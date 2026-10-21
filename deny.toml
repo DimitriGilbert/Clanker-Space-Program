@@ -1,14 +1,39 @@
-# cargo-deny: license audit only for now (PLAN §3.7). Dependency-tree bans
-# live in `cargo xtask lint-deps`, which has per-crate scoping cargo-deny
-# can't express cleanly across wasm splits.
+# cargo-deny (PLAN §3.7/§8.2): license audit + GLOBAL dependency bans.
+# Per-crate / per-target bans live in `cargo xtask lint-deps`, which has
+# the scoping cargo-deny cannot express — `deny` here applies to every
+# crate in the workspace, so it may only list crates that must never
+# appear ANYWHERE.
 [licenses]
 allow = [
     "MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "ISC",
     "BSD-2-Clause", "BSD-3-Clause", "Zlib", "Unicode-3.0",
-    "Unicode-DFS-2016", "CC0-1.0", "BSL-1.0", "MPL-2.0", "LicenseRef-CSP-GAME",
+    "Unicode-DFS-2016", "CC0-1.0", "BSL-1.0", "MPL-2.0",
 ]
 copyleft = "deny"
+# csp-app is LicenseRef-CSP-GAME + publish=false — private, skipped here.
+# cargo-deny requires `registries` to be non-empty when `ignore = true`.
+private = { ignore = true, registries = ["https://github.com/rust-lang/crates.io-index"] }
 
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+deny = [
+    # The rand facade is banned workspace-wide (PLAN §2.1): the sanctioned
+    # RNG surface is rand_chacha + rand_core through csp_core::rng. A
+    # legitimate future need (e.g. §8.1's proptest, which pulls rand)
+    # must add `wrappers = [...]` here deliberately, not silently.
+    { name = "rand" },
+    # No threadpool crates anywhere in the workspace — §2.1 bans them in
+    # the determinism domain and no presentation crate uses one either.
+    { name = "rayon" },
+    # The bevy umbrella engine crate. `bevy_ecs` is a DIFFERENT package —
+    # the only sanctioned bevy_* dep, csp-view only (xtask lint-deps).
+    { name = "bevy" },
+    # Deliberately NOT listed — per-crate scope belongs to lint-deps:
+    #   tokio: allowed in csp-server (§2.1) and via wasm-bindgen-futures
+    #          on wasm; a global ban would forbid what the plan allows.
+    #   getrandom: pulled by egui->ahash and winit->cc on the
+    #          presentation side; banned only inside determinism crates.
+    #   wgpu/winit/egui: legal in csp-app/csp-render/csp-ui/csp-view;
+    #          banned inside determinism crates by lint-deps.
+]

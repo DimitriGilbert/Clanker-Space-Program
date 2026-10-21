@@ -6,6 +6,15 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
+# bless-goldens re-records scenarios through the harness itself rather than
+# shelling out to `cargo run` — one process, no nested cargo.
+csp-bench = { workspace = true }
+
+[dev-dependencies]
+# lint-deps tests prove data/*.ron files parse with the real RON reader —
+# the "valid RON" hygiene gate is a parse, not a regex.
+ron = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 
 [lints]
 workspace = true

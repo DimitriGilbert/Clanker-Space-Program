@@ -147,7 +147,7 @@ Clanker-Space-Program/
 │   ├── test-fixtures/          # FROZEN data sets for golden replays (§8.3)
 │   └── ATTRIBUTION.md
 └── apps/
-    └── telemetry/              # TanStack Start SPA (Tailwind + shadcn + custom CSS),
+    └── telemetry/  (not yet created) # TanStack Start SPA (Tailwind + shadcn + custom CSS),
                                 # bootstrapped with TanStack CLI; built assets served by csp-server
 ```
 
@@ -1712,7 +1712,7 @@ against hard-coded expected bytes; `StateHasher` against hand-computed canonical
 |---|---|---|---|
 | `cargo check` native | — | every commit | CI-HOST |
 | `cargo check` wasm | `--workspace --exclude csp-server --exclude csp-bench --target wasm32-unknown-unknown` | every commit | CI-HOST |
-| **wasm purity (positive)** | `cargo tree --target wasm32-unknown-unknown -p csp-app` must **not** contain `csp-server`/`csp-bench`/`tokio`/`rayon`; fails on tool error | every commit | CI-HOST |
+| **wasm purity (positive)** | `cargo tree --target wasm32-unknown-unknown -p csp-app` must **not** contain `csp-server`/`csp-bench`/`tokio`/`rayon`; fails on tool error. **One narrow `tokio` exception: only as a direct dependency of `wasm-bindgen-futures`** — Cargo.lock shows `wasm-bindgen-futures` 0.4.79 declares a `tokio` edge, so a feature flip that activates it is legal through that edge alone; every other path to `tokio` is a violation | every commit | CI-HOST |
 | Dependency rules | `xtask lint-deps` parses `cargo tree --format "{p}"` and asserts an explicit allow/deny list per crate; **fails on tooling error**, never passes on empty output | every commit | CI-HOST |
 | Determinism lints | `clippy.toml`: `disallowed-methods` for `f64::{sin,cos,tan,asin,acos,atan,atan2,exp,ln,log,powf,powi,sqrt,cbrt,hypot}`; `disallowed-types` for `std::collections::{HashMap,HashSet}` and `std::time::*`; `SeedableRng::seed_from_u64`. Applied via `[lints]` in `csp-core`/`csp-sim`/`csp-phys`/`csp-data` **only** | every commit | CI-HOST |
 | `cargo-deny` | bans, duplicate versions, **license allowlist** (§3.7) | every commit | CI-HOST |

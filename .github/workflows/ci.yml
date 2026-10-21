@@ -22,7 +22,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: clippy (native)
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: test (native)
         run: cargo test --workspace
@@ -38,3 +38,20 @@ jobs:
         run: |
           cargo run -p xtask -- lint-deps
           cargo run -p xtask -- lint-attribution
+
+      # §8.2 cargo-deny gate: license allowlist + global bans (deny.toml).
+      # cargo-deny is a prebuilt binary install; NOTE it is not vendored in
+      # this workspace, so this step could not be pre-verified locally —
+      # if the pin misbehaves on first CI run, adjust here.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: cargo-deny (licenses + bans)
+        run: cargo deny check
+
+      # §8.2 golden replays — the M0 fast subset is one scenario. The
+      # workspace test run above already covers the in-process round-trips;
+      # this step runs the strict `verify_golden` path (fixture freeze,
+      # sidecar agreement, replay verdict) against the committed artifacts.
+      - name: golden replays (M0 subset)
+        run: cargo run -p csp-bench --bin csp-replay -- verify data/test-fixtures/trivial

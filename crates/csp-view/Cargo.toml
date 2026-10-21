@@ -7,6 +7,10 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 csp-core = { workspace = true }
 csp-sim = { workspace = true }
+# The UiBuild schedule's systems call csp-ui's pure panel fns; egui types
+# ride presentation resources (RawInput in, FullOutput out — §2.5).
+csp-ui = { workspace = true }
+egui = { workspace = true }
 bevy_ecs = { workspace = true, features = ["std"] }
 
 # PLAN §2.5: multi_threaded executor is a NATIVE-only feature (fixup 10).

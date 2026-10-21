@@ -1,1 +1,6 @@
-schema_version = 1
+// English localization (PLAN §1.2: v1 is English-only; LocKey is
+// indirection into this file). M0 stub — real keys land with the first
+// UI string needing loc.
+(
+    schema_version: 1,
+)

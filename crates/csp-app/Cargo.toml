@@ -3,6 +3,10 @@ name = "csp-app"
 version = "0.0.0"
 edition.workspace = true
 license = "LicenseRef-CSP-GAME"
+# The shipped game binary (PLAN §1.2): proprietary, never published. Also
+# keeps cargo-deny's license check out of LicenseRef-CSP-GAME's way
+# ([licenses] private.ignore in deny.toml).
+publish = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -12,26 +16,26 @@ name = "csp"
 path = "src/main.rs"
 
 [dependencies]
-csp-core = { version = "0.0.0", path = "../csp-core" }
-csp-render = { version = "0.0.0", path = "../csp-render" }
-csp-view = { version = "0.0.0", path = "../csp-view" }
-egui = "0.37.0"
-egui-wgpu = "0.37.0"
-egui-winit = { version = "0.37.0", default-features = false, features = ["links", "wayland", "x11"] }
-pollster = "1.0.1"
-web-time = "1.1.0"
-wgpu = "30"
-winit = "0.30.13"
+csp-core = { workspace = true }
+csp-render = { workspace = true }
+csp-view = { workspace = true }
+egui = { workspace = true }
+egui-wgpu = { workspace = true }
+egui-winit = { workspace = true, features = ["links", "wayland", "x11"] }
+pollster = { workspace = true }
+web-time = { workspace = true }
+wgpu = { workspace = true }
+winit = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-console_error_panic_hook = "0.1.7"
-console_log = "1.1.0"
-log = "0.4.34"
-wasm-bindgen = "0.2.129"
-wasm-bindgen-futures = "0.4.79"
+console_error_panic_hook = { workspace = true }
+console_log = { workspace = true }
+log = { workspace = true }
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-env_logger = "0.11.11"
+env_logger = { workspace = true }
 
 [lints]
 workspace = true

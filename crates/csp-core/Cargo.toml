@@ -5,9 +5,9 @@ edition.workspace = true
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-blake3.workspace = true
-rand_chacha = "0.10.0"
-rand_core = "0.10.1"
+blake3 = { workspace = true }
+rand_chacha = { workspace = true }
+rand_core = { workspace = true }
 
 [lints]
 workspace = true

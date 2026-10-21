@@ -4,12 +4,17 @@ disallowed-methods = [
     { path = "f64::sin" }, { path = "f64::cos" }, { path = "f64::tan" },
     { path = "f64::asin" }, { path = "f64::acos" }, { path = "f64::atan" },
     { path = "f64::atan2" }, { path = "f64::exp" }, { path = "f64::ln" },
+    { path = "f64::log", reason = "PLAN §8.2: libm only" },
+    { path = "f64::log2", reason = "PLAN §8.2: libm only" },
+    { path = "f64::log10", reason = "PLAN §8.2: libm only" },
     { path = "f64::powf" }, { path = "f64::powi" }, { path = "f64::sqrt" },
     { path = "f64::cbrt" }, { path = "f64::hypot" },
+    { path = "rand_core::SeedableRng::seed_from_u64", reason = "PLAN §2.7/§8.2: rand_core implementation detail; use csp_core::rng::derive_key" },
 ]
 disallowed-types = [
     { path = "std::collections::HashMap", reason = "iteration order is nondeterministic; use BTreeMap" },
     { path = "std::collections::HashSet", reason = "iteration order is nondeterministic; use BTreeSet" },
     { path = "std::time::Instant", reason = "no wall clock in sim" },
     { path = "std::time::SystemTime", reason = "no wall clock in sim" },
+    { path = "std::time::Duration", reason = "no wall clock in sim" },
 ]

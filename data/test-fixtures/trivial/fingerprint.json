@@ -1,0 +1,13 @@
+{
+  "rustc_version": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+  "target_triple": "x86_64-unknown-linux-gnu",
+  "parry3d_f64": null,
+  "rapier3d_f64": null,
+  "libm": "0.2.16",
+  "rand_chacha": "0.10.0",
+  "blake3": "1.8.3",
+  "hash_schema_version": 1,
+  "kdf_version": 1,
+  "data_hash_version": 1,
+  "data_fixture_hash": "f01beaff8fa6b6ffbdf4b1a1d417542419a0491c3b1b3a546a536c0929ed6578"
+}

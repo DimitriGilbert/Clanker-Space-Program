@@ -4,7 +4,10 @@ version = "0.0.0"
 edition.workspace = true
 license = "MIT OR Apache-2.0"
 
+# Pure egui panel functions only — no bevy_ecs, csp-sim, wgpu, or winit
+# (PLAN §2.1). csp-view registers the UiBuild system that calls in here.
 [dependencies]
+egui = { workspace = true }
 
 [lints]
 workspace = true

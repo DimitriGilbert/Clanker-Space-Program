@@ -5,7 +5,16 @@ edition.workspace = true
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-csp-core = { version = "0.0.0", path = "../csp-core" }
+csp-core = { workspace = true }
+# PLAN §2.1 allow-lists serde for csp-sim: the §7.6 replay artifact serializes
+# command types via bincode. Serialization never feeds the §7.1 state hash —
+# that is produced by the StateHasher visitor, so serde field order is free.
+serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+# Tests draw seeded permutations from csp_core's own deterministic streams
+# (PLAN §2.7) — never the rand facade.
+rand_core = { workspace = true }
 
 [lints]
 workspace = true

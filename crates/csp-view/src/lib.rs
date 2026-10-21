@@ -3,20 +3,180 @@
 //! Authoritative sim state never lives in this `World` — it mirrors `csp-sim`
 //! for presentation. `bevy_ecs` is confined to this crate
 //! (`default-features = false`), so replacing it later is cheap.
+//!
+//! Frame contract (§2.5, Appendix A items 1–3): `csp-app` drives
+//! [`View::begin_frame`] (Input), [`View::sim_step`] (SimStep — one
+//! `step_frame` call, always), [`View::end_frame`] (Sync → Presentation →
+//! UiBuild → RenderExtract), and consumes [`View::take_ui_frame`] to paint.
+//! `csp-app` never reads `view.world` to build UI — input arrives through
+//! the plumbing methods below, output leaves through `take_*`.
 
 use bevy_ecs::prelude::*;
+use bevy_ecs::schedule::SingleThreadedExecutor;
+use csp_core::{SimError, SimTime};
 use csp_sim::World as SimWorld;
 
-/// Integer sim clock mirrored for presentation — a COPY, written each frame by
-/// the Sync bridge. Never authoritative (PLAN §2.2).
-#[derive(Resource, Default)]
-pub struct Clock(pub csp_core::SimTime);
+/// `SimCommand` vocabulary, re-exported so `csp-app` can produce commands
+/// without depending on `csp-sim` directly — §2.1's rule that `csp-view` is
+/// the only crate depending on BOTH `csp-sim` and `csp-render` stays true.
+pub use csp_sim::{SimCommand, SourceClass};
 
-/// Proof-of-life stats shown in the debug panel.
+/// Integer sim clock mirrored for presentation — a COPY, written each frame
+/// by the `sync` schedule's [`sync_mirrors`] system (PLAN §2.2, Appendix A
+/// item 1). Never authoritative.
+#[derive(Resource, Default)]
+pub struct Clock(pub SimTime);
+
+/// Proof-of-life stats shown in the debug panel — written by [`sync_mirrors`]
+/// from the last [`AdvanceReport`](csp_sim::AdvanceReport), never by the sim
+/// path directly (Appendix A item 1).
 #[derive(Resource, Default)]
 pub struct FrameStats {
+    /// Frames rendered since startup.
     pub frames: u64,
+    /// Ticks the last `step_frame` advanced (0 on a halted or zero-advance
+    /// frame).
     pub ticks_last_frame: u64,
+}
+
+/// The sim-stored warp level, mirrored verbatim by [`sync_mirrors`] (§2.6.3:
+/// stored state, in the hash; interpreting it as a ladder rung/multiplier is
+/// `csp-app`'s job).
+#[derive(Resource)]
+pub struct WarpMirror(pub u32);
+
+impl Default for WarpMirror {
+    /// The sim boots at ×1 (real time — §2.6.2's always-allowed regime), so
+    /// the mirror starts there rather than at 0.
+    fn default() -> Self {
+        Self(1)
+    }
+}
+
+/// Session-side values `csp-app` mirrors in for the UI — written through
+/// [`View::set_gpu_info`]/[`View::update_session`] before the schedules run.
+/// Presentation/session data only (§2.2 C): never logged, never hashed.
+#[derive(Resource, Default)]
+pub struct SessionMirror {
+    /// GPU adapter name (debug HUD).
+    pub adapter: String,
+    /// wgpu backend label (debug HUD).
+    pub backend: String,
+    /// Wall-clock frame delta, ms. Display-only — wall time never reaches
+    /// the sim (§2.5).
+    pub dt_wall_ms: f64,
+    /// Warp multiplier the player asked for (controller state).
+    pub warp_requested: u64,
+    /// Warp multiplier the controller emits after §2.6.3 auto-derate.
+    pub warp_effective: u64,
+    /// §2.13 halt state — mirrored so the panel can show "SIM HALTED".
+    pub fatal: Option<SimError>,
+}
+
+/// The egui pass's input/output — the resource bridge that lets the *whole*
+/// egui pass live inside the `UiBuild` schedule (§2.5, Appendix A item 3).
+///
+/// - `ctx`: the `egui::Context` (Arc-interned, cheap to clone — `csp-app`
+///   borrows a clone only to tessellate `output` for painting).
+/// - `input`: this frame's `egui::RawInput`, staged by `csp-app` from
+///   `egui_winit::State::take_egui_input` — the winit→egui bridge stays in
+///   `csp-app`; the pass itself is the [`build_ui`] system.
+/// - `output`: the completed `egui::FullOutput`, consumed by `csp-app`'s
+///   painter (platform output, tessellation, textures delta).
+#[derive(Resource, Default)]
+pub struct EguiPass {
+    /// The egui context — lives here so `UiBuild` can run the pass.
+    pub ctx: egui::Context,
+    /// Staged raw input for the current frame.
+    pub input: egui::RawInput,
+    /// The completed pass — `Some` after `UiBuild` ran this frame.
+    pub output: Option<egui::FullOutput>,
+}
+
+impl Drop for EguiPass {
+    /// `TexturesDelta` is `#[must_use]` — epaint debug-asserts when one is
+    /// dropped unapplied. A frame whose output nobody consumed (app exit,
+    /// headless use) clears it here rather than tripping the assert.
+    fn drop(&mut self) {
+        if let Some(output) = &mut self.output {
+            output.textures_delta.clear();
+        }
+    }
+}
+
+/// Requests the UI emitted during `UiBuild` — drained by `csp-app` at the
+/// *next* frame's Input phase, the §2.5 "UI-issued commands take effect on
+/// the next tick — one-tick latency, accepted" hand-off.
+#[derive(Resource, Clone, Copy, Debug, Default)]
+pub struct UiOutbox {
+    /// Net warp-ladder steps the panel requested this pass.
+    pub warp_step: i32,
+}
+
+/// Post-step values staged for the `sync` schedule — written by
+/// [`View::end_frame`] from the authoritative sim, then distributed into the
+/// presentation mirrors by [`sync_mirrors`]. This is what makes the mirror
+/// writes *systems* (Appendix A item 1) rather than bare statements.
+#[derive(Resource, Default)]
+struct SyncInput {
+    clock: SimTime,
+    warp_level: u32,
+    ticks_last_frame: u64,
+}
+
+/// The Sync bridge (§2.5 #3): copy the staged post-step sim values into the
+/// presentation-only mirrors. The sole writer of [`Clock`], [`WarpMirror`],
+/// and [`FrameStats`].
+fn sync_mirrors(
+    input: Res<SyncInput>,
+    mut clock: ResMut<Clock>,
+    mut stats: ResMut<FrameStats>,
+    mut warp: ResMut<WarpMirror>,
+) {
+    clock.0 = input.clock;
+    warp.0 = input.warp_level;
+    stats.ticks_last_frame = input.ticks_last_frame;
+    stats.frames += 1;
+}
+
+/// The entire egui pass (§2.5 #5, Appendix A item 3): build the plain-data
+/// panel input from mirrors, run `csp_ui`'s pure panel functions under
+/// `egui::Context::run_ui`, store the `FullOutput` for `csp-app`'s painter,
+/// and record UI-emitted requests for next frame's Input. Never reads the
+/// sim — every value is a mirror or session value.
+fn build_ui(
+    mut egui: ResMut<EguiPass>,
+    clock: Res<Clock>,
+    stats: Res<FrameStats>,
+    warp: Res<WarpMirror>,
+    session: Res<SessionMirror>,
+    mut outbox: ResMut<UiOutbox>,
+) {
+    let input = csp_ui::DebugPanelInput {
+        adapter_name: &session.adapter,
+        backend: &session.backend,
+        sim_seconds: clock.0.seconds(),
+        tick: clock.0.ticks(),
+        ticks_last_frame: stats.ticks_last_frame,
+        frames: stats.frames,
+        frame_dt_ms: session.dt_wall_ms,
+        warp_level: warp.0,
+        warp_requested: session.warp_requested,
+        warp_effective: session.warp_effective,
+        fatal_reason: session.fatal.map(|e| e.reason()),
+    };
+    let mut panel_output = csp_ui::DebugPanelOutput::default();
+    let ctx = egui.ctx.clone(); // Arc-interned clone — frees the ResMut borrow.
+    let raw = egui.input.clone();
+    // Overwriting a previous, unconsumed frame would drop its
+    // `#[must_use]` TexturesDelta — clear it the documented way.
+    if let Some(prev) = &mut egui.output {
+        prev.textures_delta.clear();
+    }
+    egui.output = Some(ctx.run_ui(raw, |ctx| {
+        csp_ui::debug_panel(ctx, &input, &mut panel_output);
+    }));
+    outbox.warp_step = panel_output.warp_step;
 }
 
 /// The six schedules from PLAN §2.5, run explicitly by `csp-app`.
@@ -25,11 +185,11 @@ pub struct Schedules {
     pub input: Schedule,
     /// The sim's own step — single-threaded always (PLAN §2.5).
     pub sim_step: Schedule,
-    /// Sim snapshot -> presentation components.
+    /// Sim snapshot -> presentation components; writes every mirror.
     pub sync: Schedule,
     /// Interpolation, camera solve, LOD, VFX, audio cues.
     pub presentation: Schedule,
-    /// egui pass; emits SimCommands consumed next frame.
+    /// The entire egui pass; emits requests consumed next frame's Input.
     pub ui_build: Schedule,
     /// Build the immutable `csp_render::Frame`.
     pub render_extract: Schedule,
@@ -37,10 +197,28 @@ pub struct Schedules {
 
 /// The presentation world + its schedules + the authoritative sim.
 pub struct View {
-    /// Authoritative sim — lives OUTSIDE the ECS (PLAN §2.2).
+    /// Authoritative sim — lives OUTSIDE the ECS (PLAN §2.2). `csp-app`
+    /// reads `sim.clock()` for the §2.6.3 frame target and enqueues through
+    /// [`View::enqueue_command`]; everything else is mirror plumbing.
     pub sim: SimWorld,
+    /// The bevy_ecs presentation world — mirrors and session resources
+    /// only, never authoritative sim state (§2.2). Read/mutation
+    /// discipline for callers (`csp-app` included): **never read the ECS
+    /// to build UI** — input enters through the `set_*`/`update_*`
+    /// plumbing methods and output leaves through `take_*`; and mutate
+    /// the world only through those same plumbing methods, never by
+    /// poking resources directly (tests may, to stage fixtures).
     pub world: World,
+    /// The six §2.5 schedules. They run only through
+    /// [`View::begin_frame`]/[`View::sim_step`]/[`View::end_frame`] in the
+    /// prescribed order — `pub` so systems can be *registered* into them
+    /// as milestones land, never for ad-hoc `run` calls or reads from
+    /// `csp-app`.
     pub schedules: Schedules,
+    /// Ticks the last `sim_step` advanced — staged into `SyncInput` by
+    /// `end_frame` so `ticks_last_frame` reaches `FrameStats` through the
+    /// Sync system, not the sim path (Appendix A item 1).
+    ticks_last_frame: u64,
 }
 
 impl View {
@@ -48,9 +226,21 @@ impl View {
         let mut world = World::new();
         world.insert_resource(Clock::default());
         world.insert_resource(FrameStats::default());
+        world.insert_resource(WarpMirror::default());
+        world.insert_resource(SessionMirror::default());
+        world.insert_resource(EguiPass::default());
+        world.insert_resource(UiOutbox::default());
+        world.insert_resource(SyncInput::default());
 
+        // §2.5: "SimStep and Sync use the single-threaded executor always."
         let mut sim_step = Schedule::default();
-        sim_step.set_executor(bevy_ecs::schedule::SingleThreadedExecutor::new());
+        sim_step.set_executor(SingleThreadedExecutor::new());
+        let mut sync = Schedule::default();
+        sync.set_executor(SingleThreadedExecutor::new());
+        sync.add_systems(sync_mirrors);
+
+        let mut ui_build = Schedule::default();
+        ui_build.add_systems(build_ui);
 
         Self {
             sim: SimWorld::new(),
@@ -58,49 +248,210 @@ impl View {
             schedules: Schedules {
                 input: Schedule::default(),
                 sim_step,
-                sync: Schedule::default(),
+                sync,
                 presentation: Schedule::default(),
-                ui_build: Schedule::default(),
+                ui_build,
                 render_extract: Schedule::default(),
             },
+            ticks_last_frame: 0,
         }
     }
 
-    /// Once per frame: Input.
+    /// Ticks the last [`View::sim_step`] call actually advanced (0 on a
+    /// halted or zero-advance frame). `csp-app` divides its per-frame
+    /// `step_frame` wall measurement by this to get the per-tick cost
+    /// §2.6.3's inequality is written in. Reset to 0 by `end_frame` after
+    /// staging into `SyncInput` — read it between `sim_step` and
+    /// `end_frame`, or read the mirrored copy via `FrameStats` inside
+    /// systems.
+    pub fn ticks_last_frame(&self) -> u64 {
+        self.ticks_last_frame
+    }
+
+    /// Queue a `SimCommand` for the next tick boundary (§2.2.1). The tick and
+    /// per-source seq stamp at dequeue inside `step_frame` — enqueueing here
+    /// touches only the in-flight queue, never sim state.
+    pub fn enqueue_command(
+        &mut self,
+        source_class: SourceClass,
+        source_id: u32,
+        command: SimCommand,
+    ) {
+        self.sim.enqueue(source_class, source_id, command);
+    }
+
+    /// Once per frame: Input (§2.5 #1 — before SimStep, always).
     pub fn begin_frame(&mut self) {
         self.schedules.input.run(&mut self.world);
     }
 
-    /// Advance the sim by `n` fixed ticks (physics-warp path, PLAN §2.6).
-    /// Per tick: the authoritative `sim.step()` THEN the `SimStep` schedule —
-    /// in that order, and never the other way around.
-    pub fn sim_ticks(&mut self, n: u64) {
-        for _ in 0..n {
-            self.sim.step();
-            self.schedules.sim_step.run(&mut self.world);
-        }
-        self.world.resource_mut::<FrameStats>().ticks_last_frame = n;
+    /// The SimStep stage (§2.5 #2, §2.6.2): a single
+    /// `csp_sim::World::step_frame(target_tick)` call — the whole frame's
+    /// advance is exactly one step, what §2.5's "a single system" prescribes.
+    /// The sim lives outside the ECS `World` (§2.2), so the call itself sits
+    /// in this method — a bevy system could not reach `self.sim` — and the
+    /// `sim_step` schedule (single-threaded always) then runs any
+    /// SimStep-adjacent systems once per frame.
+    ///
+    /// The caller (csp-app's warp controller) computes `target_tick` from
+    /// wall time and warp level; this layer never derives targets —
+    /// §2.6.3 makes the sim's advance driven, never measured.
+    ///
+    /// Propagates `SimError` (§2.13): on `Fatal` the frame is abandoned and
+    /// the caller decides how to surface it — the presentation layer does
+    /// not swallow sim failures.
+    pub fn sim_step(&mut self, target_tick: u64) -> Result<(), SimError> {
+        let start = self.sim.clock().ticks();
+        let report = self.sim.step_frame(target_tick)?;
+        self.ticks_last_frame = report.reached_tick - start;
+        self.schedules.sim_step.run(&mut self.world);
+        Ok(())
     }
 
-    /// Once per frame, after all sim ticks: the Sync bridge writes the
-    /// presentation mirror, then Presentation, UiBuild, RenderExtract.
-    /// (PLAN §2.5 ordering: Input → SimStep → Sync → Presentation →
-    /// UiBuild → RenderExtract.)
+    /// Once per frame, after SimStep: Sync → Presentation → UiBuild →
+    /// RenderExtract (PLAN §2.5 ordering, Appendix A item 2). Stages the
+    /// post-step sim values into `SyncInput` first so the mirror writes are
+    /// the `sync` schedule's [`sync_mirrors`] system, not bare statements.
     pub fn end_frame(&mut self) {
-        // Sync: authoritative -> presentation mirror.
-        self.world.resource_mut::<Clock>().0 = self.sim.clock();
+        self.world.insert_resource(SyncInput {
+            clock: self.sim.clock(),
+            warp_level: self.sim.warp_level(),
+            ticks_last_frame: self.ticks_last_frame,
+        });
+        self.ticks_last_frame = 0;
         self.schedules.sync.run(&mut self.world);
         self.schedules.presentation.run(&mut self.world);
-        // NOTE: the egui pass itself is the UiBuild phase — csp-app runs it
-        // between these two schedule calls so UI sees post-step state.
         self.schedules.ui_build.run(&mut self.world);
         self.schedules.render_extract.run(&mut self.world);
-        self.world.resource_mut::<FrameStats>().frames += 1;
+    }
+
+    /// Stage this frame's `egui::RawInput` for the `UiBuild` system —
+    /// input plumbing, not a UI read of the world (§2.5).
+    pub fn set_egui_input(&mut self, input: egui::RawInput) {
+        self.world.resource_mut::<EguiPass>().input = input;
+    }
+
+    /// One-shot GPU identity for the debug HUD — session info (§2.2 C).
+    pub fn set_gpu_info(&mut self, adapter: String, backend: String) {
+        let mut m = self.world.resource_mut::<SessionMirror>();
+        m.adapter = adapter;
+        m.backend = backend;
+    }
+
+    /// Per-frame session plumbing for the UI: wall dt, the warp
+    /// controller's requested/effective multipliers, and the §2.13 halt
+    /// state. Written between frames, never read by the sim.
+    pub fn update_session(
+        &mut self,
+        dt_wall_ms: f64,
+        warp_requested: u64,
+        warp_effective: u64,
+        fatal: Option<SimError>,
+    ) {
+        let mut m = self.world.resource_mut::<SessionMirror>();
+        m.dt_wall_ms = dt_wall_ms;
+        m.warp_requested = warp_requested;
+        m.warp_effective = warp_effective;
+        m.fatal = fatal;
+    }
+
+    /// Update only the §2.13 halt mirror — for the frame a `Fatal` is
+    /// produced inside `sim_step`, so `UiBuild` sees it immediately rather
+    /// than a frame later.
+    pub fn set_fatal(&mut self, fatal: Option<SimError>) {
+        self.world.resource_mut::<SessionMirror>().fatal = fatal;
+    }
+
+    /// The `egui::Context` — `csp-app` borrows this clone to tessellate the
+    /// stored `FullOutput` into paint triangles. The pass itself already ran
+    /// inside `UiBuild`.
+    pub fn egui_context(&self) -> egui::Context {
+        self.world.resource::<EguiPass>().ctx.clone()
+    }
+
+    /// Take the completed egui pass for this frame — consumed once by the
+    /// painter (platform output, shapes → tessellation, textures delta).
+    pub fn take_ui_frame(&mut self) -> Option<egui::FullOutput> {
+        self.world.resource_mut::<EguiPass>().output.take()
+    }
+
+    /// Drain UI-emitted requests for next frame's Input (§2.5's one-frame
+    /// UiBuild → Input hand-off).
+    pub fn take_ui_outbox(&mut self) -> UiOutbox {
+        std::mem::take(&mut *self.world.resource_mut::<UiOutbox>())
     }
 }
 
 impl Default for View {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+// §2.13's no-panic rule covers shipping fallible paths; tests signal
+// failure by panicking, so unwrap/expect stays legal inside test code.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// §2.5 + Appendix A 1–3, exercised headlessly: enqueue the warp
+    /// controller's two commands, drive one frame through
+    /// Input → SimStep → Sync → Presentation → UiBuild → RenderExtract,
+    /// and assert the mirrors were written by Sync and the egui pass ran
+    /// inside UiBuild.
+    #[test]
+    fn one_frame_mirrors_state_and_builds_ui() {
+        let mut view = View::new();
+        // §2.6.3's producer pattern: SetWarp then AdvanceTo, one source.
+        view.enqueue_command(SourceClass::Ui, 0, SimCommand::SetWarp(2));
+        view.enqueue_command(SourceClass::Ui, 0, SimCommand::AdvanceTo(64));
+
+        view.begin_frame(); // Input — before SimStep, always (§2.5)
+        view.sim_step(64).unwrap(); // SimStep — one step_frame call
+        view.end_frame(); // Sync → Presentation → UiBuild → RenderExtract
+
+        // Sync mirror writes happened (Appendix A item 1).
+        assert_eq!(view.world.resource::<Clock>().0.ticks(), 64);
+        assert_eq!(view.world.resource::<WarpMirror>().0, 2);
+        let stats = view.world.resource::<FrameStats>();
+        assert_eq!(stats.ticks_last_frame, 64);
+        assert_eq!(stats.frames, 1);
+        // UiBuild ran the egui pass and produced paintable output. The
+        // `#[must_use]` TexturesDelta is cleared here the way a painter's
+        // consumption would handle it (epaint debug-asserts on drop).
+        let mut output = view.take_ui_frame().expect("UiBuild ran");
+        output.textures_delta.clear();
+        // Both commands logged in production order — the §7.6 artifact.
+        let log = view.sim.command_log();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].1, SimCommand::SetWarp(2));
+        assert_eq!(log[1].1, SimCommand::AdvanceTo(64));
+        assert!(log[0].0 < log[1].0);
+    }
+
+    /// The UiBuild → Input hand-off: a panel request written during
+    /// `UiBuild` is drained by `take_ui_outbox` for next frame's Input,
+    /// exactly once.
+    #[test]
+    fn ui_outbox_drains_for_next_frames_input() {
+        let mut view = View::new();
+        *view.world.resource_mut::<UiOutbox>() = UiOutbox { warp_step: 1 };
+        let drained = view.take_ui_outbox();
+        assert_eq!(drained.warp_step, 1);
+        assert_eq!(view.take_ui_outbox().warp_step, 0); // consumed once
+    }
+
+    /// A zero-advance frame still runs the whole pipeline and mirrors the
+    /// unchanged clock — `ticks_last_frame` reports 0, not a stale count.
+    #[test]
+    fn zero_advance_frame_reports_zero_ticks() {
+        let mut view = View::new();
+        view.sim_step(10).unwrap();
+        view.end_frame();
+        view.sim_step(10).unwrap(); // target already reached
+        view.end_frame();
+        assert_eq!(view.world.resource::<FrameStats>().ticks_last_frame, 0);
+        assert_eq!(view.world.resource::<Clock>().0.ticks(), 10);
     }
 }
