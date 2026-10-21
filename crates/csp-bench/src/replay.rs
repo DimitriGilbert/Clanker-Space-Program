@@ -19,8 +19,6 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use std::collections::BTreeMap;
-
 use csp_core::{HASH_SCHEMA_VERSION, KDF_VERSION, SimError};
 use csp_data::DATA_HASH_VERSION;
 use csp_sim::orbit::PatchedConics;
@@ -166,6 +164,13 @@ pub struct Replay {
     /// Every applied command in strictly increasing `CommandKey` order —
     /// the replay program (§2.2.1).
     pub command_log: Vec<(CommandKey, SimCommand)>,
+    /// The world's construction config at record time (§7.3 — the
+    /// data-derived orbit model plus the physics environment and
+    /// dominant body, when present). The artifact carries it so the
+    /// reconstruction is self-contained: [`replay`] rebuilds the same
+    /// construction from the artifact rather than re-running the
+    /// recipe's data loads.
+    pub config: csp_sim::WorldConfig,
 }
 
 /// A fresh recording: the artifact plus the final hash the run produced.
@@ -200,6 +205,9 @@ pub enum ReplayError {
     Json(serde_json::Error),
     /// The sim itself failed during record or replay (§2.13).
     Sim(SimError),
+    /// A recipe's `initial` failed to load its fixture data (§8.3's
+    /// frozen input).
+    Load(csp_data::LoadError),
     /// A golden file exists but is not in the documented format.
     MalformedGolden(&'static str),
     /// A log entry is stamped at a tick the restored clock has already
@@ -272,6 +280,7 @@ impl fmt::Display for ReplayError {
             Self::Decode(e) => write!(f, "bincode decode: {e}"),
             Self::Json(e) => write!(f, "fingerprint.json: {e}"),
             Self::Sim(e) => write!(f, "sim: {e}"),
+            Self::Load(e) => write!(f, "fixture data: {e}"),
             Self::MalformedGolden(r) => write!(f, "malformed golden: {r}"),
             Self::StampBehindClock { tick, clock } => write!(
                 f,
@@ -316,6 +325,7 @@ impl std::error::Error for ReplayError {
             Self::Decode(e) => Some(e),
             Self::Json(e) => Some(e),
             Self::Sim(e) => Some(e),
+            Self::Load(e) => Some(e),
             _ => None,
         }
     }
@@ -324,6 +334,12 @@ impl std::error::Error for ReplayError {
 impl From<SimError> for ReplayError {
     fn from(e: SimError) -> Self {
         Self::Sim(e)
+    }
+}
+
+impl From<csp_data::LoadError> for ReplayError {
+    fn from(e: csp_data::LoadError) -> Self {
+        Self::Load(e)
     }
 }
 
@@ -516,8 +532,9 @@ fn canonicalize(bytes: &[u8]) -> Vec<u8> {
 /// function, so the check gates both writers.
 pub fn record(recipe: &ScenarioRecipe, fixture_dir: &Path) -> Result<RecordedGolden, ReplayError> {
     let data_fixture_hash = fixture_hash(fixture_dir)?;
-    let mut world = (recipe.initial)();
+    let mut world = (recipe.initial)(fixture_dir)?;
     let initial_snapshot = world.snapshot()?;
+    let config = world.config();
     (recipe.drive)(&mut world)?;
     let final_hash = world.state_hash()?;
     let artifact = Replay {
@@ -527,6 +544,7 @@ pub fn record(recipe: &ScenarioRecipe, fixture_dir: &Path) -> Result<RecordedGol
         initial_snapshot,
         final_tick: world.clock().ticks(),
         command_log: world.command_log().to_vec(),
+        config,
     };
     match replay(&artifact) {
         Ok(actual) if actual == final_hash => {}
@@ -588,12 +606,12 @@ pub fn record(recipe: &ScenarioRecipe, fixture_dir: &Path) -> Result<RecordedGol
 /// reconstruction that stops anywhere else fails
 /// [`ReplayError::ClockMismatch`], before the hash comparison.
 pub fn replay(artifact: &Replay) -> Result<[u8; 32], ReplayError> {
-    // The orbit model is data-derived (§7.3) and not part of the artifact:
-    // the M1 scenarios record against an empty model, so restore gets an
-    // empty one — a scenario with vessels must rebuild the model from its
-    // frozen fixture the same way its recipe's `initial` does.
+    // The construction config is §7.3 data-derived state the artifact
+    // carries verbatim — the orbit model + physics environment the run
+    // was recorded against.
     let mut world = World::restore(
-        PatchedConics::new(BTreeMap::new()),
+        PatchedConics::new(artifact.config.orbits.clone()),
+        artifact.config.physics.clone(),
         artifact.initial_snapshot.clone(),
     )?;
     let log = &artifact.command_log;
@@ -1055,6 +1073,7 @@ mod tests {
             initial_snapshot: World::new().snapshot().unwrap(),
             final_tick: world.clock().ticks(),
             command_log: world.command_log().to_vec(),
+            config: world.config(),
         };
         assert_eq!(replay(&artifact).unwrap(), world.state_hash().unwrap());
     }

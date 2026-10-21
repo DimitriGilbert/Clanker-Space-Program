@@ -803,7 +803,9 @@ dependencies = [
  "blake3",
  "csp-core",
  "csp-data",
+ "csp-phys",
  "csp-sim",
+ "libm",
  "serde",
  "serde_json",
 ]
@@ -832,6 +834,12 @@ dependencies = [
 [[package]]
 name = "csp-phys"
 version = "0.0.0"
+dependencies = [
+ "csp-core",
+ "csp-data",
+ "libm",
+ "serde",
+]
 
 [[package]]
 name = "csp-render"
@@ -855,6 +863,7 @@ version = "0.0.0"
 dependencies = [
  "csp-core",
  "csp-data",
+ "csp-phys",
  "libm",
  "rand_core",
  "serde",

@@ -5,6 +5,18 @@ edition.workspace = true
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+# §2.1 allowlist for csp-phys (xtask lint-deps): csp-core supplies the f64
+# math primitives (DVec3/DQuat) and the SimError taxonomy.
+csp-core.workspace = true
+# SimpleBackend's Environment consumes the authored BodyDef/AtmosphereDef
+# (§3.0) directly — the closed-form atmosphere is evaluated inside the tick.
+csp-data.workspace = true
+# §2.7: f64 transcendentals are libm-only (atmosphere exp, ray/discriminant
+# and basis sqrt).
+libm.workspace = true
+# WeldedBody and the part graph derive serde for the §7.1/§7.2 hash/save
+# pipeline (derived caches re-weld exactly; kinematic state serializes).
+serde = { workspace = true, features = ["derive"] }
 
 [lints]
 workspace = true

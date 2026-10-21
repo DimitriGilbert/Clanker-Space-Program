@@ -143,7 +143,7 @@ fn solve_tol_seconds(dt: f64) -> f64 {
 /// `None` for the star only. Every body's elements are expressed relative
 /// to its `parent` with sim-time 0 as their epoch (the `body.ron`
 /// convention).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BodyOrbit {
     /// μ (m³/s²).
     pub mu_m3_per_s2: f64,

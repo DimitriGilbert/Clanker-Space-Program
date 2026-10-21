@@ -1,0 +1,12 @@
+// Global balance constants. ALL tuning lives here (PLAN §8.3).
+// Named fields only — positional tuples drift silently under reordering.
+(
+    schema_version: 1,
+    // Physics bubble radius (PLAN §2.3): 20 km. Vessels go on rails at the
+    // radius and rejoin at 90% (18 km) — the hysteresis is csp-sim logic,
+    // not a second constant.
+    bubble_radius_m: 20_000.0,
+    // PLAN:548 / §2.6.5: `advance_to` processes at most this many events per
+    // frame; overflow continues next frame as a Clamping-class event.
+    advance_to_max_events_per_frame: 2_000,
+)

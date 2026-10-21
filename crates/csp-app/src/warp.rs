@@ -15,9 +15,14 @@ use csp_core::TICK_HZ;
 /// sim stores it verbatim and interprets nothing (§2.6.3), so the log reads
 /// as literal multipliers.
 ///
-/// Regime gating (bubble occupied ⇒ physics warp, no-thrust/no-atmosphere
-/// ⇒ rails) arrives with the bubble in a later milestone; M0's sim has no
-/// bubble, so every rung is admissible.
+/// Regime gating landed with the M2-C bubble as a soft gate: the frame
+/// loop evaluates `World::rails_warp_refusal` on post-step state every
+/// frame, and while it reports a refusal (a bubble-resident vessel under
+/// thrust, in unsettled contact, or in atmosphere) the controller is
+/// demoted to rung 0 — see `App::run_frame`. The check reads state the
+/// step just produced, so a refusal that appears mid-step lands at the
+/// NEXT frame's command drain: a documented one-frame lag, bounded
+/// because the refusal conditions persist until commanded away.
 pub const WARP_LADDER: [u64; 7] = [1, 2, 10, 100, 1_000, 10_000, 100_000];
 
 /// §2.6.3: `budget_fraction` — the share of the frame budget sim stepping

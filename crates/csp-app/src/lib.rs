@@ -270,12 +270,24 @@ impl App {
                         log::warn!("event degraded (fallback applied): {e}");
                     }
                     // §2.6.2's rails-warp refusal seam: the sim-side
-                    // predicate, checked here every frame — the only place
-                    // it can be. Vacuous at M1 (no bubble/thrust/atmo).
-                    let refused = self.view.sim.rails_warp_refusal().is_some();
-                    if (clamping || refused)
+                    // predicate, checked here every frame on post-step
+                    // state — the only place it can be. Honest about the
+                    // one-frame lag: the predicate reads state THIS
+                    // frame's step produced, and the demote is a queued
+                    // SetWarp that lands at the next frame's boundary —
+                    // the frame the refusal appeared in already ran at
+                    // the old level. Bounded, not compounding: the
+                    // refusal conditions (thrust, contact, atmosphere)
+                    // persist until commanded away, so the predicate
+                    // re-reports every frame until the state changes.
+                    let refusal = self.view.sim.rails_warp_refusal();
+                    if (clamping || refusal.is_some())
                         && let Some(level) = self.warp.demote(0)
                     {
+                        // §2.6.2: the refusal names the offending vessel.
+                        if let Some(reason) = &refusal {
+                            log::warn!("rails warp refused ({reason}) — demoting to ×{level}");
+                        }
                         self.view.enqueue_command(
                             SourceClass::Ui,
                             WARP_SOURCE_ID,

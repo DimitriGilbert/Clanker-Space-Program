@@ -30,7 +30,17 @@ use crate::SimError;
 /// event heap (in `(tick, seq)` order), `next_event_seq`, the vessel
 /// arena + `next_vessel_id`, the tracked-vessel opt-in set, and the
 /// event budget. Bumped in the same change as the trivial-golden rebless.
-pub const HASH_SCHEMA_VERSION: u32 = 2;
+///
+/// **Version 3** (M2-C): the per-vessel walk gained the physical-
+/// residence payloads — each vessel's stored `craft` weld inputs (part
+/// graph + effective parts, hashed in full because the weld's mass
+/// properties are a pure function of them) and the `VesselState`
+/// residence payloads: `InBubble`'s welded-body kinematic/control/settle
+/// fields (`pos`, `rot`, `vel`, `ang_vel`, `throttle`, `settle`) and
+/// `SurfaceLatched`'s body-fixed pose record (`body`, lat/lon/alt,
+/// orientation). Bumped in the same change as the trivial and
+/// flight-launch golden reblesses.
+pub const HASH_SCHEMA_VERSION: u32 = 3;
 
 /// Rule-7 sum types: the source of an enum's *declared* stable `u16`
 /// discriminant (PLAN §7.1 rule 7).

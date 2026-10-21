@@ -9,6 +9,13 @@ build = "build.rs"
 csp-core = { workspace = true }
 csp-data = { workspace = true }
 csp-sim = { workspace = true }
+# The flight scenario's authored part set + environment come from the
+# weld/weld-input types; the harness measures `SimpleBackend::step` cost
+# directly (§5.3's per-tick budget).
+csp-phys = { workspace = true }
+# Scripted-controller math (atan2/acos/apsis estimates) — deterministic
+# math only, matching the sim's own rule.
+libm = { workspace = true }
 # §3.1 fixture hashing (the replay artifact's data_fixture_hash).
 blake3 = { workspace = true }
 # §7.6: replay logs stay bincode, version-scoped by T3. `serde` feature for

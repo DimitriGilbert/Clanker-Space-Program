@@ -9,10 +9,12 @@
 
 use core::ops::{Add, Div, Mul, Neg, Sub};
 
+use serde::{Deserialize, Serialize};
+
 /// A 3-component `f64` vector — positions (m) and velocities (m/s) in the
 /// orbit layer, free of any fixed frame convention (the caller documents
 /// which frame a given value lives in).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DVec3 {
     pub x: f64,
     pub y: f64,

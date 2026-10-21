@@ -1,0 +1,11 @@
+// The flight-launch golden's frozen system (§8.3): the home system's
+// star + homeworld only — the recorded run never leaves Terrin's SOI.
+// body.ron files are verbatim copies of `data/systems/home` (terrin's
+// `biome_map` is stripped — the scenario loads no biome data).
+(
+    schema_version: 1,
+    id: "flight-launch",
+    star: "solen",
+    bodies: ["solen", "terrin"],
+    epoch_note: "system.home.epoch_note",
+)

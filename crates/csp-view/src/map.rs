@@ -610,10 +610,13 @@ pub(crate) fn extract_map(
 pub(crate) fn capture_sync_input(sim: &SimWorld) -> MapSyncInput {
     MapSyncInput {
         tick: sim.clock(),
+        // Only on-rails vessels have a conic to draw — bubble-resident
+        // and surface-latched vessels are skipped (the flight-scene
+        // presentation path for them is a later milestone's work).
         vessels: sim
             .vessels()
             .iter()
-            .map(|(id, v)| (*id, v.orbit.clone()))
+            .filter_map(|(id, v)| v.orbit().cloned().map(|o| (*id, o)))
             .collect(),
     }
 }

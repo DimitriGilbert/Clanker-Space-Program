@@ -9,6 +9,9 @@ csp-core = { workspace = true }
 # §2.1 allowlist: the orbit layer reuses csp-data's `BodyId`/`KeplerElements`
 # (the §3.0 schema types) rather than redeclaring them sim-side.
 csp-data = { workspace = true }
+# §2.4/§2.9: the bubble's weld inputs (`PartGraph`/`EffectivePart`),
+# `WeldedBody`, and the `SimpleBackend` + `Environment` the World steps.
+csp-phys = { workspace = true }
 # §2.7: libm-only transcendentals — every sin/cos/atan2/sqrt in the orbit
 # layer goes through it (crate clippy.toml bans the f64 methods).
 libm = { workspace = true }
