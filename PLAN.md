@@ -83,8 +83,13 @@ Clanker-Space-Program/
 │   ├── csp-app/                # winit shell, frame loop, platform glue (native + wasm entry)
 │   ├── csp-script/             # scripting host: stable control API, Rhai guest everywhere,
 │   │                           # wasmtime mod host (native only)
-│   └── csp-ai/                 # classical automation: guidance, design solver, trajectory
-│                               # optimizer; LLM adapter trait
+│   ├── csp-ai/                 # classical automation: guidance, design solver, trajectory
+│   │                           # optimizer; LLM adapter trait
+│   ├── csp-server/             # NATIVE ONLY: embedded HTTP+WS server — telemetry screens,
+│   │                           # widget dashboards, MCP endpoint for external agents
+│   └── csp-bench/              # NATIVE ONLY: headless scenario runner — golden replays,
+│                               # LLM/eval benchmarks, economy harness. csp-sim + commands,
+│                               # no renderer
 └── data/
     ├── parts/
     ├── systems/home/
@@ -368,6 +373,55 @@ One API, one guest language, one set of semantics.
      deleting a craft, accepting a contract. The LLM proposes; the player commits.
   3. Opt-in, off by default, API-key supplied by the player, token budget visible.
 
+### 2.12 External interfaces — one control surface, four clients
+
+Everything that can *observe* or *control* the game goes through the same two doors:
+telemetry comes from `csp-sim` snapshots, mutation goes through the `SimCommand` queue.
+No interface has privileged access — this is what makes the agent story honest.
+
+| Client | Transport | Direction | Lands |
+|---|---|---|---|
+| In-game scripts (Rhai) | `ControlApi` trait, in-process | read + commands | M9 |
+| Built-in autopilots | `ControlApi` trait, in-process | read + commands | M9 |
+| **MCP server** (`csp-server`) | MCP JSON-RPC over stdio or HTTP+SSE | read + commands | M9/post |
+| **Telemetry web screens** (`csp-server`) | HTTP static SPA + WebSocket stream | mostly read; opt-in command channel | M9 |
+
+Rules for `csp-server`:
+- **Native-only.** The web build of the game cannot host a server — `csp-server` is
+  `cfg(not(target_arch = "wasm32"))` and out of the wasm CI gate's reach (it still must
+  not be a *dependency* of anything in the wasm tree).
+- **Every tool/command maps to `SimCommand`s** stamped at the tick they're consumed —
+  agents get the same one-tick latency and the same determinism contract as UI input.
+- **Bind `127.0.0.1` by default**; a generated per-save token is required for LAN binds.
+  Read-only telemetry may be unauthenticated on localhost; any mutation endpoint requires
+  the token, always.
+
+#### 2.12.1 MCP & autonomous play
+
+An MCP server exposing `ControlApi` as tools (`telemetry.get`, `vessel.control`,
+`editor.build`, `timewarp.set`, `mission.nodes`, `craft.load`, ...) plus snapshot data as
+resources. Purpose: external LLMs/agents can *play* the game — scripted scenarios,
+autonomous play, and eval benchmarks.
+
+Because `csp-sim` is headless, `csp-bench` runs the whole thing with no renderer:
+`scenario.yaml { initial_snapshot, command_source: agent|script|log, goal_predicate,
+tick_budget }` → exit code + final state hash + score (Δv used, sim-time elapsed, funds
+spent). That is an LLM eval harness by construction: deterministic replays are the
+grading ground truth, and a failing run is reproducible down to the command log.
+
+#### 2.12.2 Telemetry web screens (KSP-web-server-mod equivalent)
+
+The game serves a small static SPA + a WebSocket feed of snapshot telemetry (altitude,
+velocity, Ap/Pe, resources, stage Δv, active vessel state, colony summaries). Client-side
+widgets: gauges, graphs, digital readouts, orbit-map thumbnail, resource bars.
+
+**Dashboards are data, like workspace-welcome:** widget layouts/pages stored as JSON in
+the save (`dashboards` section), a widget registry mapping `type → component + telemetry
+fields`, user-defined pages with drag/resize — so a second monitor, a tablet, or a
+stream overlay can each show a different layout against the same running game. The
+command channel (buttons/widgets that act on the ship) is opt-in per dashboard and goes
+through the same token-gated `SimCommand` path as MCP.
+
 ---
 
 ## 3. Game design — progression layer
@@ -546,6 +600,28 @@ resources ◄── colonies/ISRU ◄── surface bases you build & supply ◄
 - Completion is evaluated by the sim, not the UI, as a predicate over sim state checked on relevant
   events (orbit achieved, docking, recovery) — never polled every tick.
 
+### 3.7 Assets & licensing policy
+
+Clarified ask: *can KSP mod content seed our part/planet library, or is everything authored fresh?*
+
+- **Mod code**: irrelevant — it's C#/Unity. Mods contribute *design lessons*, not code.
+- **Mod art/configs**: check each repo's LICENSE. Most KSP part packs are **CC-BY-NC** —
+  unusable if the game is ever sold, and murky even free. MIT-licensed assets are reusable
+  with attribution; CC-BY-SA and GPL assets are avoided entirely (share-alike contamination
+  is not worth it). Keep a `data/ATTRIBUTION.md` from the first borrowed asset.
+- **Part concepts aren't copyrightable** — a stackable fuel tank, a bell nozzle, a canard are
+  fine to recreate in KSP's spirit. Meshes, textures, and names are not. Own naming throughout.
+- **Preferred sources** (license-clean):
+  - **CC0**: Kenney (models/UI kit), Quaternius (models), Poly Haven (PBR textures/HDRI),
+    ambientCG (PBR), NASA/USGS planetary maps (public domain).
+  - **Procedural-first**: terrain, planet surfaces, clouds — generated content is
+    license-free forever and fits the fictional system anyway.
+- **Policy**: placeholder primitives through M4; first real art pass at M10, built from
+  CC0 kitbash + procedural. Any third-party asset lands in `data/` with a license line in
+  `ATTRIBUTION.md`; a CI check fails on files lacking attribution entries.
+- KSP mod *equivalents* (§4) are reimplemented features, not lifted assets — the only thing
+  ever borrowed from a mod is its ideas.
+
 ---
 
 ## 4. KSP-mod-equivalent features — scoped, with a cut list
@@ -567,7 +643,8 @@ The old table was a wishlist. Each row now has a milestone or an explicit "post-
 | CommNet / RemoteTech | Signal network, probe control range | **post-v1** — it gates *control*, i.e. it can break the scripting UX; do not ship it half-done |
 | KIS/KAS | EVA surface assembly | **post-v1** — colony modules land as prefab units in v1 |
 | Virtual texturing | Planetary surface VT | **post-v1, native tier only** (wasm heap won't take it) |
-| kRPC remote | External process control over the same API | **post-v1** |
+| kRPC remote | External agent control — **MCP endpoint** on `ControlApi` | **v1 (M9)** |
+| KSP web-server mods | Telemetry screens + user-defined widget dashboards | **v1 (M9)** |
 | Mod marketplace | — | **cut**. Not a solo-dev feature. Ship a folder and a README. |
 
 **Rejected from the old plan: "the built-in features above are implemented *as* mods against the
@@ -640,14 +717,14 @@ depended on M6/M7 data (costs, upgrades); and M2's point-mass flight model was t
 |---|---|---|
 | **M0** | Scaffold & rails | Workspace builds native + wasm in CI; winit+wgpu+egui window; `csp-view` schedules run; integer sim clock; `csp-core` RNG streams; dependency-rule lint active; state-hash harness exists |
 | **M1** | Orbit layer | Home planet + moon + 1 outer body on conics; map view; rails warp to ×10⁵ via `advance_to`; SOI transitions solved to 1 tick; event queue with alarms; round-trip elements↔cartesian test <1e-6 |
-| **M2** | Flight core (one force model, forever) | Welded body + `SimpleBackend`; thrust, drag (analytic, pre-voxel), gravity, ground contact; prebuilt craft; launch→orbit→reentry→land on a controller; physics dt locked at 1/64; golden replay green |
+| **M2** | Flight core (one force model, forever) | Welded body + `SimpleBackend`; thrust, drag (analytic, pre-voxel), gravity, ground contact; prebuilt craft; launch→orbit→reentry→land on a controller; physics dt locked at 1/64; `csp-bench` headless runner replays a command log → state hash; golden replay green |
 | **M3** | Editor + part/effective-stat pipeline | Part snap graph with attach nodes; staging; scaling + variants; **`EffectivePart` resolver** incl. stubbed upgrade/wear inputs; live Δv/TWR/burn-time; craft save/load with stable PartIds; GPU picking |
 | **M4** | Flight fidelity | Weld-time voxelization → per-part shielding; Mach/Reynolds Cd/Cl; per-part thermal + conduction + reentry heating; structural/thermal breakup with momentum conservation test; **vertical slice complete** |
 | **M5** | Interplanetary | Maneuver nodes + executor; Lambert/porkchop transfer planner; encounter prediction; transfer-window events; R2 terrain + scattering |
 | **M6** | Multi-vessel & docking | Two vessels in one bubble; docking ports as the first jointed island; station assembly; resource transfer; crew transfer |
 | **M7** | Progression | Science data model + soft-cap diminishing returns; labs/researchers with closed-form conversion; tech tree + upgrade tracks wired into the M3 resolver; funds; contracts; recovery |
 | **M8** | RTS layer | Colony modules, drills/converters, power, closed-form production under rails warp with store events; manufacture consumes resources + time; supply missions; minimal life support |
-| **M9** | Automation & reliability | `ControlApi` frozen v1; Rhai host with op budgets; Rust autopilots (ascent/rendezvous/landing); reliability hazard model + failure modes + test stands + part-test contracts |
+| **M9** | Automation, interfaces & reliability | `ControlApi` frozen v1; Rhai host with op budgets; Rust autopilots (ascent/rendezvous/landing); `csp-server` — telemetry WS + widget dashboards + MCP tools on `ControlApi`; `csp-bench` scenario format + first eval suite; reliability hazard model + failure modes + test stands + part-test contracts |
 | **M10** | Ship v1 | Save migration path; settings/input rebinding; audio; tutorial/first-flight flow; perf budgets met (§5.3); web tier playable at reduced scope |
 | **post** | Expansion | `NBody`, CommNet, LLM assistant, wasmtime mods, EVA assembly, virtual texturing, automated logistics routes |
 
@@ -737,5 +814,11 @@ Determinism has save consequences the old plan didn't draw out.
 - Terrain source: procedural noise vs authored heightmaps vs hybrid. Hybrid is likely; decide in R2
   because it determines whether virtual texturing is ever needed.
 - Whether low-thrust-on-rails (ion burns under warp) is worth the accuracy caveats. Post-v1.
+- Telemetry SPA stack: hand-rolled lightweight widgets vs a real framework build step
+  (a Vite/TS app in `apps/` served by `csp-server`). Leaning: real framework — dashboard
+  editing UX matters, and you already own the workspace-welcome patterns.
+- MCP transport: stdio (agents spawn the binary) vs HTTP+SSE only. Leaning: both — stdio
+  for `csp-bench` eval harness, HTTP for connecting to a running game.
+- License-audit tooling: a `data/ATTRIBUTION.md` linter in CI vs manual review cadence.
 - Reputation as a third currency, or fold it into contract availability. Leaning: fold it in.
 - Naming/identity: "Clanker" is a working title — needs a real one before anything public.

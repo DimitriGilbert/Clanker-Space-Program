@@ -713,6 +713,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "csp-bench"
+version = "0.0.0"
+
+[[package]]
 name = "csp-core"
 version = "0.0.0"
 dependencies = [
@@ -726,6 +730,10 @@ version = "0.0.0"
 dependencies = [
  "wgpu",
 ]
+
+[[package]]
+name = "csp-server"
+version = "0.0.0"
 
 [[package]]
 name = "csp-sim"
