@@ -90,10 +90,14 @@ Clanker-Space-Program/
 │   └── csp-bench/              # NATIVE ONLY: headless scenario runner — golden replays,
 │                               # LLM/eval benchmarks, economy harness. csp-sim + commands,
 │                               # no renderer
-└── data/
-    ├── parts/
-    ├── systems/home/
-    └── techtree/
+├── data/
+│   ├── parts/
+│   ├── systems/home/
+│   ├── techtree/
+│   └── ATTRIBUTION.md
+└── apps/
+    └── telemetry/              # TanStack Start SPA (Tailwind + shadcn + custom CSS),
+                                # bootstrapped with TanStack CLI; served by csp-server
 ```
 
 **Dependency rules (CI-enforced):**
@@ -383,7 +387,7 @@ No interface has privileged access — this is what makes the agent story honest
 |---|---|---|---|
 | In-game scripts (Rhai) | `ControlApi` trait, in-process | read + commands | M9 |
 | Built-in autopilots | `ControlApi` trait, in-process | read + commands | M9 |
-| **MCP server** (`csp-server`) | MCP JSON-RPC over stdio or HTTP+SSE | read + commands | M9/post |
+| **MCP server** (`csp-server`) | MCP JSON-RPC — **both** stdio (bench/eval harness spawns the binary) **and** HTTP+SSE (attach to a running game) | read + commands | M9/post |
 | **Telemetry web screens** (`csp-server`) | HTTP static SPA + WebSocket stream | mostly read; opt-in command channel | M9 |
 
 Rules for `csp-server`:
@@ -421,6 +425,11 @@ fields`, user-defined pages with drag/resize — so a second monitor, a tablet, 
 stream overlay can each show a different layout against the same running game. The
 command channel (buttons/widgets that act on the ship) is opt-in per dashboard and goes
 through the same token-gated `SimCommand` path as MCP.
+
+**SPA stack (settled):** TanStack Start, bootstrapped with the TanStack CLI, Tailwind +
+shadcn components + a custom CSS layer, living in `apps/telemetry/` inside the repo.
+`csp-server` serves its built assets; telemetry flows over the WS feed, dashboards
+persist via the game's save API (no separate database).
 
 ---
 
@@ -814,11 +823,5 @@ Determinism has save consequences the old plan didn't draw out.
 - Terrain source: procedural noise vs authored heightmaps vs hybrid. Hybrid is likely; decide in R2
   because it determines whether virtual texturing is ever needed.
 - Whether low-thrust-on-rails (ion burns under warp) is worth the accuracy caveats. Post-v1.
-- Telemetry SPA stack: hand-rolled lightweight widgets vs a real framework build step
-  (a Vite/TS app in `apps/` served by `csp-server`). Leaning: real framework — dashboard
-  editing UX matters, and you already own the workspace-welcome patterns.
-- MCP transport: stdio (agents spawn the binary) vs HTTP+SSE only. Leaning: both — stdio
-  for `csp-bench` eval harness, HTTP for connecting to a running game.
-- License-audit tooling: a `data/ATTRIBUTION.md` linter in CI vs manual review cadence.
 - Reputation as a third currency, or fold it into contract availability. Leaning: fold it in.
 - Naming/identity: "Clanker" is a working title — needs a real one before anything public.
