@@ -1,0 +1,9 @@
+[package]
+name = "csp-view"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bevy_ecs = { version = "0.20.0", default-features = false, features = ["std"] }
+csp-core = { version = "0.0.0", path = "../csp-core" }

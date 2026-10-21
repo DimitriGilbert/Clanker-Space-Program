@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy (native)
+        run: cargo clippy --workspace -- -D warnings
+
+      - name: test (native)
+        run: cargo test --workspace
+
+      - name: check (wasm32) — never merge a broken web build
+        run: cargo check --workspace --target wasm32-unknown-unknown
+
+      - name: dependency rules — csp-sim stays headless (PLAN §2.1)
+        run: |
+          ! cargo tree -p csp-sim 2>/dev/null | grep -E "wgpu|winit|bevy|egui|rand |rayon" \
+            && ! cargo tree -p csp-render 2>/dev/null | grep -E "csp-sim|csp-view"
