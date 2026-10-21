@@ -6,3 +6,6 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 csp-core = { version = "0.0.0", path = "../csp-core" }
+
+[lints]
+workspace = true

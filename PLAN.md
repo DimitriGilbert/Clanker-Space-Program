@@ -1723,6 +1723,12 @@ against hard-coded expected bytes; `StateHasher` against hand-computed canonical
 | **Golden replays (fast subset)** | ascent, reentry, landing+settle, docking merge, ×10⁵ warp jump, ×1-vs-×10⁵ equivalence — **suite must finish in <5 min** | every commit | CI-HOST |
 | Save round-trip determinism | §7.5, N = 10 000 | every commit | CI-HOST |
 | Shader validation | naga/WGSL compile for **both** binding models | every commit | CI-HOST |
+| Code quality | `xtask lint-quality` — complexity budgets (cognitive ≤15/25, ≤100/200 lines, ≤8 args), `cargo-geiger`, duplication stats | weekly + dep-touching PRs | CI-HOST |
+| Coverage | `cargo-llvm-cov`; floors in `ci/coverage-floors.json`; **ratchet: no decrease >0.5 pp** | per commit | CI-HOST |
+| Dead code / deps | `clippy -D warnings` (live) + `cargo-machete` + `cargo-udeps` | weekly / nightly | CI-HOST |
+| Docs | `cargo doc` `RUSTDOCFLAGS=-D warnings`; `missing_docs` warn on public API | per commit | CI-HOST |
+| Mutation testing | `cargo-mutants` on determinism crates, ≤45 min, missed-mutant tracking | weekly | CI-HOST |
+| MSRV | `cargo msrv verify` vs `rust-version = "1.95"` | weekly | CI-HOST |
 | CPU perf budgets | sim ms/tick, rails events/frame + ms/frame, weld Stage-1 ms (§5.3 CPU column); fail on >10% regression | nightly | CI-HOST |
 | Golden replays (full) | + colony century, pathological event density, 100-sim-year economy — **≤60 min** | nightly | CI-HOST |
 | Physics oracle | `SimpleBackend` vs `RapierBackend` on **≤2 s contact-free analytic** scenarios only (§2.9) | nightly | CI-HOST |
@@ -1754,6 +1760,83 @@ blindly.
 `xtask bless-goldens` regenerates goldens **and** their fingerprint files, refuses to run on a dirty
 tree, refuses to run if the state hash changed without a `HASH_SCHEMA_VERSION` bump or a documented
 behavioural change, and emits a diff summary for the commit message.
+
+### 8.5 End-to-end testing — the missing layer
+
+The pyramid (§8.1) deliberately stops at golden replays; e2e sits above it and is *not* the same
+thing. E2e exercises the system the way a player or agent would, through public surfaces only.
+
+| Tier | Harness | What it proves | Where |
+|---|---|---|---|
+| **Sim e2e** | `csp-bench` scenario files (`scenario.ron`: data set + initial snapshot + command log source + goal predicate + tick budget) | Whole systems interact correctly over mission-scale time: launch→orbit→land, contract lifecycle, colony supply loop, agent completing a mission | per-commit smoke set (<5 min), nightly full |
+| **App smoke e2e** | `csp --smoke --frames N --snapshot out.png` — headless launch, renders N frames via lavapipe/Baseline, writes a screenshot + state hash | The *integration* works: winit+winit GPU init, frame loop, schedules, egui, snapshot export — the thing unit tests structurally can't see | nightly on CI-HOST (lavapipe) |
+| **Interface e2e** (M9c+) | `csp-server` on a fixture save; a test client drives MCP tool calls and the WS subscription protocol | Protocol versioning, auth/token flow, subscription decimation, command ordering of an external client vs golden | nightly |
+| **Web e2e** (post-v1) | headless-browser smoke of the wasm build + telemetry SPA | The reduced web tier actually boots | weekly, when web tier exists |
+
+Rules: e2e tests assert **observable behaviour** (state hash, telemetry values, goal predicates),
+never internals; every e2e failure must decompose to a pyramid layer below — a failure that can
+only be seen at e2e level means a missing property/unit test, and writing it is part of the fix.
+
+### 8.6 Code-quality gates (CRAP, complexity, redundancy)
+
+Quality is enforced by tooling that fails the build, not by discipline. Budgets are per-function
+unless stated; exemptions require a `// lint-allow: <reason>` comment naming this section.
+
+**Complexity budgets** — `[workspace.lints.clippy]` + `xtask lint-quality`:
+- `cognitive_complexity` ≤ **15** warn / ≤ 25 error; `type_complexity` ≤ 10⁴; `too_many_lines`
+  ≤ 100 warn / ≤ 200 error; `too_many_arguments` ≤ 8
+- **CRAP score** (`rust-code-analysis` via `xtask lint-quality`, weekly): cyclomatic ≤ 10 with
+  coverage ≥ 80% ⇒ CRAP ≤ ~30 threshold per function; report-only for the first quarter, then a gate
+- `forbid(unsafe_code)` in `csp-core`, `csp-sim`, `csp-phys`, `csp-data`, `csp-script` — the
+  determinism domain takes zero unsafe (wgpu-facing crates may use `deny`, not `forbid`)
+- `cargo-geiger` report in the weekly quality job; new `unsafe` anywhere requires a comment
+  justifying it at the call site
+
+**Redundancy & dead code:**
+- `dead_code`/unused imports/variables: already errors via `clippy -D warnings` — keep it so
+- **`cargo-machete`** (unused deps) weekly + on dep-touching PRs; `cargo-udeps` nightly (slower,
+  catches what machete misses)
+- `cargo doc` built with `RUSTDOCFLAGS="-D warnings"` — broken intra-doc links fail
+- `cargo dup`-style duplication is not a Rust gate; instead: `xtask lint-quality` fails on any
+  function >200 lines (the usual duplication smell) and the weekly quality job reports
+  `tokei` duplication stats for human review
+- `missing_docs` lint = warn on all public API in `csp-*` crates (docs are the API contract)
+
+**Coverage (cargo-llvm-cov):**
+- Floors: `csp-core` ≥ **90%** lines, `csp-sim`/`csp-phys`/`csp-data` ≥ **80%**, `csp-view` ≥ 60%.
+  `csp-app`, `csp-render`, `csp-ui`, `csp-server` — no floor (platform glue; e2e owns them).
+- **Ratchet rule**: a PR may not *lower* any floored crate's coverage by >0.5 pp. The floor file
+  (`ci/coverage-floors.json`) bumps upward only.
+- Coverage is a tripwire, not a goal: 100% is not a target; uncovered *branches* in the
+  determinism domain are what matter — `llvm-cov` region/branch report reviewed in the weekly job.
+
+**Mutation testing (cargo-mutants):**
+- Weekly on `csp-core`, `csp-sim`, `csp-phys`, `csp-data`, capped at 45 min. Missed mutants get a
+  tracked issue or an `#[allow]`-equivalent with justification; the *trend* matters more than the score.
+- Mutants are how we know the property tests actually bite — a suite that kills nothing is decoration.
+
+**Static policy:**
+- `[workspace.lints.rust]` + `[workspace.lints.clippy]` shared across crates; per-crate overrides
+  only for the clippy.toml determinism lints (already scoped)
+- `cargo fmt --check` per commit (already); `cargo clippy --workspace -- -D warnings` per commit (already)
+- `cargo-semver-checks` on crates that publish APIs (`csp-script` post-M9c only)
+- MSRV: `cargo msrv verify` weekly against `rust-version = "1.95"` in workspace.package
+
+### 8.7 Rules of engagement (process, not tooling)
+
+1. **No code lands without its tests.** Every milestone exit criterion implies the tests proving it
+   were written in the same change. "Tests later" is how the §8.1 pyramid dies.
+2. **Fix the root, not the test.** A red golden/property test is a bug until proven a deliberate
+   behavioural change — deliberate changes bless via `xtask bless-goldens` (§8.4), nothing else.
+3. **Flaky policy:** a test that fails nondeterministically gets *one* retry in CI, then it's
+   quarantined to a `#[ignore]`d test + a tracking issue within 24 h. Quarantined determinism tests
+   are P0 — a flaky determinism test is an actual determinism bug until disproven.
+4. **Benchmarks:** `criterion` for hot paths (sim step, Kepler solve, weld Stage-1, voxelize,
+   state-hash); `cargo bench` results committed to `docs/perf/` on REF-A, regression gate >10%.
+5. **Test data is code:** fixtures under `data/test-fixtures/` version with schema_version like
+   everything else; never generated on the fly in a way that can drift between CI and local.
+6. **The quality job is weekly, not per-commit** (mutants, udeps, code-analysis, msrv): per-commit
+   stays <5 min or it will be bypassed; slow gates live where their runtime is acceptable.
 
 ---
 

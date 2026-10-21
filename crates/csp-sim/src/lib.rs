@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Headless authoritative simulation (PLAN §2.2).
 //!
 //! Plain owned data — no ECS, no wgpu, no winit, no rand facade, no `std::time`.

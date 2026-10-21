@@ -12,3 +12,6 @@ bevy_ecs = { workspace = true, features = ["std"] }
 # PLAN §2.5: multi_threaded executor is a NATIVE-only feature (fixup 10).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 bevy_ecs = { workspace = true, features = ["std", "multi_threaded", "async_executor"] }
+
+[lints]
+workspace = true

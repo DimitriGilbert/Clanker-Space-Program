@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Core sim primitives: integer sim time, deterministic RNG streams, canonical
 //! state hashing.
 //!
