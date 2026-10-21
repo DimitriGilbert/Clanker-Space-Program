@@ -27,10 +27,14 @@ jobs:
       - name: test (native)
         run: cargo test --workspace
 
+      # wasm gate: exclude native-only crates (csp-server, csp-bench) so the
+      # gate survives axum/tokio landing, and assert wasm purity positively.
       - name: check (wasm32) — never merge a broken web build
-        run: cargo check --workspace --target wasm32-unknown-unknown
-
-      - name: dependency rules — csp-sim stays headless (PLAN §2.1)
         run: |
-          ! cargo tree -p csp-sim 2>/dev/null | grep -E "wgpu|winit|bevy|egui|rand |rayon" \
-            && ! cargo tree -p csp-render 2>/dev/null | grep -E "csp-sim|csp-view"
+          cargo check --workspace --exclude csp-server --exclude csp-bench \
+            --target wasm32-unknown-unknown
+
+      - name: dependency rules + wasm purity + attribution
+        run: |
+          cargo run -p xtask -- lint-deps
+          cargo run -p xtask -- lint-attribution

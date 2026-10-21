@@ -1,9 +1,11 @@
-//! Core sim primitives: integer sim time, deterministic RNG streams.
+//! Core sim primitives: integer sim time, deterministic RNG streams, canonical
+//! state hashing.
 //!
 //! Rules (PLAN §1.1, §2.3, §2.7):
 //! - No I/O, no wall clock, no `std::time`.
 //! - Sim time is an integer tick count — never an `f64` accumulator.
 //! - Any `f64` math that feeds sim state uses `libm` transcendentals only.
+//! - No `HashMap`/`HashSet` in anything that iterates into state or a hash.
 
 use rand_chacha::ChaCha8Rng;
 use rand_core::{Rng, SeedableRng};
@@ -34,7 +36,17 @@ impl SimTime {
     }
 }
 
-/// Named deterministic RNG streams (PLAN §2.7). No global RNG exists.
+// ---------------------------------------------------------------------------
+// Deterministic RNG streams (PLAN §2.7). No global RNG exists.
+// ---------------------------------------------------------------------------
+
+/// Version of the key-derivation scheme. Bumped if the KDF ever changes;
+/// recorded in the save header so old saves can be detected.
+pub const KDF_VERSION: u8 = 1;
+
+const KDF_CONTEXT: &str = "csp/rng-stream/v1";
+
+/// Named deterministic RNG streams.
 #[derive(Clone, Copy, Debug)]
 pub enum StreamTag {
     Reliability,
@@ -43,33 +55,125 @@ pub enum StreamTag {
     Generation,
 }
 
-/// Derive a deterministic ChaCha8 stream from
-/// `(save_seed, stream_tag, entity_id, counter)`.
-///
-/// Counters are part of the save: reloading and re-flying an event does not
-/// reroll it. Anti-save-scum by construction and required for replays.
-pub fn stream(save_seed: u64, tag: StreamTag, entity_id: u64, counter: u64) -> ChaCha8Rng {
-    // splitmix64-style word mixing — deterministic across platforms, unlike
-    // `Hash`/`DefaultHasher` whose output is not specified stable.
-    let mut x = 0x9E37_79B9_7F4A_7C15u64;
-    for w in [save_seed, tag as u64, entity_id, counter] {
-        x ^= w;
-        x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
-        x ^= x >> 33;
-    }
-    ChaCha8Rng::seed_from_u64(x)
+/// Full key for one deterministic draw (PLAN §2.7). `counter` indexes into the
+/// stream — reseeding per counter, never advancing shared stream position, so
+/// a stored counter replays the exact draw.
+#[derive(Clone, Copy, Debug)]
+pub struct StreamKey {
+    pub tag: StreamTag,
+    pub entity: u64,
+    pub counter: u64,
+}
+
+/// Derive the full 32-byte ChaCha key via BLAKE3 derive-key mode.
+/// Own KDF — never `seed_from_u64`, whose output is a rand_core
+/// implementation detail and not value-stable across versions.
+pub fn derive_key(save_seed: u64, key: StreamKey) -> [u8; 32] {
+    let mut h = blake3::Hasher::new_derive_key(KDF_CONTEXT);
+    h.update(&KDF_VERSION.to_le_bytes());
+    h.update(&save_seed.to_le_bytes());
+    h.update(&(key.tag as u64).to_le_bytes());
+    h.update(&key.entity.to_le_bytes());
+    h.update(&key.counter.to_le_bytes());
+    *h.finalize().as_bytes()
+}
+
+/// A deterministic ChaCha8 stream for one `StreamKey`.
+pub fn stream(save_seed: u64, key: StreamKey) -> ChaCha8Rng {
+    ChaCha8Rng::from_seed(derive_key(save_seed, key))
 }
 
 /// Convenience: draw a uniform `f64` in `[0, 1)` from a derived stream.
-pub fn uniform(save_seed: u64, tag: StreamTag, entity_id: u64, counter: u64) -> f64 {
-    let mut rng = stream(save_seed, tag, entity_id, counter);
-    // 53-bit uniform — same construction as rand::random::<f64>.
+pub fn uniform(save_seed: u64, key: StreamKey) -> f64 {
+    let mut rng = stream(save_seed, key);
     (rng.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+}
+
+// ---------------------------------------------------------------------------
+// Canonical state hashing (PLAN §7.1). Hand-written visitor — never serde.
+// ---------------------------------------------------------------------------
+
+/// Version of the hash canonicalization scheme. Recorded next to every golden.
+pub const HASH_SCHEMA_VERSION: u32 = 1;
+
+/// Canonical byte-stream hasher over BLAKE3 (PLAN §7.1).
+///
+/// Rules: dense arena index order only; all floats via `to_bits()` with
+/// `-0.0` normalized to `0.0`; NaN is forbidden — `f64` panics in debug on NaN.
+pub struct StateHasher(blake3::Hasher);
+
+impl StateHasher {
+    pub fn new() -> Self {
+        Self(blake3::Hasher::new())
+    }
+
+    pub fn u64(&mut self, v: u64) -> &mut Self {
+        self.0.update(&v.to_le_bytes());
+        self
+    }
+    pub fn i64(&mut self, v: i64) -> &mut Self {
+        self.0.update(&v.to_le_bytes());
+        self
+    }
+    pub fn u32(&mut self, v: u32) -> &mut Self {
+        self.0.update(&v.to_le_bytes());
+        self
+    }
+    pub fn bool(&mut self, v: bool) -> &mut Self {
+        self.0.update(&[v as u8]);
+        self
+    }
+    /// `to_bits`, `-0.0 -> 0.0`; NaN panics (debug only — NaN in state is a bug).
+    pub fn f64(&mut self, v: f64) -> &mut Self {
+        debug_assert!(!v.is_nan(), "NaN must never enter sim state");
+        let v = if v == 0.0 { 0.0 } else { v };
+        self.0.update(&v.to_bits().to_le_bytes());
+        self
+    }
+    pub fn bytes(&mut self, v: &[u8]) -> &mut Self {
+        self.u64(v.len() as u64);
+        self.0.update(v);
+        self
+    }
+    pub fn str(&mut self, v: &str) -> &mut Self {
+        self.bytes(v.as_bytes())
+    }
+    /// Some(T) hashes tag 1 + T; None hashes tag 0. Canonical Option.
+    pub fn opt<T>(&mut self, v: &Option<T>, f: impl Fn(&mut Self, &T)) -> &mut Self {
+        match v {
+            Some(x) => {
+                self.u32(1);
+                f(self, x);
+            }
+            None => {
+                self.u32(0);
+            }
+        }
+        self
+    }
+
+    pub fn finish(&self) -> [u8; 32] {
+        *self.0.finalize().as_bytes()
+    }
+}
+
+impl Default for StateHasher {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key(tag: StreamTag) -> StreamKey {
+        StreamKey {
+            tag,
+            entity: 7,
+            counter: 0,
+        }
+    }
 
     #[test]
     fn time_is_integral() {
@@ -81,13 +185,41 @@ mod tests {
 
     #[test]
     fn streams_are_deterministic_and_distinct() {
-        let a = uniform(42, StreamTag::Reliability, 7, 0);
-        let b = uniform(42, StreamTag::Reliability, 7, 0);
-        let c = uniform(42, StreamTag::Ignition, 7, 0);
-        let d = uniform(43, StreamTag::Reliability, 7, 0);
+        let a = uniform(42, key(StreamTag::Reliability));
+        let b = uniform(42, key(StreamTag::Reliability));
+        let c = uniform(42, key(StreamTag::Ignition));
+        let d = uniform(43, key(StreamTag::Reliability));
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert_ne!(a, d);
         assert!((0.0..1.0).contains(&a));
     }
+
+    /// Hard-coded expected KDF output: a dependency or KDF change fails loudly.
+    #[test]
+    fn kdf_golden() {
+        let k = derive_key(
+            42,
+            StreamKey {
+                tag: StreamTag::Reliability,
+                entity: 7,
+                counter: 0,
+            },
+        );
+        let expect: [u8; 8] = EXPECTED_KDF_PREFIX;
+        assert_eq!(&k[..8], &expect);
+    }
+
+    #[test]
+    fn hash_canonicalizes_floats() {
+        let mut a = StateHasher::new();
+        let mut b = StateHasher::new();
+        a.f64(-0.0);
+        b.f64(0.0);
+        assert_eq!(a.finish(), b.finish());
+    }
 }
+
+// golden prefix for kdf_golden — filled by first run, then frozen.
+#[cfg(test)]
+const EXPECTED_KDF_PREFIX: [u8; 8] = [185, 230, 217, 66, 114, 51, 125, 180];

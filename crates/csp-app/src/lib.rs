@@ -109,9 +109,11 @@ impl App {
         let dt_wall = now.duration_since(self.last_frame).as_secs_f64();
         self.last_frame = now;
 
+        // PLAN §2.5 ordering: Input -> Nx SimStep -> Sync -> Presentation ->
+        // UiBuild (egui, below) -> RenderExtract -> render.
         let ticks = self.wall_to_ticks(dt_wall);
+        self.view.begin_frame();
         self.view.sim_ticks(ticks);
-        self.view.frame();
 
         let (window, gpu, egui_state, egui_renderer) = match (
             &self.window,
@@ -128,7 +130,7 @@ impl App {
         let full_output = self.egui_ctx.run_ui(input, |ctx| {
             egui::Window::new("CSP — M0 scaffold").show(ctx, |ui| {
                 let stats = self.view.world.resource::<FrameStats>();
-                let clock = self.view.clock();
+                let clock = self.view.sim.clock();
                 ui.label(format!("adapter: {}", gpu.adapter.get_info().name));
                 ui.label(format!("backend: {:?}", gpu.adapter.get_info().backend));
                 ui.separator();
@@ -144,6 +146,8 @@ impl App {
         let tris = self
             .egui_ctx
             .tessellate(full_output.shapes, full_output.pixels_per_point);
+
+        self.view.end_frame();
 
         let mut frame = match gpu.begin_frame() {
             csp_render::FrameResult::Ok(f) => f,

@@ -1,10 +1,48 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+members = ["crates/*", "xtask"]
 
 [workspace.package]
 edition = "2024"
-license = "MIT OR Apache-2.0"
+rust-version = "1.95"
+# NOTE: license is per-crate (PLAN §1.2). Engine libs = MIT OR Apache-2.0;
+# the shipped binary csp-app, data/ and apps/ = LICENSE-GAME (source-available).
+
+# Shared dependency versions. Exact `=` pins for everything in the
+# determinism domain (T3: hashes are version-sensitive); caret elsewhere.
+[workspace.dependencies]
+csp-core = { path = "crates/csp-core" }
+csp-data = { path = "crates/csp-data" }
+csp-sim = { path = "crates/csp-sim" }
+csp-phys = { path = "crates/csp-phys" }
+csp-view = { path = "crates/csp-view" }
+csp-render = { path = "crates/csp-render" }
+csp-ui = { path = "crates/csp-ui" }
+csp-app = { path = "crates/csp-app" }
+csp-script = { path = "crates/csp-script" }
+csp-ai = { path = "crates/csp-ai" }
+csp-server = { path = "crates/csp-server" }
+csp-bench = { path = "crates/csp-bench" }
+
+# determinism domain — exact pins
+blake3 = "=1.8.3"
+rand_chacha = "=0.10.0"
+rand_core = "=0.10.1"
+libm = "=0.2.16"
+bincode = { version = "=2.0.1" }
+ciborium = "=0.2.2"
+miniz_oxide = "=0.9.8"
+
+# shared non-deterministic deps
+bevy_ecs = { version = "0.20.0", default-features = false }
+wgpu = { version = "30", default-features = true }
+egui = "0.37.0"
+egui-wgpu = "0.37.0"
+egui-winit = { version = "0.37.0", default-features = false }
+winit = "0.30.13"
+pollster = "1.0.1"
+web-time = "1.1.0"
+serde = "1"
 
 [profile.release]
 lto = "thin"

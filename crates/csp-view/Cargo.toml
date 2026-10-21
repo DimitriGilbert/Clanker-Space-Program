@@ -2,8 +2,13 @@
 name = "csp-view"
 version = "0.0.0"
 edition.workspace = true
-license.workspace = true
+license = "MIT OR Apache-2.0"
 
 [dependencies]
-bevy_ecs = { version = "0.20.0", default-features = false, features = ["std"] }
-csp-core = { version = "0.0.0", path = "../csp-core" }
+csp-core = { workspace = true }
+csp-sim = { workspace = true }
+bevy_ecs = { workspace = true, features = ["std"] }
+
+# PLAN §2.5: multi_threaded executor is a NATIVE-only feature (fixup 10).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+bevy_ecs = { workspace = true, features = ["std", "multi_threaded", "async_executor"] }

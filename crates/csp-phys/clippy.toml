@@ -1,0 +1,15 @@
+# Determinism-domain lints (PLAN §2.1, §2.7). Applies to THIS crate only.
+# f64 transcendentals are not bit-identical across platforms — libm only.
+disallowed-methods = [
+    { path = "f64::sin" }, { path = "f64::cos" }, { path = "f64::tan" },
+    { path = "f64::asin" }, { path = "f64::acos" }, { path = "f64::atan" },
+    { path = "f64::atan2" }, { path = "f64::exp" }, { path = "f64::ln" },
+    { path = "f64::powf" }, { path = "f64::powi" }, { path = "f64::sqrt" },
+    { path = "f64::cbrt" }, { path = "f64::hypot" },
+]
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "iteration order is nondeterministic; use BTreeMap" },
+    { path = "std::collections::HashSet", reason = "iteration order is nondeterministic; use BTreeSet" },
+    { path = "std::time::Instant", reason = "no wall clock in sim" },
+    { path = "std::time::SystemTime", reason = "no wall clock in sim" },
+]
