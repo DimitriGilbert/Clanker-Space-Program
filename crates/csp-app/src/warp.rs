@@ -193,6 +193,28 @@ impl WarpController {
         target.max(current_tick)
     }
 
+    /// §2.6.5 `Clamping` / §2.6.2 rails-refusal demotion: drop `effective`
+    /// to ladder index `rung` NOW — the §2.6.3 hysteresis deliberately does
+    /// not apply downward (a fired Clamping event means the player could
+    /// already be overshooting). Any in-flight promotion streak is cleared.
+    /// `requested` is untouched: a one-shot event should not rewrite player
+    /// intent (re-promotion still waits the hysteresis), and a persistent
+    /// refusal re-demotes every frame it is checked, so it cannot
+    /// oscillate either.
+    ///
+    /// Returns `Some(multiplier)` when the emitted level changed → the
+    /// caller logs `SimCommand::SetWarp` so the demotion is replayable.
+    pub fn demote(&mut self, rung: usize) -> Option<u32> {
+        let rung = rung.min(WARP_LADDER.len() - 1);
+        if rung >= self.effective {
+            return None;
+        }
+        self.effective = rung;
+        self.promote_streak = 0;
+        self.promote_candidate = None;
+        Some(WARP_LADDER[rung] as u32)
+    }
+
     /// The emitted multiplier — `WARP_LADDER[effective]`.
     pub fn multiplier(&self) -> u64 {
         WARP_LADDER[self.effective]
@@ -320,5 +342,29 @@ mod tests {
         }
         // scaled = 999_999_960 + 60×166_666_660 ns → 703.999… ticks → 703.
         assert_eq!(t, 703);
+    }
+
+    /// §2.6.5 Clamping demotion: drops `effective` immediately, keeps
+    /// `requested`, and re-promotion still waits the §2.6.3 hysteresis.
+    #[test]
+    fn demote_drops_effective_now_and_repromotes_via_hysteresis() {
+        let mut c = WarpController::new();
+        c.request_step(6); // request ×10⁵
+        for _ in 0..=PROMOTE_FRAMES {
+            c.decide();
+        }
+        assert_eq!(c.multiplier(), 100_000);
+        // A Clamping event fired → demote to ×1, returns the new level.
+        assert_eq!(c.demote(0), Some(1));
+        assert_eq!(c.multiplier(), 1);
+        assert_eq!(c.requested_multiplier(), 100_000); // intent preserved
+        // No second event: nothing to emit.
+        assert_eq!(c.demote(0), None);
+        // Re-promotion needs the full 30-frame margined window again.
+        assert_eq!(c.decide(), None);
+        for _ in 0..PROMOTE_FRAMES {
+            c.decide();
+        }
+        assert_eq!(c.multiplier(), 100_000);
     }
 }

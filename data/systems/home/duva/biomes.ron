@@ -1,0 +1,12 @@
+// Duva biome legend (PLAN §3.0.1) — hand-authored fiction.
+// Thin CO2 atmosphere: polar ice, an equatorial dune sea, cratered
+// highlands, and one great impact basin.
+(
+    schema_version: 1,
+    entries: [
+        (index: 0, id: "duva.polar_ice", name: "biome.duva.polar_ice"),
+        (index: 1, id: "duva.dunes", name: "biome.duva.dunes"),
+        (index: 2, id: "duva.cratered_highlands", name: "biome.duva.cratered_highlands"),
+        (index: 3, id: "duva.impact_basin", name: "biome.duva.impact_basin"),
+    ],
+)

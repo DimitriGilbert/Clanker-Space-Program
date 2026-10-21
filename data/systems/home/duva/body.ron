@@ -1,0 +1,44 @@
+// Duva — the neighbouring planet (PLAN §3.0). Hand-authored fiction.
+// Slightly eccentric and inclined; thin atmosphere.
+//
+// `inclination_rad` = 0.060° = 0.0010471975511965976 rad.
+// `orbit.period_s` stores the closed form 2π·sqrt(a³/μ_solen); the
+// sheet's 1.730e7 s is its 4-significant-figure display.
+(
+    schema_version: 1,
+    id: "duva",
+    display_name: "body.duva.name",
+    parent: Some("solen"),
+    radius_m: 3.200e5,
+    mu_m3_per_s2: 3.0137e11,
+    soi_m: Some(4.790e7),
+    rotation_period_s: Some(65518.0),
+    tilt_rad: 0.0,
+    orbit: Some((
+        semi_major_axis_m: 2.070e10,
+        eccentricity: 0.051,
+        inclination_rad: 0.0010471975511965976, // 0.060°
+        ascending_node_rad: 0.0,
+        arg_periapsis_rad: 0.0,
+        mean_anomaly_epoch_rad: 0.0,
+        period_s: 17282875.60361972, // = 2π·sqrt(2.070e10³ / 1.1723e18)
+    )),
+    atmosphere: Some((
+        // "Thin" (§3.0): ~1/15 Terrin sea-level pressure.
+        sea_level_pressure_pa: 6755.0,
+        scale_height_m: 3000.0,
+        top_m: 50000.0,
+        molar_mass_kg_per_mol: 0.0434, // CO2-dominated
+        heat_capacity_ratio: 1.29,
+        temperature_knots: [
+            (altitude_m: 0.0, temperature_k: 230.0),
+            (altitude_m: 25000.0, temperature_k: 195.0),
+            (altitude_m: 50000.0, temperature_k: 172.0),
+        ],
+    )),
+    ocean: None,
+    terrain: (noise_seed: 603, heightmap: None),
+    biome_map: Some((png: "biomes.png", legend: "biomes.ron")),
+    surface_resources: [],
+    insolation_w_m2: Some(587.0),
+)

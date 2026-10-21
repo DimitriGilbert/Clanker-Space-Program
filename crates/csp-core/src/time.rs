@@ -1,5 +1,7 @@
 //! The integer sim clock (PLAN §2.3). Never an `f64` accumulator.
 
+use serde::{Deserialize, Serialize};
+
 use crate::SimError;
 
 /// Sim tick rate. The physics dt is immutably `1/TICK_HZ` seconds for the
@@ -8,7 +10,10 @@ pub const TICK_HZ: u64 = 64;
 
 /// Simulation time as an integer tick count (PLAN §2.3). Ordering and
 /// equality are total. Epoch 0 = game start; UT seconds = ticks / `TICK_HZ`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+/// `serde(transparent)` keeps the wire spelling a bare `u64` (§7.2/
+/// §7.6); serialization never feeds the §7.1 hash.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct SimTime(pub u64);
 
 impl SimTime {

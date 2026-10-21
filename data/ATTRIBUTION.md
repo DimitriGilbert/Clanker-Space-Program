@@ -15,7 +15,12 @@
 # compound suffixes must be spelled out in full (`.ron.disabled`, not
 # `.ron`):
 # authored-extensions: .ron .md .ron.disabled .txt .json .bin
-# authored-names: .gitkeep LICENSE ATTRIBUTION.md
+# authored-names: .gitkeep LICENSE ATTRIBUTION.md biomes.png
+#
+# `biomes.png` is declared authored by NAME (§3.0.1: biome maps are
+# hand-authored fiction, generated reproducibly by
+# `cargo run -p xtask --bin gen_biome_maps`). Other PNGs (textures etc.)
+# still need attribution rows.
 #
 # Every other line in this file is either a '#' comment like these, or a
 # 4-field attribution row. Rows belong below:

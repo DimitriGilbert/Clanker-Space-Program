@@ -19,8 +19,11 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use std::collections::BTreeMap;
+
 use csp_core::{HASH_SCHEMA_VERSION, KDF_VERSION, SimError};
 use csp_data::DATA_HASH_VERSION;
+use csp_sim::orbit::PatchedConics;
 use csp_sim::{CommandKey, SimCommand, World, WorldSnapshot};
 use serde::{Deserialize, Serialize};
 
@@ -585,7 +588,14 @@ pub fn record(recipe: &ScenarioRecipe, fixture_dir: &Path) -> Result<RecordedGol
 /// reconstruction that stops anywhere else fails
 /// [`ReplayError::ClockMismatch`], before the hash comparison.
 pub fn replay(artifact: &Replay) -> Result<[u8; 32], ReplayError> {
-    let mut world = World::restore(artifact.initial_snapshot.clone());
+    // The orbit model is data-derived (§7.3) and not part of the artifact:
+    // the M1 scenarios record against an empty model, so restore gets an
+    // empty one — a scenario with vessels must rebuild the model from its
+    // frozen fixture the same way its recipe's `initial` does.
+    let mut world = World::restore(
+        PatchedConics::new(BTreeMap::new()),
+        artifact.initial_snapshot.clone(),
+    )?;
     let log = &artifact.command_log;
     let mut i = 0;
     while i < log.len() {
@@ -607,7 +617,7 @@ pub fn replay(artifact: &Replay) -> Result<[u8; 32], ReplayError> {
             if let SimCommand::AdvanceTo(t) = command {
                 target = target.max(*t);
             }
-            world.enqueue(key.source_class, key.source_id, *command);
+            world.enqueue(key.source_class, key.source_id, command.clone());
             j += 1;
         }
         advance_to(&mut world, target)?;
@@ -638,7 +648,15 @@ fn advance_to(world: &mut World, target: u64) -> Result<(), ReplayError> {
     while world.clock().ticks() < target {
         let before = world.clock().ticks();
         let report = world.step_frame(target)?;
-        if report.reached_tick <= before {
+        // A deferred over-ceiling event batch (§2.6.5's per-batch ceiling)
+        // can legitimately return zero-advance frames while flushing the
+        // tail — that IS progress. A stall is literally nothing happening.
+        if report.reached_tick <= before
+            && report.events_processed == 0
+            && report.commands_applied == 0
+            && report.rejected.is_empty()
+            && report.degraded.is_empty()
+        {
             return Err(ReplayError::AdvanceStalled {
                 target,
                 reached: report.reached_tick,
@@ -987,7 +1005,10 @@ mod tests {
     fn same_tick_payload_swap_is_hash_mismatch() {
         let golden = record(scenarios::find("trivial").unwrap(), &trivial_dir()).unwrap();
         let mut artifact = golden.artifact.clone();
-        let (a, b) = (artifact.command_log[1].1, artifact.command_log[2].1);
+        let (a, b) = (
+            artifact.command_log[1].1.clone(),
+            artifact.command_log[2].1.clone(),
+        );
         artifact.command_log[1].1 = b;
         artifact.command_log[2].1 = a;
         assert!(matches!(
@@ -1122,6 +1143,20 @@ mod tests {
         assert!(fp.parry3d_f64.is_none());
     }
 
+    /// §8.3's "ALL tuning lives in balance.ron" made checkable:
+    /// `csp_sim::DEFAULT_MAX_EVENTS_PER_FRAME` is a documented MIRROR of
+    /// the loaded file — this pins the mirror to the real value so the
+    /// two can never drift silently.
+    #[test]
+    fn balance_ron_mirrors_sim_event_budget() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/balance.ron");
+        let b = csp_data::load_balance(&path).unwrap();
+        assert_eq!(
+            b.advance_to_max_events_per_frame,
+            csp_sim::DEFAULT_MAX_EVENTS_PER_FRAME
+        );
+    }
+
     /// An entry stamped at a tick the log has already moved past is
     /// rejected — the log order is ground truth, the driver never reorders.
     #[test]
@@ -1132,7 +1167,7 @@ mod tests {
         // Append a copy of the tick-0 entry after the tick-501 group: by
         // then the clock stands at 1000, so the entry's stamp is
         // unreachable.
-        let entry = artifact.command_log[0];
+        let entry = artifact.command_log[0].clone();
         artifact.command_log.push(entry);
         assert!(matches!(
             replay(&artifact),

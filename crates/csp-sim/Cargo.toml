@@ -6,6 +6,12 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 csp-core = { workspace = true }
+# §2.1 allowlist: the orbit layer reuses csp-data's `BodyId`/`KeplerElements`
+# (the §3.0 schema types) rather than redeclaring them sim-side.
+csp-data = { workspace = true }
+# §2.7: libm-only transcendentals — every sin/cos/atan2/sqrt in the orbit
+# layer goes through it (crate clippy.toml bans the f64 methods).
+libm = { workspace = true }
 # PLAN §2.1 allow-lists serde for csp-sim: the §7.6 replay artifact serializes
 # command types via bincode. Serialization never feeds the §7.1 state hash —
 # that is produced by the StateHasher visitor, so serde field order is free.

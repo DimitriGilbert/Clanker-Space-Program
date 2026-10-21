@@ -545,7 +545,20 @@ feature becomes unusable at exactly the scale it exists for.
 **Back-pressure (the real warp limiter).** At ×10⁵ a frame covers ~18 sim-minutes, so any subsystem
 with a sub-18-minute characteristic period generates ≥1 event per frame per object. The budget is
 therefore stated in **events, not milliseconds**:
-- `advance_to` processes at most **2000 events per frame** (`balance.ron`).
+- `advance_to` processes at most **2000 events per frame** (`balance.ron`), checked **between
+  same-tick batches** — the loop stops only at a tick boundary. A single tick's due batch is
+  **atomic against the budget**: "fire ALL events at `t_next`" is verbatim spec, and a half-fired
+  tick left in the heap is exactly the corrupt mid-state back-pressure exists to avoid.
+- The atomic unit is itself bounded: one tick's batch fires in chunks of at most **1024 events
+  per loop iteration**. A larger same-tick batch *defers its tail* — the remaining events stay in
+  the heap at the clock and later iterations flush them zero-advance (each still fires at its
+  due tick, in `(tick, seq)` order). While a deferred tail is pending, the tick's command drain
+  is postponed: a tick value still hosts exactly one drain, at the departing iteration once the
+  batch clears. A ceiling-exceeding batch does NOT by itself produce `partial` — a batch in
+  (1024, 2000] defers its tail without tripping the frame budget; `partial` and the warp demotion
+  come only from exceeding the *frame* budget (which a pathological pile-up reaches quickly, since
+  deferred batches keep counting events against it). The ceiling bounds the atomic work per
+  iteration, it never drops or re-ticks events.
 - On exceeding the budget it **returns early at the tick reached** with `partial: true`. Warp
   becomes self-limiting instead of frame-stalling.
 - Periodic subsystems must publish **coarse** events (next store-full, not next drill cycle).

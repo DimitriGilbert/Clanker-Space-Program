@@ -1,0 +1,12 @@
+// Rask biome legend (PLAN §3.0.1) — hand-authored fiction.
+// Airless, tidally locked moon: dark maria toward Terrin, bright
+// highlands elsewhere, cold-trap deposits at the poles.
+(
+    schema_version: 1,
+    entries: [
+        (index: 0, id: "rask.maria", name: "biome.rask.maria"),
+        (index: 1, id: "rask.highlands", name: "biome.rask.highlands"),
+        (index: 2, id: "rask.polar_deposits", name: "biome.rask.polar_deposits"),
+        (index: 3, id: "rask.crater_fields", name: "biome.rask.crater_fields"),
+    ],
+)

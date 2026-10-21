@@ -1,7 +1,13 @@
+#![forbid(unsafe_code)]
+
 //! wgpu device/surface ownership and frame lifecycle.
 //!
 //! Rendering happens in f32 relative to the active camera — the sim keeps
 //! f64 world positions, this crate never sees them.
+
+/// The M1 map-view pass (PLAN §5.1 R0): unlit orbit polylines and markers
+/// drawn from a `csp-view`-built [`map::MapPacket`].
+pub mod map;
 
 /// Everything needed to render frames into a window surface.
 pub struct Gpu {

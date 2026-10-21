@@ -16,10 +16,18 @@ use bevy_ecs::schedule::SingleThreadedExecutor;
 use csp_core::{SimError, SimTime};
 use csp_sim::World as SimWorld;
 
+/// The M1 map view (PLAN §5.1 R0 + the M1 exit row): mode/camera state,
+/// orbit polylines, markers, and the `csp_render::map::MapPacket` the
+/// `RenderExtract` schedule produces. Session state only — the sim is
+/// read through `View::end_frame` staging, never by systems (§2.5).
+pub mod map;
+
 /// `SimCommand` vocabulary, re-exported so `csp-app` can produce commands
 /// without depending on `csp-sim` directly — §2.1's rule that `csp-view` is
 /// the only crate depending on BOTH `csp-sim` and `csp-render` stays true.
-pub use csp_sim::{SimCommand, SourceClass};
+/// `AdvanceReport`/`EventClass` ride along because `csp-app` reads the
+/// fired-event classes for §2.6.5 Clamping demotion.
+pub use csp_sim::{AdvanceReport, EventClass, SimCommand, SourceClass};
 
 /// Integer sim clock mirrored for presentation — a COPY, written each frame
 /// by the `sync` schedule's [`sync_mirrors`] system (PLAN §2.2, Appendix A
@@ -150,6 +158,7 @@ fn build_ui(
     stats: Res<FrameStats>,
     warp: Res<WarpMirror>,
     session: Res<SessionMirror>,
+    map_ui: Res<map::MapUiData>,
     mut outbox: ResMut<UiOutbox>,
 ) {
     let input = csp_ui::DebugPanelInput {
@@ -175,6 +184,14 @@ fn build_ui(
     }
     egui.output = Some(ctx.run_ui(raw, |ctx| {
         csp_ui::debug_panel(ctx, &input, &mut panel_output);
+        if map_ui.mode == map::MapMode::Map {
+            csp_ui::map_overlay(
+                ctx,
+                &map_ui.focus_name,
+                map_ui.camera_distance_m,
+                &map_ui.labels,
+            );
+        }
     }));
     outbox.warp_step = panel_output.warp_step;
 }
@@ -221,8 +238,71 @@ pub struct View {
     ticks_last_frame: u64,
 }
 
+/// Startup construction failure — [`View::new`] loads `data/` (§8.3's
+/// "ALL tuning lives in data/"): a missing or invalid
+/// `balance.ron`/`systems/home/` file is a startup error, surfaced
+/// honestly, never a silent default (§2.13).
+#[derive(Debug)]
+pub enum ViewError {
+    /// A `data/` file failed to load.
+    Load(csp_data::LoadError),
+    /// The loaded body defs did not build a patched-conics model.
+    Sim(SimError),
+}
+
+impl std::fmt::Display for ViewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Load(e) => write!(f, "data/ startup load failed: {e}"),
+            Self::Sim(e) => write!(f, "data/ bodies rejected by the orbit model: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ViewError {}
+
+impl From<csp_data::LoadError> for ViewError {
+    fn from(e: csp_data::LoadError) -> Self {
+        Self::Load(e)
+    }
+}
+
 impl View {
-    pub fn new() -> Self {
+    /// The startup path: §8.3's "ALL tuning lives in `data/`" made real —
+    /// the §3.0 home system comes from `data/systems/home/` and the sim
+    /// world's §2.6.5 event budget from `data/balance.ron`'s
+    /// `advance_to_max_events_per_frame`. Missing/invalid data is a
+    /// [`ViewError`], never a silent default. `data/` is resolved relative
+    /// to the CWD, falling back to the repo layout relative to this
+    /// crate's manifest (so tests/tools work from any directory).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn new() -> Result<Self, ViewError> {
+        let root = data_root();
+        let sys = csp_data::load_system(&root.join("systems").join("home"))?;
+        let defs: Vec<csp_data::BodyDef> = sys.bodies.iter().map(|b| b.def.clone()).collect();
+        let orbits =
+            csp_sim::orbit::PatchedConics::from_body_defs(&defs).map_err(ViewError::Sim)?;
+        let balance = csp_data::load_balance(&root.join("balance.ron"))?;
+        Ok(Self::with_sim(SimWorld::with_config(
+            orbits,
+            balance.advance_to_max_events_per_frame,
+        )))
+    }
+
+    /// wasm: no `data/` filesystem exists at this milestone — the wasm
+    /// slice runs the trivial M1 world (empty system, mirror-pinned
+    /// default budget; `csp-bench`'s `balance_ron_mirrors_sim_event_budget`
+    /// test keeps that mirror honest). Native is the authoritative data
+    /// path; shipping `data/` inside the wasm bundle is a packaging
+    /// problem for a later milestone.
+    #[cfg(target_arch = "wasm32")]
+    pub fn new() -> Result<Self, ViewError> {
+        Ok(Self::with_sim(SimWorld::new()))
+    }
+
+    /// The shell around an explicit sim world — the headless/test
+    /// constructor (`new` is the data-loading startup path).
+    pub fn with_sim(sim: SimWorld) -> Self {
         let mut world = World::new();
         world.insert_resource(Clock::default());
         world.insert_resource(FrameStats::default());
@@ -232,26 +312,47 @@ impl View {
         world.insert_resource(UiOutbox::default());
         world.insert_resource(SyncInput::default());
 
+        // M1-D map resources (see map.rs): the body table/orbit model are
+        // data-derived constants; MapInput/MapSnapshot/… are session state.
+        let (body_table, map_input, orbit_model) = map::build_resources(&sim);
+        world.insert_resource(body_table);
+        world.insert_resource(map_input);
+        world.insert_resource(orbit_model);
+        world.insert_resource(map::MapInputEvents::default());
+        world.insert_resource(map::MapSyncInput::default());
+        world.insert_resource(map::MapSnapshot::default());
+        world.insert_resource(map::MapScene::default());
+        world.insert_resource(map::MapCameraF64::default());
+        world.insert_resource(map::MapUiData::default());
+        world.insert_resource(map::MapFrame::default());
+
         // §2.5: "SimStep and Sync use the single-threaded executor always."
+        let mut input = Schedule::default();
+        input.add_systems(map::apply_map_input);
         let mut sim_step = Schedule::default();
         sim_step.set_executor(SingleThreadedExecutor::new());
         let mut sync = Schedule::default();
         sync.set_executor(SingleThreadedExecutor::new());
-        sync.add_systems(sync_mirrors);
+        sync.add_systems((sync_mirrors, map::sync_map));
+
+        let mut presentation = Schedule::default();
+        presentation.add_systems(map::map_present);
+        let mut render_extract = Schedule::default();
+        render_extract.add_systems(map::extract_map);
 
         let mut ui_build = Schedule::default();
         ui_build.add_systems(build_ui);
 
         Self {
-            sim: SimWorld::new(),
+            sim,
             world,
             schedules: Schedules {
-                input: Schedule::default(),
+                input,
                 sim_step,
                 sync,
-                presentation: Schedule::default(),
+                presentation,
                 ui_build,
-                render_extract: Schedule::default(),
+                render_extract,
             },
             ticks_last_frame: 0,
         }
@@ -297,15 +398,18 @@ impl View {
     /// wall time and warp level; this layer never derives targets —
     /// §2.6.3 makes the sim's advance driven, never measured.
     ///
+    /// Returns the call's [`AdvanceReport`] — `csp-app` reads
+    /// `fired_events` for the §2.6.5 Clamping demotion.
+    ///
     /// Propagates `SimError` (§2.13): on `Fatal` the frame is abandoned and
     /// the caller decides how to surface it — the presentation layer does
     /// not swallow sim failures.
-    pub fn sim_step(&mut self, target_tick: u64) -> Result<(), SimError> {
+    pub fn sim_step(&mut self, target_tick: u64) -> Result<AdvanceReport, SimError> {
         let start = self.sim.clock().ticks();
         let report = self.sim.step_frame(target_tick)?;
         self.ticks_last_frame = report.reached_tick - start;
         self.schedules.sim_step.run(&mut self.world);
-        Ok(())
+        Ok(report)
     }
 
     /// Once per frame, after SimStep: Sync → Presentation → UiBuild →
@@ -318,6 +422,11 @@ impl View {
             warp_level: self.sim.warp_level(),
             ticks_last_frame: self.ticks_last_frame,
         });
+        // The map's sim reads are staged here too (§2.5: Sync/Presentation
+        // never read csp-sim) — vessel orbit states + the clock; positions
+        // and polylines derive from OrbitModelRes inside the schedules.
+        self.world
+            .insert_resource(map::capture_sync_input(&self.sim));
         self.ticks_last_frame = 0;
         self.schedules.sync.run(&mut self.world);
         self.schedules.presentation.run(&mut self.world);
@@ -380,11 +489,57 @@ impl View {
     pub fn take_ui_outbox(&mut self) -> UiOutbox {
         std::mem::take(&mut *self.world.resource_mut::<UiOutbox>())
     }
+
+    /// Queue a map-view event (key/mouse translated by `csp-app`) —
+    /// drained by the `Input` schedule's `apply_map_input` system next
+    /// frame (§2.5 #1: camera input is Input-stage work).
+    pub fn map_event(&mut self, event: map::MapKeyEvent) {
+        self.world
+            .resource_mut::<map::MapInputEvents>()
+            .pending
+            .push(event);
+    }
+
+    /// Per-frame viewport plumbing for the map camera/projection —
+    /// physical pixels (the packet's NDC offsets are px-exact).
+    pub fn set_map_viewport(&mut self, width_px: f64, height_px: f64) {
+        self.world.resource_mut::<map::MapInput>().viewport_px = (width_px, height_px);
+    }
+
+    /// Flight vs map — read by `csp-app` to gate map mouse input.
+    pub fn map_mode(&self) -> map::MapMode {
+        self.world.resource::<map::MapInput>().mode
+    }
+
+    /// Take this frame's map render packet — `None` in flight mode or
+    /// before the first solved camera. Consumed once by the painter,
+    /// like [`Self::take_ui_frame`].
+    pub fn take_map_packet(&mut self) -> Option<csp_render::map::MapPacket> {
+        self.world.resource_mut::<map::MapFrame>().0.take()
+    }
+}
+
+/// The data/ directory root: `./data` when it exists (the app runs from
+/// the repo root), else the repo layout relative to this crate's manifest
+/// so tests and tools resolve the same files from any CWD.
+#[cfg(not(target_arch = "wasm32"))]
+fn data_root() -> std::path::PathBuf {
+    for candidate in [
+        std::path::PathBuf::from("data"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data"),
+    ] {
+        if candidate.join("balance.ron").exists() {
+            return candidate;
+        }
+    }
+    std::path::PathBuf::from("data")
 }
 
 impl Default for View {
+    /// The headless default — no `data/` IO; [`View::new`] is the startup
+    /// path that loads it (and fails honestly on bad input).
     fn default() -> Self {
-        Self::new()
+        Self::with_sim(SimWorld::new())
     }
 }
 
@@ -402,7 +557,7 @@ mod tests {
     /// inside UiBuild.
     #[test]
     fn one_frame_mirrors_state_and_builds_ui() {
-        let mut view = View::new();
+        let mut view = View::default();
         // §2.6.3's producer pattern: SetWarp then AdvanceTo, one source.
         view.enqueue_command(SourceClass::Ui, 0, SimCommand::SetWarp(2));
         view.enqueue_command(SourceClass::Ui, 0, SimCommand::AdvanceTo(64));
@@ -435,7 +590,7 @@ mod tests {
     /// exactly once.
     #[test]
     fn ui_outbox_drains_for_next_frames_input() {
-        let mut view = View::new();
+        let mut view = View::default();
         *view.world.resource_mut::<UiOutbox>() = UiOutbox { warp_step: 1 };
         let drained = view.take_ui_outbox();
         assert_eq!(drained.warp_step, 1);
@@ -446,7 +601,7 @@ mod tests {
     /// unchanged clock — `ticks_last_frame` reports 0, not a stale count.
     #[test]
     fn zero_advance_frame_reports_zero_ticks() {
-        let mut view = View::new();
+        let mut view = View::default();
         view.sim_step(10).unwrap();
         view.end_frame();
         view.sim_step(10).unwrap(); // target already reached

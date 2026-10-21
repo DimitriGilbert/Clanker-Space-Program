@@ -4,6 +4,9 @@ version = "0.0.0"
 edition.workspace = true
 license = "MIT OR Apache-2.0"
 publish = false
+# `cargo run -p xtask -- <task>` must keep resolving to the lint harness
+# now that src/bin/gen_biome_maps.rs is a second binary.
+default-run = "xtask"
 
 [dependencies]
 # bless-goldens re-records scenarios through the harness itself rather than

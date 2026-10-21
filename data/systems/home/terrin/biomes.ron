@@ -1,0 +1,16 @@
+// Terrin biome legend (PLAN §3.0.1) — hand-authored fiction.
+// `index` is the palette index in biomes.png. IDs are stable strings:
+// science keys on (body, biome, situation), so these may change ONLY via
+// a deliberate data-set change (§3.0.1, §7.7 drift warning).
+(
+    schema_version: 1,
+    entries: [
+        (index: 0, id: "terrin.ocean", name: "biome.terrin.ocean"),
+        (index: 1, id: "terrin.grassland", name: "biome.terrin.grassland"),
+        (index: 2, id: "terrin.forest", name: "biome.terrin.forest"),
+        (index: 3, id: "terrin.desert", name: "biome.terrin.desert"),
+        (index: 4, id: "terrin.mountains", name: "biome.terrin.mountains"),
+        (index: 5, id: "terrin.tundra", name: "biome.terrin.tundra"),
+        (index: 6, id: "terrin.ice_caps", name: "biome.terrin.ice_caps"),
+    ],
+)

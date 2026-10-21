@@ -6,6 +6,9 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 wgpu = { workspace = true }
+# Vertex upload to wgpu buffers is typed as bytes; Pod derives keep the
+# map pipeline's vertex struct honest (plain repr(C) f32 data).
+bytemuck = { workspace = true }
 
 [lints]
 workspace = true

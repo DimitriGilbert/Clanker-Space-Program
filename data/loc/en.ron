@@ -1,6 +1,33 @@
 // English localization (PLAN §1.2: v1 is English-only; LocKey is
-// indirection into this file). M0 stub — real keys land with the first
-// UI string needing loc.
+// indirection into this file).
+//
+// `strings` maps LocKey text -> English display string. Key convention:
+//   system.<id>.<field>   — e.g. system.home.epoch_note
+//   body.<id>.name        — a body's display name
+//   biome.<body>.<biome>  — a biome's display name (matches the legend
+//                           entry's `name` LocKey in biomes.ron)
 (
     schema_version: 1,
+    strings: {
+        "system.home.epoch_note": "Epoch: sim-time 0. Bodies' mean anomalies are quoted at epoch; the sim-day is 21 600 s (Terrin rotation) and the sim-year 426 sim-days (Terrin orbital period).",
+        "body.solen.name": "Solen",
+        "body.terrin.name": "Terrin",
+        "body.rask.name": "Rask",
+        "body.duva.name": "Duva",
+        "biome.terrin.ocean": "Ocean",
+        "biome.terrin.grassland": "Grassland",
+        "biome.terrin.forest": "Forest",
+        "biome.terrin.desert": "Desert",
+        "biome.terrin.mountains": "Mountains",
+        "biome.terrin.tundra": "Tundra",
+        "biome.terrin.ice_caps": "Ice Caps",
+        "biome.rask.maria": "Maria",
+        "biome.rask.highlands": "Highlands",
+        "biome.rask.polar_deposits": "Polar Deposits",
+        "biome.rask.crater_fields": "Crater Fields",
+        "biome.duva.polar_ice": "Polar Ice",
+        "biome.duva.dunes": "Dunes",
+        "biome.duva.cratered_highlands": "Cratered Highlands",
+        "biome.duva.impact_basin": "Impact Basin",
+    },
 )

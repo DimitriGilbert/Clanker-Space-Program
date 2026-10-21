@@ -5,6 +5,24 @@ edition.workspace = true
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+# §3.x data defs are RON; the loader/validator needs nothing else from the
+# platform. libm only for transcendentals (§8.2 determinism lints) — the
+# period check uses libm::sqrt.
+serde = { workspace = true, features = ["derive"] }
+ron = { workspace = true }
+libm = { workspace = true }
+# The §3.1 data-set hash (data_set_hash) — same pinned construction as the
+# csp-bench fixture hash, different scope (see datahash module docs).
+blake3 = { workspace = true }
+
+[dev-dependencies]
+# Integration tests drive the loader/validator over the real data/ tree:
+# ron to parse en.ron, libm for the derived-check formulas (this crate's
+# clippy.toml bans f64::sqrt in test code too), blake3 for the empty-hash
+# comparison.
+ron = { workspace = true }
+libm = { workspace = true }
+blake3 = { workspace = true }
 
 [lints]
 workspace = true

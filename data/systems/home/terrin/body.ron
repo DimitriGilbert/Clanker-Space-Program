@@ -1,0 +1,50 @@
+// Terrin — the home world (PLAN §3.0). Hand-authored fiction.
+//
+// Derived checks pinned by tests (csp-data/tests/home_system.rs):
+//   surface escape  sqrt(2μ/R)          = 3 431 m/s ±0.1%
+//   75 km circular  sqrt(μ/(R+75 km))   = 2 287 m/s ±1%   ("home LEO")
+//
+// `orbit.period_s` stores the validator-pinned closed form
+// 2π·sqrt(a³/μ_solen); the sheet's 9.203e6 s (426 sim-days of 21 600 s)
+// is its 4-significant-figure display — the §3.0 validator checks the
+// authored value against the closed form to 1e-9 relative.
+(
+    schema_version: 1,
+    id: "terrin",
+    display_name: "body.terrin.name",
+    parent: Some("solen"),
+    radius_m: 6.000e5,
+    mu_m3_per_s2: 3.5316e12,
+    soi_m: Some(8.400e7),
+    rotation_period_s: Some(21600.0), // the sim-day (§3.0)
+    tilt_rad: 0.0,
+    orbit: Some((
+        semi_major_axis_m: 1.360e10,
+        eccentricity: 0.0,
+        inclination_rad: 0.0,
+        ascending_node_rad: 0.0,
+        arg_periapsis_rad: 0.0,
+        mean_anomaly_epoch_rad: 0.0,
+        period_s: 9203835.510438265, // = 2π·sqrt(1.360e10³ / 1.1723e18)
+    )),
+    atmosphere: Some((
+        // p(h) = p0·exp(-h/H) up to top_m, then a hard cut (§3.0).
+        sea_level_pressure_pa: 101325.0,
+        scale_height_m: 5600.0,
+        top_m: 70000.0,
+        molar_mass_kg_per_mol: 0.02897, // nitrogen-dominated
+        heat_capacity_ratio: 1.40,
+        temperature_knots: [
+            (altitude_m: 0.0, temperature_k: 288.15),
+            (altitude_m: 12000.0, temperature_k: 216.65),
+            (altitude_m: 40000.0, temperature_k: 250.35),
+            (altitude_m: 70000.0, temperature_k: 200.15),
+        ],
+    )),
+    // §3.0: "Ocean — yes (datum r = R)".
+    ocean: Some((datum_radius_m: 6.000e5)),
+    terrain: (noise_seed: 601, heightmap: None),
+    biome_map: Some((png: "biomes.png", legend: "biomes.ron")),
+    surface_resources: [],
+    insolation_w_m2: Some(1361.0),
+)

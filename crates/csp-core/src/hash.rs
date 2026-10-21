@@ -25,7 +25,12 @@ use crate::SimError;
 /// the determinism fingerprint (§7.1). Must be bumped **in the same commit**
 /// that regenerates goldens for a non-behavioural hash change, with the
 /// reason in the commit message — `xtask bless-goldens` refuses otherwise.
-pub const HASH_SCHEMA_VERSION: u32 = 1;
+///
+/// **Version 2** (M1-B): the `World` walk gained the §7.2-serialized
+/// event heap (in `(tick, seq)` order), `next_event_seq`, the vessel
+/// arena + `next_vessel_id`, the tracked-vessel opt-in set, and the
+/// event budget. Bumped in the same change as the trivial-golden rebless.
+pub const HASH_SCHEMA_VERSION: u32 = 2;
 
 /// Rule-7 sum types: the source of an enum's *declared* stable `u16`
 /// discriminant (PLAN §7.1 rule 7).

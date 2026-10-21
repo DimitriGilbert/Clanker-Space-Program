@@ -26,11 +26,14 @@ pollster = { workspace = true }
 web-time = { workspace = true }
 wgpu = { workspace = true }
 winit = { workspace = true }
+# `log` is the reporting channel for the sim's rejected/degraded
+# diagnostics (AdvanceReport) on every target — env_logger on native,
+# console_log on wasm.
+log = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = { workspace = true }
 console_log = { workspace = true }
-log = { workspace = true }
 wasm-bindgen = { workspace = true }
 wasm-bindgen-futures = { workspace = true }
 

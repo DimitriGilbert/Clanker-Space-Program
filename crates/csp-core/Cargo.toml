@@ -8,6 +8,12 @@ license = "MIT OR Apache-2.0"
 blake3 = { workspace = true }
 rand_chacha = { workspace = true }
 rand_core = { workspace = true }
+# §2.1 allowlist: save/replay serialization types (SimTime in OrbitState).
+# Serde output never feeds the §7.1 hash — that is the StateHasher's job.
+serde = { workspace = true, features = ["derive"] }
+# §2.1 allowlist: csp-core owns "f64 math (libm only)" — vec3.rs's norm and
+# all transcendentals downstream go through libm.
+libm = { workspace = true }
 
 [lints]
 workspace = true

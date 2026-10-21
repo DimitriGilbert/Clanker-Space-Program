@@ -7,11 +7,21 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 csp-core = { workspace = true }
 csp-sim = { workspace = true }
+# §8.3: balance.ron/system data files ARE the sim world's startup
+# configuration — `View::new` loads them (native).
+csp-data = { workspace = true }
 # The UiBuild schedule's systems call csp-ui's pure panel fns; egui types
 # ride presentation resources (RawInput in, FullOutput out — §2.5).
 csp-ui = { workspace = true }
+# §2.1: csp-view is the ONLY crate allowed to depend on both csp-sim and
+# csp-render — RenderExtract builds csp_render::map::MapPacket here.
+csp-render = { workspace = true }
 egui = { workspace = true }
 bevy_ecs = { workspace = true, features = ["std"] }
+# Degradation logging for the map extract path (a skipped orbit line is
+# a presentation fallback, §2.13's honest-channel class — warned, never
+# halted). No-op without a logger; wasm-safe.
+log = { workspace = true }
 
 # PLAN §2.5: multi_threaded executor is a NATIVE-only feature (fixup 10).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

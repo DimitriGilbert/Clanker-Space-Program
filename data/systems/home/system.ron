@@ -1,0 +1,13 @@
+// The home system (PLAN §3.0). Hand-authored fiction — every number is
+// frozen at M1; do not "improve" them.
+//
+// `bodies` is the manifest: each entry names a `<id>/body.ron` file in
+// this directory. `star` is the root every other body's parent chain
+// must reach.
+(
+    schema_version: 1,
+    id: "home",
+    star: "solen",
+    bodies: ["solen", "terrin", "rask", "duva"],
+    epoch_note: "system.home.epoch_note",
+)

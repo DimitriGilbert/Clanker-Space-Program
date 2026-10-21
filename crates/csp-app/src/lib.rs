@@ -24,14 +24,16 @@ use std::sync::Arc;
 
 use csp_core::SimError;
 use csp_render::Gpu;
-use csp_view::{SimCommand, SourceClass, View};
+use csp_render::map::MapRenderer;
+use csp_view::map::{MapKeyEvent, MapMode};
+use csp_view::{EventClass, SimCommand, SourceClass, View};
 use warp::WarpController;
 use web_time::Instant;
 use winit::{
     application::ApplicationHandler,
-    event::{ElementState, WindowEvent},
+    event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
-    keyboard::Key,
+    keyboard::{Key, NamedKey},
     window::{Window, WindowId},
 };
 
@@ -44,11 +46,31 @@ const MAX_FRAME_DT: f64 = 0.1;
 /// `AdvanceTo` each frame so per-source seq order applies the level first.
 const WARP_SOURCE_ID: u32 = 0;
 
+/// Map camera controls (M1-D, PLAN §5.1 R0): orbit-drag sensitivity is
+/// defined inside `csp_view::map` (`MapKeyEvent::Orbit` takes radians) —
+/// these are only the winit-side unit conversions.
+/// Radians of camera yaw/pitch per pixel of left-drag.
+const DRAG_RAD_PER_PX: f64 = 0.005;
+/// `ln` of the zoom factor per `MouseWheel::LineDelta` line.
+const ZOOM_LN_PER_LINE: f64 = 0.18;
+/// `ln` of the zoom factor per `MouseWheel::PixelDelta` pixel.
+const ZOOM_LN_PER_PX: f64 = 0.003;
+/// Screen px of pan per WASD/arrow key event (winit auto-repeat keeps it
+/// moving while held).
+const PAN_STEP_PX: f64 = 80.0;
+
 struct App {
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
     egui_state: Option<egui_winit::State>,
     egui_renderer: Option<egui_wgpu::Renderer>,
+    /// The map pass's renderer — pipelines + grow-only vertex buffers
+    /// (csp_render::map). `None` until GPU init.
+    map_renderer: Option<MapRenderer>,
+    /// Left-drag state for map camera orbit — pointer position at the
+    /// last `CursorMoved`, and whether the left button is held.
+    last_cursor: Option<(f64, f64)>,
+    map_dragging: bool,
     view: View,
     /// §2.6.3's controller — owns the warp ladder and the integer tick
     /// target; all wall-side, emitting only logged commands.
@@ -67,13 +89,21 @@ struct App {
 }
 
 impl App {
+    // §8.3/§2.13: `View::new` loads `data/` (balance.ron + the home
+    // system) — a missing or invalid file is a startup failure, surfaced
+    // loudly at construction. Presentation init is the app's one allowed
+    // `expect` site per the workspace lint doc.
+    #[allow(clippy::expect_used)]
     fn new() -> Self {
         Self {
             window: None,
             gpu: None,
             egui_state: None,
             egui_renderer: None,
-            view: View::new(),
+            map_renderer: None,
+            last_cursor: None,
+            map_dragging: false,
+            view: View::new().expect("data/ startup load failed"),
             warp: WarpController::new(),
             last_frame: Instant::now(),
             last_tick_ms: 0.0,
@@ -122,6 +152,7 @@ impl App {
             gpu.surface_format(),
             egui_wgpu::RendererOptions::default(),
         );
+        let map_renderer = MapRenderer::new(&gpu.device, gpu.surface_format());
         let info = gpu.adapter.get_info();
         self.view
             .set_gpu_info(info.name.clone(), format!("{:?}", info.backend));
@@ -130,6 +161,7 @@ impl App {
         self.gpu = Some(gpu);
         self.egui_state = Some(egui_state);
         self.egui_renderer = Some(egui_renderer);
+        self.map_renderer = Some(map_renderer);
     }
 
     /// The §2.5 frame loop — see the module doc for the shape. Runs on every
@@ -206,16 +238,64 @@ impl App {
             self.warp.multiplier(),
             self.fatal,
         );
+        // The map camera's projection needs the live framebuffer size.
+        if let Some(gpu) = &self.gpu {
+            self.view
+                .set_map_viewport(f64::from(gpu.config.width), f64::from(gpu.config.height));
+        }
 
         // §2.5 order: Input → SimStep → Sync → Presentation → UiBuild →
         // RenderExtract. One sim_step call per frame, always.
         self.view.begin_frame();
         if let Some(target) = target {
             let step_start = Instant::now();
-            if let Err(e) = self.view.sim_step(target) {
-                self.fatal = Some(e);
-                // Refresh the halt mirror so UiBuild sees it this frame.
-                self.view.set_fatal(self.fatal);
+            match self.view.sim_step(target) {
+                Ok(report) => {
+                    // §2.6.5: a fired Clamping event demotes warp — now,
+                    // before the next frame's step — so the player cannot
+                    // overshoot (PlayerAlarm, tracked-vessel SoiTransition).
+                    // The demotion itself is a logged SetWarp; re-promotion
+                    // still runs the §2.6.3 hysteresis.
+                    let clamping = report
+                        .fired_events
+                        .iter()
+                        .any(|e| e.class == EventClass::Clamping);
+                    // §2.2.1/§2.13's honest channels: rejected commands and
+                    // degraded events surface as log lines — they are the
+                    // app's view of Recoverable, never a halt.
+                    for (key, e) in &report.rejected {
+                        log::warn!("command rejected on originating channel {key:?}: {e}");
+                    }
+                    for e in &report.degraded {
+                        log::warn!("event degraded (fallback applied): {e}");
+                    }
+                    // §2.6.2's rails-warp refusal seam: the sim-side
+                    // predicate, checked here every frame — the only place
+                    // it can be. Vacuous at M1 (no bubble/thrust/atmo).
+                    let refused = self.view.sim.rails_warp_refusal().is_some();
+                    if (clamping || refused)
+                        && let Some(level) = self.warp.demote(0)
+                    {
+                        self.view.enqueue_command(
+                            SourceClass::Ui,
+                            WARP_SOURCE_ID,
+                            SimCommand::SetWarp(level),
+                        );
+                    }
+                }
+                Err(e @ SimError::Fatal(_)) => {
+                    // §2.13: only Fatal halts — step_frame keeps
+                    // Recoverable inside its report channels.
+                    self.fatal = Some(e);
+                    // Refresh the halt mirror so UiBuild sees it this frame.
+                    self.view.set_fatal(self.fatal);
+                }
+                Err(e) => {
+                    // Contract drift: a non-Fatal error escaped step_frame.
+                    // §2.13's rule is "bounded failures degrade, not halt"
+                    // — log it loud and keep running.
+                    log::error!("non-fatal error escaped step_frame: {e}");
+                }
             }
             // §2.6.3's inequality is per-tick cost: divide the frame's
             // whole step_frame wall cost by the ticks it advanced.
@@ -251,8 +331,12 @@ impl App {
         // handling it up front is safe (egui's post-paint ordering is the
         // conservative form).
         let mut textures_delta = std::mem::take(&mut full_output.textures_delta);
-        let (gpu, egui_renderer) = match (&mut self.gpu, &mut self.egui_renderer) {
-            (Some(g), Some(r)) => (g, r),
+        let (gpu, egui_renderer, map_renderer) = match (
+            &mut self.gpu,
+            &mut self.egui_renderer,
+            &mut self.map_renderer,
+        ) {
+            (Some(g), Some(r), Some(m)) => (g, r, m),
             _ => {
                 // No painter to give the delta to — `clear` is the
                 // documented way to drop it intentionally.
@@ -269,6 +353,10 @@ impl App {
             egui_renderer.free_texture(id);
         }
         textures_delta.clear();
+
+        // The RenderExtract product: the map pass's vertex data for this
+        // frame (None in flight mode).
+        let map_packet = self.view.take_map_packet();
 
         let mut frame = match gpu.begin_frame() {
             csp_render::FrameResult::Ok(f) => f,
@@ -294,7 +382,7 @@ impl App {
         );
 
         {
-            let pass = frame
+            let mut pass = frame
                 .encoder
                 .begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("main"),
@@ -317,12 +405,57 @@ impl App {
                     occlusion_query_set: None,
                     multiview_mask: None,
                 });
+            // The map pass draws under the UI: same render pass, before
+            // egui's triangles (§5.1 R0 — unlit lines + markers).
+            if let Some(packet) = &map_packet {
+                map_renderer.draw(&mut pass, &gpu.device, &gpu.queue, packet);
+            }
             egui_renderer.render(&mut pass.forget_lifetime(), &tris, &screen);
             drop(cmds); // user command buffers currently unused
         }
 
         gpu.submit(*frame);
         window.request_redraw();
+    }
+
+    /// One key-press event: manual warp ladder steps (§2.6.3 — `,` down /
+    /// `.` up land in the controller and become a logged `SetWarp` on the
+    /// next decide()) and the map camera keys. Map input rides
+    /// `View::map_event` into the Input schedule; pan keys and Tab accept
+    /// key-repeat so they track a held key, while `M`/`,`/`.` are
+    /// non-repeat single shots.
+    fn key_press(&mut self, event: &winit::event::KeyEvent) {
+        let in_map = self.view.map_mode() == MapMode::Map;
+        let pan = |dx_px: f64, dy_px: f64| MapKeyEvent::Pan { dx_px, dy_px };
+        let map_event = match &event.logical_key {
+            Key::Character(c) if c.as_str() == "," && !event.repeat => {
+                self.warp.request_step(-1);
+                return;
+            }
+            Key::Character(c) if c.as_str() == "." && !event.repeat => {
+                self.warp.request_step(1);
+                return;
+            }
+            Key::Character(c) if c.eq_ignore_ascii_case("m") && !event.repeat => {
+                Some(MapKeyEvent::ToggleMode)
+            }
+            Key::Named(NamedKey::Tab) if in_map => Some(MapKeyEvent::CycleFocus),
+            Key::Named(NamedKey::ArrowUp) if in_map => Some(pan(0.0, -PAN_STEP_PX)),
+            Key::Named(NamedKey::ArrowDown) if in_map => Some(pan(0.0, PAN_STEP_PX)),
+            Key::Named(NamedKey::ArrowLeft) if in_map => Some(pan(-PAN_STEP_PX, 0.0)),
+            Key::Named(NamedKey::ArrowRight) if in_map => Some(pan(PAN_STEP_PX, 0.0)),
+            Key::Character(c) if in_map => match c.as_str() {
+                "w" | "W" => Some(pan(0.0, -PAN_STEP_PX)),
+                "s" | "S" => Some(pan(0.0, PAN_STEP_PX)),
+                "a" | "A" => Some(pan(-PAN_STEP_PX, 0.0)),
+                "d" | "D" => Some(pan(PAN_STEP_PX, 0.0)),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(ev) = map_event {
+            self.view.map_event(ev);
+        }
     }
 }
 
@@ -339,12 +472,15 @@ impl ApplicationHandler for App {
             None => return,
         };
 
-        if let Some(state) = &mut self.egui_state {
-            let response = state.on_window_event(&window, &event);
-            if response.consumed {
-                return;
-            }
-        }
+        // egui gets first pass at raw input, but `consumed` must guard the
+        // individual handlers rather than early-returning: egui swallows
+        // the LMB release when the pointer is over a panel, and skipping
+        // the whole match would leave `map_dragging` stuck on — the camera
+        // would keep orbiting forever after button-up.
+        let consumed = self
+            .egui_state
+            .as_mut()
+            .is_some_and(|state| state.on_window_event(&window, &event).consumed);
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
@@ -353,16 +489,53 @@ impl ApplicationHandler for App {
                     gpu.resize(size.width, size.height);
                 }
             }
-            // Manual warp ladder steps (§2.6.3): `,` down / `.` up — the
-            // request lands in the controller and becomes a logged
-            // `SetWarp` on the next decide().
+            // Key presses — warp ladder + map camera; see `key_press`.
+            // `!consumed` keeps egui-owned keys (a focused text field)
+            // out of the sim.
             WindowEvent::KeyboardInput { event, .. }
-                if event.state == ElementState::Pressed && !event.repeat =>
+                if !consumed && event.state == ElementState::Pressed =>
             {
-                match &event.logical_key {
-                    Key::Character(c) if c.as_str() == "," => self.warp.request_step(-1),
-                    Key::Character(c) if c.as_str() == "." => self.warp.request_step(1),
-                    _ => {}
+                self.key_press(&event);
+            }
+            // Map camera mouse input — left-drag orbits, wheel zooms.
+            // A consumed PRESS (clicking a panel) must not start a camera
+            // drag, so the flag is `!consumed && pressed`. The RELEASE
+            // clears unconditionally — that is the point of routing
+            // consumption per-handler: a button-up over a panel must
+            // still end the drag.
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => {
+                self.map_dragging = !consumed && state == ElementState::Pressed;
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let pos = (position.x, position.y);
+                if !consumed
+                    && self.map_dragging
+                    && self.view.map_mode() == MapMode::Map
+                    && let Some(last) = self.last_cursor
+                {
+                    self.view.map_event(MapKeyEvent::Orbit {
+                        dyaw: (pos.0 - last.0) * DRAG_RAD_PER_PX,
+                        dpitch: (pos.1 - last.1) * DRAG_RAD_PER_PX,
+                    });
+                }
+                // `last_cursor` updates even on egui-consumed moves —
+                // otherwise a drag crossing a panel exits with a stale
+                // position and the camera takes one large delta jump.
+                self.last_cursor = Some(pos);
+            }
+            WindowEvent::MouseWheel { delta, .. } if !consumed => {
+                if self.view.map_mode() == MapMode::Map {
+                    let lines = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => f64::from(y) * ZOOM_LN_PER_LINE,
+                        MouseScrollDelta::PixelDelta(p) => p.y * ZOOM_LN_PER_PX,
+                    };
+                    self.view.map_event(MapKeyEvent::Zoom {
+                        factor: f64::exp(lines),
+                    });
                 }
             }
             WindowEvent::RedrawRequested => self.render(),
