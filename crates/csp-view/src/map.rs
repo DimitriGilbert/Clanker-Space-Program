@@ -40,7 +40,7 @@ use csp_core::{DVec3, SimTime, TICK_HZ};
 use csp_data::{BodyId, KeplerElements};
 use csp_render::map::{MapMesh, MapPacket, MapVertex};
 use csp_sim::orbit::{OrbitModel, OrbitState, PatchedConics};
-use csp_sim::{VesselId, World as SimWorld};
+use csp_sim::{ManeuverNode, VesselId, World as SimWorld};
 
 // ---------------------------------------------------------------------------
 // Tunables (presentation constants — §8.3 owns sim tuning; these are view
@@ -71,6 +71,10 @@ const PITCH_LIMIT: f64 = 1.55;
 const OPEN_ORBIT_NU_FILL: f64 = 0.92;
 /// Color for all vessel markers/lines at M1 (bodies get per-index colors).
 const VESSEL_COLOR: [f32; 4] = [1.0, 0.55, 0.15, 1.0];
+/// M5 maneuver-node color: the node marker and the predicted post-burn
+/// conic read as "planned, not flown" — green against the flown
+/// orange.
+const NODE_COLOR: [f32; 4] = [0.35, 0.95, 0.45, 1.0];
 /// Star marker/line color (parent-less body).
 const STAR_COLOR: [f32; 4] = [1.0, 0.85, 0.35, 1.0];
 /// Assigned round-robin to non-star bodies.
@@ -319,8 +323,9 @@ pub(crate) fn apply_map_input(
 pub(crate) struct MapSyncInput {
     /// The sim clock the vessel states were read at.
     pub tick: SimTime,
-    /// Every vessel's current orbit state, ascending-id order.
-    pub vessels: Vec<(VesselId, OrbitState)>,
+    /// Every vessel's orbit state + scheduled maneuver node (M5),
+    /// ascending-id order.
+    pub vessels: Vec<(VesselId, OrbitState, Option<ManeuverNode>)>,
 }
 
 /// The Sync-written map mirror — what Presentation and UiBuild read.
@@ -328,8 +333,9 @@ pub(crate) struct MapSyncInput {
 pub struct MapSnapshot {
     /// The sim tick this snapshot was taken at.
     pub tick: SimTime,
-    /// Every vessel's orbit state at `tick`, ascending-id order.
-    pub vessels: Vec<(VesselId, OrbitState)>,
+    /// Every vessel's orbit state + scheduled maneuver node (M5),
+    /// ascending-id order.
+    pub vessels: Vec<(VesselId, OrbitState, Option<ManeuverNode>)>,
 }
 
 /// `Sync` schedule system: copy the staged map input into the mirror.
@@ -363,6 +369,20 @@ pub struct MapScene {
     /// from — a `§2.6.6` re-base or a new spawn replaces the elements,
     /// which is the invalidation signal.
     vessel_lines: BTreeMap<VesselId, (OrbitState, Option<Vec<DVec3>>)>,
+    /// M5 node previews — see [`NodePreview`].
+    node_lines: BTreeMap<VesselId, NodePreview>,
+}
+
+/// One vessel's cached node preview: the `(orbit, node)` invalidation
+/// key, the predicted post-burn conic (parent-centred, like every
+/// sampled line), and the node point's parent-centred position.
+struct NodePreview {
+    /// The inputs this preview was derived from.
+    key: (OrbitState, ManeuverNode),
+    /// The predicted post-burn polyline (`None` = unsampleable).
+    line: Option<Vec<DVec3>>,
+    /// The node point's parent-centred position.
+    point: Option<DVec3>,
 }
 
 /// The solved map camera for one frame — f64 end to end (§2.3).
@@ -407,6 +427,7 @@ pub struct MapFrame(pub Option<MapPacket>);
 /// `Presentation` schedule system — all map derivation in one place
 /// (§2.5 #4: "camera solve, LOD selection"). Runs only in map mode;
 /// flight frames skip the whole derivation.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn map_present(
     input: Res<MapInput>,
     model: Res<OrbitModelRes>,
@@ -432,7 +453,7 @@ pub(crate) fn map_present(
             .push(body_system_pos(model, &body.id, t).ok());
     }
     scene.vessel_pos.clear();
-    for (_id, orbit) in &snap.vessels {
+    for (_id, orbit, _node) in &snap.vessels {
         let pos = (|| {
             let (r, _v) = model.state_at(orbit, t).ok()?;
             let parent = body_system_pos(model, &orbit.parent, t).ok()?;
@@ -462,7 +483,7 @@ pub(crate) fn map_present(
             scene.body_lines[i] = sample_orbit(model, &state);
         }
     }
-    for (id, orbit) in &snap.vessels {
+    for (id, orbit, _node) in &snap.vessels {
         let stale = scene
             .vessel_lines
             .get(id)
@@ -474,7 +495,9 @@ pub(crate) fn map_present(
     }
     scene
         .vessel_lines
-        .retain(|id, _| snap.vessels.iter().any(|(vid, _)| vid == id));
+        .retain(|id, _| snap.vessels.iter().any(|(vid, _, _)| vid == id));
+
+    refresh_node_previews(model, &snap, &mut scene);
 
     // Camera solve — f64 throughout.
     let focus = scene
@@ -499,7 +522,7 @@ pub(crate) fn map_present(
             });
         }
     }
-    for ((id, _orbit), pos) in snap.vessels.iter().zip(scene.vessel_pos.iter()) {
+    for ((id, _orbit, _node), pos) in snap.vessels.iter().zip(scene.vessel_pos.iter()) {
         if let Some(ndc) = pos.and_then(|p| project(&cam, p)) {
             ui.labels.push(csp_ui::MapLabel {
                 ndc,
@@ -508,11 +531,64 @@ pub(crate) fn map_present(
             });
         }
     }
+    // Node labels — the point rides its parent like the lines do.
+    for (id, orbit, node) in &snap.vessels {
+        let Some(node) = node else { continue };
+        let (Some(preview), Some(off)) = (
+            scene.node_lines.get(id),
+            table
+                .index_of(&orbit.parent)
+                .and_then(|pi| scene.body_pos.get(pi))
+                .copied()
+                .flatten(),
+        ) else {
+            continue;
+        };
+        let Some(point) = preview.point else {
+            continue;
+        };
+        if let Some(ndc) = project(&cam, point + off) {
+            let eta = (node.tick.saturating_sub(t.ticks())) as f64 / TICK_HZ as f64;
+            ui.labels.push(csp_ui::MapLabel {
+                ndc,
+                text: format!("node  T−{eta:.0} s  Δv {:.0} m/s", node.dv_magnitude()),
+                color: NODE_COLOR,
+            });
+        }
+    }
+}
+
+/// M5 node previews — the same invalidation rule the vessel lines use:
+/// the predicted post-burn conic and the node point re-derive only
+/// when the `(orbit, node)` pair they came from changes.
+fn refresh_node_previews(model: &PatchedConics, snap: &MapSnapshot, scene: &mut MapScene) {
+    for (id, orbit, node) in &snap.vessels {
+        let Some(node) = node else { continue };
+        let key = (orbit.clone(), node.clone());
+        let stale = scene.node_lines.get(id).is_none_or(|p| p.key != key);
+        if stale {
+            let predicted = csp_sim::maneuver::predict_maneuver(model, orbit, node).ok();
+            let line = predicted.as_ref().and_then(|o| sample_orbit(model, o));
+            let point = model
+                .state_at(orbit, SimTime(node.tick))
+                .ok()
+                .map(|(r, _)| r);
+            scene
+                .node_lines
+                .insert(*id, NodePreview { key, line, point });
+        }
+    }
+    scene.node_lines.retain(|id, _| {
+        snap.vessels
+            .iter()
+            .any(|(vid, _, n)| vid == id && n.is_some())
+    });
 }
 
 /// `RenderExtract` schedule system (§2.5 #6): emit the immutable
 /// `MapPacket` — clip-space vertices only. Points are projected
 /// per-frame (the camera moves); polylines stay cached.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn extract_map(
     input: Res<MapInput>,
     table: Res<BodyTable>,
@@ -569,6 +645,26 @@ pub(crate) fn extract_map(
         color[3] *= 0.8;
         emit_polyline(&mut lines.vertices, points, offset, &cam, vp, color);
     }
+    // M5 predicted post-burn conics — the same parent-centred offset
+    // convention; a failed prediction is "no line", never defaulted.
+    for preview in scene.node_lines.values() {
+        let state = &preview.key.0;
+        let Some(points) = preview.line.as_ref() else {
+            continue;
+        };
+        let Some(offset) = table
+            .index_of(&state.parent)
+            .and_then(|pi| scene.body_pos.get(pi))
+            .copied()
+            .flatten()
+        else {
+            skipped_lines += 1;
+            continue;
+        };
+        let mut color = NODE_COLOR;
+        color[3] *= 0.75;
+        emit_polyline(&mut lines.vertices, points, offset, &cam, vp, color);
+    }
     // Observability without per-frame spam: warn only when the skipped
     // count grows, so a persistently failing parent logs once while a
     // flapping one re-logs after recovering to zero.
@@ -596,6 +692,30 @@ pub(crate) fn extract_map(
             );
         }
     }
+    // Node markers — the node point offset by its parent's position,
+    // drawn slightly larger than a vessel marker.
+    for preview in scene.node_lines.values() {
+        let state = &preview.key.0;
+        let (Some(p), Some(off)) = (
+            preview.point,
+            table
+                .index_of(&state.parent)
+                .and_then(|pi| scene.body_pos.get(pi))
+                .copied()
+                .flatten(),
+        ) else {
+            continue;
+        };
+        if let Some(ndc) = project(&cam, p + off) {
+            emit_quad(
+                &mut markers.vertices,
+                ndc,
+                BODY_MARKER_PX - 0.5,
+                vp,
+                NODE_COLOR,
+            );
+        }
+    }
 
     frame.0 = Some(MapPacket { lines, markers });
 }
@@ -616,7 +736,7 @@ pub(crate) fn capture_sync_input(sim: &SimWorld) -> MapSyncInput {
         vessels: sim
             .vessels()
             .iter()
-            .filter_map(|(id, v)| v.orbit().cloned().map(|o| (*id, o)))
+            .filter_map(|(id, v)| v.orbit().cloned().map(|o| (*id, o, v.maneuver.clone())))
             .collect(),
     }
 }
@@ -628,8 +748,8 @@ pub(crate) fn capture_sync_input(sim: &SimWorld) -> MapSyncInput {
 /// A body's system-frame position: its parent-centered conic offset plus
 /// the parent's position, recursively to the root (§2.8: `state_at`
 /// positions are parent-centered; composing the chain is the caller's
-/// job).
-fn body_system_pos(
+/// job). `pub(crate)` for the flight view's sun-direction solve (R2).
+pub(crate) fn body_system_pos(
     model: &PatchedConics,
     id: &BodyId,
     t: SimTime,

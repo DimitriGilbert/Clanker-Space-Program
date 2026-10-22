@@ -9,6 +9,12 @@ wgpu = { workspace = true }
 # Vertex upload to wgpu buffers is typed as bytes; Pod derives keep the
 # map pipeline's vertex struct honest (plain repr(C) f32 data).
 bytemuck = { workspace = true }
+# DVec3 for the terrain builders' f64 math (§2.3 per-patch origins).
+csp-core = { workspace = true }
+# Terrain/LUT transcendentals go through libm so the baked heightfield
+# and transmittance LUT are bit-stable across platforms (visual
+# determinism — presentation data, never sim-hashed).
+libm = { workspace = true }
 
 [dev-dependencies]
 # WGSL validation gate (tests only): parses + full-validates this crate's

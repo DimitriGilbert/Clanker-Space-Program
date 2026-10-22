@@ -10,6 +10,10 @@
 pub mod flight;
 pub mod map;
 
+/// The R2 flight-view surface pass (PLAN §5.2): CPU quadtree terrain with
+/// per-patch f64 origins, precomputed-LUT atmospheric scattering, ocean.
+pub mod terrain;
+
 /// The M3 VAB craft view + GPU picking (PLAN M3 exit row "GPU picking",
 /// §9 "Editor viewport is `csp-render` + GPU picking"): a depth-tested
 /// placeholder-box pass over a `csp-view`-built [`vab::VabPacket`], plus
@@ -251,6 +255,8 @@ mod tests {
         for (name, src) in [
             ("map.wgsl", include_str!("map.wgsl")),
             ("vab.wgsl", include_str!("vab.wgsl")),
+            ("flight.wgsl", include_str!("flight.wgsl")),
+            ("terrain.wgsl", include_str!("terrain.wgsl")),
         ] {
             let module = naga::front::wgsl::parse_str(src)
                 .unwrap_or_else(|e| panic!("{name}: parse failed\n{}", e.emit_to_string(src)));

@@ -9,9 +9,9 @@
 //!   tracked-vessel opt-in — the policy is not sprinkled across
 //!   subsystems. The opt-in also re-writes pending entries' `class`
 //!   (see `World`'s `SetVesselTracked` apply).
-//! - **Kinds have M1 producers only.** The §2.6.5 member tables name ten
+//! - **Kinds have producers only.** The §2.6.5 member tables name ten
 //!   `Clamping` and six `Silent` members; variants whose subsystems do
-//!   not exist yet (`ManeuverNodeStart`, `ContractDeadline`,
+//!   not exist yet (`ContractDeadline`,
 //!   `ResearchProjectComplete`, `LifeSupportDepleted`, `ScriptWake`,
 //!   `Insolvent`, `ConstructionComplete`, `ColonyStore*` ,
 //!   `ReliabilityInspectionDue`, `PartFailure`, `TerminatorCrossing`)
@@ -21,6 +21,12 @@
 //!   publish deadline when the §2.6.6 scan finds no crossing inside the
 //!   query horizon — the mechanism that keeps "publish your next event
 //!   time" honest. Always `Silent`: a re-query must never clamp warp.
+//!   `TransferWindow` is the second plan-implied kind: the M5 exit row's
+//!   "transfer-window events" (the §-compatibility table's "Kerbal
+//!   Alarm Clock — transfer-window planner, falls out of the event
+//!   queue"). It shares `PlayerAlarm`'s shape — player-requested,
+//!   `Clamping`, mutates nothing — but carries a structured body pair
+//!   so the notification surfaces can render it without label parsing.
 //! - **Heap order is `(tick, seq)`.** `event_seq` is a serialized
 //!   monotonic counter (§7.2) assigned at insertion — so ordering is
 //!   total under tick ties, and because insertion order follows the
@@ -167,6 +173,33 @@ pub enum EventKind {
         /// The debris vessel to remove.
         vessel: VesselId,
     } = 3,
+    /// §2.6.5 `Clamping` member + the M5 maneuver executor's trigger
+    /// (module docs): a scheduled [`ManeuverNode`] reached its burn
+    /// tick — firing materializes the vessel in the bubble at the node
+    /// point and arms the executor. Always `Clamping` per the §2.6.5
+    /// member table (unlike `SoiTransition` it is not tracked-gated —
+    /// the player armed the node themselves, so warp must stop for it).
+    /// Scheduled by `SimCommand::SetManeuver`; dropped alongside the
+    /// node by `DeleteManeuver` and by the residence transitions that
+    /// discard the scheduled intent.
+    ManeuverNodeStart {
+        /// The vessel whose node reached its burn tick.
+        vessel: VesselId,
+    } = 4,
+    /// A predicted transfer window's optimal departure (M5
+    /// "transfer-window events"): scheduled by
+    /// `SimCommand::WatchTransferWindow` at the tick a
+    /// `transfer::plan_transfer` run produced. Firing mutates
+    /// nothing — surfacing rides `AdvanceReport::fired_events`, same
+    /// contract as `PlayerAlarm`. Always `Clamping`: the player asked
+    /// for the warning, so warp must demote rather than overshoot the
+    /// window (not tracked-gated — the event names no vessel).
+    TransferWindow {
+        /// The body the transfer departs.
+        origin: BodyId,
+        /// The body it targets.
+        destination: BodyId,
+    } = 5,
 }
 
 impl StableDiscriminant for EventKind {
@@ -176,6 +209,8 @@ impl StableDiscriminant for EventKind {
             Self::SoiRescan { .. } => 1,
             Self::PlayerAlarm { .. } => 2,
             Self::DebrisDecay { .. } => 3,
+            Self::ManeuverNodeStart { .. } => 4,
+            Self::TransferWindow { .. } => 5,
         }
     }
 }
@@ -194,7 +229,9 @@ pub fn class_of(kind: &EventKind, tracked: &BTreeSet<VesselId>) -> EventClass {
             }
         }
         EventKind::SoiRescan { .. } | EventKind::DebrisDecay { .. } => EventClass::Silent,
-        EventKind::PlayerAlarm { .. } => EventClass::Clamping,
+        EventKind::PlayerAlarm { .. }
+        | EventKind::ManeuverNodeStart { .. }
+        | EventKind::TransferWindow { .. } => EventClass::Clamping,
     }
 }
 
@@ -246,6 +283,16 @@ impl ScheduledEvent {
             }
             EventKind::DebrisDecay { vessel } => {
                 h.u64(vessel.0);
+            }
+            EventKind::ManeuverNodeStart { vessel } => {
+                h.u64(vessel.0);
+            }
+            EventKind::TransferWindow {
+                origin,
+                destination,
+            } => {
+                h.str(origin.as_str());
+                h.str(destination.as_str());
             }
         }
     }
@@ -337,6 +384,17 @@ mod tests {
         assert_eq!(class_of(&soi, &tracked), EventClass::Clamping);
         assert_eq!(
             class_of(&EventKind::PlayerAlarm { label: "x".into() }, &tracked),
+            EventClass::Clamping
+        );
+        // ManeuverNodeStart is Clamping unconditionally — not
+        // tracked-gated (the player armed the node themselves).
+        assert_eq!(
+            class_of(
+                &EventKind::ManeuverNodeStart {
+                    vessel: VesselId(9)
+                },
+                &tracked
+            ),
             EventClass::Clamping
         );
         assert_eq!(

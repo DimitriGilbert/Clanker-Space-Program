@@ -123,7 +123,9 @@ const BRENT_MAX_ITERS: u32 = 64;
 /// `BRENT_MAX_ITERS` per bracket.)
 pub const SOI_SCAN_MAX_SAMPLES: u64 = 1_048_576;
 /// `|e − 1|` at/below which an orbit is treated as parabolic (module docs).
-const E_PARABOLIC_TOL: f64 = 1e-9;
+/// Shared with `crate::transfer` — the parabolic `a := −p` encoding must be
+/// classified identically wherever elements are read.
+pub(crate) const E_PARABOLIC_TOL: f64 = 1e-9;
 /// `e` below which the circular-element conventions apply (module docs).
 const E_CIRCULAR_TOL: f64 = 1e-10;
 /// Node-vector length threshold for the equatorial conventions (module docs).
@@ -266,7 +268,10 @@ pub trait OrbitModel {
 /// z > 0:  C = (1 − cos√z)/z            S = (√z − sin√z)/√z³
 /// z < 0:  C = (cosh√(−z) − 1)/(−z)     S = (sinh√(−z) − √−z)/(−z)^1.5
 /// ```
-fn stumpff(z: f64) -> (f64, f64) {
+///
+/// `pub(crate)` for the Lambert solver (`crate::transfer`) — the same
+/// Stumpff evaluation serves the universal-variable Lambert form.
+pub(crate) fn stumpff(z: f64) -> (f64, f64) {
     if z > STUMPFF_EPS {
         let s = libm::sqrt(z);
         ((1.0 - libm::cos(s)) / z, (s - libm::sin(s)) / (s * s * s))
@@ -588,7 +593,9 @@ fn wrap_mean_anomaly(elements: &KeplerElements, m: f64) -> f64 {
 /// rotation: every caller passes a planar (z = 0) perifocal vector today,
 /// but `v.z` is carried honestly so the helper is a true frame rotation,
 /// not a 2-vector projection in disguise.
-fn perifocal_to_inertial(v: DVec3, node: f64, incl: f64, argp: f64) -> DVec3 {
+/// `pub(crate)` for `crate::transfer`'s ejection geometry — the parking
+/// orbit's inertial periapsis/normal basis comes through this rotation.
+pub(crate) fn perifocal_to_inertial(v: DVec3, node: f64, incl: f64, argp: f64) -> DVec3 {
     let (cw, sw) = (libm::cos(argp), libm::sin(argp));
     let (ci, si) = (libm::cos(incl), libm::sin(incl));
     let (co, so) = (libm::cos(node), libm::sin(node));
@@ -789,19 +796,36 @@ pub struct PatchedConics {
     /// The system model, keyed by `BodyId` — `BTreeMap` order is the
     /// deterministic body order everywhere it matters (§2.2).
     bodies: BTreeMap<BodyId, BodyOrbit>,
+    /// Physical radii (m) per body — construction-side metadata for
+    /// queries that need the body's extent (`transfer`'s encounter
+    /// prediction answers "does it hit the body" against these).
+    /// Deliberately NOT a `BodyOrbit` field: `BodyOrbit` is serialized
+    /// inside `WorldConfig` in the §7.6 replay artifact, and adding a
+    /// field there invalidates every recorded golden. This table is
+    /// rebuilt at construction like every other §7.3 derived view —
+    /// populated by [`Self::from_body_defs`] or [`Self::set_body_radius`];
+    /// `PatchedConics::new` leaves it empty (an unknown radius reads as
+    /// `None`, never a wrong answer).
+    radii: BTreeMap<BodyId, f64>,
 }
 
 impl PatchedConics {
-    /// Build a system model directly from per-body specs.
+    /// Build a system model directly from per-body specs. No physical
+    /// radii are known on this path — [`Self::set_body_radius`] adds them.
     pub fn new(bodies: BTreeMap<BodyId, BodyOrbit>) -> Self {
-        Self { bodies }
+        Self {
+            bodies,
+            radii: BTreeMap::new(),
+        }
     }
 
     /// Build from the loaded `body.ron` set — `parent`/`orbit` carried
     /// through verbatim; the csp-data validator has already proven parents
-    /// exist and terminate at the star.
+    /// exist and terminate at the star. `radius_m` lands in the side
+    /// table the encounter-prediction query reads.
     pub fn from_body_defs(defs: &[BodyDef]) -> Result<Self, SimError> {
         let mut bodies = BTreeMap::new();
+        let mut radii = BTreeMap::new();
         for def in defs {
             if bodies
                 .insert(
@@ -817,8 +841,23 @@ impl PatchedConics {
             {
                 return Err(SimError::SaveBlocking("duplicate body id in system model"));
             }
+            radii.insert(def.id.clone(), def.radius_m);
         }
-        Ok(Self { bodies })
+        Ok(Self { bodies, radii })
+    }
+
+    /// A body's physical radius (m), when the model carries it —
+    /// `from_body_defs` models always do; `new` models only via
+    /// [`Self::set_body_radius`]. Query metadata, never sim state.
+    pub fn body_radius(&self, id: &BodyId) -> Option<f64> {
+        self.radii.get(id).copied()
+    }
+
+    /// Record a body's physical radius on a directly-constructed model —
+    /// the test/tooling counterpart of `from_body_defs`' automatic fill.
+    /// Construction-style setter: call before queries read it.
+    pub fn set_body_radius(&mut self, id: &BodyId, radius_m: f64) {
+        self.radii.insert(id.clone(), radius_m);
     }
 
     /// Public read of a body's orbit record — `World` composes
@@ -844,8 +883,11 @@ impl PatchedConics {
     }
 
     /// Parent-centered state of a system body at `t`. `Err(Recoverable)`
-    /// for the star — it has no elements; it IS the frame origin.
-    fn body_state(&self, id: &BodyId, t: SimTime) -> Result<(DVec3, DVec3), SimError> {
+    /// for the star — it has no elements; it IS the frame origin. Public
+    /// for the transfer planner (`crate::transfer` composes body
+    /// ephemerides into Lambert endpoints) — read-only, same purity
+    /// contract as [`OrbitModel::state_at`].
+    pub fn body_state(&self, id: &BodyId, t: SimTime) -> Result<(DVec3, DVec3), SimError> {
         let b = self.body(id)?;
         let elements = b
             .elements
@@ -856,6 +898,97 @@ impl PatchedConics {
             None => return Err(SimError::Recoverable("orbit model: root has no parent")),
         };
         elements_state_at(elements, parent_mu, t.seconds())
+    }
+
+    /// The §2.6.6 patched-conics stitch, as a pure function: express
+    /// `s`'s state at `t` in the new parent's frame and re-derive its
+    /// elements — the same math `World::apply_soi_transition` performs
+    /// (it calls this), extracted so `crate::transfer`'s hypothetical-
+    /// conic queries (`predict_encounter`) traverse the SAME seam the
+    /// sim itself does. Two callers, one stitch — the prediction can
+    /// never drift from the transition it predicts.
+    ///
+    /// - `Enter{body}`: `body` must be a child of `s.parent` with
+    ///   elements; the relative state is `vessel − child`, both in the
+    ///   old-parent frame, and the new conic's parent is `body`.
+    /// - `Exit{body}`: `body` must BE `s.parent` and carry a parent of
+    ///   its own; the new frame is the grandparent and the state
+    ///   composes `vessel_in_parent + parent_in_grandparent`. Exiting
+    ///   past a parentless body (the star, or a root-level body) has no
+    ///   frame to re-base into — `Recoverable`; callers treat that as
+    ///   "left the system".
+    ///
+    /// The result's epoch is `t` — epoch-anchored like every conic
+    /// this model evaluates.
+    pub fn rebase(
+        &self,
+        s: &OrbitState,
+        body: &BodyId,
+        direction: SoiDirection,
+        t: SimTime,
+    ) -> Result<OrbitState, SimError> {
+        let (rv, vv) = self.state_at(s, t)?;
+        match direction {
+            SoiDirection::Enter => {
+                let child = self.body_orbit(body)?;
+                if child.parent.as_ref() != Some(&s.parent) {
+                    return Err(SimError::Recoverable(
+                        "soi enter: target is not a child of the vessel's parent",
+                    ));
+                }
+                let child_el = child
+                    .elements
+                    .clone()
+                    .ok_or(SimError::Recoverable("soi enter: child has no orbit"))?;
+                // The child's elements are relative to the vessel's
+                // current parent with epoch = sim-time 0 (body.ron
+                // convention), so its state evaluates in the same frame.
+                let child_state = OrbitState {
+                    parent: s.parent.clone(),
+                    elements: child_el,
+                    epoch: SimTime::ZERO,
+                };
+                let (rb, vb) = self.state_at(&child_state, t)?;
+                let elements = cartesian_to_elements(rv - rb, vv - vb, child.mu_m3_per_s2)?;
+                Ok(OrbitState {
+                    parent: body.clone(),
+                    elements,
+                    epoch: t,
+                })
+            }
+            SoiDirection::Exit => {
+                if &s.parent != body {
+                    return Err(SimError::Recoverable(
+                        "soi exit: event body is not the vessel's parent",
+                    ));
+                }
+                let old_parent = self.body_orbit(body)?;
+                let grandparent = old_parent
+                    .parent
+                    .clone()
+                    .ok_or(SimError::Recoverable("soi exit: parent has no parent"))?;
+                let parent_el = old_parent
+                    .elements
+                    .clone()
+                    .ok_or(SimError::Recoverable("soi exit: parent has no orbit"))?;
+                // The old parent's elements are relative to the
+                // grandparent at epoch 0 — compose `vessel_in_parent +
+                // parent_in_grandparent` for the grandparent-frame state.
+                let parent_state = OrbitState {
+                    parent: grandparent.clone(),
+                    elements: parent_el,
+                    epoch: SimTime::ZERO,
+                };
+                let (rp, vp) = self.state_at(&parent_state, t)?;
+                let mu_g = self.body_orbit(&grandparent)?.mu_m3_per_s2;
+                let elements = cartesian_to_elements(rv + rp, vv + vp, mu_g)?;
+                Ok(OrbitState {
+                    parent: grandparent,
+                    elements,
+                    epoch: t,
+                })
+            }
+        }
     }
 }
 
@@ -889,7 +1022,7 @@ impl OrbitModel for PatchedConics {
         now: SimTime,
         horizon: SimTime,
     ) -> Result<Option<SoiEvent>, SimError> {
-        self.next_soi_event_within(s, now, horizon, SOI_SCAN_MAX_SAMPLES, None)
+        self.next_soi_event_within(s, now, horizon, SOI_SCAN_MAX_SAMPLES, None, None)
             .map(|(ev, _samples)| ev)
     }
 }
@@ -992,6 +1125,13 @@ impl PatchedConics {
     /// `Enter{own-parent}`/`Exit{non-parent}` one stride later. A
     /// first-stride detection on `body`'s boundary in `direction` is a
     /// tolerance artifact and is dropped; a later detection stands.
+    ///
+    /// `exclude` names a body whose SOI boundary is skipped **while the
+    /// conic starts inside it at `now`** — the transfer-plan composition:
+    /// `plan.conic` is stamped at the origin body's center (inside the
+    /// origin's own SOI) so the earliest detection is that egress, which
+    /// was never a residence in the excluded frame. The skip is evaluated
+    /// once, up front; a re-entry later in the window is not reported.
     pub(crate) fn next_soi_event_within(
         &self,
         s: &OrbitState,
@@ -999,6 +1139,7 @@ impl PatchedConics {
         horizon: SimTime,
         max_samples: u64,
         suppress: Option<(BodyId, SoiDirection)>,
+        exclude: Option<&BodyId>,
     ) -> Result<(Option<SoiEvent>, u64), SimError> {
         if horizon.ticks() <= now.ticks() {
             return Ok((None, 0));
@@ -1010,6 +1151,13 @@ impl PatchedConics {
         // Candidate set: the parent's own boundary (exit/re-entry) and
         // every child's (entry/exit). Nested SOIs make this complete.
         for cand in self.soi_candidates(s) {
+            // The conic was stamped inside `exclude`'s SOI: it never
+            // resided in that frame, so the egress is not an encounter.
+            if exclude.is_some_and(|b| *b == cand.body)
+                && self.signed_distance(s, &cand, now.ticks())? < 0.0
+            {
+                continue;
+            }
             let v_rel_max = self.candidate_v_rel_max(&cand, vessel_bound, parent_mu)?;
             let stride = stride_ticks(cand.r_soi, v_rel_max);
             let suppress_dir = suppress
@@ -2159,13 +2307,13 @@ mod tests {
         // samples, so a 32-sample budget is exhausted mid-scan.
         let horizon = SimTime(2_000_000);
         assert!(matches!(
-            model.next_soi_event_within(&s, SimTime(0), horizon, 32, None),
+            model.next_soi_event_within(&s, SimTime(0), horizon, 32, None, None),
             Err(SimError::Recoverable(_))
         ));
         // With headroom the identical call completes honestly — and its
         // reported spend matches the stride-grid bound `span/h + 2`.
         let (ev, samples) = model
-            .next_soi_event_within(&s, SimTime(0), horizon, 1_000_000, None)
+            .next_soi_event_within(&s, SimTime(0), horizon, 1_000_000, None, None)
             .unwrap();
         assert!(ev.is_none());
         let span = horizon.ticks();
@@ -2230,7 +2378,7 @@ mod tests {
         };
         let horizon = SimTime(4_000_000);
         let (unsup, _) = model
-            .next_soi_event_within(&s, SimTime(0), horizon, SOI_SCAN_MAX_SAMPLES, None)
+            .next_soi_event_within(&s, SimTime(0), horizon, SOI_SCAN_MAX_SAMPLES, None, None)
             .unwrap();
         let ev = unsup.expect("an inbound vessel must cross inward");
         assert_eq!(ev.body, BodyId::from("m"));
@@ -2246,6 +2394,7 @@ mod tests {
                 horizon,
                 SOI_SCAN_MAX_SAMPLES,
                 Some((BodyId::from("m"), SoiDirection::Enter)),
+                None,
             )
             .unwrap();
         match sup {

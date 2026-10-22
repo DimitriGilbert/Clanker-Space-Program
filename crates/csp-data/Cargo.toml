@@ -18,6 +18,9 @@ libm = { workspace = true }
 # The §3.1 data-set hash (data_set_hash) — same pinned construction as the
 # csp-bench fixture hash, different scope (see datahash module docs).
 blake3 = { workspace = true }
+# Biome-map pixel decode (biome::decode_indexed_png — R2 terrain seeding):
+# zlib inflate only; deterministic, already workspace-pinned.
+miniz_oxide = { workspace = true }
 
 [dev-dependencies]
 # Integration tests drive the loader/validator over the real data/ tree:

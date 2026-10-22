@@ -56,7 +56,9 @@ pub mod system;
 pub mod validate;
 
 pub use balance::{BALANCE_SCHEMA_VERSION, BalanceDef};
-pub use biome::{BiomeLegend, BiomeLegendEntry, PngInfo, inspect_indexed_png};
+pub use biome::{
+    BiomeLegend, BiomeLegendEntry, IndexedPng, PngInfo, decode_indexed_png, inspect_indexed_png,
+};
 pub use datahash::{DataHashError, data_set_hash};
 pub use ids::{
     BiomeId, BodyId, ExperimentId, FamilyId, LocKey, PartId, RecipeId, ResourceId, SystemId,

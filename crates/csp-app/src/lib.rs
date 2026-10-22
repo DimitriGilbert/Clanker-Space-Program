@@ -28,6 +28,7 @@ use std::collections::BTreeMap;
 use csp_render::Gpu;
 use csp_render::flight::FlightRenderer;
 use csp_render::map::MapRenderer;
+use csp_render::terrain::TerrainRenderer;
 use csp_render::vab::VabRenderer;
 use csp_view::flight::FlightEvent;
 use csp_view::map::MapKeyEvent;
@@ -51,6 +52,9 @@ const MAX_FRAME_DT: f64 = 0.1;
 /// is the only `Ui`-class producer at M0; `SetWarp` is enqueued before
 /// `AdvanceTo` each frame so per-source seq order applies the level first.
 const WARP_SOURCE_ID: u32 = 0;
+/// §2.2.1 source id for the map maneuver panel's commands (Ui class;
+/// distinct FIFO from the warp controller's).
+const MANEUVER_SOURCE_ID: u32 = 2;
 
 /// Map camera controls (M1-D, PLAN §5.1 R0): orbit-drag sensitivity is
 /// defined inside `csp_view::map` (`MapKeyEvent::Orbit` takes radians) —
@@ -77,6 +81,10 @@ struct App {
     /// The map pass's renderer — pipelines + grow-only vertex buffers
     /// (csp_render::map). `None` until GPU init.
     flight_renderer: Option<FlightRenderer>,
+    /// The R2 surface pass (csp_render::terrain): quadtree terrain,
+    /// LUT-scattered sky, ocean — drawn into the flight view before
+    /// the craft vertices. `None` until GPU init.
+    terrain_renderer: Option<TerrainRenderer>,
     map_renderer: Option<MapRenderer>,
     /// The VAB pass's renderer — craft boxes + the offscreen object-id
     /// pick target (csp_render::vab). `None` until GPU init.
@@ -141,6 +149,7 @@ impl App {
             egui_state: None,
             egui_renderer: None,
             flight_renderer: None,
+            terrain_renderer: None,
             map_renderer: None,
             vab_renderer: None,
             last_vab_packet: None,
@@ -213,6 +222,7 @@ impl App {
             gpu.surface_format(),
             (gpu.config.width, gpu.config.height),
         );
+        let terrain_renderer = TerrainRenderer::new(&gpu.device, gpu.surface_format());
         let info = gpu.adapter.get_info();
         self.view
             .set_gpu_info(info.name.clone(), format!("{:?}", info.backend));
@@ -222,6 +232,7 @@ impl App {
         self.egui_state = Some(egui_state);
         self.egui_renderer = Some(egui_renderer);
         self.flight_renderer = Some(flight_renderer);
+        self.terrain_renderer = Some(terrain_renderer);
         self.map_renderer = Some(map_renderer);
         self.vab_renderer = Some(vab_renderer);
         self.view
@@ -278,6 +289,11 @@ impl App {
         }
         if outbox.launch {
             self.view.launch_craft();
+        }
+        // M5 node panel → the §7.6-logged command path.
+        if let Some(cmd) = outbox.maneuver {
+            self.view
+                .enqueue_command(SourceClass::Ui, MANEUVER_SOURCE_ID, cmd);
         }
         if let Some(name) = outbox.craft_load {
             match self.craft_store.get(&name) {
@@ -554,6 +570,11 @@ impl App {
             if self.view.mode() == ViewMode::Flight
                 && let (Some(f), Some(packet)) = (&mut self.flight_renderer, &flight_packet)
             {
+                // R2: the surface pass first — its sky is the backdrop,
+                // terrain/ocean write depth the craft tests against.
+                if let (Some(t), Some(tp)) = (&mut self.terrain_renderer, &packet.terrain) {
+                    t.draw(&mut pass, &gpu.device, &gpu.queue, tp);
+                }
                 f.draw(&mut pass, &gpu.device, &gpu.queue, packet);
             }
             egui_renderer.render(&mut pass.forget_lifetime(), &tris, &screen);

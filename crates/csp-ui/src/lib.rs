@@ -282,3 +282,129 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
             );
         });
 }
+
+// ---------------------------------------------------------------------------
+// M5 maneuver panel — node placement + current-node status (map mode).
+// ---------------------------------------------------------------------------
+
+/// The panel's editable state — session data owned by `csp-view` (§2.2
+/// category C), passed in and mutated by the pure panel function.
+#[derive(Clone, Debug)]
+pub struct ManeuverPanelState {
+    /// The vessel the edits target.
+    pub vessel: u64,
+    /// Seconds from "now" the node sits at — the placement input.
+    pub t_plus_s: f64,
+    /// Δv components `[prograde, normal, radial]` in m/s.
+    pub dv: [f64; 3],
+}
+
+impl Default for ManeuverPanelState {
+    fn default() -> Self {
+        Self {
+            vessel: 0,
+            t_plus_s: 600.0,
+            dv: [10.0, 0.0, 0.0],
+        }
+    }
+}
+
+/// One on-rails vessel's node status, mirrored for the panel — plain
+/// data (`csp-ui` never sees `csp-sim`).
+#[derive(Clone, Copy, Debug)]
+pub struct ManeuverVessel {
+    /// The `VesselId`.
+    pub id: u64,
+    /// The vessel's scheduled node `(tick, Δv m/s)`, if armed.
+    pub node: Option<(u64, f64)>,
+}
+
+/// The one action the panel can emit per frame — translated into
+/// `SetManeuver`/`DeleteManeuver` `SimCommand`s by `csp-view` (the
+/// §2.1 rule: `csp-ui` cannot name sim types).
+#[derive(Clone, Copy, Debug)]
+pub enum ManeuverCommand {
+    /// Set/replace the vessel's node at `tick` with `dv`.
+    Set {
+        /// The target vessel.
+        vessel: u64,
+        /// The burn tick (panel input `t_plus_s` resolved against the
+        /// mirrored clock by the caller).
+        tick: u64,
+        /// `[prograde, normal, radial]` m/s.
+        dv: [f64; 3],
+    },
+    /// Delete the vessel's node (cancel a burn in progress too).
+    Delete {
+        /// The target vessel.
+        vessel: u64,
+    },
+}
+
+/// The M5 node panel — shown in map mode beside the orbit lines it
+/// edits. Vessel picker, live node status, and the placement fields:
+/// `T+` seconds to node plus the three Δv components. Emits at most
+/// one [`ManeuverCommand`] per frame.
+pub fn maneuver_panel(
+    ctx: &egui::Context,
+    tick: u64,
+    vessels: &[ManeuverVessel],
+    state: &mut ManeuverPanelState,
+    out: &mut Option<ManeuverCommand>,
+) {
+    if vessels.is_empty() {
+        return;
+    }
+    if !vessels.iter().any(|v| v.id == state.vessel) {
+        state.vessel = vessels[0].id;
+    }
+    egui::Window::new("Maneuver node").show(ctx, |ui| {
+        egui::ComboBox::from_label("vessel")
+            .selected_text(format!("vessel {}", state.vessel))
+            .show_ui(ui, |ui| {
+                for v in vessels {
+                    ui.selectable_value(&mut state.vessel, v.id, format!("vessel {}", v.id));
+                }
+            });
+        if let Some(n) = vessels
+            .iter()
+            .find(|v| v.id == state.vessel)
+            .and_then(|v| v.node)
+        {
+            let eta = n.0.saturating_sub(tick) as f64 / 64.0;
+            ui.label(format!("armed: T−{eta:.0} s · Δv {:.1} m/s", n.1));
+        } else {
+            ui.label("no node armed");
+        }
+        ui.add(
+            egui::DragValue::new(&mut state.t_plus_s)
+                .prefix("T+ ")
+                .suffix(" s")
+                .speed(1.0),
+        );
+        ui.horizontal(|ui| {
+            for (c, label) in state.dv.iter_mut().zip(["pro", "nrm", "rad"]) {
+                ui.add(
+                    egui::DragValue::new(c)
+                        .prefix(format!("{label} "))
+                        .speed(0.1),
+                );
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Set node").clicked() {
+                let ticks = (state.t_plus_s.max(0.0) * 64.0) as u64;
+                *out = Some(ManeuverCommand::Set {
+                    vessel: state.vessel,
+                    tick: tick.saturating_add(ticks).max(tick + 1),
+                    dv: state.dv,
+                });
+            }
+            if ui.button("Delete node").clicked() {
+                *out = Some(ManeuverCommand::Delete {
+                    vessel: state.vessel,
+                });
+            }
+        });
+    });
+}

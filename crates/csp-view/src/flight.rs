@@ -30,10 +30,11 @@ use bevy_ecs::prelude::*;
 use csp_core::{DQuat, DVec3};
 use csp_sim::{VesselState, World};
 
-use crate::map::{MapCameraF64, project_into, solve_orbit_camera};
+use crate::map::{MapCameraF64, body_system_pos, project_into, solve_orbit_camera};
+use crate::terrain::{TerrainCache, TerrainConfig};
 
 /// Chase-camera FOV (radians, vertical).
-const FLIGHT_FOV_Y: f64 = 0.9;
+pub(crate) const FLIGHT_FOV_Y: f64 = 0.9;
 /// Default camera distance (m) — reframed on focus changes.
 const FLIGHT_DEFAULT_DIST: f64 = 60.0;
 /// Plasma sheath display window (W/m² of convective input,
@@ -93,7 +94,7 @@ pub struct FlightInputEvents {
 }
 
 /// The environment slice the flight view needs — staged sim data.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct FlightEnv {
     /// Planet centre (bubble frame).
     pub body_center: DVec3,
@@ -101,6 +102,25 @@ pub struct FlightEnv {
     pub radius_m: f64,
     /// Atmosphere top altitude (m), `0` when airless.
     pub atm_top_m: f64,
+    /// Atmosphere scale height (m) — the R2 scattering LUT's `H`; `0`
+    /// when airless.
+    pub atm_scale_height_m: f64,
+    /// The dominant body's id — keys the terrain heightfield/biome
+    /// cache (SOI transfer swaps it).
+    pub body: Option<csp_data::BodyId>,
+    /// Unit sun direction, bubble frame (bubble = translated system
+    /// frame, so directions carry over) — lights the terrain, the
+    /// scattering LUT lookups, and the craft lambert alike.
+    pub sun_dir: DVec3,
+    /// Dominant-body spin axis (unit, bubble frame) — `DVec3::Z` on a
+    /// non-rotating environment. With `spin_phase` this is the same
+    /// `R(axis, ω·t)` the §2.6.4 surface-latch record co-rotates
+    /// latched poses by.
+    pub spin_axis: DVec3,
+    /// Spin phase `ω·t` (rad) at the staged sim tick: a body-fixed
+    /// direction maps to the inertial bubble frame as
+    /// `R(spin_axis, spin_phase)·fixed`. `0` when `body_spin` is zero.
+    pub spin_phase: f64,
 }
 
 /// One hull's axis-aligned box, body frame — the craft's render
@@ -235,13 +255,65 @@ const SFX_TTL_FRAMES: u32 = 90;
 #[derive(Resource, Default)]
 pub struct FlightFrame(pub Option<csp_render::flight::FlightPacket>);
 
+/// Sun direction in the bubble frame: the bubble is a translated copy
+/// of the system frame, so `star_pos − dominant_pos` carries over as a
+/// direction. Falls back to the fixed shading default when the orbit
+/// model can't place either body (e.g. a physics world with no system).
+fn sun_direction(sim: &World) -> DVec3 {
+    let fallback = || {
+        let d = DVec3::new(0.4, 0.3, 0.86);
+        d / d.norm()
+    };
+    let Some(dom) = sim.dominant_body() else {
+        return fallback();
+    };
+    let Some(star) = sim
+        .orbits()
+        .bodies()
+        .iter()
+        .find(|(_, b)| b.parent.is_none())
+        .map(|(id, _)| id.clone())
+    else {
+        return fallback();
+    };
+    if star == *dom {
+        return fallback(); // the bubble is centred on the star itself
+    }
+    let t = sim.clock();
+    let to_sun = (|| {
+        let star_pos = body_system_pos(sim.orbits(), &star, t).ok()?;
+        let dom_pos = body_system_pos(sim.orbits(), dom, t).ok()?;
+        let d = star_pos - dom_pos;
+        (d.norm_squared() > 0.0).then_some(d / d.norm())
+    })();
+    to_sun.unwrap_or_else(fallback)
+}
+
 /// `end_frame` staging: pull the flight view's slice out of `World`
 /// (the only sim read this module does — §2.5).
 pub fn capture_sync_input(sim: &World) -> FlightSyncInput {
-    let env = sim.environment().map(|e| FlightEnv {
-        body_center: e.body_center,
-        radius_m: e.radius_m,
-        atm_top_m: e.atmosphere.as_ref().map_or(0.0, |a| a.top_m),
+    let env = sim.environment().map(|e| {
+        // The §2.6.4 phase convention (`csp_sim::bubble`'s
+        // `surface_pose_*`): inertial = R(axis, ω·t)·fixed at
+        // `t = clock` seconds. The terrain pass needs it to slide the
+        // surface under latched/landed craft at exactly the contact
+        // surface velocity `body_spin × rel`.
+        let omega = e.body_spin.norm();
+        let (spin_axis, spin_phase) = if omega > 0.0 {
+            (e.body_spin / omega, omega * sim.clock().seconds())
+        } else {
+            (DVec3::Z, 0.0)
+        };
+        FlightEnv {
+            body_center: e.body_center,
+            radius_m: e.radius_m,
+            atm_top_m: e.atmosphere.as_ref().map_or(0.0, |a| a.top_m),
+            atm_scale_height_m: e.atmosphere.as_ref().map_or(0.0, |a| a.scale_height_m),
+            body: sim.dominant_body().cloned(),
+            sun_dir: sun_direction(sim),
+            spin_axis,
+            spin_phase,
+        }
     });
     let mut vessels = Vec::new();
     for (id, vessel) in sim.vessels() {
@@ -314,7 +386,7 @@ pub(crate) fn apply_flight_input(
 /// `Sync` schedule — copy the staged input into the presentation
 /// mirror.
 pub(crate) fn sync_flight(staged: Res<FlightSyncInput>, mut snap: ResMut<FlightSnapshot>) {
-    snap.env = staged.env;
+    snap.env = staged.env.clone();
     snap.vessels = staged.vessels.clone();
 }
 
@@ -409,7 +481,7 @@ pub(crate) fn flight_present(
     ui.focus = Some(focus.id);
     ui.speed_mps = focus.vel.norm();
     ui.throttle = focus.throttle;
-    if let Some(env) = snap.env {
+    if let Some(env) = snap.env.as_ref() {
         let rel = focus.com - env.body_center;
         let r = rel.norm();
         ui.alt_m = r - env.radius_m;
@@ -417,30 +489,55 @@ pub(crate) fn flight_present(
     }
 }
 
-/// `RenderExtract` — emit the scene's clip-space triangles.
+/// `RenderExtract` — emit the scene's clip-space triangles + the R2
+/// terrain packet (quadtree selection runs here, in the extract, from
+/// the solved camera — §2.5's "LOD selection" lives upstream in
+/// Presentation; the leaf walk itself is extract-time derivation).
 #[allow(clippy::too_many_lines)]
 pub(crate) fn extract_flight(
     input: Res<FlightInput>,
     snap: Res<FlightSnapshot>,
     cam: Res<MapCameraF64>,
+    terrain_cfg: Res<TerrainConfig>,
+    mut terrain_cache: ResMut<TerrainCache>,
     mut frame: ResMut<FlightFrame>,
 ) {
     let mut packet = csp_render::flight::FlightPacket::default();
+    // R2 surface pass: when a physical world is present and the chase
+    // camera solved, the quadtree terrain + LUT sky replace the M4c
+    // gradient/disc. Without an environment the flat gradient stays —
+    // a flight view with no planet is a vacuum backdrop anyway.
+    if cam.valid
+        && let Some(env) = &snap.env
+    {
+        packet.terrain = Some(crate::terrain::build_packet(
+            &terrain_cfg,
+            &mut terrain_cache,
+            env,
+            &cam,
+            input.yaw,
+            input.pitch,
+            input.viewport_px,
+        ));
+    }
     let v = &mut packet.vertices;
-    // Sky: a far-depth fullscreen gradient (two tris at NDC z≈0 —
-    // reverse-Z far), horizon blue at the bottom fading up.
-    let zenith = [0.05, 0.09, 0.22, 1.0];
-    let horizon = [0.35, 0.5, 0.75, 1.0];
-    let q = [
-        ([-1.0f32, -1.0, 0.0], horizon),
-        ([1.0, -1.0, 0.0], horizon),
-        ([1.0, 1.0, 0.0], zenith),
-        ([-1.0, -1.0, 0.0], horizon),
-        ([1.0, 1.0, 0.0], zenith),
-        ([-1.0, 1.0, 0.0], zenith),
-    ];
-    for (pos, color) in q {
-        v.push(csp_render::flight::FlightVertex { pos, color });
+    if packet.terrain.is_none() {
+        // Sky fallback: a far-depth fullscreen gradient (two tris at
+        // NDC z≈0 — reverse-Z far), horizon blue fading up. The
+        // scattering sky replaces it whenever terrain runs.
+        let zenith = [0.05, 0.09, 0.22, 1.0];
+        let horizon = [0.35, 0.5, 0.75, 1.0];
+        let q = [
+            ([-1.0f32, -1.0, 0.0], horizon),
+            ([1.0, -1.0, 0.0], horizon),
+            ([1.0, 1.0, 0.0], zenith),
+            ([-1.0, -1.0, 0.0], horizon),
+            ([1.0, 1.0, 0.0], zenith),
+            ([-1.0, 1.0, 0.0], zenith),
+        ];
+        for (pos, color) in q {
+            v.push(csp_render::flight::FlightVertex { pos, color });
+        }
     }
     if !cam.valid {
         frame.0 = Some(packet);
@@ -454,50 +551,21 @@ pub(crate) fn extract_flight(
         Some(ndc)
     };
 
-    if let Some(env) = snap.env {
-        // Ground disc: a 96-seg triangle fan at surface level centred
-        // under the camera; radius = 1.4× the horizon distance so
-        // the planet edge (and curvature) reads.
-        let center_dir = {
-            let d = eye - env.body_center;
-            if d.norm() > 0.0 {
-                d / d.norm()
-            } else {
-                DVec3::Y
-            }
-        };
-        let center = env.body_center + center_dir * env.radius_m;
-        let alt = ((eye - env.body_center).norm() - env.radius_m).max(1.0);
-        let horizon_d = ((env.radius_m + alt).powi(2) - env.radius_m.powi(2)).sqrt();
-        let disc_r = (horizon_d * 1.4).max(input.distance_m * 4.0);
-        let (t1, t2) = {
-            let up = center_dir;
-            let a = if up.y.abs() < 0.9 { DVec3::Y } else { DVec3::X };
-            let t1 = up.cross(a) / up.cross(a).norm();
-            (t1, up.cross(t1))
-        };
-        let n = 96usize;
-        for i in 0..n {
-            let (a0, a1) = (
-                (i as f64) * 2.0 * core::f64::consts::PI / n as f64,
-                ((i + 1) as f64) * 2.0 * core::f64::consts::PI / n as f64,
-            );
-            let (s0, c0) = (a0.sin(), a0.cos());
-            let (s1, c1) = (a1.sin(), a1.cos());
-            let p0 = center + t1 * (c0 * disc_r) + t2 * (s0 * disc_r);
-            let p1 = center + t1 * (c1 * disc_r) + t2 * (s1 * disc_r);
-            emit(center, [0.22, 0.32, 0.18, 1.0]);
-            emit(p0, [0.22, 0.32, 0.18, 1.0]);
-            emit(p1, [0.2, 0.3, 0.17, 1.0]);
-        }
-    }
+    // R2: the quadtree terrain + ocean in `packet.terrain` replaced
+    // M4c's flat ground disc — nothing else to emit for the surface.
 
-    // Craft: per-hull boxes, flat lambert shading against a fixed sun
-    // direction; debris tints orange.
-    let sun = {
-        let s = DVec3::new(0.4, 0.3, 0.86);
-        s / s.norm()
-    };
+    // Craft: per-hull boxes, flat lambert shading against the staged
+    // sun direction (the same vector that lights the terrain);
+    // debris tints orange.
+    let sun = snap
+        .env
+        .as_ref()
+        .map(|e| e.sun_dir)
+        .filter(|s| s.norm_squared() > 0.0)
+        .unwrap_or_else(|| {
+            let s = DVec3::new(0.4, 0.3, 0.86);
+            s / s.norm()
+        });
     // Box corner indices per face — hull shells and the plasma sheath
     // share the table.
     const FACES: [([usize; 4], DVec3); 6] = [
@@ -628,7 +696,7 @@ pub(crate) fn extract_flight(
         // §3.7 ground-contact dust: a translucent tan ring hugging
         // the surface under the vessel's lowest hull vertex.
         if b.contact
-            && let Some(env) = snap.env
+            && let Some(env) = snap.env.as_ref()
         {
             let mut low = b.com;
             let mut low_alt = f64::MAX;

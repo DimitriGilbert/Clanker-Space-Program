@@ -23,6 +23,11 @@ use csp_sim::World as SimWorld;
 pub mod flight;
 pub mod map;
 
+/// The R2 surface tier (PLAN §5.2): per-body terrain config (authored
+/// `TerrainDef` seeds + ocean datums + biome palettes), the baked
+/// heightfield cache, and the `TerrainPacket` the flight view emits.
+pub mod terrain;
+
 /// The M3 VAB (editor mode): working-craft session hosting, the craft
 /// view's scene/camera/packet, and the GPU-pick event plumbing.
 pub mod vab;
@@ -152,7 +157,16 @@ pub struct UiOutbox {
     pub craft_save: Option<(String, Vec<u8>)>,
     /// Load the named craft file.
     pub craft_load: Option<String>,
+    /// M5 node panel output — the `SetManeuver`/`DeleteManeuver`
+    /// command `csp-app` enqueues at next Input (§2.5's one-frame
+    /// UiBuild → Input hand-off, same as every other request here).
+    pub maneuver: Option<SimCommand>,
 }
+
+/// The maneuver panel's session state — `csp-view` owns it (§2.2 C),
+/// `csp_ui::maneuver_panel` mutates it inside `UiBuild`.
+#[derive(Resource, Default)]
+pub struct ManeuverPanelRes(pub csp_ui::ManeuverPanelState);
 
 /// Post-step values staged for the `sync` schedule — written by
 /// [`View::end_frame`] from the authoritative sim, then distributed into the
@@ -197,6 +211,8 @@ fn build_ui(
     mut vab: ResMut<vab::VabSessionRes>,
     craft_files: Res<vab::CraftFileList>,
     flight_ui: Res<flight::FlightUiData>,
+    map_snap: Res<map::MapSnapshot>,
+    mut maneuver_state: ResMut<ManeuverPanelRes>,
     mut outbox: ResMut<UiOutbox>,
 ) {
     let mode = if vab_input.open {
@@ -241,6 +257,34 @@ fn build_ui(
                 map_ui.camera_distance_m,
                 &map_ui.labels,
             );
+            // M5 node panel — placement edits → outbox commands.
+            let mut mcmd = None;
+            csp_ui::maneuver_panel(
+                ctx,
+                clock.0.ticks(),
+                &map_snap
+                    .vessels
+                    .iter()
+                    .map(|(id, _, n)| csp_ui::ManeuverVessel {
+                        id: id.0,
+                        node: n.as_ref().map(|n| (n.tick, n.dv_magnitude())),
+                    })
+                    .collect::<Vec<_>>(),
+                &mut maneuver_state.0,
+                &mut mcmd,
+            );
+            outbox.maneuver = mcmd.map(|c| match c {
+                csp_ui::ManeuverCommand::Set { vessel, tick, dv } => SimCommand::SetManeuver {
+                    vessel: csp_sim::VesselId(vessel),
+                    tick,
+                    dv_prograde_mps: dv[0],
+                    dv_normal_mps: dv[1],
+                    dv_radial_mps: dv[2],
+                },
+                csp_ui::ManeuverCommand::Delete { vessel } => SimCommand::DeleteManeuver {
+                    vessel: csp_sim::VesselId(vessel),
+                },
+            });
         }
         if mode == csp_ui::ModeSelect::Vab {
             csp_ui::vab::vab_editor(ctx, &mut vab.0, &files, &mut vab_out);
@@ -395,6 +439,10 @@ impl View {
         let parts = csp_data::load_parts(&root.join("parts"))?;
         let resources = csp_data::load_resources(&root.join("resources.ron"))?;
         view.install_vab_catalog(parts, resources);
+        // R2: the authored terrain table (noise seeds, ocean datums,
+        // decoded biome palettes) — installed over the empty default.
+        view.world
+            .insert_resource(terrain::config_from_bodies(&sys.bodies));
         Ok(view)
     }
 
@@ -434,6 +482,7 @@ impl View {
         world.insert_resource(map::MapCameraF64::default());
         world.insert_resource(map::MapUiData::default());
         world.insert_resource(map::MapFrame::default());
+        world.insert_resource(ManeuverPanelRes::default());
 
         // M3 VAB resources (see vab.rs): the working-craft session +
         // camera/pick state + the craft-file name list.
@@ -453,6 +502,11 @@ impl View {
         world.insert_resource(flight::FlightSnapshot::default());
         world.insert_resource(flight::FlightUiData::default());
         world.insert_resource(flight::FlightFrame::default());
+        // R2 surface resources (see terrain.rs): empty config ⇒
+        // per-body params synthesised from the body id; `View::new`
+        // installs the authored table over it.
+        world.insert_resource(terrain::TerrainConfig::default());
+        world.insert_resource(terrain::TerrainCache::default());
         // §3.7 visual-SFX channel (flight.rs carries the audio deferral).
         world.insert_resource(flight::FlightSfx::default());
 

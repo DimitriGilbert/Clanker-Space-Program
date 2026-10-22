@@ -66,7 +66,15 @@ use crate::SimError;
 /// `EventKind` table gained the `DebrisDecay` kind (discriminant 3 —
 /// heap entries of it now appear in the §7.2 walk). Bumped for the
 /// golden rebless.
-pub const HASH_SCHEMA_VERSION: u32 = 6;
+///
+/// **Version 7** (M5-A/M5-B): the per-vessel walk gained `maneuver`
+/// (the scheduled-Δv node — forward-looking intent, hashed like the
+/// event heap it schedules into), and the `EventKind` table gained
+/// `ManeuverNodeStart` (discriminant 4 — §2.6.5's `Clamping` member)
+/// and `TransferWindow` (discriminant 5 — M5's transfer-window event,
+/// scheduled by `SimCommand::WatchTransferWindow`) — appended, never
+/// renumbered. Bumped for the golden rebless.
+pub const HASH_SCHEMA_VERSION: u32 = 7;
 
 /// Rule-7 sum types: the source of an enum's *declared* stable `u16`
 /// discriminant (PLAN §7.1 rule 7).

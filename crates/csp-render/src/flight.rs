@@ -31,8 +31,15 @@ impl FlightVertex {
 /// sim state (§2.1/§2.5).
 #[derive(Clone, Debug, Default)]
 pub struct FlightPacket {
-    /// Triangle-list scene: sky, ground disc, craft boxes, plumes.
+    /// Triangle-list scene: fallback sky gradient, craft boxes, plumes.
     pub vertices: Vec<FlightVertex>,
+    /// The R2 surface pass (§5.2): quadtree terrain + ocean instances
+    /// and the LUT-scattered sky, drawn by
+    /// [`crate::terrain::TerrainRenderer`] *before* the vertex stream
+    /// (the sky is the backdrop; terrain is opaque over it).
+    /// `None` without a physics environment or a solved camera — the
+    /// gradient in `vertices` is the retained fallback.
+    pub terrain: Option<crate::terrain::TerrainPacket>,
 }
 
 /// GPU owner for the flight pass — one pipeline + one depth target.

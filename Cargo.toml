@@ -31,7 +31,10 @@ rand_core = "=0.10.1"
 libm = "=0.2.16"
 bincode = { version = "=2.0.1" }
 ciborium = "=0.2.2"
-miniz_oxide = "=0.9.8"
+# Pinned at the newest published 0.9.x (the original "=0.9.8" declaration
+# predated any use and names a version that does not exist on crates.io;
+# 0.9.1 is what Cargo.lock already carries transitively).
+miniz_oxide = "=0.9.1"
 # PLAN §2.7: declared NOW so M2's csp-phys cannot get the feature set wrong.
 # `default-features = false`, `enhanced-determinism` ON (mutually exclusive
 # with `simd8`/`simd-nightly`, both OFF), `parallel` OFF (it pulls rayon).

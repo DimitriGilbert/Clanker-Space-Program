@@ -828,6 +828,7 @@ dependencies = [
  "blake3",
  "csp-core",
  "libm",
+ "miniz_oxide 0.9.1",
  "ron",
  "serde",
 ]
@@ -848,6 +849,8 @@ name = "csp-render"
 version = "0.0.0"
 dependencies = [
  "bytemuck",
+ "csp-core",
+ "libm",
  "naga",
  "wgpu",
 ]

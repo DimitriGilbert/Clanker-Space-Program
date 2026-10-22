@@ -59,6 +59,19 @@ pub mod orbit;
 /// the constant subsystem order array.
 pub mod events;
 
+/// Maneuver nodes + the thrust-integrated burn executor (PLAN M5):
+/// `ManeuverNode` sim state, the `Scheduled → Burning` lifecycle, the
+/// post-burn conic prediction the map view draws, and the executor's
+/// attitude/thrust helpers.
+pub mod maneuver;
+
+/// The transfer planner (PLAN M5 "Lambert/porkchop planner; encounter
+/// prediction; transfer-window events"): the Lambert solver, the
+/// (departure, duration) Δv surface + local refinement, the
+/// hypothetical-conic encounter query, and the plan → `SetManeuver`
+/// ejection bridge — pure queries over [`orbit::PatchedConics`].
+pub mod transfer;
+
 /// The §2.4/§2.6.4 bubble type surface: vessel-residence states, the
 /// physical-spawn weld inputs, the body-fixed latch record, and the
 /// physics construction config.
@@ -66,6 +79,7 @@ pub mod bubble;
 
 pub use bubble::{CraftDef, PhysicsConfig, SurfacePose, VesselState, VesselThermal};
 pub use events::{EventClass, EventKind, SUBSYSTEM_ORDER, ScheduledEvent, Subsystem};
+pub use maneuver::{ActiveBurn, ManeuverNode, ManeuverStatus};
 use orbit::{OrbitModel, OrbitState, PatchedConics};
 
 /// The §2.6.2 per-call tick budget — the `bubble_tick_budget_limit` slot
@@ -159,6 +173,14 @@ pub struct Vessel {
     /// when its rails periapsis drops below the atmosphere top, and
     /// deleted outright if it leaves the outermost SOI.
     pub debris_since: Option<u64>,
+    /// M5's scheduled-Δv slot — at most one [`ManeuverNode`] per
+    /// vessel in v1 (a second `SetManeuver` replaces a `Scheduled`
+    /// node; while `Burning` the command is refused — cancel with
+    /// `DeleteManeuver`). Sim state: serialized on the vessel, hashed
+    /// by `maneuver::hash_maneuver`, and lifecycle-bound to the
+    /// residence rules documented in the [`maneuver`] module (a
+    /// manual residence transition discards the scheduled intent).
+    pub maneuver: Option<ManeuverNode>,
 }
 
 impl Vessel {
@@ -402,6 +424,60 @@ pub enum SimCommand {
         vessel: VesselId,
         /// The graph node to remove (non-root required).
         node: csp_phys::PartNodeId,
+    },
+    /// M5's scheduled Δv (PLAN M5 "maneuver nodes + executor"): set the
+    /// vessel's one [`ManeuverNode`] — `{tick, dv_prograde, dv_normal,
+    /// dv_radial}` in the node point's §2.8 velocity frame — and
+    /// schedule the `ManeuverNodeStart` (§2.6.5 `Clamping`) that arms
+    /// the burn. A `tick` at or before the drain boundary clamps to the
+    /// next tick (the `SetAlarm` rule: a scheduled event must sit
+    /// strictly ahead of the clock). Replaces a `Scheduled` node
+    /// outright; refused while a burn is executing (cancel with
+    /// `DeleteManeuver` first) and for vessels the executor cannot
+    /// serve — non-`OnRails` state, no craft, no live thrust site, or
+    /// an orbit parent that is not the bubble's dominant body
+    /// (maneuver module docs). `Recoverable` rejections on the
+    /// originating channel, never silent.
+    SetManeuver {
+        /// The vessel the node belongs to.
+        vessel: VesselId,
+        /// The sim tick the burn starts at.
+        tick: u64,
+        /// Δv along the node point's prograde direction `v̂`, m/s.
+        dv_prograde_mps: f64,
+        /// Δv along the node point's orbit normal `(r × v)̂`, m/s.
+        dv_normal_mps: f64,
+        /// Δv along the node point's outward radial `r̂`, m/s.
+        dv_radial_mps: f64,
+    },
+    /// Remove the vessel's maneuver node. A `Scheduled` node's pending
+    /// `ManeuverNodeStart` event drops with it; a `Burning` node's
+    /// cancel zeroes the throttle immediately and leaves the vessel in
+    /// its current residence (the player keeps the stick — no free
+    /// teleport back to rails). Refused (`Recoverable`) when the
+    /// vessel is unknown or carries no node.
+    DeleteManeuver {
+        /// The vessel whose node is deleted.
+        vessel: VesselId,
+    },
+    /// PLAN M5's transfer-window event: schedule a
+    /// [`EventKind::TransferWindow`] (§2.6.5 `Clamping`, same surfacing
+    /// contract as `PlayerAlarm`) at `tick` — the predicted optimal
+    /// departure a `transfer::plan_transfer` call produced. The scan
+    /// itself stays OUT of the command path: a boundary apply is not
+    /// the place for an O(grid × solve) workload, and the plan is a
+    /// pure function of the system model, so carrying its output is
+    /// exactly as replayable as a `SetAlarm` label. A `tick` at or
+    /// before the drain boundary clamps to the next tick (the
+    /// `SetAlarm` rule). `Recoverable` for unknown bodies or
+    /// `origin == destination`.
+    WatchTransferWindow {
+        /// The body the transfer departs.
+        origin: BodyId,
+        /// The body it targets.
+        destination: BodyId,
+        /// The predicted optimal departure tick.
+        tick: u64,
     },
 }
 
@@ -827,6 +903,13 @@ impl World {
         self.physics.as_ref().map(|p| p.backend.environment())
     }
 
+    /// The dominant body the bubble frame is centred on — `None` for a
+    /// physics-less world. Presentation reads this to key body-local
+    /// assets (the R2 flight-view terrain/scattering selection).
+    pub fn dominant_body(&self) -> Option<&BodyId> {
+        self.physics.as_ref().map(|p| &p.dominant)
+    }
+
     /// The §2.9 geometric ground-contact predicate applied on demand
     /// to `vessel`'s bubble body — `false` for non-`InBubble` vessels
     /// and worlds without physics. Pure geometry over already-hashed
@@ -921,6 +1004,11 @@ impl World {
             }
         }
         let mut seen = std::collections::BTreeSet::new();
+        // Vessels a pending `ManeuverNodeStart` names, with the event's
+        // tick — cross-checked against the arena's `Scheduled` nodes
+        // below (the node↔event pairing is a coherence invariant: one
+        // live event per node, AT the node's tick).
+        let mut node_events = BTreeMap::new();
         for e in &snapshot.event_heap {
             if e.tick < snapshot.clock_ticks {
                 return Err(SimError::Fatal("snapshot: event behind the clock"));
@@ -939,13 +1027,42 @@ impl World {
             let vessel = match &e.kind {
                 EventKind::SoiTransition { vessel, .. }
                 | EventKind::SoiRescan { vessel }
-                | EventKind::DebrisDecay { vessel } => Some(*vessel),
-                EventKind::PlayerAlarm { .. } => None,
+                | EventKind::DebrisDecay { vessel }
+                | EventKind::ManeuverNodeStart { vessel } => Some(*vessel),
+                EventKind::PlayerAlarm { .. } | EventKind::TransferWindow { .. } => None,
             };
             if let Some(v) = vessel
                 && !snapshot.vessels.contains_key(&v)
             {
                 return Err(SimError::Fatal("snapshot: event names unknown vessel"));
+            }
+            if let EventKind::ManeuverNodeStart { vessel: v } = &e.kind
+                && node_events.insert(*v, e.tick).is_some()
+            {
+                return Err(SimError::Fatal("snapshot: duplicate node start event"));
+            }
+        }
+        // The node↔event pairing, both directions: every `Scheduled`
+        // node has exactly one pending start event AT `node.tick` (a
+        // pairing that records only the vessel id would accept a
+        // start event at the wrong tick), and every pending start
+        // event names a `Scheduled` node. `node.tick` itself must be a
+        // live future-or-flushing tick — the same `>= clock` bound the
+        // event passed above.
+        for (id, vessel) in &snapshot.vessels {
+            let node_tick = vessel
+                .maneuver
+                .as_ref()
+                .and_then(|n| matches!(n.status, ManeuverStatus::Scheduled).then_some(n.tick));
+            match (node_tick, node_events.get(id)) {
+                (Some(tick), Some(&event_tick))
+                    if tick == event_tick && tick >= snapshot.clock_ticks => {}
+                (None, None) => {}
+                _ => {
+                    return Err(SimError::Fatal(
+                        "snapshot: scheduled node / start event mismatch",
+                    ));
+                }
             }
         }
         Ok(Self {
@@ -1216,6 +1333,7 @@ impl World {
         now: u64,
         t_next: u64,
         shadow: &mut TickShadow,
+        degraded: &mut Vec<SimError>,
     ) -> Result<(), SimError> {
         if self.physics.is_none()
             || !self
@@ -1250,6 +1368,10 @@ impl World {
             .as_mut()
             .ok_or(SimError::Fatal("bubble check raced physics"))?;
         let mut dead_vessels: Vec<VesselId> = Vec::new();
+        // M5: vessels whose node burn completed during this range —
+        // processed once, after the tick loop, when `self` is whole
+        // again and the rails conversion can be attempted.
+        let mut burns_done: BTreeSet<VesselId> = BTreeSet::new();
         for t in now..t_next {
             // Breakup bookkeeping — applied after the vessel loop so
             // map surgery never disturbs iteration. `(structural,
@@ -1267,6 +1389,13 @@ impl World {
                 };
                 if !body.pos.is_finite() {
                     return Err(SimError::Fatal("non-finite body state mid-tick"));
+                }
+                // M5 burn executor — a first-class sim mechanism, not
+                // a command stream (the maneuver module docs): while a
+                // node is `Burning` it owns this body's `throttle`,
+                // `rot`, and `ang_vel` every integer tick.
+                if drive_node_burn(&mut vessel.maneuver, body) {
+                    burns_done.insert(*vid);
                 }
                 let (v0, w0) = (body.vel, body.ang_vel);
                 physics.backend.step(std::slice::from_mut(body), &[]);
@@ -1351,8 +1480,9 @@ impl World {
                     // borrow-split above keeps the heap out of reach,
                     // and the scrub is provably dead code here —
                     // vessel-named event kinds (SoiTransition,
-                    // SoiRescan, DebrisDecay) are scheduled ONLY for
-                    // on-rails conics and are dropped at `ToBubble`,
+                    // SoiRescan, DebrisDecay, ManeuverNodeStart) are
+                    // scheduled ONLY for on-rails conics and are
+                    // dropped at `ToBubble`,
                     // so an `InBubble` vessel is never named by a
                     // pending event. Same invariant at the
                     // `max_debris` eviction and the thermal-root
@@ -1423,6 +1553,79 @@ impl World {
         for vid in dead_vessels {
             self.tracked_vessels.remove(&vid);
         }
+        self.finish_burns(&burns_done, t_next, shadow, degraded)
+    }
+
+    /// M5 burn completions: the node delivered its Δv — consume it
+    /// and return the vessel to rails at the range's end tick
+    /// (`apply_to_rails_at`'s epoch is `t_next` because the elements
+    /// are measured from the body's state at the loop's end, not at
+    /// `now`). Best-effort: a conic that no longer clears the
+    /// surface — or a vessel in atmosphere/contact — stays
+    /// bubble-resident and reports on `degraded`; the node is
+    /// consumed either way (the Δv *was* delivered — staying in
+    /// the bubble is the honest ballistic outcome, not a stall).
+    /// Vessels lost mid-range (impact, breakup) are skipped.
+    ///
+    /// `Recoverable` is not the only post-stamp failure:
+    /// `apply_to_rails_at` commits `OnRails` *before* the residence
+    /// walk and the SOI publish run, so a failure there strands the
+    /// vessel on rails with no event naming it — a silent residence
+    /// freeze, the Orbits subsystem's publish deadline lost with no
+    /// rescan to re-ask. Mirror `fire_due_events`' §2.13 fallback:
+    /// report on `degraded` and republish a bare `SoiRescan` at
+    /// `clock + DEGRADED_RESCAN_TICKS` so the deadline is never
+    /// lost. (A still-`InBubble` vessel — a pre-stamp refusal — has
+    /// no conic to scan; the republish is skipped for it.) `Fatal`
+    /// is not a degradation: it propagates so the iteration's
+    /// `TickShadow` restores the world, the same verdict
+    /// `fire_due_events` gives.
+    fn finish_burns(
+        &mut self,
+        burns_done: &BTreeSet<VesselId>,
+        t_next: u64,
+        shadow: &mut TickShadow,
+        degraded: &mut Vec<SimError>,
+    ) -> Result<(), SimError> {
+        for vid in burns_done {
+            let done = self.vessels.get(vid).is_some_and(|v| {
+                matches!(v.state, VesselState::InBubble(_))
+                    && matches!(
+                        v.maneuver.as_ref().map(|n| &n.status),
+                        Some(ManeuverStatus::Burning(_))
+                    )
+            });
+            if !done {
+                continue;
+            }
+            self.shadow_vessels(shadow);
+            let v = self
+                .vessels
+                .get_mut(vid)
+                .ok_or(SimError::Fatal("burn completion: vessel vanished"))?;
+            v.maneuver = None;
+            if let VesselState::InBubble(body) = &mut v.state {
+                body.throttle = 0.0;
+            }
+            match self.apply_to_rails_at(*vid, SimTime(t_next), shadow) {
+                Ok(()) => {}
+                Err(e @ SimError::Fatal(_)) => return Err(e),
+                Err(e) => {
+                    degraded.push(e);
+                    // Post-stamp failure ⇒ `OnRails` with the publish
+                    // consumed — republish the bare rescan deadline so
+                    // the subsystem re-asks rather than freezing
+                    // (doc above; the `fire_due_events` fallback).
+                    if self.vessels.get(vid).is_some_and(|v| v.orbit().is_some()) {
+                        self.schedule_event(
+                            EventKind::SoiRescan { vessel: *vid },
+                            self.clock.ticks().saturating_add(DEGRADED_RESCAN_TICKS),
+                            shadow,
+                        )?;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1465,10 +1668,19 @@ impl World {
     /// periapsis; a hyperbolic one decays only while still inbound
     /// (`M0 < 0` — past periapsis it escapes and the SOI-exit
     /// deletion takes it instead).
+    ///
+    /// `epoch` is the stamped elements' epoch — the tick their `M0`
+    /// refers to — and the decay is measured from it. Callers whose
+    /// epoch runs ahead of the clock (the burn executor's completion
+    /// stamps `t_next` mid-range) MUST pass it: basing `at` on the
+    /// clock would fire the decay up to `epoch − clock` ticks early —
+    /// inside the very range that stamped the conic, deleting the
+    /// vessel before its epoch is even reached.
     fn schedule_debris_decay(
         &mut self,
         vessel: VesselId,
         elements: &csp_data::KeplerElements,
+        epoch: SimTime,
         shadow: &mut TickShadow,
     ) -> Result<(), SimError> {
         let Some(p) = &self.physics else {
@@ -1502,11 +1714,10 @@ impl World {
         if !dt.is_finite() || dt < 0.0 {
             return Ok(());
         }
-        let at = self
-            .clock
+        let at = epoch
             .ticks()
             .saturating_add((dt * csp_core::TICK_HZ as f64).ceil() as u64)
-            .max(self.clock.ticks() + 1);
+            .max(epoch.ticks().saturating_add(1));
         self.schedule_event(EventKind::DebrisDecay { vessel }, at, shadow)
     }
 
@@ -1564,6 +1775,14 @@ impl World {
     /// the same direction on the same body is the degenerate
     /// `Enter{own-parent}`/`Exit{non-parent}` artifact — dropped by the
     /// scan rather than scheduled into a guaranteed-`Recoverable` event.
+    ///
+    /// The scan's origin is clamped to the clock: a `now` behind it
+    /// would scan a window the world already left and could detect a
+    /// crossing whose tick is at-or-behind the clock — an event
+    /// `schedule_event` must refuse. Callers stamping an epoch ahead of
+    /// the clock (the burn executor's `t_next`) resolve the residence
+    /// the conic already implies first ([`Self::resolve_soi_residence`]),
+    /// so what remains to scan is strictly the future.
     fn schedule_next_soi(
         &mut self,
         vessel: VesselId,
@@ -1571,6 +1790,7 @@ impl World {
         shadow: &mut TickShadow,
         suppress: Option<(BodyId, orbit::SoiDirection)>,
     ) -> Result<(), SimError> {
+        let now = SimTime(now.ticks().max(self.clock.ticks()));
         // A vessel with no conic (bubble-resident or latched) has no
         // scan to publish — the invariant is that SOI events are only
         // ever scheduled while on rails.
@@ -1593,6 +1813,7 @@ impl World {
             horizon,
             orbit::SOI_SCAN_MAX_SAMPLES,
             suppress,
+            None,
         )? {
             (Some(ev), _) => self.schedule_event(
                 EventKind::SoiTransition {
@@ -1694,21 +1915,84 @@ impl World {
             SimCommand::JettisonPart { vessel, node } => {
                 self.apply_jettison_part(*vessel, *node, shadow)?
             }
-            SimCommand::SetAlarm { tick, label } => {
-                // Alarms may not rewrite the past: at-or-past ticks clamp
-                // to the next tick (an event must sit strictly ahead of
-                // the clock — `schedule_event` enforces it).
-                let at = (*tick).max(self.clock.ticks().saturating_add(1));
-                self.schedule_event(
-                    EventKind::PlayerAlarm {
-                        label: label.clone(),
-                    },
-                    at,
-                    shadow,
-                )?;
-            }
+            SimCommand::SetManeuver {
+                vessel,
+                tick,
+                dv_prograde_mps,
+                dv_normal_mps,
+                dv_radial_mps,
+            } => self.apply_set_maneuver(
+                *vessel,
+                *tick,
+                *dv_prograde_mps,
+                *dv_normal_mps,
+                *dv_radial_mps,
+                shadow,
+            )?,
+            SimCommand::DeleteManeuver { vessel } => self.apply_delete_maneuver(*vessel, shadow)?,
+            SimCommand::WatchTransferWindow {
+                origin,
+                destination,
+                tick,
+            } => self.apply_watch_window(origin, destination, *tick, shadow)?,
+            SimCommand::SetAlarm { tick, label } => self.apply_set_alarm(*tick, label, shadow)?,
         }
         Ok(())
+    }
+
+    /// `SetAlarm`: schedule a `PlayerAlarm` (§2.6.5 `Clamping`) — a
+    /// command so the alarm is §7.6-logged and replayable. At-or-past
+    /// ticks clamp to the next tick: an event must sit strictly ahead
+    /// of the clock (`schedule_event` enforces it).
+    fn apply_set_alarm(
+        &mut self,
+        tick: u64,
+        label: &str,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        let at = tick.max(self.clock.ticks().saturating_add(1));
+        self.schedule_event(
+            EventKind::PlayerAlarm {
+                label: label.to_string(),
+            },
+            at,
+            shadow,
+        )
+    }
+
+    /// `WatchTransferWindow`: schedule a `Clamping`
+    /// [`EventKind::TransferWindow`] at the tick a
+    /// `transfer::plan_transfer` run produced — the M5
+    /// "transfer-window events" mechanism. The scan stays out of the
+    /// command path (a boundary apply is not the place for an
+    /// O(grid × solve) workload, and the plan is a pure function of
+    /// the system model anyway); the command carries its output.
+    /// Unknown bodies and `origin == destination` reject
+    /// `Recoverable`; an at-or-past tick clamps to the next tick —
+    /// the `SetAlarm` rule.
+    fn apply_watch_window(
+        &mut self,
+        origin: &BodyId,
+        destination: &BodyId,
+        tick: u64,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        if origin == destination {
+            return Err(SimError::Recoverable(
+                "transfer window: origin == destination",
+            ));
+        }
+        self.orbits.body_orbit(origin)?;
+        self.orbits.body_orbit(destination)?;
+        let at = tick.max(self.clock.ticks().saturating_add(1));
+        self.schedule_event(
+            EventKind::TransferWindow {
+                origin: origin.clone(),
+                destination: destination.clone(),
+            },
+            at,
+            shadow,
+        )
     }
 
     /// `Unlatch`: restore the latched vessel's pose and leave the
@@ -1767,10 +2051,14 @@ impl World {
                 // Elements-only vessels have no parts to heat.
                 thermal: VesselThermal::default(),
                 debris_since: None,
+                maneuver: None,
             },
         );
         // §2.6.5: publish the new vessel's next event time now — the
         // heap must hold it before `t_next` is next computed.
+        // Latent edge (M5-A backlog): residence is NOT resolved at spawn —
+        // an authored spawn inside a child's SOI stays mis-parented
+        // (`resolve_soi_residence` is not run on this path).
         self.schedule_next_soi(id, self.clock, shadow, None)
     }
 
@@ -1876,6 +2164,7 @@ impl World {
                 aero_mask: csp_phys::ConfigMask::ALL,
                 thermal: VesselThermal::at_ambient(&craft.graph, ambient_k),
                 debris_since: None,
+                maneuver: None,
             },
         );
         // No SOI publish: a bubble-resident vessel has no conic.
@@ -1890,6 +2179,28 @@ impl World {
     fn apply_to_rails(
         &mut self,
         vessel: VesselId,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        self.apply_to_rails_at(vessel, self.clock, shadow)
+    }
+
+    /// The bubble→rails conversion [`Self::apply_to_rails`] wraps with
+    /// `epoch = clock`. `epoch` is the tick the stamped elements refer
+    /// to — the command path converts at the drain boundary (the
+    /// clock), while the burn executor's completion converts a body
+    /// whose integration ran to `t_next` inside `step_bubble_range`,
+    /// so it stamps that tick instead (the elements' mean anomaly is
+    /// measured from the body's *current* state; an epoch of `now`
+    /// would re-introduce the elapsed-tick offset the epoch-anchor
+    /// exists to eliminate).
+    ///
+    /// The conversion also discards the vessel's maneuver node (the
+    /// residence-transition rule — see the `maneuver` module docs):
+    /// a manual `ToRails` mid-burn is the player taking the stick.
+    fn apply_to_rails_at(
+        &mut self,
+        vessel: VesselId,
+        epoch: SimTime,
         shadow: &mut TickShadow,
     ) -> Result<(), SimError> {
         let (env, dominant) = match &self.physics {
@@ -1940,28 +2251,204 @@ impl World {
             .get_mut(&vessel)
             .ok_or(SimError::Fatal("to-rails: vessel vanished"))?;
         let is_debris = vessel_mut.debris_since.is_some();
+        vessel_mut.maneuver = None;
         vessel_mut.state = VesselState::OnRails(OrbitState {
             parent: dominant,
             elements,
-            epoch: self.clock,
+            epoch,
         });
+        // The stamped conic is only meaningful at-or-after `epoch` —
+        // but `epoch` can sit ahead of the clock (the burn executor's
+        // completion stamps `t_next` mid-range). Any transition the
+        // conic completed inside `(clock, epoch]` is already reflected
+        // in its position at `epoch`; apply it directly rather than
+        // scheduling a `SoiTransition` at a tick the clock will have
+        // reached by the time it fires (which is what wedged the frame
+        // pre-fix: the stale-ticked Enter fired in the same flush, its
+        // rescan searched the past, and the second in-window crossing
+        // hit `schedule_event`'s ahead-of-clock guard → `Fatal`).
+        let suppress = self.resolve_soi_residence(vessel, epoch, shadow)?;
+        let Some(orbit) = self.vessels.get(&vessel).and_then(|v| v.orbit()).cloned() else {
+            // The residence walk can consume the vessel outright — a
+            // debris escape past the root's SOI deletes it in place
+            // (§2.9, `apply_soi_transition`'s Exit arm).
+            return Ok(());
+        };
         if is_debris {
             // §2.9: a debris vessel whose conic decays burns up at
-            // periapsis — schedule its own removal before the SOI scan.
-            let elements = self
-                .vessels
-                .get(&vessel)
-                .and_then(|v| v.orbit())
-                .map(|o| o.elements.clone())
-                .ok_or(SimError::Fatal("to-rails: vessel vanished"))?;
-            self.schedule_debris_decay(vessel, &elements, shadow)?;
+            // periapsis — schedule its own removal before the SOI
+            // scan. Measured from `epoch`: the elements' `M0` refers
+            // to the stamped tick, not the clock.
+            self.schedule_debris_decay(vessel, &orbit.elements, epoch, shadow)?;
         }
-        self.schedule_next_soi(vessel, self.clock, shadow, None)
+        // The scan publishes strictly-future crossings: origin at the
+        // conic's epoch (never behind the clock — `schedule_next_soi`
+        // clamps defensively too).
+        self.schedule_next_soi(
+            vessel,
+            SimTime(epoch.ticks().max(self.clock.ticks())),
+            shadow,
+            suppress,
+        )
+    }
+
+    /// §2.6.6 residence resolution at a stamped epoch. The event scan
+    /// only ever sees crossings *ahead* of its origin — a conic stamped
+    /// at `epoch > clock` whose transition fell inside `(clock, epoch]`
+    /// would otherwise carry a completed transition the schedule can
+    /// never honestly express. Residence is a point-in-time property,
+    /// so resolve it directly: while the vessel's position at `epoch`
+    /// sits inside a child's SOI (or outside the parent's), apply the
+    /// §2.6.6 re-base at `epoch` — the same frame stitch the fired
+    /// event performs — and re-ask the question in the new frame.
+    ///
+    /// Termination is structural *modulo the tolerance band*: an
+    /// Enter strictly descends the body tree (the Enter distance
+    /// test IS the child's boundary) and an Exit strictly ascends —
+    /// but the re-base's `cartesian_to_elements` round-trip
+    /// reproduces the stamped position only to ~1e-6·|r|, so a conic
+    /// stamped within that band of a boundary can read on the
+    /// *pre*-transition side in the new frame. `Enter{C}` answered
+    /// by a band-flip `Exit{C}` (and back) would ping-pong the same
+    /// boundary until the bound exhausts. The walk therefore
+    /// suppresses the immediate reverse of the last applied
+    /// transition — the mirror of the scan's first-stride `suppress`
+    /// ([`PatchedConics::next_soi_event_within`]): an `Enter{B}` may
+    /// not be answered by `Exit{B}` on the very next check, nor an
+    /// `Exit{B}` by `Enter{B}`. Inside the band the skipped reading
+    /// is the tolerance artifact; a genuinely crossed boundary reads
+    /// well outside it and would never have applied the transition
+    /// being reversed.
+    ///
+    /// With the suppress in place a transition is never its own
+    /// successor: after `Enter{B}` the only Exit candidate is B
+    /// itself (suppressed), so an Enter is followed only by a deeper
+    /// Enter or by the walk's end; after `Exit{B}` the walk may
+    /// ascend again or Enter a child other than B. The sequence is a
+    /// run of ascents then a run of descents, each bounded by the
+    /// tree height, so the body count still bounds the walk; failing
+    /// to converge is a `Fatal` invariant bug, like every other
+    /// impossible state. Returns the last applied
+    /// `(body, direction)` so the caller's publish can pass it as the
+    /// post-rebase `suppress` — the same wrong-side artifact caution
+    /// the event-driven rescan takes.
+    ///
+    /// Note the residence is evaluated on the stamped conic at `epoch`
+    /// — the position the state AT `epoch` already commits to. An
+    /// Enter+Exit pair wholly inside `(clock, epoch]` therefore nets
+    /// to *no* transition: at `epoch` the vessel is back outside the
+    /// child's SOI and the parent stays — exactly the final state the
+    /// §2.6.6 event sequence would have produced had the clock been
+    /// there to fire it.
+    fn resolve_soi_residence(
+        &mut self,
+        vessel: VesselId,
+        epoch: SimTime,
+        shadow: &mut TickShadow,
+    ) -> Result<Option<(BodyId, orbit::SoiDirection)>, SimError> {
+        let bound = self.orbits.bodies().len().max(1);
+        let mut last = None;
+        for _ in 0..bound {
+            let Some(orbit) = self.vessels.get(&vessel).and_then(|v| v.orbit()).cloned() else {
+                // Off rails (shouldn't happen — callers stamp first)
+                // or deleted mid-walk by a debris escape.
+                return Ok(last);
+            };
+            let (rv, _) = self.orbits.state_at(&orbit, epoch)?;
+            // Inside a child's SOI ⇒ the Enter applies now. First hit
+            // in `BTreeMap` order wins — sibling SOIs do not overlap
+            // in a coherent system, and the order is the §2.2
+            // deterministic one if they did.
+            let mut enter: Option<BodyId> = None;
+            for (id, b) in self.orbits.bodies() {
+                if b.parent.as_ref() != Some(&orbit.parent) {
+                    continue;
+                }
+                // Reverse-transition suppression (doc above): the
+                // body the last step's `Exit` just left may not be
+                // re-Entered on this check — a within-band reading
+                // is the re-derivation artifact, not geometry.
+                if last
+                    .as_ref()
+                    .is_some_and(|(body, dir)| *dir == orbit::SoiDirection::Exit && *body == *id)
+                {
+                    continue;
+                }
+                let Some(r_soi) = b.soi_m else { continue };
+                let Some(child_el) = b.elements.clone() else {
+                    // Same verdict the scan's `v_rel_max` step gives —
+                    // an SOI-carrying child with no elements is a
+                    // `Recoverable` input failure, here as there.
+                    return Err(SimError::Recoverable("soi residence: child has no orbit"));
+                };
+                // The child's elements are relative to the vessel's
+                // parent with epoch 0 (body.ron convention) — evaluate
+                // in the same frame, same as the `Enter` arm of
+                // `apply_soi_transition`.
+                let child_state = OrbitState {
+                    parent: orbit.parent.clone(),
+                    elements: child_el,
+                    epoch: SimTime::ZERO,
+                };
+                let (rb, _) = self.orbits.state_at(&child_state, epoch)?;
+                if rv.distance(rb) < r_soi {
+                    enter = Some(id.clone());
+                    break;
+                }
+            }
+            if let Some(child) = enter {
+                self.apply_soi_transition(
+                    vessel,
+                    &child,
+                    orbit::SoiDirection::Enter,
+                    epoch.ticks(),
+                    shadow,
+                )?;
+                last = Some((child, orbit::SoiDirection::Enter));
+                continue;
+            }
+            // Outside the parent's own SOI ⇒ the Exit applies now —
+            // `apply_soi_transition` re-checks the body is the parent
+            // and handles the debris escape-past-root deletion. The
+            // same suppression guards the other direction: a just-
+            // applied `Enter{parent}` may not be answered by an
+            // immediate Exit of that same parent on this check.
+            let exit_suppressed = last.as_ref().is_some_and(|(body, dir)| {
+                *dir == orbit::SoiDirection::Enter && *body == orbit.parent
+            });
+            if !exit_suppressed
+                && self
+                    .orbits
+                    .body_orbit(&orbit.parent)?
+                    .soi_m
+                    .is_some_and(|r_soi| rv.norm() > r_soi)
+            {
+                let parent = orbit.parent.clone();
+                self.apply_soi_transition(
+                    vessel,
+                    &parent,
+                    orbit::SoiDirection::Exit,
+                    epoch.ticks(),
+                    shadow,
+                )?;
+                last = Some((parent, orbit::SoiDirection::Exit));
+                continue;
+            }
+            return Ok(last);
+        }
+        Err(SimError::Fatal(
+            "soi residence: re-parenting did not converge",
+        ))
     }
 
     /// `ToBubble`: evaluate the on-rails conic at the current tick,
     /// re-weld the stored craft, and stamp the body's kinematics —
     /// then drop the vessel's dead SOI events (it has no conic now).
+    /// A scheduled maneuver node is discarded here too (the pending
+    /// `ManeuverNodeStart` rides the same event scrub): manual
+    /// materialization is the player taking the stick — the executor's
+    /// own node-triggered materialization is the only path that keeps
+    /// the intent (see `fire_maneuver_start`).
     fn apply_to_bubble(
         &mut self,
         vessel: VesselId,
@@ -2000,10 +2487,248 @@ impl World {
             .vessels
             .get_mut(&vessel)
             .ok_or(SimError::Fatal("to-bubble: vessel vanished"))?;
+        vessel_mut.maneuver = None;
         vessel_mut.state = VesselState::InBubble(body);
         self.ensure_aero(vessel)?;
         // The vessel's pending SOI events are dead the moment it
         // leaves rails — drop them in one re-heapify pass.
+        self.shadow_events(shadow);
+        let heap = std::mem::take(&mut self.event_heap);
+        self.event_heap = heap
+            .into_iter()
+            .filter(|e| !event_names_vessel(&e.kind, &vessel))
+            .collect();
+        Ok(())
+    }
+
+    /// `SetManeuver`: validate the executor can serve this node, store
+    /// it `Scheduled` on the vessel, and schedule the `Clamping`
+    /// `ManeuverNodeStart` at its tick. Replacing a `Scheduled` node
+    /// drops the old pending event and reschedules — a deliberate
+    /// re-plan, not an error. The executor's feasibility gate is
+    /// checked up front (module docs): `OnRails`, craft with a live
+    /// thrust site, `orbit.parent == dominant`, and a node point the
+    /// model actually solves.
+    fn apply_set_maneuver(
+        &mut self,
+        vessel: VesselId,
+        tick: u64,
+        dv_prograde_mps: f64,
+        dv_normal_mps: f64,
+        dv_radial_mps: f64,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        if !(dv_prograde_mps.is_finite() && dv_normal_mps.is_finite() && dv_radial_mps.is_finite())
+        {
+            return Err(SimError::Recoverable("maneuver: non-finite dv"));
+        }
+        if dv_prograde_mps == 0.0 && dv_normal_mps == 0.0 && dv_radial_mps == 0.0 {
+            return Err(SimError::Recoverable("maneuver: zero dv"));
+        }
+        let (dominant, min_node_r) = match &self.physics {
+            Some(p) => {
+                let env = p.backend.environment();
+                // The node point must be one the executor can honestly
+                // materialize at — above the surface, and above the
+                // atmosphere top when the body has one (the same bound
+                // `ToRails` applies: the burn's end state must be a
+                // state the rails residence can take back).
+                let atm_top = env.atmosphere.as_ref().map_or(0.0, |a| a.top_m);
+                (p.dominant.clone(), env.radius_m + atm_top)
+            }
+            None => {
+                return Err(SimError::Recoverable(
+                    "maneuver: no physics environment for the executor",
+                ));
+            }
+        };
+        let Some(v) = self.vessels.get(&vessel) else {
+            return Err(SimError::Recoverable("maneuver: unknown vessel"));
+        };
+        if matches!(
+            v.maneuver.as_ref().map(|n| &n.status),
+            Some(ManeuverStatus::Burning(_))
+        ) {
+            return Err(SimError::Recoverable(
+                "maneuver: burn in progress — delete it first",
+            ));
+        }
+        let Some(orbit) = v.orbit() else {
+            return Err(SimError::Recoverable("maneuver: vessel not on rails"));
+        };
+        if orbit.parent != dominant {
+            return Err(SimError::Recoverable(
+                "maneuver: orbit parent is not the dominant body",
+            ));
+        }
+        let Some(craft) = &v.craft else {
+            return Err(SimError::Recoverable("maneuver: vessel has no craft"));
+        };
+        if !maneuver::craft_has_thrust(craft) {
+            return Err(SimError::Recoverable("maneuver: vessel has no thrust"));
+        }
+        // The same may-not-rewrite-the-past clamp `SetAlarm` applies.
+        let at = tick.max(self.clock.ticks().saturating_add(1));
+        let node = ManeuverNode {
+            tick: at,
+            dv_prograde_mps,
+            dv_normal_mps,
+            dv_radial_mps,
+            status: ManeuverStatus::Scheduled,
+        };
+        // Feasibility of the node point itself: the state at the burn
+        // tick must solve and the orbital frame there must exist —
+        // evaluated now so a bogus node rejects instead of degrading
+        // at its tick.
+        let (r, v) = self.orbits.state_at(orbit, SimTime(at))?;
+        if r.norm() <= min_node_r {
+            return Err(SimError::Recoverable(
+                "maneuver: node point inside the surface/atmosphere floor",
+            ));
+        }
+        maneuver::node_dv_world(r, v, dv_prograde_mps, dv_normal_mps, dv_radial_mps)?;
+        self.shadow_vessels(shadow);
+        self.vessels
+            .get_mut(&vessel)
+            .ok_or(SimError::Fatal("maneuver: vessel vanished"))?
+            .maneuver = Some(node);
+        // Replacing a Scheduled node: drop the old pending start event
+        // before scheduling the new one — one live event per node.
+        self.shadow_events(shadow);
+        let heap = std::mem::take(&mut self.event_heap);
+        self.event_heap = heap
+            .into_iter()
+            .filter(
+                |e| !matches!(&e.kind, EventKind::ManeuverNodeStart { vessel: v } if v == &vessel),
+            )
+            .collect();
+        self.schedule_event(EventKind::ManeuverNodeStart { vessel }, at, shadow)
+    }
+
+    /// `DeleteManeuver`: drop the node and its pending start event —
+    /// or, mid-burn, zero the throttle and leave the vessel's
+    /// residence alone (cancel keeps the stick; it is not a free ride
+    /// back to rails).
+    fn apply_delete_maneuver(
+        &mut self,
+        vessel: VesselId,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        let Some(v) = self.vessels.get(&vessel) else {
+            return Err(SimError::Recoverable("maneuver delete: unknown vessel"));
+        };
+        if v.maneuver.is_none() {
+            return Err(SimError::Recoverable("maneuver delete: no node"));
+        }
+        self.shadow_vessels(shadow);
+        let v = self
+            .vessels
+            .get_mut(&vessel)
+            .ok_or(SimError::Fatal("maneuver delete: vessel vanished"))?;
+        if let VesselState::InBubble(body) = &mut v.state {
+            body.throttle = 0.0;
+        }
+        v.maneuver = None;
+        self.shadow_events(shadow);
+        let heap = std::mem::take(&mut self.event_heap);
+        self.event_heap = heap
+            .into_iter()
+            .filter(
+                |e| !matches!(&e.kind, EventKind::ManeuverNodeStart { vessel: v } if v == &vessel),
+            )
+            .collect();
+        Ok(())
+    }
+
+    /// `ManeuverNodeStart` firing — the executor's arming point:
+    /// evaluate the vessel's conic at the node tick, resolve the
+    /// commanded Δv through the node point's velocity frame, re-weld
+    /// the stored craft into the bubble at that state, and mark the
+    /// node `Burning` with the inertial burn direction frozen. The
+    /// vessel's now-dead SOI events are dropped in the same scrub
+    /// `ToBubble` applies.
+    ///
+    /// A stale firing (no node, vessel gone, no longer on rails) is a
+    /// `Recoverable` degradation — the caller's per-event rollback +
+    /// node-drop keeps no zombie intent. Feasibility was gated at
+    /// `SetManeuver`; what can still fail here is what changed since:
+    /// a re-parented orbit (SOI transition ahead of the node tick), a
+    /// weld failure, or a state the model no longer solves.
+    fn fire_maneuver_start(
+        &mut self,
+        vessel: VesselId,
+        tick: u64,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        let (center, dominant) = match &self.physics {
+            Some(p) => (p.backend.environment().body_center, p.dominant.clone()),
+            None => {
+                return Err(SimError::Recoverable("node start: no physics environment"));
+            }
+        };
+        let Some(v) = self.vessels.get(&vessel) else {
+            // The vessel is gone (decayed/removed) — the event is
+            // stale, like `DebrisDecay` on an already-removed vessel.
+            return Ok(());
+        };
+        let Some(node) = &v.maneuver else {
+            // The node was deleted/replaced without its event —
+            // unreachable under the pairing rule, but a stale firing
+            // is a no-op, never a lie.
+            return Ok(());
+        };
+        if !matches!(node.status, ManeuverStatus::Scheduled) {
+            return Ok(());
+        }
+        let Some(orbit) = v.orbit().cloned() else {
+            return Err(SimError::Recoverable("node start: vessel not on rails"));
+        };
+        if orbit.parent != dominant {
+            return Err(SimError::Recoverable(
+                "node start: orbit parent is not the dominant body",
+            ));
+        }
+        let Some(craft) = v.craft.clone() else {
+            return Err(SimError::Recoverable("node start: vessel has no craft"));
+        };
+        let t = SimTime(tick);
+        let (r, vel) = self.orbits.state_at(&orbit, t)?;
+        let dv = maneuver::node_dv_world(
+            r,
+            vel,
+            node.dv_prograde_mps,
+            node.dv_normal_mps,
+            node.dv_radial_mps,
+        )?;
+        let dv_total = dv.norm();
+        if !(dv_total.is_finite() && dv_total > 0.0) {
+            return Err(SimError::Recoverable("node start: degenerate dv"));
+        }
+        self.shadow_vessels(shadow);
+        let mut body = csp_phys::weld(&craft.graph, &craft.parts)
+            .map_err(|e| SimError::Recoverable(e.reason()))?;
+        // Same materialization contract as `ToBubble`: the conic
+        // contributes pos/vel only — rot/ang_vel/throttle/settle come
+        // out at the weld defaults; the executor owns rot/throttle
+        // from the first tick.
+        body.pos = r + center;
+        body.vel = vel;
+        let vessel_mut = self
+            .vessels
+            .get_mut(&vessel)
+            .ok_or(SimError::Fatal("node start: vessel vanished"))?;
+        vessel_mut.state = VesselState::InBubble(body);
+        if let Some(node) = &mut vessel_mut.maneuver {
+            node.status = ManeuverStatus::Burning(ActiveBurn {
+                burn_dir: dv / dv_total,
+                dv_total_mps: dv_total,
+                dv_remaining_mps: dv_total,
+            });
+        }
+        self.ensure_aero(vessel)?;
+        // Dead the moment the vessel left rails — drop the vessel's
+        // pending SOI events in one re-heapify pass (`ToBubble`'s
+        // scrub; the just-fired event is already popped).
         self.shadow_events(shadow);
         let heap = std::mem::take(&mut self.event_heap);
         self.event_heap = heap
@@ -2533,10 +3258,24 @@ impl World {
                 Err(e) => {
                     ev_shadow.restore(self);
                     degraded.push(e);
+                    // A failed node start leaves a `Scheduled` node
+                    // whose event is gone — a zombie that never fires.
+                    // Drop the node with the event: the failure is
+                    // already on `degraded`, and "the node died" is the
+                    // honest terminal state.
+                    if let EventKind::ManeuverNodeStart { vessel } = &event.kind {
+                        self.shadow_vessels(shadow);
+                        if let Some(v) = self.vessels.get_mut(vessel) {
+                            v.maneuver = None;
+                        }
+                    }
                     let vessel = match &event.kind {
                         EventKind::SoiTransition { vessel, .. }
-                        | EventKind::SoiRescan { vessel } => Some(*vessel),
-                        EventKind::PlayerAlarm { .. } | EventKind::DebrisDecay { .. } => None,
+                        | EventKind::SoiRescan { vessel }
+                        | EventKind::ManeuverNodeStart { vessel } => Some(*vessel),
+                        EventKind::PlayerAlarm { .. }
+                        | EventKind::DebrisDecay { .. }
+                        | EventKind::TransferWindow { .. } => None,
                     };
                     if let Some(vessel) = vessel {
                         self.schedule_event(
@@ -2563,10 +3302,16 @@ impl World {
             // fired_events`'s job, and the §2.6.5 Clamping demotion is
             // csp-app's — the sim records no notification state at M1.
             EventKind::PlayerAlarm { .. } => Ok(()),
-            // The Orbits subsystem's publish deadline: re-query.
-            EventKind::SoiRescan { vessel } => {
-                self.schedule_next_soi(*vessel, SimTime(event.tick), shadow, None)
-            }
+            // The Orbits subsystem's publish deadline: re-query. The
+            // scan origin is never behind the clock — `event.tick`
+            // equals the post-advance clock for a normally-fired event,
+            // and `schedule_next_soi` clamps the deferred-tail corner.
+            EventKind::SoiRescan { vessel } => self.schedule_next_soi(
+                *vessel,
+                SimTime(event.tick.max(self.clock.ticks())),
+                shadow,
+                None,
+            ),
             // §2.9's debris-decay removal: burn-up / impact at the
             // periapsis tick. Idempotent — an already-removed vessel
             // makes the stale event a no-op, never an error.
@@ -2584,27 +3329,33 @@ impl World {
                 direction,
             } => {
                 self.apply_soi_transition(*vessel, body, *direction, event.tick, shadow)?;
+                // The re-based conic's epoch is `event.tick`; the
+                // rescan's origin is `max(tick, clock)` — a rescan may
+                // never search the past for crossings.
                 self.schedule_next_soi(
                     *vessel,
-                    SimTime(event.tick),
+                    SimTime(event.tick.max(self.clock.ticks())),
                     shadow,
                     Some((body.clone(), *direction)),
                 )
             }
+            // M5: the node reached its burn tick — materialize the
+            // vessel at the node point and arm the executor.
+            EventKind::ManeuverNodeStart { vessel } => {
+                self.fire_maneuver_start(*vessel, event.tick, shadow)
+            }
+            // The transfer-window warning — like `PlayerAlarm`, it
+            // mutates nothing: surfacing is `fired_events`'s job.
+            EventKind::TransferWindow { .. } => Ok(()),
         }
     }
 
-    /// The §2.6.6 frame re-base at a crossing: express the vessel's
-    /// state in the new parent's frame and re-derive its elements from
-    /// the relative cartesian state — the patched-conics stitch.
-    ///
-    /// - `Enter{body}`: the vessel's new parent is `body` (a child of the
-    ///   current parent — guarded, since the scan's candidate set is
-    ///   `{parent} ∪ children(parent)`). The relative state is
-    ///   `vessel_state − child_state`, both in the old-parent frame.
-    /// - `Exit{body}`: `body` must BE the current parent (guarded); the
-    ///   new parent is the grandparent, and the vessel's state composes
-    ///   as `vessel_in_parent + parent_in_grandparent`.
+    /// The §2.6.6 frame re-base at a crossing: the stitch itself is
+    /// [`PatchedConics::rebase`] (one seam, shared with the
+    /// `transfer` module's hypothetical-conic queries) — this method
+    /// owns only the vessel-side prologue (stale-event refusals) and
+    /// the §2.9 debris-escape special case, then writes the rebased
+    /// conic onto the vessel.
     ///
     /// A failed re-derivation (`Recoverable`) propagates: the boundary
     /// aborts and the shadow rolls the iteration back — at M1 there is
@@ -2632,78 +3383,23 @@ impl World {
         else {
             return Err(SimError::Recoverable("soi event: vessel not on rails"));
         };
-        let (rv, vv) = self.orbits.state_at(&orbit, t)?;
-        let new_orbit = match direction {
-            orbit::SoiDirection::Enter => {
-                let child = self.orbits.body_orbit(body)?;
-                if child.parent.as_ref() != Some(&orbit.parent) {
-                    return Err(SimError::Recoverable(
-                        "soi enter: target is not a child of the vessel's parent",
-                    ));
-                }
-                let child_el = child
-                    .elements
-                    .clone()
-                    .ok_or(SimError::Recoverable("soi enter: child has no orbit"))?;
-                // The child's elements are relative to the vessel's
-                // current parent with epoch = sim-time 0 (body.ron
-                // convention), so its state evaluates in the same frame.
-                let child_state = OrbitState {
-                    parent: orbit.parent.clone(),
-                    elements: child_el,
-                    epoch: SimTime::ZERO,
-                };
-                let (rb, vb) = self.orbits.state_at(&child_state, t)?;
-                let elements = orbit::cartesian_to_elements(rv - rb, vv - vb, child.mu_m3_per_s2)?;
-                OrbitState {
-                    parent: body.clone(),
-                    elements,
-                    epoch: t,
-                }
-            }
-            orbit::SoiDirection::Exit => {
-                if &orbit.parent != body {
-                    return Err(SimError::Recoverable(
-                        "soi exit: event body is not the vessel's parent",
-                    ));
-                }
-                let old_parent = self.orbits.body_orbit(body)?;
-                if old_parent.parent.is_none()
-                    && self
-                        .vessels
-                        .get(&vessel_id)
-                        .is_some_and(|v| v.debris_since.is_some())
-                {
-                    // §2.9: debris leaving the outermost SOI is deleted.
-                    self.remove_vessel(vessel_id, shadow);
-                    return Ok(());
-                }
-                let grandparent = old_parent
-                    .parent
-                    .clone()
-                    .ok_or(SimError::Recoverable("soi exit: parent has no parent"))?;
-                let parent_el = old_parent
-                    .elements
-                    .clone()
-                    .ok_or(SimError::Recoverable("soi exit: parent has no orbit"))?;
-                // The old parent's elements are relative to the
-                // grandparent at epoch 0 — compose `vessel_in_parent +
-                // parent_in_grandparent` for the grandparent-frame state.
-                let parent_state = OrbitState {
-                    parent: grandparent.clone(),
-                    elements: parent_el,
-                    epoch: SimTime::ZERO,
-                };
-                let (rp, vp) = self.orbits.state_at(&parent_state, t)?;
-                let mu_g = self.orbits.body_orbit(&grandparent)?.mu_m3_per_s2;
-                let elements = orbit::cartesian_to_elements(rv + rp, vv + vp, mu_g)?;
-                OrbitState {
-                    parent: grandparent,
-                    elements,
-                    epoch: t,
-                }
-            }
-        };
+        // §2.9: debris leaving the outermost SOI is deleted — the
+        // grandparent-less Exit `rebase` would refuse anyway; this
+        // intercepts it as a removal instead of a degradation. (Guard
+        // mirrors `rebase`'s Exit checks so the intercept can't shadow
+        // a legitimate error.)
+        if direction == orbit::SoiDirection::Exit
+            && orbit.parent == *body
+            && self.orbits.body_orbit(body)?.parent.is_none()
+            && self
+                .vessels
+                .get(&vessel_id)
+                .is_some_and(|v| v.debris_since.is_some())
+        {
+            self.remove_vessel(vessel_id, shadow);
+            return Ok(());
+        }
+        let new_orbit = self.orbits.rebase(&orbit, body, direction, t)?;
         self.vessels
             .get_mut(&vessel_id)
             .ok_or(SimError::Fatal("soi event: vessel vanished"))?
@@ -2807,7 +3503,7 @@ impl World {
             // now` (`now..t_next` is empty; the subsystem advance is
             // guarded).
             if t_next > now
-                && let Err(e) = self.step_bubble_range(now, t_next, &mut shadow)
+                && let Err(e) = self.step_bubble_range(now, t_next, &mut shadow, &mut degraded)
             {
                 shadow.restore(self);
                 return Err(e);
@@ -2933,15 +3629,113 @@ impl Default for World {
     }
 }
 
+/// The M5 executor's per-tick drive for one InBubble body: attitude
+/// is the weld's net thrust axis aligned to the frozen inertial
+/// `burn_dir`; throttle is full until the last tick, which is
+/// throttled so delivered Δv lands exactly on the node's command —
+/// the bookkeeping is `throttle·|F_net|·dt/m`, literally the impulse
+/// the §2.9 integrator applies this tick. A craft that loses its
+/// thrust mid-burn (jettison, breakup) stalls: throttle pinned at
+/// zero, the countdown holds — honest partial delivery.
+///
+/// Returns `true` on the tick the countdown reaches zero — the
+/// caller collects the completion (node consumption + the rails
+/// conversion run after the range, when `self` is whole again).
+fn drive_node_burn(node: &mut Option<ManeuverNode>, body: &mut WeldedBody) -> bool {
+    let Some(ManeuverStatus::Burning(burn)) = node.as_mut().map(|n| &mut n.status) else {
+        return false;
+    };
+    let (f_local, f_max) = maneuver::net_thrust_axis(body);
+    if !(f_max > 0.0 && body.mass_kg > 0.0) {
+        body.throttle = 0.0;
+        return false;
+    }
+    body.rot = maneuver::align_rotation(f_local / f_max, burn.burn_dir);
+    body.ang_vel = DVec3::ZERO;
+    let full = f_max * csp_phys::PHYSICS_DT / body.mass_kg;
+    if burn.dv_remaining_mps <= full {
+        body.throttle = burn.dv_remaining_mps / full;
+        burn.dv_remaining_mps = 0.0;
+        return true;
+    }
+    body.throttle = 1.0;
+    burn.dv_remaining_mps -= full;
+    false
+}
+
 /// Does this scheduled event name `vessel`? Used by the `ToBubble`
-/// apply to drop the vessel's dead SOI events when it leaves rails.
+/// apply and the node-start materialization to drop the vessel's dead
+/// events when it leaves rails — SOI events (no conic to scan) and
+/// `ManeuverNodeStart` (a manual transition discards the intent;
+/// `remove_vessel` relies on the same set).
 fn event_names_vessel(kind: &EventKind, vessel: &VesselId) -> bool {
     match kind {
         EventKind::SoiTransition { vessel: v, .. }
         | EventKind::SoiRescan { vessel: v }
-        | EventKind::DebrisDecay { vessel: v } => v == vessel,
-        EventKind::PlayerAlarm { .. } => false,
+        | EventKind::DebrisDecay { vessel: v }
+        | EventKind::ManeuverNodeStart { vessel: v } => v == vessel,
+        EventKind::PlayerAlarm { .. } | EventKind::TransferWindow { .. } => false,
     }
+}
+
+/// M5 node coherence for [`restore_vessel_state`]: finite components
+/// everywhere, and the lifecycle bound to residence — `Scheduled`
+/// only on rails (the pending-event half is cross-checked by the
+/// caller against the heap), `Burning` only where a body exists
+/// (InBubble, or latched mid-burn — the countdown holds until
+/// unlatch). Incoherent input is `Fatal`, like every other violated
+/// invariant.
+fn check_restored_maneuver(vessel: &Vessel) -> Result<(), SimError> {
+    let Some(node) = &vessel.maneuver else {
+        return Ok(());
+    };
+    if !(node.dv_prograde_mps.is_finite()
+        && node.dv_normal_mps.is_finite()
+        && node.dv_radial_mps.is_finite())
+    {
+        return Err(SimError::Fatal("snapshot: non-finite node dv"));
+    }
+    match &node.status {
+        ManeuverStatus::Scheduled => {
+            if !matches!(vessel.state, VesselState::OnRails(_)) {
+                return Err(SimError::Fatal(
+                    "snapshot: scheduled node on a non-rails vessel",
+                ));
+            }
+        }
+        ManeuverStatus::Burning(burn) => {
+            if !(burn.burn_dir.is_finite()
+                && burn.dv_total_mps.is_finite()
+                && burn.dv_remaining_mps.is_finite())
+            {
+                return Err(SimError::Fatal("snapshot: non-finite burn state"));
+            }
+            // The burn's quantitative shape: a positive total (the
+            // executor arms only on a nonzero Δv — `fire_maneuver_
+            // start` rejects degenerate dv), a unit `burn_dir` (it is
+            // stamped `dv / |dv|`), and a countdown inside its range
+            // — a `remaining` outside `[0, total]` would run the
+            // executor backward or never terminate.
+            if burn.dv_total_mps <= 0.0 {
+                return Err(SimError::Fatal("snapshot: non-positive burn dv_total"));
+            }
+            if (burn.burn_dir.norm() - 1.0).abs() > 1e-6 {
+                return Err(SimError::Fatal("snapshot: burn direction not unit"));
+            }
+            if burn.dv_remaining_mps < 0.0 || burn.dv_remaining_mps > burn.dv_total_mps {
+                return Err(SimError::Fatal(
+                    "snapshot: burn remaining outside [0, total]",
+                ));
+            }
+            if !matches!(
+                vessel.state,
+                VesselState::InBubble(_) | VesselState::SurfaceLatched(_)
+            ) {
+                return Err(SimError::Fatal("snapshot: burning node without a body"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// §7.3 restore validation per vessel. `InBubble` bodies are rebuilt
@@ -2950,6 +3744,7 @@ fn event_names_vessel(kind: &EventKind, vessel: &VesselId) -> bool {
 /// serialized kinematic/control/settle fields back on. `SurfaceLatched`
 /// keeps only the fixed-frame pose record; `OnRails` needs nothing.
 fn restore_vessel_state(vessel: &mut Vessel, has_physics: bool) -> Result<(), SimError> {
+    check_restored_maneuver(vessel)?;
     // M4b: the serialized thermal record must match the craft one-to-
     // one — every graph node has exactly one temperature, finite and
     // non-negative, and a craft-less vessel has none.
@@ -3350,6 +4145,9 @@ fn apply_breakup(
                         .collect(),
                 },
                 debris_since: Some(tick),
+                // Breakup fragments never inherit a burn — the node
+                // stays with the retained vessel only.
+                maneuver: None,
             },
         );
     }
@@ -3428,6 +4226,11 @@ fn hash_vessel(h: &mut StateHasher, vessel: &Vessel) {
     // M4c: debris bookkeeping is hashed sim state (caps + eviction order).
     h.opt(&vessel.debris_since, |h, t| {
         h.u64(*t);
+    });
+    // M5: the scheduled-Δv intent — a node changes the future, so it is
+    // forward-looking state like the event heap.
+    h.opt(&vessel.maneuver, |h, node| {
+        maneuver::hash_maneuver(h, node);
     });
     // M4b: the authoritative per-part temperature record — serialized
     // state, hashed like the body's kinematics.
@@ -4765,6 +5568,7 @@ mod tests {
                 craft: None,
                 aero_mask: csp_phys::ConfigMask::ALL,
                 debris_since: None,
+                maneuver: None,
                 thermal: VesselThermal::default(),
                 state: VesselState::OnRails(OrbitState {
                     parent: BodyId::from("p"),
@@ -4817,6 +5621,7 @@ mod tests {
                 SimTime(span),
                 orbit::SOI_SCAN_MAX_SAMPLES,
                 None,
+                None,
             )
             .unwrap();
         assert!(ev.is_none());
@@ -4849,6 +5654,7 @@ mod tests {
                 SimTime(0),
                 SimTime(span),
                 orbit::SOI_SCAN_MAX_SAMPLES,
+                None,
                 None,
             )
             .unwrap();
@@ -6509,6 +7315,7 @@ mod tests {
                 aero_mask: csp_phys::ConfigMask::ALL,
                 thermal: VesselThermal::default(),
                 debris_since: None,
+                maneuver: None,
             },
         );
         let mut physics = Physics {
@@ -6696,5 +7503,1232 @@ mod tests {
         let own_gh = craft_graph_hash(frag.craft.as_ref().unwrap());
         assert_eq!(rebuilt.graph_hash, own_gh, "stale table was rebuilt");
         assert_ne!(rebuilt.graph_hash, parent_gh);
+    }
+
+    // ---- M5 maneuver nodes + executor --------------------------------
+
+    /// A physical orbiter on rails: spawn the box craft `InBubble` on
+    /// a circular equatorial orbit at `alt_m` over `p`, then `ToRails`
+    /// it — the maneuver tests' vessel fixture.
+    fn orbital_vessel(w: &mut World, alt_m: f64, thrust_n: f64) -> VesselId {
+        let r = TERRIN_R + alt_m;
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SpawnPhysicalVessel {
+                craft: box_craft(1_000.0, DVec3::new(0.5, 0.5, 1.5), thrust_n),
+                pos: DVec3::new(r, 0.0, 0.0),
+                rot: csp_core::DQuat::IDENTITY,
+                vel: DVec3::new(0.0, libm::sqrt(3.5316e12 / r), 0.0),
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        let id = VesselId(0);
+        w.enqueue(SourceClass::Ui, 0, SimCommand::ToRails { vessel: id });
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(
+            w.vessels()[&id].orbit().is_some(),
+            "orbiter failed to reach rails"
+        );
+        id
+    }
+
+    fn set_node(w: &mut World, vessel: VesselId, tick: u64, dv: [f64; 3]) {
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SetManeuver {
+                vessel,
+                tick,
+                dv_prograde_mps: dv[0],
+                dv_normal_mps: dv[1],
+                dv_radial_mps: dv[2],
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(
+            r.rejected.is_empty(),
+            "SetManeuver rejected: {:?}",
+            r.rejected
+        );
+    }
+
+    /// `SetManeuver` stores the node and schedules the `Clamping`
+    /// `ManeuverNodeStart`, which fires at the node tick and arms the
+    /// burn (vessel materializes InBubble, status `Burning`).
+    #[test]
+    fn maneuver_node_fires_clamping_at_tick() {
+        let mut w = physics_world(false);
+        let id = orbital_vessel(&mut w, 200_000.0, 50_000.0);
+        let node_tick = w.clock().ticks() + 640;
+        set_node(&mut w, id, node_tick, [25.0, 0.0, 0.0]);
+        let node = w.vessels()[&id].maneuver.as_ref().unwrap();
+        assert_eq!(node.tick, node_tick);
+        assert!(matches!(node.status, ManeuverStatus::Scheduled));
+        // One tick short: nothing yet.
+        w.step_frame(node_tick - 1).unwrap();
+        assert!(matches!(
+            w.vessels()[&id].maneuver.as_ref().unwrap().status,
+            ManeuverStatus::Scheduled
+        ));
+        // The tick itself: the Clamping event fires and the burn arms.
+        let report = w.step_frame(node_tick).unwrap();
+        let start = report
+            .fired_events
+            .iter()
+            .find(|e| matches!(e.kind, EventKind::ManeuverNodeStart { vessel } if vessel == id))
+            .expect("ManeuverNodeStart did not fire");
+        assert_eq!(start.class, EventClass::Clamping);
+        assert!(matches!(
+            w.vessels()[&id].maneuver.as_ref().unwrap().status,
+            ManeuverStatus::Burning(_)
+        ));
+        assert!(matches!(w.vessels()[&id].state, VesselState::InBubble(_)));
+    }
+
+    /// The executor delivers the commanded Δv: a prograde node's
+    /// post-burn conic matches the analytic `predict_maneuver`
+    /// expectation within finite-burn tolerance — and the vessel
+    /// returns to rails with throttle zeroed.
+    #[test]
+    fn maneuver_executor_delivers_commanded_dv() {
+        let mut w = physics_world(false);
+        let id = orbital_vessel(&mut w, 200_000.0, 50_000.0); // 50 m/s²
+        let node_tick = w.clock().ticks() + 640;
+        set_node(&mut w, id, node_tick, [100.0, 0.0, 0.0]);
+        let predicted = maneuver::predict_maneuver(
+            w.orbits(),
+            w.vessels()[&id].orbit().unwrap(),
+            w.vessels()[&id].maneuver.as_ref().unwrap(),
+        )
+        .unwrap();
+        // 100 m/s at 50 m/s² → ~2 s burn. Advance well past it.
+        w.step_frame(node_tick + 3_200).unwrap();
+        let orbit = w.vessels()[&id]
+            .orbit()
+            .expect("post-burn vessel did not return to rails")
+            .clone();
+        assert!(w.vessels()[&id].maneuver.is_none());
+        let got = &orbit.elements;
+        let want = &predicted.elements;
+        // Finite-burn tolerance: the burn spreads its Δv over ~2 s of
+        // arc, so agreement is to ~0.1%, not bitwise.
+        assert!(
+            (got.semi_major_axis_m - want.semi_major_axis_m).abs() / want.semi_major_axis_m < 1e-3,
+            "a: got {} want {}",
+            got.semi_major_axis_m,
+            want.semi_major_axis_m
+        );
+        assert!(
+            (got.eccentricity - want.eccentricity).abs() < 1e-3,
+            "e: got {} want {}",
+            got.eccentricity,
+            want.eccentricity
+        );
+        // Prograde burn raises apoapsis: e > 0 and rp ≈ start radius.
+        assert!(got.eccentricity > 1e-4);
+        let rp = got.semi_major_axis_m * (1.0 - got.eccentricity);
+        assert!((rp - 8.0e5).abs() / 8.0e5 < 0.02, "rp {rp}");
+    }
+
+    /// A node on a hyperbolic orbit executes the same way — open
+    /// conics have a well-defined velocity frame at the node point.
+    #[test]
+    fn maneuver_node_on_hyperbolic_orbit() {
+        let mut w = physics_world(false);
+        // Spawn on the escape hyperbola used by the crossing tests.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SpawnVessel {
+                parent: BodyId::from("p"),
+                elements: crossing_vessel_elements(),
+            },
+        );
+        w.step_frame(1).unwrap();
+        // Elements-only vessels can't burn (no craft) — swap in a
+        // physical hyperbolic craft via the bubble path instead.
+        assert!(w.vessels()[&VesselId(0)].craft.is_none());
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SetManeuver {
+                vessel: VesselId(0),
+                tick: w.clock().ticks() + 64,
+                dv_prograde_mps: 10.0,
+                dv_normal_mps: 0.0,
+                dv_radial_mps: 0.0,
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert_eq!(r.rejected.len(), 1, "craft-less node must reject");
+        // Physical hyperbolic vessel: spawn the craft on the same
+        // conic's cartesian state and ToRails it.
+        let el = crossing_vessel_elements();
+        let os = OrbitState {
+            parent: BodyId::from("p"),
+            elements: el,
+            epoch: SimTime::ZERO,
+        };
+        let (r0, v0) = w.orbits().state_at(&os, SimTime::ZERO).unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SpawnPhysicalVessel {
+                craft: box_craft(1_000.0, DVec3::new(0.5, 0.5, 1.5), 50_000.0),
+                pos: r0,
+                rot: csp_core::DQuat::IDENTITY,
+                vel: v0,
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        let id = VesselId(1);
+        w.enqueue(SourceClass::Ui, 0, SimCommand::ToRails { vessel: id });
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(
+            w.vessels()[&id]
+                .orbit()
+                .is_some_and(|o| o.elements.eccentricity > 1.0)
+        );
+        let node_tick = w.clock().ticks() + 256;
+        set_node(&mut w, id, node_tick, [20.0, 5.0, 0.0]);
+        w.step_frame(node_tick + 2_000).unwrap();
+        // The burn ran and the vessel escaped back to rails (a
+        // hyperbolic post-burn conic still clears the surface).
+        let orbit = w.vessels()[&id]
+            .orbit()
+            .expect("hyperbolic vessel did not return to rails");
+        assert!(orbit.elements.eccentricity > 1.0);
+    }
+
+    /// `DeleteManeuver` mid-burn cancels: throttle zeroes, the node is
+    /// gone, and the vessel keeps its residence (no free rails ride).
+    #[test]
+    fn maneuver_cancel_mid_burn() {
+        let mut w = physics_world(false);
+        let id = orbital_vessel(&mut w, 200_000.0, 5_000.0); // 5 m/s²
+        let node_tick = w.clock().ticks() + 128;
+        set_node(&mut w, id, node_tick, [200.0, 0.0, 0.0]); // ~40 s burn
+        w.step_frame(node_tick + 320).unwrap();
+        // Mid-burn assertions: burning, throttle hot.
+        assert!(matches!(
+            w.vessels()[&id].maneuver.as_ref().unwrap().status,
+            ManeuverStatus::Burning(_)
+        ));
+        assert!(w.vessels()[&id].body().unwrap().throttle > 0.0);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::DeleteManeuver { vessel: id },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty());
+        assert!(w.vessels()[&id].maneuver.is_none());
+        assert_eq!(w.vessels()[&id].body().unwrap().throttle, 0.0);
+        assert!(matches!(w.vessels()[&id].state, VesselState::InBubble(_)));
+        // And it stays where the cancel left it — the burn never
+        // resumes.
+        w.step_frame(w.clock().ticks() + 1_000).unwrap();
+        assert!(w.vessels()[&id].maneuver.is_none());
+        assert_eq!(w.vessels()[&id].body().unwrap().throttle, 0.0);
+    }
+
+    /// `DeleteManeuver` on a `Scheduled` node drops the pending event
+    /// too — stepping past the tick fires nothing.
+    #[test]
+    fn maneuver_delete_scheduled_drops_event() {
+        let mut w = physics_world(false);
+        let id = orbital_vessel(&mut w, 200_000.0, 50_000.0);
+        let node_tick = w.clock().ticks() + 640;
+        set_node(&mut w, id, node_tick, [25.0, 0.0, 0.0]);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::DeleteManeuver { vessel: id },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty());
+        let report = w.step_frame(node_tick + 10).unwrap();
+        assert!(
+            !report
+                .fired_events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::ManeuverNodeStart { .. })),
+            "deleted node's event still fired"
+        );
+        assert!(w.vessels()[&id].maneuver.is_none());
+        assert!(w.vessels()[&id].orbit().is_some());
+    }
+
+    /// The node's §7.2 round-trip: a snapshot taken with a `Scheduled`
+    /// node restores a world whose hash is identical — the node is
+    /// serialized sim state, not a derived artifact.
+    #[test]
+    fn maneuver_node_snapshot_round_trip() {
+        let mut w = physics_world(false);
+        let id = orbital_vessel(&mut w, 200_000.0, 50_000.0);
+        let node_tick = w.clock().ticks() + 640;
+        set_node(&mut w, id, node_tick, [25.0, -5.0, 3.0]);
+        let snap = w.snapshot().unwrap();
+        let mut restored = World::restore(
+            test_system(),
+            Some(PhysicsConfig {
+                environment: test_env(false),
+                dominant: BodyId::from("p"),
+            }),
+            snap,
+        )
+        .unwrap();
+        assert_eq!(w.state_hash().unwrap(), restored.state_hash().unwrap());
+        // The restored world fires the node exactly like the original.
+        let report = restored.step_frame(node_tick).unwrap();
+        assert!(
+            report
+                .fired_events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::ManeuverNodeStart { .. }))
+        );
+    }
+
+    /// The hash covers the node: two worlds differing only in a
+    /// scheduled node hash differently — scheduled intent is state.
+    #[test]
+    fn maneuver_node_is_hashed_state() {
+        let mk = || {
+            let mut w = physics_world(false);
+            orbital_vessel(&mut w, 200_000.0, 50_000.0);
+            w
+        };
+        let mut a = mk();
+        let b = mk();
+        let node_tick = a.clock().ticks() + 640;
+        set_node(&mut a, VesselId(0), node_tick, [25.0, 0.0, 0.0]);
+        assert_ne!(
+            a.state_hash().unwrap(),
+            b.state_hash().unwrap(),
+            "scheduled node did not change the hash"
+        );
+    }
+
+    /// Executor feasibility gates at the command: elements-only
+    /// vessels, wrong parent, and latched/bubble residences reject.
+    #[test]
+    fn maneuver_set_rejects_infeasible() {
+        let mut w = physics_world(false);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SpawnVessel {
+                parent: BodyId::from("m"),
+                elements: circular_elements(1.0e6, 0.0),
+            },
+        );
+        w.step_frame(1).unwrap();
+        // Wrong parent (moon, not the dominant planet).
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SetManeuver {
+                vessel: VesselId(0),
+                tick: 100,
+                dv_prograde_mps: 5.0,
+                dv_normal_mps: 0.0,
+                dv_radial_mps: 0.0,
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert_eq!(r.rejected.len(), 1);
+        // A node on a world with no physics at all rejects too.
+        let mut bare = World::with_system(test_system());
+        bare.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SpawnVessel {
+                parent: BodyId::from("p"),
+                elements: leo_elements(),
+            },
+        );
+        bare.step_frame(1).unwrap();
+        bare.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SetManeuver {
+                vessel: VesselId(0),
+                tick: 100,
+                dv_prograde_mps: 5.0,
+                dv_normal_mps: 0.0,
+                dv_radial_mps: 0.0,
+            },
+        );
+        let r = bare.step_frame(bare.clock().ticks() + 1).unwrap();
+        assert_eq!(r.rejected.len(), 1);
+    }
+
+    // ---- M5-A stale-clock wedge regression -------------------------
+
+    /// The transit fixture's shrunken moon SOI — small enough that the
+    /// whole `m` transit fits inside one `MAX_TICKS_PER_FRAME` range.
+    const TRANSIT_SOI: f64 = 1.5e5;
+
+    /// The wedge scenario's vessel conic: an e = 0.9 ellipse about `p`
+    /// (rp = 7e5, ra ≈ 1.3e7) that crosses `m`'s orbital radius on the
+    /// outbound leg — M0 = 0 puts it at periapsis at sim-time 0.
+    fn transit_vessel_elements() -> KeplerElements {
+        KeplerElements {
+            semi_major_axis_m: 6.85e6,
+            eccentricity: 0.9,
+            inclination_rad: 0.0,
+            ascending_node_rad: 0.0,
+            arg_periapsis_rad: core::f64::consts::PI, // apoapsis toward +x
+            mean_anomaly_epoch_rad: 0.0,
+            period_s: f64::INFINITY,
+        }
+    }
+
+    /// `test_system` with `m`'s SOI shrunk to [`TRANSIT_SOI`] and its
+    /// phase set to `moon_m0` — aimed so the boundary sits on the
+    /// transit conic's outbound crossing of `RASK_A`.
+    fn transit_system(moon_m0: f64) -> PatchedConics {
+        let mut bodies = BTreeMap::new();
+        bodies.insert(
+            BodyId::from("sol"),
+            BodyOrbit {
+                mu_m3_per_s2: MU_SOLEN,
+                soi_m: None,
+                parent: None,
+                elements: None,
+            },
+        );
+        bodies.insert(
+            BodyId::from("p"),
+            BodyOrbit {
+                mu_m3_per_s2: MU_TERRIN,
+                soi_m: Some(TERRIN_SOI),
+                parent: Some(BodyId::from("sol")),
+                elements: Some(circular_elements(TERRIN_A, 0.0)),
+            },
+        );
+        bodies.insert(
+            BodyId::from("m"),
+            BodyOrbit {
+                mu_m3_per_s2: MU_RASK,
+                soi_m: Some(TRANSIT_SOI),
+                parent: Some(BodyId::from("p")),
+                elements: Some(circular_elements(RASK_A, moon_m0)),
+            },
+        );
+        PatchedConics::new(bodies)
+    }
+
+    /// Build the wedge world: `test_system`'s bodies with `m`'s SOI at
+    /// [`TRANSIT_SOI`] and its phase aimed so the boundary sits on the
+    /// vessel conic's outbound crossing of `RASK_A`. Returns the world
+    /// with the physical vessel already on rails, plus the stamped
+    /// conic's measured `(enter, exit)` ticks through the SOI.
+    fn transit_world() -> (World, VesselId, u64, u64) {
+        let vs = OrbitState {
+            parent: BodyId::from("p"),
+            elements: transit_vessel_elements(),
+            epoch: SimTime::ZERO,
+        };
+        let probe = test_system();
+        // The first outbound crossing of m's orbital radius — the aim
+        // point for the moon's phase.
+        let mut prev = 0.0;
+        let mut tau_c = 0u64;
+        for t in (0..=6_000_000u64).step_by(64) {
+            let (r, _) = probe.state_at(&vs, SimTime(t)).unwrap();
+            let rn = r.norm();
+            if prev != 0.0 && (prev - RASK_A).signum() != (rn - RASK_A).signum() {
+                tau_c = t;
+                break;
+            }
+            prev = rn;
+        }
+        assert!(tau_c > 0, "transit conic never crosses m's orbital radius");
+        let (rc, _) = probe.state_at(&vs, SimTime(tau_c)).unwrap();
+        let n_moon = libm::sqrt(MU_TERRIN / (RASK_A * RASK_A * RASK_A));
+        let moon_m0 = libm::atan2(rc.y, rc.x) - n_moon * SimTime(tau_c).seconds();
+        let mut w = World::with_physics(
+            transit_system(moon_m0),
+            PhysicsConfig {
+                environment: test_env(false),
+                dominant: BodyId::from("p"),
+            },
+            DEFAULT_MAX_EVENTS_PER_FRAME,
+        );
+        let (r0, v0) = w.orbits().state_at(&vs, SimTime::ZERO).unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SpawnPhysicalVessel {
+                craft: box_craft(1_000.0, DVec3::new(0.5, 0.5, 1.5), 50_000.0),
+                pos: r0,
+                rot: csp_core::DQuat::IDENTITY,
+                vel: v0,
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        w.step_frame(1).unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::ToRails {
+                vessel: VesselId(0),
+            },
+        );
+        let r = w.step_frame(2).unwrap();
+        assert!(r.rejected.is_empty(), "to-rails rejected: {:?}", r.rejected);
+        // The stamped conic's measured transit interval through the
+        // aimed SOI — the events' true ticks on the vessel's orbit.
+        let orbit = w.vessels()[&VesselId(0)].orbit().cloned().unwrap();
+        let moon = OrbitState {
+            parent: BodyId::from("p"),
+            elements: circular_elements(RASK_A, moon_m0),
+            epoch: SimTime::ZERO,
+        };
+        let mut inside = false;
+        let (mut tau1, mut tau2) = (0u64, 0u64);
+        for t in (tau_c.saturating_sub(400_000)..=tau_c + 400_000).step_by(8) {
+            let (rv, _) = w.orbits().state_at(&orbit, SimTime(t)).unwrap();
+            let (rm, _) = w.orbits().state_at(&moon, SimTime(t)).unwrap();
+            let sep = rv.distance(rm);
+            if !inside && sep < TRANSIT_SOI {
+                inside = true;
+                tau1 = t;
+            } else if inside && sep > TRANSIT_SOI {
+                tau2 = t;
+                break;
+            }
+        }
+        assert!(inside && tau2 > tau1, "no SOI transit on the stamped conic");
+        assert!(
+            tau2 - tau1 < 60_000,
+            "transit ({tau2} - {tau1}) does not fit the wedge range"
+        );
+        (w, VesselId(0), tau1, tau2)
+    }
+
+    /// Enter AND Exit wholly inside one advance range: the burn
+    /// completes mid-range, `finish_burns` stamps the conic at
+    /// `t_next`, and the vessel is back outside `m`'s SOI there — the
+    /// pair nets to no transition and the final residence stays `p`.
+    /// Pre-fix this frame wedged: the stale-ticked Enter fired in the
+    /// same flush, its rescan searched the past, and the Exit's tick
+    /// failed `schedule_event`'s ahead-of-clock guard → `Fatal` on
+    /// every replay.
+    #[test]
+    fn burn_completion_transit_inside_one_range_does_not_wedge() {
+        let (mut w, id, tau1, tau2) = transit_world();
+        // Node armed just before the Enter; the tiny burn is incidental
+        // to the geometry — what matters is `finish_burns` stamping the
+        // conic at the range's end tick.
+        let node_tick = tau1 - 2_000;
+        set_node(&mut w, id, node_tick, [5.0, 0.0, 0.0]);
+        while w.clock().ticks() < node_tick {
+            w.step_frame(node_tick).unwrap();
+        }
+        assert!(matches!(w.vessels()[&id].state, VesselState::InBubble(_)));
+        let target = node_tick + 60_000;
+        assert!(tau2 <= target, "Exit must land inside the wedge range");
+        w.step_frame(target).unwrap();
+        let orbit = w.vessels()[&id]
+            .orbit()
+            .expect("vessel did not return to rails");
+        assert_eq!(
+            orbit.parent,
+            BodyId::from("p"),
+            "Enter+Exit inside one range must net to no transition"
+        );
+        assert!(w.vessels()[&id].maneuver.is_none());
+        // The wedge was permanent — the sim must keep advancing.
+        w.step_frame(w.clock().ticks() + 10_000).unwrap();
+    }
+
+    /// Enter inside the range with the Exit still ahead: at `t_next`
+    /// the vessel IS inside `m`'s SOI, so residence resolution applies
+    /// the transition in place (parent = `m`, epoch = `t_next`). On
+    /// this fixture the re-based conic is *bound* about `m` — the
+    /// relative speed at transit is below `m`'s escape speed — so the
+    /// honest §2.6.6 outcome is capture: the vessel stays `m`-resident
+    /// and the rescan chain keeps watching.
+    #[test]
+    fn burn_completion_inside_soi_resolves_residence() {
+        let (mut w, id, tau1, tau2) = transit_world();
+        let node_tick = tau1 - 2_000;
+        set_node(&mut w, id, node_tick, [5.0, 0.0, 0.0]);
+        while w.clock().ticks() < node_tick {
+            w.step_frame(node_tick).unwrap();
+        }
+        let mid = (tau1 + tau2) / 2;
+        w.step_frame(mid).unwrap();
+        let orbit = w.vessels()[&id]
+            .orbit()
+            .expect("vessel did not return to rails")
+            .clone();
+        assert_eq!(
+            orbit.parent,
+            BodyId::from("m"),
+            "inside the SOI at the stamped epoch — the Enter resolves in place"
+        );
+        assert_eq!(orbit.epoch, SimTime(mid));
+        // The re-based conic is bound about `m` (the transit's relative
+        // speed is sub-escape at this altitude) — patched conics then
+        // keep the vessel `m`-resident for good, and the publish
+        // deadline survives as a `SoiRescan` in the heap.
+        assert!(
+            w.event_heap
+                .iter()
+                .any(|e| event_names_vessel(&e.kind, &id)),
+            "the resolved residence still needs a publish deadline"
+        );
+        w.step_frame(tau2 + 5_000).unwrap();
+        assert_eq!(
+            w.vessels()[&id].orbit().unwrap().parent,
+            BodyId::from("m"),
+            "a bound m-conic never exits — capture is the honest outcome"
+        );
+    }
+
+    // -- M5-B: transfer-window events -----------------------------------
+
+    /// `WatchTransferWindow` schedules a `Clamping` `TransferWindow`
+    /// event at its tick — the M5 "transfer-window events" deliverable,
+    /// same surfacing contract as `PlayerAlarm` (§2.6.5).
+    #[test]
+    fn watch_transfer_window_fires_clamping_at_its_tick() {
+        let mut w = World::with_system(test_system());
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::WatchTransferWindow {
+                origin: BodyId::from("p"),
+                destination: BodyId::from("m"),
+                tick: 100,
+            },
+        );
+        w.step_frame(1).unwrap(); // drains at tick 0
+        assert!(
+            w.event_heap
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::TransferWindow { .. })),
+            "the window watch must be in the heap"
+        );
+        let r = w.step_frame(100).unwrap();
+        assert_eq!(r.reached_tick, 100);
+        assert_eq!(r.fired_events.len(), 1);
+        let e = &r.fired_events[0];
+        assert_eq!(e.tick, 100);
+        assert_eq!(e.class, EventClass::Clamping);
+        assert!(matches!(
+            &e.kind,
+            EventKind::TransferWindow { origin, destination }
+                if origin == &BodyId::from("p") && destination == &BodyId::from("m")
+        ));
+        // Firing mutates nothing — same contract as PlayerAlarm.
+        assert!(w.event_heap.is_empty());
+    }
+
+    /// The `SetAlarm` rule applies: an at-or-past window tick clamps
+    /// to the next tick; unknown bodies and `origin == destination`
+    /// reject `Recoverable` onto the report's channel.
+    #[test]
+    fn watch_transfer_window_clamps_and_rejects() {
+        let mut w = World::with_system(test_system());
+        w.step_frame(50).unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::WatchTransferWindow {
+                origin: BodyId::from("p"),
+                destination: BodyId::from("m"),
+                tick: 30, // behind the clock
+            },
+        );
+        let r = w.step_frame(51).unwrap();
+        assert_eq!(r.fired_events.len(), 1);
+        assert_eq!(r.fired_events[0].tick, 51); // clamped to clock + 1
+        // Unknown body / self-pair rejections.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::WatchTransferWindow {
+                origin: BodyId::from("p"),
+                destination: BodyId::from("nowhere"),
+                tick: 100,
+            },
+        );
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::WatchTransferWindow {
+                origin: BodyId::from("p"),
+                destination: BodyId::from("p"),
+                tick: 100,
+            },
+        );
+        let r2 = w.step_frame(60).unwrap();
+        assert_eq!(r2.rejected.len(), 2);
+        assert!(
+            r2.rejected
+                .iter()
+                .all(|(_, e)| matches!(e, SimError::Recoverable(_)))
+        );
+    }
+
+    /// The scheduled watch is hashed sim state: two worlds differing
+    /// only in a pending `TransferWindow` differ in `state_hash`, and
+    /// a snapshot round-trips the pending event bit-identically (the
+    /// serialized set feeds `restore`'s class-coherence check).
+    #[test]
+    fn watch_transfer_window_is_hashed_and_restored() {
+        let mut w = World::with_system(test_system());
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::WatchTransferWindow {
+                origin: BodyId::from("p"),
+                destination: BodyId::from("m"),
+                tick: 500,
+            },
+        );
+        w.step_frame(1).unwrap();
+        let mut baseline = World::with_system(test_system());
+        baseline.step_frame(1).unwrap();
+        assert_ne!(w.state_hash().unwrap(), baseline.state_hash().unwrap());
+        let snap = w.snapshot().unwrap();
+        let mut restored = World::restore(w.orbits().clone(), None, snap).unwrap();
+        assert_eq!(restored.state_hash().unwrap(), w.state_hash().unwrap());
+        let r = restored.step_frame(500).unwrap();
+        assert!(
+            r.fired_events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::TransferWindow { .. }))
+        );
+    }
+
+    // ---- M5-C: Duva end-to-end reachability --------------------------
+
+    /// Home-system constants the generic `sol`/`p`/`m` fixtures don't
+    /// carry — the authored §3.0 Duva leg
+    /// (`data/systems/home/duva/body.ron`).
+    const MU_DUVA: f64 = 3.0137e11;
+    const DUVA_SOI: f64 = 4.79e7;
+    const DUVA_A: f64 = 2.07e10;
+    const DUVA_R: f64 = 3.2e5;
+    const RASK_R: f64 = 2.0e5;
+    const DUVA_E: f64 = 0.051;
+    const DUVA_I: f64 = 0.001_047_197_551_196_597_6; // 0.060°
+
+    /// The authored four-body home system (`data/systems/home`):
+    /// solen → terrin (→ rask) + duva, physical radii included so the
+    /// encounter machinery can flag impacts. `test_system`'s sol/p/m
+    /// table is the reduced stand-in; this fixture is the real system
+    /// the M5 exit row names.
+    fn home_system() -> PatchedConics {
+        let mut bodies = BTreeMap::new();
+        bodies.insert(
+            BodyId::from("solen"),
+            BodyOrbit {
+                mu_m3_per_s2: MU_SOLEN,
+                soi_m: None,
+                parent: None,
+                elements: None,
+            },
+        );
+        bodies.insert(
+            BodyId::from("terrin"),
+            BodyOrbit {
+                mu_m3_per_s2: MU_TERRIN,
+                soi_m: Some(TERRIN_SOI),
+                parent: Some(BodyId::from("solen")),
+                elements: Some(circular_elements(TERRIN_A, 0.0)),
+            },
+        );
+        bodies.insert(
+            BodyId::from("rask"),
+            BodyOrbit {
+                mu_m3_per_s2: MU_RASK,
+                soi_m: Some(RASK_SOI),
+                parent: Some(BodyId::from("terrin")),
+                elements: Some(circular_elements(RASK_A, 0.0)),
+            },
+        );
+        bodies.insert(
+            BodyId::from("duva"),
+            BodyOrbit {
+                mu_m3_per_s2: MU_DUVA,
+                soi_m: Some(DUVA_SOI),
+                parent: Some(BodyId::from("solen")),
+                elements: Some(KeplerElements {
+                    semi_major_axis_m: DUVA_A,
+                    eccentricity: DUVA_E,
+                    inclination_rad: DUVA_I,
+                    ascending_node_rad: 0.0,
+                    arg_periapsis_rad: 0.0,
+                    mean_anomaly_epoch_rad: 0.0,
+                    period_s: f64::INFINITY,
+                }),
+            },
+        );
+        let mut m = PatchedConics::new(bodies);
+        m.set_body_radius(&BodyId::from("terrin"), TERRIN_R);
+        m.set_body_radius(&BodyId::from("rask"), RASK_R);
+        m.set_body_radius(&BodyId::from("duva"), DUVA_R);
+        m
+    }
+
+    /// M5's missing end-to-end proof: Duva is reachable **in-sim** —
+    /// through the real chain, not a planted conic. The vessel rides
+    /// the whole path the game will drive: `SpawnPhysicalVessel` with
+    /// a thrusting craft-def → `ToRails` → `SetManeuver` → the
+    /// executor's `ManeuverNodeStart`-armed burn → the §2.6.6
+    /// `SoiTransition` machinery (`Exit{terrin}`, solen cruise,
+    /// `Enter{duva}`). The criterion's "reachable" half lands when the
+    /// Enter event fires and the vessel re-bases `duva`-parented;
+    /// "landable" is the §6.4 reduced-scope cut (a `dominant=duva`
+    /// bubble world) — see PLAN §6.4.
+    ///
+    /// Burn construction — a solved egress, not `departure_node`:
+    /// `departure_node` is documented to NOT compose to arrival on its
+    /// own (the burn rides up to a parking period ahead of the window
+    /// and SOI egress is instantaneous in the model, so the achieved
+    /// solen conic misses `r2` without a mid-course correction — and no
+    /// correction is possible in-sim: the executor serves only
+    /// `orbit.parent == physics.dominant`). Instead this test solves
+    /// the egress state directly: take `plan.conic`'s real outbound
+    /// Terrin-SOI crossing `t_c`, rotate the exit direction `m̂` a few
+    /// degrees off the plan's own exit point, Lambert-solve the solen
+    /// leg `m̂·r_soi + r_terrin(t_c) → r_duva(t_arr)` back into a
+    /// terrin-frame velocity `v_e`, and keep the candidate whose
+    /// hyperbola `H` through `(x_e, v_e)` is a genuine escape with
+    /// periapsis above the surface — the executor's post-burn
+    /// `to_rails` refuses conics that intersect the surface even
+    /// outbound, which rules out stitching `plan.conic`'s nearly
+    /// radial egress verbatim (its terrin-frame fit lands a ~58 m
+    /// periapsis). The parking orbit is phased through `H`'s outbound
+    /// point at parking radius, and the node's Δv is
+    /// `v_H(t_b) − v_vessel(t_b)` resolved into the §2.8 velocity
+    /// frame at the node tick — so the vessel exits the SOI in the
+    /// designed state and the rebase lands it on a conic that arrives
+    /// at Duva's centre. Finite-burn smear (~0.4 s at 10 kN/kg,
+    /// centred on t_b by pulling the node half a burn early),
+    /// spawn→rails stamp noise, and ±1-tick quantisation move the
+    /// achieved conic off `H` by ~1e-3 of the leg — the live
+    /// `Enter{duva}` lands ~18 min off the model prediction.
+    /// Everything the world-driving half of the Duva test needs from
+    /// the model-level design half: the plan, the solved egress
+    /// hyperbola `H`, the burn point on it, the parking orbit that
+    /// reaches it, and the model-predicted `Enter{duva}` tick the live
+    /// event is checked against.
+    struct DuvaInjection {
+        plan: transfer::TransferPlan,
+        /// The solved egress hyperbola's SOI-egress tick.
+        t_c: u64,
+        /// Burn tick on H's outbound leg (radius = `r_park`).
+        t_b: u64,
+        /// H's state at `t_b` — the burn point and its velocity.
+        burn: (DVec3, DVec3),
+        /// Parking-orbit radius the burn point sits at.
+        r_park: f64,
+        /// H's plane normal — the parking orbit's `ĥ`.
+        h_hat: DVec3,
+        /// `predict_encounter`'s `Enter{duva}` tick for the designed
+        /// egress — the live event's comparison point.
+        predicted_enter_tick: u64,
+    }
+
+    /// The Terrin→Duva porkchop window — same shape as
+    /// `transfer::tests::duva_query`: a ~0.9-synodic-period departure
+    /// range starting one sim-day out (the burn must sit ahead of the
+    /// spawn ticks), durations bracketing the Hohmann TOF.
+    fn duva_query() -> transfer::PorkchopQuery {
+        let a_t = (TERRIN_A + DUVA_A) / 2.0;
+        let t_h = core::f64::consts::PI * libm::sqrt(a_t * a_t * a_t / MU_SOLEN);
+        let n_t = libm::sqrt(MU_SOLEN / (TERRIN_A * TERRIN_A * TERRIN_A));
+        let n_d = libm::sqrt(MU_SOLEN / (DUVA_A * DUVA_A * DUVA_A));
+        let synodic = core::f64::consts::TAU / (n_t - n_d);
+        let hz_f = csp_core::TICK_HZ as f64;
+        transfer::PorkchopQuery {
+            origin: BodyId::from("terrin"),
+            destination: BodyId::from("duva"),
+            depart_lo: csp_core::TICK_HZ * 21_600,
+            depart_hi: (synodic * 0.9 * hz_f) as u64,
+            duration_lo: (t_h * 0.4 * hz_f) as u64,
+            duration_hi: (t_h * 1.6 * hz_f) as u64,
+            depart_cells: 24,
+            duration_cells: 24,
+            depart_cost: transfer::EndCost::CircularPark(TERRIN_R + 2.0e5),
+            arrive_cost: transfer::EndCost::AtInfinity,
+            max_revs: 0,
+        }
+    }
+
+    /// `plan.conic`'s real outbound crossing of `soi_m` about `origin`:
+    /// the first tick after `departure_tick` whose body separation
+    /// reaches the SOI radius (the conic is stamped at the origin's
+    /// centre and recedes — the first crossing is the egress).
+    fn first_soi_crossing(
+        model: &PatchedConics,
+        conic: &OrbitState,
+        origin: &BodyId,
+        soi_m: f64,
+        from: u64,
+        to: u64,
+    ) -> u64 {
+        let sep = |t: u64| -> f64 {
+            let (rp, _) = model.state_at(conic, SimTime(t)).unwrap();
+            let (rt, _) = model.body_state(origin, SimTime(t)).unwrap();
+            rp.distance(rt) - soi_m
+        };
+        assert!(sep(from) < 0.0, "conic starts outside the SOI");
+        let (mut lo, mut hi) = (from, from);
+        while sep(hi) < 0.0 {
+            lo = hi;
+            hi = hi.saturating_add(262_144); // 4096 s strides, then bisect
+            assert!(hi <= to, "conic never egresses the SOI");
+        }
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if sep(mid) < 0.0 { lo = mid } else { hi = mid }
+        }
+        hi
+    }
+
+    /// Solve the survivable egress hyperbola for the injection — see
+    /// the test's doc for why the naive `plan.conic` stitch cannot be
+    /// used. Rotates the exit direction `m̂` ±17° off the plan's own
+    /// egress point in the `(x_c, v_c)` plane, Lambert-solves the solen
+    /// leg back to a terrin-frame velocity, and keeps the candidate
+    /// whose hyperbola is a genuine escape with periapsis above the
+    /// 600 km surface. Returns `(H, x_e, v_e, predicted_enter_tick)`.
+    fn solve_egress_hyperbola(
+        model: &PatchedConics,
+        plan: &transfer::TransferPlan,
+        t_c: u64,
+        pred_horizon: SimTime,
+    ) -> (OrbitState, DVec3, DVec3, u64) {
+        let terrin = BodyId::from("terrin");
+        let (r_plan_c, v_plan_c) = model.state_at(&plan.conic, SimTime(t_c)).unwrap();
+        let (r_ter_c, v_ter_c) = model.body_state(&terrin, SimTime(t_c)).unwrap();
+        let x_c = r_plan_c - r_ter_c;
+        let v_c = v_plan_c - v_ter_c;
+        let m_axis = x_c.cross(v_c);
+        let x_hat_c = x_c / x_c.norm();
+        let (r_duv_arr, _) = model
+            .body_state(&plan.destination, SimTime(plan.arrival_tick))
+            .unwrap();
+        let tof = SimTime(plan.arrival_tick).seconds() - SimTime(t_c).seconds();
+        let mut best: Option<(f64, OrbitState, DVec3, DVec3)> = None;
+        for k in -120i32..=120 {
+            let theta = k as f64 * (0.30 / 120.0);
+            let x_e = DQuat::from_axis_angle(m_axis, theta).rotate(x_hat_c) * TERRIN_SOI;
+            let Ok(Some(leg)) =
+                transfer::lambert(x_e + r_ter_c, r_duv_arr, tof, MU_SOLEN, plan.leg.way)
+            else {
+                continue;
+            };
+            let v_e = leg.v1 - v_ter_c;
+            // Genuine escape only: outbound through the boundary point,
+            // hyperbolic about terrin, periapsis above the surface.
+            if x_e.dot(v_e) <= 0.0 || v_e.norm() < 400.0 {
+                continue;
+            }
+            let Ok(el) = orbit::cartesian_to_elements(x_e, v_e, MU_TERRIN) else {
+                continue;
+            };
+            if el.eccentricity <= 1.0 {
+                continue;
+            }
+            let rp = el.semi_major_axis_m.abs() * (el.eccentricity - 1.0);
+            if !(6.9e5..=TERRIN_SOI * 0.5).contains(&rp) {
+                continue;
+            }
+            let score = (rp - 8.0e5).abs();
+            if best.as_ref().is_none_or(|(s, _, _, _)| score < *s) {
+                best = Some((
+                    score,
+                    OrbitState {
+                        parent: terrin.clone(),
+                        elements: el,
+                        epoch: SimTime(t_c),
+                    },
+                    x_e,
+                    v_e,
+                ));
+            }
+        }
+        let (_, h_orbit, x_e, v_e) =
+            best.expect("no survivable egress hyperbola in ±17° of the plan's exit");
+        // Sanity: the designed egress DOES land the solen conic on
+        // duva — verified through the same rebase the fired event will
+        // perform, not just by the Lambert construction.
+        let egress_rebased = model
+            .rebase(&h_orbit, &terrin, SoiDirection::Exit, SimTime(t_c))
+            .unwrap();
+        let confirm =
+            transfer::predict_encounter(model, &egress_rebased, SimTime(t_c), pred_horizon)
+                .unwrap()
+                .expect("the designed egress must land on duva's SOI");
+        assert_eq!(confirm.event.direction, SoiDirection::Enter);
+        assert_eq!(confirm.event.body, plan.destination);
+        (h_orbit, x_e, v_e, confirm.event.tick)
+    }
+
+    /// The burn design for the injection: H's periapsis tick is
+    /// analytic (hyperbolic `M = 0` at periapsis, `M = M_e + n·Δt`),
+    /// then the outbound `r = r_park` crossing is bisected forward —
+    /// a strided scan can step clean over a narrow below-parking dip.
+    /// Returns `(t_b, (p_b, v_H(t_b)), r_park)`.
+    fn egress_burn_point(model: &PatchedConics, h: &OrbitState) -> (u64, (DVec3, DVec3), f64) {
+        let h_el = &h.elements;
+        let r_p_h = h_el.semi_major_axis_m.abs() * (h_el.eccentricity - 1.0);
+        let r_park = 8.0e5_f64.max(r_p_h * 1.25 + 5.0e4);
+        assert!(
+            r_park < TERRIN_SOI * 0.5,
+            "parking radius {r_park} leaves no burn room under the SOI"
+        );
+        let rad = |t: u64| -> f64 { model.state_at(h, SimTime(t)).unwrap().0.norm() - r_park };
+        let a_h = h_el.semi_major_axis_m.abs();
+        let n_h = libm::sqrt(MU_TERRIN / (a_h * a_h * a_h));
+        let hz_f = csp_core::TICK_HZ as f64;
+        let t_peri =
+            ((h.epoch.seconds() - h_el.mean_anomaly_epoch_rad / n_h) * hz_f).round() as u64;
+        assert!(rad(t_peri) < 0.0, "H's periapsis clears parking radius");
+        let (mut blo, mut bhi) = (t_peri, h.epoch.ticks());
+        while bhi - blo > 1 {
+            let mid = blo + (bhi - blo) / 2;
+            if rad(mid) < 0.0 { blo = mid } else { bhi = mid }
+        }
+        let t_b = bhi;
+        (t_b, model.state_at(h, SimTime(t_b)).unwrap(), r_park)
+    }
+
+    /// The model-level design half of the Duva test: plan, verify, and
+    /// solve everything the injection needs before the world is built.
+    fn design_duva_injection(model: &PatchedConics) -> DuvaInjection {
+        let terrin = BodyId::from("terrin");
+        let duva = BodyId::from("duva");
+        let plan = transfer::plan_transfer(model, &duva_query()).unwrap();
+        // Model-level gate first (the piece the M5-B tests already
+        // proved): `plan.conic` itself reaches Duva's SOI — without
+        // that, no burn construction can rescue the leg.
+        let pred_horizon = SimTime(plan.arrival_tick.saturating_add(csp_core::TICK_HZ * 86_400));
+        let pred = transfer::predict_encounter_excluding(
+            model,
+            &plan.conic,
+            SimTime(plan.departure_tick),
+            pred_horizon,
+            Some(&terrin),
+        )
+        .unwrap()
+        .expect("the plan's own conic must reach duva");
+        assert_eq!(pred.event.direction, SoiDirection::Enter);
+        assert_eq!(pred.event.body, duva);
+        // The conic's real outbound SOI crossing — the egress tick the
+        // solved hyperbola is anchored to.
+        let t_c = first_soi_crossing(
+            model,
+            &plan.conic,
+            &terrin,
+            TERRIN_SOI,
+            plan.departure_tick,
+            plan.arrival_tick,
+        );
+        let (h_orbit, x_e, v_e, predicted_enter_tick) =
+            solve_egress_hyperbola(model, &plan, t_c, pred_horizon);
+        let (t_b, burn, r_park) = egress_burn_point(model, &h_orbit);
+        DuvaInjection {
+            plan,
+            t_c,
+            t_b,
+            burn,
+            r_park,
+            h_hat: x_e.cross(v_e) / x_e.cross(v_e).norm(),
+            predicted_enter_tick,
+        }
+    }
+
+    /// Spawn the injection's orbiter: a circular parking orbit at
+    /// `r_park` in H's plane, phased through the burn point at `t_b`
+    /// (the spawn state is the exact two-body back-propagation of it),
+    /// with a 10 kN/kg craft — a ~0.4 s burn is near-impulsive, so the
+    /// finite-burn smear stays far under the SOI error budget (the
+    /// executor integrates the real thrust; this is the honest finite
+    /// burn, just short).
+    fn spawn_duva_orbiter(model: &PatchedConics, inj: &DuvaInjection) -> (World, VesselId) {
+        let (p_b, _) = inj.burn;
+        let v_park_b = inj.h_hat.cross(p_b) / p_b.norm() * libm::sqrt(MU_TERRIN / inj.r_park);
+        let (r0, v0) =
+            orbit::propagate(p_b, v_park_b, MU_TERRIN, -SimTime(inj.t_b).seconds()).unwrap();
+        let mut w = World::with_physics(
+            model.clone(),
+            PhysicsConfig {
+                environment: test_env(false),
+                dominant: BodyId::from("terrin"),
+            },
+            DEFAULT_MAX_EVENTS_PER_FRAME,
+        );
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SpawnPhysicalVessel {
+                craft: box_craft(1_000.0, DVec3::new(0.5, 0.5, 1.5), 1.0e7),
+                pos: r0,
+                rot: csp_core::DQuat::IDENTITY,
+                vel: v0,
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        w.step_frame(1).unwrap();
+        let id = VesselId(0);
+        w.enqueue(SourceClass::Ui, 0, SimCommand::ToRails { vessel: id });
+        let r = w.step_frame(2).unwrap();
+        assert!(r.rejected.is_empty(), "to-rails rejected: {:?}", r.rejected);
+        assert!(w.vessels()[&id].orbit().is_some());
+        assert!(
+            w.clock().ticks() < inj.t_b,
+            "burn tick is not ahead of the spawn drain"
+        );
+        (w, id)
+    }
+
+    /// Advance `w` to `bound` collecting the vessel's `SoiTransition`
+    /// fires — returns `(saw Exit{terrin}, Enter{duva} tick)`.
+    fn cruise_duva(w: &mut World, id: VesselId, bound: u64) -> (bool, Option<u64>) {
+        let terrin = BodyId::from("terrin");
+        let duva = BodyId::from("duva");
+        let (mut seen_exit, mut enter) = (false, None);
+        while w.clock().ticks() < bound && enter.is_none() {
+            let target = w
+                .clock()
+                .ticks()
+                .saturating_add(MAX_TICKS_PER_FRAME)
+                .min(bound);
+            let r = w.step_frame(target).unwrap();
+            assert!(r.rejected.is_empty(), "rejected: {:?}", r.rejected);
+            assert!(r.degraded.is_empty(), "degraded: {:?}", r.degraded);
+            for e in &r.fired_events {
+                if let EventKind::SoiTransition {
+                    vessel,
+                    body,
+                    direction,
+                } = &e.kind
+                    && *vessel == id
+                {
+                    if *body == terrin && *direction == SoiDirection::Exit {
+                        seen_exit = true;
+                    }
+                    if *body == duva && *direction == SoiDirection::Enter {
+                        enter = Some(e.tick);
+                    }
+                }
+            }
+        }
+        (seen_exit, enter)
+    }
+
+    #[test]
+    fn duva_reachable_in_sim_end_to_end() {
+        let model = home_system();
+        let terrin = BodyId::from("terrin");
+        let duva = BodyId::from("duva");
+        let hz = csp_core::TICK_HZ;
+        let inj = design_duva_injection(&model);
+        let (mut w, id) = spawn_duva_orbiter(&model, &inj);
+
+        // SetManeuver: the node's Δv is `v_H(t_b) − v_vessel(t_b)`
+        // resolved in the §2.8 frame at the NODE tick (the executor's
+        // own evaluation point — the delivered world vector is exactly
+        // `dv_world`). The node is pulled half a burn early so the
+        // ~0.4 s burn arc centres on t_b — the achieved conic then
+        // reads as the impulsive burn AT the design point.
+        let stamped = w.vessels()[&id].orbit().unwrap().clone();
+        let (_, v_v_b) = model.state_at(&stamped, SimTime(inj.t_b)).unwrap();
+        let dv_world = inj.burn.1 - v_v_b;
+        let burn_ticks = (dv_world.norm() / (1.0e7 / 1_000.0) * hz as f64).ceil() as u64;
+        let node_tick = inj.t_b.saturating_sub(burn_ticks / 2);
+        let (r_v_n, v_v_n) = model.state_at(&stamped, SimTime(node_tick)).unwrap();
+        let (pro, nrm, rad_f) = maneuver::burn_frame(r_v_n, v_v_n).unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SetManeuver {
+                vessel: id,
+                tick: node_tick,
+                dv_prograde_mps: dv_world.dot(pro),
+                dv_normal_mps: dv_world.dot(nrm),
+                dv_radial_mps: dv_world.dot(rad_f),
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(
+            r.rejected.is_empty(),
+            "SetManeuver rejected: {:?}",
+            r.rejected
+        );
+        // Cruise to the node; the Clamping ManeuverNodeStart arms the
+        // executor there, the finite burn runs, and the vessel returns
+        // to rails on a conic that should be H to ~1e-3 of the leg.
+        while w.clock().ticks() < inj.t_b {
+            w.step_frame(inj.t_b).unwrap();
+        }
+        w.step_frame(inj.t_b + 10_000).unwrap();
+        let post = w.vessels()[&id]
+            .orbit()
+            .expect("post-burn vessel did not return to rails")
+            .clone();
+        assert_eq!(post.parent, terrin, "post-burn residence must be terrin");
+        assert!(
+            post.elements.eccentricity > 1.0,
+            "post-burn conic is not the escape hyperbola: e={}",
+            post.elements.eccentricity
+        );
+        // Model-level read of the achieved conic: it must still
+        // predict the same Exit{terrin} egress.
+        let post_pred = transfer::predict_encounter(
+            &model,
+            &post,
+            post.epoch,
+            SimTime(inj.t_c.saturating_add(hz * 86_400)),
+        )
+        .unwrap()
+        .expect("the achieved conic must still egress terrin's SOI");
+        assert_eq!(post_pred.event.body, terrin);
+        assert_eq!(post_pred.event.direction, SoiDirection::Exit);
+
+        // Cruise: Exit{terrin} fires, then Enter{duva} fires.
+        let bound = inj
+            .plan
+            .arrival_tick
+            .saturating_add(hz.saturating_mul(1_000_000));
+        let (seen_exit, enter) = cruise_duva(&mut w, id, bound);
+        assert!(seen_exit, "Exit{{terrin}} never fired");
+        let enter_tick =
+            enter.expect("Enter{duva} never fired — the transfer conic missed the SOI");
+        // The live Enter lands within the prediction's SOI-crossing
+        // window (± the transit slack of the achieved conic vs plan).
+        let slack = inj.predicted_enter_tick.abs_diff(enter_tick);
+        assert!(
+            slack < hz * 21_600,
+            "Enter{{duva}} at {enter_tick}, predicted {} (slack {slack} ticks)",
+            inj.predicted_enter_tick
+        );
+        assert_eq!(
+            w.vessels()[&id].orbit().unwrap().parent,
+            duva,
+            "the Enter re-base must leave the vessel duva-parented"
+        );
+        // And it is a genuine hyperbolic arrival in duva's frame, not a
+        // spurious re-parent — the same claim the model-level approach
+        // geometry makes.
+        let arr = w.vessels()[&id].orbit().unwrap();
+        assert!(
+            arr.elements.eccentricity > 1.0,
+            "duva arrival conic is not hyperbolic: e={}",
+            arr.elements.eccentricity
+        );
     }
 }
