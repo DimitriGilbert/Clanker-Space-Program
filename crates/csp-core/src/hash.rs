@@ -74,7 +74,30 @@ use crate::SimError;
 /// and `TransferWindow` (discriminant 5 — M5's transfer-window event,
 /// scheduled by `SimCommand::WatchTransferWindow`) — appended, never
 /// renumbered. Bumped for the golden rebless.
-pub const HASH_SCHEMA_VERSION: u32 = 7;
+///
+/// **Version 8** (M6-B): the walk gained the §2.4 docking config
+/// (construction config that changes state evolution), the live
+/// transient-joint list + refused-pair set (hashed-never-serialized —
+/// §7.4 refuses the boundary while a joint island is live), and the
+/// per-part `dock_ports` face specs inside `hash_craft`. Bumped for
+/// the golden rebless.
+///
+/// **Version 9** (M6-C): `hash_vessel` gained the §2.4 `DockSeam`
+/// records (`port_a`/`port_b`/`seam_node`/`local_a`/`local_b`/
+/// `latch_tick`) — serialized state that outlives the transient and
+/// must hash like the rest of the vessel — plus the latch settle
+/// tunables on the docking config. `SimCommand::Undock` lands as an
+/// append-only enum variant; `Vessel.seams` is a save-schema change,
+/// so the goldens rebless.
+///
+/// **Version 10** (M6-D): `hash_vessel` gained tank contents +
+/// crew seat records, `hash_craft` gained the resolved `tanks`/
+/// `crew_seats` specs, and the world walk gained the transfer config,
+/// `next_crew_id`/`next_transfer_id` counters, and the in-flight
+/// transfer arena. `SimCommand::{TransferResource, TransferCrew,
+/// BoardCrew}` and `EventKind::TransferComplete` land as append-only
+/// enum variants; the goldens rebless.
+pub const HASH_SCHEMA_VERSION: u32 = 10;
 
 /// Rule-7 sum types: the source of an enum's *declared* stable `u16`
 /// discriminant (PLAN §7.1 rule 7).

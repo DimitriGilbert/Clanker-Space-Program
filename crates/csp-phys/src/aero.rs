@@ -100,6 +100,7 @@ use csp_core::{DVec3, SimError};
 use csp_data::AeroDef;
 
 use crate::graph::{PartGraph, PartNodeId};
+use crate::hull::facet_planes;
 use crate::part::WeldPart;
 use crate::weld::WeldedBody;
 
@@ -471,65 +472,6 @@ impl VoxelGrid {
     }
 }
 
-/// Half-open facet plane, outward normal — the voxelizer's
-/// containment test primitive for solid hulls.
-struct Plane {
-    n: DVec3,
-    d: f64,
-}
-
-/// Detect a hull's facet planes from its vertex set: a vertex triple
-/// forms a facet when every other vertex lies on one side. `O(n⁴)` in
-/// the vertex count — `n` is a convex hull's extreme-point count
-/// (8 for the ubiquitous box), so this stays cheap at craft scale.
-/// Returns `None` for degenerate inputs the solid path cannot handle
-/// (<3 vertices, or a fully coplanar set — those rasterize as flats).
-fn facet_planes(verts: &[DVec3], plane_eps: f64) -> Option<Vec<Plane>> {
-    if verts.len() < 3 {
-        return None;
-    }
-    let n = verts.len();
-    let mut planes = Vec::new();
-    for a in 0..n {
-        for b in (a + 1)..n {
-            for c in (b + 1)..n {
-                let normal = (verts[b] - verts[a]).cross(verts[c] - verts[a]);
-                let len = normal.norm();
-                if len < plane_eps * plane_eps {
-                    continue;
-                }
-                let nu = normal / len;
-                let d = nu.dot(verts[a]);
-                let mut min_d = f64::INFINITY;
-                let mut max_d = f64::NEG_INFINITY;
-                for (i, v) in verts.iter().enumerate() {
-                    if i == a || i == b || i == c {
-                        continue;
-                    }
-                    let dist = nu.dot(*v) - d;
-                    min_d = min_d.min(dist);
-                    max_d = max_d.max(dist);
-                }
-                if max_d <= plane_eps {
-                    planes.push(Plane { n: nu, d });
-                } else if min_d >= -plane_eps {
-                    planes.push(Plane { n: -nu, d: -d });
-                }
-            }
-        }
-    }
-    // Coplanar degenerate: every vertex within eps of the first facet
-    // plane → the "solid" is a flat polygon.
-    let first = planes.first()?;
-    let coplanar = verts
-        .iter()
-        .all(|v| (first.n.dot(*v) - first.d).abs() <= plane_eps);
-    if coplanar || planes.len() < 3 {
-        return None;
-    }
-    Some(planes)
-}
-
 /// Point-in-triangle test (3D): `p` is within `tol` metres of the
 /// triangle's plane and inside all three edge half-planes expanded by
 /// `tol`. The edge terms are normalized by edge length so the
@@ -579,8 +521,7 @@ fn rasterize_hull(grid: &mut VoxelGrid, verts: &[DVec3], slot: u32, tol: f64) ->
         hi = DVec3::new(hi.x.max(v.x), hi.y.max(v.y), hi.z.max(v.z));
     }
     let e = grid.edge;
-    let diag = (hi - lo).norm();
-    let plane_eps = 1e-9 * diag.max(1.0);
+    let plane_eps = crate::hull::plane_epsilon(verts);
     let idx = |p: f64, o: f64| -> i64 { libm::floor((p - o) / e) as i64 };
     let i0 = idx(lo.x - tol, grid.origin.x);
     let i1 = idx(hi.x + tol, grid.origin.x);
@@ -1464,6 +1405,9 @@ mod tests {
 
     fn box_part(mass_kg: f64, half: DVec3, com: DVec3) -> WeldPart {
         WeldPart {
+            dock_ports: vec![],
+            tanks: vec![],
+            crew_seats: 0,
             structural: csp_data::StructuralDef::unlimited(),
             mass_kg,
             com,
@@ -1671,6 +1615,9 @@ mod tests {
             }
         }
         let p = WeldPart {
+            dock_ports: vec![],
+            tanks: vec![],
+            crew_seats: 0,
             structural: csp_data::StructuralDef::unlimited(),
             mass_kg: 100.0,
             com: DVec3::ZERO,
@@ -1891,6 +1838,9 @@ mod tests {
             (800.0, 50.0)
         };
         let nose = WeldPart {
+            dock_ports: vec![],
+            tanks: vec![],
+            crew_seats: 0,
             structural: csp_data::StructuralDef::unlimited(),
             mass_kg: nose_mass,
             com: DVec3::ZERO,
@@ -1903,6 +1853,9 @@ mod tests {
             thermal: test_thermal(),
         };
         let tail = WeldPart {
+            dock_ports: vec![],
+            tanks: vec![],
+            crew_seats: 0,
             structural: csp_data::StructuralDef::unlimited(),
             mass_kg: tail_mass,
             com: DVec3::ZERO,

@@ -13,9 +13,59 @@
 use serde::{Deserialize, Serialize};
 
 use csp_core::{DVec3, StableDiscriminant};
-use csp_data::{AeroDef, StructuralDef, ThermalDef};
+use csp_data::{AeroDef, PortSize, ResourceId, StructuralDef, ThermalDef};
 
 use crate::tensor::SymMat3;
+
+/// One resolved docking-port face (§3.1 `DockPort`), part-local frame.
+/// The resolver emits one per `DockPort` module from the module's named
+/// attach node (position and direction, scaled like every attach node).
+/// Stage 1 itself does not consume the field — like `aero` and
+/// `structural` it rides the resolved view for the system that does:
+/// the §2.4 docking soft-capture (M6), whose joint anchors here and
+/// whose facing test opposes `local_dir`s.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DockPortSpec {
+    /// Capture point — the port-face attach node's position,
+    /// part-local (resolved scale).
+    pub local_pos: DVec3,
+    /// Outward-facing capture axis — the node's unit `direction`,
+    /// part-local. Two ports face when `dir_a · dir_b ≈ −1` in the
+    /// shared world frame.
+    pub local_dir: DVec3,
+    /// Size class — ports capture only within a class (sim policy;
+    /// the class is data).
+    pub size: PortSize,
+}
+
+/// One resolved tank capacity (§3.1 `Tank`), part-local.
+///
+/// The resolver emits one entry per `(resource, capacity)` pair over
+/// the part's `Tank` modules, with `mass_per_unit_kg` baked in from
+/// `data/resources.ron` at resolve time — the frozen-resolved-stat
+/// rule every `WeldPart` field follows (a `resources.ron` edit never
+/// retroacts on a built craft). Same-resource entries across multiple
+/// `Tank` modules on one part are pooled into a single spec: the sim
+/// tracks contents per `(node, resource)`, and the §2.4 1/1024
+/// contents-quantum is per tank — a split that is meaningless under
+/// pooling is not carried.
+///
+/// Stage 1 ignores the field; the M6-D resource bookkeeping consumes
+/// it: `capacity` bounds the `(node, resource)` contents slot and
+/// `capacity · mass_per_unit_kg` is the wet mass a full entry
+/// contributes to [`WeldPart::mass_kg`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TankSpec {
+    /// The stored resource.
+    pub resource: ResourceId,
+    /// Capacity in units. Finite and `>= 0` (resolved data; the weld's
+    /// input gate does not re-check — the sim's spawn/restore
+    /// validation owns the invariant).
+    pub capacity: f64,
+    /// units → kg, `resources.ron` at resolve time. Zero for massless
+    /// stores (`ElectricCharge` batteries).
+    pub mass_per_unit_kg: f64,
+}
 
 /// What a force site emits — the `kind` of §2.4's
 /// `ForceSite { local_pos, local_dir, kind }`.
@@ -88,9 +138,9 @@ impl ForceSite {
 /// A part's collision shape as resolved data: already-convex geometry
 /// in part-local frame. The weld transforms the vertex set into body
 /// frame to form one hull of the merged compound collider (§2.4 Stage
-/// 1); `csp-phys`'s backend materializes `parry3d-f64`
-/// `ConvexPolyhedron`s from those point sets when contact solving
-/// lands (sub-phase B).
+/// 1); the contact machinery reads the point sets directly
+/// (`hull::facet_planes` derives facet planes from them — no parry
+/// materialization).
 ///
 /// Variants are the primitive shapes `ColliderDef` (§3.1) will resolve
 /// to; `Points` is the escape hatch for authored convex sets. Vertices
@@ -191,6 +241,30 @@ pub struct WeldPart {
     /// `INFINITY`-class "unbreakable" is expressed as a large finite
     /// value).
     pub structural: StructuralDef,
+    /// §3.1 `DockPort` resolution: the part's docking-port faces (see
+    /// [`DockPortSpec`]), in authored module order. Stage 1 ignores
+    /// them; the §2.4 soft-capture joint machinery (M6) consumes them
+    /// through the sim's live-joint bookkeeping. Empty for a part with
+    /// no port modules — including every hand-authored `WeldPart`.
+    pub dock_ports: Vec<DockPortSpec>,
+    /// §3.1 `Tank` resolution: the part's resource capacities, one
+    /// pooled entry per `(resource)` — see [`TankSpec`]. Stage 1
+    /// ignores them; the M6-D contents bookkeeping (`Vessel`'s
+    /// tank-contents map and the `ResourceTransfer` process) consumes
+    /// them. Empty for a part with no `Tank` modules.
+    ///
+    /// **Mass convention:** `mass_kg` is the part's CURRENT total —
+    /// dry + `Σ contents·mass_per_unit_kg` over these entries — and a
+    /// part enters the sim with its tanks full (the resolver's wet
+    /// mass), so `mass_kg ≥ Σ capacity·mass_per_unit_kg` must hold at
+    /// construction. The sim debits `mass_kg` as contents leave under
+    /// the §2.4 quantized-inertia rule.
+    pub tanks: Vec<TankSpec>,
+    /// §3.1 `CrewSeat` resolution: the part's total crew slots —
+    /// `Σ CrewSeat.slots` over its modules. Stage 1 ignores it; the
+    /// M6-D crew bookkeeping (seat assignment, board/transfer
+    /// commands) consumes it. Zero for uncrewed parts.
+    pub crew_seats: u32,
 }
 
 #[cfg(test)]

@@ -200,6 +200,19 @@ pub enum EventKind {
         /// The body it targets.
         destination: BodyId,
     } = 5,
+    /// M6-D §3.5's `ResourceTransfer` completion — the process lands
+    /// its cargo (resource units into the destination's tanks, or a
+    /// crew member into a free seat). Scheduled by
+    /// `SimCommand::TransferResource`/`TransferCrew` at the
+    /// rate-computed tick; pairs with exactly one `ActiveTransfer`
+    /// record (the restore coherence check, like the maneuver node's).
+    /// Always `Clamping` — the player asked for the transfer, so warp
+    /// demotes rather than streaming past its landing (§3.5's
+    /// "publishes `TransferComplete` so it survives warp").
+    TransferComplete {
+        /// The transfer arena id the event completes.
+        transfer: crate::transfers::TransferId,
+    } = 6,
 }
 
 impl StableDiscriminant for EventKind {
@@ -211,6 +224,7 @@ impl StableDiscriminant for EventKind {
             Self::DebrisDecay { .. } => 3,
             Self::ManeuverNodeStart { .. } => 4,
             Self::TransferWindow { .. } => 5,
+            Self::TransferComplete { .. } => 6,
         }
     }
 }
@@ -231,7 +245,8 @@ pub fn class_of(kind: &EventKind, tracked: &BTreeSet<VesselId>) -> EventClass {
         EventKind::SoiRescan { .. } | EventKind::DebrisDecay { .. } => EventClass::Silent,
         EventKind::PlayerAlarm { .. }
         | EventKind::ManeuverNodeStart { .. }
-        | EventKind::TransferWindow { .. } => EventClass::Clamping,
+        | EventKind::TransferWindow { .. }
+        | EventKind::TransferComplete { .. } => EventClass::Clamping,
     }
 }
 
@@ -293,6 +308,9 @@ impl ScheduledEvent {
             } => {
                 h.str(origin.as_str());
                 h.str(destination.as_str());
+            }
+            EventKind::TransferComplete { transfer } => {
+                h.u64(transfer.0);
             }
         }
     }

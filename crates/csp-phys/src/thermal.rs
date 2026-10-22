@@ -388,6 +388,9 @@ mod tests {
 
     fn part(mass: f64, half: f64, thermal: ThermalDef) -> WeldPart {
         WeldPart {
+            dock_ports: vec![],
+            tanks: vec![],
+            crew_seats: 0,
             structural: csp_data::StructuralDef::unlimited(),
             mass_kg: mass,
             com: DVec3::ZERO,

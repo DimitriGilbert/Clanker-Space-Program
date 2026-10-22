@@ -432,6 +432,8 @@ impl View {
             max_vessels: balance.max_tracked_vessels,
             max_debris: balance.max_debris,
         });
+        sim.set_docking_config(csp_sim::DockingConfig::from_balance(&balance));
+        sim.set_transfer_config(csp_sim::TransferConfig::from_balance(&balance));
         let mut view = Self::with_sim(sim);
         // M3 VAB: the part catalog + resource registry are data-derived
         // constants for the session model (like BodyTable — §7.3's
@@ -918,6 +920,9 @@ impl Default for View {
 fn stock_flight_craft() -> csp_sim::CraftDef {
     use csp_phys::{ForceSite, ForceSiteKind, PartGraph, PartNode, PartNodeId, PartTransform};
     let mk = |mass: f64, half: f64, len: f64| csp_phys::WeldPart {
+        dock_ports: vec![],
+        tanks: vec![],
+        crew_seats: 0,
         structural: csp_data::StructuralDef {
             max_axial_n: 3.0e6,
             max_shear_n: 1.5e6,

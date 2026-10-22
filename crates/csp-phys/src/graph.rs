@@ -58,6 +58,24 @@ impl PartTransform {
         }
     }
 
+    /// The inverse transform: `self⁻¹` maps parent-frame points back
+    /// into child frame — `self.compose(self.inverse())` is the
+    /// identity to rounding (exact for exactly-unit rotations). The
+    /// docking merge uses it to express a body-frame pose inside the
+    /// seam's parent-node frame (`t_node⁻¹ ∘ T_relative`); undock's
+    /// split path reads the same convention.
+    ///
+    /// The rotation is conjugated, not renormalized: a stored
+    /// unit-within-tolerance quaternion stays one, and the op is
+    /// exact IEEE + `libm`, hence deterministic.
+    pub fn inverse(self) -> Self {
+        let r = self.rotation.conjugate();
+        Self {
+            offset: r.rotate(-self.offset),
+            rotation: r,
+        }
+    }
+
     /// Apply the transform to a child-local point.
     pub fn apply(self, p: DVec3) -> DVec3 {
         self.offset + self.rotation.rotate(p)

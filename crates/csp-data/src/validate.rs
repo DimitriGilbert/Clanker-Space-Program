@@ -1627,6 +1627,26 @@ fn check_modules(part: &PartDef, res: &ResourceFile, out: &mut Vec<ValidationErr
             reason: "discrete scaling carries no exponents — tank/engine stats would not scale",
         });
     }
+    // M6-B: a `DockPort`'s `node` must name one of the part's attach
+    // nodes — it is the docking face the sim anchors soft-capture at —
+    // and two port modules may not claim the same node (one face, one
+    // capture point; a second face authors a second node).
+    let mut port_nodes = BTreeSet::new();
+    for m in &part.modules {
+        if let ModuleDef::DockPort { node, .. } = m {
+            if !part.attach_nodes.iter().any(|n| &n.id == node) {
+                out.push(ValidationError::BadModule {
+                    part: part_id.to_string(),
+                    reason: "dock_port node names no attach node",
+                });
+            } else if !port_nodes.insert(node.as_str()) {
+                out.push(ValidationError::BadModule {
+                    part: part_id.to_string(),
+                    reason: "two dock ports claim the same attach node",
+                });
+            }
+        }
+    }
     // §3.1 category-consistent stats: the category names the module the
     // part must carry (mapping documented on PartCategory).
     let required: Option<&'static str> = match part.category {

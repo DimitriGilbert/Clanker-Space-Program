@@ -163,6 +163,12 @@ fn flight_initial(dir: &Path) -> Result<World, ReplayError> {
         max_vessels: balance.max_tracked_vessels,
         max_debris: balance.max_debris,
     });
+    // §2.4's docking tunables — same wiring as the caps: the fixture's
+    // balance.ron is the source of truth, so fixture-authored capture
+    // windows/predicates are honoured instead of the no-data defaults.
+    world.set_docking_config(csp_sim::DockingConfig::from_balance(&balance));
+    // §3.5's transfer tunables — same wiring (M6-D).
+    world.set_transfer_config(csp_sim::TransferConfig::from_balance(&balance));
     Ok(world)
 }
 
@@ -176,6 +182,9 @@ fn flight_craft() -> csp_sim::CraftDef {
         PartNode::new(None, PartTransform::IDENTITY, 0),
     );
     let booster = WeldPart {
+        dock_ports: vec![],
+        tanks: vec![],
+        crew_seats: 0,
         structural: csp_data::StructuralDef::unlimited(),
         mass_kg: 5_000.0,
         com: DVec3::ZERO,
@@ -593,6 +602,9 @@ mod tests {
                 ),
             );
             parts.push(WeldPart {
+                dock_ports: vec![],
+                tanks: vec![],
+                crew_seats: 0,
                 structural: csp_data::StructuralDef::unlimited(),
                 mass_kg: 100.0,
                 com: DVec3::ZERO,
@@ -682,6 +694,9 @@ mod tests {
                 ),
             );
             parts.push(WeldPart {
+                dock_ports: vec![],
+                tanks: vec![],
+                crew_seats: 0,
                 structural: csp_data::StructuralDef::unlimited(),
                 mass_kg: 100.0,
                 com: DVec3::ZERO,

@@ -364,15 +364,23 @@ impl SituationMask {
 
 /// Docking port size class (§3.1 `DockPort { size: PortSize }`).
 /// Mismatched classes cannot latch — the check is sim policy, the
-/// class is data.
+/// class is data. Discriminants are explicit, stable, append-only —
+/// §7.1 rule 7 hash encodings.
+#[repr(u16)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PortSize {
     /// 0.625 m class.
-    Small,
+    Small = 0,
     /// 1.25 m class.
-    Medium,
+    Medium = 1,
     /// 2.5 m class.
-    Large,
+    Large = 2,
+}
+
+impl csp_core::StableDiscriminant for PortSize {
+    fn discriminant(&self) -> u16 {
+        *self as u16
+    }
 }
 
 /// §3.1 `modules` — the functional payloads a part carries. One part
@@ -441,10 +449,20 @@ pub enum ModuleDef {
     /// graph split, not a joint). Marker module; §3.4 covers its
     /// `StuckDecoupler` failure mode via `ReliabilityDef`.
     Decoupler,
-    /// Docking port (§3.1).
+    /// Docking port (§3.1). `node` names the `attach_nodes` entry that
+    /// is the port *face* — the plan's literal `{ size }` alone cannot
+    /// say which node captures (a port part also carries its mount
+    /// node), so the designation is plan-implied schema like
+    /// `Control`/`Decoupler` are plan-implied modules. The sim's
+    /// capture test anchors its soft-capture joint at the named node's
+    /// position and requires facing `direction`s; other attach nodes
+    /// on the part are ordinary snap points.
     DockPort {
         /// Size class — ports latch only within a class.
         size: PortSize,
+        /// `attach_nodes` id of the docking face (validator: must
+        /// name an existing node).
+        node: String,
     },
     /// Crew accommodation (§3.1). A pod with a seat is command-capable;
     /// pair with `Control` for uncrewed authority.

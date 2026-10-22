@@ -357,6 +357,9 @@ mod tests {
 
     fn part(m: f64, half: f64) -> WeldPart {
         WeldPart {
+            dock_ports: vec![],
+            tanks: vec![],
+            crew_seats: 0,
             mass_kg: m,
             com: DVec3::ZERO,
             inertia: SymMat3::solid_box(m, DVec3::new(half, half, half)),

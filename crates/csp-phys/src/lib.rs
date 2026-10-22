@@ -1,8 +1,9 @@
 #![forbid(unsafe_code)]
 
 //! Weld (pure fn), collision + rigid-body integration behind `PhysicsBackend`
-//! (PLAN §2.4, §2.9). parry3d-f64 for future hull materialization; rapier for
-//! jointed islands (M6).
+//! (PLAN §2.4, §2.9). `parry3d-f64`/`rapier3d-f64` stay workspace-declared
+//! for the M6 jointed-island work; the M6-A body-vs-body contact model uses
+//! the in-crate facet-plane machinery in [`hull`].
 //!
 //! M2 sub-phase A landed the §2.4 vessel model and **weld Stage 1** —
 //! `csp_phys::weld(part_graph, &[WeldPart]) -> WeldedBody`, the pure,
@@ -28,11 +29,34 @@
 //! weld-consumed view (`WeldPart`, its `weld_input` field) embedded.
 //! Wear is plumbed but stubbed pending the §3.4 accumulation loop.
 //!
-//! Deliberately absent here: Stage-2 aero tables (§2.4.1 — deferred,
-//! command-installed, M4a), the `RapierBackend` jointed-island solver and
-//! body-vs-body/hull-facet contact (M6 — `parry3d-f64`/`rapier3d-f64` are
-//! workspace-declared, not yet depended on: the sphere-vs-vertex contact
-//! model above needs neither), `DockSeam` (M6).
+//! M6 sub-phase A lands **vessel-vessel contact**: every body in one
+//! bubble batch sees every other — collider vertices penetrating a
+//! peer hull's facet volume (and vice versa) form a pair manifold the
+//! same PGS machinery solves with equal-and-opposite impulses, plus
+//! the §7.4/§2.6.2 geometric `vessel_contact` predicate. Latched
+//! bodies act as static colliders.
+//!
+//! M6 sub-phase B lands the §2.4 **transient joint** machinery:
+//! [`JointDef`]/[`JointKind`] (`SoftCapture`) and a bilateral
+//! three-row joint constraint solved inside `SimpleBackend`'s PGS
+//! velocity pass — a compliant spherical joint that reels its anchors
+//! together under a capped closing speed. The sim's capture detection,
+//! cap-16 bookkeeping, and the latch merge live in `csp-sim`/M6-C.
+//!
+//! M6 sub-phase C lands the §2.4 **latch merge** graph edit:
+//! [`merge::merge_graphs`] folds a settled soft-capture's secondary
+//! graph into the primary's — the secondary root becomes a child of
+//! the primary-side port node at the recorded seam transform, its
+//! ids remapped above the primary's — so the merged graph welds
+//! bit-identically to a from-scratch graph of the same parts. Undock
+//! splits through the [`structural`] fragment path; the `DockSeam`
+//! record and latch bookkeeping live in `csp-sim`.
+//!
+//! Deliberately absent here: a `RapierBackend` jointed-island solver —
+//! §2.9 names it, and `rapier3d-f64` remains workspace-pinned for the
+//! §2.9 oracle cross-check and later robotics work; [`JointDef`]'s
+//! backend note documents why v1 soft-capture runs inside
+//! `SimpleBackend` instead — plus transfer/crew plumbing (M6-D).
 //!
 //! - [`graph`] — `PartGraph`/`PartNode`/`PartTransform`, the weld's
 //!   topology input.
@@ -60,6 +84,8 @@
 pub mod aero;
 pub mod backend;
 pub mod graph;
+mod hull;
+pub mod merge;
 pub mod part;
 pub mod profile;
 pub mod readout;
@@ -77,9 +103,10 @@ pub use aero::{
     VOXEL_BUDGET, VOXEL_TARGET_EDGE_M, VOXELIZER_VERSION, build_aero_tables, direction_set,
     eval_aero_curve, flow_dir_at_aoa, skin_friction_cd,
 };
-pub use backend::{BodyHandle, Contact, Hit, JointDef, PhysicsBackend, Ray};
+pub use backend::{BodyHandle, Contact, Hit, JointDef, JointKind, PhysicsBackend, Ray};
 pub use graph::{PartGraph, PartNode, PartNodeId, PartTransform};
-pub use part::{ColliderShape, ForceSite, ForceSiteKind, WeldPart};
+pub use merge::{MergeError, MergedGraph, merge_graphs};
+pub use part::{ColliderShape, DockPortSpec, ForceSite, ForceSiteKind, TankSpec, WeldPart};
 pub use profile::{BurnSegment, MissionCheck, MissionProfile, Regime};
 pub use readout::{CraftAnalysis, StageStats, analyze};
 pub use resolve::{

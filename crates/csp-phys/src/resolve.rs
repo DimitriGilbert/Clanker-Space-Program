@@ -1079,7 +1079,9 @@ fn propellant_mass(
 }
 
 /// The geometry stage: scaled collider → CoM → inertia → thrust
-/// sites, assembled into the [`WeldPart`] view.
+/// sites, assembled into the [`WeldPart`] view. `res` supplies the
+/// tank entries' resolved `mass_per_unit_kg` (M6-D — the frozen
+/// wet-mass datum the sim's contents bookkeeping debits against).
 fn resolve_weld_input(
     def: &PartDef,
     s: f64,
@@ -1087,6 +1089,7 @@ fn resolve_weld_input(
     modules: &[ModuleDef],
     thermal: &csp_data::ThermalDef,
     structural: &csp_data::StructuralDef,
+    res: &ResourceFile,
 ) -> Result<WeldPart, ResolveError> {
     let bad = |field: &'static str| ResolveError::InvalidStat {
         part_id: def.id.clone(),
@@ -1099,19 +1102,75 @@ fn resolve_weld_input(
     let com = collider_com(&def.collider) * s;
     let inertia = collider_inertia(&def.collider, s, mass_kg, com);
     let mut force_sites = Vec::new();
+    let mut dock_ports = Vec::new();
+    let mut tanks: Vec<crate::part::TankSpec> = Vec::new();
+    let mut crew_seats = 0u32;
     for m in modules {
-        if let ModuleDef::Engine { thrust_vac_n, .. } = m {
-            let z_min = collider_z_min(&collider)
-                .ok_or(bad("resolve: collider has no vertices for a thrust site"))?;
-            if !thrust_vac_n.is_finite() || *thrust_vac_n < 0.0 {
-                return Err(bad("resolve: resolved thrust is negative or non-finite"));
+        match m {
+            ModuleDef::Engine { thrust_vac_n, .. } => {
+                let z_min = collider_z_min(&collider)
+                    .ok_or(bad("resolve: collider has no vertices for a thrust site"))?;
+                if !thrust_vac_n.is_finite() || *thrust_vac_n < 0.0 {
+                    return Err(bad("resolve: resolved thrust is negative or non-finite"));
+                }
+                force_sites.push(ForceSite::new(
+                    DVec3::new(0.0, 0.0, z_min),
+                    DVec3::Z,
+                    ForceSiteKind::Thrust,
+                    *thrust_vac_n,
+                ));
             }
-            force_sites.push(ForceSite::new(
-                DVec3::new(0.0, 0.0, z_min),
-                DVec3::Z,
-                ForceSiteKind::Thrust,
-                *thrust_vac_n,
-            ));
+            // §3.1 `DockPort { size, node }` → the port face's resolved
+            // spec: the named attach node's position (scaled like every
+            // node position — `resolve_envelopes` applies the same
+            // `s`) and unit direction. A module naming no attach node
+            // is a validator failure the resolver re-checks typed.
+            ModuleDef::DockPort { size, node } => {
+                let face = def
+                    .attach_nodes
+                    .iter()
+                    .find(|n| &n.id == node)
+                    .ok_or(bad("resolve: dock_port node names no attach node"))?;
+                if !(face.position_m.is_finite() && face.direction.is_finite()) {
+                    return Err(bad("resolve: dock_port face node is non-finite"));
+                }
+                dock_ports.push(crate::part::DockPortSpec {
+                    local_pos: face.position_m * s,
+                    local_dir: face.direction,
+                    size: *size,
+                });
+            }
+            // M6-D: the `Tank` module's storage half — the resolved
+            // capacity list pooled per resource into [`TankSpec`]s
+            // with `mass_per_unit_kg` baked in. `propellant_mass`
+            // already ran these lookups on the same resolved modules,
+            // so `mass_per_unit` failures are unreachable — a missing
+            // entry here is the same `UnknownResource` verdict.
+            ModuleDef::Tank { capacity } => {
+                for (r, units) in capacity {
+                    let mpu =
+                        res.mass_per_unit(r)
+                            .ok_or_else(|| ResolveError::UnknownResource {
+                                part_id: def.id.clone(),
+                                resource: r.clone(),
+                            })?;
+                    if let Some(t) = tanks.iter_mut().find(|t| t.resource == *r) {
+                        t.capacity += units;
+                    } else {
+                        tanks.push(crate::part::TankSpec {
+                            resource: r.clone(),
+                            capacity: *units,
+                            mass_per_unit_kg: mpu,
+                        });
+                    }
+                }
+            }
+            // M6-D: `CrewSeat { slots }` → the part's seat count the
+            // sim's crew bookkeeping reads.
+            ModuleDef::CrewSeat { slots } => {
+                crew_seats = crew_seats.saturating_add(u32::from(*slots));
+            }
+            _ => {}
         }
     }
     Ok(WeldPart {
@@ -1127,6 +1186,9 @@ fn resolve_weld_input(
         },
         thermal: thermal.clone(),
         structural: structural.clone(),
+        dock_ports,
+        tanks,
+        crew_seats,
     })
 }
 
@@ -1328,7 +1390,8 @@ pub fn resolve_built_part(
     }
 
     let (structural, thermal, aero, attach_nodes) = resolve_envelopes(def, &f);
-    let weld_input = resolve_weld_input(def, f.linear, mass_kg, &modules, &thermal, &structural)?;
+    let weld_input =
+        resolve_weld_input(def, f.linear, mass_kg, &modules, &thermal, &structural, res)?;
     let reliability = resolve_reliability(def, qual, &mults)?;
 
     Ok(EffectivePart {

@@ -69,9 +69,62 @@
 //! (`‖p − c‖ < R`) produces one manifold point `{pos, normal = up,
 //! depth}` — vertex-only contact per the M2 scope; face/edge contacts
 //! on a curved surface differ from the vertex manifold by ≪ µm at
-//! home-planet radius. Body-vs-body contact is out of scope for
-//! `SimpleBackend` (vessels in one bubble are rare; hull-vs-hull needs
-//! the parry materialization anyway).
+//! home-planet radius.
+//!
+//! **Vessel-vessel contact** (M6 sub-phase A): bodies in one `step`
+//! slice see each other through a symmetric vertex-vs-hull rule — a
+//! collider vertex of `a` strictly inside a facet volume of `b` (and
+//! vice versa) yields one manifold point with the penetrated facet's
+//! outward normal. Facet planes are re-detected from each hull's
+//! canonicalized vertex set per call by [`crate::hull::facet_planes`]
+//! (a pure derived cache, never stored — the same `O(n⁴)` detector
+//! the §2.4.1 voxelizer uses; `n` is a hull's vertex count, 8 for the
+//! ubiquitous box), behind per-body and per-hull AABB broadphase.
+//! Each pair contact is a **two-body constraint**: the impulse is
+//! applied `+λ·n` to the penetrator and `−λ·n` to the penetrated body,
+//! so linear momentum is conserved by construction and the velocity
+//! solve reads the *relative* point velocity `v_a − v_b` — the moving-
+//! surface rule generalized from the spinning-ground term (the peer
+//! body's point velocity *is* the surface velocity). A latched body
+//! participates as a static collider (`inv_m = inv_i = 0`, impulses
+//! on it skipped): a resting vessel can be landed on — and pushed
+//! against — without the latched body ever moving.
+//!
+//! Pair constraints live in their own list solved in fixed ascending
+//! `(i, j, hull_i, hull_j, direction, vertex)` generation order —
+//! the §2.9 `(body_id, contact_index)` reading applied pairwise; each
+//! solver iteration runs the whole ground manifold first, then the
+//! whole pair manifold, a fixed order like everything else here. When
+//! `bodies` has one element (or no pair overlaps) the pair list is
+//! empty and every ground path is **bit-identical** to the pre-M6
+//! single-body behaviour.
+//!
+//! **Transient joints** (M6 sub-phase B, §2.4): each [`JointDef`] in
+//! `step`'s `joints` argument becomes a bilateral three-row
+//! [`JointConstraint`] solved in the same PGS velocity pass, after the
+//! pair manifold, in the re-sorted `(body_a, body_b, anchors)`
+//! generation order. Where a contact drives relative point velocity
+//! to `≥ 0`, a joint row drives it to a **target**: for
+//! [`JointKind::SoftCapture`], `−pull·separation` clamped to
+//! `±max_correction` per axis — an exponential reel-in with a hard
+//! closing-speed cap (the "soft" in soft-capture). Rows are unclamped
+//! (a joint pulls as well as pushes) and there is deliberately **no
+//! position-level row** — the velocity target is the whole correction
+//! channel, which is what "compliant" means: a Baumgarte pass would
+//! weld the pose while leaving velocity untouched, the opposite of a
+//! soft joint. §2.9 assigns jointed islands to `RapierBackend`; the
+//! documented v1 reading is that a compliant spherical joint is a
+//! bilateral three-row constraint this solver already expresses —
+//! see [`JointDef`]'s backend note.
+//!
+//! The model is deliberately **vertex-only**, matching the ground
+//! manifold's scope: an edge-edge crossing with no vertex inside
+//! either hull generates nothing that tick and is caught when a
+//! vertex crosses. Face/edge contacts between hulls are therefore an
+//! approximation of the same order as the M2 ground rule — docking
+//! approaches, resting stacks, and side-by-side contact are
+//! face-dominated configurations where it is exact to generation
+//! precision.
 //!
 //! Generation requires `depth > 0` *strictly*: a vertex exactly
 //! grazing the surface (`depth == 0`) produces no manifold point. A
@@ -158,7 +211,7 @@ use serde::{Deserialize, Serialize};
 use csp_core::{DQuat, DVec3, TICK_HZ};
 use csp_data::{AtmosphereDef, BodyDef};
 
-use crate::backend::{BodyHandle, Contact, Hit, JointDef, PhysicsBackend, Ray};
+use crate::backend::{BodyHandle, Contact, Hit, JointDef, JointKind, PhysicsBackend, Ray};
 use crate::part::{ForceSiteKind, WeldPart};
 use crate::tensor::SymMat3;
 use crate::weld::WeldedBody;
@@ -402,16 +455,9 @@ impl Constraint {
         let conj = body.rot.conjugate();
         let r_body = vertex_body - body.com_local;
         let n_body = conj.rotate(normal_world);
-        // Fixed-order two-direction friction basis, deterministic from
-        // the normal: reference axis = least-aligned of X/Y.
-        let reference = if normal_world.x.abs() <= normal_world.y.abs() {
-            DVec3::X
-        } else {
-            DVec3::Y
-        };
-        let t1_raw = normal_world.cross(reference);
-        let t1_world = t1_raw / t1_raw.norm();
-        let t2_world = normal_world.cross(t1_world);
+        // Fixed-order two-direction friction basis — shared with the
+        // pair constraints so both manifolds pick tangents identically.
+        let (t1_world, t2_world) = friction_basis(normal_world);
         let t1_body = conj.rotate(t1_world);
         let t2_body = conj.rotate(t2_world);
         let inv_i = body.inertia_local.inverse().unwrap_or(SymMat3::ZERO);
@@ -443,18 +489,37 @@ impl Constraint {
             depth,
             hull: hull_index,
             impulse: DVec3::ZERO,
+            peer: None,
         };
         (constraint, contact)
     }
 }
 
+/// Fixed-order two-direction friction basis, deterministic from the
+/// world-frame normal: reference axis = least-aligned of X/Y, then
+/// `t1 = normalize(n × ref)`, `t2 = n × t1` (§2.9's pinned basis).
+fn friction_basis(n_world: DVec3) -> (DVec3, DVec3) {
+    let reference = if n_world.x.abs() <= n_world.y.abs() {
+        DVec3::X
+    } else {
+        DVec3::Y
+    };
+    let t1_raw = n_world.cross(reference);
+    let t1 = t1_raw / t1_raw.norm();
+    (t1, n_world.cross(t1))
+}
+
 /// Apply impulse `dλ·dir_b` to `b` (dir in body frame): updates `vel`
 /// (world), `vel_b` (its cached body-frame twin — a pure vector add,
-/// no quaternion rotate) and `ang_vel` (body) — the Gauss–Seidel
-/// write-back.
+/// no quaternion rotate), `ang_vel` (body), and `omega_w` (the solve's
+/// cached world-frame `rot·ang_vel` — kept in sync because the pair
+/// constraints evaluate relative point velocities in world frame).
+/// The Gauss–Seidel write-back; `rot` does not change inside the
+/// velocity pass so every cached frame stays exact.
 fn apply_impulse(
     b: &mut WeldedBody,
     vel_b: &mut DVec3,
+    omega_w: &mut DVec3,
     c: &Constraint,
     dir_body: DVec3,
     d_lambda: f64,
@@ -462,7 +527,9 @@ fn apply_impulse(
     let j_body = dir_body * d_lambda;
     *vel_b = *vel_b + j_body / b.mass_kg;
     b.vel = b.vel + b.rot.rotate(j_body) / b.mass_kg;
-    b.ang_vel = b.ang_vel + c.inv_i.mul_vec(c.r_body.cross(j_body));
+    let dw_body = c.inv_i.mul_vec(c.r_body.cross(j_body));
+    b.ang_vel = b.ang_vel + dw_body;
+    *omega_w = *omega_w + b.rot.rotate(dw_body);
 }
 
 /// Point velocity at the contact *relative to the ground surface*,
@@ -472,6 +539,519 @@ fn apply_impulse(
 /// evaluation); `v_surf` is `ZERO` on a non-rotating world.
 fn rel_point_velocity_body(vel_b: DVec3, b: &WeldedBody, c: &Constraint) -> DVec3 {
     vel_b + b.ang_vel.cross(c.r_body) - c.surface_vel_body
+}
+
+/// One vessel-vessel contact constraint — a vertex of `a`'s compound
+/// collider strictly inside `b`'s hull, solved as a **two-body** PGS
+/// constraint in the **world frame** (the bodies' frames differ, so
+/// unlike the ground manifold no single body frame hosts both lever
+/// arms). `n` points penetrated → penetrator: `a` receives `+λ·n`,
+/// `b` receives `−λ·n` — equal and opposite, so the constraint
+/// conserves linear momentum by construction and solves the relative
+/// point velocity `v_a − v_b` (the peer body's velocity is the
+/// contact's "surface velocity", generalizing the spinning-ground
+/// `v_surf` term).
+///
+/// Generation order is fixed ascending `(i, j, hull_i, hull_j,
+/// direction, vertex)` — the §2.9 `(body_id, contact_index)` reading
+/// applied pairwise; the velocity and position passes iterate the
+/// pair list after the ground manifold each iteration.
+struct PairConstraint {
+    /// Penetrator — index into the `bodies` slice of the body whose
+    /// collider vertex is inside; it receives `+λ·n`.
+    a: u32,
+    /// Penetrated — the body owning the facet; receives `−λ·n`.
+    b: u32,
+    /// Index into `self.contacts[a]` of `a`'s public record — the
+    /// impulse write-back's channel.
+    contact_index_a: u32,
+    /// Same for `b`'s record (it records the `−n`/`−J` view).
+    contact_index_b: u32,
+    /// The penetrating vertex, `a`'s body frame — a material point;
+    /// the position pass re-poses it as `a` moves.
+    local_vertex: DVec3,
+    /// The penetrated facet's plane, `b`'s body frame — the persistent
+    /// feature the position pass re-measures depth against each
+    /// iteration (the face chosen at generation stays the feature,
+    /// the standard persistent-manifold reading).
+    n_face_b: DVec3,
+    d_face_b: f64,
+    /// Contact normal (the facet's outward normal, penetrated →
+    /// penetrator) and the fixed two-direction friction basis —
+    /// world frame, the pair solve's shared frame.
+    n: DVec3,
+    t1: DVec3,
+    t2: DVec3,
+    /// Lever arms from each body's CoM to the contact point, world
+    /// frame, at generation pose — rotation is frozen across the
+    /// velocity solve, so they stay exact through it; the position
+    /// pass recomputes them per iteration like the ground pass does.
+    r_a: DVec3,
+    r_b: DVec3,
+    /// Two-body effective masses along `n`/`t1`/`t2` — `1/K` with
+    /// `K = inv_m_a + inv_m_b +` both angular terms (a latched side
+    /// contributes `inv_m = 0`, `inv_i = ZERO` — a static collider).
+    kn: f64,
+    kt1: f64,
+    kt2: f64,
+    /// Each body's inverse inertia, its own body frame.
+    inv_i_a: SymMat3,
+    inv_i_b: SymMat3,
+    /// `settle.latched` at generation: a latched body is static for
+    /// this tick — impulses on it are skipped and the position pass
+    /// never moves it (its side's share of the constraint still
+    /// solves correctly: `inv_m = inv_i = 0` makes it immovable).
+    a_latched: bool,
+    b_latched: bool,
+    /// Accumulated impulses this tick (Gauss–Seidel, cold-started).
+    lambda_n: f64,
+    lambda_t1: f64,
+    lambda_t2: f64,
+}
+
+impl PairConstraint {
+    /// Build the pair constraint + the two public [`Contact`] records
+    /// (the penetrator's `+n` view and the penetrated body's `−n`
+    /// view — equal and opposite, like the impulses they will carry).
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        a_index: usize,
+        b_index: usize,
+        contact_index_a: usize,
+        contact_index_b: usize,
+        vertex_a: DVec3,
+        face_normal_b: DVec3,
+        face_d_b: f64,
+        pos_world: DVec3,
+        normal_world: DVec3,
+        depth: f64,
+        a: &WeldedBody,
+        b: &WeldedBody,
+        hull_a: u32,
+        hull_b: u32,
+    ) -> (Self, Contact, Contact) {
+        let (t1, t2) = friction_basis(normal_world);
+        let r_a = pos_world - a.com_world();
+        let r_b = pos_world - b.com_world();
+        let a_latched = a.settle.latched;
+        let b_latched = b.settle.latched;
+        let inv_m_a = if a_latched { 0.0 } else { 1.0 / a.mass_kg };
+        let inv_m_b = if b_latched { 0.0 } else { 1.0 / b.mass_kg };
+        let inv_i_a = if a_latched {
+            SymMat3::ZERO
+        } else {
+            a.inertia_local.inverse().unwrap_or(SymMat3::ZERO)
+        };
+        let inv_i_b = if b_latched {
+            SymMat3::ZERO
+        } else {
+            b.inertia_local.inverse().unwrap_or(SymMat3::ZERO)
+        };
+        // Angular term of the inverse effective mass along `dir`,
+        // world frame: `dir · (I_w⁻¹(r×dir) × r)` with
+        // `I_w⁻¹ x = rot·(inv_i·(rot̄·x))` — the same `K` the ground
+        // constraint computes in body frame, evaluated where the pair
+        // shares a frame.
+        let ang = |rot: DQuat, inv_i: SymMat3, r: DVec3, dir: DVec3| {
+            let rd = r.cross(dir);
+            rot.rotate(inv_i.mul_vec(rot.conjugate().rotate(rd)))
+                .cross(r)
+                .dot(dir)
+        };
+        let effective = |dir: DVec3| {
+            let k =
+                inv_m_a + inv_m_b + ang(a.rot, inv_i_a, r_a, dir) + ang(b.rot, inv_i_b, r_b, dir);
+            if k > 0.0 { 1.0 / k } else { 0.0 }
+        };
+        let constraint = Self {
+            a: a_index as u32,
+            b: b_index as u32,
+            contact_index_a: contact_index_a as u32,
+            contact_index_b: contact_index_b as u32,
+            local_vertex: vertex_a,
+            n_face_b: face_normal_b,
+            d_face_b: face_d_b,
+            n: normal_world,
+            t1,
+            t2,
+            r_a,
+            r_b,
+            kn: effective(normal_world),
+            kt1: effective(t1),
+            kt2: effective(t2),
+            inv_i_a,
+            inv_i_b,
+            a_latched,
+            b_latched,
+            lambda_n: 0.0,
+            lambda_t1: 0.0,
+            lambda_t2: 0.0,
+        };
+        let record_a = Contact {
+            pos: pos_world,
+            normal: normal_world,
+            depth,
+            hull: hull_a,
+            impulse: DVec3::ZERO,
+            peer: Some(BodyHandle(b_index as u32)),
+        };
+        let record_b = Contact {
+            pos: pos_world,
+            normal: -normal_world,
+            depth,
+            hull: hull_b,
+            impulse: DVec3::ZERO,
+            peer: Some(BodyHandle(a_index as u32)),
+        };
+        (constraint, record_a, record_b)
+    }
+}
+
+/// The world-frame impulse `j` of a two-body constraint (contact pair
+/// or joint): `+j` on `a`, `−j` on `b` — the equal-and-opposite
+/// write-back that conserves linear momentum by construction. Updates
+/// `vel` (world) directly, plus the solve's `vel_body`/`omega_world`
+/// caches (the ground constraints read the former; the pair/joint
+/// constraints the latter — both must reflect every write, latched
+/// bodies excepted).
+#[allow(clippy::too_many_arguments)]
+fn apply_two_body_impulse(
+    bodies: &mut [WeldedBody],
+    vel_body: &mut [DVec3],
+    omega_world: &mut [DVec3],
+    ia: usize,
+    ib: usize,
+    r_a: DVec3,
+    r_b: DVec3,
+    inv_i_a: SymMat3,
+    inv_i_b: SymMat3,
+    a_latched: bool,
+    b_latched: bool,
+    j: DVec3,
+) {
+    if !a_latched {
+        let b = &mut bodies[ia];
+        b.vel = b.vel + j / b.mass_kg;
+        vel_body[ia] = vel_body[ia] + b.rot.conjugate().rotate(j) / b.mass_kg;
+        let dw = inv_i_a.mul_vec(b.rot.conjugate().rotate(r_a.cross(j)));
+        b.ang_vel = b.ang_vel + dw;
+        omega_world[ia] = omega_world[ia] + b.rot.rotate(dw);
+    }
+    if !b_latched {
+        let b = &mut bodies[ib];
+        let j = -j;
+        b.vel = b.vel + j / b.mass_kg;
+        vel_body[ib] = vel_body[ib] + b.rot.conjugate().rotate(j) / b.mass_kg;
+        let dw = inv_i_b.mul_vec(b.rot.conjugate().rotate(r_b.cross(j)));
+        b.ang_vel = b.ang_vel + dw;
+        omega_world[ib] = omega_world[ib] + b.rot.rotate(dw);
+    }
+}
+
+/// The world-frame impulse `j` of a [`PairConstraint`]: `+j` on `a`,
+/// `−j` on `b` — the equal-and-opposite two-body write-back. Updates
+/// `vel` (world) directly, plus the solve's `vel_body`/`omega_world`
+/// caches (the ground constraints read the former; the pair
+/// constraints the latter — both must reflect every write, latched
+/// bodies excepted).
+fn apply_pair_impulse(
+    bodies: &mut [WeldedBody],
+    vel_body: &mut [DVec3],
+    omega_world: &mut [DVec3],
+    c: &PairConstraint,
+    j: DVec3,
+) {
+    apply_two_body_impulse(
+        bodies,
+        vel_body,
+        omega_world,
+        c.a as usize,
+        c.b as usize,
+        c.r_a,
+        c.r_b,
+        c.inv_i_a,
+        c.inv_i_b,
+        c.a_latched,
+        c.b_latched,
+        j,
+    );
+}
+
+/// One §2.4 transient joint constraint — a **bilateral** three-row PGS
+/// constraint in the fixed canonical basis (X, Y, Z), world frame like
+/// [`PairConstraint`]. It drives the anchors' relative point velocity
+/// `v_a − v_b` to a per-axis **target** rather than to zero: the target
+/// is the compliance. For [`JointKind::SoftCapture`] the target is
+/// `−pull·(p_a − p_b)` component-clamped to `±max_correction` — an
+/// exponential reel-in with a hard closing-speed cap, so a capture
+/// damps approach energy instead of welding the pose (and coincident
+/// anchors get a zero target, which is a hard hold).
+///
+/// Unlike contacts the rows are unclamped — a joint pulls as well as
+/// pushes — and there is **no position-level row**: the velocity target
+/// itself does the closing (a Baumgarte row would be a second,
+/// redundant correction channel and would move the pose without moving
+/// stored velocity, which is exactly wrong for a compliant joint).
+/// Cold-started per tick like the rest of the solve — no warm-start
+/// state, so the joint carries nothing to serialize.
+struct JointConstraint {
+    /// Index into `bodies` of the joint's first/second body.
+    a: u32,
+    b: u32,
+    /// Lever arms from each body's CoM to its anchor, world frame, at
+    /// generation pose — frozen across the velocity solve (`rot` does
+    /// not change inside it), same discipline as `PairConstraint`.
+    r_a: DVec3,
+    r_b: DVec3,
+    /// Per-axis two-body inverse effective masses `1/K` along X/Y/Z —
+    /// the pair solve's `K` applied to the canonical basis; a latched
+    /// side contributes `inv_m = 0`, `inv_i = ZERO`.
+    k: [f64; 3],
+    /// Each body's inverse inertia, its own body frame.
+    inv_i_a: SymMat3,
+    inv_i_b: SymMat3,
+    /// `settle.latched` at generation — a latched body is static for
+    /// the tick (its side of the constraint still solves: it is the
+    /// immovable anchor the free side reels toward).
+    a_latched: bool,
+    b_latched: bool,
+    /// Target relative point velocity `v_a − v_b` per axis.
+    target: DVec3,
+}
+
+impl JointConstraint {
+    /// Build the constraint for one [`JointDef`] at the
+    /// post-integration pose. Returns `None` when both bodies are
+    /// latched — a joint between two static bodies has nothing to do.
+    fn new(
+        joint: &JointDef,
+        a_index: usize,
+        b_index: usize,
+        bodies: &[WeldedBody],
+    ) -> Option<Self> {
+        let a = &bodies[a_index];
+        let b = &bodies[b_index];
+        let a_latched = a.settle.latched;
+        let b_latched = b.settle.latched;
+        if a_latched && b_latched {
+            return None;
+        }
+        let p_a = a.pos + a.rot.rotate(joint.local_anchor_a);
+        let p_b = b.pos + b.rot.rotate(joint.local_anchor_b);
+        let r_a = p_a - a.com_world();
+        let r_b = p_b - b.com_world();
+        let inv_m_a = if a_latched { 0.0 } else { 1.0 / a.mass_kg };
+        let inv_m_b = if b_latched { 0.0 } else { 1.0 / b.mass_kg };
+        let inv_i_a = if a_latched {
+            SymMat3::ZERO
+        } else {
+            a.inertia_local.inverse().unwrap_or(SymMat3::ZERO)
+        };
+        let inv_i_b = if b_latched {
+            SymMat3::ZERO
+        } else {
+            b.inertia_local.inverse().unwrap_or(SymMat3::ZERO)
+        };
+        // Angular term of the inverse effective mass along `dir`,
+        // world frame — identical to `PairConstraint::new`'s `ang`.
+        let ang = |rot: DQuat, inv_i: SymMat3, r: DVec3, dir: DVec3| {
+            let rd = r.cross(dir);
+            rot.rotate(inv_i.mul_vec(rot.conjugate().rotate(rd)))
+                .cross(r)
+                .dot(dir)
+        };
+        let effective = |dir: DVec3| {
+            let k =
+                inv_m_a + inv_m_b + ang(a.rot, inv_i_a, r_a, dir) + ang(b.rot, inv_i_b, r_b, dir);
+            if k > 0.0 { 1.0 / k } else { 0.0 }
+        };
+        let c = p_a - p_b;
+        let target = match joint.kind {
+            // `v_a − v_b` target per axis: `−pull·C` reels the
+            // separation down exponentially; the component clamp is
+            // the "soft" — closing speed can never exceed
+            // `max_correction` no matter how far the anchors sit.
+            JointKind::SoftCapture {
+                pull_per_s,
+                max_correction_mps,
+            } => DVec3::new(
+                (-pull_per_s * c.x).clamp(-max_correction_mps, max_correction_mps),
+                (-pull_per_s * c.y).clamp(-max_correction_mps, max_correction_mps),
+                (-pull_per_s * c.z).clamp(-max_correction_mps, max_correction_mps),
+            ),
+        };
+        Some(Self {
+            a: a_index as u32,
+            b: b_index as u32,
+            r_a,
+            r_b,
+            k: [
+                effective(DVec3::X),
+                effective(DVec3::Y),
+                effective(DVec3::Z),
+            ],
+            inv_i_a,
+            inv_i_b,
+            a_latched,
+            b_latched,
+            target,
+        })
+    }
+}
+
+/// Phase 4a″ — joint constraint generation. The caller's `JointDef`
+/// list is re-sorted into the solver's fixed order — ascending
+/// `(body_a, body_b, anchors)` — so the iteration order is a property
+/// of the constraint set, not of the caller's enumeration (§2.9's
+/// fixed-order rule applied to the cap-16 transient list). Joints
+/// naming a handle outside `bodies` are skipped: a handle is only
+/// valid against one `step` call's slice and the sim never emits a
+/// stale one, but a solver must not index blindly.
+fn generate_joint_constraints(bodies: &[WeldedBody], joints: &[JointDef]) -> Vec<JointConstraint> {
+    let mut order: Vec<&JointDef> = joints
+        .iter()
+        .filter(|j| (j.body_a.0 as usize) < bodies.len() && (j.body_b.0 as usize) < bodies.len())
+        .collect();
+    order.sort_by_key(|j| {
+        (
+            j.body_a.0,
+            j.body_b.0,
+            j.local_anchor_a.x.to_bits(),
+            j.local_anchor_a.y.to_bits(),
+            j.local_anchor_a.z.to_bits(),
+            j.local_anchor_b.x.to_bits(),
+            j.local_anchor_b.y.to_bits(),
+            j.local_anchor_b.z.to_bits(),
+        )
+    });
+    let mut out = Vec::with_capacity(order.len());
+    for j in order {
+        if let Some(c) = JointConstraint::new(j, j.body_a.0 as usize, j.body_b.0 as usize, bodies) {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The position pass's pair write-back — pseudo-impulse `j` (world
+/// frame, `σ·n` signed) applied to `b` about its CoM: `x̄ += j/m`,
+/// quaternion advance by `I⁻¹(r×j)`, `pos` re-derived — the same
+/// CoM-frame discipline `integrate_free` and the ground correction
+/// apply. `rot` may change here, so `r` is recomputed from the live
+/// pose, not the constraint's generation arm.
+fn pair_position_correction(b: &mut WeldedBody, inv_i: SymMat3, p_world: DVec3, j: DVec3) {
+    let com = b.com_world() + j / b.mass_kg;
+    let conj = b.rot.conjugate();
+    let r_body = conj.rotate(p_world - b.com_world());
+    let j_body = conj.rotate(j);
+    let dtheta_body = inv_i.mul_vec(r_body.cross(j_body));
+    let dtheta_world = b.rot.rotate(dtheta_body);
+    let wq = DQuat::new(dtheta_world.x, dtheta_world.y, dtheta_world.z, 0.0);
+    let dq = wq * b.rot;
+    b.rot = DQuat::new(
+        b.rot.x + 0.5 * dq.x,
+        b.rot.y + 0.5 * dq.y,
+        b.rot.z + 0.5 * dq.z,
+        b.rot.w + 0.5 * dq.w,
+    )
+    .normalize();
+    b.pos = com - b.rot.rotate(b.com_local);
+}
+
+/// World-frame AABB of one hull of `b` — `None` on an empty vertex
+/// set (a hull with no points cannot overlap anything).
+fn hull_world_aabb(b: &WeldedBody, hull: &crate::weld::ConvexHull) -> Option<(DVec3, DVec3)> {
+    let (first, rest) = hull.vertices.split_first()?;
+    let p0 = b.pos + b.rot.rotate(*first);
+    let (mut lo, mut hi) = (p0, p0);
+    for v in rest {
+        let p = b.pos + b.rot.rotate(*v);
+        lo = DVec3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
+        hi = DVec3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
+    }
+    Some((lo, hi))
+}
+
+/// World-frame AABB of `b`'s whole compound collider — `None` when
+/// every hull is empty.
+fn body_world_aabb(b: &WeldedBody) -> Option<(DVec3, DVec3)> {
+    let mut out: Option<(DVec3, DVec3)> = None;
+    for hull in &b.collider.hulls {
+        if let Some((lo, hi)) = hull_world_aabb(b, hull) {
+            out = Some(match out {
+                Some((l, h)) => (
+                    DVec3::new(l.x.min(lo.x), l.y.min(lo.y), l.z.min(lo.z)),
+                    DVec3::new(h.x.max(hi.x), h.y.max(hi.y), h.z.max(hi.z)),
+                ),
+                None => (lo, hi),
+            });
+        }
+    }
+    out
+}
+
+/// Strict AABB overlap — touching boxes do not overlap (matching the
+/// strict `depth > 0` generation rule).
+fn aabbs_overlap(a: (DVec3, DVec3), b: (DVec3, DVec3)) -> bool {
+    a.0.x < b.1.x
+        && b.0.x < a.1.x
+        && a.0.y < b.1.y
+        && b.0.y < a.1.y
+        && a.0.z < b.1.z
+        && b.0.z < a.1.z
+}
+
+/// Does any vertex of `p`'s collider lie strictly inside a facet
+/// volume of `q`'s? One direction of the pair-generation narrowphase,
+/// shared with the `vessel_contact` predicate (the rules must be the
+/// same test — a predicate that disagreed with generation would
+/// refuse warp/save on contacts the solver never produced).
+fn any_vertex_penetrates(p: &WeldedBody, q: &WeldedBody) -> bool {
+    for hp in &p.collider.hulls {
+        let Some(ap) = hull_world_aabb(p, hp) else {
+            continue;
+        };
+        for hq in &q.collider.hulls {
+            let Some(aq) = hull_world_aabb(q, hq) else {
+                continue;
+            };
+            if !aabbs_overlap(ap, aq) {
+                continue;
+            }
+            let Some(planes) =
+                crate::hull::facet_planes(&hq.vertices, crate::hull::plane_epsilon(&hq.vertices))
+            else {
+                continue;
+            };
+            for v in &hp.vertices {
+                let p_w = p.pos + p.rot.rotate(*v);
+                let p_q = q.rot.conjugate().rotate(p_w - q.pos);
+                if !crate::hull::point_penetration(
+                    &planes,
+                    p_q,
+                    crate::hull::vertex_margin(&hq.vertices),
+                )
+                .is_empty()
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// The pair-geometry predicate both `vessel_contact` and generation
+/// share: a vertex of either body strictly inside a facet volume of
+/// the other, behind body- and hull-AABB broadphase.
+fn hulls_overlap(a: &WeldedBody, b: &WeldedBody) -> bool {
+    let (Some(aa), Some(bb)) = (body_world_aabb(a), body_world_aabb(b)) else {
+        return false;
+    };
+    if !aabbs_overlap(aa, bb) {
+        return false;
+    }
+    any_vertex_penetrates(a, b) || any_vertex_penetrates(b, a)
 }
 
 /// §2.9's `SimpleBackend` — see the module docs for the full spec
@@ -504,9 +1084,9 @@ impl SimpleBackend {
     /// force the environment and the vessel's own sites apply to each
     /// graph node this tick — gravity at each part's CoM, per-part
     /// aero (table path, or the placeholder distributed by mass
-    /// share), thrust sites, and the solved ground-contact impulses
-    /// attributed by hull — expressed in **body frame** as
-    /// [`PartForce`]s.
+    /// share), thrust sites, and the solved contact impulses (ground
+    /// and vessel-vessel pair) attributed by hull — expressed in
+    /// **body frame** as [`PartForce`]s.
     ///
     /// `contacts` is the manifold record from the last `step` for
     /// this body (`self.contacts(handle)`); passing it explicitly
@@ -613,7 +1193,8 @@ impl SimpleBackend {
             }
         }
 
-        // Ground-contact impulses ÷ dt, attributed by hull → part.
+        // Contact impulses ÷ dt — ground and vessel-vessel pair —
+        // attributed by hull → part.
         let mut hull_owner: std::collections::BTreeMap<u32, crate::graph::PartNodeId> =
             std::collections::BTreeMap::new();
         for (id, pw) in &body.part_index {
@@ -651,6 +1232,17 @@ impl SimpleBackend {
             }
         }
         false
+    }
+
+    /// Geometric vessel-vessel contact predicate — the same rule
+    /// [`Self::generate_pair_contacts`] applies (a collider vertex of
+    /// either body strictly inside a facet volume of the other,
+    /// behind the body/hull AABB broadphase), evaluated on demand.
+    /// The world's §7.4 save-boundary, §2.6.2 warp-refusal, and
+    /// to-rails predicates need the pairwise truth *between* steps,
+    /// which is geometry, not solver state.
+    pub fn vessel_contact(&self, a: &WeldedBody, b: &WeldedBody) -> bool {
+        hulls_overlap(a, b)
     }
 
     /// Force and torque (about the world-frame CoM) on `b`, in the
@@ -791,13 +1383,194 @@ impl SimpleBackend {
         }
     }
 
+    /// Phase 4a′ — vessel-vessel contact generation at the
+    /// post-integration pose: for each ordered body pair `(i, j)`
+    /// (`i < j`, both not simultaneously latched, body AABBs
+    /// overlapping), every collider vertex of `i` strictly inside a
+    /// facet volume of `j` — and vice versa — yields one
+    /// [`PairConstraint`] plus one [`Contact`] record on **each**
+    /// body: the penetrator's `+n` record and the penetrated body's
+    /// `−n` record (hull-indexed to its own collider for the §2.4
+    /// breakup load attribution). Fixed ascending
+    /// `(i, j, hull_i, hull_j, direction, vertex)` order.
+    ///
+    /// Facet planes are re-detected per call from the penetrated
+    /// hull's canonicalized vertex set — a pure derived cache with no
+    /// stored state — and vertex-only like the ground manifold (the
+    /// module doc's documented limitation).
+    #[allow(clippy::too_many_lines)]
+    fn generate_pair_contacts(&mut self, bodies: &[WeldedBody], pairs: &mut Vec<PairConstraint>) {
+        if bodies.len() < 2 {
+            return;
+        }
+        // Per-body world AABBs — the broadphase reject before any
+        // facet-plane work happens (the common case: vessels sharing
+        // a bubble but kilometres apart, pays only O(total verts)).
+        let body_aabbs: Vec<Option<(DVec3, DVec3)>> = bodies.iter().map(body_world_aabb).collect();
+        for i in 0..bodies.len() {
+            for j in (i + 1)..bodies.len() {
+                let (Some(bi), Some(bj)) = (body_aabbs[i], body_aabbs[j]) else {
+                    continue;
+                };
+                if !aabbs_overlap(bi, bj) {
+                    continue;
+                }
+                let (a, b) = (&bodies[i], &bodies[j]);
+                if a.settle.latched && b.settle.latched {
+                    // Two static bodies cannot resolve a mutual
+                    // penetration — the constraint would carry zero
+                    // impulse authority either way.
+                    continue;
+                }
+                // Per-hull broadphase + facet planes for this pair.
+                // Planes are computed once per hull (lazily per pair —
+                // a hull may pair with several others) and `None`
+                // marks a degenerate hull that can never be a
+                // penetrated target.
+                let aabbs_a: Vec<Option<(DVec3, DVec3)>> = a
+                    .collider
+                    .hulls
+                    .iter()
+                    .map(|h| hull_world_aabb(a, h))
+                    .collect();
+                let aabbs_b: Vec<Option<(DVec3, DVec3)>> = b
+                    .collider
+                    .hulls
+                    .iter()
+                    .map(|h| hull_world_aabb(b, h))
+                    .collect();
+                let planes_a: Vec<Option<Vec<crate::hull::Plane>>> = a
+                    .collider
+                    .hulls
+                    .iter()
+                    .map(|h| {
+                        crate::hull::facet_planes(
+                            &h.vertices,
+                            crate::hull::plane_epsilon(&h.vertices),
+                        )
+                    })
+                    .collect();
+                let planes_b: Vec<Option<Vec<crate::hull::Plane>>> = b
+                    .collider
+                    .hulls
+                    .iter()
+                    .map(|h| {
+                        crate::hull::facet_planes(
+                            &h.vertices,
+                            crate::hull::plane_epsilon(&h.vertices),
+                        )
+                    })
+                    .collect();
+                for (hi, ha) in a.collider.hulls.iter().enumerate() {
+                    for (hb_i, hb) in b.collider.hulls.iter().enumerate() {
+                        let (Some(aa), Some(bb)) = (aabbs_a[hi], aabbs_b[hb_i]) else {
+                            continue;
+                        };
+                        if !aabbs_overlap(aa, bb) {
+                            continue;
+                        }
+                        // Direction i→j: a's vertices inside hull hb_i.
+                        if let Some(pb) = &planes_b[hb_i] {
+                            for v in &ha.vertices {
+                                let p_w = a.pos + a.rot.rotate(*v);
+                                let p_b = b.rot.conjugate().rotate(p_w - b.pos);
+                                // One manifold point per facet the
+                                // vertex entered — ascending facet
+                                // index, a fixed order like every
+                                // other loop here.
+                                for (face, depth) in crate::hull::point_penetration(
+                                    pb,
+                                    p_b,
+                                    crate::hull::vertex_margin(&hb.vertices),
+                                ) {
+                                    let n_w = b.rot.rotate(pb[face].n);
+                                    let (cia, cib) =
+                                        (self.contacts[i].len(), self.contacts[j].len());
+                                    let (c, ra, rb) = PairConstraint::new(
+                                        i,
+                                        j,
+                                        cia,
+                                        cib,
+                                        *v,
+                                        pb[face].n,
+                                        pb[face].d,
+                                        p_w,
+                                        n_w,
+                                        depth,
+                                        a,
+                                        b,
+                                        hi as u32,
+                                        hb_i as u32,
+                                    );
+                                    pairs.push(c);
+                                    self.contacts[i].push(ra);
+                                    self.contacts[j].push(rb);
+                                }
+                            }
+                        }
+                        // Direction j→i: b's vertices inside hull hi.
+                        if let Some(pa) = &planes_a[hi] {
+                            for v in &hb.vertices {
+                                let p_w = b.pos + b.rot.rotate(*v);
+                                let p_a = a.rot.conjugate().rotate(p_w - a.pos);
+                                for (face, depth) in crate::hull::point_penetration(
+                                    pa,
+                                    p_a,
+                                    crate::hull::vertex_margin(&ha.vertices),
+                                ) {
+                                    let n_w = a.rot.rotate(pa[face].n);
+                                    let (cja, cib) =
+                                        (self.contacts[j].len(), self.contacts[i].len());
+                                    let (c, rj, ri) = PairConstraint::new(
+                                        j,
+                                        i,
+                                        cja,
+                                        cib,
+                                        *v,
+                                        pa[face].n,
+                                        pa[face].d,
+                                        p_w,
+                                        n_w,
+                                        depth,
+                                        b,
+                                        a,
+                                        hb_i as u32,
+                                        hi as u32,
+                                    );
+                                    pairs.push(c);
+                                    self.contacts[j].push(rj);
+                                    self.contacts[i].push(ri);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Phase 4b — the §2.9 projected Gauss–Seidel velocity solve: 8
     /// iterations, ascending `(body_id, contact_index)` (the
     /// `constraints` vector is built in exactly that order), normal
     /// impulse `≥ 0`, friction inside the Coulomb disc `μ·λ_n`.
     /// Velocities are solved *relative to the ground surface* —
-    /// `v_surf = body_spin × rel` is nonzero on a rotating world.
-    fn solve_velocity(&self, bodies: &mut [WeldedBody], constraints: &mut [Constraint]) {
+    /// `v_surf = body_spin × rel` is nonzero on a rotating world —
+    /// and, for `pairs`, *relative to the peer body*: the pair
+    /// constraint drives `v_a − v_b` to `≥ 0` along `n` with
+    /// equal-and-opposite impulses (the generalization of the
+    /// moving-surface rule). Each iteration runs the whole ground
+    /// manifold first, then the whole pair manifold — a fixed order
+    /// like every other pass here. Joint rows run last in each
+    /// iteration, in generation order (already the fixed
+    /// `(body_a, body_b, anchors)` sort), each joint solving its three
+    /// bilateral rows X → Y → Z.
+    fn solve_velocity(
+        &self,
+        bodies: &mut [WeldedBody],
+        constraints: &mut [Constraint],
+        pairs: &mut [PairConstraint],
+        joints: &[JointConstraint],
+    ) {
         // Cache each body's body-frame linear velocity once for the
         // whole solve; impulses update it by pure vector addition —
         // `rot` does not change inside this pass, so the cache stays
@@ -806,10 +1579,15 @@ impl SimpleBackend {
             .iter()
             .map(|b| b.rot.conjugate().rotate(b.vel))
             .collect();
+        // Same trick, world frame, for the pair constraints' relative
+        // point velocities — `rot·ang_vel`, kept in sync by both
+        // impulse write-backs.
+        let mut omega_world: Vec<DVec3> = bodies.iter().map(|b| b.rot.rotate(b.ang_vel)).collect();
         for _ in 0..SOLVER_ITERATIONS {
             for c in constraints.iter_mut() {
                 let b = &mut bodies[c.body as usize];
                 let vel_b = &mut vel_body[c.body as usize];
+                let omega_w = &mut omega_world[c.body as usize];
 
                 // Normal: target vn ≥ v_surf·n (restitution 0; the
                 // surface velocity is tangential on the sphere, so in
@@ -820,7 +1598,7 @@ impl SimpleBackend {
                 c.lambda_n = (c.lambda_n - vn * c.kn).max(0.0);
                 let dl = c.lambda_n - old;
                 if dl != 0.0 {
-                    apply_impulse(b, vel_b, c, c.n_body, dl);
+                    apply_impulse(b, vel_b, omega_w, c, c.n_body, dl);
                 }
 
                 // Friction, fixed order t1 then t2.
@@ -830,7 +1608,7 @@ impl SimpleBackend {
                 c.lambda_t1 = (c.lambda_t1 - vt1 * c.kt1).clamp(-limit, limit);
                 let dl = c.lambda_t1 - old;
                 if dl != 0.0 {
-                    apply_impulse(b, vel_b, c, c.t1_body, dl);
+                    apply_impulse(b, vel_b, omega_w, c, c.t1_body, dl);
                 }
 
                 let vt2 = rel_point_velocity_body(*vel_b, b, c).dot(c.t2_body);
@@ -838,7 +1616,7 @@ impl SimpleBackend {
                 c.lambda_t2 = (c.lambda_t2 - vt2 * c.kt2).clamp(-limit, limit);
                 let dl = c.lambda_t2 - old;
                 if dl != 0.0 {
-                    apply_impulse(b, vel_b, c, c.t2_body, dl);
+                    apply_impulse(b, vel_b, omega_w, c, c.t2_body, dl);
                 }
 
                 // Coulomb disc: the per-direction clamps alone admit
@@ -853,11 +1631,110 @@ impl SimpleBackend {
                     c.lambda_t1 *= s;
                     c.lambda_t2 *= s;
                     if dl1 != 0.0 {
-                        apply_impulse(b, vel_b, c, c.t1_body, dl1);
+                        apply_impulse(b, vel_b, omega_w, c, c.t1_body, dl1);
                     }
                     if dl2 != 0.0 {
-                        apply_impulse(b, vel_b, c, c.t2_body, dl2);
+                        apply_impulse(b, vel_b, omega_w, c, c.t2_body, dl2);
                     }
+                }
+            }
+            for c in pairs.iter_mut() {
+                let (ia, ib) = (c.a as usize, c.b as usize);
+                // Relative point velocity along n — the peer body's
+                // point velocity is the "surface" velocity here, so
+                // the restitution-0 target is `vn ≥ 0` on `v_a − v_b`.
+                let vn = (bodies[ia].vel + omega_world[ia].cross(c.r_a)
+                    - (bodies[ib].vel + omega_world[ib].cross(c.r_b)))
+                .dot(c.n);
+                let old = c.lambda_n;
+                c.lambda_n = (c.lambda_n - vn * c.kn).max(0.0);
+                let dl = c.lambda_n - old;
+                if dl != 0.0 {
+                    apply_pair_impulse(bodies, &mut vel_body, &mut omega_world, c, c.n * dl);
+                }
+
+                // Friction, same fixed t1-then-t2 order and Coulomb
+                // disc as the ground manifold, on relative velocity.
+                let limit = self.env.friction_mu * c.lambda_n;
+                let vt1 = (bodies[ia].vel + omega_world[ia].cross(c.r_a)
+                    - (bodies[ib].vel + omega_world[ib].cross(c.r_b)))
+                .dot(c.t1);
+                let old = c.lambda_t1;
+                c.lambda_t1 = (c.lambda_t1 - vt1 * c.kt1).clamp(-limit, limit);
+                let dl = c.lambda_t1 - old;
+                if dl != 0.0 {
+                    apply_pair_impulse(bodies, &mut vel_body, &mut omega_world, c, c.t1 * dl);
+                }
+
+                let vt2 = (bodies[ia].vel + omega_world[ia].cross(c.r_a)
+                    - (bodies[ib].vel + omega_world[ib].cross(c.r_b)))
+                .dot(c.t2);
+                let old = c.lambda_t2;
+                c.lambda_t2 = (c.lambda_t2 - vt2 * c.kt2).clamp(-limit, limit);
+                let dl = c.lambda_t2 - old;
+                if dl != 0.0 {
+                    apply_pair_impulse(bodies, &mut vel_body, &mut omega_world, c, c.t2 * dl);
+                }
+
+                let tnorm = libm::sqrt(c.lambda_t1 * c.lambda_t1 + c.lambda_t2 * c.lambda_t2);
+                if tnorm > limit && tnorm > 0.0 {
+                    let s = limit / tnorm;
+                    let dl1 = c.lambda_t1 * s - c.lambda_t1;
+                    let dl2 = c.lambda_t2 * s - c.lambda_t2;
+                    c.lambda_t1 *= s;
+                    c.lambda_t2 *= s;
+                    if dl1 != 0.0 {
+                        apply_pair_impulse(bodies, &mut vel_body, &mut omega_world, c, c.t1 * dl1);
+                    }
+                    if dl2 != 0.0 {
+                        apply_pair_impulse(bodies, &mut vel_body, &mut omega_world, c, c.t2 * dl2);
+                    }
+                }
+            }
+            Self::solve_joint_rows(bodies, &mut vel_body, &mut omega_world, joints);
+        }
+    }
+
+    /// One sweep of the joint rows inside a `solve_velocity`
+    /// iteration — X → Y → Z, bilateral: the applied impulse is
+    /// unclamped — a joint pulls as well as pushes. `vrel` is
+    /// `v_a − v_b` at the anchors, so `Δλ = (target − vrel)·k`
+    /// applied `+dir` on `a` / `−dir` on `b` closes the row's error.
+    /// Each `Δλ` is applied directly (no accumulated λ is kept — the
+    /// solve is cold-started per tick, so there is no warm-start
+    /// record to maintain).
+    fn solve_joint_rows(
+        bodies: &mut [WeldedBody],
+        vel_body: &mut [DVec3],
+        omega_world: &mut [DVec3],
+        joints: &[JointConstraint],
+    ) {
+        const AXES: [DVec3; 3] = [DVec3::X, DVec3::Y, DVec3::Z];
+        for c in joints.iter() {
+            let (ia, ib) = (c.a as usize, c.b as usize);
+            let target = [c.target.x, c.target.y, c.target.z];
+            for (row, dir) in AXES.iter().enumerate() {
+                // Re-evaluated per row — each row's write is the
+                // next row's input (strict Gauss–Seidel, same as
+                // the contact manifold's n→t1→t2 within a point).
+                let vrel = bodies[ia].vel + omega_world[ia].cross(c.r_a)
+                    - (bodies[ib].vel + omega_world[ib].cross(c.r_b));
+                let dl = (target[row] - vrel.dot(*dir)) * c.k[row];
+                if dl != 0.0 {
+                    apply_two_body_impulse(
+                        bodies,
+                        vel_body,
+                        omega_world,
+                        ia,
+                        ib,
+                        c.r_a,
+                        c.r_b,
+                        c.inv_i_a,
+                        c.inv_i_b,
+                        c.a_latched,
+                        c.b_latched,
+                        *dir * dl,
+                    );
                 }
             }
         }
@@ -879,7 +1756,18 @@ impl SimpleBackend {
     /// `com_local ≠ 0`, possibly deepening penetration), and a cap of
     /// [`MAX_TICK_POS_CORRECTION`] metres of CoM travel per body per
     /// tick bounds the total correction.
-    fn solve_positions(&self, bodies: &mut [WeldedBody], constraints: &[Constraint]) {
+    ///
+    /// Pair constraints share the pass (and the per-body budget):
+    /// depth is re-measured each iteration against the generation
+    /// facet in the penetrated body's live frame, and `σ·n` is applied
+    /// `+` to the penetrator / `−` to the penetrated — the latched
+    /// side of a pair takes no correction and spends no budget.
+    fn solve_positions(
+        &self,
+        bodies: &mut [WeldedBody],
+        constraints: &[Constraint],
+        pairs: &[PairConstraint],
+    ) {
         // Per-body budget of CoM translation this pass may apply this
         // tick — spent in fixed ascending constraint order.
         let mut spent = vec![0.0; bodies.len()];
@@ -927,6 +1815,49 @@ impl SimpleBackend {
                 )
                 .normalize();
                 b.pos = com - b.rot.rotate(b.com_local);
+            }
+            for c in pairs {
+                let (ia, ib) = (c.a as usize, c.b as usize);
+                // Re-measure depth at the CURRENT pose against the
+                // persistent generation facet, in `b`'s live frame —
+                // the same re-evaluation the ground pass does against
+                // the sphere.
+                let p_w = bodies[ia].pos + bodies[ia].rot.rotate(c.local_vertex);
+                let p_b = bodies[ib].rot.conjugate().rotate(p_w - bodies[ib].pos);
+                let depth = c.d_face_b - c.n_face_b.dot(p_b);
+                if depth <= 0.0 {
+                    continue;
+                }
+                let n_w = bodies[ib].rot.rotate(c.n_face_b);
+                // σ is the pseudo-impulse magnitude; each moving side's
+                // CoM travels σ/m. The per-body budget caps both —
+                // a latched side moves nothing and spends nothing.
+                let mut sigma = BAUMGARTE_BETA * depth * c.kn;
+                if !c.a_latched {
+                    let remaining = (MAX_TICK_POS_CORRECTION - spent[ia]).max(0.0);
+                    let travel = sigma / bodies[ia].mass_kg;
+                    if travel > remaining && travel > 0.0 {
+                        sigma *= remaining / travel;
+                    }
+                }
+                if !c.b_latched {
+                    let remaining = (MAX_TICK_POS_CORRECTION - spent[ib]).max(0.0);
+                    let travel = sigma / bodies[ib].mass_kg;
+                    if travel > remaining && travel > 0.0 {
+                        sigma *= remaining / travel;
+                    }
+                }
+                if sigma <= 0.0 {
+                    continue;
+                }
+                if !c.a_latched {
+                    spent[ia] += sigma / bodies[ia].mass_kg;
+                    pair_position_correction(&mut bodies[ia], c.inv_i_a, p_w, n_w * sigma);
+                }
+                if !c.b_latched {
+                    spent[ib] += sigma / bodies[ib].mass_kg;
+                    pair_position_correction(&mut bodies[ib], c.inv_i_b, p_w, n_w * -sigma);
+                }
             }
         }
     }
@@ -1042,12 +1973,13 @@ impl SimpleBackend {
 }
 
 impl PhysicsBackend for SimpleBackend {
-    /// One pinned `1/64` s tick. `joints` is ignored: §2.9 assigns
-    /// jointed islands to `RapierBackend` — `SimpleBackend` has no
-    /// joint solver by design (the §2.4 cap-16 transient joints
-    /// degrade to clean separation upstream).
+    /// One pinned `1/64` s tick. `joints` are the bubble's live
+    /// transient joints (§2.4, cap 16): each becomes a bilateral
+    /// three-row [`JointConstraint`] solved inside the same PGS
+    /// velocity pass as the contacts — the documented v1 joint-island
+    /// path (see [`JointDef`]'s backend note for why this is
+    /// `SimpleBackend` and not a `RapierBackend` island).
     fn step(&mut self, bodies: &mut [WeldedBody], joints: &[JointDef]) {
-        let _ = joints;
         self.contacts.clear();
         self.contacts.resize_with(bodies.len(), Vec::new);
 
@@ -1073,11 +2005,20 @@ impl PhysicsBackend for SimpleBackend {
             self.integrate_free(b);
         }
 
-        // Phase 4 — contact solve: generation, velocity PGS, position
-        // Baumgarte, all in fixed ascending order.
+        // Phase 4 — constraint solve: generation (ground contacts,
+        // then vessel-vessel pairs, then the transient joints),
+        // velocity PGS, position Baumgarte, all in fixed order.
         let mut constraints = Vec::new();
+        let mut pair_constraints = Vec::new();
+        let joint_constraints = generate_joint_constraints(bodies, joints);
         self.generate_contacts(bodies, &mut constraints);
-        self.solve_velocity(bodies, &mut constraints);
+        self.generate_pair_contacts(bodies, &mut pair_constraints);
+        self.solve_velocity(
+            bodies,
+            &mut constraints,
+            &mut pair_constraints,
+            &joint_constraints,
+        );
         // Write each constraint's accumulated impulse into its public
         // contact record — the §2.4 breakup load evaluation's
         // collision data. Position-level Baumgarte corrections are
@@ -1089,7 +2030,14 @@ impl PhysicsBackend for SimpleBackend {
                 .rotate(c.n_body * c.lambda_n + c.t1_body * c.lambda_t1 + c.t2_body * c.lambda_t2);
             self.contacts[c.body as usize][c.contact_index as usize].impulse = j;
         }
-        self.solve_positions(bodies, &constraints);
+        // Pair impulses are already world-frame: `+J` on the
+        // penetrator's record, `−J` on the penetrated body's.
+        for c in &pair_constraints {
+            let j = c.n * c.lambda_n + c.t1 * c.lambda_t1 + c.t2 * c.lambda_t2;
+            self.contacts[c.a as usize][c.contact_index_a as usize].impulse = j;
+            self.contacts[c.b as usize][c.contact_index_b as usize].impulse = -j;
+        }
+        self.solve_positions(bodies, &constraints, &pair_constraints);
 
         // Phase 5 — the §2.6.4 terminal state.
         self.update_settle(bodies, &pose0);
@@ -1097,8 +2045,9 @@ impl PhysicsBackend for SimpleBackend {
 
     /// Ray vs the environment sphere (nearest positive root, `toi ≤
     /// max_toi`). Stepped bodies are not raycast targets yet — hull-vs-
-    /// ray needs the parry `ConvexPolyhedron` materialization, the same
-    /// deferred work body-vs-body contact waits on.
+    /// ray still waits on the parry `ConvexPolyhedron` materialization
+    /// (the M6-A vessel-vessel contact path is analytic and never
+    /// needed it).
     fn cast_ray(&self, ray: &Ray, max_toi: f64) -> Option<Hit> {
         let oc = ray.origin - self.env.body_center;
         let b = oc.dot(ray.dir);
@@ -1215,6 +2164,9 @@ mod tests {
             PartNode::new(None, PartTransform::IDENTITY, 0),
         );
         let parts = [WeldPart {
+            dock_ports: vec![],
+            tanks: vec![],
+            crew_seats: 0,
             structural: csp_data::StructuralDef::unlimited(),
             mass_kg,
             com: DVec3::ZERO,
@@ -1342,6 +2294,9 @@ mod tests {
         );
         let half = DVec3::new(0.5, 0.5, 0.5);
         let parts = [WeldPart {
+            dock_ports: vec![],
+            tanks: vec![],
+            crew_seats: 0,
             structural: csp_data::StructuralDef::unlimited(),
             mass_kg: 10.0,
             com: DVec3::ZERO,
@@ -1554,6 +2509,9 @@ mod tests {
             ),
         );
         let mk = |m| WeldPart {
+            dock_ports: vec![],
+            tanks: vec![],
+            crew_seats: 0,
             structural: csp_data::StructuralDef::unlimited(),
             mass_kg: m,
             com: DVec3::ZERO,
@@ -1713,6 +2671,9 @@ mod tests {
             ),
         );
         let mk = |m| WeldPart {
+            dock_ports: vec![],
+            tanks: vec![],
+            crew_seats: 0,
             structural: csp_data::StructuralDef::unlimited(),
             mass_kg: m,
             com: DVec3::ZERO,
@@ -1873,6 +2834,9 @@ mod tests {
             PartNode::new(None, PartTransform::IDENTITY, 0),
         );
         let parts = [WeldPart {
+            dock_ports: vec![],
+            tanks: vec![],
+            crew_seats: 0,
             structural: csp_data::StructuralDef::unlimited(),
             mass_kg: m,
             com: DVec3::ZERO,
@@ -2030,6 +2994,220 @@ mod tests {
         assert!(latched, "damped spinner never latched");
     }
 
+    /// **M6-A: two vessels side by side.** Two boxes spawned on the
+    /// sphere with a deliberate lateral overlap must not
+    /// interpenetrate: the pair manifold pushes them apart along the
+    /// penetrated face normal, they come to rest in ground contact,
+    /// and both latch — after which the state is bitwise frozen.
+    /// `vessel_contact` is the geometric predicate of the same rule
+    /// generation applies, so it must agree with the recorded
+    /// manifolds.
+    #[test]
+    fn two_boxes_pushed_apart_do_not_interpenetrate() {
+        let mut backend = SimpleBackend::new(terrin_env());
+        let half = DVec3::new(0.5, 0.5, 0.5);
+        // a at x = −0.2 spans [−0.7, 0.3]; b at +0.7 spans [0.2, 1.2]
+        // → 0.1 m of lateral overlap over the shared face area.
+        let mut a = box_body(1_000.0, half);
+        a.pos = DVec3::new(-0.2, 0.0, TERRIN_R + half.z - 0.001);
+        let mut b = box_body(1_000.0, half);
+        b.pos = DVec3::new(0.7, 0.0, TERRIN_R + half.z - 0.001);
+        let mut bodies = vec![a, b];
+
+        assert!(backend.vessel_contact(&bodies[0], &bodies[1]));
+        backend.step(&mut bodies, &[]);
+        // The pair generated contacts on BOTH records, peer-tagged.
+        assert!(
+            backend
+                .contacts(BodyHandle(0))
+                .iter()
+                .any(|c| c.peer == Some(BodyHandle(1)))
+        );
+        assert!(
+            backend
+                .contacts(BodyHandle(1))
+                .iter()
+                .any(|c| c.peer == Some(BodyHandle(0)))
+        );
+
+        let mut both_latched = false;
+        for _ in 0..8_000 {
+            backend.step(&mut bodies, &[]);
+            // Never deep-interpenetrated: the hull AABB overlap stays
+            // bounded to resting equilibrium (≪ the 0.1 spawn bite).
+            assert!(
+                !deep_overlap(&bodies[0], &bodies[1]),
+                "vessels interpenetrated past tolerance"
+            );
+            if bodies[0].settle.latched && bodies[1].settle.latched {
+                both_latched = true;
+                break;
+            }
+        }
+        assert!(both_latched, "contacting pair never settled");
+        // The 0.1 m spawn bite resolved to resting equilibrium: the
+        // boxes may still be touching (leaning contact is a real
+        // resting state — resting equilibrium keeps vertices ~mm
+        // inside, like the ground) but nothing deep remains.
+        assert!(
+            max_vertex_penetration(&bodies[0], &bodies[1]) < 0.02,
+            "residual interpenetration too deep"
+        );
+        // Frozen once latched.
+        let frozen = (bodies[0].clone(), bodies[1].clone());
+        step_n(&mut backend, &mut bodies, 128);
+        assert_eq!((bodies[0].clone(), bodies[1].clone()), frozen);
+    }
+
+    /// Deepest vertex penetration between the two bodies' hulls, in
+    /// either direction (0.0 = none) — the same facet-penetration
+    /// measurement generation uses.
+    fn max_vertex_penetration(a: &WeldedBody, b: &WeldedBody) -> f64 {
+        let into = |p: &WeldedBody, q: &WeldedBody| {
+            let mut worst: f64 = 0.0;
+            for hq in &q.collider.hulls {
+                let Some(planes) = crate::hull::facet_planes(
+                    &hq.vertices,
+                    crate::hull::plane_epsilon(&hq.vertices),
+                ) else {
+                    continue;
+                };
+                for hp in &p.collider.hulls {
+                    for v in &hp.vertices {
+                        let p_w = p.pos + p.rot.rotate(*v);
+                        let p_q = q.rot.conjugate().rotate(p_w - q.pos);
+                        for (_, d) in crate::hull::point_penetration(
+                            &planes,
+                            p_q,
+                            crate::hull::plane_epsilon(&hq.vertices),
+                        ) {
+                            worst = worst.max(d);
+                        }
+                    }
+                }
+            }
+            worst
+        };
+        into(a, b).max(into(b, a))
+    }
+
+    /// Is `b`'s geometry buried deeper than `tol` inside `a`'s (or
+    /// vice versa)? The interpenetration-depth assertion several
+    /// tests need.
+    fn deep_overlap(a: &WeldedBody, b: &WeldedBody) -> bool {
+        const TOL: f64 = 0.05; // 5 cm — resting equilibrium is ~mm scale
+        max_vertex_penetration(a, b) > TOL
+    }
+
+    /// **M6-A: approach resolves correctly.** A free-space box
+    /// moving along +x into a resting box transfers momentum through
+    /// the pair manifold: the striker loses speed, the target gains
+    /// +x velocity, and total linear momentum is conserved to solver
+    /// tolerance — impulses are applied equal-and-opposite by
+    /// construction.
+    #[test]
+    fn moving_box_pushes_resting_box_and_conserves_momentum() {
+        let mut env = terrin_env();
+        env.mu_m3_per_s2 = 0.0;
+        env.radius_m = 0.0; // no ground sphere: pure pair dynamics
+        let mut backend = SimpleBackend::new(env);
+        let half = DVec3::new(0.5, 0.5, 0.5);
+        let mut a = box_body(1_000.0, half);
+        a.pos = DVec3::new(-3.0, 0.0, 0.0);
+        a.vel = DVec3::new(2.0, 0.0, 0.0);
+        let mut b = box_body(4_000.0, half);
+        b.pos = DVec3::new(0.0, 0.0, 0.0);
+        let mut bodies = vec![a, b];
+        let p0 = bodies[0].momentum() + bodies[1].momentum();
+
+        step_n(&mut backend, &mut bodies, 192); // 3 s
+        // The striker hit the target's −x face (n = −x̂ on a's
+        // record): a decelerated (may even recoil), b moved +x.
+        assert!(
+            bodies[1].vel.x > 0.05,
+            "target not pushed: v_b {:?}",
+            bodies[1].vel
+        );
+        assert!(bodies[1].pos.x > 0.05, "target not displaced");
+        assert!(bodies[0].vel.x < 2.0, "striker did not lose speed");
+        // Momentum: equal-and-opposite impulses conserve the total.
+        let p1 = bodies[0].momentum() + bodies[1].momentum();
+        let drift = (p1 - p0).norm() / p0.norm().max(1.0);
+        assert!(drift < 1e-9, "linear momentum drift {drift}");
+        // No deep interpenetration at any point of the collision:
+        // re-run and assert per tick this time.
+        let mut a = box_body(1_000.0, half);
+        a.pos = DVec3::new(-3.0, 0.0, 0.0);
+        a.vel = DVec3::new(2.0, 0.0, 0.0);
+        let mut b = box_body(4_000.0, half);
+        b.pos = DVec3::new(0.0, 0.0, 0.0);
+        let mut bodies2 = vec![a, b];
+        for _ in 0..192 {
+            backend.step(&mut bodies2, &[]);
+            assert!(!deep_overlap(&bodies2[0], &bodies2[1]));
+        }
+    }
+
+    /// **M6-A: stacking.** A vessel resting ON another vessel is
+    /// stable: the upper body's vertices inside the lower's hull
+    /// generate the support manifold; both come to rest (the upper
+    /// counts settled ticks on its pair contacts like it would on
+    /// ground contacts) and both latch.
+    #[test]
+    fn vessel_resting_on_vessel_is_stable() {
+        let mut backend = SimpleBackend::new(terrin_env());
+        let half = DVec3::new(1.0, 1.0, 0.5);
+        // Lower: bottom 1 mm inside the ground.
+        let mut lower = box_body(5_000.0, half);
+        lower.pos = DVec3::new(0.0, 0.0, TERRIN_R + half.z - 0.001);
+        // Upper: bottom face 2 mm inside the lower's top face
+        // (lower top ≈ R + 0.999, so upper centre ≈ R + 1.497).
+        let mut upper = box_body(500.0, half);
+        upper.pos = DVec3::new(0.0, 0.0, TERRIN_R + 3.0 * half.z - 0.002);
+        let mut bodies = vec![lower, upper];
+
+        let mut both_latched = false;
+        for _ in 0..12_000 {
+            backend.step(&mut bodies, &[]);
+            assert!(
+                !deep_overlap(&bodies[0], &bodies[1]),
+                "stack interpenetrated"
+            );
+            if bodies[0].settle.latched && bodies[1].settle.latched {
+                both_latched = true;
+                break;
+            }
+        }
+        assert!(both_latched, "stack never settled");
+        // The upper did not fall through: its bottom face is still
+        // above the lower's mid-plane.
+        assert!(bodies[1].pos.z > TERRIN_R + 2.0 * half.z);
+        let frozen = (bodies[0].clone(), bodies[1].clone());
+        step_n(&mut backend, &mut bodies, 64);
+        assert_eq!((bodies[0].clone(), bodies[1].clone()), frozen);
+    }
+
+    /// **M6-A determinism**: a two-vessel bubble run is bitwise
+    /// reproducible — the same property the single-body run asserts,
+    /// now covering the pair manifold's fixed ordering.
+    #[test]
+    fn two_vessel_run_is_bitwise_deterministic() {
+        let run = || {
+            let mut backend = SimpleBackend::new(terrin_env());
+            let half = DVec3::new(0.5, 0.5, 0.5);
+            let mut a = box_body(1_000.0, half);
+            a.pos = DVec3::new(-0.2, 0.0, TERRIN_R + half.z - 0.001);
+            let mut b = box_body(2_000.0, half);
+            b.pos = DVec3::new(0.7, 0.0, TERRIN_R + half.z - 0.001);
+            let mut upper = box_body(300.0, half);
+            upper.pos = DVec3::new(0.7, 0.0, TERRIN_R + 1.6);
+            let mut bodies = vec![a, b, upper];
+            step_n(&mut backend, &mut bodies, 2_000);
+            bodies
+        };
+        assert_eq!(run(), run());
+    }
+
     /// The Baumgarte cap and the pose-delta settle gate together: a
     /// body spawned buried 1.5 m deep is raised at ≤
     /// [`MAX_TICK_POS_CORRECTION`] per tick, and while it is being
@@ -2079,5 +3257,229 @@ mod tests {
             }
         }
         assert!(latched, "buried box never reached rest/latch");
+    }
+
+    // ---- M6-B: §2.4 transient joints (soft-capture) ----
+
+    /// Zero-gravity environment — joint dynamics isolated from the
+    /// (equal-on-both) gravity term.
+    fn free_space_env() -> Environment {
+        Environment {
+            mu_m3_per_s2: 0.0,
+            ..terrin_env()
+        }
+    }
+
+    fn soft_capture() -> JointKind {
+        JointKind::SoftCapture {
+            pull_per_s: 8.0,
+            max_correction_mps: 1.0,
+        }
+    }
+
+    /// The world-frame anchor separation of a joint between
+    /// `bodies[0]` (anchor `la`) and `bodies[1]` (anchor `lb`).
+    fn anchor_sep(bodies: &[WeldedBody], la: DVec3, lb: DVec3) -> f64 {
+        let pa = bodies[0].pos + bodies[0].rot.rotate(la);
+        let pb = bodies[1].pos + bodies[1].rot.rotate(lb);
+        (pa - pb).norm()
+    }
+
+    /// A soft-capture joint reels its anchors together and the
+    /// relative velocity damps out — the compliant joint converges
+    /// instead of welding.
+    #[test]
+    fn soft_capture_reels_anchors_together() {
+        let mut backend = SimpleBackend::new(free_space_env());
+        let half = DVec3::new(0.5, 0.5, 0.5);
+        let mut bodies = vec![box_body(1_000.0, half), box_body(1_000.0, half)];
+        bodies[0].pos = DVec3::new(TERRIN_R + 1_000.0, 0.0, 0.0);
+        bodies[1].pos = DVec3::new(TERRIN_R + 1_000.0, 0.5, 0.0);
+        let joint = JointDef {
+            body_a: BodyHandle(0),
+            body_b: BodyHandle(1),
+            local_anchor_a: DVec3::ZERO,
+            local_anchor_b: DVec3::ZERO,
+            kind: soft_capture(),
+        };
+        let sep0 = anchor_sep(&bodies, DVec3::ZERO, DVec3::ZERO);
+        for _ in 0..192 {
+            backend.step(&mut bodies, &[joint]);
+        }
+        let sep = anchor_sep(&bodies, DVec3::ZERO, DVec3::ZERO);
+        assert!(
+            sep < 0.01,
+            "anchors should converge within the capture window: {sep}"
+        );
+        let vrel = (bodies[0].vel - bodies[1].vel).norm();
+        assert!(vrel < 0.01, "relative velocity should damp out: {vrel}");
+        // Exponential reel-in: separation decayed far below its start.
+        assert!(sep < sep0 * 0.05);
+    }
+
+    /// The closing-speed cap is the "soft" — a far-separated pair
+    /// closes at ≤ max_correction, never faster.
+    #[test]
+    fn soft_capture_caps_closing_speed() {
+        let mut backend = SimpleBackend::new(free_space_env());
+        let half = DVec3::new(0.5, 0.5, 0.5);
+        let mut bodies = vec![box_body(1_000.0, half), box_body(1_000.0, half)];
+        bodies[0].pos = DVec3::new(TERRIN_R + 1_000.0, 0.0, 0.0);
+        bodies[1].pos = DVec3::new(TERRIN_R + 1_000.0, 8.0, 0.0);
+        let joint = JointDef {
+            body_a: BodyHandle(0),
+            body_b: BodyHandle(1),
+            local_anchor_a: DVec3::ZERO,
+            local_anchor_b: DVec3::ZERO,
+            kind: soft_capture(),
+        };
+        let mut prev = anchor_sep(&bodies, DVec3::ZERO, DVec3::ZERO);
+        let mut saw_capped = false;
+        for _ in 0..16 {
+            backend.step(&mut bodies, &[joint]);
+            let sep = anchor_sep(&bodies, DVec3::ZERO, DVec3::ZERO);
+            let closing = (prev - sep) / PHYSICS_DT;
+            assert!(
+                closing <= 1.0 + 1e-9,
+                "closing speed {closing} exceeded the 1 m/s cap"
+            );
+            saw_capped |= closing > 0.9;
+            prev = sep;
+        }
+        assert!(saw_capped, "cap never engaged on a far separation");
+        // The pair is still being pulled together (not a dead joint).
+        assert!(prev < 8.0);
+    }
+
+    /// Equal-and-opposite impulses conserve linear momentum exactly —
+    /// gravity-free, so the joint is the only interaction.
+    #[test]
+    fn joint_impulses_conserve_momentum() {
+        let mut backend = SimpleBackend::new(free_space_env());
+        let half = DVec3::new(0.5, 0.5, 0.5);
+        let mut bodies = vec![box_body(1_000.0, half), box_body(2_000.0, half)];
+        bodies[0].pos = DVec3::new(TERRIN_R + 1_000.0, 0.0, 0.0);
+        bodies[1].pos = DVec3::new(TERRIN_R + 1_000.0, 2.0, 1.0);
+        bodies[0].vel = DVec3::new(0.0, 1.0, 0.0);
+        bodies[1].vel = DVec3::new(0.0, -0.5, 0.5);
+        let joint = JointDef {
+            body_a: BodyHandle(0),
+            body_b: BodyHandle(1),
+            // Off-CoM anchors, so the joint also torques — momentum
+            // conservation must hold through the angular channel too.
+            local_anchor_a: DVec3::new(0.2, 0.3, 0.0),
+            local_anchor_b: DVec3::new(-0.1, 0.0, 0.4),
+            kind: soft_capture(),
+        };
+        let p0 = bodies[0].vel * bodies[0].mass_kg + bodies[1].vel * bodies[1].mass_kg;
+        for _ in 0..64 {
+            backend.step(&mut bodies, &[joint]);
+        }
+        let p1 = bodies[0].vel * bodies[0].mass_kg + bodies[1].vel * bodies[1].mass_kg;
+        assert!(
+            (p1 - p0).norm() < 1e-6,
+            "joint impulses must conserve linear momentum: {p0:?} -> {p1:?}"
+        );
+    }
+
+    /// A latched side is the island's static anchor — the free body
+    /// reels toward it and it never moves.
+    #[test]
+    fn joint_latched_side_stays_put() {
+        let mut backend = SimpleBackend::new(free_space_env());
+        let half = DVec3::new(0.5, 0.5, 0.5);
+        let mut bodies = vec![box_body(1_000.0, half), box_body(1_000.0, half)];
+        bodies[0].pos = DVec3::new(TERRIN_R + 1_000.0, 0.0, 0.0);
+        bodies[1].pos = DVec3::new(TERRIN_R + 1_000.0, 2.0, 0.0);
+        bodies[0].settle.latched = true;
+        let joint = JointDef {
+            body_a: BodyHandle(0),
+            body_b: BodyHandle(1),
+            local_anchor_a: DVec3::ZERO,
+            local_anchor_b: DVec3::ZERO,
+            kind: soft_capture(),
+        };
+        let pos0 = bodies[0].pos;
+        for _ in 0..192 {
+            backend.step(&mut bodies, &[joint]);
+        }
+        assert_eq!(bodies[0].pos, pos0, "latched body must not move");
+        let sep = anchor_sep(&bodies, DVec3::ZERO, DVec3::ZERO);
+        assert!(
+            sep < 2.0,
+            "free body reeled toward the latched anchor: {sep}"
+        );
+    }
+
+    /// The solver re-sorts the joint list — enumeration order cannot
+    /// change the tick.
+    #[test]
+    fn joint_order_does_not_change_the_solve() {
+        let run = |order: [usize; 2]| {
+            let mut backend = SimpleBackend::new(free_space_env());
+            let half = DVec3::new(0.5, 0.5, 0.5);
+            let mut bodies = vec![
+                box_body(1_000.0, half),
+                box_body(1_000.0, half),
+                box_body(1_000.0, half),
+            ];
+            bodies[0].pos = DVec3::new(TERRIN_R + 1_000.0, 0.0, 0.0);
+            bodies[1].pos = DVec3::new(TERRIN_R + 1_000.0, 1.0, 0.0);
+            bodies[2].pos = DVec3::new(TERRIN_R + 1_000.0, 0.0, 1.0);
+            let js = [
+                JointDef {
+                    body_a: BodyHandle(0),
+                    body_b: BodyHandle(1),
+                    local_anchor_a: DVec3::ZERO,
+                    local_anchor_b: DVec3::ZERO,
+                    kind: soft_capture(),
+                },
+                JointDef {
+                    body_a: BodyHandle(0),
+                    body_b: BodyHandle(2),
+                    local_anchor_a: DVec3::new(0.1, 0.0, 0.0),
+                    local_anchor_b: DVec3::new(0.0, -0.1, 0.0),
+                    kind: soft_capture(),
+                },
+            ];
+            let list = [js[order[0]], js[order[1]]];
+            for _ in 0..64 {
+                backend.step(&mut bodies, &list);
+            }
+            bodies
+        };
+        let (a, b) = (run([0, 1]), run([1, 0]));
+        for i in 0..3 {
+            assert_eq!(a[i].pos, b[i].pos);
+            assert_eq!(a[i].vel, b[i].vel);
+            assert_eq!(a[i].ang_vel, b[i].ang_vel);
+        }
+    }
+
+    /// Bitwise determinism: two identical runs of a jointed island
+    /// agree bit-for-bit.
+    #[test]
+    fn joint_solve_is_bit_deterministic() {
+        let run = || {
+            let mut backend = SimpleBackend::new(free_space_env());
+            let half = DVec3::new(0.5, 0.5, 0.5);
+            let mut bodies = vec![box_body(1_000.0, half), box_body(750.0, half)];
+            bodies[0].pos = DVec3::new(TERRIN_R + 1_000.0, 0.0, 0.0);
+            bodies[1].pos = DVec3::new(TERRIN_R + 1_000.0, 1.5, 0.5);
+            bodies[1].vel = DVec3::new(0.0, -0.5, 0.25);
+            bodies[1].ang_vel = DVec3::new(0.01, 0.0, 0.02);
+            let joint = JointDef {
+                body_a: BodyHandle(0),
+                body_b: BodyHandle(1),
+                local_anchor_a: DVec3::new(0.1, 0.2, 0.0),
+                local_anchor_b: DVec3::ZERO,
+                kind: soft_capture(),
+            };
+            for _ in 0..96 {
+                backend.step(&mut bodies, &[joint]);
+            }
+            bodies
+        };
+        assert_eq!(run(), run());
     }
 }

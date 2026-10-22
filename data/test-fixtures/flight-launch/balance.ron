@@ -1,7 +1,7 @@
 // Global balance constants. ALL tuning lives here (PLAN §8.3).
 // Named fields only — positional tuples drift silently under reordering.
 (
-    schema_version: 1,
+    schema_version: 4,
     // Physics bubble radius (PLAN §2.3): 20 km. Vessels go on rails at the
     // radius and rejoin at 90% (18 km) — the hysteresis is csp-sim logic,
     // not a second constant.
@@ -13,4 +13,30 @@
     // (oldest-first eviction under breakup back-pressure).
     max_tracked_vessels: 512,
     max_debris: 64,
+    // PLAN §2.4: hard cap 16 live transient joints per bubble; creation
+    // beyond the cap degrades to an immediate clean separation.
+    max_live_joints_per_bubble: 16,
+    // PLAN §2.4: the soft-capture joint's maximum life — 192 = 3 s at
+    // 64 Hz (the capture window; the latch merge runs inside it).
+    capture_window_ticks: 192,
+    // Docking capture predicate (M6-B): port faces within this distance,
+    // facing within this angle, closing slower than this speed.
+    dock_capture_range_m: 0.5,
+    dock_capture_angle_deg: 15.0,
+    dock_capture_rel_speed_mps: 5.0,
+    // Soft-capture compliance: exponential reel-in rate and the closing-
+    // speed cap that makes the capture "soft".
+    dock_soft_pull_per_s: 8.0,
+    dock_soft_max_correction_mps: 1.0,
+    // M6-C §2.4 latch: the settle gates that consume a capture inside
+    // the window — anchors mated within this distance and moving no
+    // faster than this relative speed.
+    dock_latch_separation_m: 0.1,
+    dock_latch_rel_speed_mps: 0.5,
+    // M6-D §3.5 transfer process: undocked transfer reach (m), the
+    // single resource flow rate standing in for min(port outflow,
+    // port inflow) (units/s), and the crew-traversal delay (ticks).
+    transfer_radius_m: 100.0,
+    transfer_rate_units_per_s: 10.0,
+    crew_transfer_ticks: 640,
 )

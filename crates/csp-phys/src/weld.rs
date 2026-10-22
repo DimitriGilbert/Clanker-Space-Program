@@ -34,13 +34,14 @@ use crate::thermal::{ThermalEdge, ThermalNet, ThermalNode, joint_conductance};
 /// One hull of the merged compound collider — the convex vertex set of
 /// one part, transformed into body frame. Stored in a canonical order
 /// (sorted by `(x, y, z)`, duplicates removed) so the representation
-/// is invariant under input ordering; sub-phase B materializes
-/// `parry3d-f64` `ConvexPolyhedron`s from these point sets for the
-/// contact solver (§2.9).
+/// is invariant under input ordering; the contact solver derives
+/// facet planes from these point sets via `hull::facet_planes`
+/// (§2.9) — no parry materialization.
 ///
 /// The set is canonicalized but **not** hull-reduced: interior points
-/// a resolver supplied may survive until the parry materialization
-/// lands — sub-phase B must not assume minimality.
+/// a resolver supplied may survive — consumers must not assume
+/// minimality (the facet detector tolerates them: an interior vertex
+/// simply never forms a facet).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ConvexHull {
     pub vertices: Vec<DVec3>,
@@ -49,7 +50,8 @@ pub struct ConvexHull {
 /// The merged convex-hull compound collider of §2.4 Stage 1: one
 /// [`ConvexHull`] per welded part, indexed by
 /// [`PartWeld::hull_index`]. Kept as plain vertex sets — a serde-able,
-/// hashable mirror that the physics backend turns into parry shapes.
+/// hashable mirror the physics backend's facet machinery reads
+/// directly.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CompoundCollider {
     pub hulls: Vec<ConvexHull>,
@@ -725,9 +727,8 @@ fn build_thermal_net(
 ///
 /// This is **not** a hull reduction: interior (non-extreme) points of
 /// the input survive — canonicalization dedups and sorts, it does not
-/// compute the convex hull. Minimality is deferred to sub-phase B's
-/// `parry3d-f64` materialization; consumers must not assume the
-/// vertex set is reduced.
+/// compute the convex hull. Consumers must not assume the vertex set
+/// is reduced (the facet detector tolerates interior points).
 fn canonicalize(vertices: &mut Vec<DVec3>) {
     vertices.sort_by(|a, b| {
         a.x.total_cmp(&b.x)
@@ -771,6 +772,9 @@ mod tests {
 
     fn point_part(mass_kg: f64) -> WeldPart {
         WeldPart {
+            dock_ports: vec![],
+            tanks: vec![],
+            crew_seats: 0,
             structural: csp_data::StructuralDef::unlimited(),
             mass_kg,
             com: DVec3::ZERO,
@@ -784,6 +788,9 @@ mod tests {
 
     fn box_part(mass_kg: f64, half: DVec3) -> WeldPart {
         WeldPart {
+            dock_ports: vec![],
+            tanks: vec![],
+            crew_seats: 0,
             structural: csp_data::StructuralDef::unlimited(),
             mass_kg,
             com: DVec3::ZERO,

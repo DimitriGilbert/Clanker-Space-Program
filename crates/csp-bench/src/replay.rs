@@ -1180,6 +1180,41 @@ mod tests {
         );
         assert_eq!(b.max_tracked_vessels, csp_sim::DEFAULT_MAX_VESSELS);
         assert_eq!(b.max_debris, csp_sim::DEFAULT_MAX_DEBRIS);
+        // M6-B §2.4 docking mirrors — same pinning contract: the
+        // compiled `default_config()`/`DEFAULT_*`s are what data-less
+        // worlds run, so they must agree with the authored file.
+        let d = csp_sim::DockingConfig::from_balance(&b);
+        let m = csp_sim::joints::default_config();
+        assert_eq!(b.max_live_joints_per_bubble, m.max_live_joints);
+        assert_eq!(b.capture_window_ticks, m.capture_window_ticks);
+        assert_eq!(d.max_live_joints, m.max_live_joints);
+        assert_eq!(d.capture_window_ticks, m.capture_window_ticks);
+        assert_eq!(d.capture_range_m, m.capture_range_m);
+        assert_eq!(d.capture_min_alignment_dot, m.capture_min_alignment_dot);
+        assert_eq!(d.capture_rel_speed_mps, m.capture_rel_speed_mps);
+        assert_eq!(d.soft_pull_per_s, m.soft_pull_per_s);
+        assert_eq!(d.soft_max_correction_mps, m.soft_max_correction_mps);
+        // M6-C latch tunables — same pinning contract.
+        assert_eq!(d.latch_separation_m, m.latch_separation_m);
+        assert_eq!(d.latch_rel_speed_mps, m.latch_rel_speed_mps);
+        assert_eq!(
+            b.dock_latch_separation_m,
+            csp_sim::DEFAULT_LATCH_SEPARATION_M
+        );
+        assert_eq!(
+            b.dock_latch_rel_speed_mps,
+            csp_sim::DEFAULT_LATCH_REL_SPEED_MPS
+        );
+        // And the literal `DEFAULT_*` mirrors the file names.
+        assert_eq!(b.dock_capture_range_m, csp_sim::DEFAULT_CAPTURE_RANGE_M);
+        assert_eq!(
+            b.capture_window_ticks,
+            csp_sim::DEFAULT_CAPTURE_WINDOW_TICKS
+        );
+        assert_eq!(
+            b.max_live_joints_per_bubble,
+            csp_sim::DEFAULT_MAX_LIVE_JOINTS
+        );
     }
 
     /// An entry stamped at a tick the log has already moved past is
