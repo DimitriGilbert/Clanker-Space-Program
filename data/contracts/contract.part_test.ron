@@ -1,0 +1,28 @@
+// §3.6 part test at regime — flight-prove a crew-capable hull or a
+// thrust site in Terrin orbit (tech.rocketry.3 unlocks it). The
+// module requirement is capability-keyed: the weld record carries
+// resolved parts, so the honest check is on the module presence.
+(
+    schema_version: 1,
+    id: "contract.part_test",
+    display_name: "contract.part_test.name",
+    description: "contract.part_test.desc",
+    kind: PartTest,
+    generate: (
+        weight: 1.5,
+        space: PartTest(
+            modules: [CrewSeat, ThrustSite],
+            regime: Orbit(
+                bodies: ["terrin"],
+                min_alt_m: (80_000.0, 200_000.0),
+            ),
+        ),
+    ),
+    prerequisites: [TechResearched("tech.rocketry.3")],
+    rewards: (
+        advance_funds: 5_000.0,
+        completion_funds: 28_000.0,
+        failure_penalty_funds: 3_000.0,
+    ),
+    deadline_days: Some(60.0),
+)

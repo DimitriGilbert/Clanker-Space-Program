@@ -21,6 +21,8 @@
 //! - [`part`] — `PartDef` and everything it carries: categories,
 //!   attach nodes, scaling rules, collider/aero/thermal/structural
 //!   defs, variants, `ModuleDef`, and the §3.4 `ReliabilityDef`.
+//! - [`techtree`] — `data/techtree/*.ron` fragments: `TechNode`,
+//!   `UpgradeTrack`/`UpgradeLevel`, and the merged `TechTree` view.
 //! - [`resource`] — the §3.5 resource registry (`resources.ron`).
 //! - [`biome`] — `biomes.ron` legend + indexed-PNG header inspection.
 //! - [`loc`] — `en.ron` table.
@@ -46,41 +48,59 @@ pub const DATA_HASH_VERSION: u32 = 1;
 
 pub mod balance;
 pub mod biome;
+pub mod contract;
 pub mod datahash;
+pub mod experiment;
 pub mod ids;
 pub mod load;
 pub mod loc;
 pub mod part;
 pub mod resource;
+pub mod site;
 pub mod system;
+pub mod techtree;
 pub mod validate;
 
 pub use balance::{BALANCE_SCHEMA_VERSION, BalanceDef};
 pub use biome::{
     BiomeLegend, BiomeLegendEntry, IndexedPng, PngInfo, decode_indexed_png, inspect_indexed_png,
 };
+pub use contract::{
+    CONTRACT_SCHEMA_VERSION, ContractGenerator, ContractKind, ContractParamSpace, ContractParams,
+    ContractPrereq, ContractRegime, ContractRewards, ContractTemplate, ModuleReq, RegimeSpace,
+};
 pub use datahash::{DataHashError, data_set_hash};
+pub use experiment::{EXPERIMENT_SCHEMA_VERSION, ExperimentCap, ExperimentDef};
 pub use ids::{
-    BiomeId, BodyId, ExperimentId, FamilyId, LocKey, PartId, RecipeId, ResourceId, SystemId,
-    TechNodeId, VariantId,
+    BiomeId, BodyId, ContractTypeId, ExperimentId, FacilityId, FamilyId, LocKey, PartId, RecipeId,
+    ResourceId, SiteId, SystemId, TechNodeId, UpgradeTrackId, VariantId,
 };
 pub use load::{
-    LoadError, LoadedBiomeMap, LoadedBody, LoadedPart, LoadedParts, LoadedSystem, load_balance,
-    load_parts, load_resources, load_system,
+    LoadError, LoadedBiomeMap, LoadedBody, LoadedContract, LoadedContracts, LoadedExperiment,
+    LoadedExperiments, LoadedPart, LoadedParts, LoadedSystem, LoadedTechFile, LoadedTechTree,
+    load_balance, load_contracts, load_experiments, load_parts, load_resources, load_sites,
+    load_system, load_techtree,
 };
 pub use loc::LocFile;
 pub use part::{
     AeroDef, AeroKnot, AttachNode, ColliderDef, FailureMode, G0, ModuleDef, PART_SCHEMA_VERSION,
     PartCategory, PartDef, PartVariant, PortSize, QualCurve, QualKnot, ReliabilityDef,
-    ScaleExponents, ScaleRule, SituationMask, StatPath, StressKind, StressRule, StructuralDef,
-    ThermalDef, ThrottleRange,
+    ScaleExponents, ScaleRule, Situation, SituationMask, StatPath, StressKind, StressRule,
+    StructuralDef, ThermalDef, ThrottleRange,
 };
 pub use resource::{RESOURCE_SCHEMA_VERSION, ResourceDef, ResourceFile};
+pub use site::{SITE_SCHEMA_VERSION, SiteDef, SiteFile};
 pub use system::{
     AtmosphereDef, BiomeMapRef, BodyDef, ConcentrationMapRef, KeplerElements, OceanDef,
     SCHEMA_VERSION, SystemDef, TemperatureKnot, TerrainDef,
 };
+pub use techtree::{
+    TECHTREE_SCHEMA_VERSION, TechNode, TechTree, TechTreeDef, TechUnlocks, UpgradeEffect,
+    UpgradeLevel, UpgradeTrack,
+};
 pub use validate::{
-    PERIOD_REL_TOL, ValidationError, validate_loc_keys, validate_part_loc_keys, validate_parts,
-    validate_resources, validate_system,
+    PERIOD_REL_TOL, ValidationError, validate_contract_loc_keys, validate_contracts,
+    validate_experiments, validate_loc_keys, validate_part_loc_keys, validate_parts,
+    validate_resources, validate_sites, validate_system, validate_techtree,
+    validate_techtree_loc_keys,
 };

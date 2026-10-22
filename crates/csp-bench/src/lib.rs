@@ -12,5 +12,13 @@
 //! - [`scenarios`] — the recorded-scenario registry behind `csp-replay`
 //!   and `xtask bless-goldens`.
 
+/// M7-C §8.3 — the economy harness: the staffed-base drain probe
+/// (2–5% per sim-month band), the 100-sim-year save-size check, and
+/// the insolvency watch. See the module doc.
+/// M7-D §3.6 — the contract-lifecycle probe: generation →
+/// acceptance → advance → event-driven completion → payout,
+/// determinism-verified.
+pub mod contracts;
+pub mod economy;
 pub mod replay;
 pub mod scenarios;

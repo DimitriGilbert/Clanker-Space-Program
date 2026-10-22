@@ -1,7 +1,7 @@
 // Global balance constants. ALL tuning lives here (PLAN §8.3).
 // Named fields only — positional tuples drift silently under reordering.
 (
-    schema_version: 4,
+    schema_version: 7,
     // Physics bubble radius (PLAN §2.3): 20 km. Vessels go on rails at the
     // radius and rejoin at 90% (18 km) — the hysteresis is csp-sim logic,
     // not a second constant.
@@ -39,4 +39,23 @@
     transfer_radius_m: 100.0,
     transfer_rate_units_per_s: 10.0,
     crew_transfer_ticks: 640,
+    // M7-A §3.2 science: the diminishing-repeat soft-cap constant k
+    // (≈1.0), the lab exhaustion floor (data units), science points
+    // per data unit (eta), and ElectricCharge per transmitted unit.
+    science_softcap_k: 1.0,
+    research_data_epsilon: 1e-6,
+    lab_science_per_data: 1.0,
+    transmit_ec_per_data_unit: 1.0,
+    // M7-C §3.5 economy block — same fields as data/balance.ron.
+    starting_funds_micros: 1_000_000_000_000,
+    salary_period_days: 30,
+    crew_hire_cost_funds: 5_000.0,
+    science_funds_per_point: 10.0,
+    recovery_efficiency: 0.9,
+    abandon_recovery: 0.25,
+    // M7-D §3.6 contracts: the offer-board size the generator
+    // maintains (new offers draw at successive offer_index counters
+    // when the board is short). Mirror:
+    // `csp_sim::DEFAULT_CONTRACT_BOARD_SIZE`.
+    contract_offer_slots: 6,
 )

@@ -221,18 +221,20 @@ pub struct BuiltPart {
     /// `stat_path → TrackLevels { levels, multiplier }`.
     ///
     /// Deviation from the §3.1 sketch (`BTreeMap<FamilyId,
-    /// TrackLevels>`), documented: `data/techtree/*.ron` and its
-    /// `UpgradeTrack` schema are a later milestone, so no track defs
-    /// exist for the resolver to look levels up in. The manufacture
-    /// step composes track levels into this map **keeping both the
-    /// level count and the composed effect**: `levels` preserves the
-    /// track position for UI/save-migration, and `multiplier` folds
-    /// whatever §3.3's `multiplier_or_delta` authored — including
-    /// *additive* deltas a bare `Π`-of-multipliers map could not
-    /// represent. Storing the composed effect makes the record
-    /// **self-contained** — re-derivation on load needs the part def
-    /// only, never the tree, so a rebalanced or deleted track can
-    /// never alter an in-flight part.
+    /// TrackLevels>`), documented: the sketch keys on family, but the
+    /// `UpgradeTrack` schema that landed with the tree keys on
+    /// `stat_path` — and the map stores the *composed* effect, not a
+    /// lookup reference. [`compose_upgrade_levels`] folds the
+    /// family's purchased track levels into this map at manufacture
+    /// **keeping both the level count and the composed effect**:
+    /// `levels` preserves the track position for UI/save-migration,
+    /// and `multiplier` folds whatever §3.3's `multiplier_or_delta`
+    /// authored — including *additive* deltas a bare
+    /// `Π`-of-multipliers map could not represent. Storing the
+    /// composed effect makes the record **self-contained** —
+    /// re-derivation on load needs the part def only, never the tree,
+    /// so a rebalanced or deleted track can never alter an in-flight
+    /// part.
     pub upgrade_levels_at_build: BTreeMap<StatPath, TrackLevels>,
     /// `data_set_hash` (§3.1) at manufacture — "what the numbers meant
     /// when it was built", the §7.7 drift-warning key. Nothing consumes
@@ -747,23 +749,98 @@ fn pow2(s: f64, e: Option<f64>) -> f64 {
     }
 }
 
-/// Does `path` name a scalar this def actually carries? Top-level
-/// stats always resolve; module stats need a matching module present.
+/// Does `path` name a scalar this def actually carries? Delegates to
+/// [`StatPath::base_value`] — the reachability predicate and the
+/// delta-track base read are the same def knowledge, kept on the data
+/// side so the tech-tree validator checks against identical rules.
 /// This is the §3.1 "every path must resolve or it's a typed error"
 /// rule — the *check* half; the *apply* half is in
 /// [`resolve_stats`]/[`resolve_module`].
 fn stat_path_resolves(def: &PartDef, path: StatPath) -> bool {
-    match path {
-        StatPath::MassDryKg | StatPath::CostFunds | StatPath::BaseMtbfS => true,
-        StatPath::ThrustVacN | StatPath::IspVacS | StatPath::IspSlS | StatPath::RatedBurnS => def
-            .modules
-            .iter()
-            .any(|m| matches!(m, ModuleDef::Engine { .. })),
-        StatPath::ControlTorqueNm => def
-            .modules
-            .iter()
-            .any(|m| matches!(m, ModuleDef::Control { .. })),
+    path.base_value(def).is_some()
+}
+
+/// The manufacture half of §3.3's "upgrades apply at manufacture":
+/// compose a family's purchased [`UpgradeTrack`] levels into the
+/// frozen `BuiltPart::upgrade_levels_at_build` map.
+///
+/// `track_levels` is `(track, purchased_level_count)` — what the
+/// sim's `TechState` hands over for `def.family` (0-level tracks and
+/// tracks of other families are skipped, so a caller may hand the
+/// family's whole track list). For each applicable track the composed
+/// effect freezes as one [`TrackLevels`] entry:
+///
+/// - `Multiplier` levels fold by product;
+/// - `Delta` levels fold as `(base + Σ deltas) / base` evaluated
+///   against the **authored** base ([`StatPath::base_value`] — the
+///   level plays out multiplicatively on top of scale and variant
+///   afterwards, so an additive upgrade scales with the part);
+/// - deltas compose before multipliers, a fixed order.
+///
+/// A `level` beyond the track's authored length, a `stat_path` the
+/// def cannot resolve, or a composed effect that is not finite and
+/// positive is a typed error — the validator's track rules make all
+/// three unreachable for validated data, and this gate is the
+/// defence-in-depth mirror the resolver applies everywhere else. Two
+/// tracks reaching the same `stat_path` merge multiplicatively (the
+/// validator forbids the authoring, but the fold is harmless).
+pub fn compose_upgrade_levels<'a>(
+    def: &PartDef,
+    track_levels: impl IntoIterator<Item = (&'a csp_data::UpgradeTrack, u8)>,
+) -> Result<BTreeMap<StatPath, TrackLevels>, ResolveError> {
+    let mut out: BTreeMap<StatPath, TrackLevels> = BTreeMap::new();
+    for (track, level) in track_levels {
+        if level == 0 || track.family != def.family {
+            continue;
+        }
+        let n = usize::from(level);
+        if n > track.levels.len() {
+            return Err(ResolveError::InvalidStat {
+                part_id: def.id.clone(),
+                field: "compose: track level exceeds the authored level count",
+            });
+        }
+        let Some(base) = track.stat_path.base_value(def) else {
+            return Err(ResolveError::UnresolvableStatPath {
+                part_id: def.id.clone(),
+                stat: track.stat_path,
+                source: "upgrade_track",
+            });
+        };
+        let mut mult = 1.0f64;
+        let mut delta = 0.0f64;
+        for l in &track.levels[..n] {
+            match l.multiplier_or_delta {
+                csp_data::UpgradeEffect::Multiplier(m) => mult *= m,
+                csp_data::UpgradeEffect::Delta(d) => delta += d,
+            }
+        }
+        if delta != 0.0 {
+            if !(base.is_finite() && base > 0.0) {
+                return Err(ResolveError::InvalidStat {
+                    part_id: def.id.clone(),
+                    field: "compose: delta track base is not positive and finite",
+                });
+            }
+            mult *= (base + delta) / base;
+        }
+        if !(mult.is_finite() && mult > 0.0) {
+            return Err(ResolveError::InvalidStat {
+                part_id: def.id.clone(),
+                field: "compose: composed upgrade multiplier is not positive and finite",
+            });
+        }
+        out.entry(track.stat_path)
+            .and_modify(|tl| {
+                tl.levels = tl.levels.saturating_add(level);
+                tl.multiplier *= mult;
+            })
+            .or_insert(TrackLevels {
+                levels: level,
+                multiplier: mult,
+            });
     }
+    Ok(out)
 }
 
 /// Fold variant then `upgrade_levels_at_build` multipliers into one
@@ -1082,6 +1159,7 @@ fn propellant_mass(
 /// sites, assembled into the [`WeldPart`] view. `res` supplies the
 /// tank entries' resolved `mass_per_unit_kg` (M6-D — the frozen
 /// wet-mass datum the sim's contents bookkeeping debits against).
+#[allow(clippy::too_many_lines)] // the module-dispatch arm list grew with M7-A
 fn resolve_weld_input(
     def: &PartDef,
     s: f64,
@@ -1105,6 +1183,8 @@ fn resolve_weld_input(
     let mut dock_ports = Vec::new();
     let mut tanks: Vec<crate::part::TankSpec> = Vec::new();
     let mut crew_seats = 0u32;
+    let mut experiments = Vec::new();
+    let mut lab: Option<crate::part::LabSpec> = None;
     for m in modules {
         match m {
             ModuleDef::Engine { thrust_vac_n, .. } => {
@@ -1170,6 +1250,48 @@ fn resolve_weld_input(
             ModuleDef::CrewSeat { slots } => {
                 crew_seats = crew_seats.saturating_add(u32::from(*slots));
             }
+            // M7-A: `Experiment` → the resolved instrument spec the
+            // science model's `RunExperiment` reads.
+            ModuleDef::Experiment {
+                kind,
+                data_units,
+                reusable,
+                situations,
+            } => {
+                if !(data_units.is_finite() && *data_units > 0.0) {
+                    return Err(bad("resolve: experiment data_units not positive/finite"));
+                }
+                experiments.push(crate::part::ExperimentSpec {
+                    kind: kind.clone(),
+                    data_units: *data_units,
+                    reusable: *reusable,
+                    situations: *situations,
+                });
+            }
+            // M7-A: `Lab` → the resolved converter spec. One per part —
+            // a second Lab module is ambiguous authored data (which T /
+            // multiplier would the project formula read?), refused.
+            ModuleDef::Lab {
+                throughput_data_per_s,
+                multiplier,
+                researcher_slots,
+            } => {
+                if lab.is_some() {
+                    return Err(bad("resolve: more than one Lab module on a part"));
+                }
+                if !(throughput_data_per_s.is_finite() && *throughput_data_per_s > 0.0)
+                    || !(multiplier.is_finite() && *multiplier > 0.0)
+                {
+                    return Err(bad(
+                        "resolve: lab throughput/multiplier not positive/finite",
+                    ));
+                }
+                lab = Some(crate::part::LabSpec {
+                    throughput_data_per_s: *throughput_data_per_s,
+                    multiplier: *multiplier,
+                    researcher_slots: u32::from(*researcher_slots),
+                });
+            }
             _ => {}
         }
     }
@@ -1189,6 +1311,8 @@ fn resolve_weld_input(
         dock_ports,
         tanks,
         crew_seats,
+        experiments,
+        lab,
     })
 }
 
@@ -2180,5 +2304,121 @@ mod tests {
         let p = resolve_parts(&defs, &permuted, &res, &quals, None).unwrap();
         assert_eq!(p[0], a[1]);
         assert_eq!(p[1], a[0]);
+    }
+
+    // ---------- M7-B: compose_upgrade_levels (§3.3) ----------
+
+    use csp_data::{UpgradeEffect, UpgradeLevel, UpgradeTrack};
+
+    fn track(family: &str, stat: StatPath, levels: &[(f64, UpgradeEffect)]) -> UpgradeTrack {
+        UpgradeTrack {
+            id: csp_data::UpgradeTrackId::from(format!("track.{family}")),
+            display_name: "track.name".into(),
+            family: csp_data::FamilyId::from(family),
+            stat_path: stat,
+            levels: levels
+                .iter()
+                .map(|(cost, e)| UpgradeLevel {
+                    science_cost: *cost,
+                    multiplier_or_delta: *e,
+                })
+                .collect(),
+        }
+    }
+
+    /// Multiplier levels fold by product; the level count freezes.
+    #[test]
+    fn compose_multiplier_track() {
+        let t = track(
+            "test.family.engine",
+            StatPath::IspVacS,
+            &[
+                (10.0, UpgradeEffect::Multiplier(1.03)),
+                (10.0, UpgradeEffect::Multiplier(1.03)),
+                (10.0, UpgradeEffect::Multiplier(1.03)),
+            ],
+        );
+        let m = compose_upgrade_levels(&test_def(), [(&t, 2)]).unwrap();
+        let tl = m[&StatPath::IspVacS];
+        assert_eq!(tl.levels, 2);
+        assert_eq!(tl.multiplier, 1.03 * 1.03);
+    }
+
+    /// Delta levels fold as `(base + ΣΔ)/base` on the authored stat —
+    /// test_def's authored `isp_vac_s` is 300, so +15 → ×1.05.
+    #[test]
+    fn compose_delta_track_uses_authored_base() {
+        let t = track(
+            "test.family.engine",
+            StatPath::IspVacS,
+            &[
+                (10.0, UpgradeEffect::Delta(10.0)),
+                (10.0, UpgradeEffect::Delta(5.0)),
+            ],
+        );
+        let m = compose_upgrade_levels(&test_def(), [(&t, 2)]).unwrap();
+        let tl = m[&StatPath::IspVacS];
+        assert!((tl.multiplier - 315.0 / 300.0).abs() < 1e-12);
+    }
+
+    /// Other families' tracks and zero levels are skipped; a level
+    /// beyond the authored count and an unresolvable stat fail typed.
+    #[test]
+    fn compose_skips_and_rejects() {
+        let foreign = track(
+            "other.family",
+            StatPath::MassDryKg,
+            &[(1.0, UpgradeEffect::Multiplier(2.0))],
+        );
+        let own = track(
+            "test.family.engine",
+            StatPath::MassDryKg,
+            &[(1.0, UpgradeEffect::Multiplier(1.5))],
+        );
+        let m = compose_upgrade_levels(&test_def(), [(&foreign, 1), (&own, 0)]).unwrap();
+        assert!(m.is_empty());
+
+        let m = compose_upgrade_levels(&test_def(), [(&own, 5)]);
+        assert!(matches!(m, Err(ResolveError::InvalidStat { .. })));
+
+        // A stat the def lacks fails `UnresolvableStatPath` — drop the
+        // Control module so `ControlTorqueNm` cannot resolve.
+        let bad = track(
+            "test.family.engine",
+            StatPath::ControlTorqueNm,
+            &[(1.0, UpgradeEffect::Multiplier(1.1))],
+        );
+        let mut d = test_def();
+        d.modules
+            .retain(|m| !matches!(m, ModuleDef::Control { .. }));
+        assert!(matches!(
+            compose_upgrade_levels(&d, [(&bad, 1)]),
+            Err(ResolveError::UnresolvableStatPath { .. })
+        ));
+    }
+
+    /// A frozen `BuiltPart` keeps the manufacture-time stats — the
+    /// §3.3 never-retroactive contract expressed through compose.
+    #[test]
+    fn composed_upgrades_freeze_into_built_part() {
+        let t = track(
+            "test.family.engine",
+            StatPath::ThrustVacN,
+            &[(10.0, UpgradeEffect::Multiplier(1.1))],
+        );
+        let mut b = built("stock");
+        b.upgrade_levels_at_build = compose_upgrade_levels(&test_def(), [(&t, 1)]).unwrap();
+        let eff = resolve_part(
+            &test_def(),
+            &b,
+            &resources(),
+            &FamilyQualification::FRESH,
+            None,
+        )
+        .unwrap();
+        let ModuleDef::Engine { thrust_vac_n, .. } = &eff.modules[0] else {
+            panic!()
+        };
+        assert!(close(*thrust_vac_n, 55_000.0));
     }
 }

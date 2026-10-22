@@ -1,0 +1,29 @@
+// The home system's surface sites (PLAN §3.5) — program geography:
+// launch pads and recovery locations. `launch: true` marks the body's
+// launch site (recovery_efficiency 1.0); every other site recovers at
+// balance.ron's recovery_efficiency (0.9).
+(
+    schema_version: 1,
+    sites: [
+        (
+            schema_version: 1,
+            id: "terrin-launch",
+            display_name: "site.terrin-launch",
+            body: "terrin",
+            latitude_rad: 0.0,
+            longitude_rad: 0.0,
+            altitude_m: 0.0,
+            launch: true,
+        ),
+        (
+            schema_version: 1,
+            id: "terrin-downrange",
+            display_name: "site.terrin-downrange",
+            body: "terrin",
+            latitude_rad: 0.0,
+            longitude_rad: 0.7853981633974483,
+            altitude_m: 0.0,
+            launch: false,
+        ),
+    ],
+)

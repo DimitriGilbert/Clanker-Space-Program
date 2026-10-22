@@ -533,6 +533,10 @@ fn canonicalize(bytes: &[u8]) -> Vec<u8> {
 pub fn record(recipe: &ScenarioRecipe, fixture_dir: &Path) -> Result<RecordedGolden, ReplayError> {
     let data_fixture_hash = fixture_hash(fixture_dir)?;
     let mut world = (recipe.initial)(fixture_dir)?;
+    // The seed selects the contract generator's draws — stamp it
+    // before the baseline snapshot so the artifact's initial state
+    // carries it.
+    world.set_save_seed(recipe.save_seed);
     let initial_snapshot = world.snapshot()?;
     let config = world.config();
     (recipe.drive)(&mut world)?;
@@ -614,6 +618,21 @@ pub fn replay(artifact: &Replay) -> Result<[u8; 32], ReplayError> {
         artifact.config.physics.clone(),
         artifact.initial_snapshot.clone(),
     )?;
+    // §7.3 data-derived config like the orbit model — the artifact's
+    // recorded `experiments` table is what the science commands
+    // validated against at record time.
+    world.set_experiments(artifact.config.experiments.clone());
+    // M7-B: the merged tech tree rides the same channel — a recorded
+    // `tech_tree` is what the run's research commands validated
+    // against; `None` means the record ran tree-less.
+    if let Some(tree) = &artifact.config.tech_tree {
+        world.set_tech_tree(tree.clone());
+    }
+    // M7-C: the site table rides the same channel — a recorded run's
+    // `RecoverVessel` resolves its site against it; without it the
+    // command rejects and the log diverges.
+    world.set_sites(artifact.config.sites.clone());
+    world.set_contracts(artifact.config.contracts.clone());
     let log = &artifact.command_log;
     let mut i = 0;
     while i < log.len() {

@@ -357,6 +357,8 @@ mod tests {
 
     fn part(m: f64, half: f64) -> WeldPart {
         WeldPart {
+            experiments: Vec::new(),
+            lab: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,

@@ -1,0 +1,25 @@
+// §3.6 rescue — bring home whatever is sitting on the ground at the
+// drawn body (tech.rocketry.3 unlocks it). v1 has no stranded-vessel
+// spawner, so the honest reading is the recovery transition: a
+// vessel surface-latched at the body is `RecoverVessel`'d.
+(
+    schema_version: 1,
+    id: "contract.rescue",
+    display_name: "contract.rescue.name",
+    description: "contract.rescue.desc",
+    kind: Rescue,
+    generate: (
+        weight: 1.0,
+        space: Rescue(bodies: ["terrin", "rask"]),
+    ),
+    prerequisites: [
+        TechResearched("tech.rocketry.3"),
+        ContractsCompleted(kind: SatellitePlacement, count: 1),
+    ],
+    rewards: (
+        advance_funds: 6_000.0,
+        completion_funds: 45_000.0,
+        failure_penalty_funds: 8_000.0,
+    ),
+    deadline_days: Some(120.0),
+)

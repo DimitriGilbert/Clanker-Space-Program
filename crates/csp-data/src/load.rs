@@ -20,9 +20,14 @@ use std::path::{Path, PathBuf};
 
 use crate::balance::{BALANCE_SCHEMA_VERSION, BalanceDef};
 use crate::biome::BiomeLegend;
+use crate::contract::{CONTRACT_SCHEMA_VERSION, ContractTemplate};
+use crate::experiment::{EXPERIMENT_SCHEMA_VERSION, ExperimentDef};
+use crate::ids::ExperimentId;
 use crate::part::{PART_SCHEMA_VERSION, PartDef};
 use crate::resource::{RESOURCE_SCHEMA_VERSION, ResourceFile};
+use crate::site::{SITE_SCHEMA_VERSION, SiteFile};
 use crate::system::{BodyDef, SCHEMA_VERSION, SystemDef};
+use crate::techtree::{TECHTREE_SCHEMA_VERSION, TechTree, TechTreeDef};
 
 /// A biome map as loaded: legend (parsed) plus the PNG's raw bytes.
 /// The bytes stay raw — pixel indices are part of the hashed data set
@@ -216,6 +221,202 @@ pub fn load_resources(path: &Path) -> Result<ResourceFile, LoadError> {
     let resources: ResourceFile = read_ron(path)?;
     check_version(path, resources.schema_version, RESOURCE_SCHEMA_VERSION)?;
     Ok(resources)
+}
+
+/// Load `data/systems/<sys>/sites.ron` — the §3.5 surface-site
+/// registry. A MISSING file reads as an empty set (the
+/// `load_experiments` convention): sites are optional until a
+/// `RecoverVessel` command needs one. File-shape checks only; the
+/// body/geometry rules live in [`crate::validate::validate_sites`].
+pub fn load_sites(path: &Path) -> Result<SiteFile, LoadError> {
+    if !path.exists() {
+        return Ok(SiteFile {
+            schema_version: SITE_SCHEMA_VERSION,
+            sites: Vec::new(),
+        });
+    }
+    let sites: SiteFile = read_ron(path)?;
+    check_version(path, sites.schema_version, SITE_SCHEMA_VERSION)?;
+    Ok(sites)
+}
+
+/// One loaded experiment def plus its source path (the `id` ↔ stem
+/// check needs the file name, like [`LoadedPart`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoadedExperiment {
+    /// Parsed def.
+    pub def: ExperimentDef,
+    /// Path relative to the `data/experiments/` root the loader was
+    /// handed — diagnostics only.
+    pub path: PathBuf,
+}
+
+/// Everything `load_experiments` read under a `data/experiments/`
+/// directory, ascending relative-path order — the deterministic order
+/// `data_set_hash` hashes them in.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoadedExperiments {
+    /// Parsed experiment defs with their source paths.
+    pub experiments: Vec<LoadedExperiment>,
+}
+
+impl LoadedExperiments {
+    /// The defs keyed by [`ExperimentId`] — the lookup the sim and
+    /// validator actually consume. First def wins on a duplicate id;
+    /// the validator flags the duplicate loudly.
+    pub fn by_id(&self) -> std::collections::BTreeMap<ExperimentId, &ExperimentDef> {
+        let mut out = std::collections::BTreeMap::new();
+        for e in &self.experiments {
+            out.entry(e.def.id.clone()).or_insert(&e.def);
+        }
+        out
+    }
+}
+
+/// Load every experiment def under `data/experiments/` — `<id>.ron`
+/// files, optionally grouped in subdirectories. File-shape checks only;
+/// `transmit_ratio` band and cap sanity live in
+/// [`crate::validate::validate_experiments`]. A missing directory reads
+/// as an empty set — experiment defs are optional until a part's
+/// `Experiment` module or a science command needs them.
+pub fn load_experiments(dir: &Path) -> Result<LoadedExperiments, LoadError> {
+    if !dir.exists() {
+        return Ok(LoadedExperiments {
+            experiments: Vec::new(),
+        });
+    }
+    let mut files = Vec::new();
+    collect_ron_files(dir, &mut files)?;
+    let mut experiments = Vec::with_capacity(files.len());
+    for path in files {
+        let def: ExperimentDef = read_ron(&path)?;
+        check_version(&path, def.schema_version, EXPERIMENT_SCHEMA_VERSION)?;
+        let rel = path.strip_prefix(dir).unwrap_or(&path).to_path_buf();
+        experiments.push(LoadedExperiment { def, path: rel });
+    }
+    Ok(LoadedExperiments { experiments })
+}
+
+/// One loaded contract template plus its source path — the `id` ↔
+/// stem check needs the file name, like [`LoadedExperiment`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoadedContract {
+    /// Parsed def.
+    pub def: ContractTemplate,
+    /// Path relative to the `data/contracts/` root the loader was
+    /// handed — diagnostics only.
+    pub path: PathBuf,
+}
+
+/// Everything `load_contracts` read under a `data/contracts/`
+/// directory, ascending relative-path order — the deterministic order
+/// `data_set_hash` hashes them in.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoadedContracts {
+    /// Parsed contract templates with their source paths.
+    pub contracts: Vec<LoadedContract>,
+}
+
+impl LoadedContracts {
+    /// The defs keyed by [`crate::ids::ContractTypeId`] — the lookup
+    /// the sim installs. First def wins on a duplicate id; the
+    /// validator flags the duplicate loudly.
+    pub fn by_id(
+        &self,
+    ) -> std::collections::BTreeMap<crate::ids::ContractTypeId, &ContractTemplate> {
+        let mut out = std::collections::BTreeMap::new();
+        for c in &self.contracts {
+            out.entry(c.def.id.clone()).or_insert(&c.def);
+        }
+        out
+    }
+}
+
+/// Load every contract template under `data/contracts/` — `<id>.ron`
+/// files, optionally grouped in subdirectories. File-shape checks
+/// only; §3.6's structural rules (weights, rewards, prereq refs,
+/// param-space sanity) live in [`crate::validate::validate_contracts`].
+/// A missing directory reads as an empty set, matching
+/// `load_experiments` — a world without templates simply never
+/// generates offers.
+pub fn load_contracts(dir: &Path) -> Result<LoadedContracts, LoadError> {
+    if !dir.exists() {
+        return Ok(LoadedContracts {
+            contracts: Vec::new(),
+        });
+    }
+    let mut files = Vec::new();
+    collect_ron_files(dir, &mut files)?;
+    let mut contracts = Vec::with_capacity(files.len());
+    for path in files {
+        let def: ContractTemplate = read_ron(&path)?;
+        check_version(&path, def.schema_version, CONTRACT_SCHEMA_VERSION)?;
+        let rel = path.strip_prefix(dir).unwrap_or(&path).to_path_buf();
+        contracts.push(LoadedContract { def, path: rel });
+    }
+    Ok(LoadedContracts { contracts })
+}
+
+/// One loaded tech-tree fragment plus its source path — diagnostics
+/// only, like [`LoadedExperiment`]: the merged tree is id-keyed, and
+/// the validator reports errors with the file they came from.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoadedTechFile {
+    /// Parsed fragment.
+    pub def: TechTreeDef,
+    /// Path relative to the `data/techtree/` root the loader was
+    /// handed.
+    pub path: PathBuf,
+}
+
+/// Everything `load_techtree` read under `data/techtree/`, ascending
+/// relative-path order — the deterministic order `data_set_hash`
+/// hashes them in, which is also the order [`Self::merged`]
+/// concatenates nodes/tracks for the lookup view.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoadedTechTree {
+    /// Parsed fragments with their source paths.
+    pub trees: Vec<LoadedTechFile>,
+}
+
+impl LoadedTechTree {
+    /// The flattened lookup view the sim installs — every fragment's
+    /// `nodes`/`tracks` concatenated in ascending-path file order.
+    /// Identity rules (duplicate ids, cycles, reachability) are the
+    /// validator's; `merged` is pure concatenation so an invalid set
+    /// still produces a deterministic view for the error list to
+    /// describe.
+    pub fn merged(&self) -> TechTree {
+        let mut tree = TechTree::default();
+        for f in &self.trees {
+            tree.nodes.extend(f.def.nodes.iter().cloned());
+            tree.tracks.extend(f.def.tracks.iter().cloned());
+        }
+        tree
+    }
+}
+
+/// Load every tech-tree fragment under `data/techtree/` — `<name>.ron`
+/// files, optionally grouped in subdirectories (organization only).
+/// File-shape checks only: RON parses, `schema_version` current;
+/// §3.3's structural rules (cycles, reachability, track sanity) are
+/// [`crate::validate::validate_techtree`]. A missing directory reads
+/// as an empty set, matching `load_experiments` — a world without a
+/// tree simply rejects research commands.
+pub fn load_techtree(dir: &Path) -> Result<LoadedTechTree, LoadError> {
+    if !dir.exists() {
+        return Ok(LoadedTechTree { trees: Vec::new() });
+    }
+    let mut files = Vec::new();
+    collect_ron_files(dir, &mut files)?;
+    let mut trees = Vec::with_capacity(files.len());
+    for path in files {
+        let def: TechTreeDef = read_ron(&path)?;
+        check_version(&path, def.schema_version, TECHTREE_SCHEMA_VERSION)?;
+        let rel = path.strip_prefix(dir).unwrap_or(&path).to_path_buf();
+        trees.push(LoadedTechFile { def, path: rel });
+    }
+    Ok(LoadedTechTree { trees })
 }
 
 /// Collect every `*.ron` under `dir` recursively, in ascending

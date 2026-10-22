@@ -47,7 +47,9 @@
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 
 use csp_core::{DQuat, DVec3, SimError, SimTime, StableDiscriminant, StateHasher};
-use csp_data::{BodyId, KeplerElements, ResourceId};
+use csp_data::{
+    BiomeId, BodyId, ContractTypeId, ExperimentId, KeplerElements, ResourceId, Situation,
+};
 use csp_phys::{PhysicsBackend, SimpleBackend, WeldedBody};
 use serde::{Deserialize, Serialize};
 
@@ -90,7 +92,39 @@ pub mod joints;
 /// (including the §2.4 quantized-mass retally). See the module doc.
 pub mod transfers;
 
+/// M7-A §3.2 — the science model: the per-vessel keyed data
+/// inventory, the diminishing-repeat soft cap, transmission vs
+/// recovery, and the lab's event-driven two-regime closed form (the
+/// `Research` slot of the §2.6.5 subsystem order). See the module doc.
+pub mod research;
+
+/// M7-B §3.3/§3.4 — the tech tree's world-side half: the researched
+/// node set, purchased upgrade-track levels, family qualification
+/// records, the two research commands, and the manufacture-time
+/// `BuiltPart` freeze the M3 resolver consumes. See the module doc.
+pub mod tech;
+
+/// M7-C §3.5 — the economy core: integer-micro funds + the bounded
+/// ledger, the crew roster and its `SalaryDue` recurring drain, the
+/// recovery-site inventory arena (`RecoverVessel`), the `Insolvent`
+/// bankruptcy path, and the `ContractReward` stub interface. See the
+/// module doc.
+pub mod economy;
+
+/// M7-D §3.6 — the contract system: the deterministic `{CONTRACTS,
+/// 0, offer_index}` offer generator, the fact-based prerequisites,
+/// the event-driven completion evaluation, the `ContractDeadline`
+/// failure path, and the §7.2 fact record. See the module doc.
+pub mod contracts;
+
 pub use bubble::{CraftDef, PhysicsConfig, SurfacePose, VesselState, VesselThermal};
+pub use contracts::{
+    ActiveContract, ContractConfig, ContractFacts, ContractId, ContractOffer, ContractState,
+};
+pub use economy::{
+    ColonyId, CrewKind, CrewLocation, CrewMember, CrewStatus, EconomyConfig, EconomyState,
+    FundsReason, LedgerEntry, SiteState,
+};
 pub use events::{EventClass, EventKind, SUBSYSTEM_ORDER, ScheduledEvent, Subsystem};
 pub use joints::{
     DEFAULT_CAPTURE_RANGE_M, DEFAULT_CAPTURE_WINDOW_TICKS, DEFAULT_LATCH_REL_SPEED_MPS,
@@ -98,6 +132,11 @@ pub use joints::{
 };
 pub use maneuver::{ActiveBurn, ManeuverNode, ManeuverStatus};
 use orbit::{OrbitModel, OrbitState, PatchedConics};
+pub use research::{
+    DataKey, ResearchId, ResearchProject, ResearcherAssign, ScienceConfig, ScienceKeyState,
+    ScienceState, VesselScience,
+};
+pub use tech::TechState;
 pub use transfers::{
     ActiveTransfer, CrewId, DEFAULT_CREW_TRANSFER_TICKS, DEFAULT_TRANSFER_RADIUS_M,
     DEFAULT_TRANSFER_RATE_PER_S, TransferCargo, TransferConfig, TransferId, VesselCrew,
@@ -225,6 +264,14 @@ pub struct Vessel {
     /// `SimCommand::BoardCrew`, moved by `SimCommand::TransferCrew`.
     /// **Hashed and serialized** sim state.
     pub crew: Vec<VesselCrew>,
+    /// M7-A's §3.2 science records — the keyed data inventory plus the
+    /// non-reusable `spent` markers, both bound to producing nodes so
+    /// they partition/merge with the part graph exactly like
+    /// `tank_contents` (§2.4). Populated by `SimCommand::RunExperiment`,
+    /// drained by `TransmitData`/`RecoverData`/`StartResearch`.
+    /// **Hashed and serialized** sim state. Empty for craft-less
+    /// vessels.
+    pub science: VesselScience,
 }
 
 impl Vessel {
@@ -581,6 +628,131 @@ pub enum SimCommand {
         /// The vessel the member boards.
         vessel: VesselId,
     },
+    /// M7-A's §3.2 collection — run an `Experiment` module at `node`,
+    /// yielding a `DataRecord` keyed `(experiment, body, biome,
+    /// situation)` into the vessel's data pool (soft-capped against the
+    /// program's cumulative ledger). The caller supplies `(biome,
+    /// situation)` — the sim validates residence class and the module's
+    /// `SituationMask`; the biome-map/situation-boundary math is
+    /// presentation-side (see the `research` module doc).
+    RunExperiment {
+        /// The vessel running the instrument.
+        vessel: VesselId,
+        /// The graph node carrying the `Experiment` module.
+        node: csp_phys::PartNodeId,
+        /// Which module — the `data/experiments/` kind.
+        experiment: ExperimentId,
+        /// The caller-derived biome context.
+        biome: BiomeId,
+        /// The caller-derived situation.
+        situation: Situation,
+    },
+    /// M7-A's §3.2 transmission — bank `units·transmit_ratio` science,
+    /// drain `ElectricCharge`, and flag the key transmitted. The pooled
+    /// units leave the vessel (sent home).
+    TransmitData {
+        /// The vessel uplinking.
+        vessel: VesselId,
+        /// The science key to transmit.
+        key: DataKey,
+    },
+    /// M7-A's §3.2 recovery — bank 100% (or the `1 − ratio` remainder
+    /// of a previously transmitted key) and close the key. Requires a
+    /// `SurfaceLatched` residence.
+    RecoverData {
+        /// The vessel being recovered.
+        vessel: VesselId,
+        /// The science key being recovered.
+        key: DataKey,
+    },
+    /// M7-A's §3.2 lab assignment — a `Lab` module begins converting
+    /// the pooled data at `key` (the closed form + exhaustion events;
+    /// see `research`). The whole pool at `key` is escrowed into the
+    /// project at apply.
+    StartResearch {
+        /// The vessel carrying the lab.
+        vessel: VesselId,
+        /// The lab part's graph node.
+        lab_node: csp_phys::PartNodeId,
+        /// The record to convert.
+        key: DataKey,
+        /// The staffed researchers — §3.5 `skill ∈ 0..=5` at
+        /// assignment; the crew-arena-owned form lands later.
+        researchers: Vec<ResearcherAssign>,
+    },
+    /// M7-A's lab stop — bank accrued science and return the
+    /// unconverted remainder to the vessel's pool under the lab node.
+    StopResearch {
+        /// The project to stop.
+        project: ResearchId,
+    },
+    /// M7-B's §3.3 node purchase — spend `science.banked` for the
+    /// node's `science_cost` and mark it researched; every
+    /// `requires` prerequisite must already be researched.
+    /// `Recoverable` rejections: no tree installed, unknown or
+    /// already-researched node, unmet prerequisites, or insufficient
+    /// banked science.
+    ResearchTech {
+        /// The `data/techtree/` node to research.
+        node: csp_data::TechNodeId,
+    },
+    /// M7-B's §3.3 level purchase — buy the next level of `track`,
+    /// spending that level's authored `science_cost`. The level must
+    /// sit under the cap the researched nodes grant (the
+    /// `unlocks.track_levels` mechanism — see `tech`).
+    ResearchUpgradeLevel {
+        /// The `data/techtree/` upgrade track to advance.
+        track: csp_data::UpgradeTrackId,
+    },
+    /// M7-C §3.5's flight recovery — recover a `SurfaceLatched`
+    /// vessel: its resource contents credit to the named site's
+    /// inventory at the site's efficiency (1.0 launch,
+    /// `recovery_efficiency` otherwise; `site: None` is the
+    /// `abandon_recovery` remote salvage with no inventory credit),
+    /// the live graph's resolved `part_costs` pay out at the same
+    /// share to funds, roster crew come home `Unassigned`, pooled
+    /// science banks at the recover fraction — and the vessel leaves
+    /// the sim. `Recoverable` rejections: unknown vessel/site, no
+    /// craft, not latched, or a site on a different body.
+    RecoverVessel {
+        /// The latched vessel to recover.
+        vessel: VesselId,
+        /// The recovery site — `None` = remote abandon salvage.
+        site: Option<csp_data::SiteId>,
+    },
+    /// M7-C §3.5's hire — charge `crew_hire_cost_funds` and add a
+    /// `CrewMember` to the roster `Unassigned`, drawing
+    /// `salary_per_s` per `SalaryDue` firing. An action: unaffordable
+    /// or non-finite salary rejects `Recoverable`, never clamps.
+    HireCrew {
+        /// The member's display name (logged like a `SetAlarm` label).
+        name: String,
+        /// The member's kind.
+        kind: CrewKind,
+        /// Payroll rate, funds/sim-second.
+        salary_per_s: f64,
+    },
+    /// M7-D's contract stub interface (M7-C): apply a signed micro
+    /// amount to funds under the `ContractReward` ledger reason —
+    /// positive credits (advance/completion), negative debits
+    /// (penalty — the clamp path, never a rejection). The command
+    /// exists now so the §8.3 economy harness and the ledger
+    /// exercise the funds path contracts will drive.
+    ContractReward {
+        /// Signed micro-funds — credit when ≥ 0, debit when < 0.
+        micros: i64,
+    },
+    /// M7-D §3.6's accept — take an offer off the board: the
+    /// template's prerequisites are re-checked (facts may have
+    /// moved since generation), the advance credits to funds, the
+    /// contract enters the arena, and its `ContractDeadline`
+    /// (when authored) schedules. `Recoverable` rejections:
+    /// unknown offer, template not installed, unmet prereqs.
+    AcceptContract {
+        /// The offer's index — its `offer_index` (the KDF
+        /// counter doubles as the offer id).
+        offer: u64,
+    },
 }
 
 /// What `step_frame` did (§2.6.2): where the clock landed, what the
@@ -707,6 +879,46 @@ pub struct WorldSnapshot {
     /// §7.2 next-ID counter for the crew arena (monotonic, never
     /// reused) — [`SimCommand::BoardCrew`] allocates from it.
     pub next_crew_id: u64,
+    /// M7-A's §3.2 tunables — construction config, serialized so a
+    /// restored world enforces the same yield curve / exhaustion
+    /// epsilon / transmit economics (the `transfer_cfg` precedent).
+    pub science_cfg: ScienceConfig,
+    /// M7-A's §3.2 book — banked science, the per-key ledger, and the
+    /// project arena. **Serialized** (§7.4 does not refuse it): each
+    /// project pairs with its exhaustion event pair at
+    /// `exhaust_tick` — the restore coherence check enforces that
+    /// direction; orphan research events are tolerated like
+    /// `TransferComplete` orphans (they fire as no-ops).
+    pub science: ScienceState,
+    /// M7-B's §3.3/§3.4 progression record — §7.2 "tech state" and
+    /// "`FamilyQualification` per family": the researched node set,
+    /// purchased upgrade-track levels, and family qualification
+    /// records. **Serialized and hashed** — a lost researched node or
+    /// level silently re-locks parts and unspends science.
+    pub tech: TechState,
+    /// M7-C's §3.5 economy book — funds (micro-units), the insolvency
+    /// flag, the crew roster, and the site inventory arena.
+    /// **Serialized and hashed** (the ledger inside is serialized but
+    /// never hashed — recorded history, the `command_log` precedent).
+    pub economy: EconomyState,
+    /// M7-C's §3.5 economy tunables — construction config, serialized
+    /// so a restored world enforces the same cadence/costs/shares
+    /// (the `science_cfg` precedent).
+    pub economy_cfg: EconomyConfig,
+    /// §2.7's save seed — the KDF input the contract generator
+    /// draws under. Serialized and hashed: the seed selects the
+    /// offer params (M7-D).
+    pub save_seed: u64,
+    /// M7-D's §3.6 contract book — the offer board, the
+    /// `offer_index` counter (§7.2's named monotonic index), the
+    /// active arena, and the completed-contract fact record.
+    /// **Serialized and hashed** — a lost fact silently re-locks
+    /// gated offers.
+    pub contracts: ContractState,
+    /// §3.6's contract tunables — construction config, serialized
+    /// so a restored world enforces the same board size (the
+    /// `economy_cfg` precedent).
+    pub contract_cfg: ContractConfig,
 }
 
 /// The world's construction config — data-derived (§7.3): the orbit
@@ -721,6 +933,23 @@ pub struct WorldConfig {
     /// The bubble's environment + dominant body, if physics was
     /// configured.
     pub physics: Option<PhysicsConfig>,
+    /// The `data/experiments/` defs the world was built with (M7-A) —
+    /// data-derived construction config like `orbits`; the artifact
+    /// carries it so a replay that runs science commands replays the
+    /// same validations.
+    pub experiments: BTreeMap<ExperimentId, csp_data::ExperimentDef>,
+    /// The merged `data/techtree/` view the world was built with
+    /// (M7-B) — the same data-derived construction config channel;
+    /// `None` for a world without a tree (research commands reject).
+    pub tech_tree: Option<csp_data::TechTree>,
+    /// The `sites.ron` def table the world was built with (M7-C) —
+    /// the same data-derived construction config channel; `RecoverVessel`
+    /// resolves site ids against it.
+    pub sites: BTreeMap<csp_data::SiteId, csp_data::SiteDef>,
+    /// The `data/contracts/` template table the world was built
+    /// with (M7-D) — the same data-derived construction config
+    /// channel; `AcceptContract` re-checks prereqs against it.
+    pub contracts: BTreeMap<csp_data::ContractTypeId, csp_data::ContractTemplate>,
 }
 
 /// §2.9's object caps — construction config (from `balance.ron`),
@@ -795,6 +1024,21 @@ struct TickShadow {
     next_transfer_id: Option<u64>,
     /// See `next_transfer_id`.
     next_crew_id: Option<u64>,
+    /// `science` — captured before the first science-book write
+    /// (M7-A: collection/transfer applies, project lifecycle, event
+    /// landings; the vessel-side pool rides `vessels`).
+    science: Option<ScienceState>,
+    /// `tech` — captured before the first tech-book write (M7-B:
+    /// `ResearchTech`/`ResearchUpgradeLevel` applies; the science
+    /// debit rides `science`).
+    tech: Option<TechState>,
+    /// `economy` — captured before the first economy-book write
+    /// (M7-C: every charge/credit, hire, recovery, roster or
+    /// inventory write; the bounded ledger rides inside it).
+    economy: Option<EconomyState>,
+    /// `contracts` — captured before the first contract-book write
+    /// (M7-D: offers, active arena, fact record, counters).
+    contracts: Option<ContractState>,
 }
 
 impl TickShadow {
@@ -817,6 +1061,10 @@ impl TickShadow {
             transfers: None,
             next_transfer_id: None,
             next_crew_id: None,
+            science: None,
+            tech: None,
+            economy: None,
+            contracts: None,
         }
     }
 
@@ -871,6 +1119,18 @@ impl TickShadow {
         }
         if let Some(v) = self.next_crew_id {
             world.next_crew_id = v;
+        }
+        if let Some(v) = self.science {
+            world.science = v;
+        }
+        if let Some(v) = self.tech {
+            world.tech = v;
+        }
+        if let Some(v) = self.economy {
+            world.economy = v;
+        }
+        if let Some(v) = self.contracts {
+            world.contracts = v;
         }
     }
 }
@@ -978,6 +1238,60 @@ pub struct World {
     /// §2.2 next-ID counter for crew allocation — `BoardCrew` draws
     /// from it; monotonic, never reused, serialized and hashed.
     next_crew_id: u64,
+    /// M7-A's §3.2 book — the banked science total, the per-key
+    /// diminishing/closed ledger, and the research-project arena
+    /// (§7.2's list: serialized AND hashed — a lost project loses its
+    /// exhaustion event's meaning; a lost ledger silently re-mints
+    /// soft-capped yield).
+    science: ScienceState,
+    /// §3.2's lab/soft-cap tunables — construction config, hashed and
+    /// serialized like `transfer_cfg` (they change state evolution:
+    /// the yield curve, the exhaustion tick, the transmit economics).
+    science_cfg: ScienceConfig,
+    /// M7-B's §3.3/§3.4 progression record — the researched node set,
+    /// purchased upgrade-track levels, and §3.4 family qualification
+    /// records. **Hashed and serialized** (§7.2 "tech state"): a lost
+    /// entry silently re-locks parts and unspends science.
+    tech: TechState,
+    /// The merged `data/techtree/` view — construction config like
+    /// `experiments` (data-derived, §7.3): handed in via
+    /// [`Self::set_tech_tree`]/`WorldConfig`, never serialized or
+    /// hashed — a def change is a data-hash change, not a state edit.
+    tech_tree: Option<csp_data::TechTree>,
+    /// The `data/experiments/` defs — construction config like
+    /// `orbits` (data-derived, §7.3): handed in via
+    /// `set_experiments`/`WorldConfig`, never serialized or hashed —
+    /// a def change is a data-hash change, not a state edit.
+    experiments: BTreeMap<ExperimentId, csp_data::ExperimentDef>,
+    /// M7-C's §3.5 economy book — funds (micro-units), the insolvency
+    /// flag, the crew roster, the site inventory arena, and the
+    /// bounded ledger. **Hashed and serialized** (the ledger is
+    /// serialized but stays out of the hash — recorded history).
+    economy: EconomyState,
+    /// §3.5's economy tunables — construction config, hashed and
+    /// serialized like `science_cfg` (they change state evolution:
+    /// the salary cadence, the charge amounts, the recovery shares).
+    economy_cfg: EconomyConfig,
+    /// The `sites.ron` def table — construction config like
+    /// `experiments` (data-derived, §7.3): handed in via
+    /// `set_sites`/`WorldConfig`, never serialized or hashed.
+    site_defs: BTreeMap<csp_data::SiteId, csp_data::SiteDef>,
+    /// §2.7's save seed — the KDF input the contract generator
+    /// draws under (M7-D). Serialized and hashed: it selects the
+    /// offer draws.
+    save_seed: u64,
+    /// M7-D's §3.6 contract book — offers, the `offer_index`
+    /// counter, the active arena, and the fact record.
+    /// **Hashed and serialized** (§7.2).
+    contracts: ContractState,
+    /// §3.6's contract tunables — construction config, hashed and
+    /// serialized like `economy_cfg` (the board size changes what
+    /// generates).
+    contract_cfg: ContractConfig,
+    /// The `data/contracts/` template table — construction config
+    /// like `experiments` (data-derived, §7.3): handed in via
+    /// `set_contracts`/`WorldConfig`, never serialized or hashed.
+    contract_defs: BTreeMap<ContractTypeId, csp_data::ContractTemplate>,
     /// The §2.4/§2.9 bubble: backend + dominant body — construction
     /// config (data-derived, §7.3), `None` for worlds built without
     /// physics. `SimpleBackend`'s contact record is scratch — derived
@@ -1066,6 +1380,21 @@ impl World {
             transfers: BTreeMap::new(),
             next_transfer_id: 0,
             next_crew_id: 0,
+            science: ScienceState::default(),
+            science_cfg: research::default_config(),
+            experiments: BTreeMap::new(),
+            tech: TechState::default(),
+            tech_tree: None,
+            economy: EconomyState {
+                funds_micros: economy::default_config().starting_funds_micros,
+                ..EconomyState::default()
+            },
+            economy_cfg: economy::default_config(),
+            site_defs: BTreeMap::new(),
+            save_seed: 0,
+            contracts: ContractState::default(),
+            contract_cfg: contracts::default_config(),
+            contract_defs: BTreeMap::new(),
             physics: None,
         }
     }
@@ -1130,6 +1459,10 @@ impl World {
                 environment: p.backend.environment().clone(),
                 dominant: p.dominant.clone(),
             }),
+            experiments: self.experiments.clone(),
+            tech_tree: self.tech_tree.clone(),
+            sites: self.site_defs.clone(),
+            contracts: self.contract_defs.clone(),
         }
     }
 
@@ -1234,6 +1567,15 @@ impl World {
         if !snapshot.transfer_cfg.is_valid() {
             return Err(SimError::Fatal("snapshot: invalid transfer config"));
         }
+        if !snapshot.science_cfg.is_valid() {
+            return Err(SimError::Fatal("snapshot: invalid science config"));
+        }
+        if !snapshot.economy_cfg.is_valid() {
+            return Err(SimError::Fatal("snapshot: invalid economy config"));
+        }
+        if !snapshot.contract_cfg.is_valid() {
+            return Err(SimError::Fatal("snapshot: invalid contract config"));
+        }
         if snapshot.next_vessel_id < snapshot.vessels.keys().next_back().map_or(0, |id| id.0 + 1) {
             return Err(SimError::Fatal(
                 "snapshot: next_vessel_id not ahead of live ids",
@@ -1260,6 +1602,16 @@ impl World {
         // Transfers a pending `TransferComplete` names, with the event's
         // tick — the M6-D counterpart pairing, checked below.
         let mut transfer_events = BTreeMap::new();
+        // Research projects a pending `ResearchDataExhausted` names —
+        // the M7-A pair check (`exhausted` + `complete` at
+        // `project.exhaust_tick`), one direction only: orphan research
+        // events fire as no-ops (the `TransferComplete` precedent).
+        let mut research_exhausted = BTreeMap::new();
+        let mut research_complete = BTreeMap::new();
+        let mut salary_due_count = 0u32;
+        // M7-D: pending `ContractDeadline`s → (contract, tick) for
+        // the strict event↔contract pairing check below.
+        let mut deadline_events = BTreeMap::new();
         for e in &snapshot.event_heap {
             if e.tick < snapshot.clock_ticks {
                 return Err(SimError::Fatal("snapshot: event behind the clock"));
@@ -1282,8 +1634,22 @@ impl World {
                 | EventKind::ManeuverNodeStart { vessel } => Some(*vessel),
                 EventKind::PlayerAlarm { .. }
                 | EventKind::TransferWindow { .. }
-                | EventKind::TransferComplete { .. } => None,
+                | EventKind::TransferComplete { .. }
+                | EventKind::ResearchDataExhausted { .. }
+                | EventKind::ResearchProjectComplete { .. }
+                | EventKind::SalaryDue
+                | EventKind::Insolvent { .. }
+                | EventKind::ContractDeadline { .. } => None,
             };
+            // M7-C: at most one pending `SalaryDue`, sitting on the
+            // absolute period grid — a crafted duplicate would
+            // double-charge the roster.
+            if matches!(e.kind, EventKind::SalaryDue) {
+                salary_due_count += 1;
+                if e.tick % snapshot.economy_cfg.salary_period_ticks != 0 {
+                    return Err(SimError::Fatal("snapshot: salary event off the grid"));
+                }
+            }
             if let Some(v) = vessel
                 && !snapshot.vessels.contains_key(&v)
             {
@@ -1299,6 +1665,27 @@ impl World {
             {
                 return Err(SimError::Fatal(
                     "snapshot: duplicate transfer complete event",
+                ));
+            }
+            if let EventKind::ResearchDataExhausted { project: p } = &e.kind
+                && research_exhausted.insert(*p, e.tick).is_some()
+            {
+                return Err(SimError::Fatal(
+                    "snapshot: duplicate research-exhausted event",
+                ));
+            }
+            if let EventKind::ResearchProjectComplete { project: p } = &e.kind
+                && research_complete.insert(*p, e.tick).is_some()
+            {
+                return Err(SimError::Fatal(
+                    "snapshot: duplicate research-complete event",
+                ));
+            }
+            if let EventKind::ContractDeadline { contract: c } = &e.kind
+                && deadline_events.insert(*c, e.tick).is_some()
+            {
+                return Err(SimError::Fatal(
+                    "snapshot: duplicate contract deadline event",
                 ));
             }
         }
@@ -1325,7 +1712,24 @@ impl World {
                 }
             }
         }
+        if salary_due_count > 1 {
+            return Err(SimError::Fatal("snapshot: duplicate salary events"));
+        }
         restore_transfer_state(&snapshot, &transfer_events)?;
+        restore_science_state(&snapshot, &research_exhausted, &research_complete)?;
+        restore_economy_state(&snapshot)?;
+        restore_contract_state(&snapshot, &deadline_events)?;
+        // M7-B: the tech record's self-consistency is all restore can
+        // check — node/track refs resolve against the *tree*, which is
+        // construction config re-installed post-restore (the
+        // `set_experiments` precedent), not snapshot state.
+        for q in snapshot.tech.qualifications.values() {
+            if !q.is_valid() {
+                return Err(SimError::Fatal(
+                    "snapshot: non-finite family qualification record",
+                ));
+            }
+        }
         Ok(Self {
             clock: SimTime(snapshot.clock_ticks),
             warp_level: snapshot.warp_level,
@@ -1353,6 +1757,21 @@ impl World {
             transfers: snapshot.transfers,
             next_transfer_id: snapshot.next_transfer_id,
             next_crew_id: snapshot.next_crew_id,
+            science: snapshot.science,
+            science_cfg: snapshot.science_cfg,
+            tech: snapshot.tech,
+            economy: snapshot.economy,
+            economy_cfg: snapshot.economy_cfg,
+            save_seed: snapshot.save_seed,
+            contracts: snapshot.contracts,
+            contract_cfg: snapshot.contract_cfg,
+            // §7.3: the caller re-installs the data-derived config via
+            // `set_experiments`/`set_tech_tree`/`set_sites` (the `orbits`
+            // precedent — re-handed, not serialized).
+            experiments: BTreeMap::new(),
+            tech_tree: None,
+            site_defs: BTreeMap::new(),
+            contract_defs: BTreeMap::new(),
             physics: physics.map(|p| Physics {
                 backend: SimpleBackend::new(p.environment),
                 dominant: p.dominant,
@@ -1433,6 +1852,14 @@ impl World {
             transfers: self.transfers.clone(),
             next_transfer_id: self.next_transfer_id,
             next_crew_id: self.next_crew_id,
+            science_cfg: self.science_cfg,
+            science: self.science.clone(),
+            tech: self.tech.clone(),
+            economy: self.economy.clone(),
+            economy_cfg: self.economy_cfg,
+            save_seed: self.save_seed,
+            contracts: self.contracts.clone(),
+            contract_cfg: self.contract_cfg,
         })
     }
 
@@ -1550,10 +1977,7 @@ impl World {
 
     /// Lazy-shadow capture for the event heap + seq counter.
     fn shadow_events(&mut self, shadow: &mut TickShadow) {
-        if shadow.event_heap.is_none() {
-            shadow.event_heap = Some(self.event_heap.clone());
-            shadow.next_event_seq = Some(self.next_event_seq);
-        }
+        shadow_events_split(&self.event_heap, self.next_event_seq, shadow);
     }
 
     /// Lazy-shadow capture for the M6-D transfer arena + both counters
@@ -1566,6 +1990,18 @@ impl World {
             shadow.next_transfer_id = Some(self.next_transfer_id);
             shadow.next_crew_id = Some(self.next_crew_id);
         }
+    }
+
+    /// Lazy-shadow capture for the M7-C economy book — one clone per
+    /// tick that mutates it (the `shadow_transfers` precedent).
+    pub(crate) fn shadow_economy(&mut self, shadow: &mut TickShadow) {
+        economy::shadow_economy(&self.economy, &mut shadow.economy);
+    }
+
+    /// Lazy-shadow capture for the M7-D contract book (the
+    /// `shadow_economy` precedent).
+    pub(crate) fn shadow_contracts(&mut self, shadow: &mut TickShadow) {
+        contracts::shadow_contracts(&self.contracts, &mut shadow.contracts);
     }
 
     /// §2.6.4's shared unlatch path: returns the vessel's welded body —
@@ -1688,6 +2124,9 @@ impl World {
             .as_mut()
             .ok_or(SimError::Fatal("bubble check raced physics"))?;
         let mut dead_vessels: Vec<VesselId> = Vec::new();
+        // M7-D: vessels that surface-latched inside this range —
+        // their contract trigger runs once `self` is whole again.
+        let mut latched_total: Vec<VesselId> = Vec::new();
         // M5: vessels whose node burn completed during this range —
         // processed once, after the tick loop, when `self` is whole
         // again and the rails conversion can be attempted.
@@ -1828,6 +2267,7 @@ impl World {
             // M6-A latch departure: deferred transitions evaluated
             // post-write-back (every neighbor's pose is this tick's).
             transition_latched(vessels, physics, &latched_now, SimTime(t + 1));
+            latched_total.extend_from_slice(&latched_now);
             // Apply the tick's consequences in ascending-vessel-id
             // order: impacts remove, then §2.4 breakups split.
             let mut affected: std::collections::BTreeSet<VesselId> =
@@ -1853,6 +2293,18 @@ impl World {
                             .any(|e| event_names_vessel(&e.kind, &vid)),
                         "in-bubble removal: a pending event outlived its conic"
                     );
+                    // M7-A: the vessel's research projects die with it —
+                    // drop them (no accrual) and scrub their pending
+                    // pair, which names projects, not vessels. The drop
+                    // shadows the science book and the event heap itself
+                    // (post-removal Recoverables restore them together).
+                    research::drop_vessel_projects(
+                        &mut self.science,
+                        &mut self.event_heap,
+                        self.next_event_seq,
+                        vid,
+                        shadow,
+                    );
                     vessels.remove(&vid);
                     physics.aero.remove(&vid);
                     dead_vessels.push(vid);
@@ -1864,11 +2316,18 @@ impl World {
                     physics,
                     &mut self.next_vessel_id,
                     caps,
+                    &mut self.science,
+                    &self.science_cfg,
+                    &mut self.economy,
+                    &self.economy_cfg,
+                    &mut self.event_heap,
+                    self.next_event_seq,
                     vid,
                     &sh,
                     &th,
                     t + 1,
                     &mut dead_vessels,
+                    shadow,
                 )?;
             }
             // §2.9's `max_debris` — oldest-debris eviction by
@@ -1901,6 +2360,13 @@ impl World {
                             .any(|e| event_names_vessel(&e.kind, &vid)),
                         "in-bubble eviction: a pending event outlived its conic"
                     );
+                    research::drop_vessel_projects(
+                        &mut self.science,
+                        &mut self.event_heap,
+                        self.next_event_seq,
+                        vid,
+                        shadow,
+                    );
                     vessels.remove(&vid);
                     physics.aero.remove(&vid);
                     dead_vessels.push(vid);
@@ -1922,9 +2388,11 @@ impl World {
                 &mut self.tracked_vessels,
                 &self.event_heap,
                 &mut self.transfers,
+                &mut self.science,
                 &self.docking,
                 t + 1,
                 degraded,
+                shadow,
             )?;
             // M6-B §2.4: the joint lifecycle runs last in the tick,
             // after every consequence above — dissolution sees this
@@ -1942,6 +2410,13 @@ impl World {
         }
         for vid in dead_vessels {
             self.tracked_vessels.remove(&vid);
+        }
+        // M7-D: the surface latch is a contract trigger — evaluate
+        // the predicates once the vessel states have settled (the
+        // batch's latched ids are this range's, dedup'd by BTreeSet
+        // order).
+        for vid in latched_total {
+            self.contract_notify(&contracts::ContractTrigger::SurfaceLatched(vid), shadow)?;
         }
         self.finish_burns(&burns_done, t_next, shadow, degraded)
     }
@@ -2037,11 +2512,26 @@ impl World {
         }
         self.shadow_vessels(shadow);
         self.shadow_tracked(shadow);
+        // M7-A: the vessel's research projects die with it — drop the
+        // records (work-in-progress is lost, no accrual) so the heap
+        // scrub below takes their events with them. The drop shadows
+        // the science book and the heap itself, BEFORE either mutates —
+        // a post-removal Recoverable restores projects and their
+        // pending pair together.
+        research::drop_vessel_projects(
+            &mut self.science,
+            &mut self.event_heap,
+            self.next_event_seq,
+            vessel,
+            shadow,
+        );
         self.vessels.remove(&vessel);
         self.tracked_vessels.remove(&vessel);
         if let Some(p) = self.physics.as_mut() {
             p.aero.remove(&vessel);
         }
+        // Lazy no-op if the drop above already captured the heap —
+        // needed when the vessel carried no projects at all.
         self.shadow_events(shadow);
         let heap = std::mem::take(&mut self.event_heap);
         self.event_heap = heap
@@ -2224,6 +2714,7 @@ impl World {
     /// Runs after the drain's pop pass, so the whole world is borrowable —
     /// applies may touch the vessel arena, the opt-in set, and the event
     /// heap; everything they touch is shadow-captured first.
+    #[allow(clippy::too_many_lines)] // the arm-per-variant table grew with M7-A
     fn apply_command(
         &mut self,
         command: &SimCommand,
@@ -2330,6 +2821,42 @@ impl World {
             SimCommand::TransferResource { .. }
             | SimCommand::TransferCrew { .. }
             | SimCommand::BoardCrew { .. } => self.apply_transfer_command(command, shadow)?,
+            SimCommand::RunExperiment {
+                vessel,
+                node,
+                experiment,
+                biome,
+                situation,
+            } => {
+                self.apply_run_experiment(*vessel, *node, experiment, biome, *situation, shadow)?
+            }
+            SimCommand::TransmitData { vessel, key } => {
+                self.apply_transmit_data(*vessel, key, shadow)?
+            }
+            SimCommand::RecoverData { vessel, key } => {
+                self.apply_recover_data(*vessel, key, shadow)?
+            }
+            SimCommand::StartResearch {
+                vessel,
+                lab_node,
+                key,
+                researchers,
+            } => self.apply_start_research(*vessel, *lab_node, key, researchers, shadow)?,
+            SimCommand::StopResearch { project } => self.apply_stop_research(*project, shadow)?,
+            SimCommand::ResearchTech { node } => self.apply_research_tech(node, shadow)?,
+            SimCommand::ResearchUpgradeLevel { track } => {
+                self.apply_research_upgrade_level(track, shadow)?
+            }
+            SimCommand::RecoverVessel { vessel, site } => {
+                self.apply_recover_vessel(*vessel, site, shadow)?
+            }
+            SimCommand::HireCrew {
+                name,
+                kind,
+                salary_per_s,
+            } => self.apply_hire_crew(name, *kind, *salary_per_s, shadow)?,
+            SimCommand::ContractReward { micros } => self.apply_contract_reward(*micros, shadow)?,
+            SimCommand::AcceptContract { offer } => self.apply_accept_contract(*offer, shadow)?,
         }
         Ok(())
     }
@@ -2462,6 +2989,7 @@ impl World {
         self.vessels.insert(
             id,
             Vessel {
+                science: VesselScience::default(),
                 id,
                 craft: None,
                 state: VesselState::OnRails(orbit),
@@ -2476,6 +3004,9 @@ impl World {
                 crew: Vec::new(),
             },
         );
+        // M7-D: the spawn IS an orbit-achieved transition — the
+        // contract predicates evaluate now (event-driven, §3.6).
+        self.contract_notify(&contracts::ContractTrigger::OrbitAchieved(id), shadow)?;
         // §2.6.5: publish the new vessel's next event time now — the
         // heap must hold it before `t_next` is next computed.
         // Latent edge (M5-A backlog): residence is NOT resolved at spawn —
@@ -2490,6 +3021,7 @@ impl World {
     /// `craft: None`; this path keeps the graph on the vessel so
     /// bubble↔rails transitions and snapshot re-weld can rebuild it.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)] // the M7-C cost gate grew it past the limit
     fn apply_spawn_physical(
         &mut self,
         craft: &CraftDef,
@@ -2523,6 +3055,29 @@ impl World {
         // full tanks or the dry-mass recovery under contents debit is
         // nonsense (authored-input gate; the weld itself can't see it).
         transfers::check_tank_masses(craft)?;
+        // M7-C: `part_costs` must cover `parts` exactly and carry only
+        // finite non-negative numbers — a short table would silently
+        // undercharge the manufacture debit and the recovery payout.
+        if craft.part_costs.len() != craft.parts.len()
+            || craft
+                .part_costs
+                .iter()
+                .any(|c| !(c.is_finite() && *c >= 0.0))
+        {
+            return Err(SimError::Recoverable(
+                "physical spawn: part_costs not parallel to parts",
+            ));
+        }
+        // §3.5's part manufacture — the build charge is paid at the
+        // pad (M8's order-and-time pipeline replaces this direct
+        // debit, but the cost exists now). An action: unaffordable
+        // rejects, it never clamps (the economy module doc).
+        let cost = economy::craft_cost_micros(craft);
+        if cost > self.economy.funds_micros {
+            return Err(SimError::Recoverable(
+                "physical spawn: insufficient funds to manufacture",
+            ));
+        }
         let mut body = csp_phys::weld(&craft.graph, &craft.parts)
             .map_err(|e| SimError::Recoverable(e.reason()))?;
         body.pos = pos;
@@ -2581,9 +3136,14 @@ impl World {
             .next_vessel_id
             .checked_add(1)
             .ok_or(SimError::Fatal("vessel id counter overflow"))?;
+        // The manufacture debit — after every validation above, before
+        // the vessel exists (a `Recoverable` here restores both the
+        // charge and nothing else).
+        self.charge_funds(cost, economy::FundsReason::Manufacture, shadow)?;
         self.vessels.insert(
             id,
             Vessel {
+                science: VesselScience::default(),
                 id,
                 craft: Some(craft.clone()),
                 state: VesselState::InBubble(body),
@@ -2714,6 +3274,9 @@ impl World {
             // to the stamped tick, not the clock.
             self.schedule_debris_decay(vessel, &orbit.elements, epoch, shadow)?;
         }
+        // M7-D: the rails stamp is an orbit-achieved transition —
+        // the contract predicates evaluate now.
+        self.contract_notify(&contracts::ContractTrigger::OrbitAchieved(vessel), shadow)?;
         // The scan publishes strictly-future crossings: origin at the
         // conic's epoch (never behind the clock — `schedule_next_soi`
         // clamps defensively too).
@@ -3491,7 +4054,22 @@ impl World {
         // the simulation with its mass.
         v.tank_contents.remove(&node);
         v.crew.retain(|c| c.seat != node);
+        // M7-A: so do its pooled data records and spent marks; a
+        // project running on the jettisoned lab finalizes here —
+        // accrued science banks and the escrowed remnant leaves with
+        // the part.
+        v.science.data.remove(&node);
+        v.science.spent.retain(|(n, _)| *n != node);
         v.state = VesselState::InBubble(body);
+        let departing: std::collections::BTreeSet<csp_phys::PartNodeId> =
+            [node].into_iter().collect();
+        let tick = self.clock.ticks();
+        self.shadow_science(shadow);
+        self.shadow_events(shadow);
+        let (_, banked) = self.finalize_projects_on_nodes(&departing, tick);
+        // M7-C: the jettison-finalized projects' accrual pays out —
+        // science banked is science banked.
+        self.credit_science_payout(banked, shadow);
         if let Some(p) = self.physics.as_mut() {
             p.aero.remove(&vessel);
         }
@@ -3598,6 +4176,7 @@ impl World {
                     craft_graph_hash(&CraftDef {
                         graph: retained.clone(),
                         parts: craft.parts.clone(),
+                        part_costs: craft.part_costs.clone(),
                     }),
                 )
                 .map_err(|e| SimError::Fatal(e.reason()))?,
@@ -3649,6 +4228,7 @@ impl World {
         v.craft = Some(CraftDef {
             graph: retained,
             parts: craft.parts.clone(),
+            part_costs: craft.part_costs.clone(),
         });
         v.state = VesselState::InBubble(nb);
         v.aero_mask = csp_phys::ConfigMask(retained_mask);
@@ -3657,6 +4237,22 @@ impl World {
         // M6-D: contents and crew ride their parts — the subtree's
         // tanks and seats leave with the fragment, the rest stay.
         let (frag_tanks, frag_crew) = transfers::split_vessel_records(v, &frag_nodes);
+        // M7-A: the keyed data pool and spent marks partition by node
+        // the same way; a project whose lab node departs finalizes at
+        // this tick — accrued science banks, and its escrowed remainder
+        // lands in the fragment's pool under the lab node.
+        research::shadow_science(&self.science, &mut shadow.science);
+        shadow_events_split(&self.event_heap, self.next_event_seq, shadow);
+        let (frag_science, finalized, banked) = research::split_vessel_science(
+            v,
+            &frag_nodes,
+            &mut self.science,
+            &self.science_cfg,
+            self.clock.ticks(),
+        );
+        // M7-C: projects finalized by the split pay their accrual out
+        // at `science_funds_per_point` — the milestone edge.
+        self.credit_science_payout(banked, shadow);
         self.vessels.insert(
             id,
             Vessel {
@@ -3664,6 +4260,7 @@ impl World {
                 craft: Some(CraftDef {
                     graph: frag_g,
                     parts: craft.parts.clone(),
+                    part_costs: craft.part_costs.clone(),
                 }),
                 state: VesselState::InBubble(fb),
                 aero_mask: csp_phys::ConfigMask::ALL,
@@ -3675,8 +4272,27 @@ impl World {
                 seams: frag_seams,
                 tank_contents: frag_tanks,
                 crew: frag_crew,
+                science: frag_science,
             },
         );
+        // Scrub the finalized projects' pending event pair (they name
+        // projects, not vessels — the vessel-scrub paths never see
+        // them; orphans would fire as tolerated no-ops, but the apply
+        // knows better here).
+        for pid in &finalized {
+            let kept: Vec<ScheduledEvent> = std::mem::take(&mut self.event_heap)
+                .into_iter()
+                .filter(|e| {
+                    !matches!(
+                        &e.kind,
+                        EventKind::ResearchDataExhausted { project: p }
+                        | EventKind::ResearchProjectComplete { project: p }
+                            if *p == *pid
+                    )
+                })
+                .collect();
+            self.event_heap = kept.into_iter().collect();
+        }
         if let Some(p) = self.physics.as_mut() {
             p.aero.remove(&vessel);
         }
@@ -3783,7 +4399,7 @@ impl World {
         &mut self,
         now: SimTime,
         t_next: SimTime,
-        _shadow: &mut TickShadow,
+        shadow: &mut TickShadow,
         degraded: &mut Vec<SimError>,
     ) -> Result<(), SimError> {
         debug_assert!(t_next >= now, "interval must not be reversed");
@@ -3791,9 +4407,29 @@ impl World {
             if subsystem == Subsystem::Orbits {
                 self.advance_orbits(t_next, degraded)?;
             }
+            // M7-C §3.5: the program-economy slot. Its interval work
+            // is publish-only — ensure one `SalaryDue` sits on the
+            // absolute period grid (the lazily-published cadence; a
+            // pure function of `(clock, heap)` so the first publish
+            // lands identically in every §2.6.1 partition). The
+            // debit itself happens at the event's absolute tick —
+            // never integrated, never partition-dependent. M7-D's
+            // contracts join this slot later.
+            if subsystem == Subsystem::Contracts {
+                self.publish_economy(shadow)?;
+                // M7-D §3.6: the offer board refills lazily — a
+                // pure function of `(defs, facts, offer_index,
+                // seed)`, so the same publish lands identically in
+                // every partition.
+                self.publish_contracts(shadow)?;
+            }
             // Vessels..Alarms: the remaining §2.6.5 slots have no
-            // interval state at M1 — their advance is a no-op by
-            // definition until the subsystem lands.
+            // interval state — their advance is a no-op by definition.
+            // M7-A's `Research` slot included: a project's D(t) is a
+            // closed form evaluated at absolute ticks and mutated only
+            // at boundaries (`StartResearch` escrow, the exhaustion
+            // pair) — §2.6.5's "publishes the next event time" contract,
+            // the Orbits class, so there is no per-interval work here.
         }
         let _ = now;
         Ok(())
@@ -3898,6 +4534,23 @@ impl World {
                         self.shadow_transfers(shadow);
                         self.transfers.remove(transfer);
                     }
+                    // A failed exhaustion landing orphans its project
+                    // the same way — consume the record with the event
+                    // (the conversion that would have landed it is the
+                    // degraded failure).
+                    if let EventKind::ResearchDataExhausted { project }
+                    | EventKind::ResearchProjectComplete { project } = &event.kind
+                    {
+                        self.shadow_science(shadow);
+                        self.science.projects.remove(project);
+                    }
+                    // A failed deadline firing leaves the contract
+                    // with no expiry — drop the record with the
+                    // event (the zombie-drop, same as the node).
+                    if let EventKind::ContractDeadline { contract } = &event.kind {
+                        self.shadow_contracts(shadow);
+                        self.contracts.active.remove(contract);
+                    }
                     let vessel = match &event.kind {
                         EventKind::SoiTransition { vessel, .. }
                         | EventKind::SoiRescan { vessel }
@@ -3905,7 +4558,15 @@ impl World {
                         EventKind::PlayerAlarm { .. }
                         | EventKind::DebrisDecay { .. }
                         | EventKind::TransferWindow { .. }
-                        | EventKind::TransferComplete { .. } => None,
+                        | EventKind::TransferComplete { .. }
+                        | EventKind::ResearchDataExhausted { .. }
+                        | EventKind::ResearchProjectComplete { .. }
+                        // M7-C: economy events name no vessel — they
+                        // survive removal like the transfer/research
+                        // events (the `TransferComplete` precedent).
+                        | EventKind::SalaryDue
+                        | EventKind::Insolvent { .. }
+                        | EventKind::ContractDeadline { .. } => None,
                     };
                     if let Some(vessel) = vessel {
                         self.schedule_event(
@@ -3982,6 +4643,30 @@ impl World {
             EventKind::TransferComplete { transfer } => {
                 self.fire_transfer_complete(*transfer, shadow)
             }
+            // M7-A: the lab's escrowed data crossed the `data_epsilon`
+            // floor — bank the conversion, consume the record.
+            EventKind::ResearchDataExhausted { project } => {
+                self.fire_research_exhausted(*project, shadow)
+            }
+            // M7-A: the player-facing completion — fires second in the
+            // same-tick pair. If the project somehow still stands (a
+            // degraded Exhausted firing), complete it identically.
+            EventKind::ResearchProjectComplete { project } => {
+                self.fire_research_complete(*project, shadow)
+            }
+            // M7-C: the salary drain — debit the roster, re-arm on the
+            // absolute period grid.
+            EventKind::SalaryDue => self.fire_salary_due(event.tick, shadow),
+            // M7-C: the bankruptcy notification — mutates nothing;
+            // surfacing rides `fired_events` (the `PlayerAlarm`
+            // contract).
+            EventKind::Insolvent { .. } => Ok(()),
+            // M7-D: the contract expired — drop the record, count
+            // the failure, charge the authored penalty through the
+            // funds clamp.
+            EventKind::ContractDeadline { contract } => {
+                self.fire_contract_deadline(*contract, event.tick, shadow)
+            }
         }
     }
 
@@ -4039,7 +4724,12 @@ impl World {
             .get_mut(&vessel_id)
             .ok_or(SimError::Fatal("soi event: vessel vanished"))?
             .state = VesselState::OnRails(new_orbit);
-        Ok(())
+        // M7-D: the re-base is an orbit-achieved transition — the
+        // contract predicates evaluate now (event-driven, §3.6).
+        self.contract_notify(
+            &contracts::ContractTrigger::OrbitAchieved(vessel_id),
+            shadow,
+        )
     }
 
     /// One frame's advance — §2.6.2's single advance function, verbatim:
@@ -4283,6 +4973,35 @@ impl World {
         for e in events {
             e.hash_into(&mut h);
         }
+        // M7-A: §3.2's tunables (construction config that changes state
+        // evolution — the `transfer_cfg` precedent) and the science
+        // book — banked points, the per-key ledger, the project arena.
+        h.f64(self.science_cfg.softcap_k);
+        h.f64(self.science_cfg.data_epsilon);
+        h.f64(self.science_cfg.science_per_data);
+        h.f64(self.science_cfg.transmit_ec_per_data_unit);
+        research::hash_science(&mut h, &self.science);
+        // M7-B: the §3.3/§3.4 progression record — researched nodes,
+        // purchased levels, family qualification.
+        tech::hash_tech(&mut h, &self.tech);
+        // M7-C: §3.5's tunables (construction config — the same
+        // precedent) and the economy book: funds, insolvency, the
+        // crew roster, the site inventory arena. The ledger is
+        // recorded history — never hashed (module doc).
+        h.u64(self.economy_cfg.starting_funds_micros);
+        h.u64(self.economy_cfg.salary_period_ticks);
+        h.u64(self.economy_cfg.hire_cost_micros);
+        h.f64(self.economy_cfg.science_funds_per_point);
+        h.f64(self.economy_cfg.recovery_efficiency);
+        h.f64(self.economy_cfg.abandon_recovery);
+        economy::hash_economy(&mut h, &self.economy);
+        // M7-D: the §2.7 save seed (the offer draw input), the
+        // contract tunables, and the §3.6 contract book — offers,
+        // the `offer_index` counter, the active arena, the fact
+        // record.
+        h.u64(self.save_seed);
+        h.u32(self.contract_cfg.board_size);
+        contracts::hash_contracts(&mut h, &self.contracts);
         h.finish()
     }
 }
@@ -4327,6 +5046,22 @@ fn drive_node_burn(node: &mut Option<ManeuverNode>, body: &mut WeldedBody) -> bo
     false
 }
 
+/// The `World::shadow_events` twin for the field-level borrow splits —
+/// `step_bubble_range`'s destructure (`let Self { vessels, physics,
+/// .. } = self`) and `apply_breakup`'s parameter list keep `self` out
+/// of reach where the research bookkeeping mutates the heap. Captures
+/// `heap` + `next_event_seq` together, lazily, exactly like the method.
+fn shadow_events_split(
+    heap: &BinaryHeap<ScheduledEvent>,
+    next_event_seq: u64,
+    shadow: &mut TickShadow,
+) {
+    if shadow.event_heap.is_none() {
+        shadow.event_heap = Some(heap.clone());
+        shadow.next_event_seq = Some(next_event_seq);
+    }
+}
+
 /// Does this scheduled event name `vessel`? Used by the `ToBubble`
 /// apply and the node-start materialization to drop the vessel's dead
 /// events when it leaves rails — SOI events (no conic to scan) and
@@ -4342,8 +5077,19 @@ fn event_names_vessel(kind: &EventKind, vessel: &VesselId) -> bool {
         | EventKind::TransferWindow { .. }
         // `TransferComplete` names a *transfer*, not a vessel — it
         // survives vessel removal by design (the completion's
-        // fallback rule resolves the dead endpoint).
-        | EventKind::TransferComplete { .. } => false,
+        // fallback rule resolves the dead endpoint). M7-A's research
+        // events name *projects* the same way; `remove_vessel` and
+        // the in-bubble removal sites drop a dying vessel's projects
+        // (and their events) explicitly.
+        | EventKind::TransferComplete { .. }
+        | EventKind::ResearchDataExhausted { .. }
+        | EventKind::ResearchProjectComplete { .. }
+        // M7-C: the economy events name no vessel.
+        | EventKind::SalaryDue
+        | EventKind::Insolvent { .. }
+        // M7-D: the deadline names a contract — it survives vessel
+        // removal (contracts bind no vessel in v1).
+        | EventKind::ContractDeadline { .. } => false,
     }
 }
 
@@ -4405,6 +5151,247 @@ fn restore_transfer_state(
                 return Err(SimError::Fatal("snapshot: crew id not unique / issued"));
             }
         }
+    }
+    Ok(())
+}
+
+/// M7-A science coherence for [`World::restore`]. Every live project
+/// must sit on a live vessel, on a graph node that carries a resolved
+/// `LabSpec`, with aboard researchers, finite positive `R`/`T`/`d0`,
+/// `start_tick ≤ clock < exhaust_tick` — and exactly one pending
+/// `ResearchDataExhausted` PLUS one `ResearchProjectComplete`, both AT
+/// `exhaust_tick` (the heap walk collected them). The reverse direction
+/// is deliberately NOT checked: orphan research events are legal (a
+/// jettison/breakup/vessel-removal finalizes the project without
+/// scrubbing the pair — they fire as no-ops, the `TransferComplete`
+/// vessel-removal precedent). The ledger and banked total need only be
+/// finite/non-negative.
+fn restore_science_state(
+    snapshot: &WorldSnapshot,
+    research_exhausted: &BTreeMap<ResearchId, u64>,
+    research_complete: &BTreeMap<ResearchId, u64>,
+) -> Result<(), SimError> {
+    let science = &snapshot.science;
+    if !science.banked.is_finite() || science.banked < 0.0 {
+        return Err(SimError::Fatal("snapshot: non-finite banked science"));
+    }
+    for (key, k) in &science.keys {
+        if !(k.collected.is_finite() && k.collected >= 0.0) {
+            return Err(SimError::Fatal("snapshot: non-finite collected ledger"));
+        }
+        // A closed key must hold no aboard pool data anywhere.
+        if k.closed {
+            for v in snapshot.vessels.values() {
+                if v.science.data.values().any(|m| m.contains_key(key)) {
+                    return Err(SimError::Fatal("snapshot: pooled data under a closed key"));
+                }
+            }
+        }
+    }
+    for (id, p) in &science.projects {
+        if id.0 >= science.next_id {
+            return Err(SimError::Fatal("snapshot: research id not below next"));
+        }
+        if p.id != *id {
+            return Err(SimError::Fatal("snapshot: research id != arena key"));
+        }
+        if !(p.rate_science_per_s.is_finite() && p.rate_science_per_s > 0.0)
+            || !(p.throughput_data_per_s.is_finite() && p.throughput_data_per_s > 0.0)
+            || !(p.data_start.is_finite() && p.data_start > 0.0)
+        {
+            return Err(SimError::Fatal("snapshot: non-finite research project"));
+        }
+        if p.start_tick > snapshot.clock_ticks
+            || p.exhaust_tick <= p.start_tick
+            || p.exhaust_tick < snapshot.clock_ticks
+        {
+            return Err(SimError::Fatal("snapshot: incoherent project schedule"));
+        }
+        // `exhaust_tick` is a pure function of the frozen record + the
+        // serialized config — recompute it rather than trust the stamp
+        // (a drifted stamp would fire the conversion at the wrong tick).
+        if research::exhaust_tick(p, &snapshot.science_cfg) != p.exhaust_tick {
+            return Err(SimError::Fatal(
+                "snapshot: project exhaust tick off the closed form",
+            ));
+        }
+        // The apply-side close gate refuses while a project holds the
+        // key — a live project under a closed ledger entry is corrupt.
+        if science.keys.get(&p.key).is_some_and(|k| k.closed) {
+            return Err(SimError::Fatal("snapshot: live project under a closed key"));
+        }
+        let Some(v) = snapshot.vessels.get(&p.vessel) else {
+            return Err(SimError::Fatal("snapshot: project on unknown vessel"));
+        };
+        let Some(craft) = &v.craft else {
+            return Err(SimError::Fatal("snapshot: project on a craft-less vessel"));
+        };
+        let Some(n) = craft.graph.nodes.get(&p.lab_node) else {
+            return Err(SimError::Fatal("snapshot: project lab on non-node"));
+        };
+        let Some(lab) = craft
+            .parts
+            .get(n.effective_index as usize)
+            .and_then(|part| part.lab)
+        else {
+            return Err(SimError::Fatal("snapshot: project lab node carries no lab"));
+        };
+        if p.researchers.is_empty()
+            || p.researchers.len() as u32 > lab.researcher_slots
+            || p.researchers
+                .iter()
+                .any(|r| r.skill > 5 || !v.crew.iter().any(|c| c.id == r.crew))
+        {
+            return Err(SimError::Fatal(
+                "snapshot: incoherent researcher assignment",
+            ));
+        }
+        // The event pair: exactly one each, both AT `exhaust_tick`.
+        match (research_exhausted.get(id), research_complete.get(id)) {
+            (Some(&a), Some(&b)) if a == p.exhaust_tick && b == p.exhaust_tick => {}
+            _ => {
+                return Err(SimError::Fatal(
+                    "snapshot: project / research event pair mismatch",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// M7-C economy coherence for [`World::restore`]. The book's
+/// self-consistency: roster salaries finite and non-negative, skill
+/// inside §3.5's 0..=5, every `Vessel(v)` location naming a live
+/// vessel that actually carries the member (and no roster member
+/// aboard a vessel with a different recorded location — the two
+/// directions are one invariant), `Facility`/`Colony` locations
+/// rejected outright (no producer exists yet — a snapshot carrying
+/// one names state nothing could have written), site inventories
+/// finite and non-negative, and `insolvent` agreeing with the funds
+/// balance (a positive balance is never insolvent — credits clear
+/// it). The ledger is unhashed history — its entries need no
+/// coherence beyond being serializable.
+fn restore_economy_state(snapshot: &WorldSnapshot) -> Result<(), SimError> {
+    let e = &snapshot.economy;
+    if e.insolvent && e.funds_micros > 0 {
+        return Err(SimError::Fatal("snapshot: insolvent flag with funds"));
+    }
+    for (id, m) in &e.crew {
+        if !(m.salary_per_s.is_finite() && m.salary_per_s >= 0.0) || m.skill > 5 {
+            return Err(SimError::Fatal("snapshot: incoherent crew member"));
+        }
+        match &m.location {
+            economy::CrewLocation::Vessel(v) => {
+                let Some(vessel) = snapshot.vessels.get(v) else {
+                    return Err(SimError::Fatal("snapshot: crew aboard an unknown vessel"));
+                };
+                if !vessel.crew.iter().any(|c| c.id == *id) {
+                    return Err(SimError::Fatal(
+                        "snapshot: crew location/seat record disagree",
+                    ));
+                }
+            }
+            economy::CrewLocation::Facility(_) | economy::CrewLocation::Colony(_) => {
+                return Err(SimError::Fatal(
+                    "snapshot: crew location names an unbuilt arena",
+                ));
+            }
+            economy::CrewLocation::Unassigned => {}
+        }
+    }
+    // The mirror half: a roster member seated aboard must record
+    // `Vessel(v)` — the recovery path writes it, a crafted snapshot
+    // could otherwise strand a member aboard with a lie of a location.
+    for (vid, vessel) in &snapshot.vessels {
+        for c in &vessel.crew {
+            if let Some(m) = e.crew.get(&c.id)
+                && m.location != economy::CrewLocation::Vessel(*vid)
+            {
+                return Err(SimError::Fatal(
+                    "snapshot: seated crew's location is not its vessel",
+                ));
+            }
+        }
+    }
+    for s in e.sites.values() {
+        for u in s.inventory.values() {
+            if !(u.is_finite() && *u >= 0.0) {
+                return Err(SimError::Fatal("snapshot: non-finite site inventory"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// M7-D §3.6 contract coherence for [`World::restore`]. The book's
+/// self-consistency: each offer's stored index equals its key and
+/// sits below the `offer_index` counter (generated offers are
+/// consumed counters); params carry only finite positive numbers;
+/// each active contract's `id` equals its key and sits below
+/// `next_contract_id`; and the `ContractDeadline` pairing is strict
+/// in both directions — an active contract with a deadline has
+/// exactly one pending event at `deadline_tick`, and every pending
+/// deadline names an active contract at its tick (completion drops
+/// the event, expiry drops the record — an orphan is a crafted
+/// lie).
+fn restore_contract_state(
+    snapshot: &WorldSnapshot,
+    deadline_events: &BTreeMap<ContractId, u64>,
+) -> Result<(), SimError> {
+    let c = &snapshot.contracts;
+    let params_ok = |p: &csp_data::ContractParams| -> bool {
+        let ok = |v: f64| v.is_finite() && v >= 0.0;
+        match p {
+            csp_data::ContractParams::SatelliteOrbit {
+                min_periapsis_alt_m,
+                max_apoapsis_alt_m,
+                ..
+            } => {
+                ok(*min_periapsis_alt_m)
+                    && ok(*max_apoapsis_alt_m)
+                    && min_periapsis_alt_m <= max_apoapsis_alt_m
+            }
+            csp_data::ContractParams::SurveyData { min_units, .. } => {
+                ok(*min_units) && *min_units > 0.0
+            }
+            csp_data::ContractParams::PartTest { regime, .. } => match regime {
+                csp_data::ContractRegime::Orbit { min_alt_m, .. } => {
+                    ok(*min_alt_m) && *min_alt_m > 0.0
+                }
+                csp_data::ContractRegime::Landed { .. } => true,
+            },
+            csp_data::ContractParams::Rescue { .. } => true,
+        }
+    };
+    for (idx, o) in &c.offers {
+        if *idx != o.index || *idx >= c.offer_index {
+            return Err(SimError::Fatal("snapshot: offer index incoherent"));
+        }
+        if !params_ok(&o.params) {
+            return Err(SimError::Fatal("snapshot: offer with non-finite params"));
+        }
+    }
+    for (id, a) in &c.active {
+        if a.id != *id || id.0 >= c.next_contract_id {
+            return Err(SimError::Fatal("snapshot: contract id not below next"));
+        }
+        if !params_ok(&a.params) {
+            return Err(SimError::Fatal("snapshot: contract with non-finite params"));
+        }
+        match (a.deadline_tick, deadline_events.get(id)) {
+            (Some(t), Some(&e)) if t == e => {}
+            (None, None) => {}
+            _ => {
+                return Err(SimError::Fatal(
+                    "snapshot: contract / deadline event pairing mismatch",
+                ));
+            }
+        }
+    }
+    if deadline_events.keys().any(|id| !c.active.contains_key(id)) {
+        return Err(SimError::Fatal(
+            "snapshot: deadline event names no active contract",
+        ));
     }
     Ok(())
 }
@@ -4598,11 +5585,35 @@ fn restore_vessel_state(vessel: &mut Vessel, has_physics: bool) -> Result<(), Si
             // declared resources, capacity bounds, wet-vs-mass, and
             // the seat occupancy limit (helper below).
             restore_vessel_contents(craft, vessel)?;
+            // M7-A: the science records' node keys must be live graph
+            // nodes (the pool partitions with the graph) and every
+            // unit count finite and non-negative; `spent` marks must
+            // also sit on live nodes.
+            for (node, m) in &vessel.science.data {
+                if !craft.graph.nodes.contains_key(node) {
+                    return Err(SimError::Fatal("snapshot: science data on non-node"));
+                }
+                for u in m.values() {
+                    if !(u.is_finite() && *u >= 0.0) {
+                        return Err(SimError::Fatal("snapshot: non-finite science units"));
+                    }
+                }
+            }
+            if vessel
+                .science
+                .spent
+                .iter()
+                .any(|(n, _)| !craft.graph.nodes.contains_key(n))
+            {
+                return Err(SimError::Fatal("snapshot: spent mark on non-node"));
+            }
         }
         None if !vessel.thermal.part_temps_k.is_empty()
             || !vessel.seams.is_empty()
             || !vessel.tank_contents.is_empty()
-            || !vessel.crew.is_empty() =>
+            || !vessel.crew.is_empty()
+            || !vessel.science.data.is_empty()
+            || !vessel.science.spent.is_empty() =>
         {
             return Err(SimError::Fatal(
                 "snapshot: thermal, seam, or contents/crew record on a craft-less vessel",
@@ -4675,6 +5686,7 @@ fn restore_vessel_state(vessel: &mut Vessel, has_physics: bool) -> Result<(), Si
 /// The craft walk — the vessel's authoritative physical description.
 /// The weld's mass properties are a pure function of this, so hashing
 /// it covers them honestly (they are derived, never themselves state).
+#[allow(clippy::too_many_lines)] // the field walk grew with M7-A
 fn hash_craft(h: &mut StateHasher, craft: &CraftDef) {
     h.u64(craft.graph.root.0);
     h.btree_map(
@@ -4774,6 +5786,26 @@ fn hash_craft(h: &mut StateHasher, craft: &CraftDef) {
         h.f64(p.structural.max_axial_n);
         h.f64(p.structural.max_shear_n);
         h.f64(p.structural.max_torque_nm);
+        // M7-A: the resolved science modules — experiment instruments
+        // and the lab spec are weld input too (they decide what a
+        // `RunExperiment`/`StartResearch` may do with the part).
+        h.vec(&p.experiments, |h, e| {
+            h.str(e.kind.as_str());
+            h.f64(e.data_units);
+            h.bool(e.reusable);
+            h.u8(e.situations.0);
+        });
+        h.opt(&p.lab, |h, l| {
+            h.f64(l.throughput_data_per_s);
+            h.f64(l.multiplier);
+            h.u32(l.researcher_slots);
+        });
+    });
+    // M7-C: the frozen resolved costs — hashed like the rest of the
+    // craft identity (they decide the manufacture charge and the
+    // recovery payout).
+    h.vec(&craft.part_costs, |h, c| {
+        h.f64(*c);
     });
 }
 
@@ -4908,11 +5940,18 @@ fn apply_breakup(
     physics: &mut Physics,
     next_vessel_id: &mut u64,
     caps: VesselCaps,
+    science: &mut ScienceState,
+    science_cfg: &ScienceConfig,
+    economy: &mut EconomyState,
+    economy_cfg: &economy::EconomyConfig,
+    event_heap: &mut BinaryHeap<ScheduledEvent>,
+    next_event_seq: u64,
     vid: VesselId,
     structural_hits: &[csp_phys::PartNodeId],
     thermal_hits: &[csp_phys::PartNodeId],
     tick: u64,
     dead: &mut Vec<VesselId>,
+    shadow: &mut TickShadow,
 ) -> Result<(), SimError> {
     let Some(v) = vessels.get(&vid) else {
         return Ok(());
@@ -4942,6 +5981,10 @@ fn apply_breakup(
     // exploded part itself) leaves the simulation with it.
     let v_tanks = v.tank_contents.clone();
     let v_crew = v.crew.clone();
+    // M7-A: the keyed data pool and spent marks partition by node the
+    // same way; projects whose lab node departs finalize per fragment
+    // below (their escrowed remainder lands in the fragment's pool).
+    let v_science = v.science.clone();
     let omega_world = rot.rotate(ang_vel);
     let transforms = csp_phys::weld::body_transforms(&craft.graph, &craft.parts)
         .map_err(|e| SimError::Fatal(e.reason()))?;
@@ -5035,6 +6078,11 @@ fn apply_breakup(
         members_of.insert(d, members);
     }
 
+    // M7-A: fragments built, for the lab-departure bookkeeping after
+    // the loop (each departing project's escrowed remnant lands in the
+    // fragment that carries its lab node).
+    let mut frag_vid: Vec<(VesselId, std::collections::BTreeSet<csp_phys::PartNodeId>)> =
+        Vec::new();
     for &d in &frag_roots {
         if vessels.len() as u64 >= caps.max_vessels {
             break; // §2.9 cap — fragments beyond it are discarded
@@ -5061,6 +6109,7 @@ fn apply_breakup(
                 craft: Some(CraftDef {
                     graph: frag_g,
                     parts: craft.parts.clone(),
+                    part_costs: craft.part_costs.clone(),
                 }),
                 state: VesselState::InBubble(fb),
                 aero_mask: csp_phys::ConfigMask::ALL,
@@ -5099,8 +6148,25 @@ fn apply_breakup(
                     .filter(|c| frag_nodes.contains(&c.seat))
                     .cloned()
                     .collect(),
+                // M7-A: the fragment keeps the pool entries and spent
+                // marks inside its member set.
+                science: VesselScience {
+                    data: v_science
+                        .data
+                        .iter()
+                        .filter(|(k, _)| frag_nodes.contains(k))
+                        .map(|(k, m)| (*k, m.clone()))
+                        .collect(),
+                    spent: v_science
+                        .spent
+                        .iter()
+                        .filter(|(n, _)| frag_nodes.contains(n))
+                        .cloned()
+                        .collect(),
+                },
             },
         );
+        frag_vid.push((id, frag_nodes.clone()));
     }
 
     // The retained graph — everything not detached/exploded.
@@ -5111,6 +6177,9 @@ fn apply_breakup(
         // `InBubble`, and vessel-named events are scheduled only for
         // on-rails conics — documented and `debug_assert`ed at the
         // other in-bubble removal sites in `step_bubble_range`.
+        // M7-A: its research projects die with it — no accrual; the
+        // drop shadows the science book and the heap itself.
+        research::drop_vessel_projects(science, event_heap, next_event_seq, vid, shadow);
         vessels.remove(&vid);
         physics.aero.remove(&vid);
         dead.push(vid);
@@ -5178,6 +6247,14 @@ fn apply_breakup(
     v.tank_contents
         .retain(|id, _| craft.graph.nodes.contains_key(id));
     v.crew.retain(|c| craft.graph.nodes.contains_key(&c.seat));
+    // M7-A: the pool and spent marks keep only the retained nodes the
+    // same way; projects on departing lab nodes finalize next.
+    v.science
+        .data
+        .retain(|id, _| craft.graph.nodes.contains_key(id));
+    v.science
+        .spent
+        .retain(|(n, _)| craft.graph.nodes.contains_key(n));
     v.craft = Some(craft);
     v.aero_mask = csp_phys::ConfigMask(mask);
     v.thermal.part_temps_k = temps;
@@ -5185,6 +6262,69 @@ fn apply_breakup(
     // The cache is bound to the pre-breakup graph hash — drop it;
     // `ensure_aero` rebuilds on the staleness check.
     physics.aero.remove(&vid);
+    // M7-A: finalize the projects whose lab nodes left on a fragment —
+    // accrued science banks at this tick; the escrowed remainder lands
+    // in the fragment's pool under its lab node. A project whose node
+    // left on a discarded fragment (cap overflow) or an exploded node
+    // loses its remnant — the same "gone with the part" rule as
+    // contents/crew.
+    let departing: Vec<ResearchId> = science
+        .projects
+        .values()
+        .filter(|p| p.vessel == vid && removed.contains(&p.lab_node))
+        .map(|p| p.id)
+        .collect();
+    if !departing.is_empty() {
+        research::shadow_science(science, &mut shadow.science);
+        // The loop below scrubs each finalized project's pending pair
+        // out of the heap — capture it first so a later Recoverable
+        // restores events and records together.
+        shadow_events_split(event_heap, next_event_seq, shadow);
+        for pid in departing {
+            let (banked, remnant) =
+                research::finalize_project(science, pid, science_cfg, tick, |p| p.lab_node);
+            // M7-C: the finalized accrual pays out at
+            // `science_funds_per_point` — the milestone edge. The
+            // economy book is shadowed like the science one (the
+            // capture above covers both).
+            economy::shadow_economy(economy, &mut shadow.economy);
+            economy::credit(
+                economy,
+                tick,
+                economy::to_micros(banked * economy_cfg.science_funds_per_point),
+                economy::FundsReason::ScienceMilestone,
+            );
+            if let Some((node, key, units)) = remnant
+                && let Some(fid) = frag_vid
+                    .iter()
+                    .find(|(_, nodes)| nodes.contains(&node))
+                    .map(|(id, _)| *id)
+                && let Some(fv) = vessels.get_mut(&fid)
+            {
+                *fv.science
+                    .data
+                    .entry(node)
+                    .or_default()
+                    .entry(key)
+                    .or_insert(0.0) += units;
+            }
+            // The finalized project's pending pair is dead — scrub it
+            // (the events name the project, not the vessel, so the
+            // vessel scrub never saw them).
+            let kept: Vec<ScheduledEvent> = std::mem::take(event_heap)
+                .into_iter()
+                .filter(|e| {
+                    !matches!(
+                        &e.kind,
+                        EventKind::ResearchDataExhausted { project: p }
+                        | EventKind::ResearchProjectComplete { project: p }
+                            if *p == pid
+                    )
+                })
+                .collect();
+            *event_heap = kept.into_iter().collect();
+        }
+    }
     Ok(())
 }
 
@@ -5240,6 +6380,9 @@ fn hash_vessel(h: &mut StateHasher, vessel: &Vessel) {
         h.u64(c.id.0);
         h.u64(c.seat.0);
     });
+    // M7-A: the keyed data pool + spent marks — serialized sim state
+    // the science applies read and write.
+    research::hash_vessel_science(h, &vessel.science);
     // M4b: the authoritative per-part temperature record — serialized
     // state, hashed like the body's kinematics.
     h.btree_map(
@@ -5602,6 +6745,14 @@ mod tests {
                 transfers: BTreeMap::new(),
                 next_transfer_id: 0,
                 next_crew_id: 0,
+                science_cfg: research::default_config(),
+                science: ScienceState::default(),
+                tech: TechState::default(),
+                economy: EconomyState::default(),
+                economy_cfg: economy::default_config(),
+                save_seed: 0,
+                contracts: ContractState::default(),
+                contract_cfg: contracts::default_config(),
             },
         )
         .unwrap();
@@ -6578,6 +7729,7 @@ mod tests {
         s.vessels.insert(
             VesselId(3),
             Vessel {
+                science: VesselScience::default(),
                 id: VesselId(3),
                 craft: None,
                 aero_mask: csp_phys::ConfigMask::ALL,
@@ -6730,7 +7882,10 @@ mod tests {
         );
         CraftDef {
             graph,
+            part_costs: vec![0.0],
             parts: vec![csp_phys::WeldPart {
+                experiments: Vec::new(),
+                lab: None,
                 dock_ports: vec![],
                 tanks: vec![],
                 crew_seats: 0,
@@ -6859,6 +8014,8 @@ mod tests {
             ),
         );
         let payload = csp_phys::WeldPart {
+            experiments: Vec::new(),
+            lab: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -6879,6 +8036,8 @@ mod tests {
             },
         };
         let plate = csp_phys::WeldPart {
+            experiments: Vec::new(),
+            lab: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -6900,6 +8059,7 @@ mod tests {
         };
         CraftDef {
             graph,
+            part_costs: vec![0.0; 2],
             parts: vec![payload, plate],
         }
     }
@@ -7750,7 +8910,10 @@ mod tests {
         );
         CraftDef {
             graph,
+            part_costs: vec![0.0],
             parts: vec![csp_phys::WeldPart {
+                experiments: Vec::new(),
+                lab: None,
                 dock_ports: vec![],
                 tanks: vec![],
                 crew_seats: 0,
@@ -7879,6 +9042,8 @@ mod tests {
             ),
         );
         let mk = |max_k: f64| csp_phys::WeldPart {
+            experiments: Vec::new(),
+            lab: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -7901,6 +9066,7 @@ mod tests {
         // Root tough (10 000 K cap), leaf fragile (400 K).
         let craft = CraftDef {
             graph,
+            part_costs: vec![0.0; 2],
             parts: vec![mk(10_000.0), mk(400.0)],
         };
         spawn_falling(&mut w, craft, 10_000.0, 2_000.0);
@@ -7933,6 +9099,8 @@ mod tests {
     /// 1 m box whose thermal fields vary per node.
     fn thermal_part(cap_jk: f64, max_k: f64, cond: f64) -> csp_phys::WeldPart {
         csp_phys::WeldPart {
+            experiments: Vec::new(),
+            lab: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -8001,6 +9169,7 @@ mod tests {
         // Zero conduction isolates each lump's heating.
         let craft = CraftDef {
             graph,
+            part_costs: vec![0.0; 4],
             parts: vec![
                 thermal_part(50_000.0, 10_000.0, 0.0),
                 thermal_part(50_000.0, 10_000.0, 0.0),
@@ -8077,6 +9246,7 @@ mod tests {
         );
         let craft = CraftDef {
             graph,
+            part_costs: vec![0.0; 3],
             parts: vec![
                 thermal_part(50_000.0, 10_000.0, 0.0),
                 thermal_part(50_000.0, 400.0, 0.0),
@@ -8255,6 +9425,8 @@ mod tests {
             conduction_w_per_k: 60.0,
         };
         let engine = csp_phys::WeldPart {
+            experiments: Vec::new(),
+            lab: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -8275,6 +9447,8 @@ mod tests {
             thermal: thermal.clone(),
         };
         let payload = csp_phys::WeldPart {
+            experiments: Vec::new(),
+            lab: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -8295,6 +9469,7 @@ mod tests {
         };
         CraftDef {
             graph,
+            part_costs: vec![0.0; 2],
             parts: vec![engine, payload],
         }
     }
@@ -8421,9 +9596,12 @@ mod tests {
         }
         CraftDef {
             graph,
+            part_costs: vec![0.0; chain.len()],
             parts: chain
                 .iter()
                 .map(|_| csp_phys::WeldPart {
+                    experiments: Vec::new(),
+                    lab: None,
                     dock_ports: vec![],
                     tanks: vec![],
                     crew_seats: 0,
@@ -8460,6 +9638,7 @@ mod tests {
         vessels.insert(
             VesselId(0),
             Vessel {
+                science: VesselScience::default(),
                 id: VesselId(0),
                 craft: Some(craft.clone()),
                 state: VesselState::InBubble(body),
@@ -8480,6 +9659,30 @@ mod tests {
         };
         let mut next_id = 1u64;
         let mut dead = Vec::new();
+        let mut science = ScienceState::default();
+        let science_cfg = research::default_config();
+        let mut heap = BinaryHeap::new();
+        let mut shadow = TickShadow {
+            clock: SimTime::ZERO,
+            warp_level: 1,
+            log_len: 0,
+            drained: Vec::new(),
+            seq_restore: Vec::new(),
+            vessels: None,
+            next_vessel_id: None,
+            joints: None,
+            joint_refused: None,
+            tracked_vessels: None,
+            event_heap: None,
+            next_event_seq: None,
+            transfers: None,
+            next_transfer_id: None,
+            next_crew_id: None,
+            science: None,
+            tech: None,
+            economy: None,
+            contracts: None,
+        };
         apply_breakup(
             &mut vessels,
             &mut physics,
@@ -8488,11 +9691,21 @@ mod tests {
                 max_vessels: 16,
                 max_debris: 16,
             },
+            &mut science,
+            &science_cfg,
+            &mut EconomyState::default(),
+            &economy::EconomyConfig {
+                starting_funds_micros: 0,
+                ..economy::default_config()
+            },
+            &mut heap,
+            0,
             VesselId(0),
             structural,
             thermal,
             7,
             &mut dead,
+            &mut shadow,
         )
         .unwrap();
         (vessels, dead)
@@ -10433,6 +11646,7 @@ mod tests {
             vessels.insert(
                 VesselId(id),
                 Vessel {
+                    science: VesselScience::default(),
                     id: VesselId(id),
                     craft: Some(craft),
                     state: VesselState::InBubble(body),
@@ -10479,6 +11693,28 @@ mod tests {
         let mut tracked = BTreeSet::new();
         let mut degraded = Vec::new();
         let joint = joints_v[0].clone();
+        let mut science = ScienceState::default();
+        let mut shadow = TickShadow {
+            clock: SimTime::ZERO,
+            warp_level: 1,
+            log_len: 0,
+            drained: Vec::new(),
+            seq_restore: Vec::new(),
+            vessels: None,
+            next_vessel_id: None,
+            joints: None,
+            joint_refused: None,
+            tracked_vessels: None,
+            event_heap: None,
+            next_event_seq: None,
+            transfers: None,
+            next_transfer_id: None,
+            next_crew_id: None,
+            science: None,
+            tech: None,
+            economy: None,
+            contracts: None,
+        };
         assert!(
             joints::apply_latch(
                 &mut vessels,
@@ -10488,9 +11724,11 @@ mod tests {
                 &mut tracked,
                 &std::collections::BinaryHeap::new(),
                 &mut BTreeMap::new(),
+                &mut science,
                 &joint,
                 64,
                 &mut degraded,
+                &mut shadow,
             )
             .unwrap()
         );
@@ -10532,6 +11770,7 @@ mod tests {
         body.rot = rot;
         body.vel = vel;
         Vessel {
+            science: VesselScience::default(),
             id: VesselId(id),
             craft: Some(craft),
             state: VesselState::InBubble(body),
@@ -10570,6 +11809,7 @@ mod tests {
         let mut tracked = BTreeSet::new();
         let mut degraded = Vec::new();
         let tick = w.clock().ticks();
+        let mut shadow = TickShadow::capture(w);
         assert!(
             joints::apply_latch(
                 &mut w.vessels,
@@ -10579,9 +11819,11 @@ mod tests {
                 &mut tracked,
                 &w.event_heap,
                 &mut w.transfers,
+                &mut w.science,
                 joint,
                 tick,
                 &mut degraded,
+                &mut shadow,
             )
             .unwrap(),
             "latch must merge: {degraded:?}"
@@ -11448,6 +12690,7 @@ mod tests {
     #[test]
     fn latched_pair_links_within_radius() {
         let mk = |id, lon| Vessel {
+            science: VesselScience::default(),
             id: VesselId(id),
             craft: None,
             state: VesselState::SurfaceLatched(SurfacePose {
@@ -11488,5 +12731,858 @@ mod tests {
             VesselId(0),
             VesselId(2)
         ));
+    }
+    // -----------------------------------------------------------------
+    // M7-A §3.2 — the science model: keyed data inventory, soft cap,
+    // transmission/recovery, and the event-driven lab conversion.
+    // -----------------------------------------------------------------
+
+    /// One-part craft with the M7-A science kit: a 10-unit reusable
+    /// `exp.test` instrument, a `T=5, mult=2, 2-slot` lab, 2 seats, and
+    /// an `electric_charge` tank for transmits.
+    fn science_craft() -> CraftDef {
+        let mut c = box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0);
+        c.parts[0].experiments = vec![csp_phys::ExperimentSpec {
+            kind: ExperimentId::from("exp.test"),
+            data_units: 10.0,
+            reusable: true,
+            situations: csp_data::SituationMask::ALL,
+        }];
+        c.parts[0].lab = Some(csp_phys::LabSpec {
+            throughput_data_per_s: 5.0,
+            multiplier: 2.0,
+            researcher_slots: 2,
+        });
+        c.parts[0].crew_seats = 2;
+        c.parts[0].tanks = vec![csp_phys::TankSpec {
+            resource: ResourceId::from("electric_charge"),
+            capacity: 1e6,
+            mass_per_unit_kg: 0.0,
+        }];
+        c
+    }
+
+    /// `physics_world(false)` + the `exp.test` def (cap 10 units on
+    /// body `p`, ratio 0.4) — the seeded science world.
+    fn science_world() -> World {
+        let mut w = physics_world(false);
+        let def = csp_data::ExperimentDef {
+            schema_version: 1,
+            id: ExperimentId::from("exp.test"),
+            display_name: csp_data::LocKey::from("exp.test.name"),
+            transmit_ratio: 0.4,
+            caps: vec![csp_data::ExperimentCap {
+                body: BodyId::from("p"),
+                situations: csp_data::SituationMask::ALL,
+                cap_data_units: 10.0,
+            }],
+        };
+        w.set_experiments(BTreeMap::from([(ExperimentId::from("exp.test"), def)]));
+        w
+    }
+
+    fn science_key(biome: &str, situation: Situation) -> DataKey {
+        DataKey {
+            experiment: ExperimentId::from("exp.test"),
+            body: BodyId::from("p"),
+            biome: BiomeId::from(biome),
+            situation,
+        }
+    }
+
+    /// Spawn the science craft InBubble 200 km up and board two crew.
+    fn science_vessel(w: &mut World) -> VesselId {
+        enqueue_physical(
+            w,
+            science_craft(),
+            DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0),
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        for _ in 0..2 {
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::BoardCrew {
+                    vessel: VesselId(0),
+                },
+            );
+        }
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        VesselId(0)
+    }
+
+    fn run_experiment(w: &mut World, key: &DataKey) -> AdvanceReport {
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RunExperiment {
+                vessel: VesselId(0),
+                node: csp_phys::PartNodeId(0),
+                experiment: key.experiment.clone(),
+                biome: key.biome.clone(),
+                situation: key.situation,
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        r
+    }
+
+    /// §3.2 collection + soft cap: three runs of 10 units against a
+    /// cap of 10 bank the 63/86/95 cumulative sequence into the pool.
+    #[test]
+    fn run_experiment_soft_cap_diminishes() {
+        let mut w = science_world();
+        science_vessel(&mut w);
+        let key = science_key("plains", Situation::SpaceLow);
+        let mut pooled = Vec::new();
+        for _ in 0..3 {
+            run_experiment(&mut w, &key);
+            pooled.push(w.vessels()[&VesselId(0)].science.units_at(&key));
+        }
+        // cap·(1−e^{−n·k·u/cap}): 6.321…, 8.647…, 9.502….
+        assert!(
+            (pooled[0] - 10.0 * (1.0 - libm::exp(-1.0))).abs() < 1e-9,
+            "{pooled:?}"
+        );
+        assert!(
+            (pooled[1] - 10.0 * (1.0 - libm::exp(-2.0))).abs() < 1e-9,
+            "{pooled:?}"
+        );
+        assert!(
+            (pooled[2] - 10.0 * (1.0 - libm::exp(-3.0))).abs() < 1e-9,
+            "{pooled:?}"
+        );
+        assert_eq!(
+            w.science().keys[&key].collected,
+            pooled[2],
+            "ledger tracks cumulative collection"
+        );
+    }
+
+    /// Situation-mask + non-reusable gates reject cleanly.
+    #[test]
+    fn run_experiment_rejects_bad_context_and_spent() {
+        let mut w = science_world();
+        science_vessel(&mut w);
+        // A situation the module can't run in: craft mask is ALL here,
+        // so spend the part instead — mark it non-reusable.
+        let mut c = science_craft();
+        c.parts[0].experiments[0].reusable = false;
+        // Rebuild the vessel with the one-shot instrument.
+        let mut w2 = science_world();
+        enqueue_physical(&mut w2, c, DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0));
+        w2.step_frame(w2.clock().ticks() + 1).unwrap();
+        let key = science_key("plains", Situation::SpaceLow);
+        w2.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RunExperiment {
+                vessel: VesselId(0),
+                node: csp_phys::PartNodeId(0),
+                experiment: key.experiment.clone(),
+                biome: key.biome.clone(),
+                situation: key.situation,
+            },
+        );
+        w2.step_frame(w2.clock().ticks() + 1).unwrap();
+        // Second run rejects — the module is spent.
+        w2.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RunExperiment {
+                vessel: VesselId(0),
+                node: csp_phys::PartNodeId(0),
+                experiment: key.experiment.clone(),
+                biome: key.biome.clone(),
+                situation: key.situation,
+            },
+        );
+        let r = w2.step_frame(w2.clock().ticks() + 1).unwrap();
+        assert_eq!(r.rejected.len(), 1);
+    }
+
+    /// §3.2 transmission: banks `units·ratio`, drains ElectricCharge,
+    /// flags the key; a recovery afterward pays only the remainder.
+    #[test]
+    fn transmit_ratio_banks_and_marks_key() {
+        let mut w = science_world();
+        science_vessel(&mut w);
+        let key = science_key("plains", Situation::SpaceLow);
+        run_experiment(&mut w, &key);
+        let u = w.vessels()[&VesselId(0)].science.units_at(&key);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::TransmitData {
+                vessel: VesselId(0),
+                key: key.clone(),
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(
+            (w.science_now() - u * 0.4).abs() < 1e-9,
+            "{}",
+            w.science_now()
+        );
+        assert_eq!(w.vessels()[&VesselId(0)].science.units_at(&key), 0.0);
+        assert!(w.science().keys[&key].transmitted);
+        let ec = ResourceId::from("electric_charge");
+        assert!(
+            (transfers::vessel_resource(&w.vessels()[&VesselId(0)], &ec) - (1e6 - u)).abs() < 1e-9
+        );
+
+        // Run again (diminished), then recover aboard a latched vessel:
+        // banks only the 1−ratio remainder and closes the key.
+        run_experiment(&mut w, &key);
+        let u2 = w.vessels()[&VesselId(0)].science.units_at(&key);
+        w.vessels.get_mut(&VesselId(0)).unwrap().state = VesselState::SurfaceLatched(SurfacePose {
+            body: BodyId::from("p"),
+            latitude_rad: 0.0,
+            longitude_rad: 0.0,
+            altitude_m: 0.0,
+            orientation: DQuat::IDENTITY,
+        });
+        let banked = w.science_now();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RecoverData {
+                vessel: VesselId(0),
+                key: key.clone(),
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!((w.science_now() - (banked + u2 * 0.6)).abs() < 1e-9);
+        assert!(w.science().keys[&key].closed);
+        // The closed key refuses further collection.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RunExperiment {
+                vessel: VesselId(0),
+                node: csp_phys::PartNodeId(0),
+                experiment: key.experiment.clone(),
+                biome: key.biome.clone(),
+                situation: key.situation,
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert_eq!(r.rejected.len(), 1);
+    }
+
+    /// §3.2's lab conversion end to end: escrow at start, the
+    /// `ResearchDataExhausted` + `ResearchProjectComplete` pair lands at
+    /// the closed-form-predicted tick (both Clamping), and the whole
+    /// escrow banks.
+    #[test]
+    fn lab_exhausts_at_predicted_tick() {
+        let mut w = science_world();
+        science_vessel(&mut w);
+        let key = science_key("plains", Situation::SpaceLow);
+        run_experiment(&mut w, &key);
+        let d0 = w.vessels()[&VesselId(0)].science.units_at(&key);
+        // R = (3+2)·2 = 10 sci/s, T = 5 data/s — D0 ≈ 6.32 > T, so the
+        // project runs the abundant leg first (boundary crossing).
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::StartResearch {
+                vessel: VesselId(0),
+                lab_node: csp_phys::PartNodeId(0),
+                key: key.clone(),
+                researchers: vec![
+                    ResearcherAssign {
+                        crew: CrewId(0),
+                        skill: 3,
+                    },
+                    ResearcherAssign {
+                        crew: CrewId(1),
+                        skill: 2,
+                    },
+                ],
+            },
+        );
+        // The command drains at the CURRENT tick (the boundary is
+        // pre-advance), so the project stamps `start_tick` = drain tick.
+        let start = w.clock().ticks();
+        let r = w.step_frame(start + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        // Escrowed out of the pool; the project record holds it.
+        assert_eq!(w.vessels()[&VesselId(0)].science.units_at(&key), 0.0);
+        let p = &w.science().projects[&ResearchId(0)];
+        assert_eq!(p.data_start, d0);
+        assert_eq!(p.start_tick, start);
+        // Predicted exhaustion: abundant head then exponential tail —
+        // t = η(D0−T)/R + (ηT/R)·ln(T/ε); R = 10, T = 5, η = 1.
+        let t_s = (d0 - 5.0) / 10.0 + 0.5 * libm::log(5.0 / 1e-6);
+        let expect = start + (t_s * 64.0).ceil() as u64;
+        assert_eq!(p.exhaust_tick, expect, "predicted tick");
+        // Mid-run science accrues through the observer, unbanked.
+        let mid = start + (expect - start) / 2;
+        w.step_frame(mid).unwrap();
+        let live = w.science_now();
+        assert!(live > 0.0 && live < d0, "partial accrual {live}");
+        // Advance past the exhaustion tick — the pair lands in order.
+        let r = w.step_frame(expect).unwrap();
+        let kinds: Vec<&str> = r
+            .fired_events
+            .iter()
+            .map(|e| match &e.kind {
+                EventKind::ResearchDataExhausted { .. } => "exhausted",
+                EventKind::ResearchProjectComplete { .. } => "complete",
+                _ => "other",
+            })
+            .filter(|k| *k != "other")
+            .collect();
+        assert_eq!(kinds, ["exhausted", "complete"]);
+        assert!(
+            r.fired_events
+                .iter()
+                .all(|e| e.class == EventClass::Clamping)
+        );
+        assert!((w.science_now() - d0).abs() < 1e-9, "{}", w.science_now());
+        assert!(w.science().projects.is_empty());
+    }
+
+    /// Scarce-regime exhaust tick — D0 < T is pure exponential, so the
+    /// event fires at `start + ceil((ηT/R)·ln(D0/ε)·64)`.
+    #[test]
+    fn lab_scarce_regime_exhausts() {
+        let mut w = science_world();
+        science_vessel(&mut w);
+        let key = science_key("plains", Situation::SpaceLow);
+        run_experiment(&mut w, &key);
+        let d0 = w.vessels()[&VesselId(0)].science.units_at(&key); // 6.32 > T=5…
+        // Use a high-rate lab: two skill-5 researchers → R = 20, so
+        // D0 < T_eff? No — T is the lab's throughput (5), not R.
+        // Take the scarce regime with a smaller record: transmit first
+        // would flag it; instead make the project's D0 < T by trimming
+        // the pool directly (in-crate state edit — tests may).
+        let v = w.vessels.get_mut(&VesselId(0)).unwrap();
+        v.science.data.values_mut().for_each(|m| {
+            if let Some(u) = m.get_mut(&key) {
+                *u = 2.0;
+            }
+        });
+        let _ = d0;
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::StartResearch {
+                vessel: VesselId(0),
+                lab_node: csp_phys::PartNodeId(0),
+                key: key.clone(),
+                researchers: vec![ResearcherAssign {
+                    crew: CrewId(0),
+                    skill: 5,
+                }],
+            },
+        );
+        let start = w.clock().ticks();
+        w.step_frame(start + 1).unwrap();
+        // R = 5·2 = 10, T = 5, D0 = 2 < T: t = (ηT/R)·ln(D0/ε).
+        let t_s = 0.5 * libm::log(2.0 / 1e-6);
+        let expect = start + (t_s * 64.0).ceil() as u64;
+        assert_eq!(w.science().projects[&ResearchId(0)].exhaust_tick, expect);
+        w.step_frame(expect).unwrap();
+        assert!((w.science_now() - 2.0).abs() < 1e-9, "{}", w.science_now());
+    }
+
+    /// StopResearch banks the accrued fraction and returns the
+    /// unconverted remainder to the pool under the lab node.
+    #[test]
+    fn stop_research_banks_and_returns_data() {
+        let mut w = science_world();
+        science_vessel(&mut w);
+        let key = science_key("plains", Situation::SpaceLow);
+        run_experiment(&mut w, &key);
+        let d0 = w.vessels()[&VesselId(0)].science.units_at(&key);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::StartResearch {
+                vessel: VesselId(0),
+                lab_node: csp_phys::PartNodeId(0),
+                key: key.clone(),
+                researchers: vec![ResearcherAssign {
+                    crew: CrewId(0),
+                    skill: 3,
+                }],
+            },
+        );
+        let start = w.clock().ticks();
+        w.step_frame(start + 1).unwrap();
+        // R = 6, T = 5, D0 ≈ 6.32 > T: the linear head runs to
+        // t_b = η(D0−T)/R ≈ 0.22 s, then decays exponentially — stop
+        // at start + 64 ticks (1 s) lands inside the scarce leg.
+        let stop = start + 64;
+        w.step_frame(stop).unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::StopResearch {
+                project: ResearchId(0),
+            },
+        );
+        w.step_frame(stop + 1).unwrap();
+        assert!(w.science().projects.is_empty());
+        // StopResearch applies at the `stop` drain: elapsed = 1 s.
+        let t_b = (d0 - 5.0) / 6.0;
+        let d_stop = 5.0 * libm::exp(-6.0 * (1.0 - t_b) / 5.0);
+        let expected = d0 - d_stop; // η = 1
+        assert!(
+            (w.science_now() - expected).abs() < 1e-9,
+            "{}",
+            w.science_now()
+        );
+        let rem = w.vessels()[&VesselId(0)].science.units_at(&key);
+        assert!((rem - d_stop).abs() < 1e-9, "remnant {rem}");
+        // And no orphan events remain pending.
+        assert!(w.science().projects.is_empty());
+    }
+
+    /// Interrupt path with a live project (module doc): jettisoning the
+    /// lab node mid-run finalizes the project — science accrued to the
+    /// jettison tick banks, the record and its pending event pair are
+    /// gone, and the escrowed remnant leaves with the part (never
+    /// returns to the retained pool).
+    #[test]
+    fn jettison_lab_mid_research_finalizes() {
+        let mut w = science_world();
+        // Two-node craft: root pod (seats) + lab/instrument part (the
+        // jettisoned node). Node ids 1 (root) and 2 (child) per
+        // `two_node_craft`.
+        let mut craft = two_node_craft();
+        craft.parts[0].crew_seats = 2;
+        craft.parts[1].experiments = vec![csp_phys::ExperimentSpec {
+            kind: ExperimentId::from("exp.test"),
+            data_units: 10.0,
+            reusable: true,
+            situations: csp_data::SituationMask::ALL,
+        }];
+        craft.parts[1].lab = Some(csp_phys::LabSpec {
+            throughput_data_per_s: 5.0,
+            multiplier: 2.0,
+            researcher_slots: 2,
+        });
+        enqueue_physical(&mut w, craft, DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0));
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        for _ in 0..2 {
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::BoardCrew {
+                    vessel: VesselId(0),
+                },
+            );
+        }
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        let key = science_key("plains", Situation::SpaceLow);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RunExperiment {
+                vessel: VesselId(0),
+                node: csp_phys::PartNodeId(2),
+                experiment: key.experiment.clone(),
+                biome: key.biome.clone(),
+                situation: key.situation,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        let d0 = w.vessels()[&VesselId(0)].science.units_at(&key);
+        assert!(d0 > 0.0);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::StartResearch {
+                vessel: VesselId(0),
+                lab_node: csp_phys::PartNodeId(2),
+                key: key.clone(),
+                researchers: vec![ResearcherAssign {
+                    crew: CrewId(0),
+                    skill: 3,
+                }],
+            },
+        );
+        let start = w.clock().ticks();
+        let r = w.step_frame(start + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        // Run ~0.5 s, then jettison the lab node mid-conversion.
+        let jett = start + 32;
+        w.step_frame(jett).unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::JettisonPart {
+                vessel: VesselId(0),
+                node: csp_phys::PartNodeId(2),
+            },
+        );
+        let r = w.step_frame(jett + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        // Finalized: record gone, accrued-to-jett banked (R = 3·2 = 6,
+        // T = 5, η = 1, elapsed = 32/64 = 0.5 s — past the linear head
+        // into the exponential leg).
+        assert!(w.science().projects.is_empty());
+        let expect = d0 - research::data_at(d0, 6.0, 5.0, 1.0, 0.5);
+        assert!(
+            (w.science().banked - expect).abs() < 1e-9,
+            "banked {} vs {expect}",
+            w.science().banked
+        );
+        // The remnant left with the part — nothing returned to the pool.
+        assert_eq!(w.vessels()[&VesselId(0)].science.units_at(&key), 0.0);
+        assert_eq!(w.vessels().len(), 1, "jettison spawns no fragment");
+        // The pending pair was scrubbed, not orphaned.
+        assert!(
+            w.event_heap.iter().all(|e| !matches!(
+                e.kind,
+                EventKind::ResearchDataExhausted { .. } | EventKind::ResearchProjectComplete { .. }
+            )),
+            "orphan research events left pending"
+        );
+    }
+
+    /// The close gate's second-vessel half: recovery closes a key
+    /// *program-wide*, so it refuses while another vessel still pools
+    /// data at it — the stranded units would trip the snapshot gate's
+    /// "pooled data under a closed key" fatal.
+    #[test]
+    fn recover_rejects_while_another_vessel_holds_key() {
+        let mut w = science_world();
+        science_vessel(&mut w); // VesselId(0)
+        // A second identical science vessel shares the key space.
+        enqueue_physical(
+            &mut w,
+            science_craft(),
+            DVec3::new(TERRIN_R + 200_000.0, 50.0, 0.0),
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        let key = science_key("plains", Situation::SpaceLow);
+        // Both vessels collect at the same key.
+        run_experiment(&mut w, &key);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RunExperiment {
+                vessel: VesselId(1),
+                node: csp_phys::PartNodeId(0),
+                experiment: key.experiment.clone(),
+                biome: key.biome.clone(),
+                situation: key.situation,
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        assert!(w.vessels()[&VesselId(1)].science.units_at(&key) > 0.0);
+        // Land vessel 0 and try to recover — refused: vessel 1's pool
+        // would strand under the close.
+        w.vessels.get_mut(&VesselId(0)).unwrap().state = VesselState::SurfaceLatched(SurfacePose {
+            body: BodyId::from("p"),
+            latitude_rad: 0.0,
+            longitude_rad: 0.0,
+            altitude_m: 0.0,
+            orientation: DQuat::IDENTITY,
+        });
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RecoverData {
+                vessel: VesselId(0),
+                key: key.clone(),
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(
+            r.rejected
+                .iter()
+                .any(|(_, e)| *e
+                    == SimError::Recoverable("recover: data at key aboard another vessel")),
+            "{:?}",
+            r.rejected
+        );
+        assert!(!w.science().keys[&key].closed);
+        // Vessel 1 uplinks its record away — the key is then clear for
+        // vessel 0's recovery, which closes it for real.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::TransmitData {
+                vessel: VesselId(1),
+                key: key.clone(),
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RecoverData {
+                vessel: VesselId(0),
+                key: key.clone(),
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        assert!(w.science().keys[&key].closed);
+    }
+
+    /// The exact reachable-unrestorable scenario the close gate exists
+    /// for: collect → start a lab project → re-collect on the reusable
+    /// instrument → land → recover. The recover must refuse while the
+    /// project still holds the key; after `StopResearch` lands the
+    /// remnant back in the *open* pool, recovery closes the key and a
+    /// snapshot+restore round-trips cleanly.
+    #[test]
+    fn recover_rejects_while_project_holds_key() {
+        let mut w = science_world();
+        science_vessel(&mut w);
+        let key = science_key("plains", Situation::SpaceLow);
+        run_experiment(&mut w, &key);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::StartResearch {
+                vessel: VesselId(0),
+                lab_node: csp_phys::PartNodeId(0),
+                key: key.clone(),
+                researchers: vec![ResearcherAssign {
+                    crew: CrewId(0),
+                    skill: 3,
+                }],
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        // Re-collect — the reusable module pools fresh data at the key
+        // while the project still holds its escrow.
+        run_experiment(&mut w, &key);
+        assert!(w.vessels()[&VesselId(0)].science.units_at(&key) > 0.0);
+        // Land and recover — refused: the live project holds the key.
+        w.vessels.get_mut(&VesselId(0)).unwrap().state = VesselState::SurfaceLatched(SurfacePose {
+            body: BodyId::from("p"),
+            latitude_rad: 0.0,
+            longitude_rad: 0.0,
+            altitude_m: 0.0,
+            orientation: DQuat::IDENTITY,
+        });
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RecoverData {
+                vessel: VesselId(0),
+                key: key.clone(),
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(
+            r.rejected
+                .iter()
+                .any(|(_, e)| *e
+                    == SimError::Recoverable("recover: a live project still holds the key")),
+            "{:?}",
+            r.rejected
+        );
+        assert!(!w.science().keys[&key].closed);
+        // Stop the project — the remnant returns to the still-open
+        // pool — and now recovery succeeds and closes the key.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::StopResearch {
+                project: ResearchId(0),
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(w.vessels()[&VesselId(0)].science.units_at(&key) > 0.0);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RecoverData {
+                vessel: VesselId(0),
+                key: key.clone(),
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        assert!(w.science().keys[&key].closed);
+        assert_eq!(w.vessels()[&VesselId(0)].science.units_at(&key), 0.0);
+        // The post-close world round-trips — the state the restore gate
+        // used to meet as "pooled data under a closed key" can no
+        // longer be produced.
+        let snap = w.snapshot().unwrap();
+        World::restore(
+            test_system(),
+            Some(PhysicsConfig {
+                environment: test_env(false),
+                dominant: BodyId::from("p"),
+            }),
+            snap,
+        )
+        .unwrap();
+    }
+
+    /// Defense-in-depth: inject pooled units under a closed key by
+    /// state edit (unreachable through commands now) — StartResearch
+    /// and TransmitData must still refuse to bank on it, and the
+    /// snapshot gate must still fatal on the corrupt state.
+    #[test]
+    fn closed_key_refuses_new_banking() {
+        let mut w = science_world();
+        science_vessel(&mut w);
+        let key = science_key("plains", Situation::SpaceLow);
+        run_experiment(&mut w, &key);
+        // Land + recover — the key closes.
+        w.vessels.get_mut(&VesselId(0)).unwrap().state = VesselState::SurfaceLatched(SurfacePose {
+            body: BodyId::from("p"),
+            latitude_rad: 0.0,
+            longitude_rad: 0.0,
+            altitude_m: 0.0,
+            orientation: DQuat::IDENTITY,
+        });
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RecoverData {
+                vessel: VesselId(0),
+                key: key.clone(),
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(w.science().keys[&key].closed);
+        w.vessels
+            .get_mut(&VesselId(0))
+            .unwrap()
+            .science
+            .data
+            .entry(csp_phys::PartNodeId(0))
+            .or_default()
+            .insert(key.clone(), 1.0);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::StartResearch {
+                vessel: VesselId(0),
+                lab_node: csp_phys::PartNodeId(0),
+                key: key.clone(),
+                researchers: vec![ResearcherAssign {
+                    crew: CrewId(0),
+                    skill: 3,
+                }],
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(
+            r.rejected
+                .iter()
+                .any(|(_, e)| *e == SimError::Recoverable("research: key closed by recovery")),
+            "{:?}",
+            r.rejected
+        );
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::TransmitData {
+                vessel: VesselId(0),
+                key: key.clone(),
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(
+            r.rejected
+                .iter()
+                .any(|(_, e)| *e == SimError::Recoverable("transmit: key closed by recovery")),
+            "{:?}",
+            r.rejected
+        );
+        let snap = w.snapshot().unwrap();
+        assert!(
+            World::restore(
+                test_system(),
+                Some(PhysicsConfig {
+                    environment: test_env(false),
+                    dominant: BodyId::from("p"),
+                }),
+                snap,
+            )
+            .is_err(),
+            "pooled data under a closed key must fail the restore gate"
+        );
+    }
+
+    /// §7.2/§7.5: snapshot mid-research, restore, and the exhaustion
+    /// lands identically — the same hash, the same science.
+    #[test]
+    fn snapshot_restore_mid_research() {
+        let mut w = science_world();
+        science_vessel(&mut w);
+        let key = science_key("plains", Situation::SpaceLow);
+        run_experiment(&mut w, &key);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::StartResearch {
+                vessel: VesselId(0),
+                lab_node: csp_phys::PartNodeId(0),
+                key: key.clone(),
+                researchers: vec![ResearcherAssign {
+                    crew: CrewId(0),
+                    skill: 3,
+                }],
+            },
+        );
+        let start = w.clock().ticks();
+        w.step_frame(start + 1).unwrap();
+        let exhaust = w.science().projects[&ResearchId(0)].exhaust_tick;
+        w.step_frame(start + (exhaust - start) / 2).unwrap();
+        let snap = w.snapshot().unwrap();
+        let hash_mid = w.state_hash().unwrap();
+        let mut r = World::restore(
+            test_system(),
+            Some(PhysicsConfig {
+                environment: test_env(false),
+                dominant: BodyId::from("p"),
+            }),
+            snap,
+        )
+        .unwrap();
+        r.set_experiments(w.experiments().clone());
+        assert_eq!(r.state_hash().unwrap(), hash_mid);
+        w.step_frame(exhaust + 8).unwrap();
+        r.step_frame(exhaust + 8).unwrap();
+        assert_eq!(r.state_hash().unwrap(), w.state_hash().unwrap());
+        assert_eq!(r.science_now(), w.science_now());
+    }
+
+    /// Hash coverage: a world with collected data, banked science, and
+    /// a live project hashes differently from the same world without.
+    #[test]
+    fn state_hash_covers_science() {
+        let mut a = science_world();
+        let mut b = science_world();
+        science_vessel(&mut a);
+        science_vessel(&mut b);
+        assert_eq!(a.state_hash().unwrap(), b.state_hash().unwrap());
+        run_experiment(&mut a, &science_key("plains", Situation::SpaceLow));
+        assert_ne!(a.state_hash().unwrap(), b.state_hash().unwrap());
+        run_experiment(&mut b, &science_key("plains", Situation::SpaceLow));
+        assert_eq!(a.state_hash().unwrap(), b.state_hash().unwrap());
+        // …and a running project distinguishes them again.
+        let key = science_key("plains", Situation::SpaceLow);
+        a.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::StartResearch {
+                vessel: VesselId(0),
+                lab_node: csp_phys::PartNodeId(0),
+                key,
+                researchers: vec![ResearcherAssign {
+                    crew: CrewId(0),
+                    skill: 3,
+                }],
+            },
+        );
+        a.step_frame(a.clock().ticks() + 1).unwrap();
+        assert_ne!(a.state_hash().unwrap(), b.state_hash().unwrap());
     }
 }

@@ -97,7 +97,27 @@ use crate::SimError;
 /// transfer arena. `SimCommand::{TransferResource, TransferCrew,
 /// BoardCrew}` and `EventKind::TransferComplete` land as append-only
 /// enum variants; the goldens rebless.
-pub const HASH_SCHEMA_VERSION: u32 = 10;
+///
+/// **Version 11** (M7-A): `hash_vessel` gained the §3.2 science records
+/// (keyed data pool + spent marks), `hash_craft` gained the resolved
+/// `experiments`/`lab` specs, and the world walk appended the science
+/// config and the science book (banked, ledger, project arena).
+/// `EventKind::{ResearchDataExhausted, ResearchProjectComplete}` land
+/// as append-only discriminants 7–8; the goldens rebless.
+///
+/// **Version 13** (M7-C): the world walk appended the §3.5 economy
+/// book — funds micro-units, the insolvency flag, the crew roster,
+/// the site inventory arena, and the serialized economy tunables
+/// (the ledger inside `EconomyState` is recorded history, never
+/// hashed — the `command_log` precedent); `EventKind` gained
+/// `SalaryDue` (9) and `Insolvent` (10) — new heap entries; and
+/// `hash_craft` walks the frozen `part_costs` table.
+///
+/// **Version 12** (M7-B): the world walk appended the §3.3/§3.4 tech
+/// record — the researched node set, purchased upgrade-track levels,
+/// and family qualification records (`tech::hash_tech`). No variant or
+/// discriminant changes; the goldens rebless.
+pub const HASH_SCHEMA_VERSION: u32 = 13;
 
 /// Rule-7 sum types: the source of an enum's *declared* stable `u16`
 /// discriminant (PLAN §7.1 rule 7).

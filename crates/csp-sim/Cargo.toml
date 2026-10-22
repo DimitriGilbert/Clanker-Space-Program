@@ -19,11 +19,11 @@ libm = { workspace = true }
 # command types via bincode. Serialization never feeds the §7.1 state hash —
 # that is produced by the StateHasher visitor, so serde field order is free.
 serde = { workspace = true, features = ["derive"] }
+# §2.7: the M7-D contract generator consumes csp_core's deterministic
+# streams in shipping code — `RngCore::next_u64` is the draw source.
+rand_core = { workspace = true }
 
 [dev-dependencies]
-# Tests draw seeded permutations from csp_core's own deterministic streams
-# (PLAN §2.7) — never the rand facade.
-rand_core = { workspace = true }
 
 [lints]
 workspace = true

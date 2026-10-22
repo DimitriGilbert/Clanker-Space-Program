@@ -13,7 +13,9 @@
 use serde::{Deserialize, Serialize};
 
 use csp_core::{DVec3, StableDiscriminant};
-use csp_data::{AeroDef, PortSize, ResourceId, StructuralDef, ThermalDef};
+use csp_data::{
+    AeroDef, ExperimentId, PortSize, ResourceId, SituationMask, StructuralDef, ThermalDef,
+};
 
 use crate::tensor::SymMat3;
 
@@ -265,6 +267,48 @@ pub struct WeldPart {
     /// M6-D crew bookkeeping (seat assignment, board/transfer
     /// commands) consumes it. Zero for uncrewed parts.
     pub crew_seats: u32,
+    /// §3.1 `Experiment` resolution: the part's science instruments,
+    /// one entry per `Experiment` module in authored order. Stage 1
+    /// ignores it; the M7 science model (`RunExperiment`, the vessel's
+    /// keyed data pool) consumes it. Empty for a part with no
+    /// `Experiment` modules.
+    pub experiments: Vec<ExperimentSpec>,
+    /// §3.1 `Lab` resolution: the part's data→science converter spec,
+    /// `None` for a part with no `Lab` module (validator: at most one
+    /// per part). Stage 1 ignores it; the M7 research subsystem's
+    /// §3.2 two-regime closed form consumes it.
+    pub lab: Option<LabSpec>,
+}
+
+/// One resolved `Experiment` module (§3.1/§3.2): what one run yields
+/// (`data_units`), whether it can run again (`reusable`), and where it
+/// may run (`situations`). Frozen at resolve like every `WeldPart`
+/// field — the sim's `RunExperiment` apply reads it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExperimentSpec {
+    /// The experiment kind — `data/experiments/<id>.ron` carries the
+    /// caps and transmit ratio for it.
+    pub kind: ExperimentId,
+    /// Data units one run produces (before §3.2 diminishing).
+    pub data_units: f64,
+    /// Whether the module can run again after a collection.
+    pub reusable: bool,
+    /// Where it may run — a §3.2 `SituationMask`, non-empty.
+    pub situations: SituationMask,
+}
+
+/// The resolved `Lab` module (§3.1/§3.2): `T` = `throughput_data_per_s`
+/// bounds the data the lab can feed its researchers per second;
+/// `multiplier` scales `R = Σ skill · multiplier`; `researcher_slots`
+/// bounds the assignment count.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LabSpec {
+    /// `T` in §3.2's `rate(t) = R·min(1, D(t)/T)` — data units/s.
+    pub throughput_data_per_s: f64,
+    /// `lab_multiplier` in `R = Σ_researcher(skill) · lab_multiplier`.
+    pub multiplier: f64,
+    /// Maximum assigned researchers.
+    pub researcher_slots: u32,
 }
 
 #[cfg(test)]

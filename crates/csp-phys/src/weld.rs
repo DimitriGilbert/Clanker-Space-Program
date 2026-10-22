@@ -772,6 +772,8 @@ mod tests {
 
     fn point_part(mass_kg: f64) -> WeldPart {
         WeldPart {
+            experiments: Vec::new(),
+            lab: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -788,6 +790,8 @@ mod tests {
 
     fn box_part(mass_kg: f64, half: DVec3) -> WeldPart {
         WeldPart {
+            experiments: Vec::new(),
+            lab: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,

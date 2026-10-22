@@ -21,7 +21,19 @@ use serde::{Deserialize, Serialize};
 /// Version 4 (M6-D): the §3.5 transfer block — `transfer_radius_m`,
 /// `transfer_rate_units_per_s`, and `crew_transfer_ticks`, the
 /// resource/crew transfer process tunables.
-pub const BALANCE_SCHEMA_VERSION: u32 = 4;
+///
+/// Version 5 (M7-A): the §3.2 science block —
+/// `science_softcap_k`, `research_data_epsilon`,
+/// `lab_science_per_data`, and `transmit_ec_per_data_unit`.
+///
+/// Version 6 (M7-C): the §3.5 economy block — `starting_funds_micros`,
+/// `salary_period_days`, `crew_hire_cost_funds`,
+/// `science_funds_per_point`, `recovery_efficiency`, and
+/// `abandon_recovery`.
+///
+/// Version 7 (M7-D): the §3.6 contract block — `contract_offer_slots`,
+/// the offer-board size the generator maintains.
+pub const BALANCE_SCHEMA_VERSION: u32 = 7;
 
 /// `data/balance.ron` — the tunables every later milestone consumes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -96,4 +108,60 @@ pub struct BalanceDef {
     /// rate for resources only; a fixed traversing delay stands in).
     /// Mirror: `csp_sim::DEFAULT_CREW_TRANSFER_TICKS`.
     pub crew_transfer_ticks: u64,
+    /// §3.2's diminishing-returns constant `k` (≈ 1.0): the soft cap on
+    /// cumulative data per `(experiment, body, biome, situation)` key is
+    /// `yield = (cap − collected)·(1 − exp(−k·run/cap))` — the exact
+    /// integral of the plan's differential form, which reproduces its
+    /// quoted 63%/86%/95% repeat-run sequence for a run of `cap/k`
+    /// units. Mirror: `csp_sim::DEFAULT_SOFTCAP_K`.
+    pub science_softcap_k: f64,
+    /// §3.2's `data_epsilon` (1e-6 data units): a lab project's data is
+    /// exhausted when it drops below this — the finite-time bound that
+    /// makes the scarce-regime exponential ever fire its event.
+    /// Mirror: `csp_sim::DEFAULT_DATA_EPSILON`.
+    pub research_data_epsilon: f64,
+    /// §3.2's `η` — science points produced per data unit a lab
+    /// consumes (`D(t) = D0 − R·t/η` in the abundant regime). Mirror:
+    /// `csp_sim::DEFAULT_SCIENCE_PER_DATA`.
+    pub lab_science_per_data: f64,
+    /// `ElectricCharge` units consumed per data unit transmitted
+    /// (§3.2: "transmitting … consumes `ElectricCharge`" — the plan
+    /// authors no number; this is the tunable). Mirror:
+    /// `csp_sim::DEFAULT_TRANSMIT_EC_PER_UNIT`.
+    pub transmit_ec_per_data_unit: f64,
+    /// §3.5's starting program funds, in micro-funds (1e6 micros = 1
+    /// fund — the sim's integer fund unit; see `csp_sim::economy`'s
+    /// "integer micro-units" note for why funds are not `f64`).
+    /// Mirror: `csp_sim::DEFAULT_STARTING_FUNDS_MICROS`.
+    pub starting_funds_micros: u64,
+    /// §3.5's salary cadence in sim-days — the recurring drain fires
+    /// once per this many sim-days (30 = one sim-month per §3.5's
+    /// "a sim-month is 30 sim-days" for the drain band). Mirror:
+    /// `csp_sim::DEFAULT_SALARY_PERIOD_DAYS`.
+    pub salary_period_days: u64,
+    /// §3.5's hire cost per crew member (funds) — `SimCommand::
+    /// HireCrew`'s debit. Mirror: `csp_sim::DEFAULT_HIRE_COST_FUNDS`.
+    pub crew_hire_cost_funds: f64,
+    /// §3.5's science-milestone payout — funds credited per banked
+    /// science point (the "science milestones ─► funds" edge of the
+    /// economy loop). Mirror:
+    /// `csp_sim::DEFAULT_SCIENCE_FUNDS_PER_POINT`.
+    pub science_funds_per_point: f64,
+    /// §3.5's `recovery_efficiency` — the non-launch site's share of
+    /// a recovered vessel's contents and part value credited to its
+    /// inventory/funds (default 0.9; a launch site always gets 1.0,
+    /// the sim derives it from `SiteDef::launch`). Mirror:
+    /// `csp_sim::DEFAULT_RECOVERY_EFFICIENCY`.
+    pub recovery_efficiency: f64,
+    /// §3.5's `abandon_recovery` (default 0.25, PLAN:1274): the
+    /// share credited when a vessel is recovered with no named site
+    /// (a remote salvage — contents are scrapped in place, only the
+    /// fractional part value pays out). Mirror:
+    /// `csp_sim::DEFAULT_ABANDON_RECOVERY`.
+    pub abandon_recovery: f64,
+    /// §3.6's offer-board size — the number of live contract offers
+    /// the generator maintains (drawing at successive `offer_index`
+    /// counters when the board is short). Mirror:
+    /// `csp_sim::DEFAULT_CONTRACT_BOARD_SIZE`.
+    pub contract_offer_slots: u32,
 }

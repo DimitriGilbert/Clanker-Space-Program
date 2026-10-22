@@ -434,6 +434,46 @@ impl View {
         });
         sim.set_docking_config(csp_sim::DockingConfig::from_balance(&balance));
         sim.set_transfer_config(csp_sim::TransferConfig::from_balance(&balance));
+        // M7-A §3.2: the science tunables and the experiment-def table —
+        // same data-derived wiring (`csp-bench`'s scenario builder does
+        // the identical three calls); without them science commands
+        // would run on the no-data defaults and reject every run.
+        sim.set_science_config(csp_sim::ScienceConfig::from_balance(&balance));
+        let experiments = csp_data::load_experiments(&root.join("experiments"))?;
+        sim.set_experiments(
+            experiments
+                .experiments
+                .iter()
+                .map(|e| (e.def.id.clone(), e.def.clone()))
+                .collect(),
+        );
+        // M7-B §3.3: the merged tech tree — same data-derived wiring;
+        // without it research commands reject with "no tech tree".
+        sim.set_tech_tree(csp_data::load_techtree(&root.join("techtree"))?.merged());
+        // M7-C §3.5: the economy tunables (starting funds, the salary
+        // cadence, hire cost, milestone payout, recovery shares) and
+        // the system's site table — the same data-derived wiring;
+        // without them the funds paths run on the no-data defaults
+        // and `RecoverVessel` has no sites to name.
+        sim.set_economy_config(csp_sim::economy::EconomyConfig::from_balance(&balance));
+        let sites = csp_data::load_sites(&root.join("systems").join("home").join("sites.ron"))?;
+        sim.set_sites(
+            sites
+                .sites
+                .iter()
+                .map(|s| (s.id.clone(), s.clone()))
+                .collect(),
+        );
+        // M7-D §3.6: the contract template table + the board-size
+        // tunable — the same data-derived wiring.
+        sim.set_contracts(
+            csp_data::load_contracts(&root.join("contracts"))?
+                .by_id()
+                .into_iter()
+                .map(|(id, def)| (id, def.clone()))
+                .collect(),
+        );
+        sim.set_contract_config(csp_sim::ContractConfig::from_balance(&balance));
         let mut view = Self::with_sim(sim);
         // M3 VAB: the part catalog + resource registry are data-derived
         // constants for the session model (like BodyTable — §7.3's
@@ -829,12 +869,18 @@ impl View {
                 return Some(stock_flight_craft());
             }
             let (graph, _built) = session.to_part_graph().ok()?;
-            let parts: Vec<csp_phys::WeldPart> = analysis?
+            let analysis = analysis?;
+            let parts: Vec<csp_phys::WeldPart> = analysis
                 .effective
                 .iter()
                 .map(|e| e.weld_input.clone())
                 .collect();
-            Some(csp_sim::CraftDef { graph, parts })
+            let part_costs: Vec<f64> = analysis.effective.iter().map(|e| e.cost_funds).collect();
+            Some(csp_sim::CraftDef {
+                graph,
+                parts,
+                part_costs,
+            })
         })();
         let Some(craft) = craft_def else { return };
         let Some(env) = self.sim.environment() else {
@@ -920,6 +966,8 @@ impl Default for View {
 fn stock_flight_craft() -> csp_sim::CraftDef {
     use csp_phys::{ForceSite, ForceSiteKind, PartGraph, PartNode, PartNodeId, PartTransform};
     let mk = |mass: f64, half: f64, len: f64| csp_phys::WeldPart {
+        experiments: Vec::new(),
+        lab: None,
         dock_ports: vec![],
         tanks: vec![],
         crew_seats: 0,
@@ -1005,6 +1053,10 @@ fn stock_flight_craft() -> csp_sim::CraftDef {
     csp_sim::CraftDef {
         graph,
         parts: vec![engine, adapter, tank, pod],
+        // M7-C: the stock craft's authored build cost — a modest
+        // starter craft's price tag (the VAB path reads real resolved
+        // `cost_funds`; this debug craft authors its own).
+        part_costs: vec![12_000.0, 800.0, 4_000.0, 9_000.0],
     }
 }
 

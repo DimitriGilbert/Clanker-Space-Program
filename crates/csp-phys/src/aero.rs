@@ -1405,6 +1405,8 @@ mod tests {
 
     fn box_part(mass_kg: f64, half: DVec3, com: DVec3) -> WeldPart {
         WeldPart {
+            experiments: Vec::new(),
+            lab: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -1615,6 +1617,8 @@ mod tests {
             }
         }
         let p = WeldPart {
+            experiments: Vec::new(),
+            lab: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -1838,6 +1842,8 @@ mod tests {
             (800.0, 50.0)
         };
         let nose = WeldPart {
+            experiments: Vec::new(),
+            lab: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -1853,6 +1859,8 @@ mod tests {
             thermal: test_thermal(),
         };
         let tail = WeldPart {
+            experiments: Vec::new(),
+            lab: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,

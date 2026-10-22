@@ -333,6 +333,66 @@ pub struct ThrottleRange {
     pub max: f64,
 }
 
+/// §3.2's six situations — the `situation` leg of the
+/// `(body, biome, situation)` science key. "KSP-proven granularity; do
+/// not invent more" (§3.2). Discriminants are explicit, stable,
+/// append-only — the sim's `DataKey` hashes them (§7.1 rule 7), and
+/// each discriminant is also its [`SituationMask`] bit index, so the
+/// enum and the mask can never drift apart.
+#[repr(u16)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Situation {
+    /// On the solid surface.
+    Landed = 0,
+    /// On the ocean.
+    Splashed = 1,
+    /// Airborne below the flying-low/flying-high split.
+    FlyingLow = 2,
+    /// Airborne above it.
+    FlyingHigh = 3,
+    /// In the body's low-space band.
+    SpaceLow = 4,
+    /// In high space.
+    SpaceHigh = 5,
+}
+
+impl Situation {
+    /// The situation's [`SituationMask`] bit.
+    pub fn mask(self) -> SituationMask {
+        SituationMask(1 << (self as u8))
+    }
+
+    /// Stable name for diagnostics.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Landed => "landed",
+            Self::Splashed => "splashed",
+            Self::FlyingLow => "flying_low",
+            Self::FlyingHigh => "flying_high",
+            Self::SpaceLow => "space_low",
+            Self::SpaceHigh => "space_high",
+        }
+    }
+
+    /// The situations whose contexts are on or just above the surface —
+    /// residence sanity for the sim's `RunExperiment` apply: a
+    /// `Landed`/`Splashed`/`FlyingLow`/`FlyingHigh` claim needs a
+    /// body-adjacent residence (in-bubble or surface-latched), never
+    /// pure rails.
+    pub fn is_surface_side(self) -> bool {
+        matches!(
+            self,
+            Self::Landed | Self::Splashed | Self::FlyingLow | Self::FlyingHigh
+        )
+    }
+}
+
+impl csp_core::StableDiscriminant for Situation {
+    fn discriminant(&self) -> u16 {
+        *self as u16
+    }
+}
+
 /// §3.2's six situations as a bitmask over `u8` — `Experiment`
 /// modules declare where they may run. Transparent serde: files spell
 /// it as an integer mask, which keeps the RON terse and the bincode
@@ -354,11 +414,42 @@ impl SituationMask {
     pub const SPACE_LOW: Self = Self(1 << 4);
     /// `SpaceHigh` bit.
     pub const SPACE_HIGH: Self = Self(1 << 5);
+    /// Every situation set — convenience for `ExperimentDef` cap entries
+    /// that apply body-wide.
+    pub const ALL: Self = Self(
+        Self::LANDED.0
+            | Self::SPLASHED.0
+            | Self::FLYING_LOW.0
+            | Self::FLYING_HIGH.0
+            | Self::SPACE_LOW.0
+            | Self::SPACE_HIGH.0,
+    );
 
     /// True when no situation bit is set — the validator rejects an
     /// experiment that can run nowhere.
     pub fn is_empty(self) -> bool {
         self.0 == 0
+    }
+
+    /// Whether `situation`'s bit is set.
+    pub fn contains(self, situation: Situation) -> bool {
+        self.0 & situation.mask().0 != 0
+    }
+
+    /// The set bits as a [`Situation`] list, ascending — the canonical
+    /// enumeration for iteration (determinism domain).
+    pub fn situations(self) -> Vec<Situation> {
+        [
+            Situation::Landed,
+            Situation::Splashed,
+            Situation::FlyingLow,
+            Situation::FlyingHigh,
+            Situation::SpaceLow,
+            Situation::SpaceHigh,
+        ]
+        .into_iter()
+        .filter(|s| self.contains(*s))
+        .collect()
     }
 }
 
@@ -688,4 +779,53 @@ pub struct PartDef {
     /// with the tree loader — the §3.3 rule "every part reachable" runs
     /// there, where the full set exists.
     pub tech_requirement: TechNodeId,
+}
+
+impl StatPath {
+    /// The authored base value this path reads on `def` — `None` when
+    /// the def does not carry the stat (a `ThrustVacN` on a part with
+    /// no `Engine` module), which is also the §3.1 "the path resolves
+    /// on this def" predicate: `base_value(def).is_some()`.
+    ///
+    /// Consumers: the resolver's stat-path reachability gate
+    /// (`csp_phys::resolve`), the tech-tree validator ("every part in a
+    /// tracked family resolves the track's `stat_path`"), and the
+    /// manufacture-time composition of `Delta` upgrade levels —
+    /// `(base + Σ deltas) / base` is evaluated against exactly this
+    /// authored base.
+    ///
+    /// Convention for module stats: the *first* matching module's
+    /// authored field. The part validator forbids multiple `Engine`
+    /// modules, so engine paths are unambiguous; a part with several
+    /// `Control` modules takes the first's `torque_nm` as its delta
+    /// base (documented — deltas are an authored convention, and the
+    /// family-stat validator's coverage rule is what keeps them sane).
+    pub fn base_value(self, def: &PartDef) -> Option<f64> {
+        match self {
+            Self::MassDryKg => Some(def.mass_dry_kg),
+            Self::CostFunds => Some(def.cost_funds),
+            Self::BaseMtbfS => Some(def.reliability.base_mtbf_s),
+            Self::ThrustVacN | Self::IspVacS | Self::IspSlS | Self::RatedBurnS => {
+                def.modules.iter().find_map(|m| match m {
+                    ModuleDef::Engine {
+                        thrust_vac_n,
+                        isp_vac_s,
+                        isp_sl_s,
+                        rated_burn_s,
+                        ..
+                    } => Some(match self {
+                        Self::ThrustVacN => *thrust_vac_n,
+                        Self::IspVacS => *isp_vac_s,
+                        Self::IspSlS => *isp_sl_s,
+                        _ => *rated_burn_s,
+                    }),
+                    _ => None,
+                })
+            }
+            Self::ControlTorqueNm => def.modules.iter().find_map(|m| match m {
+                ModuleDef::Control { torque_nm, .. } => Some(*torque_nm),
+                _ => None,
+            }),
+        }
+    }
 }

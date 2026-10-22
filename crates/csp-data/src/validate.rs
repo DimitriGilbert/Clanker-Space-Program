@@ -49,7 +49,9 @@ use crate::load::{LoadedPart, LoadedParts, LoadedSystem};
 use crate::loc::LocFile;
 use crate::part::{ColliderDef, ModuleDef, PART_SCHEMA_VERSION, PartCategory, PartDef, ScaleRule};
 use crate::resource::{RESOURCE_SCHEMA_VERSION, ResourceFile};
+use crate::site::SiteFile;
 use crate::system::SCHEMA_VERSION;
+use crate::techtree::{TechNode, UpgradeTrack};
 
 /// Relative tolerance for the §3.0 period-consistency rule:
 /// `|T_authored − 2π√(a³/μ_parent)| / T_computed ≤ PERIOD_REL_TOL`.
@@ -406,6 +408,110 @@ pub enum ValidationError {
         /// Why it failed (stable reason token).
         reason: &'static str,
     },
+    /// An `data/experiments/*.ron` def failed a §3.2 rule.
+    BadExperiment {
+        /// The experiment def at fault.
+        experiment: String,
+        /// Why it failed (stable reason token).
+        reason: &'static str,
+    },
+    // ---- contracts (§3.6) ----
+    /// A `data/contracts/*.ron` template failed a §3.6 rule.
+    BadContract {
+        /// The template at fault.
+        contract: String,
+        /// Why it failed (stable reason token).
+        reason: &'static str,
+    },
+    /// A tech node's `unlocks.contract_types` names a template that
+    /// does not exist among the authored contracts.
+    UnknownContractType {
+        /// The tech node carrying the dangling unlock.
+        node: String,
+        /// The missing contract-type ID.
+        contract_type: String,
+    },
+    // ---- tech tree (§3.3) ----
+    /// Two `data/techtree/**` files declare the same node `id`.
+    DuplicateTechNodeId {
+        /// The duplicated ID.
+        id: String,
+    },
+    /// Two `data/techtree/**` files declare the same track `id`.
+    DuplicateUpgradeTrackId {
+        /// The duplicated ID.
+        id: String,
+    },
+    /// A node's `requires` names a node absent from the merged tree.
+    UnknownTechPrerequisite {
+        /// The node with the dangling prerequisite.
+        node: String,
+        /// The missing prerequisite ID.
+        prerequisite: String,
+    },
+    /// Following `requires` edges returns to a visited node — §3.3
+    /// "no cycles".
+    TechCycle {
+        /// A node on the cycle.
+        node: String,
+    },
+    /// A node's `science_cost` is lower than one of its
+    /// prerequisites' — §3.3 "every node's cost monotonic in depth"
+    /// (non-decreasing along every `requires` edge).
+    TechCostNotMonotonic {
+        /// The cheaper node.
+        node: String,
+        /// The prerequisite it undercuts.
+        prerequisite: String,
+    },
+    /// A node is malformed beyond the dedicated variants: non-finite
+    /// or negative `science_cost`, a duplicated prerequisite, a
+    /// duplicated grant, a grant level of 0 or above the track's
+    /// authored length, an empty/unresolvable id field.
+    BadTechNode {
+        /// The node at fault.
+        node: String,
+        /// Why it failed (stable reason token).
+        reason: &'static str,
+    },
+    /// A node's `track_levels` grant names a track absent from the
+    /// merged tree.
+    UnknownUpgradeTrack {
+        /// The node carrying the bad grant.
+        node: String,
+        /// The missing track ID.
+        track: String,
+    },
+    /// An `UpgradeTrack` is malformed: empty `levels`, a non-finite or
+    /// negative `science_cost`, an out-of-band effect, a duplicated
+    /// `(family, stat_path)`, a family no part belongs to, a
+    /// `stat_path` some family part cannot resolve, or more than
+    /// `u8::MAX` levels.
+    BadUpgradeTrack {
+        /// The track at fault.
+        track: String,
+        /// Why it failed (stable reason token).
+        reason: &'static str,
+    },
+    /// A part's `tech_requirement` names a node absent from the merged
+    /// tree — §3.3 "every part reachable": a def gated on a
+    /// nonexistent node can never be manufactured.
+    UnknownTechRequirement {
+        /// The unreachable part.
+        part: String,
+        /// The node it names.
+        tech: String,
+    },
+    /// A `sites.ron` site entry is malformed: duplicate id, a body
+    /// the system does not declare, a non-finite or out-of-range
+    /// geocentric pose, or a second launch site on one body.
+    InvalidSite {
+        /// The site id the rule fired on (or the empty string for
+        /// file-level rules).
+        id: String,
+        /// What is wrong with it.
+        reason: String,
+    },
 }
 
 impl fmt::Display for ValidationError {
@@ -592,6 +698,70 @@ impl ValidationError {
             ),
             Self::BadResourceTable { reason } => {
                 write!(f, "resources.ron: {reason}")
+            }
+            Self::BadExperiment { experiment, reason } => {
+                write!(f, "{experiment:?}: experiment: {reason}")
+            }
+            Self::BadContract { contract, reason } => {
+                write!(f, "{contract:?}: contract: {reason}")
+            }
+            Self::UnknownContractType {
+                node,
+                contract_type,
+            } => write!(
+                f,
+                "{node:?}: unlocks contract type {contract_type:?} but no template declares it"
+            ),
+            _ => self.fmt_tech(f),
+        }
+    }
+
+    /// Display for the §3.3 tech-tree variants — split from
+    /// [`fmt_part`] for the same readability reason. The `_` arm is
+    /// unreachable: only tech variants route here.
+    fn fmt_tech(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateTechNodeId { id } => {
+                write!(f, "duplicate tech node id {id:?}")
+            }
+            Self::DuplicateUpgradeTrackId { id } => {
+                write!(f, "duplicate upgrade track id {id:?}")
+            }
+            Self::UnknownTechPrerequisite { node, prerequisite } => {
+                write!(
+                    f,
+                    "{node:?}: prerequisite {prerequisite:?} is not in the tree"
+                )
+            }
+            Self::TechCycle { node } => {
+                write!(f, "{node:?}: requires chain cycles back")
+            }
+            Self::TechCostNotMonotonic { node, prerequisite } => {
+                write!(
+                    f,
+                    "{node:?}: science_cost below prerequisite {prerequisite:?}'s (cost must be monotonic in depth)"
+                )
+            }
+            Self::BadTechNode { node, reason } => {
+                write!(f, "{node:?}: tech node: {reason}")
+            }
+            Self::UnknownUpgradeTrack { node, track } => {
+                write!(
+                    f,
+                    "{node:?}: track_levels grant {track:?} is not in the tree"
+                )
+            }
+            Self::BadUpgradeTrack { track, reason } => {
+                write!(f, "{track:?}: upgrade track: {reason}")
+            }
+            Self::InvalidSite { id, reason } => {
+                write!(f, "site {id:?}: {reason}")
+            }
+            Self::UnknownTechRequirement { part, tech } => {
+                write!(
+                    f,
+                    "{part:?}: tech_requirement {tech:?} is not in the tree — part unreachable"
+                )
             }
             _ => Ok(()),
         }
@@ -1090,6 +1260,67 @@ pub fn validate_resources(res: &ResourceFile) -> Vec<ValidationError> {
                 part: "resources.ron".to_string(),
                 field: "mass_per_unit_kg",
                 value: r.mass_per_unit_kg,
+            });
+        }
+    }
+    out
+}
+
+/// §3.5's `sites.ron` checks: `schema_version`, unique ids, every
+/// site on a declared system body, a finite in-range geocentric pose,
+/// and at most one launch site per body (§3.5's "1.0 at the launch
+/// site" needs a definite site to mean it).
+pub fn validate_sites(file: &SiteFile, sys: &LoadedSystem) -> Vec<ValidationError> {
+    let mut out = Vec::new();
+    if file.schema_version != crate::site::SITE_SCHEMA_VERSION {
+        out.push(ValidationError::SchemaVersion {
+            file: "sites.ron".to_string(),
+            found: file.schema_version,
+        });
+    }
+    let bodies: BTreeSet<&str> = sys.bodies.iter().map(|b| b.def.id.as_str()).collect();
+    let mut seen = BTreeSet::new();
+    let mut launch_bodies = BTreeSet::new();
+    let half_pi = core::f64::consts::FRAC_PI_2;
+    for s in &file.sites {
+        let id = s.id.as_str();
+        if !seen.insert(id) {
+            out.push(ValidationError::InvalidSite {
+                id: id.to_string(),
+                reason: "duplicate site id".to_string(),
+            });
+        }
+        if !bodies.contains(s.body.as_str()) {
+            out.push(ValidationError::InvalidSite {
+                id: id.to_string(),
+                reason: format!("body {:?} not in this system", s.body.as_str()),
+            });
+        }
+        if !(s.latitude_rad.is_finite() && s.latitude_rad.abs() <= half_pi) {
+            out.push(ValidationError::InvalidSite {
+                id: id.to_string(),
+                reason: "latitude out of [-pi/2, pi/2] or non-finite".to_string(),
+            });
+        }
+        if !s.longitude_rad.is_finite() {
+            out.push(ValidationError::InvalidSite {
+                id: id.to_string(),
+                reason: "longitude non-finite".to_string(),
+            });
+        }
+        if !(s.altitude_m.is_finite() && s.altitude_m >= 0.0) {
+            out.push(ValidationError::InvalidSite {
+                id: id.to_string(),
+                reason: "altitude negative or non-finite".to_string(),
+            });
+        }
+        if s.launch && !launch_bodies.insert(s.body.as_str()) {
+            out.push(ValidationError::InvalidSite {
+                id: id.to_string(),
+                reason: format!(
+                    "second launch site on {:?} — one launch site per body",
+                    s.body.as_str()
+                ),
             });
         }
     }
@@ -1891,6 +2122,640 @@ pub fn validate_part_loc_keys(
 
 // §2.13's no-panic rule covers shipping fallible paths; tests signal
 // failure by panicking anyway, so unwrap/expect are allowed here.
+/// The §3.2 experiment-def rules over `data/experiments/`: `id` ↔
+/// file-stem agreement, unique IDs, `transmit_ratio` inside the authored
+/// `(0.2, 1.0]` band, caps finite and positive with non-overlapping
+/// `(body, situation)` coverage. Typed error list like every validator
+/// here — never asserts.
+pub fn validate_experiments(loaded: &crate::load::LoadedExperiments) -> Vec<ValidationError> {
+    let mut out = Vec::new();
+    let mut seen_ids = BTreeSet::new();
+    for le in &loaded.experiments {
+        let d = &le.def;
+        let stem = le
+            .path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if stem != d.id.as_str() {
+            out.push(ValidationError::BadExperiment {
+                experiment: d.id.as_str().to_string(),
+                reason: "experiment id does not match file stem",
+            });
+        }
+        if !seen_ids.insert(d.id.clone()) {
+            out.push(ValidationError::BadExperiment {
+                experiment: d.id.as_str().to_string(),
+                reason: "duplicate experiment id",
+            });
+        }
+        if !(d.transmit_ratio.is_finite() && d.transmit_ratio >= 0.2 && d.transmit_ratio <= 1.0) {
+            out.push(ValidationError::BadExperiment {
+                experiment: d.id.as_str().to_string(),
+                reason: "transmit_ratio outside the authored 0.2-1.0 band",
+            });
+        }
+        let mut covered: BTreeSet<(&str, crate::part::Situation)> = BTreeSet::new();
+        for cap in &d.caps {
+            if cap.situations.is_empty() {
+                out.push(ValidationError::BadExperiment {
+                    experiment: d.id.as_str().to_string(),
+                    reason: "cap entry covers no situations",
+                });
+            }
+            if !(cap.cap_data_units.is_finite() && cap.cap_data_units > 0.0) {
+                out.push(ValidationError::BadExperiment {
+                    experiment: d.id.as_str().to_string(),
+                    reason: "cap_data_units not positive and finite",
+                });
+            }
+            for s in cap.situations.situations() {
+                if !covered.insert((cap.body.as_str(), s)) {
+                    out.push(ValidationError::BadExperiment {
+                        experiment: d.id.as_str().to_string(),
+                        reason: "overlapping (body, situation) cap entries",
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+// ---------- tech tree (§3.3) ----------
+
+/// §3.3's tree rules over the merged `data/techtree/` set, checked
+/// against the loaded parts (the "every part reachable" half needs the
+/// `tech_requirement` edges only `LoadedParts` carries):
+///
+/// - `schema_version` current on every fragment;
+/// - node/track ids unique and well-formed;
+/// - `science_cost` finite and ≥ 0; `requires` resolvable, deduplicated,
+///   and cost-monotonic per edge (`node.cost ≥ prereq.cost` — §3.3's
+///   "cost monotonic in depth", read non-decreasing so equal-cost tiers
+///   stay legal);
+/// - **no cycles** — a `requires` walk never revisits a node;
+/// - every grant names a real track with a cap inside
+///   `1..=track.levels.len()`, no track granted twice on one node;
+/// - track shape: non-empty levels, `science_cost` finite ≥ 0,
+///   `Multiplier` finite > 0, `Delta` finite, `len ≤ u8::MAX`
+///   (grant/state counters are `u8`), `(family, stat_path)` unique;
+/// - every track's family has ≥ 1 part and its `stat_path` resolves on
+///   **every** part of the family — a frozen upgrade the resolver
+///   cannot reach is a `ResolveError`, so authoring must guarantee
+///   reachability ahead of manufacture;
+/// - **every part reachable** — each `PartDef::tech_requirement` names
+///   a node in the tree.
+pub fn validate_techtree(
+    loaded: &crate::load::LoadedTechTree,
+    parts: &LoadedParts,
+) -> Vec<ValidationError> {
+    let mut out = Vec::new();
+    // Pass 1: identity + shape — the id → def maps every later pass
+    // checks references against (a fragment may reference nodes
+    // authored in a *different* file).
+    let (node_ids, track_ids) = tree_identity(loaded, &mut out);
+    check_tree_nodes(&node_ids, &track_ids, &mut out);
+    check_tree_cycles(&node_ids, &mut out);
+    check_tree_tracks(&track_ids, parts, &mut out);
+    // §3.3 "every part reachable" — each part's `tech_requirement`
+    // must name a node in the merged tree.
+    for p in &parts.parts {
+        if !node_ids.contains_key(p.def.tech_requirement.as_str()) {
+            out.push(ValidationError::UnknownTechRequirement {
+                part: p.def.id.as_str().to_string(),
+                tech: p.def.tech_requirement.as_str().to_string(),
+            });
+        }
+    }
+    out
+}
+
+/// Pass 1 — schema versions, id well-formedness, duplicate ids.
+/// Returns the merged `id → def` maps the reference passes consume.
+fn tree_identity<'a>(
+    loaded: &'a crate::load::LoadedTechTree,
+    out: &mut Vec<ValidationError>,
+) -> (
+    BTreeMap<&'a str, &'a TechNode>,
+    BTreeMap<&'a str, &'a UpgradeTrack>,
+) {
+    let mut node_ids = BTreeMap::new();
+    let mut track_ids = BTreeMap::new();
+    for f in &loaded.trees {
+        if f.def.schema_version != crate::techtree::TECHTREE_SCHEMA_VERSION {
+            out.push(ValidationError::SchemaVersion {
+                file: format!("techtree/{}", f.path.display()),
+                found: f.def.schema_version,
+            });
+        }
+        for n in &f.def.nodes {
+            let id = n.id.as_str();
+            check_id(id, out);
+            if node_ids.insert(id, n).is_some() {
+                out.push(ValidationError::DuplicateTechNodeId { id: id.to_string() });
+            }
+        }
+        for t in &f.def.tracks {
+            let id = t.id.as_str();
+            check_id(id, out);
+            if track_ids.insert(id, t).is_some() {
+                out.push(ValidationError::DuplicateUpgradeTrackId { id: id.to_string() });
+            }
+        }
+    }
+    (node_ids, track_ids)
+}
+
+/// Pass 2 — node shape: `science_cost` finite ≥ 0, `requires`
+/// resolvable/deduplicated/cost-monotonic, grant refs and caps.
+fn check_tree_nodes(
+    node_ids: &BTreeMap<&str, &TechNode>,
+    track_ids: &BTreeMap<&str, &UpgradeTrack>,
+    out: &mut Vec<ValidationError>,
+) {
+    for (&id, n) in node_ids {
+        if !(n.science_cost.is_finite() && n.science_cost >= 0.0) {
+            out.push(ValidationError::BadTechNode {
+                node: id.to_string(),
+                reason: "science_cost is not finite and >= 0",
+            });
+        }
+        let mut prereqs = BTreeSet::new();
+        for r in &n.requires {
+            if !prereqs.insert(r.as_str()) {
+                out.push(ValidationError::BadTechNode {
+                    node: id.to_string(),
+                    reason: "duplicate prerequisite",
+                });
+            }
+            match node_ids.get(r.as_str()) {
+                None => out.push(ValidationError::UnknownTechPrerequisite {
+                    node: id.to_string(),
+                    prerequisite: r.as_str().to_string(),
+                }),
+                Some(p) => {
+                    if n.science_cost.is_finite()
+                        && p.science_cost.is_finite()
+                        && n.science_cost < p.science_cost
+                    {
+                        out.push(ValidationError::TechCostNotMonotonic {
+                            node: id.to_string(),
+                            prerequisite: r.as_str().to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        let mut granted = BTreeSet::new();
+        for (track, cap) in &n.unlocks.track_levels {
+            if !granted.insert(track.as_str()) {
+                out.push(ValidationError::BadTechNode {
+                    node: id.to_string(),
+                    reason: "track granted twice on one node",
+                });
+            }
+            match track_ids.get(track.as_str()) {
+                None => out.push(ValidationError::UnknownUpgradeTrack {
+                    node: id.to_string(),
+                    track: track.as_str().to_string(),
+                }),
+                Some(t) => {
+                    if *cap == 0 {
+                        out.push(ValidationError::BadTechNode {
+                            node: id.to_string(),
+                            reason: "track_levels grant of 0 unlocks nothing",
+                        });
+                    } else if usize::from(*cap) > t.levels.len() {
+                        out.push(ValidationError::BadTechNode {
+                            node: id.to_string(),
+                            reason: "track_levels grant exceeds the track's authored levels",
+                        });
+                    }
+                }
+            }
+        }
+        for f_id in &n.unlocks.facilities {
+            check_id(f_id.as_str(), out);
+        }
+        for c_id in &n.unlocks.contract_types {
+            check_id(c_id.as_str(), out);
+        }
+    }
+}
+
+/// Pass 3 — cycles: iterative DFS over `requires` edges. `done`
+/// marks fully-explored nodes, `visiting` the current DFS path;
+/// a `requires` edge landing on a `visiting` node is a cycle.
+/// Missing refs were already reported; the walk skips them (a
+/// dangling edge cannot close a loop).
+fn check_tree_cycles(node_ids: &BTreeMap<&str, &TechNode>, out: &mut Vec<ValidationError>) {
+    let mut done: BTreeSet<&str> = BTreeSet::new();
+    for &id in node_ids.keys() {
+        // `stack` is the current DFS path; `visiting` its membership.
+        let mut stack: Vec<&str> = vec![id];
+        let mut visiting: BTreeSet<&str> = [id].into_iter().collect();
+        while let Some(&cur) = stack.last() {
+            if done.contains(cur) {
+                stack.pop();
+                visiting.remove(cur);
+                continue;
+            }
+            let mut advanced = false;
+            for r in &node_ids[cur].requires {
+                let rid = r.as_str();
+                if visiting.contains(rid) {
+                    out.push(ValidationError::TechCycle {
+                        node: rid.to_string(),
+                    });
+                    continue;
+                }
+                if node_ids.contains_key(rid) && !done.contains(rid) {
+                    stack.push(rid);
+                    visiting.insert(rid);
+                    advanced = true;
+                    break;
+                }
+            }
+            if !advanced {
+                done.insert(cur);
+                stack.pop();
+                visiting.remove(cur);
+            }
+        }
+    }
+}
+
+/// Pass 4 — track shape + family coverage: `(family, stat_path)`
+/// unique, non-empty sane levels, ≥ 1 part in the family, and the
+/// `stat_path` resolving on *every* family part.
+fn check_tree_tracks(
+    track_ids: &BTreeMap<&str, &UpgradeTrack>,
+    parts: &LoadedParts,
+    out: &mut Vec<ValidationError>,
+) {
+    let mut family_stat: BTreeSet<(&str, crate::part::StatPath)> = BTreeSet::new();
+    for (&id, t) in track_ids {
+        if !family_stat.insert((t.family.as_str(), t.stat_path)) {
+            out.push(ValidationError::BadUpgradeTrack {
+                track: id.to_string(),
+                reason: "duplicate (family, stat_path) across tracks",
+            });
+        }
+        check_id(t.family.as_str(), out);
+        if t.levels.is_empty() {
+            out.push(ValidationError::BadUpgradeTrack {
+                track: id.to_string(),
+                reason: "no levels authored",
+            });
+        }
+        if t.levels.len() > u8::MAX as usize {
+            out.push(ValidationError::BadUpgradeTrack {
+                track: id.to_string(),
+                reason: "more levels than the u8 level counter can hold",
+            });
+        }
+        for l in &t.levels {
+            if !(l.science_cost.is_finite() && l.science_cost >= 0.0) {
+                out.push(ValidationError::BadUpgradeTrack {
+                    track: id.to_string(),
+                    reason: "level science_cost is not finite and >= 0",
+                });
+            }
+            match l.multiplier_or_delta {
+                crate::techtree::UpgradeEffect::Multiplier(m) if !(m.is_finite() && m > 0.0) => {
+                    out.push(ValidationError::BadUpgradeTrack {
+                        track: id.to_string(),
+                        reason: "Multiplier effect is not finite and > 0",
+                    });
+                }
+                crate::techtree::UpgradeEffect::Delta(d) if !d.is_finite() => {
+                    out.push(ValidationError::BadUpgradeTrack {
+                        track: id.to_string(),
+                        reason: "Delta effect is not finite",
+                    });
+                }
+                _ => {}
+            }
+        }
+        let mut in_family = 0usize;
+        for p in &parts.parts {
+            if p.def.family == t.family {
+                in_family += 1;
+                if t.stat_path.base_value(&p.def).is_none() {
+                    out.push(ValidationError::BadUpgradeTrack {
+                        track: id.to_string(),
+                        reason: "stat_path does not resolve on a part of the family",
+                    });
+                }
+            }
+        }
+        if in_family == 0 {
+            out.push(ValidationError::BadUpgradeTrack {
+                track: id.to_string(),
+                reason: "family has no parts",
+            });
+        }
+    }
+}
+
+/// Loc resolution for the tech tree (the
+/// [`validate_part_loc_keys`] pattern): every node/track display name
+/// and node description must resolve in `en.ron`.
+pub fn validate_techtree_loc_keys(
+    loaded: &crate::load::LoadedTechTree,
+    loc: &LocFile,
+) -> Vec<ValidationError> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut check = |context: String, key: &LocKey| {
+        if seen.insert(key.as_str().to_string()) && !loc.contains(key) {
+            out.push(ValidationError::UnresolvedLocKey {
+                context,
+                key: key.as_str().to_string(),
+            });
+        }
+    };
+    for f in &loaded.trees {
+        for n in &f.def.nodes {
+            check(format!("techtree node {}", n.id), &n.display_name);
+            check(format!("techtree node {}", n.id), &n.description);
+        }
+        for t in &f.def.tracks {
+            check(format!("techtree track {}", t.id), &t.display_name);
+        }
+    }
+    out
+}
+
+// ---------- contracts (§3.6) ----------
+
+/// One template's `generate.space` vs the system body + experiment
+/// id sets — extracted from [`validate_contracts`] for the line
+/// budget. `bad` stamps the template's error variant.
+fn validate_contract_space(
+    cid: &str,
+    kind: &crate::contract::ContractKind,
+    space: &crate::contract::ContractParamSpace,
+    body_ids: &BTreeSet<&str>,
+    experiment_ids: &BTreeSet<&str>,
+    out: &mut Vec<ValidationError>,
+) {
+    use crate::contract::{ContractParamSpace, ModuleReq, RegimeSpace};
+    let bad = |reason: &'static str| ValidationError::BadContract {
+        contract: cid.to_string(),
+        reason,
+    };
+    let bodies_ok = |bodies: &[crate::ids::BodyId], out: &mut Vec<ValidationError>| -> bool {
+        let mut ok = !bodies.is_empty();
+        for b in bodies {
+            if !body_ids.contains(b.as_str()) {
+                out.push(bad("candidate body is not in the system"));
+                ok = false;
+            }
+        }
+        ok
+    };
+    let range_ok = |r: (f64, f64), what: &'static str, out: &mut Vec<ValidationError>| -> bool {
+        if r.0.is_finite() && r.1.is_finite() && r.0 > 0.0 && r.0 <= r.1 {
+            true
+        } else {
+            out.push(bad(what));
+            false
+        }
+    };
+    match (kind, space) {
+        (
+            crate::contract::ContractKind::SatellitePlacement,
+            ContractParamSpace::SatellitePlacement {
+                bodies,
+                periapsis_alt_m,
+                apoapsis_alt_m,
+            },
+        ) => {
+            bodies_ok(bodies, out);
+            range_ok(
+                *periapsis_alt_m,
+                "periapsis_alt_m range is not 0 < lo <= hi",
+                out,
+            );
+            range_ok(
+                *apoapsis_alt_m,
+                "apoapsis_alt_m range is not 0 < lo <= hi",
+                out,
+            );
+        }
+        (
+            crate::contract::ContractKind::SurveyRun,
+            ContractParamSpace::SurveyRun {
+                experiments: exps,
+                bodies,
+                min_units,
+            },
+        ) => {
+            if exps.is_empty() {
+                out.push(bad("survey candidates: no experiments authored"));
+            }
+            for e in exps {
+                if !experiment_ids.contains(e.as_str()) {
+                    out.push(bad("survey candidate experiment is not loaded"));
+                }
+            }
+            bodies_ok(bodies, out);
+            if !(min_units.is_finite() && *min_units > 0.0) {
+                out.push(bad("min_units is not positive and finite"));
+            }
+        }
+        (
+            crate::contract::ContractKind::PartTest,
+            ContractParamSpace::PartTest { modules, regime },
+        ) => {
+            if modules.is_empty() {
+                out.push(bad("part test: no module requirements authored"));
+            }
+            for m in modules {
+                if let ModuleReq::Experiment(e) = m
+                    && !experiment_ids.contains(e.as_str())
+                {
+                    out.push(bad("module requirement names an unloaded experiment"));
+                }
+            }
+            match regime {
+                RegimeSpace::Orbit { bodies, min_alt_m } => {
+                    bodies_ok(bodies, out);
+                    range_ok(
+                        *min_alt_m,
+                        "part-test orbit min_alt range is not 0 < lo <= hi",
+                        out,
+                    );
+                }
+                RegimeSpace::Landed { bodies } => {
+                    bodies_ok(bodies, out);
+                }
+            }
+        }
+        (crate::contract::ContractKind::Rescue, ContractParamSpace::Rescue { bodies }) => {
+            bodies_ok(bodies, out);
+        }
+        _ => out.push(bad("kind and generate.space variants disagree")),
+    }
+}
+
+/// §3.6's template rules over the `data/contracts/` set, checked
+/// against the system bodies, the experiment defs, and the merged
+/// tech tree (the cross-reference set the prereqs/candidates name):
+///
+/// - `schema_version` current, `id` ↔ file-stem agreement, unique
+///   ids, well-formed id;
+/// - `kind` ↔ `generate.space` variant agreement;
+/// - `weight` finite > 0; rewards finite ≥ 0; `deadline_days`
+///   `None` or finite > 0;
+/// - candidate lists non-empty, ids resolvable (bodies in the
+///   system, experiments in the loaded set), draw ranges finite
+///   with `0 ≤ lo ≤ hi` (altitude `lo > 0` — a zero-altitude orbit
+///   band intersects the surface);
+/// - prerequisites well-formed: no duplicates, `count > 0`, tech
+///   ids resolvable in the merged tree, body ids in the system;
+/// - the tree's `unlocks.contract_types` ids each name an authored
+///   template — the other direction is free (a template may exist
+///   ununlocked).
+#[allow(clippy::too_many_lines)] // the per-field check list reads as a list
+pub fn validate_contracts(
+    loaded: &crate::load::LoadedContracts,
+    sys: &LoadedSystem,
+    experiments: &crate::load::LoadedExperiments,
+    techtree: &crate::load::LoadedTechTree,
+) -> Vec<ValidationError> {
+    use crate::contract::ContractPrereq;
+    let mut out = Vec::new();
+    let body_ids: BTreeSet<&str> = sys.bodies.iter().map(|b| b.def.id.as_str()).collect();
+    let experiment_ids: BTreeSet<&str> = experiments
+        .experiments
+        .iter()
+        .map(|e| e.def.id.as_str())
+        .collect();
+    let tree = techtree.merged();
+    let node_ids: BTreeSet<&str> = tree.nodes.iter().map(|n| n.id.as_str()).collect();
+    let mut seen_ids = BTreeSet::new();
+    let mut template_ids: BTreeSet<&str> = BTreeSet::new();
+    for lc in &loaded.contracts {
+        let d = &lc.def;
+        let cid = d.id.as_str();
+        template_ids.insert(cid);
+        if lc
+            .path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+            != cid
+        {
+            out.push(ValidationError::BadContract {
+                contract: cid.to_string(),
+                reason: "contract id does not match file stem",
+            });
+        }
+        if !seen_ids.insert(d.id.clone()) {
+            out.push(ValidationError::BadContract {
+                contract: cid.to_string(),
+                reason: "duplicate contract id",
+            });
+        }
+        check_id(cid, &mut out);
+        let bad = |reason: &'static str| ValidationError::BadContract {
+            contract: cid.to_string(),
+            reason,
+        };
+        if !(d.generate.weight.is_finite() && d.generate.weight > 0.0) {
+            out.push(bad("generator weight is not finite and > 0"));
+        }
+        for (name, v) in [
+            ("advance_funds", d.rewards.advance_funds),
+            ("completion_funds", d.rewards.completion_funds),
+            ("failure_penalty_funds", d.rewards.failure_penalty_funds),
+        ] {
+            if !(v.is_finite() && v >= 0.0) {
+                out.push(bad(match name {
+                    "advance_funds" => "advance_funds is not finite and >= 0",
+                    "completion_funds" => "completion_funds is not finite and >= 0",
+                    _ => "failure_penalty_funds is not finite and >= 0",
+                }));
+            }
+        }
+        if let Some(days) = d.deadline_days
+            && !(days.is_finite() && days > 0.0)
+        {
+            out.push(bad("deadline_days is not positive and finite"));
+        }
+        validate_contract_space(
+            cid,
+            &d.kind,
+            &d.generate.space,
+            &body_ids,
+            &experiment_ids,
+            &mut out,
+        );
+        let mut prereqs = BTreeSet::new();
+        for p in &d.prerequisites {
+            if !prereqs.insert(p.clone()) {
+                out.push(bad("duplicate prerequisite"));
+            }
+            match p {
+                ContractPrereq::TechResearched(n) => {
+                    if !node_ids.contains(n.as_str()) {
+                        out.push(bad("prerequisite tech node is not in the tree"));
+                    }
+                }
+                ContractPrereq::ContractsCompleted { count, .. } => {
+                    if *count == 0 {
+                        out.push(bad("ContractsCompleted count of 0 is a tautology"));
+                    }
+                }
+                ContractPrereq::BodyVisited(b) => {
+                    if !body_ids.contains(b.as_str()) {
+                        out.push(bad("BodyVisited names a body not in the system"));
+                    }
+                }
+                ContractPrereq::CrewLostAtMost(_) => {}
+            }
+        }
+    }
+    // The tree's `contract_types` unlocks must resolve — an unlock
+    // naming a template nobody authored is dead authored surface.
+    for n in &tree.nodes {
+        for c in &n.unlocks.contract_types {
+            if !template_ids.contains(c.as_str()) {
+                out.push(ValidationError::UnknownContractType {
+                    node: n.id.as_str().to_string(),
+                    contract_type: c.as_str().to_string(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Loc resolution for contract templates (the
+/// [`validate_techtree_loc_keys`] pattern): display name +
+/// description must resolve in `en.ron`.
+pub fn validate_contract_loc_keys(
+    loaded: &crate::load::LoadedContracts,
+    loc: &LocFile,
+) -> Vec<ValidationError> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for lc in &loaded.contracts {
+        for key in [&lc.def.display_name, &lc.def.description] {
+            if seen.insert(key.as_str().to_string()) && !loc.contains(key) {
+                out.push(ValidationError::UnresolvedLocKey {
+                    context: format!("contract {}", lc.def.id),
+                    key: key.as_str().to_string(),
+                });
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -2909,6 +3774,217 @@ mod tests {
         assert!(
             errs.iter()
                 .any(|e| matches!(e, ValidationError::UnresolvedLocKey { key, .. } if key == "part.test.engine.name")),
+            "{errs:?}"
+        );
+    }
+
+    // ---------- tech tree (§3.3) ----------
+
+    use crate::load::{LoadedTechFile, LoadedTechTree};
+    use crate::techtree::{
+        TECHTREE_SCHEMA_VERSION, TechNode, TechTreeDef, TechUnlocks, UpgradeEffect, UpgradeLevel,
+        UpgradeTrack,
+    };
+
+    /// A minimal valid two-node tree + track over `part_fixture`'s
+    /// family — the part's `tech_requirement` is `tech.start`, so the
+    /// fixture validates green as written.
+    fn tree_fixture() -> LoadedTechTree {
+        LoadedTechTree {
+            trees: vec![LoadedTechFile {
+                path: std::path::PathBuf::from("home.ron"),
+                def: TechTreeDef {
+                    schema_version: TECHTREE_SCHEMA_VERSION,
+                    nodes: vec![
+                        TechNode {
+                            id: "tech.start".into(),
+                            display_name: "tech.start.name".into(),
+                            description: "tech.start.desc".into(),
+                            science_cost: 0.0,
+                            requires: vec![],
+                            unlocks: TechUnlocks::default(),
+                        },
+                        TechNode {
+                            id: "tech.rocketry.2".into(),
+                            display_name: "tech.r2.name".into(),
+                            description: "tech.r2.desc".into(),
+                            science_cost: 30.0,
+                            requires: vec!["tech.start".into()],
+                            unlocks: TechUnlocks {
+                                track_levels: vec![("track.isp".into(), 2)],
+                                facilities: vec!["facility.lab".into()],
+                                contract_types: vec![],
+                            },
+                        },
+                    ],
+                    tracks: vec![UpgradeTrack {
+                        id: "track.isp".into(),
+                        display_name: "track.isp.name".into(),
+                        family: part_fixture().family,
+                        stat_path: crate::part::StatPath::IspVacS,
+                        levels: vec![
+                            UpgradeLevel {
+                                science_cost: 10.0,
+                                multiplier_or_delta: UpgradeEffect::Multiplier(1.03),
+                            },
+                            UpgradeLevel {
+                                science_cost: 12.0,
+                                multiplier_or_delta: UpgradeEffect::Multiplier(1.03),
+                            },
+                        ],
+                    }],
+                },
+            }],
+        }
+    }
+
+    fn tree_errors(tree: &LoadedTechTree, parts: &LoadedParts) -> Vec<ValidationError> {
+        validate_techtree(tree, parts)
+    }
+
+    /// The fixture itself must be clean.
+    #[test]
+    fn tree_fixture_is_valid() {
+        let errs = tree_errors(&tree_fixture(), &loaded_part(part_fixture()));
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    /// §3.3 "no cycles" — including a self-loop and a two-node loop.
+    #[test]
+    fn tree_cycle_is_rejected() {
+        let mut t = tree_fixture();
+        t.trees[0].def.nodes[1].requires = vec!["tech.rocketry.2".into()];
+        let errs = tree_errors(&t, &loaded_part(part_fixture()));
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::TechCycle { .. })),
+            "{errs:?}"
+        );
+
+        let mut t = tree_fixture();
+        t.trees[0].def.nodes[1].requires = vec!["tech.rocketry.3".into()];
+        t.trees[0].def.nodes.push(TechNode {
+            id: "tech.rocketry.3".into(),
+            display_name: "k".into(),
+            description: "k".into(),
+            science_cost: 60.0,
+            requires: vec!["tech.rocketry.2".into()],
+            unlocks: TechUnlocks::default(),
+        });
+        let errs = tree_errors(&t, &loaded_part(part_fixture()));
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::TechCycle { .. })),
+            "{errs:?}"
+        );
+    }
+
+    /// §3.3 "every part reachable" — a part gated on a missing node.
+    #[test]
+    fn unreachable_part_is_rejected() {
+        let mut d = part_fixture();
+        d.tech_requirement = "tech.nonexistent".into();
+        let errs = tree_errors(&tree_fixture(), &loaded_part(d));
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::UnknownTechRequirement { tech, .. } if tech == "tech.nonexistent"
+            )),
+            "{errs:?}"
+        );
+    }
+
+    /// §3.3 "cost monotonic in depth" — a node cheaper than its
+    /// prerequisite is rejected; equal cost is legal.
+    #[test]
+    fn non_monotonic_cost_is_rejected() {
+        let mut t = tree_fixture();
+        t.trees[0].def.nodes[1].science_cost = -5.0;
+        let errs = tree_errors(&t, &loaded_part(part_fixture()));
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::TechCostNotMonotonic { .. } | ValidationError::BadTechNode { .. }
+            )),
+            "{errs:?}"
+        );
+        // Equal cost along the edge is monotonic (non-decreasing).
+        let mut t = tree_fixture();
+        t.trees[0].def.nodes[0].science_cost = 30.0;
+        assert!(tree_errors(&t, &loaded_part(part_fixture())).is_empty());
+    }
+
+    /// Dangling references: unknown prerequisite, unknown track grant,
+    /// grant cap outside the authored levels.
+    #[test]
+    fn bad_tree_refs_are_rejected() {
+        let mut t = tree_fixture();
+        t.trees[0].def.nodes[1].requires = vec!["tech.missing".into()];
+        let errs = tree_errors(&t, &loaded_part(part_fixture()));
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::UnknownTechPrerequisite { .. })),
+            "{errs:?}"
+        );
+
+        let mut t = tree_fixture();
+        t.trees[0].def.nodes[1].unlocks.track_levels = vec![("track.missing".into(), 1)];
+        let errs = tree_errors(&t, &loaded_part(part_fixture()));
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::UnknownUpgradeTrack { .. })),
+            "{errs:?}"
+        );
+
+        let mut t = tree_fixture();
+        t.trees[0].def.nodes[1].unlocks.track_levels = vec![("track.isp".into(), 9)];
+        let errs = tree_errors(&t, &loaded_part(part_fixture()));
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::BadTechNode { .. })),
+            "{errs:?}"
+        );
+    }
+
+    /// Track shape rules: empty levels, bad effect, a stat the family
+    /// cannot resolve, a family with no parts, duplicate ids.
+    #[test]
+    fn bad_tracks_are_rejected() {
+        // A stat the fixture part cannot resolve (it has no Control).
+        let mut t = tree_fixture();
+        t.trees[0].def.tracks[0].stat_path = crate::part::StatPath::ControlTorqueNm;
+        let errs = tree_errors(&t, &loaded_part(part_fixture()));
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::BadUpgradeTrack { .. })),
+            "{errs:?}"
+        );
+
+        let mut t = tree_fixture();
+        t.trees[0].def.tracks[0].family = "family.nobody".into();
+        let errs = tree_errors(&t, &loaded_part(part_fixture()));
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::BadUpgradeTrack { .. })),
+            "{errs:?}"
+        );
+
+        let mut t = tree_fixture();
+        let dup = t.trees[0].def.tracks[0].clone();
+        t.trees[0].def.tracks.push(dup);
+        let errs = tree_errors(&t, &loaded_part(part_fixture()));
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::DuplicateUpgradeTrackId { .. })),
+            "{errs:?}"
+        );
+
+        let mut t = tree_fixture();
+        t.trees[0].def.tracks[0].levels.clear();
+        let errs = tree_errors(&t, &loaded_part(part_fixture()));
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::BadUpgradeTrack { .. })),
             "{errs:?}"
         );
     }

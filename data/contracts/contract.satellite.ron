@@ -1,0 +1,29 @@
+// §3.6 satellite placement — put a bird in a drawn Terrin orbit
+// band (tech.rocketry.2 unlocks it). The drawn band's apoapsis cap
+// keeps it a *placement*: an escape or a parking orbit too high does
+// not satisfy it.
+(
+    schema_version: 1,
+    id: "contract.satellite",
+    display_name: "contract.satellite.name",
+    description: "contract.satellite.desc",
+    kind: SatellitePlacement,
+    generate: (
+        weight: 3.0,
+        space: SatellitePlacement(
+            bodies: ["terrin"],
+            periapsis_alt_m: (80_000.0, 250_000.0),
+            apoapsis_alt_m: (150_000.0, 1_500_000.0),
+        ),
+    ),
+    prerequisites: [
+        TechResearched("tech.rocketry.2"),
+        ContractsCompleted(kind: SurveyRun, count: 1),
+    ],
+    rewards: (
+        advance_funds: 8_000.0,
+        completion_funds: 32_000.0,
+        failure_penalty_funds: 4_000.0,
+    ),
+    deadline_days: Some(45.0),
+)

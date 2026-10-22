@@ -105,6 +105,27 @@ id_newtype! {
     TechNodeId
 }
 id_newtype! {
+    /// Identifier of an §3.3 `UpgradeTrack` (`data/techtree/*.ron`). A
+    /// track couples one `FamilyId` to one `StatPath`; tech nodes grant
+    /// level caps on it and the sim's `ResearchUpgradeLevel` command
+    /// buys the levels individually.
+    UpgradeTrackId
+}
+id_newtype! {
+    /// Identifier of a program facility a tech node unlocks
+    /// (§3.3 — labs, test stands, pads). The facility defs themselves
+    /// land with the facility economy milestone; the id type lands
+    /// with the tree that references it.
+    FacilityId
+}
+id_newtype! {
+    /// Identifier of a §3.6 contract type a tech node unlocks
+    /// ("satellite placement", "survey data run", …). The contract
+    /// template defs land with the contracts milestone; the id type
+    /// lands with the tree that references it.
+    ContractTypeId
+}
+id_newtype! {
     /// Identifier of a science experiment kind (§3.2 `Experiment`
     /// modules key data records on it).
     ExperimentId
@@ -113,4 +134,11 @@ id_newtype! {
     /// Identifier of a converter recipe (§3.5.1 `Converter` modules
     /// name one). Recipe defs land with the colony data set.
     RecipeId
+}
+id_newtype! {
+    /// Identifier of a §3.5 surface site — a launch pad or recovery
+    /// location on a body (`data/systems/<sys>/sites.ron`). Sites are
+    /// where vessels launch from and where `RecoverVessel` credits
+    /// resources; a launch site recovers at `recovery_efficiency` 1.0.
+    SiteId
 }

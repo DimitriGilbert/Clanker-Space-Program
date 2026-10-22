@@ -1,0 +1,27 @@
+// §3.6 survey data run — the wider survey board (tech.science.1
+// unlocks it). Same predicate on a wider body set and a bigger draw.
+(
+    schema_version: 1,
+    id: "contract.survey.data",
+    display_name: "contract.survey.data.name",
+    description: "contract.survey.data.desc",
+    kind: SurveyRun,
+    generate: (
+        weight: 2.0,
+        space: SurveyRun(
+            experiments: ["exp.materials_study"],
+            bodies: ["terrin", "rask", "duva"],
+            min_units: 5.0,
+        ),
+    ),
+    prerequisites: [
+        TechResearched("tech.science.1"),
+        ContractsCompleted(kind: SurveyRun, count: 1),
+    ],
+    rewards: (
+        advance_funds: 3_000.0,
+        completion_funds: 18_000.0,
+        failure_penalty_funds: 2_000.0,
+    ),
+    deadline_days: Some(120.0),
+)

@@ -2164,6 +2164,8 @@ mod tests {
             PartNode::new(None, PartTransform::IDENTITY, 0),
         );
         let parts = [WeldPart {
+            experiments: Vec::new(),
+            lab: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -2294,6 +2296,8 @@ mod tests {
         );
         let half = DVec3::new(0.5, 0.5, 0.5);
         let parts = [WeldPart {
+            experiments: Vec::new(),
+            lab: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -2509,6 +2513,8 @@ mod tests {
             ),
         );
         let mk = |m| WeldPart {
+            experiments: Vec::new(),
+            lab: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -2671,6 +2677,8 @@ mod tests {
             ),
         );
         let mk = |m| WeldPart {
+            experiments: Vec::new(),
+            lab: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -2834,6 +2842,8 @@ mod tests {
             PartNode::new(None, PartTransform::IDENTITY, 0),
         );
         let parts = [WeldPart {
+            experiments: Vec::new(),
+            lab: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,

@@ -81,6 +81,16 @@ pub struct CraftDef {
     pub graph: PartGraph,
     /// Resolved per-part data, indexed by `PartNode::effective_index`.
     pub parts: Vec<WeldPart>,
+    /// M7-C: each part's resolved funds cost (`EffectivePart::
+    /// cost_funds`, frozen at build — the same never-retroactive
+    /// convention as the weld inputs). Parallel to `parts`, indexed
+    /// the same way, so a node's cost travels with its part through
+    /// every graph surgery that reuses `effective_index` — jettison/
+    /// breakup/undock/merge need no cost bookkeeping. The economy
+    /// module reads Σ over *live* nodes for the spawn-time
+    /// manufacture charge and the recovery payout. A test/scenario
+    /// craft legitimately authors `0.0` (free).
+    pub part_costs: Vec<f64>,
 }
 
 /// Where a vessel lives (§2.4/§2.6.2): on rails, physics-resident in

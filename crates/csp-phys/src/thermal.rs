@@ -388,6 +388,8 @@ mod tests {
 
     fn part(mass: f64, half: f64, thermal: ThermalDef) -> WeldPart {
         WeldPart {
+            experiments: Vec::new(),
+            lab: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,

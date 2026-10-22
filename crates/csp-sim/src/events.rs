@@ -213,6 +213,58 @@ pub enum EventKind {
         /// The transfer arena id the event completes.
         transfer: crate::transfers::TransferId,
     } = 6,
+    /// §3.2's lab exhaustion (M7-A): the project's escrowed data has
+    /// decayed under the `data_epsilon` floor — the firing banks the
+    /// conversion and consumes the project record. Scheduled by
+    /// `SimCommand::StartResearch` at the closed-form-predicted tick,
+    /// paired with a same-tick `ResearchProjectComplete` (this one
+    /// fires first — it was scheduled first, and `(tick, seq)` order
+    /// is insertion order). Always `Clamping` (§3.2 marks both
+    /// events clamping — the player sees the conversion land).
+    ResearchDataExhausted {
+        /// The research arena id the event exhausts.
+        project: crate::research::ResearchId,
+    } = 7,
+    /// §3.2's lab completion (M7-A): the player-facing "research
+    /// done" landing — fires immediately after the same-tick
+    /// `ResearchDataExhausted` consumed the record (firing is the
+    /// notification; an orphan — a stopped or destroyed project —
+    /// fires as a no-op). Always `Clamping`.
+    ResearchProjectComplete {
+        /// The research arena id the event completes.
+        project: crate::research::ResearchId,
+    } = 8,
+    /// §3.5's recurring salary drain (M7-C): fires once per
+    /// `salary_period_ticks` on the absolute period grid, debits
+    /// `Σ salary_per_s · period_s` over the `Active` crew roster,
+    /// and re-arms itself one period further. Always `Silent` —
+    /// routine bookkeeping must never demote warp (§2.6.5); the
+    /// shortfall it can cause is surfaced by the separate
+    /// `Insolvent` event instead.
+    SalaryDue = 9,
+    /// §3.5's bankruptcy notification (M7-C): a funds charge clamped
+    /// at zero left an unpaid shortfall — scheduled at `clock + 1`
+    /// by the charge path, once per insolvency (`economy.insolvent`
+    /// gates re-scheduling until a credit clears it). Firing mutates
+    /// nothing — surfacing rides `AdvanceReport::fired_events`, the
+    /// `PlayerAlarm` contract. Always `Clamping` per the §2.6.5
+    /// member table — warp demotes so the player sees the
+    /// insolvency, never sleeps through it.
+    Insolvent {
+        /// The unpaid micro-funds the clamp could not cover.
+        shortfall_micros: u64,
+    } = 10,
+    /// §3.6's contract expiry (M7-D; §2.6.5 `Clamping` member): a
+    /// contract's `deadline_tick` arrived — the contract fails and
+    /// its authored penalty charges through the funds clamp.
+    /// Scheduled by `SimCommand::AcceptContract`; dropped by
+    /// completion (the strict event pairing, like the maneuver
+    /// node's). Always `Clamping` — the player must see a contract
+    /// die, never sleep through it.
+    ContractDeadline {
+        /// The contract arena id the deadline expires.
+        contract: crate::contracts::ContractId,
+    } = 11,
 }
 
 impl StableDiscriminant for EventKind {
@@ -225,6 +277,11 @@ impl StableDiscriminant for EventKind {
             Self::ManeuverNodeStart { .. } => 4,
             Self::TransferWindow { .. } => 5,
             Self::TransferComplete { .. } => 6,
+            Self::ResearchDataExhausted { .. } => 7,
+            Self::ResearchProjectComplete { .. } => 8,
+            Self::SalaryDue => 9,
+            Self::Insolvent { .. } => 10,
+            Self::ContractDeadline { .. } => 11,
         }
     }
 }
@@ -242,11 +299,17 @@ pub fn class_of(kind: &EventKind, tracked: &BTreeSet<VesselId>) -> EventClass {
                 EventClass::Silent
             }
         }
-        EventKind::SoiRescan { .. } | EventKind::DebrisDecay { .. } => EventClass::Silent,
+        EventKind::SoiRescan { .. } | EventKind::DebrisDecay { .. } | EventKind::SalaryDue => {
+            EventClass::Silent
+        }
+        EventKind::ContractDeadline { .. } => EventClass::Clamping,
         EventKind::PlayerAlarm { .. }
         | EventKind::ManeuverNodeStart { .. }
         | EventKind::TransferWindow { .. }
-        | EventKind::TransferComplete { .. } => EventClass::Clamping,
+        | EventKind::TransferComplete { .. }
+        | EventKind::ResearchDataExhausted { .. }
+        | EventKind::ResearchProjectComplete { .. }
+        | EventKind::Insolvent { .. } => EventClass::Clamping,
     }
 }
 
@@ -311,6 +374,17 @@ impl ScheduledEvent {
             }
             EventKind::TransferComplete { transfer } => {
                 h.u64(transfer.0);
+            }
+            EventKind::ResearchDataExhausted { project }
+            | EventKind::ResearchProjectComplete { project } => {
+                h.u64(project.0);
+            }
+            EventKind::SalaryDue => {}
+            EventKind::Insolvent { shortfall_micros } => {
+                h.u64(*shortfall_micros);
+            }
+            EventKind::ContractDeadline { contract } => {
+                h.u64(contract.0);
             }
         }
     }

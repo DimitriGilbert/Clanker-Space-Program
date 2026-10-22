@@ -106,13 +106,16 @@ pub use aero::{
 pub use backend::{BodyHandle, Contact, Hit, JointDef, JointKind, PhysicsBackend, Ray};
 pub use graph::{PartGraph, PartNode, PartNodeId, PartTransform};
 pub use merge::{MergeError, MergedGraph, merge_graphs};
-pub use part::{ColliderShape, DockPortSpec, ForceSite, ForceSiteKind, TankSpec, WeldPart};
+pub use part::{
+    ColliderShape, DockPortSpec, ExperimentSpec, ForceSite, ForceSiteKind, LabSpec, TankSpec,
+    WeldPart,
+};
 pub use profile::{BurnSegment, MissionCheck, MissionProfile, Regime};
 pub use readout::{CraftAnalysis, StageStats, analyze};
 pub use resolve::{
     BuiltPart, EffectivePart, FamilyQualification, FamilyQualifications, PartUsage, ResolveError,
-    ResolvedReliability, TrackLevels, WEAR_HAZARD_STUB, apply_wear, resolve_built_part,
-    resolve_part, resolve_parts, wear_multiplier,
+    ResolvedReliability, TrackLevels, WEAR_HAZARD_STUB, apply_wear, compose_upgrade_levels,
+    resolve_built_part, resolve_part, resolve_parts, wear_multiplier,
 };
 pub use session::{
     ATTACH_DIAMETER_REL_TOLERANCE, AttachEdge, CRAFT_FILE_MAGIC, CRAFT_SCHEMA_VERSION,

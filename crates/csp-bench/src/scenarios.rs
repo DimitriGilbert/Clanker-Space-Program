@@ -121,6 +121,10 @@ pub struct FlightReport {
     pub max_part_temp_k: f64,
     /// The tick the vessel surface-latched, if it did.
     pub latch_tick: Option<u64>,
+    /// M7-C: the funds the `RecoverVessel` at run end paid out
+    /// (micros) — `Some` once the latched vessel was recovered at
+    /// the fixture's launch site.
+    pub recovery_micros: Option<u64>,
 }
 
 impl FlightReport {
@@ -169,6 +173,41 @@ fn flight_initial(dir: &Path) -> Result<World, ReplayError> {
     world.set_docking_config(csp_sim::DockingConfig::from_balance(&balance));
     // §3.5's transfer tunables — same wiring (M6-D).
     world.set_transfer_config(csp_sim::TransferConfig::from_balance(&balance));
+    // §3.2's science tunables + experiment defs — same wiring (M7-A):
+    // the fixture's balance.ron/experiments/ are the source of truth.
+    world.set_science_config(csp_sim::ScienceConfig::from_balance(&balance));
+    let experiments =
+        csp_data::load_experiments(&dir.join("experiments")).map_err(ReplayError::Load)?;
+    world.set_experiments(
+        experiments
+            .experiments
+            .iter()
+            .map(|e| (e.def.id.clone(), e.def.clone()))
+            .collect(),
+    );
+    // §3.5's economy tunables + site table — same wiring (M7-C): the
+    // fixture's balance.ron and sites.ron are the source of truth.
+    world.set_economy_config(csp_sim::economy::EconomyConfig::from_balance(&balance));
+    let sites = csp_data::load_sites(&dir.join("sites.ron")).map_err(ReplayError::Load)?;
+    world.set_sites(
+        sites
+            .sites
+            .iter()
+            .map(|s| (s.id.clone(), s.clone()))
+            .collect(),
+    );
+    // M7-D §3.6: the contract templates + board-size tunable — the
+    // fixture's `contracts/` dir (empty when the fixture authors
+    // none) and its balance.ron are the source of truth.
+    world.set_contracts(
+        csp_data::load_contracts(&dir.join("contracts"))
+            .map_err(ReplayError::Load)?
+            .by_id()
+            .into_iter()
+            .map(|(id, def)| (id, def.clone()))
+            .collect(),
+    );
+    world.set_contract_config(csp_sim::ContractConfig::from_balance(&balance));
     Ok(world)
 }
 
@@ -182,6 +221,8 @@ fn flight_craft() -> csp_sim::CraftDef {
         PartNode::new(None, PartTransform::IDENTITY, 0),
     );
     let booster = WeldPart {
+        experiments: Vec::new(),
+        lab: None,
         dock_ports: vec![],
         tanks: vec![],
         crew_seats: 0,
@@ -209,6 +250,10 @@ fn flight_craft() -> csp_sim::CraftDef {
     csp_sim::CraftDef {
         graph,
         parts: vec![booster],
+        // M7-C: a modest 5 t booster's build cost — the manufacture
+        // charge at spawn and the recovery payout at the latch all
+        // exercise it.
+        part_costs: vec![50_000.0],
     }
 }
 
@@ -254,6 +299,7 @@ enum FlightPhase {
 /// The scripted controller driving the launch→orbit→reentry→land arc.
 /// Every decision reads only sim state — a deterministic function, so
 /// the command log it emits replays identically.
+#[allow(clippy::too_many_lines)] // the M7-C recovery tail grew it past the limit
 pub fn flight_run(w: &mut World) -> Result<FlightReport, SimError> {
     let mut report = FlightReport::default();
     let env = w
@@ -358,6 +404,21 @@ pub fn flight_run(w: &mut World) -> Result<FlightReport, SimError> {
     if report.latch_tick.is_none() {
         return Err(SimError::Fatal("flight scenario never latched"));
     }
+    // M7-C §3.5: the flight's recovery — the vessel latched on Terrin,
+    // so `RecoverVessel` at the launch site (efficiency 1.0) credits
+    // its contents and part value and removes it. The command is
+    // logged, so the golden replays it identically.
+    let before = w.funds_micros();
+    w.enqueue(
+        SourceClass::Ui,
+        0,
+        SimCommand::RecoverVessel {
+            vessel: FLIGHT_VESSEL,
+            site: Some(csp_data::SiteId::from("terrin-launch")),
+        },
+    );
+    w.step_frame(w.clock().ticks() + 1)?;
+    report.recovery_micros = Some(w.funds_micros() - before);
     Ok(report)
 }
 
@@ -565,10 +626,15 @@ mod tests {
             report.max_part_temp_k
         );
         assert!(report.latch_tick.is_some());
-        assert!(matches!(
-            w.vessels()[&FLIGHT_VESSEL].state,
-            VesselState::SurfaceLatched(_)
-        ));
+        // M7-C: the latched vessel was recovered at the launch site —
+        // out of the arena, its part value paid out at efficiency
+        // 1.0, and its (empty) tanks credited nothing. A 50 000-fund
+        // craft minus the 50 000-fund manufacture charge: the run's
+        // net funds move is zero round-trip minus nothing, so
+        // recovery_micros = the full cost back.
+        let micros = report.recovery_micros.expect("vessel never recovered");
+        assert!(micros > 0);
+        assert!(!w.vessels().contains_key(&FLIGHT_VESSEL));
     }
 
     /// §5.3's per-tick budget — the honest measurement, not a
@@ -602,6 +668,8 @@ mod tests {
                 ),
             );
             parts.push(WeldPart {
+                experiments: Vec::new(),
+                lab: None,
                 dock_ports: vec![],
                 tanks: vec![],
                 crew_seats: 0,
@@ -694,6 +762,8 @@ mod tests {
                 ),
             );
             parts.push(WeldPart {
+                experiments: Vec::new(),
+                lab: None,
                 dock_ports: vec![],
                 tanks: vec![],
                 crew_seats: 0,

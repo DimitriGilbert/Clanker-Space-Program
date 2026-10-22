@@ -785,9 +785,11 @@ pub(crate) fn apply_latch(
     tracked: &mut BTreeSet<VesselId>,
     event_heap: &BinaryHeap<ScheduledEvent>,
     transfers: &mut BTreeMap<TransferId, ActiveTransfer>,
+    science: &mut crate::research::ScienceState,
     joint: &LiveJoint,
     tick: u64,
     degraded: &mut Vec<SimError>,
+    shadow: &mut crate::TickShadow,
 ) -> Result<bool, SimError> {
     let (Some(a), Some(b)) = (vessels.get(&joint.vessel_a), vessels.get(&joint.vessel_b)) else {
         return Ok(false);
@@ -869,6 +871,10 @@ pub(crate) fn apply_latch(
     };
     let mut parts_m = craft_p.parts.clone();
     parts_m.extend(craft_s.parts.iter().cloned());
+    // M7-C: the frozen part-cost table merges positionally exactly
+    // like `parts` — a node's cost rides its `effective_index`.
+    let mut part_costs_m = craft_p.part_costs.clone();
+    part_costs_m.extend(craft_s.part_costs.iter().cloned());
     let mut body_m =
         csp_phys::weld(&merge.graph, &parts_m).map_err(|e| SimError::Fatal(e.reason()))?;
     // §2.9's hand-off: the merged body keeps the primary's pose and
@@ -921,6 +927,12 @@ pub(crate) fn apply_latch(
     // id are redirected below so a stream already in the pipe lands
     // in the merged vessel.
     let (tanks_m, crew_m) = crate::transfers::merge_vessel_records(vp, vs, &map);
+    // M7-A: science records pool through the same remap, and the
+    // absorbed vessel's live projects re-seat onto the merged id
+    // (their lab nodes remap like the records — `map` preserves
+    // primary ids, so primary projects are untouched).
+    crate::research::shadow_science(science, &mut shadow.science);
+    let science_m = crate::research::merge_vessel_science(vp, vs, &map, &mut science.projects);
     let mut seams = vp.seams.clone();
     seams.extend(vs.seams.iter().map(|s| DockSeam {
         port_a: map(s.port_a),
@@ -980,6 +992,7 @@ pub(crate) fn apply_latch(
         let craft_m = crate::CraftDef {
             graph: merge.graph.clone(),
             parts: parts_m.clone(),
+            part_costs: part_costs_m.clone(),
         };
         body_m.aero = Some(Box::new(
             csp_phys::aero::build_aero_tables(
@@ -1000,6 +1013,7 @@ pub(crate) fn apply_latch(
         v.craft = Some(crate::CraftDef {
             graph: merge.graph,
             parts: parts_m,
+            part_costs: part_costs_m,
         });
         v.state = VesselState::InBubble(body_m);
         v.seams = seams;
@@ -1007,6 +1021,7 @@ pub(crate) fn apply_latch(
         v.aero_mask = csp_phys::ConfigMask(mask);
         v.tank_contents = tanks_m;
         v.crew = crew_m;
+        v.science = science_m;
     }
     let absorbed_tracked = tracked.remove(&sec);
     if absorbed_tracked {
@@ -1068,9 +1083,11 @@ pub(crate) fn latch_pass(
     tracked: &mut BTreeSet<VesselId>,
     event_heap: &BinaryHeap<ScheduledEvent>,
     transfers: &mut BTreeMap<TransferId, ActiveTransfer>,
+    science: &mut crate::research::ScienceState,
     cfg: &DockingConfig,
     tick: u64,
     degraded: &mut Vec<SimError>,
+    shadow: &mut crate::TickShadow,
 ) -> Result<(), SimError> {
     let mut i = 0;
     while i < joints.len() {
@@ -1080,8 +1097,8 @@ pub(crate) fn latch_pass(
         }
         let joint = joints[i].clone();
         if apply_latch(
-            vessels, physics, joints, refused, tracked, event_heap, transfers, &joint, tick,
-            degraded,
+            vessels, physics, joints, refused, tracked, event_heap, transfers, science, &joint,
+            tick, degraded, shadow,
         )? {
             // The merge removed the consumed joint — and every other
             // joint touching the absorbed vessel, at any index —

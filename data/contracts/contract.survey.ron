@@ -1,0 +1,25 @@
+// §3.6 survey data run — the starter contract (tech.start unlocks
+// it). Return materials-study data from Terrin: transmitted or
+// recovered data at a matching (experiment, body) key completes it.
+(
+    schema_version: 1,
+    id: "contract.survey",
+    display_name: "contract.survey.name",
+    description: "contract.survey.desc",
+    kind: SurveyRun,
+    generate: (
+        weight: 3.0,
+        space: SurveyRun(
+            experiments: ["exp.materials_study"],
+            bodies: ["terrin"],
+            min_units: 1.0,
+        ),
+    ),
+    prerequisites: [TechResearched("tech.start")],
+    rewards: (
+        advance_funds: 1_000.0,
+        completion_funds: 6_000.0,
+        failure_penalty_funds: 500.0,
+    ),
+    deadline_days: None,
+)
