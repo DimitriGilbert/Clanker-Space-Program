@@ -55,7 +55,18 @@ use crate::SimError;
 /// (`Vessel::thermal` — serialized state, §7.1 rule 5). Bumped for
 /// the flight-launch golden rebless; the trivial golden is
 /// vessel-free but its stream still starts with the new version.
-pub const HASH_SCHEMA_VERSION: u32 = 5;
+///
+/// **Version 6** (M4c): the per-part walk gained the resolved
+/// `structural` block (`max_axial_n`, `max_shear_n`, `max_torque_nm`
+/// — the breakup thresholds, weld input like `aero`/`thermal`), the
+/// per-vessel walk gained `debris_since` (§2.9's debris flag — the
+/// `max_debris` eviction order is derived from it), the `World` walk
+/// gained `vessel_caps` (`caps.max_vessels`/`caps.max_debris`, hashed
+/// like `event_budget` because they change state evolution), and the
+/// `EventKind` table gained the `DebrisDecay` kind (discriminant 3 —
+/// heap entries of it now appear in the §7.2 walk). Bumped for the
+/// golden rebless.
+pub const HASH_SCHEMA_VERSION: u32 = 6;
 
 /// Rule-7 sum types: the source of an enum's *declared* stable `u16`
 /// discriminant (PLAN §7.1 rule 7).

@@ -178,3 +178,107 @@ pub fn map_overlay(
             );
         });
 }
+
+/// Mirrors for the M4c flight HUD — populated by `csp-view`'s
+/// `flight_present` system (`FlightUiData`); `csp-ui` sees only
+/// this plain data (§2.1's dependency rule).
+#[derive(Clone, Debug, Default)]
+pub struct FlightHudInput<'a> {
+    /// A focused vessel exists (else the HUD shows "no vessel").
+    pub has_vessel: bool,
+    /// Altitude above surface (m).
+    pub alt_m: f64,
+    /// CoM speed (m/s).
+    pub speed_mps: f64,
+    /// Vertical speed (m/s).
+    pub vspeed_mps: f64,
+    /// Throttle [0,1].
+    pub throttle: f64,
+    /// Total vessels tracked.
+    pub vessel_count: usize,
+    /// Debris-flagged vessels.
+    pub debris_count: usize,
+    /// §3.7's visual-SFX cue lines (engine, staging, impact,
+    /// breakup) — drawn as top-center event flashes.
+    pub sfx: &'a [String],
+}
+
+/// The M4c flight HUD (§3.7's presentation floor): bottom-left
+/// telemetry strip — altitude, speed, vertical speed, throttle bar,
+/// vessel/debris counts — plus the controls hint and the visual-SFX
+/// event flashes. Drawn by `csp-view`'s `UiBuild` while
+/// `ViewMode::Flight` is active.
+pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
+    // §3.7's visual-SFX channel: each live cue is a top-center flash,
+    // newest at the bottom of the stack.
+    if !input.sfx.is_empty() {
+        let rect = ctx.content_rect();
+        egui::Area::new(egui::Id::unique("flight_sfx"))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .fixed_pos(egui::pos2(rect.center().x, rect.top() + 48.0))
+            .pivot(egui::Align2::CENTER_TOP)
+            .show(ctx, |ui| {
+                for line in input.sfx {
+                    ui.label(
+                        egui::RichText::new(format!("« {line} »"))
+                            .font(egui::FontId::proportional(17.0))
+                            .color(egui::Color32::from_rgb(255, 196, 64)),
+                    );
+                }
+            });
+    }
+    let rect = ctx.content_rect();
+    egui::Area::new(egui::Id::unique("flight_hud"))
+        .order(egui::Order::Foreground)
+        .interactable(false)
+        .fixed_pos(egui::pos2(10.0, rect.bottom() - 116.0))
+        .show(ctx, |ui| {
+            if !input.has_vessel {
+                ui.label(
+                    egui::RichText::new("FLIGHT — no vessel in the bubble")
+                        .color(egui::Color32::from_gray(200)),
+                );
+                ui.label(
+                    egui::RichText::new("[V] VAB  ·  [M] map").color(egui::Color32::from_gray(150)),
+                );
+                return;
+            }
+            let mono = egui::FontId::monospace(13.0);
+            let c = egui::Color32::from_gray(220);
+            ui.label(
+                egui::RichText::new(format!("ALT  {:>12.1} m", input.alt_m))
+                    .font(mono.clone())
+                    .color(c),
+            );
+            ui.label(
+                egui::RichText::new(format!("SPD  {:>12.1} m/s", input.speed_mps))
+                    .font(mono.clone())
+                    .color(c),
+            );
+            ui.label(
+                egui::RichText::new(format!("V/S  {:>12.1} m/s", input.vspeed_mps))
+                    .font(mono.clone())
+                    .color(c),
+            );
+            ui.add(
+                egui::ProgressBar::new(input.throttle as f32)
+                    .text(format!("THR  {:>5.1}%", input.throttle * 100.0))
+                    .desired_width(180.0),
+            );
+            ui.label(
+                egui::RichText::new(format!(
+                    "vessels {}  ·  debris {}",
+                    input.vessel_count, input.debris_count
+                ))
+                .font(mono.clone())
+                .color(egui::Color32::from_gray(170)),
+            );
+            ui.label(
+                egui::RichText::new(
+                    "[Z] full  [X] cut  drag: orbit  wheel: zoom  [M] map  [V] VAB",
+                )
+                .color(egui::Color32::from_gray(140)),
+            );
+        });
+}

@@ -7,6 +7,7 @@
 
 /// The M1 map-view pass (PLAN §5.1 R0): unlit orbit polylines and markers
 /// drawn from a `csp-view`-built [`map::MapPacket`].
+pub mod flight;
 pub mod map;
 
 /// The M3 VAB craft view + GPU picking (PLAN M3 exit row "GPU picking",

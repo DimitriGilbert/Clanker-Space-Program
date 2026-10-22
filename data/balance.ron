@@ -9,4 +9,8 @@
     // PLAN:548 / §2.6.5: `advance_to` processes at most this many events per
     // frame; overflow continues next frame as a Clamping-class event.
     advance_to_max_events_per_frame: 2_000,
+    // PLAN §2.9 object caps: vessel-arena ceiling and the debris cap
+    // (oldest-first eviction under breakup back-pressure).
+    max_tracked_vessels: 512,
+    max_debris: 64,
 )

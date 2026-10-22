@@ -1086,6 +1086,7 @@ fn resolve_weld_input(
     mass_kg: f64,
     modules: &[ModuleDef],
     thermal: &csp_data::ThermalDef,
+    structural: &csp_data::StructuralDef,
 ) -> Result<WeldPart, ResolveError> {
     let bad = |field: &'static str| ResolveError::InvalidStat {
         part_id: def.id.clone(),
@@ -1125,6 +1126,7 @@ fn resolve_weld_input(
             ref_len_m: def.aero.ref_len_m * s,
         },
         thermal: thermal.clone(),
+        structural: structural.clone(),
     })
 }
 
@@ -1326,7 +1328,7 @@ pub fn resolve_built_part(
     }
 
     let (structural, thermal, aero, attach_nodes) = resolve_envelopes(def, &f);
-    let weld_input = resolve_weld_input(def, f.linear, mass_kg, &modules, &thermal)?;
+    let weld_input = resolve_weld_input(def, f.linear, mass_kg, &modules, &thermal, &structural)?;
     let reliability = resolve_reliability(def, qual, &mults)?;
 
     Ok(EffectivePart {

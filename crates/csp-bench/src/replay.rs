@@ -1165,7 +1165,11 @@ mod tests {
     /// §8.3's "ALL tuning lives in balance.ron" made checkable:
     /// `csp_sim::DEFAULT_MAX_EVENTS_PER_FRAME` is a documented MIRROR of
     /// the loaded file — this pins the mirror to the real value so the
-    /// two can never drift silently.
+    /// two can never drift silently. The §2.9 object caps mirror the
+    /// same way: `VesselCaps`'s `DEFAULT_MAX_VESSELS`/`DEFAULT_MAX_DEBRIS`
+    /// are what worlds built without a balance file (tests, the wasm
+    /// slice) run, so the authored file and the compiled defaults must
+    /// agree.
     #[test]
     fn balance_ron_mirrors_sim_event_budget() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/balance.ron");
@@ -1174,6 +1178,8 @@ mod tests {
             b.advance_to_max_events_per_frame,
             csp_sim::DEFAULT_MAX_EVENTS_PER_FRAME
         );
+        assert_eq!(b.max_tracked_vessels, csp_sim::DEFAULT_MAX_VESSELS);
+        assert_eq!(b.max_debris, csp_sim::DEFAULT_MAX_DEBRIS);
     }
 
     /// An entry stamped at a tick the log has already moved past is

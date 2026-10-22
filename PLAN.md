@@ -1322,6 +1322,15 @@ therefore include: silhouette-correct kitbashed parts for the stock ascent craft
 reentry plasma, ground-contact dust, and basic SFX (engine, staging, impact, UI). **Stated
 explicitly: art *fidelity* is not judged at the gate — only legibility and feel.**
 
+> **M4c as-shipped note (SFX row).** "Basic SFX" ships as the *cue channel*, not an audio device:
+> `csp_view::flight`'s `FlightSfx` edge-detects the named transitions — engine ignition/cut,
+> staging/jettison, breakup, contact/impact — and flashes them in the flight HUD, and the same
+> transition stream is the seam a real backend consumes. Actual sound output is deferred to M10's
+> own exit row: no audio stack exists in the tree, and adding one mid-milestone would pull a new
+> dependency through this section's license audit plus the wasm CI matrix for zero gate-visible
+> fidelity. Reentry plasma (convective-flux-driven hull sheath) and ground-contact dust (the §2.9
+> geometric predicate wired to a surface puff) ship in full.
+
 ---
 
 ## 4. KSP-mod-equivalent features — scoped, with a cut list

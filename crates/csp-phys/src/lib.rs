@@ -66,6 +66,7 @@ pub mod readout;
 pub mod resolve;
 pub mod session;
 pub mod simple;
+pub mod structural;
 pub mod tensor;
 pub mod thermal;
 pub mod weld;
@@ -96,6 +97,10 @@ pub use simple::{
     DEFAULT_SETTLE_W, Environment, PHYSICS_DT, SOLVER_ITERATIONS, SimpleBackend,
     atmosphere_density_kg_m3, atmosphere_pressure_pa, atmosphere_sound_speed_mps,
     atmosphere_temperature_k,
+};
+pub use structural::{
+    JointLoad, PartForce, failed_joints, fragment_graph, fragment_graph_of, fragment_velocity,
+    joint_loads, subtree_set,
 };
 pub use tensor::{Axis, SymMat3};
 pub use thermal::step as thermal_step;

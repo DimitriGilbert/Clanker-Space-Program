@@ -13,7 +13,7 @@
 use serde::{Deserialize, Serialize};
 
 use csp_core::{DVec3, StableDiscriminant};
-use csp_data::{AeroDef, ThermalDef};
+use csp_data::{AeroDef, StructuralDef, ThermalDef};
 
 use crate::tensor::SymMat3;
 
@@ -182,6 +182,15 @@ pub struct WeldPart {
     /// `WeldPart`s must carry finite, in-range values (the weld's
     /// input gate).
     pub thermal: ThermalDef,
+    /// §3.1 `structural`: the part's attachment limits —
+    /// `max_axial_n`/`max_shear_n`/`max_torque_nm`. Stage 1 ignores
+    /// them; the §2.4 breakup machinery ([`crate::structural`])
+    /// compares the joint load at each node's attachment against the
+    /// CHILD part's limits and splits the graph where they are
+    /// exceeded. Finite and `>= 0` (the weld's input gate; an
+    /// `INFINITY`-class "unbreakable" is expressed as a large finite
+    /// value).
+    pub structural: StructuralDef,
 }
 
 #[cfg(test)]

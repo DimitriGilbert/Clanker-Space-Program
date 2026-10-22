@@ -26,8 +26,10 @@ use csp_core::SimError;
 use std::collections::BTreeMap;
 
 use csp_render::Gpu;
+use csp_render::flight::FlightRenderer;
 use csp_render::map::MapRenderer;
 use csp_render::vab::VabRenderer;
+use csp_view::flight::FlightEvent;
 use csp_view::map::MapKeyEvent;
 use csp_view::vab::VabEvent;
 use csp_view::{EventClass, ModeSelect, SimCommand, SourceClass, View, ViewMode};
@@ -74,6 +76,7 @@ struct App {
     egui_renderer: Option<egui_wgpu::Renderer>,
     /// The map pass's renderer — pipelines + grow-only vertex buffers
     /// (csp_render::map). `None` until GPU init.
+    flight_renderer: Option<FlightRenderer>,
     map_renderer: Option<MapRenderer>,
     /// The VAB pass's renderer — craft boxes + the offscreen object-id
     /// pick target (csp_render::vab). `None` until GPU init.
@@ -137,6 +140,7 @@ impl App {
             gpu: None,
             egui_state: None,
             egui_renderer: None,
+            flight_renderer: None,
             map_renderer: None,
             vab_renderer: None,
             last_vab_packet: None,
@@ -204,6 +208,11 @@ impl App {
             gpu.surface_format(),
             (gpu.config.width, gpu.config.height),
         );
+        let flight_renderer = FlightRenderer::new(
+            &gpu.device,
+            gpu.surface_format(),
+            (gpu.config.width, gpu.config.height),
+        );
         let info = gpu.adapter.get_info();
         self.view
             .set_gpu_info(info.name.clone(), format!("{:?}", info.backend));
@@ -212,6 +221,7 @@ impl App {
         self.gpu = Some(gpu);
         self.egui_state = Some(egui_state);
         self.egui_renderer = Some(egui_renderer);
+        self.flight_renderer = Some(flight_renderer);
         self.map_renderer = Some(map_renderer);
         self.vab_renderer = Some(vab_renderer);
         self.view
@@ -265,6 +275,9 @@ impl App {
                 .set_craft_files(self.craft_store.keys().cloned().collect());
             self.view
                 .vab_event(VabEvent::Notice(format!("saved {name}")));
+        }
+        if outbox.launch {
+            self.view.launch_craft();
         }
         if let Some(name) = outbox.craft_load {
             match self.craft_store.get(&name) {
@@ -462,6 +475,7 @@ impl App {
         // The RenderExtract product: the map pass's vertex data for this
         // frame (None in flight mode).
         let map_packet = self.view.take_map_packet();
+        let flight_packet = self.view.take_flight_packet();
         match self.view.take_vab_packet() {
             Some(p) => self.last_vab_packet = Some(p),
             None => self.last_vab_packet = None,
@@ -512,15 +526,18 @@ impl App {
                     // The VAB renderer owns the depth target (reverse-Z:
                     // clear 0.0 = far, `Greater` wins). Map/egui
                     // pipelines carry no depth state and ignore it.
-                    depth_stencil_attachment: self.vab_renderer.as_ref().map(|v| {
-                        wgpu::RenderPassDepthStencilAttachment {
-                            view: v.depth_view(),
-                            depth_ops: Some(wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(0.0),
-                                store: wgpu::StoreOp::Store,
-                            }),
-                            stencil_ops: None,
-                        }
+                    depth_stencil_attachment: (if self.view.mode() == ViewMode::Flight {
+                        self.flight_renderer.as_ref().map(|v| v.depth_view())
+                    } else {
+                        self.vab_renderer.as_ref().map(|v| v.depth_view())
+                    })
+                    .map(|view| wgpu::RenderPassDepthStencilAttachment {
+                        view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(0.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
                     }),
                     timestamp_writes: None,
                     occlusion_query_set: None,
@@ -533,6 +550,11 @@ impl App {
             }
             if let (Some(v), Some(packet)) = (&mut self.vab_renderer, &self.last_vab_packet) {
                 v.draw(&mut pass, &gpu.device, &gpu.queue, packet);
+            }
+            if self.view.mode() == ViewMode::Flight
+                && let (Some(f), Some(packet)) = (&mut self.flight_renderer, &flight_packet)
+            {
+                f.draw(&mut pass, &gpu.device, &gpu.queue, packet);
             }
             egui_renderer.render(&mut pass.forget_lifetime(), &tris, &screen);
             drop(cmds); // user command buffers currently unused
@@ -586,6 +608,7 @@ impl App {
     /// `View::map_event` into the Input schedule; pan keys and Tab accept
     /// key-repeat so they track a held key, while `M`/`,`/`.` are
     /// non-repeat single shots.
+    #[allow(clippy::too_many_lines)] // M4c's flight arms lengthened it
     fn key_press(&mut self, event: &winit::event::KeyEvent) {
         let mode = self.view.mode();
         let in_map = mode == ViewMode::Map;
@@ -653,6 +676,25 @@ impl App {
             return;
         }
         let map_event = match &event.logical_key {
+            Key::Character(c) if matches!(c.as_str(), "z" | "Z" | "x" | "X") && !event.repeat => {
+                // M4c flight throttle — the §7.6 command channel like
+                // every other mutation (logged, deterministic).
+                if let Some(vessel) = self.view.flight_focus() {
+                    self.view.enqueue_command(
+                        SourceClass::Ui,
+                        1,
+                        SimCommand::SetThrottle {
+                            vessel,
+                            throttle: if c.eq_ignore_ascii_case("z") {
+                                1.0
+                            } else {
+                                0.0
+                            },
+                        },
+                    );
+                }
+                None
+            }
             Key::Character(c) if c.as_str() == "," && !event.repeat => {
                 self.warp.request_step(-1);
                 return;
@@ -720,6 +762,11 @@ impl ApplicationHandler for App {
                 if let Some(gpu) = &mut self.gpu {
                     gpu.resize(size.width, size.height);
                 }
+                if let (Some(g), Some(f)) = (&self.gpu, &mut self.flight_renderer) {
+                    f.resize(&g.device, size.width, size.height);
+                    self.view
+                        .set_flight_viewport(size.width as f64, size.height as f64);
+                }
                 if let (Some(g), Some(v)) = (&self.gpu, &mut self.vab_renderer) {
                     v.resize(&g.device, size.width, size.height);
                 }
@@ -782,7 +829,9 @@ impl ApplicationHandler for App {
                     match self.view.mode() {
                         ViewMode::Map => self.view.map_event(MapKeyEvent::Orbit { dyaw, dpitch }),
                         ViewMode::Vab => self.view.vab_event(VabEvent::Orbit { dyaw, dpitch }),
-                        ViewMode::Flight => {}
+                        ViewMode::Flight => {
+                            self.view.flight_event(FlightEvent::Orbit { dyaw, dpitch })
+                        }
                     }
                 }
                 // `last_cursor` updates even on egui-consumed moves —
@@ -799,7 +848,7 @@ impl ApplicationHandler for App {
                 match self.view.mode() {
                     ViewMode::Map => self.view.map_event(MapKeyEvent::Zoom { factor }),
                     ViewMode::Vab => self.view.vab_event(VabEvent::Zoom { factor }),
-                    ViewMode::Flight => {}
+                    ViewMode::Flight => self.view.flight_event(FlightEvent::Zoom { factor }),
                 }
             }
             WindowEvent::RedrawRequested => self.render(),

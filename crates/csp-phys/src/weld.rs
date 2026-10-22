@@ -312,6 +312,22 @@ pub fn weld(graph: &PartGraph, effective: &[WeldPart]) -> Result<WeldedBody, Wel
     assemble(&solved)
 }
 
+/// Every node's composed body-frame transform — the map the §2.4
+/// breakup machinery needs to extract subtrees with their body-frame
+/// pose preserved ([`crate::structural::fragment_graph`]). Same
+/// traversal and compose order as the weld itself; validates the
+/// graph first so a malformed craft errors identically.
+pub fn body_transforms(
+    graph: &PartGraph,
+    effective: &[WeldPart],
+) -> Result<BTreeMap<PartNodeId, PartTransform>, WeldError> {
+    validate_structure(graph, effective)?;
+    Ok(solve_transforms(graph, effective)?
+        .into_iter()
+        .map(|(id, s)| (id, s.transform))
+        .collect())
+}
+
 /// Structural pass: root exists and is parentless, non-root parents
 /// exist, effective indices are in bounds, node transforms are finite
 /// with unit rotations, and per-part data is finite and physical. All
@@ -416,6 +432,18 @@ fn validate_effective(node: PartNodeId, ep: &WeldPart) -> Result<(), WeldError> 
     }
     if !th.conduction_w_per_k.is_finite() || th.conduction_w_per_k < 0.0 {
         return Err(bad("weld: part conduction is negative or non-finite"));
+    }
+    // §3.1 structural limits — the breakup joint thresholds; finite
+    // and non-negative like every other authored bound.
+    let s = &ep.structural;
+    if !s.max_axial_n.is_finite() || s.max_axial_n < 0.0 {
+        return Err(bad("weld: part max_axial_n is negative or non-finite"));
+    }
+    if !s.max_shear_n.is_finite() || s.max_shear_n < 0.0 {
+        return Err(bad("weld: part max_shear_n is negative or non-finite"));
+    }
+    if !s.max_torque_nm.is_finite() || s.max_torque_nm < 0.0 {
+        return Err(bad("weld: part max_torque_nm is negative or non-finite"));
     }
     Ok(())
 }
@@ -743,6 +771,7 @@ mod tests {
 
     fn point_part(mass_kg: f64) -> WeldPart {
         WeldPart {
+            structural: csp_data::StructuralDef::unlimited(),
             mass_kg,
             com: DVec3::ZERO,
             inertia: SymMat3::ZERO,
@@ -755,6 +784,7 @@ mod tests {
 
     fn box_part(mass_kg: f64, half: DVec3) -> WeldPart {
         WeldPart {
+            structural: csp_data::StructuralDef::unlimited(),
             mass_kg,
             com: DVec3::ZERO,
             inertia: SymMat3::solid_box(mass_kg, half),

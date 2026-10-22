@@ -20,6 +20,7 @@ use csp_sim::World as SimWorld;
 /// orbit polylines, markers, and the `csp_render::map::MapPacket` the
 /// `RenderExtract` schedule produces. Session state only — the sim is
 /// read through `View::end_frame` staging, never by systems (§2.5).
+pub mod flight;
 pub mod map;
 
 /// The M3 VAB (editor mode): working-craft session hosting, the craft
@@ -138,10 +139,15 @@ impl Drop for EguiPass {
 /// the next tick — one-tick latency, accepted" hand-off.
 #[derive(Resource, Clone, Debug, Default)]
 pub struct UiOutbox {
+    /// The VAB's LAUNCH button — `csp-app` calls
+    /// [`View::launch_craft`] on the next Input phase.
     /// Net warp-ladder steps the panel requested this pass.
     pub warp_step: i32,
     /// A top-bar mode request.
     pub mode: Option<csp_ui::ModeSelect>,
+    /// The VAB's LAUNCH button fired — `csp-app` calls
+    /// [`View::launch_craft`].
+    pub launch: bool,
     /// Save the working craft under this name — `(name, bytes)`.
     pub craft_save: Option<(String, Vec<u8>)>,
     /// Load the named craft file.
@@ -190,6 +196,7 @@ fn build_ui(
     vab_input: Res<vab::VabInput>,
     mut vab: ResMut<vab::VabSessionRes>,
     craft_files: Res<vab::CraftFileList>,
+    flight_ui: Res<flight::FlightUiData>,
     mut outbox: ResMut<UiOutbox>,
 ) {
     let mode = if vab_input.open {
@@ -238,9 +245,25 @@ fn build_ui(
         if mode == csp_ui::ModeSelect::Vab {
             csp_ui::vab::vab_editor(ctx, &mut vab.0, &files, &mut vab_out);
         }
+        if mode == csp_ui::ModeSelect::Flight {
+            csp_ui::flight_hud(
+                ctx,
+                &csp_ui::FlightHudInput {
+                    has_vessel: flight_ui.has_vessel,
+                    alt_m: flight_ui.alt_m,
+                    speed_mps: flight_ui.speed_mps,
+                    vspeed_mps: flight_ui.vspeed_mps,
+                    throttle: flight_ui.throttle,
+                    vessel_count: flight_ui.vessel_count,
+                    debris_count: flight_ui.debris_count,
+                    sfx: &flight_ui.sfx,
+                },
+            );
+        }
     }));
     outbox.warp_step = panel_output.warp_step;
     outbox.mode = vab_out.mode;
+    outbox.launch = vab_out.launch;
     // Save carries the serialized bytes — the app owns the file store.
     // The `if let` keeps `to_bytes` (a bincode pass over the session)
     // behind the actual save request — `Option::zip` would serialize on
@@ -340,10 +363,32 @@ impl View {
         let orbits =
             csp_sim::orbit::PatchedConics::from_body_defs(&defs).map_err(ViewError::Sim)?;
         let balance = csp_data::load_balance(&root.join("balance.ron"))?;
-        let mut view = Self::with_sim(SimWorld::with_config(
+        // M4c presentation floor: the game world runs the physics
+        // bubble over the home planet (same `Environment` convention
+        // `csp-bench`'s flight scenarios use).
+        let terrin = defs
+            .iter()
+            .find(|b| b.id.as_str() == "terrin")
+            .ok_or(ViewError::Sim(SimError::Fatal(
+                "home system has no 'terrin' body",
+            )))?;
+        let mut sim = SimWorld::with_physics(
             orbits,
+            csp_sim::PhysicsConfig {
+                environment: csp_phys::Environment::for_body(
+                    terrin,
+                    csp_core::DVec3::ZERO,
+                    terrin.rotation_period_s,
+                ),
+                dominant: terrin.id.clone(),
+            },
             balance.advance_to_max_events_per_frame,
-        ));
+        );
+        sim.set_vessel_caps(csp_sim::VesselCaps {
+            max_vessels: balance.max_tracked_vessels,
+            max_debris: balance.max_debris,
+        });
+        let mut view = Self::with_sim(sim);
         // M3 VAB: the part catalog + resource registry are data-derived
         // constants for the session model (like BodyTable — §7.3's
         // re-derived-on-load class).
@@ -400,19 +445,34 @@ impl View {
         world.insert_resource(vab::VabFrame::default());
         world.insert_resource(vab::CraftFileList::default());
 
+        // M4c flight resources (see flight.rs): chase camera + the
+        // staged InBubble craft mirrors.
+        world.insert_resource(flight::FlightInput::default());
+        world.insert_resource(flight::FlightInputEvents::default());
+        world.insert_resource(flight::FlightSyncInput::default());
+        world.insert_resource(flight::FlightSnapshot::default());
+        world.insert_resource(flight::FlightUiData::default());
+        world.insert_resource(flight::FlightFrame::default());
+        // §3.7 visual-SFX channel (flight.rs carries the audio deferral).
+        world.insert_resource(flight::FlightSfx::default());
+
         // §2.5: "SimStep and Sync use the single-threaded executor always."
         let mut input = Schedule::default();
-        input.add_systems((map::apply_map_input, vab::apply_vab_input));
+        input.add_systems((
+            map::apply_map_input,
+            vab::apply_vab_input,
+            flight::apply_flight_input,
+        ));
         let mut sim_step = Schedule::default();
         sim_step.set_executor(SingleThreadedExecutor::new());
         let mut sync = Schedule::default();
         sync.set_executor(SingleThreadedExecutor::new());
-        sync.add_systems((sync_mirrors, map::sync_map));
+        sync.add_systems((sync_mirrors, map::sync_map, flight::sync_flight));
 
         let mut presentation = Schedule::default();
-        presentation.add_systems((map::map_present, vab::vab_present));
+        presentation.add_systems((map::map_present, vab::vab_present, flight::flight_present));
         let mut render_extract = Schedule::default();
-        render_extract.add_systems((map::extract_map, vab::extract_vab));
+        render_extract.add_systems((map::extract_map, vab::extract_vab, flight::extract_flight));
 
         let mut ui_build = Schedule::default();
         ui_build.add_systems(build_ui);
@@ -501,6 +561,10 @@ impl View {
         // and polylines derive from OrbitModelRes inside the schedules.
         self.world
             .insert_resource(map::capture_sync_input(&self.sim));
+        // M4c: the flight view's InBubble craft mirrors — same
+        // staging convention (the schedules never read `sim`).
+        self.world
+            .insert_resource(flight::capture_sync_input(&self.sim));
         self.ticks_last_frame = 0;
         self.schedules.sync.run(&mut self.world);
         self.schedules.presentation.run(&mut self.world);
@@ -660,6 +724,86 @@ impl View {
         self.world.resource_mut::<vab::VabFrame>().0.take()
     }
 
+    /// Queue a flight camera event — drained by the `Input`
+    /// schedule's `apply_flight_input`.
+    pub fn flight_event(&mut self, event: flight::FlightEvent) {
+        self.world
+            .resource_mut::<flight::FlightInputEvents>()
+            .pending
+            .push(event);
+    }
+
+    /// Per-frame viewport plumbing for the flight projection —
+    /// physical pixels.
+    pub fn set_flight_viewport(&mut self, width_px: f64, height_px: f64) {
+        self.world.resource_mut::<flight::FlightInput>().viewport_px = (width_px, height_px);
+    }
+
+    /// Take this frame's flight render packet — `None` before the
+    /// first extract. Consumed once by the painter.
+    pub fn take_flight_packet(&mut self) -> Option<csp_render::flight::FlightPacket> {
+        self.world.resource_mut::<flight::FlightFrame>().0.take()
+    }
+
+    /// The focused vessel's `VesselId` — the throttle/attitude
+    /// command target (`None` when no InBubble vessel exists).
+    pub fn flight_focus(&self) -> Option<csp_sim::VesselId> {
+        self.world
+            .resource::<flight::FlightUiData>()
+            .focus
+            .map(csp_sim::VesselId)
+    }
+
+    /// M4c launch: turn the VAB working craft into a physically
+    /// spawned vessel on the pad and switch to the flight view. The
+    /// craft comes from the session's `to_part_graph` +
+    /// `CraftAnalysis.effective` weld inputs (the same resolution the
+    /// editor displays); an empty/missing session falls back to a
+    /// stock booster so the gate is playable out of the box. The
+    /// command rides the normal §7.6 log like every mutation.
+    pub fn launch_craft(&mut self) {
+        let craft = self.with_vab_session(|v| {
+            let session = v.session().clone();
+            let analysis = v.analysis().cloned();
+            (session, analysis)
+        });
+        let craft_def = (|| {
+            let (session, analysis) = craft;
+            if session.is_empty() {
+                return Some(stock_flight_craft());
+            }
+            let (graph, _built) = session.to_part_graph().ok()?;
+            let parts: Vec<csp_phys::WeldPart> = analysis?
+                .effective
+                .iter()
+                .map(|e| e.weld_input.clone())
+                .collect();
+            Some(csp_sim::CraftDef { graph, parts })
+        })();
+        let Some(craft) = craft_def else { return };
+        let Some(env) = self.sim.environment() else {
+            return;
+        };
+        let (r, spin, centre) = (env.radius_m, env.body_spin, env.body_center);
+        let pos = centre + csp_core::DVec3::X * (r + 12.0);
+        let rot =
+            csp_core::DQuat::from_axis_angle(csp_core::DVec3::Y, core::f64::consts::FRAC_PI_2);
+        let vel = spin.cross(pos - centre);
+        let ang_vel = rot.conjugate().rotate(spin);
+        self.enqueue_command(
+            SourceClass::Ui,
+            1,
+            SimCommand::SpawnPhysicalVessel {
+                craft,
+                pos,
+                rot,
+                vel,
+                ang_vel,
+            },
+        );
+        self.set_mode(ViewMode::Flight);
+    }
+
     /// Run a closure against the working-craft session — the plumbing
     /// accessor for tests/tools (app code reaches the session only via
     /// `vab_event` and the UiBuild pass, §2.5).
@@ -712,10 +856,104 @@ impl Default for View {
     }
 }
 
+/// The out-of-the-box stock craft — a three-part booster (pod over
+/// tank over engine) built from raw `WeldPart`s so it needs no part
+/// catalog (matches `csp-bench`'s scenario construction). The weak
+/// adapter limits make a hard full-throttle ascent able to fail the
+/// stack's joint — the fun gate's breakup demonstrator.
+fn stock_flight_craft() -> csp_sim::CraftDef {
+    use csp_phys::{ForceSite, ForceSiteKind, PartGraph, PartNode, PartNodeId, PartTransform};
+    let mk = |mass: f64, half: f64, len: f64| csp_phys::WeldPart {
+        structural: csp_data::StructuralDef {
+            max_axial_n: 3.0e6,
+            max_shear_n: 1.5e6,
+            max_torque_nm: 2.0e6,
+        },
+        mass_kg: mass,
+        com: csp_core::DVec3::ZERO,
+        inertia: csp_phys::SymMat3::solid_box(mass, csp_core::DVec3::new(half, half, len)),
+        collider: csp_phys::ColliderShape::Box {
+            half_extents: csp_core::DVec3::new(half, half, len),
+        },
+        force_sites: Vec::new(),
+        aero: csp_data::AeroDef {
+            cd_curve: vec![csp_data::AeroKnot {
+                mach: 0.0,
+                coeff: 0.9,
+            }],
+            cl_curve: Vec::new(),
+            ref_len_m: 2.0 * half,
+        },
+        thermal: csp_data::ThermalDef {
+            heat_capacity_j_per_k: 400.0 * mass,
+            max_temp_k: 1_500.0,
+            emissivity: 0.8,
+            conduction_w_per_k: 50.0,
+        },
+    };
+    let mut engine = mk(500.0, 0.5, 0.6);
+    engine.force_sites.push(ForceSite::new(
+        csp_core::DVec3::new(0.0, 0.0, -0.6),
+        csp_core::DVec3::Z,
+        ForceSiteKind::Thrust,
+        250_000.0,
+    ));
+    // The adapter under the tank is the authored weak link.
+    let mut adapter = mk(150.0, 0.45, 0.2);
+    adapter.structural = csp_data::StructuralDef {
+        max_axial_n: 120_000.0,
+        max_shear_n: 60_000.0,
+        max_torque_nm: 40_000.0,
+    };
+    let tank = mk(4_500.0, 0.5, 1.2);
+    let pod = mk(1_200.0, 0.55, 0.5);
+    let (e, a, t, p) = (PartNodeId(1), PartNodeId(2), PartNodeId(3), PartNodeId(4));
+    let mut graph = PartGraph::new(e);
+    graph.insert(e, PartNode::new(None, PartTransform::IDENTITY, 0));
+    graph.insert(
+        a,
+        PartNode::new(
+            Some(e),
+            PartTransform::new(
+                csp_core::DVec3::new(0.0, 0.0, 0.8),
+                csp_core::DQuat::IDENTITY,
+            ),
+            1,
+        ),
+    );
+    graph.insert(
+        t,
+        PartNode::new(
+            Some(a),
+            PartTransform::new(
+                csp_core::DVec3::new(0.0, 0.0, 1.4),
+                csp_core::DQuat::IDENTITY,
+            ),
+            2,
+        ),
+    );
+    graph.insert(
+        p,
+        PartNode::new(
+            Some(t),
+            PartTransform::new(
+                csp_core::DVec3::new(0.0, 0.0, 1.7),
+                csp_core::DQuat::IDENTITY,
+            ),
+            3,
+        ),
+    );
+    csp_sim::CraftDef {
+        graph,
+        parts: vec![engine, adapter, tank, pod],
+    }
+}
+
 #[cfg(test)]
 // §2.13's no-panic rule covers shipping fallible paths; tests signal
 // failure by panicking, so unwrap/expect stays legal inside test code.
 #[allow(clippy::unwrap_used, clippy::expect_used)]
+#[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
 

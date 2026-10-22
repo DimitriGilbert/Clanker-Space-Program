@@ -99,6 +99,17 @@ pub struct Contact {
     pub normal: DVec3,
     /// Penetration depth in metres at generation time (`> 0`).
     pub depth: f64,
+    /// Index into `CompoundCollider::hulls` of the hull the
+    /// penetrating vertex belongs to — the part attribution the §2.4
+    /// breakup load evaluation needs (`PartWeld::hull_index`).
+    pub hull: u32,
+    /// The velocity solve's total accumulated impulse on this
+    /// constraint, world frame, N·s (`λ_n·n + λ_t1·t1 + λ_t2·t2`).
+    /// Written back after `solve_velocity`; the Baumgarte position
+    /// pass's pseudo-impulses are deliberately excluded — they are
+    /// position corrections, not forces. Zero on a contact that
+    /// carried no impulse authority this tick.
+    pub impulse: DVec3,
 }
 
 /// The §2.9 physics backend interface — what `csp-sim`'s bubble step

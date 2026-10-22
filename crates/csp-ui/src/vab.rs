@@ -481,6 +481,9 @@ pub struct VabUiOutput {
     pub save_name: Option<String>,
     /// Load the named craft file.
     pub load_name: Option<String>,
+    /// The M4c launch button — spawn the working craft on the pad
+    /// and switch to the flight view.
+    pub launch: bool,
 }
 
 /// The mode bar — always-present top strip with the three view modes.
@@ -504,6 +507,12 @@ pub fn top_bar(ctx: &egui::Context, current: ModeSelect, out: &mut VabUiOutput) 
                     if ui.selectable_label(current == mode, label).clicked() {
                         out.mode = Some(mode);
                     }
+                }
+                ui.separator();
+                // M4c: spawn the working craft on the pad and fly it —
+                // the vertical slice's fun gate.
+                if ui.button("LAUNCH").clicked() {
+                    out.launch = true;
                 }
             });
         });

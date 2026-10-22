@@ -245,6 +245,19 @@ pub struct StructuralDef {
     pub max_torque_nm: f64,
 }
 
+impl StructuralDef {
+    /// Effectively unbreakable limits for hand-authored `WeldPart`s
+    /// (fixtures, single-part test bodies) — finite, so it passes the
+    /// weld's input gate, and far past any real joint load.
+    pub fn unlimited() -> Self {
+        Self {
+            max_axial_n: 1e30,
+            max_shear_n: 1e30,
+            max_torque_nm: 1e30,
+        }
+    }
+}
+
 /// The scalar stat a variant or §3.3 `UpgradeTrack` modifies. Variants
 /// (this file) and upgrade tracks (`data/techtree/*.ron`) share this
 /// vocabulary — `UpgradeTrack { family, stat_path, levels }` resolves

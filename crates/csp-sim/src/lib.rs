@@ -151,6 +151,14 @@ pub struct Vessel {
     /// record lives on the vessel (not the body) so it survives the
     /// body's re-welds and bubble↔rails↔latched transitions.
     pub thermal: VesselThermal,
+    /// M4c debris bookkeeping (§2.9's object caps): `Some(created_tick)`
+    /// marks this vessel as breakup debris — counted against
+    /// `max_debris` with oldest-first eviction (the pair
+    /// `(debris_since, id)` is the deterministic eviction order), removed
+    /// on surface impact in the bubble, decayed on a `DebrisDecay` event
+    /// when its rails periapsis drops below the atmosphere top, and
+    /// deleted outright if it leaves the outermost SOI.
+    pub debris_since: Option<u64>,
 }
 
 impl Vessel {
@@ -487,6 +495,9 @@ pub struct WorldSnapshot {
     /// The event heap's contents in `(tick, seq)` order — the canonical
     /// enumeration; restore re-heapifies deterministically.
     pub event_heap: Vec<ScheduledEvent>,
+    /// §2.9's object caps — construction config, serialized so a
+    /// restored world enforces the same limits.
+    pub vessel_caps: VesselCaps,
 }
 
 /// The world's construction config — data-derived (§7.3): the orbit
@@ -502,6 +513,24 @@ pub struct WorldConfig {
     /// configured.
     pub physics: Option<PhysicsConfig>,
 }
+
+/// §2.9's object caps — construction config (from `balance.ron`),
+/// serialized and hashed like `event_budget` because they change
+/// state evolution (spawn rejections, debris eviction).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VesselCaps {
+    /// `max_tracked_vessels` — spawns beyond this reject `Recoverable`.
+    pub max_vessels: u64,
+    /// `max_debris` — breakup debris beyond this evicts oldest-first
+    /// by `(debris_since, id)`.
+    pub max_debris: u64,
+}
+
+/// Mirror of `balance.ron`'s caps for data-less worlds (unit tests,
+/// the wasm slice) — the same roles as [`DEFAULT_MAX_EVENTS_PER_FRAME`].
+pub const DEFAULT_MAX_VESSELS: u64 = 512;
+/// See [`DEFAULT_MAX_VESSELS`].
+pub const DEFAULT_MAX_DEBRIS: u64 = 64;
 
 /// The §2.13 one-iteration shadow: everything one loop iteration of
 /// `step_frame` can mutate, captured before the iteration runs so a
@@ -662,6 +691,9 @@ pub struct World {
     /// order follows the §2.6.5 subsystem order array, the counter is
     /// hashed sim state.
     next_event_seq: u64,
+    /// §2.9's vessel/debris caps — construction config, hashed and
+    /// serialized (they change state evolution).
+    caps: VesselCaps,
     /// The §2.4/§2.9 bubble: backend + dominant body — construction
     /// config (data-derived, §7.3), `None` for worlds built without
     /// physics. `SimpleBackend`'s contact record is scratch — derived
@@ -739,8 +771,25 @@ impl World {
             tracked_vessels: BTreeSet::new(),
             event_heap: BinaryHeap::new(),
             next_event_seq: 0,
+            caps: VesselCaps {
+                max_vessels: DEFAULT_MAX_VESSELS,
+                max_debris: DEFAULT_MAX_DEBRIS,
+            },
             physics: None,
         }
+    }
+
+    /// §2.9's object caps — post-construction setter for worlds built
+    /// from `balance.ron` ([`View`](csp_view)-side startup,
+    /// `csp-bench` scenario setup). A construction-config write like
+    /// [`Self::with_physics`]: call before the first `step_frame`.
+    pub fn set_vessel_caps(&mut self, caps: VesselCaps) {
+        self.caps = caps;
+    }
+
+    /// The configured caps.
+    pub fn vessel_caps(&self) -> VesselCaps {
+        self.caps
     }
 
     /// A world with the §2.4/§2.9 physics bubble configured — the
@@ -776,6 +825,22 @@ impl World {
     /// — observation only (construction config).
     pub fn environment(&self) -> Option<&csp_phys::Environment> {
         self.physics.as_ref().map(|p| p.backend.environment())
+    }
+
+    /// The §2.9 geometric ground-contact predicate applied on demand
+    /// to `vessel`'s bubble body — `false` for non-`InBubble` vessels
+    /// and worlds without physics. Pure geometry over already-hashed
+    /// state (pos/rot + hulls vs. the environment sphere); derived,
+    /// never stored. The presentation layer's contact-VFX hook
+    /// (PLAN §3.7's ground-contact dust).
+    pub fn ground_contact(&self, vessel: VesselId) -> bool {
+        let (Some(p), Some(v)) = (self.physics.as_ref(), self.vessels.get(&vessel)) else {
+            return false;
+        };
+        match &v.state {
+            VesselState::InBubble(b) => p.backend.ground_contact(b),
+            _ => false,
+        }
     }
 
     /// Vessel ids currently `InBubble` — the documented mask set the
@@ -872,9 +937,9 @@ impl World {
                 return Err(SimError::Fatal("snapshot: event class incoherent"));
             }
             let vessel = match &e.kind {
-                EventKind::SoiTransition { vessel, .. } | EventKind::SoiRescan { vessel } => {
-                    Some(*vessel)
-                }
+                EventKind::SoiTransition { vessel, .. }
+                | EventKind::SoiRescan { vessel }
+                | EventKind::DebrisDecay { vessel } => Some(*vessel),
                 EventKind::PlayerAlarm { .. } => None,
             };
             if let Some(v) = vessel
@@ -895,6 +960,7 @@ impl World {
             vessels: snapshot.vessels,
             tracked_vessels: snapshot.tracked_vessels,
             event_heap: BinaryHeap::from(snapshot.event_heap),
+            caps: snapshot.vessel_caps,
             next_event_seq: snapshot.next_event_seq,
             physics: physics.map(|p| Physics {
                 backend: SimpleBackend::new(p.environment),
@@ -954,6 +1020,7 @@ impl World {
             tracked_vessels: self.tracked_vessels.clone(),
             next_event_seq: self.next_event_seq,
             event_heap,
+            vessel_caps: self.caps,
         })
     }
 
@@ -1143,6 +1210,7 @@ impl World {
     /// to `SurfaceLatched` immediately: the §2.6.4 body-fixed pose is
     /// captured at the tick's sim time, the body leaves the bubble, and
     /// no further ticks touch it.
+    #[allow(clippy::too_many_lines)]
     fn step_bubble_range(
         &mut self,
         now: u64,
@@ -1158,23 +1226,23 @@ impl World {
             return Ok(());
         }
         // §2.4.1: every InBubble body's attached tables must match its
-        // vessel's active mask before the first tick of this range —
-        // covers re-welded bodies (restore, unlatch, jettison, spawn)
-        // and SetAeroConfig installs. Collected first so the borrow
-        // split stays clean; ascending-id order is the fixed order.
+        // vessel's active mask AND its current craft graph before the
+        // first tick of this range — covers re-welded bodies (restore,
+        // unlatch, jettison, spawn), SetAeroConfig installs, and
+        // breakup debris still wearing the parent's tables. Collected
+        // first so the borrow split stays clean; ascending-id order is
+        // the fixed order.
         let needing: Vec<VesselId> = self
             .vessels
             .iter()
-            .filter(|(_, v)| match &v.state {
-                VesselState::InBubble(b) => b.aero.as_ref().is_none_or(|t| t.mask != v.aero_mask),
-                _ => false,
-            })
+            .filter(|(_, v)| aero_tables_stale(v))
             .map(|(id, _)| *id)
             .collect();
         for id in needing {
             self.ensure_aero(id)?;
         }
         self.shadow_vessels(shadow);
+        let caps = self.caps;
         let Self {
             vessels, physics, ..
         } = self;
@@ -1183,9 +1251,16 @@ impl World {
             .ok_or(SimError::Fatal("bubble check raced physics"))?;
         let mut dead_vessels: Vec<VesselId> = Vec::new();
         for t in now..t_next {
-            // Parts that crossed max_temp_k this tick — applied after
-            // the vessel loop so map surgery never disturbs iteration.
-            let mut thermal_hits: Vec<(VesselId, Vec<csp_phys::PartNodeId>)> = Vec::new();
+            // Breakup bookkeeping — applied after the vessel loop so
+            // map surgery never disturbs iteration. `(structural,
+            // thermal)` failed nodes per vessel.
+            let mut failures: BTreeMap<
+                VesselId,
+                (Vec<csp_phys::PartNodeId>, Vec<csp_phys::PartNodeId>),
+            > = BTreeMap::new();
+            // Debris vessels that touched the surface this tick —
+            // §2.9's "suborbital debris is removed on impact".
+            let mut impacted: Vec<VesselId> = Vec::new();
             for (vid, vessel) in vessels.iter_mut() {
                 let VesselState::InBubble(body) = &mut vessel.state else {
                     continue;
@@ -1193,7 +1268,37 @@ impl World {
                 if !body.pos.is_finite() {
                     return Err(SimError::Fatal("non-finite body state mid-tick"));
                 }
+                let (v0, w0) = (body.vel, body.ang_vel);
                 physics.backend.step(std::slice::from_mut(body), &[]);
+                // M4c §2.4 structural evaluation — post-step, like the
+                // thermal tick: joint loads from the tick's measured
+                // Δv/Δω and the per-part external-force budget (aero,
+                // thrust, gravity, contact impulses). A joint whose
+                // load exceeds the child part's authored limits fails.
+                if let Some(craft) = &vessel.craft {
+                    let ext = {
+                        let contacts = physics.backend.contacts(csp_phys::BodyHandle(0));
+                        physics
+                            .backend
+                            .external_loads(body, &craft.graph, &craft.parts, contacts)
+                            .map_err(|e| SimError::Fatal(e.reason()))?
+                    };
+                    let accel_b = body.rot.conjugate().rotate(body.vel - v0) / csp_phys::PHYSICS_DT;
+                    let alpha_b = (body.ang_vel - w0) / csp_phys::PHYSICS_DT;
+                    let loads = csp_phys::joint_loads(
+                        body,
+                        &craft.graph,
+                        &craft.parts,
+                        &ext,
+                        accel_b,
+                        alpha_b,
+                    )
+                    .map_err(|e| SimError::Fatal(e.reason()))?;
+                    let failed = csp_phys::failed_joints(&loads, &craft.graph, &craft.parts);
+                    if !failed.is_empty() {
+                        failures.entry(*vid).or_default().0 = failed;
+                    }
+                }
                 // M4b: the per-part lumped thermal tick — sampled
                 // post-step, so `flow_sample` reads the *end-of-tick*
                 // state, O(dt) off the flow the force model actually
@@ -1213,7 +1318,15 @@ impl World {
                     csp_phys::PHYSICS_DT,
                 );
                 if !hot.is_empty() {
-                    thermal_hits.push((*vid, hot));
+                    failures.entry(*vid).or_default().1 = hot;
+                } else if vessel.debris_since.is_some()
+                    && (body.settle.latched
+                        || !physics.backend.contacts(csp_phys::BodyHandle(0)).is_empty())
+                {
+                    // §2.9: suborbital debris is removed on impact —
+                    // a debris body that touches the surface (or
+                    // settles there) leaves the sim, never latches.
+                    impacted.push(*vid);
                 } else if body.settle.latched {
                     // §3.4 destruction takes precedence over the latch
                     // transition at the same tick — a part that is
@@ -1227,21 +1340,83 @@ impl World {
                     vessel.state = VesselState::SurfaceLatched(pose);
                 }
             }
-            // §3.4 thermal lethality: an overheated part explodes;
-            // the failed node's whole subtree is destroyed with it
-            // (M4b has no debris — M4c lands that; the detached branch
-            // is destroyed). A destroyed root destroys the vessel.
-            // Partial destruction re-welds the remainder in place,
-            // preserving kinematics/settle like a jettison does.
-            for (vid, hot) in thermal_hits {
-                let Some(v) = vessels.get_mut(&vid) else {
-                    continue;
-                };
-                destroy_thermal_parts(v, &hot, physics)?;
-                if v.craft.as_ref().is_none_or(|c| c.graph.nodes.is_empty()) {
+            // Apply the tick's consequences in ascending-vessel-id
+            // order: impacts remove, then §2.4 breakups split.
+            let mut affected: std::collections::BTreeSet<VesselId> =
+                failures.keys().copied().collect();
+            affected.extend(impacted.iter().copied());
+            for vid in affected {
+                if impacted.contains(&vid) {
+                    // Inline removal, not `remove_vessel`: the
+                    // borrow-split above keeps the heap out of reach,
+                    // and the scrub is provably dead code here —
+                    // vessel-named event kinds (SoiTransition,
+                    // SoiRescan, DebrisDecay) are scheduled ONLY for
+                    // on-rails conics and are dropped at `ToBubble`,
+                    // so an `InBubble` vessel is never named by a
+                    // pending event. Same invariant at the
+                    // `max_debris` eviction and the thermal-root
+                    // removal inside `apply_breakup`.
+                    debug_assert!(
+                        !self
+                            .event_heap
+                            .iter()
+                            .any(|e| event_names_vessel(&e.kind, &vid)),
+                        "in-bubble removal: a pending event outlived its conic"
+                    );
                     vessels.remove(&vid);
                     physics.aero.remove(&vid);
                     dead_vessels.push(vid);
+                    continue;
+                }
+                let (sh, th) = failures.get(&vid).cloned().unwrap_or_default();
+                apply_breakup(
+                    vessels,
+                    physics,
+                    &mut self.next_vessel_id,
+                    caps,
+                    vid,
+                    &sh,
+                    &th,
+                    t + 1,
+                    &mut dead_vessels,
+                )?;
+            }
+            // §2.9's `max_debris` — oldest-debris eviction by
+            // `(debris_since, id)`, deterministic per the plan.
+            loop {
+                let mut count = 0u64;
+                let mut oldest: Option<VesselId> = None;
+                for v in vessels.values() {
+                    if let Some(since) = v.debris_since {
+                        count += 1;
+                        if oldest.is_none_or(|o| {
+                            let os = vessels[&o].debris_since.unwrap_or(0);
+                            (since, v.id.0) < (os, o.0)
+                        }) {
+                            oldest = Some(v.id);
+                        }
+                    }
+                }
+                if count <= caps.max_debris {
+                    break;
+                }
+                if let Some(vid) = oldest {
+                    // Same inline-removal invariant as the impact
+                    // path above: evicted debris is `InBubble`, so no
+                    // pending event can name it.
+                    debug_assert!(
+                        !self
+                            .event_heap
+                            .iter()
+                            .any(|e| event_names_vessel(&e.kind, &vid)),
+                        "in-bubble eviction: a pending event outlived its conic"
+                    );
+                    vessels.remove(&vid);
+                    physics.aero.remove(&vid);
+                    dead_vessels.push(vid);
+                } else {
+                    break;
                 }
             }
         }
@@ -1249,6 +1424,90 @@ impl World {
             self.tracked_vessels.remove(&vid);
         }
         Ok(())
+    }
+
+    /// Remove a vessel record and everything it owns: arena entry,
+    /// aero-table cache, tracked opt-in, and every pending event that
+    /// names it. Idempotent — removing an unknown vessel is a no-op.
+    /// Used by the event-driven debris cleanups (`DebrisDecay`, SOI
+    /// escape). The *in-bubble* removals (surface impact,
+    /// `max_debris` eviction, thermal-root destruction inside
+    /// `apply_breakup`) drop the arena/aero/tracked entries inline
+    /// because they run under `step_bubble_range`'s borrow split —
+    /// the event scrub is provably unnecessary there: vessel-named
+    /// events are scheduled only for on-rails conics and dropped at
+    /// `ToBubble`, so nothing pending can name an `InBubble` vessel
+    /// (`debug_assert`ed at those sites).
+    fn remove_vessel(&mut self, vessel: VesselId, shadow: &mut TickShadow) {
+        if !self.vessels.contains_key(&vessel) {
+            return;
+        }
+        self.shadow_vessels(shadow);
+        self.shadow_tracked(shadow);
+        self.vessels.remove(&vessel);
+        self.tracked_vessels.remove(&vessel);
+        if let Some(p) = self.physics.as_mut() {
+            p.aero.remove(&vessel);
+        }
+        self.shadow_events(shadow);
+        let heap = std::mem::take(&mut self.event_heap);
+        self.event_heap = heap
+            .into_iter()
+            .filter(|e| !event_names_vessel(&e.kind, &vessel))
+            .collect();
+    }
+
+    /// §2.9's debris-decay scheduling: after `ToRails` stamps the
+    /// debris vessel's conic, if its periapsis dips below the parent's
+    /// atmosphere top (or the surface on an airless body) the vessel
+    /// burns up / impacts there — schedule `DebrisDecay` at the next
+    /// periapsis passage. Elliptical conics always return to
+    /// periapsis; a hyperbolic one decays only while still inbound
+    /// (`M0 < 0` — past periapsis it escapes and the SOI-exit
+    /// deletion takes it instead).
+    fn schedule_debris_decay(
+        &mut self,
+        vessel: VesselId,
+        elements: &csp_data::KeplerElements,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        let Some(p) = &self.physics else {
+            return Ok(());
+        };
+        let env = p.backend.environment();
+        let rp = elements.semi_major_axis_m * (1.0 - elements.eccentricity);
+        let h_top = env.atmosphere.as_ref().map_or(0.0, |a| a.top_m);
+        if rp - env.radius_m >= h_top {
+            return Ok(());
+        }
+        let two_pi = 2.0 * core::f64::consts::PI;
+        let a_abs = elements.semi_major_axis_m.abs();
+        let n = libm::sqrt(env.mu_m3_per_s2 / (a_abs * a_abs * a_abs));
+        if n <= 0.0 || !n.is_finite() {
+            return Ok(());
+        }
+        let m0 = elements.mean_anomaly_epoch_rad;
+        let dt = if elements.eccentricity < 1.0 {
+            let m = ((m0 % two_pi) + two_pi) % two_pi;
+            if m <= 0.0 {
+                two_pi / n
+            } else {
+                (two_pi - m) / n
+            }
+        } else if m0 < 0.0 {
+            -m0 / n
+        } else {
+            return Ok(());
+        };
+        if !dt.is_finite() || dt < 0.0 {
+            return Ok(());
+        }
+        let at = self
+            .clock
+            .ticks()
+            .saturating_add((dt * csp_core::TICK_HZ as f64).ceil() as u64)
+            .max(self.clock.ticks() + 1);
+        self.schedule_event(EventKind::DebrisDecay { vessel }, at, shadow)
     }
 
     /// §2.6.5's insertion path: assign `seq` from the serialized
@@ -1481,6 +1740,9 @@ impl World {
         elements: &csp_data::KeplerElements,
         shadow: &mut TickShadow,
     ) -> Result<(), SimError> {
+        if self.vessels.len() as u64 >= self.caps.max_vessels {
+            return Err(SimError::Recoverable("spawn: max_tracked_vessels reached"));
+        }
         let orbit = OrbitState {
             parent: parent.clone(),
             elements: elements.clone(),
@@ -1504,6 +1766,7 @@ impl World {
                 aero_mask: csp_phys::ConfigMask::ALL,
                 // Elements-only vessels have no parts to heat.
                 thermal: VesselThermal::default(),
+                debris_since: None,
             },
         );
         // §2.6.5: publish the new vessel's next event time now — the
@@ -1531,6 +1794,11 @@ impl World {
                 "physical spawn: world has no physics environment",
             ));
         };
+        if self.vessels.len() as u64 >= self.caps.max_vessels {
+            return Err(SimError::Recoverable(
+                "physical spawn: max_tracked_vessels reached",
+            ));
+        }
         if !(pos.is_finite()
             && rot.is_finite()
             && vel.is_finite()
@@ -1607,6 +1875,7 @@ impl World {
                 state: VesselState::InBubble(body),
                 aero_mask: csp_phys::ConfigMask::ALL,
                 thermal: VesselThermal::at_ambient(&craft.graph, ambient_k),
+                debris_since: None,
             },
         );
         // No SOI publish: a bubble-resident vessel has no conic.
@@ -1670,11 +1939,23 @@ impl World {
             .vessels
             .get_mut(&vessel)
             .ok_or(SimError::Fatal("to-rails: vessel vanished"))?;
+        let is_debris = vessel_mut.debris_since.is_some();
         vessel_mut.state = VesselState::OnRails(OrbitState {
             parent: dominant,
             elements,
             epoch: self.clock,
         });
+        if is_debris {
+            // §2.9: a debris vessel whose conic decays burns up at
+            // periapsis — schedule its own removal before the SOI scan.
+            let elements = self
+                .vessels
+                .get(&vessel)
+                .and_then(|v| v.orbit())
+                .map(|o| o.elements.clone())
+                .ok_or(SimError::Fatal("to-rails: vessel vanished"))?;
+            self.schedule_debris_decay(vessel, &elements, shadow)?;
+        }
         self.schedule_next_soi(vessel, self.clock, shadow, None)
     }
 
@@ -1733,19 +2014,17 @@ impl World {
     }
 
     /// §2.4.1's lazy attach: ensure the `InBubble` vessel's body
-    /// carries tables for its active `aero_mask` — a no-op outside
-    /// `InBubble`, on airless worlds, or when the attached mask is
-    /// already current. Computation is the deterministic sim-side
-    /// path; the per-mask cache caps at §2.4.1's 8 tables.
+    /// carries tables for its active `aero_mask` built against its
+    /// current craft graph — a no-op outside `InBubble`, on airless
+    /// worlds, or when the attached tables are already current (see
+    /// [`aero_tables_stale`]: mask drift OR graph-hash staleness).
+    /// Computation is the deterministic sim-side path; the per-mask
+    /// cache caps at §2.4.1's 8 tables.
     fn ensure_aero(&mut self, vessel: VesselId) -> Result<(), SimError> {
         let Some(v) = self.vessels.get(&vessel) else {
             return Err(SimError::Recoverable("aero: unknown vessel"));
         };
-        let needs = match &v.state {
-            VesselState::InBubble(body) => body.aero.as_ref().is_none_or(|t| t.mask != v.aero_mask),
-            _ => return Ok(()),
-        };
-        if !needs {
+        if !matches!(v.state, VesselState::InBubble(_)) || !aero_tables_stale(v) {
             return Ok(());
         }
         let Some(craft) = v.craft.clone() else {
@@ -2013,7 +2292,9 @@ impl World {
         let mut body = csp_phys::weld(&craft.graph, &craft.parts)
             .map_err(|e| SimError::Recoverable(e.reason()))?;
         // Preserve kinematics + throttle through the re-weld; the
-        // jettisoned mass leaves the simulation (debris is M4c).
+        // jettisoned mass leaves the simulation outright — jettison
+        // is NOT §2.4 breakup: it discards the part, it does not
+        // spawn a debris fragment.
         let (pos, rot, vel, ang_vel, throttle, settle, com_old) = match &v.state {
             VesselState::InBubble(b) => (
                 b.pos,
@@ -2255,7 +2536,7 @@ impl World {
                     let vessel = match &event.kind {
                         EventKind::SoiTransition { vessel, .. }
                         | EventKind::SoiRescan { vessel } => Some(*vessel),
-                        EventKind::PlayerAlarm { .. } => None,
+                        EventKind::PlayerAlarm { .. } | EventKind::DebrisDecay { .. } => None,
                     };
                     if let Some(vessel) = vessel {
                         self.schedule_event(
@@ -2285,6 +2566,13 @@ impl World {
             // The Orbits subsystem's publish deadline: re-query.
             EventKind::SoiRescan { vessel } => {
                 self.schedule_next_soi(*vessel, SimTime(event.tick), shadow, None)
+            }
+            // §2.9's debris-decay removal: burn-up / impact at the
+            // periapsis tick. Idempotent — an already-removed vessel
+            // makes the stale event a no-op, never an error.
+            EventKind::DebrisDecay { vessel } => {
+                self.remove_vessel(*vessel, shadow);
+                Ok(())
             }
             // §2.6.6: re-base the vessel's elements into the new frame,
             // then publish the new orbit's next event time — suppressing
@@ -2380,6 +2668,16 @@ impl World {
                     ));
                 }
                 let old_parent = self.orbits.body_orbit(body)?;
+                if old_parent.parent.is_none()
+                    && self
+                        .vessels
+                        .get(&vessel_id)
+                        .is_some_and(|v| v.debris_since.is_some())
+                {
+                    // §2.9: debris leaving the outermost SOI is deleted.
+                    self.remove_vessel(vessel_id, shadow);
+                    return Ok(());
+                }
                 let grandparent = old_parent
                     .parent
                     .clone()
@@ -2603,6 +2901,8 @@ impl World {
             },
         );
         h.u64(self.event_budget);
+        h.u64(self.caps.max_vessels);
+        h.u64(self.caps.max_debris);
         h.u64(self.next_vessel_id);
         h.arena(
             csp_core::bubble_mask(self.vessels.iter().map(|(id, v)| (id.0, v)), in_bubble),
@@ -2637,9 +2937,9 @@ impl Default for World {
 /// apply to drop the vessel's dead SOI events when it leaves rails.
 fn event_names_vessel(kind: &EventKind, vessel: &VesselId) -> bool {
     match kind {
-        EventKind::SoiTransition { vessel: v, .. } | EventKind::SoiRescan { vessel: v } => {
-            v == vessel
-        }
+        EventKind::SoiTransition { vessel: v, .. }
+        | EventKind::SoiRescan { vessel: v }
+        | EventKind::DebrisDecay { vessel: v } => v == vessel,
         EventKind::PlayerAlarm { .. } => false,
     }
 }
@@ -2820,6 +3120,11 @@ fn hash_craft(h: &mut StateHasher, craft: &CraftDef) {
         h.f64(p.thermal.max_temp_k);
         h.f64(p.thermal.emissivity);
         h.f64(p.thermal.conduction_w_per_k);
+        // M4c: structural limits are weld input — the breakup
+        // thresholds are part of the craft identity.
+        h.f64(p.structural.max_axial_n);
+        h.f64(p.structural.max_shear_n);
+        h.f64(p.structural.max_torque_nm);
     });
 }
 
@@ -2837,114 +3142,281 @@ fn craft_graph_hash(craft: &CraftDef) -> u64 {
     }
 }
 
-/// §3.4 thermal `Explosion`: destroy every overheated node **and its
-/// subtree** — M4b's reading of "thermal failure splits the part
-/// graph" with no debris machinery (M4c): the failed node and
-/// everything it held up are removed. The vessel's thermal record is
-/// pruned to match, and the remainder re-welds in place with
-/// kinematics/settle preserved (the jettison convention). An emptied
-/// graph — including a destroyed root — leaves `craft.graph` empty;
-/// the caller drops the vessel record. Runs against the split-borrow
-/// halves of `World` inside `step_bubble_range`.
-fn destroy_thermal_parts(
-    v: &mut Vessel,
-    hot: &[csp_phys::PartNodeId],
+/// §2.4.1's staleness predicate, shared by the step's pre-pass and
+/// [`World::ensure_aero`]: the attached tables need a rebuild when
+/// they are missing, their `mask` drifted from the vessel's active
+/// `aero_mask`, OR their `graph_hash` no longer matches the craft —
+/// the last is what makes breakup debris honest: a fragment inherits
+/// the *parent's* table at split (mask equal, hash bound to the
+/// parent graph), and without the hash check it would fly the
+/// parent's geometry — phantom drag and the wrong CoP arm — forever.
+/// `false` for non-`InBubble` vessels.
+fn aero_tables_stale(v: &Vessel) -> bool {
+    let VesselState::InBubble(body) = &v.state else {
+        return false;
+    };
+    body.aero.as_ref().is_none_or(|t| {
+        t.mask != v.aero_mask
+            || v.craft
+                .as_ref()
+                .is_some_and(|c| t.graph_hash != craft_graph_hash(c))
+    })
+}
+
+/// §2.4/§3.4 breakup: split `vessel`'s part graph at its failed
+/// attachments into a retained Stage-1 weld plus one debris fragment
+/// per detached subtree — momentum-conserving per `csp_phys::structural`
+/// (fragments stamp `v + ω×(c_frag − c_parent)` about the parent CoM;
+/// the retained body keeps the jettison convention
+/// `v + ω×(com_new − com_old)`).
+///
+/// Failure kinds (M4c):
+/// - **structural** (`structural_hits`): the joint fails — the failed
+///   node's whole subtree detaches intact as one debris fragment.
+/// - **thermal** (`thermal_hits`): the node itself explodes (mass
+///   destroyed, matching M4b's lethality); each child subtree
+///   detaches as debris instead of vanishing.
+///
+/// A structural failure at the root marks the whole vessel debris
+/// (it IS the fragment); a thermal failure at the root destroys the
+/// vessel outright after its child subtrees have detached. Fragments
+/// are new vessels (`debris_since = tick`), inherit the parent's
+/// aero table until a Stage-2 recompute lands (the `ensure_aero`
+/// graph-hash staleness check rebuilds it), and start
+/// `aero_mask`-active with throttle zeroed — debris has no crew.
+/// Beyond `caps.max_vessels` a fragment is dropped (§2.9's cap;
+/// documented, deterministic).
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
+fn apply_breakup(
+    vessels: &mut BTreeMap<VesselId, Vessel>,
     physics: &mut Physics,
+    next_vessel_id: &mut u64,
+    caps: VesselCaps,
+    vid: VesselId,
+    structural_hits: &[csp_phys::PartNodeId],
+    thermal_hits: &[csp_phys::PartNodeId],
+    tick: u64,
+    dead: &mut Vec<VesselId>,
 ) -> Result<(), SimError> {
-    let VesselState::InBubble(body) = &mut v.state else {
-        return Err(SimError::Fatal("thermal lethality on a non-bubble vessel"));
+    let Some(v) = vessels.get(&vid) else {
+        return Ok(());
     };
-    // The kinematics survive the re-weld — same fields a jettison
-    // preserves; the CoM jump is corrected identically below.
-    let com_old = body.com_local;
-    let (pos, rot, vel, ang_vel, throttle, settle) = (
-        body.pos,
-        body.rot,
-        body.vel,
-        body.ang_vel,
-        body.throttle,
-        body.settle,
-    );
-    let Some(craft) = &mut v.craft else {
-        return Err(SimError::Fatal("thermal lethality on a craft-less vessel"));
+    let (pos, rot, vel, ang_vel, throttle, settle, com_old, aero) = match &v.state {
+        VesselState::InBubble(b) => (
+            b.pos,
+            b.rot,
+            b.vel,
+            b.ang_vel,
+            b.throttle,
+            b.settle,
+            b.com_local,
+            b.aero.clone(),
+        ),
+        _ => return Ok(()),
     };
-    // Destroyed set = each failed node closed under its subtree
-    // (children of a destroyed attachment fall with it).
-    let mut dead: BTreeSet<csp_phys::PartNodeId> = BTreeSet::new();
-    let mut stack: Vec<csp_phys::PartNodeId> = hot.to_vec();
-    while let Some(n) = stack.pop() {
-        if dead.insert(n) {
-            stack.extend(
-                craft
-                    .graph
-                    .nodes
-                    .iter()
-                    .filter(|(_, node)| node.parent == Some(n))
-                    .map(|(id, _)| *id),
-            );
+    let Some(mut craft) = v.craft.clone() else {
+        return Ok(());
+    };
+    let mut temps = v.thermal.part_temps_k.clone();
+    let aero_mask = v.aero_mask;
+    let omega_world = rot.rotate(ang_vel);
+    let transforms = csp_phys::weld::body_transforms(&craft.graph, &craft.parts)
+        .map_err(|e| SimError::Fatal(e.reason()))?;
+
+    // Fragment roots + the node set leaving the retained graph.
+    // Structural failures first (their subtrees claim whole); a
+    // thermal hit inside an already-detached subtree is moot — it
+    // fails inside the fragment, not here.
+    //
+    // Both lists are processed ancestors-first: node ids are
+    // arbitrary labels, NOT parent-before-child order, and the
+    // `removed.contains(&n)` skip only catches a nested failure when
+    // the ancestor claimed first. Unsorted, a descendant hit (say a
+    // smaller id from `failed_joints`' ascending-id order) would
+    // claim its subtree, then the ancestor hit would claim the whole
+    // subtree *again* — the shared nodes welded into two fragments,
+    // mass fabricated.
+    let depth = |g: &csp_phys::PartGraph, mut n: csp_phys::PartNodeId| {
+        let mut d = 0u32;
+        while let Some(p) = g.nodes.get(&n).and_then(|x| x.parent) {
+            n = p;
+            d += 1;
         }
-    }
-    // `ConfigMask` bit i covers graph *position* i in ascending
-    // `PartNodeId` — the bits are positional, not per-part — so the
-    // raw mask cannot survive the node removal: every bit below a
-    // deleted position would shift onto a different part, silently
-    // re-pointing aero-inactivity (zero drag AND zero convective
-    // heating) at the wrong parts. Snapshot the old ordering so each
-    // surviving part's flag can be remapped to its new position.
-    let old_order: Vec<csp_phys::PartNodeId> = craft.graph.nodes.keys().copied().collect();
-    craft.graph.nodes.retain(|id, _| !dead.contains(id));
-    for id in &dead {
-        v.thermal.part_temps_k.remove(id);
-    }
-    if craft.graph.nodes.is_empty() {
-        return Ok(()); // root destroyed — the whole vessel is gone
-    }
-    // Remap the mask bit-by-node. `retain` keeps ascending order, so
-    // walking the old order and skipping the dead visits each survivor
-    // at its new position. Nodes at positions ≥ 64 need no bit —
-    // `ConfigMask::active` treats them as always-on.
-    let mut remapped = csp_phys::ConfigMask(0);
-    let mut new_pos = 0usize;
-    for (old_pos, id) in old_order.iter().enumerate() {
-        if dead.contains(id) {
+        d
+    };
+    let mut structural: Vec<csp_phys::PartNodeId> = structural_hits.to_vec();
+    structural.sort_by_key(|&n| (depth(&craft.graph, n), n));
+    let mut thermal: Vec<csp_phys::PartNodeId> = thermal_hits.to_vec();
+    thermal.sort_by_key(|&n| (depth(&craft.graph, n), n));
+    let mut frag_roots: Vec<csp_phys::PartNodeId> = Vec::new();
+    let mut removed: std::collections::BTreeSet<csp_phys::PartNodeId> =
+        std::collections::BTreeSet::new();
+    for &n in &structural {
+        if !craft.graph.nodes.contains_key(&n) || removed.contains(&n) {
             continue;
         }
-        if v.aero_mask.active(old_pos) && new_pos < 64 {
-            remapped.0 |= 1 << new_pos;
+        if n == craft.graph.root {
+            // The whole craft becomes debris — no split needed.
+            if let Some(v) = vessels.get_mut(&vid) {
+                v.debris_since = Some(tick);
+            }
+            return Ok(());
         }
-        new_pos += 1;
+        frag_roots.push(n);
+        removed.extend(csp_phys::subtree_set(&craft.graph, n));
     }
-    v.aero_mask = remapped;
+    for &n in &thermal {
+        if !craft.graph.nodes.contains_key(&n) || removed.contains(&n) {
+            continue;
+        }
+        // §3.4: n explodes; its direct children root the fragments —
+        // minus any already-claimed subtree (a structural hit under
+        // n claimed first; re-rooting it here would double-count it).
+        let children: Vec<csp_phys::PartNodeId> = craft
+            .graph
+            .nodes
+            .iter()
+            .filter(|(_, x)| x.parent == Some(n))
+            .map(|(i, _)| *i)
+            .filter(|c| !removed.contains(c))
+            .collect();
+        frag_roots.extend(children);
+        removed.extend(csp_phys::subtree_set(&craft.graph, n));
+    }
+    frag_roots.sort();
+    frag_roots.dedup();
+
+    // Claim order is still not enough: a frag root's subtree can
+    // *enclose* an earlier claim — a structural-hit subtree nested
+    // inside a thermal-hit child's subtree claims first, then the
+    // child roots a fragment around it (`subtree_set` walks the
+    // original graph, claimed nodes included). Every fragment's
+    // member set is therefore its subtree minus the nodes an
+    // already-built fragment owns — deepest root first so an inner
+    // claim is always assigned before its enclosure is built.
+    let mut by_depth: Vec<csp_phys::PartNodeId> = frag_roots.clone();
+    by_depth.sort_by_key(|&d| (std::cmp::Reverse(depth(&craft.graph, d)), d));
+    let mut assigned: std::collections::BTreeSet<csp_phys::PartNodeId> =
+        std::collections::BTreeSet::new();
+    let mut members_of: std::collections::BTreeMap<
+        csp_phys::PartNodeId,
+        std::collections::BTreeSet<csp_phys::PartNodeId>,
+    > = std::collections::BTreeMap::new();
+    for d in by_depth {
+        let members: std::collections::BTreeSet<csp_phys::PartNodeId> =
+            csp_phys::subtree_set(&craft.graph, d)
+                .difference(&assigned)
+                .copied()
+                .collect();
+        assigned.extend(members.iter().copied());
+        members_of.insert(d, members);
+    }
+
+    for &d in &frag_roots {
+        if vessels.len() as u64 >= caps.max_vessels {
+            break; // §2.9 cap — fragments beyond it are discarded
+        }
+        let members = &members_of[&d];
+        let frag_g = csp_phys::fragment_graph_of(&craft.graph, &transforms, d, members);
+        let mut fb =
+            csp_phys::weld(&frag_g, &craft.parts).map_err(|e| SimError::Fatal(e.reason()))?;
+        fb.pos = pos;
+        fb.rot = rot;
+        fb.vel = vel + omega_world.cross(rot.rotate(fb.com_local - com_old));
+        fb.ang_vel = ang_vel;
+        fb.aero = aero.clone(); // §2.4: inherit until Stage-2 recompute
+        let id = VesselId(*next_vessel_id);
+        *next_vessel_id = next_vessel_id
+            .checked_add(1)
+            .ok_or(SimError::Fatal("vessel id counter overflow"))?;
+        let frag_nodes: std::collections::BTreeSet<csp_phys::PartNodeId> =
+            frag_g.nodes.keys().copied().collect();
+        vessels.insert(
+            id,
+            Vessel {
+                id,
+                craft: Some(CraftDef {
+                    graph: frag_g,
+                    parts: craft.parts.clone(),
+                }),
+                state: VesselState::InBubble(fb),
+                aero_mask: csp_phys::ConfigMask::ALL,
+                thermal: VesselThermal {
+                    part_temps_k: temps
+                        .iter()
+                        .filter(|(k, _)| frag_nodes.contains(k))
+                        .map(|(k, v)| (*k, *v))
+                        .collect(),
+                },
+                debris_since: Some(tick),
+            },
+        );
+    }
+
+    // The retained graph — everything not detached/exploded.
+    let old_order: Vec<csp_phys::PartNodeId> = craft.graph.nodes.keys().copied().collect();
+    if craft.graph.nodes.keys().all(|k| removed.contains(k)) {
+        // Thermal root failure destroys the vessel outright. Inline
+        // removal (no `remove_vessel` heap scrub): the vessel is
+        // `InBubble`, and vessel-named events are scheduled only for
+        // on-rails conics — documented and `debug_assert`ed at the
+        // other in-bubble removal sites in `step_bubble_range`.
+        vessels.remove(&vid);
+        physics.aero.remove(&vid);
+        dead.push(vid);
+        return Ok(());
+    }
+    craft.graph.nodes.retain(|id, _| !removed.contains(id));
+    // ConfigMask is positional — remap like jettison does.
+    let mut mask = 0u64;
+    let mut new_positions = std::collections::BTreeMap::new();
+    for (j, id) in craft.graph.nodes.keys().enumerate() {
+        new_positions.insert(*id, j);
+    }
+    for (old, id) in old_order.iter().enumerate() {
+        if (aero_mask.0 >> old) & 1 == 1
+            && let Some(&j) = new_positions.get(id)
+        {
+            mask |= 1u64 << j;
+        }
+    }
+    temps.retain(|id, _| craft.graph.nodes.contains_key(id));
     let mut nb =
         csp_phys::weld(&craft.graph, &craft.parts).map_err(|e| SimError::Fatal(e.reason()))?;
     nb.pos = pos;
     nb.rot = rot;
-    // The retained fragment's CoM rides `v + ω×Δr` — identical to the
-    // jettison convention so destruction never injects phantom Δv.
-    let omega_world = rot.rotate(ang_vel);
     nb.vel = vel + omega_world.cross(rot.rotate(nb.com_local - com_old));
     nb.ang_vel = ang_vel;
     nb.throttle = throttle;
     nb.settle = settle;
-    // The mask was remapped bit-by-node above; the body's table must
-    // match the new craft, so rebuild for the active mask and refresh
-    // the world's cache entry (the same weld-time identity).
-    if physics.backend.environment().atmosphere.is_some() {
-        let gh = craft_graph_hash(craft);
-        let t = csp_phys::aero::build_aero_tables(&nb, &craft.graph, &craft.parts, v.aero_mask, gh)
-            .map_err(|e| SimError::Fatal(e.reason()))?;
-        nb.aero = Some(Box::new(t.clone()));
-        physics.aero.insert(
-            v.id,
-            VesselAeroCache {
-                graph_hash: gh,
-                tables: BTreeMap::from([(v.aero_mask, t)]),
-            },
-        );
+    // The retained body's aero table is rebuilt for its new mask —
+    // the M4b destruction path's convention (child fragments keep
+    // the parent's until their Stage-2 recompute lands).
+    nb.aero = if physics.backend.environment().atmosphere.is_some() {
+        Some(Box::new(
+            csp_phys::aero::build_aero_tables(
+                &nb,
+                &craft.graph,
+                &craft.parts,
+                csp_phys::ConfigMask(mask),
+                craft_graph_hash(&craft),
+            )
+            .map_err(|e| SimError::Fatal(e.reason()))?,
+        ))
     } else {
-        physics.aero.remove(&v.id);
-    }
+        None
+    };
+    let Some(v) = vessels.get_mut(&vid) else {
+        return Err(SimError::Fatal("breakup: parent vessel vanished"));
+    };
+    v.craft = Some(craft);
+    v.aero_mask = csp_phys::ConfigMask(mask);
+    v.thermal.part_temps_k = temps;
     v.state = VesselState::InBubble(nb);
+    // The cache is bound to the pre-breakup graph hash — drop it;
+    // `ensure_aero` rebuilds on the staleness check.
+    physics.aero.remove(&vid);
     Ok(())
 }
 
@@ -2953,6 +3425,10 @@ fn hash_vessel(h: &mut StateHasher, vessel: &Vessel) {
         hash_craft(h, craft);
     });
     h.u64(vessel.aero_mask.0);
+    // M4c: debris bookkeeping is hashed sim state (caps + eviction order).
+    h.opt(&vessel.debris_since, |h, t| {
+        h.u64(*t);
+    });
     // M4b: the authoritative per-part temperature record — serialized
     // state, hashed like the body's kinematics.
     h.btree_map(
@@ -3305,6 +3781,10 @@ mod tests {
                 tracked_vessels: BTreeSet::new(),
                 next_event_seq: 0,
                 event_heap: Vec::new(),
+                vessel_caps: VesselCaps {
+                    max_vessels: DEFAULT_MAX_VESSELS,
+                    max_debris: DEFAULT_MAX_DEBRIS,
+                },
             },
         )
         .unwrap();
@@ -4284,6 +4764,7 @@ mod tests {
                 id: VesselId(3),
                 craft: None,
                 aero_mask: csp_phys::ConfigMask::ALL,
+                debris_since: None,
                 thermal: VesselThermal::default(),
                 state: VesselState::OnRails(OrbitState {
                     parent: BodyId::from("p"),
@@ -4427,6 +4908,7 @@ mod tests {
         CraftDef {
             graph,
             parts: vec![csp_phys::WeldPart {
+                structural: csp_data::StructuralDef::unlimited(),
                 mass_kg,
                 com: DVec3::ZERO,
                 inertia: csp_phys::SymMat3::solid_box(mass_kg, half),
@@ -4551,6 +5033,7 @@ mod tests {
             ),
         );
         let payload = csp_phys::WeldPart {
+            structural: csp_data::StructuralDef::unlimited(),
             mass_kg: 500.0,
             com: DVec3::ZERO,
             inertia: csp_phys::SymMat3::solid_box(500.0, DVec3::new(0.5, 0.5, 0.5)),
@@ -4567,6 +5050,7 @@ mod tests {
             },
         };
         let plate = csp_phys::WeldPart {
+            structural: csp_data::StructuralDef::unlimited(),
             mass_kg: 50.0,
             com: DVec3::ZERO,
             inertia: csp_phys::SymMat3::solid_box(50.0, DVec3::new(1.0, 1.0, 0.02)),
@@ -5328,6 +5812,7 @@ mod tests {
         CraftDef {
             graph,
             parts: vec![csp_phys::WeldPart {
+                structural: csp_data::StructuralDef::unlimited(),
                 mass_kg: 1_000.0,
                 com: DVec3::ZERO,
                 inertia: csp_phys::SymMat3::solid_box(1_000.0, DVec3::new(0.5, 0.5, 0.5)),
@@ -5452,6 +5937,7 @@ mod tests {
             ),
         );
         let mk = |max_k: f64| csp_phys::WeldPart {
+            structural: csp_data::StructuralDef::unlimited(),
             mass_kg: 1_000.0,
             com: DVec3::ZERO,
             inertia: csp_phys::SymMat3::solid_box(1_000.0, DVec3::new(0.5, 0.5, 0.5)),
@@ -5502,6 +5988,7 @@ mod tests {
     /// 1 m box whose thermal fields vary per node.
     fn thermal_part(cap_jk: f64, max_k: f64, cond: f64) -> csp_phys::WeldPart {
         csp_phys::WeldPart {
+            structural: csp_data::StructuralDef::unlimited(),
             mass_kg: 1_000.0,
             com: DVec3::ZERO,
             inertia: csp_phys::SymMat3::solid_box(1_000.0, DVec3::new(0.5, 0.5, 0.5)),
@@ -5791,5 +6278,423 @@ mod tests {
         w.step_frame(w.clock().ticks() + 64).unwrap();
         w2.step_frame(w2.clock().ticks() + 64).unwrap();
         assert_eq!(w2.state_hash().unwrap(), w.state_hash().unwrap());
+    }
+
+    /// M4c test craft: engine root (unlimited structure, 200 kN
+    /// thrust site) with a weak payload on top — the child part's
+    /// authored `max_axial_n = 600 N` survives its own ~490 N of
+    /// weight at rest but fails under the landing impact or lift-off
+    /// loads (the subtree's required force is mass×accel, §2.4).
+    fn weak_joint_craft() -> CraftDef {
+        let (e, p) = (csp_phys::PartNodeId(1), csp_phys::PartNodeId(2));
+        let mut graph = csp_phys::PartGraph::new(e);
+        graph.insert(
+            e,
+            csp_phys::PartNode::new(None, csp_phys::PartTransform::IDENTITY, 0),
+        );
+        graph.insert(
+            p,
+            csp_phys::PartNode::new(
+                Some(e),
+                csp_phys::PartTransform::new(DVec3::new(0.0, 0.0, 1.0), csp_core::DQuat::IDENTITY),
+                1,
+            ),
+        );
+        let thermal = csp_data::ThermalDef {
+            heat_capacity_j_per_k: 400_000.0,
+            max_temp_k: 1_100.0,
+            emissivity: 0.8,
+            conduction_w_per_k: 60.0,
+        };
+        let engine = csp_phys::WeldPart {
+            structural: csp_data::StructuralDef::unlimited(),
+            mass_kg: 500.0,
+            com: DVec3::ZERO,
+            inertia: csp_phys::SymMat3::solid_box(500.0, DVec3::new(0.5, 0.5, 0.5)),
+            collider: csp_phys::ColliderShape::Box {
+                half_extents: DVec3::new(0.5, 0.5, 0.5),
+            },
+            force_sites: vec![csp_phys::ForceSite::new(
+                DVec3::new(0.0, 0.0, -0.5),
+                DVec3::Z,
+                csp_phys::ForceSiteKind::Thrust,
+                200_000.0,
+            )],
+            aero: csp_data::AeroDef::constant(0.8, 0.0, 1.0),
+            thermal: thermal.clone(),
+        };
+        let payload = csp_phys::WeldPart {
+            structural: csp_data::StructuralDef {
+                max_axial_n: 600.0,
+                max_shear_n: 1e30,
+                max_torque_nm: 1e30,
+            },
+            mass_kg: 50.0,
+            com: DVec3::ZERO,
+            inertia: csp_phys::SymMat3::solid_box(50.0, DVec3::new(0.4, 0.4, 0.3)),
+            collider: csp_phys::ColliderShape::Box {
+                half_extents: DVec3::new(0.4, 0.4, 0.3),
+            },
+            force_sites: vec![],
+            aero: csp_data::AeroDef::constant(0.8, 0.0, 1.0),
+            thermal,
+        };
+        CraftDef {
+            graph,
+            parts: vec![engine, payload],
+        }
+    }
+
+    /// §2.4 end-to-end: the weak joint overloads on impact, the
+    /// payload subtree detaches as a debris-flagged fragment vessel,
+    /// the retained body is re-welded smaller — and the debris is
+    /// removed when it reaches the surface (§2.9's "suborbital debris
+    /// is removed on impact").
+    #[test]
+    fn structural_overload_breaks_off_debris_fragment() {
+        let mut w = physics_world(false);
+        spawn_physical(
+            &mut w,
+            SimCommand::SpawnPhysicalVessel {
+                craft: weak_joint_craft(),
+                pos: DVec3::new(600_001.5, 0.0, 0.0),
+                rot: csp_core::DQuat::from_axis_angle(DVec3::Y, core::f64::consts::FRAC_PI_2),
+                vel: DVec3::ZERO,
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        assert_eq!(w.vessels().len(), 1);
+        let mut broke_at = None;
+        for t in 2..=1024 {
+            w.step_frame(t).unwrap();
+            if w.vessels().len() > 1 && broke_at.is_none() {
+                broke_at = Some(t);
+                // The fragment: a new vessel, debris-flagged,
+                // InBubble, carrying the payload node.
+                let frag = w
+                    .vessels()
+                    .values()
+                    .find(|v| v.id != VesselId(0))
+                    .expect("breakup produced a second vessel");
+                assert!(frag.debris_since.is_some(), "fragment is debris");
+                assert!(matches!(frag.state, VesselState::InBubble(_)));
+                assert_eq!(frag.craft.as_ref().unwrap().graph.nodes.len(), 1);
+                // The retained vessel lost the payload node.
+                assert_eq!(
+                    w.vessels()[&VesselId(0)]
+                        .craft
+                        .as_ref()
+                        .unwrap()
+                        .graph
+                        .nodes
+                        .len(),
+                    1
+                );
+            }
+            if broke_at.is_some() && w.vessels().len() == 1 {
+                break; // the debris impacted and was removed
+            }
+        }
+        assert!(broke_at.is_some(), "the weak joint overloaded");
+        assert!(
+            !w.vessels().values().any(|v| v.debris_since.is_some()),
+            "the debris fragment was removed on impact"
+        );
+    }
+
+    /// §2.5 determinism + hash coverage across a breakup: two
+    /// identical runs through the weak-joint crash land on the same
+    /// final hash, and a snapshot/restore taken with debris in flight
+    /// reproduces the same state hash (the debris record is hashed).
+    #[test]
+    fn breakup_is_deterministic_and_debris_is_hashed() {
+        let run = || {
+            let mut w = physics_world(false);
+            spawn_physical(
+                &mut w,
+                SimCommand::SpawnPhysicalVessel {
+                    craft: weak_joint_craft(),
+                    pos: DVec3::new(600_001.5, 0.0, 0.0),
+                    rot: csp_core::DQuat::from_axis_angle(DVec3::Y, core::f64::consts::FRAC_PI_2),
+                    vel: DVec3::ZERO,
+                    ang_vel: DVec3::ZERO,
+                },
+            );
+            for t in 2..=256 {
+                w.step_frame(t).unwrap();
+            }
+            w
+        };
+        let mut a = run();
+        let mut b = run();
+        assert_eq!(a.state_hash().unwrap(), b.state_hash().unwrap());
+
+        // Hash coverage: snapshot mid-run is restored bit-identically.
+        let snap = a.snapshot().unwrap();
+        let mut restored = World::restore(
+            PatchedConics::new(BTreeMap::new()),
+            Some(PhysicsConfig {
+                environment: test_env(false),
+                dominant: BodyId::from("p"),
+            }),
+            snap,
+        )
+        .unwrap();
+        assert_eq!(restored.state_hash().unwrap(), a.state_hash().unwrap());
+        a.step_frame(a.clock().ticks() + 64).unwrap();
+        restored.step_frame(restored.clock().ticks() + 64).unwrap();
+        b.step_frame(b.clock().ticks() + 64).unwrap();
+        assert_eq!(restored.state_hash().unwrap(), b.state_hash().unwrap());
+    }
+
+    /// A part-node chain for the nested-failure breakup tests:
+    /// `(id, parent_id)` pairs in weld order, each part an identical
+    /// 50 kg box — node ids deliberately decoupled from tree order.
+    fn chain_craft(chain: &[(u64, Option<u64>)]) -> CraftDef {
+        let mut graph = csp_phys::PartGraph::new(csp_phys::PartNodeId(chain[0].0));
+        for (i, &(id, parent)) in chain.iter().enumerate() {
+            graph.insert(
+                csp_phys::PartNodeId(id),
+                csp_phys::PartNode::new(
+                    parent.map(csp_phys::PartNodeId),
+                    csp_phys::PartTransform::new(
+                        DVec3::new(0.0, 0.0, i as f64),
+                        csp_core::DQuat::IDENTITY,
+                    ),
+                    i as u32,
+                ),
+            );
+        }
+        CraftDef {
+            graph,
+            parts: chain
+                .iter()
+                .map(|_| csp_phys::WeldPart {
+                    structural: csp_data::StructuralDef::unlimited(),
+                    mass_kg: 50.0,
+                    com: DVec3::ZERO,
+                    inertia: csp_phys::SymMat3::solid_box(50.0, DVec3::new(0.4, 0.4, 0.4)),
+                    collider: csp_phys::ColliderShape::Box {
+                        half_extents: DVec3::new(0.4, 0.4, 0.4),
+                    },
+                    force_sites: Vec::new(),
+                    aero: csp_data::AeroDef::constant(0.8, 0.0, 1.0),
+                    thermal: csp_data::ThermalDef {
+                        heat_capacity_j_per_k: 400_000.0,
+                        max_temp_k: 1_100.0,
+                        emissivity: 0.8,
+                        conduction_w_per_k: 60.0,
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    /// Drive `apply_breakup` directly over a one-vessel arena — the
+    /// nested-failure cases need exact `(structural, thermal)` hit
+    /// sets a crash scenario cannot stage deterministically.
+    fn run_breakup(
+        craft: &CraftDef,
+        structural: &[csp_phys::PartNodeId],
+        thermal: &[csp_phys::PartNodeId],
+    ) -> (BTreeMap<VesselId, Vessel>, Vec<VesselId>) {
+        let body = csp_phys::weld(&craft.graph, &craft.parts).unwrap();
+        let mut vessels = BTreeMap::new();
+        vessels.insert(
+            VesselId(0),
+            Vessel {
+                id: VesselId(0),
+                craft: Some(craft.clone()),
+                state: VesselState::InBubble(body),
+                aero_mask: csp_phys::ConfigMask::ALL,
+                thermal: VesselThermal::default(),
+                debris_since: None,
+            },
+        );
+        let mut physics = Physics {
+            backend: SimpleBackend::new(test_env(false)),
+            dominant: BodyId::from("p"),
+            aero: BTreeMap::new(),
+            thermal_rates: Vec::new(),
+        };
+        let mut next_id = 1u64;
+        let mut dead = Vec::new();
+        apply_breakup(
+            &mut vessels,
+            &mut physics,
+            &mut next_id,
+            VesselCaps {
+                max_vessels: 16,
+                max_debris: 16,
+            },
+            VesselId(0),
+            structural,
+            thermal,
+            7,
+            &mut dead,
+        )
+        .unwrap();
+        (vessels, dead)
+    }
+
+    /// Every part-node across every vessel's craft graph, with
+    /// multiplicities — a duplicated subtree shows up as a repeat.
+    fn all_member_nodes(vessels: &BTreeMap<VesselId, Vessel>) -> Vec<u64> {
+        let mut nodes: Vec<u64> = vessels
+            .values()
+            .flat_map(|v| {
+                v.craft
+                    .as_ref()
+                    .map(|c| c.graph.nodes.keys().map(|n| n.0).collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .collect();
+        nodes.sort_unstable();
+        nodes
+    }
+
+    /// M4c regression — the same-tick nested-failure shapes that used
+    /// to weld one subtree into two fragments:
+    ///
+    /// - **structural on descendant AND ancestor**, with the
+    ///   descendant's id *smaller* (the ascending-id order
+    ///   `failed_joints` emits): the ancestor's subtree must claim
+    ///   whole — one fragment, not an overlapping pair.
+    /// - **structural inside a thermal-hit child's subtree**: the
+    ///   child roots a fragment *around* the already-claimed subtree.
+    ///
+    /// Both: every original node must appear in at most one
+    /// resulting graph — a repeat is fabricated mass.
+    #[test]
+    fn nested_breakup_does_not_duplicate_subtrees() {
+        // Chain 0 → 3 → 1 → 2: ids deliberately out of tree order so
+        // the descendant hit (id 1) precedes its ancestor (id 3) in
+        // any ascending-id hit list.
+        let craft = chain_craft(&[(0, None), (3, Some(0)), (1, Some(3)), (2, Some(1))]);
+
+        // Nested structural, descendant-id-first: subtree(3) is one
+        // fragment {1,2,3}; the retained graph keeps only the root.
+        let (vessels, dead) = run_breakup(
+            &craft,
+            &[csp_phys::PartNodeId(1), csp_phys::PartNodeId(3)],
+            &[],
+        );
+        assert!(dead.is_empty());
+        assert_eq!(all_member_nodes(&vessels), vec![0, 1, 2, 3]);
+        let frag = vessels
+            .values()
+            .find(|v| v.id != VesselId(0))
+            .expect("the ancestor's subtree detached");
+        let mut frag_nodes: Vec<u64> = frag
+            .craft
+            .as_ref()
+            .unwrap()
+            .graph
+            .nodes
+            .keys()
+            .map(|n| n.0)
+            .collect();
+        frag_nodes.sort_unstable();
+        assert_eq!(frag_nodes, vec![1, 2, 3], "ancestor subtree claims whole");
+
+        // Structural inside a thermal child's subtree, chain
+        // 0→1→2→3: structural claims {3} first; thermal then explodes
+        // 1 and its child 2 roots a fragment *around* the claim —
+        // members {2} only, not {2,3}.
+        let craft = chain_craft(&[(0, None), (1, Some(0)), (2, Some(1)), (3, Some(2))]);
+        let (vessels, dead) = run_breakup(
+            &craft,
+            &[csp_phys::PartNodeId(3)],
+            &[csp_phys::PartNodeId(1)],
+        );
+        assert!(dead.is_empty());
+        // Node 1 exploded; each survivor appears exactly once.
+        assert_eq!(all_member_nodes(&vessels), vec![0, 2, 3]);
+        let mut sets: Vec<Vec<u64>> = vessels
+            .values()
+            .map(|v| {
+                v.craft
+                    .as_ref()
+                    .unwrap()
+                    .graph
+                    .nodes
+                    .keys()
+                    .map(|n| n.0)
+                    .collect()
+            })
+            .collect();
+        sets.sort();
+        assert_eq!(sets, vec![vec![0], vec![2], vec![3]]);
+        // Mass is conserved exactly: 3 surviving 50 kg parts.
+        let total: f64 = vessels
+            .values()
+            .filter_map(|v| v.body().map(|b| b.mass_kg))
+            .sum();
+        assert_eq!(total, 150.0);
+    }
+
+    /// §2.4.1 staleness: a breakup fragment inherits the parent's
+    /// aero table at the split (the M4c convention) but MUST NOT keep
+    /// it — the table's `graph_hash` binds the parent's graph, so the
+    /// next aero pre-pass rebuilds the fragment's own. This test
+    /// breaks the weak joint in flight (thrust overload at altitude,
+    /// no ground contact to remove the debris) and checks the table
+    /// before and after one more step.
+    #[test]
+    fn fragment_aero_rebuilds_on_graph_staleness() {
+        let mut w = physics_world(false);
+        // 20 km — inside the 70 km atmosphere so tables exist.
+        let pos = DVec3::new(TERRIN_R + 20_000.0, 0.0, 0.0);
+        spawn_physical(
+            &mut w,
+            SimCommand::SpawnPhysicalVessel {
+                craft: weak_joint_craft(),
+                pos,
+                rot: pad_rot(),
+                vel: DVec3::ZERO,
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        let parent_gh = craft_graph_hash(w.vessels()[&VesselId(0)].craft.as_ref().unwrap());
+        // Full throttle: 200 kN on 550 kg overloads the 600 N joint.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SetThrottle {
+                vessel: VesselId(0),
+                throttle: 1.0,
+            },
+        );
+        let mut frag_id = None;
+        for t in w.clock().ticks() + 1..=w.clock().ticks() + 64 {
+            w.step_frame(t).unwrap();
+            if let Some(f) = w.vessels().values().find(|v| v.id != VesselId(0)) {
+                frag_id = Some(f.id);
+                break;
+            }
+        }
+        let frag_id = frag_id.expect("the weak joint failed under thrust");
+        // Split convention: the fragment still wears the PARENT'S
+        // table — mask equal, hash bound to the parent graph.
+        let frag = &w.vessels()[&frag_id];
+        let inherited = frag
+            .body()
+            .and_then(|b| b.aero.as_deref())
+            .expect("fragment carries aero tables in atmosphere");
+        assert_eq!(
+            inherited.graph_hash, parent_gh,
+            "split inherits parent table"
+        );
+        // One step later the pre-pass has rebuilt it for the
+        // fragment's own one-node graph.
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        let frag = &w.vessels()[&frag_id];
+        let rebuilt = frag
+            .body()
+            .and_then(|b| b.aero.as_deref())
+            .expect("fragment keeps aero tables");
+        let own_gh = craft_graph_hash(frag.craft.as_ref().unwrap());
+        assert_eq!(rebuilt.graph_hash, own_gh, "stale table was rebuilt");
+        assert_ne!(rebuilt.graph_hash, parent_gh);
     }
 }

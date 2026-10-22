@@ -388,6 +388,7 @@ mod tests {
 
     fn part(mass: f64, half: f64, thermal: ThermalDef) -> WeldPart {
         WeldPart {
+            structural: csp_data::StructuralDef::unlimited(),
             mass_kg: mass,
             com: DVec3::ZERO,
             inertia: crate::SymMat3::solid_box(mass, DVec3::new(half, half, half)),

@@ -159,7 +159,7 @@ use csp_core::{DQuat, DVec3, TICK_HZ};
 use csp_data::{AtmosphereDef, BodyDef};
 
 use crate::backend::{BodyHandle, Contact, Hit, JointDef, PhysicsBackend, Ray};
-use crate::part::ForceSiteKind;
+use crate::part::{ForceSiteKind, WeldPart};
 use crate::tensor::SymMat3;
 use crate::weld::WeldedBody;
 
@@ -349,6 +349,9 @@ pub fn atmosphere_sound_speed_mps(atm: &AtmosphereDef, altitude_m: f64) -> f64 {
 struct Constraint {
     /// Index into the `bodies` slice (the `body_id` of the ordering).
     body: u32,
+    /// Index into `self.contacts[body]` of this constraint's public
+    /// record — the impulse writeback's channel.
+    contact_index: u32,
     /// The penetrating vertex, body frame (a material point — its
     /// world position is recomputed as the pose evolves).
     local_vertex: DVec3,
@@ -384,8 +387,11 @@ struct Constraint {
 
 impl Constraint {
     /// Build the constraint for one penetrating vertex of `body`.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         body_index: usize,
+        contact_index: usize,
+        hull_index: u32,
         vertex_body: DVec3,
         pos_world: DVec3,
         normal_world: DVec3,
@@ -416,6 +422,7 @@ impl Constraint {
         };
         let constraint = Self {
             body: body_index as u32,
+            contact_index: contact_index as u32,
             local_vertex: vertex_body,
             r_body,
             n_body,
@@ -434,6 +441,8 @@ impl Constraint {
             pos: pos_world,
             normal: normal_world,
             depth,
+            hull: hull_index,
+            impulse: DVec3::ZERO,
         };
         (constraint, contact)
     }
@@ -488,6 +497,140 @@ impl SimpleBackend {
     /// The environment the backend was built with.
     pub fn environment(&self) -> &Environment {
         &self.env
+    }
+
+    /// The per-part external-force budget for the §2.4 breakup load
+    /// evaluation (see `crate::structural` for the model): every
+    /// force the environment and the vessel's own sites apply to each
+    /// graph node this tick — gravity at each part's CoM, per-part
+    /// aero (table path, or the placeholder distributed by mass
+    /// share), thrust sites, and the solved ground-contact impulses
+    /// attributed by hull — expressed in **body frame** as
+    /// [`PartForce`]s.
+    ///
+    /// `contacts` is the manifold record from the last `step` for
+    /// this body (`self.contacts(handle)`); passing it explicitly
+    /// keeps the borrow discipline honest.
+    pub fn external_loads(
+        &self,
+        body: &WeldedBody,
+        graph: &crate::graph::PartGraph,
+        parts: &[WeldPart],
+        contacts: &[Contact],
+    ) -> Result<
+        std::collections::BTreeMap<crate::graph::PartNodeId, Vec<crate::structural::PartForce>>,
+        crate::weld::WeldError,
+    > {
+        use crate::structural::PartForce;
+        let transforms = crate::weld::body_transforms(graph, parts)?;
+        let mut out: std::collections::BTreeMap<crate::graph::PartNodeId, Vec<PartForce>> =
+            std::collections::BTreeMap::new();
+        let conj = body.rot.conjugate();
+        let mut push = |id: crate::graph::PartNodeId, at: DVec3, force: DVec3| {
+            out.entry(id).or_default().push(PartForce { at, force });
+        };
+
+        // Gravity at each part's body-frame CoM — the same analytic
+        // −μ·r̂/r² as `accumulate_forces`, attributed per part.
+        for (id, node) in &graph.nodes {
+            let ep = &parts[node.effective_index as usize];
+            let c_b = transforms[id].apply(ep.com);
+            let rel = (body.pos + body.rot.rotate(c_b)) - self.env.body_center;
+            let r = rel.norm();
+            if r > 0.0 && ep.mass_kg > 0.0 {
+                push(
+                    *id,
+                    c_b,
+                    conj.rotate(rel * (-self.env.mu_m3_per_s2 * ep.mass_kg / (r * r * r))),
+                );
+            }
+        }
+
+        // Aero — the §2.4.1 per-part table breakdown when installed,
+        // else the placeholder total distributed by mass share (a
+        // documented approximation — the placeholder has no
+        // application-point data to do better).
+        if let Some(atm) = &self.env.atmosphere {
+            let rel = body.com_world() - self.env.body_center;
+            let alt = rel.norm() - self.env.radius_m;
+            let rho = atmosphere_density_kg_m3(atm, alt);
+            if rho > 0.0 {
+                let v_rel = body.vel - self.env.body_spin.cross(rel);
+                let speed = v_rel.norm();
+                if speed > 0.0 {
+                    match &body.aero {
+                        Some(tables) => {
+                            let a = atmosphere_sound_speed_mps(atm, alt);
+                            let mach = if a > 0.0 { speed / a } else { 0.0 };
+                            let re_per_len = rho * speed / crate::aero::AIR_VISCOSITY_PA_S;
+                            let w_body = body.rot.conjugate().rotate(v_rel / -speed);
+                            for (node, f, cop) in tables.part_forces_body(
+                                w_body,
+                                0.5 * rho * speed * speed,
+                                mach,
+                                re_per_len,
+                            ) {
+                                push(node, cop, f);
+                            }
+                        }
+                        None => {
+                            let area = cross_section_area(body, v_rel / speed);
+                            let f_b =
+                                conj.rotate(v_rel * (-0.5 * rho * self.env.drag_cd * area * speed));
+                            if body.mass_kg > 0.0 {
+                                for (id, node) in &graph.nodes {
+                                    let ep = &parts[node.effective_index as usize];
+                                    if ep.mass_kg > 0.0 {
+                                        push(
+                                            *id,
+                                            transforms[id].apply(ep.com),
+                                            f_b * (ep.mass_kg / body.mass_kg),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Thrust sites — same channel as `accumulate_forces`.
+        let throttle = body.throttle.clamp(0.0, 1.0);
+        if throttle > 0.0 {
+            for (id, pw) in &body.part_index {
+                let sites = &body.force_sites
+                    [pw.site_start as usize..(pw.site_start + pw.site_len) as usize];
+                for site in sites {
+                    if site.kind == ForceSiteKind::Thrust {
+                        push(
+                            *id,
+                            site.local_pos,
+                            site.local_dir * (throttle * site.rated_n),
+                        );
+                    }
+                }
+            }
+        }
+
+        // Ground-contact impulses ÷ dt, attributed by hull → part.
+        let mut hull_owner: std::collections::BTreeMap<u32, crate::graph::PartNodeId> =
+            std::collections::BTreeMap::new();
+        for (id, pw) in &body.part_index {
+            hull_owner.insert(pw.hull_index, *id);
+        }
+        for c in contacts {
+            if c.impulse.norm_squared() > 0.0
+                && let Some(id) = hull_owner.get(&c.hull)
+            {
+                push(
+                    *id,
+                    conj.rotate(c.pos - body.pos),
+                    conj.rotate(c.impulse) * (1.0 / PHYSICS_DT),
+                );
+            }
+        }
+        Ok(out)
     }
 
     /// Geometric ground-contact predicate — the same rule
@@ -617,7 +760,7 @@ impl SimpleBackend {
             if b.settle.latched {
                 continue;
             }
-            for hull in &b.collider.hulls {
+            for (hull_index, hull) in b.collider.hulls.iter().enumerate() {
                 for v in &hull.vertices {
                     let p = b.pos + b.rot.rotate(*v);
                     let rel = p - self.env.body_center;
@@ -628,8 +771,18 @@ impl SimpleBackend {
                     // authority; it is caught next tick at depth
                     // ≤ v·dt (module docs).
                     if depth > 0.0 && dist > 0.0 {
-                        let (c, record) =
-                            Constraint::new(i, *v, p, rel / dist, depth, b, &self.env);
+                        let ci = self.contacts[i].len();
+                        let (c, record) = Constraint::new(
+                            i,
+                            ci,
+                            hull_index as u32,
+                            *v,
+                            p,
+                            rel / dist,
+                            depth,
+                            b,
+                            &self.env,
+                        );
                         constraints.push(c);
                         self.contacts[i].push(record);
                     }
@@ -925,6 +1078,17 @@ impl PhysicsBackend for SimpleBackend {
         let mut constraints = Vec::new();
         self.generate_contacts(bodies, &mut constraints);
         self.solve_velocity(bodies, &mut constraints);
+        // Write each constraint's accumulated impulse into its public
+        // contact record — the §2.4 breakup load evaluation's
+        // collision data. Position-level Baumgarte corrections are
+        // pseudo-impulses, not forces, and stay out.
+        for c in &constraints {
+            let b = &bodies[c.body as usize];
+            let j = b
+                .rot
+                .rotate(c.n_body * c.lambda_n + c.t1_body * c.lambda_t1 + c.t2_body * c.lambda_t2);
+            self.contacts[c.body as usize][c.contact_index as usize].impulse = j;
+        }
         self.solve_positions(bodies, &constraints);
 
         // Phase 5 — the §2.6.4 terminal state.
@@ -1051,6 +1215,7 @@ mod tests {
             PartNode::new(None, PartTransform::IDENTITY, 0),
         );
         let parts = [WeldPart {
+            structural: csp_data::StructuralDef::unlimited(),
             mass_kg,
             com: DVec3::ZERO,
             inertia: SymMat3::solid_box(mass_kg, half),
@@ -1177,6 +1342,7 @@ mod tests {
         );
         let half = DVec3::new(0.5, 0.5, 0.5);
         let parts = [WeldPart {
+            structural: csp_data::StructuralDef::unlimited(),
             mass_kg: 10.0,
             com: DVec3::ZERO,
             inertia: SymMat3::solid_box(10.0, half),
@@ -1388,6 +1554,7 @@ mod tests {
             ),
         );
         let mk = |m| WeldPart {
+            structural: csp_data::StructuralDef::unlimited(),
             mass_kg: m,
             com: DVec3::ZERO,
             inertia: SymMat3::solid_box(m, DVec3::new(0.5, 0.5, 0.5)),
@@ -1546,6 +1713,7 @@ mod tests {
             ),
         );
         let mk = |m| WeldPart {
+            structural: csp_data::StructuralDef::unlimited(),
             mass_kg: m,
             com: DVec3::ZERO,
             inertia: SymMat3::solid_box(m, DVec3::new(0.5, 0.5, 0.5)),
@@ -1705,6 +1873,7 @@ mod tests {
             PartNode::new(None, PartTransform::IDENTITY, 0),
         );
         let parts = [WeldPart {
+            structural: csp_data::StructuralDef::unlimited(),
             mass_kg: m,
             com: DVec3::ZERO,
             inertia: SymMat3::solid_box(m, half),

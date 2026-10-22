@@ -14,8 +14,8 @@
 //!   not exist yet (`ManeuverNodeStart`, `ContractDeadline`,
 //!   `ResearchProjectComplete`, `LifeSupportDepleted`, `ScriptWake`,
 //!   `Insolvent`, `ConstructionComplete`, `ColonyStore*` ,
-//!   `ReliabilityInspectionDue`, `PartFailure`, `TerminatorCrossing`,
-//!   `DebrisDecay`) are deliberately absent — they land WITH their
+//!   `ReliabilityInspectionDue`, `PartFailure`, `TerminatorCrossing`)
+//!   are deliberately absent — they land WITH their
 //!   producing subsystems (no speculative filler). `SoiRescan` is the
 //!   one kind the plan does not name: it is the Orbits subsystem's own
 //!   publish deadline when the §2.6.6 scan finds no crossing inside the
@@ -159,6 +159,14 @@ pub enum EventKind {
         /// Free-form label for the notification surface.
         label: String,
     } = 2,
+    /// §2.9's debris-decay removal (Silent member): a debris-flagged
+    /// vessel whose rails periapsis dips below its parent's atmosphere
+    /// top (or the surface, on an airless body) burns up / impacts at
+    /// the periapsis tick. Scheduled by `ToRails` on debris vessels.
+    DebrisDecay {
+        /// The debris vessel to remove.
+        vessel: VesselId,
+    } = 3,
 }
 
 impl StableDiscriminant for EventKind {
@@ -167,6 +175,7 @@ impl StableDiscriminant for EventKind {
             Self::SoiTransition { .. } => 0,
             Self::SoiRescan { .. } => 1,
             Self::PlayerAlarm { .. } => 2,
+            Self::DebrisDecay { .. } => 3,
         }
     }
 }
@@ -184,7 +193,7 @@ pub fn class_of(kind: &EventKind, tracked: &BTreeSet<VesselId>) -> EventClass {
                 EventClass::Silent
             }
         }
-        EventKind::SoiRescan { .. } => EventClass::Silent,
+        EventKind::SoiRescan { .. } | EventKind::DebrisDecay { .. } => EventClass::Silent,
         EventKind::PlayerAlarm { .. } => EventClass::Clamping,
     }
 }
@@ -234,6 +243,9 @@ impl ScheduledEvent {
             }
             EventKind::PlayerAlarm { label } => {
                 h.str(label);
+            }
+            EventKind::DebrisDecay { vessel } => {
+                h.u64(vessel.0);
             }
         }
     }

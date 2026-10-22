@@ -148,14 +148,22 @@ fn flight_initial(dir: &Path) -> Result<World, ReplayError> {
         .find(|b| b.id == BodyId::from("terrin"))
         .ok_or(ReplayError::MalformedGolden("fixture lacks terrin"))?;
     let environment = Environment::for_body(terrin, DVec3::ZERO, terrin.rotation_period_s);
-    Ok(World::with_physics(
+    let mut world = World::with_physics(
         orbits,
         PhysicsConfig {
             environment,
             dominant: BodyId::from("terrin"),
         },
         balance.advance_to_max_events_per_frame,
-    ))
+    );
+    // §2.9's object caps come from the fixture's balance.ron — the
+    // same wiring `csp-view` startup does, so fixture-authored caps
+    // are honoured instead of the no-data defaults.
+    world.set_vessel_caps(csp_sim::VesselCaps {
+        max_vessels: balance.max_tracked_vessels,
+        max_debris: balance.max_debris,
+    });
+    Ok(world)
 }
 
 /// The authored part set (§2.4/§3.1 — scenario-side, no VAB): a 5 t
@@ -168,6 +176,7 @@ fn flight_craft() -> csp_sim::CraftDef {
         PartNode::new(None, PartTransform::IDENTITY, 0),
     );
     let booster = WeldPart {
+        structural: csp_data::StructuralDef::unlimited(),
         mass_kg: 5_000.0,
         com: DVec3::ZERO,
         inertia: SymMat3::solid_box(5_000.0, DVec3::new(0.75, 0.75, 3.0)),
@@ -584,6 +593,7 @@ mod tests {
                 ),
             );
             parts.push(WeldPart {
+                structural: csp_data::StructuralDef::unlimited(),
                 mass_kg: 100.0,
                 com: DVec3::ZERO,
                 inertia: SymMat3::solid_box(100.0, DVec3::new(0.5, 0.5, 0.125)),
@@ -672,6 +682,7 @@ mod tests {
                 ),
             );
             parts.push(WeldPart {
+                structural: csp_data::StructuralDef::unlimited(),
                 mass_kg: 100.0,
                 com: DVec3::ZERO,
                 inertia: SymMat3::solid_box(100.0, DVec3::new(0.5, 0.5, 0.125)),

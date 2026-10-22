@@ -781,36 +781,73 @@ impl CraftAeroTables {
         re_per_len: f64,
     ) -> (DVec3, DVec3) {
         let (ids, wt) = self.directions.weights(w);
-        let (i0, i1, i2) = (ids[0] as usize, ids[1] as usize, ids[2] as usize);
         let mut force = DVec3::ZERO;
         let mut torque = DVec3::ZERO;
         for p in &self.parts {
-            let area = wt[0] * p.area_m2[i0] + wt[1] * p.area_m2[i1] + wt[2] * p.area_m2[i2];
-            let shield = wt[0] * p.shielded[i0] + wt[1] * p.shielded[i1] + wt[2] * p.shielded[i2];
-            let a_eff = area * (1.0 - shield);
-            if a_eff <= 0.0 {
+            let Some((fp, cop)) = Self::part_force(p, w, ids, wt, q, mach, re_per_len) else {
                 continue;
-            }
-            let cop = p.cop[i0] * wt[0] + p.cop[i1] * wt[1] + p.cop[i2] * wt[2];
-            let nrm = p.lift_axis[i0] * wt[0] + p.lift_axis[i1] * wt[1] + p.lift_axis[i2] * wt[2];
-            // Lift axis = the *negated* mean exposed-normal's
-            // component ⊥ flow: `nrm` sums outward surface normals
-            // (into the wind), while pressure pushes the body the
-            // opposite way — `−n̂_⊥ŵ` is the physical lift direction
-            // for positive `Cl`.
-            let lift = {
-                let l = nrm - w * nrm.dot(w);
-                let n = l.norm();
-                if n > 1e-12 { -l / n } else { DVec3::ZERO }
             };
-            let cd = eval_aero_curve(&p.aero.cd_curve, mach)
-                + skin_friction_cd(re_per_len * p.aero.ref_len_m);
-            let cl = eval_aero_curve(&p.aero.cl_curve, mach);
-            let fp = (w * cd + lift * cl) * (q * a_eff);
             force = force + fp;
             torque = torque + (cop - self.com_local).cross(fp);
         }
         (force, torque)
+    }
+
+    /// One part's aero force + application point (body frame) —
+    /// [`None`] when the part's effective exposed area is zero.
+    /// Shared by [`Self::force_torque_body`] (identical arithmetic,
+    /// so the total is bitwise unchanged) and
+    /// [`Self::part_forces_body`].
+    fn part_force(
+        p: &PartAeroTable,
+        w: DVec3,
+        ids: [u32; 3],
+        wt: [f64; 3],
+        q: f64,
+        mach: f64,
+        re_per_len: f64,
+    ) -> Option<(DVec3, DVec3)> {
+        let (i0, i1, i2) = (ids[0] as usize, ids[1] as usize, ids[2] as usize);
+        let area = wt[0] * p.area_m2[i0] + wt[1] * p.area_m2[i1] + wt[2] * p.area_m2[i2];
+        let shield = wt[0] * p.shielded[i0] + wt[1] * p.shielded[i1] + wt[2] * p.shielded[i2];
+        let a_eff = area * (1.0 - shield);
+        if a_eff <= 0.0 {
+            return None;
+        }
+        let cop = p.cop[i0] * wt[0] + p.cop[i1] * wt[1] + p.cop[i2] * wt[2];
+        let nrm = p.lift_axis[i0] * wt[0] + p.lift_axis[i1] * wt[1] + p.lift_axis[i2] * wt[2];
+        let lift = {
+            let l = nrm - w * nrm.dot(w);
+            let n = l.norm();
+            if n > 1e-12 { -l / n } else { DVec3::ZERO }
+        };
+        let cd = eval_aero_curve(&p.aero.cd_curve, mach)
+            + skin_friction_cd(re_per_len * p.aero.ref_len_m);
+        let cl = eval_aero_curve(&p.aero.cl_curve, mach);
+        Some(((w * cd + lift * cl) * (q * a_eff), cop))
+    }
+
+    /// The per-part breakdown of [`Self::force_torque_body`] —
+    /// `(node, force, application point)` per aero-active part in
+    /// ascending `PartNodeId` order, same arithmetic so the vector
+    /// sum is bitwise the total force. The §2.4 breakup machinery's
+    /// structural evaluation needs per-part aero loads, not just the
+    /// body total.
+    pub fn part_forces_body(
+        &self,
+        w: DVec3,
+        q: f64,
+        mach: f64,
+        re_per_len: f64,
+    ) -> Vec<(PartNodeId, DVec3, DVec3)> {
+        let (ids, wt) = self.directions.weights(w);
+        self.parts
+            .iter()
+            .filter_map(|p| {
+                Self::part_force(p, w, ids, wt, q, mach, re_per_len)
+                    .map(|(f, cop)| (p.node, f, cop))
+            })
+            .collect()
     }
 
     /// Pitch-moment derivative `∂Cm/∂α` (per radian) at a Mach-knot
@@ -1427,6 +1464,7 @@ mod tests {
 
     fn box_part(mass_kg: f64, half: DVec3, com: DVec3) -> WeldPart {
         WeldPart {
+            structural: csp_data::StructuralDef::unlimited(),
             mass_kg,
             com,
             inertia: SymMat3::solid_box(mass_kg, half),
@@ -1633,6 +1671,7 @@ mod tests {
             }
         }
         let p = WeldPart {
+            structural: csp_data::StructuralDef::unlimited(),
             mass_kg: 100.0,
             com: DVec3::ZERO,
             inertia: SymMat3::solid_box(100.0, DVec3::new(0.5, 0.5, 0.5)),
@@ -1852,6 +1891,7 @@ mod tests {
             (800.0, 50.0)
         };
         let nose = WeldPart {
+            structural: csp_data::StructuralDef::unlimited(),
             mass_kg: nose_mass,
             com: DVec3::ZERO,
             inertia: SymMat3::solid_box(nose_mass, DVec3::new(0.15, 0.15, 0.4)),
@@ -1863,6 +1903,7 @@ mod tests {
             thermal: test_thermal(),
         };
         let tail = WeldPart {
+            structural: csp_data::StructuralDef::unlimited(),
             mass_kg: tail_mass,
             com: DVec3::ZERO,
             inertia: SymMat3::solid_box(tail_mass, DVec3::new(0.5, 0.5, 0.15)),
