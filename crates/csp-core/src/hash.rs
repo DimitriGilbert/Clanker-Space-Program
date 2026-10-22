@@ -47,7 +47,15 @@ use crate::SimError;
 /// `aero_mask` (§2.4.1's active `ConfigMask`). Bumped for the
 /// flight-launch golden rebless; the trivial golden is vessel-free
 /// and unaffected.
-pub const HASH_SCHEMA_VERSION: u32 = 4;
+///
+/// **Version 5** (M4b): the per-part walk gained the resolved
+/// `thermal` block (`heat_capacity_j_per_k`, `max_temp_k`,
+/// `emissivity`, `conduction_w_per_k`), and the per-vessel walk
+/// gained the authoritative per-part temperature record
+/// (`Vessel::thermal` — serialized state, §7.1 rule 5). Bumped for
+/// the flight-launch golden rebless; the trivial golden is
+/// vessel-free but its stream still starts with the new version.
+pub const HASH_SCHEMA_VERSION: u32 = 5;
 
 /// Rule-7 sum types: the source of an enum's *declared* stable `u16`
 /// discriminant (PLAN §7.1 rule 7).

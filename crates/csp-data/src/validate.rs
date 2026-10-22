@@ -35,8 +35,10 @@
 //! category-consistent modules (an `Engine` part carries an `Engine`
 //! module, …), no `Tank`/`Engine` modules on `Discrete`-scaled parts
 //! (a size menu cannot scale their stats), resource references
-//! resolved against `resources.ron`, and the §3.4 reliability-field
-//! ranges.
+//! resolved against `resources.ron`, the §3.4 reliability-field
+//! ranges, and the M4b thermal Euler-stability bound
+//! (`conduction_w_per_k ≤ heat_capacity_j_per_k` — see
+//! [`ValidationError::ConductionExceedsCapacity`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -383,6 +385,21 @@ pub enum ValidationError {
         /// Why it failed (stable reason token).
         reason: &'static str,
     },
+    /// §3.4 thermal stability bound: `conduction_w_per_k` must not
+    /// exceed `heat_capacity_j_per_k`. M4b integrates the conduction
+    /// net with explicit Euler at the pinned `1/64` s tick — stable
+    /// while each joint satisfies `dt·G·Σ(1/C) ≤ ~0.03`; a joint's
+    /// conductance is the harmonic combination of the two parts' k
+    /// (`≤ 2·min(kᵢ, kⱼ)`), so `k ≤ C` on every part bounds every
+    /// edge the graph can form.
+    ConductionExceedsCapacity {
+        /// The part.
+        part: String,
+        /// Authored `conduction_w_per_k` (W/K).
+        conduction_w_per_k: f64,
+        /// Authored `heat_capacity_j_per_k` (J/K).
+        heat_capacity_j_per_k: f64,
+    },
     /// `data/resources.ron` itself is malformed (schema_version aside —
     /// that reports as [`ValidationError::SchemaVersion`]).
     BadResourceTable {
@@ -565,6 +582,14 @@ impl ValidationError {
             Self::BadAeroCurve { part, reason } => {
                 write!(f, "{part:?}: aero curve: {reason}")
             }
+            Self::ConductionExceedsCapacity {
+                part,
+                conduction_w_per_k,
+                heat_capacity_j_per_k,
+            } => write!(
+                f,
+                "{part:?}: conduction {conduction_w_per_k} W/K exceeds heat capacity {heat_capacity_j_per_k} J/K — the explicit-Euler thermal tick would be unstable"
+            ),
             Self::BadResourceTable { reason } => {
                 write!(f, "resources.ron: {reason}")
             }
@@ -1774,6 +1799,22 @@ fn check_part(p: &LoadedPart, res: &ResourceFile, out: &mut Vec<ValidationError>
             value: part.thermal.conduction_w_per_k,
         });
     }
+    // §3.4's explicit-Euler stability bound: a joint's conductance is
+    // the harmonic combination of the two parts' `conduction_w_per_k`
+    // (≤ 2·min(kᵢ, kⱼ)), so `k ≤ C` on every part keeps every edge's
+    // dt·G·Σ(1/C) at ~0.03 or below — authored data cannot build an
+    // unstable net. Gated on the scalar checks passing so one bad
+    // field reports exactly one error.
+    if part.thermal.heat_capacity_j_per_k.is_finite()
+        && part.thermal.heat_capacity_j_per_k > 0.0
+        && part.thermal.conduction_w_per_k > part.thermal.heat_capacity_j_per_k
+    {
+        out.push(ValidationError::ConductionExceedsCapacity {
+            part: part_id.to_string(),
+            conduction_w_per_k: part.thermal.conduction_w_per_k,
+            heat_capacity_j_per_k: part.thermal.heat_capacity_j_per_k,
+        });
+    }
     part_positive(
         part_id,
         "structural.max_axial_n",
@@ -2789,6 +2830,25 @@ mod tests {
                 .any(|e| matches!(e, ValidationError::BadAeroCurve { .. })),
             "{errs:?}"
         );
+    }
+
+    /// §3.4's Euler-stability bound: `conduction_w_per_k` above
+    /// `heat_capacity_j_per_k` is rejected; equality is the accepted
+    /// edge.
+    #[test]
+    fn conduction_exceeding_capacity_is_rejected() {
+        let mut d = part_fixture();
+        d.thermal.conduction_w_per_k = d.thermal.heat_capacity_j_per_k + 1.0;
+        let errs = part_errors(d);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::ConductionExceedsCapacity { .. })),
+            "{errs:?}"
+        );
+        // The boundary itself is valid.
+        let mut d = part_fixture();
+        d.thermal.conduction_w_per_k = d.thermal.heat_capacity_j_per_k;
+        assert!(part_errors(d).is_empty());
     }
 
     #[test]

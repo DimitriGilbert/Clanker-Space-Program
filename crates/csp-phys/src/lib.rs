@@ -67,6 +67,7 @@ pub mod resolve;
 pub mod session;
 pub mod simple;
 pub mod tensor;
+pub mod thermal;
 pub mod weld;
 
 pub use aero::{
@@ -97,4 +98,9 @@ pub use simple::{
     atmosphere_temperature_k,
 };
 pub use tensor::{Axis, SymMat3};
+pub use thermal::step as thermal_step;
+pub use thermal::{
+    CONVECTIVE_HEAT_FRACTION, SPACE_SINK_K, STEFAN_BOLTZMANN_W_M2_K4, ThermalEdge, ThermalFlow,
+    ThermalNet, ThermalNode, ambient_k, flow_sample, joint_conductance, steady_state_temp_k,
+};
 pub use weld::{CompoundCollider, ConvexHull, PartWeld, SettleState, WeldError, WeldedBody, weld};

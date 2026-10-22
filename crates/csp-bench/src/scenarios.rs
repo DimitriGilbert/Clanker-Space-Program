@@ -115,8 +115,24 @@ pub struct FlightReport {
     pub orbit_elements: Option<csp_data::KeplerElements>,
     /// Deepest atmospheric speed on the way down (m/s) — the reentry.
     pub max_reentry_speed_mps: f64,
+    /// Hottest any part got across the run (K) — the M4b reentry
+    /// heating evidence: must clear ambient and stay under the
+    /// authored `max_temp_k` for a survivable reentry.
+    pub max_part_temp_k: f64,
     /// The tick the vessel surface-latched, if it did.
     pub latch_tick: Option<u64>,
+}
+
+impl FlightReport {
+    /// Fold the vessel's serialized thermal record into the peak.
+    fn sample_thermal(&mut self, vessel: &csp_sim::Vessel) {
+        self.max_part_temp_k = vessel
+            .thermal
+            .part_temps_k
+            .values()
+            .copied()
+            .fold(self.max_part_temp_k, f64::max);
+    }
 }
 
 /// The scenario's build-from-data half: the fixture's system and balance
@@ -165,6 +181,12 @@ fn flight_craft() -> csp_sim::CraftDef {
             200_000.0,
         )],
         aero: csp_data::AeroDef::constant(1.0, 0.0, 1.0),
+        thermal: csp_data::ThermalDef {
+            heat_capacity_j_per_k: 400_000.0,
+            max_temp_k: 1_100.0,
+            emissivity: 0.8,
+            conduction_w_per_k: 60.0,
+        },
     };
     csp_sim::CraftDef {
         graph,
@@ -252,6 +274,7 @@ pub fn flight_run(w: &mut World) -> Result<FlightReport, SimError> {
         let clock = w.clock().ticks();
 
         // On rails there is no body — read state only when present.
+        report.sample_thermal(&w.vessels()[&FLIGHT_VESSEL]);
         let (rel, vel) = match w.vessels()[&FLIGHT_VESSEL].body() {
             Some(b) => (b.com_world() - env.body_center, b.vel),
             None => (DVec3::ZERO, DVec3::ZERO),
@@ -505,6 +528,24 @@ mod tests {
         assert!(ra < r + 200_000.0, "apoapsis {}", ra - r);
         // Reentry happened — atmospheric speed on descent.
         assert!(report.max_reentry_speed_mps > 100.0);
+        // M4b: the heat pulse was real — the part rose well above
+        // ambient but stayed under its authored 1100 K max_temp.
+        // (The fixture reenters at ~2 km/s; the authored craft is a
+        // survivable one, not a lethal one.)
+        assert!(
+            report.max_part_temp_k > 300.0,
+            "no reentry heating observed: {} K",
+            report.max_part_temp_k
+        );
+        eprintln!(
+            "flight reentry peak part temp: {:.1} K",
+            report.max_part_temp_k
+        );
+        assert!(
+            report.max_part_temp_k < 1_100.0,
+            "authored reentry cooked the part: {} K",
+            report.max_part_temp_k
+        );
         assert!(report.latch_tick.is_some());
         assert!(matches!(
             w.vessels()[&FLIGHT_VESSEL].state,
@@ -551,6 +592,12 @@ mod tests {
                 },
                 force_sites: Vec::new(),
                 aero: csp_data::AeroDef::constant(1.0, 0.0, 1.0),
+                thermal: csp_data::ThermalDef {
+                    heat_capacity_j_per_k: 400_000.0,
+                    max_temp_k: 1_100.0,
+                    emissivity: 0.8,
+                    conduction_w_per_k: 60.0,
+                },
             });
         }
         let mut body = csp_phys::weld(&graph, &parts).unwrap();
@@ -633,6 +680,12 @@ mod tests {
                 },
                 force_sites: Vec::new(),
                 aero: csp_data::AeroDef::constant(0.8, 0.2, 1.0),
+                thermal: csp_data::ThermalDef {
+                    heat_capacity_j_per_k: 400_000.0,
+                    max_temp_k: 1_100.0,
+                    emissivity: 0.8,
+                    conduction_w_per_k: 60.0,
+                },
             });
         }
         let body = csp_phys::weld(&graph, &parts).unwrap();

@@ -20,12 +20,42 @@
 //! non-rotating environment the phase rotation is identity and the
 //! record is the inertial pose verbatim.
 
+use std::collections::BTreeMap;
+
 use csp_core::{DQuat, DVec3, SimTime, StableDiscriminant, TICK_HZ};
 use csp_data::BodyId;
-use csp_phys::{Environment, PartGraph, WeldPart, WeldedBody};
+use csp_phys::{Environment, PartGraph, PartNodeId, WeldPart, WeldedBody};
 use serde::{Deserialize, Serialize};
 
 use crate::orbit::OrbitState;
+
+/// The vessel's M4b thermal record — per-part lumped temperatures
+/// (K) keyed by graph node. **Authoritative sim state**: serialized
+/// on the vessel, walked into `state_hash`, and persistent across
+/// residence changes (the bubble tick steps it only while
+/// `InBubble`; on rails and latched the record is held fixed — the
+/// documented v1 approximation; a rails cooldown model is not part
+/// of §4's scope).
+///
+/// The key set mirrors the craft's `PartGraph` nodes exactly:
+/// spawned with every node at the ambient temperature, pruned
+/// alongside the graph on jettison/thermal destruction. An
+/// elements-only vessel (no `craft`) carries an empty map.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct VesselThermal {
+    /// Per-part lump temperature (K), ascending `PartNodeId`.
+    pub part_temps_k: BTreeMap<PartNodeId, f64>,
+}
+
+impl VesselThermal {
+    /// Every graph node at `ambient_k` — the spawn/materialization
+    /// initial condition.
+    pub fn at_ambient(graph: &PartGraph, ambient_k: f64) -> Self {
+        Self {
+            part_temps_k: graph.nodes.keys().map(|id| (*id, ambient_k)).collect(),
+        }
+    }
+}
 
 /// The weld inputs a `SpawnPhysicalVessel` command carries — §2.4's
 /// `weld(part_graph, &[WeldPart])` arguments, verbatim.

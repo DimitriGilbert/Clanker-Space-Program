@@ -1392,6 +1392,15 @@ mod tests {
     use crate::weld::weld;
     use csp_core::DQuat;
 
+    fn test_thermal() -> csp_data::ThermalDef {
+        csp_data::ThermalDef {
+            heat_capacity_j_per_k: 100_000.0,
+            max_temp_k: 1_200.0,
+            emissivity: 0.8,
+            conduction_w_per_k: 50.0,
+        }
+    }
+
     fn aero_def(cd: f64, cl: f64, ref_len: f64) -> AeroDef {
         AeroDef {
             cd_curve: vec![
@@ -1424,6 +1433,7 @@ mod tests {
             collider: ColliderShape::Box { half_extents: half },
             force_sites: vec![],
             aero: aero_def(0.5, 0.1, 1.0),
+            thermal: test_thermal(),
         }
     }
 
@@ -1629,6 +1639,7 @@ mod tests {
             collider: ColliderShape::Points(verts),
             force_sites: vec![],
             aero: aero_def(0.5, 0.1, 2.0),
+            thermal: test_thermal(),
         };
         let body = single_node_body(p.clone(), DVec3::ZERO);
         let g = two_part_graph_single();
@@ -1849,6 +1860,7 @@ mod tests {
             },
             force_sites: vec![],
             aero: aero_def(0.4, 0.1, 0.8),
+            thermal: test_thermal(),
         };
         let tail = WeldPart {
             mass_kg: tail_mass,
@@ -1864,6 +1876,7 @@ mod tests {
             // authored `Cl` stays low so the fixture exercises the
             // intended physics rather than an arbitrary lift ratio.
             aero: aero_def(0.8, 0.05, 1.0),
+            thermal: test_thermal(),
         };
         let mut g = PartGraph::new(PartNodeId(1));
         g.insert(

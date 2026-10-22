@@ -64,7 +64,7 @@ pub mod events;
 /// physics construction config.
 pub mod bubble;
 
-pub use bubble::{CraftDef, PhysicsConfig, SurfacePose, VesselState};
+pub use bubble::{CraftDef, PhysicsConfig, SurfacePose, VesselState, VesselThermal};
 pub use events::{EventClass, EventKind, SUBSYSTEM_ORDER, ScheduledEvent, Subsystem};
 use orbit::{OrbitModel, OrbitState, PatchedConics};
 
@@ -147,6 +147,10 @@ pub struct Vessel {
     /// which derived aero table is authoritative), while the tables
     /// themselves are re-derived caches.
     pub aero_mask: csp_phys::ConfigMask,
+    /// M4b per-part temperature record — see [`VesselThermal`]. The
+    /// record lives on the vessel (not the body) so it survives the
+    /// body's re-welds and bubble↔rails↔latched transitions.
+    pub thermal: VesselThermal,
 }
 
 impl Vessel {
@@ -682,6 +686,12 @@ struct Physics {
     /// absent entry is simply recomputed by the same deterministic
     /// path. `InstallAeroTables` writes here; `ensure_aero` reads.
     aero: BTreeMap<VesselId, VesselAeroCache>,
+    /// M4b thermal-tick scratch: the `thermal_step` rate buffer,
+    /// reused across bodies and ticks so the per-node `vec![0.0; n]`
+    /// isn't a per-body-per-tick allocation. Pure scratch — never
+    /// serialized, never hashed (the whole `Physics` is construction
+    /// config).
+    thermal_rates: Vec<f64>,
 }
 
 /// One vessel's per-mask table cache — `graph_hash` binds the cache
@@ -742,6 +752,7 @@ impl World {
             backend: SimpleBackend::new(physics.environment),
             dominant: physics.dominant,
             aero: BTreeMap::new(),
+            thermal_rates: Vec::new(),
         });
         w
     }
@@ -889,6 +900,7 @@ impl World {
                 backend: SimpleBackend::new(p.environment),
                 dominant: p.dominant,
                 aero: BTreeMap::new(),
+                thermal_rates: Vec::new(),
             }),
         })
     }
@@ -1169,8 +1181,12 @@ impl World {
         let physics = physics
             .as_mut()
             .ok_or(SimError::Fatal("bubble check raced physics"))?;
+        let mut dead_vessels: Vec<VesselId> = Vec::new();
         for t in now..t_next {
-            for vessel in vessels.values_mut() {
+            // Parts that crossed max_temp_k this tick — applied after
+            // the vessel loop so map surgery never disturbs iteration.
+            let mut thermal_hits: Vec<(VesselId, Vec<csp_phys::PartNodeId>)> = Vec::new();
+            for (vid, vessel) in vessels.iter_mut() {
                 let VesselState::InBubble(body) = &mut vessel.state else {
                     continue;
                 };
@@ -1178,7 +1194,30 @@ impl World {
                     return Err(SimError::Fatal("non-finite body state mid-tick"));
                 }
                 physics.backend.step(std::slice::from_mut(body), &[]);
-                if body.settle.latched {
+                // M4b: the per-part lumped thermal tick — sampled
+                // post-step, so `flow_sample` reads the *end-of-tick*
+                // state, O(dt) off the flow the force model actually
+                // integrated over (a documented approximation: at
+                // dt = 1/64 s the offset sits well below the lumped
+                // model's own error). Uses the body's weld-produced
+                // conduction net and its aero-table directional
+                // exposure. The temperatures are the vessel's
+                // serialized record, not a derived cache.
+                let flow = csp_phys::flow_sample(physics.backend.environment(), body);
+                let hot = csp_phys::thermal_step(
+                    &body.thermal,
+                    body.aero.as_deref(),
+                    &flow,
+                    &mut vessel.thermal.part_temps_k,
+                    &mut physics.thermal_rates,
+                    csp_phys::PHYSICS_DT,
+                );
+                if !hot.is_empty() {
+                    thermal_hits.push((*vid, hot));
+                } else if body.settle.latched {
+                    // §3.4 destruction takes precedence over the latch
+                    // transition at the same tick — a part that is
+                    // burning off does not settle first.
                     let pose = bubble::surface_pose_capture(
                         physics.backend.environment(),
                         &physics.dominant,
@@ -1188,6 +1227,26 @@ impl World {
                     vessel.state = VesselState::SurfaceLatched(pose);
                 }
             }
+            // §3.4 thermal lethality: an overheated part explodes;
+            // the failed node's whole subtree is destroyed with it
+            // (M4b has no debris — M4c lands that; the detached branch
+            // is destroyed). A destroyed root destroys the vessel.
+            // Partial destruction re-welds the remainder in place,
+            // preserving kinematics/settle like a jettison does.
+            for (vid, hot) in thermal_hits {
+                let Some(v) = vessels.get_mut(&vid) else {
+                    continue;
+                };
+                destroy_thermal_parts(v, &hot, physics)?;
+                if v.craft.as_ref().is_none_or(|c| c.graph.nodes.is_empty()) {
+                    vessels.remove(&vid);
+                    physics.aero.remove(&vid);
+                    dead_vessels.push(vid);
+                }
+            }
+        }
+        for vid in dead_vessels {
+            self.tracked_vessels.remove(&vid);
         }
         Ok(())
     }
@@ -1443,6 +1502,8 @@ impl World {
                 craft: None,
                 state: VesselState::OnRails(orbit),
                 aero_mask: csp_phys::ConfigMask::ALL,
+                // Elements-only vessels have no parts to heat.
+                thermal: VesselThermal::default(),
             },
         );
         // §2.6.5: publish the new vessel's next event time now — the
@@ -1509,6 +1570,18 @@ impl World {
             body.aero = Some(Box::new(t.clone()));
             tables = Some(t);
         }
+        // M4b: fresh parts start at the ambient temperature of the
+        // spawn point's environment (§3.0 atmosphere temp, else the
+        // deep-space sink).
+        let ambient_k = {
+            let p = self
+                .physics
+                .as_ref()
+                .ok_or(SimError::Fatal("physical spawn: physics vanished"))?;
+            let env = p.backend.environment();
+            let alt = (body.com_world() - env.body_center).norm() - env.radius_m;
+            csp_phys::ambient_k(env, alt)
+        };
         self.shadow_vessels(shadow);
         let id = VesselId(self.next_vessel_id);
         if let (Some(t), Some(p)) = (tables, self.physics.as_mut()) {
@@ -1533,6 +1606,7 @@ impl World {
                 craft: Some(craft.clone()),
                 state: VesselState::InBubble(body),
                 aero_mask: csp_phys::ConfigMask::ALL,
+                thermal: VesselThermal::at_ambient(&craft.graph, ambient_k),
             },
         );
         // No SOI publish: a bubble-resident vessel has no conic.
@@ -1973,6 +2047,7 @@ impl World {
             .ok_or(SimError::Fatal("jettison: vessel vanished"))?;
         v.craft = Some(craft);
         v.aero_mask = csp_phys::ConfigMask::ALL;
+        v.thermal.part_temps_k.remove(&node);
         v.state = VesselState::InBubble(body);
         if let Some(p) = self.physics.as_mut() {
             p.aero.remove(&vessel);
@@ -2575,6 +2650,37 @@ fn event_names_vessel(kind: &EventKind, vessel: &VesselId) -> bool {
 /// serialized kinematic/control/settle fields back on. `SurfaceLatched`
 /// keeps only the fixed-frame pose record; `OnRails` needs nothing.
 fn restore_vessel_state(vessel: &mut Vessel, has_physics: bool) -> Result<(), SimError> {
+    // M4b: the serialized thermal record must match the craft one-to-
+    // one — every graph node has exactly one temperature, finite and
+    // non-negative, and a craft-less vessel has none.
+    match &vessel.craft {
+        Some(craft) => {
+            if !vessel
+                .thermal
+                .part_temps_k
+                .keys()
+                .eq(craft.graph.nodes.keys())
+            {
+                return Err(SimError::Fatal(
+                    "snapshot: thermal record does not cover the part graph",
+                ));
+            }
+            if vessel
+                .thermal
+                .part_temps_k
+                .values()
+                .any(|t| !t.is_finite() || *t < 0.0)
+            {
+                return Err(SimError::Fatal("snapshot: non-finite part temperature"));
+            }
+        }
+        None if !vessel.thermal.part_temps_k.is_empty() => {
+            return Err(SimError::Fatal(
+                "snapshot: thermal record on a craft-less vessel",
+            ));
+        }
+        None => {}
+    }
     match &mut vessel.state {
         VesselState::InBubble(body) => {
             if !has_physics {
@@ -2708,6 +2814,12 @@ fn hash_craft(h: &mut StateHasher, craft: &CraftDef) {
             h.f64(k.coeff);
         });
         h.f64(p.aero.ref_len_m);
+        // M4b: the resolved thermal lump is weld input — part of the
+        // craft identity (the net and its lethality thresholds).
+        h.f64(p.thermal.heat_capacity_j_per_k);
+        h.f64(p.thermal.max_temp_k);
+        h.f64(p.thermal.emissivity);
+        h.f64(p.thermal.conduction_w_per_k);
     });
 }
 
@@ -2725,11 +2837,133 @@ fn craft_graph_hash(craft: &CraftDef) -> u64 {
     }
 }
 
+/// §3.4 thermal `Explosion`: destroy every overheated node **and its
+/// subtree** — M4b's reading of "thermal failure splits the part
+/// graph" with no debris machinery (M4c): the failed node and
+/// everything it held up are removed. The vessel's thermal record is
+/// pruned to match, and the remainder re-welds in place with
+/// kinematics/settle preserved (the jettison convention). An emptied
+/// graph — including a destroyed root — leaves `craft.graph` empty;
+/// the caller drops the vessel record. Runs against the split-borrow
+/// halves of `World` inside `step_bubble_range`.
+fn destroy_thermal_parts(
+    v: &mut Vessel,
+    hot: &[csp_phys::PartNodeId],
+    physics: &mut Physics,
+) -> Result<(), SimError> {
+    let VesselState::InBubble(body) = &mut v.state else {
+        return Err(SimError::Fatal("thermal lethality on a non-bubble vessel"));
+    };
+    // The kinematics survive the re-weld — same fields a jettison
+    // preserves; the CoM jump is corrected identically below.
+    let com_old = body.com_local;
+    let (pos, rot, vel, ang_vel, throttle, settle) = (
+        body.pos,
+        body.rot,
+        body.vel,
+        body.ang_vel,
+        body.throttle,
+        body.settle,
+    );
+    let Some(craft) = &mut v.craft else {
+        return Err(SimError::Fatal("thermal lethality on a craft-less vessel"));
+    };
+    // Destroyed set = each failed node closed under its subtree
+    // (children of a destroyed attachment fall with it).
+    let mut dead: BTreeSet<csp_phys::PartNodeId> = BTreeSet::new();
+    let mut stack: Vec<csp_phys::PartNodeId> = hot.to_vec();
+    while let Some(n) = stack.pop() {
+        if dead.insert(n) {
+            stack.extend(
+                craft
+                    .graph
+                    .nodes
+                    .iter()
+                    .filter(|(_, node)| node.parent == Some(n))
+                    .map(|(id, _)| *id),
+            );
+        }
+    }
+    // `ConfigMask` bit i covers graph *position* i in ascending
+    // `PartNodeId` — the bits are positional, not per-part — so the
+    // raw mask cannot survive the node removal: every bit below a
+    // deleted position would shift onto a different part, silently
+    // re-pointing aero-inactivity (zero drag AND zero convective
+    // heating) at the wrong parts. Snapshot the old ordering so each
+    // surviving part's flag can be remapped to its new position.
+    let old_order: Vec<csp_phys::PartNodeId> = craft.graph.nodes.keys().copied().collect();
+    craft.graph.nodes.retain(|id, _| !dead.contains(id));
+    for id in &dead {
+        v.thermal.part_temps_k.remove(id);
+    }
+    if craft.graph.nodes.is_empty() {
+        return Ok(()); // root destroyed — the whole vessel is gone
+    }
+    // Remap the mask bit-by-node. `retain` keeps ascending order, so
+    // walking the old order and skipping the dead visits each survivor
+    // at its new position. Nodes at positions ≥ 64 need no bit —
+    // `ConfigMask::active` treats them as always-on.
+    let mut remapped = csp_phys::ConfigMask(0);
+    let mut new_pos = 0usize;
+    for (old_pos, id) in old_order.iter().enumerate() {
+        if dead.contains(id) {
+            continue;
+        }
+        if v.aero_mask.active(old_pos) && new_pos < 64 {
+            remapped.0 |= 1 << new_pos;
+        }
+        new_pos += 1;
+    }
+    v.aero_mask = remapped;
+    let mut nb =
+        csp_phys::weld(&craft.graph, &craft.parts).map_err(|e| SimError::Fatal(e.reason()))?;
+    nb.pos = pos;
+    nb.rot = rot;
+    // The retained fragment's CoM rides `v + ω×Δr` — identical to the
+    // jettison convention so destruction never injects phantom Δv.
+    let omega_world = rot.rotate(ang_vel);
+    nb.vel = vel + omega_world.cross(rot.rotate(nb.com_local - com_old));
+    nb.ang_vel = ang_vel;
+    nb.throttle = throttle;
+    nb.settle = settle;
+    // The mask was remapped bit-by-node above; the body's table must
+    // match the new craft, so rebuild for the active mask and refresh
+    // the world's cache entry (the same weld-time identity).
+    if physics.backend.environment().atmosphere.is_some() {
+        let gh = craft_graph_hash(craft);
+        let t = csp_phys::aero::build_aero_tables(&nb, &craft.graph, &craft.parts, v.aero_mask, gh)
+            .map_err(|e| SimError::Fatal(e.reason()))?;
+        nb.aero = Some(Box::new(t.clone()));
+        physics.aero.insert(
+            v.id,
+            VesselAeroCache {
+                graph_hash: gh,
+                tables: BTreeMap::from([(v.aero_mask, t)]),
+            },
+        );
+    } else {
+        physics.aero.remove(&v.id);
+    }
+    v.state = VesselState::InBubble(nb);
+    Ok(())
+}
+
 fn hash_vessel(h: &mut StateHasher, vessel: &Vessel) {
     h.opt(&vessel.craft, |h, craft| {
         hash_craft(h, craft);
     });
     h.u64(vessel.aero_mask.0);
+    // M4b: the authoritative per-part temperature record — serialized
+    // state, hashed like the body's kinematics.
+    h.btree_map(
+        &vessel.thermal.part_temps_k,
+        |h, id| {
+            h.u64(id.0);
+        },
+        |h, t| {
+            h.f64(*t);
+        },
+    );
     h.stable_enum(&vessel.state);
     match &vessel.state {
         VesselState::OnRails(orbit) => {
@@ -4050,6 +4284,7 @@ mod tests {
                 id: VesselId(3),
                 craft: None,
                 aero_mask: csp_phys::ConfigMask::ALL,
+                thermal: VesselThermal::default(),
                 state: VesselState::OnRails(OrbitState {
                     parent: BodyId::from("p"),
                     elements: leo_elements(),
@@ -4207,6 +4442,12 @@ mod tests {
                     Vec::new()
                 },
                 aero: csp_data::AeroDef::constant(1.0, 0.0, 1.0),
+                thermal: csp_data::ThermalDef {
+                    heat_capacity_j_per_k: 400_000.0,
+                    max_temp_k: 1_100.0,
+                    emissivity: 0.8,
+                    conduction_w_per_k: 60.0,
+                },
             }],
         }
     }
@@ -4318,6 +4559,12 @@ mod tests {
             },
             force_sites: vec![],
             aero: csp_data::AeroDef::constant(0.8, 0.2, 1.0),
+            thermal: csp_data::ThermalDef {
+                heat_capacity_j_per_k: 400_000.0,
+                max_temp_k: 1_100.0,
+                emissivity: 0.8,
+                conduction_w_per_k: 60.0,
+            },
         };
         let plate = csp_phys::WeldPart {
             mass_kg: 50.0,
@@ -4328,6 +4575,12 @@ mod tests {
             },
             force_sites: vec![],
             aero: csp_data::AeroDef::constant(0.8, 0.2, 1.0),
+            thermal: csp_data::ThermalDef {
+                heat_capacity_j_per_k: 400_000.0,
+                max_temp_k: 1_100.0,
+                emissivity: 0.8,
+                conduction_w_per_k: 60.0,
+            },
         };
         CraftDef {
             graph,
@@ -5060,5 +5313,483 @@ mod tests {
             w1.state_hash_masked(&w1.in_bubble_ids()).unwrap(),
             w2.state_hash_masked(&w2.in_bubble_ids()).unwrap()
         );
+    }
+
+    // ==================== M4b: thermal ====================
+
+    /// A box craft with authored thermal fields — `max_temp_k` and
+    /// capacity/contacts vary per test.
+    fn thermal_craft(cap_jk: f64, max_k: f64, cond: f64) -> CraftDef {
+        let mut graph = csp_phys::PartGraph::new(csp_phys::PartNodeId(0));
+        graph.nodes.insert(
+            csp_phys::PartNodeId(0),
+            csp_phys::PartNode::new(None, csp_phys::PartTransform::IDENTITY, 0),
+        );
+        CraftDef {
+            graph,
+            parts: vec![csp_phys::WeldPart {
+                mass_kg: 1_000.0,
+                com: DVec3::ZERO,
+                inertia: csp_phys::SymMat3::solid_box(1_000.0, DVec3::new(0.5, 0.5, 0.5)),
+                collider: csp_phys::ColliderShape::Box {
+                    half_extents: DVec3::new(0.5, 0.5, 0.5),
+                },
+                force_sites: Vec::new(),
+                aero: csp_data::AeroDef::constant(1.0, 0.0, 1.0),
+                thermal: csp_data::ThermalDef {
+                    heat_capacity_j_per_k: cap_jk,
+                    max_temp_k: max_k,
+                    emissivity: 0.8,
+                    conduction_w_per_k: cond,
+                },
+            }],
+        }
+    }
+
+    /// Spawn a craft falling straight down into the atmosphere at
+    /// `speed` m/s — the reentry-heating rig.
+    fn spawn_falling(w: &mut World, craft: CraftDef, alt: f64, speed: f64) {
+        spawn_physical(
+            w,
+            SimCommand::SpawnPhysicalVessel {
+                craft,
+                pos: DVec3::new(TERRIN_R + alt, 0.0, 0.0),
+                rot: csp_core::DQuat::IDENTITY,
+                vel: DVec3::new(-speed, 0.0, 0.0),
+                ang_vel: DVec3::ZERO,
+            },
+        );
+    }
+
+    /// A fragile single-part vessel on a fast descent burns up: the
+    /// §3.4 thermal Explosion destroys the root → the whole record.
+    #[test]
+    fn overheat_destroys_vessel() {
+        let mut w = physics_world(false);
+        // 2 km/s at 10 km: ρ≈0.21 → q̇/A ≈ 0.005·0.5·0.21·8e9 ≈
+        // 4.3e6 W/m² → ~43 K/s into a 100 kJ/K lump — a 350 K ceiling
+        // (~60 K over ambient) crosses in ~1.5 s of descent.
+        spawn_falling(
+            &mut w,
+            thermal_craft(100_000.0, 350.0, 60.0),
+            10_000.0,
+            2_000.0,
+        );
+        for _ in 0..16 {
+            if w.vessels().get(&VesselId(0)).is_none() {
+                break;
+            }
+            w.step_frame(w.clock().ticks() + 64).unwrap();
+        }
+        assert!(
+            w.vessels().get(&VesselId(0)).is_none(),
+            "overheated vessel must be destroyed"
+        );
+    }
+
+    /// A survivable descent heats then survives: the lump rises past
+    /// ambient, stays under `max_temp_k`, and the vessel lands the
+    /// parts intact.
+    #[test]
+    fn reentry_heating_survivable() {
+        let mut w = physics_world(false);
+        // 1200 m/s at 20 km: q̇/A ≈ 0.005·0.5·0.05·1.7e9 ≈ 2.2e5 W/m² —
+        // a real but sublethal pulse for a 400 kJ/K, 1100 K part.
+        // (Ambient at 20 km is ~263 K — the 2-knot table interpolates.)
+        spawn_falling(
+            &mut w,
+            thermal_craft(400_000.0, 1_100.0, 60.0),
+            20_000.0,
+            1_200.0,
+        );
+        let t0 = *w.vessels()[&VesselId(0)]
+            .thermal
+            .part_temps_k
+            .values()
+            .next()
+            .unwrap();
+        let mut peak = t0;
+        for _ in 0..40 {
+            w.step_frame(w.clock().ticks() + 64).unwrap();
+            let Some(v) = w.vessels().get(&VesselId(0)) else {
+                break;
+            };
+            for t in v.thermal.part_temps_k.values() {
+                peak = peak.max(*t);
+            }
+        }
+        let v = w.vessels().get(&VesselId(0));
+        assert!(v.is_some(), "survivable reentry must not destroy");
+        assert!(peak > t0 + 1.0, "no heating observed: {t0} -> {peak} K");
+        assert!(peak < 1_100.0, "lethal reentry: {peak} K");
+        // Deterministic regression pin: the peak measured on this rig
+        // is 273.98 K (ambient ~263 K at 20 km, +11 K pulse) — a ±0.5 K
+        // bound keeps the integration pinned without re-running the
+        // measurement on every refactor.
+        assert!(
+            (peak - 273.98).abs() < 0.5,
+            "reentry peak drifted: {peak} K (expected ~273.98 K)"
+        );
+    }
+
+    /// Two touching parts: the leaf's low `max_temp_k` kills only the
+    /// leaf — the root's subtree-pruned graph, thermal record, and
+    /// re-weld stay consistent and the vessel survives.
+    #[test]
+    fn overheat_destroys_leaf_not_root() {
+        let mut w = physics_world(false);
+        let mut graph = csp_phys::PartGraph::new(csp_phys::PartNodeId(0));
+        graph.insert(
+            csp_phys::PartNodeId(0),
+            csp_phys::PartNode::new(None, csp_phys::PartTransform::IDENTITY, 0),
+        );
+        graph.insert(
+            csp_phys::PartNodeId(1),
+            csp_phys::PartNode::new(
+                Some(csp_phys::PartNodeId(0)),
+                csp_phys::PartTransform::new(DVec3::new(0.0, 0.0, 1.0), csp_core::DQuat::IDENTITY),
+                1,
+            ),
+        );
+        let mk = |max_k: f64| csp_phys::WeldPart {
+            mass_kg: 1_000.0,
+            com: DVec3::ZERO,
+            inertia: csp_phys::SymMat3::solid_box(1_000.0, DVec3::new(0.5, 0.5, 0.5)),
+            collider: csp_phys::ColliderShape::Box {
+                half_extents: DVec3::new(0.5, 0.5, 0.5),
+            },
+            force_sites: Vec::new(),
+            aero: csp_data::AeroDef::constant(1.0, 0.0, 1.0),
+            thermal: csp_data::ThermalDef {
+                heat_capacity_j_per_k: 50_000.0,
+                max_temp_k: max_k,
+                emissivity: 0.8,
+                conduction_w_per_k: 0.0, // no conduction: leaf heats alone
+            },
+        };
+        // Root tough (10 000 K cap), leaf fragile (400 K).
+        let craft = CraftDef {
+            graph,
+            parts: vec![mk(10_000.0), mk(400.0)],
+        };
+        spawn_falling(&mut w, craft, 10_000.0, 2_000.0);
+        // Tick until the leaf burns off (a few seconds at most).
+        let mut gone = false;
+        for _ in 0..20 {
+            w.step_frame(w.clock().ticks() + 64).unwrap();
+            let Some(v) = w.vessels().get(&VesselId(0)) else {
+                panic!("root survived — vessel must not be destroyed");
+            };
+            if v.craft.as_ref().unwrap().graph.nodes.len() == 1 {
+                gone = true;
+                break;
+            }
+        }
+        assert!(gone, "fragile leaf never overheated");
+        let v = &w.vessels()[&VesselId(0)];
+        let c = v.craft.as_ref().unwrap();
+        assert!(c.graph.nodes.contains_key(&csp_phys::PartNodeId(0)));
+        assert_eq!(v.thermal.part_temps_k.len(), 1);
+        assert!(
+            v.thermal
+                .part_temps_k
+                .contains_key(&csp_phys::PartNodeId(0))
+        );
+        assert!(matches!(v.state, VesselState::InBubble(_)));
+    }
+
+    /// One `WeldPart` builder shared by the subtree/mask tests: a
+    /// 1 m box whose thermal fields vary per node.
+    fn thermal_part(cap_jk: f64, max_k: f64, cond: f64) -> csp_phys::WeldPart {
+        csp_phys::WeldPart {
+            mass_kg: 1_000.0,
+            com: DVec3::ZERO,
+            inertia: csp_phys::SymMat3::solid_box(1_000.0, DVec3::new(0.5, 0.5, 0.5)),
+            collider: csp_phys::ColliderShape::Box {
+                half_extents: DVec3::new(0.5, 0.5, 0.5),
+            },
+            force_sites: Vec::new(),
+            aero: csp_data::AeroDef::constant(1.0, 0.0, 1.0),
+            thermal: csp_data::ThermalDef {
+                heat_capacity_j_per_k: cap_jk,
+                max_temp_k: max_k,
+                emissivity: 0.8,
+                conduction_w_per_k: cond,
+            },
+        }
+    }
+
+    /// Multi-level destruction: the failed node's whole subtree —
+    /// children AND grandchildren — is removed, while the sibling
+    /// branch survives untouched.
+    ///
+    /// ```text
+    ///      0
+    ///     / \
+    ///    1   2     node 2 is the fragile one
+    ///        |
+    ///        3     falls with its parent, never overheats itself
+    /// ```
+    #[test]
+    fn overheat_destroys_multi_level_subtree() {
+        let mut w = physics_world(false);
+        let mut graph = csp_phys::PartGraph::new(csp_phys::PartNodeId(0));
+        graph.insert(
+            csp_phys::PartNodeId(0),
+            csp_phys::PartNode::new(None, csp_phys::PartTransform::IDENTITY, 0),
+        );
+        graph.insert(
+            csp_phys::PartNodeId(1),
+            csp_phys::PartNode::new(
+                Some(csp_phys::PartNodeId(0)),
+                csp_phys::PartTransform::new(DVec3::new(0.0, 0.0, 1.0), csp_core::DQuat::IDENTITY),
+                1,
+            ),
+        );
+        graph.insert(
+            csp_phys::PartNodeId(2),
+            csp_phys::PartNode::new(
+                Some(csp_phys::PartNodeId(0)),
+                csp_phys::PartTransform::new(DVec3::new(0.0, 0.0, -1.0), csp_core::DQuat::IDENTITY),
+                2,
+            ),
+        );
+        graph.insert(
+            csp_phys::PartNodeId(3),
+            csp_phys::PartNode::new(
+                Some(csp_phys::PartNodeId(2)),
+                csp_phys::PartTransform::new(DVec3::new(0.0, 0.0, -1.0), csp_core::DQuat::IDENTITY),
+                3,
+            ),
+        );
+        // Node 2 fragile; its healthy child must still fall with it.
+        // Zero conduction isolates each lump's heating.
+        let craft = CraftDef {
+            graph,
+            parts: vec![
+                thermal_part(50_000.0, 10_000.0, 0.0),
+                thermal_part(50_000.0, 10_000.0, 0.0),
+                thermal_part(50_000.0, 400.0, 0.0),
+                thermal_part(50_000.0, 10_000.0, 0.0),
+            ],
+        };
+        spawn_falling(&mut w, craft, 10_000.0, 2_000.0);
+        let mut pruned = false;
+        for _ in 0..20 {
+            w.step_frame(w.clock().ticks() + 64).unwrap();
+            let Some(v) = w.vessels().get(&VesselId(0)) else {
+                panic!("root survived — vessel must not be destroyed");
+            };
+            if v.craft.as_ref().unwrap().graph.nodes.len() == 2 {
+                pruned = true;
+                break;
+            }
+        }
+        assert!(pruned, "fragile node never overheated");
+        let v = &w.vessels()[&VesselId(0)];
+        let c = v.craft.as_ref().unwrap();
+        // The {2, 3} subtree is gone — including node 3, which never
+        // overheated; the {0, 1} branch is untouched.
+        assert_eq!(
+            c.graph.nodes.keys().copied().collect::<Vec<_>>(),
+            vec![csp_phys::PartNodeId(0), csp_phys::PartNodeId(1)]
+        );
+        assert_eq!(
+            c.graph.nodes[&csp_phys::PartNodeId(1)].parent,
+            Some(csp_phys::PartNodeId(0))
+        );
+        assert_eq!(
+            v.thermal.part_temps_k.keys().copied().collect::<Vec<_>>(),
+            vec![csp_phys::PartNodeId(0), csp_phys::PartNodeId(1)]
+        );
+        // The remainder re-welded: two of the four 1 t boxes remain.
+        let VesselState::InBubble(body) = &v.state else {
+            panic!("vessel left the bubble");
+        };
+        assert_eq!(body.mass_kg, 2_000.0);
+    }
+
+    /// §2.4.1 mask bits are *positional* over the ascending
+    /// `PartNodeId` set — destroying a node must remap `aero_mask`
+    /// node-for-node, not carry the stale bit pattern across the
+    /// position shift. Craft: root with two leaf children; the mask
+    /// keeps node 2 aero-inactive (zero drag, zero convective input).
+    /// Node 1 burns off; node 2 must stay inactive at its new
+    /// position — the pre-fix code kept `0b011`, re-activating it.
+    #[test]
+    fn overheat_remaps_aero_mask() {
+        let mut w = physics_world(false);
+        let mut graph = csp_phys::PartGraph::new(csp_phys::PartNodeId(0));
+        graph.insert(
+            csp_phys::PartNodeId(0),
+            csp_phys::PartNode::new(None, csp_phys::PartTransform::IDENTITY, 0),
+        );
+        graph.insert(
+            csp_phys::PartNodeId(1),
+            csp_phys::PartNode::new(
+                Some(csp_phys::PartNodeId(0)),
+                csp_phys::PartTransform::new(DVec3::new(0.0, 0.0, 1.0), csp_core::DQuat::IDENTITY),
+                1,
+            ),
+        );
+        graph.insert(
+            csp_phys::PartNodeId(2),
+            csp_phys::PartNode::new(
+                Some(csp_phys::PartNodeId(0)),
+                csp_phys::PartTransform::new(DVec3::new(0.0, 0.0, -1.0), csp_core::DQuat::IDENTITY),
+                2,
+            ),
+        );
+        let craft = CraftDef {
+            graph,
+            parts: vec![
+                thermal_part(50_000.0, 10_000.0, 0.0),
+                thermal_part(50_000.0, 400.0, 0.0),
+                thermal_part(50_000.0, 10_000.0, 0.0),
+            ],
+        };
+        spawn_falling(&mut w, craft, 10_000.0, 2_000.0);
+        // Nodes 0, 1 aero-active; node 2 inactive → mask 0b011.
+        w.vessels.get_mut(&VesselId(0)).unwrap().aero_mask = csp_phys::ConfigMask(0b011);
+        let mut pruned = false;
+        for _ in 0..20 {
+            w.step_frame(w.clock().ticks() + 64).unwrap();
+            let Some(v) = w.vessels().get(&VesselId(0)) else {
+                panic!("root survived — vessel must not be destroyed");
+            };
+            if v.craft.as_ref().unwrap().graph.nodes.len() == 2 {
+                pruned = true;
+                break;
+            }
+        }
+        assert!(pruned, "fragile leaf never overheated");
+        let v = &w.vessels()[&VesselId(0)];
+        // Node 0 stays active at position 0; node 2's inactive flag
+        // follows it to position 1 → 0b01.
+        assert_eq!(v.aero_mask, csp_phys::ConfigMask(0b01));
+        let VesselState::InBubble(body) = &v.state else {
+            panic!("vessel left the bubble");
+        };
+        let tables = body.aero.as_ref().unwrap();
+        assert_eq!(tables.mask, csp_phys::ConfigMask(0b01));
+        // The rebuilt table covers only the still-active node 0.
+        assert_eq!(tables.parts.len(), 1);
+        assert_eq!(tables.parts[0].node, csp_phys::PartNodeId(0));
+        // The semantic end: node 2 keeps taking zero convective input.
+        // More descent heats node 0 further while node 2 sits near its
+        // pre-destruction temperature (radiation only).
+        for _ in 0..4 {
+            w.step_frame(w.clock().ticks() + 64).unwrap();
+        }
+        let v = &w.vessels()[&VesselId(0)];
+        let t0 = v.thermal.part_temps_k[&csp_phys::PartNodeId(0)];
+        let t2 = v.thermal.part_temps_k[&csp_phys::PartNodeId(2)];
+        assert!(
+            t0 > t2 + 20.0,
+            "aero-inactive part heated: node0 {t0} K, node2 {t2} K"
+        );
+    }
+
+    /// §3.4 precedence: an overheat on the very tick the settle gate
+    /// would latch destroys the vessel — the latch transition is the
+    /// `else if` behind the thermal check, so destruction wins and no
+    /// `SurfaceLatched` record is ever written.
+    #[test]
+    fn overheat_precedes_latch() {
+        let mut w = physics_world(true);
+        let pos = DVec3::new(TERRIN_R + 0.51, 0.0, 0.0);
+        spawn_physical(
+            &mut w,
+            SimCommand::SpawnPhysicalVessel {
+                craft: box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0),
+                pos,
+                rot: pad_rot(),
+                vel: surface_vel(pos, &test_env(true)),
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        // Let the lander touch down and start accumulating settle
+        // ticks, then jump the counter to the latch edge and seed the
+        // part above `max_temp_k` — both conditions land on one tick.
+        let mut resting = false;
+        for _ in 0..1_000 {
+            w.step_frame(w.clock().ticks() + 1).unwrap();
+            let VesselState::InBubble(b) = &w.vessels()[&VesselId(0)].state else {
+                panic!("vessel left the bubble before the latch edge");
+            };
+            if b.settle.settled_ticks >= 10 {
+                resting = true;
+                break;
+            }
+        }
+        assert!(resting, "lander never began settling");
+        {
+            let v = w.vessels.get_mut(&VesselId(0)).unwrap();
+            let VesselState::InBubble(b) = &mut v.state else {
+                unreachable!()
+            };
+            b.settle.settled_ticks = test_env(true).settle_ticks - 1;
+            // box_craft's `max_temp_k` is 1_100 K — one tick of
+            // radiation cooling cannot pull 1_500 K below it.
+            v.thermal
+                .part_temps_k
+                .insert(csp_phys::PartNodeId(0), 1_500.0);
+        }
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        // The single node is the root — destruction emptied the graph
+        // and the record is gone, not latched.
+        assert!(
+            w.vessels().get(&VesselId(0)).is_none(),
+            "destruction must precede the latch: record gone, not SurfaceLatched"
+        );
+    }
+
+    /// The thermal record is authoritative state: a snapshot carries
+    /// it, restore reproduces it bit-for-bit, and the hashes agree.
+    #[test]
+    fn thermal_state_serializes_and_hashes() {
+        let mut w = physics_world(false);
+        spawn_falling(
+            &mut w,
+            thermal_craft(400_000.0, 1_100.0, 60.0),
+            20_000.0,
+            1_200.0,
+        );
+        // Ambient at 20 km is ~263 K — capture the spawn temp, run a
+        // few seconds, and require a real rise before snapshotting.
+        let t0 = *w.vessels()[&VesselId(0)]
+            .thermal
+            .part_temps_k
+            .get(&csp_phys::PartNodeId(0))
+            .unwrap();
+        w.step_frame(w.clock().ticks() + 256).unwrap();
+        let t_before = *w.vessels()[&VesselId(0)]
+            .thermal
+            .part_temps_k
+            .get(&csp_phys::PartNodeId(0))
+            .unwrap();
+        assert!(t_before > t0 + 0.5, "expected heating: {t0} -> {t_before}");
+        let snap = w.snapshot().unwrap();
+        let h_before = w.state_hash().unwrap();
+        let mut w2 = World::restore(
+            test_system(),
+            Some(PhysicsConfig {
+                environment: test_env(false),
+                dominant: BodyId::from("p"),
+            }),
+            snap,
+        )
+        .unwrap();
+        let t_after = *w2.vessels()[&VesselId(0)]
+            .thermal
+            .part_temps_k
+            .get(&csp_phys::PartNodeId(0))
+            .unwrap();
+        assert_eq!(t_after.to_bits(), t_before.to_bits());
+        assert_eq!(w2.state_hash().unwrap(), h_before);
+        // …and the restored world steps deterministically onward.
+        w.step_frame(w.clock().ticks() + 64).unwrap();
+        w2.step_frame(w2.clock().ticks() + 64).unwrap();
+        assert_eq!(w2.state_hash().unwrap(), w.state_hash().unwrap());
     }
 }

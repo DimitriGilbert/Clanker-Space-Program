@@ -13,7 +13,7 @@
 use serde::{Deserialize, Serialize};
 
 use csp_core::{DVec3, StableDiscriminant};
-use csp_data::AeroDef;
+use csp_data::{AeroDef, ThermalDef};
 
 use crate::tensor::SymMat3;
 
@@ -173,6 +173,15 @@ pub struct WeldPart {
     /// empty curves — the collider still occludes rays, it simply
     /// produces no force (`eval_aero_curve` on an empty curve is 0).
     pub aero: AeroDef,
+    /// §3.1 `thermal`: the resolved lumped-capacity parameters —
+    /// `heat_capacity_j_per_k` (mass·cp), `max_temp_k` (the §3.4
+    /// overheat lethality threshold), `emissivity` ε for the
+    /// Stefan–Boltzmann skin term, and `conduction_w_per_k` coupling
+    /// to attached neighbours. Stage 1 consumes it to build the
+    /// welded body's [`crate::thermal::ThermalNet`]; hand-authored
+    /// `WeldPart`s must carry finite, in-range values (the weld's
+    /// input gate).
+    pub thermal: ThermalDef,
 }
 
 #[cfg(test)]

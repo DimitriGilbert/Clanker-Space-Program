@@ -29,6 +29,7 @@ use csp_core::{DQuat, DVec3, SimError};
 use crate::graph::{PartGraph, PartNodeId, PartTransform};
 use crate::part::{ForceSite, WeldPart};
 use crate::tensor::SymMat3;
+use crate::thermal::{ThermalEdge, ThermalNet, ThermalNode, joint_conductance};
 
 /// One hull of the merged compound collider — the convex vertex set of
 /// one part, transformed into body frame. Stored in a canonical order
@@ -155,6 +156,16 @@ pub struct WeldedBody {
     /// §2.4.1's "aero tables are never serialized in the save").
     #[serde(skip)]
     pub aero: Option<Box<crate::aero::CraftAeroTables>>,
+    /// The M4b conduction/radiation network — per-part lumps plus the
+    /// attachment-edge conductances ([`crate::thermal`]). Weld output
+    /// like `inertia_local`/`collider`: a pure function of
+    /// `(graph, effective_parts)`, serialized with the body and
+    /// rebuilt by the re-weld on restore. The live temperatures it is
+    /// indexed against are NOT here — they are sim state on the
+    /// vessel record (`csp_sim::Vessel::thermal`), hashed per §7.1.
+    /// Boxed: the net is cold data (touched once per tick) and
+    /// `WeldedBody` lives inside `VesselState`'s enum layout.
+    pub thermal: Box<ThermalNet>,
 }
 
 impl WeldedBody {
@@ -272,6 +283,10 @@ impl From<WeldError> for SimError {
 /// [`solve_transforms`], so [`assemble`] never re-looks-up anything it
 /// could silently drop.
 struct SolvedNode<'a> {
+    /// The node's parent — `None` on the root. Carried so
+    /// `assemble` can form the conduction edges without re-reading
+    /// the graph.
+    parent: Option<PartNodeId>,
     transform: PartTransform,
     com_body: DVec3,
     part: &'a WeldPart,
@@ -386,6 +401,22 @@ fn validate_effective(node: PartNodeId, ep: &WeldPart) -> Result<(), WeldError> 
             ));
         }
     }
+    // §3.1 thermal lump — the M4b network needs finite, in-range
+    // values (the same bounds `csp-data`'s validator enforces,
+    // re-checked here because a `WeldPart` can arrive unvalidated).
+    let th = &ep.thermal;
+    if !th.heat_capacity_j_per_k.is_finite() || th.heat_capacity_j_per_k <= 0.0 {
+        return Err(bad("weld: part heat capacity is not positive-finite"));
+    }
+    if !th.max_temp_k.is_finite() || th.max_temp_k <= 0.0 {
+        return Err(bad("weld: part max_temp_k is not positive-finite"));
+    }
+    if !th.emissivity.is_finite() || th.emissivity <= 0.0 || th.emissivity > 1.0 {
+        return Err(bad("weld: part emissivity is outside (0, 1]"));
+    }
+    if !th.conduction_w_per_k.is_finite() || th.conduction_w_per_k < 0.0 {
+        return Err(bad("weld: part conduction is negative or non-finite"));
+    }
     Ok(())
 }
 
@@ -449,6 +480,7 @@ fn solve_transforms<'a>(
         solved.insert(
             id,
             SolvedNode {
+                parent: node.parent,
                 transform: t,
                 com_body: t.apply(ep.com),
                 part: ep,
@@ -495,6 +527,10 @@ fn assemble(solved: &BTreeMap<PartNodeId, SolvedNode<'_>>) -> Result<WeldedBody,
     let mut force_sites = Vec::new();
     let mut hulls = Vec::new();
     let mut part_index = BTreeMap::new();
+    // Per-node body-frame hull AABBs for the thermal net — collected
+    // in the same pass the collider hulls are canonicalized in.
+    let mut aabbs: BTreeMap<PartNodeId, (DVec3, DVec3)> = BTreeMap::new();
+    let mut thermal_nodes = Vec::new();
     for (id, s) in solved {
         let ep = s.part;
         inertia = inertia
@@ -526,6 +562,32 @@ fn assemble(solved: &BTreeMap<PartNodeId, SolvedNode<'_>>) -> Result<WeldedBody,
             *v = s.transform.apply(*v);
         }
         canonicalize(&mut vertices);
+        // The part's body-frame hull AABB — the thermal net's
+        // contact/radiative geometry. An empty vertex set (a
+        // point-collider part) produces a degenerate AABB at the
+        // part's CoM: zero contact and zero radiative area, both
+        // honest readings of "no skin".
+        let mut lo = DVec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+        let mut hi = DVec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for v in &vertices {
+            lo = DVec3::new(lo.x.min(v.x), lo.y.min(v.y), lo.z.min(v.z));
+            hi = DVec3::new(hi.x.max(v.x), hi.y.max(v.y), hi.z.max(v.z));
+        }
+        if vertices.is_empty() {
+            lo = s.com_body;
+            hi = s.com_body;
+        }
+        aabbs.insert(*id, (lo, hi));
+        let ext = hi - lo;
+        thermal_nodes.push(ThermalNode {
+            node: *id,
+            heat_capacity_j_per_k: ep.thermal.heat_capacity_j_per_k,
+            max_temp_k: ep.thermal.max_temp_k,
+            emissivity: ep.thermal.emissivity,
+            radiative_area_m2: 2.0 * (ext.x * ext.y + ext.y * ext.z + ext.x * ext.z),
+            aabb_lo: lo,
+            aabb_hi: hi,
+        });
         hulls.push(ConvexHull { vertices });
 
         part_index.insert(
@@ -542,6 +604,7 @@ fn assemble(solved: &BTreeMap<PartNodeId, SolvedNode<'_>>) -> Result<WeldedBody,
             "weld: inertia tensor is non-finite",
         ));
     }
+    let thermal = Box::new(build_thermal_net(solved, &aabbs, thermal_nodes));
     Ok(WeldedBody {
         pos: DVec3::ZERO,
         rot: DQuat::IDENTITY,
@@ -556,7 +619,76 @@ fn assemble(solved: &BTreeMap<PartNodeId, SolvedNode<'_>>) -> Result<WeldedBody,
         collider: CompoundCollider { hulls },
         part_index,
         aero: None,
+        thermal,
     })
+}
+
+/// The thermal net half of `assemble` — one [`ThermalEdge`] per
+/// parent→child attachment with the joint conductance of
+/// `crate::thermal`'s module doc. The attach axis is the dominant
+/// component of the AABB-centre separation; coincident centres (a
+/// part fully inside its parent) produce no edge — a degenerate
+/// attachment has no defined contact face.
+fn build_thermal_net(
+    solved: &BTreeMap<PartNodeId, SolvedNode<'_>>,
+    aabbs: &BTreeMap<PartNodeId, (DVec3, DVec3)>,
+    nodes: Vec<ThermalNode>,
+) -> ThermalNet {
+    let mut edges = Vec::new();
+    for (id, s) in solved {
+        let Some(parent) = s.parent else { continue };
+        let (Some(&(cl, ch)), Some(&(pl, ph))) = (aabbs.get(id), aabbs.get(&parent)) else {
+            continue;
+        };
+        let sep = ((cl + ch) - (pl + ph)) * 0.5;
+        // Dominant axis of the separation → the contact plane.
+        let ax = if sep.x.abs() >= sep.y.abs() && sep.x.abs() >= sep.z.abs() {
+            0usize
+        } else if sep.y.abs() >= sep.z.abs() {
+            1usize
+        } else {
+            2usize
+        };
+        let (u, v) = ([1, 2, 0][ax], [2, 0, 1][ax]);
+        let comp = |p: DVec3, i: usize| [p.x, p.y, p.z][i];
+        let face_c = (comp(ch, u) - comp(cl, u)).max(0.0) * (comp(ch, v) - comp(cl, v)).max(0.0);
+        let face_p = (comp(ph, u) - comp(pl, u)).max(0.0) * (comp(ph, v) - comp(pl, v)).max(0.0);
+        let ov_u = (comp(ch, u).min(comp(ph, u)) - comp(cl, u).max(comp(pl, u))).max(0.0);
+        let ov_v = (comp(ch, v).min(comp(ph, v)) - comp(cl, v).max(comp(pl, v))).max(0.0);
+        let shared = ov_u * ov_v;
+        if sep.norm_squared() < 1e-18 {
+            continue;
+        }
+        let g = joint_conductance(
+            s.part.thermal.conduction_w_per_k,
+            // The parent's part is reachable through `solved` — the
+            // DFS guarantees the parent was inserted first.
+            match solved.get(&parent) {
+                Some(ps) => ps.part.thermal.conduction_w_per_k,
+                None => continue,
+            },
+            shared,
+            face_c.min(face_p),
+        );
+        if g > 0.0 {
+            // The joint is undirected — store canonically (lesser id
+            // first) so a re-rooted graph produces the identical net.
+            let (a, b) = if parent < *id {
+                (parent, *id)
+            } else {
+                (*id, parent)
+            };
+            edges.push(ThermalEdge {
+                a,
+                b,
+                conductance_w_per_k: g,
+            });
+        }
+    }
+    // Canonical order — emission followed the child-side traversal,
+    // which a re-root permutes; the joint set itself is unchanged.
+    edges.sort_by_key(|e| (e.a, e.b));
+    ThermalNet { nodes, edges }
 }
 
 /// Sort vertices by `(x, y, z)` total order and drop duplicates — the
@@ -587,6 +719,17 @@ mod tests {
     use crate::part::{ColliderShape, ForceSiteKind};
     use core::f64::consts::FRAC_PI_2;
 
+    /// A legal `ThermalDef` for the weld's input gate — tests that
+    /// care about specific values override fields.
+    fn test_thermal() -> csp_data::ThermalDef {
+        csp_data::ThermalDef {
+            heat_capacity_j_per_k: 100_000.0,
+            max_temp_k: 1_200.0,
+            emissivity: 0.8,
+            conduction_w_per_k: 50.0,
+        }
+    }
+
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() <= 1e-13 * b.abs().max(1.0)
     }
@@ -606,6 +749,7 @@ mod tests {
             collider: ColliderShape::Points(vec![DVec3::ZERO]),
             force_sites: vec![],
             aero: csp_data::AeroDef::constant(1.0, 0.0, 1.0),
+            thermal: test_thermal(),
         }
     }
 
@@ -617,6 +761,7 @@ mod tests {
             collider: ColliderShape::Box { half_extents: half },
             force_sites: vec![],
             aero: csp_data::AeroDef::constant(1.0, 0.0, 1.0),
+            thermal: test_thermal(),
         }
     }
 

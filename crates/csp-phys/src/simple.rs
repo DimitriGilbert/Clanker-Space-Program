@@ -1014,6 +1014,15 @@ mod tests {
     use crate::weld::weld;
     use csp_data::TemperatureKnot;
 
+    fn test_thermal() -> csp_data::ThermalDef {
+        csp_data::ThermalDef {
+            heat_capacity_j_per_k: 100_000.0,
+            max_temp_k: 1_200.0,
+            emissivity: 0.8,
+            conduction_w_per_k: 50.0,
+        }
+    }
+
     const G: f64 = 9.81;
     /// Terrin (§3.0): R = 600 km, μ = 3.5316e12 → surface g ≈ 9.81.
     const TERRIN_R: f64 = 600_000.0;
@@ -1048,6 +1057,7 @@ mod tests {
             collider: ColliderShape::Box { half_extents: half },
             force_sites: vec![],
             aero: csp_data::AeroDef::constant(1.0, 0.0, 1.0),
+            thermal: test_thermal(),
         }];
         weld(&g, &parts).unwrap()
     }
@@ -1178,6 +1188,7 @@ mod tests {
                 100.0,
             )],
             aero: csp_data::AeroDef::constant(1.0, 0.0, 1.0),
+            thermal: test_thermal(),
         }];
         let mut b = weld(&g, &parts).unwrap();
         b.pos = DVec3::new(0.0, 0.0, 1.0e9); // far from the sphere
@@ -1385,6 +1396,7 @@ mod tests {
             },
             force_sites: vec![],
             aero: csp_data::AeroDef::constant(1.0, 0.0, 1.0),
+            thermal: test_thermal(),
         };
         let parts = [mk(4.0), mk(4.0)];
         let mut b0 = weld(&g, &parts).unwrap();
@@ -1542,6 +1554,7 @@ mod tests {
             },
             force_sites: vec![],
             aero: csp_data::AeroDef::constant(1.0, 0.0, 1.0),
+            thermal: test_thermal(),
         };
         let parts = [mk(4.0), mk(4.0)];
         let b = weld(&g, &parts).unwrap();
@@ -1703,6 +1716,7 @@ mod tests {
                 drive,
             )],
             aero: csp_data::AeroDef::constant(1.0, 0.0, 1.0),
+            thermal: test_thermal(),
         }];
         let mut b = weld(&g, &parts).unwrap();
         b.pos = DVec3::new(0.0, 0.0, TERRIN_R + half.z - 0.001);
