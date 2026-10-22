@@ -147,6 +147,14 @@ pub struct WeldedBody {
     /// The part index map: `PartNodeId` → weld output locations.
     /// `BTreeMap` order is the canonical part order (§2.2).
     pub part_index: BTreeMap<PartNodeId, PartWeld>,
+    /// §2.4.1 Stage-2 aero tables for the vessel's *active*
+    /// [`crate::aero::ConfigMask`], attached by the world — never
+    /// produced by `weld` (Stage 2 is deferred and installs by
+    /// command). **Derived cache**: skipped in serialization and in
+    /// the state-hash walk (a pure function of `(craft, mask)` —
+    /// §2.4.1's "aero tables are never serialized in the save").
+    #[serde(skip)]
+    pub aero: Option<Box<crate::aero::CraftAeroTables>>,
 }
 
 impl WeldedBody {
@@ -547,6 +555,7 @@ fn assemble(solved: &BTreeMap<PartNodeId, SolvedNode<'_>>) -> Result<WeldedBody,
         force_sites,
         collider: CompoundCollider { hulls },
         part_index,
+        aero: None,
     })
 }
 
@@ -596,6 +605,7 @@ mod tests {
             inertia: SymMat3::ZERO,
             collider: ColliderShape::Points(vec![DVec3::ZERO]),
             force_sites: vec![],
+            aero: csp_data::AeroDef::constant(1.0, 0.0, 1.0),
         }
     }
 
@@ -606,6 +616,7 @@ mod tests {
             inertia: SymMat3::solid_box(mass_kg, half),
             collider: ColliderShape::Box { half_extents: half },
             force_sites: vec![],
+            aero: csp_data::AeroDef::constant(1.0, 0.0, 1.0),
         }
     }
 

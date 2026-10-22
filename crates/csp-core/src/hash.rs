@@ -40,7 +40,14 @@ use crate::SimError;
 /// `SurfaceLatched`'s body-fixed pose record (`body`, lat/lon/alt,
 /// orientation). Bumped in the same change as the trivial and
 /// flight-launch golden reblesses.
-pub const HASH_SCHEMA_VERSION: u32 = 3;
+///
+/// **Version 4** (M4a): the per-part walk gained the resolved `aero`
+/// block (`cd_curve`/`cl_curve` knots + `ref_len_m` — craft state the
+/// Stage-2 tables derive from), and the per-vessel walk gained
+/// `aero_mask` (§2.4.1's active `ConfigMask`). Bumped for the
+/// flight-launch golden rebless; the trivial golden is vessel-free
+/// and unaffected.
+pub const HASH_SCHEMA_VERSION: u32 = 4;
 
 /// Rule-7 sum types: the source of an enum's *declared* stable `u16`
 /// discriminant (PLAN §7.1 rule 7).

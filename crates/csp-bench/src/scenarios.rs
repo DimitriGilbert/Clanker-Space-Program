@@ -164,6 +164,7 @@ fn flight_craft() -> csp_sim::CraftDef {
             ForceSiteKind::Thrust,
             200_000.0,
         )],
+        aero: csp_data::AeroDef::constant(1.0, 0.0, 1.0),
     };
     csp_sim::CraftDef {
         graph,
@@ -549,6 +550,7 @@ mod tests {
                     half_extents: DVec3::new(0.5, 0.5, 0.125),
                 },
                 force_sites: Vec::new(),
+                aero: csp_data::AeroDef::constant(1.0, 0.0, 1.0),
             });
         }
         let mut body = csp_phys::weld(&graph, &parts).unwrap();
@@ -593,6 +595,64 @@ mod tests {
                 free_us < 500.0 && contact_us < 500.0,
                 "over REF-A budget: free={free_us}µs contact={contact_us}µs"
             );
+        }
+    }
+
+    /// §2.4.1's REF-A target: the Stage-2 voxelize + 66-direction
+    /// sweep for a ~300-part craft completes well under 100 ms in
+    /// release (the editor install path is off-tick; this pins the
+    /// cost so it stays there). The debug bound is deliberately loose
+    /// — the machine's number is printed either way.
+    #[test]
+    fn measure_voxelize_300_part() {
+        let mut graph = PartGraph::new(PartNodeId(0));
+        let mut parts = Vec::new();
+        for i in 0..300u32 {
+            let id = PartNodeId(u64::from(i));
+            graph.nodes.insert(
+                id,
+                PartNode::new(
+                    if i == 0 {
+                        None
+                    } else {
+                        Some(PartNodeId(u64::from(i - 1)))
+                    },
+                    PartTransform::new(
+                        DVec3::new(0.0, 0.0, if i == 0 { 0.0 } else { 0.25 }),
+                        DQuat::IDENTITY,
+                    ),
+                    i,
+                ),
+            );
+            parts.push(WeldPart {
+                mass_kg: 100.0,
+                com: DVec3::ZERO,
+                inertia: SymMat3::solid_box(100.0, DVec3::new(0.5, 0.5, 0.125)),
+                collider: ColliderShape::Box {
+                    half_extents: DVec3::new(0.5, 0.5, 0.125),
+                },
+                force_sites: Vec::new(),
+                aero: csp_data::AeroDef::constant(0.8, 0.2, 1.0),
+            });
+        }
+        let body = csp_phys::weld(&graph, &parts).unwrap();
+        let t0 = std::time::Instant::now();
+        let tables =
+            csp_phys::build_aero_tables(&body, &graph, &parts, csp_phys::ConfigMask::ALL, 0)
+                .unwrap();
+        let elapsed = t0.elapsed();
+        assert_eq!(tables.parts.len(), 300);
+        assert!(tables.cd_knots.iter().all(|v| v.is_finite()));
+        let ms = elapsed.as_secs_f64() * 1000.0;
+        eprintln!(
+            "voxelize+tables 300 parts: {ms:.1} ms (edge {:.3} m)",
+            tables.voxel_edge_m
+        );
+        if cfg!(debug_assertions) {
+            assert!(ms < 30_000.0, "debug voxelize {ms} ms");
+        } else {
+            // REF-A's <100 ms for the exit-row case.
+            assert!(ms < 100.0, "voxelize {ms} ms over 100 ms target");
         }
     }
 

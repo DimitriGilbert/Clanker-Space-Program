@@ -57,6 +57,7 @@
 //! - [`simple`] — `SimpleBackend`, the §2.9 default backend, and the
 //!   §3.0 closed-form atmosphere evaluators.
 
+pub mod aero;
 pub mod backend;
 pub mod graph;
 pub mod part;
@@ -68,6 +69,12 @@ pub mod simple;
 pub mod tensor;
 pub mod weld;
 
+pub use aero::{
+    AERO_AOA_KNOTS_RAD, AERO_DIRECTION_COUNT, AERO_MACH_KNOTS, AIR_VISCOSITY_PA_S, AeroError,
+    ConfigMask, CraftAeroTables, DirTri, DirectionSet, MAX_CONFIG_MASKS, PartAeroTable,
+    VOXEL_BUDGET, VOXEL_TARGET_EDGE_M, VOXELIZER_VERSION, build_aero_tables, direction_set,
+    eval_aero_curve, flow_dir_at_aoa, skin_friction_cd,
+};
 pub use backend::{BodyHandle, Contact, Hit, JointDef, PhysicsBackend, Ray};
 pub use graph::{PartGraph, PartNode, PartNodeId, PartTransform};
 pub use part::{ColliderShape, ForceSite, ForceSiteKind, WeldPart};
@@ -86,7 +93,8 @@ pub use session::{
 pub use simple::{
     BAUMGARTE_BETA, DEFAULT_DRAG_CD, DEFAULT_FRICTION_MU, DEFAULT_SETTLE_TICKS, DEFAULT_SETTLE_V,
     DEFAULT_SETTLE_W, Environment, PHYSICS_DT, SOLVER_ITERATIONS, SimpleBackend,
-    atmosphere_density_kg_m3, atmosphere_pressure_pa, atmosphere_temperature_k,
+    atmosphere_density_kg_m3, atmosphere_pressure_pa, atmosphere_sound_speed_mps,
+    atmosphere_temperature_k,
 };
 pub use tensor::{Axis, SymMat3};
 pub use weld::{CompoundCollider, ConvexHull, PartWeld, SettleState, WeldError, WeldedBody, weld};

@@ -141,6 +141,12 @@ pub struct Vessel {
     pub craft: Option<CraftDef>,
     /// The residence state (§2.4/§2.6.2/§2.6.4).
     pub state: VesselState,
+    /// §2.4.1's active aero `ConfigMask` — bit i over the craft's
+    /// ascending `PartNodeId` set; `ConfigMask::ALL` = every part
+    /// aero-active. Sim state: hashed and serialized (the mask selects
+    /// which derived aero table is authoritative), while the tables
+    /// themselves are re-derived caches.
+    pub aero_mask: csp_phys::ConfigMask,
 }
 
 impl Vessel {
@@ -338,6 +344,52 @@ pub enum SimCommand {
     ToBubble {
         /// The rails vessel to make physical.
         vessel: VesselId,
+    },
+    /// §2.4's Stage-2 install path: `csp-app`/worker-computed aero
+    /// tables enter the sim only through this command, stamped at the
+    /// drain tick. The apply verifies `tables.graph_hash` against the
+    /// vessel's stored craft and `tables.mask` against the carried
+    /// `mask`, then caches the table; if `mask` is the vessel's active
+    /// `aero_mask` and it is `InBubble`, the body is attached
+    /// immediately. Debug builds additionally recompute the table
+    /// sim-side and byte-compare (`CraftAeroTables::bit_eq`) — a
+    /// mismatch is `Fatal` (a determinism break, not bad input).
+    InstallAeroTables {
+        /// The vessel the tables bind to.
+        vessel: VesselId,
+        /// The mask the tables were computed for.
+        mask: csp_phys::ConfigMask,
+        /// The Stage-2 output (self-describing: `graph_hash`, `mask`).
+        tables: csp_phys::CraftAeroTables,
+    },
+    /// §2.4.1 configuration switch — set the vessel's active
+    /// `ConfigMask` (deployed/stowed geometry without a graph change:
+    /// open bay doors, stowed gear, fairing-state masks). If the
+    /// mask's table is not yet computed it is computed here (the
+    /// deterministic sim-side path); past the §2.4.1 cap of 8 masks
+    /// the command resolves to the nearest computed mask by Hamming
+    /// distance (documented — not a rejection). Rails/latched vessels
+    /// carry the mask for their next materialization.
+    SetAeroConfig {
+        /// The vessel to reconfigure.
+        vessel: VesselId,
+        /// The requested active mask.
+        mask: csp_phys::ConfigMask,
+    },
+    /// Fairing/part jettison: remove one node from the vessel's part
+    /// graph — its mass leaves the weld (children re-parent to the
+    /// removed node's parent with composed transforms), the body's
+    /// kinematics are preserved through the re-weld, and previously
+    /// shielded parts gain aero exposure when the fresh Stage-2 table
+    /// lands. `InBubble` only in v1 (rails/latched reject); the
+    /// jettisoned mass simply leaves the simulation — debris spawn is
+    /// M4c's business. `aero_mask` resets to `ConfigMask::ALL` since
+    /// the node set changed.
+    JettisonPart {
+        /// The vessel shedding the part.
+        vessel: VesselId,
+        /// The graph node to remove (non-root required).
+        node: csp_phys::PartNodeId,
     },
 }
 
@@ -624,6 +676,23 @@ struct Physics {
     /// The environment's central body — bubble-frame parent for
     /// `ToRails`/`ToBubble` and the latch record's `body`.
     dominant: BodyId,
+    /// §2.4.1 Stage-2 derived cache: computed aero tables per
+    /// `(vessel, ConfigMask)`, a pure function of the stored craft.
+    /// Never serialized, never hashed, never shadowed — a cleared or
+    /// absent entry is simply recomputed by the same deterministic
+    /// path. `InstallAeroTables` writes here; `ensure_aero` reads.
+    aero: BTreeMap<VesselId, VesselAeroCache>,
+}
+
+/// One vessel's per-mask table cache — `graph_hash` binds the cache
+/// to the craft it was built from; a jettison/graph change invalidates
+/// it wholesale.
+struct VesselAeroCache {
+    /// `craft_graph_hash` of the craft these tables were built for.
+    graph_hash: u64,
+    /// Computed tables by mask — capped at
+    /// `csp_phys::MAX_CONFIG_MASKS` per §2.4.1.
+    tables: BTreeMap<csp_phys::ConfigMask, csp_phys::CraftAeroTables>,
 }
 
 impl World {
@@ -672,6 +741,7 @@ impl World {
         w.physics = Some(Physics {
             backend: SimpleBackend::new(physics.environment),
             dominant: physics.dominant,
+            aero: BTreeMap::new(),
         });
         w
     }
@@ -818,6 +888,7 @@ impl World {
             physics: physics.map(|p| Physics {
                 backend: SimpleBackend::new(p.environment),
                 dominant: p.dominant,
+                aero: BTreeMap::new(),
             }),
         })
     }
@@ -1074,6 +1145,23 @@ impl World {
         {
             return Ok(());
         }
+        // §2.4.1: every InBubble body's attached tables must match its
+        // vessel's active mask before the first tick of this range —
+        // covers re-welded bodies (restore, unlatch, jettison, spawn)
+        // and SetAeroConfig installs. Collected first so the borrow
+        // split stays clean; ascending-id order is the fixed order.
+        let needing: Vec<VesselId> = self
+            .vessels
+            .iter()
+            .filter(|(_, v)| match &v.state {
+                VesselState::InBubble(b) => b.aero.as_ref().is_none_or(|t| t.mask != v.aero_mask),
+                _ => false,
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in needing {
+            self.ensure_aero(id)?;
+        }
         self.shadow_vessels(shadow);
         let Self {
             vessels, physics, ..
@@ -1217,38 +1305,7 @@ impl World {
             SimCommand::SetWarp(level) => self.warp_level = *level,
             SimCommand::AdvanceTo(t) => *effective_target = (*effective_target).max(*t),
             SimCommand::SpawnVessel { parent, elements } => {
-                let orbit = OrbitState {
-                    parent: parent.clone(),
-                    elements: elements.clone(),
-                    // The spawn instant: elements' M0 refers to this tick.
-                    epoch: self.clock,
-                };
-                // Validation before allocation: the parent must exist and
-                // the elements must solve at the spawn tick. A failure is
-                // a command error — the drain rolls this command's effects
-                // back and reports it on `AdvanceReport::rejected` (§2.2.1:
-                // "rejected on the originating channel"), then continues
-                // the boundary.
-                self.orbits.body_orbit(&orbit.parent)?;
-                self.orbits.state_at(&orbit, self.clock)?;
-                self.shadow_vessels(shadow);
-                let id = VesselId(self.next_vessel_id);
-                self.next_vessel_id = self
-                    .next_vessel_id
-                    .checked_add(1)
-                    .ok_or(SimError::Fatal("vessel id counter overflow"))?;
-                self.vessels.insert(
-                    id,
-                    Vessel {
-                        id,
-                        craft: None,
-                        state: VesselState::OnRails(orbit),
-                    },
-                );
-                // §2.6.5: publish the new vessel's next event time now —
-                // the heap must already hold it before `t_next` is next
-                // computed. No transition just fired → nothing suppressed.
-                self.schedule_next_soi(id, self.clock, shadow, None)?;
+                self.apply_spawn_vessel(parent, elements, shadow)?
             }
             SimCommand::SpawnPhysicalVessel {
                 craft,
@@ -1308,6 +1365,17 @@ impl World {
                     })
                     .collect();
             }
+            SimCommand::InstallAeroTables {
+                vessel,
+                mask,
+                tables,
+            } => self.apply_install_aero(*vessel, *mask, tables, shadow)?,
+            SimCommand::SetAeroConfig { vessel, mask } => {
+                self.apply_set_aero_config(*vessel, *mask, shadow)?
+            }
+            SimCommand::JettisonPart { vessel, node } => {
+                self.apply_jettison_part(*vessel, *node, shadow)?
+            }
             SimCommand::SetAlarm { tick, label } => {
                 // Alarms may not rewrite the past: at-or-past ticks clamp
                 // to the next tick (an event must sit strictly ahead of
@@ -1342,6 +1410,44 @@ impl World {
         }
         self.unlatched_body(vessel, shadow)?;
         Ok(())
+    }
+
+    /// `SpawnVessel` — create an on-rails elements-only vessel at the
+    /// drain tick. Validation before allocation: the parent must
+    /// exist and the elements must solve at the spawn tick; a failure
+    /// rolls the whole command back via `AdvanceReport::rejected`.
+    fn apply_spawn_vessel(
+        &mut self,
+        parent: &BodyId,
+        elements: &csp_data::KeplerElements,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        let orbit = OrbitState {
+            parent: parent.clone(),
+            elements: elements.clone(),
+            // The spawn instant: elements' M0 refers to this tick.
+            epoch: self.clock,
+        };
+        self.orbits.body_orbit(&orbit.parent)?;
+        self.orbits.state_at(&orbit, self.clock)?;
+        self.shadow_vessels(shadow);
+        let id = VesselId(self.next_vessel_id);
+        self.next_vessel_id = self
+            .next_vessel_id
+            .checked_add(1)
+            .ok_or(SimError::Fatal("vessel id counter overflow"))?;
+        self.vessels.insert(
+            id,
+            Vessel {
+                id,
+                craft: None,
+                state: VesselState::OnRails(orbit),
+                aero_mask: csp_phys::ConfigMask::ALL,
+            },
+        );
+        // §2.6.5: publish the new vessel's next event time now — the
+        // heap must hold it before `t_next` is next computed.
+        self.schedule_next_soi(id, self.clock, shadow, None)
     }
 
     /// `SpawnPhysicalVessel`: weld the craft graph into a fresh
@@ -1380,8 +1486,42 @@ impl World {
         body.rot = rot.normalize();
         body.vel = vel;
         body.ang_vel = ang_vel;
+        // §2.4: a craft in an atmosphere-bearing environment gets its
+        // Stage-2 default-mask tables at spawn — the sim-side
+        // deterministic computation (the same path the install
+        // command's debug byte-compare uses). A vacuum environment
+        // skips Stage 2 entirely (§2.4.1's skippable clause).
+        let gh = craft_graph_hash(craft);
+        let mut tables = None;
+        if self
+            .physics
+            .as_ref()
+            .is_some_and(|p| p.backend.environment().atmosphere.is_some())
+        {
+            let t = csp_phys::aero::build_aero_tables(
+                &body,
+                &craft.graph,
+                &craft.parts,
+                csp_phys::ConfigMask::ALL,
+                gh,
+            )
+            .map_err(|e| SimError::Recoverable(e.reason()))?;
+            body.aero = Some(Box::new(t.clone()));
+            tables = Some(t);
+        }
         self.shadow_vessels(shadow);
         let id = VesselId(self.next_vessel_id);
+        if let (Some(t), Some(p)) = (tables, self.physics.as_mut()) {
+            let mut tables_map = BTreeMap::new();
+            tables_map.insert(csp_phys::ConfigMask::ALL, t);
+            p.aero.insert(
+                id,
+                VesselAeroCache {
+                    graph_hash: gh,
+                    tables: tables_map,
+                },
+            );
+        }
         self.next_vessel_id = self
             .next_vessel_id
             .checked_add(1)
@@ -1392,6 +1532,7 @@ impl World {
                 id,
                 craft: Some(craft.clone()),
                 state: VesselState::InBubble(body),
+                aero_mask: csp_phys::ConfigMask::ALL,
             },
         );
         // No SOI publish: a bubble-resident vessel has no conic.
@@ -1505,6 +1646,7 @@ impl World {
             .get_mut(&vessel)
             .ok_or(SimError::Fatal("to-bubble: vessel vanished"))?;
         vessel_mut.state = VesselState::InBubble(body);
+        self.ensure_aero(vessel)?;
         // The vessel's pending SOI events are dead the moment it
         // leaves rails — drop them in one re-heapify pass.
         self.shadow_events(shadow);
@@ -1514,6 +1656,328 @@ impl World {
             .filter(|e| !event_names_vessel(&e.kind, &vessel))
             .collect();
         Ok(())
+    }
+
+    /// §2.4.1's lazy attach: ensure the `InBubble` vessel's body
+    /// carries tables for its active `aero_mask` — a no-op outside
+    /// `InBubble`, on airless worlds, or when the attached mask is
+    /// already current. Computation is the deterministic sim-side
+    /// path; the per-mask cache caps at §2.4.1's 8 tables.
+    fn ensure_aero(&mut self, vessel: VesselId) -> Result<(), SimError> {
+        let Some(v) = self.vessels.get(&vessel) else {
+            return Err(SimError::Recoverable("aero: unknown vessel"));
+        };
+        let needs = match &v.state {
+            VesselState::InBubble(body) => body.aero.as_ref().is_none_or(|t| t.mask != v.aero_mask),
+            _ => return Ok(()),
+        };
+        if !needs {
+            return Ok(());
+        }
+        let Some(craft) = v.craft.clone() else {
+            return Err(SimError::Fatal("aero: InBubble vessel has no craft"));
+        };
+        let mask = v.aero_mask;
+        let physics = self
+            .physics
+            .as_mut()
+            .ok_or(SimError::Fatal("aero: physics vanished"))?;
+        if physics.backend.environment().atmosphere.is_none() {
+            return Ok(());
+        }
+        let gh = craft_graph_hash(&craft);
+        let cache = physics
+            .aero
+            .entry(vessel)
+            .or_insert_with(|| VesselAeroCache {
+                graph_hash: gh,
+                tables: BTreeMap::new(),
+            });
+        if cache.graph_hash != gh {
+            *cache = VesselAeroCache {
+                graph_hash: gh,
+                tables: BTreeMap::new(),
+            };
+        }
+        if !cache.tables.contains_key(&mask) && cache.tables.len() < csp_phys::MAX_CONFIG_MASKS {
+            let body = match &v.state {
+                VesselState::InBubble(b) => b,
+                _ => return Err(SimError::Fatal("aero: state changed under attach")),
+            };
+            let t = csp_phys::aero::build_aero_tables(body, &craft.graph, &craft.parts, mask, gh)
+                .map_err(|e| SimError::Recoverable(e.reason()))?;
+            cache.tables.insert(mask, t);
+        }
+        let resolved = if cache.tables.contains_key(&mask) {
+            mask
+        } else {
+            // Past the 8-mask cap: §2.4.1's nearest-by-Hamming rule.
+            cache
+                .tables
+                .keys()
+                .min_by_key(|m| (m.hamming(mask), m.0))
+                .copied()
+                .unwrap_or(mask)
+        };
+        let tables = cache.tables.get(&resolved).cloned();
+        let Some(v) = self.vessels.get_mut(&vessel) else {
+            return Err(SimError::Fatal("aero: vessel vanished"));
+        };
+        if let (Some(t), VesselState::InBubble(b)) = (tables, &mut v.state) {
+            b.aero = Some(Box::new(t));
+        }
+        Ok(())
+    }
+
+    /// `InstallAeroTables` — §2.4's Stage-2 install path. Validates
+    /// the binding (`graph_hash`, `mask` fields agree), debug
+    /// byte-compares against a sim-thread recompute, then caches.
+    fn apply_install_aero(
+        &mut self,
+        vessel: VesselId,
+        mask: csp_phys::ConfigMask,
+        tables: &csp_phys::CraftAeroTables,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        let Some(v) = self.vessels.get(&vessel) else {
+            return Err(SimError::Recoverable("install-aero: unknown vessel"));
+        };
+        let Some(craft) = v.craft.clone() else {
+            return Err(SimError::Recoverable("install-aero: vessel has no craft"));
+        };
+        let gh = craft_graph_hash(&craft);
+        if tables.graph_hash != gh {
+            return Err(SimError::Recoverable("install-aero: graph hash mismatch"));
+        }
+        if tables.mask != mask {
+            return Err(SimError::Recoverable("install-aero: mask field mismatch"));
+        }
+        // §2.4's debug byte-compare: a worker-computed table must equal
+        // the sim-thread recompute bit-for-bit — the determinism
+        // gate between the off-tick build and the install path.
+        #[cfg(debug_assertions)]
+        {
+            let mut probe = csp_phys::weld(&craft.graph, &craft.parts)
+                .map_err(|e| SimError::Recoverable(e.reason()))?;
+            if let VesselState::InBubble(b) = &v.state {
+                probe = b.clone();
+            }
+            let check =
+                csp_phys::aero::build_aero_tables(&probe, &craft.graph, &craft.parts, mask, gh)
+                    .map_err(|e| SimError::Recoverable(e.reason()))?;
+            if !check.bit_eq(tables) {
+                return Err(SimError::Fatal(
+                    "install-aero: table differs from sim-side recompute",
+                ));
+            }
+        }
+        let physics = self.physics.as_mut().ok_or(SimError::Recoverable(
+            "install-aero: no physics environment",
+        ))?;
+        let cache = physics
+            .aero
+            .entry(vessel)
+            .or_insert_with(|| VesselAeroCache {
+                graph_hash: gh,
+                tables: BTreeMap::new(),
+            });
+        if cache.graph_hash != gh {
+            *cache = VesselAeroCache {
+                graph_hash: gh,
+                tables: BTreeMap::new(),
+            };
+        }
+        if !cache.tables.contains_key(&mask) && cache.tables.len() >= csp_phys::MAX_CONFIG_MASKS {
+            return Err(SimError::Recoverable(
+                "install-aero: config-mask table cap reached",
+            ));
+        }
+        cache.tables.insert(mask, tables.clone());
+        if v.aero_mask == mask
+            && let VesselState::InBubble(_) = v.state
+        {
+            self.shadow_vessels(shadow);
+            if let Some(VesselState::InBubble(b)) =
+                self.vessels.get_mut(&vessel).map(|v| &mut v.state)
+            {
+                b.aero = Some(Box::new(tables.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    /// `SetAeroConfig` — select the vessel's active mask; the table
+    /// computes on demand (cap → nearest-computed fallback).
+    fn apply_set_aero_config(
+        &mut self,
+        vessel: VesselId,
+        mask: csp_phys::ConfigMask,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        let Some(v) = self.vessels.get(&vessel) else {
+            return Err(SimError::Recoverable("aero-config: unknown vessel"));
+        };
+        if v.craft.is_none() {
+            return Err(SimError::Recoverable("aero-config: vessel has no craft"));
+        }
+        // Materialize (or nearest-resolve) the mask's table first —
+        // only then is the vessel's active mask updated.
+        let craft = v
+            .craft
+            .clone()
+            .ok_or(SimError::Fatal("aero-config: craft vanished"))?;
+        let gh = craft_graph_hash(&craft);
+        let physics = self
+            .physics
+            .as_mut()
+            .ok_or(SimError::Recoverable("aero-config: no physics"))?;
+        let cache = physics
+            .aero
+            .entry(vessel)
+            .or_insert_with(|| VesselAeroCache {
+                graph_hash: gh,
+                tables: BTreeMap::new(),
+            });
+        if cache.graph_hash != gh {
+            *cache = VesselAeroCache {
+                graph_hash: gh,
+                tables: BTreeMap::new(),
+            };
+        }
+        if !cache.tables.contains_key(&mask) && cache.tables.len() < csp_phys::MAX_CONFIG_MASKS {
+            // Weld a stand-in body for the build when the vessel is not
+            // InBubble (rails/latched) — the voxelizer needs collider
+            // geometry, which is a pure function of the craft.
+            let body = match &v.state {
+                VesselState::InBubble(b) => b.clone(),
+                _ => csp_phys::weld(&craft.graph, &craft.parts)
+                    .map_err(|e| SimError::Recoverable(e.reason()))?,
+            };
+            let t = csp_phys::aero::build_aero_tables(&body, &craft.graph, &craft.parts, mask, gh)
+                .map_err(|e| SimError::Recoverable(e.reason()))?;
+            cache.tables.insert(mask, t);
+        }
+        let resolved = if cache.tables.contains_key(&mask) {
+            mask
+        } else {
+            cache
+                .tables
+                .keys()
+                .min_by_key(|m| (m.hamming(mask), m.0))
+                .copied()
+                .unwrap_or(mask)
+        };
+        self.shadow_vessels(shadow);
+        let v = self
+            .vessels
+            .get_mut(&vessel)
+            .ok_or(SimError::Fatal("aero-config: vessel vanished"))?;
+        v.aero_mask = resolved;
+        if let VesselState::InBubble(b) = &mut v.state {
+            let physics = self
+                .physics
+                .as_ref()
+                .ok_or(SimError::Fatal("aero-config: physics vanished"))?;
+            if let Some(t) = physics
+                .aero
+                .get(&vessel)
+                .and_then(|c| c.tables.get(&resolved))
+            {
+                b.aero = Some(Box::new(t.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    /// `JettisonPart` — remove one graph node: children reparent to
+    /// the removed node's parent (transforms compose), the parts
+    /// slice is left with an orphan entry (unreferenced effective
+    /// indices are ignored by the weld — the mass is genuinely gone),
+    /// the body re-welds preserving kinematics, and fresh default-mask
+    /// tables attach. `InBubble` only.
+    fn apply_jettison_part(
+        &mut self,
+        vessel: VesselId,
+        node: csp_phys::PartNodeId,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        let Some(v) = self.vessels.get(&vessel) else {
+            return Err(SimError::Recoverable("jettison: unknown vessel"));
+        };
+        if !matches!(v.state, VesselState::InBubble(_)) {
+            return Err(SimError::Recoverable("jettison: vessel not in bubble"));
+        }
+        let Some(mut craft) = v.craft.clone() else {
+            return Err(SimError::Recoverable("jettison: vessel has no craft"));
+        };
+        if !craft.graph.nodes.contains_key(&node) {
+            return Err(SimError::Recoverable("jettison: unknown part node"));
+        }
+        if node == craft.graph.root {
+            return Err(SimError::Recoverable("jettison: cannot drop the root"));
+        }
+        // Reparent children of `node` to node's parent, composing
+        // transforms — documented jettison semantics.
+        let removed = craft.graph.nodes[&node].clone();
+        for child_id in craft
+            .graph
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.parent == Some(node))
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>()
+        {
+            let child = craft
+                .graph
+                .nodes
+                .get_mut(&child_id)
+                .ok_or(SimError::Fatal("jettison: child vanished mid-edit"))?;
+            child.transform = removed.transform.compose(child.transform);
+            child.parent = removed.parent;
+        }
+        craft.graph.nodes.remove(&node);
+        let mut body = csp_phys::weld(&craft.graph, &craft.parts)
+            .map_err(|e| SimError::Recoverable(e.reason()))?;
+        // Preserve kinematics + throttle through the re-weld; the
+        // jettisoned mass leaves the simulation (debris is M4c).
+        let (pos, rot, vel, ang_vel, throttle, settle, com_old) = match &v.state {
+            VesselState::InBubble(b) => (
+                b.pos,
+                b.rot,
+                b.vel,
+                b.ang_vel,
+                b.throttle,
+                b.settle,
+                b.com_local,
+            ),
+            _ => return Err(SimError::Fatal("jettison: state changed mid-apply")),
+        };
+        body.pos = pos;
+        body.rot = rot;
+        // `vel` is the CoM velocity and the re-weld moved `com_local`:
+        // the material point that is now the CoM rides the rigid
+        // body's `v + ω×r`, so the retained fragment's CoM velocity is
+        // `vel + ω_world × (com_new − com_old)_world`. Skipping this
+        // would silently drop `ω×Δr` — order ‖ω‖·‖Δcom‖, metres/s for
+        // a tumbling vessel. `pos`/`rot` are unchanged, so
+        // `com_world` already lands on the correct material point.
+        let omega_world = rot.rotate(ang_vel);
+        body.vel = vel + omega_world.cross(rot.rotate(body.com_local - com_old));
+        body.ang_vel = ang_vel;
+        body.throttle = throttle;
+        body.settle = settle;
+        self.shadow_vessels(shadow);
+        let v = self
+            .vessels
+            .get_mut(&vessel)
+            .ok_or(SimError::Fatal("jettison: vessel vanished"))?;
+        v.craft = Some(craft);
+        v.aero_mask = csp_phys::ConfigMask::ALL;
+        v.state = VesselState::InBubble(body);
+        if let Some(p) = self.physics.as_mut() {
+            p.aero.remove(&vessel);
+        }
+        self.ensure_aero(vessel)
     }
 
     /// §2.2.1's boundary drain at the current tick: pop every pending
@@ -2235,13 +2699,37 @@ fn hash_craft(h: &mut StateHasher, craft: &CraftDef) {
             h.stable_enum(&s.kind);
             h.f64(s.rated_n);
         });
+        h.vec(&p.aero.cd_curve, |h, k| {
+            h.f64(k.mach);
+            h.f64(k.coeff);
+        });
+        h.vec(&p.aero.cl_curve, |h, k| {
+            h.f64(k.mach);
+            h.f64(k.coeff);
+        });
+        h.f64(p.aero.ref_len_m);
     });
+}
+
+/// The §2.4 craft identity the aero-table install command binds on:
+/// first 8 bytes (LE) of the same canonical `hash_craft` walk the
+/// state hash uses — a table built for one craft cannot install on
+/// another. `0` when the hash stream faults (non-finite craft data —
+/// weld rejects it anyway).
+fn craft_graph_hash(craft: &CraftDef) -> u64 {
+    let mut h = StateHasher::new();
+    hash_craft(&mut h, craft);
+    match h.finish() {
+        Ok(d) => u64::from_le_bytes(d[..8].try_into().unwrap_or([0; 8])),
+        Err(_) => 0,
+    }
 }
 
 fn hash_vessel(h: &mut StateHasher, vessel: &Vessel) {
     h.opt(&vessel.craft, |h, craft| {
         hash_craft(h, craft);
     });
+    h.u64(vessel.aero_mask.0);
     h.stable_enum(&vessel.state);
     match &vessel.state {
         VesselState::OnRails(orbit) => {
@@ -3561,6 +4049,7 @@ mod tests {
             Vessel {
                 id: VesselId(3),
                 craft: None,
+                aero_mask: csp_phys::ConfigMask::ALL,
                 state: VesselState::OnRails(OrbitState {
                     parent: BodyId::from("p"),
                     elements: leo_elements(),
@@ -3717,6 +4206,7 @@ mod tests {
                 } else {
                     Vec::new()
                 },
+                aero: csp_data::AeroDef::constant(1.0, 0.0, 1.0),
             }],
         }
     }
@@ -3800,6 +4290,176 @@ mod tests {
         let body = w.vessels()[&VesselId(0)].body().unwrap();
         assert!((body.vel.x + 9.96).abs() < 0.02);
         assert!((body.pos.x - (pos.x - 5.1)).abs() < 0.2);
+    }
+
+    /// A two-node craft: payload box (root, node 1) + a big thin
+    /// fairing plate above it (node 2) — enough to make the staged
+    /// and deployed tables measurably different.
+    fn two_node_craft() -> CraftDef {
+        let mut graph = csp_phys::PartGraph::new(csp_phys::PartNodeId(1));
+        graph.insert(
+            csp_phys::PartNodeId(1),
+            csp_phys::PartNode::new(None, csp_phys::PartTransform::IDENTITY, 0),
+        );
+        graph.insert(
+            csp_phys::PartNodeId(2),
+            csp_phys::PartNode::new(
+                Some(csp_phys::PartNodeId(1)),
+                csp_phys::PartTransform::new(DVec3::new(0.0, 0.0, 1.0), csp_core::DQuat::IDENTITY),
+                1,
+            ),
+        );
+        let payload = csp_phys::WeldPart {
+            mass_kg: 500.0,
+            com: DVec3::ZERO,
+            inertia: csp_phys::SymMat3::solid_box(500.0, DVec3::new(0.5, 0.5, 0.5)),
+            collider: csp_phys::ColliderShape::Box {
+                half_extents: DVec3::new(0.5, 0.5, 0.5),
+            },
+            force_sites: vec![],
+            aero: csp_data::AeroDef::constant(0.8, 0.2, 1.0),
+        };
+        let plate = csp_phys::WeldPart {
+            mass_kg: 50.0,
+            com: DVec3::ZERO,
+            inertia: csp_phys::SymMat3::solid_box(50.0, DVec3::new(1.0, 1.0, 0.02)),
+            collider: csp_phys::ColliderShape::Box {
+                half_extents: DVec3::new(1.0, 1.0, 0.02),
+            },
+            force_sites: vec![],
+            aero: csp_data::AeroDef::constant(0.8, 0.2, 1.0),
+        };
+        CraftDef {
+            graph,
+            parts: vec![payload, plate],
+        }
+    }
+
+    /// §2.4's staged-vs-deployed exit row, sim-side: two identical
+    /// falling vessels — one keeps its fairing plate, one jettisons
+    /// it. Mass leaves with the plate and the velocity profiles
+    /// diverge measurably.
+    #[test]
+    fn jettison_staged_vs_deployed_diverges() {
+        let mut w = physics_world(false);
+        let pos = DVec3::new(TERRIN_R + 30_000.0, 0.0, 0.0);
+        let cmd = |craft| SimCommand::SpawnPhysicalVessel {
+            craft,
+            pos,
+            rot: csp_core::DQuat::IDENTITY,
+            vel: DVec3::new(-300.0, 0.0, 0.0),
+            ang_vel: DVec3::ZERO,
+        };
+        spawn_physical(&mut w, cmd(two_node_craft()));
+        w.enqueue(SourceClass::Ui, 0, cmd(two_node_craft()));
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        let (m0, m1) = (
+            w.vessels()[&VesselId(0)].body().unwrap().mass_kg,
+            w.vessels()[&VesselId(1)].body().unwrap().mass_kg,
+        );
+        assert_eq!(m0, m1);
+        // Spawn attached aero tables on both (atmosphere world).
+        assert!(w.vessels()[&VesselId(0)].body().unwrap().aero.is_some());
+        // Jettison node 2 on vessel 1.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::JettisonPart {
+                vessel: VesselId(1),
+                node: csp_phys::PartNodeId(2),
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        let v1 = &w.vessels()[&VesselId(1)];
+        assert_eq!(v1.body().unwrap().mass_kg, 500.0);
+        assert!(v1.craft.as_ref().unwrap().graph.nodes.len() == 1);
+        // Fresh table for the reduced craft.
+        let t = v1.body().unwrap().aero.as_ref().unwrap();
+        assert_eq!(t.mask, csp_phys::ConfigMask::ALL);
+        // ~50 s of flight — velocities measurably diverge.
+        w.step_frame(w.clock().ticks() + 3200).unwrap();
+        let (v0, v1) = (
+            w.vessels()[&VesselId(0)].body().unwrap().vel,
+            w.vessels()[&VesselId(1)].body().unwrap().vel,
+        );
+        let dv = (v0 - v1).norm();
+        assert!(dv > 1.0, "staged/deployed divergence {dv} m/s");
+    }
+
+    /// `InstallAeroTables` round trip: build sim-side, install via
+    /// the command path, reject a mismatched graph hash.
+    #[test]
+    fn install_aero_tables_accepts_and_binds() {
+        let mut w = physics_world(false);
+        let pos = DVec3::new(TERRIN_R + 30_000.0, 0.0, 0.0);
+        spawn_physical(
+            &mut w,
+            SimCommand::SpawnPhysicalVessel {
+                craft: box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0),
+                pos,
+                rot: csp_core::DQuat::IDENTITY,
+                vel: DVec3::ZERO,
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        let v = &w.vessels()[&VesselId(0)];
+        let craft = v.craft.as_ref().unwrap();
+        let body = v.body().unwrap();
+        // gh = 0 cannot match the real craft hash → install rejects.
+        let gh = 0u64;
+        let mut bad = csp_phys::build_aero_tables(
+            body,
+            &craft.graph,
+            &craft.parts,
+            csp_phys::ConfigMask::ALL,
+            gh,
+        )
+        .unwrap();
+        bad.graph_hash = 0xDEAD;
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::InstallAeroTables {
+                vessel: VesselId(0),
+                mask: csp_phys::ConfigMask::ALL,
+                tables: bad,
+            },
+        );
+        let rep = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(
+            rep.rejected
+                .iter()
+                .any(|(_, e)| *e == SimError::Recoverable("install-aero: graph hash mismatch")),
+            "{:?}",
+            rep.rejected
+        );
+    }
+
+    /// §2.9 reentry check via the table model: a capsule dropped at
+    /// high Mach inside the atmosphere decelerates, and its `Cm_α`
+    /// sign matches the nose-heavy-stable/tail-heavy-unstable
+    /// expectation covered in `aero::cm_alpha_sign_tracks_stability`.
+    #[test]
+    fn table_aero_reentry_decelerates() {
+        let mut w = physics_world(false);
+        let pos = DVec3::new(TERRIN_R + 25_000.0, 0.0, 0.0);
+        spawn_physical(
+            &mut w,
+            SimCommand::SpawnPhysicalVessel {
+                craft: box_craft(2_000.0, DVec3::new(0.6, 0.6, 0.6), 0.0),
+                pos,
+                rot: csp_core::DQuat::IDENTITY,
+                vel: DVec3::new(-2_000.0, 0.0, 0.0),
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        let v0 = w.vessels()[&VesselId(0)].body().unwrap().vel.norm();
+        w.step_frame(w.clock().ticks() + 320).unwrap(); // ~5 s
+        let body = w.vessels()[&VesselId(0)].body().unwrap();
+        let v1 = body.vel.norm();
+        assert!(v1 < v0, "reentry should decelerate: {v0} -> {v1}");
+        // And it kept falling — drag slowed, never reversed it.
+        assert!(body.pos.x < pos.x);
     }
 
     /// `SpawnPhysicalVessel` on a physics-free world is a Recoverable

@@ -196,6 +196,26 @@ pub struct AeroDef {
     pub ref_len_m: f64,
 }
 
+impl AeroDef {
+    /// Constant-coefficient convenience — a single-knot flat `Cd`/`Cl`
+    /// (Mach-independent). For tests, scenarios, and parts whose aero
+    /// is genuinely flat (blunt bodies); authored part data should
+    /// prefer real curves.
+    pub fn constant(cd: f64, cl: f64, ref_len_m: f64) -> Self {
+        Self {
+            cd_curve: vec![AeroKnot {
+                mach: 0.0,
+                coeff: cd,
+            }],
+            cl_curve: vec![AeroKnot {
+                mach: 0.0,
+                coeff: cl,
+            }],
+            ref_len_m,
+        }
+    }
+}
+
 /// §3.1 `thermal`: lumped-capacity parameters. `heat_capacity_j_per_k`
 /// is the lump (`mass·cp`); `conduction_w_per_k` is the coupling to
 /// neighbour parts.

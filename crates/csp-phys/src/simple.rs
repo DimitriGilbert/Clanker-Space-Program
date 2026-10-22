@@ -331,6 +331,16 @@ pub fn atmosphere_density_kg_m3(atm: &AtmosphereDef, altitude_m: f64) -> f64 {
     p * atm.molar_mass_kg_per_mol / (R_GAS * t)
 }
 
+/// §3.0 speed of sound `a = √(γRT/M)` — the Mach denominator the
+/// voxel-table force model needs. `0.0` for a degenerate temperature.
+pub fn atmosphere_sound_speed_mps(atm: &AtmosphereDef, altitude_m: f64) -> f64 {
+    let t = atmosphere_temperature_k(atm, altitude_m);
+    if t <= 0.0 {
+        return 0.0;
+    }
+    libm::sqrt(atm.heat_capacity_ratio * R_GAS * t / atm.molar_mass_kg_per_mol)
+}
+
 /// One contact constraint in the solver's fixed working set — the
 /// public [`Contact`] record plus the solver bookkeeping (effective
 /// masses, accumulated impulses, lever arm). `contact_index` is the
@@ -513,15 +523,40 @@ impl SimpleBackend {
             force = force + rel * (-self.env.mu_m3_per_s2 * b.mass_kg / (r * r * r));
         }
 
-        // Pre-voxel analytic drag at the CoM.
+        // Aerodynamics: the §2.4.1 table-driven model when Stage-2
+        // tables are attached (`b.aero`), else the M2 pre-voxel
+        // placeholder — both apply at the CoM-relative points the
+        // force model documents. Table path: per-part directional
+        // exposure × authored Cd/Cl(Mach) + Cf(Re), forces applied at
+        // each part's centre of pressure → drag, lift, and the pitch
+        // moment all emerge (the placeholder produced no aero torque).
         if let Some(atm) = &self.env.atmosphere {
-            let rho = atmosphere_density_kg_m3(atm, r - self.env.radius_m);
+            let alt = r - self.env.radius_m;
+            let rho = atmosphere_density_kg_m3(atm, alt);
             if rho > 0.0 {
                 let v_rel = b.vel - self.env.body_spin.cross(rel);
                 let speed = v_rel.norm();
                 if speed > 0.0 {
-                    let area = cross_section_area(b, v_rel / speed);
-                    force = force + v_rel * (-0.5 * rho * self.env.drag_cd * area * speed);
+                    match &b.aero {
+                        Some(tables) => {
+                            let a = atmosphere_sound_speed_mps(atm, alt);
+                            let mach = if a > 0.0 { speed / a } else { 0.0 };
+                            let re_per_len = rho * speed / crate::aero::AIR_VISCOSITY_PA_S;
+                            let w_body = b.rot.conjugate().rotate(v_rel / -speed);
+                            let (fb, taub) = tables.force_torque_body(
+                                w_body,
+                                0.5 * rho * speed * speed,
+                                mach,
+                                re_per_len,
+                            );
+                            force = force + b.rot.rotate(fb);
+                            torque = torque + b.rot.rotate(taub);
+                        }
+                        None => {
+                            let area = cross_section_area(b, v_rel / speed);
+                            force = force + v_rel * (-0.5 * rho * self.env.drag_cd * area * speed);
+                        }
+                    }
                 }
             }
         }
@@ -1012,6 +1047,7 @@ mod tests {
             inertia: SymMat3::solid_box(mass_kg, half),
             collider: ColliderShape::Box { half_extents: half },
             force_sites: vec![],
+            aero: csp_data::AeroDef::constant(1.0, 0.0, 1.0),
         }];
         weld(&g, &parts).unwrap()
     }
@@ -1141,6 +1177,7 @@ mod tests {
                 ForceSiteKind::Thrust,
                 100.0,
             )],
+            aero: csp_data::AeroDef::constant(1.0, 0.0, 1.0),
         }];
         let mut b = weld(&g, &parts).unwrap();
         b.pos = DVec3::new(0.0, 0.0, 1.0e9); // far from the sphere
@@ -1347,6 +1384,7 @@ mod tests {
                 half_extents: DVec3::new(0.5, 0.5, 0.5),
             },
             force_sites: vec![],
+            aero: csp_data::AeroDef::constant(1.0, 0.0, 1.0),
         };
         let parts = [mk(4.0), mk(4.0)];
         let mut b0 = weld(&g, &parts).unwrap();
@@ -1503,6 +1541,7 @@ mod tests {
                 half_extents: DVec3::new(0.5, 0.5, 0.5),
             },
             force_sites: vec![],
+            aero: csp_data::AeroDef::constant(1.0, 0.0, 1.0),
         };
         let parts = [mk(4.0), mk(4.0)];
         let b = weld(&g, &parts).unwrap();
@@ -1663,6 +1702,7 @@ mod tests {
                 ForceSiteKind::Thrust,
                 drive,
             )],
+            aero: csp_data::AeroDef::constant(1.0, 0.0, 1.0),
         }];
         let mut b = weld(&g, &parts).unwrap();
         b.pos = DVec3::new(0.0, 0.0, TERRIN_R + half.z - 0.001);

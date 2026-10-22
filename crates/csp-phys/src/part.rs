@@ -13,6 +13,7 @@
 use serde::{Deserialize, Serialize};
 
 use csp_core::{DVec3, StableDiscriminant};
+use csp_data::AeroDef;
 
 use crate::tensor::SymMat3;
 
@@ -165,6 +166,13 @@ pub struct WeldPart {
     pub collider: ColliderShape,
     /// Force sites in part-local frame, in resolver order.
     pub force_sites: Vec<ForceSite>,
+    /// §3.1 `aero`: the authored `Cd`/`Cl`-vs-Mach curves and
+    /// reference length. Stage 1 ignores it; the §2.4.1 Stage-2
+    /// voxelizer ([`crate::aero`]) consumes it when building the
+    /// craft's directional tables. Hand-authored `WeldPart`s may carry
+    /// empty curves — the collider still occludes rays, it simply
+    /// produces no force (`eval_aero_curve` on an empty curve is 0).
+    pub aero: AeroDef,
 }
 
 #[cfg(test)]

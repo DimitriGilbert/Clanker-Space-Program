@@ -1118,6 +1118,11 @@ fn resolve_weld_input(
         inertia,
         collider,
         force_sites,
+        aero: csp_data::AeroDef {
+            cd_curve: def.aero.cd_curve.clone(),
+            cl_curve: def.aero.cl_curve.clone(),
+            ref_len_m: def.aero.ref_len_m * s,
+        },
     })
 }
 
