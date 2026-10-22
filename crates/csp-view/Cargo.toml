@@ -16,6 +16,10 @@ csp-ui = { workspace = true }
 # §2.1: csp-view is the ONLY crate allowed to depend on both csp-sim and
 # csp-render — RenderExtract builds csp_render::map::MapPacket here.
 csp-render = { workspace = true }
+# VAB session types (`PartNodeId`, `PartTransform`) ride vab events and
+# the craft-view scene — csp-phys is already in this crate's tree via
+# csp-sim; the direct edge names what the VAB systems touch.
+csp-phys = { workspace = true }
 egui = { workspace = true }
 bevy_ecs = { workspace = true, features = ["std"] }
 # Degradation logging for the map extract path (a skipped orbit line is

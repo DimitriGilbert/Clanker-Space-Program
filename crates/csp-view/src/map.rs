@@ -740,7 +740,7 @@ fn mean_anomaly_of_true(elements: &KeplerElements, nu: f64) -> f64 {
 /// Rotation `R = Rz(yaw) · Rx(pitch)` — camera basis (columns are the
 /// view axes in world space). At yaw=pitch=0 the eye sits on +z looking
 /// down onto the ecliptic.
-fn rot3(yaw: f64, pitch: f64) -> [[f64; 3]; 3] {
+pub(crate) fn rot3(yaw: f64, pitch: f64) -> [[f64; 3]; 3] {
     let (sy, cy) = f64::sin_cos(yaw);
     let (sp, cp) = f64::sin_cos(pitch);
     [
@@ -750,7 +750,7 @@ fn rot3(yaw: f64, pitch: f64) -> [[f64; 3]; 3] {
     ]
 }
 
-fn mat3_vec(m: &[[f64; 3]; 3], v: DVec3) -> DVec3 {
+pub(crate) fn mat3_vec(m: &[[f64; 3]; 3], v: DVec3) -> DVec3 {
     DVec3::new(
         m[0][0] * v.x + m[0][1] * v.y + m[0][2] * v.z,
         m[1][0] * v.x + m[1][1] * v.y + m[1][2] * v.z,
@@ -762,7 +762,7 @@ fn mat3_vec(m: &[[f64; 3]; 3], v: DVec3) -> DVec3 {
 /// (§2.3's depth contract: `[0,1]`, 1 = near). `clip.w = −z_view`, so
 /// `clip.z = near` gives `ndc.z = near/(−z_view)` → 1 at the near plane,
 /// →0 at infinity.
-fn perspective_revz(fov_y: f64, aspect: f64, near: f64) -> [[f64; 4]; 4] {
+pub(crate) fn perspective_revz(fov_y: f64, aspect: f64, near: f64) -> [[f64; 4]; 4] {
     let f = 1.0 / f64::tan(fov_y * 0.5);
     [
         [f / aspect, 0.0, 0.0, 0.0],
@@ -772,7 +772,7 @@ fn perspective_revz(fov_y: f64, aspect: f64, near: f64) -> [[f64; 4]; 4] {
     ]
 }
 
-fn mat4_mul(a: &[[f64; 4]; 4], b: &[[f64; 4]; 4]) -> [[f64; 4]; 4] {
+pub(crate) fn mat4_mul(a: &[[f64; 4]; 4], b: &[[f64; 4]; 4]) -> [[f64; 4]; 4] {
     let mut out = [[0.0; 4]; 4];
     for (i, row) in out.iter_mut().enumerate() {
         for (j, cell) in row.iter_mut().enumerate() {
@@ -784,23 +784,44 @@ fn mat4_mul(a: &[[f64; 4]; 4], b: &[[f64; 4]; 4]) -> [[f64; 4]; 4] {
 
 /// Solve the frame's map camera from [`MapInput`] + a focus point.
 fn solve_camera(input: &MapInput, focus: DVec3) -> MapCameraF64 {
-    let r = rot3(input.yaw_rad, input.pitch_rad);
-    // The view +z axis in world space is R's third column — the
-    // direction from focus to eye.
-    let eye = focus + DVec3::new(r[0][2], r[1][2], r[2][2]) * input.distance_m;
-    // view(w) = Rᵀ·(w − eye): view matrix rows are R's columns.
+    solve_orbit_camera(
+        input.yaw_rad,
+        input.pitch_rad,
+        input.distance_m,
+        input.viewport_px,
+        focus,
+        MAP_FOV_Y,
+        1e-3,
+    )
+}
+
+/// The shared orbit-camera solve — `yaw`/`pitch` place the eye on the
+/// R = Rz(yaw)·Rx(pitch) basis's third column at `distance_m` from
+/// `focus`; `fov_y`/`near` are the reverse-Z projection's parameters
+/// (§2.3). Used by the map (system frame) and the VAB (craft frame).
+pub(crate) fn solve_orbit_camera(
+    yaw_rad: f64,
+    pitch_rad: f64,
+    distance_m: f64,
+    viewport_px: (f64, f64),
+    focus: DVec3,
+    fov_y: f64,
+    near: f64,
+) -> MapCameraF64 {
+    let r = rot3(yaw_rad, pitch_rad);
+    let eye = focus + DVec3::new(r[0][2], r[1][2], r[2][2]) * distance_m;
     let view = [
         [r[0][0], r[1][0], r[2][0], 0.0],
         [r[0][1], r[1][1], r[2][1], 0.0],
         [r[0][2], r[1][2], r[2][2], 0.0],
         [0.0, 0.0, 0.0, 1.0],
     ];
-    let aspect = (input.viewport_px.0 / input.viewport_px.1.max(1.0)).max(1e-6);
-    let proj = perspective_revz(MAP_FOV_Y, aspect, 1e-3);
+    let aspect = (viewport_px.0 / viewport_px.1.max(1.0)).max(1e-6);
+    let proj = perspective_revz(fov_y, aspect, near);
     MapCameraF64 {
         view_proj: mat4_mul(&proj, &view),
         eye,
-        distance_m: input.distance_m,
+        distance_m,
         valid: true,
     }
 }
@@ -811,8 +832,19 @@ fn solve_camera(input: &MapInput, focus: DVec3) -> MapCameraF64 {
 /// non-finite (the caller skips it — lines drop the segment, markers
 /// drop the quad).
 fn project(cam: &MapCameraF64, world: DVec3) -> Option<[f32; 3]> {
-    let rel = world - cam.eye; // f64 — the only world-frame math
-    let m = &cam.view_proj;
+    project_into(&cam.view_proj, cam.eye, world)
+}
+
+/// [`project`] over explicit camera parts — the VAB's extract shares
+/// the f64-relative-subtract-then-f32 rule without borrowing the map's
+/// camera resource type.
+pub(crate) fn project_into(
+    view_proj: &[[f64; 4]; 4],
+    eye: DVec3,
+    world: DVec3,
+) -> Option<[f32; 3]> {
+    let rel = world - eye; // f64 — the only world-frame math
+    let m = view_proj;
     let clip = [
         m[0][0] * rel.x + m[0][1] * rel.y + m[0][2] * rel.z + m[0][3],
         m[1][0] * rel.x + m[1][1] * rel.y + m[1][2] * rel.z + m[1][3],

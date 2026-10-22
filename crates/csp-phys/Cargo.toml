@@ -17,6 +17,10 @@ libm.workspace = true
 # WeldedBody and the part graph derive serde for the §7.1/§7.2 hash/save
 # pipeline (derived caches re-weld exactly; kinematic state serializes).
 serde = { workspace = true, features = ["derive"] }
+# Craft-file codec for the M3 session model (session.rs): magic +
+# bincode body — the plan's other pinned codec (§7.2 "replay logs stay
+# bincode"); already on this crate's §2.1 allowlist.
+bincode = { workspace = true, features = ["serde"] }
 
 [lints]
 workspace = true

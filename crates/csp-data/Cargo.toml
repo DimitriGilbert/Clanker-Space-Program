@@ -8,6 +8,10 @@ license = "MIT OR Apache-2.0"
 # §3.x data defs are RON; the loader/validator needs nothing else from the
 # platform. libm only for transcendentals (§8.2 determinism lints) — the
 # period check uses libm::sqrt.
+# csp-core for DVec3/DQuat — part attach nodes, bounding boxes, and
+# collider geometry are 3-vectors (§3.1 PartDef), and the types must be
+# the same ones csp-phys consumes downstream.
+csp-core = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 ron = { workspace = true }
 libm = { workspace = true }

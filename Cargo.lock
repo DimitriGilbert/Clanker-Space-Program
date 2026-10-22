@@ -826,6 +826,7 @@ name = "csp-data"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "csp-core",
  "libm",
  "ron",
  "serde",
@@ -835,6 +836,7 @@ dependencies = [
 name = "csp-phys"
 version = "0.0.0"
 dependencies = [
+ "bincode",
  "csp-core",
  "csp-data",
  "libm",
@@ -846,6 +848,7 @@ name = "csp-render"
 version = "0.0.0"
 dependencies = [
  "bytemuck",
+ "naga",
  "wgpu",
 ]
 
@@ -873,6 +876,9 @@ dependencies = [
 name = "csp-ui"
 version = "0.0.0"
 dependencies = [
+ "csp-core",
+ "csp-data",
+ "csp-phys",
  "egui",
 ]
 
@@ -883,6 +889,7 @@ dependencies = [
  "bevy_ecs",
  "csp-core",
  "csp-data",
+ "csp-phys",
  "csp-render",
  "csp-sim",
  "csp-ui",

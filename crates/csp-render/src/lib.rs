@@ -9,6 +9,56 @@
 /// drawn from a `csp-view`-built [`map::MapPacket`].
 pub mod map;
 
+/// The M3 VAB craft view + GPU picking (PLAN M3 exit row "GPU picking",
+/// §9 "Editor viewport is `csp-render` + GPU picking"): a depth-tested
+/// placeholder-box pass over a `csp-view`-built [`vab::VabPacket`], plus
+/// an offscreen object-id pass whose single-pixel readback resolves the
+/// part under the cursor.
+pub mod vab;
+
+/// A grow-only GPU vertex buffer + the count it currently holds — shared
+/// by the simple pass renderers (map, VAB). Recreated with headroom when
+/// the frame's mesh outgrows it so steady-state frames never reallocate.
+pub(crate) struct GpuBuffer {
+    /// The wgpu buffer.
+    pub buffer: wgpu::Buffer,
+    /// Allocated bytes.
+    pub capacity: u64,
+}
+
+impl GpuBuffer {
+    pub(crate) fn new(device: &wgpu::Device, label: &'static str, capacity: u64) -> Self {
+        Self {
+            buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: capacity,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            capacity,
+        }
+    }
+
+    /// Upload `verts`, growing the buffer when needed. Returns the
+    /// vertex count to draw (0 ⇒ skip the draw call).
+    pub(crate) fn upload<V: bytemuck::Pod>(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        verts: &[V],
+    ) -> u32 {
+        let bytes = bytemuck::cast_slice(verts);
+        let needed = bytes.len() as u64;
+        if needed > self.capacity {
+            *self = Self::new(device, "vtx-grow", needed.next_power_of_two());
+        }
+        if needed > 0 {
+            queue.write_buffer(&self.buffer, 0, bytes);
+        }
+        verts.len() as u32
+    }
+}
+
 /// Everything needed to render frames into a window surface.
 pub struct Gpu {
     pub instance: wgpu::Instance,
@@ -179,5 +229,37 @@ impl From<wgpu::RequestAdapterError> for GpuError {
 impl From<wgpu::RequestDeviceError> for GpuError {
     fn from(e: wgpu::RequestDeviceError) -> Self {
         Self::Device(e)
+    }
+}
+
+#[cfg(test)]
+// Tests signal failure by panicking (§2.13's no-panic rule is a shipping
+// contract, not a test contract).
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    /// Every WGSL source this crate feeds `create_shader_module` must
+    /// pass the same checks wgpu runs eagerly at GPU init: naga parse +
+    /// full validation. An invalid module panics device-side and kills
+    /// the app on launch (the M3-D case: an integer varying without
+    /// `@interpolate(flat)` → InvalidInterpolationForInteger), so this
+    /// test is the gate that keeps shader regressions inside
+    /// `cargo test`. `Capabilities::all()` keeps the check permissive —
+    /// it gates structural validity, not device feature usage.
+    #[test]
+    fn shaders_parse_and_validate() {
+        for (name, src) in [
+            ("map.wgsl", include_str!("map.wgsl")),
+            ("vab.wgsl", include_str!("vab.wgsl")),
+        ] {
+            let module = naga::front::wgsl::parse_str(src)
+                .unwrap_or_else(|e| panic!("{name}: parse failed\n{}", e.emit_to_string(src)));
+            let mut validator = naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            );
+            validator
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("{name}: validation failed\n{e:?}"));
+        }
     }
 }

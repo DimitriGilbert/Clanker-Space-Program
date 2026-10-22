@@ -22,13 +22,13 @@
 
 use csp_core::{DQuat, DVec3, SimTime, StableDiscriminant, TICK_HZ};
 use csp_data::BodyId;
-use csp_phys::{EffectivePart, Environment, PartGraph, WeldedBody};
+use csp_phys::{Environment, PartGraph, WeldPart, WeldedBody};
 use serde::{Deserialize, Serialize};
 
 use crate::orbit::OrbitState;
 
 /// The weld inputs a `SpawnPhysicalVessel` command carries — §2.4's
-/// `weld(part_graph, &[EffectivePart])` arguments, verbatim.
+/// `weld(part_graph, &[WeldPart])` arguments, verbatim.
 ///
 /// The craft def IS the vessel's authoritative physical description:
 /// `WeldedBody`'s mass properties are its pure derived cache (§7.3 —
@@ -37,12 +37,20 @@ use crate::orbit::OrbitState;
 /// re-entry) rather than serializing mass properties. A vessel that
 /// never had one — an elements-only `SpawnVessel` — carries `None` and
 /// can never become physics-resident.
+///
+/// `parts` holds the weld-consumed view of each node's resolved
+/// `csp_phys::EffectivePart` (its `weld_input` field), produced by the
+/// §3.1 resolver `csp_phys::resolve` from `BuiltPart` instance records.
+/// The records themselves ride the §7.2 part-instance arena when it
+/// lands (M3-C+); the frozen resolved numbers carried here are
+/// bit-stable for the vessel's life regardless — the §3.3
+/// never-retroactive guarantee made concrete.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CraftDef {
     /// The §2.4 attachment graph.
     pub graph: PartGraph,
     /// Resolved per-part data, indexed by `PartNode::effective_index`.
-    pub parts: Vec<EffectivePart>,
+    pub parts: Vec<WeldPart>,
 }
 
 /// Where a vessel lives (§2.4/§2.6.2): on rails, physics-resident in

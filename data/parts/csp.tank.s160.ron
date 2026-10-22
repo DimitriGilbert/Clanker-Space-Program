@@ -1,0 +1,71 @@
+// csp.tank.s160 — "Drum 160" small propellant tank (§3.1 PartDef).
+// Hand-authored fiction — numbers frozen at M3.
+//
+// 1.25 m stack, 2 m tall: 162 u liquid_fuel + 198 u oxidizer =
+// 1 800 kg of propellant at 5 kg/u in the 45:55 burn ratio the
+// launch engines consume. Capacity is ~2.45 m³ of cylinder — ~735
+// kg/m³ bulk propellant density, plausible for the fiction.
+// Continuous scaling exercises the ScaleRule::Continuous path; the
+// exponents are the textbook ones (mass/capacity cubic, structural
+// quadratic, thrust unused).
+(
+    schema_version: 1,
+    id: "csp.tank.s160",
+    family: "csp.family.tank.s",
+    display_name: "part.csp.tank.s160.name",
+    category: FuelTank,
+    mass_dry_kg: 220.0,
+    cost_funds: 400.0,
+    size_m: (x: 1.25, y: 1.25, z: 2.0),
+    build_resources: [("metal", 22.0)],
+    attach_nodes: [
+        (id: "top",    position_m: (x: 0.0, y: 0.0, z: 1.0),  direction: (x: 0.0, y: 0.0, z: 1.0),  diameter_m: 1.25),
+        (id: "bottom", position_m: (x: 0.0, y: 0.0, z: -1.0), direction: (x: 0.0, y: 0.0, z: -1.0), diameter_m: 1.25),
+    ],
+    scale: Continuous(
+        min: 0.5,
+        max: 2.0,
+        exponents: (mass: 3.0, cost: 3.0, thrust: 0.0, capacity: 3.0, structural: 2.0),
+    ),
+    collider: Cylinder(radius_m: 0.625, half_height_m: 1.0),
+    aero: (
+        cd_curve: [(mach: 0.0, coeff: 0.4), (mach: 8.0, coeff: 0.25)],
+        cl_curve: [(mach: 0.0, coeff: 0.0)],
+        ref_len_m: 2.0,
+    ),
+    thermal: (
+        heat_capacity_j_per_k: 120_000.0,
+        max_temp_k: 900.0,
+        emissivity: 0.6,
+        conduction_w_per_k: 80.0,
+    ),
+    structural: (
+        max_axial_n: 800_000.0,
+        max_shear_n: 250_000.0,
+        max_torque_nm: 40_000.0,
+    ),
+    variants: [
+        (id: "stock", display_name: "part.variant.stock", cost_multiplier: 1.0, stat_multipliers: []),
+    ],
+    modules: [
+        Tank(capacity: [("liquid_fuel", 162.0), ("oxidizer", 198.0)]),
+    ],
+    reliability: (
+        base_mtbf_s: 2_000_000.0,
+        infant_mortality: 0.05,
+        qualification_curve: (knots: [
+            (qualification_units: 0.0,   hazard_multiplier: 1.0),
+            (qualification_units: 100.0, hazard_multiplier: 0.5),
+        ]),
+        regime_stress: [
+            (kind: ExcessG,         threshold: 15.0, multiplier: 2.0),
+            (kind: Overtemperature, threshold: 0.9,  multiplier: 3.0),
+        ],
+        dormant_stress: 0.01,
+        failure_modes: [
+            (Leak,        0.7),
+            (SensorFault, 0.3),
+        ],
+    ),
+    tech_requirement: "tech.start",
+)

@@ -8,6 +8,17 @@
 //! mirrors — the sim is never read directly — and return plain-data output
 //! structs the same system stores for next frame's `Input` (§2.5). Painting
 //! the resulting `egui::FullOutput` stays in `csp-app`/`egui-wgpu`.
+//!
+//! - [`vab`] — the M3 VAB: [`vab::VabSession`] owns the working-craft
+//!   session instance (§2.2 category C), the [`vab::VabAction`] op
+//!   channel, and the editor panels; [`top_bar`] is the always-present
+//!   mode bar.
+
+/// The M3 vehicle-assembly editor (PLAN M3 exit row): session instance,
+/// op channel, and panels.
+pub mod vab;
+
+pub use vab::{ModeSelect, VabSession};
 
 /// Everything the M0 debug panel needs — mirrors and session values only.
 ///

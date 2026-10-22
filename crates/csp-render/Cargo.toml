@@ -10,5 +10,15 @@ wgpu = { workspace = true }
 # map pipeline's vertex struct honest (plain repr(C) f32 data).
 bytemuck = { workspace = true }
 
+[dev-dependencies]
+# WGSL validation gate (tests only): parses + full-validates this crate's
+# shader sources so a module that would panic `create_shader_module` —
+# e.g. an integer varying without @interpolate(flat) — fails in
+# `cargo test` instead of at app startup. Pinned to the exact naga wgpu
+# 30.0.1 uses so the test validates what the runtime validates; bump in
+# lockstep with the wgpu dep. Dev-dep only — outside lint-deps' normal/
+# build edge scope and never in the shipped tree.
+naga = { version = "=30.0.1", default-features = false, features = ["wgsl-in"] }
+
 [lints]
 workspace = true

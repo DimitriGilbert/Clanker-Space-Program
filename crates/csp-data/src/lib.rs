@@ -12,14 +12,22 @@
 //! `std::time`, libm-only transcendentals (this crate's `clippy.toml`),
 //! and the loader's only I/O is reading the directory it is handed.
 //!
-//! - [`ids`] — `SystemId`, `BodyId`, `BiomeId`, `ResourceId`, `LocKey`.
+//! - [`ids`] — `SystemId`, `BodyId`, `BiomeId`, `ResourceId`, `LocKey`,
+//!   `PartId`, `FamilyId`, `VariantId`, `TechNodeId`, `ExperimentId`,
+//!   `RecipeId`.
 //! - [`system`] — `SystemDef`, `BodyDef`, `KeplerElements`,
 //!   `AtmosphereDef`, `OceanDef`, `TerrainDef`, `BiomeMapRef`,
 //!   `ConcentrationMapRef`.
+//! - [`part`] — `PartDef` and everything it carries: categories,
+//!   attach nodes, scaling rules, collider/aero/thermal/structural
+//!   defs, variants, `ModuleDef`, and the §3.4 `ReliabilityDef`.
+//! - [`resource`] — the §3.5 resource registry (`resources.ron`).
 //! - [`biome`] — `biomes.ron` legend + indexed-PNG header inspection.
 //! - [`loc`] — `en.ron` table.
-//! - [`load`] — `load_system(dir)`.
-//! - [`validate`] — the §3.0 rule set over a `LoadedSystem`.
+//! - [`load`] — `load_system(dir)`, `load_parts(dir)`,
+//!   `load_resources(path)`, `load_balance(path)`.
+//! - [`validate`] — the §3.0/§3.1/§8.2 rule sets over `LoadedSystem`,
+//!   `LoadedParts`, and `ResourceFile`.
 //! - [`datahash`] — `data_set_hash(data/)` (§3.1).
 
 /// Version of the data-set hashing scheme (PLAN §3.1). Recorded in the §7.1
@@ -42,17 +50,35 @@ pub mod datahash;
 pub mod ids;
 pub mod load;
 pub mod loc;
+pub mod part;
+pub mod resource;
 pub mod system;
 pub mod validate;
 
 pub use balance::{BALANCE_SCHEMA_VERSION, BalanceDef};
 pub use biome::{BiomeLegend, BiomeLegendEntry, PngInfo, inspect_indexed_png};
 pub use datahash::{DataHashError, data_set_hash};
-pub use ids::{BiomeId, BodyId, LocKey, ResourceId, SystemId};
-pub use load::{LoadError, LoadedBiomeMap, LoadedBody, LoadedSystem, load_balance, load_system};
+pub use ids::{
+    BiomeId, BodyId, ExperimentId, FamilyId, LocKey, PartId, RecipeId, ResourceId, SystemId,
+    TechNodeId, VariantId,
+};
+pub use load::{
+    LoadError, LoadedBiomeMap, LoadedBody, LoadedPart, LoadedParts, LoadedSystem, load_balance,
+    load_parts, load_resources, load_system,
+};
 pub use loc::LocFile;
+pub use part::{
+    AeroDef, AeroKnot, AttachNode, ColliderDef, FailureMode, G0, ModuleDef, PART_SCHEMA_VERSION,
+    PartCategory, PartDef, PartVariant, PortSize, QualCurve, QualKnot, ReliabilityDef,
+    ScaleExponents, ScaleRule, SituationMask, StatPath, StressKind, StressRule, StructuralDef,
+    ThermalDef, ThrottleRange,
+};
+pub use resource::{RESOURCE_SCHEMA_VERSION, ResourceDef, ResourceFile};
 pub use system::{
     AtmosphereDef, BiomeMapRef, BodyDef, ConcentrationMapRef, KeplerElements, OceanDef,
     SCHEMA_VERSION, SystemDef, TemperatureKnot, TerrainDef,
 };
-pub use validate::{PERIOD_REL_TOL, ValidationError, validate_loc_keys, validate_system};
+pub use validate::{
+    PERIOD_REL_TOL, ValidationError, validate_loc_keys, validate_part_loc_keys, validate_parts,
+    validate_resources, validate_system,
+};

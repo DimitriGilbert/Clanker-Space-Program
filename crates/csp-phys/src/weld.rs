@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use csp_core::{DQuat, DVec3, SimError};
 
 use crate::graph::{PartGraph, PartNodeId, PartTransform};
-use crate::part::{EffectivePart, ForceSite};
+use crate::part::{ForceSite, WeldPart};
 use crate::tensor::SymMat3;
 
 /// One hull of the merged compound collider — the convex vertex set of
@@ -266,10 +266,10 @@ impl From<WeldError> for SimError {
 struct SolvedNode<'a> {
     transform: PartTransform,
     com_body: DVec3,
-    part: &'a EffectivePart,
+    part: &'a WeldPart,
 }
 
-/// `csp_phys::weld(part_graph, &[EffectivePart]) -> WeldedBody` — §2.4
+/// `csp_phys::weld(part_graph, &[WeldPart]) -> WeldedBody` — §2.4
 /// Stage 1, on the sim thread, always.
 ///
 /// Errors instead of panicking on every malformed input: empty or
@@ -283,7 +283,7 @@ struct SolvedNode<'a> {
 /// id labelling is part of the input: a relabelled graph produces the
 /// same physical result to rounding, but bit-identity holds only for
 /// identical labellings.
-pub fn weld(graph: &PartGraph, effective: &[EffectivePart]) -> Result<WeldedBody, WeldError> {
+pub fn weld(graph: &PartGraph, effective: &[WeldPart]) -> Result<WeldedBody, WeldError> {
     validate_structure(graph, effective)?;
     let solved = solve_transforms(graph, effective)?;
     assemble(&solved)
@@ -294,7 +294,7 @@ pub fn weld(graph: &PartGraph, effective: &[EffectivePart]) -> Result<WeldedBody
 /// with unit rotations, and per-part data is finite and physical. All
 /// checks ascend `PartNodeId`, so the *first reported* error is also
 /// deterministic.
-fn validate_structure(graph: &PartGraph, effective: &[EffectivePart]) -> Result<(), WeldError> {
+fn validate_structure(graph: &PartGraph, effective: &[WeldPart]) -> Result<(), WeldError> {
     if graph.nodes.is_empty() {
         return Err(WeldError::EmptyGraph);
     }
@@ -351,7 +351,7 @@ fn validate_structure(graph: &PartGraph, effective: &[EffectivePart]) -> Result<
 
 /// Per-part physical validity: finite non-negative mass, finite CoM,
 /// PSD inertia, finite collider, finite non-zero site directions.
-fn validate_effective(node: PartNodeId, ep: &EffectivePart) -> Result<(), WeldError> {
+fn validate_effective(node: PartNodeId, ep: &WeldPart) -> Result<(), WeldError> {
     let bad = |field: &'static str| WeldError::InvalidPart { node, field };
     if !ep.mass_kg.is_finite() || ep.mass_kg < 0.0 {
         return Err(bad("weld: part mass is negative or non-finite"));
@@ -388,7 +388,7 @@ fn validate_effective(node: PartNodeId, ep: &EffectivePart) -> Result<(), WeldEr
 /// parent cycles alike.
 fn solve_transforms<'a>(
     graph: &PartGraph,
-    effective: &'a [EffectivePart],
+    effective: &'a [WeldPart],
 ) -> Result<BTreeMap<PartNodeId, SolvedNode<'a>>, WeldError> {
     let mut children: BTreeMap<PartNodeId, Vec<PartNodeId>> = BTreeMap::new();
     for (id, node) in &graph.nodes {
@@ -589,8 +589,8 @@ mod tests {
         );
     }
 
-    fn point_part(mass_kg: f64) -> EffectivePart {
-        EffectivePart {
+    fn point_part(mass_kg: f64) -> WeldPart {
+        WeldPart {
             mass_kg,
             com: DVec3::ZERO,
             inertia: SymMat3::ZERO,
@@ -599,8 +599,8 @@ mod tests {
         }
     }
 
-    fn box_part(mass_kg: f64, half: DVec3) -> EffectivePart {
-        EffectivePart {
+    fn box_part(mass_kg: f64, half: DVec3) -> WeldPart {
+        WeldPart {
             mass_kg,
             com: DVec3::ZERO,
             inertia: SymMat3::solid_box(mass_kg, half),
@@ -836,7 +836,7 @@ mod tests {
     /// the only permutation channel left.
     #[test]
     fn bit_identical_under_input_permutation() {
-        let mk = |insert_order: &[u8], eff: &[EffectivePart], idx: &[u32]| {
+        let mk = |insert_order: &[u8], eff: &[WeldPart], idx: &[u32]| {
             let mut g = PartGraph::new(PartNodeId(1));
             let nodes = [
                 (
@@ -876,10 +876,9 @@ mod tests {
         ];
         let a = mk(&[0, 1, 2], &parts, &[0, 1, 2]);
         // Reverse insertion order, reversed effective slice, remapped.
-        let rev: Vec<EffectivePart> = parts.iter().rev().cloned().collect();
+        let rev: Vec<WeldPart> = parts.iter().rev().cloned().collect();
         let b = mk(&[2, 1, 0], &rev, &[2, 1, 0]);
-        let shuffled: Vec<EffectivePart> =
-            vec![parts[1].clone(), parts[2].clone(), parts[0].clone()];
+        let shuffled: Vec<WeldPart> = vec![parts[1].clone(), parts[2].clone(), parts[0].clone()];
         let c = mk(&[1, 0, 2], &shuffled, &[2, 0, 1]);
         assert_bit_identical(&a, &b);
         assert_bit_identical(&a, &c);

@@ -1,0 +1,68 @@
+// csp.science.canister — "Specimen" materials-study canister
+// (§3.1 PartDef). Hand-authored fiction — numbers frozen at M3.
+//
+// The starter science instrument: one Experiment module running a
+// materials study, usable landed and in space (situation mask 49 =
+// LANDED | SPACE_LOW | SPACE_HIGH, §3.2's granularity — not airborne,
+// it needs to sit still). One-shot, not reusable.
+(
+    schema_version: 1,
+    id: "csp.science.canister",
+    family: "csp.family.science",
+    display_name: "part.csp.science.canister.name",
+    category: Science,
+    mass_dry_kg: 100.0,
+    cost_funds: 500.0,
+    size_m: (x: 0.625, y: 0.625, z: 0.6),
+    build_resources: [("metal", 8.0), ("composite", 4.0)],
+    attach_nodes: [
+        (id: "bottom", position_m: (x: 0.0, y: 0.0, z: -0.3), direction: (x: 0.0, y: 0.0, z: -1.0), diameter_m: 0.625),
+    ],
+    scale: None,
+    collider: Cylinder(radius_m: 0.3125, half_height_m: 0.3),
+    aero: (
+        cd_curve: [(mach: 0.0, coeff: 0.45), (mach: 8.0, coeff: 0.3)],
+        cl_curve: [(mach: 0.0, coeff: 0.0)],
+        ref_len_m: 0.6,
+    ),
+    thermal: (
+        heat_capacity_j_per_k: 50_000.0,
+        max_temp_k: 1000.0,
+        emissivity: 0.65,
+        conduction_w_per_k: 30.0,
+    ),
+    structural: (
+        max_axial_n: 200_000.0,
+        max_shear_n: 80_000.0,
+        max_torque_nm: 10_000.0,
+    ),
+    variants: [
+        (id: "stock", display_name: "part.variant.stock", cost_multiplier: 1.0, stat_multipliers: []),
+    ],
+    modules: [
+        Experiment(
+            kind: "exp.materials_study",
+            data_units: 10.0,
+            reusable: false,
+            situations: 49,
+        ),
+    ],
+    reliability: (
+        base_mtbf_s: 1_500_000.0,
+        infant_mortality: 0.1,
+        qualification_curve: (knots: [
+            (qualification_units: 0.0,   hazard_multiplier: 1.0),
+            (qualification_units: 100.0, hazard_multiplier: 0.5),
+        ]),
+        regime_stress: [
+            (kind: Overtemperature, threshold: 0.9,  multiplier: 4.0),
+            (kind: ExcessG,         threshold: 10.0, multiplier: 2.0),
+        ],
+        dormant_stress: 0.01,
+        failure_modes: [
+            (SensorFault, 0.7),
+            (PanelJam,    0.3),
+        ],
+    ),
+    tech_requirement: "tech.science.1",
+)

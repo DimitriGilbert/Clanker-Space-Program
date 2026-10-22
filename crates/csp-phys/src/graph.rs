@@ -112,7 +112,7 @@ impl PartTransform {
 /// by construction.
 ///
 /// `effective_index` selects the node's resolved stats from the
-/// `&[EffectivePart]` slice `weld` is handed — keeping identity
+/// `&[WeldPart]` slice `weld` is handed — keeping identity
 /// (graph) and stats (data) in separate slots is what lets the same
 /// graph re-weld when quantized tank contents change the effective
 /// parts (§2.4 inertia-cache rule).
@@ -125,7 +125,7 @@ pub struct PartNode {
     /// This node's frame relative to its parent's frame (relative to
     /// the graph frame for the root).
     pub transform: PartTransform,
-    /// Index into the `effective: &[EffectivePart]` weld argument.
+    /// Index into the `effective: &[WeldPart]` weld argument.
     pub effective_index: u32,
 }
 
@@ -144,7 +144,7 @@ impl PartNode {
 }
 
 /// A rooted part tree — the first `weld` argument of §2.4's
-/// `csp_phys::weld(part_graph, &[EffectivePart])`.
+/// `csp_phys::weld(part_graph, &[WeldPart])`.
 ///
 /// Construction is unordered by design (a map), but callers that build
 /// a graph from an ordered craft-file node list simply insert in that

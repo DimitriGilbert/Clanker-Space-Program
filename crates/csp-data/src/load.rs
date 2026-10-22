@@ -20,6 +20,8 @@ use std::path::{Path, PathBuf};
 
 use crate::balance::{BALANCE_SCHEMA_VERSION, BalanceDef};
 use crate::biome::BiomeLegend;
+use crate::part::{PART_SCHEMA_VERSION, PartDef};
+use crate::resource::{RESOURCE_SCHEMA_VERSION, ResourceFile};
 use crate::system::{BodyDef, SCHEMA_VERSION, SystemDef};
 
 /// A biome map as loaded: legend (parsed) plus the PNG's raw bytes.
@@ -53,6 +55,27 @@ pub struct LoadedSystem {
     pub system: SystemDef,
     /// One [`LoadedBody`] per manifest entry, in manifest order.
     pub bodies: Vec<LoadedBody>,
+}
+
+/// One loaded part def plus the file it came from — the validator
+/// checks `id` ↔ file-stem agreement (§3.1: the file *is* the ID).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoadedPart {
+    /// Parsed def.
+    pub def: PartDef,
+    /// Path relative to the `data/parts/` root the loader was handed —
+    /// carried for diagnostics (`parts/engines/csp.engine.sparc.ron`)
+    /// and the id↔stem check.
+    pub path: PathBuf,
+}
+
+/// Everything `load_parts` read under a `data/parts/` directory, in
+/// ascending relative-path order (deterministic — the same order
+/// `data_set_hash` hashes them in).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoadedParts {
+    /// Parsed part defs with their source paths.
+    pub parts: Vec<LoadedPart>,
 }
 
 /// Loader failures. Deliberately a plain error type, not
@@ -184,4 +207,55 @@ pub fn load_balance(path: &Path) -> Result<BalanceDef, LoadError> {
     let balance: BalanceDef = read_ron(path)?;
     check_version(path, balance.schema_version, BALANCE_SCHEMA_VERSION)?;
     Ok(balance)
+}
+
+/// Load `data/resources.ron` — the §3.5 resource registry. File-shape
+/// checks only; uniqueness/positivity rules live in
+/// [`crate::validate`].
+pub fn load_resources(path: &Path) -> Result<ResourceFile, LoadError> {
+    let resources: ResourceFile = read_ron(path)?;
+    check_version(path, resources.schema_version, RESOURCE_SCHEMA_VERSION)?;
+    Ok(resources)
+}
+
+/// Collect every `*.ron` under `dir` recursively, in ascending
+/// relative-path order. Deterministic by construction — the walk sorts
+/// each directory level, matching `data_set_hash`'s ordering so a
+/// reordering of `read_dir` results can never change which def a
+/// duplicate-ID diagnostic names first.
+fn collect_ron_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), LoadError> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(|source| LoadError::Io {
+            path: dir.to_path_buf(),
+            source,
+        })?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .collect();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            collect_ron_files(&path, out)?;
+        } else if path.extension().is_some_and(|ext| ext == "ron") {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// Load every part def under `data/parts/` — `<id>.ron` files,
+/// optionally grouped in subdirectories (a subdir is organization only;
+/// it carries no semantics). File-shape checks only: RON parses,
+/// `schema_version` current. Semantic rules (id↔stem, category/module
+/// consistency, resource refs) are [`crate::validate::validate_parts`].
+pub fn load_parts(dir: &Path) -> Result<LoadedParts, LoadError> {
+    let mut files = Vec::new();
+    collect_ron_files(dir, &mut files)?;
+    let mut parts = Vec::with_capacity(files.len());
+    for path in files {
+        let def: PartDef = read_ron(&path)?;
+        check_version(&path, def.schema_version, PART_SCHEMA_VERSION)?;
+        let rel = path.strip_prefix(dir).unwrap_or(&path).to_path_buf();
+        parts.push(LoadedPart { def, path: rel });
+    }
+    Ok(LoadedParts { parts })
 }

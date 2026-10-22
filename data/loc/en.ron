@@ -6,6 +6,11 @@
 //   body.<id>.name        — a body's display name
 //   biome.<body>.<biome>  — a biome's display name (matches the legend
 //                           entry's `name` LocKey in biomes.ron)
+//   part.<part id>.name   — a part's display name
+//   part.variant.<vid>    — a part variant's display name (variants are
+//                           shared vocabulary across parts, so the keys
+//                           are not per-part)
+//   resource.<rid>        — a resource's display name
 (
     schema_version: 1,
     strings: {
@@ -29,5 +34,27 @@
         "biome.duva.dunes": "Dunes",
         "biome.duva.cratered_highlands": "Cratered Highlands",
         "biome.duva.impact_basin": "Impact Basin",
+        "part.csp.pod.mk1.name": "Tin Can Mk1 Command Pod",
+        "part.csp.engine.sparc.name": "Sparc Launch Engine",
+        "part.csp.engine.ember.name": "Ember Upper-Stage Engine",
+        "part.csp.tank.s160.name": "Drum 160 Propellant Tank",
+        "part.csp.tank.s320.name": "Drum 320 Propellant Tank",
+        "part.csp.structure.adapter.name": "Rib Interstage Adapter",
+        "part.csp.decoupler.s125.name": "Shear Stack Decoupler",
+        "part.csp.nosecone.s125.name": "Dart Nose Cone",
+        "part.csp.battery.z1k.name": "Cellblock 1kU Battery",
+        "part.csp.science.canister.name": "Specimen Materials Canister",
+        "part.variant.stock": "Stock",
+        "part.variant.qualified": "Qualified",
+        "resource.ore": "Ore",
+        "resource.metal": "Metal",
+        "resource.composite": "Composite",
+        "resource.liquid_fuel": "Liquid Fuel",
+        "resource.oxidizer": "Oxidizer",
+        "resource.monoprop": "Monopropellant",
+        "resource.electric_charge": "Electric Charge",
+        "resource.water": "Water",
+        "resource.food": "Food",
+        "resource.oxygen": "Oxygen",
     },
 )

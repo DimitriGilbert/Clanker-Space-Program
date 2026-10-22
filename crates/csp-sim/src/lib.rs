@@ -3702,7 +3702,7 @@ mod tests {
         );
         CraftDef {
             graph,
-            parts: vec![csp_phys::EffectivePart {
+            parts: vec![csp_phys::WeldPart {
                 mass_kg,
                 com: DVec3::ZERO,
                 inertia: csp_phys::SymMat3::solid_box(mass_kg, half),

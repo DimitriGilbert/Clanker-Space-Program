@@ -1,0 +1,86 @@
+// csp.engine.sparc — "Sparc" 200 kN launch engine (PLAN §3.1 PartDef).
+// Hand-authored fiction — numbers frozen at M3.
+//
+// The M2 flight fixture's engine, turned into a def: 200 kN vac on a
+// ~5 t stack gives Terrin-surface TWR ~4, matching the proven flight
+// numbers. Burns the standard 45:55 liquid_fuel/oxidizer mass mix.
+// Isp 280 s sl / 320 s vac — sane for a first-stage engine at this
+// scale; the Δv coherence test (csp-data/tests/parts.rs) pins the
+// numbers against the s320 tank.
+//
+// Variants are the §3.3 cost/quality track: "qualified" pays 20% more
+// for a longer rated burn and a better MTBF.
+(
+    schema_version: 1,
+    id: "csp.engine.sparc",
+    family: "csp.family.engine.launch",
+    display_name: "part.csp.engine.sparc.name",
+    category: Engine,
+    mass_dry_kg: 900.0,
+    cost_funds: 1500.0,
+    size_m: (x: 1.25, y: 1.25, z: 1.8),
+    build_resources: [("metal", 70.0), ("composite", 10.0)],
+    attach_nodes: [
+        (id: "top", position_m: (x: 0.0, y: 0.0, z: 0.9), direction: (x: 0.0, y: 0.0, z: 1.0), diameter_m: 1.25),
+    ],
+    scale: None,
+    collider: Cylinder(radius_m: 0.625, half_height_m: 0.9),
+    aero: (
+        cd_curve: [(mach: 0.0, coeff: 0.5), (mach: 8.0, coeff: 0.3)],
+        cl_curve: [(mach: 0.0, coeff: 0.0)],
+        ref_len_m: 1.8,
+    ),
+    thermal: (
+        heat_capacity_j_per_k: 450_000.0,
+        max_temp_k: 1600.0,
+        emissivity: 0.8,
+        conduction_w_per_k: 60.0,
+    ),
+    structural: (
+        max_axial_n: 600_000.0,
+        max_shear_n: 150_000.0,
+        max_torque_nm: 25_000.0,
+    ),
+    variants: [
+        (id: "stock",     display_name: "part.variant.stock",     cost_multiplier: 1.0, stat_multipliers: []),
+        (id: "qualified", display_name: "part.variant.qualified", cost_multiplier: 1.2,
+            stat_multipliers: [(BaseMtbfS, 1.3), (RatedBurnS, 1.5)]),
+    ],
+    modules: [
+        Engine(
+            thrust_vac_n: 200_000.0,
+            isp_vac_s: 320.0,
+            isp_sl_s: 280.0,
+            throttle_range: (min: 0.3, max: 1.0),
+            gimbal_deg: 3.0,
+            ignitions: Some(6),
+            rated_burn_s: 240.0,
+            propellants: [("liquid_fuel", 0.45), ("oxidizer", 0.55)],
+            ullage_required: false,
+        ),
+    ],
+    reliability: (
+        base_mtbf_s: 400_000.0,
+        infant_mortality: 0.2,
+        qualification_curve: (knots: [
+            (qualification_units: 0.0,   hazard_multiplier: 1.0),
+            (qualification_units: 25.0,  hazard_multiplier: 0.7),
+            (qualification_units: 100.0, hazard_multiplier: 0.45),
+            (qualification_units: 400.0, hazard_multiplier: 0.3),
+        ]),
+        regime_stress: [
+            (kind: OverThrottle,      threshold: 1.0,  multiplier: 3.0),
+            (kind: BurnBeyondRated,   threshold: 0.0,  multiplier: 2.0),
+            (kind: Overtemperature,   threshold: 0.9,  multiplier: 4.0),
+            (kind: ExcessG,           threshold: 12.0, multiplier: 2.0),
+            (kind: ExcessRestarts,    threshold: 0.0,  multiplier: 3.0),
+        ],
+        dormant_stress: 0.02,
+        failure_modes: [
+            (DegradedThrust,   0.5),
+            (StuckGimbal,      0.2),
+            (IgnitionFailure,  0.3),
+        ],
+    ),
+    tech_requirement: "tech.start",
+)

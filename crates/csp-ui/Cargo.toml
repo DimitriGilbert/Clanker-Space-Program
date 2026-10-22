@@ -8,6 +8,16 @@ license = "MIT OR Apache-2.0"
 # (PLAN §2.1). csp-view registers the UiBuild system that calls in here.
 [dependencies]
 egui = { workspace = true }
+# §2.1: csp-ui owns the VAB *session instance* — the working craft is a
+# `csp_phys::CraftSession` value held here (the type stays in csp-phys,
+# per its module doc); csp-data supplies the part catalog + resource
+# table the session ops and the Δv readout resolve against.
+csp-phys = { workspace = true }
+csp-data = { workspace = true }
+
+[dev-dependencies]
+# test fixtures build literal part defs — DVec3 is csp-core's type.
+csp-core = { workspace = true }
 
 [lints]
 workspace = true

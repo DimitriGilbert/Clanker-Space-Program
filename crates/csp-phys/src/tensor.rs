@@ -24,7 +24,7 @@ pub enum Axis {
 /// `[[xx, xy, xz], [xy, yy, yz], [xz, yz, zz]]`.
 ///
 /// An inertia tensor is always expressed *about a stated point* — for
-/// [`crate::EffectivePart::inertia`] the part's own CoM in part-local
+/// [`crate::WeldPart::inertia`] the part's own CoM in part-local
 /// frame; for [`crate::WeldedBody::inertia_local`] the vessel CoM in
 /// body frame.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

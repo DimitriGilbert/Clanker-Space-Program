@@ -76,3 +76,41 @@ id_newtype! {
     /// every user-facing data string goes through a `LocKey`).
     LocKey
 }
+id_newtype! {
+    /// Identifier of a part definition (`data/parts/<id>.ron`). Stable
+    /// across the life of the project — §3.1: "Part IDs are stable
+    /// strings (`csp.engine.lv30`), never indices — saves depend on it."
+    /// A `BuiltPart` in a §7.2 save names one of these.
+    PartId
+}
+id_newtype! {
+    /// Identifier of a part *family* — the grouping §3.3's
+    /// `UpgradeTrack { family, stat_path, … }` and §3.4's
+    /// `FamilyQualification` key on. Parts in a family share upgrade
+    /// tracks and qualification state, so a family ID changes only when
+    /// the design intent is "this is a different lineage".
+    FamilyId
+}
+id_newtype! {
+    /// Identifier of one of a part's authored variants
+    /// (`PartDef::variants`, §3.3 "scaling + variants"). A `BuiltPart`'s
+    /// `variant` field names one of these; the resolver applies its
+    /// authored stat multipliers at manufacture.
+    VariantId
+}
+id_newtype! {
+    /// Identifier of a tech-tree node (§3.3, `data/techtree/*.ron`).
+    /// Part defs *reference* these (`PartDef::tech_requirement`); the
+    /// tree loader that resolves them lands with the tech tree itself.
+    TechNodeId
+}
+id_newtype! {
+    /// Identifier of a science experiment kind (§3.2 `Experiment`
+    /// modules key data records on it).
+    ExperimentId
+}
+id_newtype! {
+    /// Identifier of a converter recipe (§3.5.1 `Converter` modules
+    /// name one). Recipe defs land with the colony data set.
+    RecipeId
+}

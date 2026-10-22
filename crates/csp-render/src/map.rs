@@ -48,6 +48,8 @@ pub struct MapPacket {
     pub markers: MapMesh,
 }
 
+use crate::GpuBuffer;
+
 /// Owns the map pipeline and the two per-frame vertex buffers.
 ///
 /// Constructed once at GPU init; [`Self::draw`] uploads the packet's
@@ -57,40 +59,6 @@ pub struct MapRenderer {
     pipeline: wgpu::RenderPipeline,
     lines: GpuBuffer,
     markers: GpuBuffer,
-}
-
-/// A grow-only vertex buffer + the count of vertices currently in it.
-struct GpuBuffer {
-    buffer: wgpu::Buffer,
-    capacity: u64,
-}
-
-impl GpuBuffer {
-    fn new(device: &wgpu::Device, label: &'static str, capacity: u64) -> Self {
-        Self {
-            buffer: device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size: capacity,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }),
-            capacity,
-        }
-    }
-
-    /// Upload `mesh`'s vertices, growing the buffer when needed. Returns
-    /// the vertex count to draw (0 ⇒ skip the draw call).
-    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mesh: &MapMesh) -> u32 {
-        let bytes = bytemuck::cast_slice(&mesh.vertices);
-        let needed = bytes.len() as u64;
-        if needed > self.capacity {
-            // Grow with headroom — resampling per frame would reallocate
-            // every frame at the exact-size policy.
-            *self = Self::new(device, "map-vtx", needed.next_power_of_two());
-        }
-        queue.write_buffer(&self.buffer, 0, bytes);
-        mesh.vertices.len() as u32
-    }
 }
 
 impl MapRenderer {
@@ -146,8 +114,8 @@ impl MapRenderer {
         queue: &wgpu::Queue,
         packet: &MapPacket,
     ) {
-        let n_lines = self.lines.upload(device, queue, &packet.lines);
-        let n_markers = self.markers.upload(device, queue, &packet.markers);
+        let n_lines = self.lines.upload(device, queue, &packet.lines.vertices);
+        let n_markers = self.markers.upload(device, queue, &packet.markers.vertices);
         pass.set_pipeline(&self.pipeline);
         if n_lines > 0 {
             pass.set_vertex_buffer(0, self.lines.buffer.slice(..));

@@ -22,12 +22,33 @@ use csp_sim::World as SimWorld;
 /// read through `View::end_frame` staging, never by systems (§2.5).
 pub mod map;
 
+/// The M3 VAB (editor mode): working-craft session hosting, the craft
+/// view's scene/camera/packet, and the GPU-pick event plumbing.
+pub mod vab;
+
+/// The app's view mode — flight, map, or the VAB editor. Session
+/// state (§2.2-C): never sim state, never logged, never hashed.
+/// `csp-app` routes input and `csp-view` derives it from the two
+/// subsystem flags ([`vab::VabInput::open`] wins over the map's mode).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ViewMode {
+    /// The flight view.
+    #[default]
+    Flight,
+    /// The system map (`map::MapInput.mode == Map`).
+    Map,
+    /// The VAB editor (`vab::VabInput.open`).
+    Vab,
+}
+
 /// `SimCommand` vocabulary, re-exported so `csp-app` can produce commands
 /// without depending on `csp-sim` directly — §2.1's rule that `csp-view` is
 /// the only crate depending on BOTH `csp-sim` and `csp-render` stays true.
 /// `AdvanceReport`/`EventClass` ride along because `csp-app` reads the
 /// fired-event classes for §2.6.5 Clamping demotion.
 pub use csp_sim::{AdvanceReport, EventClass, SimCommand, SourceClass};
+// Re-exported so `csp-app` names mode requests without a csp-ui edge.
+pub use csp_ui::ModeSelect;
 
 /// Integer sim clock mirrored for presentation — a COPY, written each frame
 /// by the `sync` schedule's [`sync_mirrors`] system (PLAN §2.2, Appendix A
@@ -115,10 +136,16 @@ impl Drop for EguiPass {
 /// Requests the UI emitted during `UiBuild` — drained by `csp-app` at the
 /// *next* frame's Input phase, the §2.5 "UI-issued commands take effect on
 /// the next tick — one-tick latency, accepted" hand-off.
-#[derive(Resource, Clone, Copy, Debug, Default)]
+#[derive(Resource, Clone, Debug, Default)]
 pub struct UiOutbox {
     /// Net warp-ladder steps the panel requested this pass.
     pub warp_step: i32,
+    /// A top-bar mode request.
+    pub mode: Option<csp_ui::ModeSelect>,
+    /// Save the working craft under this name — `(name, bytes)`.
+    pub craft_save: Option<(String, Vec<u8>)>,
+    /// Load the named craft file.
+    pub craft_load: Option<String>,
 }
 
 /// Post-step values staged for the `sync` schedule — written by
@@ -152,6 +179,7 @@ fn sync_mirrors(
 /// `egui::Context::run_ui`, store the `FullOutput` for `csp-app`'s painter,
 /// and record UI-emitted requests for next frame's Input. Never reads the
 /// sim — every value is a mirror or session value.
+#[allow(clippy::too_many_arguments)]
 fn build_ui(
     mut egui: ResMut<EguiPass>,
     clock: Res<Clock>,
@@ -159,8 +187,18 @@ fn build_ui(
     warp: Res<WarpMirror>,
     session: Res<SessionMirror>,
     map_ui: Res<map::MapUiData>,
+    vab_input: Res<vab::VabInput>,
+    mut vab: ResMut<vab::VabSessionRes>,
+    craft_files: Res<vab::CraftFileList>,
     mut outbox: ResMut<UiOutbox>,
 ) {
+    let mode = if vab_input.open {
+        csp_ui::ModeSelect::Vab
+    } else if map_ui.mode == map::MapMode::Map {
+        csp_ui::ModeSelect::Map
+    } else {
+        csp_ui::ModeSelect::Flight
+    };
     let input = csp_ui::DebugPanelInput {
         adapter_name: &session.adapter,
         backend: &session.backend,
@@ -175,6 +213,7 @@ fn build_ui(
         fatal_reason: session.fatal.map(|e| e.reason()),
     };
     let mut panel_output = csp_ui::DebugPanelOutput::default();
+    let mut vab_out = csp_ui::vab::VabUiOutput::default();
     let ctx = egui.ctx.clone(); // Arc-interned clone — frees the ResMut borrow.
     let raw = egui.input.clone();
     // Overwriting a previous, unconsumed frame would drop its
@@ -182,8 +221,12 @@ fn build_ui(
     if let Some(prev) = &mut egui.output {
         prev.textures_delta.clear();
     }
+    let files = craft_files.0.clone(); // Vec<String> — cheap, frees the Res borrow
     egui.output = Some(ctx.run_ui(raw, |ctx| {
-        csp_ui::debug_panel(ctx, &input, &mut panel_output);
+        csp_ui::vab::top_bar(ctx, mode, &mut vab_out);
+        if mode != csp_ui::ModeSelect::Vab {
+            csp_ui::debug_panel(ctx, &input, &mut panel_output);
+        }
         if map_ui.mode == map::MapMode::Map {
             csp_ui::map_overlay(
                 ctx,
@@ -192,8 +235,22 @@ fn build_ui(
                 &map_ui.labels,
             );
         }
+        if mode == csp_ui::ModeSelect::Vab {
+            csp_ui::vab::vab_editor(ctx, &mut vab.0, &files, &mut vab_out);
+        }
     }));
     outbox.warp_step = panel_output.warp_step;
+    outbox.mode = vab_out.mode;
+    // Save carries the serialized bytes — the app owns the file store.
+    // The `if let` keeps `to_bytes` (a bincode pass over the session)
+    // behind the actual save request — `Option::zip` would serialize on
+    // every VAB frame.
+    outbox.craft_save = if let Some(name) = vab_out.save_name {
+        vab.0.to_bytes().ok().map(|bytes| (name, bytes))
+    } else {
+        None
+    };
+    outbox.craft_load = vab_out.load_name;
 }
 
 /// The six schedules from PLAN §2.5, run explicitly by `csp-app`.
@@ -283,10 +340,17 @@ impl View {
         let orbits =
             csp_sim::orbit::PatchedConics::from_body_defs(&defs).map_err(ViewError::Sim)?;
         let balance = csp_data::load_balance(&root.join("balance.ron"))?;
-        Ok(Self::with_sim(SimWorld::with_config(
+        let mut view = Self::with_sim(SimWorld::with_config(
             orbits,
             balance.advance_to_max_events_per_frame,
-        )))
+        ));
+        // M3 VAB: the part catalog + resource registry are data-derived
+        // constants for the session model (like BodyTable — §7.3's
+        // re-derived-on-load class).
+        let parts = csp_data::load_parts(&root.join("parts"))?;
+        let resources = csp_data::load_resources(&root.join("resources.ron"))?;
+        view.install_vab_catalog(parts, resources);
+        Ok(view)
     }
 
     /// wasm: no `data/` filesystem exists at this milestone — the wasm
@@ -326,9 +390,19 @@ impl View {
         world.insert_resource(map::MapUiData::default());
         world.insert_resource(map::MapFrame::default());
 
+        // M3 VAB resources (see vab.rs): the working-craft session +
+        // camera/pick state + the craft-file name list.
+        world.insert_resource(vab::VabSessionRes::default());
+        world.insert_resource(vab::VabInputEvents::default());
+        world.insert_resource(vab::VabInput::default());
+        world.insert_resource(vab::VabScene::default());
+        world.insert_resource(vab::VabCameraF64::default());
+        world.insert_resource(vab::VabFrame::default());
+        world.insert_resource(vab::CraftFileList::default());
+
         // §2.5: "SimStep and Sync use the single-threaded executor always."
         let mut input = Schedule::default();
-        input.add_systems(map::apply_map_input);
+        input.add_systems((map::apply_map_input, vab::apply_vab_input));
         let mut sim_step = Schedule::default();
         sim_step.set_executor(SingleThreadedExecutor::new());
         let mut sync = Schedule::default();
@@ -336,9 +410,9 @@ impl View {
         sync.add_systems((sync_mirrors, map::sync_map));
 
         let mut presentation = Schedule::default();
-        presentation.add_systems(map::map_present);
+        presentation.add_systems((map::map_present, vab::vab_present));
         let mut render_extract = Schedule::default();
-        render_extract.add_systems(map::extract_map);
+        render_extract.add_systems((map::extract_map, vab::extract_vab));
 
         let mut ui_build = Schedule::default();
         ui_build.add_systems(build_ui);
@@ -517,6 +591,101 @@ impl View {
     pub fn take_map_packet(&mut self) -> Option<csp_render::map::MapPacket> {
         self.world.resource_mut::<map::MapFrame>().0.take()
     }
+
+    /// The effective view mode — `Vab` while the editor is open, else
+    /// the map's Flight/Map. Session state (§2.2-C).
+    pub fn mode(&self) -> ViewMode {
+        if self.world.resource::<vab::VabInput>().open {
+            ViewMode::Vab
+        } else if self.world.resource::<map::MapInput>().mode == map::MapMode::Map {
+            ViewMode::Map
+        } else {
+            ViewMode::Flight
+        }
+    }
+
+    /// Switch the view mode — the choreography lives here: entering
+    /// the VAB closes the map display (its overlay would draw under
+    /// the editor), and re-entering Map refocuses. Direct resource
+    /// writes — same plumbing-mutate precedent as `set_map_viewport`.
+    pub fn set_mode(&mut self, mode: ViewMode) {
+        {
+            let mut v = self.world.resource_mut::<vab::VabInput>();
+            v.open = mode == ViewMode::Vab;
+        }
+        let focus = self.world.resource::<map::MapInput>().focus;
+        let want_map = mode == ViewMode::Map;
+        let refocus_dist = self
+            .world
+            .resource::<map::BodyTable>()
+            .bodies
+            .get(focus)
+            .and_then(|b| b.soi_m)
+            .map(|soi| (5.0 * soi).clamp(1.0e5, 2.0e11))
+            .unwrap_or(6.0e10);
+        let mut m = self.world.resource_mut::<map::MapInput>();
+        if want_map != (m.mode == map::MapMode::Map) {
+            m.mode = if want_map {
+                map::MapMode::Map
+            } else {
+                map::MapMode::Flight
+            };
+            if want_map {
+                // Re-derive framing like CycleFocus's refocus.
+                m.pan_offset = csp_core::DVec3::ZERO;
+                m.distance_m = refocus_dist;
+            }
+        }
+    }
+
+    /// Queue a VAB event (camera/mouse translated by `csp-app`, plus
+    /// pick readbacks and craft-file loads) — drained by the `Input`
+    /// schedule's `apply_vab_input` next frame.
+    pub fn vab_event(&mut self, event: vab::VabEvent) {
+        self.world
+            .resource_mut::<vab::VabInputEvents>()
+            .pending
+            .push(event);
+    }
+
+    /// Per-frame viewport plumbing for the VAB camera/projection —
+    /// physical pixels.
+    pub fn set_vab_viewport(&mut self, width_px: f64, height_px: f64) {
+        self.world.resource_mut::<vab::VabInput>().viewport_px = (width_px, height_px);
+    }
+
+    /// Take this frame's VAB render packet — `None` outside the VAB.
+    /// Consumed once by the painter, like [`Self::take_ui_frame`].
+    pub fn take_vab_packet(&mut self) -> Option<csp_render::vab::VabPacket> {
+        self.world.resource_mut::<vab::VabFrame>().0.take()
+    }
+
+    /// Run a closure against the working-craft session — the plumbing
+    /// accessor for tests/tools (app code reaches the session only via
+    /// `vab_event` and the UiBuild pass, §2.5).
+    pub fn with_vab_session<R>(&mut self, f: impl FnOnce(&mut csp_ui::vab::VabSession) -> R) -> R {
+        f(&mut self.world.resource_mut::<vab::VabSessionRes>().0)
+    }
+
+    /// Install the part catalog + resource registry (called by
+    /// `View::new` after `data/` loads; an unset catalog leaves the
+    /// VAB honest-but-empty — the wasm slice at M3).
+    pub fn install_vab_catalog(
+        &mut self,
+        parts: csp_data::LoadedParts,
+        resources: csp_data::ResourceFile,
+    ) {
+        self.world
+            .resource_mut::<vab::VabSessionRes>()
+            .0
+            .set_catalog(parts, resources);
+    }
+
+    /// The craft-file name list the save/load UI shows — plumbed by
+    /// `csp-app` (its file store owns the bytes).
+    pub fn set_craft_files(&mut self, files: Vec<String>) {
+        self.world.resource_mut::<vab::CraftFileList>().0 = files;
+    }
 }
 
 /// The data/ directory root: `./data` when it exists (the app runs from
@@ -591,7 +760,10 @@ mod tests {
     #[test]
     fn ui_outbox_drains_for_next_frames_input() {
         let mut view = View::default();
-        *view.world.resource_mut::<UiOutbox>() = UiOutbox { warp_step: 1 };
+        *view.world.resource_mut::<UiOutbox>() = UiOutbox {
+            warp_step: 1,
+            ..UiOutbox::default()
+        };
         let drained = view.take_ui_outbox();
         assert_eq!(drained.warp_step, 1);
         assert_eq!(view.take_ui_outbox().warp_step, 0); // consumed once

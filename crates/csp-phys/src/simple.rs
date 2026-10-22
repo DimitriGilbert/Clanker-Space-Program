@@ -975,7 +975,7 @@ fn cross_section_area(b: &WeldedBody, w: DVec3) -> f64 {
 mod tests {
     use super::*;
     use crate::graph::{PartGraph, PartNode, PartNodeId, PartTransform};
-    use crate::part::{ColliderShape, EffectivePart, ForceSite};
+    use crate::part::{ColliderShape, ForceSite, WeldPart};
     use crate::weld::weld;
     use csp_data::TemperatureKnot;
 
@@ -1006,7 +1006,7 @@ mod tests {
             PartNodeId(1),
             PartNode::new(None, PartTransform::IDENTITY, 0),
         );
-        let parts = [EffectivePart {
+        let parts = [WeldPart {
             mass_kg,
             com: DVec3::ZERO,
             inertia: SymMat3::solid_box(mass_kg, half),
@@ -1130,7 +1130,7 @@ mod tests {
             PartNode::new(None, PartTransform::IDENTITY, 0),
         );
         let half = DVec3::new(0.5, 0.5, 0.5);
-        let parts = [EffectivePart {
+        let parts = [WeldPart {
             mass_kg: 10.0,
             com: DVec3::ZERO,
             inertia: SymMat3::solid_box(10.0, half),
@@ -1339,7 +1339,7 @@ mod tests {
                 1,
             ),
         );
-        let mk = |m| EffectivePart {
+        let mk = |m| WeldPart {
             mass_kg: m,
             com: DVec3::ZERO,
             inertia: SymMat3::solid_box(m, DVec3::new(0.5, 0.5, 0.5)),
@@ -1495,7 +1495,7 @@ mod tests {
                 1,
             ),
         );
-        let mk = |m| EffectivePart {
+        let mk = |m| WeldPart {
             mass_kg: m,
             com: DVec3::ZERO,
             inertia: SymMat3::solid_box(m, DVec3::new(0.5, 0.5, 0.5)),
@@ -1652,7 +1652,7 @@ mod tests {
             PartNodeId(1),
             PartNode::new(None, PartTransform::IDENTITY, 0),
         );
-        let parts = [EffectivePart {
+        let parts = [WeldPart {
             mass_kg: m,
             com: DVec3::ZERO,
             inertia: SymMat3::solid_box(m, half),

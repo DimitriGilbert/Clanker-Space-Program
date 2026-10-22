@@ -1,11 +1,14 @@
 //! Per-part resolved data — the second `weld` argument of §2.4's
-//! `csp_phys::weld(part_graph, &[EffectivePart])`.
+//! `csp_phys::weld(part_graph, &[WeldPart])`.
 //!
-//! [`EffectivePart`] here is exactly the *weld-consumed view* of §3.1's
+//! [`WeldPart`] is exactly the *weld-consumed view* of §3.1's
 //! `EffectivePart = resolve(BuiltPart) ∘ wear(PartUsage)`: the numbers
-//! Stage 1 needs, already resolved. Building the resolver itself is M3
-//! (editor + effective-stat pipeline) — nothing below derives stats
-//! from `PartDef`s, upgrades, or wear.
+//! Stage 1 needs, already resolved. The name was split when the §3.1
+//! resolver landed — `crate::resolve::EffectivePart` is the resolved
+//! craft part; `WeldPart` is its `weld_input` field, the projection
+//! the weld consumes (see `resolve.rs`'s naming-reconciliation note).
+//! Nothing below derives stats from `PartDef`s, upgrades, or wear —
+//! that is the resolver's job.
 
 use serde::{Deserialize, Serialize};
 
@@ -50,7 +53,7 @@ impl StableDiscriminant for ForceSiteKind {
 /// site record.
 ///
 /// Frame convention is contextual and documented at each use:
-/// part-local inside [`EffectivePart`], body-frame inside
+/// part-local inside [`WeldPart`], body-frame inside
 /// [`crate::WeldedBody`]. `local_dir` is a unit direction supplied by
 /// the resolver — the weld rotates but never renormalizes it (a unit
 /// quaternion acting on a unit vector stays unit to f64 rounding, and
@@ -141,13 +144,17 @@ impl ColliderShape {
 /// `mass_kg` is the part's *current* total mass: dry mass plus
 /// quantized resource contents. When a tank's 1/1024-of-capacity
 /// quantum flips (§2.4 inertia-cache rule), the caller rebuilds the
-/// affected `EffectivePart`s and re-welds — the cache is a pure
+/// affected `WeldPart`s and re-welds — the cache is a pure
 /// function of currently-serialized state.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct EffectivePart {
+pub struct WeldPart {
     /// Total part mass, kg. Finite and `≥ 0`; a zero-mass part is legal
-    /// (massless structural/marker geometry) but the vessel total must
-    /// be `> 0`.
+    /// *as weld input* (massless structural/marker geometry) but the
+    /// vessel total must be `> 0`. Note the §3.1 resolver is stricter
+    /// — it refuses to *resolve* a def to zero mass
+    /// (`ResolveError::InvalidStat`): a part whose resolved stats are
+    /// massless is bad authored data, while a hand-authored `WeldPart`
+    /// at zero stays legal weld input.
     pub mass_kg: f64,
     /// Centre of mass in part-local frame.
     pub com: DVec3,

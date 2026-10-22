@@ -98,8 +98,8 @@ fn drive_trivial(w: &mut World) -> Result<(), SimError> {
 use csp_core::{DQuat, DVec3};
 use csp_data::BodyId;
 use csp_phys::{
-    ColliderShape, EffectivePart, Environment, ForceSite, ForceSiteKind, PartGraph, PartNode,
-    PartNodeId, PartTransform, SymMat3,
+    ColliderShape, Environment, ForceSite, ForceSiteKind, PartGraph, PartNode, PartNodeId,
+    PartTransform, SymMat3, WeldPart,
 };
 use csp_sim::orbit::PatchedConics;
 use csp_sim::{PhysicsConfig, VesselId, VesselState};
@@ -151,7 +151,7 @@ fn flight_craft() -> csp_sim::CraftDef {
         PartNodeId(0),
         PartNode::new(None, PartTransform::IDENTITY, 0),
     );
-    let booster = EffectivePart {
+    let booster = WeldPart {
         mass_kg: 5_000.0,
         com: DVec3::ZERO,
         inertia: SymMat3::solid_box(5_000.0, DVec3::new(0.75, 0.75, 3.0)),
@@ -541,7 +541,7 @@ mod tests {
                     i,
                 ),
             );
-            parts.push(EffectivePart {
+            parts.push(WeldPart {
                 mass_kg: 100.0,
                 com: DVec3::ZERO,
                 inertia: SymMat3::solid_box(100.0, DVec3::new(0.5, 0.5, 0.125)),

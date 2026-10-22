@@ -23,10 +23,14 @@ mod warp;
 use std::sync::Arc;
 
 use csp_core::SimError;
+use std::collections::BTreeMap;
+
 use csp_render::Gpu;
 use csp_render::map::MapRenderer;
-use csp_view::map::{MapKeyEvent, MapMode};
-use csp_view::{EventClass, SimCommand, SourceClass, View};
+use csp_render::vab::VabRenderer;
+use csp_view::map::MapKeyEvent;
+use csp_view::vab::VabEvent;
+use csp_view::{EventClass, ModeSelect, SimCommand, SourceClass, View, ViewMode};
 use warp::WarpController;
 use web_time::Instant;
 use winit::{
@@ -58,6 +62,10 @@ const ZOOM_LN_PER_PX: f64 = 0.003;
 /// Screen px of pan per WASD/arrow key event (winit auto-repeat keeps it
 /// moving while held).
 const PAN_STEP_PX: f64 = 80.0;
+/// Max cursor travel (px) between LMB down/up that still counts as a
+/// click — anything further is a camera orbit drag and must not also
+/// fire a VAB pick.
+const CLICK_MAX_DRAG_PX: f64 = 4.0;
 
 struct App {
     window: Option<Arc<Window>>,
@@ -67,10 +75,38 @@ struct App {
     /// The map pass's renderer — pipelines + grow-only vertex buffers
     /// (csp_render::map). `None` until GPU init.
     map_renderer: Option<MapRenderer>,
+    /// The VAB pass's renderer — craft boxes + the offscreen object-id
+    /// pick target (csp_render::vab). `None` until GPU init.
+    vab_renderer: Option<VabRenderer>,
+    /// Last frame's VAB packet — kept so a click can re-rasterize the
+    /// same geometry into the pick target.
+    last_vab_packet: Option<csp_render::vab::VabPacket>,
+    /// A click awaiting pick-pass encode — physical px.
+    pending_pick: Option<(u32, u32)>,
+    /// Pick readback channel + in-flight flag (one pick at a time —
+    /// the texture's single pixel is a serial resource).
+    pick_tx: std::sync::mpsc::Sender<u32>,
+    pick_rx: std::sync::mpsc::Receiver<u32>,
+    pick_in_flight: bool,
+    /// The `pick_ids` table snapshotted when the in-flight pick was
+    /// rasterized — decode must use THIS, not `last_vab_packet`: the
+    /// packet may be replaced between the encode submission and the
+    /// map_async landing, and a stale table would silently mis-decode
+    /// (selecting the wrong part).
+    pick_decode_ids: Option<Vec<u64>>,
+    /// Craft-file store: name → `CSPCRAFT` bytes. Memory-first so the
+    /// wasm build keeps a working save/load; on native the store is
+    /// mirrored to `crafts/*.cspcraft` files.
+    craft_store: BTreeMap<String, Vec<u8>>,
     /// Left-drag state for map camera orbit — pointer position at the
     /// last `CursorMoved`, and whether the left button is held.
     last_cursor: Option<(f64, f64)>,
     map_dragging: bool,
+    /// Cursor position at the last unconsumed LMB press — a candidate
+    /// VAB click. A release within `CLICK_MAX_DRAG_PX` of it becomes a
+    /// pick request; a release past it was an orbit drag and does not
+    /// select.
+    lmb_press: Option<(f64, f64)>,
     view: View,
     /// §2.6.3's controller — owns the warp ladder and the integer tick
     /// target; all wall-side, emitting only logged commands.
@@ -95,14 +131,24 @@ impl App {
     // `expect` site per the workspace lint doc.
     #[allow(clippy::expect_used)]
     fn new() -> Self {
+        let (pick_tx, pick_rx) = std::sync::mpsc::channel();
         Self {
             window: None,
             gpu: None,
             egui_state: None,
             egui_renderer: None,
             map_renderer: None,
+            vab_renderer: None,
+            last_vab_packet: None,
+            pending_pick: None,
+            pick_tx,
+            pick_rx,
+            pick_in_flight: false,
+            pick_decode_ids: None,
+            craft_store: load_craft_store(),
             last_cursor: None,
             map_dragging: false,
+            lmb_press: None,
             view: View::new().expect("data/ startup load failed"),
             warp: WarpController::new(),
             last_frame: Instant::now(),
@@ -153,6 +199,11 @@ impl App {
             egui_wgpu::RendererOptions::default(),
         );
         let map_renderer = MapRenderer::new(&gpu.device, gpu.surface_format());
+        let vab_renderer = VabRenderer::new(
+            &gpu.device,
+            gpu.surface_format(),
+            (gpu.config.width, gpu.config.height),
+        );
         let info = gpu.adapter.get_info();
         self.view
             .set_gpu_info(info.name.clone(), format!("{:?}", info.backend));
@@ -162,6 +213,9 @@ impl App {
         self.egui_state = Some(egui_state);
         self.egui_renderer = Some(egui_renderer);
         self.map_renderer = Some(map_renderer);
+        self.vab_renderer = Some(vab_renderer);
+        self.view
+            .set_craft_files(self.craft_store.keys().cloned().collect());
     }
 
     /// The §2.5 frame loop — see the module doc for the shape. Runs on every
@@ -189,12 +243,48 @@ impl App {
     /// The schedule half of the frame (§2.5): controller → commands →
     /// Input → SimStep → Sync → Presentation → UiBuild → RenderExtract.
     /// Ends with a complete `egui::FullOutput` staged for [`Self::paint`].
+    #[allow(clippy::too_many_lines)]
     fn run_frame(&mut self, window: &Window, dt_wall: f64) {
         // UiBuild → next frame's Input (§2.5's accepted one-frame latency):
         // fold last frame's panel requests into the controller.
         let outbox = self.view.take_ui_outbox();
         if outbox.warp_step != 0 {
             self.warp.request_step(outbox.warp_step);
+        }
+        if let Some(mode) = outbox.mode {
+            self.view.set_mode(match mode {
+                ModeSelect::Flight => ViewMode::Flight,
+                ModeSelect::Map => ViewMode::Map,
+                ModeSelect::Vab => ViewMode::Vab,
+            });
+        }
+        if let Some((name, bytes)) = outbox.craft_save {
+            self.craft_store.insert(name.clone(), bytes.clone());
+            save_craft_file(&name, &bytes);
+            self.view
+                .set_craft_files(self.craft_store.keys().cloned().collect());
+            self.view
+                .vab_event(VabEvent::Notice(format!("saved {name}")));
+        }
+        if let Some(name) = outbox.craft_load {
+            match self.craft_store.get(&name) {
+                Some(b) => self.view.vab_event(VabEvent::LoadCraft(b.clone())),
+                None => self
+                    .view
+                    .vab_event(VabEvent::Notice(format!("no craft file '{name}'"))),
+            }
+        }
+        // GPU pick readback: a completed map_async delivers the object
+        // id — decode through the id table snapshotted at encode time
+        // (`last_vab_packet` may have been replaced between rasterize
+        // and this landing) and route the selection through the Input
+        // schedule.
+        while let Ok(pid) = self.pick_rx.try_recv() {
+            self.pick_in_flight = false;
+            let node = pid
+                .checked_sub(1)
+                .and_then(|i| self.pick_decode_ids.as_ref()?.get(i as usize).copied());
+            self.view.vab_event(VabEvent::Pick(node));
         }
 
         // §2.6.3: observe wall cost → decide → log the level + target as
@@ -242,6 +332,8 @@ impl App {
         if let Some(gpu) = &self.gpu {
             self.view
                 .set_map_viewport(f64::from(gpu.config.width), f64::from(gpu.config.height));
+            self.view
+                .set_vab_viewport(f64::from(gpu.config.width), f64::from(gpu.config.height));
         }
 
         // §2.5 order: Input → SimStep → Sync → Presentation → UiBuild →
@@ -324,6 +416,7 @@ impl App {
     /// The paint half of the frame: consume the `UiBuild`-produced
     /// `egui::FullOutput` (platform output, tessellation, textures delta)
     /// and draw it — no egui pass logic here (§2.5).
+    #[allow(clippy::too_many_lines)]
     fn paint(&mut self, window: &Window) {
         let Some(mut full_output) = self.view.take_ui_frame() else {
             return;
@@ -369,6 +462,10 @@ impl App {
         // The RenderExtract product: the map pass's vertex data for this
         // frame (None in flight mode).
         let map_packet = self.view.take_map_packet();
+        match self.view.take_vab_packet() {
+            Some(p) => self.last_vab_packet = Some(p),
+            None => self.last_vab_packet = None,
+        }
 
         let mut frame = match gpu.begin_frame() {
             csp_render::FrameResult::Ok(f) => f,
@@ -412,7 +509,19 @@ impl App {
                         },
                         depth_slice: None,
                     })],
-                    depth_stencil_attachment: None,
+                    // The VAB renderer owns the depth target (reverse-Z:
+                    // clear 0.0 = far, `Greater` wins). Map/egui
+                    // pipelines carry no depth state and ignore it.
+                    depth_stencil_attachment: self.vab_renderer.as_ref().map(|v| {
+                        wgpu::RenderPassDepthStencilAttachment {
+                            view: v.depth_view(),
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(0.0),
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: None,
+                        }
+                    }),
                     timestamp_writes: None,
                     occlusion_query_set: None,
                     multiview_mask: None,
@@ -422,11 +531,52 @@ impl App {
             if let Some(packet) = &map_packet {
                 map_renderer.draw(&mut pass, &gpu.device, &gpu.queue, packet);
             }
+            if let (Some(v), Some(packet)) = (&mut self.vab_renderer, &self.last_vab_packet) {
+                v.draw(&mut pass, &gpu.device, &gpu.queue, packet);
+            }
             egui_renderer.render(&mut pass.forget_lifetime(), &tris, &screen);
             drop(cmds); // user command buffers currently unused
         }
 
+        // A queued pick: rasterize the same packet into the object-id
+        // target and copy the clicked pixel to the readback buffer —
+        // same encoder submission as the frame.
+        let mut encode_pick = false;
+        let mut encoded_ids = None;
+        if let (Some((x, y)), Some(v), Some(packet)) = (
+            self.pending_pick.take(),
+            &mut self.vab_renderer,
+            &self.last_vab_packet,
+        ) {
+            if self.pick_in_flight {
+                // One outstanding pick — drop the request; the next
+                // click retriggers.
+            } else {
+                encode_pick =
+                    v.encode_pick(&mut frame.encoder, &gpu.device, &gpu.queue, packet, x, y);
+                if encode_pick {
+                    // Snapshot the decode table alongside the rasterized
+                    // pixels — the readback decodes a frame or two later
+                    // and `last_vab_packet` may have moved on by then.
+                    encoded_ids = Some(packet.pick_ids.clone());
+                }
+            }
+        }
+        if let Some(ids) = encoded_ids {
+            self.pick_decode_ids = Some(ids);
+        }
         gpu.submit(*frame);
+        if encode_pick {
+            if let Some(v) = &self.vab_renderer {
+                v.map_pick(self.pick_tx.clone());
+            }
+            self.pick_in_flight = true;
+        }
+        // Service map_async callbacks (native; wasm callbacks fire on
+        // the event loop).
+        if let Err(e) = gpu.device.poll(wgpu::PollType::Poll) {
+            log::warn!("device poll failed: {e}");
+        }
         window.request_redraw();
     }
 
@@ -437,8 +587,71 @@ impl App {
     /// key-repeat so they track a held key, while `M`/`,`/`.` are
     /// non-repeat single shots.
     fn key_press(&mut self, event: &winit::event::KeyEvent) {
-        let in_map = self.view.map_mode() == MapMode::Map;
+        let mode = self.view.mode();
+        let in_map = mode == ViewMode::Map;
+        let in_vab = mode == ViewMode::Vab;
         let pan = |dx_px: f64, dy_px: f64| MapKeyEvent::Pan { dx_px, dy_px };
+        // VAB mode keys: V toggles the editor; M/WASD/arrows get their
+        // own routing below. `,`/`.` stay warp keys in every mode.
+        if let Key::Character(c) = &event.logical_key
+            && c.eq_ignore_ascii_case("v")
+            && !event.repeat
+        {
+            self.view.set_mode(if in_vab {
+                ViewMode::Flight
+            } else {
+                ViewMode::Vab
+            });
+            return;
+        }
+        if in_vab {
+            let vab_event = match &event.logical_key {
+                Key::Character(c) if c.eq_ignore_ascii_case("m") && !event.repeat => {
+                    self.view.set_mode(ViewMode::Map);
+                    return;
+                }
+                Key::Named(NamedKey::ArrowUp) => Some(VabEvent::Pan {
+                    dx_px: 0.0,
+                    dy_px: -PAN_STEP_PX,
+                }),
+                Key::Named(NamedKey::ArrowDown) => Some(VabEvent::Pan {
+                    dx_px: 0.0,
+                    dy_px: PAN_STEP_PX,
+                }),
+                Key::Named(NamedKey::ArrowLeft) => Some(VabEvent::Pan {
+                    dx_px: -PAN_STEP_PX,
+                    dy_px: 0.0,
+                }),
+                Key::Named(NamedKey::ArrowRight) => Some(VabEvent::Pan {
+                    dx_px: PAN_STEP_PX,
+                    dy_px: 0.0,
+                }),
+                Key::Character(c) => match c.as_str() {
+                    "w" | "W" => Some(VabEvent::Pan {
+                        dx_px: 0.0,
+                        dy_px: -PAN_STEP_PX,
+                    }),
+                    "s" | "S" => Some(VabEvent::Pan {
+                        dx_px: 0.0,
+                        dy_px: PAN_STEP_PX,
+                    }),
+                    "a" | "A" => Some(VabEvent::Pan {
+                        dx_px: -PAN_STEP_PX,
+                        dy_px: 0.0,
+                    }),
+                    "d" | "D" => Some(VabEvent::Pan {
+                        dx_px: PAN_STEP_PX,
+                        dy_px: 0.0,
+                    }),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(ev) = vab_event {
+                self.view.vab_event(ev);
+            }
+            return;
+        }
         let map_event = match &event.logical_key {
             Key::Character(c) if c.as_str() == "," && !event.repeat => {
                 self.warp.request_step(-1);
@@ -449,7 +662,14 @@ impl App {
                 return;
             }
             Key::Character(c) if c.eq_ignore_ascii_case("m") && !event.repeat => {
-                Some(MapKeyEvent::ToggleMode)
+                // Mode choreography lives in View::set_mode so VAB
+                // suppression is handled in one place.
+                self.view.set_mode(if in_map {
+                    ViewMode::Flight
+                } else {
+                    ViewMode::Map
+                });
+                return;
             }
             Key::Named(NamedKey::Tab) if in_map => Some(MapKeyEvent::CycleFocus),
             Key::Named(NamedKey::ArrowUp) if in_map => Some(pan(0.0, -PAN_STEP_PX)),
@@ -500,6 +720,9 @@ impl ApplicationHandler for App {
                 if let Some(gpu) = &mut self.gpu {
                     gpu.resize(size.width, size.height);
                 }
+                if let (Some(g), Some(v)) = (&self.gpu, &mut self.vab_renderer) {
+                    v.resize(&g.device, size.width, size.height);
+                }
             }
             // Key presses — warp ladder + map camera; see `key_press`.
             // `!consumed` keeps egui-owned keys (a focused text field)
@@ -521,18 +744,46 @@ impl ApplicationHandler for App {
                 ..
             } => {
                 self.map_dragging = !consumed && state == ElementState::Pressed;
+                match state {
+                    ElementState::Pressed => {
+                        // VAB pick is decided at RELEASE, not here: an
+                        // unconsumed press is only a click *candidate* —
+                        // it may be the start of a camera orbit drag,
+                        // and a drag must not also select.
+                        self.lmb_press = if consumed { None } else { self.last_cursor };
+                    }
+                    ElementState::Released => {
+                        // VAB: an unconsumed click that stayed inside
+                        // the drag threshold requests a GPU pick at the
+                        // cursor — the readback lands via the pick
+                        // channel a frame or two later.
+                        if let Some(press) = self.lmb_press.take() {
+                            let pos = self.last_cursor.unwrap_or(press);
+                            let dragged =
+                                (pos.0 - press.0).hypot(pos.1 - press.1) > CLICK_MAX_DRAG_PX;
+                            if !consumed && !dragged && self.view.mode() == ViewMode::Vab {
+                                self.pending_pick =
+                                    Some((pos.0.max(0.0) as u32, pos.1.max(0.0) as u32));
+                            }
+                        }
+                    }
+                }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let pos = (position.x, position.y);
                 if !consumed
                     && self.map_dragging
-                    && self.view.map_mode() == MapMode::Map
                     && let Some(last) = self.last_cursor
                 {
-                    self.view.map_event(MapKeyEvent::Orbit {
-                        dyaw: (pos.0 - last.0) * DRAG_RAD_PER_PX,
-                        dpitch: (pos.1 - last.1) * DRAG_RAD_PER_PX,
-                    });
+                    let (dyaw, dpitch) = (
+                        (pos.0 - last.0) * DRAG_RAD_PER_PX,
+                        (pos.1 - last.1) * DRAG_RAD_PER_PX,
+                    );
+                    match self.view.mode() {
+                        ViewMode::Map => self.view.map_event(MapKeyEvent::Orbit { dyaw, dpitch }),
+                        ViewMode::Vab => self.view.vab_event(VabEvent::Orbit { dyaw, dpitch }),
+                        ViewMode::Flight => {}
+                    }
                 }
                 // `last_cursor` updates even on egui-consumed moves —
                 // otherwise a drag crossing a panel exits with a stale
@@ -540,14 +791,15 @@ impl ApplicationHandler for App {
                 self.last_cursor = Some(pos);
             }
             WindowEvent::MouseWheel { delta, .. } if !consumed => {
-                if self.view.map_mode() == MapMode::Map {
-                    let lines = match delta {
-                        MouseScrollDelta::LineDelta(_, y) => f64::from(y) * ZOOM_LN_PER_LINE,
-                        MouseScrollDelta::PixelDelta(p) => p.y * ZOOM_LN_PER_PX,
-                    };
-                    self.view.map_event(MapKeyEvent::Zoom {
-                        factor: f64::exp(lines),
-                    });
+                let lines = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => f64::from(y) * ZOOM_LN_PER_LINE,
+                    MouseScrollDelta::PixelDelta(p) => p.y * ZOOM_LN_PER_PX,
+                };
+                let factor = f64::exp(lines);
+                match self.view.mode() {
+                    ViewMode::Map => self.view.map_event(MapKeyEvent::Zoom { factor }),
+                    ViewMode::Vab => self.view.vab_event(VabEvent::Zoom { factor }),
+                    ViewMode::Flight => {}
                 }
             }
             WindowEvent::RedrawRequested => self.render(),
@@ -587,3 +839,48 @@ pub fn wasm_start() {
     let app = App::new();
     winit::platform::web::EventLoopExtWebSys::spawn_app(event_loop, app);
 }
+
+/// Native: `crafts/` next to the working directory — session artifacts
+/// live outside `data/` (that tree is authored content + the
+/// attribution lint). On wasm the store is memory-only.
+#[cfg(not(target_arch = "wasm32"))]
+fn load_craft_store() -> BTreeMap<String, Vec<u8>> {
+    let mut store = BTreeMap::new();
+    let dir = std::path::Path::new("crafts");
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x == "cspcraft")
+                && let (Ok(bytes), Some(name)) = (
+                    std::fs::read(&p),
+                    p.file_stem().and_then(|s| s.to_str()).map(String::from),
+                )
+            {
+                store.insert(name, bytes);
+            }
+        }
+    }
+    store
+}
+
+/// wasm: in-memory only — the M3 web slice has no filesystem.
+#[cfg(target_arch = "wasm32")]
+fn load_craft_store() -> BTreeMap<String, Vec<u8>> {
+    BTreeMap::new()
+}
+
+/// Native: mirror the store entry to `crafts/<name>.cspcraft`. Failures
+/// are logged, not fatal — the in-memory store already holds the craft.
+#[cfg(not(target_arch = "wasm32"))]
+fn save_craft_file(name: &str, bytes: &[u8]) {
+    let dir = std::path::Path::new("crafts");
+    if let Err(e) = std::fs::create_dir_all(dir)
+        .and_then(|()| std::fs::write(dir.join(format!("{name}.cspcraft")), bytes))
+    {
+        log::warn!("craft save to disk failed: {e}");
+    }
+}
+
+/// wasm: nothing to write — the store in `App` is the whole store.
+#[cfg(target_arch = "wasm32")]
+fn save_craft_file(_name: &str, _bytes: &[u8]) {}
