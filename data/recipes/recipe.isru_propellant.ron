@@ -1,0 +1,9 @@
+// Propellant ISRU — ore cracked into liquid fuel + oxidizer so a
+// colony can refuel the ferries that supply it (§3.5's supply loop).
+(
+    schema_version: 1,
+    id: "recipe.isru_propellant",
+    display_name: "recipe.isru_propellant.name",
+    inputs: [("ore", 2.0)],
+    outputs: [("liquid_fuel", 0.7), ("oxidizer", 0.8)],
+)

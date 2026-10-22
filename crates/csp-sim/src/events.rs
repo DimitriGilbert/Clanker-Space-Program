@@ -11,12 +11,13 @@
 //!   (see `World`'s `SetVesselTracked` apply).
 //! - **Kinds have producers only.** The §2.6.5 member tables name ten
 //!   `Clamping` and six `Silent` members; variants whose subsystems do
-//!   not exist yet (`ContractDeadline`,
-//!   `ResearchProjectComplete`, `LifeSupportDepleted`, `ScriptWake`,
-//!   `Insolvent`, `ConstructionComplete`, `ColonyStore*` ,
-//!   `ReliabilityInspectionDue`, `PartFailure`, `TerminatorCrossing`)
+//!   not exist yet (`ScriptWake`,
+//!   `ConstructionComplete`, `ReliabilityInspectionDue`, `PartFailure`)
 //!   are deliberately absent — they land WITH their
-//!   producing subsystems (no speculative filler). `SoiRescan` is the
+//!   producing subsystems (no speculative filler). M8-A landed the
+//!   §3.5.1 colony kinds — `TerminatorCrossing`, `ColonyStore*`
+//!   (`Silent`), `ColonyInspection`, `PowerLost`/`PowerRestored`, and
+//!   `LifeSupportDepleted` (`Clamping`). `SoiRescan` is the
 //!   one kind the plan does not name: it is the Orbits subsystem's own
 //!   publish deadline when the §2.6.6 scan finds no crossing inside the
 //!   query horizon — the mechanism that keeps "publish your next event
@@ -265,6 +266,100 @@ pub enum EventKind {
         /// The contract arena id the deadline expires.
         contract: crate::contracts::ContractId,
     } = 11,
+    /// §3.5.1 rule 1's insolation step (M8-A; §2.6.5 `Silent`
+    /// member): the colony's local sunrise/sunset — a closed form
+    /// over body rotation and orbital phase. Firing stamps the new
+    /// `Daylight` and re-solves the flow network.
+    TerminatorCrossing {
+        /// The colony crossing the terminator.
+        colony: crate::ColonyId,
+    } = 12,
+    /// §3.5.1 rule 4's filling bound (M8-A; §2.6.5 `Silent` member):
+    /// the colony's earliest store-bound crossing reached its tick —
+    /// the resource's level clamped at capacity. Firing re-anchors
+    /// the stores and re-solves; a stale firing (rates changed since
+    /// it was scheduled) is an early recompute, never a wrong level.
+    ColonyStoreFull {
+        /// The colony whose store filled.
+        colony: crate::ColonyId,
+        /// The resource that reached capacity.
+        resource: csp_data::ResourceId,
+    } = 13,
+    /// §3.5.1 rule 4's emptying bound (M8-A; §2.6.5 `Silent` member):
+    /// same contract as `ColonyStoreFull`, at the zero bound.
+    ColonyStoreEmpty {
+        /// The colony whose store emptied.
+        colony: crate::ColonyId,
+        /// The resource that reached zero.
+        resource: csp_data::ResourceId,
+    } = 14,
+    /// §3.5.1 rule 4's "next scheduled inspection" (M8-A): the
+    /// colony's authored re-solve deadline — scheduled by
+    /// `SimCommand::ScheduleColonyInspection` and by the `Colonies`
+    /// slot's publish repair. Always `Silent`.
+    ColonyInspection {
+        /// The colony to re-solve.
+        colony: crate::ColonyId,
+    } = 15,
+    /// §3.5.1 rule 5's power transition (M8-A): scheduled one tick
+    /// out by the recompute when EC demand outruns production plus a
+    /// dead battery — firing sets `Degraded{PowerLost}`. `Clamping`:
+    /// a colony going dark is the rare transition the player must
+    /// not sleep through (the `LifeSupportDepleted` precedent — a
+    /// transition, not a periodic).
+    PowerLost {
+        /// The colony that lost power.
+        colony: crate::ColonyId,
+    } = 16,
+    /// The inverse transition (M8-A): scheduled when a
+    /// `Degraded{PowerLost}` colony's recompute finds EC demand
+    /// served again — firing returns it to `Nominal`. `Clamping`,
+    /// same contract as `PowerLost`.
+    PowerRestored {
+        /// The colony whose power returned.
+        colony: crate::ColonyId,
+    } = 17,
+    /// §3.5.1 rule 5 + §2.6.5's `Clamping` member (M8-A): a
+    /// life-support-required store is empty and under-granted with
+    /// crew aboard — firing marks the crew `Lost` and drops the
+    /// colony to `Dormant` (it schedules nothing ever again).
+    LifeSupportDepleted {
+        /// The colony whose life support ran out.
+        colony: crate::ColonyId,
+    } = 18,
+    /// §3.5's build order delivery (M8-B): firing materializes the
+    /// ordered craft as a surface-latched vessel at the ordering
+    /// launch site — the `ManufactureCraft` order spent its BOM and
+    /// funds at apply, so the firing is the only place the hull can
+    /// appear. `Clamping`: a finished build is the member-table
+    /// `ConstructionComplete` the player must not sleep through.
+    ConstructionComplete {
+        /// The build order completing.
+        build: crate::manufacture::BuildId,
+    } = 19,
+    /// M8-C §3.5's periodic vessel life-support check — the
+    /// `SalaryDue` precedent: one `Silent` event per
+    /// `life_support_cfg.check_period_ticks` on the absolute grid,
+    /// lazily published by the `LifeSupport` slot while any vessel
+    /// carries crew and life support is enabled. Firing debits
+    /// `rate · period` per crew member aboard each crewed vessel and
+    /// schedules the `Clamping` depletion transitions the shortfalls
+    /// earn. Always `Silent` — routine bookkeeping must never demote
+    /// warp.
+    LifeSupportCheck = 20,
+    /// M8-C §3.5's vessel-side depletion transition — scheduled one
+    /// tick out by a `LifeSupportCheck` firing when a crewed vessel
+    /// cannot cover a required resource's debit; firing marks the
+    /// vessel's crew `Lost`. `Clamping`: crew dying is the named
+    /// §2.6.5 member the player must not sleep through (the colony's
+    /// `LifeSupportDepleted` precedent). Names a vessel that may no
+    /// longer exist — the `TransferComplete` precedent: a stale
+    /// firing is a no-op, and the event is never scrubbed on vessel
+    /// removal.
+    VesselLifeSupportDepleted {
+        /// The crewed vessel whose life support ran out.
+        vessel: VesselId,
+    } = 21,
 }
 
 impl StableDiscriminant for EventKind {
@@ -282,6 +377,16 @@ impl StableDiscriminant for EventKind {
             Self::SalaryDue => 9,
             Self::Insolvent { .. } => 10,
             Self::ContractDeadline { .. } => 11,
+            Self::TerminatorCrossing { .. } => 12,
+            Self::ColonyStoreFull { .. } => 13,
+            Self::ColonyStoreEmpty { .. } => 14,
+            Self::ColonyInspection { .. } => 15,
+            Self::PowerLost { .. } => 16,
+            Self::PowerRestored { .. } => 17,
+            Self::LifeSupportDepleted { .. } => 18,
+            Self::ConstructionComplete { .. } => 19,
+            Self::LifeSupportCheck => 20,
+            Self::VesselLifeSupportDepleted { .. } => 21,
         }
     }
 }
@@ -299,10 +404,32 @@ pub fn class_of(kind: &EventKind, tracked: &BTreeSet<VesselId>) -> EventClass {
                 EventClass::Silent
             }
         }
-        EventKind::SoiRescan { .. } | EventKind::DebrisDecay { .. } | EventKind::SalaryDue => {
+        EventKind::SoiRescan { .. }
+        | EventKind::DebrisDecay { .. }
+        | EventKind::SalaryDue
+        // §3.5.1's boundary deadlines — the §2.6.5 `Silent` members
+        // (`TerminatorCrossing`, `ColonyStoreFull`/`Empty`) plus the
+        // inspection re-solve, which is pure bookkeeping.
+        | EventKind::TerminatorCrossing { .. }
+        | EventKind::ColonyStoreFull { .. }
+        | EventKind::ColonyStoreEmpty { .. }
+        | EventKind::ColonyInspection { .. }
+        // M8-C: the periodic vessel check is bookkeeping like
+        // `SalaryDue` — never clamps warp.
+        | EventKind::LifeSupportCheck => {
             EventClass::Silent
         }
-        EventKind::ContractDeadline { .. } => EventClass::Clamping,
+        EventKind::ContractDeadline { .. }
+        | EventKind::ConstructionComplete { .. }
+        // §3.5.1's transition events — `LifeSupportDepleted` is a
+        // named §2.6.5 `Clamping` member; `PowerLost`/`PowerRestored`
+        // share its "a transition, not a periodic" contract.
+        | EventKind::PowerLost { .. }
+        | EventKind::PowerRestored { .. }
+        | EventKind::LifeSupportDepleted { .. }
+        // M8-C: the vessel-side depletion shares the colony's
+        // "a transition, not a periodic" `Clamping` contract.
+        | EventKind::VesselLifeSupportDepleted { .. } => EventClass::Clamping,
         EventKind::PlayerAlarm { .. }
         | EventKind::ManeuverNodeStart { .. }
         | EventKind::TransferWindow { .. }
@@ -385,6 +512,25 @@ impl ScheduledEvent {
             }
             EventKind::ContractDeadline { contract } => {
                 h.u64(contract.0);
+            }
+            EventKind::TerminatorCrossing { colony }
+            | EventKind::ColonyInspection { colony }
+            | EventKind::PowerLost { colony }
+            | EventKind::PowerRestored { colony }
+            | EventKind::LifeSupportDepleted { colony } => {
+                h.u64(colony.0);
+            }
+            EventKind::ColonyStoreFull { colony, resource }
+            | EventKind::ColonyStoreEmpty { colony, resource } => {
+                h.u64(colony.0);
+                h.str(resource.as_str());
+            }
+            EventKind::ConstructionComplete { build } => {
+                h.u64(build.0);
+            }
+            EventKind::LifeSupportCheck => {}
+            EventKind::VesselLifeSupportDepleted { vessel } => {
+                h.u64(vessel.0);
             }
         }
     }

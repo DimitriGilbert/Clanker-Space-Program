@@ -160,6 +160,143 @@ pub fn staffed_base_run(probe: &EconomyProbe) -> Result<EconomyReport, SimError>
     Ok(report)
 }
 
+/// What a [`colony_production_run`] observed — the M8-C extension
+/// of the §8.3 harness: colony production feeding the economy.
+#[derive(Clone, Debug)]
+pub struct ColonyEconomyReport {
+    /// Ore units the colony's drill produced into its store by the
+    /// end of the run (the production side).
+    pub ore_produced: f64,
+    /// Ore units the `AbandonColony` salvage landed in the site's
+    /// inventory (the economy side — the inventory the program's
+    /// recovery/build machinery draws on) — the authored
+    /// `abandon_recovery` fraction of the produced level.
+    pub salvaged: f64,
+    /// Serialized `WorldSnapshot` size at the run's end (bytes).
+    pub final_save_bytes: u64,
+}
+
+/// M8-C §8.3's colony/economy probe: a mining colony runs `months`
+/// sim-months — the drill's production accrues into the colony's
+/// store (piecewise-linear, event-bounded — one recompute per
+/// boundary, never a per-tick integrator), then `AbandonColony`
+/// salvages the stores into the site inventory the rest of the
+/// economy reads. The world carries no physics/orbit model: the
+/// colony's light environment is synthetic (`colony_env` is
+/// construction config), so the run is a pure production book.
+#[allow(clippy::too_many_lines)] // site/env fixture + run read as one pass
+pub fn colony_production_run(months: u64) -> Result<ColonyEconomyReport, SimError> {
+    use csp_data::{BodyId, ColonyModuleDef, ResourceId, SiteId};
+    let balance = shipping_balance()
+        .map_err(|_| SimError::Fatal("economy: shipping balance.ron failed to load"))?;
+    let mut bodies = BTreeMap::new();
+    bodies.insert(
+        BodyId::from("terra"),
+        csp_sim::orbit::BodyOrbit {
+            mu_m3_per_s2: 4.0e14,
+            soi_m: None,
+            parent: None,
+            elements: None,
+        },
+    );
+    let mut w = World::with_config(
+        csp_sim::orbit::PatchedConics::new(bodies),
+        balance.advance_to_max_events_per_frame,
+    );
+    w.set_economy_config(economy::EconomyConfig::from_balance(&balance));
+    w.set_life_support_config(csp_sim::life_support::LifeSupportConfig::from_balance(
+        &balance,
+    ));
+    w.set_colony_env(BTreeMap::from([(
+        BodyId::from("terra"),
+        csp_sim::ColonyBodyEnv {
+            rotation_period_s: Some(21_600.0),
+            insolation_w_m2: Some(1361.0),
+            radius_m: 6.0e6,
+        },
+    )]));
+    let ore = ResourceId::from("ore");
+    w.set_sites(BTreeMap::from([(
+        SiteId::from("pad"),
+        csp_data::SiteDef {
+            schema_version: 1,
+            id: SiteId::from("pad"),
+            display_name: csp_data::LocKey::from("site.pad"),
+            body: BodyId::from("terra"),
+            latitude_rad: 0.0,
+            longitude_rad: 0.0,
+            altitude_m: 0.0,
+            launch: false,
+            resource_yields: vec![(ore.clone(), 1.0)],
+        },
+    )]));
+    // The authored shape: a constant-power generator, a drill
+    // pulling ore at the site's full concentration, and the store
+    // it fills. 50 days of production at 0.5 u/s ≈ 2.16 M units —
+    // the store capacity reads as unbounded for the probe.
+    w.enqueue(
+        csp_sim::SourceClass::Ui,
+        0,
+        SimCommand::FoundColony {
+            def: csp_data::ColonyDef {
+                site: SiteId::from("pad"),
+                display_name: csp_data::LocKey::from("colony.probe"),
+                modules: vec![
+                    ColonyModuleDef::Generator {
+                        fuel: ore.clone(),
+                        fuel_rate_per_s: 0.0,
+                        rate_per_s: 10.0,
+                        priority: 0,
+                    },
+                    ColonyModuleDef::Drill {
+                        resource: ore.clone(),
+                        base_rate_per_s: 0.5,
+                        min_concentration: 1.0,
+                        power_ec_per_s: 1.0,
+                    },
+                    ColonyModuleDef::Store {
+                        resource: ore.clone(),
+                        capacity: 1.0e12,
+                    },
+                ],
+                stores: vec![],
+            },
+        },
+    );
+    w.step_frame(w.clock().ticks() + 1)?;
+    let colony = *w
+        .colonies()
+        .keys()
+        .next()
+        .ok_or(SimError::Fatal("economy: colony did not found"))?;
+    let month_ticks = (30.0 * 86_400.0 * TICKS_PER_SECOND as f64) as u64;
+    let target = months * month_ticks;
+    while w.clock().ticks() < target {
+        w.step_frame(w.clock().ticks() + month_ticks)?;
+    }
+    let ore_produced = w.colonies()[&colony].stores[&ore].level_at(w.clock().ticks());
+    w.enqueue(
+        csp_sim::SourceClass::Ui,
+        0,
+        SimCommand::AbandonColony { colony },
+    );
+    w.step_frame(w.clock().ticks() + 1)?;
+    let site = w
+        .economy()
+        .sites
+        .get(&SiteId::from("pad"))
+        .ok_or(SimError::Fatal("economy: abandon left no site inventory"))?;
+    let salvaged = site.inventory.get(&ore).copied().unwrap_or(0.0);
+    let snapshot = w.snapshot()?;
+    Ok(ColonyEconomyReport {
+        ore_produced,
+        salvaged,
+        final_save_bytes: bincode::serde::encode_to_vec(&snapshot, bincode::config::standard())
+            .map_err(|_| SimError::Fatal("economy: snapshot encode failed"))?
+            .len() as u64,
+    })
+}
+
 #[cfg(test)]
 // §2.13's no-panic rule covers shipping fallible paths; tests signal
 // failure by panicking, so unwrap/expect stays legal inside test code.
@@ -186,6 +323,31 @@ mod tests {
         );
         assert_eq!(b.recovery_efficiency, economy::DEFAULT_RECOVERY_EFFICIENCY);
         assert_eq!(b.abandon_recovery, economy::DEFAULT_ABANDON_RECOVERY);
+        assert_eq!(
+            b.manufacture_rate_kg_per_s,
+            economy::DEFAULT_MANUFACTURE_KG_PER_S
+        );
+        // M8-C's life-support block — the same pinning contract:
+        // `csp_sim::life_support::DEFAULT_*` are what data-less
+        // worlds run, so they must agree with the authored file
+        // (the wiring `View::new`/`scenarios` now perform through
+        // `LifeSupportConfig::from_balance`).
+        assert_eq!(
+            b.life_support_check_period_s,
+            csp_sim::life_support::DEFAULT_CHECK_PERIOD_S
+        );
+        assert_eq!(
+            b.life_support_oxygen_per_crew_s,
+            csp_sim::life_support::DEFAULT_OXYGEN_PER_CREW_S
+        );
+        assert_eq!(
+            b.life_support_food_per_crew_s,
+            csp_sim::life_support::DEFAULT_FOOD_PER_CREW_S
+        );
+        assert_eq!(
+            b.life_support_ec_per_crew_s,
+            csp_sim::life_support::DEFAULT_EC_PER_CREW_S
+        );
     }
 
     /// The core §8.3 check: a fully staffed base's recurring drain
@@ -243,6 +405,40 @@ mod tests {
             "a 100-year staffed run never went insolvent — the drain \
              or the clamp is broken"
         );
+    }
+
+    /// M8-C §8.3's colony/economy seam: a mining colony's production
+    /// accrues into its store across sim-months, and `AbandonColony`
+    /// feeds the produced units back into the site inventory the
+    /// economy's recovery/build machinery draws on — the same
+    /// bounded ledger/save-size contract holds through it.
+    #[test]
+    fn colony_production_feeds_the_economy() {
+        let report = colony_production_run(3).unwrap();
+        // Three months at 0.5 u/s ≈ 3.9 M units — production accrued.
+        assert!(report.ore_produced > 1.0e6, "ore {report:?}");
+        // The abandon salvaged the produced units into the site
+        // inventory at the authored `abandon_recovery` fraction —
+        // colony production feeding the economy.
+        let cfg = economy::EconomyConfig::from_balance(&shipping_balance().unwrap());
+        assert!(
+            (report.salvaged - report.ore_produced * cfg.abandon_recovery).abs()
+                < report.ore_produced * 1e-9,
+            "salvage {report:?} vs recovery {}·ore",
+            cfg.abandon_recovery
+        );
+        assert!(report.final_save_bytes <= 32 * 1024 * 1024);
+    }
+
+    /// The colony probe is deterministic — two runs produce
+    /// identical books (the §8.3 replayable-economy reading).
+    #[test]
+    fn colony_probe_is_deterministic() {
+        let a = colony_production_run(1).unwrap();
+        let b = colony_production_run(1).unwrap();
+        assert_eq!(a.ore_produced, b.ore_produced);
+        assert_eq!(a.salvaged, b.salvaged);
+        assert_eq!(a.final_save_bytes, b.final_save_bytes);
     }
 
     /// Determinism: the probe run twice produces identical reports

@@ -1,7 +1,7 @@
 // Global balance constants. ALL tuning lives here (PLAN §8.3).
 // Named fields only — positional tuples drift silently under reordering.
 (
-    schema_version: 7,
+    schema_version: 9,
     // Physics bubble radius (PLAN §2.3): 20 km. Vessels go on rails at the
     // radius and rejoin at 90% (18 km) — the hysteresis is csp-sim logic,
     // not a second constant.
@@ -62,4 +62,17 @@
     // when the board is short). Mirror:
     // `csp_sim::DEFAULT_CONTRACT_BOARD_SIZE`.
     contract_offer_slots: 6,
+    // M8-B §3.5 manufacture: build-order throughput — a craft's
+    // construction takes mass_kg / manufacture_rate_kg_per_s sim
+    // seconds at its launch site. Mirror:
+    // `csp_sim::economy::DEFAULT_MANUFACTURE_KG_PER_S`.
+    manufacture_rate_kg_per_s: 50.0,
+    // M8-C §3.5 life support: the periodic vessel check's
+    // cadence (one sim-hour) and the per-crew consumption rates
+    // — `rate · period` per crew member is debited each check.
+    // Mirrors: `csp_sim::life_support::DEFAULT_*`.
+    life_support_check_period_s: 3_600.0,
+    life_support_oxygen_per_crew_s: 0.02,
+    life_support_food_per_crew_s: 0.005,
+    life_support_ec_per_crew_s: 0.05,
 )

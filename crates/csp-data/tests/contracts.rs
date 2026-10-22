@@ -19,23 +19,27 @@ fn loaded() -> (
     csp_data::LoadedSystem,
     csp_data::LoadedExperiments,
     csp_data::LoadedTechTree,
+    csp_data::ResourceFile,
 ) {
     let root = repo_root();
     let contracts = csp_data::load_contracts(&root.join("data/contracts")).unwrap();
     let sys = csp_data::load_system(&root.join("data/systems/home")).unwrap();
     let experiments = csp_data::load_experiments(&root.join("data/experiments")).unwrap();
     let tree = csp_data::load_techtree(&root.join("data/techtree")).unwrap();
-    (contracts, sys, experiments, tree)
+    let res = csp_data::load_resources(&root.join("data/resources.ron")).unwrap();
+    (contracts, sys, experiments, tree, res)
 }
 
 /// Every authored template parses at the current schema, passes the
 /// structural validator, and resolves its loc keys — including the
-/// tree's `contract_types` unlocks naming real templates.
+/// tree's `contract_types` unlocks naming real templates and the
+/// resupply template's resource candidates resolving in
+/// `resources.ron`.
 #[test]
 fn contract_templates_validate_against_shipping_data() {
-    let (contracts, sys, experiments, tree) = loaded();
-    assert_eq!(contracts.contracts.len(), 5);
-    let errors = csp_data::validate_contracts(&contracts, &sys, &experiments, &tree);
+    let (contracts, sys, experiments, tree, res) = loaded();
+    assert_eq!(contracts.contracts.len(), 6);
+    let errors = csp_data::validate_contracts(&contracts, &sys, &experiments, &tree, &res);
     assert!(errors.is_empty(), "{errors:?}");
 }
 

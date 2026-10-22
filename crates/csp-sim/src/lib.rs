@@ -48,7 +48,7 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 
 use csp_core::{DQuat, DVec3, SimError, SimTime, StableDiscriminant, StateHasher};
 use csp_data::{
-    BiomeId, BodyId, ContractTypeId, ExperimentId, KeplerElements, ResourceId, Situation,
+    BiomeId, BodyId, ContractTypeId, ExperimentId, KeplerElements, ResourceId, SiteId, Situation,
 };
 use csp_phys::{PhysicsBackend, SimpleBackend, WeldedBody};
 use serde::{Deserialize, Serialize};
@@ -117,7 +117,32 @@ pub mod economy;
 /// failure path, and the §7.2 fact record. See the module doc.
 pub mod contracts;
 
+/// M8-A §3.5.1 — the colony model: a piecewise-linear flow network
+/// recomputed only at events (the `Colonies` slot of the §2.6.5
+/// subsystem order). The two-state Day/Night insolation step with
+/// closed-form `TerminatorCrossing`s, the algebraic per-interval
+/// `T_eq`, the deterministic allocation pass, the epoch-anchored
+/// linear stores, and the `ColonyState` transition machine. See the
+/// module doc.
+pub mod colonies;
+
+/// M8-B §3.5 manufacture — the launch-site build-order machinery:
+/// `ManufactureCraft` spends BOM + funds at order time and
+/// `ConstructionComplete` delivers the latched craft.
+pub mod manufacture;
+
+/// M8-C §3.5 — the vessel-side life support (the `LifeSupport`
+/// slot of the §2.6.5 subsystem order): the per-save toggle, the
+/// periodic `LifeSupportCheck` debit, and the `Clamping`
+/// `VesselLifeSupportDepleted` crew-loss transition. See the
+/// module doc.
+pub mod life_support;
+
 pub use bubble::{CraftDef, PhysicsConfig, SurfacePose, VesselState, VesselThermal};
+pub use colonies::{
+    Colony, ColonyBodyEnv, ColonyModule, ColonyState, ColonyStore, Daylight, DegradeReason,
+    colony_env_from_body_defs,
+};
 pub use contracts::{
     ActiveContract, ContractConfig, ContractFacts, ContractId, ContractOffer, ContractState,
 };
@@ -130,6 +155,7 @@ pub use joints::{
     DEFAULT_CAPTURE_RANGE_M, DEFAULT_CAPTURE_WINDOW_TICKS, DEFAULT_LATCH_REL_SPEED_MPS,
     DEFAULT_LATCH_SEPARATION_M, DEFAULT_MAX_LIVE_JOINTS, DockSeam, DockingConfig, LiveJoint,
 };
+pub use life_support::LifeSupportConfig;
 pub use maneuver::{ActiveBurn, ManeuverNode, ManeuverStatus};
 use orbit::{OrbitModel, OrbitState, PatchedConics};
 pub use research::{
@@ -272,6 +298,16 @@ pub struct Vessel {
     /// **Hashed and serialized** sim state. Empty for craft-less
     /// vessels.
     pub science: VesselScience,
+    /// M8-B's §3.5 colony-inventory opt-in: the colony this
+    /// surface-latched vessel has joined via
+    /// [`SimCommand::JoinColonyInventory`] — the gate the
+    /// vessel↔colony transfers read. `None` = no join; membership is
+    /// never automatic (a latched vessel beside a colony transfers
+    /// nothing until this is set). Cleared on unlatch, a `ToRails`,
+    /// or `LeaveColonyInventory`; a latch merge keeps either side's
+    /// membership (`primary.or(secondary)` — the merged hull still
+    /// sits where a joined half sat).
+    pub joined_colony: Option<crate::economy::ColonyId>,
 }
 
 impl Vessel {
@@ -753,6 +789,147 @@ pub enum SimCommand {
         /// counter doubles as the offer id).
         offer: u64,
     },
+    /// M8-A §3.5.1's founding — place a colony at `def.site`:
+    /// resolve the site's body-fixed pose, build the aggregate
+    /// stores, install the module list, and run the founding solve
+    /// (daylight, allocation, terminator, the first deadlines). The
+    /// command carries the whole def verbatim — the log-contained
+    /// `SpawnPhysicalVessel`/`craft` pattern, so replays need no def
+    /// table. `Recoverable` rejections: unknown site, no colony env
+    /// for the body, non-finite fields.
+    FoundColony {
+        /// The authored colony — site, modules, founding stores.
+        def: csp_data::ColonyDef,
+    },
+    /// M8-A §3.5.1's `AbandonColony` — salvage the colony's store
+    /// contents at `abandon_recovery` into the site inventory, bring
+    /// crew home `Unassigned`, mark `Abandoned`, and drop every
+    /// pending event (the terminal record — it schedules nothing).
+    AbandonColony {
+        /// The colony to abandon.
+        colony: ColonyId,
+    },
+    /// M8-A's crew posting — move an `Unassigned` roster member to
+    /// the colony (scales its life-support demand). `Recoverable`:
+    /// unknown colony/crew, member not `Unassigned`/`Active`, colony
+    /// not live.
+    AssignCrewToColony {
+        /// The colony receiving the member.
+        colony: ColonyId,
+        /// The roster member posting.
+        crew: CrewId,
+    },
+    /// M8-A's evacuation — every crew member aboard goes
+    /// `Unassigned`; the recompute drops the life-support demand.
+    /// `Recoverable` for unknown or abandoned colonies.
+    EvacuateColony {
+        /// The colony to evacuate.
+        colony: ColonyId,
+    },
+    /// M8-A §3.5.1's crash-damage stand-in — mark one module inert
+    /// and drop the colony to `Degraded{ImpactDamage}` (the
+    /// bubble-impact detection hook is M8-B's). `Recoverable`:
+    /// unknown colony/module, already damaged, colony not live.
+    DamageColonyModule {
+        /// The colony whose module broke.
+        colony: ColonyId,
+        /// The `ModuleIndex` to mark damaged.
+        module: usize,
+    },
+    /// M8-A §3.5.1's "next scheduled inspection" — set the colony's
+    /// inspection deadline; the firing re-solves the network (the
+    /// M9b reliability hooks ride this later). A tick at or before
+    /// the drain boundary clamps to the next tick (the `SetAlarm`
+    /// rule). `Recoverable`: unknown or non-live colony.
+    ScheduleColonyInspection {
+        /// The colony to inspect.
+        colony: ColonyId,
+        /// The tick the inspection lands.
+        tick: u64,
+    },
+    /// M8-B §3.5's build order: spend `build_resources` (the craft's
+    /// aggregate `EffectivePart::build_resources` BOM) and the
+    /// `craft_cost_micros` funds out of a LAUNCH site's inventory now,
+    /// then materialize the craft as a surface-latched vessel at the
+    /// site when `ConstructionComplete` fires — construction takes
+    /// `mass_kg / manufacture_rate_kg_per_s` sim-seconds. `site` must
+    /// name a `SiteDef` with `launch`. `Recoverable`: unknown
+    /// site/non-launch site, unsound craft (the spawn gates),
+    /// insufficient inventory/funds, or the vessel cap.
+    ManufactureCraft {
+        /// The launch site ordering and receiving the craft.
+        site: SiteId,
+        /// The craft to build.
+        craft: CraftDef,
+        /// Aggregate `(resource, units)` the build consumes —
+        /// caller-summed from `EffectivePart::build_resources` (the
+        /// `part_costs`-rides-the-command convention: the log is
+        /// self-contained).
+        build_resources: Vec<(ResourceId, f64)>,
+    },
+    /// M8-B §3.5's colony-inventory opt-in — a `SurfaceLatched`
+    /// vessel within `transfer_radius_m` of a live colony joins its
+    /// store inventory. NEVER automatic; vessel↔colony transfers
+    /// reject without it. `Recoverable`: unknown vessel/colony, dead
+    /// colony, or out of range/latch.
+    JoinColonyInventory {
+        /// The vessel opting in.
+        vessel: VesselId,
+        /// The colony it joins.
+        colony: ColonyId,
+    },
+    /// M8-B §3.5 — clear the `joined_colony` opt-in (unlatching or
+    /// leaving the surface clears it too).
+    LeaveColonyInventory {
+        /// The vessel opting out.
+        vessel: VesselId,
+    },
+    /// M8-B §3.5's vessel↔colony resource transfer — same event-
+    /// driven reservation process as `TransferResource`: the source
+    /// debits now, `TransferComplete` credits at the flow-rate delay.
+    /// Requires `joined_colony == colony` (and the vessel latched —
+    /// the join record holds it).
+    TransferColonyResource {
+        /// The vessel endpoint.
+        vessel: VesselId,
+        /// The colony endpoint.
+        colony: ColonyId,
+        /// The resource moving.
+        resource: ResourceId,
+        /// Units in flight.
+        amount: f64,
+        /// `true` = vessel → colony store; `false` = colony → vessel.
+        to_colony: bool,
+    },
+    /// M8-B §3.5's vessel↔colony crew transfer — same reseat-at-
+    /// completion process as `TransferCrew`; the roster's
+    /// `CrewLocation` updates at the landing (the `AssignCrewToColony`
+    /// pairing). The member must be a roster-tracked `Active` crew —
+    /// a `BoardCrew` id-only member has no roster pair for the
+    /// colony's crew set.
+    TransferColonyCrew {
+        /// The vessel endpoint.
+        vessel: VesselId,
+        /// The colony endpoint.
+        colony: ColonyId,
+        /// The crew member moving.
+        crew: transfers::CrewId,
+        /// `true` = vessel → colony; `false` = colony → vessel seat.
+        to_colony: bool,
+    },
+    /// M8-C §3.5's per-save life-support toggle: set
+    /// `life_support_enabled` (default OFF — the subsystem is opt-in;
+    /// enabling presumes LS resources aboard). A command so a
+    /// mid-save toggle is §7.6-logged and replayable — flipping it
+    /// scrubs the pending vessel-side life-support events and
+    /// re-solves every live colony (the flag gates the `LifeSupport`
+    /// module's demand).
+    SetLifeSupportEnabled {
+        /// `true` = crewed vessels and colony `LifeSupport` modules
+        /// consume the required resources; `false` = the subsystem
+        /// is inert.
+        enabled: bool,
+    },
 }
 
 /// What `step_frame` did (§2.6.2): where the clock landed, what the
@@ -919,6 +1096,30 @@ pub struct WorldSnapshot {
     /// so a restored world enforces the same board size (the
     /// `economy_cfg` precedent).
     pub contract_cfg: ContractConfig,
+    /// M8-A's §3.5.1 colony arena — site refs, body-fixed poses, the
+    /// module lists, the `ColonyState`s, the epoch-anchored linear
+    /// stores, and the held solve outputs. **Serialized and hashed**
+    /// (§7.2's "colony stores, `ColonyState`, flow-network levels").
+    pub colonies: BTreeMap<ColonyId, Colony>,
+    /// §7.2 next-ID counter for the colony arena (monotonic, never
+    /// reused).
+    pub next_colony_id: u64,
+    /// M8-B's §3.5 build-order arena — one record per in-flight
+    /// `ManufactureCraft`, keyed by monotonic `BuildId`. **Serialized
+    /// and hashed**: each record pairs with exactly one pending
+    /// `ConstructionComplete` at `complete_tick` (the `transfers`
+    /// precedent — restore enforces both directions).
+    pub builds: BTreeMap<manufacture::BuildId, manufacture::ActiveBuild>,
+    /// §7.2 next-ID counter for the build arena.
+    pub next_build_id: u64,
+    /// M8-C's §3.5 per-save life-support toggle — serialized and
+    /// hashed (it selects whether the subsystem evolves). Opt-in:
+    /// `World::new` starts with it `false` (see [`life_support`]).
+    pub life_support_enabled: bool,
+    /// M8-C's vessel-side life-support tunables — construction
+    /// config, serialized so a restored world enforces the same
+    /// cadence/rates (the `economy_cfg` precedent).
+    pub life_support_cfg: LifeSupportConfig,
 }
 
 /// The world's construction config — data-derived (§7.3): the orbit
@@ -950,6 +1151,16 @@ pub struct WorldConfig {
     /// with (M7-D) — the same data-derived construction config
     /// channel; `AcceptContract` re-checks prereqs against it.
     pub contracts: BTreeMap<csp_data::ContractTypeId, csp_data::ContractTemplate>,
+    /// The per-body colony environments (M8-A) — rotation period
+    /// and authored insolation per body, the same data-derived
+    /// construction config channel; `FoundColony` and the
+    /// terminator closed form resolve against it.
+    pub colony_env: BTreeMap<BodyId, colonies::ColonyBodyEnv>,
+    /// The `data/recipes/` table the world was built with (M8-B) —
+    /// the same data-derived construction config channel;
+    /// `FoundColony`'s `Converter` modules resolve their `RecipeId`s
+    /// against it.
+    pub recipes: BTreeMap<csp_data::RecipeId, csp_data::RecipeDef>,
 }
 
 /// §2.9's object caps — construction config (from `balance.ron`),
@@ -1039,6 +1250,22 @@ struct TickShadow {
     /// `contracts` — captured before the first contract-book write
     /// (M7-D: offers, active arena, fact record, counters).
     contracts: Option<ContractState>,
+    /// `builds` + `next_build_id` — captured before the first
+    /// build-order write (M8-B: `ManufactureCraft`,
+    /// `ConstructionComplete` — the `transfers` precedent).
+    builds: Option<BTreeMap<manufacture::BuildId, manufacture::ActiveBuild>>,
+    /// See `builds`.
+    next_build_id: Option<u64>,
+    /// `colonies` + `next_colony_id` — captured before the first
+    /// colony-arena write (M8-A: founding, abandons, crew posts,
+    /// and every boundary recompute).
+    colonies: Option<BTreeMap<ColonyId, Colony>>,
+    /// See `colonies`.
+    next_colony_id: Option<u64>,
+    /// `life_support_enabled` — captured before the flag flips
+    /// (M8-C's `SetLifeSupportEnabled`; the config never mutates
+    /// inside a tick — a pre-run write like `economy_cfg`).
+    life_support_enabled: Option<bool>,
 }
 
 impl TickShadow {
@@ -1065,6 +1292,11 @@ impl TickShadow {
             tech: None,
             economy: None,
             contracts: None,
+            colonies: None,
+            builds: None,
+            next_build_id: None,
+            next_colony_id: None,
+            life_support_enabled: None,
         }
     }
 
@@ -1131,6 +1363,21 @@ impl TickShadow {
         }
         if let Some(v) = self.contracts {
             world.contracts = v;
+        }
+        if let Some(v) = self.colonies {
+            world.colonies = v;
+        }
+        if let Some(v) = self.builds {
+            world.builds = v;
+        }
+        if let Some(v) = self.next_build_id {
+            world.next_build_id = v;
+        }
+        if let Some(v) = self.next_colony_id {
+            world.next_colony_id = v;
+        }
+        if let Some(v) = self.life_support_enabled {
+            world.life_support_enabled = v;
         }
     }
 }
@@ -1263,6 +1510,10 @@ pub struct World {
     /// `set_experiments`/`WorldConfig`, never serialized or hashed —
     /// a def change is a data-hash change, not a state edit.
     experiments: BTreeMap<ExperimentId, csp_data::ExperimentDef>,
+    /// M8-B's `data/recipes/` table — data-derived construction
+    /// config like `experiments` (re-installed post-restore), the
+    /// `Converter` modules' `RecipeId` lookup.
+    recipes: BTreeMap<csp_data::RecipeId, csp_data::RecipeDef>,
     /// M7-C's §3.5 economy book — funds (micro-units), the insolvency
     /// flag, the crew roster, the site inventory arena, and the
     /// bounded ledger. **Hashed and serialized** (the ledger is
@@ -1292,11 +1543,40 @@ pub struct World {
     /// like `experiments` (data-derived, §7.3): handed in via
     /// `set_contracts`/`WorldConfig`, never serialized or hashed.
     contract_defs: BTreeMap<ContractTypeId, csp_data::ContractTemplate>,
+    /// M8-A's §3.5.1 colony arena — modules, states, epoch-anchored
+    /// linear stores, held solve outputs. **Hashed and serialized**
+    /// (§7.2): the flow-network levels change the next tick's
+    /// evolution, and a lost store silently un-mints resources.
+    colonies: BTreeMap<ColonyId, Colony>,
+    /// §2.2 next-ID counter for the colony arena — monotonic, never
+    /// reused, serialized and hashed.
+    next_colony_id: u64,
+    /// M8-B's in-flight build-order arena (the `transfers`
+    /// precedent: hashed + serialized, event-paired).
+    builds: BTreeMap<manufacture::BuildId, manufacture::ActiveBuild>,
+    /// §7.2's build-order counter.
+    next_build_id: u64,
+    /// The per-body colony environments — construction config like
+    /// `site_defs` (data-derived, §7.3): handed in via
+    /// `set_colony_env`/`WorldConfig`, never serialized or hashed.
+    colony_env: BTreeMap<BodyId, colonies::ColonyBodyEnv>,
     /// The §2.4/§2.9 bubble: backend + dominant body — construction
     /// config (data-derived, §7.3), `None` for worlds built without
     /// physics. `SimpleBackend`'s contact record is scratch — derived
     /// per tick, never hashed or serialized.
     physics: Option<Physics>,
+    /// M8-C's §3.5 per-save life-support toggle — serialized and
+    /// hashed sim state (flipped by `SetLifeSupportEnabled`; see
+    /// [`life_support`]). **Default OFF** — §3.5's "optional...
+    /// toggleable" reads as opt-in: enabling requires vessels/colonies
+    /// to actually carry LS resources (`oxygen`/`food`/
+    /// `electric_charge`), which the authored part set does not
+    /// provide by default.
+    life_support_enabled: bool,
+    /// M8-C's vessel-side life-support tunables — construction
+    /// config, hashed and serialized like `economy_cfg` (the
+    /// cadence and rates change state evolution).
+    life_support_cfg: LifeSupportConfig,
 }
 
 /// The world's physics half: the §2.9 backend it steps plus the
@@ -1383,6 +1663,7 @@ impl World {
             science: ScienceState::default(),
             science_cfg: research::default_config(),
             experiments: BTreeMap::new(),
+            recipes: BTreeMap::new(),
             tech: TechState::default(),
             tech_tree: None,
             economy: EconomyState {
@@ -1395,7 +1676,22 @@ impl World {
             contracts: ContractState::default(),
             contract_cfg: contracts::default_config(),
             contract_defs: BTreeMap::new(),
+            colonies: BTreeMap::new(),
+            next_colony_id: 0,
+            builds: BTreeMap::new(),
+            next_build_id: 0,
+            colony_env: BTreeMap::new(),
             physics: None,
+            // §3.5's "optional... toggleable" reads as OPT-IN: a fresh
+            // world runs with the subsystem OFF. The authored part
+            // catalog ships no `oxygen`/`food` tanks, so a default-on
+            // world would deplete every crewed vessel at the first
+            // check — crewed play would be lethal out of the box.
+            // Enabling (`set_life_support_enabled` /
+            // `SetLifeSupportEnabled`) is the save author's choice,
+            // and only makes sense once vessels carry LS resources.
+            life_support_enabled: false,
+            life_support_cfg: life_support::default_config(),
         }
     }
 
@@ -1410,6 +1706,17 @@ impl World {
     /// The configured caps.
     pub fn vessel_caps(&self) -> VesselCaps {
         self.caps
+    }
+
+    /// §2.9's cap accounting — every live build order has already
+    /// reserved the vessel slot its `ConstructionComplete` delivery
+    /// needs (the `apply_manufacture_craft` reservation), so every
+    /// arena-growing path must count vessels + in-flight builds, not
+    /// vessels alone: a `vessels`-only check lets a delivery push the
+    /// arena to `max_vessels + 1` while other spawns still believe a
+    /// slot is free.
+    pub(crate) fn vessel_slots_in_use(&self) -> u64 {
+        self.vessels.len() as u64 + self.builds.len() as u64
     }
 
     /// §2.4's docking tunables — post-construction setter for worlds
@@ -1463,6 +1770,8 @@ impl World {
             tech_tree: self.tech_tree.clone(),
             sites: self.site_defs.clone(),
             contracts: self.contract_defs.clone(),
+            colony_env: self.colony_env.clone(),
+            recipes: self.recipes.clone(),
         }
     }
 
@@ -1576,6 +1885,13 @@ impl World {
         if !snapshot.contract_cfg.is_valid() {
             return Err(SimError::Fatal("snapshot: invalid contract config"));
         }
+        // The event walk below takes `e.tick % check_period_ticks`
+        // for `LifeSupportCheck`'s grid check — the config must be
+        // proven valid (period > 0) BEFORE the heap is read, like
+        // `economy_cfg` above its `salary_period_ticks` modulo.
+        if !snapshot.life_support_cfg.is_valid() {
+            return Err(SimError::Fatal("snapshot: invalid life-support config"));
+        }
         if snapshot.next_vessel_id < snapshot.vessels.keys().next_back().map_or(0, |id| id.0 + 1) {
             return Err(SimError::Fatal(
                 "snapshot: next_vessel_id not ahead of live ids",
@@ -1612,6 +1928,20 @@ impl World {
         // M7-D: pending `ContractDeadline`s → (contract, tick) for
         // the strict event↔contract pairing check below.
         let mut deadline_events = BTreeMap::new();
+        // M8-B: pending `ConstructionComplete`s → (build, tick) —
+        // the build↔event pairing check below.
+        let mut build_events = BTreeMap::new();
+        // M8-A: colony boundary/notification uniqueness — a live
+        // colony publishes at most one terminator, one store-bound,
+        // one inspection, and one of each transition.
+        let mut colony_terminator = BTreeSet::new();
+        let mut colony_store_events = BTreeSet::new();
+        let mut colony_inspections = BTreeSet::new();
+        let mut colony_transitions = BTreeSet::new();
+        // M8-C: the check's uniqueness + the depletion's per-vessel
+        // uniqueness (the `colony_transitions` precedent).
+        let mut ls_check_count = 0u32;
+        let mut vessel_ls_depleted = BTreeSet::new();
         for e in &snapshot.event_heap {
             if e.tick < snapshot.clock_ticks {
                 return Err(SimError::Fatal("snapshot: event behind the clock"));
@@ -1639,8 +1969,71 @@ impl World {
                 | EventKind::ResearchProjectComplete { .. }
                 | EventKind::SalaryDue
                 | EventKind::Insolvent { .. }
-                | EventKind::ContractDeadline { .. } => None,
+                | EventKind::ContractDeadline { .. }
+                | EventKind::ConstructionComplete { .. } => None,
+                // M8-A: colony events name a colony, never a vessel —
+                // the colony-id existence check lives below with the
+                // event-walk's duplicate rules.
+                EventKind::TerminatorCrossing { .. }
+                | EventKind::ColonyStoreFull { .. }
+                | EventKind::ColonyStoreEmpty { .. }
+                | EventKind::ColonyInspection { .. }
+                | EventKind::PowerLost { .. }
+                | EventKind::PowerRestored { .. }
+                | EventKind::LifeSupportDepleted { .. }
+                // M8-C: the depletion names a vessel that may be gone
+                // (removal never scrubs it — the `TransferComplete`
+                // precedent); the check names nothing.
+                | EventKind::LifeSupportCheck
+                | EventKind::VesselLifeSupportDepleted { .. } => None,
             };
+            // M8-A: colony-scoped events must name a live colony and
+            // stay unique per colony per kind.
+            let colony_named = match &e.kind {
+                EventKind::TerminatorCrossing { colony } => {
+                    if !colony_terminator.insert(*colony) {
+                        return Err(SimError::Fatal("snapshot: duplicate terminator event"));
+                    }
+                    Some(*colony)
+                }
+                EventKind::ColonyStoreFull { colony, .. }
+                | EventKind::ColonyStoreEmpty { colony, .. } => {
+                    if !colony_store_events.insert(*colony) {
+                        return Err(SimError::Fatal("snapshot: duplicate colony store event"));
+                    }
+                    Some(*colony)
+                }
+                EventKind::ColonyInspection { colony } => {
+                    if !colony_inspections.insert(*colony) {
+                        return Err(SimError::Fatal("snapshot: duplicate colony inspection"));
+                    }
+                    Some(*colony)
+                }
+                EventKind::PowerLost { colony } => {
+                    if !colony_transitions.insert((*colony, 0u8)) {
+                        return Err(SimError::Fatal("snapshot: duplicate power-lost event"));
+                    }
+                    Some(*colony)
+                }
+                EventKind::PowerRestored { colony } => {
+                    if !colony_transitions.insert((*colony, 1u8)) {
+                        return Err(SimError::Fatal("snapshot: duplicate power-restored event"));
+                    }
+                    Some(*colony)
+                }
+                EventKind::LifeSupportDepleted { colony } => {
+                    if !colony_transitions.insert((*colony, 2u8)) {
+                        return Err(SimError::Fatal("snapshot: duplicate life-support event"));
+                    }
+                    Some(*colony)
+                }
+                _ => None,
+            };
+            if let Some(c) = colony_named
+                && !snapshot.colonies.contains_key(&c)
+            {
+                return Err(SimError::Fatal("snapshot: event names unknown colony"));
+            }
             // M7-C: at most one pending `SalaryDue`, sitting on the
             // absolute period grid — a crafted duplicate would
             // double-charge the roster.
@@ -1649,6 +2042,22 @@ impl World {
                 if e.tick % snapshot.economy_cfg.salary_period_ticks != 0 {
                     return Err(SimError::Fatal("snapshot: salary event off the grid"));
                 }
+            }
+            // M8-C: at most one pending `LifeSupportCheck`, on the
+            // absolute period grid; at most one pending depletion
+            // per vessel (the check's dedup rule).
+            if matches!(e.kind, EventKind::LifeSupportCheck) {
+                ls_check_count += 1;
+                if e.tick % snapshot.life_support_cfg.check_period_ticks != 0 {
+                    return Err(SimError::Fatal("snapshot: life-support check off the grid"));
+                }
+            }
+            if let EventKind::VesselLifeSupportDepleted { vessel: v } = &e.kind
+                && !vessel_ls_depleted.insert(*v)
+            {
+                return Err(SimError::Fatal(
+                    "snapshot: duplicate vessel life-support event",
+                ));
             }
             if let Some(v) = vessel
                 && !snapshot.vessels.contains_key(&v)
@@ -1665,6 +2074,13 @@ impl World {
             {
                 return Err(SimError::Fatal(
                     "snapshot: duplicate transfer complete event",
+                ));
+            }
+            if let EventKind::ConstructionComplete { build: b } = &e.kind
+                && build_events.insert(*b, e.tick).is_some()
+            {
+                return Err(SimError::Fatal(
+                    "snapshot: duplicate construction complete event",
                 ));
             }
             if let EventKind::ResearchDataExhausted { project: p } = &e.kind
@@ -1715,7 +2131,13 @@ impl World {
         if salary_due_count > 1 {
             return Err(SimError::Fatal("snapshot: duplicate salary events"));
         }
+        if ls_check_count > 1 {
+            return Err(SimError::Fatal(
+                "snapshot: duplicate life-support check events",
+            ));
+        }
         restore_transfer_state(&snapshot, &transfer_events)?;
+        restore_build_state(&snapshot, &build_events)?;
         restore_science_state(&snapshot, &research_exhausted, &research_complete)?;
         restore_economy_state(&snapshot)?;
         restore_contract_state(&snapshot, &deadline_events)?;
@@ -1728,6 +2150,57 @@ impl World {
                 return Err(SimError::Fatal(
                     "snapshot: non-finite family qualification record",
                 ));
+            }
+        }
+        // M8-A: colony-arena coherence — arena key, monotonic id
+        // counter, parallel module/fraction arrays, finite in-bound
+        // stores, and the roster↔crew-set pairing both directions.
+        for (id, c) in &snapshot.colonies {
+            if c.id != *id {
+                return Err(SimError::Fatal("snapshot: colony id != arena key"));
+            }
+            if c.module_fractions.len() != c.modules.len() {
+                return Err(SimError::Fatal(
+                    "snapshot: colony fractions/modules mismatch",
+                ));
+            }
+            for s in c.stores.values() {
+                if !(s.anchor_level.is_finite()
+                    && s.capacity.is_finite()
+                    && s.net_rate_per_s.is_finite()
+                    && s.anchor_level >= 0.0
+                    && s.anchor_level <= s.capacity + 1e-6
+                    && s.anchor_tick <= snapshot.clock_ticks)
+                {
+                    return Err(SimError::Fatal("snapshot: incoherent colony store"));
+                }
+            }
+            for crew in &c.crew {
+                let m = snapshot.economy.crew.get(crew);
+                if m.is_none_or(|m| m.location != CrewLocation::Colony(*id)) {
+                    return Err(SimError::Fatal("snapshot: colony crew not at colony"));
+                }
+            }
+        }
+        if snapshot.next_colony_id
+            < snapshot
+                .colonies
+                .keys()
+                .next_back()
+                .map_or(0, |id| id.0 + 1)
+        {
+            return Err(SimError::Fatal(
+                "snapshot: next_colony_id not ahead of live ids",
+            ));
+        }
+        for (cid, m) in &snapshot.economy.crew {
+            if let CrewLocation::Colony(id) = &m.location {
+                match snapshot.colonies.get(id) {
+                    Some(c) if c.crew.contains(cid) => {}
+                    _ => {
+                        return Err(SimError::Fatal("snapshot: roster colony ref incoherent"));
+                    }
+                }
             }
         }
         Ok(Self {
@@ -1765,10 +2238,20 @@ impl World {
             save_seed: snapshot.save_seed,
             contracts: snapshot.contracts,
             contract_cfg: snapshot.contract_cfg,
+            colonies: snapshot.colonies,
+            next_colony_id: snapshot.next_colony_id,
+            builds: snapshot.builds,
+            next_build_id: snapshot.next_build_id,
+            life_support_enabled: snapshot.life_support_enabled,
+            life_support_cfg: snapshot.life_support_cfg,
+            // Re-installed post-restore via `set_colony_env` (the
+            // `site_defs` precedent — §7.3 re-derived-on-load).
+            colony_env: BTreeMap::new(),
             // §7.3: the caller re-installs the data-derived config via
             // `set_experiments`/`set_tech_tree`/`set_sites` (the `orbits`
             // precedent — re-handed, not serialized).
             experiments: BTreeMap::new(),
+            recipes: BTreeMap::new(),
             tech_tree: None,
             site_defs: BTreeMap::new(),
             contract_defs: BTreeMap::new(),
@@ -1860,6 +2343,12 @@ impl World {
             save_seed: self.save_seed,
             contracts: self.contracts.clone(),
             contract_cfg: self.contract_cfg,
+            colonies: self.colonies.clone(),
+            next_colony_id: self.next_colony_id,
+            builds: self.builds.clone(),
+            next_build_id: self.next_build_id,
+            life_support_enabled: self.life_support_enabled,
+            life_support_cfg: self.life_support_cfg,
         })
     }
 
@@ -2004,6 +2493,15 @@ impl World {
         contracts::shadow_contracts(&self.contracts, &mut shadow.contracts);
     }
 
+    /// Lazy-shadow capture for the M8-B build arena (the
+    /// `shadow_transfers` precedent).
+    pub(crate) fn shadow_builds(&mut self, shadow: &mut TickShadow) {
+        if shadow.builds.is_none() {
+            shadow.builds = Some(self.builds.clone());
+            shadow.next_build_id = Some(self.next_build_id);
+        }
+    }
+
     /// §2.6.4's shared unlatch path: returns the vessel's welded body —
     /// re-materializing it from the stored `craft` and `SurfacePose`
     /// first when the vessel is latched (the pose reproduces exactly at
@@ -2046,10 +2544,14 @@ impl World {
                 body.rot = rot;
                 body.vel = vel;
                 body.ang_vel = ang_vel;
-                self.vessels
+                let v = self
+                    .vessels
                     .get_mut(&vessel)
-                    .ok_or(SimError::Fatal("unlatch: vessel vanished"))?
-                    .state = VesselState::InBubble(body);
+                    .ok_or(SimError::Fatal("unlatch: vessel vanished"))?;
+                v.state = VesselState::InBubble(body);
+                // §3.5's join is surface-latched only — an unlatching
+                // hull leaves the colony's inventory with the pose.
+                v.joined_colony = None;
             }
             Some(VesselState::InBubble(_)) => {}
         }
@@ -2127,6 +2629,9 @@ impl World {
         // M7-D: vessels that surface-latched inside this range —
         // their contract trigger runs once `self` is whole again.
         let mut latched_total: Vec<VesselId> = Vec::new();
+        // M8-C §3.5: debris impact points (environment frame) — the
+        // colony-radius damage check runs once `self` is whole again.
+        let mut impacts: Vec<csp_core::DVec3> = Vec::new();
         // M5: vessels whose node burn completed during this range —
         // processed once, after the tick loop, when `self` is whole
         // again and the rails conversion can be attempted.
@@ -2305,6 +2810,11 @@ impl World {
                         vid,
                         shadow,
                     );
+                    // M8-C §3.5: record the impact point for the
+                    // colony-radius damage check (post-loop).
+                    if let Some(pos) = vessels.get(&vid).and_then(|v| v.body().map(|b| b.pos)) {
+                        impacts.push(pos);
+                    }
                     vessels.remove(&vid);
                     physics.aero.remove(&vid);
                     dead_vessels.push(vid);
@@ -2316,6 +2826,7 @@ impl World {
                     physics,
                     &mut self.next_vessel_id,
                     caps,
+                    self.builds.len() as u64,
                     &mut self.science,
                     &self.science_cfg,
                     &mut self.economy,
@@ -2411,6 +2922,10 @@ impl World {
         for vid in dead_vessels {
             self.tracked_vessels.remove(&vid);
         }
+        // M8-C §3.5: every surface impact inside this range damages
+        // the colonies it fell inside — the `ColonyImpact` seam the
+        // M8-B note deferred (see `apply_surface_impacts`).
+        self.apply_surface_impacts(&impacts, shadow)?;
         // M7-D: the surface latch is a contract trigger — evaluate
         // the predicates once the vessel states have settled (the
         // batch's latched ids are this range's, dedup'd by BTreeSet
@@ -2820,6 +3335,10 @@ impl World {
             SimCommand::Undock { vessel, node } => self.apply_undock(*vessel, *node, shadow)?,
             SimCommand::TransferResource { .. }
             | SimCommand::TransferCrew { .. }
+            | SimCommand::TransferColonyResource { .. }
+            | SimCommand::TransferColonyCrew { .. }
+            | SimCommand::JoinColonyInventory { .. }
+            | SimCommand::LeaveColonyInventory { .. }
             | SimCommand::BoardCrew { .. } => self.apply_transfer_command(command, shadow)?,
             SimCommand::RunExperiment {
                 vessel,
@@ -2857,6 +3376,31 @@ impl World {
             } => self.apply_hire_crew(name, *kind, *salary_per_s, shadow)?,
             SimCommand::ContractReward { micros } => self.apply_contract_reward(*micros, shadow)?,
             SimCommand::AcceptContract { offer } => self.apply_accept_contract(*offer, shadow)?,
+            SimCommand::FoundColony { def } => self.apply_found_colony(def, shadow)?,
+            SimCommand::AbandonColony { colony } => self.apply_abandon_colony(*colony, shadow)?,
+            SimCommand::AssignCrewToColony { colony, crew } => {
+                self.apply_assign_crew(*colony, *crew, shadow)?
+            }
+            SimCommand::EvacuateColony { colony } => self.apply_evacuate_colony(*colony, shadow)?,
+            SimCommand::DamageColonyModule { colony, module } => {
+                self.apply_damage_module(*colony, *module, shadow)?
+            }
+            SimCommand::ScheduleColonyInspection { colony, tick } => {
+                self.apply_schedule_inspection(*colony, *tick, shadow)?
+            }
+            SimCommand::ManufactureCraft {
+                site,
+                craft,
+                build_resources,
+            } => self.apply_manufacture_craft(
+                site.clone(),
+                craft.clone(),
+                build_resources.clone(),
+                shadow,
+            )?,
+            SimCommand::SetLifeSupportEnabled { enabled } => {
+                self.apply_set_life_support(*enabled, shadow)?
+            }
         }
         Ok(())
     }
@@ -2881,6 +3425,25 @@ impl World {
                 crew,
             } => self.apply_transfer_crew(*from_vessel, *to_vessel, *crew, shadow),
             SimCommand::BoardCrew { vessel } => self.apply_board_crew(*vessel, shadow),
+            SimCommand::JoinColonyInventory { vessel, colony } => {
+                self.apply_join_colony(*vessel, *colony, shadow)
+            }
+            SimCommand::LeaveColonyInventory { vessel } => self.apply_leave_colony(*vessel, shadow),
+            SimCommand::TransferColonyResource {
+                vessel,
+                colony,
+                resource,
+                amount,
+                to_colony,
+            } => self.apply_transfer_colony_resource(
+                *vessel, *colony, resource, *amount, *to_colony, shadow,
+            ),
+            SimCommand::TransferColonyCrew {
+                vessel,
+                colony,
+                crew,
+                to_colony,
+            } => self.apply_transfer_colony_crew(*vessel, *colony, *crew, *to_colony, shadow),
             _ => unreachable!("apply_transfer_command: non-transfer variant"),
         }
     }
@@ -2969,7 +3532,7 @@ impl World {
         elements: &csp_data::KeplerElements,
         shadow: &mut TickShadow,
     ) -> Result<(), SimError> {
-        if self.vessels.len() as u64 >= self.caps.max_vessels {
+        if self.vessel_slots_in_use() >= self.caps.max_vessels {
             return Err(SimError::Recoverable("spawn: max_tracked_vessels reached"));
         }
         let orbit = OrbitState {
@@ -2990,6 +3553,7 @@ impl World {
             id,
             Vessel {
                 science: VesselScience::default(),
+                joined_colony: None,
                 id,
                 craft: None,
                 state: VesselState::OnRails(orbit),
@@ -3036,7 +3600,7 @@ impl World {
                 "physical spawn: world has no physics environment",
             ));
         };
-        if self.vessels.len() as u64 >= self.caps.max_vessels {
+        if self.vessel_slots_in_use() >= self.caps.max_vessels {
             return Err(SimError::Recoverable(
                 "physical spawn: max_tracked_vessels reached",
             ));
@@ -3144,6 +3708,7 @@ impl World {
             id,
             Vessel {
                 science: VesselScience::default(),
+                joined_colony: None,
                 id,
                 craft: Some(craft.clone()),
                 state: VesselState::InBubble(body),
@@ -3245,6 +3810,7 @@ impl World {
             .ok_or(SimError::Fatal("to-rails: vessel vanished"))?;
         let is_debris = vessel_mut.debris_since.is_some();
         vessel_mut.maneuver = None;
+        vessel_mut.joined_colony = None;
         vessel_mut.state = VesselState::OnRails(OrbitState {
             parent: dominant,
             elements,
@@ -4106,7 +4672,7 @@ impl World {
         if !v.seams.iter().any(|s| s.seam_node == node) {
             return Err(SimError::Recoverable("undock: no such seam"));
         }
-        if self.vessels.len() as u64 >= self.caps.max_vessels {
+        if self.vessel_slots_in_use() >= self.caps.max_vessels {
             return Err(SimError::Recoverable("undock: max_tracked_vessels reached"));
         }
         let Some(parent_body) = v.body().cloned() else {
@@ -4273,6 +4839,9 @@ impl World {
                 tank_contents: frag_tanks,
                 crew: frag_crew,
                 science: frag_science,
+                // The split-off fragment starts unjoined — a fresh
+                // `JoinColonyInventory` opts it in explicitly.
+                joined_colony: None,
             },
         );
         // Scrub the finalized projects' pending event pair (they name
@@ -4406,6 +4975,20 @@ impl World {
         for subsystem in SUBSYSTEM_ORDER {
             if subsystem == Subsystem::Orbits {
                 self.advance_orbits(t_next, degraded)?;
+            }
+            // M8-A §3.5.1: the colony slot is publish-only — the
+            // network's deadlines are re-published at every boundary
+            // recompute; the slot repairs a missing one (a degraded
+            // firing's drop) so the §2.6.5 publish contract holds.
+            if subsystem == Subsystem::Colonies {
+                self.publish_colonies(shadow)?;
+            }
+            // M8-C §3.5: the life-support slot is publish-only — the
+            // `publish_economy` precedent: ensure one `LifeSupportCheck`
+            // sits on the absolute grid while crewed vessels exist
+            // and the subsystem is enabled.
+            if subsystem == Subsystem::LifeSupport {
+                self.publish_life_support(shadow)?;
             }
             // M7-C §3.5: the program-economy slot. Its interval work
             // is publish-only — ensure one `SalaryDue` sits on the
@@ -4564,9 +5147,27 @@ impl World {
                         // M7-C: economy events name no vessel — they
                         // survive removal like the transfer/research
                         // events (the `TransferComplete` precedent).
+                        | EventKind::ConstructionComplete { .. }
                         | EventKind::SalaryDue
                         | EventKind::Insolvent { .. }
-                        | EventKind::ContractDeadline { .. } => None,
+                        | EventKind::ContractDeadline { .. }
+                        // M8-A: colony events name a colony, never a
+                        // vessel — no `SoiRescan` re-publish; the
+                        // `Colonies` slot's publish repairs a missing
+                        // boundary instead.
+                        | EventKind::TerminatorCrossing { .. }
+                        | EventKind::ColonyStoreFull { .. }
+                        | EventKind::ColonyStoreEmpty { .. }
+                        | EventKind::ColonyInspection { .. }
+                        | EventKind::PowerLost { .. }
+                        | EventKind::PowerRestored { .. }
+                        | EventKind::LifeSupportDepleted { .. }
+                        // M8-C: neither life-support kind names a
+                        // rails vessel — no rescan to republish; the
+                        // `LifeSupport` slot's publish repairs the
+                        // check cadence.
+                        | EventKind::LifeSupportCheck
+                        | EventKind::VesselLifeSupportDepleted { .. } => None,
                     };
                     if let Some(vessel) = vessel {
                         self.schedule_event(
@@ -4643,6 +5244,11 @@ impl World {
             EventKind::TransferComplete { transfer } => {
                 self.fire_transfer_complete(*transfer, shadow)
             }
+            // M8-B: the build order's delivery — the ordered craft
+            // becomes a surface-latched vessel at its site.
+            EventKind::ConstructionComplete { build } => {
+                self.fire_construction_complete(*build, shadow)
+            }
             // M7-A: the lab's escrowed data crossed the `data_epsilon`
             // floor — bank the conversion, consume the record.
             EventKind::ResearchDataExhausted { project } => {
@@ -4666,6 +5272,24 @@ impl World {
             // funds clamp.
             EventKind::ContractDeadline { contract } => {
                 self.fire_contract_deadline(*contract, event.tick, shadow)
+            }
+            // M8-A §3.5.1: every colony event — boundaries funnel
+            // into the recompute, transitions apply their state
+            // change then re-solve (see `colonies`' module doc).
+            EventKind::TerminatorCrossing { .. }
+            | EventKind::ColonyStoreFull { .. }
+            | EventKind::ColonyStoreEmpty { .. }
+            | EventKind::ColonyInspection { .. }
+            | EventKind::PowerLost { .. }
+            | EventKind::PowerRestored { .. }
+            | EventKind::LifeSupportDepleted { .. } => {
+                self.fire_colony_event(&event.kind, event.tick, shadow)
+            }
+            // M8-C: the vessel-side life-support pair — the periodic
+            // debit and the crew-loss transition.
+            EventKind::LifeSupportCheck => self.fire_life_support_check(event.tick, shadow),
+            EventKind::VesselLifeSupportDepleted { vessel } => {
+                self.fire_vessel_ls_depleted(*vessel, shadow)
             }
         }
     }
@@ -4994,6 +5618,7 @@ impl World {
         h.f64(self.economy_cfg.science_funds_per_point);
         h.f64(self.economy_cfg.recovery_efficiency);
         h.f64(self.economy_cfg.abandon_recovery);
+        h.f64(self.economy_cfg.manufacture_rate_kg_per_s);
         economy::hash_economy(&mut h, &self.economy);
         // M7-D: the §2.7 save seed (the offer draw input), the
         // contract tunables, and the §3.6 contract book — offers,
@@ -5002,6 +5627,18 @@ impl World {
         h.u64(self.save_seed);
         h.u32(self.contract_cfg.board_size);
         contracts::hash_contracts(&mut h, &self.contracts);
+        // M8-A: the §3.5.1 colony book — the arena counter, then the
+        // arena: sites/poses, states, modules, epoch-anchored linear
+        // stores, held solve outputs (crew, fractions, T_eq).
+        h.u64(self.next_colony_id);
+        colonies::hash_colonies(&mut h, &self.colonies);
+        // M8-B: the build-order arena — counter then arena (the
+        // `transfers` precedent: hashed + serialized, event-paired).
+        h.u64(self.next_build_id);
+        manufacture::hash_builds(&mut h, &self.builds);
+        // M8-C: the per-save life-support flag + tunables (the
+        // `economy_cfg` precedent — config that changes evolution).
+        life_support::hash_life_support(&mut h, self.life_support_enabled, &self.life_support_cfg);
         h.finish()
     }
 }
@@ -5075,6 +5712,7 @@ fn event_names_vessel(kind: &EventKind, vessel: &VesselId) -> bool {
         | EventKind::ManeuverNodeStart { vessel: v } => v == vessel,
         EventKind::PlayerAlarm { .. }
         | EventKind::TransferWindow { .. }
+        | EventKind::ConstructionComplete { .. }
         // `TransferComplete` names a *transfer*, not a vessel — it
         // survives vessel removal by design (the completion's
         // fallback rule resolves the dead endpoint). M7-A's research
@@ -5089,7 +5727,21 @@ fn event_names_vessel(kind: &EventKind, vessel: &VesselId) -> bool {
         | EventKind::Insolvent { .. }
         // M7-D: the deadline names a contract — it survives vessel
         // removal (contracts bind no vessel in v1).
-        | EventKind::ContractDeadline { .. } => false,
+        | EventKind::ContractDeadline { .. }
+        // M8-A: colony events name a colony, never a vessel.
+        | EventKind::TerminatorCrossing { .. }
+        | EventKind::ColonyStoreFull { .. }
+        | EventKind::ColonyStoreEmpty { .. }
+        | EventKind::ColonyInspection { .. }
+        | EventKind::PowerLost { .. }
+        | EventKind::PowerRestored { .. }
+        | EventKind::LifeSupportDepleted { .. }
+        // M8-C: the check names nothing; the depletion names a vessel
+        // but survives its removal like `TransferComplete` (a stale
+        // firing is a no-op) — deliberately NOT scrubbed, so the
+        // in-bubble removal invariant stays provable.
+        | EventKind::LifeSupportCheck
+        | EventKind::VesselLifeSupportDepleted { .. } => false,
     }
 }
 
@@ -5113,8 +5765,19 @@ fn restore_transfer_state(
         if t.id != *id {
             return Err(SimError::Fatal("snapshot: transfer id != arena key"));
         }
-        if t.from_vessel.0 >= snapshot.next_vessel_id || t.to_vessel.0 >= snapshot.next_vessel_id {
-            return Err(SimError::Fatal("snapshot: transfer names unissued vessel"));
+        for end in [t.from, t.to] {
+            match end {
+                transfers::TransferEnd::Vessel(v) => {
+                    if v.0 >= snapshot.next_vessel_id {
+                        return Err(SimError::Fatal("snapshot: transfer names unissued vessel"));
+                    }
+                }
+                transfers::TransferEnd::Colony(c) => {
+                    if !snapshot.colonies.contains_key(&c) {
+                        return Err(SimError::Fatal("snapshot: transfer names unknown colony"));
+                    }
+                }
+            }
         }
         match &t.cargo {
             transfers::TransferCargo::Resource { amount, .. } => {
@@ -5150,6 +5813,56 @@ fn restore_transfer_state(
             if c.id.0 >= snapshot.next_crew_id || !crew_seen.insert(c.id) {
                 return Err(SimError::Fatal("snapshot: crew id not unique / issued"));
             }
+        }
+    }
+    Ok(())
+}
+
+/// M8-B coherence for [`World::restore`] — the build-order arena:
+/// each `ActiveBuild` sits below `next_build_id`, its `site` names a
+/// live site-state row, and it pairs with exactly one pending
+/// `ConstructionComplete` at `complete_tick` (the `transfers`
+/// precedent, both directions). The vessel side: a `joined_colony`
+/// record must name a live colony AND sit on a `SurfaceLatched`
+/// vessel — the join is surface-latched only by construction.
+fn restore_build_state(
+    snapshot: &WorldSnapshot,
+    build_events: &BTreeMap<manufacture::BuildId, u64>,
+) -> Result<(), SimError> {
+    for (id, b) in &snapshot.builds {
+        if id.0 >= snapshot.next_build_id {
+            return Err(SimError::Fatal("snapshot: build id not below next"));
+        }
+        if b.id != *id {
+            return Err(SimError::Fatal("snapshot: build id != arena key"));
+        }
+        if !snapshot.economy.sites.contains_key(&b.site) {
+            return Err(SimError::Fatal("snapshot: build names unknown site"));
+        }
+        match build_events.get(id) {
+            Some(&tick) if tick == b.complete_tick => {}
+            _ => {
+                return Err(SimError::Fatal(
+                    "snapshot: build / construction event mismatch",
+                ));
+            }
+        }
+    }
+    for id in build_events.keys() {
+        if !snapshot.builds.contains_key(id) {
+            return Err(SimError::Fatal(
+                "snapshot: construction event names unknown build",
+            ));
+        }
+    }
+    for v in snapshot.vessels.values() {
+        if let Some(c) = v.joined_colony
+            && (!snapshot.colonies.contains_key(&c)
+                || !matches!(v.state, VesselState::SurfaceLatched(_)))
+        {
+            return Err(SimError::Fatal(
+                "snapshot: vessel joined to a missing colony or not latched",
+            ));
         }
     }
     Ok(())
@@ -5291,11 +6004,16 @@ fn restore_economy_state(snapshot: &WorldSnapshot) -> Result<(), SimError> {
                     ));
                 }
             }
-            economy::CrewLocation::Facility(_) | economy::CrewLocation::Colony(_) => {
+            // M8-A built the colony arena — `Colony` locations resolve
+            // against it below (the roster↔crew-set pairing check),
+            // the `Vessel` arm's mirror. `Facility` still names no
+            // built arena.
+            economy::CrewLocation::Facility(_) => {
                 return Err(SimError::Fatal(
                     "snapshot: crew location names an unbuilt arena",
                 ));
             }
+            economy::CrewLocation::Colony(_) => {}
             economy::CrewLocation::Unassigned => {}
         }
     }
@@ -5361,6 +6079,7 @@ fn restore_contract_state(
                 csp_data::ContractRegime::Landed { .. } => true,
             },
             csp_data::ContractParams::Rescue { .. } => true,
+            csp_data::ContractParams::ColonyResupply { amount, .. } => ok(*amount) && *amount > 0.0,
         }
     };
     for (idx, o) in &c.offers {
@@ -5392,6 +6111,15 @@ fn restore_contract_state(
         return Err(SimError::Fatal(
             "snapshot: deadline event names no active contract",
         ));
+    }
+    // M8-C: the resupply fact's cumulative quantities are bounded
+    // accounting — a crafted NaN or negative total would lie about
+    // delivered history (the `restore_economy_state` site-inventory
+    // precedent).
+    for u in c.facts.colony_deliveries.values() {
+        if !(u.is_finite() && *u >= 0.0) {
+            return Err(SimError::Fatal("snapshot: non-finite colony delivery fact"));
+        }
     }
     Ok(())
 }
@@ -5687,7 +6415,7 @@ fn restore_vessel_state(vessel: &mut Vessel, has_physics: bool) -> Result<(), Si
 /// The weld's mass properties are a pure function of this, so hashing
 /// it covers them honestly (they are derived, never themselves state).
 #[allow(clippy::too_many_lines)] // the field walk grew with M7-A
-fn hash_craft(h: &mut StateHasher, craft: &CraftDef) {
+pub(crate) fn hash_craft(h: &mut StateHasher, craft: &CraftDef) {
     h.u64(craft.graph.root.0);
     h.btree_map(
         &craft.graph.nodes,
@@ -5932,7 +6660,9 @@ fn transition_latched(
 /// graph-hash staleness check rebuilds it), and start
 /// `aero_mask`-active with throttle zeroed — debris has no crew.
 /// Beyond `caps.max_vessels` a fragment is dropped (§2.9's cap;
-/// documented, deterministic).
+/// documented, deterministic) — and in-flight build orders count
+/// against that cap (`pending_builds`), since each has already
+/// reserved the vessel slot its delivery needs.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
 fn apply_breakup(
@@ -5940,6 +6670,11 @@ fn apply_breakup(
     physics: &mut Physics,
     next_vessel_id: &mut u64,
     caps: VesselCaps,
+    // In-flight build orders — each has already reserved the vessel
+    // slot its `ConstructionComplete` delivery needs, so fragments
+    // must count them against `caps.max_vessels` exactly like the
+    // spawn/undock gates do (`World::vessel_slots_in_use`).
+    pending_builds: u64,
     science: &mut ScienceState,
     science_cfg: &ScienceConfig,
     economy: &mut EconomyState,
@@ -6084,7 +6819,7 @@ fn apply_breakup(
     let mut frag_vid: Vec<(VesselId, std::collections::BTreeSet<csp_phys::PartNodeId>)> =
         Vec::new();
     for &d in &frag_roots {
-        if vessels.len() as u64 >= caps.max_vessels {
+        if vessels.len() as u64 + pending_builds >= caps.max_vessels {
             break; // §2.9 cap — fragments beyond it are discarded
         }
         let members = &members_of[&d];
@@ -6164,6 +6899,10 @@ fn apply_breakup(
                         .cloned()
                         .collect(),
                 },
+                // A splitting fragment leaves the colony opt-in
+                // with the retained hull — it re-joins explicitly
+                // if it lands beside the colony.
+                joined_colony: None,
             },
         );
         frag_vid.push((id, frag_nodes.clone()));
@@ -6383,6 +7122,11 @@ fn hash_vessel(h: &mut StateHasher, vessel: &Vessel) {
     // M7-A: the keyed data pool + spent marks — serialized sim state
     // the science applies read and write.
     research::hash_vessel_science(h, &vessel.science);
+    // M8-B: the §3.5 colony-inventory opt-in — hashed sim state (the
+    // gate vessel↔colony transfers read).
+    h.opt(&vessel.joined_colony, |h, c| {
+        h.u64(c.0);
+    });
     // M4b: the authoritative per-part temperature record — serialized
     // state, hashed like the body's kinematics.
     h.btree_map(
@@ -6753,6 +7497,12 @@ mod tests {
                 save_seed: 0,
                 contracts: ContractState::default(),
                 contract_cfg: contracts::default_config(),
+                colonies: BTreeMap::new(),
+                next_colony_id: 0,
+                builds: BTreeMap::new(),
+                next_build_id: 0,
+                life_support_enabled: true,
+                life_support_cfg: life_support::default_config(),
             },
         )
         .unwrap();
@@ -7730,6 +8480,7 @@ mod tests {
             VesselId(3),
             Vessel {
                 science: VesselScience::default(),
+                joined_colony: None,
                 id: VesselId(3),
                 craft: None,
                 aero_mask: csp_phys::ConfigMask::ALL,
@@ -9639,6 +10390,7 @@ mod tests {
             VesselId(0),
             Vessel {
                 science: VesselScience::default(),
+                joined_colony: None,
                 id: VesselId(0),
                 craft: Some(craft.clone()),
                 state: VesselState::InBubble(body),
@@ -9682,6 +10434,11 @@ mod tests {
             tech: None,
             economy: None,
             contracts: None,
+            builds: None,
+            next_build_id: None,
+            colonies: None,
+            next_colony_id: None,
+            life_support_enabled: None,
         };
         apply_breakup(
             &mut vessels,
@@ -9691,6 +10448,7 @@ mod tests {
                 max_vessels: 16,
                 max_debris: 16,
             },
+            0,
             &mut science,
             &science_cfg,
             &mut EconomyState::default(),
@@ -11647,6 +12405,7 @@ mod tests {
                 VesselId(id),
                 Vessel {
                     science: VesselScience::default(),
+                    joined_colony: None,
                     id: VesselId(id),
                     craft: Some(craft),
                     state: VesselState::InBubble(body),
@@ -11714,6 +12473,11 @@ mod tests {
             tech: None,
             economy: None,
             contracts: None,
+            builds: None,
+            next_build_id: None,
+            colonies: None,
+            next_colony_id: None,
+            life_support_enabled: None,
         };
         assert!(
             joints::apply_latch(
@@ -11771,6 +12535,7 @@ mod tests {
         body.vel = vel;
         Vessel {
             science: VesselScience::default(),
+            joined_colony: None,
             id: VesselId(id),
             craft: Some(craft),
             state: VesselState::InBubble(body),
@@ -12691,6 +13456,7 @@ mod tests {
     fn latched_pair_links_within_radius() {
         let mk = |id, lon| Vessel {
             science: VesselScience::default(),
+            joined_colony: None,
             id: VesselId(id),
             craft: None,
             state: VesselState::SurfaceLatched(SurfacePose {

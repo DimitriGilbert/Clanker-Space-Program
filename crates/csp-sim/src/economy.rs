@@ -127,6 +127,10 @@ pub const DEFAULT_SCIENCE_FUNDS_PER_POINT: f64 = 10.0;
 pub const DEFAULT_RECOVERY_EFFICIENCY: f64 = 0.9;
 /// `balance.ron: abandon_recovery` mirror — §3.5/PLAN:1274's 0.25.
 pub const DEFAULT_ABANDON_RECOVERY: f64 = 0.25;
+/// `balance.ron: manufacture_rate_kg_per_s` mirror — M8-B's §3.5
+/// build-order throughput: a craft takes
+/// `mass_kg / rate` sim-seconds at its launch site.
+pub const DEFAULT_MANUFACTURE_KG_PER_S: f64 = 50.0;
 
 /// Sim-day in seconds (86400) — the salary cadence conversion.
 const DAY_S: f64 = 86_400.0;
@@ -153,6 +157,11 @@ pub struct EconomyConfig {
     pub recovery_efficiency: f64,
     /// The site-less recovery share (PLAN:1274's 0.25).
     pub abandon_recovery: f64,
+    /// M8-B: the launch-site build-order throughput — a craft's
+    /// construction takes `mass_kg / manufacture_rate_kg_per_s` sim
+    /// seconds before `ConstructionComplete` delivers it. Hashed like
+    /// every tunable: it moves the event grid.
+    pub manufacture_rate_kg_per_s: f64,
 }
 
 /// The `DEFAULT_*` config — `World::new()`'s no-data fallback.
@@ -164,6 +173,7 @@ pub fn default_config() -> EconomyConfig {
         science_funds_per_point: DEFAULT_SCIENCE_FUNDS_PER_POINT,
         recovery_efficiency: DEFAULT_RECOVERY_EFFICIENCY,
         abandon_recovery: DEFAULT_ABANDON_RECOVERY,
+        manufacture_rate_kg_per_s: DEFAULT_MANUFACTURE_KG_PER_S,
     }
 }
 
@@ -177,6 +187,7 @@ impl EconomyConfig {
             science_funds_per_point: b.science_funds_per_point,
             recovery_efficiency: b.recovery_efficiency,
             abandon_recovery: b.abandon_recovery,
+            manufacture_rate_kg_per_s: b.manufacture_rate_kg_per_s,
         }
     }
 
@@ -191,6 +202,8 @@ impl EconomyConfig {
             && (0.0..=1.0).contains(&self.recovery_efficiency)
             && self.abandon_recovery.is_finite()
             && (0.0..=1.0).contains(&self.abandon_recovery)
+            && self.manufacture_rate_kg_per_s.is_finite()
+            && self.manufacture_rate_kg_per_s > 0.0
     }
 }
 
@@ -246,9 +259,12 @@ impl StableDiscriminant for CrewStatus {
     }
 }
 
-/// §3.5's crew location — discriminants append-only. `Facility` and
-/// `Colony` are forward-declared for the M8 arenas; no producer can
-/// write them yet (restore rejects them — see the restore gate).
+/// §3.5's crew location — discriminants append-only. `Colony` is live:
+/// M8-A's `AssignCrewToColony`/`EvacuateColony` write it (the roster↔
+/// crew-set restore pairing resolves it against the colony arena), and
+/// M8-B's vessel↔colony crew transfer lands members here. `Facility`
+/// stays forward-declared — no producer can write it yet (restore
+/// rejects it — see the restore gate).
 #[repr(u16)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CrewLocation {
@@ -982,6 +998,7 @@ mod tests {
                 tank_contents: tanks,
                 crew: Vec::new(),
                 science: VesselScience::default(),
+                joined_colony: None,
             },
         );
         id
@@ -999,6 +1016,7 @@ mod tests {
                 longitude_rad: 0.0,
                 altitude_m: 0.0,
                 launch,
+                resource_yields: vec![],
             },
         )
     }

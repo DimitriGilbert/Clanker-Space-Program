@@ -48,6 +48,7 @@ pub const DATA_HASH_VERSION: u32 = 1;
 
 pub mod balance;
 pub mod biome;
+pub mod colony;
 pub mod contract;
 pub mod datahash;
 pub mod experiment;
@@ -55,6 +56,7 @@ pub mod ids;
 pub mod load;
 pub mod loc;
 pub mod part;
+pub mod recipe;
 pub mod resource;
 pub mod site;
 pub mod system;
@@ -65,6 +67,7 @@ pub use balance::{BALANCE_SCHEMA_VERSION, BalanceDef};
 pub use biome::{
     BiomeLegend, BiomeLegendEntry, IndexedPng, PngInfo, decode_indexed_png, inspect_indexed_png,
 };
+pub use colony::{COLONY_SCHEMA_VERSION, ColonyDef, ColonyFile, ColonyModuleDef, ColonyStoreInit};
 pub use contract::{
     CONTRACT_SCHEMA_VERSION, ContractGenerator, ContractKind, ContractParamSpace, ContractParams,
     ContractPrereq, ContractRegime, ContractRewards, ContractTemplate, ModuleReq, RegimeSpace,
@@ -77,9 +80,9 @@ pub use ids::{
 };
 pub use load::{
     LoadError, LoadedBiomeMap, LoadedBody, LoadedContract, LoadedContracts, LoadedExperiment,
-    LoadedExperiments, LoadedPart, LoadedParts, LoadedSystem, LoadedTechFile, LoadedTechTree,
-    load_balance, load_contracts, load_experiments, load_parts, load_resources, load_sites,
-    load_system, load_techtree,
+    LoadedExperiments, LoadedPart, LoadedParts, LoadedRecipe, LoadedRecipes, LoadedSystem,
+    LoadedTechFile, LoadedTechTree, load_balance, load_colonies, load_contracts, load_experiments,
+    load_parts, load_recipes, load_resources, load_sites, load_system, load_techtree,
 };
 pub use loc::LocFile;
 pub use part::{
@@ -88,8 +91,9 @@ pub use part::{
     ScaleExponents, ScaleRule, Situation, SituationMask, StatPath, StressKind, StressRule,
     StructuralDef, ThermalDef, ThrottleRange,
 };
+pub use recipe::{RECIPE_SCHEMA_VERSION, RecipeDef};
 pub use resource::{RESOURCE_SCHEMA_VERSION, ResourceDef, ResourceFile};
-pub use site::{SITE_SCHEMA_VERSION, SiteDef, SiteFile};
+pub use site::{SITE_SCHEMA_SUPPORTED, SITE_SCHEMA_VERSION, SiteDef, SiteFile};
 pub use system::{
     AtmosphereDef, BiomeMapRef, BodyDef, ConcentrationMapRef, KeplerElements, OceanDef,
     SCHEMA_VERSION, SystemDef, TemperatureKnot, TerrainDef,
@@ -99,8 +103,8 @@ pub use techtree::{
     UpgradeLevel, UpgradeTrack,
 };
 pub use validate::{
-    PERIOD_REL_TOL, ValidationError, validate_contract_loc_keys, validate_contracts,
-    validate_experiments, validate_loc_keys, validate_part_loc_keys, validate_parts,
-    validate_resources, validate_sites, validate_system, validate_techtree,
-    validate_techtree_loc_keys,
+    PERIOD_REL_TOL, ValidationError, validate_colonies, validate_contract_loc_keys,
+    validate_contracts, validate_experiments, validate_loc_keys, validate_part_loc_keys,
+    validate_parts, validate_recipes, validate_resources, validate_sites, validate_system,
+    validate_techtree, validate_techtree_loc_keys,
 };

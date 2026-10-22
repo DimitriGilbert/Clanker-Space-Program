@@ -1,0 +1,37 @@
+// The home system's authored starting colonies (PLAN §3.5.1) — one
+// Rask mining outpost exercising the M8-B module set: solar + battery
+// power, an ore drill on the site's 0.9 ore yield, a smelter running
+// recipe.smelt_ore, and ore/metal stores. Its EC math: solar at
+// Rask's authored insolation covers the drill + smelter (Rask is
+// tidally locked — no terminator crossings, a permanently daylit
+// site; the battery rides the transient, not a night).
+(
+    schema_version: 2,
+    colonies: [
+        (
+            site: "rask-mines",
+            display_name: "colony.rask-mines",
+            modules: [
+                Solar( area_m2: 40.0, efficiency: 0.20 ),
+                Battery( capacity: 5000.0 ),
+                Drill(
+                    resource: "ore",
+                    base_rate_per_s: 0.5,
+                    min_concentration: 0.5,
+                    power_ec_per_s: 2.0,
+                ),
+                Converter(
+                    recipe: "recipe.smelt_ore",
+                    priority: 5,
+                    power_ec_per_s: 1.5,
+                ),
+                Store( resource: "ore", capacity: 100.0 ),
+                Store( resource: "metal", capacity: 60.0 ),
+            ],
+            stores: [
+                (resource: "electric_charge", level: 3000.0),
+                (resource: "ore", level: 10.0),
+            ],
+        ),
+    ],
+)

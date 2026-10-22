@@ -20,12 +20,14 @@ use std::path::{Path, PathBuf};
 
 use crate::balance::{BALANCE_SCHEMA_VERSION, BalanceDef};
 use crate::biome::BiomeLegend;
+use crate::colony::{COLONY_SCHEMA_VERSION, ColonyFile};
 use crate::contract::{CONTRACT_SCHEMA_VERSION, ContractTemplate};
 use crate::experiment::{EXPERIMENT_SCHEMA_VERSION, ExperimentDef};
 use crate::ids::ExperimentId;
 use crate::part::{PART_SCHEMA_VERSION, PartDef};
+use crate::recipe::{RECIPE_SCHEMA_VERSION, RecipeDef};
 use crate::resource::{RESOURCE_SCHEMA_VERSION, ResourceFile};
-use crate::site::{SITE_SCHEMA_VERSION, SiteFile};
+use crate::site::{SITE_SCHEMA_SUPPORTED, SITE_SCHEMA_VERSION, SiteFile};
 use crate::system::{BodyDef, SCHEMA_VERSION, SystemDef};
 use crate::techtree::{TECHTREE_SCHEMA_VERSION, TechTree, TechTreeDef};
 
@@ -236,8 +238,91 @@ pub fn load_sites(path: &Path) -> Result<SiteFile, LoadError> {
         });
     }
     let sites: SiteFile = read_ron(path)?;
-    check_version(path, sites.schema_version, SITE_SCHEMA_VERSION)?;
+    // §3.1's "current and previous with explicit defaults": v1 files
+    // lack `resource_yields`, which serde reads as the empty list.
+    if !SITE_SCHEMA_SUPPORTED.contains(&sites.schema_version) {
+        return Err(LoadError::UnsupportedSchemaVersion {
+            path: path.to_path_buf(),
+            found: sites.schema_version,
+            expected: *SITE_SCHEMA_SUPPORTED.last().unwrap_or(&1),
+        });
+    }
     Ok(sites)
+}
+
+/// Load `data/systems/<sys>/colonies.ron` — the §3.5.1 authored-colony
+/// set. A MISSING file reads as an empty set (the `load_sites`
+/// convention): a system without authored colonies starts with none
+/// and `FoundColony` commands found them at runtime. File-shape
+/// checks only; the rate/resource rules live in
+/// [`crate::validate::validate_colonies`].
+pub fn load_colonies(path: &Path) -> Result<ColonyFile, LoadError> {
+    if !path.exists() {
+        return Ok(ColonyFile {
+            schema_version: COLONY_SCHEMA_VERSION,
+            colonies: Vec::new(),
+        });
+    }
+    let colonies: ColonyFile = read_ron(path)?;
+    check_version(path, colonies.schema_version, COLONY_SCHEMA_VERSION)?;
+    Ok(colonies)
+}
+
+/// One loaded recipe def plus its source path — the `id` ↔ stem check
+/// needs the file name, like [`LoadedExperiment`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoadedRecipe {
+    /// Parsed def.
+    pub def: RecipeDef,
+    /// Path relative to the `data/recipes/` root the loader was handed.
+    pub path: PathBuf,
+}
+
+/// Everything `load_recipes` read under a `data/recipes/` directory,
+/// ascending relative-path order — the deterministic order
+/// `data_set_hash` hashes them in.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoadedRecipes {
+    /// Parsed recipe defs with their source paths.
+    pub recipes: Vec<LoadedRecipe>,
+}
+
+impl LoadedRecipes {
+    /// The defs keyed by [`crate::ids::RecipeId`] — the table the sim
+    /// installs as construction config and the validator resolves
+    /// converter refs against. First def wins on a duplicate id; the
+    /// validator flags the duplicate loudly.
+    pub fn by_id(&self) -> std::collections::BTreeMap<crate::ids::RecipeId, &RecipeDef> {
+        let mut out = std::collections::BTreeMap::new();
+        for r in &self.recipes {
+            out.entry(r.def.id.clone()).or_insert(&r.def);
+        }
+        out
+    }
+}
+
+/// Load every recipe def under `data/recipes/` — `<id>.ron` files,
+/// optionally grouped in subdirectories. File-shape checks only; the
+/// resource refs and rate rules live in
+/// [`crate::validate::validate_recipes`]. A missing directory reads
+/// as an empty set — a world without recipes simply rejects
+/// `FoundColony` defs carrying `Converter` modules.
+pub fn load_recipes(dir: &Path) -> Result<LoadedRecipes, LoadError> {
+    if !dir.exists() {
+        return Ok(LoadedRecipes {
+            recipes: Vec::new(),
+        });
+    }
+    let mut files = Vec::new();
+    collect_ron_files(dir, &mut files)?;
+    let mut recipes = Vec::with_capacity(files.len());
+    for path in files {
+        let def: RecipeDef = read_ron(&path)?;
+        check_version(&path, def.schema_version, RECIPE_SCHEMA_VERSION)?;
+        let rel = path.strip_prefix(dir).unwrap_or(&path).to_path_buf();
+        recipes.push(LoadedRecipe { def, path: rel });
+    }
+    Ok(LoadedRecipes { recipes })
 }
 
 /// One loaded experiment def plus its source path (the `id` ↔ stem

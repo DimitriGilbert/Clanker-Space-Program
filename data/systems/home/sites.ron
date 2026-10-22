@@ -2,11 +2,15 @@
 // launch pads and recovery locations. `launch: true` marks the body's
 // launch site (recovery_efficiency 1.0); every other site recovers at
 // balance.ron's recovery_efficiency (0.9).
+//
+// v2 (M8-B): `resource_yields` — per-site mineable concentrations a
+// colony Drill extracts against. Terrin's pads are modest; Rask's
+// mining site is the rich pull into the colony game.
 (
-    schema_version: 1,
+    schema_version: 2,
     sites: [
         (
-            schema_version: 1,
+            schema_version: 2,
             id: "terrin-launch",
             display_name: "site.terrin-launch",
             body: "terrin",
@@ -14,9 +18,13 @@
             longitude_rad: 0.0,
             altitude_m: 0.0,
             launch: true,
+            resource_yields: [
+                ("ore", 0.35),
+                ("water", 0.15),
+            ],
         ),
         (
-            schema_version: 1,
+            schema_version: 2,
             id: "terrin-downrange",
             display_name: "site.terrin-downrange",
             body: "terrin",
@@ -24,6 +32,23 @@
             longitude_rad: 0.7853981633974483,
             altitude_m: 0.0,
             launch: false,
+            resource_yields: [
+                ("ore", 0.20),
+            ],
+        ),
+        (
+            schema_version: 2,
+            id: "rask-mines",
+            display_name: "site.rask-mines",
+            body: "rask",
+            latitude_rad: 0.0,
+            longitude_rad: 1.5707963267948966,
+            altitude_m: 0.0,
+            launch: false,
+            resource_yields: [
+                ("ore", 0.9),
+                ("water", 0.3),
+            ],
         ),
     ],
 )

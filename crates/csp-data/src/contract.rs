@@ -26,11 +26,15 @@
 //!   surface-latch triggers).
 //! - [`ContractKind::Rescue`] — a vessel latched at a body is
 //!   recovered (checked on `RecoverVessel`).
+//! - [`ContractKind::ColonyResupply`] — M8-C's base resupply: resource
+//!   units delivered into the stores of colonies on a body (checked on
+//!   `TransferComplete` landings — the vessel↔colony transfer is the
+//!   only producer of the delivery fact).
 //!
-//! Crew transport, base resupply, and tourist flight are deferred:
-//! their predicates bind facilities (M8) and crew itineraries in ways
-//! v1 has no honest sim-state reading for. Their `contract_types`
-//! unlock markers in the tech tree stay opaque until they land.
+//! Crew transport and tourist flight are deferred: their predicates
+//! bind facilities and crew itineraries in ways v1 has no honest
+//! sim-state reading for. Their `contract_types` unlock markers in the
+//! tech tree stay opaque until they land.
 //!
 //! # Prerequisites — facts, not reputation
 //!
@@ -43,7 +47,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{BodyId, ContractTypeId, ExperimentId, LocKey, TechNodeId};
+use crate::ids::{BodyId, ContractTypeId, ExperimentId, LocKey, ResourceId, TechNodeId};
 
 /// The `schema_version` this loader understands for
 /// `data/contracts/*.ron` — its own namespace (§3.1 first-field
@@ -66,6 +70,9 @@ pub enum ContractKind {
     PartTest = 2,
     /// A vessel surface-latched at a body is recovered — the rescue.
     Rescue = 3,
+    /// Resource units are delivered into colony stores on a body —
+    /// the base resupply (M8-C).
+    ColonyResupply = 4,
 }
 
 impl csp_core::StableDiscriminant for ContractKind {
@@ -163,6 +170,16 @@ pub enum ContractParamSpace {
     Rescue {
         /// Candidate bodies — non-empty.
         bodies: Vec<BodyId>,
+    },
+    /// `ColonyResupply` (M8-C): draw `body`, then `resource`, then the
+    /// delivery amount uniform in `amount`'s `(lo, hi)` range.
+    ColonyResupply {
+        /// Candidate bodies whose colonies resupply — non-empty.
+        bodies: Vec<BodyId>,
+        /// Candidate resources to deliver — non-empty.
+        resources: Vec<ResourceId>,
+        /// `(lo, hi)` draw range for the required delivered units.
+        amount: (f64, f64),
     },
 }
 
@@ -265,6 +282,17 @@ pub enum ContractParams {
         /// The body the stranded vessel sits on.
         body: BodyId,
     },
+    /// `ColonyResupply` (M8-C): cumulative resource units delivered
+    /// into the stores of colonies on `body` reach `amount`.
+    ColonyResupply {
+        /// The body whose colonies take the delivery.
+        body: BodyId,
+        /// The resource delivered.
+        resource: ResourceId,
+        /// Required delivered units — cumulative, across every colony
+        /// on the body.
+        amount: f64,
+    },
 }
 
 impl ContractParams {
@@ -276,6 +304,7 @@ impl ContractParams {
             Self::SurveyData { .. } => ContractKind::SurveyRun,
             Self::PartTest { .. } => ContractKind::PartTest,
             Self::Rescue { .. } => ContractKind::Rescue,
+            Self::ColonyResupply { .. } => ContractKind::ColonyResupply,
         }
     }
 }

@@ -18,11 +18,22 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{BodyId, LocKey, SiteId};
+use crate::ids::{BodyId, LocKey, ResourceId, SiteId};
 
 /// The `schema_version` this loader understands for `sites.ron` — its
 /// own namespace, like `balance.ron` (§3.1 first-field convention).
-pub const SITE_SCHEMA_VERSION: u32 = 1;
+///
+/// Version 2 (M8-B): `resource_yields` landed — the per-site resource
+/// concentrations a colony `Drill` module extracts against. A v1 file
+/// still parses: the field defaults to an empty list (no yields —
+/// drills founded there read concentration 0 and produce nothing).
+pub const SITE_SCHEMA_VERSION: u32 = 2;
+
+/// The `sites.ron` versions `load_sites` accepts: the current schema
+/// and the previous one under the §3.1 "current and previous, with
+/// explicit defaults" rule — v1's missing `resource_yields` reads as
+/// the empty list.
+pub const SITE_SCHEMA_SUPPORTED: [u32; 2] = [SITE_SCHEMA_VERSION - 1, SITE_SCHEMA_VERSION];
 
 /// One authored surface site (§3.5). The geocentric pose uses the
 /// same convention as `csp_sim::SurfacePose` (body-fixed latitude,
@@ -51,6 +62,17 @@ pub struct SiteDef {
     /// §3.5 (the sim derives it; the file only flags it). The
     /// validator enforces at most one launch site per body.
     pub launch: bool,
+    /// M8-B: the site's mineable resource concentrations —
+    /// `(resource, concentration fraction in [0,1])` pairs a colony
+    /// `Drill` module extracts against: drill rate is
+    /// `base_rate_per_s · min(1, concentration / min_concentration)`.
+    /// This is the flat per-site stand-in for §3.1's
+    /// `BodyDef::surface_resources` PNG concentration maps — schema-
+    /// only and unauthored to date, so a map-resolution change never
+    /// needs to move a save; per-site authoring is what the colony
+    /// flow network reads.
+    #[serde(default)]
+    pub resource_yields: Vec<(ResourceId, f64)>,
 }
 
 /// `data/systems/<sys>/sites.ron` — the system's site set. Optional:

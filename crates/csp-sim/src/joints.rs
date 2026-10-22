@@ -927,6 +927,11 @@ pub(crate) fn apply_latch(
     // id are redirected below so a stream already in the pipe lands
     // in the merged vessel.
     let (tanks_m, crew_m) = crate::transfers::merge_vessel_records(vp, vs, &map);
+    // M8-B: the merged hull keeps either half's colony opt-in — it
+    // still sits where a joined half sat (the join record is
+    // per-vessel, so a second latched member of the same colony
+    // cannot stack the same join twice: `or` reads one).
+    let joined_m = vp.joined_colony.or(vs.joined_colony);
     // M7-A: science records pool through the same remap, and the
     // absorbed vessel's live projects re-seat onto the merged id
     // (their lab nodes remap like the records — `map` preserves
@@ -1022,6 +1027,7 @@ pub(crate) fn apply_latch(
         v.tank_contents = tanks_m;
         v.crew = crew_m;
         v.science = science_m;
+        v.joined_colony = joined_m;
     }
     let absorbed_tracked = tracked.remove(&sec);
     if absorbed_tracked {

@@ -33,7 +33,16 @@ use serde::{Deserialize, Serialize};
 ///
 /// Version 7 (M7-D): the §3.6 contract block — `contract_offer_slots`,
 /// the offer-board size the generator maintains.
-pub const BALANCE_SCHEMA_VERSION: u32 = 7;
+///
+/// Version 8 (M8-B): `manufacture_rate_kg_per_s` — the §3.5 build
+/// order's throughput, the sim-side mirror
+/// `csp_sim::economy::DEFAULT_MANUFACTURE_KG_PER_S`.
+///
+/// Version 9 (M8-C): the §3.5 life-support block —
+/// `life_support_check_period_s` and the three per-crew consumption
+/// rates (`oxygen`, `food`, `electric_charge`), the sim-side mirrors
+/// `csp_sim::life_support::DEFAULT_*`.
+pub const BALANCE_SCHEMA_VERSION: u32 = 9;
 
 /// `data/balance.ron` — the tunables every later milestone consumes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -164,4 +173,27 @@ pub struct BalanceDef {
     /// counters when the board is short). Mirror:
     /// `csp_sim::DEFAULT_CONTRACT_BOARD_SIZE`.
     pub contract_offer_slots: u32,
+    /// M8-B §3.5 manufacture: the build order's throughput — a craft's
+    /// construction takes `mass_kg / manufacture_rate_kg_per_s` sim
+    /// seconds at the launch site that ordered it. Mirror:
+    /// `csp_sim::economy::DEFAULT_MANUFACTURE_KG_PER_S`.
+    pub manufacture_rate_kg_per_s: f64,
+    /// M8-C §3.5 life support: the periodic vessel check's cadence in
+    /// sim-seconds — one `LifeSupportCheck` fires per this interval on
+    /// the absolute grid, debiting `rate · period` per crew member
+    /// aboard each crewed vessel. Mirror:
+    /// `csp_sim::life_support::DEFAULT_CHECK_PERIOD_S`.
+    pub life_support_check_period_s: f64,
+    /// M8-C §3.5 life support: `oxygen` units consumed per crew
+    /// member per sim-second while life support is enabled. Mirror:
+    /// `csp_sim::life_support::DEFAULT_OXYGEN_PER_CREW_S`.
+    pub life_support_oxygen_per_crew_s: f64,
+    /// M8-C §3.5 life support: `food` units per crew member per
+    /// sim-second. Mirror:
+    /// `csp_sim::life_support::DEFAULT_FOOD_PER_CREW_S`.
+    pub life_support_food_per_crew_s: f64,
+    /// M8-C §3.5 life support: `electric_charge` units per crew
+    /// member per sim-second. Mirror:
+    /// `csp_sim::life_support::DEFAULT_EC_PER_CREW_S`.
+    pub life_support_ec_per_crew_s: f64,
 }

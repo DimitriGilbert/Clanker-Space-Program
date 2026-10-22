@@ -208,6 +208,36 @@ fn flight_initial(dir: &Path) -> Result<World, ReplayError> {
             .collect(),
     );
     world.set_contract_config(csp_sim::ContractConfig::from_balance(&balance));
+    // M8-A §3.5.1: the per-body colony environments — rotation and
+    // authored insolation from the fixture's body defs (construction
+    // config, the `set_sites` precedent).
+    world.set_colony_env(csp_sim::colony_env_from_body_defs(&defs));
+    // M8-C §3.5: the life-support tunables — same wiring (the
+    // `set_economy_config` precedent); the per-save flag itself is
+    // sim state, not construction config.
+    world.set_life_support_config(csp_sim::LifeSupportConfig::from_balance(&balance));
+    // M8-B §3.5.1: the fixture's `recipes/` dir — empty reads as a
+    // recipe-less world (the `set_colony_env` precedent).
+    world.set_recipes(
+        csp_data::load_recipes(&dir.join("recipes"))
+            .map_err(ReplayError::Load)?
+            .by_id()
+            .into_iter()
+            .map(|(id, def)| (id, def.clone()))
+            .collect(),
+    );
+    // M8-B §3.5.1: the fixture's `colonies.ron` — the same
+    // source-of-truth wiring `csp-view` startup does; a missing file
+    // reads as an empty set, so colony-free fixtures are unaffected.
+    // Founded at world build (pre-snapshot), never through the command
+    // queue — the records ride `initial_snapshot`, not the log.
+    world
+        .found_authored_colonies(
+            &csp_data::load_colonies(&dir.join("colonies.ron"))
+                .map_err(ReplayError::Load)?
+                .colonies,
+        )
+        .map_err(ReplayError::Sim)?;
     Ok(world)
 }
 

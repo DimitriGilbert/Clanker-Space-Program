@@ -190,6 +190,30 @@ impl StableDiscriminant for TransferCargo {
     }
 }
 
+/// One end of a transfer process (M8-B): `Vessel` covers the M6-D
+/// vessel↔vessel link; `Colony` is the §3.5 vessel↔colony side —
+/// reachable only for a vessel that has explicitly
+/// `JoinColonyInventory`'d (the opt-in is never automatic).
+/// Discriminants append-only, the `TransferCargo` rule.
+#[repr(u16)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum TransferEnd {
+    /// A vessel arena id.
+    Vessel(VesselId) = 0,
+    /// A colony arena id — the colony's aggregate stores, not its
+    /// site inventory.
+    Colony(crate::economy::ColonyId) = 1,
+}
+
+impl StableDiscriminant for TransferEnd {
+    fn discriminant(&self) -> u16 {
+        match self {
+            Self::Vessel(_) => 0,
+            Self::Colony(_) => 1,
+        }
+    }
+}
+
 /// One in-flight transfer — the hashed+serialized process record.
 /// Every live record pairs with exactly one pending
 /// `TransferComplete` event at `complete_tick` (the restore coherence
@@ -198,10 +222,10 @@ impl StableDiscriminant for TransferCargo {
 pub struct ActiveTransfer {
     /// Its arena key — kept inline per §2.2's arena-of-structs idiom.
     pub id: TransferId,
-    /// The vessel the cargo left.
-    pub from_vessel: VesselId,
-    /// The vessel it lands on.
-    pub to_vessel: VesselId,
+    /// The end the cargo left.
+    pub from: TransferEnd,
+    /// The end it lands at.
+    pub to: TransferEnd,
     /// What it carries.
     pub cargo: TransferCargo,
     /// The tick its `TransferComplete` event fires at.
@@ -622,8 +646,9 @@ pub(crate) fn linked(
 
 /// `(R + alt) · (cos φ·cos λ, cos φ·sin λ, sin φ)` — the latched
 /// pose's world point on the dominant body's sphere (libm
-/// transcendentals, §2.7).
-fn latched_pos(pose: &crate::SurfacePose, body_radius_m: f64) -> DVec3 {
+/// transcendentals, §2.7). `pub(crate)` for the M8-C impact
+/// check's colony surface points.
+pub(crate) fn latched_pos(pose: &crate::SurfacePose, body_radius_m: f64) -> DVec3 {
     let (slat, clat) = (libm::sin(pose.latitude_rad), libm::cos(pose.latitude_rad));
     let (slon, clon) = (libm::sin(pose.longitude_rad), libm::cos(pose.longitude_rad));
     let r = body_radius_m + pose.altitude_m;
@@ -633,8 +658,17 @@ fn latched_pos(pose: &crate::SurfacePose, body_radius_m: f64) -> DVec3 {
 /// The §7.1 field walk for one in-flight transfer — the world hash
 /// calls it under the arena's ascending-id enumeration.
 pub fn hash_transfer(h: &mut StateHasher, t: &ActiveTransfer) {
-    h.u64(t.from_vessel.0);
-    h.u64(t.to_vessel.0);
+    for e in [t.from, t.to] {
+        h.stable_enum(&e);
+        match e {
+            TransferEnd::Vessel(v) => {
+                h.u64(v.0);
+            }
+            TransferEnd::Colony(c) => {
+                h.u64(c.0);
+            }
+        }
+    }
     h.stable_enum(&t.cargo);
     match &t.cargo {
         TransferCargo::Resource { resource, amount } => {
@@ -654,12 +688,12 @@ pub fn hash_transfer(h: &mut StateHasher, t: &ActiveTransfer) {
 /// concurrent streams cannot overbook one tank.
 fn inbound_resource(
     transfers: &BTreeMap<TransferId, ActiveTransfer>,
-    to: VesselId,
+    to: TransferEnd,
     resource: &ResourceId,
 ) -> f64 {
     transfers
         .values()
-        .filter(|t| t.to_vessel == to)
+        .filter(|t| t.to == to)
         .map(|t| match &t.cargo {
             TransferCargo::Resource {
                 resource: r,
@@ -671,10 +705,10 @@ fn inbound_resource(
 }
 
 /// In-flight inbound crew bound for `vessel` — seat reservations.
-fn inbound_crew(transfers: &BTreeMap<TransferId, ActiveTransfer>, to: VesselId) -> u64 {
+fn inbound_crew(transfers: &BTreeMap<TransferId, ActiveTransfer>, to: TransferEnd) -> u64 {
     transfers
         .values()
-        .filter(|t| t.to_vessel == to && matches!(t.cargo, TransferCargo::Crew { .. }))
+        .filter(|t| t.to == to && matches!(t.cargo, TransferCargo::Crew { .. }))
         .count() as u64
 }
 
@@ -753,7 +787,7 @@ impl World {
         }
         let free = vessel_capacity(dst, resource)
             - vessel_resource(dst, resource)
-            - inbound_resource(&self.transfers, to, resource);
+            - inbound_resource(&self.transfers, TransferEnd::Vessel(to), resource);
         if free < amount {
             return Err(SimError::Recoverable("transfer: insufficient capacity"));
         }
@@ -787,8 +821,8 @@ impl World {
             id,
             ActiveTransfer {
                 id,
-                from_vessel: from,
-                to_vessel: to,
+                from: TransferEnd::Vessel(from),
+                to: TransferEnd::Vessel(to),
                 cargo: TransferCargo::Resource {
                     resource: resource.clone(),
                     amount,
@@ -849,7 +883,7 @@ impl World {
         }
         let free = vessel_seats(dst)
             .saturating_sub(dst.crew.len() as u64)
-            .saturating_sub(inbound_crew(&self.transfers, to));
+            .saturating_sub(inbound_crew(&self.transfers, TransferEnd::Vessel(to)));
         if free == 0 {
             return Err(SimError::Recoverable("crew transfer: no free seat"));
         }
@@ -868,8 +902,8 @@ impl World {
             id,
             ActiveTransfer {
                 id,
-                from_vessel: from,
-                to_vessel: to,
+                from: TransferEnd::Vessel(from),
+                to: TransferEnd::Vessel(to),
                 cargo: TransferCargo::Crew { crew },
                 complete_tick,
             },
@@ -898,7 +932,7 @@ impl World {
         };
         let free = vessel_seats(v)
             .saturating_sub(v.crew.len() as u64)
-            .saturating_sub(inbound_crew(&self.transfers, vessel));
+            .saturating_sub(inbound_crew(&self.transfers, TransferEnd::Vessel(vessel)));
         if free == 0 {
             return Err(SimError::Recoverable("board: no free seat"));
         }
@@ -941,45 +975,548 @@ impl World {
         match t.cargo {
             TransferCargo::Resource { resource, amount } => {
                 let mut remaining = amount;
-                if let Some(dst) = self.vessels.get_mut(&t.to_vessel) {
-                    let (stored, mass_changed) = credit(dst, &resource, remaining);
-                    remaining -= stored;
-                    reweld_if_mass_changed(dst, mass_changed)?;
-                }
-                if remaining > 0.0
-                    && let Some(src) = self.vessels.get_mut(&t.from_vessel)
+                let landed = self.credit_end(t.to, &resource, remaining, shadow)?;
+                remaining -= landed;
+                // M8-C §3.6: a landing into a colony's stores is the
+                // resupply fact — cumulative by `(colony, resource)`,
+                // counted by what actually landed, then the
+                // `ColonyDelivery` trigger evaluates the subscribed
+                // contracts.
+                if let TransferEnd::Colony(c) = t.to
+                    && landed > 0.0
                 {
-                    let (_, mass_changed) = credit(src, &resource, remaining);
-                    reweld_if_mass_changed(src, mass_changed)?;
+                    crate::contracts::shadow_contracts(&self.contracts, &mut shadow.contracts);
+                    *self
+                        .contracts
+                        .facts
+                        .colony_deliveries
+                        .entry((c.0, resource.clone()))
+                        .or_insert(0.0) += landed;
+                    self.contract_notify(
+                        &crate::contracts::ContractTrigger::ColonyDelivery,
+                        shadow,
+                    )?;
+                }
+                if remaining > 0.0 {
+                    remaining -= self.credit_end(t.from, &resource, remaining, shadow)?;
                 }
                 // `remaining` > 0 here: every tank that could hold it
                 // is gone (undocked fragment, breakup, removal). The
                 // units leave the simulation — the tanks' fate was
                 // already honest; the fallback order is the
                 // documented totality.
+                let _ = remaining;
             }
             TransferCargo::Crew { crew } => {
-                // Land only if the destination can seat — otherwise
-                // the member simply stays aboard the source (it
-                // never left its seat record). A missing destination,
-                // a member already gone from the source (absorbed
-                // vessel, death-with-seat), or a latch rewrite that
-                // made this a same-vessel hop all resolve to no-op.
-                if t.from_vessel != t.to_vessel
-                    && let Some(seat) = self.vessels.get(&t.to_vessel).and_then(choose_seat)
-                    && let Some(src) = self.vessels.get_mut(&t.from_vessel)
+                self.land_crew(t.from, t.to, crew, shadow)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The credit half of the best-effort rule: land `amount` at one
+    /// endpoint, returning the units that actually moved. `Vessel` is
+    /// the tank-walk (`credit` + re-weld); `Colony` is the aggregate
+    /// store's re-anchor (`min(capacity)` like the tanks) — a dead or
+    /// vanished colony still holds its frozen stores, so the credit
+    /// lands there too (the store records are terminal bookkeeping,
+    /// not a resurrected network — no recompute runs on a dead one).
+    fn credit_end(
+        &mut self,
+        end: TransferEnd,
+        resource: &ResourceId,
+        amount: f64,
+        shadow: &mut TickShadow,
+    ) -> Result<f64, SimError> {
+        match end {
+            TransferEnd::Vessel(v) => match self.vessels.get_mut(&v) {
+                Some(vessel) => {
+                    let (moved, mass_changed) = credit(vessel, resource, amount);
+                    reweld_if_mass_changed(vessel, mass_changed)?;
+                    Ok(moved)
+                }
+                None => Ok(0.0),
+            },
+            TransferEnd::Colony(c) => {
+                self.shadow_colonies(shadow);
+                let now = self.clock.ticks();
+                let Some(colony) = self.colonies.get_mut(&c) else {
+                    return Ok(0.0);
+                };
+                let Some(store) = colony.stores.get_mut(resource) else {
+                    return Ok(0.0);
+                };
+                let level = store.level_at(now);
+                let moved = (store.capacity - level).max(0.0).min(amount);
+                store.anchor_level = level + moved;
+                store.anchor_tick = now;
+                if crate::colonies::colony_live(&colony.state) {
+                    self.recompute_colony(c, now, shadow)?;
+                }
+                Ok(moved)
+            }
+        }
+    }
+
+    /// The crew-landing half: `Vessel` destinations reseat through
+    /// `choose_seat` (the vessel-vessel rule); `Colony` destinations
+    /// add the member to the colony's crew set and write the roster's
+    /// `CrewLocation::Colony` (the roster↔set pairing the restore
+    /// gate enforces). Any unmet precondition no-ops — the member
+    /// simply stays at the source, the same totality.
+    fn land_crew(
+        &mut self,
+        from: TransferEnd,
+        to: TransferEnd,
+        crew: CrewId,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        match (from, to) {
+            (TransferEnd::Vessel(f), TransferEnd::Vessel(t)) => {
+                if f != t
+                    && let Some(seat) = self.vessels.get(&t).and_then(choose_seat)
+                    && let Some(src) = self.vessels.get_mut(&f)
                     && let Some(pos) = src.crew.iter().position(|c| c.id == crew)
                 {
                     src.crew.remove(pos);
                     let dst = self
                         .vessels
-                        .get_mut(&t.to_vessel)
+                        .get_mut(&t)
                         .ok_or(SimError::Fatal("transfer: destination vanished mid-fire"))?;
                     dst.crew.push(VesselCrew { id: crew, seat });
                 }
             }
+            // vessel → colony: the member leaves its seat for the
+            // colony's crew set; roster location becomes `Colony`.
+            (TransferEnd::Vessel(f), TransferEnd::Colony(c)) => {
+                let live = self
+                    .colonies
+                    .get(&c)
+                    .is_some_and(|co| crate::colonies::colony_live(&co.state));
+                if live
+                    && let Some(src) = self.vessels.get_mut(&f)
+                    && let Some(pos) = src.crew.iter().position(|c| c.id == crew)
+                {
+                    src.crew.remove(pos);
+                    self.shadow_colonies(shadow);
+                    self.shadow_economy(shadow);
+                    if let Some(co) = self.colonies.get_mut(&c) {
+                        co.crew.insert(crew);
+                    }
+                    if let Some(m) = self.economy.crew.get_mut(&crew) {
+                        m.location = crate::economy::CrewLocation::Colony(c);
+                    }
+                    let now = self.clock.ticks();
+                    self.recompute_colony(c, now, shadow)?;
+                }
+            }
+            // colony → vessel: the member leaves the colony's crew
+            // set for a seat; roster location becomes `Vessel`.
+            (TransferEnd::Colony(c), TransferEnd::Vessel(t)) => {
+                let active = self
+                    .economy
+                    .crew
+                    .get(&crew)
+                    .is_some_and(|m| m.status == crate::economy::CrewStatus::Active);
+                if active
+                    && self
+                        .colonies
+                        .get(&c)
+                        .is_some_and(|co| co.crew.contains(&crew))
+                    && let Some(seat) = self.vessels.get(&t).and_then(choose_seat)
+                {
+                    self.shadow_colonies(shadow);
+                    self.shadow_economy(shadow);
+                    if let Some(co) = self.colonies.get_mut(&c) {
+                        co.crew.remove(&crew);
+                    }
+                    let dst = self
+                        .vessels
+                        .get_mut(&t)
+                        .ok_or(SimError::Fatal("transfer: destination vanished mid-fire"))?;
+                    dst.crew.push(VesselCrew { id: crew, seat });
+                    if let Some(m) = self.economy.crew.get_mut(&crew) {
+                        m.location = crate::economy::CrewLocation::Vessel(t);
+                    }
+                    let now = self.clock.ticks();
+                    self.recompute_colony(c, now, shadow)?;
+                }
+            }
+            (TransferEnd::Colony(_), TransferEnd::Colony(_)) => {}
         }
         Ok(())
+    }
+}
+
+impl World {
+    /// §3.5's colony-inventory opt-in gate: a `SurfaceLatched` vessel
+    /// on the colony's body whose pose chord distance to the colony's
+    /// site pose is within `transfer_radius_m` — the same-body,
+    /// same-radius rule `linked` uses for two latched vessels, with
+    /// the colony env's `radius_m` covering non-dominant bodies.
+    fn vessel_colony_linked(&self, vessel: VesselId, colony: crate::economy::ColonyId) -> bool {
+        let (Some(v), Some(co)) = (self.vessels.get(&vessel), self.colonies.get(&colony)) else {
+            return false;
+        };
+        let VesselState::SurfaceLatched(pose) = &v.state else {
+            return false;
+        };
+        if pose.body != co.body {
+            return false;
+        }
+        let Some(r) = self.colony_env.get(&co.body).map(|e| e.radius_m) else {
+            return false;
+        };
+        let alt = self
+            .site_defs
+            .get(&co.site)
+            .map(|d| d.altitude_m)
+            .unwrap_or(0.0);
+        let co_pose = crate::SurfacePose {
+            body: co.body.clone(),
+            latitude_rad: co.latitude_rad,
+            longitude_rad: co.longitude_rad,
+            altitude_m: alt,
+            orientation: csp_core::DQuat::IDENTITY,
+        };
+        latched_pos(pose, r).distance(latched_pos(&co_pose, r)) <= self.transfer_cfg.radius_m
+    }
+
+    /// `JoinColonyInventory` — §3.5's "a surface-latched vessel within
+    /// a colony's radius MAY join the colony's inventory" — the
+    /// opt-in record the vessel↔colony transfers read. NEVER
+    /// automatic: an unjoined latched vessel beside a colony
+    /// transfers nothing. The vessel must sit within
+    /// `transfer_radius_m` of the colony on the colony's body, and
+    /// the colony must be live (a frozen dead colony's stores take
+    /// no new joiners).
+    pub(crate) fn apply_join_colony(
+        &mut self,
+        vessel: VesselId,
+        colony: crate::economy::ColonyId,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        let Some(co) = self.colonies.get(&colony) else {
+            return Err(SimError::Recoverable("join colony: unknown colony"));
+        };
+        if !crate::colonies::colony_live(&co.state) {
+            return Err(SimError::Recoverable(
+                "join colony: colony is dormant or abandoned",
+            ));
+        }
+        if !self.transfer_cfg.is_valid() {
+            return Err(SimError::Recoverable(
+                "join colony: invalid transfer config",
+            ));
+        }
+        let Some(v) = self.vessels.get(&vessel) else {
+            return Err(SimError::Recoverable("join colony: unknown vessel"));
+        };
+        if v.joined_colony == Some(colony) {
+            return Ok(());
+        }
+        if !self.vessel_colony_linked(vessel, colony) {
+            return Err(SimError::Recoverable(
+                "join colony: vessel not latched in range of the colony",
+            ));
+        }
+        self.shadow_vessels(shadow);
+        self.vessels
+            .get_mut(&vessel)
+            .ok_or(SimError::Fatal("join colony: vessel vanished"))?
+            .joined_colony = Some(colony);
+        Ok(())
+    }
+
+    /// `LeaveColonyInventory` — clear the opt-in record (the join
+    /// was per-vessel; clearing while a transfer is in flight does
+    /// not recall the pipe — the completion's endpoint dispatch is
+    /// total).
+    pub(crate) fn apply_leave_colony(
+        &mut self,
+        vessel: VesselId,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        if !self.vessels.contains_key(&vessel) {
+            return Err(SimError::Recoverable("leave colony: unknown vessel"));
+        }
+        self.shadow_vessels(shadow);
+        self.vessels
+            .get_mut(&vessel)
+            .ok_or(SimError::Fatal("leave colony: vessel vanished"))?
+            .joined_colony = None;
+        Ok(())
+    }
+
+    /// The colony gate every vessel↔colony command shares: the
+    /// vessel's `joined_colony` must name THIS colony — proximity is
+    /// not re-checked (the member joined where it sits; it leaves
+    /// only by command or by leaving the surface, which clears the
+    /// record).
+    fn joined_colony_gate(
+        &self,
+        vessel: VesselId,
+        colony: crate::economy::ColonyId,
+    ) -> Result<(), SimError> {
+        let Some(v) = self.vessels.get(&vessel) else {
+            return Err(SimError::Recoverable("colony transfer: unknown vessel"));
+        };
+        if v.joined_colony != Some(colony) {
+            return Err(SimError::Recoverable(
+                "colony transfer: vessel has not joined this colony's inventory",
+            ));
+        }
+        let Some(co) = self.colonies.get(&colony) else {
+            return Err(SimError::Recoverable("colony transfer: unknown colony"));
+        };
+        if !crate::colonies::colony_live(&co.state) {
+            return Err(SimError::Recoverable(
+                "colony transfer: colony is dormant or abandoned",
+            ));
+        }
+        Ok(())
+    }
+
+    /// `TransferColonyResource { to_colony }` — the vessel↔colony
+    /// half of the §3.5 process, same reservation semantics as the
+    /// vessel-vessel path: debit the source at the command boundary
+    /// (the colony side's debit is a store re-anchor plus a re-solve
+    /// — the dropped stock can unground consumers), reserve the
+    /// destination's capacity net of inbound streams, and schedule
+    /// `TransferComplete` on the same flow-rate grid.
+    #[allow(clippy::too_many_lines)] // the two directions mirror as one list
+    pub(crate) fn apply_transfer_colony_resource(
+        &mut self,
+        vessel: VesselId,
+        colony: crate::economy::ColonyId,
+        resource: &ResourceId,
+        amount: f64,
+        to_colony: bool,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        if !(amount.is_finite() && amount > 0.0) {
+            return Err(SimError::Recoverable(
+                "colony transfer: non-positive amount",
+            ));
+        }
+        if !self.transfer_cfg.is_valid() {
+            return Err(SimError::Recoverable(
+                "colony transfer: invalid transfer config",
+            ));
+        }
+        self.joined_colony_gate(vessel, colony)?;
+        let now = self.clock.ticks();
+        if to_colony {
+            let src = self
+                .vessels
+                .get(&vessel)
+                .ok_or(SimError::Fatal("colony transfer: vessel vanished"))?;
+            if vessel_resource(src, resource) < amount {
+                return Err(SimError::Recoverable(
+                    "colony transfer: insufficient resource aboard",
+                ));
+            }
+            let co = self
+                .colonies
+                .get(&colony)
+                .ok_or(SimError::Fatal("colony transfer: colony vanished"))?;
+            let capacity = co.stores.get(resource).map(|st| st.capacity).unwrap_or(0.0);
+            let level = co
+                .stores
+                .get(resource)
+                .map(|st| st.level_at(now))
+                .unwrap_or(0.0);
+            let free = capacity
+                - level
+                - inbound_resource(&self.transfers, TransferEnd::Colony(colony), resource);
+            if free < amount {
+                return Err(SimError::Recoverable(
+                    "colony transfer: insufficient colony store capacity",
+                ));
+            }
+            // Commit — debit the vessel's tanks now.
+            self.shadow_vessels(shadow);
+            let src = self
+                .vessels
+                .get_mut(&vessel)
+                .ok_or(SimError::Fatal("colony transfer: vessel vanished"))?;
+            let (_, mass_changed) = debit(src, resource, amount);
+            reweld_if_mass_changed(src, mass_changed)?;
+        } else {
+            let co = self
+                .colonies
+                .get(&colony)
+                .ok_or(SimError::Fatal("colony transfer: colony vanished"))?;
+            let level = co
+                .stores
+                .get(resource)
+                .map(|st| st.level_at(now))
+                .unwrap_or(0.0);
+            if level < amount {
+                return Err(SimError::Recoverable(
+                    "colony transfer: insufficient colony store level",
+                ));
+            }
+            let dst = self
+                .vessels
+                .get(&vessel)
+                .ok_or(SimError::Fatal("colony transfer: vessel vanished"))?;
+            let free = vessel_capacity(dst, resource)
+                - vessel_resource(dst, resource)
+                - inbound_resource(&self.transfers, TransferEnd::Vessel(vessel), resource);
+            if free < amount {
+                return Err(SimError::Recoverable(
+                    "colony transfer: insufficient vessel capacity",
+                ));
+            }
+            // Commit — the store's anchor drops now, then a re-solve
+            // (the stock dip can change every grant and bound).
+            self.shadow_colonies(shadow);
+            let co = self
+                .colonies
+                .get_mut(&colony)
+                .ok_or(SimError::Fatal("colony transfer: colony vanished"))?;
+            if let Some(store) = co.stores.get_mut(resource) {
+                store.anchor_level = store.level_at(now) - amount;
+                store.anchor_tick = now;
+            }
+            self.recompute_colony(colony, now, shadow)?;
+        }
+        self.shadow_transfers(shadow);
+        let id = TransferId(self.next_transfer_id);
+        self.next_transfer_id = self
+            .next_transfer_id
+            .checked_add(1)
+            .ok_or(SimError::Fatal("transfer id counter overflow"))?;
+        let dur_ticks = (amount * csp_core::TICK_HZ as f64 / self.transfer_cfg.rate_units_per_s)
+            .ceil()
+            .min(u64::MAX as f64) as u64;
+        let complete_tick = self
+            .clock
+            .ticks()
+            .saturating_add(dur_ticks.max(1))
+            .max(self.clock.ticks().saturating_add(1));
+        let (from, to) = if to_colony {
+            (TransferEnd::Vessel(vessel), TransferEnd::Colony(colony))
+        } else {
+            (TransferEnd::Colony(colony), TransferEnd::Vessel(vessel))
+        };
+        self.transfers.insert(
+            id,
+            ActiveTransfer {
+                id,
+                from,
+                to,
+                cargo: TransferCargo::Resource {
+                    resource: resource.clone(),
+                    amount,
+                },
+                complete_tick,
+            },
+        );
+        self.schedule_event(
+            crate::EventKind::TransferComplete { transfer: id },
+            complete_tick,
+            shadow,
+        )
+    }
+
+    /// `TransferColonyCrew { to_colony }` — the crew half: the member
+    /// keeps the source seat/set slot until `TransferComplete`
+    /// reseats it, roster `CrewLocation` updated at the landing (the
+    /// `AssignCrewToColony`-side pairing the restore gate enforces).
+    /// Members must be roster-tracked and `Active` — a `BoardCrew`
+    /// id-only member has no roster record to pair with the colony's
+    /// crew set.
+    pub(crate) fn apply_transfer_colony_crew(
+        &mut self,
+        vessel: VesselId,
+        colony: crate::economy::ColonyId,
+        crew: CrewId,
+        to_colony: bool,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        if !self.transfer_cfg.is_valid() {
+            return Err(SimError::Recoverable(
+                "colony crew transfer: invalid transfer config",
+            ));
+        }
+        self.joined_colony_gate(vessel, colony)?;
+        if self
+            .transfers
+            .values()
+            .any(|t| matches!(&t.cargo, TransferCargo::Crew { crew: c } if *c == crew))
+        {
+            return Err(SimError::Recoverable(
+                "colony crew transfer: crew already in flight",
+            ));
+        }
+        let member = self
+            .economy
+            .crew
+            .get(&crew)
+            .filter(|m| m.status == crate::economy::CrewStatus::Active)
+            .ok_or(SimError::Recoverable(
+                "colony crew transfer: no active roster member",
+            ))?;
+        if to_colony {
+            let aboard = self
+                .vessels
+                .get(&vessel)
+                .is_some_and(|v| v.crew.iter().any(|c| c.id == crew));
+            if !aboard {
+                return Err(SimError::Recoverable(
+                    "colony crew transfer: crew not aboard vessel",
+                ));
+            }
+        } else {
+            if member.location != crate::economy::CrewLocation::Colony(colony) {
+                return Err(SimError::Recoverable(
+                    "colony crew transfer: crew not at this colony",
+                ));
+            }
+            let dst = self
+                .vessels
+                .get(&vessel)
+                .ok_or(SimError::Fatal("colony crew transfer: vessel vanished"))?;
+            let free = vessel_seats(dst)
+                .saturating_sub(dst.crew.len() as u64)
+                .saturating_sub(inbound_crew(&self.transfers, TransferEnd::Vessel(vessel)));
+            if free == 0 {
+                return Err(SimError::Recoverable("colony crew transfer: no free seat"));
+            }
+        }
+        self.shadow_transfers(shadow);
+        let id = TransferId(self.next_transfer_id);
+        self.next_transfer_id = self
+            .next_transfer_id
+            .checked_add(1)
+            .ok_or(SimError::Fatal("transfer id counter overflow"))?;
+        let complete_tick = self
+            .clock
+            .ticks()
+            .saturating_add(self.transfer_cfg.crew_transfer_ticks.max(1))
+            .max(self.clock.ticks().saturating_add(1));
+        let (from, to) = if to_colony {
+            (TransferEnd::Vessel(vessel), TransferEnd::Colony(colony))
+        } else {
+            (TransferEnd::Colony(colony), TransferEnd::Vessel(vessel))
+        };
+        self.transfers.insert(
+            id,
+            ActiveTransfer {
+                id,
+                from,
+                to,
+                cargo: TransferCargo::Crew { crew },
+                complete_tick,
+            },
+        );
+        self.schedule_event(
+            crate::EventKind::TransferComplete { transfer: id },
+            complete_tick,
+            shadow,
+        )
     }
 }
 
@@ -1023,11 +1560,11 @@ pub(crate) fn remap_transfer_vessels(
     prim: VesselId,
 ) {
     for t in transfers.values_mut() {
-        if t.from_vessel == sec {
-            t.from_vessel = prim;
+        if t.from == TransferEnd::Vessel(sec) {
+            t.from = TransferEnd::Vessel(prim);
         }
-        if t.to_vessel == sec {
-            t.to_vessel = prim;
+        if t.to == TransferEnd::Vessel(sec) {
+            t.to = TransferEnd::Vessel(prim);
         }
     }
 }

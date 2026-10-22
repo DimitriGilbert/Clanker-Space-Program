@@ -633,6 +633,14 @@ pub fn replay(artifact: &Replay) -> Result<[u8; 32], ReplayError> {
     // command rejects and the log diverges.
     world.set_sites(artifact.config.sites.clone());
     world.set_contracts(artifact.config.contracts.clone());
+    // M8-A: the per-body colony environments ride the same channel —
+    // a recorded run's `FoundColony`/terminator math resolves
+    // rotation and insolation against it.
+    world.set_colony_env(artifact.config.colony_env.clone());
+    // M8-B: the recipe table rides the same channel — a recorded
+    // run's `FoundColony`/`ManufactureCraft` resolves `RecipeId`s
+    // against it.
+    world.set_recipes(artifact.config.recipes.clone());
     let log = &artifact.command_log;
     let mut i = 0;
     while i < log.len() {

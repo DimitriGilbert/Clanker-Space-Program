@@ -68,7 +68,7 @@ use serde::{Deserialize, Serialize};
 use csp_core::{SimError, StateHasher, StreamKey, StreamTag, TICK_HZ};
 use csp_data::{
     BodyId, ContractKind, ContractParamSpace, ContractParams, ContractPrereq, ContractRegime,
-    ContractTemplate, ContractTypeId, ModuleReq, RegimeSpace,
+    ContractTemplate, ContractTypeId, ModuleReq, RegimeSpace, ResourceId,
 };
 
 use crate::economy::{FundsReason, to_micros};
@@ -131,6 +131,13 @@ pub struct ContractFacts {
     /// "bodies visited". Stamped by the same triggers the
     /// completion predicates ride.
     pub bodies_visited: BTreeSet<BodyId>,
+    /// M8-C §3.6's resupply fact — cumulative resource units a
+    /// `TransferComplete` has landed in each colony's stores, keyed
+    /// `(colony arena id, resource)`. Cumulative, not a level read:
+    /// a colony that consumed what it was given still counts the
+    /// delivery (the delivery is the contract's fact, not the
+    /// inventory).
+    pub colony_deliveries: BTreeMap<(u64, ResourceId), f64>,
 }
 
 /// The world's §3.6 contract book — everything the subsystem owns:
@@ -200,6 +207,9 @@ pub(crate) enum ContractTrigger {
     /// A `SurfaceLatched` vessel was recovered — carries the body
     /// it sat on (the vessel is gone; the event carries the fact).
     VesselRecovered(BodyId),
+    /// M8-C §3.6: a `TransferComplete` landed resource units into a
+    /// colony's stores — the `ColonyResupply` predicate's trigger.
+    ColonyDelivery,
 }
 
 /// The `[0,1)` draw — the `csp_core::uniform` scaling applied to a
@@ -289,6 +299,23 @@ fn draw_params(
                 .get(pick(rng, bodies.len()))
                 .ok_or(SimError::Fatal("contract gen: empty body space"))?
                 .clone(),
+        }),
+        // M8-C §3.6: draw the body, the resource, then the delivery
+        // amount uniform in the authored range.
+        ContractParamSpace::ColonyResupply {
+            bodies,
+            resources,
+            amount,
+        } => Ok(ContractParams::ColonyResupply {
+            body: bodies
+                .get(pick(rng, bodies.len()))
+                .ok_or(SimError::Fatal("contract gen: empty body space"))?
+                .clone(),
+            resource: resources
+                .get(pick(rng, resources.len()))
+                .ok_or(SimError::Fatal("contract gen: empty resource space"))?
+                .clone(),
+            amount: amount.0 + next01(rng) * (amount.1 - amount.0),
         }),
     }
 }
@@ -408,6 +435,16 @@ fn hash_params(h: &mut StateHasher, p: &ContractParams) {
             h.u16(3);
             hash_body(h, body);
         }
+        ContractParams::ColonyResupply {
+            body,
+            resource,
+            amount,
+        } => {
+            h.u16(4);
+            hash_body(h, body);
+            h.str(resource.as_str());
+            h.f64(*amount);
+        }
     }
 }
 
@@ -461,6 +498,18 @@ pub fn hash_contracts(h: &mut StateHasher, c: &ContractState) {
     for b in &c.facts.bodies_visited {
         hash_body(h, b);
     }
+    // M8-C: the resupply delivery record — `(colony id, resource)`
+    // → cumulative units, `BTreeMap` key order.
+    h.btree_map(
+        &c.facts.colony_deliveries,
+        |h, (colony, resource)| {
+            h.u64(*colony);
+            h.str(resource.as_str());
+        },
+        |h, units| {
+            h.f64(*units);
+        },
+    );
 }
 
 /// Lazy-shadow capture for the contract book (the
@@ -730,6 +779,32 @@ impl World {
             ContractParams::Rescue { body } => {
                 matches!(trigger, Some(ContractTrigger::VesselRecovered(b)) if b == body)
             }
+            // M8-C §3.6: cumulative deliveries into the stores of
+            // every colony on `body` reach `amount`. The fact reads
+            // the arena ids, the colony arena supplies the body
+            // binding — a delivery to a colony on another body does
+            // not count, and a decommissioned colony's deliveries
+            // still do (they happened).
+            ContractParams::ColonyResupply {
+                body,
+                resource,
+                amount,
+            } => {
+                let delivered: f64 = self
+                    .colonies
+                    .values()
+                    .filter(|c| c.body == *body)
+                    .map(|c| {
+                        self.contracts
+                            .facts
+                            .colony_deliveries
+                            .get(&(c.id.0, resource.clone()))
+                            .copied()
+                            .unwrap_or(0.0)
+                    })
+                    .sum();
+                delivered >= *amount
+            }
         }
     }
 
@@ -899,6 +974,11 @@ mod tests {
             },
             ContractKind::Rescue => ContractParamSpace::Rescue {
                 bodies: vec![BodyId::from("terrin")],
+            },
+            ContractKind::ColonyResupply => ContractParamSpace::ColonyResupply {
+                bodies: vec![BodyId::from("terrin")],
+                resources: vec![ResourceId::from("ore")],
+                amount: (10.0, 10.0),
             },
         };
         ContractTemplate {

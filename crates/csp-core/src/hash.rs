@@ -117,7 +117,36 @@ use crate::SimError;
 /// record — the researched node set, purchased upgrade-track levels,
 /// and family qualification records (`tech::hash_tech`). No variant or
 /// discriminant changes; the goldens rebless.
-pub const HASH_SCHEMA_VERSION: u32 = 13;
+///
+/// **Version 14** (M8-A): the world walk appended the §3.5.1 colony
+/// book — `next_colony_id` and the colony arena
+/// (`colonies::hash_colonies`: sites/poses, `ColonyState`, modules,
+/// epoch-anchored linear stores, held solve outputs).
+/// `EventKind` gained `TerminatorCrossing` (12),
+/// `ColonyStoreFull`/`Empty` (13/14), `ColonyInspection` (15),
+/// `PowerLost`/`PowerRestored` (16/17), `LifeSupportDepleted` (18) —
+/// appended, never renumbered; `SimCommand` gained `FoundColony`,
+/// `AbandonColony`, `AssignCrewToColony`, `EvacuateColony`,
+/// `DamageColonyModule`, `ScheduleColonyInspection` — append-only;
+/// `WorldSnapshot`/`WorldConfig` gained the colony fields. The
+/// goldens rebless.
+///
+/// **Version 14** (M8-B continuation): the same bump also covered
+/// the M8-B additions — the `builds`/`next_build_id` manufacture
+/// arena, `Vessel.joined_colony`, and `EventKind::ConstructionComplete`
+/// (19, `Clamping`) — appended under the same schema bump.
+///
+/// **Version 15** (M8-C): the world walk appended the §3.5
+/// life-support pair — `life_support_enabled` (the per-save toggle)
+/// and `life_support_cfg` (cadence + rates, the `economy_cfg`
+/// precedent); the contract walk appended `facts.colony_deliveries`
+/// (the resupply fact record) and the `ContractParams` table gained
+/// the `ColonyResupply` tag (4). `EventKind` gained
+/// `LifeSupportCheck` (20 — `Silent`, the `SalaryDue` precedent) and
+/// `VesselLifeSupportDepleted` (21 — `Clamping`); `SimCommand`
+/// gained `SetLifeSupportEnabled` — all appended, never renumbered.
+/// `ContractKind` gained `ColonyResupply` (4). The goldens rebless.
+pub const HASH_SCHEMA_VERSION: u32 = 15;
 
 /// Rule-7 sum types: the source of an enum's *declared* stable `u16`
 /// discriminant (PLAN §7.1 rule 7).

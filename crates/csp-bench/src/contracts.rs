@@ -140,6 +140,7 @@ fn mark_facts(
     );
     w.set_sites(cfg.sites);
     w.set_contracts(cfg.contracts);
+    w.set_recipes(cfg.recipes);
     Ok(())
 }
 

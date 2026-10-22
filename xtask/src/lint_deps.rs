@@ -718,11 +718,11 @@ mod tests {
         let text = std::fs::read_to_string(root.join("data/balance.ron"))
             .expect("data/balance.ron missing");
         let b: Balance = ron::from_str(&text).expect("data/balance.ron is not valid RON");
-        // Schema v7 — M7-D added the §3.6 contract tunable
-        // (`contract_offer_slots`); the loader-side pin is
-        // `csp_data::BALANCE_SCHEMA_VERSION` (kept in lockstep by
-        // csp-data's own balance gate test).
-        assert_eq!(b.schema_version, 7);
+        // Schema v9 — M8-C added the §3.5 vessel life-support tunables
+        // (`life_support_check_period_s` + the three per-crew rates);
+        // the loader-side pin is `csp_data::BALANCE_SCHEMA_VERSION`
+        // (kept in lockstep by csp-data's own balance gate test).
+        assert_eq!(b.schema_version, 9);
         assert_eq!(b.bubble_radius_m, 20_000.0);
         assert_eq!(b.advance_to_max_events_per_frame, 2_000);
         // And the other shipped data file parses too.

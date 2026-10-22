@@ -474,6 +474,37 @@ impl View {
                 .collect(),
         );
         sim.set_contract_config(csp_sim::ContractConfig::from_balance(&balance));
+        // M8-A §3.5.1: the per-body colony environments — rotation
+        // and authored insolation from the loaded body defs (the
+        // `set_sites` precedent).
+        sim.set_colony_env(csp_sim::colony_env_from_body_defs(&defs));
+        // M8-C §3.5: the life-support tunables — same data-derived
+        // wiring (the `set_economy_config` precedent); without it the
+        // check cadence/rates run on the no-data `DEFAULT_*` mirrors.
+        // The per-save flag itself is sim state, not config — it
+        // stays opt-in (`World::new` starts disabled).
+        sim.set_life_support_config(csp_sim::LifeSupportConfig::from_balance(&balance));
+        // M8-B §3.5.1: the recipe table — the same data-derived
+        // channel; `FoundColony`'s Converter modules resolve
+        // `RecipeId`s against it.
+        sim.set_recipes(
+            csp_data::load_recipes(&root.join("recipes"))?
+                .by_id()
+                .into_iter()
+                .map(|(id, def)| (id, def.clone()))
+                .collect(),
+        );
+        // M8-B §3.5.1: the home system's authored starting colonies
+        // (`colonies.ron`) — founded at world build through the same
+        // apply the `FoundColony` command drains to, after the site,
+        // colony-env, and recipe tables are installed (the apply
+        // resolves all three). A missing file reads as an empty set —
+        // a system without authored colonies simply starts with none.
+        sim.found_authored_colonies(
+            &csp_data::load_colonies(&root.join("systems").join("home").join("colonies.ron"))?
+                .colonies,
+        )
+        .map_err(ViewError::Sim)?;
         let mut view = Self::with_sim(sim);
         // M3 VAB: the part catalog + resource registry are data-derived
         // constants for the session model (like BodyTable — §7.3's

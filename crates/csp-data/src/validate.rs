@@ -512,6 +512,16 @@ pub enum ValidationError {
         /// What is wrong with it.
         reason: String,
     },
+    /// A `colonies.ron` colony entry is malformed (§3.5.1): the site
+    /// is not in `sites.ron`, a rate/capacity/level field is
+    /// non-finite or negative, or a resource ref is unknown or
+    /// duplicated inside one list.
+    InvalidColony {
+        /// The colony's site id (its name in the file).
+        site: String,
+        /// What is wrong with it.
+        reason: String,
+    },
 }
 
 impl fmt::Display for ValidationError {
@@ -756,6 +766,9 @@ impl ValidationError {
             }
             Self::InvalidSite { id, reason } => {
                 write!(f, "site {id:?}: {reason}")
+            }
+            Self::InvalidColony { site, reason } => {
+                write!(f, "colony at site {site:?}: {reason}")
             }
             Self::UnknownTechRequirement { part, tech } => {
                 write!(
@@ -1266,13 +1279,19 @@ pub fn validate_resources(res: &ResourceFile) -> Vec<ValidationError> {
     out
 }
 
-/// §3.5's `sites.ron` checks: `schema_version`, unique ids, every
-/// site on a declared system body, a finite in-range geocentric pose,
-/// and at most one launch site per body (§3.5's "1.0 at the launch
-/// site" needs a definite site to mean it).
-pub fn validate_sites(file: &SiteFile, sys: &LoadedSystem) -> Vec<ValidationError> {
+/// §3.5's `sites.ron` checks: `schema_version` (the loader's
+/// `current|previous` band), unique ids, every site on a declared
+/// system body, a finite in-range geocentric pose, at most one launch
+/// site per body (§3.5's "1.0 at the launch site" needs a definite
+/// site to mean it), and M8-B's `resource_yields` rows — unique,
+/// known resources, finite fractions in `[0,1]`.
+pub fn validate_sites(
+    file: &SiteFile,
+    sys: &LoadedSystem,
+    res: &ResourceFile,
+) -> Vec<ValidationError> {
     let mut out = Vec::new();
-    if file.schema_version != crate::site::SITE_SCHEMA_VERSION {
+    if !crate::site::SITE_SCHEMA_SUPPORTED.contains(&file.schema_version) {
         out.push(ValidationError::SchemaVersion {
             file: "sites.ron".to_string(),
             found: file.schema_version,
@@ -1322,6 +1341,361 @@ pub fn validate_sites(file: &SiteFile, sys: &LoadedSystem) -> Vec<ValidationErro
                     s.body.as_str()
                 ),
             });
+        }
+        let mut yields = BTreeSet::new();
+        for (r, y) in &s.resource_yields {
+            if !yields.insert(r.as_str()) {
+                out.push(ValidationError::InvalidSite {
+                    id: id.to_string(),
+                    reason: format!("duplicate yield resource {r:?}"),
+                });
+            }
+            if !res.contains(r) {
+                out.push(ValidationError::InvalidSite {
+                    id: id.to_string(),
+                    reason: format!("unknown yield resource {r:?}"),
+                });
+            }
+            if !(y.is_finite() && (0.0..=1.0).contains(y)) {
+                out.push(ValidationError::InvalidSite {
+                    id: id.to_string(),
+                    reason: format!("yield fraction for {r:?} outside [0,1] or non-finite"),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// `data/recipes/*.ron` checks: `schema_version`, `id` ↔ file stem,
+/// unique ids, every `inputs`/`outputs` row a known resource with a
+/// finite non-negative rate, and at least one positive-rate output
+/// (a recipe with no product is dead data).
+pub fn validate_recipes(
+    loaded: &crate::load::LoadedRecipes,
+    res: &ResourceFile,
+) -> Vec<ValidationError> {
+    let mut out = Vec::new();
+    let bad = |id: &str, reason: &str, out: &mut Vec<ValidationError>| {
+        out.push(ValidationError::InvalidColony {
+            site: id.to_string(),
+            reason: reason.to_string(),
+        });
+    };
+    let mut seen_ids = BTreeSet::new();
+    for lr in &loaded.recipes {
+        let d = &lr.def;
+        let stem = lr
+            .path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if stem != d.id.as_str() {
+            bad(
+                d.id.as_str(),
+                "recipe id does not match file stem",
+                &mut out,
+            );
+        }
+        if !seen_ids.insert(d.id.clone()) {
+            bad(d.id.as_str(), "duplicate recipe id", &mut out);
+        }
+        if d.schema_version != crate::recipe::RECIPE_SCHEMA_VERSION {
+            bad(d.id.as_str(), "unsupported schema_version", &mut out);
+        }
+        for (what, list) in [("inputs", &d.inputs), ("outputs", &d.outputs)] {
+            let mut seen = BTreeSet::new();
+            for (r, q) in list {
+                if !seen.insert(r.as_str()) {
+                    bad(
+                        d.id.as_str(),
+                        &format!("duplicate resource {r:?} in {what}"),
+                        &mut out,
+                    );
+                }
+                if !res.contains(r) {
+                    bad(
+                        d.id.as_str(),
+                        &format!("unknown resource {r:?} in {what}"),
+                        &mut out,
+                    );
+                }
+                if !(q.is_finite() && *q >= 0.0) {
+                    bad(
+                        d.id.as_str(),
+                        &format!("non-finite or negative {what} rate for {r:?}"),
+                        &mut out,
+                    );
+                }
+            }
+        }
+        if !d.outputs.iter().any(|(_, q)| *q > 0.0) {
+            bad(d.id.as_str(), "recipe produces nothing", &mut out);
+        }
+    }
+    out
+}
+
+fn bad_colony(site: &str, reason: String, out: &mut Vec<ValidationError>) {
+    out.push(ValidationError::InvalidColony {
+        site: site.to_string(),
+        reason,
+    });
+}
+
+/// `(resource, rate)` list checks for colony modules — unique, known,
+/// finite, non-negative.
+fn check_colony_pairs(
+    site: &str,
+    what: &str,
+    list: &[(crate::ids::ResourceId, f64)],
+    res: &ResourceFile,
+    out: &mut Vec<ValidationError>,
+) {
+    let mut seen = BTreeSet::new();
+    for (id, v) in list {
+        if !seen.insert(id.as_str()) {
+            bad_colony(site, format!("duplicate resource {id:?} in {what}"), out);
+        }
+        if !res.contains(id) {
+            bad_colony(site, format!("unknown resource {id:?} in {what}"), out);
+        }
+        if !v.is_finite() {
+            bad_colony(site, format!("non-finite {what} rate for {id:?}"), out);
+        } else if *v < 0.0 {
+            bad_colony(site, format!("negative {what} rate for {id:?}"), out);
+        }
+    }
+}
+
+/// The cross-field check `check_colony_pairs` cannot express: an
+/// `electric_charge` entry in a `consumes`/`consumes_per_crew` list
+/// plus a nonzero `power_ec_per_s` is ONE EC draw authored twice —
+/// the sim's `(module, resource)` request rows would collide and the
+/// grant would silently drop half the demand.
+fn check_power_collision(
+    site: &str,
+    module: usize,
+    what: &str,
+    list: &[(crate::ids::ResourceId, f64)],
+    power_ec_per_s: f64,
+    out: &mut Vec<ValidationError>,
+) {
+    if power_ec_per_s > 0.0
+        && list
+            .iter()
+            .any(|(id, q)| *q > 0.0 && id.as_str() == "electric_charge")
+    {
+        bad_colony(
+            site,
+            format!("module {module}: electric_charge in {what} collides with power_ec_per_s"),
+            out,
+        );
+    }
+}
+
+/// §3.5.1's `colonies.ron` checks: `schema_version`, every colony
+/// founded on a declared `sites.ron` site, every resource ref known
+/// to `resources.ron` and unique within its list, and every
+/// rate/capacity/level field finite and non-negative (a zero rate is
+/// legal — an inert module; negative is not a flow).
+#[allow(clippy::too_many_lines)] // the per-module-field check list reads as a list
+#[allow(clippy::cognitive_complexity)] // ditto: it is one flat per-module switch
+pub fn validate_colonies(
+    file: &crate::colony::ColonyFile,
+    sites: &SiteFile,
+    res: &ResourceFile,
+    recipes: &crate::load::LoadedRecipes,
+) -> Vec<ValidationError> {
+    let mut out = Vec::new();
+    if file.schema_version != crate::colony::COLONY_SCHEMA_VERSION {
+        out.push(ValidationError::SchemaVersion {
+            file: "colonies.ron".to_string(),
+            found: file.schema_version,
+        });
+    }
+    let site_ids: BTreeSet<&str> = sites.sites.iter().map(|s| s.id.as_str()).collect();
+    let recipe_ids: BTreeSet<&str> = recipes.recipes.iter().map(|r| r.def.id.as_str()).collect();
+    let recipe_defs: std::collections::BTreeMap<&str, &crate::recipe::RecipeDef> = recipes
+        .recipes
+        .iter()
+        .map(|r| (r.def.id.as_str(), &r.def))
+        .collect();
+    for def in &file.colonies {
+        let site = def.site.as_str();
+        if !site_ids.contains(site) {
+            bad_colony(site, format!("site {site:?} not in sites.ron"), &mut out);
+        }
+        for (i, m) in def.modules.iter().enumerate() {
+            use crate::colony::ColonyModuleDef as M;
+            match m {
+                M::Solar {
+                    area_m2,
+                    efficiency,
+                } => {
+                    if !(area_m2.is_finite() && *area_m2 >= 0.0) {
+                        bad_colony(site, format!("module {i}: bad solar area"), &mut out);
+                    }
+                    if !(efficiency.is_finite() && (0.0..=1.0).contains(efficiency)) {
+                        bad_colony(
+                            site,
+                            format!("module {i}: efficiency outside [0,1]"),
+                            &mut out,
+                        );
+                    }
+                }
+                M::Generator {
+                    fuel,
+                    fuel_rate_per_s,
+                    rate_per_s,
+                    ..
+                } => {
+                    if !res.contains(fuel) {
+                        bad_colony(
+                            site,
+                            format!("module {i}: unknown generator fuel"),
+                            &mut out,
+                        );
+                    }
+                    for (f, v) in [("fuel rate", fuel_rate_per_s), ("rate", rate_per_s)] {
+                        if !(v.is_finite() && *v >= 0.0) {
+                            bad_colony(site, format!("module {i}: bad generator {f}"), &mut out);
+                        }
+                    }
+                }
+                M::Drill {
+                    resource,
+                    base_rate_per_s,
+                    min_concentration,
+                    power_ec_per_s,
+                } => {
+                    if !res.contains(resource) {
+                        bad_colony(
+                            site,
+                            format!("module {i}: unknown drill resource"),
+                            &mut out,
+                        );
+                    }
+                    for (f, v) in [
+                        ("rate", base_rate_per_s),
+                        ("min_concentration", min_concentration),
+                        ("power", power_ec_per_s),
+                    ] {
+                        if !(v.is_finite() && *v >= 0.0) {
+                            bad_colony(site, format!("module {i}: bad drill {f}"), &mut out);
+                        }
+                    }
+                }
+                M::Converter {
+                    recipe,
+                    power_ec_per_s,
+                    ..
+                } => {
+                    if !recipe_ids.contains(recipe.as_str()) {
+                        bad_colony(
+                            site,
+                            format!("module {i}: unknown recipe {recipe:?}"),
+                            &mut out,
+                        );
+                    }
+                    if !(power_ec_per_s.is_finite() && *power_ec_per_s >= 0.0) {
+                        bad_colony(site, format!("module {i}: bad converter power"), &mut out);
+                    }
+                    if let Some(rdef) = recipe_defs.get(recipe.as_str()) {
+                        check_power_collision(
+                            site,
+                            i,
+                            "recipe inputs",
+                            &rdef.inputs,
+                            *power_ec_per_s,
+                            &mut out,
+                        );
+                    }
+                }
+                M::Store { resource, capacity } => {
+                    if !res.contains(resource) {
+                        bad_colony(
+                            site,
+                            format!("module {i}: unknown store resource"),
+                            &mut out,
+                        );
+                    }
+                    if !(capacity.is_finite() && *capacity >= 0.0) {
+                        bad_colony(site, format!("module {i}: bad store capacity"), &mut out);
+                    }
+                }
+                M::Battery { capacity } => {
+                    if !(capacity.is_finite() && *capacity >= 0.0) {
+                        bad_colony(site, format!("module {i}: bad battery capacity"), &mut out);
+                    }
+                }
+                M::Radiator {
+                    area_m2,
+                    emissivity,
+                } => {
+                    if !(area_m2.is_finite() && *area_m2 >= 0.0) {
+                        bad_colony(site, format!("module {i}: bad radiator area"), &mut out);
+                    }
+                    if !(emissivity.is_finite() && (0.0..=1.0).contains(emissivity)) {
+                        bad_colony(
+                            site,
+                            format!("module {i}: emissivity outside [0,1]"),
+                            &mut out,
+                        );
+                    }
+                }
+                M::LifeSupport {
+                    consumes_per_crew,
+                    power_ec_per_s,
+                } => {
+                    check_colony_pairs(
+                        site,
+                        "life-support consumes_per_crew",
+                        consumes_per_crew,
+                        res,
+                        &mut out,
+                    );
+                    if !(power_ec_per_s.is_finite() && *power_ec_per_s >= 0.0) {
+                        bad_colony(
+                            site,
+                            format!("module {i}: bad life-support power"),
+                            &mut out,
+                        );
+                    }
+                    check_power_collision(
+                        site,
+                        i,
+                        "consumes_per_crew",
+                        consumes_per_crew,
+                        *power_ec_per_s,
+                        &mut out,
+                    );
+                }
+            }
+        }
+        let mut seen = BTreeSet::new();
+        for s in &def.stores {
+            if !seen.insert(s.resource.as_str()) {
+                bad_colony(
+                    site,
+                    format!("duplicate store resource {:?}", s.resource),
+                    &mut out,
+                );
+            }
+            if !res.contains(&s.resource) {
+                bad_colony(
+                    site,
+                    format!("unknown store resource {:?}", s.resource),
+                    &mut out,
+                );
+            }
+            if !(s.level.is_finite() && s.level >= 0.0) {
+                bad_colony(
+                    site,
+                    format!("bad store level for {:?}", s.resource),
+                    &mut out,
+                );
+            }
         }
     }
     out
@@ -2493,12 +2867,14 @@ pub fn validate_techtree_loc_keys(
 /// One template's `generate.space` vs the system body + experiment
 /// id sets — extracted from [`validate_contracts`] for the line
 /// budget. `bad` stamps the template's error variant.
+#[allow(clippy::too_many_lines)] // one arm per kind reads as a table
 fn validate_contract_space(
     cid: &str,
     kind: &crate::contract::ContractKind,
     space: &crate::contract::ContractParamSpace,
     body_ids: &BTreeSet<&str>,
     experiment_ids: &BTreeSet<&str>,
+    res: &ResourceFile,
     out: &mut Vec<ValidationError>,
 ) {
     use crate::contract::{ContractParamSpace, ModuleReq, RegimeSpace};
@@ -2597,13 +2973,33 @@ fn validate_contract_space(
         (crate::contract::ContractKind::Rescue, ContractParamSpace::Rescue { bodies }) => {
             bodies_ok(bodies, out);
         }
+        (
+            crate::contract::ContractKind::ColonyResupply,
+            ContractParamSpace::ColonyResupply {
+                bodies,
+                resources,
+                amount,
+            },
+        ) => {
+            bodies_ok(bodies, out);
+            if resources.is_empty() {
+                out.push(bad("resupply candidates: no resources authored"));
+            }
+            for r in resources {
+                if !res.contains(r) {
+                    out.push(bad("resupply candidate resource is not in resources.ron"));
+                }
+            }
+            range_ok(*amount, "resupply amount range is not 0 < lo <= hi", out);
+        }
         _ => out.push(bad("kind and generate.space variants disagree")),
     }
 }
 
 /// §3.6's template rules over the `data/contracts/` set, checked
-/// against the system bodies, the experiment defs, and the merged
-/// tech tree (the cross-reference set the prereqs/candidates name):
+/// against the system bodies, the experiment defs, the resource
+/// registry, and the merged tech tree (the cross-reference set the
+/// prereqs/candidates name):
 ///
 /// - `schema_version` current, `id` ↔ file-stem agreement, unique
 ///   ids, well-formed id;
@@ -2611,7 +3007,8 @@ fn validate_contract_space(
 /// - `weight` finite > 0; rewards finite ≥ 0; `deadline_days`
 ///   `None` or finite > 0;
 /// - candidate lists non-empty, ids resolvable (bodies in the
-///   system, experiments in the loaded set), draw ranges finite
+///   system, experiments in the loaded set, `ColonyResupply`
+///   resources in `resources.ron`), draw ranges finite
 ///   with `0 ≤ lo ≤ hi` (altitude `lo > 0` — a zero-altitude orbit
 ///   band intersects the surface);
 /// - prerequisites well-formed: no duplicates, `count > 0`, tech
@@ -2625,6 +3022,7 @@ pub fn validate_contracts(
     sys: &LoadedSystem,
     experiments: &crate::load::LoadedExperiments,
     techtree: &crate::load::LoadedTechTree,
+    res: &ResourceFile,
 ) -> Vec<ValidationError> {
     use crate::contract::ContractPrereq;
     let mut out = Vec::new();
@@ -2692,6 +3090,7 @@ pub fn validate_contracts(
             &d.generate.space,
             &body_ids,
             &experiment_ids,
+            res,
             &mut out,
         );
         let mut prereqs = BTreeSet::new();
@@ -3987,5 +4386,101 @@ mod tests {
                 .any(|e| matches!(e, ValidationError::BadUpgradeTrack { .. })),
             "{errs:?}"
         );
+    }
+
+    // ---- colony validator tests (§3.5.1) ----
+
+    /// A sites file with one pad + a colony file over it + the recipe
+    /// its converter names — the `electric_charge`-collision negative
+    /// mutates the recipe's inputs.
+    fn colony_fixture() -> (
+        crate::colony::ColonyFile,
+        SiteFile,
+        ResourceFile,
+        crate::load::LoadedRecipes,
+    ) {
+        let sites = SiteFile {
+            schema_version: crate::site::SITE_SCHEMA_VERSION,
+            sites: vec![crate::site::SiteDef {
+                schema_version: crate::site::SITE_SCHEMA_VERSION,
+                id: "pad".into(),
+                display_name: LocKey::from("site.pad"),
+                body: "terrin".into(),
+                latitude_rad: 0.0,
+                longitude_rad: 0.0,
+                altitude_m: 0.0,
+                launch: false,
+                resource_yields: vec![("ore".into(), 0.5)],
+            }],
+        };
+        let colonies = crate::colony::ColonyFile {
+            schema_version: crate::colony::COLONY_SCHEMA_VERSION,
+            colonies: vec![crate::colony::ColonyDef {
+                site: "pad".into(),
+                display_name: LocKey::from("colony.x"),
+                modules: vec![crate::colony::ColonyModuleDef::Converter {
+                    recipe: "recipe.smelt".into(),
+                    priority: 5,
+                    power_ec_per_s: 0.5,
+                }],
+                stores: vec![],
+            }],
+        };
+        let recipes = crate::load::LoadedRecipes {
+            recipes: vec![crate::load::LoadedRecipe {
+                path: std::path::PathBuf::from("recipe.smelt.ron"),
+                def: crate::recipe::RecipeDef {
+                    schema_version: crate::recipe::RECIPE_SCHEMA_VERSION,
+                    id: "recipe.smelt".into(),
+                    display_name: "recipe.smelt.name".into(),
+                    inputs: vec![("ore".into(), 1.0)],
+                    outputs: vec![("metal".into(), 0.5)],
+                },
+            }],
+        };
+        let mut res = res_fixture();
+        res.resources.push(crate::resource::ResourceDef {
+            id: "ore".into(),
+            display_name: "resource.ore".into(),
+            mass_per_unit_kg: 1.0,
+        });
+        (colonies, sites, res, recipes)
+    }
+
+    /// The fixture is clean; listing `electric_charge` in the recipe's
+    /// inputs AND a nonzero `power_ec_per_s` — one EC draw authored
+    /// twice — is rejected, on a converter and on life support alike.
+    #[test]
+    fn colony_power_consumes_collision_is_rejected() {
+        let (file, sites, res, recipes) = colony_fixture();
+        assert!(validate_colonies(&file, &sites, &res, &recipes).is_empty());
+        let (mut bad, _, _, mut bad_recipes) = colony_fixture();
+        bad_recipes.recipes[0]
+            .def
+            .inputs
+            .push(("electric_charge".into(), 1.0));
+        let errs = validate_colonies(&bad, &sites, &res, &bad_recipes);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::InvalidColony { .. })),
+            "{errs:?}"
+        );
+        // Same rule on LifeSupport's consumes_per_crew.
+        bad.colonies[0].modules[0] = crate::colony::ColonyModuleDef::LifeSupport {
+            consumes_per_crew: vec![("electric_charge".into(), 0.1)],
+            power_ec_per_s: 0.5,
+        };
+        let errs = validate_colonies(&bad, &sites, &res, &recipes);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::InvalidColony { .. })),
+            "{errs:?}"
+        );
+        // Zero power → no collision: an EC consumes entry alone is legal.
+        bad.colonies[0].modules[0] = crate::colony::ColonyModuleDef::LifeSupport {
+            consumes_per_crew: vec![("electric_charge".into(), 0.1)],
+            power_ec_per_s: 0.0,
+        };
+        assert!(validate_colonies(&bad, &sites, &res, &recipes).is_empty());
     }
 }
