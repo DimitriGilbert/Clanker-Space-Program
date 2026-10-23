@@ -3,7 +3,12 @@
 //! engine plume — the flat-colored triangle stream `csp-view`'s
 //! `extract_flight` builds (clip-space f32, §2.3; this crate never
 //! sees the f64 bubble frame). Same reverse-Z depth convention as
-//! the map and VAB renderers.
+//! the map and VAB renderers — with one adjustment: this pipeline
+//! compares `GreaterEqual`, not `Greater`, because the fallback sky
+//! sits ON the far plane (NDC z = 0) and geometry exactly at the far
+//! plane can never pass `Greater` against a 0.0-cleared depth buffer.
+//! (A strict `Greater` left an empty flight scene wholly undrawn —
+//! the uniform-clear-color bug the headless render gate now pins.)
 
 use crate::GpuBuffer;
 
@@ -65,7 +70,11 @@ impl FlightRenderer {
         let depth_state = wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
             depth_write_enabled: Some(true),
-            depth_compare: Some(wgpu::CompareFunction::Greater),
+            // `GreaterEqual`, not the map/VAB `Greater`: the fallback
+            // sky's NDC z = 0 IS the far plane, and `Greater` can never
+            // pass against a buffer cleared to 0.0 — geometry at the
+            // far plane would be culled to nothing.
+            depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         };

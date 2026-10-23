@@ -256,12 +256,17 @@ impl App {
         settings_path: Option<std::path::PathBuf>,
         craft_dir: std::path::PathBuf,
     ) -> Self {
-        Self::assemble(
-            View::new().expect("data/ startup load failed"),
-            settings,
-            settings_path,
-            craft_dir,
-        )
+        let mut view = View::new().expect("data/ startup load failed");
+        // M10 first run: seed the stock pad craft so the app opens on a
+        // real flight scene — a Flight view with nothing InBubble draws
+        // nothing but the clear color (the shipped "purple void"). The
+        // same seed `View::new_demo` bakes in; on wasm `View::new` IS
+        // `new_demo` — `is_demo()` short-circuits this branch there.
+        if !view.is_demo() {
+            view.seed_starter_craft()
+                .expect("starter craft seed failed");
+        }
+        Self::assemble(view, settings, settings_path, craft_dir)
     }
 
     /// The `View`-injecting half of construction — the demo build and
@@ -1599,6 +1604,10 @@ mod tests {
         // change the world under test.
         let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
         app.bug_report_root = dir.clone();
+        // A Fatal only exists after a stepped frame in production —
+        // and the §7.4 snapshot refuses while commands sit undrained,
+        // which the first-run starter-craft spawn is until tick 1.
+        app.view.sim_step(1).unwrap();
         app.on_sim_fatal(SimError::Fatal("injected invariant violation (test)"));
         assert!(app.read_only);
         assert_eq!(
@@ -1632,6 +1641,28 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
         assert!(fp.contains(&expect), "fingerprint lacks the state hash");
+    }
+
+    /// M10 first run: the production constructor seeds the stock pad
+    /// craft — the app must not boot onto an empty Flight void (the
+    /// "uniform purple window" regression: the scene pass had nothing
+    /// to draw and every pixel stayed the clear color). The seed rides
+    /// the §7.6 command queue, landing on the first stepped tick.
+    #[test]
+    fn new_game_boots_with_a_pad_vessel() {
+        let dir = tempdir("first-run");
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        app.view.begin_frame();
+        app.view.sim_step(1).unwrap();
+        app.view.end_frame();
+        assert_eq!(app.view.mode(), ViewMode::Flight);
+        assert!(
+            app.view.flight_focus().is_some(),
+            "no pad vessel at boot — the flight scene would be empty"
+        );
+        // …and the same craft is loaded in the VAB for editing.
+        app.view
+            .with_vab_session(|v| assert_eq!(v.session().len(), 3));
     }
 
     /// A rebound key resolves to its new action — the input layer reads

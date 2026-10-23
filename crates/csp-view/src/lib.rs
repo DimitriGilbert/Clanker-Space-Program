@@ -487,6 +487,10 @@ pub enum ViewError {
     /// data set is internally inconsistent (a startup failure like
     /// the others).
     Demo(String),
+    /// The shipping build's first-run starter craft failed to build
+    /// ([`View::seed_starter_craft`]) — the same class of broken-data
+    /// startup failure as [`ViewError::Demo`].
+    Seed(String),
 }
 
 impl std::fmt::Display for ViewError {
@@ -495,6 +499,7 @@ impl std::fmt::Display for ViewError {
             Self::Load(e) => write!(f, "data/ startup load failed: {e}"),
             Self::Sim(e) => write!(f, "data/ bodies rejected by the orbit model: {e}"),
             Self::Demo(e) => write!(f, "demo scenario seed failed: {e}"),
+            Self::Seed(e) => write!(f, "starter craft seed failed: {e}"),
         }
     }
 }
@@ -675,8 +680,25 @@ impl View {
             v.set_part_limit(Some(demo::DEMO_PART_LIMIT));
             v.set_file_io(false);
         });
-        demo::seed_pad_craft(&mut view).map_err(ViewError::Demo)?;
+        demo::seed_pad_craft(&mut view, demo::DEMO_CRAFT_NAME).map_err(ViewError::Demo)?;
         Ok(view)
+    }
+
+    /// The shipping build's first-run seed — `csp-app` calls it once
+    /// after [`View::new`]. Spawns the stock starter craft ("Stock
+    /// Hopper") on the pad through the same
+    /// `launch_craft` command path the §6.3 demo seeds with, and leaves
+    /// the same craft loaded in the VAB session, so the app opens on a
+    /// real flight scene — terrain, sky, and a flyable vessel — instead
+    /// of the empty void a Flight mode with nothing InBubble produces
+    /// (and the editor opens on an editable craft, not a blank
+    /// session). A failure is a broken data set — [`ViewError::Seed`],
+    /// a startup error like the loaders'.
+    ///
+    /// wasm never calls this: its [`View::new`] IS [`View::new_demo`],
+    /// which self-seeds inside the constructor.
+    pub fn seed_starter_craft(&mut self) -> Result<(), ViewError> {
+        demo::seed_pad_craft(self, demo::STARTER_CRAFT_NAME).map_err(ViewError::Seed)
     }
 
     /// wasm: the §6.3 demo IS the web tier — `View::new` builds the

@@ -30,13 +30,19 @@ pub const DEMO_PART_LIMIT: usize = 60;
 /// identical in shape to the desktop paths.
 pub const DEMO_ROOT: &str = "data";
 
-/// The demo scenario's starter craft — catalog ids for the three-part
-/// pad stack (pod / S160 tank / Sparc engine). Flight-capable by
-/// construction: ~200 kN against ~4 t wet is a liftoff TWR ≈ 5.
-const DEMO_CRAFT: [&str; 3] = ["csp.pod.mk1", "csp.tank.s160", "csp.engine.sparc"];
+/// The starter craft — catalog ids for the three-part pad stack (pod /
+/// S160 tank / Sparc engine). Flight-capable by construction: ~200 kN
+/// against ~4 t wet is a liftoff TWR ≈ 5. Shared by the §6.3 demo's
+/// fixed scenario and the shipping build's first-run seed
+/// ([`View::seed_starter_craft`](crate::View::seed_starter_craft)).
+const STARTER_CRAFT: [&str; 3] = ["csp.pod.mk1", "csp.tank.s160", "csp.engine.sparc"];
+
+/// The shipping build's display name for the seeded starter craft —
+/// what the VAB session (and a first craft-file save) calls it.
+pub(crate) const STARTER_CRAFT_NAME: &str = "Stock Hopper";
 
 /// The demo's display name for the starter craft.
-const DEMO_CRAFT_NAME: &str = "Demo Hopper";
+pub(crate) const DEMO_CRAFT_NAME: &str = "Demo Hopper";
 
 /// `(virtual path, bytes)` — the whole §6.3 reduced set, baked in.
 /// Keys are `DEMO_ROOT`-relative repo paths; the ordering is
@@ -155,23 +161,25 @@ pub fn source() -> EmbeddedSource {
     EmbeddedSource::new(FILES)
 }
 
-/// Seed the fixed demo scenario: build the starter craft through the
-/// VAB session's own action channel (so the editor opens on a real,
-/// editable craft — the demo's discovery path), then launch it onto
-/// the pad via the same `SpawnPhysicalVessel` command the LAUNCH button
-/// emits. The spawn lands in the §7.6 command log like every other
-/// mutation.
+/// Seed a starter craft: build it through the VAB session's own action
+/// channel (so the editor opens on a real, editable craft — the
+/// discovery path), then launch it onto the pad via the same
+/// `SpawnPhysicalVessel` command the LAUNCH button emits. The spawn
+/// lands in the §7.6 command log like every other mutation.
 ///
-/// A failure here is a broken demo data set — [`View::new_demo`]
-/// surfaces it as a startup error rather than a silent empty pad.
-pub(crate) fn seed_pad_craft(view: &mut View) -> Result<(), String> {
+/// Shared by [`View::new_demo`] (the fixed §6.3 scenario) and
+/// [`View::seed_starter_craft`](crate::View::seed_starter_craft) (the
+/// shipping build's first run). A failure here is a broken data set —
+/// the caller surfaces it as a startup error rather than a silent
+/// empty pad.
+pub(crate) fn seed_pad_craft(view: &mut View, name: &str) -> Result<(), String> {
     let built = view.with_vab_session(|v| {
-        v.apply(VabAction::Rename(DEMO_CRAFT_NAME.to_string()))
+        v.apply(VabAction::Rename(name.to_string()))
             .map_err(|e| e.to_string())?;
-        v.apply(VabAction::SetRoot(csp_data::PartId::from(DEMO_CRAFT[0])))
+        v.apply(VabAction::SetRoot(csp_data::PartId::from(STARTER_CRAFT[0])))
             .map_err(|e| e.to_string())?;
-        for part in &DEMO_CRAFT[1..] {
-            let parent = v.selected().ok_or("demo craft: no parent selected")?;
+        for part in &STARTER_CRAFT[1..] {
+            let parent = v.selected().ok_or("starter craft: no parent selected")?;
             v.apply(VabAction::AttachAuto {
                 part: csp_data::PartId::from(*part),
                 parent,
@@ -180,11 +188,11 @@ pub(crate) fn seed_pad_craft(view: &mut View) -> Result<(), String> {
         }
         // The launch path resolves the craft from the session's cached
         // analysis — recompute now (the VAB's own frames would do it,
-        // but the demo launches before the editor ever opens).
+        // but the seed launches before the editor ever opens).
         v.recompute();
         if v.analysis().is_none() {
             return Err(format!(
-                "demo craft failed to resolve: {}",
+                "starter craft failed to resolve: {}",
                 v.analysis_error().unwrap_or("no analysis")
             ));
         }

@@ -1130,6 +1130,8 @@ dependencies = [
  "csp-ui",
  "egui",
  "log",
+ "pollster",
+ "wgpu",
 ]
 
 [[package]]

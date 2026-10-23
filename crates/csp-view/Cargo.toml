@@ -35,5 +35,14 @@ log = { workspace = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 bevy_ecs = { workspace = true, features = ["std", "multi_threaded", "async_executor"] }
 
+[dev-dependencies]
+# tests/render_gate.rs — the headless render verification (no surface):
+# wgpu for the surfaceless adapter/device + offscreen texture readback,
+# pollster to drive the async requests on a test thread. Dev-deps only —
+# the shipped tree never links them, and lint-deps scopes to
+# normal,build edges.
+pollster = { workspace = true }
+wgpu = { workspace = true }
+
 [lints]
 workspace = true

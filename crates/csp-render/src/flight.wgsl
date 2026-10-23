@@ -1,6 +1,8 @@
 // Near-flight view (M4c): sky/ground/craft triangle pass — flat
 // vertex colors, no picking. Same reverse-Z depth convention as the
-// map and VAB (z: 1 = near, 0 = far; `Greater` wins).
+// map and VAB (z: 1 = near, 0 = far; `GreaterEqual` wins — the
+// fallback sky lives exactly ON the far plane, which a strict
+// `Greater` would cull to nothing).
 
 struct Vin {
     @location(0) pos: vec3<f32>,
