@@ -1353,6 +1353,48 @@ pub(crate) fn shadow_colonies(
     }
 }
 
+/// The per-module numeric rules shared by the command-side
+/// [`colony_def_fields_finite`] gate and `World::restore`'s crafted-
+/// snapshot gate — every authored rate, capacity, and efficiency/
+/// emissivity band finite and non-negative. A `Converter`'s recipe is
+/// deliberately NOT resolved here: the recipe table is construction
+/// config (re-installed post-restore), so only `power_ec_per_s` is
+/// checkable at the serialization boundary — the recipe resolution
+/// stays with the command-side gate.
+pub(crate) fn colony_module_def_fields_finite(m: &ColonyModuleDef) -> bool {
+    let nonneg = |v: f64| v.is_finite() && v >= 0.0;
+    let pairs = |l: &[(ResourceId, f64)]| l.iter().all(|(_, q)| nonneg(*q));
+    match m {
+        ColonyModuleDef::Solar {
+            area_m2,
+            efficiency,
+        } => nonneg(*area_m2) && (0.0..=1.0).contains(efficiency),
+        ColonyModuleDef::Generator {
+            fuel_rate_per_s,
+            rate_per_s,
+            ..
+        } => nonneg(*fuel_rate_per_s) && nonneg(*rate_per_s),
+        ColonyModuleDef::Drill {
+            base_rate_per_s,
+            min_concentration,
+            power_ec_per_s,
+            ..
+        } => nonneg(*base_rate_per_s) && nonneg(*min_concentration) && nonneg(*power_ec_per_s),
+        ColonyModuleDef::Converter { power_ec_per_s, .. } => nonneg(*power_ec_per_s),
+        ColonyModuleDef::Store { capacity, .. } | ColonyModuleDef::Battery { capacity } => {
+            nonneg(*capacity)
+        }
+        ColonyModuleDef::Radiator {
+            area_m2,
+            emissivity,
+        } => nonneg(*area_m2) && (0.0..=1.0).contains(emissivity),
+        ColonyModuleDef::LifeSupport {
+            consumes_per_crew,
+            power_ec_per_s,
+        } => pairs(consumes_per_crew) && nonneg(*power_ec_per_s),
+    }
+}
+
 /// Command-side sanity for a `ColonyDef` — every authored rate,
 /// capacity, efficiency band, and store level finite and
 /// non-negative (data-side rules live in `validate_colonies`; a
@@ -1369,52 +1411,30 @@ fn colony_def_fields_finite(def: &ColonyDef, recipes: &BTreeMap<RecipeId, Recipe
     let ec_collision = |list: &[(ResourceId, f64)], power: f64| {
         power > 0.0 && list.iter().any(|(r, q)| *q > 0.0 && *r == ec)
     };
-    def.modules.iter().all(|m| match m {
-        ColonyModuleDef::Solar {
-            area_m2,
-            efficiency,
-        } => nonneg(*area_m2) && (0.0..=1.0).contains(efficiency),
-        ColonyModuleDef::Generator {
-            fuel_rate_per_s,
-            rate_per_s,
-            ..
-        } => nonneg(*fuel_rate_per_s) && nonneg(*rate_per_s),
-        ColonyModuleDef::Drill {
-            base_rate_per_s,
-            min_concentration,
-            power_ec_per_s,
-            ..
-        } => nonneg(*base_rate_per_s) && nonneg(*min_concentration) && nonneg(*power_ec_per_s),
-        ColonyModuleDef::Converter {
-            recipe,
-            power_ec_per_s,
-            ..
-        } => {
-            // M8-B: the recipe must resolve, and its own rates must be
-            // finite non-negative — a missing recipe is a command-side
-            // rejection, not a silent inert module.
-            nonneg(*power_ec_per_s)
-                && recipes.get(recipe).is_some_and(|r| {
-                    pairs(&r.inputs)
-                        && pairs(&r.outputs)
-                        && !ec_collision(&r.inputs, *power_ec_per_s)
-                })
-        }
-        ColonyModuleDef::Store { capacity, .. } | ColonyModuleDef::Battery { capacity } => {
-            nonneg(*capacity)
-        }
-        ColonyModuleDef::Radiator {
-            area_m2,
-            emissivity,
-        } => nonneg(*area_m2) && (0.0..=1.0).contains(emissivity),
-        ColonyModuleDef::LifeSupport {
-            consumes_per_crew,
-            power_ec_per_s,
-        } => {
-            pairs(consumes_per_crew)
-                && nonneg(*power_ec_per_s)
-                && !ec_collision(consumes_per_crew, *power_ec_per_s)
-        }
+    def.modules.iter().all(|m| {
+        colony_module_def_fields_finite(m)
+            && match m {
+                ColonyModuleDef::Converter {
+                    recipe,
+                    power_ec_per_s,
+                    ..
+                } => {
+                    // M8-B: the recipe must resolve, and its own rates
+                    // must be finite non-negative — a missing recipe is
+                    // a command-side rejection, not a silent inert
+                    // module.
+                    recipes.get(recipe).is_some_and(|r| {
+                        pairs(&r.inputs)
+                            && pairs(&r.outputs)
+                            && !ec_collision(&r.inputs, *power_ec_per_s)
+                    })
+                }
+                ColonyModuleDef::LifeSupport {
+                    consumes_per_crew,
+                    power_ec_per_s,
+                } => !ec_collision(consumes_per_crew, *power_ec_per_s),
+                _ => true,
+            }
     }) && def.stores.iter().all(|s| nonneg(s.level))
 }
 

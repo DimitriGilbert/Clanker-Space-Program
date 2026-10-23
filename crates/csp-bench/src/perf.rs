@@ -697,6 +697,10 @@ fn measure_landed_300() -> Result<Measurement, ReplayError> {
 /// `step_frame` cost at one-tick targets.
 fn measure_rails_500() -> Result<Measurement, ReplayError> {
     let mut w = shipping_world()?;
+    let mu = w
+        .environment()
+        .ok_or(ReplayError::MalformedGolden("no env"))?
+        .mu_m3_per_s2;
     for i in 0..500u64 {
         // Semi-major axes spread 700 km → ~5.9e6 m, all inside
         // Terrin's 8.4e7 m SOI; inclinations/Ω phase the field.
@@ -713,7 +717,10 @@ fn measure_rails_500() -> Result<Measurement, ReplayError> {
                     ascending_node_rad: (i % 24) as f64 * 0.26,
                     arg_periapsis_rad: (i % 8) as f64 * 0.4,
                     mean_anomaly_epoch_rad: (i % 64) as f64 * 0.098,
-                    period_s: 0.0,
+                    // `period_s` is redundant (the model never reads
+                    // it) but the spawn/restore gates check its sign —
+                    // author the closed form like the system sheets.
+                    period_s: 2.0 * core::f64::consts::PI * libm::sqrt(a * a * a / mu),
                 },
             },
         );

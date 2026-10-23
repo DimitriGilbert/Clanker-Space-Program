@@ -472,11 +472,12 @@ fn hex_decode(s: &str) -> Option<[u8; 32]> {
     if b.len() != 64 {
         return None;
     }
+    // Lowercase only — the `BadHeader` contract is "64 lowercase-hex
+    // characters", matching `hex_encode`'s output exactly.
     let nib = |c: u8| -> Option<u8> {
         match c {
             b'0'..=b'9' => Some(c - b'0'),
             b'a'..=b'f' => Some(c - b'a' + 10),
-            b'A'..=b'F' => Some(c - b'A' + 10),
             _ => None,
         }
     };
@@ -539,7 +540,11 @@ pub fn decode_save(bytes: &[u8]) -> Result<Save, SaveError> {
             body_format: header.body_format,
         });
     }
-    if header.body_len as usize != body.len() {
+    // Compare in `u64` — `body_len as usize` would truncate on wasm32
+    // (a header declaring `2³² + body.len()` would pass the check
+    // there). `parse_header`'s foreign-input convention: no usize
+    // arithmetic on file-controlled numbers.
+    if header.body_len != body.len() as u64 {
         return Err(SaveError::TrailingBytes);
     }
     let inflated = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(body, MAX_INFLATED_BODY)

@@ -2484,11 +2484,35 @@ impl World {
     ///   unreachable for restored worlds);
     /// - `vessel.id == key` per arena entry and `next_vessel_id` exceeds
     ///   every live id (monotonic, never reused);
-    /// - `tracked_vessels ⊆ vessels`;
+    /// - `tracked_vessels ⊆ vessels` and `autopilots ⊆ vessels` (a bound
+    ///   autopilot must not outlive its vessel);
+    /// - `script_op_budget ≥ 1` (the `event_budget` rule — the setter's
+    ///   clamp is not repeated here);
     /// - every `joint_refused` pair is canonical `(a < b)` with both
     ///   ids below `next_vessel_id` — pairs naming never-issued ids
     ///   would bind spawns the writer never saw, and a reordered pair
-    ///   would silently never match the fixed detection order.
+    ///   would silently never match the fixed detection order;
+    /// - every `OnRails` orbit resolves and decodes against the
+    ///   handed-in model (`parent ∈ orbits`, the `state_at` funnel's
+    ///   finiteness/shape rules — the `apply_spawn_vessel` gate), and
+    ///   every serialized `craft` passes the spawn/manufacture gate
+    ///   (parallel `part_costs`/`reliability` tables,
+    ///   `csp_phys::weld` — not `check_tank_masses`, whose capacity
+    ///   bound rewelds legitimately undercut) in every residence —
+    ///   plus each `ActiveBuild.craft` in the build arena;
+    /// - quaternions are finite AND nonzero-norm (`body.rot`,
+    ///   `pose.orientation` — a zero quat passes `is_finite` but NaNs
+    ///   at normalize, the `SetAttitude`/spawn convention);
+    /// - colony `site`/`body` resolve (the site-state arena and the
+    ///   orbit model), the founding pose and held solve outputs are
+    ///   finite and in range, module defs carry finite non-negative
+    ///   rates, `solved_tick ≤ clock`, and a live colony's
+    ///   `inspection_tick` pairs with exactly one pending
+    ///   `ColonyInspection` at that tick in both directions;
+    /// - roster keys sit below `next_crew_id`, `SiteState.id == key`,
+    ///   `ActiveBench.site ∈ economy.sites`, and part instances are
+    ///   unique across the whole save (the KDF keys `instance.0`
+    ///   alone).
     ///
     /// `source_seqs` entries are free-form per-source dequeue counters —
     /// no external constraint pins them (the command log is not part of
@@ -2532,7 +2556,21 @@ impl World {
         if !snapshot.life_support_cfg.is_valid() {
             return Err(SimError::Fatal("snapshot: invalid life-support config"));
         }
-        if snapshot.next_vessel_id < snapshot.vessels.keys().next_back().map_or(0, |id| id.0 + 1) {
+        // The `event_budget` gate's mirror — `set_script_op_budget`
+        // clamps to ≥1, so a serialized 0 is invalid input like a zero
+        // event budget, not a value to silently repair.
+        if snapshot.script_op_budget == 0 {
+            return Err(SimError::Fatal("snapshot: zero script op budget"));
+        }
+        // The per-entry form (`id >= next` ⇒ Fatal) — `id.0 + 1`
+        // overflows on a crafted `u64::MAX` key, panicking in debug and
+        // wrapping past the check in release.
+        if snapshot
+            .vessels
+            .keys()
+            .next_back()
+            .is_some_and(|id| id.0 >= snapshot.next_vessel_id)
+        {
             return Err(SimError::Fatal(
                 "snapshot: next_vessel_id not ahead of live ids",
             ));
@@ -2542,7 +2580,7 @@ impl World {
             if vessel.id != *id {
                 return Err(SimError::Fatal("snapshot: vessel id != arena key"));
             }
-            restore_vessel_state(vessel, physics.is_some())?;
+            restore_vessel_state(vessel, &orbits, physics.as_ref())?;
         }
         for id in &snapshot.tracked_vessels {
             if !snapshot.vessels.contains_key(id) {
@@ -2581,10 +2619,12 @@ impl World {
         let mut wake_events = BTreeMap::new();
         // M8-A: colony boundary/notification uniqueness — a live
         // colony publishes at most one terminator, one store-bound,
-        // one inspection, and one of each transition.
+        // one inspection, and one of each transition. The inspection
+        // set carries the event's tick for the `inspection_tick`
+        // pairing below (the node-events precedent).
         let mut colony_terminator = BTreeSet::new();
         let mut colony_store_events = BTreeSet::new();
-        let mut colony_inspections = BTreeSet::new();
+        let mut colony_inspections = BTreeMap::new();
         let mut colony_transitions = BTreeSet::new();
         // M8-C: the check's uniqueness + the depletion's per-vessel
         // uniqueness (the `colony_transitions` precedent).
@@ -2664,7 +2704,7 @@ impl World {
                     Some(*colony)
                 }
                 EventKind::ColonyInspection { colony } => {
-                    if !colony_inspections.insert(*colony) {
+                    if colony_inspections.insert(*colony, e.tick).is_some() {
                         return Err(SimError::Fatal("snapshot: duplicate colony inspection"));
                     }
                     Some(*colony)
@@ -2830,7 +2870,12 @@ impl World {
                 return Err(SimError::Fatal("snapshot: incoherent script record"));
             }
         }
-        if snapshot.next_script_id < snapshot.scripts.keys().next_back().map_or(0, |id| id.0 + 1) {
+        if snapshot
+            .scripts
+            .keys()
+            .next_back()
+            .is_some_and(|id| id.0 >= snapshot.next_script_id)
+        {
             return Err(SimError::Fatal(
                 "snapshot: next_script_id not ahead of live ids",
             ));
@@ -2851,7 +2896,12 @@ impl World {
                 return Err(SimError::Fatal("snapshot: wake names unknown script"));
             }
         }
-        for a in snapshot.autopilots.values() {
+        // A bound autopilot must not outlive its vessel (the removal
+        // paths all delete it) — the `tracked_vessels` subset gate.
+        for (id, a) in &snapshot.autopilots {
+            if !snapshot.vessels.contains_key(id) {
+                return Err(SimError::Fatal("snapshot: autopilot on unknown vessel"));
+            }
             if !scripts::autopilot_state_is_valid(a) {
                 return Err(SimError::Fatal("snapshot: incoherent autopilot record"));
             }
@@ -2873,57 +2923,7 @@ impl World {
                 ));
             }
         }
-        // M8-A: colony-arena coherence — arena key, monotonic id
-        // counter, parallel module/fraction arrays, finite in-bound
-        // stores, and the roster↔crew-set pairing both directions.
-        for (id, c) in &snapshot.colonies {
-            if c.id != *id {
-                return Err(SimError::Fatal("snapshot: colony id != arena key"));
-            }
-            if c.module_fractions.len() != c.modules.len() {
-                return Err(SimError::Fatal(
-                    "snapshot: colony fractions/modules mismatch",
-                ));
-            }
-            for s in c.stores.values() {
-                if !(s.anchor_level.is_finite()
-                    && s.capacity.is_finite()
-                    && s.net_rate_per_s.is_finite()
-                    && s.anchor_level >= 0.0
-                    && s.anchor_level <= s.capacity + 1e-6
-                    && s.anchor_tick <= snapshot.clock_ticks)
-                {
-                    return Err(SimError::Fatal("snapshot: incoherent colony store"));
-                }
-            }
-            for crew in &c.crew {
-                let m = snapshot.economy.crew.get(crew);
-                if m.is_none_or(|m| m.location != CrewLocation::Colony(*id)) {
-                    return Err(SimError::Fatal("snapshot: colony crew not at colony"));
-                }
-            }
-        }
-        if snapshot.next_colony_id
-            < snapshot
-                .colonies
-                .keys()
-                .next_back()
-                .map_or(0, |id| id.0 + 1)
-        {
-            return Err(SimError::Fatal(
-                "snapshot: next_colony_id not ahead of live ids",
-            ));
-        }
-        for (cid, m) in &snapshot.economy.crew {
-            if let CrewLocation::Colony(id) = &m.location {
-                match snapshot.colonies.get(id) {
-                    Some(c) if c.crew.contains(cid) => {}
-                    _ => {
-                        return Err(SimError::Fatal("snapshot: roster colony ref incoherent"));
-                    }
-                }
-            }
-        }
+        restore_colony_state(&snapshot, &orbits, &colony_inspections)?;
         Ok(Self {
             clock: SimTime(snapshot.clock_ticks),
             warp_level: snapshot.warp_level,
@@ -3953,7 +3953,9 @@ impl World {
             // split (the `shadow_*` methods need a whole `self`). The
             // roster re-seat captures `economy` lazily inside
             // `apply_latch` — only a merge with absorbed crew mutates
-            // the book.
+            // the book — and `autopilots` captures the same lazy way:
+            // only a merge whose absorbed vessel carried a bound
+            // autopilot drops a record.
             if !self.joints.is_empty() {
                 if shadow.tracked_vessels.is_none() {
                     shadow.tracked_vessels = Some(self.tracked_vessels.clone());
@@ -3972,6 +3974,7 @@ impl World {
                 &mut self.tracked_vessels,
                 &self.event_heap,
                 &mut self.transfers,
+                &mut self.autopilots,
                 &mut self.science,
                 &mut self.economy,
                 &self.docking,
@@ -4842,6 +4845,15 @@ impl World {
     ) -> Result<(), SimError> {
         if self.vessel_slots_in_use() >= self.caps.max_vessels {
             return Err(SimError::Recoverable("spawn: max_tracked_vessels reached"));
+        }
+        // The restore gate's authored-field rule, front-doored:
+        // `period_s` is redundant — unhashed and unread by the model
+        // (open orbits stamp `+∞` by convention) — so only its sign
+        // matters, and a NaN or non-positive value would mint an orbit
+        // `World::restore` refuses. `Recoverable` like every other
+        // element defect: bad input, not an invariant violation.
+        if elements.period_s.is_nan() || elements.period_s <= 0.0 {
+            return Err(SimError::Recoverable("spawn: non-positive orbit period"));
         }
         let orbit = OrbitState {
             parent: parent.clone(),
@@ -8060,6 +8072,11 @@ fn restore_transfer_state(
     snapshot: &WorldSnapshot,
     transfer_events: &BTreeMap<TransferId, u64>,
 ) -> Result<(), SimError> {
+    // Crew ids are a single arena: unique across every vessel's seats,
+    // every colony's crew set, and (separately) the in-flight cargo —
+    // an in-flight member still holds their source seat until landing.
+    let mut crew_seen = std::collections::BTreeSet::new();
+    let mut in_flight_crew = std::collections::BTreeSet::new();
     for (id, t) in &snapshot.transfers {
         if id.0 >= snapshot.next_transfer_id {
             return Err(SimError::Fatal("snapshot: transfer id not below next"));
@@ -8091,6 +8108,14 @@ fn restore_transfer_state(
                 if crew.0 >= snapshot.next_crew_id {
                     return Err(SimError::Fatal("snapshot: transfer names unissued crew"));
                 }
+                // The apply gate's "crew already in flight" rule — one
+                // in-flight transfer per member. Deliberately NOT
+                // `crew_seen`: an in-flight member keeps their source
+                // seat (or colony slot) until `land_crew` runs, so the
+                // same id legitimately appears seated AND in flight.
+                if !in_flight_crew.insert(*crew) {
+                    return Err(SimError::Fatal("snapshot: crew in flight twice"));
+                }
             }
         }
         match transfer_events.get(id) {
@@ -8109,10 +8134,19 @@ fn restore_transfer_state(
             ));
         }
     }
-    let mut crew_seen = std::collections::BTreeSet::new();
     for vessel in snapshot.vessels.values() {
         for c in &vessel.crew {
             if c.id.0 >= snapshot.next_crew_id || !crew_seen.insert(c.id) {
+                return Err(SimError::Fatal("snapshot: crew id not unique / issued"));
+            }
+        }
+    }
+    // The colony crew sets share the same arena — a member at a colony
+    // cannot also hold a seat (the roster pairing already refuses that
+    // for roster members; this covers the id-only corner too).
+    for colony in snapshot.colonies.values() {
+        for c in &colony.crew {
+            if c.0 >= snapshot.next_crew_id || !crew_seen.insert(*c) {
                 return Err(SimError::Fatal("snapshot: crew id not unique / issued"));
             }
         }
@@ -8141,6 +8175,10 @@ fn restore_build_state(
         if !snapshot.economy.sites.contains_key(&b.site) {
             return Err(SimError::Fatal("snapshot: build names unknown site"));
         }
+        // The order-time gate's mirror: `apply_manufacture_craft`
+        // refuses a craft that fails the spawn checks, so a stored one
+        // must pass them — its `craft` is hashed state.
+        check_restored_craft(&b.craft)?;
         match build_events.get(id) {
             Some(&tick) if tick == b.complete_tick => {}
             _ => {
@@ -8292,6 +8330,13 @@ fn restore_economy_state(snapshot: &WorldSnapshot) -> Result<(), SimError> {
         return Err(SimError::Fatal("snapshot: insolvent flag with funds"));
     }
     for (id, m) in &e.crew {
+        // The roster draws from `next_crew_id` like every seat —
+        // the seats/cargo gates' counterpart.
+        if id.0 >= snapshot.next_crew_id {
+            return Err(SimError::Fatal(
+                "snapshot: roster id not below next_crew_id",
+            ));
+        }
         if !(m.salary_per_s.is_finite() && m.salary_per_s >= 0.0) || m.skill > 5 {
             return Err(SimError::Fatal("snapshot: incoherent crew member"));
         }
@@ -8333,7 +8378,13 @@ fn restore_economy_state(snapshot: &WorldSnapshot) -> Result<(), SimError> {
             }
         }
     }
-    for s in e.sites.values() {
+    for (key, s) in &e.sites {
+        // `hash_economy` reads `s.id`, not the map key — a crafted
+        // mismatch would hash an identity lookups cannot find (the
+        // sibling arenas' `x.id == key` rule).
+        if s.id != *key {
+            return Err(SimError::Fatal("snapshot: site id != arena key"));
+        }
         for u in s.inventory.values() {
             if !(u.is_finite() && *u >= 0.0) {
                 return Err(SimError::Fatal("snapshot: non-finite site inventory"));
@@ -8522,6 +8573,131 @@ fn check_restored_maneuver(vessel: &Vessel) -> Result<(), SimError> {
     Ok(())
 }
 
+/// M8-A §3.5.1 colony-arena coherence for [`World::restore`] — arena
+/// key, monotonic id counter, parallel module/fraction arrays,
+/// finite in-bound stores, resolved body/site refs, finite held-
+/// solve floats, the `inspection_tick`↔event pairing, and the
+/// roster↔crew-set pairing both directions.
+fn restore_colony_state(
+    snapshot: &WorldSnapshot,
+    orbits: &PatchedConics,
+    colony_inspections: &BTreeMap<ColonyId, u64>,
+) -> Result<(), SimError> {
+    // M8-A: colony-arena coherence — arena key, monotonic id
+    // counter, parallel module/fraction arrays, finite in-bound
+    // stores, resolved body/site refs, finite held-solve floats,
+    // the `inspection_tick`↔event pairing, and the
+    // roster↔crew-set pairing both directions.
+    for (id, c) in &snapshot.colonies {
+        if c.id != *id {
+            return Err(SimError::Fatal("snapshot: colony id != arena key"));
+        }
+        // The founding resolves `site` against the site arena and
+        // `body` against the orbit model (`apply_found_colony`'s
+        // `site_defs`/`colony_env` lookups) — the site half is
+        // serializable state, resolvable here; the def/env tables
+        // themselves are construction config.
+        if !snapshot.economy.sites.contains_key(&c.site) {
+            return Err(SimError::Fatal("snapshot: colony site not in arena"));
+        }
+        if !orbits.bodies().contains_key(&c.body) {
+            return Err(SimError::Fatal("snapshot: colony body not in orbit model"));
+        }
+        // The founding pose gate verbatim — a hashed NaN or a
+        // negative founding altitude is unreachable-legit input.
+        if !(c.latitude_rad.is_finite()
+            && c.longitude_rad.is_finite()
+            && c.altitude_m.is_finite()
+            && c.altitude_m >= 0.0)
+        {
+            return Err(SimError::Fatal("snapshot: incoherent colony pose"));
+        }
+        if c.module_fractions.len() != c.modules.len() {
+            return Err(SimError::Fatal(
+                "snapshot: colony fractions/modules mismatch",
+            ));
+        }
+        // The held solve outputs — granted fractions live in
+        // [0, 1] (the allocation pass clamps them there) and a
+        // recorded equilibrium temperature is finite non-negative.
+        if c.module_fractions
+            .iter()
+            .any(|f| !(f.is_finite() && (0.0..=1.0).contains(f)))
+            || c.t_eq_k.is_some_and(|t| !(t.is_finite() && t >= 0.0))
+        {
+            return Err(SimError::Fatal("snapshot: incoherent colony solve"));
+        }
+        for m in &c.modules {
+            if !colonies::colony_module_def_fields_finite(&m.def) {
+                return Err(SimError::Fatal("snapshot: incoherent colony module"));
+            }
+        }
+        if c.solved_tick > snapshot.clock_ticks {
+            return Err(SimError::Fatal("snapshot: colony solve ahead of clock"));
+        }
+        for s in c.stores.values() {
+            if !(s.anchor_level.is_finite()
+                && s.capacity.is_finite()
+                && s.net_rate_per_s.is_finite()
+                && s.anchor_level >= 0.0
+                && s.anchor_level <= s.capacity + 1e-6
+                && s.anchor_tick <= snapshot.clock_ticks)
+            {
+                return Err(SimError::Fatal("snapshot: incoherent colony store"));
+            }
+        }
+        // The `inspection_tick`↔`ColonyInspection` pairing — the
+        // sibling pairings' rule, strict in both directions but
+        // scoped to a LIVE colony: the recompute publishes exactly
+        // one inspection event at `inspection_tick` and the firing
+        // consumes it, so `Some(t)` pairs with a pending event at
+        // `t` (a `t` at-or-behind the clock stands only mid-flush,
+        // where the pending at-clock event IS the legal deferred
+        // state). Dormant/abandoned colonies keep the serialized
+        // record — the terminal transitions never clear it — but
+        // hold no events at all.
+        let expected = colonies::colony_live(&c.state)
+            .then_some(c.inspection_tick)
+            .flatten();
+        match (expected, colony_inspections.get(id)) {
+            (Some(t), Some(&et)) if t == et => {}
+            (None, None) => {}
+            _ => {
+                return Err(SimError::Fatal(
+                    "snapshot: colony inspection / event mismatch",
+                ));
+            }
+        }
+        for crew in &c.crew {
+            let m = snapshot.economy.crew.get(crew);
+            if m.is_none_or(|m| m.location != CrewLocation::Colony(*id)) {
+                return Err(SimError::Fatal("snapshot: colony crew not at colony"));
+            }
+        }
+    }
+    if snapshot
+        .colonies
+        .keys()
+        .next_back()
+        .is_some_and(|id| id.0 >= snapshot.next_colony_id)
+    {
+        return Err(SimError::Fatal(
+            "snapshot: next_colony_id not ahead of live ids",
+        ));
+    }
+    for (cid, m) in &snapshot.economy.crew {
+        if let CrewLocation::Colony(id) = &m.location {
+            match snapshot.colonies.get(id) {
+                Some(c) if c.crew.contains(cid) => {}
+                _ => {
+                    return Err(SimError::Fatal("snapshot: roster colony ref incoherent"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `World::restore`'s refused-pair gate (§2.4/§7.2): every serialized
 /// `joint_refused` entry must be a canonical `(a < b)` pair over the
 /// live-id domain — a crafted entry could otherwise silently suppress
@@ -8539,11 +8715,39 @@ fn check_refused_pairs(snapshot: &WorldSnapshot) -> Result<(), SimError> {
     Ok(())
 }
 
-/// §7.3 restore validation per vessel. `InBubble` bodies are rebuilt
-/// by re-welding the stored craft — the weld's mass properties are a
-/// derived cache, so restoring means re-running `weld` and stamping the
-/// serialized kinematic/control/settle fields back on. `SurfaceLatched`
-/// keeps only the fixed-frame pose record; `OnRails` needs nothing.
+/// The spawn/manufacture craft gate, applied to every serialized
+/// [`CraftDef`] — a stored craft is hashed state whose fields are
+/// only ever written by paths that passed these checks verbatim:
+/// `part_costs` parallel to `parts` and finite non-negative, the
+/// reliability table empty or parallel with valid specs, and
+/// `csp_phys::weld` succeeding (its `validate_structure`/
+/// `validate_effective` reject non-finite or non-physical part
+/// data — a welded body must be re-derivable). `check_tank_masses`
+/// is deliberately NOT repeated: it is a spawn-time authoring
+/// convention — `mass_kg` covers the declared capacity — but
+/// rewelds rewrite `mass_kg` to the bucketed current-fill estimate,
+/// which legitimately sits below the capacity bound.
+fn check_restored_craft(craft: &CraftDef) -> Result<(), SimError> {
+    if craft.part_costs.len() != craft.parts.len()
+        || craft
+            .part_costs
+            .iter()
+            .any(|c| !(c.is_finite() && *c >= 0.0))
+    {
+        return Err(SimError::Fatal("snapshot: craft part_costs malformed"));
+    }
+    if !craft.reliability.is_empty()
+        && (craft.reliability.len() != craft.parts.len()
+            || craft.reliability.iter().any(|s| !s.is_valid()))
+    {
+        return Err(SimError::Fatal(
+            "snapshot: craft reliability table malformed",
+        ));
+    }
+    csp_phys::weld(&craft.graph, &craft.parts).map_err(|e| SimError::Fatal(e.reason()))?;
+    Ok(())
+}
+
 /// M9b §3.4 coherence for [`World::restore`] — the
 /// `restore_build_state` precedent: the reliability config is sane,
 /// every part instance is unique across the save and below the
@@ -8561,19 +8765,22 @@ fn restore_reliability_state(
     if !snapshot.reliability_cfg.is_valid() {
         return Err(SimError::Fatal("snapshot: invalid reliability config"));
     }
+    // The instance allocator is global and the KDF keys `instance.0`
+    // alone (`{RELIABILITY}`/`{IGNITION}` streams) — uniqueness is
+    // across the save, never merely per-vessel.
     let mut instances = BTreeSet::new();
-    for (vid, vessel) in &snapshot.vessels {
+    for vessel in snapshot.vessels.values() {
         for rec in vessel.reliability.values() {
             if rec.instance.0 >= snapshot.next_part_instance_id {
                 return Err(SimError::Fatal(
                     "snapshot: part instance not below next counter",
                 ));
             }
-            if !instances.insert((vid, rec.instance)) {
+            if !instances.insert(rec.instance) {
                 return Err(SimError::Fatal("snapshot: duplicate part instance"));
             }
             if let Some(t) = rec.pending_failure_tick
-                && pf_events.get(&(*vid, rec.instance)) != Some(&t)
+                && pf_events.get(&(vessel.id, rec.instance)) != Some(&t)
             {
                 return Err(SimError::Fatal(
                     "snapshot: pending failure tick / event mismatch",
@@ -8587,6 +8794,9 @@ fn restore_reliability_state(
         }
         if id.0 >= snapshot.next_bench_id {
             return Err(SimError::Fatal("snapshot: bench id not below next"));
+        }
+        if !snapshot.economy.sites.contains_key(&b.site) {
+            return Err(SimError::Fatal("snapshot: bench names unknown site"));
         }
         if !(b.units.is_finite() && b.units > 0.0) {
             return Err(SimError::Fatal("snapshot: non-positive bench units"));
@@ -8607,14 +8817,30 @@ fn restore_reliability_state(
     Ok(())
 }
 
+/// §7.3 restore validation per vessel. `InBubble` bodies are rebuilt
+/// by re-welding the stored craft — the weld's mass properties are a
+/// derived cache, so restoring means re-running `weld` and stamping the
+/// serialized kinematic/control/settle fields back on. `SurfaceLatched`
+/// keeps only the fixed-frame pose record; `OnRails`' orbit is proven
+/// against the handed-in model like the spawn gate (`parent` resolves,
+/// elements decode). `physics` is the construction-config channel —
+/// its `dominant` names the body every latch pose is relative to.
 #[allow(clippy::too_many_lines)] // the check list grew with M9b
-fn restore_vessel_state(vessel: &mut Vessel, has_physics: bool) -> Result<(), SimError> {
+fn restore_vessel_state(
+    vessel: &mut Vessel,
+    orbits: &PatchedConics,
+    physics: Option<&PhysicsConfig>,
+) -> Result<(), SimError> {
     check_restored_maneuver(vessel)?;
     // M4b: the serialized thermal record must match the craft one-to-
     // one — every graph node has exactly one temperature, finite and
     // non-negative, and a craft-less vessel has none.
     match &vessel.craft {
         Some(craft) => {
+            // Every serialized craft passes the spawn/manufacture gate
+            // — `InBubble`'s re-weld below re-proves it, but a rails or
+            // latched vessel's `craft` is equally hashed state.
+            check_restored_craft(craft)?;
             if !vessel
                 .thermal
                 .part_temps_k
@@ -8715,7 +8941,7 @@ fn restore_vessel_state(vessel: &mut Vessel, has_physics: bool) -> Result<(), Si
     }
     match &mut vessel.state {
         VesselState::InBubble(body) => {
-            if !has_physics {
+            if physics.is_none() {
                 return Err(SimError::Fatal(
                     "snapshot: bubble-resident vessel but no physics config",
                 ));
@@ -8733,8 +8959,11 @@ fn restore_vessel_state(vessel: &mut Vessel, has_physics: bool) -> Result<(), Si
             );
             *body = csp_phys::weld(&craft.graph, &craft.parts)
                 .map_err(|e| SimError::Fatal(e.reason()))?;
+            // The `SetAttitude`/spawn convention — a finite but
+            // zero-norm quaternion would NaN at the first integrate.
             if !(pos.is_finite()
                 && rot.is_finite()
+                && rot.norm() > 0.0
                 && vel.is_finite()
                 && ang_vel.is_finite()
                 && throttle.is_finite())
@@ -8749,23 +8978,47 @@ fn restore_vessel_state(vessel: &mut Vessel, has_physics: bool) -> Result<(), Si
             body.settle = settle;
         }
         VesselState::SurfaceLatched(pose) => {
-            if !has_physics {
+            let Some(physics) = physics else {
                 return Err(SimError::Fatal(
                     "snapshot: latched vessel but no physics config",
                 ));
-            }
+            };
             if vessel.craft.is_none() {
                 return Err(SimError::Fatal("snapshot: latched vessel has no craft"));
             }
+            // The pose record lives in `dominant`'s rotating frame —
+            // `surface_pose_capture` writes it and nothing else can.
+            if pose.body != physics.dominant {
+                return Err(SimError::Fatal("snapshot: latch pose on wrong body"));
+            }
+            // Same zero-norm rule as the bubble rot — a crafted
+            // zero quat would NaN `surface_pose_restore`'s normalize
+            // at unlatch.
             if !(pose.latitude_rad.is_finite()
                 && pose.longitude_rad.is_finite()
                 && pose.altitude_m.is_finite()
-                && pose.orientation.is_finite())
+                && pose.orientation.is_finite()
+                && pose.orientation.norm() > 0.0)
             {
                 return Err(SimError::Fatal("snapshot: non-finite latch pose"));
             }
         }
-        VesselState::OnRails(_) => {}
+        VesselState::OnRails(orbit) => {
+            // The `apply_spawn_vessel` gate verbatim: `parent` must
+            // resolve in the handed-in model and the elements must
+            // decode under its μ — `state_at`'s funnel carries every
+            // finiteness/shape rule (e ≥ 0, the conic-class `a` signs,
+            // finite angles, a live periapsis). `period_s` is the
+            // redundant authored field — unhashed and unread, `+∞` the
+            // documented open-orbit marker — so only its sign matters:
+            // NaN or non-positive is crafted.
+            if orbits.state_at(orbit, orbit.epoch).is_err()
+                || orbit.elements.period_s.is_nan()
+                || orbit.elements.period_s <= 0.0
+            {
+                return Err(SimError::Fatal("snapshot: incoherent rails orbit"));
+            }
+        }
     }
     Ok(())
 }
@@ -10459,6 +10712,32 @@ mod tests {
         assert!(w.vessels.is_empty());
     }
 
+    /// The restore gate's `period_s` sign rule, front-doored: a
+    /// `SpawnVessel` carrying a non-positive or NaN period rejects
+    /// `Recoverable` — the same defect class as every other bad
+    /// element — rather than minting an on-rails orbit
+    /// `World::restore` would refuse.
+    #[test]
+    fn spawn_vessel_rejects_nonpositive_period() {
+        for period_s in [0.0, -1.0, f64::NAN] {
+            let mut w = World::with_system(test_system());
+            let mut elements = leo_elements();
+            elements.period_s = period_s;
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::SpawnVessel {
+                    parent: BodyId::from("p"),
+                    elements,
+                },
+            );
+            let r = w.step_frame(1).unwrap();
+            assert_eq!(r.rejected.len(), 1, "period_s={period_s}");
+            assert!(matches!(r.rejected[0].error, SimError::Recoverable(_)));
+            assert!(w.vessels.is_empty(), "no orbit minted: period_s={period_s}");
+        }
+    }
+
     /// The §2.6.6 full-cycle: the moon-crossing hyperbola produces
     /// `Enter{m} → Exit{m} → Exit{p}` in that (tick, seq) order, each
     /// transition re-basing the vessel's parent, and each fire
@@ -11123,6 +11402,428 @@ mod tests {
             World::restore(PatchedConics::new(BTreeMap::new()), None, s),
             Err(SimError::Fatal(_))
         ));
+    }
+
+    /// The Phase-8 payload gates: every hashed payload a crafted
+    /// snapshot could carry is refused with `Fatal`, never half-loaded.
+    /// Shared fixtures for the two case tables below.
+    fn crafted_physics() -> Option<PhysicsConfig> {
+        Some(PhysicsConfig {
+            environment: test_env(false),
+            dominant: BodyId::from("p"),
+        })
+    }
+
+    fn crafted_rails_vessel(
+        id: VesselId,
+        elements: KeplerElements,
+        craft: Option<CraftDef>,
+    ) -> Vessel {
+        Vessel {
+            science: VesselScience::default(),
+            joined_colony: None,
+            id,
+            craft,
+            aero_mask: csp_phys::ConfigMask::ALL,
+            debris_since: None,
+            maneuver: None,
+            thermal: VesselThermal::default(),
+            state: VesselState::OnRails(OrbitState {
+                parent: BodyId::from("p"),
+                elements,
+                epoch: SimTime(0),
+            }),
+            seams: Vec::new(),
+            tank_contents: BTreeMap::new(),
+            crew: Vec::new(),
+            reliability: BTreeMap::new(),
+            control_lease: Lease::Player,
+        }
+    }
+
+    fn crafted_colony(id: ColonyId) -> Colony {
+        Colony {
+            id,
+            site: SiteId::from("pad"),
+            body: BodyId::from("p"),
+            latitude_rad: 0.0,
+            longitude_rad: 0.0,
+            altitude_m: 0.0,
+            state: ColonyState::Nominal,
+            modules: Vec::new(),
+            stores: BTreeMap::new(),
+            daylight: Daylight::Day,
+            crew: BTreeSet::new(),
+            t_eq_k: None,
+            module_fractions: Vec::new(),
+            solved_tick: 0,
+            inspection_tick: None,
+        }
+    }
+
+    fn crafted_site() -> (SiteId, SiteState) {
+        (
+            SiteId::from("pad"),
+            SiteState {
+                id: SiteId::from("pad"),
+                inventory: BTreeMap::new(),
+            },
+        )
+    }
+
+    fn crafted_fatals(
+        orbits: PatchedConics,
+        physics: Option<PhysicsConfig>,
+        s: WorldSnapshot,
+    ) -> bool {
+        matches!(World::restore(orbits, physics, s), Err(SimError::Fatal(_)))
+    }
+
+    /// The vessel payload gates: the OnRails orbit proves against the
+    /// handed-in model, every serialized craft passes the spawn gate
+    /// in every residence, quaternions carry nonzero norm, and the
+    /// next-id checks are overflow-safe.
+    #[test]
+    fn restore_rejects_crafted_vessel_payloads() {
+        let good = || World::new().snapshot().unwrap();
+        let with_vessel = |mut s: WorldSnapshot, v: Vessel| {
+            s.vessels.insert(v.id, v);
+            s.next_vessel_id = s.vessels.keys().next_back().map_or(0, |id| id.0 + 1);
+            s
+        };
+
+        // A plain OnRails vessel restores fine against the model that
+        // produced it — but refuses an empty model (the `parent` gate).
+        let s = with_vessel(
+            good(),
+            crafted_rails_vessel(VesselId(0), leo_elements(), None),
+        );
+        World::restore(test_system(), None, s.clone()).unwrap();
+        assert!(crafted_fatals(PatchedConics::new(BTreeMap::new()), None, s));
+
+        // A non-finite element fails `state_at`'s funnel even with the
+        // parent resolved; so does a NaN `period_s` (unhashed but
+        // still crafted input).
+        let mut bad_el = leo_elements();
+        bad_el.semi_major_axis_m = f64::NAN;
+        let s = with_vessel(good(), crafted_rails_vessel(VesselId(0), bad_el, None));
+        assert!(crafted_fatals(test_system(), None, s));
+        let mut bad_el = leo_elements();
+        bad_el.period_s = f64::NAN;
+        let s = with_vessel(good(), crafted_rails_vessel(VesselId(0), bad_el, None));
+        assert!(crafted_fatals(test_system(), None, s));
+
+        // A serialized craft must pass the spawn/manufacture gate in
+        // every residence — NaN part mass is refused on rails too.
+        let mut bad_craft = box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0);
+        bad_craft.parts[0].mass_kg = f64::NAN;
+        let mut v = crafted_rails_vessel(VesselId(0), leo_elements(), Some(bad_craft));
+        v.thermal
+            .part_temps_k
+            .insert(csp_phys::PartNodeId(0), 300.0);
+        let s = with_vessel(good(), v);
+        assert!(crafted_fatals(test_system(), None, s));
+
+        // A valid InBubble vessel restores; a zero-norm rot is refused
+        // (finite but un-normalizable — the `SetAttitude` rule).
+        let craft = box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0);
+        let body = csp_phys::weld(&craft.graph, &craft.parts).unwrap();
+        let mut v = crafted_rails_vessel(VesselId(0), leo_elements(), Some(craft));
+        v.state = VesselState::InBubble(body);
+        v.thermal
+            .part_temps_k
+            .insert(csp_phys::PartNodeId(0), 300.0);
+        let s = with_vessel(good(), v);
+        World::restore(test_system(), crafted_physics(), s.clone()).unwrap();
+        let mut s2 = s.clone();
+        if let VesselState::InBubble(b) = &mut s2.vessels.get_mut(&VesselId(0)).unwrap().state {
+            b.rot = DQuat::new(0.0, 0.0, 0.0, 0.0);
+        }
+        assert!(crafted_fatals(test_system(), crafted_physics(), s2));
+
+        // A valid SurfaceLatched vessel restores; a zero-norm
+        // orientation or a pose on the wrong body is refused.
+        let craft = box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0);
+        let mut v = crafted_rails_vessel(VesselId(0), leo_elements(), Some(craft));
+        v.state = VesselState::SurfaceLatched(SurfacePose {
+            body: BodyId::from("p"),
+            latitude_rad: 0.0,
+            longitude_rad: 0.0,
+            altitude_m: 0.0,
+            orientation: DQuat::IDENTITY,
+        });
+        v.thermal
+            .part_temps_k
+            .insert(csp_phys::PartNodeId(0), 300.0);
+        let s = with_vessel(good(), v);
+        World::restore(test_system(), crafted_physics(), s.clone()).unwrap();
+        let mut s2 = s.clone();
+        if let VesselState::SurfaceLatched(p) = &mut s2.vessels.get_mut(&VesselId(0)).unwrap().state
+        {
+            p.orientation = DQuat::new(0.0, 0.0, 0.0, 0.0);
+        }
+        assert!(crafted_fatals(test_system(), crafted_physics(), s2));
+        let mut s2 = s;
+        if let VesselState::SurfaceLatched(p) = &mut s2.vessels.get_mut(&VesselId(0)).unwrap().state
+        {
+            p.body = BodyId::from("m");
+        }
+        assert!(crafted_fatals(test_system(), crafted_physics(), s2));
+
+        // A `u64::MAX` live id must `Fatal`, never overflow the
+        // next-id check (the `id.0 + 1` class).
+        let mut s = good();
+        s.vessels.insert(
+            VesselId(u64::MAX),
+            crafted_rails_vessel(VesselId(u64::MAX), leo_elements(), None),
+        );
+        s.next_vessel_id = 0;
+        assert!(crafted_fatals(test_system(), None, s));
+    }
+
+    /// The arena payload gates: build crafts and sites, colony floats
+    /// and the inspection pairing, roster/site/bench/instance arenas,
+    /// autopilot bindings, the script budget, and in-flight crew.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one section per gate, kept together
+    fn restore_rejects_crafted_snapshot_arenas() {
+        let good = || World::new().snapshot().unwrap();
+        let inspection_event = |seq| ScheduledEvent {
+            tick: 10,
+            seq,
+            class: EventClass::Silent,
+            kind: EventKind::ColonyInspection {
+                colony: ColonyId(0),
+            },
+        };
+
+        // ActiveBuild: an unknown site or a malformed craft is refused;
+        // the paired event otherwise matches.
+        let mut s = good();
+        s.economy.sites.insert(crafted_site().0, crafted_site().1);
+        s.builds.insert(
+            manufacture::BuildId(0),
+            manufacture::ActiveBuild {
+                id: manufacture::BuildId(0),
+                site: SiteId::from("pad"),
+                craft: box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0),
+                complete_tick: 10,
+            },
+        );
+        s.next_build_id = 1;
+        s.event_heap = vec![ScheduledEvent {
+            tick: 10,
+            seq: 0,
+            class: events::class_of(
+                &EventKind::ConstructionComplete {
+                    build: manufacture::BuildId(0),
+                },
+                &BTreeSet::new(),
+            ),
+            kind: EventKind::ConstructionComplete {
+                build: manufacture::BuildId(0),
+            },
+        }];
+        s.next_event_seq = 1;
+        World::restore(test_system(), None, s.clone()).unwrap();
+        let mut s2 = s.clone();
+        s2.builds
+            .get_mut(&manufacture::BuildId(0))
+            .unwrap()
+            .craft
+            .parts[0]
+            .mass_kg = f64::NAN;
+        assert!(crafted_fatals(test_system(), None, s2));
+        let mut s2 = s;
+        s2.economy.sites.clear();
+        assert!(crafted_fatals(test_system(), None, s2));
+
+        // Colony gates: unresolved site/body refs, non-finite pose and
+        // solve floats, incoherent module defs, a solve stamped ahead
+        // of the clock, and fractions parallel to modules.
+        let mut s = good();
+        s.economy.sites.insert(crafted_site().0, crafted_site().1);
+        s.colonies.insert(ColonyId(0), crafted_colony(ColonyId(0)));
+        s.next_colony_id = 1;
+        World::restore(test_system(), None, s.clone()).unwrap();
+        for bad in [
+            |c: &mut Colony| c.latitude_rad = f64::NAN,
+            |c: &mut Colony| c.site = SiteId::from("nowhere"),
+            |c: &mut Colony| c.body = BodyId::from("nowhere"),
+            |c: &mut Colony| c.t_eq_k = Some(f64::NAN),
+            |c: &mut Colony| c.module_fractions = vec![2.0],
+            |c: &mut Colony| {
+                c.modules.push(colonies::ColonyModule {
+                    def: csp_data::ColonyModuleDef::Battery { capacity: -1.0 },
+                    damaged: false,
+                })
+            },
+            |c: &mut Colony| c.solved_tick = u64::MAX,
+            |c: &mut Colony| c.module_fractions = vec![0.5],
+        ] {
+            let mut s2 = s.clone();
+            bad(s2.colonies.get_mut(&ColonyId(0)).unwrap());
+            assert!(crafted_fatals(test_system(), None, s2));
+        }
+
+        // The inspection pairing — a live colony's `Some(t)` requires
+        // exactly one pending event at t; the record-less event and
+        // the event-less record are both refused.
+        let mut s2 = s.clone();
+        s2.colonies.get_mut(&ColonyId(0)).unwrap().inspection_tick = Some(10);
+        s2.event_heap = vec![inspection_event(0)];
+        s2.next_event_seq = 1;
+        World::restore(test_system(), None, s2.clone()).unwrap();
+        let mut s3 = s2.clone();
+        s3.event_heap = Vec::new();
+        assert!(crafted_fatals(test_system(), None, s3));
+        let mut s3 = s2.clone();
+        s3.colonies.get_mut(&ColonyId(0)).unwrap().inspection_tick = Some(11);
+        assert!(crafted_fatals(test_system(), None, s3));
+        let mut s3 = s2;
+        s3.colonies.get_mut(&ColonyId(0)).unwrap().inspection_tick = None;
+        assert!(crafted_fatals(test_system(), None, s3));
+        // A dormant colony keeps the record but holds no events — the
+        // terminal states' carve-out.
+        let mut s3 = s.clone();
+        {
+            let c = s3.colonies.get_mut(&ColonyId(0)).unwrap();
+            c.state = ColonyState::Dormant;
+            c.inspection_tick = Some(10);
+        }
+        World::restore(test_system(), None, s3.clone()).unwrap();
+        s3.event_heap = vec![inspection_event(0)];
+        s3.next_event_seq = 1;
+        assert!(crafted_fatals(test_system(), None, s3));
+
+        // The roster's own keys sit below `next_crew_id`, like seats.
+        let mut s = good();
+        s.economy.crew.insert(
+            CrewId(5),
+            CrewMember {
+                name: "x".into(),
+                kind: CrewKind::Pilot,
+                skill: 1,
+                location: CrewLocation::Unassigned,
+                salary_per_s: 0.0,
+                status: CrewStatus::Active,
+            },
+        );
+        s.next_crew_id = 5;
+        assert!(crafted_fatals(test_system(), None, s));
+
+        // `SiteState.id` must equal its arena key — the hash reads the
+        // inline id.
+        let mut s = good();
+        s.economy.sites.insert(
+            SiteId::from("pad"),
+            SiteState {
+                id: SiteId::from("other"),
+                inventory: BTreeMap::new(),
+            },
+        );
+        assert!(crafted_fatals(test_system(), None, s));
+
+        // An autopilot bound to a missing vessel.
+        let mut s = good();
+        s.autopilots.insert(
+            VesselId(9),
+            AutopilotState {
+                program: AutopilotProgram::Ascent {
+                    target_apoapsis_m: 100_000.0,
+                    target_periapsis_m: 100_000.0,
+                },
+                enabled: true,
+                persist: PersistMap::default(),
+            },
+        );
+        assert!(crafted_fatals(test_system(), None, s));
+
+        // A zero script op budget — the `event_budget` rule.
+        let mut s = good();
+        s.script_op_budget = 0;
+        assert!(crafted_fatals(test_system(), None, s));
+
+        // Two in-flight transfers carrying the same crew member.
+        let mut s = good();
+        for (id, tick) in [(TransferId(0), 10), (TransferId(1), 11)] {
+            s.transfers.insert(
+                id,
+                ActiveTransfer {
+                    id,
+                    from: transfers::TransferEnd::Vessel(VesselId(0)),
+                    to: transfers::TransferEnd::Vessel(VesselId(1)),
+                    cargo: TransferCargo::Crew { crew: CrewId(0) },
+                    complete_tick: tick,
+                },
+            );
+        }
+        s.next_transfer_id = 2;
+        s.next_vessel_id = 2;
+        s.next_crew_id = 1;
+        s.event_heap = vec![
+            ScheduledEvent {
+                tick: 10,
+                seq: 0,
+                class: EventClass::Clamping,
+                kind: EventKind::TransferComplete {
+                    transfer: TransferId(0),
+                },
+            },
+            ScheduledEvent {
+                tick: 11,
+                seq: 1,
+                class: EventClass::Clamping,
+                kind: EventKind::TransferComplete {
+                    transfer: TransferId(1),
+                },
+            },
+        ];
+        s.next_event_seq = 2;
+        assert!(crafted_fatals(test_system(), None, s));
+
+        // A bench run on an unknown site.
+        let mut s = good();
+        s.bench_runs.insert(
+            reliability::BenchId(0),
+            reliability::ActiveBench {
+                id: reliability::BenchId(0),
+                site: SiteId::from("nowhere"),
+                family: csp_data::FamilyId::from("f"),
+                units: 1.0,
+                complete_tick: 10,
+            },
+        );
+        s.next_bench_id = 1;
+        s.event_heap = vec![ScheduledEvent {
+            tick: 10,
+            seq: 0,
+            class: EventClass::Silent,
+            kind: EventKind::BenchTestComplete {
+                run: reliability::BenchId(0),
+            },
+        }];
+        s.next_event_seq = 1;
+        assert!(crafted_fatals(test_system(), None, s));
+
+        // Two vessels sharing one part-instance id — the KDF keys
+        // `instance.0` alone, so uniqueness is save-global.
+        let mut s = good();
+        for vid in [VesselId(0), VesselId(1)] {
+            let craft = box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0);
+            let mut v = crafted_rails_vessel(vid, leo_elements(), Some(craft));
+            v.thermal
+                .part_temps_k
+                .insert(csp_phys::PartNodeId(0), 300.0);
+            v.reliability.insert(
+                csp_phys::PartNodeId(0),
+                reliability::fresh_record(0, PartInstanceId(0), 0),
+            );
+            s.vessels.insert(vid, v);
+        }
+        s.next_vessel_id = 2;
+        s.next_part_instance_id = 1;
+        assert!(crafted_fatals(test_system(), None, s));
     }
 
     /// F2: the publish horizon is physical — `SOI_SCAN_HORIZON_PERIODS`
@@ -14991,6 +15692,46 @@ mod tests {
         assert_eq!(v.body().unwrap().mass_kg, 2000.0);
     }
 
+    /// Regression (M6-C × M9a): a bound autopilot on the absorbed
+    /// vessel used to survive the latch merge — `autopilots[sec]`
+    /// outlived `sec`, so a save taken after the dock carried a
+    /// record no arena vessel could satisfy and the restore gate's
+    /// `autopilots ⊆ vessels` check refused it with `Fatal`. The
+    /// absorb now drops the record like `remove_vessel` does.
+    #[test]
+    fn latch_absorb_drops_bound_autopilot_and_restores() {
+        let mut w = physics_world(false);
+        spawn_port_pair(&mut w, DVec3::new(0.0, 0.0, 1.8), flip_rot());
+        assert_eq!(w.joints().len(), 1);
+        // Engage on vessel B — the equal-mass tie-break makes B the
+        // absorb's secondary (the smaller `VesselId` retains).
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::EngageAutopilot {
+                vessel: VesselId(1),
+                program: AutopilotProgram::Ascent {
+                    target_apoapsis_m: 300_000.0,
+                    target_periapsis_m: 200_000.0,
+                },
+            },
+        );
+        // One tick applies the engage; the anchors still sit ~0.3 m
+        // apart (latch needs ≤ 0.1 m), so the merge cannot beat it.
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(w.autopilots().contains_key(&VesselId(1)));
+        step_until(&mut w, 192, |w| w.joints().is_empty());
+        assert_eq!(w.vessels().len(), 1, "the pair must have merged");
+        assert!(
+            w.autopilots().is_empty(),
+            "the absorbed vessel's autopilot must die with it"
+        );
+        // The post-latch save round-trips — the crafted gate's Fatal
+        // this scenario used to hit.
+        let snap = w.snapshot().unwrap();
+        World::restore(test_system(), w.config().physics.clone(), snap).unwrap();
+    }
+
     /// Undock splits the merged vessel at the seam: retained keeps the
     /// primary's graph BITWISE (merge only added nodes), the fragment
     /// carries the secondary's subtree at the seam's transform.
@@ -15201,6 +15942,7 @@ mod tests {
                 &mut tracked,
                 &std::collections::BinaryHeap::new(),
                 &mut BTreeMap::new(),
+                &mut BTreeMap::new(),
                 &mut science,
                 &mut economy,
                 &joint,
@@ -15300,6 +16042,7 @@ mod tests {
                 &mut tracked,
                 &w.event_heap,
                 &mut w.transfers,
+                &mut w.autopilots,
                 &mut w.science,
                 &mut w.economy,
                 joint,
@@ -17468,10 +18211,11 @@ mod tests {
             w.next_part_instance_id = 1;
             w.step_frame(100).unwrap();
             let theta_before = w.vessels[&VesselId(0)].reliability[&csp_phys::PartNodeId(0)].theta;
-            // A snapshot → restore round-trip is the revert path.
+            // A snapshot → restore round-trip is the revert path —
+            // against the SAME orbit model the world was built with
+            // (the `orbit.parent` gate refuses an empty model).
             let snap = w.snapshot().unwrap();
-            let mut w2 = World::restore(PatchedConics::new(BTreeMap::new()), None, snap).unwrap();
-            w2.orbits = test_system();
+            let mut w2 = World::restore(test_system(), None, snap).unwrap();
             let theta_after = w2.vessels[&VesselId(0)].reliability[&csp_phys::PartNodeId(0)].theta;
             assert_eq!(theta_before, theta_after);
             // …and it differs from a *fresh* draw at another

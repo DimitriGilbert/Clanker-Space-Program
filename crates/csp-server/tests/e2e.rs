@@ -601,7 +601,7 @@ async fn lease_enforcement_over_the_wire() {
         "semi_major_axis_m": 700_000.0, "eccentricity": 0.0,
         "inclination_rad": 0.0, "ascending_node_rad": 0.0,
         "arg_periapsis_rad": 0.0, "mean_anomaly_epoch_rad": 0.0,
-        "period_s": 0.0
+        "period_s": 1958.1284360312443
     }}});
     let (_, body) = http(
         server.addr,
@@ -1006,7 +1006,7 @@ async fn ws_subscription_stays_within_byte_budget() {
         "semi_major_axis_m": 700_000.0, "eccentricity": 0.0,
         "inclination_rad": 0.0, "ascending_node_rad": 0.0,
         "arg_periapsis_rad": 0.0, "mean_anomaly_epoch_rad": 0.0,
-        "period_s": 0.0
+        "period_s": 1958.1284360312443
     }}});
     let (_, body) = http(
         server.addr,

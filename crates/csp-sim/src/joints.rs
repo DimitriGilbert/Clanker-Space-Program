@@ -103,6 +103,7 @@ use csp_core::{DVec3, SimError, StateHasher};
 use csp_data::{BalanceDef, PortSize};
 use csp_phys::{BodyHandle, JointDef, JointKind, PartNodeId, PartTransform};
 
+use crate::scripts::AutopilotState;
 use crate::transfers::{ActiveTransfer, TransferId};
 use crate::{ScheduledEvent, Vessel, VesselId, VesselState};
 
@@ -785,6 +786,7 @@ pub(crate) fn apply_latch(
     tracked: &mut BTreeSet<VesselId>,
     event_heap: &BinaryHeap<ScheduledEvent>,
     transfers: &mut BTreeMap<TransferId, ActiveTransfer>,
+    autopilots: &mut BTreeMap<VesselId, AutopilotState>,
     science: &mut crate::research::ScienceState,
     economy: &mut crate::economy::EconomyState,
     joint: &LiveJoint,
@@ -1085,14 +1087,21 @@ pub(crate) fn apply_latch(
     // names the seats the merge just pooled — the roster re-seat
     // below reads it.
     let absorbed = vessels.remove(&sec);
-    // M9a §2.10 note: a bound autopilot keyed on `sec` survives the
-    // absorb — it goes inert (the bound vessel's telemetry no longer
-    // resolves, so `control_tick` skips it) and merges it with the
-    // absorbed record's lifetime; `remove_vessel` and the
-    // dead-vessels drain drop the record eagerly instead. `autopilots`
-    // isn't threaded into this borrow-split pass — see the
-    // `step_bubble_range` drain for the drop sites.
-    let _ = sec;
+    // M9a §2.10: a bound autopilot keyed on `sec` dies with the
+    // absorbed vessel — the `remove_vessel`/dead-vessels-drain rule
+    // applied at the absorb, so the restore gate's `autopilots ⊆
+    // vessels` invariant holds of every post-latch save (an outliving
+    // record could only ever sit inert: the bound vessel's telemetry
+    // no longer resolves). `scripts` records still survive — they
+    // are global, not per-vessel state. The shadow capture is lazy
+    // like `economy`'s below: only a merge whose secondary carried a
+    // record mutates the arena.
+    if autopilots.contains_key(&sec) {
+        if shadow.autopilots.is_none() {
+            shadow.autopilots = Some(autopilots.clone());
+        }
+        autopilots.remove(&sec);
+    }
     // In-flight transfers naming the absorbed id redirect to the
     // merged survivor — its tanks (and the reservation they held)
     // traveled with the merge.
@@ -1141,6 +1150,7 @@ pub(crate) fn latch_pass(
     tracked: &mut BTreeSet<VesselId>,
     event_heap: &BinaryHeap<ScheduledEvent>,
     transfers: &mut BTreeMap<TransferId, ActiveTransfer>,
+    autopilots: &mut BTreeMap<VesselId, AutopilotState>,
     science: &mut crate::research::ScienceState,
     economy: &mut crate::economy::EconomyState,
     cfg: &DockingConfig,
@@ -1156,8 +1166,8 @@ pub(crate) fn latch_pass(
         }
         let joint = joints[i].clone();
         if apply_latch(
-            vessels, physics, joints, refused, tracked, event_heap, transfers, science, economy,
-            &joint, tick, degraded, shadow,
+            vessels, physics, joints, refused, tracked, event_heap, transfers, autopilots, science,
+            economy, &joint, tick, degraded, shadow,
         )? {
             // The merge removed the consumed joint — and every other
             // joint touching the absorbed vessel, at any index —
