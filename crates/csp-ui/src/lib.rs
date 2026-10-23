@@ -23,10 +23,17 @@ pub mod vab;
 /// [`settings::Keymap`], and the settings panel.
 pub mod settings;
 
+/// The M10 first-flight tutorial (PLAN M10 exit row): the
+/// [`tutorial::TutorialState`] session model — the step table and the
+/// real-progress predicates — plus the [`tutorial::tutorial_overlay`]
+/// checklist panel.
+pub mod tutorial;
+
 pub use settings::{
     AudioSettings, DifficultySettings, GameplaySettings, GraphicsQuality, GraphicsSettings,
     KeyAction, KeyBinding, Keymap, Settings, SettingsPanelOutput, SettingsPanelState,
 };
+pub use tutorial::{STEP_LAUNCH, STEPS, TutorialInput, TutorialState, TutorialStep};
 pub use vab::{ModeSelect, VabSession};
 
 /// Everything the M0 debug panel needs — mirrors and session values only.

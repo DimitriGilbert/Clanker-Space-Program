@@ -22,10 +22,16 @@
 /// ([`agent`]), the declarative `scenario.ron` format
 /// ([`scenario`]), and the program registry + suite runner
 /// ([`eval`]).
+/// M10-D §5.3 — the perf log: every §5.3 budget row as a named
+/// check ([`perf::BUDGET_ROWS`]), measured headless where the row is
+/// CPU-only and recorded [`perf::PerfStatus::HardwareGated`] where it
+/// needs REF-A/REF-B. [`perf::run_perf_log`] builds the artifact;
+/// `csp-perf` writes it to `docs/perf/`.
 pub mod agent;
 pub mod contracts;
 pub mod economy;
 pub mod eval;
+pub mod perf;
 pub mod replay;
 pub mod scenario;
 pub mod scenarios;

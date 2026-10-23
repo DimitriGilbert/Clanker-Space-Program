@@ -851,6 +851,27 @@ impl CraftSession {
             .collect()
     }
 
+    /// The attach-node ids on `id`'s def an edge already binds: the
+    /// node `id` itself hangs from (its edge's `child_node`) plus the
+    /// parent-side node of every child edge. A stack node mates
+    /// exactly one neighbour — placement helpers that *choose* a node
+    /// (the VAB's `AttachAuto`) must skip these, or the new part lands
+    /// coincident with the bound one. `add_part`/`reattach` do not
+    /// consult this: an explicit [`AttachEdge`] stays the caller's
+    /// responsibility.
+    pub fn bound_attach_nodes(&self, id: PartNodeId) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        if let Some(e) = self.nodes.get(&id).and_then(|n| n.edge.as_ref()) {
+            out.insert(e.child_node.clone());
+        }
+        for child in self.children_ids(id) {
+            if let Some(e) = self.nodes.get(&child).and_then(|n| n.edge.as_ref()) {
+                out.insert(e.parent_node.clone());
+            }
+        }
+        out
+    }
+
     /// `id` plus its whole descendant subtree, ascending id — the set
     /// `remove_part` takes out and the UI's subtree selection mirrors.
     pub fn subtree_ids(&self, id: PartNodeId) -> Vec<PartNodeId> {

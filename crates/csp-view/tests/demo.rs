@@ -127,3 +127,96 @@ fn new_demo_builds_scenario_and_enforces_constraints() {
     assert_eq!(view.mode(), ViewMode::Flight);
     assert!(view.flight_focus().is_some());
 }
+
+/// Hold `vessel`'s body +z (thrust axis) on local radial-up — the
+/// same scripted-attitude convention the tutorial flight leg uses.
+fn hold_radial_up(view: &mut View, vessel: csp_sim::VesselId) {
+    let Some(rot) = (|| {
+        let body = view.sim.vessels().get(&vessel)?.body()?;
+        let env = view.sim.environment()?;
+        let rel = body.com_world() - env.body_center;
+        let n = rel.norm();
+        if n <= 0.0 {
+            return None;
+        }
+        let up = rel / n;
+        let cos = csp_core::DVec3::Z.dot(up);
+        if cos > 0.999_999 {
+            return Some(csp_core::DQuat::IDENTITY);
+        }
+        if cos < -0.999_999 {
+            return Some(csp_core::DQuat::from_axis_angle(
+                csp_core::DVec3::X,
+                core::f64::consts::PI,
+            ));
+        }
+        Some(csp_core::DQuat::from_axis_angle(
+            csp_core::DVec3::Z.cross(up),
+            f64::acos(cos),
+        ))
+    })() else {
+        return;
+    };
+    view.enqueue_command(
+        csp_view::SourceClass::Ui,
+        1,
+        csp_view::SimCommand::SetAttitude {
+            vessel,
+            rot,
+            ang_vel: csp_core::DVec3::ZERO,
+        },
+    );
+}
+
+/// The seeded "Demo Hopper" is flyable — the M10-D AttachAuto
+/// regression end-to-end on the §6.3 data set: the pod→tank→engine
+/// stack must mount its engine nozzle-down, so throttle-up accelerates
+/// the craft *away* from the pad instead of thrusting into it.
+#[test]
+fn demo_seed_craft_ascends() {
+    let mut view = View::new_demo().unwrap();
+    // The seeded spawn lands on the first stepped tick.
+    view.begin_frame();
+    view.sim_step(1).unwrap();
+    view.end_frame();
+    let vessel = view.flight_focus().expect("pad craft spawned");
+    let env = view.sim.environment().unwrap().clone();
+    let pad_alt = view
+        .sim
+        .vessels()
+        .values()
+        .next()
+        .and_then(|v| v.body())
+        .map(|b| (b.com_world() - env.body_center).norm() - env.radius_m)
+        .unwrap();
+
+    view.enqueue_command(
+        csp_view::SourceClass::Ui,
+        1,
+        csp_view::SimCommand::SetThrottle {
+            vessel,
+            throttle: 1.0,
+        },
+    );
+    let mut best_alt = pad_alt;
+    let mut radial_vel = 0.0;
+    for _ in 0..10 {
+        hold_radial_up(&mut view, vessel);
+        view.begin_frame();
+        let target = view.sim.clock().ticks() + 64;
+        view.sim_step(target).unwrap();
+        view.end_frame();
+        let Some(body) = view.sim.vessels().get(&vessel).and_then(|v| v.body()) else {
+            break;
+        };
+        let rel = body.com_world() - env.body_center;
+        best_alt = best_alt.max(rel.norm() - env.radius_m);
+        radial_vel = body.vel.dot(rel / rel.norm());
+    }
+    assert!(
+        best_alt > pad_alt + 50.0 && radial_vel > 0.0,
+        "Demo Hopper did not climb (best altitude {best_alt:.1} m from \
+         {pad_alt:.1} m, radial velocity {radial_vel:.1} m/s) — the \
+         engine must mount nozzle-down"
+    );
+}

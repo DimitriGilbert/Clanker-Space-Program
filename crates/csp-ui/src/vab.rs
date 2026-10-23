@@ -506,10 +506,29 @@ impl VabSession {
         Ok(BuiltPart::stock(part_id.clone(), variant))
     }
 
-    /// Snap `part` under `parent` trying every (parent-node,
-    /// child-node) pair until one attaches — the honest M3
-    /// auto-placement (size-class + direction rules live in
-    /// `session.add_part`).
+    /// Snap `part` under `parent` — the honest M3 auto-placement:
+    /// enumerate the (parent-node, child-node) pairs and try them
+    /// until `session.add_part` accepts one (size-class + direction
+    /// rules live there).
+    ///
+    /// Candidate choice is what makes a stack buildable:
+    ///
+    /// - A stack node mates exactly one neighbour, so parent nodes an
+    ///   edge already binds ([`CraftSession::bound_attach_nodes`]) are
+    ///   not candidates at all — a mid-stack part's "top" is spoken
+    ///   for by the part above it.
+    /// - The child hangs on the side the parent node faces, so the
+    ///   most body-downward-facing free node is preferred — "under"
+    ///   means under (−z in craft frame, the stack's growth
+    ///   direction).
+    /// - Ties break to the smallest snap rotation (`d_c · −d_p`
+    ///   descending — a top-to-bottom mate snaps with no twist while
+    ///   a top-to-top one flips the child 180°).
+    ///
+    /// Without those rules a pod→tank→engine build mates
+    /// `tank.top`→`engine.top`: the engine lands between pod and
+    /// tank rotated so its nozzle points *into* the stack and its
+    /// thrust into the pad — the M10-D "Demo Hopper" bug.
     fn attach_auto(&mut self, part: &PartId, parent: PartNodeId) -> Result<PartNodeId, VabError> {
         let defs = self.catalog.as_ref().ok_or(VabError::NoCatalog)?;
         let parent_part = self
@@ -530,24 +549,57 @@ impl VabSession {
             .def_by_id(part)
             .ok_or(VabError::PartNotInCatalog { part: part.clone() })?;
         let built = self.stock_build(part)?;
-        let parent_nodes: Vec<String> = parent_def
-            .attach_nodes
-            .iter()
-            .map(|n| n.id.clone())
-            .collect();
-        let child_nodes: Vec<String> = child_def
-            .attach_nodes
-            .iter()
-            .map(|n| n.id.clone())
-            .collect();
-        let mut last = None;
+        let bound = self.session.bound_attach_nodes(parent);
+        // Clone the candidate node records — the defs are borrowed
+        // through `&self`, and the attempt loop needs `&mut
+        // self.session`.
+        let parent_nodes = parent_def.attach_nodes.clone();
+        let child_nodes = child_def.attach_nodes.clone();
+        // The parent's rotation into body frame — folded down its
+        // ancestor chain — is what "downward-facing" is measured in.
+        // (Local −z only agrees with stack-down while every ancestor
+        // mounted unflipped; the fold stays correct through an
+        // upside-down parent.)
+        let mut chain = vec![parent];
+        while let Some(e) = chain
+            .last()
+            .and_then(|id| self.session.node(*id))
+            .and_then(|n| n.edge())
+        {
+            chain.push(e.parent);
+        }
+        let mut parent_t = PartTransform::IDENTITY;
+        for id in chain.iter().rev() {
+            if let Some(n) = self.session.node(*id) {
+                parent_t = parent_t.compose(n.transform());
+            }
+        }
+        let mut candidates: Vec<(&str, &str, f64, f64)> = Vec::new();
         for pn in &parent_nodes {
+            if bound.contains(&pn.id) {
+                continue;
+            }
+            // The node normal in body frame: the child lands on the
+            // side it faces, so a large `facing` hangs the child low.
+            let facing = -parent_t.apply_dir(pn.direction).z;
             for cn in &child_nodes {
-                let edge = AttachEdge::new(parent, pn, cn);
-                match self.session.add_part(defs, built.clone(), edge) {
-                    Ok(id) => return Ok(id),
-                    Err(e) => last = Some(e),
-                }
+                // `d_c · −d_p` is the cosine of the snap arc the
+                // session computes — 1.0 snaps with no rotation,
+                // −1.0 flips the child. Least-twist wins ties and
+                // keeps the child's authored pose (engines mount
+                // nozzle-down).
+                let twist = cn.direction.dot(-pn.direction);
+                candidates.push((&pn.id, &cn.id, facing, twist));
+            }
+        }
+        // Stable sort — authored order breaks ties deterministically.
+        candidates.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| b.3.total_cmp(&a.3)));
+        let mut last = None;
+        for &(pn, cn, ..) in &candidates {
+            let edge = AttachEdge::new(parent, pn, cn);
+            match self.session.add_part(defs, built.clone(), edge) {
+                Ok(id) => return Ok(id),
+                Err(e) => last = Some(e),
             }
         }
         Err(last.map_or(
@@ -580,6 +632,10 @@ pub struct VabUiOutput {
     /// The M4c launch button — spawn the working craft on the pad
     /// and switch to the flight view.
     pub launch: bool,
+    /// The M10 "Tutorial" button — re-open the first-flight checklist.
+    /// Session state lives in `csp-view`, so this is folded back into
+    /// the tutorial resource inside `build_ui`, not the app outbox.
+    pub tutorial: bool,
 }
 
 /// The mode bar — always-present top strip with the three view modes.
@@ -609,6 +665,13 @@ pub fn top_bar(ctx: &egui::Context, current: ModeSelect, out: &mut VabUiOutput) 
                 // the vertical slice's fun gate.
                 if ui.button("LAUNCH").clicked() {
                     out.launch = true;
+                }
+                ui.separator();
+                // M10: re-open the first-flight checklist — session
+                // state folded back into the tutorial resource inside
+                // `build_ui` (the checklist never rides the app outbox).
+                if ui.button("Tutorial").clicked() {
+                    out.tutorial = true;
                 }
             });
         });
@@ -1414,6 +1477,84 @@ mod tests {
         vab.apply(VabAction::LoadBytes(bytes)).unwrap();
         vab.recompute();
         assert_eq!(vab.session().len(), 2);
+    }
+
+    /// M10-D regression — the "Demo Hopper" stack: pod→tank→engine
+    /// through `AttachAuto` must mount the engine *nozzle-down* under
+    /// the tank's free bottom node. The pre-fix enumeration took the
+    /// first size-compatible pair in authored order — `tank.top` →
+    /// `engine.top` — which lands the engine between pod and tank
+    /// rotated 180°, thrusting into the pad.
+    #[test]
+    fn attach_auto_stacks_engine_nozzle_down() {
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        vab.apply(VabAction::SetRoot(PartId::from("t.tank")))
+            .unwrap();
+        let root = vab.session().root().unwrap();
+
+        // The mid part mates the root's *bottom* node with its own
+        // "top" — the no-twist pair — even though the root's free
+        // "top" node is enumerated first. (Pre-fix first-fit put the
+        // second part *above* the root, flipped.)
+        vab.apply(VabAction::AttachAuto {
+            part: PartId::from("t.tank"),
+            parent: root,
+        })
+        .unwrap();
+        let mid = vab.selected().unwrap();
+        let mid_node = vab.session().node(mid).unwrap();
+        let mid_edge = mid_node.edge().unwrap();
+        assert_eq!(mid_edge.parent_node, "bottom");
+        assert_eq!(mid_edge.child_node, "top");
+        let mid_up = mid_node.transform().rotation.rotate(csp_core::DVec3::Z);
+        assert!(
+            mid_up.z > 1.0 - 1e-12,
+            "mid part flipped: its +z maps to {mid_up:?}"
+        );
+        assert!(
+            mid_node.transform().offset.z < 0.0,
+            "mid part above its parent: {:?}",
+            mid_node.transform()
+        );
+
+        // The engine: the mid tank's "top" node is bound by its own
+        // edge, so the only sane mate is "bottom" → "top" at zero
+        // rotation — nozzle down, thrust (+z, the resolved thrust
+        // site's direction) pointing up through the stack.
+        vab.apply(VabAction::AttachAuto {
+            part: PartId::from("t.eng"),
+            parent: mid,
+        })
+        .unwrap();
+        let eng = vab.selected().unwrap();
+        let eng_node = vab.session().node(eng).unwrap();
+        let eng_edge = eng_node.edge().unwrap();
+        assert_eq!(eng_edge.parent_node, "bottom");
+        assert_eq!(eng_edge.child_node, "top");
+        let eng_up = eng_node.transform().rotation.rotate(csp_core::DVec3::Z);
+        assert!(
+            eng_up.z > 1.0 - 1e-12,
+            "engine flipped: its +z thrust axis maps to {eng_up:?}"
+        );
+        assert!(
+            eng_node.transform().offset.z < 0.0,
+            "engine above its parent: {:?}",
+            eng_node.transform()
+        );
+
+        // Both of the mid tank's stack nodes are now bound — a second
+        // engine has no honest mate and is refused, not overlapped.
+        let r = vab.apply(VabAction::AttachAuto {
+            part: PartId::from("t.eng"),
+            parent: mid,
+        });
+        assert_eq!(
+            r,
+            Err(VabError::NoCompatibleAttach {
+                part: PartId::from("t.eng"),
+                parent: mid,
+            })
+        );
     }
 
     /// A bad op lands in `notice`, never panics — the panel's error path.

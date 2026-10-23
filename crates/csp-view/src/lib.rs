@@ -38,6 +38,12 @@ pub mod vab;
 /// is target-agnostic so native tests exercise the same construction.
 pub mod demo;
 
+/// M10 — the first-flight tutorial driver (PLAN M10 exit row): the
+/// [`tutorial::TutorialRes`] session resource and the Presentation
+/// schedule system folding staged mirrors into the checklist's
+/// progress predicates (the model lives in `csp_ui::tutorial`).
+pub mod tutorial;
+
 /// The app's view mode — flight, map, or the VAB editor. Session
 /// state (§2.2-C): never sim state, never logged, never hashed.
 /// `csp-app` routes input and `csp-view` derives it from the two
@@ -247,6 +253,7 @@ fn build_ui(
     map_snap: Res<map::MapSnapshot>,
     mut maneuver_state: ResMut<ManeuverPanelRes>,
     mut settings_state: ResMut<SettingsPanelRes>,
+    mut tutorial: ResMut<tutorial::TutorialRes>,
     mut outbox: ResMut<UiOutbox>,
 ) {
     let mode = if vab_input.open {
@@ -285,40 +292,14 @@ fn build_ui(
             csp_ui::debug_panel(ctx, &input, &mut panel_output);
         }
         if map_ui.mode == map::MapMode::Map {
-            csp_ui::map_overlay(
+            map_panels(
                 ctx,
-                &map_ui.focus_name,
-                map_ui.camera_distance_m,
-                &map_ui.labels,
-            );
-            // M5 node panel — placement edits → outbox commands.
-            let mut mcmd = None;
-            csp_ui::maneuver_panel(
-                ctx,
+                &map_ui,
+                &map_snap,
                 clock.0.ticks(),
-                &map_snap
-                    .vessels
-                    .iter()
-                    .map(|(id, _, n)| csp_ui::ManeuverVessel {
-                        id: id.0,
-                        node: n.as_ref().map(|n| (n.tick, n.dv_magnitude())),
-                    })
-                    .collect::<Vec<_>>(),
                 &mut maneuver_state.0,
-                &mut mcmd,
+                &mut outbox,
             );
-            outbox.maneuver = mcmd.map(|c| match c {
-                csp_ui::ManeuverCommand::Set { vessel, tick, dv } => SimCommand::SetManeuver {
-                    vessel: csp_sim::VesselId(vessel),
-                    tick,
-                    dv_prograde_mps: dv[0],
-                    dv_normal_mps: dv[1],
-                    dv_radial_mps: dv[2],
-                },
-                csp_ui::ManeuverCommand::Delete { vessel } => SimCommand::DeleteManeuver {
-                    vessel: csp_sim::VesselId(vessel),
-                },
-            });
         }
         if mode == csp_ui::ModeSelect::Vab {
             csp_ui::vab::vab_editor(ctx, &mut vab.0, &files, &mut vab_out);
@@ -338,10 +319,21 @@ fn build_ui(
                 },
             );
         }
-        // M10: the settings window + the §2.13 Fatal dialog — both
-        // session-state panels, drawn in every mode.
-        m10_panels(ctx, &mut settings_state.0, &session, &mut outbox);
+        // M10: the settings window + the §2.13 Fatal dialog + the
+        // tutorial checklist — session-state panels, drawn every mode.
+        m10_panels(
+            ctx,
+            &mut settings_state.0,
+            &session,
+            &mut outbox,
+            &mut tutorial.0,
+        );
     }));
+    // The top bar's Tutorial button re-opens the checklist — session
+    // state, folded back here rather than riding the app outbox.
+    if vab_out.tutorial {
+        tutorial.0.start();
+    }
     outbox.warp_step = panel_output.warp_step;
     outbox.mode = vab_out.mode;
     outbox.launch = vab_out.launch;
@@ -357,15 +349,63 @@ fn build_ui(
     outbox.craft_load = vab_out.load_name;
 }
 
+/// The map mode's UiBuild panels — the M1 overlay + the M5 node panel
+/// (its `SetManeuver`/`DeleteManeuver` output rides the outbox).
+/// Extracted from [`build_ui`] under the line budget.
+fn map_panels(
+    ctx: &egui::Context,
+    map_ui: &map::MapUiData,
+    map_snap: &map::MapSnapshot,
+    tick: u64,
+    maneuver_state: &mut csp_ui::ManeuverPanelState,
+    outbox: &mut UiOutbox,
+) {
+    csp_ui::map_overlay(
+        ctx,
+        &map_ui.focus_name,
+        map_ui.camera_distance_m,
+        &map_ui.labels,
+    );
+    let mut mcmd = None;
+    csp_ui::maneuver_panel(
+        ctx,
+        tick,
+        &map_snap
+            .vessels
+            .iter()
+            .map(|(id, _, n)| csp_ui::ManeuverVessel {
+                id: id.0,
+                node: n.as_ref().map(|n| (n.tick, n.dv_magnitude())),
+            })
+            .collect::<Vec<_>>(),
+        maneuver_state,
+        &mut mcmd,
+    );
+    outbox.maneuver = mcmd.map(|c| match c {
+        csp_ui::ManeuverCommand::Set { vessel, tick, dv } => SimCommand::SetManeuver {
+            vessel: csp_sim::VesselId(vessel),
+            tick,
+            dv_prograde_mps: dv[0],
+            dv_normal_mps: dv[1],
+            dv_radial_mps: dv[2],
+        },
+        csp_ui::ManeuverCommand::Delete { vessel } => SimCommand::DeleteManeuver {
+            vessel: csp_sim::VesselId(vessel),
+        },
+    });
+}
+
 /// M10's always-on session panels — the settings window (when open;
-/// its Apply/Reset requests ride the outbox) and the §2.13 Fatal
-/// crash dialog (while the halt mirror is set). Extracted from
-/// [`build_ui`] to keep that system under the line budget.
+/// its Apply/Reset requests ride the outbox), the §2.13 Fatal crash
+/// dialog (while the halt mirror is set), and the first-flight
+/// tutorial checklist (while its session flag is active). Extracted
+/// from [`build_ui`] to keep that system under the line budget.
 fn m10_panels(
     ctx: &egui::Context,
     settings_state: &mut settings::SettingsPanelState,
     session: &SessionMirror,
     outbox: &mut UiOutbox,
+    tutorial: &mut csp_ui::tutorial::TutorialState,
 ) {
     let mut settings_out = csp_ui::settings::SettingsPanelOutput::default();
     if settings_state.open {
@@ -378,6 +418,11 @@ fn m10_panels(
     outbox.settings_apply = settings_out.apply;
     if let Some(fatal) = &session.fatal {
         csp_ui::crash_dialog(ctx, fatal.reason(), session.fatal_bundle.as_deref());
+    }
+    // The first-flight checklist — drawn in every mode while active
+    // (it coaches the VAB steps from inside the editor).
+    if tutorial.active {
+        csp_ui::tutorial::tutorial_overlay(ctx, tutorial);
     }
 }
 
@@ -669,6 +714,10 @@ impl View {
         world.insert_resource(ManeuverPanelRes::default());
         // M10: the settings window's staged state (§2.2-C session data).
         world.insert_resource(SettingsPanelRes::default());
+        // M10: the first-flight tutorial checklist (§2.2-C session
+        // data) — driven by `tutorial_drive` in Presentation, drawn by
+        // `build_ui`.
+        world.insert_resource(tutorial::TutorialRes::default());
 
         // M3 VAB resources (see vab.rs): the working-craft session +
         // camera/pick state + the craft-file name list.
@@ -710,7 +759,15 @@ impl View {
         sync.add_systems((sync_mirrors, map::sync_map, flight::sync_flight));
 
         let mut presentation = Schedule::default();
-        presentation.add_systems((map::map_present, vab::vab_present, flight::flight_present));
+        presentation.add_systems((
+            map::map_present,
+            vab::vab_present,
+            flight::flight_present,
+            // M10: the tutorial's progress observer — reads the
+            // Sync-written snapshot directly, so it stays independent
+            // of sibling ordering inside this schedule.
+            tutorial::tutorial_drive,
+        ));
         let mut render_extract = Schedule::default();
         render_extract.add_systems((map::extract_map, vab::extract_vab, flight::extract_flight));
 
@@ -917,6 +974,27 @@ impl View {
     /// failure) — the host's feedback channel.
     pub fn set_settings_notice(&mut self, notice: Option<String>) {
         self.world.resource_mut::<SettingsPanelRes>().0.notice = notice;
+    }
+
+    /// M10 tutorial: whether the first-flight checklist is on screen —
+    /// the overlay's own Dismiss and the top bar's Tutorial button are
+    /// the in-game path; this is the host's read for tests and a
+    /// future "don't show again" persist.
+    pub fn tutorial_active(&self) -> bool {
+        self.world.resource::<tutorial::TutorialRes>().0.active
+    }
+
+    /// M10 tutorial: show/hide the checklist — the host-side plumbing
+    /// (progress is preserved across a hide/show cycle).
+    pub fn set_tutorial_active(&mut self, active: bool) {
+        self.world.resource_mut::<tutorial::TutorialRes>().0.active = active;
+    }
+
+    /// M10 tutorial: the checklist's progress snapshot — read access
+    /// for tests and status displays (mutations go through the overlay
+    /// or `observe` inside the schedules).
+    pub fn tutorial_state(&self) -> &csp_ui::tutorial::TutorialState {
+        &self.world.resource::<tutorial::TutorialRes>().0
     }
 
     /// The `egui::Context` — `csp-app` borrows this clone to tessellate the

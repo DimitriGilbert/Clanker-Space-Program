@@ -105,6 +105,10 @@ pub struct FlightEnv {
     /// Atmosphere scale height (m) — the R2 scattering LUT's `H`; `0`
     /// when airless.
     pub atm_scale_height_m: f64,
+    /// The dominant body's gravitational parameter (m³/s²) — the
+    /// tutorial's osculating-apsides derivation needs it (the same
+    /// μ the environment's force model integrates against).
+    pub mu_m3_per_s2: f64,
     /// The dominant body's id — keys the terrain heightfield/biome
     /// cache (SOI transfer swaps it).
     pub body: Option<csp_data::BodyId>,
@@ -309,6 +313,7 @@ pub fn capture_sync_input(sim: &World) -> FlightSyncInput {
             radius_m: e.radius_m,
             atm_top_m: e.atmosphere.as_ref().map_or(0.0, |a| a.top_m),
             atm_scale_height_m: e.atmosphere.as_ref().map_or(0.0, |a| a.scale_height_m),
+            mu_m3_per_s2: e.mu_m3_per_s2,
             body: sim.dominant_body().cloned(),
             sun_dir: sun_direction(sim),
             spin_axis,
