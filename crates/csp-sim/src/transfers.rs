@@ -687,8 +687,9 @@ pub(crate) fn linked(
 
 /// `(R + alt) · (cos φ·cos λ, cos φ·sin λ, sin φ)` — the latched
 /// pose's world point on the dominant body's sphere (libm
-/// transcendentals, §2.7). `pub(crate)` for the M8-C impact
-/// check's colony surface points.
+/// transcendentals, §2.7). `pub(crate)` for
+/// [`World::colony_surface_point`], the shared convention the M8-C
+/// impact check's colony surface points ride.
 pub(crate) fn latched_pos(pose: &crate::SurfacePose, body_radius_m: f64) -> DVec3 {
     let (slat, clat) = (libm::sin(pose.latitude_rad), libm::cos(pose.latitude_rad));
     let (slon, clon) = (libm::sin(pose.longitude_rad), libm::cos(pose.longitude_rad));
@@ -1205,6 +1206,24 @@ impl World {
 }
 
 impl World {
+    /// The colony's surface point in its body's fixed frame — the ONE
+    /// convention both the join gate below and the impact seam
+    /// (`colonies::apply_surface_impacts`) read:
+    /// `colony_env[body].radius_m + colony.altitude_m` at the colony's
+    /// latched lat/lon. `None` when the body carries no `colony_env`
+    /// entry (the impact seam's "not a target" gate).
+    pub(crate) fn colony_surface_point(&self, co: &crate::colonies::Colony) -> Option<DVec3> {
+        let r = self.colony_env.get(&co.body)?.radius_m;
+        let pose = crate::SurfacePose {
+            body: co.body.clone(),
+            latitude_rad: co.latitude_rad,
+            longitude_rad: co.longitude_rad,
+            altitude_m: co.altitude_m,
+            orientation: csp_core::DQuat::IDENTITY,
+        };
+        Some(latched_pos(&pose, r))
+    }
+
     /// §3.5's colony-inventory opt-in gate: a `SurfaceLatched` vessel
     /// on the colony's body whose pose chord distance to the colony's
     /// site pose is within `transfer_radius_m` — the same-body,
@@ -1223,19 +1242,10 @@ impl World {
         let Some(r) = self.colony_env.get(&co.body).map(|e| e.radius_m) else {
             return false;
         };
-        let alt = self
-            .site_defs
-            .get(&co.site)
-            .map(|d| d.altitude_m)
-            .unwrap_or(0.0);
-        let co_pose = crate::SurfacePose {
-            body: co.body.clone(),
-            latitude_rad: co.latitude_rad,
-            longitude_rad: co.longitude_rad,
-            altitude_m: alt,
-            orientation: csp_core::DQuat::IDENTITY,
+        let Some(co_pos) = self.colony_surface_point(co) else {
+            return false;
         };
-        latched_pos(pose, r).distance(latched_pos(&co_pose, r)) <= self.transfer_cfg.radius_m
+        latched_pos(pose, r).distance(co_pos) <= self.transfer_cfg.radius_m
     }
 
     /// `JoinColonyInventory` — §3.5's "a surface-latched vessel within

@@ -90,7 +90,7 @@ pub fn contract_world(root: &Path, seed: u64) -> Result<World, ReplayError> {
             .map_err(ReplayError::Load)?
             .merged(),
     );
-    world.set_economy_config(csp_sim::economy::EconomyConfig::from_balance(&balance));
+    world.set_economy_config(csp_sim::economy::EconomyConfig::from_balance(&balance))?;
     world.set_sites(
         csp_data::load_sites(&root.join("systems/home/sites.ron"))
             .map_err(ReplayError::Load)?

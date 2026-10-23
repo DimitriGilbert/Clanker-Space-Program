@@ -626,9 +626,17 @@ impl World {
     /// `step_frame`). Also (re)seeds `funds_micros` from
     /// `starting_funds_micros`, since the starting balance is part of
     /// the same authored economy a data-built world runs under.
-    pub fn set_economy_config(&mut self, cfg: EconomyConfig) {
+    /// An invalid config (the `is_valid` gate every apply runs) is
+    /// rejected `Recoverable` rather than installed: the config lands
+    /// in hashed state, and a bad value in it would otherwise poison
+    /// every downstream check with no honest surface.
+    pub fn set_economy_config(&mut self, cfg: EconomyConfig) -> Result<(), SimError> {
+        if !cfg.is_valid() {
+            return Err(SimError::Recoverable("economy: invalid config"));
+        }
         self.economy_cfg = cfg;
         self.economy.funds_micros = cfg.starting_funds_micros;
+        Ok(())
     }
 
     /// Install the site's def table — construction config (the
@@ -1083,7 +1091,8 @@ mod tests {
             hire_cost_micros: 1_000_000,
             salary_period_ticks: 6_400,
             ..default_config()
-        });
+        })
+        .unwrap();
         w
     }
 

@@ -364,6 +364,13 @@ impl World {
     /// removal like `TransferComplete`); a disabled subsystem never
     /// kills (the toggle scrubs pending events, and this gate is the
     /// belt to their suspenders).
+    ///
+    /// The event is committed, the PREDICATE is not: the scheduling
+    /// check found a resource the tanks could not fully cover, but a
+    /// same-tick `TransferComplete` landing ahead of this firing can
+    /// have topped them up — the firing re-checks coverage (the
+    /// colony-side `LifeSupportDepleted` arm's `colony_net_solve`
+    /// re-check) and a covered vessel's crew survives.
     pub(crate) fn fire_vessel_ls_depleted(
         &mut self,
         vessel: VesselId,
@@ -376,6 +383,23 @@ impl World {
             return Ok(());
         };
         if v.crew.is_empty() {
+            return Ok(());
+        }
+        // The scheduling predicate, re-evaluated at firing: a resource
+        // is unserved iff the tanks hold less than one period's debit
+        // (the check's `moved < required` — `debit` moves min(held,
+        // required), so a short debit means a short tank).
+        let period_s = self.life_support_cfg.check_period_ticks as f64 / TICK_HZ as f64;
+        let crew_n = v.crew.len() as f64;
+        let still_short = self
+            .life_support_cfg
+            .demands()
+            .iter()
+            .any(|(resource, per_crew_s)| {
+                let required = per_crew_s * period_s * crew_n;
+                required > 0.0 && crate::transfers::vessel_resource(v, resource) < required
+            });
+        if !still_short {
             return Ok(());
         }
         self.shadow_vessels(shadow);

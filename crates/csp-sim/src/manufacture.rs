@@ -116,7 +116,10 @@ impl crate::World {
         shadow: &mut TickShadow,
     ) -> Result<(), SimError> {
         if !self.economy_cfg.is_valid() {
-            return Err(SimError::Fatal("economy: invalid config"));
+            // Input-reachable like the five transfer sites (a config
+            // a caller installed pre-check or a corrupt record): a
+            // `Recoverable` rejection, never a `Fatal`.
+            return Err(SimError::Recoverable("manufacture: invalid economy config"));
         }
         let Some(def) = self.site_defs.get(&site) else {
             return Err(SimError::Recoverable("manufacture: unknown site"));
@@ -217,9 +220,14 @@ impl crate::World {
             .checked_add(1)
             .ok_or(SimError::Fatal("build id overflow"))?;
         let now = self.clock.ticks();
+        // A huge authored mass saturates `ticks_for` — input-reachable
+        // like the non-finite check above, so the overflow is a
+        // `Recoverable` rejection, not a `Fatal`.
         let complete_tick = now
             .checked_add(ticks_for(mass, self.economy_cfg.manufacture_rate_kg_per_s))
-            .ok_or(SimError::Fatal("manufacture: tick overflow"))?;
+            .ok_or(SimError::Recoverable(
+                "manufacture: build duration overflows the tick horizon",
+            ))?;
         self.builds.insert(
             id,
             ActiveBuild {

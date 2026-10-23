@@ -655,7 +655,8 @@ impl View {
         // the system's site table — the same data-derived wiring;
         // without them the funds paths run on the no-data defaults
         // and `RecoverVessel` has no sites to name.
-        sim.set_economy_config(csp_sim::economy::EconomyConfig::from_balance(&balance));
+        sim.set_economy_config(csp_sim::economy::EconomyConfig::from_balance(&balance))
+            .map_err(ViewError::Sim)?;
         let sites =
             csp_data::load_sites_from(src, &root.join("systems").join("home").join("sites.ron"))?;
         sim.set_sites(

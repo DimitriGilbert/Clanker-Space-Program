@@ -84,7 +84,7 @@ pub fn staffed_base_run(probe: &EconomyProbe) -> Result<EconomyReport, SimError>
         csp_sim::orbit::PatchedConics::new(BTreeMap::new()),
         balance.advance_to_max_events_per_frame,
     );
-    w.set_economy_config(cfg);
+    w.set_economy_config(cfg)?;
     let period_ticks = cfg.salary_period_ticks;
     let period_s = period_ticks as f64 / TICKS_PER_SECOND as f64;
     // The monthly charge is a pure function of the roster's salary
@@ -203,7 +203,7 @@ pub fn colony_production_run(months: u64) -> Result<ColonyEconomyReport, SimErro
         csp_sim::orbit::PatchedConics::new(bodies),
         balance.advance_to_max_events_per_frame,
     );
-    w.set_economy_config(economy::EconomyConfig::from_balance(&balance));
+    w.set_economy_config(economy::EconomyConfig::from_balance(&balance))?;
     w.set_life_support_config(csp_sim::life_support::LifeSupportConfig::from_balance(
         &balance,
     ));

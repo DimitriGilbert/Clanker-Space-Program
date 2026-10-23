@@ -193,7 +193,7 @@ fn flight_initial(dir: &Path) -> Result<World, ReplayError> {
     );
     // §3.5's economy tunables + site table — same wiring (M7-C): the
     // fixture's balance.ron and sites.ron are the source of truth.
-    world.set_economy_config(csp_sim::economy::EconomyConfig::from_balance(&balance));
+    world.set_economy_config(csp_sim::economy::EconomyConfig::from_balance(&balance))?;
     let sites = csp_data::load_sites(&dir.join("sites.ron")).map_err(ReplayError::Load)?;
     world.set_sites(
         sites

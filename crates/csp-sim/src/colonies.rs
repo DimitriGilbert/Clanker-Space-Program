@@ -77,7 +77,13 @@
 //! module — damaged and ungrounded ones included: such a module's
 //! grant is zero, so crew aboard a colony whose life support can no
 //! longer serve a required resource die on schedule ("damage should
-//! kill"). `PowerRestored` is the ONLY way out of `Degraded`, and only
+//! kill"). The scan walks the module's whole request set — the
+//! `power_ec_per_s` row included — so an unpowered module whose EC
+//! request can be served by neither stock nor production reads as
+//! depleted even while a consumable reserve stays stocked (a
+//! power-pinned module cannot run at all; unsatisfied requests are
+//! depletion evidence).
+//! `PowerRestored` is the ONLY way out of `Degraded`, and only
 //! for `reason: PowerLost`: **`Degraded{ImpactDamage}` is terminal in
 //! M8-A** — there is no repair command (one lands post-M8-A with the
 //! impact-detection hook), so impact damage marks a colony dead
@@ -96,7 +102,12 @@
 //! `LifeSupportDepleted`) are never scrubbed BY THE RECOMPUTE — they
 //! are committed transitions one tick out (the life-support toggle's
 //! whole-heap scrub excepted: `LifeSupportDepleted` is committed only
-//! while the subsystem lives, and its firing re-checks the flag) —
+//! while the subsystem lives, and its firing re-checks the flag).
+//! Committed is the event, never its predicate: each transition arm
+//! re-solves the network at its own tick (`colony_net_solve`), so a
+//! same-tick `TransferComplete` resupply — or any landing that lifts
+//! `ls_depleted`/`power_starved` first — cancels the transition it
+//! would have refuted —
 //! and never duplicated: a recompute whose
 //! predicate already has that notification pending in the heap skips
 //! re-scheduling it (two recomputes at one tick — two commands in one
@@ -247,8 +258,12 @@ pub struct ColonyStore {
     pub anchor_level: f64,
     /// The tick `anchor_level` is stamped at.
     pub anchor_tick: u64,
-    /// Aggregate capacity — Σ of the colony's `Store`/`Battery`
-    /// module capacities for this resource (units).
+    /// Aggregate capacity — Σ of the colony's UNDAMAGED
+    /// `Store`/`Battery` module capacities for this resource (units).
+    /// Re-derived at every recompute ([`live_capacity`]): a damaged
+    /// store holds nothing — its contents clamp away at the damage
+    /// boundary — so `level_at`'s cap, `credit_end`'s headroom, and
+    /// the `AbandonColony` salvage never read wreckage.
     pub capacity: f64,
     /// The interval's fixed net rate (units/s): granted production
     /// minus granted consumption. Negative drains, positive fills.
@@ -284,6 +299,16 @@ pub struct Colony {
     pub latitude_rad: f64,
     /// Longitude eastward from the frame +x (rad).
     pub longitude_rad: f64,
+    /// Altitude above the body's datum radius (m) — the FOUNDING
+    /// site's authored altitude, latched onto the record like
+    /// `latitude_rad`/`longitude_rad`: the colony's surface point is
+    /// one convention (`colony_env[body].radius_m + altitude_m`) read
+    /// identically by the impact seam and `vessel_colony_linked`,
+    /// never re-resolved through the (mutable) site-def table.
+    /// `serde(default)` keeps pre-field saves loading at the old
+    /// surface-altitude convention (0).
+    #[serde(default)]
+    pub altitude_m: f64,
     /// The §3.5.1 state machine slot.
     pub state: ColonyState,
     /// The module list — index = `ModuleIndex`.
@@ -453,7 +478,11 @@ pub fn next_terminator_tick(light: &BodyLight, now: u64) -> Option<u64> {
     // boundary means the next is half a solar day out.
     let spacing = PI / syn;
     let dt = ((PI / 2.0 - h_now) / light.synodic_rate).rem_euclid(spacing);
-    let dt = if dt > EPS { dt } else { spacing };
+    // Only an exact 0 reads "sitting on the boundary" — a positive dt
+    // however small is a real crossing this interval (the `ceil` below
+    // still lands it strictly ahead at the next tick); an EPS floor
+    // here would skip a genuine crossing inside 1e-9 s.
+    let dt = if dt > 0.0 { dt } else { spacing };
     Some(now.saturating_add((dt * TICK_HZ as f64).ceil() as u64))
 }
 
@@ -487,6 +516,32 @@ fn module_inert(m: &ColonyModule, state: &ColonyState) -> bool {
             m.def,
             ColonyModuleDef::Drill { .. } | ColonyModuleDef::Converter { .. }
         )
+}
+
+/// The resource's live store capacity — Σ over UNDAMAGED
+/// `Store`/`Battery` modules only (the `active`-filtered
+/// `eps_sigma_a` discipline: a damaged module contributes nothing).
+/// Re-derived at every recompute — never cached past a damage
+/// boundary — so `credit_end`, the `level_at` cap, and the
+/// `AbandonColony` salvage all read capacity net of wreckage: a
+/// destroyed store's contents are gone with it (the clamp at the
+/// damage recompute is the honest disposal), and a destroyed battery
+/// accepts no further charge.
+fn live_capacity(modules: &[ColonyModule], resource: &ResourceId) -> f64 {
+    modules
+        .iter()
+        .filter(|m| !m.damaged)
+        .map(|m| match &m.def {
+            ColonyModuleDef::Store {
+                resource: r,
+                capacity,
+            } if *r == *resource => *capacity,
+            ColonyModuleDef::Battery { capacity } if resource.as_str() == ELECTRIC_CHARGE => {
+                *capacity
+            }
+            _ => 0.0,
+        })
+        .sum()
 }
 
 /// One module's consumer registrations — `(resource, request)` pairs
@@ -804,32 +859,12 @@ fn allocation_pass(input: &SolveInput) -> Allocation {
     let active: Vec<bool> = (0..n).map(|i| viable[i] && grounded[i]).collect();
     let consumers = consumer_map(&requests, &active);
     let mut fractions = vec![1.0f64; n];
-    let mut grants: BTreeMap<(usize, ResourceId), f64> = BTreeMap::new();
+    let mut grants: BTreeMap<(usize, ResourceId), f64>;
     let mut produced: BTreeMap<ResourceId, f64>;
     // Monotone fixpoint — each sweep's fractions are min(prev, computed).
     for _ in 0..n.saturating_add(1) {
         produced = production_at(input, &active, &fractions);
-        grants.clear();
-        for (r, list) in &consumers {
-            let stock = input.levels.get(r).copied().unwrap_or(0.0);
-            let mut remaining = produced.get(r).copied().unwrap_or(0.0)
-                + if stock > EPS { f64::INFINITY } else { 0.0 };
-            for (j, c) in list.iter().enumerate() {
-                if remaining >= c.request {
-                    grants.insert((c.module, r.clone()), c.request);
-                    remaining -= c.request;
-                } else {
-                    let total: f64 = list[j..].iter().map(|c| c.request).sum();
-                    if total > 0.0 {
-                        let share = remaining / total;
-                        for c in &list[j..] {
-                            grants.insert((c.module, r.clone()), c.request * share);
-                        }
-                    }
-                    break;
-                }
-            }
-        }
+        grants = grant_map(&consumers, &produced, input.levels);
         // New fractions — min over the module's input grants; inert
         // modules pin at 0.
         let mut changed = false;
@@ -851,13 +886,55 @@ fn allocation_pass(input: &SolveInput) -> Allocation {
             break;
         }
     }
+    // The capped final sweep can exit mid-change: `grants`/`produced`
+    // then hold the PRE-update iteration's table. Recompute both under
+    // the converged fractions so the returned `Allocation` is always
+    // one consistent solve (a clean break recomputes bitwise the same
+    // table — the extra pass is idempotent).
     produced = production_at(input, &active, &fractions);
+    grants = grant_map(&consumers, &produced, input.levels);
     Allocation {
         grants,
         fractions,
         produced,
         active,
     }
+}
+
+/// One sweep's grant table over `consumers` — the rule-3 fill: full
+/// requests in `(priority, ModuleIndex)` order until the available
+/// rate (production plus the stocked flag's infinite remainder)
+/// exhausts, then the rest splits pro-rata by request. Factored out
+/// of `allocation_pass`'s loop so the post-fixpoint grants recompute
+/// under the same `produced` the caller returns (a capped final sweep
+/// would otherwise leave `grants` one iteration stale).
+fn grant_map(
+    consumers: &BTreeMap<ResourceId, Vec<Consumer>>,
+    produced: &BTreeMap<ResourceId, f64>,
+    levels: &BTreeMap<ResourceId, f64>,
+) -> BTreeMap<(usize, ResourceId), f64> {
+    let mut grants: BTreeMap<(usize, ResourceId), f64> = BTreeMap::new();
+    for (r, list) in consumers {
+        let stock = levels.get(r).copied().unwrap_or(0.0);
+        let mut remaining =
+            produced.get(r).copied().unwrap_or(0.0) + if stock > EPS { f64::INFINITY } else { 0.0 };
+        for (j, c) in list.iter().enumerate() {
+            if remaining >= c.request {
+                grants.insert((c.module, r.clone()), c.request);
+                remaining -= c.request;
+            } else {
+                let total: f64 = list[j..].iter().map(|c| c.request).sum();
+                if total > 0.0 {
+                    let share = remaining / total;
+                    for c in &list[j..] {
+                        grants.insert((c.module, r.clone()), c.request * share);
+                    }
+                }
+                break;
+            }
+        }
+    }
+    grants
 }
 
 /// The per-resource consumer tables — rows only from `active`
@@ -993,21 +1070,21 @@ fn solve_network(input: &SolveInput) -> NetSolve {
     // just `active` ones: a damaged or ungrounded module has no grant
     // row (`g` reads 0), so crew aboard deplete the moment a required
     // store is empty — damage kills. Stocked reserves still cover the
-    // request (the "switches to reserves" reading).
+    // request (the "switches to reserves" reading). The scanned rows
+    // are the module's WHOLE request set — `module_requests` again —
+    // so `power_ec_per_s` counts as a required resource too: an
+    // unpowered (ungrounded) module whose EC request cannot be served
+    // is unsatisfied life support, and a stocked O2 reserve does not
+    // keep its crew alive (the request rows are identical to what the
+    // allocation pass registered — one source of truth for "what
+    // life support needs").
     let mut ls_depleted = false;
     if input.crew > 0 {
         for (i, m) in input.modules.iter().enumerate() {
-            if let ColonyModuleDef::LifeSupport {
-                consumes_per_crew, ..
-            } = &m.def
-            {
-                for (r, q) in consumes_per_crew {
-                    let req = q * input.crew as f64;
-                    if req <= 0.0 {
-                        continue;
-                    }
+            if let ColonyModuleDef::LifeSupport { .. } = &m.def {
+                for (_, r, req) in module_requests(m, input.crew, input.recipes) {
                     let g = grants.get(&(i, r.clone())).copied().unwrap_or(0.0);
-                    let stock = input.levels.get(r).copied().unwrap_or(0.0);
+                    let stock = input.levels.get(&r).copied().unwrap_or(0.0);
                     if stock <= EPS && g < req - EPS {
                         ls_depleted = true;
                     }
@@ -1134,6 +1211,7 @@ pub fn hash_colonies(h: &mut StateHasher, colonies: &BTreeMap<ColonyId, Colony>)
         h.str(c.body.as_str());
         h.f64(c.latitude_rad);
         h.f64(c.longitude_rad);
+        h.f64(c.altitude_m);
         h.stable_enum(&c.state);
         if let ColonyState::Degraded { reason } = &c.state {
             h.stable_enum(reason);
@@ -1435,6 +1513,7 @@ impl World {
     /// first published deadlines. `Recoverable` rejections: unknown
     /// site, no colony env for the site body, non-finite or negative
     /// rates/levels.
+    #[allow(clippy::too_many_lines)] // a sequential validate → build → solve pipeline
     pub(crate) fn apply_found_colony(
         &mut self,
         def: &ColonyDef,
@@ -1445,14 +1524,22 @@ impl World {
         };
         // Snapshot the resolved pose — `site` borrows the config
         // table, which the arena write below must not hold.
-        let (site_body, site_lat, site_lon) =
-            (site.body.clone(), site.latitude_rad, site.longitude_rad);
+        let (site_body, site_lat, site_lon, site_alt) = (
+            site.body.clone(),
+            site.latitude_rad,
+            site.longitude_rad,
+            site.altitude_m,
+        );
         let Some(env) = self.colony_env.get(&site_body).copied() else {
             return Err(SimError::Recoverable(
                 "found colony: no colony environment for site body",
             ));
         };
-        if !(site_lat.is_finite() && site_lon.is_finite()) {
+        if !(site_lat.is_finite()
+            && site_lon.is_finite()
+            && site_alt.is_finite()
+            && site_alt >= 0.0)
+        {
             return Err(SimError::Recoverable("found colony: non-finite site pose"));
         }
         if !colony_def_fields_finite(def, &self.recipes) {
@@ -1527,6 +1614,7 @@ impl World {
             body: site_body,
             latitude_rad: site_lat,
             longitude_rad: site_lon,
+            altitude_m: site_alt,
             state: ColonyState::Nominal,
             modules,
             stores,
@@ -1765,7 +1853,6 @@ impl World {
         };
         let env = physics.backend.environment();
         let center = env.body_center;
-        let radius_m = env.radius_m;
         let dominant = physics.dominant.clone();
         let range = self.transfer_cfg.radius_m;
         for &(pos, impact_tick) in impacts {
@@ -1789,22 +1876,16 @@ impl World {
                 // like the dormant filter, it is simply not a target.
                 if colony.body != dominant
                     || matches!(colony.state, ColonyState::Dormant | ColonyState::Abandoned)
-                    || !self.colony_env.contains_key(&colony.body)
                 {
                     continue;
                 }
-                // The colony's surface point — the latched-pose form
-                // (`transfers::latched_pos`) at surface altitude.
-                let site = crate::transfers::latched_pos(
-                    &crate::SurfacePose {
-                        body: colony.body.clone(),
-                        latitude_rad: colony.latitude_rad,
-                        longitude_rad: colony.longitude_rad,
-                        altitude_m: 0.0,
-                        orientation: csp_core::DQuat::IDENTITY,
-                    },
-                    radius_m,
-                );
+                // The colony's surface point — the ONE convention the
+                // proximity gate shares (`transfers::colony_surface_
+                // point`): `colony_env` radius plus the stored founding
+                // altitude. `None` is the envless-colony skip above.
+                let Some(site) = self.colony_surface_point(colony) else {
+                    continue;
+                };
                 if (pos - center - site).norm() > range {
                     continue;
                 }
@@ -1843,6 +1924,53 @@ impl World {
             .ok_or(SimError::Fatal("inspection: colony vanished"))?
             .inspection_tick = Some(t);
         self.recompute_colony(id, self.clock.ticks(), shadow)
+    }
+
+    /// The firing-time predicate re-check the transition arms run:
+    /// re-solves the colony's network over exactly the inputs
+    /// `recompute_colony` would read at `tick` — pure (levels via
+    /// `level_at`, no anchoring, no writes), so the answer is
+    /// identical in every §2.6.1 partition. A committed notification
+    /// is scheduled one tick out; a same-tick event firing ahead of it
+    /// (a `TransferComplete` resupply, a crew landing) can already
+    /// have lifted the predicate — the firing re-checks rather than
+    /// trusting the stale commit. `None` when the colony cannot be
+    /// solved at all (a missing `colony_env` entry — the input
+    /// `recompute_colony` fails `Recoverable` on).
+    fn colony_net_solve(&self, id: ColonyId, tick: u64) -> Option<NetSolve> {
+        let colony = self.colonies.get(&id)?;
+        let env = self.colony_env.get(&colony.body).copied()?;
+        let light = body_light(
+            &colony.body,
+            colony.latitude_rad,
+            colony.longitude_rad,
+            &self.orbits,
+            &env,
+        );
+        let levels: BTreeMap<ResourceId, f64> = colony
+            .stores
+            .iter()
+            .map(|(r, s)| (r.clone(), s.level_at(tick)))
+            .collect();
+        let concentrations: BTreeMap<ResourceId, f64> = self
+            .site_defs
+            .get(&colony.site)
+            .map(|d| d.resource_yields.iter().cloned().collect())
+            .unwrap_or_default();
+        Some(solve_network(&SolveInput {
+            modules: &colony.modules,
+            state: colony.state,
+            levels: &levels,
+            light: &light,
+            crew: if self.life_support_enabled {
+                colony.crew.len()
+            } else {
+                0
+            },
+            daylight: colony.daylight,
+            recipes: &self.recipes,
+            concentrations: &concentrations,
+        }))
     }
 
     /// One colony event's application — the event-side counterpart of
@@ -1929,6 +2057,17 @@ impl World {
                 if !matches!(colony.state, ColonyState::Nominal) {
                     return Ok(());
                 }
+                // Committed is the event, not the predicate: a
+                // same-tick landing (an EC resupply credited ahead of
+                // this firing) can lift the starvation the scheduling
+                // recompute saw — re-check at the firing tick or the
+                // transition lands a lie.
+                if !self
+                    .colony_net_solve(id, now)
+                    .is_some_and(|s| s.power_starved)
+                {
+                    return Ok(());
+                }
                 self.shadow_colonies(shadow);
                 self.colonies
                     .get_mut(&id)
@@ -1947,6 +2086,16 @@ impl World {
                 ) {
                     return Ok(());
                 }
+                // The inverse re-check: restoration is earned by the
+                // predicate at firing time — a same-tick demand or
+                // production change that re-starved the colony leaves
+                // it `Degraded`, the event a stale no-op.
+                if self
+                    .colony_net_solve(id, now)
+                    .is_none_or(|s| s.power_starved)
+                {
+                    return Ok(());
+                }
                 self.shadow_colonies(shadow);
                 self.colonies
                     .get_mut(&id)
@@ -1962,6 +2111,18 @@ impl World {
                 // straggler that survives — a pre-fix save's —
                 // fires as a no-op).
                 if !live || !self.life_support_enabled {
+                    return Ok(());
+                }
+                // The depletion re-check — the same belt-and-suspenders
+                // reading: a same-tick `TransferComplete` resupply (or
+                // a crew landing) ahead of this firing can restore a
+                // grant the scheduling recompute could not yet see;
+                // the commit is the event's, the predicate is
+                // re-derived at its own tick.
+                if !self
+                    .colony_net_solve(id, now)
+                    .is_some_and(|s| s.ls_depleted)
+                {
                     return Ok(());
                 }
                 // Crew aboard are Lost (the deaths setting's
@@ -2040,10 +2201,17 @@ impl World {
                 .colonies
                 .get_mut(&id)
                 .ok_or(SimError::Fatal("colony: vanished"))?;
+            let modules = &colony.modules;
             colony
                 .stores
                 .iter_mut()
                 .map(|(r, s)| {
+                    // Capacity rides the re-anchor: `live_capacity`
+                    // re-derives it from the undamaged module set
+                    // BEFORE `level_at` clamps, so a damaged
+                    // Store/Battery sheds its contents — and its
+                    // headroom — at this boundary, not retroactively.
+                    s.capacity = live_capacity(modules, r);
                     let level = s.level_at(tick);
                     s.anchor_level = level;
                     s.anchor_tick = tick;
@@ -3644,6 +3812,250 @@ mod tests {
         );
         assert_eq!(w.colonies()[&id].state, ColonyState::Dormant);
         assert_eq!(w.economy().crew[&CrewId(0)].status, CrewStatus::Lost);
+    }
+
+    /// R9-F1: a crewed `LifeSupport` module whose `power_ec_per_s`
+    /// request can be served by neither stock nor production is
+    /// unsatisfied life support — a stocked O2 reserve must NOT
+    /// freeze its crew alive (the power-pinned module runs at
+    /// nothing, and an unserved request is depletion evidence). The
+    /// scan walks the module's whole request set now — the EC row
+    /// included — so the crew depletes on schedule.
+    #[test]
+    fn unpowered_life_support_kills_crew() {
+        let mut w = colony_world();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::HireCrew {
+                name: "a".into(),
+                kind: crate::CrewKind::Engineer,
+                salary_per_s: 1.0,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        // O2 stocked at 50, but no EC anywhere — the LS module's
+        // power request is unservable, pinning it ungrounded. Under
+        // the old scan the stocked O2 read as "reserves cover it"
+        // and the crew lived forever on a module that never ran.
+        found(
+            &mut w,
+            vec![
+                ColonyModuleDef::Store {
+                    resource: ResourceId::from("oxygen"),
+                    capacity: 100.0,
+                },
+                ColonyModuleDef::LifeSupport {
+                    consumes_per_crew: vec![(ResourceId::from("oxygen"), 0.1)],
+                    power_ec_per_s: 0.5,
+                },
+            ],
+            vec![csp_data::ColonyStoreInit {
+                resource: ResourceId::from("oxygen"),
+                level: 50.0,
+            }],
+        );
+        let id = *w.colonies().keys().next().unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::AssignCrewToColony {
+                colony: id,
+                crew: CrewId(0),
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 4).unwrap();
+        assert!(
+            r.fired_events.iter().any(
+                |e| matches!(e.kind, EventKind::LifeSupportDepleted { colony } if colony == id)
+            )
+        );
+        assert_eq!(w.colonies()[&id].state, ColonyState::Dormant);
+        assert_eq!(w.economy().crew[&CrewId(0)].status, CrewStatus::Lost);
+        // The module never ran — the O2 reserve is untouched (the
+        // crew died of a dead scrubber, not suffocation).
+        let o2 = ResourceId::from("oxygen");
+        assert!((w.colonies()[&id].stores[&o2].level_at(w.clock().ticks()) - 50.0).abs() < 1e-9);
+    }
+
+    /// R9-F2: a committed `LifeSupportDepleted` re-checks its
+    /// predicate at firing — a `TransferComplete` landing O2 on the
+    /// same tick (scheduled earlier, so it fires first) restores the
+    /// grant and cancels the kill. The event still fires; it is the
+    /// no-op its own re-check earns.
+    #[test]
+    fn same_tick_resupply_cancels_ls_depletion() {
+        let mut w = colony_world();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::HireCrew {
+                name: "a".into(),
+                kind: crate::CrewKind::Engineer,
+                salary_per_s: 1.0,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        let o2 = ResourceId::from("oxygen");
+        found(
+            &mut w,
+            vec![
+                gen_module(10.0),
+                ColonyModuleDef::Store {
+                    resource: o2.clone(),
+                    capacity: 100.0,
+                },
+                ColonyModuleDef::LifeSupport {
+                    consumes_per_crew: vec![(o2.clone(), 0.1)],
+                    power_ec_per_s: 0.0,
+                },
+            ],
+            vec![csp_data::ColonyStoreInit {
+                resource: o2.clone(),
+                level: 6.4,
+            }],
+        );
+        let id = *w.colonies().keys().next().unwrap();
+        let vessel = latched_vessel(&mut w, "oxygen", 100.0, 50.0);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::JoinColonyInventory { vessel, colony: id },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::AssignCrewToColony {
+                colony: id,
+                crew: CrewId(0),
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        // The drain begins: the heap holds the store's empty bound.
+        // `ColonyStoreEmpty`'s firing will commit `LifeSupportDepleted`
+        // one tick out — the tick the resupply is aimed at.
+        let empty_tick = w
+            .event_heap
+            .iter()
+            .find(|e| {
+                matches!(
+                    &e.kind,
+                    EventKind::ColonyStoreEmpty { colony, resource }
+                        if *colony == id && *resource == o2
+                )
+            })
+            .map(|e| e.tick)
+            .unwrap();
+        // 10 units at 10 u/s = 64 ticks: applied at empty_tick−63 it
+        // completes at empty_tick+1 — with an earlier `event_seq`
+        // than the depletion the empty's recompute commits, so the
+        // credit lands first at their shared tick.
+        let apply_tick = empty_tick - 63;
+        w.step_frame(apply_tick).unwrap();
+        assert_eq!(w.clock().ticks(), apply_tick);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::TransferColonyResource {
+                vessel,
+                colony: id,
+                resource: o2.clone(),
+                amount: 10.0,
+                to_colony: true,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        // Through empty_tick+1: the empty commits the depletion, the
+        // completion credits O2, and the transition's own re-check
+        // finds the store stocked — the crew survives.
+        let r = w.step_frame(empty_tick + 3).unwrap();
+        assert!(
+            r.fired_events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::TransferComplete { .. }))
+        );
+        assert!(
+            r.fired_events.iter().any(
+                |e| matches!(e.kind, EventKind::LifeSupportDepleted { colony } if colony == id)
+            )
+        );
+        assert_eq!(w.economy().crew[&CrewId(0)].status, CrewStatus::Active);
+        assert_eq!(w.colonies()[&id].state, ColonyState::Nominal);
+        assert_eq!(w.colonies()[&id].crew.len(), 1);
+        // 10 landed at empty_tick+1, then the reserve keeps draining.
+        let level = w.colonies()[&id].stores[&o2].level_at(empty_tick + 3);
+        assert!(level > 9.9, "level {level}");
+    }
+
+    /// R9-F9: a damaged `Battery`'s capacity is gone with the
+    /// module — the recompute re-derives aggregate capacity over
+    /// undamaged stores, so an in-flight `TransferComplete` credits
+    /// nothing into a wrecked battery (the source fallback returns
+    /// the units to the vessel's tanks).
+    #[test]
+    fn damaged_battery_stops_accepting_charge() {
+        let mut w = colony_world();
+        let ec_id = ec();
+        found(
+            &mut w,
+            vec![
+                gen_module(10.0),
+                ColonyModuleDef::Battery { capacity: 100.0 },
+            ],
+            vec![csp_data::ColonyStoreInit {
+                resource: ec_id.clone(),
+                level: 50.0,
+            }],
+        );
+        let id = *w.colonies().keys().next().unwrap();
+        let vessel = latched_vessel(&mut w, "electric_charge", 100.0, 50.0);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::JoinColonyInventory { vessel, colony: id },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::TransferColonyResource {
+                vessel,
+                colony: id,
+                resource: ec_id.clone(),
+                amount: 10.0,
+                to_colony: true,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        // In flight now (64 ticks); the vessel holds 40.
+        assert!(
+            (crate::transfers::vessel_resource(&w.vessels()[&vessel], &ec_id) - 40.0).abs() < 1e-9
+        );
+        // Wreck the battery mid-flight (ModuleIndex 1).
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::DamageColonyModule {
+                colony: id,
+                module: 1,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        // Capacity re-derived to 0 — the held 50 went with the module.
+        let store = &w.colonies()[&id].stores[&ec_id];
+        assert_eq!(store.capacity, 0.0);
+        assert_eq!(store.level_at(w.clock().ticks()), 0.0);
+        // The completion credits nothing into the wrecked store; the
+        // source fallback returns the 10 units to the vessel's tanks.
+        w.step_frame(w.clock().ticks() + 128).unwrap();
+        assert_eq!(
+            w.colonies()[&id].stores[&ec_id].level_at(w.clock().ticks()),
+            0.0
+        );
+        assert!(
+            (crate::transfers::vessel_resource(&w.vessels()[&vessel], &ec_id) - 50.0).abs() < 1e-9
+        );
     }
 
     // ---- M8-B: drills / converters / generators / transfers ----

@@ -321,7 +321,10 @@ pub enum EventKind {
     /// §3.5.1 rule 5 + §2.6.5's `Clamping` member (M8-A): a
     /// life-support-required store is empty and under-granted with
     /// crew aboard — firing marks the crew `Lost` and drops the
-    /// colony to `Dormant` (it schedules nothing ever again).
+    /// colony to `Dormant` (it schedules nothing ever again). The
+    /// firing re-checks the predicate first — a same-tick resupply
+    /// credited ahead of it cancels the kill (the event is committed,
+    /// its premise is not).
     LifeSupportDepleted {
         /// The colony whose life support ran out.
         colony: crate::ColonyId,
@@ -349,7 +352,9 @@ pub enum EventKind {
     /// M8-C §3.5's vessel-side depletion transition — scheduled one
     /// tick out by a `LifeSupportCheck` firing when a crewed vessel
     /// cannot cover a required resource's debit; firing marks the
-    /// vessel's crew `Lost`. `Clamping`: crew dying is the named
+    /// vessel's crew `Lost` after re-checking the shortfall (a
+    /// same-tick resupply can cover it — the colony arm's re-check
+    /// precedent). `Clamping`: crew dying is the named
     /// §2.6.5 member the player must not sleep through (the colony's
     /// `LifeSupportDepleted` precedent). Names a vessel that may no
     /// longer exist — the `TransferComplete` precedent: a stale
