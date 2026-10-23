@@ -138,6 +138,17 @@ pub mod manufacture;
 /// module doc.
 pub mod life_support;
 
+/// M9a §2.10 — the scripting/autopilot control layer's sim-side
+/// surface: the script arena's state types (`ScriptId`,
+/// `ScriptState`, the `persist` map), the per-tick `TickIo` plumbing
+/// the engine is handed, `VesselTelemetry`, the `ScriptEngine` /
+/// `AutopilotDriver` traits the hosts implement, the closed-form
+/// wake resolution, and the poll-detection constants. The guest
+/// host itself is `csp-script`; the ascent autopilot is `csp-ai` —
+/// both are construction-config `Box<dyn …>` installs, never hashed
+/// state. See the module doc for the tick model and warp rules.
+pub mod scripts;
+
 pub use bubble::{CraftDef, PhysicsConfig, SurfacePose, VesselState, VesselThermal};
 pub use colonies::{
     Colony, ColonyBodyEnv, ColonyModule, ColonyState, ColonyStore, Daylight, DegradeReason,
@@ -161,6 +172,12 @@ use orbit::{OrbitModel, OrbitState, PatchedConics};
 pub use research::{
     DataKey, ResearchId, ResearchProject, ResearcherAssign, ScienceConfig, ScienceKeyState,
     ScienceState, VesselScience,
+};
+pub use scripts::{
+    AutopilotDriver, AutopilotProgram, AutopilotState, DEFAULT_SCRIPT_OP_BUDGET, POLL_DEMOTE_TICKS,
+    POLL_OPS_DEN, POLL_OPS_NUM, PersistMap, PersistValue, STRIKE_DISABLE_LIMIT, ScriptEngine,
+    ScriptFault, ScriptId, ScriptRunReport, ScriptState, TelemetryResidence, TickIo,
+    VesselTelemetry, WakeCondition,
 };
 pub use tech::TechState;
 pub use transfers::{
@@ -930,6 +947,51 @@ pub enum SimCommand {
         /// is inert.
         enabled: bool,
     },
+    /// M9a §2.10 — load a script bound to `vessel`: allocates the
+    /// next [`ScriptId`], validates the arena entry, and hands the
+    /// source to the installed [`ScriptEngine`] for `prepare` — a
+    /// compile fault rejects the command `Recoverable` rather than
+    /// landing a dead script. A world with no engine installed
+    /// stores the record anyway (the script simply never ticks —
+    /// engine presence is construction config, §7.3).
+    LoadScript {
+        /// The vessel the script binds to.
+        vessel: VesselId,
+        /// The guest-language source, logged verbatim.
+        source: String,
+    },
+    /// M9a §2.10 — unload a script: removes its arena record, drops
+    /// its pending `ScriptWake`, and releases engine-side state.
+    /// `Recoverable` for an unknown id.
+    UnloadScript {
+        /// The script to remove.
+        script: ScriptId,
+    },
+    /// M9a §2.10 — enable/disable a loaded script without losing its
+    /// `persist` state. `Recoverable` for an unknown id.
+    SetScriptEnabled {
+        /// The script to toggle.
+        script: ScriptId,
+        /// `true` = run `on_tick`; `false` = parked.
+        enabled: bool,
+    },
+    /// M9a §2.10 — engage a built-in autopilot on `vessel` (the
+    /// Rust-side scripted-control producer; its commands stamp
+    /// `SourceClass::Autopilot`). Replaces any engaged program on the
+    /// vessel. `Recoverable` for unknown vessels or non-finite
+    /// program parameters.
+    EngageAutopilot {
+        /// The vessel to fly.
+        vessel: VesselId,
+        /// The program to run.
+        program: AutopilotProgram,
+    },
+    /// M9a §2.10 — disengage the vessel's autopilot, dropping its
+    /// phase state. `Recoverable` when no autopilot is engaged.
+    DisengageAutopilot {
+        /// The vessel to release.
+        vessel: VesselId,
+    },
 }
 
 /// What `step_frame` did (§2.6.2): where the clock landed, what the
@@ -979,6 +1041,10 @@ pub struct AdvanceReport {
     /// back-pressure, never a stall: a partial still advanced the clock,
     /// fired events, or applied commands (§2.6.5).
     pub partial: bool,
+    /// M9a §2.10: script `log`/`print` lines produced during this call,
+    /// in production order — the console channel scripts surface through.
+    /// Never hashed or serialized (output, like `command_log`).
+    pub script_log: Vec<(ScriptId, String)>,
 }
 
 /// The world's §7.2 serialized set — everything `World::restore` needs to
@@ -1120,6 +1186,25 @@ pub struct WorldSnapshot {
     /// config, serialized so a restored world enforces the same
     /// cadence/rates (the `economy_cfg` precedent).
     pub life_support_cfg: LifeSupportConfig,
+    /// M9a §2.10's script arena — source, strikes, poll bookkeeping,
+    /// wake pairing, and the `persist` maps. **Serialized and
+    /// hashed** (§2.10: "persist … serialized into the save and
+    /// included in the state hash"; the rest is strike/wake state
+    /// that changes evolution). A `wake_tick` pairs with exactly one
+    /// pending `ScriptWake` at that tick — the restore coherence
+    /// check enforces both directions (the `transfers` precedent).
+    pub scripts: BTreeMap<ScriptId, ScriptState>,
+    /// §7.2 next-ID counter for the script arena (monotonic, never
+    /// reused).
+    pub next_script_id: u64,
+    /// §2.10's per-save op budget — construction config, serialized
+    /// so a restored world enforces the same call limit (the
+    /// `event_budget` precedent).
+    pub script_op_budget: u64,
+    /// M9a §2.10's engaged autopilots — one record per vessel
+    /// carrying a program (phase state lives in `persist`).
+    /// **Serialized and hashed** sim state.
+    pub autopilots: BTreeMap<VesselId, AutopilotState>,
 }
 
 /// The world's construction config — data-derived (§7.3): the orbit
@@ -1266,6 +1351,16 @@ struct TickShadow {
     /// (M8-C's `SetLifeSupportEnabled`; the config never mutates
     /// inside a tick — a pre-run write like `economy_cfg`).
     life_support_enabled: Option<bool>,
+    /// M9a: `scripts` + `next_script_id` — captured before the
+    /// first script-arena write (LoadScript/UnloadScript/
+    /// SetScriptEnabled applies, wake registration, the tick-pass
+    /// bookkeeping writes strikes/poll/wake fields).
+    scripts: Option<BTreeMap<ScriptId, ScriptState>>,
+    /// See `scripts`.
+    next_script_id: Option<u64>,
+    /// `autopilots` — captured before the first autopilot write
+    /// (Engage/Disengage applies, the driver's persist writes).
+    autopilots: Option<BTreeMap<VesselId, AutopilotState>>,
 }
 
 impl TickShadow {
@@ -1297,12 +1392,16 @@ impl TickShadow {
             next_build_id: None,
             next_colony_id: None,
             life_support_enabled: None,
+            scripts: None,
+            next_script_id: None,
+            autopilots: None,
         }
     }
 
     /// Roll the world back to the captured pre-iteration state — the
     /// whole state, so `state_hash()` is the pre-boundary hash again
     /// (§2.13). `None` fields were never mutated.
+    #[allow(clippy::cognitive_complexity)]
     fn restore(self, world: &mut World) {
         world.clock = self.clock;
         world.warp_level = self.warp_level;
@@ -1378,6 +1477,15 @@ impl TickShadow {
         }
         if let Some(v) = self.life_support_enabled {
             world.life_support_enabled = v;
+        }
+        if let Some(v) = self.scripts {
+            world.scripts = v;
+        }
+        if let Some(v) = self.next_script_id {
+            world.next_script_id = v;
+        }
+        if let Some(v) = self.autopilots {
+            world.autopilots = v;
         }
     }
 }
@@ -1577,6 +1685,36 @@ pub struct World {
     /// config, hashed and serialized like `economy_cfg` (the
     /// cadence and rates change state evolution).
     life_support_cfg: LifeSupportConfig,
+    /// M9a §2.10's script arena — ascending `ScriptId` key order IS
+    /// the per-tick run order (§2.10's "ascending ScriptId").
+    /// **Hashed and serialized** (module doc of [`scripts`]).
+    scripts: BTreeMap<ScriptId, ScriptState>,
+    /// §2.2 next-ID counter for the script arena — monotonic, never
+    /// reused, serialized and hashed.
+    next_script_id: u64,
+    /// §2.10's per-save op budget — construction config (from
+    /// `balance.ron: script_op_budget` in real worlds;
+    /// [`DEFAULT_SCRIPT_OP_BUDGET`] otherwise). Hashed and
+    /// serialized like `event_budget` — it changes state evolution
+    /// (a different budget is a different abort/strike history).
+    script_op_budget: u64,
+    /// M9a §2.10's engaged autopilots — one record per vessel,
+    /// ascending `VesselId` order (their per-tick run order).
+    /// **Hashed and serialized**.
+    autopilots: BTreeMap<VesselId, AutopilotState>,
+    /// The guest-language host — construction config (§7.3):
+    /// installed by the caller, never hashed or serialized. `None`
+    /// means loaded scripts never tick. `csp-script`'s `RhaiHost`
+    /// is the production implementor.
+    script_engine: Option<Box<dyn ScriptEngine>>,
+    /// The Rust-autopilot driver — same construction-config channel
+    /// as `script_engine`. `csp-ai`'s `AscentAutopilot` is the
+    /// production implementor; `None` skips the autopilot pass.
+    autopilot_driver: Option<Box<dyn AutopilotDriver>>,
+    /// M9a script `log`/`print` output accumulated during the
+    /// current `step_frame` — moved into `AdvanceReport::script_log`
+    /// at return. Scratch only: never hashed, never serialized.
+    script_log: Vec<(ScriptId, String)>,
 }
 
 /// The world's physics half: the §2.9 backend it steps plus the
@@ -1692,6 +1830,13 @@ impl World {
             // and only makes sense once vessels carry LS resources.
             life_support_enabled: false,
             life_support_cfg: life_support::default_config(),
+            scripts: BTreeMap::new(),
+            next_script_id: 0,
+            script_op_budget: DEFAULT_SCRIPT_OP_BUDGET,
+            autopilots: BTreeMap::new(),
+            script_engine: None,
+            autopilot_driver: None,
+            script_log: Vec::new(),
         }
     }
 
@@ -1706,6 +1851,47 @@ impl World {
     /// The configured caps.
     pub fn vessel_caps(&self) -> VesselCaps {
         self.caps
+    }
+
+    /// M9a §2.10: install the guest-language host — construction
+    /// config (§7.3), never hashed or serialized. `csp-script`'s
+    /// `RhaiHost` is the production implementor; replay/save
+    /// restores re-install the same channel.
+    pub fn set_script_engine(&mut self, mut engine: Box<dyn ScriptEngine>) {
+        engine.set_op_budget(self.script_op_budget);
+        self.script_engine = Some(engine);
+    }
+
+    /// M9a §2.10: install the Rust-autopilot driver — same
+    /// construction-config channel as [`Self::set_script_engine`].
+    pub fn set_autopilot_driver(&mut self, driver: Box<dyn AutopilotDriver>) {
+        self.autopilot_driver = Some(driver);
+    }
+
+    /// M9a §2.10's per-save op budget — the `balance.ron`
+    /// `script_op_budget` wiring (`set_vessel_caps` precedent):
+    /// call before the first `step_frame`.
+    pub fn set_script_op_budget(&mut self, ops: u64) {
+        self.script_op_budget = ops.max(1);
+        if let Some(engine) = self.script_engine.as_mut() {
+            engine.set_op_budget(self.script_op_budget);
+        }
+    }
+
+    /// The configured §2.10 op budget.
+    pub fn script_op_budget(&self) -> u64 {
+        self.script_op_budget
+    }
+
+    /// Read-only access to the §2.10 script arena — observation
+    /// only (the `vessels()` precedent).
+    pub fn scripts(&self) -> &BTreeMap<ScriptId, ScriptState> {
+        &self.scripts
+    }
+
+    /// Read-only access to the §2.10 autopilot arena.
+    pub fn autopilots(&self) -> &BTreeMap<VesselId, AutopilotState> {
+        &self.autopilots
     }
 
     /// §2.9's cap accounting — every live build order has already
@@ -1931,6 +2117,9 @@ impl World {
         // M8-B: pending `ConstructionComplete`s → (build, tick) —
         // the build↔event pairing check below.
         let mut build_events = BTreeMap::new();
+        // M9a: pending `ScriptWake`s → (script, tick) — the strict
+        // `wake_tick`↔event pairing check below.
+        let mut wake_events = BTreeMap::new();
         // M8-A: colony boundary/notification uniqueness — a live
         // colony publishes at most one terminator, one store-bound,
         // one inspection, and one of each transition.
@@ -1985,7 +2174,10 @@ impl World {
                 // (removal never scrubs it — the `TransferComplete`
                 // precedent); the check names nothing.
                 | EventKind::LifeSupportCheck
-                | EventKind::VesselLifeSupportDepleted { .. } => None,
+                | EventKind::VesselLifeSupportDepleted { .. }
+                // M9a: the wake names a script — the script↔wake
+                // pairing check below, not the vessel check.
+                | EventKind::ScriptWake { .. } => None,
             };
             // M8-A: colony-scoped events must name a live colony and
             // stay unique per colony per kind.
@@ -2104,6 +2296,14 @@ impl World {
                     "snapshot: duplicate contract deadline event",
                 ));
             }
+            // M9a: pending `ScriptWake`s → (script, tick) — the
+            // script↔wake pairing check below (the maneuver-node
+            // precedent).
+            if let EventKind::ScriptWake { script: s } = &e.kind
+                && wake_events.insert(*s, e.tick).is_some()
+            {
+                return Err(SimError::Fatal("snapshot: duplicate script wake event"));
+            }
         }
         // The node↔event pairing, both directions: every `Scheduled`
         // node has exactly one pending start event AT `node.tick` (a
@@ -2135,6 +2335,43 @@ impl World {
             return Err(SimError::Fatal(
                 "snapshot: duplicate life-support check events",
             ));
+        }
+        // M9a: script-arena coherence — arena key, monotonic counter,
+        // finite persist floats — then the strict `wake_tick`↔event
+        // pairing both directions (the maneuver-node precedent).
+        for (id, s) in &snapshot.scripts {
+            if s.id != *id {
+                return Err(SimError::Fatal("snapshot: script id != arena key"));
+            }
+            if !scripts::script_state_is_valid(s) {
+                return Err(SimError::Fatal("snapshot: incoherent script record"));
+            }
+        }
+        if snapshot.next_script_id < snapshot.scripts.keys().next_back().map_or(0, |id| id.0 + 1) {
+            return Err(SimError::Fatal(
+                "snapshot: next_script_id not ahead of live ids",
+            ));
+        }
+        for (id, s) in &snapshot.scripts {
+            match (s.wake_tick, wake_events.get(id)) {
+                (Some(t), Some(&et)) if t == et => {}
+                (None, None) => {}
+                _ => {
+                    return Err(SimError::Fatal(
+                        "snapshot: script wake / pending event mismatch",
+                    ));
+                }
+            }
+        }
+        for s in wake_events.keys() {
+            if !snapshot.scripts.contains_key(s) {
+                return Err(SimError::Fatal("snapshot: wake names unknown script"));
+            }
+        }
+        for a in snapshot.autopilots.values() {
+            if !scripts::autopilot_state_is_valid(a) {
+                return Err(SimError::Fatal("snapshot: incoherent autopilot record"));
+            }
         }
         restore_transfer_state(&snapshot, &transfer_events)?;
         restore_build_state(&snapshot, &build_events)?;
@@ -2261,6 +2498,16 @@ impl World {
                 aero: BTreeMap::new(),
                 thermal_rates: Vec::new(),
             }),
+            scripts: snapshot.scripts,
+            next_script_id: snapshot.next_script_id,
+            script_op_budget: snapshot.script_op_budget,
+            autopilots: snapshot.autopilots,
+            // §7.3: engines are construction config — re-installed
+            // post-restore via `set_script_engine`/
+            // `set_autopilot_driver` (the `set_experiments` precedent).
+            script_engine: None,
+            autopilot_driver: None,
+            script_log: Vec::new(),
         })
     }
 
@@ -2349,6 +2596,10 @@ impl World {
             next_build_id: self.next_build_id,
             life_support_enabled: self.life_support_enabled,
             life_support_cfg: self.life_support_cfg,
+            scripts: self.scripts.clone(),
+            next_script_id: self.next_script_id,
+            script_op_budget: self.script_op_budget,
+            autopilots: self.autopilots.clone(),
         })
     }
 
@@ -2409,7 +2660,22 @@ impl World {
     /// integer tick under it, warp-independent.
     ///
     /// Ascending-`VesselId` scan; the first found reason wins.
+    /// M9a §2.10: a poll-demoted script refuses first — the plan's
+    /// "demotes warp to ×1 with a visible warning naming the script".
     pub fn rails_warp_refusal(&self) -> Option<String> {
+        // §2.10's poll detection: a script that exhausts (or nearly
+        // exhausts) its op budget POLL_DEMOTE_TICKS ticks running is
+        // a poller — demote and name it. Checked before the physics
+        // early-return: the flag is sim state independent of the
+        // bubble's existence.
+        for (id, s) in &self.scripts {
+            if s.poll_demoted {
+                return Some(format!(
+                    "script {} is polling ({} consecutive budget-exhausting ticks)",
+                    id.0, s.consecutive_polls
+                ));
+            }
+        }
         let physics = self.physics.as_ref()?;
         let env = physics.backend.environment();
         for vessel in self.vessels.values() {
@@ -2585,11 +2851,14 @@ impl World {
     /// bubble-resident body rests on it, in which case it stays
     /// `InBubble` as a static collider in the batch until the
     /// supporter moves on.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     fn step_bubble_range(
         &mut self,
         now: u64,
         t_next: u64,
+        effective_target: &mut u64,
+        commands_applied: &mut u64,
+        rejected: &mut Vec<(CommandKey, SimError)>,
         shadow: &mut TickShadow,
         degraded: &mut Vec<SimError>,
     ) -> Result<(), SimError> {
@@ -2619,12 +2888,6 @@ impl World {
         }
         self.shadow_vessels(shadow);
         let caps = self.caps;
-        let Self {
-            vessels, physics, ..
-        } = self;
-        let physics = physics
-            .as_mut()
-            .ok_or(SimError::Fatal("bubble check raced physics"))?;
         let mut dead_vessels: Vec<VesselId> = Vec::new();
         // M7-D: vessels that surface-latched inside this range —
         // their contract trigger runs once `self` is whole again.
@@ -2637,6 +2900,28 @@ impl World {
         // again and the rails conversion can be attempted.
         let mut burns_done: BTreeSet<VesselId> = BTreeSet::new();
         for t in now..t_next {
+            // M9a §2.10: a bubble tick IS a tick boundary — drain the
+            // previous tick's control-pass commands (stamped `t`;
+            // producers pay the same one-tick latency as everyone),
+            // then run scripts ascending `ScriptId` followed by
+            // engaged autopilots ascending `VesselId`, BEFORE force
+            // integration. `self.clock` tracks the in-range tick for
+            // the drain+control duration so applies and event
+            // scheduling see the tick they are stamped at; it is
+            // restored to `now` after the loop, and `step_frame`'s
+            // advance then lands the clock on `t_next` unchanged.
+            // Tick `now` drains an empty queue (the boundary drain
+            // already ran) — "one drain producing stamps per tick
+            // value" holds.
+            self.clock = SimTime(t);
+            self.drain_at(t, effective_target, shadow, commands_applied, rejected)?;
+            self.control_tick(t, shadow, degraded)?;
+            let Self {
+                vessels, physics, ..
+            } = self;
+            let physics = physics
+                .as_mut()
+                .ok_or(SimError::Fatal("bubble check raced physics"))?;
             // Breakup bookkeeping — applied after the vessel loop so
             // map surgery never disturbs iteration. `(structural,
             // thermal)` failed nodes per vessel.
@@ -2919,8 +3204,17 @@ impl World {
                 degraded,
             )?;
         }
+        // M9a: restore the pre-range clock — `step_frame`'s
+        // `try_advance` moves `now → t_next` as before.
+        self.clock = SimTime(now);
+        // Lazy capture — no-op when `dead_vessels` is empty (the
+        // `autopilots.remove` below is then too).
+        self.shadow_autopilots(shadow);
         for vid in dead_vessels {
             self.tracked_vessels.remove(&vid);
+            // Same invariant as `remove_vessel`: a bound autopilot
+            // dies with its vessel; global `scripts` records survive.
+            self.autopilots.remove(&vid);
         }
         // M8-C §3.5: every surface impact inside this range damages
         // the colonies it fell inside — the `ColonyImpact` seam the
@@ -3042,6 +3336,12 @@ impl World {
         );
         self.vessels.remove(&vessel);
         self.tracked_vessels.remove(&vessel);
+        // A bound autopilot must not outlive its vessel — it would
+        // run a full control pass against a vessel that no longer
+        // exists. `scripts` records survive by design (a script is
+        // global, not per-vessel state).
+        self.shadow_autopilots(shadow);
+        self.autopilots.remove(&vessel);
         if let Some(p) = self.physics.as_mut() {
             p.aero.remove(&vessel);
         }
@@ -3400,6 +3700,48 @@ impl World {
             )?,
             SimCommand::SetLifeSupportEnabled { enabled } => {
                 self.apply_set_life_support(*enabled, shadow)?
+            }
+            SimCommand::LoadScript { vessel, source } => {
+                self.apply_load_script(*vessel, source, shadow)?
+            }
+            SimCommand::UnloadScript { script } => self.apply_unload_script(*script, shadow)?,
+            SimCommand::SetScriptEnabled { script, enabled } => {
+                self.shadow_scripts(shadow);
+                let Some(s) = self.scripts.get_mut(script) else {
+                    return Err(SimError::Recoverable("script: unknown id"));
+                };
+                s.enabled = *enabled;
+                if *enabled {
+                    s.disabled_reason = None;
+                    // Re-enable is the operator's clean slate — the
+                    // strike ledger starts over so an earlier fault
+                    // streak can't ghost-disable on the next fault.
+                    s.strikes = 0;
+                }
+            }
+            SimCommand::EngageAutopilot { vessel, program } => {
+                if !program.is_valid() {
+                    return Err(SimError::Recoverable("autopilot: non-finite program"));
+                }
+                if !self.vessels.contains_key(vessel) {
+                    return Err(SimError::Recoverable("autopilot: unknown vessel"));
+                }
+                self.shadow_autopilots(shadow);
+                self.autopilots.insert(
+                    *vessel,
+                    AutopilotState {
+                        program: program.clone(),
+                        enabled: true,
+                        persist: PersistMap::new(),
+                    },
+                );
+            }
+            SimCommand::DisengageAutopilot { vessel } => {
+                if !self.autopilots.contains_key(vessel) {
+                    return Err(SimError::Recoverable("autopilot: none engaged"));
+                }
+                self.shadow_autopilots(shadow);
+                self.autopilots.remove(vessel);
             }
         }
         Ok(())
@@ -4896,7 +5238,29 @@ impl World {
         commands_applied: &mut u64,
         rejected: &mut Vec<(CommandKey, SimError)>,
     ) -> Result<(), SimError> {
-        let tick = self.clock.ticks();
+        self.drain_at(
+            self.clock.ticks(),
+            effective_target,
+            shadow,
+            commands_applied,
+            rejected,
+        )
+    }
+
+    /// The drain parameterized by stamp tick — the boundary drain
+    /// passes the clock; the in-range control drain (M9a §2.10: a
+    /// bubble tick is a tick boundary for command application)
+    /// passes the range's tick `t`. Commands produced by a tick's
+    /// control pass drain stamped at the NEXT tick — the one-tick
+    /// latency every producer pays (§2.2.1/§2.12).
+    fn drain_at(
+        &mut self,
+        tick: u64,
+        effective_target: &mut u64,
+        shadow: &mut TickShadow,
+        commands_applied: &mut u64,
+        rejected: &mut Vec<(CommandKey, SimError)>,
+    ) -> Result<(), SimError> {
         // Phase 1 — pops only. BTreeMap iteration IS the §2.2.1
         // (class, source_id) order; each source's FIFO keeps production
         // order, so `staged` is contiguous per source.
@@ -5049,6 +5413,308 @@ impl World {
         Ok(())
     }
 
+    /// M9a §2.10's lazy-shadow capture for the script arena + counter.
+    fn shadow_scripts(&mut self, shadow: &mut TickShadow) {
+        if shadow.scripts.is_none() {
+            shadow.scripts = Some(self.scripts.clone());
+            shadow.next_script_id = Some(self.next_script_id);
+        }
+    }
+
+    /// M9a's lazy-shadow capture for the autopilot arena.
+    fn shadow_autopilots(&mut self, shadow: &mut TickShadow) {
+        if shadow.autopilots.is_none() {
+            shadow.autopilots = Some(self.autopilots.clone());
+        }
+    }
+
+    /// §2.10's control pass — the per-integer-tick slot inside
+    /// `step_bubble_tick`, before force integration: scripts bound to
+    /// `InBubble` vessels in ascending [`ScriptId`] order (the arena's
+    /// key order IS that order), then engaged autopilots on `InBubble`
+    /// vessels in ascending `VesselId` order. Commands they issue
+    /// enqueue for the *next* tick's `drain_at`.
+    fn control_tick(
+        &mut self,
+        tick: u64,
+        shadow: &mut TickShadow,
+        degraded: &mut Vec<SimError>,
+    ) -> Result<(), SimError> {
+        if self.scripts.is_empty() && self.autopilots.is_empty() {
+            return Ok(());
+        }
+        let in_bubble =
+            |v: Option<&Vessel>| v.is_some_and(|v| matches!(v.state, VesselState::InBubble(_)));
+        let script_ids: Vec<ScriptId> = self
+            .scripts
+            .iter()
+            .filter(|(_, s)| s.enabled && in_bubble(self.vessels.get(&s.vessel)))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in script_ids {
+            self.run_script_tick(id, tick, shadow, degraded)?;
+        }
+        let pilot_vids: Vec<VesselId> = self
+            .autopilots
+            .iter()
+            .filter(|(v, a)| a.enabled && in_bubble(self.vessels.get(v)))
+            .map(|(v, _)| *v)
+            .collect();
+        for vid in pilot_vids {
+            self.run_autopilot_tick(vid, tick, shadow, degraded)?;
+        }
+        Ok(())
+    }
+
+    /// One `on_tick` for one script — §2.10's bookkeeping around the
+    /// engine call: strikes on faults (≥ [`STRIKE_DISABLE_LIMIT`]
+    /// consecutive disables, visibly — `disabled_reason` + a
+    /// `script_log` line), poll detection on heavy ticks, wake
+    /// registration write-back. The engine is construction config:
+    /// `None` means the script never ticks (its record is inert).
+    fn run_script_tick(
+        &mut self,
+        id: ScriptId,
+        tick: u64,
+        shadow: &mut TickShadow,
+        degraded: &mut Vec<SimError>,
+    ) -> Result<(), SimError> {
+        self.shadow_scripts(shadow);
+        let Some(engine) = self.script_engine.as_mut() else {
+            return Ok(());
+        };
+        let Some(script) = self.scripts.get_mut(&id) else {
+            return Ok(());
+        };
+        if !script.enabled {
+            return Ok(());
+        }
+        let budget = self.script_op_budget;
+        let bound_vessel = script.vessel;
+        let mut io = WorldTickIo {
+            vessels: &self.vessels,
+            orbits: &self.orbits,
+            physics_env: self
+                .physics
+                .as_ref()
+                .map(|p| (p.backend.environment(), &p.dominant)),
+            pending: &mut self.pending,
+            event_heap: &mut self.event_heap,
+            next_event_seq: &mut self.next_event_seq,
+            tracked: &self.tracked_vessels,
+            clock: self.clock,
+            shadow,
+            logs: &mut self.script_log,
+            bound_script: Some(id),
+            bound_vessel: Some(bound_vessel),
+            wake: WakeAction::Untouched,
+        };
+        let report = engine.run_tick(script, tick, &mut io);
+        // The io records the script's wake intent; write it back now
+        // that both borrows are free again.
+        match io.wake {
+            WakeAction::Set(t) => script.wake_tick = Some(t),
+            WakeAction::Cleared => script.wake_tick = None,
+            WakeAction::Untouched => {}
+        }
+        // §2.10's strike counter — a faulting call strikes, a clean
+        // call resets; ≥ STRIKE_DISABLE_LIMIT consecutive disables
+        // the script visibly.
+        match &report.fault {
+            None => script.strikes = 0,
+            Some(fault) => {
+                script.strikes = script.strikes.saturating_add(1);
+                let what = match fault {
+                    ScriptFault::BudgetExceeded => "op budget exhausted".to_string(),
+                    ScriptFault::Runtime(m) => m.clone(),
+                };
+                self.script_log
+                    .push((id, format!("script {} tick {tick} aborted: {what}", id.0)));
+                if script.strikes >= STRIKE_DISABLE_LIMIT {
+                    script.enabled = false;
+                    script.disabled_reason = Some(format!(
+                        "{what} ({STRIKE_DISABLE_LIMIT} consecutive strikes)"
+                    ));
+                    self.script_log.push((
+                        id,
+                        format!(
+                            "script {} disabled: {what} ({STRIKE_DISABLE_LIMIT} consecutive strikes)",
+                            id.0
+                        ),
+                    ));
+                    degraded.push(SimError::Recoverable("script: disabled on strikes"));
+                } else {
+                    degraded.push(SimError::Recoverable("script: tick aborted"));
+                }
+            }
+        }
+        // §2.10's poll detection — a heavy tick is a budget abort OR
+        // a completion that consumed ≥ POLL_OPS_NUM/POLL_OPS_DEN of
+        // the budget (the module doc explains why near-exhausts
+        // count; a hard-exhauster is strike-disabled first anyway).
+        let heavy = matches!(report.fault, Some(ScriptFault::BudgetExceeded))
+            || report.ops_used.saturating_mul(POLL_OPS_DEN) >= budget.saturating_mul(POLL_OPS_NUM);
+        if heavy {
+            script.consecutive_polls = script.consecutive_polls.saturating_add(1);
+            if script.consecutive_polls >= POLL_DEMOTE_TICKS && !script.poll_demoted {
+                script.poll_demoted = true;
+                self.script_log.push((
+                    id,
+                    format!(
+                        "script {} is polling ({POLL_DEMOTE_TICKS} consecutive \
+                         budget-exhausting ticks) — warp demoted to ×1",
+                        id.0
+                    ),
+                ));
+            }
+        } else {
+            script.consecutive_polls = 0;
+            script.poll_demoted = false;
+        }
+        Ok(())
+    }
+
+    /// One engaged autopilot's tick — the Rust-side control producer
+    /// (§2.10: "built-in autopilots are written in Rust against
+    /// `ControlApi`"), same slot as scripts, after them. Driver
+    /// errors report on `degraded` — trusted code faulting is a bug,
+    /// never a strike counter.
+    fn run_autopilot_tick(
+        &mut self,
+        vessel: VesselId,
+        tick: u64,
+        shadow: &mut TickShadow,
+        degraded: &mut Vec<SimError>,
+    ) -> Result<(), SimError> {
+        self.shadow_autopilots(shadow);
+        let Some(driver) = self.autopilot_driver.as_mut() else {
+            return Ok(());
+        };
+        let Some(state) = self.autopilots.get_mut(&vessel) else {
+            return Ok(());
+        };
+        if !state.enabled
+            || StableDiscriminant::discriminant(&driver.program())
+                != StableDiscriminant::discriminant(&state.program)
+        {
+            return Ok(());
+        }
+        let mut io = WorldTickIo {
+            vessels: &self.vessels,
+            orbits: &self.orbits,
+            physics_env: self
+                .physics
+                .as_ref()
+                .map(|p| (p.backend.environment(), &p.dominant)),
+            pending: &mut self.pending,
+            event_heap: &mut self.event_heap,
+            next_event_seq: &mut self.next_event_seq,
+            tracked: &self.tracked_vessels,
+            clock: self.clock,
+            shadow,
+            logs: &mut self.script_log,
+            bound_script: None,
+            bound_vessel: Some(vessel),
+            wake: WakeAction::Untouched,
+        };
+        if let Err(e) = driver.run_tick(vessel, state, tick, &mut io) {
+            let _ = e; // detail rides the static Recoverable + script_log
+            degraded.push(SimError::Recoverable("autopilot: tick fault"));
+        }
+        Ok(())
+    }
+
+    /// `LoadScript` apply: validate the vessel exists, hand the
+    /// source to the engine's `prepare` (a compile fault rejects the
+    /// command — never a stored dead script), allocate the id.
+    fn apply_load_script(
+        &mut self,
+        vessel: VesselId,
+        source: &str,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        if !self.vessels.contains_key(&vessel) {
+            return Err(SimError::Recoverable("script: unknown vessel"));
+        }
+        let id = ScriptId(self.next_script_id);
+        if let Some(engine) = self.script_engine.as_mut() {
+            engine
+                .prepare(id, source)
+                .map_err(|_| SimError::Recoverable("script: compile fault"))?;
+        }
+        self.shadow_scripts(shadow);
+        self.next_script_id =
+            id.0.checked_add(1)
+                .ok_or(SimError::Fatal("script_id counter overflow"))?;
+        self.scripts.insert(
+            id,
+            ScriptState {
+                id,
+                vessel,
+                source: source.to_string(),
+                enabled: true,
+                disabled_reason: None,
+                strikes: 0,
+                consecutive_polls: 0,
+                poll_demoted: false,
+                wake_tick: None,
+                persist: PersistMap::new(),
+            },
+        );
+        Ok(())
+    }
+
+    /// `UnloadScript` apply: drop the record, scrub its pending
+    /// `ScriptWake` (the strict pair invariant), release engine
+    /// state.
+    fn apply_unload_script(
+        &mut self,
+        id: ScriptId,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        if !self.scripts.contains_key(&id) {
+            return Err(SimError::Recoverable("script: unknown id"));
+        }
+        self.shadow_scripts(shadow);
+        self.shadow_events(shadow);
+        self.scripts.remove(&id);
+        let kept: Vec<ScheduledEvent> = std::mem::take(&mut self.event_heap)
+            .into_iter()
+            .filter(|e| !matches!(&e.kind, EventKind::ScriptWake { script } if *script == id))
+            .collect();
+        self.event_heap = kept.into_iter().collect();
+        if let Some(engine) = self.script_engine.as_mut() {
+            engine.unload(id);
+        }
+        Ok(())
+    }
+
+    /// §2.10's `ScriptWake` firing — the wake event IS the tick for a
+    /// script whose vessel has no bubble ticks. Runs the script's
+    /// `on_tick` at the event tick when the registration still pairs
+    /// (a stale firing — script unloaded, disabled, or re-registered
+    /// — is a tolerated no-op, the `TransferComplete` precedent).
+    fn fire_script_wake(
+        &mut self,
+        id: ScriptId,
+        tick: u64,
+        shadow: &mut TickShadow,
+        degraded: &mut Vec<SimError>,
+    ) -> Result<(), SimError> {
+        let live = self
+            .scripts
+            .get(&id)
+            .is_some_and(|s| s.enabled && s.wake_tick == Some(tick));
+        if !live {
+            return Ok(());
+        }
+        self.shadow_scripts(shadow);
+        if let Some(s) = self.scripts.get_mut(&id) {
+            s.wake_tick = None; // consumed — the script re-arms inside its tick
+        }
+        self.run_script_tick(id, tick, shadow, degraded)
+    }
+
     /// §2.6.2's "fire all events at `t_next` (may insert new events)".
     /// Pops in `(tick, seq)` order (the heap's min-key) and reports every
     /// fired event into `fired`.
@@ -5093,7 +5759,7 @@ impl World {
             // Per-event shadow: a Recoverable firing restores only this
             // event's application; the pop stands (the event is dropped).
             let mut ev_shadow = TickShadow::capture(self);
-            match self.fire_event(&event, &mut ev_shadow) {
+            match self.fire_event(&event, &mut ev_shadow, degraded) {
                 Ok(()) => {}
                 Err(e @ SimError::Fatal(_)) => return Err(e),
                 Err(e) => {
@@ -5167,7 +5833,10 @@ impl World {
                         // `LifeSupport` slot's publish repairs the
                         // check cadence.
                         | EventKind::LifeSupportCheck
-                        | EventKind::VesselLifeSupportDepleted { .. } => None,
+                        | EventKind::VesselLifeSupportDepleted { .. }
+                        // M9a: the wake names a script — no rescan to
+                        // republish (the script re-registers or dies).
+                        | EventKind::ScriptWake { .. } => None,
                     };
                     if let Some(vessel) = vessel {
                         self.schedule_event(
@@ -5188,6 +5857,7 @@ impl World {
         &mut self,
         event: &ScheduledEvent,
         shadow: &mut TickShadow,
+        degraded: &mut Vec<SimError>,
     ) -> Result<(), SimError> {
         match &event.kind {
             // Alarms mutate nothing: surfacing is `AdvanceReport::
@@ -5290,6 +5960,11 @@ impl World {
             EventKind::LifeSupportCheck => self.fire_life_support_check(event.tick, shadow),
             EventKind::VesselLifeSupportDepleted { vessel } => {
                 self.fire_vessel_ls_depleted(*vessel, shadow)
+            }
+            // M9a §2.10: the wake event IS the script's tick — run
+            // `on_tick` at this tick even under rails warp.
+            EventKind::ScriptWake { script } => {
+                self.fire_script_wake(*script, event.tick, shadow, degraded)
             }
         }
     }
@@ -5452,7 +6127,15 @@ impl World {
             // now` (`now..t_next` is empty; the subsystem advance is
             // guarded).
             if t_next > now
-                && let Err(e) = self.step_bubble_range(now, t_next, &mut shadow, &mut degraded)
+                && let Err(e) = self.step_bubble_range(
+                    now,
+                    t_next,
+                    &mut effective_target,
+                    &mut commands_applied,
+                    &mut rejected,
+                    &mut shadow,
+                    &mut degraded,
+                )
             {
                 shadow.restore(self);
                 return Err(e);
@@ -5503,6 +6186,7 @@ impl World {
             rejected,
             degraded,
             partial: self.clock.ticks() < effective_target,
+            script_log: std::mem::take(&mut self.script_log),
         })
     }
 
@@ -5639,6 +6323,13 @@ impl World {
         // M8-C: the per-save life-support flag + tunables (the
         // `economy_cfg` precedent — config that changes evolution).
         life_support::hash_life_support(&mut h, self.life_support_enabled, &self.life_support_cfg);
+        // M9a §2.10: the script book — per-save op budget (config
+        // that changes evolution), then the arena + counter; and the
+        // engaged-autopilot arena. The engines themselves are
+        // construction config — never hashed.
+        h.u64(self.script_op_budget);
+        scripts::hash_scripts(&mut h, self.next_script_id, &self.scripts);
+        scripts::hash_autopilots(&mut h, &self.autopilots);
         h.finish()
     }
 }
@@ -5681,6 +6372,345 @@ fn drive_node_burn(node: &mut Option<ManeuverNode>, body: &mut WeldedBody) -> bo
     body.throttle = 1.0;
     burn.dv_remaining_mps -= full;
     false
+}
+
+/// M9a: what a script's tick did to its wake registration — recorded
+/// by the io and written back to `ScriptState::wake_tick` after the
+/// engine call (the script record itself is borrowed by the engine
+/// while the io lives).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WakeAction {
+    /// No wake call this tick — `wake_tick` untouched.
+    Untouched,
+    /// A wake resolved and scheduled — `wake_tick = Some(tick)`.
+    Set(u64),
+    /// `cancel_wake` — registration and pending event both dropped.
+    Cleared,
+}
+
+/// The borrow-split [`TickIo`] over [`World`] internals (M9a §2.10).
+/// Every field is a disjoint `World` field so the io can coexist with
+/// the `script_engine`/`autopilot_driver`/`scripts`/`autopilots`
+/// borrows its caller holds — there is deliberately no `&mut World`
+/// here. Telemetry reads are pure; `issue` enqueues for the next
+/// tick's drain (§2.10: "nothing bypasses the queue"); `request_wake`
+/// does the closed-form resolution + the `wake_tick` ↔ pending-event
+/// pair maintenance inline (scrub the old, schedule the new —
+/// shadowed like every heap mutation).
+struct WorldTickIo<'a> {
+    /// The vessel arena — telemetry reads.
+    vessels: &'a BTreeMap<VesselId, Vessel>,
+    /// The orbit model — rails state_at + mu/radius lookups.
+    orbits: &'a PatchedConics,
+    /// The bubble environment + dominant (worlds built with physics).
+    physics_env: Option<(&'a csp_phys::Environment, &'a BodyId)>,
+    /// The command queue — `issue` pushes here.
+    pending: &'a mut BTreeMap<(SourceClass, u32), VecDeque<SimCommand>>,
+    /// The event heap — wake scheduling/scrubbing.
+    event_heap: &'a mut BinaryHeap<ScheduledEvent>,
+    /// The event-seq counter — travels with the heap.
+    next_event_seq: &'a mut u64,
+    /// The tracked set — `class_of` input for the scheduled wake.
+    tracked: &'a BTreeSet<VesselId>,
+    /// The clock the tick runs at.
+    clock: SimTime,
+    /// The iteration shadow — heap mutations shadow first.
+    shadow: &'a mut TickShadow,
+    /// `log`/`print` lines — moved into `AdvanceReport::script_log`.
+    logs: &'a mut Vec<(ScriptId, String)>,
+    /// The script this io serves (`None` for an autopilot tick —
+    /// `request_wake` then refuses: only scripts own wakes).
+    bound_script: Option<ScriptId>,
+    /// The bound vessel (telemetry default + wake precondition).
+    bound_vessel: Option<VesselId>,
+    /// The tick's recorded wake intent — applied to
+    /// `ScriptState::wake_tick` after the engine call.
+    wake: WakeAction,
+}
+
+impl WorldTickIo<'_> {
+    /// The script's bound vessel — `Recoverable` when the io serves
+    /// an autopilot or the script's record is gone.
+    fn bound_vessel(&self) -> Result<VesselId, SimError> {
+        self.bound_vessel
+            .ok_or(SimError::Recoverable("wake: no bound vessel"))
+    }
+
+    /// Apsides/times from a conic — `(apo_alt, pe_alt, t_apo, t_pe)`.
+    /// `epoch_ticks` is the elements' stamping epoch (0 for an
+    /// osculating bubble conversion — its epoch is `clock`).
+    fn osculating(
+        elements: &KeplerElements,
+        mu: f64,
+        radius_m: Option<f64>,
+        epoch_ticks: u64,
+        clock: u64,
+    ) -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
+        let e = elements.eccentricity;
+        let a = elements.semi_major_axis_m;
+        // r_p = a(1−e) works for hyperbolic too: a<0 ⇒ |a|(e−1) > 0.
+        let pe_alt = radius_m.map(|r| a * (1.0 - e) - r);
+        let apo_alt = if e < 1.0 {
+            radius_m.map(|r| a * (1.0 + e) - r)
+        } else {
+            None
+        };
+        let to_secs =
+            |t: Option<u64>| t.map(|t| (t.saturating_sub(clock)) as f64 / csp_core::TICK_HZ as f64);
+        let t_apo = to_secs(
+            scripts::resolve_apsis_ticks(elements, mu, epoch_ticks, clock, true)
+                .ok()
+                .flatten(),
+        );
+        let t_pe = to_secs(
+            scripts::resolve_apsis_ticks(elements, mu, epoch_ticks, clock, false)
+                .ok()
+                .flatten(),
+        );
+        (apo_alt, pe_alt, t_apo, t_pe)
+    }
+
+    /// Resolve `condition` to an absolute tick — §2.10's
+    /// "closed-form time or refusal at registration", no silent
+    /// approximation.
+    fn resolve_wake(&self, vessel: VesselId, condition: &WakeCondition) -> Result<u64, SimError> {
+        let clock = self.clock.ticks();
+        match condition {
+            WakeCondition::AtTick(t) => {
+                if *t <= clock {
+                    return Err(SimError::Recoverable("wake: tick not in the future"));
+                }
+                Ok(*t)
+            }
+            WakeCondition::InTicks(n) => {
+                if *n == 0 {
+                    return Err(SimError::Recoverable("wake: zero-tick wait"));
+                }
+                Ok(clock.saturating_add(*n))
+            }
+            WakeCondition::AtApoapsis | WakeCondition::AtPeriapsis => {
+                let Some(orbit) = self.vessels.get(&vessel).and_then(|v| v.orbit()) else {
+                    return Err(SimError::Recoverable(
+                        "wake: apsis requires an on-rails vessel",
+                    ));
+                };
+                let mu = self
+                    .orbits
+                    .body_orbit(&orbit.parent)
+                    .map_err(|_| SimError::Recoverable("wake: unknown parent body"))?
+                    .mu_m3_per_s2;
+                let tick = scripts::resolve_apsis_ticks(
+                    &orbit.elements,
+                    mu,
+                    orbit.epoch.ticks(),
+                    clock,
+                    matches!(condition, WakeCondition::AtApoapsis),
+                )?;
+                tick.ok_or(SimError::Recoverable("wake: no such apsis ahead"))
+            }
+            WakeCondition::AtNextSoiTransition => {
+                let tick = self
+                    .event_heap
+                    .iter()
+                    .filter_map(|e| match &e.kind {
+                        EventKind::SoiTransition { vessel: v, .. } if *v == vessel => Some(e.tick),
+                        _ => None,
+                    })
+                    .min();
+                tick.ok_or(SimError::Recoverable("wake: no SOI transition pending"))
+            }
+            WakeCondition::AtManeuverNode => {
+                let node = self.vessels.get(&vessel).and_then(|v| v.maneuver.as_ref());
+                match node {
+                    Some(n) if matches!(n.status, ManeuverStatus::Scheduled) => Ok(n.tick),
+                    _ => Err(SimError::Recoverable("wake: no scheduled maneuver node")),
+                }
+            }
+        }
+    }
+}
+
+impl TickIo for WorldTickIo<'_> {
+    #[allow(clippy::too_many_lines)]
+    fn telemetry(&self, vessel: VesselId) -> VesselTelemetry {
+        let mut t = VesselTelemetry {
+            tick: self.clock.ticks(),
+            found: false,
+            residence: TelemetryResidence::Missing,
+            pos_m: DVec3::ZERO,
+            vel_mps: DVec3::ZERO,
+            rot: DQuat::IDENTITY,
+            ang_vel_mps: DVec3::ZERO,
+            throttle: 0.0,
+            altitude_m: None,
+            speed_mps: 0.0,
+            vertical_speed_mps: 0.0,
+            horizontal_speed_mps: 0.0,
+            mass_kg: None,
+            apoapsis_altitude_m: None,
+            periapsis_altitude_m: None,
+            time_to_apoapsis_s: None,
+            time_to_periapsis_s: None,
+            mu_m3_per_s2: None,
+            body: None,
+            elements: None,
+            maneuver_node: None,
+        };
+        let Some(v) = self.vessels.get(&vessel) else {
+            return t;
+        };
+        t.found = true;
+        t.maneuver_node = v.maneuver.as_ref().map(|n| {
+            (
+                n.tick,
+                DVec3::new(n.dv_prograde_mps, n.dv_normal_mps, n.dv_radial_mps),
+            )
+        });
+        // (rel, vel, mu, radius, epoch_ticks) per residence — the
+        // frame the telemetry's vectors live in.
+        let mut fill = |rel: DVec3,
+                        vel: DVec3,
+                        rot: DQuat,
+                        ang: DVec3,
+                        thr: f64,
+                        mu: Option<f64>,
+                        radius: Option<f64>,
+                        epoch: u64,
+                        body: Option<BodyId>,
+                        elements: Option<KeplerElements>| {
+            t.pos_m = rel;
+            t.vel_mps = vel;
+            t.rot = rot;
+            t.ang_vel_mps = ang;
+            t.throttle = thr;
+            t.body = body;
+            let r = rel.norm();
+            t.speed_mps = vel.norm();
+            let up = if r > 0.0 { rel / r } else { DVec3::X };
+            t.vertical_speed_mps = vel.dot(up);
+            t.horizontal_speed_mps = (vel - up * t.vertical_speed_mps).norm();
+            t.altitude_m = radius.map(|b| r - b);
+            t.mu_m3_per_s2 = mu;
+            if let (Some(mu), Some(el)) = (mu, &elements) {
+                let (apo, pe, ta, tp) = Self::osculating(el, mu, radius, epoch, self.clock.ticks());
+                t.apoapsis_altitude_m = apo;
+                t.periapsis_altitude_m = pe;
+                t.time_to_apoapsis_s = ta;
+                t.time_to_periapsis_s = tp;
+                t.elements = Some(el.clone());
+            }
+        };
+        match &v.state {
+            VesselState::InBubble(body) => {
+                t.residence = TelemetryResidence::InBubble;
+                t.mass_kg = Some(body.mass_kg);
+                if let Some((env, dominant)) = self.physics_env {
+                    let rel = body.com_world() - env.body_center;
+                    let elements =
+                        orbit::cartesian_to_elements(rel, body.vel, env.mu_m3_per_s2).ok();
+                    fill(
+                        rel,
+                        body.vel,
+                        body.rot,
+                        body.ang_vel,
+                        body.throttle,
+                        Some(env.mu_m3_per_s2),
+                        Some(env.radius_m),
+                        self.clock.ticks(),
+                        Some(dominant.clone()),
+                        elements,
+                    );
+                }
+            }
+            VesselState::OnRails(orbit) => {
+                t.residence = TelemetryResidence::OnRails;
+                let mu = self
+                    .orbits
+                    .body_orbit(&orbit.parent)
+                    .ok()
+                    .map(|b| b.mu_m3_per_s2);
+                let radius = self.orbits.body_radius(&orbit.parent);
+                if let Ok((rel, vel)) = self.orbits.state_at(orbit, self.clock) {
+                    fill(
+                        rel,
+                        vel,
+                        DQuat::IDENTITY,
+                        DVec3::ZERO,
+                        0.0,
+                        mu,
+                        radius,
+                        orbit.epoch.ticks(),
+                        Some(orbit.parent.clone()),
+                        Some(orbit.elements.clone()),
+                    );
+                }
+            }
+            VesselState::SurfaceLatched(pose) => {
+                t.residence = TelemetryResidence::SurfaceLatched;
+                t.altitude_m = Some(pose.altitude_m);
+                t.body = Some(pose.body.clone());
+            }
+        }
+        t
+    }
+
+    fn issue(&mut self, class: SourceClass, source_id: u32, command: SimCommand) {
+        self.pending
+            .entry((class, source_id))
+            .or_default()
+            .push_back(command);
+    }
+
+    fn request_wake(
+        &mut self,
+        script: ScriptId,
+        condition: &WakeCondition,
+    ) -> Result<u64, SimError> {
+        if self.bound_script != Some(script) {
+            return Err(SimError::Recoverable("wake: script not bound to this io"));
+        }
+        let vessel = self.bound_vessel()?;
+        let tick = self.resolve_wake(vessel, condition)?;
+        // Scrub any pending wake for this script (the strict pair
+        // invariant — one wake per script), shadowed like every heap
+        // mutation, then schedule the resolved `Clamping` event.
+        shadow_events_split(self.event_heap, *self.next_event_seq, self.shadow);
+        let kept: Vec<ScheduledEvent> = std::mem::take(self.event_heap)
+            .into_iter()
+            .filter(|e| !matches!(&e.kind, EventKind::ScriptWake { script: s } if *s == script))
+            .collect();
+        *self.event_heap = kept.into_iter().collect();
+        let seq = *self.next_event_seq;
+        *self.next_event_seq = seq
+            .checked_add(1)
+            .ok_or(SimError::Fatal("event_seq counter overflow"))?;
+        self.event_heap.push(ScheduledEvent {
+            tick,
+            seq,
+            class: crate::events::class_of(&EventKind::ScriptWake { script }, self.tracked),
+            kind: EventKind::ScriptWake { script },
+        });
+        self.wake = WakeAction::Set(tick);
+        Ok(tick)
+    }
+
+    fn cancel_wake(&mut self, script: ScriptId) -> Result<(), SimError> {
+        if self.bound_script != Some(script) {
+            return Err(SimError::Recoverable("wake: script not bound to this io"));
+        }
+        shadow_events_split(self.event_heap, *self.next_event_seq, self.shadow);
+        let kept: Vec<ScheduledEvent> = std::mem::take(self.event_heap)
+            .into_iter()
+            .filter(|e| !matches!(&e.kind, EventKind::ScriptWake { script: s } if *s == script))
+            .collect();
+        *self.event_heap = kept.into_iter().collect();
+        self.wake = WakeAction::Cleared;
+        Ok(())
+    }
+
+    fn log_line(&mut self, script: ScriptId, line: &str) {
+        self.logs.push((script, line.to_string()));
+    }
 }
 
 /// The `World::shadow_events` twin for the field-level borrow splits —
@@ -5741,7 +6771,11 @@ fn event_names_vessel(kind: &EventKind, vessel: &VesselId) -> bool {
         // firing is a no-op) — deliberately NOT scrubbed, so the
         // in-bubble removal invariant stays provable.
         | EventKind::LifeSupportCheck
-        | EventKind::VesselLifeSupportDepleted { .. } => false,
+        | EventKind::VesselLifeSupportDepleted { .. }
+        // M9a: the wake names a script, not a vessel — it survives
+        // vessel removal by design (a script on a dead vessel keeps
+        // its wake; the firing no-ops when the script is gone).
+        | EventKind::ScriptWake { .. } => false,
     }
 }
 
@@ -7470,6 +8504,10 @@ mod tests {
             PatchedConics::new(BTreeMap::new()),
             None,
             WorldSnapshot {
+                scripts: BTreeMap::new(),
+                next_script_id: 0,
+                script_op_budget: DEFAULT_SCRIPT_OP_BUDGET,
+                autopilots: BTreeMap::new(),
                 clock_ticks: 5,
                 warp_level: 3,
                 source_seqs: seqs.clone(),
@@ -10421,6 +11459,9 @@ mod tests {
             drained: Vec::new(),
             seq_restore: Vec::new(),
             vessels: None,
+            scripts: None,
+            next_script_id: None,
+            autopilots: None,
             next_vessel_id: None,
             joints: None,
             joint_refused: None,
@@ -12460,6 +13501,9 @@ mod tests {
             drained: Vec::new(),
             seq_restore: Vec::new(),
             vessels: None,
+            scripts: None,
+            next_script_id: None,
+            autopilots: None,
             next_vessel_id: None,
             joints: None,
             joint_refused: None,
@@ -14350,5 +15394,347 @@ mod tests {
         );
         a.step_frame(a.clock().ticks() + 1).unwrap();
         assert_ne!(a.state_hash().unwrap(), b.state_hash().unwrap());
+    }
+
+    /// M9a §2.10's script/autopilot machinery — the host-independent
+    /// half (a stub `ScriptEngine`/`AutopilotDriver` stands in for
+    /// `csp-script`/`csp-ai`, which depend on this crate).
+    mod m9a {
+        use super::*;
+
+        /// What the stub engine does on each `on_tick`.
+        enum Behavior {
+            /// Clean tick, no effects.
+            Nop,
+            /// `SetThrottle(f)` every tick (the queue round-trip).
+            Throttle(f64),
+            /// Fault every tick — the strike path.
+            Fault,
+            /// Report a near-exhaust op count — the poll path.
+            Poll,
+            /// First call registers `InTicks(n)`; counts calls.
+            Wake(u64),
+            /// Write `persist["n"] = tick`.
+            WritePersist,
+        }
+
+        /// A stub host — deterministic, engine-free of any real guest
+        /// language; records call order for the ascending-`ScriptId`
+        /// check. `calls` is shared so the test can inspect what ran.
+        struct StubEngine {
+            behavior: Behavior,
+            calls: std::rc::Rc<std::cell::RefCell<Vec<(ScriptId, u64)>>>,
+        }
+
+        impl ScriptEngine for StubEngine {
+            fn prepare(&mut self, _id: ScriptId, _source: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn run_tick(
+                &mut self,
+                script: &mut ScriptState,
+                tick: u64,
+                io: &mut dyn TickIo,
+            ) -> ScriptRunReport {
+                self.calls.borrow_mut().push((script.id, tick));
+                match &self.behavior {
+                    Behavior::Nop => ScriptRunReport {
+                        ops_used: 10,
+                        fault: None,
+                    },
+                    Behavior::Throttle(f) => {
+                        io.issue(
+                            SourceClass::Script,
+                            script.id.0 as u32,
+                            SimCommand::SetThrottle {
+                                vessel: script.vessel,
+                                throttle: *f,
+                            },
+                        );
+                        ScriptRunReport {
+                            ops_used: 10,
+                            fault: None,
+                        }
+                    }
+                    Behavior::Fault => ScriptRunReport {
+                        ops_used: 5,
+                        fault: Some(ScriptFault::Runtime("boom".to_string())),
+                    },
+                    Behavior::Poll => ScriptRunReport {
+                        ops_used: (DEFAULT_SCRIPT_OP_BUDGET * POLL_OPS_NUM) / POLL_OPS_DEN,
+                        fault: None,
+                    },
+                    Behavior::Wake(n) => {
+                        if self.calls.borrow().len() == 1 {
+                            io.request_wake(script.id, &WakeCondition::InTicks(*n))
+                                .unwrap();
+                        }
+                        ScriptRunReport {
+                            ops_used: 10,
+                            fault: None,
+                        }
+                    }
+                    Behavior::WritePersist => {
+                        script
+                            .persist
+                            .insert("n".to_string(), PersistValue::Int(tick as i64));
+                        ScriptRunReport {
+                            ops_used: 10,
+                            fault: None,
+                        }
+                    }
+                }
+            }
+            fn unload(&mut self, _id: ScriptId) {}
+        }
+
+        /// A physics world with the orbiter resident and a script
+        /// loaded on it — drained so the script is live. Returns the
+        /// world and the engine's shared call log.
+        #[allow(clippy::type_complexity)]
+        fn scripted_world(
+            behavior: Behavior,
+        ) -> (World, std::rc::Rc<std::cell::RefCell<Vec<(ScriptId, u64)>>>) {
+            let mut w = physics_world(false);
+            let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            w.set_script_engine(Box::new(StubEngine {
+                behavior,
+                calls: std::rc::Rc::clone(&calls),
+            }));
+            enqueue_orbiter(&mut w);
+            w.step_frame(1).unwrap();
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::LoadScript {
+                    vessel: VesselId(0),
+                    source: "stub".to_string(),
+                },
+            );
+            w.step_frame(2).unwrap();
+            assert_eq!(w.scripts().len(), 1);
+            (w, calls)
+        }
+
+        /// §2.10: `on_tick` runs per bubble tick and its commands
+        /// drain stamped `SourceClass::Script` at the NEXT tick — the
+        /// one-tick latency every producer pays.
+        #[test]
+        fn script_ticks_and_commands_apply_next_tick() {
+            let (mut w, calls) = scripted_world(Behavior::Throttle(0.5));
+            // The first `on_tick` ran at tick 1 — the range inside
+            // `step_frame(2)` covers `1..2` (the load drained at the
+            // tick-1 boundary, before the range).
+            assert_eq!(calls.borrow().len(), 1);
+            assert_eq!(calls.borrow()[0].1, 1);
+            let pre = w.command_log().len();
+            w.step_frame(3).unwrap(); // tick 2 issues; tick 3's drain applies
+            assert!(
+                w.command_log()[pre..]
+                    .iter()
+                    .any(|(k, _)| k.source_class == SourceClass::Script),
+                "a Script-stamped command must appear in the log"
+            );
+            let VesselState::InBubble(body) = &w.vessels()[&VesselId(0)].state else {
+                panic!("orbiter must be resident");
+            };
+            assert_eq!(body.throttle, 0.5);
+        }
+
+        /// §2.10's strikes: a faulting tick strikes; five consecutive
+        /// strikes disable visibly (`disabled_reason` names it).
+        #[test]
+        fn script_strikes_disable_at_five() {
+            let (mut w, _calls) = scripted_world(Behavior::Fault);
+            for t in 2..7 {
+                w.step_frame(t + 1).unwrap();
+            }
+            let s = &w.scripts()[&ScriptId(0)];
+            assert!(!s.enabled, "five consecutive strikes must disable");
+            assert_eq!(s.strikes, STRIKE_DISABLE_LIMIT);
+            assert!(s.disabled_reason.as_deref().unwrap().contains("boom"));
+        }
+
+        /// §2.10's poll detection: ten consecutive near-exhaust ticks
+        /// demote warp — the refusal names the script.
+        #[test]
+        fn script_poll_demotes_warp() {
+            let (mut w, _calls) = scripted_world(Behavior::Poll);
+            // Tick 1 already ran; POLL_DEMOTE_TICKS consecutive heavy
+            // ticks demote — step until the flag flips.
+            while !w.scripts()[&ScriptId(0)].poll_demoted {
+                let t = w.clock().ticks();
+                w.step_frame(t + 1).unwrap();
+                assert!(t < 100, "demote must arrive");
+            }
+            let refusal = w.rails_warp_refusal().unwrap_or_default();
+            assert!(
+                refusal.contains("script 0 is polling"),
+                "refusal must name the poller: {refusal}"
+            );
+            let s = &w.scripts()[&ScriptId(0)];
+            assert!(s.consecutive_polls >= POLL_DEMOTE_TICKS);
+        }
+
+        /// §2.10's `persist` is sim state: it rides the snapshot and
+        /// the hash — a restore continues the identical state.
+        #[test]
+        fn script_persist_survives_snapshot() {
+            let (mut w, _calls) = scripted_world(Behavior::WritePersist);
+            w.step_frame(4).unwrap();
+            let s = &w.scripts()[&ScriptId(0)];
+            assert!(matches!(s.persist.get("n"), Some(PersistValue::Int(_))));
+            let hash_before = w.state_hash().unwrap();
+            let snap = w.snapshot().unwrap();
+            let orbits = PatchedConics::new(BTreeMap::new());
+            let _ = orbits;
+            // Restore against the same construction config the test
+            // world was built with.
+            let mut w2 = World::restore(
+                test_system(),
+                Some(PhysicsConfig {
+                    environment: test_env(false),
+                    dominant: BodyId::from("p"),
+                }),
+                snap,
+            )
+            .unwrap();
+            assert_eq!(w2.state_hash().unwrap(), hash_before);
+            let calls2 = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            w2.set_script_engine(Box::new(StubEngine {
+                behavior: Behavior::WritePersist,
+                calls: calls2,
+            }));
+            w2.step_frame(w2.clock().ticks() + 1).unwrap();
+            assert!(matches!(
+                w2.scripts()[&ScriptId(0)].persist.get("n"),
+                Some(PersistValue::Int(_))
+            ));
+        }
+
+        /// §2.10's `ScriptWake`: the script registers an `InTicks(64)`
+        /// wake on its first run; the `Clamping` event lands in the
+        /// heap, and at the wake tick the firing runs `on_tick` a
+        /// second time that tick (a wake IS a tick — the bubble pass
+        /// ran it normally too). The strict `wake_tick`↔event pair is
+        /// consumed: post-fire, `wake_tick` clears.
+        #[test]
+        fn script_wake_fires_and_runs_extra_tick() {
+            let (mut w, calls) = scripted_world(Behavior::Wake(64));
+            // First run at tick 2 registers the wake → pending
+            // `ScriptWake` at 66, `Clamping`.
+            // First run at tick 1 registers the wake at 65.
+            assert!(w.event_heap.iter().any(|e| matches!(
+                &e.kind,
+                EventKind::ScriptWake { script } if *script == ScriptId(0) && e.tick == 65
+            )));
+            assert_eq!(w.scripts()[&ScriptId(0)].wake_tick, Some(65));
+            w.step_frame(65).unwrap();
+            // The wake event fires AT 65 (events fire at the range's
+            // end) — its `on_tick` is the ONLY call stamped 65: the
+            // normal bubble run at 65 belongs to the next range.
+            let at_65 = calls.borrow().iter().filter(|(_, t)| *t == 65).count();
+            assert_eq!(at_65, 1, "the wake's on_tick runs at its tick");
+            assert_eq!(w.scripts()[&ScriptId(0)].wake_tick, None);
+        }
+
+        /// §2.10: a script on a rails-bound vessel ticks ONLY via
+        /// wakes — with none registered it never runs and never
+        /// blocks warp.
+        #[test]
+        fn rails_script_never_ticks_without_wake() {
+            let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let mut w = World::with_system(test_system());
+            w.set_script_engine(Box::new(StubEngine {
+                behavior: Behavior::Nop,
+                calls: std::rc::Rc::clone(&calls),
+            }));
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::SpawnVessel {
+                    parent: BodyId::from("p"),
+                    elements: leo_elements(),
+                },
+            );
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::LoadScript {
+                    vessel: VesselId(0),
+                    source: "stub".to_string(),
+                },
+            );
+            w.step_frame(1).unwrap();
+            w.step_frame(10_000).unwrap();
+            assert!(
+                calls.borrow().is_empty(),
+                "a rails-bound script with no wake must never tick"
+            );
+            assert!(
+                w.rails_warp_refusal().is_none(),
+                "an unarmed script must not block warp"
+            );
+        }
+
+        /// §2.10/§2.11: an engaged autopilot runs in the same pre-
+        /// physics slot and its commands stamp `Autopilot`.
+        #[test]
+        fn autopilot_engages_and_stamps() {
+            struct StubPilot;
+            impl AutopilotDriver for StubPilot {
+                fn program(&self) -> AutopilotProgram {
+                    AutopilotProgram::Ascent {
+                        target_apoapsis_m: 0.0,
+                        target_periapsis_m: 0.0,
+                    }
+                }
+                fn run_tick(
+                    &mut self,
+                    vessel: VesselId,
+                    _state: &mut AutopilotState,
+                    _tick: u64,
+                    io: &mut dyn TickIo,
+                ) -> Result<(), String> {
+                    io.issue(
+                        SourceClass::Autopilot,
+                        vessel.0 as u32,
+                        SimCommand::SetThrottle {
+                            vessel,
+                            throttle: 0.25,
+                        },
+                    );
+                    Ok(())
+                }
+            }
+            let mut w = physics_world(false);
+            w.set_autopilot_driver(Box::new(StubPilot));
+            enqueue_orbiter(&mut w);
+            w.step_frame(1).unwrap();
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::EngageAutopilot {
+                    vessel: VesselId(0),
+                    program: AutopilotProgram::Ascent {
+                        target_apoapsis_m: 100_000.0,
+                        target_periapsis_m: 100_000.0,
+                    },
+                },
+            );
+            w.step_frame(3).unwrap();
+            let pre = w.command_log().len();
+            w.step_frame(4).unwrap();
+            assert!(
+                w.command_log()[pre..]
+                    .iter()
+                    .any(|(k, _)| k.source_class == SourceClass::Autopilot),
+                "an Autopilot-stamped command must appear"
+            );
+            let VesselState::InBubble(body) = &w.vessels()[&VesselId(0)].state else {
+                panic!("orbiter must be resident");
+            };
+            assert_eq!(body.throttle, 0.25);
+        }
     }
 }

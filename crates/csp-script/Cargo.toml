@@ -5,6 +5,22 @@ edition.workspace = true
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+# §2.10: the sim-side surface the host drives — ScriptEngine impl,
+# TickIo plumbing, telemetry/command types.
+csp-sim = { workspace = true }
+# §2.7: vectors/quats + tick math for the ControlApi.
+csp-core = { workspace = true }
+# `ResourceId` — the TransferResource command's resource key.
+csp-data = { workspace = true }
+# `PartNodeId` — the JettisonPart command's node id.
+csp-phys = { workspace = true }
+# §2.10's pinned guest language — feature set fixed by the parity
+# rule (see the workspace declaration comment).
+rhai = { workspace = true }
+# The libm oracle for the host-side transcendental overrides —
+# `RhaiHost::new` shadows every platform-libm guest function with the
+# libm implementation (see `lib.rs`'s determinism note).
+libm = { workspace = true }
 
 [lints]
 workspace = true

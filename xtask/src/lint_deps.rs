@@ -492,6 +492,82 @@ fn tree(pkg: &str, wasm: bool) -> PackageTree {
     }
 }
 
+/// M9a §2.10's feature-parity check — the resolved feature set of the
+/// `rhai` node in `csp-script`'s tree, on the host target and on
+/// `wasm32-unknown-unknown` (`cargo tree -f "{p} {f}"`-style, per the
+/// plan's parity gate). The set must be identical across targets —
+/// "a different Rhai on web would be a different script language" —
+/// and must not contain the banned features (`unchecked` would
+/// disable `max_operations`/progress tracking; `only_i32` and
+/// `f32_float` would change the numeric semantics; `sync` changes the
+/// engine's Send/Sync surface). Fails on tooling error or a missing
+/// `rhai` node — never passes on empty output.
+// xtask is CI tooling, not the determinism domain: a failed cargo
+// tree is the loud tooling failure §8.2 wants (`expect` is honest
+// here, allowed at fn scope).
+#[allow(clippy::expect_used)]
+fn rhai_feature_set(wasm: bool) -> std::collections::BTreeSet<String> {
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "tree",
+        "-p",
+        "csp-script",
+        "--edges",
+        "normal",
+        "--format",
+        "{p} {f}",
+    ]);
+    if wasm {
+        cmd.args(["--target", "wasm32-unknown-unknown"]);
+    }
+    let out = cmd.output().expect("cargo tree failed to run");
+    if !out.status.success() {
+        eprintln!(
+            "cargo tree -p csp-script{} failed:\n{}",
+            if wasm { " (wasm32)" } else { "" },
+            String::from_utf8_lossy(&out.stderr)
+        );
+        exit(2);
+    }
+    let text = String::from_utf8(out.stdout).expect("cargo tree output not utf-8");
+    let mut features = std::collections::BTreeSet::new();
+    let mut found = false;
+    for line in text.lines() {
+        // Strip tree-drawing glyphs; node lines read `name vX.Y.Z features…`.
+        let node = line.trim_start_matches(['│', '├', '─', '└', ' ', '`', '*']);
+        if !node.starts_with("rhai ") {
+            continue;
+        }
+        found = true;
+        let mut it = node.split_whitespace();
+        it.next(); // crate name
+        it.next(); // version
+        for tok in it {
+            // cargo decorates proc-macro kind markers with parens and
+            // prints the feature list comma-joined in ONE token —
+            // split on commas too or every feature lands in the set as
+            // a single glued blob and membership checks never match.
+            for part in tok.trim_matches(['(', ')']).split(',') {
+                let t = part.trim_matches(['(', ')']);
+                if !t.is_empty() && t != "proc-macro" {
+                    features.insert(t.to_string());
+                }
+            }
+        }
+    }
+    if !found {
+        eprintln!("lint-deps: `rhai` node absent from csp-script tree");
+        exit(2);
+    }
+    features
+}
+
+/// The §2.10-banned Rhai features — `unchecked` removes the
+/// `max_operations`/`on_progress` instrumentation the op budget is
+/// built on; `only_i32`/`f32_float` change the guest language's
+/// numeric semantics; `sync` changes engine sharing.
+const RHAI_BANNED_FEATURES: &[&str] = &["unchecked", "only_i32", "f32_float", "sync"];
+
 /// `cargo xtask lint-deps`: collect every crate's tree, run the rule
 /// engine, print all violations and exit 1 if any exist.
 pub fn lint_deps() {
@@ -502,7 +578,47 @@ pub fn lint_deps() {
     for pkg in WASM_PKGS {
         trees.push(tree(pkg, true));
     }
-    let violations = check_deps(&trees);
+    let mut violations = check_deps(&trees);
+    // M9a §2.10: native↔wasm32 Rhai feature parity + the banned
+    // feature list, on every commit.
+    let native = rhai_feature_set(false);
+    let wasm = rhai_feature_set(true);
+    if native != wasm {
+        violations.push(Violation {
+            pkg: "csp-script".to_string(),
+            rule: "rhai-feature-parity",
+            detail: format!(
+                "rhai features differ across targets — native: [{}], wasm32: [{}]",
+                native.iter().cloned().collect::<Vec<_>>().join(" "),
+                wasm.iter().cloned().collect::<Vec<_>>().join(" ")
+            ),
+        });
+    }
+    for f in RHAI_BANNED_FEATURES {
+        if native.contains(*f) || wasm.contains(*f) {
+            violations.push(Violation {
+                pkg: "csp-script".to_string(),
+                rule: "rhai-banned-feature",
+                detail: format!("rhai resolves banned feature `{f}` (§2.10 parity rule)"),
+            });
+        }
+    }
+    // M9a §2.10: the wall clock must never reach the guest —
+    // `no_time` (or the `no_std` bundle that contains it) is required,
+    // not merely un-banned. Without it `Engine::new` registers
+    // `BasicTimePackage` and `timestamp()`/`elapsed()` read
+    // `Instant::now()` — a determinism break the tick-pass can't see.
+    for (label, feats) in [("native", &native), ("wasm32", &wasm)] {
+        if !feats.contains("no_time") && !feats.contains("no_std") {
+            violations.push(Violation {
+                pkg: "csp-script".to_string(),
+                rule: "rhai-required-feature",
+                detail: format!(
+                    "rhai on {label} resolves without `no_time`/`no_std` — guest gains wall clock (§2.10)"
+                ),
+            });
+        }
+    }
     if violations.is_empty() {
         println!("lint-deps: OK");
     } else {
@@ -718,11 +834,11 @@ mod tests {
         let text = std::fs::read_to_string(root.join("data/balance.ron"))
             .expect("data/balance.ron missing");
         let b: Balance = ron::from_str(&text).expect("data/balance.ron is not valid RON");
-        // Schema v9 — M8-C added the §3.5 vessel life-support tunables
-        // (`life_support_check_period_s` + the three per-crew rates);
-        // the loader-side pin is `csp_data::BALANCE_SCHEMA_VERSION`
-        // (kept in lockstep by csp-data's own balance gate test).
-        assert_eq!(b.schema_version, 9);
+        // Schema v10 — M9a added §2.10's `script_op_budget` (the
+        // per-save op cap for the script host); the loader-side pin
+        // is `csp_data::BALANCE_SCHEMA_VERSION` (kept in lockstep by
+        // csp-data's own balance gate test).
+        assert_eq!(b.schema_version, 10);
         assert_eq!(b.bubble_radius_m, 20_000.0);
         assert_eq!(b.advance_to_max_events_per_frame, 2_000);
         // And the other shipped data file parses too.

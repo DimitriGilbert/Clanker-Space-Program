@@ -42,7 +42,9 @@ use serde::{Deserialize, Serialize};
 /// `life_support_check_period_s` and the three per-crew consumption
 /// rates (`oxygen`, `food`, `electric_charge`), the sim-side mirrors
 /// `csp_sim::life_support::DEFAULT_*`.
-pub const BALANCE_SCHEMA_VERSION: u32 = 9;
+/// 10 (M9a): `script_op_budget` added — §2.10's per-save operation
+/// cap for the script host.
+pub const BALANCE_SCHEMA_VERSION: u32 = 10;
 
 /// `data/balance.ron` — the tunables every later milestone consumes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -196,4 +198,8 @@ pub struct BalanceDef {
     /// member per sim-second. Mirror:
     /// `csp_sim::life_support::DEFAULT_EC_PER_CREW_S`.
     pub life_support_ec_per_crew_s: f64,
+    /// M9a §2.10's per-save script op budget — "default 20 000,
+    /// configurable per save". Mirror:
+    /// `csp_sim::DEFAULT_SCRIPT_OP_BUDGET`.
+    pub script_op_budget: u64,
 }

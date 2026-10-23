@@ -1,7 +1,7 @@
 // Global balance constants. ALL tuning lives here (PLAN §8.3).
 // Named fields only — positional tuples drift silently under reordering.
 (
-    schema_version: 9,
+    schema_version: 10,
     // Physics bubble radius (PLAN §2.3): 20 km. Vessels go on rails at the
     // radius and rejoin at 90% (18 km) — the hysteresis is csp-sim logic,
     // not a second constant.
@@ -68,4 +68,7 @@
     life_support_oxygen_per_crew_s: 0.02,
     life_support_food_per_crew_s: 0.005,
     life_support_ec_per_crew_s: 0.05,
+    // M9a §2.10's per-save script op budget — same field as
+    // data/balance.ron.
+    script_op_budget: 20_000,
 )

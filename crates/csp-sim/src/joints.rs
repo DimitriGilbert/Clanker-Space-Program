@@ -1051,6 +1051,14 @@ pub(crate) fn apply_latch(
     // the absorbed vessel simply stops — the mass is in the merged
     // body now, not orbiting as debris.
     vessels.remove(&sec);
+    // M9a §2.10 note: a bound autopilot keyed on `sec` survives the
+    // absorb — it goes inert (the bound vessel's telemetry no longer
+    // resolves, so `control_tick` skips it) and merges it with the
+    // absorbed record's lifetime; `remove_vessel` and the
+    // dead-vessels drain drop the record eagerly instead. `autopilots`
+    // isn't threaded into this borrow-split pass — see the
+    // `step_bubble_range` drain for the drop sites.
+    let _ = sec;
     // In-flight transfers naming the absorbed id redirect to the
     // merged survivor — its tanks (and the reservation they held)
     // traveled with the merge.

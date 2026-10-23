@@ -146,7 +146,16 @@ use crate::SimError;
 /// `VesselLifeSupportDepleted` (21 — `Clamping`); `SimCommand`
 /// gained `SetLifeSupportEnabled` — all appended, never renumbered.
 /// `ContractKind` gained `ColonyResupply` (4). The goldens rebless.
-pub const HASH_SCHEMA_VERSION: u32 = 15;
+///
+/// **Version 16** (M9a): the world walk appended §2.10's script book —
+/// `script_op_budget`, the script arena (`next_script_id` + each
+/// record's source/enabled/strikes/poll/wake/`persist`), and the
+/// engaged-autopilot arena. `EventKind` gained `ScriptWake` (22 —
+/// `Clamping`); `SimCommand` gained `LoadScript`, `UnloadScript`,
+/// `SetScriptEnabled`, `EngageAutopilot`, `DisengageAutopilot` — all
+/// appended, never renumbered. `WorldSnapshot` gained the four script
+/// fields (save format change). The goldens rebless.
+pub const HASH_SCHEMA_VERSION: u32 = 16;
 
 /// Rule-7 sum types: the source of an enum's *declared* stable `u16`
 /// discriminant (PLAN §7.1 rule 7).

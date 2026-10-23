@@ -7,6 +7,10 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 csp-core = { workspace = true }
 csp-sim = { workspace = true }
+# M9a §2.10: the script host + ascent autopilot installed on every
+# sim the app builds (construction config — §7.3).
+csp-script = { workspace = true }
+csp-ai = { workspace = true }
 # §8.3: balance.ron/system data files ARE the sim world's startup
 # configuration — `View::new` loads them (native).
 csp-data = { workspace = true }

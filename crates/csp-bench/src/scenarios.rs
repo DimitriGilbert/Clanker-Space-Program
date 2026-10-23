@@ -173,6 +173,12 @@ fn flight_initial(dir: &Path) -> Result<World, ReplayError> {
     world.set_docking_config(csp_sim::DockingConfig::from_balance(&balance));
     // §3.5's transfer tunables — same wiring (M6-D).
     world.set_transfer_config(csp_sim::TransferConfig::from_balance(&balance));
+    // M9a §2.10: the script host + ascent autopilot and the per-save
+    // op budget — same wiring `csp-view` startup does, so a recorded
+    // run that loads scripts replays them.
+    world.set_script_op_budget(balance.script_op_budget);
+    world.set_script_engine(Box::new(csp_script::RhaiHost::new()));
+    world.set_autopilot_driver(Box::new(csp_ai::AscentAutopilot::new()));
     // §3.2's science tunables + experiment defs — same wiring (M7-A):
     // the fixture's balance.ron/experiments/ are the source of truth.
     world.set_science_config(csp_sim::ScienceConfig::from_balance(&balance));
@@ -863,5 +869,156 @@ mod tests {
             DVec3::ZERO,
             None,
         )
+    }
+
+    /// M9a: spawn the authored craft on the pad exactly like
+    /// `flight_run` does — returns the environment the caller needs
+    /// for orbit checks.
+    fn spawn_pad(w: &mut World) -> Environment {
+        let env = w.environment().unwrap().clone();
+        let pad = DVec3::new(env.radius_m + 3.5, 0.0, 0.0);
+        let rot0 = DQuat::from_axis_angle(DVec3::Y, core::f64::consts::FRAC_PI_2);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SpawnPhysicalVessel {
+                craft: flight_craft(),
+                pos: pad,
+                rot: rot0,
+                vel: env.body_spin.cross(pad - env.body_center),
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        w.step_frame(1).unwrap();
+        env
+    }
+
+    /// Osculating `(apo, peri)` ALTITUDES of `FLIGHT_VESSEL` — the
+    /// orbit-check the autopilot/script tests assert against.
+    fn vessel_apsides(w: &World, env: &Environment) -> Option<(f64, f64)> {
+        let v = w.vessels().get(&FLIGHT_VESSEL)?;
+        let (rel, vel, mu) = match &v.state {
+            VesselState::InBubble(b) => (b.com_world() - env.body_center, b.vel, env.mu_m3_per_s2),
+            VesselState::OnRails(o) => {
+                let mu = w.orbits().body_orbit(&o.parent).ok()?.mu_m3_per_s2;
+                let (r, v) = csp_sim::orbit::OrbitModel::state_at(w.orbits(), o, w.clock()).ok()?;
+                (r, v, mu)
+            }
+            VesselState::SurfaceLatched(_) => return None,
+        };
+        let (ra, rp) = apsis(rel, vel, mu);
+        Some((ra - env.radius_m, rp - env.radius_m))
+    }
+
+    /// M9a §2.10/§2.11 acceptance: `EngageAutopilot{Ascent}` on the
+    /// authored launch craft drives it to a closed orbit entirely
+    /// above the atmosphere — the built-in Rust autopilot flying the
+    /// same `ControlApi` a script would.
+    #[test]
+    fn autopilot_ascent_reaches_orbit() {
+        let mut w = flight_initial(&fixture_dir()).unwrap();
+        let env = spawn_pad(&mut w);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::EngageAutopilot {
+                vessel: FLIGHT_VESSEL,
+                program: csp_sim::AutopilotProgram::Ascent {
+                    target_apoapsis_m: 120_000.0,
+                    target_periapsis_m: 100_000.0,
+                },
+            },
+        );
+        w.step_frame(2).unwrap();
+        let mut reached = None;
+        for _ in 0..600_000u64 {
+            let t = w.clock().ticks();
+            w.step_frame(t + 1).unwrap();
+            if let Some((apo, pe)) = vessel_apsides(&w, &env) {
+                // Orbit achieved: periapsis comfortably above the
+                // atmosphere, apoapsis in the target band.
+                if pe > env.atmosphere.as_ref().map_or(70_000.0, |a| a.top_m) && apo > 100_000.0 {
+                    reached = Some((apo, pe));
+                    break;
+                }
+            }
+        }
+        let (apo, pe) = reached.expect("autopilot never reached orbit");
+        assert!(apo < 400_000.0, "runaway apoapsis {apo}");
+        eprintln!("autopilot orbit: apo {apo:.0} pe {pe:.0}");
+        assert!(w.autopilots()[&FLIGHT_VESSEL].enabled);
+    }
+
+    /// M9a §2.10 acceptance: a real Rhai ascent script — `on_tick`
+    /// pitch program over `persist` state + `ctx.vessel` telemetry —
+    /// drives the same craft above the target apoapsis with a
+    /// throttle cut, proving the script path (telemetry read →
+    /// command → next-tick drain → physics).
+    #[test]
+    fn rhai_ascent_script_reaches_apoapsis() {
+        const SRC: &str = r#"
+            fn on_tick(ctx) {
+                let v = ctx.vessel;
+                if !v.found { return; }
+                let apo = v.apoapsis;
+                if apo != apo { apo = -1.0; } // NaN → still climbing
+                if apo >= 120000.0 {
+                    ctx.persist["done"] = true;
+                    set_throttle(0.0);
+                    return;
+                }
+                ctx.persist["done"] = false;
+                set_throttle(1.0);
+                let alt = v.altitude;
+                // pitch: vertical below 1.5 km, horizontal by 60 km
+                let f = ((alt - 1500.0) / 58500.0).max(0.0).min(1.0);
+                let pitch = (1.5707963 * (1.0 - f));
+                let up = v.pos;
+                let un = up.x * up.x + up.y * up.y + up.z * up.z;
+                un = un.sqrt();
+                let ux = up.x / un; let uy = up.y / un; let uz = up.z / un;
+                let vv = v.vel;
+                let vr = (vv.x * ux + vv.y * uy + vv.z * uz);
+                let hx = vv.x - vr * ux; let hy = vv.y - vr * uy; let hz = vv.z - vr * uz;
+                let hn = (hx * hx + hy * hy + hz * hz).sqrt();
+                let px = 0.0; let py = 0.0; let pz = 0.0;
+                if hn > 0.001 { px = hx / hn; py = hy / hn; pz = hz / hn; }
+                else { px = 1.0 - ux.abs(); py = 0.0; pz = uz; }
+                let cp = pitch.cos(); let sp = pitch.sin();
+                steer(ux * sp + px * cp, uy * sp + py * cp, uz * sp + pz * cp);
+            }
+        "#;
+        let mut w = flight_initial(&fixture_dir()).unwrap();
+        let env = spawn_pad(&mut w);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::LoadScript {
+                vessel: FLIGHT_VESSEL,
+                source: SRC.to_string(),
+            },
+        );
+        w.step_frame(2).unwrap();
+        assert!(
+            w.scripts()[&csp_sim::ScriptId(0)].enabled,
+            "script must compile"
+        );
+        let mut done = false;
+        for _ in 0..400_000u64 {
+            let t = w.clock().ticks();
+            w.step_frame(t + 1).unwrap();
+            let s = &w.scripts()[&csp_sim::ScriptId(0)];
+            assert!(s.enabled, "script faulted: {:?}", s.disabled_reason);
+            if matches!(
+                s.persist.get("done"),
+                Some(csp_sim::PersistValue::Bool(true))
+            ) {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "script never cut throttle at target apoapsis");
+        let (apo, _pe) = vessel_apsides(&w, &env).expect("no conic");
+        assert!(apo >= 120_000.0, "apoapsis {apo}");
     }
 }

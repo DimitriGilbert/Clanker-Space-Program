@@ -11,8 +11,7 @@
 //!   (see `World`'s `SetVesselTracked` apply).
 //! - **Kinds have producers only.** The §2.6.5 member tables name ten
 //!   `Clamping` and six `Silent` members; variants whose subsystems do
-//!   not exist yet (`ScriptWake`,
-//!   `ConstructionComplete`, `ReliabilityInspectionDue`, `PartFailure`)
+//!   not exist yet (`ReliabilityInspectionDue`, `PartFailure`)
 //!   are deliberately absent — they land WITH their
 //!   producing subsystems (no speculative filler). M8-A landed the
 //!   §3.5.1 colony kinds — `TerminatorCrossing`, `ColonyStore*`
@@ -360,6 +359,21 @@ pub enum EventKind {
         /// The crewed vessel whose life support ran out.
         vessel: VesselId,
     } = 21,
+    /// M9a §2.10's script wake — the `Scripts` subsystem's member of
+    /// the §2.6.5 `Clamping` table. A script registered a
+    /// closed-form-resolvable wake condition; firing runs the
+    /// script's `on_tick` at this tick even under rails warp (the
+    /// event IS the tick for a non-bubble script). `Clamping` —
+    /// warp demotes so the player cannot overshoot the wake, the
+    /// `ManeuverNodeStart` precedent. Pairs one-to-one with
+    /// `ScriptState::wake_tick` (re-registration scrubs the pending
+    /// event and reschedules); a stale firing — script unloaded,
+    /// disabled, or `wake_tick` moved — is a tolerated no-op like
+    /// `TransferComplete`.
+    ScriptWake {
+        /// The script arena id whose tick fires.
+        script: crate::ScriptId,
+    } = 22,
 }
 
 impl StableDiscriminant for EventKind {
@@ -387,6 +401,7 @@ impl StableDiscriminant for EventKind {
             Self::ConstructionComplete { .. } => 19,
             Self::LifeSupportCheck => 20,
             Self::VesselLifeSupportDepleted { .. } => 21,
+            Self::ScriptWake { .. } => 22,
         }
     }
 }
@@ -429,7 +444,11 @@ pub fn class_of(kind: &EventKind, tracked: &BTreeSet<VesselId>) -> EventClass {
         | EventKind::LifeSupportDepleted { .. }
         // M8-C: the vessel-side depletion shares the colony's
         // "a transition, not a periodic" `Clamping` contract.
-        | EventKind::VesselLifeSupportDepleted { .. } => EventClass::Clamping,
+        | EventKind::VesselLifeSupportDepleted { .. }
+        // M9a §2.10: the script wake is a named §2.6.5 `Clamping`
+        // member — warp demotes so a sleeping script's wake tick is
+        // never streamed past.
+        | EventKind::ScriptWake { .. } => EventClass::Clamping,
         EventKind::PlayerAlarm { .. }
         | EventKind::ManeuverNodeStart { .. }
         | EventKind::TransferWindow { .. }
@@ -531,6 +550,9 @@ impl ScheduledEvent {
             EventKind::LifeSupportCheck => {}
             EventKind::VesselLifeSupportDepleted { vessel } => {
                 h.u64(vessel.0);
+            }
+            EventKind::ScriptWake { script } => {
+                h.u64(script.0);
             }
         }
     }

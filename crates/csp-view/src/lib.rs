@@ -432,6 +432,12 @@ impl View {
             max_vessels: balance.max_tracked_vessels,
             max_debris: balance.max_debris,
         });
+        // M9a §2.10: the script host + autopilot driver (construction
+        // config — re-installed identically by csp-bench's replay
+        // harness) and the per-save op budget.
+        sim.set_script_op_budget(balance.script_op_budget);
+        sim.set_script_engine(Box::new(csp_script::RhaiHost::new()));
+        sim.set_autopilot_driver(Box::new(csp_ai::AscentAutopilot::new()));
         sim.set_docking_config(csp_sim::DockingConfig::from_balance(&balance));
         sim.set_transfer_config(csp_sim::TransferConfig::from_balance(&balance));
         // M7-A §3.2: the science tunables and the experiment-def table —

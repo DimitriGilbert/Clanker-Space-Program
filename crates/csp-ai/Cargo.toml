@@ -5,6 +5,14 @@ edition.workspace = true
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+# §2.10: the AutopilotDriver seam + telemetry/command types.
+csp-sim = { workspace = true }
+# The ControlApi the driver flies through (IoControlApi over TickIo).
+csp-script = { workspace = true }
+# Vectors for the guidance math.
+csp-core = { workspace = true }
+# §2.10's transcendental rule: libm only, never platform floats.
+libm = { workspace = true }
 
 [lints]
 workspace = true

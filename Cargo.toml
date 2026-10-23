@@ -31,6 +31,18 @@ rand_core = "=0.10.1"
 libm = "=0.2.16"
 bincode = { version = "=2.0.1" }
 ciborium = "=0.2.2"
+# M9a §2.10 — the guest language host. Pinned feature set per the
+# plan's parity rule: NOT `unchecked` (that would disable
+# `max_operations`/progress tracking = no budget enforcement), NOT
+# `only_i32`, NOT `f32_float` (web would be a different language),
+# `sync` OFF (its default). `no_std` is the determinism pin: it
+# bundles `no_time` (no BasicTimePackage — `timestamp()`/`elapsed`
+# cannot exist, so the guest has no wall clock) and `num-traits/libm`
+# + `libm` (every transcendental resolves to libm, not the platform
+# libm — the cross-platform float-determinism rule the sim itself
+# already enforces). Exact pin — script semantics are
+# version-sensitive like every determinism-domain dep.
+rhai = { version = "=1.27.0", default-features = false, features = ["no_std"] }
 # Pinned at the newest published 0.9.x (the original "=0.9.8" declaration
 # predated any use and names a version that does not exist on crates.io;
 # 0.9.1 is what Cargo.lock already carries transitively).

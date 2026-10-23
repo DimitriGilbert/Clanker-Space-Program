@@ -641,6 +641,13 @@ pub fn replay(artifact: &Replay) -> Result<[u8; 32], ReplayError> {
     // run's `FoundColony`/`ManufactureCraft` resolves `RecipeId`s
     // against it.
     world.set_recipes(artifact.config.recipes.clone());
+    // M9a §2.10: the script host + autopilot driver are the same
+    // construction-config channel — a recorded run whose snapshot
+    // carried scripts/autopilots replays their `on_tick` calls; the
+    // per-save op budget is serialized sim state and restores with
+    // the snapshot (the engine install forwards it).
+    world.set_script_engine(Box::new(csp_script::RhaiHost::new()));
+    world.set_autopilot_driver(Box::new(csp_ai::AscentAutopilot::new()));
     let log = &artifact.command_log;
     let mut i = 0;
     while i < log.len() {

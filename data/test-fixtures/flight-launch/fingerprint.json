@@ -6,8 +6,8 @@
   "libm": "0.2.16",
   "rand_chacha": "0.10.0",
   "blake3": "1.8.3",
-  "hash_schema_version": 15,
+  "hash_schema_version": 16,
   "kdf_version": 1,
   "data_hash_version": 1,
-  "data_fixture_hash": "05da1981b9a7841fc685530afb926d017c0b51de9b6727cab2ef447558188844"
+  "data_fixture_hash": "c4b5a31b5eb3da4b5ca0403bcd9cf73f01b4e428ee5b590780ee431219748556"
 }

@@ -9,6 +9,10 @@ build = "build.rs"
 csp-core = { workspace = true }
 csp-data = { workspace = true }
 csp-sim = { workspace = true }
+# M9a §2.10: the replay harness re-installs the same construction-
+# config engines `csp-view` does (script host + autopilot driver).
+csp-script = { workspace = true }
+csp-ai = { workspace = true }
 # The flight scenario's authored part set + environment come from the
 # weld/weld-input types; the harness measures `SimpleBackend::step` cost
 # directly (§5.3's per-tick budget).
