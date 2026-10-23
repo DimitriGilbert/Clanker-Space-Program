@@ -14,22 +14,28 @@
 //!
 //! `csp-app` never reads `view.world` for UI (§2.5): input arrives through
 //! `View`'s plumbing methods, the whole egui pass is the `ui_build`
-//! schedule's [`csp_ui`] panel system, and render consumes the stored
+//! schedule's `csp_ui` panel system, and render consumes the stored
 //! `FullOutput`. Native and wasm share this code; the entry points differ
 //! (`main.rs` vs `wasm_start` below).
 //!
 //! M10 additions: persistent settings + a rebindable keymap
-//! ([`settings_io`]), and the §2.13/§2.14 crash path — a `Fatal` or a
+//! ([`settings_io`]), the §2.13/§2.14 crash path — a `Fatal` or a
 //! panic halts the clock, marks the session read-only, writes a
-//! bug-report bundle ([`bugreport`]), and surfaces it in the UI.
+//! bug-report bundle ([`bugreport`]), and surfaces it in the UI — and
+//! the real audio backend ([`audio`], native-only): the M4c `FlightSfx`
+//! cue channel finally drives synthesized sound (§3.7's deferral).
 
 #![forbid(unsafe_code)]
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod audio;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod bugreport;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod logring;
 pub mod settings_io;
+#[cfg(not(target_arch = "wasm32"))]
+mod synth;
 mod warp;
 
 use std::sync::Arc;
@@ -173,6 +179,13 @@ struct App {
     /// `(adapter, backend)` remembered for the bundle's system info —
     /// `set_gpu_info` already hands them to the session mirror.
     gpu_info: Option<(String, String)>,
+    /// The M10 audio backend ([`audio`]) — `Some` once `init_graphics`
+    /// opened the OS device, `None` on any device failure (graceful
+    /// silence) and in tests (which never run `init_graphics`).
+    /// Presentation only: it reads `FlightSfx`/`FlightSnapshot`
+    /// post-`end_frame` and feeds nothing back.
+    #[cfg(not(target_arch = "wasm32"))]
+    audio: Option<audio::AudioBackend>,
 }
 
 impl App {
@@ -239,6 +252,8 @@ impl App {
             #[cfg(not(target_arch = "wasm32"))]
             bug_report_root: bugreport::bug_report_root(),
             gpu_info: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            audio: None,
         };
         app.apply_startup_difficulty();
         app
@@ -400,6 +415,14 @@ impl App {
         self.terrain_renderer = Some(terrain_renderer);
         self.map_renderer = Some(map_renderer);
         self.vab_renderer = Some(vab_renderer);
+        // M10 audio (native only): open the device beside the other
+        // presentation init — `None` on any failure is the supported
+        // silent path, never a startup error. Tests skip
+        // `init_graphics`, so they never touch a device.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.audio = audio::AudioBackend::open(&self.settings.audio);
+        }
         self.view
             .set_craft_files(self.craft_store.keys().cloned().collect());
     }
@@ -572,6 +595,32 @@ impl App {
             self.last_tick_ms = 0.0;
         }
         self.view.end_frame();
+
+        // M10 audio (native only): the `FlightSfx` cue queue and the
+        // flight snapshot are fresh post-`end_frame` — drain new cues
+        // into one-shots and re-drive the continuous voices. Read-only
+        // on the presentation world; nothing feeds back.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(backend) = &mut self.audio {
+            backend.update(
+                self.view.world.resource::<csp_view::flight::FlightSfx>(),
+                self.view
+                    .world
+                    .resource::<csp_view::flight::FlightSnapshot>(),
+                &self.settings.audio,
+            );
+        }
+    }
+
+    /// The session-side acknowledge blip — an app event (settings
+    /// applied, mode switched), not a sim transition, so it never
+    /// appears in the `FlightSfx` stream; the backend fires it
+    /// directly. Silent (no-op) without a device.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn ui_confirm(&self) {
+        if let Some(backend) = &self.audio {
+            backend.ui_confirm();
+        }
     }
 
     /// The one-frame-late half of the frame (§2.5): apply every request
@@ -583,6 +632,8 @@ impl App {
             self.warp.request_step(outbox.warp_step);
         }
         if let Some(mode) = outbox.mode {
+            #[cfg(not(target_arch = "wasm32"))]
+            self.ui_confirm();
             self.view.set_mode(match mode {
                 ModeSelect::Flight => ViewMode::Flight,
                 ModeSelect::Map => ViewMode::Map,
@@ -607,6 +658,8 @@ impl App {
             }
         }
         if outbox.settings_apply {
+            #[cfg(not(target_arch = "wasm32"))]
+            self.ui_confirm();
             // The panel's staged copy becomes the live set: the keymap
             // dispatch reads `self.settings.keys` next key press, and
             // the file write makes it durable (§7.8) — at the injected
