@@ -422,14 +422,16 @@ pub fn capture_sync_input(sim: &World) -> FlightSyncInput {
                 let (Some(env), Some(craft)) = (env_ref, vessel.craft.as_ref()) else {
                     continue;
                 };
-                let (pos, rot, vel, _ang_vel) =
-                    csp_sim::bubble::surface_pose_restore(env, pose, sim.clock());
                 // The pose record stores no collider — re-weld the craft
                 // for the render data (the §7.3 re-derived-on-load
-                // convention; cheap at craft scale).
+                // convention; cheap at craft scale). The weld precedes
+                // the restore: `vel` stamps the CoM slot, which needs
+                // `welded.com_local`.
                 let Ok(welded) = csp_phys::weld(&craft.graph, &craft.parts) else {
                     continue;
                 };
+                let (pos, rot, vel, _ang_vel) =
+                    csp_sim::bubble::surface_pose_restore(env, pose, welded.com_local, sim.clock());
                 let plumes = welded
                     .force_sites
                     .iter()

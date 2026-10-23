@@ -216,17 +216,26 @@ pub fn surface_pose_capture(
 /// The unlatch half of §2.6.4: reproduce the inertial pose exactly at
 /// the unlatch `tick` — `pos = body_center + R(ω·t)·p_fix`,
 /// `rot = R(ω·t)·orientation`, with `p_fix` rebuilt from
-/// `(lat, lon, alt)`. Velocity is the surface co-rotation
-/// `body_spin × (pos − body_center)`; angular velocity is the
+/// `(lat, lon, alt)`. Velocity is the surface co-rotation of the
+/// **centre of mass** — `body_spin × (pos + rot·com_local −
+/// body_center)` — because `WeldedBody::vel` is the CoM slot (§2.9's
+/// integrator advances `x̄`, not the origin): stamping the *origin's*
+/// co-rotation would silently drop `ω × rot·com_local` for any weld
+/// with `com_local ≠ 0` — the same `v + ω×r` material-point convention
+/// `csp_phys::fragment_velocity` applies. Angular velocity is the
 /// co-rotation expressed in body frame — the state a body-fixed object
 /// actually has, so an unlatched body re-enters physics mid-rotation
 /// with no impulse.
+///
+/// `com_local` is the vessel weld's [`WeldedBody::com_local`]; callers
+/// re-weld the stored craft anyway, so it is handed straight through.
 ///
 /// Returns `(pos, rot, vel, ang_vel)` in the bubble frame (ang_vel in
 /// body frame, matching `WeldedBody`'s convention).
 pub fn surface_pose_restore(
     env: &Environment,
     pose: &SurfacePose,
+    com_local: DVec3,
     tick: SimTime,
 ) -> (DVec3, DQuat, DVec3, DVec3) {
     let omega = env.body_spin.norm();
@@ -242,7 +251,11 @@ pub fn surface_pose_restore(
     let phase = phase_quat(axis, omega * seconds);
     let pos = env.body_center + phase.rotate(p_fix);
     let rot = (phase * pose.orientation).normalize();
-    let vel = env.body_spin.cross(pos - env.body_center);
+    // `vel` stamps the CoM slot: the co-rotation velocity of
+    // `com_world = pos + rot·com_local`, not of the origin `pos`.
+    let vel = env
+        .body_spin
+        .cross(pos + rot.rotate(com_local) - env.body_center);
     let ang_vel = rot.conjugate().rotate(env.body_spin);
     (pos, rot, vel, ang_vel)
 }

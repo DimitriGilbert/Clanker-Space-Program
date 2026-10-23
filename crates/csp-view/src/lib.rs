@@ -1328,23 +1328,29 @@ impl View {
         // `SpawnPhysicalVessel`'s apply does; a failed weld rejects
         // there anyway, so the `0.0` fallback only dresses a doomed
         // command. `min(0.0)` keeps an origin-below-parts craft from
-        // driving the origin itself under the datum.
-        let z_min = csp_phys::weld(&craft.graph, &craft.parts)
+        // driving the origin itself under the datum. The same weld
+        // hands `com_local` to the restore — `vel` is the CoM slot
+        // (§2.9), so the spawn's co-rotation stamp is the velocity of
+        // `pos + rot·com_local`, not of the origin.
+        let (z_min, com_local) = csp_phys::weld(&craft.graph, &craft.parts)
             .map(|b| {
-                b.collider
-                    .hulls
-                    .iter()
-                    .flat_map(|h| h.vertices.iter().map(|v| v.z))
-                    .fold(f64::INFINITY, f64::min)
+                (
+                    b.collider
+                        .hulls
+                        .iter()
+                        .flat_map(|h| h.vertices.iter().map(|v| v.z))
+                        .fold(f64::INFINITY, f64::min)
+                        .min(0.0),
+                    b.com_local,
+                )
             })
-            .unwrap_or(0.0)
-            .min(0.0);
+            .unwrap_or((0.0, csp_core::DVec3::ZERO));
         // The spawn kinematics are the §2.6.4 latch record's exact
         // restore: upright ENU pose at the site, position resolved at
         // the CURRENT tick's spin phase (the pad co-rotates — spawning
         // at the stale t=0 longitude would put the craft downrange of
-        // the site), velocity the surface co-rotation `ω × r` — a
-        // pad-resting craft, not an inertially-dropped one.
+        // the site), velocity the surface co-rotation `ω × r` of the
+        // CoM — a pad-resting craft, not an inertially-dropped one.
         let pose = csp_sim::SurfacePose {
             body: dominant,
             latitude_rad: lat,
@@ -1353,7 +1359,7 @@ impl View {
             orientation: csp_sim::bubble::surface_upright(lat, lon),
         };
         let (pos, rot, vel, ang_vel) =
-            csp_sim::bubble::surface_pose_restore(&env, &pose, self.sim.clock());
+            csp_sim::bubble::surface_pose_restore(&env, &pose, com_local, self.sim.clock());
         self.enqueue_command(
             SourceClass::Ui,
             1,

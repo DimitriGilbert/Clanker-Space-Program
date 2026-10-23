@@ -3284,8 +3284,11 @@ impl World {
                 self.shadow_vessels(shadow);
                 let mut body = csp_phys::weld(&craft.graph, &craft.parts)
                     .map_err(|e| SimError::Fatal(e.reason()))?;
+                // The weld supplies `com_local` — the restore stamps
+                // `vel` at the CoM, not the origin (§2.9's `vel` is the
+                // CoM slot).
                 let (pos, rot, vel, ang_vel) =
-                    bubble::surface_pose_restore(&env, &pose, self.clock);
+                    bubble::surface_pose_restore(&env, &pose, body.com_local, self.clock);
                 body.pos = pos;
                 body.rot = rot;
                 body.vel = vel;
@@ -5037,7 +5040,14 @@ impl World {
                     return Err(SimError::Recoverable("to-rails: live contact"));
                 }
             }
-            let (r, v2) = (body.pos - env.body_center, body.vel);
+            // The conic is the CoM's: `vel` is the CoM slot (§2.9), so
+            // the stamped state must be `com_world`, not the origin —
+            // pairing `pos` with the CoM velocity would stamp an
+            // O(‖com_local‖)-wrong conic, and the surface-clearance
+            // check below would evaluate that wrong orbit. `ToBubble`/
+            // `fire_maneuver_start` convert back the same way
+            // (`pos = com_world − rot·com_local`).
+            let (r, v2) = (body.com_world() - env.body_center, body.vel);
             let elements = orbit::cartesian_to_elements(r, v2, env.mu_m3_per_s2)?;
             // The conic must clear the surface — an orbit that
             // intersects the planet has no rails reading.
@@ -5295,7 +5305,10 @@ impl World {
         // The conic contributes pos/vel only — rot/ang_vel/throttle/
         // settle stay at the weld defaults (identity, zero, zero,
         // fresh): re-materialization does not reconstruct an attitude.
-        body.pos = r + center;
+        // The stamped conic tracks the CoM (`apply_to_rails_at` anchors
+        // it at `com_world`), so the origin backs it out as
+        // `pos = com_world − rot·com_local`.
+        body.pos = r + center - body.rot.rotate(body.com_local);
         body.vel = vel;
         let vessel_mut = self
             .vessels
@@ -5527,8 +5540,10 @@ impl World {
         // Same materialization contract as `ToBubble`: the conic
         // contributes pos/vel only — rot/ang_vel/throttle/settle come
         // out at the weld defaults; the executor owns rot/throttle
-        // from the first tick.
-        body.pos = r + center;
+        // from the first tick. The conic tracks the CoM
+        // (`apply_to_rails_at` anchors it at `com_world`), so the
+        // origin backs it out as `pos = com_world − rot·com_local`.
+        body.pos = r + center - body.rot.rotate(body.com_local);
         body.vel = vel;
         let vessel_mut = self
             .vessels
@@ -11706,6 +11721,80 @@ mod tests {
         w2.step_frame(w2.clock().ticks() + 1).unwrap();
         let b = w2.vessels()[&VesselId(0)].body().unwrap();
         assert_eq!(b.throttle, 1.0);
+    }
+
+    /// §2.6.4 unlatch with `com_local ≠ 0`: the restored `vel` is the
+    /// CoM's surface co-rotation `ω × (com_world − center)`, not the
+    /// origin's `ω × (pos − center)` — `vel` is the CoM slot (§2.9), so
+    /// an origin stamp would silently drop `ω × rot·com_local`. The
+    /// unlatch is applied directly (the `apply_undock` precedent) so
+    /// the stamp is observed before any physics tick folds gravity in.
+    #[test]
+    fn unlatch_stamps_com_surface_velocity() {
+        // A one-part box whose authored `com` sits off the geometric
+        // centre — the weld's `com_local` is measurably nonzero.
+        let com_local = DVec3::new(0.4, 0.25, -0.6);
+        let mut craft = box_craft(20_000.0, DVec3::new(1.5, 1.5, 1.5), 0.0);
+        craft.parts[0].com = com_local;
+        let env = test_env(true);
+        let mut w = physics_world(true);
+        // Spawn already co-rotating about the CoM — `vel`/`ang_vel`
+        // the exact body-fixed-rest state — so the settle countdown
+        // starts immediately rather than riding a slide.
+        let pos = DVec3::new(TERRIN_R + 1.51, 0.0, 0.0);
+        let rot = pad_rot();
+        spawn_physical(
+            &mut w,
+            SimCommand::SpawnPhysicalVessel {
+                craft,
+                pos,
+                rot,
+                vel: surface_vel(pos + rot.rotate(com_local), &env),
+                ang_vel: rot.conjugate().rotate(env.body_spin),
+            },
+        );
+        let mut latched = false;
+        for _ in 0..2_000u64 {
+            w.step_frame(w.clock().ticks() + 1).unwrap();
+            if matches!(
+                w.vessels()[&VesselId(0)].state,
+                VesselState::SurfaceLatched(_)
+            ) {
+                latched = true;
+                break;
+            }
+        }
+        assert!(latched, "offset-CoM lander never latched");
+        // Materialize the restore without a physics tick in between —
+        // the stamp is observed verbatim.
+        let mut shadow = TickShadow::capture(&w);
+        w.apply_unlatch(VesselId(0), &mut shadow).unwrap();
+        drop(shadow);
+        let body = w.vessels()[&VesselId(0)].body().unwrap();
+        // Non-vacuous: the weld really did put the CoM off-origin.
+        assert!(
+            body.com_local.norm() > 0.5,
+            "com_local={:?}",
+            body.com_local
+        );
+        // The stamp IS the CoM co-rotation — the same convention the
+        // settle gate's `v_rel` reads
+        // (`b.vel − ω×(com_world − center)`).
+        let expect = surface_vel(body.com_world(), &env);
+        assert!(
+            (body.vel - expect).norm() < 1e-9,
+            "vel={:?} expect={:?}",
+            body.vel,
+            expect
+        );
+        // The tripwire: the pre-fix origin stamp `ω×(pos − center)`
+        // differs by ‖ω × rot·com_local‖ ≈ 2e-4 m/s here — an assert
+        // a regression to the origin convention cannot pass.
+        let origin_stamp = surface_vel(body.pos, &env);
+        assert!(
+            (body.vel - origin_stamp).norm() > 1e-4,
+            "vel indistinguishable from the origin stamp — fix absent?"
+        );
     }
 
     /// Bubble→rails→bubble: `ToRails` stamps elements from the
