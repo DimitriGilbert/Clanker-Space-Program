@@ -1,6 +1,6 @@
 //! M4c near-flight view (PLAN §3.7's presentation floor): the actual
-//! InBubble craft as hull boxes, a ground disc and horizon band, an
-//! engine plume — the flat-colored triangle stream `csp-view`'s
+//! InBubble craft as kitbash part meshes, the terrain/sky surface
+//! pass, engine plumes — the flat-colored triangle stream `csp-view`'s
 //! `extract_flight` builds (clip-space f32, §2.3; this crate never
 //! sees the f64 bubble frame). Same reverse-Z depth convention as
 //! the map and VAB renderers — with one adjustment: this pipeline
@@ -36,7 +36,8 @@ impl FlightVertex {
 /// sim state (§2.1/§2.5).
 #[derive(Clone, Debug, Default)]
 pub struct FlightPacket {
-    /// Triangle-list scene: fallback sky gradient, craft boxes, plumes.
+    /// Triangle-list scene: fallback sky gradient, craft part meshes,
+    /// plumes.
     pub vertices: Vec<FlightVertex>,
     /// The R2 surface pass (§5.2): quadtree terrain + ocean instances
     /// and the LUT-scattered sky, drawn by

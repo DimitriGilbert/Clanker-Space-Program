@@ -1184,6 +1184,10 @@ impl App {
             KeyAction::CycleFocus if mode == ViewMode::Map => {
                 self.view.map_event(MapKeyEvent::CycleFocus)
             }
+            // The controls card and the dev debug scaffold — session
+            // toggles on the view, no sim involvement.
+            KeyAction::ToggleHelp => self.view.toggle_help_panel(),
+            KeyAction::ToggleDebug => self.view.toggle_debug_panel(),
             KeyAction::PanUp | KeyAction::PanDown | KeyAction::PanLeft | KeyAction::PanRight => {
                 let (dx_px, dy_px) = match action {
                     KeyAction::PanUp => (0.0, -PAN_STEP_PX),
@@ -1605,9 +1609,12 @@ mod tests {
         let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
         app.bug_report_root = dir.clone();
         // A Fatal only exists after a stepped frame in production —
-        // and the §7.4 snapshot refuses while commands sit undrained,
-        // which the first-run starter-craft spawn is until tick 1.
-        app.view.sim_step(1).unwrap();
+        // and the §7.4 snapshot refuses while commands sit undrained
+        // OR a vessel holds live ground contact — the seeded pad craft
+        // now *rests* in contact from tick one, so step past its
+        // settle → surface-latch (~128 settle ticks after first
+        // contact; 320 covers it with margin).
+        app.view.sim_step(320).unwrap();
         app.on_sim_fatal(SimError::Fatal("injected invariant violation (test)"));
         assert!(app.read_only);
         assert_eq!(

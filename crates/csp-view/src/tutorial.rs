@@ -111,6 +111,7 @@ mod tests {
             sun_dir: DVec3::Z,
             spin_axis: DVec3::Z,
             spin_phase: 0.0,
+            body_spin: DVec3::ZERO,
         }
     }
 
@@ -128,9 +129,10 @@ mod tests {
             contact: false,
             plasma_w_m2: 0.0,
             nodes: 3,
-            boxes: Vec::new(),
+            parts: Vec::new(),
             plumes: Vec::new(),
             com: rel,
+            latched: false,
         }
     }
 

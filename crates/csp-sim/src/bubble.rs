@@ -247,6 +247,52 @@ pub fn surface_pose_restore(
     (pos, rot, vel, ang_vel)
 }
 
+/// The upright pad orientation at `(lat_rad, lon_rad)` expressed in the
+/// body's *fixed* frame — feed it to [`surface_pose_restore`] as
+/// `orientation` to get the inertial rot at `tick`.
+///
+/// The mapping is a level ENU pose: the craft's stack axis (body +Z —
+/// the VAB's build direction) points along local up `û`, body +Y faces
+/// local north `n̂`, and body +X faces local east `ê` (the direction a
+/// parked craft's nose pitches toward when it lifts off east). Built as
+/// `yaw(φ about û) ∘ tilt(ẑ→û)` so the pole degenerate (`cl → 0`, where
+/// east/north are undefined) still yields a finite upright pose.
+///
+/// Convention check at `lat = lon = 0`: `û = +x`, `tilt = R(ŷ, π/2)` —
+/// the pose the original pad spawn wrote by hand.
+pub fn surface_upright(lat_rad: f64, lon_rad: f64) -> DQuat {
+    let (sl, cl) = (libm::sin(lat_rad), libm::cos(lat_rad));
+    let (so, co) = (libm::sin(lon_rad), libm::cos(lon_rad));
+    let up = DVec3::new(cl * co, cl * so, sl);
+    // tilt: ẑ → û about the hinge axis ẑ × û = (−u_y, u_x, 0); the angle
+    // is acos(ẑ·û) = acos(sl) = π/2 − lat.
+    let tilt = if cl.abs() > 1.0e-12 {
+        DQuat::from_axis_angle(
+            DVec3::new(-up.y, up.x, 0.0),
+            libm::acos(sl.clamp(-1.0, 1.0)),
+        )
+    } else if sl > 0.0 {
+        DQuat::IDENTITY // north pole: ẑ already IS up
+    } else {
+        DQuat::from_axis_angle(DVec3::Y, core::f64::consts::PI)
+    };
+    // Level frame: ê is the eastward direction on the horizon plane;
+    // n̂ = û × ê completes it. At the poles ê degenerates with `cl` —
+    // pick +y as the zero-lat reference east there (any level choice
+    // is equally honest at a pole).
+    let east = if cl.abs() > 1.0e-12 {
+        DVec3::new(-so, co, 0.0)
+    } else {
+        DVec3::Y
+    };
+    let north = up.cross(east);
+    // yaw: rotate the tilted +Y about û onto n̂ — the signed angle
+    // measured against û.
+    let y_tilted = tilt.rotate(DVec3::Y);
+    let phi = libm::atan2(y_tilted.cross(north).dot(up), y_tilted.dot(north));
+    (DQuat::from_axis_angle(up, phi) * tilt).normalize()
+}
+
 /// The world's physics construction config (§2.4/§9's "the World owns
 /// the backend + environment"): the §2.9 backend's environment plus the
 /// dominant body the bubble frame is centered on. Not sim state —

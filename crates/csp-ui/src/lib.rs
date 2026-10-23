@@ -29,6 +29,10 @@ pub mod settings;
 /// checklist panel.
 pub mod tutorial;
 
+/// The flight attitude instrument — the navball ball + heading tape,
+/// pure egui over body-frame staged vectors.
+pub mod navball;
+
 pub use settings::{
     AudioSettings, DifficultySettings, GameplaySettings, GraphicsQuality, GraphicsSettings,
     KeyAction, KeyBinding, Keymap, Settings, SettingsPanelOutput, SettingsPanelState,
@@ -236,14 +240,31 @@ pub fn map_overlay(
 pub struct FlightHudInput<'a> {
     /// A focused vessel exists (else the HUD shows "no vessel").
     pub has_vessel: bool,
+    /// The focused vessel is surface-latched (parked).
+    pub latched: bool,
     /// Altitude above surface (m).
     pub alt_m: f64,
-    /// CoM speed (m/s).
-    pub speed_mps: f64,
+    /// Surface-relative CoM speed (m/s) — `‖v − ω × r‖`.
+    pub surface_speed_mps: f64,
+    /// Inertial CoM speed (m/s) — the orbital readout.
+    pub orbital_speed_mps: f64,
     /// Vertical speed (m/s).
     pub vspeed_mps: f64,
+    /// Compass heading of the nose (deg; NaN = undefined).
+    pub heading_deg: f64,
+    /// Nose pitch above the horizon (deg; NaN = no reference).
+    pub pitch_deg: f64,
+    /// Roll about the nose axis (deg; NaN = no reference).
+    pub roll_deg: f64,
     /// Throttle [0,1].
     pub throttle: f64,
+    /// Live part count of the focused vessel.
+    pub parts: usize,
+    /// The navball's staged body-frame directions.
+    pub navball: navball::NavballInput,
+    /// Stored warp multiplier — the warp readout moved out of the
+    /// (now dev-gated) debug panel.
+    pub warp: u32,
     /// Total vessels tracked.
     pub vessel_count: usize,
     /// Debris-flagged vessels.
@@ -253,11 +274,23 @@ pub struct FlightHudInput<'a> {
     pub sfx: &'a [String],
 }
 
-/// The M4c flight HUD (§3.7's presentation floor): bottom-left
-/// telemetry strip — altitude, speed, vertical speed, throttle bar,
-/// vessel/debris counts — plus the controls hint and the visual-SFX
-/// event flashes. Drawn by `csp-view`'s `UiBuild` while
-/// `ViewMode::Flight` is active.
+/// Number formatting for the telemetry column: KSP-style SI switch —
+/// metres under 10 km, km above.
+fn fmt_alt(m: f64) -> String {
+    if m.abs() < 10_000.0 {
+        format!("{:>7.1} m", m)
+    } else {
+        format!("{:>7.1} km", m / 1e3)
+    }
+}
+
+/// The M4c flight HUD (§3.7's presentation floor, upgraded): the
+/// navball attitude instrument bottom-center (ball + heading tape),
+/// a telemetry column at its left (altitude, surface/orbital speed,
+/// vertical speed, heading/pitch/roll, throttle, parts, warp), the
+/// controls hint, and the visual-SFX event flashes. Drawn by
+/// `csp-view`'s `UiBuild` while `ViewMode::Flight` is active.
+#[allow(clippy::too_many_lines)] // one HUD = one pass
 pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
     // §3.7's visual-SFX channel: each live cue is a top-center flash,
     // newest at the bottom of the stack.
@@ -279,10 +312,12 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
             });
     }
     let rect = ctx.content_rect();
+    const BALL_R: f32 = 64.0;
+    let ball_center = egui::pos2(rect.center().x, rect.bottom() - BALL_R - 30.0);
     egui::Area::new(egui::Id::unique("flight_hud"))
         .order(egui::Order::Foreground)
         .interactable(false)
-        .fixed_pos(egui::pos2(10.0, rect.bottom() - 116.0))
+        .fixed_pos(egui::pos2(10.0, rect.bottom() - 170.0))
         .show(ctx, |ui| {
             if !input.has_vessel {
                 ui.label(
@@ -290,47 +325,139 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
                         .color(egui::Color32::from_gray(200)),
                 );
                 ui.label(
-                    egui::RichText::new("[V] VAB  ·  [M] map").color(egui::Color32::from_gray(150)),
+                    egui::RichText::new("[V] VAB  ·  [M] map  ·  [F1] controls")
+                        .color(egui::Color32::from_gray(150)),
                 );
                 return;
             }
             let mono = egui::FontId::monospace(13.0);
             let c = egui::Color32::from_gray(220);
-            ui.label(
-                egui::RichText::new(format!("ALT  {:>12.1} m", input.alt_m))
-                    .font(mono.clone())
-                    .color(c),
+            let dim = egui::Color32::from_gray(160);
+            let row = |ui: &mut egui::Ui, tag: &str, val: String, col: egui::Color32| {
+                ui.label(
+                    egui::RichText::new(format!("{tag}  {val}"))
+                        .font(mono.clone())
+                        .color(col),
+                );
+            };
+            if input.latched {
+                ui.label(
+                    egui::RichText::new("ON PAD — [Z] to launch")
+                        .font(mono.clone())
+                        .color(egui::Color32::from_rgb(140, 220, 140)),
+                );
+            }
+            row(ui, "ALT", fmt_alt(input.alt_m), c);
+            row(
+                ui,
+                "SPD",
+                format!("{:>7.1} m/s", input.surface_speed_mps),
+                c,
             );
-            ui.label(
-                egui::RichText::new(format!("SPD  {:>12.1} m/s", input.speed_mps))
-                    .font(mono.clone())
-                    .color(c),
+            row(
+                ui,
+                "ORB",
+                format!("{:>7.1} m/s", input.orbital_speed_mps),
+                dim,
             );
-            ui.label(
-                egui::RichText::new(format!("V/S  {:>12.1} m/s", input.vspeed_mps))
-                    .font(mono.clone())
-                    .color(c),
-            );
+            row(ui, "V/S", format!("{:>+7.1} m/s", input.vspeed_mps), c);
+            let hdg = if input.heading_deg.is_finite() {
+                format!("{:>7.1}°", input.heading_deg)
+            } else {
+                "    —  ".to_string()
+            };
+            row(ui, "HDG", hdg, c);
+            let pr = if input.pitch_deg.is_finite() && input.roll_deg.is_finite() {
+                format!("{:>+5.1}°/{:>+5.1}°", input.pitch_deg, input.roll_deg)
+            } else {
+                "    —  /    —  ".to_string()
+            };
+            row(ui, "P/R", pr, dim);
             ui.add(
                 egui::ProgressBar::new(input.throttle as f32)
                     .text(format!("THR  {:>5.1}%", input.throttle * 100.0))
-                    .desired_width(180.0),
+                    .desired_width(170.0),
+            );
+            row(
+                ui,
+                "PWR",
+                format!("parts {}  ·  warp ×{}", input.parts, input.warp),
+                dim,
             );
             ui.label(
-                egui::RichText::new(format!(
-                    "vessels {}  ·  debris {}",
-                    input.vessel_count, input.debris_count
-                ))
-                .font(mono.clone())
-                .color(egui::Color32::from_gray(170)),
-            );
-            ui.label(
-                egui::RichText::new(
-                    "[Z] full  [X] cut  drag: orbit  wheel: zoom  [M] map  [V] VAB",
-                )
-                .color(egui::Color32::from_gray(140)),
+                egui::RichText::new("[F1] controls  ·  [Z]/[X] throttle  ·  [M] map  [V] VAB")
+                    .color(egui::Color32::from_gray(140)),
             );
         });
+    // The navball — a raw painter draw beside the Area so it can sit
+    // dead-center-bottom like the flight instrument it is.
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::unique("flight_navball"),
+    ));
+    if input.has_vessel {
+        navball::navball(&painter, ball_center, BALL_R, &input.navball);
+        navball::heading_tape(
+            &painter,
+            ball_center + egui::vec2(0.0, BALL_R + 4.0),
+            BALL_R * 2.0,
+            input.heading_deg,
+        );
+    }
+}
+
+/// The controls-help card — a toggleable window listing every bound
+/// action *from the live [`settings::Keymap`]* (so rebinding keeps it
+/// truthful) plus the fixed mouse controls. `open` mirrors the window's
+/// close button back into the session flag.
+pub fn help_panel(ctx: &egui::Context, keymap: &settings::Keymap, open: &mut bool) {
+    let mut o = *open;
+    egui::Window::new("Controls")
+        .open(&mut o)
+        .anchor(egui::Align2::RIGHT_CENTER, egui::vec2(-12.0, 0.0))
+        .resizable(false)
+        .collapsible(false)
+        .show(ctx, |ui| {
+            ui.label("Keyboard (rebindable in Settings → Key bindings)");
+            egui::Grid::new("help_keys").num_columns(2).show(ui, |ui| {
+                for action in settings::KeyAction::ALL {
+                    let keys = keymap
+                        .bindings
+                        .get(action)
+                        .map(|v| {
+                            v.iter()
+                                .map(settings::KeyBinding::as_str)
+                                .collect::<Vec<_>>()
+                                .join(" / ")
+                        })
+                        .unwrap_or_default();
+                    ui.label(
+                        egui::RichText::new(if keys.is_empty() {
+                            "—".to_string()
+                        } else {
+                            keys
+                        })
+                        .monospace(),
+                    );
+                    ui.label(action.label());
+                    ui.end_row();
+                }
+            });
+            ui.separator();
+            ui.label("Mouse");
+            egui::Grid::new("help_mouse").num_columns(2).show(ui, |ui| {
+                for (act, desc) in [
+                    ("drag", "orbit camera"),
+                    ("wheel", "zoom"),
+                    ("click (VAB)", "select part"),
+                ] {
+                    ui.label(egui::RichText::new(act).monospace());
+                    ui.label(desc);
+                    ui.end_row();
+                }
+            });
+        });
+    *open = o;
 }
 
 // ---------------------------------------------------------------------------

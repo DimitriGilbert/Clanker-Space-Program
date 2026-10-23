@@ -15,10 +15,12 @@
 //! `SessionMirror`/`MapInput`); the type and its op channel
 //! ([`csp_ui::vab::VabAction`]) live in `csp-ui` per §2.1.
 //!
-//! The view itself is placeholder-tier per §3.7: each part renders as
-//! its resolved bounding box (`EffectivePart.size_m`) under the node's
-//! body-frame transform, depth-tested; the pick pass re-rasterizes the
-//! same boxes into an object-id texture (`csp_render::vab`).
+//! The view itself renders §3.7's kitbash tier: each part draws its
+//! classified [`crate::part_mesh::PartShape`] — a lathe of the
+//! resolved collider's silhouette, or the engine/pod override —
+//! under the node's body-frame transform, flat category-tinted with a
+//! fixed key light, depth-tested; the pick pass re-rasterizes the
+//! same vertices into an object-id texture (`csp_render::vab`).
 
 use std::collections::BTreeMap;
 
@@ -162,30 +164,29 @@ pub(crate) fn apply_vab_input(
     }
 }
 
-/// One part's render box: body-frame center + half-extents + the axis
-/// basis (columns of the node's rotation, applied per corner).
-#[derive(Clone, Copy, Debug)]
-pub struct PartBox {
+/// One part's render entry: the node's composed body-frame transform,
+/// the classified kitbash silhouette (part-local), and the category
+/// tint. `transform` plays the old `center`+`rotation` pair's role —
+/// the mesh carries part-local geometry the transform places.
+#[derive(Clone, Debug)]
+pub struct PartMesh {
     /// The node it belongs to.
     pub node: csp_phys::PartNodeId,
-    /// Body-frame center (m).
-    pub center: DVec3,
-    /// Body-frame rotation — `PartTransform::rotation` columns applied
-    /// to the half extents.
-    pub rotation: csp_phys::PartTransform,
-    /// Half-extents of the resolved bounding box (m).
-    pub half: DVec3,
+    /// Part-local → body frame (the node's composed weld transform).
+    pub transform: csp_phys::PartTransform,
+    /// The classified silhouette in part-local space.
+    pub shape: crate::part_mesh::PartShape,
     /// Linear RGBA — category-tinted; brightened when selected.
     pub color: [f32; 4],
 }
 
-/// The Presentation product: the craft's boxes in body frame +
+/// The Presentation product: the craft's part meshes in body frame +
 /// bounds. Rebuilt each VAB frame from the session's cached
 /// `body_transforms` + `analysis` (dirty-gated upstream).
 #[derive(Resource, Default)]
 pub struct VabScene {
-    /// One box per placed part, ascending id.
-    pub boxes: Vec<PartBox>,
+    /// One mesh entry per placed part, ascending id.
+    pub parts: Vec<PartMesh>,
     /// Body-frame bounding-sphere center + radius for camera framing.
     pub center: DVec3,
     /// Craft extent (m) — max corner distance from `center`.
@@ -215,17 +216,18 @@ pub(crate) fn vab_present(
     mut cam: ResMut<VabCameraF64>,
 ) {
     if !input.open {
-        scene.boxes.clear();
+        scene.parts.clear();
         cam.0.valid = false;
         return;
     }
     vab.0.recompute();
-    scene.boxes.clear();
+    scene.parts.clear();
     let sel = vab.0.selected();
-    // Resolved sizes come from the cached analysis (`size_m` is already
-    // scaled); `iter()` and `effective` share ascending-id order — the
-    // effective_index contract.
-    let sizes: BTreeMap<csp_phys::PartNodeId, DVec3> = vab
+    // The cached analysis carries each node's `EffectivePart` — the
+    // resolved collider + module list + attach nodes the silhouette
+    // classifier reads (`iter()` and `effective` share ascending-id
+    // order — the effective_index contract).
+    let effective: BTreeMap<csp_phys::PartNodeId, &csp_phys::EffectivePart> = vab
         .0
         .session()
         .iter()
@@ -236,39 +238,50 @@ pub(crate) fn vab_present(
                 .unwrap_or(&[])
                 .iter(),
         )
-        .map(|((id, _), eff)| (id, eff.size_m))
+        .map(|((id, _), eff)| (id, eff))
         .collect();
     for (id, _n) in vab.0.session().iter() {
-        let (Some(&t), Some(&sz)) = (vab.0.body_transforms().get(&id), sizes.get(&id)) else {
+        let (Some(&t), Some(&eff)) = (vab.0.body_transforms().get(&id), effective.get(&id)) else {
             continue;
         };
         let color = category_color(vab.0.def_of(id).map(|d| d.category), sel == Some(id));
-        scene.boxes.push(PartBox {
+        scene.parts.push(PartMesh {
             node: id,
-            center: t.offset,
-            rotation: t,
-            half: sz * 0.5,
+            transform: t,
+            shape: crate::part_mesh::classify_effective(eff),
             color,
         });
     }
-    // Camera framing: bounding sphere over the boxes.
-    if scene.boxes.is_empty() {
+    // Camera framing: bounding sphere over the meshes' AABBs.
+    if scene.parts.is_empty() {
         scene.center = DVec3::ZERO;
         scene.extent_m = 1.0;
     } else {
         let mut c = DVec3::ZERO;
-        for b in &scene.boxes {
-            c = c + b.center;
+        for p in &scene.parts {
+            c = c + p.transform.offset;
         }
-        c = c * (1.0 / scene.boxes.len() as f64);
+        c = c * (1.0 / scene.parts.len() as f64);
         scene.center = c;
         scene.extent_m = scene
-            .boxes
+            .parts
             .iter()
-            .map(|b| (b.center - c).norm() + b.half.norm())
+            .map(|p| {
+                let (lo, hi) = p.shape.local_aabb();
+                let mut m = 0.0_f64;
+                for x in [lo.x, hi.x] {
+                    for y in [lo.y, hi.y] {
+                        for z in [lo.z, hi.z] {
+                            let w = p.transform.apply(DVec3::new(x, y, z));
+                            m = m.max((w - c).norm());
+                        }
+                    }
+                }
+                m
+            })
             .fold(1.0_f64, f64::max);
     }
-    if !input.focused_once && !scene.boxes.is_empty() {
+    if !input.focused_once && !scene.parts.is_empty() {
         input.distance_m = (scene.extent_m * 3.0).clamp(MIN_DISTANCE_M, MAX_DISTANCE_M);
         input.focused_once = true;
     }
@@ -307,9 +320,9 @@ fn category_color(cat: Option<csp_data::PartCategory>, selected: bool) -> [f32; 
     }
 }
 
-/// `RenderExtract` schedule system: emit the `VabPacket` — box faces
-/// projected to clip space, each part's verts tagged with its 1-based
-/// pick index.
+/// `RenderExtract` schedule system: emit the `VabPacket` — the
+/// kitbash triangles projected to clip space, each part's verts
+/// tagged with its 1-based pick index.
 pub(crate) fn extract_vab(
     input: Res<VabInput>,
     scene: Res<VabScene>,
@@ -321,58 +334,55 @@ pub(crate) fn extract_vab(
         return;
     }
     let mut packet = VabPacket::default();
-    for b in &scene.boxes {
+    let mut tris = Vec::new();
+    for p in &scene.parts {
         let pick = packet.pick_ids.len() as u32 + 1;
-        packet.pick_ids.push(b.node.0);
-        emit_box(&mut packet.vertices, &cam.0, b, pick);
+        packet.pick_ids.push(p.node.0);
+        emit_part(&mut packet.vertices, &mut tris, &cam.0, p, pick);
     }
     frame.0 = Some(packet);
 }
 
-/// Push a box's 12 triangles (36 verts) into `verts`. A face whose
-/// quad has ANY corner failing projection (behind the eye plane) is
-/// dropped whole rather than clipped or clamped — at these scales the
-/// near plane never sits inside the craft in practice.
-fn emit_box(verts: &mut Vec<VabVertex>, cam: &MapCameraF64, b: &PartBox, pick: u32) {
-    let (hx, hy, hz) = (b.half.x, b.half.y, b.half.z);
-    // Local-frame corners; rotated into body frame via `apply`.
-    let locals = [
-        DVec3::new(-hx, -hy, -hz),
-        DVec3::new(hx, -hy, -hz),
-        DVec3::new(hx, hy, -hz),
-        DVec3::new(-hx, hy, -hz),
-        DVec3::new(-hx, -hy, hz),
-        DVec3::new(hx, -hy, hz),
-        DVec3::new(hx, hy, hz),
-        DVec3::new(-hx, hy, hz),
-    ];
-    let world: Vec<DVec3> = locals.iter().map(|p| b.rotation.apply(*p)).collect();
-    let clip: Vec<Option<[f32; 3]>> = world
-        .iter()
-        .map(|p| project_into(&cam.view_proj, cam.eye, *p))
-        .collect();
-    // 6 faces × 2 tris — quad corner indices.
-    const FACES: [[usize; 4]; 6] = [
-        [0, 1, 2, 3], // −z
-        [5, 4, 7, 6], // +z
-        [4, 0, 3, 7], // −x
-        [1, 5, 6, 2], // +x
-        [4, 5, 1, 0], // −y
-        [3, 2, 6, 7], // +y
-    ];
-    for f in FACES {
-        let idx = [f[0], f[1], f[2], f[0], f[2], f[3]];
-        if idx.iter().any(|i| clip[*i].is_none()) {
-            continue; // face crosses the eye plane — drop it whole
-        }
-        for i in idx {
-            if let Some(pos) = clip[i] {
-                verts.push(VabVertex {
-                    pos,
-                    color: b.color,
-                    pick,
-                });
-            }
+/// The VAB's fixed key light — a body-frame direction like the flight
+/// view's fallback sun. Per-face lambert is what makes a lathed
+/// silhouette legible under flat category colors; the pick pass never
+/// reads color, so shading cannot affect picking.
+const VAB_LIGHT: DVec3 = DVec3::new(0.4, 0.3, 0.86);
+
+/// Push one part's kitbash triangles into `verts`. A triangle with
+/// ANY corner failing projection (behind the eye plane) is dropped
+/// whole rather than clipped or clamped — the box pass's per-face
+/// rule carried over per-triangle; at these scales the near plane
+/// never sits inside the craft in practice.
+fn emit_part(
+    verts: &mut Vec<VabVertex>,
+    tris: &mut Vec<crate::part_mesh::MeshTri>,
+    cam: &MapCameraF64,
+    p: &PartMesh,
+    pick: u32,
+) {
+    tris.clear();
+    crate::part_mesh::emit(&p.shape, tris);
+    let light = {
+        let l = VAB_LIGHT;
+        l / l.norm()
+    };
+    for t in tris.iter() {
+        let world = [t.a, t.b, t.c].map(|q| p.transform.apply(q));
+        let [Some(c0), Some(c1), Some(c2)] =
+            world.map(|q| project_into(&cam.view_proj, cam.eye, q))
+        else {
+            continue; // tri crosses the eye plane — drop it whole
+        };
+        let shade = (0.55 + 0.45 * p.transform.apply_dir(t.n).dot(light).max(0.0)) as f32;
+        let color = [
+            p.color[0] * shade,
+            p.color[1] * shade,
+            p.color[2] * shade,
+            p.color[3],
+        ];
+        for pos in [c0, c1, c2] {
+            verts.push(VabVertex { pos, color, pick });
         }
     }
 }

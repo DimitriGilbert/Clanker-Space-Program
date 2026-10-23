@@ -4,9 +4,10 @@
 //! Two pipelines over one vertex stream built by `csp-view` (clip-space
 //! f32, §2.3 — this crate never sees the f64 craft frame):
 //!
-//! - **Color pass** — flat-shaded placeholder boxes (§3.7's
-//!   "placeholder primitives through M3") drawn into the app's main
-//!   pass. Depth-tested against a `Depth32Float` buffer this renderer
+//! - **Color pass** — flat-shaded kitbash part meshes (§3.7's
+//!   "silhouette-correct kitbashed parts" — the M4c floor that
+//!   replaced the through-M3 placeholder boxes) drawn into the app's
+//!   main pass. Depth-tested against a `Depth32Float` buffer this renderer
 //!   owns and the app attaches to its render pass
 //!   ([`VabRenderer::depth_view`]); reverse-Z convention like the map's
 //!   projection (z: 1 = near, 0 = far, clear 0.0, `Greater` wins).
@@ -48,7 +49,7 @@ impl VabVertex {
 /// data, no route back to session state (§2.1/§2.5).
 #[derive(Clone, Debug, Default)]
 pub struct VabPacket {
-    /// Triangle-list box faces for every placed part.
+    /// Triangle-list part-mesh faces for every placed part.
     pub vertices: Vec<VabVertex>,
     /// `pick_ids[i]` is the `PartNodeId` (as `u64`) drawn with pick
     /// index `i + 1` — the pick readback decodes through this table.
@@ -71,7 +72,7 @@ struct PickTargets {
 /// Owns the VAB pipelines, the depth texture the app's main pass
 /// attaches, and the offscreen object-id target + readback buffer.
 pub struct VabRenderer {
-    /// Boxes → the surface (depth-tested).
+    /// Part meshes → the surface (depth-tested).
     pipeline: wgpu::RenderPipeline,
     /// Object-id rasterization → `pick.color`.
     pick_pipeline: wgpu::RenderPipeline,
@@ -116,7 +117,7 @@ impl VabRenderer {
         };
         let primitive = wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
-            cull_mode: None, // authored placeholder boxes, not closed meshes
+            cull_mode: None, // kitbash meshes are not guaranteed closed
             ..Default::default()
         };
         let mk_pipeline = |label, fragment: wgpu::FragmentState<'_>| {
@@ -201,7 +202,7 @@ impl VabRenderer {
         &self.depth_view
     }
 
-    /// Upload the packet's vertices and draw the box pass into `pass`.
+    /// Upload the packet's vertices and draw the part pass into `pass`.
     pub fn draw(
         &mut self,
         pass: &mut wgpu::RenderPass<'_>,

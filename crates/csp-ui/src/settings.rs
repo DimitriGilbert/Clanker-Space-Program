@@ -207,6 +207,10 @@ pub enum KeyAction {
     PanLeft,
     /// Camera pan right (map and VAB).
     PanRight,
+    /// Toggle the controls-help card.
+    ToggleHelp,
+    /// Toggle the dev debug panel (adapter/tick internals).
+    ToggleDebug,
 }
 
 impl KeyAction {
@@ -224,6 +228,8 @@ impl KeyAction {
         Self::PanDown,
         Self::PanLeft,
         Self::PanRight,
+        Self::ToggleHelp,
+        Self::ToggleDebug,
     ];
 
     /// The panel label.
@@ -241,6 +247,8 @@ impl KeyAction {
             Self::PanDown => "pan down",
             Self::PanLeft => "pan left",
             Self::PanRight => "pan right",
+            Self::ToggleHelp => "controls help",
+            Self::ToggleDebug => "debug panel",
         }
     }
 
@@ -365,6 +373,8 @@ impl Default for Keymap {
                 (KeyAction::PanDown, b(&["s", "arrow-down"])),
                 (KeyAction::PanLeft, b(&["a", "arrow-left"])),
                 (KeyAction::PanRight, b(&["d", "arrow-right"])),
+                (KeyAction::ToggleHelp, b(&["f1", "?"])),
+                (KeyAction::ToggleDebug, b(&["f3"])),
             ]),
         }
     }

@@ -632,16 +632,25 @@ pub struct VabUiOutput {
     /// The M4c launch button — spawn the working craft on the pad
     /// and switch to the flight view.
     pub launch: bool,
+    /// Net warp-ladder steps from the top bar's −/+ buttons (the
+    /// `DebugPanelOutput::warp_step` channel moved here when the
+    /// scaffold panel became dev-gated).
+    pub warp_step: i32,
     /// The M10 "Tutorial" button — re-open the first-flight checklist.
     /// Session state lives in `csp-view`, so this is folded back into
     /// the tutorial resource inside `build_ui`, not the app outbox.
     pub tutorial: bool,
+    /// The "Help" button — toggle the controls card. Same fold-back
+    /// convention as `tutorial` (the flag lives in `csp-view`).
+    pub help: bool,
 }
 
-/// The mode bar — always-present top strip with the three view modes.
-/// Emits [`ModeSelect`] into the outbox; `csp-app` maps it to
-/// `View::set_mode`.
-pub fn top_bar(ctx: &egui::Context, current: ModeSelect, out: &mut VabUiOutput) {
+/// The mode bar — always-present top strip with the three view modes,
+/// the warp readout (the player-visible half of the old debug panel —
+/// its buttons ride the `warp_step` outbox), and the Tutorial/Help
+/// affordances. Emits [`ModeSelect`] into the outbox; `csp-app` maps
+/// it to `View::set_mode`.
+pub fn top_bar(ctx: &egui::Context, current: ModeSelect, warp: u32, out: &mut VabUiOutput) {
     egui::Window::new("mode_bar")
         .title_bar(false)
         .anchor(egui::Align2::LEFT_TOP, egui::vec2(0.0, 0.0))
@@ -667,11 +676,28 @@ pub fn top_bar(ctx: &egui::Context, current: ModeSelect, out: &mut VabUiOutput) 
                     out.launch = true;
                 }
                 ui.separator();
+                // The warp readout stays player-visible now that the
+                // debug panel is dev-gated; [,]/[.] step the ladder.
+                ui.label(
+                    egui::RichText::new(format!("warp ×{warp}"))
+                        .color(egui::Color32::from_gray(200)),
+                );
+                if ui.small_button("−").clicked() {
+                    out.warp_step -= 1;
+                }
+                if ui.small_button("+").clicked() {
+                    out.warp_step += 1;
+                }
+                ui.separator();
                 // M10: re-open the first-flight checklist — session
                 // state folded back into the tutorial resource inside
                 // `build_ui` (the checklist never rides the app outbox).
                 if ui.button("Tutorial").clicked() {
                     out.tutorial = true;
+                }
+                // The controls card — same fold-back convention.
+                if ui.button("? Help").clicked() {
+                    out.help = true;
                 }
             });
         });

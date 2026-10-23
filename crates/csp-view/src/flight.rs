@@ -1,6 +1,6 @@
 //! M4c near-flight view — PLAN §3.7's presentation floor over the
 //! real sim: the InBubble craft (and its breakup debris) rendered as
-//! hull boxes, a ground disc and horizon band for the planet, an
+//! silhouette-correct kitbash part meshes ([`crate::part_mesh`]), an
 //! engine plume, a **reentry plasma sheath** driven by the sim's own
 //! convective-heating flux sample, **ground-contact dust**, and the
 //! HUD mirrors. Same §2.5 schedule shape as the map and VAB:
@@ -125,16 +125,26 @@ pub struct FlightEnv {
     /// direction maps to the inertial bubble frame as
     /// `R(spin_axis, spin_phase)·fixed`. `0` when `body_spin` is zero.
     pub spin_phase: f64,
+    /// The body's angular velocity vector (bubble frame, rad/s) —
+    /// the HUD's surface-relative speed and the navball's level frame
+    /// both need `ω × (com − body_center)`, not just the phase.
+    pub body_spin: DVec3,
 }
 
-/// One hull's axis-aligned box, body frame — the craft's render
-/// silhouette at M4c.
-#[derive(Clone, Copy, Debug)]
-pub struct FlightBox {
-    /// AABB min corner, body frame.
+/// One part's staged render data — the §3.7 kitbash silhouette plus
+/// the collider bounds the sheath/dust VFX still measure against.
+#[derive(Clone, Debug)]
+pub struct FlightPart {
+    /// Body-frame AABB min corner of the part's collider (plasma
+    /// sheath + dust extent — the honest contact/glow bounds).
     pub lo: DVec3,
-    /// AABB max corner, body frame.
+    /// Body-frame AABB max corner.
     pub hi: DVec3,
+    /// Part-local → body frame (the graph node's composed transform —
+    /// the same fold the weld ran).
+    pub transform: csp_phys::PartTransform,
+    /// The classified silhouette in part-local space.
+    pub shape: crate::part_mesh::PartShape,
 }
 
 /// One InBubble vessel's staged render data.
@@ -161,12 +171,19 @@ pub struct FlightBody {
     pub plasma_w_m2: f64,
     /// Live part-graph node count — the staging/jettison SFX edge.
     pub nodes: usize,
-    /// Per-part hull AABBs, body frame.
-    pub boxes: Vec<FlightBox>,
+    /// Per-part render entries (silhouette + collider bounds),
+    /// ascending `PartNodeId` — the M4c box tier's hull AABBs carried
+    /// forward as `lo`/`hi` on each part.
+    pub parts: Vec<FlightPart>,
     /// Thrust sites `(local_pos, local_dir)` — plume emitters.
     pub plumes: Vec<(DVec3, DVec3)>,
     /// World-frame CoM (camera focus + HUD altitude).
     pub com: DVec3,
+    /// `true` for a §2.6.4 surface-latched vessel — staged with its
+    /// restored inertial pose (a parked craft stays visible and
+    /// focusable; a throttle command unlatches it). Its `vel` is the
+    /// co-rotation velocity the restore reproduces.
+    pub latched: bool,
 }
 
 /// What `end_frame` stages out of the sim for the flight view.
@@ -194,16 +211,49 @@ pub struct FlightUiData {
     /// Focused vessel exists.
     pub has_vessel: bool,
     /// Focused vessel id (for throttle commands), `None` otherwise.
+    /// Includes a surface-latched pad vessel — `SetThrottle` unlatches
+    /// it (the sim's §2.6.4 control rule).
     pub focus: Option<u64>,
+    /// The focused vessel is surface-latched (parked on rails) — the
+    /// HUD reads "PAD" and the instruments show rest.
+    pub latched: bool,
     /// Altitude above surface (m).
     pub alt_m: f64,
-    /// CoM speed (m/s).
-    pub speed_mps: f64,
-    /// Vertical speed (m/s).
+    /// Surface-relative CoM speed (m/s) — `‖v − ω × r‖`: what "speed
+    /// over the ground" means. ~0 for a parked craft, NOT the ~175 m/s
+    /// co-rotation the inertial frame carries on a spinning world.
+    pub surface_speed_mps: f64,
+    /// Inertial CoM speed (m/s) — the "orbital" readout.
+    pub orbital_speed_mps: f64,
+    /// Vertical speed (m/s), radial component of the inertial velocity
+    /// (the `ω × r` term is horizontal, so this is identical
+    /// surface-relative).
     pub vspeed_mps: f64,
     /// Throttle [0,1].
     pub throttle: f64,
-    /// Total vessels in the world.
+    /// Live part count of the focused vessel — the staging readout.
+    pub parts: usize,
+    /// Compass heading of the nose (deg, 0–360, NaN while undefined —
+    /// e.g. pointing straight up).
+    pub heading_deg: f64,
+    /// Nose pitch above the horizon (deg).
+    pub pitch_deg: f64,
+    /// Roll about the nose axis (deg) — 0 when the craft's dorsal +Y
+    /// points "up-ish".
+    pub roll_deg: f64,
+    /// Navball: local up expressed in the focused vessel's *body* frame
+    /// (`rot⁻¹·û`, unit). `[0,0,0]` when there is no reference (no
+    /// vessel / degenerate radius).
+    pub nav_up: [f64; 3],
+    /// Navball: local level north in body frame (unit; falls back to
+    /// the projection of world +Z, then +X).
+    pub nav_north: [f64; 3],
+    /// Navball: local level east in body frame (`n̂ × û`).
+    pub nav_east: [f64; 3],
+    /// Navball: surface-relative prograde in body frame (unit) —
+    /// `None` while the vessel is surface-stationary (parked).
+    pub nav_prograde: Option<[f64; 3]>,
+    /// Total vessels in the world (bubble + latched).
     pub vessel_count: usize,
     /// Debris-flagged vessels.
     pub debris_count: usize,
@@ -237,6 +287,8 @@ struct SfxPrev {
     vessels: usize,
     /// Focused vessel's contact flag — the touchdown edge.
     contact: bool,
+    /// Focused vessel is surface-latched — the landing edge.
+    latched: bool,
 }
 
 /// §3.7's "basic SFX" as a visual cue channel (module docs carry the
@@ -318,16 +370,113 @@ pub fn capture_sync_input(sim: &World) -> FlightSyncInput {
             sun_dir: sun_direction(sim),
             spin_axis,
             spin_phase,
+            body_spin: e.body_spin,
         }
     });
+    let env_ref = sim.environment();
     let mut vessels = Vec::new();
     for (id, vessel) in sim.vessels() {
-        let VesselState::InBubble(body) = &vessel.state else {
-            continue;
-        };
-        let boxes = body
-            .collider
-            .hulls
+        match &vessel.state {
+            VesselState::InBubble(body) => {
+                let parts = vessel_parts(vessel.craft.as_ref(), &body.collider.hulls);
+                let plumes = body
+                    .force_sites
+                    .iter()
+                    .filter(|s| s.kind == csp_phys::ForceSiteKind::Thrust)
+                    .map(|s| (s.local_pos, s.local_dir))
+                    .collect();
+                // §3.7's plasma driver: the per-area convective input the
+                // M4b thermal tick itself integrates — same `flow_sample`,
+                // same `v_rel`, so the glow tracks the sim's heating, not
+                // a lookalike.
+                let plasma_w_m2 = env_ref.map_or(0.0, |e| {
+                    let flow = csp_phys::flow_sample(e, body);
+                    csp_phys::CONVECTIVE_HEAT_FRACTION
+                        * 0.5
+                        * flow.density_kg_m3
+                        * flow.speed_mps.powi(3)
+                });
+                vessels.push(FlightBody {
+                    id: id.0,
+                    pos: body.pos,
+                    rot: body.rot,
+                    vel: body.vel,
+                    throttle: body.throttle,
+                    debris: vessel.debris_since.is_some(),
+                    contact: sim.ground_contact(*id),
+                    plasma_w_m2,
+                    nodes: vessel.craft.as_ref().map_or(0, |c| c.graph.nodes.len()),
+                    parts,
+                    plumes,
+                    com: body.com_world(),
+                    latched: false,
+                });
+            }
+            // §2.6.4 surface rails: a latched vessel is still *on the
+            // pad* — stage its restored inertial pose so the parked
+            // craft stays rendered and focusable (the throttle command
+            // the HUD targets unlatches it). The restore needs the
+            // environment; without one the record is uninterpretable —
+            // skip honestly rather than guess a pose.
+            VesselState::SurfaceLatched(pose) => {
+                let (Some(env), Some(craft)) = (env_ref, vessel.craft.as_ref()) else {
+                    continue;
+                };
+                let (pos, rot, vel, _ang_vel) =
+                    csp_sim::bubble::surface_pose_restore(env, pose, sim.clock());
+                // The pose record stores no collider — re-weld the craft
+                // for the render data (the §7.3 re-derived-on-load
+                // convention; cheap at craft scale).
+                let Ok(welded) = csp_phys::weld(&craft.graph, &craft.parts) else {
+                    continue;
+                };
+                let plumes = welded
+                    .force_sites
+                    .iter()
+                    .filter(|s| s.kind == csp_phys::ForceSiteKind::Thrust)
+                    .map(|s| (s.local_pos, s.local_dir))
+                    .collect();
+                vessels.push(FlightBody {
+                    id: id.0,
+                    pos,
+                    rot,
+                    vel,
+                    throttle: 0.0,
+                    debris: vessel.debris_since.is_some(),
+                    // Parked, not impacting — the dust puff reads as a
+                    // touchdown event, not a resting state.
+                    contact: false,
+                    plasma_w_m2: 0.0,
+                    nodes: craft.graph.nodes.len(),
+                    parts: vessel_parts(vessel.craft.as_ref(), &welded.collider.hulls),
+                    plumes,
+                    com: pos + rot.rotate(welded.com_local),
+                    latched: true,
+                });
+            }
+            VesselState::OnRails(_) => {}
+        }
+    }
+    FlightSyncInput { env, vessels }
+}
+
+/// One vessel's per-part render entries — the §3.7 kitbash upgrade
+/// over the M4c hull-AABB stream. Each graph node contributes its
+/// classified silhouette, its composed body-frame transform (the
+/// same `PartTransform::compose` fold the weld ran), and the collider
+/// AABB the sheath/dust VFX bound against.
+///
+/// A body whose craft data does not stage — an elements-only vessel
+/// with `craft: None`, or a graph `body_transforms` rejects — keeps
+/// the box-tier rendering over its collider hulls: degraded, never
+/// absent (the §2.13 honest-channel precedent: `log::warn` on the
+/// typed-error branch).
+fn vessel_parts(
+    craft: Option<&csp_sim::CraftDef>,
+    hulls: &[csp_phys::ConvexHull],
+) -> Vec<FlightPart> {
+    let fallback = || {
+        hulls
             .iter()
             .map(|h| {
                 let mut lo = DVec3::new(f64::MAX, f64::MAX, f64::MAX);
@@ -336,38 +485,53 @@ pub fn capture_sync_input(sim: &World) -> FlightSyncInput {
                     lo = DVec3::new(lo.x.min(v.x), lo.y.min(v.y), lo.z.min(v.z));
                     hi = DVec3::new(hi.x.max(v.x), hi.y.max(v.y), hi.z.max(v.z));
                 }
-                FlightBox { lo, hi }
+                let center = (lo + hi) * 0.5;
+                let half = (hi - lo) * 0.5;
+                FlightPart {
+                    lo,
+                    hi,
+                    transform: csp_phys::PartTransform::new(center, csp_core::DQuat::IDENTITY),
+                    shape: crate::part_mesh::PartShape::Box {
+                        lo: center - half,
+                        hi: center + half,
+                    },
+                }
             })
-            .collect();
-        let plumes = body
-            .force_sites
-            .iter()
-            .filter(|s| s.kind == csp_phys::ForceSiteKind::Thrust)
-            .map(|s| (s.local_pos, s.local_dir))
-            .collect();
-        // §3.7's plasma driver: the per-area convective input the M4b
-        // thermal tick itself integrates — same `flow_sample`, same
-        // `v_rel`, so the glow tracks the sim's heating, not a lookalike.
-        let plasma_w_m2 = sim.environment().map_or(0.0, |e| {
-            let flow = csp_phys::flow_sample(e, body);
-            csp_phys::CONVECTIVE_HEAT_FRACTION * 0.5 * flow.density_kg_m3 * flow.speed_mps.powi(3)
-        });
-        vessels.push(FlightBody {
-            id: id.0,
-            pos: body.pos,
-            rot: body.rot,
-            vel: body.vel,
-            throttle: body.throttle,
-            debris: vessel.debris_since.is_some(),
-            contact: sim.ground_contact(*id),
-            plasma_w_m2,
-            nodes: vessel.craft.as_ref().map_or(0, |c| c.graph.nodes.len()),
-            boxes,
-            plumes,
-            com: body.com_world(),
+            .collect()
+    };
+    let Some(craft) = craft else {
+        return fallback();
+    };
+    let Ok(transforms) = csp_phys::weld::body_transforms(&craft.graph, &craft.parts) else {
+        log::warn!("flight: craft graph failed body_transforms — boxing hulls");
+        return fallback();
+    };
+    let mut parts = Vec::with_capacity(craft.graph.nodes.len());
+    for (id, node) in &craft.graph.nodes {
+        let (Some(wp), Some(&t)) = (
+            craft.parts.get(node.effective_index as usize),
+            transforms.get(id),
+        ) else {
+            continue;
+        };
+        // The part's body-frame collider AABB — same corners the
+        // weld's hull carries, recomputed from the collider vertex
+        // set so the `part_index` map needn't be trusted.
+        let mut lo = DVec3::new(f64::MAX, f64::MAX, f64::MAX);
+        let mut hi = DVec3::new(-f64::MAX, -f64::MAX, -f64::MAX);
+        for v in wp.collider.vertices() {
+            let w = t.apply(v);
+            lo = DVec3::new(lo.x.min(w.x), lo.y.min(w.y), lo.z.min(w.z));
+            hi = DVec3::new(hi.x.max(w.x), hi.y.max(w.y), hi.z.max(w.z));
+        }
+        parts.push(FlightPart {
+            lo,
+            hi,
+            transform: t,
+            shape: crate::part_mesh::classify_weld_part(wp),
         });
     }
-    FlightSyncInput { env, vessels }
+    if parts.is_empty() { fallback() } else { parts }
 }
 
 /// `Input` schedule — drain camera events into `FlightInput`.
@@ -418,6 +582,7 @@ pub(crate) fn flight_present(
         debris: ui.debris_count,
         vessels: snap.vessels.len(),
         contact: f.contact,
+        latched: f.latched,
     });
     match (sfx.prev, cur) {
         (Some(p), Some(c)) => {
@@ -438,6 +603,13 @@ pub(crate) fn flight_present(
                 }
                 if c.contact && !p.contact {
                     push("CONTACT");
+                }
+                // §2.6.4: the settle → surface-rails transition — the
+                // "parked on the pad" edge.
+                if c.latched && !p.latched {
+                    push("LANDED — SURFACE RAILS");
+                } else if !c.latched && p.latched {
+                    push("LIFTOFF");
                 }
             }
             if c.debris > p.debris {
@@ -484,14 +656,102 @@ pub(crate) fn flight_present(
     );
     ui.has_vessel = true;
     ui.focus = Some(focus.id);
-    ui.speed_mps = focus.vel.norm();
+    ui.latched = focus.latched;
+    ui.orbital_speed_mps = focus.vel.norm();
     ui.throttle = focus.throttle;
+    ui.parts = focus.nodes;
+    ui.nav_up = [0.0; 3];
+    ui.nav_north = [0.0; 3];
+    ui.nav_east = [0.0; 3];
+    ui.nav_prograde = None;
+    ui.heading_deg = f64::NAN;
+    ui.pitch_deg = f64::NAN;
+    ui.roll_deg = f64::NAN;
+    ui.surface_speed_mps = 0.0;
     if let Some(env) = snap.env.as_ref() {
         let rel = focus.com - env.body_center;
         let r = rel.norm();
-        ui.alt_m = r - env.radius_m;
-        ui.vspeed_mps = if r > 0.0 { focus.vel.dot(rel / r) } else { 0.0 };
+        if r > 0.0 {
+            ui.alt_m = r - env.radius_m;
+            ui.vspeed_mps = focus.vel.dot(rel / r);
+            stage_attitude(&mut ui, env, focus, rel / r);
+        }
     }
+}
+
+/// The attitude/velocity half of the HUD mirrors: surface-relative
+/// speed, the heading/pitch/roll readouts, and the navball's
+/// body-frame direction set (up, north, east, prograde). `up` is the
+/// unit radial at the CoM. All presentation-side derivation off the
+/// staged snapshot — no sim reads here (§2.5).
+fn stage_attitude(ui: &mut FlightUiData, env: &FlightEnv, focus: &FlightBody, up: DVec3) {
+    // The level frame at the CoM: north is the spin axis projected on
+    // the horizon plane (world +Z for a non-rotating or equatorial
+    // degenerate), east completes it. Above the poles the projection
+    // collapses — fall back deterministically.
+    let mut north = env.spin_axis - up * env.spin_axis.dot(up);
+    if north.norm_squared() < 1.0e-12 {
+        north = DVec3::Z - up * up.z;
+        if north.norm_squared() < 1.0e-12 {
+            north = DVec3::X - up * up.x;
+        }
+    }
+    let north = north / north.norm();
+    let east = north.cross(up);
+
+    // Surface-relative velocity — the inertial velocity minus the
+    // co-rotation term `ω × r` (the same `v_rel` the bubble's aero and
+    // contact solves measure against).
+    let v_rel = focus.vel - env.body_spin.cross(rel_of(focus, env));
+    let v_surf = v_rel.norm();
+    ui.surface_speed_mps = v_surf;
+    if v_surf > 0.1 {
+        let p = v_rel / v_surf;
+        ui.nav_prograde = Some(into_arr(focus.rot.conjugate().rotate(p)));
+    }
+
+    // Attitude: nose is the stack axis (body +Z — the VAB's build
+    // direction); dorsal is +Y. Readouts in degrees.
+    let nose = focus.rot.rotate(DVec3::Z);
+    ui.pitch_deg = up.dot(nose).clamp(-1.0, 1.0).asin().to_degrees();
+    let nose_level = nose - up * up.dot(nose);
+    if nose_level.norm_squared() > 1.0e-6 {
+        let h = nose_level / nose_level.norm();
+        ui.heading_deg = h
+            .dot(east)
+            .atan2(h.dot(north))
+            .to_degrees()
+            .rem_euclid(360.0);
+    }
+    // Roll about the nose axis: signed angle from "up projected ⊥
+    // nose" to "dorsal projected ⊥ nose".
+    let dorsal = focus.rot.rotate(DVec3::Y);
+    let up_perp = up - nose * up.dot(nose);
+    let dorsal_perp = dorsal - nose * dorsal.dot(nose);
+    if up_perp.norm_squared() > 1.0e-6 && dorsal_perp.norm_squared() > 1.0e-6 {
+        let a = up_perp / up_perp.norm();
+        let b = dorsal_perp / dorsal_perp.norm();
+        ui.roll_deg = a.cross(b).dot(nose).atan2(a.dot(b)).to_degrees();
+    }
+
+    // Navball vectors in body frame — the widget rotates the world
+    // under the fixed nose reticle.
+    let conj = focus.rot.conjugate();
+    ui.nav_up = into_arr(conj.rotate(up));
+    ui.nav_north = into_arr(conj.rotate(north));
+    ui.nav_east = into_arr(conj.rotate(east));
+}
+
+/// `focus.com − env.body_center` (the radial lever arm) — factored so
+/// `flight_present` and `stage_attitude` agree on one expression.
+fn rel_of(focus: &FlightBody, env: &FlightEnv) -> DVec3 {
+    focus.com - env.body_center
+}
+
+/// `[x, y, z]` — the plain-data mirror `csp-ui` consumes (§2.1's
+/// dependency rule keeps csp-core types out of the panel layer).
+fn into_arr(v: DVec3) -> [f64; 3] {
+    [v.x, v.y, v.z]
 }
 
 /// `RenderExtract` — emit the scene's clip-space triangles + the R2
@@ -550,18 +810,18 @@ pub(crate) fn extract_flight(
     }
     let vp = &cam.view_proj;
     let eye = cam.eye;
-    let mut emit = |world: DVec3, color: [f32; 4]| -> Option<[f32; 3]> {
-        let ndc = project_into(vp, eye, world)?;
-        v.push(csp_render::flight::FlightVertex { pos: ndc, color });
-        Some(ndc)
+    let emit = |v: &mut Vec<csp_render::flight::FlightVertex>, world: DVec3, color: [f32; 4]| {
+        if let Some(ndc) = project_into(vp, eye, world) {
+            v.push(csp_render::flight::FlightVertex { pos: ndc, color });
+        }
     };
 
     // R2: the quadtree terrain + ocean in `packet.terrain` replaced
     // M4c's flat ground disc — nothing else to emit for the surface.
 
-    // Craft: per-hull boxes, flat lambert shading against the staged
-    // sun direction (the same vector that lights the terrain);
-    // debris tints orange.
+    // Craft: per-part kitbash silhouettes, flat lambert shading
+    // against the staged sun direction (the same vector that lights
+    // the terrain); debris tints orange.
     let sun = snap
         .env
         .as_ref()
@@ -571,8 +831,8 @@ pub(crate) fn extract_flight(
             let s = DVec3::new(0.4, 0.3, 0.86);
             s / s.norm()
         });
-    // Box corner indices per face — hull shells and the plasma sheath
-    // share the table.
+    // Box corner indices per face — the plasma sheath still emits the
+    // collider AABBs, so the table stays for it (and the dust extent).
     const FACES: [([usize; 4], DVec3); 6] = [
         ([0, 1, 2, 3], DVec3::new(0.0, 0.0, -1.0)),
         ([5, 4, 7, 6], DVec3::new(0.0, 0.0, 1.0)),
@@ -581,37 +841,31 @@ pub(crate) fn extract_flight(
         ([3, 2, 6, 7], DVec3::new(0.0, 1.0, 0.0)),
         ([4, 5, 1, 0], DVec3::new(0.0, -1.0, 0.0)),
     ];
+    let mut tris = Vec::new();
     for b in &snap.vessels {
         let base: [f32; 4] = if b.debris {
             [0.85, 0.45, 0.2, 1.0]
         } else {
             [0.75, 0.8, 0.88, 1.0]
         };
-        for bx in &b.boxes {
-            let corners: [DVec3; 8] = [
-                DVec3::new(bx.lo.x, bx.lo.y, bx.lo.z),
-                DVec3::new(bx.hi.x, bx.lo.y, bx.lo.z),
-                DVec3::new(bx.hi.x, bx.hi.y, bx.lo.z),
-                DVec3::new(bx.lo.x, bx.hi.y, bx.lo.z),
-                DVec3::new(bx.lo.x, bx.lo.y, bx.hi.z),
-                DVec3::new(bx.hi.x, bx.lo.y, bx.hi.z),
-                DVec3::new(bx.hi.x, bx.hi.y, bx.hi.z),
-                DVec3::new(bx.lo.x, bx.hi.y, bx.hi.z),
-            ];
-            for (idx, n_b) in FACES {
-                let n_w = b.rot.rotate(n_b);
+        for p in &b.parts {
+            tris.clear();
+            crate::part_mesh::emit(&p.shape, &mut tris);
+            for t in tris.iter() {
+                // A tri with any corner behind the eye plane drops
+                // whole — the same all-or-nothing rule the VAB packet
+                // uses — rather than emitting a corrupted fan.
+                let [Some(c0), Some(c1), Some(c2)] = [t.a, t.b, t.c]
+                    .map(|q| project_into(vp, eye, b.pos + b.rot.rotate(p.transform.apply(q))))
+                else {
+                    continue;
+                };
+                let n_w = b.rot.rotate(p.transform.apply_dir(t.n));
                 let shade = (0.45 + 0.55 * n_w.dot(sun).max(0.0)) as f32;
                 let color = [base[0] * shade, base[1] * shade, base[2] * shade, base[3]];
-                let w: Vec<DVec3> = idx
-                    .iter()
-                    .map(|&i| b.pos + b.rot.rotate(corners[i]))
-                    .collect();
-                emit(w[0], color);
-                emit(w[1], color);
-                emit(w[2], color);
-                emit(w[0], color);
-                emit(w[2], color);
-                emit(w[3], color);
+                for pos in [c0, c1, c2] {
+                    v.push(csp_render::flight::FlightVertex { pos, color });
+                }
             }
         }
         // Engine plume: a cone fan along −local_dir per thrust site.
@@ -645,9 +899,9 @@ pub(crate) fn extract_flight(
                     );
                     let q0 = base_p + u1 * (a0.cos() * r) + u2 * (a0.sin() * r);
                     let q1 = base_p + u1 * (a1.cos() * r) + u2 * (a1.sin() * r);
-                    emit(tip, col);
-                    emit(q0, col);
-                    emit(q1, col);
+                    emit(v, tip, col);
+                    emit(v, q0, col);
+                    emit(v, q1, col);
                 }
             }
         }
@@ -670,9 +924,9 @@ pub(crate) fn extract_flight(
                 (0.12 + 0.5 * plasma_i) as f32,
             ];
             let d = DVec3::new(m, m, m);
-            for bx in &b.boxes {
-                let lo = bx.lo - d;
-                let hi = bx.hi + d;
+            for p in &b.parts {
+                let lo = p.lo - d;
+                let hi = p.hi + d;
                 let corners: [DVec3; 8] = [
                     DVec3::new(lo.x, lo.y, lo.z),
                     DVec3::new(hi.x, lo.y, lo.z),
@@ -688,12 +942,12 @@ pub(crate) fn extract_flight(
                         .iter()
                         .map(|&i| b.pos + b.rot.rotate(corners[i]))
                         .collect();
-                    emit(w[0], col);
-                    emit(w[1], col);
-                    emit(w[2], col);
-                    emit(w[0], col);
-                    emit(w[2], col);
-                    emit(w[3], col);
+                    emit(v, w[0], col);
+                    emit(v, w[1], col);
+                    emit(v, w[2], col);
+                    emit(v, w[0], col);
+                    emit(v, w[2], col);
+                    emit(v, w[3], col);
                 }
             }
         }
@@ -706,16 +960,16 @@ pub(crate) fn extract_flight(
             let mut low = b.com;
             let mut low_alt = f64::MAX;
             let mut extent = 1.0_f64;
-            for bx in &b.boxes {
+            for p in &b.parts {
                 for c in [
-                    DVec3::new(bx.lo.x, bx.lo.y, bx.lo.z),
-                    DVec3::new(bx.hi.x, bx.lo.y, bx.lo.z),
-                    DVec3::new(bx.hi.x, bx.hi.y, bx.lo.z),
-                    DVec3::new(bx.lo.x, bx.hi.y, bx.lo.z),
-                    DVec3::new(bx.lo.x, bx.lo.y, bx.hi.z),
-                    DVec3::new(bx.hi.x, bx.lo.y, bx.hi.z),
-                    DVec3::new(bx.hi.x, bx.hi.y, bx.hi.z),
-                    DVec3::new(bx.lo.x, bx.hi.y, bx.hi.z),
+                    DVec3::new(p.lo.x, p.lo.y, p.lo.z),
+                    DVec3::new(p.hi.x, p.lo.y, p.lo.z),
+                    DVec3::new(p.hi.x, p.hi.y, p.lo.z),
+                    DVec3::new(p.lo.x, p.hi.y, p.lo.z),
+                    DVec3::new(p.lo.x, p.lo.y, p.hi.z),
+                    DVec3::new(p.hi.x, p.lo.y, p.hi.z),
+                    DVec3::new(p.hi.x, p.hi.y, p.hi.z),
+                    DVec3::new(p.lo.x, p.hi.y, p.hi.z),
                 ] {
                     let w = b.pos + b.rot.rotate(c);
                     extent = extent.max((w - b.pos).norm());
@@ -758,9 +1012,9 @@ pub(crate) fn extract_flight(
                 );
                 let p0 = base + t1 * (a0.cos() * dust_r) + t2 * (a0.sin() * dust_r);
                 let p1 = base + t1 * (a1.cos() * dust_r) + t2 * (a1.sin() * dust_r);
-                emit(base, col);
-                emit(p0, col);
-                emit(p1, col);
+                emit(v, base, col);
+                emit(v, p0, col);
+                emit(v, p1, col);
             }
         }
     }

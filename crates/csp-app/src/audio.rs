@@ -81,6 +81,10 @@ fn cue_shot(text: &str) -> Option<OneShot> {
         "ENGINE CUT" => Some(OneShot::EngineCut),
         "STAGE — PART JETTISONED" => Some(OneShot::StageJettison),
         "CONTACT" => Some(OneShot::Contact),
+        // §2.6.4 latch/unlatch edges — touchdown thump and the
+        // launch rumble.
+        "LANDED — SURFACE RAILS" => Some(OneShot::Contact),
+        "LIFTOFF" => Some(OneShot::EngineIgnition),
         "BREAKUP" => Some(OneShot::Breakup),
         "DEBRIS IMPACT" => Some(OneShot::DebrisImpact),
         "VESSEL REMOVED" => Some(OneShot::VesselRemoved),
@@ -481,6 +485,8 @@ mod tests {
             "ENGINE CUT",
             "STAGE — PART JETTISONED",
             "CONTACT",
+            "LANDED — SURFACE RAILS",
+            "LIFTOFF",
             "BREAKUP",
             "DEBRIS IMPACT",
             "VESSEL REMOVED",
@@ -591,9 +597,10 @@ mod tests {
                 contact: false,
                 plasma_w_m2: 4.0e4,
                 nodes: 3,
-                boxes: Vec::new(),
+                parts: Vec::new(),
                 plumes: Vec::new(),
                 com: csp_core::DVec3::ZERO,
+                latched: false,
             }],
             env: None,
         };

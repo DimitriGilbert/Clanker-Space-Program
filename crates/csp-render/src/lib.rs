@@ -16,7 +16,7 @@ pub mod terrain;
 
 /// The M3 VAB craft view + GPU picking (PLAN M3 exit row "GPU picking",
 /// §9 "Editor viewport is `csp-render` + GPU picking"): a depth-tested
-/// placeholder-box pass over a `csp-view`-built [`vab::VabPacket`], plus
+/// kitbash part pass over a `csp-view`-built [`vab::VabPacket`], plus
 /// an offscreen object-id pass whose single-pixel readback resolves the
 /// part under the cursor.
 pub mod vab;

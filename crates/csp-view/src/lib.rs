@@ -32,6 +32,12 @@ pub mod terrain;
 /// view's scene/camera/packet, and the GPU-pick event plumbing.
 pub mod vab;
 
+/// The M4c kitbash tier (PLAN §3.7 "silhouette-correct kitbashed
+/// parts"): per-part procedural meshes — the collider-profile lathe
+/// and the engine/pod overrides — shared by the VAB and flight packet
+/// producers.
+pub mod part_mesh;
+
 /// The §6.3 web-demo tier: the embedded reduced `data/` set and the
 /// fixed demo-scenario seed (Terrin only, ≤60 parts, no save
 /// import/export). The wasm `View::new` builds exactly this; the module
@@ -43,6 +49,13 @@ pub mod demo;
 /// schedule system folding staged mirrors into the checklist's
 /// progress predicates (the model lives in `csp_ui::tutorial`).
 pub mod tutorial;
+
+/// Pad-spawn clearance (m): the lowest collider vertex starts this far
+/// above the datum. Kept at zero — a nonzero drop, even centimetres,
+/// reads as a one-tick `Δv/dt` load spike and fails weak joints (the
+/// shipped "PART JETTISONED at t≈2 s" bug); resting exactly on the
+/// contact sphere means the solver holds the craft from tick one.
+const PAD_CLEARANCE_M: f64 = 0.0;
 
 /// The app's view mode — flight, map, or the VAB editor. Session
 /// state (§2.2-C): never sim state, never logged, never hashed.
@@ -111,6 +124,18 @@ impl Default for WarpMirror {
     fn default() -> Self {
         Self(1)
     }
+}
+
+/// Session toggles for the player-optional panels (§2.2-C session
+/// data — never sim state): the M0 debug scaffold (adapter/tick
+/// internals — dev-facing, off by default) and the controls-help card
+/// (off by default; `ToggleHelp` key or the top-bar button).
+#[derive(Resource, Default)]
+pub struct PanelFlags {
+    /// Show the debug scaffold panel.
+    pub debug: bool,
+    /// Show the controls-help card.
+    pub help: bool,
 }
 
 /// Session-side values `csp-app` mirrors in for the UI — written through
@@ -239,6 +264,7 @@ fn sync_mirrors(
 /// and record UI-emitted requests for next frame's Input. Never reads the
 /// sim — every value is a mirror or session value.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)] // the panel roster grew past the budget
 fn build_ui(
     mut egui: ResMut<EguiPass>,
     clock: Res<Clock>,
@@ -253,6 +279,7 @@ fn build_ui(
     map_snap: Res<map::MapSnapshot>,
     mut maneuver_state: ResMut<ManeuverPanelRes>,
     mut settings_state: ResMut<SettingsPanelRes>,
+    mut panels: ResMut<PanelFlags>,
     mut tutorial: ResMut<tutorial::TutorialRes>,
     mut outbox: ResMut<UiOutbox>,
 ) {
@@ -287,9 +314,19 @@ fn build_ui(
     }
     let files = craft_files.0.clone(); // Vec<String> — cheap, frees the Res borrow
     egui.output = Some(ctx.run_ui(raw, |ctx| {
-        csp_ui::vab::top_bar(ctx, mode, &mut vab_out);
-        if mode != csp_ui::ModeSelect::Vab {
+        csp_ui::vab::top_bar(ctx, mode, warp.0, &mut vab_out);
+        // The M0 scaffold is dev-facing (adapter/backend/tick internals)
+        // — gated behind the ToggleDebug key so the shipped view is a
+        // game screen, not a diagnostics dump.
+        if panels.debug && mode != csp_ui::ModeSelect::Vab {
             csp_ui::debug_panel(ctx, &input, &mut panel_output);
+        }
+        if panels.help {
+            let mut open = true;
+            csp_ui::help_panel(ctx, &settings_state.0.settings.keys, &mut open);
+            if !open {
+                panels.help = false;
+            }
         }
         if map_ui.mode == map::MapMode::Map {
             map_panels(
@@ -309,10 +346,24 @@ fn build_ui(
                 ctx,
                 &csp_ui::FlightHudInput {
                     has_vessel: flight_ui.has_vessel,
+                    latched: flight_ui.latched,
                     alt_m: flight_ui.alt_m,
-                    speed_mps: flight_ui.speed_mps,
+                    surface_speed_mps: flight_ui.surface_speed_mps,
+                    orbital_speed_mps: flight_ui.orbital_speed_mps,
                     vspeed_mps: flight_ui.vspeed_mps,
+                    heading_deg: flight_ui.heading_deg,
+                    pitch_deg: flight_ui.pitch_deg,
+                    roll_deg: flight_ui.roll_deg,
                     throttle: flight_ui.throttle,
+                    parts: flight_ui.parts,
+                    navball: csp_ui::navball::NavballInput {
+                        up: flight_ui.nav_up,
+                        north: flight_ui.nav_north,
+                        east: flight_ui.nav_east,
+                        prograde: flight_ui.nav_prograde,
+                        heading_deg: flight_ui.heading_deg,
+                    },
+                    warp: warp.0,
                     vessel_count: flight_ui.vessel_count,
                     debris_count: flight_ui.debris_count,
                     sfx: &flight_ui.sfx,
@@ -334,7 +385,15 @@ fn build_ui(
     if vab_out.tutorial {
         tutorial.0.start();
     }
-    outbox.warp_step = panel_output.warp_step;
+    // The top bar's "? Help" button toggles the controls card — the
+    // same fold-back pattern as the tutorial (session state, never the
+    // app outbox).
+    if vab_out.help {
+        panels.help = !panels.help;
+    }
+    // Warp steps may come from the debug panel's buttons or the top
+    // bar's −/+ now that the scaffold is dev-gated.
+    outbox.warp_step = panel_output.warp_step + vab_out.warp_step;
     outbox.mode = vab_out.mode;
     outbox.launch = vab_out.launch;
     // Save carries the serialized bytes — the app owns the file store.
@@ -736,6 +795,9 @@ impl View {
         world.insert_resource(ManeuverPanelRes::default());
         // M10: the settings window's staged state (§2.2-C session data).
         world.insert_resource(SettingsPanelRes::default());
+        // The optional-panel toggles (debug scaffold, controls help) —
+        // session state flipped by the ToggleDebug/ToggleHelp keys.
+        world.insert_resource(PanelFlags::default());
         // M10: the first-flight tutorial checklist (§2.2-C session
         // data) — driven by `tutorial_drive` in Presentation, drawn by
         // `build_ui`.
@@ -955,6 +1017,28 @@ impl View {
         self.world.resource::<SettingsPanelRes>().0.settings.clone()
     }
 
+    /// Toggle the M0 debug scaffold panel (the `ToggleDebug` binding)
+    /// — dev internals (adapter name, tick/frame counters), off by
+    /// default so the shipped view is a game screen, not a diagnostics
+    /// dump.
+    pub fn toggle_debug_panel(&mut self) {
+        let mut r = self.world.resource_mut::<PanelFlags>();
+        r.debug = !r.debug;
+    }
+
+    /// Toggle the controls-help card (the `ToggleHelp` binding, the
+    /// top-bar "?" button).
+    pub fn toggle_help_panel(&mut self) {
+        let mut r = self.world.resource_mut::<PanelFlags>();
+        r.help = !r.help;
+    }
+
+    /// Whether the controls-help card is on screen — for tests and
+    /// the app's own wiring checks.
+    pub fn help_panel_open(&self) -> bool {
+        self.world.resource::<PanelFlags>().help
+    }
+
     /// Toggle the settings window (the `OpenSettings` binding).
     pub fn toggle_settings_panel(&mut self) {
         let mut r = self.world.resource_mut::<SettingsPanelRes>();
@@ -1156,7 +1240,9 @@ impl View {
     }
 
     /// The focused vessel's `VesselId` — the throttle/attitude
-    /// command target (`None` when no InBubble vessel exists).
+    /// command target (`None` when the flight scene has no vessel —
+    /// a surface-latched pad craft still counts: `SetThrottle`
+    /// unlatches it).
     pub fn flight_focus(&self) -> Option<csp_sim::VesselId> {
         self.world
             .resource::<flight::FlightUiData>()
@@ -1171,6 +1257,14 @@ impl View {
     /// editor displays); an empty/missing session falls back to a
     /// stock booster so the gate is playable out of the box. The
     /// command rides the normal §7.6 log like every mutation.
+    ///
+    /// The spawn pose is the §2.6.4 surface record the pad implies —
+    /// the dominant body's authored launch site at the *current* spin
+    /// phase, upright, belly resting on the datum, with the surface
+    /// co-rotation velocity `ω × r`: the craft lands as a parked
+    /// vehicle, not an inertially suspended one (a spawn without the
+    /// `ω × r` term reads as ~175 m/s of surface-relative slide on
+    /// Terrin and sheds its stack on first contact).
     pub fn launch_craft(&mut self) {
         let craft = self.with_vab_session(|v| {
             let session = v.session().clone();
@@ -1206,15 +1300,60 @@ impl View {
             })
         })();
         let Some(craft) = craft_def else { return };
-        let Some(env) = self.sim.environment() else {
+        let Some(env) = self.sim.environment().cloned() else {
             return;
         };
-        let (r, spin, centre) = (env.radius_m, env.body_spin, env.body_center);
-        let pos = centre + csp_core::DVec3::X * (r + 12.0);
-        let rot =
-            csp_core::DQuat::from_axis_angle(csp_core::DVec3::Y, core::f64::consts::FRAC_PI_2);
-        let vel = spin.cross(pos - centre);
-        let ang_vel = rot.conjugate().rotate(spin);
+        let Some(dominant) = self.sim.dominant_body().cloned() else {
+            return;
+        };
+        // The pad: the dominant body's authored launch site
+        // (`sites.ron`, `launch: true`) — falling back to the
+        // fixed-frame equator origin (lat = lon = alt = 0) for a
+        // system without sites. `config()` is a derived read (§7.3),
+        // identical for every consumer.
+        let site = self
+            .sim
+            .config()
+            .sites
+            .into_values()
+            .filter(|s| s.body == dominant)
+            .reduce(|a, b| if b.launch { b } else { a });
+        let (lat, lon, site_alt) = site.map_or((0.0, 0.0, 0.0), |s| {
+            (s.latitude_rad, s.longitude_rad, s.altitude_m)
+        });
+        // Rest the craft ON the pad: `pos` is the body origin, so the
+        // spawn altitude is the site's plus the belly depth — the lowest
+        // body-frame collider vertex along the stack's up axis (+Z, the
+        // VAB's build direction). Welding here mirrors exactly what
+        // `SpawnPhysicalVessel`'s apply does; a failed weld rejects
+        // there anyway, so the `0.0` fallback only dresses a doomed
+        // command. `min(0.0)` keeps an origin-below-parts craft from
+        // driving the origin itself under the datum.
+        let z_min = csp_phys::weld(&craft.graph, &craft.parts)
+            .map(|b| {
+                b.collider
+                    .hulls
+                    .iter()
+                    .flat_map(|h| h.vertices.iter().map(|v| v.z))
+                    .fold(f64::INFINITY, f64::min)
+            })
+            .unwrap_or(0.0)
+            .min(0.0);
+        // The spawn kinematics are the §2.6.4 latch record's exact
+        // restore: upright ENU pose at the site, position resolved at
+        // the CURRENT tick's spin phase (the pad co-rotates — spawning
+        // at the stale t=0 longitude would put the craft downrange of
+        // the site), velocity the surface co-rotation `ω × r` — a
+        // pad-resting craft, not an inertially-dropped one.
+        let pose = csp_sim::SurfacePose {
+            body: dominant,
+            latitude_rad: lat,
+            longitude_rad: lon,
+            altitude_m: site_alt + PAD_CLEARANCE_M - z_min,
+            orientation: csp_sim::bubble::surface_upright(lat, lon),
+        };
+        let (pos, rot, vel, ang_vel) =
+            csp_sim::bubble::surface_pose_restore(&env, &pose, self.sim.clock());
         self.enqueue_command(
             SourceClass::Ui,
             1,
