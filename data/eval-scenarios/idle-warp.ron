@@ -1,0 +1,18 @@
+// M9d eval suite — the plumbing probe: a `Schedule` agent on a bare
+// world. Exercises: lockstep enqueue → drain → telemetry projection →
+// goal evaluation, with `AdvanceTo` carrying the clock.
+(
+    schema_version: 1,
+    name: "idle-warp",
+    world: Empty,
+    agent: Schedule([
+        [SetWarp(4)],
+        [AdvanceTo(512)],
+    ]),
+    goals: [
+        (field: "tick", op: ge, value: 512),
+        (field: "warp_level", op: eq, value: 4),
+    ],
+    tick_budget: 1_000_000,
+    event_budget: 256,
+)

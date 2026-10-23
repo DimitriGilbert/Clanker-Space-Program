@@ -41,9 +41,76 @@ async fn boot_with_full(
         token: Some("e2e-token".into()),
         auth_disabled: false,
         token_dir: None,
+        dashboard_dir: None,
+        spa_dir: None,
     };
     let server = Server::start(cfg, backend).await.expect("server binds");
     (server, host)
+}
+
+/// `boot` with a dashboard store under the temp dir (the M9d
+/// sidecar config path).
+async fn boot_dashboards() -> (Server, Arc<GameHost>, PathBuf) {
+    let dir = PathBuf::from(
+        std::env::var("CARGO_TARGET_TMPDIR")
+            .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned()),
+    )
+    .join(format!("csp-e2e-dash-{}", std::process::id()));
+    let host = Arc::new(GameHost::spawn_full(
+        World::new,
+        dir.clone(),
+        IngressQueue::new(),
+        None,
+    ));
+    let backend: Arc<dyn ControlBackend + Send + Sync> = host.clone();
+    let cfg = ServerConfig {
+        bind: "127.0.0.1:0".parse().expect("bind"),
+        token: Some("e2e-token".into()),
+        auth_disabled: false,
+        token_dir: None,
+        dashboard_dir: Some(dir.clone()),
+        spa_dir: None,
+    };
+    let server = Server::start(cfg, backend).await.expect("server binds");
+    (server, host, dir)
+}
+
+/// `boot` with a temp `spa_dir` shaped like the `apps/telemetry`
+/// build output (`index.html` + `assets/app.js`) — the M9d
+/// SPA-serving path no binary wires up yet. Returns the spa root so
+/// the test can prove which file was served.
+async fn boot_spa() -> (Server, Arc<GameHost>, PathBuf) {
+    let dir = PathBuf::from(
+        std::env::var("CARGO_TARGET_TMPDIR")
+            .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned()),
+    )
+    .join(format!("csp-e2e-spa-{}", std::process::id()));
+    let spa = dir.join("spa");
+    std::fs::create_dir_all(spa.join("assets")).expect("spa dir");
+    std::fs::write(
+        spa.join("index.html"),
+        "<!doctype html><html><head><title>t</title></head>\
+         <body>SPA-SHELL-MARKER</body></html>",
+    )
+    .expect("index.html");
+    std::fs::write(spa.join("assets").join("app.js"), "const csp_marker = 1;\n").expect("app.js");
+    let host = Arc::new(GameHost::spawn_full(
+        World::new,
+        dir.join("saves"),
+        IngressQueue::new(),
+        None,
+    ));
+    let backend: Arc<dyn ControlBackend + Send + Sync> = host.clone();
+    let cfg = ServerConfig {
+        bind: "127.0.0.1:0".parse().expect("bind"),
+        token: Some("e2e-token".into()),
+        auth_disabled: false,
+        token_dir: None,
+        dashboard_dir: None,
+        spa_dir: Some(spa.clone()),
+    };
+    let server = Server::start(cfg, backend).await.expect("server binds");
+    (server, host, spa)
 }
 
 /// A one-shot HTTP/1.1 request over a real socket — returns
@@ -471,5 +538,277 @@ async fn ws_command_channel_enqueues() {
         json!({"class": format!("{:?}", k.source_class)})
     });
     assert_eq!(stamped["class"], "External");
+    server.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboards_sidecar_api_and_tools() {
+    let (server, _host, dir) = boot_dashboards().await;
+    // 503 when unconfigured — verify on the store-less boot too:
+    // here the store exists, so exercise the full round-trip.
+    let dash = json!({
+        "schema_version": 1, "name": "flight", "title": "Flight",
+        "rate_hz": 16,
+        "widgets": [{
+            "id": "alt", "kind": "gauge", "title": "Altitude",
+            "fields": ["vessels.0.altitude_m"],
+            "rect": {"x": 0, "y": 0, "w": 4, "h": 3},
+            "options": {"unit": "m"}
+        }],
+    });
+    // PUT validates + stores; the file lands as sidecar JSON.
+    let (status, _) = http(
+        server.addr,
+        "PUT",
+        "/api/dashboards/flight",
+        &bearer(),
+        &dash.to_string(),
+    );
+    assert_eq!(status, 200);
+    assert!(dir.join("flight.json").exists());
+    // GET returns the stored document verbatim.
+    let (status, body) = http(server.addr, "GET", "/api/dashboards/flight", &bearer(), "");
+    assert_eq!(status, 200);
+    let got: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(got["name"], json!("flight"));
+    // List shows it.
+    let (status, body) = http(server.addr, "GET", "/api/dashboards", &bearer(), "");
+    assert_eq!(status, 200);
+    assert!(body.contains("flight"));
+    // Validation refuses: unknown widget kind → 400.
+    let bad = json!({"schema_version": 1, "name": "x", "title": "x",
+        "widgets": [{"id": "w", "kind": "hologram", "title": "w",
+                     "fields": ["tick"], "rect": {"x":0,"y":0,"w":2,"h":2}}]});
+    let (status, _) = http(
+        server.addr,
+        "PUT",
+        "/api/dashboards/x",
+        &bearer(),
+        &bad.to_string(),
+    );
+    assert_eq!(status, 400);
+    // The dashboard.* MCP tools share the same store (session-class).
+    let (_, body) = http(
+        server.addr,
+        "POST",
+        "/mcp",
+        &[
+            ("Authorization", "Bearer e2e-token"),
+            ("Content-Type", "application/json"),
+        ],
+        &tool(1, "dashboard.list", json!({})),
+    );
+    let v: Value = serde_json::from_str(&body).expect("json");
+    let text = v["result"]["content"][0]["text"].as_str().expect("text");
+    assert!(text.contains("flight"), "{text}");
+    let (_, body) = http(
+        server.addr,
+        "POST",
+        "/mcp",
+        &[
+            ("Authorization", "Bearer e2e-token"),
+            ("Content-Type", "application/json"),
+        ],
+        &tool(2, "dashboard.get", json!({"name": "flight"})),
+    );
+    let v: Value = serde_json::from_str(&body).expect("json");
+    let text = v["result"]["content"][0]["text"].as_str().expect("text");
+    assert!(
+        text.contains("alt-gauge") || text.contains("\"alt\""),
+        "{text}"
+    );
+    server.shutdown();
+}
+
+/// M9d's wire budget: a dashboard-width subscription at 16 Hz must
+/// stay inside §2.12's 256 KB/s — i.e. ≤ 16 KiB per frame at 16 Hz
+/// (16 × 16 KiB = 256 KiB). The assertion is per-frame, so it's a
+/// content-size check, not a timing flake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ws_subscription_stays_within_byte_budget() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite;
+
+    // A fixture world + a spawned rails vessel gives the projection
+    // real vessel fields to carry.
+    let dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/test-fixtures/flight-launch");
+    let make = move || {
+        let recipe = csp_bench::scenarios::find("flight-launch").expect("recipe");
+        (recipe.initial)(&dir).expect("fixture world")
+    };
+    let (server, _host) = boot_with(make).await;
+    // Spawn a vessel so the vessel.* fields resolve to real data.
+    let spawn = json!({"SpawnVessel": {
+    "parent": "terrin",
+    "elements": {
+        "semi_major_axis_m": 700_000.0, "eccentricity": 0.0,
+        "inclination_rad": 0.0, "ascending_node_rad": 0.0,
+        "arg_periapsis_rad": 0.0, "mean_anomaly_epoch_rad": 0.0,
+        "period_s": 0.0
+    }}});
+    let (_, body) = http(
+        server.addr,
+        "POST",
+        "/mcp",
+        &[
+            ("Authorization", "Bearer e2e-token"),
+            ("Content-Type", "application/json"),
+        ],
+        &tool(1, "sim.command", json!({"command": spawn})),
+    );
+    assert!(body.contains("\"isError\":false"), "{body}");
+
+    // The field set the shipped default dashboard subscribes —
+    // apps/telemetry's default.json in mirrored form (the comment
+    // documents the coupling).
+    let fields = [
+        "tick",
+        "warp_level",
+        "vessels.0.altitude_m",
+        "vessels.0.speed_mps",
+        "vessels.0.vertical_speed_mps",
+        "vessels.0.horizontal_speed_mps",
+        "vessels.0.apoapsis_altitude_m",
+        "vessels.0.periapsis_altitude_m",
+        "vessels.0.time_to_apoapsis_s",
+        "vessels.0.throttle",
+        "vessels.0.mass_kg",
+        "vessels.0.residence",
+        "vessels.0.pos_m",
+        "vessels.0.vel_mps",
+        "vessels.0.elements",
+        "vessels.0.maneuver_node",
+        "vessels.0.control_lease",
+    ];
+    let url = format!("ws://{}/ws?token=e2e-token&client=budget", server.addr);
+    let (mut ws, _) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("ws connect");
+    ws.send(tungstenite::Message::Text(
+        json!({"proto": 1, "kind": "subscribe", "fields": fields, "rate_hz": 16})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .expect("subscribe");
+    // Skip the subscribed ack; measure real telemetry frames.
+    const PER_FRAME_BUDGET: usize = 16 * 1024; // 256 KiB/s ÷ 16 Hz
+    let mut frames = 0;
+    let mut max_frame = 0usize;
+    for _ in 0..12 {
+        let msg = ws.next().await.expect("frame").expect("ok");
+        let text = msg.into_text().expect("text");
+        let v: Value = serde_json::from_str(&text).expect("json");
+        if v["kind"] == "telemetry" {
+            frames += 1;
+            max_frame = max_frame.max(text.len());
+            // Every field resolved — no unknown_fields leaks.
+            assert_eq!(v["unknown_fields"], json!([]));
+        }
+        if frames >= 3 {
+            break;
+        }
+    }
+    assert!(frames >= 3, "no telemetry frames arrived");
+    assert!(
+        max_frame <= PER_FRAME_BUDGET,
+        "telemetry frame {max_frame} B over the 16 Hz × 16 KiB budget"
+    );
+    server.shutdown();
+}
+
+/// M9d's SPA-serving path end to end (§2.12.3): with a real `spa_dir`
+/// the server injects the token into the built `index.html`, serves
+/// `/assets/*` token-free for the browser's `<script>`/`<link>`
+/// fetches, refuses traversal before it reaches the fs, and keeps the
+/// Origin/Host allowlist on the exempt path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn spa_serving_is_token_free_but_allowlisted() {
+    let (server, _host, spa) = boot_spa().await;
+
+    // `/` returns the *built* index.html — not the placeholder — with
+    // the token injected before `</head>` (the injection proof).
+    let (status, body) = http(server.addr, "GET", "/", &[], "");
+    assert_eq!(status, 200);
+    assert!(body.contains("SPA-SHELL-MARKER"), "{body}");
+    assert!(!body.contains("Build the telemetry SPA"), "{body}");
+    let meta = "<meta name=\"csp-token\" content=\"e2e-token\">";
+    let injected = body.find(meta).expect("token meta injected");
+    let head_end = body.find("</head>").expect("</head>");
+    assert!(injected < head_end, "meta must land inside <head>: {body}");
+
+    // `/assets/app.js` is served token-free — no Authorization header
+    // — verbatim bytes out of `spa_dir/assets/`.
+    let (status, body) = http(server.addr, "GET", "/assets/app.js", &[], "");
+    assert_eq!(status, 200);
+    assert_eq!(body, "const csp_marker = 1;\n");
+
+    // Traversal is refused before the join ever happens — and the
+    // target (`spa_dir/index.html`, which exists, so the rejection is
+    // load-bearing) must not leak. Both the raw and the
+    // percent-encoded `..` shapes.
+    assert!(spa.join("index.html").exists());
+    for path in ["/assets/../index.html", "/assets/%2e%2e/index.html"] {
+        let (status, body) = http(server.addr, "GET", path, &[], "");
+        assert_eq!(status, 400, "{path}");
+        assert!(!body.contains("SPA-SHELL-MARKER"), "{path} leaked: {body}");
+    }
+
+    // Token-free ≠ anything-goes: an unknown asset 404s, and the
+    // exemption is exactly `/` + `/assets/*` — the data surfaces keep
+    // their bearer requirement.
+    let (status, _) = http(server.addr, "GET", "/assets/nope.js", &[], "");
+    assert_eq!(status, 404);
+    let (status, _) = http(server.addr, "GET", "/api/telemetry", &[], "");
+    assert_eq!(status, 401);
+
+    // The allowlist covers the exempt path: a foreign Origin, or a
+    // request asserting a foreign Host (the DNS-rebinding shape), is
+    // 403 before the token check is even reached.
+    let (status, _) = http(
+        server.addr,
+        "GET",
+        "/assets/app.js",
+        &[("Origin", "http://evil.example")],
+        "",
+    );
+    assert_eq!(status, 403);
+    let (status, _) = http_host(
+        server.addr,
+        "evil.example",
+        "GET",
+        "/assets/app.js",
+        &[],
+        "",
+    );
+    assert_eq!(status, 403);
+    // And a localhost Origin passes — the allowlist, not a blanket ban.
+    let (status, _) = http(
+        server.addr,
+        "GET",
+        "/assets/app.js",
+        &[("Origin", "http://localhost:9999")],
+        "",
+    );
+    assert_eq!(status, 200);
+    server.shutdown();
+}
+
+/// With `dashboard_dir` unset the `/api/dashboards` routes answer a
+/// sane 503 — the store-absent path, distinct from an empty store
+/// (a `[]` would lie: "no dashboards" ≠ "dashboards not configured").
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboards_unconfigured_returns_503() {
+    let (server, _host) = boot().await; // dashboard_dir: None
+    for (method, path, req_body) in [
+        ("GET", "/api/dashboards", ""),
+        ("GET", "/api/dashboards/x", ""),
+        ("PUT", "/api/dashboards/x", "{}"),
+    ] {
+        let (status, body) = http(server.addr, method, path, &bearer(), req_body);
+        assert_eq!(status, 503, "{method} {path}: {body}");
+        assert!(body.contains("not configured"), "{method} {path}: {body}");
+    }
     server.shutdown();
 }

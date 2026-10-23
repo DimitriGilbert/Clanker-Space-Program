@@ -1,0 +1,97 @@
+@import 'tailwindcss';
+
+/* M9d — the custom CSS layer (§2.11: Tailwind + shadcn + custom CSS).
+   The design tokens shadcn-style components read. */
+:root {
+  --background: #0b0e14;
+  --foreground: #e6e9ef;
+  --card: #131722;
+  --card-foreground: #e6e9ef;
+  --muted: #8b93a5;
+  --accent: #4f9cf9;
+  --accent-warm: #f0a35c;
+  --border: #232a3a;
+  --good: #5cc98a;
+  --bad: #e5605f;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family:
+    'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+
+/* Widget chrome — the dashboard tile frame every registry widget
+   renders inside. */
+.widget-tile {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.widget-title {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.widget-value {
+  font-variant-numeric: tabular-nums;
+  font-size: 28px;
+  font-weight: 600;
+  line-height: 1.1;
+}
+
+.widget-unit {
+  color: var(--muted);
+  font-size: 13px;
+  margin-left: 4px;
+}
+
+.widget-unknown {
+  color: var(--bad);
+  font-size: 12px;
+  font-style: italic;
+}
+
+/* The 12-column dashboard grid. */
+.dash-grid {
+  display: grid;
+  grid-template-columns: repeat(12, 1fr);
+  gap: 12px;
+}
+
+/* Orbit-map canvas fills its tile. */
+.orbit-map-canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+/* Sparkline / graph stroke. */
+.graph-line {
+  stroke: var(--accent);
+  stroke-width: 1.5;
+  fill: none;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.status-dot.live {
+  background: var(--good);
+}
+.status-dot.dead {
+  background: var(--bad);
+}

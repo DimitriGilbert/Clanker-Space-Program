@@ -1,0 +1,21 @@
+// M9d eval suite — the §2.2.1 lease gate through the lockstep: the
+// agent takes `Agent(0)` (its client index = registration order), then
+// a burn + advance. Goals prove the lease-gated commands actually
+// applied (throttle held, altitude gained) — a rejected command would
+// leave `throttle: 0` and the goal red.
+(
+    schema_version: 1,
+    name: "lease-launch",
+    world: Fixture(name: "flight-launch"),
+    setup: [PadLaunch],
+    agent: Schedule([
+        [TakeControl(vessel: 0, lease: Agent(0))],
+        [SetThrottle(vessel: 0, throttle: 1.0), AdvanceTo(1280)],
+    ]),
+    goals: [
+        (field: "vessels.0.throttle", op: eq, value: 1.0),
+        (field: "vessels.0.altitude_m", op: gt, value: 1000.0),
+    ],
+    tick_budget: 10_000,
+    event_budget: 256,
+)

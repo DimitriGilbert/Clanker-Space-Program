@@ -1,0 +1,19 @@
+// M9d eval suite — the `Log` source: a verbatim command log re-issued
+// at its recorded ticks (§7.6 semantics, scenario-declared). The agent
+// hops to each drain tick with AdvanceTo — clock can never retreat,
+// and a step behind it faults the agent.
+(
+    schema_version: 1,
+    name: "log-replay",
+    world: Empty,
+    agent: Log([
+        (tick: 64, command: SetWarp(4)),
+        (tick: 128, command: AdvanceTo(512)),
+    ]),
+    goals: [
+        (field: "tick", op: ge, value: 512),
+        (field: "warp_level", op: eq, value: 4),
+    ],
+    tick_budget: 1_000_000,
+    event_budget: 256,
+)

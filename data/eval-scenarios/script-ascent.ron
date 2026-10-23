@@ -1,0 +1,56 @@
+// M9d eval suite — the `Script` source: a Rhai guest script flies the
+// same ascent through the in-sim host (M9a). The agent loads it at the
+// first boundary then Waits; `stop_when` ends the run the boundary the
+// osculating apoapsis clears 120 km — the telemetry feedback visible
+// to scripts and dashboards alike.
+(
+    schema_version: 1,
+    name: "script-ascent",
+    world: Fixture(name: "flight-launch"),
+    setup: [PadLaunch],
+    agent: Script(vessel: 0, source: r#"
+        fn on_tick(ctx) {
+            let v = ctx.vessel;
+            if !v.found { return; }
+            let apo = v.apoapsis;
+            if apo != apo { apo = -1.0; } // NaN → still climbing
+            if apo >= 120000.0 {
+                ctx.persist["done"] = true;
+                set_throttle(0.0);
+                return;
+            }
+            ctx.persist["done"] = false;
+            set_throttle(1.0);
+            let alt = v.altitude;
+            // pitch: vertical below 1.5 km, horizontal by 60 km
+            let f = ((alt - 1500.0) / 58500.0).max(0.0).min(1.0);
+            let pitch = (1.5707963 * (1.0 - f));
+            let up = v.pos;
+            let un = up.x * up.x + up.y * up.y + up.z * up.z;
+            un = un.sqrt();
+            let ux = up.x / un; let uy = up.y / un; let uz = up.z / un;
+            let vv = v.vel;
+            let vr = (vv.x * ux + vv.y * uy + vv.z * uz);
+            let hx = vv.x - vr * ux; let hy = vv.y - vr * uy; let hz = vv.z - vr * uz;
+            let hn = (hx * hx + hy * hy + hz * hz).sqrt();
+            let px = 0.0; let py = 0.0; let pz = 0.0;
+            if hn > 0.001 { px = hx / hn; py = hy / hn; pz = hz / hn; }
+            else { px = 1.0 - ux.abs(); py = 0.0; pz = uz; }
+            let cp = pitch.cos(); let sp = pitch.sin();
+            steer(ux * sp + px * cp, uy * sp + py * cp, uz * sp + pz * cp);
+        }
+    "#),
+    stop_when: Some((field: "vessels.0.apoapsis_altitude_m", op: ge, value: 120_000.0)),
+    // The script cuts throttle on the *next* on_tick after apoapsis
+    // crosses — settle 64 boundaries so its response lands before the
+    // goals read state.
+    settle_ticks: 64,
+    goals: [
+        (field: "vessels.0.apoapsis_altitude_m", op: ge, value: 120_000.0),
+        (field: "vessels.0.throttle", op: eq, value: 0.0),
+    ],
+    tick_budget: 600_000,
+    // Script verbs stamp ~2 commands/tick through the drain — the
+    // budget must cover the whole ascent (~5k ticks to 120 km).
+    event_budget: 32_000,
+)

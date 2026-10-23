@@ -250,7 +250,9 @@ fn flight_initial(dir: &Path) -> Result<World, ReplayError> {
 /// The authored part set (§2.4/§3.1 — scenario-side, no VAB): a 5 t
 /// single-stage booster, a 6 m × 1.5 m box with a 200 kN engine on its
 /// base pointing down the body +z axis. TWR ≈ 4 at Terrin surface.
-fn flight_craft() -> csp_sim::CraftDef {
+/// `pub` for M9d: the eval suite's `PadLaunch` and the `csp-mcp`
+/// mission e2e spawn this same craft.
+pub fn flight_craft() -> csp_sim::CraftDef {
     let mut graph = PartGraph::new(PartNodeId(0));
     graph.nodes.insert(
         PartNodeId(0),
@@ -297,8 +299,9 @@ fn flight_craft() -> csp_sim::CraftDef {
 }
 
 /// Quaternion taking body +z (the thrust axis) to `dir` — the scripted
-/// controller's attitude surface.
-fn thrust_attitude(dir: DVec3) -> DQuat {
+/// controller's attitude surface. `pub` for M9d: the eval suite's
+/// ascent program steers with the same convention.
+pub fn thrust_attitude(dir: DVec3) -> DQuat {
     let n = dir.norm();
     if n.partial_cmp(&0.0) != Some(core::cmp::Ordering::Greater) {
         return DQuat::IDENTITY;
@@ -335,22 +338,18 @@ enum FlightPhase {
     Descend,
 }
 
-/// The scripted controller driving the launch→orbit→reentry→land arc.
-/// Every decision reads only sim state — a deterministic function, so
-/// the command log it emits replays identically.
-#[allow(clippy::too_many_lines)] // the M7-C recovery tail grew it past the limit
-pub fn flight_run(w: &mut World) -> Result<FlightReport, SimError> {
-    let mut report = FlightReport::default();
+/// The recipe's pad spawn — equatorial site on the +x axis, body +z
+/// (thrust) pointed radially up, velocity = surface co-rotation
+/// (ω×r); drains one boundary and returns the environment the caller
+/// needs for orbit checks. Shared by `flight_run`, the M9a tests, and
+/// M9d's `SetupSpec::PadLaunch` — one spawn convention for every
+/// physical-vessel scenario.
+pub fn spawn_pad(w: &mut World) -> Result<Environment, SimError> {
     let env = w
         .environment()
         .ok_or(SimError::Fatal("flight scenario requires a physics world"))?
         .clone();
-    let mu = env.mu_m3_per_s2;
-    let radius = env.radius_m;
-    let atm_top = env.atmosphere.as_ref().map_or(0.0, |a| a.top_m);
-    // The pad: equatorial site on the +x axis, body +z (thrust) pointed
-    // radially up, velocity = surface co-rotation (ω×r).
-    let pad = DVec3::new(radius + 3.5, 0.0, 0.0);
+    let pad = DVec3::new(env.radius_m + 3.5, 0.0, 0.0);
     let rot0 = DQuat::from_axis_angle(DVec3::Y, core::f64::consts::FRAC_PI_2);
     w.enqueue(
         SourceClass::Ui,
@@ -364,6 +363,19 @@ pub fn flight_run(w: &mut World) -> Result<FlightReport, SimError> {
         },
     );
     w.step_frame(w.clock().ticks() + 1)?;
+    Ok(env)
+}
+
+/// The scripted controller driving the launch→orbit→reentry→land arc.
+/// Every decision reads only sim state — a deterministic function, so
+/// the command log it emits replays identically.
+#[allow(clippy::too_many_lines)] // the M7-C recovery tail grew it past the limit
+pub fn flight_run(w: &mut World) -> Result<FlightReport, SimError> {
+    let mut report = FlightReport::default();
+    let env = spawn_pad(w)?;
+    let mu = env.mu_m3_per_s2;
+    let radius = env.radius_m;
+    let atm_top = env.atmosphere.as_ref().map_or(0.0, |a| a.top_m);
 
     let mut phase = FlightPhase::Ascend;
     for _ in 0..800_000u64 {
@@ -874,28 +886,6 @@ mod tests {
         )
     }
 
-    /// M9a: spawn the authored craft on the pad exactly like
-    /// `flight_run` does — returns the environment the caller needs
-    /// for orbit checks.
-    fn spawn_pad(w: &mut World) -> Environment {
-        let env = w.environment().unwrap().clone();
-        let pad = DVec3::new(env.radius_m + 3.5, 0.0, 0.0);
-        let rot0 = DQuat::from_axis_angle(DVec3::Y, core::f64::consts::FRAC_PI_2);
-        w.enqueue(
-            SourceClass::Ui,
-            0,
-            SimCommand::SpawnPhysicalVessel {
-                craft: flight_craft(),
-                pos: pad,
-                rot: rot0,
-                vel: env.body_spin.cross(pad - env.body_center),
-                ang_vel: DVec3::ZERO,
-            },
-        );
-        w.step_frame(1).unwrap();
-        env
-    }
-
     /// Osculating `(apo, peri)` ALTITUDES of `FLIGHT_VESSEL` — the
     /// orbit-check the autopilot/script tests assert against.
     fn vessel_apsides(w: &World, env: &Environment) -> Option<(f64, f64)> {
@@ -920,7 +910,7 @@ mod tests {
     #[test]
     fn autopilot_ascent_reaches_orbit() {
         let mut w = flight_initial(&fixture_dir()).unwrap();
-        let env = spawn_pad(&mut w);
+        let env = spawn_pad(&mut w).unwrap();
         w.enqueue(
             SourceClass::Ui,
             0,
@@ -992,7 +982,7 @@ mod tests {
             }
         "#;
         let mut w = flight_initial(&fixture_dir()).unwrap();
-        let env = spawn_pad(&mut w);
+        let env = spawn_pad(&mut w).unwrap();
         w.enqueue(
             SourceClass::Ui,
             0,

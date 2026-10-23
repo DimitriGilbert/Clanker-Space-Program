@@ -1,0 +1,23 @@
+// M9d eval suite — the flagship: an agent flies a mission end-to-end
+// through the lockstep loop. `ascent-apoapsis` (crate::eval) takes the
+// §2.2.1 lease, flies the gravity-turn ascent reading only published
+// telemetry, cuts throttle at the target apoapsis, and withdraws.
+// Goals pin the outcome: apoapsis reached, throttle back to 0 — the
+// "agent flies a mission" proof, fully deterministic (same scenario +
+// same program → byte-identical hash).
+(
+    schema_version: 1,
+    name: "ascent-mission",
+    world: Fixture(name: "flight-launch"),
+    setup: [PadLaunch],
+    agent: Program(name: "ascent-apoapsis", args: {
+        "target_apoapsis_m": 120_000.0,
+    }),
+    goals: [
+        (field: "vessels.0.apoapsis_altitude_m", op: ge, value: 120_000.0),
+        (field: "vessels.0.throttle", op: eq, value: 0.0),
+        (field: "vessels.0.residence", op: eq, value: "InBubble"),
+    ],
+    tick_budget: 600_000,
+    event_budget: 500_000,
+)

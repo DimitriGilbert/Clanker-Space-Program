@@ -79,12 +79,32 @@ fn tool_error(msg: impl Into<String>) -> Value {
 /// default type parameter — against `GameHost`.
 pub struct Mcp<B: ControlBackend + ?Sized = dyn ControlBackend + Send + Sync> {
     backend: Arc<B>,
+    /// M9d §2.12.2 — the sidecar dashboard store the `dashboard.*`
+    /// session-class tools read/write. `None` = unconfigured
+    /// (the tools report `isError`, honest rather than fake-empty).
+    dashboards: Option<Arc<crate::dashboard::DashboardStore>>,
 }
 
 impl<B: ControlBackend + ?Sized> Mcp<B> {
-    /// Wrap the host backend.
+    /// Wrap the host backend (no dashboard store — tests and the
+    /// store-less paths).
     pub fn new(backend: Arc<B>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            dashboards: None,
+        }
+    }
+
+    /// `new` + the M9d dashboard store — `serve` and `csp-mcp` wire
+    /// one in; the `/api/dashboards` routes share the same `Arc`.
+    pub fn with_dashboards(
+        backend: Arc<B>,
+        dashboards: Option<Arc<crate::dashboard::DashboardStore>>,
+    ) -> Self {
+        Self {
+            backend,
+            dashboards,
+        }
     }
 
     /// The backend, for handlers that need it outside MCP (the WS
@@ -227,6 +247,9 @@ impl<B: ControlBackend + ?Sized> Mcp<B> {
             "session.save" => self.t_save(args),
             "session.load" => self.t_load(args),
             "session.snapshot" => self.t_snapshot(),
+            "dashboard.list" => self.t_dashboard_list(),
+            "dashboard.get" => self.t_dashboard_get(args),
+            "dashboard.save" => self.t_dashboard_save(args),
             _ => Err(ToolFail::Unknown),
         }
     }
@@ -473,6 +496,51 @@ impl<B: ControlBackend + ?Sized> Mcp<B> {
             .map_err(|e| ToolFail::Tool(e.to_string()))?;
         serde_json::to_value(summary).map_err(|e| ToolFail::Tool(e.to_string()))
     }
+
+    // -- dashboard tools (M9d, session-class — §2.12's `dashboard.*`
+    //    family; sidecar config, never replay-relevant) -------------
+
+    fn dashboards(&self) -> Result<&crate::dashboard::DashboardStore, ToolFail> {
+        self.dashboards
+            .as_deref()
+            .ok_or_else(|| ToolFail::Tool("dashboard store not configured".into()))
+    }
+
+    /// `dashboard.list` — the store's name list.
+    fn t_dashboard_list(&self) -> Result<Value, ToolFail> {
+        let names = self
+            .dashboards()?
+            .list()
+            .map_err(|e| ToolFail::Tool(e.to_string()))?;
+        Ok(json!({"dashboards": names}))
+    }
+
+    /// `dashboard.get {name}` — one stored dashboard document.
+    fn t_dashboard_get(&self, args: &Value) -> Result<Value, ToolFail> {
+        let name = req_str(args, "name")?;
+        let dash = self
+            .dashboards()?
+            .load(name)
+            .map_err(|e| ToolFail::Tool(e.to_string()))?;
+        serde_json::to_value(dash).map_err(|e| ToolFail::Tool(e.to_string()))
+    }
+
+    /// `dashboard.save {dashboard}` — validate + store (the §2.12.2
+    /// sidecar write; the store's validation is the wire's too).
+    fn t_dashboard_save(&self, args: &Value) -> Result<Value, ToolFail> {
+        let dash: crate::dashboard::Dashboard = args
+            .get("dashboard")
+            .cloned()
+            .ok_or_else(|| ToolFail::Invalid("missing dashboard".into()))
+            .and_then(|v| {
+                serde_json::from_value(v)
+                    .map_err(|e| ToolFail::Invalid(format!("dashboard does not decode: {e}")))
+            })?;
+        self.dashboards()?
+            .save(&dash.name.clone(), &dash)
+            .map_err(|e| ToolFail::Tool(e.to_string()))?;
+        Ok(json!({"name": dash.name}))
+    }
 }
 
 /// Tool-call failures: `Unknown`/`Invalid` map to JSON-RPC errors,
@@ -546,6 +614,7 @@ fn get_quat(args: &Value, key: &str) -> Result<Option<csp_core::DQuat>, ToolFail
 /// marks the session-class tools per §2.12 ("session-class tools are
 /// declared as such ... and are not replay-relevant"). Everything
 /// else is sim-class: it maps to `SimCommand`s or telemetry reads.
+#[allow(clippy::too_many_lines)] // a declarative descriptor table, one stanza per tool
 pub fn tools_v1() -> Value {
     let sim = |name: &str, desc: &str, schema: Value| json!({"name": name, "description": desc, "class": "sim", "inputSchema": schema});
     let ses = |name: &str, desc: &str, schema: Value| json!({"name": name, "description": desc, "class": "session", "inputSchema": schema});
@@ -646,6 +715,22 @@ pub fn tools_v1() -> Value {
             "The world's (tick, state-hash) summary (session-class).",
             obj(json!({}), &[])
         ),
+        ses(
+            "dashboard.list",
+            "List sidecar dashboard names (session-class; not replay-relevant).",
+            obj(json!({}), &[])
+        ),
+        ses(
+            "dashboard.get",
+            "Read one sidecar dashboard document by name (session-class).",
+            obj(json!({"name": {"type": "string"}}), &["name"])
+        ),
+        ses(
+            "dashboard.save",
+            "Validate + store a dashboard document (session-class; the §2.12.2 \
+             sidecar write — never in the save, the log, or the hash).",
+            obj(json!({"dashboard": {"type": "object"}}), &["dashboard"])
+        ),
     ])
 }
 
@@ -721,7 +806,11 @@ mod tests {
                 "session.list_saves",
                 "session.save",
                 "session.load",
-                "session.snapshot"
+                "session.snapshot",
+                // M9d — the dashboard.* family joined the session class.
+                "dashboard.list",
+                "dashboard.get",
+                "dashboard.save"
             ]
         );
         assert!(arr.iter().all(|t| t["inputSchema"].is_object()));

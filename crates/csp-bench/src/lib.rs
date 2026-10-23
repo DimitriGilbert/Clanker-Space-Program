@@ -18,7 +18,14 @@
 /// M7-D §3.6 — the contract-lifecycle probe: generation →
 /// acceptance → advance → event-driven completion → payout,
 /// determinism-verified.
+/// M9d §2.12.1 — the eval tier: the lockstep agent loop
+/// ([`agent`]), the declarative `scenario.ron` format
+/// ([`scenario`]), and the program registry + suite runner
+/// ([`eval`]).
+pub mod agent;
 pub mod contracts;
 pub mod economy;
+pub mod eval;
 pub mod replay;
+pub mod scenario;
 pub mod scenarios;

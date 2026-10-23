@@ -37,6 +37,14 @@ pub struct ServerConfig {
     /// Directory for `<pid>.token` — `$XDG_RUNTIME_DIR/csp` or the
     /// platform temp dir fallback; `None` disables the file write.
     pub token_dir: Option<PathBuf>,
+    /// M9d §2.12.2 — the sidecar dashboard directory
+    /// (`*.json` per dashboard). Default [`config_dashboard_dir`];
+    /// `None` disables the dashboard store (503 endpoints).
+    pub dashboard_dir: Option<PathBuf>,
+    /// M9d — the built telemetry SPA's static root (the
+    /// `apps/telemetry` build output: `index.html` + `assets/`).
+    /// `None` serves the placeholder page.
+    pub spa_dir: Option<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -46,6 +54,8 @@ impl Default for ServerConfig {
             token: None,
             auth_disabled: false,
             token_dir: Some(runtime_dir()),
+            dashboard_dir: Some(config_dashboard_dir()),
+            spa_dir: None,
         }
     }
 }
@@ -57,6 +67,17 @@ pub fn runtime_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
         .join(RUNTIME_SUBDIR)
+}
+
+/// `$XDG_CONFIG_HOME/csp/dashboards` (→ `~/.config/csp/dashboards`
+/// fallback, → temp last resort) — §2.12.2's "$config_dir/csp/
+/// dashboards/*.json" sidecar location.
+pub fn config_dashboard_dir() -> PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .unwrap_or_else(std::env::temp_dir);
+    base.join(RUNTIME_SUBDIR).join("dashboards")
 }
 
 /// A running server — the bound address (for ephemeral-port tests)
@@ -84,6 +105,11 @@ impl Server {
             Some(dir) => Some(write_token_file(dir, &token)?),
             None => None,
         };
+        // M9d: one store serves both the `/api/dashboards` routes and
+        // the session-class `dashboard.*` MCP tools.
+        let dashboards = config
+            .dashboard_dir
+            .map(|d| Arc::new(crate::dashboard::DashboardStore::new(d)));
         let state = Arc::new(AppState {
             token: if config.auth_disabled {
                 None
@@ -92,7 +118,9 @@ impl Server {
             },
             backend: backend.clone(),
             registry: crate::backend::ClientRegistry::new(),
-            mcp: crate::mcp::Mcp::new(backend),
+            mcp: crate::mcp::Mcp::with_dashboards(backend, dashboards.clone()),
+            dashboards,
+            spa_dir: config.spa_dir.clone(),
         });
         let app = http::router(state);
         let listener = tokio::net::TcpListener::bind(config.bind)

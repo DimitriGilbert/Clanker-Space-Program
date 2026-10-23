@@ -4,6 +4,7 @@
 //!
 //! ```text
 //! csp-mcp [--empty | --fixture <dir>] [--save-dir <dir>] [--client <name>]
+//!         [--dashboard-dir <dir>]
 //! ```
 //!
 //! - `--empty` (default): a bare `World::new()`.
@@ -13,6 +14,8 @@
 //! - `--save-dir`: where `session.*` tools read/write `.cspsave`s
 //!   (default: `./csp-saves`). On `session.load`, the fixture's
 //!   construction config is re-installed (§7.3).
+//! - `--dashboard-dir`: where the M9d `dashboard.*` tools read/write
+//!   the §2.12.2 sidecar `*.json`s (default: `./csp-dashboards`).
 //! - `--client`: this process's client name — the `source_id` its
 //!   commands stamp under (default `"local"` → index 0).
 
@@ -25,8 +28,8 @@ use csp_server::backend::{ClientRegistry, LocalGame};
 use csp_server::mcp::Mcp;
 use csp_sim::World;
 
-const USAGE: &str =
-    "usage: csp-mcp [--empty | --fixture <dir>] [--save-dir <dir>] [--client <name>]";
+const USAGE: &str = "usage: csp-mcp [--empty | --fixture <dir>] [--save-dir <dir>] \
+                     [--client <name>] [--dashboard-dir <dir>]";
 
 fn main() -> ExitCode {
     match run() {
@@ -41,6 +44,7 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     let mut fixture: Option<PathBuf> = None;
     let mut save_dir = PathBuf::from("csp-saves");
+    let mut dashboard_dir = PathBuf::from("csp-dashboards");
     let mut client_name = "local".to_string();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -51,6 +55,9 @@ fn run() -> Result<(), String> {
             }
             "--save-dir" => {
                 save_dir = PathBuf::from(args.next().ok_or("--save-dir needs a dir")?);
+            }
+            "--dashboard-dir" => {
+                dashboard_dir = PathBuf::from(args.next().ok_or("--dashboard-dir needs a dir")?);
             }
             "--client" => {
                 client_name = args.next().ok_or("--client needs a name")?;
@@ -82,7 +89,10 @@ fn run() -> Result<(), String> {
     // Arc<LocalGame> is !Send by design — `World` cannot cross
     // threads and this process is single-threaded anyway.
     #[allow(clippy::arc_with_non_send_sync)]
-    let mcp = Mcp::new(Arc::new(game));
+    let game = Arc::new(game);
+    // M9d §2.12.2: the `dashboard.*` tools' sidecar store.
+    let dashboards = Arc::new(csp_server::dashboard::DashboardStore::new(dashboard_dir));
+    let mcp = Mcp::with_dashboards(game, Some(dashboards));
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();

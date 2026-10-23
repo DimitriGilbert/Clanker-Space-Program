@@ -21,8 +21,37 @@
 //!   cap; the WS frame cap matches; the command queue is
 //!   [`crate::ingress::IngressQueue`]'s.
 //! - **Bind `127.0.0.1`** by default (see [`crate::serve`]).
+//!
+//! # §2.12.2 deferrals (recorded here so the gap is explicit, not silent)
+//!
+//! - **MessagePack for arrays.** The plan's wire encoding is "JSON for
+//!   scalars and control, MessagePack for arrays (per-part vectors)".
+//!   The WS stream is currently JSON-only: the projected field set is
+//!   scalar/small-object shaped and the per-part array fields that
+//!   motivated MessagePack are not yet surfaced by any widget. Deferred
+//!   until a subscription actually carries bulk arrays; `proto` in the
+//!   envelope is the bump mechanism when it lands, and the
+//!   `ws_subscription_stays_within_byte_budget` e2e is the tripwire
+//!   that says when JSON has stopped fitting the 256 KB/s budget.
+//! - **`SessionCommand` vs the sidecar store.** §2.12.2 says
+//!   dashboards are "mutated via `SessionCommand`" — the §2.2
+//!   category-C session channel. That channel is an app-side seam and
+//!   does not exist in this crate; what csp-server has is
+//!   *session-class tools*. The `dashboard.*` MCP tools and
+//!   `/api/dashboards` write the [`crate::dashboard::DashboardStore`]
+//!   directly, which preserves the invariant the plan actually cares
+//!   about — sidecar config is never in the save, the command log, or
+//!   the state hash — so the tools stay session-class and
+//!   replay-irrelevant with or without a future SessionCommand
+//!   channel behind them.
+//! - **`spa_dir` has no binary wiring yet.** [`AppState::spa_dir`] is
+//!   `None` in every shipped path (no binary sets it), so `/` serves
+//!   the placeholder in production today. The injection + `/assets/*`
+//!   path is exercised by the `spa_serving_*` e2e, which boots the
+//!   router against a temp `spa_dir`.
 
 use std::convert::Infallible;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
@@ -40,6 +69,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::backend::{ClientRegistry, ControlBackend};
+use crate::dashboard::{Dashboard, DashboardStore};
 use crate::ingress::MAX_MESSAGE_BYTES;
 use crate::mcp::{Mcp, SUPPORTED_REVISIONS};
 
@@ -65,6 +95,14 @@ pub struct AppState {
     pub registry: ClientRegistry,
     /// The transport-free MCP engine.
     pub mcp: Mcp,
+    /// M9d §2.12.2 — the sidecar dashboard store (`/api/dashboards` +
+    /// the `dashboard.*` session tools). `None` = unconfigured (503s,
+    /// not a fake empty list).
+    pub dashboards: Option<Arc<DashboardStore>>,
+    /// M9d — the built SPA's static root (`apps/telemetry` output);
+    /// `/` serves its `index.html` with the token injected,
+    /// `/assets/*` serves the bundle. `None` = the placeholder page.
+    pub spa_dir: Option<PathBuf>,
 }
 
 impl AppState {
@@ -75,6 +113,8 @@ impl AppState {
             mcp: Mcp::new(backend.clone()),
             backend,
             registry: ClientRegistry::new(),
+            dashboards: None,
+            spa_dir: None,
         }
     }
 }
@@ -84,6 +124,12 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/api/telemetry", get(api_telemetry))
+        .route("/api/dashboards", get(dashboard_list))
+        .route(
+            "/api/dashboards/{name}",
+            get(dashboard_get).put(dashboard_put),
+        )
+        .route("/assets/{*path}", get(spa_asset))
         .route("/mcp", post(mcp_post).get(mcp_reject).delete(mcp_reject))
         .route("/ws", get(ws_upgrade))
         .layer(DefaultBodyLimit::max(MAX_MESSAGE_BYTES))
@@ -165,7 +211,13 @@ async fn guard(
     {
         return (StatusCode::FORBIDDEN, "host not allowed").into_response();
     }
-    if req.uri().path() == "/" {
+    // The SPA shell + its static bundle are token-free — the token is
+    // *injected into* `/`, and a browser cannot set Authorization on
+    // a <script>/<link> fetch. The Origin/Host allowlist above still
+    // covers them (every endpoint gets it); the token's job is
+    // protecting the *data* surfaces, and those stay guarded.
+    let path = req.uri().path();
+    if path == "/" || path.starts_with("/assets/") {
         return next.run(req).await;
     }
     if let Some(token) = &state.token {
@@ -197,19 +249,126 @@ fn bearer_matches(headers: &HeaderMap, token: &str) -> bool {
 // `/` + `/api/telemetry` — the SPA shell and the debug read
 // ---------------------------------------------------------------------------
 
-/// The SPA shell — a placeholder until M9d ships the TanStack app;
-/// the token lands in a `<meta>` the app reads (§2.12.3).
-async fn index(State(state): State<Arc<AppState>>) -> Html<String> {
+/// The SPA shell — M9d: serve the built app's `index.html` from
+/// `spa_dir` with the token injected into its `<meta name="csp-token">`
+/// slot (§2.12.3 — the only token-free page, so the injection can't
+/// leak). Without a configured `spa_dir`, the placeholder remains.
+async fn index(State(state): State<Arc<AppState>>) -> Response {
     let token = state.token.as_deref().unwrap_or("");
+    if let Some(dir) = &state.spa_dir
+        && let Ok(html) = std::fs::read_to_string(dir.join("index.html"))
+    {
+        let meta = format!("<meta name=\"csp-token\" content=\"{token}\">");
+        // Inject before </head>; a head-less document prepends.
+        let html = match html.find("</head>") {
+            Some(i) => format!("{}{}{}", &html[..i], meta, &html[i..]),
+            None => format!("{meta}{html}"),
+        };
+        return Html(html).into_response();
+    }
     Html(format!(
         "<!doctype html><html><head><meta charset=\"utf-8\">\
          <meta name=\"csp-token\" content=\"{token}\">\
          <title>Clanker Space Program — telemetry</title></head>\
-         <body><h1>csp-server</h1><p>The telemetry SPA ships in M9d.\
-         The WS endpoint is <code>/ws</code>; MCP is <code>POST /mcp</code>\
-         (protocol revision {}).<p></body></html>",
+         <body><h1>csp-server</h1><p>Build the telemetry SPA in \
+         <code>apps/telemetry</code> and point <code>spa_dir</code> at \
+         its output. The WS endpoint is <code>/ws</code>; MCP is \
+         <code>POST /mcp</code> (protocol revision {}).<p></body></html>",
         crate::mcp::PROTOCOL_REVISION
     ))
+    .into_response()
+}
+
+/// `GET /assets/{*path}` — the SPA bundle's static files. Bounded:
+/// the path must be relative-clean (no `..`, no leading `/`), the
+/// file under `spa_dir`, and small (bundle files, not arbitrary fs).
+async fn spa_asset(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(path): axum::extract::Path<String>,
+) -> Response {
+    const MAX_ASSET: u64 = 16 * 1024 * 1024;
+    let Some(dir) = &state.spa_dir else {
+        return (StatusCode::NOT_FOUND, "no SPA configured").into_response();
+    };
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.split('/').any(|seg| seg == ".." || seg.is_empty())
+    {
+        return (StatusCode::BAD_REQUEST, "bad asset path").into_response();
+    }
+    let file = dir.join("assets").join(&path);
+    let meta = match std::fs::metadata(&file) {
+        Ok(m) if m.is_file() && m.len() <= MAX_ASSET => m,
+        _ => return (StatusCode::NOT_FOUND, "asset not found").into_response(),
+    };
+    let _ = meta;
+    let bytes = match std::fs::read(&file) {
+        Ok(b) => b,
+        Err(_) => return (StatusCode::NOT_FOUND, "asset not found").into_response(),
+    };
+    let ty = match file.extension().and_then(|e| e.to_str()) {
+        Some("js" | "mjs") => "text/javascript",
+        Some("css") => "text/css",
+        Some("html") => "text/html",
+        Some("json" | "map") => "application/json",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("woff" | "woff2") => "font/woff2",
+        _ => "application/octet-stream",
+    };
+    ([(header::CONTENT_TYPE, ty)], bytes).into_response()
+}
+
+/// `GET /api/dashboards` — the store's name list.
+async fn dashboard_list(State(state): State<Arc<AppState>>) -> Response {
+    let Some(store) = &state.dashboards else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "dashboards not configured").into_response();
+    };
+    match store.list() {
+        Ok(names) => Json(json!({"dashboards": names})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// `GET /api/dashboards/{name}` — one stored dashboard document.
+async fn dashboard_get(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Response {
+    let Some(store) = &state.dashboards else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "dashboards not configured").into_response();
+    };
+    match store.load(&name) {
+        Ok(dash) => Json(dash).into_response(),
+        Err(crate::dashboard::DashboardError::Invalid(m)) => {
+            (StatusCode::NOT_FOUND, m).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// `PUT /api/dashboards/{name}` — validate + store the document.
+/// Body cap is the shared 64 KiB message limit (a dashboard is a
+/// bounded config doc, not a blob).
+async fn dashboard_put(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    body: Bytes,
+) -> Response {
+    let Some(store) = &state.dashboards else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "dashboards not configured").into_response();
+    };
+    let dash: Dashboard = match serde_json::from_slice(&body) {
+        Ok(d) => d,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("dashboard json: {e}")).into_response(),
+    };
+    match store.save(&name, &dash) {
+        Ok(()) => Json(json!({"name": name})).into_response(),
+        Err(crate::dashboard::DashboardError::Invalid(m)) => {
+            (StatusCode::BAD_REQUEST, m).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 /// `GET /api/telemetry` — the current snapshot, verbatim JSON. A

@@ -22,10 +22,13 @@
 //!   explicit backpressure errors.
 //! - [`telemetry`] — the published `ArcSwap` snapshot + the
 //!   field-path subscription projection.
+//! - [`dashboard`] — M9d's sidecar dashboard store: `*.json` per
+//!   dashboard under the config dir, versioned, never in save/log/hash.
 
 #![forbid(unsafe_code)]
 
 pub mod backend;
+pub mod dashboard;
 pub mod http;
 pub mod ingress;
 pub mod mcp;
@@ -35,6 +38,7 @@ pub mod telemetry;
 pub use backend::{
     BackendError, ClientRegistry, ControlBackend, LocalGame, SaveInfo, SessionSummary,
 };
+pub use dashboard::{Dashboard, DashboardError, DashboardStore, Widget};
 pub use ingress::{IngressError, IngressQueue};
 pub use mcp::{Mcp, PROTOCOL_REVISION, SUPPORTED_REVISIONS, TOOL_SCHEMA_VERSION};
 pub use serve::{DEFAULT_PORT, ServeError, Server, ServerConfig, runtime_dir};
