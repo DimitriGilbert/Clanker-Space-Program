@@ -546,6 +546,47 @@ pub(crate) fn credit(vessel: &mut Vessel, resource: &ResourceId, amount: f64) ->
     (amount - remaining, mass_changed)
 }
 
+/// M9b §3.4 `Leak` — drain `amount` units from ONE part's tanks,
+/// split proportional to current holdings (a leak drains the mix,
+/// not one resource at a time). Exact-unit contents debits with the
+/// §2.4 bucketed-mass move applied per resource, the `debit`
+/// precedent — returns whether any `mass_kg` moved (the caller
+/// re-welds on true via [`reweld_if_mass_changed`]). Field-level
+/// arguments (the part + its store map) so the bubble tick's body
+/// borrow can coexist.
+pub(crate) fn leak_part(
+    part: &mut csp_phys::WeldPart,
+    stores: &mut BTreeMap<ResourceId, f64>,
+    amount: f64,
+) -> bool {
+    let total: f64 = stores.values().copied().sum();
+    if total <= 0.0 || !amount.is_finite() || amount <= 0.0 {
+        return false;
+    }
+    let mut mass_changed = false;
+    // BTreeMap order is the fixed drain order; the share is
+    // proportional to holdings — deterministic given the record.
+    let shares: Vec<(ResourceId, f64)> = stores
+        .iter()
+        .map(|(r, held)| (r.clone(), amount * held / total))
+        .collect();
+    for (r, share) in shares {
+        let Some((cap, mpu)) = part
+            .tanks
+            .iter()
+            .find(|t| t.resource == r)
+            .map(|t| (t.capacity, t.mass_per_unit_kg))
+        else {
+            continue;
+        };
+        let held = stores.entry(r).or_insert(0.0);
+        let old = *held;
+        *held = (old - share).max(0.0);
+        mass_changed |= apply_bucket_delta(part, cap, mpu, old, *held);
+    }
+    mass_changed
+}
+
 /// The re-weld half of the §2.4 inertia-cache rule — `debit`/`credit`
 /// already folded the bucketed-mass delta into `mass_kg`/`inertia` at
 /// write time (the only contents producers at M6), so this step only

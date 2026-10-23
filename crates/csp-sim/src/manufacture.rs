@@ -107,6 +107,7 @@ impl crate::World {
     /// BOM, funds, and the vessel-cap slot, then spend everything and
     /// schedule the delivery. Nothing about the craft exists until
     /// `ConstructionComplete`.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn apply_manufacture_craft(
         &mut self,
         site: SiteId,
@@ -138,6 +139,16 @@ impl crate::World {
             || !craft.part_costs.iter().all(|c| c.is_finite() && *c >= 0.0)
         {
             return Err(SimError::Recoverable("manufacture: incoherent part costs"));
+        }
+        // M9b: the reliability table is empty (no model) or covers
+        // `parts` exactly with valid specs — the `part_costs` gate.
+        if !craft.reliability.is_empty()
+            && (craft.reliability.len() != craft.parts.len()
+                || !craft.reliability.iter().all(|s| s.is_valid()))
+        {
+            return Err(SimError::Recoverable(
+                "manufacture: incoherent reliability table",
+            ));
         }
         csp_phys::weld::weld(&craft.graph, &craft.parts)
             .map_err(|_| SimError::Recoverable("manufacture: craft fails the weld gate"))?;
@@ -272,6 +283,16 @@ impl crate::World {
         let thermal = ambient.map_or_else(crate::VesselThermal::default, |a| {
             crate::VesselThermal::at_ambient(&b.craft.graph, a)
         });
+        // M9b §3.4: construction IS part creation — the delivered
+        // craft's per-node records draw their `θ₀` here, so a revert
+        // to the post-delivery snapshot preserves the pre-drawn
+        // thresholds (the allocator rides `shadow_vessels`).
+        let reliability = crate::reliability::allocate_records(
+            self.save_seed,
+            &b.craft,
+            self.clock.ticks(),
+            &mut self.next_part_instance_id,
+        )?;
         self.vessels.insert(
             id,
             crate::Vessel {
@@ -296,8 +317,13 @@ impl crate::World {
                 crew: Vec::new(),
                 science: crate::VesselScience::default(),
                 joined_colony: None,
+                reliability,
             },
         );
+        // M9b: a freshly delivered vessel sits dormant — restamp the
+        // records under the dormant rate now (the publish slot's
+        // next pass derives the pending crossings from this stamp).
+        self.reliability_residence_change(id, self.clock.ticks(), true);
         Ok(())
     }
 }
@@ -411,6 +437,7 @@ mod tests {
                 },
             }],
             part_costs: vec![10.0],
+            reliability: vec![],
         }
     }
 

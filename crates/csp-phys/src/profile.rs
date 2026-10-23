@@ -158,6 +158,104 @@ impl Default for MissionProfile {
     }
 }
 
+// ---------------------------------------------------------------------------
+// M9b: the real confidence number — `exp(−Λ_expected(profile))` (§3.4).
+// ---------------------------------------------------------------------------
+
+/// §3.4's expected hazard over a [`MissionProfile`], evaluated per
+/// part spec — the pure function the confidence number is `exp` of.
+///
+/// The evaluation is a *conservative approximation* (documented —
+/// the live model's exact regime inputs do not exist at planning
+/// time): per burn segment, each part's `λ_base · qual_factor(family)`
+/// picks up every authored stress rule whose *planning* metric the
+/// segment trips:
+///
+/// - `OverThrottle` — `seg.throttle > threshold`.
+/// - `BurnBeyondRated` — the cumulative burn duration through the
+///   segment exceeds `engine.rated_burn_s + threshold` (engine specs
+///   only; evaluated against the running total, not per segment).
+/// - `Overtemperature` — regime `Atmosphere` (ascent/descent heating
+///   is the authored stress case).
+/// - `ExcessG` — regime `Atmosphere` (the high-g legs are the
+///   atmospheric ones).
+/// - `UllageNegativeIgnition` — regime `Vacuum` on a
+///   `ullage_required` engine (vacuum ignition is assumed
+///   free-fall).
+/// - `ExcessRestarts` — segment index `> threshold` (each segment
+///   past the threshold counts as a restart).
+///
+/// Infant mortality is not folded in — a planned mission reads the
+/// mature hazard (the fresh-part bump is a property of a *specific*
+/// unit's usage, not of the profile). Dormant hazard between
+/// segments is likewise outside the profile's scope — the profile
+/// covers its burn segments only (the §3.4 shape is burn-segmented;
+/// coast time is the design assistant's to add if it ever authors
+/// dormant legs).
+///
+/// `quals` supplies the live per-family qualification records —
+/// absent families resolve at the unqualified end of the curve,
+/// matching the resolver's `FamilyQualification::FRESH` convention.
+pub fn expected_hazard(
+    specs: &[crate::resolve::ReliabilitySpec],
+    quals: &crate::resolve::FamilyQualifications,
+    profile: &MissionProfile,
+) -> f64 {
+    let mut lambda_total = 0.0;
+    for spec in specs {
+        if !spec.is_valid() {
+            continue;
+        }
+        let units = quals.get(&spec.family).map_or(0.0, |q| q.units());
+        let qual = crate::resolve::qual_factor(&spec.qualification_curve, units);
+        let base = spec.base_hazard_per_s() * qual;
+        let mut burn_s = 0.0;
+        for (i, seg) in profile.burn_segments.iter().enumerate() {
+            if !seg.duration_s.is_finite() || seg.duration_s < 0.0 {
+                continue;
+            }
+            let mut stress = 1.0;
+            for rule in &spec.regime_stress {
+                let active = match rule.kind {
+                    csp_data::StressKind::OverThrottle => seg.throttle > rule.threshold,
+                    csp_data::StressKind::BurnBeyondRated => {
+                        spec.engine.is_some()
+                            && burn_s + seg.duration_s
+                                > rule.threshold + spec.engine.map_or(0.0, |e| e.rated_burn_s)
+                    }
+                    csp_data::StressKind::Overtemperature => seg.regime == Regime::Atmosphere,
+                    csp_data::StressKind::ExcessG => seg.regime == Regime::Atmosphere,
+                    csp_data::StressKind::UllageNegativeIgnition => {
+                        seg.regime == Regime::Vacuum
+                            && spec.engine.is_some_and(|e| e.ullage_required)
+                    }
+                    csp_data::StressKind::ExcessRestarts => i as f64 > rule.threshold,
+                };
+                if active {
+                    stress *= rule.multiplier;
+                }
+            }
+            lambda_total += base * stress * seg.duration_s;
+            if spec.engine.is_some() {
+                burn_s += seg.duration_s;
+            }
+        }
+    }
+    lambda_total
+}
+
+/// §3.4's mission confidence — `exp(−Λ_expected(MissionProfile))`,
+/// the pure function (the M3 `evaluate` stub stays for the Δv/TWR
+/// verdicts; this is the reliability number the profile object was
+/// defined for).
+pub fn confidence(
+    specs: &[crate::resolve::ReliabilitySpec],
+    quals: &crate::resolve::FamilyQualifications,
+    profile: &MissionProfile,
+) -> f64 {
+    libm::exp(-expected_hazard(specs, quals, profile))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

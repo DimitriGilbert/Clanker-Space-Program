@@ -632,23 +632,32 @@ pub struct QualCurve {
 /// `rated_burn_s`, temperature fraction of `max_temp_k`, g-load,
 /// ullage-negative ignition, restarts beyond `ignitions`". Each names
 /// which regime metric `StressRule::threshold` is measured against.
+/// The §3.4 stress kinds — explicit, stable, append-only `u16`
+/// discriminants (the sim's `ReliabilitySpec` hash walk reads them).
+#[repr(u16)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StressKind {
     /// Throttle fraction above the rated point.
-    OverThrottle,
+    OverThrottle = 0,
     /// Continuous burn beyond `rated_burn_s` (seconds over).
-    BurnBeyondRated,
+    BurnBeyondRated = 1,
     /// Temperature as a fraction of `ThermalDef::max_temp_k`.
-    Overtemperature,
+    Overtemperature = 2,
     /// Sustained acceleration load (g).
-    ExcessG,
+    ExcessG = 3,
     /// Ignition attempted ullage-negative (requires
     /// `ullage_required` on the engine; threshold unused — the rule
     /// fires per event, `threshold` authors the multiplier's ramp-in
     /// and is conventionally 0).
-    UllageNegativeIgnition,
+    UllageNegativeIgnition = 4,
     /// Ignitions beyond the `ignitions` count.
-    ExcessRestarts,
+    ExcessRestarts = 5,
+}
+
+impl csp_core::StableDiscriminant for StressKind {
+    fn discriminant(&self) -> u16 {
+        *self as u16
+    }
 }
 
 /// §3.4 `regime_stress` entry: when the kind's regime metric exceeds
@@ -670,25 +679,35 @@ pub struct StressRule {
 /// panel jam. Explosions are reserved for thermal/structural."
 /// [`FailureMode::is_fatal`] is the §3.4 dormant-hazard filter —
 /// "dormant failures are restricted to non-fatal modes".
+///
+/// Discriminants are explicit, stable, append-only `u16`s — the sim's
+/// `PartFailure` event hashes them (§7.1 rule 7).
+#[repr(u16)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FailureMode {
     /// Thrust degraded — engine runs at reduced output.
-    DegradedThrust,
+    DegradedThrust = 0,
     /// Gimbal frozen in place.
-    StuckGimbal,
+    StuckGimbal = 1,
     /// Engine fails to ignite on the next ignition draw.
-    IgnitionFailure,
+    IgnitionFailure = 2,
     /// Tank contents leak over time.
-    Leak,
+    Leak = 3,
     /// Telemetry/control sensor fault.
-    SensorFault,
+    SensorFault = 4,
     /// Decoupler does not sever on the staging signal.
-    StuckDecoupler,
+    StuckDecoupler = 5,
     /// Deployable (panel/antenna) does not deploy.
-    PanelJam,
+    PanelJam = 6,
     /// Catastrophic loss of the part — thermal/structural only (§3.4).
     /// The only fatal mode; never produced by dormant hazard.
-    Explosion,
+    Explosion = 7,
+}
+
+impl csp_core::StableDiscriminant for FailureMode {
+    fn discriminant(&self) -> u16 {
+        *self as u16
+    }
 }
 
 impl FailureMode {

@@ -155,7 +155,21 @@ use crate::SimError;
 /// `SetScriptEnabled`, `EngageAutopilot`, `DisengageAutopilot` — all
 /// appended, never renumbered. `WorldSnapshot` gained the four script
 /// fields (save format change). The goldens rebless.
-pub const HASH_SCHEMA_VERSION: u32 = 16;
+///
+/// **Version 17** (M9b): §3.4's reliability model — the craft walk
+/// appended the frozen `ReliabilitySpec` table (parallel to
+/// `parts`/`part_costs`), the vessel walk appended the per-node
+/// `PartReliability` records (pre-drawn `θ`, usage, flags, and the
+/// record-tail `renewal_count` — the per-failure draw ordinal,
+/// distinct from the dedup'd `failures` list), and the world walk
+/// appended `next_part_instance_id`, the reliability config, and the
+/// bench arena + counter. `EventKind` gained
+/// `PartFailure` (23 — Silent) and `BenchTestComplete` (24 — Silent);
+/// `SimCommand` gained `RunBenchTest`; `FundsReason` gained
+/// `BenchTest` (9); `FailureMode`/`StressKind` gained explicit stable
+/// `u16` discriminants. `WorldSnapshot`/`TickShadow` gained the
+/// reliability fields (save format change). The goldens rebless.
+pub const HASH_SCHEMA_VERSION: u32 = 17;
 
 /// Rule-7 sum types: the source of an enum's *declared* stable `u16`
 /// discriminant (PLAN §7.1 rule 7).

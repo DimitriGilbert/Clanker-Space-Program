@@ -374,6 +374,35 @@ pub enum EventKind {
         /// The script arena id whose tick fires.
         script: crate::ScriptId,
     } = 22,
+    /// M9b §3.4's `PartFailure` — the reliability model's threshold
+    /// crossing, the hole in the event table the model fixes. A
+    /// dormant part's constant λ makes `Λ(t) = θ` a closed-form
+    /// crossing the `Reliability` slot publishes; firing applies the
+    /// carried mode (drawn at publish over the applicable set),
+    /// records it, and re-publishes the renewal clock. Always
+    /// `Silent` per §3.4 — surfacing rides `fired_events` plus the
+    /// notification log; a stale firing (the record moved, or its
+    /// rate changed since the publish) is a tolerated no-op like
+    /// `TransferComplete`.
+    PartFailure {
+        /// The vessel the part belongs to.
+        vessel: VesselId,
+        /// The part instance — the `{RELIABILITY}` KDF entity,
+        /// unique across the save.
+        part: crate::reliability::PartInstanceId,
+        /// The failure mode applied at the crossing (drawn at
+        /// publish — dormant publishes draw the non-fatal subset).
+        mode: csp_data::FailureMode,
+    } = 23,
+    /// M9b §3.4's test-stand delivery — the `ConstructionComplete`
+    /// precedent: a `RunBenchTest` order spent funds + site inventory
+    /// at apply; the firing credits `bench_units` into the family's
+    /// qualification record. Always `Silent` — qualification
+    /// bookkeeping must never demote warp.
+    BenchTestComplete {
+        /// The bench arena id the run completes.
+        run: crate::reliability::BenchId,
+    } = 24,
 }
 
 impl StableDiscriminant for EventKind {
@@ -402,6 +431,8 @@ impl StableDiscriminant for EventKind {
             Self::LifeSupportCheck => 20,
             Self::VesselLifeSupportDepleted { .. } => 21,
             Self::ScriptWake { .. } => 22,
+            Self::PartFailure { .. } => 23,
+            Self::BenchTestComplete { .. } => 24,
         }
     }
 }
@@ -431,7 +462,12 @@ pub fn class_of(kind: &EventKind, tracked: &BTreeSet<VesselId>) -> EventClass {
         | EventKind::ColonyInspection { .. }
         // M8-C: the periodic vessel check is bookkeeping like
         // `SalaryDue` — never clamps warp.
-        | EventKind::LifeSupportCheck => {
+        | EventKind::LifeSupportCheck
+        // M9b §3.4: the failure crossing and the bench delivery are
+        // `Silent` bookkeeping — surfacing rides the notification
+        // log, never warp demotion.
+        | EventKind::PartFailure { .. }
+        | EventKind::BenchTestComplete { .. } => {
             EventClass::Silent
         }
         EventKind::ContractDeadline { .. }
@@ -553,6 +589,14 @@ impl ScheduledEvent {
             }
             EventKind::ScriptWake { script } => {
                 h.u64(script.0);
+            }
+            EventKind::PartFailure { vessel, part, mode } => {
+                h.u64(vessel.0);
+                h.u64(part.0);
+                h.stable_enum(mode);
+            }
+            EventKind::BenchTestComplete { run } => {
+                h.u64(run.0);
             }
         }
     }

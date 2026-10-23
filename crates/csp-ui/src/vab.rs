@@ -180,6 +180,12 @@ pub struct VabSession {
     analysis_error: Option<String>,
     validation: Option<Validation>,
     body_xforms: BTreeMap<PartNodeId, PartTransform>,
+    /// The reliability probe — the inspector's editable regime
+    /// metrics, fed to `csp_phys::stress_breakdown` so the part's
+    /// authored stress rules show which would fire under a
+    /// hypothetical regime (§3.4: "hidden stress multipliers are bad
+    /// design"). Session state only (§2.2-C), never hashed.
+    stress_probe: csp_phys::RegimeMetrics,
     /// The save-slot name the file field edits (persists across saves).
     pub save_name: String,
 }
@@ -678,6 +684,7 @@ fn inspector_panel(
 }
 
 /// Craft name, totals, file save/load, mission check.
+#[allow(clippy::too_many_lines)]
 fn craft_section(
     ui: &mut egui::Ui,
     vab: &mut VabSession,
@@ -725,6 +732,22 @@ fn craft_section(
                 vab.profile().min_launch_twr,
                 if check.meets_launch_twr { "ok" } else { "LOW" }
             ));
+        }
+        // M9b §3.4: the profile's real confidence — `exp(−Λ_expected)`
+        // over the burn segments, evaluated with zero qualification
+        // units (the editor session has no save-side family table —
+        // flight-tested families improve on this number).
+        let specs: Vec<csp_phys::ReliabilitySpec> = a
+            .effective
+            .iter()
+            .map(csp_phys::ReliabilitySpec::from_effective)
+            .collect();
+        if !specs.is_empty() {
+            let quals = csp_phys::FamilyQualifications::default();
+            let c = csp_phys::confidence(&specs, &quals, vab.profile());
+            if c.is_finite() {
+                ui.label(format!("confidence {:.1}% (unqualified family)", c * 100.0));
+            }
         }
     }
     if let Some(e) = vab.analysis_error() {
@@ -975,6 +998,8 @@ fn selected_section(ui: &mut egui::Ui, vab: &mut VabSession) {
         }
     }
 
+    reliability_section(ui, vab, id);
+
     ui.horizontal(|ui| {
         if ui.button("make root").clicked() {
             let _ = vab.apply(VabAction::Reroot(id));
@@ -985,6 +1010,120 @@ fn selected_section(ui: &mut egui::Ui, vab: &mut VabSession) {
         if ui.button("deselect").clicked() {
             let _ = vab.apply(VabAction::Select(None));
         }
+    });
+}
+
+/// The node's resolved reliability spec — `analysis.effective[i]`
+/// pairs with the session's ascending-`PartNodeId` iteration (the
+/// `effective_index` convention `to_part_graph` sets).
+fn selected_spec(vab: &VabSession, id: PartNodeId) -> Option<csp_phys::ReliabilitySpec> {
+    let idx = vab.session().iter().position(|(nid, _)| nid == id)?;
+    vab.analysis()
+        .and_then(|a| a.effective.get(idx))
+        .map(csp_phys::ReliabilitySpec::from_effective)
+}
+
+/// A readable one-line rendering of an authored stress rule — the
+/// kind's metric vs its threshold, and the multiplier the rule
+/// applies while active.
+fn stress_rule_text(rule: &csp_data::StressRule) -> String {
+    use csp_data::StressKind;
+    let cond = match rule.kind {
+        StressKind::OverThrottle => format!("throttle > {:.2}", rule.threshold),
+        StressKind::BurnBeyondRated => format!("burn_s > rated + {:.0}s", rule.threshold),
+        StressKind::Overtemperature => format!("T/Tmax > {:.2}", rule.threshold),
+        StressKind::ExcessG => format!("g-load > {:.1}g", rule.threshold),
+        StressKind::UllageNegativeIgnition => "ullage-negative ignition".to_string(),
+        StressKind::ExcessRestarts => format!("restarts > {:.0}", rule.threshold),
+    };
+    format!("{cond} → λ×{:.2}", rule.multiplier)
+}
+
+/// §3.4's "displayed to the player" surface (the `regime_stress` spec
+/// text: "hidden stress multipliers are bad design") — the selected
+/// part's resolved reliability numbers plus its authored stress rules
+/// evaluated by `csp_phys::stress_breakdown` under the editable probe
+/// metrics. The active marks and the Π product are the same
+/// evaluation the flight model applies — one function, one answer.
+fn reliability_section(ui: &mut egui::Ui, vab: &mut VabSession, id: PartNodeId) {
+    let Some(spec) = selected_spec(vab, id) else {
+        return;
+    };
+    ui.collapsing("Reliability", |ui| {
+        ui.monospace(format!(
+            "MTBF {:.3e} s · family {}",
+            spec.base_mtbf_s, spec.family
+        ));
+        ui.monospace(format!(
+            "infant +{:.0}% · dormant ×{:.3}{}",
+            spec.infant_mortality * 100.0,
+            spec.dormant_stress,
+            spec.engine
+                .map(|e| format!(" · rated burn {:.0}s", e.rated_burn_s))
+                .unwrap_or_default(),
+        ));
+        let modes = spec
+            .failure_modes
+            .iter()
+            .map(|(m, w)| format!("{m:?} ×{w:.2}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        ui.weak(format!("failure modes: {modes}"));
+        if spec.regime_stress.is_empty() {
+            ui.weak("no regime stress rules");
+            return;
+        }
+        ui.separator();
+        ui.weak("probe regime (hypothetical — not sim state):");
+        let p = &mut vab.stress_probe;
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::DragValue::new(&mut p.throttle)
+                    .range(0.0..=1.5)
+                    .speed(0.02)
+                    .prefix("thr "),
+            );
+            ui.add(
+                egui::DragValue::new(&mut p.temp_fraction)
+                    .range(0.0..=2.0)
+                    .speed(0.02)
+                    .prefix("T/Tmax "),
+            );
+            ui.add(
+                egui::DragValue::new(&mut p.g_load)
+                    .range(0.0..=100.0)
+                    .speed(0.1)
+                    .prefix("g "),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::DragValue::new(&mut p.burn_s)
+                    .range(0.0..=1.0e9)
+                    .speed(1.0)
+                    .prefix("burn s "),
+            );
+            ui.add(
+                egui::DragValue::new(&mut p.restarts)
+                    .range(0.0..=1000.0)
+                    .speed(1.0)
+                    .prefix("restarts "),
+            );
+            ui.checkbox(&mut p.ullage_negative, "ullage−");
+        });
+        let probe = vab.stress_probe;
+        for (rule, active) in csp_phys::stress_breakdown(&spec, &probe) {
+            let text = stress_rule_text(rule);
+            if active {
+                ui.colored_label(egui::Color32::YELLOW, format!("▶ {text}"));
+            } else {
+                ui.weak(format!("   {text}"));
+            }
+        }
+        ui.monospace(format!(
+            "Π stress ×{:.3}  (operating λ = base × product × qual × infant)",
+            csp_phys::stress_product(&spec, &probe)
+        ));
     });
 }
 

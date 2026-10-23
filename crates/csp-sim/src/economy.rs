@@ -342,6 +342,10 @@ pub enum FundsReason {
     /// §3.6's failure penalty — a `ContractDeadline` expiry's
     /// charge (a drain: clamps, never rejects).
     ContractPenalty = 8,
+    /// M9b §3.4's test-stand charge — `RunBenchTest`'s spend
+    /// (reservation: charged at apply, delivered at
+    /// `BenchTestComplete`).
+    BenchTest = 9,
 }
 
 impl StableDiscriminant for FundsReason {
@@ -966,6 +970,7 @@ mod tests {
                 },
             }],
             part_costs: vec![cost],
+            reliability: vec![],
         }
     }
 
@@ -999,6 +1004,7 @@ mod tests {
                 crew: Vec::new(),
                 science: VesselScience::default(),
                 joined_colony: None,
+                reliability: BTreeMap::new(),
             },
         );
         id

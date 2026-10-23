@@ -177,7 +177,7 @@ use serde::{Deserialize, Serialize};
 use csp_core::{DVec3, SimError};
 use csp_data::{
     AttachNode, ColliderDef, FailureMode, FamilyId, LoadedParts, ModuleDef, PartDef, PartId,
-    ResourceFile, ResourceId, ScaleRule, StatPath, StressRule, VariantId,
+    ResourceFile, ResourceId, ScaleRule, StatPath, StressKind, StressRule, VariantId,
 };
 
 use crate::part::{ColliderShape, ForceSite, ForceSiteKind, WeldPart};
@@ -185,10 +185,18 @@ use crate::tensor::{Axis, SymMat3};
 
 /// Slope of the v1 wear→hazard stub: a part's baseline hazard grows by
 /// `operating_s / base_mtbf_s` — one full MTBF of operating time
-/// doubles the unstressed hazard. §3.4's real model (stress products,
-/// infant decay, dormant accrual, `Λ` integration) replaces this when
-/// the reliability accumulation loop lands; until then this constant
-/// keeps the wear channel honest and exercised.
+/// doubles the unstressed hazard.
+///
+/// **M9b status — superseded for failure decisions.** The §3.4 model
+/// landed in `csp-sim`'s reliability module: the authoritative λ(t)
+/// is evaluated per tick (in-bubble) or per closed-form publish
+/// (dormant) from the live `PartReliability` record — pre-drawn
+/// `θ`, regime-stress products, infant decay, dormant accrual — and
+/// this stub never feeds it. `wear_multiplier`/`apply_wear`/`hazard_
+/// per_s` remain only as resolution-time display projections (what
+/// a readout can show for a fresh/aged instance); no sim path reads
+/// them. Removing them is a follow-up cleanup once the readouts
+/// switch to the `ReliabilitySpec` table.
 pub const WEAR_HAZARD_STUB: f64 = 1.0;
 
 /// The §3.1 serialized craft-instance record — "SERIALIZED per part
@@ -423,6 +431,12 @@ pub struct ResolvedReliability {
     pub dormant_stress: f64,
     /// Authored failure-mode distribution.
     pub failure_modes: Vec<(FailureMode, f64)>,
+    /// Authored `qual_factor` curve (resolved passthrough) — the
+    /// point-evaluated [`Self::qual_factor`] is the live-units
+    /// reading at resolve time; the curve itself travels with the
+    /// resolved part so §3.4's `qual_factor(family)` can re-evaluate
+    /// on the family's *live* units (the module doc's step 7).
+    pub qualification_curve: csp_data::QualCurve,
 }
 
 /// §3.1's `EffectivePart` — the resolved craft part the whole game
@@ -1069,7 +1083,12 @@ fn resolve_module(m: &ModuleDef, f: &ScaleFactors, mults: &BTreeMap<StatPath, f6
 /// temperature-table convention `AeroKnot` docs reuse). An empty
 /// curve — which the validator forbids but a raw def could carry —
 /// resolves to `1.0`, "no qualification credit".
-fn qual_factor(curve: &csp_data::QualCurve, units: f64) -> f64 {
+///
+/// Public for the M9b reliability loop: §3.4's `qual_factor(family)`
+/// reads the family's *live* qualification units, so the sim
+/// re-evaluates the same curve the resolver does — one function, one
+/// answer.
+pub fn qual_factor(curve: &csp_data::QualCurve, units: f64) -> f64 {
     let knots = &curve.knots;
     if knots.is_empty() || units <= knots[0].qualification_units {
         return knots.first().map_or(1.0, |k| k.hazard_multiplier);
@@ -1122,6 +1141,206 @@ pub fn apply_wear(eff: &mut EffectivePart, usage: &PartUsage) -> Result<(), Reso
     r.wear_multiplier = wear_multiplier(r.base_mtbf_s, usage);
     r.hazard_per_s = r.base_hazard_per_s * r.qual_factor * r.wear_multiplier;
     Ok(())
+}
+
+/// The engine-specific half of a [`ReliabilitySpec`] — the resolved
+/// fields §3.4's stress rules key on (`BurnBeyondRated`,
+/// `ExcessRestarts`, `UllageNegativeIgnition`). `None` on a spec
+/// means the part carries no `Engine` module: engine-only stresses
+/// never apply and the part never "burns" for the operating/dormant
+/// split.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EngineReliability {
+    /// Rated continuous burn (s) — the `BurnBeyondRated` metric's
+    /// reference.
+    pub rated_burn_s: f64,
+    /// Rated lifetime ignitions; `None` = unlimited — the
+    /// `ExcessRestarts` count metric compares against the authored
+    /// rule threshold either way.
+    pub ignitions: Option<u32>,
+    /// Whether ignition requires settled propellant — gates the
+    /// `UllageNegativeIgnition` stress.
+    pub ullage_required: bool,
+}
+
+/// The reliability half of a resolved part, packaged for the sim's
+/// `CraftDef` — §3.4's def-side numbers with resolution baked in,
+/// parallel to `parts`/`part_costs` (frozen at build like both; the
+/// LIVE inputs — `PartUsage`, `FamilyQualification` — stay sim-side
+/// per §3.1's two-lifetimes rule).
+///
+/// Unlike [`ResolvedReliability`] this record carries the *curve*,
+/// not the point-evaluated `qual_factor`: §3.4 re-evaluates
+/// `qual_factor(family)` on the family's live units, so the curve
+/// must travel with the craft (a bench test mid-flight must reach
+/// already-built units — the resolve doc's step 7).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReliabilitySpec {
+    /// The upgrade/qualification family (§3.3/§3.4 key).
+    pub family: FamilyId,
+    /// `base_mtbf_s` after [`StatPath::BaseMtbfS`] multipliers (s).
+    pub base_mtbf_s: f64,
+    /// Authored infant-mortality fraction — extra hazard for a fresh
+    /// part, decaying with early operating time.
+    pub infant_mortality: f64,
+    /// Authored dormant-hazard multiplier — `λ_dormant =
+    /// λ_base · dormant_stress` (§3.4 verbatim: no `qual_factor`,
+    /// no infant decay, no regime stresses).
+    pub dormant_stress: f64,
+    /// Authored stress rules, verbatim (§3.4: displayed to the
+    /// player, never hidden).
+    pub regime_stress: Vec<StressRule>,
+    /// Authored `(mode, weight)` failure-mode distribution.
+    pub failure_modes: Vec<(FailureMode, f64)>,
+    /// Authored `qual_factor` curve — evaluated on the family's
+    /// *live* [`FamilyQualification::units`] at each λ evaluation
+    /// (the type doc's live-qualification rule).
+    pub qualification_curve: csp_data::QualCurve,
+    /// The engine half, when the part carries an `Engine` module.
+    pub engine: Option<EngineReliability>,
+}
+
+impl ReliabilitySpec {
+    /// Project one [`EffectivePart`] to its reliability spec —
+    /// the `CraftDef::reliability` producer every craft builder
+    /// shares (`part_costs` precedent: the caller assembles the
+    /// parallel table from resolved parts).
+    pub fn from_effective(eff: &EffectivePart) -> Self {
+        let engine = eff.modules.iter().find_map(|m| match m {
+            ModuleDef::Engine {
+                rated_burn_s,
+                ignitions,
+                ullage_required,
+                ..
+            } => Some(EngineReliability {
+                rated_burn_s: *rated_burn_s,
+                ignitions: *ignitions,
+                ullage_required: *ullage_required,
+            }),
+            _ => None,
+        });
+        Self {
+            family: eff.family.clone(),
+            base_mtbf_s: eff.reliability.base_mtbf_s,
+            infant_mortality: eff.reliability.infant_mortality,
+            dormant_stress: eff.reliability.dormant_stress,
+            regime_stress: eff.reliability.regime_stress.clone(),
+            failure_modes: eff.reliability.failure_modes.clone(),
+            qualification_curve: eff.reliability.qualification_curve.clone(),
+            engine,
+        }
+    }
+
+    /// Whether the record is well-formed — the sim's authored-input
+    /// gate (the spawn checks): every rate finite and non-negative,
+    /// MTBF positive, rules sane, at least one weighted mode.
+    pub fn is_valid(&self) -> bool {
+        self.base_mtbf_s.is_finite()
+            && self.base_mtbf_s > 0.0
+            && self.infant_mortality.is_finite()
+            && (0.0..1.0).contains(&self.infant_mortality)
+            && self.dormant_stress.is_finite()
+            && (0.0..=1.0).contains(&self.dormant_stress)
+            && !self.failure_modes.is_empty()
+            && self
+                .failure_modes
+                .iter()
+                .all(|(_, w)| w.is_finite() && *w > 0.0)
+            && self
+                .regime_stress
+                .iter()
+                .all(|r| r.threshold.is_finite() && r.threshold >= 0.0 && r.multiplier >= 1.0)
+            && self
+                .engine
+                .is_none_or(|e| e.rated_burn_s.is_finite() && e.rated_burn_s >= 0.0)
+    }
+
+    /// `λ_base = 1 / base_mtbf_s` (hazard per second).
+    pub fn base_hazard_per_s(&self) -> f64 {
+        1.0 / self.base_mtbf_s
+    }
+
+    /// The dormant accrual rate — §3.4 verbatim `λ_base ·
+    /// dormant_stress`, scaled by the save's global dormant switch
+    /// (`dormant_stress_scale = 0` disables the mechanic entirely).
+    /// Constant per part per save — which is what makes the dormant
+    /// `PartFailure` publish tick stable once computed.
+    pub fn dormant_hazard_per_s(&self, dormant_stress_scale: f64) -> f64 {
+        self.base_hazard_per_s() * self.dormant_stress * dormant_stress_scale
+    }
+}
+
+/// The regime inputs one stress evaluation reads — what the part saw
+/// this tick. §3.4's `Π(stress_i)` terms each key on one field; the
+/// sim's per-part tick pass fills them from live physics state, the
+/// editor fills them from a user-set probe so the same evaluation the
+/// flight model runs is the one displayed (§3.4: "hidden stress
+/// multipliers are bad design" — the display IS this function's
+/// output, never a re-derived table).
+///
+/// The type lives next to [`ReliabilitySpec`] — not in the sim —
+/// because it is pure spec math both the sim tick and the `csp-ui`
+/// VAB consume (`csp-ui` never sees `csp-sim`, §2.1).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RegimeMetrics {
+    /// Vessel throttle fraction this tick.
+    pub throttle: f64,
+    /// Continuous burn duration at this tick (s) — engine only.
+    pub burn_s: f64,
+    /// `temp_k / max_temp_k` — the `Overtemperature` metric.
+    pub temp_fraction: f64,
+    /// Sustained acceleration in g — the `ExcessG` metric.
+    pub g_load: f64,
+    /// `UllageNegativeIgnition` latched this burn.
+    pub ullage_negative: bool,
+    /// Lifetime restart count (`ignitions − 1`, floored at 0) — the
+    /// `ExcessRestarts` metric.
+    pub restarts: f64,
+}
+
+/// Whether `rule` is active under `m` — the single evaluation both
+/// [`stress_product`] and [`stress_breakdown`] read, so the displayed
+/// table can never drift from the applied product.
+fn stress_rule_active(spec: &ReliabilitySpec, rule: &StressRule, m: &RegimeMetrics) -> bool {
+    match rule.kind {
+        StressKind::OverThrottle => m.throttle > rule.threshold,
+        StressKind::BurnBeyondRated => {
+            spec.engine.is_some()
+                && m.burn_s > rule.threshold + spec.engine.map_or(0.0, |e| e.rated_burn_s)
+        }
+        StressKind::Overtemperature => m.temp_fraction > rule.threshold,
+        StressKind::ExcessG => m.g_load > rule.threshold,
+        StressKind::UllageNegativeIgnition => m.ullage_negative,
+        StressKind::ExcessRestarts => m.restarts > rule.threshold,
+    }
+}
+
+/// `Π(stress_i)` over the spec's authored rules for `metrics` — the
+/// applied half of §3.4's stress model (the sim's operating λ reads
+/// this every evaluation).
+pub fn stress_product(spec: &ReliabilitySpec, m: &RegimeMetrics) -> f64 {
+    let mut product = 1.0;
+    for rule in &spec.regime_stress {
+        if stress_rule_active(spec, rule, m) {
+            product *= rule.multiplier;
+        }
+    }
+    product
+}
+
+/// The `(rule, active)` display table — the §3.4 "displayed to the
+/// player" half of [`stress_product`], same evaluation: each authored
+/// rule paired with whether it fires under `m`. The VAB's part
+/// inspector renders this verbatim (rule text from the def, active
+/// marks from the probe metrics).
+pub fn stress_breakdown<'a>(
+    spec: &'a ReliabilitySpec,
+    m: &RegimeMetrics,
+) -> Vec<(&'a StressRule, bool)> {
+    spec.regime_stress
+        .iter()
+        .map(|rule| (rule, stress_rule_active(spec, rule, m)))
+        .collect()
 }
 
 /// Propellant mass of the resolved tank contents — tanks full (module
@@ -1438,6 +1657,7 @@ fn resolve_reliability(
         regime_stress: def.reliability.regime_stress.clone(),
         dormant_stress: def.reliability.dormant_stress,
         failure_modes: def.reliability.failure_modes.clone(),
+        qualification_curve: def.reliability.qualification_curve.clone(),
     })
 }
 

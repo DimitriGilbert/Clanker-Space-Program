@@ -1,7 +1,7 @@
 // Global balance constants. ALL tuning lives here (PLAN §8.3).
 // Named fields only — positional tuples drift silently under reordering.
 (
-    schema_version: 10,
+    schema_version: 11,
     // Physics bubble radius (PLAN §2.3): 20 km. Vessels go on rails at the
     // radius and rejoin at 90% (18 km) — the hysteresis is csp-sim logic,
     // not a second constant.
@@ -78,4 +78,24 @@
     // M9a §2.10's per-save script op budget — "default 20 000,
     // configurable per save". Mirror: `csp_sim::DEFAULT_SCRIPT_OP_BUDGET`.
     script_op_budget: 20_000,
+    // M9b §3.4's reliability block — the dormant-hazard master
+    // switch (0 disables the mechanic), the ignition-hazard window,
+    // failure-mode effect magnitudes, infant-mortality decay, the
+    // notification bound, regime-weighted flight-qualification
+    // rates, and the test-stand economics. Mirror:
+    // `csp_sim::reliability::default_config`.
+    reliability_dormant_stress_scale: 1.0,
+    reliability_ignition_hazard_s: 1.0,
+    reliability_degraded_thrust_factor: 0.5,
+    reliability_leak_units_per_s: 0.001,
+    reliability_infant_tau_s: 3_600.0,
+    reliability_notification_cap: 256,
+    reliability_flight_units_per_s_vacuum: 0.01,
+    reliability_flight_units_per_s_atmosphere: 0.02,
+    reliability_bench_funds_per_unit: 50.0,
+    // The site-inventory resource a bench run consumes (authored —
+    // §8.3 forbids hardcoded tunables).
+    reliability_bench_resource: "metal",
+    reliability_bench_resource_per_unit: 1.0,
+    reliability_bench_seconds_per_unit: 60.0,
 )

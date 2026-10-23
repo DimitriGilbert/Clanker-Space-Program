@@ -875,6 +875,23 @@ pub(crate) fn apply_latch(
     // like `parts` — a node's cost rides its `effective_index`.
     let mut part_costs_m = craft_p.part_costs.clone();
     part_costs_m.extend(craft_s.part_costs.iter().cloned());
+    // M9b: the frozen spec table merges positionally exactly like
+    // `parts`/`part_costs` — same `effective_index` convention — but
+    // only when BOTH halves carry a table covering their own `parts`.
+    // A specless half absorbed by a spec'd one has no positional
+    // representation (the absorbed side's specs would bind at the
+    // other half's `effective_index` slots), so the merged craft
+    // drops the model: its records go inert, never wrong —
+    // `reliability::specs_parallel` gates every reader the same way.
+    let reliability_table_m = if crate::reliability::specs_parallel(&craft_p)
+        && crate::reliability::specs_parallel(&craft_s)
+    {
+        let mut t = craft_p.reliability.clone();
+        t.extend(craft_s.reliability.iter().cloned());
+        t
+    } else {
+        Vec::new()
+    };
     let mut body_m =
         csp_phys::weld(&merge.graph, &parts_m).map_err(|e| SimError::Fatal(e.reason()))?;
     // §2.9's hand-off: the merged body keeps the primary's pose and
@@ -927,6 +944,17 @@ pub(crate) fn apply_latch(
     // id are redirected below so a stream already in the pipe lands
     // in the merged vessel.
     let (tanks_m, crew_m) = crate::transfers::merge_vessel_records(vp, vs, &map);
+    // M9b: reliability records pool through the same remap — the
+    // primary's pending publishes stay valid (same `VesselId`); the
+    // absorbed side's named the dead id, so their flags clear for
+    // the publish slot to re-derive under the merged binding (the
+    // stale events fire as tolerated no-ops).
+    let mut reliability_m = vp.reliability.clone();
+    for (id, rec) in &vs.reliability {
+        let mut r = rec.clone();
+        r.pending_failure_tick = None;
+        reliability_m.insert(map(*id), r);
+    }
     // M8-B: the merged hull keeps either half's colony opt-in — it
     // still sits where a joined half sat (the join record is
     // per-vessel, so a second latched member of the same colony
@@ -998,6 +1026,7 @@ pub(crate) fn apply_latch(
             graph: merge.graph.clone(),
             parts: parts_m.clone(),
             part_costs: part_costs_m.clone(),
+            reliability: reliability_table_m.clone(),
         };
         body_m.aero = Some(Box::new(
             csp_phys::aero::build_aero_tables(
@@ -1019,6 +1048,7 @@ pub(crate) fn apply_latch(
             graph: merge.graph,
             parts: parts_m,
             part_costs: part_costs_m,
+            reliability: reliability_table_m,
         });
         v.state = VesselState::InBubble(body_m);
         v.seams = seams;
@@ -1028,6 +1058,7 @@ pub(crate) fn apply_latch(
         v.crew = crew_m;
         v.science = science_m;
         v.joined_colony = joined_m;
+        v.reliability = reliability_m;
     }
     let absorbed_tracked = tracked.remove(&sec);
     if absorbed_tracked {

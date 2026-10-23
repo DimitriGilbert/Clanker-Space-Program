@@ -440,6 +440,9 @@ impl View {
         sim.set_autopilot_driver(Box::new(csp_ai::AscentAutopilot::new()));
         sim.set_docking_config(csp_sim::DockingConfig::from_balance(&balance));
         sim.set_transfer_config(csp_sim::TransferConfig::from_balance(&balance));
+        // M9b §3.4: the reliability tunables — dormant scale,
+        // ignition window, effect magnitudes, test-stand economics.
+        sim.set_reliability_config(csp_sim::ReliabilityConfig::from_balance(&balance));
         // M7-A §3.2: the science tunables and the experiment-def table —
         // same data-derived wiring (`csp-bench`'s scenario builder does
         // the identical three calls); without them science commands
@@ -913,10 +916,19 @@ impl View {
                 .map(|e| e.weld_input.clone())
                 .collect();
             let part_costs: Vec<f64> = analysis.effective.iter().map(|e| e.cost_funds).collect();
+            // M9b: the production spawn path populates the
+            // reliability table from the same resolved parts — the
+            // §3.4 model rides every launched craft.
+            let reliability: Vec<csp_phys::ReliabilitySpec> = analysis
+                .effective
+                .iter()
+                .map(csp_phys::ReliabilitySpec::from_effective)
+                .collect();
             Some(csp_sim::CraftDef {
                 graph,
                 parts,
                 part_costs,
+                reliability,
             })
         })();
         let Some(craft) = craft_def else { return };
@@ -1094,6 +1106,9 @@ fn stock_flight_craft() -> csp_sim::CraftDef {
         // starter craft's price tag (the VAB path reads real resolved
         // `cost_funds`; this debug craft authors its own).
         part_costs: vec![12_000.0, 800.0, 4_000.0, 9_000.0],
+        // M9b: hand-authored debug craft — no reliability model
+        // (the empty-table convention).
+        reliability: vec![],
     }
 }
 

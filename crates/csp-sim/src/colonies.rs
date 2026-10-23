@@ -3666,6 +3666,7 @@ mod tests {
                 },
             }],
             part_costs: vec![10.0],
+            reliability: vec![],
         }
     }
 
@@ -3708,6 +3709,7 @@ mod tests {
                 crew: Vec::new(),
                 science: crate::VesselScience::default(),
                 joined_colony: None,
+                reliability: BTreeMap::new(),
             },
         );
         id

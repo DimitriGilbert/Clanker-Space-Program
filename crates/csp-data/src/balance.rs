@@ -4,6 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::ids::ResourceId;
+
 /// The `schema_version` this loader understands for `balance.ron` — its
 /// own namespace (balance files are not body/system files, though they
 /// share the §3.1 first-field convention).
@@ -44,7 +46,13 @@ use serde::{Deserialize, Serialize};
 /// `csp_sim::life_support::DEFAULT_*`.
 /// 10 (M9a): `script_op_budget` added — §2.10's per-save operation
 /// cap for the script host.
-pub const BALANCE_SCHEMA_VERSION: u32 = 10;
+/// 11 (M9b): the §3.4 reliability block — dormant-hazard master
+/// switch, ignition window, failure-mode effect magnitudes,
+/// infant-mortality decay, notification cap, flight-qualification
+/// rates, and the test-stand economics (funds per unit, the consumed
+/// `reliability_bench_resource` + its rate, seconds per unit).
+/// Mirrors `csp_sim::reliability::default_config`.
+pub const BALANCE_SCHEMA_VERSION: u32 = 11;
 
 /// `data/balance.ron` — the tunables every later milestone consumes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -202,4 +210,39 @@ pub struct BalanceDef {
     /// configurable per save". Mirror:
     /// `csp_sim::DEFAULT_SCRIPT_OP_BUDGET`.
     pub script_op_budget: u64,
+    /// M9b §3.4: the global dormant-hazard multiplier — `0` disables
+    /// the mechanic (§3.4's `dormant_stress = 0` off-switch).
+    /// Default `1.0`.
+    pub reliability_dormant_stress_scale: f64,
+    /// Characteristic ignition hazard window (s) — the Bernoulli
+    /// ignition-failure probability is
+    /// `1 − exp(−λ_ign · ignition_hazard_s)`. Default `1.0`.
+    pub reliability_ignition_hazard_s: f64,
+    /// Thrust multiplier a `DegradedThrust` failure applies.
+    /// Default `0.5`.
+    pub reliability_degraded_thrust_factor: f64,
+    /// `Leak` mode drain rate (tank units/s). Default `0.001`.
+    pub reliability_leak_units_per_s: f64,
+    /// Infant-mortality decay constant (s). Default `3600`.
+    pub reliability_infant_tau_s: f64,
+    /// Notification-log bound. Default `256`.
+    pub reliability_notification_cap: u64,
+    /// Flight qualification units per burn second in vacuum.
+    /// Default `0.01`.
+    pub reliability_flight_units_per_s_vacuum: f64,
+    /// Flight qualification units per burn second in atmosphere —
+    /// §3.4's regime weighting. Default `0.02`.
+    pub reliability_flight_units_per_s_atmosphere: f64,
+    /// Test-stand funds charge per bench unit. Default `50`.
+    pub reliability_bench_funds_per_unit: f64,
+    /// The site-inventory resource a bench run consumes — authored,
+    /// not hardcoded (§8.3: ALL tuning lives here). Default `"metal"`;
+    /// the sim-side mirror is `csp_sim::reliability::default_config`'s
+    /// `bench_resource`.
+    pub reliability_bench_resource: ResourceId,
+    /// Test-stand resource units per bench unit (of
+    /// `reliability_bench_resource`). Default `1.0`.
+    pub reliability_bench_resource_per_unit: f64,
+    /// Sim-seconds one bench unit takes. Default `60`.
+    pub reliability_bench_seconds_per_unit: f64,
 }

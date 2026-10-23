@@ -91,6 +91,14 @@ pub struct CraftDef {
     /// manufacture charge and the recovery payout. A test/scenario
     /// craft legitimately authors `0.0` (free).
     pub part_costs: Vec<f64>,
+    /// M9b §3.4: each part's resolved reliability spec
+    /// (`ReliabilitySpec::from_effective` over the same resolved
+    /// parts), parallel to `parts` and `part_costs` — frozen at
+    /// build like both. An EMPTY table is legal and means "no
+    /// reliability model" (hand-built test craft); a non-empty
+    /// table must cover `parts` exactly (the `part_costs` spawn
+    /// gate).
+    pub reliability: Vec<csp_phys::ReliabilitySpec>,
 }
 
 /// Where a vessel lives (§2.4/§2.6.2): on rails, physics-resident in

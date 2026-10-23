@@ -138,6 +138,14 @@ pub mod manufacture;
 /// module doc.
 pub mod life_support;
 
+/// M9b §3.4 — the reliability model: per-instance `PartReliability`
+/// records (the pre-drawn `θ` thresholds and `PartUsage` accrual),
+/// the hazard/dormant model, `PartFailure` machinery, ignition
+/// Bernoulli draws, the notification log, and the test-stand /
+/// flight qualification writers (the `Reliability` slot of the
+/// §2.6.5 subsystem order). See the module doc.
+pub mod reliability;
+
 /// M9a §2.10 — the scripting/autopilot control layer's sim-side
 /// surface: the script arena's state types (`ScriptId`,
 /// `ScriptState`, the `persist` map), the per-tick `TickIo` plumbing
@@ -169,6 +177,10 @@ pub use joints::{
 pub use life_support::LifeSupportConfig;
 pub use maneuver::{ActiveBurn, ManeuverNode, ManeuverStatus};
 use orbit::{OrbitModel, OrbitState, PatchedConics};
+pub use reliability::{
+    ActiveBench, BenchId, Notification, NotificationKind, PartInstanceId, PartReliability,
+    RegimeMetrics, ReliabilityConfig,
+};
 pub use research::{
     DataKey, ResearchId, ResearchProject, ResearcherAssign, ScienceConfig, ScienceKeyState,
     ScienceState, VesselScience,
@@ -325,6 +337,13 @@ pub struct Vessel {
     /// membership (`primary.or(secondary)` — the merged hull still
     /// sits where a joined half sat).
     pub joined_colony: Option<crate::economy::ColonyId>,
+    /// M9b §3.4's per-node reliability records — the `PartUsage`
+    /// accrual, pre-drawn `θ` thresholds, and applied failure modes,
+    /// bound to `PartNodeId` so they partition/merge with the part
+    /// graph exactly like `tank_contents` and `thermal` (§2.4).
+    /// **Hashed and serialized** sim state. Empty for craft-less
+    /// vessels and crafts carrying no reliability table.
+    pub reliability: BTreeMap<csp_phys::PartNodeId, reliability::PartReliability>,
 }
 
 impl Vessel {
@@ -992,6 +1011,23 @@ pub enum SimCommand {
         /// The vessel to release.
         vessel: VesselId,
     },
+    /// M9b §3.4's test-stand run — the qualification program's bench
+    /// side: spend `bench_funds_per_unit · units` and
+    /// `bench_resource_per_unit · units` of `bench_resource` out of a
+    /// LAUNCH site's inventory now, then `BenchTestComplete` credits
+    /// `bench_units` into the family's qualification record at
+    /// `now + units · bench_seconds_per_unit` (the `ManufactureCraft`
+    /// precedent: a reservation, not an instant credit). `Recoverable`
+    /// rejections: unknown/non-launch site, non-positive units,
+    /// insufficient funds or inventory.
+    RunBenchTest {
+        /// The launch site running the stand.
+        site: SiteId,
+        /// The part family under test.
+        family: csp_data::FamilyId,
+        /// Bench units to accrue.
+        units: f64,
+    },
 }
 
 /// What `step_frame` did (§2.6.2): where the clock landed, what the
@@ -1205,6 +1241,25 @@ pub struct WorldSnapshot {
     /// carrying a program (phase state lives in `persist`).
     /// **Serialized and hashed** sim state.
     pub autopilots: BTreeMap<VesselId, AutopilotState>,
+    /// §7.2 next-ID counter for part instances (M9b §3.4 —
+    /// monotonic, never reused; the `{RELIABILITY}`/`{IGNITION}`
+    /// KDF entity allocator).
+    pub next_part_instance_id: u64,
+    /// M9b §3.4's reliability tunables — construction config,
+    /// serialized so a restored world enforces the same rates
+    /// (the `transfer_cfg` precedent).
+    pub reliability_cfg: reliability::ReliabilityConfig,
+    /// M9b §3.4's notification log — dormant-failure and misfire
+    /// records, bounded by `notification_cap`. **Serialized, never
+    /// hashed** — recorded history, the ledger precedent.
+    pub notifications: std::collections::VecDeque<reliability::Notification>,
+    /// M9b §3.4's test-stand arena — one record per in-flight
+    /// `RunBenchTest`, keyed by monotonic `BenchId`. **Serialized
+    /// and hashed** — each pairs with exactly one pending
+    /// `BenchTestComplete` (the `builds` precedent).
+    pub bench_runs: BTreeMap<reliability::BenchId, reliability::ActiveBench>,
+    /// §7.2 next-ID counter for the bench arena.
+    pub next_bench_id: u64,
 }
 
 /// The world's construction config — data-derived (§7.3): the orbit
@@ -1306,6 +1361,12 @@ struct TickShadow {
     joints: Option<Vec<LiveJoint>>,
     /// See `joints`.
     joint_refused: Option<BTreeSet<(VesselId, VesselId)>>,
+    /// `next_part_instance_id` — captured with `vessels` (M9b:
+    /// instance ids allocate only at vessel-craft instantiation, all
+    /// inside vessel-shadowed paths; the rollback must restore the
+    /// counter or a retried spawn would reallocate under ids already
+    /// burned — the `next_vessel_id` precedent).
+    next_part_instance_id: Option<u64>,
     /// `tracked_vessels` — captured before the first opt-in mutation.
     tracked_vessels: Option<BTreeSet<VesselId>>,
     /// `event_heap` — captured before the first push/class rewrite.
@@ -1361,6 +1422,14 @@ struct TickShadow {
     /// `autopilots` — captured before the first autopilot write
     /// (Engage/Disengage applies, the driver's persist writes).
     autopilots: Option<BTreeMap<VesselId, AutopilotState>>,
+    /// M9b: `bench_runs` + `next_bench_id` — captured before the
+    /// first bench-arena write (the `builds` precedent).
+    benches: Option<BTreeMap<reliability::BenchId, reliability::ActiveBench>>,
+    /// See `benches`.
+    next_bench_id: Option<u64>,
+    /// `notifications` — captured before the first log push (the
+    /// reliability writers' notification path).
+    notifications: Option<std::collections::VecDeque<reliability::Notification>>,
 }
 
 impl TickShadow {
@@ -1395,6 +1464,10 @@ impl TickShadow {
             scripts: None,
             next_script_id: None,
             autopilots: None,
+            benches: None,
+            next_bench_id: None,
+            notifications: None,
+            next_part_instance_id: None,
         }
     }
 
@@ -1486,6 +1559,18 @@ impl TickShadow {
         }
         if let Some(v) = self.autopilots {
             world.autopilots = v;
+        }
+        if let Some(v) = self.benches {
+            world.bench_runs = v;
+        }
+        if let Some(v) = self.next_bench_id {
+            world.next_bench_id = v;
+        }
+        if let Some(v) = self.notifications {
+            world.notifications = v;
+        }
+        if let Some(v) = self.next_part_instance_id {
+            world.next_part_instance_id = v;
         }
     }
 }
@@ -1715,6 +1800,23 @@ pub struct World {
     /// current `step_frame` — moved into `AdvanceReport::script_log`
     /// at return. Scratch only: never hashed, never serialized.
     script_log: Vec<(ScriptId, String)>,
+    /// M9b §3.4's part-instance counter — the `{RELIABILITY}`/
+    /// `{IGNITION}` KDF entity allocator; monotonic, never reused,
+    /// serialized and hashed (travels with `vessels` — allocated only
+    /// where the arena is shadowed).
+    next_part_instance_id: u64,
+    /// §3.4's reliability tunables — construction config, hashed and
+    /// serialized like `transfer_cfg` (they change state evolution:
+    /// dormant rate, ignition window, effects, economics).
+    reliability_cfg: reliability::ReliabilityConfig,
+    /// §3.4's notification log — dormant-failure and misfire history,
+    /// bounded. **Serialized, never hashed** (recorded history).
+    notifications: std::collections::VecDeque<reliability::Notification>,
+    /// §3.4's test-stand arena — in-flight `RunBenchTest` orders.
+    /// **Hashed and serialized** (event-paired, `builds` precedent).
+    bench_runs: BTreeMap<reliability::BenchId, reliability::ActiveBench>,
+    /// §7.2's bench-arena counter.
+    next_bench_id: u64,
 }
 
 /// The world's physics half: the §2.9 backend it steps plus the
@@ -1837,6 +1939,11 @@ impl World {
             script_engine: None,
             autopilot_driver: None,
             script_log: Vec::new(),
+            next_part_instance_id: 0,
+            reliability_cfg: reliability::default_config(),
+            notifications: std::collections::VecDeque::new(),
+            bench_runs: BTreeMap::new(),
+            next_bench_id: 0,
         }
     }
 
@@ -2117,6 +2224,11 @@ impl World {
         // M8-B: pending `ConstructionComplete`s → (build, tick) —
         // the build↔event pairing check below.
         let mut build_events = BTreeMap::new();
+        // M9b: pending `PartFailure`s → (vessel, instance) → tick —
+        // the record↔event pairing check below; pending
+        // `BenchTestComplete`s → run → tick (the build precedent).
+        let mut pf_events = BTreeMap::new();
+        let mut bench_events = BTreeMap::new();
         // M9a: pending `ScriptWake`s → (script, tick) — the strict
         // `wake_tick`↔event pairing check below.
         let mut wake_events = BTreeMap::new();
@@ -2150,7 +2262,12 @@ impl World {
                 EventKind::SoiTransition { vessel, .. }
                 | EventKind::SoiRescan { vessel }
                 | EventKind::DebrisDecay { vessel }
-                | EventKind::ManeuverNodeStart { vessel } => Some(*vessel),
+                | EventKind::ManeuverNodeStart { vessel }
+                // M9b: a `PartFailure` names a vessel — the same
+                // existence gate (a stale event after a vessel's
+                // removal is scrubbed at `remove_vessel`, and the
+                // fire tolerates it either way).
+                | EventKind::PartFailure { vessel, .. } => Some(*vessel),
                 EventKind::PlayerAlarm { .. }
                 | EventKind::TransferWindow { .. }
                 | EventKind::TransferComplete { .. }
@@ -2177,7 +2294,11 @@ impl World {
                 | EventKind::VesselLifeSupportDepleted { .. }
                 // M9a: the wake names a script — the script↔wake
                 // pairing check below, not the vessel check.
-                | EventKind::ScriptWake { .. } => None,
+                | EventKind::ScriptWake { .. }
+                // M9b: the bench delivery names a run — the
+                // run↔event pairing check below, not the vessel
+                // check.
+                | EventKind::BenchTestComplete { .. } => None,
             };
             // M8-A: colony-scoped events must name a live colony and
             // stay unique per colony per kind.
@@ -2274,6 +2395,21 @@ impl World {
                 return Err(SimError::Fatal(
                     "snapshot: duplicate construction complete event",
                 ));
+            }
+            // M9b: at most one pending `PartFailure` per part
+            // instance and one `BenchTestComplete` per run — the
+            // record↔event pairing below (the node precedent).
+            if let EventKind::PartFailure {
+                vessel: v, part, ..
+            } = &e.kind
+                && pf_events.insert((*v, *part), e.tick).is_some()
+            {
+                return Err(SimError::Fatal("snapshot: duplicate part-failure event"));
+            }
+            if let EventKind::BenchTestComplete { run: r } = &e.kind
+                && bench_events.insert(*r, e.tick).is_some()
+            {
+                return Err(SimError::Fatal("snapshot: duplicate bench-complete event"));
             }
             if let EventKind::ResearchDataExhausted { project: p } = &e.kind
                 && research_exhausted.insert(*p, e.tick).is_some()
@@ -2375,6 +2511,7 @@ impl World {
         }
         restore_transfer_state(&snapshot, &transfer_events)?;
         restore_build_state(&snapshot, &build_events)?;
+        restore_reliability_state(&snapshot, &pf_events, &bench_events)?;
         restore_science_state(&snapshot, &research_exhausted, &research_complete)?;
         restore_economy_state(&snapshot)?;
         restore_contract_state(&snapshot, &deadline_events)?;
@@ -2508,6 +2645,11 @@ impl World {
             script_engine: None,
             autopilot_driver: None,
             script_log: Vec::new(),
+            next_part_instance_id: snapshot.next_part_instance_id,
+            reliability_cfg: snapshot.reliability_cfg,
+            notifications: snapshot.notifications,
+            bench_runs: snapshot.bench_runs,
+            next_bench_id: snapshot.next_bench_id,
         })
     }
 
@@ -2600,6 +2742,11 @@ impl World {
             next_script_id: self.next_script_id,
             script_op_budget: self.script_op_budget,
             autopilots: self.autopilots.clone(),
+            next_part_instance_id: self.next_part_instance_id,
+            reliability_cfg: self.reliability_cfg.clone(),
+            notifications: self.notifications.clone(),
+            bench_runs: self.bench_runs.clone(),
+            next_bench_id: self.next_bench_id,
         })
     }
 
@@ -2720,6 +2867,9 @@ impl World {
             // match (the lifecycle re-derives it either way).
             shadow.joints = Some(self.joints.clone());
             shadow.joint_refused = Some(self.joint_refused.clone());
+            // M9b: the instance allocator travels with the arena —
+            // allocated only where the arena is shadowed.
+            shadow.next_part_instance_id = Some(self.next_part_instance_id);
         }
     }
 
@@ -2818,6 +2968,18 @@ impl World {
                 // §3.5's join is surface-latched only — an unlatching
                 // hull leaves the colony's inventory with the pose.
                 v.joined_colony = None;
+                // M9b: the latched vessel's dormant `PartFailure`s
+                // die with the residence — scrub the heap the same
+                // way `apply_to_bubble` does, then restamp the
+                // records to their bubble classes (publish flags
+                // cleared inside).
+                self.shadow_events(shadow);
+                let heap = std::mem::take(&mut self.event_heap);
+                self.event_heap = heap
+                    .into_iter()
+                    .filter(|e| !event_names_vessel(&e.kind, &vessel))
+                    .collect();
+                self.reliability_residence_change(vessel, self.clock.ticks(), false);
             }
             Some(VesselState::InBubble(_)) => {}
         }
@@ -2851,7 +3013,11 @@ impl World {
     /// bubble-resident body rests on it, in which case it stays
     /// `InBubble` as a static collider in the batch until the
     /// supporter moves on.
-    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::too_many_arguments,
+        clippy::cognitive_complexity
+    )]
     fn step_bubble_range(
         &mut self,
         now: u64,
@@ -2888,6 +3054,13 @@ impl World {
         }
         self.shadow_vessels(shadow);
         let caps = self.caps;
+        // M9b §3.4: the reliability tick's immutable captures — the
+        // save seed and the construction config ride the borrow-split
+        // loop; the family's qualification table is re-captured per
+        // tick (below) so a mid-range credit lands at the tick it was
+        // credited, identical under every partition.
+        let rel_cfg = self.reliability_cfg.clone();
+        let save_seed = self.save_seed;
         let mut dead_vessels: Vec<VesselId> = Vec::new();
         // M7-D: vessels that surface-latched inside this range —
         // their contract trigger runs once `self` is whole again.
@@ -2936,6 +3109,24 @@ impl World {
             // their SurfaceLatched transition waits for the
             // post-write-back pass below.
             let mut latched_now: Vec<VesselId> = Vec::new();
+            // M9b: the tick's reliability side-effects — the world-
+            // level writers collected during the vessel loop and
+            // applied once the loop hands `self` back (the `hot`/
+            // `impacted` precedent). `rel_post` rides to the
+            // notification log at tick `t + 1`; `rel_burns` credits
+            // flight qualification; `rel_rebody` re-welds leak-
+            // drained hulls.
+            let mut rel_post: Vec<(
+                VesselId,
+                csp_phys::PartNodeId,
+                reliability::NotificationKind,
+            )> = Vec::new();
+            let mut rel_burns: Vec<(csp_data::FamilyId, f64, bool)> = Vec::new();
+            let mut rel_rebody: Vec<VesselId> = Vec::new();
+            // The live family table — re-captured per tick so a burn
+            // credit at `t` lands before `t + 1`'s evaluation reads
+            // it (the loop doc's partition rule).
+            let quals = self.tech.qualifications.clone();
             // Build the tick's batch: per-vessel pre-step work (the
             // burn executor owns throttle/attitude before physics
             // reads them), then every InBubble body cloned out in
@@ -2956,6 +3147,13 @@ impl World {
                 // `rot`, and `ang_vel` every integer tick.
                 if drive_node_burn(&mut vessel.maneuver, body) {
                     burns_done.insert(*vid);
+                }
+                // M9b §3.4: the live `thrust_factor` reaches physics
+                // through the body's `Thrust` sites — scaled from the
+                // craft baseline each tick (idempotent across every
+                // re-weld; the site's `rated_n` is a derived view).
+                if let Some(craft) = &vessel.craft {
+                    reliability::apply_thrust_factors(body, craft, &vessel.reliability);
                 }
                 pre_vel.push((body.vel, body.ang_vel));
                 batch.push(body.clone());
@@ -2980,21 +3178,44 @@ impl World {
                 };
                 let (v0, w0) = pre_vel[i];
                 core::mem::swap(body, &mut batch[i]);
+                // M9b: the tick's regime scratch for this vessel's
+                // reliability pass — filled by the structural block
+                // below, read after `thermal_step` (fresh temps).
+                let mut rel_g = 0.0;
+                let mut rel_axial: BTreeMap<csp_phys::PartNodeId, f64> = BTreeMap::new();
+                let mut rel_ground = false;
+                let env = physics.backend.environment();
+                let rel_atmo = env.atmosphere.as_ref().is_some_and(|a| {
+                    (body.com_world() - env.body_center).norm() - env.radius_m < a.top_m
+                });
                 // M4c §2.4 structural evaluation — post-step, like the
                 // thermal tick: joint loads from the tick's measured
                 // Δv/Δω and the per-part external-force budget (aero,
                 // thrust, gravity, contact impulses). A joint whose
                 // load exceeds the child part's authored limits fails.
                 if let Some(craft) = &vessel.craft {
-                    let ext = {
+                    let (ext, ground) = {
                         let contacts = physics.backend.contacts(csp_phys::BodyHandle(i as u32));
-                        physics
-                            .backend
-                            .external_loads(body, &craft.graph, &craft.parts, contacts)
-                            .map_err(|e| SimError::Fatal(e.reason()))?
+                        let ground = contacts.iter().any(|c| c.peer.is_none());
+                        (
+                            physics
+                                .backend
+                                .external_loads(body, &craft.graph, &craft.parts, contacts)
+                                .map_err(|e| SimError::Fatal(e.reason()))?,
+                            ground,
+                        )
                     };
+                    rel_ground = ground;
                     let accel_b = body.rot.conjugate().rotate(body.vel - v0) / csp_phys::PHYSICS_DT;
                     let alpha_b = (body.ang_vel - w0) / csp_phys::PHYSICS_DT;
+                    // M9b: the tick's regime metrics ride to the
+                    // reliability pass — `ExcessG` reads the same
+                    // acceleration the load check does; `max_axial_n`
+                    // sums each part's external-force magnitude.
+                    rel_g = accel_b.norm() / 9.80665;
+                    for (node, fs) in &ext {
+                        rel_axial.insert(*node, fs.iter().map(|f| f.force.norm()).sum());
+                    }
                     let loads = csp_phys::joint_loads(
                         body,
                         &craft.graph,
@@ -3027,8 +3248,56 @@ impl World {
                     &mut physics.thermal_rates,
                     csp_phys::PHYSICS_DT,
                 );
+                // M9b §3.4: the per-part reliability tick — post-step
+                // so it reads the tick's fresh temps, loads, and
+                // throttle. `Explosion` modes fold into the same
+                // thermal-hit list `hot` feeds (§3.4's thermal/
+                // structural mechanism); the rest rides `rel_post`
+                // for the world-level writers below.
+                if let Some(craft) = &mut vessel.craft {
+                    let rel_env = reliability::BubbleEnv {
+                        temps: &vessel.thermal.part_temps_k,
+                        throttle: body.throttle,
+                        g_load: rel_g,
+                        axial: &rel_axial,
+                        on_ground: rel_ground,
+                        in_atmosphere: rel_atmo,
+                    };
+                    let eff = reliability::bubble_part_tick(
+                        craft,
+                        &mut vessel.reliability,
+                        &mut vessel.tank_contents,
+                        &rel_env,
+                        t,
+                        save_seed,
+                        &quals,
+                        &rel_cfg,
+                    );
+                    if !eff.explosions.is_empty() {
+                        failures.entry(vid).or_default().1.extend(eff.explosions);
+                    }
+                    if eff.mass_changed {
+                        rel_rebody.push(vid);
+                    }
+                    for node in eff.misfires {
+                        rel_post.push((vid, node, reliability::NotificationKind::IgnitionMisfire));
+                    }
+                    for (node, mode, dormant) in eff.failures {
+                        rel_post.push((
+                            vid,
+                            node,
+                            reliability::NotificationKind::PartFailed { mode, dormant },
+                        ));
+                    }
+                    rel_burns.extend(eff.burns);
+                }
                 if !hot.is_empty() {
-                    failures.entry(vid).or_default().1 = hot;
+                    // Append, never assign — a same-tick `Explosion`
+                    // mode already pushed its node into this list
+                    // above, and overwriting it would leave the
+                    // exploded part alive (its record renewed, the
+                    // §3.4 destruction skipped).
+                    failures.entry(vid).or_default().1.extend(hot);
                 } else if vessel.debris_since.is_some()
                     && (body.settle.latched
                         || physics
@@ -3056,8 +3325,66 @@ impl World {
             }
             // M6-A latch departure: deferred transitions evaluated
             // post-write-back (every neighbor's pose is this tick's).
-            transition_latched(vessels, physics, &latched_now, SimTime(t + 1));
+            transition_latched(vessels, physics, &latched_now, SimTime(t + 1), &rel_cfg);
             latched_total.extend_from_slice(&latched_now);
+            // M9b §3.4: the tick's collected side-effects land at
+            // `t + 1`, inside the same tick iteration — the family
+            // credits are live for `t + 1`'s evaluation (the
+            // `quals` re-capture above) and every write is the same
+            // disjoint-field access the vessel loop's collects
+            // proved: `vessels`/`physics` stay borrowed, `tech`/
+            // `notifications` do not.
+            if !rel_post.is_empty() {
+                if shadow.notifications.is_none() {
+                    shadow.notifications = Some(self.notifications.clone());
+                }
+                for (nvid, node, kind) in rel_post.drain(..) {
+                    // A failure also credits the family's
+                    // `observed_failures` — §3.4's "failures add
+                    // qualification data", through the M7-B point.
+                    if let reliability::NotificationKind::PartFailed { .. } = kind
+                        && let Some(spec) =
+                            vessels.get(&nvid).and_then(|v| World::spec_for(v, node))
+                    {
+                        let family = spec.family.clone();
+                        if shadow.tech.is_none() {
+                            shadow.tech = Some(self.tech.clone());
+                        }
+                        self.tech.credit_qualification(family, 0.0, 0.0, 1)?;
+                    }
+                    self.notifications.push_back(reliability::Notification {
+                        tick: t + 1,
+                        vessel: nvid,
+                        node: Some(node),
+                        kind,
+                    });
+                }
+                while self.notifications.len() > self.reliability_cfg.notification_cap {
+                    self.notifications.pop_front();
+                }
+            }
+            if !rel_burns.is_empty() {
+                if shadow.tech.is_none() {
+                    shadow.tech = Some(self.tech.clone());
+                }
+                for (family, burn_s, in_atmo) in rel_burns.drain(..) {
+                    let rate = if in_atmo {
+                        self.reliability_cfg.flight_units_per_s_atmosphere
+                    } else {
+                        self.reliability_cfg.flight_units_per_s_vacuum
+                    };
+                    self.tech
+                        .credit_qualification(family, burn_s * rate, 0.0, 0)?;
+                }
+            }
+            // A `Leak` that moved bucketed mass re-welds the body —
+            // the `reweld_if_mass_changed` convention, run after the
+            // vessel loop's `body` borrows are done.
+            for vid in rel_rebody.drain(..) {
+                if let Some(v) = vessels.get_mut(&vid) {
+                    transfers::reweld_if_mass_changed(v, true)?;
+                }
+            }
             // Apply the tick's consequences in ascending-vessel-id
             // order: impacts remove, then §2.4 breakups split.
             let mut affected: std::collections::BTreeSet<VesselId> =
@@ -3719,6 +4046,11 @@ impl World {
                     s.strikes = 0;
                 }
             }
+            SimCommand::RunBenchTest {
+                site,
+                family,
+                units,
+            } => self.apply_bench_test(site.clone(), family.clone(), *units, shadow)?,
             SimCommand::EngageAutopilot { vessel, program } => {
                 if !program.is_valid() {
                     return Err(SimError::Recoverable("autopilot: non-finite program"));
@@ -3908,6 +4240,8 @@ impl World {
                 // Craft-less vessels carry no tanks or seats.
                 tank_contents: BTreeMap::new(),
                 crew: Vec::new(),
+                // Craft-less vessels carry no reliability model.
+                reliability: BTreeMap::new(),
             },
         );
         // M7-D: the spawn IS an orbit-achieved transition — the
@@ -3974,6 +4308,17 @@ impl World {
                 "physical spawn: part_costs not parallel to parts",
             ));
         }
+        // M9b: the reliability table is empty (no model — hand-built
+        // test craft) or covers `parts` exactly with valid specs —
+        // the `part_costs` gate's precedent.
+        if !craft.reliability.is_empty()
+            && (craft.reliability.len() != craft.parts.len()
+                || craft.reliability.iter().any(|s| !s.is_valid()))
+        {
+            return Err(SimError::Recoverable(
+                "physical spawn: reliability table malformed",
+            ));
+        }
         // §3.5's part manufacture — the build charge is paid at the
         // pad (M8's order-and-time pipeline replaces this direct
         // debit, but the cost exists now). An action: unaffordable
@@ -4026,6 +4371,16 @@ impl World {
             csp_phys::ambient_k(env, alt)
         };
         self.shadow_vessels(shadow);
+        // M9b §3.4: allocate the part-instance records — the
+        // "drawn once at part creation" point, before the vessel
+        // exists (the allocator rides `shadow_vessels`' counter
+        // capture).
+        let reliability_records = reliability::allocate_records(
+            self.save_seed,
+            craft,
+            self.clock.ticks(),
+            &mut self.next_part_instance_id,
+        )?;
         let id = VesselId(self.next_vessel_id);
         if let (Some(t), Some(p)) = (tables, self.physics.as_mut()) {
             let mut tables_map = BTreeMap::new();
@@ -4062,6 +4417,9 @@ impl World {
                 // M6-D: tanks resolve FULL — the resolver's wet-mass
                 // convention (`mass_kg` already counts them).
                 tank_contents: transfers::spawn_contents(craft),
+                // M9b: the craft instantiation IS part creation —
+                // one instance id + pre-drawn θ per node (§3.4).
+                reliability: reliability_records,
                 crew: Vec::new(),
             },
         );
@@ -4158,6 +4516,10 @@ impl World {
             elements,
             epoch,
         });
+        // M9b: the bubble→dormant transition — restamp every part's
+        // record at `epoch` under the constant dormant λ (§2.6.1's
+        // epoch re-anchor; the publish slot re-derives the crossing).
+        self.reliability_residence_change(vessel, epoch.ticks(), true);
         // The stamped conic is only meaningful at-or-after `epoch` —
         // but `epoch` can sit ahead of the clock (the burn executor's
         // completion stamps `t_next` mid-range). Any transition the
@@ -4395,13 +4757,16 @@ impl World {
         vessel_mut.state = VesselState::InBubble(body);
         self.ensure_aero(vessel)?;
         // The vessel's pending SOI events are dead the moment it
-        // leaves rails — drop them in one re-heapify pass.
+        // leaves rails — drop them in one re-heapify pass. M9b: the
+        // same scrub covers the dormant `PartFailure`s (vessel-named);
+        // the records restamp to their bubble classes next.
         self.shadow_events(shadow);
         let heap = std::mem::take(&mut self.event_heap);
         self.event_heap = heap
             .into_iter()
             .filter(|e| !event_names_vessel(&e.kind, &vessel))
             .collect();
+        self.reliability_residence_change(vessel, self.clock.ticks(), false);
         Ok(())
     }
 
@@ -4632,13 +4997,16 @@ impl World {
         self.ensure_aero(vessel)?;
         // Dead the moment the vessel left rails — drop the vessel's
         // pending SOI events in one re-heapify pass (`ToBubble`'s
-        // scrub; the just-fired event is already popped).
+        // scrub; the just-fired event is already popped). M9b: the
+        // dormant `PartFailure`s ride the same filter, and the
+        // records restamp to their bubble classes.
         self.shadow_events(shadow);
         let heap = std::mem::take(&mut self.event_heap);
         self.event_heap = heap
             .into_iter()
             .filter(|e| !event_names_vessel(&e.kind, &vessel))
             .collect();
+        self.reliability_residence_change(vessel, self.clock.ticks(), false);
         Ok(())
     }
 
@@ -4898,6 +5266,17 @@ impl World {
         if node == craft.graph.root {
             return Err(SimError::Recoverable("jettison: cannot drop the root"));
         }
+        // M9b §3.4's `StuckDecoupler` — the recorded failure mode
+        // means this part's separation hardware is dead; jettison
+        // rejects with a Recoverable the UI can surface.
+        if v.reliability
+            .get(&node)
+            .is_some_and(|r| r.has_mode(csp_data::FailureMode::StuckDecoupler))
+        {
+            return Err(SimError::Recoverable(
+                "jettison: decoupler is stuck (reliability failure)",
+            ));
+        }
         // Reparent children of `node` to node's parent, composing
         // transforms — documented jettison semantics.
         let removed = craft.graph.nodes[&node].clone();
@@ -4968,6 +5347,11 @@ impl World {
         // the part.
         v.science.data.remove(&node);
         v.science.spent.retain(|(n, _)| *n != node);
+        // M9b: the part's reliability record leaves with its mass —
+        // an orphaned record serializes and the restore gate's
+        // "reliability record on non-node" Fatal is what a stale one
+        // trips (the part instance is never reused).
+        v.reliability.remove(&node);
         v.state = VesselState::InBubble(body);
         let departing: std::collections::BTreeSet<csp_phys::PartNodeId> =
             [node].into_iter().collect();
@@ -5085,6 +5469,7 @@ impl World {
                         graph: retained.clone(),
                         parts: craft.parts.clone(),
                         part_costs: craft.part_costs.clone(),
+                        reliability: craft.reliability.clone(),
                     }),
                 )
                 .map_err(|e| SimError::Fatal(e.reason()))?,
@@ -5137,6 +5522,7 @@ impl World {
             graph: retained,
             parts: craft.parts.clone(),
             part_costs: craft.part_costs.clone(),
+            reliability: craft.reliability.clone(),
         });
         v.state = VesselState::InBubble(nb);
         v.aero_mask = csp_phys::ConfigMask(retained_mask);
@@ -5145,6 +5531,11 @@ impl World {
         // M6-D: contents and crew ride their parts — the subtree's
         // tanks and seats leave with the fragment, the rest stay.
         let (frag_tanks, frag_crew) = transfers::split_vessel_records(v, &frag_nodes);
+        // M9b: the reliability records partition the same way — the
+        // fragment's records' pending publishes named the old vessel,
+        // so their flags clear inside `split_records` for the publish
+        // slot to re-derive under the new binding.
+        let frag_reliability = reliability::split_records(v, &frag_nodes);
         // M7-A: the keyed data pool and spent marks partition by node
         // the same way; a project whose lab node departs finalizes at
         // this tick — accrued science banks, and its escrowed remainder
@@ -5169,6 +5560,7 @@ impl World {
                     graph: frag_g,
                     parts: craft.parts.clone(),
                     part_costs: craft.part_costs.clone(),
+                    reliability: craft.reliability.clone(),
                 }),
                 state: VesselState::InBubble(fb),
                 aero_mask: csp_phys::ConfigMask::ALL,
@@ -5181,6 +5573,9 @@ impl World {
                 tank_contents: frag_tanks,
                 crew: frag_crew,
                 science: frag_science,
+                // M9b: the subtree's reliability records (pending
+                // publishes cleared inside `split_records`).
+                reliability: frag_reliability,
                 // The split-off fragment starts unjoined — a fresh
                 // `JoinColonyInventory` opts it in explicitly.
                 joined_colony: None,
@@ -5353,6 +5748,13 @@ impl World {
             // and the subsystem is enabled.
             if subsystem == Subsystem::LifeSupport {
                 self.publish_life_support(shadow)?;
+            }
+            // M9b §3.4: the reliability slot is publish-only — dormant
+            // `PartFailure`s are solved closed-form and lazily published
+            // here (a pure function of `(clock, heap, state)`); in-bubble
+            // accrual rides the per-tick bubble pass.
+            if subsystem == Subsystem::Reliability {
+                self.publish_reliability(shadow)?;
             }
             // M7-C §3.5: the program-economy slot. Its interval work
             // is publish-only — ensure one `SalaryDue` sits on the
@@ -5836,7 +6238,13 @@ impl World {
                         | EventKind::VesselLifeSupportDepleted { .. }
                         // M9a: the wake names a script — no rescan to
                         // republish (the script re-registers or dies).
-                        | EventKind::ScriptWake { .. } => None,
+                        | EventKind::ScriptWake { .. }
+                        // M9b: the failure names a vessel but is
+                        // never a rescan reason — the `Reliability`
+                        // slot's publish re-derives the dormant
+                        // crossing; the bench completion names a run.
+                        | EventKind::PartFailure { .. }
+                        | EventKind::BenchTestComplete { .. } => None,
                     };
                     if let Some(vessel) = vessel {
                         self.schedule_event(
@@ -5966,6 +6374,11 @@ impl World {
             EventKind::ScriptWake { script } => {
                 self.fire_script_wake(*script, event.tick, shadow, degraded)
             }
+            // M9b §3.4: the dormant Λ crossing and the bench delivery.
+            EventKind::PartFailure { vessel, part, mode } => {
+                self.fire_part_failure(*vessel, *part, *mode, event.tick, shadow, degraded)
+            }
+            EventKind::BenchTestComplete { run } => self.fire_bench_complete(*run, shadow),
         }
     }
 
@@ -6330,6 +6743,16 @@ impl World {
         h.u64(self.script_op_budget);
         scripts::hash_scripts(&mut h, self.next_script_id, &self.scripts);
         scripts::hash_autopilots(&mut h, &self.autopilots);
+        // M9b §3.4: the instance allocator (it decides the KDF
+        // entity of every future part), the reliability config
+        // (config that changes evolution — the `economy_cfg`
+        // precedent), and the bench arena + counter. The
+        // notification log is recorded history — serialized, never
+        // hashed (the ledger precedent).
+        h.u64(self.next_part_instance_id);
+        reliability::hash_config(&mut h, &self.reliability_cfg);
+        reliability::hash_benches(&mut h, &self.bench_runs);
+        h.u64(self.next_bench_id);
         h.finish()
     }
 }
@@ -6739,7 +7162,15 @@ fn event_names_vessel(kind: &EventKind, vessel: &VesselId) -> bool {
         EventKind::SoiTransition { vessel: v, .. }
         | EventKind::SoiRescan { vessel: v }
         | EventKind::DebrisDecay { vessel: v }
-        | EventKind::ManeuverNodeStart { vessel: v } => v == vessel,
+        | EventKind::ManeuverNodeStart { vessel: v }
+        // M9b §3.4: a dormant `PartFailure` is dead the moment the
+        // vessel enters the bubble (the tick pass owns crossings
+        // there) — the same "drops when it leaves rails" rule the
+        // SOI events share. Scrubbed at `ToBubble`/node-start/
+        // `remove_vessel` by the shared filter; a straggler that
+        // survives (unlatch's own scrub covers it below) fires as
+        // a tolerated no-op on the `InBubble` guard.
+        | EventKind::PartFailure { vessel: v, .. } => v == vessel,
         EventKind::PlayerAlarm { .. }
         | EventKind::TransferWindow { .. }
         | EventKind::ConstructionComplete { .. }
@@ -6775,7 +7206,11 @@ fn event_names_vessel(kind: &EventKind, vessel: &VesselId) -> bool {
         // M9a: the wake names a script, not a vessel — it survives
         // vessel removal by design (a script on a dead vessel keeps
         // its wake; the firing no-ops when the script is gone).
-        | EventKind::ScriptWake { .. } => false,
+        | EventKind::ScriptWake { .. }
+        // M9b: the bench completion names a run — it survives vessel
+        // removal by design (the credit is program-level, like the
+        // transfer completion's fallback).
+        | EventKind::BenchTestComplete { .. } => false,
     }
 }
 
@@ -7299,7 +7734,70 @@ fn check_refused_pairs(snapshot: &WorldSnapshot) -> Result<(), SimError> {
 /// derived cache, so restoring means re-running `weld` and stamping the
 /// serialized kinematic/control/settle fields back on. `SurfaceLatched`
 /// keeps only the fixed-frame pose record; `OnRails` needs nothing.
-#[allow(clippy::too_many_lines)] // the check list grew with M6-D
+/// M9b §3.4 coherence for [`World::restore`] — the
+/// `restore_build_state` precedent: the reliability config is sane,
+/// every part instance is unique across the save and below the
+/// allocator, every `pending_failure_tick` pairs with exactly one
+/// pending `PartFailure` at that tick (events without matching
+/// records are tolerated staleness — a record that departed on a
+/// fragment cleared its flag but the old event may still ride the
+/// heap), and the bench arena pairs with `BenchTestComplete` events
+/// both directions.
+fn restore_reliability_state(
+    snapshot: &WorldSnapshot,
+    pf_events: &BTreeMap<(VesselId, reliability::PartInstanceId), u64>,
+    bench_events: &BTreeMap<reliability::BenchId, u64>,
+) -> Result<(), SimError> {
+    if !snapshot.reliability_cfg.is_valid() {
+        return Err(SimError::Fatal("snapshot: invalid reliability config"));
+    }
+    let mut instances = BTreeSet::new();
+    for (vid, vessel) in &snapshot.vessels {
+        for rec in vessel.reliability.values() {
+            if rec.instance.0 >= snapshot.next_part_instance_id {
+                return Err(SimError::Fatal(
+                    "snapshot: part instance not below next counter",
+                ));
+            }
+            if !instances.insert((vid, rec.instance)) {
+                return Err(SimError::Fatal("snapshot: duplicate part instance"));
+            }
+            if let Some(t) = rec.pending_failure_tick
+                && pf_events.get(&(*vid, rec.instance)) != Some(&t)
+            {
+                return Err(SimError::Fatal(
+                    "snapshot: pending failure tick / event mismatch",
+                ));
+            }
+        }
+    }
+    for (id, b) in &snapshot.bench_runs {
+        if b.id != *id {
+            return Err(SimError::Fatal("snapshot: bench id != arena key"));
+        }
+        if id.0 >= snapshot.next_bench_id {
+            return Err(SimError::Fatal("snapshot: bench id not below next"));
+        }
+        if !(b.units.is_finite() && b.units > 0.0) {
+            return Err(SimError::Fatal("snapshot: non-positive bench units"));
+        }
+        if bench_events.get(id) != Some(&b.complete_tick) {
+            return Err(SimError::Fatal(
+                "snapshot: bench run / completion event mismatch",
+            ));
+        }
+    }
+    for id in bench_events.keys() {
+        if !snapshot.bench_runs.contains_key(id) {
+            return Err(SimError::Fatal(
+                "snapshot: bench completion names unknown run",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // the check list grew with M9b
 fn restore_vessel_state(vessel: &mut Vessel, has_physics: bool) -> Result<(), SimError> {
     check_restored_maneuver(vessel)?;
     // M4b: the serialized thermal record must match the craft one-to-
@@ -7343,6 +7841,26 @@ fn restore_vessel_state(vessel: &mut Vessel, has_physics: bool) -> Result<(), Si
                     return Err(SimError::Fatal("snapshot: incoherent dock seam"));
                 }
             }
+            // M9b: every reliability record keys on a live graph
+            // node with coherent state — finite-or-+∞ θ (the `U=0`
+            // never-fails corner), a valid usage record, an in-range
+            // thrust factor, and a sane epoch anchor.
+            for (node, rec) in &vessel.reliability {
+                if !craft.graph.nodes.contains_key(node) {
+                    return Err(SimError::Fatal("snapshot: reliability record on non-node"));
+                }
+                if !(rec.theta.is_finite() || rec.theta == f64::INFINITY)
+                    || rec.theta <= 0.0
+                    || !rec.usage.is_valid()
+                    || !(rec.thrust_factor.is_finite() && (0.0..=1.0).contains(&rec.thrust_factor))
+                    // The failure ordinal counts every applied
+                    // failure — it can lead the dedup'd mode list,
+                    // never trail it.
+                    || (rec.renewal_count as usize) < rec.failures.len()
+                {
+                    return Err(SimError::Fatal("snapshot: incoherent reliability record"));
+                }
+            }
             // M6-D: contents/crew coherence — live tanked nodes,
             // declared resources, capacity bounds, wet-vs-mass, and
             // the seat occupancy limit (helper below).
@@ -7375,10 +7893,12 @@ fn restore_vessel_state(vessel: &mut Vessel, has_physics: bool) -> Result<(), Si
             || !vessel.tank_contents.is_empty()
             || !vessel.crew.is_empty()
             || !vessel.science.data.is_empty()
-            || !vessel.science.spent.is_empty() =>
+            || !vessel.science.spent.is_empty()
+            || !vessel.reliability.is_empty() =>
         {
             return Err(SimError::Fatal(
-                "snapshot: thermal, seam, or contents/crew record on a craft-less vessel",
+                "snapshot: thermal, seam, contents/crew, science, or reliability \
+                 record on a craft-less vessel",
             ));
         }
         None => {}
@@ -7569,6 +8089,12 @@ pub(crate) fn hash_craft(h: &mut StateHasher, craft: &CraftDef) {
     h.vec(&craft.part_costs, |h, c| {
         h.f64(*c);
     });
+    // M9b: the frozen reliability specs — same table convention: a
+    // spec decides the part's hazard model, so it is craft identity
+    // like `parts`/`part_costs`.
+    h.vec(&craft.reliability, |h, s| {
+        reliability::hash_spec(h, s);
+    });
 }
 
 /// The §2.4 craft identity the aero-table install command binds on:
@@ -7649,6 +8175,7 @@ fn transition_latched(
     physics: &Physics,
     latched_now: &[VesselId],
     sim: SimTime,
+    rel_cfg: &reliability::ReliabilityConfig,
 ) {
     for vid in latched_now {
         let Some(vessel) = vessels.get(vid) else {
@@ -7668,6 +8195,30 @@ fn transition_latched(
         );
         if let Some(vessel) = vessels.get_mut(vid) {
             vessel.state = VesselState::SurfaceLatched(pose);
+            // M9b: the latch is a bubble→dormant transition — every
+            // part's record restamps dormant at `sim` (the constant
+            // dormant λ makes the publish tick exact; the slot
+            // re-derives it next interval). The spec read is
+            // positional over `parts` — a non-covering table (the
+            // latch merge's mismatched halves) resolves none, so the
+            // record stamps λ = 0 (inert, never a wrong part's rate).
+            if let Some(craft) = &vessel.craft {
+                let specs_ok = reliability::specs_parallel(craft);
+                for (node, rec) in vessel.reliability.iter_mut() {
+                    let lambda = craft
+                        .graph
+                        .nodes
+                        .get(node)
+                        .filter(|_| specs_ok)
+                        .and_then(|n| craft.reliability.get(n.effective_index as usize))
+                        .map_or(0.0, |s| {
+                            s.dormant_hazard_per_s(rel_cfg.dormant_stress_scale)
+                        });
+                    rec.restamp(sim.ticks(), lambda, true, false);
+                    rec.misfire = false;
+                    rec.ullage_stressed = false;
+                }
+            }
         }
     }
 }
@@ -7750,6 +8301,12 @@ fn apply_breakup(
     // exploded part itself) leaves the simulation with it.
     let v_tanks = v.tank_contents.clone();
     let v_crew = v.crew.clone();
+    // M9b: the per-node reliability records partition by node the
+    // same way — a fragment's parts keep their usage, pre-drawn
+    // thresholds, and applied failures; their pending publishes
+    // name the old vessel, so the fragment's records are cleared
+    // for the publish slot to re-derive under the new binding.
+    let v_reliability = v.reliability.clone();
     // M7-A: the keyed data pool and spent marks partition by node the
     // same way; projects whose lab node departs finalize per fragment
     // below (their escrowed remainder lands in the fragment's pool).
@@ -7879,6 +8436,7 @@ fn apply_breakup(
                     graph: frag_g,
                     parts: craft.parts.clone(),
                     part_costs: craft.part_costs.clone(),
+                    reliability: craft.reliability.clone(),
                 }),
                 state: VesselState::InBubble(fb),
                 aero_mask: csp_phys::ConfigMask::ALL,
@@ -7911,6 +8469,21 @@ fn apply_breakup(
                     .iter()
                     .filter(|(k, _)| frag_nodes.contains(k))
                     .map(|(k, s)| (*k, s.clone()))
+                    .collect(),
+                // M9b: the fragment keeps the reliability records
+                // inside its member set; their pending publishes
+                // named the old vessel, so the binding clears for
+                // the publish slot to re-derive (stale events are
+                // tolerated no-ops — `fire_part_failure`'s
+                // residence/instance checks).
+                reliability: v_reliability
+                    .iter()
+                    .filter(|(k, _)| frag_nodes.contains(k))
+                    .map(|(k, r)| {
+                        let mut r = r.clone();
+                        r.pending_failure_tick = None;
+                        (*k, r)
+                    })
                     .collect(),
                 crew: v_crew
                     .iter()
@@ -8020,6 +8593,11 @@ fn apply_breakup(
     v.tank_contents
         .retain(|id, _| craft.graph.nodes.contains_key(id));
     v.crew.retain(|c| craft.graph.nodes.contains_key(&c.seat));
+    // M9b: the retained side keeps the records of the parts it still
+    // holds — a pending publish naming this vessel stays valid (same
+    // `VesselId`, same instance), so no flag clearing here.
+    v.reliability
+        .retain(|id, _| craft.graph.nodes.contains_key(id));
     // M7-A: the pool and spent marks keep only the retained nodes the
     // same way; projects on departing lab nodes finalize next.
     v.science
@@ -8172,6 +8750,10 @@ fn hash_vessel(h: &mut StateHasher, vessel: &Vessel) {
             h.f64(*t);
         },
     );
+    // M9b: the per-node reliability records — §7.2's "PartUsage per
+    // part instance" plus the pre-drawn thresholds, hashed like the
+    // tank contents they partition with.
+    reliability::hash_vessel_reliability(h, &vessel.reliability);
     h.stable_enum(&vessel.state);
     match &vessel.state {
         VesselState::OnRails(orbit) => {
@@ -8541,6 +9123,11 @@ mod tests {
                 next_build_id: 0,
                 life_support_enabled: true,
                 life_support_cfg: life_support::default_config(),
+                next_part_instance_id: 0,
+                reliability_cfg: reliability::default_config(),
+                notifications: std::collections::VecDeque::new(),
+                bench_runs: BTreeMap::new(),
+                next_bench_id: 0,
             },
         )
         .unwrap();
@@ -9533,6 +10120,7 @@ mod tests {
                 seams: Vec::new(),
                 tank_contents: BTreeMap::new(),
                 crew: Vec::new(),
+                reliability: BTreeMap::new(),
             },
         );
         s.next_vessel_id = 3;
@@ -9701,6 +10289,7 @@ mod tests {
                     conduction_w_per_k: 60.0,
                 },
             }],
+            reliability: vec![],
         }
     }
 
@@ -9850,6 +10439,7 @@ mod tests {
             graph,
             part_costs: vec![0.0; 2],
             parts: vec![payload, plate],
+            reliability: vec![],
         }
     }
 
@@ -10722,6 +11312,7 @@ mod tests {
                     conduction_w_per_k: cond,
                 },
             }],
+            reliability: vec![],
         }
     }
 
@@ -10857,6 +11448,7 @@ mod tests {
             graph,
             part_costs: vec![0.0; 2],
             parts: vec![mk(10_000.0), mk(400.0)],
+            reliability: vec![],
         };
         spawn_falling(&mut w, craft, 10_000.0, 2_000.0);
         // Tick until the leaf burns off (a few seconds at most).
@@ -10965,6 +11557,7 @@ mod tests {
                 thermal_part(50_000.0, 400.0, 0.0),
                 thermal_part(50_000.0, 10_000.0, 0.0),
             ],
+            reliability: vec![],
         };
         spawn_falling(&mut w, craft, 10_000.0, 2_000.0);
         let mut pruned = false;
@@ -11041,6 +11634,7 @@ mod tests {
                 thermal_part(50_000.0, 400.0, 0.0),
                 thermal_part(50_000.0, 10_000.0, 0.0),
             ],
+            reliability: vec![],
         };
         spawn_falling(&mut w, craft, 10_000.0, 2_000.0);
         // Nodes 0, 1 aero-active; node 2 inactive → mask 0b011.
@@ -11260,6 +11854,7 @@ mod tests {
             graph,
             part_costs: vec![0.0; 2],
             parts: vec![engine, payload],
+            reliability: vec![],
         }
     }
 
@@ -11411,6 +12006,7 @@ mod tests {
                     },
                 })
                 .collect(),
+            reliability: vec![],
         }
     }
 
@@ -11439,6 +12035,7 @@ mod tests {
                 seams: Vec::new(),
                 tank_contents: BTreeMap::new(),
                 crew: Vec::new(),
+                reliability: BTreeMap::new(),
             },
         );
         let mut physics = Physics {
@@ -11480,6 +12077,10 @@ mod tests {
             colonies: None,
             next_colony_id: None,
             life_support_enabled: None,
+            next_part_instance_id: None,
+            notifications: None,
+            benches: None,
+            next_bench_id: None,
         };
         apply_breakup(
             &mut vessels,
@@ -13457,6 +14058,7 @@ mod tests {
                     seams: Vec::new(),
                     tank_contents: BTreeMap::new(),
                     crew: Vec::new(),
+                    reliability: BTreeMap::new(),
                 },
             );
         };
@@ -13522,6 +14124,10 @@ mod tests {
             colonies: None,
             next_colony_id: None,
             life_support_enabled: None,
+            next_part_instance_id: None,
+            notifications: None,
+            benches: None,
+            next_bench_id: None,
         };
         assert!(
             joints::apply_latch(
@@ -13590,6 +14196,7 @@ mod tests {
             seams: Vec::new(),
             tank_contents: BTreeMap::new(),
             crew: Vec::new(),
+            reliability: BTreeMap::new(),
         }
     }
 
@@ -14517,6 +15124,7 @@ mod tests {
             seams: Vec::new(),
             tank_contents: BTreeMap::new(),
             crew: Vec::new(),
+            reliability: BTreeMap::new(),
         };
         let mut vessels = BTreeMap::new();
         vessels.insert(VesselId(0), mk(0, 0.0));
@@ -15394,6 +16002,416 @@ mod tests {
         );
         a.step_frame(a.clock().ticks() + 1).unwrap();
         assert_ne!(a.state_hash().unwrap(), b.state_hash().unwrap());
+    }
+
+    /// M9b §3.4's reliability model — the end-to-end halves the
+    /// record-level unit tests can't reach: the dormant closed-form
+    /// publish → Silent `PartFailure` → record application chain,
+    /// and the anti-save-scum guarantee that `θ` rides
+    /// snapshot/restore unchanged.
+    mod m9b {
+        use super::*;
+        use crate::reliability::{self, NotificationKind, PartInstanceId};
+        use csp_data::FailureMode;
+
+        /// A dormant-stressed spec — `λ_base = 1/s` with
+        /// `dormant_stress = 1`, so the dormant crossing lands inside
+        /// a few hundred ticks for every pre-drawn θ = −ln(U) ∈ (0, ~6].
+        fn dormant_spec() -> csp_phys::ReliabilitySpec {
+            csp_phys::ReliabilitySpec {
+                family: csp_data::FamilyId::from("f"),
+                base_mtbf_s: 1.0,
+                infant_mortality: 0.0,
+                dormant_stress: 1.0,
+                regime_stress: vec![],
+                failure_modes: vec![(FailureMode::Leak, 1.0)],
+                qualification_curve: csp_data::QualCurve {
+                    knots: vec![csp_data::QualKnot {
+                        qualification_units: 0.0,
+                        hazard_multiplier: 1.0,
+                    }],
+                },
+                engine: None,
+            }
+        }
+
+        /// A one-node rails vessel with a live dormant record — the
+        /// `fresh_record` + dormant restamp a construction site
+        /// performs, driven straight into the world the residence
+        /// hooks would have.
+        fn dormant_vessel(save_seed: u64) -> Vessel {
+            let mut craft = box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0);
+            craft.reliability = vec![dormant_spec()];
+            let node = csp_phys::PartNodeId(0);
+            let mut rec = reliability::fresh_record(save_seed, PartInstanceId(0), 0);
+            rec.restamp(0, 1.0, true, false);
+            let mut thermal = VesselThermal::default();
+            thermal.part_temps_k.insert(node, 289.0);
+            Vessel {
+                science: VesselScience::default(),
+                joined_colony: None,
+                id: VesselId(0),
+                craft: Some(craft),
+                aero_mask: csp_phys::ConfigMask::ALL,
+                debris_since: None,
+                maneuver: None,
+                thermal,
+                state: VesselState::OnRails(OrbitState {
+                    parent: BodyId::from("p"),
+                    elements: leo_elements(),
+                    epoch: SimTime(0),
+                }),
+                seams: Vec::new(),
+                tank_contents: BTreeMap::new(),
+                crew: Vec::new(),
+                reliability: BTreeMap::from([(node, rec)]),
+            }
+        }
+
+        #[test]
+        fn dormant_failure_publishes_fires_silently_and_records() {
+            let mut w = World::with_system(test_system());
+            w.vessels.insert(VesselId(0), dormant_vessel(w.save_seed));
+            w.next_vessel_id = 1;
+            w.next_part_instance_id = 1;
+            // θ ~ O(1) s of dormant hazard at λ = 1/s — a 10-minute
+            // advance crosses many renewals, each a Silent event.
+            w.step_frame(10 * 60 * 64).unwrap();
+            // Two short advances: the first flushes the clamped
+            // stale-tick firing (the publish schedules the renewal
+            // one pass later, and a fire in the same iteration
+            // consumes the flag), the second lets the republish
+            // land ahead of the clock.
+            w.step_frame(w.clock().ticks() + 4).unwrap();
+            w.step_frame(w.clock().ticks() + 1).unwrap();
+            let v = &w.vessels[&VesselId(0)];
+            let rec = &v.reliability[&csp_phys::PartNodeId(0)];
+            // The mode applied — Leak is the whole non-fatal table,
+            // recorded once (mode application dedups).
+            assert_eq!(rec.failures, vec![FailureMode::Leak]);
+            // The renewal chain's next crossing is already
+            // re-published (θ advanced at each fire).
+            assert!(rec.pending_failure_tick.is_some());
+            // §3.4's observed failures are qualification data —
+            // every renewal that crossed counted one.
+            assert!(w.tech.qualifications[&csp_data::FamilyId::from("f")].observed_failures >= 1);
+            // The player hears about the dormant failure.
+            assert!(w.notifications().iter().any(|n| matches!(
+                n.kind,
+                NotificationKind::PartFailed {
+                    mode: FailureMode::Leak,
+                    dormant: true
+                }
+            )));
+            // The record's renewal chain advanced — a second dormant
+            // wait can fail the part again (never the same draw).
+            assert!(rec.theta > 0.0);
+            // …and the next crossing is already re-published —
+            // Silent, never demoting warp (§3.4's event class).
+            assert!(w.event_heap.iter().any(|e| {
+                e.class == EventClass::Silent
+                    && matches!(
+                        e.kind,
+                        EventKind::PartFailure { vessel, .. } if vessel == VesselId(0)
+                    )
+            }));
+        }
+
+        #[test]
+        fn dormant_disabled_at_zero_scale() {
+            let mut w = World::with_system(test_system());
+            let mut cfg = reliability::default_config();
+            cfg.dormant_stress_scale = 0.0;
+            w.reliability_cfg = cfg;
+            w.vessels.insert(VesselId(0), dormant_vessel(w.save_seed));
+            w.next_vessel_id = 1;
+            w.next_part_instance_id = 1;
+            w.step_frame(60 * 60 * 64).unwrap();
+            assert!(
+                w.vessels[&VesselId(0)].reliability[&csp_phys::PartNodeId(0)]
+                    .failures
+                    .is_empty()
+            );
+            assert!(w.notifications().is_empty());
+        }
+
+        #[test]
+        fn theta_survives_snapshot_restore_and_revert() {
+            // §3.4's anti-save-scum core: the pre-drawn θ is
+            // serialized state — a revert replays the identical
+            // draw, never a reroll.
+            let mut w = World::with_system(test_system());
+            w.vessels.insert(VesselId(0), dormant_vessel(w.save_seed));
+            w.next_vessel_id = 1;
+            w.next_part_instance_id = 1;
+            w.step_frame(100).unwrap();
+            let theta_before = w.vessels[&VesselId(0)].reliability[&csp_phys::PartNodeId(0)].theta;
+            // A snapshot → restore round-trip is the revert path.
+            let snap = w.snapshot().unwrap();
+            let mut w2 = World::restore(PatchedConics::new(BTreeMap::new()), None, snap).unwrap();
+            w2.orbits = test_system();
+            let theta_after = w2.vessels[&VesselId(0)].reliability[&csp_phys::PartNodeId(0)].theta;
+            assert_eq!(theta_before, theta_after);
+            // …and it differs from a *fresh* draw at another
+            // instance (revert can't buy a new number).
+            let fresh = reliability::fresh_record(w.save_seed, PartInstanceId(1), 0);
+            assert_ne!(theta_before, fresh.theta);
+            // The restored world replays the same dormant outcome —
+            // same hash after the same advance.
+            w.step_frame(10 * 60 * 64).unwrap();
+            w2.step_frame(10 * 60 * 64).unwrap();
+            assert_eq!(
+                w.state_hash_masked(&w.in_bubble_ids()).unwrap(),
+                w2.state_hash_masked(&w2.in_bubble_ids()).unwrap()
+            );
+        }
+
+        /// Jettison must drop the node's reliability record with the
+        /// rest of its per-node state — a record left behind names a
+        /// graph node that no longer exists, serializes, and the
+        /// restore gate's "reliability record on non-node" Fatal
+        /// bricks the save. Regression test on a craft carrying a
+        /// real spec table (records allocate at spawn).
+        #[test]
+        fn jettison_drops_the_record_and_restore_accepts() {
+            let mut w = physics_world(false);
+            let pos = DVec3::new(TERRIN_R + 30_000.0, 0.0, 0.0);
+            let mut craft = two_node_craft();
+            // A spec per effective part — the spawn's reliability
+            // table gate (`len == parts.len()`) and `is_valid`.
+            craft.reliability = vec![dormant_spec(), dormant_spec()];
+            spawn_physical(
+                &mut w,
+                SimCommand::SpawnPhysicalVessel {
+                    craft,
+                    pos,
+                    rot: csp_core::DQuat::IDENTITY,
+                    vel: DVec3::new(-300.0, 0.0, 0.0),
+                    ang_vel: DVec3::ZERO,
+                },
+            );
+            // One record per graph node — both parts carry the model.
+            assert_eq!(w.vessels()[&VesselId(0)].reliability.len(), 2);
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::JettisonPart {
+                    vessel: VesselId(0),
+                    node: csp_phys::PartNodeId(2),
+                },
+            );
+            w.step_frame(w.clock().ticks() + 1).unwrap();
+            let v = &w.vessels()[&VesselId(0)];
+            assert_eq!(v.craft.as_ref().unwrap().graph.nodes.len(), 1);
+            // The retained node's record stays; the jettisoned one is
+            // gone (pre-fix it stayed and killed the next restore).
+            assert_eq!(v.reliability.len(), 1);
+            assert!(v.reliability.contains_key(&csp_phys::PartNodeId(1)));
+            // The restore gate must accept the post-jettison world.
+            let snap = w.snapshot().unwrap();
+            let mut w2 = World::restore(
+                test_system(),
+                Some(PhysicsConfig {
+                    environment: test_env(false),
+                    dominant: BodyId::from("p"),
+                }),
+                snap,
+            )
+            .unwrap();
+            // …and the restored world replays bit-identically.
+            w.step_frame(w.clock().ticks() + 320).unwrap();
+            w2.step_frame(w2.clock().ticks() + 320).unwrap();
+            assert_eq!(
+                w.state_hash_masked(&w.in_bubble_ids()).unwrap(),
+                w2.state_hash_masked(&w2.in_bubble_ids()).unwrap()
+            );
+        }
+
+        /// N-1 regression: a same-tick `Explosion` mode draw AND a
+        /// thermal overheat must BOTH reach `apply_breakup`. The
+        /// explosions were folded into the thermal-hit list, then
+        /// `failures[vid].1 = hot` overwrote them — the exploded
+        /// part recorded its failure, renewed θ, and kept
+        /// simulating. Rig: a tough root with two leaves — leaf 1's
+        /// spec forces a first-tick `Explosion` draw (λ ≈ 1e6/s ⇒ Λ
+        /// crosses any finite pre-drawn θ in one tick; the mode
+        /// table is Explosion-only), leaf 2's `max_temp_k` sits
+        /// below ambient so `thermal_step` flags it the same tick.
+        /// The retained graph must be the root alone.
+        #[test]
+        fn explosion_and_overheat_same_tick_destroys_part() {
+            let mut w = physics_world(false);
+            let mut graph = csp_phys::PartGraph::new(csp_phys::PartNodeId(0));
+            graph.insert(
+                csp_phys::PartNodeId(0),
+                csp_phys::PartNode::new(None, csp_phys::PartTransform::IDENTITY, 0),
+            );
+            for (id, z) in [
+                (csp_phys::PartNodeId(1), 1.0),
+                (csp_phys::PartNodeId(2), -1.0),
+            ] {
+                graph.insert(
+                    id,
+                    csp_phys::PartNode::new(
+                        Some(csp_phys::PartNodeId(0)),
+                        csp_phys::PartTransform::new(
+                            DVec3::new(0.0, 0.0, z),
+                            csp_core::DQuat::IDENTITY,
+                        ),
+                        id.0 as u32,
+                    ),
+                );
+            }
+            let exploding = csp_phys::ReliabilitySpec {
+                family: csp_data::FamilyId::from("f"),
+                base_mtbf_s: 1e-6,
+                infant_mortality: 0.0,
+                dormant_stress: 0.0,
+                regime_stress: vec![],
+                failure_modes: vec![(FailureMode::Explosion, 1.0)],
+                qualification_curve: csp_data::QualCurve {
+                    knots: vec![csp_data::QualKnot {
+                        qualification_units: 0.0,
+                        hazard_multiplier: 1.0,
+                    }],
+                },
+                engine: None,
+            };
+            // Root and the fragile leaf carry an inert spec — the
+            // table must cover `parts` (the spawn gate) while nothing
+            // else may fail inside the test's horizon.
+            let benign = csp_phys::ReliabilitySpec {
+                base_mtbf_s: 1e30,
+                failure_modes: vec![(FailureMode::Leak, 1.0)],
+                ..exploding.clone()
+            };
+            let craft = CraftDef {
+                graph,
+                part_costs: vec![0.0; 3],
+                parts: vec![
+                    thermal_part(400_000.0, 10_000.0, 0.0),
+                    thermal_part(400_000.0, 10_000.0, 0.0),
+                    // Ambient at 10 km is ~276 K — a 250 K cap is
+                    // over limit on the very first `thermal_step`,
+                    // the same tick leaf 1 draws its Explosion.
+                    thermal_part(400_000.0, 250.0, 0.0),
+                ],
+                reliability: vec![benign.clone(), exploding, benign],
+            };
+            // `spawn_falling` steps one frame — the spawn tick IS the
+            // collision tick: leaf 1's crossing and leaf 2's overheat
+            // are both evaluated in the same `step_bubble_range`
+            // iteration, so the retained graph must already be the
+            // root alone. (Pre-fix the exploded leaf survived this
+            // tick — `= hot` had overwritten its destruction list —
+            // and exploded a SECOND time next tick when `hot` was
+            // empty, leaving two Explosion notifications.)
+            spawn_falling(&mut w, craft, 10_000.0, 2_000.0);
+            let v = &w.vessels()[&VesselId(0)];
+            let nodes: Vec<csp_phys::PartNodeId> = v
+                .craft
+                .as_ref()
+                .unwrap()
+                .graph
+                .nodes
+                .keys()
+                .copied()
+                .collect();
+            assert_eq!(
+                nodes,
+                vec![csp_phys::PartNodeId(0)],
+                "exploded leaf and overheated leaf must both be gone"
+            );
+            // The Explosion fired as a recorded operating failure —
+            // exactly ONCE. The swallowed-destruction signature was a
+            // second Explosion on the same node next tick (the record
+            // renewed θ, re-crossed, and destroyed it late).
+            assert_eq!(
+                w.notifications()
+                    .iter()
+                    .filter(|n| matches!(
+                        n.kind,
+                        NotificationKind::PartFailed {
+                            mode: FailureMode::Explosion,
+                            dormant: false
+                        }
+                    ))
+                    .count(),
+                1
+            );
+        }
+
+        /// N-2 edge: a spec table that doesn't cover `parts` — the
+        /// shape a latch merge of a specless half with a spec'd one
+        /// produces — resolves NO spec (the `specs_parallel` gate):
+        /// records go inert rather than binding a wrong part's spec.
+        #[test]
+        fn nonparallel_spec_table_resolves_nothing() {
+            let mut craft = two_node_craft();
+            // Two parts, one spec — the mismatched-merge shape. Node
+            // 2's `effective_index` (1) is in bounds for the 1-entry
+            // table: the pre-guard read returned the ROOT's spec for
+            // it — the wrong binding, not a miss.
+            craft.reliability = vec![dormant_spec()];
+            assert!(!reliability::specs_parallel(&craft));
+            let node = csp_phys::PartNodeId(2);
+            let v = Vessel {
+                science: VesselScience::default(),
+                joined_colony: None,
+                id: VesselId(0),
+                craft: Some(craft.clone()),
+                aero_mask: csp_phys::ConfigMask::ALL,
+                debris_since: None,
+                maneuver: None,
+                thermal: VesselThermal::default(),
+                state: VesselState::OnRails(OrbitState {
+                    parent: BodyId::from("p"),
+                    elements: leo_elements(),
+                    epoch: SimTime(0),
+                }),
+                seams: Vec::new(),
+                tank_contents: BTreeMap::new(),
+                crew: Vec::new(),
+                reliability: BTreeMap::new(),
+            };
+            assert!(World::spec_for(&v, node).is_none());
+            // A covering table still resolves — the gate is not a
+            // blackout.
+            let mut ok = v.clone();
+            ok.craft.as_mut().unwrap().reliability = vec![dormant_spec(), dormant_spec()];
+            assert!(World::spec_for(&ok, node).is_some());
+            // …and the bubble pass leaves a mismatched-table record
+            // inert: no accrual, no crossing, no effects.
+            let mut recs =
+                BTreeMap::from([(node, reliability::fresh_record(0, PartInstanceId(0), 0))]);
+            let mut stores = BTreeMap::new();
+            let temps = BTreeMap::new();
+            let axial = BTreeMap::new();
+            let env = reliability::BubbleEnv {
+                temps: &temps,
+                throttle: 0.0,
+                g_load: 0.0,
+                axial: &axial,
+                on_ground: false,
+                in_atmosphere: false,
+            };
+            let eff = reliability::bubble_part_tick(
+                &mut craft,
+                &mut recs,
+                &mut stores,
+                &env,
+                0,
+                0,
+                &csp_phys::FamilyQualifications::default(),
+                &reliability::default_config(),
+            );
+            assert_eq!(recs[&node].usage.hazard_integral, 0.0);
+            assert_eq!(recs[&node].epoch_tick, 0);
+            assert!(eff.failures.is_empty());
+            assert!(eff.explosions.is_empty());
+            assert!(eff.misfires.is_empty());
+            assert!(!eff.mass_changed);
+        }
     }
 
     /// M9a §2.10's script/autopilot machinery — the host-independent

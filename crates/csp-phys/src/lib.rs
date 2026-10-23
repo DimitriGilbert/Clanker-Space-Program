@@ -110,12 +110,13 @@ pub use part::{
     ColliderShape, DockPortSpec, ExperimentSpec, ForceSite, ForceSiteKind, LabSpec, TankSpec,
     WeldPart,
 };
-pub use profile::{BurnSegment, MissionCheck, MissionProfile, Regime};
+pub use profile::{BurnSegment, MissionCheck, MissionProfile, Regime, confidence, expected_hazard};
 pub use readout::{CraftAnalysis, StageStats, analyze};
 pub use resolve::{
-    BuiltPart, EffectivePart, FamilyQualification, FamilyQualifications, PartUsage, ResolveError,
-    ResolvedReliability, TrackLevels, WEAR_HAZARD_STUB, apply_wear, compose_upgrade_levels,
-    resolve_built_part, resolve_part, resolve_parts, wear_multiplier,
+    BuiltPart, EffectivePart, EngineReliability, FamilyQualification, FamilyQualifications,
+    PartUsage, RegimeMetrics, ReliabilitySpec, ResolveError, ResolvedReliability, TrackLevels,
+    WEAR_HAZARD_STUB, apply_wear, compose_upgrade_levels, qual_factor, resolve_built_part,
+    resolve_part, resolve_parts, stress_breakdown, stress_product, wear_multiplier,
 };
 pub use session::{
     ATTACH_DIAMETER_REL_TOLERANCE, AttachEdge, CRAFT_FILE_MAGIC, CRAFT_SCHEMA_VERSION,

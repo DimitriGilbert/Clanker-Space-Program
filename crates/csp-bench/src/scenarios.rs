@@ -290,6 +290,9 @@ fn flight_craft() -> csp_sim::CraftDef {
         // charge at spawn and the recovery payout at the latch all
         // exercise it.
         part_costs: vec![50_000.0],
+        // M9b: the bench's authored craft carries no reliability
+        // model (the empty-table convention).
+        reliability: vec![],
     }
 }
 
