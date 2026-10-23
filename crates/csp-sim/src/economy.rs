@@ -742,7 +742,14 @@ impl World {
         {
             return Ok(());
         }
-        let next = (self.clock.ticks() / period + 1) * period;
+        // The `fire_salary_due` re-arm convention: saturating math,
+        // strictly ahead of the clock — a `clock` near `u64::MAX`
+        // saturates to a far-future grid point rather than panicking
+        // on the unchecked `+`/`*`.
+        let next = (self.clock.ticks() / period)
+            .saturating_add(1)
+            .saturating_mul(period)
+            .max(self.clock.ticks().saturating_add(1));
         self.schedule_event(EventKind::SalaryDue, next, shadow)
     }
 
@@ -906,7 +913,11 @@ impl World {
         let crew_home: Vec<CrewId> = v.crew.iter().map(|c| c.id).collect();
         // Pooled science banks at the §3.2 recover fraction per key —
         // closed only where the closed-key invariant is safe (no
-        // other vessel pools the key, no live project holds it).
+        // other vessel pools the key, no live project holds it). The
+        // `1 − transmit_ratio` remainder is the per-key blanket
+        // [`crate::research::ScienceKeyState::transmitted`] names: it
+        // applies to all units pooled at recovery, including any
+        // collected after the transmit.
         let mut science_bank: Vec<(crate::research::DataKey, f64, bool)> = Vec::new();
         for m in v.science.data.values() {
             for (key, units) in m {

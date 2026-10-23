@@ -18,7 +18,17 @@
 //! same publish lands identically in every §2.6.1 partition. Draw
 //! order is fixed: template (weighted pick over the prereq-eligible
 //! set in ascending-id order), then the param draws in the authored
-//! field order.
+//! field order. A drawn satellite pair whose apoapsis cap lands under
+//! its periapsis floor is ordered (the bands may overlap partially)
+//! so every published offer stays satisfiable; a space that cannot
+//! produce honest params at all — empty candidate lists, or a draw
+//! that fails the restore gate's `params_ok` shape (finite
+//! everywhere; `> 0` for the units/altitude/amount asks; `≥ 0` and
+//! ordered for the satellite window) — degrades the publish
+//! `Recoverable`, never `Fatal`. Both are reachable only through
+//! unvalidated `set_contracts` installs; the per-draw gate is what
+//! keeps a poisoned space from publishing an offer the snapshot
+//! restore would `Fatal` on.
 //!
 //! # Prerequisites — facts, not reputation
 //!
@@ -41,6 +51,9 @@
 //! — and evaluates the subscribed contracts' predicates over current
 //! state. `Rescue` is the one transition-keyed predicate (the
 //! recovered vessel leaves the sim, so the event carries the body).
+//! Because the predicates read current state, an already-satisfied
+//! offer completes inside its own `AcceptContract` boundary —
+//! documented on [`World::apply_accept_contract`].
 //!
 //! # Deadline
 //!
@@ -224,13 +237,52 @@ fn pick(rng: &mut impl Rng, len: usize) -> usize {
     (next01(rng) * len as f64) as usize
 }
 
+/// The "honest params" predicate — the one shape BOTH sides of the
+/// boundary enforce: [`draw_params`] runs it on the drawn values
+/// before the params leave generation (a `Recoverable` publish
+/// degradation), and `World::restore` runs it on every serialized
+/// offer/active contract (a `Fatal` snapshot rejection — one
+/// predicate, so generation can never publish what restore would
+/// reject). Finite scalars throughout; `> 0` where the param is a
+/// demand (survey units, regime altitude, resupply amount); `≥ 0`
+/// and ordered for the satellite window.
+pub(crate) fn params_ok(p: &ContractParams) -> bool {
+    let ok = |v: f64| v.is_finite() && v >= 0.0;
+    match p {
+        ContractParams::SatelliteOrbit {
+            min_periapsis_alt_m,
+            max_apoapsis_alt_m,
+            ..
+        } => {
+            ok(*min_periapsis_alt_m)
+                && ok(*max_apoapsis_alt_m)
+                && min_periapsis_alt_m <= max_apoapsis_alt_m
+        }
+        ContractParams::SurveyData { min_units, .. } => ok(*min_units) && *min_units > 0.0,
+        ContractParams::PartTest { regime, .. } => match regime {
+            ContractRegime::Orbit { min_alt_m, .. } => ok(*min_alt_m) && *min_alt_m > 0.0,
+            ContractRegime::Landed { .. } => true,
+        },
+        ContractParams::Rescue { .. } => true,
+        ContractParams::ColonyResupply { amount, .. } => ok(*amount) && *amount > 0.0,
+    }
+}
+
 /// Draw the concrete params for a template — the fixed per-kind
-/// draw order (module doc).
+/// draw order (module doc). A space that cannot produce honest
+/// params — an empty candidate list, or a draw [`params_ok`]
+/// rejects — is a `Recoverable` (construction-config defect:
+/// `set_contracts` callers bypass the `csp-data` validators that
+/// gate it), never a `Fatal`: the board publish degrades typed and
+/// the world rolls back intact. Without the draw-time gate an
+/// unvalidated install would publish the dishonest offer and
+/// `World::restore` would `Fatal` on the snapshot (`snapshot:
+/// offer with non-finite params`).
 fn draw_params(
     rng: &mut impl Rng,
     template: &ContractTemplate,
 ) -> Result<ContractParams, SimError> {
-    match &template.generate.space {
+    let params = match &template.generate.space {
         ContractParamSpace::SatellitePlacement {
             bodies,
             periapsis_alt_m,
@@ -238,46 +290,54 @@ fn draw_params(
         } => {
             let body = bodies
                 .get(pick(rng, bodies.len()))
-                .ok_or(SimError::Fatal("contract gen: empty body space"))?
+                .ok_or(SimError::Recoverable("contract gen: empty body space"))?
                 .clone();
-            let rp = periapsis_alt_m.0 + next01(rng) * (periapsis_alt_m.1 - periapsis_alt_m.0);
+            let mut rp = periapsis_alt_m.0 + next01(rng) * (periapsis_alt_m.1 - periapsis_alt_m.0);
             let mut ra = apoapsis_alt_m.0 + next01(rng) * (apoapsis_alt_m.1 - apoapsis_alt_m.0);
             if ra < rp {
-                // The clamp the space doc names: a drawn cap under
-                // the floor would be unsatisfiable.
-                ra = rp;
+                // The ordering rule the space doc names: a drawn cap
+                // under the floor swaps into place, so the published
+                // `[min_periapsis, max_apoapsis]` window is never
+                // empty and the offer stays satisfiable. The `ra =
+                // rp` clamp it replaces collapsed the window to a
+                // single bit-exact altitude — completable only by a
+                // circular orbit at exactly `e = 0`, `a − radius =
+                // rp`, i.e. never in play.
+                std::mem::swap(&mut rp, &mut ra);
             }
-            Ok(ContractParams::SatelliteOrbit {
+            ContractParams::SatelliteOrbit {
                 body,
                 min_periapsis_alt_m: rp,
                 max_apoapsis_alt_m: ra,
-            })
+            }
         }
         ContractParamSpace::SurveyRun {
             experiments,
             bodies,
             min_units,
-        } => Ok(ContractParams::SurveyData {
+        } => ContractParams::SurveyData {
             experiment: experiments
                 .get(pick(rng, experiments.len()))
-                .ok_or(SimError::Fatal("contract gen: empty experiment space"))?
+                .ok_or(SimError::Recoverable(
+                    "contract gen: empty experiment space",
+                ))?
                 .clone(),
             body: bodies
                 .get(pick(rng, bodies.len()))
-                .ok_or(SimError::Fatal("contract gen: empty body space"))?
+                .ok_or(SimError::Recoverable("contract gen: empty body space"))?
                 .clone(),
             min_units: *min_units,
-        }),
+        },
         ContractParamSpace::PartTest { modules, regime } => {
             let module = modules
                 .get(pick(rng, modules.len()))
-                .ok_or(SimError::Fatal("contract gen: empty module space"))?
+                .ok_or(SimError::Recoverable("contract gen: empty module space"))?
                 .clone();
             let regime = match regime {
                 RegimeSpace::Orbit { bodies, min_alt_m } => {
                     let body = bodies
                         .get(pick(rng, bodies.len()))
-                        .ok_or(SimError::Fatal("contract gen: empty body space"))?
+                        .ok_or(SimError::Recoverable("contract gen: empty body space"))?
                         .clone();
                     let alt = min_alt_m.0 + next01(rng) * (min_alt_m.1 - min_alt_m.0);
                     ContractRegime::Orbit {
@@ -288,36 +348,45 @@ fn draw_params(
                 RegimeSpace::Landed { bodies } => ContractRegime::Landed {
                     body: bodies
                         .get(pick(rng, bodies.len()))
-                        .ok_or(SimError::Fatal("contract gen: empty body space"))?
+                        .ok_or(SimError::Recoverable("contract gen: empty body space"))?
                         .clone(),
                 },
             };
-            Ok(ContractParams::PartTest { module, regime })
+            ContractParams::PartTest { module, regime }
         }
-        ContractParamSpace::Rescue { bodies } => Ok(ContractParams::Rescue {
+        ContractParamSpace::Rescue { bodies } => ContractParams::Rescue {
             body: bodies
                 .get(pick(rng, bodies.len()))
-                .ok_or(SimError::Fatal("contract gen: empty body space"))?
+                .ok_or(SimError::Recoverable("contract gen: empty body space"))?
                 .clone(),
-        }),
+        },
         // M8-C §3.6: draw the body, the resource, then the delivery
         // amount uniform in the authored range.
         ContractParamSpace::ColonyResupply {
             bodies,
             resources,
             amount,
-        } => Ok(ContractParams::ColonyResupply {
+        } => ContractParams::ColonyResupply {
             body: bodies
                 .get(pick(rng, bodies.len()))
-                .ok_or(SimError::Fatal("contract gen: empty body space"))?
+                .ok_or(SimError::Recoverable("contract gen: empty body space"))?
                 .clone(),
             resource: resources
                 .get(pick(rng, resources.len()))
-                .ok_or(SimError::Fatal("contract gen: empty resource space"))?
+                .ok_or(SimError::Recoverable("contract gen: empty resource space"))?
                 .clone(),
             amount: amount.0 + next01(rng) * (amount.1 - amount.0),
-        }),
+        },
+    };
+    // Every drawn scalar — the authored `min_units` included — must
+    // pass the restore gate's own predicate before the params leave
+    // generation: a non-finite or non-positive band draw / ask off
+    // an unvalidated install degrades the publish `Recoverable`
+    // rather than printing an offer the snapshot restore fatals on.
+    if !params_ok(&params) {
+        return Err(SimError::Recoverable("contract gen: dishonest params"));
     }
+    Ok(params)
 }
 
 /// One predicate of the fact set — `TechResearched` reads the tech
@@ -589,6 +658,9 @@ impl World {
     /// templates, then the param draw — the
     /// `{CONTRACTS, 0, offer_index}` KDF seeding (§2.6.1). Returns
     /// `None` when nothing is eligible (the board just sits short).
+    /// A picked template whose space cannot produce honest params
+    /// degrades `Recoverable` out of the publish — see
+    /// [`draw_params`].
     fn generate_offer(&self, index: u64) -> Result<Option<ContractOffer>, SimError> {
         let eligible: Vec<&ContractTemplate> = self
             .contract_defs
@@ -658,6 +730,23 @@ impl World {
     /// and the completion predicate evaluates once — an already-
     /// satisfied contract completes at acceptance (facts-based
     /// semantics: the sim state is the truth).
+    ///
+    /// # Instant completion — documented v1 semantics
+    ///
+    /// The predicate reads CURRENT state, so an already-satisfied
+    /// offer completes inside its own accept boundary — advance and
+    /// completion credit together, and no deadline is armed. For
+    /// the state-reading kinds (`SatelliteOrbit`, `PartTest`,
+    /// `SurveyData`, `ColonyResupply`) that counts facts that
+    /// predate acceptance: a vessel already in the regime, banked
+    /// data, and past colony deliveries all satisfy a fresh accept.
+    /// `Rescue` cannot instant-complete — its predicate is
+    /// transition-keyed, so `trigger: None` yields `false`. This is
+    /// the intended §3.6 reading (prerequisites — not accept order —
+    /// do the gating: a program that already flew the profile owns
+    /// the fact), with the documented cost that a farmed board can
+    /// pay advance+completion for no new work, once per offer
+    /// index.
     pub(crate) fn apply_accept_contract(
         &mut self,
         offer: u64,
@@ -673,11 +762,29 @@ impl World {
             return Err(SimError::Recoverable("accept: prerequisites not met"));
         }
         let rewards = template.rewards;
-        let deadline = template.deadline_days.map(|d| {
-            self.clock
-                .ticks()
-                .saturating_add((d * DAY_S * TICK_HZ as f64).ceil().max(1.0) as u64)
-        });
+        let deadline = match template.deadline_days {
+            Some(d) => {
+                // The data validator gates `deadline_days` finite
+                // and `> 0`, but `set_contracts` callers bypass it —
+                // a NaN would slip `f64::max` and arm at +1 tick, a
+                // `+inf`/non-positive day count likewise. Reject
+                // typed rather than arm a lie.
+                if !(d.is_finite() && d > 0.0) {
+                    return Err(SimError::Recoverable(
+                        "accept: non-finite or non-positive deadline_days",
+                    ));
+                }
+                Some(
+                    self.clock.ticks().saturating_add(
+                        (d * DAY_S * TICK_HZ as f64)
+                            .ceil()
+                            .max(1.0)
+                            .min(u64::MAX as f64) as u64,
+                    ),
+                )
+            }
+            None => None,
+        };
         self.shadow_contracts(shadow);
         self.contracts.offers.remove(&offer);
         let id = ContractId(self.contracts.next_contract_id);
@@ -740,22 +847,7 @@ impl World {
                 experiment,
                 body,
                 min_units,
-            } => {
-                // Cumulative *returned* data at matching keys —
-                // transmitted or recovered (closed).
-                let units: f64 = self
-                    .science
-                    .keys
-                    .iter()
-                    .filter(|(k, s)| {
-                        k.experiment == *experiment
-                            && k.body == *body
-                            && (s.transmitted || s.closed)
-                    })
-                    .map(|(_, s)| s.collected)
-                    .sum();
-                units >= *min_units
-            }
+            } => self.survey_returned_units(experiment, body) >= *min_units,
             ContractParams::PartTest { module, regime } => self.vessels.values().any(|v| {
                 if v.debris_since.is_some() || !craft_has_module(v, module) {
                     return false;
@@ -806,6 +898,48 @@ impl World {
                 delivered >= *amount
             }
         }
+    }
+
+    /// The `SurveyData` fact — cumulative *returned* units at keys
+    /// matching `(experiment, body)` (the
+    /// `ContractParams::SurveyData` accounting): `collected` is a
+    /// cumulative-ever counter, so a key's returned share is
+    /// `collected` minus what is still outstanding (pooled aboard
+    /// any vessel, escrowed inside a live lab project). Only keys
+    /// that produced a return — transmitted at least once, or
+    /// closed by recovery — count at all; units lost with a vessel
+    /// are not distinguished (the ledger keeps no per-key loss
+    /// record). A `closed` key holds no outstanding units by
+    /// invariant, so the formula reduces to `collected` for it.
+    fn survey_returned_units(&self, experiment: &csp_data::ExperimentId, body: &BodyId) -> f64 {
+        let cfg = &self.science_cfg;
+        let clock = self.clock.ticks();
+        self.science
+            .keys
+            .iter()
+            .filter(|(k, s)| {
+                k.experiment == *experiment && k.body == *body && (s.transmitted || s.closed)
+            })
+            .map(|(k, s)| {
+                let pooled: f64 = self.vessels.values().map(|v| v.science.units_at(k)).sum();
+                let escrowed: f64 = self
+                    .science
+                    .projects
+                    .values()
+                    .filter(|p| p.key == *k)
+                    .map(|p| {
+                        crate::research::data_at(
+                            p.data_start,
+                            p.rate_science_per_s,
+                            p.throughput_data_per_s,
+                            cfg.science_per_data,
+                            clock.saturating_sub(p.start_tick) as f64 / TICK_HZ as f64,
+                        )
+                    })
+                    .sum();
+                (s.collected - pooled - escrowed).max(0.0)
+            })
+            .sum()
     }
 
     /// The event-driven completion pass — §3.6's "predicate over
@@ -916,7 +1050,13 @@ impl World {
             return Ok(());
         };
         if c.deadline_tick != Some(event_tick) {
-            return Err(SimError::Recoverable("contract deadline: tick mismatch"));
+            // The event tick IS the scheduled deadline — a record
+            // disagreeing with it breaks the pairing invariant the
+            // restore gate enforces (`snapshot: contract / deadline
+            // event pairing mismatch`), and no legit path moves one
+            // without the other. Same severity as that sibling
+            // check: `Fatal`, never a degradation.
+            return Err(SimError::Fatal("contract deadline: tick mismatch"));
         }
         let penalty = self
             .contract_defs
@@ -1352,5 +1492,392 @@ mod tests {
         changed.contracts.offer_index += 1;
         let w2 = World::restore(test_orbits(), None, changed).unwrap();
         assert_ne!(w2.state_hash().unwrap(), base_hash);
+    }
+
+    /// A satellite template whose bands overlap — `lo(apo) <
+    /// lo(peri)` — or even sit fully inverted still generates
+    /// satisfiable offers: the generator orders a crossed draw, so
+    /// every published window is non-empty and a circular orbit at
+    /// its low edge completes the contract.
+    #[test]
+    fn overlapping_bands_still_yield_satisfiable_offers() {
+        let mut t = template(
+            "contract.satellite",
+            ContractKind::SatellitePlacement,
+            vec![],
+        );
+        t.generate.space = ContractParamSpace::SatellitePlacement {
+            bodies: vec![BodyId::from("terrin")],
+            periapsis_alt_m: (100_000.0, 200_000.0),
+            apoapsis_alt_m: (50_000.0, 150_000.0),
+        };
+        let mut w = world_with(t);
+        w.economy.funds_micros = 0;
+        fill_board(&mut w);
+        assert_eq!(w.contracts().offers.len(), 6);
+        for o in w.contracts().offers.values() {
+            let ContractParams::SatelliteOrbit {
+                min_periapsis_alt_m,
+                max_apoapsis_alt_m,
+                ..
+            } = &o.params
+            else {
+                panic!("wrong params")
+            };
+            assert!(
+                max_apoapsis_alt_m >= min_periapsis_alt_m,
+                "the published window is never empty"
+            );
+        }
+        // Satisfiable in play, not just non-empty: accept the first
+        // offer and park a circular orbit at the window's low edge.
+        let ContractParams::SatelliteOrbit {
+            min_periapsis_alt_m,
+            ..
+        } = &w.contracts().offers[&0].params
+        else {
+            panic!("wrong params")
+        };
+        let alt = *min_periapsis_alt_m;
+        w.enqueue(
+            crate::SourceClass::Ui,
+            0,
+            SimCommand::AcceptContract { offer: 0 },
+        );
+        w.enqueue(
+            crate::SourceClass::Ui,
+            0,
+            SimCommand::SpawnVessel {
+                parent: BodyId::from("terrin"),
+                elements: terrin_orbit(alt),
+            },
+        );
+        w.step_frame(2 * csp_core::TICK_HZ).unwrap();
+        assert!(
+            w.contracts().active.is_empty(),
+            "the contract completed on the low-edge circular orbit"
+        );
+        assert_eq!(
+            w.contracts().facts.completed[&ContractKind::SatellitePlacement],
+            1
+        );
+    }
+
+    /// An empty `bodies` space installed through `set_contracts`
+    /// (which bypasses the data validators) degrades the board
+    /// publish `Recoverable`, never `Fatal` — the world rolls back
+    /// intact instead of bricking on a poisoned draw.
+    #[test]
+    fn empty_bodies_space_rejects_recoverable() {
+        let mut t = template(
+            "contract.satellite",
+            ContractKind::SatellitePlacement,
+            vec![],
+        );
+        t.generate.space = ContractParamSpace::SatellitePlacement {
+            bodies: vec![],
+            periapsis_alt_m: (100_000.0, 200_000.0),
+            apoapsis_alt_m: (150_000.0, 300_000.0),
+        };
+        let mut w = world_with(t);
+        let err = w.step_frame(csp_core::TICK_HZ).unwrap_err();
+        assert!(
+            matches!(err, SimError::Recoverable(_)),
+            "empty candidate space is Recoverable, got {err}"
+        );
+    }
+
+    /// A `deadline_days` that is not finite-and-positive (NaN, ±inf,
+    /// zero, negative) is a construction-config defect: acceptance
+    /// rejects `Recoverable` rather than arming a deadline at +1
+    /// tick or `u64::MAX`.
+    #[test]
+    fn non_finite_deadline_days_rejects_at_accept() {
+        for d in [f64::NAN, f64::INFINITY, 0.0, -2.0] {
+            let mut t = template(
+                "contract.satellite",
+                ContractKind::SatellitePlacement,
+                vec![],
+            );
+            t.deadline_days = Some(d);
+            let mut w = world_with(t);
+            fill_board(&mut w);
+            assert_eq!(w.contracts().offers.len(), 6);
+            w.enqueue(
+                crate::SourceClass::Ui,
+                0,
+                SimCommand::AcceptContract { offer: 0 },
+            );
+            let report = w.step_frame(2 * csp_core::TICK_HZ).unwrap();
+            assert_eq!(report.rejected.len(), 1, "deadline_days {d} rejected");
+            assert!(w.contracts().active.is_empty());
+        }
+    }
+
+    /// A live `ContractDeadline` firing whose tick disagrees with
+    /// the record's `deadline_tick` is the same pairing violation
+    /// the restore gate fatals on — `Fatal`, not a degradation.
+    #[test]
+    fn deadline_tick_mismatch_is_fatal() {
+        let mut w = world_with(template(
+            "contract.satellite",
+            ContractKind::SatellitePlacement,
+            vec![],
+        ));
+        w.contracts.active.insert(
+            ContractId(0),
+            ActiveContract {
+                id: ContractId(0),
+                template: ContractTypeId::from("contract.satellite"),
+                params: ContractParams::Rescue {
+                    body: BodyId::from("terrin"),
+                },
+                deadline_tick: Some(1_000),
+            },
+        );
+        let mut shadow = crate::TickShadow::capture(&w);
+        let err = w
+            .fire_contract_deadline(ContractId(0), 999, &mut shadow)
+            .unwrap_err();
+        assert!(matches!(err, SimError::Fatal(_)), "got {err}");
+        // The matching tick, by contrast, expires it normally.
+        let mut shadow = crate::TickShadow::capture(&w);
+        w.fire_contract_deadline(ContractId(0), 1_000, &mut shadow)
+            .unwrap();
+        assert!(w.contracts().active.is_empty());
+    }
+
+    /// The survey predicate counts units *returned*, not merely
+    /// collected: pooled-aboard units at a transmitted key do not
+    /// count until they actually come home.
+    #[test]
+    fn survey_counts_returned_not_collected() {
+        let key = crate::research::DataKey {
+            experiment: csp_data::ExperimentId::from("exp.materials_study"),
+            body: BodyId::from("terrin"),
+            biome: csp_data::BiomeId::from("bio.x"),
+            situation: csp_data::Situation::SpaceLow,
+        };
+        let survey_world = |min_units: f64| {
+            let mut t = template("contract.survey", ContractKind::SurveyRun, vec![]);
+            if let ContractParamSpace::SurveyRun {
+                min_units: slot, ..
+            } = &mut t.generate.space
+            {
+                *slot = min_units;
+            }
+            let mut w = world_with(t);
+            // The key saw a return (transmitted) after collecting
+            // 100 units; 60 units sit pooled aboard a vessel —
+            // outstanding, not returned.
+            w.science.keys.insert(
+                key.clone(),
+                crate::research::ScienceKeyState {
+                    collected: 100.0,
+                    transmitted: true,
+                    closed: false,
+                },
+            );
+            fill_board(&mut w);
+            w.enqueue(
+                crate::SourceClass::Ui,
+                0,
+                SimCommand::SpawnVessel {
+                    parent: BodyId::from("terrin"),
+                    elements: terrin_orbit(200_000.0),
+                },
+            );
+            w.step_frame(2 * csp_core::TICK_HZ).unwrap();
+            let vid = *w.vessels.keys().next().unwrap();
+            w.vessels
+                .get_mut(&vid)
+                .unwrap()
+                .science
+                .data
+                .entry(csp_phys::PartNodeId(0))
+                .or_default()
+                .insert(key.clone(), 60.0);
+            w
+        };
+        // 100 collected − 60 still aboard = 40 returned: a
+        // `min_units: 50` ask does NOT instant-complete at accept,
+        // and a `min_units: 40` ask does.
+        let mut w = survey_world(50.0);
+        w.enqueue(
+            crate::SourceClass::Ui,
+            0,
+            SimCommand::AcceptContract { offer: 0 },
+        );
+        w.step_frame(3 * csp_core::TICK_HZ).unwrap();
+        assert_eq!(
+            w.contracts().active.len(),
+            1,
+            "outstanding units are not returned"
+        );
+        let mut w = survey_world(40.0);
+        w.enqueue(
+            crate::SourceClass::Ui,
+            0,
+            SimCommand::AcceptContract { offer: 0 },
+        );
+        w.step_frame(3 * csp_core::TICK_HZ).unwrap();
+        assert!(
+            w.contracts().active.is_empty(),
+            "the 40 actually-returned units complete the ask"
+        );
+        assert_eq!(w.contracts().facts.completed[&ContractKind::SurveyRun], 1);
+    }
+
+    /// The `params_ok` draw gate covers EVERY drawn param, not just
+    /// the satellite bands: a poisoned space — a NaN/≤0 ask or a
+    /// band that draws one, reachable only through unvalidated
+    /// `set_contracts` installs — degrades the publish `Recoverable`
+    /// rather than printing an offer `World::restore` would `Fatal`
+    /// on (`snapshot: offer with non-finite params`).
+    #[test]
+    fn dishonest_param_spaces_reject_recoverable() {
+        let spaces = [
+            // A NaN authored survey ask.
+            (
+                ContractKind::SurveyRun,
+                ContractParamSpace::SurveyRun {
+                    experiments: vec![csp_data::ExperimentId::from("exp.materials_study")],
+                    bodies: vec![BodyId::from("terrin")],
+                    min_units: f64::NAN,
+                },
+            ),
+            // A zero survey ask.
+            (
+                ContractKind::SurveyRun,
+                ContractParamSpace::SurveyRun {
+                    experiments: vec![csp_data::ExperimentId::from("exp.materials_study")],
+                    bodies: vec![BodyId::from("terrin")],
+                    min_units: 0.0,
+                },
+            ),
+            // A fully-below-datum satellite band.
+            (
+                ContractKind::SatellitePlacement,
+                ContractParamSpace::SatellitePlacement {
+                    bodies: vec![BodyId::from("terrin")],
+                    periapsis_alt_m: (-200_000.0, -100_000.0),
+                    apoapsis_alt_m: (-150_000.0, -50_000.0),
+                },
+            ),
+            // A part-test orbit band whose draw NaNs out (`-inf`
+            // edge through the `lo + u·(hi − lo)` scale).
+            (
+                ContractKind::PartTest,
+                ContractParamSpace::PartTest {
+                    modules: vec![ModuleReq::CrewSeat],
+                    regime: RegimeSpace::Orbit {
+                        bodies: vec![BodyId::from("terrin")],
+                        min_alt_m: (f64::NEG_INFINITY, 0.0),
+                    },
+                },
+            ),
+            // A zero-ask resupply band.
+            (
+                ContractKind::ColonyResupply,
+                ContractParamSpace::ColonyResupply {
+                    bodies: vec![BodyId::from("terrin")],
+                    resources: vec![ResourceId::from("ore")],
+                    amount: (0.0, 0.0),
+                },
+            ),
+        ];
+        for (kind, space) in spaces {
+            let mut t = template("contract.x", kind, vec![]);
+            t.generate.space = space;
+            let mut w = world_with(t);
+            let err = w.step_frame(csp_core::TICK_HZ).unwrap_err();
+            assert!(
+                matches!(err, SimError::Recoverable(_)),
+                "{kind:?} poisoned space is Recoverable, got {err}"
+            );
+        }
+    }
+
+    /// The survey predicate's OTHER outstanding arm: units escrowed
+    /// inside a live lab project are subtracted through the `data_at`
+    /// live projection, same as pooled-aboard units — a key that
+    /// collected 100 units with 60 still escrowed has returned 40.
+    #[test]
+    fn survey_subtracts_escrowed_project_units() {
+        let key = crate::research::DataKey {
+            experiment: csp_data::ExperimentId::from("exp.materials_study"),
+            body: BodyId::from("terrin"),
+            biome: csp_data::BiomeId::from("bio.x"),
+            situation: csp_data::Situation::SpaceLow,
+        };
+        let survey_world = |min_units: f64| {
+            let mut t = template("contract.survey", ContractKind::SurveyRun, vec![]);
+            if let ContractParamSpace::SurveyRun {
+                min_units: slot, ..
+            } = &mut t.generate.space
+            {
+                *slot = min_units;
+            }
+            let mut w = world_with(t);
+            // The key saw a return (transmitted) after collecting
+            // 100 units; a live lab project escrows 60 of them.
+            // `start_tick` sits ahead of the clock so the
+            // `saturating_sub` elapsed is 0 — the closed form
+            // escrows the full `data_start` at whatever tick the
+            // predicate evaluates, keeping the ask deterministic.
+            w.science.keys.insert(
+                key.clone(),
+                crate::research::ScienceKeyState {
+                    collected: 100.0,
+                    transmitted: true,
+                    closed: false,
+                },
+            );
+            w.science.projects.insert(
+                crate::research::ResearchId(0),
+                crate::research::ResearchProject {
+                    id: crate::research::ResearchId(0),
+                    vessel: VesselId(0),
+                    lab_node: csp_phys::PartNodeId(0),
+                    key: key.clone(),
+                    researchers: vec![],
+                    rate_science_per_s: 1.0,
+                    throughput_data_per_s: 10.0,
+                    start_tick: u64::MAX,
+                    data_start: 60.0,
+                    exhaust_tick: u64::MAX,
+                },
+            );
+            fill_board(&mut w);
+            w
+        };
+        // 100 collected − 60 escrowed = 40 returned: a
+        // `min_units: 50` ask does NOT instant-complete at accept,
+        // and a `min_units: 40` ask does — the same boundary the
+        // pooled-aboard arm asserts.
+        let mut w = survey_world(50.0);
+        w.enqueue(
+            crate::SourceClass::Ui,
+            0,
+            SimCommand::AcceptContract { offer: 0 },
+        );
+        w.step_frame(3 * csp_core::TICK_HZ).unwrap();
+        assert_eq!(
+            w.contracts().active.len(),
+            1,
+            "escrowed units are not returned"
+        );
+        let mut w = survey_world(40.0);
+        w.enqueue(
+            crate::SourceClass::Ui,
+            0,
+            SimCommand::AcceptContract { offer: 0 },
+        );
+        w.step_frame(3 * csp_core::TICK_HZ).unwrap();
+        assert!(
+            w.contracts().active.is_empty(),
+            "the 40 actually-returned units complete the ask"
+        );
+        assert_eq!(w.contracts().facts.completed[&ContractKind::SurveyRun], 1);
     }
 }

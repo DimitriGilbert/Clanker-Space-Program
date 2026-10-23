@@ -136,9 +136,13 @@ pub struct ContractGenerator {
 pub enum ContractParamSpace {
     /// `SatellitePlacement`: draw `body` from `bodies`, then the
     /// orbit's periapsis altitude and apoapsis altitude, each uniform
-    /// in its `(lo, hi)` range (the generated apoapsis is clamped ≥
-    /// periapsis — a degenerate band would make an unsatisfiable
-    /// contract). Altitudes are above the body's datum radius.
+    /// in its `(lo, hi)` range. The bands may overlap partially
+    /// (`apoapsis_alt_m.0 < periapsis_alt_m.0` is legal): when a
+    /// drawn apoapsis cap lands under the drawn periapsis floor the
+    /// sim orders the pair, so the published
+    /// `[min_periapsis, max_apoapsis]` window is never empty and the
+    /// offer stays satisfiable. Altitudes are above the body's datum
+    /// radius.
     SatellitePlacement {
         /// Candidate bodies — non-empty.
         bodies: Vec<BodyId>,
@@ -155,8 +159,9 @@ pub enum ContractParamSpace {
         experiments: Vec<ExperimentId>,
         /// Candidate bodies — non-empty.
         bodies: Vec<BodyId>,
-        /// Data units that must be *returned* (transmitted or
-        /// recovered) at matching keys — fixed, not drawn.
+        /// Data units that must be *returned* at matching keys —
+        /// fixed, not drawn (see [`ContractParams::SurveyData`] for
+        /// the accounting).
         min_units: f64,
     },
     /// `PartTest`: draw the module requirement, then the regime.
@@ -259,8 +264,14 @@ pub enum ContractParams {
         max_apoapsis_alt_m: f64,
     },
     /// `SurveyRun`: cumulative *returned* data at keys matching
-    /// `(experiment, body)` — transmitted or recovered — reaches
-    /// `min_units`.
+    /// `(experiment, body)` reaches `min_units`. The sim's per-key
+    /// ledger tracks cumulative `collected`, not returns, so the
+    /// predicate counts `collected` minus what is still outstanding
+    /// (pooled aboard any vessel, escrowed inside a live lab
+    /// project) at keys that have produced a return — transmitted at
+    /// least once or closed by recovery. Units lost with a vessel
+    /// are not distinguished; the ledger keeps no per-key loss
+    /// record.
     SurveyData {
         /// The experiment kind.
         experiment: ExperimentId,

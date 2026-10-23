@@ -8346,7 +8346,9 @@ fn restore_economy_state(snapshot: &WorldSnapshot) -> Result<(), SimError> {
 /// M7-D §3.6 contract coherence for [`World::restore`]. The book's
 /// self-consistency: each offer's stored index equals its key and
 /// sits below the `offer_index` counter (generated offers are
-/// consumed counters); params carry only finite positive numbers;
+/// consumed counters); params satisfy [`crate::contracts::params_ok`]
+/// — the same predicate the offer generator gates draws on, so a
+/// legit publish can never trip this;
 /// each active contract's `id` equals its key and sits below
 /// `next_contract_id`; and the `ContractDeadline` pairing is strict
 /// in both directions — an active contract with a deadline has
@@ -8359,36 +8361,11 @@ fn restore_contract_state(
     deadline_events: &BTreeMap<ContractId, u64>,
 ) -> Result<(), SimError> {
     let c = &snapshot.contracts;
-    let params_ok = |p: &csp_data::ContractParams| -> bool {
-        let ok = |v: f64| v.is_finite() && v >= 0.0;
-        match p {
-            csp_data::ContractParams::SatelliteOrbit {
-                min_periapsis_alt_m,
-                max_apoapsis_alt_m,
-                ..
-            } => {
-                ok(*min_periapsis_alt_m)
-                    && ok(*max_apoapsis_alt_m)
-                    && min_periapsis_alt_m <= max_apoapsis_alt_m
-            }
-            csp_data::ContractParams::SurveyData { min_units, .. } => {
-                ok(*min_units) && *min_units > 0.0
-            }
-            csp_data::ContractParams::PartTest { regime, .. } => match regime {
-                csp_data::ContractRegime::Orbit { min_alt_m, .. } => {
-                    ok(*min_alt_m) && *min_alt_m > 0.0
-                }
-                csp_data::ContractRegime::Landed { .. } => true,
-            },
-            csp_data::ContractParams::Rescue { .. } => true,
-            csp_data::ContractParams::ColonyResupply { amount, .. } => ok(*amount) && *amount > 0.0,
-        }
-    };
     for (idx, o) in &c.offers {
         if *idx != o.index || *idx >= c.offer_index {
             return Err(SimError::Fatal("snapshot: offer index incoherent"));
         }
-        if !params_ok(&o.params) {
+        if !contracts::params_ok(&o.params) {
             return Err(SimError::Fatal("snapshot: offer with non-finite params"));
         }
     }
@@ -8396,7 +8373,7 @@ fn restore_contract_state(
         if a.id != *id || id.0 >= c.next_contract_id {
             return Err(SimError::Fatal("snapshot: contract id not below next"));
         }
-        if !params_ok(&a.params) {
+        if !contracts::params_ok(&a.params) {
             return Err(SimError::Fatal("snapshot: contract with non-finite params"));
         }
         match (a.deadline_tick, deadline_events.get(id)) {

@@ -1159,12 +1159,20 @@ impl World {
             .next_bench_id
             .checked_add(1)
             .ok_or(SimError::Fatal("bench id overflow"))?;
+        // The `exhaust_tick` convention: ceil to ticks, saturate at
+        // `u64::MAX` — an over-horizon run completes effectively
+        // never — and always land strictly ahead of the clock. An
+        // enormous duration used to `Fatal` on `checked_add`; both
+        // factors are gated finite above, so the product is finite
+        // or `+inf` and the `.min` clamp is the honest answer.
+        let span = (units * cfg.bench_seconds_per_unit * TICK_HZ as f64)
+            .ceil()
+            .min(u64::MAX as f64) as u64;
         let complete_tick = self
             .clock
             .ticks()
-            .checked_add((units * cfg.bench_seconds_per_unit * TICK_HZ as f64).ceil() as u64)
-            .ok_or(SimError::Fatal("bench test: tick overflow"))?
-            .max(self.clock.ticks() + 1);
+            .saturating_add(span)
+            .max(self.clock.ticks().saturating_add(1));
         self.bench_runs.insert(
             id,
             ActiveBench {

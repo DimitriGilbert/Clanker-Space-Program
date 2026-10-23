@@ -137,8 +137,14 @@ pub struct ScienceKeyState {
     /// Cumulative data collected at this key under the diminishing
     /// curve — bounded above by `cap_key` asymptotically.
     pub collected: f64,
-    /// Whether any record at this key was ever transmitted (recovery
-    /// then pays only the `1 − ratio` remainder).
+    /// Whether any record at this key was ever transmitted — a
+    /// per-key *blanket* flag, not a per-batch one: once set,
+    /// `RecoverData`/`RecoverVessel` bank the `1 − transmit_ratio`
+    /// remainder over WHATEVER units are pooled at close, including
+    /// units collected after the transmit (§3.2's "a transmitted
+    /// key can later be completed by recovery for the remainder" is
+    /// read per-key — the sim does not track which units predate
+    /// the transmit).
     pub transmitted: bool,
     /// Recovery closes the key — no further collection or cashout.
     pub closed: bool,
@@ -354,7 +360,9 @@ pub fn exhaust_tick(p: &ResearchProject, cfg: &ScienceConfig) -> u64 {
         .ceil()
         .max(1.0)
         .min(u64::MAX as f64) as u64;
-    p.start_tick.saturating_add(ticks).max(p.start_tick + 1)
+    p.start_tick
+        .saturating_add(ticks)
+        .max(p.start_tick.saturating_add(1))
 }
 
 // ---------------------------------------------------------------------------
@@ -821,7 +829,10 @@ impl World {
 
     /// `RecoverData` — the physical-recovery cashout: 100% of the
     /// pooled units, or the `1 − ratio` remainder for a previously
-    /// transmitted key; then the key closes (§3.2). Requires the vessel
+    /// transmitted key — a blanket over all units pooled at close,
+    /// post-transmit re-collection included (see
+    /// [`ScienceKeyState::transmitted`]); then the key closes (§3.2).
+    /// Requires the vessel
     /// be `SurfaceLatched` — the sample is on the ground somewhere
     /// (site mechanics belong to the recovery sub-phase). The close is
     /// program-wide, so it also refuses while any other vessel still
