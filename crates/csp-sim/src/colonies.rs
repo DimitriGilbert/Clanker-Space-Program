@@ -3363,7 +3363,7 @@ mod tests {
         assert!(
             r.rejected
                 .iter()
-                .any(|(_, e)| matches!(e, SimError::Recoverable(_))),
+                .any(|r| matches!(r.error, SimError::Recoverable(_))),
             "{:?}",
             r.rejected
         );
@@ -3885,7 +3885,7 @@ mod tests {
         assert!(
             r.rejected
                 .iter()
-                .any(|(_, e)| matches!(e, SimError::Recoverable(_))),
+                .any(|r| matches!(r.error, SimError::Recoverable(_))),
             "{:?}",
             r.rejected
         );

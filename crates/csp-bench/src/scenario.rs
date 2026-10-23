@@ -483,7 +483,7 @@ fn drain_pending(
         let msgs: Vec<String> = report
             .rejected
             .iter()
-            .map(|(_, e)| format!("{e}"))
+            .map(|r| format!("{}", r.error))
             .collect();
         return Err(EvalError::Setup(format!(
             "{scenario}: setup command rejected: {}",

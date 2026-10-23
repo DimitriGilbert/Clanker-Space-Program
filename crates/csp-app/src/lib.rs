@@ -711,8 +711,12 @@ impl App {
                     // §2.2.1/§2.13's honest channels: rejected commands and
                     // degraded events surface as log lines — they are the
                     // app's view of Recoverable, never a halt.
-                    for (key, e) in &report.rejected {
-                        log::warn!("command rejected on originating channel {key:?}: {e}");
+                    for rej in &report.rejected {
+                        log::warn!(
+                            "command rejected on originating channel {:?}: {}",
+                            rej.key,
+                            rej.error
+                        );
                     }
                     for e in &report.degraded {
                         log::warn!("event degraded (fallback applied): {e}");

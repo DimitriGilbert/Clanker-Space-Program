@@ -1247,7 +1247,7 @@ mod tests {
         );
         let r = w.step_frame(1).unwrap();
         assert_eq!(r.rejected.len(), 1);
-        assert!(matches!(r.rejected[0].1, SimError::Recoverable(_)));
+        assert!(matches!(r.rejected[0].error, SimError::Recoverable(_)));
     }
 
     /// The contract-reward stub: positive credits, negative runs the

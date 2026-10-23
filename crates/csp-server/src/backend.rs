@@ -358,7 +358,7 @@ impl HostCore {
             report.applied = report.applied.saturating_add(r.commands_applied);
             report
                 .rejected
-                .extend(r.rejected.iter().map(|(_, e)| format!("{e}")));
+                .extend(r.rejected.iter().map(|rej| format!("{}", rej.error)));
             report.reached = r.reached_tick;
             report.target = r.effective_target;
             report.partial = r.partial;

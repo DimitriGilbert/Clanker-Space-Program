@@ -1161,6 +1161,29 @@ impl SimCommand {
     }
 }
 
+/// One §2.2.1 "rejected on the originating channel" record — the
+/// element type of [`AdvanceReport::rejected`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RejectedCommand {
+    /// The [`CommandKey`] the command *would* have been stamped with
+    /// had it applied — a rejected command spends no `source_seq`
+    /// (its stamp rolls back with its effects), so this is a would-be
+    /// key: it may also appear in `command_log` for the next applied
+    /// same-source command, and two rejections from one source at one
+    /// tick repeat it. `dequeue_index` below is the distinguishing
+    /// stamp — consumers must not join `command_log` and `rejected`
+    /// on this field alone.
+    pub key: CommandKey,
+    /// The command's ordinal inside its tick's drain — 0-based over
+    /// every command that drain popped, applied or rejected. Each
+    /// tick value hosts exactly one drain (§2.2.1), so
+    /// `(key.tick, dequeue_index)` is unique within a report and
+    /// orders rejections in true dequeue order.
+    pub dequeue_index: u64,
+    /// Why the apply failed.
+    pub error: SimError,
+}
+
 /// What `step_frame` did (§2.6.2): where the clock landed, what the
 /// call's drains applied, how many events it fired — and which — plus
 /// whether the call ran out of budget before reaching the effective
@@ -1186,13 +1209,14 @@ pub struct AdvanceReport {
     /// §2.2.1's "rejected on the originating channel": commands whose
     /// apply failed non-`Fatal` (bad spawn parent, unknown vessel in
     /// `SetVesselTracked`, unsolvable elements). The channel IS this
-    /// report — the rejection is reported with the `CommandKey` the
-    /// command *would* have been stamped with. A rejected command applies
-    /// nothing: its partial effects, `source_seq` consumption, and log
-    /// entry are all rolled back, so post-frame state is identical to the
-    /// command never having existed (the boundary still consumed it — a
-    /// rejected command is not re-queued).
-    pub rejected: Vec<(CommandKey, SimError)>,
+    /// report — each [`RejectedCommand`] carries the `CommandKey` the
+    /// command *would* have been stamped with plus its drain ordinal.
+    /// A rejected command applies nothing: its partial effects,
+    /// `source_seq` consumption, and log entry are all rolled back, so
+    /// post-frame state is identical to the command never having
+    /// existed (the boundary still consumed it — a rejected command is
+    /// not re-queued).
+    pub rejected: Vec<RejectedCommand>,
     /// §2.13's Recoverable channel for the event/interval side: an event
     /// whose firing failed non-`Fatally` (e.g. a degenerate SOI event that
     /// slipped the post-rebase suppression, a scan that exhausted its
@@ -1470,7 +1494,11 @@ pub const DEFAULT_MAX_DEBRIS: u64 = 64;
 /// The queue needs no deep copy: the drain records what it popped, and a
 /// restore pushes each command back `push_front`-first in reverse drain
 /// order, which rebuilds each source FIFO's production order exactly.
-/// `seq_restore` plays the same trick for the counters.
+/// `seq_restore` plays the same trick for the counters, and `issued`
+/// records the in-iteration pushes the drain never saw — a drain empties
+/// every FIFO it touches, so the issued commands always sit at their
+/// FIFO's tail behind the re-queued pre-boundary commands, and restore
+/// pops exactly that many off the back.
 ///
 /// The M1 fields are **lazy captures**: most iterations mutate neither
 /// the vessel arena nor the event heap (an event-free interval touches
@@ -1485,9 +1513,21 @@ struct TickShadow {
     warp_level: u32,
     /// `command_log.len()` at the boundary — restore truncates to it.
     log_len: usize,
+    /// `script_log.len()` at the boundary — restore truncates to it
+    /// (the `log_len` precedent: lines a doomed iteration pushed roll
+    /// back with the rest of the tick).
+    script_log_len: usize,
     /// Commands the drain popped, in drain order (per source, production
     /// order). Restored back into `pending` on rollback.
     drained: Vec<((SourceClass, u32), SimCommand)>,
+    /// Commands `issue`d into `pending` during the iteration, counted
+    /// per source — restore pops that many entries off each FIFO's
+    /// tail after the `drained` re-queue rebuilds the front. Per the
+    /// struct doc, an issued command always sits behind every
+    /// pre-boundary command in its FIFO (drained-or-not), so the tail
+    /// pop restores the boundary queue exactly, preserving
+    /// per-`(class, source_id)` FIFO order.
+    issued: BTreeMap<(SourceClass, u32), usize>,
     /// Each source the drain touched, with its pre-increment counter —
     /// `None` = the counter did not exist before this tick.
     seq_restore: Vec<((SourceClass, u32), Option<u64>)>,
@@ -1580,7 +1620,9 @@ impl TickShadow {
             clock: world.clock,
             warp_level: world.warp_level,
             log_len: world.command_log.len(),
+            script_log_len: world.script_log.len(),
             drained: Vec::new(),
+            issued: BTreeMap::new(),
             seq_restore: Vec::new(),
             vessels: None,
             next_vessel_id: None,
@@ -1611,18 +1653,140 @@ impl TickShadow {
         }
     }
 
+    /// Fold a committed sub-shadow's captures into `self`.
+    ///
+    /// The per-command (`drain_at`) and per-event (`fire_due_events`)
+    /// shadows exist to roll back a *failed* item; when the item
+    /// commits, its lazy captures would die with the sub-shadow —
+    /// leaving the iteration shadow blind to writes the item made.
+    /// Merging keeps each field's EARLIEST capture: a `Some` already
+    /// held is the older boundary state and always wins. The cheap
+    /// scalars (`clock`, `warp_level`, `log_len`, `script_log_len`)
+    /// stay the parent's — they were captured at the earlier
+    /// boundary. `drained`/`seq_restore` are parent-owned
+    /// accumulators (only the drain itself records into them — the
+    /// child's lone would-be seq entry is consumed by the merge's
+    /// caller on rejection, never here). `issued` counts fold
+    /// additively: a committed `issue` is a queue push the
+    /// iteration's restore must still pop.
+    #[allow(clippy::cognitive_complexity)]
+    fn merge_committed(&mut self, committed: TickShadow) {
+        if self.vessels.is_none() {
+            self.vessels = committed.vessels;
+        }
+        if self.next_vessel_id.is_none() {
+            self.next_vessel_id = committed.next_vessel_id;
+        }
+        if self.joints.is_none() {
+            self.joints = committed.joints;
+        }
+        if self.joint_refused.is_none() {
+            self.joint_refused = committed.joint_refused;
+        }
+        if self.next_part_instance_id.is_none() {
+            self.next_part_instance_id = committed.next_part_instance_id;
+        }
+        if self.tracked_vessels.is_none() {
+            self.tracked_vessels = committed.tracked_vessels;
+        }
+        if self.event_heap.is_none() {
+            self.event_heap = committed.event_heap;
+        }
+        if self.next_event_seq.is_none() {
+            self.next_event_seq = committed.next_event_seq;
+        }
+        if self.transfers.is_none() {
+            self.transfers = committed.transfers;
+        }
+        if self.next_transfer_id.is_none() {
+            self.next_transfer_id = committed.next_transfer_id;
+        }
+        if self.next_crew_id.is_none() {
+            self.next_crew_id = committed.next_crew_id;
+        }
+        if self.science.is_none() {
+            self.science = committed.science;
+        }
+        if self.tech.is_none() {
+            self.tech = committed.tech;
+        }
+        if self.economy.is_none() {
+            self.economy = committed.economy;
+        }
+        if self.contracts.is_none() {
+            self.contracts = committed.contracts;
+        }
+        if self.builds.is_none() {
+            self.builds = committed.builds;
+        }
+        if self.next_build_id.is_none() {
+            self.next_build_id = committed.next_build_id;
+        }
+        if self.colonies.is_none() {
+            self.colonies = committed.colonies;
+        }
+        if self.next_colony_id.is_none() {
+            self.next_colony_id = committed.next_colony_id;
+        }
+        if self.life_support_enabled.is_none() {
+            self.life_support_enabled = committed.life_support_enabled;
+        }
+        if self.scripts.is_none() {
+            self.scripts = committed.scripts;
+        }
+        if self.next_script_id.is_none() {
+            self.next_script_id = committed.next_script_id;
+        }
+        if self.autopilots.is_none() {
+            self.autopilots = committed.autopilots;
+        }
+        if self.benches.is_none() {
+            self.benches = committed.benches;
+        }
+        if self.next_bench_id.is_none() {
+            self.next_bench_id = committed.next_bench_id;
+        }
+        if self.notifications.is_none() {
+            self.notifications = committed.notifications;
+        }
+        for (src, count) in committed.issued {
+            *self.issued.entry(src).or_default() += count;
+        }
+    }
+
     /// Roll the world back to the captured pre-iteration state — the
     /// whole state, so `state_hash()` is the pre-boundary hash again
     /// (§2.13). `None` fields were never mutated.
-    #[allow(clippy::cognitive_complexity)]
+    #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
     fn restore(self, world: &mut World) {
         world.clock = self.clock;
         world.warp_level = self.warp_level;
         world.command_log.truncate(self.log_len);
+        world.script_log.truncate(self.script_log_len);
         // Reverse drain order + push_front rebuilds each FIFO's
         // production order exactly.
         for (src, command) in self.drained.into_iter().rev() {
             world.pending.entry(src).or_default().push_front(command);
+        }
+        // In-iteration `issue` pushes sit at their FIFO's tail behind
+        // every restored pre-boundary command (a drain empties its
+        // FIFO, so nothing pre-boundary can follow an issued command
+        // in-queue). Pop exactly the recorded count off the back; a
+        // FIFO left empty drops so the queue's emptiness stays the
+        // map's (the §7.4 invariant `check_serializable` reads).
+        for (src, count) in self.issued {
+            let emptied = match world.pending.get_mut(&src) {
+                Some(fifo) => {
+                    for _ in 0..count {
+                        fifo.pop_back();
+                    }
+                    fifo.is_empty()
+                }
+                None => false,
+            };
+            if emptied {
+                world.pending.remove(&src);
+            }
         }
         for (src, seq) in self.seq_restore {
             match seq {
@@ -3137,7 +3301,11 @@ impl World {
                     .collect();
                 self.reliability_residence_change(vessel, self.clock.ticks(), false);
             }
-            Some(VesselState::InBubble(_)) => {}
+            // The arm below returns a `&mut` into the arena for direct
+            // body writes (`SetThrottle`, `SetAttitude`) — the capture
+            // must precede them or a drain-side write escapes the
+            // iteration shadow entirely.
+            Some(VesselState::InBubble(_)) => self.shadow_vessels(shadow),
         }
         match &mut self
             .vessels
@@ -3180,7 +3348,7 @@ impl World {
         t_next: u64,
         effective_target: &mut u64,
         commands_applied: &mut u64,
-        rejected: &mut Vec<(CommandKey, SimError)>,
+        rejected: &mut Vec<RejectedCommand>,
         shadow: &mut TickShadow,
         degraded: &mut Vec<SimError>,
     ) -> Result<(), SimError> {
@@ -3192,6 +3360,10 @@ impl World {
         {
             return Ok(());
         }
+        // The arena shadow precedes EVERY write this range makes —
+        // `ensure_aero` below stamps `body.aero` inside the arena, so
+        // the capture must run before the first stale-table attach.
+        self.shadow_vessels(shadow);
         // §2.4.1: every InBubble body's attached tables must match its
         // vessel's active mask AND its current craft graph before the
         // first tick of this range — covers re-welded bodies (restore,
@@ -3208,7 +3380,6 @@ impl World {
         for id in needing {
             self.ensure_aero(id)?;
         }
-        self.shadow_vessels(shadow);
         let caps = self.caps;
         // M9b §3.4: the reliability tick's immutable captures — the
         // save seed and the construction config ride the borrow-split
@@ -3659,6 +3830,21 @@ impl World {
             // merge reads settled poses) and before the lifecycle's
             // dissolve/detect pass, which sees the absorbed vessel
             // already gone.
+            // `apply_latch` rewrites `tracked_vessels` and `transfers`
+            // through its borrow-split params — capture both before
+            // the pass, inline, the same way the notification/tech
+            // captures above reach around the `vessels`/`physics`
+            // split (the `shadow_*` methods need a whole `self`).
+            if !self.joints.is_empty() {
+                if shadow.tracked_vessels.is_none() {
+                    shadow.tracked_vessels = Some(self.tracked_vessels.clone());
+                }
+                if shadow.transfers.is_none() {
+                    shadow.transfers = Some(self.transfers.clone());
+                    shadow.next_transfer_id = Some(self.next_transfer_id);
+                    shadow.next_crew_id = Some(self.next_crew_id);
+                }
+            }
             joints::latch_pass(
                 vessels,
                 physics,
@@ -3690,9 +3876,14 @@ impl World {
         // M9a: restore the pre-range clock — `step_frame`'s
         // `try_advance` moves `now → t_next` as before.
         self.clock = SimTime(now);
-        // Lazy capture — no-op when `dead_vessels` is empty (the
-        // `autopilots.remove` below is then too).
-        self.shadow_autopilots(shadow);
+        // The drain mutates `tracked_vessels` and `autopilots` — both
+        // hashed — so capture them first, but only when there is a
+        // drain to cover: an empty list mutates nothing and the clone
+        // would be wasted work, not a no-op.
+        if !dead_vessels.is_empty() {
+            self.shadow_tracked(shadow);
+            self.shadow_autopilots(shadow);
+        }
         for vid in dead_vessels {
             self.tracked_vessels.remove(&vid);
             // Same invariant as `remove_vessel`: a bound autopilot
@@ -5872,15 +6063,16 @@ impl World {
     ///
     /// Per-command rollback: each apply runs under its own [`TickShadow`]
     /// — a non-`Fatal` failure restores only that command's effects and
-    /// reports `(would-be key, error)` on `rejected` (§2.2.1's "rejected
-    /// on the originating channel"), then the boundary continues. `Fatal`
-    /// still aborts the iteration whole via the caller's shadow.
+    /// reports a [`RejectedCommand`] (would-be key + drain ordinal +
+    /// error) on `rejected` (§2.2.1's "rejected on the originating
+    /// channel"), then the boundary continues. `Fatal` still aborts the
+    /// iteration whole via the caller's shadow.
     fn drain_boundary(
         &mut self,
         effective_target: &mut u64,
         shadow: &mut TickShadow,
         commands_applied: &mut u64,
-        rejected: &mut Vec<(CommandKey, SimError)>,
+        rejected: &mut Vec<RejectedCommand>,
     ) -> Result<(), SimError> {
         self.drain_at(
             self.clock.ticks(),
@@ -5903,7 +6095,7 @@ impl World {
         effective_target: &mut u64,
         shadow: &mut TickShadow,
         commands_applied: &mut u64,
-        rejected: &mut Vec<(CommandKey, SimError)>,
+        rejected: &mut Vec<RejectedCommand>,
     ) -> Result<(), SimError> {
         // Phase 1 — pops only. BTreeMap iteration IS the §2.2.1
         // (class, source_id) order; each source's FIFO keeps production
@@ -5919,17 +6111,24 @@ impl World {
         // literally the map's, the §7.4 invariant `check_serializable`
         // reads.
         self.pending.retain(|_, fifo| !fifo.is_empty());
-        // Phase 2 — stamp, apply, log; in staged order. `last_src` flips
-        // exactly when a new source's group begins.
-        let mut last_src: Option<(SourceClass, u32)> = None;
-        for (src, command) in staged {
-            // First touch of this source this iteration: record the
-            // pre-increment counter for a whole-iteration (Fatal) restore.
-            if last_src != Some(src) {
+        // Phase 2 — stamp, apply, log; in staged order. `dequeue_index`
+        // is the per-drain ordinal a rejected command reports as its
+        // distinguishing stamp (its would-be `CommandKey` is not unique
+        // — the seq rolls back with the apply).
+        for (dequeue_index, (src, command)) in staged.into_iter().enumerate() {
+            // First touch of this source this ITERATION: record the
+            // pre-increment counter for a whole-iteration (Fatal)
+            // restore. `staged` groups a source contiguously only
+            // within one call — `step_bubble_range` re-drains every
+            // in-range tick under the same shadow, and the restore is
+            // last-wins, so a second record would overwrite the
+            // pre-iteration counter with a mid-iteration one. Dedup
+            // across the shadow's whole life instead (n is tiny — a
+            // linear scan), keeping the earliest record.
+            if !shadow.seq_restore.iter().any(|(s, _)| *s == src) {
                 shadow
                     .seq_restore
                     .push((src, self.source_seqs.get(&src).copied()));
-                last_src = Some(src);
             }
             // Per-command shadow: on a non-Fatal apply failure this
             // restores only what this command touched — plus, via
@@ -5950,6 +6149,11 @@ impl World {
                 .ok_or(SimError::Fatal("source_seq counter overflow"))?;
             match self.apply_command(src, &command, effective_target, &mut cmd_shadow) {
                 Ok(()) => {
+                    // The command committed — fold its lazy captures
+                    // into the iteration shadow so a later `Fatal`
+                    // still restores the pre-iteration state (the
+                    // `ev_shadow` precedent in `fire_due_events`).
+                    shadow.merge_committed(cmd_shadow);
                     self.command_log.push((key, command));
                     *commands_applied += 1;
                 }
@@ -5958,7 +6162,11 @@ impl World {
                 Err(e @ SimError::Fatal(_)) => return Err(e),
                 Err(e) => {
                     cmd_shadow.restore(self);
-                    rejected.push((key, e));
+                    rejected.push(RejectedCommand {
+                        key,
+                        dequeue_index: dequeue_index as u64,
+                        error: e,
+                    });
                 }
             }
         }
@@ -6428,7 +6636,12 @@ impl World {
             // event's application; the pop stands (the event is dropped).
             let mut ev_shadow = TickShadow::capture(self);
             match self.fire_event(&event, &mut ev_shadow, degraded) {
-                Ok(()) => {}
+                // The event committed — fold its lazy captures (and any
+                // `issue` counts a `ScriptWake`'s `on_tick` produced
+                // through `WorldTickIo`) into the iteration shadow, or
+                // they would die with `ev_shadow` and leave this event's
+                // writes uncovered by a later `Fatal`'s restore.
+                Ok(()) => shadow.merge_committed(ev_shadow),
                 Err(e @ SimError::Fatal(_)) => return Err(e),
                 Err(e) => {
                     ev_shadow.restore(self);
@@ -7365,6 +7578,12 @@ impl TickIo for WorldTickIo<'_> {
     }
 
     fn issue(&mut self, class: SourceClass, source_id: u32, command: SimCommand) {
+        // Record the push: the drain records only what it pops, so an
+        // issued command that never reaches a drain this iteration is
+        // otherwise invisible to the rollback — a ghost command
+        // surviving a `Fatal` (§2.13). The count restores `pending` to
+        // its pre-iteration shape tail-first (see `TickShadow::issued`).
+        *self.shadow.issued.entry((class, source_id)).or_default() += 1;
         self.pending
             .entry((class, source_id))
             .or_default()
@@ -9890,8 +10109,8 @@ mod tests {
         let r = w.step_frame(1).unwrap();
         twin.step_frame(1).unwrap();
         assert_eq!(r.rejected.len(), 1);
-        assert!(matches!(r.rejected[0].1, SimError::Recoverable(_)));
-        assert_eq!(r.rejected[0].0.source_seq, 0); // its would-be key
+        assert!(matches!(r.rejected[0].error, SimError::Recoverable(_)));
+        assert_eq!(r.rejected[0].key.source_seq, 0); // its would-be key
         assert_eq!(r.commands_applied, 1);
         assert_eq!(w.state_hash().unwrap(), twin.state_hash().unwrap());
         assert_eq!(w.command_log(), twin.command_log());
@@ -10010,7 +10229,7 @@ mod tests {
         );
         let r = w.step_frame(4).unwrap();
         assert_eq!(r.rejected.len(), 1);
-        assert!(matches!(r.rejected[0].1, SimError::Recoverable(_)));
+        assert!(matches!(r.rejected[0].error, SimError::Recoverable(_)));
     }
 
     /// The §7.2 serialized set covers the new state: snapshot mid-run,
@@ -10839,7 +11058,7 @@ mod tests {
         assert!(
             rep.rejected
                 .iter()
-                .any(|(_, e)| *e == SimError::Recoverable("install-aero: graph hash mismatch")),
+                .any(|r| r.error == SimError::Recoverable("install-aero: graph hash mismatch")),
             "{:?}",
             rep.rejected
         );
@@ -11293,7 +11512,7 @@ mod tests {
         );
         let report = w.step_frame(w.clock().ticks() + 1).unwrap();
         assert_eq!(report.rejected.len(), 1);
-        assert!(matches!(report.rejected[0].1, SimError::Recoverable(_)));
+        assert!(matches!(report.rejected[0].error, SimError::Recoverable(_)));
         // A throttle command on a still-latched vessel unlatches first —
         // §2.6.4's rule — then applies.
         let mut w2 = physics_world(true);
@@ -12356,7 +12575,9 @@ mod tests {
             clock: SimTime::ZERO,
             warp_level: 1,
             log_len: 0,
+            script_log_len: 0,
             drained: Vec::new(),
+            issued: BTreeMap::new(),
             seq_restore: Vec::new(),
             vessels: None,
             scripts: None,
@@ -13244,7 +13465,7 @@ mod tests {
         assert!(
             r2.rejected
                 .iter()
-                .all(|(_, e)| matches!(e, SimError::Recoverable(_)))
+                .all(|r| matches!(r.error, SimError::Recoverable(_)))
         );
     }
 
@@ -14404,7 +14625,9 @@ mod tests {
             clock: SimTime::ZERO,
             warp_level: 1,
             log_len: 0,
+            script_log_len: 0,
             drained: Vec::new(),
+            issued: BTreeMap::new(),
             seq_restore: Vec::new(),
             vessels: None,
             scripts: None,
@@ -16022,7 +16245,7 @@ mod tests {
         assert!(
             r.rejected
                 .iter()
-                .any(|(_, e)| *e
+                .any(|r| r.error
                     == SimError::Recoverable("recover: data at key aboard another vessel")),
             "{:?}",
             r.rejected
@@ -16102,7 +16325,7 @@ mod tests {
         assert!(
             r.rejected
                 .iter()
-                .any(|(_, e)| *e
+                .any(|r| r.error
                     == SimError::Recoverable("recover: a live project still holds the key")),
             "{:?}",
             r.rejected
@@ -16199,7 +16422,7 @@ mod tests {
         assert!(
             r.rejected
                 .iter()
-                .any(|(_, e)| *e == SimError::Recoverable("research: key closed by recovery")),
+                .any(|r| r.error == SimError::Recoverable("research: key closed by recovery")),
             "{:?}",
             r.rejected
         );
@@ -16215,7 +16438,7 @@ mod tests {
         assert!(
             r.rejected
                 .iter()
-                .any(|(_, e)| *e == SimError::Recoverable("transmit: key closed by recovery")),
+                .any(|r| r.error == SimError::Recoverable("transmit: key closed by recovery")),
             "{:?}",
             r.rejected
         );
@@ -17116,9 +17339,9 @@ mod tests {
             let r = drain(&mut w);
             assert_eq!(r.commands_applied, 0);
             assert_eq!(r.rejected.len(), 1);
-            let (key, err) = &r.rejected[0];
-            assert_eq!(key.source_class, SourceClass::External);
-            assert!(matches!(err, SimError::Recoverable(m) if m.contains("lease")));
+            let rej = &r.rejected[0];
+            assert_eq!(rej.key.source_class, SourceClass::External);
+            assert!(matches!(rej.error, SimError::Recoverable(m) if m.contains("lease")));
             // Not logged (the log holds only the spawn).
             assert_eq!(w.command_log().len(), 1);
             assert!(matches!(
@@ -17542,6 +17765,254 @@ mod tests {
             assert_eq!(log[1].0.source_id, 7);
             assert!(log[0].0 < log[1].0);
             assert_eq!(w.warp_level(), 16);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // §2.13 TickShadow coverage — a `Fatal` mid-iteration must roll back
+    // EVERY mutation channel the iteration touched, not only the hashed
+    // arenas: `issue`d queue pushes, `script_log` lines, and the
+    // borrow-split `tracked_vessels`/`transfers` writes inside the latch
+    // pass all used to survive the restore.
+    // -------------------------------------------------------------------
+    mod fatal_rollback {
+        use super::*;
+
+        /// What the probe script does each `on_tick`.
+        #[derive(Clone, Copy)]
+        enum Probe {
+            /// `issue` a `SetThrottle` — the unshadowed-queue probe.
+            Issue,
+            /// Fault — the `script_log`-push probe.
+            Fault,
+        }
+
+        /// A minimal engine — the `m9a` StubEngine shape trimmed to the
+        /// two behaviors these tests need; `issued` counts `issue` calls
+        /// so the test can prove the push really happened before the
+        /// `Fatal` rolled it back.
+        struct ProbeEngine {
+            probe: Probe,
+            issued: std::rc::Rc<std::cell::Cell<u64>>,
+        }
+
+        impl ScriptEngine for ProbeEngine {
+            fn prepare(&mut self, _id: ScriptId, _source: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn run_tick(
+                &mut self,
+                script: &mut ScriptState,
+                _tick: u64,
+                io: &mut dyn TickIo,
+            ) -> ScriptRunReport {
+                match self.probe {
+                    Probe::Issue => {
+                        self.issued.set(self.issued.get() + 1);
+                        io.issue(
+                            SourceClass::Script,
+                            script.id.0 as u32,
+                            SimCommand::SetThrottle {
+                                vessel: script.vessel,
+                                throttle: 0.5,
+                            },
+                        );
+                        ScriptRunReport {
+                            ops_used: 10,
+                            fault: None,
+                        }
+                    }
+                    Probe::Fault => ScriptRunReport {
+                        ops_used: 5,
+                        fault: Some(ScriptFault::Runtime("boom".to_string())),
+                    },
+                }
+            }
+            fn unload(&mut self, _id: ScriptId) {}
+        }
+
+        /// Physics world + resident orbiter + a script loaded on vessel
+        /// 0, mid-run at clock 2 — the `m9a::scripted_world` shape.
+        fn probed_world(probe: Probe) -> (World, std::rc::Rc<std::cell::Cell<u64>>) {
+            let issued = std::rc::Rc::new(std::cell::Cell::new(0));
+            let mut w = physics_world(false);
+            w.set_script_engine(Box::new(ProbeEngine {
+                probe,
+                issued: std::rc::Rc::clone(&issued),
+            }));
+            enqueue_orbiter(&mut w);
+            w.step_frame(1).unwrap();
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::LoadScript {
+                    vessel: VesselId(0),
+                    source: "probe".to_string(),
+                },
+            );
+            w.step_frame(2).unwrap();
+            assert_eq!(w.scripts().len(), 1);
+            (w, issued)
+        }
+
+        /// A `Fatal` planted at the iteration's event slot: an
+        /// `SoiTransition` naming a vessel that does not exist — the
+        /// apply's `Fatal("soi event for unknown vessel")` fires AFTER
+        /// the whole in-range pass (scripts, physics, latch), which is
+        /// exactly where the shadow's coverage used to thin out.
+        fn plant_doomsday_event(w: &mut World, tick: u64) {
+            let seq = w.next_event_seq;
+            w.next_event_seq += 1;
+            w.event_heap.push(ScheduledEvent {
+                tick,
+                seq,
+                class: EventClass::Silent,
+                kind: EventKind::SoiTransition {
+                    vessel: VesselId(u64::MAX),
+                    body: BodyId::from("p"),
+                    direction: orbit::SoiDirection::Enter,
+                },
+            });
+        }
+
+        fn assert_doomed(report: Result<AdvanceReport, SimError>) {
+            assert!(
+                matches!(report, Err(SimError::Fatal(m)) if m.contains("unknown vessel")),
+                "the planted event must be the Fatal: {report:?}"
+            );
+        }
+
+        /// `issue` pushes land in `pending` with no drain record — a
+        /// `Fatal` before the next drain must still restore the queue's
+        /// pre-boundary shape. The script ticks at the range's last tick
+        /// (`t_next − 1`), so its command never reaches a drain inside
+        /// the doomed iteration.
+        #[test]
+        fn fatal_after_script_issue_leaves_no_ghost_command() {
+            let (mut w, issued) = probed_world(Probe::Issue);
+            // The tick-1 `issue` sits in `pending` at this boundary —
+            // legitimately queued, restored verbatim by the rollback.
+            let pre_pending = w.pending.clone();
+            plant_doomsday_event(&mut w, 3);
+            let pre = w.state_hash().unwrap();
+            let issued_before = issued.get();
+            assert_doomed(w.step_frame(3));
+            assert!(
+                issued.get() > issued_before,
+                "the script must have issued inside the doomed iteration"
+            );
+            assert_eq!(
+                w.pending, pre_pending,
+                "the doomed iteration's issue must not survive the rollback"
+            );
+            assert_eq!(w.state_hash().unwrap(), pre);
+        }
+
+        /// `script_log` is report output, not sim state — but a line
+        /// pushed by a doomed iteration must still roll back with it
+        /// (the `command_log` `log_len` precedent), or the same line
+        /// would be reported twice when the run is retried.
+        #[test]
+        fn fatal_after_script_log_push_rolls_back_log() {
+            let (mut w, _issued) = probed_world(Probe::Fault);
+            assert!(w.script_log.is_empty(), "fixture: log starts empty");
+            plant_doomsday_event(&mut w, 3);
+            let pre = w.state_hash().unwrap();
+            assert_doomed(w.step_frame(3));
+            assert!(
+                w.script_log.is_empty(),
+                "the doomed iteration's log line must roll back: {:?}",
+                w.script_log
+            );
+            assert_eq!(w.state_hash().unwrap(), pre);
+        }
+
+        /// The latch merge rewrites `tracked_vessels` and `transfers`
+        /// through `apply_latch`'s borrow-split params — both hashed.
+        /// A `Fatal` after the merge must restore both, or the
+        /// post-rollback hash diverges from the pre-boundary hash.
+        #[test]
+        fn fatal_after_latch_merge_rolls_back_tracked_and_transfers() {
+            let mut w = physics_world(false);
+            spawn_port_pair(&mut w, DVec3::new(0.0, 0.0, 1.8), flip_rot());
+            assert_eq!(w.joints().len(), 1);
+            // Track the about-to-be-absorbed secondary and park an
+            // in-flight transfer that names it — `apply_latch` rewrites
+            // both during the merge.
+            w.tracked_vessels.insert(VesselId(1));
+            w.transfers.insert(
+                TransferId(0),
+                ActiveTransfer {
+                    id: TransferId(0),
+                    from: transfers::TransferEnd::Vessel(VesselId(0)),
+                    to: transfers::TransferEnd::Vessel(VesselId(1)),
+                    cargo: TransferCargo::Resource {
+                        resource: ResourceId::from("liquid_fuel"),
+                        amount: 1.0,
+                    },
+                    complete_tick: 10_000,
+                },
+            );
+            w.next_transfer_id = 1;
+            // The merge lands well inside the 192-tick settle window —
+            // the planted event at 384 gives it comfortable margin,
+            // then the iteration dies at the event slot.
+            plant_doomsday_event(&mut w, 384);
+            let pre = w.state_hash().unwrap();
+            assert_doomed(w.step_frame(384));
+            assert_eq!(
+                w.tracked_vessels,
+                BTreeSet::from([VesselId(1)]),
+                "the absorb's tracked rewrite must roll back"
+            );
+            let t = &w.transfers[&TransferId(0)];
+            assert!(
+                matches!(t.to, transfers::TransferEnd::Vessel(v) if v == VesselId(1)),
+                "the transfer remap must roll back: {t:?}"
+            );
+            assert_eq!(w.vessels.len(), 2, "the merge itself rolled back");
+            assert_eq!(w.state_hash().unwrap(), pre);
+        }
+
+        /// `seq_restore` dedups PER ITERATION, not per `drain_at` call:
+        /// a source drained at the boundary AND again by an in-range
+        /// drain records twice, and the last-wins restore must keep
+        /// the EARLIEST record — the pre-iteration counter. A per-call
+        /// dedup (the old `last_src`) let the in-range record
+        /// overwrite it, so the mid-iteration increment survived the
+        /// rollback and `state_hash` diverged.
+        ///
+        /// The shape: the script's tick-1 `issue` sits in `pending`,
+        /// so the doomed iteration's boundary drain pops it (record
+        /// #1); each in-range control tick re-issues, and the NEXT
+        /// tick's `drain_at` pops those (records #2, #3, …) — then the
+        /// planted event kills the iteration at `t_next`.
+        #[test]
+        fn fatal_after_boundary_and_in_range_drain_restores_source_seqs() {
+            let (mut w, issued) = probed_world(Probe::Issue);
+            let src = (SourceClass::Script, 0u32);
+            assert!(
+                w.pending.contains_key(&src),
+                "fixture: the boundary drain must touch the script's source"
+            );
+            // Multi-tick range 2..5: in-range drains at t=3 and t=4
+            // re-touch `src`; the planted event is the Fatal at
+            // `t_next` = 5. Plant BEFORE the pre-hash so the rollback's
+            // surviving heap/seq match it (the sibling tests' order).
+            plant_doomsday_event(&mut w, 5);
+            let pre_seqs = w.source_seqs.clone();
+            let pre = w.state_hash().unwrap();
+            let issued_before = issued.get();
+            assert_doomed(w.step_frame(5));
+            assert!(
+                issued.get() >= issued_before + 2,
+                "the script must have issued at multiple in-range ticks"
+            );
+            assert_eq!(
+                w.source_seqs, pre_seqs,
+                "a later drain's record must not overwrite the pre-iteration counter"
+            );
+            assert_eq!(w.state_hash().unwrap(), pre);
         }
     }
 }
