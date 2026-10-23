@@ -157,6 +157,13 @@ pub mod reliability;
 /// state. See the module doc for the tick model and warp rules.
 pub mod scripts;
 
+/// M10 §7.7 — the versioned save format and the start of the migration
+/// chain: the §7.2 `CSPSAVE\0` + JSON-header + DEFLATE-over-CBOR
+/// container, the frozen `v1` schema, `migrate_vN_to_vN+1` machinery,
+/// and the bug-report bundle's command-log codec. Distinct from the
+/// §7.6 replay artifact (which is version-scoped, never migrated).
+pub mod save;
+
 pub use bubble::{CraftDef, PhysicsConfig, SurfacePose, VesselState, VesselThermal};
 pub use colonies::{
     Colony, ColonyBodyEnv, ColonyModule, ColonyState, ColonyStore, Daylight, DegradeReason,

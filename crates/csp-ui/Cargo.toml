@@ -14,10 +14,16 @@ egui = { workspace = true }
 # table the session ops and the Δv readout resolve against.
 csp-phys = { workspace = true }
 csp-data = { workspace = true }
+# §7.8: the settings model (`settings::Settings`) is the serialized
+# shape of `$config_dir/csp/settings.ron` — serde derives here, the
+# file IO in csp-app.
+serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 # test fixtures build literal part defs — DVec3 is csp-core's type.
 csp-core = { workspace = true }
+# The settings round-trip test exercises the production file format.
+ron = { workspace = true }
 
 [lints]
 workspace = true

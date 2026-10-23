@@ -83,6 +83,14 @@ const ALLOW: &[(&str, &[&str])] = &[
             "csp-phys",
             "libm",
             "serde",
+            // §7.7: the versioned save codec lives beside the snapshot —
+            // §7.2's container is JSON header + DEFLATE-over-CBOR
+            // (serde_json + miniz_oxide + ciborium); bincode stays for
+            // the §7.6 command-log artifact only.
+            "bincode",
+            "ciborium",
+            "miniz_oxide",
+            "serde_json",
             "blake3",
             "rand_chacha",
             "rand_core",

@@ -19,6 +19,17 @@ libm = { workspace = true }
 # command types via bincode. Serialization never feeds the §7.1 state hash —
 # that is produced by the StateHasher visitor, so serde field order is free.
 serde = { workspace = true, features = ["derive"] }
+# §7.7: the versioned save format's wire container is the §7.2-adjudicated
+# `CSPSAVE\0` + u32 header_len + JSON header + DEFLATE-over-CBOR body —
+# ciborium (canonical CBOR) + miniz_oxide (zlib-framed DEFLATE, the same
+# codec the csp-data PNG decoder uses) + serde_json for the self-describing
+# header. Exact pins — the wire format is part of the save contract, not a
+# negotiated encoding. bincode stays for the §7.6 command-log artifact only
+# (§7.2: "replay logs stay bincode").
+bincode = { workspace = true, features = ["serde"] }
+ciborium = { workspace = true }
+miniz_oxide = { workspace = true }
+serde_json = { workspace = true }
 # §2.7: the M7-D contract generator consumes csp_core's deterministic
 # streams in shipping code — `RngCore::next_u64` is the draw source.
 rand_core = { workspace = true }

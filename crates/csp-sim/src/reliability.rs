@@ -688,7 +688,11 @@ impl World {
     }
 
     /// `balance.ron` wiring — the `set_life_support_cfg` precedent:
-    /// call before the first `step_frame`.
+    /// call before the first `step_frame`. This is a *construction-config*
+    /// write, not a `SimCommand`: it never enters the §7.6 command log,
+    /// so a post-construction call would diverge from any replay of that
+    /// log. The config is serialized in the save and hashed by §7.1 —
+    /// replay determinism is carried by the snapshot, not the log.
     pub fn set_reliability_config(&mut self, cfg: ReliabilityConfig) {
         self.reliability_cfg = cfg;
     }

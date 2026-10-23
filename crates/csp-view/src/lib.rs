@@ -47,6 +47,16 @@ pub enum ViewMode {
     Vab,
 }
 
+/// The §3.1 data-set hash + its scheme version — the bug-report bundle's
+/// fingerprint fields (§2.14) and §7.7's drift-warning key.
+pub use csp_data::{DATA_HASH_VERSION, datahash::data_set_hash};
+/// The §7.2 serialized set — the payload [`save`] wraps. Re-exported on
+/// the same §2.1 edge-sharing rationale.
+pub use csp_sim::WorldSnapshot;
+/// M10: the versioned save format + migration machinery (`csp_sim::save`)
+/// — re-exported so `csp-app`'s bug-report bundle and save path can
+/// encode/decode without a `csp-sim` edge of its own (§2.1).
+pub use csp_sim::save;
 /// `SimCommand` vocabulary, re-exported so `csp-app` can produce commands
 /// without depending on `csp-sim` directly — §2.1's rule that `csp-view` is
 /// the only crate depending on BOTH `csp-sim` and `csp-render` stays true.
@@ -55,6 +65,9 @@ pub enum ViewMode {
 pub use csp_sim::{AdvanceReport, EventClass, SimCommand, SourceClass};
 // Re-exported so `csp-app` names mode requests without a csp-ui edge.
 pub use csp_ui::ModeSelect;
+/// M10: the settings model + panel (`csp_ui::settings`) — re-exported so
+/// `csp-app` owns the file IO without a `csp-ui` edge of its own.
+pub use csp_ui::settings;
 
 /// Integer sim clock mirrored for presentation — a COPY, written each frame
 /// by the `sync` schedule's [`sync_mirrors`] system (PLAN §2.2, Appendix A
@@ -106,6 +119,10 @@ pub struct SessionMirror {
     pub warp_effective: u64,
     /// §2.13 halt state — mirrored so the panel can show "SIM HALTED".
     pub fatal: Option<SimError>,
+    /// The bug-report bundle path (or write-failure note) the Fatal
+    /// handler recorded — the dialog's "send this to the developer"
+    /// line. `None` until a Fatal lands or while the write is pending.
+    pub fatal_bundle: Option<String>,
 }
 
 /// The egui pass's input/output — the resource bridge that lets the *whole*
@@ -161,12 +178,22 @@ pub struct UiOutbox {
     /// command `csp-app` enqueues at next Input (§2.5's one-frame
     /// UiBuild → Input hand-off, same as every other request here).
     pub maneuver: Option<SimCommand>,
+    /// The settings panel's "Apply" — `csp-app` copies the staged
+    /// settings into its live set and persists them.
+    pub settings_apply: bool,
 }
 
 /// The maneuver panel's session state — `csp-view` owns it (§2.2 C),
 /// `csp_ui::maneuver_panel` mutates it inside `UiBuild`.
 #[derive(Resource, Default)]
 pub struct ManeuverPanelRes(pub csp_ui::ManeuverPanelState);
+
+/// The settings window's session state — `csp-view` owns it (§2.2 C),
+/// `csp_ui::settings_panel` mutates it inside `UiBuild`, and `csp-app`
+/// reaches it through the `settings_*`/`rebind_*` plumbing methods
+/// (the app owns key capture while a rebind listens).
+#[derive(Resource, Default)]
+pub struct SettingsPanelRes(pub settings::SettingsPanelState);
 
 /// Post-step values staged for the `sync` schedule — written by
 /// [`View::end_frame`] from the authoritative sim, then distributed into the
@@ -213,6 +240,7 @@ fn build_ui(
     flight_ui: Res<flight::FlightUiData>,
     map_snap: Res<map::MapSnapshot>,
     mut maneuver_state: ResMut<ManeuverPanelRes>,
+    mut settings_state: ResMut<SettingsPanelRes>,
     mut outbox: ResMut<UiOutbox>,
 ) {
     let mode = if vab_input.open {
@@ -304,6 +332,9 @@ fn build_ui(
                 },
             );
         }
+        // M10: the settings window + the §2.13 Fatal dialog — both
+        // session-state panels, drawn in every mode.
+        m10_panels(ctx, &mut settings_state.0, &session, &mut outbox);
     }));
     outbox.warp_step = panel_output.warp_step;
     outbox.mode = vab_out.mode;
@@ -318,6 +349,30 @@ fn build_ui(
         None
     };
     outbox.craft_load = vab_out.load_name;
+}
+
+/// M10's always-on session panels — the settings window (when open;
+/// its Apply/Reset requests ride the outbox) and the §2.13 Fatal
+/// crash dialog (while the halt mirror is set). Extracted from
+/// [`build_ui`] to keep that system under the line budget.
+fn m10_panels(
+    ctx: &egui::Context,
+    settings_state: &mut settings::SettingsPanelState,
+    session: &SessionMirror,
+    outbox: &mut UiOutbox,
+) {
+    let mut settings_out = csp_ui::settings::SettingsPanelOutput::default();
+    if settings_state.open {
+        csp_ui::settings::settings_panel(ctx, settings_state, &mut settings_out);
+    }
+    if settings_out.reset_defaults {
+        settings_state.settings = csp_ui::settings::Settings::default();
+        settings_state.notice = Some("defaults restored — Apply to keep".into());
+    }
+    outbox.settings_apply = settings_out.apply;
+    if let Some(fatal) = &session.fatal {
+        csp_ui::crash_dialog(ctx, fatal.reason(), session.fatal_bundle.as_deref());
+    }
 }
 
 /// The six schedules from PLAN §2.5, run explicitly by `csp-app`.
@@ -565,6 +620,8 @@ impl View {
         world.insert_resource(map::MapUiData::default());
         world.insert_resource(map::MapFrame::default());
         world.insert_resource(ManeuverPanelRes::default());
+        // M10: the settings window's staged state (§2.2-C session data).
+        world.insert_resource(SettingsPanelRes::default());
 
         // M3 VAB resources (see vab.rs): the working-craft session +
         // camera/pick state + the craft-file name list.
@@ -743,6 +800,68 @@ impl View {
     /// than a frame later.
     pub fn set_fatal(&mut self, fatal: Option<SimError>) {
         self.world.resource_mut::<SessionMirror>().fatal = fatal;
+    }
+
+    /// Update only the bug-report-bundle mirror — set by `csp-app`'s
+    /// Fatal handler once the bundle write resolves (path or failure).
+    pub fn set_fatal_bundle(&mut self, bundle: Option<String>) {
+        self.world.resource_mut::<SessionMirror>().fatal_bundle = bundle;
+    }
+
+    /// Stage the app's live settings into the panel's edit copy —
+    /// called at startup and whenever the file is (re)loaded, so the
+    /// window always opens on the applied state.
+    pub fn stage_settings(&mut self, settings: &settings::Settings) {
+        self.world.resource_mut::<SettingsPanelRes>().0.settings = settings.clone();
+    }
+
+    /// The panel's staged settings — read by `csp-app` when "Apply"
+    /// rides the outbox; it becomes the live set and the file write.
+    pub fn staged_settings(&self) -> settings::Settings {
+        self.world.resource::<SettingsPanelRes>().0.settings.clone()
+    }
+
+    /// Toggle the settings window (the `OpenSettings` binding).
+    pub fn toggle_settings_panel(&mut self) {
+        let mut r = self.world.resource_mut::<SettingsPanelRes>();
+        r.0.open = !r.0.open;
+        // A closed window drops an armed rebind so the next key press
+        // is not swallowed by a panel the user can no longer see.
+        if !r.0.open {
+            r.0.listening = None;
+        }
+    }
+
+    /// The action awaiting a captured key, if the panel's "rebind" is
+    /// armed — `csp-app` reads this *before* normal dispatch each key
+    /// press.
+    pub fn rebind_target(&self) -> Option<settings::KeyAction> {
+        self.world.resource::<SettingsPanelRes>().0.listening
+    }
+
+    /// Disarm the rebind capture (Escape, or after a key lands).
+    pub fn set_rebind_target(&mut self, action: Option<settings::KeyAction>) {
+        self.world.resource_mut::<SettingsPanelRes>().0.listening = action;
+    }
+
+    /// Land a captured key into the staged keymap ([`settings::Keymap::bind`]
+    /// handles eviction) and disarm the capture. `token` is the
+    /// host-normalized binding text — `KeyBinding::parse` has already
+    /// accepted it on the app side.
+    pub fn bind_key(&mut self, action: settings::KeyAction, key: settings::KeyBinding) {
+        let mut r = self.world.resource_mut::<SettingsPanelRes>();
+        let evicted = r.0.settings.keys.bind(action, key.clone());
+        r.0.listening = None;
+        r.0.notice = Some(match evicted {
+            Some(other) => format!("{key} bound to {} (was {})", action.label(), other.label()),
+            None => format!("{key} bound to {}", action.label()),
+        });
+    }
+
+    /// A one-line notice for the panel ("settings saved", a write
+    /// failure) — the host's feedback channel.
+    pub fn set_settings_notice(&mut self, notice: Option<String>) {
+        self.world.resource_mut::<SettingsPanelRes>().0.notice = notice;
     }
 
     /// The `egui::Context` — `csp-app` borrows this clone to tessellate the
@@ -985,9 +1104,10 @@ impl View {
 
 /// The data/ directory root: `./data` when it exists (the app runs from
 /// the repo root), else the repo layout relative to this crate's manifest
-/// so tests and tools resolve the same files from any CWD.
+/// so tests and tools resolve the same files from any CWD. `pub` so
+/// `csp-app`'s bug-report bundle can hash the same set (§2.14).
 #[cfg(not(target_arch = "wasm32"))]
-fn data_root() -> std::path::PathBuf {
+pub fn data_root() -> std::path::PathBuf {
     for candidate in [
         std::path::PathBuf::from("data"),
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data"),

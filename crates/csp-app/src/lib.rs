@@ -17,7 +17,19 @@
 //! schedule's [`csp_ui`] panel system, and render consumes the stored
 //! `FullOutput`. Native and wasm share this code; the entry points differ
 //! (`main.rs` vs `wasm_start` below).
+//!
+//! M10 additions: persistent settings + a rebindable keymap
+//! ([`settings_io`]), and the §2.13/§2.14 crash path — a `Fatal` or a
+//! panic halts the clock, marks the session read-only, writes a
+//! bug-report bundle ([`bugreport`]), and surfaces it in the UI.
 
+#![forbid(unsafe_code)]
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod bugreport;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod logring;
+pub mod settings_io;
 mod warp;
 
 use std::sync::Arc;
@@ -32,6 +44,7 @@ use csp_render::terrain::TerrainRenderer;
 use csp_render::vab::VabRenderer;
 use csp_view::flight::FlightEvent;
 use csp_view::map::MapKeyEvent;
+use csp_view::settings::{KeyAction, Settings};
 use csp_view::vab::VabEvent;
 use csp_view::{EventClass, ModeSelect, SimCommand, SourceClass, View, ViewMode};
 use warp::WarpController;
@@ -40,7 +53,6 @@ use winit::{
     application::ApplicationHandler,
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
-    keyboard::{Key, NamedKey},
     window::{Window, WindowId},
 };
 
@@ -55,6 +67,9 @@ const WARP_SOURCE_ID: u32 = 0;
 /// §2.2.1 source id for the map maneuver panel's commands (Ui class;
 /// distinct FIFO from the warp controller's).
 const MANEUVER_SOURCE_ID: u32 = 2;
+/// §2.2.1 source id for settings-applied commands (the difficulty
+/// flags' `SetLifeSupportEnabled` at new-game; Ui class, own FIFO).
+const SETTINGS_SOURCE_ID: u32 = 3;
 
 /// Map camera controls (M1-D, PLAN §5.1 R0): orbit-drag sensitivity is
 /// defined inside `csp_view::map` (`MapKeyEvent::Orbit` takes radians) —
@@ -128,11 +143,36 @@ struct App {
     /// because §2.6.3's inequality is written in per-tick cost. Never sim
     /// state.
     last_tick_ms: f64,
-    /// Set when the sim reports a §2.13 `Fatal`: ticking halts and the error
-    /// is surfaced in the debug panel. (The full policy — dialog, read-only
-    /// session, bug-report bundle — is a later-milestone concern; M0 stops
-    /// advancing and shows the error rather than panicking or dropping it.)
+    /// Set when the sim reports a §2.13 `Fatal`: ticking halts, the
+    /// session marks itself read-only, the bug-report bundle is written,
+    /// and the crash dialog surfaces it. (M0's stub — "stop advancing
+    /// and show the error" — is now the full §2.13 policy.)
     fatal: Option<SimError>,
+    /// The live settings — loaded at startup ([`settings_io`]), edited
+    /// through the settings panel's staged copy, persisted on Apply.
+    /// The input layer resolves every key press through `settings.keys`.
+    settings: Settings,
+    /// §2.13's read-only mark: set by the `Fatal` path — a halted
+    /// session refuses craft-file writes too (they would persist
+    /// artifacts of a world that may be corrupt).
+    read_only: bool,
+    /// Where `settings.ron` loads from and where Apply persists to —
+    /// `Some(settings_io::settings_path())` in production, `None` on wasm
+    /// (in-memory settings — never read there, hence the dead_code
+    /// allowance on that target). Kept injectable for test hermeticity:
+    /// a developer's real `$XDG_CONFIG_HOME/csp/settings.ron` must never
+    /// leak into a test — a `dormant_stress: false` file would silently
+    /// rewrite the world under test through `apply_startup_difficulty`.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    settings_path: Option<std::path::PathBuf>,
+    /// Where bug-report bundles land — `bugreport::bug_report_root()`
+    /// normally; tests redirect it. Native only (the bundle is a
+    /// filesystem artifact).
+    #[cfg(not(target_arch = "wasm32"))]
+    bug_report_root: std::path::PathBuf,
+    /// `(adapter, backend)` remembered for the bundle's system info —
+    /// `set_gpu_info` already hands them to the session mirror.
+    gpu_info: Option<(String, String)>,
 }
 
 impl App {
@@ -142,8 +182,34 @@ impl App {
     // `expect` site per the workspace lint doc.
     #[allow(clippy::expect_used)]
     fn new() -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        let (settings, settings_path) = (
+            settings_io::load_settings(),
+            Some(settings_io::settings_path()),
+        );
+        #[cfg(target_arch = "wasm32")]
+        let (settings, settings_path) = (settings_io::load_settings(), None);
+        Self::new_inner(settings, settings_path)
+    }
+
+    /// The settings-path-injecting constructor — what tests drive so the
+    /// real `$XDG_CONFIG_HOME/csp/settings.ron` can never leak into a
+    /// test process (see the `settings_path` field's doc). Production
+    /// goes through `new()` → `settings_io::settings_path()`.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    fn new_with_settings_path(settings_path: &std::path::Path) -> Self {
+        Self::new_inner(
+            settings_io::load_settings_from(settings_path),
+            Some(settings_path.to_path_buf()),
+        )
+    }
+
+    #[allow(clippy::expect_used)]
+    fn new_inner(settings: Settings, settings_path: Option<std::path::PathBuf>) -> Self {
         let (pick_tx, pick_rx) = std::sync::mpsc::channel();
-        Self {
+        let mut view = View::new().expect("data/ startup load failed");
+        view.stage_settings(&settings);
+        let mut app = Self {
             window: None,
             gpu: None,
             egui_state: None,
@@ -162,11 +228,109 @@ impl App {
             last_cursor: None,
             map_dragging: false,
             lmb_press: None,
-            view: View::new().expect("data/ startup load failed"),
+            view,
             warp: WarpController::new(),
             last_frame: Instant::now(),
             last_tick_ms: 0.0,
             fatal: None,
+            settings,
+            settings_path,
+            read_only: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            bug_report_root: bugreport::bug_report_root(),
+            gpu_info: None,
+        };
+        app.apply_startup_difficulty();
+        app
+    }
+
+    /// The difficulty flags are *new-game* choices: they write
+    /// construction config / a logged command before the first
+    /// `step_frame`, never mid-session (a mid-game config write would
+    /// diverge from the §7.6 command log — it is not a logged
+    /// mutation). `life_support_enabled` rides `SetLifeSupportEnabled`;
+    /// `dormant_stress: false` scales the §3.4 dormant hazard out via
+    /// `set_reliability_config` — a **construction-config write**, the
+    /// same channel `View::new`'s balance.ron `set_*_config` installs
+    /// use (serialized in the save, hashed by §7.1, but *not* a
+    /// `SimCommand` and never in the command log — replay determinism
+    /// rides on the snapshot carrying it).
+    fn apply_startup_difficulty(&mut self) {
+        if self.settings.difficulty.life_support_enabled {
+            self.view.enqueue_command(
+                SourceClass::Ui,
+                SETTINGS_SOURCE_ID,
+                SimCommand::SetLifeSupportEnabled { enabled: true },
+            );
+        }
+        if !self.settings.difficulty.dormant_stress {
+            let mut cfg = self.view.sim.reliability_cfg().clone();
+            cfg.dormant_stress_scale = 0.0;
+            self.view.sim.set_reliability_config(cfg);
+        }
+    }
+
+    /// §2.13's `Fatal` policy (M10): halt the clock, mark the session
+    /// read-only, write the §2.14 bug-report bundle, and surface it —
+    /// the world has already rolled back to the pre-tick shadow inside
+    /// `step_frame`, so the bundle's snapshot is the last good state.
+    /// Every step is best-effort: a failed bundle write must never
+    /// compound the halt with a second failure.
+    fn on_sim_fatal(&mut self, e: SimError) {
+        self.fatal = Some(e);
+        self.read_only = true;
+        // Refresh the halt mirror so UiBuild sees it this frame.
+        self.view.set_fatal(self.fatal);
+        log::error!("sim halted ({e}) — session is read-only");
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let input = self.collect_bug_report("fatal sim error", &e.to_string());
+            let bundle = match bugreport::write_bug_report(&self.bug_report_root, "fatal", &input) {
+                Ok(dir) => {
+                    log::error!("bug-report bundle: {}", dir.display());
+                    dir.display().to_string()
+                }
+                Err(err) => {
+                    log::error!("bug-report bundle write failed: {err}");
+                    format!("bundle write failed: {err}")
+                }
+            };
+            self.view.set_fatal_bundle(Some(bundle));
+        }
+    }
+
+    /// Collect the §2.14 bundle's sim-side contents: the save (encoded
+    /// at the current schema — the bundle doubles as the crash save),
+    /// the command log, the data-set hash, and the log tail. A refused
+    /// snapshot is recorded, not fatal to the bundle.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn collect_bug_report(&self, title: &'static str, error: &str) -> bugreport::BugReportInput {
+        let save = self
+            .view
+            .sim
+            .snapshot()
+            .map_err(|e| format!("snapshot refused: {e}"))
+            .and_then(|snapshot| {
+                csp_view::save::encode_save(&csp_view::save::Save {
+                    game_version: env!("CARGO_PKG_VERSION").into(),
+                    label: Some(format!("crash at tick {}", snapshot.clock_ticks)),
+                    data_set_hash: csp_view::data_set_hash(&csp_view::data_root()).ok(),
+                    snapshot,
+                })
+                .map_err(|e| e.to_string())
+            });
+        let command_log = csp_view::save::encode_command_log(self.view.sim.command_log())
+            .map_err(|e| e.to_string());
+        bugreport::BugReportInput {
+            title,
+            error: error.to_string(),
+            tick: Some(self.view.sim.clock().ticks()),
+            save,
+            command_log,
+            data_set_hash: csp_view::data_set_hash(&csp_view::data_root()).ok(),
+            gpu_adapter: self.gpu_info.as_ref().map(|(a, _)| a.clone()),
+            gpu_backend: self.gpu_info.as_ref().map(|(_, b)| b.clone()),
+            log_tail: logring::tail(),
         }
     }
 
@@ -224,6 +388,7 @@ impl App {
         );
         let terrain_renderer = TerrainRenderer::new(&gpu.device, gpu.surface_format());
         let info = gpu.adapter.get_info();
+        self.gpu_info = Some((info.name.clone(), format!("{:?}", info.backend)));
         self.view
             .set_gpu_info(info.name.clone(), format!("{:?}", info.backend));
 
@@ -269,40 +434,7 @@ impl App {
         // UiBuild → next frame's Input (§2.5's accepted one-frame latency):
         // fold last frame's panel requests into the controller.
         let outbox = self.view.take_ui_outbox();
-        if outbox.warp_step != 0 {
-            self.warp.request_step(outbox.warp_step);
-        }
-        if let Some(mode) = outbox.mode {
-            self.view.set_mode(match mode {
-                ModeSelect::Flight => ViewMode::Flight,
-                ModeSelect::Map => ViewMode::Map,
-                ModeSelect::Vab => ViewMode::Vab,
-            });
-        }
-        if let Some((name, bytes)) = outbox.craft_save {
-            self.craft_store.insert(name.clone(), bytes.clone());
-            save_craft_file(&name, &bytes);
-            self.view
-                .set_craft_files(self.craft_store.keys().cloned().collect());
-            self.view
-                .vab_event(VabEvent::Notice(format!("saved {name}")));
-        }
-        if outbox.launch {
-            self.view.launch_craft();
-        }
-        // M5 node panel → the §7.6-logged command path.
-        if let Some(cmd) = outbox.maneuver {
-            self.view
-                .enqueue_command(SourceClass::Ui, MANEUVER_SOURCE_ID, cmd);
-        }
-        if let Some(name) = outbox.craft_load {
-            match self.craft_store.get(&name) {
-                Some(b) => self.view.vab_event(VabEvent::LoadCraft(b.clone())),
-                None => self
-                    .view
-                    .vab_event(VabEvent::Notice(format!("no craft file '{name}'"))),
-            }
-        }
+        self.handle_ui_outbox(outbox);
         // GPU pick readback: a completed map_async delivers the object
         // id — decode through the id table snapshotted at encode time
         // (`last_vab_packet` may have been replaced between rasterize
@@ -418,10 +550,10 @@ impl App {
                 }
                 Err(e @ SimError::Fatal(_)) => {
                     // §2.13: only Fatal halts — step_frame keeps
-                    // Recoverable inside its report channels.
-                    self.fatal = Some(e);
-                    // Refresh the halt mirror so UiBuild sees it this frame.
-                    self.view.set_fatal(self.fatal);
+                    // Recoverable inside its report channels. The full
+                    // policy (read-only + bundle + dialog) is
+                    // `on_sim_fatal`.
+                    self.on_sim_fatal(e);
                 }
                 Err(e) => {
                     // Contract drift: a non-Fatal error escaped step_frame.
@@ -440,6 +572,77 @@ impl App {
             self.last_tick_ms = 0.0;
         }
         self.view.end_frame();
+    }
+
+    /// The one-frame-late half of the frame (§2.5): apply every request
+    /// the last `UiBuild` pass wrote into its outbox — mode changes,
+    /// craft file ops, the settings panel's Apply, node commands.
+    /// Extracted from `run_frame` under the complexity budget.
+    fn handle_ui_outbox(&mut self, outbox: csp_view::UiOutbox) {
+        if outbox.warp_step != 0 {
+            self.warp.request_step(outbox.warp_step);
+        }
+        if let Some(mode) = outbox.mode {
+            self.view.set_mode(match mode {
+                ModeSelect::Flight => ViewMode::Flight,
+                ModeSelect::Map => ViewMode::Map,
+                ModeSelect::Vab => ViewMode::Vab,
+            });
+        }
+        if let Some((name, bytes)) = outbox.craft_save {
+            if self.read_only {
+                // §2.13: a halted session is read-only — a craft file
+                // written from a possibly-corrupt world is an artifact
+                // nobody should trust.
+                self.view.vab_event(VabEvent::Notice(format!(
+                    "session is read-only — '{name}' not saved"
+                )));
+            } else {
+                self.craft_store.insert(name.clone(), bytes.clone());
+                save_craft_file(&name, &bytes);
+                self.view
+                    .set_craft_files(self.craft_store.keys().cloned().collect());
+                self.view
+                    .vab_event(VabEvent::Notice(format!("saved {name}")));
+            }
+        }
+        if outbox.settings_apply {
+            // The panel's staged copy becomes the live set: the keymap
+            // dispatch reads `self.settings.keys` next key press, and
+            // the file write makes it durable (§7.8) — at the injected
+            // path so a test's Apply never writes the real config dir.
+            self.settings = self.view.staged_settings();
+            #[cfg(not(target_arch = "wasm32"))]
+            let persist = match &self.settings_path {
+                Some(p) => settings_io::save_settings_to(p, &self.settings),
+                None => settings_io::save_settings(&self.settings),
+            };
+            #[cfg(target_arch = "wasm32")]
+            let persist = settings_io::save_settings(&self.settings);
+            match persist {
+                Ok(()) => self.view.set_settings_notice(Some("settings saved".into())),
+                Err(e) => {
+                    log::warn!("settings persist failed: {e}");
+                    self.view.set_settings_notice(Some(e));
+                }
+            }
+        }
+        if outbox.launch {
+            self.view.launch_craft();
+        }
+        // M5 node panel → the §7.6-logged command path.
+        if let Some(cmd) = outbox.maneuver {
+            self.view
+                .enqueue_command(SourceClass::Ui, MANEUVER_SOURCE_ID, cmd);
+        }
+        if let Some(name) = outbox.craft_load {
+            match self.craft_store.get(&name) {
+                Some(b) => self.view.vab_event(VabEvent::LoadCraft(b.clone())),
+                None => self
+                    .view
+                    .vab_event(VabEvent::Notice(format!("no craft file '{name}'"))),
+            }
+        }
     }
 
     /// The paint half of the frame: consume the `UiBuild`-produced
@@ -623,90 +826,75 @@ impl App {
         window.request_redraw();
     }
 
-    /// One key-press event: manual warp ladder steps (§2.6.3 — `,` down /
-    /// `.` up land in the controller and become a logged `SetWarp` on the
-    /// next decide()) and the map camera keys. Map input rides
-    /// `View::map_event` into the Input schedule; pan keys and Tab accept
-    /// key-repeat so they track a held key, while `M`/`,`/`.` are
-    /// non-repeat single shots.
-    #[allow(clippy::too_many_lines)] // M4c's flight arms lengthened it
+    /// One key-press event, resolved through the rebindable keymap
+    /// (M10): `key_token` normalizes the winit key, `settings.keys`
+    /// names the action, and the dispatch table below routes it — the
+    /// M0–M9d hardcoded bindings are now the keymap's *defaults*.
+    ///
+    /// Rebind capture comes first: while the settings panel is
+    /// listening, the next unconsumed press becomes that action's
+    /// binding (Escape cancels). Repeat presses only count for
+    /// [`KeyAction::accepts_repeat`] actions (the camera pans), so a
+    /// held key cannot machine-gun warp steps or mode toggles.
     fn key_press(&mut self, event: &winit::event::KeyEvent) {
-        let mode = self.view.mode();
-        let in_map = mode == ViewMode::Map;
-        let in_vab = mode == ViewMode::Vab;
-        let pan = |dx_px: f64, dy_px: f64| MapKeyEvent::Pan { dx_px, dy_px };
-        // VAB mode keys: V toggles the editor; M/WASD/arrows get their
-        // own routing below. `,`/`.` stay warp keys in every mode.
-        if let Key::Character(c) = &event.logical_key
-            && c.eq_ignore_ascii_case("v")
-            && !event.repeat
-        {
-            self.view.set_mode(if in_vab {
-                ViewMode::Flight
-            } else {
-                ViewMode::Vab
-            });
-            return;
-        }
-        if in_vab {
-            let vab_event = match &event.logical_key {
-                Key::Character(c) if c.eq_ignore_ascii_case("m") && !event.repeat => {
-                    self.view.set_mode(ViewMode::Map);
-                    return;
+        // Rebind capture — before all other dispatch, swallowing the key.
+        if self.view.rebind_target().is_some() {
+            match settings_io::binding_for(&event.logical_key) {
+                None => { /* unbindable key — keep listening */ }
+                Some(b) if b.as_str() == "escape" => self.view.set_rebind_target(None),
+                Some(b) => {
+                    let Some(action) = self.view.rebind_target() else {
+                        return;
+                    };
+                    self.view.bind_key(action, b);
                 }
-                Key::Named(NamedKey::ArrowUp) => Some(VabEvent::Pan {
-                    dx_px: 0.0,
-                    dy_px: -PAN_STEP_PX,
-                }),
-                Key::Named(NamedKey::ArrowDown) => Some(VabEvent::Pan {
-                    dx_px: 0.0,
-                    dy_px: PAN_STEP_PX,
-                }),
-                Key::Named(NamedKey::ArrowLeft) => Some(VabEvent::Pan {
-                    dx_px: -PAN_STEP_PX,
-                    dy_px: 0.0,
-                }),
-                Key::Named(NamedKey::ArrowRight) => Some(VabEvent::Pan {
-                    dx_px: PAN_STEP_PX,
-                    dy_px: 0.0,
-                }),
-                Key::Character(c) => match c.as_str() {
-                    "w" | "W" => Some(VabEvent::Pan {
-                        dx_px: 0.0,
-                        dy_px: -PAN_STEP_PX,
-                    }),
-                    "s" | "S" => Some(VabEvent::Pan {
-                        dx_px: 0.0,
-                        dy_px: PAN_STEP_PX,
-                    }),
-                    "a" | "A" => Some(VabEvent::Pan {
-                        dx_px: -PAN_STEP_PX,
-                        dy_px: 0.0,
-                    }),
-                    "d" | "D" => Some(VabEvent::Pan {
-                        dx_px: PAN_STEP_PX,
-                        dy_px: 0.0,
-                    }),
-                    _ => None,
-                },
-                _ => None,
-            };
-            if let Some(ev) = vab_event {
-                self.view.vab_event(ev);
             }
             return;
         }
-        let map_event = match &event.logical_key {
-            Key::Character(c) if matches!(c.as_str(), "z" | "Z" | "x" | "X") && !event.repeat => {
-                // M4c flight throttle — the §7.6 command channel like
-                // every other mutation (logged, deterministic).
+        let Some(token) = settings_io::key_token(&event.logical_key) else {
+            return;
+        };
+        let Some(action) = self.settings.keys.action_for(&token) else {
+            return;
+        };
+        if event.repeat && !action.accepts_repeat() {
+            return;
+        }
+        self.dispatch(action);
+    }
+
+    /// Route one resolved [`KeyAction`] — mode choreography lives in
+    /// `View::set_mode`, camera input rides `View::{map,vab,flight}_event`
+    /// into the Input schedule, and sim mutations ride the §7.6-logged
+    /// command channel like every other mutation.
+    fn dispatch(&mut self, action: KeyAction) {
+        let mode = self.view.mode();
+        match action {
+            KeyAction::OpenSettings => self.view.toggle_settings_panel(),
+            KeyAction::ToggleVab => self.view.set_mode(if mode == ViewMode::Vab {
+                ViewMode::Flight
+            } else {
+                ViewMode::Vab
+            }),
+            KeyAction::ToggleMap => self.view.set_mode(if mode == ViewMode::Map {
+                ViewMode::Flight
+            } else {
+                ViewMode::Map
+            }),
+            // §2.6.3: request_step lands in the controller and becomes a
+            // logged `SetWarp` on the next decide().
+            KeyAction::WarpUp => self.warp.request_step(1),
+            KeyAction::WarpDown => self.warp.request_step(-1),
+            // M4c flight throttle — the §7.6 command channel. The VAB
+            // suppresses it (throttle is a flight verb).
+            KeyAction::ThrottleFull | KeyAction::ThrottleCut if mode != ViewMode::Vab => {
                 if let Some(vessel) = self.view.flight_focus() {
                     self.view.enqueue_command(
                         SourceClass::Ui,
                         1,
                         SimCommand::SetThrottle {
                             vessel,
-                            throttle: if c.eq_ignore_ascii_case("z") {
+                            throttle: if action == KeyAction::ThrottleFull {
                                 1.0
                             } else {
                                 0.0
@@ -714,42 +902,24 @@ impl App {
                         },
                     );
                 }
-                None
             }
-            Key::Character(c) if c.as_str() == "," && !event.repeat => {
-                self.warp.request_step(-1);
-                return;
+            KeyAction::CycleFocus if mode == ViewMode::Map => {
+                self.view.map_event(MapKeyEvent::CycleFocus)
             }
-            Key::Character(c) if c.as_str() == "." && !event.repeat => {
-                self.warp.request_step(1);
-                return;
+            KeyAction::PanUp | KeyAction::PanDown | KeyAction::PanLeft | KeyAction::PanRight => {
+                let (dx_px, dy_px) = match action {
+                    KeyAction::PanUp => (0.0, -PAN_STEP_PX),
+                    KeyAction::PanDown => (0.0, PAN_STEP_PX),
+                    KeyAction::PanLeft => (-PAN_STEP_PX, 0.0),
+                    _ => (PAN_STEP_PX, 0.0),
+                };
+                match mode {
+                    ViewMode::Map => self.view.map_event(MapKeyEvent::Pan { dx_px, dy_px }),
+                    ViewMode::Vab => self.view.vab_event(VabEvent::Pan { dx_px, dy_px }),
+                    ViewMode::Flight => {}
+                }
             }
-            Key::Character(c) if c.eq_ignore_ascii_case("m") && !event.repeat => {
-                // Mode choreography lives in View::set_mode so VAB
-                // suppression is handled in one place.
-                self.view.set_mode(if in_map {
-                    ViewMode::Flight
-                } else {
-                    ViewMode::Map
-                });
-                return;
-            }
-            Key::Named(NamedKey::Tab) if in_map => Some(MapKeyEvent::CycleFocus),
-            Key::Named(NamedKey::ArrowUp) if in_map => Some(pan(0.0, -PAN_STEP_PX)),
-            Key::Named(NamedKey::ArrowDown) if in_map => Some(pan(0.0, PAN_STEP_PX)),
-            Key::Named(NamedKey::ArrowLeft) if in_map => Some(pan(-PAN_STEP_PX, 0.0)),
-            Key::Named(NamedKey::ArrowRight) if in_map => Some(pan(PAN_STEP_PX, 0.0)),
-            Key::Character(c) if in_map => match c.as_str() {
-                "w" | "W" => Some(pan(0.0, -PAN_STEP_PX)),
-                "s" | "S" => Some(pan(0.0, PAN_STEP_PX)),
-                "a" | "A" => Some(pan(-PAN_STEP_PX, 0.0)),
-                "d" | "D" => Some(pan(PAN_STEP_PX, 0.0)),
-                _ => None,
-            },
-            _ => None,
-        };
-        if let Some(ev) = map_event {
-            self.view.map_event(ev);
+            _ => {}
         }
     }
 }
@@ -884,12 +1054,70 @@ impl ApplicationHandler for App {
     }
 }
 
+/// The §2.14 panic path: install a hook that writes a minimal
+/// bug-report bundle (no sim access inside a hook — the bundle is the
+/// panic text + system info + log tail) and then chains to the
+/// previous hook for the normal stderr report. Best-effort by
+/// contract: `write_panic_bundle` swallows its own failures.
+#[cfg(not(target_arch = "wasm32"))]
+fn install_panic_hook() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(dir) = bugreport::write_panic_bundle(
+            &bugreport::bug_report_root(),
+            &info.to_string(),
+            logring::tail(),
+        ) {
+            eprintln!("bug-report bundle written to {}", dir.display());
+        }
+        prev(info);
+    }));
+}
+
+/// The `csp --bug-report` command (§2.14): write a bundle for a fresh
+/// session headlessly and print its path. `Ok(())` → exit 0.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn bug_report_cli() -> Result<(), String> {
+    let view = View::new().map_err(|e| e.to_string())?;
+    let root = bugreport::bug_report_root();
+    let save = view
+        .sim
+        .snapshot()
+        .map_err(|e| format!("snapshot refused: {e}"))
+        .and_then(|snapshot| {
+            csp_view::save::encode_save(&csp_view::save::Save {
+                game_version: env!("CARGO_PKG_VERSION").into(),
+                label: None,
+                data_set_hash: csp_view::data_set_hash(&csp_view::data_root()).ok(),
+                snapshot,
+            })
+            .map_err(|e| e.to_string())
+        });
+    let input = bugreport::BugReportInput {
+        title: "manual report",
+        error: "requested with --bug-report".into(),
+        tick: Some(view.sim.clock().ticks()),
+        save,
+        command_log: csp_view::save::encode_command_log(view.sim.command_log())
+            .map_err(|e| e.to_string()),
+        data_set_hash: csp_view::data_set_hash(&csp_view::data_root()).ok(),
+        gpu_adapter: None,
+        gpu_backend: None,
+        log_tail: logring::tail(),
+    };
+    let dir = bugreport::write_bug_report(&root, "manual", &input)
+        .map_err(|e| format!("bundle write failed: {e}"))?;
+    println!("bug-report bundle written to {}", dir.display());
+    Ok(())
+}
+
 /// Native entry point.
 // Event-loop creation/run failure is unrecoverable startup — outside the
 // determinism domain, `expect` is the honest failure mode (§2.13).
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::expect_used)]
 pub fn run() {
+    install_panic_hook();
     let event_loop = EventLoop::new().expect("failed to create event loop");
     let mut app = App::new();
     event_loop.run_app(&mut app).expect("event loop error");
@@ -954,3 +1182,176 @@ fn save_craft_file(name: &str, bytes: &[u8]) {
 /// wasm: nothing to write — the store in `App` is the whole store.
 #[cfg(target_arch = "wasm32")]
 fn save_craft_file(_name: &str, _bytes: &[u8]) {}
+
+#[cfg(test)]
+// §2.13's no-panic rule covers shipping fallible paths; tests signal
+// failure by panicking, so unwrap/expect stays legal inside test code.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[cfg(not(target_arch = "wasm32"))]
+mod tests {
+    use super::*;
+    use csp_view::settings::{KeyAction, KeyBinding};
+
+    /// A throwaway directory per test — `std::env::temp_dir` + a unique
+    /// name (no tempfile dep).
+    fn tempdir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("csp-app-test-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn key_token_maps_characters_and_named_keys() {
+        use winit::keyboard::{Key, NamedKey, SmolStr};
+        assert_eq!(
+            settings_io::key_token(&Key::Character(SmolStr::new("M"))).as_deref(),
+            Some("m")
+        );
+        assert_eq!(
+            settings_io::key_token(&Key::Character(SmolStr::new(","))).as_deref(),
+            Some(",")
+        );
+        assert_eq!(
+            settings_io::key_token(&Key::Named(NamedKey::ArrowUp)).as_deref(),
+            Some("arrow-up")
+        );
+        assert_eq!(
+            settings_io::key_token(&Key::Named(NamedKey::Escape)).as_deref(),
+            Some("escape")
+        );
+        assert_eq!(
+            settings_io::key_token(&Key::Named(NamedKey::F5)).as_deref(),
+            Some("f5")
+        );
+        // Every produced token parses into a valid binding.
+        assert!(settings_io::binding_for(&Key::Named(NamedKey::Tab)).is_some());
+    }
+
+    #[test]
+    fn settings_file_round_trips() {
+        let dir = tempdir("settings");
+        let path = dir.join("settings.ron");
+        let mut s = Settings::default();
+        s.audio.master_volume = 0.4;
+        s.difficulty.dormant_stress = false;
+        s.keys
+            .bind(KeyAction::WarpUp, KeyBinding::parse("f7").unwrap());
+        settings_io::save_settings_to(&path, &s).unwrap();
+        assert_eq!(settings_io::load_settings_from(&path), s);
+        // Missing file → defaults (the first-run path).
+        assert_eq!(
+            settings_io::load_settings_from(&dir.join("absent.ron")),
+            Settings::default()
+        );
+        // Corrupt file → defaults + warn, never a crash.
+        std::fs::write(&path, "not ron ((").unwrap();
+        assert_eq!(settings_io::load_settings_from(&path), Settings::default());
+    }
+
+    /// The §2.14 bundle, file by file — the save inside decodes through
+    /// the §7.7 codec back to the snapshot that wrote it.
+    #[test]
+    fn bug_report_bundle_writes_all_artifacts() {
+        let dir = tempdir("bundle");
+        let snapshot = View::default().sim.snapshot().unwrap();
+        let save_bytes = csp_view::save::encode_save(&csp_view::save::Save {
+            game_version: "0.0.0".into(),
+            label: Some("crash".into()),
+            data_set_hash: None,
+            snapshot: snapshot.clone(),
+        })
+        .unwrap();
+        let input = bugreport::BugReportInput {
+            title: "fatal sim error",
+            error: "injected invariant violation (test)".into(),
+            tick: Some(snapshot.clock_ticks),
+            save: Ok(save_bytes),
+            command_log: Ok(csp_view::save::encode_command_log(&[]).unwrap()),
+            data_set_hash: Some([0x5Au8; 32]),
+            gpu_adapter: Some("test adapter".into()),
+            gpu_backend: Some("test backend".into()),
+            log_tail: vec!["info  csp: hello".into()],
+        };
+        let bundle = dir.join("report");
+        bugreport::write_bundle_dir(&bundle, &input).unwrap();
+        for name in [
+            "README.txt",
+            "error.txt",
+            "system.txt",
+            "fingerprint.json",
+            "save.cspsave",
+            "commands.bin",
+            "log.txt",
+        ] {
+            assert!(bundle.join(name).exists(), "{name} missing");
+        }
+        let decoded =
+            csp_view::save::decode_save(&std::fs::read(bundle.join("save.cspsave")).unwrap())
+                .unwrap();
+        assert_eq!(decoded.snapshot, snapshot);
+        assert_eq!(decoded.label.as_deref(), Some("crash"));
+        let err = std::fs::read_to_string(bundle.join("error.txt")).unwrap();
+        assert!(err.contains("injected invariant violation"));
+        let fp = std::fs::read_to_string(bundle.join("fingerprint.json")).unwrap();
+        assert!(fp.contains("\"save_version\": 2"));
+        assert!(fp.contains("5a5a5a5a")); // data_set_hash hex prefix
+    }
+
+    /// The §2.13 crash path end-to-end: an injected `Fatal` halts the
+    /// app, marks the session read-only, writes the bundle to the
+    /// redirected root, and mirrors the path for the crash dialog.
+    #[test]
+    fn forced_fatal_writes_bundle_and_marks_read_only() {
+        let dir = tempdir("fatal");
+        // Hermetic settings: a throwaway path — never the real
+        // `$XDG_CONFIG_HOME`, so a developer's settings file cannot
+        // change the world under test.
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        app.bug_report_root = dir.clone();
+        app.on_sim_fatal(SimError::Fatal("injected invariant violation (test)"));
+        assert!(app.read_only);
+        assert_eq!(
+            app.fatal,
+            Some(SimError::Fatal("injected invariant violation (test)"))
+        );
+        let mirror = app.view.world.resource::<csp_view::SessionMirror>();
+        assert_eq!(mirror.fatal, app.fatal);
+        let path = mirror
+            .fatal_bundle
+            .clone()
+            .expect("bundle path mirrored for the dialog");
+        let bundle = std::path::Path::new(&path);
+        assert!(bundle.join("save.cspsave").exists());
+        assert!(bundle.join("commands.bin").exists());
+        assert!(bundle.join("log.txt").exists());
+        // The bundle save decodes and restores through the §7.7 codec.
+        let decoded =
+            csp_view::save::decode_save(&std::fs::read(bundle.join("save.cspsave")).unwrap())
+                .unwrap();
+        assert_eq!(decoded.snapshot.clock_ticks, app.view.sim.clock().ticks());
+    }
+
+    /// The rebind plumbing: an armed target + a landed key updates the
+    /// staged keymap and reports the eviction.
+    #[test]
+    fn rebind_capture_updates_staged_keymap() {
+        let dir = tempdir("rebind");
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        app.view.set_rebind_target(Some(KeyAction::ThrottleFull));
+        assert_eq!(app.view.rebind_target(), Some(KeyAction::ThrottleFull));
+        app.view
+            .bind_key(KeyAction::ThrottleFull, KeyBinding::parse("w").unwrap());
+        assert_eq!(app.view.rebind_target(), None);
+        assert_eq!(
+            app.view.staged_settings().keys.action_for("w"),
+            Some(KeyAction::ThrottleFull)
+        );
+        // "w" was evicted from its default owner but the arrow
+        // alternative still pans.
+        assert_eq!(
+            app.view.staged_settings().keys.action_for("arrow-up"),
+            Some(KeyAction::PanUp)
+        );
+    }
+}

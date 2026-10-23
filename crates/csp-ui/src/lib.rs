@@ -18,6 +18,15 @@
 /// op channel, and panels.
 pub mod vab;
 
+/// The M10 settings surface (PLAN §2.1's "settings, input bindings"):
+/// the serializable [`settings::Settings`] model, the rebindable
+/// [`settings::Keymap`], and the settings panel.
+pub mod settings;
+
+pub use settings::{
+    AudioSettings, DifficultySettings, GraphicsQuality, GraphicsSettings, KeyAction, KeyBinding,
+    Keymap, Settings, SettingsPanelOutput, SettingsPanelState,
+};
 pub use vab::{ModeSelect, VabSession};
 
 /// Everything the M0 debug panel needs — mirrors and session values only.
@@ -106,6 +115,40 @@ pub fn debug_panel(
             ui.colored_label(egui::Color32::RED, format!("SIM HALTED — {reason}"));
         }
     });
+}
+
+/// The §2.13 `Fatal` surfacing (M10): a readable error window naming the
+/// halt reason and the bug-report bundle's path — the on-screen half of
+/// "abort the tick, surface a dialog, mark the session read-only, write
+/// a bug-report bundle". Drawn by `csp-view`'s `UiBuild` while the
+/// session is halted; the bundle write itself is `csp-app`'s.
+///
+/// `bundle` is the human-readable path (or the write failure's message)
+/// the app recorded.
+pub fn crash_dialog(ctx: &egui::Context, reason: &str, bundle: Option<&str>) {
+    egui::Window::new("Simulation halted")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ctx, |ui| {
+            ui.colored_label(
+                egui::Color32::RED,
+                egui::RichText::new("A fatal sim error stopped the clock.")
+                    .font(egui::FontId::proportional(15.0)),
+            );
+            ui.add_space(4.0);
+            ui.label(format!("reason: {reason}"));
+            ui.label("The session is read-only — it cannot be saved or continued.");
+            match bundle {
+                Some(path) => {
+                    ui.label("A bug-report bundle was written — send it to the developer:");
+                    ui.monospace(path);
+                }
+                None => {
+                    ui.label("Writing the bug-report bundle failed; see the log.");
+                }
+            }
+        });
 }
 
 /// One map-view label — a clip-space anchor + text, produced by

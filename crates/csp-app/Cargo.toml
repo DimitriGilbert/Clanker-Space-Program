@@ -30,6 +30,12 @@ winit = { workspace = true }
 # diagnostics (AdvanceReport) on every target — env_logger on native,
 # console_log on wasm.
 log = { workspace = true }
+# §7.8: the settings sidecar is RON, same format as data/ (native file
+# IO only — the dep itself is wasm-clean).
+ron = { workspace = true }
+# §2.14: the bug-report bundle's fingerprint sidecar is JSON like the
+# §8.4 goldens' — not in the determinism domain, caret is honest.
+serde_json = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = { workspace = true }
