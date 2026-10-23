@@ -554,6 +554,52 @@ pub(crate) fn shadow_economy(world_economy: &EconomyState, slot: &mut Option<Eco
     }
 }
 
+/// Roster bookkeeping for seats that change vessels: every member
+/// still recording `CrewLocation::Vessel(from)` re-points at `to`
+/// — the roster↔seat pairing the restore gate enforces in both
+/// directions (`location == Vessel(carrier)`), so every split/merge
+/// writer must keep the roster side true or the next snapshot
+/// `Fatal`s. Id-only `BoardCrew` members (no roster record) and
+/// members whose record already disagrees are skipped — the
+/// `location == Vessel(from)` gate is the same one the recovery
+/// path uses before writing `Unassigned`.
+pub(crate) fn reseat_roster(
+    economy: &mut EconomyState,
+    from: VesselId,
+    to: VesselId,
+    crew: &[crate::transfers::VesselCrew],
+) {
+    for c in crew {
+        if let Some(m) = economy.crew.get_mut(&c.id)
+            && m.location == CrewLocation::Vessel(from)
+        {
+            m.location = CrewLocation::Vessel(to);
+        }
+    }
+}
+
+/// Roster bookkeeping for seats that leave the simulation: every
+/// member still recording `CrewLocation::Vessel(vessel)` goes `Lost`
+/// + `Unassigned` — the `fire_vessel_ls_depleted` precedent.
+///
+/// Called by every path that destroys or removes seat-carrying mass
+/// (jettison, breakup, vessel removal) with the crew list as it was
+/// *before* the removal. Callers shadow the economy book first.
+pub(crate) fn lose_aboard_crew(
+    economy: &mut EconomyState,
+    vessel: VesselId,
+    crew: &[crate::transfers::VesselCrew],
+) {
+    for c in crew {
+        if let Some(m) = economy.crew.get_mut(&c.id)
+            && m.location == CrewLocation::Vessel(vessel)
+        {
+            m.status = CrewStatus::Lost;
+            m.location = CrewLocation::Unassigned;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // World impl — commands, the salary event, observation.
 // ---------------------------------------------------------------------------

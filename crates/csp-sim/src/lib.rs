@@ -1126,12 +1126,19 @@ impl SimCommand {
     /// the command is *control-affecting*: the flight-control surface
     /// (`SetThrottle`/`SetAttitude`/residence transitions), the
     /// part/staging actions (`JettisonPart`, `SetAeroConfig`,
-    /// `Undock`), maneuver-node scheduling, and the commands that
-    /// install or remove control programs (`LoadScript`,
-    /// `EngageAutopilot`, `DisengageAutopilot`). Everything else —
-    /// world commands, resource/crew moves, science, economy — is
-    /// ungated: it does not steer the craft, and session-class actions
-    /// have their own channels.
+    /// `Undock`), maneuver-node scheduling, the commands that install
+    /// or remove control programs (`LoadScript`, `EngageAutopilot`,
+    /// `DisengageAutopilot`), and the destructive/state-rewriting
+    /// commands that end or re-author the vessel's sim presence
+    /// (`RecoverVessel` removes it, `InstallAeroTables` swaps its
+    /// flight model, `SetVesselTracked` rewrites its pending event
+    /// classes). Resource/crew moves (`TransferResource`,
+    /// `TransferCrew`, `BoardCrew`, the colony transfers) are
+    /// deliberately ungated: they move cargo, they do not steer the
+    /// craft — and the vessel-less world commands (`SetWarp`,
+    /// `SetAlarm`, `SetLifeSupportEnabled`, science, economy) have no
+    /// vessel to gate on; session-class actions keep their own
+    /// channels.
     ///
     /// `UnloadScript`/`SetScriptEnabled` are also control-affecting —
     /// unloading a lease-holding script vacates its lease, disabling
@@ -1149,13 +1156,16 @@ impl SimCommand {
             | Self::ToRails { vessel }
             | Self::ToBubble { vessel }
             | Self::SetAeroConfig { vessel, .. }
+            | Self::InstallAeroTables { vessel, .. }
             | Self::JettisonPart { vessel, .. }
             | Self::SetManeuver { vessel, .. }
             | Self::DeleteManeuver { vessel }
             | Self::Undock { vessel, .. }
             | Self::LoadScript { vessel, .. }
             | Self::EngageAutopilot { vessel, .. }
-            | Self::DisengageAutopilot { vessel } => Some(*vessel),
+            | Self::DisengageAutopilot { vessel }
+            | Self::SetVesselTracked { vessel, .. }
+            | Self::RecoverVessel { vessel, .. } => Some(*vessel),
             _ => None,
         }
     }
@@ -3390,8 +3400,12 @@ impl World {
         let save_seed = self.save_seed;
         let mut dead_vessels: Vec<VesselId> = Vec::new();
         // M7-D: vessels that surface-latched inside this range —
-        // their contract trigger runs once `self` is whole again.
-        let mut latched_total: Vec<VesselId> = Vec::new();
+        // their contract trigger runs once `self` is whole again. A
+        // `BTreeSet`: a body whose departure is vetoed by a resting
+        // neighbor re-enters `latched_now` on later ticks, so the set
+        // dedups those repeat nominations into the one real
+        // transition `transition_latched` reports.
+        let mut latched_total: BTreeSet<VesselId> = BTreeSet::new();
         // M8-C §3.5: debris impact points (environment frame) — the
         // colony-radius damage check runs once `self` is whole again.
         let mut impacts: Vec<csp_core::DVec3> = Vec::new();
@@ -3652,8 +3666,16 @@ impl World {
             }
             // M6-A latch departure: deferred transitions evaluated
             // post-write-back (every neighbor's pose is this tick's).
-            transition_latched(vessels, physics, &latched_now, SimTime(t + 1), &rel_cfg);
-            latched_total.extend_from_slice(&latched_now);
+            // Only the ids that actually transitioned count — a
+            // vetoed departure stays `InBubble` and would double-fire
+            // the contract trigger when it later departs for real.
+            latched_total.extend(transition_latched(
+                vessels,
+                physics,
+                &latched_now,
+                SimTime(t + 1),
+                &rel_cfg,
+            ));
             // M9b §3.4: the tick's collected side-effects land at
             // `t + 1`, inside the same tick iteration — the family
             // credits are live for `t + 1`'s evaluation (the
@@ -3754,7 +3776,15 @@ impl World {
                     if let Some(pos) = vessels.get(&vid).and_then(|v| v.body().map(|b| b.pos)) {
                         impacts.push(pos);
                     }
-                    vessels.remove(&vid);
+                    // Roster half of the removal (the `remove_vessel`
+                    // rule): members still recorded aboard die with
+                    // the hull — read from the record we still hold.
+                    if let Some(gone) = vessels.remove(&vid)
+                        && !gone.crew.is_empty()
+                    {
+                        economy::shadow_economy(&self.economy, &mut shadow.economy);
+                        economy::lose_aboard_crew(&mut self.economy, vid, &gone.crew);
+                    }
                     physics.aero.remove(&vid);
                     dead_vessels.push(vid);
                     continue;
@@ -3817,7 +3847,14 @@ impl World {
                         vid,
                         shadow,
                     );
-                    vessels.remove(&vid);
+                    // Roster half of the eviction — same as the
+                    // impact removal above.
+                    if let Some(gone) = vessels.remove(&vid)
+                        && !gone.crew.is_empty()
+                    {
+                        economy::shadow_economy(&self.economy, &mut shadow.economy);
+                        economy::lose_aboard_crew(&mut self.economy, vid, &gone.crew);
+                    }
                     physics.aero.remove(&vid);
                     dead_vessels.push(vid);
                 } else {
@@ -3834,7 +3871,10 @@ impl World {
             // through its borrow-split params — capture both before
             // the pass, inline, the same way the notification/tech
             // captures above reach around the `vessels`/`physics`
-            // split (the `shadow_*` methods need a whole `self`).
+            // split (the `shadow_*` methods need a whole `self`). The
+            // roster re-seat captures `economy` lazily inside
+            // `apply_latch` — only a merge with absorbed crew mutates
+            // the book.
             if !self.joints.is_empty() {
                 if shadow.tracked_vessels.is_none() {
                     shadow.tracked_vessels = Some(self.tracked_vessels.clone());
@@ -3854,6 +3894,7 @@ impl World {
                 &self.event_heap,
                 &mut self.transfers,
                 &mut self.science,
+                &mut self.economy,
                 &self.docking,
                 t + 1,
                 degraded,
@@ -3895,9 +3936,9 @@ impl World {
         // M8-B note deferred (see `apply_surface_impacts`).
         self.apply_surface_impacts(&impacts, shadow)?;
         // M7-D: the surface latch is a contract trigger — evaluate
-        // the predicates once the vessel states have settled (the
-        // batch's latched ids are this range's, dedup'd by BTreeSet
-        // order).
+        // the predicates once the vessel states have settled. The
+        // set holds only real transitions (see `transition_latched`),
+        // dedup'd and ascending-ordered by `BTreeSet`.
         for vid in latched_total {
             self.contract_notify(&contracts::ContractTrigger::SurfaceLatched(vid), shadow)?;
         }
@@ -4008,7 +4049,18 @@ impl World {
             vessel,
             shadow,
         );
-        self.vessels.remove(&vessel);
+        let gone = self.vessels.remove(&vessel);
+        // Roster half of the removal: members still recorded aboard
+        // die with the vessel — the `fire_vessel_ls_depleted`
+        // precedent. `RecoverVessel` lands its crew `Unassigned`
+        // *before* calling here, so the helper's location gate leaves
+        // survivors alone.
+        if let Some(v) = &gone
+            && !v.crew.is_empty()
+        {
+            self.shadow_economy(shadow);
+            economy::lose_aboard_crew(&mut self.economy, vessel, &v.crew);
+        }
         self.tracked_vessels.remove(&vessel);
         // A bound autopilot must not outlive its vessel — it would
         // run a full control pass against a vessel that no longer
@@ -4412,6 +4464,13 @@ impl World {
                     // streak can't ghost-disable on the next fault.
                     s.strikes = 0;
                 }
+                // M9c: a disabled script cannot hold a lease — it can
+                // never act again, so vacate EVERY vessel it controls
+                // back to `Player` rather than stranding a craft under
+                // a dead controller (the `apply_unload_script` rule).
+                if !*enabled {
+                    self.vacate_script_lease(*script, shadow);
+                }
             }
             SimCommand::RunBenchTest {
                 site,
@@ -4468,7 +4527,11 @@ impl World {
         };
         let allowed = match v.control_lease {
             Lease::Player => matches!(src.0, SourceClass::Script | SourceClass::Autopilot),
-            Lease::Script(id) => src == (SourceClass::Script, id.0 as u32),
+            // The producer's own convention (csp-script/csp-ai stamp
+            // `script.id.0.min(u32::MAX)` into the u32 `source_id`):
+            // clamp, never `as u32` — a wrapping cast would let
+            // `Script(2³²+k)` collide with the unrelated script `k`.
+            Lease::Script(id) => src == (SourceClass::Script, id.0.min(u64::from(u32::MAX)) as u32),
             Lease::Agent(client) => src == (SourceClass::External, client),
         };
         if allowed {
@@ -4497,6 +4560,25 @@ impl World {
                 "take_control: autopilot sources hold no lease identity",
             ));
         };
+        // The target must exist — a `Script` lease names a live script
+        // record (a dead/absent one would wedge the vessel under a
+        // controller that cannot act), an `Agent` lease names a client
+        // the world has actually heard from (the drain's seq-counters
+        // are the sim's only client registry — `src`'s own entry is
+        // stamped before this apply runs, so a self-acquire always
+        // resolves). `Player` needs no holder.
+        let target_exists = match lease {
+            Lease::Player => true,
+            Lease::Script(id) => self.scripts.contains_key(&id),
+            Lease::Agent(client) => self
+                .source_seqs
+                .contains_key(&(SourceClass::External, client)),
+        };
+        if !target_exists {
+            return Err(SimError::Recoverable(
+                "take_control: lease target does not exist",
+            ));
+        }
         let allowed = me == Lease::Player // Player preempts unconditionally
             || me == current // the holder transfers/releases at will
             || (current == Lease::Player && lease == me); // vacant: acquire for self
@@ -4514,6 +4596,33 @@ impl World {
             v.control_lease = lease;
         }
         Ok(())
+    }
+
+    /// M9c: a dead or disabled script cannot hold a lease — it can
+    /// never act again, so EVERY vessel under `Lease::Script(id)`
+    /// vacates back to `Player`. Scanning the arena (not just
+    /// `scripts[id].vessel`) matters: `TakeControl` seats a script
+    /// lease on any vessel the transfer rules allow, including ones
+    /// the script is not bound to — vacating only the bound vessel
+    /// would strand the extras under a controller that no longer
+    /// exists. Shared by all three release sites:
+    /// `SetScriptEnabled{false}`, `apply_unload_script`, and
+    /// `run_script_tick`'s strike-disable (which calls it only after
+    /// its `script` borrow of the arena has ended).
+    fn vacate_script_lease(&mut self, id: ScriptId, shadow: &mut TickShadow) {
+        if !self
+            .vessels
+            .values()
+            .any(|v| v.control_lease == Lease::Script(id))
+        {
+            return;
+        }
+        self.shadow_vessels(shadow);
+        for v in self.vessels.values_mut() {
+            if v.control_lease == Lease::Script(id) {
+                v.control_lease = Lease::Player;
+            }
+        }
     }
 
     /// The M6-D transfer family, one sub-dispatch so `apply_command`'s
@@ -5779,6 +5888,8 @@ impl World {
         // M6-D: the jettisoned part's contents and seated crew leave
         // the simulation with its mass.
         v.tank_contents.remove(&node);
+        let seat_gone: Vec<transfers::VesselCrew> =
+            v.crew.iter().filter(|c| c.seat == node).copied().collect();
         v.crew.retain(|c| c.seat != node);
         // M7-A: so do its pooled data records and spent marks; a
         // project running on the jettisoned lab finalizes here —
@@ -5792,12 +5903,19 @@ impl World {
         // trips (the part instance is never reused).
         v.reliability.remove(&node);
         v.state = VesselState::InBubble(body);
+        // Roster half of the seat destruction — members in the
+        // jettisoned seat die with the part (the `remove_vessel` /
+        // LS-depletion convention).
+        if !seat_gone.is_empty() {
+            self.shadow_economy(shadow);
+            economy::lose_aboard_crew(&mut self.economy, vessel, &seat_gone);
+        }
         let departing: std::collections::BTreeSet<csp_phys::PartNodeId> =
             [node].into_iter().collect();
         let tick = self.clock.ticks();
         self.shadow_science(shadow);
         self.shadow_events(shadow);
-        let (_, banked) = self.finalize_projects_on_nodes(&departing, tick);
+        let (_, banked) = self.finalize_projects_on_nodes(vessel, &departing, tick);
         // M7-C: the jettison-finalized projects' accrual pays out —
         // science banked is science banked.
         self.credit_science_payout(banked, shadow);
@@ -5991,6 +6109,13 @@ impl World {
         // M7-C: projects finalized by the split pay their accrual out
         // at `science_funds_per_point` — the milestone edge.
         self.credit_science_payout(banked, shadow);
+        // Roster half of the seat partition: members whose seats ride
+        // the fragment re-seat onto its fresh id — the roster↔seat
+        // pairing the restore gate enforces.
+        if !frag_crew.is_empty() {
+            self.shadow_economy(shadow);
+            economy::reseat_roster(&mut self.economy, vessel, id, &frag_crew);
+        }
         self.vessels.insert(
             id,
             Vessel {
@@ -6379,6 +6504,7 @@ impl World {
         // §2.10's strike counter — a faulting call strikes, a clean
         // call resets; ≥ STRIKE_DISABLE_LIMIT consecutive disables
         // the script visibly.
+        let mut strike_disabled = false;
         match &report.fault {
             None => script.strikes = 0,
             Some(fault) => {
@@ -6402,6 +6528,7 @@ impl World {
                         ),
                     ));
                     degraded.push(SimError::Recoverable("script: disabled on strikes"));
+                    strike_disabled = true;
                 } else {
                     degraded.push(SimError::Recoverable("script: tick aborted"));
                 }
@@ -6429,6 +6556,15 @@ impl World {
         } else {
             script.consecutive_polls = 0;
             script.poll_demoted = false;
+        }
+        // M9c: a disabled script cannot hold a lease — it can never
+        // act again, so vacate EVERY vessel it controls back to
+        // `Player` rather than stranding a craft under a dead
+        // controller (the `apply_unload_script` rule). This runs last
+        // because `script` borrows the arena until here — the
+        // `&mut self` helper needs the borrow ended.
+        if strike_disabled {
+            self.vacate_script_lease(id, shadow);
         }
         Ok(())
     }
@@ -6536,29 +6672,16 @@ impl World {
         }
         self.shadow_scripts(shadow);
         self.shadow_events(shadow);
-        let bound = self.scripts.get(&id).map(|s| s.vessel);
         self.scripts.remove(&id);
         let kept: Vec<ScheduledEvent> = std::mem::take(&mut self.event_heap)
             .into_iter()
             .filter(|e| !matches!(&e.kind, EventKind::ScriptWake { script } if *script == id))
             .collect();
         self.event_heap = kept.into_iter().collect();
-        // M9c: a dead script cannot hold a lease — release the bound
-        // vessel back to `Player` so the craft is never stranded under
-        // a controller that no longer exists.
-        if let Some(vessel) = bound
-            && self
-                .vessels
-                .get(&vessel)
-                .is_some_and(|v| v.control_lease == Lease::Script(id))
-        {
-            self.shadow_vessels(shadow);
-            let v = self
-                .vessels
-                .get_mut(&vessel)
-                .ok_or(SimError::Fatal("unload: bound vessel vanished"))?;
-            v.control_lease = Lease::Player;
-        }
+        // M9c: a dead script cannot hold a lease — release EVERY
+        // vessel it controls back to `Player` so no craft is stranded
+        // under a controller that no longer exists.
+        self.vacate_script_lease(id, shadow);
         if let Some(engine) = self.script_engine.as_mut() {
             engine.unload(id);
         }
@@ -8675,14 +8798,19 @@ fn bubble_vessel_contact(
 /// support — it freezes where it lies and departs on its own turn,
 /// so a resting pair still unwinds (the top one leaves first).
 /// Runs after the write-back pass so every neighbor's pose is this
-/// tick's; `sim` stamps the captured pose.
+/// tick's; `sim` stamps the captured pose. Returns the ids that
+/// actually departed — the caller's contract-trigger list must count
+/// real transitions only: a vetoed departure stays `InBubble`, keeps
+/// re-entering `latched_now` on later ticks, and would otherwise
+/// fire the trigger before (and then again at) the real latch.
 fn transition_latched(
     vessels: &mut BTreeMap<VesselId, Vessel>,
     physics: &Physics,
     latched_now: &[VesselId],
     sim: SimTime,
     rel_cfg: &reliability::ReliabilityConfig,
-) {
+) -> Vec<VesselId> {
+    let mut transitioned = Vec::new();
     for vid in latched_now {
         let Some(vessel) = vessels.get(vid) else {
             continue;
@@ -8725,8 +8853,10 @@ fn transition_latched(
                     rec.ullage_stressed = false;
                 }
             }
+            transitioned.push(*vid);
         }
     }
+    transitioned
 }
 
 /// §2.4/§3.4 breakup: split `vessel`'s part graph at its failed
@@ -9020,6 +9150,36 @@ fn apply_breakup(
             },
         );
         frag_vid.push((id, frag_nodes.clone()));
+    }
+
+    // Roster half of the crew partition (the seat records move at the
+    // sites above and below): members whose seat rode a live fragment
+    // re-seat onto its fresh id, and members on an exploded node — or
+    // on a fragment discarded at the vessel cap — die with the part
+    // (the `fire_vessel_ls_depleted` precedent). Members on retained
+    // nodes keep `Vessel(vid)` — including every aboard member when
+    // the whole craft becomes debris below, since `removed` is empty
+    // there. Covers the thermal-root early return too: it runs next,
+    // and at that point `frag_vid` is final.
+    if !v_crew.is_empty() {
+        economy::shadow_economy(economy, &mut shadow.economy);
+        for (fid, nodes) in &frag_vid {
+            let riding: Vec<transfers::VesselCrew> = v_crew
+                .iter()
+                .filter(|c| nodes.contains(&c.seat))
+                .copied()
+                .collect();
+            economy::reseat_roster(economy, vid, *fid, &riding);
+        }
+        let lost: Vec<transfers::VesselCrew> = v_crew
+            .iter()
+            .filter(|c| {
+                removed.contains(&c.seat)
+                    && !frag_vid.iter().any(|(_, nodes)| nodes.contains(&c.seat))
+            })
+            .copied()
+            .collect();
+        economy::lose_aboard_crew(economy, vid, &lost);
     }
 
     // The retained graph — everything not detached/exploded.
@@ -14621,6 +14781,7 @@ mod tests {
         let mut degraded = Vec::new();
         let joint = joints_v[0].clone();
         let mut science = ScienceState::default();
+        let mut economy = EconomyState::default();
         let mut shadow = TickShadow {
             clock: SimTime::ZERO,
             warp_level: 1,
@@ -14666,6 +14827,7 @@ mod tests {
                 &std::collections::BinaryHeap::new(),
                 &mut BTreeMap::new(),
                 &mut science,
+                &mut economy,
                 &joint,
                 64,
                 &mut degraded,
@@ -14764,6 +14926,7 @@ mod tests {
                 &w.event_heap,
                 &mut w.transfers,
                 &mut w.science,
+                &mut w.economy,
                 joint,
                 tick,
                 &mut degraded,
@@ -15626,6 +15789,260 @@ mod tests {
         assert_eq!(transfers::vessel_capacity(frag, &res), 100.0);
         assert!(retained.crew.is_empty());
         assert_eq!(frag.crew.len(), 1, "crew rides the departing seat");
+    }
+
+    /// A two-part craft — root box + child box, one crew seat each —
+    /// for the jettison/breakup roster tests (a jettison may not drop
+    /// the root, so the doomed seat needs a non-root node).
+    fn two_part_crew_craft() -> CraftDef {
+        let mut c = box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0);
+        c.parts[0].crew_seats = 1;
+        let mut child = c.parts[0].clone();
+        child.crew_seats = 1;
+        c.graph.nodes.insert(
+            csp_phys::PartNodeId(1),
+            csp_phys::PartNode::new(
+                Some(csp_phys::PartNodeId(0)),
+                csp_phys::PartTransform::new(DVec3::new(0.0, 0.0, 1.0), DQuat::IDENTITY),
+                1,
+            ),
+        );
+        c.parts.push(child);
+        c.part_costs.push(0.0);
+        c
+    }
+
+    /// Hire a roster member and seat them aboard `vessel` at `seat`
+    /// — the roster↔seat pairing written the way the life-support
+    /// tests write it (no command seats a roster member; the roster
+    /// record and the seat record must agree by hand).
+    fn hire_and_seat(w: &mut World, vessel: VesselId, seat: csp_phys::PartNodeId) -> CrewId {
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::HireCrew {
+                name: "pilot".into(),
+                kind: CrewKind::Pilot,
+                salary_per_s: 0.0,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        let cid = CrewId(w.next_crew_id - 1);
+        w.economy.crew.get_mut(&cid).unwrap().location = CrewLocation::Vessel(vessel);
+        w.vessels
+            .get_mut(&vessel)
+            .unwrap()
+            .crew
+            .push(transfers::VesselCrew { id: cid, seat });
+        cid
+    }
+
+    /// R7-F2 regression: a roster member's `TransferCrew` landing
+    /// moves the recorded `CrewLocation` with the seat — the mirror
+    /// half of the pairing the restore gate enforces. Before the
+    /// write existed the roster kept `Vessel(source)` after the
+    /// reseat and the next snapshot `Fatal`ed.
+    #[test]
+    fn roster_crew_transfer_reseats_location() {
+        let mut w = physics_world(false);
+        let base = DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0);
+        enqueue_physical(&mut w, crew_craft(2), base);
+        enqueue_physical(&mut w, crew_craft(2), base + DVec3::new(0.0, 0.0, 50.0));
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        let cid = hire_and_seat(&mut w, VesselId(0), csp_phys::PartNodeId(0));
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::TransferCrew {
+                from_vessel: VesselId(0),
+                to_vessel: VesselId(1),
+                crew: cid,
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        w.step_frame(w.clock().ticks() + 640).unwrap();
+        assert!(
+            w.vessels()[&VesselId(1)].crew.iter().any(|c| c.id == cid),
+            "the member reseated aboard the destination"
+        );
+        assert_eq!(
+            w.economy.crew[&cid].location,
+            CrewLocation::Vessel(VesselId(1)),
+            "the roster location moves with the seat"
+        );
+        // The pairing now survives the restore gate (was Fatal).
+        let snap = w.snapshot().unwrap();
+        let r = World::restore(test_system(), w.config().physics.clone(), snap).unwrap();
+        assert_eq!(r.state_hash().unwrap(), w.state_hash().unwrap());
+    }
+
+    /// R7-F2 regression: jettisoning a crewed part kills the roster
+    /// member — `Lost` + `Unassigned`, the LS-depletion convention.
+    #[test]
+    fn roster_jettison_marks_lost() {
+        let mut w = physics_world(false);
+        enqueue_physical(
+            &mut w,
+            two_part_crew_craft(),
+            DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0),
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        let cid = hire_and_seat(&mut w, VesselId(0), csp_phys::PartNodeId(1));
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::JettisonPart {
+                vessel: VesselId(0),
+                node: csp_phys::PartNodeId(1),
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        assert!(w.vessels()[&VesselId(0)].crew.is_empty());
+        let m = &w.economy.crew[&cid];
+        assert_eq!(m.status, CrewStatus::Lost);
+        assert_eq!(m.location, CrewLocation::Unassigned);
+        // And nothing dangles for the restore gate to trip on.
+        let snap = w.snapshot().unwrap();
+        World::restore(test_system(), w.config().physics.clone(), snap).unwrap();
+    }
+
+    /// R7-F2 regression: §2.4 breakup re-seats fragment-bound members
+    /// onto the fragment's id and kills members on exploded nodes —
+    /// a thermal root failure runs both halves at once.
+    #[test]
+    fn roster_breakup_reseats_fragment_and_marks_lost() {
+        let mut w = physics_world(false);
+        enqueue_physical(
+            &mut w,
+            two_part_crew_craft(),
+            DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0),
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        let doomed = hire_and_seat(&mut w, VesselId(0), csp_phys::PartNodeId(0));
+        let rider = hire_and_seat(&mut w, VesselId(0), csp_phys::PartNodeId(1));
+        // The root explodes: the child's subtree detaches as debris,
+        // then the `all removed` check destroys the parent outright.
+        let mut dead = Vec::new();
+        let mut shadow = TickShadow::capture(&w);
+        apply_breakup(
+            &mut w.vessels,
+            w.physics.as_mut().unwrap(),
+            &mut w.next_vessel_id,
+            w.caps,
+            w.builds.len() as u64,
+            &mut w.science,
+            &w.science_cfg,
+            &mut w.economy,
+            &w.economy_cfg,
+            &mut w.event_heap,
+            w.next_event_seq,
+            VesselId(0),
+            &[],
+            &[csp_phys::PartNodeId(0)],
+            w.clock.ticks(),
+            &mut dead,
+            &mut shadow,
+        )
+        .unwrap();
+        assert_eq!(dead, vec![VesselId(0)]);
+        assert!(!w.vessels().contains_key(&VesselId(0)));
+        let frag = VesselId(1);
+        assert!(
+            w.vessels().contains_key(&frag),
+            "the child rides a fragment"
+        );
+        assert!(
+            w.vessels()[&frag].crew.iter().any(|c| c.id == rider),
+            "the child-seat member rides the fragment"
+        );
+        assert_eq!(
+            w.economy.crew[&rider].location,
+            CrewLocation::Vessel(frag),
+            "the fragment rider's roster location re-seats"
+        );
+        let m = &w.economy.crew[&doomed];
+        assert_eq!(m.status, CrewStatus::Lost);
+        assert_eq!(m.location, CrewLocation::Unassigned);
+        let snap = w.snapshot().unwrap();
+        World::restore(test_system(), w.config().physics.clone(), snap).unwrap();
+    }
+
+    /// R7-F2 regression: the latch merge re-seats the absorbed
+    /// vessel's roster members onto the surviving primary.
+    #[test]
+    fn roster_latch_reseats_absorbed_crew() {
+        let mut w = physics_world(false);
+        spawn_port_tank_pair(&mut w);
+        let cid = hire_and_seat(&mut w, VesselId(1), csp_phys::PartNodeId(0));
+        step_until(&mut w, 192, |w| w.joints().is_empty());
+        assert_eq!(w.vessels().len(), 1, "the pair must merge");
+        assert_eq!(
+            w.economy.crew[&cid].location,
+            CrewLocation::Vessel(VesselId(0)),
+            "the absorbed member's roster location follows the merge"
+        );
+        let snap = w.snapshot().unwrap();
+        let r = World::restore(test_system(), w.config().physics.clone(), snap).unwrap();
+        assert_eq!(r.state_hash().unwrap(), w.state_hash().unwrap());
+    }
+
+    /// R7-F2 regression: `remove_vessel` (the DebrisDecay / SOI-escape
+    /// / recovery tail) kills roster members still recorded aboard.
+    #[test]
+    fn roster_removal_marks_lost() {
+        let mut w = physics_world(false);
+        enqueue_physical(
+            &mut w,
+            crew_craft(1),
+            DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0),
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        let cid = hire_and_seat(&mut w, VesselId(0), csp_phys::PartNodeId(0));
+        let mut shadow = TickShadow::capture(&w);
+        w.remove_vessel(VesselId(0), &mut shadow);
+        let m = &w.economy.crew[&cid];
+        assert_eq!(m.status, CrewStatus::Lost);
+        assert_eq!(m.location, CrewLocation::Unassigned);
+    }
+
+    /// R10-F1 regression: finalizing a node set touches only the
+    /// named vessel's projects — `PartNodeId`s are per-craft, so a
+    /// jettison on A must not kill B's project that shares the id.
+    #[test]
+    fn finalize_projects_on_nodes_is_vessel_scoped() {
+        let mut w = World::new();
+        let key = |n: u64| ResearchProject {
+            id: ResearchId(n),
+            vessel: VesselId(n),
+            lab_node: csp_phys::PartNodeId(0),
+            key: DataKey {
+                experiment: ExperimentId::from("e"),
+                body: BodyId::from("b"),
+                biome: BiomeId::from(""),
+                situation: Situation::SpaceLow,
+            },
+            researchers: vec![],
+            rate_science_per_s: 1.0,
+            throughput_data_per_s: 1.0,
+            start_tick: 0,
+            data_start: 10.0,
+            exhaust_tick: 1,
+        };
+        w.science.projects.insert(ResearchId(0), key(0));
+        w.science.projects.insert(ResearchId(1), key(1));
+        let nodes: BTreeSet<csp_phys::PartNodeId> = [csp_phys::PartNodeId(0)].into_iter().collect();
+        let (_, banked) = w.finalize_projects_on_nodes(VesselId(0), &nodes, 100);
+        assert!(banked > 0.0);
+        assert!(
+            !w.science.projects.contains_key(&ResearchId(0)),
+            "the jettisoning vessel's project finalized"
+        );
+        assert!(
+            w.science.projects.contains_key(&ResearchId(1)),
+            "the other vessel's same-node project survives"
+        );
     }
 
     /// §3.5's verbatim clause: two surface-latched vessels on the
@@ -17536,19 +17953,30 @@ mod tests {
         #[test]
         fn script_lease_is_exclusive() {
             let mut w = leased_world();
-            // The player grants the lease to script 2 (Ui preempts).
+            // The lease must name a live script record — load one,
+            // then the player grants it the lease (Ui preempts).
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::LoadScript {
+                    vessel: VesselId(0),
+                    source: "fn on_tick(ctx) {}".to_string(),
+                },
+            );
+            drain(&mut w);
+            let script = *w.scripts().keys().next().unwrap();
             w.enqueue(
                 SourceClass::Ui,
                 0,
                 SimCommand::TakeControl {
                     vessel: VesselId(0),
-                    lease: Lease::Script(ScriptId(2)),
+                    lease: Lease::Script(script),
                 },
             );
             drain(&mut w);
             w.enqueue(
                 SourceClass::Script,
-                2,
+                script.0 as u32,
                 SimCommand::SetThrottle {
                     vessel: VesselId(0),
                     throttle: 0.6,
@@ -17612,6 +18040,246 @@ mod tests {
             assert_eq!(w.vessels()[&VesselId(0)].control_lease, Lease::Script(id));
             w.enqueue(SourceClass::Ui, 0, SimCommand::UnloadScript { script: id });
             drain(&mut w);
+            assert_eq!(w.vessels()[&VesselId(0)].control_lease, Lease::Player);
+        }
+
+        /// `SetScriptEnabled{false}` releases a `Script(_)` lease the
+        /// same way — a disabled script can never act again, so it
+        /// cannot strand the craft under a dead controller.
+        #[test]
+        fn disabled_script_releases_lease() {
+            let mut w = World::with_system(test_system());
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::SpawnVessel {
+                    parent: BodyId::from("p"),
+                    elements: leo_elements(),
+                },
+            );
+            drain(&mut w);
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::LoadScript {
+                    vessel: VesselId(0),
+                    source: "fn on_tick(ctx) {}".to_string(),
+                },
+            );
+            drain(&mut w);
+            let id = *w.scripts().keys().next().unwrap();
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::TakeControl {
+                    vessel: VesselId(0),
+                    lease: Lease::Script(id),
+                },
+            );
+            drain(&mut w);
+            assert_eq!(w.vessels()[&VesselId(0)].control_lease, Lease::Script(id));
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::SetScriptEnabled {
+                    script: id,
+                    enabled: false,
+                },
+            );
+            drain(&mut w);
+            assert!(!w.scripts()[&id].enabled);
+            assert_eq!(
+                w.vessels()[&VesselId(0)].control_lease,
+                Lease::Player,
+                "disabling the holder must vacate its lease"
+            );
+        }
+
+        /// A fault-every-tick stub engine — the strike-disable path
+        /// needs a script whose `on_tick` fails until
+        /// `STRIKE_DISABLE_LIMIT` consecutive strikes disable it.
+        struct FaultEngine;
+        impl ScriptEngine for FaultEngine {
+            fn prepare(&mut self, _id: ScriptId, _source: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn run_tick(
+                &mut self,
+                _script: &mut ScriptState,
+                _tick: u64,
+                _io: &mut dyn TickIo,
+            ) -> ScriptRunReport {
+                ScriptRunReport {
+                    ops_used: 5,
+                    fault: Some(ScriptFault::Runtime("boom".to_string())),
+                }
+            }
+            fn unload(&mut self, _id: ScriptId) {}
+        }
+
+        /// The strike path is a disable too: `STRIKE_DISABLE_LIMIT`
+        /// consecutive faults auto-disable the script and the release
+        /// rule is the same — EVERY vessel under `Lease::Script(id)`
+        /// vacates, not only the script's bound vessel. Here the
+        /// script is bound to vessel 0 but also holds vessel 1 (a
+        /// `TakeControl` may seat a script on any vessel); a bound-
+        /// vessel-only vacate would strand vessel 1 under the dead
+        /// controller.
+        #[test]
+        fn strike_disable_releases_lease() {
+            let mut w = physics_world(false);
+            w.set_script_engine(Box::new(FaultEngine));
+            enqueue_orbiter(&mut w);
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::SpawnVessel {
+                    parent: BodyId::from("p"),
+                    elements: leo_elements(),
+                },
+            );
+            w.step_frame(1).unwrap();
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::LoadScript {
+                    vessel: VesselId(0),
+                    source: "stub".to_string(),
+                },
+            );
+            w.step_frame(2).unwrap();
+            let id = *w.scripts().keys().next().unwrap();
+            assert_eq!(w.scripts()[&id].vessel, VesselId(0));
+            // Seat the script on BOTH vessels — vessel 1 is not its
+            // bound vessel (Ui preempts unconditionally).
+            for vessel in [VesselId(0), VesselId(1)] {
+                w.enqueue(
+                    SourceClass::Ui,
+                    0,
+                    SimCommand::TakeControl {
+                        vessel,
+                        lease: Lease::Script(id),
+                    },
+                );
+            }
+            w.step_frame(3).unwrap();
+            for vessel in [VesselId(0), VesselId(1)] {
+                assert_eq!(w.vessels()[&vessel].control_lease, Lease::Script(id));
+            }
+            // One strike per bubble tick on the bound vessel; the
+            // limit disables the script mid-iteration.
+            let mut t = w.clock().ticks();
+            while w.scripts()[&id].enabled {
+                t += 1;
+                w.step_frame(t).unwrap();
+                assert!(t < 100, "the strike limit must arrive");
+            }
+            assert_eq!(w.scripts()[&id].strikes, STRIKE_DISABLE_LIMIT);
+            for vessel in [VesselId(0), VesselId(1)] {
+                assert_eq!(
+                    w.vessels()[&vessel].control_lease,
+                    Lease::Player,
+                    "a strike-disabled script must vacate every lease it holds"
+                );
+            }
+        }
+
+        /// The gate covers the destructive/state-rewriting commands
+        /// too: `RecoverVessel`, `InstallAeroTables`, and
+        /// `SetVesselTracked` are control-affecting — a non-leaseholder
+        /// rejects on all three while `Agent(3)` holds the lease.
+        #[test]
+        fn gated_commands_reject_non_leaseholders() {
+            let mut w = leased_world();
+            w.enqueue(
+                SourceClass::External,
+                3,
+                SimCommand::TakeControl {
+                    vessel: VesselId(0),
+                    lease: Lease::Agent(3),
+                },
+            );
+            drain(&mut w);
+            assert_eq!(w.vessels()[&VesselId(0)].control_lease, Lease::Agent(3));
+            // A real (if hash-mismatched) table — irrelevant either
+            // way: the lease gate runs before the apply's own
+            // validation, so the rejection is always the lease error.
+            let v = &w.vessels()[&VesselId(0)];
+            let craft = v.craft.as_ref().unwrap();
+            let tables = csp_phys::build_aero_tables(
+                v.body().unwrap(),
+                &craft.graph,
+                &craft.parts,
+                csp_phys::ConfigMask::ALL,
+                0,
+            )
+            .unwrap();
+            for command in [
+                SimCommand::SetVesselTracked {
+                    vessel: VesselId(0),
+                    tracked: true,
+                },
+                SimCommand::InstallAeroTables {
+                    vessel: VesselId(0),
+                    mask: csp_phys::ConfigMask::ALL,
+                    tables,
+                },
+                SimCommand::RecoverVessel {
+                    vessel: VesselId(0),
+                    site: None,
+                },
+            ] {
+                // Client 4 — a non-holder — plus a stray Script source:
+                // both must reject.
+                w.enqueue(SourceClass::External, 4, command.clone());
+                w.enqueue(SourceClass::Script, 9, command);
+            }
+            let r = drain(&mut w);
+            assert_eq!(r.commands_applied, 0);
+            assert_eq!(r.rejected.len(), 6);
+            assert!(
+                r.rejected.iter().all(
+                    |rej| matches!(rej.error, SimError::Recoverable(m) if m.contains("lease"))
+                ),
+                "every rejection must be the lease gate: {:?}",
+                r.rejected
+            );
+            // Nothing applied: the vessel is neither recovered nor
+            // untracked state-changed, and the lease stands.
+            assert!(w.vessels().contains_key(&VesselId(0)));
+            assert_eq!(w.vessels()[&VesselId(0)].control_lease, Lease::Agent(3));
+        }
+
+        /// `TakeControl` validates its target: a `Script` lease must
+        /// name a live script record, an `Agent` lease a client the
+        /// world has heard from — both reject `Recoverable` otherwise
+        /// (a phantom `Script` lease would wedge the vessel under a
+        /// controller that cannot act).
+        #[test]
+        fn take_control_rejects_nonexistent_targets() {
+            let mut w = leased_world();
+            for lease in [
+                Lease::Script(ScriptId(9_999)),
+                Lease::Script(ScriptId(u64::from(u32::MAX) + 1)),
+                Lease::Agent(99),
+            ] {
+                w.enqueue(
+                    SourceClass::Ui,
+                    0,
+                    SimCommand::TakeControl {
+                        vessel: VesselId(0),
+                        lease,
+                    },
+                );
+            }
+            let r = drain(&mut w);
+            assert_eq!(r.commands_applied, 0);
+            assert_eq!(r.rejected.len(), 3);
+            assert!(
+                r.rejected.iter().all(
+                    |rej| matches!(rej.error, SimError::Recoverable(m) if m.contains("target"))
+                )
+            );
             assert_eq!(w.vessels()[&VesselId(0)].control_lease, Lease::Player);
         }
 

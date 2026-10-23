@@ -1125,6 +1125,21 @@ impl World {
                         .get_mut(&t)
                         .ok_or(SimError::Fatal("transfer: destination vanished mid-fire"))?;
                     dst.crew.push(VesselCrew { id: crew, seat });
+                    // The roster half of the re-seat — the `Colony`
+                    // arms' pairing: the member's recorded location
+                    // moves with the seat, keeping the roster↔seat
+                    // invariant the restore gate checks.
+                    if self
+                        .economy
+                        .crew
+                        .get(&crew)
+                        .is_some_and(|m| m.location == crate::economy::CrewLocation::Vessel(f))
+                    {
+                        self.shadow_economy(shadow);
+                        if let Some(m) = self.economy.crew.get_mut(&crew) {
+                            m.location = crate::economy::CrewLocation::Vessel(t);
+                        }
+                    }
                 }
             }
             // vessel → colony: the member leaves its seat for the

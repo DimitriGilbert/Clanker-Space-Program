@@ -786,6 +786,7 @@ pub(crate) fn apply_latch(
     event_heap: &BinaryHeap<ScheduledEvent>,
     transfers: &mut BTreeMap<TransferId, ActiveTransfer>,
     science: &mut crate::research::ScienceState,
+    economy: &mut crate::economy::EconomyState,
     joint: &LiveJoint,
     tick: u64,
     degraded: &mut Vec<SimError>,
@@ -1080,8 +1081,10 @@ pub(crate) fn apply_latch(
     // node on the secondary dies with its id (the merged vessel keeps
     // the PRIMARY's maneuver), and a debris counter that was counting
     // the absorbed vessel simply stops — the mass is in the merged
-    // body now, not orbiting as debris.
-    vessels.remove(&sec);
+    // body now, not orbiting as debris. The record's crew list still
+    // names the seats the merge just pooled — the roster re-seat
+    // below reads it.
+    let absorbed = vessels.remove(&sec);
     // M9a §2.10 note: a bound autopilot keyed on `sec` survives the
     // absorb — it goes inert (the bound vessel's telemetry no longer
     // resolves, so `control_tick` skips it) and merges it with the
@@ -1094,6 +1097,16 @@ pub(crate) fn apply_latch(
     // merged survivor — its tanks (and the reservation they held)
     // traveled with the merge.
     crate::transfers::remap_transfer_vessels(transfers, sec, prim);
+    // Roster half of the seat merge: the absorbed vessel's members
+    // re-seat onto the surviving primary — the `split`/fragment
+    // path's mirror, keeping the roster↔seat pairing the restore
+    // gate enforces.
+    if let Some(vs) = &absorbed
+        && !vs.crew.is_empty()
+    {
+        crate::economy::shadow_economy(economy, &mut shadow.economy);
+        crate::economy::reseat_roster(economy, sec, prim, &vs.crew);
+    }
     physics.aero.remove(&prim);
     physics.aero.remove(&sec);
     // The seam's own joint is consumed; any other joint touching the
@@ -1129,6 +1142,7 @@ pub(crate) fn latch_pass(
     event_heap: &BinaryHeap<ScheduledEvent>,
     transfers: &mut BTreeMap<TransferId, ActiveTransfer>,
     science: &mut crate::research::ScienceState,
+    economy: &mut crate::economy::EconomyState,
     cfg: &DockingConfig,
     tick: u64,
     degraded: &mut Vec<SimError>,
@@ -1142,8 +1156,8 @@ pub(crate) fn latch_pass(
         }
         let joint = joints[i].clone();
         if apply_latch(
-            vessels, physics, joints, refused, tracked, event_heap, transfers, science, &joint,
-            tick, degraded, shadow,
+            vessels, physics, joints, refused, tracked, event_heap, transfers, science, economy,
+            &joint, tick, degraded, shadow,
         )? {
             // The merge removed the consumed joint — and every other
             // joint touching the absorbed vessel, at any index —

@@ -1132,15 +1132,20 @@ impl World {
         shadow_science(&self.science, &mut shadow.science);
     }
 
-    /// Jettison/split bookkeeping: finalize every project whose lab
-    /// node is in `nodes` — accrue science to `tick`, drop the record
-    /// and its pending events, and return `(remnants, banked_total)`:
-    /// each `(lab_node, key, units)` remnant for the caller to place
-    /// (or discard — jettison loses them: the escrowed data leaves
-    /// with the part) plus the summed accrual so the caller can
-    /// credit the §3.5 milestone payout.
+    /// Jettison/split bookkeeping: finalize every project ON `vessel`
+    /// whose lab node is in `nodes` — accrue science to `tick`, drop
+    /// the record and its pending events, and return `(remnants,
+    /// banked_total)`: each `(lab_node, key, units)` remnant for the
+    /// caller to place (or discard — jettison loses them: the
+    /// escrowed data leaves with the part) plus the summed accrual so
+    /// the caller can credit the §3.5 milestone payout. The vessel
+    /// scope matters: `PartNodeId`s are only unique within one craft,
+    /// so node `N` leaving vessel A must not touch another vessel's
+    /// project that happens to share the id (the
+    /// [`split_vessel_science`] `p.vessel == vessel` rule).
     pub(crate) fn finalize_projects_on_nodes(
         &mut self,
+        vessel: VesselId,
         nodes: &BTreeSet<PartNodeId>,
         tick: u64,
     ) -> (Vec<(PartNodeId, DataKey, f64)>, f64) {
@@ -1148,7 +1153,7 @@ impl World {
             .science
             .projects
             .values()
-            .filter(|p| nodes.contains(&p.lab_node))
+            .filter(|p| p.vessel == vessel && nodes.contains(&p.lab_node))
             .map(|p| p.id)
             .collect();
         let mut out = Vec::new();
