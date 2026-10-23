@@ -75,7 +75,12 @@ bevy_ecs = { version = "0.20.0", default-features = false }
 # wgpu; declared so csp-render's vertex structs can derive Pod.
 bytemuck = { version = "1", features = ["derive"] }
 wgpu = { version = "30", default-features = true }
-egui = "0.37.0"
+# `default_fonts` is explicit: egui 0.37's `default` feature is EMPTY —
+# without it no font data is bundled and the first text layout panics
+# ("No font provider has any font for FontFamily::Proportional").
+# `epaint_default_fonts` is pure embedded data — wasm-safe (egui's own
+# web demo ships it).
+egui = { version = "0.37.0", features = ["default_fonts"] }
 egui-wgpu = "0.37.0"
 egui-winit = { version = "0.37.0", default-features = false }
 winit = "0.30.13"

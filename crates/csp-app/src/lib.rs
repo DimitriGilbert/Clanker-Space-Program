@@ -968,7 +968,7 @@ impl App {
             let mut pass = frame
                 .encoder
                 .begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("main"),
+                    label: Some("scene"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &frame.view,
                         resolve_target: None,
@@ -983,13 +983,18 @@ impl App {
                         },
                         depth_slice: None,
                     })],
-                    // The VAB renderer owns the depth target (reverse-Z:
-                    // clear 0.0 = far, `Greater` wins). Map/egui
-                    // pipelines carry no depth state and ignore it.
-                    depth_stencil_attachment: (if self.view.mode() == ViewMode::Flight {
-                        self.flight_renderer.as_ref().map(|v| v.depth_view())
-                    } else {
-                        self.vab_renderer.as_ref().map(|v| v.depth_view())
+                    // Depth belongs only to the modes whose pipelines
+                    // declare it — the VAB and flight renderers each own a
+                    // surface-sized target (reverse-Z: clear 0.0 = far,
+                    // `Greater` wins). Map's pipelines carry no depth
+                    // state, and wgpu validates pass/pipeline depth
+                    // compatibility exactly: a no-depth pipeline in a
+                    // depth-attached pass is a validation error, so Map
+                    // gets `None` here.
+                    depth_stencil_attachment: (match self.view.mode() {
+                        ViewMode::Flight => self.flight_renderer.as_ref().map(|v| v.depth_view()),
+                        ViewMode::Vab => self.vab_renderer.as_ref().map(|v| v.depth_view()),
+                        ViewMode::Map => None,
                     })
                     .map(|view| wgpu::RenderPassDepthStencilAttachment {
                         view,
@@ -1021,6 +1026,33 @@ impl App {
                 }
                 f.draw(&mut pass, &gpu.device, &gpu.queue, packet);
             }
+        }
+
+        // egui paints in a second pass of its own: its pipeline declares
+        // no depth state (`RendererOptions::default().depth_stencil_format
+        // = None`), and wgpu requires pass/pipeline depth formats to match
+        // — drawing it inside the scene pass fails validation whenever a
+        // depth target is attached. `LoadOp::Load` composites the UI over
+        // the scene; no depth attachment.
+        {
+            let pass = frame
+                .encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("ui"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &frame.view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
             egui_renderer.render(&mut pass.forget_lifetime(), &tris, &screen);
             drop(cmds); // user command buffers currently unused
         }
