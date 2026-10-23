@@ -118,8 +118,8 @@ pub enum VabError {
     Session(csp_phys::session::SessionError),
     /// A craft file failed to decode.
     CraftFile(csp_phys::session::CraftFileError),
-    /// The part catalog isn't loaded (wasm slice at M3 ships without
-    /// `data/`; an empty catalog refuses placement ops).
+    /// The part catalog isn't loaded (a catalog-less headless session;
+    /// an empty catalog refuses placement ops).
     NoCatalog,
     /// The op needs a selected part and none is selected.
     NoSelection,
@@ -137,6 +137,17 @@ pub enum VabError {
         /// The parent it was tried under.
         parent: PartNodeId,
     },
+    /// A placement (or a loaded craft) would exceed the session's part
+    /// limit — the §6.3 web-demo cap is the only producer at v1.
+    PartLimit {
+        /// The configured cap.
+        limit: usize,
+        /// What the op would have produced.
+        count: usize,
+    },
+    /// Craft-file import is disabled for this session — the §6.3
+    /// demo's no-save rule (`VabAction::LoadBytes` is refused).
+    FileIoDisabled,
 }
 
 impl fmt::Display for VabError {
@@ -153,6 +164,12 @@ impl fmt::Display for VabError {
                 f,
                 "no compatible attach node pair for {part} under {parent:?}"
             ),
+            Self::PartLimit { limit, count } => {
+                write!(f, "part limit {limit} exceeded ({count} parts)")
+            }
+            Self::FileIoDisabled => {
+                write!(f, "craft file import/export is disabled in the web demo")
+            }
         }
     }
 }
@@ -160,9 +177,8 @@ impl fmt::Display for VabError {
 impl std::error::Error for VabError {}
 
 /// The VAB working session — see the module doc. `Default` is an empty
-/// session with no catalog (the wasm/headless state; the panel reports
-/// "catalog not loaded").
-#[derive(Default)]
+/// session with no catalog (the headless state; the panel reports
+/// "catalog not loaded"), no part cap, and file IO allowed.
 pub struct VabSession {
     session: CraftSession,
     catalog: Option<LoadedParts>,
@@ -188,6 +204,36 @@ pub struct VabSession {
     stress_probe: csp_phys::RegimeMetrics,
     /// The save-slot name the file field edits (persists across saves).
     pub save_name: String,
+    /// §6.3's demo cap — `Some(n)` refuses a placement that would take
+    /// the craft past `n` parts and a `LoadBytes` whose file carries
+    /// more. `None` is uncapped (the desktop default).
+    part_limit: Option<usize>,
+    /// §6.3's no-save rule — `false` refuses `VabAction::LoadBytes` and
+    /// hides the panel's save/load row. `true` is the desktop default.
+    file_io: bool,
+}
+
+impl Default for VabSession {
+    /// The desktop defaults: uncapped, file IO allowed.
+    fn default() -> Self {
+        Self {
+            session: CraftSession::default(),
+            catalog: None,
+            resources: None,
+            profile: MissionProfile::default(),
+            selected: None,
+            notice: None,
+            dirty: false,
+            analysis: None,
+            analysis_error: None,
+            validation: None,
+            body_xforms: BTreeMap::new(),
+            stress_probe: csp_phys::RegimeMetrics::default(),
+            save_name: String::new(),
+            part_limit: None,
+            file_io: true,
+        }
+    }
 }
 
 impl VabSession {
@@ -278,6 +324,40 @@ impl VabSession {
         self.catalog.as_ref()
     }
 
+    /// Set the session's part cap — `Some(n)` is the §6.3 demo's ≤60
+    /// rule; `None` restores the uncapped desktop behavior.
+    pub fn set_part_limit(&mut self, limit: Option<usize>) {
+        self.part_limit = limit;
+    }
+
+    /// The configured part cap, if any.
+    pub fn part_limit(&self) -> Option<usize> {
+        self.part_limit
+    }
+
+    /// Enable/disable craft-file import/export — §6.3's "no save" rule.
+    /// `false` refuses [`VabAction::LoadBytes`] and hides the panel's
+    /// file row (the app additionally drops save/load outbox requests).
+    pub fn set_file_io(&mut self, allowed: bool) {
+        self.file_io = allowed;
+    }
+
+    /// Whether craft-file import/export is enabled.
+    pub fn file_io(&self) -> bool {
+        self.file_io
+    }
+
+    /// The §6.3 cap check — refuses when `count` parts exceeds the
+    /// session's configured limit.
+    fn check_part_count(&self, count: usize) -> Result<(), VabError> {
+        if let Some(limit) = self.part_limit
+            && count > limit
+        {
+            return Err(VabError::PartLimit { limit, count });
+        }
+        Ok(())
+    }
+
     /// Recompute the readout/validation/transforms when the session
     /// changed — the §2.5-friendly "not per frame" cadence the M3 row
     /// asks for. Cheap when clean; honest cost when dirty.
@@ -320,6 +400,7 @@ impl VabSession {
                 self.dirty = true;
             }
             VabAction::SetRoot(part_id) => {
+                self.check_part_count(self.session.len() + 1)?;
                 let defs = self.catalog.as_ref().ok_or(VabError::NoCatalog)?;
                 let built = self.stock_build(&part_id)?;
                 let id = self
@@ -330,6 +411,7 @@ impl VabSession {
                 self.dirty = true;
             }
             VabAction::AttachAuto { part, parent } => {
+                self.check_part_count(self.session.len() + 1)?;
                 let id = self.attach_auto(&part, parent)?;
                 self.selected = Some(id);
                 self.dirty = true;
@@ -372,7 +454,15 @@ impl VabSession {
                 self.session.set_name(name);
             }
             VabAction::LoadBytes(bytes) => {
-                self.session = CraftSession::from_bytes(&bytes).map_err(VabError::CraftFile)?;
+                // §6.3's no-save rule — craft-file import is off in the
+                // demo build (`file_io`), and a loaded craft counts
+                // against the same part cap as a built one.
+                if !self.file_io {
+                    return Err(VabError::FileIoDisabled);
+                }
+                let session = CraftSession::from_bytes(&bytes).map_err(VabError::CraftFile)?;
+                self.check_part_count(session.len())?;
+                self.session = session;
                 self.selected = None;
                 self.dirty = true;
             }
@@ -700,9 +790,14 @@ fn craft_section(
         let _ = vab.apply(VabAction::Rename(name.clone()));
     }
     if let Some(a) = vab.analysis() {
+        let cap = vab
+            .part_limit()
+            .map(|l| format!("/{l}"))
+            .unwrap_or_default();
         ui.label(format!(
-            "parts {} · dry+wet {:.1} t · cost {:.0}",
+            "parts {}{} · dry+wet {:.1} t · cost {:.0}",
             a.effective.len(),
+            cap,
             a.launch_mass_kg / 1000.0,
             a.cost_funds,
         ));
@@ -785,24 +880,30 @@ fn craft_section(
     });
 
     // Craft file IO — the bytes ride the outbox; the app owns the
-    // file store.
-    ui.horizontal(|ui| {
-        ui.label("save as");
-        ui.add(egui::TextEdit::singleline(&mut vab.save_name).desired_width(120.0));
-        if ui.button("Save").clicked() && !vab.save_name.is_empty() {
-            out.save_name = Some(vab.save_name.clone());
-        }
-    });
-    if !craft_files.is_empty() {
-        egui::ComboBox::from_label("load craft")
-            .selected_text("…")
-            .show_ui(ui, |ui| {
-                for f in craft_files {
-                    if ui.selectable_label(false, f).clicked() {
-                        out.load_name = Some(f.clone());
+    // file store. §6.3: hidden entirely in the demo build (no save
+    // import/export); the session refuses the ops too — this row is
+    // the honest UI reflection of that rule, not the enforcement.
+    if vab.file_io() {
+        ui.horizontal(|ui| {
+            ui.label("save as");
+            ui.add(egui::TextEdit::singleline(&mut vab.save_name).desired_width(120.0));
+            if ui.button("Save").clicked() && !vab.save_name.is_empty() {
+                out.save_name = Some(vab.save_name.clone());
+            }
+        });
+        if !craft_files.is_empty() {
+            egui::ComboBox::from_label("load craft")
+                .selected_text("…")
+                .show_ui(ui, |ui| {
+                    for f in craft_files {
+                        if ui.selectable_label(false, f).clicked() {
+                            out.load_name = Some(f.clone());
+                        }
                     }
-                }
-            });
+                });
+        }
+    } else {
+        ui.weak("craft save/load is off in the web demo");
     }
     if ui.button("New craft").clicked() {
         let _ = vab.apply(VabAction::New);
@@ -1325,5 +1426,84 @@ mod tests {
         });
         assert!(r.is_err());
         assert!(vab.notice().is_some());
+    }
+
+    /// §6.3's part cap: placements that would take the craft past the
+    /// configured limit are refused (`PartLimit`), at the limit
+    /// still pass, and the refusal lands in `notice` like every op
+    /// failure.
+    #[test]
+    fn part_limit_refuses_past_the_cap() {
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        vab.set_part_limit(Some(2));
+        assert_eq!(vab.part_limit(), Some(2));
+        vab.apply(VabAction::SetRoot(PartId::from("t.tank")))
+            .unwrap();
+        let root = vab.session().root().unwrap();
+        // Second part — at the cap — still passes.
+        vab.apply(VabAction::AttachAuto {
+            part: PartId::from("t.tank"),
+            parent: root,
+        })
+        .unwrap();
+        assert_eq!(vab.session().len(), 2);
+        // Third part — past the cap — refuses with PartLimit.
+        let parent = vab.selected().unwrap();
+        let r = vab.apply(VabAction::AttachAuto {
+            part: PartId::from("t.eng"),
+            parent,
+        });
+        assert_eq!(r, Err(VabError::PartLimit { limit: 2, count: 3 }));
+        assert_eq!(vab.session().len(), 2);
+        assert!(vab.notice().unwrap().contains("part limit"));
+    }
+
+    /// §6.3's part cap applies to imported craft files too — a
+    /// `LoadBytes` whose session exceeds the limit is refused and the
+    /// working craft is left untouched.
+    #[test]
+    fn part_limit_applies_to_loaded_craft() {
+        // Build a 3-part craft in an uncapped session and serialize it.
+        let mut src = VabSession::new(mini_catalog(), mini_resources());
+        src.apply(VabAction::SetRoot(PartId::from("t.tank")))
+            .unwrap();
+        let mut parent = src.session().root().unwrap();
+        for _ in 0..2 {
+            src.apply(VabAction::AttachAuto {
+                part: PartId::from("t.tank"),
+                parent,
+            })
+            .unwrap();
+            parent = src.selected().unwrap();
+        }
+        assert_eq!(src.session().len(), 3);
+        let bytes = src.to_bytes().unwrap();
+
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        vab.set_part_limit(Some(2));
+        let r = vab.apply(VabAction::LoadBytes(bytes));
+        assert_eq!(r, Err(VabError::PartLimit { limit: 2, count: 3 }));
+        assert!(vab.session().is_empty());
+    }
+
+    /// §6.3's no-save rule: `file_io: false` refuses `LoadBytes`
+    /// (import) with `FileIoDisabled` — export is gated at the panel
+    /// (the file row hides) and the app (outbox drop).
+    #[test]
+    fn file_io_disabled_refuses_load() {
+        let mut src = VabSession::new(mini_catalog(), mini_resources());
+        src.apply(VabAction::SetRoot(PartId::from("t.tank")))
+            .unwrap();
+        let bytes = src.to_bytes().unwrap();
+
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        assert!(vab.file_io());
+        vab.set_file_io(false);
+        assert!(!vab.file_io());
+        assert_eq!(
+            vab.apply(VabAction::LoadBytes(bytes)),
+            Err(VabError::FileIoDisabled)
+        );
+        assert!(vab.session().is_empty());
     }
 }

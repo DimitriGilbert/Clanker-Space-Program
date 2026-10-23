@@ -1,0 +1,137 @@
+// data/techtree/home.ron — the home-system program tree (PLAN §3.3).
+//
+// Nodes cost science and unlock PartIds (via PartDef::tech_requirement),
+// UpgradeTrack level caps (unlocks.track_levels), facilities, and
+// contract types. Track levels are then bought individually at their
+// own science_cost — the node unlock is the right to purchase.
+//
+// Tiers: tech.start (free root — the launch stack) → science/rocketry
+// branches → deeper track tiers. Costs are monotonic in depth
+// (validator): start 0 < science.1 15 < rocketry.2 30 < rocketry.3 60.
+(
+    schema_version: 1,
+    nodes: [
+        (
+            id: "tech.start",
+            display_name: "tech.start.name",
+            description: "tech.start.desc",
+            science_cost: 0.0,
+            requires: [],
+            unlocks: (
+                track_levels: [],
+                facilities: ["facility.launchpad", "facility.vab"],
+                contract_types: ["contract.survey"],
+            ),
+        ),
+        (
+            id: "tech.science.1",
+            display_name: "tech.science.1.name",
+            description: "tech.science.1.desc",
+            science_cost: 15.0,
+            requires: ["tech.start"],
+            unlocks: (
+                track_levels: [("csp.track.pod.mtbf", 1)],
+                facilities: ["facility.lab"],
+                // §6.3: contract.survey.data is a Rask/Duva contract —
+                // out of the demo set.
+                contract_types: [],
+            ),
+        ),
+        (
+            id: "tech.rocketry.2",
+            display_name: "tech.rocketry.2.name",
+            description: "tech.rocketry.2.desc",
+            science_cost: 30.0,
+            requires: ["tech.start"],
+            unlocks: (
+                track_levels: [
+                    ("csp.track.engine.launch.isp", 2),
+                    ("csp.track.tank.s.mass", 2),
+                ],
+                facilities: [],
+                contract_types: ["contract.satellite"],
+            ),
+        ),
+        (
+            id: "tech.rocketry.3",
+            display_name: "tech.rocketry.3.name",
+            description: "tech.rocketry.3.desc",
+            science_cost: 60.0,
+            requires: ["tech.rocketry.2"],
+            unlocks: (
+                track_levels: [
+                    ("csp.track.engine.launch.isp", 4),
+                    ("csp.track.engine.launch.thrust", 3),
+                    ("csp.track.engine.upper.isp", 3),
+                    ("csp.track.tank.s.mass", 3),
+                    ("csp.track.pod.mtbf", 2),
+                ],
+                facilities: ["facility.test_stand"],
+                // §6.3: contract.rescue / contract.colony_resupply reach
+                // Rask/Duva — out of the demo set.
+                contract_types: ["contract.part_test"],
+            ),
+        ),
+    ],
+    tracks: [
+        // Sparc launch-engine Isp — the plan's §3.3 example shape:
+        // 4 multiplier levels at +3% each.
+        (
+            id: "csp.track.engine.launch.isp",
+            display_name: "track.engine.launch.isp.name",
+            family: "csp.family.engine.launch",
+            stat_path: IspVacS,
+            levels: [
+                (science_cost: 10.0, multiplier_or_delta: Multiplier(1.03)),
+                (science_cost: 12.0, multiplier_or_delta: Multiplier(1.03)),
+                (science_cost: 15.0, multiplier_or_delta: Multiplier(1.03)),
+                (science_cost: 18.0, multiplier_or_delta: Multiplier(1.03)),
+            ],
+        ),
+        (
+            id: "csp.track.engine.launch.thrust",
+            display_name: "track.engine.launch.thrust.name",
+            family: "csp.family.engine.launch",
+            stat_path: ThrustVacN,
+            levels: [
+                (science_cost: 15.0, multiplier_or_delta: Multiplier(1.05)),
+                (science_cost: 18.0, multiplier_or_delta: Multiplier(1.05)),
+                (science_cost: 22.0, multiplier_or_delta: Multiplier(1.05)),
+            ],
+        ),
+        // Ember's Isp improves as an authored delta — the
+        // multiplier_or_delta::Delta spelling (seconds of Isp).
+        (
+            id: "csp.track.engine.upper.isp",
+            display_name: "track.engine.upper.isp.name",
+            family: "csp.family.engine.upper",
+            stat_path: IspVacS,
+            levels: [
+                (science_cost: 12.0, multiplier_or_delta: Delta(5.0)),
+                (science_cost: 15.0, multiplier_or_delta: Delta(5.0)),
+                (science_cost: 18.0, multiplier_or_delta: Delta(10.0)),
+            ],
+        ),
+        (
+            id: "csp.track.tank.s.mass",
+            display_name: "track.tank.s.mass.name",
+            family: "csp.family.tank.s",
+            stat_path: MassDryKg,
+            levels: [
+                (science_cost: 8.0, multiplier_or_delta: Multiplier(0.95)),
+                (science_cost: 10.0, multiplier_or_delta: Multiplier(0.95)),
+                (science_cost: 12.0, multiplier_or_delta: Multiplier(0.95)),
+            ],
+        ),
+        (
+            id: "csp.track.pod.mtbf",
+            display_name: "track.pod.mtbf.name",
+            family: "csp.family.pod",
+            stat_path: BaseMtbfS,
+            levels: [
+                (science_cost: 10.0, multiplier_or_delta: Multiplier(1.25)),
+                (science_cost: 14.0, multiplier_or_delta: Multiplier(1.25)),
+            ],
+        ),
+    ],
+)

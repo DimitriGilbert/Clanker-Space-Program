@@ -70,6 +70,10 @@ pub struct WarpController {
     /// drift the target the way an `f64` accumulator would (§2.6.3's
     /// spirit: measured time drives a logged command, not hidden state).
     scaled_nanos: u128,
+    /// The settings-applied ladder ceiling (M10 "max time warp"): a QoL
+    /// cap on `requested` — the §2.6.3 inequality still applies
+    /// underneath it. `WARP_LADDER.len() - 1` until the settings limit it.
+    cap_idx: usize,
 }
 
 impl WarpController {
@@ -84,6 +88,7 @@ impl WarpController {
             promote_candidate: None,
             measured_step_ms: 0.0,
             scaled_nanos: 0,
+            cap_idx: WARP_LADDER.len() - 1,
         }
     }
 
@@ -137,7 +142,7 @@ impl WarpController {
     pub fn decide(&mut self) -> Option<u32> {
         if self.pending_step != 0 {
             let req = self.requested as i64 + i64::from(self.pending_step);
-            self.requested = req.clamp(0, WARP_LADDER.len() as i64 - 1) as usize;
+            self.requested = req.clamp(0, self.cap_idx as i64) as usize;
             self.pending_step = 0;
         }
         // Demotion is immediate — the player must not overshoot because a
@@ -218,6 +223,22 @@ impl WarpController {
         self.promote_streak = 0;
         self.promote_candidate = None;
         Some(WARP_LADDER[rung] as u32)
+    }
+
+    /// The M10 "max time warp" settings cap: clamp `requested` to the
+    /// largest rung whose multiplier is `≤ cap` (a stored value between
+    /// rungs rounds down; `0` means ×1 — the sim cannot be frozen by a
+    /// settings file). If the live `effective` sits above the new cap it
+    /// demotes NOW — no hysteresis downward, same rule as
+    /// [`Self::demote`] — and returns `Some(multiplier)` so the caller
+    /// logs `SimCommand::SetWarp` and the demotion stays replayable.
+    pub fn set_cap_multiplier(&mut self, cap: u64) -> Option<u32> {
+        self.cap_idx = WARP_LADDER
+            .iter()
+            .rposition(|&m| m <= cap.max(1))
+            .unwrap_or(0);
+        self.requested = self.requested.min(self.cap_idx);
+        self.demote(self.cap_idx)
     }
 
     /// The emitted multiplier — `WARP_LADDER[effective]`.
@@ -347,6 +368,40 @@ mod tests {
         }
         // scaled = 999_999_960 + 60×166_666_660 ns → 703.999… ticks → 703.
         assert_eq!(t, 703);
+    }
+
+    /// The M10 settings cap: `requested` clamps to the largest rung `≤`
+    /// the cap, a lowered cap demotes `effective` immediately (logged by
+    /// the caller as `SetWarp`), and between-rungs values round down.
+    #[test]
+    fn cap_multiplier_clamps_requests_and_demotes() {
+        let mut c = WarpController::new();
+        c.set_cap_multiplier(1_000);
+        c.request_step(WARP_LADDER.len() as i32); // try for the ceiling
+        c.decide();
+        for _ in 0..PROMOTE_FRAMES {
+            c.decide();
+        }
+        // Capped at ×10³ — the ladder top stays out of reach.
+        assert_eq!(c.multiplier(), 1_000);
+        assert_eq!(c.requested_multiplier(), 1_000);
+        // Between-rungs stored values round down to the rung ≤ cap —
+        // the live ×10³ already satisfies it, so nothing demotes.
+        assert_eq!(c.set_cap_multiplier(5_000), None);
+        assert_eq!(c.multiplier(), 1_000);
+        // A cap below the live rung demotes NOW (no hysteresis downward).
+        assert_eq!(c.set_cap_multiplier(10), Some(10));
+        assert_eq!(c.multiplier(), 10);
+        // And zero cannot freeze the sim — it floors at ×1.
+        assert_eq!(c.set_cap_multiplier(0), Some(1));
+        assert_eq!(c.multiplier(), 1);
+        // Re-widening the cap lets requests climb again.
+        c.set_cap_multiplier(100_000);
+        c.request_step(1);
+        for _ in 0..PROMOTE_FRAMES {
+            c.decide();
+        }
+        assert_eq!(c.multiplier(), 2);
     }
 
     /// §2.6.5 Clamping demotion: drops `effective` immediately, keeps

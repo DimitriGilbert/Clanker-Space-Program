@@ -51,6 +51,10 @@ pub struct BugReportInput {
     pub command_log: Result<Vec<u8>, String>,
     /// The §3.1 data-set hash of the live `data/`, when computable.
     pub data_set_hash: Option<[u8; 32]>,
+    /// The §7.1 `state_hash` of the world at the halt — the postmortem's
+    /// first comparison against a replayed reproduction. `None` on the
+    /// panic path (no sim access) or when hashing itself faulted.
+    pub state_hash: Option<[u8; 32]>,
     /// The GPU adapter name, when the session had one.
     pub gpu_adapter: Option<String>,
     /// The wgpu backend label, when the session had one.
@@ -183,6 +187,7 @@ pub fn write_panic_bundle(root: &Path, panic_text: &str, log_tail: Vec<String>) 
         save: Err("no sim access inside the panic hook".into()),
         command_log: Err("no sim access inside the panic hook".into()),
         data_set_hash: None,
+        state_hash: None,
         gpu_adapter: None,
         gpu_backend: None,
         log_tail,
@@ -215,16 +220,16 @@ fn system_info(input: &BugReportInput) -> String {
 /// diagnosable: every version that can change a hash without a sim bug,
 /// plus the live data-set hash (§7.7's drift key).
 fn fingerprint(input: &BugReportInput) -> String {
-    let hash_hex = input
-        .data_set_hash
-        .map(|h| h.iter().map(|b| format!("{b:02x}")).collect::<String>());
+    let hex =
+        |h: Option<[u8; 32]>| h.map(|h| h.iter().map(|b| format!("{b:02x}")).collect::<String>());
     serde_json::to_string_pretty(&serde_json::json!({
         "game_version": env!("CARGO_PKG_VERSION"),
         "save_version": csp_view::save::SAVE_VERSION_CURRENT,
         "hash_schema_version": csp_core::HASH_SCHEMA_VERSION,
         "kdf_version": csp_core::KDF_VERSION,
         "data_hash_version": csp_view::DATA_HASH_VERSION,
-        "data_set_hash": hash_hex,
+        "data_set_hash": hex(input.data_set_hash),
+        "state_hash": hex(input.state_hash),
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
     }))

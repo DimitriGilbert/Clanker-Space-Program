@@ -15,6 +15,7 @@
 //! data/systems/<sys>/<body>/biomes.png   / biome_map is Some
 //! ```
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -148,11 +149,138 @@ impl std::error::Error for LoadError {
     }
 }
 
-fn read_ron<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, LoadError> {
-    let text = std::fs::read_to_string(path).map_err(|source| LoadError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+/// The file-reading half of a `data/` tree. Native builds read the
+/// filesystem ([`FsDataSource`]); the §6.3 web tier reads a
+/// compile-time-embedded table ([`EmbeddedSource`]) — one trait, one
+/// loader path, so the demo's reduced dataset goes through the same
+/// file-shape checks as the desktop `data/` directory.
+///
+/// The paths a source sees are repo-relative (`data/parts/x.ron`,
+/// `data/systems/home/system.ron`) — the same strings callers pass as
+/// `dir`/`path` to the `load_*_from` functions.
+pub trait DataSource {
+    /// Read `path` as UTF-8 text.
+    fn read_string(&self, path: &Path) -> Result<String, LoadError>;
+    /// Read `path` as bytes.
+    fn read_bytes(&self, path: &Path) -> Result<Vec<u8>, LoadError>;
+    /// `true` when `path` exists — file *or* directory.
+    fn exists(&self, path: &Path) -> bool;
+    /// Every `*.ron` file under `dir`, ascending path order — the
+    /// `collect_ron_files` determinism contract.
+    fn ron_files(&self, dir: &Path) -> Result<Vec<PathBuf>, LoadError>;
+}
+
+/// Read `data/` from the filesystem — the native/default source.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FsDataSource;
+
+impl DataSource for FsDataSource {
+    fn read_string(&self, path: &Path) -> Result<String, LoadError> {
+        std::fs::read_to_string(path).map_err(|source| LoadError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    fn read_bytes(&self, path: &Path) -> Result<Vec<u8>, LoadError> {
+        std::fs::read(path).map_err(|source| LoadError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    fn exists(&self, path: &Path) -> bool {
+        path.exists()
+    }
+
+    /// Depth-first walk, each directory level sorted before recursion —
+    /// equivalent to a plain ascending sort of every file path found
+    /// (a subdir's contents land exactly at the subdir's sorted
+    /// position).
+    fn ron_files(&self, dir: &Path) -> Result<Vec<PathBuf>, LoadError> {
+        let mut out = Vec::new();
+        collect_ron_files(dir, &mut out)?;
+        Ok(out)
+    }
+}
+
+/// A compile-time-embedded `data/` tree — a static path → bytes table
+/// baked in with `include_bytes!`. The §6.3 web demo ships its reduced
+/// dataset this way (no filesystem on wasm); the source itself is plain
+/// data, so native tests exercise the same path.
+pub struct EmbeddedSource {
+    files: BTreeMap<PathBuf, &'static [u8]>,
+}
+
+impl EmbeddedSource {
+    /// Build from a `(path, bytes)` table — `path` is the virtual
+    /// repo-relative path (`"data/balance.ron"`).
+    pub fn new(files: &'static [(&'static str, &'static [u8])]) -> Self {
+        Self {
+            files: files
+                .iter()
+                .map(|(path, bytes)| (PathBuf::from(path), *bytes))
+                .collect(),
+        }
+    }
+
+    fn missing(path: &Path) -> LoadError {
+        LoadError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "not in the embedded data set",
+            ),
+        }
+    }
+}
+
+impl DataSource for EmbeddedSource {
+    fn read_string(&self, path: &Path) -> Result<String, LoadError> {
+        let bytes = self
+            .files
+            .get(path)
+            .copied()
+            .ok_or_else(|| Self::missing(path))?;
+        String::from_utf8(bytes.to_vec()).map_err(|e| LoadError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+        })
+    }
+
+    fn read_bytes(&self, path: &Path) -> Result<Vec<u8>, LoadError> {
+        self.files
+            .get(path)
+            .map(|b| b.to_vec())
+            .ok_or_else(|| Self::missing(path))
+    }
+
+    /// A path "exists" when it names an embedded file or prefixes one —
+    /// `exists("data/parts")` answers the `dir.exists()` checks the
+    /// optional-table loaders (`load_sites`, `load_colonies`, …) make.
+    /// `Path::starts_with` is component-wise, so `data/parts` never
+    /// matches `data/parts.ron`.
+    fn exists(&self, path: &Path) -> bool {
+        self.files.contains_key(path) || self.files.keys().any(|k| k.starts_with(path))
+    }
+
+    fn ron_files(&self, dir: &Path) -> Result<Vec<PathBuf>, LoadError> {
+        // BTreeMap key order is component-wise ascending — the same
+        // order the filesystem walk produces (see FsDataSource's doc).
+        Ok(self
+            .files
+            .keys()
+            .filter(|k| k.starts_with(dir) && k.extension().is_some_and(|ext| ext == "ron"))
+            .cloned()
+            .collect())
+    }
+}
+
+fn read_ron<T: serde::de::DeserializeOwned>(
+    src: &dyn DataSource,
+    path: &Path,
+) -> Result<T, LoadError> {
+    let text = src.read_string(path)?;
     ron::de::from_str(&text).map_err(|source| LoadError::Ron {
         path: path.to_path_buf(),
         source: Box::new(source),
@@ -172,33 +300,36 @@ fn check_version(path: &Path, found: u32, expected: u32) -> Result<(), LoadError
 }
 
 /// Load `system.ron` + every listed `<body>/body.ron` (+ biome files when
-/// referenced) from a `data/systems/<sys>/` directory.
+/// referenced) from a `data/systems/<sys>/` directory on the filesystem.
 ///
 /// Validates file shape only — run [`crate::validate::validate_system`]
 /// on the result for the §3.0 semantic rules.
 pub fn load_system(dir: &Path) -> Result<LoadedSystem, LoadError> {
+    load_system_from(&FsDataSource, dir)
+}
+
+/// [`load_system`] against an arbitrary [`DataSource`] — the web demo's
+/// embedded dataset rides this (§6.3).
+pub fn load_system_from(src: &dyn DataSource, dir: &Path) -> Result<LoadedSystem, LoadError> {
     let system_path = dir.join("system.ron");
-    let system: SystemDef = read_ron(&system_path)?;
+    let system: SystemDef = read_ron(src, &system_path)?;
     check_version(&system_path, system.schema_version, SCHEMA_VERSION)?;
 
     let mut bodies = Vec::with_capacity(system.bodies.len());
     for id in &system.bodies {
         let body_dir = dir.join(id.as_str());
         let body_path = body_dir.join("body.ron");
-        let def: BodyDef = read_ron(&body_path)?;
+        let def: BodyDef = read_ron(src, &body_path)?;
         check_version(&body_path, def.schema_version, SCHEMA_VERSION)?;
 
         let biomes = match &def.biome_map {
             None => None,
             Some(r) => {
                 let legend_path = body_dir.join(&r.legend);
-                let legend: BiomeLegend = read_ron(&legend_path)?;
+                let legend: BiomeLegend = read_ron(src, &legend_path)?;
                 check_version(&legend_path, legend.schema_version, SCHEMA_VERSION)?;
                 let png_path = body_dir.join(&r.png);
-                let png = std::fs::read(&png_path).map_err(|source| LoadError::Io {
-                    path: png_path,
-                    source,
-                })?;
+                let png = src.read_bytes(&png_path)?;
                 Some(LoadedBiomeMap { legend, png })
             }
         };
@@ -211,7 +342,12 @@ pub fn load_system(dir: &Path) -> Result<LoadedSystem, LoadError> {
 /// the caller's choice (`data/balance.ron` in production, a fixture copy
 /// in tests); file-shape checks only.
 pub fn load_balance(path: &Path) -> Result<BalanceDef, LoadError> {
-    let balance: BalanceDef = read_ron(path)?;
+    load_balance_from(&FsDataSource, path)
+}
+
+/// [`load_balance`] against an arbitrary [`DataSource`].
+pub fn load_balance_from(src: &dyn DataSource, path: &Path) -> Result<BalanceDef, LoadError> {
+    let balance: BalanceDef = read_ron(src, path)?;
     check_version(path, balance.schema_version, BALANCE_SCHEMA_VERSION)?;
     Ok(balance)
 }
@@ -220,7 +356,12 @@ pub fn load_balance(path: &Path) -> Result<BalanceDef, LoadError> {
 /// checks only; uniqueness/positivity rules live in
 /// [`crate::validate`].
 pub fn load_resources(path: &Path) -> Result<ResourceFile, LoadError> {
-    let resources: ResourceFile = read_ron(path)?;
+    load_resources_from(&FsDataSource, path)
+}
+
+/// [`load_resources`] against an arbitrary [`DataSource`].
+pub fn load_resources_from(src: &dyn DataSource, path: &Path) -> Result<ResourceFile, LoadError> {
+    let resources: ResourceFile = read_ron(src, path)?;
     check_version(path, resources.schema_version, RESOURCE_SCHEMA_VERSION)?;
     Ok(resources)
 }
@@ -231,13 +372,18 @@ pub fn load_resources(path: &Path) -> Result<ResourceFile, LoadError> {
 /// `RecoverVessel` command needs one. File-shape checks only; the
 /// body/geometry rules live in [`crate::validate::validate_sites`].
 pub fn load_sites(path: &Path) -> Result<SiteFile, LoadError> {
-    if !path.exists() {
+    load_sites_from(&FsDataSource, path)
+}
+
+/// [`load_sites`] against an arbitrary [`DataSource`].
+pub fn load_sites_from(src: &dyn DataSource, path: &Path) -> Result<SiteFile, LoadError> {
+    if !src.exists(path) {
         return Ok(SiteFile {
             schema_version: SITE_SCHEMA_VERSION,
             sites: Vec::new(),
         });
     }
-    let sites: SiteFile = read_ron(path)?;
+    let sites: SiteFile = read_ron(src, path)?;
     // §3.1's "current and previous with explicit defaults": v1 files
     // lack `resource_yields`, which serde reads as the empty list.
     if !SITE_SCHEMA_SUPPORTED.contains(&sites.schema_version) {
@@ -257,13 +403,18 @@ pub fn load_sites(path: &Path) -> Result<SiteFile, LoadError> {
 /// checks only; the rate/resource rules live in
 /// [`crate::validate::validate_colonies`].
 pub fn load_colonies(path: &Path) -> Result<ColonyFile, LoadError> {
-    if !path.exists() {
+    load_colonies_from(&FsDataSource, path)
+}
+
+/// [`load_colonies`] against an arbitrary [`DataSource`].
+pub fn load_colonies_from(src: &dyn DataSource, path: &Path) -> Result<ColonyFile, LoadError> {
+    if !src.exists(path) {
         return Ok(ColonyFile {
             schema_version: COLONY_SCHEMA_VERSION,
             colonies: Vec::new(),
         });
     }
-    let colonies: ColonyFile = read_ron(path)?;
+    let colonies: ColonyFile = read_ron(src, path)?;
     check_version(path, colonies.schema_version, COLONY_SCHEMA_VERSION)?;
     Ok(colonies)
 }
@@ -308,16 +459,20 @@ impl LoadedRecipes {
 /// as an empty set — a world without recipes simply rejects
 /// `FoundColony` defs carrying `Converter` modules.
 pub fn load_recipes(dir: &Path) -> Result<LoadedRecipes, LoadError> {
-    if !dir.exists() {
+    load_recipes_from(&FsDataSource, dir)
+}
+
+/// [`load_recipes`] against an arbitrary [`DataSource`].
+pub fn load_recipes_from(src: &dyn DataSource, dir: &Path) -> Result<LoadedRecipes, LoadError> {
+    if !src.exists(dir) {
         return Ok(LoadedRecipes {
             recipes: Vec::new(),
         });
     }
-    let mut files = Vec::new();
-    collect_ron_files(dir, &mut files)?;
+    let files = src.ron_files(dir)?;
     let mut recipes = Vec::with_capacity(files.len());
     for path in files {
-        let def: RecipeDef = read_ron(&path)?;
+        let def: RecipeDef = read_ron(src, &path)?;
         check_version(&path, def.schema_version, RECIPE_SCHEMA_VERSION)?;
         let rel = path.strip_prefix(dir).unwrap_or(&path).to_path_buf();
         recipes.push(LoadedRecipe { def, path: rel });
@@ -365,16 +520,23 @@ impl LoadedExperiments {
 /// as an empty set — experiment defs are optional until a part's
 /// `Experiment` module or a science command needs them.
 pub fn load_experiments(dir: &Path) -> Result<LoadedExperiments, LoadError> {
-    if !dir.exists() {
+    load_experiments_from(&FsDataSource, dir)
+}
+
+/// [`load_experiments`] against an arbitrary [`DataSource`].
+pub fn load_experiments_from(
+    src: &dyn DataSource,
+    dir: &Path,
+) -> Result<LoadedExperiments, LoadError> {
+    if !src.exists(dir) {
         return Ok(LoadedExperiments {
             experiments: Vec::new(),
         });
     }
-    let mut files = Vec::new();
-    collect_ron_files(dir, &mut files)?;
+    let files = src.ron_files(dir)?;
     let mut experiments = Vec::with_capacity(files.len());
     for path in files {
-        let def: ExperimentDef = read_ron(&path)?;
+        let def: ExperimentDef = read_ron(src, &path)?;
         check_version(&path, def.schema_version, EXPERIMENT_SCHEMA_VERSION)?;
         let rel = path.strip_prefix(dir).unwrap_or(&path).to_path_buf();
         experiments.push(LoadedExperiment { def, path: rel });
@@ -425,16 +587,20 @@ impl LoadedContracts {
 /// `load_experiments` — a world without templates simply never
 /// generates offers.
 pub fn load_contracts(dir: &Path) -> Result<LoadedContracts, LoadError> {
-    if !dir.exists() {
+    load_contracts_from(&FsDataSource, dir)
+}
+
+/// [`load_contracts`] against an arbitrary [`DataSource`].
+pub fn load_contracts_from(src: &dyn DataSource, dir: &Path) -> Result<LoadedContracts, LoadError> {
+    if !src.exists(dir) {
         return Ok(LoadedContracts {
             contracts: Vec::new(),
         });
     }
-    let mut files = Vec::new();
-    collect_ron_files(dir, &mut files)?;
+    let files = src.ron_files(dir)?;
     let mut contracts = Vec::with_capacity(files.len());
     for path in files {
-        let def: ContractTemplate = read_ron(&path)?;
+        let def: ContractTemplate = read_ron(src, &path)?;
         check_version(&path, def.schema_version, CONTRACT_SCHEMA_VERSION)?;
         let rel = path.strip_prefix(dir).unwrap_or(&path).to_path_buf();
         contracts.push(LoadedContract { def, path: rel });
@@ -489,14 +655,18 @@ impl LoadedTechTree {
 /// as an empty set, matching `load_experiments` — a world without a
 /// tree simply rejects research commands.
 pub fn load_techtree(dir: &Path) -> Result<LoadedTechTree, LoadError> {
-    if !dir.exists() {
+    load_techtree_from(&FsDataSource, dir)
+}
+
+/// [`load_techtree`] against an arbitrary [`DataSource`].
+pub fn load_techtree_from(src: &dyn DataSource, dir: &Path) -> Result<LoadedTechTree, LoadError> {
+    if !src.exists(dir) {
         return Ok(LoadedTechTree { trees: Vec::new() });
     }
-    let mut files = Vec::new();
-    collect_ron_files(dir, &mut files)?;
+    let files = src.ron_files(dir)?;
     let mut trees = Vec::with_capacity(files.len());
     for path in files {
-        let def: TechTreeDef = read_ron(&path)?;
+        let def: TechTreeDef = read_ron(src, &path)?;
         check_version(&path, def.schema_version, TECHTREE_SCHEMA_VERSION)?;
         let rel = path.strip_prefix(dir).unwrap_or(&path).to_path_buf();
         trees.push(LoadedTechFile { def, path: rel });
@@ -534,11 +704,15 @@ fn collect_ron_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), LoadError
 /// `schema_version` current. Semantic rules (id↔stem, category/module
 /// consistency, resource refs) are [`crate::validate::validate_parts`].
 pub fn load_parts(dir: &Path) -> Result<LoadedParts, LoadError> {
-    let mut files = Vec::new();
-    collect_ron_files(dir, &mut files)?;
+    load_parts_from(&FsDataSource, dir)
+}
+
+/// [`load_parts`] against an arbitrary [`DataSource`].
+pub fn load_parts_from(src: &dyn DataSource, dir: &Path) -> Result<LoadedParts, LoadError> {
+    let files = src.ron_files(dir)?;
     let mut parts = Vec::with_capacity(files.len());
     for path in files {
-        let def: PartDef = read_ron(&path)?;
+        let def: PartDef = read_ron(src, &path)?;
         check_version(&path, def.schema_version, PART_SCHEMA_VERSION)?;
         let rel = path.strip_prefix(dir).unwrap_or(&path).to_path_buf();
         parts.push(LoadedPart { def, path: rel });

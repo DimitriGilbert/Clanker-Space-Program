@@ -32,6 +32,12 @@ pub mod terrain;
 /// view's scene/camera/packet, and the GPU-pick event plumbing.
 pub mod vab;
 
+/// The §6.3 web-demo tier: the embedded reduced `data/` set and the
+/// fixed demo-scenario seed (Terrin only, ≤60 parts, no save
+/// import/export). The wasm `View::new` builds exactly this; the module
+/// is target-agnostic so native tests exercise the same construction.
+pub mod demo;
+
 /// The app's view mode — flight, map, or the VAB editor. Session
 /// state (§2.2-C): never sim state, never logged, never hashed.
 /// `csp-app` routes input and `csp-view` derives it from the two
@@ -415,6 +421,11 @@ pub struct View {
     /// `end_frame` so `ticks_last_frame` reaches `FrameStats` through the
     /// Sync system, not the sim path (Appendix A item 1).
     ticks_last_frame: u64,
+    /// `true` for the §6.3 web-demo build — set by [`View::new_demo`].
+    /// `csp-app` reads it to refuse craft-file import/export (the
+    /// session-level part cap and file-IO refusal are installed on the
+    /// `VabSession` itself at construction).
+    demo: bool,
 }
 
 /// Startup construction failure — [`View::new`] loads `data/` (§8.3's
@@ -427,6 +438,10 @@ pub enum ViewError {
     Load(csp_data::LoadError),
     /// The loaded body defs did not build a patched-conics model.
     Sim(SimError),
+    /// The §6.3 demo's seeded scenario failed to build — the embedded
+    /// data set is internally inconsistent (a startup failure like
+    /// the others).
+    Demo(String),
 }
 
 impl std::fmt::Display for ViewError {
@@ -434,6 +449,7 @@ impl std::fmt::Display for ViewError {
         match self {
             Self::Load(e) => write!(f, "data/ startup load failed: {e}"),
             Self::Sim(e) => write!(f, "data/ bodies rejected by the orbit model: {e}"),
+            Self::Demo(e) => write!(f, "demo scenario seed failed: {e}"),
         }
     }
 }
@@ -456,12 +472,23 @@ impl View {
     /// crate's manifest (so tests/tools work from any directory).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn new() -> Result<Self, ViewError> {
-        let root = data_root();
-        let sys = csp_data::load_system(&root.join("systems").join("home"))?;
+        Self::from_source(&csp_data::FsDataSource, &data_root())
+    }
+
+    /// The M10-C shared half: load a `data/` tree from any
+    /// [`csp_data::DataSource`] and wire the sim world + presentation
+    /// resources from it. `View::new` (native) reads the filesystem;
+    /// [`View::new_demo`] reads the §6.3 embedded set — identical wiring,
+    /// identical file-shape checks, different source.
+    fn from_source(
+        src: &dyn csp_data::DataSource,
+        root: &std::path::Path,
+    ) -> Result<Self, ViewError> {
+        let sys = csp_data::load_system_from(src, &root.join("systems").join("home"))?;
         let defs: Vec<csp_data::BodyDef> = sys.bodies.iter().map(|b| b.def.clone()).collect();
         let orbits =
             csp_sim::orbit::PatchedConics::from_body_defs(&defs).map_err(ViewError::Sim)?;
-        let balance = csp_data::load_balance(&root.join("balance.ron"))?;
+        let balance = csp_data::load_balance_from(src, &root.join("balance.ron"))?;
         // M4c presentation floor: the game world runs the physics
         // bubble over the home planet (same `Environment` convention
         // `csp-bench`'s flight scenarios use).
@@ -503,7 +530,7 @@ impl View {
         // the identical three calls); without them science commands
         // would run on the no-data defaults and reject every run.
         sim.set_science_config(csp_sim::ScienceConfig::from_balance(&balance));
-        let experiments = csp_data::load_experiments(&root.join("experiments"))?;
+        let experiments = csp_data::load_experiments_from(src, &root.join("experiments"))?;
         sim.set_experiments(
             experiments
                 .experiments
@@ -513,14 +540,15 @@ impl View {
         );
         // M7-B §3.3: the merged tech tree — same data-derived wiring;
         // without it research commands reject with "no tech tree".
-        sim.set_tech_tree(csp_data::load_techtree(&root.join("techtree"))?.merged());
+        sim.set_tech_tree(csp_data::load_techtree_from(src, &root.join("techtree"))?.merged());
         // M7-C §3.5: the economy tunables (starting funds, the salary
         // cadence, hire cost, milestone payout, recovery shares) and
         // the system's site table — the same data-derived wiring;
         // without them the funds paths run on the no-data defaults
         // and `RecoverVessel` has no sites to name.
         sim.set_economy_config(csp_sim::economy::EconomyConfig::from_balance(&balance));
-        let sites = csp_data::load_sites(&root.join("systems").join("home").join("sites.ron"))?;
+        let sites =
+            csp_data::load_sites_from(src, &root.join("systems").join("home").join("sites.ron"))?;
         sim.set_sites(
             sites
                 .sites
@@ -531,7 +559,7 @@ impl View {
         // M7-D §3.6: the contract template table + the board-size
         // tunable — the same data-derived wiring.
         sim.set_contracts(
-            csp_data::load_contracts(&root.join("contracts"))?
+            csp_data::load_contracts_from(src, &root.join("contracts"))?
                 .by_id()
                 .into_iter()
                 .map(|(id, def)| (id, def.clone()))
@@ -552,7 +580,7 @@ impl View {
         // channel; `FoundColony`'s Converter modules resolve
         // `RecipeId`s against it.
         sim.set_recipes(
-            csp_data::load_recipes(&root.join("recipes"))?
+            csp_data::load_recipes_from(src, &root.join("recipes"))?
                 .by_id()
                 .into_iter()
                 .map(|(id, def)| (id, def.clone()))
@@ -565,16 +593,19 @@ impl View {
         // resolves all three). A missing file reads as an empty set —
         // a system without authored colonies simply starts with none.
         sim.found_authored_colonies(
-            &csp_data::load_colonies(&root.join("systems").join("home").join("colonies.ron"))?
-                .colonies,
+            &csp_data::load_colonies_from(
+                src,
+                &root.join("systems").join("home").join("colonies.ron"),
+            )?
+            .colonies,
         )
         .map_err(ViewError::Sim)?;
         let mut view = Self::with_sim(sim);
         // M3 VAB: the part catalog + resource registry are data-derived
         // constants for the session model (like BodyTable — §7.3's
         // re-derived-on-load class).
-        let parts = csp_data::load_parts(&root.join("parts"))?;
-        let resources = csp_data::load_resources(&root.join("resources.ron"))?;
+        let parts = csp_data::load_parts_from(src, &root.join("parts"))?;
+        let resources = csp_data::load_resources_from(src, &root.join("resources.ron"))?;
         view.install_vab_catalog(parts, resources);
         // R2: the authored terrain table (noise seeds, ocean datums,
         // decoded biome palettes) — installed over the empty default.
@@ -583,15 +614,31 @@ impl View {
         Ok(view)
     }
 
-    /// wasm: no `data/` filesystem exists at this milestone — the wasm
-    /// slice runs the trivial M1 world (empty system, mirror-pinned
-    /// default budget; `csp-bench`'s `balance_ron_mirrors_sim_event_budget`
-    /// test keeps that mirror honest). Native is the authoritative data
-    /// path; shipping `data/` inside the wasm bundle is a packaging
-    /// problem for a later milestone.
+    /// The §6.3 web demo — the fixed scenario over the embedded reduced
+    /// data set ([`demo`]): Terrin only (the system manifest carries
+    /// solen + terrin — no interplanetary body exists to reach), the
+    /// editor part count capped at [`demo::DEMO_PART_LIMIT`], craft-file
+    /// import/export refused. A flight-capable starter craft is seeded
+    /// on the pad and pre-loaded in the VAB session.
+    ///
+    /// Compiled on every target: wasm's `View::new` IS this, and native
+    /// tests exercise the same construction.
+    pub fn new_demo() -> Result<Self, ViewError> {
+        let mut view = Self::from_source(&demo::source(), std::path::Path::new(demo::DEMO_ROOT))?;
+        view.demo = true;
+        view.with_vab_session(|v| {
+            v.set_part_limit(Some(demo::DEMO_PART_LIMIT));
+            v.set_file_io(false);
+        });
+        demo::seed_pad_craft(&mut view).map_err(ViewError::Demo)?;
+        Ok(view)
+    }
+
+    /// wasm: the §6.3 demo IS the web tier — `View::new` builds the
+    /// embedded fixed scenario; the full `data/` path is native-only.
     #[cfg(target_arch = "wasm32")]
     pub fn new() -> Result<Self, ViewError> {
-        Ok(Self::with_sim(SimWorld::new()))
+        Self::new_demo()
     }
 
     /// The shell around an explicit sim world — the headless/test
@@ -682,7 +729,15 @@ impl View {
                 render_extract,
             },
             ticks_last_frame: 0,
+            demo: false,
         }
+    }
+
+    /// `true` when this is the §6.3 web-demo world ([`View::new_demo`]) —
+    /// `csp-app` reads it to disable craft-file import/export and gate
+    /// demo-off features.
+    pub fn is_demo(&self) -> bool {
+        self.demo
     }
 
     /// Ticks the last [`View::sim_step`] call actually advanced (0 on a
@@ -1082,8 +1137,9 @@ impl View {
     }
 
     /// Install the part catalog + resource registry (called by
-    /// `View::new` after `data/` loads; an unset catalog leaves the
-    /// VAB honest-but-empty — the wasm slice at M3).
+    /// `View::from_source` after the `data/` tree loads — native reads
+    /// the filesystem, the §6.3 demo reads the embedded set; an unset
+    /// catalog leaves the VAB honest-but-empty).
     pub fn install_vab_catalog(
         &mut self,
         parts: csp_data::LoadedParts,

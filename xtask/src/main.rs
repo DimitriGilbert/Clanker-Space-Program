@@ -222,14 +222,96 @@ fn write_goldens(staged: &[Staged], reason: Option<&str>) {
     }
 }
 
+/// M10-C / §6.3: package the web demo into `apps/demo/dist/`.
+///
+/// 1. `cargo build -p csp-app --lib --release --target wasm32-unknown-unknown`
+///    — the §8.2 wasm compile gate, run for real.
+/// 2. `wasm-bindgen --target web --out-dir apps/demo/dist` over the
+///    cdylib — `wasm-bindgen-cli` must match the crate version
+///    (workspace pin 0.2.129; the CLI itself refuses a mismatched
+///    .wasm). Absent → the exact commands are printed and the task
+///    exits non-zero: §8.2's "tooling failure is loud failure", never
+///    a silent half-artifact.
+/// 3. `apps/demo/index.html` is copied beside the bundle.
+fn build_web() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let status = Command::new("cargo")
+        .args([
+            "build",
+            "-p",
+            "csp-app",
+            "--lib",
+            "--release",
+            "--target",
+            "wasm32-unknown-unknown",
+        ])
+        .current_dir(&root)
+        .status()
+        .unwrap_or_else(|e| {
+            eprintln!("build-web: failed to run cargo: {e}");
+            exit(2);
+        });
+    if !status.success() {
+        eprintln!("build-web: wasm build failed");
+        exit(status.code().unwrap_or(2));
+    }
+    let wasm = root.join("target/wasm32-unknown-unknown/release/csp_app.wasm");
+    let dist = root.join("apps/demo/dist");
+    if let Err(e) = std::fs::create_dir_all(&dist) {
+        eprintln!("build-web: cannot create {}: {e}", dist.display());
+        exit(2);
+    }
+    if let Err(e) = std::fs::copy(root.join("apps/demo/index.html"), dist.join("index.html")) {
+        eprintln!("build-web: cannot copy index.html: {e}");
+        exit(2);
+    }
+    let bindgen = Command::new("wasm-bindgen")
+        .args(["--target", "web", "--out-dir"])
+        .arg(&dist)
+        .arg("--out-name")
+        .arg("csp_app")
+        .arg(&wasm)
+        .current_dir(&root)
+        .status();
+    match bindgen {
+        Ok(s) if s.success() => {
+            println!(
+                "build-web: artifact at {} — serve it with any static file server, e.g.\n  \
+                 python3 -m http.server -d apps/demo/dist",
+                dist.display()
+            );
+        }
+        Ok(s) => {
+            eprintln!("build-web: wasm-bindgen failed ({s})");
+            exit(s.code().unwrap_or(2));
+        }
+        Err(e) => {
+            eprintln!(
+                "build-web: wasm-bindgen not found ({e}). The wasm cdylib is built at\n  \
+                 {}\nfinish the packaging with:\n  \
+                 cargo install wasm-bindgen-cli --version 0.2.129 --locked\n  \
+                 wasm-bindgen --target web --out-dir apps/demo/dist --out-name csp_app \\\n    \
+                 target/wasm32-unknown-unknown/release/csp_app.wasm\n  \
+                 cp apps/demo/index.html apps/demo/dist/",
+                wasm.display()
+            );
+            exit(2);
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("lint-deps") => lint_deps(),
         Some("lint-attribution") => lint_attribution(),
         Some("bless-goldens") => bless_goldens(args.get(1..).unwrap_or(&[])),
+        Some("build-web") => build_web(),
         _ => {
-            eprintln!("usage: cargo xtask <lint-deps|lint-attribution|bless-goldens>");
+            eprintln!("usage: cargo xtask <lint-deps|lint-attribution|bless-goldens|build-web>");
             exit(2);
         }
     }

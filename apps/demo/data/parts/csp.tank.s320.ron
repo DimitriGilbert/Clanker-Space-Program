@@ -1,0 +1,70 @@
+// csp.tank.s320 — "Drum 320" main propellant tank (§3.1 PartDef).
+// Hand-authored fiction — numbers frozen at M3.
+//
+// The launch-stage tank the Δv coherence test stacks under the Sparc:
+// 324 u liquid_fuel + 396 u oxidizer = 3 600 kg of propellant at
+// 5 kg/u. pod(800) + s320(440 dry) + sparc(900) is 5 740 kg wet /
+// 2 140 kg dry => ~3.1 km/s vacuum Δv at 320 s Isp — a single stage
+// that just reaches Terrin LEO (2 287 m/s circular) once gravity and
+// drag losses are paid, which is exactly where a starter set should sit.
+(
+    schema_version: 1,
+    id: "csp.tank.s320",
+    family: "csp.family.tank.s",
+    display_name: "part.csp.tank.s320.name",
+    category: FuelTank,
+    mass_dry_kg: 440.0,
+    cost_funds: 700.0,
+    size_m: (x: 1.25, y: 1.25, z: 4.0),
+    build_resources: [("metal", 44.0)],
+    attach_nodes: [
+        (id: "top",    position_m: (x: 0.0, y: 0.0, z: 2.0),  direction: (x: 0.0, y: 0.0, z: 1.0),  diameter_m: 1.25),
+        (id: "bottom", position_m: (x: 0.0, y: 0.0, z: -2.0), direction: (x: 0.0, y: 0.0, z: -1.0), diameter_m: 1.25),
+    ],
+    scale: Continuous(
+        min: 0.5,
+        max: 2.0,
+        exponents: (mass: 3.0, cost: 3.0, thrust: 0.0, capacity: 3.0, structural: 2.0),
+    ),
+    collider: Cylinder(radius_m: 0.625, half_height_m: 2.0),
+    aero: (
+        cd_curve: [(mach: 0.0, coeff: 0.4), (mach: 8.0, coeff: 0.25)],
+        cl_curve: [(mach: 0.0, coeff: 0.0)],
+        ref_len_m: 4.0,
+    ),
+    thermal: (
+        heat_capacity_j_per_k: 240_000.0,
+        max_temp_k: 900.0,
+        emissivity: 0.6,
+        conduction_w_per_k: 80.0,
+    ),
+    structural: (
+        max_axial_n: 1_200_000.0,
+        max_shear_n: 350_000.0,
+        max_torque_nm: 60_000.0,
+    ),
+    variants: [
+        (id: "stock", display_name: "part.variant.stock", cost_multiplier: 1.0, stat_multipliers: []),
+    ],
+    modules: [
+        Tank(capacity: [("liquid_fuel", 324.0), ("oxidizer", 396.0)]),
+    ],
+    reliability: (
+        base_mtbf_s: 2_000_000.0,
+        infant_mortality: 0.05,
+        qualification_curve: (knots: [
+            (qualification_units: 0.0,   hazard_multiplier: 1.0),
+            (qualification_units: 100.0, hazard_multiplier: 0.5),
+        ]),
+        regime_stress: [
+            (kind: ExcessG,         threshold: 15.0, multiplier: 2.0),
+            (kind: Overtemperature, threshold: 0.9,  multiplier: 3.0),
+        ],
+        dormant_stress: 0.01,
+        failure_modes: [
+            (Leak,        0.7),
+            (SensorFault, 0.3),
+        ],
+    ),
+    tech_requirement: "tech.rocketry.2",
+)

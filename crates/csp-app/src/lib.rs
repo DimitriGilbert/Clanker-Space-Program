@@ -50,7 +50,7 @@ use csp_render::terrain::TerrainRenderer;
 use csp_render::vab::VabRenderer;
 use csp_view::flight::FlightEvent;
 use csp_view::map::MapKeyEvent;
-use csp_view::settings::{KeyAction, Settings};
+use csp_view::settings::{KeyAction, Settings, UI_SCALE_MAX, UI_SCALE_MIN};
 use csp_view::vab::VabEvent;
 use csp_view::{EventClass, ModeSelect, SimCommand, SourceClass, View, ViewMode};
 use warp::WarpController;
@@ -126,10 +126,18 @@ struct App {
     /// map_async landing, and a stale table would silently mis-decode
     /// (selecting the wrong part).
     pick_decode_ids: Option<Vec<u64>>,
-    /// Craft-file store: name → `CSPCRAFT` bytes. Memory-first so the
-    /// wasm build keeps a working save/load; on native the store is
-    /// mirrored to `crafts/*.cspcraft` files.
+    /// Craft-file store: name → `CSPCRAFT` bytes. Memory-first; on
+    /// native the store is mirrored to `crafts/*.cspcraft` files under
+    /// [`Self::craft_dir`]. The §6.3 wasm demo refuses craft IO entirely
+    /// (`demo` gates the outbox; the session's `file_io` gate is deeper
+    /// still) — the store exists but stays empty there.
     craft_store: BTreeMap<String, Vec<u8>>,
+    /// The directory `craft_store` mirrors to on native — `crafts/`
+    /// beside the CWD in production, injected in tests so a test's
+    /// `craft_save` outbox never writes into the repo (the
+    /// `settings_path` precedent). Read on every target — the wasm
+    /// `save_craft_file` ignores it.
+    craft_dir: std::path::PathBuf,
     /// Left-drag state for map camera orbit — pointer position at the
     /// last `CursorMoved`, and whether the left button is held.
     last_cursor: Option<(f64, f64)>,
@@ -179,6 +187,17 @@ struct App {
     /// `(adapter, backend)` remembered for the bundle's system info —
     /// `set_gpu_info` already hands them to the session mirror.
     gpu_info: Option<(String, String)>,
+    /// §6.3: `true` on the web-demo build — craft-file import/export is
+    /// refused at the outbox (the VAB session's own `file_io` gate is
+    /// the deeper layer; this is the app's half).
+    demo: bool,
+    /// wasm only: the deferred GPU init channel — `init_graphics` spawns
+    /// `Gpu::new` rather than `pollster::block_on`ing it (the web
+    /// adapter/device requests resolve through browser promises that
+    /// need the JS event loop to turn), and `poll_gpu_init` lands the
+    /// result here a few frames later.
+    #[cfg(target_arch = "wasm32")]
+    gpu_rx: Option<std::sync::mpsc::Receiver<Result<Gpu, csp_render::GpuError>>>,
     /// The M10 audio backend ([`audio`]) — `Some` once `init_graphics`
     /// opened the OS device, `None` on any device failure (graceful
     /// silence) and in tests (which never run `init_graphics`).
@@ -202,7 +221,7 @@ impl App {
         );
         #[cfg(target_arch = "wasm32")]
         let (settings, settings_path) = (settings_io::load_settings(), None);
-        Self::new_inner(settings, settings_path)
+        Self::new_inner(settings, settings_path, std::path::PathBuf::from("crafts"))
     }
 
     /// The settings-path-injecting constructor — what tests drive so the
@@ -214,13 +233,49 @@ impl App {
         Self::new_inner(
             settings_io::load_settings_from(settings_path),
             Some(settings_path.to_path_buf()),
+            settings_path.with_file_name("crafts"),
+        )
+    }
+
+    /// The §6.3 demo build for tests — `View::new_demo` through the same
+    /// [`Self::assemble`] the production constructor uses.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    #[allow(clippy::expect_used)]
+    fn new_demo_with_settings_path(settings_path: &std::path::Path) -> Self {
+        Self::assemble(
+            View::new_demo().expect("demo data load failed"),
+            settings_io::load_settings_from(settings_path),
+            Some(settings_path.to_path_buf()),
+            settings_path.with_file_name("crafts"),
         )
     }
 
     #[allow(clippy::expect_used)]
-    fn new_inner(settings: Settings, settings_path: Option<std::path::PathBuf>) -> Self {
+    fn new_inner(
+        settings: Settings,
+        settings_path: Option<std::path::PathBuf>,
+        craft_dir: std::path::PathBuf,
+    ) -> Self {
+        Self::assemble(
+            View::new().expect("data/ startup load failed"),
+            settings,
+            settings_path,
+            craft_dir,
+        )
+    }
+
+    /// The `View`-injecting half of construction — the demo build and
+    /// the demo-mode tests route `View::new_demo()` through the same
+    /// assembly (settings staging, difficulty flags, live settings).
+    fn assemble(
+        view: View,
+        settings: Settings,
+        settings_path: Option<std::path::PathBuf>,
+        craft_dir: std::path::PathBuf,
+    ) -> Self {
         let (pick_tx, pick_rx) = std::sync::mpsc::channel();
-        let mut view = View::new().expect("data/ startup load failed");
+        let mut view = view;
+        let demo = view.is_demo();
         view.stage_settings(&settings);
         let mut app = Self {
             window: None,
@@ -237,7 +292,8 @@ impl App {
             pick_rx,
             pick_in_flight: false,
             pick_decode_ids: None,
-            craft_store: load_craft_store(),
+            craft_store: load_craft_store(&craft_dir),
+            craft_dir,
             last_cursor: None,
             map_dragging: false,
             lmb_press: None,
@@ -252,11 +308,55 @@ impl App {
             #[cfg(not(target_arch = "wasm32"))]
             bug_report_root: bugreport::bug_report_root(),
             gpu_info: None,
+            demo,
+            #[cfg(target_arch = "wasm32")]
+            gpu_rx: None,
             #[cfg(not(target_arch = "wasm32"))]
             audio: None,
         };
         app.apply_startup_difficulty();
+        app.apply_live_settings();
         app
+    }
+
+    /// Apply the live-session half of [`Settings`] — everything that is
+    /// *not* a new-game flag or a file location: the egui zoom factor
+    /// (`ui_scale`) and the warp controller's QoL ceiling
+    /// (`max_warp_multiplier`). Called at startup and on the settings
+    /// panel's Apply. A cap lowered under the live warp demotes now and
+    /// rides the §7.6-logged `SetWarp` channel like every other warp
+    /// decision.
+    fn apply_live_settings(&mut self) {
+        let scale = self
+            .settings
+            .graphics
+            .ui_scale
+            .clamp(UI_SCALE_MIN, UI_SCALE_MAX);
+        self.view.egui_context().set_zoom_factor(scale);
+        if let Some(level) = self
+            .warp
+            .set_cap_multiplier(self.settings.gameplay.max_warp_multiplier)
+        {
+            self.view.enqueue_command(
+                SourceClass::Ui,
+                SETTINGS_SOURCE_ID,
+                SimCommand::SetWarp(level),
+            );
+        }
+    }
+
+    /// Persist the live settings — shared by the panel's Apply and the
+    /// close path (which is how a resized window's new size reaches the
+    /// file). Native only; wasm settings are session-memory.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn persist_settings(&self) {
+        let result = match &self.settings_path {
+            Some(p) => settings_io::save_settings_to(p, &self.settings),
+            None => settings_io::save_settings(&self.settings),
+        };
+        if let Err(e) = result {
+            log::warn!("settings persist failed: {e}");
+        }
     }
 
     /// The difficulty flags are *new-game* choices: they write
@@ -343,6 +443,7 @@ impl App {
             save,
             command_log,
             data_set_hash: csp_view::data_set_hash(&csp_view::data_root()).ok(),
+            state_hash: self.view.sim.state_hash().ok(),
             gpu_adapter: self.gpu_info.as_ref().map(|(a, _)| a.clone()),
             gpu_backend: self.gpu_info.as_ref().map(|(_, b)| b.clone()),
             log_tail: logring::tail(),
@@ -353,10 +454,14 @@ impl App {
     // is unrecoverable presentation setup — there is nothing to fall back
     // to, so `expect` is the honest failure mode (allowed at fn scope).
     #[allow(clippy::expect_used)]
-    fn init_graphics(&mut self, event_loop: &ActiveEventLoop) {
+    fn create_window(&self, event_loop: &ActiveEventLoop) -> Arc<Window> {
+        // The persisted window size from settings (physical px —
+        // `Resized` feeds `inner_size` straight back into it). A
+        // hand-edited file with a degenerate size floors at 1 px.
+        let [win_w, win_h] = self.settings.graphics.window_size;
         let attrs = Window::default_attributes()
             .with_title("Clanker Space Program")
-            .with_inner_size(winit::dpi::LogicalSize::new(1280u32, 720u32));
+            .with_inner_size(winit::dpi::PhysicalSize::new(win_w.max(1), win_h.max(1)));
 
         #[cfg(target_arch = "wasm32")]
         let attrs = {
@@ -364,15 +469,78 @@ impl App {
             attrs.with_append(true)
         };
 
-        let window = Arc::new(
+        Arc::new(
             event_loop
                 .create_window(attrs)
                 .expect("failed to create window"),
-        );
+        )
+    }
 
-        let size = window.inner_size();
-        let gpu = pollster::block_on(Gpu::new(window.clone(), (size.width, size.height)))
-            .expect("failed to init GPU");
+    /// Kick off window + GPU init. On native this is synchronous —
+    /// `pollster::block_on` resolves wgpu's adapter/device requests
+    /// in-process. On wasm those requests resolve through *browser
+    /// promises* that need the JS event loop to turn, so
+    /// `pollster::block_on` inside `resumed` would deadlock: the wasm
+    /// path spawns `Gpu::new` on the winit loop instead and
+    /// [`Self::poll_gpu_init`] lands the result into
+    /// [`Self::finish_gpu_init`] a few event turns later.
+    #[allow(clippy::expect_used)]
+    fn init_graphics(&mut self, event_loop: &ActiveEventLoop) {
+        let window = self.create_window(event_loop);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let size = window.inner_size();
+            let gpu = pollster::block_on(Gpu::new(window.clone(), (size.width, size.height)))
+                .expect("failed to init GPU");
+            self.window = Some(window);
+            self.finish_gpu_init(gpu);
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.gpu_rx = Some(rx);
+            self.window = Some(window.clone());
+            wasm_bindgen_futures::spawn_local(async move {
+                let size = window.inner_size();
+                let _ = tx.send(Gpu::new(window, (size.width, size.height)).await);
+            });
+        }
+    }
+
+    /// wasm only: land the spawned GPU init — success finishes the
+    /// presentation setup, failure logs once and stays black (the demo
+    /// keeps running its headless frames; there is no GPU to recover).
+    #[cfg(target_arch = "wasm32")]
+    fn poll_gpu_init(&mut self) {
+        let Some(rx) = &self.gpu_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(gpu)) => {
+                self.gpu_rx = None;
+                self.finish_gpu_init(gpu);
+            }
+            Ok(Err(e)) => {
+                self.gpu_rx = None;
+                log::error!("GPU init failed: {e}");
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.gpu_rx = None;
+                log::error!("GPU init task was dropped");
+            }
+        }
+    }
+
+    /// The post-GPU half of init — egui state, the mode renderers, the
+    /// adapter mirror, audio, the craft-file list — shared by the
+    /// native synchronous path and the wasm deferred path. `self.window`
+    /// is already set by [`Self::init_graphics`].
+    fn finish_gpu_init(&mut self, gpu: Gpu) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
 
         // The egui context lives in view.world as a resource — the UiBuild
         // system runs the whole pass against it (§2.5); csp-app only feeds
@@ -407,7 +575,6 @@ impl App {
         self.view
             .set_gpu_info(info.name.clone(), format!("{:?}", info.backend));
 
-        self.window = Some(window);
         self.gpu = Some(gpu);
         self.egui_state = Some(egui_state);
         self.egui_renderer = Some(egui_renderer);
@@ -641,7 +808,14 @@ impl App {
             });
         }
         if let Some((name, bytes)) = outbox.craft_save {
-            if self.read_only {
+            if self.demo {
+                // §6.3: the demo build does not persist or export craft
+                // files — the panel hides the row, this is the app's
+                // enforcement half.
+                self.view.vab_event(VabEvent::Notice(
+                    "craft save is off in the web demo".to_string(),
+                ));
+            } else if self.read_only {
                 // §2.13: a halted session is read-only — a craft file
                 // written from a possibly-corrupt world is an artifact
                 // nobody should trust.
@@ -650,7 +824,7 @@ impl App {
                 )));
             } else {
                 self.craft_store.insert(name.clone(), bytes.clone());
-                save_craft_file(&name, &bytes);
+                save_craft_file(&self.craft_dir, &name, &bytes);
                 self.view
                     .set_craft_files(self.craft_store.keys().cloned().collect());
                 self.view
@@ -664,7 +838,12 @@ impl App {
             // dispatch reads `self.settings.keys` next key press, and
             // the file write makes it durable (§7.8) — at the injected
             // path so a test's Apply never writes the real config dir.
-            self.settings = self.view.staged_settings();
+            // `window_size` is app-tracked, not panel-edited: the live
+            // copy's value wins over the stale staged one.
+            let mut applied = self.view.staged_settings();
+            applied.graphics.window_size = self.settings.graphics.window_size;
+            self.settings = applied;
+            self.apply_live_settings();
             #[cfg(not(target_arch = "wasm32"))]
             let persist = match &self.settings_path {
                 Some(p) => settings_io::save_settings_to(p, &self.settings),
@@ -689,11 +868,20 @@ impl App {
                 .enqueue_command(SourceClass::Ui, MANEUVER_SOURCE_ID, cmd);
         }
         if let Some(name) = outbox.craft_load {
-            match self.craft_store.get(&name) {
-                Some(b) => self.view.vab_event(VabEvent::LoadCraft(b.clone())),
-                None => self
-                    .view
-                    .vab_event(VabEvent::Notice(format!("no craft file '{name}'"))),
+            if self.demo {
+                // §6.3: no craft-file import either — the VabSession's
+                // `file_io` gate would refuse the load anyway; this
+                // keeps the honest notice at the app's layer.
+                self.view.vab_event(VabEvent::Notice(format!(
+                    "craft load is off in the web demo ('{name}')"
+                )));
+            } else {
+                match self.craft_store.get(&name) {
+                    Some(b) => self.view.vab_event(VabEvent::LoadCraft(b.clone())),
+                    None => self
+                        .view
+                        .vab_event(VabEvent::Notice(format!("no craft file '{name}'"))),
+                }
             }
         }
     }
@@ -1001,8 +1189,18 @@ impl ApplicationHandler for App {
             .is_some_and(|state| state.on_window_event(&window, &event).consumed);
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                // Persist on close — this is how the tracked window
+                // size (and any applied changes) reach the file without
+                // a per-resize write storm.
+                #[cfg(not(target_arch = "wasm32"))]
+                self.persist_settings();
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => {
+                // Track the live size into settings — persisted on
+                // Apply/close, restored at the next `init_graphics`.
+                self.settings.graphics.window_size = [size.width, size.height];
                 if let Some(gpu) = &mut self.gpu {
                     gpu.resize(size.width, size.height);
                 }
@@ -1101,6 +1299,11 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // wasm: the spawned GPU init resolves on event-loop turns —
+        // check the channel here so the first frames don't need a
+        // RedrawRequested to land it.
+        #[cfg(target_arch = "wasm32")]
+        self.poll_gpu_init();
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -1154,6 +1357,7 @@ pub fn bug_report_cli() -> Result<(), String> {
         command_log: csp_view::save::encode_command_log(view.sim.command_log())
             .map_err(|e| e.to_string()),
         data_set_hash: csp_view::data_set_hash(&csp_view::data_root()).ok(),
+        state_hash: view.sim.state_hash().ok(),
         gpu_adapter: None,
         gpu_backend: None,
         log_tail: logring::tail(),
@@ -1191,13 +1395,12 @@ pub fn wasm_start() {
     winit::platform::web::EventLoopExtWebSys::spawn_app(event_loop, app);
 }
 
-/// Native: `crafts/` next to the working directory — session artifacts
-/// live outside `data/` (that tree is authored content + the
-/// attribution lint). On wasm the store is memory-only.
+/// Native: `crafts/` next to the working directory (injected in tests)
+/// — session artifacts live outside `data/` (that tree is authored
+/// content + the attribution lint). On wasm the store is memory-only.
 #[cfg(not(target_arch = "wasm32"))]
-fn load_craft_store() -> BTreeMap<String, Vec<u8>> {
+fn load_craft_store(dir: &std::path::Path) -> BTreeMap<String, Vec<u8>> {
     let mut store = BTreeMap::new();
-    let dir = std::path::Path::new("crafts");
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
             let p = e.path();
@@ -1214,17 +1417,17 @@ fn load_craft_store() -> BTreeMap<String, Vec<u8>> {
     store
 }
 
-/// wasm: in-memory only — the M3 web slice has no filesystem.
+/// wasm: in-memory only — the §6.3 demo has no filesystem and refuses
+/// craft IO anyway; `_dir` keeps the signature shared.
 #[cfg(target_arch = "wasm32")]
-fn load_craft_store() -> BTreeMap<String, Vec<u8>> {
+fn load_craft_store(_dir: &std::path::Path) -> BTreeMap<String, Vec<u8>> {
     BTreeMap::new()
 }
 
-/// Native: mirror the store entry to `crafts/<name>.cspcraft`. Failures
+/// Native: mirror the store entry to `<dir>/<name>.cspcraft`. Failures
 /// are logged, not fatal — the in-memory store already holds the craft.
 #[cfg(not(target_arch = "wasm32"))]
-fn save_craft_file(name: &str, bytes: &[u8]) {
-    let dir = std::path::Path::new("crafts");
+fn save_craft_file(dir: &std::path::Path, name: &str, bytes: &[u8]) {
     if let Err(e) = std::fs::create_dir_all(dir)
         .and_then(|()| std::fs::write(dir.join(format!("{name}.cspcraft")), bytes))
     {
@@ -1234,7 +1437,7 @@ fn save_craft_file(name: &str, bytes: &[u8]) {
 
 /// wasm: nothing to write — the store in `App` is the whole store.
 #[cfg(target_arch = "wasm32")]
-fn save_craft_file(_name: &str, _bytes: &[u8]) {}
+fn save_craft_file(_dir: &std::path::Path, _name: &str, _bytes: &[u8]) {}
 
 #[cfg(test)]
 // §2.13's no-panic rule covers shipping fallible paths; tests signal
@@ -1322,6 +1525,7 @@ mod tests {
             save: Ok(save_bytes),
             command_log: Ok(csp_view::save::encode_command_log(&[]).unwrap()),
             data_set_hash: Some([0x5Au8; 32]),
+            state_hash: Some([0xA5u8; 32]),
             gpu_adapter: Some("test adapter".into()),
             gpu_backend: Some("test backend".into()),
             log_tail: vec!["info  csp: hello".into()],
@@ -1349,6 +1553,7 @@ mod tests {
         let fp = std::fs::read_to_string(bundle.join("fingerprint.json")).unwrap();
         assert!(fp.contains("\"save_version\": 2"));
         assert!(fp.contains("5a5a5a5a")); // data_set_hash hex prefix
+        assert!(fp.contains("\"state_hash\": \"a5a5a5a5")); // world hash hex
     }
 
     /// The §2.13 crash path end-to-end: an injected `Fatal` halts the
@@ -1383,6 +1588,89 @@ mod tests {
             csp_view::save::decode_save(&std::fs::read(bundle.join("save.cspsave")).unwrap())
                 .unwrap();
         assert_eq!(decoded.snapshot.clock_ticks, app.view.sim.clock().ticks());
+        // The fingerprint carries the halted world's §7.1 state hash —
+        // the postmortem's first replay comparison.
+        let fp = std::fs::read_to_string(bundle.join("fingerprint.json")).unwrap();
+        let expect = app
+            .view
+            .sim
+            .state_hash()
+            .unwrap()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        assert!(fp.contains(&expect), "fingerprint lacks the state hash");
+    }
+
+    /// A rebound key resolves to its new action — the input layer reads
+    /// `settings.keys`, never a hardcoded table: binding "m" to
+    /// `WarpUp` makes the next "m" press a warp step, not a map toggle.
+    #[test]
+    fn rebound_key_dispatches_its_new_action() {
+        let dir = tempdir("rebind-dispatch");
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        // Default: "m" → ToggleMap.
+        assert_eq!(
+            app.settings.keys.action_for("m"),
+            Some(KeyAction::ToggleMap)
+        );
+        app.dispatch(KeyAction::ToggleMap);
+        assert_eq!(app.view.mode(), ViewMode::Map);
+        app.dispatch(KeyAction::ToggleMap);
+        assert_eq!(app.view.mode(), ViewMode::Flight);
+        // Rebind "m" to WarpUp — the same key now drives the controller.
+        app.settings
+            .keys
+            .bind(KeyAction::WarpUp, KeyBinding::parse("m").unwrap());
+        let action = app.settings.keys.action_for(
+            settings_io::key_token(&winit::keyboard::Key::Character(
+                winit::keyboard::SmolStr::new("m"),
+            ))
+            .as_deref()
+            .unwrap_or(""),
+        );
+        assert_eq!(action, Some(KeyAction::WarpUp));
+        app.dispatch(action.unwrap());
+        // The request folded into the controller (one ladder step up).
+        app.warp.decide();
+        assert_eq!(app.warp.requested_multiplier(), 2);
+    }
+
+    /// The Apply path end-to-end: staged settings become the live set,
+    /// persist to the injected file, and reach their live targets —
+    /// `ui_scale` sets the egui zoom factor, `max_warp_multiplier` caps
+    /// the controller's ladder, and the app-tracked `window_size`
+    /// survives the staged copy's stale value.
+    #[test]
+    fn settings_apply_persists_and_reaches_live_targets() {
+        let dir = tempdir("apply");
+        let path = dir.join("settings.ron");
+        let mut app = App::new_with_settings_path(&path);
+        app.settings.graphics.window_size = [1920, 1080]; // a resize landed
+        let mut staged = app.view.staged_settings();
+        staged.graphics.ui_scale = 1.5;
+        staged.gameplay.max_warp_multiplier = 100;
+        staged.graphics.window_size = [1280, 720]; // stale staged value
+        app.view.stage_settings(&staged);
+        app.handle_ui_outbox(csp_view::UiOutbox {
+            settings_apply: true,
+            ..Default::default()
+        });
+        // Applied live: the egui zoom factor lands at the start of the
+        // next pass (`set_zoom_factor` defers), and the warp cap holds.
+        app.view.begin_frame();
+        app.view.end_frame();
+        assert!((app.view.egui_context().zoom_factor() - 1.5).abs() < 1e-6);
+        app.warp.request_step(99);
+        app.warp.decide();
+        assert_eq!(app.warp.requested_multiplier(), 100);
+        // The tracked window size won over the stale staged copy.
+        assert_eq!(app.settings.graphics.window_size, [1920, 1080]);
+        // Persisted: the injected path now holds the applied file.
+        let on_disk = settings_io::load_settings_from(&path);
+        assert_eq!(on_disk.gameplay.max_warp_multiplier, 100);
+        assert!((on_disk.graphics.ui_scale - 1.5).abs() < 1e-6);
+        assert_eq!(on_disk.graphics.window_size, [1920, 1080]);
     }
 
     /// The rebind plumbing: an armed target + a landed key updates the
@@ -1406,5 +1694,30 @@ mod tests {
             app.view.staged_settings().keys.action_for("arrow-up"),
             Some(KeyAction::PanUp)
         );
+    }
+
+    /// §6.3 demo mode: the app flag comes from the view, craft-file
+    /// save/load outbox requests are dropped with a notice, and the
+    /// store stays empty — the session-level `file_io` gate is the
+    /// deeper layer, this is the app's half.
+    #[test]
+    fn demo_drops_craft_file_io() {
+        let dir = tempdir("demo");
+        let mut app = App::new_demo_with_settings_path(&dir.join("settings.ron"));
+        assert!(app.demo);
+        app.handle_ui_outbox(csp_view::UiOutbox {
+            craft_save: Some(("demo-craft".to_string(), vec![1, 2, 3])),
+            craft_load: Some("demo-craft".to_string()),
+            ..Default::default()
+        });
+        assert!(app.craft_store.is_empty());
+        // A full session is not demo — craft IO passes through.
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        assert!(!app.demo);
+        app.handle_ui_outbox(csp_view::UiOutbox {
+            craft_save: Some(("demo-craft".to_string(), vec![1, 2, 3])),
+            ..Default::default()
+        });
+        assert!(app.craft_store.contains_key("demo-craft"));
     }
 }

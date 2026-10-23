@@ -1,0 +1,17 @@
+// PLAN §3.2 — the seeded science experiment: "materials study" flown
+// aboard any craft with an Experiment module of this kind. transmit_
+// ratio sits mid-band (0.4): transmitting banks 40% and recovery closes
+// the key for the remainder. Caps are per (body, situation) — biomes
+// share the cap (the ledger keys on biome; the authored cap is
+// body/situation-scoped). Situation masks: 63 = all six; space-only =
+// SPACE_LOW|SPACE_HIGH = 48.
+(
+    schema_version: 1,
+    id: "exp.materials_study",
+    display_name: "exp.materials_study.name",
+    transmit_ratio: 0.4,
+    caps: [
+        (body: "terrin", situations: 63, cap_data_units: 30.0),
+        (body: "solen", situations: 48, cap_data_units: 50.0),
+    ],
+)

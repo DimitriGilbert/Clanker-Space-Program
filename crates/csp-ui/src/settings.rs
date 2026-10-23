@@ -2,8 +2,9 @@
 //! "settings, input bindings" for csp-ui, M10).
 //!
 //! [`Settings`] is the serializable user-preference model — audio,
-//! graphics quality, the difficulty flags applied at new-game, and the
-//! rebindable [`Keymap`]. It is *plain data* (serde): `csp-app` owns the
+//! graphics quality, window size and UI scale, the difficulty flags
+//! applied at new-game, live gameplay preferences, and the rebindable
+//! [`Keymap`]. It is *plain data* (serde): `csp-app` owns the
 //! `$config_dir/csp/settings.ron` file (§7.8's sidecar class — outside
 //! the save, the command log, and the state hash), and the winit
 //! `Key` ↔ [`KeyBinding`] token mapping. This module knows nothing of
@@ -40,6 +41,9 @@ pub struct Settings {
     /// (they write sim state/construction config), never retroactively
     /// into a live session.
     pub difficulty: DifficultySettings,
+    /// Live-session gameplay preferences — applied immediately, unlike
+    /// [`DifficultySettings`] which binds at new-game only.
+    pub gameplay: GameplaySettings,
     /// The rebindable keymap — the input layer resolves every key press
     /// through it.
     pub keys: Keymap,
@@ -52,6 +56,7 @@ impl Default for Settings {
             audio: AudioSettings::default(),
             graphics: GraphicsSettings::default(),
             difficulty: DifficultySettings::default(),
+            gameplay: GameplaySettings::default(),
             keys: Keymap::default(),
         }
     }
@@ -77,11 +82,34 @@ impl Default for AudioSettings {
 }
 
 /// Presentation preferences.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GraphicsSettings {
     /// The render-quality tier.
     pub quality: GraphicsQuality,
+    /// The egui zoom factor — the whole UI scales by it (1.0 = native).
+    /// Clamped into [`UI_SCALE_MIN`]..=[`UI_SCALE_MAX`] when applied.
+    pub ui_scale: f32,
+    /// The last window size in physical px — tracked by the app on
+    /// `Resized` and persisted, so the next launch restores it. Not a
+    /// panel-edited value: the window itself is the editor.
+    pub window_size: [u32; 2],
+}
+
+/// The lower bound [`GraphicsSettings::ui_scale`] applies at — under
+/// this the panels become unreadable.
+pub const UI_SCALE_MIN: f32 = 0.5;
+/// The upper bound [`GraphicsSettings::ui_scale`] applies at.
+pub const UI_SCALE_MAX: f32 = 2.0;
+
+impl Default for GraphicsSettings {
+    fn default() -> Self {
+        Self {
+            quality: GraphicsQuality::default(),
+            ui_scale: 1.0,
+            window_size: [1280, 720],
+        }
+    }
 }
 
 /// The render-quality ladder the settings file names.
@@ -118,6 +146,34 @@ impl Default for DifficultySettings {
         Self {
             life_support_enabled: false,
             dormant_stress: true,
+        }
+    }
+}
+
+/// The selectable time-warp ceilings — mirrors `csp-app`'s §2.6.2
+/// `WARP_LADDER` (the app's copy is authoritative; this list is only the
+/// panel's choice vocabulary, and the app clamps any value to the
+/// largest rung `≤` it, so drift between the lists degrades gracefully
+/// rather than breaking).
+pub const WARP_CAP_OPTIONS: &[u64] = &[1, 2, 10, 100, 1_000, 10_000, 100_000];
+
+/// Live-session gameplay preferences — applied the moment Apply lands,
+/// unlike the new-game [`DifficultySettings`].
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GameplaySettings {
+    /// The highest time-warp multiplier the player can step the ladder
+    /// to — a QoL ceiling, not a sim rule: the sim's §2.6.2 regime
+    /// gates and the §2.6.3 auto-derate still apply underneath it.
+    /// Stored as the literal multiplier; the app clamps it onto the
+    /// warp ladder.
+    pub max_warp_multiplier: u64,
+}
+
+impl Default for GameplaySettings {
+    fn default() -> Self {
+        Self {
+            max_warp_multiplier: 100_000,
         }
     }
 }
@@ -431,6 +487,33 @@ pub fn settings_panel(
                                 ui.selectable_value(&mut state.settings.graphics.quality, q, label);
                             }
                         });
+                    ui.add(
+                        egui::Slider::new(
+                            &mut state.settings.graphics.ui_scale,
+                            UI_SCALE_MIN..=UI_SCALE_MAX,
+                        )
+                        .text("ui scale"),
+                    );
+                    ui.label(format!(
+                        "window: {}×{} px (restored at launch)",
+                        state.settings.graphics.window_size[0],
+                        state.settings.graphics.window_size[1],
+                    ));
+                });
+            egui::CollapsingHeader::new("Gameplay")
+                .default_open(true)
+                .show(ui, |ui| {
+                    egui::ComboBox::from_label("max time warp")
+                        .selected_text(format!("×{}", state.settings.gameplay.max_warp_multiplier))
+                        .show_ui(ui, |ui| {
+                            for &cap in WARP_CAP_OPTIONS {
+                                ui.selectable_value(
+                                    &mut state.settings.gameplay.max_warp_multiplier,
+                                    cap,
+                                    format!("×{cap}"),
+                                );
+                            }
+                        });
                 });
             egui::CollapsingHeader::new("Difficulty (applies to new games)")
                 .default_open(true)
@@ -519,8 +602,11 @@ mod tests {
         let mut s = Settings::default();
         s.audio.master_volume = 0.35;
         s.graphics.quality = GraphicsQuality::Low;
+        s.graphics.ui_scale = 1.25;
+        s.graphics.window_size = [1600, 900];
         s.difficulty.life_support_enabled = true;
         s.difficulty.dormant_stress = false;
+        s.gameplay.max_warp_multiplier = 1_000;
         s.keys
             .bind(KeyAction::WarpUp, KeyBinding::parse("f6").unwrap());
         let text = ron::ser::to_string_pretty(&s, ron::ser::PrettyConfig::default()).unwrap();
@@ -548,6 +634,8 @@ mod tests {
         assert_eq!(s.graphics.quality, GraphicsQuality::High);
         // Missing sections fall back to defaults.
         assert!(s.difficulty.dormant_stress);
+        assert_eq!(s.gameplay, GameplaySettings::default());
+        assert_eq!(s.graphics.window_size, [1280, 720]);
         assert!(s.keys.bindings.is_empty());
     }
 

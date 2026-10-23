@@ -24,8 +24,8 @@ pub mod vab;
 pub mod settings;
 
 pub use settings::{
-    AudioSettings, DifficultySettings, GraphicsQuality, GraphicsSettings, KeyAction, KeyBinding,
-    Keymap, Settings, SettingsPanelOutput, SettingsPanelState,
+    AudioSettings, DifficultySettings, GameplaySettings, GraphicsQuality, GraphicsSettings,
+    KeyAction, KeyBinding, Keymap, Settings, SettingsPanelOutput, SettingsPanelState,
 };
 pub use vab::{ModeSelect, VabSession};
 

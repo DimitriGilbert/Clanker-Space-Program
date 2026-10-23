@@ -1,0 +1,101 @@
+// Global balance constants. ALL tuning lives here (PLAN §8.3).
+// Named fields only — positional tuples drift silently under reordering.
+(
+    schema_version: 11,
+    // Physics bubble radius (PLAN §2.3): 20 km. Vessels go on rails at the
+    // radius and rejoin at 90% (18 km) — the hysteresis is csp-sim logic,
+    // not a second constant.
+    bubble_radius_m: 20_000.0,
+    // PLAN:548 / §2.6.5: `advance_to` processes at most this many events per
+    // frame; overflow continues next frame as a Clamping-class event.
+    advance_to_max_events_per_frame: 2_000,
+    // PLAN §2.9 object caps: vessel-arena ceiling and the debris cap
+    // (oldest-first eviction under breakup back-pressure).
+    max_tracked_vessels: 512,
+    max_debris: 64,
+    // PLAN §2.4: hard cap 16 live transient joints per bubble; creation
+    // beyond the cap degrades to an immediate clean separation.
+    max_live_joints_per_bubble: 16,
+    // PLAN §2.4: the soft-capture joint's maximum life — 192 = 3 s at
+    // 64 Hz (the capture window; the latch merge runs inside it).
+    capture_window_ticks: 192,
+    // Docking capture predicate (M6-B): port faces within this distance,
+    // facing within this angle, closing slower than this speed.
+    dock_capture_range_m: 0.5,
+    dock_capture_angle_deg: 15.0,
+    dock_capture_rel_speed_mps: 5.0,
+    // Soft-capture compliance: exponential reel-in rate and the closing-
+    // speed cap that makes the capture "soft".
+    dock_soft_pull_per_s: 8.0,
+    dock_soft_max_correction_mps: 1.0,
+    // M6-C §2.4 latch: the settle gates that consume a capture inside
+    // the window — anchors mated within this distance and moving no
+    // faster than this relative speed.
+    dock_latch_separation_m: 0.1,
+    dock_latch_rel_speed_mps: 0.5,
+    // M6-D §3.5 transfer process: undocked transfer reach (m), the
+    // single resource flow rate standing in for min(port outflow,
+    // port inflow) (units/s), and the crew-traversal delay (ticks).
+    transfer_radius_m: 100.0,
+    transfer_rate_units_per_s: 10.0,
+    crew_transfer_ticks: 640,
+    // M7-A §3.2 science: the diminishing-repeat soft-cap constant k
+    // (≈1.0), the lab exhaustion floor (data units), science points
+    // per data unit (eta), and ElectricCharge per transmitted unit.
+    science_softcap_k: 1.0,
+    research_data_epsilon: 1e-6,
+    lab_science_per_data: 1.0,
+    transmit_ec_per_data_unit: 1.0,
+    // M7-C §3.5 economy: starting funds in micro-funds (1e6 = 1 fund),
+    // the salary cadence in sim-days (30 = one sim-month), the per-hire
+    // crew cost (funds), the science-milestone payout (funds per banked
+    // point), the non-launch recovery efficiency, and the site-less
+    // abandon-recovery fraction.
+    starting_funds_micros: 1_000_000_000_000,
+    salary_period_days: 30,
+    crew_hire_cost_funds: 5_000.0,
+    science_funds_per_point: 10.0,
+    recovery_efficiency: 0.9,
+    abandon_recovery: 0.25,
+    // M7-D §3.6 contracts: the offer-board size the generator
+    // maintains (new offers draw at successive offer_index counters
+    // when the board is short). Mirror:
+    // `csp_sim::DEFAULT_CONTRACT_BOARD_SIZE`.
+    contract_offer_slots: 6,
+    // M8-B §3.5 manufacture: build-order throughput — a craft's
+    // construction takes mass_kg / manufacture_rate_kg_per_s sim
+    // seconds at its launch site. Mirror:
+    // `csp_sim::economy::DEFAULT_MANUFACTURE_KG_PER_S`.
+    manufacture_rate_kg_per_s: 50.0,
+    // M8-C §3.5 life support: the periodic vessel check's
+    // cadence (one sim-hour) and the per-crew consumption rates
+    // — `rate · period` per crew member is debited each check.
+    // Mirrors: `csp_sim::life_support::DEFAULT_*`.
+    life_support_check_period_s: 3_600.0,
+    life_support_oxygen_per_crew_s: 0.02,
+    life_support_food_per_crew_s: 0.005,
+    life_support_ec_per_crew_s: 0.05,
+    // M9a §2.10's per-save script op budget — "default 20 000,
+    // configurable per save". Mirror: `csp_sim::DEFAULT_SCRIPT_OP_BUDGET`.
+    script_op_budget: 20_000,
+    // M9b §3.4's reliability block — the dormant-hazard master
+    // switch (0 disables the mechanic), the ignition-hazard window,
+    // failure-mode effect magnitudes, infant-mortality decay, the
+    // notification bound, regime-weighted flight-qualification
+    // rates, and the test-stand economics. Mirror:
+    // `csp_sim::reliability::default_config`.
+    reliability_dormant_stress_scale: 1.0,
+    reliability_ignition_hazard_s: 1.0,
+    reliability_degraded_thrust_factor: 0.5,
+    reliability_leak_units_per_s: 0.001,
+    reliability_infant_tau_s: 3_600.0,
+    reliability_notification_cap: 256,
+    reliability_flight_units_per_s_vacuum: 0.01,
+    reliability_flight_units_per_s_atmosphere: 0.02,
+    reliability_bench_funds_per_unit: 50.0,
+    // The site-inventory resource a bench run consumes (authored —
+    // §8.3 forbids hardcoded tunables).
+    reliability_bench_resource: "metal",
+    reliability_bench_resource_per_unit: 1.0,
+    reliability_bench_seconds_per_unit: 60.0,
+)

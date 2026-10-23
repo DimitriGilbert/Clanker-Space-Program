@@ -1,0 +1,40 @@
+<!doctype html>
+<!-- §6.3 web-demo shell (M10-C). `cargo xtask build-web` produces
+     `apps/demo/dist/` — this file beside `csp_app.js` +
+     `csp_app_bg.wasm`. Serve statically, e.g.:
+         cargo xtask build-web && python3 -m http.server -d apps/demo/dist
+     The §6.3 contract — Terrin only, ≤60 parts, no save — is enforced
+     in the VAB session and the app shell, not here. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clanker Space Program — Web Demo</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #05060a; min-height: 100%; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; }
+  #loading {
+    position: fixed; inset: 0; display: flex; align-items: center;
+    justify-content: center; color: #8a93a6;
+    font: 14px/1.4 system-ui, sans-serif;
+  }
+</style>
+</head>
+<body>
+<div id="loading">loading the §6.3 demo…</div>
+<script type="module">
+  // csp-app's wasm entry point is `wasm_start` (#[wasm_bindgen(start)])
+  // — `init()` instantiates the module and runs it; winit appends its
+  // canvas to <body>.
+  import init from './csp_app.js';
+  try {
+    await init();
+  } catch (e) {
+    document.getElementById('loading').textContent = `demo failed to start: ${e}`;
+    throw e;
+  }
+  document.getElementById('loading').remove();
+</script>
+</body>
+</html>

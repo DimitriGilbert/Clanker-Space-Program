@@ -1,0 +1,9 @@
+// Ore smelter — the colony's first ISRU recipe: raw ore into the
+// metal every early build order consumes (§3.5's cheap-Metal start).
+(
+    schema_version: 1,
+    id: "recipe.smelt_ore",
+    display_name: "recipe.smelt_ore.name",
+    inputs: [("ore", 1.0)],
+    outputs: [("metal", 0.6)],
+)

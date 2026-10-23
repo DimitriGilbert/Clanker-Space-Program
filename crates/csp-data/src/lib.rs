@@ -79,10 +79,13 @@ pub use ids::{
     ResourceId, SiteId, SystemId, TechNodeId, UpgradeTrackId, VariantId,
 };
 pub use load::{
-    LoadError, LoadedBiomeMap, LoadedBody, LoadedContract, LoadedContracts, LoadedExperiment,
-    LoadedExperiments, LoadedPart, LoadedParts, LoadedRecipe, LoadedRecipes, LoadedSystem,
-    LoadedTechFile, LoadedTechTree, load_balance, load_colonies, load_contracts, load_experiments,
-    load_parts, load_recipes, load_resources, load_sites, load_system, load_techtree,
+    DataSource, EmbeddedSource, FsDataSource, LoadError, LoadedBiomeMap, LoadedBody,
+    LoadedContract, LoadedContracts, LoadedExperiment, LoadedExperiments, LoadedPart, LoadedParts,
+    LoadedRecipe, LoadedRecipes, LoadedSystem, LoadedTechFile, LoadedTechTree, load_balance,
+    load_balance_from, load_colonies, load_colonies_from, load_contracts, load_contracts_from,
+    load_experiments, load_experiments_from, load_parts, load_parts_from, load_recipes,
+    load_recipes_from, load_resources, load_resources_from, load_sites, load_sites_from,
+    load_system, load_system_from, load_techtree, load_techtree_from,
 };
 pub use loc::LocFile;
 pub use part::{

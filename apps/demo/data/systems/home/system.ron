@@ -1,0 +1,15 @@
+// The §6.3 web-demo system — the home system's Terrin slice. The demo
+// is Terrin only: Rask and Duva are not in this set, so no
+// interplanetary body is reachable and the demo's data-set hash can
+// never match the desktop's (saves are not portable — §1.1/§6.3).
+//
+// `bodies` is the manifest: each entry names a `<id>/body.ron` file in
+// this directory. `star` is the root every other body's parent chain
+// must reach.
+(
+    schema_version: 1,
+    id: "home",
+    star: "solen",
+    bodies: ["solen", "terrin"],
+    epoch_note: "system.home.epoch_note",
+)

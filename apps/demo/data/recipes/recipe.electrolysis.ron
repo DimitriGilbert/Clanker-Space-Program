@@ -1,0 +1,8 @@
+// Water electrolysis — ice into oxygen for colony life support.
+(
+    schema_version: 1,
+    id: "recipe.electrolysis",
+    display_name: "recipe.electrolysis.name",
+    inputs: [("water", 0.5)],
+    outputs: [("oxygen", 0.4)],
+)

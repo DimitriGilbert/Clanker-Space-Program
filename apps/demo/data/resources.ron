@@ -1,0 +1,26 @@
+// The v1 resource registry (PLAN §3.5: "ten, not thirty").
+// Hand-authored fiction — every number is frozen at M3.
+//
+// `mass_per_unit_kg` is the physical datum: tank wet mass and build
+// costs resolve units -> kg through this table, so the editor's dV
+// readout is honest (csp-data/tests/parts.rs computes Tsiolkovsky from
+// these numbers). Propellant densities are KSP-flavoured: liquid_fuel
+// and oxidizer share 5 kg/unit so the 45:55 mass ratio engines burn is
+// also a 45:55 unit ratio in tank capacities. electric_charge is
+// massless — a battery is a Tank of it (§3.5 "a Cargo bay is just a
+// Tank" applied to charge).
+(
+    schema_version: 1,
+    resources: [
+        (id: "ore",             display_name: "resource.ore",             mass_per_unit_kg: 10.0),
+        (id: "metal",           display_name: "resource.metal",           mass_per_unit_kg: 10.0),
+        (id: "composite",       display_name: "resource.composite",       mass_per_unit_kg: 8.0),
+        (id: "liquid_fuel",     display_name: "resource.liquid_fuel",     mass_per_unit_kg: 5.0),
+        (id: "oxidizer",        display_name: "resource.oxidizer",        mass_per_unit_kg: 5.0),
+        (id: "monoprop",        display_name: "resource.monoprop",        mass_per_unit_kg: 4.0),
+        (id: "electric_charge", display_name: "resource.electric_charge", mass_per_unit_kg: 0.0),
+        (id: "water",           display_name: "resource.water",           mass_per_unit_kg: 1.0),
+        (id: "food",            display_name: "resource.food",            mass_per_unit_kg: 0.5),
+        (id: "oxygen",          display_name: "resource.oxygen",          mass_per_unit_kg: 0.5),
+    ],
+)
