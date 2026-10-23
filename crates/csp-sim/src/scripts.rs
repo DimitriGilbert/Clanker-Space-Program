@@ -313,7 +313,10 @@ pub enum WakeCondition {
 /// frame the residence reports: the bubble frame's body-centred
 /// vectors for `InBubble`, the conic parent's frame for `OnRails`
 /// (matching [`OrbitModel::state_at`](crate::orbit::OrbitModel)).
-#[derive(Clone, Debug, PartialEq)]
+///
+/// `Serialize` (one-directional) so the M9c interface tier can put it
+/// straight on the wire — it is a read snapshot, never a save type.
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct VesselTelemetry {
     /// The tick this snapshot was taken at.
     pub tick: u64,
@@ -373,7 +376,7 @@ pub struct VesselTelemetry {
 /// Where the vessel lives — the telemetry enum mirror of
 /// [`VesselState`](crate::VesselState) so the control layer doesn't
 /// pattern-match sim internals.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum TelemetryResidence {
     /// Conic state, no body.
     OnRails,

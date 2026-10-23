@@ -3,8 +3,44 @@ name = "csp-server"
 version = "0.0.0"
 edition.workspace = true
 license = "MIT OR Apache-2.0"
+description = "Embedded HTTP+WS+MCP interface tier (PLAN §2.12). NATIVE ONLY — never in the wasm tree."
 
+# NATIVE ONLY (§2.12.3): axum/tokio live here and nowhere else; nothing
+# in the determinism domain may see them (§8.2 asserts the ban via
+# `xtask lint-deps` + the wasm check's --exclude).
 [dependencies]
+csp-core = { workspace = true }
+csp-sim = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+# The `.cspsave` container (the replay artifact's codec: serde-bridge
+# bincode, version-scoped per §7.6/§7.7).
+bincode = { workspace = true, features = ["serde"] }
+# The §2.12.3 publish point — readers load the Arc, never block.
+arc-swap = "1"
+# HTTP/WS server + the single runtime. Caret pins: outside the
+# determinism domain (the T3 rule does not reach here).
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "time",
+    "sync",
+    "io-util",
+    "fs",
+] }
+# WS stream/sink split + SSE response streams.
+futures-util = "0.3"
+
+[dev-dependencies]
+# Router-level tests drive the app without a listener (ServiceExt).
+tower = { version = "0.5", features = ["util"] }
+# The WS e2e client's wire implementation.
+tokio-tungstenite = "0.30"
+# Fixture-built worlds for the e2e tests (the flight recipe's
+# `initial`). A dev-dep so the normal tree stays lean.
+csp-bench = { workspace = true }
 
 [lints]
 workspace = true

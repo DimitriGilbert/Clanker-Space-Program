@@ -72,6 +72,13 @@ use rhai::{AST, Dynamic, Engine, FLOAT, INT, Map, Scope};
 ///
 /// Every mutation issues a [`SimCommand`] for the next tick's drain;
 /// telemetry reads are snapshots of this tick's state.
+///
+/// **FROZEN at M9c (§6 row "Interfaces").** The MCP tool surface
+/// (`csp.mcp.tools.v1`) maps onto this trait; changing a signature,
+/// adding or removing a verb is a deliberate compatibility event that
+/// requires a new tool-schema major version. `tests/api_freeze.rs`
+/// pins the method set — a drift is a test failure, not a diff
+/// reviewer's judgment call.
 pub trait ControlApi {
     /// The bound vessel's telemetry snapshot.
     fn telemetry(&mut self) -> VesselTelemetry;
@@ -244,6 +251,9 @@ impl ControlApi for IoControlApi<'_> {
 /// call actually resolves through the registered bindings (a missing
 /// function OR a wrong arity is a `FunctionNotFound` fault), so this
 /// list matches the documented `ControlApi` surface one-for-one.
+///
+/// **FROZEN at M9c** — pinned verbatim by `tests/api_freeze.rs`;
+/// appending a name is a `csp.mcp.tools` major-version event.
 pub const CONTROL_API_SURFACE: &[(&str, &str)] = &[
     ("set_throttle", "0.0"),
     ("steer", "0.0, 1.0, 0.0"),

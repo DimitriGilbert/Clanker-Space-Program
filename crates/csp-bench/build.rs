@@ -54,20 +54,82 @@ fn main() {
     }
 }
 
-/// The `version =` line of `pkg`'s `[[package]]` block. Cargo.lock lists
-/// `name` before `version` in each block; the first match wins (a duplicate
-/// version would be a cargo-deny finding, not a fingerprint concern).
+/// The version of `pkg` the determinism domain actually links.
+///
+/// Cargo.lock lists `name` before `version` in each `[[package]]`
+/// block, but a *first-match* scan is wrong whenever `pkg` resolves to
+/// two versions — a transitive duplicate (e.g. tungstenite's
+/// `rand_chacha 0.9.0`) can sort before the workspace's real pick
+/// (csp-core's pinned `0.10.0`), and the fingerprint then reports a
+/// version nothing in the domain compiled against — a false drift
+/// warning at verify time.
+///
+/// Resolution order: when a workspace member (a `[[package]]` block
+/// with no `source =` line) names `pkg` in its `dependencies` as a
+/// versioned spec — cargo writes `"pkg X.Y.Z"` exactly when the name
+/// is ambiguous — that pinned spec is the linked version. Otherwise
+/// the highest resolved version wins (a single version is trivially
+/// its own max).
 fn locked_version(lock: &str, pkg: &str) -> Option<String> {
     let needle = format!("name = \"{pkg}\"");
-    let mut found = false;
+    let spec = format!("\"{pkg} ");
+    let mut versions: Vec<String> = Vec::new();
+    let mut pinned: Option<String> = None;
+    let mut named = false; // previous line was `name = "pkg"`
+    let mut member = false; // inside a workspace (`source`-less) package
+    let mut in_deps = false; // inside its `dependencies = [ … ]`
     for line in lock.lines().map(str::trim) {
         if line == "[[package]]" {
-            found = false;
-        } else if line == needle {
-            found = true;
-        } else if found && let Some(rest) = line.strip_prefix("version = \"") {
-            return rest.strip_suffix('"').map(str::to_string);
+            named = false;
+            member = true;
+            in_deps = false;
+            continue;
+        }
+        if line.starts_with('[') {
+            // A non-package table ([metadata], patches) — member and
+            // deps state are block-scoped; foreign dep specs must not
+            // leak into the pin.
+            member = false;
+            in_deps = false;
+            continue;
+        }
+        if line == needle {
+            named = true;
+        } else if named
+            && let Some(rest) = line.strip_prefix("version = \"")
+            && let Some(v) = rest.strip_suffix('"')
+        {
+            versions.push(v.to_string());
+            named = false;
+        }
+        if line.starts_with("source =") {
+            member = false;
+        } else if member && line.starts_with("dependencies =") {
+            in_deps = true;
+        } else if in_deps && line.starts_with(']') {
+            in_deps = false;
+        } else if in_deps
+            && pinned.is_none()
+            && let Some(rest) = line.trim_end_matches(',').strip_prefix(spec.as_str())
+        {
+            // `"pkg X.Y.Z"` or `"pkg X.Y.Z (registry+…)"` — the
+            // version token is first.
+            pinned = rest
+                .trim_end_matches('"')
+                .split_whitespace()
+                .next()
+                .map(str::to_string);
         }
     }
-    None
+    pinned.or_else(|| versions.iter().max_by_key(|v| semver_key(v)).cloned())
+}
+
+/// A numeric ordering key for `"X.Y.Z[-pre][+meta]"` — split on
+/// non-digits and compare the numeric runs lexicographically. Good
+/// enough to pick the max out of a duplicate-version pair.
+fn semver_key(v: &str) -> Vec<u64> {
+    v.split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse().unwrap_or(0))
+        .collect()
 }

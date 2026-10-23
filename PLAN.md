@@ -1733,7 +1733,7 @@ against hard-coded expected bytes; `StateHasher` against hand-computed canonical
 | Gate | What | Runs | Where |
 |---|---|---|---|
 | `cargo check` native | — | every commit | CI-HOST |
-| `cargo check` wasm | `--workspace --exclude csp-server --exclude csp-bench --target wasm32-unknown-unknown` | every commit | CI-HOST |
+| `cargo check` wasm | `--workspace --exclude csp-server --exclude csp-bench --exclude xtask --target wasm32-unknown-unknown` | every commit | CI-HOST |
 | **wasm purity (positive)** | `cargo tree --target wasm32-unknown-unknown -p csp-app` must **not** contain `csp-server`/`csp-bench`/`tokio`/`rayon`; fails on tool error. **One narrow `tokio` exception: only as a direct dependency of `wasm-bindgen-futures`** — Cargo.lock shows `wasm-bindgen-futures` 0.4.79 declares a `tokio` edge, so a feature flip that activates it is legal through that edge alone; every other path to `tokio` is a violation | every commit | CI-HOST |
 | Dependency rules | `xtask lint-deps` parses `cargo tree --format "{p}"` and asserts an explicit allow/deny list per crate; **fails on tooling error**, never passes on empty output | every commit | CI-HOST |
 | Determinism lints | `clippy.toml`: `disallowed-methods` for `f64::{sin,cos,tan,asin,acos,atan,atan2,exp,ln,log,powf,powi,sqrt,cbrt,hypot}`; `disallowed-types` for `std::collections::{HashMap,HashSet}` and `std::time::*`; `SeedableRng::seed_from_u64`. Applied via `[lints]` in `csp-core`/`csp-sim`/`csp-phys`/`csp-data` **only** | every commit | CI-HOST |
@@ -1937,8 +1937,8 @@ depend on them and because the scaffold is the first pattern an implementer copi
    already committed — keep it.
 8. **Fix the wasm CI gate.** `cargo check --workspace --target wasm32-unknown-unknown` currently
    passes only because `csp-server`/`csp-bench` are empty; the day axum/tokio lands it breaks and
-   the reflex will be to weaken the gate. Add `--exclude csp-server --exclude csp-bench` **plus** the
-   positive wasm-purity assertion (§8.2).
+   the reflex will be to weaken the gate. Add `--exclude csp-server --exclude csp-bench --exclude xtask`
+   **plus** the positive wasm-purity assertion (§8.2).
 9. **Replace the dependency-rule one-liner.** `! cargo tree -p X 2>/dev/null | grep -E ...` passes
    silently when `cargo tree` fails (empty output → grep fails → `!` succeeds), and `"rand "`
    matches nothing — while `csp-core` does pull `rand_chacha`. Replace with `xtask lint-deps`

@@ -318,6 +318,7 @@ impl crate::World {
                 science: crate::VesselScience::default(),
                 joined_colony: None,
                 reliability,
+                control_lease: crate::Lease::Player,
             },
         );
         // M9b: a freshly delivered vessel sits dormant — restamp the

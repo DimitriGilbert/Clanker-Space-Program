@@ -27,12 +27,13 @@ jobs:
       - name: test (native)
         run: cargo test --workspace
 
-      # wasm gate: exclude native-only crates (csp-server, csp-bench) so the
-      # gate survives axum/tokio landing, and assert wasm purity positively.
+      # wasm gate: exclude native-only crates (csp-server, csp-bench, xtask —
+      # xtask depends on csp-bench for the feature graph) so the gate survives
+      # axum/tokio landing, and assert wasm purity positively.
       - name: check (wasm32) — never merge a broken web build
         run: |
           cargo check --workspace --exclude csp-server --exclude csp-bench \
-            --target wasm32-unknown-unknown
+            --exclude xtask --target wasm32-unknown-unknown
 
       - name: dependency rules + wasm purity + attribution
         run: |

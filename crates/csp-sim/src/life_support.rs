@@ -401,7 +401,7 @@ impl World {
 mod tests {
     use super::*;
     use crate::transfers::vessel_resource;
-    use crate::{SimCommand, SourceClass, Vessel, VesselState, VesselThermal};
+    use crate::{Lease, SimCommand, SourceClass, Vessel, VesselState, VesselThermal};
     use csp_data::BodyId;
     use csp_phys::{PartGraph, PartNode, PartNodeId, PartTransform, TankSpec};
     use std::collections::BTreeMap;
@@ -512,6 +512,7 @@ mod tests {
                 science: crate::VesselScience::default(),
                 joined_colony: None,
                 reliability: BTreeMap::new(),
+                control_lease: Lease::Player,
             },
         );
         id

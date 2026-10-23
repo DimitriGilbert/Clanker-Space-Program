@@ -3710,6 +3710,7 @@ mod tests {
                 science: crate::VesselScience::default(),
                 joined_colony: None,
                 reliability: BTreeMap::new(),
+                control_lease: crate::Lease::Player,
             },
         );
         id

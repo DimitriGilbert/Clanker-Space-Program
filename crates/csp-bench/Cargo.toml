@@ -17,6 +17,10 @@ csp-ai = { workspace = true }
 # weld/weld-input types; the harness measures `SimpleBackend::step` cost
 # directly (§5.3's per-tick budget).
 csp-phys = { workspace = true }
+# M9c §2.12.1: `csp-mcp` — the stdio MCP bin — drives a headless sim
+# through the interface tier's transport-free engine + LocalGame host
+# (native-only, like this crate).
+csp-server = { workspace = true }
 # Scripted-controller math (atan2/acos/apsis estimates) — deterministic
 # math only, matching the sim's own rule.
 libm = { workspace = true }

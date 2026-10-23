@@ -344,6 +344,15 @@ pub struct Vessel {
     /// **Hashed and serialized** sim state. Empty for craft-less
     /// vessels and crafts carrying no reliability table.
     pub reliability: BTreeMap<csp_phys::PartNodeId, reliability::PartReliability>,
+    /// M9c §2.2.1's control lease — the single control-authority holder
+    /// ([`Lease`]). The drain checks every control-affecting command
+    /// against it: a non-leaseholder command rejects `Recoverable` onto
+    /// [`AdvanceReport::rejected`] (an explicit error on the originating
+    /// channel, never a silent drop). [`SimCommand::TakeControl`]
+    /// transfers it; `Player` preempts unconditionally.
+    /// **Hashed and serialized** — it decides future applies, so it is
+    /// state like any other gate.
+    pub control_lease: Lease,
 }
 
 impl Vessel {
@@ -387,6 +396,62 @@ pub enum SourceClass {
 impl StableDiscriminant for SourceClass {
     fn discriminant(&self) -> u16 {
         *self as u16
+    }
+}
+
+/// M9c §2.2.1's control lease — who holds a vessel's control authority.
+///
+/// Each [`Vessel`] carries exactly one `control_lease: Lease`; commands
+/// affecting a vessel's control from a non-leaseholder are rejected at the
+/// drain with a `Recoverable` on [`AdvanceReport::rejected`], never
+/// silently dropped and never logged. [`SimCommand::TakeControl`]
+/// transfers the lease; `Player` (the `Ui` source class) preempts
+/// unconditionally — the human at the keyboard can always grab the stick.
+///
+/// `Player` is also the *vacant* state: under it, `Ui`, `Script`, and
+/// `Autopilot` sources all pass the check (the player's own automation
+/// acts on their behalf — the M9a behaviour), while `External` sources
+/// must take the lease first. Under `Script(_)`/`Agent(_)`, only the
+/// named holder — and `Ui` — passes.
+///
+/// The lease is sim state: hashed and serialized. Determinism is a
+/// property of the command log — a replay feeds logged `TakeControl`s
+/// back through the queue and reproduces every apply/reject decision.
+///
+/// Discriminants are append-only and stable (the `SourceClass` rule).
+#[repr(u16)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Lease {
+    /// The human player — the default, and the vacant state.
+    Player = 0,
+    /// A loaded script holds control (its [`ScriptId`]).
+    Script(ScriptId) = 1,
+    /// An external client holds control — `source_id` of the
+    /// `SourceClass::External` producer (the server's client index).
+    Agent(u32) = 2,
+}
+
+impl StableDiscriminant for Lease {
+    fn discriminant(&self) -> u16 {
+        match self {
+            Self::Player => 0,
+            Self::Script(_) => 1,
+            Self::Agent(_) => 2,
+        }
+    }
+}
+
+/// The issuer's lease identity from its `(source_class, source_id)` —
+/// `Ui` is the player, `Script`/`External` carry their arena/client
+/// index, and `Autopilot` has no identity: the built-in drivers are the
+/// player's own automation, never leaseholders (`None` — they may not
+/// `TakeControl`).
+fn lease_identity(class: SourceClass, source_id: u32) -> Option<Lease> {
+    match class {
+        SourceClass::Ui => Some(Lease::Player),
+        SourceClass::Script => Some(Lease::Script(ScriptId(u64::from(source_id)))),
+        SourceClass::External => Some(Lease::Agent(source_id)),
+        SourceClass::Autopilot => None,
     }
 }
 
@@ -1028,6 +1093,65 @@ pub enum SimCommand {
         /// Bench units to accrue.
         units: f64,
     },
+    /// M9c §2.2.1 — transfer `vessel`'s [`Lease`] to `lease`. The rules:
+    ///
+    /// - the `Ui` source (the player) may set any lease — **Player
+    ///   preempts unconditionally**;
+    /// - the current holder may transfer or release (`lease: Player`)
+    ///   at will;
+    /// - a non-holder may acquire the lease *for itself only* while the
+    ///   vessel is `Player`-held (vacant);
+    /// - everything else rejects `Recoverable` — a non-holder cannot
+    ///   grab, steal, or force-release another holder's lease.
+    ///
+    /// `Autopilot` sources have no lease identity and may not take
+    /// control. Unknown vessels reject.
+    TakeControl {
+        /// The vessel whose lease moves.
+        vessel: VesselId,
+        /// The holder to install.
+        lease: Lease,
+    },
+}
+
+impl SimCommand {
+    /// M9c §2.2.1 — the vessel whose [`Lease`] gates this command, if
+    /// the command is *control-affecting*: the flight-control surface
+    /// (`SetThrottle`/`SetAttitude`/residence transitions), the
+    /// part/staging actions (`JettisonPart`, `SetAeroConfig`,
+    /// `Undock`), maneuver-node scheduling, and the commands that
+    /// install or remove control programs (`LoadScript`,
+    /// `EngageAutopilot`, `DisengageAutopilot`). Everything else —
+    /// world commands, resource/crew moves, science, economy — is
+    /// ungated: it does not steer the craft, and session-class actions
+    /// have their own channels.
+    ///
+    /// `UnloadScript`/`SetScriptEnabled` are also control-affecting —
+    /// unloading a lease-holding script vacates its lease, disabling
+    /// it neuters the controller — but they carry no vessel field:
+    /// the drain resolves `scripts[id].vessel` and gates on the bound
+    /// vessel instead (see `apply_command`).
+    ///
+    /// `TakeControl` deliberately returns `None`: it has its own
+    /// transfer rules (see its doc), not the holder-check.
+    pub fn control_gated_vessel(&self) -> Option<VesselId> {
+        match self {
+            Self::SetThrottle { vessel, .. }
+            | Self::SetAttitude { vessel, .. }
+            | Self::Unlatch { vessel }
+            | Self::ToRails { vessel }
+            | Self::ToBubble { vessel }
+            | Self::SetAeroConfig { vessel, .. }
+            | Self::JettisonPart { vessel, .. }
+            | Self::SetManeuver { vessel, .. }
+            | Self::DeleteManeuver { vessel }
+            | Self::Undock { vessel, .. }
+            | Self::LoadScript { vessel, .. }
+            | Self::EngageAutopilot { vessel, .. }
+            | Self::DisengageAutopilot { vessel } => Some(*vessel),
+            _ => None,
+        }
+    }
 }
 
 /// What `step_frame` did (§2.6.2): where the clock landed, what the
@@ -1077,6 +1201,15 @@ pub struct AdvanceReport {
     /// back-pressure, never a stall: a partial still advanced the clock,
     /// fired events, or applied commands (§2.6.5).
     pub partial: bool,
+    /// The target this call actually chased: `max(target, every
+    /// `AdvanceTo` arg drained inside the call)`. A `partial` report
+    /// means `reached_tick < effective_target`; re-issuing
+    /// `step_frame(effective_target)` continues the same advance —
+    /// the recorder contract's "re-issue the same effective target"
+    /// made readable (the `AdvanceTo` a drain applied lives *inside*
+    /// the call, so the caller cannot recompute it from its own
+    /// `target` alone).
+    pub effective_target: u64,
     /// M9a §2.10: script `log`/`print` lines produced during this call,
     /// in production order — the console channel scripts surface through.
     /// Never hashed or serialized (output, like `command_log`).
@@ -2784,6 +2917,22 @@ impl World {
         &self.orbits
     }
 
+    /// The same telemetry snapshot a script/autopilot tick would see
+    /// for `vessel` — the interface tier's (M9c §2.12) read path: the
+    /// server and MCP hosts call this rather than re-deriving frames
+    /// themselves. Pure observation; `found: false` on unknown ids.
+    pub fn telemetry(&self, vessel: VesselId) -> VesselTelemetry {
+        WorldTickIo::telemetry_at(
+            &self.vessels,
+            &self.orbits,
+            self.physics
+                .as_ref()
+                .map(|p| (p.backend.environment(), &p.dominant)),
+            self.clock,
+            vessel,
+        )
+    }
+
     /// Read-only access to the on-rails vessel arena — `BTreeMap` order is
     /// ascending-ID (§2.2). Observation only: the mutation surface stays
     /// `enqueue` + `step_frame`.
@@ -3859,10 +4008,30 @@ impl World {
     #[allow(clippy::too_many_lines)] // the arm-per-variant table grew with M7-A
     fn apply_command(
         &mut self,
+        src: (SourceClass, u32),
         command: &SimCommand,
         effective_target: &mut u64,
         shadow: &mut TickShadow,
     ) -> Result<(), SimError> {
+        // M9c §2.2.1 — the control lease gates every control-affecting
+        // command BEFORE its apply: a non-leaseholder command rejects
+        // `Recoverable` onto `AdvanceReport::rejected` with zero world
+        // writes (the "rejected on the originating channel" channel).
+        // `UnloadScript`/`SetScriptEnabled` carry no vessel field but
+        // ARE control-affecting — unloading a lease-holding script
+        // vacates its lease (a steal path); disabling it neuters the
+        // controller. They gate on the script's *bound* vessel,
+        // resolved here where the arena is in scope; an unknown id is
+        // ungated — its own apply's unknown-id diagnostic is the error.
+        let gated_vessel = command.control_gated_vessel().or_else(|| match command {
+            SimCommand::UnloadScript { script } | SimCommand::SetScriptEnabled { script, .. } => {
+                self.scripts.get(script).map(|s| s.vessel)
+            }
+            _ => None,
+        });
+        if let Some(vessel) = gated_vessel {
+            self.check_control_lease(vessel, src)?;
+        }
         match command {
             SimCommand::SetWarp(level) => self.warp_level = *level,
             SimCommand::AdvanceTo(t) => *effective_target = (*effective_target).max(*t),
@@ -4075,6 +4244,76 @@ impl World {
                 self.shadow_autopilots(shadow);
                 self.autopilots.remove(vessel);
             }
+            SimCommand::TakeControl { vessel, lease } => {
+                self.apply_take_control(*vessel, *lease, src, shadow)?
+            }
+        }
+        Ok(())
+    }
+
+    /// M9c §2.2.1 — the drain-side lease gate. `Ui` preempts
+    /// unconditionally; under a `Player` (vacant) lease the player's
+    /// own automation (`Script`/`Autopilot`) passes while `External`
+    /// sources must hold the lease; under `Script(_)`/`Agent(_)` only
+    /// the named holder passes. An unknown vessel is `Ok` — the
+    /// apply's own unknown-vessel diagnostic is the better error.
+    fn check_control_lease(
+        &self,
+        vessel: VesselId,
+        src: (SourceClass, u32),
+    ) -> Result<(), SimError> {
+        if src.0 == SourceClass::Ui {
+            return Ok(());
+        }
+        let Some(v) = self.vessels.get(&vessel) else {
+            return Ok(());
+        };
+        let allowed = match v.control_lease {
+            Lease::Player => matches!(src.0, SourceClass::Script | SourceClass::Autopilot),
+            Lease::Script(id) => src == (SourceClass::Script, id.0 as u32),
+            Lease::Agent(client) => src == (SourceClass::External, client),
+        };
+        if allowed {
+            Ok(())
+        } else {
+            Err(SimError::Recoverable(
+                "lease: control-affecting command from a non-leaseholder",
+            ))
+        }
+    }
+
+    /// `TakeControl` — the §2.2.1 lease transfer (see the variant's
+    /// doc for the rule table).
+    fn apply_take_control(
+        &mut self,
+        vessel: VesselId,
+        lease: Lease,
+        src: (SourceClass, u32),
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        let Some(current) = self.vessels.get(&vessel).map(|v| v.control_lease) else {
+            return Err(SimError::Recoverable("take_control: unknown vessel"));
+        };
+        let Some(me) = lease_identity(src.0, src.1) else {
+            return Err(SimError::Recoverable(
+                "take_control: autopilot sources hold no lease identity",
+            ));
+        };
+        let allowed = me == Lease::Player // Player preempts unconditionally
+            || me == current // the holder transfers/releases at will
+            || (current == Lease::Player && lease == me); // vacant: acquire for self
+        if !allowed {
+            return Err(SimError::Recoverable(
+                "take_control: lease held by another controller",
+            ));
+        }
+        if current != lease {
+            self.shadow_vessels(shadow);
+            let v = self
+                .vessels
+                .get_mut(&vessel)
+                .ok_or(SimError::Fatal("take_control: vessel vanished mid-apply"))?;
+            v.control_lease = lease;
         }
         Ok(())
     }
@@ -4242,6 +4481,7 @@ impl World {
                 crew: Vec::new(),
                 // Craft-less vessels carry no reliability model.
                 reliability: BTreeMap::new(),
+                control_lease: Lease::Player,
             },
         );
         // M7-D: the spawn IS an orbit-achieved transition — the
@@ -4421,6 +4661,7 @@ impl World {
                 // one instance id + pre-drawn θ per node (§3.4).
                 reliability: reliability_records,
                 crew: Vec::new(),
+                control_lease: Lease::Player,
             },
         );
         // No SOI publish: a bubble-resident vessel has no conic.
@@ -5579,6 +5820,7 @@ impl World {
                 // The split-off fragment starts unjoined — a fresh
                 // `JoinColonyInventory` opts it in explicitly.
                 joined_colony: None,
+                control_lease: Lease::Player,
             },
         );
         // Scrub the finalized projects' pending event pair (they name
@@ -5699,7 +5941,7 @@ impl World {
             *seq = seq
                 .checked_add(1)
                 .ok_or(SimError::Fatal("source_seq counter overflow"))?;
-            match self.apply_command(&command, effective_target, &mut cmd_shadow) {
+            match self.apply_command(src, &command, effective_target, &mut cmd_shadow) {
                 Ok(()) => {
                     self.command_log.push((key, command));
                     *commands_applied += 1;
@@ -6079,12 +6321,29 @@ impl World {
         }
         self.shadow_scripts(shadow);
         self.shadow_events(shadow);
+        let bound = self.scripts.get(&id).map(|s| s.vessel);
         self.scripts.remove(&id);
         let kept: Vec<ScheduledEvent> = std::mem::take(&mut self.event_heap)
             .into_iter()
             .filter(|e| !matches!(&e.kind, EventKind::ScriptWake { script } if *script == id))
             .collect();
         self.event_heap = kept.into_iter().collect();
+        // M9c: a dead script cannot hold a lease — release the bound
+        // vessel back to `Player` so the craft is never stranded under
+        // a controller that no longer exists.
+        if let Some(vessel) = bound
+            && self
+                .vessels
+                .get(&vessel)
+                .is_some_and(|v| v.control_lease == Lease::Script(id))
+        {
+            self.shadow_vessels(shadow);
+            let v = self
+                .vessels
+                .get_mut(&vessel)
+                .ok_or(SimError::Fatal("unload: bound vessel vanished"))?;
+            v.control_lease = Lease::Player;
+        }
         if let Some(engine) = self.script_engine.as_mut() {
             engine.unload(id);
         }
@@ -6599,6 +6858,7 @@ impl World {
             rejected,
             degraded,
             partial: self.clock.ticks() < effective_target,
+            effective_target,
             script_log: std::mem::take(&mut self.script_log),
         })
     }
@@ -6953,11 +7213,20 @@ impl WorldTickIo<'_> {
     }
 }
 
-impl TickIo for WorldTickIo<'_> {
+impl WorldTickIo<'_> {
+    /// The telemetry computation shared by the per-tick io and
+    /// [`World::telemetry`] — same fields, same frames; the public
+    /// read never stands up a mutable io.
     #[allow(clippy::too_many_lines)]
-    fn telemetry(&self, vessel: VesselId) -> VesselTelemetry {
+    fn telemetry_at(
+        vessels: &BTreeMap<VesselId, Vessel>,
+        orbits: &PatchedConics,
+        physics_env: Option<(&csp_phys::Environment, &BodyId)>,
+        clock: SimTime,
+        vessel: VesselId,
+    ) -> VesselTelemetry {
         let mut t = VesselTelemetry {
-            tick: self.clock.ticks(),
+            tick: clock.ticks(),
             found: false,
             residence: TelemetryResidence::Missing,
             pos_m: DVec3::ZERO,
@@ -6979,7 +7248,7 @@ impl TickIo for WorldTickIo<'_> {
             elements: None,
             maneuver_node: None,
         };
-        let Some(v) = self.vessels.get(&vessel) else {
+        let Some(v) = vessels.get(&vessel) else {
             return t;
         };
         t.found = true;
@@ -7015,7 +7284,7 @@ impl TickIo for WorldTickIo<'_> {
             t.altitude_m = radius.map(|b| r - b);
             t.mu_m3_per_s2 = mu;
             if let (Some(mu), Some(el)) = (mu, &elements) {
-                let (apo, pe, ta, tp) = Self::osculating(el, mu, radius, epoch, self.clock.ticks());
+                let (apo, pe, ta, tp) = Self::osculating(el, mu, radius, epoch, clock.ticks());
                 t.apoapsis_altitude_m = apo;
                 t.periapsis_altitude_m = pe;
                 t.time_to_apoapsis_s = ta;
@@ -7027,7 +7296,7 @@ impl TickIo for WorldTickIo<'_> {
             VesselState::InBubble(body) => {
                 t.residence = TelemetryResidence::InBubble;
                 t.mass_kg = Some(body.mass_kg);
-                if let Some((env, dominant)) = self.physics_env {
+                if let Some((env, dominant)) = physics_env {
                     let rel = body.com_world() - env.body_center;
                     let elements =
                         orbit::cartesian_to_elements(rel, body.vel, env.mu_m3_per_s2).ok();
@@ -7039,7 +7308,7 @@ impl TickIo for WorldTickIo<'_> {
                         body.throttle,
                         Some(env.mu_m3_per_s2),
                         Some(env.radius_m),
-                        self.clock.ticks(),
+                        clock.ticks(),
                         Some(dominant.clone()),
                         elements,
                     );
@@ -7047,13 +7316,12 @@ impl TickIo for WorldTickIo<'_> {
             }
             VesselState::OnRails(orbit) => {
                 t.residence = TelemetryResidence::OnRails;
-                let mu = self
-                    .orbits
+                let mu = orbits
                     .body_orbit(&orbit.parent)
                     .ok()
                     .map(|b| b.mu_m3_per_s2);
-                let radius = self.orbits.body_radius(&orbit.parent);
-                if let Ok((rel, vel)) = self.orbits.state_at(orbit, self.clock) {
+                let radius = orbits.body_radius(&orbit.parent);
+                if let Ok((rel, vel)) = orbits.state_at(orbit, clock) {
                     fill(
                         rel,
                         vel,
@@ -7075,6 +7343,18 @@ impl TickIo for WorldTickIo<'_> {
             }
         }
         t
+    }
+}
+
+impl TickIo for WorldTickIo<'_> {
+    fn telemetry(&self, vessel: VesselId) -> VesselTelemetry {
+        Self::telemetry_at(
+            self.vessels,
+            self.orbits,
+            self.physics_env,
+            self.clock,
+            vessel,
+        )
     }
 
     fn issue(&mut self, class: SourceClass, source_id: u32, command: SimCommand) {
@@ -8510,6 +8790,7 @@ fn apply_breakup(
                 // with the retained hull — it re-joins explicitly
                 // if it lands beside the colony.
                 joined_colony: None,
+                control_lease: Lease::Player,
             },
         );
         frag_vid.push((id, frag_nodes.clone()));
@@ -8679,6 +8960,7 @@ fn apply_breakup(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // field-per-line walk — splitting hides order
 fn hash_vessel(h: &mut StateHasher, vessel: &Vessel) {
     h.opt(&vessel.craft, |h, craft| {
         hash_craft(h, craft);
@@ -8754,6 +9036,18 @@ fn hash_vessel(h: &mut StateHasher, vessel: &Vessel) {
     // part instance" plus the pre-drawn thresholds, hashed like the
     // tank contents they partition with.
     reliability::hash_vessel_reliability(h, &vessel.reliability);
+    // M9c: the control lease — it decides which commands apply, so it
+    // is hashed state like every other gate (§7.1's completeness rule).
+    h.stable_enum(&vessel.control_lease);
+    match vessel.control_lease {
+        Lease::Player => {}
+        Lease::Script(id) => {
+            h.u64(id.0);
+        }
+        Lease::Agent(client) => {
+            h.u32(client);
+        }
+    }
     h.stable_enum(&vessel.state);
     match &vessel.state {
         VesselState::OnRails(orbit) => {
@@ -10121,6 +10415,7 @@ mod tests {
                 tank_contents: BTreeMap::new(),
                 crew: Vec::new(),
                 reliability: BTreeMap::new(),
+                control_lease: Lease::Player,
             },
         );
         s.next_vessel_id = 3;
@@ -12036,6 +12331,7 @@ mod tests {
                 tank_contents: BTreeMap::new(),
                 crew: Vec::new(),
                 reliability: BTreeMap::new(),
+                control_lease: Lease::Player,
             },
         );
         let mut physics = Physics {
@@ -14059,6 +14355,7 @@ mod tests {
                     tank_contents: BTreeMap::new(),
                     crew: Vec::new(),
                     reliability: BTreeMap::new(),
+                    control_lease: Lease::Player,
                 },
             );
         };
@@ -14197,6 +14494,7 @@ mod tests {
             tank_contents: BTreeMap::new(),
             crew: Vec::new(),
             reliability: BTreeMap::new(),
+            control_lease: Lease::Player,
         }
     }
 
@@ -15125,6 +15423,7 @@ mod tests {
             tank_contents: BTreeMap::new(),
             crew: Vec::new(),
             reliability: BTreeMap::new(),
+            control_lease: Lease::Player,
         };
         let mut vessels = BTreeMap::new();
         vessels.insert(VesselId(0), mk(0, 0.0));
@@ -16065,6 +16364,7 @@ mod tests {
                 tank_contents: BTreeMap::new(),
                 crew: Vec::new(),
                 reliability: BTreeMap::from([(node, rec)]),
+                control_lease: Lease::Player,
             }
         }
 
@@ -16373,6 +16673,7 @@ mod tests {
                 tank_contents: BTreeMap::new(),
                 crew: Vec::new(),
                 reliability: BTreeMap::new(),
+                control_lease: Lease::Player,
             };
             assert!(World::spec_for(&v, node).is_none());
             // A covering table still resolves — the gate is not a
@@ -16753,6 +17054,487 @@ mod tests {
                 panic!("orbiter must be resident");
             };
             assert_eq!(body.throttle, 0.25);
+        }
+    }
+    // -------------------------------------------------------------------
+    // M9c §2.2.1 — the control lease
+    // -------------------------------------------------------------------
+    mod m9c {
+        use super::*;
+
+        /// An in-bubble test vessel on a physics world — lease tests
+        /// need a resident body so a *passing* control command has a
+        /// visible effect (`body.throttle`).
+        fn leased_world() -> World {
+            let mut w = physics_world(false);
+            spawn_physical(
+                &mut w,
+                SimCommand::SpawnPhysicalVessel {
+                    craft: box_craft(5_000.0, DVec3::new(0.5, 0.5, 1.5), 0.0),
+                    pos: DVec3::new(TERRIN_R + 100.0, 0.0, 0.0),
+                    rot: pad_rot(),
+                    vel: DVec3::ZERO,
+                    ang_vel: DVec3::ZERO,
+                },
+            );
+            w
+        }
+
+        /// Drain all enqueued commands at the next boundary.
+        fn drain(w: &mut World) -> AdvanceReport {
+            let t = w.clock().ticks();
+            w.step_frame(t + 1).unwrap()
+        }
+
+        /// §2.2.1: a control command from an `External` source on a
+        /// `Player`-leased (vacant) vessel rejects onto
+        /// `AdvanceReport::rejected` — never silently dropped, never
+        /// logged, and zero state change.
+        #[test]
+        fn external_control_rejects_without_lease() {
+            let mut w = leased_world();
+            // The same world advanced one tick with nothing enqueued —
+            // the rejection must leave the state identical (a rejected
+            // command is not re-queued and consumes no stamp).
+            let mut clean = leased_world();
+            clean.step_frame(clean.clock().ticks() + 1).unwrap();
+            w.enqueue(
+                SourceClass::External,
+                0,
+                SimCommand::SetThrottle {
+                    vessel: VesselId(0),
+                    throttle: 1.0,
+                },
+            );
+            let r = drain(&mut w);
+            assert_eq!(r.commands_applied, 0);
+            assert_eq!(r.rejected.len(), 1);
+            let (key, err) = &r.rejected[0];
+            assert_eq!(key.source_class, SourceClass::External);
+            assert!(matches!(err, SimError::Recoverable(m) if m.contains("lease")));
+            // Not logged (the log holds only the spawn).
+            assert_eq!(w.command_log().len(), 1);
+            assert!(matches!(
+                w.command_log()[0].1,
+                SimCommand::SpawnPhysicalVessel { .. }
+            ));
+            assert_eq!(w.state_hash().unwrap(), clean.state_hash().unwrap());
+            assert_eq!(w.command_log(), clean.command_log());
+        }
+
+        /// The full handshake: `TakeControl{Agent}` acquires the
+        /// vacant lease, the holder's control commands then apply and
+        /// log under `source_class = External` — the same one-tick
+        /// latency and determinism contract as every producer.
+        #[test]
+        fn take_control_then_control_applies() {
+            let mut w = leased_world();
+            w.enqueue(
+                SourceClass::External,
+                3,
+                SimCommand::TakeControl {
+                    vessel: VesselId(0),
+                    lease: Lease::Agent(3),
+                },
+            );
+            let r = drain(&mut w);
+            assert_eq!(r.commands_applied, 1);
+            assert_eq!(w.vessels()[&VesselId(0)].control_lease, Lease::Agent(3));
+
+            w.enqueue(
+                SourceClass::External,
+                3,
+                SimCommand::SetThrottle {
+                    vessel: VesselId(0),
+                    throttle: 0.5,
+                },
+            );
+            let r = drain(&mut w);
+            assert_eq!(r.commands_applied, 1, "rejected: {:?}", r.rejected);
+            let (key, _) = w.command_log().last().unwrap();
+            assert_eq!(key.source_class, SourceClass::External);
+            assert_eq!(key.source_id, 3);
+            assert_eq!(w.vessels()[&VesselId(0)].body().unwrap().throttle, 0.5);
+        }
+
+        /// While `Agent(3)` holds, a second client is locked out on
+        /// both axes: its control commands reject AND its `TakeControl`
+        /// attempts — acquire-for-self and force-release — reject.
+        #[test]
+        fn second_client_cannot_touch_or_steal() {
+            let mut w = leased_world();
+            w.enqueue(
+                SourceClass::External,
+                3,
+                SimCommand::TakeControl {
+                    vessel: VesselId(0),
+                    lease: Lease::Agent(3),
+                },
+            );
+            drain(&mut w);
+            w.enqueue(
+                SourceClass::External,
+                4,
+                SimCommand::SetThrottle {
+                    vessel: VesselId(0),
+                    throttle: 1.0,
+                },
+            );
+            w.enqueue(
+                SourceClass::External,
+                4,
+                SimCommand::TakeControl {
+                    vessel: VesselId(0),
+                    lease: Lease::Agent(4),
+                },
+            );
+            w.enqueue(
+                SourceClass::External,
+                4,
+                SimCommand::TakeControl {
+                    vessel: VesselId(0),
+                    lease: Lease::Player,
+                },
+            );
+            let r = drain(&mut w);
+            assert_eq!(r.commands_applied, 0);
+            assert_eq!(r.rejected.len(), 3);
+            assert_eq!(w.vessels()[&VesselId(0)].control_lease, Lease::Agent(3));
+        }
+
+        /// `Player` preempts unconditionally: `Ui` control commands
+        /// apply straight through an `Agent` lease, and a `Ui`
+        /// `TakeControl` reclaims the vessel at will.
+        #[test]
+        fn player_preempts_unconditionally() {
+            let mut w = leased_world();
+            w.enqueue(
+                SourceClass::External,
+                3,
+                SimCommand::TakeControl {
+                    vessel: VesselId(0),
+                    lease: Lease::Agent(3),
+                },
+            );
+            drain(&mut w);
+            // Ui control through the held lease.
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::SetThrottle {
+                    vessel: VesselId(0),
+                    throttle: 0.25,
+                },
+            );
+            let r = drain(&mut w);
+            assert_eq!(r.commands_applied, 1, "rejected: {:?}", r.rejected);
+            assert_eq!(w.vessels()[&VesselId(0)].body().unwrap().throttle, 0.25);
+            // Ui reclaim — then the agent is a non-holder again.
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::TakeControl {
+                    vessel: VesselId(0),
+                    lease: Lease::Player,
+                },
+            );
+            drain(&mut w);
+            assert_eq!(w.vessels()[&VesselId(0)].control_lease, Lease::Player);
+            w.enqueue(
+                SourceClass::External,
+                3,
+                SimCommand::SetThrottle {
+                    vessel: VesselId(0),
+                    throttle: 1.0,
+                },
+            );
+            let r = drain(&mut w);
+            assert_eq!(r.commands_applied, 0);
+            assert_eq!(r.rejected.len(), 1);
+        }
+
+        /// The holder releases at will — `TakeControl{Player}` from
+        /// the holder's own channel returns the vessel to vacant.
+        #[test]
+        fn holder_releases_its_lease() {
+            let mut w = leased_world();
+            for lease in [Lease::Agent(3), Lease::Player] {
+                w.enqueue(
+                    SourceClass::External,
+                    3,
+                    SimCommand::TakeControl {
+                        vessel: VesselId(0),
+                        lease,
+                    },
+                );
+                drain(&mut w);
+            }
+            assert_eq!(w.vessels()[&VesselId(0)].control_lease, Lease::Player);
+        }
+
+        /// Under the vacant `Player` lease the player's own automation
+        /// keeps the M9a behaviour: `Script`/`Autopilot` sources pass —
+        /// only `External` must take the lease.
+        #[test]
+        fn vacant_lease_passes_in_sim_automation() {
+            let mut w = leased_world();
+            w.enqueue(
+                SourceClass::Script,
+                0,
+                SimCommand::SetThrottle {
+                    vessel: VesselId(0),
+                    throttle: 0.4,
+                },
+            );
+            w.enqueue(
+                SourceClass::Autopilot,
+                0,
+                SimCommand::SetAttitude {
+                    vessel: VesselId(0),
+                    rot: csp_core::DQuat::IDENTITY,
+                    ang_vel: DVec3::ZERO,
+                },
+            );
+            let r = drain(&mut w);
+            assert_eq!(r.commands_applied, 2, "rejected: {:?}", r.rejected);
+            assert_eq!(w.vessels()[&VesselId(0)].body().unwrap().throttle, 0.4);
+        }
+
+        /// A `Script(_)` lease is exclusive the same way: the named
+        /// script and `Ui` pass; a different script and any agent
+        /// reject.
+        #[test]
+        fn script_lease_is_exclusive() {
+            let mut w = leased_world();
+            // The player grants the lease to script 2 (Ui preempts).
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::TakeControl {
+                    vessel: VesselId(0),
+                    lease: Lease::Script(ScriptId(2)),
+                },
+            );
+            drain(&mut w);
+            w.enqueue(
+                SourceClass::Script,
+                2,
+                SimCommand::SetThrottle {
+                    vessel: VesselId(0),
+                    throttle: 0.6,
+                },
+            );
+            w.enqueue(
+                SourceClass::Script,
+                9,
+                SimCommand::SetThrottle {
+                    vessel: VesselId(0),
+                    throttle: 0.9,
+                },
+            );
+            w.enqueue(
+                SourceClass::External,
+                0,
+                SimCommand::SetThrottle {
+                    vessel: VesselId(0),
+                    throttle: 0.9,
+                },
+            );
+            let r = drain(&mut w);
+            assert_eq!(r.commands_applied, 1);
+            assert_eq!(r.rejected.len(), 2);
+            assert_eq!(w.vessels()[&VesselId(0)].body().unwrap().throttle, 0.6);
+        }
+
+        /// `UnloadScript` releases a `Script(_)` lease on the bound
+        /// vessel — a dead controller can never strand the craft.
+        #[test]
+        fn unload_script_releases_lease() {
+            let mut w = World::with_system(test_system());
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::SpawnVessel {
+                    parent: BodyId::from("p"),
+                    elements: leo_elements(),
+                },
+            );
+            drain(&mut w);
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::LoadScript {
+                    vessel: VesselId(0),
+                    source: "fn on_tick(ctx) {}".to_string(),
+                },
+            );
+            drain(&mut w);
+            let id = *w.scripts().keys().next().unwrap();
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::TakeControl {
+                    vessel: VesselId(0),
+                    lease: Lease::Script(id),
+                },
+            );
+            drain(&mut w);
+            assert_eq!(w.vessels()[&VesselId(0)].control_lease, Lease::Script(id));
+            w.enqueue(SourceClass::Ui, 0, SimCommand::UnloadScript { script: id });
+            drain(&mut w);
+            assert_eq!(w.vessels()[&VesselId(0)].control_lease, Lease::Player);
+        }
+
+        /// The steal path the script-arena gate closes: a non-holder
+        /// cannot vacate a `Script(_)` lease by unloading — or neuter
+        /// it by disabling — the holder. `UnloadScript`/
+        /// `SetScriptEnabled` gate on the script's *bound* vessel;
+        /// both reject `Recoverable`, the lease stands, and the
+        /// follow-up `TakeControl` still refuses.
+        #[test]
+        fn external_cannot_unload_lease_holding_script() {
+            let mut w = World::with_system(test_system());
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::SpawnVessel {
+                    parent: BodyId::from("p"),
+                    elements: leo_elements(),
+                },
+            );
+            drain(&mut w);
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::LoadScript {
+                    vessel: VesselId(0),
+                    source: "fn on_tick(ctx) {}".to_string(),
+                },
+            );
+            drain(&mut w);
+            let id = *w.scripts().keys().next().unwrap();
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::TakeControl {
+                    vessel: VesselId(0),
+                    lease: Lease::Script(id),
+                },
+            );
+            drain(&mut w);
+            assert_eq!(w.vessels()[&VesselId(0)].control_lease, Lease::Script(id));
+            // External client 7 — not the holder — tries both verbs.
+            w.enqueue(
+                SourceClass::External,
+                7,
+                SimCommand::UnloadScript { script: id },
+            );
+            w.enqueue(
+                SourceClass::External,
+                7,
+                SimCommand::SetScriptEnabled {
+                    script: id,
+                    enabled: false,
+                },
+            );
+            let r = drain(&mut w);
+            assert_eq!(r.commands_applied, 0);
+            assert_eq!(r.rejected.len(), 2);
+            assert!(w.scripts().contains_key(&id));
+            assert!(w.scripts()[&id].enabled);
+            assert_eq!(w.vessels()[&VesselId(0)].control_lease, Lease::Script(id));
+            // The steal still refuses — the lease never vacated.
+            w.enqueue(
+                SourceClass::External,
+                7,
+                SimCommand::TakeControl {
+                    vessel: VesselId(0),
+                    lease: Lease::Agent(7),
+                },
+            );
+            let r = drain(&mut w);
+            assert_eq!(r.rejected.len(), 1);
+            assert_eq!(w.vessels()[&VesselId(0)].control_lease, Lease::Script(id));
+            // The holder itself may unload — `(Script, id)` is the
+            // lease's named holder.
+            w.enqueue(
+                SourceClass::Script,
+                id.0 as u32,
+                SimCommand::UnloadScript { script: id },
+            );
+            let r = drain(&mut w);
+            assert_eq!(r.commands_applied, 1, "rejected: {:?}", r.rejected);
+            assert_eq!(w.vessels()[&VesselId(0)].control_lease, Lease::Player);
+        }
+
+        /// `Autopilot` sources hold no lease identity — a `TakeControl`
+        /// stamped `Autopilot` rejects even on a vacant vessel.
+        #[test]
+        fn autopilot_source_cannot_take_control() {
+            let mut w = leased_world();
+            w.enqueue(
+                SourceClass::Autopilot,
+                0,
+                SimCommand::TakeControl {
+                    vessel: VesselId(0),
+                    lease: Lease::Player,
+                },
+            );
+            let r = drain(&mut w);
+            assert_eq!(r.rejected.len(), 1);
+        }
+
+        /// The lease is sim state: snapshot→restore keeps it, and the
+        /// state hash covers it (§7.1 completeness — it decides which
+        /// commands apply).
+        #[test]
+        fn lease_is_serialized_and_hashed() {
+            let a = leased_world();
+            let mut b = leased_world();
+            b.enqueue(
+                SourceClass::External,
+                1,
+                SimCommand::TakeControl {
+                    vessel: VesselId(0),
+                    lease: Lease::Agent(1),
+                },
+            );
+            drain(&mut b);
+            assert_ne!(a.state_hash().unwrap(), b.state_hash().unwrap());
+            // Round-trip: the restored world keeps the lease, and its
+            // gate keeps deciding the same way.
+            let snap = b.snapshot().unwrap();
+            let mut r = World::restore(test_system(), b.config().physics.clone(), snap).unwrap();
+            assert_eq!(r.vessels()[&VesselId(0)].control_lease, Lease::Agent(1));
+            assert_eq!(r.state_hash().unwrap(), b.state_hash().unwrap());
+            r.enqueue(
+                SourceClass::External,
+                9,
+                SimCommand::SetThrottle {
+                    vessel: VesselId(0),
+                    throttle: 1.0,
+                },
+            );
+            let rep = drain(&mut r);
+            assert_eq!(rep.rejected.len(), 1);
+        }
+
+        /// §2.2.1's ordering contract for `External`: same-tick
+        /// commands order by `source_class` — `Ui` (2) drains before
+        /// `External` (3), stamped at the dequeue tick.
+        #[test]
+        fn external_commands_enter_the_total_order() {
+            let mut w = World::new();
+            w.enqueue(SourceClass::Ui, 0, SimCommand::SetWarp(4));
+            w.enqueue(SourceClass::External, 7, SimCommand::SetWarp(16));
+            w.step_frame(1).unwrap();
+            let log = w.command_log();
+            assert_eq!(log.len(), 2);
+            assert_eq!(log[0].0.source_class, SourceClass::Ui);
+            assert_eq!(log[1].0.source_class, SourceClass::External);
+            assert_eq!(log[1].0.source_id, 7);
+            assert!(log[0].0 < log[1].0);
+            assert_eq!(w.warp_level(), 16);
         }
     }
 }

@@ -928,7 +928,7 @@ impl World {
 mod tests {
     use super::*;
     use crate::{
-        CraftDef, SimCommand, SourceClass, SurfacePose, Vessel, VesselScience, VesselState,
+        CraftDef, Lease, SimCommand, SourceClass, SurfacePose, Vessel, VesselScience, VesselState,
         VesselThermal,
     };
     use csp_core::DQuat;
@@ -1005,6 +1005,7 @@ mod tests {
                 science: VesselScience::default(),
                 joined_colony: None,
                 reliability: BTreeMap::new(),
+                control_lease: Lease::Player,
             },
         );
         id

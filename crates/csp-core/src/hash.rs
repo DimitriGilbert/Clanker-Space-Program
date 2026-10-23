@@ -169,7 +169,14 @@ use crate::SimError;
 /// `BenchTest` (9); `FailureMode`/`StressKind` gained explicit stable
 /// `u16` discriminants. `WorldSnapshot`/`TickShadow` gained the
 /// reliability fields (save format change). The goldens rebless.
-pub const HASH_SCHEMA_VERSION: u32 = 17;
+///
+/// **Version 18** (M9c): §2.2.1's control lease — the vessel walk
+/// appended `control_lease` (`Lease`, a new `repr(u16)` sum type:
+/// `Player`/`Script`/`Agent`), `SimCommand` gained `TakeControl`
+/// (appended, never renumbered), and `Vessel`/`WorldSnapshot` carry the
+/// field (save format change). `UnloadScript` now also releases a
+/// `Script(_)` lease on its bound vessel. The goldens rebless.
+pub const HASH_SCHEMA_VERSION: u32 = 18;
 
 /// Rule-7 sum types: the source of an enum's *declared* stable `u16`
 /// discriminant (PLAN §7.1 rule 7).
