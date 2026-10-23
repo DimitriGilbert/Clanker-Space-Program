@@ -245,13 +245,23 @@ pub const MAX_EVENTS_PER_BATCH: u64 = 1_024;
 /// §2.13's documented fallback for a `Recoverable` event application: the
 /// failed event is rolled back and dropped, the error rides
 /// [`AdvanceReport::degraded`], and a bare `SoiRescan` is re-published at
-/// `clock + DEGRADED_RESCAN_TICKS` so the Orbits subsystem keeps a live
-/// publish deadline (the next scan re-examines the full window, so a
+/// `event.tick + DEGRADED_RESCAN_TICKS` so the Orbits subsystem keeps a
+/// live publish deadline (the next scan re-examines the full window, so a
 /// bounded retry cadence loses no information — it only re-asks later).
-/// 4096 ticks = 64 sim-seconds at 64 Hz: often enough that a transient
-/// solver hiccup heals quickly, rare enough that a permanently broken
-/// orbit cannot storm the event budget.
-pub const DEGRADED_RESCAN_TICKS: u64 = 4_096;
+///
+/// The republish anchors at the failed event's *own* tick — a pure
+/// function of the event, identical under every §2.6.1 partition (a mid-
+/// interval firing's `event.tick` sits below the restored `t_next`
+/// clock). The value must satisfy `event.tick + K > t_next` for every
+/// event a batch can pop so `schedule_event`'s strict `tick > clock`
+/// invariant holds: every poppable event's tick lies strictly ahead of
+/// the interval's start (`t_next − advance`, or the deferring batch's
+/// start for a flush-iteration leftover), and `advance ≤
+/// [`MAX_TICKS_PER_FRAME`]. 69_120 ticks = 1080 sim-seconds (18
+/// sim-minutes) at 64 Hz: rare enough that a permanently broken orbit
+/// cannot storm the event budget, often enough that a transient solver
+/// hiccup still heals on a human timescale.
+pub const DEGRADED_RESCAN_TICKS: u64 = MAX_TICKS_PER_FRAME;
 
 /// §2.2 sim-side vessel identity: a monotonic `u64`, never reused
 /// (`next_vessel_id` is serialized per §7.2). Iteration that affects
@@ -1495,6 +1505,29 @@ pub const DEFAULT_MAX_VESSELS: u64 = 512;
 /// See [`DEFAULT_MAX_VESSELS`].
 pub const DEFAULT_MAX_DEBRIS: u64 = 64;
 
+/// One queued command in `World::pending`, carrying the earliest tick
+/// it may drain at. Externally [`World::enqueue`]d commands carry
+/// `not_before == 0` — drainable at the very next boundary, whatever
+/// its tick value. Script/autopilot `issue`s stamp
+/// `producing tick + 1`: the §2.2.1 one-tick latency holds for
+/// wake-fired ticks too — a command produced inside the event batch at
+/// `t_next` must NOT drain at `t_next`'s own boundary (that drain
+/// already ran before the batch fired). Within a FIFO `not_before` is
+/// non-decreasing — production order is non-decreasing tick order — so
+/// a drain pops a FIFO's prefix and stops at the first held entry.
+///
+/// The tag is queue metadata, not sim state: `pending` is neither
+/// hashed nor serialized (the snapshot boundary requires it empty —
+/// [`World::check_serializable`], §7.4).
+#[derive(Clone, Debug, PartialEq)]
+struct PendingCommand {
+    /// Earliest drain tick — the entry waits past any drain stamped
+    /// below this.
+    not_before: u64,
+    /// The queued command.
+    command: SimCommand,
+}
+
 /// The §2.13 one-iteration shadow: everything one loop iteration of
 /// `step_frame` can mutate, captured before the iteration runs so a
 /// `Fatal`/`Recoverable` mid-iteration restores the pre-boundary state
@@ -1529,7 +1562,7 @@ struct TickShadow {
     script_log_len: usize,
     /// Commands the drain popped, in drain order (per source, production
     /// order). Restored back into `pending` on rollback.
-    drained: Vec<((SourceClass, u32), SimCommand)>,
+    drained: Vec<((SourceClass, u32), PendingCommand)>,
     /// Commands `issue`d into `pending` during the iteration, counted
     /// per source — restore pops that many entries off each FIFO's
     /// tail after the `drained` re-queue rebuilds the front. Per the
@@ -1910,7 +1943,7 @@ pub struct World {
     /// commands back where they came from. Sources drained to empty FIFOs
     /// are dropped, so `check_serializable` can read the queue's
     /// emptiness straight off the map.
-    pending: BTreeMap<(SourceClass, u32), VecDeque<SimCommand>>,
+    pending: BTreeMap<(SourceClass, u32), VecDeque<PendingCommand>>,
     /// Every applied command in `CommandKey` order — the §7.6 artifact.
     /// Appended only by the drain, so the vec itself is the sorted log.
     command_log: Vec<(CommandKey, SimCommand)>,
@@ -3087,7 +3120,10 @@ impl World {
         self.pending
             .entry((source_class, source_id))
             .or_default()
-            .push_back(command);
+            .push_back(PendingCommand {
+                not_before: 0,
+                command,
+            });
     }
 
     /// Read-only access to the §2.8 orbit model — observation, never
@@ -3301,6 +3337,12 @@ impl World {
                 // §3.5's join is surface-latched only — an unlatching
                 // hull leaves the colony's inventory with the pose.
                 v.joined_colony = None;
+                // The residence-transition rule — `ToRails`/`ToBubble`
+                // both drop the node (a latched vessel's `Scheduled`
+                // node has no conic to materialize at, a `Burning` one
+                // has no executor running): leaving it would strand a
+                // zombie node on the unlatched hull.
+                v.maneuver = None;
                 // M9b: the latched vessel's dormant `PartFailure`s
                 // die with the residence — scrub the heap the same
                 // way `apply_to_bubble` does, then restamp the
@@ -3391,7 +3433,15 @@ impl World {
             .map(|(id, _)| *id)
             .collect();
         for id in needing {
-            self.ensure_aero(id)?;
+            // An in-range `?` carries only `Fatal`: a table-build
+            // `Recoverable` escaping `step_frame` as a bare `Err`
+            // would skip the iteration `TickShadow`'s restore-verdict
+            // bookkeeping — promote the class at this boundary. (The
+            // event/command `ensure_aero` call sites keep
+            // `Recoverable`: theirs degrades or rejects just that one
+            // item; the range pre-pass owns no narrower channel.)
+            self.ensure_aero(id)
+                .map_err(|e| SimError::Fatal(e.reason()))?;
         }
         let caps = self.caps;
         // M9b §3.4: the reliability tick's immutable captures — the
@@ -3409,9 +3459,13 @@ impl World {
         // dedups those repeat nominations into the one real
         // transition `transition_latched` reports.
         let mut latched_total: BTreeSet<VesselId> = BTreeSet::new();
-        // M8-C §3.5: debris impact points (environment frame) — the
-        // colony-radius damage check runs once `self` is whole again.
-        let mut impacts: Vec<csp_core::DVec3> = Vec::new();
+        // M8-C §3.5: debris impact points (environment frame) + the
+        // tick each impact landed — the colony-radius damage check
+        // runs once `self` is whole again and must anchor its recompute
+        // at the impact tick, not the range's `now` (the clock is
+        // restored to `now` below — anchoring damage there would make
+        // a damaged module retroactively inert over the whole range).
+        let mut impacts: Vec<(csp_core::DVec3, u64)> = Vec::new();
         // M5: vessels whose node burn completed during this range —
         // processed once, after the tick loop, when `self` is whole
         // again and the rails conversion can be attempted.
@@ -3485,19 +3539,22 @@ impl World {
                 if !body.pos.is_finite() {
                     return Err(SimError::Fatal("non-finite body state mid-tick"));
                 }
+                // M9b §3.4: the live `thrust_factor` reaches physics
+                // through the body's `Thrust` sites — scaled from the
+                // craft baseline each tick (idempotent across every
+                // re-weld; the site's `rated_n` is a derived view).
+                // This runs BEFORE the burn executor reads the sites'
+                // `rated_n` (`net_thrust_axis`) so the executor sees
+                // this tick's derate, not last tick's.
+                if let Some(craft) = &vessel.craft {
+                    reliability::apply_thrust_factors(body, craft, &vessel.reliability);
+                }
                 // M5 burn executor — a first-class sim mechanism, not
                 // a command stream (the maneuver module docs): while a
                 // node is `Burning` it owns this body's `throttle`,
                 // `rot`, and `ang_vel` every integer tick.
                 if drive_node_burn(&mut vessel.maneuver, body) {
                     burns_done.insert(*vid);
-                }
-                // M9b §3.4: the live `thrust_factor` reaches physics
-                // through the body's `Thrust` sites — scaled from the
-                // craft baseline each tick (idempotent across every
-                // re-weld; the site's `rated_n` is a derived view).
-                if let Some(craft) = &vessel.craft {
-                    reliability::apply_thrust_factors(body, craft, &vessel.reliability);
                 }
                 pre_vel.push((body.vel, body.ang_vel));
                 batch.push(body.clone());
@@ -3702,7 +3759,14 @@ impl World {
                         if shadow.tech.is_none() {
                             shadow.tech = Some(self.tech.clone());
                         }
-                        self.tech.credit_qualification(family, 0.0, 0.0, 1)?;
+                        // In-range `?` chains may carry only `Fatal`
+                        // (`step_frame`'s contract) — a `Recoverable`
+                        // here would be an invariant bug anyway (the
+                        // credit is a constant), so map rather than
+                        // propagate.
+                        self.tech
+                            .credit_qualification(family, 0.0, 0.0, 1)
+                            .map_err(|e| SimError::Fatal(e.reason()))?;
                     }
                     self.notifications.push_back(reliability::Notification {
                         tick: t + 1,
@@ -3725,8 +3789,12 @@ impl World {
                     } else {
                         self.reliability_cfg.flight_units_per_s_vacuum
                     };
+                    // Same in-range rule: `Recoverable` cannot
+                    // propagate out of `step_bubble_range` — and a
+                    // non-finite accrual here IS a physics bug.
                     self.tech
-                        .credit_qualification(family, burn_s * rate, 0.0, 0)?;
+                        .credit_qualification(family, burn_s * rate, 0.0, 0)
+                        .map_err(|e| SimError::Fatal(e.reason()))?;
                 }
             }
             // A `Leak` that moved bucketed mass re-welds the body —
@@ -3734,7 +3802,12 @@ impl World {
             // vessel loop's `body` borrows are done.
             for vid in rel_rebody.drain(..) {
                 if let Some(v) = vessels.get_mut(&vid) {
-                    transfers::reweld_if_mass_changed(v, true)?;
+                    // The re-weld re-runs `csp_phys::weld` on a craft
+                    // that already welded once — a failure here is an
+                    // invariant bug, and in-range `?` chains carry only
+                    // `Fatal` anyway (`step_frame`'s contract).
+                    transfers::reweld_if_mass_changed(v, true)
+                        .map_err(|e| SimError::Fatal(e.reason()))?;
                 }
             }
             // Apply the tick's consequences in ascending-vessel-id
@@ -3775,9 +3848,12 @@ impl World {
                         shadow,
                     );
                     // M8-C §3.5: record the impact point for the
-                    // colony-radius damage check (post-loop).
+                    // colony-radius damage check (post-loop) — and the
+                    // completed tick `t + 1` it lands at, so the damage
+                    // anchors at the impact tick rather than rewinding
+                    // the colony to `now`.
                     if let Some(pos) = vessels.get(&vid).and_then(|v| v.body().map(|b| b.pos)) {
-                        impacts.push(pos);
+                        impacts.push((pos, t + 1));
                     }
                     // Roster half of the removal (the `remove_vessel`
                     // rule): members still recorded aboard die with
@@ -3966,7 +4042,9 @@ impl World {
     /// freeze, the Orbits subsystem's publish deadline lost with no
     /// rescan to re-ask. Mirror `fire_due_events`' §2.13 fallback:
     /// report on `degraded` and republish a bare `SoiRescan` at
-    /// `clock + DEGRADED_RESCAN_TICKS` so the deadline is never
+    /// `t_next + DEGRADED_RESCAN_TICKS` — anchored at the stamped
+    /// conic's epoch (the clock still sits at range start `now`
+    /// here) — so the deadline is never
     /// lost. (A still-`InBubble` vessel — a pre-stamp refusal — has
     /// no conic to scan; the republish is skipped for it.) `Fatal`
     /// is not a degradation: it propagates so the iteration's
@@ -4009,9 +4087,16 @@ impl World {
                     // the subsystem re-asks rather than freezing
                     // (doc above; the `fire_due_events` fallback).
                     if self.vessels.get(vid).is_some_and(|v| v.orbit().is_some()) {
+                        // Anchor at the range end — `t_next`, the tick
+                        // the post-burn conic was stamped at — not the
+                        // clock, which sits at range start `now` here.
+                        // `fire_due_events`' twin fallback applies the
+                        // same rule from its own side: it anchors at the
+                        // failed event's tick — the tick ITS failure is
+                        // dated — never the restored `t_next` clock.
                         self.schedule_event(
                             EventKind::SoiRescan { vessel: *vid },
-                            self.clock.ticks().saturating_add(DEGRADED_RESCAN_TICKS),
+                            t_next.saturating_add(DEGRADED_RESCAN_TICKS),
                             shadow,
                         )?;
                     }
@@ -4432,7 +4517,7 @@ impl World {
             }
             SimCommand::EvacuateColony { colony } => self.apply_evacuate_colony(*colony, shadow)?,
             SimCommand::DamageColonyModule { colony, module } => {
-                self.apply_damage_module(*colony, *module, shadow)?
+                self.apply_damage_module(*colony, *module, self.clock.ticks(), shadow)?
             }
             SimCommand::ScheduleColonyInspection { colony, tick } => {
                 self.apply_schedule_inspection(*colony, *tick, shadow)?
@@ -6239,12 +6324,18 @@ impl World {
     ) -> Result<(), SimError> {
         // Phase 1 — pops only. BTreeMap iteration IS the §2.2.1
         // (class, source_id) order; each source's FIFO keeps production
-        // order, so `staged` is contiguous per source.
+        // order, so `staged` is contiguous per source. An entry whose
+        // `not_before` sits ahead of this drain's tick stays queued —
+        // the one-tick latency a wake-fired tick's `issue`s pay (the
+        // producing tick's own drain already ran).
         let mut staged: Vec<((SourceClass, u32), SimCommand)> = Vec::new();
         for (&src, fifo) in &mut self.pending {
-            while let Some(command) = fifo.pop_front() {
-                shadow.drained.push((src, command.clone()));
-                staged.push((src, command));
+            while fifo.front().is_some_and(|e| e.not_before <= tick) {
+                let Some(entry) = fifo.pop_front() else {
+                    break;
+                };
+                shadow.drained.push((src, entry.clone()));
+                staged.push((src, entry.command));
             }
         }
         // Drained FIFOs go empty — drop them so the queue's emptiness is
@@ -6708,6 +6799,14 @@ impl World {
     /// `on_tick` at the event tick when the registration still pairs
     /// (a stale firing — script unloaded, disabled, or re-registered
     /// — is a tolerated no-op, the `TransferComplete` precedent).
+    ///
+    /// Residence rule: the wake only *carries* ticks for vessels
+    /// without bubble ticks. A script bound to an `InBubble` vessel
+    /// gets tick `tick` from the bubble's own control pass — running
+    /// `on_tick` here too would double-tick the same tick value (and
+    /// at a different world view: the control tick runs after that
+    /// tick's drain). The firing still consumes the registration —
+    /// the script re-arms inside its next normal tick.
     fn fire_script_wake(
         &mut self,
         id: ScriptId,
@@ -6723,8 +6822,16 @@ impl World {
             return Ok(());
         }
         self.shadow_scripts(shadow);
+        let in_bubble = self
+            .scripts
+            .get(&id)
+            .and_then(|s| self.vessels.get(&s.vessel))
+            .is_some_and(|v| matches!(v.state, VesselState::InBubble(_)));
         if let Some(s) = self.scripts.get_mut(&id) {
             s.wake_tick = None; // consumed — the script re-arms inside its tick
+        }
+        if in_bubble {
+            return Ok(());
         }
         self.run_script_tick(id, tick, shadow, degraded)
     }
@@ -6744,12 +6851,31 @@ impl World {
     /// (a deferred tail is the only state in which `tick == clock` is
     /// legal, and `World::restore` accepts `≥`).
     ///
+    /// Each event fires **at its own tick**: `self.clock` is set to
+    /// `event.tick` for the firing's duration and restored to `t_next`
+    /// between pops and at every exit. Lazy publishes run during
+    /// `advance_interval_subsystems` at `clock == now` and can land an
+    /// event inside `(now, t_next]` — the `e.tick <= t_next` pop then
+    /// fires it mid-interval, where a clock-relative write (`clock + 1`
+    /// schedules, `clock`-anchored recomputes) would diverge from the
+    /// same event fired at `clock == event.tick` in a finer §2.6.1
+    /// partition. Anchoring every firing read at `event.tick` makes
+    /// the firing a pure function of the event — and a follow-up the
+    /// firing schedules at `event.tick + 1` still pops inside this
+    /// batch (`≤ t_next`), firing at ITS tick in turn, so cascades
+    /// stay partition-independent too.
+    ///
     /// §2.13 Recoverable per event: a failed firing rolls back only that
     /// event's application (earlier fires stand), drops the popped event,
     /// reports the error on `degraded`, and — for vessel-carrying kinds —
-    /// re-publishes a bare `SoiRescan` at `clock + DEGRADED_RESCAN_TICKS`
-    /// so the subsystem's publish deadline survives the failure. `Fatal`
-    /// still aborts the whole iteration.
+    /// re-publishes a bare `SoiRescan` at `event.tick +
+    /// DEGRADED_RESCAN_TICKS` so the subsystem's publish deadline
+    /// survives the failure. The anchor is the event's own tick, NOT the
+    /// restored `t_next` clock: a mid-interval firing (`event.tick <
+    /// t_next`) must land the same rescan a finer §2.6.1 partition does
+    /// (where the event pops at `t_next == event.tick`) — anchoring at
+    /// the clock made the heap partition-dependent. `Fatal` still aborts
+    /// the whole iteration.
     fn fire_due_events(
         &mut self,
         t_next: u64,
@@ -6772,16 +6898,32 @@ impl World {
             fired.push(event.clone());
             // Per-event shadow: a Recoverable firing restores only this
             // event's application; the pop stands (the event is dropped).
+            // The capture precedes the clock swap so a restore lands the
+            // `t_next` clock back, not the firing tick's.
             let mut ev_shadow = TickShadow::capture(self);
+            // The firing runs AT the event's tick — §2.6.1: identical
+            // to the same event fired in the finest partition (doc
+            // above). `event.tick <= t_next` by the pop condition, so
+            // the swap only ever stands the clock still or steps it
+            // back inside the batch.
+            self.clock = SimTime(event.tick);
             match self.fire_event(&event, &mut ev_shadow, degraded) {
                 // The event committed — fold its lazy captures (and any
                 // `issue` counts a `ScriptWake`'s `on_tick` produced
                 // through `WorldTickIo`) into the iteration shadow, or
                 // they would die with `ev_shadow` and leave this event's
                 // writes uncovered by a later `Fatal`'s restore.
-                Ok(()) => shadow.merge_committed(ev_shadow),
-                Err(e @ SimError::Fatal(_)) => return Err(e),
+                Ok(()) => {
+                    self.clock = SimTime(t_next);
+                    shadow.merge_committed(ev_shadow);
+                }
+                Err(e @ SimError::Fatal(_)) => {
+                    self.clock = SimTime(t_next);
+                    return Err(e);
+                }
                 Err(e) => {
+                    // Restores the swap too — `ev_shadow` was captured
+                    // with the `t_next` clock.
                     ev_shadow.restore(self);
                     degraded.push(e);
                     // A failed node start leaves a `Scheduled` node
@@ -6864,9 +7006,26 @@ impl World {
                         | EventKind::BenchTestComplete { .. } => None,
                     };
                     if let Some(vessel) = vessel {
+                        // §2.6.1: the republish tick is a pure function
+                        // of the failed event — `event.tick + K`, never
+                        // the restored `t_next` clock (`self.clock`
+                        // sits at `t_next` after `ev_shadow.restore`,
+                        // so a mid-interval `event.tick < t_next` would
+                        // anchor `t_next + K` here and diverge from the
+                        // `event.tick + K` a finer partition lands).
+                        // `K ≥ MAX_TICKS_PER_FRAME` keeps the sum
+                        // strictly ahead of `t_next` (doc on the
+                        // constant); the `.max` covers the deferred-
+                        // tail corner, where a leftover's tick can sit
+                        // at-or-behind `now` — clamp into the future
+                        // rather than trip `schedule_event`'s
+                        // `tick > clock` invariant.
                         self.schedule_event(
                             EventKind::SoiRescan { vessel },
-                            self.clock.ticks().saturating_add(DEGRADED_RESCAN_TICKS),
+                            event
+                                .tick
+                                .saturating_add(DEGRADED_RESCAN_TICKS)
+                                .max(self.clock.ticks().saturating_add(1)),
                             shadow,
                         )?;
                     }
@@ -7397,10 +7556,22 @@ fn drive_node_burn(node: &mut Option<ManeuverNode>, body: &mut WeldedBody) -> bo
     let Some(ManeuverStatus::Burning(burn)) = node.as_mut().map(|n| &mut n.status) else {
         return false;
     };
+    // `net_thrust_axis` reads the sites' `rated_n` — already rescaled
+    // by this tick's `thrust_factor`s (the caller applies the factors
+    // first, so the executor never sees a stale derate).
     let (f_local, f_max) = maneuver::net_thrust_axis(body);
     if !(f_max > 0.0 && body.mass_kg > 0.0) {
+        // No live thrust this tick (every site derated to zero — a
+        // failed engine mid-burn) or a nonphysical mass: the burn can
+        // never deliver its remaining Δv, so returning `false` would
+        // wedge the node in `Burning` forever — `SetManeuver` refuses
+        // while one runs and only manual `DeleteManeuver`/`ToRails`
+        // would recover. Declare the burn done instead: the post-loop
+        // `finish_burns` consumes the node, zeroes the throttle, and
+        // returns the vessel to rails with whatever Δv was actually
+        // delivered — the honest ballistic outcome.
         body.throttle = 0.0;
-        return false;
+        return true;
     }
     body.rot = maneuver::align_rotation(f_local / f_max, burn.burn_dir);
     body.ang_vel = DVec3::ZERO;
@@ -7446,7 +7617,7 @@ struct WorldTickIo<'a> {
     /// The bubble environment + dominant (worlds built with physics).
     physics_env: Option<(&'a csp_phys::Environment, &'a BodyId)>,
     /// The command queue — `issue` pushes here.
-    pending: &'a mut BTreeMap<(SourceClass, u32), VecDeque<SimCommand>>,
+    pending: &'a mut BTreeMap<(SourceClass, u32), VecDeque<PendingCommand>>,
     /// The event heap — wake scheduling/scrubbing.
     event_heap: &'a mut BinaryHeap<ScheduledEvent>,
     /// The event-seq counter — travels with the heap.
@@ -7725,7 +7896,15 @@ impl TickIo for WorldTickIo<'_> {
         self.pending
             .entry((class, source_id))
             .or_default()
-            .push_back(command);
+            .push_back(PendingCommand {
+                // The one-tick latency, applied to the PRODUCING tick:
+                // a wake-fired tick inside `fire_due_events` runs at
+                // its event tick and its issues must stamp one past
+                // it, not that boundary's drain tick (which already
+                // ran — see [`PendingCommand`]).
+                not_before: self.clock.ticks().saturating_add(1),
+                command,
+            });
     }
 
     fn request_wake(
@@ -7737,7 +7916,17 @@ impl TickIo for WorldTickIo<'_> {
             return Err(SimError::Recoverable("wake: script not bound to this io"));
         }
         let vessel = self.bound_vessel()?;
-        let tick = self.resolve_wake(vessel, condition)?;
+        // The heap's `tick > clock` invariant applies here exactly as it
+        // does in `World::schedule_event` — this path pushes the
+        // `ScheduledEvent` directly, so it must hold the line itself.
+        // `resolve_wake`'s `AtNextSoiTransition`/`AtManeuverNode` arms
+        // read live state that can sit at-or-behind the clock in a
+        // deferred-batch flush (a tail event's tick, a `Scheduled`
+        // node's own `node.tick`): clamp the resolution to the next
+        // tick rather than push a sub-clock entry.
+        let tick = self
+            .resolve_wake(vessel, condition)?
+            .max(self.clock.ticks().saturating_add(1));
         // Scrub any pending wake for this script (the strict pair
         // invariant — one wake per script), shadowed like every heap
         // mutation, then schedule the resolved `Clamping` event.
@@ -10692,6 +10881,126 @@ mod tests {
         let clock = w.clock().ticks();
         w.step_frame(clock + 100).unwrap();
         assert!(w.clock().ticks() > clock);
+    }
+
+    /// §2.13/§2.6.1 regression: a mid-interval event (`event.tick <
+    /// t_next`) that fails `Recoverable` must republish its fallback
+    /// `SoiRescan` at `event.tick + DEGRADED_RESCAN_TICKS` — a pure
+    /// function of the event, identical in every partition. Anchoring
+    /// at `self.clock` was anchoring at the restored `t_next`: the same
+    /// failure fired at `t_next == event.tick` in a finer partition
+    /// landed `event.tick + K` while the coarse partition landed
+    /// `t_next + K` — the hashed heap content diverged.
+    ///
+    /// A `ManeuverNodeStart` on a physics-less world is the clean
+    /// guaranteed `Recoverable` ("no physics environment" is checked
+    /// before the node lookup). `fire_due_events` is driven directly
+    /// because `step_frame`'s `t_next = min(target, heap_min, …)`
+    /// always lands a heap-min event at its own tick — a mid-interval
+    /// firing can only be stood up on demand by holding `t_next` ahead
+    /// of the planted tick, exactly what the interval-internal publish
+    /// paths do in production.
+    #[test]
+    fn degraded_rescan_republishes_at_event_tick_in_every_partition() {
+        let build = || {
+            let mut w = World::with_system(test_system());
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::SpawnVessel {
+                    parent: BodyId::from("p"),
+                    elements: leo_elements(),
+                },
+            );
+            w.step_frame(1).unwrap();
+            w
+        };
+        // Plant the failing event at tick 50 — straight into the heap,
+        // the `plant_doomsday_event` pattern.
+        let plant = |w: &mut World, tick: u64| {
+            let kind = EventKind::ManeuverNodeStart {
+                vessel: VesselId(0),
+            };
+            let seq = w.next_event_seq;
+            w.next_event_seq += 1;
+            w.event_heap.push(ScheduledEvent {
+                tick,
+                seq,
+                class: events::class_of(&kind, &w.tracked_vessels),
+                kind,
+            });
+        };
+        let fire = |w: &mut World, t_next: u64| {
+            let mut shadow = TickShadow::capture(w);
+            let mut processed = 0u64;
+            let mut fired = Vec::new();
+            let mut degraded = Vec::new();
+            w.fire_due_events(
+                t_next,
+                &mut processed,
+                &mut fired,
+                &mut degraded,
+                &mut shadow,
+            )
+            .unwrap();
+            (fired, degraded)
+        };
+        // The spawn's own `SoiRescan` shares the heap — collect ALL
+        // rescan ticks so the republish is singled out, not positionally
+        // confused with the standing one. A `BTreeSet`: heap iteration
+        // order is an implementation detail.
+        let rescan_ticks = |w: &World| {
+            w.event_heap
+                .iter()
+                .filter(
+                    |e| matches!(e.kind, EventKind::SoiRescan { vessel } if vessel == VesselId(0)),
+                )
+                .map(|e| e.tick)
+                .collect::<BTreeSet<_>>()
+        };
+        let expected = 50 + DEGRADED_RESCAN_TICKS;
+
+        // The fine partition: the event pops at its own tick
+        // (`t_next == event.tick`) — the boundary firing.
+        let mut fine = build();
+        plant(&mut fine, 50);
+        fine.clock = SimTime(50);
+        let (_, degraded) = fire(&mut fine, 50);
+        assert_eq!(
+            degraded.len(),
+            1,
+            "the planted node start must degrade: {degraded:?}"
+        );
+        assert!(matches!(degraded[0], SimError::Recoverable(_)));
+        assert!(
+            rescan_ticks(&fine).contains(&expected),
+            "boundary firing must anchor at event.tick + K: {:?}",
+            rescan_ticks(&fine)
+        );
+
+        // The coarse partition: the same event pops mid-interval
+        // (`event.tick = 50 < t_next = 200`). Pre-fix this anchored at
+        // `t_next + K`, diverging from the fine run's `event.tick + K`.
+        let mut coarse = build();
+        plant(&mut coarse, 50);
+        coarse.clock = SimTime(200);
+        let (_, degraded) = fire(&mut coarse, 200);
+        assert_eq!(degraded.len(), 1);
+        assert!(
+            rescan_ticks(&coarse).contains(&expected),
+            "mid-interval firing must anchor at event.tick + K: {:?}",
+            rescan_ticks(&coarse)
+        );
+        assert!(
+            !rescan_ticks(&coarse).contains(&(200 + DEGRADED_RESCAN_TICKS)),
+            "the republish must not read the restored t_next clock"
+        );
+        // The republish tick itself is the partition-independence claim.
+        assert_eq!(
+            rescan_ticks(&fine),
+            rescan_ticks(&coarse),
+            "the republish must be a pure function of the event"
+        );
     }
 
     /// §2.6.5's per-batch hard ceiling: a same-tick batch bigger than
@@ -17469,6 +17778,11 @@ mod tests {
             Poll,
             /// First call registers `InTicks(n)`; counts calls.
             Wake(u64),
+            /// First call registers `AtTick(t)`; counts calls.
+            WakeAt(u64),
+            /// `issue` a `SetAlarm` (residence-agnostic, applies
+            /// cleanly for a rails vessel) on every call.
+            IssueAlarm,
             /// Write `persist["n"] = tick`.
             WritePersist,
         }
@@ -17524,6 +17838,30 @@ mod tests {
                             io.request_wake(script.id, &WakeCondition::InTicks(*n))
                                 .unwrap();
                         }
+                        ScriptRunReport {
+                            ops_used: 10,
+                            fault: None,
+                        }
+                    }
+                    Behavior::WakeAt(t) => {
+                        if self.calls.borrow().len() == 1 {
+                            io.request_wake(script.id, &WakeCondition::AtTick(*t))
+                                .unwrap();
+                        }
+                        ScriptRunReport {
+                            ops_used: 10,
+                            fault: None,
+                        }
+                    }
+                    Behavior::IssueAlarm => {
+                        io.issue(
+                            SourceClass::Script,
+                            script.id.0 as u32,
+                            SimCommand::SetAlarm {
+                                tick: tick + 1_000,
+                                label: "wake".to_string(),
+                            },
+                        );
                         ScriptRunReport {
                             ops_used: 10,
                             fault: None,
@@ -17669,15 +18007,14 @@ mod tests {
 
         /// §2.10's `ScriptWake`: the script registers an `InTicks(64)`
         /// wake on its first run; the `Clamping` event lands in the
-        /// heap, and at the wake tick the firing runs `on_tick` a
-        /// second time that tick (a wake IS a tick — the bubble pass
-        /// ran it normally too). The strict `wake_tick`↔event pair is
-        /// consumed: post-fire, `wake_tick` clears.
+        /// heap, and at the wake tick the firing consumes the
+        /// registration WITHOUT running `on_tick` — the vessel is
+        /// `InBubble`, so tick 65 belongs to the bubble's own control
+        /// pass (which runs it exactly once, in the next range).
+        /// Running both would double-tick the same tick value.
         #[test]
         fn script_wake_fires_and_runs_extra_tick() {
             let (mut w, calls) = scripted_world(Behavior::Wake(64));
-            // First run at tick 2 registers the wake → pending
-            // `ScriptWake` at 66, `Clamping`.
             // First run at tick 1 registers the wake at 65.
             assert!(w.event_heap.iter().any(|e| matches!(
                 &e.kind,
@@ -17685,12 +18022,102 @@ mod tests {
             )));
             assert_eq!(w.scripts()[&ScriptId(0)].wake_tick, Some(65));
             w.step_frame(65).unwrap();
-            // The wake event fires AT 65 (events fire at the range's
-            // end) — its `on_tick` is the ONLY call stamped 65: the
-            // normal bubble run at 65 belongs to the next range.
-            let at_65 = calls.borrow().iter().filter(|(_, t)| *t == 65).count();
-            assert_eq!(at_65, 1, "the wake's on_tick runs at its tick");
+            // The wake event fires AT 65 and consumes the registration
+            // — but delivers no `on_tick`: the `InBubble` script's
+            // tick-65 call comes from `control_tick` in the next range.
             assert_eq!(w.scripts()[&ScriptId(0)].wake_tick, None);
+            let at_65 = calls.borrow().iter().filter(|(_, t)| *t == 65).count();
+            assert_eq!(at_65, 0, "an InBubble wake must not run on_tick");
+            w.step_frame(66).unwrap();
+            // The control pass's tick-65 call — exactly once, never
+            // doubled by the consumed wake.
+            let at_65 = calls.borrow().iter().filter(|(_, t)| *t == 65).count();
+            assert_eq!(at_65, 1, "tick 65 must be delivered exactly once");
+        }
+
+        /// An `InBubble` script holding a live `AtTick` wake gets its
+        /// `on_tick` exactly once at that tick — the wake firing only
+        /// consumes the registration; the bubble control pass delivers
+        /// the tick itself. (Regression: the wake used to run a second
+        /// `on_tick` for the same tick.)
+        #[test]
+        fn in_bubble_at_tick_wake_delivers_tick_once() {
+            let (mut w, calls) = scripted_world(Behavior::WakeAt(70));
+            w.step_frame(70).unwrap(); // the wake fires — consumed, not run
+            assert_eq!(w.scripts()[&ScriptId(0)].wake_tick, None);
+            assert!(
+                calls.borrow().iter().all(|(_, t)| *t != 70),
+                "the wake must not run on_tick for an InBubble script"
+            );
+            w.step_frame(75).unwrap();
+            let at_70 = calls.borrow().iter().filter(|(_, t)| *t == 70).count();
+            assert_eq!(at_70, 1, "tick 70 delivered exactly once");
+        }
+
+        /// A command `issue`d inside a wake-fired `on_tick` is stamped
+        /// one tick past the producing tick — `t_next + 1`, not the
+        /// boundary's own `t_next` (the boundary drain already ran).
+        #[test]
+        fn wake_issued_command_stamps_next_tick() {
+            let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let mut w = World::with_system(test_system());
+            w.set_script_engine(Box::new(StubEngine {
+                behavior: Behavior::IssueAlarm,
+                calls: std::rc::Rc::clone(&calls),
+            }));
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::SpawnVessel {
+                    parent: BodyId::from("p"),
+                    elements: leo_elements(),
+                },
+            );
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::LoadScript {
+                    vessel: VesselId(0),
+                    source: "stub".to_string(),
+                },
+            );
+            w.step_frame(1).unwrap();
+            assert_eq!(w.scripts().len(), 1);
+            // Plant the strict wake pair at tick 10 — a rails-bound
+            // script ticks only via its wake.
+            let mut shadow = TickShadow::capture(&w);
+            w.schedule_event(
+                EventKind::ScriptWake {
+                    script: ScriptId(0),
+                },
+                10,
+                &mut shadow,
+            )
+            .unwrap();
+            w.scripts.get_mut(&ScriptId(0)).unwrap().wake_tick = Some(10);
+            let script_src = (SourceClass::Script, 0u32);
+            w.step_frame(10).unwrap();
+            assert_eq!(calls.borrow().len(), 1, "the wake ran the tick at 10");
+            // The issued SetAlarm waits past tick 10's boundary drain.
+            assert!(
+                !w.command_log()
+                    .iter()
+                    .any(|(k, _)| k.source_class == SourceClass::Script),
+                "the wake's issue must not apply at its own tick"
+            );
+            assert!(w.pending.contains_key(&script_src));
+            // A frame that ends at 11 without a drain still holds it.
+            w.step_frame(11).unwrap();
+            assert!(w.pending.contains_key(&script_src));
+            // The first drain at a tick > 10 applies it, stamped 11.
+            w.step_frame(12).unwrap();
+            let (key, _) = w
+                .command_log()
+                .iter()
+                .rev()
+                .find(|(k, _)| k.source_class == SourceClass::Script)
+                .expect("the issued command must land in the log");
+            assert_eq!(key.tick, 11, "stamped one tick past the wake tick");
         }
 
         /// §2.10: a script on a rails-bound vessel ticks ONLY via

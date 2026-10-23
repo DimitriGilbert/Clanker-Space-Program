@@ -40,7 +40,15 @@
 //! A script bound to a vessel that is not `InBubble` ticks **only**
 //! when its `ScriptWake` event fires — that is what "survives rails
 //! warp" means: there are no bubble ticks under rails, so the wake
-//! event is the tick.
+//! event is the tick. The corollary holds too: a `ScriptWake` firing
+//! for a script whose vessel IS `InBubble` consumes the registration
+//! without running `on_tick` — the bubble's own control pass delivers
+//! that tick (running both would double-tick the same tick value).
+//!
+//! Commands a script `issue`s are stamped at the producing tick + 1 —
+//! the latency is measured from the tick the `on_tick` ran at, so a
+//! wake-fired tick's issues never drain at the boundary that already
+//! passed (see `PendingCommand` in `lib.rs`).
 //!
 //! # Warp discipline (§2.10)
 //!

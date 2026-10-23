@@ -1698,10 +1698,15 @@ impl World {
     /// `PowerLost` reason can leave `Degraded`, via `PowerRestored`),
     /// and a `Degraded{PowerLost}` colony keeps its existing reason
     /// rather than switching.
+    /// `tick` is the tick the damage lands at — the recompute anchors
+    /// there. The command path passes the drain boundary's clock; the
+    /// impact seam passes the impact's own tick so the damage is not
+    /// retroactive over the range it was collected in.
     pub(crate) fn apply_damage_module(
         &mut self,
         id: ColonyId,
         module: usize,
+        tick: u64,
         shadow: &mut TickShadow,
     ) -> Result<(), SimError> {
         let Some(colony) = self.colonies.get(&id) else {
@@ -1727,7 +1732,7 @@ impl World {
                 reason: DegradeReason::ImpactDamage,
             };
         }
-        self.recompute_colony(id, self.clock.ticks(), shadow)
+        self.recompute_colony(id, tick, shadow)
     }
 
     /// M8-C §3.5: the deferred surface-impact seam — every debris
@@ -1742,9 +1747,14 @@ impl World {
     /// Iteration is ascending `ColonyId` and selection is
     /// first-undamaged: the outcome is a deterministic function of
     /// `(impacts, colonies)` with no draw needed.
+    /// Each entry pairs the impact point with the completed tick it
+    /// landed at (`t + 1` inside the range): the damage's
+    /// `recompute_colony` anchors there, not at the range's `now` —
+    /// anchoring at the range start would treat the damaged module as
+    /// retroactively inert over the whole `(now, t_next]` interval.
     pub(crate) fn apply_surface_impacts(
         &mut self,
-        impacts: &[csp_core::DVec3],
+        impacts: &[(csp_core::DVec3, u64)],
         shadow: &mut TickShadow,
     ) -> Result<(), SimError> {
         if impacts.is_empty() {
@@ -1758,7 +1768,7 @@ impl World {
         let radius_m = env.radius_m;
         let dominant = physics.dominant.clone();
         let range = self.transfer_cfg.radius_m;
-        for pos in impacts {
+        for &(pos, impact_tick) in impacts {
             if !pos.is_finite() {
                 continue;
             }
@@ -1772,8 +1782,14 @@ impl World {
                 // and `step_frame`'s contract is `Err` only for `Fatal`
                 // — a dormant colony in the radius would otherwise
                 // wedge every advance past the impact.
+                // A colony whose body no longer has a `colony_env`
+                // entry (a mid-run `set_colony_env` swap) cannot be
+                // solved — `recompute_colony` fails `Recoverable` on
+                // the miss, and `step_frame` may carry only `Fatal`:
+                // like the dormant filter, it is simply not a target.
                 if colony.body != dominant
                     || matches!(colony.state, ColonyState::Dormant | ColonyState::Abandoned)
+                    || !self.colony_env.contains_key(&colony.body)
                 {
                     continue;
                 }
@@ -1789,7 +1805,7 @@ impl World {
                     },
                     radius_m,
                 );
-                if (*pos - center - site).norm() > range {
+                if (pos - center - site).norm() > range {
                     continue;
                 }
                 if let Some(idx) = colony.modules.iter().position(|m| !m.damaged) {
@@ -1797,7 +1813,7 @@ impl World {
                 }
             }
             for (id, module) in hits {
-                self.apply_damage_module(id, module, shadow)?;
+                self.apply_damage_module(id, module, impact_tick, shadow)?;
             }
         }
         Ok(())
@@ -1837,7 +1853,7 @@ impl World {
     pub(crate) fn fire_colony_event(
         &mut self,
         kind: &EventKind,
-        _event_tick: u64,
+        event_tick: u64,
         shadow: &mut TickShadow,
     ) -> Result<(), SimError> {
         let Some(id) = event_colony(kind) else {
@@ -1852,14 +1868,17 @@ impl World {
             colony.state,
             ColonyState::Nominal | ColonyState::Degraded { .. }
         );
-        // The re-solve runs at the CLOCK, never at `event_tick`: in a
-        // deferred-batch flush the event's tick sits behind the clock
-        // — re-anchoring a store there would walk a level backward,
-        // and `schedule_event` rightly Fatals on a non-forward tick.
-        // Levels are linear, so re-anchoring at the landing tick is
-        // the same value — and the clock is an absolute tick, so the
-        // publish is identical in every §2.6.1 partition.
-        let now = self.clock.ticks();
+        // The re-solve anchors at the EVENT's tick — `fire_due_events`
+        // runs every firing with `self.clock == event.tick`, so `now`
+        // IS the clock here; naming `event_tick` just keeps the anchor
+        // honest if the firing context ever changes. A lazily
+        // re-published event can legitimately fire mid-interval with
+        // `event.tick < t_next`; anchoring at the range-end clock
+        // there would make `anchor_tick` (hashed state) and the
+        // `tick + 1` transition schedules diverge across §2.6.1
+        // partitions — the value at the event's own tick is the one
+        // every partition agrees on.
+        let now = event_tick;
         match kind {
             EventKind::TerminatorCrossing { .. } => {
                 if !live {
@@ -4310,14 +4329,23 @@ mod tests {
         // 5 m radially out is inside the 100 m radius, 200 m east is
         // outside it.
         w.apply_surface_impacts(
-            &[csp_core::DVec3::new(6.0e6 + 200.0, 0.0, 0.0)],
+            &[(
+                csp_core::DVec3::new(6.0e6 + 200.0, 0.0, 0.0),
+                w.clock().ticks(),
+            )],
             &mut shadow,
         )
         .unwrap();
         assert!(w.colonies()[&id].modules.iter().all(|m| !m.damaged));
         assert!(matches!(w.colonies()[&id].state, ColonyState::Nominal));
-        w.apply_surface_impacts(&[csp_core::DVec3::new(6.0e6 + 5.0, 0.0, 0.0)], &mut shadow)
-            .unwrap();
+        w.apply_surface_impacts(
+            &[(
+                csp_core::DVec3::new(6.0e6 + 5.0, 0.0, 0.0),
+                w.clock().ticks(),
+            )],
+            &mut shadow,
+        )
+        .unwrap();
         assert!(w.colonies()[&id].modules[0].damaged);
         assert!(!w.colonies()[&id].modules[1].damaged);
         assert!(matches!(
@@ -4327,8 +4355,14 @@ mod tests {
             }
         ));
         // A second impact takes the next undamaged module.
-        w.apply_surface_impacts(&[csp_core::DVec3::new(6.0e6 + 5.0, 0.0, 0.0)], &mut shadow)
-            .unwrap();
+        w.apply_surface_impacts(
+            &[(
+                csp_core::DVec3::new(6.0e6 + 5.0, 0.0, 0.0),
+                w.clock().ticks(),
+            )],
+            &mut shadow,
+        )
+        .unwrap();
         assert!(w.colonies()[&id].modules.iter().all(|m| m.damaged));
         // The damage rides the snapshot — hashed state.
         let h = w.state_hash().unwrap();
@@ -4337,6 +4371,41 @@ mod tests {
         r.set_colony_env(test_env());
         r.set_sites(BTreeMap::from([(SiteId::from("pad"), test_site())]));
         assert_eq!(r.state_hash().unwrap(), h);
+    }
+
+    /// R8-F4/R9-F8 regression: a colony whose body lost its
+    /// `colony_env` entry (a `set_colony_env` swap post-install) is
+    /// not an impact target — the seam must return `Ok`, never a
+    /// `Recoverable` that `step_frame` would wrongly surface as
+    /// `Err`.
+    #[test]
+    fn surface_impact_skips_envless_colony() {
+        let mut w = impact_world();
+        found(
+            &mut w,
+            vec![
+                gen_module(10.0),
+                ColonyModuleDef::Store {
+                    resource: ResourceId::from("ore"),
+                    capacity: 100.0,
+                },
+            ],
+            vec![],
+        );
+        let id = *w.colonies().keys().next().unwrap();
+        // Drop the whole env table — the colony's body now misses.
+        w.set_colony_env(BTreeMap::new());
+        let mut shadow = TickShadow::capture(&w);
+        w.apply_surface_impacts(
+            &[(
+                csp_core::DVec3::new(6.0e6 + 5.0, 0.0, 0.0),
+                w.clock().ticks(),
+            )],
+            &mut shadow,
+        )
+        .unwrap();
+        assert!(w.colonies()[&id].modules.iter().all(|m| !m.damaged));
+        assert!(matches!(w.colonies()[&id].state, ColonyState::Nominal));
     }
 
     /// The resupply contract's predicate rides the real transfer: a

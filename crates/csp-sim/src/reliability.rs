@@ -929,6 +929,24 @@ impl World {
             return Ok(());
         };
         if mode.is_fatal() {
+            // A fatal mode on a dormant record is a crafted/stale
+            // event — the publish only ever draws the non-fatal
+            // subset. But the record's `pending_failure_tick` still
+            // names this event: leaving it set would make
+            // `publish_reliability` skip the record forever AND wedge
+            // the next snapshot restore (the restore gate requires
+            // every pending tick to pair with a live event). Clear it
+            // like the stale-fire branch below so the publish slot
+            // re-derives the true crossing.
+            self.shadow_vessels(shadow);
+            let v = self
+                .vessels
+                .get_mut(&vessel)
+                .ok_or(SimError::Fatal("part failure: vessel vanished"))?;
+            v.reliability
+                .get_mut(&node)
+                .ok_or(SimError::Fatal("part failure: record vanished"))?
+                .pending_failure_tick = None;
             return Ok(());
         }
         let fire_tick = tick.min(self.clock.ticks());

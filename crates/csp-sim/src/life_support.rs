@@ -327,9 +327,13 @@ impl World {
                 if short {
                     let kind = EventKind::VesselLifeSupportDepleted { vessel: vid };
                     // One pending depletion per vessel — the colony
-                    // transition dedup precedent.
+                    // transition dedup precedent. The transition lands
+                    // one tick past the EVENT's tick — `fire_due_events`
+                    // runs this firing with `clock == event_tick`, so
+                    // the anchor is identical in every §2.6.1 partition
+                    // even when the check fires mid-interval.
                     if !self.event_heap.iter().any(|e| e.kind == kind) {
-                        self.schedule_event(kind, self.clock.ticks().saturating_add(1), shadow)?;
+                        self.schedule_event(kind, event_tick.saturating_add(1), shadow)?;
                     }
                 }
             }
@@ -516,6 +520,53 @@ mod tests {
             },
         );
         id
+    }
+
+    /// §2.6.1 regression: a lazily published `LifeSupportCheck` that
+    /// lands INSIDE the interval must fire identically under every
+    /// partition. The coarse run publishes and fires the check
+    /// mid-interval (`event.tick = 100 < t_next`); the fine run fires
+    /// it at `clock == event.tick`. The depletion transition's
+    /// `event_tick + 1` schedule is hashed either way.
+    #[test]
+    fn mid_interval_check_fires_identically_across_partitions() {
+        let build = || {
+            let mut w = World::new();
+            w.set_life_support_config(test_cfg()); // 100-tick grid
+            w.set_life_support_enabled(true);
+            let vid = crewed_vessel(&mut w, 10.0, 1);
+            // No oxygen aboard — the check shorts and schedules the
+            // depletion transition.
+            w.vessels
+                .get_mut(&vid)
+                .unwrap()
+                .tank_contents
+                .get_mut(&PartNodeId(0))
+                .unwrap()
+                .insert(ResourceId::from(OXYGEN), 0.0);
+            w
+        };
+        let mut coarse = build();
+        let mut fine = build();
+        // One 300-tick frame: the publish lands `LifeSupportCheck` at
+        // 100 inside `(0, 300]`; the event batch fires it mid-interval,
+        // and its `event_tick + 1` depletion cascades in-batch.
+        coarse.step_frame(300).unwrap();
+        // Fine partitions: the check fires at its own tick, the
+        // depletion one tick later, then the run steps on.
+        for t in [100, 101, 200, 300] {
+            fine.step_frame(t).unwrap();
+        }
+        assert_eq!(coarse.clock().ticks(), 300);
+        assert_eq!(fine.clock().ticks(), 300);
+        // Non-vacuous: the depletion really fired in both runs.
+        assert!(coarse.vessels[&VesselId(0)].crew.is_empty());
+        assert!(fine.vessels[&VesselId(0)].crew.is_empty());
+        assert_eq!(
+            coarse.state_hash().unwrap(),
+            fine.state_hash().unwrap(),
+            "mid-interval event firing must be partition-independent"
+        );
     }
 
     /// LS check: a crewed, stocked vessel debits rate·period·crew per
