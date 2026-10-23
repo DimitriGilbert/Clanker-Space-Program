@@ -1080,6 +1080,7 @@ dependencies = [
  "csp-core",
  "csp-sim",
  "futures-util",
+ "getrandom 0.4.3",
  "serde",
  "serde_json",
  "tokio",

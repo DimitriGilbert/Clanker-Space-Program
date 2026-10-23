@@ -166,6 +166,21 @@ impl IngressQueue {
         Ok(())
     }
 
+    /// Drop the `n` most recently pushed commands — the `submit_batch`
+    /// rollback path: a batch refused mid-push unwinds its queued
+    /// prefix so a failed batch leaves `pending` untouched rather
+    /// than residue the next unrelated drain would silently apply.
+    pub fn rollback_last(&mut self, n: usize) {
+        for _ in 0..n {
+            let Some((client, _)) = self.pending.pop_back() else {
+                break;
+            };
+            if let Some(used) = self.per_client.get_mut(&client) {
+                *used = used.saturating_sub(1);
+            }
+        }
+    }
+
     /// Pop the oldest outstanding command, decrementing its client's
     /// budget — FIFO across clients.
     pub fn pop(&mut self) -> Option<(u32, SimCommand)> {
@@ -225,6 +240,23 @@ mod tests {
             q.push(1, SimCommand::SetWarp(1)),
             Err(IngressError::QueueFull { .. })
         ));
+    }
+
+    #[test]
+    fn rollback_last_unwinds_the_pushed_prefix() {
+        let mut q = IngressQueue::with_limits(64, 2);
+        q.push(9, SimCommand::SetWarp(1)).expect("other client");
+        q.push(7, SimCommand::SetWarp(1)).expect("batch 1");
+        q.push(7, SimCommand::SetWarp(1)).expect("batch 2");
+        // A mid-batch refusal drops only this batch's prefix — the
+        // most recently pushed entries — an earlier client's
+        // commands are untouched.
+        q.rollback_last(2);
+        assert_eq!(q.len(), 1);
+        // The rolled-back client's budget is freed.
+        q.push(7, SimCommand::SetWarp(2)).expect("budget freed");
+        q.push(7, SimCommand::SetWarp(2)).expect("budget freed");
+        assert_eq!(q.len(), 3);
     }
 
     #[test]

@@ -34,7 +34,7 @@ async fn boot_with_full(
             .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned()),
     )
     .join(format!("csp-e2e-{}", std::process::id()));
-    let host = Arc::new(GameHost::spawn_full(make, dir, queue, None));
+    let host = Arc::new(GameHost::spawn_full(make, dir, queue, None).expect("game host"));
     let backend: Arc<dyn ControlBackend + Send + Sync> = host.clone();
     let cfg = ServerConfig {
         bind: "127.0.0.1:0".parse().expect("bind"),
@@ -56,12 +56,10 @@ async fn boot_dashboards() -> (Server, Arc<GameHost>, PathBuf) {
             .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned()),
     )
     .join(format!("csp-e2e-dash-{}", std::process::id()));
-    let host = Arc::new(GameHost::spawn_full(
-        World::new,
-        dir.clone(),
-        IngressQueue::new(),
-        None,
-    ));
+    let host = Arc::new(
+        GameHost::spawn_full(World::new, dir.clone(), IngressQueue::new(), None)
+            .expect("game host"),
+    );
     let backend: Arc<dyn ControlBackend + Send + Sync> = host.clone();
     let cfg = ServerConfig {
         bind: "127.0.0.1:0".parse().expect("bind"),
@@ -94,12 +92,10 @@ async fn boot_spa() -> (Server, Arc<GameHost>, PathBuf) {
     )
     .expect("index.html");
     std::fs::write(spa.join("assets").join("app.js"), "const csp_marker = 1;\n").expect("app.js");
-    let host = Arc::new(GameHost::spawn_full(
-        World::new,
-        dir.join("saves"),
-        IngressQueue::new(),
-        None,
-    ));
+    let host = Arc::new(
+        GameHost::spawn_full(World::new, dir.join("saves"), IngressQueue::new(), None)
+            .expect("game host"),
+    );
     let backend: Arc<dyn ControlBackend + Send + Sync> = host.clone();
     let cfg = ServerConfig {
         bind: "127.0.0.1:0".parse().expect("bind"),
@@ -111,6 +107,16 @@ async fn boot_spa() -> (Server, Arc<GameHost>, PathBuf) {
     };
     let server = Server::start(cfg, backend).await.expect("server binds");
     (server, host, spa)
+}
+
+/// A per-test scratch dir under `CARGO_TARGET_TMPDIR` (or the system
+/// temp dir).
+fn scratch(tag: &str) -> PathBuf {
+    PathBuf::from(
+        std::env::var("CARGO_TARGET_TMPDIR")
+            .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned()),
+    )
+    .join(format!("{tag}-{}", std::process::id()))
 }
 
 /// A one-shot HTTP/1.1 request over a real socket — returns
@@ -164,13 +170,44 @@ fn tool(id: u64, name: &str, args: Value) -> String {
     rpc(id, "tools/call", json!({"name": name, "arguments": args}))
 }
 
+/// The MCP `initialize` handshake for one client name (`None` = the
+/// default) — the lifecycle gate makes it every tool-driving test's
+/// first request on that client.
+fn mcp_init(addr: std::net::SocketAddr, client: Option<&str>) {
+    let path = match client {
+        Some(c) => format!("/mcp?client={c}"),
+        None => "/mcp".to_string(),
+    };
+    let (status, body) = http(
+        addr,
+        "POST",
+        &path,
+        &[
+            ("Authorization", "Bearer e2e-token"),
+            ("Content-Type", "application/json"),
+        ],
+        &rpc(
+            0,
+            "initialize",
+            json!({"protocolVersion": "2026-07-28", "capabilities": {}}),
+        ),
+    );
+    let v: Value = serde_json::from_str(&body).expect("init json");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(v["result"]["protocolVersion"], "2026-07-28", "{body}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn server_boots_and_serves() {
     let (server, _host) = boot().await;
-    // `/` is token-free by design — the token is injected into it.
+    // `/` is token-free by design — and free of the secret: the shell
+    // is served verbatim; the token only ever travels the
+    // authenticated channel (token file / `Authorization` header /
+    // `?token=` on `/ws`).
     let (status, body) = http(server.addr, "GET", "/", &[], "");
     assert_eq!(status, 200);
-    assert!(body.contains("csp-token"));
+    assert!(!body.contains("e2e-token"), "token leaked into /: {body}");
+    assert!(!body.contains("csp-token"), "{body}");
     // `/api/telemetry` needs the bearer.
     let (status, _) = http(server.addr, "GET", "/api/telemetry", &[], "");
     assert_eq!(status, 401);
@@ -178,6 +215,185 @@ async fn server_boots_and_serves() {
     assert_eq!(status, 200);
     assert!(body.contains("\"tick\""));
     server.shutdown();
+}
+
+/// R19-F1 regression: a generated token must be minted promptly — the
+/// old `fs::read("/dev/urandom")` blocked on an EOF that never comes,
+/// so this `Server::start` would deadlock before bind. The timeout is
+/// the proof.
+/// R19-F2 regression: the generated token must not appear in `GET /`
+/// — the token-free shell no longer carries the secret — while the
+/// bearer-authenticated path still works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn generated_token_is_prompt_and_never_served() {
+    let dir = scratch("csp-e2e-gen");
+    let host = Arc::new(
+        GameHost::spawn_full(World::new, dir, IngressQueue::new(), None).expect("game host"),
+    );
+    let backend: Arc<dyn ControlBackend + Send + Sync> = host.clone();
+    let cfg = ServerConfig {
+        bind: "127.0.0.1:0".parse().expect("bind"),
+        token: None, // the production shape: generate per start
+        auth_disabled: false,
+        token_dir: None,
+        dashboard_dir: None,
+        spa_dir: None,
+    };
+    let server = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        Server::start(cfg, backend),
+    )
+    .await
+    .expect("Server::start hangs — generate_token must return promptly")
+    .expect("server binds");
+    assert_eq!(server.token.len(), 64);
+    assert!(server.token.bytes().all(|b| b.is_ascii_hexdigit()));
+    let (status, body) = http(server.addr, "GET", "/", &[], "");
+    assert_eq!(status, 200);
+    assert!(
+        !body.contains(&server.token),
+        "generated token served at /: {body}"
+    );
+    let auth = format!("Bearer {}", server.token);
+    let (status, _) = http(
+        server.addr,
+        "GET",
+        "/api/telemetry",
+        &[("Authorization", auth.as_str())],
+        "",
+    );
+    assert_eq!(status, 200);
+    server.shutdown();
+}
+
+/// `?token=` is the WS bootstrap credential only — a browser upgrade
+/// cannot set headers. On every other endpoint a bearer in the query
+/// string must not satisfy auth (it would leak into logs).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn query_token_authenticates_only_the_ws_path() {
+    let (server, _host) = boot().await;
+    for (method, path) in [
+        ("GET", "/api/telemetry?token=e2e-token"),
+        ("GET", "/api/dashboards?token=e2e-token"),
+        ("GET", "/mcp?token=e2e-token"),
+        ("POST", "/mcp?token=e2e-token"),
+    ] {
+        let (status, _) = http(server.addr, method, path, &[], "");
+        assert_eq!(status, 401, "{method} {path}");
+    }
+    // `/ws` still accepts it: the guard passes, so the failure (if
+    // any) is the extractor's — anything but 401 means auth held.
+    let (status, _) = http(server.addr, "GET", "/ws?token=e2e-token", &[], "");
+    assert_ne!(status, 401);
+    server.shutdown();
+}
+
+/// RFC 9110 §11.4: the auth scheme is case-insensitive — `bearer` and
+/// `BEARER` authenticate like `Bearer`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bearer_scheme_is_case_insensitive() {
+    let (server, _host) = boot().await;
+    for scheme in ["bearer", "Bearer", "BEARER"] {
+        let header = format!("{scheme} e2e-token");
+        let (status, _) = http(
+            server.addr,
+            "GET",
+            "/api/telemetry",
+            &[("Authorization", header.as_str())],
+            "",
+        );
+        assert_eq!(status, 200, "{scheme}");
+    }
+    server.shutdown();
+}
+
+/// The discovery file contract (§2.12.3): `<token>\n<port>\n` under a
+/// `0700` runtime dir, created `0600` atomically, and removed on
+/// `shutdown` — no stale token may outlive its server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn token_file_lifecycle_is_0600_and_cleaned_up() {
+    let dir = scratch("csp-e2e-tokenfile");
+    let token_dir = dir.join("runtime");
+    let host = Arc::new(
+        GameHost::spawn_full(World::new, dir.join("saves"), IngressQueue::new(), None)
+            .expect("game host"),
+    );
+    let backend: Arc<dyn ControlBackend + Send + Sync> = host.clone();
+    let cfg = ServerConfig {
+        bind: "127.0.0.1:0".parse().expect("bind"),
+        token: Some("e2e-token".into()),
+        auth_disabled: false,
+        token_dir: Some(token_dir.clone()),
+        dashboard_dir: None,
+        spa_dir: None,
+    };
+    let server = Server::start(cfg, backend).await.expect("server binds");
+    let file = server.token_file.clone().expect("token file written");
+    assert_eq!(file.parent(), Some(token_dir.as_path()));
+    let contents = std::fs::read_to_string(&file).expect("read token file");
+    assert_eq!(contents, format!("e2e-token\n{}\n", server.addr.port()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&file)
+                .expect("file meta")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "the token file must be created 0600, not chmod'd after"
+        );
+        assert_eq!(
+            std::fs::metadata(&token_dir)
+                .expect("dir meta")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "the runtime dir must be owner-only"
+        );
+    }
+    server.shutdown();
+    assert!(!file.exists(), "stale token file survived shutdown");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A pre-existing `<pid>.token` — here an attacker-planted symlink —
+/// must be refused, never followed and truncated (R19-F7).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn token_file_refuses_a_preplanted_symlink() {
+    let dir = scratch("csp-e2e-toklink");
+    std::fs::create_dir_all(&dir).expect("token dir");
+    let target = dir.join("victim.txt");
+    std::fs::write(&target, "keep me").expect("victim");
+    std::os::unix::fs::symlink(&target, dir.join(format!("{}.token", std::process::id())))
+        .expect("symlink");
+    let host = Arc::new(
+        GameHost::spawn_full(World::new, dir.join("saves"), IngressQueue::new(), None)
+            .expect("game host"),
+    );
+    let backend: Arc<dyn ControlBackend + Send + Sync> = host.clone();
+    let cfg = ServerConfig {
+        bind: "127.0.0.1:0".parse().expect("bind"),
+        token: Some("e2e-token".into()),
+        auth_disabled: false,
+        token_dir: Some(dir.clone()),
+        dashboard_dir: None,
+        spa_dir: None,
+    };
+    match Server::start(cfg, backend).await {
+        Err(csp_server::ServeError::TokenFile(_)) => {}
+        Err(e) => panic!("expected a token-file refusal, got {e}"),
+        Ok(_) => panic!("a pre-planted symlinked token path was followed"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("victim"),
+        "keep me",
+        "the symlink target must be untouched"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -267,7 +483,9 @@ async fn mcp_round_trip_and_external_ordering() {
     );
     // timewarp.set lands an External-stamped command — the e2e
     // ordering proof: the command log records `(External, 0)` under
-    // the one-tick contract.
+    // the one-tick contract. `agent-a` is its own client — the
+    // lifecycle gate wants its handshake first.
+    mcp_init(server.addr, Some("agent-a"));
     let (_, body) = http(
         server.addr,
         "POST",
@@ -312,7 +530,8 @@ async fn mcp_round_trip_and_external_ordering() {
 async fn bounded_ingress_returns_backpressure() {
     // Per-client budget 2 → a batch of 3 in one drain window is
     // refused at the third command (§2.2.1 backpressure error).
-    let (server, _host) = boot_with_full(World::new, IngressQueue::with_limits(64, 2)).await;
+    let (server, host) = boot_with_full(World::new, IngressQueue::with_limits(64, 2)).await;
+    mcp_init(server.addr, None);
     let cmds: Vec<Value> = (0..3).map(|_| json!({"SetWarp": 1})).collect();
     let (_, body) = http(
         server.addr,
@@ -328,6 +547,34 @@ async fn bounded_ingress_returns_backpressure() {
     assert_eq!(v["result"]["isError"], true, "{body}");
     let text = v["result"]["content"][0]["text"].as_str().expect("text");
     assert!(text.contains("budget"), "{text}");
+    // R19-F5: the refused batch is atomic — its pushed prefix must not
+    // linger and drain under the next unrelated submit. A clean
+    // AdvanceTo(5) follows; the log must hold exactly that one command.
+    let (_, body) = http(
+        server.addr,
+        "POST",
+        "/mcp",
+        &[
+            ("Authorization", "Bearer e2e-token"),
+            ("Content-Type", "application/json"),
+        ],
+        &tool(2, "sim.command", json!({"command": {"AdvanceTo": 5}})),
+    );
+    let v: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(v["result"]["isError"], false, "{body}");
+    let logged = host.inspect(|w| {
+        let cmds: Vec<String> = w
+            .command_log()
+            .iter()
+            .map(|(_, c)| format!("{c:?}"))
+            .collect();
+        json!({"tick": w.clock().ticks(), "commands": cmds})
+    });
+    assert_eq!(
+        logged,
+        json!({"tick": 5, "commands": ["AdvanceTo(5)"]}),
+        "the failed batch's residue must not apply"
+    );
     server.shutdown();
 }
 
@@ -342,6 +589,9 @@ async fn lease_enforcement_over_the_wire() {
         (recipe.initial)(&dir).expect("fixture world")
     };
     let (server, host) = boot_with(make).await;
+    // Two named clients drive tools — each needs its own handshake.
+    mcp_init(server.addr, Some("setup"));
+    mcp_init(server.addr, Some("agent"));
     // Spawn a rails vessel as the player (Ui through sim.command? —
     // external clients stamp External; SpawnVessel is not
     // lease-gated, so sim.command works for the setup too).
@@ -427,6 +677,7 @@ async fn commands_vs_local_world_hash() {
     }
 
     let (server, _host) = boot().await;
+    mcp_init(server.addr, None);
     for (i, c) in seq.iter().enumerate() {
         let cmd = serde_json::to_value(c).expect("encode");
         let (_, body) = http(
@@ -541,9 +792,118 @@ async fn ws_command_channel_enqueues() {
     server.shutdown();
 }
 
+/// R19-F14 wire asymmetries: `command` envelopes must pass the same
+/// `proto` gate as `subscribe`; an over-cap `fields` list is an
+/// explicit error, never a silent truncation; and `command_ack`s
+/// carry their own sequence, not the telemetry `seq`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ws_envelope_rules_are_symmetric() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite;
+
+    let (server, _host) = boot().await;
+    let url = format!("ws://{}/ws?token=e2e-token&client=asym", server.addr);
+    let (mut ws, _) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("ws connect");
+    // A command without `proto` must be refused like a proto-less
+    // subscribe — the version field covers the whole wire surface.
+    ws.send(tungstenite::Message::Text(
+        json!({"kind": "command", "command": {"SetWarp": 1}})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .expect("send command");
+    let msg = ws.next().await.expect("frame").expect("ok");
+    let v: Value = serde_json::from_str(&msg.into_text().expect("text")).expect("json");
+    assert_eq!(v["kind"], "error");
+    assert!(v["error"].as_str().expect("error").contains("proto"), "{v}");
+
+    // An over-cap fields list is refused, not truncated — nothing
+    // streams, and the refusal names the cap.
+    let fields: Vec<String> = (0..65).map(|i| format!("f{i}")).collect();
+    ws.send(tungstenite::Message::Text(
+        json!({"proto": 1, "kind": "subscribe", "fields": fields})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .expect("send subscribe");
+    let msg = ws.next().await.expect("frame").expect("ok");
+    let v: Value = serde_json::from_str(&msg.into_text().expect("text")).expect("json");
+    assert_eq!(v["kind"], "error");
+    assert!(v["error"].as_str().expect("error").contains("cap"), "{v}");
+
+    // A legal subscribe at 1 Hz, then two commands: their acks run
+    // on their own `seq` (0, 1), disjoint from the telemetry stream.
+    ws.send(tungstenite::Message::Text(
+        json!({"proto": 1, "kind": "subscribe", "fields": ["tick"], "rate_hz": 1})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .expect("subscribe");
+    for _ in 0..2 {
+        ws.send(tungstenite::Message::Text(
+            json!({"proto": 1, "kind": "command", "command": {"SetWarp": 1}})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("command");
+    }
+    let mut ack_seqs = Vec::new();
+    for _ in 0..10 {
+        let msg = ws.next().await.expect("frame").expect("ok");
+        let v: Value = serde_json::from_str(&msg.into_text().expect("text")).expect("json");
+        if v["kind"] == "command_ack" {
+            ack_seqs.push(v["seq"].as_u64().expect("seq"));
+        }
+        if ack_seqs.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(ack_seqs, vec![0, 1], "ack sequence must start at 0");
+    server.shutdown();
+}
+
+/// R19-F18: the `/ws` connection count is bounded — the cap+1th
+/// upgrade is refused (503), and a closed session returns its slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ws_connection_cap_refuses_overflow() {
+    let (server, _host) = boot().await;
+    let url = |i: usize| format!("ws://{}/ws?token=e2e-token&client=c{i}", server.addr);
+    let mut held = Vec::new();
+    // csp_server::http's MAX_WS_CONNECTIONS = 16.
+    for i in 0..16 {
+        let (ws, _) = tokio_tungstenite::connect_async(url(i))
+            .await
+            .expect("within cap");
+        held.push(ws);
+    }
+    // The 17th upgrade is refused before the WS handshake.
+    let err = tokio_tungstenite::connect_async(url(16))
+        .await
+        .expect_err("cap+1th connection must refuse");
+    assert!(err.to_string().contains("503"), "{err}");
+    // Dropping one session frees its slot — the permit returns on
+    // session end, and a retry then connects.
+    held.pop();
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if tokio_tungstenite::connect_async(url(17)).await.is_ok() {
+            server.shutdown();
+            return;
+        }
+    }
+    panic!("a freed WS slot never became available");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dashboards_sidecar_api_and_tools() {
     let (server, _host, dir) = boot_dashboards().await;
+    mcp_init(server.addr, None);
     // 503 when unconfigured — verify on the store-less boot too:
     // here the store exists, so exercise the full round-trip.
     let dash = json!({
@@ -638,6 +998,7 @@ async fn ws_subscription_stays_within_byte_budget() {
         (recipe.initial)(&dir).expect("fixture world")
     };
     let (server, _host) = boot_with(make).await;
+    mcp_init(server.addr, None);
     // Spawn a vessel so the vessel.* fields resolve to real data.
     let spawn = json!({"SpawnVessel": {
     "parent": "terrin",
@@ -719,24 +1080,23 @@ async fn ws_subscription_stays_within_byte_budget() {
 }
 
 /// M9d's SPA-serving path end to end (§2.12.3): with a real `spa_dir`
-/// the server injects the token into the built `index.html`, serves
-/// `/assets/*` token-free for the browser's `<script>`/`<link>`
-/// fetches, refuses traversal before it reaches the fs, and keeps the
-/// Origin/Host allowlist on the exempt path.
+/// the server serves the built `index.html` verbatim — token-free and
+/// carrying no secret — serves `/assets/*` token-free for the
+/// browser's `<script>`/`<link>` fetches, refuses traversal before it
+/// reaches the fs, and keeps the Origin/Host allowlist on the exempt
+/// path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn spa_serving_is_token_free_but_allowlisted() {
     let (server, _host, spa) = boot_spa().await;
 
-    // `/` returns the *built* index.html — not the placeholder — with
-    // the token injected before `</head>` (the injection proof).
+    // `/` returns the *built* index.html — not the placeholder —
+    // verbatim: the token-free shell must never carry the secret.
     let (status, body) = http(server.addr, "GET", "/", &[], "");
     assert_eq!(status, 200);
     assert!(body.contains("SPA-SHELL-MARKER"), "{body}");
     assert!(!body.contains("Build the telemetry SPA"), "{body}");
-    let meta = "<meta name=\"csp-token\" content=\"e2e-token\">";
-    let injected = body.find(meta).expect("token meta injected");
-    let head_end = body.find("</head>").expect("</head>");
-    assert!(injected < head_end, "meta must land inside <head>: {body}");
+    assert!(!body.contains("e2e-token"), "token leaked into /: {body}");
+    assert!(!body.contains("csp-token"), "{body}");
 
     // `/assets/app.js` is served token-free — no Authorization header
     // — verbatim bytes out of `spa_dir/assets/`.
@@ -810,5 +1170,124 @@ async fn dashboards_unconfigured_returns_503() {
         assert_eq!(status, 503, "{method} {path}: {body}");
         assert!(body.contains("not configured"), "{method} {path}: {body}");
     }
+    server.shutdown();
+}
+
+/// R19-F3: the allowlist derives from the bind — a wildcard
+/// (`--bind-lan`) bind accepts the IP-literal authorities LAN clients
+/// actually send, keeps the loopback names the wildcard covers, and
+/// still refuses unverifiable *names* (the DNS-rebinding shape).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lan_bind_allowlist_accepts_ip_authorities() {
+    let dir = scratch("csp-e2e-lan");
+    let host = Arc::new(
+        GameHost::spawn_full(World::new, dir, IngressQueue::new(), None).expect("game host"),
+    );
+    let backend: Arc<dyn ControlBackend + Send + Sync> = host.clone();
+    let cfg = ServerConfig {
+        bind: "0.0.0.0:0".parse().expect("bind"),
+        token: Some("e2e-token".into()),
+        auth_disabled: false,
+        token_dir: None,
+        dashboard_dir: None,
+        spa_dir: None,
+    };
+    let server = Server::start(cfg, backend).await.expect("server binds");
+
+    // A LAN browser addresses us literally — `Host: <ip>:<port>` must
+    // not 403 the way a hardcoded localhost set would.
+    let (status, _) = http_host(
+        server.addr,
+        "192.168.10.5:47900",
+        "GET",
+        "/api/telemetry",
+        &bearer(),
+        "",
+    );
+    assert_eq!(status, 200);
+    // Loopback names still pass — the wildcard covers loopback too.
+    let (status, _) = http_host(server.addr, "localhost:1", "GET", "/", &[], "");
+    assert_eq!(status, 200);
+    // Names still deny — `evil.example` rebound to this host is the
+    // exact DNS-rebinding shape the guard exists for, and a LAN DNS
+    // name is unverifiable (clients use the literal address).
+    for host in ["evil.example", "desktop.lan", "localhost.evil.example"] {
+        let (status, _) = http_host(server.addr, host, "GET", "/", &[], "");
+        assert_eq!(status, 403, "{host}");
+    }
+    server.shutdown();
+}
+
+/// R19-F4: backend calls must ride the blocking pool, not runtime
+/// workers. With a single worker thread, a `/mcp` call queued behind
+/// a held game thread must not starve a `/api/telemetry` read — under
+/// the old blocking-recv the one worker would have been parked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn backend_calls_leave_workers_free() {
+    let (server, host) = boot().await;
+    mcp_init(server.addr, None);
+    // Occupy the game thread — the shape of a long drain/session op.
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let held = {
+        let host = host.clone();
+        std::thread::spawn(move || {
+            host.inspect(move |_| {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv();
+                json!(null)
+            });
+        })
+    };
+    entered_rx.await.expect("game thread held");
+
+    let addr = server.addr;
+    let mcp_call = std::thread::spawn(move || {
+        http(
+            addr,
+            "POST",
+            "/mcp",
+            &[
+                ("Authorization", "Bearer e2e-token"),
+                ("Content-Type", "application/json"),
+            ],
+            &tool(1, "session.snapshot", json!({})),
+        )
+    });
+    // Let the request reach the handler — under the old code it parks
+    // the single worker right about now.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // The game thread is still held; a telemetry read (ArcSwap, no
+    // backend call) must answer anyway — proof the worker is free.
+    let (tele_tx, tele_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tele_tx.send(http(
+            addr,
+            "GET",
+            "/api/telemetry",
+            &[("Authorization", "Bearer e2e-token")],
+            "",
+        ));
+    });
+    let (status, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || tele_rx.recv()),
+    )
+    .await
+    .expect("telemetry starved — the backend call parked the worker pool")
+    .expect("join")
+    .expect("recv");
+    assert_eq!(status, 200);
+
+    // Release the game thread: the queued backend call completes.
+    let _ = release_tx.send(());
+    let (status, _) = tokio::task::spawn_blocking(move || mcp_call.join().expect("mcp thread"))
+        .await
+        .expect("join");
+    assert_eq!(status, 200);
+    tokio::task::spawn_blocking(move || held.join().expect("held thread"))
+        .await
+        .expect("join");
     server.shutdown();
 }

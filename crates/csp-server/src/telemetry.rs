@@ -73,10 +73,17 @@ impl TelemetrySnapshot {
 
     /// Resolve one field path against the serialized snapshot.
     /// `None` = the path does not exist (a subscription error, not a
-    /// skipped field — the WS layer reports it).
+    /// skipped field — the WS layer reports it). Serializes the whole
+    /// snapshot per call — the single-field diagnostic form;
+    /// [`Self::project`] is the batched path subscriptions take.
     pub fn field(&self, path: &str) -> Option<serde_json::Value> {
-        let value = serde_json::to_value(self).ok()?;
-        let mut cur = &value;
+        Self::field_in(&serde_json::to_value(self).ok()?, path)
+    }
+
+    /// `path` against an already-serialized snapshot — `project`'s
+    /// per-field step after the one `to_value` it pays per call.
+    fn field_in(value: &serde_json::Value, path: &str) -> Option<serde_json::Value> {
+        let mut cur = value;
         for seg in path.split('.') {
             cur = match cur {
                 serde_json::Value::Object(m) => m.get(seg)?,
@@ -92,15 +99,23 @@ impl TelemetrySnapshot {
 
     /// Project a declared field list into `{path: value}` — the
     /// subscription wire payload (§2.12.2). `None`-valued paths are
-    /// reported in `unknown`, never silently dropped.
+    /// reported in `unknown`, never silently dropped. The snapshot
+    /// serializes **once** per call, not once per field — a 64-field
+    /// 64 Hz subscription is one `to_value` per tick, not 4,096/s.
     pub fn project(
         &self,
         fields: &[String],
     ) -> (serde_json::Map<String, serde_json::Value>, Vec<String>) {
         let mut out = serde_json::Map::new();
         let mut unknown = Vec::new();
+        let Ok(root) = serde_json::to_value(self) else {
+            // A snapshot that cannot serialize resolves nothing —
+            // report every declared path unknown rather than guess.
+            unknown.extend(fields.iter().cloned());
+            return (out, unknown);
+        };
         for f in fields {
-            match self.field(f) {
+            match Self::field_in(&root, f) {
                 Some(v) => {
                     out.insert(f.clone(), v);
                 }

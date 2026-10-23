@@ -4,11 +4,12 @@
 //! deliberate flag, `--bind-lan` in the app, printing a warning —
 //! the config field here is `bind`, the policy lives app-side), a
 //! fixed default port, and a token at
-//! `$XDG_RUNTIME_DIR/csp/<pid>.token` (mode 0600, rotated per start,
-//! never in a save) that MCP clients read.
+//! `$XDG_RUNTIME_DIR/csp/<pid>.token` (created mode 0600 atomically,
+//! contents `<token>\n<port>\n`, removed on shutdown, rotated per
+//! start, never in a save) that MCP clients read.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::backend::ControlBackend;
@@ -61,7 +62,10 @@ impl Default for ServerConfig {
 }
 
 /// `$XDG_RUNTIME_DIR/csp`, falling back to `<temp>/csp` — the token
-/// dir a headless/test environment can still satisfy.
+/// dir a headless/test environment can still satisfy. The fallback is
+/// a shared location, so the hardening lives in the writer: the dir is
+/// enforced `0700` and the `<pid>.token` file is created `0600`
+/// atomically with pre-existing paths refused.
 pub fn runtime_dir() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -100,10 +104,9 @@ impl Server {
         config: ServerConfig,
         backend: Arc<dyn ControlBackend + Send + Sync>,
     ) -> Result<Self, ServeError> {
-        let token = config.token.clone().unwrap_or_else(generate_token);
-        let token_file = match &config.token_dir {
-            Some(dir) => Some(write_token_file(dir, &token)?),
-            None => None,
+        let token = match &config.token {
+            Some(t) => t.clone(),
+            None => generate_token()?,
         };
         // M9d: one store serves both the `/api/dashboards` routes and
         // the session-class `dashboard.*` MCP tools.
@@ -119,8 +122,13 @@ impl Server {
             backend: backend.clone(),
             registry: crate::backend::ClientRegistry::new(),
             mcp: crate::mcp::Mcp::with_dashboards(backend, dashboards.clone()),
+            // The Origin/Host gate follows the socket: a LAN bind
+            // accepts the addresses it actually listens on, a loopback
+            // bind keeps the localhost set — never a hardcoded list.
+            allowlist: http::BindAllowlist::for_bind(config.bind),
             dashboards,
             spa_dir: config.spa_dir.clone(),
+            ws_live: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
         let app = http::router(state);
         let listener = tokio::net::TcpListener::bind(config.bind)
@@ -129,6 +137,13 @@ impl Server {
         let addr = listener
             .local_addr()
             .map_err(|e| ServeError::Bind(e.to_string()))?;
+        // The discovery file is written after bind: it carries the
+        // bound port (an ephemeral `:0` only resolves here), and a
+        // failed bind leaves no stale file behind.
+        let token_file = match &config.token_dir {
+            Some(dir) => Some(write_token_file(dir, &token, addr.port())?),
+            None => None,
+        };
         let task = tokio::spawn(async move {
             axum::serve(listener, app)
                 .await
@@ -142,9 +157,23 @@ impl Server {
         })
     }
 
-    /// Stop the server task.
+    /// Stop the server task and remove the `<pid>.token` discovery
+    /// file — no stale token may outlive the server it unlocks
+    /// (§2.12.3). `Drop` performs the cleanup, so this is the
+    /// explicit-stop spelling of dropping.
     pub fn shutdown(self) {
+        // `Drop` aborts the task and unlinks the token file.
+    }
+}
+
+impl Drop for Server {
+    /// Runs on `shutdown` *and* on a plain drop — a leaked `Server`
+    /// cannot leave a stale `<pid>.token` naming a dead port.
+    fn drop(&mut self) {
         self.task.abort();
+        if let Some(path) = self.token_file.take() {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -153,6 +182,10 @@ impl Server {
 pub enum ServeError {
     /// `TcpListener::bind` failed.
     Bind(String),
+    /// The CSPRNG could not mint a bearer token — there is no weak
+    /// fallback: an unguessable token is the auth boundary, so
+    /// entropy failure is a startup failure.
+    Token(String),
     /// The token file could not be written.
     TokenFile(String),
     /// `axum::serve` returned.
@@ -163,6 +196,7 @@ impl std::fmt::Display for ServeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Bind(m) => write!(f, "bind: {m}"),
+            Self::Token(m) => write!(f, "token: {m}"),
             Self::TokenFile(m) => write!(f, "token file: {m}"),
             Self::Serve(m) => write!(f, "serve: {m}"),
         }
@@ -171,43 +205,85 @@ impl std::fmt::Display for ServeError {
 
 impl std::error::Error for ServeError {}
 
-/// The per-start token — 32 bytes from `/dev/urandom` rendered hex
-/// (a CSPRNG read, not a seeded stream); non-unix builds fall back to
-/// a hash of pid + system time, which is honest for a localhost token.
-fn generate_token() -> String {
-    #[cfg(unix)]
-    {
-        if let Ok(bytes) = std::fs::read("/dev/urandom")
-            && bytes.len() >= 32
-        {
-            return bytes[..32].iter().map(|b| format!("{b:02x}")).collect();
-        }
-    }
-    // Fallback: pid + nanos + a stack address — weak but local-only.
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    use std::hash::Hasher;
-    h.write_u64(std::process::id() as u64);
-    h.write_u128(nanos);
-    h.write_usize(&nanos as *const _ as usize);
-    format!("{:016x}{:016x}", h.finish(), nanos)
+/// The per-start token — 32 bytes from the OS CSPRNG rendered hex.
+/// `getrandom` covers every native target (urandom, BCrypt, …), so
+/// there is no platform fallback to a guessable pid+time hash — a
+/// token that might be predictable is no token at all (R19-F20).
+fn generate_token() -> Result<String, ServeError> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|e| ServeError::Token(e.to_string()))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// `<dir>/<pid>.token` mode 0600, contents `<token>\n<port>\n` — the
-/// discovery file MCP clients read (§2.12.3).
-fn write_token_file(dir: &PathBuf, token: &str) -> Result<PathBuf, ServeError> {
-    std::fs::create_dir_all(dir).map_err(|e| ServeError::TokenFile(e.to_string()))?;
+/// `<dir>/<pid>.token` holding `<token>\n<port>\n` — the discovery
+/// file MCP clients read (§2.12.3). The file is created mode `0600`
+/// atomically (`create_new`, never write-then-chmod): a pre-existing
+/// path — a stale file from a killed run or an attacker-planted
+/// symlink under the shared `<temp>/csp` fallback — is refused, never
+/// followed and truncated.
+fn write_token_file(dir: &Path, token: &str, port: u16) -> Result<PathBuf, ServeError> {
+    use std::io::Write;
+    ensure_token_dir(dir)?;
     let path = dir.join(format!("{}.token", std::process::id()));
-    std::fs::write(&path, format!("{token}\n"))
-        .map_err(|e| ServeError::TokenFile(e.to_string()))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path).map_err(|e| {
+        let hint = if e.kind() == std::io::ErrorKind::AlreadyExists {
+            " (a stale or pre-planted token file — remove it and retry)"
+        } else {
+            ""
+        };
+        ServeError::TokenFile(format!("{e}{hint}"))
+    })?;
+    if let Err(e) = file.write_all(format!("{token}\n{port}\n").as_bytes()) {
+        let _ = std::fs::remove_file(&path);
+        return Err(ServeError::TokenFile(e.to_string()));
+    }
+    Ok(path)
+}
+
+/// Create the runtime dir if absent — `0700` on unix so the
+/// `<temp>/csp` fallback is never world-browsable — and enforce the
+/// same perms on a pre-existing dir we own. A symlink, a non-dir, or
+/// a foreign-owned dir (the chmod fails) all fail closed: the token
+/// must never land where another user can read or pre-plant it.
+fn ensure_token_dir(dir: &Path) -> Result<(), ServeError> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            if meta.is_symlink() || !meta.is_dir() {
+                return Err(ServeError::TokenFile(format!(
+                    "token dir {} is not a plain directory",
+                    dir.display()
+                )));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            builder
+                .create(dir)
+                .map_err(|e| ServeError::TokenFile(e.to_string()))?;
+        }
+        Err(e) => return Err(ServeError::TokenFile(e.to_string())),
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| ServeError::TokenFile(e.to_string()))?;
+        let meta = std::fs::metadata(dir).map_err(|e| ServeError::TokenFile(e.to_string()))?;
+        if meta.permissions().mode() & 0o777 != 0o700 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| ServeError::TokenFile(format!("token dir perms: {e}")))?;
+        }
     }
-    Ok(path)
+    Ok(())
 }

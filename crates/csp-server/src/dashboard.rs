@@ -38,6 +38,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -164,12 +165,19 @@ impl std::error::Error for DashboardError {}
 /// silent empty list).
 pub struct DashboardStore {
     dir: PathBuf,
+    /// Serializes `save` — the cap check and the write are one
+    /// critical section, so two concurrent PUTs cannot both slip
+    /// under [`MAX_DASHBOARDS`] (R19-F17's check-then-act TOCTOU).
+    write_lock: Mutex<()>,
 }
 
 impl DashboardStore {
     /// The store over `dir` — created on first `save`.
     pub fn new(dir: PathBuf) -> Self {
-        Self { dir }
+        Self {
+            dir,
+            write_lock: Mutex::new(()),
+        }
     }
 
     fn path(&self, name: &str) -> PathBuf {
@@ -214,6 +222,10 @@ impl DashboardStore {
 
     /// Validate + write one dashboard — the only mutation path. The
     /// store caps total dashboards (a new name at the cap refuses).
+    /// The cap check and the write run under `write_lock` — no
+    /// check-then-act race — and the write itself is temp-file +
+    /// rename, so a crash mid-write can never leave torn JSON at
+    /// `name.json` (R19-F17).
     pub fn save(&self, name: &str, dash: &Dashboard) -> Result<(), DashboardError> {
         check_name(name)?;
         if dash.name != name {
@@ -223,6 +235,11 @@ impl DashboardStore {
             )));
         }
         dash.validate()?;
+        // Poison-recovery is sound here: the guard's only invariant
+        // is "one writer at a time", and the temp+rename discipline
+        // means even a panic mid-write leaves at worst a stray
+        // `.*.tmp`, never a torn target file.
+        let _guard = self.write_lock.lock().unwrap_or_else(|p| p.into_inner());
         if !self.path(name).exists() && self.list()?.len() >= MAX_DASHBOARDS {
             return Err(DashboardError::Invalid(format!(
                 "dashboard cap {MAX_DASHBOARDS} reached"
@@ -230,7 +247,13 @@ impl DashboardStore {
         }
         std::fs::create_dir_all(&self.dir).map_err(DashboardError::Io)?;
         let bytes = serde_json::to_vec_pretty(dash).map_err(DashboardError::Json)?;
-        std::fs::write(self.path(name), bytes).map_err(DashboardError::Io)
+        let tmp = self.dir.join(format!(".{name}.json.tmp"));
+        std::fs::write(&tmp, &bytes).map_err(DashboardError::Io)?;
+        if let Err(e) = std::fs::rename(&tmp, self.path(name)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(DashboardError::Io(e));
+        }
+        Ok(())
     }
 }
 

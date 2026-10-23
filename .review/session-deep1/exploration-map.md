@@ -1,0 +1,24 @@
+# Exploration Map — session-deep1 (22 clusters)
+
+- C01 csp-core determinism primitives: crates/csp-core/src/{lib,error,hash,quat,rng,time,vec3}.rs — hasher/KDF/SimTime/DVec3. HIGH
+- C02 csp-data schemas: crates/csp-data/src/{lib,ids,loc,system,site,balance,resource,recipe,biome,techtree,part,colony,contract,experiment}.rs — serde schemas. MED
+- C03 csp-data loader+validator+datahash: crates/csp-data/src/{load,validate,datahash}.rs + tests/*.rs. HIGH
+- C04 csp-sim command/event surface: csp-sim/src/lib.rs L1-1168 + events.rs + bubble.rs. HIGH
+- C05 csp-sim orbits/transfer/maneuver: orbit.rs, transfer.rs, maneuver.rs. HIGH (numerical)
+- C06 csp-sim snapshot/save/restore: lib.rs L1169-3016 + L7431-8391 + save.rs. HIGH
+- C07 csp-sim vessel lifecycle/spawn/docking/transfers: lib.rs L3017-5974 + joints.rs + transfers.rs. HIGHEST (user-facing)
+- C08 csp-sim advance loop+control+hash + scripting: lib.rs L5975-7430 + L8392-9112 + scripts.rs + csp-script/lib.rs + csp-ai/lib.rs. HIGHEST
+- C09 csp-sim colonies/manufacture/life_support. HIGH (flow math)
+- C10 csp-sim program layer: research,tech,economy,contracts,reliability. HIGH
+- C11 csp-sim lib.rs tests L9113-17547. MED
+- C12 csp-phys weld/colliders/graph: backend,graph,part,tensor,weld,hull,merge,structural. HIGHEST
+- C13 csp-phys SimpleBackend+aero+thermal: simple,aero,thermal. HIGHEST
+- C14 csp-phys resolver/session/readout/profile + tests. HIGH
+- C15 csp-view presentation world: lib,map,flight,terrain,part_mesh,vab,demo,tutorial + tests/*.rs. HIGH (user-facing)
+- C16 csp-render wgpu passes + WGSL: lib,flight,map,terrain,vab(.rs+.wgsl). HIGH
+- C17 csp-app shell/input/sidecars: lib,main,warp,settings_io,bugreport,logring,audio,synth. HIGH (user-facing)
+- C18 csp-ui egui panels: lib,vab,settings,tutorial,navball. HIGH (user-facing)
+- C19 csp-server HTTP/WS/MCP: lib,backend,dashboard,http,ingress,mcp,serve,telemetry + e2e. HIGH (security)
+- C20 csp-bench replay/eval/perf: lib,agent,contracts,economy,eval,perf,replay,scenario,scenarios + eval_suite. HIGH (determinism gate)
+- C21 bench bins + build.rs + xtask: csp-{eval,mcp,perf,replay}.rs + xtask/src/*. MED
+- C22 apps/telemetry SPA: src/**/*.{ts,tsx,css} + scripts/finalize.mjs. MED

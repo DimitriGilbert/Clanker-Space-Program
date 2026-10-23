@@ -36,7 +36,7 @@ pub mod serve;
 pub mod telemetry;
 
 pub use backend::{
-    BackendError, ClientRegistry, ControlBackend, LocalGame, SaveInfo, SessionSummary,
+    BackendError, ClientRegistry, ControlBackend, LocalGame, SaveInfo, SessionSummary, SubmitReport,
 };
 pub use dashboard::{Dashboard, DashboardError, DashboardStore, Widget};
 pub use ingress::{IngressError, IngressQueue};

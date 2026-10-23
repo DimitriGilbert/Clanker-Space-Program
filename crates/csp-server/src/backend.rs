@@ -30,6 +30,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use csp_sim::orbit::PatchedConics;
@@ -60,16 +61,40 @@ pub struct SessionSummary {
     pub hash: String,
 }
 
+/// What one `submit`/`submit_batch` drain reports back — §2.2.1's
+/// per-channel outcome plus where the advance actually landed. Both
+/// shipped hosts drain synchronously, so the report is real data the
+/// client can branch on, not a status echo.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct SubmitReport {
+    /// Commands the drain's frames applied.
+    pub applied: u64,
+    /// Drain-time rejections, human-readable — the §2.2.1 "error
+    /// delivered on the originating channel" made literal.
+    pub rejected: Vec<String>,
+    /// `true` when the drain's frame cap (64 partial `step_frame`s)
+    /// cut the advance short of its target — the clock reached
+    /// `reached`, not `target`; re-issue the advance to continue it.
+    /// Surfaced rather than silently swallowed: a short-of-target
+    /// `Ok` would lie about where the run stands.
+    pub partial: bool,
+    /// The tick the clock stands at after the drain.
+    pub reached: u64,
+    /// The target the drain last chased — the `AdvanceTo`-extended
+    /// effective target, or `clock + 1` for a plain boundary.
+    pub target: u64,
+}
+
 /// A backend refusal — ingress backpressure passes through as data;
 /// everything else is a session/host failure rendered to the client.
+/// Drain-time command rejections are *not* errors here: they ride back
+/// inside [`SubmitReport::rejected`], the §2.2.1 "error delivered on
+/// the originating channel" made literal.
 #[derive(Debug)]
 pub enum BackendError {
     /// §2.2.1 explicit backpressure — structured, so the wire keeps
     /// the `error` tag the client can branch on.
     Ingress(IngressError),
-    /// A drain-time rejection, observed synchronously — the §2.2.1
-    /// "error delivered on the originating channel" made literal.
-    Rejected(Vec<String>),
     /// Session-side failure (missing save, refused snapshot, IO).
     Session(String),
 }
@@ -78,7 +103,6 @@ impl fmt::Display for BackendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Ingress(e) => write!(f, "{e}"),
-            Self::Rejected(msgs) => write!(f, "command rejected: {}", msgs.join("; ")),
             Self::Session(m) => write!(f, "{m}"),
         }
     }
@@ -105,25 +129,32 @@ pub trait ControlBackend {
     fn telemetry(&self) -> Option<Arc<TelemetrySnapshot>>;
 
     /// Push one `SimCommand` into bounded ingress under `client`.
-    /// Returns the drain-time rejections the host observed — both
-    /// shipped hosts drain synchronously, so the §2.2.1 "error
-    /// delivered on the originating channel" arrives in the result.
-    fn submit(&self, client: u32, command: SimCommand) -> Result<Vec<String>, BackendError>;
+    /// Returns the [`SubmitReport`] the drain observed — both shipped
+    /// hosts drain synchronously, so the §2.2.1 "error delivered on
+    /// the originating channel" arrives in the result, and a partial
+    /// advance reports where the clock actually stopped.
+    fn submit(&self, client: u32, command: SimCommand) -> Result<SubmitReport, BackendError>;
 
     /// Push a *batch* in one drain window — the form under which the
     /// §2.2.1 per-client budget (≤32 commands per drain) is reachable:
     /// commands queue together, then drain together. The default
-    /// loops `submit`; hosts override for queue-then-drain semantics.
+    /// loops `submit`; hosts override for queue-then-drain semantics
+    /// (and for atomicity: a refused push leaves nothing queued).
     fn submit_batch(
         &self,
         client: u32,
         commands: Vec<SimCommand>,
-    ) -> Result<Vec<String>, BackendError> {
-        let mut rejected = Vec::new();
+    ) -> Result<SubmitReport, BackendError> {
+        let mut report = SubmitReport::default();
         for c in commands {
-            rejected.extend(self.submit(client, c)?);
+            let r = self.submit(client, c)?;
+            report.applied = report.applied.saturating_add(r.applied);
+            report.rejected.extend(r.rejected);
+            report.partial = r.partial;
+            report.reached = r.reached;
+            report.target = r.target;
         }
-        Ok(rejected)
+        Ok(report)
     }
 
     /// Session-class: the saves this host can load. `Ok(vec![])` is
@@ -140,10 +171,29 @@ pub trait ControlBackend {
     fn summary(&self) -> Result<SessionSummary, BackendError>;
 }
 
+/// The `?client=`/`X-CSP-Client` name bound — a `source_id` label is
+/// a diagnostic tag, not a document. Longer names truncate (on a
+/// char boundary); distinct names that collide past the cap simply
+/// share an id, which aliases the *stamp* and nothing else.
+pub const MAX_CLIENT_NAME: usize = 64;
+
+/// The registry's entry bound — attacker-controlled names cannot
+/// grow the map without limit (R19-F9). Past it, every new name
+/// folds into [`OVERFLOW_CLIENT`]: the overflow pool shares one id,
+/// so its members also share one §2.2.1 per-client ingress budget
+/// among themselves — the flood starves itself, not the server.
+pub const MAX_CLIENTS: usize = 256;
+
+/// The id every name past [`MAX_CLIENTS`] resolves to — outside the
+/// `0..MAX_CLIENTS` range the allocator assigns, never colliding
+/// with a real client index.
+pub const OVERFLOW_CLIENT: u32 = u32::MAX;
+
 /// §2.12.3's `source_id` allocator — first-seen client names get
 /// ascending indexes ("assigned in connection order"). The map is
 /// live-session state, never sim state: the command log records the
-/// numeric id; replay stamps it verbatim.
+/// numeric id; replay stamps it verbatim. Bounded by
+/// [`MAX_CLIENT_NAME`]/[`MAX_CLIENTS`]; see their docs.
 #[derive(Debug, Default)]
 pub struct ClientRegistry {
     map: Mutex<BTreeMap<String, u32>>,
@@ -156,11 +206,20 @@ impl ClientRegistry {
     }
 
     /// `name`'s client index — assigned on first sight, stable for
-    /// the server's life.
+    /// the server's life. Names are normalized to
+    /// [`MAX_CLIENT_NAME`] bytes first; past [`MAX_CLIENTS`]
+    /// distinct names, every newcomer gets [`OVERFLOW_CLIENT`].
     pub fn id(&self, name: &str) -> u32 {
+        // Poison recovery is sound here: each critical section is a
+        // single map read or insert with no multi-step invariant, so
+        // a panic elsewhere can never leave a half-updated ledger.
         let mut map = self.map.lock().unwrap_or_else(|p| p.into_inner());
+        let name = normalize_client_name(name);
         if let Some(id) = map.get(name) {
             return *id;
+        }
+        if map.len() >= MAX_CLIENTS {
+            return OVERFLOW_CLIENT;
         }
         let id = map.len() as u32;
         map.insert(name.to_string(), id);
@@ -176,6 +235,18 @@ impl ClientRegistry {
             .map(|(n, i)| (n.clone(), *i))
             .collect()
     }
+}
+
+/// Truncate `name` to [`MAX_CLIENT_NAME`] bytes on a char boundary.
+fn normalize_client_name(name: &str) -> &str {
+    if name.len() <= MAX_CLIENT_NAME {
+        return name;
+    }
+    let mut end = MAX_CLIENT_NAME;
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    &name[..end]
 }
 
 // ---------------------------------------------------------------------------
@@ -266,12 +337,13 @@ impl HostCore {
     /// Pop the ingress queue into the world, then step one boundary
     /// (plus any `AdvanceTo` the drain extends to, honouring
     /// `partial` by re-issuing the same *effective* target — the
-    /// recorder contract). Returns `(applied, rejected-messages)`.
-    fn drain_and_step(&mut self) -> Result<(u64, Vec<String>), BackendError> {
+    /// recorder contract). Returns the [`SubmitReport`] — including
+    /// the `partial` flag when the frame cap leaves the clock short
+    /// of target.
+    fn drain_and_step(&mut self) -> Result<SubmitReport, BackendError> {
         self.queue.drain_into(&mut self.world);
         let mut target = self.world.clock().ticks().saturating_add(1);
-        let mut applied = 0_u64;
-        let mut rejected = Vec::new();
+        let mut report = SubmitReport::default();
         // Bounded like the frame loop: a partial advance re-issues the
         // call's *effective* target — the `AdvanceTo`-extended one the
         // report carries — never the stale `clock + 1`, which a
@@ -283,29 +355,39 @@ impl HostCore {
                 .world
                 .step_frame(target)
                 .map_err(|e| BackendError::Session(format!("step_frame: {e}")))?;
-            applied = applied.saturating_add(r.commands_applied);
-            rejected.extend(r.rejected.iter().map(|(_, e)| format!("{e}")));
+            report.applied = report.applied.saturating_add(r.commands_applied);
+            report
+                .rejected
+                .extend(r.rejected.iter().map(|(_, e)| format!("{e}")));
+            report.reached = r.reached_tick;
+            report.target = r.effective_target;
+            report.partial = r.partial;
             if !r.partial {
                 break;
             }
             target = r.effective_target;
         }
-        Ok((applied, rejected))
+        Ok(report)
     }
 
     /// Queue-then-drain: the whole batch lands in the ingress queue
     /// (budget-checked per command), then one drain applies it — the
     /// shape under which `ClientBudget`/`QueueFull` actually fire.
+    /// The queue side is atomic: a mid-push refusal rolls the queued
+    /// prefix back, so a failed batch leaves `pending` untouched —
+    /// never residue the next unrelated submit would silently apply.
     fn submit_batch(
         &mut self,
         client: u32,
         commands: Vec<SimCommand>,
-    ) -> Result<Vec<String>, BackendError> {
-        for c in commands {
-            self.queue.push(client, c)?;
+    ) -> Result<SubmitReport, BackendError> {
+        for (pushed, c) in commands.into_iter().enumerate() {
+            if let Err(e) = self.queue.push(client, c) {
+                self.queue.rollback_last(pushed);
+                return Err(BackendError::Ingress(e));
+            }
         }
-        let (_, rejected) = self.drain_and_step()?;
-        Ok(rejected)
+        self.drain_and_step()
     }
 
     fn save_path(&self, name: &str) -> PathBuf {
@@ -442,7 +524,7 @@ impl LocalGame {
 
     /// Tighter ingress bounds — tests exercise the refusals.
     pub fn with_ingress(self, queue: IngressQueue) -> Self {
-        self.inner().queue = queue;
+        self.inner_or_recover().queue = queue;
         self
     }
 
@@ -450,15 +532,15 @@ impl LocalGame {
     /// engine, autopilot driver, op budget — the `set_*` calls a
     /// fixture-built world needs re-applied after `session.load`).
     pub fn with_reconfigure(self, f: impl Fn(&mut World) + Send + 'static) -> Self {
-        self.inner().reconfigure = Some(Box::new(f));
+        self.inner_or_recover().reconfigure = Some(Box::new(f));
         self
     }
 
     /// Drain queued commands into the world and step one boundary —
     /// the `submit` internals without the submit, for hosts driving
-    /// the pump out-of-band. Returns `(applied, rejected-messages)`.
-    pub fn pump(&self) -> Result<(u64, Vec<String>), BackendError> {
-        let mut g = self.inner();
+    /// the pump out-of-band. Returns the [`SubmitReport`].
+    pub fn pump(&self) -> Result<SubmitReport, BackendError> {
+        let mut g = self.inner()?;
         let r = g.drain_and_step()?;
         self.publish(&g);
         drop(g);
@@ -467,13 +549,34 @@ impl LocalGame {
 
     /// Read-side access to the world under the host's lock — test and
     /// diagnostic surface (assert the command log, inspect arena
-    /// state) without exposing the mutex.
+    /// state) without exposing the mutex. Poison-recoverable like
+    /// [`Self::inner_or_recover`]: a diagnostic *read* of a world left
+    /// mid-mutation by a panic is memory-safe and best-effort — the
+    /// mutation paths, where a half-drained queue would corrupt the
+    /// stream, refuse instead.
     pub fn with_world<R>(&self, f: impl FnOnce(&World) -> R) -> R {
-        let g = self.inner();
+        let g = self.inner_or_recover();
         f(&g.world)
     }
 
-    fn inner(&self) -> MutexGuard<'_, HostCore> {
+    /// The host lock for the mutation/session paths — `Err` on
+    /// poison: a panic inside a critical section (mid-drain,
+    /// mid-restore) can leave the queue half-drained or the world
+    /// half-stepped, and recovering the guard would silently resume
+    /// from that state (R19-F19). Propagating the refusal is the
+    /// honest answer.
+    fn inner(&self) -> Result<MutexGuard<'_, HostCore>, BackendError> {
+        self.inner
+            .lock()
+            .map_err(|_| BackendError::Session("host lock poisoned by a panic mid-mutation".into()))
+    }
+
+    /// The builder/diagnostic lock — poison-*recoverable*, unlike
+    /// [`Self::inner`]: these callers only swap construction config
+    /// or read the world, never continue a half-run mutation. Safe
+    /// Rust keeps the `HostCore` itself coherent under a panic, so
+    /// the recovered guard sees consistent memory.
+    fn inner_or_recover(&self) -> MutexGuard<'_, HostCore> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
 
@@ -488,7 +591,7 @@ impl ControlBackend for LocalGame {
         Some(self.published.load_full())
     }
 
-    fn submit(&self, client: u32, command: SimCommand) -> Result<Vec<String>, BackendError> {
+    fn submit(&self, client: u32, command: SimCommand) -> Result<SubmitReport, BackendError> {
         self.submit_batch(client, vec![command])
     }
 
@@ -496,39 +599,56 @@ impl ControlBackend for LocalGame {
         &self,
         client: u32,
         commands: Vec<SimCommand>,
-    ) -> Result<Vec<String>, BackendError> {
-        let rejected;
+    ) -> Result<SubmitReport, BackendError> {
+        let report;
         {
-            let mut g = self.inner();
-            rejected = g.submit_batch(client, commands)?;
+            let mut g = self.inner()?;
+            report = g.submit_batch(client, commands)?;
             self.publish(&g);
         }
-        Ok(rejected)
+        Ok(report)
     }
 
     fn list_saves(&self) -> Result<Vec<SaveInfo>, BackendError> {
-        self.inner().list_saves()
+        self.inner()?.list_saves()
     }
 
     fn load_save(&self, name: &str) -> Result<SessionSummary, BackendError> {
-        let mut g = self.inner();
+        let mut g = self.inner()?;
         let r = g.load_save(name)?;
         self.publish(&g);
         Ok(r)
     }
 
     fn store_save(&self, name: &str) -> Result<SaveInfo, BackendError> {
-        self.inner().store_save(name)
+        self.inner()?.store_save(name)
     }
 
     fn summary(&self) -> Result<SessionSummary, BackendError> {
-        self.inner().summary()
+        self.inner()?.summary()
     }
 }
 
 // ---------------------------------------------------------------------------
 // GameHost — the attach-to-a-running-game host (axum side)
 // ---------------------------------------------------------------------------
+
+/// The last-resort bound on a game-thread reply — generous enough to
+/// cover the longest legitimate drain (64 budget-split `step_frame`s
+/// or a big `session.load`); a *dead* thread disconnects instantly
+/// and never waits this out. The HTTP layer's own timeout is far
+/// shorter — this one exists so a wedged-but-alive thread can never
+/// park a caller forever.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Drop's bound on the game thread's exit — a `Shutdown` request
+/// normally lands the instant the current drain returns, but a thread
+/// wedged *inside* a drain (a pathological `step_frame`, a deadlock)
+/// would park an unbounded `join()` forever. On timeout the
+/// `JoinHandle` is dropped: std offers no abort, so the thread
+/// detaches and keeps running — the process stops waiting instead of
+/// hanging.
+const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A request to the game thread — `reply` is the rendezvous channel
 /// the answer rides back on.
@@ -540,7 +660,7 @@ enum Request {
         /// The command(s) to enqueue in one drain window.
         commands: Vec<SimCommand>,
         /// Rejection-report rendezvous.
-        reply: std::sync::mpsc::Sender<Result<Vec<String>, BackendError>>,
+        reply: std::sync::mpsc::Sender<Result<SubmitReport, BackendError>>,
     },
     /// `ControlBackend::list_saves`.
     ListSaves(std::sync::mpsc::Sender<Result<Vec<SaveInfo>, BackendError>>),
@@ -589,8 +709,13 @@ impl GameHost {
     /// Spawn the game thread: `make` builds the world *inside* the
     /// thread (a `World` cannot cross threads — the builder must be
     /// `Send`, the result needn't be), `save_dir` hosts session
-    /// tools.
-    pub fn spawn(make: impl FnOnce() -> World + Send + 'static, save_dir: PathBuf) -> Self {
+    /// tools. A thread-spawn failure is a `BackendError::Session`,
+    /// never a process-killing panic — a library host must surface
+    /// its own failures (R19-F19).
+    pub fn spawn(
+        make: impl FnOnce() -> World + Send + 'static,
+        save_dir: PathBuf,
+    ) -> Result<Self, BackendError> {
         Self::spawn_full(make, save_dir, IngressQueue::new(), None)
     }
 
@@ -602,7 +727,7 @@ impl GameHost {
         save_dir: PathBuf,
         queue: IngressQueue,
         reconfigure: Option<Reconfigure>,
-    ) -> Self {
+    ) -> Result<Self, BackendError> {
         let published = Arc::new(ArcSwap::from_pointee(TelemetrySnapshot::from_world(
             &World::new(),
         )));
@@ -614,6 +739,10 @@ impl GameHost {
                 let mut core = HostCore::new(make(), save_dir, queue, reconfigure);
                 pub_in.store(Arc::new(TelemetrySnapshot::from_world(&core.world)));
                 while let Ok(req) = rx.recv() {
+                    // A failed `reply.send` means *this requester*
+                    // went away (a timed-out or cancelled call drops
+                    // its receiver) — the host must keep serving, not
+                    // exit the loop and strand every later request.
                     match req {
                         Request::Submit {
                             client,
@@ -622,58 +751,45 @@ impl GameHost {
                         } => {
                             let r = core.submit_batch(client, commands);
                             pub_in.store(Arc::new(TelemetrySnapshot::from_world(&core.world)));
-                            if reply.send(r).is_err() {
-                                break;
-                            }
+                            let _ = reply.send(r);
                         }
                         Request::ListSaves(reply) => {
-                            if reply.send(core.list_saves()).is_err() {
-                                break;
-                            }
+                            let _ = reply.send(core.list_saves());
                         }
                         Request::LoadSave { name, reply } => {
                             let r = core.load_save(&name);
                             pub_in.store(Arc::new(TelemetrySnapshot::from_world(&core.world)));
-                            if reply.send(r).is_err() {
-                                break;
-                            }
+                            let _ = reply.send(r);
                         }
                         Request::StoreSave { name, reply } => {
-                            if reply.send(core.store_save(&name)).is_err() {
-                                break;
-                            }
+                            let _ = reply.send(core.store_save(&name));
                         }
                         Request::Summary(reply) => {
-                            if reply.send(core.summary()).is_err() {
-                                break;
-                            }
+                            let _ = reply.send(core.summary());
                         }
                         Request::Inspect { f, reply } => {
-                            if reply.send(f(&core.world)).is_err() {
-                                break;
-                            }
+                            let _ = reply.send(f(&core.world));
                         }
                         Request::Shutdown => break,
                     }
                 }
             });
-        let join = match join {
-            Ok(j) => j,
-            Err(e) => {
-                // A thread that cannot spawn is a hard failure — surface
-                // it rather than serving a dead backend.
-                panic!("csp-game thread spawn failed: {e}");
-            }
-        };
-        Self {
+        // A thread that cannot spawn is a hard failure — surface it
+        // rather than serving a dead backend, and never `panic!` in a
+        // library: the caller decides what a dead host means.
+        let join =
+            join.map_err(|e| BackendError::Session(format!("csp-game thread spawn: {e}")))?;
+        Ok(Self {
             tx,
             published,
             join: Mutex::new(Some(join)),
-        }
+        })
     }
 
     /// Read access on the game thread — the test/diagnostic channel
-    /// [`LocalGame::with_world`] mirrors.
+    /// [`LocalGame::with_world`] mirrors. Bounded by `REPLY_TIMEOUT`:
+    /// a wedged game thread yields `Value::Null`, never a parked
+    /// caller.
     pub fn inspect(&self, f: impl FnOnce(&World) -> Value + Send + 'static) -> Value {
         let (rtx, rrx) = std::sync::mpsc::channel();
         if self
@@ -686,9 +802,14 @@ impl GameHost {
         {
             return Value::Null;
         }
-        rrx.recv().unwrap_or(Value::Null)
+        rrx.recv_timeout(REPLY_TIMEOUT).unwrap_or(Value::Null)
     }
 
+    /// Blocking callers: the sync [`ControlBackend`] contract means
+    /// this waits on a std channel — it must only ever run on a real
+    /// thread (the HTTP layer drives it through
+    /// `tokio::task::spawn_blocking` so a slow drain parks a blocking
+    /// thread, never a runtime worker).
     fn call<R>(
         &self,
         req: impl FnOnce(std::sync::mpsc::Sender<Result<R, BackendError>>) -> Request,
@@ -697,17 +818,44 @@ impl GameHost {
         if self.tx.send(req(rtx)).is_err() {
             return Err(BackendError::Session("game thread gone".into()));
         }
-        rrx.recv()
-            .unwrap_or_else(|_| Err(BackendError::Session("game thread gone".into())))
+        match rrx.recv_timeout(REPLY_TIMEOUT) {
+            Ok(r) => r,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Err(BackendError::Session("game thread reply timed out".into()))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(BackendError::Session("game thread gone".into()))
+            }
+        }
     }
 }
 
 impl Drop for GameHost {
     fn drop(&mut self) {
         let _ = self.tx.send(Request::Shutdown);
-        if let Some(j) = self.join.lock().unwrap_or_else(|p| p.into_inner()).take() {
-            let _ = j.join();
+        // Poison-recoverable by construction: the only critical
+        // section is the atomic `take`, so a poisoned lock can only
+        // mean a prior `Drop` panicked *after* it — recovering still
+        // completes the shutdown `Drop` owes the thread.
+        let Some(j) = self.join.lock().unwrap_or_else(|p| p.into_inner()).take() else {
+            return;
+        };
+        // Bounded join (see `SHUTDOWN_JOIN_TIMEOUT`): poll
+        // `is_finished` — `JoinHandle::join` alone is unbounded and a
+        // wedged game thread would park the dropper forever. On
+        // timeout the handle drops here, detaching the thread.
+        let deadline = std::time::Instant::now() + SHUTDOWN_JOIN_TIMEOUT;
+        while !j.is_finished() {
+            if std::time::Instant::now() >= deadline {
+                eprintln!(
+                    "csp-server: game thread did not exit within \
+                     {SHUTDOWN_JOIN_TIMEOUT:?}; detaching"
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
+        let _ = j.join();
     }
 }
 
@@ -716,7 +864,7 @@ impl ControlBackend for GameHost {
         Some(self.published.load_full())
     }
 
-    fn submit(&self, client: u32, command: SimCommand) -> Result<Vec<String>, BackendError> {
+    fn submit(&self, client: u32, command: SimCommand) -> Result<SubmitReport, BackendError> {
         self.submit_batch(client, vec![command])
     }
 
@@ -724,7 +872,7 @@ impl ControlBackend for GameHost {
         &self,
         client: u32,
         commands: Vec<SimCommand>,
-    ) -> Result<Vec<String>, BackendError> {
+    ) -> Result<SubmitReport, BackendError> {
         self.call(|reply| Request::Submit {
             client,
             commands,
@@ -760,6 +908,35 @@ impl ControlBackend for GameHost {
 mod tests {
     use super::*;
 
+    /// R19-F9: the registry is bounded — names normalize to
+    /// [`MAX_CLIENT_NAME`] bytes (on a char boundary), and distinct
+    /// names past [`MAX_CLIENTS`] fold into the shared
+    /// [`OVERFLOW_CLIENT`] id instead of growing the map.
+    #[test]
+    fn registry_is_bounded_on_attacker_names() {
+        let r = ClientRegistry::new();
+        // Name length cap: a 200-byte name truncates; the truncated
+        // twin resolves to the same id.
+        let long = "x".repeat(200);
+        let id = r.id(&long);
+        assert_eq!(r.id(&long[..MAX_CLIENT_NAME]), id);
+        // Multibyte truncation stays on a char boundary (€ is 3
+        // bytes; byte 64 lands mid-char → normalizes to 63).
+        let mb = "€".repeat(22); // 66 bytes
+        let id_mb = r.id(&mb);
+        assert_eq!(r.id(&"€".repeat(21)), id_mb);
+        // Entry cap: fill to the cap, then every new name overflows.
+        let r = ClientRegistry::new();
+        for i in 0..MAX_CLIENTS {
+            assert_eq!(r.id(&format!("c{i}")), i as u32);
+        }
+        assert_eq!(r.id("one-too-many"), OVERFLOW_CLIENT);
+        assert_eq!(r.id("another"), OVERFLOW_CLIENT);
+        assert_eq!(r.clients().len(), MAX_CLIENTS);
+        // …while existing names still resolve to their real ids.
+        assert_eq!(r.id("c0"), 0);
+    }
+
     /// Regression — an `AdvanceTo` past [`csp_sim::MAX_TICKS_PER_FRAME`]
     /// must land on its target, not stall on the first `partial`:
     /// `drain_and_step` re-issues the report's *effective* target (the
@@ -769,10 +946,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("csp-backend-{}", std::process::id()));
         let game = LocalGame::new(World::new(), dir);
         let target = csp_sim::MAX_TICKS_PER_FRAME * 2 + 42;
-        let rejected = game
+        let report = game
             .submit(0, SimCommand::AdvanceTo(target))
             .expect("submit");
-        assert!(rejected.is_empty(), "{rejected:?}");
+        assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+        assert!(!report.partial);
+        assert_eq!(report.reached, target);
         game.with_world(|w| assert_eq!(w.clock().ticks(), target));
         assert_eq!(game.telemetry().expect("snapshot").tick, target);
         // A further warp from the new clock lands too — the host
@@ -781,5 +960,70 @@ mod tests {
         game.submit(0, SimCommand::AdvanceTo(target2))
             .expect("submit");
         game.with_world(|w| assert_eq!(w.clock().ticks(), target2));
+    }
+
+    /// A batch refused mid-push must leave nothing queued — otherwise
+    /// the pushed prefix silently drains under the next unrelated
+    /// submit (R19-F5). Here a 3-command batch exceeds the per-client
+    /// budget at the third push; a following `pump` must find the
+    /// queue empty (nothing applied, nothing in the log).
+    #[test]
+    fn failed_batch_leaves_no_residue() {
+        let dir = std::env::temp_dir().join(format!("csp-backend-{}", std::process::id()));
+        let game = LocalGame::new(World::new(), dir).with_ingress(IngressQueue::with_limits(64, 2));
+        let err = game
+            .submit_batch(
+                0,
+                vec![
+                    SimCommand::SetWarp(1),
+                    SimCommand::SetWarp(1),
+                    SimCommand::SetWarp(1),
+                ],
+            )
+            .expect_err("budget refusal");
+        assert!(matches!(
+            err,
+            BackendError::Ingress(IngressError::ClientBudget { .. })
+        ));
+        // The rolled-back prefix never drains: the pump steps an empty
+        // boundary (no commands applied) and the log stays empty.
+        let report = game.pump().expect("pump");
+        assert_eq!(report.applied, 0);
+        game.with_world(|w| assert!(w.command_log().is_empty()));
+        // A clean submit still works — and applies only itself.
+        let report = game.submit(0, SimCommand::SetWarp(9)).expect("submit");
+        assert!(report.rejected.is_empty());
+        game.with_world(|w| {
+            let entries: Vec<_> = w.command_log().to_vec();
+            assert_eq!(entries.len(), 1, "{entries:?}");
+        });
+    }
+
+    /// The 64-partial-frame cap must be *reported*, not swallowed
+    /// (R19-F15): an `AdvanceTo` the drain cannot finish comes back
+    /// `partial: true` with the clock's real landing tick, so the
+    /// caller knows to re-issue rather than assume arrival.
+    #[test]
+    fn drain_cap_reports_partial_shortfall() {
+        let dir = std::env::temp_dir().join(format!("csp-backend-{}", std::process::id()));
+        let game = LocalGame::new(World::new(), dir);
+        // One past what 64 budget-split frames can reach.
+        let target = 64 * csp_sim::MAX_TICKS_PER_FRAME + 1;
+        let report = game
+            .submit(0, SimCommand::AdvanceTo(target))
+            .expect("submit");
+        assert!(report.partial, "{report:?}");
+        assert_eq!(report.target, target);
+        assert!(report.reached < target);
+        game.with_world(|w| assert_eq!(w.clock().ticks(), report.reached));
+        // Re-issuing continues the same advance (the recorder
+        // contract): the next drain's target resumes from `reached`
+        // and the remaining tick lands it — no stall, no restart.
+        let report = game
+            .submit(0, SimCommand::AdvanceTo(target))
+            .expect("submit");
+        assert_eq!(report.target, target);
+        assert!(!report.partial, "{report:?}");
+        assert_eq!(report.reached, target);
     }
 }

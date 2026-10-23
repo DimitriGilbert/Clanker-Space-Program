@@ -6,17 +6,22 @@
 //! - **`Origin`/`Host` allowlists on every endpoint, read-only ones
 //!   included.** DNS-rebinding protection: a browser page from another
 //!   origin — or any request asserting a foreign `Host` authority (the
-//!   rebinding shape: `attacker.example` resolved to 127.0.0.1) — gets
-//!   403 before auth is even considered. Allowed: `localhost`,
-//!   `127.0.0.1`, `[::1]` on any port, or an absent `Origin`/`Host`
-//!   (non-browser clients do not send `Origin`; a missing `Host` falls
-//!   back to the URI authority, then to the bound localhost address).
-//! - **Bearer token on every endpoint except `/`** — the token is
-//!   injected into the served HTML (a `<meta>` tag), lives at
+//!   rebinding shape: `attacker.example` resolved to the bound
+//!   address) — gets 403 before auth is even considered. The allowlist
+//!   is derived from the bind ([`BindAllowlist`]): a loopback bind
+//!   accepts the localhost names, a specific bind accepts its own
+//!   address, a wildcard (`--bind-lan`) bind accepts any IP-literal
+//!   authority plus the loopback names it covers. An absent
+//!   `Origin`/`Host` also passes (non-browser clients do not send
+//!   `Origin`; a missing `Host` falls back to the URI authority).
+//! - **Bearer token on every endpoint except the SPA shell** — `/`
+//!   and `/assets/*` are token-free so a browser can load the page,
+//!   but the served shell never carries the secret. The token lives at
 //!   `$XDG_RUNTIME_DIR/csp/<pid>.token` mode 0600, is rotated per
-//!   process start, and is never stored in a save. MCP clients read it
-//!   from the file; browsers send it as `Authorization: Bearer` (or
-//!   `?token=` on the WS upgrade, which cannot set headers).
+//!   process start, and is never stored in a save. It reaches clients
+//!   only over authenticated channels — the file for MCP clients, an
+//!   `Authorization: Bearer` header everywhere else, and `?token=`
+//!   solely on the `/ws` upgrade, which cannot set headers.
 //! - **Bounded ingress**: the body limit is the §2.2.1 64 KiB message
 //!   cap; the WS frame cap matches; the command queue is
 //!   [`crate::ingress::IngressQueue`]'s.
@@ -46,13 +51,16 @@
 //!   channel behind them.
 //! - **`spa_dir` has no binary wiring yet.** [`AppState::spa_dir`] is
 //!   `None` in every shipped path (no binary sets it), so `/` serves
-//!   the placeholder in production today. The injection + `/assets/*`
-//!   path is exercised by the `spa_serving_*` e2e, which boots the
-//!   router against a temp `spa_dir`.
+//!   the placeholder in production today. The verbatim `/` +
+//!   `/assets/*` path is exercised by the `spa_serving_*` e2e, which
+//!   boots the router against a temp `spa_dir`.
 
 use std::convert::Infallible;
-use std::path::PathBuf;
+use std::net::{IpAddr, SocketAddr};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -83,6 +91,33 @@ const MAX_FIELDS: usize = 64;
 /// breaking change (§2.12.2).
 const WIRE_PROTO: u64 = 1;
 
+/// Bound on a backend call riding a `spawn_blocking` thread: the
+/// synchronous [`ControlBackend`] contract waits on a game-thread
+/// rendezvous — a hung or wedged game thread gets a 503 here instead
+/// of an in-flight request (or a parked worker) that outlives its
+/// client. Generous enough for a legitimate heavy drain.
+const BACKEND_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Live `/ws` connection bound — a telemetry stream costs a task and
+/// a per-tick projection, so the count is a resource limit like the
+/// body/frame caps (R19-F18). The cap+1th upgrade gets a 503.
+const MAX_WS_CONNECTIONS: usize = 16;
+
+/// `/ws` keepalive cadence — a protocol-level Ping per interval;
+/// the peer's Pong refreshes `last_seen`.
+const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// `/ws` liveness bound — three missed ping cycles with *no* inbound
+/// frame at all closes the session (a dead or deaf peer must not
+/// leak a task + a connection slot forever).
+const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Bound on one outbound send — the drop-to-latest contract means a
+/// send never queues; a client that stops reading fills the socket
+/// buffer and would stall `Sink::send` (and the whole session loop)
+/// without it.
+const WS_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The shared app state behind every route.
 pub struct AppState {
     /// The bearer token — `None` only for the test-side router
@@ -95,27 +130,67 @@ pub struct AppState {
     pub registry: ClientRegistry,
     /// The transport-free MCP engine.
     pub mcp: Mcp,
+    /// The `Origin`/`Host` allowlist the guard enforces — derived
+    /// from the bound address ([`BindAllowlist::for_bind`]), never a
+    /// hardcoded localhost set.
+    pub allowlist: BindAllowlist,
     /// M9d §2.12.2 — the sidecar dashboard store (`/api/dashboards` +
     /// the `dashboard.*` session tools). `None` = unconfigured (503s,
     /// not a fake empty list).
     pub dashboards: Option<Arc<DashboardStore>>,
     /// M9d — the built SPA's static root (`apps/telemetry` output);
-    /// `/` serves its `index.html` with the token injected,
-    /// `/assets/*` serves the bundle. `None` = the placeholder page.
+    /// `/` serves its `index.html` verbatim (the shell is token-free
+    /// and must never carry the secret), `/assets/*` serves the
+    /// bundle. `None` = the placeholder page.
     pub spa_dir: Option<PathBuf>,
+    /// Live `/ws` sessions — counted so the connection bound is a
+    /// real limit, not a wish (see `ws_permit`).
+    pub ws_live: Arc<AtomicUsize>,
+}
+
+/// A held `/ws` connection slot — decrements the live count on drop,
+/// i.e. exactly when the session task ends (any exit path).
+pub struct WsPermit {
+    live: Arc<AtomicUsize>,
+}
+
+impl Drop for WsPermit {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl AppState {
-    /// Wire the state's parts from a backend + token.
-    pub fn new(backend: Arc<dyn ControlBackend + Send + Sync>, token: Option<String>) -> Self {
+    /// Wire the state's parts from a backend + token + the address
+    /// the socket binds (the allowlist follows it).
+    pub fn new(
+        backend: Arc<dyn ControlBackend + Send + Sync>,
+        token: Option<String>,
+        bind: SocketAddr,
+    ) -> Self {
         Self {
             token,
             mcp: Mcp::new(backend.clone()),
             backend,
             registry: ClientRegistry::new(),
+            allowlist: BindAllowlist::for_bind(bind),
             dashboards: None,
             spa_dir: None,
+            ws_live: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Take a `/ws` connection slot — `None` once
+    /// [`MAX_WS_CONNECTIONS`] sessions are live; the returned permit
+    /// holds the slot until the session ends.
+    fn ws_permit(&self) -> Option<WsPermit> {
+        if self.ws_live.fetch_add(1, Ordering::Relaxed) >= MAX_WS_CONNECTIONS {
+            self.ws_live.fetch_sub(1, Ordering::Relaxed);
+            return None;
+        }
+        Some(WsPermit {
+            live: self.ws_live.clone(),
+        })
     }
 }
 
@@ -141,8 +216,83 @@ pub fn router(state: Arc<AppState>) -> Router {
 // Guard — Origin allowlist + bearer token (all endpoints)
 // ---------------------------------------------------------------------------
 
-/// The `localhost` names — what `Origin` and `Host` authorities must
-/// both reduce to under the §2.12.3 allowlist.
+/// The `Origin`/`Host` allowlist, derived from the bound address —
+/// §2.12.3's DNS-rebinding gate follows where the socket actually
+/// listens, never a hardcoded localhost set (a LAN bind with a
+/// localhost-only list would fail closed for the intended users and
+/// open for `Host: localhost` spoofers).
+#[derive(Clone, Debug)]
+pub enum BindAllowlist {
+    /// A loopback bind: the localhost authority set — `localhost`,
+    /// `127.0.0.0/8`, `[::1]` on any port.
+    Loopback,
+    /// A specific non-loopback bind (e.g. `192.168.1.5`): the bound
+    /// address alone — every connection arrives on it, and no other
+    /// authority (a name, a different address, `localhost` itself)
+    /// can be verified.
+    Bound(IpAddr),
+    /// A wildcard bind (`0.0.0.0`/`::` — the app's deliberate
+    /// `--bind-lan`): every local address is bound, so any IP-literal
+    /// authority that reached us names a bound address, and the
+    /// localhost set rides the loopback the wildcard covers. Other
+    /// *names* stay denied — a DNS name for this host cannot be
+    /// verified, so LAN clients must address us literally.
+    Wildcard,
+}
+
+impl BindAllowlist {
+    /// The allowlist for a bound socket address.
+    pub fn for_bind(bind: SocketAddr) -> Self {
+        let ip = bind.ip();
+        if ip.is_unspecified() {
+            Self::Wildcard
+        } else if ip.is_loopback() {
+            Self::Loopback
+        } else {
+            Self::Bound(ip)
+        }
+    }
+
+    /// `true` when `host` — the host part of a `Host`/`Origin`
+    /// authority — names a bound address under this allowlist.
+    fn name_allowed(&self, host: &str) -> bool {
+        match self {
+            Self::Loopback => {
+                localhost_name(host) || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+            }
+            Self::Bound(ip) => host.parse::<IpAddr>().is_ok_and(|h| h == *ip),
+            Self::Wildcard => host.parse::<IpAddr>().is_ok() || localhost_name(host),
+        }
+    }
+
+    /// `true` when `Origin`'s authority names a bound address — the
+    /// spec's DNS-rebinding rule. We compare the *authority*, not the
+    /// scheme string, so `http://localhost:PORT` and
+    /// `https://127.0.0.1:PORT` both pass on a loopback bind and
+    /// `http://evil.example` never does anywhere.
+    fn origin_allowed(&self, origin: &str) -> bool {
+        // Strip the scheme, then the path — keep the authority.
+        let rest = origin
+            .split("://")
+            .nth(1)
+            .unwrap_or(origin)
+            .split('/')
+            .next()
+            .unwrap_or_default();
+        self.name_allowed(authority_host(rest))
+    }
+
+    /// `true` when a `Host` (or URI) authority names a bound
+    /// address — the other half of the DNS-rebinding rule. An
+    /// unbracketed IPv6 literal (`::1` bare) is malformed for an
+    /// authority and denies.
+    fn host_allowed(&self, host: &str) -> bool {
+        self.name_allowed(authority_host(host.trim()))
+    }
+}
+
+/// The `localhost` names — the loopback-bind authority set (and the
+/// name half a wildcard bind keeps for the loopback it covers).
 fn localhost_name(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
 }
@@ -158,34 +308,10 @@ fn authority_host(authority: &str) -> &str {
     }
 }
 
-/// `true` when `Origin` is unset or names a localhost authority —
-/// the spec's DNS-rebinding rule. We compare the *authority*, not the
-/// scheme string, so `http://localhost:PORT` and
-/// `https://127.0.0.1:PORT` both pass and `http://evil.example` never
-/// does.
-fn origin_allowed(origin: &str) -> bool {
-    // Strip the scheme, then the path — keep the authority.
-    let rest = origin
-        .split("://")
-        .nth(1)
-        .unwrap_or(origin)
-        .split('/')
-        .next()
-        .unwrap_or_default();
-    localhost_name(authority_host(rest))
-}
-
-/// `true` when a `Host` (or URI) authority names localhost — the
-/// other half of the DNS-rebinding rule. An unbracketed IPv6 literal
-/// (`::1` bare) is malformed for an authority and denies.
-fn host_allowed(host: &str) -> bool {
-    localhost_name(authority_host(host.trim()))
-}
-
 /// The guard: the §2.12.3 Origin/Host allowlist first (403 on a
 /// foreign authority — the DNS-rebinding shape), then the bearer
-/// token on everything except the SPA shell the token is injected
-/// into. `?token=` authenticates the WS upgrade path.
+/// token on everything except the token-free SPA shell. `?token=`
+/// authenticates the `/ws` upgrade path only.
 async fn guard(
     State(state): State<Arc<AppState>>,
     req: axum::http::Request<Body>,
@@ -193,7 +319,7 @@ async fn guard(
 ) -> Response {
     if let Some(origin) = req.headers().get(header::ORIGIN)
         && let Ok(s) = origin.to_str()
-        && !origin_allowed(s)
+        && !state.allowlist.origin_allowed(s)
     {
         return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
     }
@@ -201,31 +327,41 @@ async fn guard(
     // `/` included. Absent (HTTP/1.0, or h2's `:authority` riding the
     // URI) the URI's own authority is checked instead; neither
     // present means nothing foreign was claimed and the bound
-    // localhost address stands.
+    // address stands.
     if let Some(host) = req
         .headers()
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
         .or_else(|| req.uri().host())
-        && !host_allowed(host)
+        && !state.allowlist.host_allowed(host)
     {
         return (StatusCode::FORBIDDEN, "host not allowed").into_response();
     }
-    // The SPA shell + its static bundle are token-free — the token is
-    // *injected into* `/`, and a browser cannot set Authorization on
-    // a <script>/<link> fetch. The Origin/Host allowlist above still
-    // covers them (every endpoint gets it); the token's job is
-    // protecting the *data* surfaces, and those stay guarded.
+    // The SPA shell + its static bundle are token-free — a browser
+    // cannot set Authorization on a <script>/<link> fetch, and the
+    // shell never carries the secret (the token is never served; it
+    // arrives over the authenticated channel). The Origin/Host
+    // allowlist above still covers them (every endpoint gets it); the
+    // token's job is protecting the *data* surfaces, and those stay
+    // guarded.
     let path = req.uri().path();
     if path == "/" || path.starts_with("/assets/") {
         return next.run(req).await;
     }
     if let Some(token) = &state.token {
-        let ok = bearer_matches(req.headers(), token)
-            || Query::<TokenQuery>::try_from_uri(req.uri())
+        // `?token=` exists for the WS bootstrap only — a browser's
+        // upgrade request cannot set headers — never for the REST/MCP
+        // surfaces, where a bearer-carrying query string would leak
+        // into logs and history.
+        let query_ok = path == "/ws"
+            && Query::<TokenQuery>::try_from_uri(req.uri())
                 .ok()
-                .is_some_and(|q| q.token.as_deref() == Some(token.as_str()));
-        if !ok {
+                .is_some_and(|q| {
+                    q.token
+                        .as_deref()
+                        .is_some_and(|t| constant_time_eq(t, token))
+                });
+        if !bearer_matches(req.headers(), token) && !query_ok {
             return (StatusCode::UNAUTHORIZED, "bad or missing bearer token").into_response();
         }
     }
@@ -237,12 +373,30 @@ struct TokenQuery {
     token: Option<String>,
 }
 
+/// `Authorization: Bearer <token>` — the auth scheme is
+/// case-insensitive (RFC 9110 §11.4); the credential compare never
+/// short-circuits on a matching prefix.
 fn bearer_matches(headers: &HeaderMap, token: &str) -> bool {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|t| t == token)
+        .and_then(|v| {
+            let (scheme, credential) = v.split_once(' ')?;
+            scheme.eq_ignore_ascii_case("bearer").then_some(credential)
+        })
+        .is_some_and(|t| constant_time_eq(t, token))
+}
+
+/// Constant-time string equality: every byte pair is folded into one
+/// accumulator (the length difference included), so the running time
+/// cannot reveal where a guess diverged.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut diff = a.len() ^ b.len();
+    for i in 0..a.len().max(b.len()) {
+        diff |= usize::from(a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0));
+    }
+    diff == 0
 }
 
 // ---------------------------------------------------------------------------
@@ -250,25 +404,18 @@ fn bearer_matches(headers: &HeaderMap, token: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// The SPA shell — M9d: serve the built app's `index.html` from
-/// `spa_dir` with the token injected into its `<meta name="csp-token">`
-/// slot (§2.12.3 — the only token-free page, so the injection can't
-/// leak). Without a configured `spa_dir`, the placeholder remains.
+/// `spa_dir` **verbatim** (§2.12.3 — `/` is the token-free page, so
+/// the secret must never appear in what it serves; the token reaches
+/// the client only over the authenticated channel). Without a
+/// configured `spa_dir`, the token-free placeholder remains.
 async fn index(State(state): State<Arc<AppState>>) -> Response {
-    let token = state.token.as_deref().unwrap_or("");
     if let Some(dir) = &state.spa_dir
-        && let Ok(html) = std::fs::read_to_string(dir.join("index.html"))
+        && let Ok(html) = tokio::fs::read_to_string(dir.join("index.html")).await
     {
-        let meta = format!("<meta name=\"csp-token\" content=\"{token}\">");
-        // Inject before </head>; a head-less document prepends.
-        let html = match html.find("</head>") {
-            Some(i) => format!("{}{}{}", &html[..i], meta, &html[i..]),
-            None => format!("{meta}{html}"),
-        };
         return Html(html).into_response();
     }
     Html(format!(
         "<!doctype html><html><head><meta charset=\"utf-8\">\
-         <meta name=\"csp-token\" content=\"{token}\">\
          <title>Clanker Space Program — telemetry</title></head>\
          <body><h1>csp-server</h1><p>Build the telemetry SPA in \
          <code>apps/telemetry</code> and point <code>spa_dir</code> at \
@@ -279,8 +426,25 @@ async fn index(State(state): State<Arc<AppState>>) -> Response {
     .into_response()
 }
 
+/// The `/assets/{*path}` gate (R19-F13): `path` must be a plain
+/// relative path of `Normal` segments — `\` is refused outright (a
+/// separator on Windows, where `a\..\b` would traverse even though a
+/// `/`-split sees one safe segment), NUL likewise (OS paths truncate
+/// at it), `:` too (Windows drive prefixes and ADS forks survive the
+/// `Normal` walk on Unix), and a `Component` walk rejects every
+/// `.`/`..`/root/Windows-prefix piece; empty `/`-segments (`a//b`)
+/// are refused too.
+fn clean_asset_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains(['\\', '\0', ':'])
+        && !path.split('/').any(str::is_empty)
+        && Path::new(path)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
+}
+
 /// `GET /assets/{*path}` — the SPA bundle's static files. Bounded:
-/// the path must be relative-clean (no `..`, no leading `/`), the
+/// the path must be relative-clean (see [`clean_asset_path`]), the
 /// file under `spa_dir`, and small (bundle files, not arbitrary fs).
 async fn spa_asset(
     State(state): State<Arc<AppState>>,
@@ -290,19 +454,17 @@ async fn spa_asset(
     let Some(dir) = &state.spa_dir else {
         return (StatusCode::NOT_FOUND, "no SPA configured").into_response();
     };
-    if path.is_empty()
-        || path.starts_with('/')
-        || path.split('/').any(|seg| seg == ".." || seg.is_empty())
-    {
+    if !clean_asset_path(&path) {
         return (StatusCode::BAD_REQUEST, "bad asset path").into_response();
     }
     let file = dir.join("assets").join(&path);
-    let meta = match std::fs::metadata(&file) {
-        Ok(m) if m.is_file() && m.len() <= MAX_ASSET => m,
+    // async fs — a blocking `std::fs` call on a runtime worker would
+    // stall sibling handlers under a slow disk (R19-F16).
+    match tokio::fs::metadata(&file).await {
+        Ok(m) if m.is_file() && m.len() <= MAX_ASSET => {}
         _ => return (StatusCode::NOT_FOUND, "asset not found").into_response(),
-    };
-    let _ = meta;
-    let bytes = match std::fs::read(&file) {
+    }
+    let bytes = match tokio::fs::read(&file).await {
         Ok(b) => b,
         Err(_) => return (StatusCode::NOT_FOUND, "asset not found").into_response(),
     };
@@ -319,14 +481,33 @@ async fn spa_asset(
     ([(header::CONTENT_TYPE, ty)], bytes).into_response()
 }
 
+/// Run one synchronous [`DashboardStore`] op on the blocking pool —
+/// the store's fs I/O must not park a runtime worker (R19-F16); the
+/// `JoinError` arm is a panicked task, surfaced as a 500.
+async fn store_call<R: Send + 'static>(
+    state: &Arc<AppState>,
+    op: impl FnOnce(&DashboardStore) -> R + Send + 'static,
+) -> Result<R, Response> {
+    let Some(store) = state.dashboards.clone() else {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "dashboards not configured").into_response());
+    };
+    tokio::task::spawn_blocking(move || op(&store))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("dashboard task failed: {e}"),
+            )
+                .into_response()
+        })
+}
+
 /// `GET /api/dashboards` — the store's name list.
 async fn dashboard_list(State(state): State<Arc<AppState>>) -> Response {
-    let Some(store) = &state.dashboards else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "dashboards not configured").into_response();
-    };
-    match store.list() {
-        Ok(names) => Json(json!({"dashboards": names})).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    match store_call(&state, |s| s.list()).await {
+        Err(resp) => resp,
+        Ok(Ok(names)) => Json(json!({"dashboards": names})).into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -335,15 +516,13 @@ async fn dashboard_get(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Response {
-    let Some(store) = &state.dashboards else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "dashboards not configured").into_response();
-    };
-    match store.load(&name) {
-        Ok(dash) => Json(dash).into_response(),
-        Err(crate::dashboard::DashboardError::Invalid(m)) => {
+    match store_call(&state, move |s| s.load(&name)).await {
+        Err(resp) => resp,
+        Ok(Ok(dash)) => Json(dash).into_response(),
+        Ok(Err(crate::dashboard::DashboardError::Invalid(m))) => {
             (StatusCode::NOT_FOUND, m).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -355,19 +534,23 @@ async fn dashboard_put(
     axum::extract::Path(name): axum::extract::Path<String>,
     body: Bytes,
 ) -> Response {
-    let Some(store) = &state.dashboards else {
+    // The 503 precedes the body parse — an unconfigured store says
+    // "not configured", never a JSON complaint about a body it
+    // would not have stored anyway.
+    if state.dashboards.is_none() {
         return (StatusCode::SERVICE_UNAVAILABLE, "dashboards not configured").into_response();
-    };
+    }
     let dash: Dashboard = match serde_json::from_slice(&body) {
         Ok(d) => d,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("dashboard json: {e}")).into_response(),
     };
-    match store.save(&name, &dash) {
-        Ok(()) => Json(json!({"name": name})).into_response(),
-        Err(crate::dashboard::DashboardError::Invalid(m)) => {
+    match store_call(&state, move |s| s.save(&name, &dash).map(|()| name)).await {
+        Err(resp) => resp,
+        Ok(Ok(saved)) => Json(json!({"name": saved})).into_response(),
+        Ok(Err(crate::dashboard::DashboardError::Invalid(m))) => {
             (StatusCode::BAD_REQUEST, m).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -440,7 +623,34 @@ async fn mcp_post(
         })
         .unwrap_or_else(|| "default".to_string());
     let client = state.registry.id(&client_name);
-    let Some(response) = state.mcp.handle(client, &msg) else {
+    // The backend behind `mcp.handle` is synchronous (its `call`
+    // waits on a game-thread rendezvous) — run it on a blocking
+    // thread with a bound so a slow drain parks the blocking pool,
+    // never a runtime worker, and a wedged thread answers 503.
+    let mcp = state.mcp.clone();
+    let handled = tokio::time::timeout(
+        BACKEND_CALL_TIMEOUT,
+        tokio::task::spawn_blocking(move || mcp.handle(client, &msg)),
+    )
+    .await;
+    let handled = match handled {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("mcp task failed: {e}"),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "game thread did not answer in time",
+            )
+                .into_response();
+        }
+    };
+    let Some(response) = handled else {
         return StatusCode::ACCEPTED.into_response();
     };
     // Per-request SSE upgrade — the plan's transport shape: when the
@@ -475,31 +685,61 @@ async fn mcp_reject() -> (StatusCode, &'static str) {
 /// The WS subscribe envelope: `{proto, kind: "subscribe", fields,
 /// rate_hz?}`; afterwards `{kind: "command", command}` is the opt-in
 /// command channel (§2.12's "mostly read; opt-in command channel").
+/// Bounded: [`MAX_WS_CONNECTIONS`] slots, and the frame cap matches
+/// the message cap — the §2.2.1 64 KiB wire bound applies to single
+/// frames too, not just reassembled messages (R19-F10).
 async fn ws_upgrade(
     State(state): State<Arc<AppState>>,
     Query(q): Query<McpQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
+    let Some(permit) = state.ws_permit() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many websocket connections",
+        )
+            .into_response();
+    };
     let client = state.registry.id(q.client.as_deref().unwrap_or("default"));
-    ws.max_message_size(MAX_MESSAGE_BYTES)
-        .on_upgrade(move |socket| ws_session(socket, state, client))
+    ws.max_frame_size(MAX_MESSAGE_BYTES)
+        .max_message_size(MAX_MESSAGE_BYTES)
+        .on_upgrade(move |socket| ws_session(socket, state, client, permit))
 }
 
 /// One WS session: subscribe → project fields per tick of the rate
 /// interval → send `{proto, kind: "telemetry", seq, tick, payload}`.
 /// Backpressure is drop-to-latest by construction — each send reads
 /// the `ArcSwap` anew; a slow client degrades its own rate only.
-#[allow(clippy::too_many_lines)] // the select! loop holds the whole session state machine
-async fn ws_session(socket: WebSocket, state: Arc<AppState>, client: u32) {
+/// Keepalive is a protocol Ping per [`WS_PING_INTERVAL`]; any inbound
+/// frame (Pongs included) refreshes liveness, and
+/// [`WS_IDLE_TIMEOUT`] without one closes the session. Sends are
+/// bounded by [`WS_SEND_TIMEOUT`] — a peer that stops reading is
+/// dropped, never queued (R19-F18). `_permit` holds the connection
+/// slot for the session's life.
+// The select! loop holds the whole session state machine — splitting
+// the arms would scatter the shared `fields`/`ticker`/`seq` state.
+#[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
+async fn ws_session(socket: WebSocket, state: Arc<AppState>, client: u32, _permit: WsPermit) {
     let (mut sink, mut stream) = socket.split();
     let mut fields: Option<Vec<String>> = None;
     let mut rate_hz = 16_u64;
+    // The telemetry frame counter. `command_ack`s carry their own —
+    // sharing it would tie a request/response sequence to the
+    // stream's cadence (R19-F14).
     let mut seq = 0_u64;
+    let mut cmd_seq = 0_u64;
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(1000 / rate_hz));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut keepalive = tokio::time::interval_at(
+        tokio::time::Instant::now() + WS_PING_INTERVAL,
+        WS_PING_INTERVAL,
+    );
+    let mut last_seen = tokio::time::Instant::now();
     loop {
         tokio::select! {
-            _ = ticker.tick() => {
+            // The subscription gate keeps an unsubscribed session
+            // from waking 16×/s to do nothing.
+            _ = ticker.tick(), if fields.is_some() => {
                 let Some(fs) = fields.as_ref() else { continue };
                 let Some(snap) = state.backend.telemetry() else { continue };
                 let (payload, unknown) = snap.project(fs);
@@ -509,46 +749,88 @@ async fn ws_session(socket: WebSocket, state: Arc<AppState>, client: u32) {
                     "payload": payload, "unknown_fields": unknown,
                 });
                 seq += 1;
-                if sink.send(Message::Text(frame.to_string().into())).await.is_err() {
+                if !send_msg(&mut sink, Message::Text(frame.to_string().into())).await {
+                    return;
+                }
+            }
+            _ = keepalive.tick() => {
+                if last_seen.elapsed() > WS_IDLE_TIMEOUT {
+                    // Missed-pong cycles: the peer is dead or deaf —
+                    // best-effort close, then reclaim the slot.
+                    let _ = send_msg(&mut sink, Message::Close(None)).await;
+                    return;
+                }
+                if !send_msg(&mut sink, Message::Ping(Bytes::new())).await {
                     return;
                 }
             }
             msg = stream.next() => {
                 let Some(Ok(msg)) = msg else { return };
+                // Any inbound frame — Pongs to our pings included —
+                // is liveness proof.
+                last_seen = tokio::time::Instant::now();
                 let Message::Text(text) = msg else { continue };
                 let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
+                // Every client→server envelope carries `proto` — the
+                // version field is the bump mechanism for the whole
+                // wire surface, not just subscriptions (R19-F14).
+                if matches!(
+                    v.get("kind").and_then(Value::as_str),
+                    Some("subscribe" | "command")
+                ) && v.get("proto") != Some(&json!(WIRE_PROTO))
+                {
+                    if !send_json(&mut sink, &json!({
+                        "proto": WIRE_PROTO, "kind": "error",
+                        "error": format!("wire proto must be {WIRE_PROTO}"),
+                    })).await {
+                        return;
+                    }
+                    continue;
+                }
                 match v.get("kind").and_then(Value::as_str) {
                     Some("subscribe") => {
-                        if v.get("proto") != Some(&json!(WIRE_PROTO)) {
-                            let _ = send_json(&mut sink, &json!({
-                                "proto": WIRE_PROTO, "kind": "error",
-                                "error": format!("wire proto must be {WIRE_PROTO}"),
-                            })).await;
-                            continue;
-                        }
                         let fs: Vec<String> = v
                             .get("fields")
                             .and_then(Value::as_array)
                             .map(|a| {
                                 a.iter()
                                     .filter_map(|f| f.as_str().map(str::to_string))
-                                    .take(MAX_FIELDS)
                                     .collect()
                             })
                             .unwrap_or_default();
                         if fs.is_empty() {
-                            let _ = send_json(&mut sink, &json!({
+                            if !send_json(&mut sink, &json!({
                                 "proto": WIRE_PROTO, "kind": "error",
                                 "error": "subscription needs a non-empty fields list",
-                            })).await;
+                            })).await {
+                                return;
+                            }
+                            continue;
+                        }
+                        // Over-cap is an explicit error, never a
+                        // silent truncation — paths past the cap
+                        // would vanish without even an
+                        // `unknown_fields` mention (R19-F14).
+                        if fs.len() > MAX_FIELDS {
+                            if !send_json(&mut sink, &json!({
+                                "proto": WIRE_PROTO, "kind": "error",
+                                "error": format!(
+                                    "fields list {} exceeds the {MAX_FIELDS}-field cap",
+                                    fs.len()
+                                ),
+                            })).await {
+                                return;
+                            }
                             continue;
                         }
                         let rate = v.get("rate_hz").and_then(Value::as_u64).unwrap_or(16);
                         if !VALID_RATES.contains(&rate) {
-                            let _ = send_json(&mut sink, &json!({
+                            if !send_json(&mut sink, &json!({
                                 "proto": WIRE_PROTO, "kind": "error",
                                 "error": format!("rate_hz must divide 64: {VALID_RATES:?}"),
-                            })).await;
+                            })).await {
+                                return;
+                            }
                             continue;
                         }
                         rate_hz = rate;
@@ -559,33 +841,51 @@ async fn ws_session(socket: WebSocket, state: Arc<AppState>, client: u32) {
                         ticker.set_missed_tick_behavior(
                             tokio::time::MissedTickBehavior::Skip,
                         );
-                        let _ = send_json(&mut sink, &json!({
+                        if !send_json(&mut sink, &json!({
                             "proto": WIRE_PROTO, "kind": "subscribed",
                             "rate_hz": rate_hz,
-                        })).await;
+                        })).await {
+                            return;
+                        }
                     }
                     Some("command") => {
                         let cmd = v.get("command").cloned().unwrap_or(Value::Null);
-                        let result = serde_json::from_value::<SimCommand>(cmd)
-                            .map_err(|e| e.to_string())
-                            .and_then(|c| {
-                                state
-                                    .backend
-                                    .submit(client, c)
+                        // Same spawn_blocking + bound as `/mcp` —
+                        // `submit` waits on the game thread.
+                        let backend = state.backend.clone();
+                        let result = tokio::time::timeout(
+                            BACKEND_CALL_TIMEOUT,
+                            tokio::task::spawn_blocking(move || {
+                                serde_json::from_value::<SimCommand>(cmd)
                                     .map_err(|e| e.to_string())
-                            });
+                                    .and_then(|c| {
+                                        backend.submit(client, c).map_err(|e| e.to_string())
+                                    })
+                            }),
+                        )
+                        .await;
+                        let result = match result {
+                            Ok(Ok(r)) => r,
+                            Ok(Err(e)) => Err(format!("command task failed: {e}")),
+                            Err(_) => Err("game thread did not answer in time".to_string()),
+                        };
                         let frame = match result {
-                            Ok(rejected) => json!({
+                            Ok(report) => json!({
                                 "proto": WIRE_PROTO, "kind": "command_ack",
-                                "seq": seq, "rejected": rejected,
+                                "seq": cmd_seq, "rejected": report.rejected,
+                                "partial": report.partial,
+                                "reached": report.reached,
+                                "target": report.target,
                             }),
                             Err(e) => json!({
                                 "proto": WIRE_PROTO, "kind": "command_ack",
-                                "seq": seq, "error": e,
+                                "seq": cmd_seq, "error": e,
                             }),
                         };
-                        seq += 1;
-                        let _ = send_json(&mut sink, &frame).await;
+                        cmd_seq += 1;
+                        if !send_json(&mut sink, &frame).await {
+                            return;
+                        }
                     }
                     _ => {}
                 }
@@ -594,26 +894,47 @@ async fn ws_session(socket: WebSocket, state: Arc<AppState>, client: u32) {
     }
 }
 
+/// A bounded send — `false` means the peer or the deadline lost, so
+/// the caller ends the session. The timeout exists because
+/// drop-to-latest forbids queueing: a stalled `Sink::send` on a
+/// full socket buffer must close the session, not park it
+/// (`WS_SEND_TIMEOUT`, R19-F18).
+async fn send_msg(
+    sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    msg: Message,
+) -> bool {
+    matches!(
+        tokio::time::timeout(WS_SEND_TIMEOUT, sink.send(msg)).await,
+        Ok(Ok(()))
+    )
+}
+
 async fn send_json(
     sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     v: &Value,
-) -> Result<(), axum::Error> {
-    sink.send(Message::Text(v.to_string().into())).await
+) -> bool {
+    send_msg(sink, Message::Text(v.to_string().into())).await
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // test assertions
 mod tests {
     use super::*;
 
+    fn loopback() -> BindAllowlist {
+        BindAllowlist::for_bind("127.0.0.1:47900".parse().unwrap())
+    }
+
     #[test]
     fn origin_allowlist() {
+        let a = loopback();
         for ok in [
             "http://localhost:47900",
             "https://127.0.0.1",
             "http://[::1]:8080/path?q=1",
             "http://LOCALHOST",
         ] {
-            assert!(origin_allowed(ok), "{ok}");
+            assert!(a.origin_allowed(ok), "{ok}");
         }
         for bad in [
             "http://evil.example",
@@ -622,32 +943,117 @@ mod tests {
             "javascript:alert(1)",
             "",
         ] {
-            assert!(!origin_allowed(bad), "{bad}");
+            assert!(!a.origin_allowed(bad), "{bad}");
         }
     }
 
     #[test]
     fn host_allowlist() {
+        let a = loopback();
         for ok in [
             "localhost",
             "localhost:47900",
             "127.0.0.1",
             "127.0.0.1:8080",
+            "127.0.0.2", // any loopback address, not just .1
             "[::1]",
             "[::1]:9000",
             "LOCALHOST:80",
         ] {
-            assert!(host_allowed(ok), "{ok}");
+            assert!(a.host_allowed(ok), "{ok}");
         }
         for bad in [
             "evil.example",
             "localhost.evil.example",
             "127.0.0.1.evil.example",
             "user@evil.example:80",
-            "::1", // unbracketed v6 is a malformed authority
+            "::1",         // unbracketed v6 is a malformed authority
+            "192.168.1.5", // a LAN address is foreign to a loopback bind
             "",
         ] {
-            assert!(!host_allowed(bad), "{bad}");
+            assert!(!a.host_allowed(bad), "{bad}");
+        }
+    }
+
+    /// R19-F3: the allowlist follows the bind — a `--bind-lan`
+    /// (wildcard) bind accepts the IP-literal authorities LAN
+    /// clients actually send, keeps the loopback names the wildcard
+    /// covers, and still refuses unverifiable names (the
+    /// DNS-rebinding shape). A specific non-loopback bind accepts
+    /// its own address only — `localhost` included in the refused set.
+    #[test]
+    fn allowlist_follows_the_bind() {
+        // Wildcard bind (the --bind-lan shape).
+        let a = BindAllowlist::for_bind("0.0.0.0:47900".parse().unwrap());
+        for ok in [
+            "192.168.1.5:47900", // a LAN client addressing us literally
+            "192.168.1.5",
+            "10.0.0.2",
+            "[fe80::1]:47900",
+            "localhost:47900", // loopback is covered by the wildcard
+            "127.0.0.1",
+            "[::1]",
+        ] {
+            assert!(a.host_allowed(ok), "{ok}");
+        }
+        for bad in [
+            "evil.example", // the rebinding shape — still denied
+            "desktop.lan",  // unverifiable name — denied, use the literal IP
+            "localhost.evil.example",
+            "user@evil.example:80",
+            "",
+        ] {
+            assert!(!a.host_allowed(bad), "{bad}");
+        }
+        assert!(a.origin_allowed("http://192.168.1.5:47900"));
+        assert!(!a.origin_allowed("http://evil.example"));
+
+        // A specific non-loopback bind — only the bound address.
+        let a = BindAllowlist::for_bind("192.168.1.5:47900".parse().unwrap());
+        assert!(a.host_allowed("192.168.1.5"));
+        assert!(a.host_allowed("192.168.1.5:80"));
+        for bad in ["localhost", "127.0.0.1", "192.168.1.6", "desktop.lan", ""] {
+            assert!(!a.host_allowed(bad), "{bad}");
+        }
+
+        // `::` is a wildcard too.
+        assert!(matches!(
+            BindAllowlist::for_bind("[::]:47900".parse().unwrap()),
+            BindAllowlist::Wildcard
+        ));
+    }
+
+    /// R19-F13: the asset-path gate refuses every non-`Normal`
+    /// component — `..`/`.`/roots on any platform, and the Windows
+    /// shapes a `/`-only split cannot see (`a\..\b` is one safe-
+    /// looking `/`-segment that traverses on Windows).
+    #[test]
+    fn asset_path_gate_refuses_traversal() {
+        // `a/./b` normalizes to `a/b` under the Component walk — the
+        // join resolves to the same file, so it is accepted.
+        for ok in [
+            "app.js",
+            "css/site.css",
+            "a/b/c.chunk.mjs",
+            "x.json",
+            "a/./b",
+        ] {
+            assert!(clean_asset_path(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "/app.js",
+            "a//b",
+            "a/",
+            "..",
+            "../index.html",
+            "a/../b",
+            "a\\..\\b", // the Windows traversal — `\` never reaches join
+            "a\\b",     // any backslash, traversal or not
+            "a\0b.js",  // NUL truncates OS paths
+            "C:/x.js",  // a Windows drive root is not a relative asset
+        ] {
+            assert!(!clean_asset_path(bad), "{bad:?}");
         }
     }
 }

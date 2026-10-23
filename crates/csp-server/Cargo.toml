@@ -32,6 +32,9 @@ tokio = { version = "1", features = [
 ] }
 # WS stream/sink split + SSE response streams.
 futures-util = "0.3"
+# The bearer token's CSPRNG — one cross-platform source (no weak
+# pid+time fallback on non-Unix targets).
+getrandom = "0.4"
 
 [dev-dependencies]
 # Router-level tests drive the app without a listener (ServiceExt).

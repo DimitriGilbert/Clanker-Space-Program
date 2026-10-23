@@ -12,6 +12,11 @@
 //!   returns either `application/json` or a per-request
 //!   `text/event-stream` upgrade (the transport's choice per §2.12).
 //!
+//! The MCP lifecycle's one hard rule applies on both: `initialize`
+//! is a client's first request (`ping` excepted) — tracked per
+//! §2.12.3 client index, since the sessionless transport has no
+//! connection to hang the handshake on.
+//!
 //! # Tools — `csp.mcp.tools.v1`
 //!
 //! The tool schema is versioned independently
@@ -24,7 +29,8 @@
 //! issued under `source_class = External`, they pay the same one-tick
 //! latency and honour the same §2.2.1 control lease as every client.
 
-use std::sync::Arc;
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 
 use csp_core::DVec3;
 use csp_sim::{Lease, SimCommand, VesselId};
@@ -83,6 +89,26 @@ pub struct Mcp<B: ControlBackend + ?Sized = dyn ControlBackend + Send + Sync> {
     /// session-class tools read/write. `None` = unconfigured
     /// (the tools report `isError`, honest rather than fake-empty).
     dashboards: Option<Arc<crate::dashboard::DashboardStore>>,
+    /// The MCP handshake ledger — the client indexes that completed
+    /// `initialize`. Revision 2026-07-28 has no protocol-level
+    /// sessions, so the handshake is tracked per §2.12.3 client
+    /// index; shared across `Clone`s because the HTTP transport
+    /// moves a clone onto a `spawn_blocking` thread per POST.
+    initialized: Arc<Mutex<BTreeSet<u32>>>,
+}
+
+/// Cheap clone — two `Arc`s plus the shared handshake ledger — so
+/// an async transport can move the engine onto a `spawn_blocking`
+/// thread (`B = dyn ...` has no `Clone`, hence the manual impl
+/// rather than a derive).
+impl<B: ControlBackend + ?Sized> Clone for Mcp<B> {
+    fn clone(&self) -> Self {
+        Self {
+            backend: self.backend.clone(),
+            dashboards: self.dashboards.clone(),
+            initialized: self.initialized.clone(),
+        }
+    }
 }
 
 impl<B: ControlBackend + ?Sized> Mcp<B> {
@@ -92,6 +118,7 @@ impl<B: ControlBackend + ?Sized> Mcp<B> {
         Self {
             backend,
             dashboards: None,
+            initialized: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -104,6 +131,7 @@ impl<B: ControlBackend + ?Sized> Mcp<B> {
         Self {
             backend,
             dashboards,
+            initialized: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -133,9 +161,26 @@ impl<B: ControlBackend + ?Sized> Mcp<B> {
             // for every method we serve.
             return None;
         };
+        // The MCP lifecycle's one hard rule: `initialize` is a
+        // client's first request (`ping` is the spec's pre-handshake
+        // exception). The revision-2026-07-28 transport is
+        // sessionless, so the handshake is tracked per §2.12.3
+        // client index — a request ahead of it is a protocol error,
+        // not a silently-served dispatch (R19-F20).
+        if method != "initialize" && method != "ping" && !self.is_initialized(client) {
+            return Some(rpc_error(
+                id,
+                INVALID_REQUEST,
+                "expected initialize before other requests",
+            ));
+        }
         let params = msg.get("params").cloned().unwrap_or(Value::Null);
         let result = match method {
-            "initialize" => Ok(self.initialize(&params)),
+            "initialize" => {
+                let out = self.initialize(&params);
+                self.mark_initialized(client);
+                Ok(out)
+            }
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({"tools": tools_v1()})),
             "tools/call" => self.tool_call(id, client, &params),
@@ -153,6 +198,28 @@ impl<B: ControlBackend + ?Sized> Mcp<B> {
             Ok(v) => json!({"jsonrpc": "2.0", "id": id, "result": v}),
             Err(e) => e,
         })
+    }
+
+    /// `true` once `client` has completed `initialize` — the
+    /// pre-handshake gate [`Self::handle`] enforces. Poison-recovery
+    /// is sound: each critical section is a single set op, so a
+    /// panic elsewhere cannot leave a half-written ledger.
+    fn is_initialized(&self, client: u32) -> bool {
+        self.initialized
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&client)
+    }
+
+    /// Record `client`'s handshake. Called when `initialize`
+    /// answers — the sessionless transport cannot wait on the
+    /// `notifications/initialized` confirmation, so the response
+    /// itself completes the server's side of the lifecycle.
+    fn mark_initialized(&self, client: u32) {
+        self.initialized
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(client);
     }
 
     /// `initialize`: negotiate the protocol revision (§2.12's
@@ -298,36 +365,38 @@ impl<B: ControlBackend + ?Sized> Mcp<B> {
     }
 
     /// `vessel.control {vessel, throttle?, steer_dir?, attitude?, hold_attitude?}`
-    /// — the frozen `ControlApi` verbs as commands. Fields apply in
-    /// argument order: steer/attitude then throttle (the documented
-    /// order — a combined call lands coherently).
+    /// — the frozen `ControlApi` verbs as commands. Fields queue in
+    /// argument order — steer/attitude then throttle — and apply in
+    /// **one** drain window: a combined call lands coherently at a
+    /// single boundary, not one tick per field.
     fn t_vessel_control(&self, client: u32, args: &Value) -> Result<Value, ToolFail> {
         let vessel = req_u64(args, "vessel").map(VesselId)?;
-        let mut enqueued = 0_u32;
-        let mut rejected: Vec<String> = Vec::new();
-        let mut submit = |cmd: SimCommand| match self.backend.submit(client, cmd) {
-            Ok(r) => {
-                enqueued += 1;
-                rejected.extend(r);
-            }
-            Err(e) => rejected.push(e.to_string()),
-        };
+        let mut commands: Vec<SimCommand> = Vec::new();
         if let Some(dir) = get_vec3(args, "steer_dir")? {
             let rot = if dir.norm() > 0.0 {
                 csp_sim::maneuver::align_rotation(DVec3::Z, dir / dir.norm())
             } else {
                 csp_core::DQuat::IDENTITY
             };
-            submit(SimCommand::SetAttitude {
+            commands.push(SimCommand::SetAttitude {
                 vessel,
                 rot,
                 ang_vel: DVec3::ZERO,
             });
         }
-        if let Some(att) = args.get("attitude") {
+        if let Some(att) = args.get("attitude").filter(|a| !a.is_null()) {
+            // A non-object `attitude` is a param error, not a silent
+            // identity rotation — `{"attitude": 5}` must never queue
+            // a `SetAttitude{IDENTITY}` the caller didn't write
+            // (R19-F20).
+            if !att.is_object() {
+                return Err(ToolFail::Invalid(
+                    "attitude must be an object {rot?, ang_vel?}".into(),
+                ));
+            }
             let rot = get_quat(att, "rot")?.unwrap_or(csp_core::DQuat::IDENTITY);
             let ang_vel = get_vec3(att, "ang_vel")?.unwrap_or(DVec3::ZERO);
-            submit(SimCommand::SetAttitude {
+            commands.push(SimCommand::SetAttitude {
                 vessel,
                 rot,
                 ang_vel,
@@ -335,29 +404,39 @@ impl<B: ControlBackend + ?Sized> Mcp<B> {
         }
         if args.get("hold_attitude").and_then(Value::as_bool) == Some(true) {
             // SAS-style hold of the *current* orientation — read it off
-            // the published telemetry (the script host's equivalent).
+            // the published telemetry (the script host's equivalent)
+            // before the batch submits, so the hold is the state the
+            // caller saw, not a mid-batch intermediate.
             let rot = self
                 .snapshot()?
                 .vessels
                 .get(&vessel.0)
                 .map(|v| v.telemetry.rot)
                 .unwrap_or(csp_core::DQuat::IDENTITY);
-            submit(SimCommand::SetAttitude {
+            commands.push(SimCommand::SetAttitude {
                 vessel,
                 rot,
                 ang_vel: DVec3::ZERO,
             });
         }
         if let Some(throttle) = get_f64(args, "throttle")? {
-            submit(SimCommand::SetThrottle { vessel, throttle });
+            commands.push(SimCommand::SetThrottle { vessel, throttle });
         }
-        if enqueued == 0 {
+        if commands.is_empty() {
             return Err(ToolFail::Invalid(
                 "vessel.control needs at least one of throttle/steer_dir/attitude/hold_attitude"
                     .into(),
             ));
         }
-        Ok(json!({"enqueued": enqueued, "rejected": rejected}))
+        let enqueued = commands.len() as u64;
+        let report = self.submit_batch(client, commands)?;
+        Ok(json!({
+            "enqueued": enqueued,
+            "rejected": report.rejected,
+            "partial": report.partial,
+            "reached": report.reached,
+            "target": report.target,
+        }))
     }
 
     /// `vessel.take_control {vessel}` / `vessel.release_control
@@ -371,20 +450,27 @@ impl<B: ControlBackend + ?Sized> Mcp<B> {
         } else {
             Lease::Agent(client)
         };
-        let rejected = self.submit(client, SimCommand::TakeControl { vessel, lease })?;
-        Ok(json!({"lease": lease, "rejected": rejected}))
+        let report = self.submit(client, SimCommand::TakeControl { vessel, lease })?;
+        Ok(json!({
+            "lease": lease,
+            "rejected": report.rejected,
+            "partial": report.partial,
+            "reached": report.reached,
+            "target": report.target,
+        }))
     }
 
     /// `mission.nodes {vessel, set?, delete?}` — the one-node schedule.
     fn t_mission_nodes(&self, client: u32, args: &Value) -> Result<Value, ToolFail> {
         let vessel = req_u64(args, "vessel").map(VesselId)?;
         let mut rejected = Vec::new();
+        let mut partial = false;
         if let Some(set) = args.get("set") {
             let tick = req_u64(set, "tick")?;
             let pro = get_f64(set, "dv_prograde_mps")?.unwrap_or(0.0);
             let norm = get_f64(set, "dv_normal_mps")?.unwrap_or(0.0);
             let rad = get_f64(set, "dv_radial_mps")?.unwrap_or(0.0);
-            rejected.extend(self.submit(
+            let r = self.submit(
                 client,
                 SimCommand::SetManeuver {
                     vessel,
@@ -393,10 +479,14 @@ impl<B: ControlBackend + ?Sized> Mcp<B> {
                     dv_normal_mps: norm,
                     dv_radial_mps: rad,
                 },
-            )?);
+            )?;
+            rejected.extend(r.rejected);
+            partial |= r.partial;
         }
         if args.get("delete").and_then(Value::as_bool) == Some(true) {
-            rejected.extend(self.submit(client, SimCommand::DeleteManeuver { vessel })?);
+            let r = self.submit(client, SimCommand::DeleteManeuver { vessel })?;
+            rejected.extend(r.rejected);
+            partial |= r.partial;
         }
         let node = self
             .snapshot()?
@@ -404,22 +494,39 @@ impl<B: ControlBackend + ?Sized> Mcp<B> {
             .get(&vessel.0)
             .and_then(|v| v.telemetry.maneuver_node)
             .map(|(t, dv)| json!({"tick": t, "dv": [dv.x, dv.y, dv.z]}));
-        Ok(json!({"node": node, "rejected": rejected}))
+        Ok(json!({"node": node, "rejected": rejected, "partial": partial}))
     }
 
-    /// `timewarp.set {level}` — the stored ladder rung.
+    /// `timewarp.set {level}` — the stored ladder rung. `level` is
+    /// `u32` on the wire (`SimCommand::SetWarp`) — a value past
+    /// `u32::MAX` is Invalid-params, never a truncating `as` cast
+    /// (R19-F8).
     fn t_timewarp_set(&self, client: u32, args: &Value) -> Result<Value, ToolFail> {
         let level = req_u64(args, "level")?;
-        let rejected = self.submit(client, SimCommand::SetWarp(level as u32))?;
-        Ok(json!({"warp_level": self.snapshot()?.warp_level, "rejected": rejected}))
+        let level = u32::try_from(level)
+            .map_err(|_| ToolFail::Invalid("level exceeds the u32 rung range".into()))?;
+        let report = self.submit(client, SimCommand::SetWarp(level))?;
+        Ok(json!({
+            "warp_level": self.snapshot()?.warp_level,
+            "rejected": report.rejected,
+            "partial": report.partial,
+        }))
     }
 
     /// `timewarp.advance_to {tick}` — a logged advance (the recorder
-    /// contract: the run's real targets flow through `AdvanceTo`).
+    /// contract: the run's real targets flow through `AdvanceTo`). A
+    /// drain that hits the frame cap short of `tick` answers
+    /// `partial: true` with the tick it actually `reached` — the
+    /// advance is not done; re-issue to continue it.
     fn t_advance_to(&self, client: u32, args: &Value) -> Result<Value, ToolFail> {
         let tick = req_u64(args, "tick")?;
-        let rejected = self.submit(client, SimCommand::AdvanceTo(tick))?;
-        Ok(json!({"tick": self.snapshot()?.tick, "rejected": rejected}))
+        let report = self.submit(client, SimCommand::AdvanceTo(tick))?;
+        Ok(json!({
+            "tick": report.reached,
+            "rejected": report.rejected,
+            "partial": report.partial,
+            "target": report.target,
+        }))
     }
 
     /// `sim.command {command}` / `{commands: [...]}` — the raw
@@ -446,19 +553,34 @@ impl<B: ControlBackend + ?Sized> Mcp<B> {
                 "sim.command needs {command} or {commands}".into(),
             ));
         }
-        let rejected = self
-            .backend
-            .submit_batch(client, commands)
-            .map_err(|e| ToolFail::Tool(e.to_string()))?;
-        Ok(json!({"rejected": rejected}))
+        let report = self.submit_batch(client, commands)?;
+        Ok(json!({
+            "rejected": report.rejected,
+            "partial": report.partial,
+            "reached": report.reached,
+            "target": report.target,
+        }))
     }
 
-    fn submit(&self, client: u32, cmd: SimCommand) -> Result<Vec<String>, ToolFail> {
-        self.backend.submit(client, cmd).map_err(|e| match e {
-            BackendError::Ingress(i) => ToolFail::Tool(i.to_string()),
-            BackendError::Rejected(r) => ToolFail::Tool(r.join("; ")),
-            BackendError::Session(m) => ToolFail::Tool(m),
-        })
+    fn submit(
+        &self,
+        client: u32,
+        cmd: SimCommand,
+    ) -> Result<crate::backend::SubmitReport, ToolFail> {
+        self.submit_batch(client, vec![cmd])
+    }
+
+    fn submit_batch(
+        &self,
+        client: u32,
+        cmds: Vec<SimCommand>,
+    ) -> Result<crate::backend::SubmitReport, ToolFail> {
+        self.backend
+            .submit_batch(client, cmds)
+            .map_err(|e| match e {
+                BackendError::Ingress(i) => ToolFail::Tool(i.to_string()),
+                BackendError::Session(m) => ToolFail::Tool(m),
+            })
     }
 
     // -- session-class tools ----------------------------------------------
@@ -679,7 +801,10 @@ pub fn tools_v1() -> Value {
         sim(
             "timewarp.set",
             "Store a warp ladder rung (the multiplier is presentation's business).",
-            obj(json!({"level": u()}), &["level"])
+            obj(
+                json!({"level": {"type": "integer", "minimum": 0, "maximum": u32::MAX}}),
+                &["level"]
+            )
         ),
         sim(
             "timewarp.advance_to",
@@ -760,12 +885,103 @@ mod tests {
         (Mcp::new(game.clone()), game)
     }
 
+    /// The MCP handshake for `client` — every tools/resources test
+    /// must run it first (the lifecycle gate, R19-F20).
+    fn init(m: &Mcp<LocalGame>, client: u32) {
+        let out = m.handle(
+            client,
+            &json!({"jsonrpc": "2.0", "id": 0, "method": "initialize",
+                    "params": {"protocolVersion": "2026-07-28", "capabilities": {}}}),
+        );
+        assert!(
+            out.as_ref().is_some_and(|v| v["result"].is_object()),
+            "{out:?}"
+        );
+    }
+
     #[test]
     fn protocol_revision_is_the_pinned_one() {
         // The deliberate-commit pin — bumping the constant means
         // updating PROTOCOL.md in the same change.
         assert_eq!(PROTOCOL_REVISION, "2026-07-28");
         assert!(SUPPORTED_REVISIONS.contains(&"2025-11-25"));
+    }
+
+    /// R19-F20: the lifecycle gate — a client's first *request* must
+    /// be `initialize` (`ping` stays legal before it per the spec);
+    /// a `tools/call` ahead of the handshake is a `-32600` protocol
+    /// error, never a silent dispatch. The handshake is per client
+    /// index: one client's `initialize` does not open the surface
+    /// for another.
+    #[test]
+    fn requests_before_initialize_are_refused() {
+        let (m, _) = mcp();
+        let out = m
+            .handle(
+                0,
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": {"name": "timewarp.set", "arguments": {"level": 4}}}),
+            )
+            .expect("response");
+        assert_eq!(out["error"]["code"], INVALID_REQUEST);
+        // `ping` is the spec's pre-handshake exception.
+        let out = m
+            .handle(0, &json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}))
+            .expect("response");
+        assert!(out["result"].is_object());
+        // After initialize the same call dispatches normally.
+        init(&m, 0);
+        let out = m
+            .handle(
+                0,
+                &json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}),
+            )
+            .expect("response");
+        assert!(out["result"]["tools"].is_array());
+        // …but the handshake is per client — client 1 is still gated.
+        let out = m
+            .handle(
+                1,
+                &json!({"jsonrpc": "2.0", "id": 4, "method": "tools/list"}),
+            )
+            .expect("response");
+        assert_eq!(out["error"]["code"], INVALID_REQUEST);
+    }
+
+    /// R19-F8: a `timewarp.set` level past `u32::MAX` is
+    /// Invalid-params, never a truncating cast.
+    #[test]
+    fn timewarp_level_over_u32_is_invalid() {
+        let (m, _) = mcp();
+        init(&m, 0);
+        let out = m
+            .handle(
+                0,
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": {"name": "timewarp.set",
+                                   "arguments": {"level": u64::from(u32::MAX) + 3}}}),
+            )
+            .expect("response");
+        assert_eq!(out["error"]["code"], INVALID_PARAMS);
+    }
+
+    /// R19-F20: a non-object `attitude` is Invalid-params — it must
+    /// never decay into a silent `SetAttitude{IDENTITY}`.
+    #[test]
+    fn non_object_attitude_is_invalid_params() {
+        let (m, _) = mcp();
+        init(&m, 0);
+        for attitude in [json!(5), json!("north"), json!([1, 2, 3])] {
+            let out = m
+                .handle(
+                    0,
+                    &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                            "params": {"name": "vessel.control",
+                                       "arguments": {"vessel": 0, "attitude": attitude}}}),
+                )
+                .expect("response");
+            assert_eq!(out["error"]["code"], INVALID_PARAMS, "{attitude}");
+        }
     }
 
     #[test]
@@ -839,6 +1055,7 @@ mod tests {
     #[test]
     fn tool_call_round_trip() {
         let (m, game) = mcp();
+        init(&m, 0);
         let out = m
             .handle(
                 0,
@@ -860,9 +1077,41 @@ mod tests {
         assert_eq!(snap.warp_level, 4);
     }
 
+    /// R19-F6 regression: a multi-field `vessel.control` is ONE drain
+    /// window — the commands apply at a single boundary (clock +1),
+    /// not one tick per field. (The empty world's vessel-0 commands
+    /// are drain-rejected — lease/unknown-vessel — which is fine: the
+    /// clock and `enqueued` are what prove the batching.)
+    #[test]
+    fn vessel_control_batches_into_one_boundary() {
+        let (m, game) = mcp();
+        init(&m, 0);
+        let out = m
+            .handle(
+                0,
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": {"name": "vessel.control",
+                                   "arguments": {"vessel": 0,
+                                                 "steer_dir": [0.0, 0.0, 1.0],
+                                                 "throttle": 1.0}}}),
+            )
+            .expect("response");
+        let text = out["result"]["content"][0]["text"].as_str().expect("text");
+        let v: Value = serde_json::from_str(text).expect("tool json");
+        assert_eq!(v["enqueued"], 2, "{text}");
+        game.with_world(|w| {
+            assert_eq!(
+                w.clock().ticks(),
+                1,
+                "a combined call must advance exactly one boundary"
+            );
+        });
+    }
+
     #[test]
     fn unknown_tool_is_invalid_params() {
         let (m, _) = mcp();
+        init(&m, 0);
         let out = m
             .handle(
                 0,
