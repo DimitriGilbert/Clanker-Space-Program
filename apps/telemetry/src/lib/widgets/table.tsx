@@ -13,16 +13,25 @@ export function TableWidget({ def, frame }: WidgetProps) {
     <div className="flex-1 overflow-auto">
       <table className="w-full text-sm" style={{ fontVariantNumeric: 'tabular-nums' }}>
         <tbody>
-          {def.fields.map((f) => (
-            <tr key={f}>
-              <td className="py-0.5 pr-2" style={{ color: 'var(--muted)' }}>
-                {f.split('.').pop()}
-              </td>
-              <td className="py-0.5 text-right">
-                {frame ? render(frame.payload[f]) : '—'}
-              </td>
-            </tr>
-          ))}
+          {def.fields.map((f) => {
+            const missing = frame?.unknown_fields.includes(f) ?? false
+            return (
+              <tr key={f}>
+                <td className="py-0.5 pr-2" style={{ color: 'var(--muted)' }}>
+                  {f.split('.').pop()}
+                </td>
+                <td className="py-0.5 text-right">
+                  {missing ? (
+                    <span className="widget-unknown">unknown field</span>
+                  ) : frame ? (
+                    render(frame.payload[f])
+                  ) : (
+                    '—'
+                  )}
+                </td>
+              </tr>
+            )
+          })}
         </tbody>
       </table>
     </div>

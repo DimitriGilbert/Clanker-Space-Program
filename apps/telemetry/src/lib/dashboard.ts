@@ -4,6 +4,8 @@
 // /api/dashboards. A dashboard is non-authoritative: it selects and
 // lays out fields, never mutates the sim.
 
+import { cspToken } from './ws'
+
 export const DASHBOARD_SCHEMA_VERSION = 1
 
 export interface WidgetRect {
@@ -49,33 +51,69 @@ async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
   })
 }
 
-import { cspToken } from './ws'
+export type DashboardSource = 'server' | 'bundled'
 
-/** Load the named dashboard — falls back to the bundled default
- *  when the store has none (first run) or the fetch fails. */
-export async function loadDashboard(name: string): Promise<Dashboard> {
-  try {
-    const res = await apiFetch(`/api/dashboards/${name}`)
-    if (res.ok) {
-      const dash = (await res.json()) as Dashboard
-      if (dash?.schema_version === DASHBOARD_SCHEMA_VERSION) return dash
-    }
-  } catch {
-    /* fall through to the bundled default */
-  }
-  const def = (await import('../../dashboards/default.json')).default as Dashboard
-  return def
+export interface LoadedDashboard {
+  dashboard: Dashboard
+  /** Where the layout came from — the server's store or the bundled
+   *  default fallback. */
+  source: DashboardSource
+  /** Why the bundled default is in use, when it is — surfaced in the
+   *  page header rather than silently swallowed. */
+  notice?: string
 }
 
-/** Persist a dashboard via the sidecar API (PUT /api/dashboards/name). */
-export async function saveDashboard(dash: Dashboard): Promise<boolean> {
+async function bundledDefault(): Promise<Dashboard> {
+  return (await import('../../dashboards/default.json')).default as Dashboard
+}
+
+/** Load the named dashboard. Falls back to the bundled default for a
+ *  first run (404 / unconfigured store), and reports *why* — the
+ *  distinction between "nothing stored", "store not configured",
+ *  "auth failed", and "server unreachable" matters to the user. */
+export async function loadDashboard(name: string): Promise<LoadedDashboard> {
+  let res: Response
   try {
-    const res = await apiFetch(`/api/dashboards/${dash.name}`, {
-      method: 'PUT',
-      body: JSON.stringify(dash),
-    })
-    return res.ok
+    res = await apiFetch(`/api/dashboards/${name}`)
   } catch {
-    return false
+    return {
+      dashboard: await bundledDefault(),
+      source: 'bundled',
+      notice: 'dashboard store unreachable — showing the bundled default',
+    }
   }
+  if (res.ok) {
+    // A 200 with a non-JSON body must not reject loadDashboard — an
+    // unhandled parse failure leaves the dashboard permanently blank
+    // with no notice. Surface it as a schema/parse mismatch instead.
+    let dash: Dashboard
+    try {
+      dash = (await res.json()) as Dashboard
+    } catch {
+      return {
+        dashboard: await bundledDefault(),
+        source: 'bundled',
+        notice: `dashboard '${name}' returned a malformed (non-JSON) body — showing the bundled default`,
+      }
+    }
+    if (dash?.schema_version === DASHBOARD_SCHEMA_VERSION) {
+      return { dashboard: dash, source: 'server' }
+    }
+    return {
+      dashboard: await bundledDefault(),
+      source: 'bundled',
+      notice: `dashboard '${name}' is schema_version ${String(
+        dash?.schema_version,
+      )} — this client speaks ${DASHBOARD_SCHEMA_VERSION}; showing the bundled default`,
+    }
+  }
+  const notice =
+    res.status === 401 || res.status === 403
+      ? `dashboard fetch unauthorized (HTTP ${res.status}) — check the access token; showing the bundled default`
+      : res.status === 404
+        ? `no '${name}' dashboard stored (first run) — showing the bundled default`
+        : res.status === 503
+          ? 'dashboard store not configured on the server — showing the bundled default'
+          : `dashboard fetch failed (HTTP ${res.status}) — showing the bundled default`
+  return { dashboard: await bundledDefault(), source: 'bundled', notice }
 }

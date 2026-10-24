@@ -18,5 +18,5 @@ export function CardHeader({ className, ...props }: React.ComponentProps<'div'>)
 }
 
 export function CardContent({ className, ...props }: React.ComponentProps<'div'>) {
-  return <div className={cn('flex-1 min-h-0', className)} {...props} />
+  return <div className={cn('flex-1 min-h-0 flex flex-col', className)} {...props} />
 }

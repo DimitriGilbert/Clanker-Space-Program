@@ -10,10 +10,15 @@ import { TableWidget } from './table'
 import { OrbitMapWidget } from './orbit-map'
 
 /** What every widget receives — its def + the latest frame's
- *  resolved fields (path → value; missing paths are absent). */
+ *  resolved fields (path → value; missing paths are absent). `frame`
+ *  is `null` before the first frame and whenever the stream has gone
+ *  stale (socket closed/errored). */
 export interface WidgetProps {
   def: WidgetDef
   frame: TelemetryFrame | null
+  /** The rate the server negotiated in its `subscribed` ack — widgets
+   *  size time-based buffers from this, never a hardcoded 16 Hz. */
+  rateHz: number
 }
 
 export const WIDGET_REGISTRY: Record<WidgetKind, ComponentType<WidgetProps>> = {

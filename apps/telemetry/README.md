@@ -14,9 +14,18 @@ The output is **static**: `vite.config.ts` sets `spa: { enabled: true,
 prerender }` so the client build emits `_shell.html` + `assets/`;
 `scripts/finalize.mjs` promotes the shell to `index.html`. Point
 `csp-server`'s `ServerConfig::spa_dir` at `dist/client` — the server
-serves `index.html` at `/` (injecting the bearer token into a
-`csp-token` meta tag the WS client reads) and the bundle at
-`/assets/*`.
+serves `index.html` at `/` **verbatim** and the bundle at `/assets/*`.
+The shell is token-free by design: the SPA asks for csp-server's
+per-run bearer token once (the gate reads `$XDG_RUNTIME_DIR/csp/
+<pid>.token`, first line) and keeps it in the tab's sessionStorage.
+`?csp_token=<token>` in the URL is the non-interactive channel.
+
+## Dev
+
+`npm run dev` (port 47901) proxies `/ws` + `/api` at `CSP_SERVER_URL`
+(default `http://127.0.0.1:47900`) — run csp-server alongside it and
+open `http://localhost:47901/?csp_token=<token>` once, or export
+`VITE_CSP_TOKEN` before `npm run dev`.
 
 ## Shape
 

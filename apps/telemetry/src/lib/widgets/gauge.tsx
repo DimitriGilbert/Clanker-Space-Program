@@ -20,7 +20,15 @@ export function GaugeWidget({ def, frame }: WidgetProps) {
   return (
     <div className="flex-1 flex flex-col justify-center">
       {value === null ? (
-        <div className="widget-unknown">{missing ? `unknown field ${path}` : '—'}</div>
+        missing ? (
+          <div className="widget-unknown">unknown field {path}</div>
+        ) : raw !== null && raw !== undefined ? (
+          // The path resolved but isn't a number — a type mismatch,
+          // not "no data".
+          <div className="widget-unknown">non-numeric {path}</div>
+        ) : (
+          <div className="widget-value" style={{ color: 'var(--muted)' }}>—</div>
+        )
       ) : (
         <>
           <div>

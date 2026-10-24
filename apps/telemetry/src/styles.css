@@ -62,11 +62,56 @@ body {
   font-style: italic;
 }
 
-/* The 12-column dashboard grid. */
+/* The 12-column dashboard grid. `rect.h`/`rect.y` are tile-height
+   units (the layout contract in csp-server's dashboard.rs) — rows are
+   fixed tiles, not content-sized, so a 2-high gauge and a 4-high table
+   hold their proportions. */
 .dash-grid {
   display: grid;
   grid-template-columns: repeat(12, 1fr);
+  grid-auto-rows: var(--tile-h);
   gap: 12px;
+}
+
+:root {
+  --tile-h: 84px;
+}
+
+/* The load-failure banner — why the bundled default is showing. */
+.dash-notice {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent-warm);
+  background: var(--card);
+  color: var(--muted);
+  font-size: 12px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  margin-bottom: 12px;
+}
+
+/* The first-boot token gate. */
+.token-input {
+  flex: 1;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--foreground);
+  font-size: 13px;
+  padding: 8px 10px;
+  outline: none;
+}
+.token-input:focus {
+  border-color: var(--accent);
+}
+.token-button {
+  background: var(--accent);
+  color: #0b0e14;
+  font-size: 13px;
+  font-weight: 600;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 14px;
+  cursor: pointer;
 }
 
 /* Orbit-map canvas fills its tile. */
