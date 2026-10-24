@@ -39,6 +39,7 @@ pub const G0: f64 = 9.81;
 /// module, and so on — the mapping is [`PartCategory::required_module`]
 /// and the rule lives in `crate::validate`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum PartCategory {
     /// Liquid engines — must carry a [`ModuleDef::Engine`].
     Engine,
@@ -83,6 +84,7 @@ impl PartCategory {
 /// 0.625 m node without an adapter — the check is editor policy, the
 /// number is data).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttachNode {
     /// Node name, unique within the part (`"top"`, `"bottom"`).
     /// Craft files reference `(part_node, node_id)` pairs.
@@ -104,6 +106,7 @@ pub struct AttachNode {
 /// diameters scale by `s`; stats scale by `s^exponent` where the
 /// exponents are authored (see [`ScaleExponents`]).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ScaleRule {
     /// Fixed size — pods and engines typically do not scale.
     None,
@@ -137,6 +140,7 @@ pub enum ScaleRule {
 /// them is a schema-version decision — see `csp-phys`'s resolve module
 /// doc for the deferred-question list.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScaleExponents {
     /// Exponent on `mass_dry_kg` — also applied to `build_resources`
     /// amounts (the BOM is mass-like; see the struct doc).
@@ -158,6 +162,7 @@ pub struct ScaleExponents {
 /// convert to vertex sets; `Convex` is the escape hatch for shapes
 /// that are not primitives.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ColliderDef {
     /// Axis-aligned box by half-extents (m).
     Box { half_extents_m: DVec3 },
@@ -175,6 +180,7 @@ pub enum ColliderDef {
 /// resolver clamps to the ends, matching the §3.0 temperature-table
 /// convention.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AeroKnot {
     /// Mach number (≥ 0, strictly increasing within a curve).
     pub mach: f64,
@@ -186,6 +192,7 @@ pub struct AeroKnot {
 /// §2.4.1 voxelizer's `AeroTable` normalizes against. Exposed/shielded
 /// area is *not* authored — it comes from voxelization at weld Stage 2.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AeroDef {
     /// Drag coefficient vs Mach. ≥ 1 knot.
     pub cd_curve: Vec<AeroKnot>,
@@ -220,6 +227,7 @@ impl AeroDef {
 /// is the lump (`mass·cp`); `conduction_w_per_k` is the coupling to
 /// neighbour parts.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ThermalDef {
     /// Lumped heat capacity, `mass·cp` (J/K).
     pub heat_capacity_j_per_k: f64,
@@ -236,6 +244,7 @@ pub struct ThermalDef {
 /// §3.1 `structural`: weld/breakup limits. §2.4 breakup splits the
 /// part graph at the node whose load exceeds these.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StructuralDef {
     /// Maximum axial (along-stack) load (N).
     pub max_axial_n: f64,
@@ -266,6 +275,7 @@ impl StructuralDef {
 /// scalar stats the resolver reads; resource-pair fields (tank
 /// capacities) are not variant targets in v1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum StatPath {
     /// `PartDef::mass_dry_kg`.
     MassDryKg,
@@ -310,6 +320,7 @@ impl StatPath {
 /// that the variant set is non-empty with unique IDs and positive
 /// finite multipliers.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PartVariant {
     /// Variant ID, unique within the part.
     pub id: VariantId,
@@ -326,6 +337,7 @@ pub struct PartVariant {
 
 /// Propellant feed range as a fraction of rated thrust.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ThrottleRange {
     /// Minimum throttle setting ∈ [0, 1).
     pub min: f64,
@@ -341,6 +353,7 @@ pub struct ThrottleRange {
 /// enum and the mask can never drift apart.
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum Situation {
     /// On the solid surface.
     Landed = 0,
@@ -396,7 +409,9 @@ impl csp_core::StableDiscriminant for Situation {
 /// §3.2's six situations as a bitmask over `u8` — `Experiment`
 /// modules declare where they may run. Transparent serde: files spell
 /// it as an integer mask, which keeps the RON terse and the bincode
-/// path trivial.
+/// path trivial. Bits 6–7 are reserved for future `Situation`
+/// variants: the validator rejects a mask that sets them (the
+/// `situations()` iterator would silently drop the dead bits).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SituationMask(pub u8);
@@ -459,6 +474,7 @@ impl SituationMask {
 /// §7.1 rule 7 hash encodings.
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum PortSize {
     /// 0.625 m class.
     Small = 0,
@@ -486,6 +502,7 @@ impl csp_core::StableDiscriminant for PortSize {
 /// is the staging part (§2.4 names decoupler transients; §3.4's failure
 /// list includes "stuck decoupler").
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ModuleDef {
     /// Liquid engine. §3.1 field set verbatim except `throttle_range`,
     /// spelled as a named [`ThrottleRange`].
@@ -611,6 +628,7 @@ pub enum ModuleDef {
 /// in units; the resolver clamps to the ends. First knot is at 0 units
 /// by convention — its multiplier is the unqualified hazard factor.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QualKnot {
     /// Accumulated qualification units (≥ 0, strictly increasing).
     pub qualification_units: f64,
@@ -622,6 +640,7 @@ pub struct QualKnot {
 /// §3.4 `qualification_curve` as a knot table. `λ(t) = λ_base ·
 /// Π(stress_i) · qual_factor(family)`; this table is `qual_factor`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QualCurve {
     /// Knots of the piecewise-linear curve (validator: ≥ 1, units
     /// strictly increasing, multipliers ∈ (0, 1]).
@@ -636,6 +655,7 @@ pub struct QualCurve {
 /// discriminants (the sim's `ReliabilitySpec` hash walk reads them).
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum StressKind {
     /// Throttle fraction above the rated point.
     OverThrottle = 0,
@@ -665,6 +685,7 @@ impl csp_core::StableDiscriminant for StressKind {
 /// **displayed to the player** (§3.4: "hidden stress multipliers are
 /// bad design") — the editor lists every authored rule.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StressRule {
     /// Which regime metric this rule watches.
     pub kind: StressKind,
@@ -684,6 +705,7 @@ pub struct StressRule {
 /// `PartFailure` event hashes them (§7.1 rule 7).
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum FailureMode {
     /// Thrust degraded — engine runs at reduced output.
     DegradedThrust = 0,
@@ -723,6 +745,7 @@ impl FailureMode {
 /// model (`PartUsage` is the live half and serializes per instance —
 /// it is not part data).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReliabilityDef {
     /// Base mean-time-between-failures (s) — `λ_base = 1/base_mtbf_s`
     /// in `λ(t) = λ_base · Π(stress_i) · qual_factor(family)`.
@@ -751,6 +774,7 @@ pub struct ReliabilityDef {
 /// economics, shape, scaling, physics, functionality, reliability,
 /// gating.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PartDef {
     /// First field of every data file (§3.1). Must equal
     /// [`PART_SCHEMA_VERSION`].

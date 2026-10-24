@@ -90,6 +90,16 @@ fn home_colonies_load_and_validate_green() {
     assert!(errs.is_empty(), "colony validator errors: {errs:#?}");
 }
 
+/// Every authored site's `display_name` LocKey resolves in
+/// `data/loc/en.ron` — the `validate_site_loc_keys` gate.
+#[test]
+fn home_site_loc_keys_resolve() {
+    let sites = load_sites(&home_dir().join("sites.ron")).unwrap();
+    let loc = en_loc();
+    let errs = csp_data::validate_site_loc_keys(&sites, &loc);
+    assert!(errs.is_empty(), "unresolved site loc keys: {errs:#?}");
+}
+
 /// Every authored colony's `display_name` LocKey resolves in
 /// `data/loc/en.ron`.
 #[test]

@@ -56,6 +56,7 @@ pub const BALANCE_SCHEMA_VERSION: u32 = 11;
 
 /// `data/balance.ron` — the tunables every later milestone consumes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BalanceDef {
     /// First field of every data file (§3.1). Must equal
     /// [`BALANCE_SCHEMA_VERSION`].

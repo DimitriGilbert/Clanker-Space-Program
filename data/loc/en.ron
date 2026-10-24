@@ -11,6 +11,7 @@
 //                           shared vocabulary across parts, so the keys
 //                           are not per-part)
 //   resource.<rid>        — a resource's display name
+//   exp.<id>.name         — an experiment's display name
 (
     schema_version: 1,
     strings: {
@@ -88,5 +89,6 @@
         "recipe.smelt_ore.name": "Ore Smelting",
         "recipe.isru_propellant.name": "Propellant ISRU",
         "recipe.electrolysis.name": "Water Electrolysis",
+        "exp.materials_study.name": "Materials Study",
     },
 )

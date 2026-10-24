@@ -38,6 +38,7 @@ pub const COLONY_SCHEMA_VERSION: u32 = 2;
 /// sim-side store record adds the anchor/rate fields the linear
 /// model needs.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ColonyStoreInit {
     /// The resource stocked.
     pub resource: ResourceId,
@@ -52,6 +53,7 @@ pub struct ColonyStoreInit {
 /// are explicit, stable, append-only (§7.1 rule 7).
 #[repr(u16)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ColonyModuleDef {
     /// Solar collector — produces
     /// `day_insolation · area_m2 · efficiency` `electric_charge` units/s
@@ -100,8 +102,9 @@ pub enum ColonyModuleDef {
         /// Extraction rate (units/s) at full concentration —
         /// `min(1, yield / min_concentration)` scales it.
         base_rate_per_s: f64,
-        /// The yield fraction at which the drill reaches full rate
-        /// (matches the part-side `ModuleDef::Drill::min_concentration`).
+        /// The yield fraction at which the drill reaches full rate —
+        /// `[0, 1]`, the same bound the part-side
+        /// `ModuleDef::Drill::min_concentration` carries (validator).
         min_concentration: f64,
         /// EC draw while running (units/s).
         power_ec_per_s: f64,
@@ -179,6 +182,7 @@ impl csp_core::StableDiscriminant for ColonyModuleDef {
 /// the same log-contained pattern `SpawnPhysicalVessel`'s `craft`
 /// uses — so a replay needs no def table to re-found the colony.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ColonyDef {
     /// The site the colony occupies — resolves body and body-fixed
     /// pose at founding.
@@ -198,6 +202,7 @@ pub struct ColonyDef {
 /// a system without authored colonies simply starts with none —
 /// `FoundColony` commands found the rest).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ColonyFile {
     /// First field of every data file (§3.1). Must equal
     /// [`COLONY_SCHEMA_VERSION`].

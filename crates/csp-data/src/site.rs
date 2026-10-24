@@ -41,6 +41,7 @@ pub const SITE_SCHEMA_SUPPORTED: [u32; 2] = [SITE_SCHEMA_VERSION - 1, SITE_SCHEM
 /// datum) so the sim can compare a latched vessel's pose to a site's
 /// location without a frame dance.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SiteDef {
     /// First field of every data file (§3.1). Must equal
     /// [`SITE_SCHEMA_VERSION`].
@@ -80,6 +81,7 @@ pub struct SiteDef {
 /// convention) — a system without sites simply refuses recovery
 /// commands, it does not fail to load.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SiteFile {
     /// First field of every data file (§3.1). Must equal
     /// [`SITE_SCHEMA_VERSION`].

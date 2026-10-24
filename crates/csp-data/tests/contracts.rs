@@ -53,3 +53,97 @@ fn contract_loc_keys_resolve() {
     let errors = csp_data::validate_contract_loc_keys(&contracts, &loc);
     assert!(errors.is_empty(), "{errors:?}");
 }
+
+/// §3.6 "candidate lists non-empty" — an empty `bodies` space is a
+/// `BadContract`, not a silent pass that Fatals at the first offer
+/// draw (R3-F1/R10-F6: `check_bodies`'s predecessor returned the
+/// check as a `bool` and every call site discarded it).
+#[test]
+fn empty_body_space_is_a_validation_error() {
+    let (mut contracts, sys, experiments, tree, res) = loaded();
+    let sat = contracts
+        .contracts
+        .iter_mut()
+        .find(|c| c.def.id.as_str() == "contract.satellite")
+        .unwrap();
+    let csp_data::ContractParamSpace::SatellitePlacement { bodies, .. } =
+        &mut sat.def.generate.space
+    else {
+        panic!("contract.satellite is not a SatellitePlacement")
+    };
+    bodies.clear();
+    let errors = csp_data::validate_contracts(&contracts, &sys, &experiments, &tree, &res);
+    assert!(
+        errors.iter().any(|e| matches!(
+            e,
+            csp_data::ValidationError::BadContract { contract, reason }
+                if contract == "contract.satellite" && reason.contains("empty")
+        )),
+        "empty bodies must fail validation: {errors:?}"
+    );
+}
+
+/// Point `contract.satellite`'s draw bands at `(peri, apo)` — the
+/// mutation the cross-band test needs, scoped so the borrow ends
+/// before each `validate_contracts` call.
+fn set_satellite_bands(
+    contracts: &mut csp_data::LoadedContracts,
+    peri: (f64, f64),
+    apo: (f64, f64),
+) {
+    let sat = contracts
+        .contracts
+        .iter_mut()
+        .find(|c| c.def.id.as_str() == "contract.satellite")
+        .unwrap();
+    let csp_data::ContractParamSpace::SatellitePlacement {
+        periapsis_alt_m,
+        apoapsis_alt_m,
+        ..
+    } = &mut sat.def.generate.space
+    else {
+        panic!("contract.satellite is not a SatellitePlacement")
+    };
+    *periapsis_alt_m = peri;
+    *apoapsis_alt_m = apo;
+}
+
+/// The satellite cross-band rule: `apoapsis_alt_m.hi` below
+/// `periapsis_alt_m.lo` inverts every draw — the authored bands carry
+/// none of their stated meaning, so the validator rejects the space
+/// (R2-F3/R3-F12). Partial overlap stays legal — the shipping file
+/// itself overlaps partially and validates green.
+#[test]
+fn fully_inverted_satellite_bands_are_a_validation_error() {
+    let (mut contracts, sys, experiments, tree, res) = loaded();
+    // apo ceiling (60 km) under the peri floor (100 km): fully
+    // inverted — every draw comes out of the sim's pair-ordering swap.
+    set_satellite_bands(&mut contracts, (100_000.0, 250_000.0), (50_000.0, 60_000.0));
+    let errors = csp_data::validate_contracts(&contracts, &sys, &experiments, &tree, &res);
+    assert!(
+        errors.iter().any(|e| matches!(
+            e,
+            csp_data::ValidationError::BadContract { contract, reason }
+                if contract == "contract.satellite" && reason.contains("inverts")
+        )),
+        "inverted bands must fail validation: {errors:?}"
+    );
+
+    // The boundary the rule deliberately does NOT cross: apo ceiling
+    // equal to the peri floor is partial-overlap territory, still
+    // legal (a draw can produce ra == rp).
+    set_satellite_bands(
+        &mut contracts,
+        (100_000.0, 250_000.0),
+        (50_000.0, 100_000.0),
+    );
+    let errors = csp_data::validate_contracts(&contracts, &sys, &experiments, &tree, &res);
+    assert!(
+        !errors.iter().any(|e| matches!(
+            e,
+            csp_data::ValidationError::BadContract { contract, .. }
+                if contract == "contract.satellite"
+        )),
+        "boundary-touching bands must stay legal: {errors:?}"
+    );
+}

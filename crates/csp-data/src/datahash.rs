@@ -1,6 +1,6 @@
 //! The §3.1 **data-set hash** — BLAKE3 over `path_bytes || 0x00 ||
-//! canonicalized_file_bytes`, ascending path order, for every file under
-//! `data/` *except*:
+//! u64-LE len || canonicalized_file_bytes`, ascending path order, for
+//! every file under `data/` *except*:
 //!
 //! - everything under `data/test-fixtures/` (§8.3: frozen golden inputs,
 //!   deliberately outside the shipping data set — they are hashed
@@ -41,12 +41,30 @@ pub enum DataHashError {
         /// The underlying error.
         source: std::io::Error,
     },
+    /// A symlink sits inside `data/` — the hash walks the committed
+    /// file tree only; a link's target could change outside it.
+    Symlink {
+        /// The link.
+        path: PathBuf,
+    },
+    /// A file name is not UTF-8 — the hash keys files by path bytes,
+    /// and a lossy conversion could collide two distinct names.
+    NonUtf8Name {
+        /// The file.
+        path: PathBuf,
+    },
 }
 
 impl fmt::Display for DataHashError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io { path, source } => write!(f, "io at {}: {source}", path.display()),
+            Self::Symlink { path } => {
+                write!(f, "symlink in the data set at {}", path.display())
+            }
+            Self::NonUtf8Name { path } => {
+                write!(f, "non-UTF-8 file name at {}", path.display())
+            }
         }
     }
 }
@@ -55,6 +73,7 @@ impl std::error::Error for DataHashError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
+            Self::Symlink { .. } | Self::NonUtf8Name { .. } => None,
         }
     }
 }
@@ -69,11 +88,22 @@ pub fn data_set_hash(data_root: &Path) -> Result<[u8; 32], DataHashError> {
             path: data_root.join(&rel),
             source,
         })?;
-        h.update(rel.as_bytes());
-        h.update(&[0]);
-        h.update(&canonicalize(&bytes));
+        feed_file(&mut h, &rel, &canonicalize(&bytes));
     }
     Ok(*h.finalize().as_bytes())
+}
+
+/// One file's contribution to the §3.1 stream: `path || 0x00 || len ||
+/// content`. The `0x00` terminates the path (filenames cannot carry
+/// NUL); the little-endian length prefix then makes the whole frame
+/// injective — the earlier `path || 0x00 || content` framing was not
+/// (file `a` containing `Xb\0Y` hashed identically to files `a`→`X` and
+/// `b`→`Y`), which is why [`crate::DATA_HASH_VERSION`] bumped to 2.
+fn feed_file(h: &mut blake3::Hasher, rel: &str, content: &[u8]) {
+    h.update(rel.as_bytes());
+    h.update(&[0]);
+    h.update(&(content.len() as u64).to_le_bytes());
+    h.update(content);
 }
 
 /// Every hashed file under `data_root` as `/`-joined relative paths in
@@ -95,7 +125,24 @@ fn collect(dir: &Path, prefix: &str, out: &mut Vec<String>) -> Result<(), DataHa
             path: dir.to_path_buf(),
             source,
         })?;
-        let name = entry.file_name().to_string_lossy().into_owned();
+        // `file_type` does not follow symlinks: a symlink inside
+        // `data/` is refused rather than silently traversed — its
+        // target could change outside the hashed tree (and a link
+        // pointing out of `data/` would escape the set entirely).
+        let ft = entry.file_type().map_err(|source| DataHashError::Io {
+            path: entry.path(),
+            source,
+        })?;
+        if ft.is_symlink() {
+            return Err(DataHashError::Symlink { path: entry.path() });
+        }
+        // The hash stream keys files by their relative-path BYTES —
+        // a name that cannot be represented as UTF-8 has no honest
+        // key (lossy conversion could collide two distinct names).
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| DataHashError::NonUtf8Name { path: entry.path() })?;
         let rel = if prefix.is_empty() {
             name.clone()
         } else {
@@ -138,5 +185,45 @@ fn canonicalize(bytes: &[u8]) -> Vec<u8> {
             .join("\n")
             .into_bytes(),
         Err(_) => bytes.to_vec(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The framing must be injective: under the pre-v2 scheme
+    /// (`path || 0x00 || content`) the file set `{("a", "Xb\0Y")}`
+    /// hashed byte-identically to `{("a", "X"), ("b", "Y")}` — one
+    /// stream, two file sets. The length prefix separates them.
+    #[test]
+    fn framing_is_injective_against_content_injected_boundaries() {
+        let mut one_file = blake3::Hasher::new();
+        feed_file(&mut one_file, "a", b"Xb\0Y");
+        let mut two_files = blake3::Hasher::new();
+        feed_file(&mut two_files, "a", b"X");
+        feed_file(&mut two_files, "b", b"Y");
+        assert_ne!(
+            one_file.finalize().as_bytes(),
+            two_files.finalize().as_bytes(),
+            "injected boundary must not collide with the two-file frame"
+        );
+
+        // The probe this guards against: both sequences are literally
+        // `a\0Xb\0Y` under the retired framing.
+        let legacy = |files: &[(&str, &[u8])]| {
+            let mut h = blake3::Hasher::new();
+            for (p, c) in files {
+                h.update(p.as_bytes());
+                h.update(&[0]);
+                h.update(c);
+            }
+            *h.finalize().as_bytes()
+        };
+        assert_eq!(
+            legacy(&[("a", b"Xb\0Y")]),
+            legacy(&[("a", b"X"), ("b", b"Y")]),
+            "the retired framing demonstrably collided"
+        );
     }
 }

@@ -6,9 +6,11 @@
 //! plus a `biomes.ron` legend. They are deliberately decoupled from terrain
 //! noise (science keys on `(body, biome, situation)`; §3.0.1), and the
 //! §3.1 data-set hash covers them — [`crate::datahash`] treats the PNG
-//! bytes as data. [`inspect_indexed_png`] validates headers; the pixel
-//! payload only decodes for *presentation* consumers ([`decode_indexed_png`]
-//! — the R2 terrain palette), never into the sim.
+//! bytes as data. The *validator* fully decodes maps
+//! ([`decode_indexed_png`] — header rules plus pixel-level legend
+//! coverage); [`inspect_indexed_png`] remains the cheap header-only
+//! read for consumers that do not need pixels (the R2 terrain palette
+//! uses the decode).
 
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +23,7 @@ pub const BIOME_MAP_MAX_H: u32 = 1024;
 
 /// One legend row: pixel palette index → biome identity.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BiomeLegendEntry {
     /// Palette index used in the PNG (0-based).
     pub index: u8,
@@ -33,6 +36,7 @@ pub struct BiomeLegendEntry {
 
 /// `biomes.ron` — the versioned legend for a body's `biomes.png`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BiomeLegend {
     /// First field of every data file (§3.1). Must equal
     /// [`crate::system::SCHEMA_VERSION`].
@@ -143,11 +147,13 @@ pub struct IndexedPng {
     pub indices: Vec<u8>,
 }
 
-/// Fully decode a §3.0.1 biome map: header checks identical to
-/// [`inspect_indexed_png`], then zlib-inflate the `IDAT` payload and
-/// reverse the PNG scanline filters. Bit depth 8 / colour type 3 means
-/// one index byte per pixel — no packing or interlacing to undo (the
-/// header checks reject anything else).
+/// Fully decode a §3.0.1 biome map: [`inspect_indexed_png`]'s header
+/// checks plus §3.0.1's [`BIOME_MAP_MAX_W`]×[`BIOME_MAP_MAX_H`]
+/// dimension cap and a no-interlace rule — all enforced at header
+/// parse, before any allocation — then zlib-inflate the `IDAT`
+/// payload and reverse the PNG scanline filters. Bit depth 8 / colour
+/// type 3 means one index byte per pixel — no packing or interlacing
+/// to undo (the header checks reject anything else).
 ///
 /// The sim never reads pixels (biome stability is authored, §3.0.1);
 /// this exists for presentation consumers — the R2 terrain palette.
@@ -193,6 +199,13 @@ pub fn decode_indexed_png(bytes: &[u8]) -> Result<IndexedPng, &'static str> {
                 );
                 if w == 0 || h == 0 {
                     return Err("zero-dimension image");
+                }
+                // §3.0.1's dimension cap enforced *here*, at header
+                // parse — a crafted oversized declaration must not
+                // reach inflate (`unfilter_scanlines` would otherwise
+                // size its buffers from the attacker's numbers).
+                if w > BIOME_MAP_MAX_W || h > BIOME_MAP_MAX_H {
+                    return Err("dimensions exceed the 2048x1024 biome-map cap");
                 }
                 if bytes[data_start + 9] != 3 {
                     return Err("not palette-indexed (colour type != 3)");

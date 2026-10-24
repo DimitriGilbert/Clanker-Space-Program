@@ -176,7 +176,18 @@ use crate::SimError;
 /// (appended, never renumbered), and `Vessel`/`WorldSnapshot` carry the
 /// field (save format change). `UnloadScript` now also releases a
 /// `Script(_)` lease on its bound vessel. The goldens rebless.
-pub const HASH_SCHEMA_VERSION: u32 = 18;
+///
+/// **Version 19** (deep-review Phase 9.2): the colony walk appended
+/// `Colony::altitude_m` — the founding site's authored altitude,
+/// latched so the impact seam and `vessel_colony_linked` read one
+/// surface convention. The field itself landed in Phase 6 with
+/// `#[serde(default)]` (pre-field saves decode at the old `0.0`
+/// convention, so `SAVE_VERSION` is *not* bumped — `SaveBodyV2` wraps
+/// the live `WorldSnapshot`); this version bump is the schema-
+/// coordination that was deferred to 9.2. Lands with
+/// `csp_data::DATA_HASH_VERSION` 2 (the §3.1 framing fix — a separate
+/// constant, fingerprint-recorded). The goldens rebless.
+pub const HASH_SCHEMA_VERSION: u32 = 19;
 
 /// Rule-7 sum types: the source of an enum's *declared* stable `u16`
 /// discriminant (PLAN §7.1 rule 7).

@@ -39,6 +39,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// 1e-9 relative, so an authoring slip in *either* `a` or `T` is caught
 /// rather than silently disagreeing with the sheet.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KeplerElements {
     /// Semi-major axis `a` (m). Positive for ellipses; **negative for
     /// hyperbolic vessel orbits** (`a := −p` under the parabolic
@@ -66,6 +67,7 @@ pub struct KeplerElements {
 /// One knot of a body's authored piecewise-linear temperature table
 /// (§3.0 atmosphere model).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TemperatureKnot {
     /// Altitude above the datum (m). Knots must be strictly increasing.
     pub altitude_m: f64,
@@ -79,6 +81,7 @@ pub struct TemperatureKnot {
 /// to zero. Density from the ideal gas law with `molar_mass_kg_per_mol`;
 /// speed of sound `√(γRT/M)` with `heat_capacity_ratio` as γ.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AtmosphereDef {
     /// Sea-level (datum) pressure `p0` (Pa).
     pub sea_level_pressure_pa: f64,
@@ -98,6 +101,7 @@ pub struct AtmosphereDef {
 
 /// A surface ocean (§3.0: Terrin has "ocean — yes (datum r = R)").
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OceanDef {
     /// Radius of the ocean surface above the body's centre (m) — the
     /// altimetry datum for "splashed" vs "landed".
@@ -108,6 +112,7 @@ pub struct OceanDef {
 /// refs"). The seed is consumed by the R2 terrain generator; biomes are
 /// deliberately NOT derived from it (§3.0.1).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TerrainDef {
     /// Seed for the procedural terrain generator (R2). Authored so a
     /// generated world is reproducible across saves and replays.
@@ -120,6 +125,7 @@ pub struct TerrainDef {
 /// Reference to a body's §3.0.1 biome map: a palette-indexed equirect
 /// PNG plus its RON legend.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BiomeMapRef {
     /// Palette-indexed PNG, relative to the body directory. Equirect,
     /// ≤2048×1024, 8-bit palette (colour type 3) — the validator parses
@@ -135,6 +141,7 @@ pub struct BiomeMapRef {
 /// local concentration fraction; the sim reads it via the biome-map-style
 /// equirect projection. Schema-only at M1 — no maps are authored yet.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConcentrationMapRef {
     /// Map file, relative to the body directory.
     pub png: String,
@@ -145,6 +152,7 @@ pub struct ConcentrationMapRef {
 /// so the manifest is the complete body set (the validator checks the
 /// two agree exactly).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SystemDef {
     /// First field of every data file (§3.1). Must equal
     /// [`SCHEMA_VERSION`].
@@ -163,6 +171,7 @@ pub struct SystemDef {
 
 /// `data/systems/<sys>/<body>/body.ron` — one celestial body (§3.0).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BodyDef {
     /// First field of every data file (§3.1). Must equal
     /// [`SCHEMA_VERSION`].

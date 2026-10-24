@@ -37,14 +37,20 @@
 /// change explains — rather than silently red-dening — every golden replay.
 ///
 /// The pinned scheme: BLAKE3-256 over the concatenation, in ascending path
-/// order, of `path_bytes || 0x00 || canonicalized_file_bytes` for every file
-/// in the hashed set, where canonicalization is LF line endings with
-/// trailing whitespace stripped (§3.1). `csp-bench` applies the same
-/// construction to a frozen `data/test-fixtures/<scenario>/` directory to
-/// produce the replay artifact's `data_fixture_hash` (§7.6).
+/// order, of `path_bytes || 0x00 || u64-LE len || canonicalized_file_bytes`
+/// for every file in the hashed set, where canonicalization is LF line
+/// endings with trailing whitespace stripped (§3.1). `csp-bench` applies
+/// the same construction to a frozen `data/test-fixtures/<scenario>/`
+/// directory to produce the replay artifact's `data_fixture_hash` (§7.6).
 ///
 /// Bump this in the same commit that changes the scheme, and say why.
-pub const DATA_HASH_VERSION: u32 = 1;
+///
+/// Version 2 (deep-review R3-F3): the content gained its u64-LE length
+/// prefix — `path || 0x00 || content` was provably non-injective (file
+/// `a` containing `Xb\0Y` hashed identically to files `a`→`X`, `b`→`Y`),
+/// so two different data sets could share a fingerprint. `csp-bench`'s
+/// `fixture_hash` mirrors the same frame.
+pub const DATA_HASH_VERSION: u32 = 2;
 
 pub mod balance;
 pub mod biome;
@@ -83,9 +89,9 @@ pub use load::{
     LoadedContract, LoadedContracts, LoadedExperiment, LoadedExperiments, LoadedPart, LoadedParts,
     LoadedRecipe, LoadedRecipes, LoadedSystem, LoadedTechFile, LoadedTechTree, load_balance,
     load_balance_from, load_colonies, load_colonies_from, load_contracts, load_contracts_from,
-    load_experiments, load_experiments_from, load_parts, load_parts_from, load_recipes,
-    load_recipes_from, load_resources, load_resources_from, load_sites, load_sites_from,
-    load_system, load_system_from, load_techtree, load_techtree_from,
+    load_experiments, load_experiments_from, load_loc, load_loc_from, load_parts, load_parts_from,
+    load_recipes, load_recipes_from, load_resources, load_resources_from, load_sites,
+    load_sites_from, load_system, load_system_from, load_techtree, load_techtree_from,
 };
 pub use loc::LocFile;
 pub use part::{
@@ -106,8 +112,9 @@ pub use techtree::{
     UpgradeLevel, UpgradeTrack,
 };
 pub use validate::{
-    PERIOD_REL_TOL, ValidationError, validate_colonies, validate_contract_loc_keys,
-    validate_contracts, validate_experiments, validate_loc_keys, validate_part_loc_keys,
-    validate_parts, validate_recipes, validate_resources, validate_sites, validate_system,
+    PERIOD_REL_TOL, ValidationError, validate_balance, validate_colonies,
+    validate_contract_loc_keys, validate_contracts, validate_experiment_loc_keys,
+    validate_experiments, validate_loc, validate_loc_keys, validate_part_loc_keys, validate_parts,
+    validate_recipes, validate_resources, validate_site_loc_keys, validate_sites, validate_system,
     validate_techtree, validate_techtree_loc_keys,
 };

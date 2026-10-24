@@ -14,9 +14,10 @@
 //!   `a` to 1e-9 relative: `T = 2π√(a³/μ_parent)`;
 //! - an atmosphere's `top_m` exceeds its `scale_height_m`, its
 //!   temperature table is a usable ≥2-knot piecewise-linear function;
-//! - biome legends have unique indices/IDs that fit inside the PNG's
-//!   palette, and the map is a real 8-bit palette PNG within
-//!   §3.0.1's ≤2048×1024 bound;
+//! - biome legends have unique well-formed indices/IDs that fit inside
+//!   the PNG's palette, the map decodes as a real 8-bit palette PNG
+//!   within §3.0.1's ≤2048×1024 bound, and every pixel index the map
+//!   paints is legended;
 //! - field sanity: finite, positive where physics requires — and the
 //!   **body**-orbit invariants `a > 0`, `0 ≤ e < 1`. Note the scope:
 //!   `KeplerElements` also carries open *vessel* orbits sim-side
@@ -43,7 +44,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use crate::biome::{BIOME_MAP_MAX_H, BIOME_MAP_MAX_W, inspect_indexed_png};
+use crate::biome::{BIOME_MAP_MAX_H, BIOME_MAP_MAX_W, decode_indexed_png, inspect_indexed_png};
 use crate::ids::LocKey;
 use crate::load::{LoadedPart, LoadedParts, LoadedSystem};
 use crate::loc::LocFile;
@@ -62,13 +63,18 @@ pub const PERIOD_REL_TOL: f64 = 1e-9;
 /// (same convention as `csp_bench::ReplayError`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum ValidationError {
-    /// A file's `schema_version` differs from [`SCHEMA_VERSION`].
+    /// A file's `schema_version` is outside the band its loader/
+    /// validator pair supports (the exact-match namespaces pin
+    /// `expected`; `sites.ron`'s current-or-previous band reports the
+    /// current version).
     SchemaVersion {
         /// Which file kind ("system.ron", `body.ron`/`biomes.ron` under a
         /// body dir — the message carries the context).
         file: String,
         /// What the file declared.
         found: u32,
+        /// The schema version this validator expects.
+        expected: u32,
     },
     /// Two loaded `body.ron` files declare the same `id`.
     DuplicateBodyId {
@@ -231,6 +237,16 @@ pub enum ValidationError {
         width: u32,
         /// Image height.
         height: u32,
+    },
+    /// A pixel in the decoded map carries a palette index no legend
+    /// entry names — an unnamed biome region (the science key would
+    /// resolve a biome id that was never authored). The header/pixel
+    /// bound is the PNG's palette; this is the legend side.
+    BiomeIndexNotInLegend {
+        /// The body.
+        body: String,
+        /// The palette index the legend does not cover.
+        index: u8,
     },
     /// A `LocKey` referenced by the data set does not resolve in the
     /// locale file.
@@ -402,11 +418,16 @@ pub enum ValidationError {
         /// Authored `heat_capacity_j_per_k` (J/K).
         heat_capacity_j_per_k: f64,
     },
-    /// `data/resources.ron` itself is malformed (schema_version aside —
-    /// that reports as [`ValidationError::SchemaVersion`]).
-    BadResourceTable {
-        /// Why it failed (stable reason token).
-        reason: &'static str,
+    /// A `data/recipes/*.ron` def failed a §3.5.1 rule — the
+    /// [`ValidationError::InvalidSite`]/[`ValidationError::InvalidColony`]
+    /// shape applied to the recipe registry (previously recipe errors
+    /// were stamped `InvalidColony`, which attributed recipe-registry
+    /// failures to a colony file that never carried them).
+    InvalidRecipe {
+        /// The recipe def's id.
+        id: String,
+        /// What is wrong with it.
+        reason: String,
     },
     /// An `data/experiments/*.ron` def failed a §3.2 rule.
     BadExperiment {
@@ -502,6 +523,50 @@ pub enum ValidationError {
         /// The node it names.
         tech: String,
     },
+    /// A `data/balance.ron` tunable violates its authored domain — a
+    /// bounded value outside its range (the capture-cone angle, the
+    /// recovery shares, the soft-capture Euler-stability bound, a zero
+    /// cadence) beyond what the plain sign checks express. Finite/sign
+    /// failures report as [`ValidationError::PartNonFinite`]/
+    /// [`ValidationError::PartNonPositive`] under `"balance.ron"`; the
+    /// resource ref reports as [`ValidationError::UnknownResource`].
+    BadBalance {
+        /// Field name.
+        field: &'static str,
+        /// Why it failed (stable reason token).
+        reason: &'static str,
+    },
+    /// A `data/parts/` `Converter` module names a `data/recipes/` id
+    /// that does not exist — the colony flow network would register no
+    /// recipe rows for it (a dead converter).
+    UnknownRecipe {
+        /// The referencing part.
+        part: String,
+        /// The unknown recipe ID.
+        recipe: String,
+    },
+    /// A `data/parts/` `Experiment` module names a
+    /// `data/experiments/` kind that does not exist — `RunExperiment`
+    /// has no def to resolve and `ModuleReq::Experiment` prereqs can
+    /// never be met.
+    UnknownExperimentKind {
+        /// The referencing part.
+        part: String,
+        /// The unknown experiment kind ID.
+        experiment: String,
+    },
+    /// An authored file reference (`terrain.heightmap`, a
+    /// `surface_resources` map, a `BiomeMapRef` legend/png) is not a
+    /// tame single-segment relative name — the loader rejects these
+    /// before the `join`; the validator repeats the check so a
+    /// hand-rolled `LoadedSystem` cannot smuggle an unsafe ref to
+    /// later consumers.
+    BadFileRef {
+        /// Owning body.
+        body: String,
+        /// Field name.
+        field: &'static str,
+    },
     /// A `sites.ron` site entry is malformed: duplicate id, a body
     /// the system does not declare, a non-finite or out-of-range
     /// geocentric pose, or a second launch site on one body.
@@ -525,13 +590,15 @@ pub enum ValidationError {
 }
 
 impl fmt::Display for ValidationError {
+    #[allow(clippy::too_many_lines)] // one arm per variant + the explicit delegation alternation
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::SchemaVersion { file, found } => {
-                write!(
-                    f,
-                    "{file}: schema_version {found}, expected {SCHEMA_VERSION}"
-                )
+            Self::SchemaVersion {
+                file,
+                found,
+                expected,
+            } => {
+                write!(f, "{file}: schema_version {found}, expected {expected}")
             }
             Self::DuplicateBodyId { id } => write!(f, "duplicate body id {id:?}"),
             Self::ListedIdNotDeclared { id } => {
@@ -612,12 +679,56 @@ impl fmt::Display for ValidationError {
                 f,
                 "{body:?}: biome map {width}x{height} exceeds {BIOME_MAP_MAX_W}x{BIOME_MAP_MAX_H}"
             ),
+            Self::BiomeIndexNotInLegend { body, index } => write!(
+                f,
+                "{body:?}: biome map paints palette index {index} the legend does not name"
+            ),
             Self::UnresolvedLocKey { context, key } => {
                 write!(f, "{context}: loc key {key:?} has no entry in en.ron")
             }
-            // Part/resource diagnostics are grouped into `fmt_part` —
-            // one arm per variant would triple this function's length.
-            _ => self.fmt_part(f),
+            // Part/resource/recipe/contract/tech/site/colony
+            // diagnostics are grouped into `fmt_part`/`fmt_tech` — one
+            // arm per variant would triple this function's length. The
+            // delegation is an explicit alternation, NOT `_`: a new
+            // variant makes this match non-exhaustive, so it can never
+            // reach the bottom of the chain and format empty.
+            Self::DuplicatePartId { .. }
+            | Self::PartIdFileMismatch { .. }
+            | Self::PartNonFinite { .. }
+            | Self::PartNonPositive { .. }
+            | Self::UnknownResource { .. }
+            | Self::DuplicateResource { .. }
+            | Self::EmptyVariants { .. }
+            | Self::DuplicateVariantId { .. }
+            | Self::DuplicateVariantStat { .. }
+            | Self::BadVariantMultiplier { .. }
+            | Self::BadScaleRule { .. }
+            | Self::BadAttachNode { .. }
+            | Self::CategoryModuleMismatch { .. }
+            | Self::BadModule { .. }
+            | Self::BadReliability { .. }
+            | Self::BadCollider { .. }
+            | Self::BadAeroCurve { .. }
+            | Self::ConductionExceedsCapacity { .. }
+            | Self::InvalidRecipe { .. }
+            | Self::BadExperiment { .. }
+            | Self::BadContract { .. }
+            | Self::UnknownContractType { .. }
+            | Self::DuplicateTechNodeId { .. }
+            | Self::DuplicateUpgradeTrackId { .. }
+            | Self::UnknownTechPrerequisite { .. }
+            | Self::TechCycle { .. }
+            | Self::TechCostNotMonotonic { .. }
+            | Self::BadTechNode { .. }
+            | Self::UnknownUpgradeTrack { .. }
+            | Self::BadUpgradeTrack { .. }
+            | Self::UnknownTechRequirement { .. }
+            | Self::BadBalance { .. }
+            | Self::UnknownRecipe { .. }
+            | Self::UnknownExperimentKind { .. }
+            | Self::BadFileRef { .. }
+            | Self::InvalidSite { .. }
+            | Self::InvalidColony { .. } => self.fmt_part(f),
         }
     }
 }
@@ -627,6 +738,7 @@ impl ValidationError {
     /// [`fmt::Display`] to keep both functions readable (one arm per
     /// variant is the honest shape here). The `_` arm is unreachable:
     /// `fmt`'s catch-all routes only part/resource variants here.
+    #[allow(clippy::too_many_lines)] // one arm per variant is the table
     fn fmt_part(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::DuplicatePartId { id } => write!(f, "duplicate part id {id:?}"),
@@ -706,8 +818,8 @@ impl ValidationError {
                 f,
                 "{part:?}: conduction {conduction_w_per_k} W/K exceeds heat capacity {heat_capacity_j_per_k} J/K — the explicit-Euler thermal tick would be unstable"
             ),
-            Self::BadResourceTable { reason } => {
-                write!(f, "resources.ron: {reason}")
+            Self::InvalidRecipe { id, reason } => {
+                write!(f, "recipe {id:?}: {reason}")
             }
             Self::BadExperiment { experiment, reason } => {
                 write!(f, "{experiment:?}: experiment: {reason}")
@@ -722,13 +834,56 @@ impl ValidationError {
                 f,
                 "{node:?}: unlocks contract type {contract_type:?} but no template declares it"
             ),
-            _ => self.fmt_tech(f),
+            Self::BadBalance { field, reason } => {
+                write!(f, "balance.ron: {field}: {reason}")
+            }
+            Self::UnknownRecipe { part, recipe } => {
+                write!(
+                    f,
+                    "{part:?}: converter recipe {recipe:?} is not in data/recipes"
+                )
+            }
+            Self::UnknownExperimentKind { part, experiment } => {
+                write!(
+                    f,
+                    "{part:?}: experiment kind {experiment:?} is not in data/experiments"
+                )
+            }
+            Self::BadFileRef { body, field } => {
+                write!(
+                    f,
+                    "{body:?}: {field} is not a tame single-segment file name"
+                )
+            }
+            // The tech/site/colony tail delegates to `fmt_tech` —
+            // explicit alternation like `fmt`'s, so the routing is
+            // compile-checked.
+            Self::DuplicateTechNodeId { .. }
+            | Self::DuplicateUpgradeTrackId { .. }
+            | Self::UnknownTechPrerequisite { .. }
+            | Self::TechCycle { .. }
+            | Self::TechCostNotMonotonic { .. }
+            | Self::BadTechNode { .. }
+            | Self::UnknownUpgradeTrack { .. }
+            | Self::BadUpgradeTrack { .. }
+            | Self::UnknownTechRequirement { .. }
+            | Self::InvalidSite { .. }
+            | Self::InvalidColony { .. } => self.fmt_tech(f),
+            // The system-side variants `fmt` handles locally never
+            // reach here — same never-empty rule as `fmt_tech`'s tail.
+            other => {
+                debug_assert!(false, "ValidationError has no Display arm: {other:?}");
+                write!(f, "{other:?}")
+            }
         }
     }
 
-    /// Display for the §3.3 tech-tree variants — split from
-    /// [`fmt_part`] for the same readability reason. The `_` arm is
-    /// unreachable: only tech variants route here.
+    /// Display for the §3.3 tech-tree variants plus the site/colony
+    /// file variants — split from [`fmt_part`] for the same readability
+    /// reason. The final arm is unreachable by construction (the
+    /// alternations above route only this set here) but still never
+    /// formats empty: debug builds assert, release writes the Debug
+    /// form.
     fn fmt_tech(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::DuplicateTechNodeId { id } => {
@@ -776,7 +931,13 @@ impl ValidationError {
                     "{part:?}: tech_requirement {tech:?} is not in the tree — part unreachable"
                 )
             }
-            _ => Ok(()),
+            // Unreachable by construction — but never an empty render:
+            // a variant routed here without an arm is a bug the debug
+            // assert names loudly, and release still prints something.
+            other => {
+                debug_assert!(false, "ValidationError has no Display arm: {other:?}");
+                write!(f, "{other:?}")
+            }
         }
     }
 }
@@ -797,6 +958,25 @@ fn id_well_formed(id: &str) -> bool {
 fn check_id(id: &str, out: &mut Vec<ValidationError>) {
     if !id_well_formed(id) {
         out.push(ValidationError::MalformedId { id: id.to_string() });
+    }
+}
+
+/// §3.2 situation-mask hygiene shared by `ModuleDef::Experiment` and
+/// `ExperimentCap`: the mask must be non-empty (`empty_reason` keeps
+/// each site's stable message) AND carry no bits outside
+/// [`crate::part::SituationMask::ALL`] — a spare bit is dead authored
+/// data (`situations()` silently drops it; `Situation` is append-only,
+/// so no shipping bit pattern may set them).
+fn check_situation_mask(
+    mask: crate::part::SituationMask,
+    empty_reason: &'static str,
+    mut bad: impl FnMut(&'static str),
+) {
+    if mask.is_empty() {
+        bad(empty_reason);
+    }
+    if mask.0 & !crate::part::SituationMask::ALL.0 != 0 {
+        bad("situation mask sets spare bits outside the six situations");
     }
 }
 
@@ -857,6 +1037,7 @@ fn check_schema_versions(sys: &LoadedSystem, out: &mut Vec<ValidationError>) {
         out.push(ValidationError::SchemaVersion {
             file: "system.ron".to_string(),
             found: sys.system.schema_version,
+            expected: SCHEMA_VERSION,
         });
     }
     for b in &sys.bodies {
@@ -864,6 +1045,7 @@ fn check_schema_versions(sys: &LoadedSystem, out: &mut Vec<ValidationError>) {
             out.push(ValidationError::SchemaVersion {
                 file: format!("{}/body.ron", b.def.id),
                 found: b.def.schema_version,
+                expected: SCHEMA_VERSION,
             });
         }
         if let Some(bm) = &b.biomes
@@ -879,17 +1061,23 @@ fn check_schema_versions(sys: &LoadedSystem, out: &mut Vec<ValidationError>) {
                         .map_or("biomes.ron", |r| r.legend.as_str())
                 ),
                 found: bm.legend.schema_version,
+                expected: SCHEMA_VERSION,
             });
         }
     }
 }
 
-/// Index loaded defs by ID, reporting duplicates.
+/// Index loaded defs by ID, reporting duplicates. First def wins —
+/// the convention the loaders' `by_id` views document (`or_insert`,
+/// not `insert`: `insert` would make the LAST duplicate the resolved
+/// def while the sim sees the first).
 fn build_def_map<'a>(sys: &'a LoadedSystem, out: &mut Vec<ValidationError>) -> DefMap<'a> {
     let mut defs = DefMap::new();
     for b in &sys.bodies {
         let id = b.def.id.as_str();
-        if defs.insert(id, b).is_some() {
+        if let std::collections::btree_map::Entry::Vacant(v) = defs.entry(id) {
+            v.insert(b);
+        } else {
             out.push(ValidationError::DuplicateBodyId { id: id.to_string() });
         }
     }
@@ -1027,6 +1215,34 @@ fn check_body_fields(b: &crate::load::LoadedBody, out: &mut Vec<ValidationError>
     if let Some(oc) = &b.def.ocean {
         check_positive(body, "ocean.datum_radius_m", oc.datum_radius_m, out);
     }
+    check_file_refs(b, out);
+}
+
+/// Authored file references must be tame single-segment names — the
+/// same gate [`crate::load`] runs before `join`ing them under the body
+/// dir, repeated here so a hand-rolled `LoadedSystem` cannot smuggle a
+/// `..`/absolute/separator-bearing ref to the renderer or the
+/// concentration-map consumer.
+fn check_file_refs(b: &crate::load::LoadedBody, out: &mut Vec<ValidationError>) {
+    let body = b.def.id.as_str();
+    let mut check = |field: &'static str, name: &str| {
+        if !crate::load::authored_name_ok(name) {
+            out.push(ValidationError::BadFileRef {
+                body: body.to_string(),
+                field,
+            });
+        }
+    };
+    if let Some(h) = &b.def.terrain.heightmap {
+        check("terrain.heightmap", h);
+    }
+    if let Some(r) = &b.def.biome_map {
+        check("biome_map.png", &r.png);
+        check("biome_map.legend", &r.legend);
+    }
+    for (_, map) in &b.def.surface_resources {
+        check("surface_resources.png", &map.png);
+    }
 }
 
 /// Orbit-element sanity plus the two §3.0 orbital rules: child apoapsis
@@ -1163,6 +1379,7 @@ fn check_biomes(
     let mut indices = BTreeSet::new();
     let mut ids = BTreeSet::new();
     for e in &bm.legend.entries {
+        check_id(e.id.as_str(), out);
         if !indices.insert(e.index) {
             out.push(ValidationError::BiomeLegendDuplicate {
                 body: body.to_string(),
@@ -1176,25 +1393,51 @@ fn check_biomes(
             });
         }
     }
-    match inspect_indexed_png(&bm.png) {
+    // Header pass for §3.0.1's dimension cap — `BiomeMapTooLarge`
+    // carries the declared dims, which the decode's `&'static str`
+    // cannot. [`decode_indexed_png`] enforces the same bound at header
+    // parse regardless (pre-inflate), so an oversized map is rejected
+    // either way and gets no pixel pass.
+    if let Ok(info) = inspect_indexed_png(&bm.png)
+        && (info.width > BIOME_MAP_MAX_W || info.height > BIOME_MAP_MAX_H)
+    {
+        out.push(ValidationError::BiomeMapTooLarge {
+            body: body.to_string(),
+            width: info.width,
+            height: info.height,
+        });
+        return;
+    }
+    // Pixels, not just headers: a map that paints a palette index the
+    // legend never names is an unnamed biome region, and a corrupt
+    // IDAT is data rot — both surface only through the decode
+    // ([`crate::biome::decode_indexed_png`] runs the same header rules
+    // `inspect_indexed_png` did, plus inflate + palette bounds).
+    match decode_indexed_png(&bm.png) {
         Err(reason) => out.push(ValidationError::BiomeMapPngInvalid {
             body: body.to_string(),
             reason,
         }),
-        Ok(info) => {
-            if info.width > BIOME_MAP_MAX_W || info.height > BIOME_MAP_MAX_H {
-                out.push(ValidationError::BiomeMapTooLarge {
-                    body: body.to_string(),
-                    width: info.width,
-                    height: info.height,
-                });
-            }
+        Ok(img) => {
+            let info = img.info;
             for e in &bm.legend.entries {
                 if usize::from(e.index) >= info.palette_len {
                     out.push(ValidationError::BiomeIndexExceedsPalette {
                         body: body.to_string(),
                         index: e.index,
                         palette_len: info.palette_len,
+                    });
+                }
+            }
+            // `indices` is exactly the legend's coverage set — every
+            // pixel index must land in it. One error per uncovered
+            // index, not per pixel.
+            let mut reported = BTreeSet::new();
+            for &i in &img.indices {
+                if !indices.contains(&i) && reported.insert(i) {
+                    out.push(ValidationError::BiomeIndexNotInLegend {
+                        body: body.to_string(),
+                        index: i,
                     });
                 }
             }
@@ -1252,6 +1495,7 @@ pub fn validate_resources(res: &ResourceFile) -> Vec<ValidationError> {
         out.push(ValidationError::SchemaVersion {
             file: "resources.ron".to_string(),
             found: res.schema_version,
+            expected: RESOURCE_SCHEMA_VERSION,
         });
     }
     let mut seen = BTreeSet::new();
@@ -1279,6 +1523,290 @@ pub fn validate_resources(res: &ResourceFile) -> Vec<ValidationError> {
     out
 }
 
+/// §8.3's `balance.ron` checks: `schema_version` current; every numeric
+/// tunable finite and inside the domain its `csp-sim` `*Config::is_valid`
+/// mirror gates at restore (`DockingConfig`, `TransferConfig`,
+/// `ScienceConfig`, `EconomyConfig`, `LifeSupportConfig`,
+/// `ReliabilityConfig` — the authored file must never produce a config
+/// the sim itself would reject); and `reliability_bench_resource`
+/// resolvable against `resources.ron` — the bench run reads the site
+/// inventory through it, so an unresolved id silently charges nothing.
+///
+/// Sign conventions: strictly-positive where a zero is not a tunable
+/// (radii, rates, cadences — `part_positive`'s rule), non-negative for
+/// magnitudes that may be authored off (`dormant_stress_scale: 0`
+/// disables the mechanic). Ranges beyond the sign report as
+/// [`ValidationError::BadBalance`]. Ungated counters — `max_debris`,
+/// `max_live_joints_per_bubble`, `capture_window_ticks`,
+/// `crew_transfer_ticks`, `starting_funds_micros`,
+/// `script_op_budget`, `reliability_notification_cap`, and
+/// `max_tracked_vessels` — all admit `0` as a legal degenerate (no
+/// debris, no joints, an empty arena) and carry no finite domain to
+/// check.
+///
+/// The `dock_soft_pull_per_s < 128` bound is the explicit-Euler
+/// stability limit of the soft-capture map `c_{n+1} ≈ (1 − pull·dt)·c_n`
+/// at the pinned `1/64` s tick (`pull·dt < 2`); `csp-sim`
+/// `DockingConfig::is_valid` is its canonical home — `csp-data` cannot
+/// call it (the dependency runs the other way), so the bound is
+/// mirrored here with the constant named.
+#[allow(clippy::too_many_lines)] // one line per field reads as a table
+pub fn validate_balance(
+    b: &crate::balance::BalanceDef,
+    res: &ResourceFile,
+) -> Vec<ValidationError> {
+    /// The `part` slot balance errors stamp — the `resources.ron`
+    /// convention above.
+    const WHO: &str = "balance.ron";
+    /// Finite and `> 0`.
+    fn pos(field: &'static str, v: f64, out: &mut Vec<ValidationError>) {
+        part_positive(WHO, field, v, out);
+    }
+    /// Finite and `≥ 0`.
+    fn nonneg(field: &'static str, v: f64, out: &mut Vec<ValidationError>) {
+        if !v.is_finite() {
+            out.push(ValidationError::PartNonFinite {
+                part: WHO.to_string(),
+                field,
+            });
+        } else if v < 0.0 {
+            out.push(ValidationError::PartNonPositive {
+                part: WHO.to_string(),
+                field,
+                value: v,
+            });
+        }
+    }
+    /// Finite, then the authored band — a band failure is a
+    /// [`ValidationError::BadBalance`], not a sign failure.
+    fn band(
+        field: &'static str,
+        v: f64,
+        in_band: impl FnOnce(f64) -> bool,
+        reason: &'static str,
+        out: &mut Vec<ValidationError>,
+    ) {
+        if !v.is_finite() {
+            out.push(ValidationError::PartNonFinite {
+                part: WHO.to_string(),
+                field,
+            });
+        } else if !in_band(v) {
+            out.push(ValidationError::BadBalance { field, reason });
+        }
+    }
+
+    let mut out = Vec::new();
+    if b.schema_version != crate::balance::BALANCE_SCHEMA_VERSION {
+        out.push(ValidationError::SchemaVersion {
+            file: WHO.to_string(),
+            found: b.schema_version,
+            expected: crate::balance::BALANCE_SCHEMA_VERSION,
+        });
+    }
+    // §2.3/§2.6.5/§2.9 world-shape tunables.
+    pos("bubble_radius_m", b.bubble_radius_m, &mut out);
+    if b.advance_to_max_events_per_frame == 0 {
+        out.push(ValidationError::BadBalance {
+            field: "advance_to_max_events_per_frame",
+            reason: "zero — every advance_to call would overflow on its first event",
+        });
+    }
+    // §2.4 docking block — `DockingConfig::is_valid`'s finite-≥0 domain,
+    // plus the authored refinements `from_balance` documents.
+    nonneg("dock_capture_range_m", b.dock_capture_range_m, &mut out);
+    band(
+        "dock_capture_angle_deg",
+        b.dock_capture_angle_deg,
+        |v| v > 0.0 && v <= 90.0,
+        "outside the authored (0, 90] capture cone — from_balance clamps into it",
+        &mut out,
+    );
+    nonneg(
+        "dock_capture_rel_speed_mps",
+        b.dock_capture_rel_speed_mps,
+        &mut out,
+    );
+    nonneg("dock_soft_pull_per_s", b.dock_soft_pull_per_s, &mut out);
+    if b.dock_soft_pull_per_s >= 128.0 {
+        out.push(ValidationError::BadBalance {
+            field: "dock_soft_pull_per_s",
+            reason: ">= 128 — the soft-capture Euler step diverges (pull*dt >= 2 at dt = 1/64 s)",
+        });
+    }
+    nonneg(
+        "dock_soft_max_correction_mps",
+        b.dock_soft_max_correction_mps,
+        &mut out,
+    );
+    nonneg(
+        "dock_latch_separation_m",
+        b.dock_latch_separation_m,
+        &mut out,
+    );
+    nonneg(
+        "dock_latch_rel_speed_mps",
+        b.dock_latch_rel_speed_mps,
+        &mut out,
+    );
+    // §3.5 transfers — `TransferConfig::is_valid`: radius ≥ 0, rate > 0.
+    nonneg("transfer_radius_m", b.transfer_radius_m, &mut out);
+    pos(
+        "transfer_rate_units_per_s",
+        b.transfer_rate_units_per_s,
+        &mut out,
+    );
+    // §3.2 science — `ScienceConfig::is_valid`: k, epsilon, η > 0; the
+    // transmit cost ≥ 0.
+    pos("science_softcap_k", b.science_softcap_k, &mut out);
+    pos("research_data_epsilon", b.research_data_epsilon, &mut out);
+    pos("lab_science_per_data", b.lab_science_per_data, &mut out);
+    nonneg(
+        "transmit_ec_per_data_unit",
+        b.transmit_ec_per_data_unit,
+        &mut out,
+    );
+    // §3.5 economy — `EconomyConfig::is_valid`: salary cadence nonzero,
+    // payout ≥ 0, shares in [0,1], manufacture rate > 0.
+    if b.salary_period_days == 0 {
+        out.push(ValidationError::BadBalance {
+            field: "salary_period_days",
+            reason: "zero — the salary cadence must be nonzero",
+        });
+    }
+    nonneg("crew_hire_cost_funds", b.crew_hire_cost_funds, &mut out);
+    nonneg(
+        "science_funds_per_point",
+        b.science_funds_per_point,
+        &mut out,
+    );
+    band(
+        "recovery_efficiency",
+        b.recovery_efficiency,
+        |v| (0.0..=1.0).contains(&v),
+        "outside [0, 1] — it is a share of recovered value",
+        &mut out,
+    );
+    band(
+        "abandon_recovery",
+        b.abandon_recovery,
+        |v| (0.0..=1.0).contains(&v),
+        "outside [0, 1] — it is a share of recovered value",
+        &mut out,
+    );
+    // §3.6 board — `ContractConfig::is_valid`: board size nonzero.
+    if b.contract_offer_slots == 0 {
+        out.push(ValidationError::BadBalance {
+            field: "contract_offer_slots",
+            reason: "zero — the offer board would never stock",
+        });
+    }
+    // §3.5 manufacture + life support — rates ≥ 0, cadence > 0.
+    pos(
+        "manufacture_rate_kg_per_s",
+        b.manufacture_rate_kg_per_s,
+        &mut out,
+    );
+    pos(
+        "life_support_check_period_s",
+        b.life_support_check_period_s,
+        &mut out,
+    );
+    nonneg(
+        "life_support_oxygen_per_crew_s",
+        b.life_support_oxygen_per_crew_s,
+        &mut out,
+    );
+    nonneg(
+        "life_support_food_per_crew_s",
+        b.life_support_food_per_crew_s,
+        &mut out,
+    );
+    nonneg(
+        "life_support_ec_per_crew_s",
+        b.life_support_ec_per_crew_s,
+        &mut out,
+    );
+    // §3.4 reliability — `ReliabilityConfig::is_valid` domains.
+    nonneg(
+        "reliability_dormant_stress_scale",
+        b.reliability_dormant_stress_scale,
+        &mut out,
+    );
+    nonneg(
+        "reliability_ignition_hazard_s",
+        b.reliability_ignition_hazard_s,
+        &mut out,
+    );
+    band(
+        "reliability_degraded_thrust_factor",
+        b.reliability_degraded_thrust_factor,
+        |v| (0.0..=1.0).contains(&v),
+        "outside [0, 1] — a degraded-thrust multiplier may not exceed full thrust",
+        &mut out,
+    );
+    nonneg(
+        "reliability_leak_units_per_s",
+        b.reliability_leak_units_per_s,
+        &mut out,
+    );
+    pos(
+        "reliability_infant_tau_s",
+        b.reliability_infant_tau_s,
+        &mut out,
+    );
+    nonneg(
+        "reliability_flight_units_per_s_vacuum",
+        b.reliability_flight_units_per_s_vacuum,
+        &mut out,
+    );
+    nonneg(
+        "reliability_flight_units_per_s_atmosphere",
+        b.reliability_flight_units_per_s_atmosphere,
+        &mut out,
+    );
+    nonneg(
+        "reliability_bench_funds_per_unit",
+        b.reliability_bench_funds_per_unit,
+        &mut out,
+    );
+    check_id(b.reliability_bench_resource.as_str(), &mut out);
+    if !res.contains(&b.reliability_bench_resource) {
+        out.push(ValidationError::UnknownResource {
+            part: WHO.to_string(),
+            resource: b.reliability_bench_resource.as_str().to_string(),
+        });
+    }
+    nonneg(
+        "reliability_bench_resource_per_unit",
+        b.reliability_bench_resource_per_unit,
+        &mut out,
+    );
+    nonneg(
+        "reliability_bench_seconds_per_unit",
+        b.reliability_bench_seconds_per_unit,
+        &mut out,
+    );
+    out
+}
+
+/// §1.2's `loc/en.ron` file-shape check repeated validator-side — the
+/// same `schema_version` gate [`crate::load::load_loc`] runs, here for
+/// hand-rolled tables (the "validator re-checks what serde enforced"
+/// convention). The key-resolution half lives in the
+/// `validate_*_loc_keys` family.
+pub fn validate_loc(loc: &LocFile) -> Vec<ValidationError> {
+    if loc.schema_version != SCHEMA_VERSION {
+        vec![ValidationError::SchemaVersion {
+            file: "loc/en.ron".to_string(),
+            found: loc.schema_version,
+            expected: SCHEMA_VERSION,
+        }]
+    } else {
+        Vec::new()
+    }
+}
+
 /// §3.5's `sites.ron` checks: `schema_version` (the loader's
 /// `current|previous` band), unique ids, every site on a declared
 /// system body, a finite in-range geocentric pose, at most one launch
@@ -1295,6 +1823,7 @@ pub fn validate_sites(
         out.push(ValidationError::SchemaVersion {
             file: "sites.ron".to_string(),
             found: file.schema_version,
+            expected: crate::site::SITE_SCHEMA_VERSION,
         });
     }
     let bodies: BTreeSet<&str> = sys.bodies.iter().map(|b| b.def.id.as_str()).collect();
@@ -1303,6 +1832,16 @@ pub fn validate_sites(
     let half_pi = core::f64::consts::FRAC_PI_2;
     for s in &file.sites {
         let id = s.id.as_str();
+        check_id(id, &mut out);
+        // Each entry re-declares its own version (§3.1 first-field
+        // convention): the same current-or-previous band as the file.
+        if !crate::site::SITE_SCHEMA_SUPPORTED.contains(&s.schema_version) {
+            out.push(ValidationError::SchemaVersion {
+                file: format!("sites.ron entry {id:?}"),
+                found: s.schema_version,
+                expected: crate::site::SITE_SCHEMA_VERSION,
+            });
+        }
         if !seen.insert(id) {
             out.push(ValidationError::InvalidSite {
                 id: id.to_string(),
@@ -1367,6 +1906,25 @@ pub fn validate_sites(
     out
 }
 
+/// Loc resolution for the site set (the [`validate_loc_keys`]
+/// pattern): every site's `display_name` must resolve in `en.ron`.
+/// Separate from [`validate_sites`] because the loc file lives
+/// outside the system directory.
+pub fn validate_site_loc_keys(file: &SiteFile, loc: &LocFile) -> Vec<ValidationError> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for s in &file.sites {
+        let key = &s.display_name;
+        if seen.insert(key.as_str().to_string()) && !loc.contains(key) {
+            out.push(ValidationError::UnresolvedLocKey {
+                context: format!("site {}", s.id),
+                key: key.as_str().to_string(),
+            });
+        }
+    }
+    out
+}
+
 /// `data/recipes/*.ron` checks: `schema_version`, `id` ↔ file stem,
 /// unique ids, every `inputs`/`outputs` row a known resource with a
 /// finite non-negative rate, and at least one positive-rate output
@@ -1377,14 +1935,15 @@ pub fn validate_recipes(
 ) -> Vec<ValidationError> {
     let mut out = Vec::new();
     let bad = |id: &str, reason: &str, out: &mut Vec<ValidationError>| {
-        out.push(ValidationError::InvalidColony {
-            site: id.to_string(),
+        out.push(ValidationError::InvalidRecipe {
+            id: id.to_string(),
             reason: reason.to_string(),
         });
     };
     let mut seen_ids = BTreeSet::new();
     for lr in &loaded.recipes {
         let d = &lr.def;
+        check_id(d.id.as_str(), &mut out);
         let stem = lr
             .path
             .file_stem()
@@ -1484,7 +2043,7 @@ fn check_power_collision(
     if power_ec_per_s > 0.0
         && list
             .iter()
-            .any(|(id, q)| *q > 0.0 && id.as_str() == "electric_charge")
+            .any(|(id, q)| *q > 0.0 && id.as_str() == crate::resource::ELECTRIC_CHARGE)
     {
         bad_colony(
             site,
@@ -1512,15 +2071,20 @@ pub fn validate_colonies(
         out.push(ValidationError::SchemaVersion {
             file: "colonies.ron".to_string(),
             found: file.schema_version,
+            expected: crate::colony::COLONY_SCHEMA_VERSION,
         });
     }
     let site_ids: BTreeSet<&str> = sites.sites.iter().map(|s| s.id.as_str()).collect();
     let recipe_ids: BTreeSet<&str> = recipes.recipes.iter().map(|r| r.def.id.as_str()).collect();
-    let recipe_defs: std::collections::BTreeMap<&str, &crate::recipe::RecipeDef> = recipes
-        .recipes
-        .iter()
-        .map(|r| (r.def.id.as_str(), &r.def))
-        .collect();
+    // First def wins on a duplicate id — the same convention
+    // `LoadedRecipes::by_id` gives the sim (`BTreeMap::collect` would
+    // keep the LAST def; `validate_recipes` flags the duplicate
+    // loudly either way, but the collision check below must inspect
+    // the def the sim would actually install).
+    let mut recipe_defs: BTreeMap<&str, &crate::recipe::RecipeDef> = BTreeMap::new();
+    for r in &recipes.recipes {
+        recipe_defs.entry(r.def.id.as_str()).or_insert(&r.def);
+    }
     for def in &file.colonies {
         let site = def.site.as_str();
         if !site_ids.contains(site) {
@@ -1576,14 +2140,22 @@ pub fn validate_colonies(
                             &mut out,
                         );
                     }
-                    for (f, v) in [
-                        ("rate", base_rate_per_s),
-                        ("min_concentration", min_concentration),
-                        ("power", power_ec_per_s),
-                    ] {
+                    for (f, v) in [("rate", base_rate_per_s), ("power", power_ec_per_s)] {
                         if !(v.is_finite() && *v >= 0.0) {
                             bad_colony(site, format!("module {i}: bad drill {f}"), &mut out);
                         }
+                    }
+                    // The part-side `ModuleDef::Drill` bound
+                    // (`check_drill_module`) — the field's doc claims
+                    // parity and the sim's `conc / min_concentration`
+                    // scaling makes a `> 1` author a permanent output
+                    // cap, which is a trap, not an intent.
+                    if !(min_concentration.is_finite() && (0.0..=1.0).contains(min_concentration)) {
+                        bad_colony(
+                            site,
+                            format!("module {i}: drill min_concentration outside [0,1]"),
+                            &mut out,
+                        );
                     }
                 }
                 M::Converter {
@@ -1591,6 +2163,7 @@ pub fn validate_colonies(
                     power_ec_per_s,
                     ..
                 } => {
+                    check_id(recipe.as_str(), &mut out);
                     if !recipe_ids.contains(recipe.as_str()) {
                         bad_colony(
                             site,
@@ -2000,8 +2573,18 @@ fn check_variants(part: &PartDef, out: &mut Vec<ValidationError>) {
 }
 
 /// Per-module field checks — dispatch is in [`check_modules`]; the
-/// engine's checks live in [`check_engine_module`].
-fn check_module(part_id: &str, res: &ResourceFile, m: &ModuleDef, out: &mut Vec<ValidationError>) {
+/// engine's checks live in [`check_engine_module`]. `recipe_ids` and
+/// `experiment_ids` resolve the `Converter`/`Experiment` cross-
+/// references — the data set the modules point at, not the module's
+/// own fields.
+fn check_module(
+    part_id: &str,
+    res: &ResourceFile,
+    recipe_ids: &BTreeSet<&str>,
+    experiment_ids: &BTreeSet<&str>,
+    m: &ModuleDef,
+    out: &mut Vec<ValidationError>,
+) {
     match m {
         ModuleDef::Engine { .. } => check_engine_module(part_id, res, m, out),
         ModuleDef::Tank { capacity } => {
@@ -2039,20 +2622,41 @@ fn check_module(part_id: &str, res: &ResourceFile, m: &ModuleDef, out: &mut Vec<
             }
         }
         ModuleDef::Experiment {
+            kind,
             data_units,
             situations,
             ..
         } => {
-            part_positive(part_id, "experiment.data_units", *data_units, out);
-            if situations.is_empty() {
-                out.push(ValidationError::BadModule {
+            check_id(kind.as_str(), out);
+            if !experiment_ids.contains(kind.as_str()) {
+                out.push(ValidationError::UnknownExperimentKind {
                     part: part_id.to_string(),
-                    reason: "experiment can run in no situation",
+                    experiment: kind.as_str().to_string(),
                 });
             }
+            part_positive(part_id, "experiment.data_units", *data_units, out);
+            check_situation_mask(
+                *situations,
+                "experiment can run in no situation",
+                |reason| {
+                    out.push(ValidationError::BadModule {
+                        part: part_id.to_string(),
+                        reason,
+                    });
+                },
+            );
         }
         ModuleDef::Drill { .. } => check_drill_module(part_id, res, m, out),
-        ModuleDef::Converter { power_w, .. } => {
+        ModuleDef::Converter {
+            recipe, power_w, ..
+        } => {
+            check_id(recipe.as_str(), out);
+            if !recipe_ids.contains(recipe.as_str()) {
+                out.push(ValidationError::UnknownRecipe {
+                    part: part_id.to_string(),
+                    recipe: recipe.as_str().to_string(),
+                });
+            }
             if !(power_w.is_finite() && *power_w >= 0.0) {
                 out.push(ValidationError::BadModule {
                     part: part_id.to_string(),
@@ -2196,10 +2800,16 @@ fn check_engine_module(
     }
 }
 
-fn check_modules(part: &PartDef, res: &ResourceFile, out: &mut Vec<ValidationError>) {
+fn check_modules(
+    part: &PartDef,
+    res: &ResourceFile,
+    recipe_ids: &BTreeSet<&str>,
+    experiment_ids: &BTreeSet<&str>,
+    out: &mut Vec<ValidationError>,
+) {
     let part_id = part.id.as_str();
     for m in &part.modules {
-        check_module(part_id, res, m, out);
+        check_module(part_id, res, recipe_ids, experiment_ids, m, out);
     }
     let has = |pred: fn(&ModuleDef) -> bool| part.modules.iter().any(pred);
     let has_engine = has(|m| matches!(m, ModuleDef::Engine { .. }));
@@ -2352,12 +2962,28 @@ fn check_reliability(part: &PartDef, out: &mut Vec<ValidationError>) {
 /// §3.1 part rules over the whole `data/parts/` set: per-def field and
 /// module checks plus set-level ID uniqueness and id↔filename
 /// agreement. `res` resolves every `ResourceId` a part references
-/// (`build_resources`, tank capacities, propellants, drill outputs).
-pub fn validate_parts(loaded: &LoadedParts, res: &ResourceFile) -> Vec<ValidationError> {
+/// (`build_resources`, tank capacities, propellants, drill outputs);
+/// `recipes` and `experiments` resolve the `Converter::recipe` and
+/// `Experiment::kind` cross-references — a converter naming a missing
+/// recipe is a dead module ([`ValidationError::UnknownRecipe`]), an
+/// instrument naming a missing experiment kind can never run
+/// ([`ValidationError::UnknownExperimentKind`]).
+pub fn validate_parts(
+    loaded: &LoadedParts,
+    res: &ResourceFile,
+    recipes: &crate::load::LoadedRecipes,
+    experiments: &crate::load::LoadedExperiments,
+) -> Vec<ValidationError> {
     let mut out = Vec::new();
+    let recipe_ids: BTreeSet<&str> = recipes.recipes.iter().map(|r| r.def.id.as_str()).collect();
+    let experiment_ids: BTreeSet<&str> = experiments
+        .experiments
+        .iter()
+        .map(|e| e.def.id.as_str())
+        .collect();
     let mut ids = BTreeSet::new();
     for p in &loaded.parts {
-        check_part(p, res, &mut out);
+        check_part(p, res, &recipe_ids, &experiment_ids, &mut out);
         let id = p.def.id.as_str();
         check_id(id, &mut out);
         if !ids.insert(id) {
@@ -2379,13 +3005,20 @@ pub fn validate_parts(loaded: &LoadedParts, res: &ResourceFile) -> Vec<Validatio
 }
 
 /// All per-def checks for one loaded part.
-fn check_part(p: &LoadedPart, res: &ResourceFile, out: &mut Vec<ValidationError>) {
+fn check_part(
+    p: &LoadedPart,
+    res: &ResourceFile,
+    recipe_ids: &BTreeSet<&str>,
+    experiment_ids: &BTreeSet<&str>,
+    out: &mut Vec<ValidationError>,
+) {
     let part = &p.def;
     let part_id = part.id.as_str();
     if part.schema_version != PART_SCHEMA_VERSION {
         out.push(ValidationError::SchemaVersion {
             file: format!("parts/{}", p.path.display()),
             found: part.schema_version,
+            expected: PART_SCHEMA_VERSION,
         });
     }
     check_id(part.family.as_str(), out);
@@ -2459,7 +3092,7 @@ fn check_part(p: &LoadedPart, res: &ResourceFile, out: &mut Vec<ValidationError>
         out,
     );
     check_variants(part, out);
-    check_modules(part, res, out);
+    check_modules(part, res, recipe_ids, experiment_ids, out);
     check_reliability(part, out);
 }
 
@@ -2497,15 +3130,29 @@ pub fn validate_part_loc_keys(
 // §2.13's no-panic rule covers shipping fallible paths; tests signal
 // failure by panicking anyway, so unwrap/expect are allowed here.
 /// The §3.2 experiment-def rules over `data/experiments/`: `id` ↔
-/// file-stem agreement, unique IDs, `transmit_ratio` inside the authored
-/// `(0.2, 1.0]` band, caps finite and positive with non-overlapping
-/// `(body, situation)` coverage. Typed error list like every validator
-/// here — never asserts.
-pub fn validate_experiments(loaded: &crate::load::LoadedExperiments) -> Vec<ValidationError> {
+/// file-stem agreement, unique IDs, `schema_version` current,
+/// `transmit_ratio` inside the authored `(0.2, 1.0]` band, caps finite
+/// and positive with non-overlapping `(body, situation)` coverage, and
+/// every `cap.body` resolvable against `sys` — an unreachable cap is
+/// dead authored data (`cap_for` exact-matches the id). Typed error
+/// list like every validator here — never asserts.
+pub fn validate_experiments(
+    loaded: &crate::load::LoadedExperiments,
+    sys: &LoadedSystem,
+) -> Vec<ValidationError> {
     let mut out = Vec::new();
+    let body_ids: BTreeSet<&str> = sys.bodies.iter().map(|b| b.def.id.as_str()).collect();
     let mut seen_ids = BTreeSet::new();
     for le in &loaded.experiments {
         let d = &le.def;
+        check_id(d.id.as_str(), &mut out);
+        if d.schema_version != crate::experiment::EXPERIMENT_SCHEMA_VERSION {
+            out.push(ValidationError::SchemaVersion {
+                file: format!("experiments/{}", le.path.display()),
+                found: d.schema_version,
+                expected: crate::experiment::EXPERIMENT_SCHEMA_VERSION,
+            });
+        }
         let stem = le
             .path
             .file_stem()
@@ -2531,10 +3178,20 @@ pub fn validate_experiments(loaded: &crate::load::LoadedExperiments) -> Vec<Vali
         }
         let mut covered: BTreeSet<(&str, crate::part::Situation)> = BTreeSet::new();
         for cap in &d.caps {
-            if cap.situations.is_empty() {
+            check_id(cap.body.as_str(), &mut out);
+            if !body_ids.contains(cap.body.as_str()) {
                 out.push(ValidationError::BadExperiment {
                     experiment: d.id.as_str().to_string(),
-                    reason: "cap entry covers no situations",
+                    reason: "cap names a body not in the system",
+                });
+            }
+            {
+                let experiment = d.id.as_str();
+                check_situation_mask(cap.situations, "cap entry covers no situations", |reason| {
+                    out.push(ValidationError::BadExperiment {
+                        experiment: experiment.to_string(),
+                        reason,
+                    });
                 });
             }
             if !(cap.cap_data_units.is_finite() && cap.cap_data_units > 0.0) {
@@ -2551,6 +3208,29 @@ pub fn validate_experiments(loaded: &crate::load::LoadedExperiments) -> Vec<Vali
                     });
                 }
             }
+        }
+    }
+    out
+}
+
+/// Loc resolution for the experiment defs (the
+/// [`validate_contract_loc_keys`] pattern): every def's
+/// `display_name` must resolve in `en.ron`. Separate from
+/// [`validate_experiments`] because the loc file lives outside the
+/// experiments directory.
+pub fn validate_experiment_loc_keys(
+    loaded: &crate::load::LoadedExperiments,
+    loc: &LocFile,
+) -> Vec<ValidationError> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for le in &loaded.experiments {
+        let key = &le.def.display_name;
+        if seen.insert(key.as_str().to_string()) && !loc.contains(key) {
+            out.push(ValidationError::UnresolvedLocKey {
+                context: format!("experiment {}", le.def.id),
+                key: key.as_str().to_string(),
+            });
         }
     }
     out
@@ -2577,7 +3257,10 @@ pub fn validate_experiments(loaded: &crate::load::LoadedExperiments) -> Vec<Vali
 /// - every track's family has ≥ 1 part and its `stat_path` resolves on
 ///   **every** part of the family — a frozen upgrade the resolver
 ///   cannot reach is a `ResolveError`, so authoring must guarantee
-///   reachability ahead of manufacture;
+///   reachability ahead of manufacture — and a `Delta`-carrying track
+///   needs a positive finite base everywhere it resolves (the
+///   manufacture compose folds `(base + Σ deltas) / base`; a zero or
+///   NaN base `InvalidStat`s at resolve);
 /// - **every part reachable** — each `PartDef::tech_requirement` names
 ///   a node in the tree.
 pub fn validate_techtree(
@@ -2621,19 +3304,24 @@ fn tree_identity<'a>(
             out.push(ValidationError::SchemaVersion {
                 file: format!("techtree/{}", f.path.display()),
                 found: f.def.schema_version,
+                expected: crate::techtree::TECHTREE_SCHEMA_VERSION,
             });
         }
         for n in &f.def.nodes {
             let id = n.id.as_str();
             check_id(id, out);
-            if node_ids.insert(id, n).is_some() {
+            if let std::collections::btree_map::Entry::Vacant(v) = node_ids.entry(id) {
+                v.insert(n);
+            } else {
                 out.push(ValidationError::DuplicateTechNodeId { id: id.to_string() });
             }
         }
         for t in &f.def.tracks {
             let id = t.id.as_str();
             check_id(id, out);
-            if track_ids.insert(id, t).is_some() {
+            if let std::collections::btree_map::Entry::Vacant(v) = track_ids.entry(id) {
+                v.insert(t);
+            } else {
                 out.push(ValidationError::DuplicateUpgradeTrackId { id: id.to_string() });
             }
         }
@@ -2789,6 +3477,7 @@ fn check_tree_tracks(
                 reason: "more levels than the u8 level counter can hold",
             });
         }
+        let mut has_delta = false;
         for l in &t.levels {
             if !(l.science_cost.is_finite() && l.science_cost >= 0.0) {
                 out.push(ValidationError::BadUpgradeTrack {
@@ -2797,30 +3486,50 @@ fn check_tree_tracks(
                 });
             }
             match l.multiplier_or_delta {
-                crate::techtree::UpgradeEffect::Multiplier(m) if !(m.is_finite() && m > 0.0) => {
-                    out.push(ValidationError::BadUpgradeTrack {
-                        track: id.to_string(),
-                        reason: "Multiplier effect is not finite and > 0",
-                    });
+                crate::techtree::UpgradeEffect::Multiplier(m) => {
+                    if !(m.is_finite() && m > 0.0) {
+                        out.push(ValidationError::BadUpgradeTrack {
+                            track: id.to_string(),
+                            reason: "Multiplier effect is not finite and > 0",
+                        });
+                    }
                 }
-                crate::techtree::UpgradeEffect::Delta(d) if !d.is_finite() => {
-                    out.push(ValidationError::BadUpgradeTrack {
-                        track: id.to_string(),
-                        reason: "Delta effect is not finite",
-                    });
+                crate::techtree::UpgradeEffect::Delta(d) => {
+                    has_delta = true;
+                    if !d.is_finite() {
+                        out.push(ValidationError::BadUpgradeTrack {
+                            track: id.to_string(),
+                            reason: "Delta effect is not finite",
+                        });
+                    }
                 }
-                _ => {}
             }
         }
         let mut in_family = 0usize;
         for p in &parts.parts {
             if p.def.family == t.family {
                 in_family += 1;
-                if t.stat_path.base_value(&p.def).is_none() {
-                    out.push(ValidationError::BadUpgradeTrack {
-                        track: id.to_string(),
-                        reason: "stat_path does not resolve on a part of the family",
-                    });
+                match t.stat_path.base_value(&p.def) {
+                    None => {
+                        out.push(ValidationError::BadUpgradeTrack {
+                            track: id.to_string(),
+                            reason: "stat_path does not resolve on a part of the family",
+                        });
+                    }
+                    // A `Delta` level composes `(base + Σ deltas) /
+                    // base` at manufacture — the same gate
+                    // `csp_phys::resolve::compose_upgrade_levels`
+                    // runs: the authored base must be positive and
+                    // finite or every `resolve_built_part` on the
+                    // family `InvalidStat`s. `Some(0.0)` (a
+                    // zero-torque `Control`, say) used to pass here.
+                    Some(base) if has_delta && !(base.is_finite() && base > 0.0) => {
+                        out.push(ValidationError::BadUpgradeTrack {
+                            track: id.to_string(),
+                            reason: "Delta track's stat_path base is not positive and finite on a family part",
+                        });
+                    }
+                    _ => {}
                 }
             }
         }
@@ -2882,15 +3591,21 @@ fn validate_contract_space(
         contract: cid.to_string(),
         reason,
     };
-    let bodies_ok = |bodies: &[crate::ids::BodyId], out: &mut Vec<ValidationError>| -> bool {
-        let mut ok = !bodies.is_empty();
+    // §3.6's "candidate lists non-empty" rule: an empty `bodies`
+    // space pushes an error here — the first offer draw indexes it
+    // unconditionally (`bodies.get(pick(rng, bodies.len()))` sim-side)
+    // and the generation gate would degrade `Recoverable` on every
+    // template pick. The membership half still reports each body that
+    // misses the system table.
+    let check_bodies = |bodies: &[crate::ids::BodyId], out: &mut Vec<ValidationError>| {
+        if bodies.is_empty() {
+            out.push(bad("candidate body list is empty"));
+        }
         for b in bodies {
             if !body_ids.contains(b.as_str()) {
                 out.push(bad("candidate body is not in the system"));
-                ok = false;
             }
         }
-        ok
     };
     let range_ok = |r: (f64, f64), what: &'static str, out: &mut Vec<ValidationError>| -> bool {
         if r.0.is_finite() && r.1.is_finite() && r.0 > 0.0 && r.0 <= r.1 {
@@ -2909,17 +3624,30 @@ fn validate_contract_space(
                 apoapsis_alt_m,
             },
         ) => {
-            bodies_ok(bodies, out);
-            range_ok(
+            check_bodies(bodies, out);
+            let peri_ok = range_ok(
                 *periapsis_alt_m,
                 "periapsis_alt_m range is not 0 < lo <= hi",
                 out,
             );
-            range_ok(
+            let apo_ok = range_ok(
                 *apoapsis_alt_m,
                 "apoapsis_alt_m range is not 0 < lo <= hi",
                 out,
             );
+            // Cross-band sanity: partial overlap is legal (the sim
+            // orders a drawn pair — see `ContractParamSpace`'s doc),
+            // but when the apoapsis band's *ceiling* sits under the
+            // periapsis band's *floor* every possible draw inverts —
+            // the published window always comes out of the swap, so
+            // the authored bands carry none of their stated meaning.
+            // Gated on both bands passing `range_ok` so a malformed
+            // band reports exactly its own error.
+            if peri_ok && apo_ok && apoapsis_alt_m.1 < periapsis_alt_m.0 {
+                out.push(bad(
+                    "apoapsis_alt_m.hi below periapsis_alt_m.lo — every draw inverts",
+                ));
+            }
         }
         (
             crate::contract::ContractKind::SurveyRun,
@@ -2937,7 +3665,7 @@ fn validate_contract_space(
                     out.push(bad("survey candidate experiment is not loaded"));
                 }
             }
-            bodies_ok(bodies, out);
+            check_bodies(bodies, out);
             if !(min_units.is_finite() && *min_units > 0.0) {
                 out.push(bad("min_units is not positive and finite"));
             }
@@ -2958,7 +3686,7 @@ fn validate_contract_space(
             }
             match regime {
                 RegimeSpace::Orbit { bodies, min_alt_m } => {
-                    bodies_ok(bodies, out);
+                    check_bodies(bodies, out);
                     range_ok(
                         *min_alt_m,
                         "part-test orbit min_alt range is not 0 < lo <= hi",
@@ -2966,12 +3694,12 @@ fn validate_contract_space(
                     );
                 }
                 RegimeSpace::Landed { bodies } => {
-                    bodies_ok(bodies, out);
+                    check_bodies(bodies, out);
                 }
             }
         }
         (crate::contract::ContractKind::Rescue, ContractParamSpace::Rescue { bodies }) => {
-            bodies_ok(bodies, out);
+            check_bodies(bodies, out);
         }
         (
             crate::contract::ContractKind::ColonyResupply,
@@ -2981,7 +3709,7 @@ fn validate_contract_space(
                 amount,
             },
         ) => {
-            bodies_ok(bodies, out);
+            check_bodies(bodies, out);
             if resources.is_empty() {
                 out.push(bad("resupply candidates: no resources authored"));
             }
@@ -3010,7 +3738,10 @@ fn validate_contract_space(
 ///   system, experiments in the loaded set, `ColonyResupply`
 ///   resources in `resources.ron`), draw ranges finite
 ///   with `0 ≤ lo ≤ hi` (altitude `lo > 0` — a zero-altitude orbit
-///   band intersects the surface);
+///   band intersects the surface), and — for `SatellitePlacement` —
+///   the bands must not be fully inverted (`apoapsis_alt_m.hi <
+///   periapsis_alt_m.lo` would invert every draw; partial overlap
+///   stays legal — the sim orders the pair);
 /// - prerequisites well-formed: no duplicates, `count > 0`, tech
 ///   ids resolvable in the merged tree, body ids in the system;
 /// - the tree's `unlocks.contract_types` ids each name an authored
@@ -3040,6 +3771,13 @@ pub fn validate_contracts(
         let d = &lc.def;
         let cid = d.id.as_str();
         template_ids.insert(cid);
+        if d.schema_version != crate::contract::CONTRACT_SCHEMA_VERSION {
+            out.push(ValidationError::SchemaVersion {
+                file: format!("contracts/{}", lc.path.display()),
+                found: d.schema_version,
+                expected: crate::contract::CONTRACT_SCHEMA_VERSION,
+            });
+        }
         if lc
             .path
             .file_stem()
@@ -3403,9 +4141,19 @@ mod tests {
         );
     }
 
-    /// A minimal valid palette-PNG byte stream for validator tests — the
-    /// inspector never checks CRCs, so chunks can be hand-assembled.
-    fn tiny_png(w: u32, h: u32, palette_entries: usize) -> Vec<u8> {
+    /// A minimal valid palette-PNG byte stream for validator tests —
+    /// CRCs are still unchecked, but the `IDAT` is a real zlib stream
+    /// (the validator now decodes pixels, so a header-only PNG would
+    /// fail `BiomeMapPngInvalid` before the rule under test). `pixels`
+    /// is `w*h` palette indices, row-major.
+    fn tiny_png(w: u32, h: u32, palette_entries: usize, pixels: &[u8]) -> Vec<u8> {
+        assert_eq!(pixels.len(), (w * h) as usize);
+        let mut raw = Vec::with_capacity((w as usize + 1) * h as usize);
+        for row in pixels.chunks_exact(w as usize) {
+            raw.push(0); // scanline filter: None
+            raw.extend_from_slice(row);
+        }
+        let idat = miniz_oxide::deflate::compress_to_vec_zlib(&raw, 6);
         let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
         let mut ihdr = Vec::new();
         ihdr.extend_from_slice(&w.to_be_bytes());
@@ -3414,6 +4162,7 @@ mod tests {
         for (kind, data) in [
             (*b"IHDR", ihdr),
             (*b"PLTE", vec![0u8; palette_entries * 3]),
+            (*b"IDAT", idat),
             (*b"IEND", Vec::new()),
         ] {
             out.extend_from_slice(&(data.len() as u32).to_be_bytes());
@@ -3453,11 +4202,40 @@ mod tests {
     #[test]
     fn biome_legend_index_beyond_palette_is_rejected() {
         let mut sys = fixture();
-        with_biomes(&mut sys, 5, tiny_png(4, 4, 2)); // palette of 2, index 5
+        with_biomes(&mut sys, 5, tiny_png(4, 4, 2, &[0; 16])); // palette of 2, index 5
         let errs = validate_system(&sys);
         assert!(
             errs.iter()
                 .any(|e| matches!(e, ValidationError::BiomeIndexExceedsPalette { .. })),
+            "{errs:?}"
+        );
+    }
+
+    /// The validator decodes pixels: a map painting a palette index
+    /// the legend never names is an unnamed biome region.
+    #[test]
+    fn unlegended_pixel_index_is_rejected() {
+        let mut sys = fixture();
+        // Legend covers indices 0 and 1; the map paints a 2 (palette
+        // of 4, so `BiomeIndexExceedsPalette` does not fire — this is
+        // the legend-coverage rule specifically).
+        let mut pixels = [0u8; 16];
+        pixels[5] = 2;
+        with_biomes(&mut sys, 1, tiny_png(4, 4, 4, &pixels));
+        let errs = validate_system(&sys);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::BiomeIndexNotInLegend { index: 2, .. })),
+            "{errs:?}"
+        );
+        // And the clean map passes the coverage check entirely.
+        let mut sys = fixture();
+        with_biomes(&mut sys, 1, tiny_png(4, 4, 4, &[1; 16]));
+        let errs = validate_system(&sys);
+        assert!(
+            !errs
+                .iter()
+                .any(|e| matches!(e, ValidationError::BiomeIndexNotInLegend { .. })),
             "{errs:?}"
         );
     }
@@ -3477,7 +4255,7 @@ mod tests {
     #[test]
     fn oversized_biome_map_is_rejected() {
         let mut sys = fixture();
-        with_biomes(&mut sys, 1, tiny_png(4096, 32, 2));
+        with_biomes(&mut sys, 1, tiny_png(4096, 32, 2, &vec![0; 4096 * 32]));
         let errs = validate_system(&sys);
         assert!(
             errs.iter()
@@ -3489,7 +4267,7 @@ mod tests {
     #[test]
     fn duplicate_legend_index_is_rejected() {
         let mut sys = fixture();
-        with_biomes(&mut sys, 0, tiny_png(4, 4, 2)); // two entries at index 0
+        with_biomes(&mut sys, 0, tiny_png(4, 4, 2, &[0; 16])); // two entries at index 0
         let errs = validate_system(&sys);
         assert!(
             errs.iter()
@@ -3662,8 +4440,24 @@ mod tests {
         }
     }
 
+    /// Empty registries for the `Converter`/`Experiment` cross-ref
+    /// checks — `part_fixture` carries an `Engine` module only, so the
+    /// empty set is enough for every negative test below; the
+    /// cross-ref tests install their own.
+    fn empty_registries() -> (crate::load::LoadedRecipes, crate::load::LoadedExperiments) {
+        (
+            crate::load::LoadedRecipes {
+                recipes: Vec::new(),
+            },
+            crate::load::LoadedExperiments {
+                experiments: Vec::new(),
+            },
+        )
+    }
+
     fn part_errors(def: PartDef) -> Vec<ValidationError> {
-        validate_parts(&loaded_part(def), &res_fixture())
+        let (recipes, experiments) = empty_registries();
+        validate_parts(&loaded_part(def), &res_fixture(), &recipes, &experiments)
     }
 
     /// The fixture itself must be clean — otherwise the negative tests
@@ -3701,7 +4495,8 @@ mod tests {
                 },
             ],
         };
-        let errs = validate_parts(&loaded, &res_fixture());
+        let (recipes, experiments) = empty_registries();
+        let errs = validate_parts(&loaded, &res_fixture(), &recipes, &experiments);
         assert!(
             errs.iter()
                 .any(|e| matches!(e, ValidationError::DuplicatePartId { .. })),
@@ -3717,7 +4512,8 @@ mod tests {
                 def: part_fixture(),
             }],
         };
-        let errs = validate_parts(&loaded, &res_fixture());
+        let (recipes, experiments) = empty_registries();
+        let errs = validate_parts(&loaded, &res_fixture(), &recipes, &experiments);
         assert!(
             errs.iter()
                 .any(|e| matches!(e, ValidationError::PartIdFileMismatch { .. })),
@@ -4482,5 +5278,401 @@ mod tests {
             power_ec_per_s: 0.0,
         };
         assert!(validate_colonies(&bad, &sites, &res, &recipes).is_empty());
+    }
+
+    // ---- Phase 9.2: module cross-references + version discipline ----
+
+    /// `ModuleDef::Converter.recipe` and `ModuleDef::Experiment.kind`
+    /// must resolve in `data/recipes`/`data/experiments` — an
+    /// unresolved recipe is a dead converter in `csp-sim`, an
+    /// unresolved kind can never run. (`part_errors` runs against the
+    /// empty registries, so every authored ref is unresolvable.)
+    #[test]
+    fn converter_recipe_and_experiment_kind_resolve() {
+        let mut d = part_fixture();
+        d.category = PartCategory::Utility;
+        d.modules = vec![
+            ModuleDef::Converter {
+                recipe: "recipe.missing".into(),
+                priority: 0,
+                power_w: 0.0,
+            },
+            ModuleDef::Experiment {
+                kind: "exp.missing".into(),
+                data_units: 1.0,
+                reusable: true,
+                situations: crate::part::SituationMask(1),
+            },
+        ];
+        let errs = part_errors(d);
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::UnknownRecipe { recipe, .. } if recipe == "recipe.missing"
+            )),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::UnknownExperimentKind { experiment, .. } if experiment == "exp.missing"
+            )),
+            "{errs:?}"
+        );
+
+        // Positive half: a recipe the registry *does* carry is fine.
+        let mut d = part_fixture();
+        d.category = PartCategory::Utility;
+        d.modules = vec![ModuleDef::Converter {
+            recipe: "recipe.smelt".into(),
+            priority: 0,
+            power_w: 0.0,
+        }];
+        let (_, _, _, recipes) = colony_fixture();
+        let (_, experiments) = empty_registries();
+        let errs = validate_parts(&loaded_part(d), &res_fixture(), &recipes, &experiments);
+        assert!(
+            !errs
+                .iter()
+                .any(|e| matches!(e, ValidationError::UnknownRecipe { .. })),
+            "{errs:?}"
+        );
+    }
+
+    /// `ExperimentCap.body` must name a body in the system — a cap on
+    /// an unknown body is dead authored data (`cap_for`
+    /// exact-matches). The experiment version gate rides the same
+    /// file.
+    #[test]
+    fn experiment_cap_body_and_version_are_checked() {
+        let mut loaded = crate::load::LoadedExperiments {
+            experiments: vec![crate::load::LoadedExperiment {
+                path: PathBuf::from("exp.test.ron"),
+                def: crate::experiment::ExperimentDef {
+                    schema_version: crate::experiment::EXPERIMENT_SCHEMA_VERSION,
+                    id: "exp.test".into(),
+                    display_name: "exp.test.name".into(),
+                    transmit_ratio: 0.5,
+                    caps: vec![crate::experiment::ExperimentCap {
+                        body: "kerbin".into(),
+                        situations: crate::part::SituationMask(1),
+                        cap_data_units: 1.0,
+                    }],
+                },
+            }],
+        };
+        let errs = validate_experiments(&loaded, &fixture());
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::BadExperiment { experiment, reason }
+                    if experiment == "exp.test" && *reason == "cap names a body not in the system"
+            )),
+            "{errs:?}"
+        );
+
+        loaded.experiments[0].def.caps[0].body = "planet".into();
+        loaded.experiments[0].def.schema_version = 0;
+        let errs = validate_experiments(&loaded, &fixture());
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::SchemaVersion { found: 0, .. })),
+            "{errs:?}"
+        );
+    }
+
+    /// Each `SiteDef` entry re-declares its own version — the same
+    /// current-or-previous band as the `SiteFile` wrapper.
+    #[test]
+    fn site_entry_schema_version_is_checked() {
+        let (_, mut sites, res, _) = colony_fixture();
+        sites.sites[0].schema_version = 0;
+        let errs = validate_sites(&sites, &fixture(), &res);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::SchemaVersion { found: 0, .. })),
+            "{errs:?}"
+        );
+    }
+
+    /// `validate_contracts` runs the per-template schema_version gate.
+    #[test]
+    fn contract_schema_version_is_checked() {
+        let contracts = crate::load::LoadedContracts {
+            contracts: vec![crate::load::LoadedContract {
+                path: PathBuf::from("contract.test.ron"),
+                def: crate::contract::ContractTemplate {
+                    schema_version: 0,
+                    id: "contract.test".into(),
+                    display_name: "k".into(),
+                    description: "k".into(),
+                    kind: crate::contract::ContractKind::Rescue,
+                    generate: crate::contract::ContractGenerator {
+                        weight: 1.0,
+                        space: crate::contract::ContractParamSpace::Rescue {
+                            bodies: vec!["planet".into()],
+                        },
+                    },
+                    prerequisites: Vec::new(),
+                    rewards: crate::contract::ContractRewards {
+                        advance_funds: 1.0,
+                        completion_funds: 1.0,
+                        failure_penalty_funds: 1.0,
+                    },
+                    deadline_days: None,
+                },
+            }],
+        };
+        let (_, experiments) = empty_registries();
+        let tree = tree_fixture();
+        let errs = validate_contracts(&contracts, &fixture(), &experiments, &tree, &res_fixture());
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::SchemaVersion { found: 0, .. })),
+            "{errs:?}"
+        );
+    }
+
+    /// `validate_loc` re-checks the `LocFile` schema_version the
+    /// loader gates.
+    #[test]
+    fn loc_schema_version_is_checked() {
+        let loc = LocFile {
+            schema_version: 0,
+            strings: BTreeMap::new(),
+        };
+        assert!(matches!(
+            validate_loc(&loc).as_slice(),
+            [ValidationError::SchemaVersion { found: 0, .. }]
+        ));
+    }
+
+    /// A `body.ron` file reference (`terrain.heightmap`, a
+    /// `surface_resources` map) that is not a tame one-segment name
+    /// reports `BadFileRef` — the same gate the loader runs before
+    /// `join`, repeated for hand-rolled `LoadedSystem`s.
+    #[test]
+    fn unsafe_body_file_refs_are_rejected() {
+        let mut sys = fixture();
+        // bodies[0] is the star; the planet carries the refs here.
+        sys.bodies[1].def.terrain.heightmap = Some("../x.png".to_string());
+        sys.bodies[1].def.surface_resources = vec![(
+            "ore".into(),
+            crate::system::ConcentrationMapRef {
+                png: "sub/map.png".to_string(),
+            },
+        )];
+        let errs = validate_system(&sys);
+        assert!(
+            errs.iter()
+                .filter(|e| {
+                    matches!(e, ValidationError::BadFileRef { body, .. } if body == "planet")
+                })
+                .count()
+                >= 2,
+            "{errs:?}"
+        );
+    }
+
+    // ---- Phase 9.3: LOW-batch gates ----
+
+    /// `SituationMask` bits 6–7 are dead authored data —
+    /// `situations()` drops them silently — so a mask setting them is
+    /// rejected on the module and on an experiment cap alike (an
+    /// all-spares mask is non-empty yet covers no situation).
+    #[test]
+    fn situation_mask_spare_bits_are_rejected() {
+        let mut d = part_fixture();
+        d.category = PartCategory::Utility;
+        d.modules = vec![ModuleDef::Experiment {
+            kind: "exp.test".into(),
+            data_units: 1.0,
+            reusable: true,
+            situations: crate::part::SituationMask(0x40),
+        }];
+        let errs = part_errors(d);
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::BadModule {
+                    reason: "situation mask sets spare bits outside the six situations",
+                    ..
+                }
+            )),
+            "{errs:?}"
+        );
+
+        let loaded = crate::load::LoadedExperiments {
+            experiments: vec![crate::load::LoadedExperiment {
+                path: PathBuf::from("exp.test.ron"),
+                def: crate::experiment::ExperimentDef {
+                    schema_version: crate::experiment::EXPERIMENT_SCHEMA_VERSION,
+                    id: "exp.test".into(),
+                    display_name: "exp.test.name".into(),
+                    transmit_ratio: 0.5,
+                    caps: vec![crate::experiment::ExperimentCap {
+                        body: "planet".into(),
+                        situations: crate::part::SituationMask(0xC0),
+                        cap_data_units: 1.0,
+                    }],
+                },
+            }],
+        };
+        let errs = validate_experiments(&loaded, &fixture());
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::BadExperiment {
+                    reason: "situation mask sets spare bits outside the six situations",
+                    ..
+                }
+            )),
+            "{errs:?}"
+        );
+    }
+
+    /// A `Delta`-effect track needs a positive finite base on every
+    /// family part — the same gate `compose_upgrade_levels` runs at
+    /// manufacture (`(base + Σ deltas) / base`). `Some(0.0)` used to
+    /// pass the resolve check alone.
+    #[test]
+    fn delta_track_nonpositive_base_is_rejected() {
+        let mut t = tree_fixture();
+        t.trees[0].def.tracks[0].stat_path = crate::part::StatPath::MassDryKg;
+        t.trees[0].def.tracks[0].levels[0].multiplier_or_delta = UpgradeEffect::Delta(5.0);
+        let mut zero_base = part_fixture();
+        zero_base.mass_dry_kg = 0.0;
+        let errs = tree_errors(&t, &loaded_part(zero_base.clone()));
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::BadUpgradeTrack {
+                    reason: "Delta track's stat_path base is not positive and finite on a family part",
+                    ..
+                }
+            )),
+            "{errs:?}"
+        );
+        // A Multiplier track on the same zero base stays legal — the
+        // manufacture gate only fires when a delta term exists.
+        let mut t = tree_fixture();
+        t.trees[0].def.tracks[0].stat_path = crate::part::StatPath::MassDryKg;
+        assert!(
+            !tree_errors(&t, &loaded_part(zero_base))
+                .iter()
+                .any(|e| matches!(e, ValidationError::BadUpgradeTrack { .. })),
+            "multiplier track must not trip the delta-base gate"
+        );
+        // Positive base + Delta: the intended authoring, still green.
+        let mut t = tree_fixture();
+        t.trees[0].def.tracks[0].levels[0].multiplier_or_delta = UpgradeEffect::Delta(5.0);
+        assert!(
+            tree_errors(&t, &loaded_part(part_fixture())).is_empty(),
+            "positive-base delta track must stay valid"
+        );
+    }
+
+    /// Recipe failures stamp `InvalidRecipe`, not `InvalidColony` —
+    /// the recipe registry is not a colony file.
+    #[test]
+    fn recipe_errors_stamp_invalid_recipe() {
+        let (_, _, res, mut recipes) = colony_fixture();
+        recipes.recipes[0].def.outputs = vec![("unobtainium".into(), 1.0)];
+        let errs = validate_recipes(&recipes, &res);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::InvalidRecipe { .. })),
+            "{errs:?}"
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|e| matches!(e, ValidationError::InvalidColony { .. })),
+            "{errs:?}"
+        );
+    }
+
+    /// `check_id` covers the remaining registry ids: sites, recipes,
+    /// experiments, and biome legend entries.
+    #[test]
+    fn registry_ids_are_well_formed_checked() {
+        let (_, mut sites, res, _) = colony_fixture();
+        sites.sites[0].id = "Bad Id".into();
+        let errs = validate_sites(&sites, &fixture(), &res);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::MalformedId { .. })),
+            "site: {errs:?}"
+        );
+
+        let (_, _, res, mut recipes) = colony_fixture();
+        recipes.recipes[0].def.id = "Bad Id".into();
+        let errs = validate_recipes(&recipes, &res);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::MalformedId { .. })),
+            "recipe: {errs:?}"
+        );
+
+        let mut loaded = crate::load::LoadedExperiments {
+            experiments: vec![crate::load::LoadedExperiment {
+                path: PathBuf::from("Bad Id.ron"),
+                def: crate::experiment::ExperimentDef {
+                    schema_version: crate::experiment::EXPERIMENT_SCHEMA_VERSION,
+                    id: "Bad Id".into(),
+                    display_name: "exp.test.name".into(),
+                    transmit_ratio: 0.5,
+                    caps: Vec::new(),
+                },
+            }],
+        };
+        let errs = validate_experiments(&loaded, &fixture());
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::MalformedId { .. })),
+            "experiment: {errs:?}"
+        );
+        loaded.experiments.clear();
+
+        let mut sys = fixture();
+        with_biomes(&mut sys, 1, tiny_png(4, 4, 4, &[0; 16]));
+        sys.bodies[1].biomes.as_mut().unwrap().legend.entries[0].id = "Bad Id".into();
+        let errs = validate_system(&sys);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::MalformedId { .. })),
+            "biome: {errs:?}"
+        );
+    }
+
+    /// The colony `Drill.min_concentration` bound is the part-side
+    /// `[0, 1]` — a `> 1` author permanently caps drill output.
+    #[test]
+    fn colony_drill_min_concentration_bound_matches_part_side() {
+        let (mut file, sites, res, recipes) = colony_fixture();
+        file.colonies[0].modules[0] = crate::colony::ColonyModuleDef::Drill {
+            resource: "ore".into(),
+            base_rate_per_s: 1.0,
+            min_concentration: 1.5,
+            power_ec_per_s: 1.0,
+        };
+        let errs = validate_colonies(&file, &sites, &res, &recipes);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::InvalidColony { .. })),
+            "{errs:?}"
+        );
+        for edge in [0.0, 1.0] {
+            file.colonies[0].modules[0] = crate::colony::ColonyModuleDef::Drill {
+                resource: "ore".into(),
+                base_rate_per_s: 1.0,
+                min_concentration: edge,
+                power_ec_per_s: 1.0,
+            };
+            assert!(
+                validate_colonies(&file, &sites, &res, &recipes).is_empty(),
+                "edge {edge} must stay legal"
+            );
+        }
     }
 }

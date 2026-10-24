@@ -13,8 +13,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use csp_data::{
-    G0, LoadedParts, LocFile, ModuleDef, PartDef, ResourceFile, load_parts, load_resources,
-    validate_part_loc_keys, validate_parts, validate_resources,
+    G0, LoadedExperiments, LoadedParts, LoadedRecipes, LocFile, ModuleDef, PartDef, ResourceFile,
+    load_experiments, load_parts, load_recipes, load_resources, validate_part_loc_keys,
+    validate_parts, validate_resources,
 };
 
 fn repo_root() -> PathBuf {
@@ -30,6 +31,14 @@ fn parts() -> LoadedParts {
 
 fn resources() -> ResourceFile {
     load_resources(&repo_root().join("data/resources.ron")).unwrap()
+}
+
+fn recipes() -> LoadedRecipes {
+    load_recipes(&repo_root().join("data/recipes")).unwrap()
+}
+
+fn experiments() -> LoadedExperiments {
+    load_experiments(&repo_root().join("data/experiments")).unwrap()
 }
 
 fn def<'a>(loaded: &'a LoadedParts, id: &str) -> &'a PartDef {
@@ -89,7 +98,7 @@ fn authored_parts_load_and_validate_green() {
     let loaded = parts();
     let res = resources();
     assert_eq!(loaded.parts.len(), 10, "the M3 starter set is 10 parts");
-    let errs = validate_parts(&loaded, &res);
+    let errs = validate_parts(&loaded, &res, &recipes(), &experiments());
     assert!(errs.is_empty(), "validator errors: {errs:#?}");
 }
 

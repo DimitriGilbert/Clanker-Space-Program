@@ -61,6 +61,18 @@ fn home_system_loc_keys_resolve() {
     assert!(errs.is_empty(), "unresolved loc keys: {errs:#?}");
 }
 
+/// Every site `display_name` in `data/systems/home/sites.ron`
+/// resolves in `data/loc/en.ron` — the `validate_site_loc_keys` gate.
+#[test]
+fn home_site_loc_keys_resolve() {
+    let sites = csp_data::load_sites(&repo_root().join("data/systems/home/sites.ron")).unwrap();
+    let loc_path = repo_root().join("data/loc/en.ron");
+    let text = std::fs::read_to_string(&loc_path).unwrap();
+    let loc: LocFile = ron::de::from_str(&text).unwrap();
+    let errs = csp_data::validate_site_loc_keys(&sites, &loc);
+    assert!(errs.is_empty(), "unresolved site loc keys: {errs:#?}");
+}
+
 /// §3.0 derived check: Terrin surface escape velocity
 /// `sqrt(2μ/R)` = 3 431 m/s ±0.1%.
 #[test]

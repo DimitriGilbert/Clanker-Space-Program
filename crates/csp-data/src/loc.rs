@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 /// `BTreeMap` keeps iteration order deterministic (§2.2 bans hash maps in
 /// this crate).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LocFile {
     /// First field of every data file (§3.1). Must equal
     /// [`crate::system::SCHEMA_VERSION`].

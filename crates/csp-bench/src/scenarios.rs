@@ -186,9 +186,9 @@ fn flight_initial(dir: &Path) -> Result<World, ReplayError> {
         csp_data::load_experiments(&dir.join("experiments")).map_err(ReplayError::Load)?;
     world.set_experiments(
         experiments
-            .experiments
-            .iter()
-            .map(|e| (e.def.id.clone(), e.def.clone()))
+            .by_id()
+            .into_iter()
+            .map(|(id, def)| (id, def.clone()))
             .collect(),
     );
     // §3.5's economy tunables + site table — same wiring (M7-C): the

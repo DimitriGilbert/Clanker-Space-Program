@@ -5,7 +5,13 @@
 //! rules hold trivially. Everything *semantic* (parent links, SOI/period
 //! consistency, biome-map sanity) is the validator's job
 //! ([`crate::validate`]); the loader enforces only file shape: presence,
-//! RON syntax, and `schema_version`.
+//! RON syntax, `schema_version` (checked BEFORE the full def parse via
+//! [`SchemaProbe`], so a stale file reports its version rather than the
+//! missing new field its out-of-date shape would produce), and the
+//! authored-name gate: every authored string that becomes a path
+//! component (`system.bodies` entries, `BiomeMapRef` legend/png) must be
+//! a tame single-segment relative name — `..`/absolute/separator-bearing
+//! names are rejected before the `join` ([`LoadError::UnsafeName`]).
 //!
 //! Layout (§3.0):
 //! ```text
@@ -119,6 +125,18 @@ pub enum LoadError {
         /// The schema version the loader for this file type knows.
         expected: u32,
     },
+    /// An authored name — a `system.bodies` entry or a file reference
+    /// (`biomes.ron` legend/png, `heightmap`, concentration map) — is
+    /// not a plain single-segment relative name. `..`/absolute/
+    /// separator-bearing strings would escape the directory the caller
+    /// handed the loader (`FsDataSource` joins verbatim), so the join
+    /// refuses them up front.
+    UnsafeName {
+        /// The file the bad name was read from.
+        path: PathBuf,
+        /// The offending name.
+        name: String,
+    },
 }
 
 impl fmt::Display for LoadError {
@@ -135,6 +153,11 @@ impl fmt::Display for LoadError {
                 "{}: unsupported schema_version {found} (loader knows {expected})",
                 path.display()
             ),
+            Self::UnsafeName { path, name } => write!(
+                f,
+                "{}: unsafe authored name {name:?} — not a single-segment relative name",
+                path.display()
+            ),
         }
     }
 }
@@ -144,7 +167,7 @@ impl std::error::Error for LoadError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Ron { source, .. } => Some(source),
-            Self::UnsupportedSchemaVersion { .. } => None,
+            Self::UnsupportedSchemaVersion { .. } | Self::UnsafeName { .. } => None,
         }
     }
 }
@@ -193,10 +216,10 @@ impl DataSource for FsDataSource {
         path.exists()
     }
 
-    /// Depth-first walk, each directory level sorted before recursion —
-    /// equivalent to a plain ascending sort of every file path found
-    /// (a subdir's contents land exactly at the subdir's sorted
-    /// position).
+    /// Recursive walk sorted by the same key `data_set_hash` sorts on —
+    /// the `/`-joined relative path compared byte-wise (see
+    /// [`collect_ron_files`] for why a plain `Path` sort is NOT the
+    /// same order).
     fn ron_files(&self, dir: &Path) -> Result<Vec<PathBuf>, LoadError> {
         let mut out = Vec::new();
         collect_ron_files(dir, &mut out)?;
@@ -265,36 +288,95 @@ impl DataSource for EmbeddedSource {
     }
 
     fn ron_files(&self, dir: &Path) -> Result<Vec<PathBuf>, LoadError> {
-        // BTreeMap key order is component-wise ascending — the same
-        // order the filesystem walk produces (see FsDataSource's doc).
-        Ok(self
+        // BTreeMap key order is component-wise `Path` order — which is
+        // NOT `data_set_hash`'s order on a `x/` vs `x.ron` prefix
+        // collision, so the result is re-sorted by the same key the
+        // filesystem walk uses (`collect_ron_files`).
+        let mut out: Vec<PathBuf> = self
             .files
             .keys()
             .filter(|k| k.starts_with(dir) && k.extension().is_some_and(|ext| ext == "ron"))
             .cloned()
-            .collect())
+            .collect();
+        out.sort_by_cached_key(|p| ron_sort_key(dir, p));
+        Ok(out)
     }
 }
 
-fn read_ron<T: serde::de::DeserializeOwned>(
-    src: &dyn DataSource,
-    path: &Path,
-) -> Result<T, LoadError> {
-    let text = src.read_string(path)?;
-    ron::de::from_str(&text).map_err(|source| LoadError::Ron {
-        path: path.to_path_buf(),
-        source: Box::new(source),
-    })
+/// A `schema_version`-only view of a versioned data file — every file's
+/// first field (§3.1). [`read_versioned_ron`] probes this BEFORE the
+/// full def parse: a stale-version file missing a *new* required field
+/// would otherwise report the missing field (a shape error) when the
+/// actionable diagnosis is the version. Probe failures are ignored —
+/// the full parse's positioned [`LoadError::Ron`] is the better
+/// diagnostic for a file that is not RON at all or whose
+/// `schema_version` is not a `u32`.
+#[derive(serde::Deserialize)]
+struct SchemaProbe {
+    schema_version: Option<u32>,
 }
 
-fn check_version(path: &Path, found: u32, expected: u32) -> Result<(), LoadError> {
-    if found == expected {
+fn check_version(path: &Path, found: u32, supported: &[u32]) -> Result<(), LoadError> {
+    if supported.contains(&found) {
         Ok(())
     } else {
         Err(LoadError::UnsupportedSchemaVersion {
             path: path.to_path_buf(),
             found,
-            expected,
+            expected: *supported.last().unwrap_or(&0),
+        })
+    }
+}
+
+/// Read `path` as `T`, running the `supported`-band version check
+/// *before* the full parse (§3.1's order — a stale file's missing new
+/// fields must not mask the version problem as a shape error) and again
+/// on the parsed def via `version_of`.
+fn read_versioned_ron<T: serde::de::DeserializeOwned>(
+    src: &dyn DataSource,
+    path: &Path,
+    supported: &[u32],
+    version_of: impl FnOnce(&T) -> u32,
+) -> Result<T, LoadError> {
+    let text = src.read_string(path)?;
+    if let Ok(SchemaProbe {
+        schema_version: Some(found),
+    }) = ron::de::from_str::<SchemaProbe>(&text)
+    {
+        check_version(path, found, supported)?;
+    }
+    let def: T = ron::de::from_str(&text).map_err(|source| LoadError::Ron {
+        path: path.to_path_buf(),
+        source: Box::new(source),
+    })?;
+    check_version(path, version_of(&def), supported)?;
+    Ok(def)
+}
+
+/// `true` for a tame one-segment file/dir name — what authored names
+/// (body ids, `biomes.ron`/`*.png` refs, heightmaps, concentration
+/// maps) must satisfy before they may be joined under a data dir:
+/// non-empty, not `.`/`..`, and free of `/`, `\`, and NUL. The
+/// validator repeats the check ([`crate::validate`]) so a hand-rolled
+/// `LoadedSystem` cannot smuggle an unsafe ref to later consumers.
+pub(crate) fn authored_name_ok(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', '\0'])
+}
+
+/// `dir.join(name)` for an *authored* single-segment relative name —
+/// the guard against `..`/absolute/separator-bearing authored strings
+/// escaping the directory the caller handed the loader.
+/// `FsDataSource` joins verbatim, so an unchecked `..` in
+/// `system.bodies` or a `BiomeMapRef` would read outside `data/`.
+/// `declared_in` names the file the bad name came from, for the
+/// diagnostic.
+fn join_authored(dir: &Path, name: &str, declared_in: &Path) -> Result<PathBuf, LoadError> {
+    if authored_name_ok(name) {
+        Ok(dir.join(name))
+    } else {
+        Err(LoadError::UnsafeName {
+            path: declared_in.to_path_buf(),
+            name: name.to_string(),
         })
     }
 }
@@ -312,23 +394,32 @@ pub fn load_system(dir: &Path) -> Result<LoadedSystem, LoadError> {
 /// embedded dataset rides this (§6.3).
 pub fn load_system_from(src: &dyn DataSource, dir: &Path) -> Result<LoadedSystem, LoadError> {
     let system_path = dir.join("system.ron");
-    let system: SystemDef = read_ron(src, &system_path)?;
-    check_version(&system_path, system.schema_version, SCHEMA_VERSION)?;
+    let system: SystemDef =
+        read_versioned_ron(src, &system_path, &[SCHEMA_VERSION], |d: &SystemDef| {
+            d.schema_version
+        })?;
 
     let mut bodies = Vec::with_capacity(system.bodies.len());
     for id in &system.bodies {
-        let body_dir = dir.join(id.as_str());
+        // Authored names become path components here — tame names only
+        // (`join_authored`); a `..`/absolute/separator-bearing id or
+        // biome ref would escape `dir` under `FsDataSource`.
+        let body_dir = join_authored(dir, id.as_str(), &system_path)?;
         let body_path = body_dir.join("body.ron");
-        let def: BodyDef = read_ron(src, &body_path)?;
-        check_version(&body_path, def.schema_version, SCHEMA_VERSION)?;
+        let def: BodyDef =
+            read_versioned_ron(src, &body_path, &[SCHEMA_VERSION], |d: &BodyDef| {
+                d.schema_version
+            })?;
 
         let biomes = match &def.biome_map {
             None => None,
             Some(r) => {
-                let legend_path = body_dir.join(&r.legend);
-                let legend: BiomeLegend = read_ron(src, &legend_path)?;
-                check_version(&legend_path, legend.schema_version, SCHEMA_VERSION)?;
-                let png_path = body_dir.join(&r.png);
+                let legend_path = join_authored(&body_dir, &r.legend, &body_path)?;
+                let legend: BiomeLegend =
+                    read_versioned_ron(src, &legend_path, &[SCHEMA_VERSION], |l: &BiomeLegend| {
+                        l.schema_version
+                    })?;
+                let png_path = join_authored(&body_dir, &r.png, &body_path)?;
                 let png = src.read_bytes(&png_path)?;
                 Some(LoadedBiomeMap { legend, png })
             }
@@ -345,11 +436,13 @@ pub fn load_balance(path: &Path) -> Result<BalanceDef, LoadError> {
     load_balance_from(&FsDataSource, path)
 }
 
-/// [`load_balance`] against an arbitrary [`DataSource`].
+/// [`load_balance`] against an arbitrary [`DataSource`]. File-shape
+/// checks only — the ~45 tunables' finiteness/range rules live in
+/// [`crate::validate::validate_balance`].
 pub fn load_balance_from(src: &dyn DataSource, path: &Path) -> Result<BalanceDef, LoadError> {
-    let balance: BalanceDef = read_ron(src, path)?;
-    check_version(path, balance.schema_version, BALANCE_SCHEMA_VERSION)?;
-    Ok(balance)
+    read_versioned_ron(src, path, &[BALANCE_SCHEMA_VERSION], |b: &BalanceDef| {
+        b.schema_version
+    })
 }
 
 /// Load `data/resources.ron` — the §3.5 resource registry. File-shape
@@ -361,9 +454,9 @@ pub fn load_resources(path: &Path) -> Result<ResourceFile, LoadError> {
 
 /// [`load_resources`] against an arbitrary [`DataSource`].
 pub fn load_resources_from(src: &dyn DataSource, path: &Path) -> Result<ResourceFile, LoadError> {
-    let resources: ResourceFile = read_ron(src, path)?;
-    check_version(path, resources.schema_version, RESOURCE_SCHEMA_VERSION)?;
-    Ok(resources)
+    read_versioned_ron(src, path, &[RESOURCE_SCHEMA_VERSION], |r: &ResourceFile| {
+        r.schema_version
+    })
 }
 
 /// Load `data/systems/<sys>/sites.ron` — the §3.5 surface-site
@@ -383,17 +476,13 @@ pub fn load_sites_from(src: &dyn DataSource, path: &Path) -> Result<SiteFile, Lo
             sites: Vec::new(),
         });
     }
-    let sites: SiteFile = read_ron(src, path)?;
     // §3.1's "current and previous with explicit defaults": v1 files
-    // lack `resource_yields`, which serde reads as the empty list.
-    if !SITE_SCHEMA_SUPPORTED.contains(&sites.schema_version) {
-        return Err(LoadError::UnsupportedSchemaVersion {
-            path: path.to_path_buf(),
-            found: sites.schema_version,
-            expected: *SITE_SCHEMA_SUPPORTED.last().unwrap_or(&1),
-        });
-    }
-    Ok(sites)
+    // lack `resource_yields`, which serde reads as the empty list —
+    // hence the band rather than the exact-match the other loaders
+    // run.
+    read_versioned_ron(src, path, &SITE_SCHEMA_SUPPORTED, |s: &SiteFile| {
+        s.schema_version
+    })
 }
 
 /// Load `data/systems/<sys>/colonies.ron` — the §3.5.1 authored-colony
@@ -414,9 +503,9 @@ pub fn load_colonies_from(src: &dyn DataSource, path: &Path) -> Result<ColonyFil
             colonies: Vec::new(),
         });
     }
-    let colonies: ColonyFile = read_ron(src, path)?;
-    check_version(path, colonies.schema_version, COLONY_SCHEMA_VERSION)?;
-    Ok(colonies)
+    read_versioned_ron(src, path, &[COLONY_SCHEMA_VERSION], |c: &ColonyFile| {
+        c.schema_version
+    })
 }
 
 /// One loaded recipe def plus its source path — the `id` ↔ stem check
@@ -472,8 +561,10 @@ pub fn load_recipes_from(src: &dyn DataSource, dir: &Path) -> Result<LoadedRecip
     let files = src.ron_files(dir)?;
     let mut recipes = Vec::with_capacity(files.len());
     for path in files {
-        let def: RecipeDef = read_ron(src, &path)?;
-        check_version(&path, def.schema_version, RECIPE_SCHEMA_VERSION)?;
+        let def: RecipeDef =
+            read_versioned_ron(src, &path, &[RECIPE_SCHEMA_VERSION], |d: &RecipeDef| {
+                d.schema_version
+            })?;
         let rel = path.strip_prefix(dir).unwrap_or(&path).to_path_buf();
         recipes.push(LoadedRecipe { def, path: rel });
     }
@@ -501,9 +592,10 @@ pub struct LoadedExperiments {
 }
 
 impl LoadedExperiments {
-    /// The defs keyed by [`ExperimentId`] — the lookup the sim and
-    /// validator actually consume. First def wins on a duplicate id;
-    /// the validator flags the duplicate loudly.
+    /// The defs keyed by [`ExperimentId`] — the lookup the sim
+    /// installs (`csp-view`/`csp-bench` world construction; the
+    /// validator iterates `experiments` directly). First def wins on
+    /// a duplicate id; the validator flags the duplicate loudly.
     pub fn by_id(&self) -> std::collections::BTreeMap<ExperimentId, &ExperimentDef> {
         let mut out = std::collections::BTreeMap::new();
         for e in &self.experiments {
@@ -536,8 +628,12 @@ pub fn load_experiments_from(
     let files = src.ron_files(dir)?;
     let mut experiments = Vec::with_capacity(files.len());
     for path in files {
-        let def: ExperimentDef = read_ron(src, &path)?;
-        check_version(&path, def.schema_version, EXPERIMENT_SCHEMA_VERSION)?;
+        let def: ExperimentDef = read_versioned_ron(
+            src,
+            &path,
+            &[EXPERIMENT_SCHEMA_VERSION],
+            |d: &ExperimentDef| d.schema_version,
+        )?;
         let rel = path.strip_prefix(dir).unwrap_or(&path).to_path_buf();
         experiments.push(LoadedExperiment { def, path: rel });
     }
@@ -600,8 +696,12 @@ pub fn load_contracts_from(src: &dyn DataSource, dir: &Path) -> Result<LoadedCon
     let files = src.ron_files(dir)?;
     let mut contracts = Vec::with_capacity(files.len());
     for path in files {
-        let def: ContractTemplate = read_ron(src, &path)?;
-        check_version(&path, def.schema_version, CONTRACT_SCHEMA_VERSION)?;
+        let def: ContractTemplate = read_versioned_ron(
+            src,
+            &path,
+            &[CONTRACT_SCHEMA_VERSION],
+            |d: &ContractTemplate| d.schema_version,
+        )?;
         let rel = path.strip_prefix(dir).unwrap_or(&path).to_path_buf();
         contracts.push(LoadedContract { def, path: rel });
     }
@@ -666,31 +766,70 @@ pub fn load_techtree_from(src: &dyn DataSource, dir: &Path) -> Result<LoadedTech
     let files = src.ron_files(dir)?;
     let mut trees = Vec::with_capacity(files.len());
     for path in files {
-        let def: TechTreeDef = read_ron(src, &path)?;
-        check_version(&path, def.schema_version, TECHTREE_SCHEMA_VERSION)?;
+        let def: TechTreeDef =
+            read_versioned_ron(src, &path, &[TECHTREE_SCHEMA_VERSION], |d: &TechTreeDef| {
+                d.schema_version
+            })?;
         let rel = path.strip_prefix(dir).unwrap_or(&path).to_path_buf();
         trees.push(LoadedTechFile { def, path: rel });
     }
     Ok(LoadedTechTree { trees })
 }
 
-/// Collect every `*.ron` under `dir` recursively, in ascending
-/// relative-path order. Deterministic by construction — the walk sorts
-/// each directory level, matching `data_set_hash`'s ordering so a
-/// reordering of `read_dir` results can never change which def a
-/// duplicate-ID diagnostic names first.
+/// Collect every `*.ron` under `dir` recursively, in `data_set_hash`'s
+/// ascending order — the path relative to `dir` with components joined
+/// by `/`, compared byte-wise ([`ron_sort_key`]). Deterministic by
+/// construction: a reordering of `read_dir` results can never change
+/// which def a duplicate-ID diagnostic names first.
 fn collect_ron_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), LoadError> {
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+    gather_ron_files(dir, out)?;
+    out.sort_by_cached_key(|p| ron_sort_key(dir, p));
+    Ok(())
+}
+
+/// The sort key `data_set_hash` effectively orders hashed files by:
+/// `path` relative to `dir`, components joined by `/`, compared
+/// byte-wise. Plain `Path` ordering is component-wise and disagrees on
+/// a prefix collision — `x/` sorts before `x.ron` component-wise but
+/// `x.ron` sorts before `x/a.ron` byte-wise (`'.' < '/'`), and a
+/// sorted-per-level DFS can never interleave a directory's contents
+/// with its file siblings anyway. `as_encoded_bytes` keeps non-UTF-8
+/// names deterministic on every platform.
+fn ron_sort_key(dir: &Path, path: &Path) -> Vec<u8> {
+    let mut key = Vec::new();
+    for (i, c) in path
+        .strip_prefix(dir)
+        .unwrap_or(path)
+        .components()
+        .enumerate()
+    {
+        if i > 0 {
+            key.push(b'/');
+        }
+        key.extend_from_slice(c.as_os_str().as_encoded_bytes());
+    }
+    key
+}
+
+/// The unsorted recursive half of [`collect_ron_files`].
+fn gather_ron_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), LoadError> {
+    let entries = std::fs::read_dir(dir)
         .map_err(|source| LoadError::Io {
             path: dir.to_path_buf(),
             source,
         })?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .collect();
-    entries.sort();
-    for path in entries {
+        // A failed directory entry is a load error, not a missing
+        // file — `filter_map`-swallowing it would silently load a
+        // partial registry.
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| LoadError::Io {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+    for entry in entries {
+        let path = entry.path();
         if path.is_dir() {
-            collect_ron_files(&path, out)?;
+            gather_ron_files(&path, out)?;
         } else if path.extension().is_some_and(|ext| ext == "ron") {
             out.push(path);
         }
@@ -703,19 +842,189 @@ fn collect_ron_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), LoadError
 /// it carries no semantics). File-shape checks only: RON parses,
 /// `schema_version` current. Semantic rules (id↔stem, category/module
 /// consistency, resource refs) are [`crate::validate::validate_parts`].
+/// A missing directory reads as an empty set — the `load_experiments`
+/// convention.
 pub fn load_parts(dir: &Path) -> Result<LoadedParts, LoadError> {
     load_parts_from(&FsDataSource, dir)
 }
 
-/// [`load_parts`] against an arbitrary [`DataSource`].
+/// [`load_parts`] against an arbitrary [`DataSource`]. A missing
+/// directory reads as an empty set — the `load_experiments` convention
+/// the other registry loaders share (previously `FsDataSource` errored
+/// here where `EmbeddedSource` returned empty — an asymmetry, not a
+/// deliberate gate).
 pub fn load_parts_from(src: &dyn DataSource, dir: &Path) -> Result<LoadedParts, LoadError> {
+    if !src.exists(dir) {
+        return Ok(LoadedParts { parts: Vec::new() });
+    }
     let files = src.ron_files(dir)?;
     let mut parts = Vec::with_capacity(files.len());
     for path in files {
-        let def: PartDef = read_ron(src, &path)?;
-        check_version(&path, def.schema_version, PART_SCHEMA_VERSION)?;
+        let def: PartDef =
+            read_versioned_ron(src, &path, &[PART_SCHEMA_VERSION], |d: &PartDef| {
+                d.schema_version
+            })?;
         let rel = path.strip_prefix(dir).unwrap_or(&path).to_path_buf();
         parts.push(LoadedPart { def, path: rel });
     }
     Ok(LoadedParts { parts })
+}
+
+/// Load `data/loc/en.ron` — the §1.2 English localization table every
+/// `LocKey` in the data set resolves against. Unlike the optional
+/// registries a missing loc file is an error (every consumer treats it
+/// as required — this loader is what they were hand-parsing before).
+/// File-shape checks only; the `schema_version` re-check and the
+/// key-resolution rules live in [`crate::validate::validate_loc`] and
+/// the `validate_*_loc_keys` family.
+pub fn load_loc(path: &Path) -> Result<crate::loc::LocFile, LoadError> {
+    load_loc_from(&FsDataSource, path)
+}
+
+/// [`load_loc`] against an arbitrary [`DataSource`].
+pub fn load_loc_from(src: &dyn DataSource, path: &Path) -> Result<crate::loc::LocFile, LoadError> {
+    read_versioned_ron(src, path, &[SCHEMA_VERSION], |l: &crate::loc::LocFile| {
+        l.schema_version
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// §3.1's order is version-first: a stale-version file that also
+    /// fails the current schema's required-field shape must report
+    /// `UnsupportedSchemaVersion`, not the missing-field `Ron` error
+    /// its out-of-date shape would produce. (The pre-prescan loader
+    /// reported exactly that misattributed shape error.)
+    #[test]
+    fn stale_version_reports_version_not_missing_field() {
+        // colonies.ron v2 gained required fields — a file declaring
+        // an unsupported version AND missing them is a version
+        // problem, not a shape problem.
+        let src = EmbeddedSource::new(&[(
+            "colonies.ron",
+            br#"(schema_version: 99, colonies: [])"# as &[u8],
+        )]);
+        let err = load_colonies_from(&src, Path::new("colonies.ron")).unwrap_err();
+        assert!(
+            matches!(err, LoadError::UnsupportedSchemaVersion { found: 99, .. }),
+            "{err:?}"
+        );
+    }
+
+    /// A file missing `schema_version` entirely has no version to
+    /// report — the positioned `Ron` missing-field error is the right
+    /// diagnostic (the probe stays out of the way).
+    #[test]
+    fn missing_version_still_reports_shape() {
+        let src = EmbeddedSource::new(&[("colonies.ron", br#"(colonies: [])"# as &[u8])]);
+        let err = load_colonies_from(&src, Path::new("colonies.ron")).unwrap_err();
+        assert!(matches!(err, LoadError::Ron { .. }), "{err:?}");
+    }
+
+    /// An authored `system.bodies` entry that is not a tame
+    /// one-segment name is refused before the join — `..` would
+    /// escape the system dir under `FsDataSource`.
+    #[test]
+    fn unsafe_manifest_names_are_rejected() {
+        for bad in ["..", "a/b", "/abs", "."] {
+            let ron: &'static [u8] = format!(
+                r#"(schema_version: 1, id: "sys", star: "s", bodies: ["{bad}"], epoch_note: "k")"#
+            )
+            .into_bytes()
+            .leak();
+            let table: &'static [(&'static str, &'static [u8])] =
+                Box::leak(Box::new([("sys/system.ron", ron)]));
+            let src = EmbeddedSource::new(table);
+            let err = load_system_from(&src, Path::new("sys")).unwrap_err();
+            assert!(
+                matches!(err, LoadError::UnsafeName { .. }),
+                "{bad:?} -> {err:?}"
+            );
+        }
+    }
+
+    /// A `BiomeMapRef` legend/png name gets the same gate — the join
+    /// is under the body dir, so `..` would escape it.
+    #[test]
+    fn unsafe_biome_refs_are_rejected() {
+        let body = r#"(schema_version: 1, id: "b", display_name: "k", parent: None,
+            radius_m: 1.0, mu_m3_per_s2: 1.0, soi_m: None, rotation_period_s: None,
+            tilt_rad: 0.0, orbit: None, atmosphere: None, ocean: None,
+            terrain: (noise_seed: 0, heightmap: None),
+            biome_map: Some((png: "../x.png", legend: "biomes.ron")),
+            surface_resources: [], insolation_w_m2: None)"#;
+        let table: &'static [(&'static str, &'static [u8])] = Box::leak(Box::new([
+            (
+                "sys/system.ron",
+                br#"(schema_version: 1, id: "sys", star: "b", bodies: ["b"], epoch_note: "k")"#
+                    as &[u8],
+            ),
+            ("sys/b/body.ron", body.as_bytes()),
+            // The legend joins (and reads) before the png — it must
+            // exist for the png gate to be reached.
+            (
+                "sys/b/biomes.ron",
+                br#"(schema_version: 1, entries: [])"# as &[u8],
+            ),
+        ]));
+        let src = EmbeddedSource::new(table);
+        let err = load_system_from(&src, Path::new("sys")).unwrap_err();
+        assert!(matches!(err, LoadError::UnsafeName { .. }), "{err:?}");
+    }
+
+    /// The `x/` vs `x.ron` prefix collision that made the old
+    /// per-level DFS order diverge from `data_set_hash`: byte-wise,
+    /// `x.ron` sorts before `x/sub.ron` (`'.' < '/'`); component-wise
+    /// `Path` order puts the directory's contents first.
+    #[test]
+    fn ron_sort_key_orders_like_data_set_hash() {
+        let dir = Path::new("data/parts");
+        let mut paths = [
+            PathBuf::from("data/parts/x/sub.ron"),
+            PathBuf::from("data/parts/x.ron"),
+            PathBuf::from("data/parts/y.ron"),
+        ];
+        paths.sort_by_cached_key(|p| ron_sort_key(dir, p));
+        assert_eq!(
+            paths,
+            [
+                PathBuf::from("data/parts/x.ron"),
+                PathBuf::from("data/parts/x/sub.ron"),
+                PathBuf::from("data/parts/y.ron"),
+            ]
+        );
+    }
+
+    /// End-to-end on the embedded source: `ron_files` emits the hash
+    /// order across the same collision (its BTreeMap key order alone
+    /// would keep `x/` first).
+    #[test]
+    fn embedded_ron_files_emit_hash_order() {
+        let src = EmbeddedSource::new(&[
+            ("data/parts/x/sub.ron", b"" as &[u8]),
+            ("data/parts/x.ron", b"" as &[u8]),
+            ("data/parts/y.ron", b"" as &[u8]),
+        ]);
+        let files = src.ron_files(Path::new("data/parts")).unwrap();
+        assert_eq!(
+            files,
+            [
+                PathBuf::from("data/parts/x.ron"),
+                PathBuf::from("data/parts/x/sub.ron"),
+                PathBuf::from("data/parts/y.ron"),
+            ]
+        );
+    }
+
+    /// A missing `data/parts` directory reads as an empty set — the
+    /// convention the four sibling registry loaders already follow.
+    #[test]
+    fn missing_parts_dir_loads_empty() {
+        let src = EmbeddedSource::new(&[]);
+        let loaded = load_parts_from(&src, Path::new("data/parts")).unwrap();
+        assert!(loaded.parts.is_empty());
+    }
 }

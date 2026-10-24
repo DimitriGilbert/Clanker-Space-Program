@@ -12,8 +12,8 @@
 use std::path::PathBuf;
 
 use csp_data::{
-    LocFile, load_parts, load_resources, load_techtree, validate_parts, validate_techtree,
-    validate_techtree_loc_keys,
+    LocFile, load_experiments, load_parts, load_recipes, load_resources, load_techtree,
+    validate_parts, validate_techtree, validate_techtree_loc_keys,
 };
 
 fn data_root() -> PathBuf {
@@ -29,7 +29,9 @@ fn shipping_techtree_is_valid_against_the_part_set() {
     let resources = load_resources(&root.join("resources.ron")).unwrap();
     // The part set itself must be clean before the tree gate means
     // anything.
-    assert!(validate_parts(&parts, &resources).is_empty());
+    let recipes = load_recipes(&root.join("recipes")).unwrap();
+    let experiments = load_experiments(&root.join("experiments")).unwrap();
+    assert!(validate_parts(&parts, &resources, &recipes, &experiments).is_empty());
     let errs = validate_techtree(&tree, &parts);
     assert!(errs.is_empty(), "techtree errors: {errs:#?}");
 }

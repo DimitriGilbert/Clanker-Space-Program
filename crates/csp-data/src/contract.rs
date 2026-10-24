@@ -59,6 +59,7 @@ pub const CONTRACT_SCHEMA_VERSION: u32 = 1;
 /// append-only, never reordered.
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ContractKind {
     /// A vessel reaches a matching orbit — the satellite contract.
     SatellitePlacement = 0,
@@ -83,6 +84,7 @@ impl csp_core::StableDiscriminant for ContractKind {
 
 /// `data/contracts/<id>.ron` — one contract template (§3.6).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContractTemplate {
     /// First field of every data file (§3.1). Must equal
     /// [`CONTRACT_SCHEMA_VERSION`].
@@ -119,6 +121,7 @@ pub struct ContractTemplate {
 /// weight plus the per-kind candidate sets the concrete
 /// [`ContractParams`] draw from, in the documented draw order.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContractGenerator {
     /// Weighted-pick share (validator: finite, `> 0`). A template with
     /// weight `w` among eligible templates totaling `W` draws with
@@ -133,6 +136,7 @@ pub struct ContractGenerator {
 /// is the field order written here — the KDF stream's fixed arity
 /// (§2.6.1: a stored `offer_index` reproduces the exact draw).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ContractParamSpace {
     /// `SatellitePlacement`: draw `body` from `bodies`, then the
     /// orbit's periapsis altitude and apoapsis altitude, each uniform
@@ -141,8 +145,11 @@ pub enum ContractParamSpace {
     /// drawn apoapsis cap lands under the drawn periapsis floor the
     /// sim orders the pair, so the published
     /// `[min_periapsis, max_apoapsis]` window is never empty and the
-    /// offer stays satisfiable. Altitudes are above the body's datum
-    /// radius.
+    /// offer stays satisfiable. A *fully* inverted space is not legal:
+    /// the validator rejects `apoapsis_alt_m.1 < periapsis_alt_m.0`,
+    /// where every draw would come out of the swap and the authored
+    /// bands would carry none of their stated meaning. Altitudes are
+    /// above the body's datum radius.
     SatellitePlacement {
         /// Candidate bodies — non-empty.
         bodies: Vec<BodyId>,
@@ -191,6 +198,7 @@ pub enum ContractParamSpace {
 /// The regime a [`ContractKind::PartTest`] offer demands — the
 /// generation-space form (with candidate bodies and draw ranges).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum RegimeSpace {
     /// A bound orbit at a drawn body with periapsis altitude ≥ the
     /// drawn minimum.
@@ -214,6 +222,7 @@ pub enum RegimeSpace {
 /// Discriminants append-only.
 #[repr(u16)]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ModuleReq {
     /// A part with a `Lab` module.
     Lab = 0,
@@ -232,6 +241,7 @@ pub enum ModuleReq {
 /// A concrete generated regime — the sim-state form of
 /// [`RegimeSpace`] after the draw.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ContractRegime {
     /// Bound orbit at `body`, periapsis altitude ≥ `min_alt_m` above
     /// the body's datum.
@@ -251,6 +261,7 @@ pub enum ContractRegime {
 /// The concrete parameters an offer carries — what the completion
 /// predicate is evaluated against. Discriminants append-only.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ContractParams {
     /// `SatellitePlacement`: a bound orbit at `body` with
     /// `min_periapsis_alt_m ≤ r_p − radius` and
@@ -323,6 +334,7 @@ impl ContractParams {
 /// §3.6's fact-based prerequisite — one predicate over serialized
 /// program facts (module doc). All listed entries must hold.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ContractPrereq {
     /// A tech-tree node is researched (`TechState::researched`).
     TechResearched(TechNodeId),
@@ -347,6 +359,7 @@ pub enum ContractPrereq {
 /// funds (the sim converts to micros at apply, the `to_micros`
 /// boundary).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContractRewards {
     /// Paid on `AcceptContract` — §3.5's advance.
     pub advance_funds: f64,

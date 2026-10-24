@@ -136,8 +136,10 @@ use crate::{EventKind, TickShadow, World};
 
 /// The `ResourceId` spelling of charge — `resources.ron`'s
 /// `electric_charge`. Power is a resource (module doc rule 1); every
-/// place the network treats EC specially keys on this id.
-pub const ELECTRIC_CHARGE: &str = "electric_charge";
+/// place the network treats EC specially keys on this id. The
+/// canonical spelling lives in `csp_data::resource` — the colony
+/// validator's one-EC-draw check keys on the same constant.
+pub const ELECTRIC_CHARGE: &str = csp_data::resource::ELECTRIC_CHARGE;
 
 /// Stefan–Boltzmann σ, W/(m²·K⁴) — the §3.5.1 rule-2 solve constant.
 const STEFAN_BOLTZMANN: f64 = 5.670374419e-8;

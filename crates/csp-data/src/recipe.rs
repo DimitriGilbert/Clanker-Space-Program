@@ -31,6 +31,7 @@ pub const RECIPE_SCHEMA_VERSION: u32 = 1;
 
 /// `data/recipes/<id>.ron` — one converter recipe (§3.5.1).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecipeDef {
     /// First field of every data file (§3.1). Must equal
     /// [`RECIPE_SCHEMA_VERSION`].

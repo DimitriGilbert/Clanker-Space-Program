@@ -29,6 +29,7 @@ pub const EXPERIMENT_SCHEMA_VERSION: u32 = 1;
 /// units) for `body` in each of `situations`. Entries must not overlap
 /// on a `(body, situation)` pair — the validator rejects ambiguity.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExperimentCap {
     /// The body this cap applies to.
     pub body: BodyId,
@@ -41,6 +42,7 @@ pub struct ExperimentCap {
 
 /// `data/experiments/<id>.ron` — one experiment kind (§3.2).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExperimentDef {
     /// First field of every data file (§3.1). Must equal
     /// [`EXPERIMENT_SCHEMA_VERSION`].

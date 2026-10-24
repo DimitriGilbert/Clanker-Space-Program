@@ -80,9 +80,9 @@ pub fn contract_world(root: &Path, seed: u64) -> Result<World, ReplayError> {
     world.set_experiments(
         csp_data::load_experiments(&root.join("experiments"))
             .map_err(ReplayError::Load)?
-            .experiments
-            .iter()
-            .map(|e| (e.def.id.clone(), e.def.clone()))
+            .by_id()
+            .into_iter()
+            .map(|(id, def)| (id, def.clone()))
             .collect(),
     );
     world.set_tech_tree(

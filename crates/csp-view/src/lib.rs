@@ -642,9 +642,9 @@ impl View {
         let experiments = csp_data::load_experiments_from(src, &root.join("experiments"))?;
         sim.set_experiments(
             experiments
-                .experiments
-                .iter()
-                .map(|e| (e.def.id.clone(), e.def.clone()))
+                .by_id()
+                .into_iter()
+                .map(|(id, def)| (id, def.clone()))
                 .collect(),
         );
         // M7-B §3.3: the merged tech tree — same data-derived wiring;

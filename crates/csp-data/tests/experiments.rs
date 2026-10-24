@@ -29,8 +29,22 @@ fn authored_experiments_load_and_validate_green() {
         !loaded.experiments.is_empty(),
         "data/experiments/ must seed at least one experiment"
     );
-    let errs = csp_data::validate_experiments(&loaded);
+    let sys = csp_data::load_system(&repo_root().join("data/systems/home")).unwrap();
+    let errs = csp_data::validate_experiments(&loaded, &sys);
     assert!(errs.is_empty(), "validator errors: {errs:#?}");
+}
+
+/// Every experiment `display_name` LocKey resolves in
+/// `data/loc/en.ron` — the `validate_experiment_loc_keys` gate (the
+/// seeded `exp.materials_study.name` was a live broken datum before
+/// the validator existed).
+#[test]
+fn experiment_loc_keys_resolve() {
+    let loaded = csp_data::load_experiments(&repo_root().join("data/experiments")).unwrap();
+    let text = std::fs::read_to_string(repo_root().join("data/loc/en.ron")).unwrap();
+    let loc: csp_data::LocFile = ron::de::from_str(&text).unwrap();
+    let errs = csp_data::validate_experiment_loc_keys(&loaded, &loc);
+    assert!(errs.is_empty(), "unresolved loc keys: {errs:#?}");
 }
 
 /// The seeded def answers `cap_for` coherently — the sim's yield path

@@ -73,6 +73,7 @@ pub const TECHTREE_SCHEMA_VERSION: u32 = 1;
 /// tree (see the module doc). Identity rules live on the merged set:
 /// the fragment carries no id of its own.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TechTreeDef {
     /// First field of every data file (§3.1). Must equal
     /// [`TECHTREE_SCHEMA_VERSION`].
@@ -89,6 +90,7 @@ pub struct TechTreeDef {
 /// so an empty `requires` is a root and every chain terminates at
 /// one).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TechNode {
     /// Stable node id (`tech.rocketry.2`). Part defs name it through
     /// `PartDef::tech_requirement`.
@@ -115,6 +117,7 @@ pub struct TechNode {
 /// `PartDef::tech_requirement`, which the validator checks against the
 /// tree as the "every part reachable" rule).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TechUnlocks {
     /// `(track, cap)` grants — researching the node raises the
     /// purchasable level cap on `track` to `cap` (max over every
@@ -133,6 +136,7 @@ pub struct TechUnlocks {
 /// One purchasable rung of an [`UpgradeTrack`] — §3.3's
 /// `{ science_cost, multiplier_or_delta }` verbatim.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpgradeLevel {
     /// Science points the `ResearchUpgradeLevel` command spends to buy
     /// exactly this rung (validator: finite, ≥ 0).
@@ -147,6 +151,7 @@ pub struct UpgradeLevel {
 /// (`(base + ΣΔ)/base`), then the product of multipliers — see the
 /// module doc's composition note.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum UpgradeEffect {
     /// Multiplicative factor — folds by product
     /// (`stat · Π multipliers`). Must be finite and `> 0` (validator).
@@ -168,6 +173,7 @@ pub enum UpgradeEffect {
 /// identifies a track unambiguously (two tracks folding onto the same
 /// stat of the same family would be redundant authored surface).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpgradeTrack {
     /// Stable track id (`csp.track.engine.launch.isp`) — node grants
     /// and the `ResearchUpgradeLevel` command name it.
@@ -193,6 +199,7 @@ pub struct UpgradeTrack {
 /// (deterministic); lookup helpers are plain scans — the v1 tree is
 /// tens of nodes, not thousands.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TechTree {
     /// Every fragment's nodes, concatenated in file order.
     pub nodes: Vec<TechNode>,

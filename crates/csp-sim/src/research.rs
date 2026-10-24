@@ -105,7 +105,8 @@ use crate::{TickShadow, Vessel, VesselId, VesselState, World};
 /// The ElectricCharge resource a transmission drains (§3.2). The
 /// resource *name* is the resources.ron id — authored data could
 /// rename it, in which case transmits simply find no charge aboard.
-pub const ELECTRIC_CHARGE: &str = "electric_charge";
+/// The canonical spelling lives in `csp_data::resource`.
+pub const ELECTRIC_CHARGE: &str = csp_data::resource::ELECTRIC_CHARGE;
 
 /// §2.2 sim-side research-project identity — monotonic `u64`, never
 /// reused (`next_id` is serialized per §7.2). What a project's

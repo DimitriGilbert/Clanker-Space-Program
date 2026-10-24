@@ -43,6 +43,10 @@ bevy_ecs = { workspace = true, features = ["std", "multi_threaded", "async_execu
 # normal,build edges.
 pollster = { workspace = true }
 wgpu = { workspace = true }
+# tests/demo.rs — parse the demo's embedded en.ron into csp_data::LocFile
+# for the loc-key validation gates (same dependency the csp-data
+# integration tests declare for the same purpose).
+ron = { workspace = true }
 
 [lints]
 workspace = true

@@ -208,6 +208,20 @@ pub enum ReplayError {
     /// A recipe's `initial` failed to load its fixture data (§8.3's
     /// frozen input).
     Load(csp_data::LoadError),
+    /// A symlink sits inside the fixture dir — the hash walks the
+    /// committed file tree only; a link's target could change outside
+    /// it. Mirrors `csp_data::DataHashError::Symlink`.
+    Symlink {
+        /// The link.
+        path: PathBuf,
+    },
+    /// A fixture file name is not UTF-8 — the hash keys files by path
+    /// bytes, and a lossy conversion could collide two distinct names.
+    /// Mirrors `csp_data::DataHashError::NonUtf8Name`.
+    NonUtf8Name {
+        /// The file.
+        path: PathBuf,
+    },
     /// A golden file exists but is not in the documented format.
     MalformedGolden(&'static str),
     /// A log entry is stamped at a tick the restored clock has already
@@ -281,6 +295,12 @@ impl fmt::Display for ReplayError {
             Self::Json(e) => write!(f, "fingerprint.json: {e}"),
             Self::Sim(e) => write!(f, "sim: {e}"),
             Self::Load(e) => write!(f, "fixture data: {e}"),
+            Self::Symlink { path } => {
+                write!(f, "symlink in the fixture dir at {}", path.display())
+            }
+            Self::NonUtf8Name { path } => {
+                write!(f, "non-UTF-8 file name at {}", path.display())
+            }
             Self::MalformedGolden(r) => write!(f, "malformed golden: {r}"),
             Self::StampBehindClock { tick, clock } => write!(
                 f,
@@ -443,34 +463,52 @@ pub fn fingerprint_warnings(recorded: &Fingerprint, current_fixture_hash: [u8; 3
 }
 
 /// §3.1's data-set hash applied to a frozen fixture dir (§8.3): BLAKE3-256
-/// over `path_bytes || 0x00 || canonicalized_file_bytes` for every file, in
-/// ascending path order. Canonicalization mirrors §3.1 — LF line endings,
-/// trailing whitespace stripped — for UTF-8 files; a non-UTF-8 file hashes
-/// raw (its bytes are already canonical — the scheme is defined for text
-/// data, and fixture sets are text).
+/// over `path_bytes || 0x00 || u64-LE len || canonicalized_file_bytes`
+/// for every file, in ascending path order — the length prefix keeps the
+/// frame injective (the retired `path || 0x00 || content` framing was
+/// not; see `csp_data::datahash`). Canonicalization mirrors §3.1 — LF
+/// line endings, trailing whitespace stripped — for UTF-8 files; a
+/// non-UTF-8 file hashes raw (its bytes are already canonical — the
+/// scheme is defined for text data, and fixture sets are text).
 ///
 /// Golden artifact files (`replay.bin`, `expected-hash.txt`,
 /// `fingerprint.json`) are outputs of recording, not
 /// inputs, and are excluded — including them would be self-referential.
-/// Changing this scheme bumps `csp_data::DATA_HASH_VERSION`.
+/// Changing this scheme bumps `csp_data::DATA_HASH_VERSION` (v2: the
+/// length-prefix above — keep this implementation byte-identical to
+/// `csp_data::datahash::data_set_hash`).
 pub fn fixture_hash(dir: &Path) -> Result<[u8; 32], ReplayError> {
     let mut h = blake3::Hasher::new();
     for rel in fixture_files(dir)? {
         let bytes = read_file(&dir.join(&rel))?;
-        h.update(rel.as_bytes());
-        h.update(&[0]);
-        h.update(&canonicalize(&bytes));
+        feed_file(&mut h, &rel, &canonicalize(&bytes));
     }
     Ok(*h.finalize().as_bytes())
 }
 
+/// One file's contribution to the §3.1 stream — byte-identical to
+/// `csp_data::datahash`'s per-file frame: `path || 0x00 || u64-LE len ||
+/// content`.
+fn feed_file(h: &mut blake3::Hasher, rel: &str, content: &[u8]) {
+    h.update(rel.as_bytes());
+    h.update(&[0]);
+    h.update(&(content.len() as u64).to_le_bytes());
+    h.update(content);
+}
+
 /// Every non-artifact file under `dir` as a sorted list of `/`-separated
 /// relative paths — ascending path order per §3.1, independent of the
-/// filesystem's own enumeration order.
+/// filesystem's own enumeration order. The walk mirrors
+/// `csp_data::datahash`'s `collect` entry-for-entry: `file_type()` is
+/// queried *without* following symlinks (a link is refused, not
+/// traversed — `path.is_dir()` would follow it into a cycle or out of
+/// the hashed tree) and file names must be UTF-8, because the hash
+/// stream keys entries by their relative-path bytes and a lossy
+/// conversion could collide two distinct names.
 fn fixture_files(dir: &Path) -> Result<Vec<String>, ReplayError> {
     let mut out = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
+    let mut stack = vec![(dir.to_path_buf(), String::new())];
+    while let Some((d, prefix)) = stack.pop() {
         let entries = std::fs::read_dir(&d).map_err(|source| ReplayError::Io {
             path: d.clone(),
             source,
@@ -480,24 +518,30 @@ fn fixture_files(dir: &Path) -> Result<Vec<String>, ReplayError> {
                 path: d.clone(),
                 source,
             })?;
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
+            let ft = entry.file_type().map_err(|source| ReplayError::Io {
+                path: entry.path(),
+                source,
+            })?;
+            if ft.is_symlink() {
+                return Err(ReplayError::Symlink { path: entry.path() });
+            }
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| ReplayError::NonUtf8Name { path: entry.path() })?;
+            let rel = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if ft.is_dir() {
+                stack.push((entry.path(), rel));
                 continue;
             }
-            if ARTIFACT_FILES
-                .iter()
-                .any(|&n| path.file_name().is_some_and(|f| f == n))
-            {
+            // Golden artifacts are recording outputs, not fixture data.
+            if ARTIFACT_FILES.contains(&name.as_str()) {
                 continue;
             }
-            let rel = path
-                .strip_prefix(dir)
-                .map_err(|_| ReplayError::MalformedGolden("fixture file outside its dir"))?
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join("/");
             out.push(rel);
         }
     }
@@ -1286,6 +1330,65 @@ mod tests {
             }
         }
         assert_eq!(a, fixture_hash(&tmp.0).unwrap());
+    }
+
+    /// The fixture walk is a byte-identical mirror of
+    /// `csp_data::datahash`'s walk on their overlapping scope: a plain
+    /// file tree (no `test-fixtures/` dir, no `art/` exclusions, no
+    /// artifact files) must produce the same §3.1 hash from both
+    /// functions, and nested paths must join identically.
+    #[test]
+    fn fixture_walk_mirrors_data_set_hash() {
+        let tmp = TempDir::new("fixture-mirror");
+        std::fs::write(tmp.0.join("a.ron"), b"one  \n\ntwo\r\n").unwrap();
+        std::fs::create_dir(tmp.0.join("sub")).unwrap();
+        std::fs::write(tmp.0.join("sub").join("b.ron"), b"three").unwrap();
+        assert_eq!(
+            fixture_hash(&tmp.0).unwrap(),
+            csp_data::data_set_hash(&tmp.0).unwrap()
+        );
+    }
+
+    /// A symlink inside the fixture dir is a named error, never
+    /// followed: the walk hashes the committed tree only — the same
+    /// refusal `csp_data::datahash` applies to `data/`.
+    #[cfg(unix)]
+    #[test]
+    fn fixture_walk_refuses_symlinks() {
+        let tmp = TempDir::new("fixture-symlink");
+        std::fs::write(tmp.0.join("real.ron"), b"data").unwrap();
+        std::os::unix::fs::symlink(tmp.0.join("real.ron"), tmp.0.join("link.ron")).unwrap();
+        assert!(matches!(
+            fixture_hash(&tmp.0),
+            Err(ReplayError::Symlink { .. })
+        ));
+        assert!(matches!(
+            csp_data::data_set_hash(&tmp.0),
+            Err(csp_data::DataHashError::Symlink { .. })
+        ));
+    }
+
+    /// A non-UTF-8 file name has no honest path-bytes key: refused by
+    /// name in both walks rather than mangled through a lossy
+    /// conversion that could collide two distinct names.
+    #[cfg(unix)]
+    #[test]
+    fn fixture_walk_refuses_non_utf8_names() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let tmp = TempDir::new("fixture-nonutf8");
+        std::fs::write(
+            tmp.0.join(std::ffi::OsStr::from_bytes(b"bad-\xFF.ron")),
+            b"data",
+        )
+        .unwrap();
+        assert!(matches!(
+            fixture_hash(&tmp.0),
+            Err(ReplayError::NonUtf8Name { .. })
+        ));
+        assert!(matches!(
+            csp_data::data_set_hash(&tmp.0),
+            Err(csp_data::DataHashError::NonUtf8Name { .. })
+        ));
     }
 
     /// `SourceClass` ordering is exercised by the trivial log: the tick-500

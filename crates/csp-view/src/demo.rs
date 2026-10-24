@@ -57,6 +57,10 @@ static FILES: &[(&str, &[u8])] = &[
         include_bytes!("../../../apps/demo/data/resources.ron"),
     ),
     (
+        "data/loc/en.ron",
+        include_bytes!("../../../apps/demo/data/loc/en.ron"),
+    ),
+    (
         "data/systems/home/system.ron",
         include_bytes!("../../../apps/demo/data/systems/home/system.ron"),
     ),

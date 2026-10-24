@@ -37,20 +37,27 @@ fn demo_dataset_loads_and_validates() {
     let contracts = csp_data::load_contracts_from(&s, &r.join("contracts")).unwrap();
     let recipes = csp_data::load_recipes_from(&s, &r.join("recipes")).unwrap();
     let colonies = csp_data::load_colonies_from(&s, &r.join("systems/home/colonies.ron")).unwrap();
-    let _balance = csp_data::load_balance_from(&s, &r.join("balance.ron")).unwrap();
+    let balance = csp_data::load_balance_from(&s, &r.join("balance.ron")).unwrap();
 
-    let cases: [(&str, Vec<csp_data::ValidationError>); 8] = [
+    let cases: [(&str, Vec<csp_data::ValidationError>); 9] = [
         ("system", csp_data::validate_system(&sys)),
         ("resources", csp_data::validate_resources(&res)),
-        ("parts", csp_data::validate_parts(&parts, &res)),
+        (
+            "parts",
+            csp_data::validate_parts(&parts, &res, &recipes, &experiments),
+        ),
         ("sites", csp_data::validate_sites(&sites, &sys, &res)),
-        ("experiments", csp_data::validate_experiments(&experiments)),
+        (
+            "experiments",
+            csp_data::validate_experiments(&experiments, &sys),
+        ),
         ("techtree", csp_data::validate_techtree(&techtree, &parts)),
         (
             "contracts",
             csp_data::validate_contracts(&contracts, &sys, &experiments, &techtree, &res),
         ),
         ("recipes", csp_data::validate_recipes(&recipes, &res)),
+        ("balance", csp_data::validate_balance(&balance, &res)),
     ];
     for (name, errors) in cases {
         assert!(errors.is_empty(), "demo set: {name} invalid: {errors:?}");
@@ -59,6 +66,38 @@ fn demo_dataset_loads_and_validates() {
         csp_data::validate_colonies(&colonies, &sites, &res, &recipes).is_empty(),
         "demo set: colonies invalid"
     );
+
+    // The demo ships its own reduced loc table — every LocKey the
+    // embedded set references must resolve in it (same gate family
+    // the desktop tests run against data/loc/en.ron).
+    let loc = csp_data::load_loc_from(&s, &r.join("loc/en.ron")).unwrap();
+    assert!(
+        csp_data::validate_loc(&loc).is_empty(),
+        "demo set: loc/en.ron invalid"
+    );
+    let loc_cases: [(&str, Vec<csp_data::ValidationError>); 6] = [
+        ("system loc", csp_data::validate_loc_keys(&sys, &loc)),
+        ("site loc", csp_data::validate_site_loc_keys(&sites, &loc)),
+        (
+            "part loc",
+            csp_data::validate_part_loc_keys(&parts, &res, &loc),
+        ),
+        (
+            "experiment loc",
+            csp_data::validate_experiment_loc_keys(&experiments, &loc),
+        ),
+        (
+            "techtree loc",
+            csp_data::validate_techtree_loc_keys(&techtree, &loc),
+        ),
+        (
+            "contract loc",
+            csp_data::validate_contract_loc_keys(&contracts, &loc),
+        ),
+    ];
+    for (name, errors) in loc_cases {
+        assert!(errors.is_empty(), "demo set: {name} invalid: {errors:?}");
+    }
 }
 
 /// §6.3's "Terrin only" — the demo system's manifest carries exactly

@@ -18,12 +18,24 @@ use crate::ids::{LocKey, ResourceId};
 /// its own namespace, like `balance.ron` (§3.1 first-field convention).
 pub const RESOURCE_SCHEMA_VERSION: u32 = 1;
 
+/// The canonical `resources.ron` id for electric charge. Power is a
+/// resource like any other, but several rules name it literally — the
+/// colony validator's one-EC-draw check (`validate::check_power_collision`,
+/// which keeps a recipe/consumes `electric_charge` row from colliding
+/// with a module's `power_ec_per_s`) and the sim's `ELECTRIC_CHARGE`
+/// lookups — so the spelling is pinned here, one source of truth.
+/// Renaming the resource in `resources.ron` is a data+code change by
+/// design (the sim's transmits would find no charge aboard a renamed
+/// resource — see `csp_sim::research`'s note).
+pub const ELECTRIC_CHARGE: &str = "electric_charge";
+
 /// One resource type: identity, display name, and the mass of one
 /// unit. `mass_per_unit_kg` is the only physical datum the sim needs —
 /// a `Tank`'s wet mass is `Σ units·mass_per_unit_kg`, and
 /// `ElectricCharge` legitimately authors `0.0` (charge is massless; the
 /// validator allows exactly `>= 0` here rather than `> 0`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResourceDef {
     /// Stable resource ID (`"liquid_fuel"` — matched case-insensitively
     /// nowhere; IDs are strings and must be spelled identically in
@@ -40,6 +52,7 @@ pub struct ResourceDef {
 /// checks every `ResourceId` a part references (build materials, tank
 /// capacities, engine propellants, drill outputs) against this table.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResourceFile {
     /// First field of every data file (§3.1). Must equal
     /// [`RESOURCE_SCHEMA_VERSION`].
