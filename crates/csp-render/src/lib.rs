@@ -72,6 +72,10 @@ pub struct Gpu {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
+    /// Warn-once latches for `begin_frame`'s degraded acquire outcomes
+    /// (`Cell` — `begin_frame` takes `&self`). Bit 0: skip-class
+    /// (Timeout/Occluded), bit 1: Validation.
+    surface_warned: std::cell::Cell<u8>,
 }
 
 impl Gpu {
@@ -140,6 +144,7 @@ impl Gpu {
             device,
             queue,
             config,
+            surface_warned: std::cell::Cell::new(0),
         })
     }
 
@@ -155,6 +160,17 @@ impl Gpu {
         self.config.format
     }
 
+    /// Log a degraded acquire outcome once per class — the flags make
+    /// a persistent fault (a wedged swapchain, a recurring validation
+    /// error) a single line instead of per-frame spam.
+    fn warn_surface_once(&self, bit: u8, msg: &str) {
+        let flags = self.surface_warned.get();
+        if flags & bit == 0 {
+            self.surface_warned.set(flags | bit);
+            log::warn!("surface: {msg}");
+        }
+    }
+
     /// Acquire the next surface texture and an encoder for it.
     pub fn begin_frame(&self) -> FrameResult {
         let texture = match self.surface.get_current_texture() {
@@ -163,8 +179,30 @@ impl Gpu {
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 return FrameResult::Reconfigure;
             }
-            // Timeout / Occluded / Validation — nothing to draw into.
-            _ => return FrameResult::Skip,
+            wgpu::CurrentSurfaceTexture::Validation => {
+                // A validation error is a real fault, not a transient
+                // state — report it and ask the caller to reconfigure,
+                // which is the only available recovery attempt.
+                self.warn_surface_once(
+                    0b10,
+                    "validation error in get_current_texture — reconfiguring",
+                );
+                return FrameResult::Reconfigure;
+            }
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                self.warn_surface_once(
+                    0b01,
+                    "timed out acquiring a frame — skipping until it recovers",
+                );
+                return FrameResult::Skip;
+            }
+            wgpu::CurrentSurfaceTexture::Occluded => {
+                self.warn_surface_once(
+                    0b01,
+                    "surface occluded — skipping frames until it is visible again",
+                );
+                return FrameResult::Skip;
+            }
         };
         let view = texture
             .texture
@@ -190,9 +228,12 @@ impl Gpu {
 /// Result of [`Gpu::begin_frame`].
 pub enum FrameResult {
     Ok(Box<Frame>),
-    /// Surface lost/outdated — call [`Gpu::resize`] with current size, skip the frame.
+    /// Surface lost/outdated — or an acquire-time validation error,
+    /// which the same reconfigure is the only recovery for. Call
+    /// [`Gpu::resize`] with current size, skip the frame.
     Reconfigure,
-    /// Nothing renderable this frame (timeout, occluded, validation error).
+    /// Nothing renderable this frame (timeout, occluded) — transient;
+    /// retry next frame.
     Skip,
 }
 

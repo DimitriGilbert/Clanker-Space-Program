@@ -18,7 +18,8 @@ struct U {
     sun_dir: vec4<f32>,       // unit sun direction, body frame
     planet: vec4<f32>,        // x datum R, y atm_top (0 = vacuum), z ocean_r, w amplitude
     atmo: vec4<f32>,          // x scale_height, y has_biome, z/w unused
-    misc: vec4<f32>,          // x tan(fov_y/2)·aspect, y tan(fov_y/2)
+    misc: vec4<f32>,          // x tan(fov_y/2)·aspect, y tan(fov_y/2),
+                              // z/w fs_sky shell constants |pa|²−r² (CPU f64 bake)
     spin: vec4<f32>,          // xyz unit spin axis, w phase ω·t (inertial → fixed)
     rayleigh: vec4<f32>,      // Rayleigh β rgb (1/m)
     biome_colors: array<vec4<f32>, 16>,
@@ -71,13 +72,18 @@ fn rot_axis(axis: vec3<f32>, angle: f32, v: vec3<f32>) -> vec3<f32> {
 }
 
 // --- transmittance LUT: T(h, μ) manual bilinear (clamped both axes).
+// The bake is *endpoint*-centered (bake_transmittance: col/(W−1),
+// row/(H−1)), so the texel coordinate is `·(d − 1)` — NOT the
+// texel-center `·d − 0.5` convention `height_at` uses (the heightfield
+// bakes at (i+0.5)/w). The two conventions must not be shared: mixing
+// them costs up to half a texel of systematic bias per axis.
 fn trans(h: f32, mu: f32) -> vec3<f32> {
     if (u.planet.y <= 0.0) {
         return vec3<f32>(1.0, 1.0, 1.0);
     }
     let d = vec2<i32>(textureDimensions(tlut));
-    let uu = (mu * 0.5 + 0.5) * f32(d.x) - 0.5;
-    let vv = clamp(h / u.planet.y, 0.0, 1.0) * f32(d.y) - 0.5;
+    let uu = (mu * 0.5 + 0.5) * f32(d.x - 1);
+    let vv = clamp(h / u.planet.y, 0.0, 1.0) * f32(d.y - 1);
     let i0 = i32(floor(uu));
     let j0 = i32(floor(vv));
     let fu = uu - f32(i0);
@@ -343,9 +349,13 @@ fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
         return vec4<f32>(space, 1.0);
     }
 
-    let r_top = R + u.planet.y;
+    // Ray/shell quadratic |pa + t·rd|² = r² ⇒ t² + 2b·t + c = 0,
+    // disc = b² − c. The constant `c = |pa|² − r²` cancels two
+    // ~1e11-magnitude terms at planetary radii — computing it in f32
+    // would cost ~1e5 m² of absolute error (a ±300 m wobble on the
+    // limb), so it arrives pre-baked from the CPU in f64 (u.misc.z/w).
     let b = dot(pa, rd);
-    let disc_top = b * b - (dot(pa, pa) - r_top * r_top);
+    let disc_top = b * b - u.misc.z;
     if (disc_top <= 0.0) {
         // The ray misses the top shell entirely — nothing crosses the
         // atmosphere, so the space backdrop arrives unattenuated (the
@@ -356,7 +366,7 @@ fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
     var t0 = max(-b - sq, 0.0);
     var t1 = -b + sq;
     // Datum strike — the shell march stops where the ray grounds out.
-    let disc_g = b * b - (dot(pa, pa) - R * R);
+    let disc_g = b * b - u.misc.w;
     var hit_ground = false;
     if (disc_g > 0.0) {
         let tg = -b - sqrt(disc_g);

@@ -684,12 +684,17 @@ impl App {
             self.warp.multiplier(),
             self.fatal,
         );
-        // The map camera's projection needs the live framebuffer size.
+        // The cameras' projections need the live framebuffer size —
+        // re-fed every frame from `gpu.config` so a `Resized` swallowed
+        // by the deferred wasm GPU init (or a backend that never sends
+        // one) can't wedge an aspect.
         if let Some(gpu) = &self.gpu {
             self.view
                 .set_map_viewport(f64::from(gpu.config.width), f64::from(gpu.config.height));
             self.view
                 .set_vab_viewport(f64::from(gpu.config.width), f64::from(gpu.config.height));
+            self.view
+                .set_flight_viewport(f64::from(gpu.config.width), f64::from(gpu.config.height));
         }
 
         // §2.5 order: Input → SimStep → Sync → Presentation → UiBuild →
@@ -953,11 +958,14 @@ impl App {
         let mut frame = match gpu.begin_frame() {
             csp_render::FrameResult::Ok(f) => f,
             csp_render::FrameResult::Reconfigure => {
-                // Surface lost (e.g. resize race) — reconfigure and skip.
+                // Surface lost/outdated (e.g. resize race) or an
+                // acquire-time validation error — reconfigure and
+                // skip; `begin_frame` already logged the cause once.
                 let (w, h) = (gpu.config.width, gpu.config.height);
                 gpu.resize(w, h);
                 return;
             }
+            // Transient (timeout/occluded) — `begin_frame` warned once.
             csp_render::FrameResult::Skip => return,
         };
 
@@ -1245,14 +1253,21 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(size) => {
                 // Track the live size into settings — persisted on
                 // Apply/close, restored at the next `init_graphics`.
-                self.settings.graphics.window_size = [size.width, size.height];
+                // Minimized/hidden windows can report a zero dimension:
+                // skip those so a transient collapse isn't persisted as
+                // a 1-px window next launch.
+                if size.width > 0 && size.height > 0 {
+                    self.settings.graphics.window_size = [size.width, size.height];
+                }
                 if let Some(gpu) = &mut self.gpu {
                     gpu.resize(size.width, size.height);
                 }
+                // The renderer resize stays here (its target must match
+                // the surface), but the *view* viewport is re-fed per
+                // frame in `run_frame` — an event that lands before
+                // `finish_gpu_init` no longer loses the aspect.
                 if let (Some(g), Some(f)) = (&self.gpu, &mut self.flight_renderer) {
                     f.resize(&g.device, size.width, size.height);
-                    self.view
-                        .set_flight_viewport(size.width as f64, size.height as f64);
                 }
                 if let (Some(g), Some(v)) = (&self.gpu, &mut self.vab_renderer) {
                     v.resize(&g.device, size.width, size.height);

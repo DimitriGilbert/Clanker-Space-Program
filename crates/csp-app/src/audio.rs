@@ -413,8 +413,9 @@ impl AudioBackend {
         }
 
         // Continuous voices: amplitude follows the focused vessel —
-        // same `vessels.first()` focus convention `flight_present` uses.
-        let focus = snap.vessels.first();
+        // same `vessels.last()` (newest spawn) focus convention
+        // `flight_present`'s `focus_vessel` uses.
+        let focus = snap.vessels.last();
         let engine_target = focus.map_or(0.0, |v| v.throttle.clamp(0.0, 1.0) as f32);
         let plasma_target = focus.map_or(0.0, |v| {
             ((v.plasma_w_m2 - PLASMA_ONSET_W_M2) / (PLASMA_FULL_W_M2 - PLASMA_ONSET_W_M2))

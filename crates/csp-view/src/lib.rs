@@ -818,11 +818,18 @@ impl View {
         // M4c flight resources (see flight.rs): chase camera + the
         // staged InBubble craft mirrors.
         world.insert_resource(flight::FlightInput::default());
+        // Separate from `map::MapCameraF64` — the two `*_present`
+        // systems share one unordered tuple, so a shared resource
+        // would be a last-writer-wins race.
+        world.insert_resource(flight::FlightCameraF64::default());
         world.insert_resource(flight::FlightInputEvents::default());
         world.insert_resource(flight::FlightSyncInput::default());
         world.insert_resource(flight::FlightSnapshot::default());
         world.insert_resource(flight::FlightUiData::default());
         world.insert_resource(flight::FlightFrame::default());
+        // §2.6.4: the latched-vessel weld cache — the staging path's
+        // session state, so a parked craft isn't re-welded per frame.
+        world.insert_resource(flight::LatchedWeldCache::default());
         // R2 surface resources (see terrain.rs): empty config ⇒
         // per-body params synthesised from the body id; `View::new`
         // installs the authored table over it.
@@ -953,9 +960,14 @@ impl View {
         self.world
             .insert_resource(map::capture_sync_input(&self.sim));
         // M4c: the flight view's InBubble craft mirrors — same
-        // staging convention (the schedules never read `sim`).
-        self.world
-            .insert_resource(flight::capture_sync_input(&self.sim));
+        // staging convention (the schedules never read `sim`). The
+        // §2.6.4 latched vessels reuse `LatchedWeldCache` instead of
+        // re-welding per frame.
+        let staged_flight = {
+            let mut cache = self.world.resource_mut::<flight::LatchedWeldCache>();
+            flight::capture_sync_input(&self.sim, &mut cache)
+        };
+        self.world.insert_resource(staged_flight);
         self.ticks_last_frame = 0;
         self.schedules.sync.run(&mut self.world);
         self.schedules.presentation.run(&mut self.world);
@@ -1242,9 +1254,11 @@ impl View {
     }
 
     /// The focused vessel's `VesselId` — the throttle/attitude
-    /// command target (`None` when the flight scene has no vessel —
-    /// a surface-latched pad craft still counts: `SetThrottle`
-    /// unlatches it).
+    /// command target (`None` when the flight scene has no vessel).
+    /// The focus is the most recently spawned staged vessel — a new
+    /// launch takes the camera, HUD, and this command route with it.
+    /// A surface-latched pad craft still counts: `SetThrottle`
+    /// unlatches it.
     pub fn flight_focus(&self) -> Option<csp_sim::VesselId> {
         self.world
             .resource::<flight::FlightUiData>()
@@ -1604,5 +1618,54 @@ mod tests {
         view.end_frame();
         assert_eq!(view.world.resource::<FrameStats>().ticks_last_frame, 0);
         assert_eq!(view.world.resource::<Clock>().0.ticks(), 10);
+    }
+
+    /// R15-F3 regression: `map_present` and `flight_present` sit in
+    /// one unordered Presentation tuple — `flight_present` runs even
+    /// in Map mode, so its chase solve must land on
+    /// `flight::FlightCameraF64` and leave `map::MapCameraF64` alone.
+    /// Before the resource split both wrote one `ResMut<MapCameraF64>`
+    /// and the last writer won in unspecified order. The two solves
+    /// land ~6e10 m vs 60 m apart, so a clobber is unmissable.
+    #[test]
+    fn flight_camera_cannot_clobber_the_map_camera() {
+        let mut view = View::default();
+        // Stage a vessel so flight_present takes the solving branch
+        // (empty staging → the early `valid = false` path).
+        view.world
+            .resource_mut::<flight::FlightSnapshot>()
+            .vessels
+            .push(flight::FlightBody {
+                id: 7,
+                pos: csp_core::DVec3::ZERO,
+                rot: csp_core::DQuat::IDENTITY,
+                vel: csp_core::DVec3::ZERO,
+                throttle: 0.0,
+                debris: false,
+                contact: false,
+                plasma_w_m2: 0.0,
+                nodes: 1,
+                parts: Vec::new(),
+                plumes: Vec::new(),
+                com: csp_core::DVec3::ZERO,
+                latched: false,
+            });
+        view.set_mode(ViewMode::Map);
+        // Run just the Presentation stage — `end_frame` would first
+        // re-stage `FlightSyncInput` from the (empty) sim and wipe the
+        // staged vessel; the race this pins lives inside the tuple.
+        view.schedules.presentation.run(&mut view.world);
+
+        // The map camera is the map's own solve — not whatever the
+        // chase solve happened to run second.
+        let map_dist = view.world.resource::<map::MapInput>().distance_m;
+        let cam = view.world.resource::<map::MapCameraF64>();
+        assert!(cam.valid, "map camera must be solved in map mode");
+        assert_eq!(cam.distance_m, map_dist);
+        // …and the chase camera exists on its own resource.
+        let flight_dist = view.world.resource::<flight::FlightInput>().distance_m;
+        let fcam = view.world.resource::<flight::FlightCameraF64>();
+        assert!(fcam.0.valid, "chase camera must solve with a staged vessel");
+        assert_eq!(fcam.0.distance_m, flight_dist);
     }
 }

@@ -1053,6 +1053,7 @@ dependencies = [
  "bytemuck",
  "csp-core",
  "libm",
+ "log",
  "naga",
  "wgpu",
 ]

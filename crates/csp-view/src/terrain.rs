@@ -166,12 +166,12 @@ fn biome_field(loaded: &csp_data::LoadedBiomeMap) -> Option<Arc<rt::BiomeField>>
         colors[slot] = biome_color(entry.id.as_str());
     }
     let indices: Vec<u8> = img.indices.iter().map(|&px| slot_of[px as usize]).collect();
-    Some(Arc::new(rt::BiomeField {
-        width: img.info.width,
-        height: img.info.height,
+    Some(Arc::new(rt::BiomeField::new(
+        img.info.width,
+        img.info.height,
         indices,
         colors,
-    }))
+    )))
 }
 
 /// The baked heightfield cache — one per dominant body, rebuilt when
@@ -212,6 +212,12 @@ impl TerrainCache {
 /// shoreline at its own resolution (margin bounds the miss on dips
 /// narrower than a fifth of the patch).
 ///
+/// The terrain surface sits at `radius_m + h·amplitude_m`; the ocean
+/// surface at `datum_m` — which is *not* necessarily the datum radius
+/// (an authored `ocean.datum_radius_m` can sit above or below it). The
+/// shoreline test therefore compares `lo·amplitude_m` against
+/// `(datum_m − radius_m) + margin`, not against the margin alone.
+///
 /// `unspin` is the inertial→fixed rotation (`R(axis, −phase)`): patch
 /// directions are inertial but the heightfield is body-fixed — the
 /// same conjugate the shader applies before `height_at`.
@@ -219,6 +225,8 @@ fn patch_might_hold_sea(
     field: &rt::HeightField,
     id: rt::PatchId,
     amplitude_m: f64,
+    datum_m: f64,
+    radius_m: f64,
     unspin: DQuat,
 ) -> bool {
     let (corner, du, dv) = rt::patch_cube(id);
@@ -229,7 +237,8 @@ fn patch_might_hold_sea(
             lo = lo.min(field.sample_dir(unspin.rotate(c / c.norm())));
         }
     }
-    lo * amplitude_m <= (amplitude_m * rt::OCEAN_CULL_FRAC).max(250.0)
+    let margin = (amplitude_m * rt::OCEAN_CULL_FRAC).max(250.0);
+    lo * amplitude_m <= (datum_m - radius_m) + margin
 }
 
 /// Cast a row-major f64 4×4 into the WGSL column-major `[[f32;4];4]`
@@ -285,7 +294,7 @@ pub(crate) fn build_packet(
     for &id in &leaves {
         terrain.push(rt::patch_instance(id, 0.0, eye_rel, env.radius_m));
         if let Some(datum) = body.ocean_datum_m
-            && patch_might_hold_sea(&field, id, body.amplitude_m, unspin)
+            && patch_might_hold_sea(&field, id, body.amplitude_m, datum, env.radius_m, unspin)
         {
             ocean.push(rt::patch_instance(id, 1.0, eye_rel, datum));
         }
@@ -311,6 +320,15 @@ pub(crate) fn build_packet(
         top_m: env.atm_top_m,
         scale_height_m: env.atm_scale_height_m.max(1.0),
     });
+    // fs_sky's ray/shell quadratic `b² − c`: `c = |pa|² − r²` is a
+    // per-frame constant, baked here in f64 so the ~1e11-magnitude
+    // subtraction never runs in f32 (`misc.z` top shell, `misc.w`
+    // datum shell — the shader's `b·b − c` then carries only the `b²`
+    // rounding error, ~4 decades smaller than the cancelled terms).
+    let eye_r2 = eye_rel.norm_squared();
+    let r_top = env.radius_m + env.atm_top_m;
+    let c_top = (eye_r2 - r_top * r_top) as f32;
+    let c_ground = (eye_r2 - env.radius_m * env.radius_m) as f32;
     rt::TerrainPacket {
         uniforms: rt::TerrainUniforms {
             view_proj: m4_wgsl(&cam.view_proj),
@@ -329,7 +347,7 @@ pub(crate) fn build_packet(
                 0.0,
                 0.0,
             ],
-            misc: [(tan_y * aspect) as f32, tan_y as f32, 0.0, 0.0],
+            misc: [(tan_y * aspect) as f32, tan_y as f32, c_top, c_ground],
             spin: [
                 env.spin_axis.x as f32,
                 env.spin_axis.y as f32,

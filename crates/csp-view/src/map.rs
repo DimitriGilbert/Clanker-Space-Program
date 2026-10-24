@@ -69,6 +69,13 @@ const PITCH_LIMIT: f64 = 1.55;
 /// Fraction of the hyperbolic asymptote anomaly drawn for open orbits —
 /// keeps the polyline finite while covering the SOI-crossing leg.
 const OPEN_ORBIT_NU_FILL: f64 = 0.92;
+/// `|e − 1|` at/below which an orbit is drawn as parabolic — mirrors
+/// `csp_sim::orbit::E_PARABOLIC_TOL` (`pub(crate)` there, so mirrored
+/// literally). The sim encodes parabolas as `a := −p < 0`; the sampler
+/// must classify the same band identically or a parabolic-encoded
+/// orbit with `e` just under 1.0 would take the closed branch, fail
+/// its `a > 0` check, and draw no line at all.
+const E_PARABOLIC_TOL: f64 = 1e-9;
 /// Color for all vessel markers/lines at M1 (bodies get per-index colors).
 const VESSEL_COLOR: [f32; 4] = [1.0, 0.55, 0.15, 1.0];
 /// M5 maneuver-node color: the node marker and the predicted post-burn
@@ -386,6 +393,9 @@ struct NodePreview {
 }
 
 /// The solved map camera for one frame — f64 end to end (§2.3).
+/// Flight's chase camera is `flight::FlightCameraF64`, a *separate*
+/// resource: `map_present` and `flight_present` sit in one unordered
+/// Presentation tuple, so a shared `ResMut` would race.
 #[derive(Resource, Default)]
 pub struct MapCameraF64 {
     /// camera-relative world → clip (`P · Rᵀ`), f64.
@@ -769,7 +779,8 @@ pub(crate) fn body_system_pos(
 
 /// Sample an orbit into a parent-centered polyline (§2.8 `state_at`).
 ///
-/// Closed orbits (`e < 1`): `ORBIT_LINE_SAMPLES` segments uniform in
+/// Closed orbits (`e < 1 − E_PARABOLIC_TOL`, the sim's elliptic band):
+/// `ORBIT_LINE_SAMPLES` segments uniform in
 /// mean anomaly over one full period starting at `epoch` — first and
 /// last sample coincide. Open orbits: samples uniform in *true* anomaly
 /// over [`OPEN_ORBIT_NU_FILL`] of the asymptotic range — mean-anomaly
@@ -786,7 +797,7 @@ fn sample_orbit(model: &PatchedConics, state: &OrbitState) -> Option<Vec<DVec3>>
     let epoch_ticks = state.epoch.ticks() as i64;
 
     let mut out = Vec::with_capacity(ORBIT_LINE_SAMPLES + 1);
-    if e < 1.0 {
+    if e < 1.0 - E_PARABOLIC_TOL {
         if !(a > 0.0 && a.is_finite() && mu > 0.0) {
             return None;
         }
@@ -809,7 +820,7 @@ fn sample_orbit(model: &PatchedConics, state: &OrbitState) -> Option<Vec<DVec3>>
         if !(mu > 0.0 && a.is_finite() && a != 0.0) {
             return None;
         }
-        let nu_max = if e > 1.0 + 1e-9 {
+        let nu_max = if e > 1.0 + E_PARABOLIC_TOL {
             f64::acos(-1.0 / e) * OPEN_ORBIT_NU_FILL
         } else {
             // Parabolic encoding (e ≈ 1): the anomaly range is ±π.
@@ -844,13 +855,15 @@ fn sample_orbit(model: &PatchedConics, state: &OrbitState) -> Option<Vec<DVec3>>
 /// not apply in csp-view.)
 fn mean_anomaly_of_true(elements: &KeplerElements, nu: f64) -> f64 {
     let e = elements.eccentricity;
-    if e < 1.0 {
+    if e < 1.0 - E_PARABOLIC_TOL {
         let ea = 2.0 * f64::atan(f64::sqrt((1.0 - e) / (1.0 + e)) * f64::tan(nu * 0.5));
         ea - e * f64::sin(ea)
-    } else if e <= 1.0 + 1e-9 {
-        // Barker's equation (parabola).
+    } else if e <= 1.0 + E_PARABOLIC_TOL {
+        // Barker's equation (parabola): `M = (t + t³/3)/2` — the same
+        // convention `csp_sim::orbit` uses (`state_at` reads this `M`
+        // back; the un-halved form would double the sampled time).
         let t = f64::tan(nu * 0.5);
-        t + t * t * t / 3.0
+        0.5 * (t + t * t * t / 3.0)
     } else {
         // tanh(F/2) = sqrt((e−1)/(e+1)) · tan(ν/2);  M = e·sinh F − F.
         let f = 2.0 * f64::atanh(f64::sqrt((e - 1.0) / (e + 1.0)) * f64::tan(nu * 0.5));
@@ -1249,6 +1262,39 @@ mod tests {
             epoch: SimTime::ZERO,
         };
         let line = sample_orbit(&model, &state).expect("parabola samples");
+        assert!(line.len() > ORBIT_LINE_SAMPLES / 2);
+        for pt in &line {
+            assert!(pt.norm() >= r_p * 0.99);
+        }
+    }
+
+    /// Regression: a parabolic-encoded orbit (`a := −p < 0`) whose `e`
+    /// lands *just under* 1.0 — inside the sim's `|e − 1| ≤ 1e-9`
+    /// parabolic band (`csp_sim::orbit::E_PARABOLIC_TOL`) — must take
+    /// the open branch. Classifying on raw `e < 1.0` sent it to the
+    /// closed branch, where the `a > 0` check rejected the `−p`
+    /// encoding and `sample_orbit` returned `None` — no orbit line.
+    #[test]
+    fn parabolic_e_sliver_still_samples() {
+        let model = test_system();
+        let r_p = 7.0e5;
+        let el = KeplerElements {
+            semi_major_axis_m: -2.0 * r_p, // a := −p
+            // 5e-16 below 1.0 — inside the parabolic band, but `e < 1.0`
+            // is still literally true.
+            eccentricity: 1.0 - 5e-16,
+            inclination_rad: 0.0,
+            ascending_node_rad: 0.0,
+            arg_periapsis_rad: 0.0,
+            mean_anomaly_epoch_rad: 0.0,
+            period_s: f64::INFINITY,
+        };
+        let state = OrbitState {
+            parent: BodyId::from("p"),
+            elements: el,
+            epoch: SimTime::ZERO,
+        };
+        let line = sample_orbit(&model, &state).expect("parabolic sliver samples");
         assert!(line.len() > ORBIT_LINE_SAMPLES / 2);
         for pt in &line {
             assert!(pt.norm() >= r_p * 0.99);

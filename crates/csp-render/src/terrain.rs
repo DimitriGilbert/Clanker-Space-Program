@@ -296,13 +296,12 @@ fn patch_dir0_size(id: PatchId) -> (DVec3, f64) {
 /// order, fixed child order, FIFO queue; a saturated budget emits the
 /// queued nodes as leaves, so coarse coverage completes before detail.
 pub fn select_patches(eye_rel_body: DVec3, radius_m: f64, cfg: &LodConfig) -> Vec<PatchId> {
-    // `PatchId::{x, y}` are `u16`: splitting a level-16 node would wrap
-    // `x * 2 + dx`. The default config stays at 12; this guards a
-    // tuned-up `LodConfig`.
-    debug_assert!(
-        cfg.max_level <= 16,
-        "max_level > 16 overflows PatchId's u16 cell indices"
-    );
+    // `PatchId::{x, y}` are `u16`: a level-16 node holds cell indices
+    // up to `2^16 − 1`, so splitting one would wrap `x * 2 + dx`.
+    // Clamp rather than assert — a tuned-up `LodConfig` silently
+    // degrades to depth 16 instead of emitting corrupted cells in
+    // release builds (the old `debug_assert!` covered only debug).
+    let max_level = cfg.max_level.min(16);
     let mut out = Vec::new();
     let eye_norm = eye_rel_body.norm();
     let eye_r = eye_norm.max(radius_m * 1e-9);
@@ -334,7 +333,7 @@ pub fn select_patches(eye_rel_body: DVec3, radius_m: f64, cfg: &LodConfig) -> Ve
         }
         let dist = (eye_rel_body - dir0 * radius_m).norm() - cube_size * radius_m * 0.5;
         if out.len() + queue.len() < cfg.max_patches
-            && id.level < cfg.max_level
+            && id.level < max_level
             && dist < cfg.split_factor * cube_size * radius_m
         {
             for (dx, dy) in [(0u16, 0u16), (1, 0), (0, 1), (1, 1)] {
@@ -410,7 +409,10 @@ pub struct TerrainUniforms {
     pub planet: [f32; 4],
     /// `x` atmosphere scale height (m), `y` has-biome flag, `z`/`w` unused.
     pub atmo: [f32; 4],
-    /// `x` tan(fov_y/2)·aspect, `y` tan(fov_y/2) — sky ray reconstruction.
+    /// `x` tan(fov_y/2)·aspect, `y` tan(fov_y/2) — sky ray
+    /// reconstruction; `z`/`w` are `fs_sky`'s ray/shell quadratic
+    /// constants `|pa|² − r_top²` / `|pa|² − R²` — baked CPU-side in
+    /// f64 (the cancelled terms are ~1e11 m², past f32 resolution).
     pub misc: [f32; 4],
     /// Body spin for the fixed-frame terrain lookup: `xyz` unit spin
     /// axis (bubble frame), `w` the `ω·t` phase wrapped to `[0, 2π)` —
@@ -450,6 +452,33 @@ pub struct BiomeField {
     pub indices: Vec<u8>,
     /// Slot → linear RGB (unused slots carry the fallback tint).
     pub colors: [[f32; 4]; 16],
+    /// Content hash — the renderer's re-upload key. Keying on content
+    /// (like [`HeightField::key`]) rather than the `Arc` address keeps
+    /// the cache correct if an `Arc` is ever dropped and a new field
+    /// lands on the recycled pointer (latent ABA).
+    pub key: u64,
+}
+
+impl BiomeField {
+    /// Build a field, hashing the content for [`Self::key`]. The hash
+    /// is a `mix64` fold over dims + slots + palette — deterministic,
+    /// order-sensitive, one-time (fields are immutable).
+    pub fn new(width: u32, height: u32, indices: Vec<u8>, colors: [[f32; 4]; 16]) -> Self {
+        let mut key = mix64(u64::from(width) << 32 | u64::from(height));
+        for (i, &slot) in indices.iter().enumerate() {
+            key = mix64(key ^ u64::from(slot).wrapping_add(i as u64));
+        }
+        for c in colors.iter().flatten() {
+            key = mix64(key ^ u64::from(c.to_bits()));
+        }
+        Self {
+            width,
+            height,
+            indices,
+            colors,
+            key,
+        }
+    }
 }
 
 /// The R2 RenderExtract product — everything [`TerrainRenderer::draw`]
@@ -686,7 +715,7 @@ pub struct TerrainRenderer {
     biome_tex: wgpu::Texture,
     uploaded_height_key: Option<u64>,
     uploaded_atmo: Option<AtmoDesc>,
-    uploaded_biome_key: Option<usize>,
+    uploaded_biome_key: Option<u64>,
 }
 
 impl TerrainRenderer {
@@ -1028,8 +1057,10 @@ impl TerrainRenderer {
             self.uploaded_atmo = packet.atmo;
             rebind = true;
         }
-        // Identity by Arc address — the field is immutable once built.
-        let biome_key = packet.biome.as_ref().map(|b| Arc::as_ptr(b) as usize);
+        // Identity by content hash — the field is immutable once built;
+        // keying on `BiomeField::key` (like `uploaded_height_key`)
+        // can't ABA on a recycled `Arc` address.
+        let biome_key = packet.biome.as_ref().map(|b| b.key);
         if biome_key != self.uploaded_biome_key {
             if let Some(b) = &packet.biome {
                 self.biome_tex = Self::write_tex(
@@ -1182,6 +1213,36 @@ mod tests {
         assert!(inst.corner[..3].iter().all(|c| c.abs() <= 1.0));
     }
 
+    /// CPU mirror of the WGSL `trans` bilinear: the LUT is baked
+    /// *endpoint*-centered (`col/(W−1)`, `row/(H−1)`), so the texel
+    /// coordinate is `·(d − 1)` — unlike `height_at`'s texel-center
+    /// `·d − 0.5`. Keeping this mirror in the test is what locks the
+    /// bake and the shader to the same convention.
+    fn lut_trans(lut: &[f32], top_m: f64, h: f64, mu: f64) -> [f32; 3] {
+        let uu = (mu * 0.5 + 0.5) * (LUT_W - 1) as f64;
+        let vv = (h / top_m).clamp(0.0, 1.0) * (LUT_H - 1) as f64;
+        let (i0, j0) = (uu.floor() as i64, vv.floor() as i64);
+        let (fu, fv) = (uu - i0 as f64, vv - j0 as f64);
+        let texel = |i: i64, j: i64| -> [f32; 3] {
+            let i = i.clamp(0, LUT_W as i64 - 1) as usize;
+            let j = j.clamp(0, LUT_H as i64 - 1) as usize;
+            let k = (j * LUT_W + i) * 4;
+            [lut[k], lut[k + 1], lut[k + 2]]
+        };
+        let (wi0, wi1) = (1.0 - fu, fu);
+        let (wj0, wj1) = (1.0 - fv, fv);
+        let mut out = [0.0f32; 3];
+        for (j, wj) in [(j0, wj0), (j0 + 1, wj1)] {
+            for (i, wi) in [(i0, wi0), (i0 + 1, wi1)] {
+                let t = texel(i, j);
+                for c in 0..3 {
+                    out[c] += t[c] * (wi * wj) as f32;
+                }
+            }
+        }
+        out
+    }
+
     /// The transmittance LUT: unity in space, decreasing with depth,
     /// zero through the ground — and it matches the vertical-ray
     /// closed form `exp(−β·H·e^(−h/H))`.
@@ -1206,5 +1267,32 @@ mod tests {
         assert!((got - closed).abs() < 0.01, "{got} vs {closed}");
         // Straight down (μ=−1, col 0) hits the datum → 0.
         assert_eq!(t(LUT_H / 2, 0), [0.0, 0.0, 0.0]);
+
+        // The shader↔bake mapping (R16-F3): sampling the shader's
+        // `trans` formula AT each baked grid point must return that
+        // texel exactly — an off-by-half-texel convention would smear
+        // every endpoint (and is exactly the bias this guards).
+        for row in (0..LUT_H).step_by(7) {
+            for col in (0..LUT_W).step_by(9) {
+                let h = atmo.top_m * row as f64 / (LUT_H - 1) as f64;
+                let mu = -1.0 + 2.0 * col as f64 / (LUT_W - 1) as f64;
+                let s = lut_trans(&lut, atmo.top_m, h, mu);
+                let e = t(row, col);
+                for c in 0..3 {
+                    assert!(
+                        (s[c] - e[c]).abs() < 1e-6,
+                        "grid ({row},{col}): sampled {s:?} vs texel {e:?}"
+                    );
+                }
+            }
+        }
+        // And the endpoints the mapping must preserve verbatim:
+        // μ=−1 stays the ground-blocked 0, h=top stays ≈1.
+        assert_eq!(lut_trans(&lut, atmo.top_m, 0.0, -1.0), [0.0, 0.0, 0.0]);
+        assert!(
+            lut_trans(&lut, atmo.top_m, atmo.top_m, 0.0)
+                .iter()
+                .all(|&v| v > 0.99)
+        );
     }
 }

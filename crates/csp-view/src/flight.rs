@@ -24,13 +24,15 @@
 //! the map projection. Cue TTLs count presentation frames — session
 //! state, never sim state.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use bevy_ecs::prelude::*;
 use csp_core::{DQuat, DVec3};
-use csp_sim::{VesselState, World};
+use csp_sim::{VesselId, VesselState, World};
 
-use crate::map::{MapCameraF64, body_system_pos, project_into, solve_orbit_camera};
+use crate::map::{
+    MapCameraF64, MapInput, MapMode, body_system_pos, project_into, solve_orbit_camera,
+};
 use crate::terrain::{TerrainCache, TerrainConfig};
 
 /// Chase-camera FOV (radians, vertical).
@@ -191,7 +193,9 @@ pub struct FlightBody {
 pub struct FlightSyncInput {
     /// The physics environment — `None` without physics.
     pub env: Option<FlightEnv>,
-    /// InBubble vessels, ascending `VesselId`.
+    /// Staged vessels (InBubble + surface-latched), ascending
+    /// `VesselId` — `last()` is the most recently spawned, which is the
+    /// flight focus rule (see `focus_vessel`).
     pub vessels: Vec<FlightBody>,
 }
 
@@ -210,7 +214,8 @@ pub struct FlightSnapshot {
 pub struct FlightUiData {
     /// Focused vessel exists.
     pub has_vessel: bool,
-    /// Focused vessel id (for throttle commands), `None` otherwise.
+    /// Focused vessel id (for throttle commands), `None` otherwise —
+    /// the most recently spawned staged vessel (see `focus_vessel`).
     /// Includes a surface-latched pad vessel — `SetThrottle` unlatches
     /// it (the sim's §2.6.4 control rule).
     pub focus: Option<u64>,
@@ -275,7 +280,7 @@ pub struct SfxCue {
 /// Last frame's edge-detection summary for [`FlightSfx`].
 #[derive(Clone, Copy, Debug)]
 struct SfxPrev {
-    /// Focused vessel id (`vessels[0]` — the chase target).
+    /// Focused vessel id (`vessels.last()` — the chase target).
     focus: u64,
     /// `throttle > 0` — the ignition/cut edge.
     throttle_on: bool,
@@ -310,6 +315,74 @@ const SFX_TTL_FRAMES: u32 = 90;
 /// The RenderExtract product — `None` while no flight scene exists.
 #[derive(Resource, Default)]
 pub struct FlightFrame(pub Option<csp_render::flight::FlightPacket>);
+
+/// Session-state cache for the §2.6.4 latched-vessel weld. The
+/// `SurfaceLatched` pose record stores no collider, so staging a
+/// parked craft's render data needs a re-weld of its stored craft —
+/// but a latched craft is immutable sim state (any command that
+/// changes it unlatches or removes the vessel first), so the weld +
+/// per-part staging is cached on `(vessel id, craft fingerprint)`
+/// instead of running once per frame. Entries whose vessel is no
+/// longer surface-latched are dropped at the next capture, keeping
+/// the map bounded by the live latched count.
+#[derive(Resource, Default)]
+pub struct LatchedWeldCache {
+    /// `VesselId.0` → the cached weld-derived render data.
+    entries: BTreeMap<u64, LatchedWeld>,
+}
+
+/// One latched vessel's cached weld output — the render data
+/// `capture_sync_input` would otherwise recompute every frame.
+struct LatchedWeld {
+    /// `craft_fingerprint` of the `(graph, parts)` this entry welded.
+    key: u64,
+    /// `WeldedBody::com_local` — `surface_pose_restore`'s CoM input.
+    com_local: DVec3,
+    /// Thrust sites `(local_pos, local_dir)` — the plume emitters.
+    plumes: Vec<(DVec3, DVec3)>,
+    /// `vessel_parts`' output over the welded hulls.
+    parts: Vec<FlightPart>,
+}
+
+/// The [`LatchedWeldCache`] staleness key: FNV-1a over the
+/// weld-relevant craft structure — node ids, parents, transforms, and
+/// effective indices, then the part count and each part's mass/CoM —
+/// so a same-id/different-craft hit re-welds rather than rendering a
+/// stale parked shape. Presentation-only; not the §7.1 state hash.
+fn craft_fingerprint(craft: &csp_sim::CraftDef) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = FNV_OFFSET;
+    let mut mix = |bits: u64| {
+        h ^= bits;
+        h = h.wrapping_mul(FNV_PRIME);
+    };
+    mix(craft.graph.root.0);
+    for (id, node) in &craft.graph.nodes {
+        mix(id.0);
+        mix(node.parent.map_or(u64::MAX, |p| p.0));
+        for v in [
+            node.transform.offset.x,
+            node.transform.offset.y,
+            node.transform.offset.z,
+            node.transform.rotation.x,
+            node.transform.rotation.y,
+            node.transform.rotation.z,
+            node.transform.rotation.w,
+        ] {
+            mix(v.to_bits());
+        }
+        mix(u64::from(node.effective_index));
+    }
+    mix(craft.parts.len() as u64);
+    for p in &craft.parts {
+        mix(p.mass_kg.to_bits());
+        mix(p.com.x.to_bits());
+        mix(p.com.y.to_bits());
+        mix(p.com.z.to_bits());
+    }
+    h
+}
 
 /// Sun direction in the bubble frame: the bubble is a translated copy
 /// of the system frame, so `star_pos − dominant_pos` carries over as a
@@ -346,8 +419,10 @@ fn sun_direction(sim: &World) -> DVec3 {
 }
 
 /// `end_frame` staging: pull the flight view's slice out of `World`
-/// (the only sim read this module does — §2.5).
-pub fn capture_sync_input(sim: &World) -> FlightSyncInput {
+/// (the only sim read this module does — §2.5). `cache` is the
+/// session's [`LatchedWeldCache`] — surface-latched vessels reuse its
+/// weld-derived render data instead of re-welding every frame.
+pub fn capture_sync_input(sim: &World, cache: &mut LatchedWeldCache) -> FlightSyncInput {
     let env = sim.environment().map(|e| {
         // The §2.6.4 phase convention (`csp_sim::bubble`'s
         // `surface_pose_*`): inertial = R(axis, ω·t)·fixed at
@@ -374,6 +449,14 @@ pub fn capture_sync_input(sim: &World) -> FlightSyncInput {
         }
     });
     let env_ref = sim.environment();
+    // Bound the weld cache to the live latched set — an unlatched or
+    // removed vessel's entry can never be hit again.
+    cache.entries.retain(|vid, _| {
+        matches!(
+            sim.vessels().get(&VesselId(*vid)).map(|v| &v.state),
+            Some(VesselState::SurfaceLatched(_))
+        )
+    });
     let mut vessels = Vec::new();
     for (id, vessel) in sim.vessels() {
         match &vessel.state {
@@ -419,47 +502,79 @@ pub fn capture_sync_input(sim: &World) -> FlightSyncInput {
             // environment; without one the record is uninterpretable —
             // skip honestly rather than guess a pose.
             VesselState::SurfaceLatched(pose) => {
-                let (Some(env), Some(craft)) = (env_ref, vessel.craft.as_ref()) else {
-                    continue;
-                };
-                // The pose record stores no collider — re-weld the craft
-                // for the render data (the §7.3 re-derived-on-load
-                // convention; cheap at craft scale). The weld precedes
-                // the restore: `vel` stamps the CoM slot, which needs
-                // `welded.com_local`.
-                let Ok(welded) = csp_phys::weld(&craft.graph, &craft.parts) else {
-                    continue;
-                };
-                let (pos, rot, vel, _ang_vel) =
-                    csp_sim::bubble::surface_pose_restore(env, pose, welded.com_local, sim.clock());
-                let plumes = welded
-                    .force_sites
-                    .iter()
-                    .filter(|s| s.kind == csp_phys::ForceSiteKind::Thrust)
-                    .map(|s| (s.local_pos, s.local_dir))
-                    .collect();
-                vessels.push(FlightBody {
-                    id: id.0,
-                    pos,
-                    rot,
-                    vel,
-                    throttle: 0.0,
-                    debris: vessel.debris_since.is_some(),
-                    // Parked, not impacting — the dust puff reads as a
-                    // touchdown event, not a resting state.
-                    contact: false,
-                    plasma_w_m2: 0.0,
-                    nodes: craft.graph.nodes.len(),
-                    parts: vessel_parts(vessel.craft.as_ref(), &welded.collider.hulls),
-                    plumes,
-                    com: pos + rot.rotate(welded.com_local),
-                    latched: true,
-                });
+                if let Some(body) = stage_latched(sim, env_ref, *id, vessel, pose, cache) {
+                    vessels.push(body);
+                }
             }
             VesselState::OnRails(_) => {}
         }
     }
     FlightSyncInput { env, vessels }
+}
+
+/// Stage one §2.6.4 surface-latched vessel. The restored inertial
+/// pose is a function of the sim clock and is re-solved every frame
+/// (the pad co-rotates); the weld-derived render data (`com_local`,
+/// the plume sites, the per-part silhouettes) comes from
+/// [`LatchedWeldCache`] — the latched craft is immutable, so the weld
+/// runs only on a `(vessel id, craft fingerprint)` miss.
+///
+/// `None` for an unstageable record — no environment (the pose record
+/// is uninterpretable without one), no stored craft, or a craft that
+/// cannot weld. Skipping honestly matches the pre-cache behaviour:
+/// degraded, never guessed.
+fn stage_latched(
+    sim: &World,
+    env: Option<&csp_phys::Environment>,
+    id: VesselId,
+    vessel: &csp_sim::Vessel,
+    pose: &csp_sim::SurfacePose,
+    cache: &mut LatchedWeldCache,
+) -> Option<FlightBody> {
+    let (Some(env), Some(craft)) = (env, vessel.craft.as_ref()) else {
+        return None;
+    };
+    let key = craft_fingerprint(craft);
+    if cache.entries.get(&id.0).is_none_or(|e| e.key != key) {
+        let welded = csp_phys::weld(&craft.graph, &craft.parts).ok()?;
+        let plumes = welded
+            .force_sites
+            .iter()
+            .filter(|s| s.kind == csp_phys::ForceSiteKind::Thrust)
+            .map(|s| (s.local_pos, s.local_dir))
+            .collect();
+        cache.entries.insert(
+            id.0,
+            LatchedWeld {
+                key,
+                com_local: welded.com_local,
+                plumes,
+                parts: vessel_parts(vessel.craft.as_ref(), &welded.collider.hulls),
+            },
+        );
+    }
+    let entry = cache.entries.get(&id.0)?;
+    // `vel` stamps the CoM slot: the co-rotation velocity of
+    // `pos + rot·com_local`, not of the origin `pos`.
+    let (pos, rot, vel, _ang_vel) =
+        csp_sim::bubble::surface_pose_restore(env, pose, entry.com_local, sim.clock());
+    Some(FlightBody {
+        id: id.0,
+        pos,
+        rot,
+        vel,
+        throttle: 0.0,
+        debris: vessel.debris_since.is_some(),
+        // Parked, not impacting — the dust puff reads as a touchdown
+        // event, not a resting state.
+        contact: false,
+        plasma_w_m2: 0.0,
+        nodes: craft.graph.nodes.len(),
+        parts: entry.parts.clone(),
+        plumes: entry.plumes.clone(),
+        com: pos + rot.rotate(entry.com_local),
+        latched: true,
+    })
 }
 
 /// One vessel's per-part render entries — the §3.7 kitbash upgrade
@@ -493,9 +608,13 @@ fn vessel_parts(
                     lo,
                     hi,
                     transform: csp_phys::PartTransform::new(center, csp_core::DQuat::IDENTITY),
+                    // The transform already carries `center` — the shape
+                    // is part-LOCAL, so the box is centred on the local
+                    // origin. Centring it again here would double the
+                    // offset at emit (`transform.apply(shape_corner)`).
                     shape: crate::part_mesh::PartShape::Box {
-                        lo: center - half,
-                        hi: center + half,
+                        lo: -half,
+                        hi: half,
                     },
                 }
             })
@@ -561,12 +680,21 @@ pub(crate) fn sync_flight(staged: Res<FlightSyncInput>, mut snap: ResMut<FlightS
     snap.vessels = staged.vessels.clone();
 }
 
+/// The solved chase camera — `MapCameraF64` reused (same orbit
+/// convention). A *separate* resource from the map's camera:
+/// `map_present` and `flight_present` share the unordered Presentation
+/// tuple, so one `ResMut<MapCameraF64>` between them would be a
+/// last-writer-wins race every frame (same newtype pattern as
+/// `vab::VabCameraF64`).
+#[derive(Resource, Default)]
+pub struct FlightCameraF64(pub MapCameraF64);
+
 /// `Presentation` schedule — chase-camera solve + HUD mirrors + the
 /// §3.7 SFX cue edges (the schedule's "VFX, audio cues" slot).
 pub(crate) fn flight_present(
     input: Res<FlightInput>,
     snap: Res<FlightSnapshot>,
-    mut cam: ResMut<MapCameraF64>,
+    mut cam: ResMut<FlightCameraF64>,
     mut ui: ResMut<FlightUiData>,
     mut sfx: ResMut<FlightSfx>,
 ) {
@@ -577,7 +705,8 @@ pub(crate) fn flight_present(
     // on the staged snapshot (never the sim). Per-focus edges apply
     // only while the SAME vessel stays focused; a focus switch
     // re-baselines instead of firing a spurious cut/contact edge.
-    let cur = snap.vessels.first().map(|f| SfxPrev {
+    // The focus rule is `focus_vessel`'s — the newest staged vessel.
+    let cur = focus_vessel(&snap.vessels).map(|f| SfxPrev {
         focus: f.id,
         throttle_on: f.throttle > 0.0,
         nodes: f.nodes,
@@ -641,13 +770,13 @@ pub(crate) fn flight_present(
     ui.sfx = sfx.cues.iter().map(|c| c.text.clone()).collect();
     sfx.prev = cur;
 
-    let Some(focus) = snap.vessels.first() else {
-        cam.valid = false;
+    let Some(focus) = focus_vessel(&snap.vessels) else {
+        cam.0.valid = false;
         ui.has_vessel = false;
         ui.focus = None;
         return;
     };
-    *cam = solve_orbit_camera(
+    cam.0 = solve_orbit_camera(
         input.yaw,
         input.pitch,
         input.distance_m,
@@ -679,6 +808,17 @@ pub(crate) fn flight_present(
             stage_attitude(&mut ui, env, focus, rel / r);
         }
     }
+}
+
+/// The chase target / HUD / throttle-command vessel: the most recently
+/// spawned staged vessel. `vessels` is staged ascending `VesselId` and
+/// the sim's `next_vessel_id` counter is monotonic, so `last()` is the
+/// newest spawn — a fresh launch (or a new breakup fragment) takes the
+/// camera, the HUD mirrors, and `SetThrottle` routing with it. When it
+/// leaves the staging set the next-newest vessel inherits focus; an
+/// empty scene has none.
+pub(crate) fn focus_vessel(vessels: &[FlightBody]) -> Option<&FlightBody> {
+    vessels.last()
 }
 
 /// The attitude/velocity half of the HUD mirrors: surface-relative
@@ -763,8 +903,9 @@ fn into_arr(v: DVec3) -> [f64; 3] {
 #[allow(clippy::too_many_lines)]
 pub(crate) fn extract_flight(
     input: Res<FlightInput>,
+    map_input: Res<MapInput>,
     snap: Res<FlightSnapshot>,
-    cam: Res<MapCameraF64>,
+    cam: Res<FlightCameraF64>,
     terrain_cfg: Res<TerrainConfig>,
     mut terrain_cache: ResMut<TerrainCache>,
     mut frame: ResMut<FlightFrame>,
@@ -773,15 +914,18 @@ pub(crate) fn extract_flight(
     // R2 surface pass: when a physical world is present and the chase
     // camera solved, the quadtree terrain + LUT sky replace the M4c
     // gradient/disc. Without an environment the flat gradient stays —
-    // a flight view with no planet is a vacuum backdrop anyway.
-    if cam.valid
+    // a flight view with no planet is a vacuum backdrop anyway. The
+    // mode gate keeps map frames from paying the quadtree walk +
+    // instance bake for a packet nothing draws.
+    if map_input.mode == MapMode::Flight
+        && cam.0.valid
         && let Some(env) = &snap.env
     {
         packet.terrain = Some(crate::terrain::build_packet(
             &terrain_cfg,
             &mut terrain_cache,
             env,
-            &cam,
+            &cam.0,
             input.yaw,
             input.pitch,
             input.viewport_px,
@@ -806,15 +950,27 @@ pub(crate) fn extract_flight(
             v.push(csp_render::flight::FlightVertex { pos, color });
         }
     }
-    if !cam.valid {
+    if !cam.0.valid {
         frame.0 = Some(packet);
         return;
     }
-    let vp = &cam.view_proj;
-    let eye = cam.eye;
-    let emit = |v: &mut Vec<csp_render::flight::FlightVertex>, world: DVec3, color: [f32; 4]| {
-        if let Some(ndc) = project_into(vp, eye, world) {
-            v.push(csp_render::flight::FlightVertex { pos: ndc, color });
+    let vp = &cam.0.view_proj;
+    let eye = cam.0.eye;
+    // All-or-nothing emission: every corner of a triangle is projected
+    // first and the tri is pushed whole or dropped whole — the same
+    // rule the part pass below and the VAB packet use. A per-vertex
+    // `push` here would let one behind-eye corner shift every later
+    // triangle in the shared unindexed `TriangleList` stream.
+    let emit_tri = |v: &mut Vec<csp_render::flight::FlightVertex>,
+                    a: DVec3,
+                    b: DVec3,
+                    c: DVec3,
+                    color: [f32; 4]| {
+        let [Some(c0), Some(c1), Some(c2)] = [a, b, c].map(|q| project_into(vp, eye, q)) else {
+            return;
+        };
+        for pos in [c0, c1, c2] {
+            v.push(csp_render::flight::FlightVertex { pos, color });
         }
     };
 
@@ -901,9 +1057,7 @@ pub(crate) fn extract_flight(
                     );
                     let q0 = base_p + u1 * (a0.cos() * r) + u2 * (a0.sin() * r);
                     let q1 = base_p + u1 * (a1.cos() * r) + u2 * (a1.sin() * r);
-                    emit(v, tip, col);
-                    emit(v, q0, col);
-                    emit(v, q1, col);
+                    emit_tri(v, tip, q0, q1, col);
                 }
             }
         }
@@ -940,16 +1094,9 @@ pub(crate) fn extract_flight(
                     DVec3::new(lo.x, hi.y, hi.z),
                 ];
                 for (idx, _) in FACES {
-                    let w: Vec<DVec3> = idx
-                        .iter()
-                        .map(|&i| b.pos + b.rot.rotate(corners[i]))
-                        .collect();
-                    emit(v, w[0], col);
-                    emit(v, w[1], col);
-                    emit(v, w[2], col);
-                    emit(v, w[0], col);
-                    emit(v, w[2], col);
-                    emit(v, w[3], col);
+                    let w = idx.map(|i| b.pos + b.rot.rotate(corners[i]));
+                    emit_tri(v, w[0], w[1], w[2], col);
+                    emit_tri(v, w[0], w[2], w[3], col);
                 }
             }
         }
@@ -1014,11 +1161,146 @@ pub(crate) fn extract_flight(
                 );
                 let p0 = base + t1 * (a0.cos() * dust_r) + t2 * (a0.sin() * dust_r);
                 let p1 = base + t1 * (a1.cos() * dust_r) + t2 * (a1.sin() * dust_r);
-                emit(v, base, col);
-                emit(v, p0, col);
-                emit(v, p1, col);
+                emit_tri(v, base, p0, p1, col);
             }
         }
     }
     frame.0 = Some(packet);
+}
+
+#[cfg(test)]
+// §2.13's no-panic rule covers shipping fallible paths; tests signal
+// failure by panicking, so unwrap/expect stays legal inside test code.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// Run `extract_flight` on a synthetic snapshot/camera through a
+    /// real `Schedule` — the RenderExtract system's own resource
+    /// plumbing, not a bare call.
+    fn run_extract(snap: FlightSnapshot, cam: MapCameraF64) -> csp_render::flight::FlightPacket {
+        let mut world = bevy_ecs::world::World::new();
+        world.insert_resource(FlightInput::default());
+        // extract_flight gates the terrain build on the map's mode —
+        // Flight here, matching the synthetic chase camera below.
+        world.insert_resource(MapInput {
+            mode: MapMode::Flight,
+            focus: 0,
+            pan_offset: DVec3::ZERO,
+            yaw_rad: 0.0,
+            pitch_rad: 0.0,
+            distance_m: 0.0,
+            viewport_px: (1.0, 1.0),
+        });
+        world.insert_resource(snap);
+        world.insert_resource(FlightCameraF64(cam));
+        world.insert_resource(TerrainConfig::default());
+        world.insert_resource(TerrainCache::default());
+        world.insert_resource(FlightFrame::default());
+        let mut sched = Schedule::default();
+        sched.add_systems(extract_flight);
+        sched.run(&mut world);
+        world
+            .resource_mut::<FlightFrame>()
+            .0
+            .take()
+            .expect("extract produced a flight packet")
+    }
+
+    /// A throttle-open vessel whose plume base ring lies exactly on
+    /// the eye plane: every fan triangle has its tip in front of the
+    /// eye and both ring corners unprojectable. The pre-fix per-vertex
+    /// `emit` pushed the lone tip vertices and shifted every later
+    /// triangle in the shared `TriangleList` stream; all-or-nothing
+    /// `emit_tri` drops each fan tri whole, so the stream stays a
+    /// multiple of three — aligned.
+    #[test]
+    fn behind_eye_corners_keep_the_triangle_stream_aligned() {
+        let vessel = FlightBody {
+            id: 0,
+            pos: DVec3::ZERO,
+            rot: DQuat::IDENTITY,
+            vel: DVec3::ZERO,
+            throttle: 1.0,
+            debris: false,
+            contact: false,
+            plasma_w_m2: 0.0,
+            nodes: 1,
+            parts: vec![FlightPart {
+                lo: DVec3::new(-0.5, -0.5, -0.5),
+                hi: DVec3::new(0.5, 0.5, 0.5),
+                transform: csp_phys::PartTransform::IDENTITY,
+                shape: crate::part_mesh::PartShape::Box {
+                    lo: DVec3::new(-0.5, -0.5, -0.5),
+                    hi: DVec3::new(0.5, 0.5, 0.5),
+                },
+            }],
+            // Thrust site at the body origin, dir +Z: the fan tip sits
+            // at the vessel, the 1.5 m-radius base ring 36 m along −Z.
+            plumes: vec![(DVec3::ZERO, DVec3::Z)],
+            com: DVec3::ZERO,
+            latched: false,
+        };
+        let snap = FlightSnapshot {
+            env: None,
+            vessels: vec![vessel],
+        };
+        // pitch = π puts the eye 36 m along −Z from the origin focus,
+        // looking back along +Z: the plume tip is 36 m in front, the
+        // ring corners sit at view depth ≈ 0 (`project_into` → `None`).
+        let cam = solve_orbit_camera(
+            0.0,
+            core::f64::consts::PI,
+            36.0,
+            (320.0, 240.0),
+            DVec3::ZERO,
+            FLIGHT_FOV_Y,
+            0.1,
+        );
+        // The setup really is the bug's shape — the tip projects, a
+        // ring corner does not.
+        assert!(project_into(&cam.view_proj, cam.eye, DVec3::ZERO).is_some());
+        assert!(project_into(&cam.view_proj, cam.eye, DVec3::new(1.5, 0.0, -36.0)).is_none());
+
+        let packet = run_extract(snap, cam);
+        assert_eq!(
+            packet.vertices.len() % 3,
+            0,
+            "unindexed TriangleList stream misaligned: {} vertices",
+            packet.vertices.len()
+        );
+    }
+
+    /// The craftless `vessel_parts` fallback: the part-local box must
+    /// be centred on the local origin — `transform` already carries
+    /// the hull's body-frame centre, so centring the shape too would
+    /// double the offset at emit.
+    #[test]
+    fn fallback_box_is_not_double_offset() {
+        // One hull offset from the body origin: body-frame AABB
+        // lo=(2,−3,0), hi=(4,−1,2).
+        let hull = csp_phys::ConvexHull {
+            vertices: vec![
+                DVec3::new(2.0, -3.0, 0.0),
+                DVec3::new(4.0, -3.0, 0.0),
+                DVec3::new(4.0, -1.0, 0.0),
+                DVec3::new(2.0, -1.0, 0.0),
+                DVec3::new(2.0, -3.0, 2.0),
+                DVec3::new(4.0, -3.0, 2.0),
+                DVec3::new(4.0, -1.0, 2.0),
+                DVec3::new(2.0, -1.0, 2.0),
+            ],
+        };
+        let parts = vessel_parts(None, &[hull]);
+        assert_eq!(parts.len(), 1);
+        let p = &parts[0];
+        let crate::part_mesh::PartShape::Box { lo, hi } = &p.shape else {
+            panic!("fallback shape must be a box, got {:?}", p.shape);
+        };
+        // The emitted corners (`transform.apply(shape_corner)`) must
+        // land on the body-frame AABB — the dyadic coordinates make
+        // this exact.
+        assert_eq!(p.transform.apply(*lo), p.lo);
+        assert_eq!(p.transform.apply(*hi), p.hi);
+    }
 }

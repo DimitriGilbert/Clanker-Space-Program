@@ -15,7 +15,7 @@
 use bevy_ecs::prelude::*;
 use csp_core::DVec3;
 
-use crate::flight::FlightSnapshot;
+use crate::flight::{FlightSnapshot, focus_vessel};
 use crate::vab::{VabInput, VabSessionRes};
 
 /// The tutorial session resource — `csp-view` owns it (§2.2-C), the
@@ -53,8 +53,8 @@ fn osculating_apsides(rel: DVec3, vel: DVec3, mu: f64) -> Option<(f64, f64)> {
 /// [`csp_ui::tutorial::TutorialInput`] and drive the checklist. Reads
 /// [`FlightSnapshot`] directly (not `FlightUiData`, so it stays
 /// independent of system ordering within the schedule); the focused
-/// vessel is `vessels.first()`, the same convention `flight_present`
-/// uses.
+/// vessel is [`focus_vessel`]'s pick — literally the same accessor
+/// `flight_present` uses.
 pub(crate) fn tutorial_drive(
     snap: Res<FlightSnapshot>,
     vab_input: Res<VabInput>,
@@ -64,7 +64,7 @@ pub(crate) fn tutorial_drive(
     let env = snap.env.as_ref();
     let mut apoapsis_m = None;
     let mut periapsis_m = None;
-    if let (Some(v), Some(env)) = (snap.vessels.first(), env)
+    if let (Some(v), Some(env)) = (focus_vessel(&snap.vessels), env)
         && let Some((ra, rp)) = osculating_apsides(v.com - env.body_center, v.vel, env.mu_m3_per_s2)
     {
         apoapsis_m = Some(ra - env.radius_m);
@@ -79,8 +79,8 @@ pub(crate) fn tutorial_drive(
             .analysis()
             .is_some_and(|a| a.stages.iter().any(|s| s.thrust_vac_n > 0.0)),
         has_vessel: !snap.vessels.is_empty(),
-        throttle: snap.vessels.first().map_or(0.0, |v| v.throttle),
-        alt_m: match (snap.vessels.first(), env) {
+        throttle: focus_vessel(&snap.vessels).map_or(0.0, |v| v.throttle),
+        alt_m: match (focus_vessel(&snap.vessels), env) {
             (Some(v), Some(env)) => (v.com - env.body_center).norm() - env.radius_m,
             _ => 0.0,
         },

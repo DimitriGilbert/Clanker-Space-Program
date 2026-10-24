@@ -15,6 +15,9 @@ csp-core = { workspace = true }
 # and transmittance LUT are bit-stable across platforms (visual
 # determinism — presentation data, never sim-hashed).
 libm = { workspace = true }
+# Surface-acquire degradation reporting (begin_frame's warn-once on
+# Timeout/Occluded/Validation). No-op without a logger; wasm-safe.
+log = { workspace = true }
 
 [dev-dependencies]
 # WGSL validation gate (tests only): parses + full-validates this crate's
