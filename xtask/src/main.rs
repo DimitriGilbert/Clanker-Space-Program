@@ -46,10 +46,15 @@ struct Staged {
 /// `csp_bench::replay::record` replays its own output and refuses a
 /// recording that cannot reproduce its recorded final hash.
 ///
-/// Two hard refusals:
+/// Hard refusals:
 ///
 /// - **dirty tree** — `git status --porcelain` must be empty, so the
 ///   blessed commit contains exactly the regeneration;
+/// - **partial artifact set** — a fixture dir holding SOME of the
+///   `ARTIFACT_FILES` (e.g. `expected-hash.txt` without `replay.bin`)
+///   is ambiguous: it cannot load as an existing golden, but treating
+///   it as brand-new would skip the hash-change refusal. The dir must
+///   be made all-or-nothing first;
 /// - **hash changed without a `HASH_SCHEMA_VERSION` bump** — if the
 ///   re-recorded final hash differs from the committed one while
 ///   `csp_core::HASH_SCHEMA_VERSION` is unchanged, blessing would hide a
@@ -98,6 +103,15 @@ fn refuse_on_dirty_tree(root: &Path) {
 #[allow(clippy::expect_used)]
 fn stage_goldens(root: &Path) -> Vec<Staged> {
     let fixtures = root.join("data/test-fixtures");
+    // "Is this dir a golden?" keys on ANY artifact file, not just
+    // replay.bin — a partial set (expected-hash.txt without replay.bin,
+    // say) is still a committed golden, not a blank fixture dir.
+    let has_artifacts = |dir: &Path| {
+        csp_bench::replay::ARTIFACT_FILES
+            .iter()
+            .filter(|f| dir.join(f).exists())
+            .count()
+    };
     // A committed golden whose scenario recipe no longer exists cannot be
     // re-recorded — refuse rather than silently leaving it stale.
     let mut orphans = Vec::new();
@@ -106,7 +120,7 @@ fn stage_goldens(root: &Path) -> Vec<Staged> {
         .flatten()
     {
         let dir = e.path();
-        if dir.is_dir() && dir.join(csp_bench::replay::REPLAY_FILE).exists() {
+        if dir.is_dir() && has_artifacts(&dir) > 0 {
             let name = dir
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -136,8 +150,8 @@ fn stage_goldens(root: &Path) -> Vec<Staged> {
             eprintln!("bless-goldens: recording '{name}' failed: {e}");
             exit(2);
         });
-        let (old_expected, old_schema_version) =
-            if dir.join(csp_bench::replay::REPLAY_FILE).exists() {
+        let (old_expected, old_schema_version) = match has_artifacts(&dir) {
+            n if n == csp_bench::replay::ARTIFACT_FILES.len() => {
                 let (old_artifact, old_expected) = csp_bench::replay::load_golden(&dir)
                     .unwrap_or_else(|e| {
                         eprintln!("bless-goldens: loading '{}' failed: {e}", dir.display());
@@ -147,9 +161,29 @@ fn stage_goldens(root: &Path) -> Vec<Staged> {
                     Some(old_expected),
                     Some(old_artifact.fingerprint.hash_schema_version),
                 )
-            } else {
-                (None, None)
-            };
+            }
+            0 => (None, None),
+            n => {
+                // A partial artifact set is not a blank slate: keying
+                // "new" on replay.bin alone would let a dir holding
+                // only expected-hash.txt skip the hash-change refusal
+                // and have its artifacts overwritten unchecked.
+                let present: Vec<&str> = csp_bench::replay::ARTIFACT_FILES
+                    .iter()
+                    .copied()
+                    .filter(|f| dir.join(f).exists())
+                    .collect();
+                eprintln!(
+                    "bless-goldens: refusing — '{}' holds a partial golden \
+                     ({n}/{} artifacts: {}). Restore or delete the artifact files \
+                     so the dir is all-or-nothing.",
+                    dir.display(),
+                    csp_bench::replay::ARTIFACT_FILES.len(),
+                    present.join(", ")
+                );
+                exit(2);
+            }
+        };
         staged.push(Staged {
             dir,
             name,
@@ -226,13 +260,16 @@ fn write_goldens(staged: &[Staged], reason: Option<&str>) {
 ///
 /// 1. `cargo build -p csp-app --lib --release --target wasm32-unknown-unknown`
 ///    — the §8.2 wasm compile gate, run for real.
-/// 2. `wasm-bindgen --target web --out-dir apps/demo/dist` over the
-///    cdylib — `wasm-bindgen-cli` must match the crate version
-///    (workspace pin 0.2.129; the CLI itself refuses a mismatched
-///    .wasm). Absent → the exact commands are printed and the task
-///    exits non-zero: §8.2's "tooling failure is loud failure", never
-///    a silent half-artifact.
-/// 3. `apps/demo/index.html` is copied beside the bundle.
+/// 2. `wasm-bindgen --target web` over the cdylib into a **staging**
+///    dir that only renames to `apps/demo/dist` on success — a failed
+///    or missing bindgen must not leave a half-populated `dist/`
+///    behind (the old flow wrote `index.html` into `dist/` before
+///    bindgen even ran). `wasm-bindgen-cli` must match the crate
+///    version (workspace pin 0.2.129; the CLI itself refuses a
+///    mismatched .wasm). Absent → the exact commands are printed and
+///    the task exits non-zero: §8.2's "tooling failure is loud
+///    failure", never a silent half-artifact.
+/// 3. `apps/demo/index.html` is staged beside the bundle.
 fn build_web() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -247,6 +284,7 @@ fn build_web() {
             "--release",
             "--target",
             "wasm32-unknown-unknown",
+            "--locked",
         ])
         .current_dir(&root)
         .status()
@@ -260,17 +298,23 @@ fn build_web() {
     }
     let wasm = root.join("target/wasm32-unknown-unknown/release/csp_app.wasm");
     let dist = root.join("apps/demo/dist");
-    if let Err(e) = std::fs::create_dir_all(&dist) {
-        eprintln!("build-web: cannot create {}: {e}", dist.display());
+    let stage = root.join("apps/demo/.dist-staging");
+    if stage.exists()
+        && let Err(e) = std::fs::remove_dir_all(&stage)
+    {
+        eprintln!("build-web: cannot clear {}: {e}", stage.display());
         exit(2);
     }
-    if let Err(e) = std::fs::copy(root.join("apps/demo/index.html"), dist.join("index.html")) {
-        eprintln!("build-web: cannot copy index.html: {e}");
+    if let Err(e) = std::fs::create_dir_all(&stage) {
+        eprintln!("build-web: cannot create {}: {e}", stage.display());
         exit(2);
+    }
+    if let Err(e) = std::fs::copy(root.join("apps/demo/index.html"), stage.join("index.html")) {
+        build_web_fail(&stage, 2, &format!("cannot copy index.html: {e}"));
     }
     let bindgen = Command::new("wasm-bindgen")
         .args(["--target", "web", "--out-dir"])
-        .arg(&dist)
+        .arg(&stage)
         .arg("--out-name")
         .arg("csp_app")
         .arg(&wasm)
@@ -278,6 +322,29 @@ fn build_web() {
         .status();
     match bindgen {
         Ok(s) if s.success() => {
+            // All artifacts exist — swap dist/ in one rename so the
+            // output is never observed half-written.
+            if let Ok(md) = std::fs::symlink_metadata(&dist) {
+                let removed = if md.is_dir() {
+                    std::fs::remove_dir_all(&dist)
+                } else {
+                    std::fs::remove_file(&dist)
+                };
+                if let Err(e) = removed {
+                    build_web_fail(
+                        &stage,
+                        2,
+                        &format!("cannot remove old {}: {e}", dist.display()),
+                    );
+                }
+            }
+            if let Err(e) = std::fs::rename(&stage, &dist) {
+                build_web_fail(
+                    &stage,
+                    2,
+                    &format!("cannot move {} into place: {e}", stage.display()),
+                );
+            }
             println!(
                 "build-web: artifact at {} — serve it with any static file server, e.g.\n  \
                  python3 -m http.server -d apps/demo/dist",
@@ -285,8 +352,8 @@ fn build_web() {
             );
         }
         Ok(s) => {
-            eprintln!("build-web: wasm-bindgen failed ({s})");
-            exit(s.code().unwrap_or(2));
+            let code = s.code().unwrap_or(2);
+            build_web_fail(&stage, code, &format!("wasm-bindgen failed ({s})"));
         }
         Err(e) => {
             eprintln!(
@@ -298,9 +365,17 @@ fn build_web() {
                  cp apps/demo/index.html apps/demo/dist/",
                 wasm.display()
             );
-            exit(2);
+            build_web_fail(&stage, 2, "wasm-bindgen unavailable");
         }
     }
+}
+
+/// Clear the staging dir and exit — a bindgen failure must leave
+/// neither a half-populated `dist/` nor a stale `.dist-staging/`.
+fn build_web_fail(stage: &Path, code: i32, msg: &str) -> ! {
+    let _ = std::fs::remove_dir_all(stage);
+    eprintln!("build-web: {msg}");
+    exit(code);
 }
 
 fn main() {

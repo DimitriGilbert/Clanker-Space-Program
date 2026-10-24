@@ -215,12 +215,20 @@ fn collect_files(dir: &Path, prefix: &str, out: &mut Vec<String>) {
 // See lint_deps::tree — tooling failure is loud failure here (§8.2).
 #[allow(clippy::expect_used)]
 pub fn lint_attribution() {
-    let attr = std::fs::read_to_string("data/ATTRIBUTION.md").expect("data/ATTRIBUTION.md missing");
+    // Anchor to the manifest dir like the bless-goldens/gen_biome_maps
+    // siblings — CWD-relative paths would panic (or silently lint the
+    // wrong tree) when invoked outside the repo root.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let attr = std::fs::read_to_string(root.join("data/ATTRIBUTION.md"))
+        .expect("data/ATTRIBUTION.md missing");
     let mut files = Vec::new();
-    collect_files(Path::new("data"), "data", &mut files);
+    collect_files(&root.join("data"), "data", &mut files);
     // §3.7 covers assets/ too; it does not exist yet — walk it when it does.
-    if Path::new("assets").is_dir() {
-        collect_files(Path::new("assets"), "assets", &mut files);
+    if root.join("assets").is_dir() {
+        collect_files(&root.join("assets"), "assets", &mut files);
     }
     let violations = check_attribution(&attr, &files);
     if violations.is_empty() {

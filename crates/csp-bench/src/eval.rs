@@ -208,7 +208,9 @@ pub struct SuiteEntry {
 /// Run every `*.ron` in `dir` (sorted by file name — deterministic
 /// suite order), returning one entry per file. `fixtures_root`
 /// resolves `WorldSpec::Fixture{name}` (this repo's convention:
-/// `data/test-fixtures/`).
+/// `data/test-fixtures/`). A directory with no scenarios is a harness
+/// error, not a vacuous pass — an empty suite reporting `all_pass`
+/// would green-light a typo'd path.
 pub fn run_suite(dir: &Path, fixtures_root: &Path) -> Result<Vec<SuiteEntry>, EvalError> {
     // Entry-level IO failures surface as suite errors — `.flatten()`
     // would silently drop a scenario the directory listing failed on.
@@ -218,6 +220,12 @@ pub fn run_suite(dir: &Path, fixtures_root: &Path) -> Result<Vec<SuiteEntry>, Ev
     }
     files.retain(|p| p.extension().and_then(|e| e.to_str()) == Some("ron"));
     files.sort();
+    if files.is_empty() {
+        return Err(EvalError::Invalid(format!(
+            "suite dir {} contains no *.ron scenario files",
+            dir.display()
+        )));
+    }
     Ok(files
         .into_iter()
         .map(|path| {

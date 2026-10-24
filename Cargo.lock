@@ -4998,6 +4998,7 @@ dependencies = [
  "csp-bench",
  "ron",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -56,6 +56,11 @@ impl Ban {
 /// `rayon`, `tokio`, `getrandom`, or `rand` facade anywhere in the
 /// dependency tree. `std::time` is deliberately absent — it is a code-level
 /// ban enforced by the crates' `clippy.toml`, not a package.
+///
+/// This list is necessarily authored (which members ARE the domain is a
+/// policy decision), but [`check_membership`] proves every name is a real
+/// workspace member so a stale or typo'd entry cannot silently stop
+/// linting.
 const DETERMINISM_CRATES: &[&str] = &["csp-core", "csp-data", "csp-sim", "csp-phys"];
 const DETERMINISM_BANS: &[Ban] = &[
     Ban::Prefix("bevy_"),
@@ -185,25 +190,6 @@ const WASM_BANS: &[Ban] = &[
 /// activates it, `tokio` is allowed ONLY through this edge — every other
 /// path to `tokio` is a violation.
 const TOKIO_ALLOWED_PARENT: &str = "wasm-bindgen-futures";
-
-/// Every workspace member `lint-deps` walks (§2.1's "the dependency lint
-/// must still list it" — missing crates simply are not trees yet; a member
-/// present in the workspace is linted).
-const ALL_PKGS: &[&str] = &[
-    "csp-core",
-    "csp-data",
-    "csp-sim",
-    "csp-phys",
-    "csp-view",
-    "csp-render",
-    "csp-ui",
-    "csp-app",
-    "csp-script",
-    "csp-ai",
-    "csp-server",
-    "csp-bench",
-    "xtask",
-];
 
 /// One node of a parsed `cargo tree --format "{p}"` output.
 #[derive(Debug)]
@@ -469,6 +455,9 @@ pub fn check_deps(trees: &[PackageTree]) -> Vec<Violation> {
 #[allow(clippy::expect_used)]
 fn tree(pkg: &str, wasm: bool) -> PackageTree {
     let mut cmd = Command::new("cargo");
+    // `--locked`: a nominally read-only lint must never resolve (and
+    // thereby rewrite Cargo.lock) as a side effect — a stale lockfile
+    // is itself a loud failure.
     cmd.args([
         "tree",
         "-p",
@@ -477,6 +466,7 @@ fn tree(pkg: &str, wasm: bool) -> PackageTree {
         "normal,build",
         "--format",
         "{p}",
+        "--locked",
     ]);
     if wasm {
         cmd.args(["--target", "wasm32-unknown-unknown"]);
@@ -524,6 +514,7 @@ fn rhai_feature_set(wasm: bool) -> std::collections::BTreeSet<String> {
         "normal",
         "--format",
         "{p} {f}",
+        "--locked",
     ]);
     if wasm {
         cmd.args(["--target", "wasm32-unknown-unknown"]);
@@ -555,9 +546,12 @@ fn rhai_feature_set(wasm: bool) -> std::collections::BTreeSet<String> {
             // prints the feature list comma-joined in ONE token —
             // split on commas too or every feature lands in the set as
             // a single glued blob and membership checks never match.
+            // The `(*)` dedup marker on an already-printed node is not
+            // a feature either — it would land in both sets and turn a
+            // real asymmetric dedup into a false parity failure.
             for part in tok.trim_matches(['(', ')']).split(',') {
                 let t = part.trim_matches(['(', ')']);
-                if !t.is_empty() && t != "proc-macro" {
+                if !t.is_empty() && t != "proc-macro" && t != "*" {
                     features.insert(t.to_string());
                 }
             }
@@ -576,17 +570,88 @@ fn rhai_feature_set(wasm: bool) -> std::collections::BTreeSet<String> {
 /// numeric semantics; `sync` changes engine sharing.
 const RHAI_BANNED_FEATURES: &[&str] = &["unchecked", "only_i32", "f32_float", "sync"];
 
-/// `cargo xtask lint-deps`: collect every crate's tree, run the rule
+/// The workspace's member package names, from
+/// `cargo metadata --no-deps` — the authoritative answer to the glob
+/// `members = ["crates/*", "xtask"]`. The lint walks every member, so
+/// membership must be derived, not listed: a 14th crate under
+/// `crates/` would pass a hand-maintained list unwalked.
+#[allow(clippy::expect_used)] // See `tree` — tooling failure is loud failure (§8.2).
+fn workspace_members() -> Vec<String> {
+    let out = Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1", "--locked"])
+        .output()
+        .expect("cargo metadata failed to run");
+    if !out.status.success() {
+        eprintln!(
+            "cargo metadata failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        exit(2);
+    }
+    // `--no-deps` leaves `packages` holding exactly the workspace
+    // members — no resolved graph is fetched.
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("cargo metadata output was not JSON");
+    let mut names: Vec<String> = json["packages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p["name"].as_str().map(str::to_string))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Cross-check the authored crate lists against real workspace
+/// membership. A name in `DETERMINISM_CRATES`/`WASM_PKGS`/`ALLOW`/
+/// `EXTRA_BANS` that is not a member means a typo or a removed crate —
+/// either way the rule it claims to enforce silently runs on nothing.
+pub fn check_membership(members: &[String]) -> Vec<Violation> {
+    let mut out = Vec::new();
+    let mut check = |list: &str, pkg: &str| {
+        if !members.iter().any(|m| m == pkg) {
+            out.push(Violation {
+                pkg: pkg.to_string(),
+                rule: "stale-crate-list",
+                detail: format!(
+                    "{list} names {pkg} — not a workspace member (typo or removed crate?)"
+                ),
+            });
+        }
+    };
+    for p in DETERMINISM_CRATES {
+        check("DETERMINISM_CRATES", p);
+    }
+    for p in WASM_PKGS {
+        check("WASM_PKGS", p);
+    }
+    for (p, _) in ALLOW {
+        check("ALLOW", p);
+    }
+    for (p, _) in EXTRA_BANS {
+        check("EXTRA_BANS", p);
+    }
+    out
+}
+
+/// `cargo xtask lint-deps`: collect every member's tree, run the rule
 /// engine, print all violations and exit 1 if any exist.
 pub fn lint_deps() {
+    let members = workspace_members();
     let mut trees = Vec::new();
-    for pkg in ALL_PKGS {
+    for pkg in &members {
         trees.push(tree(pkg, false));
     }
     for pkg in WASM_PKGS {
-        trees.push(tree(pkg, true));
+        // Non-member entries skip the tree walk; check_membership
+        // reports the stale name itself.
+        if members.iter().any(|m| m == pkg) {
+            trees.push(tree(pkg, true));
+        }
     }
-    let mut violations = check_deps(&trees);
+    let mut violations = check_membership(&members);
+    violations.extend(check_deps(&trees));
     // M9a §2.10: native↔wasm32 Rhai feature parity + the banned
     // feature list, on every commit.
     let native = rhai_feature_set(false);
@@ -775,15 +840,18 @@ mod tests {
         assert!(parse_tree("csp-sim", false, "csp-core v0.0.0\n").is_err());
     }
 
-    /// §8.2 determinism-lints row, second half: the four crates' clippy.toml
-    /// files must exist, be byte-identical, and carry every required entry —
-    /// a lint that differs between crates is a lint that does not exist.
+    /// §8.2 determinism-lints row, second half: the determinism crates'
+    /// clippy.toml files must exist, be byte-identical, and carry every
+    /// required entry — a lint that differs between crates is a lint that
+    /// does not exist. The crate list is `DETERMINISM_CRATES` itself, and
+    /// the reverse check proves no other crate opted into the mechanism.
     #[test]
     fn determinism_clippy_tomls_are_identical_and_complete() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("xtask manifest dir has a parent");
-        let crates = ["csp-core", "csp-data", "csp-phys", "csp-sim"];
+        // The crate list is DETERMINISM_CRATES itself — a duplicated
+        // list here would silently stop testing a new domain member.
         let required = [
             // §2.7 RNG ban — seed_from_u64 is a rand_core impl detail.
             "rand_core::SeedableRng::seed_from_u64",
@@ -807,7 +875,7 @@ mod tests {
             "std::time::Duration",
         ];
         let mut texts = Vec::new();
-        for c in crates {
+        for c in DETERMINISM_CRATES {
             let p = root.join(format!("crates/{c}/clippy.toml"));
             let text = std::fs::read_to_string(&p)
                 .unwrap_or_else(|e| panic!("{} unreadable: {e}", p.display()));
@@ -818,8 +886,23 @@ mod tests {
         }
         assert!(
             texts.windows(2).all(|w| w[0] == w[1]),
-            "the four determinism clippy.tomls must be byte-identical"
+            "the determinism crates' clippy.tomls must be byte-identical"
         );
+        // The reverse direction too: a crate carrying a clippy.toml
+        // without being in DETERMINISM_CRATES opted into the mechanism
+        // untested — force the list update.
+        for e in std::fs::read_dir(root.join("crates"))
+            .expect("crates/ missing")
+            .flatten()
+        {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if e.path().join("clippy.toml").is_file() {
+                assert!(
+                    DETERMINISM_CRATES.contains(&name.as_str()),
+                    "{name}/clippy.toml exists but {name} is not in DETERMINISM_CRATES"
+                );
+            }
+        }
     }
 
     /// data/balance.ron (and en.ron) must be real RON — schema_versioned,

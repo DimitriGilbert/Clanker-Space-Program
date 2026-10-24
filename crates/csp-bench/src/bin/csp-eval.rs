@@ -71,6 +71,20 @@ fn run() -> Result<ExitCode, EvalError> {
     }
 
     if let Some(dir) = suite_dir {
+        // Reject the silent drops: a positional scenario beside
+        // `--suite` would be ignored, and `--transcript` is defined
+        // for single-scenario mode only — guessing either is worse
+        // than refusing.
+        if scenario_path.is_some() {
+            return Err(EvalError::Invalid(format!(
+                "{USAGE}\npositional scenario and --suite are mutually exclusive"
+            )));
+        }
+        if transcript_out.is_some() {
+            return Err(EvalError::Invalid(format!(
+                "{USAGE}\n--transcript is single-scenario mode only; not valid with --suite"
+            )));
+        }
         let entries = csp_bench::eval::run_suite(&dir, &fixtures_root)?;
         let mut all_pass = true;
         for entry in &entries {

@@ -71,13 +71,22 @@ fn run() -> Result<(), String> {
         None => World::new(),
     };
     let mut game = LocalGame::new(world, save_dir);
-    // On `session.load` the fixture's construction config (engine,
-    // driver, budgets) must be re-installed — it is §7.3's
-    // data-derived channel, never in the snapshot.
+    // On `session.load` the fixture's script engine and autopilot
+    // driver must be re-installed — they are §7.3's data-derived
+    // channel, never in the snapshot (`World::restore` leaves them
+    // `None`). `script_op_budget` IS serialized, but the reload
+    // re-imposes the fixture's own balance.ron over whatever budget a
+    // foreign save happened to carry.
     if let Some(dir) = fixture {
         game = game.with_reconfigure(move |w: &mut World| {
-            if let Ok(bal) = csp_data::load_balance(&dir.join("balance.ron")) {
-                w.set_script_op_budget(bal.script_op_budget);
+            let balance = dir.join("balance.ron");
+            match csp_data::load_balance(&balance) {
+                Ok(bal) => w.set_script_op_budget(bal.script_op_budget),
+                Err(e) => eprintln!(
+                    "csp-mcp: reloading {} failed ({e}) — keeping the loaded \
+                     save's script op budget",
+                    balance.display()
+                ),
             }
             w.set_script_engine(Box::new(csp_script::RhaiHost::new()));
             w.set_autopilot_driver(Box::new(csp_ai::AscentAutopilot::new()));

@@ -46,8 +46,11 @@ pub const FINGERPRINT_FILE: &str = "fingerprint.json";
 /// Golden artifacts are recording outputs, not fixture data —
 /// [`fixture_hash`] skips exactly these names, and only at the
 /// fixture dir's top level: a *nested* file that happens to share a
-/// name is fixture data and must hash like any other.
-const ARTIFACT_FILES: &[&str] = &[REPLAY_FILE, EXPECTED_HASH_FILE, FINGERPRINT_FILE];
+/// name is fixture data and must hash like any other. Public so
+/// bless-goldens keys "is this dir a golden?" on the full set — a
+/// *partial* artifact set (e.g. `expected-hash.txt` without
+/// `replay.bin`) must never read as brand-new.
+pub const ARTIFACT_FILES: &[&str] = &[REPLAY_FILE, EXPECTED_HASH_FILE, FINGERPRINT_FILE];
 
 /// The §7.1 determinism fingerprint — every field that can legitimately
 /// change a golden hash without a sim bug, so a red build is diagnosable

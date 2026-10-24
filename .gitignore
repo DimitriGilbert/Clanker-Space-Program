@@ -1,3 +1,4 @@
 /target
 *.pdb
 apps/demo/dist/
+apps/demo/.dist-staging/

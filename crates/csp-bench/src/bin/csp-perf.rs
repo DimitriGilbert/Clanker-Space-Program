@@ -78,13 +78,21 @@ fn main() -> ExitCode {
     }
 }
 
-/// Trim a detail line for the summary table.
+/// Trim a detail line for the summary table. The byte cut is floored
+/// to a char boundary — detail strings carry non-ASCII (`≤`, `—`, `§`,
+/// `×`, `⁵`), so a raw `&s[..MAX]` can panic mid-char.
 fn shorten(s: &str) -> String {
     const MAX: usize = 110;
     if s.len() <= MAX {
         s.to_string()
     } else {
-        format!("{}…", &s[..MAX])
+        let end = s
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|&i| i <= MAX)
+            .last()
+            .unwrap_or(0);
+        format!("{}…", &s[..end])
     }
 }
 

@@ -143,18 +143,31 @@ const MAPS: &[MapSpec] = &[
     },
 ];
 
-/// Rasterize a spec into W×H palette indices (row-major, top row = +90°).
-fn rasterize(spec: &MapSpec) -> Vec<u8> {
+/// Rasterize a spec into W×H palette indices (row-major, top row =
+/// +90°). A pixel rule returning an index outside `spec.palette` is an
+/// authoring error — encode it and the PNG indexes a PLTE entry that
+/// does not exist — so it fails here rather than shipping a corrupt
+/// map.
+fn rasterize(spec: &MapSpec) -> Result<Vec<u8>, String> {
     let mut px = Vec::with_capacity((W * H) as usize);
     for y in 0..H {
         // Pixel-centre coordinates: equirect, lat +90 (top) to -90.
         let lat = 90.0 - (f64::from(y) + 0.5) * (180.0 / f64::from(H));
         for x in 0..W {
             let lon = (f64::from(x) + 0.5) * (360.0 / f64::from(W));
-            px.push((spec.pixel)(lon, lat));
+            let idx = (spec.pixel)(lon, lat);
+            if usize::from(idx) >= spec.palette.len() {
+                return Err(format!(
+                    "{}: pixel rule returned index {idx} at lon {lon:.1} lat {lat:.1} \
+                     but the palette has {} entries",
+                    spec.body,
+                    spec.palette.len()
+                ));
+            }
+            px.push(idx);
         }
     }
-    px
+    Ok(px)
 }
 
 // ---- minimal deterministic PNG encoder --------------------------------
@@ -256,7 +269,7 @@ fn run(check: bool) -> Result<(), String> {
     let mut stale = Vec::new();
     for spec in MAPS {
         let path = base.join(spec.body).join("biomes.png");
-        let bytes = encode_indexed_png(W, H, spec.palette, &rasterize(spec));
+        let bytes = encode_indexed_png(W, H, spec.palette, &rasterize(spec)?);
         if check {
             let on_disk = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
             if on_disk != bytes {
@@ -277,7 +290,18 @@ fn run(check: bool) -> Result<(), String> {
 }
 
 fn main() {
-    let check = std::env::args().skip(1).any(|a| a == "--check");
+    // Strict flags — `--check` must not silently swallow a typo'd
+    // second argument (e.g. `--chek` would run the WRITE path).
+    let mut check = false;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--check" => check = true,
+            other => {
+                eprintln!("usage: gen_biome_maps [--check]\nunknown arg {other}");
+                exit(2);
+            }
+        }
+    }
     if let Err(e) = run(check) {
         eprintln!("gen_biome_maps: {e}");
         exit(1);

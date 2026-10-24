@@ -12,6 +12,9 @@ default-run = "xtask"
 # bless-goldens re-records scenarios through the harness itself rather than
 # shelling out to `cargo run` — one process, no nested cargo.
 csp-bench = { workspace = true }
+# lint-deps derives the workspace member list from `cargo metadata` —
+# hand-maintaining it would let a new member pass unwalked.
+serde_json = { workspace = true }
 
 [dev-dependencies]
 # lint-deps tests prove data/*.ron files parse with the real RON reader —
