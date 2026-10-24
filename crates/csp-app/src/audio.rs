@@ -604,6 +604,7 @@ mod tests {
                 plumes: Vec::new(),
                 com: csp_core::DVec3::ZERO,
                 latched: false,
+                tanks: Vec::new(),
             }],
             env: None,
         };

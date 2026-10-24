@@ -241,6 +241,71 @@ fn patch_might_hold_sea(
     lo * amplitude_m <= (datum_m - radius_m) + margin
 }
 
+/// The chase camera's ground floor along a unit `dir` (bubble-frame,
+/// inertial): the local terrain surface radius — `radius_m` plus the
+/// baked heightfield's bilinear sample scaled by the body's
+/// amplitude — taken as the MAX over a ±1.5-texel ring around the
+/// direction. A bilinear texel cell's peak sits at a corner, so the
+/// ring bounds the *rendered* surface under the eye even when the eye
+/// direction lands mid-cell on a spike; [`crate::flight`] clamps the
+/// solved eye above this + the eye margin so an orbit drag cannot
+/// bury the camera inside a hill (the datum-only floor let terrain
+/// poke through — the camera-went-underground defect).
+///
+/// Body resolution and seeding match [`build_packet`] exactly (the
+/// authored table, else the `synthesized` fallback), and the
+/// inertial→fixed `unspin` conjugate is the same `R(axis, −phase)`
+/// the shader applies — the clamp measures the same surface the pass
+/// draws.
+pub(crate) fn surface_floor_radius(
+    cfg: &TerrainConfig,
+    cache: &mut TerrainCache,
+    env: &FlightEnv,
+    dir: DVec3,
+) -> f64 {
+    let body_id = env.body.as_ref().map_or("", |b| b.as_str());
+    let body = cfg
+        .bodies
+        .get(body_id)
+        .cloned()
+        .unwrap_or_else(|| TerrainBody::synthesized(body_id, env.radius_m));
+    let field = cache.field(body_id, body.seed);
+    let phase = env.spin_phase.rem_euclid(2.0 * core::f64::consts::PI);
+    let fixed = if phase != 0.0 {
+        DQuat::from_axis_angle(env.spin_axis, -phase).rotate(dir)
+    } else {
+        dir
+    };
+    // Ring taps at ~1.5 equirect texels of angular offset (2π/W ≈
+    // 6.1 mrad at 1024 wide) — near the poles a fixed offset covers
+    // more longitude texels, which only widens the bound.
+    const TAP: f64 = 1.5 * 2.0 * core::f64::consts::PI / HEIGHTFIELD_W as f64;
+    let (t1, t2) = {
+        let a = if fixed.z.abs() < 0.9 {
+            DVec3::Z
+        } else {
+            DVec3::X
+        };
+        let t = {
+            let t = fixed.cross(a);
+            if t.norm_squared() > 1.0e-12 {
+                t / t.norm()
+            } else {
+                DVec3::X
+            }
+        };
+        (t, fixed.cross(t))
+    };
+    let mut h = field.sample_dir(fixed);
+    for off in [t1 * TAP, -t1 * TAP, t2 * TAP, -t2 * TAP] {
+        let d = fixed + off;
+        if d.norm_squared() > 1.0e-12 {
+            h = h.max(field.sample_dir(d / d.norm()));
+        }
+    }
+    env.radius_m + h * body.amplitude_m
+}
+
 /// Cast a row-major f64 4×4 into the WGSL column-major `[[f32;4];4]`
 /// (`out[col][row] = m[row][col]`).
 fn m4_wgsl(m: &[[f64; 4]; 4]) -> [[f32; 4]; 4] {

@@ -257,6 +257,15 @@ fn boot_scene_has_real_geometry() {
     // The app's own startup path — `App::new_inner` calls exactly this.
     view.seed_starter_craft().expect("starter seed");
     view.set_flight_viewport(f64::from(W), f64::from(H));
+    // The authored launch site is authored where the baked heightfield
+    // sits ~at the sim's datum (the old lon-π site was under a ~+57 m
+    // plateau and a datum spawn rendered buried): the default 60 m
+    // chase camera now frames the craft on flat ground, but a pulled
+    // back camera keeps the horizon — lit terrain + sky + pad — in the
+    // frame so the pixel-variety assertions measure real scene content.
+    view.world
+        .resource_mut::<csp_view::flight::FlightInput>()
+        .distance_m = 300.0;
     for _ in 0..3 {
         frame(&mut view, 1);
     }

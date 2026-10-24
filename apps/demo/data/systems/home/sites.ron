@@ -10,8 +10,15 @@
             id: "terrin-launch",
             display_name: "site.terrin-launch",
             body: "terrin",
-            latitude_rad: 0.0,
-            longitude_rad: 0.0,
+            // Mirror of data/systems/home/sites.ron: just south of the
+            // equator on a shoreline where the baked heightfield
+            // (noise_seed 601) is ~0 m against the sim's datum contact
+            // sphere — the old lon-π site sits under a +57 m hill and
+            // a datum-spawned craft would render buried. lon 2.916 is
+            // ~0.23 rad west of the t=0 sun meridian: a morning pad,
+            // ~1.7 h of daylight at spawn.
+            latitude_rad: -0.092,
+            longitude_rad: 2.916,
             altitude_m: 0.0,
             launch: true,
             resource_yields: [
@@ -25,7 +32,7 @@
             display_name: "site.terrin-downrange",
             body: "terrin",
             latitude_rad: 0.0,
-            longitude_rad: 0.7853981633974483,
+            longitude_rad: 3.9269908169872414,
             altitude_m: 0.0,
             launch: false,
             resource_yields: [

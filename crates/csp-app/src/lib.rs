@@ -94,6 +94,13 @@ const ZOOM_LN_PER_PX: f64 = 0.003;
 /// Screen px of pan per WASD/arrow key event (winit auto-repeat keeps it
 /// moving while held).
 const PAN_STEP_PX: f64 = 80.0;
+/// Throttle fraction per `ThrottleUp`/`ThrottleDown` key event (the
+/// KSP-style Shift/Ctrl fine control — `accepts_repeat` steps it while
+/// held at the OS repeat rate).
+const THROTTLE_STEP: f64 = 0.1;
+/// Commanded body-frame angular rate per held attitude key, rad/s —
+/// the `SetAttitude` control stand-in's "stick deflection" (≈46°/s).
+const ATTITUDE_RATE_RAD_S: f64 = 0.8;
 /// Max cursor travel (px) between LMB down/up that still counts as a
 /// click — anything further is a camera orbit drag and must not also
 /// fire a VAB pick.
@@ -164,6 +171,12 @@ struct App {
     /// as "1" — a token match would never clear and would swallow
     /// every future "!" press until a focus loss reset it.
     captured_key: Option<winit::keyboard::PhysicalKey>,
+    /// Attitude actions currently held (flight mode) — the set is the
+    /// angular-rate request [`Self::apply_attitude`] folds into one
+    /// `SetAttitude` command per change. Populated on key press,
+    /// depopulated on release; a focus loss clears it (the missed
+    /// release could never arrive) and re-issues a zero-rate hold.
+    attitude_held: std::collections::BTreeSet<KeyAction>,
     view: View,
     /// §2.6.3's controller — owns the warp ladder and the integer tick
     /// target; all wall-side, emitting only logged commands.
@@ -291,13 +304,44 @@ impl App {
     /// assembly (settings staging, difficulty flags, live settings).
     fn assemble(
         view: View,
-        settings: Settings,
+        mut settings: Settings,
         settings_path: Option<std::path::PathBuf>,
         craft_dir: std::path::PathBuf,
     ) -> Self {
         let (pick_tx, pick_rx) = std::sync::mpsc::channel();
         let mut view = view;
         let demo = view.is_demo();
+        // Settings-file migration: pre-`key-*` files bound the
+        // movement/throttle cluster by typed *character* ("w", "z") —
+        // layout-dependent tokens that leave AZERTY controls on the
+        // wrong keys. Migrate every character with a positional
+        // equivalent onto its `key-*` token (sanitize re-runs to
+        // absorb collisions the rewrite can produce), and say so —
+        // a silent remap is still a moved binding. Characters with no
+        // positional equivalent can't migrate; they get the honest
+        // "layout-dependent bindings exist" notice instead.
+        let migrated = settings_io::migrate_char_bindings(&mut settings.keys);
+        if migrated > 0 {
+            let dropped = settings.keys.sanitize();
+            log::warn!(
+                "settings: migrated {migrated} layout-dependent character binding(s) to positional key-* tokens ({dropped} collision(s) dropped)"
+            );
+            view.flight_notice(format!(
+                "SETTINGS — {migrated} KEY BINDING(S) MIGRATED TO POSITIONAL KEYS"
+            ));
+            view.set_settings_notice(Some(format!(
+                "migrated {migrated} layout-dependent character binding(s) to positional keys"
+            )));
+        }
+        let layout_bound = settings_io::layout_dependent_binding_count(&settings.keys);
+        if layout_bound > 0 {
+            log::warn!(
+                "settings: {layout_bound} key binding(s) use characters with no positional equivalent — layout-dependent"
+            );
+            view.set_settings_notice(Some(format!(
+                "{layout_bound} key binding(s) use layout-dependent characters — rebind them or Reset to defaults"
+            )));
+        }
         view.stage_settings(&settings);
         // The live keymap mirror — every hint bar and the controls
         // card prints *this*, never the staged edit copy.
@@ -323,6 +367,7 @@ impl App {
             map_dragging: false,
             lmb_press: None,
             captured_key: None,
+            attitude_held: std::collections::BTreeSet::new(),
             view,
             warp: WarpController::new(),
             last_frame: Instant::now(),
@@ -1230,7 +1275,7 @@ impl App {
                 // A held key must not count as a second "next press".
                 return;
             }
-            match settings_io::binding_for(&event.logical_key) {
+            match settings_io::event_binding(event) {
                 None => { /* unbindable key — keep listening */ }
                 Some(b) if b.as_str() == "escape" => {
                     self.captured_key = Some(event.physical_key);
@@ -1246,16 +1291,181 @@ impl App {
             }
             return;
         }
-        let Some(token) = settings_io::key_token(&event.logical_key) else {
-            return;
-        };
-        let Some(action) = self.settings.keys.action_for(&token) else {
+        // Physical-first resolution (§ M10 AZERTY): the `key-*` tokens
+        // name the key's *position* — a bound `key-w` fires on the
+        // W-position key whether the layout prints `w` or `z` on it.
+        // The logical token is the fallback for character bindings a
+        // user (or an old settings file) recorded by glyph.
+        let action = settings_io::keycode_token(&event.physical_key)
+            .and_then(|t| self.settings.keys.action_for(&t))
+            .or_else(|| {
+                settings_io::key_token(&event.logical_key)
+                    .and_then(|t| self.settings.keys.action_for(&t))
+            });
+        let Some(action) = action else {
             return;
         };
         if event.repeat && !action.accepts_repeat() {
             return;
         }
         self.dispatch(action);
+    }
+
+    /// The release-side resolver — the same physical-first order
+    /// [`Self::key_press`] uses, so a key that fired an attitude action
+    /// releases exactly that action regardless of layout.
+    fn action_of(&self, event: &winit::event::KeyEvent) -> Option<KeyAction> {
+        settings_io::keycode_token(&event.physical_key)
+            .and_then(|t| self.settings.keys.action_for(&t))
+            .or_else(|| {
+                settings_io::key_token(&event.logical_key)
+                    .and_then(|t| self.settings.keys.action_for(&t))
+            })
+    }
+
+    /// Mark an attitude action held and re-issue the combined rate
+    /// command (the `BTreeSet::insert` dedup makes OS key repeats free).
+    fn attitude_press(&mut self, action: KeyAction) {
+        if self.attitude_held.insert(action) {
+            self.apply_attitude();
+        }
+    }
+
+    /// Clear an attitude action on release and re-issue the combined
+    /// rate — an empty set commands a zero angular rate (the stand-in
+    /// control authority's "stop rotating" until M3+ real SAS).
+    fn attitude_release(&mut self, action: KeyAction) {
+        if self.attitude_held.remove(&action) {
+            self.apply_attitude();
+        }
+    }
+
+    /// Fold the held attitude set into one `SetAttitude` command on the
+    /// focused vessel's player FIFO — the sim's `SetAttitude` is the
+    /// documented M2 control stand-in, so held keys mean a commanded
+    /// body-frame angular rate, not a torque model. Axes (§3.7's
+    /// convention): nose = body +Z (pitch about +X), dorsal = +Y (yaw
+    /// about +Y), roll about +Z. Reads `sim` for the freshest pose —
+    /// the command carries an absolute `rot`, and the staged mirror's
+    /// one-frame-old pose would visibly snap the craft back.
+    fn apply_attitude(&mut self) {
+        if self.read_only {
+            self.attitude_held.clear();
+            return;
+        }
+        let Some(vessel) = self.view.flight_focus() else {
+            return;
+        };
+        let Some(body) = self.view.sim.vessels().get(&vessel).and_then(|v| v.body()) else {
+            // No InBubble body — a surface-latched pad craft or a
+            // rails vessel has no attitude surface to command (and
+            // refusing keeps an accidental WASD press from unlatching
+            // the parked craft).
+            return;
+        };
+        let rate = |neg: KeyAction, pos: KeyAction| -> f64 {
+            f64::from(
+                self.attitude_held.contains(&pos) as i8 - self.attitude_held.contains(&neg) as i8,
+            ) * ATTITUDE_RATE_RAD_S
+        };
+        // PanUp/Down are the W/S positions — KSP's pitch down/up;
+        // PanLeft/Right the A/D yaw; Roll Q/E.
+        let ang_vel = csp_core::DVec3::new(
+            rate(KeyAction::PanDown, KeyAction::PanUp),
+            rate(KeyAction::PanLeft, KeyAction::PanRight),
+            rate(KeyAction::RollRight, KeyAction::RollLeft),
+        );
+        self.view.enqueue_command(
+            SourceClass::Ui,
+            csp_view::PLAYER_SOURCE_ID,
+            SimCommand::SetAttitude {
+                vessel,
+                rot: body.rot,
+                ang_vel,
+            },
+        );
+    }
+
+    /// One `ThrottleUp`/`ThrottleDown` event — steps the focused
+    /// vessel's throttle fraction (read live from the sim body; a
+    /// latched craft reads 0 — its first step unlatches at
+    /// `THROTTLE_STEP`). `accepts_repeat` walks it while held.
+    fn throttle_nudge(&mut self, up: bool) {
+        if self.read_only {
+            self.view.vab_event(VabEvent::Notice(
+                "session is read-only — throttle not applied".to_string(),
+            ));
+            return;
+        }
+        let Some(vessel) = self.view.flight_focus() else {
+            return;
+        };
+        let current = self
+            .view
+            .sim
+            .vessels()
+            .get(&vessel)
+            .and_then(|v| v.body())
+            .map_or(0.0, |b| b.throttle);
+        let step = if up { THROTTLE_STEP } else { -THROTTLE_STEP };
+        self.view.enqueue_command(
+            SourceClass::Ui,
+            csp_view::PLAYER_SOURCE_ID,
+            SimCommand::SetThrottle {
+                vessel,
+                throttle: (current + step).clamp(0.0, 1.0),
+            },
+        );
+    }
+
+    /// The `Stage` key — the view drains the launch-captured
+    /// [`csp_view::flight::StagePlan`] into logged `JettisonPart`s.
+    fn stage_press(&mut self) {
+        if self.read_only {
+            self.view.vab_event(VabEvent::Notice(
+                "session is read-only — staging not applied".to_string(),
+            ));
+        } else {
+            self.view.fire_stage();
+        }
+    }
+
+    /// A focus loss can drop the releases that clear a captured key
+    /// and held attitude keys — clear both here (the craft gets a
+    /// zero-rate hold instead of spinning offscreen forever).
+    fn focus_lost(&mut self) {
+        self.captured_key = None;
+        if !self.attitude_held.is_empty() {
+            self.attitude_held.clear();
+            self.apply_attitude();
+        }
+    }
+
+    /// Record the glyph a physical key produced on this layout — the
+    /// hint bars show an AZERTY `z` where a QWERTY hint says `w`.
+    fn note_key_label(&mut self, event: &WindowEvent) {
+        if let WindowEvent::KeyboardInput { event, .. } = event
+            && let Some((token, label)) = settings_io::event_label(event)
+        {
+            self.view.set_key_label(token, label);
+        }
+    }
+
+    /// The KeyboardInput arm — presses dispatch the action (see
+    /// [`Self::key_press`]); releases clear held attitude verbs.
+    /// The release is matched on the action (not the key) so a key
+    /// the press bound still releases under a rebind.
+    fn keyboard_event(&mut self, event: &winit::event::KeyEvent) {
+        match event.state {
+            ElementState::Pressed => self.key_press(event),
+            ElementState::Released => {
+                if let Some(action) = self.action_of(event)
+                    && action.is_attitude()
+                {
+                    self.attitude_release(action);
+                }
+            }
+        }
     }
 
     /// The pre-egui half of key routing (R17-F7): returns `true` when
@@ -1283,6 +1493,11 @@ impl App {
         }
         if event.state == ElementState::Released {
             self.captured_key = None;
+            // The release never dispatches to egui or the keymap, but
+            // the held-attitude set still clears — the key's press may
+            // have inserted its action before the capture armed, and a
+            // swallowed release would leave the rate stuck on.
+            self.keyboard_event(event);
         }
         true
     }
@@ -1355,6 +1570,14 @@ impl App {
                     );
                 }
             }
+            // Fine throttle — same §7.6 channel and the same read-only
+            // discipline as the full/cut verbs.
+            KeyAction::ThrottleUp | KeyAction::ThrottleDown if mode != ViewMode::Vab => {
+                self.throttle_nudge(action == KeyAction::ThrottleUp);
+            }
+            // Space fires the next stage — the view resolves the
+            // session-captured drop set into logged `JettisonPart`s.
+            KeyAction::Stage if mode == ViewMode::Flight => self.stage_press(),
             KeyAction::CycleFocus if mode == ViewMode::Map => {
                 self.view.map_event(MapKeyEvent::CycleFocus)
             }
@@ -1369,17 +1592,31 @@ impl App {
                 self.ui_confirm();
                 self.view.toggle_debug_panel();
             }
-            KeyAction::PanUp | KeyAction::PanDown | KeyAction::PanLeft | KeyAction::PanRight => {
-                let (dx_px, dy_px) = match action {
-                    KeyAction::PanUp => (0.0, -PAN_STEP_PX),
-                    KeyAction::PanDown => (0.0, PAN_STEP_PX),
-                    KeyAction::PanLeft => (-PAN_STEP_PX, 0.0),
-                    _ => (PAN_STEP_PX, 0.0),
-                };
-                match mode {
-                    ViewMode::Map => self.view.map_event(MapKeyEvent::Pan { dx_px, dy_px }),
-                    ViewMode::Vab => self.view.vab_event(VabEvent::Pan { dx_px, dy_px }),
-                    ViewMode::Flight => {}
+            // WASD positions are mode-split verbs: camera pans on the
+            // map/VAB, held-to-turn attitude in flight (with the Q/E
+            // roll pair — pure flight verbs, inert elsewhere).
+            KeyAction::PanUp
+            | KeyAction::PanDown
+            | KeyAction::PanLeft
+            | KeyAction::PanRight
+            | KeyAction::RollLeft
+            | KeyAction::RollRight => {
+                if mode == ViewMode::Flight {
+                    self.attitude_press(action);
+                } else if !matches!(action, KeyAction::RollLeft | KeyAction::RollRight) {
+                    // Roll keys are flight-only; the pan cluster still
+                    // steers the map/VAB cameras per event.
+                    let (dx_px, dy_px) = match action {
+                        KeyAction::PanUp => (0.0, -PAN_STEP_PX),
+                        KeyAction::PanDown => (0.0, PAN_STEP_PX),
+                        KeyAction::PanLeft => (-PAN_STEP_PX, 0.0),
+                        _ => (PAN_STEP_PX, 0.0),
+                    };
+                    match mode {
+                        ViewMode::Map => self.view.map_event(MapKeyEvent::Pan { dx_px, dy_px }),
+                        ViewMode::Vab => self.view.vab_event(VabEvent::Pan { dx_px, dy_px }),
+                        ViewMode::Flight => {}
+                    }
                 }
             }
             _ => {}
@@ -1407,11 +1644,10 @@ impl ApplicationHandler for App {
         {
             return;
         }
-        // A focus loss can drop the release that clears a captured
-        // key — clear here rather than swallowing that key forever.
         if matches!(event, WindowEvent::Focused(false)) {
-            self.captured_key = None;
+            self.focus_lost();
         }
+        self.note_key_label(&event);
 
         // egui gets first pass at raw input, but `consumed` must guard the
         // individual handlers rather than early-returning: egui swallows
@@ -1455,13 +1691,18 @@ impl ApplicationHandler for App {
                     v.resize(&g.device, size.width, size.height);
                 }
             }
-            // Key presses — warp ladder + map camera; see `key_press`.
-            // `!consumed` keeps egui-owned keys (a focused text field)
-            // out of the sim.
-            WindowEvent::KeyboardInput { event, .. }
-                if !consumed && event.state == ElementState::Pressed =>
-            {
-                self.key_press(&event);
+            // Key presses and releases. Presses stay `!consumed`-gated
+            // so egui-owned keys (a focused text field) never reach the
+            // sim — but a RELEASE always runs `keyboard_event`: a
+            // release egui swallowed would leak `attitude_held` and the
+            // craft would hold its last commanded rate until a focus
+            // loss cleared it (the same reason LMB releases clear
+            // `map_dragging` unconditionally — consumption gates
+            // presses, never releases).
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state == ElementState::Released || !consumed {
+                    self.keyboard_event(&event);
+                }
             }
             // Map camera mouse input — left-drag orbits, wheel zooms.
             // A consumed PRESS (clicking a panel) must not start a camera
@@ -1915,9 +2156,9 @@ mod tests {
     fn rebound_key_dispatches_its_new_action() {
         let dir = tempdir("rebind-dispatch");
         let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
-        // Default: "m" → ToggleMap.
+        // Default: the M-position key → ToggleMap (physical token).
         assert_eq!(
-            app.settings.keys.action_for("m"),
+            app.settings.keys.action_for("key-m"),
             Some(KeyAction::ToggleMap)
         );
         app.dispatch(KeyAction::ToggleMap);

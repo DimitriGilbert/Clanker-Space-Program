@@ -94,3 +94,48 @@ fn starter_craft_rests_on_the_pad() {
         "throttle did not unlatch the pad craft"
     );
 }
+
+/// The second half of "rests on the pad": the pad must sit where the
+/// RENDERED ground is — the sim's contact surface is the datum sphere,
+/// but `sites.ron`'s launch site is authored against the baked
+/// heightfield (the body `noise_seed`'s terrain is decoration that can
+/// sit tens of metres above the datum: the lon-π pad site was under a
+/// ~+57 m plateau and the datum spawn rendered the craft buried inside
+/// the hill). This pins the authored site's terrain-vs-datum delta so
+/// a re-authored coordinate or a seed change that re-buries the pad
+/// fails here instead of in a screenshot.
+#[test]
+fn launch_site_sits_on_rendered_ground() {
+    let view = View::new().expect("data/ load");
+    let dominant = view.sim.dominant_body().cloned().expect("no dominant body");
+    let site = view
+        .sim
+        .config()
+        .sites
+        .into_values()
+        .find(|s| s.launch && s.body == dominant)
+        .expect("dominant body has no launch site");
+    let terrain = view.world.resource::<csp_view::terrain::TerrainConfig>();
+    let body = terrain
+        .bodies
+        .get(dominant.as_str())
+        .expect("no terrain config for the dominant body");
+    // The same 1024×512 equirect bake `terrain::build_packet` ships to
+    // the GPU — `sample_dir` is the texel-exact CPU mirror of the
+    // vertex shader's `height_at`, so this measures the exact surface
+    // the pass draws at the pad.
+    let field = csp_render::terrain::HeightField::bake(body.seed, 1024, 512);
+    let (sl, cl) = site.latitude_rad.sin_cos();
+    let (so, co) = site.longitude_rad.sin_cos();
+    let dir = csp_core::DVec3::new(cl * co, cl * so, sl);
+    let terrain_m = field.sample_dir(dir) * body.amplitude_m;
+    let delta_m = terrain_m - site.altitude_m;
+    assert!(
+        delta_m.abs() <= 5.0,
+        "launch site {:?}: rendered terrain is {terrain_m:+.1} m over \
+         the pad's datum altitude {:.1} m — a datum-resting spawn \
+         renders {delta_m:+.1} m off the visible ground",
+        site.id,
+        site.altitude_m,
+    );
+}

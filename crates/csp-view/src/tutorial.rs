@@ -139,6 +139,7 @@ mod tests {
             plumes: Vec::new(),
             com: rel,
             latched: false,
+            tanks: Vec::new(),
         }
     }
 

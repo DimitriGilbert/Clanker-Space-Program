@@ -37,11 +37,15 @@ impl TutorialStep {
     /// The coaching line with `{key}` replaced by the action's live
     /// binding display — `"[m]"`, `"[unbound]"` when the action has
     /// no keys.
-    fn hint_for(&self, keys: &crate::settings::Keymap) -> String {
+    fn hint_for(
+        &self,
+        keys: &crate::settings::Keymap,
+        labels: &std::collections::BTreeMap<String, String>,
+    ) -> String {
         match self.key_action {
             Some(action) => self
                 .hint
-                .replace("{key}", &format!("[{}]", keys.hint(action))),
+                .replace("{key}", &format!("[{}]", keys.hint_labeled(action, labels))),
             None => self.hint.to_string(),
         }
     }
@@ -277,6 +281,7 @@ pub fn tutorial_overlay(
     ctx: &egui::Context,
     state: &mut TutorialState,
     keys: &crate::settings::Keymap,
+    key_labels: &std::collections::BTreeMap<String, String>,
     in_vab: bool,
 ) {
     let anchor = if in_vab {
@@ -323,7 +328,7 @@ pub fn tutorial_overlay(
             if let Some(step) = state.current() {
                 ui.separator();
                 ui.label(
-                    egui::RichText::new(format!("Now: {}", step.hint_for(keys)))
+                    egui::RichText::new(format!("Now: {}", step.hint_for(keys, key_labels)))
                         .color(egui::Color32::from_gray(200)),
                 );
             }

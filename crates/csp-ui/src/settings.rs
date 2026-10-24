@@ -197,16 +197,26 @@ pub enum KeyAction {
     ThrottleFull,
     /// Cut throttle on the focused flight vessel.
     ThrottleCut,
+    /// Increment throttle on the focused flight vessel (repeatable).
+    ThrottleUp,
+    /// Decrement throttle on the focused flight vessel (repeatable).
+    ThrottleDown,
+    /// Fire the focused vessel's next stage (jettison its drop set).
+    Stage,
     /// Cycle the map camera's focus body/vessel.
     CycleFocus,
-    /// Camera pan up (map and VAB).
+    /// Camera pan up (map and VAB); nose-down pitch in flight.
     PanUp,
-    /// Camera pan down (map and VAB).
+    /// Camera pan down (map and VAB); nose-up pitch in flight.
     PanDown,
-    /// Camera pan left (map and VAB).
+    /// Camera pan left (map and VAB); yaw left in flight.
     PanLeft,
-    /// Camera pan right (map and VAB).
+    /// Camera pan right (map and VAB); yaw right in flight.
     PanRight,
+    /// Roll left (counterclockwise) in flight.
+    RollLeft,
+    /// Roll right (clockwise) in flight.
+    RollRight,
     /// Toggle the controls-help card.
     ToggleHelp,
     /// Toggle the dev debug panel (adapter/tick internals).
@@ -223,11 +233,16 @@ impl KeyAction {
         Self::WarpDown,
         Self::ThrottleFull,
         Self::ThrottleCut,
+        Self::ThrottleUp,
+        Self::ThrottleDown,
+        Self::Stage,
         Self::CycleFocus,
         Self::PanUp,
         Self::PanDown,
         Self::PanLeft,
         Self::PanRight,
+        Self::RollLeft,
+        Self::RollRight,
         Self::ToggleHelp,
         Self::ToggleDebug,
     ];
@@ -242,23 +257,49 @@ impl KeyAction {
             Self::WarpDown => "warp slower",
             Self::ThrottleFull => "throttle full",
             Self::ThrottleCut => "throttle cut",
+            Self::ThrottleUp => "throttle up",
+            Self::ThrottleDown => "throttle down",
+            Self::Stage => "stage",
             Self::CycleFocus => "cycle focus",
-            Self::PanUp => "pan up",
-            Self::PanDown => "pan down",
-            Self::PanLeft => "pan left",
-            Self::PanRight => "pan right",
+            Self::PanUp => "pan up / pitch down",
+            Self::PanDown => "pan down / pitch up",
+            Self::PanLeft => "pan left / yaw left",
+            Self::PanRight => "pan right / yaw right",
+            Self::RollLeft => "roll left",
+            Self::RollRight => "roll right",
             Self::ToggleHelp => "controls help",
             Self::ToggleDebug => "debug panel",
         }
     }
 
     /// Whether key-repeat events count for this action — camera pans
-    /// track a held key; every other action is a single-shot so a held
-    /// key does not machine-gun warp steps or mode toggles.
+    /// and throttle nudges track a held key; every other action is a
+    /// single-shot so a held key does not machine-gun warp steps,
+    /// staging, or mode toggles.
     pub const fn accepts_repeat(self) -> bool {
         matches!(
             self,
-            Self::PanUp | Self::PanDown | Self::PanLeft | Self::PanRight
+            Self::PanUp
+                | Self::PanDown
+                | Self::PanLeft
+                | Self::PanRight
+                | Self::ThrottleUp
+                | Self::ThrottleDown
+        )
+    }
+
+    /// Whether the action is a held-to-turn attitude verb — the input
+    /// layer tracks its press *and* release (flight mode only); map/VAB
+    /// pans are still per-event camera moves, never held.
+    pub const fn is_attitude(self) -> bool {
+        matches!(
+            self,
+            Self::PanUp
+                | Self::PanDown
+                | Self::PanLeft
+                | Self::PanRight
+                | Self::RollLeft
+                | Self::RollRight
         )
     }
 }
@@ -266,8 +307,13 @@ impl KeyAction {
 /// One bound key — a host-agnostic *token*, not a winit `Key`
 /// (§2.1: csp-ui never sees winit). Character keys serialize as their
 /// lowercase character (`"m"`, `","`); named keys as a fixed kebab-case
-/// name (`"tab"`, `"arrow-up"`, `"f5"`). `csp-app` produces tokens from
-/// winit events and resolves actions by exact match.
+/// name (`"tab"`, `"arrow-up"`, `"f5"`); physical-position keys as
+/// `"key-<name>"` (`"key-w"`, `"key-comma"`) — the QWERTY-name of the
+/// *position*, which is layout-independent (the same physical key
+/// resolves the token whether the OS layout prints `w` or `z` on it —
+/// that is what makes WASD-style controls work on AZERTY). `csp-app`
+/// produces tokens from winit events and resolves actions by exact
+/// match.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct KeyBinding(pub String);
@@ -315,14 +361,78 @@ pub const NAMED_KEY_TOKENS: &[&str] = &[
     "f12",
 ];
 
+/// The physical-position tokens [`KeyBinding::parse`] accepts — the
+/// `key-` prefix plus the QWERTY name of the key's *position* (winit's
+/// `KeyCode` vocabulary, mirrored here as plain strings because §2.1
+/// keeps winit out of this crate). `key-w` means "the key in the
+/// QWERTY `W` position", which is the AZERTY `Z` key — bindings stay
+/// positional, so the default movement/throttle cluster lands under
+/// the same fingers on every letter layout.
+pub const PHYSICAL_KEY_TOKENS: &[&str] = &[
+    // Letter row positions (QWERTY names).
+    "key-a",
+    "key-b",
+    "key-c",
+    "key-d",
+    "key-e",
+    "key-f",
+    "key-g",
+    "key-h",
+    "key-i",
+    "key-j",
+    "key-k",
+    "key-l",
+    "key-m",
+    "key-n",
+    "key-o",
+    "key-p",
+    "key-q",
+    "key-r",
+    "key-s",
+    "key-t",
+    "key-u",
+    "key-v",
+    "key-w",
+    "key-x",
+    "key-y",
+    "key-z",
+    // Digit row.
+    "key-0",
+    "key-1",
+    "key-2",
+    "key-3",
+    "key-4",
+    "key-5",
+    "key-6",
+    "key-7",
+    "key-8",
+    "key-9",
+    // Punctuation positions (QWERTY names).
+    "key-backquote",
+    "key-minus",
+    "key-equal",
+    "key-bracket-left",
+    "key-bracket-right",
+    "key-backslash",
+    "key-semicolon",
+    "key-quote",
+    "key-comma",
+    "key-period",
+    "key-slash",
+];
+
 impl KeyBinding {
     /// Parse and normalize a binding token: lowercase, validated
-    /// against [`NAMED_KEY_TOKENS`] or a single character. `None` for
-    /// anything else — an unrecognized token in a hand-edited file is
-    /// rejected rather than silently dead-bound.
+    /// against [`NAMED_KEY_TOKENS`], [`PHYSICAL_KEY_TOKENS`], or a
+    /// single character. `None` for anything else — an unrecognized
+    /// token in a hand-edited file is rejected rather than silently
+    /// dead-bound.
     pub fn parse(token: &str) -> Option<Self> {
         let t = token.trim().to_lowercase();
-        if t.chars().count() == 1 || NAMED_KEY_TOKENS.contains(&t.as_str()) {
+        if t.chars().count() == 1
+            || NAMED_KEY_TOKENS.contains(&t.as_str())
+            || PHYSICAL_KEY_TOKENS.contains(&t.as_str())
+        {
             Some(Self(t))
         } else {
             None
@@ -332,6 +442,47 @@ impl KeyBinding {
     /// The normalized token.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// A physical token's printed-glyph fallback — the QWERTY character at
+/// that position. Used when no observed label exists (the key was
+/// never pressed this session, so the real layout's glyph is unknown).
+fn physical_fallback(name: &str) -> String {
+    match name.strip_prefix("key-") {
+        Some(rest) if rest.chars().count() == 1 => rest.to_uppercase(),
+        Some(rest) => match rest {
+            "backquote" => "`",
+            "minus" => "-",
+            "equal" => "=",
+            "bracket-left" => "[",
+            "bracket-right" => "]",
+            "backslash" => "\\",
+            "semicolon" => ";",
+            "quote" => "'",
+            "comma" => ",",
+            "period" => ".",
+            "slash" => "/",
+            "space" => "space",
+            _ => rest,
+        }
+        .to_string(),
+        None => name.to_string(),
+    }
+}
+
+impl KeyBinding {
+    /// The human-readable key name for hint bars and the bindings
+    /// column: `observed` maps physical tokens to the glyph the key
+    /// actually produced on this machine's layout (recorded by the
+    /// input layer when the key was pressed — so an AZERTY `Z` shows
+    /// as `z`, not `w`). Un-observed physical tokens fall back to
+    /// their QWERTY glyph; character/named tokens print verbatim.
+    pub fn display_label(&self, observed: &BTreeMap<String, String>) -> String {
+        if let Some(l) = observed.get(&self.0) {
+            return l.clone();
+        }
+        physical_fallback(&self.0)
     }
 }
 
@@ -353,27 +504,36 @@ pub struct Keymap {
 }
 
 impl Default for Keymap {
-    /// The shipped bindings — exactly the keys the M0–M9d hardcoded
-    /// dispatch used, plus `escape` for the new settings toggle.
+    /// The shipped bindings. Position-sensitive keys (the
+    /// movement/throttle/attitude letters and the punctuation warp
+    /// keys) bind **physical positions** (`key-*`) so the layout the OS
+    /// reports — QWERTY, AZERTY, Dvorak — never moves the controls:
+    /// `key-w` is the same finger position everywhere. Named keys are
+    /// layout-stable already and keep their plain tokens.
     fn default() -> Self {
         let b = |tokens: &[&str]| -> Vec<KeyBinding> {
             tokens.iter().filter_map(|t| KeyBinding::parse(t)).collect()
         };
         Self {
             bindings: BTreeMap::from([
-                (KeyAction::ToggleMap, b(&["m"])),
-                (KeyAction::ToggleVab, b(&["v"])),
+                (KeyAction::ToggleMap, b(&["key-m"])),
+                (KeyAction::ToggleVab, b(&["key-v"])),
                 (KeyAction::OpenSettings, b(&["escape"])),
-                (KeyAction::WarpUp, b(&["."])),
-                (KeyAction::WarpDown, b(&[","])),
-                (KeyAction::ThrottleFull, b(&["z"])),
-                (KeyAction::ThrottleCut, b(&["x"])),
+                (KeyAction::WarpUp, b(&["key-period"])),
+                (KeyAction::WarpDown, b(&["key-comma"])),
+                (KeyAction::ThrottleFull, b(&["key-z"])),
+                (KeyAction::ThrottleCut, b(&["key-x"])),
+                (KeyAction::ThrottleUp, b(&["shift"])),
+                (KeyAction::ThrottleDown, b(&["control"])),
+                (KeyAction::Stage, b(&["space"])),
                 (KeyAction::CycleFocus, b(&["tab"])),
-                (KeyAction::PanUp, b(&["w", "arrow-up"])),
-                (KeyAction::PanDown, b(&["s", "arrow-down"])),
-                (KeyAction::PanLeft, b(&["a", "arrow-left"])),
-                (KeyAction::PanRight, b(&["d", "arrow-right"])),
-                (KeyAction::ToggleHelp, b(&["f1", "?"])),
+                (KeyAction::PanUp, b(&["key-w", "arrow-up"])),
+                (KeyAction::PanDown, b(&["key-s", "arrow-down"])),
+                (KeyAction::PanLeft, b(&["key-a", "arrow-left"])),
+                (KeyAction::PanRight, b(&["key-d", "arrow-right"])),
+                (KeyAction::RollLeft, b(&["key-q"])),
+                (KeyAction::RollRight, b(&["key-e"])),
+                (KeyAction::ToggleHelp, b(&["f1", "key-slash"])),
                 (KeyAction::ToggleDebug, b(&["f3"])),
             ]),
         }
@@ -466,11 +626,18 @@ impl Keymap {
     /// no keys. Hint text derives through this so a rebind can never
     /// leave a printed key name stale.
     pub fn hint(&self, action: KeyAction) -> String {
+        self.hint_labeled(action, &BTreeMap::new())
+    }
+
+    /// [`Self::hint`] with the observed physical-key labels — prints
+    /// the glyph the key produces on *this* machine's layout where one
+    /// has been recorded ([`KeyBinding::display_label`]).
+    pub fn hint_labeled(&self, action: KeyAction, observed: &BTreeMap<String, String>) -> String {
         self.bindings
             .get(&action)
             .map(|v| {
                 v.iter()
-                    .map(KeyBinding::as_str)
+                    .map(|k| k.display_label(observed))
                     .collect::<Vec<_>>()
                     .join(" / ")
             })
@@ -485,6 +652,19 @@ impl Keymap {
             .get(&action)
             .and_then(|v| v.first())
             .map(KeyBinding::as_str)
+    }
+
+    /// [`Self::first_binding`] with the observed-label translation
+    /// applied ([`KeyBinding::display_label`]).
+    pub fn first_binding_label(
+        &self,
+        action: KeyAction,
+        observed: &BTreeMap<String, String>,
+    ) -> Option<String> {
+        self.bindings
+            .get(&action)
+            .and_then(|v| v.first())
+            .map(|k| k.display_label(observed))
     }
 }
 
@@ -522,10 +702,13 @@ pub struct SettingsPanelOutput {
 /// The settings window — the egui half of M10's settings surface.
 /// Edits [`SettingsPanelState::settings`] in place; the host persists
 /// on `apply` and owns key-capture while `listening` is armed.
+/// `key_labels` is the host's observed physical-token → glyph map —
+/// the bindings column prints what the keys say on *this* keyboard.
 pub fn settings_panel(
     ctx: &egui::Context,
     state: &mut SettingsPanelState,
     out: &mut SettingsPanelOutput,
+    key_labels: &BTreeMap<String, String>,
 ) {
     let mut open = state.open;
     egui::Window::new("Settings")
@@ -601,7 +784,7 @@ pub fn settings_panel(
                 });
             egui::CollapsingHeader::new("Key bindings")
                 .default_open(true)
-                .show(ui, |ui| keymap_grid(ui, state));
+                .show(ui, |ui| keymap_grid(ui, state, key_labels));
             ui.separator();
             ui.horizontal(|ui| {
                 if ui.button("Apply").clicked() {
@@ -628,8 +811,14 @@ pub fn settings_panel(
 
 /// The keymap section's grid — one row per [`KeyAction`]: label, current
 /// bindings, and the rebind/clear affordance (or the "press a key" hint
-/// while a capture is armed).
-fn keymap_grid(ui: &mut egui::Ui, state: &mut SettingsPanelState) {
+/// while a capture is armed). Bindings print through
+/// [`KeyBinding::display_label`] — the glyph the key produces on this
+/// machine's layout where one was observed.
+fn keymap_grid(
+    ui: &mut egui::Ui,
+    state: &mut SettingsPanelState,
+    labels: &BTreeMap<String, String>,
+) {
     egui::Grid::new("keymap_grid")
         .num_columns(3)
         .show(ui, |ui| {
@@ -642,7 +831,7 @@ fn keymap_grid(ui: &mut egui::Ui, state: &mut SettingsPanelState) {
                     .get(action)
                     .map(|v| {
                         v.iter()
-                            .map(KeyBinding::as_str)
+                            .map(|k| k.display_label(labels))
                             .collect::<Vec<_>>()
                             .join("  ")
                     })
@@ -739,26 +928,30 @@ mod tests {
     #[test]
     fn rebind_replaces_and_evicts() {
         let mut k = Keymap::default();
-        // Steal "w" from PanUp for ThrottleFull.
-        let evicted = k.bind(KeyAction::ThrottleFull, KeyBinding::parse("w").unwrap());
+        // Steal "key-w" from PanUp for ThrottleFull.
+        let evicted = k.bind(KeyAction::ThrottleFull, KeyBinding::parse("key-w").unwrap());
         assert_eq!(evicted, Some(KeyAction::PanUp));
-        assert_eq!(k.action_for("w"), Some(KeyAction::ThrottleFull));
+        assert_eq!(k.action_for("key-w"), Some(KeyAction::ThrottleFull));
         // PanUp keeps its arrow alternative.
         assert_eq!(k.action_for("arrow-up"), Some(KeyAction::PanUp));
         assert_eq!(
             k.bindings[&KeyAction::ThrottleFull],
-            vec![KeyBinding::parse("w").unwrap()]
+            vec![KeyBinding::parse("key-w").unwrap()]
         );
     }
 
     #[test]
     fn action_for_resolves_first_match() {
         let k = Keymap::default();
-        assert_eq!(k.action_for("m"), Some(KeyAction::ToggleMap));
-        assert_eq!(k.action_for("."), Some(KeyAction::WarpUp));
-        assert_eq!(k.action_for(","), Some(KeyAction::WarpDown));
+        assert_eq!(k.action_for("key-m"), Some(KeyAction::ToggleMap));
+        assert_eq!(k.action_for("key-period"), Some(KeyAction::WarpUp));
+        assert_eq!(k.action_for("key-comma"), Some(KeyAction::WarpDown));
         assert_eq!(k.action_for("tab"), Some(KeyAction::CycleFocus));
-        assert_eq!(k.action_for("q"), None);
+        // A *logical* "z" is unbound — the default is the physical
+        // "key-z" (position), so a bare character token resolves
+        // nothing under the shipped map.
+        assert_eq!(k.action_for("z"), None);
+        assert_eq!(k.action_for("key-z"), Some(KeyAction::ThrottleFull));
     }
 
     /// R18-F5: a hand-edited file deserializes raw strings through the
@@ -779,22 +972,23 @@ mod tests {
                 KeyBinding("f6".into()),      // in-row dup of the above
             ],
         );
-        // "m" is ToggleMap's; claiming it under WarpDown too is the
+        // "key-m" is ToggleMap's; claiming it under WarpDown too is the
         // file-only shape `bind` prevents in-session.
         k.bindings
-            .insert(KeyAction::WarpDown, vec![KeyBinding("m".into())]);
+            .insert(KeyAction::WarpDown, vec![KeyBinding("key-m".into())]);
         let dropped = k.sanitize();
-        assert_eq!(dropped, 3); // "arrowup", dup "f6", stolen "m"
+        assert_eq!(dropped, 3); // "arrowup", dup "f6", stolen "key-m"
         assert_eq!(
             k.bindings[&KeyAction::WarpUp],
             vec![KeyBinding::parse("f6").unwrap()]
         );
         assert!(k.bindings[&KeyAction::WarpDown].is_empty());
-        // The first claimant keeps the key — ToggleMap still owns "m".
-        assert_eq!(k.action_for("m"), Some(KeyAction::ToggleMap));
+        // The first claimant keeps the key — ToggleMap still owns
+        // "key-m".
+        assert_eq!(k.action_for("key-m"), Some(KeyAction::ToggleMap));
         // A clean map is a fixed point.
         assert_eq!(k.sanitize(), 0);
-        assert_eq!(k.action_for("m"), Some(KeyAction::ToggleMap));
+        assert_eq!(k.action_for("key-m"), Some(KeyAction::ToggleMap));
     }
 
     #[test]

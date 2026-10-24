@@ -14,8 +14,22 @@
             id: "terrin-launch",
             display_name: "site.terrin-launch",
             body: "terrin",
-            latitude_rad: 0.0,
-            longitude_rad: 0.0,
+            // The pad sits just south of the equator on a shoreline —
+            // see the longitude note.
+            latitude_rad: -0.092,
+            // The sun sits at −X at t=0 (Terrin orbits at +X), so a pad
+            // near lon π spawns in daylight instead of on the night
+            // side. lon 2.916 (−0.226 rad from the sun meridian) is a
+            // MORNING pad — ~1.7 h of daylight remain at spawn. The
+            // exact site is terrain-aware: the sim's ground contact is
+            // the datum sphere, but the rendered terrain is the baked
+            // heightfield (noise_seed 601) — at lon π that surface sits
+            // ~+57 m above datum and a pad spawned at altitude 0 would
+            // be buried inside the hill. At (−0.092, 2.916) the baked
+            // field is +0.02 m against datum and flat to ±0.5 m over
+            // the pad footprint, so the craft visibly rests on the
+            // rendered ground.
+            longitude_rad: 2.916,
             altitude_m: 0.0,
             launch: true,
             resource_yields: [
@@ -29,7 +43,7 @@
             display_name: "site.terrin-downrange",
             body: "terrin",
             latitude_rad: 0.0,
-            longitude_rad: 0.7853981633974483,
+            longitude_rad: 3.9269908169872414,
             altitude_m: 0.0,
             launch: false,
             resource_yields: [

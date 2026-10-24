@@ -17,7 +17,7 @@
 use std::path::{Path, PathBuf};
 
 use csp_view::settings::{KeyBinding, Settings};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 
 /// The app directory inside the platform config dir (§7.8's `$config_dir/csp`).
 #[cfg(not(target_arch = "wasm32"))]
@@ -214,4 +214,215 @@ pub fn key_token(key: &Key) -> Option<String> {
 /// never rejects a token this module produces).
 pub fn binding_for(key: &Key) -> Option<KeyBinding> {
     key_token(key).and_then(|t| KeyBinding::parse(&t))
+}
+
+/// Translate a winit *physical* key into the [`KeyBinding`] token the
+/// keymap resolves against — the layout-independent path. `KeyCode`
+/// names the key by its *position* (the QWERTY label), not the
+/// character it types: the `W`-position key produces `key-w` whether
+/// the layout prints `w` (QWERTY) or `z` (AZERTY) on it, so the
+/// default movement/throttle cluster stays under the same fingers.
+/// Named positional codes (space, arrows, F-keys, modifiers) map onto
+/// the existing [`csp_view::settings::NAMED_KEY_TOKENS`] vocabulary —
+/// they are layout-stable already. `None` for unidentifiable codes.
+pub fn keycode_token(key: &PhysicalKey) -> Option<String> {
+    let code = match key {
+        PhysicalKey::Code(c) => *c,
+        PhysicalKey::Unidentified(_) => return None,
+    };
+    let token = match code {
+        // Letter positions → `key-<letter>`.
+        KeyCode::KeyA => "key-a",
+        KeyCode::KeyB => "key-b",
+        KeyCode::KeyC => "key-c",
+        KeyCode::KeyD => "key-d",
+        KeyCode::KeyE => "key-e",
+        KeyCode::KeyF => "key-f",
+        KeyCode::KeyG => "key-g",
+        KeyCode::KeyH => "key-h",
+        KeyCode::KeyI => "key-i",
+        KeyCode::KeyJ => "key-j",
+        KeyCode::KeyK => "key-k",
+        KeyCode::KeyL => "key-l",
+        KeyCode::KeyM => "key-m",
+        KeyCode::KeyN => "key-n",
+        KeyCode::KeyO => "key-o",
+        KeyCode::KeyP => "key-p",
+        KeyCode::KeyQ => "key-q",
+        KeyCode::KeyR => "key-r",
+        KeyCode::KeyS => "key-s",
+        KeyCode::KeyT => "key-t",
+        KeyCode::KeyU => "key-u",
+        KeyCode::KeyV => "key-v",
+        KeyCode::KeyW => "key-w",
+        KeyCode::KeyX => "key-x",
+        KeyCode::KeyY => "key-y",
+        KeyCode::KeyZ => "key-z",
+        // Digit row.
+        KeyCode::Digit0 => "key-0",
+        KeyCode::Digit1 => "key-1",
+        KeyCode::Digit2 => "key-2",
+        KeyCode::Digit3 => "key-3",
+        KeyCode::Digit4 => "key-4",
+        KeyCode::Digit5 => "key-5",
+        KeyCode::Digit6 => "key-6",
+        KeyCode::Digit7 => "key-7",
+        KeyCode::Digit8 => "key-8",
+        KeyCode::Digit9 => "key-9",
+        // Punctuation positions.
+        KeyCode::Backquote => "key-backquote",
+        KeyCode::Minus => "key-minus",
+        KeyCode::Equal => "key-equal",
+        KeyCode::BracketLeft => "key-bracket-left",
+        KeyCode::BracketRight => "key-bracket-right",
+        KeyCode::Backslash => "key-backslash",
+        KeyCode::Semicolon => "key-semicolon",
+        KeyCode::Quote => "key-quote",
+        KeyCode::Comma => "key-comma",
+        KeyCode::Period => "key-period",
+        KeyCode::Slash => "key-slash",
+        // Named positions → the plain named tokens (layout-stable).
+        KeyCode::Space => "space",
+        KeyCode::Tab => "tab",
+        KeyCode::Enter => "enter",
+        KeyCode::Escape => "escape",
+        KeyCode::Backspace => "backspace",
+        KeyCode::Delete => "delete",
+        KeyCode::Insert => "insert",
+        KeyCode::Home => "home",
+        KeyCode::End => "end",
+        KeyCode::PageUp => "page-up",
+        KeyCode::PageDown => "page-down",
+        KeyCode::ArrowUp => "arrow-up",
+        KeyCode::ArrowDown => "arrow-down",
+        KeyCode::ArrowLeft => "arrow-left",
+        KeyCode::ArrowRight => "arrow-right",
+        // Left/right collapse into the shared modifier tokens — a
+        // binding on "shift" takes either side (the `key_token` path
+        // made the same choice through `NamedKey::Shift`).
+        KeyCode::ShiftLeft | KeyCode::ShiftRight => "shift",
+        KeyCode::ControlLeft | KeyCode::ControlRight => "control",
+        KeyCode::AltLeft | KeyCode::AltRight => "alt",
+        KeyCode::SuperLeft | KeyCode::SuperRight => "super",
+        KeyCode::CapsLock => "caps-lock",
+        KeyCode::NumLock => "num-lock",
+        KeyCode::ScrollLock => "scroll-lock",
+        KeyCode::PrintScreen => "print-screen",
+        KeyCode::Pause => "pause",
+        KeyCode::ContextMenu => "context-menu",
+        KeyCode::F1 => "f1",
+        KeyCode::F2 => "f2",
+        KeyCode::F3 => "f3",
+        KeyCode::F4 => "f4",
+        KeyCode::F5 => "f5",
+        KeyCode::F6 => "f6",
+        KeyCode::F7 => "f7",
+        KeyCode::F8 => "f8",
+        KeyCode::F9 => "f9",
+        KeyCode::F10 => "f10",
+        KeyCode::F11 => "f11",
+        KeyCode::F12 => "f12",
+        _ => return None,
+    };
+    Some(token.to_string())
+}
+
+/// The binding a rebind capture records for `event` — the physical
+/// token when the key has one (a `key-*` position token binds
+/// positionally, so a capture on an AZERTY `Z` records `key-w` and
+/// works as the W-position on every layout), else the logical token.
+pub fn event_binding(event: &winit::event::KeyEvent) -> Option<KeyBinding> {
+    keycode_token(&event.physical_key)
+        .and_then(|t| KeyBinding::parse(&t))
+        .or_else(|| binding_for(&event.logical_key))
+}
+
+/// The character a saved binding token uses → its positional `key-*`
+/// token — the inverse of the punctuation names `keycode_token`
+/// produces (letters and digits are `key-<char>`). `None` for
+/// characters with no positional equivalent (non-Latin glyphs) and
+/// for non-character tokens (named keys, `key-*` — already
+/// layout-stable).
+fn char_to_physical_token(token: &str) -> Option<String> {
+    let mut it = token.chars();
+    let (Some(c), None) = (it.next(), it.next()) else {
+        return None;
+    };
+    match c.to_ascii_lowercase() {
+        c @ ('a'..='z' | '0'..='9') => Some(format!("key-{c}")),
+        // A bare " " is a valid one-char binding the event path can
+        // never produce (space resolves as the "space" named token) —
+        // migrating it fixes a dead binding too.
+        ' ' => Some("space".to_string()),
+        '`' => Some("key-backquote".into()),
+        '-' => Some("key-minus".into()),
+        '=' => Some("key-equal".into()),
+        '[' => Some("key-bracket-left".into()),
+        ']' => Some("key-bracket-right".into()),
+        '\\' => Some("key-backslash".into()),
+        ';' => Some("key-semicolon".into()),
+        '\'' => Some("key-quote".into()),
+        ',' => Some("key-comma".into()),
+        '.' => Some("key-period".into()),
+        '/' => Some("key-slash".into()),
+        _ => None,
+    }
+}
+
+/// Migrate a loaded keymap's character bindings onto positional
+/// `key-*` tokens. Settings files written before positional tokens
+/// existed bound the movement/throttle cluster by *typed character*
+/// (`"w"`, `"z"`) — layout-dependent tokens that leave an AZERTY
+/// user's controls on the wrong keys until a Reset-to-defaults (the
+/// shipped map binds positions for exactly this reason). A character
+/// with a positional equivalent becomes its `key-*` token; the rest
+/// stay characters and surface through
+/// [`layout_dependent_binding_count`]. Returns the migrated count —
+/// the caller re-runs `Keymap::sanitize` to absorb collisions the
+/// rewrite can produce (a hand-bound `"key-w"` beside an inherited
+/// `"w"`).
+pub fn migrate_char_bindings(keys: &mut csp_view::settings::Keymap) -> usize {
+    let mut migrated = 0;
+    for list in keys.bindings.values_mut() {
+        for k in list.iter_mut() {
+            if let Some(t) = char_to_physical_token(k.as_str())
+                && let Some(b) = KeyBinding::parse(&t)
+            {
+                *k = b;
+                migrated += 1;
+            }
+        }
+    }
+    migrated
+}
+
+/// Count bindings still bound to a bare character — after
+/// [`migrate_char_bindings`] those are characters with no positional
+/// equivalent: layout-dependent forever, the "you have bindings that
+/// move with your keyboard layout" the user should be told about.
+pub fn layout_dependent_binding_count(keys: &csp_view::settings::Keymap) -> usize {
+    keys.bindings
+        .values()
+        .flatten()
+        .filter(|k| k.as_str().chars().count() == 1)
+        .count()
+}
+
+/// The printed glyph an event's physical token should display as —
+/// the character the key actually produced on this machine's layout.
+/// `None` for non-character keys (their token names the key already).
+/// The input layer records this per `key-*` token so hint bars can
+/// show an AZERTY `z` where a QWERTY hint would show `w`.
+pub fn event_label(event: &winit::event::KeyEvent) -> Option<(String, String)> {
+    let token = keycode_token(&event.physical_key)?;
+    if !token.starts_with("key-") {
+        return None;
+    }
+    if let Key::Character(c) = &event.logical_key {
+        let t = c.to_lowercase();
+        if t.chars().count() == 1 {
+            return Some((token, t));
+        }
+    }
+    None
 }

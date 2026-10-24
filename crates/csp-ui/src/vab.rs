@@ -658,6 +658,7 @@ pub fn top_bar(
     current: ModeSelect,
     warp: u32,
     keys: &crate::settings::Keymap,
+    key_labels: &std::collections::BTreeMap<String, String>,
     out: &mut VabUiOutput,
 ) {
     egui::Window::new("mode_bar")
@@ -675,14 +676,14 @@ pub fn top_bar(
                         ModeSelect::Map,
                         format!(
                             "Map  [{}]",
-                            keys.hint(crate::settings::KeyAction::ToggleMap)
+                            keys.hint_labeled(crate::settings::KeyAction::ToggleMap, key_labels)
                         ),
                     ),
                     (
                         ModeSelect::Vab,
                         format!(
                             "VAB  [{}]",
-                            keys.hint(crate::settings::KeyAction::ToggleVab)
+                            keys.hint_labeled(crate::settings::KeyAction::ToggleVab, key_labels)
                         ),
                     ),
                 ] {
@@ -735,12 +736,13 @@ pub fn vab_editor(
     vab: &mut VabSession,
     craft_files: &[String],
     keys: &crate::settings::Keymap,
+    key_labels: &std::collections::BTreeMap<String, String>,
     out: &mut VabUiOutput,
 ) {
     vab.recompute();
     palette_panel(ctx, vab);
     inspector_panel(ctx, vab, craft_files, out);
-    vab_hint_bar(ctx, vab, keys);
+    vab_hint_bar(ctx, vab, keys, key_labels);
 }
 
 /// Left side: the part catalog browser + the craft tree.
@@ -1367,7 +1369,12 @@ fn validation_section(ui: &mut egui::Ui, vab: &mut VabSession) {
 /// viewport — without this the editor reads as a blank scene with no
 /// cause (the panel's "resolve:" line sits off to the side in the
 /// Craft window).
-fn vab_hint_bar(ctx: &egui::Context, vab: &VabSession, keys: &crate::settings::Keymap) {
+fn vab_hint_bar(
+    ctx: &egui::Context,
+    vab: &VabSession,
+    keys: &crate::settings::Keymap,
+    key_labels: &std::collections::BTreeMap<String, String>,
+) {
     let rect = ctx.content_rect();
     let problem = if let Some(e) = vab.analysis_error() {
         Some(format!("craft failed to resolve — {e}"))
@@ -1391,7 +1398,7 @@ fn vab_hint_bar(ctx: &egui::Context, vab: &VabSession, keys: &crate::settings::K
                 format!(
                     "VAB  ·  {parts} part(s)  —  [{}] exit  drag: orbit  wheel: zoom  \
                      click a part to select",
-                    keys.hint(crate::settings::KeyAction::ToggleVab)
+                    keys.hint_labeled(crate::settings::KeyAction::ToggleVab, key_labels)
                 ),
                 egui::FontId::proportional(13.0),
                 egui::Color32::from_gray(180),

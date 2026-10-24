@@ -174,6 +174,11 @@ pub struct SessionMirror {
     /// pre-Apply copy — so the on-screen key names are always the ones
     /// that actually dispatch.
     pub keys: csp_ui::settings::Keymap,
+    /// Observed physical-token → printed glyph map (`"key-w" → "z"`
+    /// on AZERTY) — recorded by the input layer as keys are pressed
+    /// ([`View::set_key_label`]), so hint bars show what the keys say
+    /// on *this* machine's layout, not the QWERTY fallback.
+    pub key_labels: std::collections::BTreeMap<String, String>,
 }
 
 /// The egui pass's input/output — the resource bridge that lets the *whole*
@@ -328,7 +333,14 @@ fn build_ui(
     }
     let files = craft_files.0.clone(); // Vec<String> — cheap, frees the Res borrow
     egui.output = Some(ctx.run_ui(raw, |ctx| {
-        csp_ui::vab::top_bar(ctx, mode, warp.0, &session.keys, &mut vab_out);
+        csp_ui::vab::top_bar(
+            ctx,
+            mode,
+            warp.0,
+            &session.keys,
+            &session.key_labels,
+            &mut vab_out,
+        );
         // The M0 scaffold is dev-facing (adapter/backend/tick internals)
         // — gated behind the ToggleDebug key so the shipped view is a
         // game screen, not a diagnostics dump.
@@ -339,7 +351,7 @@ fn build_ui(
             let mut open = true;
             // The LIVE keymap — the staged edit copy would show
             // pending changes the dispatch doesn't honor yet.
-            csp_ui::help_panel(ctx, &session.keys, &mut open);
+            csp_ui::help_panel(ctx, &session.keys, &session.key_labels, &mut open);
             if !open {
                 panels.help = false;
             }
@@ -350,13 +362,20 @@ fn build_ui(
                 &map_ui,
                 &map_snap,
                 clock.0.ticks(),
-                &session.keys,
+                &session,
                 &mut maneuver_state.0,
                 &mut outbox,
             );
         }
         if mode == csp_ui::ModeSelect::Vab {
-            csp_ui::vab::vab_editor(ctx, &mut vab.0, &files, &session.keys, &mut vab_out);
+            csp_ui::vab::vab_editor(
+                ctx,
+                &mut vab.0,
+                &files,
+                &session.keys,
+                &session.key_labels,
+                &mut vab_out,
+            );
         }
         if mode == csp_ui::ModeSelect::Flight {
             csp_ui::flight_hud(
@@ -383,7 +402,11 @@ fn build_ui(
                     vessel_count: flight_ui.vessel_count,
                     debris_count: flight_ui.debris_count,
                     sfx: &flight_ui.sfx,
+                    propellant: &flight_ui.propellant,
+                    stages_left: flight_ui.stages_left,
+                    stages_total: flight_ui.stages_total,
                     keys: &session.keys,
+                    key_labels: &session.key_labels,
                 },
             );
         }
@@ -434,7 +457,7 @@ fn map_panels(
     map_ui: &map::MapUiData,
     map_snap: &map::MapSnapshot,
     tick: u64,
-    keys: &settings::Keymap,
+    session: &SessionMirror,
     maneuver_state: &mut csp_ui::ManeuverPanelState,
     outbox: &mut UiOutbox,
 ) {
@@ -443,7 +466,8 @@ fn map_panels(
         &map_ui.focus_name,
         map_ui.camera_distance_m,
         &map_ui.labels,
-        keys,
+        &session.keys,
+        &session.key_labels,
     );
     let mut mcmd = None;
     csp_ui::maneuver_panel(
@@ -490,7 +514,12 @@ fn m10_panels(
 ) {
     let mut settings_out = csp_ui::settings::SettingsPanelOutput::default();
     if settings_state.open {
-        csp_ui::settings::settings_panel(ctx, settings_state, &mut settings_out);
+        csp_ui::settings::settings_panel(
+            ctx,
+            settings_state,
+            &mut settings_out,
+            &session.key_labels,
+        );
     }
     if settings_out.reset_defaults {
         settings_state.settings = csp_ui::settings::Settings::default();
@@ -508,7 +537,13 @@ fn m10_panels(
     // (it coaches the VAB steps from inside the editor, where its
     // anchor keeps it clear of the Craft inspector).
     if tutorial.active {
-        csp_ui::tutorial::tutorial_overlay(ctx, tutorial, &session.keys, in_vab);
+        csp_ui::tutorial::tutorial_overlay(
+            ctx,
+            tutorial,
+            &session.keys,
+            &session.key_labels,
+            in_vab,
+        );
     }
 }
 
@@ -853,6 +888,7 @@ impl View {
         world.insert_resource(flight::FlightSyncInput::default());
         world.insert_resource(flight::FlightSnapshot::default());
         world.insert_resource(flight::FlightUiData::default());
+        world.insert_resource(flight::StagePlan::default());
         world.insert_resource(flight::FlightFrame::default());
         // §2.6.4: the latched-vessel weld cache — the staging path's
         // session state, so a parked craft isn't re-welded per frame.
@@ -1060,6 +1096,17 @@ impl View {
     /// in [`SettingsPanelRes`] stays the edit buffer.
     pub fn set_live_keymap(&mut self, keys: &settings::Keymap) {
         self.world.resource_mut::<SessionMirror>().keys = keys.clone();
+    }
+
+    /// Record the glyph a physical `key-*` token produced on the
+    /// host's keyboard layout — the hint bars' observed-label map
+    /// ([`csp_ui::settings::KeyBinding::display_label`]). The input
+    /// layer calls this on every key event; repeats are idempotent.
+    pub fn set_key_label(&mut self, token: String, label: String) {
+        self.world
+            .resource_mut::<SessionMirror>()
+            .key_labels
+            .insert(token, label);
     }
 
     /// The panel's staged settings — read by `csp-app` when "Apply"
@@ -1353,10 +1400,11 @@ impl View {
                 v.session().clone(),
                 v.analysis().cloned(),
                 v.analysis_error().map(str::to_string),
+                stage_plan_of(v),
             )
         });
+        let (session, analysis, analysis_error, stage_plan) = craft;
         let craft_def: Result<csp_sim::CraftDef, String> = (|| {
-            let (session, analysis, analysis_error) = craft;
             if session.is_empty() {
                 return Ok(stock_flight_craft());
             }
@@ -1457,6 +1505,14 @@ impl View {
         };
         let (pos, rot, vel, ang_vel) =
             csp_sim::bubble::surface_pose_restore(&env, &pose, com_local, self.sim.clock());
+        // The staged craft's firing plan rides session state (the
+        // spawned graph drops stage metadata); `fire_stage` drains it
+        // one set per press. The plan binds to THIS launch's vessel —
+        // captured before the enqueue so `min_id` bounds the binding
+        // to ids minted after this point (the spawn's `VesselId` is
+        // allocated at drain, so prediction is impossible — the
+        // fingerprint + bound are the identity).
+        let plan = flight::StagePlan::for_launch(stage_plan, &self.sim, &craft);
         self.enqueue_command(
             SourceClass::Ui,
             PLAYER_SOURCE_ID,
@@ -1470,8 +1526,123 @@ impl View {
         );
         // Only a successfully enqueued launch leaves the VAB — every
         // refusal above returned before this point.
+        self.world.insert_resource(plan);
         self.set_mode(ViewMode::Flight);
         Ok(())
+    }
+
+    /// Fire the launched craft's next stage: pop the front drop set
+    /// off [`flight::StagePlan`] and issue one logged `JettisonPart`
+    /// per node — the session's decoupler semantics ("severs all its
+    /// child edges") mapped onto the sim's v1 command surface.
+    /// Returns the nodes jettisoned (`0` = no stage left, or the
+    /// press was refused before popping).
+    ///
+    /// The plan belongs to the vessel its launch spawned — NOT the
+    /// flight focus, which a newer spawn or a breakup fragment can
+    /// take over without retargeting this craft's stages (the
+    /// jettisons must reach the launched graph's node ids, not
+    /// whatever holds focus). [`flight::StagePlan::vessel_for`] binds
+    /// that vessel once the spawn lands.
+    ///
+    /// `JettisonPart` is `InBubble`-only in v1, so the pop happens
+    /// only after the bound vessel checks bubble-resident: on a
+    /// surface-latched pad craft or a rails vessel the commands would
+    /// all reject while the stage was still eaten — a silent no-op
+    /// that permanently spent the firing. Every outcome now lands a
+    /// [`flight::FlightSfx`] cue (the HUD's visible feedback
+    /// channel): the press either visibly does something or says why
+    /// not. Honest limitation: a jettisoned part leaves the sim
+    /// outright — no KSP-style debris fragment, and engines are
+    /// globally armed so a firing separates but never ignites.
+    pub fn fire_stage(&mut self) -> usize {
+        let (vessel, refuse) = {
+            let mut plan = self.world.resource_mut::<flight::StagePlan>();
+            if plan.stages.is_empty() {
+                // `total` keeps the cases honest — an expended
+                // multi-stage plan and a single-stage craft are not
+                // the same "nothing".
+                (
+                    None,
+                    Some(if plan.total > 0 {
+                        "ALL STAGES FIRED — NOTHING LEFT"
+                    } else {
+                        "SINGLE-STAGE CRAFT — NOTHING TO STAGE"
+                    }),
+                )
+            } else {
+                (plan.vessel_for(&self.sim), None)
+            }
+        };
+        if let Some(msg) = refuse {
+            self.flight_notice(msg.to_string());
+            return 0;
+        }
+        let Some(vessel) = vessel else {
+            // The launch's spawn has not landed yet — or never did
+            // (a spawn rejection leaves no vessel to bind).
+            self.flight_notice("STAGING NOT READY — LAUNCHED CRAFT NOT SPAWNED".to_string());
+            return 0;
+        };
+        match self.sim.vessels().get(&vessel).map(|v| &v.state) {
+            Some(csp_sim::VesselState::InBubble(_)) => {}
+            Some(csp_sim::VesselState::SurfaceLatched(_)) => {
+                self.flight_notice(
+                    "NOT STAGED — PARKED ON THE SURFACE (THROTTLE TO LIFTOFF)".to_string(),
+                );
+                return 0;
+            }
+            Some(csp_sim::VesselState::OnRails(_)) => {
+                self.flight_notice("NOT STAGED — VESSEL IS ON RAILS".to_string());
+                return 0;
+            }
+            None => {
+                // The bound vessel left the arena — retire the plan
+                // so the readout stops promising firings it cannot
+                // deliver.
+                {
+                    let mut plan = self.world.resource_mut::<flight::StagePlan>();
+                    plan.stages.clear();
+                    plan.vessel = None;
+                }
+                self.flight_notice("NOTHING TO STAGE — LAUNCHED CRAFT GONE".to_string());
+                return 0;
+            }
+        }
+        // `stages` is stored front-first firing order; `remove(0)`
+        // takes the next firing (pop() would take the last).
+        let nodes = self
+            .world
+            .resource_mut::<flight::StagePlan>()
+            .stages
+            .remove(0);
+        let fired = nodes.len();
+        for node in nodes {
+            self.enqueue_command(
+                SourceClass::Ui,
+                PLAYER_SOURCE_ID,
+                SimCommand::JettisonPart { vessel, node },
+            );
+        }
+        self.flight_notice(format!("STAGED — {fired} PART(S) JETTISONED"));
+        fired
+    }
+
+    /// Push a player-visible flight notice — a cue on the HUD's §3.7
+    /// [`flight::FlightSfx`] channel (the same stack that flashes sim
+    /// transitions). The in-flight feedback path for player commands
+    /// the view must refuse or confirm — staging a parked craft, an
+    /// empty plan, a landed staging fire — so a key press either does
+    /// something visible or says why it cannot. Session state only;
+    /// nothing here reaches the sim.
+    pub fn flight_notice(&mut self, text: impl Into<String>) {
+        self.world
+            .resource_mut::<flight::FlightSfx>()
+            .cues
+            .push_back(flight::SfxCue {
+                text: text.into(),
+                ttl: flight::SFX_TTL_FRAMES,
+            });
     }
 
     /// The shared refusal tail of [`View::launch_craft`]: the reason
@@ -1535,6 +1706,41 @@ impl Default for View {
     fn default() -> Self {
         Self::with_sim(SimWorld::new())
     }
+}
+
+/// The launch-time staging capture — the session's `stage_order`
+/// firing sequence resolved into per-firing drop sets for
+/// [`flight::StagePlan`]: each stage's drop set is every node in the
+/// subtree below each decoupler assigned to that stage (the session's
+/// "severs all its child edges" rule — the decoupler stays
+/// parent-side). Stages with no decoupler, or a decoupler severing
+/// nothing, contribute nothing.
+fn stage_plan_of(vab: &csp_ui::vab::VabSession) -> Vec<Vec<csp_phys::PartNodeId>> {
+    let session = vab.session();
+    let mut plan = Vec::new();
+    for stage in session.stage_order() {
+        let mut drop_set = std::collections::BTreeSet::new();
+        for id in session.parts_in_stage(stage) {
+            let is_decoupler = vab.def_of(id).is_some_and(|d| {
+                d.modules
+                    .iter()
+                    .any(|m| matches!(m, csp_data::ModuleDef::Decoupler))
+            });
+            if !is_decoupler {
+                continue;
+            }
+            let mut stack = session.children_ids(id);
+            while let Some(n) = stack.pop() {
+                if drop_set.insert(n) {
+                    stack.extend(session.children_ids(n));
+                }
+            }
+        }
+        if !drop_set.is_empty() {
+            plan.push(drop_set.into_iter().collect());
+        }
+    }
+    plan
 }
 
 /// The out-of-the-box stock craft — a three-part booster (pod over
@@ -1742,6 +1948,7 @@ mod tests {
                 plumes: Vec::new(),
                 com: csp_core::DVec3::ZERO,
                 latched: false,
+                tanks: Vec::new(),
             });
         view.set_mode(ViewMode::Map);
         // Run just the Presentation stage — `end_frame` would first

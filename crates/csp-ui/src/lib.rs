@@ -162,6 +162,19 @@ pub fn crash_dialog(ctx: &egui::Context, reason: &str, bundle: Option<&str>) {
         });
 }
 
+/// One propellant resource's aggregate fill on the focused vessel —
+/// plain data for the flight HUD's fuel gauges (units/capacity
+/// summed over the vessel's live tanks, per resource).
+#[derive(Clone, Debug)]
+pub struct PropellantGauge {
+    /// Resource display id.
+    pub resource: String,
+    /// Current contents across the vessel's tanks (units).
+    pub units: f64,
+    /// Total capacity (units).
+    pub capacity: f64,
+}
+
 /// One map-view label — a clip-space anchor + text, produced by
 /// `csp-view`'s `map_present` system (M1-D). Plain data; `map_overlay`
 /// converts the NDC anchor into screen coordinates.
@@ -192,6 +205,7 @@ pub fn map_overlay(
     camera_distance_m: f64,
     labels: &[MapLabel],
     keys: &settings::Keymap,
+    key_labels: &std::collections::BTreeMap<String, String>,
 ) {
     let rect = ctx.content_rect();
     egui::Area::new(egui::Id::unique("map_overlay"))
@@ -223,7 +237,10 @@ pub fn map_overlay(
                     c,
                 );
             }
-            let pan = |a: settings::KeyAction| keys.first_binding(a).unwrap_or("—");
+            let pan = |a: settings::KeyAction| {
+                keys.first_binding_label(a, key_labels)
+                    .unwrap_or_else(|| "—".to_string())
+            };
             painter.text(
                 egui::pos2(rect.left() + 10.0, rect.bottom() - 8.0),
                 egui::Align2::LEFT_BOTTOM,
@@ -231,8 +248,8 @@ pub fn map_overlay(
                     "MAP  ·  focus: {focus_name}  ·  camera {camera_distance_m:.3e} m  \
                      —  [{}] flight  [{}] focus  drag: orbit  wheel: zoom  \
                      [{}/{}/{}/{}] pan",
-                    keys.hint(settings::KeyAction::ToggleMap),
-                    keys.hint(settings::KeyAction::CycleFocus),
+                    keys.hint_labeled(settings::KeyAction::ToggleMap, key_labels),
+                    keys.hint_labeled(settings::KeyAction::CycleFocus, key_labels),
                     pan(settings::KeyAction::PanUp),
                     pan(settings::KeyAction::PanDown),
                     pan(settings::KeyAction::PanLeft),
@@ -284,9 +301,23 @@ pub struct FlightHudInput<'a> {
     /// §3.7's visual-SFX cue lines (engine, staging, impact,
     /// breakup) — drawn as top-center event flashes.
     pub sfx: &'a [String],
+    /// The focused vessel's propellant — one gauge per resource
+    /// still carried (empty for tank-less vessels).
+    pub propellant: &'a [PropellantGauge],
+    /// Stage firings left in the launched craft's stage plan —
+    /// `0` = nothing left. `stages_total` distinguishes an expended
+    /// multi-stage craft from a genuinely single-stage one.
+    pub stages_left: usize,
+    /// Firings the launched craft's stage plan captured at launch —
+    /// `0` = single-stage (or no plan); `> 0` with `stages_left == 0`
+    /// = expended.
+    pub stages_total: usize,
     /// The *live* (applied) keymap — the hint lines print the real
     /// bindings, never hardcoded names (`help_panel`'s rule).
     pub keys: &'a settings::Keymap,
+    /// Observed physical-token → glyph map — hints print the keys as
+    /// they read on this machine's layout.
+    pub key_labels: &'a std::collections::BTreeMap<String, String>,
 }
 
 /// Number formatting for the telemetry column: KSP-style SI switch —
@@ -407,14 +438,62 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
                 format!("parts {}  ·  warp ×{}", input.parts, input.warp),
                 dim,
             );
+            // Staging — the launch-captured plan's remaining firings.
+            // "single stage" is only honest when the craft never had
+            // a firing to spend (`stages_total == 0`); an expended
+            // multi-stage craft reads "0 firing(s) left" instead.
+            row(
+                ui,
+                "STG",
+                if input.stages_total == 0 {
+                    "single stage".to_string()
+                } else {
+                    format!("{} firing(s) left", input.stages_left)
+                },
+                dim,
+            );
+            // Propellant gauges — one bar per resource still aboard
+            // (tanks the staging drops leave with their nodes).
+            for t in input.propellant {
+                let frac = if t.capacity > 0.0 {
+                    (t.units / t.capacity) as f32
+                } else {
+                    0.0
+                };
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .text(format!(
+                            "{}  {:.0}/{:.0}",
+                            t.resource, t.units, t.capacity
+                        ))
+                        .desired_width(170.0),
+                );
+            }
             ui.label(
                 egui::RichText::new(format!(
-                    "[{}] controls  ·  [{}]/[{}] throttle  ·  [{}] map  [{}] VAB",
-                    input.keys.hint(settings::KeyAction::ToggleHelp),
-                    input.keys.hint(settings::KeyAction::ThrottleFull),
-                    input.keys.hint(settings::KeyAction::ThrottleCut),
-                    input.keys.hint(settings::KeyAction::ToggleMap),
-                    input.keys.hint(settings::KeyAction::ToggleVab),
+                    "[{}] controls  ·  [{}]/[{}] throttle [{}]/[{}]  ·  [{}] stage  ·  [{}] map  [{}] VAB",
+                    input.keys.hint_labeled(settings::KeyAction::ToggleHelp, input.key_labels),
+                    input
+                        .keys
+                        .hint_labeled(settings::KeyAction::ThrottleFull, input.key_labels),
+                    input
+                        .keys
+                        .hint_labeled(settings::KeyAction::ThrottleCut, input.key_labels),
+                    input
+                        .keys
+                        .hint_labeled(settings::KeyAction::ThrottleUp, input.key_labels),
+                    input
+                        .keys
+                        .hint_labeled(settings::KeyAction::ThrottleDown, input.key_labels),
+                    input
+                        .keys
+                        .hint_labeled(settings::KeyAction::Stage, input.key_labels),
+                    input
+                        .keys
+                        .hint_labeled(settings::KeyAction::ToggleMap, input.key_labels),
+                    input
+                        .keys
+                        .hint_labeled(settings::KeyAction::ToggleVab, input.key_labels),
                 ))
                 .color(egui::Color32::from_gray(140)),
             );
@@ -440,7 +519,12 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
 /// action *from the live [`settings::Keymap`]* (so rebinding keeps it
 /// truthful) plus the fixed mouse controls. `open` mirrors the window's
 /// close button back into the session flag.
-pub fn help_panel(ctx: &egui::Context, keymap: &settings::Keymap, open: &mut bool) {
+pub fn help_panel(
+    ctx: &egui::Context,
+    keymap: &settings::Keymap,
+    key_labels: &std::collections::BTreeMap<String, String>,
+    open: &mut bool,
+) {
     let mut o = *open;
     egui::Window::new("Controls")
         .open(&mut o)
@@ -456,7 +540,7 @@ pub fn help_panel(ctx: &egui::Context, keymap: &settings::Keymap, open: &mut boo
                         .get(action)
                         .map(|v| {
                             v.iter()
-                                .map(settings::KeyBinding::as_str)
+                                .map(|k| k.display_label(key_labels))
                                 .collect::<Vec<_>>()
                                 .join(" / ")
                         })

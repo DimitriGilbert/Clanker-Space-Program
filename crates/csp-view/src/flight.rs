@@ -31,7 +31,7 @@ use csp_core::{DQuat, DVec3};
 use csp_sim::{VesselId, VesselState, World};
 
 use crate::map::{
-    MapCameraF64, MapInput, MapMode, body_system_pos, project_into, solve_orbit_camera,
+    MapCameraF64, MapInput, MapMode, body_system_pos, mat4_mul, perspective_revz, project_into,
 };
 use crate::terrain::{TerrainCache, TerrainConfig};
 
@@ -149,6 +149,12 @@ pub struct FlightPart {
     pub shape: crate::part_mesh::PartShape,
 }
 
+/// One propellant resource's aggregate fill on a vessel — units and
+/// capacity summed over every live node carrying it (the HUD's fuel
+/// gauge; the `csp-ui` plain-data type so `UiBuild` passes the staged
+/// slice straight to `flight_hud`).
+pub type FlightTank = csp_ui::PropellantGauge;
+
 /// One InBubble vessel's staged render data.
 #[derive(Clone, Debug)]
 pub struct FlightBody {
@@ -186,6 +192,9 @@ pub struct FlightBody {
     /// focusable; a throttle command unlatches it). Its `vel` is the
     /// co-rotation velocity the restore reproduces.
     pub latched: bool,
+    /// Propellant per resource — the HUD's fuel gauges. Empty for
+    /// craft-less or tank-less vessels.
+    pub tanks: Vec<FlightTank>,
 }
 
 /// What `end_frame` stages out of the sim for the flight view.
@@ -266,6 +275,17 @@ pub struct FlightUiData {
     /// written from [`FlightSfx`], drawn as event flashes by
     /// `csp_ui::flight_hud`.
     pub sfx: Vec<String>,
+    /// The focused vessel's propellant (resource, units, capacity) —
+    /// the HUD's fuel gauges; empty for tank-less vessels.
+    pub propellant: Vec<FlightTank>,
+    /// Stage firings left in the launched craft's [`StagePlan`] —
+    /// the HUD's "STG" readout. `0` = nothing left; `stages_total`
+    /// carries the single-stage-vs-expended distinction.
+    pub stages_left: usize,
+    /// Firings the launched craft's plan captured at launch — `0` =
+    /// a genuinely single-stage craft (or no plan), `> 0` with
+    /// `stages_left == 0` = an expended multi-stage craft.
+    pub stages_total: usize,
 }
 
 /// One live cue in the §3.7 visual-SFX channel.
@@ -310,11 +330,122 @@ pub struct FlightSfx {
 }
 
 /// Cue lifetime in frames — ~1.5 s at 60 fps.
-const SFX_TTL_FRAMES: u32 = 90;
+pub(crate) const SFX_TTL_FRAMES: u32 = 90;
 
 /// The RenderExtract product — `None` while no flight scene exists.
 #[derive(Resource, Default)]
 pub struct FlightFrame(pub Option<csp_render::flight::FlightPacket>);
+
+/// The launched craft's remaining stage firings (§2.2-C session
+/// state — captured at [`crate::View::launch_craft`] from the VAB
+/// session's editor staging, which the spawned `PartGraph` itself
+/// does not carry). Each entry is one firing's drop set: the part
+/// nodes that leave the sim when it fires — every node in the subtree
+/// below each decoupler assigned to that stage (the session's
+/// "severs all its child edges" rule; the decoupler itself stays
+/// with the parent side, the KSP convention). Entries are in firing
+/// order (the session's descending `stage_order`). Empty stages
+/// (no decoupler, or a decoupler severing nothing) are dropped at
+/// capture, so `stages.len()` counts real separations only.
+///
+/// `View::fire_stage` pops the front set and issues one logged
+/// `JettisonPart` per node — the sim's per-node jettison is the
+/// command surface v1 staging maps onto (a jettisoned part leaves
+/// the sim outright; KSP-style fragment spawn is not in the v1
+/// command vocabulary).
+///
+/// The plan belongs to the vessel its launch spawned — NOT the
+/// flight focus: a newer spawn or a breakup fragment can take the
+/// focus rule's "newest staged vessel" slot without ever retargeting
+/// this plan. The `VesselId` cannot be predicted at capture (the
+/// enqueued `SpawnPhysicalVessel` allocates it inside `step_frame`,
+/// and queued producers/event firings may burn ids first), so the
+/// plan binds *lazily* — the first `fire_stage`/`vessel_for` call
+/// that sees a post-launch vessel carrying the captured craft
+/// fingerprint keeps it.
+#[derive(Resource, Default)]
+pub struct StagePlan {
+    /// Remaining stage drop-sets, firing order.
+    pub stages: Vec<Vec<csp_phys::PartNodeId>>,
+    /// Firings the plan held at launch — `stages.is_empty()` with
+    /// `total > 0` means "expended", not "single stage" (the HUD's
+    /// `stages_total` mirror).
+    pub total: usize,
+    /// The vessel this plan fires at — `None` until [`Self::vessel_for`]
+    /// binds it; a bound id is never re-pointed at another vessel.
+    pub vessel: Option<VesselId>,
+    /// Binding bound: the lowest `VesselId` a post-launch spawn can
+    /// mint — `vessels().next_back() + 1` at capture (ids are
+    /// monotonic and never reused, so nothing already live can meet
+    /// it, and any id at/above it was necessarily allocated after the
+    /// launch was enqueued).
+    min_id: u64,
+    /// `craft_fingerprint` of the launched craft — the binding match.
+    /// Two launches of the same session craft produce identical
+    /// fingerprints; `min_id` keeps the newest launch's plan from
+    /// binding a still-live older copy.
+    craft_key: u64,
+}
+
+impl StagePlan {
+    /// The launch-time capture — [`crate::View::launch_craft`] fills
+    /// this after resolving the craft and before enqueueing the
+    /// spawn. `min_id`/`craft_key` are what [`Self::vessel_for`]
+    /// binds against once the spawn lands.
+    pub(crate) fn for_launch(
+        stages: Vec<Vec<csp_phys::PartNodeId>>,
+        sim: &World,
+        craft: &csp_sim::CraftDef,
+    ) -> Self {
+        Self {
+            total: stages.len(),
+            stages,
+            vessel: None,
+            min_id: sim.vessels().keys().next_back().map_or(0, |id| id.0 + 1),
+            craft_key: craft_fingerprint(craft),
+        }
+    }
+
+    /// A plan pre-bound to a known vessel — for tests and scripted
+    /// producers that mint the `VesselId` themselves. `min_id`/
+    /// `craft_key` stay inert because [`Self::vessel`] is already set.
+    pub fn bound_to(stages: Vec<Vec<csp_phys::PartNodeId>>, vessel: VesselId) -> Self {
+        Self {
+            total: stages.len(),
+            stages,
+            vessel: Some(vessel),
+            min_id: 0,
+            craft_key: 0,
+        }
+    }
+
+    /// The vessel this plan fires at, binding on first call: the
+    /// newest vessel minted at-or-after [`Self::min_id`] whose stored
+    /// craft matches the launch's fingerprint. An unbound plan stays
+    /// unbound (never caches `None`) so a not-yet-landed spawn binds
+    /// on a later press; a bound id is returned verbatim — the caller
+    /// re-checks it against the live arena (the vessel may be gone).
+    pub(crate) fn vessel_for(&mut self, sim: &World) -> Option<VesselId> {
+        if let Some(v) = self.vessel {
+            return Some(v);
+        }
+        let found = sim
+            .vessels()
+            .iter()
+            .rev()
+            .find(|(id, v)| {
+                id.0 >= self.min_id
+                    && v.craft
+                        .as_ref()
+                        .is_some_and(|c| craft_fingerprint(c) == self.craft_key)
+            })
+            .map(|(id, _)| *id);
+        if found.is_some() {
+            self.vessel = found;
+        }
+        found
+    }
+}
 
 /// Session-state cache for the §2.6.4 latched-vessel weld. The
 /// `SurfaceLatched` pose record stores no collider, so staging a
@@ -493,6 +624,7 @@ pub fn capture_sync_input(sim: &World, cache: &mut LatchedWeldCache) -> FlightSy
                     plumes,
                     com: body.com_world(),
                     latched: false,
+                    tanks: vessel_tanks(vessel),
                 });
             }
             // §2.6.4 surface rails: a latched vessel is still *on the
@@ -574,7 +706,42 @@ fn stage_latched(
         plumes: entry.plumes.clone(),
         com: pos + rot.rotate(entry.com_local),
         latched: true,
+        tanks: vessel_tanks(vessel),
     })
+}
+
+/// One vessel's per-resource propellant totals — capacities summed
+/// over each live node's `WeldPart::tanks`, contents over the sim's
+/// `tank_contents` ledger (the same `(node, resource)` map the
+/// transfer/feed paths maintain). Sorted by resource id so the HUD
+/// order is stable; a tank-less vessel returns empty.
+fn vessel_tanks(vessel: &csp_sim::Vessel) -> Vec<FlightTank> {
+    let Some(craft) = vessel.craft.as_ref() else {
+        return Vec::new();
+    };
+    let mut totals: BTreeMap<String, (f64, f64)> = BTreeMap::new();
+    for (id, node) in &craft.graph.nodes {
+        let Some(part) = craft.parts.get(node.effective_index as usize) else {
+            continue;
+        };
+        let contents = vessel.tank_contents.get(id);
+        for tank in &part.tanks {
+            let e = totals.entry(tank.resource.as_str().to_owned()).or_default();
+            e.1 += tank.capacity;
+            e.0 += contents
+                .and_then(|m| m.get(&tank.resource))
+                .copied()
+                .unwrap_or(0.0);
+        }
+    }
+    totals
+        .into_iter()
+        .map(|(resource, (units, capacity))| FlightTank {
+            resource,
+            units,
+            capacity,
+        })
+        .collect()
 }
 
 /// One vessel's per-part render entries — the §3.7 kitbash upgrade
@@ -664,10 +831,12 @@ pub(crate) fn apply_flight_input(
         match e {
             FlightEvent::Orbit { dyaw, dpitch } => {
                 input.yaw += dyaw;
-                input.pitch = (input.pitch + dpitch).clamp(-1.45, 1.45);
+                // ~89° — the camera may go nearly under or directly
+                // overhead; a hard ±π/2 flips the up vector instead.
+                input.pitch = (input.pitch + dpitch).clamp(-1.55, 1.55);
             }
             FlightEvent::Zoom { factor } => {
-                input.distance_m = (input.distance_m * factor).clamp(5.0, 1.0e6);
+                input.distance_m = (input.distance_m * factor).clamp(3.0, 1.0e6);
             }
         }
     }
@@ -678,6 +847,98 @@ pub(crate) fn apply_flight_input(
 pub(crate) fn sync_flight(staged: Res<FlightSyncInput>, mut snap: ResMut<FlightSnapshot>) {
     snap.env = staged.env.clone();
     snap.vessels = staged.vessels.clone();
+}
+
+/// The flight chase-camera solve: an orbit camera in the *local-level
+/// frame* at the focus (up = radial at the CoM, north = spin axis
+/// projected level, east completes it), so the horizon stays level
+/// while the camera is dragged — the shared world-frame
+/// `solve_orbit_camera` puts the orbit basis on the ecliptic normal,
+/// which renders a pad away from the pole tilted (the "can't place
+/// the camera" complaint). `input.yaw` is the azimuth about local up,
+/// `input.pitch` the elevation above the horizon; the eye is clamped
+/// just above the *terrain* surface (the baked heightfield rises up
+/// to `amplitude_m` above `radius_m`, so a datum-only floor lets a
+/// downward drag bury the camera inside a hill). Falls back to the
+/// world-frame basis when there is no environment.
+fn solve_chase_camera(
+    input: &FlightInput,
+    env: Option<&FlightEnv>,
+    focus: &FlightBody,
+    terrain_cfg: &TerrainConfig,
+    terrain_cache: &mut TerrainCache,
+) -> MapCameraF64 {
+    let mut up = DVec3::Z;
+    let mut axis = DVec3::Z;
+    if let Some(env) = env {
+        axis = env.spin_axis;
+        let rel = focus.com - env.body_center;
+        if rel.norm_squared() > 1.0e-12 {
+            up = rel / rel.norm();
+        }
+    }
+    let mut north = axis - up * axis.dot(up);
+    if north.norm_squared() < 1.0e-12 {
+        north = DVec3::Z - up * up.z;
+        if north.norm_squared() < 1.0e-12 {
+            north = DVec3::X - up * up.x;
+        }
+    }
+    let north = north / north.norm();
+    let east = north.cross(up);
+    let (sy, cy) = input.yaw.sin_cos();
+    let (sp, cp) = input.pitch.sin_cos();
+    let dir = north * (cy * cp) + east * (sy * cp) + up * sp;
+    let mut eye = focus.com + dir * input.distance_m;
+    // Keep the eye out of the ground: a drag pitching under the
+    // horizon stops above the local terrain surface (the baked
+    // heightfield's neighbourhood ceiling), not the bare datum —
+    // procedural relief rises up to `amplitude_m` over `radius_m`.
+    if let Some(env) = env {
+        let rel = eye - env.body_center;
+        let r = rel.norm();
+        if r > 0.0 {
+            let floor =
+                crate::terrain::surface_floor_radius(terrain_cfg, terrain_cache, env, rel / r);
+            let min_r = (env.radius_m + 1.5).max(floor + 1.5);
+            if r < min_r {
+                eye = env.body_center + rel * (min_r / r);
+            }
+        }
+    }
+    // Camera basis (columns = view axes in world, c0×c1 = c2): z_out
+    // points focus → eye, "up" is the local surface up.
+    let z_out = {
+        let d = eye - focus.com;
+        if d.norm_squared() > 1.0e-12 {
+            d / d.norm()
+        } else {
+            up
+        }
+    };
+    let right = {
+        let r = up.cross(z_out);
+        if r.norm_squared() > 1.0e-12 {
+            r / r.norm()
+        } else {
+            east
+        }
+    };
+    let upv = z_out.cross(right);
+    let view = [
+        [right.x, right.y, right.z, 0.0],
+        [upv.x, upv.y, upv.z, 0.0],
+        [z_out.x, z_out.y, z_out.z, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ];
+    let aspect = (input.viewport_px.0 / input.viewport_px.1.max(1.0)).max(1e-6);
+    let proj = perspective_revz(FLIGHT_FOV_Y, aspect, 0.1);
+    MapCameraF64 {
+        view_proj: mat4_mul(&proj, &view),
+        eye,
+        distance_m: input.distance_m,
+        valid: true,
+    }
 }
 
 /// The solved chase camera — `MapCameraF64` reused (same orbit
@@ -691,27 +952,82 @@ pub struct FlightCameraF64(pub MapCameraF64);
 
 /// `Presentation` schedule — chase-camera solve + HUD mirrors + the
 /// §3.7 SFX cue edges (the schedule's "VFX, audio cues" slot).
+#[allow(clippy::too_many_arguments)] // the camera solve carries the terrain floor
 pub(crate) fn flight_present(
     input: Res<FlightInput>,
     snap: Res<FlightSnapshot>,
+    plan: Res<StagePlan>,
+    terrain_cfg: Res<TerrainConfig>,
+    mut terrain_cache: ResMut<TerrainCache>,
     mut cam: ResMut<FlightCameraF64>,
     mut ui: ResMut<FlightUiData>,
     mut sfx: ResMut<FlightSfx>,
 ) {
     ui.vessel_count = snap.vessels.len();
     ui.debris_count = snap.vessels.iter().filter(|v| v.debris).count();
+    // §3.7 edge detection on the staged snapshot — cue pushes and
+    // TTL aging live in `sfx_edges` (kept out of this system under
+    // the line budget).
+    ui.sfx = sfx_edges(&mut sfx, &snap.vessels, ui.debris_count);
 
-    // SFX edge detection — the §3.7 row's named transitions, detected
-    // on the staged snapshot (never the sim). Per-focus edges apply
-    // only while the SAME vessel stays focused; a focus switch
-    // re-baselines instead of firing a spurious cut/contact edge.
-    // The focus rule is `focus_vessel`'s — the newest staged vessel.
-    let cur = focus_vessel(&snap.vessels).map(|f| SfxPrev {
+    let Some(focus) = focus_vessel(&snap.vessels) else {
+        cam.0.valid = false;
+        ui.has_vessel = false;
+        ui.focus = None;
+        ui.propellant.clear();
+        ui.stages_left = 0;
+        ui.stages_total = plan.total;
+        return;
+    };
+    cam.0 = solve_chase_camera(
+        &input,
+        snap.env.as_ref(),
+        focus,
+        &terrain_cfg,
+        &mut terrain_cache,
+    );
+    ui.has_vessel = true;
+    ui.focus = Some(focus.id);
+    ui.latched = focus.latched;
+    ui.propellant = focus.tanks.clone();
+    ui.stages_left = plan.stages.len();
+    ui.stages_total = plan.total;
+    ui.orbital_speed_mps = focus.vel.norm();
+    ui.throttle = focus.throttle;
+    ui.parts = focus.nodes;
+    ui.nav_up = [0.0; 3];
+    ui.nav_north = [0.0; 3];
+    ui.nav_east = [0.0; 3];
+    ui.nav_prograde = None;
+    ui.heading_deg = f64::NAN;
+    ui.pitch_deg = f64::NAN;
+    ui.roll_deg = f64::NAN;
+    ui.surface_speed_mps = 0.0;
+    if let Some(env) = snap.env.as_ref() {
+        let rel = focus.com - env.body_center;
+        let r = rel.norm();
+        if r > 0.0 {
+            ui.alt_m = r - env.radius_m;
+            ui.vspeed_mps = focus.vel.dot(rel / r);
+            stage_attitude(&mut ui, env, focus, rel / r);
+        }
+    }
+}
+
+/// The §3.7 edge detector — the named transitions (ignition/cut,
+/// jettison, contact, latch, breakup, removal) detected on the staged
+/// snapshot, folded into [`FlightSfx`] cue pushes plus the TTL
+/// age-out, and the live stack mirrored for the HUD. Per-focus edges
+/// apply only while the SAME vessel stays focused; a focus switch
+/// re-baselines instead of firing a spurious cut/contact edge. The
+/// focus rule is `focus_vessel`'s — the newest staged vessel.
+fn sfx_edges(sfx: &mut FlightSfx, vessels: &[FlightBody], debris_count: usize) -> Vec<String> {
+    let cur = focus_vessel(vessels).map(|f| SfxPrev {
         focus: f.id,
         throttle_on: f.throttle > 0.0,
         nodes: f.nodes,
-        debris: ui.debris_count,
-        vessels: snap.vessels.len(),
+        debris: debris_count,
+        vessels: vessels.len(),
         contact: f.contact,
         latched: f.latched,
     });
@@ -767,47 +1083,8 @@ pub(crate) fn flight_present(
     while sfx.cues.front().is_some_and(|c| c.ttl == 0) {
         sfx.cues.pop_front();
     }
-    ui.sfx = sfx.cues.iter().map(|c| c.text.clone()).collect();
     sfx.prev = cur;
-
-    let Some(focus) = focus_vessel(&snap.vessels) else {
-        cam.0.valid = false;
-        ui.has_vessel = false;
-        ui.focus = None;
-        return;
-    };
-    cam.0 = solve_orbit_camera(
-        input.yaw,
-        input.pitch,
-        input.distance_m,
-        input.viewport_px,
-        focus.com,
-        FLIGHT_FOV_Y,
-        0.1,
-    );
-    ui.has_vessel = true;
-    ui.focus = Some(focus.id);
-    ui.latched = focus.latched;
-    ui.orbital_speed_mps = focus.vel.norm();
-    ui.throttle = focus.throttle;
-    ui.parts = focus.nodes;
-    ui.nav_up = [0.0; 3];
-    ui.nav_north = [0.0; 3];
-    ui.nav_east = [0.0; 3];
-    ui.nav_prograde = None;
-    ui.heading_deg = f64::NAN;
-    ui.pitch_deg = f64::NAN;
-    ui.roll_deg = f64::NAN;
-    ui.surface_speed_mps = 0.0;
-    if let Some(env) = snap.env.as_ref() {
-        let rel = focus.com - env.body_center;
-        let r = rel.norm();
-        if r > 0.0 {
-            ui.alt_m = r - env.radius_m;
-            ui.vspeed_mps = focus.vel.dot(rel / r);
-            stage_attitude(&mut ui, env, focus, rel / r);
-        }
-    }
+    sfx.cues.iter().map(|c| c.text.clone()).collect()
 }
 
 /// The chase target / HUD / throttle-command vessel: the most recently
@@ -1240,6 +1517,7 @@ mod tests {
             plumes: vec![(DVec3::ZERO, DVec3::Z)],
             com: DVec3::ZERO,
             latched: false,
+            tanks: Vec::new(),
         };
         let snap = FlightSnapshot {
             env: None,
@@ -1248,7 +1526,7 @@ mod tests {
         // pitch = π puts the eye 36 m along −Z from the origin focus,
         // looking back along +Z: the plume tip is 36 m in front, the
         // ring corners sit at view depth ≈ 0 (`project_into` → `None`).
-        let cam = solve_orbit_camera(
+        let cam = crate::map::solve_orbit_camera(
             0.0,
             core::f64::consts::PI,
             36.0,

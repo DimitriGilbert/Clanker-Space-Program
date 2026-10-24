@@ -108,7 +108,21 @@ fn trans(h: f32, mu: f32) -> vec3<f32> {
 // exponential atmosphere (μ constant along the ray); on the sphere it's
 // the usual ratio approximation. Clamped where the LUT floors at 0
 // (ground-blocked rays).
+//
+// The LUT only holds "to-space" transmittance, so a DESCENDING segment
+// (mua < 0 — the ray grounds out past b) used to read 0 at both ends
+// and collapse the ratio: every ground fragment on a below-horizon ray
+// shaded featureless black (`col·0 + ins·0`). For a descending segment
+// the fix is the same ratio taken along the ray's UP-going
+// continuation — the continuation from the lower end passes through
+// the upper end and on to space, so T(a→b) = T(b→∞)/T(a→∞) evaluated
+// at zenith −mu.
 fn trans_between(ha: f32, hb: f32, mua: f32, mub: f32) -> vec3<f32> {
+    if (mua < 0.0) {
+        let ta = trans(ha, -mua);
+        return clamp(trans(hb, -mub) / max(ta, vec3<f32>(1.0e-4)),
+                     vec3<f32>(0.0), vec3<f32>(1.0));
+    }
     let tb = trans(hb, mub);
     return clamp(trans(ha, mua) / max(tb, vec3<f32>(1.0e-4)), vec3<f32>(0.0), vec3<f32>(1.0));
 }
@@ -290,7 +304,11 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
             sun_lum = sun_lum * trans(alt_b, dot(sun, i.dir));
         }
         let lam = max(dot(i.nrm, sun), 0.0);
-        col = alb * (0.08 + lam * sun_lum);
+        // A faint cool ambient floor keeps the night side readable —
+        // starlight/airglow rather than a hard 0 that reads as a
+        // rendering bug (the unlit terminator side was featureless
+        // black at 0.08·albedo).
+        col = alb * (vec3<f32>(0.10, 0.12, 0.17) + lam * sun_lum);
     }
 
     if (has_atmo) {
