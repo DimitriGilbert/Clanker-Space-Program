@@ -9,6 +9,17 @@
 //!
 //! The only transcendentals are `libm::{sin, cos, sqrt}` — this crate's
 //! `clippy.toml` bans the `f64` intrinsic versions (§2.7/§8.2).
+//!
+//! **No-FMA reliance (§8.4).** The Hamilton product, [`DQuat::rotate`], and
+//! the `dot`/`norm` chains are plain `a * b ± c * d` `f64` expressions.
+//! rustc today lowers each to discrete `fmul`/`fadd` with no fast-math
+//! flags, so LLVM cannot contract them into `fma` — but that is a codegen
+//! observation, not a language guarantee. The reliance is covered by two
+//! mitigations: the pinned toolchain (`rust-toolchain.toml`) and the §8.4
+//! determinism fingerprint recorded beside every golden, which goes red if
+//! a toolchain change ever alters the bits. The `to_bits` golden tests at
+//! the bottom of this module pin current outputs on contraction-sensitive
+//! inputs for the same reason.
 
 use core::ops::Mul;
 
@@ -38,10 +49,22 @@ impl DQuat {
     }
 
     /// Rotation of `angle` radians about `axis`. The axis is normalized
-    /// internally; a zero axis yields NaN — callers validate geometry at
-    /// the same boundary where they reject non-finite fields.
+    /// internally.
+    ///
+    /// Contract: `axis` must be finite and nonzero. A zero axis has no
+    /// direction to rotate about, and a huge axis can overflow `norm` to
+    /// `+inf` — both violate the geometry gate callers are expected to run
+    /// at ingest, so they trap in debug builds (the `StateHasher` rule-4
+    /// convention: invariant violations trap, never silently degrade).
+    /// In release the zero case yields NaN components (which the §7.1 hash
+    /// rejects as `Fatal`) and the `+inf` case yields a finite wrong
+    /// quaternion — another reason the ingest gate is not optional.
     pub fn from_axis_angle(axis: DVec3, angle: f64) -> Self {
         let n = axis.norm();
+        debug_assert!(
+            n.is_finite() && n > 0.0,
+            "DQuat::from_axis_angle: axis norm must be finite and > 0, got {n}"
+        );
         let (ax, ay, az) = (axis.x / n, axis.y / n, axis.z / n);
         let half = angle * 0.5;
         let s = libm::sin(half);
@@ -61,8 +84,20 @@ impl DQuat {
     /// `q / ‖q‖`. Normalizing every composed rotation keeps unit-quat
     /// drift bounded across long attachment chains; the op is exact
     /// IEEE + one `libm::sqrt`, so it stays bit-deterministic.
+    ///
+    /// Contract: `self` must be finite and nonzero — a zero quaternion has
+    /// no direction to normalize. Violations trap in debug builds (the
+    /// `StateHasher` rule-4 convention) and yield NaN components in
+    /// release. Callers hold a `norm() > 0.0` gate at ingest (the
+    /// `SetAttitude` / physical-spawn / snapshot-boundary checks in
+    /// csp-sim); there is deliberately no `try_normalize` because every
+    /// call site already owns that gate.
     pub fn normalize(self) -> Self {
         let n = self.norm();
+        debug_assert!(
+            n.is_finite() && n > 0.0,
+            "DQuat::normalize: quaternion norm must be finite and > 0, got {n}"
+        );
         Self::new(self.x / n, self.y / n, self.z / n, self.w / n)
     }
 
@@ -145,5 +180,53 @@ mod tests {
         let q = DQuat::new(1.0, -2.0, 0.5, 2.0).normalize();
         assert!((q.norm() - 1.0).abs() < 1e-15);
         assert!(q.is_finite());
+    }
+
+    // -- §8.4 bit-exactness canaries -------------------------------------
+    // `to_bits` pins on inputs where fma contraction changes the answer
+    // (verified: the fused forms differ in the last ulp on these exact
+    // operands). A failure here means a toolchain/codegen change altered
+    // FP semantics — re-bless only alongside a deliberate fingerprint
+    // bump, never silently.
+
+    #[test]
+    fn hamilton_mul_is_bit_exact_on_contraction_sensitive_inputs() {
+        let m = DQuat::new(-0.125, 0.6, 2.3, -1.75) * DQuat::new(3.0, -2.0, 0.875, 0.3);
+        assert_eq!(m.x.to_bits(), 0xbfc4ccccccccccc0);
+        assert_eq!(m.y.to_bits(), 0x402560f5c28f5c29);
+        assert_eq!(m.z.to_bits(), 0xc0032147ae147ae1);
+        assert_eq!(m.w.to_bits(), 0xbfeecccccccccccc);
+    }
+
+    #[test]
+    fn rotate_is_bit_exact_on_contraction_sensitive_inputs() {
+        let q = DQuat::new(1.1, 1.75, -0.1, -2.375);
+        let r = q.rotate(DVec3::new(0.7, -2.7, -2.2));
+        assert_eq!(r.x.to_bits(), 0x40183ae147ae147e);
+        assert_eq!(r.y.to_bits(), 0xc00e79db22d0e568);
+        assert_eq!(r.z.to_bits(), 0x4042a87ae147ae16);
+    }
+
+    #[test]
+    fn normalize_is_bit_exact_on_contraction_sensitive_inputs() {
+        let q = DQuat::new(0.4, -0.875, 0.6, 2.1).normalize();
+        assert_eq!(q.x.to_bits(), 0x3fc5741c2d7c04fc);
+        assert_eq!(q.y.to_bits(), 0xbfd776fed1bfa573);
+        assert_eq!(q.z.to_bits(), 0x3fd01715221d03bd);
+        assert_eq!(q.w.to_bits(), 0x3fec2864fbb2c68b);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "axis norm must be finite and > 0")]
+    fn from_axis_angle_traps_on_zero_axis() {
+        let _ = DQuat::from_axis_angle(DVec3::ZERO, PI);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "quaternion norm must be finite and > 0")]
+    fn normalize_traps_on_zero_quaternion() {
+        let _ = DQuat::new(0.0, 0.0, 0.0, 0.0).normalize();
     }
 }

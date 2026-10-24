@@ -185,7 +185,7 @@ pub fn predict_maneuver(
     orbit: &OrbitState,
     node: &ManeuverNode,
 ) -> Result<OrbitState, csp_core::SimError> {
-    let t = SimTime(node.tick);
+    let t = SimTime::from_ticks(node.tick);
     let (r, v) = model.state_at(orbit, t)?;
     let dv = node_dv_world(
         r,

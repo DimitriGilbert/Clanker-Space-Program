@@ -2925,7 +2925,7 @@ impl World {
         }
         restore_colony_state(&snapshot, &orbits, &colony_inspections)?;
         Ok(Self {
-            clock: SimTime(snapshot.clock_ticks),
+            clock: SimTime::from_ticks(snapshot.clock_ticks),
             warp_level: snapshot.warp_level,
             pending: BTreeMap::new(),
             command_log: Vec::new(),
@@ -3484,7 +3484,7 @@ impl World {
             // Tick `now` drains an empty queue (the boundary drain
             // already ran) — "one drain producing stamps per tick
             // value" holds.
-            self.clock = SimTime(t);
+            self.clock = SimTime::from_ticks(t);
             self.drain_at(t, effective_target, shadow, commands_applied, rejected)?;
             self.control_tick(t, shadow, degraded)?;
             let Self {
@@ -3733,7 +3733,7 @@ impl World {
                 vessels,
                 physics,
                 &latched_now,
-                SimTime(t + 1),
+                SimTime::from_ticks(t + 1),
                 &rel_cfg,
             ));
             // M9b §3.4: the tick's collected side-effects land at
@@ -3998,7 +3998,7 @@ impl World {
         }
         // M9a: restore the pre-range clock — `step_frame`'s
         // `try_advance` moves `now → t_next` as before.
-        self.clock = SimTime(now);
+        self.clock = SimTime::from_ticks(now);
         // The drain mutates `tracked_vessels` and `autopilots` — both
         // hashed — so capture them first, but only when there is a
         // drain to cover: an empty list mutates nothing and the clone
@@ -4080,7 +4080,7 @@ impl World {
             if let VesselState::InBubble(body) = &mut v.state {
                 body.throttle = 0.0;
             }
-            match self.apply_to_rails_at(*vid, SimTime(t_next), shadow) {
+            match self.apply_to_rails_at(*vid, SimTime::from_ticks(t_next), shadow) {
                 Ok(()) => {}
                 Err(e @ SimError::Fatal(_)) => return Err(e),
                 Err(e) => {
@@ -4302,7 +4302,7 @@ impl World {
         shadow: &mut TickShadow,
         suppress: Option<(BodyId, orbit::SoiDirection)>,
     ) -> Result<(), SimError> {
-        let now = SimTime(now.ticks().max(self.clock.ticks()));
+        let now = SimTime::from_ticks(now.ticks().max(self.clock.ticks()));
         // A vessel with no conic (bubble-resident or latched) has no
         // scan to publish — the invariant is that SOI events are only
         // ever scheduled while on rails.
@@ -4318,7 +4318,7 @@ impl World {
         let Some(span) = self.orbits.scan_horizon(&orbit)? else {
             return Ok(());
         };
-        let horizon = SimTime(now.ticks().saturating_add(span));
+        let horizon = SimTime::from_ticks(now.ticks().saturating_add(span));
         match self.orbits.next_soi_event_within(
             &orbit,
             now,
@@ -5207,7 +5207,7 @@ impl World {
         // clamps defensively too).
         self.schedule_next_soi(
             vessel,
-            SimTime(epoch.ticks().max(self.clock.ticks())),
+            SimTime::from_ticks(epoch.ticks().max(self.clock.ticks())),
             shadow,
             suppress,
         )
@@ -5507,7 +5507,7 @@ impl World {
         // tick must solve and the orbital frame there must exist —
         // evaluated now so a bogus node rejects instead of degrading
         // at its tick.
-        let (r, v) = self.orbits.state_at(orbit, SimTime(at))?;
+        let (r, v) = self.orbits.state_at(orbit, SimTime::from_ticks(at))?;
         if r.norm() <= min_node_r {
             return Err(SimError::Recoverable(
                 "maneuver: node point inside the surface/atmosphere floor",
@@ -5618,7 +5618,7 @@ impl World {
         let Some(craft) = v.craft.clone() else {
             return Err(SimError::Recoverable("node start: vessel has no craft"));
         };
-        let t = SimTime(tick);
+        let t = SimTime::from_ticks(tick);
         let (r, vel) = self.orbits.state_at(&orbit, t)?;
         let dv = maneuver::node_dv_world(
             r,
@@ -6918,7 +6918,7 @@ impl World {
             // above). `event.tick <= t_next` by the pop condition, so
             // the swap only ever stands the clock still or steps it
             // back inside the batch.
-            self.clock = SimTime(event.tick);
+            self.clock = SimTime::from_ticks(event.tick);
             match self.fire_event(&event, &mut ev_shadow, degraded) {
                 // The event committed — fold its lazy captures (and any
                 // `issue` counts a `ScriptWake`'s `on_tick` produced
@@ -6926,11 +6926,11 @@ impl World {
                 // they would die with `ev_shadow` and leave this event's
                 // writes uncovered by a later `Fatal`'s restore.
                 Ok(()) => {
-                    self.clock = SimTime(t_next);
+                    self.clock = SimTime::from_ticks(t_next);
                     shadow.merge_committed(ev_shadow);
                 }
                 Err(e @ SimError::Fatal(_)) => {
-                    self.clock = SimTime(t_next);
+                    self.clock = SimTime::from_ticks(t_next);
                     return Err(e);
                 }
                 Err(e) => {
@@ -7066,7 +7066,7 @@ impl World {
             // and `schedule_next_soi` clamps the deferred-tail corner.
             EventKind::SoiRescan { vessel } => self.schedule_next_soi(
                 *vessel,
-                SimTime(event.tick.max(self.clock.ticks())),
+                SimTime::from_ticks(event.tick.max(self.clock.ticks())),
                 shadow,
                 None,
             ),
@@ -7092,7 +7092,7 @@ impl World {
                 // never search the past for crossings.
                 self.schedule_next_soi(
                     *vessel,
-                    SimTime(event.tick.max(self.clock.ticks())),
+                    SimTime::from_ticks(event.tick.max(self.clock.ticks())),
                     shadow,
                     Some((body.clone(), *direction)),
                 )
@@ -7189,7 +7189,7 @@ impl World {
         tick: u64,
         shadow: &mut TickShadow,
     ) -> Result<(), SimError> {
-        let t = SimTime(tick);
+        let t = SimTime::from_ticks(tick);
         self.shadow_vessels(shadow);
         // The event only exists for a vessel that was on rails when it
         // was scheduled; a stale firing on a non-rails vessel is a
@@ -7343,8 +7343,8 @@ impl World {
             }
             if t_next > now
                 && let Err(e) = self.advance_interval_subsystems(
-                    SimTime(now),
-                    SimTime(t_next),
+                    SimTime::from_ticks(now),
+                    SimTime::from_ticks(t_next),
                     &mut shadow,
                     &mut degraded,
                 )
@@ -11220,7 +11220,7 @@ mod tests {
         // (`t_next == event.tick`) — the boundary firing.
         let mut fine = build();
         plant(&mut fine, 50);
-        fine.clock = SimTime(50);
+        fine.clock = SimTime::from_ticks(50);
         let (_, degraded) = fire(&mut fine, 50);
         assert_eq!(
             degraded.len(),
@@ -11239,7 +11239,7 @@ mod tests {
         // `t_next + K`, diverging from the fine run's `event.tick + K`.
         let mut coarse = build();
         plant(&mut coarse, 50);
-        coarse.clock = SimTime(200);
+        coarse.clock = SimTime::from_ticks(200);
         let (_, degraded) = fire(&mut coarse, 200);
         assert_eq!(degraded.len(), 1);
         assert!(
@@ -11375,7 +11375,7 @@ mod tests {
                 state: VesselState::OnRails(OrbitState {
                     parent: BodyId::from("p"),
                     elements: leo_elements(),
-                    epoch: SimTime(0),
+                    epoch: SimTime::from_ticks(0),
                 }),
                 seams: Vec::new(),
                 tank_contents: BTreeMap::new(),
@@ -11431,7 +11431,7 @@ mod tests {
             state: VesselState::OnRails(OrbitState {
                 parent: BodyId::from("p"),
                 elements,
-                epoch: SimTime(0),
+                epoch: SimTime::from_ticks(0),
             }),
             seams: Vec::new(),
             tank_contents: BTreeMap::new(),
@@ -11836,7 +11836,7 @@ mod tests {
         let leo = OrbitState {
             parent: BodyId::from("p"),
             elements: leo_elements(),
-            epoch: SimTime(0),
+            epoch: SimTime::from_ticks(0),
         };
         let span = model.scan_horizon(&leo).unwrap().unwrap();
         // LEO's own period is the tightest orbit in play.
@@ -11846,8 +11846,8 @@ mod tests {
         let (ev, samples) = model
             .next_soi_event_within(
                 &leo,
-                SimTime(0),
-                SimTime(span),
+                SimTime::from_ticks(0),
+                SimTime::from_ticks(span),
                 orbit::SOI_SCAN_MAX_SAMPLES,
                 None,
                 None,
@@ -11871,7 +11871,7 @@ mod tests {
         let hyp = OrbitState {
             parent: BodyId::from("p"),
             elements: crossing_vessel_elements(),
-            epoch: SimTime(0),
+            epoch: SimTime::from_ticks(0),
         };
         let span = model.scan_horizon(&hyp).unwrap().unwrap();
         let t_moon_s =
@@ -11880,8 +11880,8 @@ mod tests {
         let (ev, samples) = model
             .next_soi_event_within(
                 &hyp,
-                SimTime(0),
-                SimTime(span),
+                SimTime::from_ticks(0),
+                SimTime::from_ticks(span),
                 orbit::SOI_SCAN_MAX_SAMPLES,
                 None,
                 None,
@@ -14466,7 +14466,7 @@ mod tests {
         let mut prev = 0.0;
         let mut tau_c = 0u64;
         for t in (0..=6_000_000u64).step_by(64) {
-            let (r, _) = probe.state_at(&vs, SimTime(t)).unwrap();
+            let (r, _) = probe.state_at(&vs, SimTime::from_ticks(t)).unwrap();
             let rn = r.norm();
             if prev != 0.0 && (prev - RASK_A).signum() != (rn - RASK_A).signum() {
                 tau_c = t;
@@ -14475,9 +14475,9 @@ mod tests {
             prev = rn;
         }
         assert!(tau_c > 0, "transit conic never crosses m's orbital radius");
-        let (rc, _) = probe.state_at(&vs, SimTime(tau_c)).unwrap();
+        let (rc, _) = probe.state_at(&vs, SimTime::from_ticks(tau_c)).unwrap();
         let n_moon = libm::sqrt(MU_TERRIN / (RASK_A * RASK_A * RASK_A));
-        let moon_m0 = libm::atan2(rc.y, rc.x) - n_moon * SimTime(tau_c).seconds();
+        let moon_m0 = libm::atan2(rc.y, rc.x) - n_moon * SimTime::from_ticks(tau_c).seconds();
         let mut w = World::with_physics(
             transit_system(moon_m0),
             PhysicsConfig {
@@ -14519,8 +14519,8 @@ mod tests {
         let mut inside = false;
         let (mut tau1, mut tau2) = (0u64, 0u64);
         for t in (tau_c.saturating_sub(400_000)..=tau_c + 400_000).step_by(8) {
-            let (rv, _) = w.orbits().state_at(&orbit, SimTime(t)).unwrap();
-            let (rm, _) = w.orbits().state_at(&moon, SimTime(t)).unwrap();
+            let (rv, _) = w.orbits().state_at(&orbit, SimTime::from_ticks(t)).unwrap();
+            let (rm, _) = w.orbits().state_at(&moon, SimTime::from_ticks(t)).unwrap();
             let sep = rv.distance(rm);
             if !inside && sep < TRANSIT_SOI {
                 inside = true;
@@ -14600,7 +14600,7 @@ mod tests {
             BodyId::from("m"),
             "inside the SOI at the stamped epoch — the Enter resolves in place"
         );
-        assert_eq!(orbit.epoch, SimTime(mid));
+        assert_eq!(orbit.epoch, SimTime::from_ticks(mid));
         // The re-based conic is bound about `m` (the transit's relative
         // speed is sub-escape at this altitude) — patched conics then
         // keep the vessel `m`-resident for good, and the publish
@@ -14906,8 +14906,8 @@ mod tests {
         to: u64,
     ) -> u64 {
         let sep = |t: u64| -> f64 {
-            let (rp, _) = model.state_at(conic, SimTime(t)).unwrap();
-            let (rt, _) = model.body_state(origin, SimTime(t)).unwrap();
+            let (rp, _) = model.state_at(conic, SimTime::from_ticks(t)).unwrap();
+            let (rt, _) = model.body_state(origin, SimTime::from_ticks(t)).unwrap();
             rp.distance(rt) - soi_m
         };
         assert!(sep(from) < 0.0, "conic starts outside the SOI");
@@ -14938,16 +14938,19 @@ mod tests {
         pred_horizon: SimTime,
     ) -> (OrbitState, DVec3, DVec3, u64) {
         let terrin = BodyId::from("terrin");
-        let (r_plan_c, v_plan_c) = model.state_at(&plan.conic, SimTime(t_c)).unwrap();
-        let (r_ter_c, v_ter_c) = model.body_state(&terrin, SimTime(t_c)).unwrap();
+        let (r_plan_c, v_plan_c) = model
+            .state_at(&plan.conic, SimTime::from_ticks(t_c))
+            .unwrap();
+        let (r_ter_c, v_ter_c) = model.body_state(&terrin, SimTime::from_ticks(t_c)).unwrap();
         let x_c = r_plan_c - r_ter_c;
         let v_c = v_plan_c - v_ter_c;
         let m_axis = x_c.cross(v_c);
         let x_hat_c = x_c / x_c.norm();
         let (r_duv_arr, _) = model
-            .body_state(&plan.destination, SimTime(plan.arrival_tick))
+            .body_state(&plan.destination, SimTime::from_ticks(plan.arrival_tick))
             .unwrap();
-        let tof = SimTime(plan.arrival_tick).seconds() - SimTime(t_c).seconds();
+        let tof =
+            SimTime::from_ticks(plan.arrival_tick).seconds() - SimTime::from_ticks(t_c).seconds();
         let mut best: Option<(f64, OrbitState, DVec3, DVec3)> = None;
         for k in -120i32..=120 {
             let theta = k as f64 * (0.30 / 120.0);
@@ -14980,7 +14983,7 @@ mod tests {
                     OrbitState {
                         parent: terrin.clone(),
                         elements: el,
-                        epoch: SimTime(t_c),
+                        epoch: SimTime::from_ticks(t_c),
                     },
                     x_e,
                     v_e,
@@ -14993,12 +14996,21 @@ mod tests {
         // duva — verified through the same rebase the fired event will
         // perform, not just by the Lambert construction.
         let egress_rebased = model
-            .rebase(&h_orbit, &terrin, SoiDirection::Exit, SimTime(t_c))
+            .rebase(
+                &h_orbit,
+                &terrin,
+                SoiDirection::Exit,
+                SimTime::from_ticks(t_c),
+            )
             .unwrap();
-        let confirm =
-            transfer::predict_encounter(model, &egress_rebased, SimTime(t_c), pred_horizon)
-                .unwrap()
-                .expect("the designed egress must land on duva's SOI");
+        let confirm = transfer::predict_encounter(
+            model,
+            &egress_rebased,
+            SimTime::from_ticks(t_c),
+            pred_horizon,
+        )
+        .unwrap()
+        .expect("the designed egress must land on duva's SOI");
         assert_eq!(confirm.event.direction, SoiDirection::Enter);
         assert_eq!(confirm.event.body, plan.destination);
         (h_orbit, x_e, v_e, confirm.event.tick)
@@ -15017,7 +15029,9 @@ mod tests {
             r_park < TERRIN_SOI * 0.5,
             "parking radius {r_park} leaves no burn room under the SOI"
         );
-        let rad = |t: u64| -> f64 { model.state_at(h, SimTime(t)).unwrap().0.norm() - r_park };
+        let rad = |t: u64| -> f64 {
+            model.state_at(h, SimTime::from_ticks(t)).unwrap().0.norm() - r_park
+        };
         let a_h = h_el.semi_major_axis_m.abs();
         let n_h = libm::sqrt(MU_TERRIN / (a_h * a_h * a_h));
         let hz_f = csp_core::TICK_HZ as f64;
@@ -15030,7 +15044,11 @@ mod tests {
             if rad(mid) < 0.0 { blo = mid } else { bhi = mid }
         }
         let t_b = bhi;
-        (t_b, model.state_at(h, SimTime(t_b)).unwrap(), r_park)
+        (
+            t_b,
+            model.state_at(h, SimTime::from_ticks(t_b)).unwrap(),
+            r_park,
+        )
     }
 
     /// The model-level design half of the Duva test: plan, verify, and
@@ -15042,11 +15060,12 @@ mod tests {
         // Model-level gate first (the piece the M5-B tests already
         // proved): `plan.conic` itself reaches Duva's SOI — without
         // that, no burn construction can rescue the leg.
-        let pred_horizon = SimTime(plan.arrival_tick.saturating_add(csp_core::TICK_HZ * 86_400));
+        let pred_horizon =
+            SimTime::from_ticks(plan.arrival_tick.saturating_add(csp_core::TICK_HZ * 86_400));
         let pred = transfer::predict_encounter_excluding(
             model,
             &plan.conic,
-            SimTime(plan.departure_tick),
+            SimTime::from_ticks(plan.departure_tick),
             pred_horizon,
             Some(&terrin),
         )
@@ -15088,8 +15107,13 @@ mod tests {
     fn spawn_duva_orbiter(model: &PatchedConics, inj: &DuvaInjection) -> (World, VesselId) {
         let (p_b, _) = inj.burn;
         let v_park_b = inj.h_hat.cross(p_b) / p_b.norm() * libm::sqrt(MU_TERRIN / inj.r_park);
-        let (r0, v0) =
-            orbit::propagate(p_b, v_park_b, MU_TERRIN, -SimTime(inj.t_b).seconds()).unwrap();
+        let (r0, v0) = orbit::propagate(
+            p_b,
+            v_park_b,
+            MU_TERRIN,
+            -SimTime::from_ticks(inj.t_b).seconds(),
+        )
+        .unwrap();
         let mut w = World::with_physics(
             model.clone(),
             PhysicsConfig {
@@ -15173,11 +15197,15 @@ mod tests {
         // ~0.4 s burn arc centres on t_b — the achieved conic then
         // reads as the impulsive burn AT the design point.
         let stamped = w.vessels()[&id].orbit().unwrap().clone();
-        let (_, v_v_b) = model.state_at(&stamped, SimTime(inj.t_b)).unwrap();
+        let (_, v_v_b) = model
+            .state_at(&stamped, SimTime::from_ticks(inj.t_b))
+            .unwrap();
         let dv_world = inj.burn.1 - v_v_b;
         let burn_ticks = (dv_world.norm() / (1.0e7 / 1_000.0) * hz as f64).ceil() as u64;
         let node_tick = inj.t_b.saturating_sub(burn_ticks / 2);
-        let (r_v_n, v_v_n) = model.state_at(&stamped, SimTime(node_tick)).unwrap();
+        let (r_v_n, v_v_n) = model
+            .state_at(&stamped, SimTime::from_ticks(node_tick))
+            .unwrap();
         let (pro, nrm, rad_f) = maneuver::burn_frame(r_v_n, v_v_n).unwrap();
         w.enqueue(
             SourceClass::Ui,
@@ -15219,7 +15247,7 @@ mod tests {
             &model,
             &post,
             post.epoch,
-            SimTime(inj.t_c.saturating_add(hz * 86_400)),
+            SimTime::from_ticks(inj.t_c.saturating_add(hz * 86_400)),
         )
         .unwrap()
         .expect("the achieved conic must still egress terrin's SOI");
@@ -18123,7 +18151,7 @@ mod tests {
                 state: VesselState::OnRails(OrbitState {
                     parent: BodyId::from("p"),
                     elements: leo_elements(),
-                    epoch: SimTime(0),
+                    epoch: SimTime::from_ticks(0),
                 }),
                 seams: Vec::new(),
                 tank_contents: BTreeMap::new(),
@@ -18433,7 +18461,7 @@ mod tests {
                 state: VesselState::OnRails(OrbitState {
                     parent: BodyId::from("p"),
                     elements: leo_elements(),
-                    epoch: SimTime(0),
+                    epoch: SimTime::from_ticks(0),
                 }),
                 seams: Vec::new(),
                 tank_contents: BTreeMap::new(),

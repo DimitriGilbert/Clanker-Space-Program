@@ -6,6 +6,17 @@
 //! `libm::sqrt` — this crate's `clippy.toml` bans `f64::sqrt` like every
 //! other non-`libm` float math entry point (§2.7/§8.2). Everything else is
 //! exact IEEE `f64` arithmetic.
+//!
+//! **No-FMA reliance (§8.4).** `dot`/`cross` are plain `a * b ± c * d`
+//! `f64` chains — "exact IEEE" above means each operation rounds once, in
+//! source order. rustc today lowers them to discrete `fmul`/`fadd` with no
+//! fast-math flags, so LLVM cannot contract them into `fma` — but that is
+//! a codegen observation, not a language guarantee. The reliance is
+//! covered by two mitigations: the pinned toolchain
+//! (`rust-toolchain.toml`) and the §8.4 determinism fingerprint recorded
+//! beside every golden, which goes red if a toolchain change ever alters
+//! the bits. The `to_bits` golden tests at the bottom of this module pin
+//! current outputs on contraction-sensitive inputs for the same reason.
 
 use core::ops::{Add, Div, Mul, Neg, Sub};
 
@@ -158,5 +169,29 @@ mod tests {
         assert!(DVec3::new(1.0, 2.0, 3.0).is_finite());
         assert!(!DVec3::new(f64::NAN, 0.0, 0.0).is_finite());
         assert!(!DVec3::new(0.0, f64::INFINITY, 0.0).is_finite());
+    }
+
+    // -- §8.4 bit-exactness canaries -------------------------------------
+    // `to_bits` pins on inputs where fma contraction changes the answer
+    // (verified: the fused forms differ in the last ulp on these exact
+    // operands). A failure here means a toolchain/codegen change altered
+    // FP semantics — re-bless only alongside a deliberate fingerprint
+    // bump, never silently.
+
+    #[test]
+    fn dot_is_bit_exact_on_contraction_sensitive_inputs() {
+        let a = DVec3::new(-1.0, 2.1, 2.8);
+        let b = DVec3::new(-0.125, 1.375, -0.75);
+        assert_eq!(a.dot(b).to_bits(), 0x3fed333333333338);
+    }
+
+    #[test]
+    fn cross_is_bit_exact_on_contraction_sensitive_inputs() {
+        let a = DVec3::new(0.8, -2.625, -3.0);
+        let b = DVec3::new(0.125, -2.0, 2.9);
+        let c = a.cross(b);
+        assert_eq!(c.x.to_bits(), 0xc02b39999999999a);
+        assert_eq!(c.y.to_bits(), 0xc0058f5c28f5c28f);
+        assert_eq!(c.z.to_bits(), 0xbff459999999999a);
     }
 }

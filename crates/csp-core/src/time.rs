@@ -12,12 +12,24 @@ pub const TICK_HZ: u64 = 64;
 /// equality are total. Epoch 0 = game start; UT seconds = ticks / `TICK_HZ`.
 /// `serde(transparent)` keeps the wire spelling a bare `u64` (§7.2/
 /// §7.6); serialization never feeds the §7.1 hash.
+///
+/// The field is private on purpose: [`SimTime::try_advance`] is the only
+/// mutator, and it is checked — direct field writes would bypass its
+/// overflow contract and wrap silently in release.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct SimTime(pub u64);
+pub struct SimTime(u64);
 
 impl SimTime {
     pub const ZERO: Self = Self(0);
+
+    /// Construct from a raw tick count — the only constructor besides
+    /// [`Self::ZERO`]. Unchecked by design: a tick count is just a `u64`,
+    /// and the fallible contract lives on the mutation path
+    /// ([`Self::try_advance`]), not on construction.
+    pub const fn from_ticks(ticks: u64) -> Self {
+        Self(ticks)
+    }
 
     /// Advance by `ticks` — the only mutator, and it is fallible (§2.13:
     /// `step_frame` returns `Result<_, SimError>`).
@@ -67,14 +79,14 @@ mod tests {
 
     #[test]
     fn try_advance_accumulates_exactly() {
-        let mut t = SimTime(u64::MAX - 4);
+        let mut t = SimTime::from_ticks(u64::MAX - 4);
         t.try_advance(4).unwrap();
         assert_eq!(t.ticks(), u64::MAX);
     }
 
     #[test]
     fn try_advance_overflow_is_fatal_and_preserves_clock() {
-        let mut t = SimTime(u64::MAX - 4);
+        let mut t = SimTime::from_ticks(u64::MAX - 4);
         assert!(matches!(t.try_advance(8), Err(SimError::Fatal(_))));
         assert_eq!(t.ticks(), u64::MAX - 4); // untouched on failure
     }

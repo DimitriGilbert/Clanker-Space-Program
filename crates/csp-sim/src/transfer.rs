@@ -749,8 +749,8 @@ fn leg_at(
     depart_tick: u64,
     duration_ticks: u64,
 ) -> Result<Option<TransferLeg>, SimError> {
-    let t_dep = SimTime(depart_tick);
-    let t_arr = SimTime(depart_tick.saturating_add(duration_ticks));
+    let t_dep = SimTime::from_ticks(depart_tick);
+    let t_arr = SimTime::from_ticks(depart_tick.saturating_add(duration_ticks));
     let tof_s = duration_ticks as f64 / TICK_HZ as f64;
     if tof_s <= 0.0 {
         return Ok(None);
@@ -1054,11 +1054,11 @@ pub fn plan_transfer(model: &PatchedConics, q: &PorkchopQuery) -> Result<Transfe
     }
     let leg = leg_at(model, q, mu_p, mu_o, mu_d, pd, pt)?
         .ok_or(SimError::Recoverable("plan: refined point is infeasible"))?;
-    let (r1, _) = model.body_state(&q.origin, SimTime(pd))?;
+    let (r1, _) = model.body_state(&q.origin, SimTime::from_ticks(pd))?;
     let conic = OrbitState {
         parent,
         elements: cartesian_to_elements(r1, leg.v1, mu_p)?,
-        epoch: SimTime(pd),
+        epoch: SimTime::from_ticks(pd),
     };
     Ok(TransferPlan {
         origin: q.origin.clone(),
@@ -1172,7 +1172,7 @@ pub fn predict_encounter_excluding(
     else {
         return Ok(None);
     };
-    let t = SimTime(event.tick);
+    let t = SimTime::from_ticks(event.tick);
     // The only rebased=None case is an Exit past a parentless body —
     // it has no frame to re-base into. Every other failure (including
     // Fatal) propagates rather than degrading the prediction silently.
@@ -1315,7 +1315,7 @@ pub fn departure_node(
     }
     let mu_o = model.body_orbit(&plan.origin)?.mu_m3_per_s2;
     let v_hat = v_inf / vinf;
-    let t_dep = SimTime(plan.departure_tick);
+    let t_dep = SimTime::from_ticks(plan.departure_tick);
     // The parking orbit's inertial basis: periapsis direction ê,
     // orbit normal ŵ, and the in-plane quadrature q̂ = ŵ×ê.
     let e_hat = perifocal_to_inertial(
@@ -1365,7 +1365,7 @@ pub fn departure_node(
         return Err(SimError::Recoverable("ejection: burn precedes epoch"));
     }
     let burn_tick = (burn_s * TICK_HZ as f64).round() as u64;
-    let (r_bv, v_bv) = model.state_at(vessel_orbit, SimTime(burn_tick))?;
+    let (r_bv, v_bv) = model.state_at(vessel_orbit, SimTime::from_ticks(burn_tick))?;
     let dv_world = v_post - v_bv;
     let (pro, nrm, rad) = burn_frame(r_bv, v_bv)?;
     Ok(DepartureNode {
@@ -1759,10 +1759,16 @@ mod tests {
         // (in the system plane) should satisfy the Hohmann phasing
         // π − n_d·tof within the eccentric/finite-burn slack.
         let (rt, _) = model
-            .body_state(&BodyId::from("terrin"), SimTime(plan.departure_tick))
+            .body_state(
+                &BodyId::from("terrin"),
+                SimTime::from_ticks(plan.departure_tick),
+            )
             .unwrap();
         let (rd, _) = model
-            .body_state(&BodyId::from("duva"), SimTime(plan.departure_tick))
+            .body_state(
+                &BodyId::from("duva"),
+                SimTime::from_ticks(plan.departure_tick),
+            )
             .unwrap();
         let phase = libm::atan2(rt.cross(rd).z, rt.dot(rd));
         let n_d = libm::sqrt(MU_SOLEN / (DUVA_A * DUVA_A * DUVA_A));
@@ -1828,7 +1834,7 @@ mod tests {
         OrbitState {
             parent: BodyId::from("solen"),
             elements: cartesian_to_elements(aim, vel, MU_SOLEN).unwrap(),
-            epoch: SimTime((t_enc * TICK_HZ as f64) as u64),
+            epoch: SimTime::from_ticks((t_enc * TICK_HZ as f64) as u64),
         }
     }
 
@@ -1841,8 +1847,8 @@ mod tests {
         let model = home_system();
         let t_enc = 2.0e6;
         let conic = graze_conic(4.0e5, t_enc); // 400 km offset < 600 km radius
-        let now = SimTime(((t_enc - 6.0e5).max(0.0) * TICK_HZ as f64) as u64);
-        let horizon = SimTime(((t_enc + 6.0e5) * TICK_HZ as f64) as u64);
+        let now = SimTime::from_ticks(((t_enc - 6.0e5).max(0.0) * TICK_HZ as f64) as u64);
+        let horizon = SimTime::from_ticks(((t_enc + 6.0e5) * TICK_HZ as f64) as u64);
         let pred = predict_encounter(&model, &conic, now, horizon)
             .unwrap()
             .expect("a transit this direct must encounter");
@@ -1857,7 +1863,7 @@ mod tests {
         // The rebased conic is Terrin-parented at the crossing tick.
         let rebased = pred.rebased.unwrap();
         assert_eq!(rebased.parent, BodyId::from("terrin"));
-        assert_eq!(rebased.epoch, SimTime(pred.event.tick));
+        assert_eq!(rebased.epoch, SimTime::from_ticks(pred.event.tick));
     }
 
     /// Chaining: a graze (`b` far above the surface) ENTERS Terrin's
@@ -1870,15 +1876,20 @@ mod tests {
         // b = 6e7 m — deep inside the 8.4e7 SOI but nowhere near the
         // 6e5 surface: a clean enter-then-exit residence.
         let conic = graze_conic(6.0e7, t_enc);
-        let now = SimTime(((t_enc - 6.0e5).max(0.0) * TICK_HZ as f64) as u64);
-        let horizon = SimTime(((t_enc + 6.0e5) * TICK_HZ as f64) as u64);
+        let now = SimTime::from_ticks(((t_enc - 6.0e5).max(0.0) * TICK_HZ as f64) as u64);
+        let horizon = SimTime::from_ticks(((t_enc + 6.0e5) * TICK_HZ as f64) as u64);
         let first = predict_encounter(&model, &conic, now, horizon)
             .unwrap()
             .expect("designed graze must encounter");
         assert_eq!(first.event.direction, SoiDirection::Enter);
         let rebased = first.rebased.unwrap();
-        let second =
-            predict_encounter(&model, &rebased, SimTime(first.event.tick), horizon).unwrap();
+        let second = predict_encounter(
+            &model,
+            &rebased,
+            SimTime::from_ticks(first.event.tick),
+            horizon,
+        )
+        .unwrap();
         // The residence ends inside the horizon → the Exit reports.
         let second = second.expect("graze must exit the SOI it entered");
         assert_eq!(second.event.direction, SoiDirection::Exit);
@@ -1898,11 +1909,11 @@ mod tests {
         let model = home_system();
         let q = duva_query(12);
         let plan = plan_transfer(&model, &q).unwrap();
-        let horizon = SimTime(plan.arrival_tick.saturating_add(TICK_HZ * 86_400));
+        let horizon = SimTime::from_ticks(plan.arrival_tick.saturating_add(TICK_HZ * 86_400));
         let pred = predict_encounter_excluding(
             &model,
             &plan.conic,
-            SimTime(plan.departure_tick),
+            SimTime::from_ticks(plan.departure_tick),
             horizon,
             Some(&plan.origin),
         )
@@ -1956,11 +1967,11 @@ mod tests {
         let conic = OrbitState {
             parent: BodyId::from("solen"),
             elements: circular_elements(2.5e10, 0.0), // beyond Duva, coplanar
-            epoch: SimTime(0),
+            epoch: SimTime::from_ticks(0),
         };
-        let horizon = SimTime((4.0e6 * TICK_HZ as f64) as u64);
+        let horizon = SimTime::from_ticks((4.0e6 * TICK_HZ as f64) as u64);
         assert!(
-            predict_encounter(&model, &conic, SimTime(0), horizon)
+            predict_encounter(&model, &conic, SimTime::from_ticks(0), horizon)
                 .unwrap()
                 .is_none()
         );
@@ -1987,7 +1998,7 @@ mod tests {
         let vessel = OrbitState {
             parent: BodyId::from("terrin"),
             elements: circular_elements(TERRIN_R + 75e3, 0.0),
-            epoch: SimTime(0),
+            epoch: SimTime::from_ticks(0),
         };
         let node = departure_node(&model, &vessel, &plan).unwrap();
         // The node is finite and sits at-or-before the window.
@@ -1995,7 +2006,9 @@ mod tests {
         assert!(node.dv_prograde_mps.is_finite());
         // Post-burn conic about terrin: hyperbolic, and its outgoing
         // asymptote matches the plan's v_inf direction.
-        let (rb, vb) = model.state_at(&vessel, SimTime(node.tick)).unwrap();
+        let (rb, vb) = model
+            .state_at(&vessel, SimTime::from_ticks(node.tick))
+            .unwrap();
         let dv = crate::maneuver::node_dv_world(
             rb,
             vb,
@@ -2040,7 +2053,7 @@ mod tests {
         let vessel = OrbitState {
             parent: BodyId::from("terrin"),
             elements: circular_elements(park_r, 0.0),
-            epoch: SimTime(0),
+            epoch: SimTime::from_ticks(0),
         };
         let node = departure_node(&model, &vessel, &plan).unwrap();
         let bound = plan.leg.dv_depart_mps;
@@ -2072,7 +2085,7 @@ mod tests {
         let helio = OrbitState {
             parent: BodyId::from("solen"),
             elements: circular_elements(1.5e10, 0.0),
-            epoch: SimTime(0),
+            epoch: SimTime::from_ticks(0),
         };
         assert!(departure_node(&model, &helio, &plan).is_err());
         // Open parking orbit.
@@ -2082,7 +2095,7 @@ mod tests {
         let open = OrbitState {
             parent: BodyId::from("terrin"),
             elements: hyper,
-            epoch: SimTime(0),
+            epoch: SimTime::from_ticks(0),
         };
         assert!(departure_node(&model, &open, &plan).is_err());
     }

@@ -570,7 +570,7 @@ fn refresh_node_previews(model: &PatchedConics, snap: &MapSnapshot, scene: &mut 
             let predicted = csp_sim::maneuver::predict_maneuver(model, orbit, node).ok();
             let line = predicted.as_ref().and_then(|o| sample_orbit(model, o));
             let point = model
-                .state_at(orbit, SimTime(node.tick))
+                .state_at(orbit, SimTime::from_ticks(node.tick))
                 .ok()
                 .map(|(r, _)| r);
             scene
@@ -797,7 +797,8 @@ fn sample_orbit(model: &PatchedConics, state: &OrbitState) -> Option<Vec<DVec3>>
         for i in 0..=ORBIT_LINE_SAMPLES {
             let t_ticks = epoch_ticks
                 + (period * TICK_HZ as f64 * i as f64 / ORBIT_LINE_SAMPLES as f64).round() as i64;
-            let Ok((r, _v)) = model.state_at(state, SimTime(t_ticks.max(0) as u64)) else {
+            let Ok((r, _v)) = model.state_at(state, SimTime::from_ticks(t_ticks.max(0) as u64))
+            else {
                 continue;
             };
             if r.is_finite() {
@@ -826,7 +827,7 @@ fn sample_orbit(model: &PatchedConics, state: &OrbitState) -> Option<Vec<DVec3>>
             if t_ticks < 0 {
                 continue; // the integer clock cannot go below zero
             }
-            let Ok((r, _v)) = model.state_at(state, SimTime(t_ticks as u64)) else {
+            let Ok((r, _v)) = model.state_at(state, SimTime::from_ticks(t_ticks as u64)) else {
                 continue;
             };
             if r.is_finite() {

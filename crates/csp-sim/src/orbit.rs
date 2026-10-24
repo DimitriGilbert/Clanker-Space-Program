@@ -1266,7 +1266,7 @@ impl PatchedConics {
         cand: &SoiCandidate,
         t_ticks: u64,
     ) -> Result<f64, SimError> {
-        let t = SimTime(t_ticks);
+        let t = SimTime::from_ticks(t_ticks);
         let (rv, _) = self.state_at(s, t)?;
         let sep = if cand.is_parent {
             rv.norm()
@@ -1626,10 +1626,10 @@ mod tests {
         let s = OrbitState {
             parent: BodyId::from("sol"),
             elements: el,
-            epoch: SimTime(0),
+            epoch: SimTime::from_ticks(0),
         };
-        let (r1, v1) = model.state_at(&s, SimTime(6_400_000)).unwrap();
-        let (r2, v2) = model.state_at(&s, SimTime(6_400_000)).unwrap();
+        let (r1, v1) = model.state_at(&s, SimTime::from_ticks(6_400_000)).unwrap();
+        let (r2, v2) = model.state_at(&s, SimTime::from_ticks(6_400_000)).unwrap();
         assert_eq!(r1.x.to_bits(), r2.x.to_bits());
         assert_eq!(r1, r2);
         assert_eq!(v1, v2);
@@ -1695,10 +1695,10 @@ mod tests {
         let s = OrbitState {
             parent: BodyId::from("terrin"),
             elements: bad,
-            epoch: SimTime(0),
+            epoch: SimTime::from_ticks(0),
         };
         assert!(matches!(
-            model.state_at(&s, SimTime(64)),
+            model.state_at(&s, SimTime::from_ticks(64)),
             Err(SimError::Recoverable(_))
         ));
     }
@@ -1788,7 +1788,7 @@ mod tests {
         OrbitState {
             parent: BodyId::from("sol"),
             elements: cartesian_to_elements(aim, vel, MU_SOLEN).unwrap(),
-            epoch: SimTime((t_enc * TICK_HZ as f64) as u64),
+            epoch: SimTime::from_ticks((t_enc * TICK_HZ as f64) as u64),
         }
     }
 
@@ -1813,15 +1813,15 @@ mod tests {
             residence > h,
             "designed residence {residence} must exceed h {h}"
         );
-        let now = SimTime(((t_enc - residence) * TICK_HZ as f64) as u64);
-        let horizon = SimTime(((t_enc + 2.0 * residence) * TICK_HZ as f64) as u64);
+        let now = SimTime::from_ticks(((t_enc - residence) * TICK_HZ as f64) as u64);
+        let horizon = SimTime::from_ticks(((t_enc + 2.0 * residence) * TICK_HZ as f64) as u64);
         let ev = model.next_soi_event(&s, now, horizon).unwrap().unwrap();
         assert_eq!(ev.body, BodyId::from("p"));
         assert_eq!(ev.direction, SoiDirection::Enter);
         assert!(ev.tick > now.ticks() && ev.tick <= horizon.ticks());
         // The next event from the same pass is the Exit.
         let ev2 = model
-            .next_soi_event(&s, SimTime(ev.tick), horizon)
+            .next_soi_event(&s, SimTime::from_ticks(ev.tick), horizon)
             .unwrap()
             .unwrap();
         assert_eq!(ev2.body, BodyId::from("p"));
@@ -1860,8 +1860,8 @@ mod tests {
         // lands ~0.2·h after exit: no sample inside the residence.
         let t_in_ticks = ((t_enc - residence / 2.0) * TICK_HZ as f64) as u64;
         let now_ticks = t_in_ticks - 2 * h_ticks - h_ticks / 5;
-        let now = SimTime(now_ticks);
-        let horizon = SimTime(now_ticks + 6 * h_ticks);
+        let now = SimTime::from_ticks(now_ticks);
+        let horizon = SimTime::from_ticks(now_ticks + 6 * h_ticks);
         let ev = model.next_soi_event(&s, now, horizon).unwrap();
         assert!(
             ev.is_none(),
@@ -1934,24 +1934,24 @@ mod tests {
                 mean_anomaly_epoch_rad: 0.0,
                 period_s: f64::INFINITY,
             },
-            epoch: SimTime(0),
+            epoch: SimTime::from_ticks(0),
         };
-        let horizon = SimTime(200_000 * TICK_HZ);
+        let horizon = SimTime::from_ticks(200_000 * TICK_HZ);
         let ev1 = model
-            .next_soi_event(&s, SimTime(0), horizon)
+            .next_soi_event(&s, SimTime::from_ticks(0), horizon)
             .unwrap()
             .unwrap();
         assert_eq!(ev1.body, BodyId::from("m"));
         assert_eq!(ev1.direction, SoiDirection::Enter);
         assert!(ev1.tick as f64 / TICK_HZ as f64 > t_cross * 0.5);
         let ev2 = model
-            .next_soi_event(&s, SimTime(ev1.tick), horizon)
+            .next_soi_event(&s, SimTime::from_ticks(ev1.tick), horizon)
             .unwrap()
             .unwrap();
         assert_eq!(ev2.body, BodyId::from("m"));
         assert_eq!(ev2.direction, SoiDirection::Exit);
         let ev3 = model
-            .next_soi_event(&s, SimTime(ev2.tick), horizon)
+            .next_soi_event(&s, SimTime::from_ticks(ev2.tick), horizon)
             .unwrap()
             .unwrap();
         assert_eq!(ev3.body, BodyId::from("p"));
@@ -1966,10 +1966,10 @@ mod tests {
         let s = OrbitState {
             parent: BodyId::from("sol"),
             elements: circular_elements(TERRIN_A * 1.5, 0.0),
-            epoch: SimTime(0),
+            epoch: SimTime::from_ticks(0),
         };
         let ev = model
-            .next_soi_event(&s, SimTime(0), SimTime(1_000_000))
+            .next_soi_event(&s, SimTime::from_ticks(0), SimTime::from_ticks(1_000_000))
             .unwrap();
         assert!(ev.is_none());
     }
@@ -2105,10 +2105,10 @@ mod tests {
         let s = OrbitState {
             parent: BodyId::from("sol"),
             elements: el,
-            epoch: SimTime(big),
+            epoch: SimTime::from_ticks(big),
         };
-        let (r0, _) = model.state_at(&s, SimTime(big)).unwrap();
-        let (r1, _) = model.state_at(&s, SimTime(big + 1)).unwrap();
+        let (r0, _) = model.state_at(&s, SimTime::from_ticks(big)).unwrap();
+        let (r1, _) = model.state_at(&s, SimTime::from_ticks(big + 1)).unwrap();
         assert_ne!(r0, r1, "one tick of motion must survive at t=2^52");
         // The step is one tick of orbital motion: bounded by the
         // orbit's own speed bound / TICK_HZ, and non-negligible.
@@ -2139,7 +2139,7 @@ mod tests {
         // And the model is live: Terrin's epoch state is its authored
         // circular orbit at r = a about Solen.
         let (r, v) = model
-            .body_state(&BodyId::from("terrin"), SimTime(0))
+            .body_state(&BodyId::from("terrin"), SimTime::from_ticks(0))
             .unwrap();
         assert!(rel_err(r.norm(), TERRIN_A) < 1e-9);
         assert!(rel_err(v.norm(), libm::sqrt(MU_SOLEN / TERRIN_A)) < 1e-9);
@@ -2193,7 +2193,7 @@ mod tests {
                 mean_anomaly_epoch_rad: 0.0,
                 period_s: f64::INFINITY,
             },
-            epoch: SimTime(0),
+            epoch: SimTime::from_ticks(0),
         };
         let scans = model.scan_strides(&s).unwrap();
         // The candidate set the scan walks: {parent p} ∪ {child m}.
@@ -2246,10 +2246,10 @@ mod tests {
         let s = OrbitState {
             parent: BodyId::from("p"),
             elements: circular_elements(7.0e5, 0.0),
-            epoch: SimTime(0),
+            epoch: SimTime::from_ticks(0),
         };
         assert!(matches!(
-            model.next_soi_event(&s, SimTime(0), SimTime(640)),
+            model.next_soi_event(&s, SimTime::from_ticks(0), SimTime::from_ticks(640)),
             Err(SimError::Recoverable(_))
         ));
         assert!(matches!(
@@ -2275,11 +2275,15 @@ mod tests {
             let s = OrbitState {
                 parent: BodyId::from("sol"),
                 elements: el,
-                epoch: SimTime(0),
+                epoch: SimTime::from_ticks(0),
             };
             assert!(
                 matches!(
-                    model.next_soi_event(&s, SimTime(0), SimTime(1_000_000)),
+                    model.next_soi_event(
+                        &s,
+                        SimTime::from_ticks(0),
+                        SimTime::from_ticks(1_000_000)
+                    ),
                     Err(SimError::Recoverable(_))
                 ),
                 "NaN angle field {field} must error, never scan silently"
@@ -2301,19 +2305,19 @@ mod tests {
         let s = OrbitState {
             parent: BodyId::from("sol"),
             elements: circular_elements(TERRIN_A * 3.0, 0.0),
-            epoch: SimTime(0),
+            epoch: SimTime::from_ticks(0),
         };
         // Stride here is ~3.7e4 ticks; the 2e6-tick horizon needs ~55
         // samples, so a 32-sample budget is exhausted mid-scan.
-        let horizon = SimTime(2_000_000);
+        let horizon = SimTime::from_ticks(2_000_000);
         assert!(matches!(
-            model.next_soi_event_within(&s, SimTime(0), horizon, 32, None, None),
+            model.next_soi_event_within(&s, SimTime::from_ticks(0), horizon, 32, None, None),
             Err(SimError::Recoverable(_))
         ));
         // With headroom the identical call completes honestly — and its
         // reported spend matches the stride-grid bound `span/h + 2`.
         let (ev, samples) = model
-            .next_soi_event_within(&s, SimTime(0), horizon, 1_000_000, None, None)
+            .next_soi_event_within(&s, SimTime::from_ticks(0), horizon, 1_000_000, None, None)
             .unwrap();
         assert!(ev.is_none());
         let span = horizon.ticks();
@@ -2374,11 +2378,18 @@ mod tests {
         let s = OrbitState {
             parent: BodyId::from("m"),
             elements: el,
-            epoch: SimTime(0),
+            epoch: SimTime::from_ticks(0),
         };
-        let horizon = SimTime(4_000_000);
+        let horizon = SimTime::from_ticks(4_000_000);
         let (unsup, _) = model
-            .next_soi_event_within(&s, SimTime(0), horizon, SOI_SCAN_MAX_SAMPLES, None, None)
+            .next_soi_event_within(
+                &s,
+                SimTime::from_ticks(0),
+                horizon,
+                SOI_SCAN_MAX_SAMPLES,
+                None,
+                None,
+            )
             .unwrap();
         let ev = unsup.expect("an inbound vessel must cross inward");
         assert_eq!(ev.body, BodyId::from("m"));
@@ -2390,7 +2401,7 @@ mod tests {
         let (sup, _) = model
             .next_soi_event_within(
                 &s,
-                SimTime(0),
+                SimTime::from_ticks(0),
                 horizon,
                 SOI_SCAN_MAX_SAMPLES,
                 Some((BodyId::from("m"), SoiDirection::Enter)),
