@@ -318,6 +318,200 @@ pub fn emit(shape: &PartShape, out: &mut Vec<MeshTri>) {
     }
 }
 
+/// A triangle carrying per-vertex unit outward normals — the
+/// smooth-shaded stream [`emit_smooth`] produces for the flight view.
+/// Lathe sides shade continuously around the ring (a tank reads as a
+/// cylinder rather than 24 flat panels), caps stay flat, and a `Box`
+/// keeps its face normals.
+#[derive(Clone, Copy, Debug)]
+pub struct SmoothTri {
+    /// Corner a, part-local.
+    pub a: DVec3,
+    /// Corner b, part-local.
+    pub b: DVec3,
+    /// Corner c, part-local.
+    pub c: DVec3,
+    /// Unit outward normal at `a`.
+    pub na: DVec3,
+    /// Unit outward normal at `b`.
+    pub nb: DVec3,
+    /// Unit outward normal at `c`.
+    pub nc: DVec3,
+}
+
+/// Append `shape`'s triangles to `out` with per-vertex analytic
+/// normals — the same silhouette as [`emit`], but each corner carries
+/// the true surface normal so consumers can shade per vertex.
+pub fn emit_smooth(shape: &PartShape, out: &mut Vec<SmoothTri>) {
+    match shape {
+        PartShape::Box { lo, hi } => {
+            let mut flat = Vec::new();
+            emit_box(*lo, *hi, &mut flat);
+            out.extend(flat.iter().map(|t| SmoothTri {
+                a: t.a,
+                b: t.b,
+                c: t.c,
+                na: t.n,
+                nb: t.n,
+                nc: t.n,
+            }));
+        }
+        PartShape::Lathe { axis, profile } => emit_lathe_smooth(*axis, profile, out),
+    }
+}
+
+/// The smooth lathe — same ring/strip layout as [`emit_lathe`], but
+/// each vertex carries the analytic normal: the profile-space normal
+/// `(-dr, dz)` revolved about the axis for ring vertices, the axis
+/// direction for apexes, ±z for the flat caps.
+fn emit_lathe_smooth(axis: [f64; 2], profile: &[(f64, f64)], out: &mut Vec<SmoothTri>) {
+    let n_st = profile.len();
+    if n_st < 2 {
+        return;
+    }
+    // Profile-space station normals `(n_z, n_r)` — the perpendicular
+    // of the (z, r) profile tangent, signed so `n_r` is positive
+    // (outward) on an ascending-z profile.
+    let pnorm: Vec<(f64, f64)> = (0..n_st)
+        .map(|i| {
+            let (dz, dr) = if i == 0 {
+                (profile[1].0 - profile[0].0, profile[1].1 - profile[0].1)
+            } else if i + 1 == n_st {
+                (
+                    profile[i].0 - profile[i - 1].0,
+                    profile[i].1 - profile[i - 1].1,
+                )
+            } else {
+                (
+                    profile[i + 1].0 - profile[i - 1].0,
+                    profile[i + 1].1 - profile[i - 1].1,
+                )
+            };
+            let l = (dz * dz + dr * dr).sqrt();
+            if l > 1e-12 {
+                (-dr / l, dz / l)
+            } else {
+                (0.0, 1.0)
+            }
+        })
+        .collect();
+    // Per-station rings + normals — empty vecs mark an apex.
+    let stations: Vec<(f64, Vec<DVec3>, Vec<DVec3>)> = profile
+        .iter()
+        .zip(&pnorm)
+        .map(|(&(z, r), &(nz, nr))| {
+            if r <= APEX_RADIUS_M {
+                (z, Vec::new(), Vec::new())
+            } else {
+                let (ring, nrms): (Vec<DVec3>, Vec<DVec3>) = (0..LATHE_SEGMENTS)
+                    .map(|i| {
+                        let a = (i as f64) * (2.0 * core::f64::consts::PI) / LATHE_SEGMENTS as f64;
+                        let (ca, sa) = (a.cos(), a.sin());
+                        (
+                            DVec3::new(axis[0] + r * ca, axis[1] + r * sa, z),
+                            DVec3::new(nr * ca, nr * sa, nz),
+                        )
+                    })
+                    .unzip();
+                (z, ring, nrms)
+            }
+        })
+        .collect();
+    let tri =
+        |out: &mut Vec<SmoothTri>, va: (DVec3, DVec3), vb: (DVec3, DVec3), vc: (DVec3, DVec3)| {
+            let e = (vb.0 - va.0).cross(vc.0 - va.0);
+            if e.norm_squared() > 1e-30 {
+                out.push(SmoothTri {
+                    a: va.0,
+                    b: vb.0,
+                    c: vc.0,
+                    na: va.1,
+                    nb: vb.1,
+                    nc: vc.1,
+                });
+            }
+        };
+    // Side strips between consecutive stations.
+    for w in stations.windows(2) {
+        let ((z0, r0, n0), (z1, r1, n1)) = (&w[0], &w[1]);
+        let apex =
+            |z: f64, away: f64| (DVec3::new(axis[0], axis[1], z), DVec3::new(0.0, 0.0, away));
+        for i in 0..LATHE_SEGMENTS {
+            let j = (i + 1) % LATHE_SEGMENTS;
+            match (r0.is_empty(), r1.is_empty()) {
+                (false, false) => {
+                    tri(out, (r0[i], n0[i]), (r0[j], n0[j]), (r1[j], n1[j]));
+                    tri(out, (r0[i], n0[i]), (r1[j], n1[j]), (r1[i], n1[i]));
+                }
+                (true, false) => tri(out, apex(*z0, -1.0), (r1[i], n1[i]), (r1[j], n1[j])),
+                (false, true) => tri(out, (r0[i], n0[i]), apex(*z1, 1.0), (r0[j], n0[j])),
+                (true, true) => {}
+            }
+        }
+    }
+    // Flat caps on the two open ends (apexes need none) — the cap
+    // normal is the axis direction, so the disc shades flat.
+    for (k, sgn) in [(0usize, -1.0f64), (n_st - 1, 1.0)] {
+        let (z, ring, _) = &stations[k];
+        if ring.is_empty() {
+            continue;
+        }
+        let n = DVec3::new(0.0, 0.0, sgn);
+        let cap = (DVec3::new(axis[0], axis[1], *z), n);
+        for i in 0..LATHE_SEGMENTS {
+            let j = (i + 1) % LATHE_SEGMENTS;
+            tri(out, cap, (ring[i], n), (ring[j], n));
+        }
+    }
+}
+
+/// `shape` offset outward by `margin` — the hull shell the reentry
+/// sheath emits. Box faces push out along their axes; lathe rings
+/// fatten by the margin and the two end stations extend along the
+/// axis (apexes round off into small rings). The result hugs the part
+/// silhouette — it is the hull grown a skin, never a bounding box.
+pub fn inflated(shape: &PartShape, margin: f64) -> PartShape {
+    match shape {
+        PartShape::Box { lo, hi } => {
+            let d = DVec3::new(margin, margin, margin);
+            PartShape::Box {
+                lo: *lo - d,
+                hi: *hi + d,
+            }
+        }
+        PartShape::Lathe { axis, profile } => {
+            let last = profile.len().saturating_sub(1);
+            // The end stations move ∓margin along the axis — a margin
+            // wider than half the z-span (a flat part, or a big plasma
+            // intensity) would swap their order and emit a
+            // self-intersecting shell. Clamp the margin so station
+            // order is preserved.
+            let z_span = profile
+                .first()
+                .zip(profile.last())
+                .map_or(0.0, |(f, l)| l.0 - f.0);
+            let margin = margin.clamp(0.0, (z_span * 0.5).max(0.0));
+            PartShape::Lathe {
+                axis: *axis,
+                profile: profile
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(z, r))| {
+                        let dz = if i == 0 {
+                            -margin
+                        } else if i == last {
+                            margin
+                        } else {
+                            0.0
+                        };
+                        (z + dz, r + margin)
+                    })
+                    .collect(),
+            }
+        }
+    }
+}
+
 /// One triangle, wound so its normal faces away from `center` — every
 /// emitted primitive is star-convex about its bounds/axis centre, so
 /// the centroid−centre dot is the outward test. Zero-area slivers are
@@ -570,6 +764,73 @@ mod tests {
                     "inward normal on {t:?} of {s:?}"
                 );
             }
+        }
+    }
+
+    /// `emit_smooth` emits the same triangle stream as `emit` (one
+    /// triangle per emitted facet) with unit outward per-vertex
+    /// normals: a cylinder's side normals point radially out, its cap
+    /// normals along the axis.
+    #[test]
+    fn smooth_lathe_normals_are_unit_and_outward() {
+        let s = classify(&cylinder_collider(0.625, 1.0), false, false, None);
+        let mut flat = Vec::new();
+        emit(&s, &mut flat);
+        let mut smooth = Vec::new();
+        emit_smooth(&s, &mut smooth);
+        assert_eq!(flat.len(), smooth.len());
+        for t in &smooth {
+            for (p, n) in [(t.a, t.na), (t.b, t.nb), (t.c, t.nc)] {
+                assert!((n.norm() - 1.0).abs() < 1e-9, "non-unit normal {n:?}");
+                // The collider is centred on the origin: side normals
+                // dot positive with the radial component, cap normals
+                // with the axial one — either way `n·p > 0`.
+                assert!(n.dot(p) > 0.0, "inward normal {n:?} at {p:?}");
+            }
+        }
+    }
+
+    /// The sheath's hull offset: a lathe inflates radially AND along
+    /// the axis ends (apexes round into small rings), a box grows on
+    /// every face — the margin is the skin standoff, never an AABB.
+    #[test]
+    fn inflated_offsets_the_hull() {
+        let s = classify(&cylinder_collider(0.625, 1.0), false, false, None);
+        let PartShape::Lathe { profile, .. } = inflated(&s, 0.1) else {
+            panic!("inflated lathe must stay a lathe");
+        };
+        assert!((profile[0].1 - 0.725).abs() < 1e-12, "rings fatten");
+        assert!((profile[0].0 - -1.1).abs() < 1e-12, "ends extend");
+        let boxed = PartShape::Box {
+            lo: DVec3::new(-0.3, -0.3, -0.2),
+            hi: DVec3::new(0.3, 0.3, 0.2),
+        };
+        let PartShape::Box { lo, hi } = inflated(&boxed, 0.05) else {
+            panic!("inflated box must stay a box");
+        };
+        assert_eq!(lo, DVec3::new(-0.35, -0.35, -0.25));
+        assert_eq!(hi, DVec3::new(0.35, 0.35, 0.25));
+    }
+
+    /// A margin wider than half the z-span (flat parts, big plasma
+    /// margins) must clamp — extending the ends further would swap
+    /// the station order into a self-intersecting shell.
+    #[test]
+    fn inflated_never_inverts_station_order() {
+        let flat = PartShape::Lathe {
+            axis: [0.0, 0.0],
+            profile: vec![(-0.01, 0.4), (0.0, 0.4), (0.01, 0.4)],
+        };
+        let PartShape::Lathe { profile, .. } = inflated(&flat, 0.1) else {
+            panic!("inflated lathe must stay a lathe");
+        };
+        for w in profile.windows(2) {
+            assert!(
+                w[0].0 <= w[1].0,
+                "stations inverted: {:?} then {:?}",
+                w[0],
+                w[1]
+            );
         }
     }
 }

@@ -22,7 +22,7 @@ use csp_core::{DQuat, DVec3};
 use csp_render::terrain as rt;
 
 use crate::flight::FlightEnv;
-use crate::map::{MapCameraF64, rot3};
+use crate::map::MapCameraF64;
 
 /// Heightfield bake dimensions (equirect texels). 1024×512 ≈ 3.7 km
 /// texels at Terrin's 600 km radius — the low-frequency surface the
@@ -318,6 +318,28 @@ fn m4_wgsl(m: &[[f64; 4]; 4]) -> [[f32; 4]; 4] {
     out
 }
 
+/// `fs_sky`'s view→body basis, recovered from `view_proj = P·V` (the
+/// solved chase camera — not rebuilt from the orbit angles). The
+/// reverse-Z projection's inverse is exact in f64: with
+/// `P = [[f/a,0,0,0],[0,f,0,0],[0,0,0,near],[0,0,-1,0]]` the view rows
+/// come back as `(row0·tan·aspect, row1·tan, −row3)`. Those rows are
+/// the camera axes — and the WGSL `mat4x4` is column-major, so they
+/// land as `view_rot`'s COLUMNS: `view_rot * v` then expands the
+/// view-space ray over `right`/`up`/`z_out`, giving `fs_sky`'s
+/// per-pixel rays exactly the directions the vertex stream projects.
+/// (Storing them per-row uploads V — the shader then computes
+/// `V·v = Rᵀ·v` and the sky draws rotated away from the view: the
+/// "second sky" sliding against the terrain.)
+fn sky_view_rot(vp: &[[f64; 4]; 4], tan_y: f64, aspect: f64) -> [[f32; 4]; 4] {
+    let mut view_rot = [[0.0f32; 4]; 4];
+    for c in 0..3 {
+        view_rot[0][c] = (vp[0][c] * tan_y * aspect) as f32; // column 0 = right
+        view_rot[1][c] = (vp[1][c] * tan_y) as f32; // column 1 = up
+        view_rot[2][c] = (-vp[3][c]) as f32; // column 2 = backward (z_out)
+    }
+    view_rot
+}
+
 /// The `RenderExtract`-side packet build: quadtree select around the
 /// camera, per-patch instance baking, ocean emission, uniforms. Called
 /// from `extract_flight` — `cam`/`input` are the solved presentation
@@ -327,8 +349,6 @@ pub(crate) fn build_packet(
     cache: &mut TerrainCache,
     env: &FlightEnv,
     cam: &MapCameraF64,
-    yaw: f64,
-    pitch: f64,
     viewport_px: (f64, f64),
 ) -> rt::TerrainPacket {
     let body_id = env.body.as_ref().map_or("", |b| b.as_str());
@@ -365,15 +385,15 @@ pub(crate) fn build_packet(
         }
     }
 
-    let rot = rot3(yaw, pitch);
-    let mut view_rot = [[0.0f32; 4]; 4];
-    for c in 0..3 {
-        for r in 0..3 {
-            view_rot[c][r] = rot[r][c] as f32;
-        }
-    }
+    // `view_rot` is the SOLVED chase camera's own basis — recovered
+    // from `view_proj` rather than rebuilt from the orbit angles (see
+    // `sky_view_rot`; the pre-fix `rot3(yaw, pitch)` basis was the
+    // map's ecliptic orbit-camera frame — the sky drew rotated away
+    // from the actual view, a second sky sliding against the terrain
+    // while orbiting).
     let aspect = (viewport_px.0 / viewport_px.1.max(1.0)).max(1e-6);
     let tan_y = (crate::flight::FLIGHT_FOV_Y * 0.5).tan();
+    let view_rot = sky_view_rot(&cam.view_proj, tan_y, aspect);
     let sun = env.sun_dir;
     let sun_dir = if sun.norm_squared() > 0.0 {
         sun / sun.norm()
@@ -433,5 +453,95 @@ pub(crate) fn build_packet(
         terrain,
         ocean,
         sky: true,
+    }
+}
+
+#[cfg(test)]
+// Tests signal failure by panicking; §2.13's no-panic rule covers
+// shipping fallible paths, not test code.
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::map::{mat4_mul, perspective_revz, project_into};
+
+    /// A non-axis-aligned camera basis — a transpose slips through
+    /// any test whose axes line up with the coordinate axes.
+    fn tilted_view() -> (DVec3, DVec3, DVec3, [[f64; 4]; 4]) {
+        let z_out = {
+            let d = DVec3::new(0.4, -0.5, 0.75);
+            d / d.norm()
+        };
+        let right = {
+            let r = DVec3::Y.cross(z_out);
+            r / r.norm()
+        };
+        let upv = z_out.cross(right);
+        let view = [
+            [right.x, right.y, right.z, 0.0],
+            [upv.x, upv.y, upv.z, 0.0],
+            [z_out.x, z_out.y, z_out.z, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        (right, upv, z_out, view)
+    }
+
+    /// `sky_view_rot`'s columns must BE the recovered camera axes —
+    /// the WGSL `mat4x4` is column-major and `view_rot * v` expands
+    /// the ray over them. Storing the axes per-row uploads `V`
+    /// instead of `Vᵀ` and `fs_sky` rays rotate against the view
+    /// (the "second sky" defect).
+    #[test]
+    fn view_rot_columns_are_the_camera_axes() {
+        let (right, upv, z_out, view) = tilted_view();
+        let aspect = 1.6;
+        let tan_y = (crate::flight::FLIGHT_FOV_Y * 0.5).tan();
+        let vp = mat4_mul(
+            &perspective_revz(crate::flight::FLIGHT_FOV_Y, aspect, 0.1),
+            &view,
+        );
+        let m = sky_view_rot(&vp, tan_y, aspect);
+        for (c, axis) in [right, upv, z_out].into_iter().enumerate() {
+            let got = DVec3::new(f64::from(m[c][0]), f64::from(m[c][1]), f64::from(m[c][2]));
+            assert!(
+                (got - axis).norm() < 1e-6,
+                "column {c} = {got:?}, expected camera axis {axis:?}"
+            );
+            assert_eq!(m[c][3], 0.0, "column {c} row 3 must pad to 0");
+        }
+    }
+
+    /// The full shader path: `rd = normalize(view_rot · (ndc·misc,
+    /// −1))` must be the world direction that same pixel projects to —
+    /// the end-to-end check that fails under a transpose.
+    #[test]
+    fn sky_ray_roundtrips_through_view_proj() {
+        let (_r, _u, _z, view) = tilted_view();
+        let aspect = 1.6;
+        let tan_y = (crate::flight::FLIGHT_FOV_Y * 0.5).tan();
+        let vp = mat4_mul(
+            &perspective_revz(crate::flight::FLIGHT_FOV_Y, aspect, 0.1),
+            &view,
+        );
+        let m = sky_view_rot(&vp, tan_y, aspect);
+        for &(nx, ny) in &[(0.0, 0.0), (0.8, -0.4), (-0.6, 0.9)] {
+            // `fs_sky`: v = (ndc.x·misc.x, ndc.y·misc.y, −1, 0).
+            let v = [nx * tan_y * aspect, ny * tan_y, -1.0, 0.0];
+            let rd = DVec3::new(
+                f64::from(m[0][0]) * v[0] + f64::from(m[1][0]) * v[1] + f64::from(m[2][0]) * v[2],
+                f64::from(m[0][1]) * v[0] + f64::from(m[1][1]) * v[1] + f64::from(m[2][1]) * v[2],
+                f64::from(m[0][2]) * v[0] + f64::from(m[1][2]) * v[1] + f64::from(m[2][2]) * v[2],
+            );
+            let rd = rd / rd.norm();
+            // A world point along `rd` from the eye (origin — the
+            // view carries no translation) must land back on (nx, ny).
+            let ndc = project_into(&vp, DVec3::ZERO, rd)
+                .unwrap_or_else(|| panic!("ray for ndc ({nx}, {ny}) is behind the eye"));
+            assert!(
+                (f64::from(ndc[0]) - nx).abs() < 1e-5 && (f64::from(ndc[1]) - ny).abs() < 1e-5,
+                "ndc ({nx}, {ny}) ray projected to ({}, {})",
+                ndc[0],
+                ndc[1]
+            );
+        }
     }
 }

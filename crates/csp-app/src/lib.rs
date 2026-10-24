@@ -94,10 +94,17 @@ const ZOOM_LN_PER_PX: f64 = 0.003;
 /// Screen px of pan per WASD/arrow key event (winit auto-repeat keeps it
 /// moving while held).
 const PAN_STEP_PX: f64 = 80.0;
-/// Throttle fraction per `ThrottleUp`/`ThrottleDown` key event (the
-/// KSP-style Shift/Ctrl fine control — `accepts_repeat` steps it while
-/// held at the OS repeat rate).
-const THROTTLE_STEP: f64 = 0.1;
+/// Throttle fraction applied instantly on a `ThrottleUp`/`ThrottleDown`
+/// press — the tap: a short press still moves the needle one fine step
+/// (and, on a latched pad craft, that first `SetThrottle` is the
+/// unlatching command). Holding continues into [`THROTTLE_RAMP_PER_S`].
+const THROTTLE_TAP_STEP: f64 = 0.05;
+/// Throttle fraction per second while a `ThrottleUp`/`ThrottleDown` key
+/// is held — [`Self::tick_throttle_ramp`] integrates the frame's wall
+/// dt into one `SetThrottle` per frame on the player FIFO (full travel
+/// is ~4 s). Releasing the key just stops enqueuing — the last
+/// commanded value persists in the sim.
+const THROTTLE_RAMP_PER_S: f64 = 0.25;
 /// Commanded body-frame angular rate per held attitude key, rad/s —
 /// the `SetAttitude` control stand-in's "stick deflection" (≈46°/s).
 const ATTITUDE_RATE_RAD_S: f64 = 0.8;
@@ -177,6 +184,26 @@ struct App {
     /// depopulated on release; a focus loss clears it (the missed
     /// release could never arrive) and re-issues a zero-rate hold.
     attitude_held: std::collections::BTreeSet<KeyAction>,
+    /// Set when a press left `attitude_held` non-empty but no
+    /// `SetAttitude` could issue — no commandable body (pad-latched,
+    /// on rails) or a halted session. [`Self::tick_attitude`] retries
+    /// every frame, so a key held through the latch → liftoff edge
+    /// starts steering the moment a bubble body exists again.
+    attitude_deferred: bool,
+    /// `ThrottleUp`/`ThrottleDown` currently held — the axis
+    /// [`Self::tick_throttle_ramp`] integrates per frame. Populated on
+    /// press, depopulated on release; a focus loss clears it (the
+    /// missed release could never arrive — the throttle simply holds
+    /// its last commanded value, so no cancellation is needed).
+    throttle_held: std::collections::BTreeSet<KeyAction>,
+    /// The wall-side throttle axis position — what the tap steps and
+    /// the ramp *command*, independent of what the sim last applied
+    /// (an unlatch rebuilds the body at throttle 0, a dry engine
+    /// clamps to 0 — the player's axis must not snap back under
+    /// either). Re-initialized from the applied value when a ramp
+    /// starts from released; the Z/X snaps write it too, so a snap
+    /// mid-hold rebases the ramp instead of fighting it.
+    throttle_axis: f64,
     view: View,
     /// §2.6.3's controller — owns the warp ladder and the integer tick
     /// target; all wall-side, emitting only logged commands.
@@ -368,6 +395,9 @@ impl App {
             lmb_press: None,
             captured_key: None,
             attitude_held: std::collections::BTreeSet::new(),
+            attitude_deferred: false,
+            throttle_held: std::collections::BTreeSet::new(),
+            throttle_axis: 0.0,
             view,
             warp: WarpController::new(),
             last_frame: Instant::now(),
@@ -416,9 +446,8 @@ impl App {
                 // still landed (it is app state, not sim state); only
                 // the logged command is refused — same notice
                 // convention as the launch/maneuver gates.
-                self.view.vab_event(VabEvent::Notice(
-                    "session is read-only — warp demotion not applied".to_string(),
-                ));
+                self.view
+                    .flight_notice("SESSION IS READ-ONLY — WARP DEMOTION NOT APPLIED");
             } else {
                 self.view.enqueue_command(
                     SourceClass::Ui,
@@ -776,6 +805,15 @@ impl App {
                 .set_flight_viewport(f64::from(gpu.config.width), f64::from(gpu.config.height));
         }
 
+        // The app's wall-side held-key axes, ahead of the Input
+        // schedule: the throttle ramp integrates this frame's wall dt
+        // into one `SetThrottle` on the player FIFO (drained by the
+        // `sim_step` below with every other queued command), and a
+        // deferred attitude request retries — a key held through the
+        // latch → liftoff edge starts steering immediately.
+        self.tick_attitude();
+        self.tick_throttle_ramp(dt_wall);
+
         // §2.5 order: Input → SimStep → Sync → Presentation → UiBuild →
         // RenderExtract. One sim_step call per frame, always.
         self.view.begin_frame();
@@ -954,12 +992,16 @@ impl App {
             // copy's value wins over the stale staged one.
             let mut applied = self.view.staged_settings();
             applied.graphics.window_size = self.settings.graphics.window_size;
+            let old_keys = self.settings.keys.clone();
             self.settings = applied;
             self.apply_live_settings();
             // The applied keymap is now live — re-mirror it so the
             // controls card and hint bars name the keys that actually
             // dispatch (they never read the staged copy).
             self.view.set_live_keymap(&self.settings.keys);
+            if old_keys != self.settings.keys {
+                self.drop_rebound_holds(&old_keys);
+            }
             #[cfg(not(target_arch = "wasm32"))]
             let persist = match &self.settings_path {
                 Some(p) => settings_io::save_settings_to(p, &self.settings),
@@ -992,9 +1034,11 @@ impl App {
                 // inert-but-misleading switch. (The §6.3 demo keeps
                 // launch — its fixed-scenario contract caps parts and
                 // refuses craft IO, not flight.)
-                self.view.vab_event(VabEvent::Notice(
-                    "session is read-only — launch refused".to_string(),
-                ));
+                // flight_notice, not the VAB row: a halted session can
+                // be sitting in any mode, and the VAB's notice row is
+                // invisible outside the editor.
+                self.view
+                    .flight_notice("SESSION IS READ-ONLY — LAUNCH REFUSED");
             } else {
                 // A refusal already lands on the VAB notice row inside
                 // `launch_craft`; its `Err` exists for callers with no
@@ -1007,9 +1051,8 @@ impl App {
             if self.read_only {
                 // Same §2.13 halt discipline — the command must not
                 // queue silently behind a clock that never ticks again.
-                self.view.vab_event(VabEvent::Notice(
-                    "session is read-only — maneuver not applied".to_string(),
-                ));
+                self.view
+                    .flight_notice("SESSION IS READ-ONLY — MANEUVER NOT APPLIED");
             } else {
                 self.view
                     .enqueue_command(SourceClass::Ui, MANEUVER_SOURCE_ID, cmd);
@@ -1210,26 +1253,41 @@ impl App {
 
         // A queued pick: rasterize the same packet into the object-id
         // target and copy the clicked pixel to the readback buffer —
-        // same encoder submission as the frame.
+        // same encoder submission as the frame. An in-bounds click
+        // that cannot rasterize (empty vertices, an unresolved craft,
+        // no packet at all) still resolves — as a background pixel —
+        // so "click empty space" cancels an armed placement instead
+        // of dropping silently.
         let mut encode_pick = false;
         let mut encoded_ids = None;
-        if let (Some((x, y)), Some(v), Some(packet)) = (
-            self.pending_pick.take(),
-            &mut self.vab_renderer,
-            &self.last_vab_packet,
-        ) {
+        let mut resolve_background = false;
+        if let Some((x, y)) = self.pending_pick.take() {
             if self.pick_in_flight {
                 // One outstanding pick — drop the request; the next
                 // click retriggers.
-            } else {
-                encode_pick =
-                    v.encode_pick(&mut frame.encoder, &gpu.device, &gpu.queue, packet, x, y);
-                if encode_pick {
-                    // Snapshot the decode table alongside the rasterized
-                    // pixels — the readback decodes a frame or two later
-                    // and `last_vab_packet` may have moved on by then.
-                    encoded_ids = Some(packet.pick_ids.clone());
-                }
+            } else if x < gpu.config.width && y < gpu.config.height {
+                encode_pick = match (&mut self.vab_renderer, &self.last_vab_packet) {
+                    (Some(v), Some(packet)) => {
+                        let ok = v.encode_pick(
+                            &mut frame.encoder,
+                            &gpu.device,
+                            &gpu.queue,
+                            packet,
+                            x,
+                            y,
+                        );
+                        if ok {
+                            // Snapshot the decode table alongside the
+                            // rasterized pixels — the readback decodes
+                            // a frame or two later and `last_vab_packet`
+                            // may have moved on by then.
+                            encoded_ids = Some(packet.pick_ids.clone());
+                        }
+                        ok
+                    }
+                    _ => false,
+                };
+                resolve_background = !encode_pick;
             }
         }
         if let Some(ids) = encoded_ids {
@@ -1241,6 +1299,12 @@ impl App {
                 v.map_pick(self.pick_tx.clone());
             }
             self.pick_in_flight = true;
+        } else if resolve_background {
+            // The pick pass would have cleared this pixel to the
+            // background id anyway — resolve it through the same
+            // `Pick(None)` the readback decodes (deselect + disarm a
+            // pending placement).
+            self.view.vab_event(VabEvent::Pick(None));
         }
         // Service map_async callbacks (native; wasm callbacks fire on
         // the event loop).
@@ -1267,7 +1331,9 @@ impl App {
     ///
     /// Repeat presses only count for [`KeyAction::accepts_repeat`]
     /// actions (the camera pans), so a held key cannot machine-gun
-    /// warp steps or mode toggles.
+    /// warp steps or mode toggles. The held verbs — attitude and the
+    /// throttle axis — ignore repeats too: their press inserts into a
+    /// held set the per-frame tick drives, so repeats are deduped no-ops.
     fn key_press(&mut self, event: &winit::event::KeyEvent) {
         // Rebind capture — before all other dispatch, swallowing the key.
         if self.view.rebind_target().is_some() {
@@ -1325,18 +1391,75 @@ impl App {
 
     /// Mark an attitude action held and re-issue the combined rate
     /// command (the `BTreeSet::insert` dedup makes OS key repeats free).
+    /// A press with no commandable body is NOT silent: the reason lands
+    /// as a HUD cue ([`View::flight_notice`]) and the hold is deferred —
+    /// [`Self::tick_attitude`] picks it up the frame a body exists.
     fn attitude_press(&mut self, action: KeyAction) {
-        if self.attitude_held.insert(action) {
-            self.apply_attitude();
+        if !self.attitude_held.insert(action) {
+            return; // already held — an OS repeat, nothing changed
+        }
+        match self.attitude_blocker() {
+            Some(reason) => {
+                self.attitude_deferred = true;
+                self.view.flight_notice(reason);
+            }
+            None => self.apply_attitude(),
         }
     }
 
     /// Clear an attitude action on release and re-issue the combined
     /// rate — an empty set commands a zero angular rate (the stand-in
-    /// control authority's "stop rotating" until M3+ real SAS).
+    /// control authority's "stop rotating" until M3+ real SAS). While
+    /// blocked there is no live command to update — the held set just
+    /// shrinks and the deferred flag tracks whether anything remains
+    /// for [`Self::tick_attitude`] to pick up.
     fn attitude_release(&mut self, action: KeyAction) {
-        if self.attitude_held.remove(&action) {
+        if !self.attitude_held.remove(&action) {
+            return;
+        }
+        if self.attitude_blocker().is_none() {
+            self.attitude_deferred = false;
             self.apply_attitude();
+        } else {
+            self.attitude_deferred = !self.attitude_held.is_empty();
+        }
+    }
+
+    /// Per-frame retry for a held attitude request that had no
+    /// commandable body when pressed — the pad case: WASD held through
+    /// "throttle to liftoff" starts steering the frame the vessel is
+    /// back in the bubble instead of requiring a second press.
+    fn tick_attitude(&mut self) {
+        if self.attitude_deferred
+            && !self.attitude_held.is_empty()
+            && self.attitude_blocker().is_none()
+        {
+            self.attitude_deferred = false;
+            self.apply_attitude();
+        }
+    }
+
+    /// Why the focused vessel cannot take a `SetAttitude` right now —
+    /// `None` means it can. The `Some` text is the HUD cue the press
+    /// surfaces, so a dead key always says why. The checks are the same
+    /// reads [`Self::apply_attitude`] made silently: `InBubble` bodies
+    /// have an attitude surface; a surface-latched pad craft or a rails
+    /// vessel does not (and refusing keeps an accidental WASD press
+    /// from unlatching the parked craft).
+    fn attitude_blocker(&self) -> Option<&'static str> {
+        if self.read_only {
+            return Some("SESSION IS READ-ONLY — ATTITUDE NOT APPLIED");
+        }
+        let Some(vessel) = self.view.flight_focus() else {
+            return Some("NO VESSEL — ATTITUDE LOCKED");
+        };
+        match self.view.sim.vessels().get(&vessel).map(|v| &v.state) {
+            Some(csp_view::VesselState::InBubble(_)) => None,
+            Some(csp_view::VesselState::SurfaceLatched(_)) => {
+                Some("PARKED — ATTITUDE LOCKED UNTIL LAUNCH (THROTTLE TO LIFTOFF)")
+            }
+            Some(csp_view::VesselState::OnRails(_)) => Some("ATTITUDE LOCKED — VESSEL IS ON RAILS"),
+            None => Some("NO VESSEL — ATTITUDE LOCKED"),
         }
     }
 
@@ -1386,34 +1509,104 @@ impl App {
         );
     }
 
-    /// One `ThrottleUp`/`ThrottleDown` event — steps the focused
-    /// vessel's throttle fraction (read live from the sim body; a
-    /// latched craft reads 0 — its first step unlatches at
-    /// `THROTTLE_STEP`). `accepts_repeat` walks it while held.
-    fn throttle_nudge(&mut self, up: bool) {
+    /// Press edge of a throttle axis key: insert into the held set —
+    /// [`Self::tick_throttle_ramp`] picks it up next frame — and apply
+    /// the tap step so a quick press still moves the needle one fine
+    /// notch (`BTreeSet::insert` dedup makes OS repeats free).
+    fn throttle_press(&mut self, action: KeyAction) {
         if self.read_only {
-            self.view.vab_event(VabEvent::Notice(
-                "session is read-only — throttle not applied".to_string(),
-            ));
+            // §2.13: a halted session takes no new sim commands — the
+            // throttle would pile up undrained behind a clock that
+            // never ticks again. Same refusal convention as the
+            // launch/maneuver gates, on the HUD's cue channel where a
+            // flight-view press can see it.
+            self.view
+                .flight_notice("SESSION IS READ-ONLY — THROTTLE NOT APPLIED");
             return;
         }
+        if !self.throttle_held.insert(action) {
+            return; // already held — an OS repeat
+        }
+        if self.throttle_held.len() == 1 {
+            // A ramp starting from released re-reads the applied
+            // throttle (a latched craft reads 0) — the axis then owns
+            // the commanded value until every throttle key is up.
+            self.throttle_axis = self
+                .view
+                .flight_focus()
+                .and_then(|v| self.view.sim.vessels().get(&v))
+                .and_then(|v| v.body())
+                .map_or(0.0, |b| b.throttle);
+        }
+        self.throttle_axis_step(if action == KeyAction::ThrottleUp {
+            THROTTLE_TAP_STEP
+        } else {
+            -THROTTLE_TAP_STEP
+        });
+    }
+
+    /// Release edge of a throttle axis key — just leaves the held set.
+    /// Nothing is re-issued: throttle is persistent sim state, so the
+    /// last commanded value is the hold ("released = hold").
+    fn throttle_release(&mut self, action: KeyAction) {
+        self.throttle_held.remove(&action);
+    }
+
+    /// The held-key throttle axis, driven once per frame from
+    /// [`Self::run_frame`]: while `throttle_held` is non-empty the
+    /// commanded value rides `±THROTTLE_RAMP_PER_S` of wall dt — a real
+    /// axis, not a repeat-stepped switch. Up+Down cancel (hold
+    /// position). Nothing is enqueued when the axis is already clamped
+    /// at the rail, so a held key cannot spam the §7.6 log with no-op
+    /// commands.
+    fn tick_throttle_ramp(&mut self, dt_wall: f64) {
+        if self.throttle_held.is_empty() {
+            return;
+        }
+        if self.read_only || self.view.mode() == ViewMode::Vab {
+            // A halt mid-hold or a switch into the VAB ends the ramp —
+            // the VAB suppresses throttle verbs (it's a flight axis).
+            self.throttle_held.clear();
+            return;
+        }
+        let dir = i8::from(self.throttle_held.contains(&KeyAction::ThrottleUp))
+            - i8::from(self.throttle_held.contains(&KeyAction::ThrottleDown));
+        if dir == 0 {
+            return;
+        }
+        // A rails focus has no throttle surface — keep the axis held
+        // but don't feed the drain a reject every frame.
+        if self
+            .view
+            .flight_focus()
+            .and_then(|v| self.view.sim.vessels().get(&v))
+            .is_some_and(|v| matches!(v.state, csp_view::VesselState::OnRails(_)))
+        {
+            return;
+        }
+        self.throttle_axis_step(f64::from(dir) * THROTTLE_RAMP_PER_S * dt_wall);
+    }
+
+    /// Move the throttle axis by `delta` — shared by the press tap and
+    /// the per-frame ramp: clamp into `[0, 1]`, and when the value
+    /// actually moved, enqueue the `SetThrottle` on the player FIFO
+    /// (launch's `SpawnPhysicalVessel` rides it too — issue order is
+    /// preserved in the §7.6 log).
+    fn throttle_axis_step(&mut self, delta: f64) {
+        let next = (self.throttle_axis + delta).clamp(0.0, 1.0);
+        if (next - self.throttle_axis).abs() <= f64::EPSILON {
+            return;
+        }
+        self.throttle_axis = next;
         let Some(vessel) = self.view.flight_focus() else {
             return;
         };
-        let current = self
-            .view
-            .sim
-            .vessels()
-            .get(&vessel)
-            .and_then(|v| v.body())
-            .map_or(0.0, |b| b.throttle);
-        let step = if up { THROTTLE_STEP } else { -THROTTLE_STEP };
         self.view.enqueue_command(
             SourceClass::Ui,
             csp_view::PLAYER_SOURCE_ID,
             SimCommand::SetThrottle {
                 vessel,
-                throttle: (current + step).clamp(0.0, 1.0),
+                throttle: next,
             },
         );
     }
@@ -1422,19 +1615,44 @@ impl App {
     /// [`csp_view::flight::StagePlan`] into logged `JettisonPart`s.
     fn stage_press(&mut self) {
         if self.read_only {
-            self.view.vab_event(VabEvent::Notice(
-                "session is read-only — staging not applied".to_string(),
-            ));
+            self.view
+                .flight_notice("SESSION IS READ-ONLY — STAGING NOT APPLIED");
         } else {
             self.view.fire_stage();
         }
     }
 
-    /// A focus loss can drop the releases that clear a captured key
-    /// and held attitude keys — clear both here (the craft gets a
-    /// zero-rate hold instead of spinning offscreen forever).
+    /// A live keymap swap invalidates the held sets: they store the
+    /// resolved ACTION while a release resolves through whatever
+    /// keymap is live *then* — a verb whose binding moved under a
+    /// held finger never sees its release and would ramp (or steer)
+    /// until a focus loss cleared it. Keep only the held verbs whose
+    /// binding list did not move; when the attitude set shrank,
+    /// re-issue the combined rate — [`Self::focus_lost`]'s "stopped
+    /// keys command a zero rate" discipline.
+    fn drop_rebound_holds(&mut self, old: &csp_view::settings::Keymap) {
+        let new = &self.settings.keys;
+        let attitude_before = self.attitude_held.len();
+        self.attitude_held
+            .retain(|a| old.bindings.get(a) == new.bindings.get(a));
+        self.throttle_held
+            .retain(|a| old.bindings.get(a) == new.bindings.get(a));
+        if self.attitude_held.len() != attitude_before {
+            if self.attitude_held.is_empty() {
+                self.attitude_deferred = false;
+            }
+            self.apply_attitude();
+        }
+    }
+
+    /// A focus loss can drop the releases that clear a captured key,
+    /// held attitude keys, and the throttle axis — clear all three here
+    /// (the craft gets a zero-rate hold instead of spinning offscreen
+    /// forever, and the throttle just keeps its last commanded value).
     fn focus_lost(&mut self) {
         self.captured_key = None;
+        self.throttle_held.clear();
+        self.attitude_deferred = false;
         if !self.attitude_held.is_empty() {
             self.attitude_held.clear();
             self.apply_attitude();
@@ -1452,17 +1670,21 @@ impl App {
     }
 
     /// The KeyboardInput arm — presses dispatch the action (see
-    /// [`Self::key_press`]); releases clear held attitude verbs.
-    /// The release is matched on the action (not the key) so a key
-    /// the press bound still releases under a rebind.
+    /// [`Self::key_press`]); releases clear the held attitude verbs
+    /// and the throttle axis. The release is matched on the action
+    /// (not the key) so a key the press bound still releases under a
+    /// rebind.
     fn keyboard_event(&mut self, event: &winit::event::KeyEvent) {
         match event.state {
             ElementState::Pressed => self.key_press(event),
             ElementState::Released => {
-                if let Some(action) = self.action_of(event)
-                    && action.is_attitude()
-                {
+                let Some(action) = self.action_of(event) else {
+                    return;
+                };
+                if action.is_attitude() {
                     self.attitude_release(action);
+                } else if action.is_throttle_axis() {
+                    self.throttle_release(action);
                 }
             }
         }
@@ -1548,32 +1770,39 @@ impl App {
                 if self.read_only {
                     // §2.13: a halted session takes no new sim commands —
                     // the throttle would pile up undrained behind a
-                    // clock that never ticks again. Same refusal notice
-                    // the outbox's launch/maneuver gates raise.
-                    self.view.vab_event(VabEvent::Notice(
-                        "session is read-only — throttle not applied".to_string(),
-                    ));
-                } else if let Some(vessel) = self.view.flight_focus() {
-                    self.view.enqueue_command(
-                        SourceClass::Ui,
-                        // The shared player-command FIFO — launch's
-                        // `SpawnPhysicalVessel` rides it too.
-                        csp_view::PLAYER_SOURCE_ID,
-                        SimCommand::SetThrottle {
-                            vessel,
-                            throttle: if action == KeyAction::ThrottleFull {
-                                1.0
-                            } else {
-                                0.0
+                    // clock that never ticks again. The HUD cue channel,
+                    // not the VAB row — this key fires in flight.
+                    self.view
+                        .flight_notice("SESSION IS READ-ONLY — THROTTLE NOT APPLIED");
+                } else {
+                    // Snap keys rebase the axis too — a Z/X pressed
+                    // mid-hold moves the ramp's commanded value to the
+                    // rail instead of fighting it from the old base.
+                    self.throttle_axis = if action == KeyAction::ThrottleFull {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                    if let Some(vessel) = self.view.flight_focus() {
+                        self.view.enqueue_command(
+                            SourceClass::Ui,
+                            // The shared player-command FIFO — launch's
+                            // `SpawnPhysicalVessel` rides it too.
+                            csp_view::PLAYER_SOURCE_ID,
+                            SimCommand::SetThrottle {
+                                vessel,
+                                throttle: self.throttle_axis,
                             },
-                        },
-                    );
+                        );
+                    }
                 }
             }
-            // Fine throttle — same §7.6 channel and the same read-only
-            // discipline as the full/cut verbs.
+            // Fine throttle — the held-key axis: the press inserts into
+            // `throttle_held` (the per-frame ramp drives it from there)
+            // and lands the tap step; same §7.6 channel and the same
+            // read-only discipline as the full/cut verbs.
             KeyAction::ThrottleUp | KeyAction::ThrottleDown if mode != ViewMode::Vab => {
-                self.throttle_nudge(action == KeyAction::ThrottleUp);
+                self.throttle_press(action);
             }
             // Space fires the next stage — the view resolves the
             // session-captured drop set into logged `JettisonPart`s.
@@ -1586,9 +1815,8 @@ impl App {
             // control lease.
             KeyAction::RecoverControl if mode != ViewMode::Vab => {
                 if self.read_only {
-                    self.view.vab_event(VabEvent::Notice(
-                        "session is read-only — recover-control not applied".to_string(),
-                    ));
+                    self.view
+                        .flight_notice("SESSION IS READ-ONLY — RECOVER-CONTROL NOT APPLIED");
                 } else {
                     self.view.recover_control();
                 }
@@ -1706,11 +1934,12 @@ impl ApplicationHandler for App {
             // Key presses and releases. Presses stay `!consumed`-gated
             // so egui-owned keys (a focused text field) never reach the
             // sim — but a RELEASE always runs `keyboard_event`: a
-            // release egui swallowed would leak `attitude_held` and the
-            // craft would hold its last commanded rate until a focus
-            // loss cleared it (the same reason LMB releases clear
-            // `map_dragging` unconditionally — consumption gates
-            // presses, never releases).
+            // release egui swallowed would leak `attitude_held` (the
+            // craft would hold its last commanded rate) or keep the
+            // throttle axis ramping until a focus loss cleared it (the
+            // same reason LMB releases clear `map_dragging`
+            // unconditionally — consumption gates presses, never
+            // releases).
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Released || !consumed {
                     self.keyboard_event(&event);
@@ -2364,8 +2593,16 @@ mod tests {
         app.view.sim_step(2).unwrap();
         app.view.end_frame();
         assert_eq!(app.view.sim.command_log().len(), logged);
-        app.view
-            .with_vab_session(|v| assert!(v.notice().unwrap().contains("read-only")));
+        // The refusals surface on the HUD's cue channel — the VAB's
+        // notice row is invisible outside the editor, and these gates
+        // fire in any mode.
+        {
+            let sfx = app.view.world.resource::<csp_view::flight::FlightSfx>();
+            assert!(
+                sfx.cues.iter().any(|c| c.text.contains("READ-ONLY")),
+                "halted launch/maneuver refusals must surface a flight notice"
+            );
+        }
         // And the un-gated path still works — launch is only refused
         // while halted.
         let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
@@ -2375,5 +2612,139 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(app.view.mode(), ViewMode::Flight);
+    }
+
+    /// The held-key throttle axis: the press lands the tap step, the
+    /// per-frame tick then ramps the commanded value by
+    /// `THROTTLE_RAMP_PER_S` of wall dt while the key is held, and
+    /// releasing just stops enqueuing — the sim holds the last value.
+    /// Asserted on the §7.6 command log (the values the axis actually
+    /// commanded), which is also what a replay sees.
+    #[test]
+    fn held_throttle_ramps_then_holds_on_release() {
+        let dir = tempdir("throttle-ramp");
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        // Settle the seeded pad craft to its surface latch.
+        app.view.begin_frame();
+        app.view.sim_step(320).unwrap();
+        app.view.end_frame();
+        let vessel = app.view.flight_focus().unwrap();
+        // The logged `SetThrottle` values for the focused vessel, in
+        // drain order — the axis's commanded trail.
+        let logged = |app: &App| -> Vec<f64> {
+            app.view
+                .sim
+                .command_log()
+                .iter()
+                .filter_map(|(_, c)| match c {
+                    SimCommand::SetThrottle {
+                        vessel: v,
+                        throttle,
+                    } if *v == vessel => Some(*throttle),
+                    _ => None,
+                })
+                .collect()
+        };
+        // One "frame": the ramp tick, then a sim step that drains the
+        // queued commands (the order `run_frame` uses).
+        fn frame(app: &mut App, ticks: u64) {
+            let target = app.view.sim.clock().ticks() + ticks;
+            app.view.begin_frame();
+            app.tick_throttle_ramp(1.0 / 60.0);
+            app.view.sim_step(target).unwrap();
+            app.view.end_frame();
+        }
+        app.dispatch(KeyAction::ThrottleUp);
+        assert!(app.throttle_held.contains(&KeyAction::ThrottleUp));
+        // 60 held frames at dt = 1/60 → 0.25 of axis travel on top of
+        // the tap step.
+        for _ in 0..60 {
+            frame(&mut app, 30);
+        }
+        let vals = logged(&app);
+        // The tap leads, then one ramp command per held frame.
+        assert_eq!(vals.len(), 61, "tap + 60 ramp frames");
+        assert!((vals[0] - THROTTLE_TAP_STEP).abs() < 1e-9, "tap step first");
+        let ramp_step = THROTTLE_RAMP_PER_S / 60.0;
+        for (i, w) in vals.windows(2).enumerate() {
+            assert!(
+                (w[1] - w[0] - ramp_step).abs() < 1e-9,
+                "frame {i}: ramp moved {} → {} (expected +{ramp_step})",
+                w[0],
+                w[1]
+            );
+        }
+        assert!((vals[60] - (THROTTLE_TAP_STEP + THROTTLE_RAMP_PER_S)).abs() < 1e-6);
+        // Release: the axis stops — no further commands, and the sim
+        // keeps the last commanded value.
+        app.throttle_release(KeyAction::ThrottleUp);
+        frame(&mut app, 60);
+        assert_eq!(logged(&app).len(), 61);
+        // The snap key still jumps straight to full and rebases the
+        // axis (a fresh hold would start from 1.0, not the old ramp).
+        app.dispatch(KeyAction::ThrottleFull);
+        frame(&mut app, 60);
+        assert_eq!(*logged(&app).last().unwrap(), 1.0);
+        assert_eq!(app.throttle_axis, 1.0);
+    }
+
+    /// A pad craft has no attitude surface — WASD used to die silently
+    /// inside `apply_attitude`. Now the refused press lands a HUD cue
+    /// naming the lock, the key stays held as a deferred request, and
+    /// `tick_attitude` issues the real `SetAttitude` the frame a bubble
+    /// body exists again (throttle → liftoff), so a key held through
+    /// the launch starts steering without a second press.
+    #[test]
+    fn pad_attitude_press_notices_and_defers_until_liftoff() {
+        let dir = tempdir("pad-attitude");
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        app.view.begin_frame();
+        app.view.sim_step(320).unwrap();
+        app.view.end_frame();
+        let vessel = app.view.flight_focus().unwrap();
+        let in_bubble = |app: &App| {
+            app.view
+                .sim
+                .vessels()
+                .get(&vessel)
+                .and_then(|v| v.body())
+                .is_some()
+        };
+        assert!(!in_bubble(&app), "seeded craft should be surface-latched");
+        // Parked: the press is refused — loudly, on the HUD channel.
+        app.dispatch(KeyAction::PanUp);
+        {
+            let sfx = app.view.world.resource::<csp_view::flight::FlightSfx>();
+            assert!(
+                sfx.cues.iter().any(|c| c.text.contains("ATTITUDE LOCKED")),
+                "pad attitude press must surface a flight notice"
+            );
+        }
+        assert!(app.attitude_deferred);
+        // Throttle to liftoff still holding the pitch key — one frame
+        // per iteration, the app's tick ahead of the sim step. The
+        // unlatch lands inside a `sim_step`; the NEXT frame's
+        // `tick_attitude` issues the deferred `SetAttitude`, so check
+        // the commanded rate on that same frame before free
+        // integration bleeds it.
+        app.dispatch(KeyAction::ThrottleFull);
+        let mut saw_command = false;
+        for _ in 0..40 {
+            let target = app.view.sim.clock().ticks() + 60;
+            app.view.begin_frame();
+            app.tick_attitude();
+            app.view.sim_step(target).unwrap();
+            app.view.end_frame();
+            if in_bubble(&app) && !app.attitude_deferred {
+                let body = app.view.sim.vessels()[&vessel].body().unwrap();
+                saw_command = body.ang_vel.norm() > 0.1;
+                break;
+            }
+        }
+        assert!(in_bubble(&app), "full throttle should unlatch");
+        assert!(
+            saw_command,
+            "held pitch key should command a rate once airborne"
+        );
     }
 }

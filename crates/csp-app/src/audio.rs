@@ -13,14 +13,27 @@
 //! presentation, like the VFX it accompanies.
 //!
 //! **The backend.** A real-time PCM mixer streams interleaved-stereo
-//! f32 into a native player *subprocess* (`paplay`, else `aplay`) over
-//! a piped stdin — no FFI, no unsafe, no link-time audio libraries,
-//! so the build needs nothing beyond a C toolchain and degrades to
-//! silence wherever no player (or server) exists. That is also the
-//! deliberate "simpler approach" the audio row allows: cpal/rodio/
-//! miniaudio all need platform dev packages or libclang at *build*
-//! time; a subprocess needs none and talks to the same sound servers
-//! (pipewire-pulse / pipewire-alsa) those crates would target.
+//! f32 into a native player *subprocess* (`pw-play`, else `paplay`,
+//! else `aplay`) over a piped stdin — no FFI, no unsafe, no link-time
+//! audio libraries, so the build needs nothing beyond a C toolchain
+//! and degrades to silence wherever no player (or server) exists.
+//! That is also the deliberate "simpler approach" the audio row
+//! allows: cpal/rodio/miniaudio all need platform dev packages or
+//! libclang at *build* time; a subprocess needs none and talks to the
+//! same sound servers (pipewire / pipewire-pulse / pipewire-alsa)
+//! those crates would target.
+//!
+//! **Latency.** A piped player buffers at three layers — the writer's
+//! chunk, the OS pipe (~185 ms of slack), and the player's own server
+//! request (paplay defaults to ~2 s of `tlength`!). Cue-to-ear was
+//! 0.2–0.7 s. The fix is three-fold: the players are spawned with
+//! their low-latency flags (`pw-play --latency`, `paplay
+//! --latency-msec`, `aplay --period-size`/`--buffer-size`), the mix
+//! chunk is small (`FRAMES_PER_BUF` ≈ 12 ms), and the writer thread
+//! caps how far ahead of the player's real-time drain it may fill
+//! (`MAX_PIPE_LEAD_S`) — audio queued in a pipe the player hasn't
+//! seen is stale cue latency, so the writer sleeps the excess off
+//! instead of letting the queue grow unbounded.
 //!
 //! **Graceful absence.** No player binary, dead server, killed child —
 //! none of it is an error. `AudioBackend::open` returns `None` when
@@ -44,9 +57,22 @@ use crate::synth::{self, OneShot, SAMPLE_RATE};
 /// Output channel count — the stream is interleaved stereo; mono
 /// sources are duplicated into both ears by the mixer.
 const CHANNELS: usize = 2;
-/// Frames mixed per pipe write — ~46 ms at 44.1 kHz, the cue-to-ear
-/// latency budget (a SFX cue lands well inside a frame's notice).
-const FRAMES_PER_BUF: usize = 2048;
+/// Frames mixed per pipe write — ~11.6 ms at 44.1 kHz. Small on
+/// purpose: a one-shot pushed mid-buffer waits at most this long
+/// before the mix hands it to the player.
+const FRAMES_PER_BUF: usize = 512;
+/// How far ahead of real time the writer may fill the player's stdin,
+/// in seconds of queued audio — the bound on the pipe's contribution
+/// to cue latency. The OS pipe alone holds ~185 ms of stream; without
+/// this cap the writer's blocking write is a slack-filling pacer, not
+/// a latency bound.
+const MAX_PIPE_LEAD_S: f64 = 0.05;
+/// Grace period after spawning a player before committing to it — a
+/// binary that exists but cannot connect (`pw-play` with no pipewire
+/// daemon, `paplay` with no pulse socket) exits almost immediately;
+/// detecting that here lets the fallback list reach the next player
+/// instead of owning a dead pipe.
+const PLAYER_SETTLE_MS: u64 = 60;
 /// Concurrent one-shot cap — a transition burst (breakup chains) sheds
 /// new shots past this rather than stacking unbounded voices.
 const MAX_ACTIVE_SHOTS: usize = 16;
@@ -72,9 +98,10 @@ const PLASMA_ONSET_W_M2: f64 = 5.0e3;
 const PLASMA_FULL_W_M2: f64 = 8.0e4;
 
 /// The cue text → one-shot map — the vocabulary `flight_present`
-/// pushes, mirrored literally (the strings are its wire format; the
-/// drift detector in `AudioBackend::update` logs any cue that lands
-/// unmapped).
+/// pushes plus the fixed `flight_notice` refusals the app's input
+/// layer pushes, mirrored literally (the strings are the wire format;
+/// the drift detector in `AudioBackend::update` logs any cue that
+/// lands unmapped).
 fn cue_shot(text: &str) -> Option<OneShot> {
     match text {
         "ENGINE IGNITION" => Some(OneShot::EngineIgnition),
@@ -89,6 +116,15 @@ fn cue_shot(text: &str) -> Option<OneShot> {
         "DEBRIS IMPACT" => Some(OneShot::DebrisImpact),
         "VESSEL REMOVED" => Some(OneShot::VesselRemoved),
         "VESSEL LEFT BUBBLE" => Some(OneShot::VesselLeftBubble),
+        // App-pushed `flight_notice` refusals (the input layer's
+        // "this verb cannot apply" texts) — the acknowledge blip so a
+        // dead keypress still says it was heard, rather than tripping
+        // the vocabulary-drift warn.
+        "SESSION IS READ-ONLY — ATTITUDE NOT APPLIED"
+        | "SESSION IS READ-ONLY — THROTTLE NOT APPLIED"
+        | "PARKED — ATTITUDE LOCKED UNTIL LAUNCH (THROTTLE TO LIFTOFF)"
+        | "ATTITUDE LOCKED — VESSEL IS ON RAILS"
+        | "NO VESSEL — ATTITUDE LOCKED" => Some(OneShot::UiConfirm),
         _ => None,
     }
 }
@@ -130,21 +166,44 @@ impl CueTracker {
 
 /// The player binaries the backend tries, in order — each is spawned
 /// to read interleaved-stereo f32 LE at `SAMPLE_RATE` from stdin.
-/// `paplay` (pipewire-pulse/pulse) first — it is the desktop session's
-/// native API; `aplay` (ALSA, usually via the pipewire-alsa plugin)
-/// as the fallback.
-const PLAYERS: &[&str] = &["paplay", "aplay"];
+/// `pw-play` first: on a pipewire desktop it is the most direct path —
+/// no pulse-emulation layer, and `--latency` sets the node latency in
+/// frames. `paplay` (pipewire-pulse/pulse) next, then `aplay` (ALSA,
+/// usually via the pipewire-alsa plugin). A binary that spawns but
+/// dies at connect is caught by `open`'s settle check, so ordering by
+/// latency preference is safe.
+const PLAYERS: &[&str] = &["pw-play", "paplay", "aplay"];
 
-/// The argv for `player` — raw-stream flags naming our wire format.
+/// The argv for `player` — raw-stream flags naming our wire format
+/// plus each player's low-latency request (without it the server-side
+/// buffer is the dominant cue-to-ear term: paplay's default `tlength`
+/// is ~2 s; aplay's ALSA ring is sized by whatever the plugin picks).
 fn player_args(player: &str) -> Vec<String> {
     match player {
+        // pw-play: `-` = stdin, `--raw` = raw stream, `--latency` in
+        // frames (~23 ms at 44.1 kHz — pipewire's usual quantum).
+        "pw-play" => vec![
+            "--raw".into(),
+            "--format=f32".into(),
+            format!("--rate={SAMPLE_RATE}"),
+            format!("--channels={CHANNELS}"),
+            "--latency=1024".into(),
+            "-".into(),
+        ],
         "paplay" => vec![
             "--raw".into(),
             "--format=float32le".into(),
             format!("--rate={SAMPLE_RATE}"),
             format!("--channels={CHANNELS}"),
+            // Bound the server request: 50 ms total stream latency,
+            // fed in 25 ms requests.
+            "--latency-msec=50".into(),
+            "--process-time-msec=25".into(),
         ],
         // aplay: `-` = stdin, `-q` = quiet, FLOAT_LE = our f32 stream.
+        // The ALSA ring is 4 × the mix chunk: ~12 ms interrupts behind
+        // a ~46 ms buffer — small enough for cues, fat enough to ride
+        // out a scheduling hiccup without an xrun.
         _ => vec![
             "-q".into(),
             "-t".into(),
@@ -155,6 +214,8 @@ fn player_args(player: &str) -> Vec<String> {
             SAMPLE_RATE.to_string(),
             "-c".into(),
             CHANNELS.to_string(),
+            format!("--period-size={FRAMES_PER_BUF}"),
+            format!("--buffer-size={}", 4 * FRAMES_PER_BUF),
             "-".into(),
         ],
     }
@@ -227,12 +288,23 @@ impl MixState {
 
 /// The writer thread's loop: mix one buffer, encode f32 LE, write —
 /// repeat until the stop flag or a broken pipe. The blocking write is
-/// the natural pacer (the player drains at real-time rate), and it
-/// happens *outside* the mix lock.
+/// the slow-path pacer; the lead cap below is the latency bound (see
+/// `MAX_PIPE_LEAD_S`), and it runs *outside* the mix lock.
 fn writer_loop(stdin: &mut ChildStdin, state: &Mutex<MixState>, stop: &AtomicBool) {
     let mut buf = vec![0.0f32; FRAMES_PER_BUF * CHANNELS];
     let mut bytes = vec![0u8; buf.len() * 4];
+    let started = std::time::Instant::now();
+    let mut written_frames = 0_u64;
     while !stop.load(Ordering::Relaxed) {
+        // Lead bound: stream-seconds already handed to the pipe minus
+        // wall-seconds the player could have drained. Sleep off the
+        // excess — audio queued in the pipe is stale cue latency, so
+        // a faster-than-realtime mix must wait, not fill.
+        let lead = written_frames as f64 / f64::from(SAMPLE_RATE) - started.elapsed().as_secs_f64();
+        if lead > MAX_PIPE_LEAD_S {
+            std::thread::sleep(std::time::Duration::from_secs_f64(lead - MAX_PIPE_LEAD_S));
+            continue;
+        }
         match state.lock() {
             Ok(mut st) => st.mix(&mut buf),
             Err(_) => {
@@ -246,6 +318,7 @@ fn writer_loop(stdin: &mut ChildStdin, state: &Mutex<MixState>, stop: &AtomicBoo
         if stdin.write_all(&bytes).is_err() {
             return; // player exited or pipe closed — silently done
         }
+        written_frames += FRAMES_PER_BUF as u64;
     }
 }
 
@@ -303,6 +376,22 @@ impl AudioBackend {
                 let _ = child.wait();
                 continue;
             };
+            // The settle check: a player that exists but cannot reach
+            // its server exits almost immediately — catching it here
+            // lets the loop try the next candidate instead of
+            // committing to a pipe whose reader is already dead
+            // (`update`'s liveness check would only notice after the
+            // first frame, with no fallback left to try).
+            std::thread::sleep(std::time::Duration::from_millis(PLAYER_SETTLE_MS));
+            match child.try_wait() {
+                Ok(None) => {}
+                Ok(Some(_)) => continue,
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    continue;
+                }
+            }
             let state = Arc::new(Mutex::new(MixState::new()));
             let stop = Arc::new(AtomicBool::new(false));
             let writer = {
@@ -573,6 +662,22 @@ mod tests {
         s.muted = false;
         s.master_volume = -0.5;
         assert_eq!(master_gain(&s), 0.0);
+    }
+
+    /// The argv contract: every player carries its low-latency flag —
+    /// the regression guard for the latency work (a dropped flag
+    /// silently returns cue latency to the server-buffered default).
+    #[test]
+    fn player_args_request_low_latency() {
+        for player in PLAYERS {
+            let args = player_args(player).join(" ");
+            let bounded = match *player {
+                "pw-play" => args.contains("--latency=1024"),
+                "paplay" => args.contains("--latency-msec=50"),
+                _ => args.contains("--period-size=512") && args.contains("--buffer-size=2048"),
+            };
+            assert!(bounded, "{player} argv lacks its latency flag: {args}");
+        }
     }
 
     /// Open + pump + drop, exercising the real subprocess path whenever

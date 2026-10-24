@@ -133,6 +133,29 @@ pub struct FlightEnv {
     pub body_spin: DVec3,
 }
 
+/// The render classification of a resolved part — which module
+/// family it belongs to. Drives the flight view's livery palette so a
+/// stack reads as distinct parts (tank / engine / pod / structural)
+/// rather than one grey lathe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PartKind {
+    /// Engine — a `Thrust` force site or resolved `EngineSpec`.
+    Engine,
+    /// Crew pod.
+    Crew,
+    /// Mass-carrying propellant tank.
+    Tank,
+    /// Massless-resource store (a battery's `ElectricCharge` tank).
+    Battery,
+    /// Science instrument or lab.
+    Science,
+    /// Docking port.
+    Port,
+    /// Everything else — nose cones, adapters, decouplers, hull
+    /// fallbacks.
+    Structural,
+}
+
 /// One part's staged render data — the §3.7 kitbash silhouette plus
 /// the collider bounds the sheath/dust VFX still measure against.
 #[derive(Clone, Debug)]
@@ -147,6 +170,8 @@ pub struct FlightPart {
     pub transform: csp_phys::PartTransform,
     /// The classified silhouette in part-local space.
     pub shape: crate::part_mesh::PartShape,
+    /// The module-family classification — livery tint + banding key.
+    pub kind: PartKind,
 }
 
 /// One propellant resource's aggregate fill on a vessel — units and
@@ -788,6 +813,75 @@ fn vessel_tanks(vessel: &csp_sim::Vessel) -> Vec<FlightTank> {
         .collect()
 }
 
+/// Classify a resolved part into its render [`PartKind`] — the same
+/// precedence `part_mesh::classify` uses for silhouettes (engine and
+/// crew beat the collider), then the carried inventories: propellant
+/// tanks (mass-bearing `TankSpec`s) vs batteries (massless stores),
+/// science payloads, docking ports, and everything else structural.
+fn part_kind(wp: &csp_phys::WeldPart) -> PartKind {
+    if wp.engine.is_some()
+        || wp
+            .force_sites
+            .iter()
+            .any(|s| s.kind == csp_phys::ForceSiteKind::Thrust)
+    {
+        return PartKind::Engine;
+    }
+    if wp.crew_seats > 0 {
+        return PartKind::Crew;
+    }
+    if !wp.tanks.is_empty() {
+        return if wp.tanks.iter().any(|t| t.mass_per_unit_kg > 0.0) {
+            PartKind::Tank
+        } else {
+            PartKind::Battery
+        };
+    }
+    if !wp.experiments.is_empty() || wp.lab.is_some() {
+        return PartKind::Science;
+    }
+    if !wp.dock_ports.is_empty() {
+        return PartKind::Port;
+    }
+    PartKind::Structural
+}
+
+/// Per-kind base albedo (linear RGB) — the livery palette that keeps
+/// a stack from reading as one grey lathe: propellant tanks run a
+/// light warm stage-white, capsules a slightly creamier off-white,
+/// engines dark nozzle steel, batteries darker still.
+fn kind_tint(kind: PartKind) -> [f32; 3] {
+    match kind {
+        PartKind::Engine => [0.23, 0.24, 0.28],
+        PartKind::Crew => [0.72, 0.70, 0.64],
+        PartKind::Tank => [0.80, 0.78, 0.71],
+        PartKind::Battery => [0.19, 0.23, 0.26],
+        PartKind::Science => [0.44, 0.46, 0.50],
+        PartKind::Port => [0.30, 0.32, 0.35],
+        PartKind::Structural => [0.60, 0.63, 0.69],
+    }
+}
+
+/// Painted-band accents along the part's local z — `u` is the
+/// vertex's height normalized over the shape's z range (0 = the −z
+/// end). Tanks carry an engine-skirt band and a mid-stage ring (the
+/// classic stage livery), pods a dark window ring; everything else
+/// keeps its flat tint.
+fn livery(kind: PartKind, tint: [f32; 3], u: f64) -> [f32; 3] {
+    let band = |acc: [f32; 3], k: f32| {
+        [
+            tint[0] + (acc[0] - tint[0]) * k,
+            tint[1] + (acc[1] - tint[1]) * k,
+            tint[2] + (acc[2] - tint[2]) * k,
+        ]
+    };
+    match kind {
+        PartKind::Tank if u < 0.09 || (0.58..0.66).contains(&u) => band([0.68, 0.34, 0.14], 0.85),
+        PartKind::Crew if (0.30..0.44).contains(&u) => band([0.08, 0.10, 0.15], 0.85),
+        _ => tint,
+    }
+}
+
 /// One vessel's per-part render entries — the §3.7 kitbash upgrade
 /// over the M4c hull-AABB stream. Each graph node contributes its
 /// classified silhouette, its composed body-frame transform (the
@@ -827,6 +921,7 @@ fn vessel_parts(
                         lo: -half,
                         hi: half,
                     },
+                    kind: PartKind::Structural,
                 }
             })
             .collect()
@@ -861,6 +956,7 @@ fn vessel_parts(
             hi,
             transform: t,
             shape: crate::part_mesh::classify_weld_part(wp),
+            kind: part_kind(wp),
         });
     }
     if parts.is_empty() { fallback() } else { parts }
@@ -1270,10 +1366,187 @@ fn into_arr(v: DVec3) -> [f64; 3] {
     [v.x, v.y, v.z]
 }
 
+/// All-or-nothing emission of one world-space triangle into the
+/// clip-space stream: every corner is projected first and the tri is
+/// pushed whole or dropped whole — the same rule the part pass and
+/// the VAB packet use. A per-vertex `push` would let one behind-eye
+/// corner shift every later triangle in the shared unindexed
+/// `TriangleList` stream.
+fn emit_tri(
+    v: &mut Vec<csp_render::flight::FlightVertex>,
+    vp: &[[f64; 4]; 4],
+    eye: DVec3,
+    a: DVec3,
+    b: DVec3,
+    c: DVec3,
+    color: [f32; 4],
+) {
+    let [Some(c0), Some(c1), Some(c2)] = [a, b, c].map(|q| project_into(vp, eye, q)) else {
+        return;
+    };
+    for pos in [c0, c1, c2] {
+        v.push(csp_render::flight::FlightVertex { pos, color });
+    }
+}
+
+/// [`emit_tri`] with a per-corner color — the plume and plasma-sheath
+/// gradient streams.
+fn emit_tri3(
+    v: &mut Vec<csp_render::flight::FlightVertex>,
+    vp: &[[f64; 4]; 4],
+    eye: DVec3,
+    a: DVec3,
+    b: DVec3,
+    c: DVec3,
+    colors: [[f32; 4]; 3],
+) {
+    let [Some(c0), Some(c1), Some(c2)] = [a, b, c].map(|q| project_into(vp, eye, q)) else {
+        return;
+    };
+    for (pos, color) in [(c0, colors[0]), (c1, colors[1]), (c2, colors[2])] {
+        v.push(csp_render::flight::FlightVertex { pos, color });
+    }
+}
+
+/// One vessel's engine plumes — a two-shell tapered column along
+/// `−local_dir` per thrust site: a bright core inside a wider
+/// translucent mantle. Rings widen downstream (under-expanded
+/// expansion grows with altitude, `expand` ≥ 1), alpha fades
+/// tip→tail, and a slow sim-clock flicker keeps the column alive.
+fn emit_plumes(
+    v: &mut Vec<csp_render::flight::FlightVertex>,
+    vp: &[[f64; 4]; 4],
+    eye: DVec3,
+    b: &FlightBody,
+    expand: f64,
+    t_s: f64,
+) {
+    let throttle = b.throttle.clamp(0.0, 1.0);
+    const PLUME_RINGS: usize = 6;
+    const PLUME_SEGS: usize = 16;
+    for (site, (p0, dir)) in b.plumes.iter().enumerate() {
+        let dir_w = {
+            let d = b.rot.rotate(*dir);
+            d / d.norm()
+        };
+        let tip = b.pos + b.rot.rotate(*p0);
+        let len = 4.5 + 22.0 * throttle;
+        let exit_r = 0.30 + 0.38 * throttle;
+        let (u1, u2) = {
+            let a = if dir_w.y.abs() < 0.9 {
+                DVec3::Y
+            } else {
+                DVec3::X
+            };
+            let u1 = {
+                let u = dir_w.cross(a);
+                u / u.norm()
+            };
+            (u1, dir_w.cross(u1))
+        };
+        // Two concentric shells: bright core + outer mantle. The
+        // INNER core emits first: the flight pass writes depth with
+        // `GreaterEqual`, so a mantle drawn first would leave its
+        // front wall's depth in the buffer and the core — behind it
+        // along the ray — would fail the test and never render
+        // (depth-culled dead geometry inside its own plume).
+        for &(r_scale, l_scale, hot, a_gain) in &[
+            (0.55, 0.70, [1.0f64, 0.94, 0.78], 0.95f64),
+            (1.0, 1.0, [1.0, 0.72, 0.32], 0.70),
+        ] {
+            let n_len = len * l_scale;
+            for k in 0..PLUME_RINGS {
+                let t0 = k as f64 / PLUME_RINGS as f64;
+                let t1 = (k + 1) as f64 / PLUME_RINGS as f64;
+                let ring = |t: f64, i: usize| {
+                    let ang = (i as f64) * 2.0 * core::f64::consts::PI / PLUME_SEGS as f64;
+                    let wob = 1.0
+                        + 0.06 * (t_s * 9.0 + site as f64 * 2.3 + t * 11.0 + i as f64 * 0.7).sin();
+                    let r = exit_r * r_scale * (1.0 + 0.85 * expand * t.powf(1.5)) * wob;
+                    tip - dir_w * (t * n_len) + u1 * (ang.cos() * r) + u2 * (ang.sin() * r)
+                };
+                let col = |t: f64| -> [f32; 4] {
+                    let fade = (1.0 - t).powf(1.7);
+                    let cool = [0.85f64, 0.28, 0.08];
+                    let rgb = [
+                        hot[0] + (cool[0] - hot[0]) * t,
+                        hot[1] + (cool[1] - hot[1]) * t,
+                        hot[2] + (cool[2] - hot[2]) * t,
+                    ];
+                    [
+                        rgb[0] as f32,
+                        rgb[1] as f32,
+                        rgb[2] as f32,
+                        (a_gain * fade * (0.25 + 0.75 * throttle)) as f32,
+                    ]
+                };
+                for i in 0..PLUME_SEGS {
+                    let j = (i + 1) % PLUME_SEGS;
+                    let (a0, b0) = (ring(t0, i), ring(t0, j));
+                    let (a1, b1) = (ring(t1, i), ring(t1, j));
+                    let (c0, c1) = (col(t0), col(t1));
+                    emit_tri3(v, vp, eye, a0, a1, b1, [c0, c1, c1]);
+                    emit_tri3(v, vp, eye, a0, b1, b0, [c0, c1, c0]);
+                }
+            }
+        }
+    }
+}
+
+/// One vessel's §3.7 reentry plasma — an emissive sheath grown off
+/// the hull: each part's silhouette re-emitted inflated by an
+/// intensity-scaled margin and shaded by how much each vertex faces
+/// the flow, so the leading side burns white-orange while the wake
+/// side stays a faint red rim. Alpha-blended over the hull, the craft
+/// reads as glowing inside its shock layer. `plasma_i` is the staged
+/// convective input normalized through the display window; the shell
+/// is flat-lit (emissive).
+fn emit_sheath(
+    v: &mut Vec<csp_render::flight::FlightVertex>,
+    vp: &[[f64; 4]; 4],
+    eye: DVec3,
+    b: &FlightBody,
+    flow: DVec3,
+    plasma_i: f64,
+    tris: &mut Vec<crate::part_mesh::SmoothTri>,
+) {
+    for p in &b.parts {
+        let (lo, hi) = p.shape.local_aabb();
+        let size = ((hi - lo).norm() * 0.5).max(0.05);
+        let shell = crate::part_mesh::inflated(&p.shape, size * (0.04 + 0.08 * plasma_i) + 0.015);
+        tris.clear();
+        crate::part_mesh::emit_smooth(&shell, tris);
+        for t in tris.iter() {
+            let world = |q: DVec3| b.pos + b.rot.rotate(p.transform.apply(q));
+            let cols = [(t.a, t.na), (t.b, t.nb), (t.c, t.nc)].map(|(_q, n)| {
+                let n_w = b.rot.rotate(p.transform.apply_dir(n));
+                let facing = if flow == DVec3::ZERO {
+                    // Coasting: wrap the glow evenly rather than
+                    // guess a leading side.
+                    0.5
+                } else {
+                    n_w.dot(flow).max(0.0).powf(0.6)
+                };
+                // Wrap term keeps the shaded side a faint ember
+                // rather than switching off.
+                let glow = 0.12 + 0.88 * facing;
+                [
+                    1.0,
+                    (0.16 + 0.58 * facing) as f32,
+                    (0.03 + 0.28 * facing) as f32,
+                    ((0.05 + 0.42 * plasma_i) * glow) as f32,
+                ]
+            });
+            emit_tri3(v, vp, eye, world(t.a), world(t.b), world(t.c), cols);
+        }
+    }
+}
+
 /// `RenderExtract` — emit the scene's clip-space triangles + the R2
 /// terrain packet (quadtree selection runs here, in the extract, from
 /// the solved camera — §2.5's "LOD selection" lives upstream in
 /// Presentation; the leaf walk itself is extract-time derivation).
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
 pub(crate) fn extract_flight(
     input: Res<FlightInput>,
@@ -1282,6 +1555,7 @@ pub(crate) fn extract_flight(
     cam: Res<FlightCameraF64>,
     terrain_cfg: Res<TerrainConfig>,
     mut terrain_cache: ResMut<TerrainCache>,
+    clock: Res<crate::Clock>,
     mut frame: ResMut<FlightFrame>,
 ) {
     let mut packet = csp_render::flight::FlightPacket::default();
@@ -1300,23 +1574,22 @@ pub(crate) fn extract_flight(
             &mut terrain_cache,
             env,
             &cam.0,
-            input.yaw,
-            input.pitch,
             input.viewport_px,
         ));
     }
     let v = &mut packet.vertices;
     if packet.terrain.is_none() {
-        // Sky fallback: a far-depth fullscreen gradient (two tris at
-        // NDC z≈0 — reverse-Z far), horizon blue fading up. The
+        // Sky fallback: a far-depth fullscreen space backdrop (two
+        // tris at NDC z≈0 — reverse-Z far). Near-black with a faint
+        // cool gradient so the frame isn't a dead flat void; the
         // scattering sky replaces it whenever terrain runs.
-        let zenith = [0.05, 0.09, 0.22, 1.0];
-        let horizon = [0.35, 0.5, 0.75, 1.0];
+        let zenith = [0.004, 0.006, 0.015, 1.0];
+        let nadir = [0.014, 0.017, 0.034, 1.0];
         let q = [
-            ([-1.0f32, -1.0, 0.0], horizon),
-            ([1.0, -1.0, 0.0], horizon),
+            ([-1.0f32, -1.0, 0.0], nadir),
+            ([1.0, -1.0, 0.0], nadir),
             ([1.0, 1.0, 0.0], zenith),
-            ([-1.0, -1.0, 0.0], horizon),
+            ([-1.0, -1.0, 0.0], nadir),
             ([1.0, 1.0, 0.0], zenith),
             ([-1.0, 1.0, 0.0], zenith),
         ];
@@ -1330,30 +1603,15 @@ pub(crate) fn extract_flight(
     }
     let vp = &cam.0.view_proj;
     let eye = cam.0.eye;
-    // All-or-nothing emission: every corner of a triangle is projected
-    // first and the tri is pushed whole or dropped whole — the same
-    // rule the part pass below and the VAB packet use. A per-vertex
-    // `push` here would let one behind-eye corner shift every later
-    // triangle in the shared unindexed `TriangleList` stream.
-    let emit_tri = |v: &mut Vec<csp_render::flight::FlightVertex>,
-                    a: DVec3,
-                    b: DVec3,
-                    c: DVec3,
-                    color: [f32; 4]| {
-        let [Some(c0), Some(c1), Some(c2)] = [a, b, c].map(|q| project_into(vp, eye, q)) else {
-            return;
-        };
-        for pos in [c0, c1, c2] {
-            v.push(csp_render::flight::FlightVertex { pos, color });
-        }
-    };
 
     // R2: the quadtree terrain + ocean in `packet.terrain` replaced
     // M4c's flat ground disc — nothing else to emit for the surface.
 
-    // Craft: per-part kitbash silhouettes, flat lambert shading
+    // Craft: per-part kitbash silhouettes, smooth-shaded per vertex
     // against the staged sun direction (the same vector that lights
-    // the terrain); debris tints orange.
+    // the terrain) plus a faint view-half-vector sheen; livery tint
+    // and painted bands come from the part's module family. Debris
+    // tints charred orange and takes no sheen.
     let sun = snap
         .env
         .as_ref()
@@ -1363,26 +1621,18 @@ pub(crate) fn extract_flight(
             let s = DVec3::new(0.4, 0.3, 0.86);
             s / s.norm()
         });
-    // Box corner indices per face — the plasma sheath still emits the
-    // collider AABBs, so the table stays for it (and the dust extent).
-    const FACES: [([usize; 4], DVec3); 6] = [
-        ([0, 1, 2, 3], DVec3::new(0.0, 0.0, -1.0)),
-        ([5, 4, 7, 6], DVec3::new(0.0, 0.0, 1.0)),
-        ([1, 5, 6, 2], DVec3::new(1.0, 0.0, 0.0)),
-        ([4, 0, 3, 7], DVec3::new(-1.0, 0.0, 0.0)),
-        ([3, 2, 6, 7], DVec3::new(0.0, 1.0, 0.0)),
-        ([4, 5, 1, 0], DVec3::new(0.0, -1.0, 0.0)),
-    ];
     let mut tris = Vec::new();
     for b in &snap.vessels {
-        let base: [f32; 4] = if b.debris {
-            [0.85, 0.45, 0.2, 1.0]
-        } else {
-            [0.75, 0.8, 0.88, 1.0]
-        };
         for p in &b.parts {
+            let base: [f32; 3] = if b.debris {
+                [0.72, 0.38, 0.16]
+            } else {
+                kind_tint(p.kind)
+            };
+            let (lo, hi) = p.shape.local_aabb();
+            let z_span = (hi.z - lo.z).max(1e-9);
             tris.clear();
-            crate::part_mesh::emit(&p.shape, &mut tris);
+            crate::part_mesh::emit_smooth(&p.shape, &mut tris);
             for t in tris.iter() {
                 // A tri with any corner behind the eye plane drops
                 // whole — the same all-or-nothing rule the VAB packet
@@ -1392,87 +1642,84 @@ pub(crate) fn extract_flight(
                 else {
                     continue;
                 };
-                let n_w = b.rot.rotate(p.transform.apply_dir(t.n));
-                let shade = (0.45 + 0.55 * n_w.dot(sun).max(0.0)) as f32;
-                let color = [base[0] * shade, base[1] * shade, base[2] * shade, base[3]];
-                for pos in [c0, c1, c2] {
-                    v.push(csp_render::flight::FlightVertex { pos, color });
+                for ((local, nrm), pos) in [(t.a, t.na), (t.b, t.nb), (t.c, t.nc)]
+                    .into_iter()
+                    .zip([c0, c1, c2])
+                {
+                    let n_w = b.rot.rotate(p.transform.apply_dir(nrm));
+                    let lam = n_w.dot(sun).max(0.0);
+                    let mut shade = 0.36 + 0.64 * lam;
+                    // Faint metallic sheen toward the eye — charred
+                    // debris stays matte.
+                    if !b.debris {
+                        let to_eye = eye - b.pos - b.rot.rotate(p.transform.apply(local));
+                        let d2 = to_eye.norm_squared();
+                        if d2 > 1e-6 {
+                            let half = sun + to_eye / d2.sqrt();
+                            let hl = half.norm();
+                            if hl > 1e-9 {
+                                shade += 0.20 * n_w.dot(half / hl).max(0.0).powi(12);
+                            }
+                        }
+                    }
+                    let u = (local.z - lo.z) / z_span;
+                    let tint = if b.debris {
+                        base
+                    } else {
+                        livery(p.kind, base, u)
+                    };
+                    let shade = shade.min(1.0) as f32;
+                    v.push(csp_render::flight::FlightVertex {
+                        pos,
+                        color: [
+                            (tint[0] * shade).min(1.0),
+                            (tint[1] * shade).min(1.0),
+                            (tint[2] * shade).min(1.0),
+                            1.0,
+                        ],
+                    });
                 }
             }
         }
-        // Engine plume: a cone fan along −local_dir per thrust site.
+        // Engine plume: a two-shell tapered column along −local_dir
+        // per thrust site — a bright core inside a wider translucent
+        // mantle. Rings widen downstream (under-expanded expansion
+        // grows with altitude), alpha fades tip→tail, and a slow
+        // sim-clock flicker keeps the column alive.
         if b.throttle > 0.0 {
-            for (p0, dir) in &b.plumes {
-                let dir_w = {
-                    let d = b.rot.rotate(*dir);
-                    d / d.norm()
-                };
-                let tip = b.pos + b.rot.rotate(*p0);
-                let len = 6.0 + 30.0 * b.throttle;
-                let base_p = tip - dir_w * len;
-                let (u1, u2) = {
-                    let a = if dir_w.y.abs() < 0.9 {
-                        DVec3::Y
-                    } else {
-                        DVec3::X
-                    };
-                    let u1 = {
-                        let u = dir_w.cross(a);
-                        u / u.norm()
-                    };
-                    (u1, dir_w.cross(u1))
-                };
-                let r = 0.6 + 0.9 * b.throttle;
-                let col = [1.0, 0.55 + 0.25 * b.throttle as f32, 0.15, 0.7];
-                for i in 0..8 {
-                    let (a0, a1) = (
-                        (i as f64) * core::f64::consts::PI * 0.25,
-                        ((i + 1) as f64) * core::f64::consts::PI * 0.25,
-                    );
-                    let q0 = base_p + u1 * (a0.cos() * r) + u2 * (a0.sin() * r);
-                    let q1 = base_p + u1 * (a1.cos() * r) + u2 * (a1.sin() * r);
-                    emit_tri(v, tip, q0, q1, col);
+            // Ambient expansion: vacuum plumes flare far wider than
+            // sea-level ones (ratio keyed to the atmosphere top).
+            let expand = snap.env.as_ref().map_or(1.0, |e| {
+                if e.atm_top_m > 0.0 {
+                    let alt = ((b.com - e.body_center).norm() - e.radius_m).max(0.0);
+                    1.0 + 1.8 * (alt / e.atm_top_m).clamp(0.0, 1.0)
+                } else {
+                    2.6
                 }
-            }
+            });
+            let t_s = clock.0.ticks() as f64 / csp_core::TICK_HZ as f64;
+            emit_plumes(v, vp, eye, b, expand, t_s);
         }
 
-        // §3.7 reentry plasma: an emissive sheath hugging the hull —
-        // each box re-emitted expanded by an intensity-scaled margin,
-        // alpha-blended over the hull so the craft reads as glowing
-        // inside its shock layer. Intensity is the staged convective
-        // input normalized through the display window; the shell is
-        // flat-lit (emissive, no sun term).
+        // §3.7 reentry plasma: an emissive sheath grown off the hull —
+        // the leading side burns white-orange, the wake side a faint
+        // red rim (`emit_sheath` carries the details).
         let plasma_i = ((b.plasma_w_m2 - PLASMA_ONSET_W_M2)
             / (PLASMA_FULL_W_M2 - PLASMA_ONSET_W_M2))
             .clamp(0.0, 1.0);
         if plasma_i > 0.0 {
-            let m = 0.15 + 0.35 * plasma_i;
-            let col: [f32; 4] = [
-                1.0,
-                (0.3 + 0.6 * plasma_i) as f32,
-                (0.05 + 0.35 * plasma_i) as f32,
-                (0.12 + 0.5 * plasma_i) as f32,
-            ];
-            let d = DVec3::new(m, m, m);
-            for p in &b.parts {
-                let lo = p.lo - d;
-                let hi = p.hi + d;
-                let corners: [DVec3; 8] = [
-                    DVec3::new(lo.x, lo.y, lo.z),
-                    DVec3::new(hi.x, lo.y, lo.z),
-                    DVec3::new(hi.x, hi.y, lo.z),
-                    DVec3::new(lo.x, hi.y, lo.z),
-                    DVec3::new(lo.x, lo.y, hi.z),
-                    DVec3::new(hi.x, lo.y, hi.z),
-                    DVec3::new(hi.x, hi.y, hi.z),
-                    DVec3::new(lo.x, hi.y, hi.z),
-                ];
-                for (idx, _) in FACES {
-                    let w = idx.map(|i| b.pos + b.rot.rotate(corners[i]));
-                    emit_tri(v, w[0], w[1], w[2], col);
-                    emit_tri(v, w[0], w[2], w[3], col);
-                }
-            }
+            // Stagnation side = the surface-relative velocity
+            // direction (the sim's own `v_rel` convention).
+            let v_rel = snap
+                .env
+                .as_ref()
+                .map_or(b.vel, |e| b.vel - e.body_spin.cross(b.com - e.body_center));
+            let flow = if v_rel.norm_squared() > 1.0 {
+                v_rel / v_rel.norm()
+            } else {
+                DVec3::ZERO
+            };
+            emit_sheath(v, vp, eye, b, flow, plasma_i, &mut tris);
         }
 
         // §3.7 ground-contact dust: a translucent tan ring hugging
@@ -1535,7 +1782,7 @@ pub(crate) fn extract_flight(
                 );
                 let p0 = base + t1 * (a0.cos() * dust_r) + t2 * (a0.sin() * dust_r);
                 let p1 = base + t1 * (a1.cos() * dust_r) + t2 * (a1.sin() * dust_r);
-                emit_tri(v, base, p0, p1, col);
+                emit_tri(v, vp, eye, base, p0, p1, col);
             }
         }
     }
@@ -1571,6 +1818,7 @@ mod tests {
         world.insert_resource(FlightCameraF64(cam));
         world.insert_resource(TerrainConfig::default());
         world.insert_resource(TerrainCache::default());
+        world.insert_resource(crate::Clock::default());
         world.insert_resource(FlightFrame::default());
         let mut sched = Schedule::default();
         sched.add_systems(extract_flight);
@@ -1609,6 +1857,7 @@ mod tests {
                     lo: DVec3::new(-0.5, -0.5, -0.5),
                     hi: DVec3::new(0.5, 0.5, 0.5),
                 },
+                kind: PartKind::Structural,
             }],
             // Thrust site at the body origin, dir +Z: the fan tip sits
             // at the vessel, the 1.5 m-radius base ring 36 m along −Z.

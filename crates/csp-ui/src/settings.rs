@@ -197,9 +197,12 @@ pub enum KeyAction {
     ThrottleFull,
     /// Cut throttle on the focused flight vessel.
     ThrottleCut,
-    /// Increment throttle on the focused flight vessel (repeatable).
+    /// Ramp throttle up on the focused flight vessel while held —
+    /// the input layer treats this as a continuous axis (tap = one
+    /// fine step, hold = a smooth per-frame ramp).
     ThrottleUp,
-    /// Decrement throttle on the focused flight vessel (repeatable).
+    /// Ramp throttle down on the focused flight vessel while held —
+    /// see [`Self::ThrottleUp`].
     ThrottleDown,
     /// Fire the focused vessel's next stage (jettison its drop set).
     Stage,
@@ -279,19 +282,18 @@ impl KeyAction {
         }
     }
 
-    /// Whether key-repeat events count for this action — camera pans
-    /// and throttle nudges track a held key; every other action is a
-    /// single-shot so a held key does not machine-gun warp steps,
-    /// staging, or mode toggles.
+    /// Whether key-repeat events count for this action — the camera
+    /// pans track a held key; every other action is a single-shot so a
+    /// held key does not machine-gun warp steps, staging, or mode
+    /// toggles. The held verbs (`is_attitude`, `is_throttle_axis`) are
+    /// deliberately excluded: their press inserts into the app's held
+    /// set and the per-frame tick drives them, so a repeat is a
+    /// deduped no-op either way — dropping it early just saves the
+    /// dispatch.
     pub const fn accepts_repeat(self) -> bool {
         matches!(
             self,
-            Self::PanUp
-                | Self::PanDown
-                | Self::PanLeft
-                | Self::PanRight
-                | Self::ThrottleUp
-                | Self::ThrottleDown
+            Self::PanUp | Self::PanDown | Self::PanLeft | Self::PanRight
         )
     }
 
@@ -308,6 +310,14 @@ impl KeyAction {
                 | Self::RollLeft
                 | Self::RollRight
         )
+    }
+
+    /// Whether the action is a held-to-ramp throttle verb — the input
+    /// layer tracks its press *and* release into a held set the
+    /// per-frame tick drives as a continuous axis (`ThrottleFull`/
+    /// `ThrottleCut` stay single-shot snaps, not part of the axis).
+    pub const fn is_throttle_axis(self) -> bool {
+        matches!(self, Self::ThrottleUp | Self::ThrottleDown)
     }
 }
 

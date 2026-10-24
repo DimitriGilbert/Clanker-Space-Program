@@ -35,7 +35,9 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use csp_data::{LoadedParts, PartDef, PartId, ResourceFile, ScaleRule, VariantId};
+use csp_data::{
+    LoadedParts, LocFile, ModuleDef, PartDef, PartId, ResourceFile, ScaleRule, VariantId,
+};
 use csp_phys::graph::PartTransform;
 use csp_phys::readout::CraftAnalysis;
 use csp_phys::session::{AttachEdge, CraftSession, Validation};
@@ -69,6 +71,20 @@ pub enum VabAction {
         /// The node to hang it under.
         parent: PartNodeId,
     },
+    /// The palette's one-click "add part" — context picks the honest
+    /// op so a catalog click always does something visible:
+    ///
+    /// - empty craft → `part` becomes the root;
+    /// - a part is selected → `part` attaches under it;
+    /// - otherwise → arms *pending placement*: the next
+    ///   [`Self::Select`]`(Some)` is consumed as the parent pick (the
+    ///   banner says "click where it attaches" — from the 3D view, the
+    ///   craft tree, or a stage row), and `Select(None)` cancels.
+    ///   Re-clicking the armed catalog row cancels too.
+    CatalogPick(PartId),
+    /// Disarm a pending placement without placing anything (the
+    /// palette banner's cancel button).
+    CancelPlacement,
     /// Remove `node` and its subtree.
     Remove(PartNodeId),
     /// Re-root the tree at `node` (the VAB's reroot tool).
@@ -185,9 +201,19 @@ pub struct VabSession {
     session: CraftSession,
     catalog: Option<LoadedParts>,
     resources: Option<ResourceFile>,
+    /// The English loc table — the catalog's display-name half
+    /// (`PartDef::display_name` is a `LocKey`). Data-derived, same
+    /// class as the catalog; absent in headless fixtures, where names
+    /// fall back to the part id.
+    loc: Option<LocFile>,
     profile: MissionProfile,
     /// Currently selected node (inspector + attach target).
     selected: Option<PartNodeId>,
+    /// The armed pending placement (see [`VabAction::CatalogPick`]):
+    /// `Some(part)` means the next `Select(Some)` is consumed as that
+    /// part's parent pick, and `Select(None)`/[`VabAction::CancelPlacement`]
+    /// disarms. Session state — never serialized into the craft file.
+    pending_part: Option<PartId>,
     /// The last op's status/error line — surfaced by the panel.
     notice: Option<String>,
     /// Set by every mutating op; cleared by `recompute`.
@@ -213,6 +239,11 @@ pub struct VabSession {
     /// §6.3's no-save rule — `false` refuses `VabAction::LoadBytes` and
     /// hides the panel's save/load row. `true` is the desktop default.
     file_io: bool,
+    /// Craft-generation counter — bumped by `VabAction::New` and a
+    /// successful `LoadBytes`. The 3D view watches it so the camera's
+    /// one-shot fit re-arms on a craft that is not the one it framed
+    /// (edits don't bump it — only replacing the craft does).
+    craft_epoch: u64,
 }
 
 impl Default for VabSession {
@@ -222,8 +253,10 @@ impl Default for VabSession {
             session: CraftSession::default(),
             catalog: None,
             resources: None,
+            loc: None,
             profile: MissionProfile::default(),
             selected: None,
+            pending_part: None,
             notice: None,
             dirty: false,
             analysis: None,
@@ -234,6 +267,7 @@ impl Default for VabSession {
             save_name: String::new(),
             part_limit: None,
             file_io: true,
+            craft_epoch: 0,
         }
     }
 }
@@ -256,6 +290,52 @@ impl VabSession {
         self.catalog = Some(catalog);
         self.resources = Some(resources);
         self.dirty = true;
+    }
+
+    /// Install the localization table the palette resolves
+    /// `PartDef::display_name` keys against (`View::from_source` loads
+    /// `data/loc/en.ron` beside the catalog). Absent →
+    /// [`Self::display_name`] falls back to the part id.
+    pub fn set_loc(&mut self, loc: LocFile) {
+        self.loc = Some(loc);
+    }
+
+    /// The player-facing name of a catalog part — the loc-resolved
+    /// `display_name`, or the part id itself when no loc table is
+    /// installed or the key is missing (honest, never blank).
+    pub fn display_name(&self, part_id: &PartId) -> String {
+        self.def_by_id(part_id)
+            .and_then(|d| {
+                self.loc
+                    .as_ref()
+                    .and_then(|l| l.strings.get(d.display_name.as_str()))
+            })
+            .cloned()
+            .unwrap_or_else(|| part_id.as_str().to_string())
+    }
+
+    /// The display name of a *placed* node — `#id` when the node is
+    /// gone (a stale reference in a message).
+    fn node_label(&self, node: PartNodeId) -> String {
+        self.session
+            .node(node)
+            .map(|n| self.display_name(&n.built().part_id))
+            .unwrap_or_else(|| format!("#{}", node.0))
+    }
+
+    /// The craft-generation counter — bumped on `New` and a
+    /// successful `LoadBytes`. The craft view resets its one-shot
+    /// camera fit when it changes (a `focused_once` left armed would
+    /// frame the NEW craft at the OLD craft's distance).
+    pub fn craft_epoch(&self) -> u64 {
+        self.craft_epoch
+    }
+
+    /// The armed pending placement, if any (see
+    /// [`VabAction::CatalogPick`]) — the palette banner and hint bar
+    /// surface it.
+    pub fn pending_part(&self) -> Option<&PartId> {
+        self.pending_part.as_ref()
     }
 
     /// The underlying session — read-only for panels/scene building.
@@ -382,116 +462,231 @@ impl VabSession {
 
     /// Apply one [`VabAction`] — the shared entry for panels, input
     /// events, and (later) session-class tools. Mutations mark the
-    /// session dirty for the next `recompute`; failures land in
-    /// [`Self::notice`].
+    /// session dirty for the next `recompute`; every call lands a
+    /// line in [`Self::notice`] — a confirmation on success, the
+    /// refusal on failure — so no op is ever silent.
     pub fn apply(&mut self, action: VabAction) -> Result<(), VabError> {
         let r = self.apply_inner(action);
         match &r {
-            Ok(()) => self.notice = None,
+            Ok(msg) => self.notice = msg.clone(),
             Err(e) => self.notice = Some(e.to_string()),
         }
-        r
+        r.map(|_| ())
     }
 
-    /// The op dispatch — see [`Self::apply`].
-    fn apply_inner(&mut self, action: VabAction) -> Result<(), VabError> {
-        match action {
+    /// The op dispatch — see [`Self::apply`]. `Ok(Some(_))` is a
+    /// player-facing confirmation; `Ok(None)` clears the notice (a
+    /// quiet op — selection, rename keystroke, profile drag — whose
+    /// result is already visible where it happened).
+    fn apply_inner(&mut self, action: VabAction) -> Result<Option<String>, VabError> {
+        Ok(match action {
             VabAction::New => {
                 self.session = CraftSession::with_name(self.session.name());
                 self.selected = None;
+                self.pending_part = None;
+                self.craft_epoch += 1;
                 self.dirty = true;
+                Some("new craft — click a catalog part to place the root".to_string())
             }
-            VabAction::SetRoot(part_id) => {
-                self.check_part_count(self.session.len() + 1)?;
-                let defs = self.catalog.as_ref().ok_or(VabError::NoCatalog)?;
-                let built = self.stock_build(&part_id)?;
-                let id = self
-                    .session
-                    .add_root(defs, built)
-                    .map_err(VabError::Session)?;
-                self.selected = Some(id);
-                self.dirty = true;
-            }
-            VabAction::AttachAuto { part, parent } => {
-                self.check_part_count(self.session.len() + 1)?;
-                let id = self.attach_auto(&part, parent)?;
-                self.selected = Some(id);
-                self.dirty = true;
-            }
-            VabAction::Remove(node) => {
-                let removed = self.session.remove_part(node).map_err(VabError::Session)?;
-                if self.selected.is_some_and(|s| removed.contains(&s)) {
-                    self.selected = None;
+            VabAction::SetRoot(part_id) => Some(self.place_root(&part_id)?),
+            VabAction::AttachAuto { part, parent } => Some(self.place_attach(&part, parent)?),
+            VabAction::CatalogPick(part) => self.catalog_pick(&part)?,
+            VabAction::CancelPlacement => {
+                if self.pending_part.take().is_some() {
+                    Some("placement cancelled".to_string())
+                } else {
+                    None
                 }
-                self.dirty = true;
             }
+            VabAction::Remove(node) => Some(self.remove_node(node)?),
             VabAction::Reroot(node) => {
                 self.session.reroot(node).map_err(VabError::Session)?;
                 self.dirty = true;
+                Some(format!("re-rooted the craft at {}", self.node_label(node)))
             }
-            VabAction::Select(sel) => {
-                self.selected = sel.filter(|id| self.session.contains(*id));
-            }
+            VabAction::Select(sel) => self.select(sel)?,
             VabAction::SetStage { node, stage } => {
+                let label = self.node_label(node);
                 self.session
                     .set_stage(node, stage)
                     .map_err(VabError::Session)?;
                 self.dirty = true;
+                Some(format!("{label} → stage {stage}"))
             }
             VabAction::SetScale { node, scale } => {
+                let label = self.node_label(node);
                 let defs = self.catalog.as_ref().ok_or(VabError::NoCatalog)?;
                 self.session
                     .set_scale(defs, node, scale)
                     .map_err(VabError::Session)?;
                 self.dirty = true;
+                Some(format!("{label} scale → {scale:.2}"))
             }
             VabAction::SetVariant { node, variant } => {
+                let label = self.node_label(node);
                 let defs = self.catalog.as_ref().ok_or(VabError::NoCatalog)?;
                 self.session
-                    .set_variant(defs, node, variant)
+                    .set_variant(defs, node, variant.clone())
                     .map_err(VabError::Session)?;
                 self.dirty = true;
+                Some(format!("{label} variant → {}", variant.as_str()))
             }
             VabAction::Rename(name) => {
                 self.session.set_name(name);
+                None
             }
-            VabAction::LoadBytes(bytes) => {
-                // §6.3's no-save rule — craft-file import is off in the
-                // demo build (`file_io`), and a loaded craft counts
-                // against the same part cap as a built one.
-                if !self.file_io {
-                    return Err(VabError::FileIoDisabled);
-                }
-                let session = CraftSession::from_bytes(&bytes).map_err(VabError::CraftFile)?;
-                self.check_part_count(session.len())?;
-                self.session = session;
-                self.selected = None;
-                self.dirty = true;
-            }
+            VabAction::LoadBytes(bytes) => Some(self.load_bytes(&bytes)?),
             VabAction::SetTargetDeltaV(dv) => {
                 if dv.is_finite() && dv >= 0.0 {
                     self.profile.target_delta_v_m_per_s = dv;
                 }
+                None
             }
             VabAction::SetMinLaunchTwr(t) => {
                 if t.is_finite() && t >= 0.0 {
                     self.profile.min_launch_twr = t;
                 }
+                None
             }
             VabAction::InsertStage(at) => {
                 self.session.insert_stage(at).map_err(VabError::Session)?;
                 self.dirty = true;
+                Some(format!("inserted stage {at}"))
             }
             VabAction::RemoveStage(at) => {
                 self.session.remove_stage(at);
                 self.dirty = true;
+                Some(format!(
+                    "removed stage {at} — its parts folded down a stage"
+                ))
             }
             VabAction::CompactStages => {
                 self.session.compact_stages();
                 self.dirty = true;
+                Some("compacted stage numbering".to_string())
             }
+        })
+    }
+
+    /// The palette's one-click add — [`VabAction::CatalogPick`]'s
+    /// dispatch. The catalog check runs before ANY branch so a
+    /// catalog-less session refuses honestly instead of arming a
+    /// placement that can never resolve.
+    fn catalog_pick(&mut self, part: &PartId) -> Result<Option<String>, VabError> {
+        if self.catalog.is_none() {
+            return Err(VabError::NoCatalog);
         }
-        Ok(())
+        Ok(Some(if self.session.is_empty() {
+            self.place_root(part)?
+        } else if let Some(parent) = self.selected() {
+            self.place_attach(part, parent)?
+        } else if self.pending_part.as_ref() == Some(part) {
+            // Re-clicking the armed row toggles it off.
+            self.pending_part = None;
+            "placement cancelled".to_string()
+        } else {
+            // Refuse to arm a part the catalog doesn't carry — arming
+            // a bad id would park the editor in a state whose only
+            // exits are cancel and a guaranteed-failing attach.
+            self.def_by_id(part)
+                .ok_or(VabError::PartNotInCatalog { part: part.clone() })?;
+            let msg = format!(
+                "placing {} — click the craft part to attach it under \
+                 (3D view, craft tree, or stage row)",
+                self.display_name(part)
+            );
+            self.pending_part = Some(part.clone());
+            msg
+        }))
+    }
+
+    /// [`VabAction::Remove`]'s dispatch — the node plus its whole
+    /// subtree; clears the selection when it was inside the removed
+    /// set. Returns the confirmation line.
+    fn remove_node(&mut self, node: PartNodeId) -> Result<String, VabError> {
+        let label = self.node_label(node);
+        let removed = self.session.remove_part(node).map_err(VabError::Session)?;
+        if self.selected.is_some_and(|s| removed.contains(&s)) {
+            self.selected = None;
+        }
+        self.dirty = true;
+        Ok(if removed.len() > 1 {
+            format!("removed {label} + subtree ({} parts)", removed.len())
+        } else {
+            format!("removed {label}")
+        })
+    }
+
+    /// [`VabAction::LoadBytes`]'s dispatch. §6.3's no-save rule —
+    /// craft-file import is off in the demo build (`file_io`), and a
+    /// loaded craft counts against the same part cap as a built one.
+    fn load_bytes(&mut self, bytes: &[u8]) -> Result<String, VabError> {
+        if !self.file_io {
+            return Err(VabError::FileIoDisabled);
+        }
+        let session = CraftSession::from_bytes(bytes).map_err(VabError::CraftFile)?;
+        self.check_part_count(session.len())?;
+        self.session = session;
+        self.selected = None;
+        self.pending_part = None;
+        self.craft_epoch += 1;
+        self.dirty = true;
+        Ok(format!("loaded craft '{}'", self.session.name()))
+    }
+
+    /// [`VabAction::Select`]'s dispatch. An armed pending placement
+    /// consumes `Some(node)` as its parent pick — the banner's "click
+    /// where it attaches" made literal; a failed attach keeps the arm
+    /// so the next click can try a different parent. `None` (a
+    /// background click) deselects and disarms.
+    fn select(&mut self, sel: Option<PartNodeId>) -> Result<Option<String>, VabError> {
+        let target = sel.filter(|id| self.session.contains(*id));
+        if let (Some(part), Some(parent)) = (self.pending_part.clone(), target) {
+            return self.place_attach(&part, parent).map(Some);
+        }
+        self.selected = target;
+        Ok(if target.is_none() && self.pending_part.take().is_some() {
+            // Background click — the natural cancel.
+            Some("placement cancelled".to_string())
+        } else {
+            None
+        })
+    }
+
+    /// Place `part` as the craft root — the shared half of
+    /// [`VabAction::SetRoot`] and the empty-craft branch of
+    /// [`VabAction::CatalogPick`]. Returns the confirmation line.
+    fn place_root(&mut self, part_id: &PartId) -> Result<String, VabError> {
+        self.check_part_count(self.session.len() + 1)?;
+        let defs = self.catalog.as_ref().ok_or(VabError::NoCatalog)?;
+        let built = self.stock_build(part_id)?;
+        let id = self
+            .session
+            .add_root(defs, built)
+            .map_err(VabError::Session)?;
+        self.selected = Some(id);
+        self.pending_part = None;
+        self.dirty = true;
+        Ok(format!(
+            "placed {} as the craft root",
+            self.display_name(part_id)
+        ))
+    }
+
+    /// Snap `part` under `parent` — the shared half of
+    /// [`VabAction::AttachAuto`], [`VabAction::CatalogPick`]'s
+    /// selected-parent branch, and the pending-placement
+    /// [`VabAction::Select`] consume. Success disarms the pending arm
+    /// and selects the new part; failure leaves the arm (and the
+    /// selection) alone. Returns the confirmation line.
+    fn place_attach(&mut self, part: &PartId, parent: PartNodeId) -> Result<String, VabError> {
+        self.check_part_count(self.session.len() + 1)?;
+        let name = self.display_name(part);
+        let id = self.attach_auto(part, parent)?;
+        self.selected = Some(id);
+        self.pending_part = None;
+        self.dirty = true;
+        Ok(format!("attached {name} under {}", self.node_label(parent)))
     }
 
     /// The stock `BuiltPart` for a catalog id — `variants[0]` is the
@@ -745,18 +940,70 @@ pub fn vab_editor(
     vab_hint_bar(ctx, vab, keys, key_labels);
 }
 
-/// Left side: the part catalog browser + the craft tree.
+/// One catalog row, snapshotted as owned data so the click handlers
+/// below can mutate `vab` through `apply` while it renders.
+struct PaletteRow {
+    /// The catalog part.
+    id: PartId,
+    /// Loc-resolved display name (falls back to the id).
+    name: String,
+    /// One-line stat/module summary under the name.
+    blurb: String,
+}
+
+/// A one-line summary of what a part IS and DOES — the catalog's
+/// "description" half: mass + cost plus each module's headline stat.
+fn part_blurb(def: &PartDef) -> String {
+    let mut mods: Vec<String> = Vec::new();
+    for m in &def.modules {
+        mods.push(match m {
+            ModuleDef::Engine {
+                thrust_vac_n,
+                isp_vac_s,
+                ..
+            } => format!("{:.0} kN vac · Isp {isp_vac_s:.0} s", thrust_vac_n / 1000.0),
+            ModuleDef::Tank { capacity } => format!(
+                "holds {}",
+                capacity
+                    .iter()
+                    .map(|(r, u)| format!("{u:.0} {}", r.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(" + ")
+            ),
+            ModuleDef::Control { torque_nm, .. } => format!("{torque_nm:.0} N·m torque"),
+            ModuleDef::Decoupler => "staging decoupler".to_string(),
+            ModuleDef::DockPort { .. } => "docking port".to_string(),
+            ModuleDef::CrewSeat { slots } => format!("{slots} crew seat(s)"),
+            ModuleDef::Experiment { data_units, .. } => {
+                format!("experiment · {data_units:.0} data")
+            }
+            ModuleDef::Drill { .. } => "resource drill".to_string(),
+            ModuleDef::Converter { .. } => "ISRU converter".to_string(),
+            ModuleDef::Lab { .. } => "science lab".to_string(),
+        });
+    }
+    let mut s = format!("{:.0} kg · {:.0} funds", def.mass_dry_kg, def.cost_funds);
+    if !mods.is_empty() {
+        s.push_str(&format!(" — {}", mods.join(" · ")));
+    }
+    s
+}
+
+/// Left side: the part catalog browser + the craft tree — the
+/// player's build surface. Every catalog row is a one-click add
+/// ([`VabAction::CatalogPick`]); the banner above the list says what
+/// the next click does, so the flow needs no docs.
 fn palette_panel(ctx: &egui::Context, vab: &mut VabSession) {
     egui::Window::new("Parts")
         .anchor(egui::Align2::LEFT_TOP, egui::vec2(0.0, 30.0))
         .resizable(true)
-        .default_size([240.0, 560.0])
+        .default_size([300.0, 620.0])
         .show(ctx, |ui| {
-            ui.heading("Parts");
-            // Snapshot the catalog into owned ids — the buttons below
-            // mutate `vab` through `apply`, so no catalog borrow may
+            ui.heading("Parts catalog");
+            // Snapshot the catalog into owned rows — the click handlers
+            // below mutate `vab` through `apply`, so no borrow may
             // cross them.
-            let grouped: Vec<(&'static str, Vec<PartId>)> = {
+            let grouped: Vec<(&'static str, Vec<PaletteRow>)> = {
                 const CATS: [csp_data::PartCategory; 7] = [
                     csp_data::PartCategory::Control,
                     csp_data::PartCategory::Engine,
@@ -771,57 +1018,130 @@ fn palette_panel(ctx: &egui::Context, vab: &mut VabSession) {
                     Some(c) => CATS
                         .iter()
                         .filter_map(|cat| {
-                            let ids: Vec<PartId> = c
+                            let rows: Vec<PaletteRow> = c
                                 .parts
                                 .iter()
                                 .filter(|p| p.def.category == *cat)
-                                .map(|p| p.def.id.clone())
+                                .map(|p| PaletteRow {
+                                    id: p.def.id.clone(),
+                                    name: vab.display_name(&p.def.id),
+                                    blurb: part_blurb(&p.def),
+                                })
                                 .collect();
-                            (!ids.is_empty()).then_some((cat.name(), ids))
+                            (!rows.is_empty()).then_some((cat.name(), rows))
                         })
                         .collect(),
                 }
             };
-            if grouped.is_empty() {
-                ui.label(if vab.catalog().is_none() {
-                    "part catalog not loaded"
-                } else {
-                    "catalog is empty"
-                });
+            let pending_name = vab.pending_part().map(|p| vab.display_name(p));
+            let empty = vab.session().is_empty();
+            let sel_name = vab.selected().map(|id| vab.node_label(id));
+            palette_banner(ui, vab, pending_name.as_deref(), empty, sel_name.as_deref());
+
+            if grouped.is_empty() && vab.catalog().is_some() {
+                ui.weak("catalog is empty");
             }
-            {
-                let empty = vab.session().is_empty();
-                for (cat, parts) in grouped {
-                    egui::CollapsingHeader::new(cat)
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            for id in parts {
-                                ui.horizontal(|ui| {
-                                    ui.label(id.as_str());
-                                    let label = if empty { "root" } else { "attach" };
-                                    if ui.small_button(label).clicked() {
-                                        if empty {
-                                            let _ = vab.apply(VabAction::SetRoot(id.clone()));
-                                        } else if let Some(parent) = vab.selected() {
-                                            let _ = vab.apply(VabAction::AttachAuto {
-                                                part: id.clone(),
-                                                parent,
-                                            });
-                                        } else {
-                                            vab.set_notice(Some(
-                                                "select a parent part first".to_string(),
-                                            ));
-                                        }
+            egui::ScrollArea::vertical()
+                .id_salt("vab_catalog")
+                .max_height(360.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for (cat, rows) in grouped {
+                        egui::CollapsingHeader::new(cat)
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                for row in rows {
+                                    let armed = pending_name.is_some()
+                                        && vab.pending_part() == Some(&row.id);
+                                    let verb = if empty {
+                                        "place as the craft root"
+                                    } else if sel_name.is_some() {
+                                        "attach under the selected part"
+                                    } else {
+                                        "start placing (then click the parent)"
+                                    };
+                                    let hover = format!("{} — click to {verb}", row.id.as_str());
+                                    let name_hit = ui
+                                        .selectable_label(
+                                            armed,
+                                            egui::RichText::new(&row.name).strong(),
+                                        )
+                                        .on_hover_text(&hover)
+                                        .clicked();
+                                    // The blurb is the same part's row —
+                                    // a click on it must do what the
+                                    // name does, not dead-end.
+                                    let blurb_hit = ui
+                                        .add(
+                                            egui::Label::new(
+                                                egui::RichText::new(format!("   {}", row.blurb))
+                                                    .weak(),
+                                            )
+                                            .sense(egui::Sense::click()),
+                                        )
+                                        .on_hover_text(&hover)
+                                        .clicked();
+                                    if name_hit || blurb_hit {
+                                        let _ = vab.apply(VabAction::CatalogPick(row.id.clone()));
                                     }
-                                });
-                            }
-                        });
-                }
-            }
+                                }
+                            });
+                    }
+                });
             ui.separator();
             ui.heading("Craft tree");
-            craft_tree(ui, vab);
+            egui::ScrollArea::vertical()
+                .id_salt("vab_tree")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    craft_tree(ui, vab);
+                });
         });
+}
+
+/// The palette's state banner — the one line that says what the next
+/// catalog click does BEFORE the player commits. The old "select a
+/// parent part first" notice answered after the fact and left the
+/// attach step undiscoverable; pending placement turns the same
+/// gesture into the guided "click a part, then click where it
+/// attaches" flow.
+fn palette_banner(
+    ui: &mut egui::Ui,
+    vab: &mut VabSession,
+    pending_name: Option<&str>,
+    empty: bool,
+    sel_name: Option<&str>,
+) {
+    if vab.catalog().is_none() {
+        ui.colored_label(
+            egui::Color32::RED,
+            "part catalog not loaded — nothing can be placed",
+        );
+    } else if let Some(name) = pending_name {
+        ui.group(|ui| {
+            ui.colored_label(
+                egui::Color32::LIGHT_GREEN,
+                format!(
+                    "Placing {name} — click the craft part to attach it under \
+                     (3D view, craft tree below, or a stage row)."
+                ),
+            );
+            if ui.small_button("cancel placement").clicked() {
+                let _ = vab.apply(VabAction::CancelPlacement);
+            }
+        });
+    } else if empty {
+        ui.label("Empty craft — click a part to place it as the root.");
+    } else if let Some(sel) = sel_name {
+        ui.label(format!(
+            "Click a part to attach it under the selected {sel}."
+        ));
+    } else {
+        ui.label(
+            "Click a part, then click the craft part it attaches under \
+             (3D view, craft tree, or stage row).",
+        );
+    }
 }
 
 /// The session tree as an indented selectable list — DFS from the
@@ -841,7 +1161,9 @@ fn craft_tree(ui: &mut egui::Ui, vab: &mut VabSession) {
     }
     while let Some((id, depth)) = stack.pop() {
         if let Some(n) = vab.session().node(id) {
-            let name = n.built().part_id.as_str();
+            // The loc display name, like the palette/notices — the raw
+            // part id is the fallback, never the label.
+            let name = vab.node_label(id);
             let is_sel = vab.selected() == Some(id);
             ui.horizontal(|ui| {
                 ui.add_space(depth as f32 * 12.0);
@@ -1067,13 +1389,10 @@ fn staging_section(ui: &mut egui::Ui, vab: &mut VabSession) {
                     let parts = st
                         .part_ids
                         .iter()
-                        .map(|id| {
-                            let name = vab
-                                .def_of(*id)
-                                .map(|d| d.id.as_str().to_string())
-                                .unwrap_or_else(|| "<missing def>".to_string());
-                            (*id, name)
-                        })
+                        // The loc display name (palette/notices
+                        // convention); `node_label` falls back to the
+                        // part id when no loc table is installed.
+                        .map(|id| (*id, vab.node_label(*id)))
                         .collect();
                     let stats = (!st.engine_ids.is_empty()).then_some((
                         st.delta_v_m_per_s,
@@ -1119,7 +1438,11 @@ fn staging_section(ui: &mut egui::Ui, vab: &mut VabSession) {
 fn selected_section(ui: &mut egui::Ui, vab: &mut VabSession) {
     ui.heading("Selected part");
     let Some(id) = vab.selected() else {
-        ui.weak("none — click a part in the view or tree");
+        ui.weak(if vab.pending_part().is_some() {
+            "placing a part — click the craft part it attaches under"
+        } else {
+            "none — click a part in the 3D view, the craft tree, or a stage row"
+        });
         return;
     };
     // Snapshot the node's data as owned values — the closures below
@@ -1132,12 +1455,11 @@ fn selected_section(ui: &mut egui::Ui, vab: &mut VabSession) {
         node.built().scale,
         node.built().variant.clone(),
     );
-    let part_id = node.built().part_id.clone();
     let def_data = vab
         .def_of(id)
         .map(|d| (d.variants.clone(), d.scale.clone()));
 
-    ui.label(format!("#{}  {}", id.0, part_id.as_str()));
+    ui.label(format!("#{}  {}", id.0, vab.node_label(id)));
     ui.label(format!(
         "stage {stage_now} · scale {scale_now:.2} · variant {}",
         variant_now.as_str()
@@ -1214,7 +1536,12 @@ fn selected_section(ui: &mut egui::Ui, vab: &mut VabSession) {
     }
 
     reliability_section(ui, vab, id);
+    selected_actions(ui, vab, id);
+}
 
+/// The inspector's destructive/structural button row — reroot,
+/// remove-subtree, deselect.
+fn selected_actions(ui: &mut egui::Ui, vab: &mut VabSession, id: PartNodeId) {
     ui.horizontal(|ui| {
         if ui.button("make root").clicked() {
             let _ = vab.apply(VabAction::Reroot(id));
@@ -1397,13 +1724,40 @@ fn vab_hint_bar(
                 egui::Align2::LEFT_BOTTOM,
                 format!(
                     "VAB  ·  {parts} part(s)  —  [{}] exit  drag: orbit  wheel: zoom  \
-                     click a part to select",
+                     click part: select/attach  catalog click: add part",
                     keys.hint_labeled(crate::settings::KeyAction::ToggleVab, key_labels)
                 ),
                 egui::FontId::proportional(13.0),
                 egui::Color32::from_gray(180),
             );
-            if let Some(msg) = &problem {
+            // The op notice rides the viewport too — the Craft window's
+            // notice row can scroll out of sight, and "every action
+            // produces a visible result or a clear notice" only holds
+            // if the notice is where the player is looking.
+            if let Some(n) = vab.notice() {
+                painter.text(
+                    egui::pos2(rect.left() + 10.0, rect.bottom() - 26.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    n,
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::YELLOW,
+                );
+            }
+            // An armed placement is the banner state — it outranks the
+            // problem line (which still shows in the Craft window).
+            if let Some(p) = vab.pending_part() {
+                painter.text(
+                    egui::pos2(rect.center().x, rect.top() + 46.0),
+                    egui::Align2::CENTER_TOP,
+                    format!(
+                        "placing {} — click a craft part to attach it under \
+                         (click empty space to cancel)",
+                        vab.display_name(p)
+                    ),
+                    egui::FontId::proportional(15.0),
+                    egui::Color32::LIGHT_GREEN,
+                );
+            } else if let Some(msg) = &problem {
                 painter.text(
                     egui::pos2(rect.center().x, rect.top() + 46.0),
                     egui::Align2::CENTER_TOP,
@@ -1635,6 +1989,128 @@ mod tests {
                 parent: mid,
             })
         );
+    }
+
+    /// The palette's one-click add drives the whole build flow: empty
+    /// craft → root; a selection → immediate attach under it; neither
+    /// → the placement ARMS (pending) and the next `Select` is
+    /// consumed as the parent pick — from a tree row, a stage row, or
+    /// the 3D view's pick, all of which land on `Select`.
+    #[test]
+    fn catalog_pick_drives_the_build_flow() {
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        // Empty craft → the click places the root.
+        vab.apply(VabAction::CatalogPick(PartId::from("t.tank")))
+            .unwrap();
+        let root = vab.session().root().unwrap();
+        assert_eq!(vab.selected(), Some(root));
+        assert!(vab.notice().unwrap().contains("root"));
+        // The root stays selected → the next click attaches under it.
+        vab.apply(VabAction::CatalogPick(PartId::from("t.tank")))
+            .unwrap();
+        assert_eq!(vab.session().len(), 2);
+        let mid = vab.selected().unwrap();
+        assert_ne!(mid, root);
+        // Deselect → a catalog click arms pending placement rather
+        // than dying on "select a parent first".
+        vab.apply(VabAction::Select(None)).unwrap();
+        vab.apply(VabAction::CatalogPick(PartId::from("t.eng")))
+            .unwrap();
+        assert_eq!(vab.pending_part(), Some(&PartId::from("t.eng")));
+        assert!(vab.notice().unwrap().contains("placing"));
+        assert_eq!(vab.session().len(), 2); // armed, not placed
+        // The next Select is the parent pick — the guided
+        // "click a part, then click where it attaches".
+        vab.apply(VabAction::Select(Some(mid))).unwrap();
+        assert_eq!(vab.session().len(), 3);
+        assert!(vab.pending_part().is_none());
+        assert!(vab.notice().unwrap().contains("attached"));
+        // The new part is selected, so the NEXT catalog click targets
+        // it as parent without an extra click — here honestly refused
+        // (the engine's only node is bound by its own edge), with the
+        // error notice to say why.
+        assert_ne!(vab.selected(), Some(mid));
+        let r = vab.apply(VabAction::CatalogPick(PartId::from("t.tank")));
+        assert!(r.is_err());
+        assert_eq!(vab.session().len(), 3);
+        assert!(vab.notice().unwrap().contains("no compatible"));
+    }
+
+    /// Pending placement has three honest exits — a background click
+    /// (`Select(None)`), the banner's `CancelPlacement`, and
+    /// re-clicking the armed catalog row — and none of them places a
+    /// part.
+    #[test]
+    fn pending_placement_cancels_three_ways() {
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        vab.apply(VabAction::CatalogPick(PartId::from("t.tank")))
+            .unwrap();
+        vab.apply(VabAction::Select(None)).unwrap();
+        // 1: background click cancels.
+        vab.apply(VabAction::CatalogPick(PartId::from("t.eng")))
+            .unwrap();
+        assert!(vab.pending_part().is_some());
+        vab.apply(VabAction::Select(None)).unwrap();
+        assert!(vab.pending_part().is_none());
+        assert_eq!(vab.session().len(), 1);
+        // 2: the banner's cancel button.
+        vab.apply(VabAction::CatalogPick(PartId::from("t.eng")))
+            .unwrap();
+        vab.apply(VabAction::CancelPlacement).unwrap();
+        assert!(vab.pending_part().is_none());
+        assert_eq!(vab.session().len(), 1);
+        // 3: re-clicking the armed row toggles it off.
+        vab.apply(VabAction::CatalogPick(PartId::from("t.eng")))
+            .unwrap();
+        vab.apply(VabAction::CatalogPick(PartId::from("t.eng")))
+            .unwrap();
+        assert!(vab.pending_part().is_none());
+        assert_eq!(vab.session().len(), 1);
+    }
+
+    /// A refused pending attach keeps the arm: the error notice names
+    /// the failure and the next click can try a different parent —
+    /// losing the placement silently would be the old bug's shape.
+    #[test]
+    fn failed_pending_attach_keeps_the_arm() {
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        vab.apply(VabAction::CatalogPick(PartId::from("t.tank")))
+            .unwrap();
+        vab.apply(VabAction::CatalogPick(PartId::from("t.tank")))
+            .unwrap();
+        let mid = vab.selected().unwrap();
+        // Bind the mid tank's bottom node too — then it has no honest
+        // mate left for the armed engine.
+        vab.apply(VabAction::CatalogPick(PartId::from("t.eng")))
+            .unwrap();
+        vab.apply(VabAction::Select(None)).unwrap();
+        vab.apply(VabAction::CatalogPick(PartId::from("t.eng")))
+            .unwrap();
+        let r = vab.apply(VabAction::Select(Some(mid)));
+        assert!(r.is_err());
+        assert!(vab.pending_part().is_some());
+        assert!(vab.notice().unwrap().contains("no compatible"));
+        // Picking the root (free top node) instead completes it.
+        let root = vab.session().root().unwrap();
+        vab.apply(VabAction::Select(Some(root))).unwrap();
+        assert_eq!(vab.session().len(), 4);
+        assert!(vab.pending_part().is_none());
+    }
+
+    /// `display_name` resolves a def's `LocKey` through the installed
+    /// loc table and falls back to the raw part id when none is.
+    #[test]
+    fn display_name_uses_loc_then_falls_back() {
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        assert_eq!(vab.display_name(&PartId::from("t.tank")), "t.tank");
+        // The mini defs all key their name on LocKey "n".
+        vab.set_loc(LocFile {
+            schema_version: 1,
+            strings: [("n".to_string(), "Test Tank".to_string())]
+                .into_iter()
+                .collect(),
+        });
+        assert_eq!(vab.display_name(&PartId::from("t.tank")), "Test Tank");
     }
 
     /// A bad op lands in `notice`, never panics — the panel's error path.

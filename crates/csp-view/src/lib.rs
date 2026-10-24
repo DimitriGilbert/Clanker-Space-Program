@@ -94,8 +94,11 @@ pub use csp_sim::save;
 /// without depending on `csp-sim` directly — §2.1's rule that `csp-view` is
 /// the only crate depending on BOTH `csp-sim` and `csp-render` stays true.
 /// `AdvanceReport`/`EventClass` ride along because `csp-app` reads the
-/// fired-event classes for §2.6.5 Clamping demotion.
-pub use csp_sim::{AdvanceReport, EventClass, SimCommand, SourceClass};
+/// fired-event classes for §2.6.5 Clamping demotion; `VesselState`
+/// because its input layer classifies the focused vessel's residence
+/// (bubble / surface-latched / rails) to name the reason a control verb
+/// cannot apply.
+pub use csp_sim::{AdvanceReport, EventClass, SimCommand, SourceClass, VesselState};
 // Re-exported so `csp-app` names mode requests without a csp-ui edge.
 pub use csp_ui::ModeSelect;
 /// M10: the settings model + panel (`csp_ui::settings`) — re-exported so
@@ -785,6 +788,12 @@ impl View {
         let parts = csp_data::load_parts_from(src, &root.join("parts"))?;
         let resources = csp_data::load_resources_from(src, &root.join("resources.ron"))?;
         view.install_vab_catalog(parts, resources);
+        // The catalog's display-name half: `PartDef::display_name` is a
+        // `LocKey`, so the English table is what lets the palette print
+        // "Sparc Launch Engine" instead of the raw part id — same
+        // data-derived-constant class as the catalog itself.
+        let loc = csp_data::load_loc_from(src, &root.join("loc").join("en.ron"))?;
+        view.with_vab_session(|v| v.set_loc(loc));
         // R2: the authored terrain table (noise seeds, ocean datums,
         // decoded biome palettes) — installed over the empty default.
         view.world

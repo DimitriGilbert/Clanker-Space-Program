@@ -92,6 +92,11 @@ pub struct VabInput {
     /// `false` until the first `vab_present` frames a nonempty craft —
     /// distance derives from the craft extent once.
     pub focused_once: bool,
+    /// The session's [`csp_ui::vab::VabSession::craft_epoch`] the
+    /// camera last framed — `New`/load bumps it and the one-shot
+    /// refit must run again (a stale `focused_once` would frame the
+    /// new craft at the old craft's distance).
+    pub craft_epoch: u64,
 }
 
 impl Default for VabInput {
@@ -104,6 +109,7 @@ impl Default for VabInput {
             pan_offset: DVec3::ZERO,
             viewport_px: (1280.0, 720.0),
             focused_once: false,
+            craft_epoch: u64::MAX, // nothing framed yet
         }
     }
 }
@@ -221,6 +227,14 @@ pub(crate) fn vab_present(
         return;
     }
     vab.0.recompute();
+    // A `New` or a loaded craft is a different object than the one
+    // the camera framed — re-arm the one-shot fit and drop the stale
+    // pan (it was measured around the old craft's center).
+    if vab.0.craft_epoch() != input.craft_epoch {
+        input.craft_epoch = vab.0.craft_epoch();
+        input.focused_once = false;
+        input.pan_offset = DVec3::ZERO;
+    }
     scene.parts.clear();
     let sel = vab.0.selected();
     // The cached analysis carries each node's `EffectivePart` — the
