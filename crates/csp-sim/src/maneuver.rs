@@ -138,16 +138,28 @@ pub struct ActiveBurn {
     pub dv_remaining_mps: f64,
 }
 
+/// The `r × v` degeneracy bound for [`burn_frame`], relative to
+/// `|r|·|v|`: `h/(r·v) = |sin θ|`, so the gate refuses trajectories
+/// this close to rectilinear. At the bound the normal's direction
+/// error — O(`eps·|r|·|v|/h`) — already exceeds the §2.8 element
+/// budget, so below it the orbit normal is a rounding artifact, not a
+/// direction.
+const BURN_FRAME_H_TOL: f64 = 1e-10;
+
 /// The node's orbital velocity frame at a state `(r, v)` —
 /// parent-centred inertial: `(prograde, normal, radial)` =
 /// `(v̂, (r × v)̂, r̂)`. `Recoverable` when the frame is degenerate —
-/// a singular state (`r = 0`, `v = 0`) or a radial trajectory
-/// (`r × v ≈ 0`), where "normal" and "prograde" have no honest reading.
+/// a singular state (`r = 0`, `v = 0`) or a near-radial trajectory
+/// (`|r × v| ≤ `[`BURN_FRAME_H_TOL`]`·|r|·|v|`), where "normal" and
+/// "prograde" have no honest reading.
 pub fn burn_frame(r: DVec3, v: DVec3) -> Result<(DVec3, DVec3, DVec3), csp_core::SimError> {
     let rn = r.norm();
     let vn = v.norm();
     let hn = r.cross(v).norm();
-    if !(rn.is_finite() && vn.is_finite() && hn.is_finite()) || rn <= 0.0 || vn <= 0.0 || hn <= 0.0
+    if !(rn.is_finite() && vn.is_finite() && hn.is_finite())
+        || rn <= 0.0
+        || vn <= 0.0
+        || hn <= BURN_FRAME_H_TOL * rn * vn
     {
         return Err(csp_core::SimError::Recoverable(
             "maneuver: degenerate orbital frame at node point",
@@ -293,13 +305,20 @@ mod tests {
     }
 
     /// Degenerate states refuse — a node at a singular point or on a
-    /// radial (zero-angular-momentum) trajectory has no frame.
+    /// radial (zero-angular-momentum) trajectory has no frame, and
+    /// neither does a NEAR-radial one: `|r × v|/(|r|·|v|)` below the
+    /// relative gate means the orbit normal is rounding noise.
     #[test]
     fn burn_frame_refuses_degenerate_states() {
         assert!(burn_frame(DVec3::ZERO, DVec3::X).is_err());
         assert!(burn_frame(DVec3::X, DVec3::ZERO).is_err());
         // Radial trajectory: r ∥ v ⇒ r × v = 0.
         assert!(burn_frame(DVec3::X * 1.0e6, DVec3::X * 500.0).is_err());
+        // Near-radial: h/(r·v) ≈ 8e-11 < BURN_FRAME_H_TOL — refuses
+        // rather than return a noise-defined normal.
+        assert!(burn_frame(DVec3::X * 1.0e6, DVec3::new(500.0, 4.0e-8, 0.0)).is_err());
+        // Just above the gate (h/(r·v) ≈ 1e-9) still resolves.
+        assert!(burn_frame(DVec3::X * 1.0e6, DVec3::new(500.0, 5.0e-7, 0.0)).is_ok());
     }
 
     /// `align_rotation` lands `from` exactly on `to`, including the

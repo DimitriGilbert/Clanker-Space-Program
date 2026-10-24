@@ -15008,6 +15008,7 @@ mod tests {
             &egress_rebased,
             SimTime::from_ticks(t_c),
             pred_horizon,
+            None,
         )
         .unwrap()
         .expect("the designed egress must land on duva's SOI");
@@ -15067,6 +15068,7 @@ mod tests {
             &plan.conic,
             SimTime::from_ticks(plan.departure_tick),
             pred_horizon,
+            None,
             Some(&terrin),
         )
         .unwrap()
@@ -15248,6 +15250,7 @@ mod tests {
             &post,
             post.epoch,
             SimTime::from_ticks(inj.t_c.saturating_add(hz * 86_400)),
+            None,
         )
         .unwrap()
         .expect("the achieved conic must still egress terrin's SOI");

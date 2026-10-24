@@ -538,7 +538,11 @@ pub fn lambert(
 /// `revs = 0` delegates to [`lambert`] and wraps the `Option` for a
 /// uniform call shape. Every candidate root passes the residual gate
 /// AND the lands check (propagation to `r2`) — a root that fails
-/// either is dropped, never returned as a wrong answer.
+/// either is dropped, never returned as a wrong answer. A `ψ` that
+/// survived the residual gate but fails velocity recovery is a
+/// solver defect, not a missing root: it propagates `Recoverable`
+/// exactly as [`lambert`] does, so an empty `Vec` always means
+/// "this branch had no roots", never a swallowed failure.
 pub fn lambert_multi(
     r1: DVec3,
     r2: DVec3,
@@ -559,9 +563,8 @@ pub fn lambert_multi(
     let g = lambert_geom(r1, r2, way)?;
     let mut out = Vec::new();
     for z in multi_rev_z(&g, mu, tof_s, revs) {
-        if let Ok(sol) = lambert_velocities(&g, mu, z, revs)
-            && lands_on(&g, mu, tof_s, sol.v1)
-        {
+        let sol = lambert_velocities(&g, mu, z, revs)?;
+        if lands_on(&g, mu, tof_s, sol.v1) {
             out.push(sol);
         }
     }
@@ -1107,10 +1110,17 @@ pub struct EncounterPrediction {
     /// scheduled `SoiEvent`).
     pub event: SoiEvent,
     /// The conic re-based into the new parent's frame at the event
-    /// tick — `Some` whenever [`PatchedConics::rebase`] can produce it
-    /// (an `Exit` past a parentless body has no frame and is `None`).
-    /// Feed it back into [`predict_encounter`] at `now = event.tick`
-    /// to chain multi-encounter predictions.
+    /// tick — `Some` whenever [`PatchedConics::rebase`] can produce it.
+    /// `None` on exactly two honest no-frame cases: an `Exit` past a
+    /// parentless body (the conic left the system entirely), and the
+    /// ≤1-tick wrong-side Brent artifact an unsuppressed chained query
+    /// can surface — a first-stride `Enter` of the conic's own parent,
+    /// or an `Exit` of a body that is not it, where the event stands
+    /// as a real lattice crossing but no frame exists to re-base into
+    /// (pass the consumed event back as `suppress` to drop the
+    /// detection outright rather than report it frameless). Feed
+    /// `rebased` back into [`predict_encounter`] at
+    /// `now = event.tick` to chain multi-encounter predictions.
     pub rebased: Option<OrbitState>,
     /// For `Enter` events: the approach geometry in the encountered
     /// body's frame. `None` for `Exit` (leaving a parent's SOI has no
@@ -1132,6 +1142,18 @@ pub struct EncounterPrediction {
 /// direction for multi-encounter chaining (grazes, moon-assist
 /// chains).
 ///
+/// `suppress` names a just-consumed `(body, direction)` crossing —
+/// the same knob the live sim's post-`SoiTransition` rescan installs
+/// ([`PatchedConics::next_soi_event_within`]). The reported tick may
+/// sit ≤1 tick on the *wrong* side of the refined crossing, so a
+/// `rebased` conic fed back at `now = event.tick` can re-detect the
+/// boundary it just crossed as a degenerate first-stride
+/// `Enter{own-parent}`/`Exit{non-parent}`: pass the consumed event
+/// verbatim — `Some((&pred.event.body, pred.event.direction))` — to
+/// drop that detection. Chaining without `suppress` surfaces the
+/// artifact as a prediction with `rebased: None` (never a wrong
+/// frame, but a dead end the chain cannot continue through).
+///
 /// `Err` propagates the model's own failures (unsolvable elements,
 /// scan budget exhaustion — the caller clamps the horizon and
 /// retries, exactly as the live scan prescribes).
@@ -1140,23 +1162,27 @@ pub fn predict_encounter(
     conic: &OrbitState,
     now: SimTime,
     horizon: SimTime,
+    suppress: Option<(&BodyId, SoiDirection)>,
 ) -> Result<Option<EncounterPrediction>, SimError> {
-    predict_encounter_excluding(model, conic, now, horizon, None)
+    predict_encounter_excluding(model, conic, now, horizon, suppress, None)
 }
 
-/// [`predict_encounter`] with one transfer-plan composition rule:
-/// `exclude` names a body whose SOI boundary is skipped **while the
-/// conic starts inside it at `now`**. [`plan_transfer`] stamps
-/// `plan.conic` at the origin body's center — inside the origin's own
-/// SOI — so an unfiltered scan reports the egress (`Exit{origin}`),
-/// which was never a residence in the origin's frame and has no
-/// approach geometry. Pass `plan.origin` to read through to the real
-/// encounter — e.g. `Enter{destination}`.
+/// [`predict_encounter`] with the transfer-plan composition rules,
+/// in the scan's own argument order: `suppress` is the post-rebase
+/// first-stride filter documented there, and `exclude` names a body
+/// whose SOI boundary is skipped **while the conic starts inside it
+/// at `now`**. [`plan_transfer`] stamps `plan.conic` at the origin
+/// body's center — inside the origin's own SOI — so an unfiltered
+/// scan reports the egress (`Exit{origin}`), which was never a
+/// residence in the origin's frame and has no approach geometry.
+/// Pass `plan.origin` to read through to the real encounter —
+/// e.g. `Enter{destination}`.
 pub fn predict_encounter_excluding(
     model: &PatchedConics,
     conic: &OrbitState,
     now: SimTime,
     horizon: SimTime,
+    suppress: Option<(&BodyId, SoiDirection)>,
     exclude: Option<&BodyId>,
 ) -> Result<Option<EncounterPrediction>, SimError> {
     let Some(event) = model
@@ -1165,7 +1191,7 @@ pub fn predict_encounter_excluding(
             now,
             horizon,
             crate::orbit::SOI_SCAN_MAX_SAMPLES,
-            None,
+            suppress.map(|(b, d)| (b.clone(), d)),
             exclude,
         )?
         .0
@@ -1173,20 +1199,36 @@ pub fn predict_encounter_excluding(
         return Ok(None);
     };
     let t = SimTime::from_ticks(event.tick);
-    // The only rebased=None case is an Exit past a parentless body —
-    // it has no frame to re-base into. Every other failure (including
-    // Fatal) propagates rather than degrading the prediction silently.
-    let rebased = match model.rebase(conic, &event.body, event.direction, t) {
-        Ok(s) => Some(s),
-        Err(e) => {
-            let parentless_exit = event.direction == SoiDirection::Exit
-                && model
-                    .body_orbit(&event.body)
-                    .is_ok_and(|b| b.parent.is_none());
-            if parentless_exit {
-                None
-            } else {
-                return Err(e);
+    // Honest no-frame cases — `rebased: None`, never a wrong frame:
+    // - The ≤1-tick wrong-side artifact an unsuppressed chained query
+    //   surfaces: the conic's own parent can never be *entered* (the
+    //   vessel already resides there), and a non-parent's SOI can
+    //   never be *exited*. The detection is a real lattice crossing
+    //   but degenerate for `rebase` — classified structurally, BEFORE
+    //   the call, so a genuine `state_at`/elements failure still
+    //   propagates rather than reading as the artifact.
+    // - An `Exit` past a parentless body: left the system entirely.
+    // Every other failure (including Fatal) propagates rather than
+    // degrading the prediction silently.
+    let artifact = match event.direction {
+        SoiDirection::Enter => event.body == conic.parent,
+        SoiDirection::Exit => event.body != conic.parent,
+    };
+    let rebased = if artifact {
+        None
+    } else {
+        match model.rebase(conic, &event.body, event.direction, t) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                let parentless_exit = event.direction == SoiDirection::Exit
+                    && model
+                        .body_orbit(&event.body)
+                        .is_ok_and(|b| b.parent.is_none());
+                if parentless_exit {
+                    None
+                } else {
+                    return Err(e);
+                }
             }
         }
     };
@@ -1242,6 +1284,13 @@ pub struct DepartureNode {
     /// The tick the burn executes — the vessel's last passage through
     /// the ejection longitude at-or-before the plan's departure tick
     /// (the "node at window" convention; see [`departure_node`]).
+    /// Guaranteed strictly ahead of the `now` the query was given —
+    /// `SimCommand::SetManeuver` clamps an at-or-past tick to
+    /// `clock + 1` and re-resolves the stored components at the
+    /// CLAMPED tick, which would burn the designed vector at the wrong
+    /// orbital longitude; the query refuses rather than produce that
+    /// node. Re-check `tick > clock` if wall time passed between the
+    /// query and the command.
     pub tick: u64,
     /// Δv components — `SimCommand::SetManeuver`'s fields verbatim.
     pub dv_prograde_mps: f64,
@@ -1287,16 +1336,25 @@ pub struct DepartureNode {
 /// measure the missed approach, and re-plan around the remainder
 /// until the encounter closes.
 ///
+/// `now` is the clock the resulting node will be scheduled against.
+/// The burn can sit up to one parking period before `departure_tick`,
+/// so a plan queried late can design a node in the past — and
+/// `SetManeuver` clamps an at-or-past tick to `clock + 1`, then
+/// resolves the components at the CLAMPED longitude: same |Δv|, wrong
+/// inertial direction. The query refuses `tick ≤ now` instead of
+/// handing back that trap.
+///
 /// `Recoverable` when the geometry can't produce the asymptote: an
 /// open parking orbit, a `v∞` pointing nearly along the parking
 /// normal (the cone never reaches the plane — the honest answer is a
 /// split plane change, which is the AI job's to decompose), a burn
 /// longitude the iteration fails to converge, or a burn tick that
-/// lands at-or-before epoch 0.
+/// lands at-or-before epoch 0 or `now`.
 pub fn departure_node(
     model: &PatchedConics,
     vessel_orbit: &OrbitState,
     plan: &TransferPlan,
+    now: SimTime,
 ) -> Result<DepartureNode, SimError> {
     if vessel_orbit.parent != plan.origin {
         return Err(SimError::Recoverable(
@@ -1365,6 +1423,14 @@ pub fn departure_node(
         return Err(SimError::Recoverable("ejection: burn precedes epoch"));
     }
     let burn_tick = (burn_s * TICK_HZ as f64).round() as u64;
+    // The node must still be in the future when `SetManeuver` receives
+    // it: the command clamps an at-or-past tick to `clock + 1` and
+    // re-resolves the stored components at the CLAMPED tick — same
+    // |Δv|, wrong burn longitude. A burn at-or-behind `now` is a typed
+    // refusal, not a silently re-timed node.
+    if burn_tick <= now.ticks() {
+        return Err(SimError::Recoverable("ejection: burn precedes now"));
+    }
     let (r_bv, v_bv) = model.state_at(vessel_orbit, SimTime::from_ticks(burn_tick))?;
     let dv_world = v_post - v_bv;
     let (pro, nrm, rad) = burn_frame(r_bv, v_bv)?;
@@ -1490,6 +1556,7 @@ mod tests {
     const MU_SOLEN: f64 = 1.1723e18;
     const MU_TERRIN: f64 = 3.5316e12;
     const MU_DUVA: f64 = 3.0137e11;
+    const MU_RASK: f64 = 6.5138e10;
     const TERRIN_SOI: f64 = 8.4e7;
     const DUVA_SOI: f64 = 4.79e7;
     const TERRIN_A: f64 = 1.36e10;
@@ -1849,7 +1916,7 @@ mod tests {
         let conic = graze_conic(4.0e5, t_enc); // 400 km offset < 600 km radius
         let now = SimTime::from_ticks(((t_enc - 6.0e5).max(0.0) * TICK_HZ as f64) as u64);
         let horizon = SimTime::from_ticks(((t_enc + 6.0e5) * TICK_HZ as f64) as u64);
-        let pred = predict_encounter(&model, &conic, now, horizon)
+        let pred = predict_encounter(&model, &conic, now, horizon, None)
             .unwrap()
             .expect("a transit this direct must encounter");
         assert_eq!(pred.event.direction, SoiDirection::Enter);
@@ -1878,16 +1945,20 @@ mod tests {
         let conic = graze_conic(6.0e7, t_enc);
         let now = SimTime::from_ticks(((t_enc - 6.0e5).max(0.0) * TICK_HZ as f64) as u64);
         let horizon = SimTime::from_ticks(((t_enc + 6.0e5) * TICK_HZ as f64) as u64);
-        let first = predict_encounter(&model, &conic, now, horizon)
+        let first = predict_encounter(&model, &conic, now, horizon, None)
             .unwrap()
             .expect("designed graze must encounter");
         assert_eq!(first.event.direction, SoiDirection::Enter);
         let rebased = first.rebased.unwrap();
+        // The documented chaining recipe: the just-consumed crossing is
+        // passed back as `suppress` so the ≤1-tick wrong-side Brent
+        // artifact cannot re-report the boundary the conic just crossed.
         let second = predict_encounter(
             &model,
             &rebased,
             SimTime::from_ticks(first.event.tick),
             horizon,
+            Some((&first.event.body, first.event.direction)),
         )
         .unwrap();
         // The residence ends inside the horizon → the Exit reports.
@@ -1915,6 +1986,7 @@ mod tests {
             &plan.conic,
             SimTime::from_ticks(plan.departure_tick),
             horizon,
+            None,
             Some(&plan.origin),
         )
         .unwrap()
@@ -1960,6 +2032,88 @@ mod tests {
         assert!(ap.v_inf_mps.unwrap() > 0.0);
     }
 
+    /// The verified-report-05 F1 fixture through the PUBLIC query: a
+    /// conic parented to `rask` but parked just OUTSIDE its SOI (the
+    /// marginal position an early Brent landing leaves) on an inbound
+    /// leg. Without `suppress` the first-stride `Enter{rask}` is the
+    /// wrong-side artifact — reported frameless (`rebased: None`),
+    /// never the `Recoverable` the raw `rebase` raises on it. With the
+    /// just-fired `(body, direction)` passed back — the same knob the
+    /// sim's post-transition rescan installs — the artifact detection
+    /// is dropped and only real geometry reports.
+    #[test]
+    fn chained_prediction_suppresses_the_wrong_side_artifact() {
+        let mut bodies = BTreeMap::new();
+        bodies.insert(
+            BodyId::from("solen"),
+            BodyOrbit {
+                mu_m3_per_s2: MU_SOLEN,
+                soi_m: None,
+                parent: None,
+                elements: None,
+            },
+        );
+        bodies.insert(
+            BodyId::from("terrin"),
+            BodyOrbit {
+                mu_m3_per_s2: MU_TERRIN,
+                soi_m: Some(TERRIN_SOI),
+                parent: Some(BodyId::from("solen")),
+                elements: Some(circular_elements(TERRIN_A, 0.0)),
+            },
+        );
+        bodies.insert(
+            BodyId::from("rask"),
+            BodyOrbit {
+                mu_m3_per_s2: MU_RASK,
+                soi_m: Some(2.43e6),
+                parent: Some(BodyId::from("terrin")),
+                elements: Some(circular_elements(1.2e7, 0.0)),
+            },
+        );
+        let model = PatchedConics::new(bodies);
+        let r0 = DVec3::new(2.44e6, 0.0, 0.0); // just above rask's r_soi 2.43e6
+        let v0 = DVec3::new(-80.0, 150.0, 0.0); // inbound, sub-circular
+        let el = cartesian_to_elements(r0, v0, MU_RASK).unwrap();
+        let conic = OrbitState {
+            parent: BodyId::from("rask"),
+            elements: el,
+            epoch: SimTime::from_ticks(0),
+        };
+        let horizon = SimTime::from_ticks(4_000_000);
+        // Unsuppressed: the artifact reports with no frame — a typed
+        // dead end, never the rebase's `Recoverable`.
+        let unsup = predict_encounter(&model, &conic, SimTime::ZERO, horizon, None)
+            .unwrap()
+            .expect("an inbound conic must cross inward");
+        assert_eq!(unsup.event.body, BodyId::from("rask"));
+        assert_eq!(unsup.event.direction, SoiDirection::Enter);
+        assert!(
+            unsup.rebased.is_none(),
+            "the own-parent Enter artifact has no frame to re-base into"
+        );
+        // The chaining recipe: the just-fired (body, direction) drops
+        // exactly that first-stride detection.
+        let sup = predict_encounter(
+            &model,
+            &conic,
+            SimTime::ZERO,
+            horizon,
+            Some((&unsup.event.body, unsup.event.direction)),
+        )
+        .unwrap();
+        match sup {
+            None => {}
+            Some(next) => {
+                assert!(
+                    !(next.event.direction == SoiDirection::Enter
+                        && next.event.tick == unsup.event.tick),
+                    "the suppressed artifact must not re-report: {next:?}"
+                );
+            }
+        }
+    }
+
     /// A conic that never crosses any SOI boundary reports `None`.
     #[test]
     fn encounter_prediction_reports_none_for_a_quiet_orbit() {
@@ -1971,7 +2125,7 @@ mod tests {
         };
         let horizon = SimTime::from_ticks((4.0e6 * TICK_HZ as f64) as u64);
         assert!(
-            predict_encounter(&model, &conic, SimTime::from_ticks(0), horizon)
+            predict_encounter(&model, &conic, SimTime::from_ticks(0), horizon, None)
                 .unwrap()
                 .is_none()
         );
@@ -2000,7 +2154,7 @@ mod tests {
             elements: circular_elements(TERRIN_R + 75e3, 0.0),
             epoch: SimTime::from_ticks(0),
         };
-        let node = departure_node(&model, &vessel, &plan).unwrap();
+        let node = departure_node(&model, &vessel, &plan, SimTime::ZERO).unwrap();
         // The node is finite and sits at-or-before the window.
         assert!(node.tick <= plan.departure_tick);
         assert!(node.dv_prograde_mps.is_finite());
@@ -2055,7 +2209,7 @@ mod tests {
             elements: circular_elements(park_r, 0.0),
             epoch: SimTime::from_ticks(0),
         };
-        let node = departure_node(&model, &vessel, &plan).unwrap();
+        let node = departure_node(&model, &vessel, &plan, SimTime::ZERO).unwrap();
         let bound = plan.leg.dv_depart_mps;
         let actual = node.dv_world.norm();
         assert!(
@@ -2087,7 +2241,7 @@ mod tests {
             elements: circular_elements(1.5e10, 0.0),
             epoch: SimTime::from_ticks(0),
         };
-        assert!(departure_node(&model, &helio, &plan).is_err());
+        assert!(departure_node(&model, &helio, &plan, SimTime::ZERO).is_err());
         // Open parking orbit.
         let mut hyper = circular_elements(1e6, 0.0);
         hyper.eccentricity = 1.5;
@@ -2097,6 +2251,34 @@ mod tests {
             elements: hyper,
             epoch: SimTime::from_ticks(0),
         };
-        assert!(departure_node(&model, &open, &plan).is_err());
+        assert!(departure_node(&model, &open, &plan, SimTime::ZERO).is_err());
+    }
+
+    /// The burn sits up to one parking period BEFORE `departure_tick`,
+    /// so a plan queried late produces a node in the past — which
+    /// `SetManeuver` would silently clamp to `clock + 1` and fire at
+    /// the wrong orbital longitude. `now` bounds the node: a burn at
+    /// or behind it is a typed refusal.
+    #[test]
+    fn departure_node_refuses_a_past_burn() {
+        let model = home_system();
+        let q = duva_query(12);
+        let plan = plan_transfer(&model, &q).unwrap();
+        let vessel = OrbitState {
+            parent: BodyId::from("terrin"),
+            elements: circular_elements(TERRIN_R + 75e3, 0.0),
+            epoch: SimTime::from_ticks(0),
+        };
+        // `now` at the departure window itself: the "last passage
+        // at-or-before" burn tick can never sit strictly ahead of it.
+        let late = SimTime::from_ticks(plan.departure_tick);
+        assert!(matches!(
+            departure_node(&model, &vessel, &plan, late),
+            Err(SimError::Recoverable(_))
+        ));
+        // The same query against clock 0 succeeds — and its node is
+        // strictly ahead of the `now` it was scheduled against.
+        let node = departure_node(&model, &vessel, &plan, SimTime::ZERO).unwrap();
+        assert!(node.tick > 0);
     }
 }

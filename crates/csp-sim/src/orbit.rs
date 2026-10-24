@@ -64,7 +64,10 @@
 //! ticks (min 1), brackets sign changes, and Brent-refines each bracket on
 //! the real-tick axis to `≤ 1 tick` (cap 64) — the reported event tick may
 //! sit on *either* side of the crossing inside that bound; the claim is
-//! distance, not direction. The honest guarantee:
+//! distance, not direction. The bound is exact up to the refinement's
+//! machine slack: the exit tolerance is `1 + 4·eps·|b|` raw ticks, under
+//! a tick until ~4e14 ticks (≈ 200k sim-years at 64 Hz), so "≤ 1 tick"
+//! holds at any reachable sim time. The honest guarantee:
 //! **a residence shorter than `h` may be missed** — `h` is exposed per
 //! candidate via [`PatchedConics::scan_strides`] for the debug overlay,
 //! computed by the *same* candidate-enumeration and stride helpers the
@@ -160,15 +163,18 @@ pub struct BodyOrbit {
 /// A scheduled sphere-of-influence transition (§2.6.6). `tick` is a whole
 /// sim tick within 1 tick of the refined crossing — on either side of it;
 /// the §2.6.6 "≤ 1 tick" claim is a *distance* bound, not a side claim.
-/// Events are always in `(now, horizon]` when returned by
-/// [`OrbitModel::next_soi_event`].
+/// (The bound carries the Brent exit tolerance's machine slack,
+/// `4·eps·|tick|` — under a tick until ~4e14 ticks, so the claim holds at
+/// any reachable sim time.) Events are always in `(now, horizon]` when
+/// returned by [`OrbitModel::next_soi_event`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SoiEvent {
     /// The body whose SOI is crossed.
     pub body: BodyId,
     /// `Enter` = vessel enters `body`'s SOI; `Exit` = vessel leaves it.
     pub direction: SoiDirection,
-    /// Whole tick within 1 tick of the crossing (either side of it).
+    /// Whole tick within 1 tick of the crossing (either side of it,
+    /// plus the `4·eps·|tick|` machine slack — see the struct doc).
     pub tick: u64,
 }
 
@@ -220,6 +226,35 @@ struct SoiCandidate {
     body: BodyId,
     r_soi: f64,
     is_parent: bool,
+}
+
+/// One [`SoiCandidate`] from a body's `soi_m`: `None` admits no boundary
+/// (the star's infinite SOI). A present-but-degenerate radius is
+/// `Recoverable`, not a silent drop — a NaN `r_soi` would degenerate
+/// `signed_distance` to all-NaN (every sign comparison false: "no
+/// crossing" on short horizons, the full [`SOI_SCAN_MAX_SAMPLES`]
+/// budget burned on long ones) and a non-positive radius is equally
+/// meaningless geometry — the same loud-NaN rule the
+/// `nan_angle_orbit_state_fails_next_soi_event` test pins for
+/// orientation angles. The validated `body.ron` path already rejects
+/// non-finite `soi_m`; this guards hand-built models and bypassed
+/// validation.
+fn soi_candidate(
+    body: &BodyId,
+    soi_m: Option<f64>,
+    is_parent: bool,
+) -> Result<Option<SoiCandidate>, SimError> {
+    let Some(r_soi) = soi_m else {
+        return Ok(None);
+    };
+    if !(r_soi.is_finite() && r_soi > 0.0) {
+        return Err(SimError::Recoverable("soi scan: degenerate soi radius"));
+    }
+    Ok(Some(SoiCandidate {
+        body: body.clone(),
+        r_soi,
+        is_parent,
+    }))
 }
 
 /// The §2.8 orbit-model trait — the seam the post-v1 `NBody` model also
@@ -652,6 +687,10 @@ pub fn elements_to_cartesian(
 /// falls out of `e` alone and the expression never divides by a near-zero
 /// energy. Degenerate-angle conventions are in the module docs; a radial
 /// trajectory (`h = 0`) has no plane to hang angles on → `Recoverable`.
+/// A NEAR-radial state (`h` tiny but nonzero) is not refused: the gate
+/// tests exact zero, so it yields degenerate-but-finite elements whose
+/// orientation angles are rounding-dominated — the caller-side gate for
+/// that domain is `crate::maneuver::burn_frame`'s relative `h` bound.
 pub fn cartesian_to_elements(
     r_vec: DVec3,
     v_vec: DVec3,
@@ -1015,7 +1054,9 @@ impl OrbitModel for PatchedConics {
     ///    [`Self::scan_strides`] reports the `h` values for the overlay.
     /// 5. The reported tick is a whole tick within 1 tick of the refined
     ///    crossing — on *either* side of it — always inside
-    ///    `(now, horizon]`.
+    ///    `(now, horizon]`. The 1-tick bound carries the Brent exit
+    ///    tolerance's `4·eps·|tick|` machine slack (under a tick until
+    ///    ~4e14 ticks; see [`Self::brent_root`]).
     fn next_soi_event(
         &self,
         s: &OrbitState,
@@ -1072,7 +1113,7 @@ impl PatchedConics {
     /// `Ok(None)` = no SOI candidates exist (the vessel can never cross —
     /// the caller schedules nothing).
     pub(crate) fn scan_horizon(&self, s: &OrbitState) -> Result<Option<u64>, SimError> {
-        let cands = self.soi_candidates(s);
+        let cands = self.soi_candidates(s)?;
         if cands.is_empty() {
             return Ok(None);
         }
@@ -1118,9 +1159,10 @@ impl PatchedConics {
     /// publish's cost.
     ///
     /// `suppress` names a just-applied §2.6.6 re-base `(body, direction)`:
-    /// the reported tick may sit ≤1 tick on the *wrong* side of the true
-    /// crossing (the Brent bound is a distance claim, not a side claim —
-    /// module docs), so a vessel rebased just outside `body`'s SOI would
+    /// the reported tick may sit ≤1 tick (+ machine slack) on the *wrong*
+    /// side of the true crossing (the Brent bound is a distance claim,
+    /// not a side claim — module docs), so a vessel rebased just outside
+    /// `body`'s SOI would
     /// otherwise re-detect the same boundary as a degenerate
     /// `Enter{own-parent}`/`Exit{non-parent}` one stride later. A
     /// first-stride detection on `body`'s boundary in `direction` is a
@@ -1150,7 +1192,7 @@ impl PatchedConics {
         let mut best: Option<SoiEvent> = None;
         // Candidate set: the parent's own boundary (exit/re-entry) and
         // every child's (entry/exit). Nested SOIs make this complete.
-        for cand in self.soi_candidates(s) {
+        for cand in self.soi_candidates(s)? {
             // The conic was stamped inside `exclude`'s SOI: it never
             // resided in that frame, so the egress is not an encounter.
             if exclude.is_some_and(|b| *b == cand.body)
@@ -1187,27 +1229,21 @@ impl PatchedConics {
     /// an SOI is a candidate *whether or not it has elements* — the
     /// `v_rel_max` step is where a missing-elements child fails, and it
     /// fails identically in both callers.
-    fn soi_candidates(&self, s: &OrbitState) -> Vec<SoiCandidate> {
+    fn soi_candidates(&self, s: &OrbitState) -> Result<Vec<SoiCandidate>, SimError> {
         let mut out = Vec::new();
-        if let Some(r_soi) = self.bodies.get(&s.parent).and_then(|b| b.soi_m) {
-            out.push(SoiCandidate {
-                body: s.parent.clone(),
-                r_soi,
-                is_parent: true,
-            });
+        if let Some(b) = self.bodies.get(&s.parent)
+            && let Some(cand) = soi_candidate(&s.parent, b.soi_m, true)?
+        {
+            out.push(cand);
         }
         for (id, b) in &self.bodies {
             if b.parent.as_ref() == Some(&s.parent)
-                && let Some(r_soi) = b.soi_m
+                && let Some(cand) = soi_candidate(id, b.soi_m, false)?
             {
-                out.push(SoiCandidate {
-                    body: id.clone(),
-                    r_soi,
-                    is_parent: false,
-                });
+                out.push(cand);
             }
         }
-        out
+        Ok(out)
     }
 
     /// `v_rel_max` for one candidate: the vessel's speed bound for the
@@ -1247,7 +1283,7 @@ impl PatchedConics {
         let parent_mu = self.body(&s.parent)?.mu_m3_per_s2;
         let vessel_bound = speed_bound(&s.elements, parent_mu)?;
         let mut out = Vec::new();
-        for cand in self.soi_candidates(s) {
+        for cand in self.soi_candidates(s)? {
             let v_rel_max = self.candidate_v_rel_max(&cand, vessel_bound, parent_mu)?;
             out.push(SoiScan {
                 body: cand.body,
@@ -1361,7 +1397,14 @@ impl PatchedConics {
     /// current estimate, `c` the contrapoint bracketing it; returns a
     /// whole tick within the `≤ 1 tick` bound of the crossing — on
     /// *either* side of it (the guarantee is a distance bound, not a
-    /// direction claim).
+    /// direction claim). Honest bound: the exit test is
+    /// `|c − b|/2 ≤ tol1` with `tol1 = 2·eps·|b| + 0.5`, so the final
+    /// bracket width — and the |tick − crossing| bound — is
+    /// `1 + 4·eps·|b|` raw ticks. The machine term is the stall guard
+    /// that keeps the ±tol1 step representable for `|b|` past 2⁵³; it
+    /// stays under a tick until ~4e14 ticks (≈ 200k sim-years at 64
+    /// Hz), so the documented `≤ 1 tick` claim holds at any reachable
+    /// sim time.
     fn brent_root(
         &self,
         s: &OrbitState,
@@ -1447,8 +1490,9 @@ impl PatchedConics {
             }
         }
         // b is the refined crossing on the tick axis; ceil keeps the
-        // event tick integral — within the ≤1-tick bound of the crossing,
-        // on whichever side b converged to (no side is claimed).
+        // event tick integral — within the `1 + 4·eps·|b|` bound of the
+        // crossing, on whichever side b converged to (no side is
+        // claimed).
         Ok(b.ceil() as u64)
     }
 }
@@ -2289,6 +2333,66 @@ mod tests {
                 "NaN angle field {field} must error, never scan silently"
             );
         }
+    }
+
+    /// A NaN `soi_m` must surface as `Err` on every path that
+    /// enumerates candidates — otherwise `signed_distance` degenerates
+    /// to all-NaN (every sign comparison false) and the scan reports a
+    /// silent `Ok(None)` or burns the whole sample budget at a 1-tick
+    /// stride. Same loud-NaN contract as the orientation angles above.
+    #[test]
+    fn nan_soi_radius_fails_next_soi_event() {
+        // Child-side: `p` carries a NaN SOI and the conic is
+        // sol-parented — `p` is a child candidate.
+        let mut bodies = BTreeMap::new();
+        bodies.insert(
+            BodyId::from("sol"),
+            BodyOrbit {
+                mu_m3_per_s2: MU_SOLEN,
+                soi_m: None,
+                parent: None,
+                elements: None,
+            },
+        );
+        bodies.insert(
+            BodyId::from("p"),
+            BodyOrbit {
+                mu_m3_per_s2: MU_TERRIN,
+                soi_m: Some(f64::NAN),
+                parent: Some(BodyId::from("sol")),
+                elements: Some(circular_elements(TERRIN_A, 0.0)),
+            },
+        );
+        let model = PatchedConics::new(bodies);
+        let s = OrbitState {
+            parent: BodyId::from("sol"),
+            elements: circular_elements(TERRIN_A * 1.5, 0.0),
+            epoch: SimTime::from_ticks(0),
+        };
+        let horizon = SimTime::from_ticks(1_000_000);
+        assert!(matches!(
+            model.next_soi_event(&s, SimTime::from_ticks(0), horizon),
+            Err(SimError::Recoverable(_))
+        ));
+        assert!(matches!(
+            model.scan_strides(&s),
+            Err(SimError::Recoverable(_))
+        ));
+        assert!(matches!(
+            model.scan_horizon(&s),
+            Err(SimError::Recoverable(_))
+        ));
+        // Parent-side: a conic parented to `p` scans `p`'s own NaN
+        // boundary first — same refusal.
+        let s = OrbitState {
+            parent: BodyId::from("p"),
+            elements: circular_elements(7.0e5, 0.0),
+            epoch: SimTime::from_ticks(0),
+        };
+        assert!(matches!(
+            model.next_soi_event(&s, SimTime::from_ticks(0), horizon),
+            Err(SimError::Recoverable(_))
+        ));
     }
 
     /// §2.6.5 back-pressure on the §2.6.6 coarse scan: a grid needing
