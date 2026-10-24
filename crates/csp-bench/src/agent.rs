@@ -16,9 +16,9 @@
 //! - [`AgentReply::Act`] — commands enqueued at this boundary;
 //! - [`AgentReply::Wait`] — "still thinking": the plan's tick-count
 //!   timeout, a no-op by definition (the boundary proceeds without the
-//!   agent). `tick_timeout` consecutive waits drops the agent — its
-//!   replies are ignored from then on and the transcript records the
-//!   drop;
+//!   agent). `tick_timeout: Some(n)` drops the agent on the *n*-th
+//!   consecutive `Wait` — its replies are ignored from then on and the
+//!   transcript records the drop;
 //! - [`AgentReply::Done`] — the agent withdraws; the run ends when
 //!   *every* registered agent is done (or dropped).
 //!
@@ -36,7 +36,7 @@
 
 use csp_core::{SimError, TICK_HZ};
 use csp_server::telemetry::TelemetrySnapshot;
-use csp_sim::{AdvanceReport, SimCommand, SourceClass, World};
+use csp_sim::{AdvanceReport, RejectedCommand, SimCommand, SourceClass, World};
 
 /// What one agent returns for the current boundary — see the module
 /// doc for the §2.12.1 semantics of each variant.
@@ -82,9 +82,11 @@ struct Slot {
     name: String,
     /// The §2.12.3 client index (registration order).
     client: u32,
-    /// Max consecutive `Wait`s before the agent is dropped; `None`
+    /// Consecutive `Wait` count at which the agent is dropped; `None`
     /// = never drops (the schedule/script sources never wait anyway —
-    /// the cap exists for genuinely-async drivers).
+    /// the cap exists for genuinely-async drivers). `Some(n)` drops on
+    /// the n-th consecutive `Wait` — that boundary's transcript kind is
+    /// `timeout`, not `wait`.
     tick_timeout: Option<u64>,
     agent: Box<dyn Agent>,
     /// Consecutive `Wait` streak — reset by `Act`/`Done`.
@@ -103,10 +105,17 @@ pub struct TranscriptEntry {
     /// The agent's registration name.
     pub agent: String,
     /// What the agent returned: `act`, `wait`, `timeout` (the drop
-    /// boundary), or `done`.
+    /// boundary), `done`, `fail`, or `rejected` (the drain-level entry
+    /// carrying rejections no live agent entry owns).
     pub kind: &'static str,
     /// The agent's commands on an `act` entry — empty otherwise.
     pub commands: Vec<SimCommand>,
+    /// This boundary's drain rejections attributed to the agent —
+    /// `"Class:id dequeue#n: error"` lines per §2.2.1's
+    /// "rejected on the originating channel". A rejected command left
+    /// no state and no log entry; the transcript is the only place its
+    /// refusal is recorded, so it is never silently dropped.
+    pub rejected: Vec<String>,
 }
 
 /// The loop's end state for one [`Lockstep::run`] — reported into the
@@ -148,6 +157,10 @@ pub struct Lockstep {
     /// `AgentReply::Fail` messages collected this run — surfaced in
     /// the eval report.
     agent_faults: Vec<String>,
+    /// Every drain rejection across the run as `"Class:id dequeue#n:
+    /// error"` lines — the flat list the eval report carries (the
+    /// transcript attributes each to its agent's entry).
+    rejected_commands: Vec<String>,
 }
 
 impl Lockstep {
@@ -162,13 +175,14 @@ impl Lockstep {
             applied: 0,
             dv_used_mps: 0.0,
             agent_faults: Vec::new(),
+            rejected_commands: Vec::new(),
         }
     }
 
     /// Register `agent` under `name`; returns the client index it was
     /// bound with (registration order — the `ClientRegistry` rule).
-    /// `tick_timeout: Some(n)` drops the agent after `n` consecutive
-    /// `Wait`s; `None` never drops.
+    /// `tick_timeout: Some(n)` drops the agent on the `n`-th
+    /// consecutive `Wait`; `None` never drops.
     pub fn add_agent(
         &mut self,
         name: impl Into<String>,
@@ -211,6 +225,15 @@ impl Lockstep {
         self.agent_faults.clone()
     }
 
+    /// Every drain rejection across the run — `"Class:id dequeue#n:
+    /// error"` lines in drain order, the eval report's
+    /// `rejected_commands` field. §2.2.1's rejections are *refusals*,
+    /// not faults: a rejected command applied nothing, so these ride
+    /// the report rather than failing the run.
+    pub fn rejected_commands(&self) -> &[String] {
+        &self.rejected_commands
+    }
+
     /// The score's commanded-Δv integral (m/s) — see the field doc.
     pub fn dv_used_mps(&self) -> f64 {
         self.dv_used_mps
@@ -235,15 +258,27 @@ impl Lockstep {
 
     /// One lockstep boundary: snapshot → poll every live agent →
     /// enqueue → `step_frame` → score/apply bookkeeping. Returns the
-    /// drain report (rejections ride it, §2.2.1).
+    /// boundary's merged drain report (rejections ride it, §2.2.1 —
+    /// they are also attributed onto the transcript and the run's
+    /// [`Self::rejected_commands`] list, never dropped).
     ///
     /// The plan's lockstep rule *is* the synchronous call order: the
-    /// world cannot advance between snapshot and drain because
-    /// `step_frame` is the last statement.
+    /// world cannot advance between snapshot and drain because the
+    /// agents have all returned before `step_frame` runs.
+    ///
+    /// §2.6.5's back-pressure can split the boundary's advance into
+    /// partial frames; the agents are NOT re-polled mid-advance (they
+    /// already answered for the boundary) — the report's
+    /// `effective_target` is re-issued until the frame lands, covering
+    /// a truncated `AdvanceTo`. A continuation frame that makes zero
+    /// progress is a sim/harness bug (`Fatal`), not a normal partial.
     pub fn step(&mut self) -> Result<AdvanceReport, SimError> {
         let tick = self.world.clock().ticks().saturating_add(1);
         let snap = TelemetrySnapshot::from_world(&self.world);
         let mut pending: Vec<(u32, SimCommand)> = Vec::new();
+        // `(client, transcript index)` for this boundary's `act`
+        // entries — the drain's rejections attribute back onto them.
+        let mut act_entries: Vec<(u32, usize)> = Vec::new();
         for slot in &mut self.agents {
             if slot.retired {
                 continue;
@@ -259,16 +294,19 @@ impl Lockstep {
                         agent: slot.name.clone(),
                         kind: "act",
                         commands,
+                        rejected: Vec::new(),
                     });
+                    act_entries.push((slot.client, self.transcript.len() - 1));
                 }
                 AgentReply::Wait => {
                     slot.waits = slot.waits.saturating_add(1);
-                    let dropped = slot.tick_timeout.is_some_and(|t| slot.waits > t);
+                    let dropped = slot.tick_timeout.is_some_and(|t| slot.waits >= t);
                     self.transcript.push(TranscriptEntry {
                         tick,
                         agent: slot.name.clone(),
                         kind: if dropped { "timeout" } else { "wait" },
                         commands: Vec::new(),
+                        rejected: Vec::new(),
                     });
                     if dropped {
                         slot.retired = true;
@@ -281,6 +319,7 @@ impl Lockstep {
                         agent: slot.name.clone(),
                         kind: "done",
                         commands: Vec::new(),
+                        rejected: Vec::new(),
                     });
                 }
                 AgentReply::Fail(message) => {
@@ -291,6 +330,7 @@ impl Lockstep {
                         agent: slot.name.clone(),
                         kind: "fail",
                         commands: Vec::new(),
+                        rejected: Vec::new(),
                     });
                 }
             }
@@ -298,10 +338,74 @@ impl Lockstep {
         for (client, command) in pending {
             self.world.enqueue(SourceClass::External, client, command);
         }
-        let report = self.world.step_frame(tick)?;
+        let mut report = self.world.step_frame(tick)?;
+        while report.partial {
+            let before = report.reached_tick;
+            let next = self.world.step_frame(report.effective_target)?;
+            // A partial is back-pressure, never a stall: it advanced
+            // the clock, fired events, or applied/drained commands.
+            // Zero activity on a continuation frame is a bug.
+            let stalled = next.reached_tick <= before
+                && next.events_processed == 0
+                && next.commands_applied == 0
+                && next.rejected.is_empty()
+                && next.degraded.is_empty();
+            merge_report(&mut report, next);
+            if stalled {
+                return Err(SimError::Fatal(
+                    "lockstep: a partial advance made zero progress",
+                ));
+            }
+        }
         self.applied = self.applied.saturating_add(report.commands_applied);
         self.accumulate_dv(tick - 1, report.reached_tick);
+        self.record_rejections(tick, &act_entries, &report.rejected);
         Ok(report)
+    }
+
+    /// Attribute the boundary's drain rejections (§2.2.1's "rejected
+    /// on the originating channel") onto the transcript: an
+    /// `External`-class rejection lands on the acting agent's `act`
+    /// entry; one from any other class (a script's verb, an
+    /// autopilot's command — the lockstep's agents only ever stamp
+    /// `External`) collects onto a drain-level `rejected` entry so the
+    /// refusal is recorded rather than laundered. Every line also
+    /// lands in [`Self::rejected_commands`].
+    fn record_rejections(
+        &mut self,
+        tick: u64,
+        act_entries: &[(u32, usize)],
+        rejected: &[RejectedCommand],
+    ) {
+        let mut stray: Vec<String> = Vec::new();
+        for r in rejected {
+            let line = format!(
+                "{:?}:{} dequeue#{}: {}",
+                r.key.source_class, r.key.source_id, r.dequeue_index, r.error
+            );
+            self.rejected_commands.push(line.clone());
+            let entry = if r.key.source_class == SourceClass::External {
+                act_entries
+                    .iter()
+                    .find(|(client, _)| *client == r.key.source_id)
+                    .map(|(_, idx)| *idx)
+            } else {
+                None
+            };
+            match entry {
+                Some(idx) => self.transcript[idx].rejected.push(line),
+                None => stray.push(line),
+            }
+        }
+        if !stray.is_empty() {
+            self.transcript.push(TranscriptEntry {
+                tick,
+                agent: "<drain>".into(),
+                kind: "rejected",
+                commands: Vec::new(),
+                rejected: stray,
+            });
+        }
     }
 
     /// The score's Δv accumulator: `throttle · thrust/mass · Δt` per
@@ -332,6 +436,23 @@ impl Lockstep {
             self.dv_used_mps += throttle * (thrust_n / body.mass_kg) * dt_s;
         }
     }
+}
+
+/// Fold a §2.6.5 partial-continuation's report into `acc` — one
+/// boundary's view across however many `step_frame`s the budgets split
+/// it into: counts sum, the ordered channels concatenate in order, and
+/// the terminal `reached_tick`/`effective_target`/`partial` come from
+/// the last call.
+fn merge_report(acc: &mut AdvanceReport, next: AdvanceReport) {
+    acc.reached_tick = next.reached_tick;
+    acc.commands_applied += next.commands_applied;
+    acc.events_processed += next.events_processed;
+    acc.fired_events.extend(next.fired_events);
+    acc.rejected.extend(next.rejected);
+    acc.degraded.extend(next.degraded);
+    acc.partial = next.partial;
+    acc.effective_target = next.effective_target;
+    acc.script_log.extend(next.script_log);
 }
 
 #[cfg(test)]
@@ -372,6 +493,8 @@ mod tests {
         assert_eq!(key.source_id, 0);
     }
 
+    /// `tick_timeout: Some(n)` drops on the *n*-th consecutive `Wait`
+    /// — that boundary records `timeout`, not `wait`.
     #[test]
     fn wait_then_timeout_drops_the_agent() {
         let mut run = Lockstep::new(World::new());
@@ -380,16 +503,14 @@ mod tests {
             Some(2),
             scripted(vec![
                 AgentReply::Wait,
-                AgentReply::Wait,
-                AgentReply::Wait, // streak 3 > 2 → dropped here
+                AgentReply::Wait, // streak 2 = the timeout → dropped here
                 AgentReply::Act(vec![SimCommand::SetWarp(9)]),
             ]),
         );
         run.step().unwrap();
         run.step().unwrap();
-        run.step().unwrap();
         let kinds: Vec<&str> = run.transcript().iter().map(|e| e.kind).collect();
-        assert_eq!(kinds, ["wait", "wait", "timeout"]);
+        assert_eq!(kinds, ["wait", "timeout"]);
         // The dropped agent's later Act never landed — the rung stays
         // the fresh world's default (1×), never the dropped 9.
         run.step().unwrap();
@@ -420,6 +541,54 @@ mod tests {
         assert!(!run.all_done());
         run.step().unwrap();
         assert!(run.all_done());
+    }
+
+    /// §2.6.5 back-pressure inside the lockstep: an agent's
+    /// `AdvanceTo` past `MAX_TICKS_PER_FRAME` partials — `step`
+    /// re-issues the effective target until the frame lands instead
+    /// of dropping the tail, and the merged report reflects it.
+    #[test]
+    fn step_resumes_partial_advances() {
+        let mut run = Lockstep::new(World::new());
+        run.add_agent(
+            "hop",
+            None,
+            scripted(vec![AgentReply::Act(vec![SimCommand::AdvanceTo(
+                csp_sim::MAX_TICKS_PER_FRAME + 100,
+            )])]),
+        );
+        let report = run.step().unwrap();
+        assert!(!report.partial);
+        assert_eq!(
+            run.world().clock().ticks(),
+            csp_sim::MAX_TICKS_PER_FRAME + 100
+        );
+        // The boundary merged every partial's applied count.
+        assert_eq!(run.applied(), 1);
+    }
+
+    /// A rejected agent command lands on the `act` entry's `rejected`
+    /// list and the run-level feed — §2.2.1's refusal is recorded,
+    /// never silently dropped.
+    #[test]
+    fn rejected_commands_ride_the_transcript_and_report() {
+        let mut run = Lockstep::new(World::new());
+        run.add_agent(
+            "bad",
+            None,
+            scripted(vec![AgentReply::Act(vec![SimCommand::SetThrottle {
+                vessel: csp_sim::VesselId(99),
+                throttle: 0.5,
+            }])]),
+        );
+        run.step().unwrap();
+        assert_eq!(run.rejected_commands().len(), 1);
+        assert!(run.rejected_commands()[0].contains("External:0"));
+        let entry = &run.transcript()[0];
+        assert_eq!(entry.kind, "act");
+        assert_eq!(entry.rejected.len(), 1);
+        // A rejected command left no log entry.
+        assert!(run.world().command_log().is_empty());
     }
 
     #[test]

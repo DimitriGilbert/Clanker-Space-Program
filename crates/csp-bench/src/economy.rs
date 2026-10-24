@@ -22,7 +22,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use csp_core::SimError;
+use csp_core::{SimError, TICK_HZ};
 use csp_sim::{EventKind, SimCommand, World, economy};
 
 /// The report a [`staffed_base_run`] produces — the harness's
@@ -60,7 +60,6 @@ pub struct EconomyProbe {
     pub years: u64,
 }
 
-const TICKS_PER_SECOND: u64 = 64;
 const SIM_YEAR_S: f64 = 365.0 * 86_400.0;
 
 /// Load `data/balance.ron` from the workspace — the §8.3 "shipping
@@ -86,7 +85,7 @@ pub fn staffed_base_run(probe: &EconomyProbe) -> Result<EconomyReport, SimError>
     );
     w.set_economy_config(cfg)?;
     let period_ticks = cfg.salary_period_ticks;
-    let period_s = period_ticks as f64 / TICKS_PER_SECOND as f64;
+    let period_s = period_ticks as f64 / TICK_HZ as f64;
     // The monthly charge is a pure function of the roster's salary
     // total — solve it so the drain lands on `drain_fraction` of the
     // balance that survives the hire costs, split evenly per member.
@@ -111,7 +110,21 @@ pub fn staffed_base_run(probe: &EconomyProbe) -> Result<EconomyReport, SimError>
             },
         );
     }
-    w.step_frame(w.clock().ticks() + 1)?;
+    // Drain the hires one boundary (re-issuing the effective target
+    // while §2.6.5 splits the frame) — and surface rejections: a
+    // refused `HireCrew` must fail the probe, never silently shrink
+    // the roster it claims to measure.
+    let mut target = w.clock().ticks() + 1;
+    loop {
+        let r = w.step_frame(target)?;
+        if let Some(first) = r.rejected.first() {
+            return Err(first.error);
+        }
+        if !r.partial {
+            break;
+        }
+        target = r.effective_target;
+    }
     let mut report = EconomyReport {
         months: Vec::new(),
         insolvent_tick: None,
@@ -269,7 +282,7 @@ pub fn colony_production_run(months: u64) -> Result<ColonyEconomyReport, SimErro
         .keys()
         .next()
         .ok_or(SimError::Fatal("economy: colony did not found"))?;
-    let month_ticks = (30.0 * 86_400.0 * TICKS_PER_SECOND as f64) as u64;
+    let month_ticks = (30.0 * 86_400.0 * TICK_HZ as f64) as u64;
     let target = months * month_ticks;
     while w.clock().ticks() < target {
         w.step_frame(w.clock().ticks() + month_ticks)?;
@@ -363,6 +376,10 @@ mod tests {
             years: 4,
         };
         let report = staffed_base_run(&probe).unwrap();
+        // The roster actually hired — a rejected `HireCrew` that
+        // slipped through would otherwise silently shrink the staff
+        // the band is measured against.
+        assert_eq!(report.crew_count, probe.staff);
         assert!(report.months.len() >= probe.band_months as usize);
         for (tick, start, end) in report.months.iter().take(probe.band_months as usize) {
             assert!(

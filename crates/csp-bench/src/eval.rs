@@ -210,12 +210,13 @@ pub struct SuiteEntry {
 /// resolves `WorldSpec::Fixture{name}` (this repo's convention:
 /// `data/test-fixtures/`).
 pub fn run_suite(dir: &Path, fixtures_root: &Path) -> Result<Vec<SuiteEntry>, EvalError> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map_err(EvalError::Io)?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("ron"))
-        .collect();
+    // Entry-level IO failures surface as suite errors — `.flatten()`
+    // would silently drop a scenario the directory listing failed on.
+    let mut files: Vec<PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(EvalError::Io)? {
+        files.push(entry.map_err(EvalError::Io)?.path());
+    }
+    files.retain(|p| p.extension().and_then(|e| e.to_str()) == Some("ron"));
     files.sort();
     Ok(files
         .into_iter()

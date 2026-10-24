@@ -105,6 +105,57 @@ fn schedule_scenario_deterministic() {
     assert!(a.pass);
 }
 
+/// §2.6.5 inside `setup`: an `AdvanceTo` past `MAX_TICKS_PER_FRAME`
+/// (69 120) splits into partial frames — the setup drain must
+/// re-issue the effective target until the run lands, not drop the
+/// tail at the first partial.
+#[test]
+fn setup_advance_to_survives_frame_budget_partials() {
+    let text = r#"(
+        schema_version: 1,
+        name: "long-setup",
+        world: Empty,
+        setup: [Command(AdvanceTo(200_000))],
+        agent: Idle,
+        goals: [(field: "tick", op: ge, value: 200_000)],
+        tick_budget: 1_000_000,
+        event_budget: 16,
+    )"#;
+    let file = scenario::parse_scenario(text).expect("parses");
+    let report = scenario::run_scenario(&file, &fixtures_root()).expect("runs");
+    // The setup advance landed the full 200 000 — the Idle agent then
+    // gets its one boundary before `Done`, so the clock stands one
+    // past it.
+    assert_eq!(report.final_tick, 200_001);
+    assert!(report.pass, "setup partial was dropped: {report:?}");
+}
+
+/// §2.7: `save_seed` is consumed at world build — two scenarios
+/// differing only in the seed hash differently (the seed rides the
+/// hashed state; a never-applied seed would collide them).
+#[test]
+fn save_seed_changes_final_hash() {
+    let make = |seed: u64| {
+        let text = format!(
+            r#"(
+                schema_version: 1,
+                name: "seeded",
+                world: Empty,
+                save_seed: {seed},
+                agent: Schedule([[SetWarp(2)]]),
+                goals: [(field: "tick", op: ge, value: 0)],
+                tick_budget: 1_000,
+                event_budget: 16,
+            )"#
+        );
+        scenario::parse_scenario(&text).expect("parses")
+    };
+    let a = scenario::run_scenario(&make(0), &fixtures_root()).expect("run a");
+    let b = scenario::run_scenario(&make(42), &fixtures_root()).expect("run b");
+    assert!(a.pass && b.pass);
+    assert_ne!(a.final_hash, b.final_hash);
+}
+
 // ---------------------------------------------------------------------------
 // The format's failure surface
 // ---------------------------------------------------------------------------
@@ -294,14 +345,18 @@ impl McpProc {
         serde_json::from_str(&line).expect("response json")
     }
 
-    /// A `tools/call` → the tool's JSON result payload (the
-    /// `content[0].text` JSON the surface wraps results in).
+    /// A `tools/call` → the tool's typed JSON result payload (the
+    /// `content[0].text` JSON the surface wraps results in). A
+    /// non-JSON payload is a test failure, not a value — the mission
+    /// asserts on typed fields, and a `{"raw": ...}` escape hatch
+    /// would let any malformed response pass them.
     fn tool(&mut self, name: &str, args: Value) -> Value {
         let resp = self.rpc("tools/call", json!({"name": name, "arguments": args}));
         let text = resp["result"]["content"][0]["text"]
             .as_str()
             .unwrap_or_else(|| panic!("tool {name} failed: {resp}"));
-        serde_json::from_str(text).unwrap_or_else(|_| json!({"raw": text}))
+        serde_json::from_str(text)
+            .unwrap_or_else(|e| panic!("tool {name} returned non-JSON payload {text:?}: {e}"))
     }
 }
 
@@ -374,7 +429,7 @@ fn mcp_mission_agent_flies_ascent() {
     // assumed.
     let denied = mcp.tool("vessel.control", json!({"vessel": 0, "throttle": 1.0}));
     assert!(
-        denied["rejected"].as_array().is_none_or(|r| !r.is_empty()) || denied.get("raw").is_some(),
+        denied["rejected"].as_array().is_some_and(|r| !r.is_empty()),
         "lease-less control should reject: {denied}"
     );
     mcp.tool("vessel.take_control", json!({"vessel": 0}));

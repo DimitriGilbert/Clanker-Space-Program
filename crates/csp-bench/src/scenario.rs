@@ -87,8 +87,10 @@ pub enum SetupSpec {
     PadLaunch,
 }
 
-/// One `Log` entry — re-issue `command` so it drains at `tick`
-/// (§7.6's stamped-drain semantics, scenario-declared).
+/// One `Log` entry — re-issue `command` so it is *stamped* `tick`:
+/// under the dequeue-stamp rule (§2.2.1/§7.6) a command enqueued while
+/// the clock stands at `tick` drains at that boundary stamped `tick`,
+/// so the agent issues on the boundary where `snap.tick == tick`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LoggedStep {
     /// The drain tick the command must land on.
@@ -132,10 +134,11 @@ pub enum AgentSpec {
         /// The Rhai source (`on_tick` entry point, §2.10).
         source: String,
     },
-    /// A verbatim command log — `LoggedStep`s re-issued so each
-    /// drains at its recorded tick. Steps must be strictly ascending
-    /// and ahead of the post-setup clock; a step the clock has
-    /// passed is an agent `Fail` (a clock cannot retreat, §2.3).
+    /// A verbatim command log — `LoggedStep`s re-issued so each is
+    /// stamped at its recorded tick (see [`LoggedStep`]). Steps must
+    /// be strictly ascending and at-or-ahead of the post-setup clock;
+    /// a step the clock has passed is an agent `Fail` (a clock cannot
+    /// retreat, §2.3).
     Log(Vec<LoggedStep>),
 }
 
@@ -268,6 +271,13 @@ pub struct EvalReport {
     /// Agent `Fail` replies surfaced at run end (a faulted agent is
     /// a failed run even if the goals incidentally hold).
     pub agent_faults: Vec<String>,
+    /// Commands the run's drains rejected — `"Class:id dequeue#n:
+    /// error"` lines from [`Lockstep::rejected_commands`]. A
+    /// rejection is an issued decision the sim refused (§2.2.1):
+    /// surfaced so it is never silently dropped; the transcript
+    /// attributes each to its producing agent. Informational — it
+    /// does not by itself fail the run.
+    pub rejected_commands: Vec<String>,
 }
 
 /// Harness-side failures — distinct from an honest `pass: false`
@@ -332,8 +342,11 @@ pub struct ScenarioFile {
     /// The scenario's name — report/test label.
     pub name: String,
     /// The §2.7 save seed the run rides (mirrors
-    /// `ScenarioRecipe::save_seed`; M0's `World` draws no seeded
-    /// streams yet — it is carried, not consumed).
+    /// `ScenarioRecipe::save_seed`): `build_world` stamps it into the
+    /// world via [`World::set_save_seed`] before setup drains — the
+    /// seed selects the contract generator's draws and rides the
+    /// hashed state, so two otherwise-identical scenarios with
+    /// different seeds produce different `final_hash`es.
     #[serde(default)]
     pub save_seed: u64,
     /// The world construction.
@@ -434,6 +447,10 @@ impl ScenarioFile {
                     .map_err(|e: ReplayError| EvalError::Setup(format!("fixture {name:?}: {e}")))?
             }
         };
+        // §2.7's seed is a construction-time write — stamp it before
+        // the first drain so every seeded draw the run makes (and the
+        // hashed state itself) carries it.
+        world.set_save_seed(self.save_seed);
         let mut pending: Vec<SimCommand> = Vec::new();
         for spec in &self.setup {
             match spec {
@@ -477,17 +494,42 @@ fn drain_pending(
     for c in pending.drain(..) {
         world.enqueue(SourceClass::Ui, 0, c);
     }
-    let t = world.clock().ticks();
-    let report = world.step_frame(t + 1)?;
-    if !report.rejected.is_empty() {
-        let msgs: Vec<String> = report
-            .rejected
-            .iter()
-            .map(|r| format!("{}", r.error))
-            .collect();
+    // One boundary drains the batch — but the drain's `AdvanceTo`s
+    // raise the frame's effective target, and §2.6.5's budgets can
+    // split the advance into partial frames. Re-issue the report's
+    // `effective_target` until the run lands, collecting rejections
+    // from every partial; a zero-progress frame is a harness/sim bug,
+    // not a normal partial.
+    let mut target = world
+        .clock()
+        .ticks()
+        .checked_add(1)
+        .ok_or_else(|| EvalError::Setup(format!("{scenario}: setup clock at u64::MAX")))?;
+    let mut rejected: Vec<String> = Vec::new();
+    loop {
+        let before = world.clock().ticks();
+        let report = world.step_frame(target)?;
+        rejected.extend(report.rejected.iter().map(|r| r.error.to_string()));
+        if !report.partial {
+            break;
+        }
+        let progressed = report.reached_tick > before
+            || report.events_processed > 0
+            || report.commands_applied > 0
+            || !report.rejected.is_empty()
+            || !report.degraded.is_empty();
+        if !progressed {
+            return Err(EvalError::Setup(format!(
+                "{scenario}: setup advance stalled below tick {}",
+                report.effective_target
+            )));
+        }
+        target = report.effective_target;
+    }
+    if !rejected.is_empty() {
         return Err(EvalError::Setup(format!(
             "{scenario}: setup command rejected: {}",
-            msgs.join("; ")
+            rejected.join("; ")
         )));
     }
     Ok(())
@@ -522,8 +564,10 @@ impl Agent for WaitAgent {
     }
 }
 
-/// `Log` — `AdvanceTo(tick-1)` hops between logged ticks, then the
-/// logged commands on their drain tick. A step behind the clock is
+/// `Log` — `AdvanceTo(tick)` hops the clock onto each step's drain
+/// tick, then the logged command issues on the boundary where the
+/// snapshot's tick *is* the step's (dequeue-stamp semantics: enqueued
+/// at `tick`, drained and stamped `tick`). A step behind the clock is
 /// `Fail` — the log cannot re-enter the past (§2.3).
 struct LogAgent {
     steps: std::collections::VecDeque<LoggedStep>,
@@ -531,11 +575,10 @@ struct LogAgent {
 
 impl Agent for LogAgent {
     fn act(&mut self, snap: &TelemetrySnapshot) -> AgentReply {
-        let next_tick = snap.tick.saturating_add(1);
         let Some(step) = self.steps.front() else {
             return AgentReply::Done;
         };
-        match next_tick.cmp(&step.tick) {
+        match step.tick.cmp(&snap.tick) {
             std::cmp::Ordering::Equal => {
                 // `front()` held Some, so the pop cannot miss.
                 let Some(step) = self.steps.pop_front() else {
@@ -543,10 +586,13 @@ impl Agent for LogAgent {
                 };
                 AgentReply::Act(vec![step.command])
             }
-            std::cmp::Ordering::Less => AgentReply::Act(vec![SimCommand::AdvanceTo(step.tick - 1)]),
-            std::cmp::Ordering::Greater => AgentReply::Fail(format!(
-                "log step at tick {} is behind the clock ({next_tick} next)",
-                step.tick
+            // Hop the clock onto the step's tick — the command itself
+            // issues next boundary, where `snap.tick == step.tick`, so
+            // the drain stamps it `step.tick`.
+            std::cmp::Ordering::Greater => AgentReply::Act(vec![SimCommand::AdvanceTo(step.tick)]),
+            std::cmp::Ordering::Less => AgentReply::Fail(format!(
+                "log step at tick {} is behind the clock ({})",
+                step.tick, snap.tick
             )),
         }
     }
@@ -648,6 +694,7 @@ pub fn run_scenario_full(
         })
         .collect();
     let agent_faults = run.agent_faults();
+    let rejected_commands = run.rejected_commands().to_vec();
     let hash = run.world().state_hash().map_err(EvalError::Sim)?;
     let pass = goals.iter().all(|g| g.passed) && agent_faults.is_empty();
     let transcript = run.transcript().to_vec();
@@ -666,6 +713,7 @@ pub fn run_scenario_full(
             events_applied: run.applied(),
             goals,
             agent_faults,
+            rejected_commands,
         },
         transcript,
     ))

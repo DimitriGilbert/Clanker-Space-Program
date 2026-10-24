@@ -1,7 +1,11 @@
 // M9d eval suite — the `Log` source: a verbatim command log re-issued
-// at its recorded ticks (§7.6 semantics, scenario-declared). The agent
-// hops to each drain tick with AdvanceTo — clock can never retreat,
-// and a step behind it faults the agent.
+// at its recorded ticks (§7.6 dequeue-stamp semantics, scenario-declared:
+// a command enqueued while the clock stands at `tick` drains at that
+// boundary stamped `tick`). The agent hops the clock onto each step's
+// tick with AdvanceTo, then issues the command on the boundary where
+// `snap.tick == step.tick` — so `tick: 64` below lands stamped 64, not
+// 63. The clock can never retreat, and a step behind it faults the
+// agent.
 (
     schema_version: 1,
     name: "log-replay",

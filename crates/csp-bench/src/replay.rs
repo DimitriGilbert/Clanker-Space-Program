@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use csp_core::{HASH_SCHEMA_VERSION, KDF_VERSION, SimError};
 use csp_data::DATA_HASH_VERSION;
 use csp_sim::orbit::PatchedConics;
-use csp_sim::{CommandKey, SimCommand, World, WorldSnapshot};
+use csp_sim::{CommandKey, SimCommand, SourceClass, World, WorldSnapshot};
 use serde::{Deserialize, Serialize};
 
 use crate::scenarios::ScenarioRecipe;
@@ -44,7 +44,9 @@ pub const EXPECTED_HASH_FILE: &str = "expected-hash.txt";
 /// The §7.1 determinism fingerprint sidecar.
 pub const FINGERPRINT_FILE: &str = "fingerprint.json";
 /// Golden artifacts are recording outputs, not fixture data —
-/// [`fixture_hash`] skips exactly these names.
+/// [`fixture_hash`] skips exactly these names, and only at the
+/// fixture dir's top level: a *nested* file that happens to share a
+/// name is fixture data and must hash like any other.
 const ARTIFACT_FILES: &[&str] = &[REPLAY_FILE, EXPECTED_HASH_FILE, FINGERPRINT_FILE];
 
 /// The §7.1 determinism fingerprint — every field that can legitimately
@@ -146,7 +148,11 @@ impl From<FingerprintSidecar> for Fingerprint {
 pub struct Replay {
     /// The build/data environment this was recorded under (§7.1).
     pub fingerprint: Fingerprint,
-    /// The §2.7 save seed the run was recorded under.
+    /// The §2.7 save seed the run was recorded under. A cross-check,
+    /// not an input: `record` stamps the seed into the world *before*
+    /// the initial snapshot, so [`World::restore`] already carries it —
+    /// [`replay`] verifies the field agrees with the snapshot and a
+    /// doctored/spliced value is [`ReplayError::MalformedGolden`].
     pub save_seed: u64,
     /// §3.1 hash of the frozen fixture the run loaded (§8.3). Raw bytes on
     /// the binary wire — the hex rendering lives only in `fingerprint.json`
@@ -237,7 +243,9 @@ pub enum ReplayError {
     /// entries than the log records — stamping diverged; determinism is
     /// already broken before the hash comparison.
     StampMismatch {
-        /// Index into the log of the first divergent entry.
+        /// Index into the log of the first divergent entry — equal to
+        /// `command_log.len()` when the divergence is a spurious entry
+        /// produced past the log's end.
         index: usize,
     },
     /// [`replay`] produced a final hash that differs from the recorded
@@ -268,11 +276,13 @@ pub enum ReplayError {
         /// The tick the clock remained at.
         reached: u64,
     },
-    /// A freshly recorded artifact failed to reproduce its own run —
-    /// [`record`] (and therefore `xtask bless-goldens`, which records
-    /// through it) checks this before anything may be written. A golden
-    /// that fails this check is a recorder-contract violation or a
-    /// harness bug, refused here rather than discovered by CI later.
+    /// A freshly recorded artifact is unfit to write — either its own
+    /// replay failed to reproduce the run, or the log it captured is
+    /// empty (a vacuous golden [`verify_golden`] would refuse as
+    /// malformed). [`record`] (and therefore `xtask bless-goldens`,
+    /// which records through it) checks this before anything may be
+    /// written: a recorder-contract violation or a harness bug,
+    /// refused here rather than discovered by CI later.
     SelfCheckFailed(String),
     /// The on-disk fixture dir no longer hashes to the recorded
     /// `data_fixture_hash`. The §8.3 fixture freeze is a hard failure in
@@ -472,8 +482,10 @@ pub fn fingerprint_warnings(recorded: &Fingerprint, current_fixture_hash: [u8; 3
 /// scheme is defined for text data, and fixture sets are text).
 ///
 /// Golden artifact files (`replay.bin`, `expected-hash.txt`,
-/// `fingerprint.json`) are outputs of recording, not
-/// inputs, and are excluded — including them would be self-referential.
+/// `fingerprint.json`) are outputs of recording, not inputs, and are
+/// excluded at the dir's top level — including them would be
+/// self-referential. A *nested* file sharing one of those names is
+/// ordinary fixture data and hashes like any other.
 /// Changing this scheme bumps `csp_data::DATA_HASH_VERSION` (v2: the
 /// length-prefix above — keep this implementation byte-identical to
 /// `csp_data::datahash::data_set_hash`).
@@ -538,8 +550,10 @@ fn fixture_files(dir: &Path) -> Result<Vec<String>, ReplayError> {
                 stack.push((entry.path(), rel));
                 continue;
             }
-            // Golden artifacts are recording outputs, not fixture data.
-            if ARTIFACT_FILES.contains(&name.as_str()) {
+            // Golden artifacts are recording outputs, not fixture data —
+            // excluded at the top level only (an empty `prefix`); a
+            // nested file sharing an artifact's name is fixture data.
+            if prefix.is_empty() && ARTIFACT_FILES.contains(&name.as_str()) {
                 continue;
             }
             out.push(rel);
@@ -572,8 +586,10 @@ fn canonicalize(bytes: &[u8]) -> Vec<u8> {
 /// must reconstruct the recorded final hash from it, or the recipe
 /// violated the recorder contract (see [`crate::scenarios`]) / the harness
 /// is broken — either way the answer is [`ReplayError::SelfCheckFailed`]
-/// and nothing is fit to write. `xtask bless-goldens` records through this
-/// function, so the check gates both writers.
+/// and nothing is fit to write. An **empty command log** is refused the
+/// same way — a vacuous golden that [`verify_golden`] would reject as
+/// [`ReplayError::MalformedGolden`]. `xtask bless-goldens` records through
+/// this function, so the check gates both writers.
 pub fn record(recipe: &ScenarioRecipe, fixture_dir: &Path) -> Result<RecordedGolden, ReplayError> {
     let data_fixture_hash = fixture_hash(fixture_dir)?;
     let mut world = (recipe.initial)(fixture_dir)?;
@@ -585,13 +601,25 @@ pub fn record(recipe: &ScenarioRecipe, fixture_dir: &Path) -> Result<RecordedGol
     let config = world.config();
     (recipe.drive)(&mut world)?;
     let final_hash = world.state_hash()?;
+    let command_log = world.command_log().to_vec();
+    // An empty log writes a vacuous golden — one `verify_golden`
+    // refuses as `MalformedGolden`. Refuse it here instead: the
+    // record path must never produce an artifact the verify path
+    // rejects on sight.
+    if command_log.is_empty() {
+        return Err(ReplayError::SelfCheckFailed(format!(
+            "scenario '{}' produced an empty command log — a golden \
+             with nothing to replay is vacuous",
+            recipe.name
+        )));
+    }
     let artifact = Replay {
         fingerprint: fingerprint(data_fixture_hash),
         save_seed: recipe.save_seed,
         data_fixture_hash,
         initial_snapshot,
         final_tick: world.clock().ticks(),
-        command_log: world.command_log().to_vec(),
+        command_log,
         config,
     };
     match replay(&artifact) {
@@ -627,13 +655,46 @@ pub fn record(recipe: &ScenarioRecipe, fixture_dir: &Path) -> Result<RecordedGol
 /// same-tick groups — a tick's commands all drained in one boundary pass
 /// during recording, so they are enqueued together here:
 ///
-/// 1. advance the restored clock to the group tick with an **empty** queue
-///    (every earlier group already drained), so nothing is stamped early;
-/// 2. enqueue the group under its recorded sources — within one source,
-///    log order is production order, so the restored `source_seq` counters
-///    reproduce the recorded `seq`s;
-/// 3. advance one tick past the drain — the boundary that stamps the
-///    recorded `tick`.
+/// 1. advance the restored clock to the group tick — the queue is
+///    *externally* empty (every earlier group already drained) but may
+///    hold not-yet-due `Script`/`Autopilot` entries the sim's own
+///    control ticks issued along the way — those are expected, they
+///    drain at their recorded ticks;
+/// 2. enqueue the group's externally-sourced entries under their
+///    recorded sources — within one source, log order is production
+///    order, so the restored `source_seq` counters reproduce the
+///    recorded `seq`s. **`Script`/`Autopilot`-class entries are NOT
+///    enqueued** (see "sim-derived entries" below);
+/// 3. advance past the drain — the boundary that stamps the recorded
+///    `tick`, plus whatever target the group's `AdvanceTo`s raise.
+///
+/// Sim-derived entries (§2.10): the restored world re-runs the same
+/// script `on_tick`s and autopilot ticks the recording ran, and each
+/// re-issues its commands into `pending` with the same one-tick
+/// `not_before` latency — they drain and log themselves. Two
+/// consequences for the driver:
+///
+/// - Re-enqueueing a recorded `Script`/`Autopilot` entry would stamp a
+///   *second* copy, so those entries are never enqueued — they are
+///   expectations, and the produced-vs-log comparison still verifies
+///   the sim reproduced them entry-for-entry.
+/// - A warp advance produces a whole span of them at once: the
+///   covering `advance_to` logs every sim-derived entry up to the
+///   target, so `produced` legitimately runs ahead of the current
+///   group, and later groups can sit at ticks the clock already
+///   passed. A group that is *entirely* sim-derived at `tick < clock`
+///   is therefore compare-only (its entries must already sit in
+///   `produced`); a non-sim entry behind the clock remains
+///   [`ReplayError::StampBehindClock`], because an external stamp
+///   requires the recorder's clock to have stood at that tick —
+///   something a warp span never does.
+///
+/// The documented ambiguity this leaves: an entry stamped
+/// `Script`/`Autopilot` that was enqueued *externally* at record time
+/// (a driver forging the sim-internal classes — `World::enqueue` does
+/// not police the class it is handed) is filtered out here too and
+/// never re-issued, so `record`'s self-check refuses such a recipe
+/// rather than writing an unreplayable golden.
 ///
 /// The `step_frame` targets are read back out of the log, never computed
 /// from anything outside it — the recorder contract (see
@@ -692,36 +753,84 @@ pub fn replay(artifact: &Replay) -> Result<[u8; 32], ReplayError> {
     // the snapshot (the engine install forwards it).
     world.set_script_engine(Box::new(csp_script::RhaiHost::new()));
     world.set_autopilot_driver(Box::new(csp_ai::AscentAutopilot::new()));
+    // §2.7: `Replay::save_seed` is a cross-check — `restore` already
+    // took the snapshot's seed (the record stamped it pre-snapshot), so
+    // a disagreement is a doctored or spliced artifact, not an input to
+    // apply.
+    if world.save_seed() != artifact.save_seed {
+        return Err(ReplayError::MalformedGolden(
+            "replay.save_seed disagrees with the initial snapshot's save_seed",
+        ));
+    }
     let log = &artifact.command_log;
+    // §2.10 producers re-derive their own log entries (see the fn doc):
+    // `Script`/`Autopilot`-class entries are expectations, not inputs.
+    let is_sim_derived =
+        |class: SourceClass| matches!(class, SourceClass::Script | SourceClass::Autopilot);
     let mut i = 0;
     while i < log.len() {
-        let tick = log[i].0.tick;
-        let clock = world.clock().ticks();
-        if tick < clock {
-            return Err(ReplayError::StampBehindClock { tick, clock });
-        }
-        advance_to(&mut world, tick)?;
+        let group_tick = log[i].0.tick;
         let mut j = i;
-        // The drain frame's step target was drain tick + 1 at record
-        // time; logged AdvanceTo commands extend it, so the effective
-        // target is their max — read back from the log itself.
-        let mut target = tick
-            .checked_add(1)
-            .ok_or(SimError::Fatal("replay log stamps u64::MAX tick"))?;
-        while j < log.len() && log[j].0.tick == tick {
-            let (key, command) = &log[j];
-            if let SimCommand::AdvanceTo(t) = command {
-                target = target.max(*t);
-            }
-            world.enqueue(key.source_class, key.source_id, command.clone());
+        while j < log.len() && log[j].0.tick == group_tick {
             j += 1;
         }
-        advance_to(&mut world, target)?;
+        let group = &log[i..j];
+        let clock = world.clock().ticks();
+        if group_tick < clock {
+            // A covering warp advance already ran this tick's drain —
+            // only sim-derived entries can legitimately sit here
+            // (their producing control ticks re-issued them en route).
+            // An external entry behind the clock can never reproduce
+            // its stamp: the recorder's clock had to stand at the tick
+            // to log it, and a warp span never does.
+            if group.iter().any(|(k, _)| !is_sim_derived(k.source_class)) {
+                return Err(ReplayError::StampBehindClock {
+                    tick: group_tick,
+                    clock,
+                });
+            }
+        } else {
+            advance_to(&mut world, group_tick)?;
+            // The drain frame's step target was drain tick + 1 at
+            // record time; logged AdvanceTo commands extend it, so the
+            // effective target is their max — read back from the log
+            // itself. A sim-derived AdvanceTo raised the recorded
+            // frame's target too — the scan covers the whole group
+            // regardless of which entries get enqueued.
+            let mut target = group_tick
+                .checked_add(1)
+                .ok_or(SimError::Fatal("replay log stamps u64::MAX tick"))?;
+            for (key, command) in group {
+                if let SimCommand::AdvanceTo(t) = command {
+                    target = target.max(*t);
+                }
+                if !is_sim_derived(key.source_class) {
+                    world.enqueue(key.source_class, key.source_id, command.clone());
+                }
+            }
+            advance_to(&mut world, target)?;
+        }
+        // `produced` may run ahead of `j` — a warp advance logs a
+        // whole span of sim-derived entries at once — so the check is
+        // the group's window, not the produced length.
         let produced = world.command_log();
-        if produced.len() != j || produced[i..j] != log[i..j] {
-            return Err(ReplayError::StampMismatch { index: i });
+        if produced.len() < j || produced[i..j] != log[i..j] {
+            // Report the first divergent entry, not the group's start:
+            // the earliest position where the drain's output differs
+            // from the log (a produced log missing the group's tail
+            // diverges at `produced.len()`).
+            let index = (i..j)
+                .find(|&k| produced.get(k) != log.get(k))
+                .unwrap_or_else(|| produced.len().min(j));
+            return Err(ReplayError::StampMismatch { index });
         }
         i = j;
+    }
+    // Produced entries past the log's end — a spurious extra the
+    // recording never saw (the windowed check only ever covers logged
+    // spans, and produced may legitimately have run ahead).
+    if world.command_log().len() != log.len() {
+        return Err(ReplayError::StampMismatch { index: log.len() });
     }
     let actual = world.clock().ticks();
     if actual != artifact.final_tick {
@@ -1022,6 +1131,117 @@ mod tests {
     #[test]
     fn record_replay_round_trip_in_memory() {
         let golden = record(scenarios::find("trivial").unwrap(), &trivial_dir()).unwrap();
+        assert_eq!(replay(&golden.artifact).unwrap(), golden.final_hash);
+        verify(&golden.artifact, golden.final_hash).unwrap();
+    }
+
+    /// A run whose log carries `SourceClass::Script` entries — the
+    /// in-sim host's own issues — records, self-checks, and verifies
+    /// clean. The restored world re-derives them through its control
+    /// ticks; enqueueing the recorded copies again would stamp a
+    /// duplicate of every one (`StampMismatch`) — the filtered path
+    /// is what makes scripted runs recordable at all.
+    #[test]
+    fn scripted_recipe_records_and_verifies() {
+        use std::collections::BTreeMap;
+
+        use csp_core::{DQuat, DVec3};
+        use csp_data::BodyId;
+        use csp_sim::orbit::BodyOrbit;
+        use csp_sim::{PhysicsConfig, VesselId};
+
+        /// A single-body world with a physics environment and the Rhai
+        /// host installed — the minimal stage for a `Script`-class
+        /// command producer.
+        fn scripted_initial(_dir: &Path) -> Result<World, ReplayError> {
+            let mut bodies = BTreeMap::new();
+            bodies.insert(
+                BodyId::from("p"),
+                BodyOrbit {
+                    mu_m3_per_s2: 3.5316e12,
+                    soi_m: None,
+                    parent: None,
+                    elements: None,
+                },
+            );
+            let mut world = World::with_physics(
+                PatchedConics::new(bodies),
+                PhysicsConfig {
+                    environment: csp_phys::Environment {
+                        body_center: DVec3::ZERO,
+                        radius_m: 600_000.0,
+                        mu_m3_per_s2: 3.5316e12,
+                        body_spin: DVec3::ZERO,
+                        atmosphere: None,
+                        settle_v: 0.05,
+                        settle_w: 0.05,
+                        settle_ticks: 128,
+                        friction_mu: 0.5,
+                        drag_cd: 1.0,
+                    },
+                    dominant: BodyId::from("p"),
+                },
+                csp_sim::DEFAULT_MAX_EVENTS_PER_FRAME,
+            );
+            world.set_script_engine(Box::new(csp_script::RhaiHost::new()));
+            Ok(world)
+        }
+
+        /// Orbiter spawn → `LoadScript` → control ticks — the guest's
+        /// `set_throttle` lands `Script`-stamped entries in the log
+        /// every tick it ticks, including inside the `AdvanceTo` warp.
+        fn drive_scripted(w: &mut World) -> Result<(), SimError> {
+            let pos = DVec3::new(800_000.0, 0.0, 0.0);
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::SpawnPhysicalVessel {
+                    craft: scenarios::flight_craft(),
+                    pos,
+                    rot: DQuat::IDENTITY,
+                    vel: DVec3::new(0.0, libm::sqrt(3.5316e12 / pos.norm()), 0.0),
+                    ang_vel: DVec3::ZERO,
+                },
+            );
+            w.step_frame(w.clock().ticks() + 1)?;
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::LoadScript {
+                    vessel: VesselId(0),
+                    source: "fn on_tick(ctx) { set_throttle(0.5); }".to_string(),
+                },
+            );
+            w.step_frame(w.clock().ticks() + 1)?;
+            // Recorder contract: each frame's target is its drain
+            // tick + 1; longer strides ride a logged `AdvanceTo`.
+            for _ in 0..8 {
+                w.step_frame(w.clock().ticks() + 1)?;
+            }
+            w.enqueue(SourceClass::Ui, 0, SimCommand::AdvanceTo(64));
+            w.step_frame(w.clock().ticks() + 1)?;
+            Ok(())
+        }
+
+        const RECIPE: ScenarioRecipe = ScenarioRecipe {
+            name: "scripted-probe",
+            save_seed: 0,
+            initial: scripted_initial,
+            drive: drive_scripted,
+        };
+
+        let golden = record(&RECIPE, &trivial_dir()).unwrap();
+        // The run really did exercise the §2.10 producer path — the
+        // log must carry `Script`-stamped entries, not just the
+        // externally-enqueued commands.
+        assert!(
+            golden
+                .artifact
+                .command_log
+                .iter()
+                .any(|(k, _)| k.source_class == SourceClass::Script),
+            "scripted run logged no Script-class commands"
+        );
         assert_eq!(replay(&golden.artifact).unwrap(), golden.final_hash);
         verify(&golden.artifact, golden.final_hash).unwrap();
     }
