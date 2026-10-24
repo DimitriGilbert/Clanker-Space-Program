@@ -425,6 +425,67 @@ impl Keymap {
     pub fn clear(&mut self, action: KeyAction) {
         self.bindings.insert(action, Vec::new());
     }
+
+    /// Re-validate a deserialized keymap — serde accepts any string
+    /// through the transparent [`KeyBinding`] newtype, so a
+    /// hand-edited file can carry tokens [`KeyBinding::parse`] would
+    /// refuse (dead bindings that display but can never fire) and the
+    /// same token bound under two actions. Normalize each token
+    /// through `parse` (trim + lowercase), drop the ones it rejects,
+    /// dedup within a row, and keep each surviving token under its
+    /// first claiming action in [`KeyAction::ALL`] order — the same
+    /// one-action-per-key rule [`Self::bind`] enforces. Returns the
+    /// dropped-token count so the load path can warn.
+    pub fn sanitize(&mut self) -> usize {
+        let mut dropped = 0usize;
+        let mut claimed = std::collections::BTreeSet::new();
+        for action in KeyAction::ALL {
+            let Some(keys) = self.bindings.get_mut(action) else {
+                continue;
+            };
+            let mut clean: Vec<KeyBinding> = Vec::with_capacity(keys.len());
+            for k in std::mem::take(keys) {
+                match KeyBinding::parse(k.as_str()) {
+                    Some(b) if !claimed.contains(b.as_str()) => {
+                        claimed.insert(b.as_str().to_owned());
+                        clean.push(b);
+                    }
+                    // `parse` refused, a dup within the row, or a key
+                    // an earlier action already claimed — dropped
+                    // either way.
+                    _ => dropped += 1,
+                }
+            }
+            *keys = clean;
+        }
+        dropped
+    }
+
+    /// The binding display a hint line prints for `action` — every
+    /// bound token joined `" / "`, or `"unbound"` when the action has
+    /// no keys. Hint text derives through this so a rebind can never
+    /// leave a printed key name stale.
+    pub fn hint(&self, action: KeyAction) -> String {
+        self.bindings
+            .get(&action)
+            .map(|v| {
+                v.iter()
+                    .map(KeyBinding::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unbound".to_string())
+    }
+
+    /// The action's first bound key — the compact hint form for a
+    /// row that would otherwise stack every alternative.
+    pub fn first_binding(&self, action: KeyAction) -> Option<&str> {
+        self.bindings
+            .get(&action)
+            .and_then(|v| v.first())
+            .map(KeyBinding::as_str)
+    }
 }
 
 /// The settings window's session state — owned by `csp-view` (§2.2-C
@@ -438,7 +499,8 @@ pub struct SettingsPanelState {
     /// live settings when the window opens, applied back on "Apply".
     pub settings: Settings,
     /// The action awaiting a captured key — set by the row's "rebind"
-    /// button; `csp-app` resolves the next unconsumed key press into
+    /// button; `csp-app` intercepts the next key press *before* egui
+    /// (a focused widget cannot steal it) and resolves it into
     /// [`Keymap::bind`] (Escape cancels). `None` = not listening.
     pub listening: Option<KeyAction>,
     /// One-line feedback ("settings saved", a stolen-key notice, …).
@@ -554,6 +616,14 @@ pub fn settings_panel(
             }
         });
     state.open = open;
+    // An X-close while a rebind capture is armed must drop it — the
+    // host reads `listening` for its pre-egui key intercept, and an
+    // armed-but-invisible panel would swallow the next key press into
+    // a keymap the user cannot see (the `OpenSettings` toggle's own
+    // close path disarms too — this is the window-chrome half).
+    if !state.open {
+        state.listening = None;
+    }
 }
 
 /// The keymap section's grid — one row per [`KeyAction`]: label, current
@@ -689,6 +759,42 @@ mod tests {
         assert_eq!(k.action_for(","), Some(KeyAction::WarpDown));
         assert_eq!(k.action_for("tab"), Some(KeyAction::CycleFocus));
         assert_eq!(k.action_for("q"), None);
+    }
+
+    /// R18-F5: a hand-edited file deserializes raw strings through the
+    /// transparent `KeyBinding` — `sanitize` re-runs `parse`, drops
+    /// dead tokens, normalizes case/whitespace, and keeps each key
+    /// under its first claiming action (`bind`'s one-action-per-key
+    /// rule applied to file data).
+    #[test]
+    fn sanitize_repairs_hand_edited_keymap() {
+        let mut k = Keymap::default();
+        // A dead token, an unnormalized token, an in-row dup, and a
+        // cross-action dup — every shape a text editor can produce.
+        k.bindings.insert(
+            KeyAction::WarpUp,
+            vec![
+                KeyBinding("arrowup".into()), // unparseable — dead
+                KeyBinding(" F6 ".into()),    // valid once normalized
+                KeyBinding("f6".into()),      // in-row dup of the above
+            ],
+        );
+        // "m" is ToggleMap's; claiming it under WarpDown too is the
+        // file-only shape `bind` prevents in-session.
+        k.bindings
+            .insert(KeyAction::WarpDown, vec![KeyBinding("m".into())]);
+        let dropped = k.sanitize();
+        assert_eq!(dropped, 3); // "arrowup", dup "f6", stolen "m"
+        assert_eq!(
+            k.bindings[&KeyAction::WarpUp],
+            vec![KeyBinding::parse("f6").unwrap()]
+        );
+        assert!(k.bindings[&KeyAction::WarpDown].is_empty());
+        // The first claimant keeps the key — ToggleMap still owns "m".
+        assert_eq!(k.action_for("m"), Some(KeyAction::ToggleMap));
+        // A clean map is a fixed point.
+        assert_eq!(k.sanitize(), 0);
+        assert_eq!(k.action_for("m"), Some(KeyAction::ToggleMap));
     }
 
     #[test]

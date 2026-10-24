@@ -76,6 +76,11 @@ const MANEUVER_SOURCE_ID: u32 = 2;
 /// §2.2.1 source id for settings-applied commands (the difficulty
 /// flags' `SetLifeSupportEnabled` at new-game; Ui class, own FIFO).
 const SETTINGS_SOURCE_ID: u32 = 3;
+// The throttle keys' `SetThrottle` rides `csp_view::PLAYER_SOURCE_ID`
+// (id 1) — deliberately shared with the launch path's
+// `SpawnPhysicalVessel` so every player-initiated craft command keeps
+// issue order in one FIFO; the const lives in csp-view so the two
+// producers can never drift on the value.
 
 /// Map camera controls (M1-D, PLAN §5.1 R0): orbit-drag sensitivity is
 /// defined inside `csp_view::map` (`MapKeyEvent::Orbit` takes radians) —
@@ -147,6 +152,18 @@ struct App {
     /// pick request; a release past it was an orbit drag and does not
     /// select.
     lmb_press: Option<(f64, f64)>,
+    /// The physical key a rebind capture just consumed — that key's
+    /// events are swallowed until its release. Without this a held
+    /// key's repeats would resolve through the *live* keymap (the
+    /// capture only wrote the staged one, pending Apply) and an
+    /// `accepts_repeat` action could machine-gun the old binding.
+    ///
+    /// This is the *physical* key (the scancode), not the logical
+    /// token, because the token is modifier-dependent: a Shift+1
+    /// capture records "!" but, once Shift is already up, releases
+    /// as "1" — a token match would never clear and would swallow
+    /// every future "!" press until a focus loss reset it.
+    captured_key: Option<winit::keyboard::PhysicalKey>,
     view: View,
     /// §2.6.3's controller — owns the warp ladder and the integer tick
     /// target; all wall-side, emitting only logged commands.
@@ -282,6 +299,9 @@ impl App {
         let mut view = view;
         let demo = view.is_demo();
         view.stage_settings(&settings);
+        // The live keymap mirror — every hint bar and the controls
+        // card prints *this*, never the staged edit copy.
+        view.set_live_keymap(&settings.keys);
         let mut app = Self {
             window: None,
             gpu: None,
@@ -302,6 +322,7 @@ impl App {
             last_cursor: None,
             map_dragging: false,
             lmb_press: None,
+            captured_key: None,
             view,
             warp: WarpController::new(),
             last_frame: Instant::now(),
@@ -330,7 +351,8 @@ impl App {
     /// (`max_warp_multiplier`). Called at startup and on the settings
     /// panel's Apply. A cap lowered under the live warp demotes now and
     /// rides the §7.6-logged `SetWarp` channel like every other warp
-    /// decision.
+    /// decision — except in a §2.13 read-only session, where the
+    /// command is refused (the dead clock would never drain it).
     fn apply_live_settings(&mut self) {
         let scale = self
             .settings
@@ -342,11 +364,23 @@ impl App {
             .warp
             .set_cap_multiplier(self.settings.gameplay.max_warp_multiplier)
         {
-            self.view.enqueue_command(
-                SourceClass::Ui,
-                SETTINGS_SOURCE_ID,
-                SimCommand::SetWarp(level),
-            );
+            if self.read_only {
+                // §2.13: a halted session takes no new sim commands —
+                // the demotion would queue silently behind a clock
+                // that never ticks again. The wall-side cap itself
+                // still landed (it is app state, not sim state); only
+                // the logged command is refused — same notice
+                // convention as the launch/maneuver gates.
+                self.view.vab_event(VabEvent::Notice(
+                    "session is read-only — warp demotion not applied".to_string(),
+                ));
+            } else {
+                self.view.enqueue_command(
+                    SourceClass::Ui,
+                    SETTINGS_SOURCE_ID,
+                    SimCommand::SetWarp(level),
+                );
+            }
         }
     }
 
@@ -804,6 +838,12 @@ impl App {
         }
     }
 
+    /// wasm: no audio backend — the blip is a no-op. Keeping the
+    /// method defined lets every call site stay unconditional and
+    /// symmetric with native.
+    #[cfg(target_arch = "wasm32")]
+    fn ui_confirm(&self) {}
+
     /// The one-frame-late half of the frame (§2.5): apply every request
     /// the last `UiBuild` pass wrote into its outbox — mode changes,
     /// craft file ops, the settings panel's Apply, node commands.
@@ -813,7 +853,6 @@ impl App {
             self.warp.request_step(outbox.warp_step);
         }
         if let Some(mode) = outbox.mode {
-            #[cfg(not(target_arch = "wasm32"))]
             self.ui_confirm();
             self.view.set_mode(match mode {
                 ModeSelect::Flight => ViewMode::Flight,
@@ -836,9 +875,24 @@ impl App {
                 self.view.vab_event(VabEvent::Notice(format!(
                     "session is read-only — '{name}' not saved"
                 )));
+            } else if let Err(reason) = validate_craft_name(&name) {
+                // Reject before either half of the store can diverge:
+                // a separator or traversal name would write outside —
+                // or below — `craft_dir` while the store key and the
+                // file list showed a phantom entry the non-recursive
+                // loader can never find.
+                self.view.vab_event(VabEvent::Notice(format!(
+                    "'{name}' is not a usable craft name ({reason})"
+                )));
+            } else if let Err(e) = save_craft_file(&self.craft_dir, &name, &bytes) {
+                // Honest failure: no store entry, no list update — the
+                // craft files row and the disk mirror stay in lockstep.
+                self.view
+                    .vab_event(VabEvent::Notice(format!("could not save '{name}': {e}")));
             } else {
-                self.craft_store.insert(name.clone(), bytes.clone());
-                save_craft_file(&self.craft_dir, &name, &bytes);
+                // Insert only after the write lands — store, file
+                // list, and filesystem agree or none of them moves.
+                self.craft_store.insert(name.clone(), bytes);
                 self.view
                     .set_craft_files(self.craft_store.keys().cloned().collect());
                 self.view
@@ -846,7 +900,6 @@ impl App {
             }
         }
         if outbox.settings_apply {
-            #[cfg(not(target_arch = "wasm32"))]
             self.ui_confirm();
             // The panel's staged copy becomes the live set: the keymap
             // dispatch reads `self.settings.keys` next key press, and
@@ -858,6 +911,10 @@ impl App {
             applied.graphics.window_size = self.settings.graphics.window_size;
             self.settings = applied;
             self.apply_live_settings();
+            // The applied keymap is now live — re-mirror it so the
+            // controls card and hint bars name the keys that actually
+            // dispatch (they never read the staged copy).
+            self.view.set_live_keymap(&self.settings.keys);
             #[cfg(not(target_arch = "wasm32"))]
             let persist = match &self.settings_path {
                 Some(p) => settings_io::save_settings_to(p, &self.settings),
@@ -866,7 +923,16 @@ impl App {
             #[cfg(target_arch = "wasm32")]
             let persist = settings_io::save_settings(&self.settings);
             match persist {
-                Ok(()) => self.view.set_settings_notice(Some("settings saved".into())),
+                // wasm's `save_settings` is an in-memory `Ok(())` — the
+                // notice must not claim a file write that never happened.
+                Ok(()) => self.view.set_settings_notice(Some(
+                    if cfg!(target_arch = "wasm32") {
+                        "settings applied — the web demo cannot persist them"
+                    } else {
+                        "settings saved"
+                    }
+                    .into(),
+                )),
                 Err(e) => {
                     log::warn!("settings persist failed: {e}");
                     self.view.set_settings_notice(Some(e));
@@ -874,12 +940,35 @@ impl App {
             }
         }
         if outbox.launch {
-            self.view.launch_craft();
+            if self.read_only {
+                // §2.13: a halted session takes no new sim commands —
+                // the spawn would sit undrained forever while
+                // `launch_craft` still flips the mode to Flight: an
+                // inert-but-misleading switch. (The §6.3 demo keeps
+                // launch — its fixed-scenario contract caps parts and
+                // refuses craft IO, not flight.)
+                self.view.vab_event(VabEvent::Notice(
+                    "session is read-only — launch refused".to_string(),
+                ));
+            } else {
+                // A refusal already lands on the VAB notice row inside
+                // `launch_craft`; its `Err` exists for callers with no
+                // notice audience (the startup seed).
+                let _ = self.view.launch_craft();
+            }
         }
         // M5 node panel → the §7.6-logged command path.
         if let Some(cmd) = outbox.maneuver {
-            self.view
-                .enqueue_command(SourceClass::Ui, MANEUVER_SOURCE_ID, cmd);
+            if self.read_only {
+                // Same §2.13 halt discipline — the command must not
+                // queue silently behind a clock that never ticks again.
+                self.view.vab_event(VabEvent::Notice(
+                    "session is read-only — maneuver not applied".to_string(),
+                ));
+            } else {
+                self.view
+                    .enqueue_command(SourceClass::Ui, MANEUVER_SOURCE_ID, cmd);
+            }
         }
         if let Some(name) = outbox.craft_load {
             if self.demo {
@@ -1122,20 +1211,36 @@ impl App {
     /// M0–M9d hardcoded bindings are now the keymap's *defaults*.
     ///
     /// Rebind capture comes first: while the settings panel is
-    /// listening, the next unconsumed press becomes that action's
-    /// binding (Escape cancels). Repeat presses only count for
-    /// [`KeyAction::accepts_repeat`] actions (the camera pans), so a
-    /// held key cannot machine-gun warp steps or mode toggles.
+    /// listening, the next press becomes that action's binding
+    /// (Escape cancels). `window_event` routes presses here *before*
+    /// egui sees the event, so a widget that would consume the key —
+    /// a focused TextEdit — cannot steal the capture and the key never
+    /// lands as typed text. OS auto-repeat never counts while a
+    /// capture is armed, and the captured key stays swallowed until
+    /// its release ([`Self::captured_key`]) so the live keymap's old
+    /// binding cannot fire under a held finger before Apply.
+    ///
+    /// Repeat presses only count for [`KeyAction::accepts_repeat`]
+    /// actions (the camera pans), so a held key cannot machine-gun
+    /// warp steps or mode toggles.
     fn key_press(&mut self, event: &winit::event::KeyEvent) {
         // Rebind capture — before all other dispatch, swallowing the key.
         if self.view.rebind_target().is_some() {
+            if event.repeat {
+                // A held key must not count as a second "next press".
+                return;
+            }
             match settings_io::binding_for(&event.logical_key) {
                 None => { /* unbindable key — keep listening */ }
-                Some(b) if b.as_str() == "escape" => self.view.set_rebind_target(None),
+                Some(b) if b.as_str() == "escape" => {
+                    self.captured_key = Some(event.physical_key);
+                    self.view.set_rebind_target(None);
+                }
                 Some(b) => {
                     let Some(action) = self.view.rebind_target() else {
                         return;
                     };
+                    self.captured_key = Some(event.physical_key);
                     self.view.bind_key(action, b);
                 }
             }
@@ -1153,6 +1258,35 @@ impl App {
         self.dispatch(action);
     }
 
+    /// The pre-egui half of key routing (R17-F7): returns `true` when
+    /// the event belongs to the rebind-capture machinery and must not
+    /// reach egui or the normal dispatch. While the settings panel
+    /// listens, the next press is the new binding even when a widget
+    /// (a focused TextEdit) would otherwise consume it — and egui must
+    /// not see it at all, or a captured 'x' would also land as typed
+    /// text. A just-captured key stays swallowed until its release so
+    /// its repeats cannot fire the live keymap's old binding (the
+    /// capture wrote only the staged map, pending Apply).
+    fn intercept_rebind_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        if event.state == ElementState::Pressed && self.view.rebind_target().is_some() {
+            self.key_press(event);
+            return true;
+        }
+        // Match on the physical key, not the logical token — the token
+        // shifts with modifiers (Shift+1 presses "!", releases "1"),
+        // so a token match could miss the release and wedge the
+        // captured key. `physical_key` is stable across modifier
+        // state.
+        let is_captured = self.captured_key.is_some_and(|c| c == event.physical_key);
+        if !is_captured {
+            return false;
+        }
+        if event.state == ElementState::Released {
+            self.captured_key = None;
+        }
+        true
+    }
+
     /// Route one resolved [`KeyAction`] — mode choreography lives in
     /// `View::set_mode`, camera input rides `View::{map,vab,flight}_event`
     /// into the Input schedule, and sim mutations ride the §7.6-logged
@@ -1160,17 +1294,35 @@ impl App {
     fn dispatch(&mut self, action: KeyAction) {
         let mode = self.view.mode();
         match action {
-            KeyAction::OpenSettings => self.view.toggle_settings_panel(),
-            KeyAction::ToggleVab => self.view.set_mode(if mode == ViewMode::Vab {
-                ViewMode::Flight
-            } else {
-                ViewMode::Vab
-            }),
-            KeyAction::ToggleMap => self.view.set_mode(if mode == ViewMode::Map {
-                ViewMode::Flight
-            } else {
-                ViewMode::Map
-            }),
+            // Session toggles acknowledge with the same blip the
+            // outbox's UI-driven mode switch and Apply play — a
+            // key-driven session event is the same class of event.
+            KeyAction::OpenSettings => {
+                self.ui_confirm();
+                self.view.toggle_settings_panel();
+                // Restage on open — the window always edits the
+                // applied set; unapplied edits from a previous visit
+                // are discarded, not resurrected.
+                if self.view.settings_panel_open() {
+                    self.view.stage_settings(&self.settings);
+                }
+            }
+            KeyAction::ToggleVab => {
+                self.ui_confirm();
+                self.view.set_mode(if mode == ViewMode::Vab {
+                    ViewMode::Flight
+                } else {
+                    ViewMode::Vab
+                });
+            }
+            KeyAction::ToggleMap => {
+                self.ui_confirm();
+                self.view.set_mode(if mode == ViewMode::Map {
+                    ViewMode::Flight
+                } else {
+                    ViewMode::Map
+                });
+            }
             // §2.6.3: request_step lands in the controller and becomes a
             // logged `SetWarp` on the next decide().
             KeyAction::WarpUp => self.warp.request_step(1),
@@ -1178,10 +1330,20 @@ impl App {
             // M4c flight throttle — the §7.6 command channel. The VAB
             // suppresses it (throttle is a flight verb).
             KeyAction::ThrottleFull | KeyAction::ThrottleCut if mode != ViewMode::Vab => {
-                if let Some(vessel) = self.view.flight_focus() {
+                if self.read_only {
+                    // §2.13: a halted session takes no new sim commands —
+                    // the throttle would pile up undrained behind a
+                    // clock that never ticks again. Same refusal notice
+                    // the outbox's launch/maneuver gates raise.
+                    self.view.vab_event(VabEvent::Notice(
+                        "session is read-only — throttle not applied".to_string(),
+                    ));
+                } else if let Some(vessel) = self.view.flight_focus() {
                     self.view.enqueue_command(
                         SourceClass::Ui,
-                        1,
+                        // The shared player-command FIFO — launch's
+                        // `SpawnPhysicalVessel` rides it too.
+                        csp_view::PLAYER_SOURCE_ID,
                         SimCommand::SetThrottle {
                             vessel,
                             throttle: if action == KeyAction::ThrottleFull {
@@ -1197,9 +1359,16 @@ impl App {
                 self.view.map_event(MapKeyEvent::CycleFocus)
             }
             // The controls card and the dev debug scaffold — session
-            // toggles on the view, no sim involvement.
-            KeyAction::ToggleHelp => self.view.toggle_help_panel(),
-            KeyAction::ToggleDebug => self.view.toggle_debug_panel(),
+            // toggles on the view, no sim involvement; same blip
+            // discipline as the other session toggles.
+            KeyAction::ToggleHelp => {
+                self.ui_confirm();
+                self.view.toggle_help_panel();
+            }
+            KeyAction::ToggleDebug => {
+                self.ui_confirm();
+                self.view.toggle_debug_panel();
+            }
             KeyAction::PanUp | KeyAction::PanDown | KeyAction::PanLeft | KeyAction::PanRight => {
                 let (dx_px, dy_px) = match action {
                     KeyAction::PanUp => (0.0, -PAN_STEP_PX),
@@ -1230,6 +1399,19 @@ impl ApplicationHandler for App {
             Some(w) => w.clone(),
             None => return,
         };
+
+        // Rebind capture intercepts key events BEFORE egui (see
+        // `intercept_rebind_key`).
+        if let WindowEvent::KeyboardInput { event, .. } = &event
+            && self.intercept_rebind_key(event)
+        {
+            return;
+        }
+        // A focus loss can drop the release that clears a captured
+        // key — clear here rather than swallowing that key forever.
+        if matches!(event, WindowEvent::Focused(false)) {
+            self.captured_key = None;
+        }
 
         // egui gets first pass at raw input, but `consumed` must guard the
         // individual handlers rather than early-returning: egui swallows
@@ -1469,6 +1651,10 @@ fn load_craft_store(dir: &std::path::Path) -> BTreeMap<String, Vec<u8>> {
                     std::fs::read(&p),
                     p.file_stem().and_then(|s| s.to_str()).map(String::from),
                 )
+                // A hand-placed file whose stem the save path would
+                // refuse stays out of the store too — one name rule
+                // for both directions keeps the key set portable.
+                && validate_craft_name(&name).is_ok()
             {
                 store.insert(name, bytes);
             }
@@ -1484,20 +1670,51 @@ fn load_craft_store(_dir: &std::path::Path) -> BTreeMap<String, Vec<u8>> {
     BTreeMap::new()
 }
 
-/// Native: mirror the store entry to `<dir>/<name>.cspcraft`. Failures
-/// are logged, not fatal — the in-memory store already holds the craft.
-#[cfg(not(target_arch = "wasm32"))]
-fn save_craft_file(dir: &std::path::Path, name: &str, bytes: &[u8]) {
-    if let Err(e) = std::fs::create_dir_all(dir)
-        .and_then(|()| std::fs::write(dir.join(format!("{name}.cspcraft")), bytes))
-    {
-        log::warn!("craft save to disk failed: {e}");
+/// A craft name becomes `<name>.cspcraft` under `craft_dir` — it must
+/// be one safe filename component, nothing more. Reject:
+/// - an empty name (the UI hides it, this is the enforcement half);
+/// - `.`/`..`-style names — the traversal class (`dir.join("a/../b")`
+///   escapes `craft_dir`; even the degenerate `.` produces a file the
+///   flat loader skips);
+/// - path separators `/` and `\` (a name containing one writes into a
+///   subdirectory or — joined absolute — outside `dir` entirely,
+///   leaving a store entry the non-recursive loader can never find);
+/// - `:` (a Windows drive prefix like `C:x` also escapes the join);
+/// - control characters (legal on unix, broken everywhere else and
+///   unprintable in notices).
+fn validate_craft_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("empty name");
     }
+    if name == "." || name == ".." || name.contains("..") {
+        return Err("path traversal");
+    }
+    if name
+        .chars()
+        .any(|c| c == '/' || c == '\\' || c == ':' || c.is_control())
+    {
+        return Err("path separator or control character");
+    }
+    Ok(())
+}
+
+/// Native: mirror the store entry to `<dir>/<name>.cspcraft`. The
+/// caller validates `name` first ([`validate_craft_name`]), so the
+/// join can never escape `dir`; a failed write is returned, not
+/// logged, so the caller can refuse the store insert and keep the
+/// memory store honest with the disk mirror.
+#[cfg(not(target_arch = "wasm32"))]
+fn save_craft_file(dir: &std::path::Path, name: &str, bytes: &[u8]) -> Result<(), String> {
+    std::fs::create_dir_all(dir)
+        .and_then(|()| std::fs::write(dir.join(format!("{name}.cspcraft")), bytes))
+        .map_err(|e| format!("{}: {e}", dir.display()))
 }
 
 /// wasm: nothing to write — the store in `App` is the whole store.
 #[cfg(target_arch = "wasm32")]
-fn save_craft_file(_dir: &std::path::Path, _name: &str, _bytes: &[u8]) {}
+fn save_craft_file(_dir: &std::path::Path, _name: &str, _bytes: &[u8]) -> Result<(), String> {
+    Ok(())
+}
 
 #[cfg(test)]
 // §2.13's no-panic rule covers shipping fallible paths; tests signal
@@ -1763,11 +1980,17 @@ mod tests {
     }
 
     /// The rebind plumbing: an armed target + a landed key updates the
-    /// staged keymap and reports the eviction.
+    /// staged keymap and reports the eviction. The capture is
+    /// open-gated — a closed window never reports a listening target.
     #[test]
     fn rebind_capture_updates_staged_keymap() {
         let dir = tempdir("rebind");
         let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        // A closed window reports no target even when armed — the
+        // X-close path clears it and `rebind_target` gates on open.
+        app.view.set_rebind_target(Some(KeyAction::ThrottleFull));
+        assert_eq!(app.view.rebind_target(), None);
+        app.view.toggle_settings_panel(); // open
         app.view.set_rebind_target(Some(KeyAction::ThrottleFull));
         assert_eq!(app.view.rebind_target(), Some(KeyAction::ThrottleFull));
         app.view
@@ -1808,5 +2031,96 @@ mod tests {
             ..Default::default()
         });
         assert!(app.craft_store.contains_key("demo-craft"));
+        // …but launching is still playable in the demo (§6.3 caps
+        // parts and refuses craft IO, not flight) — the launch gate
+        // is `read_only`, not `demo`.
+        let mut app = App::new_demo_with_settings_path(&dir.join("settings.ron"));
+        app.view.set_mode(ViewMode::Vab);
+        app.handle_ui_outbox(csp_view::UiOutbox {
+            launch: true,
+            ..Default::default()
+        });
+        assert_eq!(app.view.mode(), ViewMode::Flight);
+    }
+
+    /// A raw TextEdit name must never reach the filesystem: separator
+    /// and traversal names are refused before the write *and* before
+    /// the store insert, so no phantom `craft_store` entry or escaped
+    /// file can appear. A clean name writes to disk first, then the
+    /// store — insert-after-write.
+    #[test]
+    fn unsafe_craft_names_are_refused() {
+        let dir = tempdir("craft-names");
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        for bad in ["../escape", "a/b", "a\\b", "c:drive", "", "x\0y", ".."] {
+            app.handle_ui_outbox(csp_view::UiOutbox {
+                craft_save: Some((bad.to_string(), vec![1])),
+                ..Default::default()
+            });
+            assert!(app.craft_store.is_empty(), "{bad:?} entered the store");
+        }
+        // Nothing escaped `craft_dir` into its parent.
+        assert!(!dir.join("escape.cspcraft").exists());
+        // The notice row explains the refusal honestly — the event
+        // lands via the Input schedule, so pump one frame first.
+        app.view.begin_frame();
+        app.view.end_frame();
+        app.view.with_vab_session(|v| {
+            assert!(v.notice().unwrap().contains("not a usable craft name"));
+        });
+        // A clean name saves — the disk mirror lands, then the store.
+        app.handle_ui_outbox(csp_view::UiOutbox {
+            craft_save: Some(("good-name".to_string(), vec![1])),
+            ..Default::default()
+        });
+        assert!(app.craft_store.contains_key("good-name"));
+        assert!(app.craft_dir.join("good-name.cspcraft").exists());
+    }
+
+    /// §2.13's read-only halt gates the command paths the craft-save
+    /// gate already covered: `outbox.launch` and `outbox.maneuver` are
+    /// refused with a notice instead of queueing behind a clock that
+    /// never ticks — and `launch_craft`'s inert-but-misleading switch
+    /// to Flight never happens.
+    #[test]
+    fn read_only_refuses_launch_and_maneuver() {
+        let dir = tempdir("read-only-io");
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        // Drain the seeded pad launch so the command log is quiet.
+        app.view.begin_frame();
+        app.view.sim_step(1).unwrap();
+        app.view.end_frame();
+        let logged = app.view.sim.command_log().len();
+        let vessel = app.view.flight_focus().expect("seeded pad vessel");
+        app.view.set_mode(ViewMode::Vab);
+        app.read_only = true;
+        app.handle_ui_outbox(csp_view::UiOutbox {
+            launch: true,
+            maneuver: Some(SimCommand::SetManeuver {
+                vessel,
+                tick: 10_000,
+                dv_prograde_mps: 1.0,
+                dv_normal_mps: 0.0,
+                dv_radial_mps: 0.0,
+            }),
+            ..Default::default()
+        });
+        // No misleading switch to Flight, nothing was enqueued.
+        assert_eq!(app.view.mode(), ViewMode::Vab);
+        app.view.begin_frame();
+        app.view.sim_step(2).unwrap();
+        app.view.end_frame();
+        assert_eq!(app.view.sim.command_log().len(), logged);
+        app.view
+            .with_vab_session(|v| assert!(v.notice().unwrap().contains("read-only")));
+        // And the un-gated path still works — launch is only refused
+        // while halted.
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        app.view.set_mode(ViewMode::Vab);
+        app.handle_ui_outbox(csp_view::UiOutbox {
+            launch: true,
+            ..Default::default()
+        });
+        assert_eq!(app.view.mode(), ViewMode::Flight);
     }
 }

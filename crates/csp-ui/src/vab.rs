@@ -26,9 +26,11 @@
 //! # Readout
 //!
 //! `recompute` runs `csp_phys::readout::analyze` + `session.validate`
-//! + `session.body_transforms` only when the session is dirty — a
-//! stage op or a pick does not re-resolve. The panel shows the
-//! [`StageStats`] rows plus the [`MissionProfile`] comparison.
+//! + `session.body_transforms` only when the session is dirty — every
+//! mutating op (a stage assignment included: it changes the resolved
+//! stage table) marks dirty, while a pick does not re-resolve. The
+//! panel shows the stage-stats rows plus the [`MissionProfile`]
+//! comparison.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -649,8 +651,15 @@ pub struct VabUiOutput {
 /// the warp readout (the player-visible half of the old debug panel —
 /// its buttons ride the `warp_step` outbox), and the Tutorial/Help
 /// affordances. Emits [`ModeSelect`] into the outbox; `csp-app` maps
-/// it to `View::set_mode`.
-pub fn top_bar(ctx: &egui::Context, current: ModeSelect, warp: u32, out: &mut VabUiOutput) {
+/// it to `View::set_mode`. `keys` is the live keymap — the mode
+/// labels print its bindings, not hardcoded names.
+pub fn top_bar(
+    ctx: &egui::Context,
+    current: ModeSelect,
+    warp: u32,
+    keys: &crate::settings::Keymap,
+    out: &mut VabUiOutput,
+) {
     egui::Window::new("mode_bar")
         .title_bar(false)
         .anchor(egui::Align2::LEFT_TOP, egui::vec2(0.0, 0.0))
@@ -661,9 +670,21 @@ pub fn top_bar(ctx: &egui::Context, current: ModeSelect, warp: u32, out: &mut Va
                 ui.label("Clanker Space Program");
                 ui.separator();
                 for (mode, label) in [
-                    (ModeSelect::Flight, "Flight"),
-                    (ModeSelect::Map, "Map  [M]"),
-                    (ModeSelect::Vab, "VAB  [V]"),
+                    (ModeSelect::Flight, "Flight".to_string()),
+                    (
+                        ModeSelect::Map,
+                        format!(
+                            "Map  [{}]",
+                            keys.hint(crate::settings::KeyAction::ToggleMap)
+                        ),
+                    ),
+                    (
+                        ModeSelect::Vab,
+                        format!(
+                            "VAB  [{}]",
+                            keys.hint(crate::settings::KeyAction::ToggleVab)
+                        ),
+                    ),
                 ] {
                     if ui.selectable_label(current == mode, label).clicked() {
                         out.mode = Some(mode);
@@ -707,17 +728,19 @@ pub fn top_bar(ctx: &egui::Context, current: ModeSelect, warp: u32, out: &mut Va
 /// staging + readout, validation, craft-file bar. Runs only while the
 /// mode is `Vab`. Session ops apply immediately through
 /// [`VabSession::apply`] (the §2.2-C channel); file IO and mode
-/// switches ride `out` for next frame's app-side Input.
+/// switches ride `out` for next frame's app-side Input. `keys` is the
+/// live keymap the hint bar prints bindings from.
 pub fn vab_editor(
     ctx: &egui::Context,
     vab: &mut VabSession,
     craft_files: &[String],
+    keys: &crate::settings::Keymap,
     out: &mut VabUiOutput,
 ) {
     vab.recompute();
     palette_panel(ctx, vab);
     inspector_panel(ctx, vab, craft_files, out);
-    vab_hint_bar(ctx, vab);
+    vab_hint_bar(ctx, vab, keys);
 }
 
 /// Left side: the part catalog browser + the craft tree.
@@ -1338,9 +1361,23 @@ fn validation_section(ui: &mut egui::Ui, vab: &mut VabSession) {
     }
 }
 
-/// Bottom hint bar — same overlay idiom as `map_overlay`.
-fn vab_hint_bar(ctx: &egui::Context, vab: &VabSession) {
+/// Bottom hint bar — same overlay idiom as `map_overlay`. Also the
+/// viewport-side surface for an unresolvable craft: the scene draws
+/// from `analysis.effective`, so a failed resolve paints an empty
+/// viewport — without this the editor reads as a blank scene with no
+/// cause (the panel's "resolve:" line sits off to the side in the
+/// Craft window).
+fn vab_hint_bar(ctx: &egui::Context, vab: &VabSession, keys: &crate::settings::Keymap) {
     let rect = ctx.content_rect();
+    let problem = if let Some(e) = vab.analysis_error() {
+        Some(format!("craft failed to resolve — {e}"))
+    } else if !vab.session().is_empty() && vab.analysis().is_none() && vab.catalog().is_none() {
+        // Reachable via a loaded craft file in a catalog-less session:
+        // parts exist, nothing can resolve.
+        Some("part catalog is not loaded — the craft cannot resolve".to_string())
+    } else {
+        None
+    };
     egui::Area::new(egui::Id::unique("vab_hint"))
         .order(egui::Order::Background)
         .interactable(false)
@@ -1352,12 +1389,22 @@ fn vab_hint_bar(ctx: &egui::Context, vab: &VabSession) {
                 egui::pos2(rect.left() + 10.0, rect.bottom() - 8.0),
                 egui::Align2::LEFT_BOTTOM,
                 format!(
-                    "VAB  ·  {parts} part(s)  —  [V] exit  drag: orbit  wheel: zoom  \
-                     click a part to select"
+                    "VAB  ·  {parts} part(s)  —  [{}] exit  drag: orbit  wheel: zoom  \
+                     click a part to select",
+                    keys.hint(crate::settings::KeyAction::ToggleVab)
                 ),
                 egui::FontId::proportional(13.0),
                 egui::Color32::from_gray(180),
             );
+            if let Some(msg) = &problem {
+                painter.text(
+                    egui::pos2(rect.center().x, rect.top() + 46.0),
+                    egui::Align2::CENTER_TOP,
+                    msg,
+                    egui::FontId::proportional(15.0),
+                    egui::Color32::RED,
+                );
+            }
         });
 }
 

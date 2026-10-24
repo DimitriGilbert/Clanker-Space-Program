@@ -57,6 +57,14 @@ pub mod tutorial;
 /// contact sphere means the solver holds the craft from tick one.
 const PAD_CLEARANCE_M: f64 = 0.0;
 
+/// §2.2.1 `source_id` for the local player's direct craft verbs —
+/// the launch path's `SpawnPhysicalVessel` here and `csp-app`'s
+/// throttle dispatch (`SetThrottle`) there. Two producers, one FIFO
+/// *on purpose*: every player-initiated craft command drains in
+/// issue order. `csp-app`'s unrelated Ui-class producers take their
+/// own ids (warp/maneuver/settings are 0/2/3 — never reused).
+pub const PLAYER_SOURCE_ID: u32 = 1;
+
 /// The app's view mode — flight, map, or the VAB editor. Session
 /// state (§2.2-C): never sim state, never logged, never hashed.
 /// `csp-app` routes input and `csp-view` derives it from the two
@@ -160,6 +168,12 @@ pub struct SessionMirror {
     /// handler recorded — the dialog's "send this to the developer"
     /// line. `None` until a Fatal lands or while the write is pending.
     pub fatal_bundle: Option<String>,
+    /// The app's *live* (applied) keymap — mirrored by
+    /// [`View::set_live_keymap`]. The controls card and every hint bar
+    /// print *this* map — never the settings window's staged
+    /// pre-Apply copy — so the on-screen key names are always the ones
+    /// that actually dispatch.
+    pub keys: csp_ui::settings::Keymap,
 }
 
 /// The egui pass's input/output — the resource bridge that lets the *whole*
@@ -314,7 +328,7 @@ fn build_ui(
     }
     let files = craft_files.0.clone(); // Vec<String> — cheap, frees the Res borrow
     egui.output = Some(ctx.run_ui(raw, |ctx| {
-        csp_ui::vab::top_bar(ctx, mode, warp.0, &mut vab_out);
+        csp_ui::vab::top_bar(ctx, mode, warp.0, &session.keys, &mut vab_out);
         // The M0 scaffold is dev-facing (adapter/backend/tick internals)
         // — gated behind the ToggleDebug key so the shipped view is a
         // game screen, not a diagnostics dump.
@@ -323,7 +337,9 @@ fn build_ui(
         }
         if panels.help {
             let mut open = true;
-            csp_ui::help_panel(ctx, &settings_state.0.settings.keys, &mut open);
+            // The LIVE keymap — the staged edit copy would show
+            // pending changes the dispatch doesn't honor yet.
+            csp_ui::help_panel(ctx, &session.keys, &mut open);
             if !open {
                 panels.help = false;
             }
@@ -334,12 +350,13 @@ fn build_ui(
                 &map_ui,
                 &map_snap,
                 clock.0.ticks(),
+                &session.keys,
                 &mut maneuver_state.0,
                 &mut outbox,
             );
         }
         if mode == csp_ui::ModeSelect::Vab {
-            csp_ui::vab::vab_editor(ctx, &mut vab.0, &files, &mut vab_out);
+            csp_ui::vab::vab_editor(ctx, &mut vab.0, &files, &session.keys, &mut vab_out);
         }
         if mode == csp_ui::ModeSelect::Flight {
             csp_ui::flight_hud(
@@ -361,12 +378,12 @@ fn build_ui(
                         north: flight_ui.nav_north,
                         east: flight_ui.nav_east,
                         prograde: flight_ui.nav_prograde,
-                        heading_deg: flight_ui.heading_deg,
                     },
                     warp: warp.0,
                     vessel_count: flight_ui.vessel_count,
                     debris_count: flight_ui.debris_count,
                     sfx: &flight_ui.sfx,
+                    keys: &session.keys,
                 },
             );
         }
@@ -378,6 +395,7 @@ fn build_ui(
             &session,
             &mut outbox,
             &mut tutorial.0,
+            mode == csp_ui::ModeSelect::Vab,
         );
     }));
     // The top bar's Tutorial button re-opens the checklist — session
@@ -416,6 +434,7 @@ fn map_panels(
     map_ui: &map::MapUiData,
     map_snap: &map::MapSnapshot,
     tick: u64,
+    keys: &settings::Keymap,
     maneuver_state: &mut csp_ui::ManeuverPanelState,
     outbox: &mut UiOutbox,
 ) {
@@ -424,11 +443,13 @@ fn map_panels(
         &map_ui.focus_name,
         map_ui.camera_distance_m,
         &map_ui.labels,
+        keys,
     );
     let mut mcmd = None;
     csp_ui::maneuver_panel(
         ctx,
         tick,
+        csp_core::TICK_HZ as f64,
         &map_snap
             .vessels
             .iter()
@@ -465,6 +486,7 @@ fn m10_panels(
     session: &SessionMirror,
     outbox: &mut UiOutbox,
     tutorial: &mut csp_ui::tutorial::TutorialState,
+    in_vab: bool,
 ) {
     let mut settings_out = csp_ui::settings::SettingsPanelOutput::default();
     if settings_state.open {
@@ -473,15 +495,20 @@ fn m10_panels(
     if settings_out.reset_defaults {
         settings_state.settings = csp_ui::settings::Settings::default();
         settings_state.notice = Some("defaults restored — Apply to keep".into());
+        // The restage drops the keymap the armed capture expected —
+        // a press landing now would bind into the fresh defaults, not
+        // the rows the user armed against.
+        settings_state.listening = None;
     }
     outbox.settings_apply = settings_out.apply;
     if let Some(fatal) = &session.fatal {
         csp_ui::crash_dialog(ctx, fatal.reason(), session.fatal_bundle.as_deref());
     }
     // The first-flight checklist — drawn in every mode while active
-    // (it coaches the VAB steps from inside the editor).
+    // (it coaches the VAB steps from inside the editor, where its
+    // anchor keeps it clear of the Craft inspector).
     if tutorial.active {
-        csp_ui::tutorial::tutorial_overlay(ctx, tutorial);
+        csp_ui::tutorial::tutorial_overlay(ctx, tutorial, &session.keys, in_vab);
     }
 }
 
@@ -1019,10 +1046,20 @@ impl View {
     }
 
     /// Stage the app's live settings into the panel's edit copy —
-    /// called at startup and whenever the file is (re)loaded, so the
-    /// window always opens on the applied state.
+    /// called at startup, every time the window opens (the restage
+    /// keeps discarded edits from haunting the next session), and
+    /// whenever the file is (re)loaded, so the window always opens on
+    /// the applied state.
     pub fn stage_settings(&mut self, settings: &settings::Settings) {
         self.world.resource_mut::<SettingsPanelRes>().0.settings = settings.clone();
+    }
+
+    /// Mirror the app's live (applied) keymap into [`SessionMirror`]
+    /// — the source every hint bar and the controls card prints.
+    /// Called at startup and on each settings Apply; the staged copy
+    /// in [`SettingsPanelRes`] stays the edit buffer.
+    pub fn set_live_keymap(&mut self, keys: &settings::Keymap) {
+        self.world.resource_mut::<SessionMirror>().keys = keys.clone();
     }
 
     /// The panel's staged settings — read by `csp-app` when "Apply"
@@ -1064,11 +1101,20 @@ impl View {
         }
     }
 
+    /// Whether the settings window is open — for the app's
+    /// restage-on-open and for tests.
+    pub fn settings_panel_open(&self) -> bool {
+        self.world.resource::<SettingsPanelRes>().0.open
+    }
+
     /// The action awaiting a captured key, if the panel's "rebind" is
     /// armed — `csp-app` reads this *before* normal dispatch each key
-    /// press.
+    /// press. `None` while the window is closed even if `listening`
+    /// was left armed (e.g. an X-close raced a frame) — a capture
+    /// must never swallow keys for a panel the user cannot see.
     pub fn rebind_target(&self) -> Option<settings::KeyAction> {
-        self.world.resource::<SettingsPanelRes>().0.listening
+        let s = &self.world.resource::<SettingsPanelRes>().0;
+        if s.open { s.listening } else { None }
     }
 
     /// Disarm the rebind capture (Escape, or after a key lands).
@@ -1273,6 +1319,15 @@ impl View {
     /// editor displays); an empty/missing session falls back to a
     /// stock booster so the gate is playable out of the box. The
     /// command rides the normal §7.6 log like every mutation.
+    /// A craft that cannot resolve is refused *before* the mode
+    /// switch — the player stays in the VAB with the reason on the
+    /// session's notice row (a `VabEvent::Notice`) instead of landing
+    /// in a flight view with no vessel. Every refusal also returns
+    /// `Err` with the same text: callers with no VAB audience (the
+    /// startup seed, a headless launch) must not mistake a queued
+    /// notice nobody reads for a spawn. `Ok(())` means the
+    /// `SpawnPhysicalVessel` command is enqueued and the mode is
+    /// Flight.
     ///
     /// The spawn pose is the §2.6.4 surface record the pad implies —
     /// the dominant body's authored launch site at the *current* spin
@@ -1281,19 +1336,40 @@ impl View {
     /// vehicle, not an inertially suspended one (a spawn without the
     /// `ω × r` term reads as ~175 m/s of surface-relative slide on
     /// Terrin and sheds its stack on first contact).
-    pub fn launch_craft(&mut self) {
+    pub fn launch_craft(&mut self) -> Result<(), String> {
+        // The analysis cache is dirty-gated — the VAB's own
+        // Presentation frames refresh it, but a launch can arrive
+        // before the editor ever ran one (the demo seed, a headless
+        // spawn) or between an edit and the next frame. `effective`
+        // is bound positionally to `session.iter()`/`to_part_graph`
+        // order, so a stale cache pairs the fresh graph with another
+        // revision's resolved parts — an `EffectiveIndexOutOfRange`
+        // reject at best, silently misassigned weld inputs at worst.
+        // Recompute first: cheap when clean (`demo::seed_pad_craft`
+        // documents the same requirement).
         let craft = self.with_vab_session(|v| {
-            let session = v.session().clone();
-            let analysis = v.analysis().cloned();
-            (session, analysis)
+            v.recompute();
+            (
+                v.session().clone(),
+                v.analysis().cloned(),
+                v.analysis_error().map(str::to_string),
+            )
         });
-        let craft_def = (|| {
-            let (session, analysis) = craft;
+        let craft_def: Result<csp_sim::CraftDef, String> = (|| {
+            let (session, analysis, analysis_error) = craft;
             if session.is_empty() {
-                return Some(stock_flight_craft());
+                return Ok(stock_flight_craft());
             }
-            let (graph, _built) = session.to_part_graph().ok()?;
-            let analysis = analysis?;
+            // A non-empty session that failed to resolve cannot
+            // launch — the cached analysis error names why; without
+            // a catalog the session can hold parts (a loaded craft
+            // file) yet resolve nothing.
+            let analysis = analysis.ok_or_else(|| {
+                analysis_error.unwrap_or_else(|| {
+                    "craft could not be resolved — is the part catalog loaded?".to_string()
+                })
+            })?;
+            let (graph, _built) = session.to_part_graph().map_err(|e| e.to_string())?;
             let parts: Vec<csp_phys::WeldPart> = analysis
                 .effective
                 .iter()
@@ -1308,32 +1384,36 @@ impl View {
                 .iter()
                 .map(csp_phys::ReliabilitySpec::from_effective)
                 .collect();
-            Some(csp_sim::CraftDef {
+            Ok(csp_sim::CraftDef {
                 graph,
                 parts,
                 part_costs,
                 reliability,
             })
         })();
-        let Some(craft) = craft_def else { return };
+        let craft = match craft_def {
+            Ok(c) => c,
+            Err(reason) => return Err(self.launch_refused(reason)),
+        };
         let Some(env) = self.sim.environment().cloned() else {
-            return;
+            return Err(self.launch_refused("no system is loaded"));
         };
         let Some(dominant) = self.sim.dominant_body().cloned() else {
-            return;
+            return Err(self.launch_refused("no system is loaded"));
         };
         // The pad: the dominant body's authored launch site
-        // (`sites.ron`, `launch: true`) — falling back to the
-        // fixed-frame equator origin (lat = lon = alt = 0) for a
-        // system without sites. `config()` is a derived read (§7.3),
-        // identical for every consumer.
+        // (`sites.ron`, `launch: true`; the data validator enforces at
+        // most one per body) — falling back to the fixed-frame equator
+        // origin (lat = lon = alt = 0) for a body with no launch site.
+        // A non-launch site is a recovery site, never a pad.
+        // `config()` is a derived read (§7.3), identical for every
+        // consumer.
         let site = self
             .sim
             .config()
             .sites
             .into_values()
-            .filter(|s| s.body == dominant)
-            .reduce(|a, b| if b.launch { b } else { a });
+            .find(|s| s.body == dominant && s.launch);
         let (lat, lon, site_alt) = site.map_or((0.0, 0.0, 0.0), |s| {
             (s.latitude_rad, s.longitude_rad, s.altitude_m)
         });
@@ -1341,26 +1421,27 @@ impl View {
         // spawn altitude is the site's plus the belly depth — the lowest
         // body-frame collider vertex along the stack's up axis (+Z, the
         // VAB's build direction). Welding here mirrors exactly what
-        // `SpawnPhysicalVessel`'s apply does; a failed weld rejects
-        // there anyway, so the `0.0` fallback only dresses a doomed
-        // command. `min(0.0)` keeps an origin-below-parts craft from
-        // driving the origin itself under the datum. The same weld
-        // hands `com_local` to the restore — `vel` is the CoM slot
-        // (§2.9), so the spawn's co-rotation stamp is the velocity of
-        // `pos + rot·com_local`, not of the origin.
-        let (z_min, com_local) = csp_phys::weld(&craft.graph, &craft.parts)
-            .map(|b| {
-                (
-                    b.collider
-                        .hulls
-                        .iter()
-                        .flat_map(|h| h.vertices.iter().map(|v| v.z))
-                        .fold(f64::INFINITY, f64::min)
-                        .min(0.0),
-                    b.com_local,
-                )
-            })
-            .unwrap_or((0.0, csp_core::DVec3::ZERO));
+        // `SpawnPhysicalVessel`'s apply does — and a failed weld is a
+        // refusal like every check above: enqueueing the spawn anyway
+        // would land the player in Flight with no vessel and only a
+        // logged command reject to show for it. `min(0.0)` keeps an
+        // origin-below-parts craft from driving the origin itself
+        // under the datum. The same weld hands `com_local` to the
+        // restore — `vel` is the CoM slot (§2.9), so the spawn's
+        // co-rotation stamp is the velocity of `pos + rot·com_local`,
+        // not of the origin.
+        let (z_min, com_local) = match csp_phys::weld(&craft.graph, &craft.parts) {
+            Ok(b) => (
+                b.collider
+                    .hulls
+                    .iter()
+                    .flat_map(|h| h.vertices.iter().map(|v| v.z))
+                    .fold(f64::INFINITY, f64::min)
+                    .min(0.0),
+                b.com_local,
+            ),
+            Err(e) => return Err(self.launch_refused(e)),
+        };
         // The spawn kinematics are the §2.6.4 latch record's exact
         // restore: upright ENU pose at the site, position resolved at
         // the CURRENT tick's spin phase (the pad co-rotates — spawning
@@ -1378,7 +1459,7 @@ impl View {
             csp_sim::bubble::surface_pose_restore(&env, &pose, com_local, self.sim.clock());
         self.enqueue_command(
             SourceClass::Ui,
-            1,
+            PLAYER_SOURCE_ID,
             SimCommand::SpawnPhysicalVessel {
                 craft,
                 pos,
@@ -1387,7 +1468,19 @@ impl View {
                 ang_vel,
             },
         );
+        // Only a successfully enqueued launch leaves the VAB — every
+        // refusal above returned before this point.
         self.set_mode(ViewMode::Flight);
+        Ok(())
+    }
+
+    /// The shared refusal tail of [`View::launch_craft`]: the reason
+    /// lands on the VAB session's notice row for the player AND comes
+    /// back as the `Err` text for callers with no notice audience.
+    fn launch_refused(&mut self, reason: impl std::fmt::Display) -> String {
+        let msg = format!("launch refused — {reason}");
+        self.vab_event(vab::VabEvent::Notice(msg.clone()));
+        msg
     }
 
     /// Run a closure against the working-craft session — the plumbing

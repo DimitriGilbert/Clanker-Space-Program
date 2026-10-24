@@ -23,8 +23,28 @@
 pub struct TutorialStep {
     /// One-line checklist title ("Launch from the pad").
     pub title: &'static str,
-    /// The current-step coaching line shown under the checklist.
+    /// The current-step coaching line shown under the checklist. A
+    /// `{key}` placeholder is filled from the live keymap at draw
+    /// time (see [`Self::hint_for`]) so a rebind never leaves the
+    /// coaching line naming a key that does nothing.
     pub hint: &'static str,
+    /// The action a `{key}` placeholder in [`Self::hint`] resolves
+    /// against — `None` for a hint with no key reference.
+    pub key_action: Option<crate::settings::KeyAction>,
+}
+
+impl TutorialStep {
+    /// The coaching line with `{key}` replaced by the action's live
+    /// binding display — `"[m]"`, `"[unbound]"` when the action has
+    /// no keys.
+    fn hint_for(&self, keys: &crate::settings::Keymap) -> String {
+        match self.key_action {
+            Some(action) => self
+                .hint
+                .replace("{key}", &format!("[{}]", keys.hint(action))),
+            None => self.hint.to_string(),
+        }
+    }
 }
 
 /// Index of the LAUNCH step — the rewind anchor: when a vessel leaves
@@ -46,33 +66,40 @@ pub const SPACE_FALLBACK_ALT_M: f64 = 70_000.0;
 pub const STEPS: &[TutorialStep] = &[
     TutorialStep {
         title: "Open the Vehicle Assembly Building",
-        hint: "Open the VAB — [V] or the VAB button in the top bar.",
+        hint: "Open the VAB — {key} or the VAB button in the top bar.",
+        key_action: Some(crate::settings::KeyAction::ToggleVab),
     },
     TutorialStep {
         title: "Assemble a flyable rocket",
         hint: "Stack a command pod, a fuel tank, and an engine — the \
                readout must show thrust.",
+        key_action: None,
     },
     TutorialStep {
         title: "Launch from the pad",
         hint: "Press LAUNCH in the top bar — your craft spawns on the pad.",
+        key_action: None,
     },
     TutorialStep {
         title: "Open the throttle",
-        hint: "Spool the engine — [Z] for full throttle.",
+        hint: "Spool the engine — {key} for full throttle.",
+        key_action: Some(crate::settings::KeyAction::ThrottleFull),
     },
     TutorialStep {
         title: "Climb to 10 km",
         hint: "Hold the burn and climb — 10 km on the altimeter.",
+        key_action: None,
     },
     TutorialStep {
         title: "Reach space",
         hint: "Keep burning until you clear the atmosphere (70 km on Terrin).",
+        key_action: None,
     },
     TutorialStep {
         title: "Close the orbit",
         hint: "Pitch over to prograde near apoapsis and raise periapsis \
                above the atmosphere.",
+        key_action: None,
     },
 ];
 
@@ -236,14 +263,29 @@ impl TutorialState {
     }
 }
 
-/// The tutorial overlay — a right-top checklist card drawn in every
-/// mode (it coaches the VAB steps from inside the editor too). Pure
-/// egui over the session model: `state` mutates only through the
-/// Dismiss/Restart buttons; progress arrives via
-/// [`TutorialState::observe`], never through this function.
-pub fn tutorial_overlay(ctx: &egui::Context, state: &mut TutorialState) {
+/// The tutorial overlay — a checklist card drawn in every mode (it
+/// coaches the VAB steps from inside the editor too). Pure egui over
+/// the session model: `state` mutates only through the Dismiss/Restart
+/// buttons; progress arrives via [`TutorialState::observe`], never
+/// through this function. `keys` is the live keymap the coaching
+/// lines' `{key}` placeholders resolve against.
+///
+/// The anchor is mode-aware: the VAB's Craft inspector owns the
+/// right-top corner, so `in_vab` drops the card to center-top where
+/// it overlaps nothing; flight/map keep the free right-top slot.
+pub fn tutorial_overlay(
+    ctx: &egui::Context,
+    state: &mut TutorialState,
+    keys: &crate::settings::Keymap,
+    in_vab: bool,
+) {
+    let anchor = if in_vab {
+        (egui::Align2::CENTER_TOP, egui::vec2(0.0, 30.0))
+    } else {
+        (egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 30.0))
+    };
     egui::Window::new("First flight")
-        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 30.0))
+        .anchor(anchor.0, anchor.1)
         .collapsible(true)
         .resizable(false)
         .default_width(290.0)
@@ -281,7 +323,7 @@ pub fn tutorial_overlay(ctx: &egui::Context, state: &mut TutorialState) {
             if let Some(step) = state.current() {
                 ui.separator();
                 ui.label(
-                    egui::RichText::new(format!("Now: {}", step.hint))
+                    egui::RichText::new(format!("Now: {}", step.hint_for(keys)))
                         .color(egui::Color32::from_gray(200)),
                 );
             }
@@ -295,6 +337,15 @@ pub fn tutorial_overlay(ctx: &egui::Context, state: &mut TutorialState) {
                 ui.label(
                     egui::RichText::new(format!("best altitude: {:.1} km", state.best_alt_m / 1e3))
                         .color(egui::Color32::from_gray(150)),
+                );
+            }
+            if state.best_periapsis_m > f64::MIN {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "best periapsis: {:.1} km",
+                        state.best_periapsis_m / 1e3
+                    ))
+                    .color(egui::Color32::from_gray(150)),
                 );
             }
             ui.separator();

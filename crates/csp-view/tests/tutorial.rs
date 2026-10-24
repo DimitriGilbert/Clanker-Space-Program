@@ -114,7 +114,7 @@ fn tutorial_first_flight_progression() {
     // the pad, the same command path the LAUNCH button emits. The
     // VAB-built pod→tank→engine must mount its engine nozzle-down —
     // the AttachAuto regression this test pins end-to-end.
-    view.launch_craft();
+    view.launch_craft().expect("launch");
     frame(&mut view, 1);
     let vessel = view.flight_focus().expect("vessel on the pad");
     assert_eq!(view.tutorial_state().step, 3, "after launch");

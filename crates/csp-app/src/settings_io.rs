@@ -67,6 +67,10 @@ pub fn load_settings() -> Settings {
 }
 
 /// The path-taking half of [`load_settings`] — what tests drive.
+/// A file that parses is then sanitized: the keymap's raw-string
+/// tokens are re-validated through `Keymap::sanitize` (dropping
+/// unparseable/duplicate bindings with a warn) so a hand-edited file
+/// meets the same rules `Keymap::bind` enforces in-session.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn load_settings_from(path: &Path) -> Settings {
     let text = match std::fs::read_to_string(path) {
@@ -81,7 +85,21 @@ pub fn load_settings_from(path: &Path) -> Settings {
         }
     };
     match ron::from_str::<Settings>(&text) {
-        Ok(s) => s,
+        Ok(mut s) => {
+            // Serde's transparent `KeyBinding` accepts raw strings —
+            // a hand-edited file can carry tokens `KeyBinding::parse`
+            // would refuse (dead bindings) or one key under two
+            // actions. Re-run the model's own validation so file data
+            // meets the same rules `Keymap::bind` enforces in-session.
+            let dropped = s.keys.sanitize();
+            if dropped > 0 {
+                log::warn!(
+                    "settings: {} carried {dropped} invalid/duplicate key binding token(s) — dropped",
+                    path.display()
+                );
+            }
+            s
+        }
         Err(e) => {
             log::warn!(
                 "settings: {} is not a valid settings file ({e}) — using defaults",
@@ -119,7 +137,9 @@ pub fn load_settings() -> Settings {
     Settings::default()
 }
 
-/// wasm: settings apply for the session but cannot persist.
+/// wasm: settings apply for the session but cannot persist — the
+/// `Ok` here means "accepted for the session", and the caller's
+/// notice says "applied", never "saved".
 #[cfg(target_arch = "wasm32")]
 pub fn save_settings(_settings: &Settings) -> Result<(), String> {
     Ok(())

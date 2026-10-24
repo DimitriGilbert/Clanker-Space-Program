@@ -15,7 +15,7 @@
 use bevy_ecs::prelude::*;
 use csp_core::DVec3;
 
-use crate::flight::{FlightSnapshot, focus_vessel};
+use crate::flight::FlightSnapshot;
 use crate::vab::{VabInput, VabSessionRes};
 
 /// The tutorial session resource — `csp-view` owns it (§2.2-C), the
@@ -52,9 +52,9 @@ fn osculating_apsides(rel: DVec3, vel: DVec3, mu: f64) -> Option<(f64, f64)> {
 /// `Presentation` schedule — fold the staged mirrors into
 /// [`csp_ui::tutorial::TutorialInput`] and drive the checklist. Reads
 /// [`FlightSnapshot`] directly (not `FlightUiData`, so it stays
-/// independent of system ordering within the schedule); the focused
-/// vessel is [`focus_vessel`]'s pick — literally the same accessor
-/// `flight_present` uses.
+/// independent of system ordering within the schedule); the tracked
+/// vessel is the newest non-debris entry — the flight focus rule
+/// minus wreckage, which must not satisfy (or suppress) progress.
 pub(crate) fn tutorial_drive(
     snap: Res<FlightSnapshot>,
     vab_input: Res<VabInput>,
@@ -62,9 +62,15 @@ pub(crate) fn tutorial_drive(
     mut tutorial: ResMut<TutorialRes>,
 ) {
     let env = snap.env.as_ref();
+    // The tutorial's vessel is the newest NON-debris staged vessel —
+    // `focus_vessel`'s `last()` can pick a fresh breakup fragment, and
+    // wreckage must not count as "a vessel" at all: a climb that
+    // shatters leaves only debris, and counting it would suppress the
+    // vessel_lost rewind the checklist needs to re-guide the player.
+    let focus = snap.vessels.iter().rev().find(|v| !v.debris);
     let mut apoapsis_m = None;
     let mut periapsis_m = None;
-    if let (Some(v), Some(env)) = (focus_vessel(&snap.vessels), env)
+    if let (Some(v), Some(env)) = (focus, env)
         && let Some((ra, rp)) = osculating_apsides(v.com - env.body_center, v.vel, env.mu_m3_per_s2)
     {
         apoapsis_m = Some(ra - env.radius_m);
@@ -78,9 +84,9 @@ pub(crate) fn tutorial_drive(
             .0
             .analysis()
             .is_some_and(|a| a.stages.iter().any(|s| s.thrust_vac_n > 0.0)),
-        has_vessel: !snap.vessels.is_empty(),
-        throttle: focus_vessel(&snap.vessels).map_or(0.0, |v| v.throttle),
-        alt_m: match (focus_vessel(&snap.vessels), env) {
+        has_vessel: focus.is_some(),
+        throttle: focus.map_or(0.0, |v| v.throttle),
+        alt_m: match (focus, env) {
             (Some(v), Some(env)) => (v.com - env.body_center).norm() - env.radius_m,
             _ => 0.0,
         },
@@ -189,6 +195,43 @@ mod tests {
         let mut t = TutorialRes::default();
         drive(snap, false, &mut t);
         assert!(t.0.finished, "orbital snapshot must finish the checklist");
+    }
+
+    /// R15-F4: debris is not "a vessel" — a mid-flight shattering
+    /// leaves only wreckage staged, and the checklist must rewind to
+    /// LAUNCH rather than wait on telemetry wreckage will never
+    /// produce. A real vessel alongside debris is still tracked.
+    #[test]
+    fn debris_only_snapshot_rewinds_as_vessel_lost() {
+        let mut t = TutorialRes::default();
+        // Climb progress first — put the checklist on a flight step.
+        let climbing = FlightSnapshot {
+            env: Some(env()),
+            vessels: vec![vessel(
+                DVec3::new(6.02e5, 0.0, 0.0),
+                DVec3::new(0.0, 300.0, 400.0),
+                1.0,
+            )],
+        };
+        drive(climbing, false, &mut t);
+        assert!(t.0.step > csp_ui::tutorial::STEP_LAUNCH);
+        // The craft shatters: only a debris fragment remains staged.
+        let mut wreck = vessel(
+            DVec3::new(6.02e5, 0.0, 0.0),
+            DVec3::new(0.0, 300.0, 400.0),
+            0.0,
+        );
+        wreck.debris = true;
+        drive(
+            FlightSnapshot {
+                env: Some(env()),
+                vessels: vec![wreck],
+            },
+            false,
+            &mut t,
+        );
+        assert_eq!(t.0.step, csp_ui::tutorial::STEP_LAUNCH);
+        assert!(t.0.vessel_lost);
     }
 
     /// A sub-orbital staged snapshot advances only through the

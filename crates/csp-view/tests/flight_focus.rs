@@ -29,7 +29,7 @@ fn second_launch_moves_focus_to_the_new_vessel() {
     frame(&mut view, 1);
     let first = view.flight_focus().expect("first spawn focused");
 
-    view.launch_craft();
+    view.launch_craft().expect("second launch");
     frame(&mut view, 1);
 
     assert_eq!(view.sim.vessels().len(), 2, "second launch did not spawn");

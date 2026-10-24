@@ -183,12 +183,15 @@ pub struct MapLabel {
 ///
 /// NDC → screen: `x_px = (ndc.x + 1)/2 · w`, `y_px = (1 − ndc.y)/2 · h`
 /// — anchors off-screen (|x|,|y| > 1.2) or behind the far field are
-/// skipped.
+/// skipped. `keys` is the *live* (applied) keymap — the hint bar
+/// prints bindings, not hardcoded names, so a rebind never leaves the
+/// overlay lying about which key does what.
 pub fn map_overlay(
     ctx: &egui::Context,
     focus_name: &str,
     camera_distance_m: f64,
     labels: &[MapLabel],
+    keys: &settings::Keymap,
 ) {
     let rect = ctx.content_rect();
     egui::Area::new(egui::Id::unique("map_overlay"))
@@ -220,12 +223,20 @@ pub fn map_overlay(
                     c,
                 );
             }
+            let pan = |a: settings::KeyAction| keys.first_binding(a).unwrap_or("—");
             painter.text(
                 egui::pos2(rect.left() + 10.0, rect.bottom() - 8.0),
                 egui::Align2::LEFT_BOTTOM,
                 format!(
                     "MAP  ·  focus: {focus_name}  ·  camera {camera_distance_m:.3e} m  \
-                     —  [M] flight  [Tab] focus  drag: orbit  wheel: zoom  WASD: pan"
+                     —  [{}] flight  [{}] focus  drag: orbit  wheel: zoom  \
+                     [{}/{}/{}/{}] pan",
+                    keys.hint(settings::KeyAction::ToggleMap),
+                    keys.hint(settings::KeyAction::CycleFocus),
+                    pan(settings::KeyAction::PanUp),
+                    pan(settings::KeyAction::PanDown),
+                    pan(settings::KeyAction::PanLeft),
+                    pan(settings::KeyAction::PanRight),
                 ),
                 egui::FontId::proportional(13.0),
                 egui::Color32::from_gray(180),
@@ -235,8 +246,9 @@ pub fn map_overlay(
 
 /// Mirrors for the M4c flight HUD — populated by `csp-view`'s
 /// `flight_present` system (`FlightUiData`); `csp-ui` sees only
-/// this plain data (§2.1's dependency rule).
-#[derive(Clone, Debug, Default)]
+/// this plain data (§2.1's dependency rule). No `Default` — the
+/// borrowed keymap has no empty value to default to.
+#[derive(Clone, Debug)]
 pub struct FlightHudInput<'a> {
     /// A focused vessel exists (else the HUD shows "no vessel").
     pub has_vessel: bool,
@@ -272,6 +284,9 @@ pub struct FlightHudInput<'a> {
     /// §3.7's visual-SFX cue lines (engine, staging, impact,
     /// breakup) — drawn as top-center event flashes.
     pub sfx: &'a [String],
+    /// The *live* (applied) keymap — the hint lines print the real
+    /// bindings, never hardcoded names (`help_panel`'s rule).
+    pub keys: &'a settings::Keymap,
 }
 
 /// Number formatting for the telemetry column: KSP-style SI switch —
@@ -325,8 +340,13 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
                         .color(egui::Color32::from_gray(200)),
                 );
                 ui.label(
-                    egui::RichText::new("[V] VAB  ·  [M] map  ·  [F1] controls")
-                        .color(egui::Color32::from_gray(150)),
+                    egui::RichText::new(format!(
+                        "[{}] VAB  ·  [{}] map  ·  [{}] controls",
+                        input.keys.hint(settings::KeyAction::ToggleVab),
+                        input.keys.hint(settings::KeyAction::ToggleMap),
+                        input.keys.hint(settings::KeyAction::ToggleHelp),
+                    ))
+                    .color(egui::Color32::from_gray(150)),
                 );
                 return;
             }
@@ -342,9 +362,12 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
             };
             if input.latched {
                 ui.label(
-                    egui::RichText::new("ON PAD — [Z] to launch")
-                        .font(mono.clone())
-                        .color(egui::Color32::from_rgb(140, 220, 140)),
+                    egui::RichText::new(format!(
+                        "ON PAD — [{}] to launch",
+                        input.keys.hint(settings::KeyAction::ThrottleFull)
+                    ))
+                    .font(mono.clone())
+                    .color(egui::Color32::from_rgb(140, 220, 140)),
                 );
             }
             row(ui, "ALT", fmt_alt(input.alt_m), c);
@@ -385,8 +408,15 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
                 dim,
             );
             ui.label(
-                egui::RichText::new("[F1] controls  ·  [Z]/[X] throttle  ·  [M] map  [V] VAB")
-                    .color(egui::Color32::from_gray(140)),
+                egui::RichText::new(format!(
+                    "[{}] controls  ·  [{}]/[{}] throttle  ·  [{}] map  [{}] VAB",
+                    input.keys.hint(settings::KeyAction::ToggleHelp),
+                    input.keys.hint(settings::KeyAction::ThrottleFull),
+                    input.keys.hint(settings::KeyAction::ThrottleCut),
+                    input.keys.hint(settings::KeyAction::ToggleMap),
+                    input.keys.hint(settings::KeyAction::ToggleVab),
+                ))
+                .color(egui::Color32::from_gray(140)),
             );
         });
     // The navball — a raw painter draw beside the Area so it can sit
@@ -522,9 +552,15 @@ pub enum ManeuverCommand {
 /// edits. Vessel picker, live node status, and the placement fields:
 /// `T+` seconds to node plus the three Δv components. Emits at most
 /// one [`ManeuverCommand`] per frame.
+///
+/// `tick_hz` converts between sim ticks and the seconds the fields
+/// speak — the caller feeds `csp_core::TICK_HZ` (§2.1 keeps this crate
+/// off csp-core, so the rate arrives as a parameter rather than a
+/// hardcoded constant that could drift from the sim's real one).
 pub fn maneuver_panel(
     ctx: &egui::Context,
     tick: u64,
+    tick_hz: f64,
     vessels: &[ManeuverVessel],
     state: &mut ManeuverPanelState,
     out: &mut Option<ManeuverCommand>,
@@ -548,7 +584,7 @@ pub fn maneuver_panel(
             .find(|v| v.id == state.vessel)
             .and_then(|v| v.node)
         {
-            let eta = n.0.saturating_sub(tick) as f64 / 64.0;
+            let eta = n.0.saturating_sub(tick) as f64 / tick_hz;
             ui.label(format!("armed: T−{eta:.0} s · Δv {:.1} m/s", n.1));
         } else {
             ui.label("no node armed");
@@ -570,7 +606,7 @@ pub fn maneuver_panel(
         });
         ui.horizontal(|ui| {
             if ui.button("Set node").clicked() {
-                let ticks = (state.t_plus_s.max(0.0) * 64.0) as u64;
+                let ticks = (state.t_plus_s.max(0.0) * tick_hz) as u64;
                 *out = Some(ManeuverCommand::Set {
                     vessel: state.vessel,
                     tick: tick.saturating_add(ticks).max(tick + 1),

@@ -203,7 +203,11 @@ pub(crate) fn seed_pad_craft(view: &mut View, name: &str) -> Result<(), String> 
         Ok(())
     });
     built?;
-    view.launch_craft();
+    // A refused launch only queues a VAB Notice — nobody reads the
+    // session's notice row at startup, so the `Err` is what surfaces
+    // the failure (the caller turns it into a startup error rather
+    // than leaving a silent empty pad).
+    view.launch_craft()?;
     Ok(())
 }
 

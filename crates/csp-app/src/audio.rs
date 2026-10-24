@@ -395,6 +395,11 @@ impl AudioBackend {
                 Ok(None) => {}
             }
         }
+        // A dead player makes the whole pass a no-op — cue drains,
+        // gain writes, and `play` pushes all happen only while alive.
+        if !self.alive {
+            return;
+        }
         self.set_master(settings);
         for text in self.cues.drain_new(&sfx.cues) {
             match cue_shot(&text) {
@@ -407,9 +412,6 @@ impl AudioBackend {
                     }
                 }
             }
-        }
-        if !self.alive {
-            return;
         }
 
         // Continuous voices: amplitude follows the focused vessel —
