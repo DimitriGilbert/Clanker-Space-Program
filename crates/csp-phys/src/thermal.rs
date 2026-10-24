@@ -38,7 +38,14 @@
 //!   because authored couplings satisfy `G·dt/C ≪ 1` (W/K vs J/K) and
 //!   the radiation Jacobian `4εσA·T³/C` is likewise tiny at every
 //!   temperature that survives a tick. No implicit solve is warranted
-//!   at this dt.
+//!   at this dt. The stability contract is *enforced on inputs*, not
+//!   left to chance: `weld` rejects any attachment edge whose
+//!   coupling violates `G·dt·(1/C_a + 1/C_b) < 2`
+//!   ([`crate::weld::WeldError::UnstableThermalCoupling`]), and
+//!   [`step`] withholds any still-non-finite writeback — a hand-built
+//!   or restore-corrupt net can no longer put NaN into the serialized
+//!   temperature map, where it evaded the lethality gate and surfaced
+//!   as a `Fatal` at the next `state_hash`.
 //!
 //! # Conduction coupling (§3.1 `conduction_w_per_k`)
 //!
@@ -85,7 +92,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use csp_core::DVec3;
+use csp_core::{DVec3, SimError};
 
 use crate::aero::CraftAeroTables;
 use crate::graph::PartNodeId;
@@ -281,6 +288,19 @@ fn node_index(net: &ThermalNet, id: PartNodeId) -> Option<usize> {
 /// consistent snapshot. Returns the nodes that ended the tick above
 /// `max_temp_k`, ascending — the §3.4 thermal lethality trigger the
 /// caller applies.
+///
+/// The writeback is guarded: an explicit-Euler `new_t` that lands
+/// non-finite (a coupling past the `G·dt·(1/C_a + 1/C_b) < 2` bound
+/// the weld enforces, a radiation runaway from corrupt inputs) is
+/// *withheld* — the node keeps its pre-tick temperature, so nothing
+/// non-finite can enter the serialized map or hop an edge through it
+/// next tick (NaN also evaded the `new_t > max_temp_k` lethality
+/// gate, which is what let the poison spread before surfacing as a
+/// `Fatal` at `state_hash`). The pass still completes — every finite
+/// update lands and lethality is collected normally — then reports
+/// `Err(SimError::Recoverable)`: the §2.13 "bounded subsystem
+/// failed" fallback is the logged skip of the diverged node's tick,
+/// never a crash deferred to the hash.
 pub fn step(
     net: &ThermalNet,
     aero: Option<&CraftAeroTables>,
@@ -288,7 +308,7 @@ pub fn step(
     temps: &mut BTreeMap<PartNodeId, f64>,
     rates: &mut Vec<f64>,
     dt: f64,
-) -> Vec<PartNodeId> {
+) -> Result<Vec<PartNodeId>, SimError> {
     rates.clear();
     rates.resize(net.nodes.len(), 0.0);
 
@@ -347,6 +367,7 @@ pub fn step(
         a2 * a2
     };
     let mut overheated = Vec::new();
+    let mut diverged = false;
     for (i, n) in net.nodes.iter().enumerate() {
         let Some(&t) = temps.get(&n.node) else {
             continue;
@@ -354,12 +375,23 @@ pub fn step(
         let t2 = t * t;
         rates[i] += n.emissivity * STEFAN_BOLTZMANN_W_M2_K4 * n.radiative_area_m2 * (a4 - t2 * t2);
         let new_t = t + dt * rates[i] / n.heat_capacity_j_per_k;
-        temps.insert(n.node, new_t);
-        if new_t > n.max_temp_k {
-            overheated.push(n.node);
+        if new_t.is_finite() {
+            temps.insert(n.node, new_t);
+            if new_t > n.max_temp_k {
+                overheated.push(n.node);
+            }
+        } else {
+            // Withheld — the node keeps its finite pre-tick
+            // temperature; the divergence reports below.
+            diverged = true;
         }
     }
-    overheated
+    if diverged {
+        return Err(SimError::Recoverable(
+            "thermal: explicit step produced a non-finite temperature",
+        ));
+    }
+    Ok(overheated)
 }
 
 /// The harmonic-mean joint conductance `2·k_a·k_b/(k_a+k_b)` derated
@@ -475,7 +507,8 @@ mod tests {
                 &mut temps,
                 &mut rates,
                 crate::simple::PHYSICS_DT,
-            );
+            )
+            .unwrap();
             assert!(hot.is_empty());
         }
         let t = temps[&PartNodeId(0)];
@@ -523,7 +556,8 @@ mod tests {
                 &mut temps,
                 &mut rates,
                 crate::simple::PHYSICS_DT,
-            );
+            )
+            .unwrap();
         }
         let (t0, t1) = (temps[&PartNodeId(0)], temps[&PartNodeId(1)]);
         assert!((t0 - t1).abs() < 0.1, "not equalized: {t0} vs {t1}");
@@ -571,7 +605,8 @@ mod tests {
                 &mut temps,
                 &mut rates,
                 crate::simple::PHYSICS_DT,
-            );
+            )
+            .unwrap();
             let t = temps[&PartNodeId(0)];
             assert!(t >= last - 1e-9, "non-monotone approach: {last} -> {t}");
             assert!(t < t_ss, "overshot steady state: {t} >= {t_ss}");
@@ -605,7 +640,8 @@ mod tests {
             &mut temps,
             &mut Vec::new(),
             crate::simple::PHYSICS_DT,
-        );
+        )
+        .unwrap();
         assert_eq!(hot, vec![PartNodeId(1)]);
     }
 
@@ -658,7 +694,8 @@ mod tests {
                     &mut temps,
                     &mut rates,
                     crate::simple::PHYSICS_DT,
-                );
+                )
+                .unwrap();
             }
             temps
         };
@@ -667,6 +704,112 @@ mod tests {
         for (k, v) in &a {
             assert_eq!(v.to_bits(), b[k].to_bits());
         }
+    }
+
+    /// R13-F2(a): a hand-built net whose coupling is past the
+    /// explicit-Euler bound `G·dt·(1/C_a + 1/C_b) < 2` diverges in a
+    /// few ticks. The writeback guard withholds the non-finite
+    /// result: the call reports a typed `Recoverable` and the
+    /// serialized map stays finite — no NaN spread, no `Fatal`
+    /// deferred to the next `state_hash`.
+    #[test]
+    fn divergent_net_reports_recoverable_not_nan() {
+        // G·dt·(1/C_a + 1/C_b) ≈ 3e295 ≫ 2 — the two-lump difference
+        // map's multiplier `1 − G·dt·(1/C_a + 1/C_b)` is ~−3e295, so
+        // the separation blows past f64 range on the second tick.
+        let node = |id: u64| ThermalNode {
+            node: PartNodeId(id),
+            heat_capacity_j_per_k: 1_000.0,
+            max_temp_k: 1e30, // lethality cannot stop the divergence
+            emissivity: 0.0,
+            radiative_area_m2: 0.0,
+            aabb_lo: DVec3::ZERO,
+            aabb_hi: DVec3::ZERO,
+        };
+        let net = ThermalNet {
+            nodes: vec![node(0), node(1)],
+            edges: vec![ThermalEdge {
+                a: PartNodeId(0),
+                b: PartNodeId(1),
+                conductance_w_per_k: 1e300,
+            }],
+        };
+        let flow = ThermalFlow {
+            ambient_k: 0.0,
+            density_kg_m3: 0.0,
+            speed_mps: 0.0,
+            dir_body: DVec3::new(0.0, 0.0, -1.0),
+        };
+        let mut temps = BTreeMap::from([(PartNodeId(0), 300.0), (PartNodeId(1), 500.0)]);
+        let mut rates = Vec::new();
+        let mut err = None;
+        for _ in 0..16 {
+            match step(
+                &net,
+                None,
+                &flow,
+                &mut temps,
+                &mut rates,
+                crate::simple::PHYSICS_DT,
+            ) {
+                Ok(_) => assert!(
+                    temps.values().all(|t| t.is_finite()),
+                    "a pre-error tick wrote a non-finite temperature"
+                ),
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            err,
+            Some(SimError::Recoverable(
+                "thermal: explicit step produced a non-finite temperature"
+            )),
+            "divergence must surface as a typed error, not silent state"
+        );
+        assert!(
+            temps.values().all(|t| t.is_finite()),
+            "the withheld writeback keeps the serialized map finite"
+        );
+    }
+
+    /// R13-F2(b): the weld refuses an attachment whose conductance
+    /// and endpoint heat capacities violate the coupled bound
+    /// `G·dt·(1/C_a + 1/C_b) < 2` — the net it would emit is one the
+    /// tick cannot integrate.
+    #[test]
+    fn weld_rejects_divergent_coupling() {
+        let mut g = PartGraph::new(PartNodeId(0));
+        g.insert(
+            PartNodeId(0),
+            PartNode::new(None, PartTransform::IDENTITY, 0),
+        );
+        g.insert(
+            PartNodeId(1),
+            PartNode::new(
+                Some(PartNodeId(0)),
+                PartTransform::new(DVec3::new(0.0, 0.0, 2.0), DQuat::IDENTITY),
+                1,
+            ),
+        );
+        // C = 1 J/K a side, k = 200 W/K a side → G = 200 at full
+        // contact → 200·(1/64)·(1 + 1) = 6.25 ≥ 2.
+        let td = thermal_def(1.0, 1_000.0, 0.8, 200.0);
+        let parts = [part(100.0, 1.0, td.clone()), part(100.0, 1.0, td)];
+        assert!(matches!(
+            weld(&g, &parts),
+            Err(crate::weld::WeldError::UnstableThermalCoupling {
+                a: PartNodeId(0),
+                b: PartNodeId(1),
+            })
+        ));
+        // Just under the bound welds fine — the check is the coupled
+        // product, not either field alone.
+        let td = thermal_def(50.0, 1_000.0, 0.8, 200.0);
+        let parts = [part(100.0, 1.0, td.clone()), part(100.0, 1.0, td)];
+        assert!(weld(&g, &parts).is_ok());
     }
 
     /// `joint_conductance` degenerate inputs produce zero coupling,

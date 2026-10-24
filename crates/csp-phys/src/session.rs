@@ -65,17 +65,22 @@
 //!
 //! KSP's rule: **higher stage numbers fire earlier** — the firing
 //! order is strictly descending (`stage_order`). New parts default to
-//! stage `0`, the last-fired floor. A [`ModuleDef::Decoupler`] part
+//! stage `0`, the last-fired floor, and indices are capped at
+//! [`MAX_STAGE_INDEX`] (`set_stage`/`insert_stage` refuse more — a
+//! saturating add may never merge two stages). A
+//! [`ModuleDef::Decoupler`] part
 //! severs *all its child edges* when its stage fires ("the attach node
 //! below this part severs" — the decoupler stays with the parent side;
 //! radial children depart too — a documented simplification for v1's
 //! single-child decouplers).
 //!
 //! [`CraftSession::validate`] returns a [`Validation`] with two lists.
-//! *Errors* make the craft unlaunchable (missing defs, stored `built`
-//! records failing the shared scale/variant gate, bindings naming
-//! attach nodes the defs don't carry — reachable only through corrupt
-//! files or callers mutating behind the session's back). *Warnings*
+//! *Errors* make the craft unlaunchable: an empty craft (matching
+//! `to_part_graph`'s `EmptySession` refusal), missing defs, stored
+//! `built` records failing the shared scale/variant/upgrade gate,
+//! out-of-cap stage indices, or bindings naming attach nodes the
+//! defs don't carry — the last four reachable only through corrupt
+//! files or callers mutating behind the session's back. *Warnings*
 //! are editor surfacing: an empty stage index in the firing sequence,
 //! a decoupler with no children to sever, a post-scale diameter
 //! mismatch, and **an engine whose stage leaves it no propellant** —
@@ -121,7 +126,7 @@ use serde::{Deserialize, Serialize};
 
 use csp_core::{DQuat, DVec3, SimError};
 use csp_data::{
-    AttachNode, LoadedParts, ModuleDef, PartDef, PartId, ResourceId, ScaleRule, VariantId,
+    AttachNode, LoadedParts, ModuleDef, PartDef, PartId, ResourceId, ScaleRule, StatPath, VariantId,
 };
 
 use crate::graph::{PartGraph, PartNode, PartNodeId, PartTransform};
@@ -156,11 +161,22 @@ const MIN_DIRECTION_NORM: f64 = 1e-9;
 const ARC_PARALLEL_EPS: f64 = 1e-12;
 
 /// Cap on individually reported [`SessionWarning::EmptyStage`] gaps.
-/// Stage indices are unbounded `u32`s, so a crafted file staging a
-/// part at `u32::MAX` spans ~4 G empty indices — iterating the span
-/// OOMs `validate`. Gaps past the cap fold into one
+/// Crafted files can still carry stage indices above
+/// [`MAX_STAGE_INDEX`] — a file staging a part at `u32::MAX` spans
+/// ~4 G empty indices, and iterating the span would OOM `validate`.
+/// Gaps past the cap fold into one
 /// [`SessionWarning::EmptyStagesOmitted`] summary.
 const MAX_EMPTY_STAGE_WARNINGS: usize = 8;
+
+/// Highest legal stage index — the cap `set_stage`/`insert_stage`
+/// enforce and `validate` re-checks. Stage indices were unbounded
+/// `u32`s, which let `insert_stage`'s `saturating_add(1)` silently
+/// merge two stages at `u32::MAX`; bounding the index space makes
+/// saturation unreachable through the ops (999 stages is far past
+/// any real staging scheme). Crafted files can still carry larger
+/// indices — `validate` flags them as [`SessionError::InvalidStage`]
+/// rather than trusting the op-level cap.
+pub const MAX_STAGE_INDEX: u32 = 999;
 
 /// Which attach node of the parent mates which attach node of the
 /// child — the §3.1 `(part_node, node_id)` pair a craft file
@@ -320,6 +336,34 @@ pub enum SessionError {
         /// The missing variant id.
         variant: VariantId,
     },
+    /// A frozen `upgrade_levels_at_build` entry the resolver would
+    /// refuse at commit — `check_built`'s third arm (after scale and
+    /// variant): the [`StatPath`] must resolve on the def
+    /// (`StatPath::base_value`) and the composed multiplier must be
+    /// finite and `> 0`. Without the gate a bad `TrackLevels` would
+    /// serialize into the craft file and fail later at
+    /// `resolve::fold_multipliers`.
+    InvalidUpgrade {
+        /// The node carrying the record.
+        node: PartNodeId,
+        /// The offending entry's stat path.
+        stat: StatPath,
+        /// Which constraint failed.
+        detail: &'static str,
+    },
+    /// A stage index above [`MAX_STAGE_INDEX`] — from `set_stage`,
+    /// `insert_stage`, or a crafted file surfaced by `validate`.
+    /// Stage indices are bounded so a saturating add can never
+    /// silently merge two stages.
+    InvalidStage {
+        /// The node being restaged — `None` for `insert_stage`, which
+        /// names no node.
+        node: Option<PartNodeId>,
+        /// The offending index.
+        stage: u32,
+        /// Which constraint failed.
+        detail: &'static str,
+    },
     /// `next_id` hit `u64::MAX` — ids are never reused, so the session
     /// refuses rather than collide. Unreachable in practice; typed so
     /// the allocator has no wraparound path.
@@ -371,6 +415,19 @@ impl fmt::Display for SessionError {
             Self::UnknownVariant { node, variant } => {
                 write!(f, "session: node {node:?} has no variant {variant}")
             }
+            Self::InvalidUpgrade { node, stat, detail } => write!(
+                f,
+                "session: node {node:?} upgrade on {}: {detail}",
+                stat.name()
+            ),
+            Self::InvalidStage {
+                node,
+                stage,
+                detail,
+            } => match node {
+                Some(n) => write!(f, "session: node {n:?} stage {stage}: {detail}"),
+                None => write!(f, "session: stage {stage}: {detail}"),
+            },
             Self::IdSpaceExhausted => write!(f, "session: part id space exhausted"),
             Self::IndexOverflow => {
                 write!(f, "session: node count exceeds the u32 weld index space")
@@ -728,6 +785,28 @@ fn check_built(def: &PartDef, built: &BuiltPart, node: PartNodeId) -> Result<(),
             variant: built.variant.clone(),
         });
     }
+    // Third arm: the frozen upgrade entries. `fold_multipliers`
+    // enforces both rules at commit — the stat path must resolve on
+    // this def (`StatPath::base_value`) and the composed multiplier
+    // must be positive and finite — but an ungated record would
+    // serialize into the craft file and only fail on launch, so the
+    // boundary check runs them here too.
+    for (path, tl) in &built.upgrade_levels_at_build {
+        if path.base_value(def).is_none() {
+            return Err(SessionError::InvalidUpgrade {
+                node,
+                stat: *path,
+                detail: "session: upgrade stat path does not resolve on this part",
+            });
+        }
+        if !tl.multiplier.is_finite() || tl.multiplier <= 0.0 {
+            return Err(SessionError::InvalidUpgrade {
+                node,
+                stat: *path,
+                detail: "session: upgrade multiplier is not positive and finite",
+            });
+        }
+    }
     Ok(())
 }
 
@@ -1043,6 +1122,25 @@ impl CraftSession {
                 detail: "session: child attach direction is not finite/non-zero",
             });
         }
+        // `position_m` gates (R14-F3): a non-finite node position
+        // yields a NaN-offset transform from `snap_transform`, which
+        // `to_bytes` would write verbatim and `from_file` refuse —
+        // a session could save a file it cannot reload. Checked here,
+        // the boundary where it can still be a typed error.
+        if !pn.position_m.is_finite() {
+            return Err(SessionError::IncompatibleAttach {
+                parent: edge.parent,
+                child_part: built.part_id.clone(),
+                detail: "session: parent attach position is non-finite",
+            });
+        }
+        if !cn.position_m.is_finite() {
+            return Err(SessionError::IncompatibleAttach {
+                parent: edge.parent,
+                child_part: built.part_id.clone(),
+                detail: "session: child attach position is non-finite",
+            });
+        }
         if !pn.diameter_m.is_finite()
             || !cn.diameter_m.is_finite()
             || !diameters_match(pn.diameter_m, cn.diameter_m)
@@ -1053,7 +1151,19 @@ impl CraftSession {
                 detail: "session: attach-node size classes do not match",
             });
         }
-        Ok(snap_transform(&pn, &cn))
+        let transform = snap_transform(&pn, &cn);
+        // Output gate: with the inputs above checked the snap is
+        // finite, but the stored transform is what the file and the
+        // weld consume — verify it against the same `is_valid` rule
+        // `set_transform` enforces before any caller stores it.
+        if !transform.is_valid() {
+            return Err(SessionError::IncompatibleAttach {
+                parent: edge.parent,
+                child_part: built.part_id.clone(),
+                detail: "session: snap produced an invalid transform",
+            });
+        }
+        Ok(transform)
     }
 
     /// Remove `id` and its whole subtree (the §2.4 editor rule for a
@@ -1265,10 +1375,20 @@ impl CraftSession {
         Ok(())
     }
 
-    /// Assign `id` to stage `stage`. Stage indices are unbounded
-    /// `u32`s; gaps are legal mid-edit and surface as
-    /// [`SessionWarning::EmptyStage`] in `validate`.
+    /// Assign `id` to stage `stage`. Indices are bounded by
+    /// [`MAX_STAGE_INDEX`] — larger values are refused so no stage
+    /// can sit at the `u32` saturation point where [`Self::insert_stage`]
+    /// would merge it with the next insertion. Gaps are legal
+    /// mid-edit and surface as [`SessionWarning::EmptyStage`] in
+    /// `validate`.
     pub fn set_stage(&mut self, id: PartNodeId, stage: u32) -> Result<(), SessionError> {
+        if stage > MAX_STAGE_INDEX {
+            return Err(SessionError::InvalidStage {
+                node: Some(id),
+                stage,
+                detail: "session: stage index exceeds the maximum",
+            });
+        }
         let node = self
             .nodes
             .get_mut(&id)
@@ -1314,14 +1434,39 @@ impl CraftSession {
         self.populated_stages().last().copied()
     }
 
-    /// Open a gap at `at`: every part with `stage ≥ at` moves up one
-    /// (saturating — a `u32::MAX` stage cannot move and stays put).
-    pub fn insert_stage(&mut self, at: u32) {
+    /// Open a gap at `at`: every part with `stage ≥ at` moves up one.
+    /// `at` is capped by [`MAX_STAGE_INDEX`], and an insert that
+    /// would push a part already at the cap is **refused**, not
+    /// saturated — two stages can never silently merge (the
+    /// `u32::MAX` `saturating_add` behaviour this replaced). Atomic:
+    /// both checks run before any mutation. Nodes carrying an
+    /// out-of-cap stage (only reachable via a crafted file —
+    /// `validate` flags them) are left where they are.
+    pub fn insert_stage(&mut self, at: u32) -> Result<(), SessionError> {
+        if at > MAX_STAGE_INDEX {
+            return Err(SessionError::InvalidStage {
+                node: None,
+                stage: at,
+                detail: "session: stage index exceeds the maximum",
+            });
+        }
+        if self
+            .nodes
+            .values()
+            .any(|n| n.stage >= at && n.stage == MAX_STAGE_INDEX)
+        {
+            return Err(SessionError::InvalidStage {
+                node: None,
+                stage: at,
+                detail: "session: insert would push a part past the stage cap",
+            });
+        }
         for n in self.nodes.values_mut() {
-            if n.stage >= at {
-                n.stage = n.stage.saturating_add(1);
+            if n.stage >= at && n.stage < MAX_STAGE_INDEX {
+                n.stage += 1;
             }
         }
+        Ok(())
     }
 
     /// Delete stage `at`: parts in it fold to `at − 1` (stage 0 is the
@@ -1381,12 +1526,30 @@ impl CraftSession {
 
     /// The two-tier check the VAB's validate button and the commit
     /// path share — see the module doc. `defs` is the part catalog;
-    /// nodes whose defs are missing — or whose stored `built` fails the
-    /// shared scale/variant gate — land in `errors`.
+    /// an empty session, a node whose def is missing, whose stored
+    /// `built` fails the shared scale/variant/upgrade gate, or whose
+    /// stage index exceeds [`MAX_STAGE_INDEX`] lands in `errors`.
     pub fn validate(&self, defs: &LoadedParts) -> Validation {
         let mut out = Validation::default();
+        // An empty session is not launchable — `to_part_graph`
+        // refuses it (`EmptySession`), so `validate` must agree
+        // rather than report a clean bill on a craft that cannot
+        // commit.
+        if self.nodes.is_empty() {
+            out.errors.push(SessionError::EmptySession);
+        }
         let mut def_of: BTreeMap<PartNodeId, &PartDef> = BTreeMap::new();
         for (id, n) in &self.nodes {
+            // Out-of-cap stage index — only reachable via a crafted
+            // file (the ops gate it), flagged like the other
+            // file-bypassed checks below.
+            if n.stage > MAX_STAGE_INDEX {
+                out.errors.push(SessionError::InvalidStage {
+                    node: Some(*id),
+                    stage: n.stage,
+                    detail: "session: stage index exceeds the maximum",
+                });
+            }
             match find_def(defs, &n.built.part_id) {
                 Some(d) => {
                     def_of.insert(*id, d);
@@ -2153,7 +2316,7 @@ mod tests {
         assert_eq!(s.next_stage(), Some(2));
         assert_eq!(s.parts_in_stage(0), vec![pod]);
         // insert at 1 pushes the old stage 1/2 up.
-        s.insert_stage(1);
+        s.insert_stage(1).unwrap();
         assert_eq!(s.stage_of(tank), Some(2));
         assert_eq!(s.stage_of(eng), Some(3));
         // remove 2: tank folds to 1, engine shifts 3 → 2.
@@ -2242,23 +2405,34 @@ mod tests {
         )));
     }
 
-    /// A crafted file can stage a part at `u32::MAX` — `validate` must
+    /// A crafted file can stage a part at `u32::MAX` — the ops refuse
+    /// indices past [`MAX_STAGE_INDEX`], so this is a *file-level*
+    /// attack: `validate` flags it as `InvalidStage` AND must still
     /// bound its empty-stage reporting, not emit ~4 G warnings (OOM).
     #[test]
     fn validate_bounds_empty_stage_warnings() {
         let defs = stack_catalog();
         let mut s = CraftSession::new();
         let pod = s.add_root(&defs, stock("test.hull")).unwrap();
-        let sky = s
-            .add_part(
-                &defs,
-                stock("test.tank"),
-                AttachEdge::new(pod, "bottom", "top"),
-            )
-            .unwrap();
-        s.set_stage(sky, u32::MAX).unwrap();
-        let v = s.validate(&defs);
-        assert!(v.is_launchable());
+        s.add_part(
+            &defs,
+            stock("test.tank"),
+            AttachEdge::new(pod, "bottom", "top"),
+        )
+        .unwrap();
+        // The ops cap stage indices — forge the file a crafted load
+        // would produce.
+        let mut f = file_of(&s);
+        f.nodes[1].stage = u32::MAX;
+        let forged = CraftSession::from_bytes(&encode(&f)).unwrap();
+        let v = forged.validate(&defs);
+        assert!(!v.is_launchable());
+        assert!(
+            v.errors.iter().any(
+                |e| matches!(e, SessionError::InvalidStage { stage, .. } if *stage == u32::MAX)
+            ),
+            "out-of-cap stage must error: {v:?}"
+        );
         // The 0..=u32::MAX span holds 4_294_967_294 gaps for these two
         // parts: the cap report individually, one summary carries the rest.
         assert_eq!(v.warnings.len(), MAX_EMPTY_STAGE_WARNINGS + 1);
@@ -2549,5 +2723,223 @@ mod tests {
             CraftSession::from_bytes(&encode(&f)),
             Err(CraftFileError::BadTransform { .. })
         ));
+    }
+
+    /// R14-F3: a non-finite `position_m` on either side of an edge is
+    /// refused at `compute_attach` — before the fix, `snap_transform`
+    /// produced a NaN-offset transform that `to_bytes` wrote verbatim
+    /// and `from_file` refused: a session could save a file it could
+    /// not reload.
+    #[test]
+    fn attach_rejects_nonfinite_node_positions() {
+        let broken_child = {
+            let mut d = def("test.broken.child", 1.0, 0.5, Vec::new());
+            d.attach_nodes[0].position_m = DVec3::new(f64::NAN, 0.0, 0.5);
+            d
+        };
+        let broken_parent = {
+            let mut d = def("test.broken.parent", 1.0, 0.5, Vec::new());
+            d.attach_nodes[1].position_m = DVec3::new(0.0, f64::INFINITY, -0.5);
+            d
+        };
+        let defs = catalog(vec![
+            def("test.hull", 1.0, 0.5, Vec::new()),
+            broken_child,
+            broken_parent,
+        ]);
+        let mut s = CraftSession::new();
+        let pod = s.add_root(&defs, stock("test.hull")).unwrap();
+        // Child-side NaN position.
+        assert!(matches!(
+            s.add_part(
+                &defs,
+                stock("test.broken.child"),
+                AttachEdge::new(pod, "bottom", "top"),
+            ),
+            Err(SessionError::IncompatibleAttach { .. })
+        ));
+        // Parent-side inf position — the broken part roots fine (a
+        // root has no edge), it just can't be attached under.
+        let bp = s.add_root(&defs, stock("test.broken.parent"));
+        assert!(matches!(bp, Err(SessionError::AlreadyRooted { .. })));
+        let mut s2 = CraftSession::new();
+        let bp = s2.add_root(&defs, stock("test.broken.parent")).unwrap();
+        assert!(matches!(
+            s2.add_part(
+                &defs,
+                stock("test.hull"),
+                AttachEdge::new(bp, "bottom", "top"),
+            ),
+            Err(SessionError::IncompatibleAttach { .. })
+        ));
+        // Refused attaches consumed no ids.
+        assert_eq!(s.len(), 1);
+        assert_eq!(s2.len(), 1);
+    }
+
+    /// R14-F3's round-trip half: every transform the ops can store is
+    /// `is_valid`, so `to_bytes` → `from_bytes` on an op-built session
+    /// can never hit `BadTransform`. (The file-level gate itself is
+    /// covered by `load_rejects_structural_corruption`; here a forged
+    /// NaN *offset* proves the same net catches what the ops now
+    /// refuse.)
+    #[test]
+    fn op_built_session_always_reloads() {
+        let (mut s, ..) = stack();
+        let eng = s.iter().map(|(id, _)| id).last().unwrap();
+        s.set_transform(
+            eng,
+            PartTransform::new(DVec3::new(1.0, -2.0, 0.5), DQuat::IDENTITY),
+        )
+        .unwrap();
+        for (_, n) in s.iter() {
+            assert!(n.transform().is_valid());
+        }
+        let bytes = s.to_bytes().unwrap();
+        assert!(CraftSession::from_bytes(&bytes).is_ok());
+        // The loader's net is still live for crafted files.
+        let mut f = file_of(&s);
+        f.nodes[1].transform.offset = DVec3::new(f64::NAN, 0.0, 0.0);
+        assert!(matches!(
+            CraftSession::from_bytes(&encode(&f)),
+            Err(CraftFileError::BadTransform { .. })
+        ));
+    }
+
+    /// R14-F4: `check_built`'s upgrade arm — an unresolvable
+    /// `StatPath` or a non-positive/non-finite multiplier fails at
+    /// the boundary (`add_root`/`add_part`), and a crafted file
+    /// carrying the same record fails at `validate`.
+    #[test]
+    fn check_built_rejects_invalid_upgrade_levels() {
+        use crate::resolve::TrackLevels;
+
+        let defs = stack_catalog();
+        // Unresolvable path: the hull def carries no Engine/Control,
+        // so `ThrustVacN` has no `base_value` on it.
+        let mut b = stock("test.hull");
+        b.upgrade_levels_at_build.insert(
+            StatPath::ThrustVacN,
+            TrackLevels {
+                levels: 1,
+                multiplier: 1.1,
+            },
+        );
+        let mut s = CraftSession::new();
+        assert!(matches!(
+            s.add_root(&defs, b),
+            Err(SessionError::InvalidUpgrade {
+                stat: StatPath::ThrustVacN,
+                ..
+            })
+        ));
+        // Non-finite and non-positive multipliers on a path that does
+        // resolve (`MassDryKg` is present on every def).
+        for m in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
+            let mut b = stock("test.hull");
+            b.upgrade_levels_at_build.insert(
+                StatPath::MassDryKg,
+                TrackLevels {
+                    levels: 1,
+                    multiplier: m,
+                },
+            );
+            assert!(
+                matches!(
+                    s.add_root(&defs, b),
+                    Err(SessionError::InvalidUpgrade { .. })
+                ),
+                "multiplier {m} must fail"
+            );
+        }
+        // A clean record is accepted (the engine part's MassDryKg).
+        let mut b = stock("test.engine");
+        b.upgrade_levels_at_build.insert(
+            StatPath::MassDryKg,
+            TrackLevels {
+                levels: 2,
+                multiplier: 0.9,
+            },
+        );
+        // ...rooted on a fresh session since `s` still has no root
+        // (all adds above failed — allocator untouched).
+        let n = s.add_root(&defs, b).unwrap();
+        assert_eq!(n, PartNodeId(0));
+        // The same record reaching `validate` through a forged file
+        // is flagged there too — `ControlTorqueNm` does not resolve on
+        // the engine def (no Control module).
+        let mut f = file_of(&s);
+        f.nodes[0].built.upgrade_levels_at_build.insert(
+            StatPath::ControlTorqueNm,
+            TrackLevels {
+                levels: 1,
+                multiplier: 1.1,
+            },
+        );
+        let forged = CraftSession::from_bytes(&encode(&f)).unwrap();
+        let v = forged.validate(&defs);
+        assert!(
+            v.errors.iter().any(|e| matches!(
+                e,
+                SessionError::InvalidUpgrade {
+                    stat: StatPath::ControlTorqueNm,
+                    ..
+                }
+            )),
+            "forged unresolvable upgrade must error: {v:?}"
+        );
+    }
+
+    /// An empty session validates as unlaunchable — `to_part_graph`
+    /// refuses it (`EmptySession`) so `validate` must agree (R14-F7).
+    #[test]
+    fn empty_session_is_a_validation_error() {
+        let defs = stack_catalog();
+        let v = CraftSession::new().validate(&defs);
+        assert!(!v.is_launchable());
+        assert_eq!(v.errors, vec![SessionError::EmptySession]);
+    }
+
+    /// R14-F8: stage indices are capped — `set_stage` and
+    /// `insert_stage` refuse inputs past [`MAX_STAGE_INDEX`], and an
+    /// insert with no headroom at the cap fails instead of merging.
+    #[test]
+    fn stage_indices_are_capped() {
+        let (mut s, _, _, tank, eng) = stack();
+        assert!(matches!(
+            s.set_stage(tank, MAX_STAGE_INDEX + 1),
+            Err(SessionError::InvalidStage { .. })
+        ));
+        assert!(matches!(
+            s.set_stage(tank, u32::MAX),
+            Err(SessionError::InvalidStage { .. })
+        ));
+        assert_eq!(s.stage_of(tank), Some(0)); // unchanged on refusal
+        assert!(matches!(
+            s.insert_stage(MAX_STAGE_INDEX + 1),
+            Err(SessionError::InvalidStage { .. })
+        ));
+        // Legal cap value works.
+        s.set_stage(tank, MAX_STAGE_INDEX).unwrap();
+        assert_eq!(s.stage_of(tank), Some(MAX_STAGE_INDEX));
+        // An insert that would push the capped part past the cap is
+        // refused — never saturated into a silent merge.
+        assert!(matches!(
+            s.insert_stage(0),
+            Err(SessionError::InvalidStage { .. })
+        ));
+        assert_eq!(s.stage_of(tank), Some(MAX_STAGE_INDEX));
+        // Inserting at the cap itself also fails while a part sits
+        // there — every legal insert preserves it, never merges.
+        assert!(matches!(
+            s.insert_stage(MAX_STAGE_INDEX),
+            Err(SessionError::InvalidStage { .. })
+        ));
+        // And a normal insert still shifts.
+        s.set_stage(tank, 2).unwrap();
+        s.set_stage(eng, 3).unwrap();
+        s.insert_stage(2).unwrap();
+        assert_eq!(s.stage_of(tank), Some(3));
+        assert_eq!(s.stage_of(eng), Some(4));
     }
 }

@@ -443,8 +443,11 @@ pub struct ResolvedReliability {
 /// runs on: manufacture-frozen stats with the weld input embedded.
 ///
 /// Produced only by [`resolve_part`]/[`resolve_parts`] (which is why
-/// construction guarantees hold: every number is finite, `mass_kg >
-/// 0`, stat paths resolved). Serialized for craft-file and tooling
+/// construction guarantees hold: every emitted numeric family is
+/// gated at the stage that produces it — `resolve_stats`,
+/// `resolve_envelopes`, `resolve_weld_input`, `resolve_reliability` —
+/// so every number is finite, `mass_kg > 0`, and stat paths
+/// resolved). Serialized for craft-file and tooling
 /// symmetry with [`WeldPart`]; the §7.2 record of truth remains the
 /// [`BuiltPart`] this was resolved from.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -506,6 +509,17 @@ pub enum ResolveError {
         /// `effective_index` in the graph convention (module doc), so
         /// the graph node it failed on is recoverable.
         index: usize,
+    },
+    /// Two defs in the `LoadedParts` set share one `PartId` — the
+    /// `BTreeMap` lookup index would silently keep the last, so a
+    /// `built` record naming it resolves against whichever def
+    /// happened to sort later: ambiguous authority is a data-set
+    /// defect, refused. The set-level validator forbids duplicate
+    /// ids; this is the resolver's defence-in-depth mirror for a set
+    /// that never passed it.
+    DuplicatePartId {
+        /// The id claimed by two defs.
+        part_id: PartId,
     },
     /// `resolve_part` was handed a def whose `id` disagrees with
     /// `built.part_id` — caller-side lookup bug, reported typed
@@ -609,6 +623,7 @@ impl ResolveError {
     pub fn reason(&self) -> &'static str {
         match self {
             Self::UnknownPartId { .. } => "resolve: unknown part id",
+            Self::DuplicatePartId { .. } => "resolve: two defs share one part id",
             Self::PartIdMismatch { .. } => "resolve: def id does not match built part id",
             Self::UnknownVariant { .. } => "resolve: unknown variant id",
             Self::InvalidScale { rule, .. } => rule,
@@ -633,6 +648,9 @@ impl fmt::Display for ResolveError {
                     f,
                     "resolve: no def for part id {part_id:?} (built[{index}])"
                 )
+            }
+            Self::DuplicatePartId { part_id } => {
+                write!(f, "resolve: two defs claim part id {part_id:?}")
             }
             Self::PartIdMismatch { def, built } => {
                 write!(f, "resolve: def {def:?} handed for built part {built:?}")
@@ -1006,32 +1024,106 @@ fn collider_inertia(collider: &ColliderDef, s: f64, mass: f64, com: DVec3) -> Sy
     }
 }
 
+/// The `resolve_stats` product — `(mass_dry_kg, cost_funds,
+/// build_resources, modules)` — aliased so the signature stays
+/// readable.
+type ResolvedStats = (f64, f64, Vec<(ResourceId, f64)>, Vec<ModuleDef>);
+
 /// The scalar/module half of resolution (everything except geometry
 /// and reliability). Returns `(mass_dry, cost, build_resources,
 /// modules)` with scale and multipliers applied.
+///
+/// Every emitted numeric family is gated — the resolver's output
+/// contract (`EffectivePart`: "every number is finite") is enforced
+/// here, at emission, so a def that skipped the `csp-data` validator
+/// fails typed rather than leaking NaN/∞ or out-of-range stats into
+/// the resolved record. The gates mirror the validator's rules; the
+/// `res` argument resolves module `ResourceId`s (engine propellants,
+/// drill outputs) — the validator's `check_resource_list` layer,
+/// re-checked here because the resolver cannot assume validation ran.
 fn resolve_stats(
     def: &PartDef,
     f: &ScaleFactors,
     mults: &BTreeMap<StatPath, f64>,
     cost_multiplier: f64,
-) -> (f64, f64, Vec<(ResourceId, f64)>, Vec<ModuleDef>) {
+    res: &ResourceFile,
+) -> Result<ResolvedStats, ResolveError> {
+    let bad = |field: &'static str| ResolveError::InvalidStat {
+        part_id: def.id.clone(),
+        field,
+    };
     let mass_dry = def.mass_dry_kg * f.mass * mult(mults, StatPath::MassDryKg);
     let cost = def.cost_funds * f.cost * cost_multiplier * mult(mults, StatPath::CostFunds);
     // BOM scales with `s^mass`, not `s^cost`: a bill of materials is
     // mass-like (a scaled tank's BOM is its scaled dry mass in
     // feedstock terms). See the module doc's convention note — a
     // dedicated BOM exponent is a deferred schema question.
-    let build_resources = def
+    let build_resources: Vec<(ResourceId, f64)> = def
         .build_resources
         .iter()
         .map(|(r, u)| (r.clone(), u * f.mass))
         .collect();
+    // Resolved BOM amounts are positive and finite — the validator's
+    // `check_resource_list` rule applied to the *resolved* amount.
+    for (_, u) in &build_resources {
+        if !(u.is_finite() && *u > 0.0) {
+            return Err(bad(
+                "resolve: build resource amount is not positive and finite",
+            ));
+        }
+    }
     let modules = def
         .modules
         .iter()
-        .map(|m| resolve_module(m, f, mults))
-        .collect();
-    (mass_dry, cost, build_resources, modules)
+        .map(|m| resolve_module(def, m, f, mults, res))
+        .collect::<Result<_, _>>()?;
+    Ok((mass_dry, cost, build_resources, modules))
+}
+
+/// The `Engine.propellants` contract: `ResourceId`s known to
+/// `resources.ron`, unique, with positive finite mass fractions that
+/// total 1 — the validator's `check_engine_module` rules, mirrored so
+/// an unvalidated def cannot resolve a mix the readout's mass-flow
+/// bookkeeping cannot drain (an unknown id there resolves
+/// `mass_per_unit` to `None`, silently starving the stage).
+fn check_engine_propellants(
+    def: &PartDef,
+    propellants: &[(ResourceId, f64)],
+    res: &ResourceFile,
+) -> Result<(), ResolveError> {
+    /// Mirror of csp-data's `PROPELLANT_SUM_TOL` (private to the
+    /// validator) — fractions must total 1 within authoring noise.
+    const PROPELLANT_SUM_TOL: f64 = 1e-6;
+    let bad = |field: &'static str| ResolveError::InvalidStat {
+        part_id: def.id.clone(),
+        field,
+    };
+    if propellants.is_empty() {
+        return Err(bad("resolve: engine declares no propellants"));
+    }
+    let mut seen = BTreeSet::new();
+    let mut sum = 0.0;
+    for (r, frac) in propellants {
+        if !seen.insert(r.as_str()) {
+            return Err(bad("resolve: duplicate propellant resource id"));
+        }
+        if !res.contains(r) {
+            return Err(ResolveError::UnknownResource {
+                part_id: def.id.clone(),
+                resource: r.clone(),
+            });
+        }
+        if !(frac.is_finite() && *frac > 0.0) {
+            return Err(bad(
+                "resolve: propellant fraction is not positive and finite",
+            ));
+        }
+        sum += frac;
+    }
+    if !(sum.is_finite() && (sum - 1.0).abs() <= PROPELLANT_SUM_TOL) {
+        return Err(bad("resolve: propellant mass fractions do not sum to 1"));
+    }
+    Ok(())
 }
 
 /// One module with resolution baked in: engine stats get `s^thrust`
@@ -1041,8 +1133,28 @@ fn resolve_stats(
 /// `Control.torque_nm` is **unscaled by `s` on purpose**: the schema
 /// has no exponent channel for it (module doc's gap note) — torque
 /// still takes its [`StatPath::ControlTorqueNm`] multiplier.
-fn resolve_module(m: &ModuleDef, f: &ScaleFactors, mults: &BTreeMap<StatPath, f64>) -> ModuleDef {
-    match m {
+///
+/// The emitted fields are gated per family (see [`resolve_stats`]'s
+/// doc): the engine numbers the readout divides by and compares, tank
+/// capacities, control authority, drill/lab/converter rates — each
+/// re-checked against the same bounds the `csp-data` validator
+/// enforces. `Converter.recipe` and `Experiment.kind` are
+/// cross-references into *other* data files (recipes, experiment
+/// kinds) this signature cannot see — resolving them is the
+/// validator's job alone, documented rather than half-checked.
+#[allow(clippy::too_many_lines)] // the per-module gate list is inherently an arm table
+fn resolve_module(
+    def: &PartDef,
+    m: &ModuleDef,
+    f: &ScaleFactors,
+    mults: &BTreeMap<StatPath, f64>,
+    res: &ResourceFile,
+) -> Result<ModuleDef, ResolveError> {
+    let bad = |field: &'static str| ResolveError::InvalidStat {
+        part_id: def.id.clone(),
+        field,
+    };
+    Ok(match m {
         ModuleDef::Engine {
             thrust_vac_n,
             isp_vac_s,
@@ -1053,36 +1165,181 @@ fn resolve_module(m: &ModuleDef, f: &ScaleFactors, mults: &BTreeMap<StatPath, f6
             rated_burn_s,
             propellants,
             ullage_required,
-        } => ModuleDef::Engine {
-            thrust_vac_n: thrust_vac_n * f.thrust * mult(mults, StatPath::ThrustVacN),
-            isp_vac_s: isp_vac_s * mult(mults, StatPath::IspVacS),
-            isp_sl_s: isp_sl_s * mult(mults, StatPath::IspSlS),
-            throttle_range: *throttle_range,
-            gimbal_deg: *gimbal_deg,
-            ignitions: *ignitions,
-            rated_burn_s: rated_burn_s * mult(mults, StatPath::RatedBurnS),
-            propellants: propellants.clone(),
-            ullage_required: *ullage_required,
-        },
-        ModuleDef::Tank { capacity } => ModuleDef::Tank {
-            capacity: capacity
-                .iter()
-                .map(|(r, u)| (r.clone(), u * f.capacity))
-                .collect(),
-        },
-        ModuleDef::Control { torque_nm, power_w } => ModuleDef::Control {
-            torque_nm: torque_nm * mult(mults, StatPath::ControlTorqueNm),
-            power_w: *power_w,
-        },
+        } => {
+            let thrust = thrust_vac_n * f.thrust * mult(mults, StatPath::ThrustVacN);
+            let isp_vac = isp_vac_s * mult(mults, StatPath::IspVacS);
+            let isp_sl = isp_sl_s * mult(mults, StatPath::IspSlS);
+            let burn = rated_burn_s * mult(mults, StatPath::RatedBurnS);
+            if !(thrust.is_finite() && thrust > 0.0) {
+                return Err(bad(
+                    "resolve: engine thrust_vac_n is not positive and finite",
+                ));
+            }
+            if !(isp_vac.is_finite() && isp_vac > 0.0) {
+                return Err(bad("resolve: engine isp_vac_s is not positive and finite"));
+            }
+            if !(isp_sl.is_finite() && isp_sl > 0.0) {
+                return Err(bad("resolve: engine isp_sl_s is not positive and finite"));
+            }
+            if !(burn.is_finite() && burn > 0.0) {
+                return Err(bad(
+                    "resolve: engine rated_burn_s is not positive and finite",
+                ));
+            }
+            if !(throttle_range.min.is_finite()
+                && throttle_range.max.is_finite()
+                && throttle_range.min >= 0.0
+                && throttle_range.min < throttle_range.max
+                && throttle_range.max <= 1.0)
+            {
+                return Err(bad(
+                    "resolve: engine throttle_range outside 0 <= min < max <= 1",
+                ));
+            }
+            if !(gimbal_deg.is_finite() && *gimbal_deg >= 0.0) {
+                return Err(bad("resolve: engine gimbal_deg is negative or non-finite"));
+            }
+            if let Some(n) = ignitions
+                && *n == 0
+            {
+                return Err(bad(
+                    "resolve: engine ignitions is Some(0) — use None for unlimited",
+                ));
+            }
+            check_engine_propellants(def, propellants, res)?;
+            ModuleDef::Engine {
+                thrust_vac_n: thrust,
+                isp_vac_s: isp_vac,
+                isp_sl_s: isp_sl,
+                throttle_range: *throttle_range,
+                gimbal_deg: *gimbal_deg,
+                ignitions: *ignitions,
+                rated_burn_s: burn,
+                propellants: propellants.clone(),
+                ullage_required: *ullage_required,
+            }
+        }
+        ModuleDef::Tank { capacity } => {
+            let mut seen = BTreeSet::new();
+            let mut resolved = Vec::with_capacity(capacity.len());
+            for (r, u) in capacity {
+                if !seen.insert(r.as_str()) {
+                    return Err(bad("resolve: duplicate tank capacity resource id"));
+                }
+                if !res.contains(r) {
+                    return Err(ResolveError::UnknownResource {
+                        part_id: def.id.clone(),
+                        resource: r.clone(),
+                    });
+                }
+                let u = u * f.capacity;
+                if !(u.is_finite() && u > 0.0) {
+                    return Err(bad("resolve: tank capacity is not positive and finite"));
+                }
+                resolved.push((r.clone(), u));
+            }
+            ModuleDef::Tank { capacity: resolved }
+        }
+        ModuleDef::Control { torque_nm, power_w } => {
+            let torque = torque_nm * mult(mults, StatPath::ControlTorqueNm);
+            if !(torque.is_finite() && torque >= 0.0) {
+                return Err(bad("resolve: control torque_nm is negative or non-finite"));
+            }
+            if !(power_w.is_finite() && *power_w >= 0.0) {
+                return Err(bad("resolve: control power_w is negative or non-finite"));
+            }
+            ModuleDef::Control {
+                torque_nm: torque,
+                power_w: *power_w,
+            }
+        }
+        ModuleDef::CrewSeat { slots } => {
+            if *slots == 0 {
+                return Err(bad("resolve: crew seat with zero slots"));
+            }
+            ModuleDef::CrewSeat { slots: *slots }
+        }
+        ModuleDef::Experiment {
+            kind,
+            data_units,
+            reusable,
+            situations,
+        } => {
+            if !(data_units.is_finite() && *data_units > 0.0) {
+                return Err(bad("resolve: experiment data_units not positive/finite"));
+            }
+            if situations.is_empty() || situations.0 & !csp_data::SituationMask::ALL.0 != 0 {
+                return Err(bad("resolve: experiment situation mask is invalid"));
+            }
+            ModuleDef::Experiment {
+                kind: kind.clone(),
+                data_units: *data_units,
+                reusable: *reusable,
+                situations: *situations,
+            }
+        }
+        ModuleDef::Drill {
+            resource,
+            base_rate_per_s,
+            min_concentration,
+            power_w,
+        } => {
+            if !res.contains(resource) {
+                return Err(ResolveError::UnknownResource {
+                    part_id: def.id.clone(),
+                    resource: resource.clone(),
+                });
+            }
+            if !(base_rate_per_s.is_finite() && *base_rate_per_s > 0.0) {
+                return Err(bad("resolve: drill base_rate is not positive and finite"));
+            }
+            if !(min_concentration.is_finite() && (0.0..=1.0).contains(min_concentration)) {
+                return Err(bad("resolve: drill min_concentration outside [0, 1]"));
+            }
+            if !(power_w.is_finite() && *power_w >= 0.0) {
+                return Err(bad("resolve: drill power_w is negative or non-finite"));
+            }
+            m.clone()
+        }
+        ModuleDef::Converter { power_w, .. } => {
+            if !(power_w.is_finite() && *power_w >= 0.0) {
+                return Err(bad("resolve: converter power_w is negative or non-finite"));
+            }
+            m.clone()
+        }
+        ModuleDef::Lab {
+            throughput_data_per_s,
+            multiplier,
+            researcher_slots,
+        } => {
+            if !(throughput_data_per_s.is_finite() && *throughput_data_per_s > 0.0)
+                || !(multiplier.is_finite() && *multiplier > 0.0)
+            {
+                return Err(bad(
+                    "resolve: lab throughput/multiplier not positive/finite",
+                ));
+            }
+            if *researcher_slots == 0 {
+                return Err(bad("resolve: lab with zero researcher slots"));
+            }
+            m.clone()
+        }
+        // `DockPort`/`Decoupler` carry no numeric families — the port's
+        // node-name check lives in [`resolve_weld_input`] where the
+        // face spec is produced.
         other => other.clone(),
-    }
+    })
 }
 
 /// Piecewise-linear `qual_factor` at `units` over the def's
 /// qualification curve, clamped to the end knots (the §3.0
 /// temperature-table convention `AeroKnot` docs reuse). An empty
 /// curve — which the validator forbids but a raw def could carry —
-/// resolves to `1.0`, "no qualification credit".
+/// resolves to `1.0`, "no qualification credit". A **non-finite**
+/// `units` also resolves to the first knot: the comparisons below all
+/// fail on NaN/±∞, which would otherwise fall through to the last
+/// (best) knot — corrupt qualification state degrades to the
+/// unqualified reading, never the qualified one.
 ///
 /// Public for the M9b reliability loop: §3.4's `qual_factor(family)`
 /// reads the family's *live* qualification units, so the sim
@@ -1090,6 +1347,9 @@ fn resolve_module(m: &ModuleDef, f: &ScaleFactors, mults: &BTreeMap<StatPath, f6
 /// answer.
 pub fn qual_factor(curve: &csp_data::QualCurve, units: f64) -> f64 {
     let knots = &curve.knots;
+    if !units.is_finite() {
+        return knots.first().map_or(1.0, |k| k.hazard_multiplier);
+    }
     if knots.is_empty() || units <= knots[0].qualification_units {
         return knots.first().map_or(1.0, |k| k.hazard_multiplier);
     }
@@ -1117,7 +1377,9 @@ pub fn qual_factor(curve: &csp_data::QualCurve, units: f64) -> f64 {
 /// so). Note `base_mtbf_s` is the *resolved* MTBF — normalizing by
 /// the post-upgrade value is deliberate and double-counts an MTBF
 /// upgrade's benefit; the module doc's wear note explains why that
-/// is the documented v1 choice rather than a bug.
+/// is the documented v1 choice rather than a bug. Even under the
+/// contract the quotient is unbounded — [`apply_wear`] gates the
+/// *result* for finiteness before storing it.
 pub fn wear_multiplier(base_mtbf_s: f64, usage: &PartUsage) -> f64 {
     1.0 + WEAR_HAZARD_STUB * (usage.operating_s / base_mtbf_s)
 }
@@ -1130,6 +1392,10 @@ pub fn wear_multiplier(base_mtbf_s: f64, usage: &PartUsage) -> f64 {
 ///
 /// Errors on invalid usage input (non-finite or negative fields) so a
 /// corrupt serialized record fails typed rather than poisoning hazard.
+/// Also errors when the *output* overflows: `operating_s /
+/// base_mtbf_s` is unbounded for valid inputs (a huge accumulator
+/// against a small-but-legal MTBF), and an infinite multiplier must
+/// fail typed instead of writing `∞` into `hazard_per_s`.
 pub fn apply_wear(eff: &mut EffectivePart, usage: &PartUsage) -> Result<(), ResolveError> {
     if !usage.is_valid() {
         return Err(ResolveError::InvalidUsage {
@@ -1138,8 +1404,16 @@ pub fn apply_wear(eff: &mut EffectivePart, usage: &PartUsage) -> Result<(), Reso
         });
     }
     let r = &mut eff.reliability;
-    r.wear_multiplier = wear_multiplier(r.base_mtbf_s, usage);
-    r.hazard_per_s = r.base_hazard_per_s * r.qual_factor * r.wear_multiplier;
+    let wear = wear_multiplier(r.base_mtbf_s, usage);
+    let hazard = r.base_hazard_per_s * r.qual_factor * wear;
+    if !wear.is_finite() || !hazard.is_finite() {
+        return Err(ResolveError::InvalidStat {
+            part_id: eff.part_id.clone(),
+            field: "resolve: wear multiplier/hazard overflowed to non-finite",
+        });
+    }
+    r.wear_multiplier = wear;
+    r.hazard_per_s = hazard;
     Ok(())
 }
 
@@ -1246,10 +1520,12 @@ impl ReliabilitySpec {
                 .failure_modes
                 .iter()
                 .all(|(_, w)| w.is_finite() && *w > 0.0)
-            && self
-                .regime_stress
-                .iter()
-                .all(|r| r.threshold.is_finite() && r.threshold >= 0.0 && r.multiplier >= 1.0)
+            && self.regime_stress.iter().all(|r| {
+                r.threshold.is_finite()
+                    && r.threshold >= 0.0
+                    && r.multiplier.is_finite()
+                    && r.multiplier >= 1.0
+            })
             && self
                 .engine
                 .is_none_or(|e| e.rated_burn_s.is_finite() && e.rated_burn_s >= 0.0)
@@ -1396,6 +1672,17 @@ fn resolve_weld_input(
     if !collider.is_valid() {
         return Err(bad("resolve: collider resolves to non-finite vertices"));
     }
+    // A zero-vertex collider is a `Convex { points: [] }` passthrough
+    // — `ColliderShape::is_valid` is vacuous on an empty set and the
+    // weld tolerates it as a documented "no-skin" marker, but an
+    // *authored* `ColliderDef` must resolve real geometry: a part
+    // with no hull has no contact, no facet planes, and a `z_min`
+    // the engine thrust-site lookup cannot compute. The validator
+    // requires ≥ 4 convex points; the resolver rejects the empty set
+    // outright.
+    if collider.vertices().is_empty() {
+        return Err(bad("resolve: collider resolves to zero vertices"));
+    }
     let com = collider_com(&def.collider) * s;
     let inertia = collider_inertia(&def.collider, s, mass_kg, com);
     let mut force_sites = Vec::new();
@@ -1535,44 +1822,133 @@ fn resolve_weld_input(
     })
 }
 
+/// The `‖d‖ = 1` band for resolved attach-node directions — a mirror
+/// of the `csp-data` validator's `NODE_DIR_UNIT_TOL` (private there).
+/// The session's snap machinery normalizes for its own use; the
+/// resolver gates so the *resolved* record carries the authored
+/// direction only when it was already unit within authoring noise.
+const NODE_DIR_UNIT_TOL: f64 = 1e-6;
+
+/// One aero coefficient curve under the output contract: every knot
+/// finite, `mach ≥ 0` strictly increasing, `coeff ≥ 0` — so an
+/// unvalidated def's curve cannot reach `csp-phys::aero`'s piecewise
+/// reader (a non-monotone or NaN knot lerps garbage). An **empty**
+/// curve is legal resolved data: `WeldPart::aero`'s doc gives it the
+/// "occludes but produces no force" semantics, so the resolver gates
+/// knot quality rather than presence (the validator's non-empty rule
+/// is authored-data policy, not an output contract).
+fn aero_curve_is_valid(curve: &[csp_data::AeroKnot]) -> bool {
+    let mut prev = f64::NEG_INFINITY;
+    for k in curve {
+        if !(k.mach.is_finite() && k.coeff.is_finite())
+            || k.mach < 0.0
+            || k.mach <= prev
+            || k.coeff < 0.0
+        {
+            return false;
+        }
+        prev = k.mach;
+    }
+    true
+}
+
 /// The envelope stage: structural limits, thermal lump, aero, and
-/// attach nodes at the resolved scale.
+/// attach nodes at the resolved scale — each emitted family gated
+/// against the same bounds the `csp-data` validator enforces (the
+/// resolver's output contract, applied to the *resolved* values).
 fn resolve_envelopes(
     def: &PartDef,
     f: &ScaleFactors,
-) -> (
-    csp_data::StructuralDef,
-    csp_data::ThermalDef,
-    csp_data::AeroDef,
-    Vec<AttachNode>,
-) {
+) -> Result<
+    (
+        csp_data::StructuralDef,
+        csp_data::ThermalDef,
+        csp_data::AeroDef,
+        Vec<AttachNode>,
+    ),
+    ResolveError,
+> {
+    let bad = |field: &'static str| ResolveError::InvalidStat {
+        part_id: def.id.clone(),
+        field,
+    };
     let structural = csp_data::StructuralDef {
         max_axial_n: def.structural.max_axial_n * f.structural,
         max_shear_n: def.structural.max_shear_n * f.structural,
         max_torque_nm: def.structural.max_torque_nm * f.structural,
     };
+    if !(structural.max_axial_n.is_finite() && structural.max_axial_n > 0.0)
+        || !(structural.max_shear_n.is_finite() && structural.max_shear_n > 0.0)
+        || !(structural.max_torque_nm.is_finite() && structural.max_torque_nm > 0.0)
+    {
+        return Err(bad("resolve: structural limit is not positive and finite"));
+    }
     let thermal = csp_data::ThermalDef {
         heat_capacity_j_per_k: def.thermal.heat_capacity_j_per_k * f.mass,
         max_temp_k: def.thermal.max_temp_k,
         emissivity: def.thermal.emissivity,
         conduction_w_per_k: def.thermal.conduction_w_per_k,
     };
+    if !(thermal.heat_capacity_j_per_k.is_finite() && thermal.heat_capacity_j_per_k > 0.0)
+        || !(thermal.max_temp_k.is_finite() && thermal.max_temp_k > 0.0)
+        || !(thermal.emissivity.is_finite()
+            && thermal.emissivity > 0.0
+            && thermal.emissivity <= 1.0)
+        || !(thermal.conduction_w_per_k.is_finite() && thermal.conduction_w_per_k >= 0.0)
+    {
+        return Err(bad("resolve: thermal field is out of range or non-finite"));
+    }
+    // The explicit-Euler stability bound (validator's
+    // `ConductionExceedsCapacity`) re-checked at *resolved* values:
+    // `heat_capacity` scales by `s^mass` while `conduction` does not
+    // (v1 schema gap, module doc), so a small-enough scale can push a
+    // def that passed authored-side over the bound.
+    if thermal.conduction_w_per_k > thermal.heat_capacity_j_per_k {
+        return Err(bad(
+            "resolve: conduction exceeds resolved heat capacity — unstable thermal lump",
+        ));
+    }
+    if !(def.aero.ref_len_m * f.linear).is_finite() || def.aero.ref_len_m * f.linear <= 0.0 {
+        return Err(bad("resolve: aero ref_len_m is not positive and finite"));
+    }
+    if !aero_curve_is_valid(&def.aero.cd_curve) || !aero_curve_is_valid(&def.aero.cl_curve) {
+        return Err(bad(
+            "resolve: aero curve knot is non-finite, negative, or non-monotone",
+        ));
+    }
     let aero = csp_data::AeroDef {
         cd_curve: def.aero.cd_curve.clone(),
         cl_curve: def.aero.cl_curve.clone(),
         ref_len_m: def.aero.ref_len_m * f.linear,
     };
-    let attach_nodes = def
-        .attach_nodes
-        .iter()
-        .map(|n| AttachNode {
+    let mut seen_ids = BTreeSet::new();
+    let mut attach_nodes = Vec::with_capacity(def.attach_nodes.len());
+    for n in &def.attach_nodes {
+        if n.id.is_empty() || !seen_ids.insert(n.id.as_str()) {
+            return Err(bad("resolve: attach node id is empty or duplicated"));
+        }
+        let position_m = n.position_m * f.linear;
+        let diameter_m = n.diameter_m * f.linear;
+        if !position_m.is_finite() {
+            return Err(bad("resolve: attach node position is non-finite"));
+        }
+        let len = n.direction.norm();
+        if !(len.is_finite() && (len - 1.0).abs() <= NODE_DIR_UNIT_TOL) {
+            return Err(bad("resolve: attach node direction is not unit length"));
+        }
+        if !(diameter_m.is_finite() && diameter_m > 0.0) {
+            return Err(bad(
+                "resolve: attach node diameter is not positive and finite",
+            ));
+        }
+        attach_nodes.push(AttachNode {
             id: n.id.clone(),
-            position_m: n.position_m * f.linear,
+            position_m,
             direction: n.direction,
-            diameter_m: n.diameter_m * f.linear,
-        })
-        .collect();
-    (structural, thermal, aero, attach_nodes)
+            diameter_m,
+        });
+    }
+    Ok((structural, thermal, aero, attach_nodes))
 }
 
 /// The reliability stage: `λ_base` post-variant and `qual_factor` at
@@ -1705,7 +2081,7 @@ pub fn resolve_built_part(
     )?;
 
     let (mass_dry, cost_funds, build_resources, modules) =
-        resolve_stats(def, &f, &mults, variant.cost_multiplier);
+        resolve_stats(def, &f, &mults, variant.cost_multiplier, res)?;
 
     // Build-material resources must resolve too — a craft that can't
     // be costed can't be built.
@@ -1733,10 +2109,14 @@ pub fn resolve_built_part(
         return Err(bad("resolve: resolved cost is negative or non-finite"));
     }
 
-    let (structural, thermal, aero, attach_nodes) = resolve_envelopes(def, &f);
+    let (structural, thermal, aero, attach_nodes) = resolve_envelopes(def, &f)?;
     let weld_input =
         resolve_weld_input(def, f.linear, mass_kg, &modules, &thermal, &structural, res)?;
     let reliability = resolve_reliability(def, qual, &mults)?;
+    let size_m = def.size_m * f.linear;
+    if !(size_m.is_finite() && size_m.x > 0.0 && size_m.y > 0.0 && size_m.z > 0.0) {
+        return Err(bad("resolve: resolved size_m is not positive and finite"));
+    }
 
     Ok(EffectivePart {
         part_id: def.id.clone(),
@@ -1747,7 +2127,7 @@ pub fn resolve_built_part(
         weld_input,
         cost_funds,
         build_resources,
-        size_m: def.size_m * f.linear,
+        size_m,
         attach_nodes,
         modules,
         structural,
@@ -1786,9 +2166,11 @@ pub fn resolve_part(
 /// [`FamilyQualification::FRESH`] — an untested family is the legal
 /// unqualified state, not an error.
 ///
-/// Def lookup is a `BTreeMap` build once per call — deterministic
-/// first-error under duplicate input (unknown id errors report the
-/// lowest-positioned failing record in `built` order).
+/// Def lookup is a `BTreeMap` built once per call — a def set naming
+/// one `PartId` twice fails [`ResolveError::DuplicatePartId`] up front
+/// rather than silently keeping the last; unknown-id errors report the
+/// lowest-positioned failing record in `built` order (deterministic
+/// first-error).
 pub fn resolve_parts(
     defs: &LoadedParts,
     built: &[BuiltPart],
@@ -1804,11 +2186,14 @@ pub fn resolve_parts(
             usages: u.len(),
         });
     }
-    let by_id: BTreeMap<&str, &PartDef> = defs
-        .parts
-        .iter()
-        .map(|p| (p.def.id.as_str(), &p.def))
-        .collect();
+    let mut by_id: BTreeMap<&str, &PartDef> = BTreeMap::new();
+    for p in &defs.parts {
+        if by_id.insert(p.def.id.as_str(), &p.def).is_some() {
+            return Err(ResolveError::DuplicatePartId {
+                part_id: p.def.id.clone(),
+            });
+        }
+    }
     let mut out = Vec::with_capacity(built.len());
     for (i, b) in built.iter().enumerate() {
         let def =
@@ -1963,11 +2348,25 @@ mod tests {
     fn resources() -> ResourceFile {
         ResourceFile {
             schema_version: csp_data::RESOURCE_SCHEMA_VERSION,
-            resources: vec![csp_data::ResourceDef {
-                id: ResourceId::from("metal"),
-                display_name: "r.metal".into(),
-                mass_per_unit_kg: 10.0,
-            }],
+            resources: vec![
+                csp_data::ResourceDef {
+                    id: ResourceId::from("metal"),
+                    display_name: "r.metal".into(),
+                    mass_per_unit_kg: 10.0,
+                },
+                // The engine def burns these — `resolve_module`
+                // resolves propellant `ResourceId`s against the set.
+                csp_data::ResourceDef {
+                    id: ResourceId::from("liquid_fuel"),
+                    display_name: "r.liquid_fuel".into(),
+                    mass_per_unit_kg: 5.0,
+                },
+                csp_data::ResourceDef {
+                    id: ResourceId::from("oxidizer"),
+                    display_name: "r.oxidizer".into(),
+                    mass_per_unit_kg: 5.0,
+                },
+            ],
         }
     }
 
@@ -1977,6 +2376,37 @@ mod tests {
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() <= 1e-12 * b.abs().max(1.0)
+    }
+
+    /// Resolve the stock build of `def` fresh — every output-contract
+    /// refusal test starts from the authored-good def and breaks one
+    /// field, so this is the one-line common path.
+    fn resolve_stock(def: &PartDef) -> Result<EffectivePart, ResolveError> {
+        resolve_part(
+            def,
+            &built("stock"),
+            &resources(),
+            &FamilyQualification::FRESH,
+            None,
+        )
+    }
+
+    /// Assert `result` is `Err(InvalidStat)` naming `field` — most
+    /// output-contract gates share the one variant, so the field text
+    /// is what pins *which* gate fired (asserting the variant alone
+    /// would pass if a different, earlier gate tripped first).
+    #[track_caller]
+    fn assert_invalid_stat<T: std::fmt::Debug>(
+        result: Result<T, ResolveError>,
+        field: &'static str,
+    ) {
+        assert_eq!(
+            result.unwrap_err(),
+            ResolveError::InvalidStat {
+                part_id: PartId::from("test.engine.unit"),
+                field,
+            }
+        );
     }
 
     #[test]
@@ -2640,5 +3070,365 @@ mod tests {
             panic!()
         };
         assert!(close(*thrust_vac_n, 55_000.0));
+    }
+
+    // ---------- R14-F2/F5: output-contract refusal gates ----------
+    //
+    // Every gate below mirrors a `csp-data` validator rule on the
+    // *resolved* record — the resolver cannot assume validation ran,
+    // so a def reaching it unvalidated must fail typed rather than
+    // leak NaN/∞/out-of-range stats into `EffectivePart`. Each test
+    // asserts the typed variant (and, for the `InvalidStat` family,
+    // the exact field text pinning which gate fired).
+
+    /// `resolve_parts` refuses a def set claiming one `PartId` twice:
+    /// the `BTreeMap` lookup index would silently keep the last def,
+    /// so the ambiguity is a data-set defect refused up front.
+    #[test]
+    fn resolve_parts_rejects_duplicate_part_ids() {
+        use std::path::PathBuf;
+
+        let defs = LoadedParts {
+            parts: vec![
+                csp_data::LoadedPart {
+                    def: test_def(),
+                    path: PathBuf::from("test.engine.unit.ron"),
+                },
+                // Same id in a second file — the dup the index build
+                // must catch regardless of `built` contents.
+                csp_data::LoadedPart {
+                    def: test_def(),
+                    path: PathBuf::from("test.engine.unit.copy.ron"),
+                },
+            ],
+        };
+        let err = resolve_parts(
+            &defs,
+            &[built("stock")],
+            &resources(),
+            &FamilyQualifications::new(),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ResolveError::DuplicatePartId {
+                part_id: PartId::from("test.engine.unit"),
+            }
+        );
+    }
+
+    /// An authored `Convex` with no points would resolve a zero-vertex
+    /// collider — no hull, no facet planes, no `z_min` for the engine
+    /// thrust-site lookup. `ColliderShape::is_valid` is vacuous on the
+    /// empty set, so this is its own gate.
+    #[test]
+    fn empty_convex_collider_is_refused() {
+        let mut def = test_def();
+        def.collider = ColliderDef::Convex { points: Vec::new() };
+        assert_invalid_stat(
+            resolve_stock(&def),
+            "resolve: collider resolves to zero vertices",
+        );
+    }
+
+    /// `throttle_range` must satisfy `0 <= min < max <= 1` on the
+    /// resolved module — an inverted or empty band, or one escaping
+    /// [0, 1], is refused before a throttle readout can consume it.
+    #[test]
+    fn engine_throttle_range_out_of_band_is_refused() {
+        for range in [
+            ThrottleRange { min: 0.8, max: 0.5 }, // inverted
+            ThrottleRange { min: 0.5, max: 0.5 }, // empty (min == max)
+            ThrottleRange {
+                min: -0.1,
+                max: 1.0,
+            }, // below 0
+            ThrottleRange { min: 0.0, max: 1.5 }, // above 1
+            ThrottleRange {
+                min: f64::NAN,
+                max: 1.0,
+            }, // non-finite
+        ] {
+            let mut def = test_def();
+            let ModuleDef::Engine { throttle_range, .. } = &mut def.modules[0] else {
+                panic!("engine module expected");
+            };
+            *throttle_range = range;
+            assert_invalid_stat(
+                resolve_stock(&def),
+                "resolve: engine throttle_range outside 0 <= min < max <= 1",
+            );
+        }
+    }
+
+    /// `gimbal_deg` is degrees of authority: negative or non-finite is
+    /// refused (zero stays legal — a fixed nozzle).
+    #[test]
+    fn engine_gimbal_deg_negative_or_nonfinite_is_refused() {
+        for g in [-1.0, f64::NAN, f64::INFINITY] {
+            let mut def = test_def();
+            let ModuleDef::Engine { gimbal_deg, .. } = &mut def.modules[0] else {
+                panic!("engine module expected");
+            };
+            *gimbal_deg = g;
+            assert_invalid_stat(
+                resolve_stock(&def),
+                "resolve: engine gimbal_deg is negative or non-finite",
+            );
+        }
+    }
+
+    /// `ignitions: Some(0)` — "zero lifetime ignitions" — is refused;
+    /// `None` is the authored spelling of unlimited.
+    #[test]
+    fn engine_zero_ignitions_is_refused() {
+        let mut def = test_def();
+        let ModuleDef::Engine { ignitions, .. } = &mut def.modules[0] else {
+            panic!("engine module expected");
+        };
+        *ignitions = Some(0);
+        assert_invalid_stat(
+            resolve_stock(&def),
+            "resolve: engine ignitions is Some(0) — use None for unlimited",
+        );
+    }
+
+    /// The `Engine.propellants` contract on an unvalidated def: ids
+    /// known to `resources.ron`, unique, positive finite fractions
+    /// summing to 1. Each defect fails typed — `UnknownResource` for
+    /// the missing id, `InvalidStat` naming the rule for the rest.
+    #[test]
+    fn engine_propellant_gates_refuse_each_defect() {
+        let set_propellants = |def: &mut PartDef, p: Vec<(ResourceId, f64)>| {
+            let ModuleDef::Engine { propellants, .. } = &mut def.modules[0] else {
+                panic!("engine module expected");
+            };
+            *propellants = p;
+        };
+        // Duplicate ResourceId (dedup runs before the sum check).
+        let mut def = test_def();
+        set_propellants(
+            &mut def,
+            vec![
+                (ResourceId::from("liquid_fuel"), 0.5),
+                (ResourceId::from("liquid_fuel"), 0.5),
+            ],
+        );
+        assert_invalid_stat(
+            resolve_stock(&def),
+            "resolve: duplicate propellant resource id",
+        );
+        // Fractions not summing to 1 (0.9 here).
+        let mut def = test_def();
+        set_propellants(
+            &mut def,
+            vec![
+                (ResourceId::from("liquid_fuel"), 0.5),
+                (ResourceId::from("oxidizer"), 0.4),
+            ],
+        );
+        assert_invalid_stat(
+            resolve_stock(&def),
+            "resolve: propellant mass fractions do not sum to 1",
+        );
+        // Unknown ResourceId — the dedicated variant, not InvalidStat.
+        let mut def = test_def();
+        set_propellants(&mut def, vec![(ResourceId::from("unobtainium"), 1.0)]);
+        let err = resolve_stock(&def).unwrap_err();
+        assert_eq!(
+            err,
+            ResolveError::UnknownResource {
+                part_id: PartId::from("test.engine.unit"),
+                resource: ResourceId::from("unobtainium"),
+            }
+        );
+        // Non-positive / non-finite fractions (the per-entry check
+        // fires before the sum check, so these never reach it).
+        for frac in [0.0, -0.5, f64::NAN] {
+            let mut def = test_def();
+            set_propellants(&mut def, vec![(ResourceId::from("liquid_fuel"), frac)]);
+            assert_invalid_stat(
+                resolve_stock(&def),
+                "resolve: propellant fraction is not positive and finite",
+            );
+        }
+        // An empty propellant list is its own message.
+        let mut def = test_def();
+        set_propellants(&mut def, Vec::new());
+        assert_invalid_stat(
+            resolve_stock(&def),
+            "resolve: engine declares no propellants",
+        );
+    }
+
+    /// Tank capacity entries re-check the resource list at resolve:
+    /// unknown ids → `UnknownResource`, duplicate ids and
+    /// non-positive resolved units → `InvalidStat` naming the rule.
+    #[test]
+    fn tank_capacity_gates_refuse_each_defect() {
+        // Unknown resource id.
+        let mut def = test_def();
+        def.modules.push(ModuleDef::Tank {
+            capacity: vec![(ResourceId::from("unobtainium"), 5.0)],
+        });
+        let err = resolve_stock(&def).unwrap_err();
+        assert_eq!(
+            err,
+            ResolveError::UnknownResource {
+                part_id: PartId::from("test.engine.unit"),
+                resource: ResourceId::from("unobtainium"),
+            }
+        );
+        // Non-positive resolved units (zero, negative, non-finite).
+        for units in [0.0, -5.0, f64::NAN] {
+            let mut def = test_def();
+            def.modules.push(ModuleDef::Tank {
+                capacity: vec![(ResourceId::from("liquid_fuel"), units)],
+            });
+            assert_invalid_stat(
+                resolve_stock(&def),
+                "resolve: tank capacity is not positive and finite",
+            );
+        }
+        // Duplicate resource ids within one tank.
+        let mut def = test_def();
+        def.modules.push(ModuleDef::Tank {
+            capacity: vec![
+                (ResourceId::from("liquid_fuel"), 5.0),
+                (ResourceId::from("liquid_fuel"), 5.0),
+            ],
+        });
+        assert_invalid_stat(
+            resolve_stock(&def),
+            "resolve: duplicate tank capacity resource id",
+        );
+    }
+
+    /// An `Experiment` whose `situations` mask is empty or sets the
+    /// reserved bits (6–7) can run nowhere meaningful — the same
+    /// refusal the validator gives.
+    #[test]
+    fn experiment_bad_situation_mask_is_refused() {
+        for mask in [
+            csp_data::SituationMask(0),           // runs nowhere
+            csp_data::SituationMask(0b0100_0000), // reserved bit 6
+            csp_data::SituationMask(0xFF),        // valid + reserved bits
+        ] {
+            let mut def = test_def();
+            def.modules.push(ModuleDef::Experiment {
+                kind: csp_data::ExperimentId::from("exp.test"),
+                data_units: 10.0,
+                reusable: true,
+                situations: mask,
+            });
+            assert_invalid_stat(
+                resolve_stock(&def),
+                "resolve: experiment situation mask is invalid",
+            );
+        }
+    }
+
+    /// A cd/cl curve with non-increasing mach knots would feed
+    /// `csp-phys::aero`'s piecewise reader garbage — refused on either
+    /// curve (strictly-increasing means equal machs fail too).
+    #[test]
+    fn aero_curve_non_monotonic_mach_is_refused() {
+        const GATE: &str = "resolve: aero curve knot is non-finite, negative, or non-monotone";
+        let decreasing = vec![
+            csp_data::AeroKnot {
+                mach: 1.0,
+                coeff: 0.5,
+            },
+            csp_data::AeroKnot {
+                mach: 0.5,
+                coeff: 0.6,
+            },
+        ];
+        // cd side.
+        let mut def = test_def();
+        def.aero.cd_curve = decreasing.clone();
+        assert_invalid_stat(resolve_stock(&def), GATE);
+        // cl side.
+        let mut def = test_def();
+        def.aero.cl_curve = decreasing;
+        assert_invalid_stat(resolve_stock(&def), GATE);
+        // Equal machs are non-monotone (not strictly increasing).
+        let mut def = test_def();
+        def.aero.cd_curve = vec![
+            csp_data::AeroKnot {
+                mach: 0.5,
+                coeff: 0.5,
+            },
+            csp_data::AeroKnot {
+                mach: 0.5,
+                coeff: 0.6,
+            },
+        ];
+        assert_invalid_stat(resolve_stock(&def), GATE);
+    }
+
+    /// `conduction_w_per_k > resolved heat_capacity` violates the
+    /// explicit-Euler stability bound (the validator's
+    /// `ConductionExceedsCapacity` re-checked at resolved values).
+    /// `heat_capacity` scales by `s^mass` while conduction is unscaled
+    /// (the v1 schema gap), so s = 0.5 pushes a def that passes the
+    /// authored-side bound over the resolved one: 100_000 · 0.5³ =
+    /// 12_500 < 20_000.
+    #[test]
+    fn conduction_exceeding_resolved_heat_capacity_is_refused() {
+        let mut def = test_def();
+        def.thermal.conduction_w_per_k = 20_000.0; // < authored 100_000 heat cap
+        let mut b = built("stock");
+        b.scale = 0.5;
+        assert_invalid_stat(
+            resolve_part(&def, &b, &resources(), &FamilyQualification::FRESH, None),
+            "resolve: conduction exceeds resolved heat capacity — unstable thermal lump",
+        );
+    }
+
+    /// Attach-node directions must resolve unit length (±1e-6): the
+    /// snap graph's opposing-direction test assumes normalized
+    /// normals. Non-unit and non-finite both fail the same gate.
+    #[test]
+    fn non_unit_attach_direction_is_refused() {
+        const GATE: &str = "resolve: attach node direction is not unit length";
+        let mut def = test_def();
+        def.attach_nodes[0].direction = DVec3::new(1.0, 1.0, 0.0); // ‖d‖ = √2
+        assert_invalid_stat(resolve_stock(&def), GATE);
+        let mut def = test_def();
+        def.attach_nodes[0].direction = DVec3::new(f64::NAN, 0.0, 0.0);
+        assert_invalid_stat(resolve_stock(&def), GATE);
+    }
+
+    /// `apply_wear`'s overflow gate: `base_mtbf_s` is only contracted
+    /// "finite and positive", so a tiny-but-legal MTBF makes
+    /// `operating_s / base_mtbf_s` overflow to ∞ for a valid usage
+    /// record — the non-finite multiplier/hazard must fail typed,
+    /// never be stored. `f64::MAX / 1e-300` overflows.
+    #[test]
+    fn apply_wear_overflow_on_tiny_mtbf_is_refused() {
+        let mut def = test_def();
+        def.reliability.base_mtbf_s = 1e-300; // λ_base = 1e300, still finite → resolves
+        let mut eff = resolve_stock(&def).unwrap();
+        let usage = PartUsage {
+            operating_s: f64::MAX,
+            ..PartUsage::FRESH
+        };
+        assert_invalid_stat(
+            apply_wear(&mut eff, &usage),
+            "resolve: wear multiplier/hazard overflowed to non-finite",
+        );
+        // The composed `resolve_part` path refuses identically.
+        assert_invalid_stat(
+            resolve_part(
+                &def,
+                &built("stock"),
+                &resources(),
+                &FamilyQualification::FRESH,
+                Some(&usage),
+            ),
+            "resolve: wear multiplier/hazard overflowed to non-finite",
+        );
     }
 }

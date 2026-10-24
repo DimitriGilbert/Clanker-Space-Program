@@ -170,7 +170,7 @@ fn flight_initial(dir: &Path) -> Result<World, ReplayError> {
     // §2.4's docking tunables — same wiring as the caps: the fixture's
     // balance.ron is the source of truth, so fixture-authored capture
     // windows/predicates are honoured instead of the no-data defaults.
-    world.set_docking_config(csp_sim::DockingConfig::from_balance(&balance));
+    world.set_docking_config(csp_sim::DockingConfig::from_balance(&balance))?;
     // §3.5's transfer tunables — same wiring (M6-D).
     world.set_transfer_config(csp_sim::TransferConfig::from_balance(&balance));
     // M9a §2.10: the script host + ascent autopilot and the per-save

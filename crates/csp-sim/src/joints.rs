@@ -101,7 +101,7 @@ use serde::{Deserialize, Serialize};
 
 use csp_core::{DVec3, SimError, StateHasher};
 use csp_data::{BalanceDef, PortSize};
-use csp_phys::{BodyHandle, JointDef, JointKind, PartNodeId, PartTransform};
+use csp_phys::{BodyHandle, JointDef, JointKind, PHYSICS_DT, PartNodeId, PartTransform};
 
 use crate::scripts::AutopilotState;
 use crate::transfers::{ActiveTransfer, TransferId};
@@ -122,6 +122,22 @@ pub const DEFAULT_CAPTURE_ANGLE_DEG: f64 = 15.0;
 pub const DEFAULT_CAPTURE_REL_SPEED_MPS: f64 = 5.0;
 /// `balance.ron: dock_soft_pull_per_s` mirror.
 pub const DEFAULT_SOFT_PULL_PER_S: f64 = 8.0;
+/// The `soft_pull_per_s` exclusive upper bound (1/s) — the
+/// soft-capture reel-in is the explicit map
+/// `c_{n+1} ≈ (1 − pull·dt)·c_n` through the solver's unclamped
+/// bilateral PGS targets (`csp-phys::simple::solve_joint_rows`), so
+/// `pull·dt ≥ 2` gives `|1 − pull·dt| ≥ 1`: the separation never
+/// contracts — a bounded limit cycle injecting a full-strength
+/// impulse every tick, and (with the shipped
+/// `soft_max_correction_mps > latch_rel_speed_mps`) a joint that can
+/// never read settled. Derived from the pinned timestep rather than
+/// named as a magic number — `2/dt` at 64 Hz is 128/s; the
+/// alternating-overshoot band below it (`pull·dt ≥ 1`, i.e. ≥ 64/s)
+/// converges but is not the authored regime either.
+/// `csp-data::validate_balance` mirrors this bound file-side — the
+/// dependency runs `csp-sim → csp-data`, so the mirror is the only
+/// direction available.
+pub const SOFT_PULL_LIMIT_PER_S: f64 = 2.0 / PHYSICS_DT;
 /// `balance.ron: dock_soft_max_correction_mps` mirror.
 pub const DEFAULT_SOFT_MAX_CORRECTION_MPS: f64 = 1.0;
 /// `balance.ron: dock_latch_separation_m` mirror.
@@ -153,7 +169,9 @@ pub struct DockingConfig {
     /// (m/s) — a fast fly-through cannot capture.
     pub capture_rel_speed_mps: f64,
     /// Soft-capture compliance: exponential reel-in rate (1/s) — see
-    /// [`JointKind::SoftCapture`].
+    /// [`JointKind::SoftCapture`]. Bounded above by
+    /// [`SOFT_PULL_LIMIT_PER_S`] — the joint solve is an explicit map
+    /// and diverges (limit-cycle buzz, never settles) at or past it.
     pub soft_pull_per_s: f64,
     /// Soft-capture compliance: the anchor-closing speed cap (m/s).
     pub soft_max_correction_mps: f64,
@@ -192,6 +210,12 @@ impl DockingConfig {
     /// an invalid config (the degenerate `0°` edge — perfect facing
     /// required — stays valid; non-finite input passes `clamp`
     /// through and `is_valid` still catches it).
+    ///
+    /// The remaining fields copy verbatim — the authored domain is
+    /// [`Self::is_valid`]'s, enforced file-side by
+    /// `csp_data::validate_balance` (which mirrors the
+    /// [`SOFT_PULL_LIMIT_PER_S`] bound) and install-side by
+    /// [`crate::World::set_docking_config`]'s rejection.
     pub fn from_balance(b: &BalanceDef) -> Self {
         Self {
             max_live_joints: b.max_live_joints_per_bubble,
@@ -206,9 +230,12 @@ impl DockingConfig {
         }
     }
 
-    /// The snapshot-restore gate: corrupt config fails typed rather
+    /// The install/restore gate: corrupt config fails typed rather
     /// than silently diverging the run (`NaN` in the predicate would
-    /// make every comparison false — a silent capture-off).
+    /// make every comparison false — a silent capture-off; a
+    /// `soft_pull_per_s` at or past [`SOFT_PULL_LIMIT_PER_S`] would
+    /// put the joint solve into a permanent limit cycle). Checked at
+    /// snapshot restore and by [`crate::World::set_docking_config`].
     pub fn is_valid(&self) -> bool {
         self.capture_range_m.is_finite()
             && self.capture_range_m >= 0.0
@@ -218,6 +245,7 @@ impl DockingConfig {
             && self.capture_rel_speed_mps >= 0.0
             && self.soft_pull_per_s.is_finite()
             && self.soft_pull_per_s >= 0.0
+            && self.soft_pull_per_s < SOFT_PULL_LIMIT_PER_S
             && self.soft_max_correction_mps.is_finite()
             && self.soft_max_correction_mps >= 0.0
             && self.latch_separation_m.is_finite()

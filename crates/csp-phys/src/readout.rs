@@ -315,8 +315,21 @@ pub fn analyze(
                 row.twr_surface = row.thrust_vac_n / (row.wet_mass_kg * G0);
             }
 
-            // Consume the propellant — ascending-id order, each
+            // Consume the propellant — ascending `PartNodeId`, each
             // resource drawn down until the stage's burn is met.
+            //
+            // DRAW ORDER (documented, R14-F6): `attached` is a
+            // `BTreeSet`, so tanks drain in *allocation* order — the
+            // order parts were added to the session, not any authored
+            // priority. The order is stable and deterministic for a
+            // given session (ids are never reused), but it is not a
+            // game rule: which tank empties first only matters when a
+            // stage's burn cannot empty them all — a partial draw
+            // drains low-id tanks first, and a decoupler dropping the
+            // drained half leaves later stages more propellant than
+            // dropping the full half would. A stable *authored* rule
+            // (tank feed priority, bottom-up draining) is a schema
+            // question, deferred like the other v1 simplifications.
             for (r, kg_s) in &demand {
                 let mpu = res.mass_per_unit(r).unwrap_or(1.0).max(1e-12);
                 let mut need_units = kg_s * burn / mpu;

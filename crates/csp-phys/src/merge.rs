@@ -50,7 +50,14 @@
 //! then *bitwise* the same `PartGraph` a VAB session would author
 //! for the assembled station, so `weld(merged) ==
 //! weld(from-scratch)` bit-identically — the exit criterion the
-//! plan names.
+//! plan names. **Bit-identity qualifier:** the equality is exact
+//! only under exact-unit arithmetic — `compose` renormalizes every
+//! step and `inverse` conjugates; both are exact IEEE for exactly
+//! unit rotations (what authored transforms and the test exercise),
+//! but a seam/rotation at the edge of
+//! [`PartTransform::UNIT_ROTATION_TOLERANCE`] can round differently
+//! across the two orders, so the criterion is bit-identity up to
+//! that tolerance, not unconditional.
 //!
 //! # The record
 //!
@@ -85,11 +92,16 @@ pub enum MergeError {
     AttachNodeMissing(PartNodeId),
     /// `port_b` is not a node of the secondary graph.
     PortNodeMissing(PartNodeId),
-    /// The secondary graph is empty or its `root` is not a node.
+    /// The secondary graph is empty, its `root` is not a node, or
+    /// its parent chains do not all reach the root (a detached
+    /// cycle). Carries the specific reason text.
     SecondaryShape(&'static str),
     /// A non-root secondary node names no parent or a parent outside
     /// the graph — malformed input the merge reports here rather than
-    /// letting the merged weld reject it as `Unreachable`.
+    /// letting the merged weld reject it as `Unreachable`. (Detached
+    /// *cycles* — parents that exist but never reach the root — are
+    /// reported as [`Self::SecondaryShape`] by the reachability walk,
+    /// not here.)
     SecondaryParent {
         node: PartNodeId,
         parent: Option<PartNodeId>,
@@ -175,7 +187,12 @@ pub struct MergedGraph {
 ///   `parts_primary ++ parts_secondary` (the sim concatenates the
 ///   slices itself; `merge_graphs` is a graph edit, and keeping the
 ///   parts vec out of the signature keeps the function pure over
-///   exactly what it transforms).
+///   exactly what it transforms). **Precondition:** the base must be
+///   at least `max(primary effective_index) + 1` — a too-small base
+///   cannot be detected here (the parts slice is out of signature by
+///   design) and would silently alias secondary nodes onto primary
+///   `WeldPart`s; a `debug_assert` against the primary's used
+///   indices catches the violation in debug builds.
 ///
 /// Errors instead of panicking on every malformed input: missing
 /// attach/port nodes, a malformed secondary graph, a non-unit seam,
@@ -210,6 +227,19 @@ pub fn merge_graphs(
     if !seam.is_valid() {
         return Err(MergeError::InvalidSeam);
     }
+    // `effective_base` must exceed every primary `effective_index`
+    // (doc precondition) — undersizing it silently aliases secondary
+    // nodes onto primary `WeldPart`s, which no check downstream can
+    // see. The parts slice is out of signature, so only the
+    // primary's used indices can prove the bound: debug-assert it.
+    debug_assert!(
+        primary
+            .nodes
+            .values()
+            .all(|n| n.effective_index < effective_base),
+        "merge: effective_base below the primary's used effective indices"
+    );
+    check_secondary_structure(secondary)?;
     // The remap base: every merged secondary id sorts above every
     // primary id, so the weld's ascending-id summation order is the
     // primary subtree's order followed by the secondary's — the order
@@ -269,6 +299,50 @@ pub fn merge_graphs(
         seam_node,
         port_b,
     })
+}
+
+/// Secondary structure gate: every non-root node's parent must exist
+/// AND reach the root. The graph edit's parent lookup alone proves
+/// only existence — a detached cycle (a→b→a, never reaching the
+/// root) satisfies it too and would merge into unreachable nodes the
+/// weld then rejects as `Unreachable`. Both halves run here, up
+/// front: existence first (the `SecondaryParent` verdict the edit
+/// pass would give — same ascending order, same first offender),
+/// then a reachability walk from the root over the child edges,
+/// where anything unreached is by construction a cycle.
+fn check_secondary_structure(secondary: &PartGraph) -> Result<(), MergeError> {
+    let mut children: BTreeMap<PartNodeId, Vec<PartNodeId>> = BTreeMap::new();
+    for (&id, node) in &secondary.nodes {
+        if id == secondary.root {
+            continue;
+        }
+        match node.parent {
+            Some(p) if secondary.nodes.contains_key(&p) => {
+                children.entry(p).or_default().push(id);
+            }
+            _ => {
+                return Err(MergeError::SecondaryParent {
+                    node: id,
+                    parent: node.parent,
+                });
+            }
+        }
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut stack = vec![secondary.root];
+    while let Some(id) = stack.pop() {
+        if seen.insert(id)
+            && let Some(cs) = children.get(&id)
+        {
+            stack.extend(cs.iter().copied());
+        }
+    }
+    if seen.len() < secondary.nodes.len() {
+        return Err(MergeError::SecondaryShape(
+            "merge: secondary parent chain does not reach the root",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -685,6 +759,26 @@ mod tests {
         assert!(matches!(
             merge_graphs(&gp, &orphan, PartNodeId(1), PartNodeId(0), seam(), 2),
             Err(MergeError::SecondaryParent { .. })
+        ));
+        // A secondary whose non-root nodes form a detached parent
+        // CYCLE — every parent exists in the graph, but the chain
+        // never reaches the root; unreachable nodes must not merge.
+        let mut cyclic = PartGraph::new(PartNodeId(0));
+        cyclic.insert(
+            PartNodeId(0),
+            PartNode::new(None, PartTransform::IDENTITY, 0),
+        );
+        cyclic.insert(
+            PartNodeId(6),
+            PartNode::new(Some(PartNodeId(7)), PartTransform::IDENTITY, 0),
+        );
+        cyclic.insert(
+            PartNodeId(7),
+            PartNode::new(Some(PartNodeId(6)), PartTransform::IDENTITY, 0),
+        );
+        assert!(matches!(
+            merge_graphs(&gp, &cyclic, PartNodeId(1), PartNodeId(0), seam(), 2),
+            Err(MergeError::SecondaryShape(_))
         ));
         // A secondary root that names a parent is malformed input.
         let mut bad_root = PartGraph::new(PartNodeId(0));

@@ -477,7 +477,7 @@ impl VabSession {
                 }
             }
             VabAction::InsertStage(at) => {
-                self.session.insert_stage(at);
+                self.session.insert_stage(at).map_err(VabError::Session)?;
                 self.dirty = true;
             }
             VabAction::RemoveStage(at) => {

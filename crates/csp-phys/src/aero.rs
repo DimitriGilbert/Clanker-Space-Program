@@ -159,7 +159,10 @@ const TRI_EPS: f64 = 1e-9;
 /// semantics change (§2.4.1's `<voxelizer_version>` cache key).
 /// v2: lattice-bin occlusion sweep, `area_m2` = total projected area,
 /// tol-0 rasterization + thin-hull dilation, inward lift axis.
-pub const VOXELIZER_VERSION: u32 = 2;
+/// v3: `ref_area_m2` = unblocked force-producing area (the occluded
+/// share excluded), matching the `area·(1 − shielded)` the knot
+/// normalization actually divides by.
+pub const VOXELIZER_VERSION: u32 = 3;
 
 /// §2.4.1's `ConfigMask` — a bitset over the craft's nodes in
 /// ascending [`PartNodeId`] order (see the module doc). Bits past 63
@@ -650,8 +653,12 @@ pub struct PartAeroTable {
     pub shielded: Vec<f64>,
     /// Area-weighted centre of the part's *unblocked* entry faces
     /// per direction, body frame — the aero force application point.
-    /// The part's body-frame CoM when the unblocked area is zero
-    /// (unused then).
+    /// Fallback when a direction's unblocked area is zero: the hull's
+    /// *vertex centroid* (NOT the part CoM — the weld's per-part CoM
+    /// lives in `WeldPart.com` in part-local frame and is not re-
+    /// derived here). The fallback can still contribute through the
+    /// 3-direction interpolation when a neighbouring direction has
+    /// area, so it is a geometric stand-in only, not a mass property.
     pub cop: Vec<DVec3>,
     /// Area-weighted mean of the unblocked entry faces' *outward*
     /// normals per direction — `‖·‖ ≤ 1` (a mean of unit vectors,
@@ -689,8 +696,12 @@ pub struct CraftAeroTables {
     /// the edge had to double (the editor-facing warning flag).
     pub voxel_budget_exceeded: bool,
     /// Craft reference area (m²): the max over directions of the
-    /// per-part total exposed projected area summed across parts —
-    /// the `A_ref` the knot grid's coefficients normalize against.
+    /// per-part *unblocked* force-producing projected area
+    /// `Σ area·(1 − shielded)` — the `A_ref` the knot grid's
+    /// coefficients normalize against. Occluded area produces no
+    /// force, so including it would bias every knot coefficient low
+    /// by the occluded share; the per-part `area_m2` totals still
+    /// carry the occluded share for the shielding bookkeeping.
     pub ref_area_m2: f64,
     /// Craft reference length (m): the collider AABB's largest
     /// dimension — the `L_ref` for `Cm`.
@@ -985,22 +996,31 @@ fn voxelize_craft(body: &WeldedBody, active: &[Active<'_>]) -> (VoxelGrid, DVec3
     let mut edge = VOXEL_TARGET_EDGE_M;
     let mut dims = [0usize; 3];
     let mut exceeded = false;
-    loop {
+    let cells = loop {
         let span = hi - lo;
         dims[0] = (libm::ceil(span.x.max(0.0) / edge) as usize).max(1);
         dims[1] = (libm::ceil(span.y.max(0.0) / edge) as usize).max(1);
         dims[2] = (libm::ceil(span.z.max(0.0) / edge) as usize).max(1);
-        if dims[0] * dims[1] * dims[2] <= VOXEL_BUDGET {
-            break;
+        // The product must be compared BEFORE it is proven `usize`-
+        // representable: a degenerate span (e.g. planetary offsets)
+        // saturates `as usize` at each dim, and a wrapping `usize`
+        // product can land under the budget — under-allocating
+        // `part_of` and leaving `index()` to walk out of bounds.
+        // Compare in `u128`; the loop keeps doubling `edge` until
+        // the grid genuinely fits.
+        let cells128 = dims[0] as u128 * dims[1] as u128 * dims[2] as u128;
+        if cells128 <= VOXEL_BUDGET as u128 {
+            // Now `≤ VOXEL_BUDGET`, so it fits `usize` exactly.
+            break cells128 as usize;
         }
         exceeded = true;
         edge *= 2.0;
-    }
+    };
     let mut grid = VoxelGrid {
         edge,
         origin: lo,
         dims,
-        part_of: vec![EMPTY; dims[0] * dims[1] * dims[2]],
+        part_of: vec![EMPTY; cells],
         occupied: Vec::new(),
     };
     // Strict centre-in-hull pass (`tol = 0`): a cell is occupied only
@@ -1213,7 +1233,11 @@ fn assemble_part_tables(
     for (slot, a) in active.iter().enumerate() {
         let acc = &accums[slot];
         let verts = &body.collider.hulls[a.hull as usize].vertices;
-        let part_com = verts.iter().fold(DVec3::ZERO, |s, v| s + *v) / verts.len().max(1) as f64;
+        // Zero-area `cop` fallback: the hull's vertex centroid — a
+        // geometric stand-in, deliberately NOT labelled a centre of
+        // mass (the part's true `com` is part-local and unused here).
+        let hull_centroid =
+            verts.iter().fold(DVec3::ZERO, |s, v| s + *v) / verts.len().max(1) as f64;
         let mut area_m2 = Vec::with_capacity(AERO_DIRECTION_COUNT);
         let mut shielded = Vec::with_capacity(AERO_DIRECTION_COUNT);
         let mut cop = Vec::with_capacity(AERO_DIRECTION_COUNT);
@@ -1234,7 +1258,7 @@ fn assemble_part_tables(
             cop.push(if a_dir > 0.0 {
                 acc.cop_num[di] / a_dir
             } else {
-                part_com
+                hull_centroid
             });
             lift_axis.push(if a_dir > 0.0 {
                 acc.nrm_num[di] / a_dir
@@ -1295,8 +1319,14 @@ pub fn build_aero_tables(
     // Craft references.
     let mut ref_area = 0.0f64;
     for di in 0..AERO_DIRECTION_COUNT {
-        let total: f64 = tables.iter().map(|p| p.area_m2[di]).sum();
-        ref_area = ref_area.max(total);
+        // Unblocked (force-producing) area — the same
+        // `area·(1 − shielded)` product `part_force` applies; see the
+        // `ref_area_m2` doc for why the occluded share is excluded.
+        let exposed: f64 = tables
+            .iter()
+            .map(|p| p.area_m2[di] * (1.0 - p.shielded[di]))
+            .sum();
+        ref_area = ref_area.max(exposed);
     }
     let ref_len = (hi - lo).x.max((hi - lo).y).max((hi - lo).z).max(1.0);
 

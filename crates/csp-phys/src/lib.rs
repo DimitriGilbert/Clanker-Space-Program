@@ -110,7 +110,10 @@ pub use part::{
     ColliderShape, DockPortSpec, ExperimentSpec, ForceSite, ForceSiteKind, LabSpec, TankSpec,
     WeldPart,
 };
-pub use profile::{BurnSegment, MissionCheck, MissionProfile, Regime, confidence, expected_hazard};
+pub use profile::{
+    BurnSegment, HazardReport, MissionCheck, MissionProfile, Regime, confidence, expected_hazard,
+    expected_hazard_report,
+};
 pub use readout::{CraftAnalysis, StageStats, analyze};
 pub use resolve::{
     BuiltPart, EffectivePart, EngineReliability, FamilyQualification, FamilyQualifications,

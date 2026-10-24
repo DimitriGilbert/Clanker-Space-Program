@@ -28,6 +28,7 @@ use csp_core::{DQuat, DVec3, SimError};
 
 use crate::graph::{PartGraph, PartNodeId, PartTransform};
 use crate::part::{ForceSite, WeldPart};
+use crate::simple::PHYSICS_DT;
 use crate::tensor::SymMat3;
 use crate::thermal::{ThermalEdge, ThermalNet, ThermalNode, joint_conductance};
 
@@ -244,6 +245,15 @@ pub enum WeldError {
     /// Defensive: a computed mass property came out non-finite despite
     /// validated inputs.
     NonFiniteResult(&'static str),
+    /// The attachment edge's conductance and endpoint heat capacities
+    /// violate the thermal tick's explicit-Euler stability bound
+    /// `G·dt·(1/C_a + 1/C_b) < 2` at the pinned [`PHYSICS_DT`] — the
+    /// two-lump conduction map's multiplier `1 − G·dt·(1/C_a + 1/C_b)`
+    /// would leave `[−1, 1]`, so the net cannot be emitted: the
+    /// per-field gates on `conduction`/`heat_capacity` can't see the
+    /// coupling, which is why the check lives at edge formation.
+    /// Carries the edge's canonical `(a < b)` endpoints.
+    UnstableThermalCoupling { a: PartNodeId, b: PartNodeId },
 }
 
 impl WeldError {
@@ -261,6 +271,9 @@ impl WeldError {
             Self::NonUnitRotation(_) => "weld: node rotation is not a unit quaternion",
             Self::IndexOverflow(f) | Self::InternalInvariant(f) | Self::NonFiniteResult(f) => f,
             Self::ZeroTotalMass => "weld: total mass is zero",
+            Self::UnstableThermalCoupling { .. } => {
+                "weld: thermal edge coupling exceeds the explicit-Euler stability bound"
+            }
         }
     }
 }
@@ -391,7 +404,8 @@ fn validate_structure(graph: &PartGraph, effective: &[WeldPart]) -> Result<(), W
 }
 
 /// Per-part physical validity: finite non-negative mass, finite CoM,
-/// PSD inertia, finite collider, finite non-zero site directions.
+/// PSD inertia, finite collider within the vertex cap, finite unit
+/// site directions.
 fn validate_effective(node: PartNodeId, ep: &WeldPart) -> Result<(), WeldError> {
     let bad = |field: &'static str| WeldError::InvalidPart { node, field };
     if !ep.mass_kg.is_finite() || ep.mass_kg < 0.0 {
@@ -404,14 +418,21 @@ fn validate_effective(node: PartNodeId, ep: &WeldPart) -> Result<(), WeldError> 
         return Err(bad("weld: part inertia is not positive-semidefinite"));
     }
     if !ep.collider.is_valid() {
-        return Err(bad("weld: collider contains non-finite vertices"));
+        return Err(bad(
+            "weld: collider has non-finite vertices or exceeds MAX_COLLIDER_VERTICES",
+        ));
     }
     for site in &ep.force_sites {
+        // `local_dir` is a unit direction (its doc contract): the
+        // force model multiplies `throttle·rated_n` by it verbatim,
+        // so a non-unit direction silently scales the force — the
+        // `NonUnitRotation` gate above is the precedent. The same
+        // `q·q − 1` tolerance applies (`‖d‖²` within 1e-9 of 1).
         if !site.local_pos.is_finite()
             || !site.local_dir.is_finite()
-            || site.local_dir.norm_squared() <= 0.0
+            || (site.local_dir.norm_squared() - 1.0).abs() > PartTransform::UNIT_ROTATION_TOLERANCE
         {
-            return Err(bad("weld: force site has non-finite or zero direction"));
+            return Err(bad("weld: force site direction is non-finite or non-unit"));
         }
         if !site.rated_n.is_finite() || site.rated_n < 0.0 {
             return Err(bad(
@@ -634,7 +655,7 @@ fn assemble(solved: &BTreeMap<PartNodeId, SolvedNode<'_>>) -> Result<WeldedBody,
             "weld: inertia tensor is non-finite",
         ));
     }
-    let thermal = Box::new(build_thermal_net(solved, &aabbs, thermal_nodes));
+    let thermal = Box::new(build_thermal_net(solved, &aabbs, thermal_nodes)?);
     Ok(WeldedBody {
         pos: DVec3::ZERO,
         rot: DQuat::IDENTITY,
@@ -663,7 +684,7 @@ fn build_thermal_net(
     solved: &BTreeMap<PartNodeId, SolvedNode<'_>>,
     aabbs: &BTreeMap<PartNodeId, (DVec3, DVec3)>,
     nodes: Vec<ThermalNode>,
-) -> ThermalNet {
+) -> Result<ThermalNet, WeldError> {
     let mut edges = Vec::new();
     for (id, s) in solved {
         let Some(parent) = s.parent else { continue };
@@ -689,14 +710,14 @@ fn build_thermal_net(
         if sep.norm_squared() < 1e-18 {
             continue;
         }
+        // The parent's part is reachable through `solved` — the DFS
+        // guarantees the parent was inserted first.
+        let Some(ps) = solved.get(&parent) else {
+            continue;
+        };
         let g = joint_conductance(
             s.part.thermal.conduction_w_per_k,
-            // The parent's part is reachable through `solved` — the
-            // DFS guarantees the parent was inserted first.
-            match solved.get(&parent) {
-                Some(ps) => ps.part.thermal.conduction_w_per_k,
-                None => continue,
-            },
+            ps.part.thermal.conduction_w_per_k,
             shared,
             face_c.min(face_p),
         );
@@ -708,6 +729,22 @@ fn build_thermal_net(
             } else {
                 (*id, parent)
             };
+            // The thermal tick is explicit Euler — the edge's
+            // two-lump conduction map has multiplier
+            // `1 − G·dt·(1/C_a + 1/C_b)`, which leaves [−1, 1] (and
+            // diverges, alternating) once the product reaches 2.
+            // `validate_effective`'s per-field gates can't see the
+            // coupling, so the coupled bound is enforced at edge
+            // formation: a net the pinned-dt tick cannot integrate
+            // is not emitted (both capacities are proven
+            // positive-finite upstream).
+            if g * PHYSICS_DT
+                * (1.0 / s.part.thermal.heat_capacity_j_per_k
+                    + 1.0 / ps.part.thermal.heat_capacity_j_per_k)
+                >= 2.0
+            {
+                return Err(WeldError::UnstableThermalCoupling { a, b });
+            }
             edges.push(ThermalEdge {
                 a,
                 b,
@@ -718,7 +755,7 @@ fn build_thermal_net(
     // Canonical order — emission followed the child-side traversal,
     // which a re-root permutes; the joint set itself is unchanged.
     edges.sort_by_key(|e| (e.a, e.b));
-    ThermalNet { nodes, edges }
+    Ok(ThermalNet { nodes, edges })
 }
 
 /// Sort vertices by `(x, y, z)` total order and drop duplicates — the
@@ -1353,6 +1390,41 @@ mod tests {
         );
         assert!(matches!(
             weld(&g, &parts),
+            Err(WeldError::InvalidPart {
+                node: PartNodeId(1),
+                ..
+            })
+        ));
+
+        // Non-unit force-site direction — would silently scale
+        // `throttle·rated_n`; the `NonUnitRotation` precedent.
+        let mut g_ok = PartGraph::new(PartNodeId(1));
+        g_ok.insert(
+            PartNodeId(1),
+            PartNode::new(None, PartTransform::IDENTITY, 0),
+        );
+        let mut bad = point_part(1.0);
+        bad.force_sites = vec![ForceSite::new(
+            DVec3::ZERO,
+            DVec3::new(2.0, 0.0, 0.0),
+            ForceSiteKind::Thrust,
+            10.0,
+        )];
+        assert!(matches!(
+            weld(&g_ok, &[bad]),
+            Err(WeldError::InvalidPart {
+                node: PartNodeId(1),
+                ..
+            })
+        ));
+
+        // Over-cap collider vertex set — the `O(n⁴)` per-tick
+        // facet sweep bound.
+        let mut bad = point_part(1.0);
+        bad.collider =
+            ColliderShape::Points(vec![DVec3::ZERO; crate::part::MAX_COLLIDER_VERTICES + 1]);
+        assert!(matches!(
+            weld(&g_ok, &[bad]),
             Err(WeldError::InvalidPart {
                 node: PartNodeId(1),
                 ..

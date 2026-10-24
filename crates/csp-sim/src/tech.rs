@@ -418,7 +418,7 @@ mod tests {
                 gimbal_deg: 0.0,
                 ignitions: None,
                 rated_burn_s: 100.0,
-                propellants: vec![],
+                propellants: vec![(ResourceId::from("liquid_fuel"), 1.0)],
                 ullage_required: false,
             }],
             reliability: ReliabilityDef {
@@ -632,7 +632,11 @@ mod tests {
         // And the composed stat resolves through the M3 resolver.
         let res = csp_data::ResourceFile {
             schema_version: 1,
-            resources: vec![],
+            resources: vec![csp_data::ResourceDef {
+                id: csp_data::ResourceId::from("liquid_fuel"),
+                display_name: "r.liquid_fuel".into(),
+                mass_per_unit_kg: 5.0,
+            }],
         };
         let eff =
             csp_phys::resolve_part(&d, &b2, &res, &csp_phys::FamilyQualification::FRESH, None)

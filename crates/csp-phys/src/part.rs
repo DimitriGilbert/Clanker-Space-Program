@@ -156,6 +156,18 @@ pub enum ColliderShape {
     Box { half_extents: DVec3 },
 }
 
+/// Upper bound on a collider's vertex count — the weld's input gate
+/// rejects larger sets. [`crate::hull::facet_planes`] re-derives a
+/// hull's facet planes by a brute-force `O(n⁴)` sweep over the vertex
+/// set *every tick a pair candidate overlaps*, so the authored count
+/// must stay small: 64 bounds that sweep at ~10⁶ multiply-adds (and
+/// still dwarfs every shipped collider — `Box` is 8, a `Cylinder`
+/// resolves to an inscribed 16-vertex octagonal prism, and authored
+/// `Convex` point sets are low-poly). Interior (non-extreme) points
+/// are wasted work regardless — `Points` authors should list extreme
+/// vertices only.
+pub const MAX_COLLIDER_VERTICES: usize = 64;
+
 impl ColliderShape {
     /// The convex-hull vertex set in part-local frame, in a fixed
     /// enumeration order.
@@ -176,10 +188,15 @@ impl ColliderShape {
         }
     }
 
-    /// All vertices finite — the weld's input gate.
+    /// All vertices finite and within [`MAX_COLLIDER_VERTICES`] — the
+    /// weld's input gate. The count bound keeps the per-tick
+    /// `O(n⁴)` facet-plane sweep bounded; exceeding sets are bad
+    /// authored data, not geometry to subsample silently.
     pub fn is_valid(&self) -> bool {
         match self {
-            Self::Points(pts) => pts.iter().all(|p| p.is_finite()),
+            Self::Points(pts) => {
+                pts.len() <= MAX_COLLIDER_VERTICES && pts.iter().all(|p| p.is_finite())
+            }
             Self::Box { half_extents: h } => h.is_finite(),
         }
     }
@@ -356,7 +373,7 @@ mod tests {
     }
 
     /// Every `is_valid` failure mode: non-finite point, non-finite box
-    /// half-extent; valid shapes pass.
+    /// half-extent, over-cap vertex count; valid shapes pass.
     #[test]
     fn collider_shape_is_valid() {
         assert!(ColliderShape::Points(vec![DVec3::ZERO]).is_valid());
@@ -366,6 +383,8 @@ mod tests {
             !ColliderShape::Points(vec![DVec3::ZERO, DVec3::new(0.0, f64::INFINITY, 0.0)])
                 .is_valid()
         );
+        // Over-cap vertex count — the `O(n⁴)` facet-sweep bound.
+        assert!(!ColliderShape::Points(vec![DVec3::ZERO; MAX_COLLIDER_VERTICES + 1]).is_valid());
         assert!(
             ColliderShape::Box {
                 half_extents: DVec3::new(0.5, 0.5, 0.5)

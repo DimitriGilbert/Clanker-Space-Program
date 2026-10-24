@@ -2363,8 +2363,19 @@ impl World {
     /// built from `balance.ron` ([`View`](csp_view)-side startup,
     /// `csp-bench` scenario setup). A construction-config write like
     /// [`Self::set_vessel_caps`]: call before the first `step_frame`.
-    pub fn set_docking_config(&mut self, config: DockingConfig) {
+    /// An invalid config (the `is_valid` gate the snapshot restore
+    /// runs) is rejected `Recoverable` rather than installed: the
+    /// config lands in hashed state, and an out-of-bound
+    /// `soft_pull_per_s` (≥ `joints::SOFT_PULL_LIMIT_PER_S`, the joint
+    /// solve's explicit-map stability bound) would otherwise put every
+    /// capture into a permanent limit cycle with no honest surface —
+    /// the [`Self::set_economy_config`] precedent.
+    pub fn set_docking_config(&mut self, config: DockingConfig) -> Result<(), SimError> {
+        if !config.is_valid() {
+            return Err(SimError::Recoverable("docking: invalid config"));
+        }
         self.docking = config;
+        Ok(())
     }
 
     /// The configured docking tunables.
@@ -3626,7 +3637,8 @@ impl World {
                         alpha_b,
                     )
                     .map_err(|e| SimError::Fatal(e.reason()))?;
-                    let failed = csp_phys::failed_joints(&loads, &craft.graph, &craft.parts);
+                    let failed = csp_phys::failed_joints(&loads, &craft.graph, &craft.parts)
+                        .map_err(|e| SimError::Fatal(e.reason()))?;
                     if !failed.is_empty() {
                         failures.entry(vid).or_default().0 = failed;
                     }
@@ -3641,14 +3653,27 @@ impl World {
                 // exposure. The temperatures are the vessel's
                 // serialized record, not a derived cache.
                 let flow = csp_phys::flow_sample(physics.backend.environment(), body);
-                let hot = csp_phys::thermal_step(
+                // A diverged lump is withheld at the source (the
+                // writeback guard in `thermal::step`) and reported
+                // `Recoverable` — the in-range channel is `degraded`
+                // (the `?`-boundary rule above: only `Fatal` escapes
+                // the range), with `hot` empty: the vessel's
+                // thermal tick is skipped rather than writing a NaN
+                // that the next `state_hash` would read as `Fatal`.
+                let hot = match csp_phys::thermal_step(
                     &body.thermal,
                     body.aero.as_deref(),
                     &flow,
                     &mut vessel.thermal.part_temps_k,
                     &mut physics.thermal_rates,
                     csp_phys::PHYSICS_DT,
-                );
+                ) {
+                    Ok(hot) => hot,
+                    Err(e) => {
+                        degraded.push(e);
+                        Vec::new()
+                    }
+                };
                 // M9b §3.4: the per-part reliability tick — post-step
                 // so it reads the tick's fresh temps, loads, and
                 // throttle. `Explosion` modes fold into the same
@@ -6076,7 +6101,8 @@ impl World {
         let transforms = csp_phys::weld::body_transforms(&craft.graph, &craft.parts)
             .map_err(|e| SimError::Fatal(e.reason()))?;
         let members = csp_phys::subtree_set(&craft.graph, node);
-        let frag_g = csp_phys::fragment_graph_of(&craft.graph, &transforms, node, &members);
+        let frag_g = csp_phys::fragment_graph_of(&craft.graph, &transforms, node, &members)
+            .map_err(|e| SimError::Fatal(e.reason()))?;
         let mut fb =
             csp_phys::weld(&frag_g, &craft.parts).map_err(|e| SimError::Fatal(e.reason()))?;
         let mut retained = craft.graph.clone();
@@ -9393,8 +9419,8 @@ fn apply_breakup(
     // Both lists are processed ancestors-first: node ids are
     // arbitrary labels, NOT parent-before-child order, and the
     // `removed.contains(&n)` skip only catches a nested failure when
-    // the ancestor claimed first. Unsorted, a descendant hit (say a
-    // smaller id from `failed_joints`' ascending-id order) would
+    // the ancestor claimed first. Unsorted, a descendant hit (say an
+    // early child in `failed_joints`' DFS preorder) would
     // claim its subtree, then the ancestor hit would claim the whole
     // subtree *again* — the shared nodes welded into two fragments,
     // mass fabricated.
@@ -9484,7 +9510,8 @@ fn apply_breakup(
             break; // §2.9 cap — fragments beyond it are discarded
         }
         let members = &members_of[&d];
-        let frag_g = csp_phys::fragment_graph_of(&craft.graph, &transforms, d, members);
+        let frag_g = csp_phys::fragment_graph_of(&craft.graph, &transforms, d, members)
+            .map_err(|e| SimError::Fatal(e.reason()))?;
         let mut fb =
             csp_phys::weld(&frag_g, &craft.parts).map_err(|e| SimError::Fatal(e.reason()))?;
         fb.pos = pos;
@@ -15368,6 +15395,39 @@ mod tests {
         }
     }
 
+    /// R13-F1: `soft_pull_per_s` at or past the joint solve's
+    /// explicit-map stability bound (`SOFT_PULL_LIMIT_PER_S` =
+    /// `2/PHYSICS_DT` = 128/s) is invalid, and the setter refuses to
+    /// install it — an unbounded pull puts the reel-in map
+    /// `c_{n+1} ≈ (1 − pull·dt)·c_n` into a permanent limit cycle.
+    #[test]
+    fn soft_pull_at_stability_bound_is_rejected() {
+        let mut cfg = joints::default_config();
+        cfg.soft_pull_per_s = joints::SOFT_PULL_LIMIT_PER_S;
+        assert!(!cfg.is_valid(), "the bound itself is excluded");
+        cfg.soft_pull_per_s = 1e6;
+        assert!(!cfg.is_valid());
+        cfg.soft_pull_per_s = 64.0;
+        assert!(cfg.is_valid(), "inside the bound still validates");
+        let mut w = physics_world(false);
+        let before = w.docking_config();
+        let err = w.set_docking_config(cfg_with_pull(200.0));
+        assert_eq!(err, Err(SimError::Recoverable("docking: invalid config")));
+        assert_eq!(
+            w.docking_config(),
+            before,
+            "a rejected config must not install"
+        );
+    }
+
+    /// A `DockingConfig` with only the pull rate varied.
+    fn cfg_with_pull(pull: f64) -> DockingConfig {
+        DockingConfig {
+            soft_pull_per_s: pull,
+            ..joints::default_config()
+        }
+    }
+
     /// §2.4: two vessels' port faces in range AND facing form a
     /// transient soft-capture joint.
     #[test]
@@ -15421,7 +15481,7 @@ mod tests {
     #[test]
     fn capture_joint_damps_relative_motion() {
         let mut w = physics_world(false);
-        w.set_docking_config(latch_off());
+        w.set_docking_config(latch_off()).unwrap();
         // B closing at 2 m/s along the port axis: the pair enters
         // range during the approach, captures, and damps.
         let base = DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0);
@@ -15476,7 +15536,8 @@ mod tests {
         w.set_docking_config(DockingConfig {
             max_live_joints: 1,
             ..latch_off()
-        });
+        })
+        .unwrap();
         // Pair 1 captures. Pair 2, also in geometry, is refused —
         // clean separation + one Recoverable on the report.
         spawn_port_pair(&mut w, DVec3::new(0.0, 0.0, 1.8), flip_rot());
@@ -15538,7 +15599,7 @@ mod tests {
     #[test]
     fn saving_refused_while_joint_is_live() {
         let mut w = physics_world(false);
-        w.set_docking_config(latch_off());
+        w.set_docking_config(latch_off()).unwrap();
         let stalk = |size: csp_data::PortSize| {
             let mut c = port_craft(size);
             c.parts[0].dock_ports[0].local_pos = DVec3::new(0.0, 0.0, 2.0);
@@ -15608,7 +15669,7 @@ mod tests {
         let base = DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0);
         let v = DVec3::new(0.0, libm::sqrt(3.5316e12 / base.norm()), 0.0);
         let mut w = physics_world(false);
-        w.set_docking_config(latch_off());
+        w.set_docking_config(latch_off()).unwrap();
         for (pos, rot) in [
             (base, DQuat::IDENTITY),
             (base + DVec3::new(0.0, 0.0, 4.3), flip_rot()),
@@ -15659,8 +15720,8 @@ mod tests {
     fn joint_island_hash_is_deterministic() {
         let mut a = physics_world(false);
         let mut b = physics_world(false);
-        a.set_docking_config(latch_off());
-        b.set_docking_config(latch_off());
+        a.set_docking_config(latch_off()).unwrap();
+        b.set_docking_config(latch_off()).unwrap();
         spawn_port_pair(&mut a, DVec3::new(0.0, 0.0, 1.8), flip_rot());
         spawn_port_pair(&mut b, DVec3::new(0.0, 0.0, 1.8), flip_rot());
         for _ in 0..64 {
@@ -16651,7 +16712,7 @@ mod tests {
     #[test]
     fn jointed_pair_is_docked_for_transfer() {
         let mut w = physics_world(false);
-        w.set_docking_config(latch_off()); // keep the island alive
+        w.set_docking_config(latch_off()).unwrap(); // keep the island alive
         spawn_port_tank_pair(&mut w);
         assert_eq!(w.joints().len(), 1);
         let res = ResourceId::from("liquid_fuel");

@@ -7,8 +7,11 @@
 //! hull's facet planes are therefore re-detected from the vertex set on
 //! demand by the brute-force [`facet_planes`] sweep: `O(n⁴)` in the
 //! vertex count, `n` being a convex hull's extreme-point count (8 for
-//! the ubiquitous box), so this stays cheap at craft scale — and is a
-//! pure function of the vertex set, satisfying §2.4/§7.3's
+//! the ubiquitous box). The per-tick cost is bounded by the input
+//! gate — the weld rejects colliders above
+//! [`crate::part::MAX_COLLIDER_VERTICES`], and `facet_planes` itself
+//! declines over-cap sets — so this stays cheap at craft scale, and
+//! is a pure function of the vertex set, satisfying §2.4/§7.3's
 //! derived-cache rule.
 
 use csp_core::DVec3;
@@ -30,12 +33,26 @@ pub(crate) struct Plane {
     pub(crate) thick: f64,
 }
 
+/// Fixed upper bound on the facet-merge normal tolerance — see the
+/// dedup pass in [`facet_planes`]. Unit normals from the same facet
+/// agree to ~1e-15 at any scale, so 1e-9 is still three orders of
+/// magnitude above detection noise while refusing to merge facets
+/// whose normals genuinely differ.
+const NORMAL_MERGE_EPS: f64 = 1e-9;
+
 /// Detect a hull's facet planes from its vertex set: a vertex triple
 /// forms a facet when every other vertex lies on one side. Returns
 /// `None` for degenerate inputs the solid path cannot handle
-/// (<3 vertices, or a fully coplanar set — those have no interior).
+/// (<3 vertices, a fully coplanar set — those have no interior — or
+/// an over-[`crate::part::MAX_COLLIDER_VERTICES`] set, which the
+/// weld's input gate already rejects).
 pub(crate) fn facet_planes(verts: &[DVec3], plane_eps: f64) -> Option<Vec<Plane>> {
-    if verts.len() < 3 {
+    // Over-cap vertex sets are treated like the degenerate cases: the
+    // weld's input gate already rejects them
+    // (`ColliderShape::is_valid`), and this belt-and-suspenders bound
+    // keeps the `O(n⁴)` sweep bounded for hulls that never passed
+    // through it (hand-built `WeldedBody`s).
+    if verts.len() < 3 || verts.len() > crate::part::MAX_COLLIDER_VERTICES {
         return None;
     }
     let n = verts.len();
@@ -93,12 +110,19 @@ pub(crate) fn facet_planes(verts: &[DVec3], plane_eps: f64) -> Option<Vec<Plane>
     // duplicates (keep the first — ascending triple order already
     // walked them) so each real facet emits one manifold point, not
     // four: duplicate pair constraints act as parallel springs and
-    // over-correct. Compare `(n, d)` at `plane_eps` — the same fuzz
-    // as detection — in ascending plane order.
+    // over-correct. Compare `(n, d)` in ascending plane order — but
+    // the two axes are not interchangeable fuzz: `d` is a length and
+    // correctly shares `plane_eps` (itself ∝ hull size), while the
+    // normal difference is dimensionless — triples of one facet agree
+    // to f64 rounding (~1e-15) at ANY hull scale, so the normal test
+    // stays bounded by [`NORMAL_MERGE_EPS`]. Letting it scale with
+    // `plane_eps` would merge legitimately distinct near-parallel
+    // facets on ~km-diagonal hulls.
+    let normal_eps = plane_eps.min(NORMAL_MERGE_EPS);
     let mut dedup: Vec<Plane> = Vec::with_capacity(planes.len());
     'outer: for pl in planes {
         for kept in &dedup {
-            let same_normal = (kept.n - pl.n).norm() <= plane_eps;
+            let same_normal = (kept.n - pl.n).norm() <= normal_eps;
             if same_normal && (kept.d - pl.d).abs() <= plane_eps {
                 continue 'outer;
             }
@@ -156,8 +180,10 @@ pub(crate) fn plane_epsilon(verts: &[DVec3]) -> f64 {
 /// - **On the boundary** (some `depth_j ≤ 0`): **every** facet `f`
 ///   the vertex is on the near half of — `depth_f > 0`, `p` inside
 ///   every *other* facet within `tol` (`depth_j ≥ −tol`, `j ≠ f`),
-///   and `depth_f < thick_f/2 − tol` (the side of `f`'s slab `p`
-///   could only have reached by crossing `f`). Each is a genuine
+///   and `depth_f < max(thick_f/2 − tol, tol)` (the side of `f`'s
+///   slab `p` could only have reached by crossing `f`; the `tol`
+///   floor keeps the test open on sub-tolerance-thin slabs). Each is
+///   a genuine
 ///   crossing and earns its own manifold point — a vertex inside two
 ///   slabs must not collapse to the *nearest* face: the shallow graze
 ///   through a side facet would mask the deep support contact through
@@ -192,7 +218,16 @@ pub(crate) fn point_penetration(planes: &[Plane], p: DVec3, tol: f64) -> Vec<(us
     }
     let mut out = Vec::new();
     for (i, &df) in depths.iter().enumerate() {
-        if df <= 0.0 || df >= planes[i].thick * 0.5 - tol {
+        // The far-wall margin is min-bounded at `tol`: on hulls
+        // thinner than `2·tol` the raw `thick·0.5 − tol` goes
+        // negative and would reject EVERY boundary candidate — a
+        // sub-tolerance-thin plate could then never be entered
+        // through this facet at all. At such thicknesses the
+        // "which side" question is inside the fuzz anyway, so any
+        // shallow positive depth counts as a crossing; the
+        // on-the-corner reading (`df ≈ thick`, the full slab width)
+        // is still rejected whenever `thick ≥ tol`.
+        if df <= 0.0 || df >= (planes[i].thick * 0.5 - tol).max(tol) {
             continue;
         }
         let inside_others = depths

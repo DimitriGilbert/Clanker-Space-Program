@@ -1547,9 +1547,10 @@ pub fn validate_resources(res: &ResourceFile) -> Vec<ValidationError> {
 /// The `dock_soft_pull_per_s < 128` bound is the explicit-Euler
 /// stability limit of the soft-capture map `c_{n+1} ≈ (1 − pull·dt)·c_n`
 /// at the pinned `1/64` s tick (`pull·dt < 2`); `csp-sim`
-/// `DockingConfig::is_valid` is its canonical home — `csp-data` cannot
-/// call it (the dependency runs the other way), so the bound is
-/// mirrored here with the constant named.
+/// `DockingConfig::is_valid` is its canonical home (constant
+/// `joints::SOFT_PULL_LIMIT_PER_S` = `2/PHYSICS_DT`) — `csp-data`
+/// cannot call it (the dependency runs the other way), so the bound
+/// is mirrored here with the constant named.
 #[allow(clippy::too_many_lines)] // one line per field reads as a table
 pub fn validate_balance(
     b: &crate::balance::BalanceDef,

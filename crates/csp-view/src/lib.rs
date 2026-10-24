@@ -629,7 +629,8 @@ impl View {
         sim.set_script_op_budget(balance.script_op_budget);
         sim.set_script_engine(Box::new(csp_script::RhaiHost::new()));
         sim.set_autopilot_driver(Box::new(csp_ai::AscentAutopilot::new()));
-        sim.set_docking_config(csp_sim::DockingConfig::from_balance(&balance));
+        sim.set_docking_config(csp_sim::DockingConfig::from_balance(&balance))
+            .map_err(ViewError::Sim)?;
         sim.set_transfer_config(csp_sim::TransferConfig::from_balance(&balance));
         // M9b §3.4: the reliability tunables — dormant scale,
         // ignition window, effect magnitudes, test-stand economics.

@@ -58,8 +58,9 @@
 //! fragment gets the same formula from the jettison convention);
 //! §2.4's defined tolerances are checked by the sim-side test.
 //!
-//! Determinism: identical iteration discipline to the weld —
-//! ascending `PartNodeId`, plain `f64`, no hash maps.
+//! Determinism: identical discipline to the weld — a fixed traversal
+//! order (`joint_loads`' DFS preorder, `BTreeMap` key order
+//! elsewhere), plain `f64`, no hash maps.
 
 use std::collections::BTreeMap;
 
@@ -110,8 +111,11 @@ struct Agg {
 /// for the model. `accel_body`/`alpha_body` are the tick's measured
 /// accelerations in body frame (`(v₁−v₀)/dt` conjugated by `rot`,
 /// `(ω₁−ω₀)/dt`); `ext` is the per-node external force list from the
-/// backend. Returns loads in ascending `PartNodeId` order — the same
-/// order [`failed_joints`] and the split driver consume.
+/// backend. Returns loads in **depth-first preorder** from the graph
+/// root (a parent ahead of its children — the traversal order the
+/// split driver's subtree bookkeeping needs), NOT ascending
+/// `PartNodeId`. [`failed_joints`] preserves that order; sim
+/// consumers that need id order re-sort by `(depth, id)`.
 #[allow(clippy::too_many_lines)]
 pub fn joint_loads(
     body: &WeldedBody,
@@ -213,10 +217,26 @@ pub fn joint_loads(
 
         // Attach axis: dominant axis of the AABB-centre separation,
         // signed toward the child (the thermal net's convention).
+        // When the centres coincide the dominant-axis rule would pick
+        // an arbitrary +X (`0.0.signum() == 1.0`): the thermal net
+        // drops such an edge outright (`build_thermal_net`'s
+        // `sep < 1e-18` skip), and this pass takes the matching
+        // fallback — a joint load still needs an axis, so it falls
+        // back to the joint→subtree-CoM direction exactly like the
+        // no-skin case below, one convention for both degeneracies.
+        let fallback_axis = |d: DVec3| {
+            if d.norm() > 1e-9 {
+                d / d.norm()
+            } else {
+                DVec3::Z
+            }
+        };
         let axis = match (aabbs.get(id), aabbs.get(&parent)) {
             (Some(&(cl, ch)), Some(&(pl, ph))) => {
                 let sep = ((cl + ch) - (pl + ph)) * 0.5;
-                if sep.x.abs() >= sep.y.abs() && sep.x.abs() >= sep.z.abs() {
+                if sep.norm_squared() < 1e-18 {
+                    fallback_axis(c_s - p_j)
+                } else if sep.x.abs() >= sep.y.abs() && sep.x.abs() >= sep.z.abs() {
                     DVec3::new(sep.x.signum(), 0.0, 0.0)
                 } else if sep.y.abs() >= sep.z.abs() {
                     DVec3::new(0.0, sep.y.signum(), 0.0)
@@ -227,12 +247,7 @@ pub fn joint_loads(
             _ => {
                 // Degenerate attachment (no skin on one side): fall
                 // back to the joint→subtree-CoM direction, then +z.
-                let d = c_s - p_j;
-                if d.norm() > 1e-9 {
-                    d / d.norm()
-                } else {
-                    DVec3::Z
-                }
+                fallback_axis(c_s - p_j)
             }
         };
         let fa = f_j.dot(axis);
@@ -247,25 +262,41 @@ pub fn joint_loads(
 }
 
 /// The attachments whose load exceeds the CHILD part's authored
-/// `structural` limits — ascending `PartNodeId`. A zero limit fails
-/// only on a strictly-positive load (`max = 0` is authored data for
-/// "no tolerance", not "always broken").
+/// `structural` limits, in `loads` order (the [`joint_loads`] DFS
+/// preorder — the split driver re-sorts by depth before consuming).
+/// A zero limit fails only on a strictly-positive load (`max = 0` is
+/// authored data for "no tolerance", not "always broken").
+///
+/// Errors `InternalInvariant` rather than panicking when a load names
+/// a node outside `graph` or a node whose `effective_index` is out of
+/// `parts` — contract violations like the other typed paths here.
 pub fn failed_joints(
     loads: &[JointLoad],
     graph: &PartGraph,
     parts: &[WeldPart],
-) -> Vec<PartNodeId> {
-    loads
-        .iter()
-        .filter(|l| {
-            let node = &graph.nodes[&l.node];
-            let s = &parts[node.effective_index as usize].structural;
-            (l.axial_n > 0.0 && l.axial_n > s.max_axial_n)
-                || (l.shear_n > 0.0 && l.shear_n > s.max_shear_n)
-                || (l.torque_nm > 0.0 && l.torque_nm > s.max_torque_nm)
-        })
-        .map(|l| l.node)
-        .collect()
+) -> Result<Vec<PartNodeId>, WeldError> {
+    let mut failed = Vec::new();
+    for l in loads {
+        let node = graph
+            .nodes
+            .get(&l.node)
+            .ok_or(WeldError::InternalInvariant(
+                "structural: joint load names a node outside the graph",
+            ))?;
+        let s = &parts
+            .get(node.effective_index as usize)
+            .ok_or(WeldError::InternalInvariant(
+                "structural: effective index out of range in joint check",
+            ))?
+            .structural;
+        if (l.axial_n > 0.0 && l.axial_n > s.max_axial_n)
+            || (l.shear_n > 0.0 && l.shear_n > s.max_shear_n)
+            || (l.torque_nm > 0.0 && l.torque_nm > s.max_torque_nm)
+        {
+            failed.push(l.node);
+        }
+    }
+    Ok(failed)
 }
 
 /// The closed subtree rooted at `root`, ascending id.
@@ -296,7 +327,7 @@ pub fn fragment_graph(
     graph: &PartGraph,
     transforms: &BTreeMap<PartNodeId, PartTransform>,
     root: PartNodeId,
-) -> PartGraph {
+) -> Result<PartGraph, WeldError> {
     fragment_graph_of(graph, transforms, root, &subtree_set(graph, root))
 }
 
@@ -310,17 +341,26 @@ pub fn fragment_graph(
 /// subtree — a member's ancestors up to `root` are themselves
 /// members — which is exactly what removing whole closed subtrees
 /// from a subtree produces.
+///
+/// Errors `InternalInvariant` rather than panicking on a contract
+/// violation: a `members` id absent from `graph`, or `root` missing
+/// from `transforms` (the caller's `body_transforms` output covers
+/// every graph node, so a miss means the arguments disagree).
 pub fn fragment_graph_of(
     graph: &PartGraph,
     transforms: &BTreeMap<PartNodeId, PartTransform>,
     root: PartNodeId,
     members: &std::collections::BTreeSet<PartNodeId>,
-) -> PartGraph {
+) -> Result<PartGraph, WeldError> {
     let mut frag = PartGraph::new(root);
     for &id in members {
-        let node = &graph.nodes[&id];
+        let node = graph.nodes.get(&id).ok_or(WeldError::InternalInvariant(
+            "structural: fragment member missing from the parent graph",
+        ))?;
         let transform = if id == root {
-            transforms[&id]
+            *transforms.get(&id).ok_or(WeldError::InternalInvariant(
+                "structural: fragment root missing from body transforms",
+            ))?
         } else {
             node.transform
         };
@@ -333,7 +373,7 @@ pub fn fragment_graph_of(
             ),
         );
     }
-    frag
+    Ok(frag)
 }
 
 /// The fragment CoM velocity inherited from the parent rigid body —
@@ -434,7 +474,7 @@ mod tests {
         let (p0, l0) = total_pl(&[&body]);
         let transforms = crate::weld::body_transforms(&graph, &parts).unwrap();
         // Split at the adapter: {adapter,pod} fragment, {engine} retained.
-        let frag = fragment_graph(&graph, &transforms, PartNodeId(2));
+        let frag = fragment_graph(&graph, &transforms, PartNodeId(2)).unwrap();
         let mut fb = crate::weld(&frag, &parts).unwrap();
         let mut retained_graph = graph.clone();
         for n in subtree_set(&graph, PartNodeId(2)) {
@@ -490,11 +530,11 @@ mod tests {
         .unwrap();
         let adapter = loads.iter().find(|l| l.node == PartNodeId(2)).unwrap();
         assert!(adapter.axial_n > 100.0, "expected a real axial load");
-        let failed = failed_joints(&loads, &graph, &parts);
+        let failed = failed_joints(&loads, &graph, &parts).unwrap();
         assert_eq!(failed, vec![PartNodeId(2)]);
         // Raise the limit: nothing fails.
         parts[1].structural = csp_data::StructuralDef::unlimited();
-        let failed2 = failed_joints(&loads, &graph, &parts);
+        let failed2 = failed_joints(&loads, &graph, &parts).unwrap();
         assert!(failed2.is_empty());
         // The pod's own joint is unlimited too.
         graph.nodes.remove(&PartNodeId(2));

@@ -200,9 +200,9 @@
 //! penetration). `‖Δrot‖` is measured as `‖q₁ − q₀‖` — for the small
 //! per-tick angles at issue that equals the rotation angle to second
 //! order (`2·sin(θ/2) ≈ θ`). At `settle_ticks` (default 128 =
-//! 2 s) the body is marked `latched`, its velocities are zeroed, and
-//! its contacts are released — the backend holds no integrating state
-//! for it. A `throttle > 0` unlatches (§2.6.4's "any throttle command
+//! 2 s) the body is marked `latched`, its velocities and throttle are
+//! zeroed, and its contacts are released — the backend holds no
+//! integrating state for it. A `throttle > 0` unlatches (§2.6.4's "any throttle command
 //! unlatches it first"); the other unlatch triggers (`SimCommand::
 //! Unlatch`, activation, nearby impact) are M2-C World wiring.
 
@@ -291,7 +291,11 @@ pub struct Environment {
     pub settle_w: f64,
     /// Consecutive settled ticks required to latch (§2.6.4: 128 = 2 s).
     pub settle_ticks: u32,
-    /// Coulomb μ for ground contact (see [`DEFAULT_FRICTION_MU`]).
+    /// Coulomb μ for contact friction — authored as the *ground*
+    /// coefficient (see [`DEFAULT_FRICTION_MU`]) and reused verbatim
+    /// for the vessel-vessel pair manifold (see `solve_velocity`):
+    /// a deliberate single-coefficient approximation — there is no
+    /// per-material pair table in v1.
     pub friction_mu: f64,
     /// Pre-voxel drag coefficient (see [`DEFAULT_DRAG_CD`]).
     pub drag_cd: f64,
@@ -910,7 +914,16 @@ impl JointConstraint {
 fn generate_joint_constraints(bodies: &[WeldedBody], joints: &[JointDef]) -> Vec<JointConstraint> {
     let mut order: Vec<&JointDef> = joints
         .iter()
-        .filter(|j| (j.body_a.0 as usize) < bodies.len() && (j.body_b.0 as usize) < bodies.len())
+        // Self-joints are meaningless input the caller should never
+        // emit: `body_a == body_b` would halve the constraint's
+        // impulse authority (both write-backs land on the same body)
+        // and inject a spurious torque. Filter them alongside the
+        // stale handles rather than solve them wrong.
+        .filter(|j| {
+            j.body_a != j.body_b
+                && (j.body_a.0 as usize) < bodies.len()
+                && (j.body_b.0 as usize) < bodies.len()
+        })
         .collect();
     order.sort_by_key(|j| {
         (
@@ -1960,9 +1973,15 @@ impl SimpleBackend {
                 if b.settle.settled_ticks >= self.env.settle_ticks {
                     // Latch: contacts released, velocities zeroed — the
                     // backend holds no integrating state for the body.
+                    // `throttle` is zeroed too — §2.6.4's "a latched
+                    // vessel's throttle is zero" is enforced, not
+                    // assumed: leaving a residual throttle would
+                    // unlatch the body next tick and start a
+                    // ~settle_ticks-period latch/unlatch flicker.
                     b.settle.latched = true;
                     b.vel = DVec3::ZERO;
                     b.ang_vel = DVec3::ZERO;
+                    b.throttle = 0.0;
                     self.contacts[i].clear();
                 }
             } else {
@@ -1993,8 +2012,9 @@ impl PhysicsBackend for SimpleBackend {
         // semantically identical to three passes.
         for b in bodies.iter_mut() {
             if b.settle.latched {
-                // §2.6.4: a latched vessel's throttle is zero, and any
-                // throttle command unlatches it first.
+                // §2.6.4: a latched vessel's throttle is zero (the
+                // latch itself zeroes it), so a nonzero value here is
+                // a fresh throttle command — unlatch first.
                 if b.throttle > 0.0 {
                     b.settle.latched = false;
                     b.settle.settled_ticks = 0;
