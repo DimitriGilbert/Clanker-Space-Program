@@ -205,6 +205,11 @@ pub enum KeyAction {
     Stage,
     /// Cycle the map camera's focus body/vessel.
     CycleFocus,
+    /// Bring the focused (or newest) on-rails vessel back into the
+    /// physics bubble — the dead-stick recovery verb (`ToBubble` +
+    /// a `Player` lease). Named for the player takeover it performs;
+    /// the sim's `SimCommand::TakeControl` is the lease transfer.
+    RecoverControl,
     /// Camera pan up (map and VAB); nose-down pitch in flight.
     PanUp,
     /// Camera pan down (map and VAB); nose-up pitch in flight.
@@ -237,6 +242,7 @@ impl KeyAction {
         Self::ThrottleDown,
         Self::Stage,
         Self::CycleFocus,
+        Self::RecoverControl,
         Self::PanUp,
         Self::PanDown,
         Self::PanLeft,
@@ -261,6 +267,7 @@ impl KeyAction {
             Self::ThrottleDown => "throttle down",
             Self::Stage => "stage",
             Self::CycleFocus => "cycle focus",
+            Self::RecoverControl => "recover control of vessel",
             Self::PanUp => "pan up / pitch down",
             Self::PanDown => "pan down / pitch up",
             Self::PanLeft => "pan left / yaw left",
@@ -527,6 +534,7 @@ impl Default for Keymap {
                 (KeyAction::ThrottleDown, b(&["control"])),
                 (KeyAction::Stage, b(&["space"])),
                 (KeyAction::CycleFocus, b(&["tab"])),
+                (KeyAction::RecoverControl, b(&["key-t"])),
                 (KeyAction::PanUp, b(&["key-w", "arrow-up"])),
                 (KeyAction::PanDown, b(&["key-s", "arrow-down"])),
                 (KeyAction::PanLeft, b(&["key-a", "arrow-left"])),

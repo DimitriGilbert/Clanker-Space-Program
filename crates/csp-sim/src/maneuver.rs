@@ -41,8 +41,14 @@
 //!   dominant-centred frame; an elements-only vessel has no thrust
 //!   machinery). A vessel that re-parents before its node fires has the
 //!   firing degrade and the node dropped (§2.13's channel).
-//! - **Mass is weld-constant** — v1 has no propellant depletion, so
-//!   delivered Δv bookkeeping is `∫ throttle·F/m dt` exactly.
+//! - **Mass changes only on the §2.4 quantum.** Engines debit
+//!   propellant every tick (see [`crate::transfers`]); the weld's
+//!   mass moves only when a 1/1024 contents bucket flips, so the
+//!   executor's `throttle·F/m` bookkeeping reads a mass that steps
+//!   discretely rather than draining continuously — the documented
+//!   v1 reading. A burn that starves its tanks mid-run stalls at the
+//!   fuel-limited `net_thrust_axis` like any other lost-thrust stall:
+//!   the executor finishes with whatever Δv was actually delivered.
 //! - **While `Burning`, the executor owns throttle and attitude.** The
 //!   same absolute-control convention `SetThrottle`/`SetAttitude` use
 //!   (`rot`/`ang_vel` writes, not torque loops): manual writes during a

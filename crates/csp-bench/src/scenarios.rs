@@ -261,6 +261,7 @@ pub fn flight_craft() -> csp_sim::CraftDef {
     let booster = WeldPart {
         experiments: Vec::new(),
         lab: None,
+        engine: None,
         dock_ports: vec![],
         tanks: vec![],
         crew_seats: 0,
@@ -721,6 +722,7 @@ mod tests {
             parts.push(WeldPart {
                 experiments: Vec::new(),
                 lab: None,
+                engine: None,
                 dock_ports: vec![],
                 tanks: vec![],
                 crew_seats: 0,
@@ -815,6 +817,7 @@ mod tests {
             parts.push(WeldPart {
                 experiments: Vec::new(),
                 lab: None,
+                engine: None,
                 dock_ports: vec![],
                 tanks: vec![],
                 crew_seats: 0,

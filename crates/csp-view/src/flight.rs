@@ -208,6 +208,40 @@ pub struct FlightSyncInput {
     pub vessels: Vec<FlightBody>,
 }
 
+/// Pass-1 dead-stick recovery: the vessel the flight focus should pin
+/// to once it is staged (set by `View::recover_control` alongside the
+/// `ToBubble` command). The pin is NOT forever — it releases when the
+/// pinned vessel leaves the staged set after having been seen there
+/// (`seen` flips on its first staged frame; a leave after that is a
+/// `ToRails`/removal — the Presentation half of the release rule),
+/// when it leaves the sim's vessel arena while still pending
+/// (`View::end_frame`'s sim-side half — a pending pin can never stage
+/// if the vessel is gone), or when a fresh launch claims the focus
+/// under the documented newest-spawn rule (`View::launch_craft`).
+#[derive(Resource, Default)]
+pub(crate) struct FlightFocusOverride {
+    /// The pinned vessel, if any.
+    pub target: Option<csp_sim::VesselId>,
+    /// `true` once `target` has appeared in the staged vessel set —
+    /// what distinguishes "the `ToBubble` is still draining" (the pin
+    /// must survive the gap) from "it staged and left again" (release).
+    seen: bool,
+}
+
+impl FlightFocusOverride {
+    /// Pin the flight focus to `vessel` once it stages.
+    pub(crate) fn set(&mut self, vessel: csp_sim::VesselId) {
+        self.target = Some(vessel);
+        self.seen = false;
+    }
+
+    /// Release the pin — the newest-spawn focus rule applies again.
+    pub(crate) fn clear(&mut self) {
+        self.target = None;
+        self.seen = false;
+    }
+}
+
 /// The `sync` schedule's mirror — identical data, presentation-owned.
 #[derive(Resource, Default)]
 pub struct FlightSnapshot {
@@ -275,6 +309,16 @@ pub struct FlightUiData {
     /// written from [`FlightSfx`], drawn as event flashes by
     /// `csp_ui::flight_hud`.
     pub sfx: Vec<String>,
+    /// Osculating apoapsis altitude (m) — `None` open/latched/no vessel.
+    pub apo_alt_m: Option<f64>,
+    /// Osculating periapsis altitude (m).
+    pub pe_alt_m: Option<f64>,
+    /// Time to apoapsis (s).
+    pub t_apo_s: Option<f64>,
+    /// Time to periapsis (s).
+    pub t_pe_s: Option<f64>,
+    /// Orbital period (s).
+    pub period_s: Option<f64>,
     /// The focused vessel's propellant (resource, units, capacity) —
     /// the HUD's fuel gauges; empty for tank-less vessels.
     pub propellant: Vec<FlightTank>,
@@ -962,6 +1006,8 @@ pub(crate) fn flight_present(
     mut cam: ResMut<FlightCameraF64>,
     mut ui: ResMut<FlightUiData>,
     mut sfx: ResMut<FlightSfx>,
+    clock: Res<crate::Clock>,
+    mut focus_override: ResMut<FlightFocusOverride>,
 ) {
     ui.vessel_count = snap.vessels.len();
     ui.debris_count = snap.vessels.iter().filter(|v| v.debris).count();
@@ -970,7 +1016,24 @@ pub(crate) fn flight_present(
     // the line budget).
     ui.sfx = sfx_edges(&mut sfx, &snap.vessels, ui.debris_count);
 
-    let Some(focus) = focus_vessel(&snap.vessels) else {
+    // Pin lifecycle: a pinned vessel seen staged releases the override
+    // the frame it leaves the set (a `ToRails` conversion or a
+    // removal — the "was there, now gone" edge). A pin whose vessel
+    // was never staged is a `ToBubble` still draining and survives;
+    // `View::end_frame` clears the sub-case where the vessel left the
+    // sim's arena entirely (it can never stage).
+    if let Some(id) = focus_override.target {
+        if snap.vessels.iter().any(|b| b.id == id.0) {
+            focus_override.seen = true;
+        } else if focus_override.seen {
+            focus_override.clear();
+        }
+    }
+    let focus = focus_override
+        .target
+        .and_then(|id| snap.vessels.iter().find(|b| b.id == id.0))
+        .or_else(|| focus_vessel(&snap.vessels));
+    let Some(focus) = focus else {
         cam.0.valid = false;
         ui.has_vessel = false;
         ui.focus = None;
@@ -1003,6 +1066,11 @@ pub(crate) fn flight_present(
     ui.pitch_deg = f64::NAN;
     ui.roll_deg = f64::NAN;
     ui.surface_speed_mps = 0.0;
+    ui.apo_alt_m = None;
+    ui.pe_alt_m = None;
+    ui.t_apo_s = None;
+    ui.t_pe_s = None;
+    ui.period_s = None;
     if let Some(env) = snap.env.as_ref() {
         let rel = focus.com - env.body_center;
         let r = rel.norm();
@@ -1010,6 +1078,35 @@ pub(crate) fn flight_present(
             ui.alt_m = r - env.radius_m;
             ui.vspeed_mps = focus.vel.dot(rel / r);
             stage_attitude(&mut ui, env, focus, rel / r);
+        }
+        // Pass-1 orbit readout: osculating elements at the CoM →
+        // Ap/Pe altitudes, times-to-apsis, period. Latched bodies
+        // ride pure co-rotation — no honest conic to report.
+        if !focus.latched
+            && let Ok(el) = csp_sim::orbit::cartesian_to_elements(rel, focus.vel, env.mu_m3_per_s2)
+        {
+            let (a, e) = (el.semi_major_axis_m, el.eccentricity);
+            // The parabolic sliver: `cartesian_to_elements` encodes
+            // |e − 1| ≤ `E_PARABOLIC_TOL` as `a := −p < 0`, so a raw
+            // `e < 1.0` gate reports AP = a(1 + e) < 0 and T = ∞ on a
+            // conic that has neither. Pe/apo readouts publish only
+            // outside the band — a closed branch needs `a > 0` too.
+            if (e - 1.0).abs() > crate::map::E_PARABOLIC_TOL {
+                ui.pe_alt_m = Some(a * (1.0 - e) - env.radius_m);
+            }
+            if a > 0.0 && e < 1.0 - crate::map::E_PARABOLIC_TOL {
+                ui.apo_alt_m = Some(a * (1.0 + e) - env.radius_m);
+                ui.period_s = Some(el.period_s);
+                let now = clock.0.ticks();
+                let t = |apo: bool| {
+                    csp_sim::scripts::resolve_apsis_ticks(&el, env.mu_m3_per_s2, now, now, apo)
+                        .ok()
+                        .flatten()
+                        .map(|tk| (tk - now) as f64 / csp_core::TICK_HZ as f64)
+                };
+                ui.t_apo_s = t(true);
+                ui.t_pe_s = t(false);
+            }
         }
     }
 }
@@ -1463,6 +1560,7 @@ mod tests {
         world.insert_resource(MapInput {
             mode: MapMode::Flight,
             focus: 0,
+            focus_vessel: None,
             pan_offset: DVec3::ZERO,
             yaw_rad: 0.0,
             pitch_rad: 0.0,

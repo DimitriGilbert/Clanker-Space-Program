@@ -1437,6 +1437,7 @@ mod tests {
         WeldPart {
             experiments: Vec::new(),
             lab: None,
+            engine: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -1649,6 +1650,7 @@ mod tests {
         let p = WeldPart {
             experiments: Vec::new(),
             lab: None,
+            engine: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -1874,6 +1876,7 @@ mod tests {
         let nose = WeldPart {
             experiments: Vec::new(),
             lab: None,
+            engine: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -1891,6 +1894,7 @@ mod tests {
         let tail = WeldPart {
             experiments: Vec::new(),
             lab: None,
+            engine: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,

@@ -368,6 +368,7 @@ mod tests {
         WeldPart {
             experiments: Vec::new(),
             lab: None,
+            engine: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,

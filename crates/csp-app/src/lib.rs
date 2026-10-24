@@ -1581,6 +1581,18 @@ impl App {
             KeyAction::CycleFocus if mode == ViewMode::Map => {
                 self.view.map_event(MapKeyEvent::CycleFocus)
             }
+            // Pass-1 dead-stick recovery: pull the focused (or newest)
+            // on-rails vessel back into the bubble and take its
+            // control lease.
+            KeyAction::RecoverControl if mode != ViewMode::Vab => {
+                if self.read_only {
+                    self.view.vab_event(VabEvent::Notice(
+                        "session is read-only — recover-control not applied".to_string(),
+                    ));
+                } else {
+                    self.view.recover_control();
+                }
+            }
             // The controls card and the dev debug scaffold — session
             // toggles on the view, no sim involvement; same blip
             // discipline as the other session toggles.

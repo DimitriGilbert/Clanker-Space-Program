@@ -1691,9 +1691,24 @@ fn resolve_weld_input(
     let mut crew_seats = 0u32;
     let mut experiments = Vec::new();
     let mut lab: Option<crate::part::LabSpec> = None;
+    let mut engine: Option<crate::part::EngineSpec> = None;
     for m in modules {
         match m {
-            ModuleDef::Engine { thrust_vac_n, .. } => {
+            ModuleDef::Engine {
+                thrust_vac_n,
+                isp_vac_s,
+                propellants,
+                ..
+            } => {
+                // The consumption half rides the weld view too — the
+                // sim's per-tick propellant bookkeeping debits
+                // `throttle·rated/(isp_vac·g₀)` split by the resolved
+                // mass fractions (validator: at most one Engine module
+                // per part, mirrored by `check_engine_propellants`).
+                engine = Some(crate::part::EngineSpec {
+                    isp_vac_s: *isp_vac_s,
+                    propellants: propellants.clone(),
+                });
                 let z_min = collider_z_min(&collider)
                     .ok_or(bad("resolve: collider has no vertices for a thrust site"))?;
                 if !thrust_vac_n.is_finite() || *thrust_vac_n < 0.0 {
@@ -1819,6 +1834,7 @@ fn resolve_weld_input(
         crew_seats,
         experiments,
         lab,
+        engine,
     })
 }
 

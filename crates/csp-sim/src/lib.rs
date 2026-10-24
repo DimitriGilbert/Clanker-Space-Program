@@ -3555,32 +3555,95 @@ impl World {
             let mut batch: Vec<csp_phys::WeldedBody> = Vec::new();
             let mut pre_vel: Vec<(csp_core::DVec3, csp_core::DVec3)> = Vec::new();
             for (vid, vessel) in vessels.iter_mut() {
-                let VesselState::InBubble(body) = &mut vessel.state else {
-                    continue;
-                };
-                if !body.pos.is_finite() {
-                    return Err(SimError::Fatal("non-finite body state mid-tick"));
+                // Pass-1 propellant bookkeeping state for this vessel —
+                // the plans ride to the post-debit re-scale below.
+                let mut fuel_plans: Vec<FuelPlan> = Vec::new();
+                let mut fuel_debits: Vec<(ResourceId, f64)> = Vec::new();
+                {
+                    let VesselState::InBubble(body) = &mut vessel.state else {
+                        continue;
+                    };
+                    if !body.pos.is_finite() {
+                        return Err(SimError::Fatal("non-finite body state mid-tick"));
+                    }
+                    // M9b §3.4: the live `thrust_factor` reaches physics
+                    // through the body's `Thrust` sites — scaled from the
+                    // craft baseline each tick (idempotent across every
+                    // re-weld; the site's `rated_n` is a derived view).
+                    // This runs BEFORE the burn executor reads the sites'
+                    // `rated_n` (`net_thrust_axis`) so the executor sees
+                    // this tick's derate, not last tick's.
+                    if let Some(craft) = &vessel.craft {
+                        reliability::apply_thrust_factors(body, craft, &vessel.reliability);
+                        // Pass-1: propellant coverage — the engines'
+                        // `rated_n` is now scaled by `base·factor·cov`,
+                        // so a starved engine's site already reads the
+                        // limited thrust when the executor (and later
+                        // the force model) reads it.
+                        fuel_plans = propellant_plans(
+                            craft,
+                            body,
+                            &vessel.tank_contents,
+                            &vessel.reliability,
+                        );
+                        apply_fuel_scales(body, craft, &fuel_plans);
+                    }
+                    // M5 burn executor — a first-class sim mechanism, not
+                    // a command stream (the maneuver module docs): while a
+                    // node is `Burning` it owns this body's `throttle`,
+                    // `rot`, and `ang_vel` every integer tick.
+                    if drive_node_burn(&mut vessel.maneuver, body) {
+                        burns_done.insert(*vid);
+                    }
+                    // The tick's propellant draw at the *commanded*
+                    // throttle — collected here, debited below where the
+                    // whole vessel is borrowable (`debit` walks
+                    // `tank_contents` + part masses, then the §2.4
+                    // re-weld).
+                    let throttle = body.throttle.clamp(0.0, 1.0);
+                    if throttle > 0.0 {
+                        for p in &fuel_plans {
+                            for (r, u) in &p.needs {
+                                let amt = u * p.scale * throttle;
+                                if amt > 0.0 && amt.is_finite() {
+                                    fuel_debits.push((r.clone(), amt));
+                                }
+                            }
+                        }
+                    }
                 }
-                // M9b §3.4: the live `thrust_factor` reaches physics
-                // through the body's `Thrust` sites — scaled from the
-                // craft baseline each tick (idempotent across every
-                // re-weld; the site's `rated_n` is a derived view).
-                // This runs BEFORE the burn executor reads the sites'
-                // `rated_n` (`net_thrust_axis`) so the executor sees
-                // this tick's derate, not last tick's.
-                if let Some(craft) = &vessel.craft {
-                    reliability::apply_thrust_factors(body, craft, &vessel.reliability);
+                // Pass-1: the debits + the possible contents-quantum
+                // re-weld — `transfers::debit` needs `&mut Vessel`, so
+                // the body borrow above had to close first. Ascending
+                // plan order = ascending node order = the fixed drain
+                // order; `debit` itself drains ascending `PartNodeId`.
+                if !fuel_debits.is_empty() {
+                    let mut mass_changed = false;
+                    for (r, amt) in &fuel_debits {
+                        let (_, m) = transfers::debit(vessel, r, *amt);
+                        mass_changed |= m;
+                    }
+                    // The `rel_rebody` convention: a re-weld failure in
+                    // range is an invariant bug → `Fatal`.
+                    transfers::reweld_if_mass_changed(vessel, mass_changed)
+                        .map_err(|e| SimError::Fatal(e.reason()))?;
                 }
-                // M5 burn executor — a first-class sim mechanism, not
-                // a command stream (the maneuver module docs): while a
-                // node is `Burning` it owns this body's `throttle`,
-                // `rot`, and `ang_vel` every integer tick.
-                if drive_node_burn(&mut vessel.maneuver, body) {
-                    burns_done.insert(*vid);
+                {
+                    let VesselState::InBubble(body) = &mut vessel.state else {
+                        continue;
+                    };
+                    // A re-weld rebuilt the sites at craft baseline —
+                    // restore the tick's factor + coverage scales so
+                    // the batch clone reads the same thrust the
+                    // executor booked. Idempotent when nothing moved.
+                    if let Some(craft) = &vessel.craft {
+                        reliability::apply_thrust_factors(body, craft, &vessel.reliability);
+                        apply_fuel_scales(body, craft, &fuel_plans);
+                    }
+                    pre_vel.push((body.vel, body.ang_vel));
+                    batch.push(body.clone());
+                    batch_vids.push(*vid);
                 }
-                pre_vel.push((body.vel, body.ang_vel));
-                batch.push(body.clone());
-                batch_vids.push(*vid);
             }
             // M6-B §2.4: translate the live transient joints into the
             // backend's per-tick `JointDef`s — anchors re-posed through
@@ -4426,8 +4489,13 @@ impl World {
                 if !throttle.is_finite() {
                     return Err(SimError::Recoverable("throttle: non-finite"));
                 }
+                // Pass-1: a positive throttle on a vessel whose engines
+                // are all propellant-starved clamps to 0 — a dry
+                // engine records no thrust command it cannot back.
+                let can_draw = self.vessels.get(vessel).is_none_or(engine_can_draw);
                 let body = self.unlatched_body(*vessel, shadow)?;
-                body.throttle = throttle.clamp(0.0, 1.0);
+                let t = throttle.clamp(0.0, 1.0);
+                body.throttle = if t > 0.0 && !can_draw { 0.0 } else { t };
             }
             SimCommand::SetAttitude {
                 vessel,
@@ -7589,6 +7657,220 @@ impl Default for World {
     }
 }
 
+/// One engine node's fuel plan for the tick — the propellant
+/// bookkeeping the bubble step consumes. `needs` is the per-resource
+/// units a *full-throttle* tick would draw; `scale` is the coverage
+/// fraction the site's `rated_n` carries.
+struct FuelPlan {
+    /// The node's `craft.parts` slot (`effective_index`).
+    eff: usize,
+    /// The node's thrust-site range inside `body.force_sites`
+    /// (`site_start..site_end` — same span `PartWeld` records).
+    site_start: usize,
+    site_end: usize,
+    /// The §3.4 reliability derate — reapplied with the coverage
+    /// scale so the two factors compose multiplicatively.
+    factor: f64,
+    /// Fuel coverage for a full-throttle tick: `min` over the engine's
+    /// propellants of that resource's *shared* coverage
+    /// (`available / Σ needs` across every claimant — co-claimants
+    /// split the pool proportionally, never each claiming it whole),
+    /// ∈ [0, 1].
+    scale: f64,
+    /// `(resource, units)` a full-throttle tick debits.
+    needs: Vec<(ResourceId, f64)>,
+}
+
+/// The craft's `mass_per_unit_kg` for `resource` — read off any
+/// declaring `TankSpec` (the resolved value is per-resource, identical
+/// across parts). Ascending graph order, `None` when no tank offers it.
+fn propellant_mpu(craft: &CraftDef, resource: &ResourceId) -> Option<f64> {
+    for node in craft.graph.nodes.values() {
+        let Some(part) = craft.parts.get(node.effective_index as usize) else {
+            continue;
+        };
+        if let Some(t) = part.tanks.iter().find(|t| t.resource == *resource) {
+            return Some(t.mass_per_unit_kg);
+        }
+    }
+    None
+}
+
+/// The tick's per-engine fuel plans — ascending `PartNodeId`, the
+/// fixed order every other vessel pass shares. Coverage is computed
+/// in two passes: first every engine's full-throttle `needs` per
+/// resource, then each resource's *shared* coverage
+/// `min(1, available / Σ needs)` pooled across every claimant, and
+/// finally each plan's scale as the min over its propellants'
+/// coverages. The fraction of rated thrust the tanks can sustain is
+/// applied to the site's `rated_n` for the whole tick so the burn
+/// executor's `throttle·|F|·dt/m` bookkeeping stays exact even while
+/// starved (the documented v1 reading of the §2.9 "thrust sites" rule
+/// + the "no propellant depletion" gap).
+///
+/// The shared denominator matters: scaling each engine against the
+/// pooled availability independently let two co-claimants both read
+/// 100% coverage of the same units — on the dry-out tick both sites
+/// thrust at their claimed scale while the pooled `debit` clamped at
+/// `available`, delivering impulse the tanks never paid for. With
+/// `available / Σ needs` the co-claimants split the limiting resource
+/// proportionally and total debit lands exactly on availability.
+fn propellant_plans(
+    craft: &CraftDef,
+    body: &WeldedBody,
+    tank_contents: &BTreeMap<csp_phys::PartNodeId, BTreeMap<ResourceId, f64>>,
+    records: &BTreeMap<csp_phys::PartNodeId, reliability::PartReliability>,
+) -> Vec<FuelPlan> {
+    // Pooled availability — the same sum `transfers::vessel_resource`
+    // performs, read here without a whole-vessel borrow.
+    let avail_of = |r: &ResourceId| -> f64 {
+        tank_contents
+            .values()
+            .map(|m| m.get(r).copied().unwrap_or(0.0))
+            .sum()
+    };
+    let mut out = Vec::new();
+    // Σ needs per resource across every engine — the shared pool each
+    // claimant's coverage is measured against.
+    let mut demand: BTreeMap<ResourceId, f64> = BTreeMap::new();
+    for (id, node) in &craft.graph.nodes {
+        let eff = node.effective_index as usize;
+        let Some(part) = craft.parts.get(eff) else {
+            continue;
+        };
+        let Some(spec) = &part.engine else {
+            continue;
+        };
+        let Some(w) = body.part_index.get(id) else {
+            continue;
+        };
+        let (s0, s1) = (
+            w.site_start as usize,
+            ((w.site_start + w.site_len) as usize).min(body.force_sites.len()),
+        );
+        let factor = records.get(id).map_or(1.0, |r| r.thrust_factor);
+        // Full-throttle need: Σ base·factor over the node's Thrust
+        // sites, `ṁ = F/(isp·g₀)` kg/s, split by mass fractions and
+        // converted to units through the tanks' `mass_per_unit_kg`.
+        let rated: f64 = part
+            .force_sites
+            .iter()
+            .filter(|s| s.kind == csp_phys::ForceSiteKind::Thrust)
+            .map(|s| s.rated_n)
+            .sum();
+        if !(rated.is_finite() && spec.isp_vac_s.is_finite())
+            || rated <= 0.0
+            || spec.isp_vac_s <= 0.0
+        {
+            continue;
+        }
+        let dm_kg = rated * factor * csp_phys::PHYSICS_DT / (spec.isp_vac_s * csp_data::G0);
+        let mut needs: Vec<(ResourceId, f64)> = Vec::new();
+        for (r, frac) in &spec.propellants {
+            // A propellant no tank can hold (or a massless one, whose
+            // kg→units conversion is undefined) starves the engine —
+            // treated as zero availability rather than a free burn.
+            let units = match propellant_mpu(craft, r) {
+                Some(mpu) if mpu > 0.0 => dm_kg * frac / mpu,
+                _ => f64::INFINITY,
+            };
+            if units > 0.0 {
+                *demand.entry(r.clone()).or_default() += units;
+            }
+            needs.push((r.clone(), units));
+        }
+        out.push(FuelPlan {
+            eff,
+            site_start: s0,
+            site_end: s1,
+            factor,
+            scale: 0.0, // resolved below, once every claimant's needs are in
+            needs,
+        });
+    }
+    // Per-resource shared coverage of the pool. A non-finite or empty
+    // total is an un-holdable propellant (`units = ∞` above): zero
+    // coverage for everyone, matching the pre-share starvation rule.
+    let mut coverage: BTreeMap<ResourceId, f64> = BTreeMap::new();
+    for (r, total) in &demand {
+        let cov = if total.is_finite() && *total > 0.0 {
+            (avail_of(r) / *total).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        coverage.insert(r.clone(), cov);
+    }
+    for p in &mut out {
+        let mut scale = 1.0f64;
+        for (r, u) in &p.needs {
+            if *u > 0.0 {
+                scale = scale.min(coverage.get(r).copied().unwrap_or(0.0));
+            }
+        }
+        p.scale = scale.clamp(0.0, 1.0);
+    }
+    out
+}
+
+/// Write the plans' `base·factor·coverage` into the body's Thrust
+/// sites — the pre-step restore path: the executor reads the
+/// fuel-limited `net_thrust_axis` (a dry engine stalls the burn like
+/// any lost thrust), and the batch clone carries the same rating the
+/// debit was computed against. Runs after every weld/derate recompute
+/// that rebuilt the sites at baseline.
+fn apply_fuel_scales(body: &mut WeldedBody, craft: &CraftDef, plans: &[FuelPlan]) {
+    for p in plans {
+        let Some(part) = craft.parts.get(p.eff) else {
+            continue;
+        };
+        for (j, site) in body.force_sites[p.site_start..p.site_end]
+            .iter_mut()
+            .enumerate()
+        {
+            if site.kind != csp_phys::ForceSiteKind::Thrust {
+                continue;
+            }
+            if let Some(base) = part.force_sites.get(j) {
+                site.rated_n = base.rated_n * p.factor * p.scale;
+            }
+        }
+    }
+}
+
+/// Whether any engine-spec part can draw propellant — the
+/// `SetThrottle` gate: a positive throttle on an all-starved vessel
+/// clamps to 0 rather than recording a thrust command the tanks
+/// cannot back. Craft-less and engine-less (unmetered) vessels are
+/// never gated — the hand-authored debug convention keeps its
+/// throttle channel.
+fn engine_can_draw(vessel: &Vessel) -> bool {
+    let Some(craft) = &vessel.craft else {
+        return true;
+    };
+    let mut any_spec = false;
+    for node in craft.graph.nodes.values() {
+        let Some(part) = craft.parts.get(node.effective_index as usize) else {
+            continue;
+        };
+        let Some(spec) = &part.engine else {
+            continue;
+        };
+        any_spec = true;
+        let live_site = part
+            .force_sites
+            .iter()
+            .any(|s| s.kind == csp_phys::ForceSiteKind::Thrust && s.rated_n > 0.0);
+        let fueled = spec
+            .propellants
+            .iter()
+            .all(|(r, _)| transfers::vessel_resource(vessel, r) > 0.0);
+        if live_site && fueled {
+            return true;
+        }
+    }
+    !any_spec
+}
+
 /// The M5 executor's per-tick drive for one InBubble body: attitude
 /// is the weld's net thrust axis aligned to the frozen inertial
 /// `burn_dir`; throttle is full until the last tick, which is
@@ -9214,6 +9496,16 @@ pub(crate) fn hash_craft(h: &mut StateHasher, craft: &CraftDef) {
             h.f64(l.throughput_data_per_s);
             h.f64(l.multiplier);
             h.u32(l.researcher_slots);
+        });
+        // Pass-1 propellant bookkeeping: the resolved engine spec —
+        // the isp/propellant split decides what a burn debits, so it
+        // is craft identity like the tanks it drains.
+        h.opt(&p.engine, |h, e| {
+            h.f64(e.isp_vac_s);
+            h.vec(&e.propellants, |h, (r, f)| {
+                h.str(r.as_str());
+                h.f64(*f);
+            });
         });
     });
     // M7-C: the frozen resolved costs — hashed like the rest of the
@@ -12028,6 +12320,7 @@ mod tests {
             parts: vec![csp_phys::WeldPart {
                 experiments: Vec::new(),
                 lab: None,
+                engine: None,
                 dock_ports: vec![],
                 tanks: vec![],
                 crew_seats: 0,
@@ -12217,6 +12510,7 @@ mod tests {
         let payload = csp_phys::WeldPart {
             experiments: Vec::new(),
             lab: None,
+            engine: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -12239,6 +12533,7 @@ mod tests {
         let plate = csp_phys::WeldPart {
             experiments: Vec::new(),
             lab: None,
+            engine: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -13454,6 +13749,7 @@ mod tests {
             parts: vec![csp_phys::WeldPart {
                 experiments: Vec::new(),
                 lab: None,
+                engine: None,
                 dock_ports: vec![],
                 tanks: vec![],
                 crew_seats: 0,
@@ -13585,6 +13881,7 @@ mod tests {
         let mk = |max_k: f64| csp_phys::WeldPart {
             experiments: Vec::new(),
             lab: None,
+            engine: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -13643,6 +13940,7 @@ mod tests {
         csp_phys::WeldPart {
             experiments: Vec::new(),
             lab: None,
+            engine: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -13971,6 +14269,7 @@ mod tests {
         let engine = csp_phys::WeldPart {
             experiments: Vec::new(),
             lab: None,
+            engine: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -13993,6 +14292,7 @@ mod tests {
         let payload = csp_phys::WeldPart {
             experiments: Vec::new(),
             lab: None,
+            engine: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -14147,6 +14447,7 @@ mod tests {
                 .map(|_| csp_phys::WeldPart {
                     experiments: Vec::new(),
                     lab: None,
+                    engine: None,
                     dock_ports: vec![],
                     tanks: vec![],
                     crew_seats: 0,
@@ -16935,6 +17236,113 @@ mod tests {
             mass_per_unit_kg: mpu,
         }];
         c
+    }
+
+    /// `tank_craft` plus a working engine: one Thrust site and the
+    /// `EngineSpec` the propellant bookkeeping reads (liquid_fuel
+    /// only). `thrust_n` rides the site; `isp` the spec.
+    fn fueled_engine_craft(cap: f64, mpu: f64, thrust_n: f64, isp: f64) -> CraftDef {
+        let mut c = tank_craft(500.0, cap, mpu);
+        c.parts[0].force_sites = vec![csp_phys::ForceSite::new(
+            DVec3::new(0.0, 0.0, -0.5),
+            DVec3::Z,
+            csp_phys::ForceSiteKind::Thrust,
+            thrust_n,
+        )];
+        c.parts[0].engine = Some(csp_phys::EngineSpec {
+            isp_vac_s: isp,
+            propellants: vec![(ResourceId::from("liquid_fuel"), 1.0)],
+        });
+        c
+    }
+
+    /// Pass-1: a burning engine debits its propellant — the tank
+    /// contents drop by `throttle·rated·dt/(isp·g₀)` per tick while
+    /// the body accelerates.
+    #[test]
+    fn engine_burn_drains_propellant() {
+        let mut w = physics_world(false);
+        let base = DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0);
+        enqueue_physical(&mut w, fueled_engine_craft(100.0, 5.0, 200.0, 300.0), base);
+        w.step_frame(1).unwrap();
+        let before = transfers::vessel_resource(
+            &w.vessels()[&VesselId(0)],
+            &ResourceId::from("liquid_fuel"),
+        );
+        assert_eq!(before, 100.0, "spawned full");
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SetThrottle {
+                vessel: VesselId(0),
+                throttle: 1.0,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 64).unwrap();
+        let v = &w.vessels()[&VesselId(0)];
+        let after = transfers::vessel_resource(v, &ResourceId::from("liquid_fuel"));
+        // 64 ticks at ṁ = 200/(300·9.81) kg/s ≈ 0.06795 kg/s ≈ 0.0136 u/s.
+        assert!(
+            after < before && after > 90.0,
+            "fuel must drain by burn-rate, got {after}"
+        );
+        // Expected drain: per tick ṁ_units = F·dt/(isp·g₀·mpu).
+        let per_tick = 200.0 * csp_phys::PHYSICS_DT / (300.0 * csp_data::G0 * 5.0);
+        assert!(
+            (before - after - per_tick * 64.0).abs() < per_tick * 2.0,
+            "drain tracks ṁ = throttle·F/(isp·g₀)"
+        );
+    }
+
+    /// Pass-1: a dry engine produces no thrust — velocity stops
+    /// growing once the tank empties, and `SetThrottle` cannot keep a
+    /// dry engine lit.
+    #[test]
+    fn dry_engine_produces_no_thrust() {
+        let mut w = physics_world(false);
+        let base = DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0);
+        // 0.1 u × 5 kg/u = 0.5 kg ≈ 7.4 s of fuel at 200 N — empties
+        // mid-run.
+        enqueue_physical(&mut w, fueled_engine_craft(0.1, 5.0, 200.0, 300.0), base);
+        w.step_frame(1).unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SetThrottle {
+                vessel: VesselId(0),
+                throttle: 1.0,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1024).unwrap();
+        let v = &w.vessels()[&VesselId(0)];
+        assert_eq!(
+            transfers::vessel_resource(v, &ResourceId::from("liquid_fuel")),
+            0.0,
+            "the tank must be empty"
+        );
+        let speed1 = v.body().unwrap().vel.norm();
+        // A dry engine's site reads zero rated force — and a new
+        // SetThrottle cannot relight it.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SetThrottle {
+                vessel: VesselId(0),
+                throttle: 1.0,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 64).unwrap();
+        let v = &w.vessels()[&VesselId(0)];
+        let b = v.body().unwrap();
+        assert_eq!(b.throttle, 0.0, "SetThrottle must not light a dry engine");
+        // Ballistic: speed can only change through gravity — over 1 s
+        // in a ~800 km orbit it shifts < 1 m/s; a live 200 N burn on a
+        // 500 kg craft would add ~40 m/s.
+        assert!(
+            (b.vel.norm() - speed1).abs() < 1.0,
+            "velocity must stop growing once dry ({speed1} → {})",
+            b.vel.norm()
+        );
     }
 
     /// A one-part box with `seats` crew slots (no tanks).

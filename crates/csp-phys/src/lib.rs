@@ -107,8 +107,8 @@ pub use backend::{BodyHandle, Contact, Hit, JointDef, JointKind, PhysicsBackend,
 pub use graph::{PartGraph, PartNode, PartNodeId, PartTransform};
 pub use merge::{MergeError, MergedGraph, merge_graphs};
 pub use part::{
-    ColliderShape, DockPortSpec, ExperimentSpec, ForceSite, ForceSiteKind, LabSpec, TankSpec,
-    WeldPart,
+    ColliderShape, DockPortSpec, EngineSpec, ExperimentSpec, ForceSite, ForceSiteKind, LabSpec,
+    TankSpec, WeldPart,
 };
 pub use profile::{
     BurnSegment, HazardReport, MissionCheck, MissionProfile, Regime, confidence, expected_hazard,

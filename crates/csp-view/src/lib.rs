@@ -402,6 +402,11 @@ fn build_ui(
                     vessel_count: flight_ui.vessel_count,
                     debris_count: flight_ui.debris_count,
                     sfx: &flight_ui.sfx,
+                    apo_alt_m: flight_ui.apo_alt_m,
+                    pe_alt_m: flight_ui.pe_alt_m,
+                    t_apo_s: flight_ui.t_apo_s,
+                    t_pe_s: flight_ui.t_pe_s,
+                    period_s: flight_ui.period_s,
                     propellant: &flight_ui.propellant,
                     stages_left: flight_ui.stages_left,
                     stages_total: flight_ui.stages_total,
@@ -855,6 +860,7 @@ impl View {
         world.insert_resource(map::MapScene::default());
         world.insert_resource(map::MapCameraF64::default());
         world.insert_resource(map::MapUiData::default());
+        world.insert_resource(flight::FlightFocusOverride::default());
         world.insert_resource(map::MapFrame::default());
         world.insert_resource(ManeuverPanelRes::default());
         // M10: the settings window's staged state (§2.2-C session data).
@@ -1031,6 +1037,14 @@ impl View {
             flight::capture_sync_input(&self.sim, &mut cache)
         };
         self.world.insert_resource(staged_flight);
+        // The focus pin's sim-side release rule: a pinned vessel gone
+        // from the arena (impact removal, a despawn) can never stage,
+        // so the pin is dead — clear it here where `sim` is readable.
+        // `flight_present` covers the staged-then-left case.
+        let pin = self.world.resource::<flight::FlightFocusOverride>().target;
+        if pin.is_some_and(|id| !self.sim.vessels().contains_key(&id)) {
+            self.clear_flight_focus_override();
+        }
         self.ticks_last_frame = 0;
         self.schedules.sync.run(&mut self.world);
         self.schedules.presentation.run(&mut self.world);
@@ -1346,6 +1360,101 @@ impl View {
         self.world.resource_mut::<flight::FlightFrame>().0.take()
     }
 
+    /// Pass-1 dead-stick recovery: bring an on-rails vessel back into
+    /// the physics bubble so the player regains throttle/attitude
+    /// control. The target is the map's focused vessel when the map
+    /// has one, else the newest on-rails vessel — the logged
+    /// `ToBubble` converts it on the next drain; the flight-focus
+    /// override pins the chase camera + HUD to it once it stages.
+    /// Returns the vessel the commands were enqueued for.
+    ///
+    /// The pin and the `ToBubble` are only issued when the command can
+    /// plausibly apply (`to_bubble_eligible` — the drain's own
+    /// reject classes checked up front): a focused vessel that cannot
+    /// convert (in the bubble already, off the dominant parent's
+    /// conic, craft-less) raises the "not recoverable" flight notice
+    /// instead of a pin-and-silent-reject, and no eligible target at
+    /// all raises "no vessel to recover". The takeover also moves the
+    /// vessel's §2.2.1 control lease to `Player` in the same drain — a
+    /// bound `Script`/`Agent` holder keeps issuing control commands
+    /// after `ToBubble` converts the residence (only `Ui` and the
+    /// named holder pass `check_control_lease` under a non-`Player`
+    /// lease), so the recovered vessel would answer two masters.
+    pub fn recover_control(&mut self) -> Option<csp_sim::VesselId> {
+        let focused = if self.mode() == ViewMode::Map {
+            self.world.resource::<map::MapInput>().focus_vessel
+        } else {
+            None
+        };
+        let target = match focused {
+            // An explicit map target that cannot convert is a refusal
+            // to surface, not a reason to redirect at another vessel.
+            Some(id) if self.to_bubble_eligible(id) => Some(id),
+            Some(_) => {
+                self.flight_notice("VESSEL NOT RECOVERABLE — NOT ON RAILS HERE".to_string());
+                return None;
+            }
+            None => self
+                .sim
+                .vessels()
+                .iter()
+                .filter(|(id, _)| self.to_bubble_eligible(**id))
+                .map(|(id, _)| *id)
+                .max(),
+        };
+        let Some(target) = target else {
+            self.flight_notice("NO VESSEL TO RECOVER".to_string());
+            return None;
+        };
+        self.enqueue_command(
+            SourceClass::Ui,
+            PLAYER_SOURCE_ID,
+            csp_sim::SimCommand::ToBubble { vessel: target },
+        );
+        // M9c §2.2.1: vacate any `Script`/`Agent` control lease — `Ui`
+        // preempts unconditionally, so the `TakeControl` lands whenever
+        // the `ToBubble` does (and is harmless when it doesn't).
+        self.enqueue_command(
+            SourceClass::Ui,
+            PLAYER_SOURCE_ID,
+            csp_sim::SimCommand::TakeControl {
+                vessel: target,
+                lease: csp_sim::Lease::Player,
+            },
+        );
+        self.world
+            .resource_mut::<flight::FlightFocusOverride>()
+            .set(target);
+        Some(target)
+    }
+
+    /// Would a `ToBubble` plausibly apply to `vessel`? The drain's own
+    /// reject classes, checked pre-pin: the vessel exists, rides an
+    /// on-rails conic around the dominant body, carries a craft, and a
+    /// physics environment exists to receive it.
+    fn to_bubble_eligible(&self, vessel: csp_sim::VesselId) -> bool {
+        let Some(v) = self.sim.vessels().get(&vessel) else {
+            return false;
+        };
+        let Some(orbit) = v.orbit() else {
+            return false;
+        };
+        if v.craft.is_none() || self.sim.environment().is_none() {
+            return false;
+        }
+        self.sim.dominant_body().is_some_and(|d| orbit.parent == *d)
+    }
+
+    /// Clear the recover-control focus pin (session navigation aid) —
+    /// called from `end_frame` when the pinned vessel leaves the sim's
+    /// arena and from `launch_craft` so a fresh launch reclaims the
+    /// focus under the newest-spawn rule.
+    pub fn clear_flight_focus_override(&mut self) {
+        self.world
+            .resource_mut::<flight::FlightFocusOverride>()
+            .clear();
+    }
+
     /// The focused vessel's `VesselId` — the throttle/attitude
     /// command target (`None` when the flight scene has no vessel).
     /// The focus is the most recently spawned staged vessel — a new
@@ -1525,7 +1634,11 @@ impl View {
             },
         );
         // Only a successfully enqueued launch leaves the VAB — every
-        // refusal above returned before this point.
+        // refusal above returned before this point. A recover-control
+        // pin from an earlier T press must not survive it: the
+        // documented rule is newest-spawn-takes-focus, so the fresh
+        // launch gets the camera, HUD, and command route.
+        self.clear_flight_focus_override();
         self.world.insert_resource(plan);
         self.set_mode(ViewMode::Flight);
         Ok(())
@@ -1753,6 +1866,7 @@ fn stock_flight_craft() -> csp_sim::CraftDef {
     let mk = |mass: f64, half: f64, len: f64| csp_phys::WeldPart {
         experiments: Vec::new(),
         lab: None,
+        engine: None,
         dock_ports: vec![],
         tanks: vec![],
         crew_seats: 0,

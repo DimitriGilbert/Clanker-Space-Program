@@ -440,6 +440,29 @@ fn validate_effective(node: PartNodeId, ep: &WeldPart) -> Result<(), WeldError> 
             ));
         }
     }
+    // The resolved engine spec — `None` is the unmetered hand-authored
+    // convention (`EngineSpec`'s doc); a `Some` must carry a positive
+    // finite isp and a non-empty propellant list of unique, positive,
+    // finite fractions summing to 1 — the resolver's
+    // `check_engine_propellants` bounds, re-checked because a
+    // `WeldPart` can arrive unvalidated. A bad spec is bad input, not
+    // a free-burning engine.
+    if let Some(eng) = &ep.engine {
+        if !eng.isp_vac_s.is_finite() || eng.isp_vac_s <= 0.0 {
+            return Err(bad("weld: engine isp is not positive and finite"));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut sum = 0.0;
+        for (r, f) in &eng.propellants {
+            if !seen.insert(r.as_str()) || !f.is_finite() || *f <= 0.0 {
+                return Err(bad("weld: engine propellant list malformed"));
+            }
+            sum += f;
+        }
+        if eng.propellants.is_empty() || (sum - 1.0).abs() > 1e-6 {
+            return Err(bad("weld: engine propellant list malformed"));
+        }
+    }
     // §3.1 thermal lump — the M4b network needs finite, in-range
     // values (the same bounds `csp-data`'s validator enforces,
     // re-checked here because a `WeldPart` can arrive unvalidated).
@@ -811,6 +834,7 @@ mod tests {
         WeldPart {
             experiments: Vec::new(),
             lab: None,
+            engine: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -829,6 +853,7 @@ mod tests {
         WeldPart {
             experiments: Vec::new(),
             lab: None,
+            engine: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,

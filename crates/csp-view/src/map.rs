@@ -74,8 +74,9 @@ const OPEN_ORBIT_NU_FILL: f64 = 0.92;
 /// literally). The sim encodes parabolas as `a := −p < 0`; the sampler
 /// must classify the same band identically or a parabolic-encoded
 /// orbit with `e` just under 1.0 would take the closed branch, fail
-/// its `a > 0` check, and draw no line at all.
-const E_PARABOLIC_TOL: f64 = 1e-9;
+/// its `a > 0` check, and draw no line at all. `pub(crate)` so the
+/// flight HUD's osculating readouts gate the same sliver.
+pub(crate) const E_PARABOLIC_TOL: f64 = 1e-9;
 /// Color for all vessel markers/lines at M1 (bodies get per-index colors).
 const VESSEL_COLOR: [f32; 4] = [1.0, 0.55, 0.15, 1.0];
 /// M5 maneuver-node color: the node marker and the predicted post-burn
@@ -204,8 +205,17 @@ impl BodyTable {
 pub struct MapInput {
     /// Flight vs map.
     pub mode: MapMode,
-    /// Index into [`BodyTable::bodies`].
+    /// Index into [`BodyTable::bodies`] — or `bodies.len() + i` into
+    /// [`MapSnapshot::vessels`] when the focus cycle lands on a vessel.
     pub focus: usize,
+    /// The vessel `focus` addresses, by id. `MapSnapshot::vessels` is
+    /// re-keyed every frame — a removal shifts every later index — so
+    /// an index alone cannot hold a vessel across frames: `sync_map`
+    /// re-anchors `focus` at the id's current slot, and drops the
+    /// vessel focus back to the default body when the id leaves the
+    /// snapshot (the stale-index → camera-at-world-origin defect).
+    /// `None` whenever `focus` addresses the body half.
+    pub(crate) focus_vessel: Option<VesselId>,
     /// Free offset added to the focus position (pan).
     pub pan_offset: DVec3,
     /// Camera yaw about the world's +z (ecliptic normal).
@@ -225,6 +235,7 @@ impl MapInput {
         Self {
             mode: MapMode::Flight,
             focus: table.default_focus,
+            focus_vessel: None,
             pan_offset: DVec3::ZERO,
             yaw_rad: 0.0,
             pitch_rad: 0.6,
@@ -234,7 +245,7 @@ impl MapInput {
     }
 
     /// Apply one event — the `Input` schedule's work.
-    fn apply(&mut self, ev: MapKeyEvent, table: &BodyTable) {
+    fn apply(&mut self, ev: MapKeyEvent, table: &BodyTable, snap: &MapSnapshot) {
         match ev {
             MapKeyEvent::ToggleMode => {
                 self.mode = match self.mode {
@@ -242,13 +253,24 @@ impl MapInput {
                     MapMode::Map => MapMode::Flight,
                 };
                 if self.mode == MapMode::Map {
-                    self.refocus(table);
+                    self.refocus(table, snap);
                 }
             }
             MapKeyEvent::CycleFocus => {
-                if self.mode == MapMode::Map && !table.bodies.is_empty() {
-                    self.focus = (self.focus + 1) % table.bodies.len();
-                    self.refocus(table);
+                // Focus cycles bodies THEN vessels — a vessel index is
+                // `bodies.len() + i` into `snap.vessels` order. The
+                // vessel half is recorded by id so `sync_map` can hold
+                // the focus across the snapshot's re-keying.
+                if self.mode == MapMode::Map {
+                    let n = table.bodies.len() + snap.vessels.len();
+                    if n > 0 {
+                        self.focus = (self.focus + 1) % n;
+                        self.focus_vessel = self
+                            .vessel_focus(table)
+                            .and_then(|i| snap.vessels.get(i))
+                            .map(|(id, _, _)| *id);
+                        self.refocus(table, snap);
+                    }
                 }
             }
             MapKeyEvent::Orbit { dyaw, dpitch } => {
@@ -276,9 +298,22 @@ impl MapInput {
 
     /// Re-lock the camera on the focus body — resets pan and re-derives
     /// a framing distance.
-    fn refocus(&mut self, table: &BodyTable) {
+    fn refocus(&mut self, table: &BodyTable, snap: &MapSnapshot) {
         self.pan_offset = DVec3::ZERO;
-        self.distance_m = default_distance(table, self.focus);
+        self.distance_m = match self.vessel_focus(table).and_then(|i| snap.vessels.get(i)) {
+            // Vessel focus: frame ~3 semi-major axes out (a low orbit
+            // clamps to the minimum — still far tighter than a body).
+            Some((_, o, _)) => {
+                (3.0 * o.elements.semi_major_axis_m.abs()).clamp(MIN_DISTANCE_M, MAX_DISTANCE_M)
+            }
+            None => default_distance(table, self.focus),
+        };
+    }
+
+    /// `Some(vessel index)` when `focus` addresses the vessel half of
+    /// the focus cycle (indices `>= bodies.len()`).
+    pub(crate) fn vessel_focus(&self, table: &BodyTable) -> Option<usize> {
+        self.focus.checked_sub(table.bodies.len())
     }
 }
 
@@ -307,9 +342,10 @@ pub(crate) fn apply_map_input(
     mut events: ResMut<MapInputEvents>,
     mut input: ResMut<MapInput>,
     table: Res<BodyTable>,
+    snap: Res<MapSnapshot>,
 ) {
     for ev in events.pending.drain(..) {
-        input.apply(ev, &table);
+        input.apply(ev, &table, &snap);
     }
 }
 
@@ -345,10 +381,33 @@ pub struct MapSnapshot {
     pub vessels: Vec<(VesselId, OrbitState, Option<ManeuverNode>)>,
 }
 
-/// `Sync` schedule system: copy the staged map input into the mirror.
-pub(crate) fn sync_map(input: Res<MapSyncInput>, mut snap: ResMut<MapSnapshot>) {
+/// `Sync` schedule system: copy the staged map input into the mirror,
+/// then repair the session's vessel focus against the re-keyed list.
+/// `focus_vessel` is the focus index's anchor: an id still present
+/// re-anchors `focus` at its (possibly shifted) slot; an id that left
+/// the snapshot — the vessel landed, unstaged, or was removed — drops
+/// the vessel focus back to the default body. Without this the stale
+/// index addressed past `vessels.len()`: `vessel_focus` still returned
+/// `Some(i)` while `vessel_pos.get(i)` yielded `None`, snapping the
+/// camera to the world origin and the HUD's focus name to "—".
+pub(crate) fn sync_map(
+    input: Res<MapSyncInput>,
+    mut snap: ResMut<MapSnapshot>,
+    mut map_input: ResMut<MapInput>,
+    table: Res<BodyTable>,
+) {
     snap.tick = input.tick;
     snap.vessels.clone_from(&input.vessels);
+    if let Some(id) = map_input.focus_vessel {
+        match snap.vessels.iter().position(|(vid, _, _)| *vid == id) {
+            Some(i) => map_input.focus = table.bodies.len() + i,
+            None => {
+                map_input.focus = table.default_focus;
+                map_input.focus_vessel = None;
+                map_input.refocus(&table, &snap);
+            }
+        }
+    }
 }
 
 /// The orbit model as a presentation resource — a clone taken at `View`
@@ -509,16 +568,19 @@ pub(crate) fn map_present(
 
     refresh_node_previews(model, &snap, &mut scene);
 
-    // Camera solve — f64 throughout.
-    let focus = scene
-        .body_pos
-        .get(input.focus)
-        .copied()
-        .flatten()
-        .unwrap_or(DVec3::ZERO)
+    // Camera solve — f64 throughout. The focus cycle's vessel half
+    // (indices `>= bodies.len()`) addresses `scene.vessel_pos`.
+    let focus = match input.vessel_focus(&table) {
+        Some(i) => scene.vessel_pos.get(i).copied().flatten(),
+        None => scene.body_pos.get(input.focus).copied().flatten(),
+    }
+    .unwrap_or(DVec3::ZERO)
         + input.pan_offset;
     *cam = solve_camera(&input, focus);
-    ui.focus_name = table.focus_name(input.focus).to_string();
+    ui.focus_name = match input.vessel_focus(&table).and_then(|i| snap.vessels.get(i)) {
+        Some((id, _, _)) => format!("vessel {}", id.0),
+        None => table.focus_name(input.focus).to_string(),
+    };
     ui.camera_distance_m = input.distance_m;
 
     // Labels: bodies + vessels that project.
@@ -738,15 +800,35 @@ pub(crate) fn extract_map(
 /// Stage the map's sim reads for the `Sync` schedule (vessel orbit
 /// states + clock — everything else derives from `OrbitModelRes`).
 pub(crate) fn capture_sync_input(sim: &SimWorld) -> MapSyncInput {
+    // On-rails vessels carry their conic; an InBubble vessel's
+    // osculating conic is fitted from its CoM state so the flying
+    // vessel draws on the map too (its line re-samples every frame —
+    // the `OrbitState` changes with the integration). Surface-latched
+    // vessels stay skipped (a parked craft has no conic to draw).
+    let (env, dominant) = (sim.environment(), sim.dominant_body());
     MapSyncInput {
         tick: sim.clock(),
-        // Only on-rails vessels have a conic to draw — bubble-resident
-        // and surface-latched vessels are skipped (the flight-scene
-        // presentation path for them is a later milestone's work).
         vessels: sim
             .vessels()
             .iter()
-            .filter_map(|(id, v)| v.orbit().cloned().map(|o| (*id, o, v.maneuver.clone())))
+            .filter_map(|(id, v)| {
+                if let Some(o) = v.orbit() {
+                    return Some((*id, o.clone(), v.maneuver.clone()));
+                }
+                let (env, dom, body) = (env?, dominant?, v.body()?);
+                let rel = body.com_world() - env.body_center;
+                let elements =
+                    csp_sim::orbit::cartesian_to_elements(rel, body.vel, env.mu_m3_per_s2).ok()?;
+                Some((
+                    *id,
+                    OrbitState {
+                        parent: dom.clone(),
+                        elements,
+                        epoch: sim.clock(),
+                    },
+                    v.maneuver.clone(),
+                ))
+            })
             .collect(),
     }
 }
@@ -1324,19 +1406,20 @@ mod tests {
                 dy_px: 0.0,
             },
             &table,
+            &MapSnapshot::default(),
         );
         assert!(input.pan_offset.norm() > 0.0);
         let start = input.focus; // the star — last in table order
-        input.apply(MapKeyEvent::CycleFocus, &table);
+        input.apply(MapKeyEvent::CycleFocus, &table, &MapSnapshot::default());
         assert_eq!(input.focus, (start + 1) % table.bodies.len());
         assert_eq!(input.pan_offset, DVec3::ZERO); // refocus resets pan
         for _ in 0..table.bodies.len() {
-            input.apply(MapKeyEvent::CycleFocus, &table);
+            input.apply(MapKeyEvent::CycleFocus, &table, &MapSnapshot::default());
         }
         assert_eq!(input.focus, (start + 1) % table.bodies.len()); // wrap + 1
         // CycleFocus is a no-op in Flight mode.
         input.mode = MapMode::Flight;
-        input.apply(MapKeyEvent::CycleFocus, &table);
+        input.apply(MapKeyEvent::CycleFocus, &table, &MapSnapshot::default());
         assert_eq!(input.focus, (start + 1) % table.bodies.len());
     }
 
@@ -1346,9 +1429,9 @@ mod tests {
         let table = BodyTable::from_model(&test_system());
         let mut input = MapInput::new(&table);
         assert_eq!(input.mode, MapMode::Flight);
-        input.apply(MapKeyEvent::ToggleMode, &table);
+        input.apply(MapKeyEvent::ToggleMode, &table, &MapSnapshot::default());
         assert_eq!(input.mode, MapMode::Map);
-        input.apply(MapKeyEvent::ToggleMode, &table);
+        input.apply(MapKeyEvent::ToggleMode, &table, &MapSnapshot::default());
         assert_eq!(input.mode, MapMode::Flight);
     }
 
@@ -1358,11 +1441,19 @@ mod tests {
         let table = BodyTable::from_model(&test_system());
         let mut input = MapInput::new(&table);
         for _ in 0..100 {
-            input.apply(MapKeyEvent::Zoom { factor: 0.5 }, &table);
+            input.apply(
+                MapKeyEvent::Zoom { factor: 0.5 },
+                &table,
+                &MapSnapshot::default(),
+            );
         }
         assert_eq!(input.distance_m, MIN_DISTANCE_M);
         for _ in 0..200 {
-            input.apply(MapKeyEvent::Zoom { factor: 2.0 }, &table);
+            input.apply(
+                MapKeyEvent::Zoom { factor: 2.0 },
+                &table,
+                &MapSnapshot::default(),
+            );
         }
         assert_eq!(input.distance_m, MAX_DISTANCE_M);
         for _ in 0..100 {
@@ -1372,6 +1463,7 @@ mod tests {
                     dpitch: 1.0,
                 },
                 &table,
+                &MapSnapshot::default(),
             );
         }
         assert_eq!(input.pitch_rad, PITCH_LIMIT);
@@ -1440,5 +1532,95 @@ mod tests {
         }
         // 3 bodies with markers + 1 vessel = 4 quads × 6 verts.
         assert_eq!(packet.markers.vertices.len(), 4 * 6);
+    }
+
+    /// Pass-1: a physics-resident (InBubble) vessel is staged into
+    /// `MapSyncInput` via its osculating conic — the map draws the
+    /// flying vessel, not just on-rails ones.
+    #[test]
+    fn in_bubble_vessel_appears_in_map_sync() {
+        let env = csp_phys::Environment {
+            body_center: DVec3::ZERO,
+            radius_m: 6.0e5,
+            mu_m3_per_s2: MU_TERRIN,
+            body_spin: DVec3::ZERO,
+            atmosphere: None,
+            settle_v: 0.05,
+            settle_w: 0.05,
+            settle_ticks: 128,
+            friction_mu: 0.4,
+            drag_cd: 1.0,
+        };
+        let mut sim = SimWorld::with_physics(
+            test_system(),
+            csp_sim::PhysicsConfig {
+                environment: env,
+                dominant: BodyId::from("p"),
+            },
+            1024,
+        );
+        let part = csp_phys::WeldPart {
+            experiments: Vec::new(),
+            lab: None,
+            engine: None,
+            dock_ports: vec![],
+            tanks: vec![],
+            crew_seats: 0,
+            structural: csp_data::StructuralDef::unlimited(),
+            mass_kg: 100.0,
+            com: DVec3::ZERO,
+            inertia: csp_phys::SymMat3::solid_box(100.0, DVec3::new(0.5, 0.5, 0.5)),
+            collider: csp_phys::ColliderShape::Box {
+                half_extents: DVec3::new(0.5, 0.5, 0.5),
+            },
+            force_sites: Vec::new(),
+            aero: csp_data::AeroDef::constant(1.0, 0.0, 1.0),
+            thermal: csp_data::ThermalDef {
+                heat_capacity_j_per_k: 400.0,
+                max_temp_k: 1_200.0,
+                emissivity: 0.8,
+                conduction_w_per_k: 50.0,
+            },
+        };
+        let mut graph = csp_phys::PartGraph::new(csp_phys::PartNodeId(0));
+        graph.nodes.insert(
+            csp_phys::PartNodeId(0),
+            csp_phys::PartNode::new(None, csp_phys::PartTransform::IDENTITY, 0),
+        );
+        let r = 6.0e5 + 100_000.0;
+        sim.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SpawnPhysicalVessel {
+                craft: csp_sim::CraftDef {
+                    graph,
+                    part_costs: vec![0.0],
+                    parts: vec![part],
+                    reliability: vec![],
+                },
+                pos: DVec3::new(r, 0.0, 0.0),
+                rot: csp_core::DQuat::IDENTITY,
+                vel: DVec3::new(0.0, (MU_TERRIN / r).sqrt(), 0.0),
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        sim.step_frame(1).unwrap();
+        let staged = capture_sync_input(&sim);
+        assert_eq!(
+            staged.vessels.len(),
+            1,
+            "the InBubble vessel must be staged for the map"
+        );
+        let (id, orbit, _) = &staged.vessels[0];
+        assert_eq!(*id, csp_sim::VesselId(0));
+        assert_eq!(orbit.parent.as_str(), "p");
+        assert_eq!(orbit.epoch, staged.tick);
+        assert!(orbit.elements.semi_major_axis_m > 0.0);
+        // The osculating conic places it at the spawned altitude.
+        let (pos, _) = sim
+            .orbits()
+            .state_at(orbit, staged.tick)
+            .expect("conic solves at its epoch");
+        assert!((pos.norm() - r).abs() < 1.0);
     }
 }

@@ -422,6 +422,7 @@ mod tests {
             parts: vec![csp_phys::WeldPart {
                 experiments: Vec::new(),
                 lab: None,
+                engine: None,
                 dock_ports: vec![],
                 tanks: vec![csp_phys::TankSpec {
                     resource: ResourceId::from("ore"),

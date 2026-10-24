@@ -301,6 +301,16 @@ pub struct FlightHudInput<'a> {
     /// §3.7's visual-SFX cue lines (engine, staging, impact,
     /// breakup) — drawn as top-center event flashes.
     pub sfx: &'a [String],
+    /// Osculating apoapsis/periapsis altitude, times-to-apsis, period.
+    pub apo_alt_m: Option<f64>,
+    /// Periapsis altitude (m).
+    pub pe_alt_m: Option<f64>,
+    /// Time to apoapsis (s).
+    pub t_apo_s: Option<f64>,
+    /// Time to periapsis (s).
+    pub t_pe_s: Option<f64>,
+    /// Orbital period (s).
+    pub period_s: Option<f64>,
     /// The focused vessel's propellant — one gauge per resource
     /// still carried (empty for tank-less vessels).
     pub propellant: &'a [PropellantGauge],
@@ -415,6 +425,21 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
                 dim,
             );
             row(ui, "V/S", format!("{:>+7.1} m/s", input.vspeed_mps), c);
+            // Pass-1 orbit readout — Ap/Pe altitudes + times-to-apsis
+            // + period, "—" where the conic is open or unset.
+            let opt = |v: Option<f64>| v.map_or("     —  ".to_string(), fmt_alt);
+            row(ui, " AP", opt(input.apo_alt_m), c);
+            row(ui, " PE", opt(input.pe_alt_m), c);
+            let ts = |v: Option<f64>| {
+                v.map_or("     —  ".to_string(), |s| format!("{:>6.0} s", s))
+            };
+            row(
+                ui,
+                "T-A/P",
+                format!("{} /{}", ts(input.t_apo_s), ts(input.t_pe_s)),
+                dim,
+            );
+            row(ui, "  T", ts(input.period_s), dim);
             let hdg = if input.heading_deg.is_finite() {
                 format!("{:>7.1}°", input.heading_deg)
             } else {

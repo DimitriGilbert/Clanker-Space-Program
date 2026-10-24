@@ -187,7 +187,14 @@ use crate::SimError;
 /// coordination that was deferred to 9.2. Lands with
 /// `csp_data::DATA_HASH_VERSION` 2 (the §3.1 framing fix — a separate
 /// constant, fingerprint-recorded). The goldens rebless.
-pub const HASH_SCHEMA_VERSION: u32 = 19;
+///
+/// **Version 20** (pass-1 propellant consumption): the craft walk
+/// appended `WeldPart::engine` — the resolved `EngineSpec` carrying
+/// the isp and propellant mass fractions the per-tick propellant
+/// bookkeeping debits against, craft identity like the tanks it
+/// drains. `WeldPart` gained the field (save format change). The
+/// goldens rebless.
+pub const HASH_SCHEMA_VERSION: u32 = 20;
 
 /// Rule-7 sum types: the source of an enum's *declared* stable `u16`
 /// discriminant (PLAN §7.1 rule 7).

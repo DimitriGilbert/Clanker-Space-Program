@@ -295,6 +295,36 @@ pub struct WeldPart {
     /// per part). Stage 1 ignores it; the M7 research subsystem's
     /// §3.2 two-regime closed form consumes it.
     pub lab: Option<LabSpec>,
+    /// §3.1 `Engine` resolution: the propellant-consumption spec —
+    /// `None` for a part with no `Engine` module (and the unmetered
+    /// hand-authored-craft convention — see [`EngineSpec`]). Stage 1
+    /// ignores it; the sim's per-tick propellant bookkeeping debits
+    /// `throttle·rated_n·dt/(isp_vac·g₀)` split across `propellants`.
+    pub engine: Option<EngineSpec>,
+}
+
+/// The resolved `Engine` module's *consumption* half — what the sim's
+/// propellant bookkeeping needs that the force site alone cannot say:
+/// the specific impulse converting rated newtons into mass flow
+/// (`ṁ = F/(isp·g₀)`) and the `(resource, mass fraction)` split that
+/// flow debits from the vessel's tanks. Frozen at resolve like every
+/// `WeldPart` field — the resolved `isp_vac_s` (post-scale, post-
+/// multiplier) and the authored fractions verbatim (validator: unique,
+/// positive, summing to 1).
+///
+/// `None` marks a part with no engine module — and, on hand-authored
+/// `WeldPart`s (test/scenario craft that never passed through the
+/// resolver), a `Thrust` site with no consumption model at all: the
+/// documented "unmetered" debug craft, which thrusts without drawing
+/// propellant. Only the `Some` case feeds the tank ledger.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EngineSpec {
+    /// Resolved `isp_vac_s` (s) — the `ṁ = throttle·rated/(isp·g₀)`
+    /// divisor.
+    pub isp_vac_s: f64,
+    /// `(resource, mass fraction)` — the resolved `propellants` list,
+    /// fractions positive and summing to 1.
+    pub propellants: Vec<(ResourceId, f64)>,
 }
 
 /// One resolved `Experiment` module (§3.1/§3.2): what one run yields

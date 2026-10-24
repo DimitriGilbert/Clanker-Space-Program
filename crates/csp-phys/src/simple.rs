@@ -2186,6 +2186,7 @@ mod tests {
         let parts = [WeldPart {
             experiments: Vec::new(),
             lab: None,
+            engine: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -2318,6 +2319,7 @@ mod tests {
         let parts = [WeldPart {
             experiments: Vec::new(),
             lab: None,
+            engine: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -2535,6 +2537,7 @@ mod tests {
         let mk = |m| WeldPart {
             experiments: Vec::new(),
             lab: None,
+            engine: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -2699,6 +2702,7 @@ mod tests {
         let mk = |m| WeldPart {
             experiments: Vec::new(),
             lab: None,
+            engine: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -2864,6 +2868,7 @@ mod tests {
         let parts = [WeldPart {
             experiments: Vec::new(),
             lab: None,
+            engine: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
