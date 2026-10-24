@@ -875,8 +875,12 @@ the authoritative snapshot or change replay ground truth.
   - **`Origin`/`Host` allowlist on *all* endpoints, including read-only.** "Read-only telemetry is
     unauthenticated on localhost" was wrong: any web page the player visits could `fetch` their game
     state and enumerate ports.
-  - Token at `$XDG_RUNTIME_DIR/csp/<pid>.token`, mode 0600, rotated per process start, injected into
-    the served HTML — **never stored in the save**. Documented for MCP clients to read.
+  - Token at `$XDG_RUNTIME_DIR/csp/<pid>.token`, mode 0600, rotated per process start — **never
+    stored in the save and never injected into the served shell** (`/` and `/assets/*` are
+    token-free; a served page carrying the secret would leak the bearer to any same-origin
+    script). Clients authenticate with `Authorization: Bearer` — `?token=` only on the `/ws`
+    upgrade, which cannot set headers — and the SPA bootstraps from a pasted `?csp_token=` (kept
+    in tab `sessionStorage`, stripped from the address bar). Documented for MCP clients to read.
   - LAN binds require an explicit `--bind-lan` flag, print a warning, and require the token on
     every endpoint. No TLS in v1; that is stated as a limitation, not hidden.
 
@@ -1063,11 +1067,15 @@ and contract validation. If these ever disagree, players find it in a day.
 
 **Data-set hash, defined precisely** (it is load-bearing for §7.7's drift warning and for
 `BuiltPart`): BLAKE3 over the concatenation, in ascending path order, of
-`path_bytes || 0x00 || canonicalized_file_bytes` for every file under `data/` **excluding**
-`data/test-fixtures/` and any file matching the art extensions list (`*.png` is **included** for
-biome maps and concentration maps, and excluded for textures under `data/art/`). Canonicalization =
-LF line endings, trailing whitespace stripped. Algorithm pinned; changing it bumps
-`DATA_HASH_VERSION`.
+`path_bytes || 0x00 || u64-LE len || canonicalized_file_bytes` for every file under `data/`
+**excluding** `data/test-fixtures/` and any file matching the art extensions list **under
+`data/art/`** (`*.png` is **included** for biome maps and concentration maps — the art-extension
+exclusion applies only beneath `data/art/`). The `u64` length prefix makes each file's frame
+injective — the retired `path || 0x00 || content` framing let one file's bytes alias a file
+boundary, which is why `DATA_HASH_VERSION` stands at 2. The walk **refuses symlinks and non-UTF-8
+file names** rather than following a link out of the set or lossy-colliding two distinct names.
+Canonicalization = UTF-8 text rejoined on LF with trailing whitespace stripped; non-UTF-8 bytes
+(PNG maps) hash verbatim. Algorithm pinned; changing it bumps `DATA_HASH_VERSION`.
 
 ### 3.2 Science economy
 

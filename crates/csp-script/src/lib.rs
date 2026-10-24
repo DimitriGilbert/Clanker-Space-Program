@@ -64,7 +64,7 @@ use csp_sim::{
     ScriptRunReport, ScriptState, SimCommand, SourceClass, TickIo, VesselId, VesselTelemetry,
     WakeCondition,
 };
-use rhai::{AST, Dynamic, Engine, FLOAT, INT, Map, Scope};
+use rhai::{AST, Dynamic, Engine, EvalAltResult, FLOAT, INT, Map, Scope};
 
 /// §2.10's `ControlApi` — the control surface shared by the Rhai
 /// host and the Rust autopilot (`csp-ai` drives
@@ -87,7 +87,9 @@ pub trait ControlApi {
     /// `SetThrottle` — clamped `[0, 1]` by the apply.
     fn set_throttle(&mut self, fraction: f64);
     /// `SetAttitude` — aim the fore axis along `dir` (world frame),
-    /// zero angular rate. The sim's `align_rotation` convention.
+    /// zero angular rate. The sim's `align_rotation` convention; a
+    /// zero `dir` holds the current orientation (the Rhai `steer`
+    /// binding's zero-vector fallback is the same).
     fn steer_dir(&mut self, dir: DVec3);
     /// `SetAttitude` holding the current orientation — the closest
     /// the sim ships to a SAS hold.
@@ -121,7 +123,10 @@ pub struct IoControlApi<'a> {
     /// `SourceClass` the commands stamp under.
     pub class: SourceClass,
     /// `source_id` for the stamp (vessel id for autopilots, script id
-    /// is implicit — wake/log still route through it).
+    /// is implicit — wake/log still route through it). A u32 channel
+    /// key, not the full id — producers clamp u64 ids with
+    /// `.min(u32::MAX)` (see `CommandKey::source_id`); the sim's io
+    /// re-derives the stamp from its binding regardless.
     pub source_id: u32,
     /// The bound vessel.
     pub vessel: VesselId,
@@ -710,7 +715,7 @@ impl RhaiHost {
                 },
             );
         });
-        let (v, fx0) = (bound.vessel, fx.clone());
+        let (v, fx0, cur_rot) = (bound.vessel, fx.clone(), bound.rot);
         self.engine
             .register_fn("steer", move |x: FLOAT, y: FLOAT, z: FLOAT| {
                 let d = DVec3::new(x, y, z);
@@ -720,7 +725,11 @@ impl RhaiHost {
                     // axis) onto the world direction.
                     csp_sim::maneuver::align_rotation(DVec3::Z, d / n)
                 } else {
-                    DQuat::IDENTITY
+                    // Zero direction = hold: the same verb as
+                    // `IoControlApi::steer_dir`, whose fallback is the
+                    // telemetry rotation — `cur_rot` is exactly that
+                    // snapshot (`Bound::rot`).
+                    cur_rot
                 };
                 push(
                     &fx0,
@@ -971,13 +980,23 @@ impl ScriptEngine for RhaiHost {
 
         match result {
             Err(e) => {
-                let msg = e.to_string();
-                let fault = if msg.contains("Terminated")
-                    || msg.to_lowercase().contains("too many operations")
-                {
+                // Structured classification — `EvalAltResult` carries
+                // the abort cause, so no message sniffing:
+                // `ErrorTooManyOperations` is the `max_operations`
+                // budget abort and `ErrorTerminated` the `on_progress`
+                // token abort (this host's callback never returns
+                // `Some`, so unreachable today — kept so a future
+                // progress-token abort still classifies as the budget
+                // abort it is). A guest `throw` is `ErrorRuntime`
+                // whatever its message says — naming the budget in a
+                // thrown string can no longer misclassify.
+                let fault = if matches!(
+                    *e,
+                    EvalAltResult::ErrorTooManyOperations(..) | EvalAltResult::ErrorTerminated(..)
+                ) {
                     ScriptFault::BudgetExceeded
                 } else {
-                    ScriptFault::Runtime(msg)
+                    ScriptFault::Runtime(e.to_string())
                 };
                 ScriptRunReport {
                     ops_used,
@@ -1027,6 +1046,14 @@ impl ScriptEngine for RhaiHost {
                 if let Some(p) = persist_next {
                     script.persist = p;
                 }
+                // `source_id` is a u32 channel key, not the full
+                // script id (see `CommandKey::source_id`): every id
+                // above `u32::MAX` collapses onto the shared
+                // `(Script, u32::MAX)` channel — one pending FIFO and
+                // one `source_seq` counter — while never aliasing a
+                // smaller id's channel. `check_control_lease` clamps
+                // `Lease::Script` the same way, so the collapse is
+                // consistent end to end.
                 let source_id = script.id.0.min(u64::from(u32::MAX)) as u32;
                 for c in &fx.commands {
                     io.issue(SourceClass::Script, source_id, c.clone());

@@ -198,6 +198,10 @@ impl AutopilotDriver for AscentAutopilot {
         let mut api = IoControlApi {
             io,
             class: SourceClass::Autopilot,
+            // `source_id` is a u32 channel key, not the full vessel id
+            // (see `CommandKey::source_id`): ids above `u32::MAX`
+            // share the `(Autopilot, u32::MAX)` channel — one pending
+            // FIFO, one `source_seq` — never a smaller id's channel.
             source_id: (vessel.0.min(u64::from(u32::MAX))) as u32,
             vessel,
             script: None,

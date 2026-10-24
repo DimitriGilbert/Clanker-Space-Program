@@ -488,9 +488,20 @@ pub struct CommandKey {
     pub tick: u64,
     /// The command's ordering class (§2.2.1).
     pub source_class: SourceClass,
-    /// Which producer of that class issued the command.
+    /// Which producer of that class issued the command — a u32
+    /// channel key, not necessarily the producer's full id: producers
+    /// holding u64 ids clamp with `.min(u32::MAX)` (the same clamp
+    /// `check_control_lease` applies to `Lease::Script`), so every id
+    /// above the clamp shares the `(class, u32::MAX)` channel — one
+    /// pending FIFO, one `source_seq` counter — while never aliasing
+    /// a smaller id's channel.
     pub source_id: u32,
-    /// Per-source production-order counter, stamped at dequeue.
+    /// Per-`(source_class, source_id)`-channel production-order
+    /// counter, stamped at dequeue. Producers collapsed onto one
+    /// channel (see `source_id`) interleave their commands under the
+    /// channel's shared sequence — per-producer order is still
+    /// FIFO-exact; the cross-producer order within the channel is
+    /// production order.
     pub source_seq: u64,
 }
 
@@ -7686,6 +7697,24 @@ impl WorldTickIo<'_> {
             .ok_or(SimError::Recoverable("wake: no bound vessel"))
     }
 
+    /// The `(source_class, source_id)` this io's commands stamp
+    /// under — derived from the binding, never trusted from the
+    /// engine: a script io stamps `(Script, its id)`, an autopilot
+    /// io `(Autopilot, its vessel)`, each clamped into the u32
+    /// channel key exactly as `check_control_lease` clamps
+    /// `Lease::Script` (ids above `u32::MAX` share one channel — see
+    /// [`CommandKey::source_id`]).
+    fn source_stamp(&self) -> (SourceClass, u32) {
+        match self.bound_script {
+            Some(id) => (SourceClass::Script, id.0.min(u64::from(u32::MAX)) as u32),
+            None => (
+                SourceClass::Autopilot,
+                self.bound_vessel
+                    .map_or(0, |v| v.0.min(u64::from(u32::MAX)) as u32),
+            ),
+        }
+    }
+
     /// Apsides/times from a conic — `(apo_alt, pe_alt, t_apo, t_pe)`.
     /// `epoch_ticks` is the elements' stamping epoch (0 for an
     /// osculating bubble conversion — its epoch is `clock`).
@@ -7925,6 +7954,21 @@ impl TickIo for WorldTickIo<'_> {
     }
 
     fn issue(&mut self, class: SourceClass, source_id: u32, command: SimCommand) {
+        // The trust boundary is the binding, not the caller: the io
+        // serves exactly one producer, so the stamp it pushes is
+        // derived, not taken — a stamp that disagrees is an engine
+        // bug the assert names, and in release the derived pair is
+        // what the queue sees regardless (a spoofed `Ui` would
+        // bypass `check_control_lease`'s unconditional pass; a
+        // foreign `Script`/`External` id would spend another
+        // producer's FIFO and `source_seq`).
+        let derived = self.source_stamp();
+        debug_assert_eq!(
+            (class, source_id),
+            derived,
+            "TickIo::issue: engine stamped a source the io is not bound to"
+        );
+        let (class, source_id) = derived;
         // Record the push: the drain records only what it pops, so an
         // issued command that never reaches a drain this iteration is
         // otherwise invisible to the rollback — a ghost command
@@ -10016,6 +10060,17 @@ mod tests {
         circular_elements(6.75e5, 0.0)
     }
 
+    /// The authored §3.0 home system (`data/systems/home`) — the
+    /// ground truth the `test_env`/`home_system` fixture-binding
+    /// tests hold their mocks against.
+    fn authored_home_defs() -> Vec<csp_data::BodyDef> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("data/systems/home");
+        let sys = csp_data::load_system(&dir).unwrap();
+        sys.bodies.iter().map(|b| b.def.clone()).collect()
+    }
+
     /// A hyperbola about `p` (e = 1.5, periapsis 7e5) that escapes through
     /// `m`'s SOI — the orbit.rs ordering-test construction: Enter{m} then
     /// Exit{m} then Exit{p}. Returns the elements; the moon's M0 is aimed
@@ -12053,6 +12108,64 @@ mod tests {
         csp_core::DQuat::from_axis_angle(DVec3::Y, core::f64::consts::FRAC_PI_2)
     }
 
+    /// The `test_env` mock is bound field-wise to Terrin's authored
+    /// `body.ron` via `Environment::for_body` — the real construction
+    /// path — so a RON edit reds here instead of leaving the fixture
+    /// silently stale. One documented carve-out: `temperature_knots`.
+    /// The mock carries the authored table's two ENDPOINTS only
+    /// (0 m → 288.15 K, 70 km → 200.15 K) — a straight ramp that
+    /// drops the authored stratosphere bump (216.65 K at 12 km,
+    /// 250.35 K at 40 km). The delta is load-bearing, not sloppiness:
+    /// the suite pins the mock's warmer ambient —
+    /// `explosion_and_overheat_same_tick_destroys_part` relies on
+    /// ~276 K at 10 km to push its 250 K `max_temp_k` leaf over limit
+    /// on the first `thermal_step` (authored: ~229 K — the leaf would
+    /// not overheat). Endpoint edits in the RON must red this test;
+    /// mid-table edits are exactly the carve-out.
+    #[test]
+    fn test_env_binds_to_authored_terrin_except_temp_knots() {
+        let defs = authored_home_defs();
+        let terrin = defs
+            .iter()
+            .find(|b| b.id == BodyId::from("terrin"))
+            .unwrap();
+        let authored = csp_phys::Environment::for_body(terrin, DVec3::ZERO, Some(21_600.0));
+        let mock = test_env(true);
+        assert_eq!(mock.body_center, authored.body_center);
+        assert_eq!(mock.radius_m, authored.radius_m);
+        assert_eq!(mock.mu_m3_per_s2, authored.mu_m3_per_s2);
+        assert_eq!(mock.body_spin, authored.body_spin);
+        assert_eq!(mock.settle_v, authored.settle_v);
+        assert_eq!(mock.settle_w, authored.settle_w);
+        assert_eq!(mock.settle_ticks, authored.settle_ticks);
+        assert_eq!(mock.friction_mu, authored.friction_mu);
+        assert_eq!(mock.drag_cd, authored.drag_cd);
+        let (m_atm, a_atm) = (
+            mock.atmosphere.as_ref().unwrap(),
+            authored.atmosphere.as_ref().unwrap(),
+        );
+        assert_eq!(m_atm.sea_level_pressure_pa, a_atm.sea_level_pressure_pa);
+        assert_eq!(m_atm.scale_height_m, a_atm.scale_height_m);
+        assert_eq!(m_atm.top_m, a_atm.top_m);
+        assert_eq!(m_atm.molar_mass_kg_per_mol, a_atm.molar_mass_kg_per_mol);
+        assert_eq!(m_atm.heat_capacity_ratio, a_atm.heat_capacity_ratio);
+        // The carve-out, pinned exactly: the mock's table is the
+        // authored endpoints, and it must stay a strict subset.
+        assert!(
+            a_atm.temperature_knots.len() > m_atm.temperature_knots.len(),
+            "the carve-out assumes the authored table is richer"
+        );
+        assert_eq!(m_atm.temperature_knots.len(), 2);
+        assert_eq!(
+            m_atm.temperature_knots[0],
+            *a_atm.temperature_knots.first().unwrap()
+        );
+        assert_eq!(
+            m_atm.temperature_knots[1],
+            *a_atm.temperature_knots.last().unwrap()
+        );
+    }
+
     /// §2.4: a physical spawn welds its craft into a bubble-resident
     /// `WeldedBody`; gravity alone pulls it down at ~g.
     #[test]
@@ -12204,10 +12317,11 @@ mod tests {
         assert!(dv > 1.0, "staged/deployed divergence {dv} m/s");
     }
 
-    /// `InstallAeroTables` round trip: build sim-side, install via
-    /// the command path, reject a mismatched graph hash.
+    /// `InstallAeroTables` reject leg: build sim-side, install via
+    /// the command path, reject a mismatched graph hash — and a
+    /// `mask` field that disagrees with the command's mask argument.
     #[test]
-    fn install_aero_tables_accepts_and_binds() {
+    fn install_aero_tables_rejects_bad_binding() {
         let mut w = physics_world(false);
         let pos = DVec3::new(TERRIN_R + 30_000.0, 0.0, 0.0);
         spawn_physical(
@@ -12221,12 +12335,12 @@ mod tests {
             },
         );
         let v = &w.vessels()[&VesselId(0)];
-        let craft = v.craft.as_ref().unwrap();
-        let body = v.body().unwrap();
+        let craft = v.craft.as_ref().unwrap().clone();
+        let body = v.body().unwrap().clone();
         // gh = 0 cannot match the real craft hash → install rejects.
         let gh = 0u64;
         let mut bad = csp_phys::build_aero_tables(
-            body,
+            &body,
             &craft.graph,
             &craft.parts,
             csp_phys::ConfigMask::ALL,
@@ -12251,6 +12365,269 @@ mod tests {
             "{:?}",
             rep.rejected
         );
+        // The second binding gate: a well-formed table whose `mask`
+        // field disagrees with the command's mask argument.
+        let good = csp_phys::build_aero_tables(
+            &body,
+            &craft.graph,
+            &craft.parts,
+            csp_phys::ConfigMask::ALL,
+            craft_graph_hash(&craft),
+        )
+        .unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::InstallAeroTables {
+                vessel: VesselId(0),
+                mask: csp_phys::ConfigMask(0b10),
+                tables: good,
+            },
+        );
+        let rep = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(
+            rep.rejected
+                .iter()
+                .any(|r| r.error == SimError::Recoverable("install-aero: mask field mismatch")),
+            "{:?}",
+            rep.rejected
+        );
+    }
+
+    /// `InstallAeroTables` accept leg — and the hot-swap. On an
+    /// airless world the lazy `ensure_aero` attach is a no-op, so the
+    /// body starts table-free: installing a correctly-bound table for
+    /// the vessel's ACTIVE `aero_mask` lands it in the per-mask cache
+    /// AND binds it straight onto the live body (`aero` goes
+    /// `None → Some(installed)`). A second install for a non-active
+    /// mask caches without touching the live attach.
+    #[test]
+    fn install_aero_tables_accepts_and_binds() {
+        let mut env = test_env(false);
+        env.atmosphere = None; // ensure_aero early-outs — the body stays table-free
+        let mut w = World::with_physics(
+            test_system(),
+            PhysicsConfig {
+                environment: env,
+                dominant: BodyId::from("p"),
+            },
+            DEFAULT_MAX_EVENTS_PER_FRAME,
+        );
+        let pos = DVec3::new(TERRIN_R + 30_000.0, 0.0, 0.0);
+        spawn_physical(
+            &mut w,
+            SimCommand::SpawnPhysicalVessel {
+                craft: box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0),
+                pos,
+                rot: csp_core::DQuat::IDENTITY,
+                vel: DVec3::ZERO,
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        let v = &w.vessels()[&VesselId(0)];
+        assert!(v.body().unwrap().aero.is_none(), "airless: no lazy attach");
+        assert_eq!(v.aero_mask, csp_phys::ConfigMask::ALL);
+        let craft = v.craft.as_ref().unwrap().clone();
+        let body = v.body().unwrap().clone();
+        let gh = craft_graph_hash(&craft);
+        let install = |w: &mut World, mask: csp_phys::ConfigMask| {
+            let tables =
+                csp_phys::build_aero_tables(&body, &craft.graph, &craft.parts, mask, gh).unwrap();
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::InstallAeroTables {
+                    vessel: VesselId(0),
+                    mask,
+                    tables: tables.clone(),
+                },
+            );
+            let rep = w.step_frame(w.clock().ticks() + 1).unwrap();
+            assert!(rep.rejected.is_empty(), "{:?}", rep.rejected);
+            tables
+        };
+        // The active-mask install: cache insert + hot-swap onto the
+        // live body — observable here as `None → Some`.
+        let tables_all = install(&mut w, csp_phys::ConfigMask::ALL);
+        assert!(
+            w.physics
+                .as_ref()
+                .unwrap()
+                .aero
+                .get(&VesselId(0))
+                .is_some_and(|c| c.tables.contains_key(&csp_phys::ConfigMask::ALL)),
+            "install must land in the per-mask cache"
+        );
+        let attached = w.vessels()[&VesselId(0)]
+            .body()
+            .unwrap()
+            .aero
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert!(
+            attached.bit_eq(&tables_all),
+            "the live body must bind the installed table, not a recompute"
+        );
+        // A non-active mask caches without disturbing the attach.
+        let off_mask = csp_phys::ConfigMask(0b10);
+        install(&mut w, off_mask);
+        let cache = &w.physics.as_ref().unwrap().aero[&VesselId(0)];
+        assert_eq!(cache.tables.len(), 2);
+        let still = w.vessels()[&VesselId(0)]
+            .body()
+            .unwrap()
+            .aero
+            .as_ref()
+            .unwrap();
+        assert_eq!(still.mask, csp_phys::ConfigMask::ALL);
+    }
+
+    /// §2.4's Stage-2 determinism gate: a table that passes the
+    /// binding checks but differs from the sim-side recompute is a
+    /// `Fatal` — the `#[cfg(debug_assertions)]` byte-compare that
+    /// catches a worker/sim divergence. (In release the gate is
+    /// compiled out and the install commits — the arm exists only
+    /// where it can fire.)
+    #[test]
+    fn install_aero_tables_byte_compare_gate_fires() {
+        let mut w = physics_world(false);
+        let pos = DVec3::new(TERRIN_R + 30_000.0, 0.0, 0.0);
+        spawn_physical(
+            &mut w,
+            SimCommand::SpawnPhysicalVessel {
+                craft: box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0),
+                pos,
+                rot: csp_core::DQuat::IDENTITY,
+                vel: DVec3::ZERO,
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        let v = &w.vessels()[&VesselId(0)];
+        let craft = v.craft.as_ref().unwrap();
+        let body = v.body().unwrap();
+        // Binding-clean but payload-corrupt: pass graph_hash and the
+        // mask field, then perturb a payload float the byte-compare
+        // reads at to_bits resolution.
+        let mut tables = csp_phys::build_aero_tables(
+            body,
+            &craft.graph,
+            &craft.parts,
+            csp_phys::ConfigMask::ALL,
+            craft_graph_hash(craft),
+        )
+        .unwrap();
+        tables.ref_area_m2 *= 1.5;
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::InstallAeroTables {
+                vessel: VesselId(0),
+                mask: csp_phys::ConfigMask::ALL,
+                tables,
+            },
+        );
+        let out = w.step_frame(w.clock().ticks() + 1);
+        if cfg!(debug_assertions) {
+            assert_eq!(
+                out.unwrap_err(),
+                SimError::Fatal("install-aero: table differs from sim-side recompute")
+            );
+        } else {
+            // No gate in release: the install commits.
+            assert!(out.unwrap().rejected.is_empty());
+        }
+    }
+
+    /// `SetAeroConfig` through the command path: the requested mask's
+    /// table builds on demand and binds (live body included), an
+    /// unknown vessel is a named `Recoverable`, and past §2.4.1's
+    /// 8-table cap the active mask resolves to the nearest computed
+    /// mask by Hamming distance.
+    #[test]
+    fn set_aero_config_builds_binds_and_hamming_resolves() {
+        let mut w = physics_world(false);
+        let pos = DVec3::new(TERRIN_R + 30_000.0, 0.0, 0.0);
+        spawn_physical(
+            &mut w,
+            SimCommand::SpawnPhysicalVessel {
+                craft: box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0),
+                pos,
+                rot: csp_core::DQuat::IDENTITY,
+                vel: DVec3::ZERO,
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        // Named rejection, not a no-op.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SetAeroConfig {
+                vessel: VesselId(9),
+                mask: csp_phys::ConfigMask(1),
+            },
+        );
+        let rep = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(
+            rep.rejected
+                .iter()
+                .any(|r| r.error == SimError::Recoverable("aero-config: unknown vessel")),
+            "{:?}",
+            rep.rejected
+        );
+        // On-demand build + bind: mask 0b10 was never computed.
+        let mask_b10 = csp_phys::ConfigMask(0b10);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SetAeroConfig {
+                vessel: VesselId(0),
+                mask: mask_b10,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        let v = &w.vessels()[&VesselId(0)];
+        assert_eq!(v.aero_mask, mask_b10);
+        assert_eq!(v.body().unwrap().aero.as_ref().unwrap().mask, mask_b10);
+        // Fill the cache to §2.4.1's 8-mask cap. The spawn's lazy
+        // `ensure_aero` already cached `ALL`, so the set is
+        // {ALL, 0b10} plus single bits — the seventh request (256)
+        // lands past the cap and Hamming-resolves instead of
+        // building, the same fallback the last enqueue checks.
+        for bit in [4u64, 8, 16, 32, 64, 128, 256] {
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::SetAeroConfig {
+                    vessel: VesselId(0),
+                    mask: csp_phys::ConfigMask(bit),
+                },
+            );
+        }
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert_eq!(
+            w.physics.as_ref().unwrap().aero[&VesselId(0)].tables.len(),
+            csp_phys::MAX_CONFIG_MASKS
+        );
+        // Mask 0b11 is uncached and the cache is full: the active
+        // mask must resolve to the Hamming-nearest computed mask —
+        // 0b10 (distance 1; every other cached mask is ≥ 3 away) —
+        // and its table binds.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SetAeroConfig {
+                vessel: VesselId(0),
+                mask: csp_phys::ConfigMask(0b11),
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        let v = &w.vessels()[&VesselId(0)];
+        assert_eq!(
+            v.aero_mask, mask_b10,
+            "the cap fallback must pick the Hamming-nearest computed mask"
+        );
+        assert_eq!(v.body().unwrap().aero.as_ref().unwrap().mask, mask_b10);
     }
 
     /// §2.9 reentry check via the table model: a capsule dropped at
@@ -14834,6 +15211,57 @@ mod tests {
         m
     }
 
+    /// `home_system`'s constants are bound field-wise to the authored
+    /// `data/systems/home` set via `PatchedConics::from_body_defs` —
+    /// a RON edit can no longer leave the flagship fixture silently
+    /// stale. Two documented carve-outs:
+    /// - `period_s`: the redundant display field — the model derives
+    ///   mean motion from `μ,a³` and never reads it (the spawn and
+    ///   restore gates demand only positive non-NaN), so the fixture
+    ///   carries `+∞`, the documented open-orbit marker.
+    /// - `solen`'s physical radius: the fixture stamps radii for the
+    ///   three encounter-relevant bodies only; the star's
+    ///   `body_radius` reads `None` (query metadata, never sim state).
+    #[test]
+    fn home_system_fixture_binds_to_authored_data() {
+        let defs = authored_home_defs();
+        let authored = PatchedConics::from_body_defs(&defs).unwrap();
+        let mock = home_system();
+        assert_eq!(mock.bodies().len(), authored.bodies().len());
+        for (id, a) in authored.bodies() {
+            let m = &mock.bodies()[id];
+            assert_eq!(m.mu_m3_per_s2, a.mu_m3_per_s2, "{id}");
+            assert_eq!(m.soi_m, a.soi_m, "{id}");
+            assert_eq!(m.parent, a.parent, "{id}");
+            match (&m.elements, &a.elements) {
+                (Some(me), Some(ae)) => {
+                    assert_eq!(me.semi_major_axis_m, ae.semi_major_axis_m, "{id}");
+                    assert_eq!(me.eccentricity, ae.eccentricity, "{id}");
+                    assert_eq!(me.inclination_rad, ae.inclination_rad, "{id}");
+                    assert_eq!(me.ascending_node_rad, ae.ascending_node_rad, "{id}");
+                    assert_eq!(me.arg_periapsis_rad, ae.arg_periapsis_rad, "{id}");
+                    assert_eq!(me.mean_anomaly_epoch_rad, ae.mean_anomaly_epoch_rad, "{id}");
+                    assert_eq!(
+                        me.period_s,
+                        f64::INFINITY,
+                        "{id}: the fixture's documented period_s carve-out"
+                    );
+                }
+                (None, None) => {}
+                _ => panic!("{id}: elements presence diverged from authored"),
+            }
+        }
+        for id in ["terrin", "rask", "duva"] {
+            let id = BodyId::from(id);
+            assert_eq!(mock.body_radius(&id), authored.body_radius(&id), "{id}");
+        }
+        assert_eq!(
+            mock.body_radius(&BodyId::from("solen")),
+            None,
+            "the star's radius is the fixture's documented gap"
+        );
+    }
+
     /// M5's missing end-to-end proof: Duva is reachable **in-sim** —
     /// through the real chain, not a planted conic. The vessel rides
     /// the whole path the game will drive: `SpawnPhysicalVessel` with
@@ -15381,6 +15809,22 @@ mod tests {
     /// 180° about Y — turns B's +z port face to world −z, toward A.
     fn flip_rot() -> DQuat {
         DQuat::from_axis_angle(DVec3::Y, core::f64::consts::PI)
+    }
+
+    /// A rotation carrying local +z to unit `dir` — the pose a
+    /// single-port craft needs for its port face to aim along `dir`.
+    /// Degenerate near-parallel cases collapse to the exact unit
+    /// rotations (`flip_rot`'s π about Y covers `dir ≈ −ẑ`).
+    fn rot_facing_z_to(dir: DVec3) -> DQuat {
+        let t = dir / dir.norm();
+        let d = DVec3::Z.dot(t);
+        if d > 1.0 - 1e-12 {
+            DQuat::IDENTITY
+        } else if d < -1.0 + 1e-12 {
+            flip_rot()
+        } else {
+            DQuat::from_axis_angle(DVec3::Z.cross(t), libm::acos(d.clamp(-1.0, 1.0)))
+        }
     }
 
     /// A docking config with the M6-C latch disabled — zero settle
@@ -16319,29 +16763,115 @@ mod tests {
         assert_eq!(detached.seams, vec![seam2_record]);
     }
 
-    /// §2.4's station claim, small scale: a second dock adds a second
-    /// seam — one vessel, one WeldedBody, two recorded seams.
+    /// §2.4's station claim, small scale: a REAL second dock — a
+    /// second capture through the joint → settle → latch pipeline —
+    /// adds a second seam record on the one merged body. The
+    /// secondary carries TWO ports: the +z face seals the primary's
+    /// port at the first latch; the −z face (world +z after the
+    /// flip) stays exposed at the merged craft's far end, and a
+    /// third single-port craft docks onto it.
     #[test]
     fn second_dock_records_a_second_seam_on_one_body() {
         let mut w = physics_world(false);
-        spawn_port_pair(&mut w, DVec3::new(0.0, 0.0, 1.8), flip_rot());
+        // Vessel B's craft: one box, two opposing port faces.
+        let mut two_port = port_craft(csp_data::PortSize::Small);
+        two_port.parts[0].dock_ports.push(csp_phys::DockPortSpec {
+            local_pos: DVec3::new(0.0, 0.0, -0.75),
+            local_dir: -DVec3::Z,
+            size: csp_data::PortSize::Small,
+        });
+        let base = DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0);
+        let v = DVec3::new(0.0, libm::sqrt(3.5316e12 / base.norm()), 0.0);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SpawnPhysicalVessel {
+                craft: port_craft(csp_data::PortSize::Small),
+                pos: base,
+                rot: DQuat::IDENTITY,
+                vel: v,
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SpawnPhysicalVessel {
+                craft: two_port,
+                pos: base + DVec3::new(0.0, 0.0, 1.8),
+                rot: flip_rot(),
+                vel: v,
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert_eq!(w.joints().len(), 1);
         step_until(&mut w, 192, |w| {
             w.joints().is_empty() && w.vessels().len() == 1
         });
-        assert_eq!(w.vessels()[&VesselId(0)].seams.len(), 1);
-        // A third vessel approaches the merged station's far side:
-        // its port faces −z (flip), the station's still-free port… the
-        // merged craft's port nodes: node 0 carries the primary port
-        // (now sealed), node 1 the secondary's. Give the newcomer a
-        // port and place it against the secondary side — re-docking
-        // needs a second port on the merged craft; the single-port
-        // boxes can't re-capture, so use a TWO-port secondary craft.
-        // Simpler honest check: the seam record round-trips through
-        // save/load instead (below) — here assert the merged body is
-        // one WeldedBody with the seam's subtree intact.
-        let v = &w.vessels()[&VesselId(0)];
-        assert_eq!(v.craft.as_ref().unwrap().graph.nodes.len(), 2);
-        assert_eq!(v.body().unwrap().part_index.len(), 2);
+        let merged = &w.vessels()[&VesselId(0)];
+        assert_eq!(merged.seams.len(), 1, "first latch = first seam");
+        assert_eq!(merged.craft.as_ref().unwrap().graph.nodes.len(), 2);
+
+        // The surviving free port is B's second spec on the seam's
+        // `port_b` node — read its world pose off the merged body,
+        // then pose vessel C's port face `gap` m off it, opposing.
+        let (port_w, dir_w, vel_w) = {
+            let v0 = &w.vessels()[&VesselId(0)];
+            let craft = v0.craft.as_ref().unwrap();
+            let body = v0.body().unwrap();
+            let node = v0.seams[0].port_b;
+            let part = &craft.parts[craft.graph.nodes[&node].effective_index as usize];
+            assert_eq!(part.dock_ports.len(), 2, "B's part keeps both port specs");
+            let spec = part.dock_ports[1];
+            let transforms = csp_phys::weld::body_transforms(&craft.graph, &craft.parts).unwrap();
+            let t = transforms[&node];
+            let dir = body.rot.rotate(t.apply_dir(spec.local_dir));
+            (
+                body.pos + body.rot.rotate(t.apply(spec.local_pos)),
+                dir / dir.norm(),
+                body.vel,
+            )
+        };
+        let gap = 0.3; // inside capture_range_m (0.5)
+        let rot_c = rot_facing_z_to(-dir_w);
+        // C's port face lands at `port_w + dir_w·gap`; its box extends
+        // away along +dir_w — clear of the merged hull.
+        let pos_c = port_w + dir_w * (gap + 0.75);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SpawnPhysicalVessel {
+                craft: port_craft(csp_data::PortSize::Small),
+                pos: pos_c,
+                rot: rot_c,
+                vel: vel_w,
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert_eq!(w.vessels().len(), 2);
+        assert_eq!(
+            w.joints().len(),
+            1,
+            "the free port must soft-capture the newcomer"
+        );
+        step_until(&mut w, 192, |w| {
+            w.joints().is_empty() && w.vessels().len() == 1
+        });
+        let merged = &w.vessels()[&VesselId(0)];
+        assert_eq!(
+            merged.seams.len(),
+            2,
+            "the second latch records a second seam on the one body"
+        );
+        assert_eq!(merged.craft.as_ref().unwrap().graph.nodes.len(), 3);
+        assert_eq!(merged.body().unwrap().part_index.len(), 3);
+        // The new seam straddles the station's B-node port and C's
+        // absorbed root — distinct from the first seam.
+        let (seam1, seam2) = (&merged.seams[0], &merged.seams[1]);
+        assert_ne!(seam1.seam_node, seam2.seam_node);
+        assert_eq!(seam2.port_a, seam1.port_b);
     }
 
     /// §7.2/§7.5: the seam record is serialized — a merged vessel
@@ -18627,7 +19157,7 @@ mod tests {
                     Behavior::Throttle(f) => {
                         io.issue(
                             SourceClass::Script,
-                            script.id.0 as u32,
+                            script.id.0.min(u64::from(u32::MAX)) as u32,
                             SimCommand::SetThrottle {
                                 vessel: script.vessel,
                                 throttle: *f,
@@ -18669,7 +19199,7 @@ mod tests {
                     Behavior::IssueAlarm => {
                         io.issue(
                             SourceClass::Script,
-                            script.id.0 as u32,
+                            script.id.0.min(u64::from(u32::MAX)) as u32,
                             SimCommand::SetAlarm {
                                 tick: tick + 1_000,
                                 label: "wake".to_string(),
@@ -18792,8 +19322,6 @@ mod tests {
             assert!(matches!(s.persist.get("n"), Some(PersistValue::Int(_))));
             let hash_before = w.state_hash().unwrap();
             let snap = w.snapshot().unwrap();
-            let orbits = PatchedConics::new(BTreeMap::new());
-            let _ = orbits;
             // Restore against the same construction config the test
             // world was built with.
             let mut w2 = World::restore(
@@ -18993,7 +19521,7 @@ mod tests {
                 ) -> Result<(), String> {
                     io.issue(
                         SourceClass::Autopilot,
-                        vessel.0 as u32,
+                        vessel.0.min(u64::from(u32::MAX)) as u32,
                         SimCommand::SetThrottle {
                             vessel,
                             throttle: 0.25,
@@ -19305,7 +19833,7 @@ mod tests {
             drain(&mut w);
             w.enqueue(
                 SourceClass::Script,
-                script.0 as u32,
+                script.0.min(u64::from(u32::MAX)) as u32,
                 SimCommand::SetThrottle {
                     vessel: VesselId(0),
                     throttle: 0.6,
@@ -19686,7 +20214,7 @@ mod tests {
             // lease's named holder.
             w.enqueue(
                 SourceClass::Script,
-                id.0 as u32,
+                id.0.min(u64::from(u32::MAX)) as u32,
                 SimCommand::UnloadScript { script: id },
             );
             let r = drain(&mut w);
@@ -19808,7 +20336,7 @@ mod tests {
                         self.issued.set(self.issued.get() + 1);
                         io.issue(
                             SourceClass::Script,
-                            script.id.0 as u32,
+                            script.id.0.min(u64::from(u32::MAX)) as u32,
                             SimCommand::SetThrottle {
                                 vessel: script.vessel,
                                 throttle: 0.5,

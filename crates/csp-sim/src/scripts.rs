@@ -497,6 +497,16 @@ pub trait TickIo {
     /// Enqueue a command for the *next* tick's drain under
     /// `(class, source_id)` — production order per source is
     /// preserved by the FIFO (§2.2.1).
+    ///
+    /// The `(class, source_id)` arguments are advisory: the io is
+    /// bound to exactly one producer and re-derives the stamp from
+    /// that binding (a script io stamps `(Script, its id)`, an
+    /// autopilot io `(Autopilot, its vessel)`). An honest engine
+    /// passes what the io would derive anyway; a mismatched stamp
+    /// is an engine bug — the sim's io debug-asserts on it and never
+    /// lets it reach the queue, so a guest cannot stamp `Ui` to
+    /// bypass the §2.2.1 lease gate or impersonate another
+    /// producer's channel.
     fn issue(&mut self, class: SourceClass, source_id: u32, command: SimCommand);
 
     /// Register `script`'s wake: resolve `condition` to a tick, drop
