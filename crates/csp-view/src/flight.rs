@@ -271,8 +271,17 @@ pub struct FlightBody {
     /// ascending `PartNodeId` — the M4c box tier's hull AABBs carried
     /// forward as `lo`/`hi` on each part.
     pub parts: Vec<FlightPart>,
-    /// Thrust sites `(local_pos, local_dir)` — plume emitters.
-    pub plumes: Vec<(DVec3, DVec3)>,
+    /// Live plume emitters `(local_pos, local_dir, delivered)` — only
+    /// the Thrust sites the sim still rates: each tick rewrites a
+    /// craft engine site's `rated_n` as `base·factor·coverage` (the
+    /// §3.4 derate times the pooled propellant coverage), so a dry or
+    /// misfired engine reads `0` and stages no emitter — a
+    /// dry-but-throttled craft (the `throttle` command survives the
+    /// dry-out) draws no exhaust. `delivered` is the site's live
+    /// share of its baseline rating — `emit_plumes` dims the column
+    /// by `throttle·delivered`, keying the effect to real delivered
+    /// thrust rather than the throttle command alone.
+    pub plumes: Vec<(DVec3, DVec3, f64)>,
     /// World-frame CoM (camera focus + HUD altitude).
     pub com: DVec3,
     /// `true` for a §2.6.4 surface-latched vessel — staged with its
@@ -734,8 +743,9 @@ struct LatchedWeld {
     key: u64,
     /// `WeldedBody::com_local` — `surface_pose_restore`'s CoM input.
     com_local: DVec3,
-    /// Thrust sites `(local_pos, local_dir)` — the plume emitters.
-    plumes: Vec<(DVec3, DVec3)>,
+    /// Live plume emitters `(local_pos, local_dir, delivered)` — see
+    /// [`FlightBody::plumes`]. A fresh baseline weld stages `1.0`.
+    plumes: Vec<(DVec3, DVec3, f64)>,
     /// `vessel_parts`' output over the welded hulls.
     parts: Vec<FlightPart>,
 }
@@ -863,12 +873,7 @@ pub fn capture_sync_input(
         match &vessel.state {
             VesselState::InBubble(body) => {
                 let parts = vessel_parts(vessel.craft.as_ref(), &body.collider.hulls, art);
-                let plumes = body
-                    .force_sites
-                    .iter()
-                    .filter(|s| s.kind == csp_phys::ForceSiteKind::Thrust)
-                    .map(|s| (s.local_pos, s.local_dir))
-                    .collect();
+                let plumes = live_plumes(vessel.craft.as_ref(), body);
                 // §3.7's plasma driver: the per-area convective input the
                 // M4b thermal tick itself integrates — same `flow_sample`,
                 // same `v_rel`, so the glow tracks the sim's heating, not
@@ -957,12 +962,12 @@ fn stage_latched(
     let key = craft_fingerprint(craft);
     if cache.entries.get(&id.0).is_none_or(|e| e.key != key) {
         let welded = csp_phys::weld(&craft.graph, &craft.parts).ok()?;
-        let plumes = welded
-            .force_sites
-            .iter()
-            .filter(|s| s.kind == csp_phys::ForceSiteKind::Thrust)
-            .map(|s| (s.local_pos, s.local_dir))
-            .collect();
+        // A fresh weld reads baseline `rated_n` on every site —
+        // `live_plumes` stages each at `delivered = 1` (and drops a
+        // baseline-dead site honestly). The parked craft's staged
+        // `throttle` is 0, so the emitters only matter the frame a
+        // throttle command unlatches it into the InBubble arm anyway.
+        let plumes = live_plumes(vessel.craft.as_ref(), &welded);
         cache.entries.insert(
             id.0,
             LatchedWeld {
@@ -1028,6 +1033,65 @@ fn vessel_tanks(vessel: &csp_sim::Vessel) -> Vec<FlightTank> {
             resource,
             units,
             capacity,
+        })
+        .collect()
+}
+
+/// One vessel's live plume emitters — `(local_pos, local_dir,
+/// delivered)` per Thrust site the sim still rates. Every tick the
+/// propellant bookkeeping rewrites a craft engine site's `rated_n` as
+/// `base·factor·coverage` (the §3.4 reliability derate times the
+/// pooled `min(1, avail/Σdemand)` coverage), so `rated_n > 0` is
+/// exactly "this site can deliver thrust now": a starved or misfired
+/// engine reads `0` and stages no emitter — the dry-but-throttled
+/// craft that used to keep its exhaust lit shows nothing. A
+/// craft-less (unmetered) body's sites never rescale, so they all
+/// stage — no consumption model exists to starve them.
+///
+/// `delivered` is the site's live share of its baseline rating — the
+/// factor·coverage product — so partial coverage shrinks the column
+/// instead of leaving it full-size. The baseline lookup walks
+/// `part_index`: each node's body site span indexes
+/// `craft.parts[eff].force_sites` in order, the same fold the sim's
+/// `apply_fuel_scales` writes through. Sites with no baseline
+/// (unmapped, or a baseline `rated_n` of `0`) stage at `1.0`.
+fn live_plumes(
+    craft: Option<&csp_sim::CraftDef>,
+    body: &csp_phys::WeldedBody,
+) -> Vec<(DVec3, DVec3, f64)> {
+    let mut base = vec![None; body.force_sites.len()];
+    if let Some(craft) = craft {
+        for (nid, w) in &body.part_index {
+            let Some(part) = craft
+                .graph
+                .nodes
+                .get(nid)
+                .and_then(|n| craft.parts.get(n.effective_index as usize))
+            else {
+                continue;
+            };
+            let start = w.site_start as usize;
+            let end = ((w.site_start + w.site_len) as usize).min(body.force_sites.len());
+            for (j, slot) in base[start..end].iter_mut().enumerate() {
+                *slot = part.force_sites.get(j).map(|s| s.rated_n);
+            }
+        }
+    }
+    body.force_sites
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| {
+            if s.kind != csp_phys::ForceSiteKind::Thrust
+                || !s.rated_n.is_finite()
+                || s.rated_n <= 0.0
+            {
+                return None;
+            }
+            let delivered = match base[i] {
+                Some(b) if b > 0.0 => (s.rated_n / b).clamp(0.0, 1.0),
+                _ => 1.0,
+            };
+            Some((s.local_pos, s.local_dir, delivered))
         })
         .collect()
 }
@@ -2129,14 +2193,23 @@ fn emit_plumes(
     let throttle = b.throttle.clamp(0.0, 1.0);
     const PLUME_RINGS: usize = 6;
     const PLUME_SEGS: usize = 16;
-    for (site, (p0, dir)) in b.plumes.iter().enumerate() {
+    for (site, (p0, dir, delivered)) in b.plumes.iter().enumerate() {
+        // Delivered-thrust fraction: the throttle command times the
+        // site's live share of rated force (factor·coverage — see
+        // [`FlightBody::plumes`]). A partially starved or derated
+        // engine reads a shorter, dimmer column; a fully dry one
+        // never staged an emitter at all.
+        let drive = (throttle * *delivered).clamp(0.0, 1.0);
+        if drive <= 0.0 {
+            continue;
+        }
         let dir_w = {
             let d = b.rot.rotate(*dir);
             d / d.norm()
         };
         let tip = b.pos + b.rot.rotate(*p0);
-        let len = 4.5 + 22.0 * throttle;
-        let exit_r = 0.30 + 0.38 * throttle;
+        let len = 4.5 + 22.0 * drive;
+        let exit_r = 0.30 + 0.38 * drive;
         let (u1, u2) = {
             let a = if dir_w.y.abs() < 0.9 {
                 DVec3::Y
@@ -2182,7 +2255,7 @@ fn emit_plumes(
                         rgb[0] as f32,
                         rgb[1] as f32,
                         rgb[2] as f32,
-                        (a_gain * fade * (0.25 + 0.75 * throttle)) as f32,
+                        (a_gain * fade * (0.25 + 0.75 * drive)) as f32,
                     ]
                 };
                 for i in 0..PLUME_SEGS {
@@ -2649,7 +2722,7 @@ mod tests {
             }],
             // Thrust site at the body origin, dir +Z: the fan tip sits
             // at the vessel, the 1.5 m-radius base ring 36 m along −Z.
-            plumes: vec![(DVec3::ZERO, DVec3::Z)],
+            plumes: vec![(DVec3::ZERO, DVec3::Z, 1.0)],
             com: DVec3::ZERO,
             latched: false,
             tanks: Vec::new(),

@@ -188,10 +188,15 @@ impl<'a> Rd<'a> {
             self.take(8)?.try_into().map_err(|_| "u64")?,
         ))
     }
-    fn inflate(&mut self) -> Result<Vec<u8>, String> {
-        let n = self.u64()? as usize;
+    /// Inflate the next `u64 len || deflate` payload, bounded at
+    /// `limit` — the exact byte count the entry's header implies, so
+    /// a payload cannot balloon past its declared shape (and a corrupt
+    /// header cannot size the allocation).
+    fn inflate(&mut self, limit: usize) -> Result<Vec<u8>, String> {
+        let n =
+            usize::try_from(self.u64()?).map_err(|_| "csar payload length overflow".to_string())?;
         let comp = self.take(n)?;
-        miniz_oxide::inflate::decompress_to_vec_zlib(comp)
+        miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(comp, limit)
             .map_err(|e| format!("csar inflate: {e:?}"))
     }
 }
@@ -221,30 +226,15 @@ fn decode(b: &[u8]) -> Result<Vec<(&str, Entry)>, String> {
         let name = String::from_utf8_lossy(r.take(nlen)?).into_owned();
         let name: &'static str = Box::leak(name.into_boxed_str());
         match kind {
-            1 => {
-                let (w, h) = (u32::from(r.u16()?), u32::from(r.u16()?));
-                let (layers, mips) = (u32::from(r.u8()?), u32::from(r.u8()?));
-                let mut means = Vec::with_capacity(layers as usize);
-                for _ in 0..layers {
-                    means.push(self_read4(&mut r)?);
-                }
-                let data = r.inflate()?;
-                out.push((
-                    name,
-                    Entry::Image(TerrainTex {
-                        w,
-                        h,
-                        layers,
-                        mips,
-                        means,
-                        data,
-                    }),
-                ));
-            }
+            1 => out.push((name, Entry::Image(read_image(&mut r)?))),
             2 => {
                 let (nv, ni) = (r.u32()? as usize, r.u32()? as usize);
-                let raw = r.inflate()?;
-                if raw.len() != nv * 32 + ni * 4 {
+                // u64 math — `nv * 32` alone overflows usize on 32-bit
+                // targets (wasm) for adversarial counts.
+                let expected = usize::try_from(nv as u64 * 32 + ni as u64 * 4)
+                    .map_err(|_| "mesh payload length overflow".to_string())?;
+                let raw = r.inflate(expected)?;
+                if raw.len() != expected {
                     return Err("mesh payload size mismatch".to_string());
                 }
                 let mut lo = [f32::MAX; 3];
@@ -309,6 +299,68 @@ fn decode(b: &[u8]) -> Result<Vec<(&str, Entry)>, String> {
 fn self_read4(r: &mut Rd<'_>) -> Result<[u8; 4], String> {
     let s = r.take(4)?;
     Ok([s[0], s[1], s[2], s[3]])
+}
+
+/// Read one kind-1 image entry's tail — `u16 w, u16 h, u8 layers,
+/// u8 mips, layers×4 means, u64 len || deflate`. The upload slices
+/// `data` mip-major on the header's word alone (csp-render
+/// `write_art_tex`), so the shape must be proven here: a payload that
+/// is not exactly `layers × Σ_l (w>>l)×(h>>l)×4` bytes is a decode
+/// error, not a startup panic — the same cross-check the mesh branch
+/// has always run.
+fn read_image(r: &mut Rd<'_>) -> Result<TerrainTex, String> {
+    let (w, h) = (u32::from(r.u16()?), u32::from(r.u16()?));
+    let (layers, mips) = (u32::from(r.u8()?), u32::from(r.u8()?));
+    let mut means = Vec::with_capacity(layers as usize);
+    for _ in 0..layers {
+        means.push(self_read4(r)?);
+    }
+    let expected = image_payload_len(w, h, layers, mips)?;
+    let data = r.inflate(expected)?;
+    if data.len() != expected {
+        return Err(format!(
+            "image payload size mismatch (want {expected} B, got {} B)",
+            data.len()
+        ));
+    }
+    Ok(TerrainTex {
+        w,
+        h,
+        layers,
+        mips,
+        means,
+        data,
+    })
+}
+
+/// The byte length an image entry's header implies — `layers` images
+/// of `(w>>l)×(h>>l)×4` RGBA8 per mip level, levels `0..mips`, the
+/// mip-major layout `write_art_tex` slices — plus the shape sanity
+/// the upload assumes: nonzero dims and layers, dims inside wgpu's
+/// 2-D texture limit, and a mip chain no deeper than `max(w, h)`
+/// supports (a header outside that is one no bake could produce —
+/// and `w >> level` for `level ≥ 32` would panic on its own).
+fn image_payload_len(w: u32, h: u32, layers: u32, mips: u32) -> Result<usize, String> {
+    const MAX_DIM: u32 = 8192; // wgpu's default max_texture_dimension_2d
+    if w == 0 || h == 0 || layers == 0 {
+        return Err(format!("degenerate image shape {w}x{h}x{layers}"));
+    }
+    if w > MAX_DIM || h > MAX_DIM {
+        return Err(format!("image {w}x{h} exceeds the {MAX_DIM} texture cap"));
+    }
+    // A mip chain can have at most floor(log2(max_dim)) + 1 levels
+    // (the bake's chain ends at 1×1 — anything deeper is corrupt).
+    let max_mips = 32 - w.max(h).leading_zeros();
+    if mips == 0 || mips > max_mips {
+        return Err(format!("bad mip count {mips} for {w}x{h}"));
+    }
+    let mut total = 0u64;
+    for l in 0..mips {
+        let lw = u64::from((w >> l).max(1));
+        let lh = u64::from((h >> l).max(1));
+        total += u64::from(layers) * lw * lh * 4;
+    }
+    usize::try_from(total).map_err(|_| "image payload length overflow".to_string())
 }
 
 /// The baked model key for a part — the def id wins when known
@@ -392,5 +444,66 @@ mod tests {
         let t = art.0.terrain.as_ref().unwrap();
         assert_eq!(t.albedo.layers, 4);
         assert!(t.water.mips > 4);
+    }
+
+    /// A minimal in-memory pack with one image entry — `w,h` level-0
+    /// dims, `layers`, `mips`, and `payload` as the INFLATED bytes.
+    fn image_pack(w: u16, h: u16, layers: u8, mips: u8, payload: &[u8]) -> Vec<u8> {
+        let mut pack = b"CSAR".to_vec();
+        pack.extend_from_slice(&2u32.to_le_bytes()); // version
+        pack.extend_from_slice(&1u32.to_le_bytes()); // n entries
+        pack.push(1); // kind: image
+        pack.push(3); // name len
+        pack.extend_from_slice(b"tex");
+        pack.extend_from_slice(&w.to_le_bytes());
+        pack.extend_from_slice(&h.to_le_bytes());
+        pack.push(layers);
+        pack.push(mips);
+        pack.extend_from_slice(&vec![9u8; layers as usize * 4]); // means
+        let comp = miniz_oxide::deflate::compress_to_vec_zlib(payload, 6);
+        pack.extend_from_slice(&(comp.len() as u64).to_le_bytes());
+        pack.extend_from_slice(&comp);
+        pack
+    }
+
+    /// A corrupt pack — a valid header whose payload inflates short of
+    /// the declared `w×h×layers×mips` shape — fails `decode` with an
+    /// error, not a panic: the upload slices `data` on the header's
+    /// word, so the cross-check must happen here (C12-F1).
+    #[test]
+    fn truncated_image_payload_errors_not_panics() {
+        // 64×64 ×1 layer ×2 mips wants 64·64·4 + 32·32·4 = 20480 B.
+        let pack = image_pack(64, 64, 1, 2, &[0u8; 16]);
+        assert!(decode(&pack).is_err());
+        // So does a payload that inflates PAST the declared shape.
+        let pack = image_pack(64, 64, 1, 2, &[0u8; 20481]);
+        assert!(decode(&pack).is_err());
+    }
+
+    /// A mip count deeper than `max(w,h)` supports is corrupt on its
+    /// face — `w >> level` for level ≥ 32 would panic before any
+    /// length check ran.
+    #[test]
+    fn absurd_mip_count_errors_not_panics() {
+        // 4×4 supports exactly 3 levels (4→2→1); 33 is nonsense.
+        let pack = image_pack(4, 4, 1, 33, &[0u8; 4096]);
+        assert!(decode(&pack).is_err());
+        let pack = image_pack(4, 4, 1, 0, &[]);
+        assert!(decode(&pack).is_err());
+    }
+
+    /// A well-formed small image entry still decodes — the shape math
+    /// accepts exactly the mip-major layout the bake writes.
+    #[test]
+    fn wellformed_image_entry_decodes() {
+        // 4×4 ×1 layer, full chain 4→2→1 = 3 levels: (16+4+1)×4 B.
+        let payload = vec![7u8; (16 + 4 + 1) * 4];
+        let pack = image_pack(4, 4, 1, 3, &payload);
+        let entries = decode(&pack).unwrap();
+        let [("tex", Entry::Image(tex))] = entries.as_slice() else {
+            panic!("expected one image entry, got {}", entries.len())
+        };
+        assert_eq!((tex.w, tex.h, tex.layers, tex.mips), (4, 4, 1, 3));
+        assert_eq!(tex.data, payload);
     }
 }

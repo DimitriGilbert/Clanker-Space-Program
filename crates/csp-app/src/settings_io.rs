@@ -397,6 +397,10 @@ pub fn save_settings(settings: &Settings) -> Result<(), String> {
 }
 
 /// The path-taking half of [`save_settings`] — what tests drive.
+/// Writes go through a sibling `*.tmp` file + rename — the dashboard
+/// store's discipline (csp-server `DashboardStore::save`): a crash
+/// mid-write leaves at worst a stray `settings.ron.tmp`, never a torn
+/// file the next boot has to salvage.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn save_settings_to(path: &Path, settings: &Settings) -> Result<(), String> {
     let pretty = ron::ser::PrettyConfig::new().struct_names(false);
@@ -405,7 +409,22 @@ pub fn save_settings_to(path: &Path, settings: &Settings) -> Result<(), String> 
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("settings dir {}: {e}", dir.display()))?;
     }
-    std::fs::write(path, text).map_err(|e| format!("settings write {}: {e}", path.display()))
+    let tmp = {
+        let mut t = path.as_os_str().to_owned();
+        t.push(".tmp");
+        PathBuf::from(t)
+    };
+    std::fs::write(&tmp, &text).map_err(|e| format!("settings write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        // Best-effort sweep of the orphaned temp file — the write
+        // already succeeded, so only the rename failed.
+        let _ = std::fs::remove_file(&tmp);
+        format!(
+            "settings rename {} -> {}: {e}",
+            tmp.display(),
+            path.display()
+        )
+    })
 }
 
 /// wasm: no filesystem — the session runs on defaults (the
@@ -705,4 +724,37 @@ pub fn event_label(event: &winit::event::KeyEvent) -> Option<(String, String)> {
         }
     }
     None
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// The tmp-file + rename write lands the target and leaves no
+    /// stray `*.tmp` — including the overwrite path where the file
+    /// already exists (`rename` must replace it atomically).
+    #[test]
+    fn save_is_tmp_plus_rename() {
+        let dir = std::env::temp_dir().join(format!("csp-settings-io-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.ron");
+        std::fs::write(&path, "stale").unwrap();
+        let s = Settings::default();
+        save_settings_to(&path, &s).unwrap();
+        assert_eq!(load_settings_from(&path), (s, Vec::new()));
+        assert!(
+            !dir.join("settings.ron.tmp").exists(),
+            "temp file must not survive the rename"
+        );
+        // Save again over an existing file — the replace path a
+        // crash-mid-write fix must not regress.
+        let mut s2 = Settings::default();
+        s2.audio.master_volume = 0.5;
+        save_settings_to(&path, &s2).unwrap();
+        assert_eq!(load_settings_from(&path), (s2, Vec::new()));
+        assert!(!dir.join("settings.ron.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -7308,6 +7308,14 @@ impl World {
                 direction,
             } => {
                 self.apply_soi_transition(*vessel, body, *direction, event.tick, shadow)?;
+                // §2.9: a debris Exit past the outermost SOI deletes
+                // the vessel in place — there is no conic left to
+                // rescan, and `schedule_next_soi` would Fatal on the
+                // unknown id (mirrors `apply_to_rails_at`'s
+                // post-`resolve_soi_residence` re-check).
+                if self.vessels.get(vessel).and_then(|v| v.orbit()).is_none() {
+                    return Ok(());
+                }
                 // The re-based conic's epoch is `event.tick`; the
                 // rescan's origin is `max(tick, clock)` — a rescan may
                 // never search the past for crossings.
@@ -11340,6 +11348,71 @@ mod tests {
         // The vessel ended up orbiting sol — the patched-conics stitch.
         let v = &w.vessels[&VesselId(0)];
         assert_eq!(v.orbit().unwrap().parent, BodyId::from("sol"));
+    }
+
+    /// C4a-F1 regression (§2.9): a debris vessel on an escape
+    /// hyperbola that exits a finite-*root* SOI is deleted outright by
+    /// `apply_soi_transition` — the firing arm must then NOT publish a
+    /// rescan for the removed id. Pre-fix the unconditional
+    /// `schedule_next_soi` returned `Fatal("soi schedule: unknown
+    /// vessel")`, the iteration rollback re-queued the same event, and
+    /// every later `step_frame` Err'd on it forever — the world was
+    /// bricked. A parentless body carrying `soi_m` is legal in a
+    /// hand-built `PatchedConics` (the channel `World::restore`/
+    /// `WorldConfig` accepts); the shipped home system's root simply
+    /// never exercises it (`soi_m: None`).
+    #[test]
+    fn debris_escape_past_root_soi_removes_without_fatal() {
+        // One root body — finite SOI (the verifier's 8.4e7), no parent.
+        let mut bodies = BTreeMap::new();
+        bodies.insert(
+            BodyId::from("sol"),
+            BodyOrbit {
+                mu_m3_per_s2: MU_SOLEN,
+                soi_m: Some(8.4e7),
+                parent: None,
+                elements: None,
+            },
+        );
+        let mut w = World::with_system(PatchedConics::new(bodies));
+        // The e = 1.5 / rp = 7e5 escape hyperbola — the scan publishes
+        // the Exit{sol} crossing ~5k ticks out.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SpawnVessel {
+                parent: BodyId::from("sol"),
+                elements: crossing_vessel_elements(),
+            },
+        );
+        w.step_frame(1).unwrap();
+        let id = VesselId(0);
+        assert!(
+            w.event_heap.iter().any(|e| matches!(
+                e.kind,
+                EventKind::SoiTransition {
+                    direction: SoiDirection::Exit,
+                    ..
+                }
+            )),
+            "the escape hyperbola must publish an Exit at the root SOI"
+        );
+        // §2.9's marker — breakup debris, deletable on the outermost
+        // exit.
+        w.vessels.get_mut(&id).unwrap().debris_since = Some(0);
+        // Drive past the crossing: the event deletes the vessel and
+        // the clock keeps going — pre-fix this Err(Fatal)'d and every
+        // subsequent step_frame re-fired the same event.
+        w.step_frame(20_000).unwrap();
+        assert_eq!(w.clock().ticks(), 20_000);
+        assert!(
+            !w.vessels().contains_key(&id),
+            "debris escape past the root SOI must remove the vessel"
+        );
+        // The brick was the repeat-fatal — prove the world still
+        // advances clean.
+        w.step_frame(30_000).unwrap();
+        assert_eq!(w.clock().ticks(), 30_000);
     }
 
     /// §2.6.5's opt-in: tracking a vessel promotes its PENDING

@@ -29,7 +29,9 @@
 //!   `libm` (every transcendental — `sin`, `cos`, `sqrt`, `exp`, `ln`,
 //!   `atan2`, … — resolves to libm, not the platform libm, so guest
 //!   math is bit-identical across targets). `on_progress`-counted
-//!   `set_max_operations` is the only budget.
+//!   `set_max_operations` bounds the op count;
+//!   `set_max_string_size`/`set_max_array_size`/`set_max_map_size`
+//!   bound per-op memory — together they are the sandbox budget.
 //!
 //! # The `ctx` contract
 //!
@@ -300,9 +302,18 @@ pub fn preprocess(source: &str) -> Result<(), String> {
     Scan {
         b: source.as_bytes(),
     }
-    .code(0, false)
+    .code(0, false, 0)
     .map(|_| ())
 }
+
+/// The gate's nesting bound: each `${…}` interpolation inside a
+/// backtick template descends one native stack frame in
+/// [`Scan::code`], so an unbounded `` "`${" * n `` source would
+/// overflow the host's stack (a `SIGSEGV`/abort no `catch_unwind`
+/// covers) before Rhai's own limits ever see the script. The cap is
+/// twice Rhai's default expression-depth limit (32) — far past any
+/// legitimate template — and rejects as an ordinary compile error.
+const MAX_TEMPLATE_DEPTH: usize = 64;
 
 /// The preprocessor's scanner state — `code` walks real tokens
 /// (skipping comments and literals), stopping early at a `}` that
@@ -315,10 +326,13 @@ impl Scan<'_> {
     /// Scan code from `i`. Returns the index where scanning stopped —
     /// EOF, or the `}` closing a `${…}` interpolation when
     /// `brace_stop`. `Err` is the §2.10 gate's rejection.
+    /// `template_depth` counts enclosing `${…}` interpolations — the
+    /// recursion is depth-capped at [`MAX_TEMPLATE_DEPTH`] so hostile
+    /// source cannot overflow the host stack.
     // The lexical state machine needs every branch in one place —
     // splitting it would hide the token-boundary invariants.
     #[allow(clippy::too_many_lines)]
-    fn code(&self, mut i: usize, brace_stop: bool) -> Result<usize, String> {
+    fn code(&self, mut i: usize, brace_stop: bool, template_depth: usize) -> Result<usize, String> {
         let b = self.b;
         // The last significant (non-whitespace, non-comment) byte seen
         // — `Some(b'.')` means the next identifier is a member access.
@@ -400,8 +414,14 @@ impl Scan<'_> {
                                 i += 2;
                             }
                             b'$' if b.get(i + 1) == Some(&b'{') => {
+                                if template_depth >= MAX_TEMPLATE_DEPTH {
+                                    return Err(format!(
+                                        "template `${{…}}` nested deeper than \
+                                         {MAX_TEMPLATE_DEPTH} levels"
+                                    ));
+                                }
                                 // `code` stops AT the closing `}`.
-                                i = self.code(i + 2, true)? + 1;
+                                i = self.code(i + 2, true, template_depth + 1)? + 1;
                             }
                             _ => {
                                 i += 1;
@@ -519,6 +539,22 @@ fn rhai_map_to_persist(map: &Map) -> Result<PersistMap, String> {
 // Effects + host
 // ---------------------------------------------------------------------------
 
+/// §2.10 sandbox memory ceilings. `set_max_operations` bounds only the
+/// op *count* — a guest `s = s + s` doubling loop allocates 2ⁿ bytes
+/// for ~n counted ops, so uncapped strings/arrays/maps OOM-kill the
+/// host inside the op budget (a non-deterministic abort — the worst
+/// fault class in the determinism domain). Rhai 1.27's defaults are
+/// unlimited; these pin real bounds. Over-limit growth raises a
+/// runtime fault the strike classifier already handles. Sizes are
+/// generous against the honest workload: `log` lines and telemetry
+/// strings are small, and `persist` is "a map of primitives".
+/// The string cap is in bytes.
+const MAX_SCRIPT_STRING_SIZE: usize = 1 << 20; // 1 MiB
+/// Max array elements — a tick's effects are dozens, not thousands.
+const MAX_SCRIPT_ARRAY_SIZE: usize = 10_000;
+/// Max object-map entries — `ctx`/`persist` carry tens of keys.
+const MAX_SCRIPT_MAP_SIZE: usize = 10_000;
+
 /// The tick's recorded effects — the registered Rhai functions write
 /// here; after the call the host drains them into the [`TickIo`]. The
 /// `Rc<RefCell<_>>` is Rhai's required capture discipline — never
@@ -573,6 +609,12 @@ impl RhaiHost {
         let mut engine = Engine::new();
         Self::register_libm_math(&mut engine);
         engine.set_max_operations(DEFAULT_SCRIPT_OP_BUDGET);
+        // The op budget bounds op count only — cap guest memory too,
+        // or a string/array doubling loop OOMs the host in ~34 ops
+        // (rhai 1.27's defaults are unlimited).
+        engine.set_max_string_size(MAX_SCRIPT_STRING_SIZE);
+        engine.set_max_array_size(MAX_SCRIPT_ARRAY_SIZE);
+        engine.set_max_map_size(MAX_SCRIPT_MAP_SIZE);
         let ops = Rc::new(RefCell::new(0_u64));
         let c = Rc::clone(&ops);
         engine.on_progress(move |n| {
@@ -1127,6 +1169,35 @@ mod tests {
         assert!(preprocess("fn on_tick(ctx) { let wait = 1; }").is_ok());
     }
 
+    /// C16-F1 regression: each `${` inside a backtick template
+    /// recurses one native stack frame in `Scan::code` — an uncapped
+    /// `` "`${" * n `` source overflowed the host stack (~20k reps
+    /// abort the process; ~10k on wasm's 1 MiB stack) before Rhai's
+    /// parser limits could engage. The depth cap rejects it as an
+    /// ordinary compile error.
+    #[test]
+    fn preprocess_caps_template_interpolation_depth() {
+        // The verifier's repro, scaled to the cap: unterminated input
+        // still rejects — the depth check fires before EOF matters.
+        let evil = "`${".repeat(MAX_TEMPLATE_DEPTH + 1);
+        assert!(preprocess(&evil).is_err());
+        // Nesting AT the cap still scans clean — the reject is the
+        // depth, not the template syntax.
+        let at_cap = format!(
+            "{}x{}",
+            "`${".repeat(MAX_TEMPLATE_DEPTH),
+            "}`".repeat(MAX_TEMPLATE_DEPTH)
+        );
+        assert!(preprocess(&at_cap).is_ok());
+        // One level past the cap, well-formed, rejects.
+        let over = format!(
+            "{}x{}",
+            "`${".repeat(MAX_TEMPLATE_DEPTH + 1),
+            "}`".repeat(MAX_TEMPLATE_DEPTH + 1)
+        );
+        assert!(preprocess(&over).is_err());
+    }
+
     /// §2.10's primitive-map round-trip; nested structures refuse.
     #[test]
     fn persist_conversions_are_primitives_only() {
@@ -1298,6 +1369,41 @@ mod tests {
         let mut io = StubIo::new();
         let r = host.run_tick(&mut s, 1, &mut io);
         assert_eq!(r.fault, Some(ScriptFault::BudgetExceeded), "{:?}", r.fault);
+    }
+
+    /// C16-F2 regression: `set_max_operations` counts ops, not bytes —
+    /// a doubling loop allocates 2ⁿ in ~n counted ops, so an uncapped
+    /// guest string/array OOM-killed the host inside the op budget
+    /// (~34 ops for 16 GiB). The `set_max_*_size` ceilings turn it
+    /// into an ordinary runtime fault (a strike), not an abort.
+    #[test]
+    fn host_memory_limits_fault_not_oom() {
+        let mut host = RhaiHost::new();
+        // ~a few hundred counted ops doubling a 16-byte string past
+        // the 1 MiB ceiling (crossed at iteration ~17).
+        let src = "fn on_tick(ctx) { let s = \"0123456789abcdef\"; let i = 0; \
+                   while i < 60 { s = s + s; i += 1; } }";
+        host.prepare(ScriptId(0), src).unwrap();
+        let mut s = script(src);
+        let mut io = StubIo::new();
+        let r = host.run_tick(&mut s, 1, &mut io);
+        assert!(
+            matches!(r.fault, Some(ScriptFault::Runtime(_))),
+            "over-limit string growth must fault, not abort the host: {:?}",
+            r.fault
+        );
+        // Same for arrays — `a += a` doubles the element count.
+        let src = "fn on_tick(ctx) { let a = [1]; let i = 0; \
+                   while i < 40 { a += a; i += 1; } }";
+        host.prepare(ScriptId(1), src).unwrap();
+        let mut s = script(src);
+        s.id = ScriptId(1);
+        let r = host.run_tick(&mut s, 1, &mut io);
+        assert!(
+            matches!(r.fault, Some(ScriptFault::Runtime(_))),
+            "over-limit array growth must fault, not abort the host: {:?}",
+            r.fault
+        );
     }
 
     /// Telemetry reaches the script through `ctx.vessel`.

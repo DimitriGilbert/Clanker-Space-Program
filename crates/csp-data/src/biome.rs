@@ -232,7 +232,11 @@ pub fn decode_indexed_png(bytes: &[u8]) -> Result<IndexedPng, &'static str> {
     };
     let palette_len = palette_len.ok_or("missing PLTE")?;
     let (w, h) = (width as usize, height as usize);
-    let raw = miniz_oxide::inflate::decompress_to_vec_zlib(&idat)
+    // Bounded inflate at the exact payload size — the header cap
+    // (≤2048×1024) keeps `(w + 1) * h` small, so an IDAT crafted to
+    // inflate past it fails here instead of ballooning into an OOM
+    // before `unfilter_scanlines` could check the length.
+    let raw = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&idat, (w + 1) * h)
         .map_err(|_| "IDAT zlib inflate failed")?;
     let indices = unfilter_scanlines(&raw, w, h)?;
     if indices.iter().any(|&i| i as usize >= palette_len) {
@@ -356,5 +360,34 @@ mod tests {
         let mut truncated = include_bytes!("../../../data/systems/home/terrin/biomes.png").to_vec();
         truncated.truncate(40);
         assert!(decode_indexed_png(&truncated).is_err());
+    }
+
+    /// A crafted IDAT that inflates past the declared image's payload
+    /// is refused at inflate — the bounded decompress caps the
+    /// allocation at `stride*h`, so a small compressed stream cannot
+    /// balloon into an OOM-sized buffer before the length check.
+    #[test]
+    fn decode_refuses_inflate_bomb() {
+        // The largest legal declaration (2048×1024) — its payload cap
+        // is (2048+1)*1024 ≈ 2.1 MB; a stream inflating past that must
+        // error, not allocate.
+        let payload = vec![0u8; (2048 + 1) * 1024 + 1];
+        let idat = miniz_oxide::deflate::compress_to_vec_zlib(&payload, 6);
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut chunk = |kind: &[u8; 4], data: &[u8]| {
+            png.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            png.extend_from_slice(kind);
+            png.extend_from_slice(data);
+            png.extend_from_slice(&[0; 4]); // CRC — the decoder does not check it
+        };
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&2048u32.to_be_bytes());
+        ihdr.extend_from_slice(&1024u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 3, 0, 0, 0]); // 8-bit palette, no interlace
+        chunk(b"IHDR", &ihdr);
+        chunk(b"PLTE", &[0, 0, 0]);
+        chunk(b"IDAT", &idat);
+        chunk(b"IEND", &[]);
+        assert!(decode_indexed_png(&png).is_err());
     }
 }

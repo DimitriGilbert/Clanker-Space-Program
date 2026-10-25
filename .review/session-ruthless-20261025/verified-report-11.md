@@ -1,0 +1,48 @@
+# Verified Report 11 — csp-render renderers + WGSL graphics review
+
+Verified 2026-10-25 against working tree @ `1e8c6da` ("fix(render): procedural sky + real authored rocket parts", 14:08). The mid-edit terrain.wgsl/terrain.rs state flagged in the original report landed as that commit; tree is now clean and `cargo check -p csp-render` passes. The commit only replaced the equirect star texture with a procedural shell-lattice starfield (bindings 7/8 removed, sampler moved to 7) — it touched none of the nine findings. Net line shifts from it: terrain.rs cites move ~-7, terrain.wgsl sky-region cites move ~+26.
+
+### Finding 1: No anti-aliasing anywhere in the pipeline — CONFIRMED
+**Original**: All four renderers use `MultisampleState::default()` (sample_count 1), no MSAA surface, no post-process AA.
+**Verification**: Current sites: terrain.rs:911, flight.rs:134, vab.rs:166, map.rs:119 — all `multisample: wgpu::MultisampleState::default()`. Workspace-wide grep for `sample_count` finds only `1` values (texture/view descriptors: flight.rs:147,197, vab.rs:406, terrain.rs:771 — none on pipelines). Grep for fxaa/taa/post-process across all crates: zero hits. No offscreen scene target exists (no `create_texture` in csp-app/src/lib.rs or csp-view); both frame passes use `resolve_target: None` (csp-app/src/lib.rs:1268, 1338). Frame is exactly scene pass (lib.rs:1264-1323) + egui pass (lib.rs:1334-1352). Map's in-shader analytic AA contrast claim also verified (map.wgsl:36-46 smoothstep ring/disc edges). Terrain cite shifted 918→911 from the concurrent commit; substance unchanged.
+
+### Finding 2: Craft lighting ignores the atmosphere — CONFIRMED
+**Original**: flight.wgsl lights with raw `light.sun_col.rgb`; terrain attenuates sun through the LUT + aerial perspective; CPU bakes a constant sun color.
+**Verification**: flight.wgsl:91 `var rgb = i.color.rgb * (amb + light.sun_col.rgb * max(ndl, 0.0));` and :98 spec term — no transmittance read anywhere in flight.wgsl. CPU side: csp-view/src/flight.rs:2410 `sun_col: [0.95, 0.92, 0.85, 0.0],` — constant, rebuilt every frame in `build_packet` (flight.rs:2398-2415), with the comment claiming parity with the terrain pass via "same sun direction" (direction matches, color does not). Terrain contrast verified: terrain.wgsl:702-707 `sun_lum = sun_lum * trans(alt_b, dot(sun, dir))` (has_atmo-gated) and :726-736 `col = col * t_view + view_inscatter(...)` aerial perspective. Note the divergence is small in vacuum (terrain base [1.0,0.98,0.92] vs craft [0.95,0.92,0.85]) and grows exactly in the sunset/reentry scenarios the finding describes. PartLight struct (csp-render lib.rs:33-44) carries only sun_dir/sun_col/amb/hemi — no atmo term exists to apply.
+
+### Finding 3: Translucent ocean writes depth before the craft draws — CONFIRMED
+**Original**: Alpha-blended ocean (0.62-1.0) shares a depth-writing pipeline with terrain, drawn in one instanced call before the craft pass.
+**Verification**: terrain.wgsl:578/659 — water alpha `clamp(0.62 + 0.38 * (depth / 25.0), 0.62, 1.0)`, blended via `BlendState::ALPHA_BLENDING` on the terrain pipe (terrain.rs:921-926). Single shared `depth_state` with `depth_write_enabled: Some(true)`, `Greater` (terrain.rs:963-967) used by the one terrain pipeline both kinds ride ("Terrain + ocean share the mesh and pipeline — one instanced draw", terrain.rs:1390-1395, concat + `draw_indexed` at :1396-1405; kind discriminator in `dir0_kind.w`, terrain.rs:392-393 — the suggested split is viable as described). App order: csp-app/src/lib.rs:1319 `t.draw(...)` (sky, terrain, ocean) then :1321 `f.draw(...)` (craft). Flight pipeline tests `GreaterEqual` with writes (flight.rs:99-107) against the same depth attachment — a hull fragment below the waterline is farther (smaller reverse-Z z) than the ocean surface depth already written, so it is rejected rather than blended-through. Cites shifted: depth state 970→963, draw 1416-1429→1390-1405.
+
+### Finding 4: Aerial perspective is a 5-step un-jittered march — CONFIRMED
+**Original**: `view_inscatter` uses `steps = 5.0` fixed midpoint lattice; the sky march next to it uses 20 steps + per-pixel jitter explicitly to kill banding.
+**Verification**: terrain.wgsl:246-248 `let steps = 5.0; let ds = dist / steps;` with sample points `pa + ray * (dist * (i + 0.5) / steps)` — no jitter term. Sky march: terrain.wgsl:880-883 `// 20 jittered steps — the per-pixel phase offset breaks the banding a fixed lattice leaves in the thin shell. let steps = 20.0; let jit = screen_hash(i.ndc);` applied at :893 `t0 + (s + 0.05 + jit * 0.9) * ds`. The in-file comment is an explicit admission of the artifact class. Cites shifted +26 (854-858/867→880-893) by the concurrent commit; `view_inscatter` itself untouched.
+
+### Finding 5: No uncaptured-error or device-lost handling — CONFIRMED
+**Original**: `Gpu::new` never installs `on_uncaptured_error`; a validation error panics, a lost device is unhandled.
+**Verification**: lib.rs:147-153 bare `request_device(&wgpu::DeviceDescriptor {...})`; workspace-wide grep for `on_uncaptured_error|push_error_scope|pop_error_scope|DeviceLost|on_lost` returns zero hits in any crate. `begin_frame` (lib.rs:213-251) handles all `get_current_texture` outcomes with warn-once + Reconfigure/Skip — the report's praise of that path is accurate — but `submit()` (lib.rs:258-261) assumes a live device. PLAN.md:896 indeed classes presentation-only faults as `Cosmetic`: "log once, placeholder, continue" — wgpu's default uncaptured-error handler (panic) contradicts the project's own policy.
+
+### Finding 6: VAB pass skips the tone map flight applies — CONFIRMED
+**Original**: Identical lighting models, but vab.wgsl returns raw RGB while flight.wgsl tone-maps.
+**Verification**: vab.wgsl:82 `return vec4<f32>(rgb, i.color.a);` vs flight.wgsl:103 `return vec4<f32>(tone_map(rgb), i.color.a);`. Lighting lines are structurally identical (vab.wgsl:74-81 vs flight.wgsl:91-102: same ambient/sun/Blinn/fresnel sequence), and flight.wgsl:27-31 documents the ACES fit as deliberate parity with the terrain pass. Line cites exact.
+
+### Finding 7: `TerrainTex::means` decoded but never used; mean re-derived via unenforced 1x1-mip invariant — CONFIRMED (one cite corrected)
+**Original**: `means` is dead payload; `class_albedo` loads deepest-mip (0,0) as the mean, which is only correct because bake_art chains mips to 1x1.
+**Verification**: terrain.rs:536 `pub means: Vec<[u8; 4]>`; decoded at csp-view/src/art.rs:227-239; grep for any read of `.means` outside decode/construction: zero. Shader side terrain.wgsl:493-499: `let last = i32(textureNumLevels(alb_arr)) - 1; let mean = textureLoad(alb_arr, vec2<i32>(0, 0), layer, last).rgb;`. Bake side verified: `image_entry` computes per-layer means AND loops `downsample` until `cw == 1 && ch == 1` (xtask/src/bin/bake_art.rs:489-530, box average at :458-483). CITATION CORRECTION: the original cited bake_art.rs:794-808, but the file is 596 lines — the mip chain lives at 489-530. Nuance: the invariant is not fully "undocumented" — terrain.wgsl:483-485 says "the deepest mip IS the mean" — but it is enforced nowhere (no assert in `write_art_tex`/`TerrainTex`), and `means` remains dead bytes in every packet. Core claim stands.
+
+### Finding 8: Surface-format fallback silently picks non-sRGB — CONFIRMED
+**Original**: `find(is_srgb).unwrap_or(caps.formats[0])` with no warning; linear-output shaders would render ~2.2x dark.
+**Verification**: lib.rs:160-161 `.find(|f| f.is_srgb()) / .unwrap_or(caps.formats[0]);` and lib.rs:171 `alpha_mode: caps.alpha_modes[0],` — no `log::warn!` or fallback logic anywhere in `Gpu::new`. All five pipelines take `surface_format` and output linear (terrain/flight/vab tone-map in-shader expecting hardware sRGB encode), so the double-dark scenario is real if a backend ever reports no sRGB format.
+
+### Finding 9: Per-frame instance staging Vec in the terrain hot path — CONFIRMED
+**Original**: Fresh `Vec::with_capacity` + two `extend_from_slice` per frame to concat terrain+ocean.
+**Verification**: terrain.rs:1394-1398 (shifted from 1419-1424): `let mut inst = Vec::with_capacity(n_inst); inst.extend_from_slice(&packet.terrain); inst.extend_from_slice(&packet.ocean);` every draw, plus full-range `queue.write_buffer` in `GpuBuffer::upload` (lib.rs:93-96). `TerrainInstance` is 5x[f32;4] = 80 B (terrain.rs:385-397); instance buffer sized for 4096 (terrain.rs:1017-1021); LOD budget `max_patches: 2048` (terrain.rs:267) — the ~160 KB/frame figure at budget checks out. The GPU buffer is grow-only; only the CPU-side Vec churns. LOW severity is right.
+
+---
+
+### PLAN-claims vs reality — all three verified
+- **"PBR parts" (PLAN.md:1418) vs Blinn-Phong**: CONFIRMED. flight.wgsl:72-104 is hemisphere ambient x baked AO + Lambert sun + Blinn spec + fresnel rim; `mat` vertex attribute carries spec-strength/exponent/occlusion only (flight.wgsl:50, vab.wgsl:74-79) — no metalness/roughness channel anywhere in csp-render.
+- **"shadow cascades" (PLAN.md:1419) vs blob**: CONFIRMED. terrain.wgsl:400-415 is a Gaussian contact-shadow blob (0.55 peak, altitude fade) + `sun_occlusion` 5-tap heightfield march (terrain.wgsl:369-394); grep for "shadow" in flight.wgsl/vab.wgsl: zero hits — parts receive no shadows at all.
+- **"Precomputed-LUT scattering" (PLAN.md:1354, 1420) is real**: CONFIRMED. `bake_transmittance(atmo, beta: [f64; 3])` (terrain.rs:640), endpoint-centered LUT, and a test-module CPU mirror of the WGSL `trans` bilinear whose doc explicitly says "Keeping this mirror in the test is what locks the bake and the shader to the same convention" (terrain.rs tests ~1517-1530).
+
+**Summary: 9 confirmed, 0 dismissed, 0 fixed-by-concurrent-edit.**

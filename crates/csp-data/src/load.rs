@@ -137,6 +137,14 @@ pub enum LoadError {
         /// The offending name.
         name: String,
     },
+    /// A symlink sits inside a scanned registry directory — the walk
+    /// refuses it rather than traverse, the same boundary
+    /// [`crate::datahash`]'s collect draws: a link's target could live
+    /// outside the `dir` the caller handed the loader.
+    Symlink {
+        /// The link.
+        path: PathBuf,
+    },
 }
 
 impl fmt::Display for LoadError {
@@ -158,6 +166,9 @@ impl fmt::Display for LoadError {
                 "{}: unsafe authored name {name:?} — not a single-segment relative name",
                 path.display()
             ),
+            Self::Symlink { path } => {
+                write!(f, "symlink in the data tree at {}", path.display())
+            }
         }
     }
 }
@@ -167,7 +178,9 @@ impl std::error::Error for LoadError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Ron { source, .. } => Some(source),
-            Self::UnsupportedSchemaVersion { .. } | Self::UnsafeName { .. } => None,
+            Self::UnsupportedSchemaVersion { .. }
+            | Self::UnsafeName { .. }
+            | Self::Symlink { .. } => None,
         }
     }
 }
@@ -828,7 +841,19 @@ fn gather_ron_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), LoadError>
         })?;
     for entry in entries {
         let path = entry.path();
-        if path.is_dir() {
+        // `file_type` does not follow symlinks: a link under `dir` is
+        // refused, not traversed — its target could live outside the
+        // directory the caller handed the loader (the same refusal
+        // `datahash::collect` makes over the hashed tree, where
+        // `Path::is_dir` would otherwise happily follow it).
+        let ft = entry.file_type().map_err(|source| LoadError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        if ft.is_symlink() {
+            return Err(LoadError::Symlink { path });
+        }
+        if ft.is_dir() {
             gather_ron_files(&path, out)?;
         } else if path.extension().is_some_and(|ext| ext == "ron") {
             out.push(path);
@@ -1026,5 +1051,23 @@ mod tests {
         let src = EmbeddedSource::new(&[]);
         let loaded = load_parts_from(&src, Path::new("data/parts")).unwrap();
         assert!(loaded.parts.is_empty());
+    }
+
+    /// A symlink inside a scanned registry dir is refused, not
+    /// followed — a link pointing out of `data/` would escape the
+    /// directory the loader was handed (parity with
+    /// `datahash::collect`, which refuses the same way). Unix-only:
+    /// symlink creation needs privileges on Windows.
+    #[cfg(unix)]
+    #[test]
+    fn gather_refuses_symlinks() {
+        let root = std::env::temp_dir().join(format!("csp-load-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("real.ron"), b"").unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", root.join("link.ron")).unwrap();
+        let err = FsDataSource.ron_files(&root).unwrap_err();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(matches!(err, LoadError::Symlink { .. }), "{err:?}");
     }
 }
