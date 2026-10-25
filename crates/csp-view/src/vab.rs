@@ -766,6 +766,12 @@ pub(crate) fn extract_vab(
         craft_epoch: vab.0.craft_epoch(),
         ..VabPacket::default()
     };
+    // The editor environment — emitted BEFORE the craft so the parts
+    // depth-resolve over it: a backdrop gradient (97.8% of the frame
+    // was a dead void), a lit hangar floor under the craft's lowest
+    // extent, a soft contact blob grounding the craft, and a
+    // reference grid (vision-report VAB-3.1). All unpickable.
+    emit_environment(&mut packet.vertices, &cam.0, &scene);
     let mut tris = Vec::new();
     for p in &scene.parts {
         // The selection outline: an inflated copy of the silhouette
@@ -809,6 +815,195 @@ pub(crate) fn extract_vab(
         emit_octa(&mut packet.vertices, &cam.0, *pos, marker_m, *color);
     }
     frame.0 = Some(packet);
+}
+
+/// The VAB studio environment (vision-report 3.1 — the craft floated
+/// in a 97.8%-uniform void): a far-plane backdrop gradient, a lit
+/// floor disc fading at its rim, a soft contact blob under the craft,
+/// and a Cartesian reference grid. Everything is emitted into the
+/// same vertex stream before the parts (pick id 0 — unpickable) and
+/// resolves through the shared depth test, so orbiting under the
+/// floor shows its underside like a real floor does.
+#[allow(clippy::too_many_lines)] // one environment assembly pass; splitting fragments the scene
+fn emit_environment(verts: &mut Vec<VabVertex>, cam: &MapCameraF64, scene: &VabScene) {
+    // Backdrop: a two-stop vertical gradient quad pinned just inside
+    // the far plane (NDC z = 1e-5 — the VAB depth test is `Greater`
+    // against a 0.0 clear, so z = 0 itself can never pass). Unlit:
+    // these are authored colors, not lit material.
+    let zenith = [0.028, 0.034, 0.058, 1.0];
+    let nadir = [0.010, 0.012, 0.024, 1.0];
+    for (pos, color) in [
+        ([-1.0f32, -1.0, 1e-5], nadir),
+        ([1.0, -1.0, 1e-5], nadir),
+        ([1.0, 1.0, 1e-5], zenith),
+        ([-1.0, -1.0, 1e-5], nadir),
+        ([1.0, 1.0, 1e-5], zenith),
+        ([-1.0, 1.0, 1e-5], zenith),
+    ] {
+        verts.push(unlit_v(pos, color, 0));
+    }
+
+    // The floor sits just under the craft's lowest hull point so the
+    // stack reads as standing on it; an empty craft gets a default
+    // apron under the origin.
+    let mut min_z = f64::INFINITY;
+    for p in &scene.parts {
+        let (lo, hi) = p.shape.local_aabb();
+        for x in [lo.x, hi.x] {
+            for y in [lo.y, hi.y] {
+                for z in [lo.z, hi.z] {
+                    min_z = min_z.min(p.transform.apply(DVec3::new(x, y, z)).z);
+                }
+            }
+        }
+    }
+    let extent = scene.extent_m.max(1.0);
+    let floor_z = if min_z.is_finite() {
+        min_z - (0.02 * extent).max(0.01)
+    } else {
+        scene.center.z - extent * 1.2
+    };
+    let c = scene.center;
+    // One floor triangle — all three corners must project (the same
+    // all-or-nothing rule `emit_part` uses); emitted LIT so the apron
+    // shades under the packet's studio light like the parts do.
+    let emit_floor_tri = |verts: &mut Vec<VabVertex>, world: [DVec3; 3], alpha: [f32; 3]| {
+        let [Some(c0), Some(c1), Some(c2)] =
+            world.map(|q| project_into(&cam.view_proj, cam.eye, q))
+        else {
+            return;
+        };
+        for (k, q) in world.iter().enumerate() {
+            let rel = *q - cam.eye;
+            verts.push(VabVertex {
+                pos: [c0, c1, c2][k],
+                world: f3(rel),
+                nrm: [0.0, 0.0, 1.0],
+                color: [0.115, 0.125, 0.160, alpha[k]],
+                mat: [0.04, 8.0, 0.9],
+                pick: 0,
+            });
+        }
+    };
+
+    // Lit floor disc — a center fan plus an outer ring whose alpha
+    // fades to nothing so the apron melts into the backdrop instead
+    // of hard-clipping at its rim.
+    const SEGS: usize = 48;
+    let r_in = (extent * 3.0).clamp(6.0, 300.0);
+    let r_out = r_in * 1.8;
+    let ring = |r: f64, i: usize| {
+        let t = (i % SEGS) as f64 * std::f64::consts::TAU / SEGS as f64;
+        DVec3::new(c.x + r * t.cos(), c.y + r * t.sin(), floor_z)
+    };
+    for i in 0..SEGS {
+        emit_floor_tri(
+            verts,
+            [
+                DVec3::new(c.x, c.y, floor_z),
+                ring(r_in, i),
+                ring(r_in, i + 1),
+            ],
+            [1.0, 1.0, 1.0],
+        );
+    }
+    // Fade ring — same lit shading, alpha 1 → 0 across the rim.
+    for i in 0..SEGS {
+        emit_floor_tri(
+            verts,
+            [ring(r_in, i), ring(r_out, i), ring(r_out, i + 1)],
+            [1.0, 0.0, 0.0],
+        );
+        emit_floor_tri(
+            verts,
+            [ring(r_in, i), ring(r_out, i + 1), ring(r_in, i + 1)],
+            [1.0, 0.0, 1.0],
+        );
+    }
+    // Contact blob — an unlit alpha-gradient fan a few millimetres
+    // over the floor, grounding the craft the way the terrain pass's
+    // blob shadow does on the pad.
+    let blob_r = extent * 1.05;
+    let z_blob = floor_z + 0.004;
+    for i in 0..SEGS {
+        let t0 = (i % SEGS) as f64 * std::f64::consts::TAU / SEGS as f64;
+        let t1 = ((i + 1) % SEGS) as f64 * std::f64::consts::TAU / SEGS as f64;
+        let world = [
+            DVec3::new(c.x, c.y, z_blob),
+            DVec3::new(c.x + blob_r * t0.cos(), c.y + blob_r * t0.sin(), z_blob),
+            DVec3::new(c.x + blob_r * t1.cos(), c.y + blob_r * t1.sin(), z_blob),
+        ];
+        let [Some(c0), Some(c1), Some(c2)] =
+            world.map(|q| project_into(&cam.view_proj, cam.eye, q))
+        else {
+            continue;
+        };
+        for (k, a) in [0.42f32, 0.0, 0.0].iter().enumerate() {
+            verts.push(unlit_v([c0, c1, c2][k], [0.0, 0.0, 0.02, *a], 0));
+        }
+    }
+
+    // Reference grid — thin unlit quads on the plane; line spacing is
+    // a round fraction of the craft extent so it reads at any scale.
+    let z_grid = floor_z + 0.007;
+    let spacing = {
+        let s = extent / 6.0;
+        let p = s.log10().floor();
+        let m = s / 10f64.powf(p);
+        let m = if m < 1.5 {
+            1.0
+        } else if m < 3.5 {
+            2.0
+        } else if m < 7.5 {
+            5.0
+        } else {
+            10.0
+        };
+        m * 10f64.powf(p)
+    };
+    let half = r_in * 0.55;
+    let w = (extent * 0.004).clamp(0.004, 0.05);
+    let n_lines = (half / spacing).floor() as i32;
+    for i in -n_lines..=n_lines {
+        let off = i as f64 * spacing;
+        let major = i == 0 || i % 5 == 0;
+        let col = if major {
+            [0.36, 0.44, 0.62, 0.55]
+        } else {
+            [0.26, 0.32, 0.46, 0.28]
+        };
+        for (a, b) in [
+            (
+                DVec3::new(c.x + off - w, c.y - half, z_grid),
+                DVec3::new(c.x + off + w, c.y + half, z_grid),
+            ),
+            (
+                DVec3::new(c.x - half, c.y + off - w, z_grid),
+                DVec3::new(c.x + half, c.y + off + w, z_grid),
+            ),
+        ] {
+            let q = [
+                a,
+                DVec3::new(b.x, a.y, a.z),
+                b,
+                a,
+                b,
+                DVec3::new(a.x, b.y, a.z),
+            ];
+            let mut clip = [None; 6];
+            let mut all = true;
+            for (k, p) in q.iter().enumerate() {
+                clip[k] = project_into(&cam.view_proj, cam.eye, *p);
+                all &= clip[k].is_some();
+            }
+            if !all {
+                continue;
+            }
+            for c in clip {
+                verts.push(unlit_v(c.unwrap_or([0.0; 3]), col, 0));
+            }
+        }
+    }
 }
 
 /// `DVec3` → f32 triple — the camera-relative world position and

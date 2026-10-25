@@ -25,6 +25,7 @@ struct U {
     biome_colors: array<vec4<f32>, 16>,
     shadow: vec4<f32>,        // xyz vessel-shadow anchor dir (inertial, unit), w blob radius (m, 0 = off)
     art: vec4<f32>,           // x real-texture flag (0 = procedural fallback), y clock s, z/w unused
+    class_means: array<vec4<f32>, 4>, // per-class mean LINEAR albedo (pack header — single source of truth)
 };
 
 @group(0) @binding(0) var<uniform> u: U;
@@ -229,10 +230,17 @@ fn trans_between(ha: f32, hb: f32, mua: f32, mub: f32) -> vec3<f32> {
     return clamp(trans(ha, mua) / max(tb, vec3<f32>(1.0e-4)), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
+// Per-pixel march jitter — decorrelates the fixed step lattice so the
+// aerial-perspective integral doesn't band (the same trick fs_sky's
+// 20-step march already pulls).
+fn screen_hash(px: vec2<f32>) -> f32 {
+    return fract(sin(dot(px, vec2<f32>(12.9898, 78.233))) * 43758.5453);
+}
+
 // Analytic single-scatter along the eye→frag segment: N midpoint
 // samples of  β·P_r(μ_sun)·T(eye→s)·T(s→sun)·ρ(s)  (the §5.1 Baseline
 // "analytic single-scatter" — no inscatter LUT).
-fn view_inscatter(pa: vec3<f32>, pb: vec3<f32>, ray: vec3<f32>, dist: f32) -> vec3<f32> {
+fn view_inscatter(pa: vec3<f32>, pb: vec3<f32>, ray: vec3<f32>, dist: f32, px: vec2<f32>) -> vec3<f32> {
     let R = u.planet.x;
     let H = max(u.atmo.x, 1.0);
     let Hm = max(H * 0.30, 1.0); // aerosol hugging the surface harder
@@ -243,10 +251,15 @@ fn view_inscatter(pa: vec3<f32>, pb: vec3<f32>, ray: vec3<f32>, dist: f32) -> ve
     let mua = dot(ray, pa / max(length(pa), 1.0));
     var acc = vec3<f32>(0.0);
     var acc_m = vec3<f32>(0.0);
-    let steps = 5.0;
+    // 12 jittered steps — the old fixed 5-step lattice banded the
+    // inscatter integral into visible shells on long view segments;
+    // the per-pixel phase offset breaks the bands the same way the
+    // sky march's jitter does.
+    let steps = 12.0;
+    let jit = screen_hash(px);
     let ds = dist / steps;
     for (var i = 0.0; i < steps; i = i + 1.0) {
-        let p = pa + ray * (dist * (i + 0.5) / steps);
+        let p = pa + ray * ((i + 0.05 + jit * 0.9) * ds);
         let alt_i = max(length(p) - R, 0.0);
         let up = p / max(length(p), 1.0);
         let t_ei = trans_between(alt_a, alt_i, mua, dot(ray, up));
@@ -479,21 +492,22 @@ fn class_tile(layer: i32) -> f32 {
     return 16.0;                      // snow
 }
 
-// One class's normalized albedo detail: texel ÷ layer mean (the
-// deepest mip IS the mean — the detail pattern survives while the
-// authored palette keeps the hue), blended across the two dominant
-// projection planes. The mean floor has to sit BELOW every layer's
-// actual per-channel mean (the rock class averages ~0.01 linear, the
-// grass blue channel ~0.012): at the old 0.05 floor the dark layers
-// divided by ~5× their own mean, so the pattern's bright veins hit
-// the downstream detail clamp as isolated white streaks while the
-// rest of the layer went mud-dark.
+// One class's normalized albedo detail: texel ÷ layer mean, blended
+// across the two dominant projection planes. The mean comes from the
+// pack header (u.class_means — the bake's exact level-0 average,
+// sRGB→linear), NOT the deepest mip: the header row is the single
+// source of truth, and the per-level floor bias in the mip chain no
+// longer reaches the shader at all. The mean floor has to sit BELOW
+// every layer's actual per-channel mean (the rock class averages
+// ~0.01 linear, the grass blue channel ~0.012): at the old 0.05
+// floor the dark layers divided by ~5× their own mean, so the
+// pattern's bright veins hit the downstream detail clamp as isolated
+// white streaks while the rest of the layer went mud-dark.
 fn class_albedo(p: PlaneUV, layer: i32) -> vec3<f32> {
     let k = u.planet.x / class_tile(layer);
     let ta = textureSample(alb_arr, samp, p.a * k, layer).rgb;
     let tb = textureSample(alb_arr, samp, p.b * k, layer).rgb;
-    let last = i32(textureNumLevels(alb_arr)) - 1;
-    let mean = textureLoad(alb_arr, vec2<i32>(0, 0), layer, last).rgb;
+    let mean = u.class_means[layer].rgb;
     return mix(ta, tb, p.wb) / max(mean, vec3<f32>(0.008, 0.008, 0.008));
 }
 
@@ -728,7 +742,7 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
         let mua = dot(ray, pa / max(length(pa), 1.0));
         let mub = dot(ray, pb / max(length(pb), 1.0));
         let t_view = trans_between(alt_a, alt_b, mua, mub);
-        col = col * t_view + view_inscatter(pa, pb, ray, dist);
+        col = col * t_view + view_inscatter(pa, pb, ray, dist, i.clip.xy);
     }
     return vec4<f32>(tone_map(col), alpha);
 }
@@ -751,12 +765,6 @@ fn vs_sky(@builtin(vertex_index) vi: u32) -> Vs {
     o.ndc = p[vi];
     o.clip = vec4<f32>(p[vi], 0.0, 1.0); // z = 0: reverse-Z far plane
     return o;
-}
-
-// Per-pixel march jitter — decorrelates the fixed step lattice so the
-// shell gradient doesn't band.
-fn screen_hash(ndc: vec2<f32>) -> f32 {
-    return fract(sin(dot(ndc, vec2<f32>(12.9898, 78.233))) * 43758.5453);
 }
 
 // Procedural starfield — crisp POINT stars hashed out of a 3D shell

@@ -66,11 +66,34 @@ fn offscreen_target(device: &wgpu::Device, label: &'static str) -> wgpu::Texture
     })
 }
 
-/// Render-pass color attachment against `view`, cleared to CLEAR.
-fn color_attach<'a>(view: &'a wgpu::TextureView) -> wgpu::RenderPassColorAttachment<'a> {
+/// A 4×-multisampled attachment texture — the pipelines all run
+/// MSAA now; dumps render into this and resolve into the readback.
+fn msaa_target(device: &wgpu::Device, label: &'static str) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: W,
+            height: H,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: csp_render::MSAA_SAMPLES,
+        dimension: wgpu::TextureDimension::D2,
+        format: FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    })
+}
+
+/// Render-pass color attachment rendering to `msaa` and resolving
+/// into `view`, cleared to CLEAR.
+fn color_attach<'a>(
+    msaa: &'a wgpu::TextureView,
+    view: &'a wgpu::TextureView,
+) -> wgpu::RenderPassColorAttachment<'a> {
     wgpu::RenderPassColorAttachment {
-        view,
-        resolve_target: None,
+        view: msaa,
+        resolve_target: Some(view),
         ops: wgpu::Operations {
             load: wgpu::LoadOp::Clear(wgpu::Color {
                 r: CLEAR[0],
@@ -171,6 +194,8 @@ fn dump_map() {
     );
 
     let tex = offscreen_target(&device, "map-dump-target");
+    let msaa_tex = msaa_target(&device, "map-dump-msaa");
+    let msaa = msaa_tex.create_view(&wgpu::TextureViewDescriptor::default());
     let target = tex.create_view(&wgpu::TextureViewDescriptor::default());
     let mut map = csp_render::map::MapRenderer::new(&device, FORMAT);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -179,7 +204,7 @@ fn dump_map() {
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("map"),
-            color_attachments: &[Some(color_attach(&target))],
+            color_attachments: &[Some(color_attach(&msaa, &target))],
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
@@ -318,6 +343,8 @@ fn dump_parts() {
         ..Default::default()
     };
     let tex = offscreen_target(&device, "parts-dump-target");
+    let msaa_tex = msaa_target(&device, "parts-dump-msaa");
+    let msaa = msaa_tex.create_view(&wgpu::TextureViewDescriptor::default());
     let target = tex.create_view(&wgpu::TextureViewDescriptor::default());
     let mut flight = csp_render::flight::FlightRenderer::new(&device, FORMAT, (W, H));
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -326,7 +353,7 @@ fn dump_parts() {
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("parts"),
-            color_attachments: &[Some(color_attach(&target))],
+            color_attachments: &[Some(color_attach(&msaa, &target))],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: flight.depth_view(),
                 depth_ops: Some(wgpu::Operations {
@@ -390,6 +417,8 @@ fn dump_vab() {
     );
 
     let tex = offscreen_target(&device, "vab-dump-target");
+    let msaa_tex = msaa_target(&device, "vab-dump-msaa");
+    let msaa = msaa_tex.create_view(&wgpu::TextureViewDescriptor::default());
     let target = tex.create_view(&wgpu::TextureViewDescriptor::default());
     let mut vab = csp_render::vab::VabRenderer::new(&device, FORMAT, (W, H));
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -398,7 +427,7 @@ fn dump_vab() {
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("vab"),
-            color_attachments: &[Some(color_attach(&target))],
+            color_attachments: &[Some(color_attach(&msaa, &target))],
             // Reverse-Z target owned by the renderer, like the app pass.
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: vab.depth_view(),

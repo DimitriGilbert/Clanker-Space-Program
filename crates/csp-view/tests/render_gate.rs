@@ -92,6 +92,10 @@ struct Stats {
     distinct: usize,
     /// Largest per-channel spread across the image (uniform ⇒ 0).
     max_spread: u8,
+    /// Near-white pixels (every channel ≥ 210): the distinguishing
+    /// signal for the washed-out bug shape — a plausible scene has
+    /// some (sun glints), a blown frame is mostly white.
+    near_white: usize,
 }
 
 fn analyze(img: &[u8]) -> Stats {
@@ -127,10 +131,17 @@ fn analyze(img: &[u8]) -> Stats {
             hi[c] = hi[c].max(px[c]);
         }
     }
+    let mut near_white = 0usize;
+    for px in img.chunks_exact(4) {
+        if px[0] >= 210 && px[1] >= 210 && px[2] >= 210 {
+            near_white += 1;
+        }
+    }
     Stats {
         non_clear,
         distinct: buckets.iter().filter(|n| **n > 0).count(),
         max_spread: (0..3).map(|c| hi[c] - lo[c]).max().unwrap_or(0),
+        near_white,
     }
 }
 
@@ -146,6 +157,7 @@ fn render_flight_scene(
 }
 
 /// Sized variant — the 256 B copy-row alignment must divide `w*4`.
+#[allow(clippy::too_many_lines)] // one render-pass recipe for the gate
 fn render_flight_scene_sized(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -153,6 +165,23 @@ fn render_flight_scene_sized(
     w: u32,
     h: u32,
 ) -> Vec<u8> {
+    // Same target layout as the app: a 4×-multisampled color
+    // attachment resolved into the single-sampled readback texture.
+    let msaa_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("render-gate-msaa"),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: csp_render::MSAA_SAMPLES,
+        dimension: wgpu::TextureDimension::D2,
+        format: FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let msaa = msaa_tex.create_view(&wgpu::TextureViewDescriptor::default());
     let color_tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("render-gate-target"),
         size: wgpu::Extent3d {
@@ -177,8 +206,8 @@ fn render_flight_scene_sized(
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("scene"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &target,
-                resolve_target: None,
+                view: &msaa,
+                resolve_target: Some(&target),
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color {
                         r: CLEAR[0],
@@ -204,12 +233,16 @@ fn render_flight_scene_sized(
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        // The app's draw order: surface pass (sky backdrop + terrain)
-        // before the craft vertex stream.
+        // The app's draw order: surface pass (sky backdrop + opaque
+        // terrain), craft vertex stream, then the depth-test-only
+        // ocean over both.
         if let Some(tp) = &packet.terrain {
             terrain.draw(&mut pass, device, queue, tp);
         }
         flight.draw(&mut pass, device, queue, packet);
+        if let Some(tp) = &packet.terrain {
+            terrain.draw_ocean(&mut pass, tp);
+        }
     }
     let row_bytes = w as usize * 4;
     debug_assert_eq!(row_bytes % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize, 0);
@@ -307,8 +340,8 @@ fn boot_scene_has_real_geometry() {
     let stats = analyze(&img);
     let total = (W * H) as usize;
     eprintln!(
-        "seeded scene: non_clear={}/{} distinct={} spread={}",
-        stats.non_clear, total, stats.distinct, stats.max_spread
+        "seeded scene: non_clear={}/{} distinct={} spread={} near_white={}",
+        stats.non_clear, total, stats.distinct, stats.max_spread, stats.near_white
     );
     assert!(
         stats.non_clear as f64 / total as f64 > 0.5,
@@ -321,6 +354,73 @@ fn boot_scene_has_real_geometry() {
         "image lacks real scene shading ({} buckets, spread {})",
         stats.distinct,
         stats.max_spread
+    );
+    // Distinguishing assertion (verified-report-13-F1): the old gate
+    // passed the historical washed-out bug shape because it only
+    // checked non-clear + color buckets. A blown-white frame now
+    // fails — the control test below proves this bound rejects it.
+    assert!(
+        (stats.near_white as f64 / total as f64) < 0.25,
+        "a quarter of the frame is near-white — the washed-out bug shape ({}/{})",
+        stats.near_white,
+        total
+    );
+}
+
+/// The washed-out control — proves the near-white bound above is not
+/// vacuous. The same seeded packet rendered with the Rayleigh
+/// inscatter driven 80× hot reproduces the "pale-blown" bug shape:
+/// it rasterizes plenty (non_clear passes trivially) but the frame
+/// is a white veil the old assertion set would have blessed.
+#[test]
+fn washed_out_scene_is_what_the_gate_rejects() {
+    let Some((device, queue)) = headless_device() else {
+        eprintln!("render-gate: no headless GPU adapter (install lavapipe) — skipping");
+        return;
+    };
+
+    let mut view = View::new().expect("data/ load");
+    view.seed_starter_craft().expect("starter seed");
+    view.set_flight_viewport(f64::from(W), f64::from(H));
+    view.world
+        .resource_mut::<csp_view::flight::FlightInput>()
+        .distance_m = 300.0;
+    for _ in 0..3 {
+        frame(&mut view, 1);
+    }
+    let mut packet = view
+        .take_flight_packet()
+        .expect("RenderExtract produced a flight packet");
+    // Drive the inscatter term 80× hot — the same failure shape the
+    // washed-out bug produced (everything rasterizes, everything is
+    // white).
+    if let Some(tp) = &mut packet.terrain {
+        for c in tp.uniforms.rayleigh.iter_mut().take(3) {
+            *c *= 80.0;
+        }
+        for c in tp.uniforms.biome_colors.iter_mut().flatten() {
+            *c = (*c * 6.0).min(1.0);
+        }
+    }
+    let img = render_flight_scene(&device, &queue, &packet);
+    let stats = analyze(&img);
+    let total = (W * H) as usize;
+    eprintln!(
+        "washed control: non_clear={}/{} near_white={}",
+        stats.non_clear, total, stats.near_white
+    );
+    // The frame DID rasterize (the old gate would pass it)…
+    assert!(
+        stats.non_clear as f64 / total as f64 > 0.5,
+        "control failed to rasterize — it must differ from clear, not be absent"
+    );
+    // …but the distinguishing bound rejects it.
+    assert!(
+        stats.near_white as f64 / total as f64 >= 0.25,
+        "the washed-out control should FAIL the near-white bound ({}/{}) — \
+         the gate's distinguishing assertion is vacuous",
+        stats.near_white,
+        total
     );
 }
 
@@ -394,6 +494,21 @@ fn dump_sky() {
     let terrain_art = art.0.terrain.clone().expect("terrain art pack loaded");
     let mut terrain = csp_render::terrain::TerrainRenderer::new(&device, FORMAT);
 
+    let msaa_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("sky-dump-msaa"),
+        size: wgpu::Extent3d {
+            width: W,
+            height: H,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: csp_render::MSAA_SAMPLES,
+        dimension: wgpu::TextureDimension::D2,
+        format: FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let msaa = msaa_tex.create_view(&wgpu::TextureViewDescriptor::default());
     let color_tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("sky-dump-target"),
         size: wgpu::Extent3d {
@@ -451,6 +566,7 @@ fn dump_sky() {
                 planet: [600_000.0, 0.0, 0.0, 2_400.0],
                 misc: [(t * aspect) as f32, t as f32, 0.0, 0.0],
                 art: [1.0, 0.0, 0.0, 0.0],
+                class_means: test_means(&terrain_art),
                 ..Default::default()
             },
             ..Default::default()
@@ -463,8 +579,8 @@ fn dump_sky() {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("sky"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &target,
-                    resolve_target: None,
+                    view: &msaa,
+                    resolve_target: Some(&target),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
@@ -638,6 +754,24 @@ fn dump_flight() {
         .filter(|p| p[0] > 235 && p[1] > 215)
         .count();
     eprintln!("{name}: alt={a:.0} white={white}");
+}
+
+/// The pack's per-class means → the `class_means` uniform, mirroring
+/// `csp_view::terrain::build_packet`'s sRGB→linear fill.
+fn test_means(art: &csp_render::terrain::TerrainArt) -> [[f32; 4]; 4] {
+    let lin = |u: u8| {
+        let v = f32::from(u) / 255.0;
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let mut m = [[0.0f32; 4]; 4];
+    for (d, s) in m.iter_mut().zip(art.albedo.means.iter()) {
+        *d = [lin(s[0]), lin(s[1]), lin(s[2]), f32::from(s[3]) / 255.0];
+    }
+    m
 }
 
 fn env_f(k: &str, d: f64) -> f64 {
@@ -839,6 +973,7 @@ fn dump_surface() {
             biome_colors,
             shadow: [0.0; 4],
             art: [1.0, 0.0, 0.0, 0.0],
+            class_means: test_means(&art),
         },
         heightfield: Some(std::sync::Arc::new(field)),
         biome,

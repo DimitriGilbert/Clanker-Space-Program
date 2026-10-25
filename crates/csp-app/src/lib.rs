@@ -1271,9 +1271,13 @@ impl App {
                 .encoder
                 .begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("scene"),
+                    // 4×MSAA: every pipeline rasterizes into the
+                    // multisampled target and the pass resolves into
+                    // the surface view (C11-F1 — the previous frame
+                    // had no AA anywhere).
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &frame.view,
-                        resolve_target: None,
+                        view: gpu.msaa_view(),
+                        resolve_target: Some(&frame.view),
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color {
                                 r: 0.02,
@@ -1321,12 +1325,19 @@ impl App {
             if self.view.mode() == ViewMode::Flight
                 && let (Some(f), Some(packet)) = (&mut self.flight_renderer, &flight_packet)
             {
-                // R2: the surface pass first — its sky is the backdrop,
-                // terrain/ocean write depth the craft tests against.
+                // R2: the surface pass first — its sky is the backdrop
+                // and OPAQUE terrain writes the depth the craft tests
+                // against. The ocean is a THIRD draw after the craft
+                // stream: alpha-blended water must resolve over an
+                // already-rasterized hull, not occlude it with depth
+                // written before the craft existed (C11-F3).
                 if let (Some(t), Some(tp)) = (&mut self.terrain_renderer, &packet.terrain) {
                     t.draw(&mut pass, &gpu.device, &gpu.queue, tp);
                 }
                 f.draw(&mut pass, &gpu.device, &gpu.queue, packet);
+                if let (Some(t), Some(tp)) = (&mut self.terrain_renderer, &packet.terrain) {
+                    t.draw_ocean(&mut pass, tp);
+                }
             }
         }
 

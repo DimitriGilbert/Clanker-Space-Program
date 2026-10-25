@@ -57,6 +57,78 @@ impl Default for PartLight {
     }
 }
 
+/// The multisample count every pipeline and the scene framebuffer use
+/// (C11-F1: 4×MSAA across terrain/flight/vab/map — before this there
+/// was no AA anywhere in the pipeline). Kept in one constant so a
+/// sample-count mismatch between a pipeline and its attachments is
+/// impossible by construction.
+pub const MSAA_SAMPLES: u32 = 4;
+
+/// The `MultisampleState` every surface-destined pipeline declares.
+pub(crate) fn msaa_state() -> wgpu::MultisampleState {
+    wgpu::MultisampleState {
+        count: MSAA_SAMPLES,
+        ..wgpu::MultisampleState::default()
+    }
+}
+
+/// The scene pass's multisampled color target: every surface-bound
+/// pipeline renders into this 4× texture and the pass resolves into
+/// the swapchain view. Recreated when the surface size or format
+/// changes (resize/reconfigure).
+pub struct MsaaColor {
+    /// Kept alive for `view` — a wgpu `TextureView` is an unborrowed
+    /// handle, so dropping the texture would leave a dangling view.
+    #[allow(dead_code)]
+    tex: wgpu::Texture,
+    view: wgpu::TextureView,
+    size: (u32, u32),
+    format: wgpu::TextureFormat,
+}
+
+impl MsaaColor {
+    /// Create the multisampled target for `size`/`format`.
+    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, size: (u32, u32)) -> Self {
+        let size = (size.0.max(1), size.1.max(1));
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("msaa-color"),
+            size: wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: MSAA_SAMPLES,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        Self {
+            tex,
+            view,
+            size,
+            format,
+        }
+    }
+
+    /// Recreate the target when `size`/`format` moved (surface resize
+    /// or reconfigure); a no-op otherwise.
+    pub fn ensure(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat, size: (u32, u32)) {
+        let size = (size.0.max(1), size.1.max(1));
+        if size != self.size || format != self.format {
+            *self = Self::new(device, format, size);
+        }
+    }
+
+    /// The attachment view the scene pass renders into (resolve
+    /// target = the frame's surface view).
+    pub fn view(&self) -> &wgpu::TextureView {
+        &self.view
+    }
+}
+
 /// A grow-only GPU vertex buffer + the count it currently holds — shared
 /// by the simple pass renderers (map, VAB). Recreated with headroom when
 /// the frame's mesh outgrows it so steady-state frames never reallocate.
@@ -108,9 +180,15 @@ pub struct Gpu {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
+    /// The scene pass's multisampled framebuffer — pipelines render
+    /// into [`MsaaColor::view`] and resolve into the surface view.
+    msaa: MsaaColor,
+    /// Set by the device-lost callback; `begin_frame` degrades to the
+    /// reconfigure path instead of feeding commands to a dead device.
+    device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Warn-once latches for `begin_frame`'s degraded acquire outcomes
     /// (`Cell` — `begin_frame` takes `&self`). Bit 0: skip-class
-    /// (Timeout/Occluded), bit 1: Validation.
+    /// (Timeout/Occluded), bit 1: Validation, bit 2: device-lost.
     surface_warned: std::cell::Cell<u8>,
 }
 
@@ -152,13 +230,55 @@ impl Gpu {
             })
             .await?;
 
+        // PLAN §2.13 classes presentation faults as Cosmetic —
+        // "log once, placeholder, continue". wgpu's DEFAULT uncaptured
+        // handler panics, which contradicts that policy (a stray
+        // validation error would kill the app), so install a logging
+        // handler instead. Errors repeat on real faults — dedup by
+        // message keeps a persistent fault one line, not per-frame
+        // spam; the cap keeps an error storm bounded.
+        device.on_uncaptured_error(std::sync::Arc::new(move |err: wgpu::Error| {
+            use std::sync::{Mutex, OnceLock};
+            static SEEN: OnceLock<Mutex<std::collections::BTreeSet<String>>> = OnceLock::new();
+            let seen = SEEN.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()));
+            let msg = err.to_string();
+            let mut guard = seen.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.len() < 64 && guard.insert(msg.clone()) {
+                log::error!("wgpu uncaptured error: {msg}");
+            }
+        }));
+        // A lost device cannot be re-requested from inside the
+        // callback — flag it so `begin_frame` degrades to the surface
+        // reconfigure path instead of panicking or hanging on dead
+        // submissions.
+        let device_lost = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let flag = device_lost.clone();
+            device.set_device_lost_callback(move |reason, message| {
+                if !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    log::error!("wgpu device lost ({reason:?}): {message}");
+                }
+            });
+        }
+
         let caps = surface.get_capabilities(&adapter);
         let format = caps
             .formats
             .iter()
             .copied()
             .find(|f| f.is_srgb())
-            .unwrap_or(caps.formats[0]);
+            .unwrap_or_else(|| {
+                // Every pipeline tone-maps into the attachment expecting
+                // a hardware sRGB encode — a non-sRGB fallback renders
+                // ~2.2× dark. Warn loudly rather than silently shipping
+                // a wrong-gamma frame (C11-F8).
+                log::warn!(
+                    "surface offers no sRGB format — falling back to {:?}; \
+                     output will render dark",
+                    caps.formats[0]
+                );
+                caps.formats[0]
+            });
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -172,6 +292,7 @@ impl Gpu {
             view_formats: vec![],
         };
         surface.configure(&device, &config);
+        let msaa = MsaaColor::new(&device, format, (config.width, config.height));
 
         Ok(Self {
             instance,
@@ -180,6 +301,8 @@ impl Gpu {
             device,
             queue,
             config,
+            msaa,
+            device_lost,
             surface_warned: std::cell::Cell::new(0),
         })
     }
@@ -189,11 +312,22 @@ impl Gpu {
             self.config.width = width;
             self.config.height = height;
             self.surface.configure(&self.device, &self.config);
+            self.msaa.ensure(
+                &self.device,
+                self.config.format,
+                (self.config.width, self.config.height),
+            );
         }
     }
 
     pub fn surface_format(&self) -> wgpu::TextureFormat {
         self.config.format
+    }
+
+    /// The multisampled attachment the scene pass renders into —
+    /// `resolve_target` is the frame's surface view.
+    pub fn msaa_view(&self) -> &wgpu::TextureView {
+        self.msaa.view()
     }
 
     /// Log a degraded acquire outcome once per class — the flags make
@@ -209,6 +343,17 @@ impl Gpu {
 
     /// Acquire the next surface texture and an encoder for it.
     pub fn begin_frame(&self) -> FrameResult {
+        if self.device_lost.load(std::sync::atomic::Ordering::Relaxed) {
+            // The device-lost callback already logged once; degrade to
+            // the reconfigure path — the only recovery a dead device
+            // still allows — rather than submitting work that either
+            // panics validation or silently vanishes.
+            self.warn_surface_once(
+                0b100,
+                "device lost — attempting surface reconfigure each frame",
+            );
+            return FrameResult::Reconfigure;
+        }
         let texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,

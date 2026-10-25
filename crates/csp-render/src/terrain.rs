@@ -310,6 +310,11 @@ pub struct TerrainUniforms {
     /// scroll — the sim tick-derived value, still deterministic),
     /// `z`/`w` unused.
     pub art: [f32; 4],
+    /// Per-class mean LINEAR albedo (grass, rock, sand, snow —
+    /// `TerrainTex::means` sRGB→linear at packet build). The shader
+    /// divides class detail by these; the header row is the single
+    /// source of truth (no deepest-mip readback).
+    pub class_means: [[f32; 4]; 4],
 }
 
 /// Atmosphere signature the renderer keys its LUT rebuild on.
@@ -380,8 +385,9 @@ pub struct TerrainTex {
     pub layers: u32,
     /// Mip levels present in `data`.
     pub mips: u32,
-    /// Per-layer mean RGBA — the shader normalizes texel detail
-    /// against these so the authored palette keeps the hue.
+    /// Per-layer mean sRGB RGBA — consumed by `csp-view`'s terrain
+    /// packet build into `uniforms.class_means`, which the shader
+    /// divides texel detail by so the authored palette keeps the hue.
     pub means: Vec<[u8; 4]>,
     /// Concatenated mip levels (see above).
     pub data: Vec<u8>,
@@ -479,6 +485,79 @@ pub const LUT_H: usize = 32;
 /// Trapezoid steps per marched ray — fixed, deterministic.
 const LUT_STEPS: usize = 96;
 
+/// One transmittance-ray optical depth: from radius `r0` along
+/// `(sx, sy)` in the zenith frame the ray runs `t_end` metres.
+/// The trapezoid lattice matches `fs_sky`'s march conventions and is
+/// shared by the LUT bake and the per-frame CPU lookups below.
+fn march_tau(atmo: AtmoDesc, r0: f64, sx: f64, sy: f64, t_end: f64) -> f64 {
+    let mut tau = 0.0;
+    if t_end > 0.0 {
+        let ds = t_end / LUT_STEPS as f64;
+        for i in 0..LUT_STEPS {
+            let t = (i as f64 + 0.5) * ds;
+            let px = t * sx;
+            let py = r0 + t * sy;
+            let alt_i = (libm::sqrt(px * px + py * py) - atmo.radius_m).max(0.0);
+            tau += libm::exp(-alt_i / atmo.scale_height_m) * ds;
+        }
+    }
+    tau
+}
+
+/// Transmittance to space from altitude `h` along zenith-cosine `mu`,
+/// in the same frame/convention as [`bake_transmittance`]: a
+/// ground-struck ray returns `(0, true)`. Used by `csp-view` to tint
+/// the craft's staged sun color by the same atmosphere the terrain
+/// pass attenuates through (C11-F2) — one ray is ~96 trapezoid taps,
+/// cheap enough per frame without rebuilding the whole LUT.
+pub fn transmittance_to_space(atmo: AtmoDesc, beta: [f64; 3], h: f64, mu: f64) -> [f32; 3] {
+    let mu = mu.clamp(-1.0, 1.0);
+    let r0 = atmo.radius_m + h.clamp(0.0, atmo.top_m);
+    let (sx, sy) = (libm::sqrt((1.0 - mu * mu).max(0.0)), mu);
+    // Same path-length math as the bake: far top-shell root, or the
+    // forward datum strike.
+    let disc = r0 * r0 * mu * mu - (r0 * r0 - (atmo.radius_m + atmo.top_m).powi(2));
+    let t_exit = if disc <= 0.0 {
+        0.0
+    } else {
+        -r0 * mu + libm::sqrt(disc)
+    };
+    let gdisc = r0 * r0 * mu * mu - (r0 * r0 - atmo.radius_m * atmo.radius_m);
+    let t_ground = if gdisc <= 0.0 {
+        f64::INFINITY
+    } else {
+        let near = -r0 * mu - libm::sqrt(gdisc);
+        let far = -r0 * mu + libm::sqrt(gdisc);
+        if near > 1e-9 {
+            near
+        } else if far > 1e-9 && mu < 0.0 {
+            0.0
+        } else {
+            f64::INFINITY
+        }
+    };
+    let t_end = t_exit.min(t_ground);
+    let tau = march_tau(atmo, r0, sx, sy, t_end);
+    let blocked = t_ground < t_exit;
+    [
+        if blocked {
+            0.0
+        } else {
+            libm::exp(-tau * beta[0]) as f32
+        },
+        if blocked {
+            0.0
+        } else {
+            libm::exp(-tau * beta[1]) as f32
+        },
+        if blocked {
+            0.0
+        } else {
+            libm::exp(-tau * beta[2]) as f32
+        },
+    ]
+}
+
 /// Bake the transmittance LUT `T(h, μ) = exp(−β_r · τ)` over
 /// `μ ∈ [−1, 1]` (columns) × `h ∈ [0, top_m]` (rows), `RGBA32Float`,
 /// row-major `(row, col)`, `a` = 1.
@@ -487,62 +566,13 @@ const LUT_STEPS: usize = 96;
 /// top-shell intersection, or stops at the datum — a ground-struck ray
 /// transmits 0 (no light crosses the planet). Deterministic f64.
 pub fn bake_transmittance(atmo: AtmoDesc, beta: [f64; 3]) -> Vec<f32> {
-    let r_datum = atmo.radius_m;
-    let r_top = atmo.radius_m + atmo.top_m;
     let mut out = Vec::with_capacity(LUT_W * LUT_H * 4);
     for row in 0..LUT_H {
         let h = atmo.top_m * row as f64 / (LUT_H - 1) as f64;
         for col in 0..LUT_W {
             let mu = -1.0 + 2.0 * col as f64 / (LUT_W - 1) as f64;
-            // Ray in a local frame where +y is the zenith at the origin.
-            let r0 = r_datum + h;
-            let (sx, sy) = (libm::sqrt((1.0 - mu * mu).max(0.0)), mu);
-            // Path length to the top shell — the far root of
-            // |o + t·d| = r_top (past the periapsis dip for μ < 0).
-            let disc = r0 * r0 * mu * mu - (r0 * r0 - r_top * r_top);
-            let t_exit = if disc <= 0.0 {
-                0.0
-            } else {
-                -r0 * mu + libm::sqrt(disc)
-            };
-            // Datum strike — a *strictly forward* near root blocks the
-            // ray; a near root ≤ 0 with a positive far root means the
-            // origin sits on/below the datum going down (μ < 0), which
-            // is a strike at t = 0. h = 0 with μ ≥ 0 escapes upward.
-            let gdisc = r0 * r0 * mu * mu - (r0 * r0 - r_datum * r_datum);
-            let t_ground = if gdisc <= 0.0 {
-                f64::INFINITY
-            } else {
-                let near = -r0 * mu - libm::sqrt(gdisc);
-                let far = -r0 * mu + libm::sqrt(gdisc);
-                if near > 1e-9 {
-                    near
-                } else if far > 1e-9 && mu < 0.0 {
-                    0.0
-                } else {
-                    f64::INFINITY
-                }
-            };
-            let t_end = t_exit.min(t_ground);
-            let mut tau = 0.0;
-            if t_end > 0.0 {
-                let ds = t_end / LUT_STEPS as f64;
-                for i in 0..LUT_STEPS {
-                    let t = (i as f64 + 0.5) * ds;
-                    let px = t * sx;
-                    let py = r0 + t * sy;
-                    let alt_i = (libm::sqrt(px * px + py * py) - r_datum).max(0.0);
-                    tau += libm::exp(-alt_i / atmo.scale_height_m) * ds;
-                }
-            }
-            let blocked = t_ground < t_exit;
-            for b in beta {
-                out.push(if blocked {
-                    0.0
-                } else {
-                    libm::exp(-tau * b) as f32
-                });
-            }
+            let t = transmittance_to_space(atmo, beta, h, mu);
+            out.extend_from_slice(&t);
             out.push(1.0);
         }
     }
@@ -634,6 +664,9 @@ impl TexUpload {
 /// when its packet key changes.
 pub struct TerrainRenderer {
     terrain_pipe: wgpu::RenderPipeline,
+    /// Ocean pipeline — same shaders/mesh as `terrain_pipe`, depth
+    /// test-only, drawn after the flight stream (see `pipelines`).
+    ocean_pipe: wgpu::RenderPipeline,
     sky_pipe: wgpu::RenderPipeline,
     bgl: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
@@ -643,6 +676,11 @@ pub struct TerrainRenderer {
     grid_index_count: u32,
     grid_uploaded: bool,
     instances: GpuBuffer,
+    /// Byte range of the ocean slice inside `instances` (terrain ends
+    /// at `inst_bytes`, the upload at `inst_end`) — set by `draw`,
+    /// consumed by `draw_ocean`.
+    inst_bytes: wgpu::BufferAddress,
+    inst_end: wgpu::BufferAddress,
     height_tex: wgpu::Texture,
     lut_tex: wgpu::Texture,
     biome_tex: wgpu::Texture,
@@ -730,15 +768,20 @@ impl TerrainRenderer {
         })
     }
 
-    /// The two passes sharing the layout: instanced terrain/ocean and
-    /// the fullscreen sky (depth always-pass, no writes).
+    /// The three passes sharing the layout: instanced terrain, the
+    /// depth-test-only ocean variant (drawn after the flight stream),
+    /// and the fullscreen sky (depth always-pass, no writes).
     fn pipelines(
         device: &wgpu::Device,
         layout: &wgpu::PipelineLayout,
         shader: &wgpu::ShaderModule,
         surface_format: wgpu::TextureFormat,
         depth_state: &wgpu::DepthStencilState,
-    ) -> (wgpu::RenderPipeline, wgpu::RenderPipeline) {
+    ) -> (
+        wgpu::RenderPipeline,
+        wgpu::RenderPipeline,
+        wgpu::RenderPipeline,
+    ) {
         let pipe = |label, vs, fs, buffers, targets, depth: wgpu::DepthStencilState| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
@@ -757,7 +800,7 @@ impl TerrainRenderer {
                 }),
                 primitive: wgpu::PrimitiveState::default(),
                 depth_stencil: Some(depth),
-                multisample: wgpu::MultisampleState::default(),
+                multisample: crate::msaa_state(),
                 multiview_mask: None,
                 cache: None,
             })
@@ -774,6 +817,23 @@ impl TerrainRenderer {
             &[Some(GridVertex::LAYOUT), Some(TerrainInstance::LAYOUT)],
             &terrain_targets,
             depth_state.clone(),
+        );
+        // The ocean shares shaders/mesh but rides a second pipeline:
+        // depth-TEST-only. It draws AFTER the flight vertex stream so a
+        // hull below the waterline stays visible through the blend
+        // instead of being rejected by depth the ocean wrote before the
+        // craft existed (C11-F3). The `dir0_kind.w` discriminator still
+        // selects the ocean shading branch in `fs_terrain`.
+        let ocean = pipe(
+            "ocean",
+            "vs_terrain",
+            "fs_terrain",
+            &[Some(GridVertex::LAYOUT), Some(TerrainInstance::LAYOUT)],
+            &terrain_targets,
+            wgpu::DepthStencilState {
+                depth_write_enabled: Some(false),
+                ..depth_state.clone()
+            },
         );
         let sky_targets = [Some(wgpu::ColorTargetState {
             format: surface_format,
@@ -792,7 +852,7 @@ impl TerrainRenderer {
                 ..depth_state.clone()
             },
         );
-        (terrain, sky)
+        (terrain, ocean, sky)
     }
 
     /// Build pipelines, the shared grid, the uniform buffer, and 1×1
@@ -816,7 +876,7 @@ impl TerrainRenderer {
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         };
-        let (terrain_pipe, sky_pipe) =
+        let (terrain_pipe, ocean_pipe, sky_pipe) =
             Self::pipelines(device, &layout, &shader, surface_format, &depth_state);
 
         let (verts, indices) = unit_grid();
@@ -854,6 +914,7 @@ impl TerrainRenderer {
         );
         Self {
             terrain_pipe,
+            ocean_pipe,
             sky_pipe,
             bgl,
             bind_group,
@@ -867,6 +928,8 @@ impl TerrainRenderer {
                 "terrain-instances",
                 (std::mem::size_of::<TerrainInstance>() * 4096) as u64,
             ),
+            inst_bytes: 0,
+            inst_end: 0,
             height_tex,
             lut_tex,
             biome_tex,
@@ -1137,8 +1200,11 @@ impl TerrainRenderer {
     }
 
     /// Upload the packet's changing pieces (uniforms, instance rows,
-    /// any stale textures) and record: sky → terrain+ocean, into the
+    /// any stale textures) and record: sky → opaque terrain, into the
     /// caller's open pass sharing the flight depth target (reverse-Z).
+    /// The ocean is the separate [`Self::draw_ocean`] phase — it runs
+    /// after the flight stream.
+    #[allow(clippy::too_many_lines)] // uploads + two draws; splitting fragments the data flow
     pub fn draw(
         &mut self,
         pass: &mut wgpu::RenderPass<'_>,
@@ -1238,21 +1304,52 @@ impl TerrainRenderer {
             pass.set_pipeline(&self.sky_pipe);
             pass.draw(0..3, 0..1);
         }
-        // Terrain + ocean share the mesh and pipeline — one instanced
-        // draw, terrain first so the alpha-blended ocean resolves
-        // against land in primitive order.
-        let n_inst = packet.terrain.len() + packet.ocean.len();
+        // Terrain + ocean share the mesh — ONE upload, laid out
+        // terrain-then-ocean so `draw` slices the terrain range and
+        // `draw_ocean` slices the rest (the ocean draws in a second
+        // phase after the flight stream, so the two stages never
+        // race one buffer).
+        let n_terrain = packet.terrain.len();
+        let n_inst = n_terrain + packet.ocean.len();
         if n_inst > 0 {
             let mut inst = Vec::with_capacity(n_inst);
             inst.extend_from_slice(&packet.terrain);
             inst.extend_from_slice(&packet.ocean);
-            let n = self.instances.upload(device, queue, &inst);
+            let _ = self.instances.upload(device, queue, &inst);
+            self.inst_bytes =
+                (n_terrain * std::mem::size_of::<TerrainInstance>()) as wgpu::BufferAddress;
+            self.inst_end =
+                (n_inst * std::mem::size_of::<TerrainInstance>()) as wgpu::BufferAddress;
+        }
+        if n_terrain > 0 {
             pass.set_pipeline(&self.terrain_pipe);
             pass.set_vertex_buffer(0, self.grid_v.slice(..));
-            pass.set_vertex_buffer(1, self.instances.buffer.slice(..));
+            pass.set_vertex_buffer(1, self.instances.buffer.slice(0..self.inst_bytes));
             pass.set_index_buffer(self.grid_i.slice(..), wgpu::IndexFormat::Uint16);
-            pass.draw_indexed(0..self.grid_index_count, 0, 0..n);
+            pass.draw_indexed(0..self.grid_index_count, 0, 0..n_terrain as u32);
         }
+    }
+
+    /// The ocean phase — call from the same open pass AFTER the flight
+    /// vertex stream (app order: `draw` → flight `draw` → `draw_ocean`).
+    /// The ocean pipeline tests depth but never writes it: submerged
+    /// hull fragments keep their already-rasterized pixels instead of
+    /// being occluded by water drawn before them, and the alpha blend
+    /// still tints them through the surface. A no-op when `draw` was
+    /// not called this frame or no ocean instances were uploaded.
+    pub fn draw_ocean(&mut self, pass: &mut wgpu::RenderPass<'_>, packet: &TerrainPacket) {
+        if packet.ocean.is_empty() {
+            return;
+        }
+        pass.set_pipeline(&self.ocean_pipe);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.set_vertex_buffer(0, self.grid_v.slice(..));
+        pass.set_vertex_buffer(
+            1,
+            self.instances.buffer.slice(self.inst_bytes..self.inst_end),
+        );
+        pass.set_index_buffer(self.grid_i.slice(..), wgpu::IndexFormat::Uint16);
+        pass.draw_indexed(0..self.grid_index_count, 0, 0..packet.ocean.len() as u32);
     }
 }
 

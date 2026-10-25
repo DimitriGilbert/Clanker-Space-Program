@@ -116,7 +116,7 @@ impl MapRenderer {
                 ..Default::default()
             },
             depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
+            multisample: crate::msaa_state(),
             multiview_mask: None,
             cache: None,
         });

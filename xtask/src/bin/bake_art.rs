@@ -8,7 +8,8 @@
 //! "CSAR"  u32 version=2  u32 n_entries
 //! per entry:  u8 kind, u8 name_len, name bytes
 //!   kind 1 = image: u16 w, u16 h, u8 layers, u8 mips,
-//!                   layers×4 u8 mean-RGBA (per-layer average),
+//!                   layers×4 u8 mean-RGBA (per-layer average —
+//!                   the shader divides class detail by it),
 //!                   u64 payload_len, deflate(payload)
 //!          payload = mip-major: level 0..mips, each level's
 //!          layers contiguous — (w>>l)×(h>>l)×4 RGBA8.
@@ -101,7 +102,9 @@ enum Entry {
     Mesh(MeshEntry),
 }
 
-fn write_csar(path: &Path, entries: &[(&str, Entry)]) {
+/// Serialize a pack fully in memory — writing happens only in
+/// [`atomic_write`], after BOTH packs have assembled without panic.
+fn assemble_csar(entries: &[(&str, Entry)]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"CSAR");
     out.extend_from_slice(&2u32.to_le_bytes());
@@ -148,13 +151,18 @@ fn write_csar(path: &Path, entries: &[(&str, Entry)]) {
             }
         }
     }
-    fs::write(path, &out).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
-    println!(
-        "wrote {} ({} entries, {} B)",
-        path.display(),
-        entries.len(),
-        out.len()
-    );
+    out
+}
+
+/// Write `bytes` to `path` via a sibling tmp file + rename — a
+/// mid-write kill can never leave a truncated pack (the embedded
+/// `include_bytes!` packs must never be observed half-written).
+fn atomic_write(path: &Path, bytes: &[u8]) {
+    let tmp = path.with_extension("csar.tmp");
+    fs::write(&tmp, bytes).unwrap_or_else(|e| panic!("write {}: {e}", tmp.display()));
+    fs::rename(&tmp, path)
+        .unwrap_or_else(|e| panic!("rename {} → {}: {e}", tmp.display(), path.display()));
+    println!("wrote {} ({} B)", path.display(), bytes.len());
 }
 
 // ---------------------------------------------------------------------------
@@ -174,9 +182,9 @@ struct Face {
 }
 
 /// Dihedral threshold for "hard": adjacent faces whose normals meet
-/// under this cosine (≈53°) are a crease — Loop sharp-rules it and the
-/// normal rebuild splits it. Kenney's 45° bevels stay under the bar
-/// (they smooth), 60°+ machined corners sit over it (they stay crisp).
+/// under this cosine (≈53°) are a crease — the wedge-normal rebuild
+/// splits there. Sub-53° bevels stay under the bar (they smooth),
+/// 60°+ machined corners sit over it (they stay crisp).
 const CREASE_DOT: f64 = 0.6;
 
 fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
@@ -251,9 +259,8 @@ fn edge_is_crease(fl: &[usize], fns: &[[f64; 3]]) -> bool {
 
 /// Convex/concave edge-shading: each hard 2-face edge darkens or
 /// brightens its endpoint vertices — concave seams read as panel gaps,
-/// convex edges catch a faint edge light. Applied to the coarse mesh
-/// BEFORE subdivision so the falloff spreads smoothly through the
-/// subdivided descendants.
+/// convex edges catch a faint edge light. Applied directly to the
+/// authored mesh (there is no subdivision stage).
 fn edge_shade(pos: &[[f64; 3]], faces: &[Face], tint: &mut [f32]) {
     let fns = face_normals(pos, faces);
     for ((a, b), fl) in edge_faces(faces) {
@@ -313,7 +320,7 @@ fn mat_params(col: [u8; 4]) -> [u8; 2] {
     }
 }
 
-/// Rebuild the emitted mesh from the subdivided working mesh: smooth
+/// Rebuild the emitted mesh from the welded working mesh: smooth
 /// vertex normals per smoothing wedge (angle-weighted face normals
 /// over the corner's connected-by-smooth-edges face set), split across
 /// creases and material colors, plus per-vertex cavity AO from the
@@ -458,28 +465,67 @@ fn load_rgba8(path: &Path, w: u32, h: u32) -> Vec<u8> {
     img.into_raw()
 }
 
-fn downsample(level: &[u8], w: usize, h: usize) -> (Vec<u8>, usize, usize) {
+/// round(acc/cnt) without float — `floor((2a + n) / 2n)`.
+fn div_round(acc: u32, cnt: u32) -> u8 {
+    ((acc * 2 + cnt) / (cnt * 2)) as u8
+}
+
+/// 2× box downsample. Rounds to nearest (the old `as u8` cast floored
+/// every level, biasing each mip ≤1 LSB dark per channel). `normal`
+/// marks tangent-space normal maps: their RGB channels are averaged
+/// in signed space and RENORMALIZED to unit length — a plain box
+/// mean of unit vectors is strictly sub-unit, so un-renormalized
+/// mips flattened the surface slope with distance (C19bake-F1).
+fn downsample(level: &[u8], w: usize, h: usize, normal: bool) -> (Vec<u8>, usize, usize) {
     let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
     let mut out = vec![0u8; nw * nh * 4];
     for y in 0..nh {
         for x in 0..nw {
-            let mut acc = [0u32; 4];
-            let mut cnt = 0u32;
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let (sx, sy) = (2 * x + dx, 2 * y + dy);
-                    if sx < w && sy < h {
-                        let o = (sy * w + sx) * 4;
-                        for c in 0..4 {
-                            acc[c] += level[o + c] as u32;
+            let o = (y * nw + x) * 4;
+            if normal {
+                let mut v = [0.0f64; 3];
+                let mut acc_a = 0u32;
+                let mut cnt = 0u32;
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let (sx, sy) = (2 * x + dx, 2 * y + dy);
+                        if sx < w && sy < h {
+                            let p = (sy * w + sx) * 4;
+                            for c in 0..3 {
+                                v[c] += f64::from(level[p + c]) / 255.0 * 2.0 - 1.0;
+                            }
+                            acc_a += level[p + 3] as u32;
+                            cnt += 1;
                         }
-                        cnt += 1;
                     }
                 }
-            }
-            let o = (y * nw + x) * 4;
-            for c in 0..4 {
-                out[o + c] = (acc[c] / cnt) as u8;
+                let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+                // Degenerate (opposing normals cancel) → up vector.
+                let s = if l > 1e-6 { 1.0 / l } else { 0.0 };
+                for c in 0..3 {
+                    let n = v[c] * s;
+                    let enc = if l > 1e-6 { n } else { [0.0, 0.0, 1.0][c] };
+                    out[o + c] = ((enc * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8;
+                }
+                out[o + 3] = div_round(acc_a, cnt);
+            } else {
+                let mut acc = [0u32; 4];
+                let mut cnt = 0u32;
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let (sx, sy) = (2 * x + dx, 2 * y + dy);
+                        if sx < w && sy < h {
+                            let p = (sy * w + sx) * 4;
+                            for c in 0..4 {
+                                acc[c] += level[p + c] as u32;
+                            }
+                            cnt += 1;
+                        }
+                    }
+                }
+                for c in 0..4 {
+                    out[o + c] = div_round(acc[c], cnt);
+                }
             }
         }
     }
@@ -487,20 +533,24 @@ fn downsample(level: &[u8], w: usize, h: usize) -> (Vec<u8>, usize, usize) {
 }
 
 /// Build the mip-major payload + per-layer means for an image stack
-/// (`layers` same-sized RGBA8 tiles).
-fn image_entry(w: u16, h: u16, level0_layers: Vec<Vec<u8>>) -> ImageEntry {
+/// (`layers` same-sized RGBA8 tiles). `normal` marks normal maps —
+/// their mip chain renormalizes (see `downsample`); the means row is
+/// the albedo normalization factor the shader divides detail by
+/// (terrain.wgsl `u.class_means`), NOT a normal-map value.
+fn image_entry(w: u16, h: u16, level0_layers: Vec<Vec<u8>>, normal: bool) -> ImageEntry {
     let layers = level0_layers.len() as u8;
     let means: Vec<[u8; 4]> = level0_layers
         .iter()
         .map(|l| {
-            let n = l.len() as u64 / 4;
+            let n = (l.len() as u64 / 4).max(1);
             let mut acc = [0u64; 4];
             for px in l.chunks_exact(4) {
                 for c in 0..4 {
                     acc[c] += px[c] as u64;
                 }
             }
-            [0, 1, 2, 3].map(|c| (acc[c] / n.max(1)) as u8)
+            // Round, not floor — the shader divides by this.
+            [0, 1, 2, 3].map(|c| ((acc[c] * 2 + n) / (n * 2)) as u8)
         })
         .collect();
     let mut mips = 0u8;
@@ -517,7 +567,7 @@ fn image_entry(w: u16, h: u16, level0_layers: Vec<Vec<u8>>) -> ImageEntry {
         }
         let mut next = Vec::with_capacity(cur.len());
         for layer in &cur {
-            next.push(downsample(layer, cw, ch).0);
+            next.push(downsample(layer, cw, ch, normal).0);
         }
         cw = (cw / 2).max(1);
         ch = (ch / 2).max(1);
@@ -544,11 +594,16 @@ fn main() {
     fs::create_dir_all(&out).unwrap();
 
     // --- rocket part models (procedurally authored — see parts.rs) ---
+    // Both packs ASSEMBLE fully before either writes: the old order
+    // committed parts.csar before the terrain sources decoded, so a
+    // corrupt jpg left a fresh parts pack beside a stale terrain pack
+    // — silently mixed generations embedded by include_bytes
+    // (C19bake-F3).
     let entries: Vec<(&str, Entry)> = parts::build_all()
         .into_iter()
         .map(|(k, m)| (k, Entry::Mesh(m)))
         .collect();
-    write_csar(&out.join("parts.csar"), &entries);
+    let parts_bytes = assemble_csar(&entries);
 
     // --- terrain textures (ambientCG CC0) -----------------------------------
     // The night sky is NOT baked: `terrain.wgsl`'s fs_sky synthesizes a
@@ -581,16 +636,20 @@ fn main() {
         // layer order: 0 grass, 1 rock, 2 sand, 3 snow — terrain.wgsl keys it
         (
             "albedo",
-            Entry::Image(image_entry(T as u16, T as u16, alb_layers)),
+            Entry::Image(image_entry(T as u16, T as u16, alb_layers, false)),
         ),
         (
             "normal",
-            Entry::Image(image_entry(T as u16, T as u16, nrm_layers)),
+            Entry::Image(image_entry(T as u16, T as u16, nrm_layers, true)),
         ),
         (
             "water_nrm",
-            Entry::Image(image_entry(T as u16, T as u16, vec![water])),
+            Entry::Image(image_entry(T as u16, T as u16, vec![water], true)),
         ),
     ];
-    write_csar(&out.join("terrain.csar"), &entries);
+    let terrain_bytes = assemble_csar(&entries);
+
+    // Both packs assembled — publish each atomically.
+    atomic_write(&out.join("parts.csar"), &parts_bytes);
+    atomic_write(&out.join("terrain.csar"), &terrain_bytes);
 }

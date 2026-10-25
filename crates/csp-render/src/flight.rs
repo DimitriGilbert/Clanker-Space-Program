@@ -131,7 +131,7 @@ impl FlightRenderer {
                 ..Default::default()
             },
             depth_stencil: Some(depth_state),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: crate::msaa_state(),
             multiview_mask: None,
             cache: None,
         });
@@ -144,7 +144,7 @@ impl FlightRenderer {
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
-            sample_count: 1,
+            sample_count: crate::MSAA_SAMPLES,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth32Float,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -194,7 +194,7 @@ impl FlightRenderer {
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
-            sample_count: 1,
+            sample_count: crate::MSAA_SAMPLES,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth32Float,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,

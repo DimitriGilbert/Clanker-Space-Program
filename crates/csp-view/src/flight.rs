@@ -2478,9 +2478,38 @@ pub(crate) fn extract_flight(
                 })
             })
             .unwrap_or(DVec3::Z);
+        // C11-F2 — couple the craft's sun to the atmosphere: the same
+        // T(h, μ) the terrain pass applies, evaluated on the focus
+        // vessel's own altitude and sun-zenith angle. The old constant
+        // [0.95,0.92,0.85] left the hull glowing identically in thick
+        // air, at sunset, and in vacuum; now it reddens/dims with the
+        // local transmittance exactly like the ground under it.
+        // The base color mirrors fs_terrain's `sun_lum` ([1.0,0.98,0.92]).
+        let sun_col = snap.env.as_ref().map_or([1.0, 0.98, 0.92], |e| {
+            let alt = snap
+                .vessels
+                .first()
+                .map(|b| ((b.com - e.body_center).norm() - e.radius_m).max(0.0))
+                .unwrap_or(0.0);
+            if e.atm_top_m <= 0.0 {
+                [1.0, 0.98, 0.92] // vacuum — full sun
+            } else {
+                let t = csp_render::terrain::transmittance_to_space(
+                    csp_render::terrain::AtmoDesc {
+                        radius_m: e.radius_m,
+                        top_m: e.atm_top_m,
+                        scale_height_m: e.atm_scale_height_m.max(1.0),
+                    },
+                    csp_render::terrain::RAYLEIGH_BETA,
+                    alt,
+                    sun.dot(up),
+                );
+                [t[0], 0.98 * t[1], 0.92 * t[2]]
+            }
+        });
         csp_render::PartLight {
             sun_dir: [sun.x as f32, sun.y as f32, sun.z as f32, 0.0],
-            sun_col: [0.95, 0.92, 0.85, 0.0],
+            sun_col: [sun_col[0], sun_col[1], sun_col[2], 0.0],
             amb_up: [0.16, 0.20, 0.27, 0.0],
             amb_dn: [0.065, 0.060, 0.055, 0.0],
             hemi: [up.x as f32, up.y as f32, up.z as f32, 0.10],

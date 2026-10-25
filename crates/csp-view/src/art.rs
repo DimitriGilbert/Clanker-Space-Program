@@ -18,8 +18,9 @@
 //! u32 ni, u64 len, deflate` — vertex = f32×3 pos + f32×3 normal +
 //! u8×4 sRGB color + u8×2 material (spec strength, spec exponent) +
 //! u8 occlusion + u8 pad = 32 B, then u32 indices). Meshes are the
-//! bake's welded, Loop-subdivided, smoothing-wedge-normalled models —
-//! the low-poly facet look is removed at bake time.
+//! bake's welded, edge-shaded, smoothing-wedge-normalled models —
+//! there is no subdivision stage (the authored geometry is dense at
+//! bake).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -201,7 +202,9 @@ impl<'a> Rd<'a> {
     }
 }
 
-fn srgb_to_linear(u: f32) -> f32 {
+/// sRGB channel (0..1) → linear — shared by the mesh decode below and
+/// `terrain::build_packet`'s `class_means` uniform fill.
+pub(crate) fn srgb_to_linear(u: f32) -> f32 {
     if u <= 0.04045 {
         u / 12.92
     } else {

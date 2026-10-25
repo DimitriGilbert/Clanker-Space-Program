@@ -408,6 +408,7 @@ fn vessel_shadow(
 /// camera, per-patch instance baking, ocean emission, uniforms. Called
 /// from `extract_flight` — `cam`/`input` are the solved presentation
 /// camera; `env` is the staged physics environment.
+#[allow(clippy::too_many_lines)] // quadtree select + uniform bake is one pass
 pub(crate) fn build_packet(
     cfg: &TerrainConfig,
     cache: &mut TerrainCache,
@@ -533,6 +534,21 @@ pub(crate) fn build_packet(
                 0.0,
                 0.0,
             ],
+            // The pack's per-class means, sRGB bytes → linear — the
+            // shader divides class detail by these (the header row is
+            // the single source of truth for the layer mean).
+            class_means: cfg.art.as_ref().map_or([[0.0; 4]; 4], |a| {
+                let mut m = [[0.0f32; 4]; 4];
+                for (dst, src) in m.iter_mut().zip(a.albedo.means.iter()) {
+                    *dst = [
+                        crate::art::srgb_to_linear(f32::from(src[0]) / 255.0),
+                        crate::art::srgb_to_linear(f32::from(src[1]) / 255.0),
+                        crate::art::srgb_to_linear(f32::from(src[2]) / 255.0),
+                        f32::from(src[3]) / 255.0,
+                    ];
+                }
+                m
+            }),
         },
         heightfield: Some(field),
         biome: body.biome,

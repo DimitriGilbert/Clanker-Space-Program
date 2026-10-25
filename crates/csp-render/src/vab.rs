@@ -126,6 +126,7 @@ pub struct VabRenderer {
 
 impl VabRenderer {
     /// Build both pipelines and the offscreen targets for `size`.
+    #[allow(clippy::too_many_lines)] // two pipelines + targets is one init block
     pub fn new(
         device: &wgpu::Device,
         surface_format: wgpu::TextureFormat,
@@ -155,7 +156,7 @@ impl VabRenderer {
             cull_mode: None, // kitbash meshes are not guaranteed closed
             ..Default::default()
         };
-        let mk_pipeline = |label, fragment: wgpu::FragmentState<'_>| {
+        let mk_pipeline = |label, samples: u32, fragment: wgpu::FragmentState<'_>| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: None,
@@ -163,13 +164,17 @@ impl VabRenderer {
                 fragment: Some(fragment),
                 primitive,
                 depth_stencil: Some(depth_state.clone()),
-                multisample: wgpu::MultisampleState::default(),
+                multisample: wgpu::MultisampleState {
+                    count: samples,
+                    ..wgpu::MultisampleState::default()
+                },
                 multiview_mask: None,
                 cache: None,
             })
         };
         let pipeline = mk_pipeline(
             "vab",
+            crate::MSAA_SAMPLES,
             wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("fs_main"),
@@ -181,8 +186,12 @@ impl VabRenderer {
                 })],
             },
         );
+        // The pick pass rasterizes into its own single-sampled
+        // object-id target — MSAA there would be pure cost (and the
+        // id values are not blendable anyway).
         let pick_pipeline = mk_pipeline(
             "vab-pick",
+            1,
             wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("fs_pick"),
@@ -194,7 +203,13 @@ impl VabRenderer {
                 })],
             },
         );
-        let depth = render_target(device, size, wgpu::TextureFormat::Depth32Float, "vab-depth");
+        let depth = render_target(
+            device,
+            size,
+            wgpu::TextureFormat::Depth32Float,
+            crate::MSAA_SAMPLES,
+            "vab-depth",
+        );
         let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
         // The color pipeline's auto layout carries group(0) (`light`);
         // the pick pipeline shares the shader module but never
@@ -241,8 +256,13 @@ impl VabRenderer {
     pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         let size = (width.max(1), height.max(1));
         if size != self.size {
-            self.depth =
-                render_target(device, size, wgpu::TextureFormat::Depth32Float, "vab-depth");
+            self.depth = render_target(
+                device,
+                size,
+                wgpu::TextureFormat::Depth32Float,
+                crate::MSAA_SAMPLES,
+                "vab-depth",
+            );
             self.depth_view = self
                 .depth
                 .create_view(&wgpu::TextureViewDescriptor::default());
@@ -388,11 +408,12 @@ impl PickTargets {
     }
 }
 
-/// A surface-sized render-target texture.
+/// A surface-sized render-target texture at `samples` multisamples.
 fn render_target(
     device: &wgpu::Device,
     size: (u32, u32),
     format: wgpu::TextureFormat,
+    samples: u32,
     label: &'static str,
 ) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
@@ -403,7 +424,7 @@ fn render_target(
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
-        sample_count: 1,
+        sample_count: samples,
         dimension: wgpu::TextureDimension::D2,
         format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
@@ -411,13 +432,15 @@ fn render_target(
     })
 }
 
-/// Fresh pick targets at `size`.
+/// Fresh pick targets at `size` — single-sampled (object ids don't
+/// multisample).
 fn pick_targets(device: &wgpu::Device, size: (u32, u32)) -> PickTargets {
-    let color = render_target(device, size, wgpu::TextureFormat::R32Uint, "vab-pick");
+    let color = render_target(device, size, wgpu::TextureFormat::R32Uint, 1, "vab-pick");
     let depth = render_target(
         device,
         size,
         wgpu::TextureFormat::Depth32Float,
+        1,
         "vab-pick-depth",
     );
     PickTargets {
