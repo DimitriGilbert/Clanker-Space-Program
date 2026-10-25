@@ -142,6 +142,20 @@ fn stage_plan_fires_its_own_vessel_not_the_focus() {
     let first = view.flight_focus().expect("first spawn focused");
     // `seed_starter_craft` leaves the same craft in the VAB session —
     // a second `launch_craft` spawns a second vessel and takes focus.
+    // The pad is a single berth (the spawn-occupancy gate refuses a
+    // launch that would materialize inside the parked craft), so fly
+    // the first vessel clear before launching again.
+    view.enqueue_command(
+        csp_view::SourceClass::Ui,
+        csp_view::PLAYER_SOURCE_ID,
+        csp_view::SimCommand::SetThrottle {
+            vessel: first,
+            throttle: 1.0,
+        },
+    );
+    for _ in 0..8 {
+        frame(&mut view, 64); // ~8 s — well clear of the pad volume
+    }
     view.launch_craft().expect("second launch");
     frame(&mut view, 1);
     let focus = view.flight_focus().expect("second spawn focused");

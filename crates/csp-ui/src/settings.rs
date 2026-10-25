@@ -85,7 +85,12 @@ impl Default for AudioSettings {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GraphicsSettings {
-    /// The render-quality tier.
+    /// Reserved render-quality tier — persisted and round-tripped like
+    /// [`AudioSettings`]' note says, but consumed by NOTHING today: no
+    /// render tier exists to select (P14-F1). The panel deliberately
+    /// does NOT show a control for it — a lying control is worse than
+    /// an absent one. Kept in the file schema for forward-compat (old
+    /// files carry it; new ones default it).
     pub quality: GraphicsQuality,
     /// The egui zoom factor — the whole UI scales by it (1.0 = native).
     /// Clamped into [`UI_SCALE_MIN`]..=[`UI_SCALE_MAX`] when applied.
@@ -745,21 +750,10 @@ pub fn settings_panel(
             egui::CollapsingHeader::new("Graphics")
                 .default_open(true)
                 .show(ui, |ui| {
-                    egui::ComboBox::from_label("quality")
-                        .selected_text(match state.settings.graphics.quality {
-                            GraphicsQuality::Low => "low",
-                            GraphicsQuality::Medium => "medium",
-                            GraphicsQuality::High => "high",
-                        })
-                        .show_ui(ui, |ui| {
-                            for (q, label) in [
-                                (GraphicsQuality::Low, "low"),
-                                (GraphicsQuality::Medium, "medium"),
-                                (GraphicsQuality::High, "high"),
-                            ] {
-                                ui.selectable_value(&mut state.settings.graphics.quality, q, label);
-                            }
-                        });
+                    // No `quality` row: the field has zero consumers
+                    // (P14-F1) — an interactive control that steers
+                    // nothing is a lie. It stays in the settings model
+                    // for file forward-compat only.
                     ui.add(
                         egui::Slider::new(
                             &mut state.settings.graphics.ui_scale,

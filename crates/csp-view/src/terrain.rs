@@ -373,7 +373,9 @@ pub(crate) fn build_packet(
     };
 
     let eye_rel = cam.eye - env.body_center;
-    let leaves = rt::select_patches(eye_rel, env.radius_m, &cfg.lod);
+    // `amplitude_m` rides the horizon cull — displaced relief up to
+    // `radius + amplitude` stays visible past the bare-datum limb.
+    let leaves = rt::select_patches(eye_rel, env.radius_m, body.amplitude_m, &cfg.lod);
     let mut terrain = Vec::with_capacity(leaves.len());
     let mut ocean = Vec::new();
     for &id in &leaves {

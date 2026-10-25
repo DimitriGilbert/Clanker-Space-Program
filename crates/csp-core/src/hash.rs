@@ -192,8 +192,11 @@ use crate::SimError;
 /// appended `WeldPart::engine` — the resolved `EngineSpec` carrying
 /// the isp and propellant mass fractions the per-tick propellant
 /// bookkeeping debits against, craft identity like the tanks it
-/// drains. `WeldPart` gained the field (save format change). The
-/// goldens rebless.
+/// drains. `WeldPart` gained the field (save format change — the
+/// `SAVE_VERSION` 3 bump that should have landed here came later:
+/// stamped-2 bodies now prove the current schema byte-exact, and a
+/// body that fails the proof is refused `UnsupportedVersion` rather
+/// than silently decoding `engine: None`). The goldens rebless.
 pub const HASH_SCHEMA_VERSION: u32 = 20;
 
 /// Rule-7 sum types: the source of an enum's *declared* stable `u16`

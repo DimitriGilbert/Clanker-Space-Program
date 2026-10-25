@@ -42,7 +42,7 @@
 //! Native-only: the whole module is `cfg(not(target_arch = "wasm32"))`,
 //! so the wasm slice is untouched.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::io::Write;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,12 +61,22 @@ const CHANNELS: usize = 2;
 /// purpose: a one-shot pushed mid-buffer waits at most this long
 /// before the mix hands it to the player.
 const FRAMES_PER_BUF: usize = 512;
+/// Stream-seconds one mix buffer covers — the writer's drain quantum.
+const BUF_TIME_S: f64 = FRAMES_PER_BUF as f64 / SAMPLE_RATE as f64;
 /// How far ahead of real time the writer may fill the player's stdin,
 /// in seconds of queued audio — the bound on the pipe's contribution
 /// to cue latency. The OS pipe alone holds ~185 ms of stream; without
 /// this cap the writer's blocking write is a slack-filling pacer, not
 /// a latency bound.
 const MAX_PIPE_LEAD_S: f64 = 0.05;
+/// The OS pipe's capacity in stream-seconds (64 KiB of interleaved
+/// stereo f32 at 44.1 kHz ≈ 185 ms) — the occupancy the writer assumes
+/// when a blocking write proves the pipe was full. It's an *anchor*,
+/// not a measurement: on a platform with a smaller default pipe the
+/// estimate over-states the backlog once per saturation event (the
+/// recovery sleep runs a touch long — a bounded extra gap), never
+/// under-states it into a permanent backlog.
+const PIPE_CAP_S: f64 = 65_536.0 / (SAMPLE_RATE as f64 * CHANNELS as f64 * 4.0);
 /// Grace period after spawning a player before committing to it — a
 /// binary that exists but cannot connect (`pw-play` with no pipewire
 /// daemon, `paplay` with no pulse socket) exits almost immediately;
@@ -97,36 +107,44 @@ const PLASMA_ONSET_W_M2: f64 = 5.0e3;
 /// See `PLASMA_ONSET_W_M2`.
 const PLASMA_FULL_W_M2: f64 = 8.0e4;
 
-/// The cue text → one-shot map — the vocabulary `flight_present`
-/// pushes plus the fixed `flight_notice` refusals the app's input
-/// layer pushes, mirrored literally (the strings are the wire format;
-/// the drift detector in `AudioBackend::update` logs any cue that
-/// lands unmapped).
-fn cue_shot(text: &str) -> Option<OneShot> {
+/// The cue text → one-shot map. The `sfx_edges` transition vocabulary
+/// maps literally — those strings are the wire format. Everything else
+/// on the `FlightSfx` channel is an app/view `flight_notice`: a
+/// player-facing ack or refusal line, several of them `format!`-built
+/// (`STAGED — N PART(S) JETTISONED`, `SETTINGS — …`) so they can never
+/// literal-match a table (P13-F2). Those map by prefix family, and any
+/// notice no rule names still gets the ack blip — a cue the producers
+/// pushed that resolves to silence was the "dead keypress" bug class,
+/// and warn-once-per-text spammed on every intended notice. There is
+/// deliberately no unmapped path: the map is best-effort enrichment,
+/// not a contract the cue texts must satisfy.
+fn cue_shot(text: &str) -> OneShot {
     match text {
-        "ENGINE IGNITION" => Some(OneShot::EngineIgnition),
-        "ENGINE CUT" => Some(OneShot::EngineCut),
-        "STAGE — PART JETTISONED" => Some(OneShot::StageJettison),
-        "CONTACT" => Some(OneShot::Contact),
+        "ENGINE IGNITION" => return OneShot::EngineIgnition,
+        "ENGINE CUT" => return OneShot::EngineCut,
+        "STAGE — PART JETTISONED" => return OneShot::StageJettison,
+        "CONTACT" => return OneShot::Contact,
         // §2.6.4 latch/unlatch edges — touchdown thump and the
         // launch rumble.
-        "LANDED — SURFACE RAILS" => Some(OneShot::Contact),
-        "LIFTOFF" => Some(OneShot::EngineIgnition),
-        "BREAKUP" => Some(OneShot::Breakup),
-        "DEBRIS IMPACT" => Some(OneShot::DebrisImpact),
-        "VESSEL REMOVED" => Some(OneShot::VesselRemoved),
-        "VESSEL LEFT BUBBLE" => Some(OneShot::VesselLeftBubble),
-        // App-pushed `flight_notice` refusals (the input layer's
-        // "this verb cannot apply" texts) — the acknowledge blip so a
-        // dead keypress still says it was heard, rather than tripping
-        // the vocabulary-drift warn.
-        "SESSION IS READ-ONLY — ATTITUDE NOT APPLIED"
-        | "SESSION IS READ-ONLY — THROTTLE NOT APPLIED"
-        | "PARKED — ATTITUDE LOCKED UNTIL LAUNCH (THROTTLE TO LIFTOFF)"
-        | "ATTITUDE LOCKED — VESSEL IS ON RAILS"
-        | "NO VESSEL — ATTITUDE LOCKED" => Some(OneShot::UiConfirm),
-        _ => None,
+        "LANDED — SURFACE RAILS" => return OneShot::Contact,
+        "LIFTOFF" => return OneShot::EngineIgnition,
+        "BREAKUP" => return OneShot::Breakup,
+        "DEBRIS IMPACT" => return OneShot::DebrisImpact,
+        "VESSEL REMOVED" => return OneShot::VesselRemoved,
+        "VESSEL LEFT BUBBLE" => return OneShot::VesselLeftBubble,
+        _ => {}
     }
+    // The success confirm "STAGED — N PART(S) JETTISONED" carries a
+    // variable count, so it maps by prefix — same stage clunk the
+    // `STAGE —` edge cue plays.
+    if text.starts_with("STAGED —") {
+        return OneShot::StageJettison;
+    }
+    // Every refusal/notice — "SESSION IS READ-ONLY — …", the
+    // `*_LOCKED` verb refusals, "NO VESSEL …", staging/recover
+    // refusals, `COMMAND REFUSED — …`, settings repairs — and any
+    // future cue text gets the acknowledge blip.
+    OneShot::UiConfirm
 }
 
 /// Edge-detector over `FlightSfx.cues`. The queue is a multiset of
@@ -290,19 +308,45 @@ impl MixState {
 /// repeat until the stop flag or a broken pipe. The blocking write is
 /// the slow-path pacer; the lead cap below is the latency bound (see
 /// `MAX_PIPE_LEAD_S`), and it runs *outside* the mix lock.
+///
+/// P13-F1: the old `written/SR − wall_elapsed` lead was a *proxy* for
+/// pipe occupancy — it could never see saturation. A ≥135 ms stall
+/// (suspend, debugger, window drag) or a player whose device clock
+/// runs just off realtime filled the 64 KiB pipe, after which every
+/// `write_all` paced at drain rate with `lead` frozen under the cap:
+/// cue latency silently pegged at ~185 ms for the rest of the
+/// session. The rewrite estimates *occupancy* instead, and occupancy
+/// is observable at exactly two points: realtime drain decays the
+/// estimate between iterations (a writer stall collapses it to 0 —
+/// the player underran and the pipe is empty again), and a *blocked*
+/// write means the pipe is at capacity, re-anchoring the estimate at
+/// `PIPE_CAP_S` so the sleep branch drains the backlog instead of
+/// pacing it. Between those anchors the estimate stays conservative:
+/// a player pre-buffering faster than realtime only lowers true
+/// occupancy, and a slower-than-realtime drain eventually blocks a
+/// write and re-anchors.
 fn writer_loop(stdin: &mut ChildStdin, state: &Mutex<MixState>, stop: &AtomicBool) {
     let mut buf = vec![0.0f32; FRAMES_PER_BUF * CHANNELS];
     let mut bytes = vec![0u8; buf.len() * 4];
-    let started = std::time::Instant::now();
-    let mut written_frames = 0_u64;
+    // Estimated seconds of queued audio sitting in the pipe — the
+    // quantity `MAX_PIPE_LEAD_S` bounds. See the function doc: a stall
+    // decays it to zero (the player underran), a blocked write
+    // re-anchors it at the pipe cap.
+    let mut queued_s = 0.0_f64;
+    let mut last = std::time::Instant::now();
     while !stop.load(Ordering::Relaxed) {
-        // Lead bound: stream-seconds already handed to the pipe minus
-        // wall-seconds the player could have drained. Sleep off the
-        // excess — audio queued in the pipe is stale cue latency, so
-        // a faster-than-realtime mix must wait, not fill.
-        let lead = written_frames as f64 / f64::from(SAMPLE_RATE) - started.elapsed().as_secs_f64();
-        if lead > MAX_PIPE_LEAD_S {
-            std::thread::sleep(std::time::Duration::from_secs_f64(lead - MAX_PIPE_LEAD_S));
+        // The player reads the pipe at realtime; decay the estimate
+        // by wall elapsed since the last iteration. A stall lands
+        // here too: while we slept, the player drained — and then
+        // starved — so the pipe is empty and the estimate floors at
+        // zero rather than pretending the backlog still exists.
+        let now = std::time::Instant::now();
+        queued_s = (queued_s - now.duration_since(last).as_secs_f64()).max(0.0);
+        last = now;
+        if queued_s > MAX_PIPE_LEAD_S {
+            std::thread::sleep(std::time::Duration::from_secs_f64(
+                queued_s - MAX_PIPE_LEAD_S,
+            ));
             continue;
         }
         match state.lock() {
@@ -315,10 +359,22 @@ fn writer_loop(stdin: &mut ChildStdin, state: &Mutex<MixState>, stop: &AtomicBoo
         for (b, s) in bytes.chunks_mut(4).zip(buf.iter()) {
             b.copy_from_slice(&s.to_le_bytes());
         }
+        let write_start = std::time::Instant::now();
         if stdin.write_all(&bytes).is_err() {
             return; // player exited or pipe closed — silently done
         }
-        written_frames += FRAMES_PER_BUF as u64;
+        queued_s += BUF_TIME_S;
+        // A write that had to wait means the pipe was full — the one
+        // place real occupancy is observable. Re-anchor at the pipe
+        // cap so the next iterations sleep while the backlog drains
+        // to `MAX_PIPE_LEAD_S` instead of pacing a saturated pipe
+        // forever. Half a buffer is the discriminator: a blocked
+        // 4 KiB write waits roughly the drain time for the deficit
+        // it needed, while an uncontended write is sub-millisecond.
+        if write_start.elapsed() >= std::time::Duration::from_secs_f64(BUF_TIME_S * 0.5) {
+            queued_s = PIPE_CAP_S;
+            last = std::time::Instant::now();
+        }
     }
 }
 
@@ -349,9 +405,6 @@ pub(crate) struct AudioBackend {
     /// `false` once the child has exited — the backend goes inert
     /// instead of writing into a dead pipe every frame.
     alive: bool,
-    /// Cue texts already warned about — unmapped cues log once, not
-    /// per frame (a `flight.rs` string drift is a report, not spam).
-    unmapped: BTreeSet<String>,
 }
 
 impl AudioBackend {
@@ -425,7 +478,6 @@ impl AudioBackend {
                 plasma_level: 0.0,
                 cues: CueTracker::default(),
                 alive: true,
-                unmapped: BTreeSet::new(),
             };
             backend.set_master(settings);
             log::info!("audio backend open via '{player}' — synthesized cues armed");
@@ -491,29 +543,49 @@ impl AudioBackend {
         }
         self.set_master(settings);
         for text in self.cues.drain_new(&sfx.cues) {
-            match cue_shot(&text) {
-                Some(shot) => self.play(shot),
-                // Log once per text — an unmapped cue means flight.rs's
-                // vocabulary drifted from `cue_shot`'s table.
-                None => {
-                    if self.unmapped.insert(text.clone()) {
-                        log::warn!("unmapped SFX cue {text:?} — cue vocabulary drifted");
-                    }
-                }
-            }
+            // `cue_shot` is total — every pushed cue resolves to a
+            // sound, unrecognized texts to the ack blip (P13-F2).
+            self.play(cue_shot(&text));
         }
 
         // Continuous voices: amplitude follows the focused vessel —
-        // same `vessels.last()` (newest spawn) focus convention
-        // `flight_present`'s `focus_vessel` uses.
-        let focus = snap.vessels.last();
-        let engine_target = focus.map_or(0.0, |v| v.throttle.clamp(0.0, 1.0) as f32);
+        // the SAME pin-aware resolution `flight_present` applies to
+        // the chase camera, HUD, and cue edges (a `recover_control`
+        // pin must not leave the voices on the newest spawn while the
+        // player flies the recovered vessel — P07-F1).
+        let focus = sfx
+            .focus_vessel
+            .and_then(|id| snap.vessels.iter().find(|v| v.id == id));
+        // P13-F4: a NaN throttle/flux frame must not poison the
+        // smoother — `NaN.clamp` passes NaN through, and a NaN level
+        // would pin the gain at 0 forever (NaN > LEVEL_EPS is false).
+        // Non-finite input reads as silence for that frame.
+        let engine_target = focus.map_or(0.0, |v| {
+            if v.throttle.is_finite() {
+                v.throttle.clamp(0.0, 1.0) as f32
+            } else {
+                0.0
+            }
+        });
         let plasma_target = focus.map_or(0.0, |v| {
-            ((v.plasma_w_m2 - PLASMA_ONSET_W_M2) / (PLASMA_FULL_W_M2 - PLASMA_ONSET_W_M2))
-                .clamp(0.0, 1.0) as f32
+            if v.plasma_w_m2.is_finite() {
+                ((v.plasma_w_m2 - PLASMA_ONSET_W_M2) / (PLASMA_FULL_W_M2 - PLASMA_ONSET_W_M2))
+                    .clamp(0.0, 1.0) as f32
+            } else {
+                0.0
+            }
         });
         self.engine_level += (engine_target - self.engine_level) * LEVEL_SMOOTH;
         self.plasma_level += (plasma_target - self.plasma_level) * LEVEL_SMOOTH;
+        // …and the same guard on the state itself: if a non-finite
+        // level ever lands here anyway, reset to silence so the NEXT
+        // finite frame revives the voice instead of staying dead.
+        if !self.engine_level.is_finite() {
+            self.engine_level = 0.0;
+        }
+        if !self.plasma_level.is_finite() {
+            self.plasma_level = 0.0;
+        }
         if let Ok(mut st) = self.state.lock() {
             st.engine_gain = if self.engine_level > LEVEL_EPS {
                 self.master * self.engine_level * ENGINE_GAIN
@@ -545,12 +617,17 @@ impl Drop for AudioBackend {
 }
 
 /// The settings fold: `muted` collapses the mix to silence regardless
-/// of volume; an out-of-range volume clamps into `[0, 1]`.
+/// of volume; an out-of-range volume clamps into `[0, 1]`. A
+/// non-finite value — a `NaN`/`inf` literal in a hand-edited
+/// `settings.ron` survives `f32::clamp` (P14-F3) — folds to the
+/// shipped default rather than feeding NaN PCM into the player.
 fn master_gain(settings: &AudioSettings) -> f32 {
     if settings.muted {
         0.0
-    } else {
+    } else if settings.master_volume.is_finite() {
         settings.master_volume.clamp(0.0, 1.0)
+    } else {
+        AudioSettings::default().master_volume
     }
 }
 
@@ -567,26 +644,60 @@ mod tests {
         }
     }
 
-    /// The vocabulary lock: every cue text `flight_present` can push
-    /// maps to a one-shot — the table is the wire format, so this test
-    /// is the drift tripwire (update() also logs unknowns once).
+    /// The vocabulary lock: every `sfx_edges` transition text maps to
+    /// its own one-shot, the notice families map by prefix to the ack
+    /// blip (incl. `format!` texts that can never literal-match), and
+    /// an unrecognized cue still gets the default beep — `cue_shot`
+    /// is total, so no pushed cue is ever audio-silent (P13-F2).
     #[test]
     fn every_flight_cue_maps() {
-        for text in [
-            "ENGINE IGNITION",
-            "ENGINE CUT",
-            "STAGE — PART JETTISONED",
-            "CONTACT",
-            "LANDED — SURFACE RAILS",
-            "LIFTOFF",
-            "BREAKUP",
-            "DEBRIS IMPACT",
-            "VESSEL REMOVED",
-            "VESSEL LEFT BUBBLE",
+        for (text, want) in [
+            ("ENGINE IGNITION", OneShot::EngineIgnition),
+            ("ENGINE CUT", OneShot::EngineCut),
+            ("STAGE — PART JETTISONED", OneShot::StageJettison),
+            ("CONTACT", OneShot::Contact),
+            ("LANDED — SURFACE RAILS", OneShot::Contact),
+            ("LIFTOFF", OneShot::EngineIgnition),
+            ("BREAKUP", OneShot::Breakup),
+            ("DEBRIS IMPACT", OneShot::DebrisImpact),
+            ("VESSEL REMOVED", OneShot::VesselRemoved),
+            ("VESSEL LEFT BUBBLE", OneShot::VesselLeftBubble),
         ] {
-            assert!(cue_shot(text).is_some(), "{text:?} unmapped");
+            assert_eq!(cue_shot(text), want, "{text:?} mapped wrong");
         }
-        assert!(cue_shot("NO SUCH CUE").is_none());
+        // The `format!` confirm and every refusal/notice family —
+        // exact-matchable or not — resolve to a shot.
+        for (text, want) in [
+            ("STAGED — 3 PART(S) JETTISONED", OneShot::StageJettison),
+            ("SESSION IS READ-ONLY — LAUNCH REFUSED", OneShot::UiConfirm),
+            (
+                "SESSION IS READ-ONLY — ATTITUDE NOT APPLIED",
+                OneShot::UiConfirm,
+            ),
+            (
+                "SESSION IS READ-ONLY — THROTTLE NOT APPLIED",
+                OneShot::UiConfirm,
+            ),
+            (
+                "PARKED — ATTITUDE LOCKED UNTIL LAUNCH (THROTTLE TO LIFTOFF)",
+                OneShot::UiConfirm,
+            ),
+            ("ATTITUDE LOCKED — VESSEL IS ON RAILS", OneShot::UiConfirm),
+            ("NO VESSEL — ATTITUDE LOCKED", OneShot::UiConfirm),
+            ("VESSEL ON RAILS — THROTTLE LOCKED", OneShot::UiConfirm),
+            ("NO VESSEL — THROTTLE LOCKED", OneShot::UiConfirm),
+            ("NOT STAGED — VESSEL IS ON RAILS", OneShot::UiConfirm),
+            ("NO VESSEL TO RECOVER", OneShot::UiConfirm),
+            (
+                "COMMAND REFUSED — CONTROL: VESSEL ON RAILS",
+                OneShot::UiConfirm,
+            ),
+            ("SETTINGS — 2 KEY BINDING(S) MIGRATED", OneShot::UiConfirm),
+            // Unknown future text still gets the default beep.
+            ("SOMETHING FUTURE-PRODUCED", OneShot::UiConfirm),
+        ] {
+            assert_eq!(cue_shot(text), want, "{text:?} mapped wrong");
+        }
     }
 
     /// `CueTracker` fires each push exactly once: a fresh cue is new,
@@ -692,8 +803,12 @@ mod tests {
             return; // graceful-absence path
         };
         // `prev` is flight.rs-private — stage cues via the pub queue.
+        // The voices' focus mirror: `focus_vessel` names the vessel the
+        // pin-aware resolver picked (vessel id 1 below) — without it
+        // there is no focus and the voices correctly read silence.
         let mut sfx = FlightSfx::default();
         sfx.cues.push_back(cue("BREAKUP", 89));
+        sfx.focus_vessel = Some(1);
         let snap = FlightSnapshot {
             vessels: vec![csp_view::flight::FlightBody {
                 id: 1,

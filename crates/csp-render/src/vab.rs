@@ -55,6 +55,16 @@ pub struct VabPacket {
     /// index `i + 1` — the pick readback decodes through this table.
     /// `u64`, not `PartNodeId`, so `csp-app` needs no `csp-phys` edge.
     pub pick_ids: Vec<u64>,
+    /// The `VabSession::craft_epoch` this packet's `pick_ids` table
+    /// was generated from — the stale-pick stamp (P10-F3): a readback
+    /// decoded through a snapshotted table is only meaningful while
+    /// the session still reports the SAME epoch (the app's
+    /// `View::with_vab_session(|v| v.craft_epoch())` read). A craft
+    /// edit between encode and decode either dead-ends the id
+    /// (collapses a parent-pick into "background click", disarming a
+    /// pending placement) or, worse, reuses the id for a DIFFERENT
+    /// node — an epoch check drops the stale decode instead.
+    pub craft_epoch: u64,
 }
 
 /// The offscreen targets the pick pass draws into.

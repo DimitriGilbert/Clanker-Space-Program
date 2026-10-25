@@ -145,6 +145,12 @@ struct App {
     /// map_async landing, and a stale table would silently mis-decode
     /// (selecting the wrong part).
     pick_decode_ids: Option<Vec<u64>>,
+    /// The `VabPacket::craft_epoch` snapshotted beside
+    /// `pick_decode_ids` — the stale-pick stamp (P10-F3). A craft
+    /// edit between the pick encode and the map_async landing makes
+    /// the snapshotted id belong to a different generation: the
+    /// readback is dropped, not applied to the wrong node.
+    pick_decode_epoch: Option<u64>,
     /// Craft-file store: name → `CSPCRAFT` bytes. Memory-first; on
     /// native the store is mirrored to `crafts/*.cspcraft` files under
     /// [`Self::craft_dir`]. The §6.3 wasm demo refuses craft IO entirely
@@ -161,11 +167,16 @@ struct App {
     /// last `CursorMoved`, and whether the left button is held.
     last_cursor: Option<(f64, f64)>,
     map_dragging: bool,
-    /// Cursor position at the last unconsumed LMB press — a candidate
-    /// VAB click. A release within `CLICK_MAX_DRAG_PX` of it becomes a
-    /// pick request; a release past it was an orbit drag and does not
-    /// select.
-    lmb_press: Option<(f64, f64)>,
+    /// The last unconsumed LMB press — a candidate VAB click. The
+    /// outer `Some` records the press itself; the inner `Option` is
+    /// the cursor anchor — `None` when no position has been delivered
+    /// yet (winit's `MouseInput` carries no position and `Window`
+    /// exposes no cursor-position query, so a click can precede the
+    /// first `CursorMoved`; the anchor then binds to the first
+    /// position delivered during the press). A release within
+    /// `CLICK_MAX_DRAG_PX` of the anchor becomes a pick request; a
+    /// release past it was an orbit drag and does not select.
+    lmb_press: Option<Option<(f64, f64)>>,
     /// The physical key a rebind capture just consumed — that key's
     /// events are swallowed until its release. Without this a held
     /// key's repeats would resolve through the *live* keymap (the
@@ -272,13 +283,18 @@ impl App {
     #[allow(clippy::expect_used)]
     fn new() -> Self {
         #[cfg(not(target_arch = "wasm32"))]
-        let (settings, settings_path) = (
+        let ((settings, load_notes), settings_path) = (
             settings_io::load_settings(),
             Some(settings_io::settings_path()),
         );
         #[cfg(target_arch = "wasm32")]
-        let (settings, settings_path) = (settings_io::load_settings(), None);
-        Self::new_inner(settings, settings_path, std::path::PathBuf::from("crafts"))
+        let ((settings, load_notes), settings_path) = (settings_io::load_settings(), None);
+        Self::new_inner(
+            settings,
+            load_notes,
+            settings_path,
+            std::path::PathBuf::from("crafts"),
+        )
     }
 
     /// The settings-path-injecting constructor — what tests drive so the
@@ -287,8 +303,10 @@ impl App {
     /// goes through `new()` → `settings_io::settings_path()`.
     #[cfg(all(test, not(target_arch = "wasm32")))]
     fn new_with_settings_path(settings_path: &std::path::Path) -> Self {
+        let (settings, load_notes) = settings_io::load_settings_from(settings_path);
         Self::new_inner(
-            settings_io::load_settings_from(settings_path),
+            settings,
+            load_notes,
             Some(settings_path.to_path_buf()),
             settings_path.with_file_name("crafts"),
         )
@@ -299,9 +317,11 @@ impl App {
     #[cfg(all(test, not(target_arch = "wasm32")))]
     #[allow(clippy::expect_used)]
     fn new_demo_with_settings_path(settings_path: &std::path::Path) -> Self {
+        let (settings, load_notes) = settings_io::load_settings_from(settings_path);
         Self::assemble(
             View::new_demo().expect("demo data load failed"),
-            settings_io::load_settings_from(settings_path),
+            settings,
+            load_notes,
             Some(settings_path.to_path_buf()),
             settings_path.with_file_name("crafts"),
         )
@@ -310,6 +330,7 @@ impl App {
     #[allow(clippy::expect_used)]
     fn new_inner(
         settings: Settings,
+        load_notes: Vec<String>,
         settings_path: Option<std::path::PathBuf>,
         craft_dir: std::path::PathBuf,
     ) -> Self {
@@ -323,15 +344,19 @@ impl App {
             view.seed_starter_craft()
                 .expect("starter craft seed failed");
         }
-        Self::assemble(view, settings, settings_path, craft_dir)
+        Self::assemble(view, settings, load_notes, settings_path, craft_dir)
     }
 
     /// The `View`-injecting half of construction — the demo build and
     /// the demo-mode tests route `View::new_demo()` through the same
     /// assembly (settings staging, difficulty flags, live settings).
+    /// `load_notes` carries the settings-file repairs the load
+    /// performed ([`settings_io::load_settings`]) — surfaced as
+    /// notices below, never swallowed.
     fn assemble(
         view: View,
         mut settings: Settings,
+        load_notes: Vec<String>,
         settings_path: Option<std::path::PathBuf>,
         craft_dir: std::path::PathBuf,
     ) -> Self {
@@ -346,28 +371,31 @@ impl App {
         // absorb collisions the rewrite can produce), and say so —
         // a silent remap is still a moved binding. Characters with no
         // positional equivalent can't migrate; they get the honest
-        // "layout-dependent bindings exist" notice instead.
+        // "layout-dependent bindings exist" notice instead. Every
+        // repair the file load already performed (P14-F2/F3's salvage,
+        // backfill, non-finite rejects — `load_notes`) joins the same
+        // notice batch: the file's changes surface in every mode, not
+        // just the log.
+        let mut notes = load_notes;
         let migrated = settings_io::migrate_char_bindings(&mut settings.keys);
         if migrated > 0 {
             let dropped = settings.keys.sanitize();
-            log::warn!(
-                "settings: migrated {migrated} layout-dependent character binding(s) to positional key-* tokens ({dropped} collision(s) dropped)"
-            );
-            view.flight_notice(format!(
-                "SETTINGS — {migrated} KEY BINDING(S) MIGRATED TO POSITIONAL KEYS"
+            notes.push(format!(
+                "migrated {migrated} layout-dependent character binding(s) to positional keys ({dropped} collision(s) dropped)"
             ));
-            view.set_settings_notice(Some(format!(
-                "migrated {migrated} layout-dependent character binding(s) to positional keys"
-            )));
         }
         let layout_bound = settings_io::layout_dependent_binding_count(&settings.keys);
         if layout_bound > 0 {
-            log::warn!(
-                "settings: {layout_bound} key binding(s) use characters with no positional equivalent — layout-dependent"
-            );
-            view.set_settings_notice(Some(format!(
+            notes.push(format!(
                 "{layout_bound} key binding(s) use layout-dependent characters — rebind them or Reset to defaults"
-            )));
+            ));
+        }
+        if !notes.is_empty() {
+            for note in &notes {
+                log::warn!("settings: {note}");
+            }
+            view.flight_notice(format!("SETTINGS — {}", notes.join("; ").to_uppercase()));
+            view.set_settings_notice(Some(notes.join("; ")));
         }
         view.stage_settings(&settings);
         // The live keymap mirror — every hint bar and the controls
@@ -388,6 +416,7 @@ impl App {
             pick_rx,
             pick_in_flight: false,
             pick_decode_ids: None,
+            pick_decode_epoch: None,
             craft_store: load_craft_store(&craft_dir),
             craft_dir,
             last_cursor: None,
@@ -429,11 +458,17 @@ impl App {
     /// decision — except in a §2.13 read-only session, where the
     /// command is refused (the dead clock would never drain it).
     fn apply_live_settings(&mut self) {
-        let scale = self
-            .settings
-            .graphics
-            .ui_scale
-            .clamp(UI_SCALE_MIN, UI_SCALE_MAX);
+        // A hand-edited file can carry a literal `NaN` — `f32::clamp`
+        // passes it through and `set_zoom_factor(NaN)` would NaN the
+        // whole egui UI persistently (P14-F3). The load path already
+        // rejects non-finite values; the guard here covers every other
+        // source (a future widget, an in-memory edit) the same way.
+        let raw_scale = self.settings.graphics.ui_scale;
+        let scale = if raw_scale.is_finite() {
+            raw_scale.clamp(UI_SCALE_MIN, UI_SCALE_MAX)
+        } else {
+            1.0
+        };
         self.view.egui_context().set_zoom_factor(scale);
         if let Some(level) = self
             .warp
@@ -745,6 +780,25 @@ impl App {
         // schedule.
         while let Ok(pid) = self.pick_rx.try_recv() {
             self.pick_in_flight = false;
+            // The snapshotted id table is only meaningful while the
+            // session still reports the epoch it was rasterized from
+            // (P10-F3): a craft edit between encode and landing makes
+            // the decoded id stale — drop the readback rather than
+            // select or attach a different generation's node.
+            let live_epoch = self.view.with_vab_session(|v| v.craft_epoch());
+            if matches!(self.pick_decode_epoch, Some(ep) if ep != live_epoch) {
+                // The snapshotted id table belongs to another craft
+                // generation, so the decoded node cannot be trusted —
+                // but a pure drop swallows the click outright. Resolve
+                // it as a background pick instead: `Select(None)` is
+                // id-safe (the session filters by `contains`, and the
+                // new generation's selection is cleared anyway).
+                log::info!(
+                    "stale VAB pick readback — craft_epoch moved since encode; resolving as background"
+                );
+                self.view.vab_event(VabEvent::Pick(None));
+                continue;
+            }
             let node = pid
                 .checked_sub(1)
                 .and_then(|i| self.pick_decode_ids.as_ref()?.get(i as usize).copied());
@@ -832,13 +886,25 @@ impl App {
                         .any(|e| e.class == EventClass::Clamping);
                     // §2.2.1/§2.13's honest channels: rejected commands and
                     // degraded events surface as log lines — they are the
-                    // app's view of Recoverable, never a halt.
+                    // app's view of Recoverable, never a halt. A rejected
+                    // PLAYER command is also a *refusal* — the press that
+                    // issued it did nothing — so it lands on the global cue
+                    // channel too, not just the log. The cue is scoped to
+                    // `SourceClass::Ui`: a Script/Agent channel's reject is
+                    // machine traffic, and a buggy script could otherwise
+                    // spam cues + blips every frame.
                     for rej in &report.rejected {
                         log::warn!(
                             "command rejected on originating channel {:?}: {}",
                             rej.key,
                             rej.error
                         );
+                        if rej.key.source_class == SourceClass::Ui {
+                            self.view.flight_notice(format!(
+                                "COMMAND REFUSED — {}",
+                                rej.error.reason().to_uppercase()
+                            ));
+                        }
                     }
                     for e in &report.degraded {
                         log::warn!("event degraded (fallback applied): {e}");
@@ -933,7 +999,15 @@ impl App {
     /// Extracted from `run_frame` under the complexity budget.
     fn handle_ui_outbox(&mut self, outbox: csp_view::UiOutbox) {
         if outbox.warp_step != 0 {
-            self.warp.request_step(outbox.warp_step);
+            if self.read_only {
+                // Same §2.13 discipline as the key-driven warp verbs:
+                // a halted session's `decide` never runs, so the
+                // request would change nothing — say so.
+                self.view
+                    .flight_notice("SESSION IS READ-ONLY — WARP NOT APPLIED");
+            } else {
+                self.warp.request_step(outbox.warp_step);
+            }
         }
         if let Some(mode) = outbox.mode {
             self.ui_confirm();
@@ -948,30 +1022,23 @@ impl App {
                 // §6.3: the demo build does not persist or export craft
                 // files — the panel hides the row, this is the app's
                 // enforcement half.
-                self.view.vab_event(VabEvent::Notice(
-                    "craft save is off in the web demo".to_string(),
-                ));
+                self.craft_refusal("craft save is off in the web demo".to_string());
             } else if self.read_only {
                 // §2.13: a halted session is read-only — a craft file
                 // written from a possibly-corrupt world is an artifact
                 // nobody should trust.
-                self.view.vab_event(VabEvent::Notice(format!(
-                    "session is read-only — '{name}' not saved"
-                )));
+                self.craft_refusal(format!("session is read-only — '{name}' not saved"));
             } else if let Err(reason) = validate_craft_name(&name) {
                 // Reject before either half of the store can diverge:
                 // a separator or traversal name would write outside —
                 // or below — `craft_dir` while the store key and the
                 // file list showed a phantom entry the non-recursive
                 // loader can never find.
-                self.view.vab_event(VabEvent::Notice(format!(
-                    "'{name}' is not a usable craft name ({reason})"
-                )));
+                self.craft_refusal(format!("'{name}' is not a usable craft name ({reason})"));
             } else if let Err(e) = save_craft_file(&self.craft_dir, &name, &bytes) {
                 // Honest failure: no store entry, no list update — the
                 // craft files row and the disk mirror stay in lockstep.
-                self.view
-                    .vab_event(VabEvent::Notice(format!("could not save '{name}': {e}")));
+                self.craft_refusal(format!("could not save '{name}': {e}"));
             } else {
                 // Insert only after the write lands — store, file
                 // list, and filesystem agree or none of them moves.
@@ -1039,11 +1106,12 @@ impl App {
                 // invisible outside the editor.
                 self.view
                     .flight_notice("SESSION IS READ-ONLY — LAUNCH REFUSED");
-            } else {
-                // A refusal already lands on the VAB notice row inside
-                // `launch_craft`; its `Err` exists for callers with no
-                // notice audience (the startup seed).
-                let _ = self.view.launch_craft();
+            } else if let Err(reason) = self.view.launch_craft() {
+                // `launch_refused` already wrote the VAB session's
+                // notice row; forward the same text to the global cue
+                // channel so the refusal reads whatever mode the
+                // session sits in (a VAB row is VAB-only).
+                self.view.flight_notice(reason.to_uppercase());
             }
         }
         // M5 node panel → the §7.6-logged command path.
@@ -1063,18 +1131,24 @@ impl App {
                 // §6.3: no craft-file import either — the VabSession's
                 // `file_io` gate would refuse the load anyway; this
                 // keeps the honest notice at the app's layer.
-                self.view.vab_event(VabEvent::Notice(format!(
-                    "craft load is off in the web demo ('{name}')"
-                )));
+                self.craft_refusal(format!("craft load is off in the web demo ('{name}')"));
             } else {
                 match self.craft_store.get(&name) {
                     Some(b) => self.view.vab_event(VabEvent::LoadCraft(b.clone())),
-                    None => self
-                        .view
-                        .vab_event(VabEvent::Notice(format!("no craft file '{name}'"))),
+                    None => self.craft_refusal(format!("no craft file '{name}'")),
                 }
             }
         }
+    }
+
+    /// A craft-file refusal lands on TWO channels: the VAB session's
+    /// notice row (the panel context that produced the request) AND
+    /// the global `flight_notice` cue channel — the row is invisible
+    /// outside the editor, and a refused click must say so wherever
+    /// the session sits.
+    fn craft_refusal(&mut self, text: String) {
+        self.view.flight_notice(text.clone());
+        self.view.vab_event(VabEvent::Notice(text));
     }
 
     /// The paint half of the frame: consume the `UiBuild`-produced
@@ -1260,11 +1334,15 @@ impl App {
         // of dropping silently.
         let mut encode_pick = false;
         let mut encoded_ids = None;
+        let mut encoded_epoch = None;
         let mut resolve_background = false;
         if let Some((x, y)) = self.pending_pick.take() {
             if self.pick_in_flight {
-                // One outstanding pick — drop the request; the next
-                // click retriggers.
+                // One outstanding pick — the click can't rasterize a
+                // second pass, but it is still a *click*: resolve it
+                // as background so a select/cancel gesture lands
+                // instead of vanishing (P10-F1).
+                resolve_background = true;
             } else if x < gpu.config.width && y < gpu.config.height {
                 encode_pick = match (&mut self.vab_renderer, &self.last_vab_packet) {
                     (Some(v), Some(packet)) => {
@@ -1280,18 +1358,30 @@ impl App {
                             // Snapshot the decode table alongside the
                             // rasterized pixels — the readback decodes
                             // a frame or two later and `last_vab_packet`
-                            // may have moved on by then.
+                            // may have moved on by then. The craft epoch
+                            // rides beside it so a pick encoded against
+                            // one craft generation can't decode into the
+                            // next (P10-F3).
                             encoded_ids = Some(packet.pick_ids.clone());
+                            encoded_epoch = Some(packet.craft_epoch);
                         }
                         ok
                     }
                     _ => false,
                 };
                 resolve_background = !encode_pick;
+            } else {
+                // The release landed outside the (possibly just-
+                // resized) surface — definitionally a background
+                // pixel: no rasterize exists for it, but the click
+                // still deselects and disarms a pending placement
+                // (P10-F2).
+                resolve_background = true;
             }
         }
         if let Some(ids) = encoded_ids {
             self.pick_decode_ids = Some(ids);
+            self.pick_decode_epoch = encoded_epoch;
         }
         gpu.submit(*frame);
         if encode_pick {
@@ -1509,40 +1599,113 @@ impl App {
         );
     }
 
+    /// Why the focused vessel cannot take a `SetThrottle` right now —
+    /// `None` means it can. The `Some` text is the HUD cue the press
+    /// surfaces, the `attitude_blocker` analog the throttle verbs
+    /// lacked (P02-F2): without it a rails or missing focus enqueued
+    /// a `SetThrottle` the drain rejects `Recoverable` (a `log::warn`
+    /// nobody in-game sees) or, for no vessel at all, returned
+    /// silently — a dead key either way. `SurfaceLatched` is
+    /// deliberately NOT a blocker: `SetThrottle` *is* the §2.6.4
+    /// unlatch command ("throttle to liftoff").
+    fn throttle_blocker(&self) -> Option<&'static str> {
+        if self.read_only {
+            return Some("SESSION IS READ-ONLY — THROTTLE NOT APPLIED");
+        }
+        let Some(vessel) = self.view.flight_focus() else {
+            return Some("NO VESSEL — THROTTLE LOCKED");
+        };
+        match self.view.sim.vessels().get(&vessel).map(|v| &v.state) {
+            Some(csp_view::VesselState::InBubble(_))
+            | Some(csp_view::VesselState::SurfaceLatched(_)) => None,
+            Some(csp_view::VesselState::OnRails(_)) => Some("VESSEL ON RAILS — THROTTLE LOCKED"),
+            None => Some("NO VESSEL — THROTTLE LOCKED"),
+        }
+    }
+
+    /// The throttle verbs' shared dispatch — the VAB suppresses the
+    /// axis entirely (throttle is a flight verb; a press there says so
+    /// rather than dying), and everywhere else `throttle_blocker`
+    /// names the refusal — a snap press on a rails focus or no vessel
+    /// used to be a dead key (P02-F2).
+    fn throttle_dispatch(&mut self, action: KeyAction, mode: ViewMode) {
+        if mode == ViewMode::Vab {
+            self.view.flight_notice("THROTTLE — FLIGHT/MAP VIEW ONLY");
+            return;
+        }
+        if matches!(action, KeyAction::ThrottleUp | KeyAction::ThrottleDown) {
+            // Fine throttle — the held-key axis: the press inserts
+            // into `throttle_held` (the per-frame ramp drives it from
+            // there) and lands the tap step.
+            self.throttle_press(action);
+            return;
+        }
+        match self.throttle_blocker() {
+            Some(reason) => self.view.flight_notice(reason),
+            None => {
+                // Snap keys rebase the axis too — a Z/X pressed
+                // mid-hold moves the ramp's commanded value to the
+                // rail instead of fighting it from the old base.
+                self.throttle_axis = if action == KeyAction::ThrottleFull {
+                    1.0
+                } else {
+                    0.0
+                };
+                if let Some(vessel) = self.view.flight_focus() {
+                    self.view.enqueue_command(
+                        SourceClass::Ui,
+                        // The shared player-command FIFO — launch's
+                        // `SpawnPhysicalVessel` rides it too.
+                        csp_view::PLAYER_SOURCE_ID,
+                        SimCommand::SetThrottle {
+                            vessel,
+                            throttle: self.throttle_axis,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
     /// Press edge of a throttle axis key: insert into the held set —
     /// [`Self::tick_throttle_ramp`] picks it up next frame — and apply
     /// the tap step so a quick press still moves the needle one fine
-    /// notch (`BTreeSet::insert` dedup makes OS repeats free).
+    /// notch (`BTreeSet::insert` dedup makes OS repeats free). A
+    /// blocked press (no commandable focus) is NOT silent: the reason
+    /// lands as a HUD cue via [`Self::throttle_blocker`], and the key
+    /// stays held so the ramp picks the axis up the frame the focus
+    /// is commandable again — the same held-through-a-transition
+    /// contract the attitude verbs' deferral provides.
     fn throttle_press(&mut self, action: KeyAction) {
-        if self.read_only {
-            // §2.13: a halted session takes no new sim commands — the
-            // throttle would pile up undrained behind a clock that
-            // never ticks again. Same refusal convention as the
-            // launch/maneuver gates, on the HUD's cue channel where a
-            // flight-view press can see it.
-            self.view
-                .flight_notice("SESSION IS READ-ONLY — THROTTLE NOT APPLIED");
-            return;
-        }
         if !self.throttle_held.insert(action) {
             return; // already held — an OS repeat
         }
         if self.throttle_held.len() == 1 {
             // A ramp starting from released re-reads the applied
-            // throttle (a latched craft reads 0) — the axis then owns
-            // the commanded value until every throttle key is up.
-            self.throttle_axis = self
+            // throttle — but only a bubble-resident body HAS an
+            // applied value to read (P02-F2). A latched or rails
+            // focus keeps the axis where it was: squashing it to 0
+            // would diverge the wall-side commanded axis from a
+            // nonzero commanded value with no signal.
+            if let Some(body) = self
                 .view
                 .flight_focus()
                 .and_then(|v| self.view.sim.vessels().get(&v))
                 .and_then(|v| v.body())
-                .map_or(0.0, |b| b.throttle);
+            {
+                self.throttle_axis = body.throttle;
+            }
         }
-        self.throttle_axis_step(if action == KeyAction::ThrottleUp {
-            THROTTLE_TAP_STEP
-        } else {
-            -THROTTLE_TAP_STEP
-        });
+        match self.throttle_blocker() {
+            // No doomed `SetThrottle` rides the player FIFO to a
+            // log-only reject — the refusal says why instead.
+            Some(reason) => self.view.flight_notice(reason),
+            None => self.throttle_axis_step(if action == KeyAction::ThrottleUp {
+                THROTTLE_TAP_STEP
+            } else {
+                -THROTTLE_TAP_STEP
+            }),
+        }
     }
 
     /// Release edge of a throttle axis key — just leaves the held set.
@@ -1574,14 +1737,11 @@ impl App {
         if dir == 0 {
             return;
         }
-        // A rails focus has no throttle surface — keep the axis held
-        // but don't feed the drain a reject every frame.
-        if self
-            .view
-            .flight_focus()
-            .and_then(|v| self.view.sim.vessels().get(&v))
-            .is_some_and(|v| matches!(v.state, csp_view::VesselState::OnRails(_)))
-        {
+        // A blocked focus (rails, no vessel — `throttle_blocker`'s
+        // whole list) has no throttle surface: keep the axis held but
+        // don't feed the drain a reject every frame — the press's
+        // notice already said why once.
+        if self.throttle_blocker().is_some() {
             return;
         }
         self.throttle_axis_step(f64::from(dir) * THROTTLE_RAMP_PER_S * dt_wall);
@@ -1656,6 +1816,64 @@ impl App {
         if !self.attitude_held.is_empty() {
             self.attitude_held.clear();
             self.apply_attitude();
+        }
+    }
+
+    /// LMB press/release for the VAB click-vs-drag decision — lifted
+    /// out of `window_event` so the match stays a routing table.
+    ///
+    /// The pick is decided at RELEASE: an unconsumed press is only a
+    /// click *candidate* — it may be the start of a camera orbit drag,
+    /// and a drag must not also select. The press is recorded even
+    /// with no known cursor position (winit's `MouseInput` carries
+    /// none and `Window` exposes no cursor-position query, so a click
+    /// with no prior `CursorMoved` would otherwise be dropped); the
+    /// anchor then binds to the first position delivered during the
+    /// press, and a no-motion release picks at the release position.
+    fn lmb_click_candidate(&mut self, state: ElementState, consumed: bool) {
+        match state {
+            ElementState::Pressed => {
+                self.lmb_press = if consumed {
+                    None
+                } else {
+                    Some(self.last_cursor)
+                };
+            }
+            ElementState::Released => {
+                // VAB: an unconsumed click that stayed inside the drag
+                // threshold requests a GPU pick at the cursor — the
+                // readback lands via the pick channel a frame or two
+                // later.
+                if let Some(press) = self.lmb_press.take() {
+                    // Release-side cursor wins — the click targets
+                    // where it lands; the press anchor is the fallback
+                    // for a press that saw no delivered motion.
+                    let pos = self.last_cursor.or(press);
+                    let dragged = match (press, pos) {
+                        (Some(p), Some(q)) => (q.0 - p.0).hypot(q.1 - p.1) > CLICK_MAX_DRAG_PX,
+                        _ => false,
+                    };
+                    if !consumed && !dragged && self.view.mode() == ViewMode::Vab {
+                        match pos {
+                            Some(q) => {
+                                self.pending_pick =
+                                    Some((q.0.max(0.0) as u32, q.1.max(0.0) as u32));
+                            }
+                            // Press+release with zero `CursorMoved`
+                            // ever delivered — the click has no pixel
+                            // to pick at (winit's `MouseInput` carries
+                            // no position and `Window` exposes no
+                            // cursor query). A silent drop is input
+                            // loss; say so on the session's notice row.
+                            None => {
+                                self.view.vab_event(VabEvent::Notice(
+                                    "click had no cursor position — nothing picked".to_string(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1761,54 +1979,40 @@ impl App {
                 });
             }
             // §2.6.3: request_step lands in the controller and becomes a
-            // logged `SetWarp` on the next decide().
-            KeyAction::WarpUp => self.warp.request_step(1),
-            KeyAction::WarpDown => self.warp.request_step(-1),
-            // M4c flight throttle — the §7.6 command channel. The VAB
-            // suppresses it (throttle is a flight verb).
-            KeyAction::ThrottleFull | KeyAction::ThrottleCut if mode != ViewMode::Vab => {
+            // logged `SetWarp` on the next decide(). While halted the
+            // decide never runs — the press used to change literally
+            // nothing; say so instead of dying silently.
+            KeyAction::WarpUp | KeyAction::WarpDown => {
                 if self.read_only {
-                    // §2.13: a halted session takes no new sim commands —
-                    // the throttle would pile up undrained behind a
-                    // clock that never ticks again. The HUD cue channel,
-                    // not the VAB row — this key fires in flight.
                     self.view
-                        .flight_notice("SESSION IS READ-ONLY — THROTTLE NOT APPLIED");
+                        .flight_notice("SESSION IS READ-ONLY — WARP NOT APPLIED");
                 } else {
-                    // Snap keys rebase the axis too — a Z/X pressed
-                    // mid-hold moves the ramp's commanded value to the
-                    // rail instead of fighting it from the old base.
-                    self.throttle_axis = if action == KeyAction::ThrottleFull {
-                        1.0
-                    } else {
-                        0.0
-                    };
-                    if let Some(vessel) = self.view.flight_focus() {
-                        self.view.enqueue_command(
-                            SourceClass::Ui,
-                            // The shared player-command FIFO — launch's
-                            // `SpawnPhysicalVessel` rides it too.
-                            csp_view::PLAYER_SOURCE_ID,
-                            SimCommand::SetThrottle {
-                                vessel,
-                                throttle: self.throttle_axis,
-                            },
-                        );
-                    }
+                    self.warp
+                        .request_step(if action == KeyAction::WarpUp { 1 } else { -1 });
                 }
             }
-            // Fine throttle — the held-key axis: the press inserts into
-            // `throttle_held` (the per-frame ramp drives it from there)
-            // and lands the tap step; same §7.6 channel and the same
-            // read-only discipline as the full/cut verbs.
-            KeyAction::ThrottleUp | KeyAction::ThrottleDown if mode != ViewMode::Vab => {
-                self.throttle_press(action);
-            }
+            // M4c flight throttle — the §7.6 command channel, snap
+            // verbs and the held axis share the mode gate and the
+            // refusal blocker (`throttle_dispatch` keeps `dispatch`
+            // under the complexity budget).
+            KeyAction::ThrottleFull
+            | KeyAction::ThrottleCut
+            | KeyAction::ThrottleUp
+            | KeyAction::ThrottleDown => self.throttle_dispatch(action, mode),
             // Space fires the next stage — the view resolves the
             // session-captured drop set into logged `JettisonPart`s.
-            KeyAction::Stage if mode == ViewMode::Flight => self.stage_press(),
+            // The fire itself is mode-agnostic (the plan binds the
+            // launch's vessel, not the camera), so Flight's old
+            // `mode ==` gate just made Space a dead key in Map —
+            // widened to everything but the editor, where it still
+            // says so rather than staging silently.
+            KeyAction::Stage if mode != ViewMode::Vab => self.stage_press(),
+            KeyAction::Stage => self.view.flight_notice("STAGE — FLIGHT/MAP VIEW ONLY"),
             KeyAction::CycleFocus if mode == ViewMode::Map => {
                 self.view.map_event(MapKeyEvent::CycleFocus)
+            }
+            KeyAction::CycleFocus => {
+                self.view.flight_notice("CYCLE FOCUS — MAP VIEW ONLY");
             }
             // Pass-1 dead-stick recovery: pull the focused (or newest)
             // on-rails vessel back into the bubble and take its
@@ -1820,6 +2024,10 @@ impl App {
                 } else {
                     self.view.recover_control();
                 }
+            }
+            KeyAction::RecoverControl => {
+                self.view
+                    .flight_notice("RECOVER-CONTROL — FLIGHT/MAP VIEW ONLY");
             }
             // The controls card and the dev debug scaffold — session
             // toggles on the view, no sim involvement; same blip
@@ -1843,9 +2051,13 @@ impl App {
             | KeyAction::RollRight => {
                 if mode == ViewMode::Flight {
                     self.attitude_press(action);
-                } else if !matches!(action, KeyAction::RollLeft | KeyAction::RollRight) {
-                    // Roll keys are flight-only; the pan cluster still
-                    // steers the map/VAB cameras per event.
+                } else if matches!(action, KeyAction::RollLeft | KeyAction::RollRight) {
+                    // Roll keys are flight-only — say so instead of
+                    // dying as a dead key.
+                    self.view.flight_notice("ROLL — FLIGHT VIEW ONLY");
+                } else {
+                    // The pan cluster still steers the map/VAB cameras
+                    // per event.
                     let (dx_px, dy_px) = match action {
                         KeyAction::PanUp => (0.0, -PAN_STEP_PX),
                         KeyAction::PanDown => (0.0, PAN_STEP_PX),
@@ -1858,8 +2070,9 @@ impl App {
                         ViewMode::Flight => {}
                     }
                 }
-            }
-            _ => {}
+            } // No catch-all: the match stays exhaustive on purpose —
+              // a new `KeyAction` variant is a compile error here, not
+              // another silently-dead verb.
         }
     }
 }
@@ -1957,30 +2170,7 @@ impl ApplicationHandler for App {
                 ..
             } => {
                 self.map_dragging = !consumed && state == ElementState::Pressed;
-                match state {
-                    ElementState::Pressed => {
-                        // VAB pick is decided at RELEASE, not here: an
-                        // unconsumed press is only a click *candidate* —
-                        // it may be the start of a camera orbit drag,
-                        // and a drag must not also select.
-                        self.lmb_press = if consumed { None } else { self.last_cursor };
-                    }
-                    ElementState::Released => {
-                        // VAB: an unconsumed click that stayed inside
-                        // the drag threshold requests a GPU pick at the
-                        // cursor — the readback lands via the pick
-                        // channel a frame or two later.
-                        if let Some(press) = self.lmb_press.take() {
-                            let pos = self.last_cursor.unwrap_or(press);
-                            let dragged =
-                                (pos.0 - press.0).hypot(pos.1 - press.1) > CLICK_MAX_DRAG_PX;
-                            if !consumed && !dragged && self.view.mode() == ViewMode::Vab {
-                                self.pending_pick =
-                                    Some((pos.0.max(0.0) as u32, pos.1.max(0.0) as u32));
-                            }
-                        }
-                    }
-                }
+                self.lmb_click_candidate(state, consumed);
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let pos = (position.x, position.y);
@@ -1999,6 +2189,13 @@ impl ApplicationHandler for App {
                             self.view.flight_event(FlightEvent::Orbit { dyaw, dpitch })
                         }
                     }
+                }
+                // A press still awaiting its first position binds its
+                // anchor now — the drag threshold then measures real
+                // movement during the press, while a no-motion click
+                // keeps the release position as its pick pixel.
+                if matches!(self.lmb_press, Some(None)) {
+                    self.lmb_press = Some(Some(pos));
                 }
                 // `last_cursor` updates even on egui-consumed moves —
                 // otherwise a drag crossing a panel exits with a stale
@@ -2256,15 +2453,18 @@ mod tests {
         s.keys
             .bind(KeyAction::WarpUp, KeyBinding::parse("f7").unwrap());
         settings_io::save_settings_to(&path, &s).unwrap();
-        assert_eq!(settings_io::load_settings_from(&path), s);
-        // Missing file → defaults (the first-run path).
+        assert_eq!(settings_io::load_settings_from(&path), (s, Vec::new()));
+        // Missing file → defaults (the first-run path), no notes.
         assert_eq!(
             settings_io::load_settings_from(&dir.join("absent.ron")),
-            Settings::default()
+            (Settings::default(), Vec::new())
         );
-        // Corrupt file → defaults + warn, never a crash.
+        // Corrupt file → defaults + a visible repair note, never a
+        // crash and never a silent reset (P14-F2).
         std::fs::write(&path, "not ron ((").unwrap();
-        assert_eq!(settings_io::load_settings_from(&path), Settings::default());
+        let (got, notes) = settings_io::load_settings_from(&path);
+        assert_eq!(got, Settings::default());
+        assert!(!notes.is_empty(), "a corrupt file must leave a note");
     }
 
     /// The §2.14 bundle, file by file — the save inside decodes through
@@ -2313,7 +2513,10 @@ mod tests {
         let err = std::fs::read_to_string(bundle.join("error.txt")).unwrap();
         assert!(err.contains("injected invariant violation"));
         let fp = std::fs::read_to_string(bundle.join("fingerprint.json")).unwrap();
-        assert!(fp.contains("\"save_version\": 2"));
+        assert!(fp.contains(&format!(
+            "\"save_version\": {}",
+            csp_view::save::SAVE_VERSION_CURRENT
+        )));
         assert!(fp.contains("5a5a5a5a")); // data_set_hash hex prefix
         assert!(fp.contains("\"state_hash\": \"a5a5a5a5")); // world hash hex
     }
@@ -2458,7 +2661,7 @@ mod tests {
         // The tracked window size won over the stale staged copy.
         assert_eq!(app.settings.graphics.window_size, [1920, 1080]);
         // Persisted: the injected path now holds the applied file.
-        let on_disk = settings_io::load_settings_from(&path);
+        let (on_disk, _) = settings_io::load_settings_from(&path);
         assert_eq!(on_disk.gameplay.max_warp_multiplier, 100);
         assert!((on_disk.graphics.ui_scale - 1.5).abs() < 1e-6);
         assert_eq!(on_disk.graphics.window_size, [1920, 1080]);
@@ -2748,6 +2951,193 @@ mod tests {
         assert!(
             saw_command,
             "held pitch key should command a rate once airborne"
+        );
+    }
+
+    /// P02-F2: throttle verbs name their refusal. With no vessel at
+    /// all the axis press lands "NO VESSEL — THROTTLE LOCKED" on the
+    /// cue channel and enqueues nothing; in the VAB the verbs are a
+    /// mode refusal; a halted session's warp press says why too —
+    /// none of them a dead key anymore.
+    #[test]
+    fn throttle_verbs_notice_instead_of_silent_refuse() {
+        let dir = tempdir("throttle-blocker");
+        // `View::default()` — no vessels, no pad seed.
+        let mut app = App::assemble(
+            View::default(),
+            Settings::default(),
+            Vec::new(),
+            Some(dir.join("settings.ron")),
+            dir.join("crafts"),
+        );
+        let cues = |app: &App| -> Vec<String> {
+            app.view
+                .world
+                .resource::<csp_view::flight::FlightSfx>()
+                .cues
+                .iter()
+                .map(|c| c.text.clone())
+                .collect()
+        };
+        app.dispatch(KeyAction::ThrottleUp);
+        assert!(cues(&app).iter().any(|c| c.contains("NO VESSEL")));
+        // No doomed SetThrottle was enqueued for a nonexistent focus.
+        assert!(app.view.sim.command_log().is_empty());
+        app.dispatch(KeyAction::ThrottleFull);
+        assert_eq!(
+            cues(&app)
+                .iter()
+                .filter(|c| c.contains("NO VESSEL"))
+                .count(),
+            2
+        );
+        // VAB mode: every flight verb says it's the wrong view.
+        app.view.set_mode(ViewMode::Vab);
+        for a in [
+            KeyAction::ThrottleUp,
+            KeyAction::ThrottleFull,
+            KeyAction::Stage,
+            KeyAction::RecoverControl,
+        ] {
+            app.dispatch(a);
+            assert!(
+                cues(&app).iter().any(|c| c.contains("VIEW ONLY")),
+                "{a:?} died silently in VAB"
+            );
+        }
+        // Outside Map, CycleFocus is a mode refusal too.
+        app.view.set_mode(ViewMode::Flight);
+        app.dispatch(KeyAction::CycleFocus);
+        assert!(cues(&app).iter().any(|c| c.contains("MAP VIEW ONLY")));
+        // Halted: a warp keypress is a dead verb no longer.
+        app.read_only = true;
+        app.dispatch(KeyAction::WarpUp);
+        assert!(cues(&app).iter().any(|c| c.contains("WARP NOT APPLIED")));
+        assert_eq!(app.warp.requested_multiplier(), 1);
+    }
+
+    /// P02-F2's axis half: a ramp start on a focus with no bubble
+    /// body — the latched pad craft — must NOT squash `throttle_axis`
+    /// to 0; the axis is the wall-side commanded value and the sim's
+    /// stored throttle may not be readable through `body()`.
+    #[test]
+    fn latched_focus_keeps_the_throttle_axis() {
+        let dir = tempdir("axis-no-squash");
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        // Settle the seeded pad craft to its surface latch.
+        app.view.begin_frame();
+        app.view.sim_step(320).unwrap();
+        app.view.end_frame();
+        let vessel = app.view.flight_focus().unwrap();
+        assert!(
+            app.view.sim.vessels()[&vessel].body().is_none(),
+            "seeded craft should be surface-latched (no body to read)"
+        );
+        // A commanded axis value in flight (e.g. just-snapped full)
+        // survives the next press's re-read — latched craft have no
+        // `body()` to rebase from, so the axis holds its own value
+        // and the tap steps it up from there.
+        app.throttle_axis = 0.4;
+        app.dispatch(KeyAction::ThrottleUp);
+        assert!(
+            (app.throttle_axis - 0.45).abs() < 1e-9,
+            "axis squashed to the tap base: {}",
+            app.throttle_axis
+        );
+        app.throttle_release(KeyAction::ThrottleUp);
+    }
+
+    /// P14-F2a: a settings file written before the held-throttle /
+    /// stage / recover / roll verbs existed leaves them absent from
+    /// `bindings` — the load must backfill the shipped defaults so
+    /// upgraders don't get six dead verbs, while a present-but-empty
+    /// row stays the user's deliberate unbind.
+    #[test]
+    fn load_backfills_verbs_the_file_predates() {
+        let dir = tempdir("backfill");
+        let path = dir.join("settings.ron");
+        let mut s = Settings::default();
+        // Simulate the pre-M10-verbs file: six actions absent, and a
+        // deliberately-cleared WarpUp that must stay unbound.
+        for a in [
+            KeyAction::ThrottleUp,
+            KeyAction::ThrottleDown,
+            KeyAction::Stage,
+            KeyAction::RecoverControl,
+            KeyAction::RollLeft,
+            KeyAction::RollRight,
+        ] {
+            s.keys.bindings.remove(&a);
+        }
+        s.keys.bindings.insert(KeyAction::WarpUp, Vec::new());
+        settings_io::save_settings_to(&path, &s).unwrap();
+        let (loaded, notes) = settings_io::load_settings_from(&path);
+        for a in [KeyAction::ThrottleUp, KeyAction::Stage, KeyAction::RollLeft] {
+            assert!(
+                loaded.keys.bindings.get(&a).is_some_and(|v| !v.is_empty()),
+                "{a:?} stayed unbound"
+            );
+        }
+        assert!(loaded.keys.action_for("space") == Some(KeyAction::Stage));
+        // …but the deliberate unbind is honored — absent ≠ empty.
+        assert_eq!(loaded.keys.bindings[&KeyAction::WarpUp], Vec::new());
+        assert!(
+            notes.iter().any(|n| n.contains("no binding")),
+            "backfill must leave a visible note: {notes:?}"
+        );
+    }
+
+    /// P14-F3: a hand-edited `NaN` literal parses through RON and
+    /// `f32::clamp` lets it straight through — the load must reject
+    /// it before `set_zoom_factor`/`master_gain` can see it.
+    #[test]
+    fn load_rejects_nonfinite_floats() {
+        let dir = tempdir("nonfinite");
+        let path = dir.join("settings.ron");
+        std::fs::write(
+            &path,
+            "(graphics: (ui_scale: NaN), audio: (master_volume: inf))",
+        )
+        .unwrap();
+        let (s, notes) = settings_io::load_settings_from(&path);
+        assert!(s.graphics.ui_scale.is_finite());
+        assert_eq!(s.audio.master_volume, 0.8); // shipped default
+        assert!(
+            notes.iter().any(|n| n.contains("not a finite number")),
+            "nonfinite rejection must leave a note: {notes:?}"
+        );
+    }
+
+    /// P14-F2b: a file with one variant this build doesn't know — the
+    /// downgrade case — used to reset EVERYTHING with only a
+    /// `log::warn`. The lenient load keeps every field and binding row
+    /// that still parses and reports the dropped row.
+    #[test]
+    fn corrupt_keymap_salvages_readable_fields() {
+        let dir = tempdir("salvage");
+        let path = dir.join("settings.ron");
+        std::fs::write(
+            &path,
+            r#"(
+                audio: (master_volume: 0.5),
+                keys: (bindings: {r#warp-up: ["f7"], stage: ["space"], r#future-verb: ["f9"]}),
+            )"#,
+        )
+        .unwrap();
+        let (s, notes) = settings_io::load_settings_from(&path);
+        // The unknown verb row is dropped; the readable rows and
+        // other sections survive; missing verbs backfill.
+        assert_eq!(s.keys.action_for("f7"), Some(KeyAction::WarpUp));
+        assert_eq!(s.keys.action_for("space"), Some(KeyAction::Stage));
+        assert!((s.audio.master_volume - 0.5).abs() < 1e-6);
+        assert!(s.keys.action_for("shift") == Some(KeyAction::ThrottleUp));
+        assert!(
+            notes.iter().any(|n| n.contains("doesn't know")),
+            "the dropped row must be named: {notes:?}"
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("not fully readable")),
+            "the salvage itself must be disclosed: {notes:?}"
         );
     }
 }

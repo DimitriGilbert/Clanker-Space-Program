@@ -2365,8 +2365,10 @@ impl World {
     /// arena-growing path must count vessels + in-flight builds, not
     /// vessels alone: a `vessels`-only check lets a delivery push the
     /// arena to `max_vessels + 1` while other spawns still believe a
-    /// slot is free.
-    pub(crate) fn vessel_slots_in_use(&self) -> u64 {
+    /// slot is free. `pub` so a launch caller can pre-check the cap
+    /// (`vessel_slots_in_use() >= vessel_caps().max_vessels`) before
+    /// committing — the `funds_micros` precedent.
+    pub fn vessel_slots_in_use(&self) -> u64 {
         self.vessels.len() as u64 + self.builds.len() as u64
     }
 
@@ -3579,28 +3581,49 @@ impl World {
                         // `rated_n` is now scaled by `base·factor·cov`,
                         // so a starved engine's site already reads the
                         // limited thrust when the executor (and later
-                        // the force model) reads it.
+                        // the force model) reads it. The pool is
+                        // normalized by the throttle the tick will
+                        // command: `body.throttle` is already final
+                        // here for every vessel the executor does not
+                        // own (the drain applied `SetThrottle`
+                        // upstream); a `Burning` node gets the
+                        // full-throttle bound — the executor's
+                        // final-tick partial then under-debits
+                        // conservatively.
+                        let burning = matches!(
+                            vessel.maneuver.as_ref().map(|n| &n.status),
+                            Some(ManeuverStatus::Burning(_))
+                        );
                         fuel_plans = propellant_plans(
                             craft,
                             body,
                             &vessel.tank_contents,
                             &vessel.reliability,
+                            if burning {
+                                1.0
+                            } else {
+                                body.throttle.clamp(0.0, 1.0)
+                            },
                         );
                         apply_fuel_scales(body, craft, &fuel_plans);
-                    }
-                    // M5 burn executor — a first-class sim mechanism, not
-                    // a command stream (the maneuver module docs): while a
-                    // node is `Burning` it owns this body's `throttle`,
-                    // `rot`, and `ang_vel` every integer tick.
-                    if drive_node_burn(&mut vessel.maneuver, body) {
-                        burns_done.insert(*vid);
                     }
                     // The tick's propellant draw at the *commanded*
                     // throttle — collected here, debited below where the
                     // whole vessel is borrowable (`debit` walks
                     // `tank_contents` + part masses, then the §2.4
-                    // re-weld).
-                    let throttle = body.throttle.clamp(0.0, 1.0);
+                    // re-weld). A `Burning` node's throttle is set by
+                    // `drive_node_burn`, which now runs on the
+                    // *post-debit* body below (the Δv bookkeeping needs
+                    // the mass the step will actually integrate); the
+                    // debit therefore reads the executor's decision
+                    // previewed at the pre-debit mass — identical on
+                    // every non-bucket-flip tick, and only ever higher
+                    // on a flip (the post-debit `full` can shrink the
+                    // committed throttle, never grow it — a slight
+                    // over-debit on a mass-crossing completion tick,
+                    // never a free impulse).
+                    let throttle = planned_burn_throttle(&vessel.maneuver, body)
+                        .unwrap_or_else(|| body.throttle.clamp(0.0, 1.0));
                     if throttle > 0.0 {
                         for p in &fuel_plans {
                             for (r, u) in &p.needs {
@@ -3639,6 +3662,17 @@ impl World {
                     if let Some(craft) = &vessel.craft {
                         reliability::apply_thrust_factors(body, craft, &vessel.reliability);
                         apply_fuel_scales(body, craft, &fuel_plans);
+                    }
+                    // M5 burn executor — a first-class sim mechanism, not
+                    // a command stream (the maneuver module docs): while a
+                    // node is `Burning` it owns this body's `throttle`,
+                    // `rot`, and `ang_vel` every integer tick. It runs on
+                    // the post-debit weld so `throttle·|F|·dt/m` books
+                    // against the mass the step actually integrates — a
+                    // bucket-flip tick booked at the pre-debit mass
+                    // overshot the node's commanded Δv.
+                    if drive_node_burn(&mut vessel.maneuver, body) {
+                        burns_done.insert(*vid);
                     }
                     pre_vel.push((body.vel, body.ang_vel));
                     batch.push(body.clone());
@@ -5006,6 +5040,78 @@ impl World {
         self.schedule_next_soi(id, self.clock, shadow, None)
     }
 
+    /// The spawn-occupancy rule [`Self::apply_spawn_physical`] refuses
+    /// on and [`Self::spawn_site_occupied`] exposes for pre-flight
+    /// checks: `true` when a resident vessel's collider volume claims
+    /// any of `candidate`'s — `InBubble` hulls directly,
+    /// `SurfaceLatched` hulls re-materialized from their §2.6.4 pose
+    /// at the current phase (a latched vessel carries no live
+    /// collider; the volume it will unlatch into is the claim).
+    /// `OnRails` vessels hold no bubble volume and cannot occupy a
+    /// site. `false` when the world has no physics — a physical spawn
+    /// refuses earlier on that ground anyway.
+    fn spawn_site_occupied_by(&self, candidate: &WeldedBody) -> bool {
+        let Some(physics) = &self.physics else {
+            return false;
+        };
+        let env = physics.backend.environment();
+        for v in self.vessels.values() {
+            // The latched vessel's re-materialized body — assigned and
+            // read only inside the `SurfaceLatched` arm; it owns the
+            // weld `other` borrows from.
+            let parked: Option<WeldedBody>;
+            let other = match &v.state {
+                VesselState::InBubble(b) => Some(b),
+                VesselState::OnRails(_) => None,
+                VesselState::SurfaceLatched(pose) => {
+                    // Rebuild the pose the vessel would unlatch into
+                    // at this tick — the same weld + restore
+                    // `unlatched_body` runs. A latch on a body other
+                    // than this bubble's dominant, or a latched
+                    // vessel with no craft to weld, claims no volume
+                    // here (both break the latch invariant anyway;
+                    // skipping is the honest non-blocking read).
+                    if pose.body != physics.dominant {
+                        None
+                    } else {
+                        parked = v.craft.as_ref().and_then(|craft| {
+                            csp_phys::weld(&craft.graph, &craft.parts)
+                                .ok()
+                                .map(|mut b| {
+                                    let (pos, rot, _, _) = bubble::surface_pose_restore(
+                                        env,
+                                        pose,
+                                        b.com_local,
+                                        self.clock,
+                                    );
+                                    b.pos = pos;
+                                    b.rot = rot;
+                                    b
+                                })
+                        });
+                        parked.as_ref()
+                    }
+                }
+            };
+            if other.is_some_and(|o| physics.backend.volumes_overlap(candidate, o)) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The `SpawnPhysicalVessel` occupancy gate, exposed so a launch
+    /// caller can refuse *before* committing — welds its candidate at
+    /// the pad pose and asks here instead of reading the spawn's
+    /// `Recoverable` reject out of a command log after the fact.
+    /// `candidate` is the would-be body at its spawn pose (the caller
+    /// welds it; the apply path runs the identical check again at
+    /// drain time, so nothing pre-checked can slip through a
+    /// second-source spawn).
+    pub fn spawn_site_occupied(&self, candidate: &WeldedBody) -> bool {
+        self.spawn_site_occupied_by(candidate)
+    }
+
     /// `SpawnPhysicalVessel`: weld the craft graph into a fresh
     /// `WeldedBody` at the authored kinematics and insert it
     /// `InBubble`. Elements-only vessels (`SpawnVessel`) keep
@@ -5086,6 +5192,16 @@ impl World {
         body.rot = rot.normalize();
         body.vel = vel;
         body.ang_vel = ang_vel;
+        // The spawn site must be unoccupied: a second launch onto an
+        // occupied pad once materialized inside the parked craft —
+        // coincident hulls produce no contacts (every vertex lies ON
+        // the shared facets, never strictly inside), so the pair
+        // ghost-overlapped forever. The volume test covers InBubble
+        // residents and SurfaceLatched vessels whose stored pose
+        // claims the site — a launch pad is a single berth.
+        if self.spawn_site_occupied_by(&body) {
+            return Err(SimError::Recoverable("physical spawn: spawn site occupied"));
+        }
         // §2.4: a craft in an atmosphere-bearing environment gets its
         // Stage-2 default-mask tables at spawn — the sim-side
         // deterministic computation (the same path the install
@@ -7671,11 +7787,11 @@ struct FuelPlan {
     /// The §3.4 reliability derate — reapplied with the coverage
     /// scale so the two factors compose multiplicatively.
     factor: f64,
-    /// Fuel coverage for a full-throttle tick: `min` over the engine's
+    /// Fuel coverage for the tick: `min` over the engine's
     /// propellants of that resource's *shared* coverage
-    /// (`available / Σ needs` across every claimant — co-claimants
-    /// split the pool proportionally, never each claiming it whole),
-    /// ∈ [0, 1].
+    /// (`available / Σ demand` across every claimant at the tick's
+    /// commanded throttle — co-claimants split the pool
+    /// proportionally, never each claiming it whole), ∈ [0, 1].
     scale: f64,
     /// `(resource, units)` a full-throttle tick debits.
     needs: Vec<(ResourceId, f64)>,
@@ -7700,26 +7816,46 @@ fn propellant_mpu(craft: &CraftDef, resource: &ResourceId) -> Option<f64> {
 /// fixed order every other vessel pass shares. Coverage is computed
 /// in two passes: first every engine's full-throttle `needs` per
 /// resource, then each resource's *shared* coverage
-/// `min(1, available / Σ needs)` pooled across every claimant, and
-/// finally each plan's scale as the min over its propellants'
+/// `min(1, available / Σ demand)` pooled across every claimant —
+/// where `demand` is the needs at the tick's *commanded* throttle —
+/// and finally each plan's scale as the min over its propellants'
 /// coverages. The fraction of rated thrust the tanks can sustain is
 /// applied to the site's `rated_n` for the whole tick so the burn
 /// executor's `throttle·|F|·dt/m` bookkeeping stays exact even while
 /// starved (the documented v1 reading of the §2.9 "thrust sites" rule
 /// + the "no propellant depletion" gap).
 ///
+/// `throttle` is the throttle the tick will actually command: the
+/// body's carried (post-drain) throttle for an un-piloted vessel —
+/// already final when the plan runs — and the full-throttle bound
+/// `1.0` while a maneuver node is `Burning`, where the executor
+/// overwrites the channel after the plan is drawn. Normalizing the
+/// pool by the commanded draw rather than the full-throttle bound
+/// matters in the depletion regime: `full`-normalized coverage at
+/// partial throttle under-delivers thrust the tanks could have
+/// covered (`throttle·avail/Σneeds` instead of the commanded
+/// `min(throttle, avail/Σneeds)` share) and debits only
+/// `throttle·avail` of the remaining pool each tick — the contents
+/// decayed geometrically and never cleanly emptied. At the commanded
+/// normalization, coverage is exactly the share of the commanded
+/// draw the tanks sustain and the pooled debit lands on
+/// `min(avail, throttle·Σneeds)`; the `Burning` bound stays
+/// conservative — the executor's final-tick partial then
+/// under-debits (leaves residue, never overdraws).
+///
 /// The shared denominator matters: scaling each engine against the
 /// pooled availability independently let two co-claimants both read
 /// 100% coverage of the same units — on the dry-out tick both sites
 /// thrust at their claimed scale while the pooled `debit` clamped at
 /// `available`, delivering impulse the tanks never paid for. With
-/// `available / Σ needs` the co-claimants split the limiting resource
+/// `available / Σ demand` the co-claimants split the limiting resource
 /// proportionally and total debit lands exactly on availability.
 fn propellant_plans(
     craft: &CraftDef,
     body: &WeldedBody,
     tank_contents: &BTreeMap<csp_phys::PartNodeId, BTreeMap<ResourceId, f64>>,
     records: &BTreeMap<csp_phys::PartNodeId, reliability::PartReliability>,
+    throttle: f64,
 ) -> Vec<FuelPlan> {
     // Pooled availability — the same sum `transfers::vessel_resource`
     // performs, read here without a whole-vessel borrow.
@@ -7730,8 +7866,11 @@ fn propellant_plans(
             .sum()
     };
     let mut out = Vec::new();
-    // Σ needs per resource across every engine — the shared pool each
-    // claimant's coverage is measured against.
+    // Σ demand per resource across every engine — the shared pool
+    // each claimant's coverage is measured against, at the tick's
+    // commanded `throttle` (the `needs` entries themselves stay
+    // full-throttle: the debit path re-multiplies by the actual
+    // throttle downstream).
     let mut demand: BTreeMap<ResourceId, f64> = BTreeMap::new();
     for (id, node) in &craft.graph.nodes {
         let eff = node.effective_index as usize;
@@ -7774,8 +7913,14 @@ fn propellant_plans(
                 Some(mpu) if mpu > 0.0 => dm_kg * frac / mpu,
                 _ => f64::INFINITY,
             };
-            if units > 0.0 {
-                *demand.entry(r.clone()).or_default() += units;
+            // The `throttle > 0` guard keeps `∞·0` out of the pool —
+            // a zero-throttle tick has no demand at all (coverage
+            // resolves empty → scale 0 below, consistent with no
+            // draw), and a commanded `throttle > 0` against an
+            // un-holdable propellant leaves `∞` in the pool → zero
+            // coverage for every claimant of it.
+            if units > 0.0 && throttle > 0.0 {
+                *demand.entry(r.clone()).or_default() += units * throttle;
             }
             needs.push((r.clone(), units));
         }
@@ -7871,6 +8016,30 @@ fn engine_can_draw(vessel: &Vessel) -> bool {
     !any_spec
 }
 
+/// The throttle [`drive_node_burn`] will command this tick, previewed
+/// against the body's *current* mass — `None` when no `Burning` node
+/// owns the channel (the carried `body.throttle` is then the tick's
+/// draw). The propellant debit runs before the executor so the
+/// committed call can book `full = |F|·dt/m` against the post-debit
+/// mass; the preview is what the debit draws at. The two can only
+/// diverge on a contents-bucket flip (the debit sheds mass, growing
+/// `full`), and only one way: the committed throttle is ≤ the
+/// previewed one, so the debit is never short — a slight over-debit
+/// on a mass-crossing completion tick, never a free impulse.
+fn planned_burn_throttle(node: &Option<ManeuverNode>, body: &WeldedBody) -> Option<f64> {
+    let ManeuverStatus::Burning(burn) = &node.as_ref()?.status else {
+        return None;
+    };
+    let (_, f_max) = maneuver::net_thrust_axis(body);
+    if !(f_max > 0.0 && body.mass_kg > 0.0) {
+        // The stalled-burn arm: `drive_node_burn` pins the throttle at
+        // zero and declares the burn done — no draw either way.
+        return Some(0.0);
+    }
+    let full = f_max * csp_phys::PHYSICS_DT / body.mass_kg;
+    Some((burn.dv_remaining_mps / full).clamp(0.0, 1.0))
+}
+
 /// The M5 executor's per-tick drive for one InBubble body: attitude
 /// is the weld's net thrust axis aligned to the frozen inertial
 /// `burn_dir`; throttle is full until the last tick, which is
@@ -7879,6 +8048,11 @@ fn engine_can_draw(vessel: &Vessel) -> bool {
 /// the §2.9 integrator applies this tick. A craft that loses its
 /// thrust mid-burn (jettison, breakup) stalls: throttle pinned at
 /// zero, the countdown holds — honest partial delivery.
+///
+/// The caller runs this on the **post-debit** body: `full` divides by
+/// the mass the step actually integrates, so a contents-quantum flip
+/// no longer overshoots the commanded Δv (the tank draw itself was
+/// previewed at the pre-debit mass — see [`planned_burn_throttle`]).
 ///
 /// Returns `true` on the tick the countdown reaches zero — the
 /// caller collects the completion (node consumption + the rails
@@ -17343,6 +17517,365 @@ mod tests {
             "velocity must stop growing once dry ({speed1} → {})",
             b.vel.norm()
         );
+    }
+
+    /// A 3-part craft: a root tank part (`cap`/`mpu` of `liquid_fuel`)
+    /// plus two identical engine children (`thrust_n`, `isp`,
+    /// liquid_fuel-only) — the pooled-coverage fixture: two
+    /// co-claimants on one limiting resource.
+    fn twin_engine_tank_craft(cap: f64, mpu: f64, thrust_n: f64, isp: f64) -> CraftDef {
+        let mut c = tank_craft(500.0, cap, mpu);
+        for (id, x) in [(1u64, -1.0f64), (2, 1.0)] {
+            let mut engine = c.parts[0].clone();
+            engine.tanks.clear();
+            engine.force_sites = vec![csp_phys::ForceSite::new(
+                DVec3::new(0.0, 0.0, -0.5),
+                DVec3::Z,
+                csp_phys::ForceSiteKind::Thrust,
+                thrust_n,
+            )];
+            engine.engine = Some(csp_phys::EngineSpec {
+                isp_vac_s: isp,
+                propellants: vec![(ResourceId::from("liquid_fuel"), 1.0)],
+            });
+            c.graph.nodes.insert(
+                csp_phys::PartNodeId(id),
+                csp_phys::PartNode::new(
+                    Some(csp_phys::PartNodeId(0)),
+                    csp_phys::PartTransform::new(DVec3::new(x, 0.0, -0.5), DQuat::IDENTITY),
+                    id as u32,
+                ),
+            );
+            c.parts.push(engine);
+            c.part_costs.push(0.0);
+        }
+        c
+    }
+
+    /// Every Thrust site's `rated_n`, in site order — the observable
+    /// the coverage tests read off the stepped body.
+    fn thrust_rated(vessel: &Vessel) -> Vec<f64> {
+        vessel
+            .body()
+            .unwrap()
+            .force_sites
+            .iter()
+            .filter(|s| s.kind == csp_phys::ForceSiteKind::Thrust)
+            .map(|s| s.rated_n)
+            .collect()
+    }
+
+    /// Pooled coverage: two co-claimant engines on one limiting
+    /// resource split it honestly — each reads the SAME shared
+    /// coverage fraction (not first-come-full, not each-claims-whole),
+    /// and the pooled debit lands exactly on availability: the tank
+    /// empties in the one tick it can sustain.
+    #[test]
+    fn pooled_coverage_splits_limiting_resource_honestly() {
+        let (thrust_n, isp, mpu) = (1_000.0, 300.0, 5.0);
+        // One engine's full-throttle draw per tick, in units.
+        let u = thrust_n * csp_phys::PHYSICS_DT / (isp * csp_data::G0 * mpu);
+        // 1.5 draws aboard against 2.0 of demand → shared coverage 0.75.
+        let cap = 1.5 * u;
+        let mut w = physics_world(false);
+        let base = DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0);
+        enqueue_physical(
+            &mut w,
+            twin_engine_tank_craft(cap, mpu, thrust_n, isp),
+            base,
+        );
+        w.step_frame(1).unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SetThrottle {
+                vessel: VesselId(0),
+                throttle: 1.0,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        let v = &w.vessels()[&VesselId(0)];
+        assert_eq!(
+            transfers::vessel_resource(v, &ResourceId::from("liquid_fuel")),
+            0.0,
+            "the pooled debit must land exactly on availability"
+        );
+        let rated = thrust_rated(v);
+        assert_eq!(rated.len(), 2, "both engines keep a site");
+        for r in &rated {
+            assert!(
+                (r - 0.75 * thrust_n).abs() < 1.0,
+                "each claimant reads the shared 0.75 coverage, got {r}"
+            );
+        }
+    }
+
+    /// Commanded-throttle normalization (P03-F1): when the tanks can
+    /// cover the tick's *commanded* draw, coverage is 1 — the sites
+    /// read full rating even below full throttle, and the pooled
+    /// debit empties the tank exactly instead of decaying
+    /// asymptotically. (The old full-throttle normalization would
+    /// have read half rating here and left half the fuel aboard.)
+    #[test]
+    fn coverage_normalizes_to_commanded_throttle() {
+        let (thrust_n, isp, mpu) = (1_000.0, 300.0, 5.0);
+        let u = thrust_n * csp_phys::PHYSICS_DT / (isp * csp_data::G0 * mpu);
+        // One full-throttle-tick draw aboard; at half throttle the two
+        // engines demand exactly the pool → coverage 1, clean empty.
+        let mut w = physics_world(false);
+        let base = DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0);
+        enqueue_physical(&mut w, twin_engine_tank_craft(u, mpu, thrust_n, isp), base);
+        w.step_frame(1).unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SetThrottle {
+                vessel: VesselId(0),
+                throttle: 0.5,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        let v = &w.vessels()[&VesselId(0)];
+        assert_eq!(
+            transfers::vessel_resource(v, &ResourceId::from("liquid_fuel")),
+            0.0,
+            "commanded-draw normalization debits the whole pool, no residue"
+        );
+        for r in thrust_rated(v) {
+            assert!(
+                (r - thrust_n).abs() < 1.0,
+                "full coverage of the commanded draw keeps full rating, got {r}"
+            );
+        }
+    }
+
+    /// Starvation: a propellant no tank can hold (`units = ∞`) and a
+    /// dry tank both resolve to zero coverage — the site carries no
+    /// rating, the throttle channel has nothing to draw.
+    #[test]
+    fn unholdable_and_empty_propellant_starve_coverage() {
+        let records: BTreeMap<csp_phys::PartNodeId, reliability::PartReliability> = BTreeMap::new();
+        // Un-holdable: the spec wants "oxidizer"; the tanks offer only
+        // liquid_fuel — `propellant_mpu` finds no entry → needs ∞.
+        let mut c = fueled_engine_craft(100.0, 5.0, 1_000.0, 300.0);
+        c.parts[0].engine.as_mut().unwrap().propellants = vec![(ResourceId::from("oxidizer"), 1.0)];
+        let mut body = csp_phys::weld(&c.graph, &c.parts).unwrap();
+        let contents = transfers::spawn_contents(&c);
+        let plans = propellant_plans(&c, &body, &contents, &records, 1.0);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].scale, 0.0, "un-holdable propellant starves");
+        apply_fuel_scales(&mut body, &c, &plans);
+        assert!(body.force_sites.iter().all(|s| s.rated_n == 0.0));
+        // Holdable but empty: debit the tank dry, re-plan — the same
+        // zero, now from availability rather than the spec.
+        let c2 = fueled_engine_craft(100.0, 5.0, 1_000.0, 300.0);
+        let mut contents2 = transfers::spawn_contents(&c2);
+        for stores in contents2.values_mut() {
+            for u in stores.values_mut() {
+                *u = 0.0;
+            }
+        }
+        let body2 = csp_phys::weld(&c2.graph, &c2.parts).unwrap();
+        let plans2 = propellant_plans(&c2, &body2, &contents2, &records, 1.0);
+        assert_eq!(plans2[0].scale, 0.0, "a dry pool covers nothing");
+    }
+
+    /// `apply_fuel_scales` is idempotent — across a second apply on
+    /// the same body AND across the post-debit re-weld restore: the
+    /// scale lands on the craft baseline each time, never compounding.
+    #[test]
+    fn apply_fuel_scales_idempotent_across_reweld() {
+        // Half a tick's draw aboard → coverage 0.5, so the scale is
+        // observable.
+        let u = 1_000.0 * csp_phys::PHYSICS_DT / (300.0 * csp_data::G0 * 5.0);
+        let c = fueled_engine_craft(0.5 * u, 5.0, 1_000.0, 300.0);
+        let contents = transfers::spawn_contents(&c);
+        let records: BTreeMap<csp_phys::PartNodeId, reliability::PartReliability> = BTreeMap::new();
+        let mut body = csp_phys::weld(&c.graph, &c.parts).unwrap();
+        let plans = propellant_plans(&c, &body, &contents, &records, 1.0);
+        assert!(plans[0].scale < 1.0, "the test needs partial coverage");
+        apply_fuel_scales(&mut body, &c, &plans);
+        let once = thrust_rated_from_body(&body);
+        apply_fuel_scales(&mut body, &c, &plans);
+        assert_eq!(
+            once,
+            thrust_rated_from_body(&body),
+            "re-applying is a no-op"
+        );
+        // The re-weld rebuilds sites at baseline; re-applying the same
+        // plans must land the identical rating — the tick's
+        // factor+coverage restore is stable under §2.4 re-welds.
+        let mut rewelded = csp_phys::weld(&c.graph, &c.parts).unwrap();
+        assert_ne!(thrust_rated_from_body(&rewelded), once);
+        apply_fuel_scales(&mut rewelded, &c, &plans);
+        assert_eq!(once, thrust_rated_from_body(&rewelded));
+    }
+
+    fn thrust_rated_from_body(body: &csp_phys::WeldedBody) -> Vec<f64> {
+        body.force_sites
+            .iter()
+            .filter(|s| s.kind == csp_phys::ForceSiteKind::Thrust)
+            .map(|s| s.rated_n)
+            .collect()
+    }
+
+    /// Jettisoning the tank mid-burn starves the engine honestly:
+    /// contents leave with the part, coverage drops to zero, and the
+    /// vessel goes ballistic — no thrust from tanks it no longer has.
+    #[test]
+    fn jettisoned_tank_mid_burn_starves_engine() {
+        let mut w = physics_world(false);
+        // Root: engine part (no tanks). Child: the tank — jettisoning
+        // node 1 takes every unit of propellant with it.
+        let mut c = fueled_engine_craft(0.0, 5.0, 1_000.0, 300.0);
+        c.parts[0].tanks.clear();
+        c.parts[0].mass_kg = 500.0;
+        c.parts[0].inertia = csp_phys::SymMat3::solid_box(500.0, DVec3::new(0.5, 0.5, 0.5));
+        let mut tank = c.parts[0].clone();
+        tank.engine = None;
+        tank.force_sites.clear();
+        tank.tanks = vec![csp_phys::TankSpec {
+            resource: ResourceId::from("liquid_fuel"),
+            capacity: 100.0,
+            mass_per_unit_kg: 5.0,
+        }];
+        tank.mass_kg = 500.0 + 100.0 * 5.0;
+        tank.inertia = csp_phys::SymMat3::solid_box(tank.mass_kg, DVec3::new(0.5, 0.5, 0.5));
+        c.graph.nodes.insert(
+            csp_phys::PartNodeId(1),
+            csp_phys::PartNode::new(
+                Some(csp_phys::PartNodeId(0)),
+                csp_phys::PartTransform::new(DVec3::new(0.0, 0.0, 1.0), DQuat::IDENTITY),
+                1,
+            ),
+        );
+        c.parts.push(tank);
+        c.part_costs.push(0.0);
+        let base = DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0);
+        enqueue_physical(&mut w, c, base);
+        w.step_frame(1).unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SetThrottle {
+                vessel: VesselId(0),
+                throttle: 1.0,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 64).unwrap();
+        let v = &w.vessels()[&VesselId(0)];
+        let speed_burning = v.body().unwrap().vel.norm();
+        assert!(
+            transfers::vessel_resource(v, &ResourceId::from("liquid_fuel")) < 100.0,
+            "the burn must be drawing"
+        );
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::JettisonPart {
+                vessel: VesselId(0),
+                node: csp_phys::PartNodeId(1),
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        let v = &w.vessels()[&VesselId(0)];
+        assert_eq!(
+            transfers::vessel_resource(v, &ResourceId::from("liquid_fuel")),
+            0.0,
+            "the fuel leaves with the tank"
+        );
+        assert!(
+            thrust_rated(v).iter().all(|r| *r == 0.0),
+            "a tank-less engine's sites carry no rating"
+        );
+        // Ballistic now — the dry-engine plateau bound.
+        w.step_frame(w.clock().ticks() + 64).unwrap();
+        let v = &w.vessels()[&VesselId(0)];
+        let speed = v.body().unwrap().vel.norm();
+        assert!(
+            (speed - speed_burning).abs() < 40.0,
+            "post-jettison the vessel only coasts ({speed_burning} → {speed})"
+        );
+    }
+
+    /// Enqueue `craft` at `pos` with zero velocity — the parked-
+    /// vessel spawn the occupancy test needs (`enqueue_physical`'s
+    /// orbital speed would drift the resident ~33 m in the drain
+    /// frame, out of its own spawn volume).
+    fn enqueue_parked(w: &mut World, craft: CraftDef, pos: DVec3) {
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SpawnPhysicalVessel {
+                craft,
+                pos,
+                rot: DQuat::IDENTITY,
+                vel: DVec3::ZERO,
+                ang_vel: DVec3::ZERO,
+            },
+        );
+    }
+
+    /// The spawn-site occupancy gate: a second `SpawnPhysicalVessel`
+    /// inside a resident hull refuses `Recoverable` — for an InBubble
+    /// neighbour AND for a SurfaceLatched one (the launch-pad repro:
+    /// two coincident hulls produce zero contacts and ghost-overlap
+    /// forever). A clear site still spawns.
+    #[test]
+    fn spawn_physical_refuses_occupied_site() {
+        let mut w = physics_world(false);
+        let pos = DVec3::new(TERRIN_R + 50.0, 0.0, 0.0);
+        enqueue_parked(
+            &mut w,
+            box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0),
+            pos,
+        );
+        w.step_frame(1).unwrap();
+        // InBubble occupancy: identical pose — the ghost-overlap repro.
+        enqueue_parked(
+            &mut w,
+            box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0),
+            pos,
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert_eq!(w.vessels().len(), 1, "the occupied spawn must refuse");
+        assert!(!r.rejected.is_empty(), "the refusal must be reported");
+        // Latch the resident at exactly that pose (non-spinning env:
+        // lat = lon = 0, origin altitude = |pos| − R) — the parked
+        // vessel's §2.6.4 record claims the same volume.
+        w.vessels.get_mut(&VesselId(0)).unwrap().state = VesselState::SurfaceLatched(SurfacePose {
+            body: BodyId::from("p"),
+            latitude_rad: 0.0,
+            longitude_rad: 0.0,
+            altitude_m: 50.0,
+            orientation: DQuat::IDENTITY,
+        });
+        enqueue_physical(
+            &mut w,
+            box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0),
+            pos,
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert_eq!(
+            w.vessels().len(),
+            1,
+            "a latched vessel's pose must claim the site"
+        );
+        assert!(!r.rejected.is_empty());
+        // The pre-flight accessor agrees — same site blocked, a clear
+        // site free.
+        let craft = box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0);
+        let mut candidate = csp_phys::weld(&craft.graph, &craft.parts).unwrap();
+        candidate.pos = pos;
+        assert!(w.spawn_site_occupied(&candidate));
+        candidate.pos = pos + DVec3::new(0.0, 0.0, 10_000.0);
+        assert!(!w.spawn_site_occupied(&candidate));
+        // And a clear spawn still lands.
+        enqueue_physical(&mut w, craft, pos + DVec3::new(0.0, 0.0, 10_000.0));
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        assert_eq!(w.vessels().len(), 2);
     }
 
     /// A one-part box with `seats` crew slots (no tanks).

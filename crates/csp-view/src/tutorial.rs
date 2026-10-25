@@ -53,21 +53,31 @@ fn osculating_apsides(rel: DVec3, vel: DVec3, mu: f64) -> Option<(f64, f64)> {
 /// [`csp_ui::tutorial::TutorialInput`] and drive the checklist. Reads
 /// [`FlightSnapshot`] directly (not `FlightUiData`, so it stays
 /// independent of system ordering within the schedule); the tracked
-/// vessel is the newest non-debris entry — the flight focus rule
-/// minus wreckage, which must not satisfy (or suppress) progress.
+/// vessel is the pin-resolved focus (`FlightFocusOverride`'s
+/// [`resolve`](crate::flight::FlightFocusOverride::resolve) — pin
+/// target when staged, newest otherwise) minus wreckage: a
+/// recover-control pin must measure the recovered vessel, not the
+/// newest spawn (P12-F1), while debris still must not satisfy (or
+/// suppress) progress.
 pub(crate) fn tutorial_drive(
     snap: Res<FlightSnapshot>,
+    live: Res<crate::flight::LiveVesselCount>,
+    focus_override: Res<crate::flight::FlightFocusOverride>,
     vab_input: Res<VabInput>,
     vab: Res<VabSessionRes>,
     mut tutorial: ResMut<TutorialRes>,
 ) {
     let env = snap.env.as_ref();
-    // The tutorial's vessel is the newest NON-debris staged vessel —
-    // `focus_vessel`'s `last()` can pick a fresh breakup fragment, and
-    // wreckage must not count as "a vessel" at all: a climb that
-    // shatters leaves only debris, and counting it would suppress the
-    // vessel_lost rewind the checklist needs to re-guide the player.
-    let focus = snap.vessels.iter().rev().find(|v| !v.debris);
+    // The tutorial's vessel is the focused NON-debris staged vessel —
+    // the pin-aware resolver picks the pinned target first, then
+    // falls back to the newest non-debris entry (debris must not
+    // count as "a vessel" at all: a climb that shatters leaves only
+    // wreckage, and counting it would suppress the vessel_lost
+    // rewind the checklist needs to re-guide the player).
+    let focus = focus_override
+        .resolve(&snap.vessels)
+        .filter(|v| !v.debris)
+        .or_else(|| snap.vessels.iter().rev().find(|v| !v.debris));
     let mut apoapsis_m = None;
     let mut periapsis_m = None;
     if let (Some(v), Some(env)) = (focus, env)
@@ -84,7 +94,12 @@ pub(crate) fn tutorial_drive(
             .0
             .analysis()
             .is_some_and(|a| a.stages.iter().any(|s| s.thrust_vac_n > 0.0)),
-        has_vessel: focus.is_some(),
+        // A vessel is "had" in ANY residence — `live` is the staged
+        // count of non-debris vessels across ALL residences, so a live
+        // craft that finished its burn back onto rails does not read
+        // as lost (P12-F2). `focus` covers only the InBubble/latched
+        // staged set — it is a subset of the count.
+        has_vessel: live.0 > 0,
         throttle: focus.map_or(0.0, |v| v.throttle),
         alt_m: match (focus, env) {
             (Some(v), Some(env)) => (v.com - env.body_center).norm() - env.radius_m,
@@ -145,10 +160,13 @@ mod tests {
 
     /// Run `tutorial_drive` on a hand-staged presentation world —
     /// the system under test, on the same resources it reads in
-    /// production.
-    fn drive(snap: FlightSnapshot, vab_open: bool, tutorial: &mut TutorialRes) {
+    /// production. `live` stages the cross-residence non-debris count
+    /// `sync_flight` would have written from the sim.
+    fn drive(snap: FlightSnapshot, live: usize, vab_open: bool, tutorial: &mut TutorialRes) {
         let mut world = World::new();
         world.insert_resource(snap);
+        world.insert_resource(crate::flight::LiveVesselCount(live));
+        world.insert_resource(crate::flight::FlightFocusOverride::default());
         world.insert_resource(VabInput {
             open: vab_open,
             ..VabInput::default()
@@ -194,7 +212,7 @@ mod tests {
             )],
         };
         let mut t = TutorialRes::default();
-        drive(snap, false, &mut t);
+        drive(snap, 1, false, &mut t);
         assert!(t.0.finished, "orbital snapshot must finish the checklist");
     }
 
@@ -214,7 +232,7 @@ mod tests {
                 1.0,
             )],
         };
-        drive(climbing, false, &mut t);
+        drive(climbing, 1, false, &mut t);
         assert!(t.0.step > csp_ui::tutorial::STEP_LAUNCH);
         // The craft shatters: only a debris fragment remains staged.
         let mut wreck = vessel(
@@ -228,6 +246,10 @@ mod tests {
                 env: Some(env()),
                 vessels: vec![wreck],
             },
+            // Wreckage is not alive — the count is non-debris vessels
+            // only, so a debris-only world reads as "vessel lost"
+            // (P12-F2's complement).
+            0,
             false,
             &mut t,
         );
@@ -249,7 +271,7 @@ mod tests {
             )],
         };
         let mut t = TutorialRes::default();
-        drive(snap, false, &mut t);
+        drive(snap, 1, false, &mut t);
         assert_eq!(t.0.step, 4, "at 2 km the checklist sits on Climb");
         assert!(!t.0.finished);
     }

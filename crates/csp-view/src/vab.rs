@@ -336,9 +336,12 @@ fn category_color(cat: Option<csp_data::PartCategory>, selected: bool) -> [f32; 
 
 /// `RenderExtract` schedule system: emit the `VabPacket` — the
 /// kitbash triangles projected to clip space, each part's verts
-/// tagged with its 1-based pick index.
+/// tagged with its 1-based pick index. `craft_epoch` stamps the
+/// packet's `pick_ids` generation so a late GPU readback decoded
+/// against a CHANGED session is dropped, not mis-applied (P10-F3).
 pub(crate) fn extract_vab(
     input: Res<VabInput>,
+    vab: Res<VabSessionRes>,
     scene: Res<VabScene>,
     cam: Res<VabCameraF64>,
     mut frame: ResMut<VabFrame>,
@@ -347,7 +350,10 @@ pub(crate) fn extract_vab(
         frame.0 = None;
         return;
     }
-    let mut packet = VabPacket::default();
+    let mut packet = VabPacket {
+        craft_epoch: vab.0.craft_epoch(),
+        ..VabPacket::default()
+    };
     let mut tris = Vec::new();
     for p in &scene.parts {
         let pick = packet.pick_ids.len() as u32 + 1;

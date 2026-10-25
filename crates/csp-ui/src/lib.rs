@@ -415,9 +415,6 @@ pub struct FlightHudInput<'a> {
     pub vessel_count: usize,
     /// Debris-flagged vessels.
     pub debris_count: usize,
-    /// §3.7's visual-SFX cue lines (engine, staging, impact,
-    /// breakup) — drawn as top-center event flashes.
-    pub sfx: &'a [String],
     /// Osculating apoapsis/periapsis altitude, times-to-apsis, period.
     pub apo_alt_m: Option<f64>,
     /// Periapsis altitude (m).
@@ -487,33 +484,46 @@ pub fn fmt_period(s: f64) -> String {
     }
 }
 
+/// The §3.7 visual-SFX channel as a GLOBAL overlay — the cue stack
+/// (`FlightSfx`: sim-transition edges AND `View::flight_notice`
+/// refusals) drawn top-center in EVERY view mode, not just Flight.
+/// Refusals that fire outside the flight view — `RecoverControl` in
+/// Map, LAUNCH in the VAB, throttle/stage/lease rejections anywhere —
+/// push onto this same channel; gating it behind `mode == Flight`
+/// made every one of them silent (P02-F1/P04-F1/P10-F12/P11-F2).
+/// Drawn by `csp-view`'s `UiBuild` unconditionally; TTL aging lives in
+/// `flight_present`, which runs in every mode, so the stack fades on
+/// schedule wherever it is read.
+pub fn notice_overlay(ctx: &egui::Context, lines: &[String]) {
+    if lines.is_empty() {
+        return;
+    }
+    let rect = ctx.content_rect();
+    egui::Area::new(egui::Id::unique("flight_sfx"))
+        .order(egui::Order::Foreground)
+        .interactable(false)
+        .fixed_pos(egui::pos2(rect.center().x, rect.top() + 48.0))
+        .pivot(egui::Align2::CENTER_TOP)
+        .show(ctx, |ui| {
+            for line in lines {
+                ui.label(
+                    egui::RichText::new(format!("« {line} »"))
+                        .font(egui::FontId::proportional(17.0))
+                        .color(egui::Color32::from_rgb(255, 196, 64)),
+                );
+            }
+        });
+}
+
 /// The M4c flight HUD (§3.7's presentation floor, upgraded): the
 /// navball attitude instrument bottom-center (ball + heading tape),
 /// a telemetry column at its left (altitude, surface/orbital speed,
-/// vertical speed, heading/pitch/roll, throttle, parts, warp), the
-/// controls hint, and the visual-SFX event flashes. Drawn by
-/// `csp-view`'s `UiBuild` while `ViewMode::Flight` is active.
+/// vertical speed, heading/pitch/roll, throttle, parts, warp), and
+/// the controls hint. Drawn by `csp-view`'s `UiBuild` while
+/// `ViewMode::Flight` is active. The §3.7 cue flashes moved out to
+/// [`notice_overlay`] — they render in every mode, not just here.
 #[allow(clippy::too_many_lines)] // one HUD = one pass
 pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
-    // §3.7's visual-SFX channel: each live cue is a top-center flash,
-    // newest at the bottom of the stack.
-    if !input.sfx.is_empty() {
-        let rect = ctx.content_rect();
-        egui::Area::new(egui::Id::unique("flight_sfx"))
-            .order(egui::Order::Foreground)
-            .interactable(false)
-            .fixed_pos(egui::pos2(rect.center().x, rect.top() + 48.0))
-            .pivot(egui::Align2::CENTER_TOP)
-            .show(ctx, |ui| {
-                for line in input.sfx {
-                    ui.label(
-                        egui::RichText::new(format!("« {line} »"))
-                            .font(egui::FontId::proportional(17.0))
-                            .color(egui::Color32::from_rgb(255, 196, 64)),
-                    );
-                }
-            });
-    }
     let rect = ctx.content_rect();
     const BALL_R: f32 = 64.0;
     let ball_center = egui::pos2(rect.center().x, rect.bottom() - BALL_R - 30.0);

@@ -37,9 +37,25 @@
 //! | version | body |
 //! |---|---|
 //! | 1 | bare [`v1::WorldSnapshotV1`] — the first public build's schema |
-//! | 2 | [`SaveBodyV2`] — the live [`WorldSnapshot`] |
+//! | 2 | the live [`WorldSnapshot`] body stamped `2` — accepted only |
+//! |   |   when it byte-exact-decodes under the current schema (see |
+//! |   |   below) |
+//! | 3 | [`SaveBodyV3`] — the live [`WorldSnapshot`] |
 //! |   |   (v2's envelope additions — label + data-set hash — live in |
 //! |   |   the JSON header, not the body) |
+//!
+//! v2 and v3 share one body schema: the stamp failed to advance when
+//! `WeldPart::engine` grew the serialized `Vessel` tree, so a
+//! stamped-2 body is ambiguous — it may be a post-engine write (which
+//! decodes cleanly and loads) or a pre-engine write (which cannot be
+//! resolved — serde would field-default `engine` to `None`, silently
+//! unmetering every resolved engine). The dispatch therefore proves
+//! v1/v2 bodies against the schema they claim: a body that fails the
+//! byte-exact re-encode gate under its stamped version is refused
+//! [`SaveError::UnsupportedVersion`] — the honest "this build cannot
+//! name your schema" surface, never the cryptic `TrailingBytes` the
+//! gate alone produced (and never the silent `None` decode that made
+//! pre-engine saves restore with free-burning engines).
 //!
 //! [`decode_save`] folds the `migrate_vN_to_vN+1` chain until the current
 //! schema falls out; v2's semantic addition is envelope metadata, so the
@@ -69,9 +85,11 @@ use crate::{
     TransferId, Vessel, VesselCaps, VesselId, WorldSnapshot, manufacture, reliability,
 };
 
-/// `save_version` written by this build (§7.7). The chain begins here:
-/// version 1 is the first public build's schema, frozen in [`v1`].
-pub const SAVE_VERSION_CURRENT: u32 = 2;
+/// `save_version` written by this build (§7.7). The chain begins at
+/// version 1, the first public build's schema, frozen in [`v1`].
+/// Version 3 carries the same body schema as 2 — the bump marks the
+/// `WeldPart::engine` payload change the `2` stamp missed.
+pub const SAVE_VERSION_CURRENT: u32 = 3;
 /// The oldest `save_version` this build can read.
 pub const SAVE_VERSION_MIN: u32 = 1;
 /// The §7.2 magic — the first 8 bytes of every save file, `CSPSAVE`
@@ -153,12 +171,14 @@ struct SaveHeader {
     body_len: u64,
 }
 
-/// The v2 body — the live snapshot under the v2 schema's name. Frozen
-/// the moment v3 lands (it becomes `v2`'s copy and the live body moves
+/// The v3 body — the live snapshot under the v3 schema's name. Frozen
+/// the moment v4 lands (it becomes `v3`'s copy and the live body moves
 /// on). The envelope metadata v2 added over v1 (label, data-set hash)
 /// lives in the JSON header per §7.2, so the body is the snapshot alone.
+/// Stamped-2 bodies decode under this same schema — see the module
+/// doc's version table for the pre-/post-`engine` ambiguity rule.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct SaveBodyV2 {
+struct SaveBodyV3 {
     /// The §7.2 set at the live schema.
     snapshot: WorldSnapshot,
 }
@@ -448,8 +468,9 @@ impl std::error::Error for SaveError {}
 enum VersionedBody {
     /// `save_version` 1 — the frozen first-public-build snapshot.
     V1(v1::WorldSnapshotV1),
-    /// `save_version` 2 — the current body wrapping the live snapshot.
-    V2(SaveBodyV2),
+    /// `save_version` 3 (and proven stamped-2 bodies — the schemas are
+    /// identical) — the current body wrapping the live snapshot.
+    V3(SaveBodyV3),
 }
 
 /// Encode a hash as lowercase hex — the JSON header's `data_set_hash`
@@ -503,7 +524,7 @@ fn compress_body<T: Serialize>(v: &T) -> Result<Vec<u8>, SaveError> {
 /// Encode [`Save`] as a complete §7.2 save file (magic + JSON header +
 /// DEFLATE-over-CBOR body) at [`SAVE_VERSION_CURRENT`].
 pub fn encode_save(save: &Save) -> Result<Vec<u8>, SaveError> {
-    let body = SaveBodyV2 {
+    let body = SaveBodyV3 {
         snapshot: save.snapshot.clone(),
     };
     let compressed = compress_body(&body)?;
@@ -602,8 +623,25 @@ fn decode_body(version: u32, bytes: &[u8]) -> Result<VersionedBody, SaveError> {
         Ok(v)
     }
     match version {
-        1 => Ok(VersionedBody::V1(decode(bytes)?)),
-        2 => Ok(VersionedBody::V2(decode(bytes)?)),
+        // The version-proof rule from the module doc: a body stamped
+        // below CURRENT that cannot byte-exact-decode under the schema
+        // its stamp claims is an *unresolvable* schema (the `2` stamp
+        // predates `WeldPart::engine`'s payload change, so pre-engine
+        // bodies carry a tree this build has no name for). Refusing
+        // `UnsupportedVersion` names the real problem — the version —
+        // where the gate's raw `TrailingBytes` named only a framing
+        // symptom.
+        1 => Ok(VersionedBody::V1(
+            decode(bytes).map_err(|_| SaveError::UnsupportedVersion { found: 1 })?,
+        )),
+        // Stamped-2 bodies decode under the v3 schema: post-`engine`
+        // writers emit exactly this tree, so a clean decode is the
+        // proof the file is what its stamp failed to say. A decode
+        // failure is the pre-`engine` case above.
+        2 => Ok(VersionedBody::V3(
+            decode(bytes).map_err(|_| SaveError::UnsupportedVersion { found: 2 })?,
+        )),
+        3 => Ok(VersionedBody::V3(decode(bytes)?)),
         found => Err(SaveError::UnsupportedVersion { found }),
     }
 }
@@ -613,10 +651,13 @@ fn decode_body(version: u32, bytes: &[u8]) -> Result<VersionedBody, SaveError> {
 /// and one more dispatch arm; the fold shape never changes.
 fn to_current(body: VersionedBody) -> Save {
     match body {
-        VersionedBody::V1(snapshot) => to_current(VersionedBody::V2(SaveBodyV2 {
+        // The v1→current fold is one step: `migrate_v1_to_v2` already
+        // produces the live snapshot tree (v2 added envelope metadata
+        // only), and v2→v3 is a stamp-only change over the same body.
+        VersionedBody::V1(snapshot) => to_current(VersionedBody::V3(SaveBodyV3 {
             snapshot: migrate_v1_to_v2(snapshot),
         })),
-        VersionedBody::V2(body) => Save {
+        VersionedBody::V3(body) => Save {
             // Filled in by `decode_save` from the JSON header.
             game_version: String::new(),
             label: None,
@@ -787,6 +828,50 @@ mod tests {
         let migrated = decode_save(&bytes).unwrap().snapshot;
         let restored = World::restore(PatchedConics::new(BTreeMap::new()), None, migrated).unwrap();
         assert_eq!(restored.state_hash().unwrap(), original_hash);
+    }
+
+    /// A stamped-2 body carrying the *current* schema (a post-`engine`
+    /// writer's save — the stamp lagged the schema, the bytes did not)
+    /// still loads: the v2 arm decodes under the shared v3 body.
+    #[test]
+    fn stamped_v2_current_schema_loads() {
+        let snapshot = live_snapshot();
+        let body = SaveBodyV3 {
+            snapshot: snapshot.clone(),
+        };
+        let bytes = fixture_bytes(2, &body, "2.0.0-post-engine");
+        let save = decode_save(&bytes).unwrap();
+        assert_eq!(save.snapshot, snapshot);
+    }
+
+    /// A stamped-2 body that cannot prove the current schema — the
+    /// pre-`WeldPart::engine` write — refuses `UnsupportedVersion`,
+    /// not the cryptic `TrailingBytes` the re-encode gate produced
+    /// (and never the silent `engine: None` decode that unmetered
+    /// every resolved engine).
+    #[test]
+    fn stamped_v2_unresolvable_body_refused_as_version() {
+        let bytes = fixture_bytes(
+            2,
+            &v1::WorldSnapshotV1::from(&live_snapshot()),
+            "1.x-pre-engine",
+        );
+        assert!(matches!(
+            decode_save(&bytes),
+            Err(SaveError::UnsupportedVersion { found: 2 })
+        ));
+    }
+
+    /// The same proof at the chain's floor: a stamped-1 body the
+    /// frozen v1 schema cannot decode byte-exact is an unresolvable
+    /// schema, refused as a version — never a framing error.
+    #[test]
+    fn stamped_v1_unresolvable_body_refused_as_version() {
+        let bytes = fixture_bytes(1, &42u64, "x");
+        assert!(matches!(
+            decode_save(&bytes),
+            Err(SaveError::UnsupportedVersion { found: 1 })
+        ));
     }
 
     /// §7.7: a save outside the chain is refused with the versions named,

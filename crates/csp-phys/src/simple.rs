@@ -1014,6 +1014,17 @@ fn aabbs_overlap(a: (DVec3, DVec3), b: (DVec3, DVec3)) -> bool {
         && b.0.z < a.1.z
 }
 
+/// Inclusive AABB overlap — face-touching counts (the spawn-occupancy
+/// rule: a box sharing a boundary claims the spawn volume's edge).
+fn aabbs_touch(a: (DVec3, DVec3), b: (DVec3, DVec3)) -> bool {
+    a.0.x <= b.1.x
+        && b.0.x <= a.1.x
+        && a.0.y <= b.1.y
+        && b.0.y <= a.1.y
+        && a.0.z <= b.1.z
+        && b.0.z <= a.1.z
+}
+
 /// Does any vertex of `p`'s collider lie strictly inside a facet
 /// volume of `q`'s? One direction of the pair-generation narrowphase,
 /// shared with the `vessel_contact` predicate (the rules must be the
@@ -1256,6 +1267,23 @@ impl SimpleBackend {
     /// which is geometry, not solver state.
     pub fn vessel_contact(&self, a: &WeldedBody, b: &WeldedBody) -> bool {
         hulls_overlap(a, b)
+    }
+
+    /// Spawn-site occupancy predicate — do the two bodies' collider
+    /// volumes claim any of the same space? Deliberately broader than
+    /// [`Self::vessel_contact`]: that rule asks for a vertex *strictly
+    /// inside* a facet volume, which two hulls materialized in the
+    /// same pose can never produce (every vertex lies *on* the shared
+    /// facets — the pair would ghost through each other forever). The
+    /// inclusive world-AABB test here catches the coincident and
+    /// merely-touching cases the vertex rule misses; a false positive
+    /// only refuses a spawn into a crowded volume, it never invents
+    /// a contact the solver must then resolve.
+    pub fn volumes_overlap(&self, a: &WeldedBody, b: &WeldedBody) -> bool {
+        let (Some(aa), Some(bb)) = (body_world_aabb(a), body_world_aabb(b)) else {
+            return false;
+        };
+        aabbs_touch(aa, bb)
     }
 
     /// Force and torque (about the world-frame CoM) on `b`, in the

@@ -295,7 +295,23 @@ fn patch_dir0_size(id: PatchId) -> (DVec3, f64) {
 /// half-angle + patch angular radius). Deterministic — fixed face
 /// order, fixed child order, FIFO queue; a saturated budget emits the
 /// queued nodes as leaves, so coarse coverage completes before detail.
-pub fn select_patches(eye_rel_body: DVec3, radius_m: f64, cfg: &LodConfig) -> Vec<PatchId> {
+///
+/// `amplitude_m` is the surface's maximum displacement ABOVE the
+/// datum: relief rises to `radius_m + amplitude_m`, so the cull must
+/// credit peaks beyond the bare-datum horizon or the displaced limb
+/// culls its own relief (missing mountains + subtree-level popping,
+/// P08-F1). The margin is the two-observer horizon rule: the eye
+/// (height `alt`) and a peak (height `amplitude_m`) see each other
+/// while the SUM of their datum-horizon angles covers the
+/// separation — `acos(R/(R+alt)) + acos(R/(R+amp))`. It errs wide on
+/// purpose: elevated intervening terrain narrows the real horizon,
+/// and an over-kept leaf is a few verts, not a missing mountain.
+pub fn select_patches(
+    eye_rel_body: DVec3,
+    radius_m: f64,
+    amplitude_m: f64,
+    cfg: &LodConfig,
+) -> Vec<PatchId> {
     // `PatchId::{x, y}` are `u16`: a level-16 node holds cell indices
     // up to `2^16 − 1`, so splitting one would wrap `x * 2 + dx`.
     // Clamp rather than assert — a tuned-up `LodConfig` silently
@@ -308,8 +324,12 @@ pub fn select_patches(eye_rel_body: DVec3, radius_m: f64, cfg: &LodConfig) -> Ve
     let alt = (eye_r - radius_m).max(0.0);
     // Horizon half-angle about the sub-camera point: the visible surface
     // is the disc of directions within `acos(R / (R+h))` of the eye's
-    // own radial direction; beyond it the planet occludes itself.
-    let horizon = libm::acos((radius_m / (radius_m + alt)).clamp(-1.0, 1.0));
+    // own radial direction; beyond it the planet occludes itself —
+    // PLUS the horizon a peak of height `amplitude_m` commands beyond
+    // that datum limb (the two-observer rule in the fn doc). The
+    // bare-datum term alone culls displaced relief at the limb.
+    let horizon = libm::acos((radius_m / (radius_m + alt)).clamp(-1.0, 1.0))
+        + libm::acos((radius_m / (radius_m + amplitude_m.max(0.0))).clamp(-1.0, 1.0));
     // Degenerate eye at the body centre → no culling.
     let sub_dir = (eye_norm > radius_m * 1e-9).then(|| eye_rel_body / eye_norm);
     let mut queue = VecDeque::new();
@@ -1171,8 +1191,9 @@ mod tests {
     fn lod_subdivides_with_distance() {
         let cfg = LodConfig::default();
         let r = 600_000.0;
-        let low = select_patches(DVec3::new(r + 100.0, 0.0, 0.0), r, &cfg);
-        let high = select_patches(DVec3::new(r * 5.0, 0.0, 0.0), r, &cfg);
+        let amp = r * 0.004; // the authored Terrin-class amplitude
+        let low = select_patches(DVec3::new(r + 100.0, 0.0, 0.0), r, amp, &cfg);
+        let high = select_patches(DVec3::new(r * 5.0, 0.0, 0.0), r, amp, &cfg);
         assert!(!low.is_empty() && !high.is_empty());
         let max_low = low.iter().map(|p| p.level).max().unwrap();
         let max_high = high.iter().map(|p| p.level).max().unwrap();

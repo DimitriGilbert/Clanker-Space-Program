@@ -231,6 +231,11 @@ pub struct FlightSyncInput {
     /// `VesselId` — `last()` is the most recently spawned, which is the
     /// flight focus rule (see `focus_vessel`).
     pub vessels: Vec<FlightBody>,
+    /// Non-debris vessels in the sim across ALL residences — `vessels`
+    /// stages only InBubble + latched, so an OnRails vessel would
+    /// otherwise read as destroyed (P12-F2: a burn completing back to
+    /// rails read as "vessel lost" and rewound the tutorial).
+    pub live_vessels: usize,
 }
 
 /// Pass-1 dead-stick recovery: the vessel the flight focus should pin
@@ -250,20 +255,62 @@ pub(crate) struct FlightFocusOverride {
     /// `true` once `target` has appeared in the staged vessel set —
     /// what distinguishes "the `ToBubble` is still draining" (the pin
     /// must survive the gap) from "it staged and left again" (release).
-    seen: bool,
+    pub(crate) seen: bool,
+    /// `true` while the recovered vessel's `TakeControl{Player}` lease
+    /// transfer is still owed — issued by `View::end_frame` only on
+    /// the `seen` edge, so a `ToBubble` that drained and REJECTED
+    /// never preempts the vessel's live `Script`/`Agent` lease
+    /// (P04-F3: the press is not the conversion).
+    pub(crate) lease_pending: bool,
 }
 
 impl FlightFocusOverride {
-    /// Pin the flight focus to `vessel` once it stages.
+    /// Pin the flight focus to `vessel` once it stages, and arm the
+    /// Player-lease transfer for the moment it proves staged (the
+    /// recover-control press issues `ToBubble`; the lease follows the
+    /// conversion, not the press).
     pub(crate) fn set(&mut self, vessel: csp_sim::VesselId) {
         self.target = Some(vessel);
         self.seen = false;
+        self.lease_pending = true;
     }
 
     /// Release the pin — the newest-spawn focus rule applies again.
     pub(crate) fn clear(&mut self) {
         self.target = None;
         self.seen = false;
+        self.lease_pending = false;
+    }
+
+    /// `true` while the pin is armed but its vessel has never staged
+    /// — the `ToBubble` is either still draining or already rejected.
+    /// `View::sim_step` uses this to release the dead pin on a
+    /// drain-reject (P04-F2): a pending pin left armed would hijack
+    /// the focus on any later staging of the same vessel.
+    pub(crate) fn pending(&self) -> bool {
+        self.target.is_some() && !self.seen
+    }
+
+    /// The vessel the Player-lease transfer is owed for — `Some`
+    /// exactly once, on the frame `seen` first proves the `ToBubble`
+    /// materialized the pinned vessel.
+    pub(crate) fn lease_target(&self) -> Option<csp_sim::VesselId> {
+        (self.seen && self.lease_pending)
+            .then_some(self.target)
+            .flatten()
+    }
+
+    /// The shared pin-aware focus resolver — the real focus is the
+    /// pinned vessel when it is staged, else the newest staged vessel
+    /// ([`focus_vessel`]'s rule). Every focus-sensitive consumer
+    /// resolves through HERE — the chase camera/HUD, the SFX edges,
+    /// the tutorial measures, and (via [`FlightSfx::focus_vessel`])
+    /// the app's audio voices — so a `recover_control` pin cannot
+    /// split them across two vessels (P04-F4/P07-F1/P11-F1/P12-F1).
+    pub(crate) fn resolve<'a>(&self, vessels: &'a [FlightBody]) -> Option<&'a FlightBody> {
+        self.target
+            .and_then(|id| vessels.iter().find(|b| b.id == id.0))
+            .or_else(|| focus_vessel(vessels))
     }
 }
 
@@ -276,6 +323,16 @@ pub struct FlightSnapshot {
     pub vessels: Vec<FlightBody>,
 }
 
+/// The staged non-debris vessel count across ALL residences —
+/// [`FlightSyncInput::live_vessels`] mirrored by `sync_flight`
+/// (Appendix A item 1's "mirror writes are systems"). A standalone
+/// resource rather than a `FlightSnapshot` field: `FlightSnapshot`'s
+/// pub fields are literal-constructed by `csp-app`'s audio test, so
+/// the struct cannot grow. The tutorial's `has_vessel` reads this —
+/// an OnRails vessel is alive, not lost (P12-F2).
+#[derive(Resource, Default)]
+pub struct LiveVesselCount(pub usize);
+
 /// HUD mirrors — written by `flight_present`, drawn by
 /// `csp_ui::flight_hud`.
 #[derive(Resource, Default)]
@@ -283,9 +340,11 @@ pub struct FlightUiData {
     /// Focused vessel exists.
     pub has_vessel: bool,
     /// Focused vessel id (for throttle commands), `None` otherwise —
-    /// the most recently spawned staged vessel (see `focus_vessel`).
-    /// Includes a surface-latched pad vessel — `SetThrottle` unlatches
-    /// it (the sim's §2.6.4 control rule).
+    /// the pin-aware resolution ([`FlightFocusOverride::resolve`]):
+    /// the pinned vessel when staged, else the most recently spawned
+    /// staged vessel (see `focus_vessel`). Includes a surface-latched
+    /// pad vessel — `SetThrottle` unlatches it (the sim's §2.6.4
+    /// control rule).
     pub focus: Option<u64>,
     /// The focused vessel is surface-latched (parked on rails) — the
     /// HUD reads "PAD" and the instruments show rest.
@@ -369,7 +428,9 @@ pub struct SfxCue {
 /// Last frame's edge-detection summary for [`FlightSfx`].
 #[derive(Clone, Copy, Debug)]
 struct SfxPrev {
-    /// Focused vessel id (`vessels.last()` — the chase target).
+    /// Focused vessel id — the pin-aware resolution
+    /// ([`FlightFocusOverride::resolve`]) the caller staged the edges
+    /// against, not a raw `vessels.last()`.
     focus: u64,
     /// `throttle > 0` — the ignition/cut edge.
     throttle_on: bool,
@@ -394,6 +455,13 @@ struct SfxPrev {
 pub struct FlightSfx {
     /// Live cue stack, oldest first.
     pub cues: VecDeque<SfxCue>,
+    /// The pin-aware flight-focus vessel id (`FlightFocusOverride`'s
+    /// [`resolve`](FlightFocusOverride::resolve) result, `VesselId.0`)
+    /// — mirrored here each `flight_present` so the audio backend's
+    /// continuous voices follow the SAME vessel the cues and HUD do,
+    /// not `vessels.last()` (P07-F1's wrong-vessel-audio defect).
+    /// `None` when no vessel is staged.
+    pub focus_vessel: Option<u64>,
     /// Last frame's edge state — `None` until the first present pass.
     prev: Option<SfxPrev>,
 }
@@ -454,6 +522,15 @@ pub struct StagePlan {
     /// fingerprints; `min_id` keeps the newest launch's plan from
     /// binding a still-live older copy.
     craft_key: u64,
+    /// `true` once binding proved AMBIGUOUS — two or more live
+    /// vessels minted at/above `min_id` share the launch fingerprint
+    /// (P05-F1: a second same-craft mint interposed while unbound,
+    /// e.g. the plan's own spawn rejected and a scripted mint of the
+    /// same craft landed instead). `(min_id, fingerprint)` cannot
+    /// name the vessel honestly, so the plan stays unbound rather
+    /// than latching a permanent wrong-vessel bind — `fire_stage`
+    /// surfaces the notice and retires the plan.
+    pub ambiguous: bool,
 }
 
 impl StagePlan {
@@ -472,6 +549,7 @@ impl StagePlan {
             vessel: None,
             min_id: sim.vessels().keys().next_back().map_or(0, |id| id.0 + 1),
             craft_key: craft_fingerprint(craft),
+            ambiguous: false,
         }
     }
 
@@ -485,30 +563,42 @@ impl StagePlan {
             vessel: Some(vessel),
             min_id: 0,
             craft_key: 0,
+            ambiguous: false,
         }
     }
 
     /// The vessel this plan fires at, binding on first call: the
-    /// newest vessel minted at-or-after [`Self::min_id`] whose stored
-    /// craft matches the launch's fingerprint. An unbound plan stays
-    /// unbound (never caches `None`) so a not-yet-landed spawn binds
-    /// on a later press; a bound id is returned verbatim — the caller
-    /// re-checks it against the live arena (the vessel may be gone).
+    /// UNIQUE vessel minted at-or-after [`Self::min_id`] whose stored
+    /// craft matches the launch's fingerprint (P05-F1 — the old
+    /// "newest match" rule permanently bound a wrong vessel whenever
+    /// a second same-craft mint interposed while the plan was
+    /// unbound). An unbound plan stays unbound (never caches `None`)
+    /// so a not-yet-landed spawn binds on a later press; a bound id
+    /// is returned verbatim — the caller re-checks it against the
+    /// live arena (the vessel may be gone). Two or more matching
+    /// candidates mean `(min_id, fingerprint)` cannot disambiguate:
+    /// [`Self::ambiguous`] latches and the plan never binds.
     pub(crate) fn vessel_for(&mut self, sim: &World) -> Option<VesselId> {
         if let Some(v) = self.vessel {
             return Some(v);
         }
-        let found = sim
-            .vessels()
-            .iter()
-            .rev()
-            .find(|(id, v)| {
-                id.0 >= self.min_id
-                    && v.craft
-                        .as_ref()
-                        .is_some_and(|c| craft_fingerprint(c) == self.craft_key)
-            })
-            .map(|(id, _)| *id);
+        if self.ambiguous {
+            return None;
+        }
+        let mut candidates = sim.vessels().iter().filter(|(id, v)| {
+            id.0 >= self.min_id
+                && v.craft
+                    .as_ref()
+                    .is_some_and(|c| craft_fingerprint(c) == self.craft_key)
+        });
+        let found = candidates.next().map(|(id, _)| *id);
+        if candidates.next().is_some() {
+            // A second same-fingerprint mint at/above the bound —
+            // which one is OURS is unanswerable. Latch the flag:
+            // honest "cannot stage" beats a silent wrong-vessel fire.
+            self.ambiguous = true;
+            return None;
+        }
         if found.is_some() {
             self.vessel = found;
         }
@@ -710,7 +800,21 @@ pub fn capture_sync_input(sim: &World, cache: &mut LatchedWeldCache) -> FlightSy
             VesselState::OnRails(_) => {}
         }
     }
-    FlightSyncInput { env, vessels }
+    // Every non-debris vessel counts as ALIVE regardless of residence —
+    // the staged list above carries only InBubble + latched, so an
+    // OnRails vessel (a completed burn, a converted flight) must still
+    // register here or the tutorial's `has_vessel` conflates "on
+    // rails" with "destroyed" (P12-F2).
+    let live_vessels = sim
+        .vessels()
+        .values()
+        .filter(|v| v.debris_since.is_none())
+        .count();
+    FlightSyncInput {
+        env,
+        vessels,
+        live_vessels,
+    }
 }
 
 /// Stage one §2.6.4 surface-latched vessel. The restored inertial
@@ -984,9 +1088,14 @@ pub(crate) fn apply_flight_input(
 
 /// `Sync` schedule — copy the staged input into the presentation
 /// mirror.
-pub(crate) fn sync_flight(staged: Res<FlightSyncInput>, mut snap: ResMut<FlightSnapshot>) {
+pub(crate) fn sync_flight(
+    staged: Res<FlightSyncInput>,
+    mut snap: ResMut<FlightSnapshot>,
+    mut live: ResMut<LiveVesselCount>,
+) {
     snap.env = staged.env.clone();
     snap.vessels = staged.vessels.clone();
+    live.0 = staged.live_vessels;
 }
 
 /// The flight chase-camera solve: an orbit camera in the *local-level
@@ -1107,10 +1216,6 @@ pub(crate) fn flight_present(
 ) {
     ui.vessel_count = snap.vessels.len();
     ui.debris_count = snap.vessels.iter().filter(|v| v.debris).count();
-    // §3.7 edge detection on the staged snapshot — cue pushes and
-    // TTL aging live in `sfx_edges` (kept out of this system under
-    // the line budget).
-    ui.sfx = sfx_edges(&mut sfx, &snap.vessels, ui.debris_count);
 
     // Pin lifecycle: a pinned vessel seen staged releases the override
     // the frame it leaves the set (a `ToRails` conversion or a
@@ -1125,10 +1230,19 @@ pub(crate) fn flight_present(
             focus_override.clear();
         }
     }
-    let focus = focus_override
-        .target
-        .and_then(|id| snap.vessels.iter().find(|b| b.id == id.0))
-        .or_else(|| focus_vessel(&snap.vessels));
+    // THE focus: pin first, newest staged vessel otherwise — one
+    // resolver for the camera, the HUD mirrors, and the SFX edges.
+    // (`sfx_edges` used to baseline on `vessels.last()` alone, so a
+    // recover_control pin tracked cues on the wrong vessel — P04-F4.)
+    let focus = focus_override.resolve(&snap.vessels);
+    // §3.7 edge detection on the staged snapshot — cue pushes and
+    // TTL aging live in `sfx_edges` (kept out of this system under
+    // the line budget). The edges baseline on the same resolved
+    // focus the camera follows.
+    ui.sfx = sfx_edges(&mut sfx, &snap.vessels, ui.debris_count, focus);
+    // The audio backend's focus mirror: voices key off this, not a
+    // `vessels.last()` of their own (P07-F1).
+    sfx.focus_vessel = focus.map(|f| f.id);
     let Some(focus) = focus else {
         cam.0.valid = false;
         ui.has_vessel = false;
@@ -1213,9 +1327,17 @@ pub(crate) fn flight_present(
 /// age-out, and the live stack mirrored for the HUD. Per-focus edges
 /// apply only while the SAME vessel stays focused; a focus switch
 /// re-baselines instead of firing a spurious cut/contact edge. The
-/// focus rule is `focus_vessel`'s — the newest staged vessel.
-fn sfx_edges(sfx: &mut FlightSfx, vessels: &[FlightBody], debris_count: usize) -> Vec<String> {
-    let cur = focus_vessel(vessels).map(|f| SfxPrev {
+/// `focus` is the caller's pin-aware resolution
+/// ([`FlightFocusOverride::resolve`]) — pin target when staged, else
+/// the newest staged vessel — so edges track the vessel the player
+/// actually controls, not whichever staged last (P04-F4).
+fn sfx_edges(
+    sfx: &mut FlightSfx,
+    vessels: &[FlightBody],
+    debris_count: usize,
+    focus: Option<&FlightBody>,
+) -> Vec<String> {
+    let cur = focus.map(|f| SfxPrev {
         focus: f.id,
         throttle_on: f.throttle > 0.0,
         nodes: f.nodes,
@@ -1758,9 +1880,15 @@ pub(crate) fn extract_flight(
                     DVec3::X
                 }
             };
-            // Puff sits a hair above the surface so depth ties resolve
-            // for the dust.
-            let base = env.body_center + dir * (env.radius_m + 0.3);
+            // Puff sits a hair above the LOCAL terrain surface — the
+            // baked heightfield's floor radius under `dir`, not the
+            // bare datum: a datum-anchored ring buries under up to
+            // `amplitude_m` of positive relief and floats over dips
+            // (P07-F2/P08-F3; `surface_floor_radius` is the same tap
+            // the camera floor uses).
+            let floor =
+                crate::terrain::surface_floor_radius(&terrain_cfg, &mut terrain_cache, env, dir);
+            let base = env.body_center + dir * (floor.max(env.radius_m) + 0.3);
             let (t1, t2) = {
                 let a = if dir.y.abs() < 0.9 {
                     DVec3::Y

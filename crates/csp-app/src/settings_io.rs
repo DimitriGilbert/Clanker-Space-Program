@@ -14,6 +14,8 @@
 //! and edit for the session.
 
 #[cfg(not(target_arch = "wasm32"))]
+use std::collections::BTreeMap;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
 
 use csp_view::settings::{KeyBinding, Settings};
@@ -61,53 +63,330 @@ pub fn settings_path() -> PathBuf {
 /// A `schema_version` newer than this build loads anyway — §7.8's
 /// forward-compat rule is "unknown keys ignored", so a newer file's
 /// understood fields are kept and the rest defaulted.
+///
+/// Returns `(settings, notes)` — `notes` carries one user-facing line
+/// per repair the load performed (a salvaged parse, dropped binding
+/// tokens, backfilled verbs, rejected non-finite values) so the app
+/// can surface them through the in-app notice channels: a settings
+/// file that changed under the user's feet must say so, not just
+/// `log::warn` (P14-F2).
 #[cfg(not(target_arch = "wasm32"))]
-pub fn load_settings() -> Settings {
+pub fn load_settings() -> (Settings, Vec<String>) {
     load_settings_from(&settings_path())
 }
 
 /// The path-taking half of [`load_settings`] — what tests drive.
-/// A file that parses is then sanitized: the keymap's raw-string
-/// tokens are re-validated through `Keymap::sanitize` (dropping
-/// unparseable/duplicate bindings with a warn) so a hand-edited file
-/// meets the same rules `Keymap::bind` enforces in-session.
+/// A file that parses is then normalized ([`normalize`]): the
+/// keymap's raw-string tokens are re-validated through
+/// `Keymap::sanitize`, verbs the file predates are backfilled from
+/// the shipped defaults, and non-finite floats are rejected — each
+/// repair recorded in the returned notes.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn load_settings_from(path: &Path) -> Settings {
+pub fn load_settings_from(path: &Path) -> (Settings, Vec<String>) {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Settings::default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (Settings::default(), Vec::new());
+        }
         Err(e) => {
             log::warn!(
                 "settings: cannot read {}: {e} — using defaults",
                 path.display()
             );
-            return Settings::default();
+            return (
+                Settings::default(),
+                vec!["settings file could not be read — defaults in use".to_string()],
+            );
         }
     };
-    match ron::from_str::<Settings>(&text) {
-        Ok(mut s) => {
-            // Serde's transparent `KeyBinding` accepts raw strings —
-            // a hand-edited file can carry tokens `KeyBinding::parse`
-            // would refuse (dead bindings) or one key under two
-            // actions. Re-run the model's own validation so file data
-            // meets the same rules `Keymap::bind` enforces in-session.
-            let dropped = s.keys.sanitize();
-            if dropped > 0 {
-                log::warn!(
-                    "settings: {} carried {dropped} invalid/duplicate key binding token(s) — dropped",
-                    path.display()
-                );
-            }
-            s
-        }
+    let mut notes = Vec::new();
+    let mut s = match ron::from_str::<Settings>(&text) {
+        Ok(s) => s,
         Err(e) => {
+            // All-or-nothing is the wrong failure mode for a
+            // hand-editable sidecar: one unknown keymap verb (a file
+            // written by a NEWER build, or a typo'd variant name) used
+            // to discard every setting with only a log line to show
+            // for it (P14-F2). Salvage each field — and inside `keys`,
+            // each binding row — that still parses.
             log::warn!(
-                "settings: {} is not a valid settings file ({e}) — using defaults",
+                "settings: {} is not a valid settings file ({e}) — salvaging readable fields",
                 path.display()
             );
-            Settings::default()
+            match salvage_settings(&text, &mut notes) {
+                Some(s) => {
+                    notes.insert(
+                        0,
+                        "settings file is not fully readable — kept every field that still parses"
+                            .to_string(),
+                    );
+                    s
+                }
+                None => {
+                    notes.push(
+                        "settings file could not be parsed at all — defaults in use".to_string(),
+                    );
+                    Settings::default()
+                }
+            }
+        }
+    };
+    normalize(&mut s, &mut notes);
+    (s, notes)
+}
+
+/// Post-parse repair shared by the strict and the salvaged load:
+///
+/// - `Keymap::sanitize` — re-validate raw-string tokens (serde's
+///   transparent `KeyBinding` accepts anything), dropping
+///   unparseable/duplicate bindings so a hand-edited file meets the
+///   same rules `Keymap::bind` enforces in-session.
+/// - [`backfill_missing_bindings`] — a file written before a verb
+///   existed never mentions it; absent actions inherit the shipped
+///   defaults so upgraders don't get dead keys (P14-F2).
+/// - Non-finite floats — RON accepts `NaN`/`inf` literals and
+///   `f32::clamp` passes NaN straight through, so `ui_scale: NaN`
+///   would reach `egui::Context::set_zoom_factor` and NaN the whole
+///   UI past the point the settings panel could fix it (P14-F3).
+///
+/// Each repair appends one user-facing line to `notes`.
+#[cfg(not(target_arch = "wasm32"))]
+fn normalize(s: &mut Settings, notes: &mut Vec<String>) {
+    let dropped = s.keys.sanitize();
+    if dropped > 0 {
+        notes.push(format!(
+            "{dropped} invalid/duplicate key binding token(s) dropped"
+        ));
+    }
+    let backfilled = backfill_missing_bindings(&mut s.keys);
+    if backfilled > 0 {
+        notes.push(format!(
+            "{backfilled} input action(s) had no binding in the settings file — default binding(s) restored"
+        ));
+    }
+    if !s.audio.master_volume.is_finite() {
+        s.audio.master_volume = csp_view::settings::AudioSettings::default().master_volume;
+        notes.push("audio.master_volume was not a finite number — reset to default".into());
+    }
+    if !s.graphics.ui_scale.is_finite() {
+        s.graphics.ui_scale = csp_view::settings::GraphicsSettings::default().ui_scale;
+        notes.push("graphics.ui_scale was not a finite number — reset to default".into());
+    }
+}
+
+/// Backfill actions the loaded keymap predates (P14-F2): `bindings`
+/// deserializes only the entries present, so a `settings.ron` written
+/// before a verb shipped leaves it unbound forever — a dead verb no
+/// Reset-less upgrade path can revive. An action with NO `bindings`
+/// entry inherits the shipped defaults for it; a *present-but-empty*
+/// list stays empty (that is the deliberate unbind a user wrote — the
+/// distinction `serde(default)` preserves). A default token already
+/// claimed by another action is skipped, so a user's rebind is never
+/// shadowed by a backfill. Returns the count of actions backfilled.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn backfill_missing_bindings(keys: &mut csp_view::settings::Keymap) -> usize {
+    use csp_view::settings::KeyAction;
+    let defaults = csp_view::settings::Keymap::default();
+    let mut filled = 0;
+    for action in KeyAction::ALL {
+        if keys.bindings.contains_key(action) {
+            continue;
+        }
+        let claimed: std::collections::BTreeSet<&str> = keys
+            .bindings
+            .values()
+            .flatten()
+            .map(KeyBinding::as_str)
+            .collect();
+        let fresh: Vec<KeyBinding> = defaults
+            .bindings
+            .get(action)
+            .into_iter()
+            .flatten()
+            .filter(|k| !claimed.contains(k.as_str()))
+            .cloned()
+            .collect();
+        keys.bindings.insert(*action, fresh);
+        filled += 1;
+    }
+    filled
+}
+
+/// One raw `name: value` slice of a RON map, keys included —
+/// `RawValue` captures each field's *source text*, and `into_rust`
+/// re-parses it through the real deserializer (enums included), which
+/// `ron::Value` cannot do (it folds bare enum identifiers to `Unit`).
+/// `RawValue` is `Ord`, so the map sorts by raw text; field lookup is
+/// a linear find on a ≤6-entry table — not worth a comparator.
+#[cfg(not(target_arch = "wasm32"))]
+type SalvageMap = BTreeMap<Box<ron::value::RawValue>, Box<ron::value::RawValue>>;
+
+/// `map.get(name)` — raw captures carry leading whitespace, so match
+/// on trimmed text.
+#[cfg(not(target_arch = "wasm32"))]
+fn salvage_field<'m>(map: &'m SalvageMap, name: &str) -> Option<&'m ron::value::RawValue> {
+    map.iter()
+        .find(|(k, _)| k.trim().get_ron() == name)
+        .map(|(_, v)| &**v)
+}
+
+/// A `(name: value, …)` field slice re-read as a map — the
+/// struct-form sections (`graphics: (…)`) parse once the outer parens
+/// are re-braced (RON map and struct syntaxes share `name: value`
+/// pairs).
+#[cfg(not(target_arch = "wasm32"))]
+fn salvage_submap(raw: &ron::value::RawValue) -> Option<SalvageMap> {
+    let inner = raw.trim().get_ron().strip_prefix('(')?.strip_suffix(')')?;
+    ron::from_str::<SalvageMap>(&format!("{{{inner}}}")).ok()
+}
+
+/// `salvage_field` + `into_rust` + assign, recording a note on
+/// unreadable text instead of failing. (A macro, not a generic fn:
+/// `into_rust`'s `Deserialize` bound can't be named without a `serde`
+/// dep.)
+#[cfg(not(target_arch = "wasm32"))]
+macro_rules! salvage_take {
+    ($notes:expr, $map:expr, $name:literal, $ty:ty, $dst:expr) => {
+        if let Some(raw) = salvage_field(&$map, $name) {
+            match raw.into_rust::<$ty>() {
+                Ok(v) => $dst = v,
+                Err(_) => $notes.push(
+                    concat!("settings field `", $name, "` unreadable — defaulted").to_string(),
+                ),
+            }
+        }
+    };
+}
+
+/// The lenient half of [`load_settings_from`]: when the strict
+/// `Settings` parse fails — one unknown enum variant (a keymap verb a
+/// newer build added, a typo'd quality tier) poisons the whole file —
+/// re-read it as raw field text and re-parse field by field. Fields
+/// that still parse are kept; inside `keys`, each binding row is kept
+/// or dropped on its own ([`salvage_keymap`]). `None` when the file
+/// is not even a RON `field: value` map (total garbage still yields
+/// defaults + the caller's note).
+#[cfg(not(target_arch = "wasm32"))]
+fn salvage_settings(text: &str, notes: &mut Vec<String>) -> Option<Settings> {
+    let inner = text.trim().strip_prefix('(')?.strip_suffix(')')?;
+    let top: SalvageMap = ron::from_str(&format!("{{{inner}}}")).ok()?;
+    let mut s = Settings::default();
+    salvage_take!(notes, top, "schema_version", u32, s.schema_version);
+    s.audio = salvage_audio(&top, notes);
+    s.graphics = salvage_graphics(&top, notes);
+    s.difficulty = salvage_difficulty(&top, notes);
+    s.gameplay = salvage_gameplay(&top, notes);
+    if let Some(raw) = salvage_field(&top, "keys") {
+        match raw.into_rust::<csp_view::settings::Keymap>() {
+            Ok(v) => s.keys = v,
+            Err(_) => s.keys.bindings = salvage_keymap(&top, notes),
         }
     }
+    Some(s)
+}
+
+/// Whole-section `into_rust` first; on failure the leaf fields are
+/// salvaged one by one so a single bad value keeps its siblings —
+/// the unit of damage is a field, not a file. An absent section is
+/// default-quiet (serde(default) semantics), an unreadable one
+/// leaves a note.
+macro_rules! salvage_section_fn {
+    ($fname:ident, $name:literal, $ty:ty, $sec:ident, $m:ident, { $($lf:literal : $lty:ty => $leaf:expr),* $(,)? }) => {
+        #[cfg(not(target_arch = "wasm32"))]
+        fn $fname(top: &SalvageMap, notes: &mut Vec<String>) -> $ty {
+            let Some(raw) = salvage_field(top, $name) else {
+                return <$ty>::default();
+            };
+            match raw.into_rust::<$ty>() {
+                Ok(v) => v,
+                Err(_) => {
+                    // `$sec`/`$m` are caller-supplied idents so the
+                    // `$leaf` expressions name them without fighting
+                    // macro hygiene.
+                    let mut $sec = <$ty>::default();
+                    if let Some($m) = salvage_submap(raw) {
+                        $(salvage_take!(notes, $m, $lf, $lty, $leaf);)*
+                    }
+                    notes.push(concat!(
+                        "settings section `", $name,
+                        "` partially unreadable — kept readable fields",
+                    ).to_string());
+                    $sec
+                }
+            }
+        }
+    };
+}
+
+salvage_section_fn!(salvage_audio, "audio", csp_view::settings::AudioSettings, sec, m, {
+    "master_volume": f32 => sec.master_volume,
+    "muted": bool => sec.muted,
+});
+salvage_section_fn!(salvage_graphics, "graphics", csp_view::settings::GraphicsSettings, sec, m, {
+    "quality": csp_view::settings::GraphicsQuality => sec.quality,
+    "ui_scale": f32 => sec.ui_scale,
+    "window_size": [u32; 2] => sec.window_size,
+});
+salvage_section_fn!(salvage_difficulty, "difficulty", csp_view::settings::DifficultySettings, sec, m, {
+    "life_support_enabled": bool => sec.life_support_enabled,
+    "dormant_stress": bool => sec.dormant_stress,
+});
+salvage_section_fn!(salvage_gameplay, "gameplay", csp_view::settings::GameplaySettings, sec, m, {
+    "max_warp_multiplier": u64 => sec.max_warp_multiplier,
+});
+
+/// The `keys` section's per-row salvage — `bindings` is a map from
+/// the `KeyAction` enum, and one unknown variant fails the whole
+/// struct parse, so rows are re-read individually: each entry's name
+/// and binding list parse on their own, an unknown action or a
+/// mangled list drops ONE row with a note instead of the whole
+/// keymap. The returned map replaces `keys.bindings` wholesale —
+/// rows the file never had are absent, so `normalize`'s backfill
+/// restores their defaults, and a salvaged present-but-empty row
+/// stays deliberately unbound.
+#[cfg(not(target_arch = "wasm32"))]
+fn salvage_keymap(
+    top: &SalvageMap,
+    notes: &mut Vec<String>,
+) -> BTreeMap<csp_view::settings::KeyAction, Vec<KeyBinding>> {
+    use csp_view::settings::KeyAction;
+    let mut bindings = BTreeMap::new();
+    let Some(keys_map) = salvage_field(top, "keys").and_then(salvage_submap) else {
+        notes.push("settings section `keys` is unreadable — default bindings in use".into());
+        return bindings;
+    };
+    let Some(bmap) = salvage_field(&keys_map, "bindings")
+        .and_then(|r| ron::from_str::<SalvageMap>(r.get_ron()).ok())
+    else {
+        notes.push("settings section `keys` is unreadable — default bindings in use".into());
+        return bindings;
+    };
+    let mut kept = 0usize;
+    for (k, v) in &bmap {
+        let name = k
+            .trim()
+            .get_ron()
+            .strip_prefix("r#")
+            .unwrap_or_else(|| k.trim().get_ron());
+        match (k.into_rust::<KeyAction>(), v.into_rust::<Vec<KeyBinding>>()) {
+            (Ok(a), Ok(list)) => {
+                bindings.insert(a, list);
+                kept += 1;
+            }
+            (Err(_), _) => notes.push(format!(
+                "keymap binding(s) for `{name}` name an action this build doesn't know — dropped"
+            )),
+            (_, Err(_)) => {
+                notes.push(format!(
+                    "keymap binding(s) for `{name}` are unreadable — dropped"
+                ));
+            }
+        }
+    }
+    notes.push(format!(
+        "settings section `keys` partially unreadable — kept {kept} binding row(s), the rest defaulted"
+    ));
+    bindings
 }
 
 /// Persist settings to `$config_dir/csp/settings.ron`. Failures log —
@@ -131,10 +410,11 @@ pub fn save_settings_to(path: &Path, settings: &Settings) -> Result<(), String> 
 
 /// wasm: no filesystem — the session runs on defaults (the
 /// `craft_store` precedent; a persistence story for the web build is a
-/// §6.3 packaging question, not this milestone's).
+/// §6.3 packaging question, not this milestone's). The empty notes
+/// match the native signature — nothing was loaded, nothing repaired.
 #[cfg(target_arch = "wasm32")]
-pub fn load_settings() -> Settings {
-    Settings::default()
+pub fn load_settings() -> (Settings, Vec<String>) {
+    (Settings::default(), Vec::new())
 }
 
 /// wasm: settings apply for the session but cannot persist — the

@@ -404,7 +404,6 @@ fn build_ui(
                     warp: warp.0,
                     vessel_count: flight_ui.vessel_count,
                     debris_count: flight_ui.debris_count,
-                    sfx: &flight_ui.sfx,
                     apo_alt_m: flight_ui.apo_alt_m,
                     pe_alt_m: flight_ui.pe_alt_m,
                     t_apo_s: flight_ui.t_apo_s,
@@ -428,6 +427,14 @@ fn build_ui(
             &mut tutorial.0,
             mode == csp_ui::ModeSelect::Vab,
         );
+        // The §3.7 cue stack — the GLOBAL refusal/transition channel.
+        // Drawn in every mode: a refusal that can only flash inside
+        // `flight_hud` is invisible exactly where it fires (Map
+        // recover-control, VAB launch, warp demotion) — the dead-click
+        // complaint. `flight_ui.sfx` is the Presentation-mirrored live
+        // stack; `flight_present` ages the TTLs every frame, so cues
+        // pushed from any mode still fade on schedule.
+        csp_ui::notice_overlay(ctx, &flight_ui.sfx);
     }));
     // The top bar's Tutorial button re-opens the checklist — session
     // state, folded back here rather than riding the app outbox.
@@ -487,7 +494,12 @@ fn map_panels(
         &map_snap
             .vessels
             .iter()
-            .map(|(id, _, n)| csp_ui::ManeuverVessel {
+            // Only ON-RAILS vessels are offered (P09-F2): a
+            // `SetManeuver` on an InBubble vessel rejects "not on
+            // rails" at drain — the picker used to list them anyway,
+            // making every such Set press a silent refusal.
+            .filter(|(.., on_rails)| *on_rails)
+            .map(|(id, _, n, _)| csp_ui::ManeuverVessel {
                 id: id.0,
                 node: n.as_ref().map(|n| (n.tick, n.dv_magnitude())),
             })
@@ -1010,6 +1022,9 @@ impl View {
         world.insert_resource(flight::FlightInputEvents::default());
         world.insert_resource(flight::FlightSyncInput::default());
         world.insert_resource(flight::FlightSnapshot::default());
+        // The non-debris vessel count across all residences — the
+        // tutorial's alive-or-lost mirror (P12-F2).
+        world.insert_resource(flight::LiveVesselCount::default());
         world.insert_resource(flight::FlightUiData::default());
         world.insert_resource(flight::StagePlan::default());
         world.insert_resource(flight::FlightFrame::default());
@@ -1126,6 +1141,32 @@ impl View {
         let start = self.sim.clock().ticks();
         let report = self.sim.step_frame(target_tick)?;
         self.ticks_last_frame = report.reached_tick - start;
+        // The focus pin's drain-reject release (P04-F2): `end_frame`
+        // covers the pinned vessel gone from the arena and
+        // `flight_present` the staged-then-left case, but a `ToBubble`
+        // that drained and REJECTED (the SOI-TOCTOU class the
+        // eligibility check cannot see — an event re-parenting the
+        // conic inside the same drain) leaves the vessel on rails and
+        // the pin armed forever, hijacking focus on any later
+        // staging. A "to-bubble" rejection on the player channel is
+        // the recover's own command failing — release the pending pin
+        // and say so on the global cue channel. Gated on `pending()`:
+        // a `seen` pin's vessel already converted, so a later
+        // to-bubble rejection cannot be ours.
+        let to_bubble_reject = report.rejected.iter().any(|r| {
+            r.key.source_class == SourceClass::Ui
+                && r.key.source_id == PLAYER_SOURCE_ID
+                && r.error.reason().starts_with("to-bubble")
+        });
+        if to_bubble_reject
+            && self
+                .world
+                .resource::<flight::FlightFocusOverride>()
+                .pending()
+        {
+            self.clear_flight_focus_override();
+            self.flight_notice("RECOVER FAILED — CONVERSION REFUSED".to_string());
+        }
         self.schedules.sim_step.run(&mut self.world);
         Ok(report)
     }
@@ -1165,6 +1206,29 @@ impl View {
         self.ticks_last_frame = 0;
         self.schedules.sync.run(&mut self.world);
         self.schedules.presentation.run(&mut self.world);
+        // P04-F3: the recover-control Player-lease transfer issues on
+        // the pin's `seen` edge — `flight_present` just proved the
+        // `ToBubble` materialized the vessel — never optimistically at
+        // press time (a rejected conversion used to still preempt the
+        // vessel's live `Script`/`Agent` lease). The command rides the
+        // player FIFO and drains at the next tick boundary.
+        if let Some(target) = self
+            .world
+            .resource::<flight::FlightFocusOverride>()
+            .lease_target()
+        {
+            self.enqueue_command(
+                SourceClass::Ui,
+                PLAYER_SOURCE_ID,
+                SimCommand::TakeControl {
+                    vessel: target,
+                    lease: csp_sim::Lease::Player,
+                },
+            );
+            self.world
+                .resource_mut::<flight::FlightFocusOverride>()
+                .lease_pending = false;
+        }
         self.schedules.ui_build.run(&mut self.world);
         self.schedules.render_extract.run(&mut self.world);
     }
@@ -1404,33 +1468,39 @@ impl View {
     /// the VAB closes the map display (its overlay would draw under
     /// the editor), and re-entering Map refocuses. Direct resource
     /// writes — same plumbing-mutate precedent as `set_map_viewport`.
+    /// The refocus runs `MapInput::refocus` itself (P09-F1) — the
+    /// hand-duplicated body-only version snapped a vessel focus to
+    /// the 6e10 m system distance because `bodies.get(focus)` misses
+    /// every vessel-half index.
     pub fn set_mode(&mut self, mode: ViewMode) {
         {
             let mut v = self.world.resource_mut::<vab::VabInput>();
             v.open = mode == ViewMode::Vab;
         }
-        let focus = self.world.resource::<map::MapInput>().focus;
         let want_map = mode == ViewMode::Map;
-        let refocus_dist = self
-            .world
-            .resource::<map::BodyTable>()
-            .bodies
-            .get(focus)
-            .and_then(|b| b.soi_m)
-            .map(|soi| (5.0 * soi).clamp(1.0e5, 2.0e11))
-            .unwrap_or(6.0e10);
-        let mut m = self.world.resource_mut::<map::MapInput>();
-        if want_map != (m.mode == map::MapMode::Map) {
-            m.mode = if want_map {
-                map::MapMode::Map
-            } else {
-                map::MapMode::Flight
-            };
-            if want_map {
-                // Re-derive framing like CycleFocus's refocus.
-                m.pan_offset = csp_core::DVec3::ZERO;
-                m.distance_m = refocus_dist;
+        let mut refocus = false;
+        {
+            let mut m = self.world.resource_mut::<map::MapInput>();
+            if want_map != (m.mode == map::MapMode::Map) {
+                m.mode = if want_map {
+                    map::MapMode::Map
+                } else {
+                    map::MapMode::Flight
+                };
+                refocus = want_map;
             }
+        }
+        if refocus {
+            // `refocus` needs the body table + the vessel snapshot
+            // alongside the mutable input — `resource_scope` lifts
+            // `MapInput` out so the two reads borrow cleanly.
+            self.world
+                .resource_scope(|world, mut m: Mut<map::MapInput>| {
+                    m.refocus(
+                        world.resource::<map::BodyTable>(),
+                        world.resource::<map::MapSnapshot>(),
+                    );
+                });
         }
     }
 
@@ -1528,17 +1598,12 @@ impl View {
             PLAYER_SOURCE_ID,
             csp_sim::SimCommand::ToBubble { vessel: target },
         );
-        // M9c §2.2.1: vacate any `Script`/`Agent` control lease — `Ui`
-        // preempts unconditionally, so the `TakeControl` lands whenever
-        // the `ToBubble` does (and is harmless when it doesn't).
-        self.enqueue_command(
-            SourceClass::Ui,
-            PLAYER_SOURCE_ID,
-            csp_sim::SimCommand::TakeControl {
-                vessel: target,
-                lease: csp_sim::Lease::Player,
-            },
-        );
+        // M9c §2.2.1: vacate any `Script`/`Agent` control lease — but
+        // ONLY once the `ToBubble` actually converts. Issuing the
+        // `TakeControl` optimistically here would preempt the live
+        // lease even when the conversion rejects at drain (P04-F3):
+        // the pin's `lease_pending` flag arms it, and `end_frame`
+        // issues it on the `seen` edge the materialization proves.
         self.world
             .resource_mut::<flight::FlightFocusOverride>()
             .set(target);
@@ -1547,8 +1612,14 @@ impl View {
 
     /// Would a `ToBubble` plausibly apply to `vessel`? The drain's own
     /// reject classes, checked pre-pin: the vessel exists, rides an
-    /// on-rails conic around the dominant body, carries a craft, and a
-    /// physics environment exists to receive it.
+    /// on-rails conic around the dominant body, carries a craft, a
+    /// physics environment exists to receive it — AND the two fallible
+    /// conversions the apply performs actually succeed: the conic must
+    /// evaluate at the current tick (`state_at`) and the stored craft
+    /// must re-weld (P04-F2 — an unchecked reject here used to leave
+    /// the pin armed forever). What this still cannot see is the
+    /// TOCTOU half: an SOI event re-parenting the orbit inside the
+    /// same drain. `View::sim_step`'s drain-reject release covers that.
     fn to_bubble_eligible(&self, vessel: csp_sim::VesselId) -> bool {
         let Some(v) = self.sim.vessels().get(&vessel) else {
             return false;
@@ -1556,10 +1627,26 @@ impl View {
         let Some(orbit) = v.orbit() else {
             return false;
         };
-        if v.craft.is_none() || self.sim.environment().is_none() {
+        let Some(craft) = v.craft.as_ref() else {
+            return false;
+        };
+        if self.sim.environment().is_none() {
             return false;
         }
-        self.sim.dominant_body().is_some_and(|d| orbit.parent == *d)
+        if !self.sim.dominant_body().is_some_and(|d| orbit.parent == *d) {
+            return false;
+        }
+        // The apply's fallible halves, mirrored exactly:
+        // `self.orbits.state_at(orbit_state, self.clock)` and
+        // `csp_phys::weld(&craft.graph, &craft.parts)` — both reject
+        // Recoverable at drain, so both are checked up front. The weld
+        // runs once per keypress, not per frame — cheap enough to be
+        // honest instead of predictive.
+        if csp_sim::orbit::OrbitModel::state_at(self.sim.orbits(), orbit, self.sim.clock()).is_err()
+        {
+            return false;
+        }
+        csp_phys::weld(&craft.graph, &craft.parts).is_ok()
     }
 
     /// Clear the recover-control focus pin (session navigation aid) —
@@ -1609,6 +1696,7 @@ impl View {
     /// vehicle, not an inertially suspended one (a spawn without the
     /// `ω × r` term reads as ~175 m/s of surface-relative slide on
     /// Terrin and sheds its stack on first contact).
+    #[allow(clippy::too_many_lines)] // the pre-flight gate pass grew it past the limit
     pub fn launch_craft(&mut self) -> Result<(), String> {
         // The analysis cache is dirty-gated — the VAB's own
         // Presentation frames refresh it, but a launch can arrive
@@ -1703,19 +1791,20 @@ impl View {
         // under the datum. The same weld hands `com_local` to the
         // restore — `vel` is the CoM slot (§2.9), so the spawn's
         // co-rotation stamp is the velocity of `pos + rot·com_local`,
-        // not of the origin.
-        let (z_min, com_local) = match csp_phys::weld(&craft.graph, &craft.parts) {
-            Ok(b) => (
-                b.collider
-                    .hulls
-                    .iter()
-                    .flat_map(|h| h.vertices.iter().map(|v| v.z))
-                    .fold(f64::INFINITY, f64::min)
-                    .min(0.0),
-                b.com_local,
-            ),
+        // not of the origin. The welded body survives below as the
+        // pre-flight occupancy check's candidate.
+        let mut candidate = match csp_phys::weld(&craft.graph, &craft.parts) {
+            Ok(b) => b,
             Err(e) => return Err(self.launch_refused(e)),
         };
+        let z_min = candidate
+            .collider
+            .hulls
+            .iter()
+            .flat_map(|h| h.vertices.iter().map(|v| v.z))
+            .fold(f64::INFINITY, f64::min)
+            .min(0.0);
+        let com_local = candidate.com_local;
         // The spawn kinematics are the §2.6.4 latch record's exact
         // restore: upright ENU pose at the site, position resolved at
         // the CURRENT tick's spin phase (the pad co-rotates — spawning
@@ -1731,6 +1820,17 @@ impl View {
         };
         let (pos, rot, vel, ang_vel) =
             csp_sim::bubble::surface_pose_restore(&env, &pose, com_local, self.sim.clock());
+        // `launch_preflight` runs `apply_spawn_physical`'s refusals
+        // BEFORE the enqueue + mode switch, so a doomed spawn keeps
+        // the player in the VAB with the reason on the notice row.
+        // The candidate is posed exactly as the spawn would insert it.
+        candidate.pos = pos;
+        candidate.rot = rot.normalize();
+        candidate.vel = vel;
+        candidate.ang_vel = ang_vel;
+        if let Some(reason) = self.launch_preflight(&craft, &candidate) {
+            return Err(reason);
+        }
         // The staged craft's firing plan rides session state (the
         // spawned graph drops stage metadata); `fire_stage` drains it
         // one set per press. The plan binds to THIS launch's vessel —
@@ -1786,7 +1886,7 @@ impl View {
     /// outright — no KSP-style debris fragment, and engines are
     /// globally armed so a firing separates but never ignites.
     pub fn fire_stage(&mut self) -> usize {
-        let (vessel, refuse) = {
+        let (vessel, ambiguous, refuse) = {
             let mut plan = self.world.resource_mut::<flight::StagePlan>();
             if plan.stages.is_empty() {
                 // `total` keeps the cases honest — an expended
@@ -1794,6 +1894,7 @@ impl View {
                 // the same "nothing".
                 (
                     None,
+                    false,
                     Some(if plan.total > 0 {
                         "ALL STAGES FIRED — NOTHING LEFT"
                     } else {
@@ -1801,11 +1902,27 @@ impl View {
                     }),
                 )
             } else {
-                (plan.vessel_for(&self.sim), None)
+                let v = plan.vessel_for(&self.sim);
+                (v, plan.ambiguous, None)
             }
         };
         if let Some(msg) = refuse {
             self.flight_notice(msg.to_string());
+            return 0;
+        }
+        if ambiguous {
+            // P05-F1: two same-craft mints ≥ min_id — the plan can
+            // never name its vessel honestly, so a firing now would
+            // hit a random one. Retire it like the gone-vessel branch
+            // rather than leaving a loaded trap for the next press.
+            {
+                let mut plan = self.world.resource_mut::<flight::StagePlan>();
+                plan.stages.clear();
+                plan.vessel = None;
+            }
+            self.flight_notice(
+                "STAGE PLAN LOST — DUPLICATE LAUNCHED CRAFT, CANNOT IDENTIFY VESSEL".to_string(),
+            );
             return 0;
         }
         let Some(vessel) = vessel else {
@@ -1873,6 +1990,57 @@ impl View {
                 text: text.into(),
                 ttl: flight::SFX_TTL_FRAMES,
             });
+    }
+
+    /// The pre-flight half of `apply_spawn_physical`'s refusals —
+    /// every gate the spawn's drain-time apply would reject on,
+    /// checked BEFORE [`View::launch_craft`] commits so a doomed spawn
+    /// keeps the player in the VAB with the reason on the notice row
+    /// instead of landing in an empty flight view with only a logged
+    /// command reject to show for it. `candidate` is the welded body
+    /// already posed at the spawn point. Returns the refusal text
+    /// (already posted through [`Self::launch_refused`]) or `None`
+    /// when the launch is clear. The drain re-runs every gate
+    /// regardless — a second source can spawn in between — so this
+    /// check only ever *refuses* early; it can never let a bad spawn
+    /// through.
+    fn launch_preflight(
+        &mut self,
+        craft: &csp_sim::CraftDef,
+        candidate: &csp_phys::WeldedBody,
+    ) -> Option<String> {
+        // §2.9's cap — vessels + in-flight builds (each build already
+        // reserved its delivery slot).
+        if self.sim.vessel_slots_in_use() >= self.sim.vessel_caps().max_vessels {
+            return Some(self.launch_refused(format!(
+                "vessel cap reached — {} slots in use; recover a vessel first",
+                self.sim.vessel_slots_in_use()
+            )));
+        }
+        // §3.5's manufacture debit is charged at the pad — an
+        // unaffordable craft must not launch, never clamp (the
+        // economy module's action rule).
+        let cost_micros = csp_sim::economy::craft_cost_micros(craft);
+        let funds_micros = self.sim.funds_micros();
+        if cost_micros > funds_micros {
+            return Some(self.launch_refused(format!(
+                "insufficient funds — craft costs {:.0}, {:.0} on hand",
+                cost_micros as f64 / csp_sim::economy::MICROS_PER_FUND,
+                funds_micros as f64 / csp_sim::economy::MICROS_PER_FUND,
+            )));
+        }
+        // The pad is a single berth — the sim's occupancy predicate
+        // counts InBubble hulls directly and re-materializes each
+        // latched vessel's stored pose at the current phase, so a
+        // parked craft still blocks the site.
+        if self.sim.spawn_site_occupied(candidate) {
+            return Some(
+                self.launch_refused(
+                    "launch site occupied — recover or move the parked vessel first",
+                ),
+            );
+        }
+        None
     }
 
     /// The shared refusal tail of [`View::launch_craft`]: the reason

@@ -29,6 +29,21 @@ fn second_launch_moves_focus_to_the_new_vessel() {
     frame(&mut view, 1);
     let first = view.flight_focus().expect("first spawn focused");
 
+    // The pad is a single berth — the spawn-occupancy gate refuses a
+    // launch that would materialize inside the parked craft, so fly
+    // the first vessel clear before launching again.
+    view.enqueue_command(
+        csp_view::SourceClass::Ui,
+        csp_view::PLAYER_SOURCE_ID,
+        csp_view::SimCommand::SetThrottle {
+            vessel: first,
+            throttle: 1.0,
+        },
+    );
+    for _ in 0..8 {
+        frame(&mut view, 64); // ~8 s — well clear of the pad volume
+    }
+
     view.launch_craft().expect("second launch");
     frame(&mut view, 1);
 
