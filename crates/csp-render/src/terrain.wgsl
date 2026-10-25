@@ -31,16 +31,16 @@ struct U {
 @group(0) @binding(1) var heightmap: texture_2d<f32>;   // R32Float equirect
 @group(0) @binding(2) var tlut: texture_2d<f32>;        // RGBA32Float T(h, μ)
 @group(0) @binding(3) var biomemap: texture_2d<u32>;    // R8Uint slots
-// Real art (data/art/terrain.csar, ambientCG + NASA SVS — see
+// Real art (data/art/terrain.csar, ambientCG — see
 // assets/ASSETS.md): class albedo/normal arrays keyed
-// [0 grass, 1 rock, 2 sand, 3 snow], the ocean wave normal map, and the
-// equirect star map. All 1×1 placeholders when the packet carries no
-// art (u.art.x == 0 keeps them unread).
+// [0 grass, 1 rock, 2 sand, 3 snow] and the ocean wave normal map.
+// All 1×1 placeholders when the packet carries no art (u.art.x == 0
+// keeps them unread). The night sky is fully procedural — no star
+// texture exists to bind.
 @group(0) @binding(4) var alb_arr: texture_2d_array<f32>;
 @group(0) @binding(5) var nrm_arr: texture_2d_array<f32>;
 @group(0) @binding(6) var water_nrm: texture_2d<f32>;
-@group(0) @binding(7) var stars_tex: texture_2d<f32>;
-@group(0) @binding(8) var samp: sampler;
+@group(0) @binding(7) var samp: sampler;
 
 const PI: f32 = 3.141592653589793;
 
@@ -759,31 +759,65 @@ fn screen_hash(ndc: vec2<f32>) -> f32 {
     return fract(sin(dot(ndc, vec2<f32>(12.9898, 78.233))) * 43758.5453);
 }
 
-// Procedural starfield — cell-hashed points anchored to the inertial
-// frame (rd is a world direction, so the stars are a real sky rather
-// than a screenspace pattern). The atmosphere dims them through the
-// view ray's transmittance; the planet occludes them on a ground
-// strike.
-fn star_field(rd: vec3<f32>) -> vec3<f32> {
-    let s = 120.0;
-    let p = rd * s;
-    let c = vec3<i32>(floor(p));
-    let f = p - floor(p) - 0.5;
-    let h = hash_i3(c.x, c.y, c.z);
-    if (h < 0.994) {
-        return vec3<f32>(0.0);
-    }
-    // A stable per-star offset inside the cell + a colour pick.
+// Procedural starfield — crisp POINT stars hashed out of a 3D shell
+// lattice in direction space. `rd` is an inertial direction, so the
+// field is a real sky (not screenspace noise, and not an equirect
+// texture: density is uniform at every latitude, poles included, and
+// nothing can smear — there is no image to blur). Each occupied cell
+// holds one star at a stable interior offset; the ray's distance to it
+// falls off as a sub-cell Gaussian, so stars land as sharp 1–2 px
+// points. The atmosphere dims them through the view ray's
+// transmittance; the planet occludes them on a ground strike.
+//
+// One star's contribution: `rd` the view ray, `s` the shell scale,
+// `ci` the ray's lattice cell. The star's position is hashed inside
+// the cell, then PROJECTED onto the direction sphere — the distance
+// measured is the small-angle ray↔star offset (in cell units), so a
+// star anywhere in the cell's depth range shows at full brightness
+// (a 3D-position Gaussian would hide ~85% of stars off the shell).
+fn star_cell(rd: vec3<f32>, s: f32, ci: vec3<i32>, gain: f32) -> vec3<f32> {
+    // |off| < 0.5 → the star stays inside its own cell, so the
+    // single-cell lookup sees all of it (no border clipping, no
+    // neighbour bleed needed).
     let off = (vec3<f32>(
-        hash_i3(c.x + 11, c.y + 5, c.z - 7),
-        hash_i3(c.x - 3, c.y + 17, c.z + 9),
-        hash_i3(c.x + 5, c.y - 13, c.z + 2),
-    ) - 0.5) * 0.55;
-    let d = f - off;
-    let m = exp(-dot(d, d) * 260.0) * min((h - 0.994) * 260.0, 1.0);
-    let tint = mix(vec3<f32>(0.72, 0.80, 1.0), vec3<f32>(1.0, 0.85, 0.66),
-                   fract(h * 729.31));
-    return tint * m * 1.7;
+        hash_i3(ci.x + 11, ci.y + 5, ci.z - 7),
+        hash_i3(ci.x - 3, ci.y + 17, ci.z + 9),
+        hash_i3(ci.x + 5, ci.y - 13, ci.z + 2),
+    ) - 0.5) * 0.7;
+    let star_dir = normalize(vec3<f32>(ci) + 0.5 + off);
+    let d = (star_dir - rd) * s;
+    // Magnitude: bent hash — most stars faint, a few burning bright;
+    // brighter stars bloom slightly wider.
+    let mag = hash_i3(ci.x - 7, ci.y + 23, ci.z + 13);
+    let bright = 0.14 + 1.5 * pow(mag, 3.0);
+    // Blue-white ↔ warm spread (B/A through K/M colours).
+    let t = hash_i3(ci.x + 19, ci.y - 11, ci.z + 3);
+    let tint = mix(vec3<f32>(0.70, 0.80, 1.0), vec3<f32>(1.0, 0.82, 0.62), t);
+    return tint * (exp(-dot(d, d) * (240.0 / (0.6 + bright))) * bright * gain);
+}
+
+fn star_field(rd: vec3<f32>) -> vec3<f32> {
+    var acc = vec3<f32>(0.0);
+    // Sparse bright layer (~7k stars all-sky at 3.2% occupancy).
+    let p1 = rd * 130.0;
+    let c1 = vec3<i32>(floor(p1));
+    if (hash_i3(c1.x, c1.y, c1.z) < 0.032) {
+        acc = acc + star_cell(rd, 130.0, c1, 1.6);
+    }
+    // Milky Way: a fixed great-circle band (galactic pole n) that lifts
+    // the faint layer's density and adds a whisper of broadband glow —
+    // deliberately low contrast, just enough to read as a band.
+    let mw_band = exp(-pow(dot(rd, vec3<f32>(0.3586, 0.2054, -0.9106)), 2.0) * 30.0);
+    // Dense faint layer (finer cells, occupancy raised inside the
+    // band), offset so its lattice decorrelates from the bright one.
+    let p2 = rd * 290.0 + vec3<f32>(0.37, 0.59, 0.83);
+    let c2 = vec3<i32>(floor(p2));
+    let faint = 0.11 + 0.12 * mw_band;
+    if (hash_i3(c2.x, c2.y, c2.z) < faint) {
+        acc = acc + star_cell(rd, 290.0, c2, 0.55);
+    }
+    acc = acc + vec3<f32>(0.006, 0.007, 0.011) * mw_band;
+    return acc;
 }
 
 @fragment
@@ -803,18 +837,10 @@ fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
     // by the atmosphere along the view ray.
     let disc = pow(max(dot(rd, sun), 0.0), 4000.0) * 24.0;
     let halo = pow(max(dot(rd, sun), 0.0), 16.0) * 0.10;
-    // Real star map when the art pack is loaded (NASA SVS Deep Star
-    // Map, svs.gsfc.nasa.gov/3895 — a pure all-sky plate carrée field,
-    // no landscape in any hemisphere): an equirect lookup on the
-    // inertial ray, north pole (+z) at v = 0 matching the map's
-    // Dec +90 top row. The procedural cell field is the fallback for
-    // art-less packets.
-    var stars = star_field(rd);
-    if (u.art.x > 0.5) {
-        let su = atan2(rd.y, rd.x) / (2.0 * PI) + 0.5;
-        let sv = 0.5 - asin(clamp(rd.z, -1.0, 1.0)) / PI;
-        stars = textureSample(stars_tex, samp, vec2<f32>(su, sv)).rgb * 2.4;
-    }
+    // The procedural starfield (always — no baked star image exists);
+    // sun glare washes stars out toward the disc.
+    let stars = star_field(rd)
+              * (1.0 - 0.85 * pow(max(dot(rd, sun), 0.0), 12.0));
     var space = vec3<f32>(0.004, 0.006, 0.014)
               + vec3<f32>(1.0, 0.95, 0.85) * (disc + halo)
               + stars;

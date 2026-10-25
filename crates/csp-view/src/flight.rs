@@ -172,7 +172,7 @@ pub struct FlightPart {
     pub shape: crate::part_mesh::PartShape,
     /// The module-family classification — livery tint + banding key.
     pub kind: PartKind,
-    /// The real baked model (Kenney Space Kit, `data/art/parts.csar`)
+    /// The real baked model (procedural parts.csar)
     /// fitted to the shape's AABB at emit — `None` draws the kitbash
     /// silhouette fallback.
     pub model: Option<std::sync::Arc<crate::art::PartModel>>,
@@ -2264,7 +2264,7 @@ fn kind_mat(kind: PartKind) -> [f32; 3] {
     }
 }
 
-/// Emit one part's real baked model (Kenney Space Kit) — fitted to the
+/// Emit one part's real baked model (procedural parts.csar) — fitted to the
 /// collider AABB. The vertex stream carries the authored albedo, the
 /// smoothing-wedge normal, and the baked material terms; per-pixel
 /// lighting happens in the fragment shader under `packet.light`.

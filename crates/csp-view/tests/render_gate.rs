@@ -378,10 +378,10 @@ fn empty_flight_scene_is_what_the_gate_rejects() {
 }
 
 /// Scratch sky-dome dump — renders the terrain sky pass alone with a
-/// vacuum-body packet (fs_sky's unattenuated space path) so the baked
-/// equirect star map is readable on its own. Three frames: north
-/// (map top), equator (map horizon row), south (map bottom — where a
-/// landscape HDRI's ground half used to live). Run explicitly:
+/// vacuum-body packet (fs_sky's unattenuated space path) so the
+/// procedural starfield is readable on its own. Three frames: north,
+/// equator, south — the shell-lattice hash must give crisp point stars
+/// with uniform density at every latitude. Run explicitly:
 /// `cargo test -p csp-view --test render_gate dump_sky -- --ignored`.
 #[test]
 #[ignore]

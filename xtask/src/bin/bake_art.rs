@@ -20,34 +20,34 @@
 //!          payload = verts ++ u32 indices (LE)
 //! ```
 //!
-//! ## Part-model quality pass (v2)
+//! ## Part models — procedurally authored (v3)
 //!
-//! The Kenney Space Kit ships flat-shaded, faceted models (~50–340
-//! triangles per part): every face corner carries a duplicated vertex
-//! with a face normal, so the baked meshes read as hard-edged low-poly
-//! solids. The bake upgrades them instead of shipping that:
+//! The Kenney Space Kit models were retired: they are stylized
+//! cartoon primitives, and no bake-side pass can un-cartoon a
+//! fundamentally low-poly authored silhouette. The parts are now
+//! **authored procedurally** by `parts.rs` in this directory — real
+//! aerospace geometry built as lathe/sweep/prism meshes with many
+//! control points: a Rao-flared double-wall bell nozzle with
+//! corrugated cooling channels and a copper liner, an Apollo-class
+//! capsule with recessed glass windows and a docking probe, a tank
+//! with ellipsoidal domes and raised weld rings, a tangent-ogive
+//! nosecone, an SRB, machined rings, a superellipse battery pack —
+//! then the same downstream quality pass the kit loader used:
 //!
 //! 1. **Weld** — all primitives merge on quantized position, so the
-//!    real topology (closed solids, real dihedral angles) is visible;
-//!    material borders stay as per-face colors, not as vertex splits.
+//!    authored topology (closed solids, real dihedral angles) is
+//!    intact; material borders stay as per-face colors.
 //! 2. **Edge shading** — every sharp edge is classified convex vs
 //!    concave; convex edges catch a light tint, concave seams darken —
-//!    the cheap "panel gap + edge wear" read that keeps flat materials
-//!    from looking untextured.
-//! 3. **Crease-aware Loop subdivision** — 1–2 iterations, smooth edges
-//!    (< ~53° dihedral) take the Loop limit surface while hard edges
-//!    (≥ ~53°, boundaries, non-manifold seams) take the sharp-crease
-//!    rules: 45° bevels and 8-gon barrels round into true curved
-//!    surfaces while machined 90° corners stay crisp. The low-poly
-//!    silhouette is gone at bake time, so the runtime cost stays a
-//!    plain indexed mesh.
-//! 4. **Split normals** — vertex normals rebuilt per smoothing wedge
+//!    the cheap "panel gap + edge wear" read.
+//! 3. **Split normals** — vertex normals rebuilt per smoothing wedge
 //!    (angle-weighted, split across creases): smooth regions shade
-//!    continuously, hard edges keep their flat facets.
-//! 5. **Material params** — each source material maps to a specular
-//!    strength/exponent pair (machined dark metal, painted hull,
-//!    glass, accent paint) and a cavity AO term is baked per vertex —
-//!    the shader reads them per pixel.
+//!    continuously, machined edges keep their crisp facets.
+//! 4. **Material params** — each authored face color maps to a
+//!    specular strength/exponent pair (machined dark metal, painted
+//!    hull, glossy glazing, charred ablative, accent paint) and a
+//!    cavity AO term is baked per vertex — the shader reads them
+//!    per pixel.
 //!
 //! The decoder is `csp-view`'s `art` module; the format is deliberately
 //! frozen-independent — bump `version` on any layout change.
@@ -59,7 +59,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde_json::Value;
+mod parts;
 
 // ---------------------------------------------------------------------------
 // .csar writer
@@ -158,62 +158,10 @@ fn write_csar(path: &Path, entries: &[(&str, Entry)]) {
 }
 
 // ---------------------------------------------------------------------------
-// glTF (.glb) minimal reader — POSITION/NORMAL/indices + material colors.
-// Enough for the Kenney packs (non-interleaved, f32 accessors).
-// ---------------------------------------------------------------------------
-
-fn comp_read<'a>(bin: &'a [u8], views: &[Value], acc: &Value) -> (&'a [u8], usize, usize) {
-    let bv = &views[acc["bufferView"].as_u64().unwrap() as usize];
-    let off = bv["byteOffset"].as_u64().unwrap_or(0) as usize
-        + acc["byteOffset"].as_u64().unwrap_or(0) as usize;
-    let n = acc["count"].as_u64().unwrap() as usize;
-    let ty = acc["type"].as_str().unwrap();
-    let comps = match ty {
-        "SCALAR" => 1,
-        "VEC2" => 2,
-        "VEC3" => 3,
-        "VEC4" => 4,
-        _ => panic!("accessor type {ty}"),
-    };
-    (&bin[off..], n, comps)
-}
-
-fn read_f32v3(bin: &[u8], views: &[Value], acc: &Value) -> Vec<[f32; 3]> {
-    assert_eq!(acc["componentType"].as_u64().unwrap(), 5126);
-    let (buf, n, comps) = comp_read(bin, views, acc);
-    assert_eq!(comps, 3);
-    (0..n)
-        .map(|i| {
-            let o = i * 12;
-            [
-                f32::from_le_bytes(buf[o..o + 4].try_into().unwrap()),
-                f32::from_le_bytes(buf[o + 4..o + 8].try_into().unwrap()),
-                f32::from_le_bytes(buf[o + 8..o + 12].try_into().unwrap()),
-            ]
-        })
-        .collect()
-}
-
-fn read_indices(bin: &[u8], views: &[Value], acc: &Value) -> Vec<u32> {
-    let (buf, n, _) = comp_read(bin, views, acc);
-    match acc["componentType"].as_u64().unwrap() {
-        5123 => (0..n)
-            .map(|i| u16::from_le_bytes(buf[i * 2..i * 2 + 2].try_into().unwrap()) as u32)
-            .collect(),
-        5125 => (0..n)
-            .map(|i| u32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap()))
-            .collect(),
-        c => panic!("index componentType {c}"),
-    }
-}
-
-fn srgb_u8(v: f64) -> u8 {
-    (v.clamp(0.0, 1.0) * 255.0).round() as u8
-}
-
-// ---------------------------------------------------------------------------
-// Part-model quality pass — weld → orient → edge-shade → Loop-subdivide →
-// split normals. All mesh math in f64 at bake; the pack stores f32.
+// Part-model quality pass — weld → edge-shade → split normals. The
+// authored meshes (parts.rs) arrive already dense and correctly
+// oriented, so no subdivision step is needed. All mesh math in f64 at
+// bake; the pack stores f32.
 // ---------------------------------------------------------------------------
 
 /// One triangle of the welded working mesh: vertex indices into the
@@ -301,17 +249,6 @@ fn edge_is_crease(fl: &[usize], fns: &[[f64; 3]]) -> bool {
     fl.len() != 2 || dot(fns[fl[0]], fns[fl[1]]) < CREASE_DOT
 }
 
-/// The third vertex of face `fi` — the corner opposite edge `(a, b)`
-/// (order-free; only the sum enters the Loop odd-vertex rule).
-fn third(faces: &[Face], fi: usize, a: u32, b: u32) -> u32 {
-    faces[fi]
-        .v
-        .iter()
-        .copied()
-        .find(|&v| v != a && v != b)
-        .unwrap_or(a)
-}
-
 /// Convex/concave edge-shading: each hard 2-face edge darkens or
 /// brightens its endpoint vertices — concave seams read as panel gaps,
 /// convex edges catch a faint edge light. Applied to the coarse mesh
@@ -350,106 +287,25 @@ fn edge_shade(pos: &[[f64; 3]], faces: &[Face], tint: &mut [f32]) {
     }
 }
 
-/// One crease-aware Loop subdivision step — faces ×4. Smooth edges get
-/// the Loop limit rules (bevels and polygonal barrels round into real
-/// curves); crease/boundary/non-manifold edges get the sharp rules so
-/// hard corners hold. `tint` tracks positions: edge midpoints average
-/// their endpoints' edge-shade factors.
-fn subdivide(pos: &mut Vec<[f64; 3]>, faces: &mut Vec<Face>, tint: &mut Vec<f32>) {
-    let fns = face_normals(pos, faces);
-    let edges = edge_faces(faces);
-    let n_v = pos.len();
-    // Vertex adjacency split by edge class — the even-vertex rule needs
-    // both the full one-ring (smooth rule) and just the crease
-    // neighbours (crease rule).
-    let mut nbrs: Vec<Vec<u32>> = vec![Vec::new(); n_v];
-    let mut crease_nbrs: Vec<Vec<u32>> = vec![Vec::new(); n_v];
-    for ((a, b), fl) in &edges {
-        nbrs[*a as usize].push(*b);
-        nbrs[*b as usize].push(*a);
-        if edge_is_crease(fl, &fns) {
-            crease_nbrs[*a as usize].push(*b);
-            crease_nbrs[*b as usize].push(*a);
-        }
-    }
-    // Odd vertices (one per edge).
-    let mut odd: BTreeMap<(u32, u32), u32> = BTreeMap::new();
-    for ((a, b), fl) in &edges {
-        let (pa, pb) = (pos[*a as usize], pos[*b as usize]);
-        let p = if edge_is_crease(fl, &fns) {
-            scale(add(pa, pb), 0.5)
-        } else {
-            let c = pos[third(faces, fl[0], *a, *b) as usize];
-            let d = pos[third(faces, fl[1], *a, *b) as usize];
-            add(scale(add(pa, pb), 0.375), scale(add(c, d), 0.125))
-        };
-        odd.insert((*a, *b), pos.len() as u32);
-        pos.push(p);
-        tint.push((tint[*a as usize] + tint[*b as usize]) * 0.5);
-    }
-    // Even vertices: standard Loop — smooth interior verts take the
-    // β-rule, verts on exactly two crease edges take the crease-curve
-    // rule, corners/ambiguous verts are pinned.
-    let even: Vec<[f64; 3]> = (0..n_v)
-        .map(|v| {
-            let cn = &crease_nbrs[v];
-            if cn.len() == 2 {
-                scale(
-                    add(
-                        add(pos[cn[0] as usize], pos[cn[1] as usize]),
-                        scale(pos[v], 6.0),
-                    ),
-                    0.125,
-                )
-            } else if cn.is_empty() {
-                let nb = &nbrs[v];
-                let n = nb.len();
-                if n < 3 {
-                    return pos[v];
-                }
-                let beta = if n == 3 {
-                    3.0 / 16.0
-                } else {
-                    3.0 / (8.0 * n as f64)
-                };
-                let sum = nb
-                    .iter()
-                    .fold([0.0; 3], |acc, &u| add(acc, pos[u as usize]));
-                add(scale(pos[v], 1.0 - n as f64 * beta), scale(sum, beta))
-            } else {
-                pos[v]
-            }
-        })
-        .collect();
-    pos[..n_v].copy_from_slice(&even);
-    // Rebuild: each face → 4 children, winding preserved.
-    let mut out = Vec::with_capacity(faces.len() * 4);
-    for f in faces.iter() {
-        let [a, b, c] = f.v;
-        let eab = odd[&(a.min(b), a.max(b))];
-        let ebc = odd[&(b.min(c), b.max(c))];
-        let eca = odd[&(c.min(a), c.max(a))];
-        for v in [[a, eab, eca], [eab, b, ebc], [eab, ebc, eca], [eca, ebc, c]] {
-            out.push(Face { v, col: f.col });
-        }
-    }
-    *faces = out;
-}
-
-/// `(spec_strength·255, spec_exponent)` for a source material color —
+/// `(spec_strength·255, spec_exponent)` for an authored face color —
 /// the per-material shininess the shader mixes per pixel. Dark
-/// blue-steel reads as machined metal (tight, strong highlight), the
-/// whites as glass/ceramic (tightest), the orange accent and hull
-/// greys as paint and brushed metal.
+/// blue-dominant colors read as glossy glazing (tight, strong
+/// highlight); warm darks as charred ablative (matte); the orange
+/// accent as paint, the whites as ceramic, the hull greys as paint
+/// and brushed metal.
 fn mat_params(col: [u8; 4]) -> [u8; 2] {
     let (r, g, b) = (f64::from(col[0]), f64::from(col[1]), f64::from(col[2]));
     let lum = (0.3 * r + 0.5 * g + 0.2 * b) / 255.0;
-    if r > 200.0 && g < 190.0 && b < 120.0 {
+    if b > r + 16.0 && lum < 0.45 {
+        [200, 120] // dark glazing — pod windows, lenses
+    } else if r > g * 1.15 && g >= b && lum < 0.30 {
+        [40, 10] // charred ablative — heat shields, sooted interiors
+    } else if r > 200.0 && g < 190.0 && b < 120.0 {
         [115, 40] // accent paint
     } else if lum < 0.38 {
         [150, 72] // machined dark metal (nozzle, shadowed hardware)
     } else if lum > 0.92 {
-        [165, 90] // near-white: pod glazing / ceramic
+        [165, 90] // near-white: ceramic
     } else if lum > 0.72 {
         [100, 44] // painted hull
     } else {
@@ -586,137 +442,9 @@ fn finish(pos: &[[f64; 3]], faces: &[Face], tint: &[f32]) -> MeshEntry {
     MeshEntry { verts, indices }
 }
 
-/// Load a GLB: weld all primitives on quantized position (f32 sources,
-/// 1e-6 grid — material borders merge into the shared topology),
-/// orient every face outward through its authored normals, then run
-/// the subdivision/normal/material quality pass. glTF y-up converts
-/// to the game's z-up part frame `(x,y,z) -> (x,-z,y)`.
-fn load_glb(path: &Path) -> MeshEntry {
-    let d = fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    assert_eq!(&d[0..4], b"glTF", "{}: not a GLB", path.display());
-    let jlen = u32::from_le_bytes(d[12..16].try_into().unwrap()) as usize;
-    let json: Value = serde_json::from_slice(&d[20..20 + jlen]).unwrap();
-    let bin_off = 20 + jlen;
-    assert_eq!(&d[bin_off + 4..bin_off + 8], b"BIN\0", "no BIN chunk");
-    let blen = u32::from_le_bytes(d[bin_off..bin_off + 4].try_into().unwrap()) as usize;
-    let bin = &d[bin_off + 8..bin_off + 8 + blen];
-
-    let views: Vec<Value> = json["bufferViews"].as_array().unwrap().clone();
-    let accs: Vec<Value> = json["accessors"].as_array().cloned().unwrap_or_default();
-    let mats: Vec<Value> = json["materials"].as_array().cloned().unwrap_or_default();
-
-    let mut vmap: BTreeMap<[i64; 3], u32> = BTreeMap::new();
-    let mut pos: Vec<[f64; 3]> = Vec::new();
-    let mut faces: Vec<Face> = Vec::new();
-    let mut weld = |p: [f64; 3]| -> u32 {
-        let key = [
-            (p[0] * 1e6).round() as i64,
-            (p[1] * 1e6).round() as i64,
-            (p[2] * 1e6).round() as i64,
-        ];
-        *vmap.entry(key).or_insert_with(|| {
-            pos.push(p);
-            (pos.len() - 1) as u32
-        })
-    };
-    for mesh in json["meshes"].as_array().unwrap() {
-        for prim in mesh["primitives"].as_array().unwrap() {
-            let mode = prim["mode"].as_u64().unwrap_or(4);
-            assert_eq!(mode, 4, "non-triangle primitive");
-            let attrs = &prim["attributes"];
-            let prim_pos = read_f32v3(
-                bin,
-                &views,
-                &accs[attrs["POSITION"].as_u64().unwrap() as usize],
-            );
-            let prim_nrm = read_f32v3(
-                bin,
-                &views,
-                &accs[attrs["NORMAL"].as_u64().unwrap() as usize],
-            );
-            let col = prim["material"]
-                .as_u64()
-                .and_then(|m| {
-                    mats[m as usize]["pbrMetallicRoughness"]["baseColorFactor"]
-                        .as_array()
-                        .map(|a| {
-                            [
-                                srgb_u8(a[0].as_f64().unwrap_or(1.0)),
-                                srgb_u8(a[1].as_f64().unwrap_or(1.0)),
-                                srgb_u8(a[2].as_f64().unwrap_or(1.0)),
-                                srgb_u8(a[3].as_f64().unwrap_or(1.0)),
-                            ]
-                        })
-                })
-                .unwrap_or([255, 255, 255, 255]);
-            let idx: Vec<u32> = match prim.get("indices").and_then(|i| i.as_u64()) {
-                Some(a) => read_indices(bin, &views, &accs[a as usize]),
-                None => (0..prim_pos.len() as u32).collect(),
-            };
-            for t in idx.chunks_exact(3) {
-                let [ia, ib, ic] = [t[0], t[1], t[2]].map(|i| i as usize);
-                if ia == ib || ib == ic || ic == ia {
-                    continue;
-                }
-                let (pa, pb, pc) = (prim_pos[ia], prim_pos[ib], prim_pos[ic]);
-                // y-up → z-up conversion lands the model "up" on the
-                // stack axis; positions weld on the CONVERTED frame.
-                let cv = |p: [f32; 3]| [f64::from(p[0]), f64::from(-p[2]), f64::from(p[1])];
-                // Orient outward: the authored corner normals are the
-                // kit's ground truth — a face whose geometric normal
-                // fights them gets its winding flipped so every
-                // downstream normal points out.
-                let an = {
-                    let n = unit(cross(sub(cv(pb), cv(pa)), sub(cv(pc), cv(pa))));
-                    let authored = unit(add(
-                        add(
-                            [
-                                f64::from(prim_nrm[ia][0]),
-                                f64::from(-prim_nrm[ia][2]),
-                                f64::from(prim_nrm[ia][1]),
-                            ],
-                            [
-                                f64::from(prim_nrm[ib][0]),
-                                f64::from(-prim_nrm[ib][2]),
-                                f64::from(prim_nrm[ib][1]),
-                            ],
-                        ),
-                        [
-                            f64::from(prim_nrm[ic][0]),
-                            f64::from(-prim_nrm[ic][2]),
-                            f64::from(prim_nrm[ic][1]),
-                        ],
-                    ));
-                    if dot(n, authored) < 0.0 {
-                        [cv(pa), cv(pc), cv(pb)]
-                    } else {
-                        [cv(pa), cv(pb), cv(pc)]
-                    }
-                };
-                let (va, vb, vc) = (weld(an[0]), weld(an[1]), weld(an[2]));
-                if va == vb || vb == vc || vc == va {
-                    continue;
-                }
-                faces.push(Face {
-                    v: [va, vb, vc],
-                    col,
-                });
-            }
-        }
-    }
-    assert!(!faces.is_empty(), "{}: no triangles", path.display());
-    let mut tint = vec![1.0f32; pos.len()];
-    edge_shade(&pos, &faces, &mut tint);
-    // Up to two Loop iterations, bounded — subdividing stops when the
-    // next step would pass ~2.4k tris so the big models don't explode.
-    for _ in 0..2 {
-        if faces.len() * 4 > 2400 {
-            break;
-        }
-        subdivide(&mut pos, &mut faces, &mut tint);
-    }
-    finish(&pos, &faces, &tint)
-}
+// The parts are procedurally authored in `parts/` — no model files
+// load here anymore. (The Kenney GLB path was retired: stylized
+// cartoon primitives cannot be baked into real hardware.)
 
 // ---------------------------------------------------------------------------
 // Images — decode, resize, mip chain (box downsample), per-layer means.
@@ -728,18 +456,6 @@ fn load_rgba8(path: &Path, w: u32, h: u32) -> Vec<u8> {
         .resize_exact(w, h, image::imageops::FilterType::Lanczos3)
         .to_rgba8();
     img.into_raw()
-}
-
-/// The sky-dome source must be a *pure* star field. The first pass here
-/// baked Poly Haven's `lakeside_night` HDRI — a landscape panorama whose
-/// lower hemisphere is trees/water/shore and whose upper half blows out
-/// to a white twilight glow under tone-mapping; mapped onto the sky
-/// sphere it read as "the inside of a planet". The replacement is NASA
-/// SVS's Deep Star Map (svs.gsfc.nasa.gov/3895): a plate carrée
-/// (equirect) all-sky render of ~100 M catalogue stars + the Milky Way
-/// — dark sky in EVERY direction, no landscape anywhere.
-fn load_stars(path: &Path, w: u32, h: u32) -> Vec<u8> {
-    load_rgba8(path, w, h)
 }
 
 fn downsample(level: &[u8], w: usize, h: usize) -> (Vec<u8>, usize, usize) {
@@ -827,35 +543,18 @@ fn main() {
     let out = root.join("data/art");
     fs::create_dir_all(&out).unwrap();
 
-    let glb = |n: &str| src.join(format!("kenney_space-kit/Models/GLTF format/{n}.glb"));
-
-    // --- rocket part models (Kenney Space Kit, CC0) -------------------------
-    let parts: &[(&str, &str)] = &[
-        ("engine_a", "rocket_baseA"),
-        ("engine_b", "rocket_baseB"),
-        ("pod", "rocket_topA"),
-        ("nosecone", "rocket_topB"),
-        ("tank", "rocket_fuelB"),
-        ("booster", "rocket_sidesA"),
-        ("decoupler", "pipe_ring"),
-        ("adapter", "structure"),
-        ("battery", "machine_wireless"),
-        ("science", "machine_barrel"),
-        ("fins", "rocket_finsA"),
-    ];
-    let mut entries: Vec<(&str, Entry)> = Vec::new();
-    for (key, file) in parts {
-        let m = load_glb(&glb(file));
-        println!(
-            "part {key:<10} <- {file}.glb: {} verts {} tris",
-            m.verts.len(),
-            m.indices.len() / 3
-        );
-        entries.push((key, Entry::Mesh(m)));
-    }
+    // --- rocket part models (procedurally authored — see parts.rs) ---
+    let entries: Vec<(&str, Entry)> = parts::build_all()
+        .into_iter()
+        .map(|(k, m)| (k, Entry::Mesh(m)))
+        .collect();
     write_csar(&out.join("parts.csar"), &entries);
 
-    // --- terrain/sky textures (ambientCG CC0 + NASA SVS public-domain) ------
+    // --- terrain textures (ambientCG CC0) -----------------------------------
+    // The night sky is NOT baked: `terrain.wgsl`'s fs_sky synthesizes a
+    // procedural shell-lattice starfield — a baked equirect star map
+    // blurred catalogue stars into speckle noise and smeared at the
+    // poles, so the image was removed rather than replaced.
     let acg = |id: &str, map: &str| src.join(format!("{id}/{id}_1K-JPG_{map}.jpg"));
     const T: u32 = 512;
     let alb_layers: Vec<Vec<u8>> = [
@@ -877,8 +576,6 @@ fn main() {
     .map(|p| load_rgba8(p, T, T))
     .collect();
     let water = load_rgba8(&acg("Foam002", "NormalGL"), T, T);
-    // 2048×1024 keeps catalogue stars ~0.2°/texel — points, not smears.
-    let stars = load_stars(&src.join("starmap_4k.jpg"), 2048, 1024);
 
     let entries: Vec<(&str, Entry)> = vec![
         // layer order: 0 grass, 1 rock, 2 sand, 3 snow — terrain.wgsl keys it
@@ -894,7 +591,6 @@ fn main() {
             "water_nrm",
             Entry::Image(image_entry(T as u16, T as u16, vec![water])),
         ),
-        ("stars", Entry::Image(image_entry(2048, 1024, vec![stars]))),
     ];
     write_csar(&out.join("terrain.csar"), &entries);
 }

@@ -47,7 +47,8 @@ pub struct ModelVert {
     pub mat: [f32; 3],
 }
 
-/// A baked part mesh — real model geometry from the Kenney Space Kit.
+/// A baked part mesh — real authored geometry from the procedural
+/// part generator (`xtask bake_art`'s `parts.rs`).
 #[derive(Debug)]
 pub struct PartModel {
     /// Vertices.
@@ -65,7 +66,7 @@ pub struct PartModel {
 pub struct ArtInner {
     /// Named part meshes (`"pod"`, `"engine_a"`, `"tank"`, …).
     pub models: BTreeMap<String, Arc<PartModel>>,
-    /// The surface-pass texture set (terrain classes, water, stars).
+    /// The surface-pass texture set (terrain classes, water).
     pub terrain: Option<Arc<TerrainArt>>,
 }
 
@@ -109,7 +110,6 @@ pub fn load() -> ArtAssets {
                         "albedo" => t.albedo = Some(tex),
                         "normal" => t.normal = Some(tex),
                         "water_nrm" => t.water = Some(tex),
-                        "stars" => t.stars = Some(tex),
                         _ => {}
                     }
                 }
@@ -126,16 +126,17 @@ struct TerrainTexSet {
     albedo: Option<TerrainTex>,
     normal: Option<TerrainTex>,
     water: Option<TerrainTex>,
-    stars: Option<TerrainTex>,
 }
 
 impl TerrainTexSet {
     /// Complete set → `TerrainArt` with a content key; incomplete →
     /// `None` (all-or-nothing — the shader's flag covers the pack).
+    /// (`stars` was dropped from the pack: the night sky is
+    /// `terrain.wgsl`'s procedural starfield now, no baked image.)
     fn finish(self) -> Option<Arc<TerrainArt>> {
-        let (albedo, normal, water, stars) = (self.albedo?, self.normal?, self.water?, self.stars?);
+        let (albedo, normal, water) = (self.albedo?, self.normal?, self.water?);
         let mut key = 0xcbf2_9ce4_8422_2325u64;
-        for t in [&albedo, &normal, &water, &stars] {
+        for t in [&albedo, &normal, &water] {
             key = (key ^ (t.data.len() as u64)).wrapping_mul(0x0000_0100_0000_01b3)
                 ^ (u64::from(t.w) << 32 | u64::from(t.h));
         }
@@ -143,7 +144,6 @@ impl TerrainTexSet {
             albedo,
             normal,
             water,
-            stars,
             key,
         }))
     }
@@ -391,6 +391,6 @@ mod tests {
         }
         let t = art.0.terrain.as_ref().unwrap();
         assert_eq!(t.albedo.layers, 4);
-        assert!(t.stars.mips > 4);
+        assert!(t.water.mips > 4);
     }
 }

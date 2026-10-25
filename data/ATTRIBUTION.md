@@ -25,21 +25,9 @@
 # Every other line in this file is either a '#' comment like these, or a
 # 4-field attribution row. Rows belong below:
 #
-# path | source | license | urlart/parts.csar | Kenney "Space Kit" (rocket_baseA/B, rocket_topA/B, rocket_fuelB, rocket_sidesA, rocket_finsA, pipe_ring, structure, machine_wireless, machine_barrel), baked by xtask --bin bake_art | CC0-1.0 | https://kenney.nl/assets/space-kit
-data/art/parts.csar | Kenney Space Kit GLBs (see assets/ASSETS.md), baked by xtask bake_art | CC0-1.0 | https://kenney.nl/assets/space-kit
+# path | source | license | url
+data/art/parts.csar | procedural rocket-part meshes authored in xtask/src/bin/parts.rs, baked by xtask bake_art | MIT | https://github.com/DimitriGilbert/Clanker-Space-Program
 data/art/terrain.csar | ambientCG Grass003/Rock035/Ground080/Snow010A/Foam002 PBR maps, baked by xtask bake_art | CC0-1.0 | https://ambientcg.com
-data/art/terrain.csar | NASA/GSFC SVS "Deep Star Maps" starmap_4k.jpg (all-sky equirect star field), baked by xtask bake_art | public-domain | https://svs.gsfc.nasa.gov/3895
-assets/src/kenney_space-kit/Models/GLTF format/rocket_baseA.glb | Kenney Space Kit | CC0-1.0 | https://kenney.nl/assets/space-kit
-assets/src/kenney_space-kit/Models/GLTF format/rocket_baseB.glb | Kenney Space Kit | CC0-1.0 | https://kenney.nl/assets/space-kit
-assets/src/kenney_space-kit/Models/GLTF format/rocket_topA.glb | Kenney Space Kit | CC0-1.0 | https://kenney.nl/assets/space-kit
-assets/src/kenney_space-kit/Models/GLTF format/rocket_topB.glb | Kenney Space Kit | CC0-1.0 | https://kenney.nl/assets/space-kit
-assets/src/kenney_space-kit/Models/GLTF format/rocket_fuelB.glb | Kenney Space Kit | CC0-1.0 | https://kenney.nl/assets/space-kit
-assets/src/kenney_space-kit/Models/GLTF format/rocket_sidesA.glb | Kenney Space Kit | CC0-1.0 | https://kenney.nl/assets/space-kit
-assets/src/kenney_space-kit/Models/GLTF format/rocket_finsA.glb | Kenney Space Kit | CC0-1.0 | https://kenney.nl/assets/space-kit
-assets/src/kenney_space-kit/Models/GLTF format/pipe_ring.glb | Kenney Space Kit | CC0-1.0 | https://kenney.nl/assets/space-kit
-assets/src/kenney_space-kit/Models/GLTF format/structure.glb | Kenney Space Kit | CC0-1.0 | https://kenney.nl/assets/space-kit
-assets/src/kenney_space-kit/Models/GLTF format/machine_wireless.glb | Kenney Space Kit | CC0-1.0 | https://kenney.nl/assets/space-kit
-assets/src/kenney_space-kit/Models/GLTF format/machine_barrel.glb | Kenney Space Kit | CC0-1.0 | https://kenney.nl/assets/space-kit
 assets/src/Grass003/Grass003_1K-JPG_Color.jpg | ambientCG Grass003 (grass) | CC0-1.0 | https://ambientcg.com/view?id=Grass003
 assets/src/Grass003/Grass003_1K-JPG_NormalGL.jpg | ambientCG Grass003 (grass) | CC0-1.0 | https://ambientcg.com/view?id=Grass003
 assets/src/Rock035/Rock035_1K-JPG_Color.jpg | ambientCG Rock035 (rock) | CC0-1.0 | https://ambientcg.com/view?id=Rock035
@@ -50,4 +38,3 @@ assets/src/Snow010A/Snow010A_1K-JPG_Color.jpg | ambientCG Snow010A (snow) | CC0-
 assets/src/Snow010A/Snow010A_1K-JPG_NormalGL.jpg | ambientCG Snow010A (snow) | CC0-1.0 | https://ambientcg.com/view?id=Snow010A
 assets/src/Foam002/Foam002_1K-JPG_Color.jpg | ambientCG Foam002 (ocean-foam) | CC0-1.0 | https://ambientcg.com/view?id=Foam002
 assets/src/Foam002/Foam002_1K-JPG_NormalGL.jpg | ambientCG Foam002 (ocean-foam) | CC0-1.0 | https://ambientcg.com/view?id=Foam002
-assets/src/starmap_4k.jpg | NASA/GSFC Scientific Visualization Studio Deep Star Maps (star catalogues: Bright Star, Tycho-2, UCAC3) | public-domain | https://svs.gsfc.nasa.gov/3895

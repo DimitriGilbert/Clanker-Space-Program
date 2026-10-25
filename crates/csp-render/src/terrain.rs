@@ -540,8 +540,9 @@ pub struct TerrainTex {
 
 /// The real-asset set for the surface pass — decoded from
 /// `data/art/terrain.csar` by `csp-view` (see `assets/ASSETS.md` for
-/// provenance). All four members ride one upload key: the pack is
-/// all-or-nothing.
+/// provenance). All three members ride one upload key: the pack is
+/// all-or-nothing. The night sky is procedural (`fs_sky`'s shell-lattice
+/// starfield) — no star texture ships.
 #[derive(Debug)]
 pub struct TerrainArt {
     /// Class albedo array — layers `[grass, rock, sand, snow]`.
@@ -550,8 +551,6 @@ pub struct TerrainArt {
     pub normal: TerrainTex,
     /// Ocean wave normal map.
     pub water: TerrainTex,
-    /// Equirect night-sky map (north = v 0).
-    pub stars: TerrainTex,
     /// Content key — the renderer re-uploads on change.
     pub key: u64,
 }
@@ -782,8 +781,8 @@ impl TexUpload {
 /// fullscreen sky pipeline, the uniform buffer, the three data
 /// textures (heightfield `R32Float`, transmittance `RGBA32Float`, biome
 /// `R8Uint`), and the real-art set (albedo/normal `RGBA8` arrays, the
-/// water normal map, the equirect star map + the filtering sampler) —
-/// each re-uploaded only when its packet key changes.
+/// water normal map + the filtering sampler) — each re-uploaded only
+/// when its packet key changes.
 pub struct TerrainRenderer {
     terrain_pipe: wgpu::RenderPipeline,
     sky_pipe: wgpu::RenderPipeline,
@@ -798,11 +797,10 @@ pub struct TerrainRenderer {
     height_tex: wgpu::Texture,
     lut_tex: wgpu::Texture,
     biome_tex: wgpu::Texture,
-    /// Real-art textures (bindings 4–7) + the shared sampler (8).
+    /// Real-art textures (bindings 4–6) + the shared sampler (7).
     alb_tex: wgpu::Texture,
     nrm_tex: wgpu::Texture,
     water_tex: wgpu::Texture,
-    star_tex: wgpu::Texture,
     sampler: wgpu::Sampler,
     uploaded_height_key: Option<u64>,
     uploaded_atmo: Option<AtmoDesc>,
@@ -813,10 +811,10 @@ pub struct TerrainRenderer {
 impl TerrainRenderer {
     /// The shared bind-group layout: 0 uniforms, 1 heightfield,
     /// 2 transmittance LUT, 3 biome slots — all `textureLoad`
-    /// (non-filterable formats keep every backend happy). Bindings 4–7
-    /// are the real-art set (albedo/normal `D2Array`, water normal and
-    /// star map `D2`, all filterable `RGBA8`) plus the filtering sampler
-    /// at 8 — they carry 1×1 placeholders until a packet uploads art.
+    /// (non-filterable formats keep every backend happy). Bindings 4–6
+    /// are the real-art set (albedo/normal `D2Array`, water normal `D2`,
+    /// all filterable `RGBA8`) plus the filtering sampler at 7 — they
+    /// carry 1×1 placeholders until a packet uploads art.
     fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
         let tex = |binding: u32, vis, sample_type| wgpu::BindGroupLayoutEntry {
             binding,
@@ -873,13 +871,8 @@ impl TerrainRenderer {
                     wgpu::ShaderStages::FRAGMENT,
                     wgpu::TextureSampleType::Float { filterable: true },
                 ),
-                tex(
-                    7,
-                    wgpu::ShaderStages::FRAGMENT,
-                    wgpu::TextureSampleType::Float { filterable: true },
-                ),
                 wgpu::BindGroupLayoutEntry {
-                    binding: 8,
+                    binding: 7,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
@@ -997,7 +990,7 @@ impl TerrainRenderer {
             mapped_at_creation: false,
         });
         let (height_tex, lut_tex, biome_tex) = Self::init_data_tex(device);
-        let (alb_tex, nrm_tex, water_tex, star_tex, sampler) = Self::init_art_tex(device);
+        let (alb_tex, nrm_tex, water_tex, sampler) = Self::init_art_tex(device);
         let bind_group = Self::bind_group(
             device,
             &bgl,
@@ -1008,7 +1001,6 @@ impl TerrainRenderer {
             &alb_tex,
             &nrm_tex,
             &water_tex,
-            &star_tex,
             &sampler,
         );
         Self {
@@ -1032,7 +1024,6 @@ impl TerrainRenderer {
             alb_tex,
             nrm_tex,
             water_tex,
-            star_tex,
             sampler,
             uploaded_height_key: None,
             uploaded_atmo: None,
@@ -1064,13 +1055,7 @@ impl TerrainRenderer {
     /// sampler the packs sample through.
     fn init_art_tex(
         device: &wgpu::Device,
-    ) -> (
-        wgpu::Texture,
-        wgpu::Texture,
-        wgpu::Texture,
-        wgpu::Texture,
-        wgpu::Sampler,
-    ) {
+    ) -> (wgpu::Texture, wgpu::Texture, wgpu::Texture, wgpu::Sampler) {
         let ph = |format: wgpu::TextureFormat| TexUpload {
             label: "terrain-art-placeholder",
             format,
@@ -1094,7 +1079,6 @@ impl TerrainRenderer {
             arr(wgpu::TextureFormat::Rgba8UnormSrgb),
             arr(wgpu::TextureFormat::Rgba8Unorm),
             one(wgpu::TextureFormat::Rgba8Unorm),
-            one(wgpu::TextureFormat::Rgba8UnormSrgb),
             sampler,
         )
     }
@@ -1110,7 +1094,6 @@ impl TerrainRenderer {
         alb_tex: &wgpu::Texture,
         nrm_tex: &wgpu::Texture,
         water_tex: &wgpu::Texture,
-        star_tex: &wgpu::Texture,
         sampler: &wgpu::Sampler,
     ) -> wgpu::BindGroup {
         let height_view = height_tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1119,7 +1102,6 @@ impl TerrainRenderer {
         let alb_view = alb_tex.create_view(&wgpu::TextureViewDescriptor::default());
         let nrm_view = nrm_tex.create_view(&wgpu::TextureViewDescriptor::default());
         let water_view = water_tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let star_view = star_tex.create_view(&wgpu::TextureViewDescriptor::default());
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("terrain"),
             layout: bgl,
@@ -1154,10 +1136,6 @@ impl TerrainRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 7,
-                    resource: wgpu::BindingResource::TextureView(&star_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
                     resource: wgpu::BindingResource::Sampler(sampler),
                 },
             ],
@@ -1175,7 +1153,6 @@ impl TerrainRenderer {
             &self.alb_tex,
             &self.nrm_tex,
             &self.water_tex,
-            &self.star_tex,
             &self.sampler,
         );
     }
@@ -1284,7 +1261,7 @@ impl TerrainRenderer {
         out
     }
 
-    /// Keyed upload of the packet's [`TerrainArt`] (all four members
+    /// Keyed upload of the packet's [`TerrainArt`] (all three members
     /// ride one content key). Returns whether the bind group must be
     /// recreated.
     fn upload_art(
@@ -1305,7 +1282,6 @@ impl TerrainRenderer {
             self.alb_tex = Self::write_art_tex(device, queue, &a.albedo, sg, "terrain-albedo");
             self.nrm_tex = Self::write_art_tex(device, queue, &a.normal, ln, "terrain-normal");
             self.water_tex = Self::write_art_tex(device, queue, &a.water, ln, "terrain-water");
-            self.star_tex = Self::write_art_tex(device, queue, &a.stars, sg, "terrain-stars");
         }
         self.uploaded_art_key = art_key;
         true
@@ -1397,7 +1373,7 @@ impl TerrainRenderer {
             self.uploaded_biome_key = biome_key;
             rebind = true;
         }
-        // The real-art set — one key for the four-member pack; the
+        // The real-art set — one key for the three-member pack; the
         // `uniforms.art.x` flag is what actually arms the shader path,
         // so a stale placeholder only costs samples when the packet
         // claims art it doesn't have (which the view never builds).

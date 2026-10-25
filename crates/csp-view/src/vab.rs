@@ -973,7 +973,7 @@ fn emit_part(
     pick: u32,
 ) {
     if let Some(m) = &p.model {
-        // Real baked model (Kenney Space Kit): smoothing-wedge normals
+        // Real baked model (procedural, parts.csar): wedge normals
         // + authored albedo + baked material terms.
         let (lo, hi) = p.shape.local_aabb();
         let mut mtris = Vec::new();

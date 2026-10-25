@@ -1,21 +1,32 @@
 # Art assets — sources & licenses
 
-All third-party art is CC0 or public-domain NASA imagery; every file is
-baked into `data/art/*.csar` packs by `cargo run -p xtask --bin bake_art`
-(`xtask/src/bin/bake_art.rs`) and decoded at startup by
-`csp_view::art`. Nothing under `assets/` is read at runtime — it is the
-reproducible bake input. Rows below are also recorded in
-`data/ATTRIBUTION.md` for the shipped `data/art/` files.
+The bake `cargo run -p xtask --bin bake_art`
+(`xtask/src/bin/bake_art.rs`) packs `data/art/*.csar`, decoded at
+startup by `csp_view::art`. Nothing under `assets/` is read at
+runtime — it is the reproducible bake input.
+
+## Rocket parts — procedurally authored, no external source
+
+The part meshes in `data/art/parts.csar` are **authored in code** by
+`xtask/src/bin/parts.rs`: real aerospace geometry built as
+lathe/sweep/prism meshes (Rao-flared double-wall bell nozzles with
+corrugated cooling channels and copper liners, an Apollo-class
+capsule with recessed windows and a docking probe, tanks with
+ellipsoidal domes and raised weld rings, a tangent-ogive nosecone,
+an SRB, machined rings, a superellipse battery pack, an instrument
+canister, a fin can). No third-party model files are bake inputs —
+the Kenney Space Kit GLBs were retired because stylized cartoon
+primitives cannot bake into real hardware.
+
+## Terrain textures (ambientCG, CC0)
 
 | Source file(s) (`assets/src/…`) | Origin | License | URL |
 |---|---|---|---|
-| `kenney_space-kit/Models/GLTF format/rocket_baseA.glb`, `rocket_baseB.glb`, `rocket_topA.glb`, `rocket_topB.glb`, `rocket_fuelB.glb`, `rocket_sidesA.glb`, `rocket_finsA.glb`, `pipe_ring.glb`, `structure.glb`, `machine_wireless.glb`, `machine_barrel.glb` | Kenney "Space Kit" 2.0 | CC0-1.0 | https://kenney.nl/assets/space-kit |
 | `Grass003/…_Color.jpg`, `…_NormalGL.jpg` | ambientCG "Grass 003" | CC0-1.0 | https://ambientcg.com/view?id=Grass003 |
 | `Rock035/…_Color.jpg`, `…_NormalGL.jpg` | ambientCG "Rock 035" | CC0-1.0 | https://ambientcg.com/view?id=Rock035 |
 | `Ground080/…_Color.jpg`, `…_NormalGL.jpg` | ambientCG "Ground 080" (beach sand) | CC0-1.0 | https://ambientcg.com/view?id=Ground080 |
 | `Snow010A/…_Color.jpg`, `…_NormalGL.jpg` | ambientCG "Snow 010 A" | CC0-1.0 | https://ambientcg.com/view?id=Snow010A |
 | `Foam002/…_NormalGL.jpg` | ambientCG "Foam 002" (ocean foam → wave normals) | CC0-1.0 | https://ambientcg.com/view?id=Foam002 |
-| `starmap_4k.jpg` | NASA/GSFC Scientific Visualization Studio "Deep Star Maps" (plate carrée all-sky star field, celestial coords) | public-domain | https://svs.gsfc.nasa.gov/3895 |
 
-Attribution is not legally required (CC0 / NASA media guidelines) but
-given anyway — thanks Kenney, ambientCG, and NASA/GSFC SVS.
+Attribution is not legally required (CC0) but given anyway — thanks
+ambientCG.

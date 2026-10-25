@@ -1,0 +1,83 @@
+# Cluster 11 — rendering pipeline + shaders (graphics-quality forensics)
+
+Scope: `crates/csp-render/src/{terrain.rs,terrain.wgsl,lib.rs,vab.rs,vab.wgsl,flight.rs,flight.wgsl,map.rs,map.wgsl}`, `Cargo.toml`, plus the caller side (`csp-app/src/lib.rs` pass composition, `csp-view/src/{terrain.rs,flight.rs,map.rs,art.rs}`) needed to judge pass contracts. Static review only (no cargo, per instruction).
+
+**Mid-edit tree state** (`git status --porcelain crates/csp-render`): ` M crates/csp-render/src/terrain.wgsl` — reviewed as-on-disk (887 lines, newer than the 854-line snapshot in the brief; also flight.rs/vab.rs/lib.rs mtimes are newer than the last commit but content is clean per git). Findings against terrain.wgsl may move by a few lines if the concurrent edit lands.
+
+**Reverse-Z discipline audit (the historical bug class) — CLEAN.** Verified every pass and pipeline:
+- App scene pass depth clear 0.0 (`csp-app/src/lib.rs:1296`), VAB pick pass clear 0.0 (`vab.rs:321`).
+- vab `Greater` (`vab.rs:143`), flight `GreaterEqual` (`flight.rs:105`, deliberate and correct — fallback sky sits exactly on NDC z=0 and a strict `Greater` can never pass a 0.0-cleared buffer), terrain `Greater` (`terrain.rs:973`), terrain sky `Always` + no depth write drawn first in-pass (`terrain.rs:947-951`, `terrain.rs:1412-1415`), map no depth (`map.rs:118`).
+- Projection is a true infinite-far reverse-Z (`csp-view/src/map.rs:1374-1382`), so terrain-at-planet-distance NDC z ≈ near/dist ≈ 1.7e-7 > 0.0 passes `Greater` — no far-plane cull, no purple-frame recurrence. Draw order terrain→ocean in one instanced draw (`terrain.rs:1419-1429`) makes equal-depth ocean fragments fail `Greater`, which is what prevents shoreline z-fighting. No depthClamp anywhere; none needed (no finite far plane).
+
+---
+
+### [SEVERITY: HIGH] Finding 1: No anti-aliasing anywhere in the pipeline — every silhouette shimmers
+**File**: crates/csp-render/src/terrain.rs:918, crates/csp-render/src/flight.rs:134, crates/csp-render/src/vab.rs:166, crates/csp-render/src/map.rs:119
+**Problem**: Every pipeline is created with `multisample: wgpu::MultisampleState::default()` at `sample_count: 1`, the surface has no MSAA, and there is no post-process AA pass — the app records exactly two passes per frame (scene + egui, `csp-app/src/lib.rs:1261-1352`). PLAN §5.1 Baseline row "Post: FXAA/none" — "none" is what shipped.
+**Evidence**: terrain.rs pipe() closure: `multisample: wgpu::MultisampleState::default(),` — identical in all four renderers; no `resolve_target` other than `None`, no intermediate scene target exists at all.
+**Impact**: Hard 1-px stair-stepping on craft part edges (Kenney kit parts are thin cylinders/fins — the worst case for aliasing), terrain ridgelines and mountain silhouettes crawl during camera orbit, VAB editor edges sparkle on every drag. On the map view, orbit lines/markers have in-shader analytic AA (map.wgsl:36-46 — good), which makes the 3-D views look worse by comparison. This alone reads as "shit graphics" on a 1080p screen.
+**Suggestion**: Cheapest correct step: an FXAA pass — render the scene into an offscreen `TextureFormat::Rgba16Float` target, run a stock FXAA shader into the surface view, keep egui on top (its pass already composites with `LoadOp::Load`). Better: 4x MSAA on that intermediate (terrain + flight + vab pipelines set `count: 4`, resolve into the offscreen, then blit). The scene is a single pass with three pipelines, so both are a contained change in `csp-app`.
+
+### [SEVERITY: MEDIUM] Finding 2: Craft lighting ignores the atmosphere — vessel stays neutral white while the world goes orange
+**File**: crates/csp-render/src/flight.wgsl:85-98 (and the data source csp-view/src/flight.rs:2407)
+**Problem**: The terrain pass attenuates sunlight through the LUT (`terrain.wgsl:703-707`: `sun_lum = sun_lum * trans(alt_b, dot(sun, dir))` — sunset reddening, altitude dimming) and applies aerial perspective to distant ground (`terrain.wgsl:724-732`). The craft pass does neither: `fs_main` lights with the raw uniform `light.sun_col.rgb` and never reads a transmittance term.
+**Evidence**: flight.wgsl:91: `var rgb = i.color.rgb * (amb + light.sun_col.rgb * max(ndl, 0.0));` — and csp-view/src/flight.rs:2407 bakes a constant: `sun_col: [0.95, 0.92, 0.85, 0.0],` regardless of atmosphere, sun elevation, or altitude (comment claims it makes the hull "read like the scene the terrain pass draws (same sun direction)" — the direction matches; the color does not).
+**Impact**: At sunrise/sunset or high-altitude reentry the terrain and sky go deep orange/red while the vessel stays flat white-lit — the craft looks pasted onto the background, the classic "two renders in one screenshot" tell. Also no aerial perspective on a distant craft seen from map-zoom-out distances.
+**Suggestion**: `PartLight` is rebuilt every frame by the extract — multiply `sun_col` (and tint `amb_up`) by the same `bake_transmittance`-LUT evaluation the renderer has: csp-view can't call the shader LUT, but the renderer already owns it — either sample `trans()` CPU-side from the baked `Vec<f32>` in `build_packet` and stuff the tinted sun into `packet.light`, or (simpler) pass `atmo` terms into flight.wgsl and apply `trans()` in `fs_main`. One multiply, zero extra passes.
+
+### [SEVERITY: MEDIUM] Finding 3: Translucent ocean writes depth before the craft draws — splashdown hulls clip at the waterline
+**File**: crates/csp-render/src/terrain.rs:970-976 + 1416-1429, csp-app/src/lib.rs:1313-1321
+**Problem**: The ocean is drawn alpha-blended (`fs_terrain` returns `alpha` 0.62-1.0, terrain.wgsl:659) but with `depth_write_enabled: Some(true)` and it is drawn in the same instanced call *before* the flight vertex stream. The translucent water was designed so "the drawn seabed shows through" — that works for terrain (drawn earlier), but everything drawn *later* is depth-rejected by the water surface.
+**Evidence**: `depth_state` is shared by terrain+ocean (`terrain.rs:970-976`); the app order is `terrain.draw(...)` (sky, terrain, ocean) then `f.draw(...)` (craft) — csp-app/src/lib.rs:1318-1321.
+**Impact**: On splashdown or a partially submerged hull, the part below the waterline simply disappears (depth test fails) instead of showing dimly through the 62%-alpha water. A floating stage shows a hollow, cut-off silhouette. Any wake/foam geometry drawn with the craft has the same problem over water.
+**Suggestion**: Split the ocean into a second draw (it already carries `kind` in `dir0_kind.w` — two `draw_indexed` ranges or a second instance buffer), and have `csp-app` order: terrain → craft → ocean, with the ocean keeping depth *test* but disabling depth *write* (or keeping write; test-only is the standard translucent treatment). If one draw must stay, at minimum disable ocean depth writes so later-drawn craft renders and blends behind water.
+
+### [SEVERITY: MEDIUM] Finding 4: Terrain aerial perspective is a 5-step, un-jittered march — banding on the limb
+**File**: crates/csp-render/src/terrain.wgsl:246-247
+**Problem**: `view_inscatter` (the aerial-perspective haze added to every terrain fragment) marches the eye→fragment segment with `let steps = 5.0;` and a fixed midpoint lattice. The fullscreen sky march right next to it uses 20 steps plus a per-pixel hash jitter specifically "to break the banding a fixed step lattice leaves" (terrain.wgsl:854-858).
+**Evidence**: terrain.wgsl:246-247: `let steps = 5.0; let ds = dist / steps;` — no jitter term (contrast line 867: `t0 + (s + 0.05 + jit * 0.9) * ds`).
+**Impact**: From orbit (or a mountain overlook at 100+ km sight-lines) the step boundaries print as concentric haze bands on distant ridges — exactly the pixels that make a planet look like a wallpaper gradient instead of an atmosphere. Same class of artifact the sky pass already acknowledges and fixed for itself.
+**Suggestion**: Reuse `screen_hash` on the fragment's screen coordinate (or `vnoise3(dir_fix * 1e3)`) as a per-sample offset and raise steps to 8-12 for `dist > ~5e4`; cost is a handful of LUT `textureLoad`s.
+
+### [SEVERITY: MEDIUM] Finding 5: No uncaptured-error or device-lost handling — one validation error kills the process
+**File**: crates/csp-render/src/lib.rs:146-153, 258-261
+**Problem**: `Gpu::new` requests the device and never installs `device.on_uncaptured_error(...)`; `submit()` assumes the device is alive. Surface acquire degradation is handled well (`begin_frame` warn-once, Reconfigure/Skip — good), but the device itself is not: wgpu's default uncaptured-error handler panics, and a lost device makes `queue.submit`/`present` silently no-op or error with nothing to catch.
+**Evidence**: lib.rs:146-153 `request_device(&wgpu::DeviceDescriptor { ... })` — no error-sink configuration anywhere in the crate; PLAN §2.4 line 898 classes a graphics fault as `Cosmetic`: "log once, placeholder, continue".
+**Impact**: Any future shader/pipeline regression (the exact class this crate's own naga gate test exists to catch) turns into a hard crash at runtime instead of a logged frame skip — the "purple frame" incident's failure mode was benign only because it rendered, not crashed. On transient driver resets (laptop GPU switching), the game hangs instead of reinitializing.
+**Suggestion**: In `Gpu::new`: `device.on_uncaptured_error(Box::new(|e| log::error!("wgpu: {e:?}")))`; expose a `DeviceLost` flag (`device.on_lost`/`pop_error_scope` pattern or `device.destroyed()` poll) that `begin_frame` folds into `FrameResult::Reconfigure` so the app can rebuild the context.
+
+### [SEVERITY: LOW] Finding 6: VAB color pass skips the tone map the flight pass applies — same craft, two looks, plus clipping
+**File**: crates/csp-render/src/vab.wgsl:59-83
+**Problem**: `flight.wgsl` tonemaps lit fragments with the ACES fit "so the lit hull shares the surface's highlight rolloff" (flight.wgsl:32-43, 103), but `vab.wgsl`'s `fs_main` — byte-for-byte the same lighting model — returns `vec4(rgb, i.color.a)` raw.
+**Evidence**: vab.wgsl:82: `return vec4<f32>(rgb, i.color.a);` vs flight.wgsl:103: `return vec4<f32>(tone_map(rgb), i.color.a);`
+**Impact**: A part with albedo near 1.0 under the studio key (sun 0.92 + spec) exceeds 1.0 and clips to flat white highlights in the editor, while the identical part in flight rolls off gracefully — the editor preview misrepresents the shipped look. Minor, but it is a copy-paste divergence between two identical shaders.
+**Suggestion**: Apply the same `tone_map` in `vab.wgsl` (the function is 10 lines — better: move both shaders' lighting into a shared include once a second consumer exists, per the project's reuse-before-create rule).
+
+### [SEVERITY: LOW] Finding 7: `TerrainTex::means` is decoded, shipped, and never used — the shader re-derives the mean from the mip chain by an undocumented invariant
+**File**: crates/csp-render/src/terrain.rs:534-536 vs terrain.wgsl:495-497
+**Problem**: The `.csar` format carries per-layer mean RGBA (`means`), `art.rs` decodes it into `TerrainTex`, and nothing ever uploads or reads it. Instead `class_albedo` reconstructs the mean as "texel (0,0) of the deepest mip": `let mean = textureLoad(alb_arr, vec2<i32>(0, 0), layer, last).rgb;`. That is only the true mean because `xtask/src/bin/bake_art.rs:794-808` happens to chain mips all the way to 1×1 with box averaging — a cross-crate contract enforced by nothing.
+**Evidence**: terrain.rs:534-536 `/// Per-layer mean RGBA — ... pub means: Vec<[u8; 4]>,` — zero references outside the decode; terrain.wgsl:495-497 loads mip `textureNumLevels-1` at (0,0).
+**Impact**: If a future pack stops the mip chain at 4×4 (common for tiling textures, to avoid mip-wrap edge artifacts), every class's normalization factor silently becomes a corner texel — global albedo drift per layer, i.e. the exact "washed-out / mud" class of bug the comment above `class_albedo` says was already fought once. Meanwhile `means` bytes are dead payload in every packet.
+**Suggestion**: Either upload `means` as a tiny `RGBA8` 16×1 texture (or fold into the uniform block) and sample it, or delete the field and write the 1×1 invariant into `TerrainTex`'s doc + assert it in `write_art_tex` (`tex.w >> (tex.mips-1) == 1`).
+
+### [SEVERITY: LOW] Finding 8: Surface-format fallback silently picks a non-sRGB target — the whole scene would render double-dark
+**File**: crates/csp-render/src/lib.rs:155-161
+**Problem**: Format selection is `find(|f| f.is_srgb()).unwrap_or(caps.formats[0])`. Every shader in the crate outputs linear and relies on the sRGB surface encode (tone-mapped linear → hardware encode). If `caps.formats` ever lacks an sRGB entry (some remote-desktop/Wayland/x11 surface configurations), the fallback renders to a plain UNORM target: no encode, everything ~2.2× too dark, no error anywhere.
+**Evidence**: lib.rs:156-161: `.find(|f| f.is_srgb())` / `.unwrap_or(caps.formats[0])`.
+**Impact**: Rare but catastrophic-when-it-hits, and invisible in code review of the shaders (they are correct — the target changed under them). Same shape for `alpha_mode: caps.alpha_modes[0]` (an `Inherit`/`PreMultiplied` first element would composite egui wrong).
+**Suggestion**: If no sRGB format exists, either convert outputs in-shader behind a pipeline-level flag (two `ColorTargetState`s, one pipeline per format — the renderers already take `surface_format` as a parameter), or at minimum `log::warn!` and pick `Bgra8UnormSrgb` when supported; log the chosen `alpha_mode` at init.
+
+### [SEVERITY: LOW] Finding 9: Per-frame instance staging allocation in the terrain hot path
+**File**: crates/csp-render/src/terrain.rs:1419-1424
+**Problem**: `TerrainRenderer::draw` builds a fresh `Vec<TerrainInstance>` every frame (`Vec::with_capacity(n_inst)` + two `extend_from_slice`) to concatenate terrain+ocean into one upload, on top of `queue.write_buffer` of the full ~2048×80 B range.
+**Evidence**: terrain.rs:1421-1424: `let mut inst = Vec::with_capacity(n_inst); inst.extend_from_slice(&packet.terrain); inst.extend_from_slice(&packet.ocean);`
+**Impact**: Pure allocator churn (~160 KB/frame at the 2048-patch budget) — not a frame-time problem on its own, but it is the only per-frame heap allocation in the render crate's steady state and trivially avoidable.
+**Suggestion**: Keep a reusable `Vec<TerrainInstance>` field on `TerrainRenderer`, `clear()` + extend each frame; or upload the two slices at offsets 0 and `terrain.len()*80` into the instance buffer with two `write_buffer` calls and skip the concat entirely.
+
+---
+
+**PLAN-claims vs reality (graphics lens)**: R0 row promises "PBR parts" — delivered lighting is Blinn-Phong + baked occlusion + fresnel rim (flight.wgsl:72-104), no metalness/roughness channel anywhere (`mat` is spec-strength/exponent only). R1 row promises "shadow cascades" — delivered is a Gaussian blob shadow (terrain.wgsl:400-413) plus a 5-tap heightfield ray-march for terrain self-shadow (terrain.wgsl:369-394); parts receive no shadows at all. "Precomputed-LUT scattering" (R2) is real and competently built (endpoint-centered LUT with a locked CPU mirror test, f64-baked shell constants, descending-segment transmittance fix — the math checks out). The honest one-line diagnosis: the atmosphere/terrain/LOD machinery is well above placeholder tier, while parts lighting, shadows, and AA are at "programmer art" tier — the owner's "shit graphics" is most plausibly Finding 1 (aliasing) + Finding 2 (unlit-feel craft) + the R1 shadow gap, not the terrain.
+
+**Follow-ups (out of scope, one line each)**: `biome_albedo`'s keyword-matched palette (csp-view/src/terrain.rs:127-150) is placeholder-tier tinting; triplanar UVs at `R/tile ≈ 6.6e4` repeats ride the edge of f32 UV precision (mild distant shimmer on grass); `flight`/`vab` share ~60 lines of duplicated lighting shader; the `dist` used for fade bands is computed from body-frame f32 positions (`pb - pa` at ~6e5 magnitude, ~6 cm quantization — harmless today).
+
+**Verdict (graphics code quality)**: The rendering core is better than "shit" — reverse-Z discipline is now airtight across all five pipelines, the f64 patch-origin precision scheme is genuinely well engineered, and the scattering LUT is correct by construction and by test. But the shipped *image quality* has three unforgivable gaps for a 2026 game: zero anti-aliasing, craft lighting that ignores the atmosphere the rest of the scene simulates, and no part shadows — plus translucent-water depth ordering that breaks splashdown. All three fixes are small, contained, and in this crate's files; none require the Advanced tier. REQUEST CHANGES: fix Findings 1-3 for the milestone, 4-5 shortly after.
