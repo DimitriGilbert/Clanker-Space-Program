@@ -38,8 +38,13 @@ const VAB_NEAR_M: f64 = 0.05;
 /// Orbit/zoom limits (m).
 const MIN_DISTANCE_M: f64 = 0.5;
 const MAX_DISTANCE_M: f64 = 2_000.0;
-/// Pitch clamp, ~89°.
-const PITCH_LIMIT: f64 = 1.55;
+/// Pitch clamp — the FULL pole-to-pole orbit. The eye's offset is
+/// `Rz(yaw)·Rx(pitch)`'s third column, so its height over the focus is
+/// `cos(pitch)·distance`: a sub-π/2 clamp keeps the eye above the
+/// craft's mid-plane forever, which leaves the bottom (−z) cap —
+/// and its `bottom` attach node — invisible and unhittable. `±π`
+/// reaches the straight-up view from directly beneath the stack.
+const PITCH_LIMIT: f64 = std::f64::consts::PI;
 
 /// One winit-side event for the VAB — staged by `csp-app` through
 /// [`crate::View::vab_event`], drained by the `Input` schedule's
@@ -806,13 +811,39 @@ pub(crate) fn extract_vab(
     frame.0 = Some(packet);
 }
 
-/// Emit one kitbash shape's shaded triangles under `transform` —
+/// `DVec3` → f32 triple — the camera-relative world position and
+/// world normal channels of the lit vertex format.
+fn f3(v: DVec3) -> [f32; 3] {
+    [v.x as f32, v.y as f32, v.z as f32]
+}
+
+/// An unlit-stream vertex — selection shells, attach-node markers,
+/// ghost accents: `nrm` ≈ 0 marks the fragment-shader passthrough so
+/// `color` lands unchanged.
+fn unlit_v(pos: [f32; 3], color: [f32; 4], pick: u32) -> VabVertex {
+    VabVertex {
+        pos,
+        world: [0.0; 3],
+        nrm: [0.0; 3],
+        color,
+        mat: [0.0; 3],
+        pick,
+    }
+}
+
+/// Material terms for the kitbash fallback in the editor — a generic
+/// painted-metal pair; the real models carry their own baked terms.
+const VAB_KITBASH_MAT: [f32; 3] = [0.45, 44.0, 1.0];
+
+/// Emit one kitbash shape's triangles under `transform` —
 /// `emit_part`'s core with the shape/color/pick as parameters so the
 /// selection shell, ghosts, and solid parts share the code path.
+/// Models and kitbash silhouettes emit LIT vertices (the fragment
+/// shader lights them per pixel under `packet.light`).
 #[allow(clippy::too_many_arguments)]
 fn emit_triangles(
     verts: &mut Vec<VabVertex>,
-    tris: &mut Vec<crate::part_mesh::MeshTri>,
+    tris: &mut Vec<crate::part_mesh::SmoothTri>,
     cam: &MapCameraF64,
     shape: &crate::part_mesh::PartShape,
     model: Option<&crate::art::PartModel>,
@@ -826,10 +857,6 @@ fn emit_triangles(
         let (lo, hi) = shape.local_aabb();
         let mut mtris = Vec::new();
         crate::part_mesh::emit_model(m, lo, hi, &mut mtris);
-        let light = {
-            let l = VAB_LIGHT;
-            l / l.norm()
-        };
         for t in &mtris {
             let world = [t.a, t.b, t.c].map(|q| transform.apply(q));
             let [Some(c0), Some(c1), Some(c2)] =
@@ -837,20 +864,21 @@ fn emit_triangles(
             else {
                 continue;
             };
-            for ((n, alb), pos) in [t.na, t.nb, t.nc]
-                .into_iter()
-                .zip([t.ca, t.cb, t.cc])
-                .zip([c0, c1, c2])
+            for (k, &(n, alb, mt)) in [(t.na, t.ca, t.ma), (t.nb, t.cb, t.mb), (t.nc, t.cc, t.mc)]
+                .iter()
+                .enumerate()
             {
-                let shade = (0.55 + 0.45 * transform.apply_dir(n).dot(light).max(0.0)) as f32;
                 verts.push(VabVertex {
-                    pos,
+                    pos: [c0, c1, c2][k],
+                    world: f3(world[k] - cam.eye),
+                    nrm: f3(transform.apply_dir(n)),
                     color: [
-                        alb[0] * color[0] * shade,
-                        alb[1] * color[1] * shade,
-                        alb[2] * color[2] * shade,
+                        alb[0] * color[0],
+                        alb[1] * color[1],
+                        alb[2] * color[2],
                         color[3],
                     ],
+                    mat: mt,
                     pick,
                 });
             }
@@ -858,11 +886,7 @@ fn emit_triangles(
         return;
     }
     tris.clear();
-    crate::part_mesh::emit(shape, tris);
-    let light = {
-        let l = VAB_LIGHT;
-        l / l.norm()
-    };
+    crate::part_mesh::emit_smooth(shape, tris);
     for t in tris.iter() {
         let world = [t.a, t.b, t.c].map(|q| transform.apply(q));
         let [Some(c0), Some(c1), Some(c2)] =
@@ -870,17 +894,13 @@ fn emit_triangles(
         else {
             continue;
         };
-        let shade = (0.55 + 0.45 * transform.apply_dir(t.n).dot(light).max(0.0)) as f32;
-        let c = [
-            color[0] * shade,
-            color[1] * shade,
-            color[2] * shade,
-            color[3],
-        ];
-        for pos in [c0, c1, c2] {
+        for (k, &n) in [t.na, t.nb, t.nc].iter().enumerate() {
             verts.push(VabVertex {
-                pos,
-                color: c,
+                pos: [c0, c1, c2][k],
+                world: f3(world[k] - cam.eye),
+                nrm: f3(transform.apply_dir(n)),
+                color,
+                mat: VAB_KITBASH_MAT,
                 pick,
             });
         }
@@ -917,11 +937,7 @@ fn emit_octa(verts: &mut Vec<VabVertex>, cam: &MapCameraF64, pos: DVec3, m: f64,
             continue;
         };
         for c in [c0, c1, c2] {
-            verts.push(VabVertex {
-                pos: c,
-                color,
-                pick: 0,
-            });
+            verts.push(unlit_v(c, color, 0));
         }
     }
 }
@@ -943,34 +959,25 @@ fn ghost_model(
         .cloned()
 }
 
-/// The VAB's fixed key light — a body-frame direction like the flight
-/// view's fallback sun. Per-face lambert is what makes a lathed
-/// silhouette legible under flat category colors; the pick pass never
-/// reads color, so shading cannot affect picking.
-const VAB_LIGHT: DVec3 = DVec3::new(0.4, 0.3, 0.86);
-
-/// Push one part's kitbash triangles into `verts`. A triangle with
-/// ANY corner failing projection (behind the eye plane) is dropped
-/// whole rather than clipped or clamped — the box pass's per-face
-/// rule carried over per-triangle; at these scales the near plane
-/// never sits inside the craft in practice.
+/// Push one part's triangles into `verts`. A triangle with ANY corner
+/// failing projection (behind the eye plane) is dropped whole rather
+/// than clipped or clamped — the box pass's per-face rule carried
+/// over per-triangle; at these scales the near plane never sits inside
+/// the craft in practice. All part streams emit LIT vertices — the
+/// fragment shader shades per pixel under `packet.light`.
 fn emit_part(
     verts: &mut Vec<VabVertex>,
-    tris: &mut Vec<crate::part_mesh::MeshTri>,
+    tris: &mut Vec<crate::part_mesh::SmoothTri>,
     cam: &MapCameraF64,
     p: &PartMesh,
     pick: u32,
 ) {
     if let Some(m) = &p.model {
-        // Real baked model (Kenney Space Kit): per-vertex normals +
-        // authored albedo under the VAB key light.
+        // Real baked model (Kenney Space Kit): smoothing-wedge normals
+        // + authored albedo + baked material terms.
         let (lo, hi) = p.shape.local_aabb();
         let mut mtris = Vec::new();
         crate::part_mesh::emit_model(m, lo, hi, &mut mtris);
-        let light = {
-            let l = VAB_LIGHT;
-            l / l.norm()
-        };
         for t in &mtris {
             let world = [t.a, t.b, t.c].map(|q| p.transform.apply(q));
             let [Some(c0), Some(c1), Some(c2)] =
@@ -978,15 +985,16 @@ fn emit_part(
             else {
                 continue;
             };
-            for ((q, n, alb), pos) in [(t.a, t.na, t.ca), (t.b, t.nb, t.cb), (t.c, t.nc, t.cc)]
-                .into_iter()
-                .zip([c0, c1, c2])
+            for (k, &(n, alb, mt)) in [(t.na, t.ca, t.ma), (t.nb, t.cb, t.mb), (t.nc, t.cc, t.mc)]
+                .iter()
+                .enumerate()
             {
-                let _ = q;
-                let shade = (0.55 + 0.45 * p.transform.apply_dir(n).dot(light).max(0.0)) as f32;
                 verts.push(VabVertex {
-                    pos,
-                    color: [alb[0] * shade, alb[1] * shade, alb[2] * shade, alb[3]],
+                    pos: [c0, c1, c2][k],
+                    world: f3(world[k] - cam.eye),
+                    nrm: f3(p.transform.apply_dir(n)),
+                    color: alb,
+                    mat: mt,
                     pick,
                 });
             }
@@ -994,11 +1002,7 @@ fn emit_part(
         return;
     }
     tris.clear();
-    crate::part_mesh::emit(&p.shape, tris);
-    let light = {
-        let l = VAB_LIGHT;
-        l / l.norm()
-    };
+    crate::part_mesh::emit_smooth(&p.shape, tris);
     for t in tris.iter() {
         let world = [t.a, t.b, t.c].map(|q| p.transform.apply(q));
         let [Some(c0), Some(c1), Some(c2)] =
@@ -1006,15 +1010,110 @@ fn emit_part(
         else {
             continue; // tri crosses the eye plane — drop it whole
         };
-        let shade = (0.55 + 0.45 * p.transform.apply_dir(t.n).dot(light).max(0.0)) as f32;
-        let color = [
-            p.color[0] * shade,
-            p.color[1] * shade,
-            p.color[2] * shade,
-            p.color[3],
-        ];
-        for pos in [c0, c1, c2] {
-            verts.push(VabVertex { pos, color, pick });
+        for (k, &n) in [t.na, t.nb, t.nc].iter().enumerate() {
+            verts.push(VabVertex {
+                pos: [c0, c1, c2][k],
+                world: f3(world[k] - cam.eye),
+                nrm: f3(p.transform.apply_dir(n)),
+                color: p.color,
+                mat: VAB_KITBASH_MAT,
+                pick,
+            });
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// The orbit clamp must let the eye below the craft's mid-plane.
+    /// `cos(pitch)·distance` is the eye's height over the focus, so a
+    /// sub-π/2 clamp keeps the bottom cap — and its `bottom` attach
+    /// node — forever unviewable and unhittable ("can't place shit
+    /// below"). Pole-to-pole (`±π`) reaches the view from directly
+    /// beneath the stack.
+    #[test]
+    fn orbit_reaches_below_the_craft() {
+        let mut input = VabInput::default();
+        for _ in 0..200 {
+            input.apply(&VabEvent::Orbit {
+                dyaw: 0.0,
+                dpitch: 1.0,
+            });
+        }
+        assert_eq!(input.pitch_rad, PITCH_LIMIT);
+        // At the pole the eye sits directly under the focus: the
+        // camera looks straight up at the bottom cap.
+        let cam = solve_orbit_camera(
+            0.0,
+            input.pitch_rad,
+            10.0,
+            input.viewport_px,
+            DVec3::ZERO,
+            VAB_FOV_Y,
+            VAB_NEAR_M,
+        );
+        assert!(cam.valid);
+        assert!(
+            cam.eye.z < -9.0,
+            "eye never left the upper half: eye.z = {}",
+            cam.eye.z
+        );
+    }
+
+    /// From beneath, the center-screen hover ray enters the part's
+    /// −z AABB face and reports `BottomCap` — the region
+    /// `VabSession::plan_axial` reads to pick the parent's
+    /// down-facing authored node.
+    #[test]
+    fn hover_from_below_hits_the_bottom_cap() {
+        let mut input = VabInput {
+            yaw_rad: 0.0,
+            pitch_rad: std::f64::consts::PI, // directly below, looking up
+            distance_m: 10.0,
+            ..VabInput::default()
+        };
+        let cam = solve_orbit_camera(
+            input.yaw_rad,
+            input.pitch_rad,
+            input.distance_m,
+            input.viewport_px,
+            DVec3::ZERO,
+            VAB_FOV_Y,
+            VAB_NEAR_M,
+        );
+        let parts = vec![PartMesh {
+            node: csp_phys::PartNodeId(1),
+            transform: PartTransform::IDENTITY,
+            shape: crate::part_mesh::PartShape::Box {
+                lo: DVec3::new(-0.5, -0.5, -0.5),
+                hi: DVec3::new(0.5, 0.5, 0.5),
+            },
+            color: [1.0; 4],
+            selected: false,
+            model: None,
+        }];
+        let (w, h) = input.viewport_px;
+        let hit = hover_pick(&input, &cam, &parts, w * 0.5, h * 0.5)
+            .expect("center pixel must hit the box from below");
+        assert_eq!(hit.node, csp_phys::PartNodeId(1));
+        assert_eq!(hit.region, csp_ui::vab::AttachRegion::BottomCap);
+        assert!(hit.local.z < 0.0);
+        // And the top cap still classifies from above.
+        input.pitch_rad = 0.0;
+        let cam = solve_orbit_camera(
+            input.yaw_rad,
+            input.pitch_rad,
+            input.distance_m,
+            input.viewport_px,
+            DVec3::ZERO,
+            VAB_FOV_Y,
+            VAB_NEAR_M,
+        );
+        let hit = hover_pick(&input, &cam, &parts, w * 0.5, h * 0.5)
+            .expect("center pixel must hit the box from above");
+        assert_eq!(hit.region, csp_ui::vab::AttachRegion::TopCap);
     }
 }

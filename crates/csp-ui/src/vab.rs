@@ -3901,4 +3901,32 @@ mod tests {
         let placed = vab.selected().unwrap();
         assert!(vab.session().node(placed).unwrap().transform().offset.z > 0.0);
     }
+
+    /// The bottom-cap mirror of [`cap_hover_stacks_on_the_hit_side`]:
+    /// once the camera can orbit under the craft, a −z cap hover must
+    /// plan the parent's *bottom* node and land the part beneath it —
+    /// the "can't place shit below" path end to end.
+    #[test]
+    fn bottom_cap_hover_plans_the_bottom_node() {
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        vab.apply(VabAction::SetRoot(PartId::from("t.tank")))
+            .unwrap();
+        let root = vab.session().root().unwrap();
+        vab.recompute();
+        vab.set_hover(Some(HoverHit {
+            node: root,
+            local: DVec3::new(0.0, 0.0, -0.5),
+            region: AttachRegion::BottomCap,
+        }));
+        let plan = vab.plan_attach(&PartId::from("t.tank"), root);
+        assert_eq!(plan.edges.len(), 1, "plan error: {:?}", plan.error);
+        // A bottom-cap hit stacks on the parent's bottom node.
+        assert_eq!(plan.edges[0].parent_node, "bottom");
+        vab.apply(VabAction::PlaceAtHover {
+            part: PartId::from("t.tank"),
+        })
+        .unwrap();
+        let placed = vab.selected().unwrap();
+        assert!(vab.session().node(placed).unwrap().transform().offset.z < 0.0);
+    }
 }

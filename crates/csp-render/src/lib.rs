@@ -21,6 +21,42 @@ pub mod terrain;
 /// part under the cursor.
 pub mod vab;
 
+/// Per-frame part lighting for the flight and VAB vertex passes —
+/// one directional "sun" plus a two-stop hemisphere ambient (sky
+/// bounce toward `hemi.xyz`, ground bounce away). All terms are in the
+/// camera-relative frame the vertex streams already carry; the eye
+/// sits at the origin by construction (§2.3), so the fragment shader
+/// needs no eye position. `mat` on each vertex supplies specular
+/// strength/exponent and baked occlusion.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct PartLight {
+    /// Unit direction TO the light (xyz; w unused).
+    pub sun_dir: [f32; 4],
+    /// Sun's linear RGB intensity (w unused).
+    pub sun_col: [f32; 4],
+    /// Hemisphere ambient, up-side (linear RGB; w unused).
+    pub amb_up: [f32; 4],
+    /// Hemisphere ambient, down-side (linear RGB; w unused).
+    pub amb_dn: [f32; 4],
+    /// Hemisphere "up" axis (xyz; w = rim-light strength multiplier).
+    pub hemi: [f32; 4],
+}
+
+impl Default for PartLight {
+    /// Neutral studio light — what the VAB editor uses: a warm key
+    /// from the upper front, a cool sky fill, a dim ground bounce.
+    fn default() -> Self {
+        Self {
+            sun_dir: [0.4021, 0.3016, 0.8645, 0.0], // normalized (0.4,0.3,0.86)
+            sun_col: [0.92, 0.89, 0.84, 0.0],
+            amb_up: [0.20, 0.24, 0.31, 0.0],
+            amb_dn: [0.075, 0.070, 0.065, 0.0],
+            hemi: [0.0, 0.0, 1.0, 0.1],
+        }
+    }
+}
+
 /// A grow-only GPU vertex buffer + the count it currently holds — shared
 /// by the simple pass renderers (map, VAB). Recreated with headroom when
 /// the frame's mesh outgrows it so steady-state frames never reallocate.

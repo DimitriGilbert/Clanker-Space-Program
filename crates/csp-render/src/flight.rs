@@ -13,22 +13,41 @@
 use crate::GpuBuffer;
 
 /// One vertex of the flight scene — clip-space NDC (z: 1 = near,
-/// 0 = far) + flat RGBA. Identical layout to `VabVertex` minus the
-/// pick channel (flight has no picking at M4c).
+/// 0 = far) plus the per-pixel-lighting channels: camera-relative
+/// world position (the eye sits at the origin), world normal, linear
+/// albedo, and the material terms `[spec strength, spec exponent,
+/// occlusion]`. A ~zero `nrm` marks the unlit stream (sky, plumes,
+/// dust) — the fragment shader passes `color` straight through.
+/// Identical layout to `VabVertex` minus the pick channel (flight has
+/// no picking at M4c).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct FlightVertex {
     /// Clip-space position (z is the depth value).
     pub pos: [f32; 3],
-    /// Linear RGBA.
+    /// Camera-relative world position (f32 — §2.3 already renders
+    /// relative to the eye).
+    pub world: [f32; 3],
+    /// World-space unit normal; ~0 → unlit passthrough.
+    pub nrm: [f32; 3],
+    /// Linear RGBA albedo (unlit color when `nrm` ≈ 0).
     pub color: [f32; 4],
+    /// `[specular strength, specular exponent, occlusion]` — baked
+    /// per-material terms the fragment lighting reads.
+    pub mat: [f32; 3],
 }
 
 impl FlightVertex {
     const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<FlightVertex>() as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Vertex,
-        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4],
+        attributes: &wgpu::vertex_attr_array![
+            0 => Float32x3,
+            1 => Float32x3,
+            2 => Float32x3,
+            3 => Float32x4,
+            4 => Float32x3
+        ],
     };
 }
 
@@ -39,6 +58,9 @@ pub struct FlightPacket {
     /// Triangle-list scene: fallback sky gradient, craft part meshes,
     /// plumes.
     pub vertices: Vec<FlightVertex>,
+    /// The frame's part lighting — the staged sun + the hemisphere
+    /// ambient the extract solved for the focus vessel's local sky.
+    pub light: crate::PartLight,
     /// The R2 surface pass (§5.2): quadtree terrain + ocean instances
     /// and the LUT-scattered sky, drawn by
     /// [`crate::terrain::TerrainRenderer`] *before* the vertex stream
@@ -48,10 +70,15 @@ pub struct FlightPacket {
     pub terrain: Option<crate::terrain::TerrainPacket>,
 }
 
-/// GPU owner for the flight pass — one pipeline + one depth target.
+/// GPU owner for the flight pass — one pipeline + one depth target +
+/// the lighting uniform the lit vertex stream shades against.
 pub struct FlightRenderer {
     pipeline: wgpu::RenderPipeline,
     verts: GpuBuffer,
+    /// `PartLight` uniform — rewritten per draw from the packet.
+    light_buf: wgpu::Buffer,
+    /// group(0) — the `light` uniform binding.
+    light_bind: wgpu::BindGroup,
     depth: wgpu::Texture,
     depth_view: wgpu::TextureView,
     size: (u32, u32),
@@ -124,6 +151,20 @@ impl FlightRenderer {
             view_formats: &[],
         });
         let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+        let light_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("flight-light"),
+            size: std::mem::size_of::<crate::PartLight>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let light_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("flight-light"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: light_buf.as_entire_binding(),
+            }],
+        });
         Self {
             pipeline,
             verts: GpuBuffer::new(
@@ -131,6 +172,8 @@ impl FlightRenderer {
                 "flight-verts",
                 (std::mem::size_of::<FlightVertex>() * 16384) as u64,
             ),
+            light_buf,
+            light_bind,
             depth,
             depth_view,
             size,
@@ -181,7 +224,9 @@ impl FlightRenderer {
         if n == 0 {
             return;
         }
+        queue.write_buffer(&self.light_buf, 0, bytemuck::bytes_of(&packet.light));
         pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.light_bind, &[]);
         pass.set_vertex_buffer(0, self.verts.buffer.slice(..));
         pass.draw(0..n, 0..1);
     }

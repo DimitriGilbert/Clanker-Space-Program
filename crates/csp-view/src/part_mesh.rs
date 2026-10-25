@@ -36,10 +36,11 @@ pub const LATHE_SEGMENTS: usize = 24;
 const APEX_RADIUS_M: f64 = 1e-9;
 
 /// One triangle of a part's kitbash mesh — part-local positions plus
-/// the unit outward face normal. The vertex streams carry no normal
-/// channel (flat colors only), so the normal rides the triangle: the
-/// flight pass lamberts per face against the staged sun, the VAB
-/// against its fixed key light.
+/// the unit outward face normal. The flight/VAB vertex streams carry
+/// per-vertex normals + material terms lit per pixel in the fragment
+/// shader ([`emit_smooth`] supplies the per-vertex normals); this
+/// face-normal stream remains for silhouette/VFX paths that only need
+/// the flat facet normal.
 #[derive(Clone, Copy, Debug)]
 pub struct MeshTri {
     /// Corner a, part-local.
@@ -495,6 +496,13 @@ pub struct ModelTri {
     pub cb: [f32; 4],
     /// Albedo at `c`.
     pub cc: [f32; 4],
+    /// Baked material terms at `a` — `[spec strength, spec exponent,
+    /// occlusion]` (see [`crate::art::ModelVert::mat`]).
+    pub ma: [f32; 3],
+    /// Material terms at `b`.
+    pub mb: [f32; 3],
+    /// Material terms at `c`.
+    pub mc: [f32; 3],
 }
 
 /// Emit `model`'s triangles fitted into the part-local box `[lo, hi]`
@@ -561,6 +569,9 @@ pub fn emit_model(model: &crate::art::PartModel, lo: DVec3, hi: DVec3, out: &mut
             ca: a.col,
             cb: b.col,
             cc: c.col,
+            ma: a.mat,
+            mb: b.mat,
+            mc: c.mat,
         });
     }
 }

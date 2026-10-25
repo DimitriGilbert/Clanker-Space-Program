@@ -95,16 +95,26 @@ const ZOOM_LN_PER_PX: f64 = 0.003;
 /// moving while held).
 const PAN_STEP_PX: f64 = 80.0;
 /// Throttle fraction applied instantly on a `ThrottleUp`/`ThrottleDown`
-/// press — the tap: a short press still moves the needle one fine step
+/// press — the tap: a quick press nudges the needle one fine step
 /// (and, on a latched pad craft, that first `SetThrottle` is the
 /// unlatching command). Holding continues into [`THROTTLE_RAMP_PER_S`].
-const THROTTLE_TAP_STEP: f64 = 0.05;
-/// Throttle fraction per second while a `ThrottleUp`/`ThrottleDown` key
-/// is held — [`Self::tick_throttle_ramp`] integrates the frame's wall
-/// dt into one `SetThrottle` per frame on the player FIFO (full travel
-/// is ~4 s). Releasing the key just stops enqueuing — the last
+const THROTTLE_TAP_STEP: f64 = 0.01;
+/// Peak throttle fraction per second while a `ThrottleUp`/`ThrottleDown`
+/// key is held — [`Self::tick_throttle_ramp`] integrates the frame's
+/// wall dt into one `SetThrottle` per frame on the player FIFO. The
+/// rate does not snap on: it eases in over [`THROTTLE_RAMP_SPINUP_S`],
+/// so a hold that lingers a frame or two still reads as fine trim and
+/// a sustained hold climbs smoothly to full rate (full travel ≈ 4.7 s
+/// from zero). Releasing the key just stops enqueuing — the last
 /// commanded value persists in the sim.
 const THROTTLE_RAMP_PER_S: f64 = 0.25;
+/// Seconds of actively-ramping hold time over which the ramp rate
+/// eases from zero to [`THROTTLE_RAMP_PER_S`], quadratically
+/// (`rate = max · (t/spinup)²`): the first half-second of a hold moves
+/// ~1% on its own — less than the tap — and the axis reaches full rate
+/// by one second. This is what keeps a "tap that lingered" from
+/// reading as a jump while leaving a real hold fully responsive.
+const THROTTLE_RAMP_SPINUP_S: f64 = 1.0;
 /// Commanded body-frame angular rate per held attitude key, rad/s —
 /// the `SetAttitude` control stand-in's "stick deflection" (≈46°/s).
 const ATTITUDE_RATE_RAD_S: f64 = 0.8;
@@ -223,6 +233,13 @@ struct App {
     /// starts from released; the Z/X snaps write it too, so a snap
     /// mid-hold rebases the ramp instead of fighting it.
     throttle_axis: f64,
+    /// Wall seconds the current hold has spent *actively ramping* —
+    /// the ease-in clock for [`THROTTLE_RAMP_SPINUP_S`]. Reset when
+    /// the held set empties (the next press starts a fresh ramp), and
+    /// advanced only on frames that actually command: a hold spent
+    /// blocked (rails, no vessel) or cancelled (Up+Down both held)
+    /// still eases in from zero the frame it starts moving the axis.
+    throttle_hold_s: f64,
     view: View,
     /// §2.6.3's controller — owns the warp ladder and the integer tick
     /// target; all wall-side, emitting only logged commands.
@@ -435,6 +452,7 @@ impl App {
             attitude_deferred: false,
             throttle_held: std::collections::BTreeSet::new(),
             throttle_axis: 0.0,
+            throttle_hold_s: 0.0,
             view,
             warp: WarpController::new(),
             last_frame: Instant::now(),
@@ -1719,6 +1737,10 @@ impl App {
             return; // already held — an OS repeat
         }
         if self.throttle_held.len() == 1 {
+            // A fresh hold restarts the ease-in clock — the ramp
+            // always spools up from zero rate, never resumes the
+            // speed a previous hold had spun to.
+            self.throttle_hold_s = 0.0;
             // A ramp starting from released re-reads the applied
             // throttle — but only a bubble-resident body HAS an
             // applied value to read (P02-F2). A latched or rails
@@ -1748,18 +1770,26 @@ impl App {
 
     /// Release edge of a throttle axis key — just leaves the held set.
     /// Nothing is re-issued: throttle is persistent sim state, so the
-    /// last commanded value is the hold ("released = hold").
+    /// last commanded value is the hold ("released = hold"). An emptied
+    /// set also zeroes the ease-in clock so the NEXT press's ramp
+    /// spools up from zero rate again.
     fn throttle_release(&mut self, action: KeyAction) {
         self.throttle_held.remove(&action);
+        if self.throttle_held.is_empty() {
+            self.throttle_hold_s = 0.0;
+        }
     }
 
     /// The held-key throttle axis, driven once per frame from
     /// [`Self::run_frame`]: while `throttle_held` is non-empty the
     /// commanded value rides `±THROTTLE_RAMP_PER_S` of wall dt — a real
-    /// axis, not a repeat-stepped switch. Up+Down cancel (hold
-    /// position). Nothing is enqueued when the axis is already clamped
-    /// at the rail, so a held key cannot spam the §7.6 log with no-op
-    /// commands.
+    /// axis, not a repeat-stepped switch — with the rate eased in
+    /// quadratically over [`THROTTLE_RAMP_SPINUP_S`] of commanding hold
+    /// (`throttle_hold_s`), so a brief hold is a fine trim and only a
+    /// sustained one reaches full slew. Up+Down cancel (hold position,
+    /// and the clock pauses with it). Nothing is enqueued when the
+    /// axis is already clamped at the rail, so a held key cannot spam
+    /// the §7.6 log with no-op commands.
     fn tick_throttle_ramp(&mut self, dt_wall: f64) {
         if self.throttle_held.is_empty() {
             return;
@@ -1768,6 +1798,7 @@ impl App {
             // A halt mid-hold or a switch into the VAB ends the ramp —
             // the VAB suppresses throttle verbs (it's a flight axis).
             self.throttle_held.clear();
+            self.throttle_hold_s = 0.0;
             return;
         }
         let dir = i8::from(self.throttle_held.contains(&KeyAction::ThrottleUp))
@@ -1778,11 +1809,15 @@ impl App {
         // A blocked focus (rails, no vessel — `throttle_blocker`'s
         // whole list) has no throttle surface: keep the axis held but
         // don't feed the drain a reject every frame — the press's
-        // notice already said why once.
+        // notice already said why once. The ease-in clock pauses too:
+        // a key held through a transition spools up when the focus
+        // becomes commandable instead of resuming at full slew.
         if self.throttle_blocker().is_some() {
             return;
         }
-        self.throttle_axis_step(f64::from(dir) * THROTTLE_RAMP_PER_S * dt_wall);
+        let ease = (self.throttle_hold_s / THROTTLE_RAMP_SPINUP_S).min(1.0);
+        self.throttle_hold_s += dt_wall;
+        self.throttle_axis_step(f64::from(dir) * THROTTLE_RAMP_PER_S * ease * ease * dt_wall);
     }
 
     /// Move the throttle axis by `delta` — shared by the press tap and
@@ -1835,6 +1870,9 @@ impl App {
             .retain(|_, a| old.bindings.get(a) == new.bindings.get(a));
         self.throttle_held
             .retain(|a| old.bindings.get(a) == new.bindings.get(a));
+        if self.throttle_held.is_empty() {
+            self.throttle_hold_s = 0.0;
+        }
         if self.attitude_held.len() != attitude_before {
             if self.attitude_held.is_empty() {
                 self.attitude_deferred = false;
@@ -1850,6 +1888,7 @@ impl App {
     fn focus_lost(&mut self) {
         self.captured_key = None;
         self.throttle_held.clear();
+        self.throttle_hold_s = 0.0;
         self.attitude_deferred = false;
         if !self.attitude_held.is_empty() {
             self.attitude_held.clear();
@@ -2895,11 +2934,12 @@ mod tests {
     }
 
     /// The held-key throttle axis: the press lands the tap step, the
-    /// per-frame tick then ramps the commanded value by
-    /// `THROTTLE_RAMP_PER_S` of wall dt while the key is held, and
-    /// releasing just stops enqueuing — the sim holds the last value.
-    /// Asserted on the §7.6 command log (the values the axis actually
-    /// commanded), which is also what a replay sees.
+    /// per-frame tick then ramps the commanded value — eased in
+    /// quadratically over `THROTTLE_RAMP_SPINUP_S` up to
+    /// `THROTTLE_RAMP_PER_S` of wall dt — and releasing just stops
+    /// enqueuing: the sim holds the last value. Asserted on the §7.6
+    /// command log (the values the axis actually commanded), which is
+    /// also what a replay sees.
     #[test]
     fn held_throttle_ramps_then_holds_on_release() {
         let dir = tempdir("throttle-ramp");
@@ -2934,32 +2974,80 @@ mod tests {
             app.view.sim_step(target).unwrap();
             app.view.end_frame();
         }
+        // Expected ramp step on commanding-hold frame `k` at
+        // dt = 1/60: rate = RAMP·(t/spinup)² until the ease-in tops
+        // out, then the flat full slew. k=0 is the zero-rate frame —
+        // it commands nothing at all.
+        let ramp_step = |k: usize| -> f64 {
+            let ease = (k as f64 / 60.0 / THROTTLE_RAMP_SPINUP_S).min(1.0);
+            THROTTLE_RAMP_PER_S * ease * ease / 60.0
+        };
+        let full_step = THROTTLE_RAMP_PER_S / 60.0;
+
+        // QUICK TAP: a press released ~80 ms later moves ~one tap
+        // step — the still-spooling ramp contributes orders of
+        // magnitude less (the user-visible fine-tune contract).
         app.dispatch(KeyAction::ThrottleUp);
         assert!(app.throttle_held.contains(&KeyAction::ThrottleUp));
-        // 60 held frames at dt = 1/60 → 0.25 of axis travel on top of
-        // the tap step.
-        for _ in 0..60 {
+        for _ in 0..5 {
             frame(&mut app, 30);
         }
-        let vals = logged(&app);
-        // The tap leads, then one ramp command per held frame.
-        assert_eq!(vals.len(), 61, "tap + 60 ramp frames");
-        assert!((vals[0] - THROTTLE_TAP_STEP).abs() < 1e-9, "tap step first");
-        let ramp_step = THROTTLE_RAMP_PER_S / 60.0;
-        for (i, w) in vals.windows(2).enumerate() {
+        app.throttle_release(KeyAction::ThrottleUp);
+        frame(&mut app, 30);
+        let tap_vals = logged(&app);
+        assert_eq!(tap_vals.len(), 5, "tap + 4 nonzero spin-up frames");
+        assert!(
+            (tap_vals[0] - THROTTLE_TAP_STEP).abs() < 1e-9,
+            "tap step first"
+        );
+        for (i, w) in tap_vals.windows(2).enumerate() {
             assert!(
-                (w[1] - w[0] - ramp_step).abs() < 1e-9,
-                "frame {i}: ramp moved {} → {} (expected +{ramp_step})",
+                (w[1] - w[0] - ramp_step(i + 1)).abs() < 1e-9,
+                "tap frame {i}: ramp moved {} → {}",
                 w[0],
                 w[1]
             );
         }
-        assert!((vals[60] - (THROTTLE_TAP_STEP + THROTTLE_RAMP_PER_S)).abs() < 1e-6);
+        assert!(
+            tap_vals[4] - tap_vals[0] < 1e-4,
+            "an ~80 ms press should stay a fine nudge: {}",
+            tap_vals[4]
+        );
+
+        // SUSTAINED HOLD: the tap re-reads the applied axis, then the
+        // first second spools up and every frame after is the full
+        // ±THROTTLE_RAMP_PER_S slew — smooth, never a jump.
+        let base = tap_vals.len();
+        app.dispatch(KeyAction::ThrottleUp);
+        for _ in 0..150 {
+            frame(&mut app, 30);
+        }
+        let vals = logged(&app);
+        // Second tap + ramp frames k=1..=149 (k=0 commands nothing).
+        assert_eq!(vals.len(), base + 1 + 149);
+        assert!(
+            (vals[base] - (tap_vals[4] + THROTTLE_TAP_STEP)).abs() < 1e-9,
+            "second press taps from the applied axis"
+        );
+        for i in (base + 1)..vals.len() {
+            let k = i - base; // ramp frame index, 1..=149
+            let delta = vals[i] - vals[i - 1];
+            assert!(
+                (delta - ramp_step(k)).abs() < 1e-9,
+                "hold frame {k}: expected +{}, got {delta}",
+                ramp_step(k)
+            );
+        }
+        // Ease-in sanity: a mid-spool frame moves well under full
+        // slew; past the spin-up every frame is exactly the rate cap.
+        assert!(vals[base + 30] - vals[base + 29] < full_step);
+        assert!((vals[base + 120] - vals[base + 119] - full_step).abs() < 1e-9);
+
         // Release: the axis stops — no further commands, and the sim
         // keeps the last commanded value.
         app.throttle_release(KeyAction::ThrottleUp);
         frame(&mut app, 60);
-        assert_eq!(logged(&app).len(), 61);
+        assert_eq!(logged(&app).len(), vals.len());
         // The snap key still jumps straight to full and rebases the
         // axis (a fresh hold would start from 1.0, not the old ramp).
         app.dispatch(KeyAction::ThrottleFull);
@@ -3218,7 +3306,7 @@ mod tests {
         app.throttle_axis = 0.4;
         app.dispatch(KeyAction::ThrottleUp);
         assert!(
-            (app.throttle_axis - 0.45).abs() < 1e-9,
+            (app.throttle_axis - 0.41).abs() < 1e-9,
             "axis squashed to the tap base: {}",
             app.throttle_axis
         );

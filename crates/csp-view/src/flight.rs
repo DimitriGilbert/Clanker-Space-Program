@@ -2052,6 +2052,25 @@ fn delta_v_walk_from(
     (current, staged)
 }
 
+/// `DVec3` → f32 triple — the camera-relative world position and
+/// world normal channels of the lit vertex format.
+fn f3(v: DVec3) -> [f32; 3] {
+    [v.x as f32, v.y as f32, v.z as f32]
+}
+
+/// An unlit-stream vertex — sky quads, plumes, the plasma sheath, the
+/// contact-dust ring: `nrm` ≈ 0 marks the fragment-shader passthrough
+/// so `color` lands unchanged.
+fn unlit_v(pos: [f32; 3], color: [f32; 4]) -> csp_render::flight::FlightVertex {
+    csp_render::flight::FlightVertex {
+        pos,
+        world: [0.0; 3],
+        nrm: [0.0; 3],
+        color,
+        mat: [0.0; 3],
+    }
+}
+
 /// All-or-nothing emission of one world-space triangle into the
 /// clip-space stream: every corner is projected first and the tri is
 /// pushed whole or dropped whole — the same rule the part pass and
@@ -2071,7 +2090,7 @@ fn emit_tri(
         return;
     };
     for pos in [c0, c1, c2] {
-        v.push(csp_render::flight::FlightVertex { pos, color });
+        v.push(unlit_v(pos, color));
     }
 }
 
@@ -2090,7 +2109,7 @@ fn emit_tri3(
         return;
     };
     for (pos, color) in [(c0, colors[0]), (c1, colors[1]), (c2, colors[2])] {
-        v.push(csp_render::flight::FlightVertex { pos, color });
+        v.push(unlit_v(pos, color));
     }
 }
 
@@ -2228,9 +2247,28 @@ fn emit_sheath(
     }
 }
 
+/// Per-kind material terms for the kitbash fallback — `[spec strength,
+/// spec exponent, occlusion]`: engines and structural parts shade as
+/// bare/machined metal, tanks and pods as painted hull, batteries and
+/// ports as duller hardware. (The real models carry their own baked
+/// per-material terms — this table is the procedural tier's stand-in.)
+fn kind_mat(kind: PartKind) -> [f32; 3] {
+    match kind {
+        PartKind::Engine => [0.62, 56.0, 1.0],
+        PartKind::Crew => [0.55, 64.0, 1.0],
+        PartKind::Tank => [0.38, 40.0, 1.0],
+        PartKind::Battery => [0.45, 36.0, 1.0],
+        PartKind::Science => [0.50, 44.0, 1.0],
+        PartKind::Port => [0.42, 36.0, 1.0],
+        PartKind::Structural => [0.52, 48.0, 1.0],
+    }
+}
+
 /// Emit one part's real baked model (Kenney Space Kit) — fitted to the
-/// collider AABB, per-vertex authored albedo under the flight sun's
-/// lambert + specular sheen; debris chars the albedo.
+/// collider AABB. The vertex stream carries the authored albedo, the
+/// smoothing-wedge normal, and the baked material terms; per-pixel
+/// lighting happens in the fragment shader under `packet.light`.
+/// Debris chars the albedo and kills the specular sheen.
 #[allow(clippy::too_many_arguments)]
 fn emit_model_part(
     v: &mut Vec<csp_render::flight::FlightVertex>,
@@ -2239,49 +2277,33 @@ fn emit_model_part(
     m: &crate::art::PartModel,
     vp: &[[f64; 4]; 4],
     eye: DVec3,
-    sun: DVec3,
 ) {
     let (mlo, mhi) = p.shape.local_aabb();
     let mut mtris = Vec::new();
     crate::part_mesh::emit_model(m, mlo, mhi, &mut mtris);
     for t in &mtris {
-        let [Some(c0), Some(c1), Some(c2)] = [t.a, t.b, t.c]
-            .map(|q| project_into(vp, eye, b.pos + b.rot.rotate(p.transform.apply(q))))
-        else {
+        let world = [t.a, t.b, t.c].map(|q| b.pos + b.rot.rotate(p.transform.apply(q)));
+        let [Some(c0), Some(c1), Some(c2)] = world.map(|q| project_into(vp, eye, q)) else {
             continue;
         };
-        for ((local, nrm, alb), pos) in [(t.a, t.na, t.ca), (t.b, t.nb, t.cb), (t.c, t.nc, t.cc)]
-            .into_iter()
-            .zip([c0, c1, c2])
-        {
+        for k in 0..3 {
+            let (nrm, alb, mt) = [(t.na, t.ca, t.ma), (t.nb, t.cb, t.mb), (t.nc, t.cc, t.mc)][k];
             let n_w = b.rot.rotate(p.transform.apply_dir(nrm));
-            let lam = n_w.dot(sun).max(0.0);
-            let mut shade = 0.36 + 0.64 * lam;
-            if !b.debris {
-                let to_eye = eye - b.pos - b.rot.rotate(p.transform.apply(local));
-                let d2 = to_eye.norm_squared();
-                if d2 > 1e-6 {
-                    let half = sun + to_eye / d2.sqrt();
-                    let hl = half.norm();
-                    if hl > 1e-9 {
-                        shade += 0.20 * n_w.dot(half / hl).max(0.0).powi(12);
-                    }
-                }
-            }
-            let shade = shade.min(1.0) as f32;
-            let (r, g, bl) = if b.debris {
-                (alb[0] * 0.72, alb[1] * 0.38, alb[2] * 0.16)
+            let rel = world[k] - eye;
+            let (color, mat) = if b.debris {
+                (
+                    [alb[0] * 0.72, alb[1] * 0.38, alb[2] * 0.16, alb[3]],
+                    [0.0, mt[1], mt[2]],
+                )
             } else {
-                (alb[0], alb[1], alb[2])
+                (alb, mt)
             };
             v.push(csp_render::flight::FlightVertex {
-                pos,
-                color: [
-                    (r * shade).min(1.0),
-                    (g * shade).min(1.0),
-                    (bl * shade).min(1.0),
-                    alb[3],
-                ],
+                pos: [c0, c1, c2][k],
+                world: f3(rel),
+                nrm: f3(n_w),
+                color,
+                mat,
             });
         }
     }
@@ -2340,7 +2362,7 @@ pub(crate) fn extract_flight(
             ([-1.0, 1.0, 0.0], zenith),
         ];
         for (pos, color) in q {
-            v.push(csp_render::flight::FlightVertex { pos, color });
+            v.push(unlit_v(pos, color));
         }
     }
     if !cam.0.valid {
@@ -2367,6 +2389,30 @@ pub(crate) fn extract_flight(
             let s = DVec3::new(0.4, 0.3, 0.86);
             s / s.norm()
         });
+    // The part-lighting uniform for this frame: the staged sun plus a
+    // hemisphere ambient keyed to the focus vessel's local up — sky
+    // bounce above it, dim ground bounce below — so hull shading reads
+    // like the scene the terrain pass draws (same sun direction).
+    packet.light = {
+        let up = snap
+            .env
+            .as_ref()
+            .and_then(|e| {
+                snap.vessels.first().map(|b| {
+                    let d = b.com - e.body_center;
+                    let l = d.norm();
+                    if l > 1.0 { d / l } else { DVec3::Z }
+                })
+            })
+            .unwrap_or(DVec3::Z);
+        csp_render::PartLight {
+            sun_dir: [sun.x as f32, sun.y as f32, sun.z as f32, 0.0],
+            sun_col: [0.95, 0.92, 0.85, 0.0],
+            amb_up: [0.16, 0.20, 0.27, 0.0],
+            amb_dn: [0.065, 0.060, 0.055, 0.0],
+            hemi: [up.x as f32, up.y as f32, up.z as f32, 0.10],
+        }
+    };
     let mut tris = Vec::new();
     for b in &snap.vessels {
         for p in &b.parts {
@@ -2378,55 +2424,39 @@ pub(crate) fn extract_flight(
             let (lo, hi) = p.shape.local_aabb();
             let z_span = (hi.z - lo.z).max(1e-9);
             if let Some(m) = &p.model {
-                emit_model_part(v, b, p, m, vp, eye, sun);
+                emit_model_part(v, b, p, m, vp, eye);
                 continue;
             }
             tris.clear();
             crate::part_mesh::emit_smooth(&p.shape, &mut tris);
+            let mat = if b.debris {
+                [0.0, 32.0, 1.0]
+            } else {
+                kind_mat(p.kind)
+            };
             for t in tris.iter() {
                 // A tri with any corner behind the eye plane drops
                 // whole — the same all-or-nothing rule the VAB packet
                 // uses — rather than emitting a corrupted fan.
-                let [Some(c0), Some(c1), Some(c2)] = [t.a, t.b, t.c]
-                    .map(|q| project_into(vp, eye, b.pos + b.rot.rotate(p.transform.apply(q))))
-                else {
+                let world = [t.a, t.b, t.c].map(|q| b.pos + b.rot.rotate(p.transform.apply(q)));
+                let [Some(c0), Some(c1), Some(c2)] = world.map(|q| project_into(vp, eye, q)) else {
                     continue;
                 };
-                for ((local, nrm), pos) in [(t.a, t.na), (t.b, t.nb), (t.c, t.nc)]
-                    .into_iter()
-                    .zip([c0, c1, c2])
+                for (k, &(local, nrm)) in [(t.a, t.na), (t.b, t.nb), (t.c, t.nc)].iter().enumerate()
                 {
                     let n_w = b.rot.rotate(p.transform.apply_dir(nrm));
-                    let lam = n_w.dot(sun).max(0.0);
-                    let mut shade = 0.36 + 0.64 * lam;
-                    // Faint metallic sheen toward the eye — charred
-                    // debris stays matte.
-                    if !b.debris {
-                        let to_eye = eye - b.pos - b.rot.rotate(p.transform.apply(local));
-                        let d2 = to_eye.norm_squared();
-                        if d2 > 1e-6 {
-                            let half = sun + to_eye / d2.sqrt();
-                            let hl = half.norm();
-                            if hl > 1e-9 {
-                                shade += 0.20 * n_w.dot(half / hl).max(0.0).powi(12);
-                            }
-                        }
-                    }
                     let u = (local.z - lo.z) / z_span;
                     let tint = if b.debris {
                         base
                     } else {
                         livery(p.kind, base, u)
                     };
-                    let shade = shade.min(1.0) as f32;
                     v.push(csp_render::flight::FlightVertex {
-                        pos,
-                        color: [
-                            (tint[0] * shade).min(1.0),
-                            (tint[1] * shade).min(1.0),
-                            (tint[2] * shade).min(1.0),
-                            1.0,
-                        ],
+                        pos: [c0, c1, c2][k],
+                        world: f3(world[k] - eye),
+                        nrm: f3(n_w),
+                        color: [tint[0], tint[1], tint[2], 1.0],
+                        mat,
                     });
                 }
             }

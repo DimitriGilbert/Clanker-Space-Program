@@ -23,16 +23,27 @@
 
 use crate::GpuBuffer;
 
-/// One vertex of a part box — clip-space NDC (z: 1 = near, 0 = far —
-/// the map projection's reverse-Z convention), flat RGBA color, and
-/// the part's 1-based pick index (0 = none/background).
+/// One vertex of a part mesh — clip-space NDC (z: 1 = near, 0 = far —
+/// the map projection's reverse-Z convention) plus the per-pixel-
+/// lighting channels shared with `FlightVertex` (camera-relative world
+/// position, world normal, linear albedo, material terms; ~zero normal
+/// marks the unlit stream), and the part's 1-based pick index
+/// (0 = none/background).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct VabVertex {
     /// Clip-space position (z is the depth value).
     pub pos: [f32; 3],
-    /// Linear RGBA.
+    /// Camera-relative world position (f32 — §2.3 renders relative to
+    /// the eye, so the view direction is `-normalize(world)`).
+    pub world: [f32; 3],
+    /// World-space unit normal; ~0 → unlit passthrough.
+    pub nrm: [f32; 3],
+    /// Linear RGBA albedo (unlit color when `nrm` ≈ 0).
     pub color: [f32; 4],
+    /// `[specular strength, specular exponent, occlusion]` — baked
+    /// per-material terms the fragment lighting reads.
+    pub mat: [f32; 3],
     /// 1-based index into [`VabPacket::pick_ids`].
     pub pick: u32,
 }
@@ -41,7 +52,14 @@ impl VabVertex {
     const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<VabVertex>() as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Vertex,
-        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Uint32],
+        attributes: &wgpu::vertex_attr_array![
+            0 => Float32x3,
+            1 => Float32x3,
+            2 => Float32x3,
+            3 => Float32x4,
+            4 => Float32x3,
+            5 => Uint32
+        ],
     };
 }
 
@@ -65,6 +83,9 @@ pub struct VabPacket {
     /// pending placement) or, worse, reuses the id for a DIFFERENT
     /// node — an epoch check drops the stale decode instead.
     pub craft_epoch: u64,
+    /// The frame's part lighting — the editor's fixed studio key +
+    /// hemisphere fill, written to the uniform buffer each draw.
+    pub light: crate::PartLight,
 }
 
 /// The offscreen targets the pick pass draws into.
@@ -87,6 +108,10 @@ pub struct VabRenderer {
     /// Object-id rasterization → `pick.color`.
     pick_pipeline: wgpu::RenderPipeline,
     verts: GpuBuffer,
+    /// `PartLight` uniform — rewritten per draw from the packet.
+    light_buf: wgpu::Buffer,
+    /// group(0) on the color pipeline — the `light` uniform binding.
+    light_bind: wgpu::BindGroup,
     /// Depth for the app's main render pass (reverse-Z convention) —
     /// texture + view kept so `depth_view` can return a reference.
     depth: wgpu::Texture,
@@ -171,9 +196,29 @@ impl VabRenderer {
         );
         let depth = render_target(device, size, wgpu::TextureFormat::Depth32Float, "vab-depth");
         let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+        // The color pipeline's auto layout carries group(0) (`light`);
+        // the pick pipeline shares the shader module but never
+        // references the uniform, so its own layout stays empty and no
+        // bind group is needed for it.
+        let light_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("vab-light"),
+            size: std::mem::size_of::<crate::PartLight>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let light_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("vab-light"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: light_buf.as_entire_binding(),
+            }],
+        });
         Self {
             pipeline,
             pick_pipeline,
+            light_buf,
+            light_bind,
             verts: GpuBuffer::new(
                 device,
                 "vab-verts",
@@ -224,7 +269,9 @@ impl VabRenderer {
         if n == 0 {
             return;
         }
+        queue.write_buffer(&self.light_buf, 0, bytemuck::bytes_of(&packet.light));
         pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.light_bind, &[]);
         pass.set_vertex_buffer(0, self.verts.buffer.slice(..));
         pass.draw(0..n, 0..1);
     }

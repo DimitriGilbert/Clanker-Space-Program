@@ -11,12 +11,15 @@
 //!
 //! ## `.csar` layout (little-endian, mirrors `xtask::bake_art`)
 //!
-//! `"CSAR"` · u32 version=1 · u32 n_entries; then per entry `u8 kind`,
+//! `"CSAR"` · u32 version=2 · u32 n_entries; then per entry `u8 kind`,
 //! `u8 name_len`, name bytes — kind 1 image (`u16 w, u16 h, u8 layers,
 //! u8 mips, layers×4 mean RGBA, u64 len, deflate payload` — mip-major:
 //! each level holds all layers contiguous), kind 2 mesh (`u32 nv,
 //! u32 ni, u64 len, deflate` — vertex = f32×3 pos + f32×3 normal +
-//! u8×4 sRGB color = 28 B, then u32 indices).
+//! u8×4 sRGB color + u8×2 material (spec strength, spec exponent) +
+//! u8 occlusion + u8 pad = 32 B, then u32 indices). Meshes are the
+//! bake's welded, Loop-subdivided, smoothing-wedge-normalled models —
+//! the low-poly facet look is removed at bake time.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -26,15 +29,22 @@ use csp_render::terrain::{TerrainArt, TerrainTex};
 
 /// One vertex of a baked part model — model-local position (z-up —
 /// the bake converted glTF y-up), unit normal, and the linear RGBA
-/// albedo decoded from the source material color.
+/// albedo decoded from the source material color. `mat` carries the
+/// baked per-material lighting terms: `[specular strength 0..1,
+/// specular exponent, cavity occlusion 0..1]` — the shader's per-pixel
+/// lighting reads them straight.
 #[derive(Clone, Copy, Debug)]
 pub struct ModelVert {
     /// Model-local position (m, model's own units — fitted at emit).
     pub pos: [f32; 3],
-    /// Unit outward normal, model-local.
+    /// Unit outward normal, model-local — the bake's smoothing-wedge
+    /// normal (split across creases, smooth within a panel).
     pub nrm: [f32; 3],
-    /// Linear RGBA albedo.
+    /// Linear RGBA albedo (source material × baked edge shading).
     pub col: [f32; 4],
+    /// `[spec strength, spec exponent, occlusion]` — baked material
+    /// terms; `[0, ·, 1]` shades matte.
+    pub mat: [f32; 3],
 }
 
 /// A baked part mesh — real model geometry from the Kenney Space Kit.
@@ -200,7 +210,7 @@ fn decode(b: &[u8]) -> Result<Vec<(&str, Entry)>, String> {
         return Err("bad magic".to_string());
     }
     let ver = r.u32()?;
-    if ver != 1 {
+    if ver != 2 {
         return Err(format!("csar version {ver}"));
     }
     let n = r.u32()?;
@@ -234,14 +244,14 @@ fn decode(b: &[u8]) -> Result<Vec<(&str, Entry)>, String> {
             2 => {
                 let (nv, ni) = (r.u32()? as usize, r.u32()? as usize);
                 let raw = r.inflate()?;
-                if raw.len() != nv * 28 + ni * 4 {
+                if raw.len() != nv * 32 + ni * 4 {
                     return Err("mesh payload size mismatch".to_string());
                 }
                 let mut lo = [f32::MAX; 3];
                 let mut hi = [f32::MIN; 3];
                 let mut verts = Vec::with_capacity(nv);
                 for i in 0..nv {
-                    let o = i * 28;
+                    let o = i * 32;
                     let f = |k: usize| {
                         f32::from_le_bytes(
                             raw[o + k * 4..o + k * 4 + 4].try_into().unwrap_or_default(),
@@ -263,11 +273,16 @@ fn decode(b: &[u8]) -> Result<Vec<(&str, Entry)>, String> {
                             srgb_to_linear(f32::from(c[2]) / 255.0),
                             f32::from(c[3]) / 255.0,
                         ],
+                        mat: [
+                            f32::from(raw[o + 28]) / 255.0,
+                            f32::from(raw[o + 29]),
+                            f32::from(raw[o + 30]) / 255.0,
+                        ],
                     });
                 }
                 let mut indices = Vec::with_capacity(ni);
                 for i in 0..ni {
-                    let o = nv * 28 + i * 4;
+                    let o = nv * 32 + i * 4;
                     indices.push(u32::from_le_bytes(
                         raw[o..o + 4].try_into().unwrap_or_default(),
                     ));
