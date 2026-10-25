@@ -50,11 +50,29 @@ use csp_sim::{ManeuverNode, VesselId, World as SimWorld};
 /// Segments per sampled orbit line.
 pub const ORBIT_LINE_SAMPLES: usize = 128;
 /// Half-width of the quad-stripped orbit lines.
-const LINE_HALF_WIDTH_PX: f64 = 0.75;
-/// Screen-space marker half-sizes.
-const BODY_MARKER_PX: f64 = 5.0;
+const LINE_HALF_WIDTH_PX: f64 = 0.85;
+/// Width multiplier for the focused body's/vessel's orbit line.
+const FOCUS_LINE_WIDTH: f64 = 1.6;
+/// Screen-space marker half-sizes (the disc — the glow extends ~3×).
+const BODY_MARKER_PX: f64 = 4.5;
 /// Vessels draw smaller than bodies.
-const VESSEL_MARKER_PX: f64 = 3.5;
+const VESSEL_MARKER_PX: f64 = 3.0;
+/// The star's marker reads bigger — it is the system's anchor point.
+const STAR_MARKER_SCALE: f64 = 1.7;
+/// Focused-target ring half-size (a ring reads "this is the camera's
+/// reference" better than a color swap on a 5 px disc).
+const FOCUS_RING_PX: f64 = 9.0;
+/// Apsis markers on the focused vessel's orbit (Ap/Pe ring half-size).
+const APSIS_MARKER_PX: f64 = 4.5;
+/// Pick radius for click-to-focus — screen px around a marker's anchor.
+/// `pub(crate)`: the `UiBuild` hit-test in `crate` uses the same bound.
+pub(crate) const PICK_RADIUS_PX: f64 = 14.0;
+/// Starfield: how many world-anchored backdrop stars the extract emits.
+const STAR_COUNT: usize = 700;
+/// Distance (m) the backdrop stars sit at — effectively infinite:
+/// far enough that translation never parallaxes them, finite enough
+/// that the f64 clip solve stays conditioned.
+const STAR_DISTANCE_M: f64 = 1.0e28;
 /// Camera vertical field of view (rad).
 const MAP_FOV_Y: f64 = std::f64::consts::FRAC_PI_3;
 /// Clip-space w reject bound — points this close to or behind the eye
@@ -119,11 +137,23 @@ pub enum MapKeyEvent {
     ToggleMode,
     /// `Tab` — cycle the camera's focus body (resets pan + distance).
     CycleFocus,
+    /// Click-to-focus a body by [`BodyTable`] index (resets pan +
+    /// re-frames; clicking the already-focused body recenters it).
+    FocusBody(usize),
+    /// Click-to-focus a vessel by id — the same anchor
+    /// [`MapInput::focus_vessel`] uses, so a re-keyed snapshot cannot
+    /// retarget the click.
+    FocusVessel(VesselId),
     /// Left-drag orbit — radians to add to yaw/pitch.
     Orbit { dyaw: f64, dpitch: f64 },
-    /// Scroll zoom — multiplicative factor on `distance_m`.
+    /// Scroll zoom — multiplicative factor on `distance_m`. With a
+    /// live [`MapInput::cursor_px`] the zoom aims at the point under
+    /// the cursor (KSP-style), so pointing and scrolling places the
+    /// camera anywhere in the system.
     Zoom { factor: f64 },
-    /// Keyboard pan — screen-space pixels (WASD/arrows).
+    /// Free pan — screen-space pixels (WASD/arrows, or middle/right
+    /// drag converted to px upstream). The look-at point detaches from
+    /// the focus body freely; there is no clamp.
     Pan { dx_px: f64, dy_px: f64 },
 }
 
@@ -227,6 +257,11 @@ pub struct MapInput {
     /// Current viewport in physical pixels — written by csp-app each
     /// frame via [`crate::View::set_map_viewport`].
     pub viewport_px: (f64, f64),
+    /// Cursor position in physical pixels — staged each map frame by
+    /// `UiBuild` from egui's pointer state. Feeds scroll-zoom's
+    /// zoom-toward-cursor offset; `None` when the pointer is off-window
+    /// (zoom then homes on the focus point as before).
+    pub cursor_px: Option<(f64, f64)>,
 }
 
 impl MapInput {
@@ -241,6 +276,7 @@ impl MapInput {
             pitch_rad: 0.6,
             distance_m: default_distance(table, table.default_focus),
             viewport_px: (1280.0, 720.0),
+            cursor_px: None,
         }
     }
 
@@ -273,13 +309,53 @@ impl MapInput {
                     }
                 }
             }
+            MapKeyEvent::FocusBody(i) => {
+                // Click-to-focus: valid in map mode only, and `refocus`
+                // on the *current* body is the recenter gesture (pan
+                // resets, distance re-frames) rather than a no-op.
+                if self.mode == MapMode::Map && i < table.bodies.len() {
+                    self.focus = i;
+                    self.focus_vessel = None;
+                    self.refocus(table, snap);
+                }
+            }
+            MapKeyEvent::FocusVessel(id) => {
+                if self.mode == MapMode::Map
+                    && let Some(i) = snap.vessels.iter().position(|(vid, _, _)| *vid == id)
+                {
+                    self.focus = table.bodies.len() + i;
+                    self.focus_vessel = Some(id);
+                    self.refocus(table, snap);
+                }
+            }
             MapKeyEvent::Orbit { dyaw, dpitch } => {
                 self.yaw_rad += dyaw;
                 self.pitch_rad = (self.pitch_rad + dpitch).clamp(-PITCH_LIMIT, PITCH_LIMIT);
             }
             MapKeyEvent::Zoom { factor } => {
-                self.distance_m =
-                    (self.distance_m * factor.max(1e-9)).clamp(MIN_DISTANCE_M, MAX_DISTANCE_M);
+                let old = self.distance_m;
+                let new = (old * factor.max(1e-9)).clamp(MIN_DISTANCE_M, MAX_DISTANCE_M);
+                // Zoom-toward-cursor: the world point under the cursor
+                // stays under the cursor, so the look-at point shifts
+                // toward it by the fraction the distance actually
+                // changed. Point + scroll therefore places the camera
+                // anywhere — the cursor's focus-plane offset is right/
+                // up vector lengths at the OLD distance, and the
+                // residual `off·(1 − new/old)` is what the new, tighter
+                // frame leaves un-covered.
+                if let Some((cx, cy)) = self.cursor_px {
+                    let (w, h) = self.viewport_px;
+                    if w > 1.0 && h > 1.0 {
+                        let nx = 2.0 * cx / w - 1.0;
+                        let ny = 1.0 - 2.0 * cy / h;
+                        let half_h = old * f64::tan(MAP_FOV_Y * 0.5);
+                        let half_w = half_h * (w / h);
+                        let r = rot3(self.yaw_rad, self.pitch_rad);
+                        let off = mat3_vec(&r, DVec3::new(nx * half_w, ny * half_h, 0.0));
+                        self.pan_offset = self.pan_offset + off * (1.0 - new / old);
+                    }
+                }
+                self.distance_m = new;
             }
             MapKeyEvent::Pan { dx_px, dy_px } => {
                 // world units per screen px at the focus distance;
@@ -437,6 +513,12 @@ pub struct MapScene {
     vessel_lines: BTreeMap<VesselId, (OrbitState, Option<Vec<DVec3>>)>,
     /// M5 node previews — see [`NodePreview`].
     node_lines: BTreeMap<VesselId, NodePreview>,
+    /// System-frame Ap/Pe points on the *focused* orbit (vessel or
+    /// body) — recomputed each map frame in `map_present`, drawn as
+    /// ring markers by `extract_map`. Empty when the focus has no
+    /// conic (the star) or no vessel is focused and the focused body
+    /// is the root.
+    pub(crate) focus_apsis: Vec<DVec3>,
 }
 
 /// One vessel's cached node preview: the `(orbit, node)` invalidation
@@ -482,6 +564,34 @@ pub struct MapUiData {
     pub camera_distance_m: f64,
     /// Projected label anchors for this frame.
     pub labels: Vec<csp_ui::MapLabel>,
+    /// Click-to-focus targets — projected marker anchors paired with
+    /// the focus they switch to, hit-tested by `UiBuild` against the
+    /// egui pointer (markers are too small to name in winit space).
+    pub picks: Vec<MapPick>,
+    /// The focused orbit's readout for the info panel — `None` when
+    /// the focus is the star or its conic cannot be read.
+    pub orbit_info: Option<csp_ui::MapOrbitInfo>,
+}
+
+/// A click-to-focus target — the screen anchor plus the destination.
+/// Identity rides this table rather than the label text so a renamed
+/// label can never desync the pick.
+#[derive(Clone, Copy, Debug)]
+pub struct MapPick {
+    /// Clip-space anchor (same projection the marker used).
+    pub ndc: [f32; 3],
+    /// What a click on this anchor focuses.
+    pub target: MapFocusTarget,
+}
+
+/// Where a click takes the camera.
+#[derive(Clone, Copy, Debug)]
+pub enum MapFocusTarget {
+    /// A [`BodyTable`] index.
+    Body(usize),
+    /// A vessel id — matched against the *snapshot* at apply time, so
+    /// a vessel that left between frames simply does nothing.
+    Vessel(VesselId),
 }
 
 /// The RenderExtract product — the packet `csp-app` hands to
@@ -583,14 +693,21 @@ pub(crate) fn map_present(
     };
     ui.camera_distance_m = input.distance_m;
 
-    // Labels: bodies + vessels that project.
+    // Labels: bodies + vessels that project — each projected marker is
+    // also a click-to-focus target (`UiBuild` hit-tests the pointer).
     ui.labels.clear();
-    for (body, pos) in table.bodies.iter().zip(scene.body_pos.iter()) {
+    ui.picks.clear();
+    for (i, (body, pos)) in table.bodies.iter().zip(scene.body_pos.iter()).enumerate() {
         if let Some(ndc) = pos.and_then(|p| project(&cam, p)) {
             ui.labels.push(csp_ui::MapLabel {
                 ndc,
                 text: body.id.to_string(),
                 color: body.color,
+                kind: csp_ui::MapLabelKind::Body,
+            });
+            ui.picks.push(MapPick {
+                ndc,
+                target: MapFocusTarget::Body(i),
             });
         }
     }
@@ -600,6 +717,11 @@ pub(crate) fn map_present(
                 ndc,
                 text: format!("vessel {}", id.0),
                 color: VESSEL_COLOR,
+                kind: csp_ui::MapLabelKind::Vessel,
+            });
+            ui.picks.push(MapPick {
+                ndc,
+                target: MapFocusTarget::Vessel(*id),
             });
         }
     }
@@ -625,9 +747,163 @@ pub(crate) fn map_present(
                 ndc,
                 text: format!("node  T−{eta:.0} s  Δv {:.0} m/s", node.dv_magnitude()),
                 color: NODE_COLOR,
+                kind: csp_ui::MapLabelKind::Node,
             });
         }
     }
+
+    // The focused conic — Ap/Pe marks on it plus the info panel's
+    // readout. Vessels and bodies share the element shape; the star
+    // (or any unsolvable parent position) leaves both empty.
+    scene.focus_apsis.clear();
+    ui.orbit_info = None;
+    if let Some(focus) = focused_conic(&input, &table, &snap, model) {
+        ui.orbit_info = orbit_info(&focus, model);
+        if let Some(parent_pos) = table
+            .index_of(&focus.parent)
+            .and_then(|pi| scene.body_pos.get(pi))
+            .copied()
+            .flatten()
+        {
+            // Pe always exists on a conic; Ap only when it closes.
+            let parent_radius = model.body_radius(&focus.parent);
+            for (nu, tag) in [(0.0, "Pe"), (std::f64::consts::PI, "Ap")] {
+                if nu != 0.0 && focus.elements.eccentricity >= 1.0 - E_PARABOLIC_TOL {
+                    continue; // open conic — no apoapsis
+                }
+                let Some(rel) = apsis_point(focus.elements, nu) else {
+                    continue;
+                };
+                let world = parent_pos + rel;
+                scene.focus_apsis.push(world);
+                let Some(ndc) = project(&cam, world) else {
+                    continue;
+                };
+                // Surface altitude when the parent's radius is known,
+                // else the raw radius (the star has no surface).
+                let shown = parent_radius.map_or(rel.norm(), |rad| rel.norm() - rad);
+                ui.labels.push(csp_ui::MapLabel {
+                    ndc,
+                    text: format!("{tag} {}", csp_ui::fmt_distance(shown)),
+                    color: focus.line_color,
+                    kind: csp_ui::MapLabelKind::Apsis,
+                });
+            }
+        }
+    }
+}
+
+/// The conic the camera is focused on — the focused vessel's orbit or
+/// the focused body's own orbit about its parent (`None` for the
+/// star). The display name and the line color (vessel orange vs the
+/// body's palette entry) ride along so the apsis marks match what
+/// the player sees drawn.
+struct FocusedConic<'a> {
+    /// Display name for the info panel.
+    name: String,
+    /// The central body the elements orbit.
+    parent: BodyId,
+    /// The conic elements (parent-centred, own epoch).
+    elements: &'a KeplerElements,
+    /// The orbit line's color — apsis marks take the same tint.
+    line_color: [f32; 4],
+}
+
+/// Resolve [`MapInput::focus`] into the conic it tracks.
+fn focused_conic<'a>(
+    input: &MapInput,
+    table: &'a BodyTable,
+    snap: &'a MapSnapshot,
+    model: &'a PatchedConics,
+) -> Option<FocusedConic<'a>> {
+    match input.vessel_focus(table) {
+        Some(i) => {
+            let (id, orbit, _) = snap.vessels.get(i)?;
+            Some(FocusedConic {
+                name: format!("vessel {}", id.0),
+                parent: orbit.parent.clone(),
+                elements: &orbit.elements,
+                line_color: VESSEL_COLOR,
+            })
+        }
+        None => {
+            let body = table.bodies.get(input.focus)?;
+            let parent = body.parent.as_ref()?;
+            let elements = model.body_orbit(&body.id).ok()?.elements.as_ref()?;
+            Some(FocusedConic {
+                name: body.id.to_string(),
+                parent: parent.clone(),
+                elements,
+                line_color: body.color,
+            })
+        }
+    }
+}
+
+/// The info panel's numbers — apsis radii + period straight off the
+/// elements. `None` when the parent's μ record is missing.
+fn orbit_info(focus: &FocusedConic<'_>, model: &PatchedConics) -> Option<csp_ui::MapOrbitInfo> {
+    let mu = model.body_orbit(&focus.parent).ok()?.mu_m3_per_s2;
+    let el = focus.elements;
+    let e = el.eccentricity;
+    let a = el.semi_major_axis_m;
+    let p = p_latus(el)?;
+    let closed = e < 1.0 - E_PARABOLIC_TOL && a > 0.0 && mu > 0.0;
+    Some(csp_ui::MapOrbitInfo {
+        name: focus.name.clone(),
+        parent_name: focus.parent.to_string(),
+        apo_r_m: closed.then(|| p / (1.0 - e)),
+        pe_r_m: p / (1.0 + e),
+        parent_radius_m: model.body_radius(&focus.parent),
+        period_s: closed.then(|| 2.0 * std::f64::consts::PI * f64::sqrt(a * a * a / mu)),
+    })
+}
+
+/// Semi-latus rectum `p` for any conic in the sim's encoding — the
+/// apsis geometry's shared constant. Elliptic/hyperbolic:
+/// `p = |a(1 − e²)|`; the `|e − 1| ≤ E_PARABOLIC_TOL` band carries the
+/// sim's parabola convention `a := −p`, so `p = |a|` literally.
+/// `None` when the elements cannot form a conic (p ≤ 0 / non-finite).
+fn p_latus(el: &KeplerElements) -> Option<f64> {
+    let e = el.eccentricity;
+    let a = el.semi_major_axis_m;
+    let p = if (e - 1.0).abs() <= E_PARABOLIC_TOL {
+        a.abs()
+    } else {
+        (a * (1.0 - e * e)).abs()
+    };
+    (p.is_finite() && p > 0.0).then_some(p)
+}
+
+/// The parent-centred apsis point at true anomaly `nu` — pure conic
+/// geometry (`r = p/(1 + e·cos ν)` in the perifocal frame, rotated to
+/// inertial), no time solve needed. `None` when `nu` lands past the
+/// hyperbolic asymptote (`1 + e·cos ν ≤ 0`).
+fn apsis_point(el: &KeplerElements, nu: f64) -> Option<DVec3> {
+    let e = el.eccentricity;
+    let p = p_latus(el)?;
+    let denom = 1.0 + e * f64::cos(nu);
+    if denom <= 0.0 {
+        return None;
+    }
+    let r = p / denom;
+    let (s, c) = f64::sin_cos(nu);
+    Some(perifocal_to_inertial(DVec3::new(r * c, r * s, 0.0), el))
+}
+
+/// Perifocal → inertial `R3(Ω)·R1(i)·R3(ω)` — mirrored literally from
+/// `csp_sim::orbit::perifocal_to_inertial` (which is `pub(crate)`
+/// there): the apsis points are conic geometry, and the view cannot
+/// reach the sim's private helper.
+fn perifocal_to_inertial(v: DVec3, el: &KeplerElements) -> DVec3 {
+    let (sw, cw) = f64::sin_cos(el.arg_periapsis_rad);
+    let (si, ci) = f64::sin_cos(el.inclination_rad);
+    let (so, co) = f64::sin_cos(el.ascending_node_rad);
+    DVec3::new(
+        (co * cw - so * ci * sw) * v.x + (-co * sw - so * ci * cw) * v.y + so * si * v.z,
+        (so * cw + co * ci * sw) * v.x + (-so * sw + co * ci * cw) * v.y - co * si * v.z,
+        (si * sw) * v.x + (si * cw) * v.y + ci * v.z,
+    )
 }
 
 /// M5 node previews — the same invalidation rule the vessel lines use:
@@ -674,48 +950,80 @@ pub(crate) fn extract_map(
         return;
     }
     let vp = input.viewport_px;
+    let mut bg = MapMesh::default();
     let mut lines = MapMesh::default();
     let mut markers = MapMesh::default();
     let mut skipped_lines = 0u32;
 
-    // Orbit polylines — parent-centered samples + the parent's current
-    // system position. A failed parent solve skips the line entirely
-    // (MapScene::body_pos's documented "skipped, not defaulted" policy):
-    // offsetting by DVec3::ZERO would draw the child's orbit through the
-    // system origin instead of around its parent.
+    // The backdrop — a fixed world-anchored starfield. Stars sit
+    // effectively at infinity: they parallax with camera rotation but
+    // not translation, which is exactly how a real sky reads.
+    emit_starfield(&mut bg.vertices, &cam, vp);
+
+    // A parent's current position, by table index — the offset every
+    // parent-centred polyline rides. `None` on a failed solve (the
+    // "skipped, not defaulted" policy — offsetting by ZERO would draw
+    // the child's orbit through the system origin).
+    let parent_pos = |id: &BodyId| {
+        table
+            .index_of(id)
+            .and_then(|pi| scene.body_pos.get(pi))
+            .copied()
+            .flatten()
+    };
+
+    // Orbit polylines — the focused conic draws brighter and wider so
+    // "which of these lines is my reference" reads at a glance.
+    let focus_body = input.vessel_focus(&table).is_none().then_some(input.focus);
     for (i, line) in scene.body_lines.iter().enumerate() {
         let (Some(points), Some(body)) = (line.as_ref(), table.bodies.get(i)) else {
             continue;
         };
-        let Some(offset) = body
-            .parent
-            .as_ref()
-            .and_then(|p| table.index_of(p))
-            .and_then(|pi| scene.body_pos.get(pi))
-            .copied()
-            .flatten()
-        else {
+        let Some(offset) = body.parent.as_ref().and_then(&parent_pos) else {
             skipped_lines += 1;
             continue;
         };
-        let mut dim = body.color;
-        dim[3] *= 0.65;
-        emit_polyline(&mut lines.vertices, points, offset, &cam, vp, dim);
+        let focused = focus_body == Some(i);
+        let mut color = body.color;
+        color[3] *= if focused { 0.9 } else { 0.55 };
+        let half_px = if focused {
+            LINE_HALF_WIDTH_PX * FOCUS_LINE_WIDTH
+        } else {
+            LINE_HALF_WIDTH_PX
+        };
+        emit_polyline(
+            &mut lines.vertices,
+            points,
+            offset,
+            &cam,
+            vp,
+            color,
+            half_px,
+        );
     }
-    for (state, line) in scene.vessel_lines.values() {
+    for (id, (state, line)) in &scene.vessel_lines {
         let Some(points) = line else { continue };
-        let Some(offset) = table
-            .index_of(&state.parent)
-            .and_then(|pi| scene.body_pos.get(pi))
-            .copied()
-            .flatten()
-        else {
+        let Some(offset) = parent_pos(&state.parent) else {
             skipped_lines += 1;
             continue;
         };
+        let focused = input.focus_vessel == Some(*id);
         let mut color = VESSEL_COLOR;
-        color[3] *= 0.8;
-        emit_polyline(&mut lines.vertices, points, offset, &cam, vp, color);
+        color[3] *= if focused { 0.95 } else { 0.55 };
+        let half_px = if focused {
+            LINE_HALF_WIDTH_PX * FOCUS_LINE_WIDTH
+        } else {
+            LINE_HALF_WIDTH_PX
+        };
+        emit_polyline(
+            &mut lines.vertices,
+            points,
+            offset,
+            &cam,
+            vp,
+            color,
+            half_px,
+        );
     }
     // M5 predicted post-burn conics — the same parent-centred offset
     // convention; a failed prediction is "no line", never defaulted.
@@ -724,18 +1032,21 @@ pub(crate) fn extract_map(
         let Some(points) = preview.line.as_ref() else {
             continue;
         };
-        let Some(offset) = table
-            .index_of(&state.parent)
-            .and_then(|pi| scene.body_pos.get(pi))
-            .copied()
-            .flatten()
-        else {
+        let Some(offset) = parent_pos(&state.parent) else {
             skipped_lines += 1;
             continue;
         };
         let mut color = NODE_COLOR;
-        color[3] *= 0.75;
-        emit_polyline(&mut lines.vertices, points, offset, &cam, vp, color);
+        color[3] *= 0.8;
+        emit_polyline(
+            &mut lines.vertices,
+            points,
+            offset,
+            &cam,
+            vp,
+            color,
+            LINE_HALF_WIDTH_PX,
+        );
     }
     // Observability without per-frame spam: warn only when the skipped
     // count grows, so a persistently failing parent logs once while a
@@ -747,49 +1058,122 @@ pub(crate) fn extract_map(
     }
     *skipped_prev = skipped_lines;
 
-    // Markers — screen-space quads at projected positions.
-    for (body, pos) in table.bodies.iter().zip(scene.body_pos.iter()) {
-        if let Some(ndc) = pos.and_then(|p| project(&cam, p)) {
-            emit_quad(&mut markers.vertices, ndc, BODY_MARKER_PX, vp, body.color);
-        }
-    }
-    for pos in &scene.vessel_pos {
-        if let Some(ndc) = pos.and_then(|p| project(&cam, p)) {
-            emit_quad(
+    // Markers — a soft glow under an AA disc, with a ring on whichever
+    // target the camera is focused on.
+    for (i, (body, pos)) in table.bodies.iter().zip(scene.body_pos.iter()).enumerate() {
+        let Some(ndc) = pos.and_then(|p| project(&cam, p)) else {
+            continue;
+        };
+        let scale = if body.parent.is_none() {
+            STAR_MARKER_SCALE
+        } else {
+            1.0
+        };
+        let mut glow = body.color;
+        glow[3] *= 0.35;
+        emit_shape(
+            &mut markers.vertices,
+            ndc,
+            BODY_MARKER_PX * scale * 3.2,
+            vp,
+            glow,
+            MapVertex::KIND_GLOW,
+        );
+        emit_shape(
+            &mut markers.vertices,
+            ndc,
+            BODY_MARKER_PX * scale,
+            vp,
+            body.color,
+            MapVertex::KIND_DISC,
+        );
+        if focus_body == Some(i) {
+            emit_shape(
                 &mut markers.vertices,
                 ndc,
-                VESSEL_MARKER_PX,
+                FOCUS_RING_PX,
                 vp,
-                VESSEL_COLOR,
+                [1.0, 1.0, 1.0, 0.9],
+                MapVertex::KIND_RING,
             );
         }
     }
-    // Node markers — the node point offset by its parent's position,
-    // drawn slightly larger than a vessel marker.
+    for (i, pos) in scene.vessel_pos.iter().enumerate() {
+        let Some(ndc) = pos.and_then(|p| project(&cam, p)) else {
+            continue;
+        };
+        let focused = input.vessel_focus(&table) == Some(i);
+        let mut glow = VESSEL_COLOR;
+        glow[3] *= if focused { 0.45 } else { 0.3 };
+        emit_shape(
+            &mut markers.vertices,
+            ndc,
+            VESSEL_MARKER_PX * 3.0,
+            vp,
+            glow,
+            MapVertex::KIND_GLOW,
+        );
+        emit_shape(
+            &mut markers.vertices,
+            ndc,
+            VESSEL_MARKER_PX,
+            vp,
+            VESSEL_COLOR,
+            MapVertex::KIND_DISC,
+        );
+        if focused {
+            emit_shape(
+                &mut markers.vertices,
+                ndc,
+                FOCUS_RING_PX,
+                vp,
+                [1.0, 1.0, 1.0, 0.9],
+                MapVertex::KIND_RING,
+            );
+        }
+    }
+    // Node markers — a hollow ring reads "planned point", not a body.
     for preview in scene.node_lines.values() {
         let state = &preview.key.0;
-        let (Some(p), Some(off)) = (
-            preview.point,
-            table
-                .index_of(&state.parent)
-                .and_then(|pi| scene.body_pos.get(pi))
-                .copied()
-                .flatten(),
-        ) else {
+        let (Some(p), Some(off)) = (preview.point, parent_pos(&state.parent)) else {
             continue;
         };
         if let Some(ndc) = project(&cam, p + off) {
-            emit_quad(
+            emit_shape(
                 &mut markers.vertices,
                 ndc,
-                BODY_MARKER_PX - 0.5,
+                BODY_MARKER_PX,
                 vp,
                 NODE_COLOR,
+                MapVertex::KIND_RING,
+            );
+        }
+    }
+    // Ap/Pe rings on the focused conic — same parent-centred points
+    // `map_present` labeled, now as geometry.
+    let apsis_color = if input.vessel_focus(&table).is_some() {
+        VESSEL_COLOR
+    } else {
+        table
+            .bodies
+            .get(input.focus)
+            .map(|b| b.color)
+            .unwrap_or(STAR_COLOR)
+    };
+    for p in &scene.focus_apsis {
+        if let Some(ndc) = project(&cam, *p) {
+            emit_shape(
+                &mut markers.vertices,
+                ndc,
+                APSIS_MARKER_PX,
+                vp,
+                apsis_color,
+                MapVertex::KIND_RING,
             );
         }
     }
 
-    frame.0 = Some(MapPacket { lines, markers });
+    frame.0 = Some(MapPacket { bg, lines, markers });
 }
 
 // ---------------------------------------------------------------------------
@@ -1084,35 +1468,93 @@ pub(crate) fn project_into(
     ])
 }
 
-/// Emit a screen-space quad (two triangles) centered on `ndc`.
-fn emit_quad(
+/// Emit a screen-space quad (two triangles) centered on `ndc`, shaped
+/// by `kind` (see `MapVertex::KIND_*` — solid/disc/ring/glow). Shaped
+/// kinds get `uv` spanning `[-1,1]` across the quad so the fragment
+/// shader can measure radius.
+fn emit_shape(
     verts: &mut Vec<MapVertex>,
     ndc: [f32; 3],
     half_px: f64,
     vp: (f64, f64),
     color: [f32; 4],
+    kind: f32,
 ) {
     let hx = (half_px * 2.0 / vp.0.max(1.0)) as f32;
     let hy = (half_px * 2.0 / vp.1.max(1.0)) as f32;
     let [x, y, z] = ndc;
     let corners = [
-        [x - hx, y - hy, z],
-        [x + hx, y - hy, z],
-        [x + hx, y + hy, z],
-        [x - hx, y + hy, z],
+        ([x - hx, y - hy, z], [-1.0f32, -1.0]),
+        ([x + hx, y - hy, z], [1.0, -1.0]),
+        ([x + hx, y + hy, z], [1.0, 1.0]),
+        ([x - hx, y + hy, z], [-1.0, 1.0]),
     ];
     for idx in [0usize, 1, 2, 0, 2, 3] {
         verts.push(MapVertex {
-            pos: corners[idx],
+            pos: corners[idx].0,
             color,
+            uv: corners[idx].1,
+            kind,
         });
     }
 }
 
-/// Emit a polyline as per-segment quads in screen space — the honest M1
-/// substitute for line primitives (which have no width control). Points
-/// are world-frame, `offset` is added in f64 before projection; segments
-/// whose either endpoint fails [`project`] are skipped.
+/// The backdrop starfield — `STAR_COUNT` points on a fixed hash-seeded
+/// sphere around the eye. Deterministic per index, so the sky is
+/// identical every frame with no stored table and no RNG state.
+fn emit_starfield(verts: &mut Vec<MapVertex>, cam: &MapCameraF64, vp: (f64, f64)) {
+    for i in 0..STAR_COUNT as u64 {
+        // Uniform direction on the sphere (z = 2u−1, φ = 2πv) plus two
+        // spare uniforms for size/brightness.
+        let u_dir = splitmix01(i.wrapping_mul(4) + 1);
+        let u_phi = splitmix01(i.wrapping_mul(4) + 2);
+        let u_size = splitmix01(i.wrapping_mul(4) + 3);
+        let u_tint = splitmix01(i.wrapping_mul(4) + 4);
+        let z = 2.0 * u_dir - 1.0;
+        let phi = 2.0 * std::f64::consts::PI * u_phi;
+        let s = f64::sqrt((1.0 - z * z).max(0.0));
+        let dir = DVec3::new(s * f64::cos(phi), s * f64::sin(phi), z);
+        let Some(ndc) = project(cam, cam.eye + dir * STAR_DISTANCE_M) else {
+            continue;
+        };
+        // Mostly warm-white; a cool tail keeps the field from reading
+        // as uniform noise.
+        let (r, g, b): (f32, f32, f32) = if u_tint < 0.12 {
+            (1.0, 0.8, 0.62)
+        } else if u_tint < 0.28 {
+            (0.68, 0.8, 1.0)
+        } else {
+            (0.9, 0.93, 1.0)
+        };
+        let alpha = (0.22 + 0.6 * u_tint) as f32;
+        let half_px = 1.6 + 2.4 * u_size;
+        emit_shape(
+            verts,
+            ndc,
+            half_px,
+            vp,
+            [r, g, b, alpha],
+            MapVertex::KIND_GLOW,
+        );
+    }
+}
+
+/// splitmix64's finalizer over a seed, rescaled to `[0,1)` — a
+/// stateless per-index hash so the starfield needs no table.
+fn splitmix01(seed: u64) -> f64 {
+    let mut x = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    (x >> 11) as f64 * (1.0 / 9.007_199_254_740_992e15)
+}
+
+/// Emit a polyline as per-segment quads in screen space — the honest
+/// substitute for line primitives (which have no width control) —
+/// with a small disc at every interior vertex so segment joints don't
+/// crack on tight curves. Points are world-frame, `offset` is added in
+/// f64 before projection; segments whose either endpoint fails
+/// [`project`] are skipped.
 fn emit_polyline(
     verts: &mut Vec<MapVertex>,
     points: &[DVec3],
@@ -1120,6 +1562,7 @@ fn emit_polyline(
     cam: &MapCameraF64,
     vp: (f64, f64),
     color: [f32; 4],
+    half_px: f64,
 ) {
     let mut prev: Option<[f32; 3]> = None;
     for p in points {
@@ -1131,7 +1574,7 @@ fn emit_polyline(
         prev = ndc;
         // Perpendicular in pixel space so the width is constant on screen.
         // Viewport-dimension guards clamp at 1.0 everywhere in this file
-        // (emit_quad, MapInput::apply, solve_camera) — they exist only to
+        // (emit_shape, MapInput::apply, solve_camera) — they exist only to
         // avoid div-by-zero on a zero-size viewport, so use the same bound.
         let fx = vp.0.max(1.0) / 2.0;
         let fy = vp.1.max(1.0) / 2.0;
@@ -1141,8 +1584,8 @@ fn emit_polyline(
         if len < 1e-9 {
             continue;
         }
-        let ox = (-dy / len * LINE_HALF_WIDTH_PX / fx) as f32;
-        let oy = (dx / len * LINE_HALF_WIDTH_PX / fy) as f32;
+        let ox = (-dy / len * half_px / fx) as f32;
+        let oy = (dx / len * half_px / fy) as f32;
         let quad = [
             [a[0] + ox, a[1] + oy, a[2]],
             [a[0] - ox, a[1] - oy, a[2]],
@@ -1153,8 +1596,16 @@ fn emit_polyline(
             verts.push(MapVertex {
                 pos: quad[idx],
                 color,
+                uv: [0.0, 0.0],
+                kind: MapVertex::KIND_SOLID,
             });
         }
+        // Round join — a disc of the line's half-width at the shared
+        // vertex covers the seam between per-segment quads.
+        emit_shape(verts, a, half_px, vp, color, MapVertex::KIND_DISC);
+    }
+    if let Some(last) = prev {
+        emit_shape(verts, last, half_px, vp, color, MapVertex::KIND_DISC);
     }
 }
 
@@ -1435,6 +1886,113 @@ mod tests {
         assert_eq!(input.mode, MapMode::Flight);
     }
 
+    /// Click-to-focus lands on the clicked body/vessel and recenters
+    /// pan — the "can't change ref" path that doesn't need the
+    /// focus-cycle key at all.
+    #[test]
+    fn focus_events_retarget_the_camera() {
+        let table = BodyTable::from_model(&test_system());
+        let mut input = MapInput::new(&table);
+        input.mode = MapMode::Map;
+        // A click on 'p' takes the focus there and clears pan.
+        input.pan_offset = DVec3::new(1.0, 2.0, 3.0);
+        let p = table.index_of(&BodyId::from("p")).unwrap();
+        input.apply(MapKeyEvent::FocusBody(p), &table, &MapSnapshot::default());
+        assert_eq!(input.focus, p);
+        assert_eq!(input.pan_offset, DVec3::ZERO);
+        assert_eq!(input.distance_m, default_distance(&table, p));
+        // A click on a vessel focuses the vessel-half of the cycle and
+        // anchors the id — a snapshot re-key can't retarget it.
+        let vid = VesselId(7);
+        let snap = MapSnapshot {
+            tick: SimTime::ZERO,
+            vessels: vec![(
+                vid,
+                OrbitState {
+                    parent: BodyId::from("p"),
+                    elements: circular_elements(6.75e5, 0.0),
+                    epoch: SimTime::ZERO,
+                },
+                None,
+            )],
+        };
+        input.apply(MapKeyEvent::FocusVessel(vid), &table, &snap);
+        assert_eq!(input.vessel_focus(&table), Some(0));
+        assert_eq!(input.focus_vessel, Some(vid));
+        // An id not in the snapshot does nothing — the click raced a
+        // despawn and must not retarget onto a different vessel.
+        input.apply(MapKeyEvent::FocusVessel(VesselId(99)), &table, &snap);
+        assert_eq!(input.focus_vessel, Some(vid));
+        // Out-of-range body clicks are ignored; clicks do nothing in
+        // flight mode.
+        input.apply(MapKeyEvent::FocusBody(usize::MAX), &table, &snap);
+        assert_eq!(input.focus_vessel, Some(vid));
+        input.mode = MapMode::Flight;
+        input.apply(MapKeyEvent::FocusBody(p), &table, &snap);
+        assert_eq!(input.focus_vessel, Some(vid));
+    }
+
+    /// Zoom-toward-cursor: the world point under the cursor stays
+    /// under the cursor — the look-at offset shifts toward it by
+    /// `1 − new/old` of its focus-plane offset.
+    #[test]
+    fn zoom_tracks_the_cursor_point() {
+        let table = BodyTable::from_model(&test_system());
+        let mut input = MapInput::new(&table);
+        input.mode = MapMode::Map;
+        input.viewport_px = (1000.0, 1000.0);
+        // yaw = pitch = 0 ⇒ camera basis is the identity: screen x is
+        // world +x, screen up is world +y.
+        input.yaw_rad = 0.0;
+        input.pitch_rad = 0.0;
+        input.distance_m = 1.0e10;
+        // Cursor at the right edge, vertically centered → the point
+        // under it sits at world offset (+half_w, 0, 0) on the
+        // focus plane.
+        input.cursor_px = Some((1000.0, 500.0));
+        input.apply(
+            MapKeyEvent::Zoom { factor: 0.5 },
+            &table,
+            &MapSnapshot::default(),
+        );
+        assert_eq!(input.distance_m, 5.0e9);
+        let half_w = 1.0e10 * f64::tan(MAP_FOV_Y * 0.5);
+        let expected = DVec3::new(half_w * 0.5, 0.0, 0.0);
+        let d = (input.pan_offset - expected).norm() / half_w;
+        assert!(d < 1e-9, "pan moved toward the cursor point: {d}");
+        // No cursor → the distance still zooms, pan stays put.
+        input.cursor_px = None;
+        input.apply(
+            MapKeyEvent::Zoom { factor: 0.5 },
+            &table,
+            &MapSnapshot::default(),
+        );
+        assert_eq!(input.distance_m, 2.5e9);
+        assert_eq!(input.pan_offset, expected);
+    }
+
+    /// The apsis geometry: a circular orbit's Pe/Ap are both `a` out
+    /// and antiparallel; an eccentric conic spans [a(1−e), a(1+e)];
+    /// a hyperbola has no Ap at ν = π.
+    #[test]
+    fn apsis_points_match_the_conic() {
+        let el = circular_elements(1.0e7, 0.0);
+        let pe = apsis_point(&el, 0.0).unwrap();
+        let ap = apsis_point(&el, std::f64::consts::PI).unwrap();
+        assert!((pe.norm() - 1.0e7).abs() < 1.0);
+        assert!((ap.norm() - 1.0e7).abs() < 1.0);
+        assert!(pe.dot(ap) < 0.0);
+        let mut ecc = circular_elements(1.0e7, 0.0);
+        ecc.eccentricity = 0.5;
+        assert!((apsis_point(&ecc, 0.0).unwrap().norm() - 5.0e6).abs() < 1.0);
+        assert!((apsis_point(&ecc, std::f64::consts::PI).unwrap().norm() - 1.5e7).abs() < 1.0);
+        let mut hyp = circular_elements(-2.0e6, 0.0); // a < 0
+        hyp.eccentricity = 1.5;
+        // p = |a(1−e²)| = 2.5e6; r_p = p/(1+e) = 1.0e6.
+        assert!((apsis_point(&hyp, 0.0).unwrap().norm() - 1.0e6).abs() < 1.0);
+        assert!(apsis_point(&hyp, std::f64::consts::PI).is_none());
+    }
+
     /// Zoom clamps at both ends; orbit clamps pitch.
     #[test]
     fn zoom_and_orbit_clamps() {
@@ -1522,16 +2080,19 @@ mod tests {
         let packet = view.take_map_packet().expect("map mode emits a packet");
         assert!(!packet.markers.vertices.is_empty());
         assert!(!packet.lines.vertices.is_empty());
+        assert!(!packet.bg.vertices.is_empty(), "the starfield draws");
         for v in packet
             .markers
             .vertices
             .iter()
             .chain(packet.lines.vertices.iter())
+            .chain(packet.bg.vertices.iter())
         {
             assert!(v.pos.iter().all(|c| c.is_finite()));
         }
-        // 3 bodies with markers + 1 vessel = 4 quads × 6 verts.
-        assert_eq!(packet.markers.vertices.len(), 4 * 6);
+        // 3 bodies × (glow + disc) + the focused star's ring + 1 vessel
+        // × (glow + disc) = 9 quads × 6 verts.
+        assert_eq!(packet.markers.vertices.len(), 9 * 6);
     }
 
     /// Pass-1: a physics-resident (InBubble) vessel is staged into

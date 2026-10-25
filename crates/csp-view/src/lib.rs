@@ -474,9 +474,11 @@ fn map_panels(
         &map_ui.focus_name,
         map_ui.camera_distance_m,
         &map_ui.labels,
+        map_ui.orbit_info.as_ref(),
         &session.keys,
         &session.key_labels,
     );
+
     let mut mcmd = None;
     csp_ui::maneuver_panel(
         ctx,
@@ -505,6 +507,112 @@ fn map_panels(
             vessel: csp_sim::VesselId(vessel),
         },
     });
+}
+
+/// The map's pointer-side camera intake — a second `UiBuild` system
+/// ordered after [`build_ui`] so egui's pointer state (this frame's
+/// `EguiPass.input`, processed inside the `run_ui` pass) is complete.
+/// A middle/right-drag becomes free `Pan`, a primary click inside
+/// [`map::PICK_RADIUS_PX`] of a projected marker becomes
+/// click-to-focus, and the live cursor lands on
+/// [`map::MapInput::cursor_px`] so scroll-zoom aims at the point under
+/// it — all queued for the next `Input` pass (§2.5's one-frame
+/// UiBuild → Input hand-off, same as the outbox).
+///
+/// `egui_wants_pointer_input` gates every action: clicks and drags on
+/// panels or the top bar are egui's business, never camera moves. It
+/// deliberately stays `false` for a drag that began on the open map
+/// and crosses a panel — matching the winit orbit-drag's
+/// never-cancelled-by-panels rule (a swallowed release must not leave
+/// the camera moving).
+///
+/// `egui_wants_pointer_input` alone can't gate a pan drag, though: its
+/// over-egui clause is dead while any button is held, and no egui
+/// widget claims a secondary/middle drag, so it reads `false` for the
+/// whole drag even when the press landed on a panel. `drag_over_ui`
+/// latches the press frame's own verdict — `is_pointer_over_egui` for
+/// where the press fell, `egui_is_using_pointer` for a press landing
+/// mid-widget-interaction — and gates the drag until every pan button
+/// is released.
+fn map_pointer_input(
+    egui: Res<EguiPass>,
+    map_ui: Res<map::MapUiData>,
+    mut map_cam: ResMut<map::MapInput>,
+    mut map_events: ResMut<map::MapInputEvents>,
+    mut drag_over_ui: Local<bool>,
+) {
+    if map_ui.mode != map::MapMode::Map {
+        map_cam.cursor_px = None;
+        *drag_over_ui = false;
+        return;
+    }
+    let ctx = &egui.ctx;
+    let ppp = f64::from(ctx.pixels_per_point());
+    let over_ui = ctx.egui_wants_pointer_input();
+    let (cursor, pan_delta, clicked, pan_pressed, pan_held) = ctx.input(|i| {
+        (
+            i.pointer.latest_pos(),
+            (i.pointer.button_down(egui::PointerButton::Middle)
+                || i.pointer.button_down(egui::PointerButton::Secondary))
+            .then(|| i.pointer.delta()),
+            i.pointer
+                .primary_clicked()
+                .then(|| i.pointer.interact_pos())
+                .flatten(),
+            i.pointer.button_pressed(egui::PointerButton::Middle)
+                || i.pointer.button_pressed(egui::PointerButton::Secondary),
+            i.pointer.button_down(egui::PointerButton::Middle)
+                || i.pointer.button_down(egui::PointerButton::Secondary),
+        )
+    });
+    // `|=` keeps a still-held earlier press's verdict when a second
+    // pan button joins; the latch clears once no pan button is down.
+    if pan_pressed {
+        *drag_over_ui |= ctx.is_pointer_over_egui() || ctx.egui_is_using_pointer();
+    }
+    if !pan_held {
+        *drag_over_ui = false;
+    }
+    // Physical px — the space `viewport_px`/`cursor_px` speak (egui
+    // positions are in points; `ppp` converts).
+    map_cam.cursor_px = cursor.map(|p| (f64::from(p.x) * ppp, f64::from(p.y) * ppp));
+    if over_ui {
+        return;
+    }
+    if let Some(d) = pan_delta
+        && (d.x != 0.0 || d.y != 0.0)
+        && !*drag_over_ui
+    {
+        // Grab-the-map feel: the content follows the cursor, so the
+        // look-at point moves opposite the drag delta.
+        map_events.pending.push(map::MapKeyEvent::Pan {
+            dx_px: -f64::from(d.x) * ppp,
+            dy_px: -f64::from(d.y) * ppp,
+        });
+    }
+    if let Some(pos) = clicked {
+        let (w, h) = map_cam.viewport_px;
+        let px = (f64::from(pos.x) * ppp, f64::from(pos.y) * ppp);
+        // Nearest projected marker inside the pick radius wins —
+        // picks were recorded in `map_present` alongside the labels,
+        // so a hit targets exactly what the player saw drawn.
+        let hit = map_ui
+            .picks
+            .iter()
+            .filter_map(|pk| {
+                let sx = (f64::from(pk.ndc[0]) * 0.5 + 0.5) * w;
+                let sy = (0.5 - f64::from(pk.ndc[1]) * 0.5) * h;
+                let d = (sx - px.0).hypot(sy - px.1);
+                (d <= map::PICK_RADIUS_PX).then_some((d, pk.target))
+            })
+            .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some((_, target)) = hit {
+            map_events.pending.push(match target {
+                map::MapFocusTarget::Body(i) => map::MapKeyEvent::FocusBody(i),
+                map::MapFocusTarget::Vessel(id) => map::MapKeyEvent::FocusVessel(id),
+            });
+        }
+    }
 }
 
 /// M10's always-on session panels — the settings window (when open;
@@ -943,7 +1051,7 @@ impl View {
         render_extract.add_systems((map::extract_map, vab::extract_vab, flight::extract_flight));
 
         let mut ui_build = Schedule::default();
-        ui_build.add_systems(build_ui);
+        ui_build.add_systems((build_ui, map_pointer_input.after(build_ui)));
 
         Self {
             sim,

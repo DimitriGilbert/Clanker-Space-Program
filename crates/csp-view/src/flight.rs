@@ -1813,6 +1813,7 @@ mod tests {
             pitch_rad: 0.0,
             distance_m: 0.0,
             viewport_px: (1.0, 1.0),
+            cursor_px: None,
         });
         world.insert_resource(snap);
         world.insert_resource(FlightCameraF64(cam));

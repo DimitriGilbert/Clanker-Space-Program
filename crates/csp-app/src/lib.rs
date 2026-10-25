@@ -2010,7 +2010,10 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => f64::from(y) * ZOOM_LN_PER_LINE,
                     MouseScrollDelta::PixelDelta(p) => p.y * ZOOM_LN_PER_PX,
                 };
-                let factor = f64::exp(lines);
+                // factor multiplies camera distance; scroll-UP (lines > 0)
+                // is zoom-IN in every camera convention, so the factor
+                // must be < 1 there — exp(−lines), not exp(lines).
+                let factor = f64::exp(-lines);
                 match self.view.mode() {
                     ViewMode::Map => self.view.map_event(MapKeyEvent::Zoom { factor }),
                     ViewMode::Vab => self.view.vab_event(VabEvent::Zoom { factor }),

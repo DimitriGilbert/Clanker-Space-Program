@@ -175,6 +175,21 @@ pub struct PropellantGauge {
     pub capacity: f64,
 }
 
+/// What a map label names — drives the overlay's styling (apsis marks
+/// draw smaller and dimmer than object names) and the de-overlap
+/// pass's priority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapLabelKind {
+    /// A celestial body's name.
+    Body,
+    /// A vessel's name.
+    Vessel,
+    /// A maneuver node's status line.
+    Node,
+    /// An apsis mark (Ap/Pe) on the focused orbit.
+    Apsis,
+}
+
 /// One map-view label — a clip-space anchor + text, produced by
 /// `csp-view`'s `map_present` system (M1-D). Plain data; `map_overlay`
 /// converts the NDC anchor into screen coordinates.
@@ -182,28 +197,56 @@ pub struct PropellantGauge {
 pub struct MapLabel {
     /// Clip-space anchor: x/y in `[-1,1]` (wgpu NDC, y up), z = depth.
     pub ndc: [f32; 3],
-    /// Label text (body id / vessel id at M1).
+    /// Label text (body id / vessel id / apsis mark).
     pub text: String,
     /// Linear RGBA.
     pub color: [f32; 4],
+    /// What this label names — styling + de-overlap priority.
+    pub kind: MapLabelKind,
 }
 
-/// The M1 map-view overlay (§5.1 R0): a non-interactive `Background`
-/// layer painting name labels at projected body/vessel positions plus a
-/// hint bar — the egui half of the map; the wgpu half (orbit lines,
-/// markers) is `csp_render::map`. Called by `csp-view`'s `UiBuild`
-/// system only while `MapMode::Map` is active.
+/// The focused orbit's readout for the map's info panel — plain data
+/// built by `csp-view` (`csp-ui` never sees sim types). Radii are
+/// parent-centred; `parent_radius_m` turns them into surface altitudes
+/// when the body table carries the parent's radius.
+#[derive(Clone, Debug)]
+pub struct MapOrbitInfo {
+    /// Subject name ("terrin", "vessel 3").
+    pub name: String,
+    /// Central body these numbers are relative to.
+    pub parent_name: String,
+    /// Apoapsis radius from the parent's center (m) — `None` on an
+    /// open conic (hyperbolic/parabolic, no apoapsis exists).
+    pub apo_r_m: Option<f64>,
+    /// Periapsis radius from the parent's center (m).
+    pub pe_r_m: f64,
+    /// The parent's surface radius, when the model carries it —
+    /// `Some` ⇒ the panel prints altitudes, `None` ⇒ radii.
+    pub parent_radius_m: Option<f64>,
+    /// Orbital period (s) — `None` on an open conic.
+    pub period_s: Option<f64>,
+}
+
+/// The map-view overlay (§5.1): a `Background` layer painting name
+/// labels at projected body/vessel/apsis positions, the focused
+/// orbit's readout panel, and a hint bar — the egui half of the map;
+/// the wgpu half (orbit lines, markers, starfield) is
+/// `csp_render::map`. Called by `csp-view`'s `UiBuild` system only
+/// while `MapMode::Map` is active.
 ///
 /// NDC → screen: `x_px = (ndc.x + 1)/2 · w`, `y_px = (1 − ndc.y)/2 · h`
-/// — anchors off-screen (|x|,|y| > 1.2) or behind the far field are
-/// skipped. `keys` is the *live* (applied) keymap — the hint bar
-/// prints bindings, not hardcoded names, so a rebind never leaves the
-/// overlay lying about which key does what.
+/// — anchors off-screen (|x|,|y| > 1.2) are skipped. Labels that would
+/// land on an already-painted label nudge down until clear (or drop
+/// after a few tries). `keys` is the *live* (applied) keymap — the
+/// hint bar prints bindings, not hardcoded names, so a rebind never
+/// leaves the overlay lying about which key does what.
+#[allow(clippy::too_many_arguments)] // one overlay = one data bag
 pub fn map_overlay(
     ctx: &egui::Context,
     focus_name: &str,
     camera_distance_m: f64,
     labels: &[MapLabel],
+    orbit: Option<&MapOrbitInfo>,
     keys: &settings::Keymap,
     key_labels: &std::collections::BTreeMap<String, String>,
 ) {
@@ -214,29 +257,58 @@ pub fn map_overlay(
         .fixed_pos(egui::pos2(0.0, 0.0))
         .show(ctx, |ui| {
             let painter = ui.painter();
+            let shadow = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 170);
+            let mut placed: Vec<egui::Rect> = Vec::with_capacity(labels.len());
             for label in labels {
                 let [nx, ny, _z] = label.ndc;
                 if nx.abs() > 1.2 || ny.abs() > 1.2 {
                     continue;
                 }
-                let pos = egui::pos2(
+                let anchor = egui::pos2(
                     rect.left() + (nx * 0.5 + 0.5) * rect.width(),
                     rect.top() + (0.5 - ny * 0.5) * rect.height(),
                 );
-                let c = egui::Color32::from_rgba_unmultiplied(
-                    (label.color[0] * 255.0) as u8,
-                    (label.color[1] * 255.0) as u8,
-                    (label.color[2] * 255.0) as u8,
-                    (label.color[3] * 255.0) as u8,
-                );
-                painter.text(
-                    pos + egui::vec2(7.0, -7.0),
-                    egui::Align2::LEFT_BOTTOM,
-                    &label.text,
-                    egui::FontId::proportional(12.0),
-                    c,
-                );
+                paint_map_label(painter, anchor, label, shadow, &mut placed);
             }
+
+            // The focused orbit's readout — top-right, out of the
+            // hint bar's way. Radii print as surface altitudes when the
+            // parent radius is known, else raw radii (star-center
+            // orbits have no "surface" to subtract).
+            if let Some(o) = orbit {
+                let alt = |r: f64| o.parent_radius_m.map_or(r, |rad| r - rad);
+                let lines = [
+                    (format!("{}  orbiting  {}", o.name, o.parent_name), 190),
+                    (
+                        match o.apo_r_m {
+                            Some(r) => format!("Ap   {}", fmt_distance(alt(r))),
+                            None => "Ap   — escape".to_string(),
+                        },
+                        170,
+                    ),
+                    (format!("Pe   {}", fmt_distance(alt(o.pe_r_m))), 170),
+                    (
+                        match o.period_s {
+                            Some(t) => format!("T    {}", fmt_period(t)),
+                            None => "T    —".to_string(),
+                        },
+                        150,
+                    ),
+                ];
+                let mono = egui::FontId::monospace(12.0);
+                let mut y = rect.top() + 34.0;
+                for (line, gray) in lines {
+                    painter.text(
+                        egui::pos2(rect.right() - 12.0, y),
+                        egui::Align2::RIGHT_TOP,
+                        &line,
+                        mono.clone(),
+                        egui::Color32::from_gray(gray),
+                    );
+                    y += 15.0;
+                }
+            }
+
             let pan = |a: settings::KeyAction| {
                 keys.first_binding_label(a, key_labels)
                     .unwrap_or_else(|| "—".to_string())
@@ -246,8 +318,9 @@ pub fn map_overlay(
                 egui::Align2::LEFT_BOTTOM,
                 format!(
                     "MAP  ·  focus: {focus_name}  ·  camera {camera_distance_m:.3e} m  \
-                     —  [{}] flight  [{}] focus  drag: orbit  wheel: zoom  \
-                     [{}/{}/{}/{}] pan",
+                     —  [{}] flight  [{}] focus  ·  click a marker to focus  \
+                     ·  drag: orbit  ·  RMB/MMB drag: pan  ·  wheel: zoom to cursor  \
+                     ·  [{}/{}/{}/{}] pan",
                     keys.hint_labeled(settings::KeyAction::ToggleMap, key_labels),
                     keys.hint_labeled(settings::KeyAction::CycleFocus, key_labels),
                     pan(settings::KeyAction::PanUp),
@@ -259,6 +332,50 @@ pub fn map_overlay(
                 egui::Color32::from_gray(180),
             );
         });
+}
+
+/// One map label: font by kind, `label.color` baked into the galley,
+/// then a dark offset copy under the text — a real shadow, which needs
+/// [`egui::Painter::galley_with_override_text_color`]. `galley`'s own
+/// color arg is only a fallback for `PLACEHOLDER` pixels and
+/// `layout_no_wrap` already colored every glyph, so plain `galley`
+/// would repaint in the label's own color (a smear, not a shadow).
+/// Extracted from [`map_overlay`] under the line budget — de-overlap
+/// nudges the label down past anything already drawn (markers cluster
+/// when the camera zooms out) and quietly drops one that can't fit
+/// rather than stacking into an unreadable pile.
+fn paint_map_label(
+    painter: &egui::Painter,
+    anchor: egui::Pos2,
+    label: &MapLabel,
+    shadow: egui::Color32,
+    placed: &mut Vec<egui::Rect>,
+) {
+    let (font, lift) = match label.kind {
+        MapLabelKind::Apsis => (egui::FontId::proportional(10.5), 5.0),
+        _ => (egui::FontId::proportional(12.0), 8.0),
+    };
+    let c = egui::Color32::from_rgba_unmultiplied(
+        (label.color[0] * 255.0) as u8,
+        (label.color[1] * 255.0) as u8,
+        (label.color[2] * 255.0) as u8,
+        (label.color[3] * 255.0) as u8,
+    );
+    let galley = painter.layout_no_wrap(label.text.clone(), font, c);
+    let mut pos = anchor + egui::vec2(8.0, -lift);
+    let mut rect_at = egui::Rect::from_min_size(pos, galley.size());
+    let mut tries = 0;
+    while placed.iter().any(|r| r.intersects(rect_at)) && tries < 8 {
+        pos.y += galley.size().y + 2.0;
+        rect_at = egui::Rect::from_min_size(pos, galley.size());
+        tries += 1;
+    }
+    if tries >= 8 {
+        return;
+    }
+    placed.push(rect_at);
+    painter.galley_with_override_text_color(pos + egui::vec2(1.2, 1.2), galley.clone(), shadow);
+    painter.galley(pos, galley, c);
 }
 
 /// Mirrors for the M4c flight HUD — populated by `csp-view`'s
@@ -337,6 +454,36 @@ fn fmt_alt(m: f64) -> String {
         format!("{:>7.1} m", m)
     } else {
         format!("{:>7.1} km", m / 1e3)
+    }
+}
+
+/// SI distance formatting for map readouts — the same m→km switch as
+/// the flight column but unpadded and extended to Gm for
+/// interplanetary ranges.
+pub fn fmt_distance(m: f64) -> String {
+    let a = m.abs();
+    if a < 10_000.0 {
+        format!("{m:.0} m")
+    } else if a < 1.0e9 {
+        format!("{:.1} km", m / 1e3)
+    } else {
+        format!("{:.2} Gm", m / 1e9)
+    }
+}
+
+/// Orbital-period formatting: seconds under a kilosecond, then
+/// minutes/hours/days so a year-long transfer doesn't print
+/// "31000000 s".
+pub fn fmt_period(s: f64) -> String {
+    let a = s.abs();
+    if a < 1000.0 {
+        format!("{s:.0} s")
+    } else if a < 100_000.0 {
+        format!("{:.1} min", s / 60.0)
+    } else if a < 10_000_000.0 {
+        format!("{:.1} h", s / 3600.0)
+    } else {
+        format!("{:.1} d", s / 86_400.0)
     }
 }
 
@@ -587,7 +734,9 @@ pub fn help_panel(
             egui::Grid::new("help_mouse").num_columns(2).show(ui, |ui| {
                 for (act, desc) in [
                     ("drag", "orbit camera"),
-                    ("wheel", "zoom"),
+                    ("wheel", "zoom (to cursor in map)"),
+                    ("RMB / MMB drag", "pan (map)"),
+                    ("click (map)", "focus body / vessel"),
                     ("click (VAB)", "select part"),
                 ] {
                     ui.label(egui::RichText::new(act).monospace());
