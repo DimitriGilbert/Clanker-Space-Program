@@ -465,6 +465,106 @@ fn emit_lathe_smooth(axis: [f64; 2], profile: &[(f64, f64)], out: &mut Vec<Smoot
     }
 }
 
+/// `true` for a lathe profile ending in a top apex — the cone/ogive
+/// class the nose-cone model claims (a flat-topped cylinder reads as
+/// an adapter instead).
+pub fn is_pointed(shape: &PartShape) -> bool {
+    matches!(shape, PartShape::Lathe { profile, .. } if tip_at_top(profile))
+}
+
+/// One triangle of a baked real model ([`crate::art::PartModel`]) —
+/// per-corner positions, per-corner unit normals, and per-corner
+/// authored albedo (linear RGBA, baked from the source materials).
+#[derive(Clone, Copy, Debug)]
+pub struct ModelTri {
+    /// Corner a, part-local.
+    pub a: DVec3,
+    /// Corner b, part-local.
+    pub b: DVec3,
+    /// Corner c, part-local.
+    pub c: DVec3,
+    /// Unit outward normal at `a`, part-local.
+    pub na: DVec3,
+    /// Normal at `b`.
+    pub nb: DVec3,
+    /// Normal at `c`.
+    pub nc: DVec3,
+    /// Albedo at `a` (linear RGBA).
+    pub ca: [f32; 4],
+    /// Albedo at `b`.
+    pub cb: [f32; 4],
+    /// Albedo at `c`.
+    pub cc: [f32; 4],
+}
+
+/// Emit `model`'s triangles fitted into the part-local box `[lo, hi]`
+/// (the resolved collider's AABB — `PartShape::local_aabb`). Per-axis
+/// affine fit keeps the model inside its collider exactly; normals go
+/// through the inverse-transpose so a non-uniform stretch still
+/// shades correctly.
+pub fn emit_model(model: &crate::art::PartModel, lo: DVec3, hi: DVec3, out: &mut Vec<ModelTri>) {
+    let span_t = hi - lo;
+    let span_m = model.hi - model.lo;
+    let s = DVec3::new(
+        if span_m.x > 1e-9 {
+            span_t.x / span_m.x
+        } else {
+            1.0
+        },
+        if span_m.y > 1e-9 {
+            span_t.y / span_m.y
+        } else {
+            1.0
+        },
+        if span_m.z > 1e-9 {
+            span_t.z / span_m.z
+        } else {
+            1.0
+        },
+    );
+    let fit = |p: [f32; 3]| -> DVec3 {
+        DVec3::new(
+            lo.x + (f64::from(p[0]) - model.lo.x) * s.x,
+            lo.y + (f64::from(p[1]) - model.lo.y) * s.y,
+            lo.z + (f64::from(p[2]) - model.lo.z) * s.z,
+        )
+    };
+    let nrm = |n: [f32; 3]| -> DVec3 {
+        let v = DVec3::new(
+            f64::from(n[0]) / s.x,
+            f64::from(n[1]) / s.y,
+            f64::from(n[2]) / s.z,
+        );
+        let l = v.norm();
+        if l > 1e-12 { v / l } else { DVec3::Z }
+    };
+    for tri in model.indices.chunks_exact(3) {
+        let (Some(a), Some(b), Some(c)) = (
+            model.verts.get(tri[0] as usize).copied(),
+            model.verts.get(tri[1] as usize).copied(),
+            model.verts.get(tri[2] as usize).copied(),
+        ) else {
+            continue;
+        };
+        let (pa, pb, pc) = (fit(a.pos), fit(b.pos), fit(c.pos));
+        let e = (pb - pa).cross(pc - pa);
+        if e.norm_squared() <= 1e-30 {
+            continue; // degenerate after the fit — drop, never corrupt
+        }
+        out.push(ModelTri {
+            a: pa,
+            b: pb,
+            c: pc,
+            na: nrm(a.nrm),
+            nb: nrm(b.nrm),
+            nc: nrm(c.nrm),
+            ca: a.col,
+            cb: b.col,
+            cc: c.col,
+        });
+    }
+}
+
 /// `shape` offset outward by `margin` — the hull shell the reentry
 /// sheath emits. Box faces push out along their axes; lathe rings
 /// fatten by the margin and the two end stations extend along the

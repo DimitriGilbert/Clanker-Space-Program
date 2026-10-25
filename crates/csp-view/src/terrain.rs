@@ -66,6 +66,9 @@ pub struct TerrainConfig {
     pub bodies: BTreeMap<String, TerrainBody>,
     /// LOD selection tunables.
     pub lod: rt::LodConfig,
+    /// The real-art texture set (decoded `data/art/terrain.csar`) —
+    /// `None` keeps the procedural fallback shading.
+    pub art: Option<Arc<rt::TerrainArt>>,
 }
 
 /// Deterministic seed for a body with no authored `TerrainDef` — a
@@ -117,6 +120,7 @@ pub fn config_from_bodies(bodies: &[csp_data::LoadedBody]) -> TerrainConfig {
     TerrainConfig {
         bodies: map,
         lod: rt::LodConfig::default(),
+        art: None,
     }
 }
 
@@ -409,6 +413,7 @@ pub(crate) fn build_packet(
     env: &FlightEnv,
     cam: &MapCameraF64,
     viewport_px: (f64, f64),
+    time_s: f64,
 ) -> rt::TerrainPacket {
     let body_id = env.body.as_ref().map_or("", |b| b.as_str());
     let body = cfg
@@ -519,6 +524,14 @@ pub(crate) fn build_packet(
             ],
             biome_colors: body.biome.as_ref().map_or([[0.0; 4]; 16], |b| b.colors),
             shadow,
+            // x: real-texture flag; y: the sim-clock seconds the wave
+            // scroll reads (deterministic — tick-derived, never wall).
+            art: [
+                if cfg.art.is_some() { 1.0 } else { 0.0 },
+                time_s as f32,
+                0.0,
+                0.0,
+            ],
         },
         heightfield: Some(field),
         biome: body.biome,
@@ -526,6 +539,7 @@ pub(crate) fn build_packet(
         terrain,
         ocean,
         sky: true,
+        art: cfg.art.clone(),
     }
 }
 

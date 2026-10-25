@@ -26,6 +26,8 @@ csp-render = { workspace = true }
 csp-phys = { workspace = true }
 egui = { workspace = true }
 bevy_ecs = { workspace = true, features = ["std"] }
+# .csar art-pack decode (data/art/) — real models + textures.
+miniz_oxide = { workspace = true }
 # Degradation logging for the map extract path (a skipped orbit line is
 # a presentation fallback, §2.13's honest-channel class — warned, never
 # halted). No-op without a logger; wasm-safe.

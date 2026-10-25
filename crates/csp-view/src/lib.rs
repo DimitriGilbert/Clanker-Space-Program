@@ -32,11 +32,16 @@ pub mod terrain;
 /// view's scene/camera/packet, and the GPU-pick event plumbing.
 pub mod vab;
 
-/// The M4c kitbash tier (PLAN §3.7 "silhouette-correct kitbashed
-/// parts"): per-part procedural meshes — the collider-profile lathe
-/// and the engine/pod overrides — shared by the VAB and flight packet
-/// producers.
+/// Per-part meshes for the VAB and flight packet producers: the real
+/// baked models (`art`) emitted through [`part_mesh::emit_model`],
+/// with the collider-profile procedural silhouettes as the
+/// art-less fallback and the basis for selection shells.
 pub mod part_mesh;
+
+/// Real art assets — the `.csar` packs baked from CC0 sources
+/// (`assets/ASSETS.md`), decoded once at startup into the
+/// [`art::ArtAssets`] resource (part meshes + surface textures).
+pub mod art;
 
 /// The §6.3 web-demo tier: the embedded reduced `data/` set and the
 /// fixed demo-scenario seed (Terrin only, ≤60 parts, no save
@@ -929,8 +934,11 @@ impl View {
         view.with_vab_session(|v| v.set_loc(loc));
         // R2: the authored terrain table (noise seeds, ocean datums,
         // decoded biome palettes) — installed over the empty default.
-        view.world
-            .insert_resource(terrain::config_from_bodies(&sys.bodies));
+        let art = art::load();
+        let mut tc = terrain::config_from_bodies(&sys.bodies);
+        tc.art = art.0.terrain.clone();
+        view.world.insert_resource(tc);
+        view.world.insert_resource(art);
         Ok(view)
     }
 
@@ -1053,6 +1061,7 @@ impl View {
         // installs the authored table over it.
         world.insert_resource(terrain::TerrainConfig::default());
         world.insert_resource(terrain::TerrainCache::default());
+        world.insert_resource(art::ArtAssets::default());
         // §3.7 visual-SFX channel (flight.rs carries the audio deferral).
         world.insert_resource(flight::FlightSfx::default());
 
@@ -1208,8 +1217,9 @@ impl View {
         // §2.6.4 latched vessels reuse `LatchedWeldCache` instead of
         // re-welding per frame.
         let staged_flight = {
+            let art = self.world.resource::<art::ArtAssets>().clone();
             let mut cache = self.world.resource_mut::<flight::LatchedWeldCache>();
-            flight::capture_sync_input(&self.sim, &mut cache)
+            flight::capture_sync_input(&self.sim, &mut cache, &art)
         };
         self.world.insert_resource(staged_flight);
         // The focus pin's sim-side release rule: a pinned vessel gone

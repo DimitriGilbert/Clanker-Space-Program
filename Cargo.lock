@@ -1133,6 +1133,7 @@ dependencies = [
  "csp-ui",
  "egui",
  "log",
+ "miniz_oxide 0.9.1",
  "pollster",
  "ron",
  "wgpu",
@@ -2094,6 +2095,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -4997,6 +5000,8 @@ name = "xtask"
 version = "0.0.0"
 dependencies = [
  "csp-bench",
+ "image",
+ "miniz_oxide 0.9.1",
  "ron",
  "serde",
  "serde_json",

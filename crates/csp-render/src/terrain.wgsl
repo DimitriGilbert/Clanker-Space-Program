@@ -24,12 +24,23 @@ struct U {
     rayleigh: vec4<f32>,      // Rayleigh β rgb (1/m)
     biome_colors: array<vec4<f32>, 16>,
     shadow: vec4<f32>,        // xyz vessel-shadow anchor dir (inertial, unit), w blob radius (m, 0 = off)
+    art: vec4<f32>,           // x real-texture flag (0 = procedural fallback), y clock s, z/w unused
 };
 
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var heightmap: texture_2d<f32>;   // R32Float equirect
 @group(0) @binding(2) var tlut: texture_2d<f32>;        // RGBA32Float T(h, μ)
 @group(0) @binding(3) var biomemap: texture_2d<u32>;    // R8Uint slots
+// Real art (data/art/terrain.csar, CC0 ambientCG + Poly Haven — see
+// assets/ASSETS.md): class albedo/normal arrays keyed
+// [0 grass, 1 rock, 2 sand, 3 snow], the ocean wave normal map, and the
+// equirect star map. All 1×1 placeholders when the packet carries no
+// art (u.art.x == 0 keeps them unread).
+@group(0) @binding(4) var alb_arr: texture_2d_array<f32>;
+@group(0) @binding(5) var nrm_arr: texture_2d_array<f32>;
+@group(0) @binding(6) var water_nrm: texture_2d<f32>;
+@group(0) @binding(7) var stars_tex: texture_2d<f32>;
+@group(0) @binding(8) var samp: sampler;
 
 const PI: f32 = 3.141592653589793;
 
@@ -405,6 +416,92 @@ fn ramp_albedo(dir: vec3<f32>, h: f32, slope: f32, dither: f32) -> vec3<f32> {
     return c;
 }
 
+// --- real texture detail -------------------------------------------------
+// Planar UV on the dominant axes of the body-fixed direction: two
+// projections (strongest + runner-up |component| planes) blended by
+// |axis|^4 — cheap triplanar that stays coherent across quadtree patch
+// borders (uv derives from body-fixed coordinates, not patch-local
+// ones) and never pinches like an equirect would at the poles.
+struct PlaneUV {
+    a: vec2<f32>,
+    b: vec2<f32>,
+    wb: f32,
+};
+
+fn dom_uvs(d: vec3<f32>) -> PlaneUV {
+    let a = abs(d);
+    var uva: vec2<f32>;
+    var uvb: vec2<f32>;
+    var wa: f32;
+    var wb: f32;
+    if (a.z >= a.x && a.z >= a.y) {
+        uva = d.xy; wa = a.z;
+        if (a.x >= a.y) { uvb = d.yz; wb = a.x; } else { uvb = d.xz; wb = a.y; }
+    } else if (a.y >= a.x) {
+        uva = d.xz; wa = a.y;
+        if (a.x >= a.z) { uvb = d.yz; wb = a.x; } else { uvb = d.xy; wb = a.z; }
+    } else {
+        uva = d.yz; wa = a.x;
+        if (a.y >= a.z) { uvb = d.xz; wb = a.y; } else { uvb = d.xy; wb = a.z; }
+    }
+    let wa4 = wa * wa * wa * wa;
+    let wb4 = wb * wb * wb * wb;
+    var o: PlaneUV;
+    o.a = uva; o.b = uvb;
+    o.wb = wb4 / max(wa4 + wb4, 1.0e-9);
+    return o;
+}
+
+// Per-class tile edge length (m) — grass is fine-grained, rock coarse.
+fn class_tile(layer: i32) -> f32 {
+    if (layer == 0) { return 9.0; }   // grass
+    if (layer == 1) { return 22.0; }  // rock
+    if (layer == 2) { return 12.0; }  // sand
+    return 16.0;                      // snow
+}
+
+// One class's normalized albedo detail: texel ÷ layer mean (the
+// deepest mip IS the mean — the detail pattern survives while the
+// authored palette keeps the hue), blended across the two dominant
+// projection planes.
+fn class_albedo(p: PlaneUV, layer: i32) -> vec3<f32> {
+    let k = u.planet.x / class_tile(layer);
+    let ta = textureSample(alb_arr, samp, p.a * k, layer).rgb;
+    let tb = textureSample(alb_arr, samp, p.b * k, layer).rgb;
+    let last = i32(textureNumLevels(alb_arr)) - 1;
+    let mean = textureLoad(alb_arr, vec2<i32>(0, 0), layer, last).rgb;
+    return mix(ta, tb, p.wb) / max(mean, vec3<f32>(0.05, 0.05, 0.05));
+}
+
+// Matching normal-map sample for `layer` — tangent-space xy slope.
+fn class_normal(p: PlaneUV, layer: i32) -> vec2<f32> {
+    let k = u.planet.x / class_tile(layer);
+    let na = textureSample(nrm_arr, samp, p.a * k, layer).xy * 2.0 - 1.0;
+    let nb = textureSample(nrm_arr, samp, p.b * k, layer).xy * 2.0 - 1.0;
+    return mix(na, nb, p.wb);
+}
+
+// Surface-class weights (grass, rock, sand, snow) from height/slope/
+// latitude — the same decisions ramp_albedo makes, re-expressed as
+// blend weights so neighbouring bands share texture detail instead of
+// hard-switching at a threshold.
+fn class_weights(h: f32, slope: f32, lat_abs: f32, dither: f32) -> vec4<f32> {
+    let hd = h + dither * 0.02;
+    // order: x grass, y rock, z sand, w snow — the array layer order
+    let snowline = 0.58 - lat_abs * 0.28;
+    let snow = smoothstep(snowline, snowline + 0.10, hd)
+             * (1.0 - smoothstep(0.22, 0.48, slope));
+    let rock = max(smoothstep(0.14, 0.34, slope + dither * 0.10),
+                   smoothstep(0.45, 0.62, hd) * 0.7);
+    let sand = (1.0 - smoothstep(-0.01, 0.05, hd)) * 0.9;
+    let grass = smoothstep(-0.45, -0.02, hd);
+    var w = vec4<f32>(grass, rock, sand, snow);
+    w = max(w, vec4<f32>(0.0));
+    let s = w.x + w.y + w.z + w.w;
+    if (s < 1.0e-4) { return vec4<f32>(1.0, 0.0, 0.0, 0.0); }
+    return w / s;
+}
+
 fn biome_albedo(dir: vec3<f32>, h: f32, slope: f32, dither: f32) -> vec3<f32> {
     var base = ramp_albedo(dir, h, slope, dither);
     if (u.atmo.y > 0.5) {
@@ -472,6 +569,22 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
         wg = wg * (0.4 + 0.6 * det_fade)
            + ngrad(dir_fix, basis.e, basis.n, 48000.0) * (0.9 * 48000.0 / u.planet.x)
              * wf_near;
+        if (u.art.x > 0.5) {
+            // Real wave normal map (Foam 002, ambientCG CC0) at two
+            // scrolled scales — chop + swell — over the noise swell.
+            // Scroll rides the sim-tick clock, so it stays deterministic.
+            let p = dom_uvs(dir_fix);
+            let t = u.art.y;
+            let w1 = textureSample(water_nrm, samp, p.a * (u.planet.x / 37.0)
+                        + vec2<f32>(t * 0.011, t * 0.007)).xy * 2.0 - 1.0;
+            let w2 = textureSample(water_nrm, samp, p.a * (u.planet.x / 11.0)
+                        + vec2<f32>(-t * 0.019, t * 0.013)).xy * 2.0 - 1.0;
+            let w3 = textureSample(water_nrm, samp, p.b * (u.planet.x / 37.0)
+                        + vec2<f32>(t * 0.011, t * 0.007)).xy * 2.0 - 1.0;
+            let w12 = mix(w1, w3, p.wb);
+            wg = wg * 0.5 + w12 * 0.85
+               + w2 * 0.45 * max(wf_near * 2.0 + 0.3, 0.0);
+        }
         let n_fix = normalize(dir_fix - basis.e * wg.x - basis.n * wg.y);
         let n = rot_axis(u.spin.xyz, u.spin.w, n_fix);
 
@@ -519,8 +632,7 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
     } else {
         // --- terrain --------------------------------------------------
         let n_macro = terrain_normal_fix(dir_fix, basis);
-        let n_fix = bump_fix(dir_fix, n_macro, basis, dist);
-        let n = rot_axis(u.spin.xyz, u.spin.w, n_fix);
+        var n_fix = bump_fix(dir_fix, n_macro, basis, dist);
         let slope = 1.0 - clamp(dot(n_fix, dir_fix), 0.0, 1.0);
         // Albedo grain — the same near-field banding as the bump:
         // large patches mottle, close-ups get per-metre speckle.
@@ -529,6 +641,30 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
                    + vnoise3(dir_fix * 5300.0) * 0.3
                    + vnoise3(dir_fix * 46000.0) * 0.2 * max(f_near, 0.15);
         var alb = biome_albedo(dir_fix, i.h_norm, slope, mottle);
+        if (u.art.x > 0.5) {
+            // Real PBR detail: class-weighted (grass/rock/sand/snow)
+            // ambientCG textures normalized to unit mean so the
+            // authored biome palette keeps the hue while the texels
+            // carry the pattern — plus a real normal map perturbing
+            // the shading normal on the dominant class.
+            let wts = class_weights(i.h_norm, slope, abs(dir_fix.z), mottle);
+            let puv = dom_uvs(dir_fix);
+            var detail = vec3<f32>(0.0);
+            var dom_layer = 0;
+            var dom_w = 0.0;
+            for (var l = 0; l < 4; l = l + 1) {
+                let w = wts[l];
+                if (w > 0.02) {
+                    detail = detail + class_albedo(puv, l) * w;
+                    if (w > dom_w) { dom_w = w; dom_layer = l; }
+                }
+            }
+            let det_str = clamp(0.25 + 0.75 * det_fade, 0.0, 1.0);
+            alb = alb * mix(vec3<f32>(1.0), clamp(detail, vec3<f32>(0.0), vec3<f32>(3.0)), det_str);
+            let ntex = class_normal(puv, dom_layer) * (0.35 + 0.65 * det_fade);
+            n_fix = normalize(n_fix - basis.e * ntex.x * 0.55 - basis.n * ntex.y * 0.55);
+        }
+        let n = rot_axis(u.spin.xyz, u.spin.w, n_fix);
         alb = alb * (1.0 + (0.09 * mottle + 0.10 * vnoise3(dir_fix * 160000.0) * f_near));
         // Sun dimmed by the atmosphere at the fragment's altitude.
         var sun_lum = vec3<f32>(1.0, 0.98, 0.92);
@@ -634,9 +770,19 @@ fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
     // by the atmosphere along the view ray.
     let disc = pow(max(dot(rd, sun), 0.0), 4000.0) * 24.0;
     let halo = pow(max(dot(rd, sun), 0.0), 16.0) * 0.10;
+    // Real star map when the art pack is loaded (Poly Haven
+    // lakeside_night HDRI, CC0 — tone-mapped at bake): an equirect
+    // lookup on the inertial ray. The procedural cell field is the
+    // fallback for art-less packets.
+    var stars = star_field(rd);
+    if (u.art.x > 0.5) {
+        let su = atan2(rd.y, rd.x) / (2.0 * PI) + 0.5;
+        let sv = 0.5 - asin(clamp(rd.z, -1.0, 1.0)) / PI;
+        stars = textureSample(stars_tex, samp, vec2<f32>(su, sv)).rgb * 2.4;
+    }
     var space = vec3<f32>(0.004, 0.006, 0.014)
               + vec3<f32>(1.0, 0.95, 0.85) * (disc + halo)
-              + star_field(rd);
+              + stars;
 
     if (u.planet.y <= 0.0) {
         return vec4<f32>(space, 1.0);

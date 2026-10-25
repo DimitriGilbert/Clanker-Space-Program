@@ -25,7 +25,8 @@
 use std::collections::BTreeMap;
 
 use bevy_ecs::prelude::*;
-use csp_core::DVec3;
+use csp_core::{DQuat, DVec3};
+use csp_phys::PartTransform;
 use csp_render::vab::{VabPacket, VabVertex};
 
 use crate::map::{self, MapCameraF64, project_into, solve_orbit_camera};
@@ -152,7 +153,14 @@ pub(crate) fn apply_vab_input(
 ) {
     let pending: Vec<VabEvent> = events.pending.drain(..).collect();
     for ev in pending {
-        input.apply(&ev);
+        // A press carrying a part — or begun on one, about to lift it
+        // — is a placement/move gesture, not a camera drag: the
+        // egui-side pointer pass sets `orbit_block` for the press's
+        // whole life so dragging a part moves the part.
+        let orbit_blocked = matches!(ev, VabEvent::Orbit { .. }) && vab.0.orbit_block();
+        if !orbit_blocked {
+            input.apply(&ev);
+        }
         match ev {
             VabEvent::Pick(id) => {
                 let _ = vab
@@ -187,6 +195,9 @@ pub struct PartMesh {
     /// `true` while this part is the selection — `extract_vab` emits
     /// an inflated accent shell behind it (the 3D selection outline).
     pub selected: bool,
+    /// The real baked model (`data/art/parts.csar`) when the catalog
+    /// covers the part — `None` draws the kitbash silhouette.
+    pub model: Option<std::sync::Arc<crate::art::PartModel>>,
 }
 
 /// A placement ghost — the armed catalog part rendered translucent at
@@ -201,6 +212,8 @@ pub struct GhostMesh {
     /// Tint incl. alpha — green when the plan is placeable, red when
     /// the planner reported a refusal.
     pub color: [f32; 4],
+    /// The real baked model for the armed part, when resolvable.
+    pub model: Option<std::sync::Arc<crate::art::PartModel>>,
 }
 
 /// The Presentation product: the craft's part meshes in body frame +
@@ -246,6 +259,7 @@ pub(crate) fn vab_present(
     mut vab: ResMut<VabSessionRes>,
     mut scene: ResMut<VabScene>,
     mut cam: ResMut<VabCameraF64>,
+    art: Option<Res<crate::art::ArtAssets>>,
 ) {
     if !input.open {
         scene.parts.clear();
@@ -263,6 +277,14 @@ pub(crate) fn vab_present(
     }
     scene.parts.clear();
     let sel = vab.0.selected();
+    // A lifted part (and its subtree) draws as the cursor's ghost,
+    // not as a placed solid — it's "in hand", so it can't be hovered
+    // or picked either.
+    let move_set: std::collections::BTreeSet<csp_phys::PartNodeId> = vab
+        .0
+        .move_node()
+        .map(|n| vab.0.session().subtree_ids(n).into_iter().collect())
+        .unwrap_or_default();
     // The cached analysis carries each node's `EffectivePart` — the
     // resolved collider + module list + attach nodes the silhouette
     // classifier reads (`iter()` and `effective` share ascending-id
@@ -281,16 +303,51 @@ pub(crate) fn vab_present(
         .map(|((id, _), eff)| (id, eff))
         .collect();
     for (id, _n) in vab.0.session().iter() {
+        if move_set.contains(&id) {
+            continue;
+        }
         let (Some(&t), Some(&eff)) = (vab.0.body_transforms().get(&id), effective.get(&id)) else {
             continue;
         };
         let color = category_color(vab.0.def_of(id).map(|d| d.category), sel == Some(id));
+        let shape = crate::part_mesh::classify_effective(eff);
+        let model = art.as_ref().and_then(|a| {
+            let kind = if eff
+                .modules
+                .iter()
+                .any(|m| matches!(m, csp_data::part::ModuleDef::Engine { .. }))
+            {
+                crate::flight::PartKind::Engine
+            } else if eff
+                .modules
+                .iter()
+                .any(|m| matches!(m, csp_data::part::ModuleDef::CrewSeat { .. }))
+            {
+                crate::flight::PartKind::Crew
+            } else if eff
+                .modules
+                .iter()
+                .any(|m| matches!(m, csp_data::part::ModuleDef::Tank { .. }))
+            {
+                crate::flight::PartKind::Tank
+            } else {
+                crate::flight::PartKind::Structural
+            };
+            a.0.models
+                .get(crate::art::model_key(
+                    Some(eff.part_id.as_str()),
+                    kind,
+                    crate::part_mesh::is_pointed(&shape),
+                ))
+                .cloned()
+        });
         scene.parts.push(PartMesh {
             node: id,
             transform: t,
-            shape: crate::part_mesh::classify_effective(eff),
+            shape,
             color,
             selected: sel == Some(id),
+            model,
         });
     }
     // Camera framing: bounding sphere over the meshes' AABBs.
@@ -338,8 +395,8 @@ pub(crate) fn vab_present(
     );
 
     // -----------------------------------------------------------------
-    // CPU hover pick + placement affordances. The GPU pick pass only
-    // fires on clicks; the hover path needs a hit EVERY frame (ghost,
+    // CPU hover pick + held-part ghost. The GPU pick pass only fires
+    // on clicks; the hover path needs a hit EVERY frame (ghost,
     // attach-node markers, right-click remove), so the ray is cast
     // here against the kitbash AABBs — cheap at VAB part counts and
     // exact for the collider shapes the meshes bake.
@@ -350,84 +407,218 @@ pub(crate) fn vab_present(
         .cursor_px()
         .and_then(|(x, y)| hover_pick(&input, &cam.0, &scene.parts, x, y));
     vab.0.set_hover(hover);
-    // The armed part's ghost: plan through the session so the preview
-    // is exactly what a drop commits — edges, symmetry copies, and the
-    // refusal reason included.
-    let armed = vab.0.armed_part().cloned();
-    if let (Some(part), Some(hit)) = (armed.as_ref(), hover)
-        && let Some(eff) = vab.0.resolve_stock(part)
-    {
-        let plan = vab.0.plan_attach(part, hit.node);
-        let ok = !plan.edges.is_empty();
-        let color: [f32; 4] = if ok {
-            [0.35, 0.95, 0.45, 0.45]
-        } else {
-            [0.95, 0.30, 0.25, 0.45]
-        };
-        if let Some(&parent_t) = vab.0.body_transforms().get(&hit.node) {
-            let shape = crate::part_mesh::classify_effective(&eff);
-            for t in &plan.transforms {
-                scene.ghosts.push(GhostMesh {
-                    transform: parent_t.compose(*t),
-                    shape: shape.clone(),
-                    color,
-                });
+
+    // The carried part — KSP's held ghost, in one of three poses:
+    // snapped green where the plan succeeds, red where it refuses
+    // (with the reason pushed to `ghost_status`), or floating at the
+    // cursor at focus depth when nothing is under it.
+    let mut status: Option<String> = None;
+    // The floating anchor: the cursor ray pushed to the focus plane's
+    // depth — the part rides the cursor in the air.
+    let float_anchor = vab.0.cursor_px().and_then(|(x, y)| {
+        cursor_ray(&input, x, y).map(|dir| {
+            let depth = (focus - cam.0.eye).norm().max(1.0);
+            cam.0.eye + dir * depth
+        })
+    });
+    match vab.0.carried() {
+        Some(csp_ui::vab::Carried::Placing(part)) => {
+            if let Some(eff) = vab.0.resolve_stock(part) {
+                let shape = crate::part_mesh::classify_effective(&eff);
+                if let Some(hit) = hover {
+                    let plan = vab.0.plan_attach(part, hit.node);
+                    if plan.edges.is_empty() {
+                        status = plan.error.clone();
+                        // Red ghost anchored at the hit point — the
+                        // "can't here" read.
+                        if let Some(&pt) = vab.0.body_transforms().get(&hit.node) {
+                            scene.ghosts.push(GhostMesh {
+                                transform: PartTransform::new(pt.apply(hit.local), pt.rotation),
+                                shape,
+                                color: [0.95, 0.30, 0.25, 0.55],
+                                model: ghost_model(&art, &eff),
+                            });
+                        }
+                    } else {
+                        if let Some(&parent_t) = vab.0.body_transforms().get(&hit.node) {
+                            for t in &plan.transforms {
+                                scene.ghosts.push(GhostMesh {
+                                    transform: parent_t.compose(*t),
+                                    shape: shape.clone(),
+                                    color: [0.35, 0.95, 0.45, 0.45],
+                                    model: ghost_model(&art, &eff),
+                                });
+                            }
+                        }
+                    }
+                    emit_markers(
+                        &vab.0,
+                        &mut scene,
+                        hit.node,
+                        &plan,
+                        freed_move_node(&vab.0, hit.node),
+                    );
+                } else if let Some(anchor) = float_anchor {
+                    scene.ghosts.push(GhostMesh {
+                        transform: PartTransform::new(anchor, DQuat::IDENTITY),
+                        shape,
+                        color: [0.65, 0.78, 1.0, 0.40],
+                        model: ghost_model(&art, &eff),
+                    });
+                }
             }
         }
-        // Node markers on the hovered part: free authored nodes green,
-        // bound ones dim, the plan's chosen parent node brightest —
-        // the "where it snaps" read a text panel can't give.
-        if let (Some(&t), Some(def)) = (
-            vab.0.body_transforms().get(&hit.node),
-            vab.0.def_of(hit.node),
-        ) {
-            let bound = vab.0.session().bound_attach_nodes(hit.node);
-            let chosen = plan.edges.first().map(|e| e.parent_node.as_str());
-            let (bs, bt) = vab
-                .0
-                .session()
-                .node(hit.node)
-                .map(|n| (n.built().scale, n.built().stretch))
-                .unwrap_or((1.0, 1.0));
-            for n in &def.attach_nodes {
-                let Some(sn) = csp_phys::session::scaled_attach_node(def, &n.id, bs, bt) else {
+        Some(csp_ui::vab::Carried::Moving(node)) => {
+            // The carried subtree rides rigidly: each member's pose
+            // relative to the lifted node folds under wherever the
+            // lift lands.
+            let rels = vab.0.subtree_rel_transforms(node);
+            let mut members: Vec<(
+                csp_phys::PartTransform,
+                crate::part_mesh::PartShape,
+                Option<std::sync::Arc<crate::art::PartModel>>,
+            )> = Vec::with_capacity(rels.len());
+            for (id, rel) in &rels {
+                let Some(rec) = vab.0.session().node(*id) else {
                     continue;
                 };
-                let pos = t.apply(sn.position_m);
-                let c = if chosen == Some(n.id.as_str()) {
-                    [0.2, 1.0, 0.4, 1.0]
-                } else if bound.contains(&n.id) {
-                    [0.45, 0.45, 0.45, 0.5]
-                } else {
-                    [0.25, 0.9, 0.35, 0.8]
-                };
-                scene.markers.push((pos, c));
+                if let Some(eff) = vab.0.resolve_built(rec.built()) {
+                    let shape = crate::part_mesh::classify_effective(&eff);
+                    members.push((*rel, shape, ghost_model(&art, &eff)));
+                }
             }
-            // The plan's surface mount point gets a marker too.
-            if let Some(e) = plan.edges.first()
-                && e.parent_node
-                    .starts_with(csp_phys::session::SURFACE_NODE_PREFIX)
-                && let Some(sn) = csp_phys::session::decode_surface_node(&e.parent_node)
-            {
-                scene
-                    .markers
-                    .push((t.apply(sn.position_m), [0.2, 1.0, 0.4, 1.0]));
+            if members.is_empty() {
+                status = Some("the carried part failed to resolve".to_string());
+            }
+            let (anchor, color): (Option<PartTransform>, [f32; 4]) = if let Some(hit) = hover {
+                let plan = vab.0.plan_move(node, hit.node);
+                emit_markers(
+                    &vab.0,
+                    &mut scene,
+                    hit.node,
+                    &plan,
+                    freed_move_node(&vab.0, hit.node),
+                );
+                if plan.edges.is_empty() {
+                    status = plan.error.clone();
+                    (
+                        vab.0
+                            .body_transforms()
+                            .get(&hit.node)
+                            .map(|pt| PartTransform::new(pt.apply(hit.local), pt.rotation))
+                            .or_else(|| {
+                                float_anchor.map(|a| PartTransform::new(a, DQuat::IDENTITY))
+                            }),
+                        [0.95, 0.30, 0.25, 0.55],
+                    )
+                } else {
+                    (
+                        vab.0
+                            .body_transforms()
+                            .get(&hit.node)
+                            .map(|pt| pt.compose(plan.transforms[0])),
+                        [0.35, 0.95, 0.45, 0.45],
+                    )
+                }
+            } else {
+                // Floating — keep the lifted node's current body
+                // orientation while it rides the cursor.
+                let rot = vab
+                    .0
+                    .body_transforms()
+                    .get(&node)
+                    .map(|t| t.rotation)
+                    .unwrap_or(DQuat::IDENTITY);
+                (
+                    float_anchor.map(|a| PartTransform::new(a, rot)),
+                    [0.65, 0.78, 1.0, 0.40],
+                )
+            };
+            if let Some(base) = anchor {
+                for (rel, shape, model) in &members {
+                    scene.ghosts.push(GhostMesh {
+                        transform: base.compose(*rel),
+                        shape: shape.clone(),
+                        color,
+                        model: model.clone(),
+                    });
+                }
             }
         }
+        None => {}
+    }
+    vab.0.set_ghost_status(status);
+}
+
+/// The node id a lifted move frees on `hit_node`, if it is the moved
+/// part's current parent — its old mount reads "free" to the markers
+/// while the lift is in progress.
+fn freed_move_node(
+    vab: &csp_ui::vab::VabSession,
+    hit_node: csp_phys::PartNodeId,
+) -> Option<String> {
+    let moving = vab.move_node()?;
+    vab.session()
+        .node(moving)
+        .and_then(|n| n.edge())
+        .filter(|e| e.parent == hit_node)
+        .map(|e| e.parent_node.clone())
+}
+
+/// Attach-node markers on the hovered part while something is
+/// carried: free authored nodes green, bound ones dim, the plan's
+/// chosen parent node brightest — the "where it snaps" read a text
+/// panel can't give.
+fn emit_markers(
+    vab: &csp_ui::vab::VabSession,
+    scene: &mut VabScene,
+    hit_node: csp_phys::PartNodeId,
+    plan: &csp_ui::vab::AttachPlan,
+    freed: Option<String>,
+) {
+    let (Some(&t), Some(def)) = (vab.body_transforms().get(&hit_node), vab.def_of(hit_node)) else {
+        return;
+    };
+    let mut bound = vab.session().bound_attach_nodes(hit_node);
+    if let Some(f) = freed {
+        bound.remove(&f);
+    }
+    let chosen = plan.edges.first().map(|e| e.parent_node.as_str());
+    let (bs, bt) = vab
+        .session()
+        .node(hit_node)
+        .map(|n| (n.built().scale, n.built().stretch))
+        .unwrap_or((1.0, 1.0));
+    for n in &def.attach_nodes {
+        let Some(sn) = csp_phys::session::scaled_attach_node(def, &n.id, bs, bt) else {
+            continue;
+        };
+        let pos = t.apply(sn.position_m);
+        let c = if chosen == Some(n.id.as_str()) {
+            [0.2, 1.0, 0.4, 1.0]
+        } else if bound.contains(&n.id) {
+            [0.45, 0.45, 0.45, 0.5]
+        } else {
+            [0.25, 0.9, 0.35, 0.8]
+        };
+        scene.markers.push((pos, c));
+    }
+    // The plan's surface mount point gets a marker too.
+    if let Some(e) = plan.edges.first()
+        && e.parent_node
+            .starts_with(csp_phys::session::SURFACE_NODE_PREFIX)
+        && let Some(sn) = csp_phys::session::decode_surface_node(&e.parent_node)
+    {
+        scene
+            .markers
+            .push((t.apply(sn.position_m), [0.2, 1.0, 0.4, 1.0]));
     }
 }
 
-/// Cast the viewport cursor's ray against each part's kitbash AABB in
-/// its local frame; the nearest hit wins. Returns the node, the hit
-/// point in the node's scaled local frame (the surface-mount plan
-/// records it verbatim), and which face region it lands on.
-fn hover_pick(
-    input: &VabInput,
-    cam: &MapCameraF64,
-    parts: &[PartMesh],
-    px_x: f64,
-    px_y: f64,
-) -> Option<csp_ui::vab::HoverHit> {
+/// The viewport cursor's world-space ray direction (origin is
+/// `cam.eye`) — shared by the hover pick and the carried ghost's
+/// floating anchor.
+fn cursor_ray(input: &VabInput, px_x: f64, px_y: f64) -> Option<DVec3> {
     let (w, h) = input.viewport_px;
     if w <= 0.0 || h <= 0.0 {
         return None;
@@ -445,7 +636,21 @@ fn hover_pick(
     }
     let dir_view = dir_view / dir_len;
     let r = map::rot3(input.yaw_rad, input.pitch_rad);
-    let dir = map::mat3_vec(&r, dir_view);
+    Some(map::mat3_vec(&r, dir_view))
+}
+
+/// Cast the viewport cursor's ray against each part's kitbash AABB in
+/// its local frame; the nearest hit wins. Returns the node, the hit
+/// point in the node's scaled local frame (the surface-mount plan
+/// records it verbatim), and which face region it lands on.
+fn hover_pick(
+    input: &VabInput,
+    cam: &MapCameraF64,
+    parts: &[PartMesh],
+    px_x: f64,
+    px_y: f64,
+) -> Option<csp_ui::vab::HoverHit> {
+    let dir = cursor_ray(input, px_x, px_y)?;
     let mut best: Option<(f64, csp_phys::PartNodeId, DVec3, csp_ui::vab::AttachRegion)> = None;
     for p in parts {
         let inv = p.transform.inverse();
@@ -569,6 +774,7 @@ pub(crate) fn extract_vab(
                 &mut tris,
                 &cam.0,
                 &shell,
+                None,
                 p.transform,
                 [0.25, 1.0, 0.5, 1.0],
                 0,
@@ -586,6 +792,7 @@ pub(crate) fn extract_vab(
             &mut tris,
             &cam.0,
             &g.shape,
+            g.model.as_deref(),
             g.transform,
             g.color,
             0,
@@ -602,15 +809,54 @@ pub(crate) fn extract_vab(
 /// Emit one kitbash shape's shaded triangles under `transform` —
 /// `emit_part`'s core with the shape/color/pick as parameters so the
 /// selection shell, ghosts, and solid parts share the code path.
+#[allow(clippy::too_many_arguments)]
 fn emit_triangles(
     verts: &mut Vec<VabVertex>,
     tris: &mut Vec<crate::part_mesh::MeshTri>,
     cam: &MapCameraF64,
     shape: &crate::part_mesh::PartShape,
+    model: Option<&crate::art::PartModel>,
     transform: csp_phys::PartTransform,
     color: [f32; 4],
     pick: u32,
 ) {
+    if let Some(m) = model {
+        // Ghost model: the real mesh under the ghost's translucent
+        // tint (albedo × tint-hue, alpha from the ghost color).
+        let (lo, hi) = shape.local_aabb();
+        let mut mtris = Vec::new();
+        crate::part_mesh::emit_model(m, lo, hi, &mut mtris);
+        let light = {
+            let l = VAB_LIGHT;
+            l / l.norm()
+        };
+        for t in &mtris {
+            let world = [t.a, t.b, t.c].map(|q| transform.apply(q));
+            let [Some(c0), Some(c1), Some(c2)] =
+                world.map(|q| project_into(&cam.view_proj, cam.eye, q))
+            else {
+                continue;
+            };
+            for ((n, alb), pos) in [t.na, t.nb, t.nc]
+                .into_iter()
+                .zip([t.ca, t.cb, t.cc])
+                .zip([c0, c1, c2])
+            {
+                let shade = (0.55 + 0.45 * transform.apply_dir(n).dot(light).max(0.0)) as f32;
+                verts.push(VabVertex {
+                    pos,
+                    color: [
+                        alb[0] * color[0] * shade,
+                        alb[1] * color[1] * shade,
+                        alb[2] * color[2] * shade,
+                        color[3],
+                    ],
+                    pick,
+                });
+            }
+        }
+        return;
+    }
     tris.clear();
     crate::part_mesh::emit(shape, tris);
     let light = {
@@ -680,6 +926,23 @@ fn emit_octa(verts: &mut Vec<VabVertex>, cam: &MapCameraF64, pos: DVec3, m: f64,
     }
 }
 
+/// Resolve a ghost/carried part's model through the def id —
+/// the same keying `vab_present` uses for placed parts.
+fn ghost_model(
+    art: &Option<Res<crate::art::ArtAssets>>,
+    eff: &csp_phys::EffectivePart,
+) -> Option<std::sync::Arc<crate::art::PartModel>> {
+    art.as_ref()?
+        .0
+        .models
+        .get(crate::art::model_key(
+            Some(eff.part_id.as_str()),
+            crate::flight::PartKind::Structural,
+            false,
+        ))
+        .cloned()
+}
+
 /// The VAB's fixed key light — a body-frame direction like the flight
 /// view's fallback sun. Per-face lambert is what makes a lathed
 /// silhouette legible under flat category colors; the pick pass never
@@ -698,6 +961,38 @@ fn emit_part(
     p: &PartMesh,
     pick: u32,
 ) {
+    if let Some(m) = &p.model {
+        // Real baked model (Kenney Space Kit): per-vertex normals +
+        // authored albedo under the VAB key light.
+        let (lo, hi) = p.shape.local_aabb();
+        let mut mtris = Vec::new();
+        crate::part_mesh::emit_model(m, lo, hi, &mut mtris);
+        let light = {
+            let l = VAB_LIGHT;
+            l / l.norm()
+        };
+        for t in &mtris {
+            let world = [t.a, t.b, t.c].map(|q| p.transform.apply(q));
+            let [Some(c0), Some(c1), Some(c2)] =
+                world.map(|q| project_into(&cam.view_proj, cam.eye, q))
+            else {
+                continue;
+            };
+            for ((q, n, alb), pos) in [(t.a, t.na, t.ca), (t.b, t.nb, t.cb), (t.c, t.nc, t.cc)]
+                .into_iter()
+                .zip([c0, c1, c2])
+            {
+                let _ = q;
+                let shade = (0.55 + 0.45 * p.transform.apply_dir(n).dot(light).max(0.0)) as f32;
+                verts.push(VabVertex {
+                    pos,
+                    color: [alb[0] * shade, alb[1] * shade, alb[2] * shade, alb[3]],
+                    pick,
+                });
+            }
+        }
+        return;
+    }
     tris.clear();
     crate::part_mesh::emit(&p.shape, tris);
     let light = {

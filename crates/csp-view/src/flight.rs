@@ -172,6 +172,10 @@ pub struct FlightPart {
     pub shape: crate::part_mesh::PartShape,
     /// The module-family classification — livery tint + banding key.
     pub kind: PartKind,
+    /// The real baked model (Kenney Space Kit, `data/art/parts.csar`)
+    /// fitted to the shape's AABB at emit — `None` draws the kitbash
+    /// silhouette fallback.
+    pub model: Option<std::sync::Arc<crate::art::PartModel>>,
 }
 
 /// One propellant resource's aggregate fill on a vessel — units and
@@ -814,7 +818,11 @@ fn sun_direction(sim: &World) -> DVec3 {
 /// (the only sim read this module does — §2.5). `cache` is the
 /// session's [`LatchedWeldCache`] — surface-latched vessels reuse its
 /// weld-derived render data instead of re-welding every frame.
-pub fn capture_sync_input(sim: &World, cache: &mut LatchedWeldCache) -> FlightSyncInput {
+pub fn capture_sync_input(
+    sim: &World,
+    cache: &mut LatchedWeldCache,
+    art: &crate::art::ArtAssets,
+) -> FlightSyncInput {
     let env = sim.environment().map(|e| {
         // The §2.6.4 phase convention (`csp_sim::bubble`'s
         // `surface_pose_*`): inertial = R(axis, ω·t)·fixed at
@@ -854,7 +862,7 @@ pub fn capture_sync_input(sim: &World, cache: &mut LatchedWeldCache) -> FlightSy
     for (id, vessel) in sim.vessels() {
         match &vessel.state {
             VesselState::InBubble(body) => {
-                let parts = vessel_parts(vessel.craft.as_ref(), &body.collider.hulls);
+                let parts = vessel_parts(vessel.craft.as_ref(), &body.collider.hulls, art);
                 let plumes = body
                     .force_sites
                     .iter()
@@ -897,7 +905,7 @@ pub fn capture_sync_input(sim: &World, cache: &mut LatchedWeldCache) -> FlightSy
             // environment; without one the record is uninterpretable —
             // skip honestly rather than guess a pose.
             VesselState::SurfaceLatched(pose) => {
-                if let Some(body) = stage_latched(sim, env_ref, *id, vessel, pose, cache) {
+                if let Some(body) = stage_latched(sim, env_ref, *id, vessel, pose, cache, art) {
                     vessels.push(body);
                     propulsion.push(vessel_propulsion(*id, vessel, None));
                 }
@@ -941,6 +949,7 @@ fn stage_latched(
     vessel: &csp_sim::Vessel,
     pose: &csp_sim::SurfacePose,
     cache: &mut LatchedWeldCache,
+    art: &crate::art::ArtAssets,
 ) -> Option<FlightBody> {
     let (Some(env), Some(craft)) = (env, vessel.craft.as_ref()) else {
         return None;
@@ -960,7 +969,7 @@ fn stage_latched(
                 key,
                 com_local: welded.com_local,
                 plumes,
-                parts: vessel_parts(vessel.craft.as_ref(), &welded.collider.hulls),
+                parts: vessel_parts(vessel.craft.as_ref(), &welded.collider.hulls, art),
             },
         );
     }
@@ -1181,6 +1190,7 @@ fn livery(kind: PartKind, tint: [f32; 3], u: f64) -> [f32; 3] {
 fn vessel_parts(
     craft: Option<&csp_sim::CraftDef>,
     hulls: &[csp_phys::ConvexHull],
+    art: &crate::art::ArtAssets,
 ) -> Vec<FlightPart> {
     let fallback = || {
         hulls
@@ -1207,6 +1217,7 @@ fn vessel_parts(
                         hi: half,
                     },
                     kind: PartKind::Structural,
+                    model: None,
                 }
             })
             .collect()
@@ -1236,12 +1247,22 @@ fn vessel_parts(
             lo = DVec3::new(lo.x.min(w.x), lo.y.min(w.y), lo.z.min(w.z));
             hi = DVec3::new(hi.x.max(w.x), hi.y.max(w.y), hi.z.max(w.z));
         }
+        let shape = crate::part_mesh::classify_weld_part(wp);
+        let kind = part_kind(wp);
+        // The weld view carries no def id — key the model by module
+        // family; a pointed lathe profile upgrades Structural → nose cone.
+        let model = art.model(crate::art::model_key(
+            None,
+            kind,
+            crate::part_mesh::is_pointed(&shape),
+        ));
         parts.push(FlightPart {
             lo,
             hi,
             transform: t,
-            shape: crate::part_mesh::classify_weld_part(wp),
-            kind: part_kind(wp),
+            shape,
+            kind,
+            model,
         });
     }
     if parts.is_empty() { fallback() } else { parts }
@@ -2207,6 +2228,65 @@ fn emit_sheath(
     }
 }
 
+/// Emit one part's real baked model (Kenney Space Kit) — fitted to the
+/// collider AABB, per-vertex authored albedo under the flight sun's
+/// lambert + specular sheen; debris chars the albedo.
+#[allow(clippy::too_many_arguments)]
+fn emit_model_part(
+    v: &mut Vec<csp_render::flight::FlightVertex>,
+    b: &FlightBody,
+    p: &FlightPart,
+    m: &crate::art::PartModel,
+    vp: &[[f64; 4]; 4],
+    eye: DVec3,
+    sun: DVec3,
+) {
+    let (mlo, mhi) = p.shape.local_aabb();
+    let mut mtris = Vec::new();
+    crate::part_mesh::emit_model(m, mlo, mhi, &mut mtris);
+    for t in &mtris {
+        let [Some(c0), Some(c1), Some(c2)] = [t.a, t.b, t.c]
+            .map(|q| project_into(vp, eye, b.pos + b.rot.rotate(p.transform.apply(q))))
+        else {
+            continue;
+        };
+        for ((local, nrm, alb), pos) in [(t.a, t.na, t.ca), (t.b, t.nb, t.cb), (t.c, t.nc, t.cc)]
+            .into_iter()
+            .zip([c0, c1, c2])
+        {
+            let n_w = b.rot.rotate(p.transform.apply_dir(nrm));
+            let lam = n_w.dot(sun).max(0.0);
+            let mut shade = 0.36 + 0.64 * lam;
+            if !b.debris {
+                let to_eye = eye - b.pos - b.rot.rotate(p.transform.apply(local));
+                let d2 = to_eye.norm_squared();
+                if d2 > 1e-6 {
+                    let half = sun + to_eye / d2.sqrt();
+                    let hl = half.norm();
+                    if hl > 1e-9 {
+                        shade += 0.20 * n_w.dot(half / hl).max(0.0).powi(12);
+                    }
+                }
+            }
+            let shade = shade.min(1.0) as f32;
+            let (r, g, bl) = if b.debris {
+                (alb[0] * 0.72, alb[1] * 0.38, alb[2] * 0.16)
+            } else {
+                (alb[0], alb[1], alb[2])
+            };
+            v.push(csp_render::flight::FlightVertex {
+                pos,
+                color: [
+                    (r * shade).min(1.0),
+                    (g * shade).min(1.0),
+                    (bl * shade).min(1.0),
+                    alb[3],
+                ],
+            });
+        }
+    }
+}
+
 /// `RenderExtract` — emit the scene's clip-space triangles + the R2
 /// terrain packet (quadtree selection runs here, in the extract, from
 /// the solved camera — §2.5's "LOD selection" lives upstream in
@@ -2240,6 +2320,7 @@ pub(crate) fn extract_flight(
             env,
             &cam.0,
             input.viewport_px,
+            clock.0.ticks() as f64 / csp_core::TICK_HZ as f64,
         ));
     }
     let v = &mut packet.vertices;
@@ -2296,6 +2377,10 @@ pub(crate) fn extract_flight(
             };
             let (lo, hi) = p.shape.local_aabb();
             let z_span = (hi.z - lo.z).max(1e-9);
+            if let Some(m) = &p.model {
+                emit_model_part(v, b, p, m, vp, eye, sun);
+                continue;
+            }
             tris.clear();
             crate::part_mesh::emit_smooth(&p.shape, &mut tris);
             for t in tris.iter() {
@@ -2530,6 +2615,7 @@ mod tests {
                     hi: DVec3::new(0.5, 0.5, 0.5),
                 },
                 kind: PartKind::Structural,
+                model: None,
             }],
             // Thrust site at the body origin, dir +Z: the fan tip sits
             // at the vessel, the 1.5 m-radius base ring 36 m along −Z.
@@ -2588,7 +2674,7 @@ mod tests {
                 DVec3::new(2.0, -1.0, 2.0),
             ],
         };
-        let parts = vessel_parts(None, &[hull]);
+        let parts = vessel_parts(None, &[hull], &Default::default());
         assert_eq!(parts.len(), 1);
         let p = &parts[0];
         let crate::part_mesh::PartShape::Box { lo, hi } = &p.shape else {

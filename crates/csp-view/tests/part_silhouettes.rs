@@ -39,9 +39,12 @@ fn starter_stack_stages_distinct_silhouettes() {
     view.seed_starter_craft().expect("starter seed");
     frame(&mut view, 1); // the spawn lands on the first stepped tick
 
+    // Default catalog ⇒ the kitbash-silhouette path (what this test
+    // measures); the real-model path is exercised by art::load().
     let staged = csp_view::flight::capture_sync_input(
         &view.sim,
         &mut csp_view::flight::LatchedWeldCache::default(),
+        &csp_view::art::ArtAssets::default(),
     );
     let vessel = staged.vessels.first().expect("seeded vessel staged");
     assert_eq!(vessel.parts.len(), 3, "pod + tank + engine");

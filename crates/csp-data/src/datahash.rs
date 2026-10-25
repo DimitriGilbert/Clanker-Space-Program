@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 /// (§3.1). Everything else under `data/` — including `*.png` biome and
 /// concentration maps — is hashed.
 pub const ART_EXTENSIONS: &[&str] = &[
-    "png", "jpg", "jpeg", "tga", "webp", "ktx2", "ogg", "wav", "glb",
+    "png", "jpg", "jpeg", "tga", "webp", "ktx2", "ogg", "wav", "glb", "csar",
 ];
 
 /// `data_set_hash` failures — plain io diagnostics, like the loader's.

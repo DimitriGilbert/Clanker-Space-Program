@@ -142,11 +142,22 @@ fn render_flight_scene(
     queue: &wgpu::Queue,
     packet: &csp_render::flight::FlightPacket,
 ) -> Vec<u8> {
+    render_flight_scene_sized(device, queue, packet, W, H)
+}
+
+/// Sized variant — the 256 B copy-row alignment must divide `w*4`.
+fn render_flight_scene_sized(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    packet: &csp_render::flight::FlightPacket,
+    w: u32,
+    h: u32,
+) -> Vec<u8> {
     let color_tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("render-gate-target"),
         size: wgpu::Extent3d {
-            width: W,
-            height: H,
+            width: w,
+            height: h,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -157,7 +168,7 @@ fn render_flight_scene(
         view_formats: &[],
     });
     let target = color_tex.create_view(&wgpu::TextureViewDescriptor::default());
-    let mut flight = csp_render::flight::FlightRenderer::new(device, FORMAT, (W, H));
+    let mut flight = csp_render::flight::FlightRenderer::new(device, FORMAT, (w, h));
     let mut terrain = csp_render::terrain::TerrainRenderer::new(device, FORMAT);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("render-gate"),
@@ -200,7 +211,7 @@ fn render_flight_scene(
         }
         flight.draw(&mut pass, device, queue, packet);
     }
-    let row_bytes = W as usize * 4;
+    let row_bytes = w as usize * 4;
     debug_assert_eq!(row_bytes % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize, 0);
     let buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("render-gate-readback"),
@@ -220,7 +231,7 @@ fn render_flight_scene(
             layout: wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(row_bytes as u32),
-                rows_per_image: Some(H),
+                rows_per_image: Some(h),
             },
         },
         wgpu::Extent3d {
@@ -364,4 +375,30 @@ fn empty_flight_scene_is_what_the_gate_rejects() {
         stats.non_clear,
         total
     );
+}
+
+/// Scratch visual dump — write the seeded frame to /tmp/frame.ppm.
+/// Run explicitly: `cargo test -p csp-view --test render_gate dump -- --ignored`.
+#[test]
+#[ignore]
+fn dump() {
+    let Some((device, queue)) = headless_device() else {
+        return;
+    };
+    let mut view = View::new().unwrap();
+    view.seed_starter_craft().unwrap();
+    view.set_flight_viewport(320.0, 240.0);
+    view.world
+        .resource_mut::<csp_view::flight::FlightInput>()
+        .distance_m = 25.0;
+    for _ in 0..3 {
+        frame(&mut view, 1);
+    }
+    let packet = view.take_flight_packet().unwrap();
+    let img = render_flight_scene(&device, &queue, &packet);
+    let mut out = b"P6 320 240 255\n".to_vec();
+    for px in img.chunks_exact(4) {
+        out.extend_from_slice(&px[..3]);
+    }
+    std::fs::write("/tmp/frame.ppm", &out).unwrap();
 }

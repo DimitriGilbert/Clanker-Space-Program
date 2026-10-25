@@ -31,6 +31,22 @@
 //! stage table) marks dirty, while a pick does not re-resolve. The
 //! panel shows the stage-stats rows plus the [`MissionProfile`]
 //! comparison.
+//!
+//! # The held-part model (KSP's VAB)
+//!
+//! A palette click never places anything — it lifts the part onto the
+//! cursor (`pending_part`/`drag_part`), where it floats as a ghost
+//! until the player clicks a craft part (the drop — `Select(Some)`
+//! consumed through [`VabSession::plan_attach`], so a side-face click
+//! surface-mounts and a cap click stacks), clicks the empty build
+//! area of an empty craft (the root), or cancels (Esc/right-click —
+//! [`VabAction::CancelPlacement`]). A click on empty space keeps the
+//! part held. Placed parts move the same way: drag one — or click the
+//! already-selected one — and it lifts as a ghost
+//! ([`VabAction::Grab`], `move_node`), reattaching through
+//! `CraftSession::reattach` on the next drop so the node keeps its
+//! id, build, and subtree. [`VabSession::carried`] is the one
+//! accessor every affordance (ghost, banner, cancel, drop) reads.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -90,6 +106,18 @@ pub struct HoverHit {
     pub region: AttachRegion,
 }
 
+/// What the cursor is carrying — KSP's held part. `csp-view` draws it
+/// as a ghost that follows the cursor (snapped green over a placeable
+/// target, red over a refused one, floating over empty space); a
+/// click or drop commits it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Carried<'a> {
+    /// A catalog part picked up for its first placement.
+    Placing(&'a PartId),
+    /// A placed part lifted to move (with its subtree) — the node id.
+    Moving(PartNodeId),
+}
+
 /// What a placement would produce — computed by
 /// [`VabSession::plan_attach`] without touching the session so the
 /// ghost preview shows exactly what a drop commits.
@@ -134,39 +162,52 @@ pub enum VabAction {
         /// The node to hang it under.
         parent: PartNodeId,
     },
-    /// The palette's one-click "add part" — context picks the honest
-    /// op so a catalog click always does something visible:
-    ///
-    /// - empty craft → `part` becomes the root;
-    /// - a part is selected → `part` attaches under it;
-    /// - otherwise → arms *pending placement*: the next
-    ///   [`Self::Select`]`(Some)` is consumed as the parent pick (the
-    ///   banner says "click where it attaches" — from the 3D view, the
-    ///   craft tree, or a stage row), and `Select(None)` cancels.
-    ///   Re-clicking the armed catalog row cancels too. The consume
-    ///   path plans through [`VabSession::plan_attach`] against the
-    ///   stored hover hit, so a side-face click surface-mounts like a
-    ///   drag-drop does.
+    /// The palette's "pick up a part" — the KSP held-part gesture:
+    /// the click never places anything; it arms the ghost that
+    /// follows the cursor. The ghost commits when the player clicks a
+    /// craft part (consumed by [`Self::Select`]`(Some)` through
+    /// [`VabSession::plan_attach`], so a side-face click
+    /// surface-mounts like a drag-drop) or clicks the empty build
+    /// area of an empty craft (the part becomes the root). Clicking
+    /// empty space on a non-empty craft keeps it held — only
+    /// [`Self::CancelPlacement`] (Esc/right-click/the banner button)
+    /// or re-clicking the armed row puts it back. Picking a different
+    /// row swaps the carried part.
     CatalogPick(PartId),
-    /// Disarm a pending placement without placing anything (the
-    /// palette banner's cancel button).
+    /// Put back whatever the cursor carries — an armed catalog part
+    /// or a lifted placed part (which never left the session, so the
+    /// "put back" is free). The palette banner's cancel button,
+    /// right-click while carrying, and Esc all land here.
     CancelPlacement,
-    /// The drag-and-drop landing: attach `part` at the stored
-    /// [`VabSession::hover`] target through [`Self::plan_attach`]
-    /// (axial or surface per the hit region + attach mode + radial
-    /// symmetry). With no hover target the op falls back to
-    /// [`Self::AttachAuto`]'s axial pick under the hovered part, and
-    /// with no hover at all it becomes `SetRoot`/`CatalogPick`'s arm
-    /// on an empty craft or a plain notice.
+    /// Commit whatever the cursor carries at the current
+    /// [`VabSession::hover`] target — the drag-release landing for
+    /// both a palette drag and a lifted part. With no hover target
+    /// the carry stays armed (a drop on empty space lets go of
+    /// nothing); on an empty craft a carried catalog part becomes
+    /// the root.
+    Drop,
+    /// The drag-and-drop landing for a *catalog* part: arm `part` and
+    /// resolve [`Self::Drop`] in the same op — the palette-drag
+    /// release and headless tests both use it.
     PlaceAtHover {
         /// The catalog part being dropped.
         part: PartId,
     },
+    /// Lift a placed part onto the cursor to move it (with its
+    /// subtree) — the click-on-selected and drag-lift gestures and the
+    /// inspector's "pick up" button all land here. The root refuses:
+    /// it defines the build frame (reroot moves the origin).
+    Grab(PartNodeId),
     /// Remove `node` and its subtree.
     Remove(PartNodeId),
     /// Re-root the tree at `node` (the VAB's reroot tool).
     Reroot(PartNodeId),
-    /// Select `Some` node for the inspector, or clear the selection.
+    /// The 3D-view click + panel clicks, unified: while the cursor
+    /// carries a part this is the *drop* — `Some` is the new mount
+    /// point, `None` an empty-space click (keeps the carry, or places
+    /// the root on an empty craft). Carrying nothing, `Some` selects
+    /// (or lifts the already-selected part for a move) and `None`
+    /// deselects.
     Select(Option<PartNodeId>),
     /// Assign `node` to `stage`.
     SetStage {
@@ -298,16 +339,36 @@ pub struct VabSession {
     profile: MissionProfile,
     /// Currently selected node (inspector + attach target).
     selected: Option<PartNodeId>,
-    /// The armed pending placement (see [`VabAction::CatalogPick`]):
-    /// `Some(part)` means the next `Select(Some)` is consumed as that
-    /// part's parent pick, and `Select(None)`/[`VabAction::CancelPlacement`]
-    /// disarms. Session state — never serialized into the craft file.
+    /// The armed pending placement — the KSP held part: a palette
+    /// click lifts the catalog part onto the cursor as a ghost; it
+    /// commits when the player clicks a craft part (or the empty
+    /// build area for the root) and stays held otherwise. See
+    /// [`VabAction::CatalogPick`]. Session state — never serialized
+    /// into the craft file.
     pending_part: Option<PartId>,
-    /// The palette-row drag currently in flight. Distinct from
-    /// `pending_part`: a click-ARM disarms on drop, a drag always
-    /// resolves on release — attach at the hover target, root on an
-    /// empty craft, cancel over a panel or dead space.
+    /// The palette-row drag currently in flight. A drag arms
+    /// `pending_part` like a click; the release resolves through
+    /// [`VabAction::Drop`] over the viewport or cancels over a panel.
     drag_part: Option<PartId>,
+    /// The placed node lifted for a move — the cursor carries it and
+    /// its whole subtree as ghosts; a click or drop reattaches it.
+    /// The lift is presentation-only: the node never leaves the
+    /// session, so a cancel just clears this field and the part is
+    /// exactly where it was.
+    move_node: Option<PartNodeId>,
+    /// The placed part an LMB press over the viewport began on — the
+    /// drag-lift candidate: if the press turns into a drag this node
+    /// is grabbed. `None` for presses on empty space or a panel.
+    press_node: Option<PartNodeId>,
+    /// Set each frame by `vab_pointer_input` while an LMB press over
+    /// the viewport is a placement/move gesture (carrying a part, or
+    /// pressing on one). `csp-view` skips camera-orbit deltas while
+    /// this is set so dragging a part moves the part, not the camera.
+    orbit_block: bool,
+    /// The carried ghost's live status — the plan's refusal reason
+    /// while hovering an invalid target, pushed by `csp-view` each
+    /// frame so the hint bar can show *why* a spot won't take.
+    ghost_status: Option<String>,
     /// The CPU hover pick — the part face the pointer is over, in the
     /// node's scaled local frame. `csp-view` pushes it every frame the
     /// cursor is over the 3D viewport (and clears it when it leaves);
@@ -366,6 +427,10 @@ impl Default for VabSession {
             selected: None,
             pending_part: None,
             drag_part: None,
+            move_node: None,
+            press_node: None,
+            orbit_block: false,
+            ghost_status: None,
             hover: None,
             cursor_px: None,
             symmetry: 1,
@@ -460,11 +525,13 @@ impl VabSession {
     /// Set/clear the in-flight palette drag — the palette panel owns
     /// this. A starting drag also arms `pending_part` so the banner,
     /// the ghost, and a stray mid-drag click agree on what is being
-    /// placed; clearing the drag leaves the arm alone.
+    /// placed; it also puts back any lifted part (one carry at a
+    /// time). Clearing the drag leaves the arm alone.
     pub fn set_drag_part(&mut self, part: Option<PartId>) {
         self.drag_part = part.clone();
         if let Some(p) = part {
             self.pending_part = Some(p);
+            self.move_node = None;
         }
     }
 
@@ -472,6 +539,55 @@ impl VabSession {
     /// the click-armed pending part.
     pub fn armed_part(&self) -> Option<&PartId> {
         self.drag_part.as_ref().or(self.pending_part.as_ref())
+    }
+
+    /// The node lifted for a move, if still placed (see
+    /// [`VabAction::Grab`]).
+    pub fn move_node(&self) -> Option<PartNodeId> {
+        self.move_node.filter(|id| self.session.contains(*id))
+    }
+
+    /// What the cursor is carrying, if anything — the held-part state
+    /// the ghost view and every cancel/drop path read.
+    pub fn carried(&self) -> Option<Carried<'_>> {
+        if let Some(n) = self.move_node() {
+            Some(Carried::Moving(n))
+        } else {
+            self.armed_part().map(Carried::Placing)
+        }
+    }
+
+    /// The placed part an LMB press began on — the drag-lift
+    /// candidate (set/cleared by `vab_pointer_input`).
+    pub fn press_node(&self) -> Option<PartNodeId> {
+        self.press_node
+    }
+
+    /// Set/clear the drag-lift candidate.
+    pub fn set_press_node(&mut self, node: Option<PartNodeId>) {
+        self.press_node = node;
+    }
+
+    /// Whether a placement/move gesture owns the LMB press —
+    /// `csp-view` skips camera-orbit deltas while this is set.
+    pub fn orbit_block(&self) -> bool {
+        self.orbit_block
+    }
+
+    /// Push the orbit-block flag — `vab_pointer_input` owns this.
+    pub fn set_orbit_block(&mut self, on: bool) {
+        self.orbit_block = on;
+    }
+
+    /// The carried ghost's live status (the current plan refusal), if
+    /// any — `csp-view` pushes it each frame.
+    pub fn ghost_status(&self) -> Option<&str> {
+        self.ghost_status.as_deref()
+    }
+
+    /// Push/clear the carried ghost's status — `csp-view` owns this.
+    pub fn set_ghost_status(&mut self, status: Option<String>) {
+        self.ghost_status = status;
     }
 
     /// The live CPU hover pick, if the cursor is over a craft part.
@@ -652,23 +768,35 @@ impl VabSession {
                 self.session = CraftSession::with_name(self.session.name());
                 self.selected = None;
                 self.pending_part = None;
+                self.drag_part = None;
+                self.move_node = None;
+                self.press_node = None;
                 self.craft_epoch += 1;
                 self.dirty = true;
-                Some("new craft — click a catalog part to place the root".to_string())
+                Some("new craft — pick up a catalog part and click the build area".to_string())
             }
             VabAction::SetRoot(part_id) => Some(self.place_root(&part_id)?),
             VabAction::AttachAuto { part, parent } => Some(self.place_attach(&part, parent)?),
             VabAction::CatalogPick(part) => self.catalog_pick(&part)?,
             VabAction::CancelPlacement => {
-                if self.pending_part.take().is_some() {
-                    Some("placement cancelled".to_string())
+                // All three takes must run — `||` short-circuits.
+                let a = self.pending_part.take().is_some();
+                let b = self.drag_part.take().is_some();
+                let c = self.move_node.take().is_some();
+                if a || b || c {
+                    Some("placement cancelled — part put back".to_string())
                 } else {
                     None
                 }
             }
-            VabAction::PlaceAtHover { part } => Some(self.place_at_hover(&part)?),
+            VabAction::PlaceAtHover { part } => self.place_at_hover(&part)?,
+            VabAction::Drop => self.drop_carried()?,
+            VabAction::Grab(node) => self.grab(node)?,
             VabAction::Remove(node) => Some(self.remove_node(node)?),
             VabAction::Reroot(node) => {
+                // A carry can't survive a root change — the moved
+                // node's own edge may be rewritten by the reversal.
+                self.move_node = None;
                 self.session.reroot(node).map_err(VabError::Session)?;
                 self.dirty = true;
                 Some(format!("re-rooted the craft at {}", self.node_label(node)))
@@ -766,36 +894,38 @@ impl VabSession {
         })
     }
 
-    /// The palette's one-click add — [`VabAction::CatalogPick`]'s
-    /// dispatch. The catalog check runs before ANY branch so a
-    /// catalog-less session refuses honestly instead of arming a
-    /// placement that can never resolve.
+    /// The palette's "pick up" — [`VabAction::CatalogPick`]'s
+    /// dispatch. A catalog click never places anything: it lifts the
+    /// part onto the cursor as a ghost (KSP's held part). The drop is
+    /// a separate gesture — [`Self::select`]/[`Self::drop_carried`].
+    /// The catalog check runs before ANY branch so a catalog-less
+    /// session refuses honestly instead of arming a ghost that can
+    /// never resolve.
     fn catalog_pick(&mut self, part: &PartId) -> Result<Option<String>, VabError> {
         if self.catalog.is_none() {
             return Err(VabError::NoCatalog);
         }
-        Ok(Some(if self.session.is_empty() {
-            self.place_root(part)?
-        } else if let Some(parent) = self.selected() {
-            self.place_attach(part, parent)?
-        } else if self.pending_part.as_ref() == Some(part) {
-            // Re-clicking the armed row toggles it off.
+        // Refuse to arm a part the catalog doesn't carry — arming a
+        // bad id would park the editor in a state whose only exits
+        // are cancel and a guaranteed-failing attach.
+        self.def_by_id(part)
+            .ok_or(VabError::PartNotInCatalog { part: part.clone() })?;
+        // Re-clicking the armed row puts the part back — a click that
+        // resolves to nothing must still do something honest.
+        if self.pending_part.as_ref() == Some(part) && self.drag_part.is_none() {
             self.pending_part = None;
-            "placement cancelled".to_string()
-        } else {
-            // Refuse to arm a part the catalog doesn't carry — arming
-            // a bad id would park the editor in a state whose only
-            // exits are cancel and a guaranteed-failing attach.
-            self.def_by_id(part)
-                .ok_or(VabError::PartNotInCatalog { part: part.clone() })?;
-            let msg = format!(
-                "placing {} — click the craft part to attach it under \
-                 (3D view, craft tree, or stage row)",
-                self.display_name(part)
-            );
-            self.pending_part = Some(part.clone());
-            msg
-        }))
+            return Ok(Some("placement cancelled — part put back".to_string()));
+        }
+        // One carry at a time: picking up a catalog part puts any
+        // lifted placed part back (it never left the session) and
+        // swaps the held ghost.
+        self.move_node = None;
+        self.pending_part = Some(part.clone());
+        Ok(Some(format!(
+            "picked up {} — click a craft part to attach it, or empty \
+             space to keep carrying",
+            self.display_name(part)
+        )))
     }
 
     /// [`VabAction::Remove`]'s dispatch — the node plus its whole
@@ -806,6 +936,13 @@ impl VabSession {
         let removed = self.session.remove_part(node).map_err(VabError::Session)?;
         if self.selected.is_some_and(|s| removed.contains(&s)) {
             self.selected = None;
+        }
+        // A carry can't outlive the carried part.
+        if self.move_node.is_some_and(|m| removed.contains(&m)) {
+            self.move_node = None;
+        }
+        if self.press_node.is_some_and(|p| removed.contains(&p)) {
+            self.press_node = None;
         }
         self.dirty = true;
         Ok(if removed.len() > 1 {
@@ -827,47 +964,153 @@ impl VabSession {
         self.session = session;
         self.selected = None;
         self.pending_part = None;
+        self.drag_part = None;
+        self.move_node = None;
+        self.press_node = None;
         self.craft_epoch += 1;
         self.dirty = true;
         Ok(format!("loaded craft '{}'", self.session.name()))
     }
 
-    /// [`VabAction::Select`]'s dispatch. An armed pending placement
-    /// consumes `Some(node)` as its parent pick — the banner's "click
-    /// where it attaches" made literal; a failed attach keeps the arm
-    /// so the next click can try a different parent. `None` (a
-    /// background click) deselects and disarms. The consume runs
-    /// through [`Self::attach_planned`] so a click on a part's side
-    /// surface-mounts exactly like a drag-drop.
+    /// [`VabAction::Select`]'s dispatch — the 3D-view click,
+    /// unified. While the cursor carries a part the click is the
+    /// *drop*: `Some(node)` is the new mount point (consumed through
+    /// [`Self::attach_planned`]/[`Self::move_planned`], so a side-face
+    /// click surface-mounts exactly like a drag-drop; a failed attach
+    /// keeps the carry), `None` is an empty-space click — it keeps
+    /// the part held (KSP: nothing on empty space) except on an empty
+    /// craft, where it places the root. Carrying nothing, `Some`
+    /// selects — or lifts the already-selected part for a move — and
+    /// `None` deselects.
     fn select(&mut self, sel: Option<PartNodeId>) -> Result<Option<String>, VabError> {
         let target = sel.filter(|id| self.session.contains(*id));
-        if let (Some(part), Some(parent)) = (self.pending_part.clone(), target) {
-            return self.attach_planned(&part, parent).map(Some);
+        if let Some(node) = self.move_node {
+            return Ok(Some(match target {
+                Some(parent) => self.move_planned(node, parent)?,
+                None => format!(
+                    "carrying {} — click a craft part to reattach it",
+                    self.node_label(node)
+                ),
+            }));
+        }
+        if let Some(part) = self.pending_part.clone() {
+            return Ok(Some(match target {
+                Some(parent) => self.attach_planned(&part, parent)?,
+                None if self.session.is_empty() => self.place_root(&part)?,
+                None => format!(
+                    "carrying {} — click a craft part to place it",
+                    self.display_name(&part)
+                ),
+            }));
+        }
+        // A click on the already-selected part lifts it — the
+        // click-to-move affordance, same as the drag-lift.
+        if let Some(id) = target
+            && self.selected() == Some(id)
+        {
+            return self.grab(id);
         }
         self.selected = target;
-        Ok(if target.is_none() && self.pending_part.take().is_some() {
-            // Background click — the natural cancel.
-            Some("placement cancelled".to_string())
-        } else {
-            None
-        })
+        Ok(None)
     }
 
-    /// [`VabAction::PlaceAtHover`]'s dispatch — the drag-drop landing:
-    /// attach at the stored hover target, place the root on an empty
-    /// craft, or report the drop that found no surface.
-    fn place_at_hover(&mut self, part: &PartId) -> Result<String, VabError> {
+    /// [`VabAction::Grab`]'s dispatch — lift `node` onto the cursor
+    /// for a move. The lift is presentation-only (the node keeps its
+    /// edge until the drop rewrites it), so a cancel costs nothing.
+    /// The root refuses: it defines the build frame.
+    fn grab(&mut self, node: PartNodeId) -> Result<Option<String>, VabError> {
+        let Some(rec) = self.session.node(node) else {
+            return Err(VabError::Session(
+                csp_phys::session::SessionError::UnknownNode { id: node },
+            ));
+        };
+        if rec.edge().is_none() {
+            return Ok(Some(
+                "the craft root can't be picked up — it defines the build frame \
+                 (reroot moves the origin)"
+                    .to_string(),
+            ));
+        }
+        // One carry at a time — a catalog ghost gives way.
+        self.pending_part = None;
+        self.drag_part = None;
+        self.move_node = Some(node);
+        Ok(Some(format!(
+            "picked up {} — click a craft part to reattach it (Esc puts it back)",
+            self.node_label(node)
+        )))
+    }
+
+    /// [`VabAction::Drop`]'s dispatch — commit the carried thing at
+    /// the stored [`Self::hover`]. A drop that finds no surface keeps
+    /// the carry: letting go is a deliberate cancel, not a missed
+    /// click.
+    fn drop_carried(&mut self) -> Result<Option<String>, VabError> {
+        if let Some(node) = self.move_node {
+            let Some(hit) = self.hover else {
+                return Ok(Some(format!(
+                    "still carrying {} — aim at a craft part to drop it",
+                    self.node_label(node)
+                )));
+            };
+            return self.move_planned(node, hit.node).map(Some);
+        }
+        if let Some(part) = self.pending_part.clone() {
+            if self.session.is_empty() {
+                return self.place_root(&part).map(Some);
+            }
+            let Some(hit) = self.hover else {
+                return Ok(Some(format!(
+                    "still carrying {} — aim at a craft part to place it",
+                    self.display_name(&part)
+                )));
+            };
+            return self.attach_planned(&part, hit.node).map(Some);
+        }
+        Ok(None)
+    }
+
+    /// [`VabAction::PlaceAtHover`]'s dispatch — the catalog
+    /// drag-drop landing: arm the part and resolve
+    /// [`Self::drop_carried`] in one op.
+    fn place_at_hover(&mut self, part: &PartId) -> Result<Option<String>, VabError> {
         if self.catalog.is_none() {
             return Err(VabError::NoCatalog);
         }
-        if self.session.is_empty() {
-            return self.place_root(part);
+        self.pending_part = Some(part.clone());
+        self.drop_carried()
+    }
+
+    /// The move half of the drop — [`Self::move_planned`] commits the
+    /// plan [`Self::plan_move`] produced: one reattach, same node id,
+    /// subtree carried. Dropping onto the node's own subtree puts it
+    /// back where it was (the graceful read of "onto yourself").
+    fn move_planned(&mut self, node: PartNodeId, parent: PartNodeId) -> Result<String, VabError> {
+        if self.session.subtree_ids(node).contains(&parent) {
+            self.move_node = None;
+            return Ok(format!("put {} back where it was", self.node_label(node)));
         }
-        let Some(hit) = self.hover else {
-            // Released over dead space — nothing under the cursor.
-            return Ok("dropped over empty space — nothing attached".to_string());
-        };
-        self.attach_planned(part, hit.node)
+        let part = self
+            .session
+            .node(node)
+            .map(|n| n.built().part_id.clone())
+            .ok_or(VabError::Session(
+                csp_phys::session::SessionError::UnknownNode { id: node },
+            ))?;
+        let plan = self.plan_move(node, parent);
+        if plan.edges.is_empty() {
+            return Err(VabError::NoCompatibleAttach { part, parent });
+        }
+        let defs = self.catalog.as_ref().ok_or(VabError::NoCatalog)?;
+        self.session
+            .reattach(defs, node, plan.edges[0].clone())
+            .map_err(VabError::Session)?;
+        let name = self.node_label(node);
+        let onto = self.node_label(parent);
+        self.move_node = None;
+        self.selected = Some(node);
+        self.dirty = true;
+        Ok(format!("moved {name} onto {onto}"))
     }
 
     /// Attach `part` to `parent` through [`Self::plan_attach`]: the
@@ -900,6 +1143,7 @@ impl VabSession {
             self.selected = Some(first);
         }
         self.pending_part = None;
+        self.drag_part = None;
         self.dirty = true;
         let copies = placed.len();
         Ok(if copies > 1 {
@@ -932,6 +1176,89 @@ impl VabSession {
                 return plan;
             }};
         }
+        let Some(child_def) = self.def_by_id(part) else {
+            fail!(format!("part '{part}' is not in the loaded catalog"));
+        };
+        let Ok(built) = self.stock_build(part) else {
+            fail!(format!("part '{part}' cannot be built"));
+        };
+        let bound = self.session.bound_attach_nodes(parent);
+        self.plan_edges(
+            parent,
+            child_def,
+            &built,
+            &bound,
+            &std::collections::BTreeSet::new(),
+            usize::from(self.symmetry.max(1)),
+        )
+    }
+
+    /// The would-be move for the lifted `node` under `parent` —
+    /// [`Self::plan_attach`]'s move half: the same face/hover
+    /// planning, but the child is the node's *own* built part
+    /// (variant/scale/stretch preserved), symmetry does not fan out
+    /// (one reattach), the node's current edge frees BOTH its ends
+    /// (re-attaching where it was must be a valid plan), and the
+    /// child's nodes already mated to the node's own children are not
+    /// candidates.
+    pub fn plan_move(&self, node: PartNodeId, parent: PartNodeId) -> AttachPlan {
+        let mut plan = AttachPlan::default();
+        macro_rules! fail {
+            ($why:expr) => {{
+                plan.error = Some($why);
+                return plan;
+            }};
+        }
+        let Some(node_rec) = self.session.node(node) else {
+            fail!(format!("node {node:?} is not placed"));
+        };
+        if self.session.subtree_ids(node).contains(&parent) {
+            fail!("a part cannot attach to its own subtree".to_string());
+        }
+        let built = node_rec.built().clone();
+        let Some(child_def) = self.def_by_id(&built.part_id) else {
+            fail!(format!(
+                "part '{}' is not in the loaded catalog",
+                built.part_id
+            ));
+        };
+        // Free the moved edge's ends: the parent node it hangs from
+        // (only when the target IS that parent) and its own mount
+        // node. Everything else `bound_attach_nodes` reports stays
+        // bound — the node's children still own their mates.
+        let mut bound = self.session.bound_attach_nodes(parent);
+        let mut child_bound = self.session.bound_attach_nodes(node);
+        if let Some(e) = node_rec.edge() {
+            if e.parent == parent {
+                bound.remove(&e.parent_node);
+            }
+            child_bound.remove(&e.child_node);
+        }
+        self.plan_edges(parent, child_def, &built, &bound, &child_bound, 1)
+    }
+
+    /// The shared planner for [`Self::plan_attach`] (new part) and
+    /// [`Self::plan_move`] (lifted part): resolves the parent records,
+    /// reads the stored hover + attach mode, and dispatches to the
+    /// axial or surface half. `bound`/`child_bound` are the
+    /// already-spoken-for node ids on the parent/child;
+    /// `copies` is the radial fan-out (1 for a move).
+    fn plan_edges(
+        &self,
+        parent: PartNodeId,
+        child_def: &PartDef,
+        built: &BuiltPart,
+        bound: &std::collections::BTreeSet<String>,
+        child_bound: &std::collections::BTreeSet<String>,
+        copies: usize,
+    ) -> AttachPlan {
+        let mut plan = AttachPlan::default();
+        macro_rules! fail {
+            ($why:expr) => {{
+                plan.error = Some($why);
+                return plan;
+            }};
+        }
         let Some(parent_rec) = self.session.node(parent) else {
             fail!(format!("node {parent:?} is not placed"));
         };
@@ -940,13 +1267,6 @@ impl VabSession {
         let Some(parent_def) = self.def_by_id(&parent_part) else {
             fail!(format!("part '{parent_part}' is not in the loaded catalog"));
         };
-        let Some(child_def) = self.def_by_id(part) else {
-            fail!(format!("part '{part}' is not in the loaded catalog"));
-        };
-        let Ok(built) = self.stock_build(part) else {
-            fail!(format!("part '{part}' cannot be built"));
-        };
-        let bound = self.session.bound_attach_nodes(parent);
         let hit = self.hover.filter(|h| h.node == parent);
         let mode = match self.attach_mode {
             AttachMode::Auto => match hit.map(|h| h.region) {
@@ -957,20 +1277,37 @@ impl VabSession {
         };
         match mode {
             AttachMode::Axial | AttachMode::Auto => self.plan_axial(
-                parent, parent_def, child_def, &built, &bound, hit, &mut plan,
+                parent,
+                parent_def,
+                child_def,
+                built,
+                bound,
+                child_bound,
+                hit,
+                &mut plan,
             ),
             AttachMode::Side | AttachMode::End => self.plan_radial(
-                parent, parent_def, child_def, &built, &bound, hit, p_scale, p_stretch, mode,
+                parent,
+                parent_def,
+                child_def,
+                built,
+                bound,
+                child_bound,
+                hit,
+                p_scale,
+                p_stretch,
+                mode,
+                copies,
                 &mut plan,
             ),
         }
         plan
     }
 
-    /// The axial half of [`Self::plan_attach`] — the authored snap
+    /// The axial half of [`Self::plan_edges`] — the authored snap
     /// graph on the side the hit named (default: the down-stack face,
     /// the same preference `attach_auto` applies). Candidates are the
-    /// (free parent node, child node) pairs ordered by
+    /// (free parent node, free child node) pairs ordered by
     /// (side-match, least-twist); the first one the session's own
     /// `preview_attach` accepts wins.
     #[allow(clippy::too_many_arguments)] // the plan context is one unit; a params struct would obscure it
@@ -981,6 +1318,7 @@ impl VabSession {
         child_def: &PartDef,
         built: &BuiltPart,
         bound: &std::collections::BTreeSet<String>,
+        child_bound: &std::collections::BTreeSet<String>,
         hit: Option<HoverHit>,
         plan: &mut AttachPlan,
     ) {
@@ -1028,6 +1366,11 @@ impl VabSession {
                 facing < 0.0
             };
             for cn in &child_def.attach_nodes {
+                // A moved part's children already own some of its
+                // nodes — a node can't mate twice.
+                if child_bound.contains(&cn.id) {
+                    continue;
+                }
                 let twist = cn.direction.dot(-pn.direction);
                 candidates.push((&pn.id, &cn.id, i32::from(side_match), twist));
             }
@@ -1051,11 +1394,12 @@ impl VabSession {
         }));
     }
 
-    /// The surface-mount half of [`Self::plan_attach`]: a synthesized
-    /// `surf:` parent node at the hit's azimuth/height, `symmetry`
-    /// copies fanned around the parent's axis. `Side` mounts the child
-    /// upright on its own `surf:` side node; `End` mates the child's
-    /// most axial authored node so the part protrudes.
+    /// The surface-mount half of [`Self::plan_edges`]: a synthesized
+    /// `surf:` parent node at the hit's azimuth/height, `copies`
+    /// fanned around the parent's axis (`symmetry` for a new part, 1
+    /// for a move). `Side` mounts the child upright on its own
+    /// `surf:` side node; `End` mates the child's most axial *free*
+    /// authored node so the part protrudes.
     #[allow(clippy::too_many_arguments)]
     fn plan_radial(
         &self,
@@ -1064,10 +1408,12 @@ impl VabSession {
         child_def: &PartDef,
         built: &BuiltPart,
         bound: &std::collections::BTreeSet<String>,
+        child_bound: &std::collections::BTreeSet<String>,
         hit: Option<HoverHit>,
         p_scale: f64,
         p_stretch: f64,
         mode: AttachMode,
+        copies: usize,
         plan: &mut AttachPlan,
     ) {
         let Some(defs) = self.catalog() else {
@@ -1087,19 +1433,21 @@ impl VabSession {
         let azimuth = libm::atan2(hit.local.y, hit.local.x);
         // `End` mode mates the child's authored node closest to its
         // own stack axis — resolved once up front so the parent
-        // surface node's size class matches it exactly.
+        // surface node's size class matches it exactly. Nodes a moved
+        // part's children already own are not candidates.
         let end_node = (mode == AttachMode::End)
             .then(|| {
                 child_def
                     .attach_nodes
                     .iter()
+                    .filter(|n| !child_bound.contains(&n.id))
                     .max_by(|a, b| a.direction.z.abs().total_cmp(&b.direction.z.abs()))
                     .map(|n| (n.id.clone(), n.diameter_m * built.scale))
             })
             .flatten();
         if mode == AttachMode::End && end_node.is_none() {
             plan.error = Some(format!(
-                "{} has no attach nodes to mount by",
+                "{} has no free attach node to mount by",
                 self.display_name(&child_def.id)
             ));
             return;
@@ -1114,7 +1462,7 @@ impl VabSession {
                 .map(|n| n.diameter_m * built.scale)
                 .unwrap_or(0.625)
         });
-        let copies = usize::from(self.symmetry.max(1));
+        let copies = copies.max(1);
         for k in 0..copies {
             let th = azimuth + k as f64 * 2.0 * core::f64::consts::PI / copies as f64;
             let (sy, cy) = libm::sincos(th);
@@ -1137,6 +1485,12 @@ impl VabSession {
                         -u,
                         mount_dia,
                     );
+                    // A moved part's own children can already own this
+                    // synthesized hull node — no double-mating.
+                    if child_bound.contains(&child_id) {
+                        plan.error = Some("the part's hull mount point is occupied".to_string());
+                        return;
+                    }
                     AttachEdge::new(parent, &parent_id, &child_id)
                 }
                 _ => {
@@ -1220,15 +1574,45 @@ impl VabSession {
     /// through it; `None` when the catalog/resources are not loaded
     /// or the def fails to resolve.
     pub fn resolve_stock(&self, part_id: &PartId) -> Option<EffectivePart> {
-        let def = self.def_by_id(part_id)?;
+        self.resolve_built(&self.stock_build(part_id).ok()?)
+    }
+
+    /// Any `BuiltPart` resolved — the moved-part ghost's resolve:
+    /// the node's actual variant/scale/stretch, not the stock build.
+    /// `None` when the catalog/resources are not loaded or the def
+    /// fails to resolve.
+    pub fn resolve_built(&self, built: &BuiltPart) -> Option<EffectivePart> {
+        let def = self.def_by_id(&built.part_id)?;
         let res = self.resources.as_ref()?;
         csp_phys::resolve::resolve_built_part(
             def,
-            &self.stock_build(part_id).ok()?,
+            built,
             res,
             &csp_phys::FamilyQualification::FRESH,
         )
         .ok()
+    }
+
+    /// `(id, transform-relative-to-subtree-root)` for `node` and its
+    /// descendants — the carried-subtree ghost's rigidity: the lifted
+    /// node folds to the identity and each child's stored parent-local
+    /// transform composes under its parent's, so the whole subtree
+    /// moves as one rigid body wherever the lift lands.
+    pub fn subtree_rel_transforms(&self, node: PartNodeId) -> Vec<(PartNodeId, PartTransform)> {
+        let mut out = Vec::new();
+        if !self.session.contains(node) {
+            return out;
+        }
+        let mut stack = vec![(node, PartTransform::IDENTITY)];
+        while let Some((id, rel)) = stack.pop() {
+            out.push((id, rel));
+            for c in self.session.children_ids(id) {
+                if let Some(n) = self.session.node(c) {
+                    stack.push((c, rel.compose(n.transform())));
+                }
+            }
+        }
+        out
     }
 
     /// Snap `part` under `parent` — the honest M3 auto-placement:
@@ -1518,31 +1902,41 @@ pub fn vab_editor(
 }
 
 /// The pointer/hotkey half of the editor pass — runs after the panels
-/// so their window rects are known:
+/// so their window rects are known. The KSP held-part gesture layer:
 ///
 /// - publishes the viewport cursor (physical px) into the session so
 ///   `csp-view` can cast the CPU hover ray — `None` while the pointer
 ///   is over a panel or off the window;
-/// - resolves an in-flight palette drag on release: over the craft
-///   viewport it attaches at the hover target ([`VabAction::
-///   PlaceAtHover`]), over a panel or dead space it cancels;
-/// - right-click over the viewport removes the *hovered* part's
-///   subtree (the craft tree's context menu and the Del key cover the
-///   selected part);
-/// - `Del`/`Backspace` removes the selected part, `Esc` cancels a
-///   placement or deselects, `X` cycles radial symmetry 1→2→4.
+/// - tracks the LMB press: a press that began on a placed part and
+///   became a drag *lifts* the part for a move (the camera orbit is
+///   suppressed by `orbit_block` for the press's whole life);
+/// - resolves the LMB release: a lifted part dropped over the
+///   viewport commits at the hover target ([`VabAction::Drop`]),
+///   dropped over the palette is deleted (KSP's bin), dropped over
+///   another panel stays held; a palette drag drops the same way and
+///   cancels over a panel;
+/// - right-click over the viewport puts the carried part back, or —
+///   carrying nothing — removes the *hovered* part's subtree;
+/// - `Del`/`Backspace` removes the selected part, `Esc` puts the
+///   carried part back or deselects, `X` cycles radial symmetry 1→2→4.
+#[allow(clippy::too_many_lines)] // one gesture pass — each branch is one input's resolution
 fn vab_pointer_input(ctx: &egui::Context, vab: &mut VabSession, panels: &[egui::Rect]) {
-    let (pos, released, secondary, del, esc, sym_key, typing) = ctx.input(|i| {
-        (
-            i.pointer.hover_pos(),
-            i.pointer.any_released(),
-            i.pointer.secondary_clicked(),
-            i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace),
-            i.key_pressed(egui::Key::Escape),
-            i.key_pressed(egui::Key::X),
-            i.focused,
-        )
-    });
+    use egui::PointerButton;
+    let (pos, pressed, primary_down, released, deciding, secondary, del, esc, sym_key, typing) =
+        ctx.input(|i| {
+            (
+                i.pointer.hover_pos(),
+                i.pointer.button_pressed(PointerButton::Primary),
+                i.pointer.primary_down(),
+                i.pointer.button_released(PointerButton::Primary),
+                i.pointer.is_decidedly_dragging(),
+                i.pointer.secondary_clicked(),
+                i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace),
+                i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::X),
+                i.focused,
+            )
+        });
     let ppp = ctx.pixels_per_point();
     // The viewport is the content rect minus the floating panels —
     // egui's `is_pointer_over_area` misreports during drags (the drag
@@ -1555,23 +1949,70 @@ fn vab_pointer_input(ctx: &egui::Context, vab: &mut VabSession, panels: &[egui::
         None
     });
 
-    // The palette drag resolves on release: attach at the hover
-    // target over the viewport, cancel over a panel or dead space.
-    if released && let Some(part) = vab.drag_part().cloned() {
-        vab.set_drag_part(None);
-        if over_viewport {
-            let _ = vab.apply(VabAction::PlaceAtHover { part });
-        }
+    // The press anchor: which placed part (if any) the LMB press
+    // began on — the drag-lift candidate.
+    if pressed {
+        vab.set_press_node(if over_viewport {
+            vab.hover().map(|h| h.node)
+        } else {
+            None
+        });
+    }
+    if !primary_down {
+        vab.set_press_node(None);
     }
 
-    // Right-click over the viewport removes the hovered part — the
-    // 3D surface is wgpu, not egui, so the gesture is read here
-    // through the same hover pick the ghost uses.
-    if secondary
-        && over_viewport
-        && let Some(hit) = vab.hover()
+    // An LMB press carrying a part — or begun on one, about to lift
+    // it — is a placement/move gesture, not a camera drag: `csp-view`
+    // skips orbit deltas while this is set.
+    vab.set_orbit_block(
+        primary_down && over_viewport && (vab.carried().is_some() || vab.press_node().is_some()),
+    );
+
+    // The drag-lift: a press on a placed part that became a drag
+    // picks the part up. `carried` fills on the grab, so this fires
+    // once per press at most.
+    if primary_down
+        && deciding
+        && vab.carried().is_none()
+        && let Some(n) = vab.press_node()
     {
-        let _ = vab.apply(VabAction::Remove(hit.node));
+        let _ = vab.apply(VabAction::Grab(n));
+    }
+
+    if released {
+        // A lifted part dropped over the palette is deleted — KSP's
+        // drag-to-the-parts-list bin; over the viewport it commits at
+        // the hover target; over any other panel it stays held.
+        if let Some(node) = vab.move_node() {
+            if pos.is_some_and(|p| panels.first().is_some_and(|r| r.contains(p))) {
+                let _ = vab.apply(VabAction::Remove(node));
+            } else if over_viewport {
+                let _ = vab.apply(VabAction::Drop);
+            }
+        }
+        // The palette drag resolves on release — through the same
+        // `Drop` as a click, so a drop with nothing under it just
+        // keeps the part held; over a panel it cancels.
+        if vab.drag_part().is_some() {
+            vab.set_drag_part(None);
+            if over_viewport {
+                let _ = vab.apply(VabAction::Drop);
+            } else {
+                let _ = vab.apply(VabAction::CancelPlacement);
+            }
+        }
+        vab.set_press_node(None);
+    }
+
+    // Right-click over the viewport: carrying a part it puts it back
+    // (the cancel); carrying nothing it removes the hovered part.
+    if secondary && over_viewport {
+        if vab.carried().is_some() {
+            let _ = vab.apply(VabAction::CancelPlacement);
+        } else if let Some(hit) = vab.hover() {
+            let _ = vab.apply(VabAction::Remove(hit.node));
+        }
     }
 
     // Hotkeys — gated on no text field wanting the input so a rename
@@ -1583,9 +2024,8 @@ fn vab_pointer_input(ctx: &egui::Context, vab: &mut VabSession, panels: &[egui::
         let _ = vab.apply(VabAction::Remove(id));
     }
     if esc {
-        if vab.pending_part().is_some() || vab.drag_part().is_some() {
+        if vab.carried().is_some() {
             let _ = vab.apply(VabAction::CancelPlacement);
-            vab.set_drag_part(None);
         } else {
             let _ = vab.apply(VabAction::Select(None));
         }
@@ -1637,13 +2077,17 @@ fn action_bar(ctx: &egui::Context, vab: &mut VabSession) -> egui::Rect {
                 }
                 ui.separator();
                 if let Some(id) = vab.selected()
-                    && ui.button("Remove selected").clicked()
+                    && vab.carried().is_none()
                 {
-                    let _ = vab.apply(VabAction::Remove(id));
+                    if ui.button("Pick up (move)").clicked() {
+                        let _ = vab.apply(VabAction::Grab(id));
+                    }
+                    if ui.button("Remove").clicked() {
+                        let _ = vab.apply(VabAction::Remove(id));
+                    }
                 }
-                if vab.armed_part().is_some() && ui.button("Cancel placement").clicked() {
+                if vab.carried().is_some() && ui.button("Put back (Esc)").clicked() {
                     let _ = vab.apply(VabAction::CancelPlacement);
-                    vab.set_drag_part(None);
                 }
             });
         })
@@ -1880,10 +2324,13 @@ fn palette_panel(ctx: &egui::Context, vab: &mut VabSession) -> egui::Rect {
                         .collect(),
                 }
             };
-            let pending_name = vab.pending_part().map(|p| vab.display_name(p));
+            let carried_label = match vab.carried() {
+                Some(Carried::Placing(p)) => Some(format!("{} (new part)", vab.display_name(p))),
+                Some(Carried::Moving(n)) => Some(format!("{} (moving)", vab.node_label(n))),
+                None => None,
+            };
             let empty = vab.session().is_empty();
-            let sel_name = vab.selected().map(|id| vab.node_label(id));
-            palette_banner(ui, vab, pending_name.as_deref(), empty, sel_name.as_deref());
+            palette_banner(ui, vab, carried_label.as_deref(), empty);
 
             if grouped.is_empty() && vab.catalog().is_some() {
                 ui.weak("catalog is empty");
@@ -1900,11 +2347,9 @@ fn palette_panel(ctx: &egui::Context, vab: &mut VabSession) -> egui::Rect {
                                 for row in rows {
                                     let armed = vab.armed_part() == Some(&row.id);
                                     let verb = if empty {
-                                        "place as the craft root"
-                                    } else if sel_name.is_some() {
-                                        "attach under the selected part"
+                                        "pick up, then click the build area to place it"
                                     } else {
-                                        "start placing (then click the parent)"
+                                        "pick up, then click a craft part to attach it"
                                     };
                                     palette_row(ui, vab, &row, armed, verb);
                                 }
@@ -1984,46 +2429,39 @@ fn palette_row(ui: &mut egui::Ui, vab: &mut VabSession, row: &PaletteRow, armed:
 }
 
 /// The palette's state banner — the one line that says what the next
-/// catalog click does BEFORE the player commits. The old "select a
-/// parent part first" notice answered after the fact and left the
-/// attach step undiscoverable; pending placement turns the same
-/// gesture into the guided "click a part, then click where it
-/// attaches" flow.
+/// click does BEFORE the player commits: carrying a part, what will
+/// place it and what puts it back; otherwise how the pick-up flow
+/// reads.
 fn palette_banner(
     ui: &mut egui::Ui,
     vab: &mut VabSession,
-    pending_name: Option<&str>,
+    carried_label: Option<&str>,
     empty: bool,
-    sel_name: Option<&str>,
 ) {
     if vab.catalog().is_none() {
         ui.colored_label(
             egui::Color32::RED,
             "part catalog not loaded — nothing can be placed",
         );
-    } else if let Some(name) = pending_name {
+    } else if let Some(name) = carried_label {
         ui.group(|ui| {
             ui.colored_label(
                 egui::Color32::LIGHT_GREEN,
                 format!(
-                    "Placing {name} — click the craft part to attach it under \
-                     (3D view, craft tree below, or a stage row)."
+                    "Carrying {name} — click a craft part to place it; \
+                     Esc or right-click puts it back."
                 ),
             );
-            if ui.small_button("cancel placement").clicked() {
+            if ui.small_button("put it back").clicked() {
                 let _ = vab.apply(VabAction::CancelPlacement);
             }
         });
     } else if empty {
-        ui.label("Empty craft — click a part to place it as the root.");
-    } else if let Some(sel) = sel_name {
-        ui.label(format!(
-            "Click a part to attach it under the selected {sel}."
-        ));
+        ui.label("Empty craft — pick up a part, then click the build area to place it.");
     } else {
         ui.label(
-            "Click a part, then click the craft part it attaches under \
-             (3D view, craft tree, or stage row).",
+            "Pick up a part (click or drag), hover the craft to snap it, \
+             click to place. Drag a placed part to move it.",
         );
     }
 }
@@ -2069,6 +2507,10 @@ fn craft_tree(ui: &mut egui::Ui, vab: &mut VabSession) {
                 resp.context_menu(|ui| {
                     if ui.button("select").clicked() {
                         pending.push(VabAction::Select(Some(id)));
+                        ui.close();
+                    }
+                    if ui.button("pick up (move)").clicked() {
+                        pending.push(VabAction::Grab(id));
                         ui.close();
                     }
                     if ui.button("make root").clicked() {
@@ -2355,8 +2797,8 @@ fn staging_section(ui: &mut egui::Ui, vab: &mut VabSession) {
 fn selected_section(ui: &mut egui::Ui, vab: &mut VabSession) {
     ui.heading("Selected part");
     let Some(id) = vab.selected() else {
-        ui.weak(if vab.pending_part().is_some() {
-            "placing a part — click the craft part it attaches under"
+        ui.weak(if vab.carried().is_some() {
+            "carrying a part — click a craft part to place it"
         } else {
             "none — click a part in the 3D view, the craft tree, or a stage row"
         });
@@ -2505,6 +2947,9 @@ fn selected_section(ui: &mut egui::Ui, vab: &mut VabSession) {
 /// remove-subtree, deselect.
 fn selected_actions(ui: &mut egui::Ui, vab: &mut VabSession, id: PartNodeId) {
     ui.horizontal(|ui| {
+        if ui.button("pick up (move)").clicked() {
+            let _ = vab.apply(VabAction::Grab(id));
+        }
         if ui.button("make root").clicked() {
             let _ = vab.apply(VabAction::Reroot(id));
         }
@@ -2685,8 +3130,9 @@ fn vab_hint_bar(
                 egui::pos2(rect.left() + 10.0, rect.bottom() - 8.0),
                 egui::Align2::LEFT_BOTTOM,
                 format!(
-                    "VAB  ·  {parts} part(s)  —  [{}] exit  drag: orbit  wheel: zoom  \
-                     click part: select/attach  catalog click: add part",
+                    "VAB  ·  {parts} part(s)  —  [{}] exit  drag empty space: orbit  \
+                     wheel: zoom  click part: select  click/drag selected: move  \
+                     Del/right-click: remove",
                     keys.hint_labeled(crate::settings::KeyAction::ToggleVab, key_labels)
                 ),
                 egui::FontId::proportional(13.0),
@@ -2705,27 +3151,56 @@ fn vab_hint_bar(
                     egui::Color32::YELLOW,
                 );
             }
-            // An armed placement is the banner state — it outranks the
+            // A carried part is the banner state — it outranks the
             // problem line (which still shows in the Craft window).
-            if let Some(p) = vab.pending_part() {
+            // The plan's live refusal rides under it: the ghost is
+            // red, this says *why*.
+            match vab.carried() {
+                Some(Carried::Placing(p)) => {
+                    painter.text(
+                        egui::pos2(rect.center().x, rect.top() + 46.0),
+                        egui::Align2::CENTER_TOP,
+                        format!(
+                            "carrying {} — click a craft part to place it \
+                             (Esc/right-click puts it back)",
+                            vab.display_name(p)
+                        ),
+                        egui::FontId::proportional(15.0),
+                        egui::Color32::LIGHT_GREEN,
+                    );
+                }
+                Some(Carried::Moving(n)) => {
+                    painter.text(
+                        egui::pos2(rect.center().x, rect.top() + 46.0),
+                        egui::Align2::CENTER_TOP,
+                        format!(
+                            "moving {} — click a craft part to reattach it \
+                             (Esc/right-click puts it back, palette deletes)",
+                            vab.node_label(n)
+                        ),
+                        egui::FontId::proportional(15.0),
+                        egui::Color32::LIGHT_GREEN,
+                    );
+                }
+                None => {
+                    if let Some(msg) = &problem {
+                        painter.text(
+                            egui::pos2(rect.center().x, rect.top() + 46.0),
+                            egui::Align2::CENTER_TOP,
+                            msg,
+                            egui::FontId::proportional(15.0),
+                            egui::Color32::RED,
+                        );
+                    }
+                }
+            }
+            if let Some(status) = vab.ghost_status() {
                 painter.text(
-                    egui::pos2(rect.center().x, rect.top() + 46.0),
+                    egui::pos2(rect.center().x, rect.top() + 64.0),
                     egui::Align2::CENTER_TOP,
-                    format!(
-                        "placing {} — click a craft part to attach it under \
-                         (click empty space to cancel)",
-                        vab.display_name(p)
-                    ),
-                    egui::FontId::proportional(15.0),
-                    egui::Color32::LIGHT_GREEN,
-                );
-            } else if let Some(msg) = &problem {
-                painter.text(
-                    egui::pos2(rect.center().x, rect.top() + 46.0),
-                    egui::Align2::CENTER_TOP,
-                    msg,
-                    egui::FontId::proportional(15.0),
-                    egui::Color32::RED,
+                    status,
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_rgb(255, 120, 100),
                 );
             }
         });
@@ -2953,80 +3428,76 @@ mod tests {
         );
     }
 
-    /// The palette's one-click add drives the whole build flow: empty
-    /// craft → root; a selection → immediate attach under it; neither
-    /// → the placement ARMS (pending) and the next `Select` is
-    /// consumed as the parent pick — from a tree row, a stage row, or
-    /// the 3D view's pick, all of which land on `Select`.
+    /// The held-part flow: a catalog click never places — it arms the
+    /// ghost. The NEXT click commits: empty space on an empty craft
+    /// drops the root, a craft part is the snap target. Empty space
+    /// on a non-empty craft keeps the part held — KSP's "nothing on
+    /// empty space".
     #[test]
-    fn catalog_pick_drives_the_build_flow() {
+    fn catalog_pick_arms_the_ghost_then_click_places() {
         let mut vab = VabSession::new(mini_catalog(), mini_resources());
-        // Empty craft → the click places the root.
+        // Empty craft: the click arms, it does NOT place.
         vab.apply(VabAction::CatalogPick(PartId::from("t.tank")))
             .unwrap();
-        let root = vab.session().root().unwrap();
-        assert_eq!(vab.selected(), Some(root));
-        assert!(vab.notice().unwrap().contains("root"));
-        // The root stays selected → the next click attaches under it.
-        vab.apply(VabAction::CatalogPick(PartId::from("t.tank")))
-            .unwrap();
-        assert_eq!(vab.session().len(), 2);
-        let mid = vab.selected().unwrap();
-        assert_ne!(mid, root);
-        // Deselect → a catalog click arms pending placement rather
-        // than dying on "select a parent first".
+        assert_eq!(vab.session().len(), 0);
+        assert_eq!(
+            vab.carried(),
+            Some(Carried::Placing(&PartId::from("t.tank")))
+        );
+        // A background click drops the ghost as the root.
         vab.apply(VabAction::Select(None)).unwrap();
+        assert_eq!(vab.session().len(), 1);
+        assert!(vab.carried().is_none());
+        let root = vab.session().root().unwrap();
+        // Next part: armed ghost, then a click on the root attaches it.
         vab.apply(VabAction::CatalogPick(PartId::from("t.eng")))
             .unwrap();
-        assert_eq!(vab.pending_part(), Some(&PartId::from("t.eng")));
-        assert!(vab.notice().unwrap().contains("placing"));
-        assert_eq!(vab.session().len(), 2); // armed, not placed
-        // The next Select is the parent pick — the guided
-        // "click a part, then click where it attaches".
-        vab.apply(VabAction::Select(Some(mid))).unwrap();
-        assert_eq!(vab.session().len(), 3);
+        assert_eq!(vab.session().len(), 1);
+        vab.apply(VabAction::Select(Some(root))).unwrap();
+        assert_eq!(vab.session().len(), 2);
         assert!(vab.pending_part().is_none());
         assert!(vab.notice().unwrap().contains("attached"));
-        // The new part is selected, so the NEXT catalog click targets
-        // it as parent without an extra click — here honestly refused
-        // (the engine's only node is bound by its own edge), with the
-        // error notice to say why.
-        assert_ne!(vab.selected(), Some(mid));
-        let r = vab.apply(VabAction::CatalogPick(PartId::from("t.tank")));
-        assert!(r.is_err());
-        assert_eq!(vab.session().len(), 3);
-        assert!(vab.notice().unwrap().contains("no compatible"));
-    }
-
-    /// Pending placement has three honest exits — a background click
-    /// (`Select(None)`), the banner's `CancelPlacement`, and
-    /// re-clicking the armed catalog row — and none of them places a
-    /// part.
-    #[test]
-    fn pending_placement_cancels_three_ways() {
-        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        // A background click while the craft is non-empty keeps the
+        // part held — the "cancels every time" trap is gone.
         vab.apply(VabAction::CatalogPick(PartId::from("t.tank")))
             .unwrap();
         vab.apply(VabAction::Select(None)).unwrap();
-        // 1: background click cancels.
+        assert_eq!(vab.session().len(), 2);
+        assert!(vab.pending_part().is_some());
+    }
+
+    /// The held part's honest "put it back" exits — the banner's
+    /// `CancelPlacement`, re-clicking the armed catalog row, and a
+    /// different row swapping the ghost — none of which places a
+    /// part.
+    #[test]
+    fn held_part_exits() {
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        // A one-part craft through the held-part flow: arm, then drop.
+        vab.apply(VabAction::CatalogPick(PartId::from("t.tank")))
+            .unwrap();
+        vab.apply(VabAction::Select(None)).unwrap();
+        assert_eq!(vab.session().len(), 1);
+        // 1: the banner's cancel button (Esc/right-click land here).
         vab.apply(VabAction::CatalogPick(PartId::from("t.eng")))
             .unwrap();
         assert!(vab.pending_part().is_some());
-        vab.apply(VabAction::Select(None)).unwrap();
-        assert!(vab.pending_part().is_none());
-        assert_eq!(vab.session().len(), 1);
-        // 2: the banner's cancel button.
-        vab.apply(VabAction::CatalogPick(PartId::from("t.eng")))
-            .unwrap();
         vab.apply(VabAction::CancelPlacement).unwrap();
         assert!(vab.pending_part().is_none());
         assert_eq!(vab.session().len(), 1);
-        // 3: re-clicking the armed row toggles it off.
+        // 2: re-clicking the armed row puts it back.
         vab.apply(VabAction::CatalogPick(PartId::from("t.eng")))
             .unwrap();
         vab.apply(VabAction::CatalogPick(PartId::from("t.eng")))
             .unwrap();
         assert!(vab.pending_part().is_none());
+        assert_eq!(vab.session().len(), 1);
+        // 3: a different row swaps the held ghost.
+        vab.apply(VabAction::CatalogPick(PartId::from("t.eng")))
+            .unwrap();
+        vab.apply(VabAction::CatalogPick(PartId::from("t.tank")))
+            .unwrap();
+        assert_eq!(vab.pending_part(), Some(&PartId::from("t.tank")));
         assert_eq!(vab.session().len(), 1);
     }
 
@@ -3036,16 +3507,22 @@ mod tests {
     #[test]
     fn failed_pending_attach_keeps_the_arm() {
         let mut vab = VabSession::new(mini_catalog(), mini_resources());
-        vab.apply(VabAction::CatalogPick(PartId::from("t.tank")))
+        vab.apply(VabAction::SetRoot(PartId::from("t.tank")))
             .unwrap();
-        vab.apply(VabAction::CatalogPick(PartId::from("t.tank")))
-            .unwrap();
+        let root = vab.session().root().unwrap();
+        vab.apply(VabAction::AttachAuto {
+            part: PartId::from("t.tank"),
+            parent: root,
+        })
+        .unwrap();
         let mid = vab.selected().unwrap();
-        // Bind the mid tank's bottom node too — then it has no honest
-        // mate left for the armed engine.
-        vab.apply(VabAction::CatalogPick(PartId::from("t.eng")))
-            .unwrap();
-        vab.apply(VabAction::Select(None)).unwrap();
+        // Bind BOTH of mid's stack nodes — its top by its own edge,
+        // its bottom by an engine.
+        vab.apply(VabAction::AttachAuto {
+            part: PartId::from("t.eng"),
+            parent: mid,
+        })
+        .unwrap();
         vab.apply(VabAction::CatalogPick(PartId::from("t.eng")))
             .unwrap();
         let r = vab.apply(VabAction::Select(Some(mid)));
@@ -3053,10 +3530,139 @@ mod tests {
         assert!(vab.pending_part().is_some());
         assert!(vab.notice().unwrap().contains("no compatible"));
         // Picking the root (free top node) instead completes it.
-        let root = vab.session().root().unwrap();
         vab.apply(VabAction::Select(Some(root))).unwrap();
         assert_eq!(vab.session().len(), 4);
         assert!(vab.pending_part().is_none());
+    }
+
+    /// Grab lifts a placed part onto the cursor; the drop reattaches
+    /// it — the node keeps its id, its build, and its whole subtree.
+    #[test]
+    fn grab_lifts_and_drop_moves_the_real_node() {
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        vab.apply(VabAction::SetRoot(PartId::from("t.tank")))
+            .unwrap();
+        let root = vab.session().root().unwrap();
+        vab.apply(VabAction::AttachAuto {
+            part: PartId::from("t.tank"),
+            parent: root,
+        })
+        .unwrap();
+        let mid = vab.selected().unwrap();
+        vab.apply(VabAction::AttachAuto {
+            part: PartId::from("t.eng"),
+            parent: mid,
+        })
+        .unwrap();
+        let eng = vab.selected().unwrap();
+        // The lift removes nothing — the node stays in the session.
+        vab.apply(VabAction::Grab(mid)).unwrap();
+        assert_eq!(vab.move_node(), Some(mid));
+        assert_eq!(vab.session().len(), 3);
+        assert_eq!(vab.carried(), Some(Carried::Moving(mid)));
+        // A drop with nothing under the cursor keeps it held.
+        vab.apply(VabAction::Drop).unwrap();
+        assert_eq!(vab.move_node(), Some(mid));
+        // Drop it on the root's top cap — a real reattach.
+        vab.set_hover(Some(HoverHit {
+            node: root,
+            local: DVec3::new(0.0, 0.0, 0.5),
+            region: AttachRegion::TopCap,
+        }));
+        vab.apply(VabAction::Drop).unwrap();
+        assert!(vab.move_node().is_none());
+        assert_eq!(vab.selected(), Some(mid));
+        let edge = vab.session().node(mid).unwrap().edge().unwrap().clone();
+        assert_eq!(edge.parent, root);
+        assert_eq!(edge.parent_node, "top");
+        assert!(vab.session().node(mid).unwrap().transform().offset.z > 0.0);
+        // The engine followed — same ids, same subtree.
+        assert_eq!(vab.session().node(eng).unwrap().edge().unwrap().parent, mid);
+        assert_eq!(vab.session().len(), 3);
+    }
+
+    /// The move's own-subtree drop puts the part back, a cancel puts
+    /// it back untouched, and the root refuses to lift at all.
+    #[test]
+    fn move_cancel_and_self_drop_put_it_back() {
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        vab.apply(VabAction::SetRoot(PartId::from("t.tank")))
+            .unwrap();
+        let root = vab.session().root().unwrap();
+        vab.apply(VabAction::AttachAuto {
+            part: PartId::from("t.tank"),
+            parent: root,
+        })
+        .unwrap();
+        let mid = vab.selected().unwrap();
+        let mid_edge = vab.session().node(mid).unwrap().edge().unwrap().clone();
+        // The root refuses — it defines the build frame.
+        vab.apply(VabAction::Grab(root)).unwrap();
+        assert!(vab.move_node().is_none());
+        assert!(vab.notice().unwrap().contains("root"));
+        // A cancel puts the lifted part back, edge untouched.
+        vab.apply(VabAction::Grab(mid)).unwrap();
+        assert_eq!(vab.move_node(), Some(mid));
+        vab.apply(VabAction::CancelPlacement).unwrap();
+        assert!(vab.move_node().is_none());
+        assert_eq!(*vab.session().node(mid).unwrap().edge().unwrap(), mid_edge);
+        // Dropping on its own subtree reads "put it back" too — a
+        // child of mid can't be its parent.
+        vab.apply(VabAction::AttachAuto {
+            part: PartId::from("t.eng"),
+            parent: mid,
+        })
+        .unwrap();
+        let eng = vab.selected().unwrap();
+        vab.apply(VabAction::Grab(mid)).unwrap();
+        vab.apply(VabAction::Select(Some(eng))).unwrap();
+        assert!(vab.move_node().is_none());
+        assert_eq!(*vab.session().node(mid).unwrap().edge().unwrap(), mid_edge);
+        // A click on the already-selected part lifts it — the
+        // click-to-move affordance.
+        vab.apply(VabAction::Select(Some(mid))).unwrap();
+        assert!(vab.move_node().is_none());
+        vab.apply(VabAction::Select(Some(mid))).unwrap();
+        assert_eq!(vab.move_node(), Some(mid));
+    }
+
+    /// The move plan frees both ends of the lifted edge — a move that
+    /// lands where the part already hangs is a valid plan — while
+    /// nodes its children own stay bound.
+    #[test]
+    fn plan_move_frees_the_old_edge_not_the_children() {
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        vab.apply(VabAction::SetRoot(PartId::from("t.tank")))
+            .unwrap();
+        let root = vab.session().root().unwrap();
+        vab.apply(VabAction::AttachAuto {
+            part: PartId::from("t.tank"),
+            parent: root,
+        })
+        .unwrap();
+        let mid = vab.selected().unwrap();
+        vab.apply(VabAction::AttachAuto {
+            part: PartId::from("t.eng"),
+            parent: mid,
+        })
+        .unwrap();
+        // Moving mid back under the root (its bottom is spoken for by
+        // mid's current edge → freed by the plan): the plan exists,
+        // and mid's own "bottom" — bound by the engine — cannot be
+        // the child's mount node.
+        vab.set_hover(Some(HoverHit {
+            node: root,
+            local: DVec3::new(0.0, 0.0, 0.5),
+            region: AttachRegion::TopCap,
+        }));
+        let plan = vab.plan_move(mid, root);
+        assert_eq!(plan.edges.len(), 1, "plan error: {:?}", plan.error);
+        assert_eq!(plan.edges[0].parent_node, "top");
+        assert_eq!(plan.edges[0].child_node, "top");
+        // Into its own subtree — refused at the plan, not the commit.
+        let plan = vab.plan_move(mid, vab.selected().unwrap());
+        assert!(plan.edges.is_empty());
+        assert!(plan.error.unwrap().contains("subtree"));
     }
 
     /// `display_name` resolves a def's `LocKey` through the installed
