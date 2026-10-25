@@ -2471,13 +2471,16 @@ impl World {
     /// The §2.9 geometric ground-contact predicate applied on demand
     /// to `vessel`'s bubble body — `false` for non-`InBubble` vessels
     /// and worlds without physics. Pure geometry over already-hashed
-    /// state (pos/rot + hulls vs. the environment sphere); derived,
-    /// never stored. The presentation layer's contact-VFX hook
-    /// (PLAN §3.7's ground-contact dust).
+    /// state (pos/rot + hulls vs. the environment's contact surface —
+    /// the displaced heightfield when the env carries terrain);
+    /// derived, never stored. The presentation layer's contact-VFX
+    /// hook (PLAN §3.7's ground-contact dust).
     pub fn ground_contact(&self, vessel: VesselId) -> bool {
         let (Some(p), Some(v)) = (self.physics.as_ref(), self.vessels.get(&vessel)) else {
             return false;
         };
+        // Terrain is body-fixed — sample it at the state's tick.
+        p.backend.set_sim_time(self.clock);
         match &v.state {
             VesselState::InBubble(b) => p.backend.ground_contact(b),
             _ => false,
@@ -3067,6 +3070,9 @@ impl World {
         // no warm-start state to lose — but the refusal is the plan's
         // letter and protects the same case the Rapier path will need.
         if let Some(physics) = &self.physics {
+            // Terrain is body-fixed — the contact predicate samples it
+            // at the state's spin phase.
+            physics.backend.set_sim_time(self.clock);
             for vessel in self.vessels.values() {
                 if let VesselState::InBubble(body) = &vessel.state
                     && (physics.backend.ground_contact(body)
@@ -3231,6 +3237,9 @@ impl World {
             }
         }
         let physics = self.physics.as_ref()?;
+        // Terrain is body-fixed — the contact predicate samples it at
+        // the state's spin phase.
+        physics.backend.set_sim_time(self.clock);
         let env = physics.backend.environment();
         for vessel in self.vessels.values() {
             let VesselState::InBubble(body) = &vessel.state else {
@@ -3526,6 +3535,14 @@ impl World {
             // already ran) — "one drain producing stamps per tick
             // value" holds.
             self.clock = SimTime::from_ticks(t);
+            // The heightfield contact surface is body-fixed: every
+            // ground evaluation this tick (the drain's predicates
+            // and the bubble step alike) samples it at this tick's
+            // spin phase — the same convention `surface_pose_capture`
+            // and the renderer's `spin_phase` use.
+            if let Some(p) = &self.physics {
+                p.backend.set_sim_time(self.clock);
+            }
             self.drain_at(t, effective_target, shadow, commands_applied, rejected)?;
             self.control_tick(t, shadow, degraded)?;
             let Self {
@@ -5372,6 +5389,9 @@ impl World {
                     .physics
                     .as_ref()
                     .ok_or(SimError::Fatal("to-rails: physics vanished"))?;
+                // Terrain is body-fixed — the contact predicate
+                // samples it at the state's spin phase.
+                physics.backend.set_sim_time(self.clock);
                 if physics.backend.ground_contact(body)
                     || bubble_vessel_contact(&physics.backend, &self.vessels, vessel, body, false)
                 {
@@ -12580,6 +12600,9 @@ mod tests {
             settle_ticks: 128,
             friction_mu: 0.5,
             drag_cd: 1.0,
+            // Bare-sphere ground — the suite's landing/impact fixtures
+            // are authored against the datum, not a seeded field.
+            terrain: None,
         }
     }
 

@@ -4569,6 +4569,7 @@ mod tests {
                 settle_ticks: 128,
                 friction_mu: 0.5,
                 drag_cd: 1.0,
+                terrain: None,
             },
             dominant: BodyId::from("terra"),
         }

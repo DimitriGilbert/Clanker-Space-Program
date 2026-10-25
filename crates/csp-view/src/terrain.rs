@@ -24,15 +24,16 @@ use csp_render::terrain as rt;
 use crate::flight::FlightEnv;
 use crate::map::MapCameraF64;
 
-/// Heightfield bake dimensions (equirect texels). 1024×512 ≈ 3.7 km
-/// texels at Terrin's 600 km radius — the low-frequency surface the
-/// R2 quadtree displaces; finer relief is R4 scatter/VT territory.
-const HEIGHTFIELD_W: u32 = 1024;
-const HEIGHTFIELD_H: u32 = 512;
-
-/// Terrain amplitude as a fraction of the body radius — ~2.4 km of
-/// relief at Terrin, proportionally less on moons.
-const AMPLITUDE_FRAC: f64 = 0.004;
+// Heightfield bake dims + amplitude share `csp_core::terrain`'s
+// constants — the physics contact surface (`csp-phys` `TerrainSurface`)
+// bakes the SAME field at the SAME scale, so the ground the solver
+// contacts is bit-identical to the surface this module draws.
+// 1024×512 ≈ 3.7 km texels at Terrin's 600 km radius — the low-
+// frequency surface the R2 quadtree displaces; finer relief is R4
+// scatter/VT territory.
+use csp_core::terrain::{
+    AMPLITUDE_FRAC, BAKE_HEIGHT as HEIGHTFIELD_H, BAKE_WIDTH as HEIGHTFIELD_W,
+};
 
 /// Fallback sun direction when the world has no resolvable star —
 /// unnormalized (callers divide by `norm`, like `flight.rs`'s copy).

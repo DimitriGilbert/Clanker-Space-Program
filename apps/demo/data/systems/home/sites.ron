@@ -12,11 +12,13 @@
             body: "terrin",
             // Mirror of data/systems/home/sites.ron: just south of the
             // equator on a shoreline where the baked heightfield
-            // (noise_seed 601) is ~0 m against the sim's datum contact
-            // sphere — the old lon-π site sits under a +57 m hill and
-            // a datum-spawned craft would render buried. lon 2.916 is
-            // ~0.23 rad west of the t=0 sun meridian: a morning pad,
-            // ~1.7 h of daylight at spawn.
+            // (noise_seed 601) — which is BOTH the sim's contact
+            // surface and the rendered ground — is ~0 m against datum:
+            // a flat pad, and altimetry that stays honest. The old
+            // lon-π site sits atop a +57 m hill — a pad there would
+            // be parked on a slope. lon 2.916 is ~0.23 rad west of the
+            // t=0 sun meridian: a morning pad, ~1.7 h of daylight at
+            // spawn.
             latitude_rad: -0.092,
             longitude_rad: 2.916,
             altitude_m: 0.0,

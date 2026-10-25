@@ -861,9 +861,13 @@ mod tests {
     }
 
     /// The measurement env — Terrin's numbers (non-spinning: a
-    /// free-flight cost isolate).
+    /// free-flight cost isolate). Terrain is detached: the "in
+    /// contact" half poses its body at `radius + 3.1` — a seeded
+    /// ±amplitude surface would either float it kilometres or bury
+    /// it, and neither measures the resting-solve cost the fixture
+    /// is named for.
     fn env_for_measure() -> Environment {
-        Environment::for_body(
+        let mut env = Environment::for_body(
             &csp_data::BodyDef {
                 schema_version: 1,
                 id: BodyId::from("terrin"),
@@ -887,7 +891,9 @@ mod tests {
             },
             DVec3::ZERO,
             None,
-        )
+        );
+        env.terrain = None;
+        env
     }
 
     /// Osculating `(apo, peri)` ALTITUDES of `FLIGHT_VESSEL` — the

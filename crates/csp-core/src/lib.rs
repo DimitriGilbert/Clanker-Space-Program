@@ -14,6 +14,7 @@ mod error;
 mod hash;
 mod quat;
 mod rng;
+pub mod terrain;
 mod time;
 mod vec3;
 

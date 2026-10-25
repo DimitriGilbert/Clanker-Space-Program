@@ -2121,6 +2121,7 @@ mod tests {
             settle_ticks: 128,
             friction_mu: 0.4,
             drag_cd: 1.0,
+            terrain: None,
         };
         let mut sim = SimWorld::with_physics(
             test_system(),

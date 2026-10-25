@@ -62,14 +62,20 @@
 //!
 //! # Contact model
 //!
-//! The environment's ground is a **sphere of `radius_m` centred at
-//! `body_center`** (§2.3: at 600 km the surface is locally flat to
-//! µm and the exact sphere keeps lat/long meaningful). Generation:
-//! every collider vertex whose world position falls below the surface
-//! (`‖p − c‖ < R`) produces one manifold point `{pos, normal = up,
-//! depth}` — vertex-only contact per the M2 scope; face/edge contacts
-//! on a curved surface differ from the vertex manifold by ≪ µm at
-//! home-planet radius.
+//! The environment's ground is the **contact surface
+//! [`Environment::surface_radius`]`(dir)` — the sphere of `radius_m`
+//! centred at `body_center` for `terrain: None`, and the displaced
+//! seeded heightfield `radius_m + h(dir)·amplitude` (the exact
+//! surface `csp-render` draws) when the environment carries a
+//! [`TerrainSurface`] — `Environment::for_body` always attaches one,
+//! so authored worlds contact the rendered ground (§2.3: at 600 km
+//! the surface is locally flat to µm and the sphere keeps lat/long
+//! meaningful). Generation: every collider vertex whose world
+//! position falls below the surface (`‖p − c‖ < surface_radius(p̂)`)
+//! produces one manifold point `{pos, normal = up, depth}` —
+//! vertex-only contact per the M2 scope with a radial "up" normal;
+//! face/edge contacts on a curved surface differ from the vertex
+//! manifold by ≪ µm at home-planet radius.
 //!
 //! **Vessel-vessel contact** (M6 sub-phase A): bodies in one `step`
 //! slice see each other through a symmetric vertex-vs-hull rule — a
@@ -206,9 +212,13 @@
 //! unlatches it first"); the other unlatch triggers (`SimCommand::
 //! Unlatch`, activation, nearby impact) are M2-C World wiring.
 
+use std::cell::{Cell, OnceCell};
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
-use csp_core::{DQuat, DVec3, TICK_HZ};
+use csp_core::terrain::{AMPLITUDE_FRAC, BAKE_HEIGHT, BAKE_WIDTH, HeightField};
+use csp_core::{DQuat, DVec3, SimTime, TICK_HZ};
 use csp_data::{AtmosphereDef, BodyDef};
 
 use crate::backend::{BodyHandle, Contact, Hit, JointDef, JointKind, PhysicsBackend, Ray};
@@ -260,9 +270,102 @@ pub const DEFAULT_DRAG_CD: f64 = 1.0;
 /// ideal-gas density `ρ = pM/(RT)` needs it.
 const R_GAS: f64 = 8.314_462_618_153_24;
 
+/// The seeded heightfield contact surface — the SIM half of the R2
+/// terrain. `csp-render` displaces the drawn surface to
+/// `radius + h(dir)·amplitude` where `h` is the baked equirect field
+/// from `csp_core::terrain`; this type samples the *same* bake so the
+/// ground the solver contacts is bit-identical to the ground the
+/// renderer draws. (The pre-terrain contact surface was the bare
+/// datum sphere — the "sank below the visible ground before the sim
+/// noticed" defect this type exists to close.)
+///
+/// The baked field is a **pure derived cache** of `seed`: it is
+/// skipped by serde (a save/replay carries the seed, not the ~2 MB of
+/// texels) and lazily re-baked on first sample — bit-identical every
+/// time, per `HeightField`'s determinism contract. The `OnceCell`
+/// keeps the `&self` predicate paths (`ground_contact`, `cast_ray`)
+/// honest: evaluation warms the cache without mutating state.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct TerrainSurface {
+    /// `TerrainDef::noise_seed` — the height function's identity.
+    pub seed: u64,
+    /// Height amplitude, metres — `radius_m · AMPLITUDE_FRAC`, the
+    /// same scale `csp-view`'s `TerrainBody::amplitude_m` computes.
+    pub amplitude_m: f64,
+    /// The baked equirect field — derived cache of `seed` (see the
+    /// type doc); `Arc`-shared so an `Environment` clone stays cheap.
+    #[serde(skip)]
+    field: OnceCell<Arc<HeightField>>,
+}
+
+impl TerrainSurface {
+    /// A terrain surface for `seed` — the field bakes lazily on first
+    /// sample (or on [`Self::prewarm`]).
+    pub fn new(seed: u64, amplitude_m: f64) -> Self {
+        Self {
+            seed,
+            amplitude_m,
+            field: OnceCell::new(),
+        }
+    }
+
+    /// A surface over an already-baked field — the test seam: a small
+    /// bake keeps the contact-surface tests fast while exercising the
+    /// identical sample path the full-size field drives.
+    #[cfg(test)]
+    pub(crate) fn with_field(field: HeightField, seed: u64, amplitude_m: f64) -> Self {
+        let s = Self::new(seed, amplitude_m);
+        // New cell — `set` cannot fail on an empty OnceCell.
+        let _ = s.field.set(Arc::new(field));
+        s
+    }
+
+    /// Bake the field now — a construction-time warm-up so the first
+    /// contact tick doesn't eat the ~0.5 M-texel bake mid-frame. Pure
+    /// function of `seed`; safe to call repeatedly.
+    pub fn prewarm(&self) {
+        let _ = self.field();
+    }
+
+    /// The baked field — `get_or_init` behind `OnceCell`, the lazy
+    /// half of [`Self::prewarm`].
+    fn field(&self) -> &Arc<HeightField> {
+        self.field
+            .get_or_init(|| Arc::new(HeightField::bake(self.seed, BAKE_WIDTH, BAKE_HEIGHT)))
+    }
+
+    /// Terrain height above the datum radius at `dir_fixed` — a
+    /// BODY-FIXED unit direction (the inertial→fixed conjugate is the
+    /// caller's; see [`Environment::surface_radius`]). Same value the
+    /// shader's `height_at` computes at the same texel coordinates,
+    /// scaled to metres.
+    pub fn height_m(&self, dir_fixed: DVec3) -> f64 {
+        self.field().sample_dir(dir_fixed) * self.amplitude_m
+    }
+}
+
+impl PartialEq for TerrainSurface {
+    /// Identity is the seeded descriptor — the baked field is a
+    /// derived cache and never participates.
+    fn eq(&self, other: &Self) -> bool {
+        self.seed == other.seed && self.amplitude_m == other.amplitude_m
+    }
+}
+
+impl core::fmt::Debug for TerrainSurface {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TerrainSurface")
+            .field("seed", &self.seed)
+            .field("amplitude_m", &self.amplitude_m)
+            .field("field_baked", &self.field.get().is_some())
+            .finish()
+    }
+}
+
 /// The world a `SimpleBackend` steps inside: the dominant gravitating
-/// body (its sphere is also the contact surface and altimetry datum),
-/// the §3.0 atmosphere, and the solver/latch tunables.
+/// body (its sphere is the altimetry datum and, via [`Self::terrain`],
+/// carries the displaced contact surface), the §3.0 atmosphere, and
+/// the solver/latch tunables.
 ///
 /// Everything is expressed in the **bubble frame** — `body_center` is
 /// where the planet centre sits relative to the bubble origin (§2.3's
@@ -273,7 +376,10 @@ pub struct Environment {
     /// Centre of the dominant body, bubble frame, metres.
     pub body_center: DVec3,
     /// Surface radius (equatorial; axial tilt is 0 across the v1 home
-    /// system, §3.0), metres — the contact sphere.
+    /// system, §3.0), metres — the altimetry datum and, for
+    /// `terrain: None`, the contact sphere (with terrain the datum
+    /// stays `radius_m` and the contact surface is displaced — see
+    /// [`Self::surface_radius`]).
     pub radius_m: f64,
     /// Gravitational parameter μ, m³/s².
     pub mu_m3_per_s2: f64,
@@ -299,6 +405,14 @@ pub struct Environment {
     pub friction_mu: f64,
     /// Pre-voxel drag coefficient (see [`DEFAULT_DRAG_CD`]).
     pub drag_cd: f64,
+    /// The seeded heightfield contact surface (see [`TerrainSurface`]):
+    /// `Some` ⇒ ground contact evaluates against the displaced surface
+    /// `radius_m + h(dir_fixed)` the renderer draws; `None` ⇒ the bare
+    /// datum sphere (test environments, pre-terrain construction
+    /// configs). `serde(default)` keeps pre-terrain save/replay
+    /// artifacts decodable — they replay on the sphere they recorded.
+    #[serde(default)]
+    pub terrain: Option<TerrainSurface>,
 }
 
 impl Environment {
@@ -328,7 +442,42 @@ impl Environment {
             settle_ticks: DEFAULT_SETTLE_TICKS,
             friction_mu: DEFAULT_FRICTION_MU,
             drag_cd: DEFAULT_DRAG_CD,
+            // The seeded surface the renderer draws — `noise_seed` is
+            // the authored `TerrainDef` identity and the amplitude the
+            // shared `AMPLITUDE_FRAC · radius` rule `csp-view`'s
+            // `TerrainBody` computes; sim and render displace to the
+            // same surface by construction.
+            terrain: Some(TerrainSurface::new(
+                body.terrain.noise_seed,
+                body.radius_m * AMPLITUDE_FRAC,
+            )),
         }
+    }
+
+    /// The contact-surface radius along `dir` at sim-second `seconds`
+    /// — `dir` a UNIT body-center-relative direction in the inertial
+    /// bubble frame. `radius_m` for a bare-sphere environment
+    /// (`terrain: None`); with terrain, `radius_m + h·amplitude` where
+    /// `h` is the baked field's bilinear sample.
+    ///
+    /// The heightfield is **body-fixed**: the inertial sample
+    /// direction conjugates by `R(axis, −ω·seconds)` — the same
+    /// `unspin` the vertex shader applies in `vs_terrain`, and the
+    /// same phase convention `bubble.rs`'s surface records use —
+    /// so sim, renderer, and surface rails name the same surface. On
+    /// a non-rotating body (`body_spin == 0`) the conjugate is
+    /// identity and `seconds` is inert.
+    pub fn surface_radius(&self, dir: DVec3, seconds: f64) -> f64 {
+        let Some(t) = &self.terrain else {
+            return self.radius_m;
+        };
+        let omega = self.body_spin.norm();
+        let dir_fixed = if omega > 0.0 {
+            DQuat::from_axis_angle(self.body_spin / omega, -omega * seconds).rotate(dir)
+        } else {
+            dir
+        };
+        self.radius_m + t.height_m(dir_fixed)
     }
 }
 
@@ -1085,6 +1234,16 @@ fn hulls_overlap(a: &WeldedBody, b: &WeldedBody) -> bool {
 #[derive(Clone, Debug)]
 pub struct SimpleBackend {
     env: Environment,
+    /// The sim-second the stepped/predicated state is stamped at —
+    /// `set_sim_time` input. The body-fixed heightfield's inertial
+    /// direction is a function of the spin phase `ω·t`, so terrain
+    /// contact evaluation on a rotating world needs the tick (the
+    /// same instant `bubble.rs`'s pose records and the renderer's
+    /// `spin_phase` use). `Cell` because the `&self` predicates
+    /// (`ground_contact`, `cast_ray`) share the stamp. Inert on a
+    /// non-rotating environment (the phase conjugate is identity);
+    /// per-tick construction scratch, never sim state.
+    time_s: Cell<f64>,
     /// Per-body contact manifold from the most recent `step`, indexed
     /// by slice position ([`BodyHandle`]). Cleared for latched bodies.
     contacts: Vec<Vec<Contact>>,
@@ -1092,10 +1251,30 @@ pub struct SimpleBackend {
 
 impl SimpleBackend {
     pub fn new(env: Environment) -> Self {
+        // Warm the terrain bake at construction rather than on the
+        // first contact tick — the ~0.5 M-texel bake is a pure
+        // function of the seed, so when it runs is unobservable, but
+        // a startup stall beats a mid-step one.
+        if let Some(t) = &env.terrain {
+            t.prewarm();
+        }
         Self {
             env,
+            time_s: Cell::new(0.0),
             contacts: Vec::new(),
         }
+    }
+
+    /// Stamp the sim time the backend's state is indexed at. On a
+    /// rotating world the heightfield rotates with the body, so the
+    /// ground the solver should contact at a given instant is the
+    /// field sampled through `R(axis, −ω·t)` — the caller's `t` is
+    /// the *state's* tick (the convention `surface_pose_capture`
+    /// stamps post-step poses with); `step` evaluates the ground at
+    /// `t + dt`, the instant the post-integration pose lands.
+    /// Inert when the environment has no terrain or does not rotate.
+    pub fn set_sim_time(&self, t: SimTime) {
+        self.time_s.set(t.seconds());
     }
 
     /// The environment the backend was built with.
@@ -1240,17 +1419,22 @@ impl SimpleBackend {
 
     /// Geometric ground-contact predicate — the same rule
     /// [`Self::generate_contacts`] applies (any collider vertex with
-    /// `depth > 0` against the environment sphere), evaluated
+    /// `depth > 0` against the environment's surface — the displaced
+    /// heightfield when `env.terrain` is set), evaluated
     /// on-demand. The `contacts()` record is only a view of the most
     /// recent `step` call; the sim's warp-refusal and save-boundary
     /// predicates need the per-body truth *between* steps, which is
-    /// geometry, not solver state.
+    /// geometry, not solver state. Evaluated at the stamped instant
+    /// (`set_sim_time`): the surface under a vertex at tick `t` is
+    /// the field at spin phase `ω·t`.
     pub fn ground_contact(&self, b: &WeldedBody) -> bool {
         for hull in &b.collider.hulls {
             for v in &hull.vertices {
                 let p = b.pos + b.rot.rotate(*v);
-                let dist = (p - self.env.body_center).norm();
-                if self.env.radius_m - dist > 0.0 && dist > 0.0 {
+                let rel = p - self.env.body_center;
+                let dist = rel.norm();
+                if dist > 0.0 && self.env.surface_radius(rel / dist, self.time_s.get()) - dist > 0.0
+                {
                     return true;
                 }
             }
@@ -1384,11 +1568,21 @@ impl SimpleBackend {
     }
 
     /// Phase 4a — contact generation at the post-integration pose.
-    /// Every collider vertex below the environment sphere's surface
-    /// yields one manifold point, in fixed ascending `(body, hull,
-    /// vertex)` order. `constraints` is the solver working set,
-    /// `self.contacts` the public record — same points, two views.
+    /// Every collider vertex below the environment's surface —
+    /// `env.surface_radius`, the displaced heightfield when
+    /// `env.terrain` is set — yields one manifold point, in fixed
+    /// ascending `(body, hull, vertex)` order. `constraints` is the
+    /// solver working set, `self.contacts` the public record — same
+    /// points, two views.
+    ///
+    /// The surface is evaluated at `time_s + dt`: the pose the step
+    /// produces is stamped with the NEXT tick (the convention
+    /// `transition_latched` applies when it captures the pose), so
+    /// the ground the vertex rests against is the field at that
+    /// instant's spin phase — the same surface the renderer draws
+    /// for that tick.
     fn generate_contacts(&mut self, bodies: &[WeldedBody], constraints: &mut Vec<Constraint>) {
+        let eval_s = self.time_s.get() + PHYSICS_DT;
         for (i, b) in bodies.iter().enumerate() {
             if b.settle.latched {
                 continue;
@@ -1398,7 +1592,11 @@ impl SimpleBackend {
                     let p = b.pos + b.rot.rotate(*v);
                     let rel = p - self.env.body_center;
                     let dist = rel.norm();
-                    let depth = self.env.radius_m - dist;
+                    let depth = if dist > 0.0 {
+                        self.env.surface_radius(rel / dist, eval_s) - dist
+                    } else {
+                        self.env.radius_m - dist
+                    };
                     // Strict `> 0`: a vertex exactly grazing the
                     // surface carries no penetration and no impulse
                     // authority; it is caught next tick at depth
@@ -1818,7 +2016,16 @@ impl SimpleBackend {
                 let p = b.pos + b.rot.rotate(c.local_vertex);
                 let rel = p - self.env.body_center;
                 let dist = rel.norm();
-                let depth = self.env.radius_m - dist;
+                // Re-measure penetration against the SAME surface the
+                // generator used — the heightfield at the step's
+                // eval instant (`time_s + dt`), not the bare datum.
+                let depth = if dist > 0.0 {
+                    self.env
+                        .surface_radius(rel / dist, self.time_s.get() + PHYSICS_DT)
+                        - dist
+                } else {
+                    self.env.radius_m - dist
+                };
                 if depth <= 0.0 || dist <= 0.0 {
                     continue;
                 }
@@ -2091,32 +2298,115 @@ impl PhysicsBackend for SimpleBackend {
         self.update_settle(bodies, &pose0);
     }
 
-    /// Ray vs the environment sphere (nearest positive root, `toi ≤
-    /// max_toi`). Stepped bodies are not raycast targets yet — hull-vs-
+    /// Ray vs the environment surface. Bare-sphere environments take
+    /// the analytic nearest positive root (`toi ≤ max_toi`); with
+    /// terrain the same question is answered against the displaced
+    /// surface — the ray's entry into the `radius ± amplitude` shell
+    /// brackets a fixed 96-step scan for a sign change of
+    /// `‖p(t)‖ − surface_radius(dir)`, refined by a fixed 40-step
+    /// bisection (deterministic counts, like every other loop here).
+    /// Stepped bodies are not raycast targets yet — hull-vs-
     /// ray still waits on the parry `ConvexPolyhedron` materialization
     /// (the M6-A vessel-vessel contact path is analytic and never
     /// needed it).
     fn cast_ray(&self, ray: &Ray, max_toi: f64) -> Option<Hit> {
         let oc = ray.origin - self.env.body_center;
         let b = oc.dot(ray.dir);
-        let c = oc.dot(oc) - self.env.radius_m * self.env.radius_m;
-        let disc = b * b - c;
-        if disc < 0.0 {
+        if self.env.terrain.is_none() {
+            let c = oc.dot(oc) - self.env.radius_m * self.env.radius_m;
+            let disc = b * b - c;
+            if disc < 0.0 {
+                return None;
+            }
+            let sq = libm::sqrt(disc);
+            let toi = if -b - sq >= 0.0 { -b - sq } else { -b + sq };
+            if toi < 0.0 || toi > max_toi {
+                return None;
+            }
+            let point = ray.origin + ray.dir * toi;
+            let rel = point - self.env.body_center;
+            return Some(Hit {
+                toi,
+                point,
+                normal: rel / rel.norm(),
+                body: None,
+            });
+        }
+        // Terrain: `f(t) = ‖p(t) − c‖ − surface_radius(p̂(t))`, signed
+        // distance to the displaced surface along the ray. March the
+        // shell window for the first zero crossing (entry from
+        // outside, or exit for an origin already under the surface).
+        let amp = self
+            .env
+            .terrain
+            .as_ref()
+            .map_or(0.0, |t| t.amplitude_m)
+            .abs();
+        let r_out = self.env.radius_m + amp;
+        let c_out = oc.dot(oc) - r_out * r_out;
+        let (w0, mut w1) = if c_out > 0.0 {
+            // Outside the outer bound — the entry/exit roots bracket
+            // every possible surface crossing.
+            let disc = b * b - c_out;
+            if disc < 0.0 {
+                return None;
+            }
+            let sq = libm::sqrt(disc);
+            ((-b - sq).max(0.0), -b + sq)
+        } else {
+            // Already inside the shell — the far root bounds the scan.
+            (0.0, -b + libm::sqrt((b * b - c_out).max(0.0)))
+        };
+        w1 = w1.min(max_toi);
+        if !(w1 >= w0 && w1 > 0.0) {
             return None;
         }
-        let sq = libm::sqrt(disc);
-        let toi = if -b - sq >= 0.0 { -b - sq } else { -b + sq };
-        if toi < 0.0 || toi > max_toi {
-            return None;
+        let eval = |toi: f64| -> f64 {
+            let rel = ray.origin + ray.dir * toi - self.env.body_center;
+            let d = rel.norm();
+            if d <= 0.0 {
+                return -1.0;
+            }
+            d - self.env.surface_radius(rel / d, self.time_s.get())
+        };
+        const STEPS: usize = 96;
+        const BISECT: usize = 40;
+        let mut ta = w0;
+        let mut fa = eval(ta);
+        for k in 1..=STEPS {
+            let tb = w0 + (w1 - w0) * k as f64 / STEPS as f64;
+            let fb = eval(tb);
+            if (fa > 0.0) != (fb > 0.0) || fb == 0.0 {
+                // Sign change in (ta, tb] — bisect a fixed count.
+                let (mut lo, mut hi) = (ta, tb);
+                let mut flo = fa;
+                for _ in 0..BISECT {
+                    let m = 0.5 * (lo + hi);
+                    let fm = eval(m);
+                    if (fm > 0.0) == (flo > 0.0) {
+                        lo = m;
+                        flo = fm;
+                    } else {
+                        hi = m;
+                    }
+                }
+                let toi = 0.5 * (lo + hi);
+                if toi > max_toi {
+                    return None;
+                }
+                let point = ray.origin + ray.dir * toi;
+                let rel = point - self.env.body_center;
+                return Some(Hit {
+                    toi,
+                    point,
+                    normal: rel / rel.norm(),
+                    body: None,
+                });
+            }
+            ta = tb;
+            fa = fb;
         }
-        let point = ray.origin + ray.dir * toi;
-        let rel = point - self.env.body_center;
-        Some(Hit {
-            toi,
-            point,
-            normal: rel / rel.norm(),
-            body: None,
-        })
+        None
     }
 
     fn contacts(&self, body: BodyHandle) -> &[Contact] {
@@ -2196,6 +2486,7 @@ mod tests {
             mu_m3_per_s2: TERRIN_MU,
             body_spin: DVec3::ZERO,
             atmosphere: None,
+            terrain: None, // bare-sphere ground: the fixture's pinned model
             settle_v: DEFAULT_SETTLE_V,
             settle_w: DEFAULT_SETTLE_W,
             settle_ticks: DEFAULT_SETTLE_TICKS,
@@ -3320,6 +3611,125 @@ mod tests {
             }
         }
         assert!(latched, "buried box never reached rest/latch");
+    }
+
+    // ---- R2: the seeded heightfield IS the contact surface ----
+
+    /// The ground the solver contacts is the same displaced field the
+    /// renderer draws: a box dropped above a hill latches and rests
+    /// with its lowest vertex at the terrain radius
+    /// `radius_m + h·amplitude` — NOT the bare datum sphere (the
+    /// pre-terrain model let the box sink ~amplitude metres below the
+    /// drawn ground wherever `h > 0` — the "penetrate the ground
+    /// before the sim notices" defect).
+    #[test]
+    fn dropped_box_rests_on_terrain_not_datum() {
+        // A small bake keeps the test fast — `with_field` drives the
+        // identical `sample_dir` path the full-size field uses.
+        let seed = 601u64;
+        let amp = TERRIN_R * AMPLITUDE_FRAC; // 2.4 km at Terrin
+        let field = HeightField::bake(seed, 128, 64);
+        // Drop on a hill: the strongest upward deviation in a 64-dir
+        // scan, so "rests at terrain, not at datum" discriminates by
+        // ~kilometres rather than millimetres.
+        let mut dir = DVec3::X;
+        let mut h_best = f64::NEG_INFINITY;
+        for k in 0..64 {
+            let t = 2.0 * core::f64::consts::PI * k as f64 / 64.0;
+            let d = DVec3::new(libm::cos(t), libm::sin(t), 0.35);
+            let d = d / d.norm();
+            let h = field.sample_dir(d);
+            if h > h_best {
+                dir = d;
+                h_best = h;
+            }
+        }
+        let mut env = terrin_env();
+        env.terrain = Some(TerrainSurface::with_field(field, seed, amp));
+        env.settle_ticks = 32;
+        let surf_r = env.surface_radius(dir, 0.0);
+        assert!(
+            surf_r - env.radius_m > 0.2 * amp,
+            "test premise: no real hill in the scan (best h {h_best})"
+        );
+        let mut backend = SimpleBackend::new(env.clone());
+        let mut b = box_body(1_000.0, DVec3::new(0.5, 0.5, 0.5));
+        b.pos = dir * (surf_r + 3.0); // belly ~2.5 m over the surface
+        let mut bodies = vec![b];
+        let mut latched = false;
+        for _ in 0..4_096 {
+            backend.step(&mut bodies, &[]);
+            if bodies[0].settle.latched {
+                latched = true;
+                break;
+            }
+        }
+        assert!(latched, "dropped box never latched on terrain");
+        let b = &bodies[0];
+        // Clearance of each collider vertex above the terrain surface
+        // under its own direction — the same `sample_dir` the shader
+        // displaces to. The lowest must sit ON the surface, not below.
+        let lo_terrain = b
+            .collider
+            .hulls
+            .iter()
+            .flat_map(|hull| hull.vertices.iter().copied())
+            .map(|v| {
+                let rel = b.pos + b.rot.rotate(v) - env.body_center;
+                let d = rel.norm();
+                d - env.surface_radius(rel / d, 0.0)
+            })
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            lo_terrain.abs() < 0.5,
+            "resting box floats/sinks {lo_terrain} m vs the terrain surface"
+        );
+        // And the discriminator: the lowest vertex is ~amplitude-scale
+        // OFF the bare datum — a datum-contact solve would have sunk it.
+        let lo_datum = b
+            .collider
+            .hulls
+            .iter()
+            .flat_map(|hull| hull.vertices.iter().copied())
+            .map(|v| (b.pos + b.rot.rotate(v) - env.body_center).norm() - env.radius_m)
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            lo_datum > 0.1 * amp,
+            "box rests only {lo_datum} m above datum — sank to the sphere"
+        );
+    }
+
+    /// `ground_contact`/`cast_ray` predicate parity: a vertex just
+    /// above the local terrain height is clear, just below is contact
+    /// — and a downward ray reports its hit AT the displaced surface.
+    #[test]
+    fn terrain_predicates_see_the_displaced_surface() {
+        let seed = 7u64;
+        let amp = 100.0; // exaggerated, keeps the test readable
+        let field = HeightField::bake(seed, 64, 32);
+        let mut env = terrin_env();
+        env.terrain = Some(TerrainSurface::with_field(field, seed, amp));
+        let dir = DVec3::X;
+        let surf_r = env.surface_radius(dir, 0.0);
+        let backend = SimpleBackend::new(env.clone());
+        let mut b = box_body(100.0, DVec3::new(0.5, 0.5, 0.5));
+        b.pos = dir * (surf_r + 1.0); // bottom vertex 0.5 m clear
+        assert!(!backend.ground_contact(&b));
+        b.pos = dir * (surf_r + 0.4); // bottom vertex 0.1 m buried
+        assert!(backend.ground_contact(&b));
+        let hit = backend
+            .cast_ray(
+                &Ray {
+                    origin: dir * (surf_r + 50.0),
+                    dir: -dir,
+                },
+                200.0,
+            )
+            .expect("downward ray must hit the terrain");
+        assert!(
+            (hit.toi - 50.0).abs() < 0.5,
+            "ray hit {hit:?}, surface at toi 50"
+        );
     }
 
     // ---- M6-B: §2.4 transient joints (soft-capture) ----
