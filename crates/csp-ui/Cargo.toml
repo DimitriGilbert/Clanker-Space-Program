@@ -11,17 +11,20 @@ egui = { workspace = true }
 # §2.1: csp-ui owns the VAB *session instance* — the working craft is a
 # `csp_phys::CraftSession` value held here (the type stays in csp-phys,
 # per its module doc); csp-data supplies the part catalog + resource
-# table the session ops and the Δv readout resolve against.
+# table the session ops and the Δv readout resolve against. csp-core
+# supplies DVec3 — the hover-hit/attach-plan records are f64 geometry.
 csp-phys = { workspace = true }
 csp-data = { workspace = true }
+csp-core = { workspace = true }
 # §7.8: the settings model (`settings::Settings`) is the serialized
 # shape of `$config_dir/csp/settings.ron` — serde derives here, the
 # file IO in csp-app.
 serde = { workspace = true, features = ["derive"] }
+# The surface-mount planner's azimuth/azimuth-step math — the same
+# pinned libm the session's snap arc uses.
+libm = { workspace = true }
 
 [dev-dependencies]
-# test fixtures build literal part defs — DVec3 is csp-core's type.
-csp-core = { workspace = true }
 # The settings round-trip test exercises the production file format.
 ron = { workspace = true }
 

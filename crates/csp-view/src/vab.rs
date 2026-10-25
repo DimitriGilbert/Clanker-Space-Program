@@ -184,6 +184,23 @@ pub struct PartMesh {
     pub shape: crate::part_mesh::PartShape,
     /// Linear RGBA — category-tinted; brightened when selected.
     pub color: [f32; 4],
+    /// `true` while this part is the selection — `extract_vab` emits
+    /// an inflated accent shell behind it (the 3D selection outline).
+    pub selected: bool,
+}
+
+/// A placement ghost — the armed catalog part rendered translucent at
+/// its snap pose. Carries no pick id (the GPU pick can't select it).
+#[derive(Clone, Debug)]
+pub struct GhostMesh {
+    /// Local→craft-body transform (the parent's body transform
+    /// composed with the plan's parent-local snap).
+    pub transform: csp_phys::PartTransform,
+    /// The ghost part's kitbash silhouette.
+    pub shape: crate::part_mesh::PartShape,
+    /// Tint incl. alpha — green when the plan is placeable, red when
+    /// the planner reported a refusal.
+    pub color: [f32; 4],
 }
 
 /// The Presentation product: the craft's part meshes in body frame +
@@ -193,6 +210,13 @@ pub struct PartMesh {
 pub struct VabScene {
     /// One mesh entry per placed part, ascending id.
     pub parts: Vec<PartMesh>,
+    /// The placement ghosts — the armed catalog part rendered at each
+    /// planned copy's snap pose (radial symmetry expands the set).
+    pub ghosts: Vec<GhostMesh>,
+    /// Attach-node markers on the hovered part while a placement is
+    /// armed — `(body-space point, color)` rendered as small octahedra
+    /// (the "where it snaps" affordance).
+    pub markers: Vec<(DVec3, [f32; 4])>,
     /// Body-frame bounding-sphere center + radius for camera framing.
     pub center: DVec3,
     /// Craft extent (m) — max corner distance from `center`.
@@ -214,7 +238,9 @@ pub struct VabFrame(pub Option<VabPacket>);
 pub struct CraftFileList(pub Vec<String>);
 
 /// `Presentation` schedule system: recompute the session (dirty-gated)
-/// and solve the scene + camera. Runs only in VAB mode.
+/// and solve the scene + camera + hover/ghost/markers. Runs only in
+/// VAB mode.
+#[allow(clippy::too_many_lines)] // the presentation pipeline is one pass — splitting it fragments the data flow
 pub(crate) fn vab_present(
     mut input: ResMut<VabInput>,
     mut vab: ResMut<VabSessionRes>,
@@ -264,6 +290,7 @@ pub(crate) fn vab_present(
             transform: t,
             shape: crate::part_mesh::classify_effective(eff),
             color,
+            selected: sel == Some(id),
         });
     }
     // Camera framing: bounding sphere over the meshes' AABBs.
@@ -309,6 +336,181 @@ pub(crate) fn vab_present(
         VAB_FOV_Y,
         VAB_NEAR_M,
     );
+
+    // -----------------------------------------------------------------
+    // CPU hover pick + placement affordances. The GPU pick pass only
+    // fires on clicks; the hover path needs a hit EVERY frame (ghost,
+    // attach-node markers, right-click remove), so the ray is cast
+    // here against the kitbash AABBs — cheap at VAB part counts and
+    // exact for the collider shapes the meshes bake.
+    scene.ghosts.clear();
+    scene.markers.clear();
+    let hover = vab
+        .0
+        .cursor_px()
+        .and_then(|(x, y)| hover_pick(&input, &cam.0, &scene.parts, x, y));
+    vab.0.set_hover(hover);
+    // The armed part's ghost: plan through the session so the preview
+    // is exactly what a drop commits — edges, symmetry copies, and the
+    // refusal reason included.
+    let armed = vab.0.armed_part().cloned();
+    if let (Some(part), Some(hit)) = (armed.as_ref(), hover)
+        && let Some(eff) = vab.0.resolve_stock(part)
+    {
+        let plan = vab.0.plan_attach(part, hit.node);
+        let ok = !plan.edges.is_empty();
+        let color: [f32; 4] = if ok {
+            [0.35, 0.95, 0.45, 0.45]
+        } else {
+            [0.95, 0.30, 0.25, 0.45]
+        };
+        if let Some(&parent_t) = vab.0.body_transforms().get(&hit.node) {
+            let shape = crate::part_mesh::classify_effective(&eff);
+            for t in &plan.transforms {
+                scene.ghosts.push(GhostMesh {
+                    transform: parent_t.compose(*t),
+                    shape: shape.clone(),
+                    color,
+                });
+            }
+        }
+        // Node markers on the hovered part: free authored nodes green,
+        // bound ones dim, the plan's chosen parent node brightest —
+        // the "where it snaps" read a text panel can't give.
+        if let (Some(&t), Some(def)) = (
+            vab.0.body_transforms().get(&hit.node),
+            vab.0.def_of(hit.node),
+        ) {
+            let bound = vab.0.session().bound_attach_nodes(hit.node);
+            let chosen = plan.edges.first().map(|e| e.parent_node.as_str());
+            let (bs, bt) = vab
+                .0
+                .session()
+                .node(hit.node)
+                .map(|n| (n.built().scale, n.built().stretch))
+                .unwrap_or((1.0, 1.0));
+            for n in &def.attach_nodes {
+                let Some(sn) = csp_phys::session::scaled_attach_node(def, &n.id, bs, bt) else {
+                    continue;
+                };
+                let pos = t.apply(sn.position_m);
+                let c = if chosen == Some(n.id.as_str()) {
+                    [0.2, 1.0, 0.4, 1.0]
+                } else if bound.contains(&n.id) {
+                    [0.45, 0.45, 0.45, 0.5]
+                } else {
+                    [0.25, 0.9, 0.35, 0.8]
+                };
+                scene.markers.push((pos, c));
+            }
+            // The plan's surface mount point gets a marker too.
+            if let Some(e) = plan.edges.first()
+                && e.parent_node
+                    .starts_with(csp_phys::session::SURFACE_NODE_PREFIX)
+                && let Some(sn) = csp_phys::session::decode_surface_node(&e.parent_node)
+            {
+                scene
+                    .markers
+                    .push((t.apply(sn.position_m), [0.2, 1.0, 0.4, 1.0]));
+            }
+        }
+    }
+}
+
+/// Cast the viewport cursor's ray against each part's kitbash AABB in
+/// its local frame; the nearest hit wins. Returns the node, the hit
+/// point in the node's scaled local frame (the surface-mount plan
+/// records it verbatim), and which face region it lands on.
+fn hover_pick(
+    input: &VabInput,
+    cam: &MapCameraF64,
+    parts: &[PartMesh],
+    px_x: f64,
+    px_y: f64,
+) -> Option<csp_ui::vab::HoverHit> {
+    let (w, h) = input.viewport_px;
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    // NDC → view → world. The projection is `perspective_revz`: on the
+    // −z forward plane, x_ndc = fx·vx, y_ndc = fy·vy.
+    let nx = 2.0 * px_x / w - 1.0;
+    let ny = 1.0 - 2.0 * px_y / h;
+    let f = 1.0 / f64::tan(VAB_FOV_Y * 0.5);
+    let aspect = (w / h).max(1e-6);
+    let dir_view = DVec3::new(nx * aspect / f, ny / f, -1.0);
+    let dir_len = dir_view.norm();
+    if dir_len <= 0.0 {
+        return None;
+    }
+    let dir_view = dir_view / dir_len;
+    let r = map::rot3(input.yaw_rad, input.pitch_rad);
+    let dir = map::mat3_vec(&r, dir_view);
+    let mut best: Option<(f64, csp_phys::PartNodeId, DVec3, csp_ui::vab::AttachRegion)> = None;
+    for p in parts {
+        let inv = p.transform.inverse();
+        let o = inv.apply(cam.eye);
+        let d = inv.apply_dir(dir);
+        let (lo, hi) = p.shape.local_aabb();
+        let Some((t, face)) = slab_hit(o, d, lo, hi) else {
+            continue;
+        };
+        let hit_pt = o + d * t;
+        let region = match face {
+            2 => {
+                if hit_pt.z >= 0.0 {
+                    csp_ui::vab::AttachRegion::TopCap
+                } else {
+                    csp_ui::vab::AttachRegion::BottomCap
+                }
+            }
+            _ => csp_ui::vab::AttachRegion::Side,
+        };
+        if best.as_ref().is_none_or(|(bt, ..)| t < *bt) {
+            best = Some((t, p.node, hit_pt, region));
+        }
+    }
+    best.map(|(_, node, local, region)| csp_ui::vab::HoverHit {
+        node,
+        local,
+        region,
+    })
+}
+
+/// Ray–AABB slab test in a part's local frame: `(t_hit, face_axis)`
+/// where the face axis 0/1/2 = x/y/z of the entry face. `None` on a
+/// miss or a degenerate ray.
+fn slab_hit(o: DVec3, d: DVec3, lo: DVec3, hi: DVec3) -> Option<(f64, usize)> {
+    let mut t_min = f64::NEG_INFINITY;
+    let mut t_max = f64::INFINITY;
+    let mut face = 0usize;
+    let ov = [o.x, o.y, o.z];
+    let dv = [d.x, d.y, d.z];
+    let lv = [lo.x, lo.y, lo.z];
+    let hv = [hi.x, hi.y, hi.z];
+    for axis in 0..3 {
+        let (oc, dc, lc, hc) = (ov[axis], dv[axis], lv[axis], hv[axis]);
+        if dc.abs() < 1e-12 {
+            if oc < lc || oc > hc {
+                return None;
+            }
+            continue;
+        }
+        let (mut t1, mut t2) = ((lc - oc) / dc, (hc - oc) / dc);
+        if t1 > t2 {
+            std::mem::swap(&mut t1, &mut t2);
+        }
+        if t1 > t_min {
+            t_min = t1;
+            face = axis;
+        }
+        t_max = t_max.min(t2);
+        if t_min > t_max {
+            return None;
+        }
+    }
+    let t = if t_min >= 0.0 { t_min } else { t_max };
+    (t >= 0.0 && t.is_finite()).then_some((t, face))
 }
 
 /// Flat color per part category — placeholder tier: legibility, not art.
@@ -356,11 +558,126 @@ pub(crate) fn extract_vab(
     };
     let mut tris = Vec::new();
     for p in &scene.parts {
+        // The selection outline: an inflated copy of the silhouette
+        // emitted FIRST in the selection accent — the part's own tris
+        // overwrite its face, leaving the shell's rim as a visible
+        // outline. Pick id 0 keeps the shell unpickable.
+        if p.selected {
+            let shell = crate::part_mesh::inflated(&p.shape, scene.extent_m * 0.008 + 0.01);
+            emit_triangles(
+                &mut packet.vertices,
+                &mut tris,
+                &cam.0,
+                &shell,
+                p.transform,
+                [0.25, 1.0, 0.5, 1.0],
+                0,
+            );
+        }
         let pick = packet.pick_ids.len() as u32 + 1;
         packet.pick_ids.push(p.node.0);
         emit_part(&mut packet.vertices, &mut tris, &cam.0, p, pick);
     }
+    // Placement ghosts — translucent, unpickable, emitted after the
+    // solid craft so their alpha reads over it.
+    for g in &scene.ghosts {
+        emit_triangles(
+            &mut packet.vertices,
+            &mut tris,
+            &cam.0,
+            &g.shape,
+            g.transform,
+            g.color,
+            0,
+        );
+    }
+    // Attach-node markers — a tiny octahedron per point.
+    let marker_m = (scene.extent_m * 0.012 + 0.02).max(0.03);
+    for (pos, color) in &scene.markers {
+        emit_octa(&mut packet.vertices, &cam.0, *pos, marker_m, *color);
+    }
     frame.0 = Some(packet);
+}
+
+/// Emit one kitbash shape's shaded triangles under `transform` —
+/// `emit_part`'s core with the shape/color/pick as parameters so the
+/// selection shell, ghosts, and solid parts share the code path.
+fn emit_triangles(
+    verts: &mut Vec<VabVertex>,
+    tris: &mut Vec<crate::part_mesh::MeshTri>,
+    cam: &MapCameraF64,
+    shape: &crate::part_mesh::PartShape,
+    transform: csp_phys::PartTransform,
+    color: [f32; 4],
+    pick: u32,
+) {
+    tris.clear();
+    crate::part_mesh::emit(shape, tris);
+    let light = {
+        let l = VAB_LIGHT;
+        l / l.norm()
+    };
+    for t in tris.iter() {
+        let world = [t.a, t.b, t.c].map(|q| transform.apply(q));
+        let [Some(c0), Some(c1), Some(c2)] =
+            world.map(|q| project_into(&cam.view_proj, cam.eye, q))
+        else {
+            continue;
+        };
+        let shade = (0.55 + 0.45 * transform.apply_dir(t.n).dot(light).max(0.0)) as f32;
+        let c = [
+            color[0] * shade,
+            color[1] * shade,
+            color[2] * shade,
+            color[3],
+        ];
+        for pos in [c0, c1, c2] {
+            verts.push(VabVertex {
+                pos,
+                color: c,
+                pick,
+            });
+        }
+    }
+}
+
+/// Emit a small unlit octahedron at `pos` — the attach-node marker.
+/// Pick id 0; the marker is an affordance, not a selectable part.
+fn emit_octa(verts: &mut Vec<VabVertex>, cam: &MapCameraF64, pos: DVec3, m: f64, color: [f32; 4]) {
+    let pts = [
+        DVec3::new(m, 0.0, 0.0),
+        DVec3::new(-m, 0.0, 0.0),
+        DVec3::new(0.0, m, 0.0),
+        DVec3::new(0.0, -m, 0.0),
+        DVec3::new(0.0, 0.0, m),
+        DVec3::new(0.0, 0.0, -m),
+    ];
+    // The octahedron's 8 faces — apex pairs around the equator.
+    let faces: [[usize; 3]; 8] = [
+        [4, 0, 2],
+        [4, 2, 1],
+        [4, 1, 3],
+        [4, 3, 0],
+        [5, 2, 0],
+        [5, 1, 2],
+        [5, 3, 1],
+        [5, 0, 3],
+    ];
+    for f in &faces {
+        let world = f.map(|i| pos + pts[i]);
+        let [Some(c0), Some(c1), Some(c2)] =
+            world.map(|q| project_into(&cam.view_proj, cam.eye, q))
+        else {
+            continue;
+        };
+        for c in [c0, c1, c2] {
+            verts.push(VabVertex {
+                pos: c,
+                color,
+                pick: 0,
+            });
+        }
+    }
 }
 
 /// The VAB's fixed key light — a body-frame direction like the flight

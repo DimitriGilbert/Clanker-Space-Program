@@ -119,6 +119,10 @@ impl TechState {
         Ok(BuiltPart {
             part_id: def.id.clone(),
             scale,
+            // Sim-side manufacture has no length input — the VAB's
+            // per-part stretch is an editor dimension; manufacture
+            // builds unstretched unless the record says otherwise.
+            stretch: 1.0,
             variant,
             upgrade_levels_at_build: self.frozen_upgrades(tree, def)?,
             data_set_hash,

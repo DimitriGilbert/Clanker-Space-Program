@@ -340,6 +340,65 @@ fn sky_view_rot(vp: &[[f64; 4]; 4], tan_y: f64, aspect: f64) -> [[f32; 4]; 4] {
     view_rot
 }
 
+/// The vessel blob-shadow anchor — `(uniform_row, craft_alt_m)`.
+/// The chase camera's focus IS the vessel CoM, so
+/// `focus = eye − z_out·distance_m` recovers it from the solved basis
+/// (column 2 of `view_rot` is the camera's world-frame z_out —
+/// `solve_chase_camera` points it focus → eye). The shadow lands where
+/// the down-sun ray from the craft meets the local surface:
+/// `craft − sun·(alt/μ☉)` in the local-horizontal approximation,
+/// clamped so a low sun doesn't fling the anchor kilometres away.
+/// No sim data crosses into the extract — this is pure camera math.
+/// A `w = 0` row disables the blob (no focus, night side, orbit
+/// altitude).
+#[allow(clippy::too_many_arguments)]
+fn vessel_shadow(
+    view_rot: &[[f32; 4]; 4],
+    cam: &MapCameraF64,
+    env: &FlightEnv,
+    field: &rt::HeightField,
+    unspin: &DQuat,
+    amplitude_m: f64,
+    sun_dir: DVec3,
+) -> ([f32; 4], f32) {
+    let z_out = DVec3::new(
+        f64::from(view_rot[2][0]),
+        f64::from(view_rot[2][1]),
+        f64::from(view_rot[2][2]),
+    );
+    let craft_rel = cam.eye - env.body_center - z_out * cam.distance_m;
+    let craft_r = craft_rel.norm();
+    if !(craft_r.is_finite() && craft_r > env.radius_m * 0.5) {
+        return ([0.0; 4], 0.0);
+    }
+    let up = craft_rel / craft_r;
+    let surf_r = env.radius_m + field.sample_dir(unspin.rotate(up)) * amplitude_m;
+    let alt = (craft_r - surf_r).max(0.0);
+    let sun_up = sun_dir.dot(up);
+    if sun_up <= 0.04 || alt >= 4_000.0 {
+        return ([0.0; 4], alt as f32);
+    }
+    let slide = ((alt + 2.0) / sun_up.max(0.10)).min(1_500.0);
+    let hit = craft_rel - sun_dir * slide;
+    let shadow_dir = if hit.norm_squared() > 1.0 {
+        hit / hit.norm()
+    } else {
+        up
+    };
+    // The blob spreads and softens with altitude — a landed craft gets
+    // a tight contact shadow, a low flyer a broad diffuse one.
+    let radius = (7.0 + alt * 0.22).min(150.0) as f32;
+    (
+        [
+            shadow_dir.x as f32,
+            shadow_dir.y as f32,
+            shadow_dir.z as f32,
+            radius,
+        ],
+        alt as f32,
+    )
+}
+
 /// The `RenderExtract`-side packet build: quadtree select around the
 /// camera, per-patch instance baking, ocean emission, uniforms. Called
 /// from `extract_flight` — `cam`/`input` are the solved presentation
@@ -402,6 +461,17 @@ pub(crate) fn build_packet(
     } else {
         FALLBACK_SUN / FALLBACK_SUN.norm()
     };
+
+    let (shadow, craft_alt) = vessel_shadow(
+        &view_rot,
+        cam,
+        env,
+        &field,
+        &unspin,
+        body.amplitude_m,
+        sun_dir,
+    );
+
     let atmo = (env.atm_top_m > 0.0).then_some(rt::AtmoDesc {
         radius_m: env.radius_m,
         top_m: env.atm_top_m,
@@ -431,7 +501,7 @@ pub(crate) fn build_packet(
             atmo: [
                 env.atm_scale_height_m as f32,
                 if body.biome.is_some() { 1.0 } else { 0.0 },
-                0.0,
+                craft_alt,
                 0.0,
             ],
             misc: [(tan_y * aspect) as f32, tan_y as f32, c_top, c_ground],
@@ -448,6 +518,7 @@ pub(crate) fn build_packet(
                 0.0,
             ],
             biome_colors: body.biome.as_ref().map_or([[0.0; 4]; 16], |b| b.colors),
+            shadow,
         },
         heightfield: Some(field),
         biome: body.biome,

@@ -223,6 +223,20 @@ pub struct BuiltPart {
     /// Linear scale factor frozen at manufacture (must satisfy the
     /// def's [`ScaleRule`] at resolve time).
     pub scale: f64,
+    /// Stack-axis ("length") multiplier frozen at manufacture —
+    /// `1.0` is unstretched. Geometry along the part's local +z axis
+    /// is `scale · stretch`; cross-sections are `scale` alone (the
+    /// VAB's per-part length control — the difference between a
+    /// bigger tank and a *longer* tank). Stat scaling treats the
+    /// authored [`ScaleExponents`] as volume-order exponents: the
+    /// uniform `s^e` covers the two cross-section powers, and stretch
+    /// contributes the remainder `t^max(e−2, 0)` — a capacity/mass
+    /// exponent of 3 (volume) makes a `Continuous` tank's contents
+    /// scale linearly with length. Gated by the same [`ScaleRule`]
+    /// bounds as `scale` at resolve time (`None` forces `1.0`,
+    /// `Discrete` bounds to the authored menu's min/max, `Continuous`
+    /// to its authored range).
+    pub stretch: f64,
     /// Which authored variant it was built as.
     pub variant: VariantId,
     /// §3.3 upgrade tracks frozen at manufacture:
@@ -254,13 +268,14 @@ pub struct BuiltPart {
 }
 
 impl BuiltPart {
-    /// A stock build: scale 1, the `variant` named, no upgrades,
-    /// zeroed data-set hash. Convenience for tests and early call
-    /// sites; the manufacture path fills every field.
+    /// A stock build: scale 1, stretch 1, the `variant` named, no
+    /// upgrades, zeroed data-set hash. Convenience for tests and
+    /// early call sites; the manufacture path fills every field.
     pub fn stock(part_id: PartId, variant: VariantId) -> Self {
         Self {
             part_id,
             scale: 1.0,
+            stretch: 1.0,
             variant,
             upgrade_levels_at_build: BTreeMap::new(),
             data_set_hash: [0; 32],
@@ -460,6 +475,8 @@ pub struct EffectivePart {
     pub variant: VariantId,
     /// The scale factor applied.
     pub scale: f64,
+    /// The stack-axis stretch factor applied ([`BuiltPart::stretch`]).
+    pub stretch: f64,
     /// `data_set_hash` carried from the [`BuiltPart`] — the §7.7
     /// drift-warning key, so a resolved part still reports what data
     /// produced it.
@@ -713,11 +730,14 @@ const SOURCE_VARIANT: &str = "variant";
 const SOURCE_UPGRADE: &str = "upgrade_levels_at_build";
 
 /// The resolved `s^e` factors for one scale step. `linear` is `s`
-/// itself (geometry); the rest are per-[`ScaleExponents`] `s^e`
-/// evaluated through `libm::pow` — the pinned `powf` stand-in, so
+/// itself (cross-section geometry); `linear_z` is `s · t` — the
+/// stack-axis geometry factor (`t` = [`BuiltPart::stretch`]). The
+/// rest are per-[`ScaleExponents`] `s^e · t^max(e−2, 0)` evaluated
+/// through `libm::pow` — the pinned `powf` stand-in, so
 /// cross-platform bit-identity holds by construction.
 struct ScaleFactors {
     linear: f64,
+    linear_z: f64,
     mass: f64,
     cost: f64,
     thrust: f64,
@@ -725,10 +745,37 @@ struct ScaleFactors {
     structural: f64,
 }
 
-/// Gate `built.scale` against the def's [`ScaleRule`] and produce the
-/// per-stat factors. `ScaleRule::Discrete` authors no exponents (see
-/// the module doc): stat factors are 1 there, only `linear` applies.
-fn scale_factors(def: &PartDef, scale: f64) -> Result<ScaleFactors, ResolveError> {
+/// The stretch bounds a [`ScaleRule`] admits: `None` pins `1.0`
+/// (a part that does not scale does not stretch either), `Discrete`
+/// bounds to the authored menu's min/max (its stats stay fixed —
+/// geometry-only rules stretch geometry-only, same convention as
+/// `scale`), `Continuous` to its authored range.
+fn stretch_bounds(rule: &ScaleRule) -> (f64, f64) {
+    match rule {
+        ScaleRule::None => (1.0, 1.0),
+        ScaleRule::Discrete(set) => (
+            set.first().copied().unwrap_or(1.0),
+            set.last().copied().unwrap_or(1.0),
+        ),
+        ScaleRule::Continuous { min, max, .. } => (*min, *max),
+    }
+}
+
+/// The per-stat exponent a stretch step applies: `t^max(e−2, 0)`.
+/// `s^e` for a uniform scale covers volume as `e` powers of `s`;
+/// the cross-section contributes two of them (scaled by `s`), so the
+/// remaining `e−2` powers are the length axis's share (scaled by `t`
+/// instead). An exponent under 2 is cross-section-dominated and sees
+/// no length term — `t^0 = 1` exactly.
+fn stretch_exp(e: Option<f64>) -> Option<f64> {
+    e.map(|e| (e - 2.0).max(0.0))
+}
+
+/// Gate `built.scale`/`built.stretch` against the def's [`ScaleRule`]
+/// and produce the per-stat factors. `ScaleRule::Discrete` authors no
+/// exponents (see the module doc): stat factors are 1 there, only
+/// `linear`/`linear_z` apply.
+fn scale_factors(def: &PartDef, scale: f64, stretch: f64) -> Result<ScaleFactors, ResolveError> {
     let bad = |rule: &'static str| ResolveError::InvalidScale {
         part_id: def.id.clone(),
         scale,
@@ -736,6 +783,13 @@ fn scale_factors(def: &PartDef, scale: f64) -> Result<ScaleFactors, ResolveError
     };
     if !scale.is_finite() || scale <= 0.0 {
         return Err(bad("resolve: scale must be finite and positive"));
+    }
+    if !stretch.is_finite() || stretch <= 0.0 {
+        return Err(bad("resolve: stretch must be finite and positive"));
+    }
+    let (t_lo, t_hi) = stretch_bounds(&def.scale);
+    if stretch < t_lo || stretch > t_hi {
+        return Err(bad("resolve: stretch outside the authored range"));
     }
     let exp = match &def.scale {
         ScaleRule::None => {
@@ -763,11 +817,15 @@ fn scale_factors(def: &PartDef, scale: f64) -> Result<ScaleFactors, ResolveError
     };
     Ok(ScaleFactors {
         linear: scale,
-        mass: pow2(scale, exp.map(|e| e.mass)),
-        cost: pow2(scale, exp.map(|e| e.cost)),
-        thrust: pow2(scale, exp.map(|e| e.thrust)),
-        capacity: pow2(scale, exp.map(|e| e.capacity)),
-        structural: pow2(scale, exp.map(|e| e.structural)),
+        linear_z: scale * stretch,
+        mass: pow2(scale, exp.map(|e| e.mass)) * pow2(stretch, stretch_exp(exp.map(|e| e.mass))),
+        cost: pow2(scale, exp.map(|e| e.cost)) * pow2(stretch, stretch_exp(exp.map(|e| e.cost))),
+        thrust: pow2(scale, exp.map(|e| e.thrust))
+            * pow2(stretch, stretch_exp(exp.map(|e| e.thrust))),
+        capacity: pow2(scale, exp.map(|e| e.capacity))
+            * pow2(stretch, stretch_exp(exp.map(|e| e.capacity))),
+        structural: pow2(scale, exp.map(|e| e.structural))
+            * pow2(stretch, stretch_exp(exp.map(|e| e.structural))),
     })
 }
 
@@ -936,11 +994,12 @@ fn mult(mults: &BTreeMap<StatPath, f64>, path: StatPath) -> f64 {
     mults.get(&path).copied().unwrap_or(1.0)
 }
 
-/// The resolved collider. `Cylinder` becomes the inscribed octagonal
+/// The resolved collider — `s` scales cross-sections, `sz` the stack
+/// axis (`s · stretch`). `Cylinder` becomes the inscribed octagonal
 /// prism documented in the module header; the 8 ring directions are
 /// exact constants (`FRAC_1_SQRT_2` pairs) so no libm call sits on the
 /// geometry path.
-fn scale_collider(collider: &ColliderDef, s: f64) -> ColliderShape {
+fn scale_collider(collider: &ColliderDef, s: f64, sz: f64) -> ColliderShape {
     const R: f64 = core::f64::consts::FRAC_1_SQRT_2;
     const RING: [(f64, f64); 8] = [
         (1.0, 0.0),
@@ -952,15 +1011,16 @@ fn scale_collider(collider: &ColliderDef, s: f64) -> ColliderShape {
         (0.0, -1.0),
         (R, -R),
     ];
+    let st = |v: DVec3| DVec3::new(v.x * s, v.y * s, v.z * sz);
     match collider {
         ColliderDef::Box { half_extents_m } => ColliderShape::Box {
-            half_extents: *half_extents_m * s,
+            half_extents: st(*half_extents_m),
         },
         ColliderDef::Cylinder {
             radius_m,
             half_height_m,
         } => {
-            let (r, h) = (radius_m * s, half_height_m * s);
+            let (r, h) = (radius_m * s, half_height_m * sz);
             let mut pts = Vec::with_capacity(16);
             for &(x, y) in &RING {
                 pts.push(DVec3::new(r * x, r * y, h));
@@ -971,7 +1031,7 @@ fn scale_collider(collider: &ColliderDef, s: f64) -> ColliderShape {
             ColliderShape::Points(pts)
         }
         ColliderDef::Convex { points } => {
-            ColliderShape::Points(points.iter().map(|p| *p * s).collect())
+            ColliderShape::Points(points.iter().map(|p| st(*p)).collect())
         }
     }
 }
@@ -1003,13 +1063,20 @@ fn collider_com(collider: &ColliderDef) -> DVec3 {
 /// collider: exact primitive formulas for `Box`/`Cylinder`, the
 /// documented point-cloud approximation for `Convex` (equal `m/n`
 /// point masses at the scaled vertices, about `com`).
-fn collider_inertia(collider: &ColliderDef, s: f64, mass: f64, com: DVec3) -> SymMat3 {
+fn collider_inertia(collider: &ColliderDef, s: f64, sz: f64, mass: f64, com: DVec3) -> SymMat3 {
     match collider {
-        ColliderDef::Box { half_extents_m } => SymMat3::solid_box(mass, *half_extents_m * s),
+        ColliderDef::Box { half_extents_m } => SymMat3::solid_box(
+            mass,
+            DVec3::new(
+                half_extents_m.x * s,
+                half_extents_m.y * s,
+                half_extents_m.z * sz,
+            ),
+        ),
         ColliderDef::Cylinder {
             radius_m,
             half_height_m,
-        } => SymMat3::solid_cylinder(mass, radius_m * s, half_height_m * s, Axis::Z),
+        } => SymMat3::solid_cylinder(mass, radius_m * s, half_height_m * sz, Axis::Z),
         ColliderDef::Convex { points } => {
             if points.is_empty() {
                 return SymMat3::ZERO;
@@ -1017,7 +1084,7 @@ fn collider_inertia(collider: &ColliderDef, s: f64, mass: f64, com: DVec3) -> Sy
             let m = mass / points.len() as f64;
             let mut i = SymMat3::ZERO;
             for p in points {
-                i = i + SymMat3::ZERO.shift(m, *p * s - com);
+                i = i + SymMat3::ZERO.shift(m, DVec3::new(p.x * s, p.y * s, p.z * sz) - com);
             }
             i
         }
@@ -1655,9 +1722,11 @@ fn propellant_mass(
 /// tank entries' resolved `mass_per_unit_kg` (M6-D — the frozen
 /// wet-mass datum the sim's contents bookkeeping debits against).
 #[allow(clippy::too_many_lines)] // the module-dispatch arm list grew with M7-A
+#[allow(clippy::too_many_arguments)] // s/sz scale + the stat/module triples — splitting obscures the pipeline
 fn resolve_weld_input(
     def: &PartDef,
     s: f64,
+    sz: f64,
     mass_kg: f64,
     modules: &[ModuleDef],
     thermal: &csp_data::ThermalDef,
@@ -1668,7 +1737,7 @@ fn resolve_weld_input(
         part_id: def.id.clone(),
         field,
     };
-    let collider = scale_collider(&def.collider, s);
+    let collider = scale_collider(&def.collider, s, sz);
     if !collider.is_valid() {
         return Err(bad("resolve: collider resolves to non-finite vertices"));
     }
@@ -1683,8 +1752,9 @@ fn resolve_weld_input(
     if collider.vertices().is_empty() {
         return Err(bad("resolve: collider resolves to zero vertices"));
     }
-    let com = collider_com(&def.collider) * s;
-    let inertia = collider_inertia(&def.collider, s, mass_kg, com);
+    let com0 = collider_com(&def.collider);
+    let com = DVec3::new(com0.x * s, com0.y * s, com0.z * sz);
+    let inertia = collider_inertia(&def.collider, s, sz, mass_kg, com);
     let mut force_sites = Vec::new();
     let mut dock_ports = Vec::new();
     let mut tanks: Vec<crate::part::TankSpec> = Vec::new();
@@ -1736,7 +1806,11 @@ fn resolve_weld_input(
                     return Err(bad("resolve: dock_port face node is non-finite"));
                 }
                 dock_ports.push(crate::part::DockPortSpec {
-                    local_pos: face.position_m * s,
+                    local_pos: DVec3::new(
+                        face.position_m.x * s,
+                        face.position_m.y * s,
+                        face.position_m.z * sz,
+                    ),
                     local_dir: face.direction,
                     size: *size,
                 });
@@ -1943,7 +2017,13 @@ fn resolve_envelopes(
         if n.id.is_empty() || !seen_ids.insert(n.id.as_str()) {
             return Err(bad("resolve: attach node id is empty or duplicated"));
         }
-        let position_m = n.position_m * f.linear;
+        let position_m = DVec3::new(
+            n.position_m.x * f.linear,
+            n.position_m.y * f.linear,
+            n.position_m.z * f.linear_z,
+        );
+        // The node diameter is a cross-section measure — the stack
+        // axis's stretch does not widen it.
         let diameter_m = n.diameter_m * f.linear;
         if !position_m.is_finite() {
             return Err(bad("resolve: attach node position is non-finite"));
@@ -2081,7 +2161,7 @@ pub fn resolve_built_part(
         part_id: def.id.clone(),
         field,
     };
-    let f = scale_factors(def, built.scale)?;
+    let f = scale_factors(def, built.scale, built.stretch)?;
     let variant = def
         .variants
         .iter()
@@ -2126,10 +2206,22 @@ pub fn resolve_built_part(
     }
 
     let (structural, thermal, aero, attach_nodes) = resolve_envelopes(def, &f)?;
-    let weld_input =
-        resolve_weld_input(def, f.linear, mass_kg, &modules, &thermal, &structural, res)?;
+    let weld_input = resolve_weld_input(
+        def,
+        f.linear,
+        f.linear_z,
+        mass_kg,
+        &modules,
+        &thermal,
+        &structural,
+        res,
+    )?;
     let reliability = resolve_reliability(def, qual, &mults)?;
-    let size_m = def.size_m * f.linear;
+    let size_m = DVec3::new(
+        def.size_m.x * f.linear,
+        def.size_m.y * f.linear,
+        def.size_m.z * f.linear_z,
+    );
     if !(size_m.is_finite() && size_m.x > 0.0 && size_m.y > 0.0 && size_m.z > 0.0) {
         return Err(bad("resolve: resolved size_m is not positive and finite"));
     }
@@ -2139,6 +2231,7 @@ pub fn resolve_built_part(
         family: def.family.clone(),
         variant: built.variant.clone(),
         scale: f.linear,
+        stretch: built.stretch,
         data_set_hash: built.data_set_hash,
         weld_input,
         cost_funds,

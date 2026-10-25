@@ -427,7 +427,9 @@ pub struct TerrainUniforms {
     /// `x` datum radius, `y` atmosphere top (m, 0 = none), `z` ocean
     /// datum radius (0 = none), `w` terrain amplitude (m).
     pub planet: [f32; 4],
-    /// `x` atmosphere scale height (m), `y` has-biome flag, `z`/`w` unused.
+    /// `x` atmosphere scale height (m), `y` has-biome flag, `z` craft
+    /// altitude above the local terrain surface (m — the blob shadow's
+    /// altitude fade), `w` unused.
     pub atmo: [f32; 4],
     /// `x` tan(fov_y/2)·aspect, `y` tan(fov_y/2) — sky ray
     /// reconstruction; `z`/`w` are `fs_sky`'s ray/shell quadratic
@@ -445,6 +447,14 @@ pub struct TerrainUniforms {
     pub rayleigh: [f32; 4],
     /// Biome palette colours (slot → linear RGB), up to 16 slots.
     pub biome_colors: [[f32; 4]; 16],
+    /// Vessel blob-shadow anchor: `xyz` unit direction (inertial,
+    /// body-centred) of the point where the focused craft's shadow
+    /// lands — the craft position projected down-sun to the local
+    /// surface; `w` blob radius (m), `0` disables. The chase camera's
+    /// focus is the vessel, so the extractor derives this from the
+    /// solved view basis rather than plumbing sim state through the
+    /// packet contract.
+    pub shadow: [f32; 4],
 }
 
 /// Atmosphere signature the renderer keys its LUT rebuild on.

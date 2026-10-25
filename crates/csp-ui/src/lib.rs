@@ -436,6 +436,35 @@ pub struct FlightHudInput<'a> {
     /// `0` = single-stage (or no plan); `> 0` with `stages_left == 0`
     /// = expended.
     pub stages_total: usize,
+    /// Live wet mass of the focused vessel (kg).
+    pub mass_kg: f64,
+    /// Thrust delivered at the commanded throttle (N) —
+    /// coverage·throttle over the live engines.
+    pub thrust_n: f64,
+    /// Full-throttle deliverable thrust (N).
+    pub thrust_full_n: f64,
+    /// Thrust-to-weight at the commanded throttle vs local gravity.
+    pub twr: Option<f64>,
+    /// Full-throttle TWR vs body-surface gravity — the pad figure.
+    pub twr_surface: Option<f64>,
+    /// Thrust acceleration at the commanded throttle (m/s²).
+    pub accel_mps2: Option<f64>,
+    /// `accel_mps2` in g's (standard gravity — view-side conversion).
+    pub accel_gee: Option<f64>,
+    /// Mass-flow-weighted vacuum Isp over the metered engines (s).
+    pub isp_s: Option<f64>,
+    /// Propellant mass flow at the commanded throttle (kg/s).
+    pub mass_flow_kg_s: Option<f64>,
+    /// Seconds until the limiting propellant empties at the commanded
+    /// throttle — `None` closed-throttle, unmetered, or no engines.
+    pub fuel_depletion_s: Option<f64>,
+    /// The same at full throttle (s) — the burn-time figure.
+    pub burn_full_s: Option<f64>,
+    /// Δv still aboard — the attached set's burn plus the remaining
+    /// stage drops' (m/s).
+    pub delta_v_mps: Option<f64>,
+    /// The staged-drops portion of `delta_v_mps` (m/s).
+    pub delta_v_stages_mps: f64,
     /// The *live* (applied) keymap — the hint lines print the real
     /// bindings, never hardcoded names (`help_panel`'s rule).
     pub keys: &'a settings::Keymap,
@@ -484,6 +513,53 @@ pub fn fmt_period(s: f64) -> String {
     }
 }
 
+/// Countdown-clock formatting for the HUD's time readouts (T-to-apsis,
+/// fuel depletion, burn time): `M:SS` while the wait is under ten
+/// hours, `fmt_period`'s coarse steps beyond.
+fn fmt_clock(s: f64) -> String {
+    let a = s.abs();
+    if a < 36_000.0 {
+        let m = (a / 60.0).floor();
+        let sec = a - m * 60.0;
+        format!("{m:.0}:{sec:02.0}")
+    } else {
+        fmt_period(s)
+    }
+}
+
+/// Mass formatting for the vessel column — kg under ten tonnes, then t.
+fn fmt_mass(kg: f64) -> String {
+    if kg.abs() < 10_000.0 {
+        format!("{kg:.0} kg")
+    } else {
+        format!("{:.2} t", kg / 1e3)
+    }
+}
+
+/// Thrust formatting — N under a kilonewton, then kN.
+fn fmt_force(n: f64) -> String {
+    if n.abs() < 1_000.0 {
+        format!("{n:.0} N")
+    } else {
+        format!("{:.1} kN", n / 1e3)
+    }
+}
+
+/// Speed formatting for Δv — m/s under 10 km/s, then km/s.
+fn fmt_speed(v: f64) -> String {
+    if v.abs() < 10_000.0 {
+        format!("{v:.0} m/s")
+    } else {
+        format!("{:.2} km/s", v / 1e3)
+    }
+}
+
+/// The honest blank — one em-dash for every unavailable readout
+/// (parked, no engine, open orbit, closed throttle).
+fn fmt_opt(v: Option<f64>, f: impl Fn(f64) -> String) -> String {
+    v.map_or("—".to_string(), f)
+}
+
 /// The §3.7 visual-SFX channel as a GLOBAL overlay — the cue stack
 /// (`FlightSfx`: sim-transition edges AND `View::flight_notice`
 /// refusals) drawn top-center in EVERY view mode, not just Flight.
@@ -517,11 +593,19 @@ pub fn notice_overlay(ctx: &egui::Context, lines: &[String]) {
 
 /// The M4c flight HUD (§3.7's presentation floor, upgraded): the
 /// navball attitude instrument bottom-center (ball + heading tape),
-/// a telemetry column at its left (altitude, surface/orbital speed,
-/// vertical speed, heading/pitch/roll, throttle, parts, warp), and
-/// the controls hint. Drawn by `csp-view`'s `UiBuild` while
-/// `ViewMode::Flight` is active. The §3.7 cue flashes moved out to
-/// [`notice_overlay`] — they render in every mode, not just here.
+/// a grouped telemetry grid at its left — ORBIT (Ap/Pe altitudes,
+/// times-to-apsis, period), SURFACE (altitude, surface/orbital speed,
+/// vertical speed, heading, pitch/roll), VESSEL (mass, current +
+/// full-throttle thrust, TWR at local and surface gravity, thrust
+/// acceleration in m/s² and g's, Δv remaining incl. the staged
+/// drops' share), and PROP (throttle + tank gauges, mass flow,
+/// time-to-fuel-depletion, burn time, Isp) — then staging, parts,
+/// warp, and the controls hint. Every propulsion figure derives from
+/// live sim state each frame; unavailable readouts print "—" (parked
+/// conic, closed throttle, no metered engine, open orbit). Drawn by
+/// `csp-view`'s `UiBuild` while `ViewMode::Flight` is active. The
+/// §3.7 cue flashes moved out to [`notice_overlay`] — they render in
+/// every mode, not just here.
 #[allow(clippy::too_many_lines)] // one HUD = one pass
 pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
     let rect = ctx.content_rect();
@@ -551,11 +635,34 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
             let mono = egui::FontId::monospace(13.0);
             let c = egui::Color32::from_gray(220);
             let dim = egui::Color32::from_gray(160);
-            let row = |ui: &mut egui::Ui, tag: &str, val: String, col: egui::Color32| {
+            let head = egui::Color32::from_gray(115);
+            // The readout grid: two `TAG value` cells per row — left
+            // cell a 4-char tag + 12-wide value, right cell a 6-char
+            // tag + 12-wide value (35 columns of mono).
+            let pair = |ui: &mut egui::Ui,
+                        l: &str,
+                        lv: String,
+                        r: &str,
+                        rv: String,
+                        col: egui::Color32| {
                 ui.label(
-                    egui::RichText::new(format!("{tag}  {val}"))
+                    egui::RichText::new(format!("{l:<4}{lv:>12}  {r:<6}{rv:>12}"))
                         .font(mono.clone())
                         .color(col),
+                );
+            };
+            let row = |ui: &mut egui::Ui, tag: &str, val: String, col: egui::Color32| {
+                ui.label(
+                    egui::RichText::new(format!("{tag:<4}{val:>31}"))
+                        .font(mono.clone())
+                        .color(col),
+                );
+            };
+            let sect = |ui: &mut egui::Ui, name: &str| {
+                ui.label(
+                    egui::RichText::new(format!("── {name} ─────────────────────────────"))
+                        .font(mono.clone())
+                        .color(head),
                 );
             };
             if input.latched {
@@ -568,56 +675,142 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
                     .color(egui::Color32::from_rgb(140, 220, 140)),
                 );
             }
-            row(ui, "ALT", fmt_alt(input.alt_m), c);
-            row(
+            // Orbit — the osculating conic at the CoM: apsides,
+            // times-to-apsis, period. "—" where the conic is open or
+            // the vessel rides surface rails.
+            sect(ui, "ORBIT");
+            pair(
                 ui,
-                "SPD",
-                format!("{:>7.1} m/s", input.surface_speed_mps),
+                "AP",
+                fmt_opt(input.apo_alt_m, fmt_alt),
+                "PE",
+                fmt_opt(input.pe_alt_m, fmt_alt),
                 c,
             );
-            row(
+            pair(
                 ui,
+                "T-AP",
+                fmt_opt(input.t_apo_s, fmt_clock),
+                "T-PE",
+                fmt_opt(input.t_pe_s, fmt_clock),
+                dim,
+            );
+            row(ui, "T", fmt_opt(input.period_s, fmt_period), dim);
+            // Surface frame — altitude, surface/orbital speed, vertical
+            // speed, and the attitude readouts.
+            sect(ui, "SURFACE");
+            pair(
+                ui,
+                "ALT",
+                fmt_alt(input.alt_m),
+                "V/S",
+                format!("{:>+6.1} m/s", input.vspeed_mps),
+                c,
+            );
+            pair(
+                ui,
+                "SPD",
+                format!("{:>6.1} m/s", input.surface_speed_mps),
                 "ORB",
-                format!("{:>7.1} m/s", input.orbital_speed_mps),
-                dim,
+                format!("{:>6.1} m/s", input.orbital_speed_mps),
+                c,
             );
-            row(ui, "V/S", format!("{:>+7.1} m/s", input.vspeed_mps), c);
-            // Pass-1 orbit readout — Ap/Pe altitudes + times-to-apsis
-            // + period, "—" where the conic is open or unset.
-            let opt = |v: Option<f64>| v.map_or("     —  ".to_string(), fmt_alt);
-            row(ui, " AP", opt(input.apo_alt_m), c);
-            row(ui, " PE", opt(input.pe_alt_m), c);
-            let ts = |v: Option<f64>| {
-                v.map_or("     —  ".to_string(), |s| format!("{:>6.0} s", s))
-            };
-            row(
-                ui,
-                "T-A/P",
-                format!("{} /{}", ts(input.t_apo_s), ts(input.t_pe_s)),
-                dim,
-            );
-            row(ui, "  T", ts(input.period_s), dim);
             let hdg = if input.heading_deg.is_finite() {
-                format!("{:>7.1}°", input.heading_deg)
+                format!("{:>6.1}°", input.heading_deg)
             } else {
-                "    —  ".to_string()
+                "—".to_string()
             };
-            row(ui, "HDG", hdg, c);
             let pr = if input.pitch_deg.is_finite() && input.roll_deg.is_finite() {
-                format!("{:>+5.1}°/{:>+5.1}°", input.pitch_deg, input.roll_deg)
+                format!("{:>+4.0}°/{:>+4.0}°", input.pitch_deg, input.roll_deg)
             } else {
-                "    —  /    —  ".to_string()
+                "—/—".to_string()
             };
-            row(ui, "P/R", pr, dim);
+            pair(ui, "HDG", hdg, "P/R", pr, dim);
+            // Vessel — mass, the live thrust/TWR/acceleration readouts
+            // off the staged propulsion walk, and Δv remaining (the
+            // rocket equation over live tanks + isp + mass, including
+            // the stage plan's unfired drops).
+            sect(ui, "VESSEL");
+            pair(
+                ui,
+                "MASS",
+                fmt_mass(input.mass_kg),
+                "FN",
+                fmt_force(input.thrust_n),
+                c,
+            );
+            pair(
+                ui,
+                "TWR",
+                fmt_opt(input.twr, |v| format!("{v:.2}")),
+                "MAXF",
+                fmt_force(input.thrust_full_n),
+                c,
+            );
+            pair(
+                ui,
+                "TWR·SL",
+                fmt_opt(input.twr_surface, |v| format!("{v:.2}")),
+                "ACC",
+                fmt_opt(input.accel_mps2, |v| format!("{v:.1} m/s²")),
+                c,
+            );
+            pair(
+                ui,
+                "G",
+                fmt_opt(input.accel_gee, |v| format!("{v:.2}")),
+                "ΔV",
+                fmt_opt(input.delta_v_mps, fmt_speed),
+                c,
+            );
+            if input.delta_v_stages_mps > 0.0 {
+                row(
+                    ui,
+                    "STG+",
+                    format!("{} m/s in stages", input.delta_v_stages_mps as u64),
+                    dim,
+                );
+            }
+            // Propellant — the tank gauges plus the flow/depletion
+            // readouts at the commanded throttle (and at full for the
+            // burn-time figure).
+            sect(ui, "PROP");
             ui.add(
                 egui::ProgressBar::new(input.throttle as f32)
                     .text(format!("THR  {:>5.1}%", input.throttle * 100.0))
-                    .desired_width(170.0),
+                    .desired_width(280.0),
             );
-            row(
+            // Propellant gauges — one bar per resource still aboard
+            // (tanks the staging drops leave with their nodes).
+            for t in input.propellant {
+                let frac = if t.capacity > 0.0 {
+                    (t.units / t.capacity) as f32
+                } else {
+                    0.0
+                };
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .text(format!(
+                            "{}  {:.0}/{:.0}",
+                            t.resource, t.units, t.capacity
+                        ))
+                        .desired_width(280.0),
+                );
+            }
+            pair(
                 ui,
-                "PWR",
-                format!("parts {}  ·  warp ×{}", input.parts, input.warp),
+                "FLOW",
+                fmt_opt(input.mass_flow_kg_s, |v| format!("{v:.1} kg/s")),
+                "DEP",
+                fmt_opt(input.fuel_depletion_s, fmt_clock),
+                c,
+            );
+            pair(
+                ui,
+                "BURN",
+                fmt_opt(input.burn_full_s, fmt_clock),
+                "ISP",
+                fmt_opt(input.isp_s, |v| format!("{v:.0} s")),
                 dim,
             );
             // Staging — the launch-captured plan's remaining firings.
@@ -634,23 +827,12 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
                 },
                 dim,
             );
-            // Propellant gauges — one bar per resource still aboard
-            // (tanks the staging drops leave with their nodes).
-            for t in input.propellant {
-                let frac = if t.capacity > 0.0 {
-                    (t.units / t.capacity) as f32
-                } else {
-                    0.0
-                };
-                ui.add(
-                    egui::ProgressBar::new(frac)
-                        .text(format!(
-                            "{}  {:.0}/{:.0}",
-                            t.resource, t.units, t.capacity
-                        ))
-                        .desired_width(170.0),
-                );
-            }
+            row(
+                ui,
+                "",
+                format!("parts {}  ·  warp ×{}", input.parts, input.warp),
+                dim,
+            );
             ui.label(
                 egui::RichText::new(format!(
                     "[{}] controls  ·  [{}]/[{}] throttle [{}]/[{}]  ·  [{}] stage  ·  [{}] map  [{}] VAB",

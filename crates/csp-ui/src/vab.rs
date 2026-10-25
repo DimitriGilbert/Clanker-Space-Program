@@ -35,13 +35,76 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use csp_core::DVec3;
 use csp_data::{
     LoadedParts, LocFile, ModuleDef, PartDef, PartId, ResourceFile, ScaleRule, VariantId,
 };
 use csp_phys::graph::PartTransform;
 use csp_phys::readout::CraftAnalysis;
+use csp_phys::resolve::EffectivePart;
 use csp_phys::session::{AttachEdge, CraftSession, Validation};
 use csp_phys::{BuiltPart, MissionProfile, PartNodeId};
+
+/// How a placement decides *where* the new part mounts — the attach
+/// UX toggle in the action bar. `Auto` reads the hovered face: top or
+/// bottom caps stack axially, the hull side surface-mounts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachMode {
+    /// Pick by the hovered region — caps stack, sides surface-mount.
+    Auto,
+    /// Stack on an authored axial node (above or below).
+    Axial,
+    /// Surface-mount upright — the part keeps its own +z axis and
+    /// lies flush against the hull (KSP's radial attach).
+    Side,
+    /// Mount an authored node (typically the part's `top`) against the
+    /// hull — the part sticks out perpendicular to the surface.
+    End,
+}
+
+/// Which face of the hovered part the pointer is over — the view
+/// reports it with the hit; [`AttachMode::Auto`] and the axial plan's
+/// side pick read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachRegion {
+    /// The +z (up-stack) cap.
+    TopCap,
+    /// The −z (down-stack) cap.
+    BottomCap,
+    /// The hull side — a surface mount.
+    Side,
+}
+
+/// Where the pointer currently sits on the craft — the CPU hover pick
+/// the view computes each frame and pushes in. `local` is the hit
+/// point in the node's *scaled* part-local frame (the same frame
+/// [`csp_phys::session::scaled_attach_node`] reports), so a surface
+/// mount can record it verbatim.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HoverHit {
+    /// The part under the cursor.
+    pub node: PartNodeId,
+    /// Hit point in the node's scaled part-local frame.
+    pub local: DVec3,
+    /// Which face the hit is on.
+    pub region: AttachRegion,
+}
+
+/// What a placement would produce — computed by
+/// [`VabSession::plan_attach`] without touching the session so the
+/// ghost preview shows exactly what a drop commits.
+#[derive(Clone, Debug, Default)]
+pub struct AttachPlan {
+    /// One edge per placed copy (radial symmetry expands the set).
+    /// Empty on failure — `error` says why.
+    pub edges: Vec<AttachEdge>,
+    /// The parent-local transform each edge snaps to, parallel to
+    /// `edges` — the ghost's pose (body-frame it via the parent's
+    /// composed transform).
+    pub transforms: Vec<PartTransform>,
+    /// The refusal reason when nothing could be planned.
+    pub error: Option<String>,
+}
 
 /// A mode-switch request the top bar emits — `csp-view` maps these to
 /// its `ViewMode`.
@@ -80,11 +143,25 @@ pub enum VabAction {
     ///   [`Self::Select`]`(Some)` is consumed as the parent pick (the
     ///   banner says "click where it attaches" — from the 3D view, the
     ///   craft tree, or a stage row), and `Select(None)` cancels.
-    ///   Re-clicking the armed catalog row cancels too.
+    ///   Re-clicking the armed catalog row cancels too. The consume
+    ///   path plans through [`VabSession::plan_attach`] against the
+    ///   stored hover hit, so a side-face click surface-mounts like a
+    ///   drag-drop does.
     CatalogPick(PartId),
     /// Disarm a pending placement without placing anything (the
     /// palette banner's cancel button).
     CancelPlacement,
+    /// The drag-and-drop landing: attach `part` at the stored
+    /// [`VabSession::hover`] target through [`Self::plan_attach`]
+    /// (axial or surface per the hit region + attach mode + radial
+    /// symmetry). With no hover target the op falls back to
+    /// [`Self::AttachAuto`]'s axial pick under the hovered part, and
+    /// with no hover at all it becomes `SetRoot`/`CatalogPick`'s arm
+    /// on an empty craft or a plain notice.
+    PlaceAtHover {
+        /// The catalog part being dropped.
+        part: PartId,
+    },
     /// Remove `node` and its subtree.
     Remove(PartNodeId),
     /// Re-root the tree at `node` (the VAB's reroot tool).
@@ -105,6 +182,18 @@ pub enum VabAction {
         /// New linear scale factor.
         scale: f64,
     },
+    /// Restretch `node` — [`csp_phys::BuiltPart::stretch`], the
+    /// stack-axis length factor, gated by the same `ScaleRule` bounds.
+    SetStretch {
+        /// The node to restretch.
+        node: PartNodeId,
+        /// New stack-axis multiplier.
+        stretch: f64,
+    },
+    /// Radial symmetry count for surface mounts — 1, 2, or 4 copies.
+    SetSymmetry(u8),
+    /// The placement attach-mode override.
+    SetAttachMode(AttachMode),
     /// Rebuild `node` as `variant`.
     SetVariant {
         /// The node to re-variant.
@@ -214,6 +303,25 @@ pub struct VabSession {
     /// part's parent pick, and `Select(None)`/[`VabAction::CancelPlacement`]
     /// disarms. Session state — never serialized into the craft file.
     pending_part: Option<PartId>,
+    /// The palette-row drag currently in flight. Distinct from
+    /// `pending_part`: a click-ARM disarms on drop, a drag always
+    /// resolves on release — attach at the hover target, root on an
+    /// empty craft, cancel over a panel or dead space.
+    drag_part: Option<PartId>,
+    /// The CPU hover pick — the part face the pointer is over, in the
+    /// node's scaled local frame. `csp-view` pushes it every frame the
+    /// cursor is over the 3D viewport (and clears it when it leaves);
+    /// the attach planner and the right-click remove read it.
+    hover: Option<HoverHit>,
+    /// The pointer position in physical surface px while it is over
+    /// the 3D viewport — pushed by `vab_editor` from egui each frame.
+    /// `csp-view`'s hover ray is cast through it; `None` over a panel
+    /// or off-window.
+    cursor_px: Option<(f64, f64)>,
+    /// Radial symmetry copies for surface mounts — 1, 2, or 4.
+    symmetry: u8,
+    /// The attach-mode override — `Auto` reads the hovered face.
+    attach_mode: AttachMode,
     /// The last op's status/error line — surfaced by the panel.
     notice: Option<String>,
     /// Set by every mutating op; cleared by `recompute`.
@@ -257,6 +365,11 @@ impl Default for VabSession {
             profile: MissionProfile::default(),
             selected: None,
             pending_part: None,
+            drag_part: None,
+            hover: None,
+            cursor_px: None,
+            symmetry: 1,
+            attach_mode: AttachMode::Auto,
             notice: None,
             dirty: false,
             analysis: None,
@@ -336,6 +449,60 @@ impl VabSession {
     /// surface it.
     pub fn pending_part(&self) -> Option<&PartId> {
         self.pending_part.as_ref()
+    }
+
+    /// The part a palette drag is carrying, if any — the drag-armed
+    /// placement (`pending_part` is its click-armed sibling).
+    pub fn drag_part(&self) -> Option<&PartId> {
+        self.drag_part.as_ref()
+    }
+
+    /// Set/clear the in-flight palette drag — the palette panel owns
+    /// this. A starting drag also arms `pending_part` so the banner,
+    /// the ghost, and a stray mid-drag click agree on what is being
+    /// placed; clearing the drag leaves the arm alone.
+    pub fn set_drag_part(&mut self, part: Option<PartId>) {
+        self.drag_part = part.clone();
+        if let Some(p) = part {
+            self.pending_part = Some(p);
+        }
+    }
+
+    /// The part any placement gesture would drop — drag first, then
+    /// the click-armed pending part.
+    pub fn armed_part(&self) -> Option<&PartId> {
+        self.drag_part.as_ref().or(self.pending_part.as_ref())
+    }
+
+    /// The live CPU hover pick, if the cursor is over a craft part.
+    pub fn hover(&self) -> Option<HoverHit> {
+        self.hover
+    }
+
+    /// Push/clear the frame's hover pick — `csp-view` owns this.
+    pub fn set_hover(&mut self, hover: Option<HoverHit>) {
+        self.hover = hover;
+    }
+
+    /// The viewport cursor position (physical px), if the pointer is
+    /// over the 3D view — `csp-view` casts its hover ray through it.
+    pub fn cursor_px(&self) -> Option<(f64, f64)> {
+        self.cursor_px
+    }
+
+    /// Push/clear the viewport cursor — `vab_editor` owns this.
+    pub fn set_cursor_px(&mut self, px: Option<(f64, f64)>) {
+        self.cursor_px = px;
+    }
+
+    /// The radial symmetry count for surface mounts (1, 2, or 4).
+    pub fn symmetry(&self) -> u8 {
+        self.symmetry
+    }
+
+    /// The attach-mode override — `Auto` reads the hovered face.
+    pub fn attach_mode(&self) -> AttachMode {
+        self.attach_mode
     }
 
     /// The underlying session — read-only for panels/scene building.
@@ -478,6 +645,7 @@ impl VabSession {
     /// player-facing confirmation; `Ok(None)` clears the notice (a
     /// quiet op — selection, rename keystroke, profile drag — whose
     /// result is already visible where it happened).
+    #[allow(clippy::too_many_lines)] // one arm per op — the dispatch table IS the list
     fn apply_inner(&mut self, action: VabAction) -> Result<Option<String>, VabError> {
         Ok(match action {
             VabAction::New => {
@@ -498,6 +666,7 @@ impl VabSession {
                     None
                 }
             }
+            VabAction::PlaceAtHover { part } => Some(self.place_at_hover(&part)?),
             VabAction::Remove(node) => Some(self.remove_node(node)?),
             VabAction::Reroot(node) => {
                 self.session.reroot(node).map_err(VabError::Session)?;
@@ -521,6 +690,35 @@ impl VabSession {
                     .map_err(VabError::Session)?;
                 self.dirty = true;
                 Some(format!("{label} scale → {scale:.2}"))
+            }
+            VabAction::SetStretch { node, stretch } => {
+                let label = self.node_label(node);
+                let defs = self.catalog.as_ref().ok_or(VabError::NoCatalog)?;
+                self.session
+                    .set_stretch(defs, node, stretch)
+                    .map_err(VabError::Session)?;
+                self.dirty = true;
+                Some(format!("{label} length ×{stretch:.2}"))
+            }
+            VabAction::SetSymmetry(n) => {
+                self.symmetry = match n {
+                    2 => 2,
+                    4 => 4,
+                    _ => 1,
+                };
+                Some(format!("symmetry ×{}", self.symmetry))
+            }
+            VabAction::SetAttachMode(mode) => {
+                self.attach_mode = mode;
+                Some(format!(
+                    "attach mode: {}",
+                    match mode {
+                        AttachMode::Auto => "auto (hover picks the face)",
+                        AttachMode::Axial => "stack above/below",
+                        AttachMode::Side => "surface mount — upright",
+                        AttachMode::End => "surface mount — end-on",
+                    }
+                ))
             }
             VabAction::SetVariant { node, variant } => {
                 let label = self.node_label(node);
@@ -638,11 +836,13 @@ impl VabSession {
     /// consumes `Some(node)` as its parent pick — the banner's "click
     /// where it attaches" made literal; a failed attach keeps the arm
     /// so the next click can try a different parent. `None` (a
-    /// background click) deselects and disarms.
+    /// background click) deselects and disarms. The consume runs
+    /// through [`Self::attach_planned`] so a click on a part's side
+    /// surface-mounts exactly like a drag-drop.
     fn select(&mut self, sel: Option<PartNodeId>) -> Result<Option<String>, VabError> {
         let target = sel.filter(|id| self.session.contains(*id));
         if let (Some(part), Some(parent)) = (self.pending_part.clone(), target) {
-            return self.place_attach(&part, parent).map(Some);
+            return self.attach_planned(&part, parent).map(Some);
         }
         self.selected = target;
         Ok(if target.is_none() && self.pending_part.take().is_some() {
@@ -651,6 +851,318 @@ impl VabSession {
         } else {
             None
         })
+    }
+
+    /// [`VabAction::PlaceAtHover`]'s dispatch — the drag-drop landing:
+    /// attach at the stored hover target, place the root on an empty
+    /// craft, or report the drop that found no surface.
+    fn place_at_hover(&mut self, part: &PartId) -> Result<String, VabError> {
+        if self.catalog.is_none() {
+            return Err(VabError::NoCatalog);
+        }
+        if self.session.is_empty() {
+            return self.place_root(part);
+        }
+        let Some(hit) = self.hover else {
+            // Released over dead space — nothing under the cursor.
+            return Ok("dropped over empty space — nothing attached".to_string());
+        };
+        self.attach_planned(part, hit.node)
+    }
+
+    /// Attach `part` to `parent` through [`Self::plan_attach`]: the
+    /// hovered face decides axial vs surface mount (subject to the
+    /// attach-mode override), radial symmetry fans the plan out to
+    /// `symmetry` copies. Success disarms the pending placement and
+    /// selects the first placed copy; failure returns a typed error
+    /// and leaves the arm/selection alone.
+    fn attach_planned(&mut self, part: &PartId, parent: PartNodeId) -> Result<String, VabError> {
+        let plan = self.plan_attach(part, parent);
+        if plan.edges.is_empty() {
+            return Err(VabError::NoCompatibleAttach {
+                part: part.clone(),
+                parent,
+            });
+        }
+        self.check_part_count(self.session.len() + plan.edges.len())?;
+        let name = self.display_name(part);
+        let defs = self.catalog.as_ref().ok_or(VabError::NoCatalog)?;
+        let built = self.stock_build(part)?;
+        let mut placed = Vec::with_capacity(plan.edges.len());
+        for edge in &plan.edges {
+            let id = self
+                .session
+                .add_part(defs, built.clone(), edge.clone())
+                .map_err(VabError::Session)?;
+            placed.push(id);
+        }
+        if let Some(&first) = placed.first() {
+            self.selected = Some(first);
+        }
+        self.pending_part = None;
+        self.dirty = true;
+        let copies = placed.len();
+        Ok(if copies > 1 {
+            format!("attached {copies}× {name} on {}", self.node_label(parent))
+        } else {
+            format!("attached {name} on {}", self.node_label(parent))
+        })
+    }
+
+    /// The would-be attach for `part` under `parent`, evaluated
+    /// against the stored [`Self::hover`] (when it names `parent`),
+    /// [`Self::attach_mode`], and [`Self::symmetry`] — the ghost's
+    /// source of truth. No session mutation; the `transforms` are
+    /// parent-local poses parallel to `edges`.
+    ///
+    /// - Hover on a cap (or `Axial` forced) → an authored axial snap:
+    ///   the free node on that side mates the child node that needs
+    ///   the least twist — the same preference [`Self::attach_auto`]
+    ///   applies, restricted to the clicked side.
+    /// - Hover on the side (or `Side`/`End` forced) → a surface mount:
+    ///   a synthesized `surf:` node on the parent hull at the hit's
+    ///   azimuth/height. `Side` keeps the child upright on a `surf:`
+    ///   side node of its own; `End` mates the child's most axial
+    ///   authored node so the part stands perpendicular to the hull.
+    pub fn plan_attach(&self, part: &PartId, parent: PartNodeId) -> AttachPlan {
+        let mut plan = AttachPlan::default();
+        macro_rules! fail {
+            ($why:expr) => {{
+                plan.error = Some($why);
+                return plan;
+            }};
+        }
+        let Some(parent_rec) = self.session.node(parent) else {
+            fail!(format!("node {parent:?} is not placed"));
+        };
+        let parent_part = parent_rec.built().part_id.clone();
+        let (p_scale, p_stretch) = (parent_rec.built().scale, parent_rec.built().stretch);
+        let Some(parent_def) = self.def_by_id(&parent_part) else {
+            fail!(format!("part '{parent_part}' is not in the loaded catalog"));
+        };
+        let Some(child_def) = self.def_by_id(part) else {
+            fail!(format!("part '{part}' is not in the loaded catalog"));
+        };
+        let Ok(built) = self.stock_build(part) else {
+            fail!(format!("part '{part}' cannot be built"));
+        };
+        let bound = self.session.bound_attach_nodes(parent);
+        let hit = self.hover.filter(|h| h.node == parent);
+        let mode = match self.attach_mode {
+            AttachMode::Auto => match hit.map(|h| h.region) {
+                Some(AttachRegion::Side) => AttachMode::Side,
+                _ => AttachMode::Axial,
+            },
+            m => m,
+        };
+        match mode {
+            AttachMode::Axial | AttachMode::Auto => self.plan_axial(
+                parent, parent_def, child_def, &built, &bound, hit, &mut plan,
+            ),
+            AttachMode::Side | AttachMode::End => self.plan_radial(
+                parent, parent_def, child_def, &built, &bound, hit, p_scale, p_stretch, mode,
+                &mut plan,
+            ),
+        }
+        plan
+    }
+
+    /// The axial half of [`Self::plan_attach`] — the authored snap
+    /// graph on the side the hit named (default: the down-stack face,
+    /// the same preference `attach_auto` applies). Candidates are the
+    /// (free parent node, child node) pairs ordered by
+    /// (side-match, least-twist); the first one the session's own
+    /// `preview_attach` accepts wins.
+    #[allow(clippy::too_many_arguments)] // the plan context is one unit; a params struct would obscure it
+    fn plan_axial(
+        &self,
+        parent: PartNodeId,
+        parent_def: &PartDef,
+        child_def: &PartDef,
+        built: &BuiltPart,
+        bound: &std::collections::BTreeSet<String>,
+        hit: Option<HoverHit>,
+        plan: &mut AttachPlan,
+    ) {
+        let Some(defs) = self.catalog() else {
+            plan.error = Some("part catalog is not loaded".to_string());
+            return;
+        };
+        // The parent's body-frame orientation — needed to know which
+        // authored node faces which way after the ancestor fold.
+        let parent_t = self
+            .body_transforms()
+            .get(&parent)
+            .copied()
+            .unwrap_or_else(|| {
+                let mut chain = vec![parent];
+                while let Some(e) = chain
+                    .last()
+                    .and_then(|id| self.session.node(*id))
+                    .and_then(|n| n.edge())
+                {
+                    chain.push(e.parent);
+                }
+                let mut t = PartTransform::IDENTITY;
+                for id in chain.iter().rev() {
+                    if let Some(n) = self.session.node(*id) {
+                        t = t.compose(n.transform());
+                    }
+                }
+                t
+            });
+        // The preferred stack side: a cap hit names it, anything else
+        // keeps "below" — the auto-placement's growth direction.
+        let want_down = !matches!(hit.map(|h| h.region), Some(AttachRegion::TopCap));
+        let mut candidates: Vec<(&str, &str, i32, f64)> = Vec::new();
+        for pn in &parent_def.attach_nodes {
+            if bound.contains(&pn.id) {
+                continue;
+            }
+            // Same facing metric as `attach_auto`: the parent node's
+            // body-frame outward normal — positive faces down-stack.
+            let facing = -parent_t.apply_dir(pn.direction).z;
+            let side_match = if want_down {
+                facing > 0.0
+            } else {
+                facing < 0.0
+            };
+            for cn in &child_def.attach_nodes {
+                let twist = cn.direction.dot(-pn.direction);
+                candidates.push((&pn.id, &cn.id, i32::from(side_match), twist));
+            }
+        }
+        // Preferred side first, then least twist, authored order last.
+        candidates.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| b.3.total_cmp(&a.3)));
+        let mut last = None;
+        for &(pn, cn, ..) in &candidates {
+            let edge = AttachEdge::new(parent, pn, cn);
+            match self.session.preview_attach(defs, built, &edge) {
+                Ok(t) => {
+                    plan.edges.push(edge);
+                    plan.transforms.push(t);
+                    return;
+                }
+                Err(e) => last = Some(e.to_string()),
+            }
+        }
+        plan.error = Some(last.unwrap_or_else(|| {
+            "no free attach node on that side — flip the camera or pick another face".to_string()
+        }));
+    }
+
+    /// The surface-mount half of [`Self::plan_attach`]: a synthesized
+    /// `surf:` parent node at the hit's azimuth/height, `symmetry`
+    /// copies fanned around the parent's axis. `Side` mounts the child
+    /// upright on its own `surf:` side node; `End` mates the child's
+    /// most axial authored node so the part protrudes.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_radial(
+        &self,
+        parent: PartNodeId,
+        parent_def: &PartDef,
+        child_def: &PartDef,
+        built: &BuiltPart,
+        bound: &std::collections::BTreeSet<String>,
+        hit: Option<HoverHit>,
+        p_scale: f64,
+        p_stretch: f64,
+        mode: AttachMode,
+        plan: &mut AttachPlan,
+    ) {
+        let Some(defs) = self.catalog() else {
+            plan.error = Some("part catalog is not loaded".to_string());
+            return;
+        };
+        let Some(hit) = hit else {
+            plan.error =
+                Some("aim at the part's side — surface mount needs a hull hit".to_string());
+            return;
+        };
+        // The mount height: the hit's z, clamped inside the parent's
+        // z extent so a grazing hit near a cap still lands on the hull.
+        let (z_lo, z_hi) = collider_z_extent(&parent_def.collider, p_scale, p_stretch);
+        let span = (z_hi - z_lo).max(0.0);
+        let z = hit.local.z.clamp(z_lo + 0.05 * span, z_hi - 0.05 * span);
+        let azimuth = libm::atan2(hit.local.y, hit.local.x);
+        // `End` mode mates the child's authored node closest to its
+        // own stack axis — resolved once up front so the parent
+        // surface node's size class matches it exactly.
+        let end_node = (mode == AttachMode::End)
+            .then(|| {
+                child_def
+                    .attach_nodes
+                    .iter()
+                    .max_by(|a, b| a.direction.z.abs().total_cmp(&b.direction.z.abs()))
+                    .map(|n| (n.id.clone(), n.diameter_m * built.scale))
+            })
+            .flatten();
+        if mode == AttachMode::End && end_node.is_none() {
+            plan.error = Some(format!(
+                "{} has no attach nodes to mount by",
+                self.display_name(&child_def.id)
+            ));
+            return;
+        }
+        // The child's mount size class — for `End` the mated authored
+        // node's diameter (the size-class gate must pass); for `Side`
+        // both ends are synthesized and simply agree.
+        let mount_dia = end_node.as_ref().map(|(_, d)| *d).unwrap_or_else(|| {
+            child_def
+                .attach_nodes
+                .first()
+                .map(|n| n.diameter_m * built.scale)
+                .unwrap_or(0.625)
+        });
+        let copies = usize::from(self.symmetry.max(1));
+        for k in 0..copies {
+            let th = azimuth + k as f64 * 2.0 * core::f64::consts::PI / copies as f64;
+            let (sy, cy) = libm::sincos(th);
+            let u = DVec3::new(cy, sy, 0.0);
+            let r_p = collider_support_xy(&parent_def.collider, u) * p_scale;
+            let parent_pos = DVec3::new(u.x * r_p, u.y * r_p, z);
+            let parent_id = csp_phys::session::surface_node_id(parent_pos, u, mount_dia);
+            if bound.contains(&parent_id) {
+                plan.error = Some("that surface spot is already occupied".to_string());
+                return;
+            }
+            let edge = match mode {
+                AttachMode::Side => {
+                    // Upright mount: the child's synthesized node faces
+                    // −u in its own local frame, so the snap rotation
+                    // is the identity — the part keeps its +z axis.
+                    let r_c = collider_support_xy(&child_def.collider, -u) * built.scale;
+                    let child_id = csp_phys::session::surface_node_id(
+                        DVec3::new(-u.x * r_c, -u.y * r_c, 0.0),
+                        -u,
+                        mount_dia,
+                    );
+                    AttachEdge::new(parent, &parent_id, &child_id)
+                }
+                _ => {
+                    // End-on mount: the pre-resolved authored node —
+                    // the part protrudes perpendicular to the hull.
+                    let Some((cn_id, _)) = &end_node else {
+                        plan.error =
+                            Some("the mounted part has no authored attach node".to_string());
+                        return;
+                    };
+                    AttachEdge::new(parent, &parent_id, cn_id)
+                }
+            };
+            match self.session.preview_attach(defs, built, &edge) {
+                Ok(t) => {
+                    plan.edges.push(edge);
+                    plan.transforms.push(t);
+                }
+                Err(e) => {
+                    plan.edges.clear();
+                    plan.transforms.clear();
+                    plan.error = Some(e.to_string());
+                    return;
+                }
+            }
+        }
     }
 
     /// Place `part` as the craft root — the shared half of
@@ -701,6 +1213,22 @@ impl VabSession {
             .map(|v| v.id.clone())
             .unwrap_or_else(|| VariantId::from("stock"));
         Ok(BuiltPart::stock(part_id.clone(), variant))
+    }
+
+    /// The stock build resolved — the catalog part's shape and stats
+    /// at scale 1. `csp-view` resolves the placement ghost's mesh
+    /// through it; `None` when the catalog/resources are not loaded
+    /// or the def fails to resolve.
+    pub fn resolve_stock(&self, part_id: &PartId) -> Option<EffectivePart> {
+        let def = self.def_by_id(part_id)?;
+        let res = self.resources.as_ref()?;
+        csp_phys::resolve::resolve_built_part(
+            def,
+            &self.stock_build(part_id).ok()?,
+            res,
+            &csp_phys::FamilyQualification::FRESH,
+        )
+        .ok()
     }
 
     /// Snap `part` under `parent` — the honest M3 auto-placement:
@@ -815,6 +1343,50 @@ impl VabSession {
     }
 }
 
+/// The def's collider z-extent at a built scale — `(-h·s·t, +h·s·t)`
+/// for the centered primitives, the scaled min/max z over the point
+/// set for `Convex`. The surface-mount planner clamps the mount
+/// height inside it.
+fn collider_z_extent(collider: &csp_data::ColliderDef, scale: f64, stretch: f64) -> (f64, f64) {
+    match collider {
+        csp_data::ColliderDef::Box { half_extents_m } => {
+            let h = half_extents_m.z * scale * stretch;
+            (-h, h)
+        }
+        csp_data::ColliderDef::Cylinder { half_height_m, .. } => {
+            let h = half_height_m * scale * stretch;
+            (-h, h)
+        }
+        csp_data::ColliderDef::Convex { points } => {
+            let mut lo = f64::INFINITY;
+            let mut hi = f64::NEG_INFINITY;
+            for p in points {
+                lo = lo.min(p.z * scale * stretch);
+                hi = hi.max(p.z * scale * stretch);
+            }
+            if lo > hi { (-0.5, 0.5) } else { (lo, hi) }
+        }
+    }
+}
+
+/// The def's collider support radius in the xy plane along direction
+/// `u` (unit, z ignored) at `scale 1` — the caller multiplies by the
+/// built scale. `Cylinder` is exact; `Box`/`Convex` take the support
+/// function `max(p·u)` over their vertices so a side mount lands on
+/// the face, not inside it.
+fn collider_support_xy(collider: &csp_data::ColliderDef, u: DVec3) -> f64 {
+    match collider {
+        csp_data::ColliderDef::Box { half_extents_m } => {
+            half_extents_m.x * u.x.abs() + half_extents_m.y * u.y.abs()
+        }
+        csp_data::ColliderDef::Cylinder { radius_m, .. } => *radius_m,
+        csp_data::ColliderDef::Convex { points } => points
+            .iter()
+            .map(|p| p.x * u.x + p.y * u.y)
+            .fold(0.0_f64, f64::max),
+    }
+}
+
 /// Requests the VAB panel emitted during `UiBuild` — drained by
 /// `csp-app` next frame (the §2.5 one-frame hand-off).
 #[derive(Clone, Debug, Default)]
@@ -921,11 +1493,13 @@ pub fn top_bar(
 }
 
 /// The whole VAB editor pass — palette, craft tree, inspector +
-/// staging + readout, validation, craft-file bar. Runs only while the
-/// mode is `Vab`. Session ops apply immediately through
-/// [`VabSession::apply`] (the §2.2-C channel); file IO and mode
-/// switches ride `out` for next frame's app-side Input. `keys` is the
-/// live keymap the hint bar prints bindings from.
+/// staging + readout, validation, craft-file bar, the action strip,
+/// and the pointer-side plumbing (hover cursor, palette drag-drop,
+/// right-click remove, hotkeys). Runs only while the mode is `Vab`.
+/// Session ops apply immediately through [`VabSession::apply`] (the
+/// §2.2-C channel); file IO and mode switches ride `out` for next
+/// frame's app-side Input. `keys` is the live keymap the hint bar
+/// prints bindings from.
 pub fn vab_editor(
     ctx: &egui::Context,
     vab: &mut VabSession,
@@ -935,9 +1509,146 @@ pub fn vab_editor(
     out: &mut VabUiOutput,
 ) {
     vab.recompute();
-    palette_panel(ctx, vab);
-    inspector_panel(ctx, vab, craft_files, out);
+    let mut panels = Vec::with_capacity(4);
+    panels.push(palette_panel(ctx, vab));
+    panels.push(inspector_panel(ctx, vab, craft_files, out));
+    panels.push(action_bar(ctx, vab));
     vab_hint_bar(ctx, vab, keys, key_labels);
+    vab_pointer_input(ctx, vab, &panels);
+}
+
+/// The pointer/hotkey half of the editor pass — runs after the panels
+/// so their window rects are known:
+///
+/// - publishes the viewport cursor (physical px) into the session so
+///   `csp-view` can cast the CPU hover ray — `None` while the pointer
+///   is over a panel or off the window;
+/// - resolves an in-flight palette drag on release: over the craft
+///   viewport it attaches at the hover target ([`VabAction::
+///   PlaceAtHover`]), over a panel or dead space it cancels;
+/// - right-click over the viewport removes the *hovered* part's
+///   subtree (the craft tree's context menu and the Del key cover the
+///   selected part);
+/// - `Del`/`Backspace` removes the selected part, `Esc` cancels a
+///   placement or deselects, `X` cycles radial symmetry 1→2→4.
+fn vab_pointer_input(ctx: &egui::Context, vab: &mut VabSession, panels: &[egui::Rect]) {
+    let (pos, released, secondary, del, esc, sym_key, typing) = ctx.input(|i| {
+        (
+            i.pointer.hover_pos(),
+            i.pointer.any_released(),
+            i.pointer.secondary_clicked(),
+            i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace),
+            i.key_pressed(egui::Key::Escape),
+            i.key_pressed(egui::Key::X),
+            i.focused,
+        )
+    });
+    let ppp = ctx.pixels_per_point();
+    // The viewport is the content rect minus the floating panels —
+    // egui's `is_pointer_over_area` misreports during drags (the drag
+    // source's layer counts), so the panel set is geometric instead.
+    let over_viewport = pos
+        .is_some_and(|p| ctx.content_rect().contains(p) && !panels.iter().any(|r| r.contains(p)));
+    vab.set_cursor_px(if over_viewport {
+        pos.map(|p| (p.x as f64 * f64::from(ppp), p.y as f64 * f64::from(ppp)))
+    } else {
+        None
+    });
+
+    // The palette drag resolves on release: attach at the hover
+    // target over the viewport, cancel over a panel or dead space.
+    if released && let Some(part) = vab.drag_part().cloned() {
+        vab.set_drag_part(None);
+        if over_viewport {
+            let _ = vab.apply(VabAction::PlaceAtHover { part });
+        }
+    }
+
+    // Right-click over the viewport removes the hovered part — the
+    // 3D surface is wgpu, not egui, so the gesture is read here
+    // through the same hover pick the ghost uses.
+    if secondary
+        && over_viewport
+        && let Some(hit) = vab.hover()
+    {
+        let _ = vab.apply(VabAction::Remove(hit.node));
+    }
+
+    // Hotkeys — gated on no text field wanting the input so a rename
+    // or a save-slot edit never eats them.
+    if typing {
+        return;
+    }
+    if del && let Some(id) = vab.selected() {
+        let _ = vab.apply(VabAction::Remove(id));
+    }
+    if esc {
+        if vab.pending_part().is_some() || vab.drag_part().is_some() {
+            let _ = vab.apply(VabAction::CancelPlacement);
+            vab.set_drag_part(None);
+        } else {
+            let _ = vab.apply(VabAction::Select(None));
+        }
+    }
+    if sym_key {
+        let next = match vab.symmetry() {
+            1 => 2,
+            2 => 4,
+            _ => 1,
+        };
+        let _ = vab.apply(VabAction::SetSymmetry(next));
+    }
+}
+
+/// The bottom-center action strip — always-visible placement
+/// controls: radial symmetry, the attach-mode override, and the
+/// obvious remove/cancel affordances the old hint-only UI lacked.
+fn action_bar(ctx: &egui::Context, vab: &mut VabSession) -> egui::Rect {
+    egui::Window::new("vab_actions")
+        .title_bar(false)
+        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -28.0))
+        .resizable(false)
+        .collapsible(false)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("symmetry");
+                for n in [1u8, 2, 4] {
+                    if ui
+                        .selectable_label(vab.symmetry() == n, format!("×{n}"))
+                        .clicked()
+                    {
+                        let _ = vab.apply(VabAction::SetSymmetry(n));
+                    }
+                }
+                ui.separator();
+                ui.label("mount");
+                for (mode, label) in [
+                    (AttachMode::Auto, "auto"),
+                    (AttachMode::Axial, "stack"),
+                    (AttachMode::Side, "side"),
+                    (AttachMode::End, "end-on"),
+                ] {
+                    if ui
+                        .selectable_label(vab.attach_mode() == mode, label)
+                        .clicked()
+                    {
+                        let _ = vab.apply(VabAction::SetAttachMode(mode));
+                    }
+                }
+                ui.separator();
+                if let Some(id) = vab.selected()
+                    && ui.button("Remove selected").clicked()
+                {
+                    let _ = vab.apply(VabAction::Remove(id));
+                }
+                if vab.armed_part().is_some() && ui.button("Cancel placement").clicked() {
+                    let _ = vab.apply(VabAction::CancelPlacement);
+                    vab.set_drag_part(None);
+                }
+            });
+        })
+        .map(|r| r.response.rect)
+        .unwrap_or(egui::Rect::NOTHING)
 }
 
 /// One catalog row, snapshotted as owned data so the click handlers
@@ -949,6 +1660,10 @@ struct PaletteRow {
     name: String,
     /// One-line stat/module summary under the name.
     blurb: String,
+    /// Browser category — the row's silhouette tint.
+    cat: csp_data::PartCategory,
+    /// The `(z, radius)` side profile the thumbnail draws.
+    profile: Vec<(f64, f64)>,
 }
 
 /// A one-line summary of what a part IS and DOES — the catalog's
@@ -989,20 +1704,150 @@ fn part_blurb(def: &PartDef) -> String {
     s
 }
 
+/// A side-view silhouette for the palette icon — `(z, radius)`
+/// stations in ascending z, drawn mirrored about the part axis. Same
+/// kind-override convention as the 3D kitbash classifier (`csp_view::
+/// part_mesh`): an engine reads as its bell, a crew pod as its taper,
+/// a cone collider as its authored profile.
+fn def_profile(def: &PartDef) -> Vec<(f64, f64)> {
+    let engine = def
+        .modules
+        .iter()
+        .any(|m| matches!(m, ModuleDef::Engine { .. }));
+    let crew = def
+        .modules
+        .iter()
+        .any(|m| matches!(m, ModuleDef::CrewSeat { .. }));
+    let (z0, z1, r) = match &def.collider {
+        csp_data::ColliderDef::Box { half_extents_m } => (
+            -half_extents_m.z,
+            half_extents_m.z,
+            half_extents_m.x.max(half_extents_m.y),
+        ),
+        csp_data::ColliderDef::Cylinder {
+            radius_m,
+            half_height_m,
+        } => (-*half_height_m, *half_height_m, *radius_m),
+        csp_data::ColliderDef::Convex { points } => {
+            // Authored point set → per-z max ring radius — the same
+            // silhouette the kitbash lathe produces.
+            let mut zs: Vec<f64> = points.iter().map(|p| p.z).collect();
+            zs.sort_by(f64::total_cmp);
+            zs.dedup_by(|a, b| (*b - *a).abs() < 1e-9);
+            let mut out = Vec::with_capacity(zs.len());
+            for z in zs {
+                let r = points
+                    .iter()
+                    .filter(|p| (p.z - z).abs() < 1e-9)
+                    .map(|p| p.x.hypot(p.y))
+                    .fold(0.0_f64, f64::max);
+                out.push((z, r));
+            }
+            return out;
+        }
+    };
+    if engine {
+        // The kitbash bell profile (mount → throat → nozzle flare).
+        let h = z1 - z0;
+        return [
+            (0.0, 0.97),
+            (0.08, 0.83),
+            (0.26, 0.58),
+            (0.45, 0.46),
+            (1.0, 0.58),
+        ]
+        .into_iter()
+        .map(|(t, k)| (z0 + t * h, k * r))
+        .collect();
+    }
+    if crew {
+        // The capsule taper — full base radius, smoothstep to a
+        // top-stack half radius.
+        let h = z1 - z0;
+        let rt = 0.5 * r;
+        return [0.0, 0.15, 0.35, 0.55, 0.75, 0.9, 1.0]
+            .into_iter()
+            .map(|t: f64| {
+                let u = ((t - 0.15) / 0.85).clamp(0.0, 1.0);
+                (z0 + t * h, r + (rt - r) * u * u * (3.0 - 2.0 * u))
+            })
+            .collect();
+    }
+    vec![(z0, r), (z1, r)]
+}
+
+/// Draw a `(z, r)` profile as a filled axisymmetric silhouette inside
+/// `rect` — the palette row's thumbnail. The axis runs vertically
+/// (part +z up); the profile mirrors about it.
+fn paint_part_icon(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    profile: &[(f64, f64)],
+    tint: egui::Color32,
+) {
+    if profile.is_empty() {
+        return;
+    }
+    let z_lo = profile.first().map_or(0.0, |s| s.0);
+    let z_hi = profile.last().map_or(0.0, |s| s.0);
+    let r_max = profile.iter().map(|s| s.1).fold(0.0_f64, f64::max);
+    if r_max <= 0.0 || z_hi <= z_lo {
+        return;
+    }
+    let pad = 2.0;
+    let cx = rect.center().x;
+    let h_half = (rect.height() * 0.5 - pad).max(1.0);
+    let w_half = (rect.width() * 0.5 - pad).max(1.0);
+    // Fit the silhouette into the rect preserving aspect: scale each
+    // axis by its own fit so any part stays inside the cell.
+    let k_r = (w_half / r_max as f32).min(1e6);
+    let k_z = (h_half / ((z_hi - z_lo) * 0.5) as f32).min(1e6);
+    let k = k_r.min(k_z) * 0.95;
+    let map = |z: f64, r: f64| {
+        let t = ((z - z_lo) / (z_hi - z_lo) - 0.5) as f32;
+        egui::pos2(
+            cx - r as f32 * k,
+            rect.center().y - t * ((z_hi - z_lo) as f32 * k),
+        )
+    };
+    // Right flank up, left flank back down — one closed polygon.
+    let mut pts: Vec<egui::Pos2> = profile.iter().map(|&(z, r)| map(z, -r)).collect();
+    pts.extend(profile.iter().rev().map(|&(z, r)| map(z, r)));
+    ui.painter()
+        .add(egui::Shape::convex_polygon(pts, tint, egui::Stroke::NONE));
+}
+
+/// The category tint — matches the 3D craft view's `category_color`
+/// so palette icons and placed parts read identically.
+fn category_tint(cat: csp_data::PartCategory) -> egui::Color32 {
+    let c = match cat {
+        csp_data::PartCategory::Engine => (216, 115, 51),
+        csp_data::PartCategory::FuelTank => (115, 140, 179),
+        csp_data::PartCategory::Control => (115, 191, 128),
+        csp_data::PartCategory::Structure => (153, 153, 153),
+        csp_data::PartCategory::Payload => (179, 153, 77),
+        csp_data::PartCategory::Science => (140, 115, 204),
+        csp_data::PartCategory::Utility => (166, 166, 140),
+    };
+    egui::Color32::from_rgb(c.0, c.1, c.2)
+}
+
 /// Left side: the part catalog browser + the craft tree — the
-/// player's build surface. Every catalog row is a one-click add
-/// ([`VabAction::CatalogPick`]); the banner above the list says what
-/// the next click does, so the flow needs no docs.
-fn palette_panel(ctx: &egui::Context, vab: &mut VabSession) {
+/// player's build surface. Each catalog row is a thumbnail + name +
+/// key stats, click-to-add ([`VabAction::CatalogPick`]) or drag onto
+/// the 3D craft (the drag resolves through
+/// [`VabAction::PlaceAtHover`]). Returns the window rect so the
+/// pointer pass can mask the viewport cursor.
+fn palette_panel(ctx: &egui::Context, vab: &mut VabSession) -> egui::Rect {
     egui::Window::new("Parts")
         .anchor(egui::Align2::LEFT_TOP, egui::vec2(0.0, 30.0))
         .resizable(true)
-        .default_size([300.0, 620.0])
+        .default_size([310.0, 620.0])
         .show(ctx, |ui| {
             ui.heading("Parts catalog");
-            // Snapshot the catalog into owned rows — the click handlers
-            // below mutate `vab` through `apply`, so no borrow may
-            // cross them.
+            // Snapshot the catalog into owned rows — the click/drag
+            // handlers below mutate `vab` through `apply`, so no
+            // borrow may cross them.
             let grouped: Vec<(&'static str, Vec<PaletteRow>)> = {
                 const CATS: [csp_data::PartCategory; 7] = [
                     csp_data::PartCategory::Control,
@@ -1026,6 +1871,8 @@ fn palette_panel(ctx: &egui::Context, vab: &mut VabSession) {
                                     id: p.def.id.clone(),
                                     name: vab.display_name(&p.def.id),
                                     blurb: part_blurb(&p.def),
+                                    cat: *cat,
+                                    profile: def_profile(&p.def),
                                 })
                                 .collect();
                             (!rows.is_empty()).then_some((cat.name(), rows))
@@ -1043,7 +1890,7 @@ fn palette_panel(ctx: &egui::Context, vab: &mut VabSession) {
             }
             egui::ScrollArea::vertical()
                 .id_salt("vab_catalog")
-                .max_height(360.0)
+                .max_height(380.0)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     for (cat, rows) in grouped {
@@ -1051,8 +1898,7 @@ fn palette_panel(ctx: &egui::Context, vab: &mut VabSession) {
                             .default_open(true)
                             .show(ui, |ui| {
                                 for row in rows {
-                                    let armed = pending_name.is_some()
-                                        && vab.pending_part() == Some(&row.id);
+                                    let armed = vab.armed_part() == Some(&row.id);
                                     let verb = if empty {
                                         "place as the craft root"
                                     } else if sel_name.is_some() {
@@ -1060,30 +1906,7 @@ fn palette_panel(ctx: &egui::Context, vab: &mut VabSession) {
                                     } else {
                                         "start placing (then click the parent)"
                                     };
-                                    let hover = format!("{} — click to {verb}", row.id.as_str());
-                                    let name_hit = ui
-                                        .selectable_label(
-                                            armed,
-                                            egui::RichText::new(&row.name).strong(),
-                                        )
-                                        .on_hover_text(&hover)
-                                        .clicked();
-                                    // The blurb is the same part's row —
-                                    // a click on it must do what the
-                                    // name does, not dead-end.
-                                    let blurb_hit = ui
-                                        .add(
-                                            egui::Label::new(
-                                                egui::RichText::new(format!("   {}", row.blurb))
-                                                    .weak(),
-                                            )
-                                            .sense(egui::Sense::click()),
-                                        )
-                                        .on_hover_text(&hover)
-                                        .clicked();
-                                    if name_hit || blurb_hit {
-                                        let _ = vab.apply(VabAction::CatalogPick(row.id.clone()));
-                                    }
+                                    palette_row(ui, vab, &row, armed, verb);
                                 }
                             });
                     }
@@ -1096,7 +1919,68 @@ fn palette_panel(ctx: &egui::Context, vab: &mut VabSession) {
                 .show(ui, |ui| {
                     craft_tree(ui, vab);
                 });
-        });
+        })
+        .map(|r| r.response.rect)
+        .unwrap_or(egui::Rect::NOTHING)
+}
+
+/// One palette row — silhouette icon, name, stat line — sensed for
+/// both click (`CatalogPick`) and drag (arms `drag_part`; the drop
+/// resolves in `vab_pointer_input`).
+fn palette_row(ui: &mut egui::Ui, vab: &mut VabSession, row: &PaletteRow, armed: bool, verb: &str) {
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width().max(120.0), 42.0),
+        egui::Sense::click_and_drag(),
+    );
+    let tint = category_tint(row.cat);
+    // Row chrome: armed rows light up; hovered rows lift.
+    let fill = if armed {
+        egui::Color32::from_rgb(60, 90, 60)
+    } else if resp.hovered() {
+        ui.visuals().widgets.hovered.bg_fill
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, 4.0, fill);
+    let icon_rect = egui::Rect::from_min_size(rect.min, egui::vec2(30.0, rect.height()));
+    paint_part_icon(ui, icon_rect.shrink(1.0), &row.profile, tint);
+    ui.painter().text(
+        egui::pos2(rect.min.x + 36.0, rect.min.y + 8.0),
+        egui::Align2::LEFT_TOP,
+        &row.name,
+        egui::FontId::proportional(13.5),
+        ui.visuals().text_color(),
+    );
+    ui.painter().text(
+        egui::pos2(rect.min.x + 36.0, rect.min.y + 24.0),
+        egui::Align2::LEFT_TOP,
+        &row.blurb,
+        egui::FontId::proportional(11.0),
+        ui.visuals().weak_text_color(),
+    );
+    resp.clone()
+        .on_hover_text(format!("{} — click or drag to {verb}", row.id.as_str()));
+    if resp.clicked() {
+        let _ = vab.apply(VabAction::CatalogPick(row.id.clone()));
+    }
+    if resp.drag_started() {
+        // Arming `pending_part` rides inside `set_drag_part` — the
+        // banner, the ghost, and a stray mid-drag click all agree.
+        vab.set_drag_part(Some(row.id.clone()));
+    }
+    if resp.dragged()
+        && let Some(pos) = ui.ctx().input(|i| i.pointer.hover_pos())
+    {
+        // The carried part's name rides the cursor — the 3D ghost
+        // shows where it would land.
+        ui.ctx().debug_painter().text(
+            pos + egui::vec2(14.0, 14.0),
+            egui::Align2::LEFT_CENTER,
+            &row.name,
+            egui::FontId::proportional(13.0),
+            egui::Color32::LIGHT_GREEN,
+        );
+    }
 }
 
 /// The palette's state banner — the one line that says what the next
@@ -1165,10 +2049,40 @@ fn craft_tree(ui: &mut egui::Ui, vab: &mut VabSession) {
             // part id is the fallback, never the label.
             let name = vab.node_label(id);
             let is_sel = vab.selected() == Some(id);
+            // How the part hangs: its edge's mount id — an authored
+            // node name ("bottom") or a surface mount ("on the hull").
+            let mount = n.edge().map(|e| {
+                if e.parent_node
+                    .starts_with(csp_phys::session::SURFACE_NODE_PREFIX)
+                {
+                    "hull".to_string()
+                } else {
+                    e.parent_node.clone()
+                }
+            });
             ui.horizontal(|ui| {
                 ui.add_space(depth as f32 * 12.0);
-                if ui.selectable_label(is_sel, name).clicked() {
+                let resp = ui.selectable_label(is_sel, name);
+                if resp.clicked() {
                     pending.push(VabAction::Select(Some(id)));
+                }
+                resp.context_menu(|ui| {
+                    if ui.button("select").clicked() {
+                        pending.push(VabAction::Select(Some(id)));
+                        ui.close();
+                    }
+                    if ui.button("make root").clicked() {
+                        pending.push(VabAction::Reroot(id));
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("remove subtree").clicked() {
+                        pending.push(VabAction::Remove(id));
+                        ui.close();
+                    }
+                });
+                if let Some(m) = mount {
+                    ui.weak(format!("@{m}"));
                 }
                 ui.weak(format!("s{}", n.stage()));
             });
@@ -1191,7 +2105,7 @@ fn inspector_panel(
     vab: &mut VabSession,
     craft_files: &[String],
     out: &mut VabUiOutput,
-) {
+) -> egui::Rect {
     egui::Window::new("Craft")
         .anchor(egui::Align2::RIGHT_TOP, egui::vec2(0.0, 30.0))
         .resizable(true)
@@ -1206,7 +2120,9 @@ fn inspector_panel(
                 ui.separator();
                 validation_section(ui, vab);
             });
-        });
+        })
+        .map(|r| r.response.rect)
+        .unwrap_or(egui::Rect::NOTHING)
 }
 
 /// Craft name, totals, file save/load, mission check.
@@ -1433,8 +2349,9 @@ fn staging_section(ui: &mut egui::Ui, vab: &mut VabSession) {
     }
 }
 
-/// The selected part's controls: variant, scale (per the def's
-/// `ScaleRule`), stage, reroot/remove.
+/// The selected part's controls: variant, scale + stack length (per
+/// the def's `ScaleRule`), stage, reroot/remove.
+#[allow(clippy::too_many_lines)] // the inspector IS a list of sections — splitting adds indirection, not structure
 fn selected_section(ui: &mut egui::Ui, vab: &mut VabSession) {
     ui.heading("Selected part");
     let Some(id) = vab.selected() else {
@@ -1450,20 +2367,34 @@ fn selected_section(ui: &mut egui::Ui, vab: &mut VabSession) {
     let Some(node) = vab.session().node(id) else {
         return;
     };
-    let (stage_now, scale_now, variant_now) = (
+    let (stage_now, scale_now, stretch_now, variant_now) = (
         node.stage(),
         node.built().scale,
+        node.built().stretch,
         node.built().variant.clone(),
     );
     let def_data = vab
         .def_of(id)
-        .map(|d| (d.variants.clone(), d.scale.clone()));
+        .map(|d| (d.variants.clone(), d.scale.clone(), d.size_m));
 
     ui.label(format!("#{}  {}", id.0, vab.node_label(id)));
     ui.label(format!(
-        "stage {stage_now} · scale {scale_now:.2} · variant {}",
+        "stage {stage_now} · scale {scale_now:.2} · length ×{stretch_now:.2} · variant {}",
         variant_now.as_str()
     ));
+    // Resolved stats for the placed part — the same `effective` row
+    // the reliability section indexes (ascending-id convention).
+    if let Some(eff) = vab
+        .session()
+        .iter()
+        .position(|(nid, _)| nid == id)
+        .and_then(|i| vab.analysis().and_then(|a| a.effective.get(i)))
+    {
+        ui.weak(format!(
+            "resolved {:.1} kg · {:.0} funds · {:.2}×{:.2}×{:.2} m",
+            eff.weld_input.mass_kg, eff.cost_funds, eff.size_m.x, eff.size_m.y, eff.size_m.z,
+        ));
+    }
 
     // Stage controls.
     let mut stage = stage_now as i32;
@@ -1480,7 +2411,7 @@ fn selected_section(ui: &mut egui::Ui, vab: &mut VabSession) {
         }
     });
 
-    if let Some((variants, scale_rule)) = def_data {
+    if let Some((variants, scale_rule, size_m)) = def_data {
         // Variant combo.
         egui::ComboBox::from_label("variant")
             .selected_text(variant_now.as_str())
@@ -1532,6 +2463,37 @@ fn selected_section(ui: &mut egui::Ui, vab: &mut VabSession) {
                     let _ = vab.apply(VabAction::SetScale { node: id, scale: s });
                 }
             }
+        }
+        // The stack-axis length control — `BuiltPart::stretch`, the
+        // same rule's bounds as the uniform scale (`None` rules have
+        // no length dimension at all). Shown in metres: the part's
+        // authored z extent times the two factors.
+        let (t_lo, t_hi) = match &scale_rule {
+            ScaleRule::None => (1.0, 1.0),
+            ScaleRule::Discrete(set) => (
+                set.first().copied().unwrap_or(1.0),
+                set.last().copied().unwrap_or(1.0),
+            ),
+            ScaleRule::Continuous { min, max, .. } => (*min, *max),
+        };
+        if t_hi > t_lo {
+            let mut t = stretch_now;
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        egui::Slider::new(&mut t, t_lo..=t_hi)
+                            .text("length")
+                            .fixed_decimals(2),
+                    )
+                    .changed()
+                {
+                    let _ = vab.apply(VabAction::SetStretch {
+                        node: id,
+                        stretch: t,
+                    });
+                }
+                ui.weak(format!("{:.2} m", size_m.z * scale_now * t));
+            });
         }
     }
 
@@ -2202,5 +3164,135 @@ mod tests {
             Err(VabError::FileIoDisabled)
         );
         assert!(vab.session().is_empty());
+    }
+
+    /// The surface-mount plan: a side-face hover produces a `surf:`
+    /// parent node on the hull at the hit's azimuth, `PlaceAtHover`
+    /// commits it, and the mounted child keeps its own +z axis
+    /// (identity snap — the `Side` style's whole point).
+    #[test]
+    fn side_hover_plans_and_places_a_surface_mount() {
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        vab.apply(VabAction::SetRoot(PartId::from("t.tank")))
+            .unwrap();
+        let root = vab.session().root().unwrap();
+        vab.recompute();
+        // Hover the root's +x hull face: a hit on the side AABB in
+        // the node's scaled local frame (the mini catalog's collider
+        // is a unit box).
+        vab.set_hover(Some(HoverHit {
+            node: root,
+            local: DVec3::new(0.5, 0.0, 0.0),
+            region: AttachRegion::Side,
+        }));
+        let plan = vab.plan_attach(&PartId::from("t.eng"), root);
+        assert_eq!(plan.edges.len(), 1, "plan error: {:?}", plan.error);
+        assert!(
+            plan.edges[0]
+                .parent_node
+                .starts_with(csp_phys::session::SURFACE_NODE_PREFIX)
+        );
+        assert!(
+            plan.edges[0]
+                .child_node
+                .starts_with(csp_phys::session::SURFACE_NODE_PREFIX)
+        );
+        vab.apply(VabAction::PlaceAtHover {
+            part: PartId::from("t.eng"),
+        })
+        .unwrap();
+        assert_eq!(vab.session().len(), 2);
+        let eng = vab.selected().unwrap();
+        let eng_node = vab.session().node(eng).unwrap();
+        // Identity rotation — the mounted part stays upright.
+        let up = eng_node.transform().rotation.rotate(DVec3::Z);
+        assert!(up.z > 1.0 - 1e-12, "side mount flipped: {up:?}");
+        // And it sits beside the root, on +x.
+        assert!(eng_node.transform().offset.x > 0.5);
+    }
+
+    /// Radial symmetry: `SetSymmetry(4)` fans a surface-mount plan
+    /// out to four copies around the parent's axis.
+    #[test]
+    fn symmetry_fans_a_surface_mount_to_copies() {
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        vab.apply(VabAction::SetRoot(PartId::from("t.tank")))
+            .unwrap();
+        let root = vab.session().root().unwrap();
+        vab.apply(VabAction::SetSymmetry(4)).unwrap();
+        vab.set_hover(Some(HoverHit {
+            node: root,
+            local: DVec3::new(0.5, 0.0, 0.0),
+            region: AttachRegion::Side,
+        }));
+        let plan = vab.plan_attach(&PartId::from("t.eng"), root);
+        assert_eq!(plan.edges.len(), 4, "plan error: {:?}", plan.error);
+        // Each copy mounts at a distinct azimuth — no two parent
+        // surface ids collide.
+        let ids: std::collections::BTreeSet<&str> =
+            plan.edges.iter().map(|e| e.parent_node.as_str()).collect();
+        assert_eq!(ids.len(), 4);
+        vab.apply(VabAction::PlaceAtHover {
+            part: PartId::from("t.eng"),
+        })
+        .unwrap();
+        assert_eq!(vab.session().len(), 5);
+    }
+
+    /// `SetStretch` grows a part along its stack axis and re-snaps
+    /// the part attached beneath it — the stretched parent carries
+    /// its child rather than leaving it floating.
+    #[test]
+    fn stretch_moves_the_attached_child() {
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        vab.apply(VabAction::SetRoot(PartId::from("t.tank")))
+            .unwrap();
+        let root = vab.session().root().unwrap();
+        vab.apply(VabAction::AttachAuto {
+            part: PartId::from("t.tank"),
+            parent: root,
+        })
+        .unwrap();
+        let child = vab.selected().unwrap();
+        let before = vab.session().node(child).unwrap().transform().offset;
+        vab.apply(VabAction::SetStretch {
+            node: root,
+            stretch: 2.0,
+        })
+        .unwrap();
+        let after = vab.session().node(child).unwrap().transform().offset;
+        assert_eq!(vab.session().node(root).unwrap().built().stretch, 2.0);
+        // The root's bottom node moved 0.5m lower (z extent × 2), so
+        // the child's transform moved with it.
+        assert!(
+            after.z < before.z - 0.4,
+            "child did not follow the stretch: {before:?} -> {after:?}"
+        );
+    }
+
+    /// A cap-face hover stacks axially on that side — the plan picks
+    /// the authored node facing the hit, not just the first free one.
+    #[test]
+    fn cap_hover_stacks_on_the_hit_side() {
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        vab.apply(VabAction::SetRoot(PartId::from("t.tank")))
+            .unwrap();
+        let root = vab.session().root().unwrap();
+        vab.recompute();
+        vab.set_hover(Some(HoverHit {
+            node: root,
+            local: DVec3::new(0.0, 0.0, 0.5),
+            region: AttachRegion::TopCap,
+        }));
+        let plan = vab.plan_attach(&PartId::from("t.tank"), root);
+        assert_eq!(plan.edges.len(), 1, "plan error: {:?}", plan.error);
+        // A top-cap hit stacks on the parent's top node.
+        assert_eq!(plan.edges[0].parent_node, "top");
+        vab.apply(VabAction::PlaceAtHover {
+            part: PartId::from("t.tank"),
+        })
+        .unwrap();
+        let placed = vab.selected().unwrap();
+        assert!(vab.session().node(placed).unwrap().transform().offset.z > 0.0);
     }
 }

@@ -412,6 +412,19 @@ fn build_ui(
                     propellant: &flight_ui.propellant,
                     stages_left: flight_ui.stages_left,
                     stages_total: flight_ui.stages_total,
+                    mass_kg: flight_ui.mass_kg,
+                    thrust_n: flight_ui.thrust_n,
+                    thrust_full_n: flight_ui.thrust_full_n,
+                    twr: flight_ui.twr,
+                    twr_surface: flight_ui.twr_surface,
+                    accel_mps2: flight_ui.accel_mps2,
+                    accel_gee: flight_ui.accel_gee,
+                    isp_s: flight_ui.isp_s,
+                    mass_flow_kg_s: flight_ui.mass_flow_kg_s,
+                    fuel_depletion_s: flight_ui.fuel_depletion_s,
+                    burn_full_s: flight_ui.burn_full_s,
+                    delta_v_mps: flight_ui.delta_v_mps,
+                    delta_v_stages_mps: flight_ui.delta_v_stages_mps,
                     keys: &session.keys,
                     key_labels: &session.key_labels,
                 },
@@ -1025,6 +1038,10 @@ impl View {
         // The non-debris vessel count across all residences — the
         // tutorial's alive-or-lost mirror (P12-F2).
         world.insert_resource(flight::LiveVesselCount::default());
+        // The propulsion walk mirror — the HUD's live TWR/Δv/
+        // burn-time figures (same standalone-resource pattern as
+        // `LiveVesselCount`: `FlightSnapshot` cannot grow).
+        world.insert_resource(flight::VesselPropulsionStaged::default());
         world.insert_resource(flight::FlightUiData::default());
         world.insert_resource(flight::StagePlan::default());
         world.insert_resource(flight::FlightFrame::default());

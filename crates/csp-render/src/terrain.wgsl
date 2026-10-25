@@ -17,12 +17,13 @@ struct U {
     eye_rel_body: vec4<f32>,  // camera pos rel body centre (m)
     sun_dir: vec4<f32>,       // unit sun direction, body frame
     planet: vec4<f32>,        // x datum R, y atm_top (0 = vacuum), z ocean_r, w amplitude
-    atmo: vec4<f32>,          // x scale_height, y has_biome, z/w unused
+    atmo: vec4<f32>,          // x scale_height, y has_biome, z craft alt (m, shadow fade), w unused
     misc: vec4<f32>,          // x tan(fov_y/2)·aspect, y tan(fov_y/2),
                               // z/w fs_sky shell constants |pa|²−r² (CPU f64 bake)
     spin: vec4<f32>,          // xyz unit spin axis, w phase ω·t (inertial → fixed)
     rayleigh: vec4<f32>,      // Rayleigh β rgb (1/m)
     biome_colors: array<vec4<f32>, 16>,
+    shadow: vec4<f32>,        // xyz vessel-shadow anchor dir (inertial, unit), w blob radius (m, 0 = off)
 };
 
 @group(0) @binding(0) var<uniform> u: U;
@@ -70,6 +71,77 @@ fn rot_axis(axis: vec3<f32>, angle: f32, v: vec3<f32>) -> vec3<f32> {
     let s = sin(angle);
     return v * c + cross(axis, v) * s + axis * dot(axis, v) * (1.0 - c);
 }
+
+// --- procedural detail: deterministic integer-hash value noise on the
+// sphere. This is the "not a smudge" channel — the baked heightfield
+// tops out near ~4 km texels while the quadtree subdivides to ~300 m
+// patches, so everything finer than a texel is synthesized here at
+// fragment rate: micro-relief bump normals, albedo mottling, water
+// waves, star cells. Deterministic by construction (u32 avalanche),
+// camera-independent (sampled on the body-fixed direction).
+
+fn hash_i3(x: i32, y: i32, z: i32) -> f32 {
+    var h = bitcast<u32>(x) * 0x8da6b343u;
+    h = h ^ (bitcast<u32>(y) * 0xd8163841u);
+    h = h ^ (bitcast<u32>(z) * 0xcb1ab31fu);
+    h = (h ^ (h >> 15u)) * 0x85ebca6bu;
+    h = (h ^ (h >> 13u)) * 0xc2b2ae35u;
+    h = h ^ (h >> 16u);
+    return f32(h & 0xffffffu) * (1.0 / 16777216.0); // [0,1)
+}
+
+// Trilinear value noise ∈ [-1,1). `p` is `dir·freq` — frequency is
+// measured in cells per unit-direction, i.e. wavelength ≈ 2πR/freq.
+fn vnoise3(p: vec3<f32>) -> f32 {
+    let ip = floor(p);
+    let i = vec3<i32>(ip);
+    let f = p - ip;
+    let t = f * f * (3.0 - 2.0 * f);
+    let x00 = mix(hash_i3(i.x, i.y, i.z), hash_i3(i.x + 1, i.y, i.z), t.x);
+    let x10 = mix(hash_i3(i.x, i.y + 1, i.z), hash_i3(i.x + 1, i.y + 1, i.z), t.x);
+    let x01 = mix(hash_i3(i.x, i.y, i.z + 1), hash_i3(i.x + 1, i.y, i.z + 1), t.x);
+    let x11 = mix(hash_i3(i.x, i.y + 1, i.z + 1), hash_i3(i.x + 1, i.y + 1, i.z + 1), t.x);
+    return mix(mix(x00, x10, t.y), mix(x01, x11, t.y), t.z) * 2.0 - 1.0;
+}
+
+// A local tangent frame on the sphere (fixed frame): east = d/dlon,
+// north = d/dlat. Pole-safe fallback matches the vertex shader's.
+struct Basis { e: vec3<f32>, n: vec3<f32> };
+
+fn tangent_basis(d: vec3<f32>) -> Basis {
+    var east = cross(vec3<f32>(0.0, 0.0, 1.0), d);
+    if (dot(east, east) < 1.0e-6) {
+        east = vec3<f32>(1.0, 0.0, 0.0);
+    } else {
+        east = normalize(east);
+    }
+    var b: Basis;
+    b.e = east;
+    b.n = normalize(cross(d, east));
+    return b;
+}
+
+// Geometric noise gradient at `dir·freq`: returns ∂n/∂x in noise units
+// (∼±0.6), so a virtual relief of height `h_eq` metres converts to a
+// surface slope as `grad · h_eq·freq/R`.
+fn ngrad(d: vec3<f32>, e: vec3<f32>, n: vec3<f32>, freq: f32) -> vec2<f32> {
+    let off = 0.8 / freq;
+    let c0 = vnoise3(d * freq);
+    return vec2<f32>(
+        vnoise3((d + e * off) * freq) - c0,
+        vnoise3((d + n * off) * freq) - c0,
+    ) / (off * freq);
+}
+
+// Henyey–Greenstein-ish forward lobe for the Mie haze term — cheap
+// form, `d·sqrt(d)` instead of pow(d, 1.5).
+fn mie_phase(mu: f32) -> f32 {
+    let g = 0.72;
+    let d = 1.0 + g * g - 2.0 * g * mu;
+    return (1.0 - g * g) / (4.0 * PI * max(d * sqrt(d), 1.0e-6));
+}
+
+const MIE_BETA: vec3<f32> = vec3<f32>(2.9e-6, 2.9e-6, 2.9e-6); // 1/m, grey aerosol
 
 // --- transmittance LUT: T(h, μ) manual bilinear (clamped both axes).
 // The bake is *endpoint*-centered (bake_transmittance: col/(W−1),
@@ -133,12 +205,15 @@ fn trans_between(ha: f32, hb: f32, mua: f32, mub: f32) -> vec3<f32> {
 fn view_inscatter(pa: vec3<f32>, pb: vec3<f32>, ray: vec3<f32>, dist: f32) -> vec3<f32> {
     let R = u.planet.x;
     let H = max(u.atmo.x, 1.0);
+    let Hm = max(H * 0.30, 1.0); // aerosol hugging the surface harder
     let mu_sun = dot(ray, u.sun_dir.xyz);
     let phase = (3.0 / (16.0 * PI)) * (1.0 + mu_sun * mu_sun);
+    let phase_m = mie_phase(mu_sun);
     let alt_a = max(length(pa) - R, 0.0);
     let mua = dot(ray, pa / max(length(pa), 1.0));
     var acc = vec3<f32>(0.0);
-    let steps = 4.0;
+    var acc_m = vec3<f32>(0.0);
+    let steps = 5.0;
     let ds = dist / steps;
     for (var i = 0.0; i < steps; i = i + 1.0) {
         let p = pa + ray * (dist * (i + 0.5) / steps);
@@ -147,8 +222,11 @@ fn view_inscatter(pa: vec3<f32>, pb: vec3<f32>, ray: vec3<f32>, dist: f32) -> ve
         let t_ei = trans_between(alt_a, alt_i, mua, dot(ray, up));
         let t_is = trans(alt_i, dot(u.sun_dir.xyz, up));
         acc = acc + u.rayleigh.rgb * phase * exp(-alt_i / H) * t_ei * t_is * ds;
+        acc_m = acc_m + MIE_BETA * phase_m * exp(-alt_i / Hm) * t_ei * t_is * ds;
     }
-    return acc;
+    // Rayleigh gain ~4 (single-scatter proxy for multiple scatter) plus
+    // a Mie veil that whitens the horizon and glows around the sun.
+    return acc * 4.2 + acc_m * 1.6;
 }
 
 // --- terrain/ocean instanced draw -------------------------------------
@@ -169,11 +247,10 @@ struct Inst {
 struct Vt {
     @builtin(position) clip: vec4<f32>,
     @location(0) dir: vec3<f32>,
-    @location(1) nrm: vec3<f32>,
-    @location(2) pos_rel_body: vec3<f32>,
-    @location(3) h_norm: f32,
-    @location(4) @interpolate(flat) kind: f32,
-    @location(5) dir_fix: vec3<f32>,
+    @location(1) pos_rel_body: vec3<f32>,
+    @location(2) h_norm: f32,
+    @location(3) @interpolate(flat) kind: f32,
+    @location(4) dir_fix: vec3<f32>,
 };
 
 @vertex
@@ -198,33 +275,13 @@ fn vs_terrain(g: Gv, inst: Inst) -> Vt {
     }
     let wrel = local + inst.origin_skirt.xyz;
 
-    // Surface normal from the heightfield gradient (terrain only) —
-    // built in the fixed frame around `dir_fix`, then rotated back to
-    // inertial for the (inertial-frame) sun lighting.
-    var nrm = dir;
-    if (!ocean) {
-        var east = cross(vec3<f32>(0.0, 0.0, 1.0), dir_fix);
-        if (dot(east, east) < 1.0e-6) {
-            east = vec3<f32>(1.0, 0.0, 0.0);
-        } else {
-            east = normalize(east);
-        }
-        let north = cross(dir_fix, east);
-        let e = 0.004;
-        let dhe = height_at(normalize(dir_fix + east * e))
-                  - height_at(normalize(dir_fix - east * e));
-        let dhn = height_at(normalize(dir_fix + north * e))
-                  - height_at(normalize(dir_fix - north * e));
-        let denom = 2.0 * e * radius;
-        let nrm_fix = normalize(dir_fix - east * (dhe * u.planet.w / denom)
-                                - north * (dhn * u.planet.w / denom));
-        nrm = rot_axis(u.spin.xyz, u.spin.w, nrm_fix);
-    }
+    // Shading normals are built per-fragment now (fs_terrain derives
+    // the heightfield gradient + procedural bump at the interpolated
+    // direction) — the vertex stage only carries geometry.
 
     var o: Vt;
     o.clip = u.view_proj * vec4<f32>(wrel, 1.0);
     o.dir = dir;
-    o.nrm = nrm;
     o.pos_rel_body = dir * (radius + h);
     o.h_norm = h_norm;
     o.kind = inst.dir0_kind.w;
@@ -232,20 +289,124 @@ fn vs_terrain(g: Gv, inst: Inst) -> Vt {
     return o;
 }
 
-// Fallback palette when a body has no biome map (h = normalized height,
-// dir.z = sin(latitude)).
-fn ramp_albedo(dir: vec3<f32>, h: f32) -> vec3<f32> {
-    var c = mix(vec3<f32>(0.10, 0.09, 0.06), vec3<f32>(0.26, 0.38, 0.15),
-                smoothstep(-0.05, 0.05, h)); // sea floor → green
-    c = mix(c, vec3<f32>(0.42, 0.33, 0.20), smoothstep(0.12, 0.32, h)); // highland
-    c = mix(c, vec3<f32>(0.40, 0.38, 0.36), smoothstep(0.45, 0.65, h)); // rock
-    let snowline = 0.72 - abs(dir.z) * 0.30; // snow reaches lower near the poles
-    c = mix(c, vec3<f32>(0.85, 0.88, 0.92), smoothstep(snowline, snowline + 0.12, h));
+// Per-pixel macro normal from the heightfield gradient (fixed frame) —
+// the old vertex-rate normal interpolated across ~18 m cells and
+// flattened every sub-texel facet; sampling the gradient per fragment
+// keeps relief crisp down to the texel, and `bump_fix` adds the
+// procedural micro-relief below it.
+fn terrain_normal_fix(dir_fix: vec3<f32>, b: Basis) -> vec3<f32> {
+    let e = 0.0035;
+    let dhe = height_at(normalize(dir_fix + b.e * e))
+              - height_at(normalize(dir_fix - b.e * e));
+    let dhn = height_at(normalize(dir_fix + b.n * e))
+              - height_at(normalize(dir_fix - b.n * e));
+    let denom = 2.0 * e * u.planet.x;
+    return normalize(dir_fix - b.e * (dhe * u.planet.w / denom)
+                     - b.n * (dhn * u.planet.w / denom));
+}
+
+// Micro-relief bump: four distance-banded noise octaves perturb the
+// macro normal. Frequencies are in cells per unit-direction — a cell
+// spans ~R/freq metres, so metre-scale grain needs freq ~1e5. Each
+// octave fades with view distance before it can sub-pixel shimmer.
+// This is what stops the surface reading as a smooth smudge at
+// chase-camera range: the baked heightfield carries nothing below
+// ~4 km texels.
+fn bump_fix(dir_fix: vec3<f32>, n: vec3<f32>, b: Basis, dist: f32) -> vec3<f32> {
+    let R = u.planet.x;
+    var g = vec2<f32>(0.0);
+    // ~2 km / ~400 m features — visible from low orbit.
+    let f_far = clamp(1.0 - dist / 2.4e5, 0.0, 1.0);
+    g = g + ngrad(dir_fix, b.e, b.n, 2800.0) * (90.0 * 2800.0 / R * f_far);
+    // ~65 m hillocks — fade out by ~60 km altitude.
+    let f_mid = clamp(1.0 - dist / 6.0e4, 0.0, 1.0);
+    g = g + ngrad(dir_fix, b.e, b.n, 9200.0) * (30.0 * 9200.0 / R * f_mid);
+    // Metre-scale grain (~13 m and ~3.5 m cells) — only meaningful
+    // within ~15 km of the surface.
+    let f_near = clamp(1.0 - dist / 1.5e4, 0.0, 1.0);
+    if (f_near > 0.001) {
+        g = g + ngrad(dir_fix, b.e, b.n, 48000.0) * (7.0 * 48000.0 / R * f_near)
+              + ngrad(dir_fix, b.e, b.n, 170000.0) * (2.2 * 170000.0 / R * f_near);
+    }
+    return normalize(n - b.e * g.x - b.n * g.y);
+}
+
+// Cheap terrain self-shadowing: march the sun ray over the heightfield
+// in the local-horizontal approximation — `s` metres along the sun's
+// projected direction, the ray's clearance grows at the sun-elevation
+// slope. Long soft shadows appear automatically at low sun, which is
+// where the terminator needs them most.
+fn sun_occlusion(dir_fix: vec3<f32>, h_m: f32, sun_fix: vec3<f32>) -> f32 {
+    let up = dir_fix;
+    let su = dot(sun_fix, up);
+    if (su <= 0.035) {
+        return 0.0; // sun below the local horizon — fully occluded
+    }
+    var hs = sun_fix - up * su;
+    let hl = length(hs);
+    if (hl < 1.0e-4) {
+        return 1.0; // sun at the zenith — nothing shadows overhead
+    }
+    hs = hs / hl;
+    let rise = su / hl;
+    let R = u.planet.x;
+    let amp = u.planet.w;
+    var vis = 1.0;
+    for (var k = 0; k < 5; k = k + 1) {
+        let s = 55.0 * pow(3.1, f32(k));            // 55 m → ~5 km taps
+        let pd = normalize(up + hs * (s / R));
+        let h_ray = h_m + s * rise;
+        let h_t = height_at(pd) * amp;
+        let pen = s * 0.08 + 30.0;                  // penumbra widens with distance
+        vis = min(vis, clamp((h_ray - h_t + pen) / (2.0 * pen), 0.0, 1.0));
+    }
+    return vis;
+}
+
+// Vessel contact shadow — a Gaussian blob on the surface where the
+// chase camera's focus (the craft) casts it. `u.atmo.z` carries the
+// craft altitude for the fade; a high craft diffuses into a broad
+// haze instead of a crisp disc.
+fn blob_shadow(dir: vec3<f32>) -> f32 {
+    if (u.shadow.w <= 0.0) {
+        return 0.0;
+    }
+    // Ground distance via atan2(|dir×anchor|, dir·anchor) — at the
+    // arc-second scale a craft shadow lives at, acos(1−ε) quantizes
+    // to zero in f32; the cross-magnitude stays accurate.
+    let d = u.planet.x * atan2(length(cross(dir, u.shadow.xyz)),
+                               dot(dir, u.shadow.xyz));
+    let rr = u.shadow.w;
+    let g = exp(-(d * d) / (rr * rr));
+    let fade = exp(-u.atmo.z / 850.0);
+    return 0.55 * g * fade;
+}
+
+// Fallback palette when a body has no biome map — elevation bands
+// (abyss → shelf → beach → grass → dry highland) crossed with a
+// slope-driven rock mask and a snowline that sheds off cliffs.
+// `dither` (detail noise) raggeds the band edges so they don't read
+// as contour lines; `slope` is 1 − n·up (0 flat … ~1 cliff).
+fn ramp_albedo(dir: vec3<f32>, h: f32, slope: f32, dither: f32) -> vec3<f32> {
+    let hd = h + dither * 0.018;
+    var c = mix(vec3<f32>(0.075, 0.085, 0.055), vec3<f32>(0.32, 0.27, 0.14),
+                smoothstep(-0.45, -0.02, hd));           // abyss → coastal shelf
+    c = mix(c, vec3<f32>(0.60, 0.52, 0.33),              // beach sand
+            smoothstep(-0.015, 0.012, hd) * (1.0 - smoothstep(0.035, 0.11, hd)));
+    c = mix(c, vec3<f32>(0.21, 0.38, 0.12), smoothstep(0.03, 0.14, hd)); // grass
+    c = mix(c, vec3<f32>(0.38, 0.29, 0.16), smoothstep(0.32, 0.55, hd)); // dry highland
+    let rock = mix(vec3<f32>(0.27, 0.25, 0.24), vec3<f32>(0.50, 0.47, 0.44),
+                   smoothstep(0.0, 0.6, hd));
+    c = mix(c, rock, smoothstep(0.14, 0.34, slope + dither * 0.10));
+    let snowline = 0.58 - abs(dir.z) * 0.28; // snow reaches lower near the poles
+    let snowy = smoothstep(snowline, snowline + 0.10, hd)
+              * (1.0 - smoothstep(0.22, 0.48, slope));
+    c = mix(c, vec3<f32>(0.88, 0.90, 0.94), snowy);
     return c;
 }
 
-fn biome_albedo(dir: vec3<f32>, h: f32) -> vec3<f32> {
-    var base = ramp_albedo(dir, h);
+fn biome_albedo(dir: vec3<f32>, h: f32, slope: f32, dither: f32) -> vec3<f32> {
+    var base = ramp_albedo(dir, h, slope, dither);
     if (u.atmo.y > 0.5) {
         let lat = asin(clamp(dir.z, -1.0, 1.0));
         let lon = atan2(dir.y, dir.x);
@@ -259,13 +420,17 @@ fn biome_albedo(dir: vec3<f32>, h: f32) -> vec3<f32> {
             vec2<i32>(clamp(ii, 0, d.x - 1), clamp(jj, 0, d.y - 1)), 0).x;
         if (slot < 255u) {
             base = u.biome_colors[min(slot, 15u)].xyz;
-            // Height still modulates: beaches and snow on top of the
-            // authored biome tint.
+            let hd = h + dither * 0.018;
+            // Height and slope still modulate: beaches, rock faces and
+            // snow on top of the authored biome tint.
             base = mix(base, vec3<f32>(0.62, 0.55, 0.38),
-                       smoothstep(0.0, 0.03, h) * (1.0 - smoothstep(0.03, 0.10, h)));
-            let snowline = 0.72 - abs(dir.z) * 0.30;
+                       smoothstep(-0.01, 0.02, hd) * (1.0 - smoothstep(0.03, 0.10, hd)));
+            let rock = vec3<f32>(0.42, 0.40, 0.38);
+            base = mix(base, rock, smoothstep(0.16, 0.38, slope + dither * 0.10));
+            let snowline = 0.58 - abs(dir.z) * 0.28;
             base = mix(base, vec3<f32>(0.85, 0.88, 0.92),
-                       smoothstep(snowline, snowline + 0.10, h));
+                       smoothstep(snowline, snowline + 0.10, hd)
+                       * (1.0 - smoothstep(0.22, 0.48, slope)));
         }
     }
     return base;
@@ -280,35 +445,111 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
     let ray = seg / dist;
     let sun = u.sun_dir.xyz;
     let has_atmo = u.planet.y > 0.0;
+    let dir = normalize(i.dir);
+    let dir_fix = normalize(i.dir_fix);
+    let sun_fix = rot_axis(u.spin.xyz, -u.spin.w, sun);
+    let basis = tangent_basis(dir_fix);
+    // Detail fades out long before orbit distances — a planet seen from
+    // 300 km shouldn't shimmer with 100 m noise.
+    let det_fade = clamp(1.0 - dist / 2.4e5, 0.0, 1.0);
 
     var col: vec3<f32>;
     var alpha = 1.0;
     if (i.kind > 0.5) {
-        // Ocean: flat datum surface — fresnel toward the sky tint,
-        // sun glint on the sphere normal.
+        // --- ocean ----------------------------------------------------
+        // Water depth under the fragment: ocean datum minus the seabed
+        // radius — drives the colour, the shoreline foam and the
+        // see-through alpha.
+        let seabed = u.planet.x + height_at(dir_fix) * u.planet.w;
+        let depth = max(u.planet.z - seabed, 0.0);
+        // Wave normal: a long swell plus chop octaves over the
+        // geometric normal — static (no time uniform), but the
+        // perturbed glint alone reads as water. Near the surface the
+        // ~7 m chop takes over the shading.
+        let wf_near = clamp(1.0 - dist / 2.0e4, 0.0, 1.0);
+        var wg = ngrad(dir_fix, basis.e, basis.n, 1200.0) * (4.5 * 1200.0 / u.planet.x)
+               + ngrad(dir_fix, basis.e, basis.n, 6400.0) * (1.8 * 6400.0 / u.planet.x);
+        wg = wg * (0.4 + 0.6 * det_fade)
+           + ngrad(dir_fix, basis.e, basis.n, 48000.0) * (0.9 * 48000.0 / u.planet.x)
+             * wf_near;
+        let n_fix = normalize(dir_fix - basis.e * wg.x - basis.n * wg.y);
+        let n = rot_axis(u.spin.xyz, u.spin.w, n_fix);
+
         let v = -ray;
-        let n = i.dir;
-        let fres = 0.03 + 0.97 * pow(1.0 - max(dot(n, v), 0.0), 5.0);
-        let sun_up = max(dot(n, sun), 0.0);
-        let spec = pow(max(dot(reflect(-v, n), sun), 0.0), 220.0) * sun_up;
-        let water = vec3<f32>(0.012, 0.045, 0.10) * (0.25 + 0.75 * sun_up);
-        let skyc = vec3<f32>(0.30, 0.44, 0.66) * (0.3 + 0.7 * sun_up);
-        col = mix(water, skyc, fres) + vec3<f32>(1.0, 0.95, 0.8) * spec;
-        alpha = 1.0;
+        let fres = 0.02 + 0.98 * pow(1.0 - max(dot(n, v), 0.0), 5.0);
+        let sun_up = max(dot(dir, sun), 0.0);
+        // Depth body colour — teal shelf to near-black basin.
+        var water = mix(vec3<f32>(0.045, 0.26, 0.30), vec3<f32>(0.006, 0.042, 0.115),
+                        clamp(depth / 60.0, 0.0, 1.0));
+        water = mix(vec3<f32>(0.10, 0.32, 0.26), water, smoothstep(0.4, 6.0, depth));
+        // Approximate reflected sky: horizon haze at grazing, deep
+        // blue at the zenith, a warm forward-scatter lobe sun-side.
+        let r = reflect(ray, n);
+        let rup = clamp(dot(r, dir), 0.0, 1.0);
+        let rsun = max(dot(r, sun), 0.0);
+        var skyc = mix(vec3<f32>(0.38, 0.52, 0.74), vec3<f32>(0.045, 0.095, 0.24),
+                       pow(rup, 0.6));
+        skyc = skyc + vec3<f32>(0.55, 0.38, 0.20) * pow(rsun, 5.0);
+        if (!has_atmo) {
+            skyc = vec3<f32>(0.015, 0.02, 0.05);
+        }
+        // Sun glint: a tight sparkle lobe (the wave noise makes it
+        // glitter) plus a broad sheen — both killed by terrain/vessel
+        // shadow and the atmosphere's sun transmittance.
+        var sun_lum = vec3<f32>(1.0, 0.96, 0.86);
+        if (has_atmo) {
+            let alt_b = max(length(pb) - u.planet.x, 0.0);
+            sun_lum = sun_lum * trans(alt_b, dot(sun, dir));
+        }
+        let occ = sun_occlusion(dir_fix, u.planet.z - u.planet.x, sun_fix);
+        let vis = occ * (1.0 - blob_shadow(dir));
+        let spec = pow(rsun, 700.0) * 2.6 + pow(rsun, 48.0) * 0.22;
+        col = mix(water * (0.10 + 0.90 * sun_up * vis),
+                  skyc * (0.22 + 0.78 * sun_up), fres)
+              + sun_lum * vis * spec;
+        // Shoreline foam: a noise-broken band where the seabed meets
+        // the surface.
+        let foam_n = smoothstep(0.35, 0.85, 0.5 + 0.5 * vnoise3(dir_fix * 5400.0));
+        let foam = (1.0 - smoothstep(0.2, 2.6, depth)) * foam_n;
+        col = mix(col, vec3<f32>(0.80, 0.85, 0.87) * (0.10 + 0.90 * sun_up * vis),
+                  clamp(foam, 0.0, 1.0) * 0.75);
+        // Shallow water goes translucent — the drawn seabed shows
+        // through at the shoreline.
+        alpha = clamp(0.62 + 0.38 * (depth / 25.0), 0.62, 1.0);
     } else {
-        var alb = biome_albedo(i.dir_fix, i.h_norm);
+        // --- terrain --------------------------------------------------
+        let n_macro = terrain_normal_fix(dir_fix, basis);
+        let n_fix = bump_fix(dir_fix, n_macro, basis, dist);
+        let n = rot_axis(u.spin.xyz, u.spin.w, n_fix);
+        let slope = 1.0 - clamp(dot(n_fix, dir_fix), 0.0, 1.0);
+        // Albedo grain — the same near-field banding as the bump:
+        // large patches mottle, close-ups get per-metre speckle.
+        let f_near = clamp(1.0 - dist / 1.5e4, 0.0, 1.0);
+        let mottle = vnoise3(dir_fix * 1500.0) * 0.5
+                   + vnoise3(dir_fix * 5300.0) * 0.3
+                   + vnoise3(dir_fix * 46000.0) * 0.2 * max(f_near, 0.15);
+        var alb = biome_albedo(dir_fix, i.h_norm, slope, mottle);
+        alb = alb * (1.0 + (0.09 * mottle + 0.10 * vnoise3(dir_fix * 160000.0) * f_near));
         // Sun dimmed by the atmosphere at the fragment's altitude.
         var sun_lum = vec3<f32>(1.0, 0.98, 0.92);
         if (has_atmo) {
             let alt_b = max(length(pb) - u.planet.x, 0.0);
-            sun_lum = sun_lum * trans(alt_b, dot(sun, i.dir));
+            sun_lum = sun_lum * trans(alt_b, dot(sun, dir));
         }
-        let lam = max(dot(i.nrm, sun), 0.0);
-        // A faint cool ambient floor keeps the night side readable —
-        // starlight/airglow rather than a hard 0 that reads as a
-        // rendering bug (the unlit terminator side was featureless
-        // black at 0.08·albedo).
-        col = alb * (vec3<f32>(0.10, 0.12, 0.17) + lam * sun_lum);
+        let lam = max(dot(n, sun), 0.0);
+        let occ = sun_occlusion(dir_fix, i.h_norm * u.planet.w, sun_fix);
+        let vis = occ * (1.0 - blob_shadow(dir));
+        // Hemisphere ambient — cool sky fill on day, a faint airglow
+        // floor on the night side so the terminator never goes dead
+        // black, both weighted by how up-facing the surface is.
+        let dayness = clamp(dot(dir, sun) * 0.5 + 0.5, 0.0, 1.0);
+        var amb = mix(vec3<f32>(0.020, 0.026, 0.045), vec3<f32>(0.16, 0.20, 0.28),
+                      dayness);
+        amb = amb * (0.55 + 0.45 * max(dot(n, dir), 0.0));
+        if (!has_atmo) {
+            amb = vec3<f32>(0.016, 0.018, 0.030);
+        }
+        col = alb * (amb + lam * vis * sun_lum);
     }
 
     if (has_atmo) {
@@ -318,8 +559,7 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
         let mua = dot(ray, pa / max(length(pa), 1.0));
         let mub = dot(ray, pb / max(length(pb), 1.0));
         let t_view = trans_between(alt_a, alt_b, mua, mub);
-        let ins = view_inscatter(pa, pb, ray, dist);
-        col = col * t_view + ins * 4.0;
+        col = col * t_view + view_inscatter(pa, pb, ray, dist);
     }
     return vec4<f32>(col, alpha);
 }
@@ -344,6 +584,39 @@ fn vs_sky(@builtin(vertex_index) vi: u32) -> Vs {
     return o;
 }
 
+// Per-pixel march jitter — decorrelates the fixed step lattice so the
+// shell gradient doesn't band.
+fn screen_hash(ndc: vec2<f32>) -> f32 {
+    return fract(sin(dot(ndc, vec2<f32>(12.9898, 78.233))) * 43758.5453);
+}
+
+// Procedural starfield — cell-hashed points anchored to the inertial
+// frame (rd is a world direction, so the stars are a real sky rather
+// than a screenspace pattern). The atmosphere dims them through the
+// view ray's transmittance; the planet occludes them on a ground
+// strike.
+fn star_field(rd: vec3<f32>) -> vec3<f32> {
+    let s = 120.0;
+    let p = rd * s;
+    let c = vec3<i32>(floor(p));
+    let f = p - floor(p) - 0.5;
+    let h = hash_i3(c.x, c.y, c.z);
+    if (h < 0.994) {
+        return vec3<f32>(0.0);
+    }
+    // A stable per-star offset inside the cell + a colour pick.
+    let off = (vec3<f32>(
+        hash_i3(c.x + 11, c.y + 5, c.z - 7),
+        hash_i3(c.x - 3, c.y + 17, c.z + 9),
+        hash_i3(c.x + 5, c.y - 13, c.z + 2),
+    ) - 0.5) * 0.55;
+    let d = f - off;
+    let m = exp(-dot(d, d) * 260.0) * min((h - 0.994) * 260.0, 1.0);
+    let tint = mix(vec3<f32>(0.72, 0.80, 1.0), vec3<f32>(1.0, 0.85, 0.66),
+                   fract(h * 729.31));
+    return tint * m * 1.7;
+}
+
 @fragment
 fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
     let pa = u.eye_rel_body.xyz;
@@ -357,11 +630,13 @@ fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
     let mu_eye = dot(rd, pa / max(length(pa), 1.0));
     let t_bg = trans(alt_a, mu_eye); // 1.0 on vacuum bodies
 
-    // Space: near-black + the sun disc, both attenuated by the
-    // atmosphere along the view ray.
+    // Space: near-black + the sun disc + the starfield, all attenuated
+    // by the atmosphere along the view ray.
     let disc = pow(max(dot(rd, sun), 0.0), 4000.0) * 24.0;
     let halo = pow(max(dot(rd, sun), 0.0), 16.0) * 0.10;
-    var space = vec3<f32>(0.004, 0.006, 0.014) + vec3<f32>(1.0, 0.95, 0.85) * (disc + halo);
+    var space = vec3<f32>(0.004, 0.006, 0.014)
+              + vec3<f32>(1.0, 0.95, 0.85) * (disc + halo)
+              + star_field(rd);
 
     if (u.planet.y <= 0.0) {
         return vec4<f32>(space, 1.0);
@@ -395,28 +670,37 @@ fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
     }
     var col = space;
     if (t1 > t0) {
-        let steps = 16.0;
+        // 20 jittered steps — the per-pixel phase offset breaks the
+        // banding a fixed lattice leaves in the thin shell.
+        let steps = 20.0;
+        let jit = screen_hash(i.ndc);
         let ds = (t1 - t0) / steps;
         let H = max(u.atmo.x, 1.0);
+        let Hm = max(H * 0.30, 1.0); // aerosols hug the low shell
         let mu_sun = dot(rd, sun);
         let phase = (3.0 / (16.0 * PI)) * (1.0 + mu_sun * mu_sun);
+        let phase_m = mie_phase(mu_sun);
         var acc = vec3<f32>(0.0);
+        var acc_m = vec3<f32>(0.0);
         for (var s = 0.0; s < steps; s = s + 1.0) {
-            let p = pa + rd * (t0 + (s + 0.5) * ds);
+            let p = pa + rd * (t0 + (s + 0.05 + jit * 0.9) * ds);
             let pr = length(p);
             let alt_i = max(pr - R, 0.0);
             let up = p / pr;
             let t_ei = trans_between(alt_a, alt_i, mu_eye, dot(rd, up));
             let t_is = trans(alt_i, dot(sun, up));
             acc = acc + u.rayleigh.rgb * phase * exp(-alt_i / H) * t_ei * t_is * ds;
+            acc_m = acc_m + MIE_BETA * phase_m * exp(-alt_i / Hm) * t_ei * t_is * ds;
         }
         // Inscatter + the space term attenuated by the view ray's own
         // transmittance; a ground strike swaps the backdrop for haze.
+        // The Mie veil is what whitens the limb and warms the glow
+        // around the sun instead of a flat blue tint.
         var bg_t = vec3<f32>(0.0);
         if (!hit_ground) {
             bg_t = t_bg;
         }
-        col = acc * 4.0 + space * bg_t;
+        col = acc * 4.2 + acc_m * 1.5 + space * bg_t;
     }
     return vec4<f32>(col, 1.0);
 }

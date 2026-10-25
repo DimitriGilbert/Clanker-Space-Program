@@ -134,8 +134,11 @@ use crate::resolve::BuiltPart;
 
 /// Body schema version of the craft file — the §3.1 first-field
 /// convention carried into the codec. §7.7 pre-1.0: an unknown version
-/// is *refused*, never migrated.
-pub const CRAFT_SCHEMA_VERSION: u32 = 1;
+/// is *refused*, never migrated. Version 2 added `BuiltPart::stretch`
+/// (the stack-axis length factor) and [`SURFACE_NODE_PREFIX`] attach
+/// ids; version-1 bodies decode against the old `BuiltPart` layout and
+/// so are refused rather than silently misread.
+pub const CRAFT_SCHEMA_VERSION: u32 = 2;
 
 /// Craft-file magic — §7.2's `CSPSAVE\0` convention, one byte longer.
 pub const CRAFT_FILE_MAGIC: &[u8] = b"CSPCRAFT\0";
@@ -684,17 +687,97 @@ fn find_def<'a>(defs: &'a LoadedParts, part_id: &PartId) -> Option<&'a PartDef> 
     defs.parts.iter().map(|p| &p.def).find(|d| d.id == *part_id)
 }
 
-/// A def's attach node scaled to `s` — the same scaling the resolver
-/// applies (`position·s`, `diameter·s`, direction unchanged; resolve.rs
-/// `resolve_envelopes`). Kept local so snapping does not need a full
+/// The synthesized surface-mount node convention. A def authors its
+/// axial snap points; a *radial* (side) mount has no authored node on
+/// the parent to name — the mount point is wherever the player put it.
+/// The session records such a mount as an `AttachEdge` node id with
+/// this prefix, carrying the full node inline:
+/// `surf:<x>:<y>:<z>:<nx>:<ny>:<nz>:<d>` — seven f64 fields in
+/// shortest round-trip form: the surface point in part-local frame,
+/// the outward normal, and the size class. Decoded by
+/// [`scaled_attach_node`]/[`decode_surface_node`]; the values stored
+/// are already at the node's built scale+stretch, so decode applies
+/// no further scaling.
+pub const SURFACE_NODE_PREFIX: &str = "surf:";
+
+/// Encode a synthetic surface-mount node as an [`AttachEdge`] node id.
+/// `position`/`direction` are part-local at the mounting part's built
+/// scale (the caller resolves them); `diameter_m` is the size class
+/// the mate must match.
+pub fn surface_node_id(position: DVec3, direction: DVec3, diameter_m: f64) -> String {
+    let mut s = String::with_capacity(96);
+    s.push_str(SURFACE_NODE_PREFIX);
+    for (i, v) in [
+        position.x,
+        position.y,
+        position.z,
+        direction.x,
+        direction.y,
+        direction.z,
+        diameter_m,
+    ]
+    .iter()
+    .enumerate()
+    {
+        if i > 0 {
+            s.push(':');
+        }
+        s.push_str(&format!("{v}"));
+    }
+    s
+}
+
+/// Decode a [`SURFACE_NODE_PREFIX`] id into an [`AttachNode`]. `None`
+/// when the id is not a surface id or any field fails to parse —
+/// malformed surface ids resolve like any other unknown node id
+/// (typed `UnknownAttachNode` at attach/validate time).
+pub fn decode_surface_node(node_id: &str) -> Option<AttachNode> {
+    let body = node_id.strip_prefix(SURFACE_NODE_PREFIX)?;
+    let mut fields = [0.0_f64; 7];
+    let mut it = body.split(':');
+    for f in fields.iter_mut() {
+        *f = it.next()?.parse::<f64>().ok()?;
+        if !f.is_finite() {
+            return None;
+        }
+    }
+    if it.next().is_some() || fields[6] <= 0.0 {
+        return None;
+    }
+    Some(AttachNode {
+        id: node_id.to_string(),
+        position_m: DVec3::new(fields[0], fields[1], fields[2]),
+        direction: DVec3::new(fields[3], fields[4], fields[5]),
+        diameter_m: fields[6],
+    })
+}
+
+/// A def's attach node resolved to the node's built scale — the same
+/// scaling the resolver applies (`position·(s, s, s·t)`, `diameter·s`,
+/// direction unchanged; resolve.rs `resolve_envelopes`). `node_id` may
+/// also be a [`SURFACE_NODE_PREFIX`] synthetic surface-mount id —
+/// those decode inline and arrive already scaled, so `scale`/`stretch`
+/// do not apply to them. Kept local so snapping does not need a full
 /// resolve (no `ResourceFile`/qual inputs on the placement path).
-fn scaled_attach_node(def: &PartDef, node_id: &str, scale: f64) -> Option<AttachNode> {
+pub fn scaled_attach_node(
+    def: &PartDef,
+    node_id: &str,
+    scale: f64,
+    stretch: f64,
+) -> Option<AttachNode> {
+    if let Some(n) = decode_surface_node(node_id) {
+        return Some(n);
+    }
     def.attach_nodes
         .iter()
         .find(|n| n.id == node_id)
         .map(|n| AttachNode {
             id: n.id.clone(),
-            position_m: n.position_m * scale,
+            position_m: DVec3::new(
+                n.position_m.x * scale,
+                n.position_m.y * scale,
+                n.position_m.z * scale * stretch,
+            ),
             direction: n.direction,
             diameter_m: n.diameter_m * scale,
         })
@@ -778,6 +861,24 @@ fn check_built(def: &PartDef, built: &BuiltPart, node: PartNodeId) -> Result<(),
                 return Err(bad_scale("session: scale outside the authored range"));
             }
         }
+    }
+    // The stack-axis stretch factor rides the same rule's bounds (the
+    // resolver's `scale_factors` enforces the identical range at
+    // commit): `None` pins 1.0, `Discrete`/`Continuous` bound to the
+    // authored min/max.
+    if !built.stretch.is_finite() || built.stretch <= 0.0 {
+        return Err(bad_scale("session: stretch must be finite and positive"));
+    }
+    let (t_lo, t_hi) = match &def.scale {
+        ScaleRule::None => (1.0, 1.0),
+        ScaleRule::Discrete(set) => (
+            set.first().copied().unwrap_or(1.0),
+            set.last().copied().unwrap_or(1.0),
+        ),
+        ScaleRule::Continuous { min, max, .. } => (*min, *max),
+    };
+    if built.stretch < t_lo || built.stretch > t_hi {
+        return Err(bad_scale("session: stretch outside the authored range"));
     }
     if !def.variants.iter().any(|v| v.id == built.variant) {
         return Err(SessionError::UnknownVariant {
@@ -1095,19 +1196,23 @@ impl CraftSession {
                 node: Some(child),
                 part_id: built.part_id.clone(),
             })?;
-        let pn = scaled_attach_node(parent_def, &edge.parent_node, parent_node_rec.built.scale)
+        let pn = scaled_attach_node(
+            parent_def,
+            &edge.parent_node,
+            parent_node_rec.built.scale,
+            parent_node_rec.built.stretch,
+        )
+        .ok_or_else(|| SessionError::UnknownAttachNode {
+            node: child,
+            which: "parent",
+            node_id: edge.parent_node.clone(),
+        })?;
+        let cn = scaled_attach_node(child_def, &edge.child_node, built.scale, built.stretch)
             .ok_or_else(|| SessionError::UnknownAttachNode {
-                node: child,
-                which: "parent",
-                node_id: edge.parent_node.clone(),
-            })?;
-        let cn = scaled_attach_node(child_def, &edge.child_node, built.scale).ok_or_else(|| {
-            SessionError::UnknownAttachNode {
                 node: child,
                 which: "child",
                 node_id: edge.child_node.clone(),
-            }
-        })?;
+            })?;
         if !pn.direction.is_finite() || pn.direction.norm() < MIN_DIRECTION_NORM {
             return Err(SessionError::IncompatibleAttach {
                 parent: edge.parent,
@@ -1164,6 +1269,18 @@ impl CraftSession {
             });
         }
         Ok(transform)
+    }
+
+    /// The transform `add_part` would compute for `edge` — the same
+    /// checks, no session mutation. The editor's ghost preview uses it
+    /// so the drop lands exactly what was previewed.
+    pub fn preview_attach(
+        &self,
+        defs: &LoadedParts,
+        built: &BuiltPart,
+        edge: &AttachEdge,
+    ) -> Result<PartTransform, SessionError> {
+        self.compute_attach(defs, PartNodeId(self.next_id), built, edge)
     }
 
     /// Remove `id` and its whole subtree (the §2.4 editor rule for a
@@ -1323,9 +1440,64 @@ impl CraftSession {
         Ok(())
     }
 
+    /// Recompute a node's stored transform from its edge at the
+    /// *current* built scale/stretch of both ends — no placement gate
+    /// (the edge is already bound), just the snap re-evaluated so
+    /// geometry follows a resize. Missing defs or a malformed edge
+    /// leave the stored transform alone (the session stays
+    /// consistent; `validate` reports the record).
+    fn resnap_node(&mut self, defs: &LoadedParts, id: PartNodeId) {
+        let Some((built, edge)) = self
+            .nodes
+            .get(&id)
+            .map(|n| (n.built.clone(), n.edge.clone()))
+        else {
+            return;
+        };
+        let Some(edge) = edge else { return };
+        let Some(parent_rec) = self.nodes.get(&edge.parent) else {
+            return;
+        };
+        let Some(parent_def) = find_def(defs, &parent_rec.built.part_id) else {
+            return;
+        };
+        let Some(child_def) = find_def(defs, &built.part_id) else {
+            return;
+        };
+        let pn = scaled_attach_node(
+            parent_def,
+            &edge.parent_node,
+            parent_rec.built.scale,
+            parent_rec.built.stretch,
+        );
+        let cn = scaled_attach_node(child_def, &edge.child_node, built.scale, built.stretch);
+        if let (Some(pn), Some(cn)) = (pn, cn) {
+            let t = snap_transform(&pn, &cn);
+            if t.is_valid()
+                && let Some(n) = self.nodes.get_mut(&id)
+            {
+                n.transform = t;
+            }
+        }
+    }
+
+    /// Re-snap a node and every direct child — the shared tail of the
+    /// resize ops: a part that grows or stretches carries its
+    /// attachments' snap points with it (the edges are already bound,
+    /// so only positions/rotations re-evaluate — the diameter gate is
+    /// a *placement* rule; `validate` keeps reporting post-resize
+    /// mismatches as warnings).
+    fn resnap_self_and_children(&mut self, defs: &LoadedParts, id: PartNodeId) {
+        self.resnap_node(defs, id);
+        for child in self.children_ids(id) {
+            self.resnap_node(defs, child);
+        }
+    }
+
     /// Editor scale change — prechecked against the def's `ScaleRule`
     /// (same conditions `resolve::scale_factors` enforces); the
-    /// resolver re-validates at commit.
+    /// resolver re-validates at commit. The node and its direct
+    /// children re-snap at the new size so the stack stays mated.
     pub fn set_scale(
         &mut self,
         defs: &LoadedParts,
@@ -1347,6 +1519,36 @@ impl CraftSession {
             .get_mut(&id)
             .ok_or(SessionError::UnknownNode { id })?
             .built = built;
+        self.resnap_self_and_children(defs, id);
+        Ok(())
+    }
+
+    /// Editor stack-axis (length) change — [`BuiltPart::stretch`],
+    /// gated by the same `ScaleRule` bounds `check_built` enforces and
+    /// the resolver re-checks. The node and its direct children
+    /// re-snap, same as [`Self::set_scale`].
+    pub fn set_stretch(
+        &mut self,
+        defs: &LoadedParts,
+        id: PartNodeId,
+        stretch: f64,
+    ) -> Result<(), SessionError> {
+        let node = self
+            .nodes
+            .get(&id)
+            .ok_or(SessionError::UnknownNode { id })?;
+        let mut built = node.built.clone();
+        built.stretch = stretch;
+        let def = find_def(defs, &built.part_id).ok_or_else(|| SessionError::UnknownPartDef {
+            node: Some(id),
+            part_id: built.part_id.clone(),
+        })?;
+        check_built(def, &built, id)?;
+        self.nodes
+            .get_mut(&id)
+            .ok_or(SessionError::UnknownNode { id })?
+            .built = built;
+        self.resnap_self_and_children(defs, id);
         Ok(())
     }
 
@@ -1577,36 +1779,32 @@ impl CraftSession {
             let Some(parent_def) = def_of.get(&edge.parent).copied() else {
                 continue;
             };
-            if !parent_def
-                .attach_nodes
-                .iter()
-                .any(|a| a.id == edge.parent_node)
-            {
+            let node_known = |def: &PartDef, node_id: &str| {
+                def.attach_nodes.iter().any(|a| a.id == node_id)
+                    || decode_surface_node(node_id).is_some()
+            };
+            if !node_known(parent_def, &edge.parent_node) {
                 out.errors.push(SessionError::UnknownAttachNode {
                     node: *id,
                     which: "parent",
                     node_id: edge.parent_node.clone(),
                 });
             }
-            if !child_def
-                .attach_nodes
-                .iter()
-                .any(|a| a.id == edge.child_node)
-            {
+            if !node_known(child_def, &edge.child_node) {
                 out.errors.push(SessionError::UnknownAttachNode {
                     node: *id,
                     which: "child",
                     node_id: edge.child_node.clone(),
                 });
             }
-            let parent_scale = self
+            let (parent_scale, parent_stretch) = self
                 .nodes
                 .get(&edge.parent)
-                .map(|p| p.built.scale)
-                .unwrap_or(1.0);
+                .map(|p| (p.built.scale, p.built.stretch))
+                .unwrap_or((1.0, 1.0));
             match (
-                scaled_attach_node(parent_def, &edge.parent_node, parent_scale),
-                scaled_attach_node(child_def, &edge.child_node, n.built.scale),
+                scaled_attach_node(parent_def, &edge.parent_node, parent_scale, parent_stretch),
+                scaled_attach_node(child_def, &edge.child_node, n.built.scale, n.built.stretch),
             ) {
                 (Some(pn), Some(cn)) if !diameters_match(pn.diameter_m, cn.diameter_m) => {
                     out.warnings

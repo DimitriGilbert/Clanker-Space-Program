@@ -189,12 +189,20 @@ struct App {
     /// as "1" — a token match would never clear and would swallow
     /// every future "!" press until a focus loss reset it.
     captured_key: Option<winit::keyboard::PhysicalKey>,
-    /// Attitude actions currently held (flight mode) — the set is the
-    /// angular-rate request [`Self::apply_attitude`] folds into one
-    /// `SetAttitude` command per change. Populated on key press,
-    /// depopulated on release; a focus loss clears it (the missed
-    /// release could never arrive) and re-issues a zero-rate hold.
-    attitude_held: std::collections::BTreeSet<KeyAction>,
+    /// Attitude keys currently held (flight mode) — `held-token → the
+    /// action its press resolved to`. The held-token is the same
+    /// physical-first token [`Self::key_press`] resolves (`key-w` for
+    /// the W-position key, a logical token for non-positional keys,
+    /// `verb:<action>` for programmatic dispatches with no key event).
+    /// Keying by token — not by action — is what makes a release
+    /// remove exactly what its own press added: two bindings on one
+    /// action (W + ArrowUp) hold independently instead of aliasing,
+    /// and a rebind mid-hold can't strand a stale action the release
+    /// re-resolution would miss. [`Self::apply_attitude`] folds the
+    /// held action *values* into one `SetAttitude` per change; a focus
+    /// loss clears the map (the missed release could never arrive) and
+    /// re-issues a zero-rate hold.
+    attitude_held: std::collections::BTreeMap<String, KeyAction>,
     /// Set when a press left `attitude_held` non-empty but no
     /// `SetAttitude` could issue — no commandable body (pad-latched,
     /// on rails) or a halted session. [`Self::tick_attitude`] retries
@@ -423,7 +431,7 @@ impl App {
             map_dragging: false,
             lmb_press: None,
             captured_key: None,
-            attitude_held: std::collections::BTreeSet::new(),
+            attitude_held: std::collections::BTreeMap::new(),
             attitude_deferred: false,
             throttle_held: std::collections::BTreeSet::new(),
             throttle_axis: 0.0,
@@ -1451,20 +1459,30 @@ impl App {
         // name the key's *position* — a bound `key-w` fires on the
         // W-position key whether the layout prints `w` or `z` on it.
         // The logical token is the fallback for character bindings a
-        // user (or an old settings file) recorded by glyph.
-        let action = settings_io::keycode_token(&event.physical_key)
-            .and_then(|t| self.settings.keys.action_for(&t))
-            .or_else(|| {
-                settings_io::key_token(&event.logical_key)
-                    .and_then(|t| self.settings.keys.action_for(&t))
-            });
-        let Some(action) = action else {
-            return;
+        // user (or an old settings file) recorded by glyph. The held
+        // token is whichever produced the action — it is what the
+        // release must remove from `attitude_held`.
+        let phys = settings_io::keycode_token(&event.physical_key);
+        let (action, held_token) = match phys
+            .as_deref()
+            .and_then(|t| self.settings.keys.action_for(t))
+        {
+            Some(a) => (a, phys),
+            None => {
+                let logical = settings_io::key_token(&event.logical_key);
+                let Some(a) = logical
+                    .as_deref()
+                    .and_then(|t| self.settings.keys.action_for(t))
+                else {
+                    return;
+                };
+                (a, logical)
+            }
         };
         if event.repeat && !action.accepts_repeat() {
             return;
         }
-        self.dispatch(action);
+        self.dispatch_with_key(action, held_token);
     }
 
     /// The release-side resolver — the same physical-first order
@@ -1480,12 +1498,16 @@ impl App {
     }
 
     /// Mark an attitude action held and re-issue the combined rate
-    /// command (the `BTreeSet::insert` dedup makes OS key repeats free).
+    /// command. `held_token` identifies the *key* — the same physical
+    /// token the press resolved, or `verb:<action>` for a keyless
+    /// programmatic dispatch (tests, future UI holds). The `BTreeMap`
+    /// insert dedup makes OS key repeats free: a repeat press of the
+    /// same key replaces its own entry, changing nothing.
     /// A press with no commandable body is NOT silent: the reason lands
     /// as a HUD cue ([`View::flight_notice`]) and the hold is deferred —
     /// [`Self::tick_attitude`] picks it up the frame a body exists.
-    fn attitude_press(&mut self, action: KeyAction) {
-        if !self.attitude_held.insert(action) {
+    fn attitude_press(&mut self, action: KeyAction, held_token: String) {
+        if self.attitude_held.insert(held_token, action).is_some() {
             return; // already held — an OS repeat, nothing changed
         }
         match self.attitude_blocker() {
@@ -1497,15 +1519,19 @@ impl App {
         }
     }
 
-    /// Clear an attitude action on release and re-issue the combined
+    /// Clear an attitude hold on release and re-issue the combined
     /// rate — an empty set commands a zero angular rate (the stand-in
-    /// control authority's "stop rotating" until M3+ real SAS). While
-    /// blocked there is no live command to update — the held set just
-    /// shrinks and the deferred flag tracks whether anything remains
-    /// for [`Self::tick_attitude`] to pick up.
-    fn attitude_release(&mut self, action: KeyAction) {
-        if !self.attitude_held.remove(&action) {
-            return;
+    /// control authority's "stop rotating" until M3+ real SAS). The
+    /// removal is keyed on the released key's *token* so a second
+    /// binding held for the same action keeps steering (two bindings,
+    /// one verb). `false` when the token held nothing — the caller
+    /// may then try the event's other token form.
+    /// While blocked there is no live command to update — the held set
+    /// just shrinks and the deferred flag tracks whether anything
+    /// remains for [`Self::tick_attitude`] to pick up.
+    fn attitude_release(&mut self, held_token: &str) -> bool {
+        if self.attitude_held.remove(held_token).is_none() {
+            return false;
         }
         if self.attitude_blocker().is_none() {
             self.attitude_deferred = false;
@@ -1513,6 +1539,7 @@ impl App {
         } else {
             self.attitude_deferred = !self.attitude_held.is_empty();
         }
+        true
     }
 
     /// Per-frame retry for a held attitude request that had no
@@ -1544,6 +1571,18 @@ impl App {
             return Some("NO VESSEL — ATTITUDE LOCKED");
         };
         match self.view.sim.vessels().get(&vessel).map(|v| &v.state) {
+            // An InBubble body the backend's settle pass latched —
+            // resting on the pad's contact sphere, or stacked on
+            // another vessel's static collider while that supporter
+            // is still moving — never makes it to `SurfaceLatched`,
+            // yet the backend skips it entirely while `throttle == 0`:
+            // a `SetAttitude` would apply and do literally nothing —
+            // a silent dead key. Same parked refusal + deferral as the
+            // surface-latched case: `tick_attitude` lands the rate the
+            // tick a throttle command unlatches it.
+            Some(csp_view::VesselState::InBubble(body)) if body.settle.latched => {
+                Some("PARKED — ATTITUDE LOCKED UNTIL LAUNCH (THROTTLE TO LIFTOFF)")
+            }
             Some(csp_view::VesselState::InBubble(_)) => None,
             Some(csp_view::VesselState::SurfaceLatched(_)) => {
                 Some("PARKED — ATTITUDE LOCKED UNTIL LAUNCH (THROTTLE TO LIFTOFF)")
@@ -1576,10 +1615,9 @@ impl App {
             // the parked craft).
             return;
         };
+        let held = |a: KeyAction| self.attitude_held.values().any(|v| *v == a);
         let rate = |neg: KeyAction, pos: KeyAction| -> f64 {
-            f64::from(
-                self.attitude_held.contains(&pos) as i8 - self.attitude_held.contains(&neg) as i8,
-            ) * ATTITUDE_RATE_RAD_S
+            f64::from(held(pos) as i8 - held(neg) as i8) * ATTITUDE_RATE_RAD_S
         };
         // PanUp/Down are the W/S positions — KSP's pitch down/up;
         // PanLeft/Right the A/D yaw; Roll Q/E.
@@ -1794,7 +1832,7 @@ impl App {
         let new = &self.settings.keys;
         let attitude_before = self.attitude_held.len();
         self.attitude_held
-            .retain(|a| old.bindings.get(a) == new.bindings.get(a));
+            .retain(|_, a| old.bindings.get(a) == new.bindings.get(a));
         self.throttle_held
             .retain(|a| old.bindings.get(a) == new.bindings.get(a));
         if self.attitude_held.len() != attitude_before {
@@ -1896,12 +1934,22 @@ impl App {
         match event.state {
             ElementState::Pressed => self.key_press(event),
             ElementState::Released => {
-                let Some(action) = self.action_of(event) else {
-                    return;
-                };
-                if action.is_attitude() {
-                    self.attitude_release(action);
-                } else if action.is_throttle_axis() {
+                // Attitude holds key off the *token* the press stored —
+                // try the physical token first, then the logical (a
+                // press whose physical key produced no token — an
+                // `Unidentified` key or an unbound `key-*` — stored the
+                // logical). One key = one entry; the first hit wins.
+                let _ = settings_io::keycode_token(&event.physical_key)
+                    .as_deref()
+                    .is_some_and(|t| self.attitude_release(t))
+                    || settings_io::key_token(&event.logical_key)
+                        .as_deref()
+                        .is_some_and(|t| self.attitude_release(t));
+                // The throttle axis still resolves the action (its
+                // held set is action-keyed).
+                if let Some(action) = self.action_of(event)
+                    && action.is_throttle_axis()
+                {
                     self.throttle_release(action);
                 }
             }
@@ -1945,8 +1993,20 @@ impl App {
     /// Route one resolved [`KeyAction`] — mode choreography lives in
     /// `View::set_mode`, camera input rides `View::{map,vab,flight}_event`
     /// into the Input schedule, and sim mutations ride the §7.6-logged
-    /// command channel like every other mutation.
+    /// command channel like every other mutation. The keyless dispatch
+    /// path — tests and future programmatic verb triggers reach the
+    /// held verbs through the `verb:<action>` fallback token; the real
+    /// input path is [`Self::key_press`] → [`Self::dispatch_with_key`].
+    #[cfg(test)]
     fn dispatch(&mut self, action: KeyAction) {
+        self.dispatch_with_key(action, None);
+    }
+
+    /// [`Self::dispatch`] carrying the held-key token the press
+    /// resolved (`key_press` passes it; programmatic dispatches pass
+    /// `None` and the held verbs fall back to a `verb:<action>` token
+    /// — a per-action placeholder no real key can produce).
+    fn dispatch_with_key(&mut self, action: KeyAction, held_token: Option<String>) {
         let mode = self.view.mode();
         match action {
             // Session toggles acknowledge with the same blip the
@@ -2050,7 +2110,10 @@ impl App {
             | KeyAction::RollLeft
             | KeyAction::RollRight => {
                 if mode == ViewMode::Flight {
-                    self.attitude_press(action);
+                    self.attitude_press(
+                        action,
+                        held_token.unwrap_or_else(|| format!("verb:{action:?}")),
+                    );
                 } else if matches!(action, KeyAction::RollLeft | KeyAction::RollRight) {
                     // Roll keys are flight-only — say so instead of
                     // dying as a dead key.
@@ -2144,17 +2207,28 @@ impl ApplicationHandler for App {
                     v.resize(&g.device, size.width, size.height);
                 }
             }
-            // Key presses and releases. Presses stay `!consumed`-gated
-            // so egui-owned keys (a focused text field) never reach the
-            // sim — but a RELEASE always runs `keyboard_event`: a
-            // release egui swallowed would leak `attitude_held` (the
-            // craft would hold its last commanded rate) or keep the
-            // throttle axis ramping until a focus loss cleared it (the
-            // same reason LMB releases clear `map_dragging`
-            // unconditionally — consumption gates presses, never
-            // releases).
+            // Key presses and releases. egui reports `consumed` for
+            // EVERY key press whenever *any* widget holds keyboard
+            // focus (`wants_keyboard_input` = `focused().is_some()`) —
+            // and hardcodes it for Tab besides, which also hands focus
+            // to the first focusable widget. Honoring that verbatim
+            // dead-keys the entire board the moment a TextEdit,
+            // DragValue, slider, or Tab-focused button holds egui
+            // focus — every verb swallowed with zero feedback (the
+            // "no attitude response" trap). Only *text entry* justifies
+            // hiding a press from the game: gate on
+            // `text_edit_focused` instead. A focused button/slider
+            // keeps its own egui key handling (egui sees the event
+            // regardless) without stealing the game's. A RELEASE always
+            // runs `keyboard_event`: a release egui swallowed would
+            // leak `attitude_held` (the craft would hold its last
+            // commanded rate) or keep the throttle axis ramping until
+            // a focus loss cleared it (the same reason LMB releases
+            // clear `map_dragging` unconditionally — consumption gates
+            // presses, never releases).
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state == ElementState::Released || !consumed {
+                let typing = self.view.egui_context().text_edit_focused();
+                if event.state == ElementState::Released || !typing {
                     self.keyboard_event(&event);
                 }
             }
@@ -2952,6 +3026,110 @@ mod tests {
             saw_command,
             "held pitch key should command a rate once airborne"
         );
+    }
+
+    /// The held roll verb end-to-end: a `RollRight` press while airborne
+    /// lands a nonzero `ang_vel` on the bubble body, the §2.9 integrator
+    /// turns it into real rotation the render path stages, and the
+    /// release leaves the craft holding the attitude it reached — the
+    /// rotation is integrated state, not something the next event
+    /// rewinds or cancels.
+    #[test]
+    fn held_roll_rotates_and_persists_airborne() {
+        let dir = tempdir("roll-hold");
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        let frame = |app: &mut App, ticks: u64| {
+            let target = app.view.sim.clock().ticks() + ticks;
+            app.view.begin_frame();
+            app.tick_attitude();
+            app.view.sim_step(target).unwrap();
+            app.view.end_frame();
+        };
+        // Quaternion angle between two orientations — how far the craft
+        // actually turned, independent of any axis convention.
+        let angle = |a: csp_core::DQuat, b: csp_core::DQuat| -> f64 {
+            let d = (a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w)
+                .abs()
+                .min(1.0);
+            2.0 * d.acos()
+        };
+        frame(&mut app, 320); // settle the seeded pad craft
+        app.dispatch(KeyAction::ThrottleFull);
+        for _ in 0..20 {
+            frame(&mut app, 60); // liftoff — ~19 sim-seconds of climb
+        }
+        let vessel = app.view.flight_focus().unwrap();
+        let body_of = |app: &App| {
+            app.view.sim.vessels()[&vessel]
+                .body()
+                .map(|b| (b.rot, b.ang_vel))
+        };
+        let (rot0, _) = body_of(&app).expect("airborne body");
+        // Hold roll: the first stepped frame after the press must carry
+        // a nonzero commanded rate.
+        app.dispatch(KeyAction::RollRight);
+        frame(&mut app, 1);
+        let (_, w1) = body_of(&app).unwrap();
+        assert!(
+            w1.norm() > 0.1,
+            "held roll key commanded no angular rate: {w1:?}"
+        );
+        for _ in 0..5 {
+            frame(&mut app, 60);
+        }
+        let (rot1, _) = body_of(&app).unwrap();
+        let turned = angle(rot0, rot1);
+        assert!(
+            turned > 0.1,
+            "held roll key produced no rotation ({turned:.4} rad)"
+        );
+        // Release: the rate stops and the craft KEEPS the attitude it
+        // reached — the release's `SetAttitude` snapshot carries the
+        // freshest rot, so the turn persists instead of rewinding.
+        assert!(app.attitude_release("verb:RollRight"));
+        for _ in 0..3 {
+            frame(&mut app, 60);
+        }
+        let (rot2, w2) = body_of(&app).unwrap();
+        assert!(
+            w2.norm() < 0.05,
+            "released roll key still commands a rate: {w2:?}"
+        );
+        assert!(
+            angle(rot0, rot2) > turned * 0.5,
+            "release rewound the rotation: held turn {turned:.4} rad, post-release delta {:.4}",
+            angle(rot0, rot2)
+        );
+    }
+
+    /// Two bindings on one attitude verb (the shipped `key-w` +
+    /// `arrow-up` pair): each key's hold is tracked by its token, so
+    /// releasing the second binding does NOT drop the first's hold —
+    /// the action-keyed set used to alias them and zero the rate while
+    /// W was still held.
+    #[test]
+    fn second_binding_release_keeps_first_hold() {
+        let dir = tempdir("alias-hold");
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        app.view.begin_frame();
+        app.view.sim_step(320).unwrap();
+        app.view.end_frame();
+        // Parked craft: both presses defer (the same blocked path a
+        // pad press takes) — the held set is what this test audits.
+        app.attitude_press(KeyAction::PanUp, "key-w".to_string());
+        app.attitude_press(KeyAction::PanUp, "arrow-up".to_string());
+        assert_eq!(app.attitude_held.len(), 2, "each held key is an entry");
+        // Releasing the arrow must NOT clear W's hold — the alias bug
+        // emptied the set on the action.
+        assert!(app.attitude_release("arrow-up"));
+        assert!(
+            app.attitude_held.values().any(|a| *a == KeyAction::PanUp),
+            "releasing the second binding killed the first key's hold"
+        );
+        assert!(app.attitude_deferred);
+        // And the remaining W hold still releases cleanly by its token.
+        assert!(app.attitude_release("key-w"));
+        assert!(app.attitude_held.is_empty());
     }
 
     /// P02-F2: throttle verbs name their refusal. With no vessel at

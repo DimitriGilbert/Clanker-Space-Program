@@ -180,6 +180,65 @@ pub struct FlightPart {
 /// slice straight to `flight_hud`).
 pub type FlightTank = csp_ui::PropellantGauge;
 
+/// One graph node's propulsion-walk inputs — the staged data
+/// `flight_present` turns into the live TWR/acceleration/burn-time/Δv
+/// readouts (§2.5: the sim read happens in `capture_sync_input`; the
+/// arithmetic is presentation-side, off this mirror). Craft-less
+/// vessels stage an empty node list — their unmetered thrust still
+/// shows via [`VesselPropulsion::thrust_live_n`], the propellant
+/// figures honestly report "—".
+#[derive(Clone, Debug)]
+pub struct PropulsionNode {
+    /// The graph node — the [`StagePlan`] drop sets key on these.
+    pub node: csp_phys::PartNodeId,
+    /// Live node mass (kg) — dry + current contents (the part's
+    /// `mass_kg` is debited as propellant leaves).
+    pub mass_kg: f64,
+    /// Σ *craft-baseline* `rated_n` over the node's `Thrust` force
+    /// sites (N) — pre-factor, pre-coverage; the walk applies the
+    /// §3.4 derate and the fuel-coverage pool itself so a zero-throttle
+    /// tick (whose live sites all read 0) still stages a real figure.
+    pub thrust_base_n: f64,
+    /// The §3.4 reliability thrust factor (`1.0` nominal, `0.0`
+    /// misfired/ignition-dead) — `vessel.reliability`'s record.
+    pub thrust_factor: f64,
+    /// Resolved vacuum Isp (s) — `0` without an `EngineSpec` (an
+    /// unmetered site: real thrust, no consumption model).
+    pub isp_vac_s: f64,
+    /// `(resource, mass-fraction)` consumption split — empty unmetered.
+    pub propellants: Vec<(csp_data::ResourceId, f64)>,
+    /// The node's declared tanks as `(resource, units remaining,
+    /// mass_per_unit_kg)` — live `tank_contents` against the spec.
+    pub tanks: Vec<(csp_data::ResourceId, f64, f64)>,
+}
+
+/// One vessel's propulsion walk table — the per-node inputs plus the
+/// live body figures that need no craft.
+#[derive(Clone, Debug, Default)]
+pub struct VesselPropulsion {
+    /// `VesselId.0` — the lookup key against the staged vessels.
+    pub vessel: u64,
+    /// Live wet mass (kg) — `WeldedBody::mass_kg` in the bubble, Σ
+    /// part masses on a latched pose.
+    pub mass_kg: f64,
+    /// Σ live-scaled `rated_n` over the body's `Thrust` sites (N) —
+    /// the base·factor·coverage product a full-throttle tick applies.
+    /// `0` for latched vessels (a parked craft's commanded throttle is
+    /// zero — its sites carry no live scaling; `nodes` still stages
+    /// the baseline ratings the TWR/Δv walk needs).
+    pub thrust_live_n: f64,
+    /// Per-node walk rows, ascending `PartNodeId`.
+    pub nodes: Vec<PropulsionNode>,
+}
+
+/// The propulsion walk mirror — a standalone resource for the same
+/// reason [`LiveVesselCount`] is one: `FlightSnapshot`'s pub fields
+/// are literal-constructed by `csp-app`'s audio test, so the struct
+/// cannot grow. `sync_flight` writes it from the staged input;
+/// `flight_present` resolves the focused vessel against it.
+#[derive(Resource, Default)]
+pub struct VesselPropulsionStaged(pub Vec<VesselPropulsion>);
+
 /// One InBubble vessel's staged render data.
 #[derive(Clone, Debug)]
 pub struct FlightBody {
@@ -236,6 +295,11 @@ pub struct FlightSyncInput {
     /// otherwise read as destroyed (P12-F2: a burn completing back to
     /// rails read as "vessel lost" and rewound the tutorial).
     pub live_vessels: usize,
+    /// Per-vessel propulsion walk tables — staged beside `vessels` (a
+    /// parallel list keyed by id, not a `FlightBody` field: the render
+    /// struct is literal-constructed by downstream tests and cannot
+    /// grow either). Mirrored into [`VesselPropulsionStaged`].
+    pub propulsion: Vec<VesselPropulsion>,
 }
 
 /// Pass-1 dead-stick recovery: the vessel the flight focus should pin
@@ -414,6 +478,44 @@ pub struct FlightUiData {
     /// a genuinely single-stage craft (or no plan), `> 0` with
     /// `stages_left == 0` = an expended multi-stage craft.
     pub stages_total: usize,
+    /// Live wet mass of the focused vessel (kg) — `0` unknown.
+    pub mass_kg: f64,
+    /// Thrust delivered at the commanded throttle (N) — the
+    /// base·factor·coverage·throttle product over the live engines
+    /// (the unmetered-craft fallback is the live site sum·throttle).
+    pub thrust_n: f64,
+    /// Full-throttle deliverable thrust (N) — the coverage pool at
+    /// θ = 1; the figure `twr_surface` and the max-acceleration
+    /// readouts hang off.
+    pub thrust_full_n: f64,
+    /// Thrust-to-weight at the commanded throttle vs *local* gravity —
+    /// `None` with no environment, no propulsion data, or zero mass.
+    pub twr: Option<f64>,
+    /// `thrust_full_n / (mass·g_surface)` — the pad figure KSP pads
+    /// the staging column with (body's own surface g, not G0).
+    pub twr_surface: Option<f64>,
+    /// Thrust acceleration at the commanded throttle (m/s²).
+    pub accel_mps2: Option<f64>,
+    /// `accel_mps2 / csp_data::G0` — the same in g's.
+    pub accel_gee: Option<f64>,
+    /// Mass-flow-weighted vacuum Isp over the metered engines (s) —
+    /// `None` when none are aboard (unmetered craft or no engines).
+    pub isp_s: Option<f64>,
+    /// Propellant mass flow at the commanded throttle (kg/s) —
+    /// `None` without metered engines.
+    pub mass_flow_kg_s: Option<f64>,
+    /// Seconds until the limiting propellant pool empties at the
+    /// commanded throttle — `None` closed-throttle, no metered
+    /// engines, or nothing drawing.
+    pub fuel_depletion_s: Option<f64>,
+    /// The same at full throttle (s) — the burn-time figure.
+    pub burn_full_s: Option<f64>,
+    /// Tsiolkovsky Δv still aboard: the attached set's burn plus the
+    /// remaining stage drops' (m/s) — `None` with no metered engine.
+    pub delta_v_mps: Option<f64>,
+    /// The staged-drops portion of `delta_v_mps` (m/s) — `0` when the
+    /// plan is unbound, expended, or not the focused vessel's.
+    pub delta_v_stages_mps: f64,
 }
 
 /// One live cue in the §3.7 visual-SFX channel.
@@ -748,6 +850,7 @@ pub fn capture_sync_input(sim: &World, cache: &mut LatchedWeldCache) -> FlightSy
         )
     });
     let mut vessels = Vec::new();
+    let mut propulsion = Vec::new();
     for (id, vessel) in sim.vessels() {
         match &vessel.state {
             VesselState::InBubble(body) => {
@@ -785,6 +888,7 @@ pub fn capture_sync_input(sim: &World, cache: &mut LatchedWeldCache) -> FlightSy
                     latched: false,
                     tanks: vessel_tanks(vessel),
                 });
+                propulsion.push(vessel_propulsion(*id, vessel, Some(body)));
             }
             // §2.6.4 surface rails: a latched vessel is still *on the
             // pad* — stage its restored inertial pose so the parked
@@ -795,6 +899,7 @@ pub fn capture_sync_input(sim: &World, cache: &mut LatchedWeldCache) -> FlightSy
             VesselState::SurfaceLatched(pose) => {
                 if let Some(body) = stage_latched(sim, env_ref, *id, vessel, pose, cache) {
                     vessels.push(body);
+                    propulsion.push(vessel_propulsion(*id, vessel, None));
                 }
             }
             VesselState::OnRails(_) => {}
@@ -814,6 +919,7 @@ pub fn capture_sync_input(sim: &World, cache: &mut LatchedWeldCache) -> FlightSy
         env,
         vessels,
         live_vessels,
+        propulsion,
     }
 }
 
@@ -915,6 +1021,81 @@ fn vessel_tanks(vessel: &csp_sim::Vessel) -> Vec<FlightTank> {
             capacity,
         })
         .collect()
+}
+
+/// Stage one vessel's propulsion walk table — the per-node mass,
+/// engine, and live tank data `flight_present` turns into the
+/// TWR/acceleration/burn-time/Δv readouts. `body` is the live welded
+/// body for an InBubble vessel (its Thrust sites carry this tick's
+/// base·factor·coverage ratings — the `thrust_live_n` figure); `None`
+/// for a latched pose, where the parked craft still stages its
+/// baseline walk rows but no live scaling exists to read.
+///
+/// The walk deliberately stages *baseline* site ratings
+/// (`craft.parts[].force_sites`), not the body's live-scaled ones:
+/// the sim zeros every site's `rated_n` on a closed throttle (the
+/// coverage pool has no demand to normalize), so live ratings would
+/// report zero engine capability exactly when the pilot needs the
+/// number. The presentation-side walk recomputes coverage at the
+/// commanded throttle — the same pooled `min(1, avail/Σdemand)`
+/// accounting `propellant_plans` runs per tick.
+fn vessel_propulsion(
+    id: VesselId,
+    vessel: &csp_sim::Vessel,
+    body: Option<&csp_phys::WeldedBody>,
+) -> VesselPropulsion {
+    let mut nodes = Vec::new();
+    if let Some(craft) = vessel.craft.as_ref() {
+        for (nid, node) in &craft.graph.nodes {
+            let Some(part) = craft.parts.get(node.effective_index as usize) else {
+                continue;
+            };
+            let thrust_base_n: f64 = part
+                .force_sites
+                .iter()
+                .filter(|s| s.kind == csp_phys::ForceSiteKind::Thrust)
+                .map(|s| s.rated_n)
+                .sum();
+            let (isp_vac_s, propellants) = part.engine.as_ref().map_or_else(
+                || (0.0, Vec::new()),
+                |e| (e.isp_vac_s, e.propellants.clone()),
+            );
+            let tanks = part
+                .tanks
+                .iter()
+                .map(|t| {
+                    let units = vessel
+                        .tank_contents
+                        .get(nid)
+                        .and_then(|m| m.get(&t.resource))
+                        .copied()
+                        .unwrap_or(0.0);
+                    (t.resource.clone(), units, t.mass_per_unit_kg)
+                })
+                .collect();
+            nodes.push(PropulsionNode {
+                node: *nid,
+                mass_kg: part.mass_kg,
+                thrust_base_n,
+                thrust_factor: vessel.reliability.get(nid).map_or(1.0, |r| r.thrust_factor),
+                isp_vac_s,
+                propellants,
+                tanks,
+            });
+        }
+    }
+    VesselPropulsion {
+        vessel: id.0,
+        mass_kg: body.map_or_else(|| nodes.iter().map(|n| n.mass_kg).sum(), |b| b.mass_kg),
+        thrust_live_n: body.map_or(0.0, |b| {
+            b.force_sites
+                .iter()
+                .filter(|s| s.kind == csp_phys::ForceSiteKind::Thrust)
+                .map(|s| s.rated_n)
+                .sum()
+        }),
+        nodes,
+    }
 }
 
 /// Classify a resolved part into its render [`PartKind`] — the same
@@ -1092,10 +1273,12 @@ pub(crate) fn sync_flight(
     staged: Res<FlightSyncInput>,
     mut snap: ResMut<FlightSnapshot>,
     mut live: ResMut<LiveVesselCount>,
+    mut prop: ResMut<VesselPropulsionStaged>,
 ) {
     snap.env = staged.env.clone();
     snap.vessels = staged.vessels.clone();
     live.0 = staged.live_vessels;
+    prop.0 = staged.propulsion.clone();
 }
 
 /// The flight chase-camera solve: an orbit camera in the *local-level
@@ -1206,6 +1389,7 @@ pub(crate) fn flight_present(
     input: Res<FlightInput>,
     snap: Res<FlightSnapshot>,
     plan: Res<StagePlan>,
+    prop: Res<VesselPropulsionStaged>,
     terrain_cfg: Res<TerrainConfig>,
     mut terrain_cache: ResMut<TerrainCache>,
     mut cam: ResMut<FlightCameraF64>,
@@ -1250,6 +1434,7 @@ pub(crate) fn flight_present(
         ui.propellant.clear();
         ui.stages_left = 0;
         ui.stages_total = plan.total;
+        stage_propulsion(&mut ui, None, &[], 0.0, None, None);
         return;
     };
     cam.0 = solve_chase_camera(
@@ -1281,10 +1466,18 @@ pub(crate) fn flight_present(
     ui.t_apo_s = None;
     ui.t_pe_s = None;
     ui.period_s = None;
+    // Weight figures need the environment's μ against the live radius;
+    // without one the propulsion readouts stay honest ("—").
+    let mut g_local = None;
+    let mut g_surface = None;
     if let Some(env) = snap.env.as_ref() {
+        if env.radius_m > 0.0 {
+            g_surface = Some(env.mu_m3_per_s2 / (env.radius_m * env.radius_m));
+        }
         let rel = focus.com - env.body_center;
         let r = rel.norm();
         if r > 0.0 {
+            g_local = Some(env.mu_m3_per_s2 / (r * r));
             ui.alt_m = r - env.radius_m;
             ui.vspeed_mps = focus.vel.dot(rel / r);
             stage_attitude(&mut ui, env, focus, rel / r);
@@ -1319,6 +1512,23 @@ pub(crate) fn flight_present(
             }
         }
     }
+    // Propulsion readouts — the staged walk table for the focused
+    // vessel. The plan's remaining drop sets apply only while it is
+    // bound to this vessel (a newer spawn or a fragment can hold the
+    // focus without owning the plan — `vessel_for`'s binding rule).
+    let drops: &[Vec<csp_phys::PartNodeId>] = if plan.vessel == Some(VesselId(focus.id)) {
+        &plan.stages
+    } else {
+        &[]
+    };
+    stage_propulsion(
+        &mut ui,
+        prop.0.iter().find(|p| p.vessel == focus.id),
+        drops,
+        focus.throttle,
+        g_local,
+        g_surface,
+    );
 }
 
 /// The §3.7 edge detector — the named transitions (ignition/cut,
@@ -1486,6 +1696,339 @@ fn rel_of(focus: &FlightBody, env: &FlightEnv) -> DVec3 {
 /// dependency rule keeps csp-core types out of the panel layer).
 fn into_arr(v: DVec3) -> [f64; 3] {
     [v.x, v.y, v.z]
+}
+
+/// The propulsion walk's mutable node state — the burn loop shrinks
+/// live mass as it draws contents.
+struct WalkNode {
+    /// Live mass (kg) — dry + remaining contents.
+    mass_kg: f64,
+    /// Σ Thrust rating at base·reliability-factor (N) — pre-coverage.
+    thrust_n: f64,
+    /// Vacuum Isp (s) — `0` on an unmetered node (real thrust, no
+    /// consumption model; counted for TWR/accel, never for Δv).
+    isp_s: f64,
+    /// `(resource, mass fraction)` consumption split — empty unmetered.
+    propellants: Vec<(csp_data::ResourceId, f64)>,
+    /// `resource → units` remaining on this node.
+    contents: BTreeMap<csp_data::ResourceId, f64>,
+}
+
+/// One attached-set burn evaluation at throttle `θ` — the shared core
+/// of the TWR/acceleration/burn-time/Δv readouts.
+struct BurnStep {
+    /// Deliverable Σ thrust at `θ` (N) — metered and unmetered engines.
+    thrust_n: f64,
+    /// Mass-flow-weighted vacuum Isp over the metered engines (s);
+    /// `0` when none deliver.
+    isp_s: f64,
+    /// Σ propellant mass flow at `θ` (kg/s).
+    mass_flow_kg_s: f64,
+    /// Seconds until the limiting pooled propellant empties at `θ` —
+    /// `INFINITY` when nothing draws (idle throttle, dry tanks).
+    burn_s: f64,
+    /// Engines want propellant (`demand` non-empty) but nothing flows
+    /// — the tanks are out *now*. The HUD's depletion readout renders
+    /// `0:00` instead of an ambiguous "—" (a misfired engine carries
+    /// `thrust_factor = 0` → no demand → still "—", correctly).
+    deprived: bool,
+    /// `(resource, units)` the burn draws — the walk's debit list.
+    drawn: Vec<(csp_data::ResourceId, f64)>,
+    /// Propellant mass the burn consumes (kg).
+    burned_kg: f64,
+}
+
+/// Pooled-coverage burn accounting over the attached set — the same
+/// `min(1, avail / Σ demand)` model the sim's `propellant_plans`
+/// normalizes per tick, evaluated on the staged walk table at throttle
+/// `θ`. Unmetered nodes (`EngineSpec: None`) deliver `base·factor·θ`
+/// and claim nothing — the sim's free-thrust convention.
+fn burn_step(
+    attached: &BTreeMap<csp_phys::PartNodeId, WalkNode>,
+    mpu: &BTreeMap<csp_data::ResourceId, f64>,
+    throttle: f64,
+) -> BurnStep {
+    let mut step = BurnStep {
+        thrust_n: 0.0,
+        isp_s: 0.0,
+        mass_flow_kg_s: 0.0,
+        burn_s: f64::INFINITY,
+        deprived: false,
+        drawn: Vec::new(),
+        burned_kg: 0.0,
+    };
+    let theta = throttle.clamp(0.0, 1.0);
+    if theta <= 0.0 {
+        // A closed throttle draws nothing — the sim's coverage pool
+        // resolves empty and every metered site reads zero.
+        return step;
+    }
+    // Pooled availability (units) and full-throttle demand (units/s)
+    // per resource — the demand pool counts every claimant's needs,
+    // starved or not (the sim's shared-denominator rule).
+    let mut avail: BTreeMap<&csp_data::ResourceId, f64> = BTreeMap::new();
+    let mut demand: BTreeMap<&csp_data::ResourceId, f64> = BTreeMap::new();
+    for n in attached.values() {
+        for (r, u) in &n.contents {
+            *avail.entry(r).or_default() += u;
+        }
+        if n.isp_s > 0.0 && n.thrust_n > 0.0 {
+            for (r, frac) in &n.propellants {
+                let need = match mpu.get(r) {
+                    Some(&m) if m > 0.0 => n.thrust_n * frac / (n.isp_s * csp_data::G0 * m),
+                    // Un-holdable (or massless) propellant: infinite
+                    // demand → zero coverage — the sim's starvation rule.
+                    _ => f64::INFINITY,
+                };
+                if need > 0.0 {
+                    *demand.entry(r).or_default() += need * theta;
+                }
+            }
+        }
+    }
+    let cov_of = |r: &csp_data::ResourceId| -> f64 {
+        let d = demand.get(r).copied().unwrap_or(0.0);
+        if d.is_finite() && d > 0.0 {
+            (avail.get(r).copied().unwrap_or(0.0) / d).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    };
+    // Per-engine thrust at `θ` + per-resource draw (units/s).
+    let mut metered_f = 0.0;
+    let mut metered_f_over_isp = 0.0;
+    let mut flow: BTreeMap<&csp_data::ResourceId, f64> = BTreeMap::new();
+    for n in attached.values() {
+        if n.thrust_n <= 0.0 {
+            continue;
+        }
+        if n.propellants.is_empty() || n.isp_s <= 0.0 {
+            step.thrust_n += n.thrust_n * theta; // unmetered site
+            continue;
+        }
+        let mut cov = 1.0f64;
+        for (r, frac) in &n.propellants {
+            if *frac > 0.0 {
+                cov = cov.min(cov_of(r));
+            }
+        }
+        let f = n.thrust_n * cov * theta;
+        if f <= 0.0 {
+            continue; // starved — contributes no thrust and draws nothing
+        }
+        step.thrust_n += f;
+        metered_f += f;
+        metered_f_over_isp += f / n.isp_s;
+        for (r, frac) in &n.propellants {
+            // `f > 0` already proved this resource's coverage finite,
+            // so its mpu resolved — the lookup still degrades to 0
+            // honestly rather than trusting the implication.
+            let Some(&m) = mpu.get(r) else { continue };
+            if m > 0.0 {
+                *flow.entry(r).or_default() += f * frac / (n.isp_s * csp_data::G0 * m);
+            }
+        }
+    }
+    if metered_f_over_isp > 0.0 {
+        step.isp_s = metered_f / metered_f_over_isp;
+    }
+    for (r, units_s) in &flow {
+        if *units_s > 0.0 {
+            let a = avail.get(r).copied().unwrap_or(0.0);
+            step.burn_s = step.burn_s.min(a / units_s);
+            step.mass_flow_kg_s += units_s * mpu.get(*r).copied().unwrap_or(0.0);
+        }
+    }
+    if step.burn_s.is_finite() {
+        for (r, units_s) in &flow {
+            let draw = (units_s * step.burn_s).min(avail.get(r).copied().unwrap_or(0.0));
+            if draw > 0.0 {
+                step.burned_kg += draw * mpu.get(*r).copied().unwrap_or(0.0);
+                step.drawn.push(((*r).clone(), draw));
+            }
+        }
+    } else {
+        // Demand exists but no flow — every metered engine is fuel-
+        // starved right now: the limiting pool is already empty.
+        step.deprived = !demand.is_empty();
+    }
+    step
+}
+
+/// Debit one burn's `drawn` list out of the attached set — ascending
+/// `PartNodeId`, the fixed drain order every sim pass shares. Node
+/// mass follows the drawn units' mass-per-unit.
+fn consume_drawn(
+    attached: &mut BTreeMap<csp_phys::PartNodeId, WalkNode>,
+    mpu: &BTreeMap<csp_data::ResourceId, f64>,
+    drawn: &[(csp_data::ResourceId, f64)],
+) {
+    for (r, units) in drawn {
+        let mut rem = *units;
+        let m = mpu.get(r).copied().unwrap_or(0.0);
+        for n in attached.values_mut() {
+            if rem <= 0.0 {
+                break;
+            }
+            let Some(have) = n.contents.get_mut(r) else {
+                continue;
+            };
+            let take = (*have).min(rem);
+            *have -= take;
+            n.mass_kg -= take * m;
+            rem -= take;
+        }
+    }
+}
+
+/// The staged table → mutable walk state (`BTreeMap` keeps the
+/// ascending-`PartNodeId` drain order) plus the resource→mpu map the
+/// kg↔units conversions read.
+fn build_walk(
+    nodes: &[PropulsionNode],
+) -> (
+    BTreeMap<csp_phys::PartNodeId, WalkNode>,
+    BTreeMap<csp_data::ResourceId, f64>,
+) {
+    let attached = nodes
+        .iter()
+        .map(|n| {
+            (
+                n.node,
+                WalkNode {
+                    mass_kg: n.mass_kg,
+                    thrust_n: n.thrust_base_n * n.thrust_factor,
+                    isp_s: n.isp_vac_s,
+                    propellants: n.propellants.clone(),
+                    contents: n.tanks.iter().map(|(r, u, _)| (r.clone(), *u)).collect(),
+                },
+            )
+        })
+        .collect();
+    let mut mpu: BTreeMap<csp_data::ResourceId, f64> = BTreeMap::new();
+    for n in nodes {
+        for (r, _, m) in &n.tanks {
+            mpu.entry(r.clone()).or_insert(*m);
+        }
+    }
+    (attached, mpu)
+}
+
+/// The propulsion half of the HUD mirrors — TWR (current + surface),
+/// thrust acceleration, mass flow, time-to-depletion, and Δv
+/// remaining, all off the staged [`VesselPropulsion`] table plus the
+/// launch plan's remaining drop sets. `g_local`/`g_surface` are the
+/// environment-derived gravities (`None` with no env → the weight
+/// figures honestly go blank). Every number derives from the live
+/// staged state each Presentation frame — never a launch-time cache.
+fn stage_propulsion(
+    ui: &mut FlightUiData,
+    prop: Option<&VesselPropulsion>,
+    drops: &[Vec<csp_phys::PartNodeId>],
+    throttle: f64,
+    g_local: Option<f64>,
+    g_surface: Option<f64>,
+) {
+    ui.mass_kg = 0.0;
+    ui.thrust_n = 0.0;
+    ui.thrust_full_n = 0.0;
+    ui.twr = None;
+    ui.twr_surface = None;
+    ui.accel_mps2 = None;
+    ui.accel_gee = None;
+    ui.isp_s = None;
+    ui.mass_flow_kg_s = None;
+    ui.fuel_depletion_s = None;
+    ui.burn_full_s = None;
+    ui.delta_v_mps = None;
+    ui.delta_v_stages_mps = 0.0;
+    let Some(prop) = prop else { return };
+    ui.mass_kg = prop.mass_kg;
+    let (mut attached, mpu) = build_walk(&prop.nodes);
+    let now = burn_step(&attached, &mpu, throttle);
+    let full = burn_step(&attached, &mpu, 1.0);
+    // A crafted vessel's thrust is the recomputed coverage figure;
+    // a craft-less one (hand-authored debug body) falls back to the
+    // live site sum the sim carries.
+    let (thrust_now, thrust_full) = if attached.is_empty() {
+        (prop.thrust_live_n * throttle, prop.thrust_live_n)
+    } else {
+        (now.thrust_n, full.thrust_n)
+    };
+    ui.thrust_n = thrust_now;
+    ui.thrust_full_n = thrust_full;
+    if prop.mass_kg > 0.0 {
+        ui.accel_mps2 = Some(thrust_now / prop.mass_kg);
+        ui.accel_gee = Some(thrust_now / (prop.mass_kg * csp_data::G0));
+        if let Some(g) = g_local.filter(|g| *g > 0.0) {
+            ui.twr = Some(thrust_now / (prop.mass_kg * g));
+        }
+        if let Some(g) = g_surface.filter(|g| *g > 0.0) {
+            ui.twr_surface = Some(thrust_full / (prop.mass_kg * g));
+        }
+    }
+    let metered = attached
+        .values()
+        .any(|n| n.isp_s > 0.0 && n.thrust_n > 0.0 && !n.propellants.is_empty());
+    if !metered {
+        return;
+    }
+    ui.isp_s = (full.isp_s > 0.0).then_some(full.isp_s);
+    ui.mass_flow_kg_s = Some(now.mass_flow_kg_s);
+    ui.fuel_depletion_s = if now.burn_s.is_finite() {
+        Some(now.burn_s)
+    } else {
+        now.deprived.then_some(0.0)
+    };
+    ui.burn_full_s = if full.burn_s.is_finite() {
+        Some(full.burn_s)
+    } else {
+        full.deprived.then_some(0.0)
+    };
+    let (dv, dv_staged) = delta_v_walk_from(&mut attached, &mpu, drops);
+    ui.delta_v_mps = Some(dv + dv_staged);
+    ui.delta_v_stages_mps = dv_staged;
+}
+
+/// [`delta_v_walk`] over a pre-built attached set — `stage_propulsion`
+/// constructs the walk table once for both its burn evaluations and
+/// the Δv pass.
+fn delta_v_walk_from(
+    attached: &mut BTreeMap<csp_phys::PartNodeId, WalkNode>,
+    mpu: &BTreeMap<csp_data::ResourceId, f64>,
+    drops: &[Vec<csp_phys::PartNodeId>],
+) -> (f64, f64) {
+    let mut current = 0.0;
+    let mut staged = 0.0;
+    for step in 0..=drops.len() {
+        // Burn the attached set to depletion — each pass drains at
+        // least one pooled resource, so a few iterations cover
+        // multi-resource craft; the bound is defence, not a limit.
+        for _ in 0..64 {
+            let b = burn_step(attached, mpu, 1.0);
+            if !(b.burn_s.is_finite() && b.burn_s > 0.0 && b.isp_s > 0.0 && b.burned_kg > 0.0) {
+                break;
+            }
+            let wet: f64 = attached.values().map(|n| n.mass_kg).sum();
+            let dry_end = (wet - b.burned_kg).max(1e-9);
+            let ratio = wet / dry_end;
+            if ratio > 1.0 {
+                let dv = b.isp_s * csp_data::G0 * ratio.ln();
+                if step == 0 {
+                    current += dv;
+                } else {
+                    staged += dv;
+                }
+            }
+            consume_drawn(attached, mpu, &b.drawn);
+        }
+        if step < drops.len() {
+            for id in &drops[step] {
+                attached.remove(id);
+            }
+        }
+    }
+    (current, staged)
 }
 
 /// All-or-nothing emission of one world-space triangle into the
@@ -2056,5 +2599,126 @@ mod tests {
         // this exact.
         assert_eq!(p.transform.apply(*lo), p.lo);
         assert_eq!(p.transform.apply(*hi), p.hi);
+    }
+
+    /// A [`PropulsionNode`] fixture — one graph node's staged
+    /// mass/engine/tank row.
+    fn prop_node(
+        id: u64,
+        mass_kg: f64,
+        thrust_n: f64,
+        isp_s: f64,
+        mix: &[(&str, f64)],
+        tanks: &[(&str, f64, f64)],
+    ) -> PropulsionNode {
+        PropulsionNode {
+            node: csp_phys::PartNodeId(id),
+            mass_kg,
+            thrust_base_n: thrust_n,
+            thrust_factor: 1.0,
+            isp_vac_s: isp_s,
+            propellants: mix
+                .iter()
+                .map(|(r, f)| (csp_data::ResourceId::from(*r), *f))
+                .collect(),
+            tanks: tanks
+                .iter()
+                .map(|(r, u, m)| (csp_data::ResourceId::from(*r), *u, *m))
+                .collect(),
+        }
+    }
+
+    /// The HUD's live figures on a pod + tank + engine vessel: the
+    /// burn time, Δv, and TWR all land on the hand-computed values —
+    /// and a closed throttle honestly reports "—" for the burn while
+    /// keeping the surface-TWR pad figure.
+    #[test]
+    fn propulsion_walk_reports_real_numbers() {
+        // 100 u fuel @ 5 kg/u = 500 kg; 1 kN engine, isp 300 s;
+        // wet 710 kg → ṁ = 1/(300·g₀) kN⁻¹… ṁ = F/(isp·g₀) kg/s.
+        let g0 = csp_data::G0;
+        let prop = VesselPropulsion {
+            vessel: 1,
+            mass_kg: 710.0,
+            thrust_live_n: 1000.0,
+            nodes: vec![
+                prop_node(1, 60.0, 0.0, 0.0, &[], &[]),
+                prop_node(2, 600.0, 0.0, 0.0, &[], &[("fuel", 100.0, 5.0)]),
+                prop_node(3, 50.0, 1000.0, 300.0, &[("fuel", 1.0)], &[]),
+            ],
+        };
+        let mut ui = FlightUiData::default();
+        stage_propulsion(&mut ui, Some(&prop), &[], 1.0, Some(9.81), Some(9.81));
+        let mdot = 1000.0 / (300.0 * g0);
+        assert!((ui.mass_flow_kg_s.unwrap() - mdot).abs() < 1e-9);
+        // burn = propellant_kg / ṁ = 500/ṁ ≈ 1471 s.
+        assert!((ui.fuel_depletion_s.unwrap() - 500.0 / mdot).abs() < 1e-6);
+        // Δv = isp·g₀·ln(710/210) ≈ 3583 m/s.
+        let dv = 300.0 * g0 * (710.0_f64 / 210.0).ln();
+        assert!((ui.delta_v_mps.unwrap() - dv).abs() < 1e-6);
+        assert_eq!(ui.delta_v_stages_mps, 0.0);
+        // TWR = F/(m·g) at both readouts (g = 9.81 staged both ways).
+        let twr = 1000.0 / (710.0 * 9.81);
+        assert!((ui.twr.unwrap() - twr).abs() < 1e-9);
+        assert!((ui.twr_surface.unwrap() - twr).abs() < 1e-9);
+        assert!((ui.accel_mps2.unwrap() - 1000.0 / 710.0).abs() < 1e-9);
+        assert!((ui.isp_s.unwrap() - 300.0).abs() < 1e-9);
+
+        // Half throttle: thrust halves, depletion doubles — the
+        // same live-state arithmetic the tick's coverage pool runs.
+        stage_propulsion(&mut ui, Some(&prop), &[], 0.5, Some(9.81), Some(9.81));
+        assert!((ui.thrust_n - 500.0).abs() < 1e-9);
+        assert!((ui.fuel_depletion_s.unwrap() - 1000.0 / mdot).abs() < 1e-6);
+
+        // Closed throttle: the burn figures go "—" but the surface
+        // TWR pad figure stays (it is a capability, not a burn).
+        stage_propulsion(&mut ui, Some(&prop), &[], 0.0, Some(9.81), Some(9.81));
+        assert_eq!(ui.thrust_n, 0.0);
+        assert!(ui.fuel_depletion_s.is_none());
+        assert!((ui.twr_surface.unwrap() - twr).abs() < 1e-9);
+    }
+
+    /// Dry tanks with the throttle open read `0:00` (deprived), not
+    /// an ambiguous "—"; a spent drop-set feeds the staged-Δv figure.
+    #[test]
+    fn propulsion_walk_marks_depletion_and_stage_drops() {
+        let mut dry = VesselPropulsion {
+            vessel: 1,
+            mass_kg: 710.0,
+            thrust_live_n: 0.0,
+            nodes: vec![
+                prop_node(1, 60.0, 0.0, 0.0, &[], &[]),
+                prop_node(2, 100.0, 0.0, 0.0, &[], &[("fuel", 0.0, 5.0)]),
+                prop_node(3, 50.0, 1000.0, 300.0, &[("fuel", 1.0)], &[]),
+                // Upper stage: own tank + engine still attached.
+                prop_node(4, 540.0, 0.0, 0.0, &[], &[("fuel", 100.0, 5.0)]),
+                prop_node(5, 20.0, 400.0, 350.0, &[("fuel", 1.0)], &[]),
+            ],
+        };
+        let mut ui = FlightUiData::default();
+        // The pooled fuel on node 4 still feeds both engines — the
+        // v1 crossfeed model. Burn drains it; the drop set then cuts
+        // nodes 2+3's dead mass — but nothing remains to burn, so the
+        // staged share is 0 (the conservative, sim-literal figure).
+        stage_propulsion(
+            &mut ui,
+            Some(&dry),
+            &[vec![csp_phys::PartNodeId(2), csp_phys::PartNodeId(3)]],
+            1.0,
+            Some(9.81),
+            Some(9.81),
+        );
+        assert!(ui.delta_v_mps.unwrap() > 0.0);
+        // Now with node 4's tank dry too: the depletion readout is
+        // "0:00" — tanks are out NOW, not merely unreportable.
+        for n in &mut dry.nodes {
+            for t in &mut n.tanks {
+                t.1 = 0.0;
+            }
+        }
+        stage_propulsion(&mut ui, Some(&dry), &[], 1.0, Some(9.81), Some(9.81));
+        assert_eq!(ui.fuel_depletion_s, Some(0.0));
+        assert_eq!(ui.delta_v_mps, Some(0.0));
+        assert_eq!(ui.thrust_n, 0.0);
     }
 }
