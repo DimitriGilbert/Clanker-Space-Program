@@ -240,6 +240,13 @@ struct App {
     /// blocked (rails, no vessel) or cancelled (Up+Down both held)
     /// still eases in from zero the frame it starts moving the axis.
     throttle_hold_s: f64,
+    /// The flight-focus vessel the current throttle hold began on —
+    /// recorded by [`Self::throttle_press`]. A focus change mid-hold
+    /// (recover-control pinning, the newest-staged fallback moving)
+    /// must not carry the OLD vessel's commanded axis onto the new
+    /// focus: [`Self::tick_throttle_ramp`] rebases the axis from the
+    /// new vessel's applied value and says so (C15-lib2-F2).
+    throttle_hold_vessel: Option<csp_sim::VesselId>,
     view: View,
     /// §2.6.3's controller — owns the warp ladder and the integer tick
     /// target; all wall-side, emitting only logged commands.
@@ -453,6 +460,7 @@ impl App {
             throttle_held: std::collections::BTreeSet::new(),
             throttle_axis: 0.0,
             throttle_hold_s: 0.0,
+            throttle_hold_vessel: None,
             view,
             warp: WarpController::new(),
             last_frame: Instant::now(),
@@ -1741,6 +1749,10 @@ impl App {
             // always spools up from zero rate, never resumes the
             // speed a previous hold had spun to.
             self.throttle_hold_s = 0.0;
+            // …and pins the focus it started on, so a focus change
+            // mid-hold is detected as a retarget, not silently
+            // applied to the new vessel (C15-lib2-F2).
+            self.throttle_hold_vessel = self.view.flight_focus();
             // A ramp starting from released re-reads the applied
             // throttle — but only a bubble-resident body HAS an
             // applied value to read (P02-F2). A latched or rails
@@ -1777,6 +1789,7 @@ impl App {
         self.throttle_held.remove(&action);
         if self.throttle_held.is_empty() {
             self.throttle_hold_s = 0.0;
+            self.throttle_hold_vessel = None;
         }
     }
 
@@ -1799,6 +1812,7 @@ impl App {
             // the VAB suppresses throttle verbs (it's a flight axis).
             self.throttle_held.clear();
             self.throttle_hold_s = 0.0;
+            self.throttle_hold_vessel = None;
             return;
         }
         let dir = i8::from(self.throttle_held.contains(&KeyAction::ThrottleUp))
@@ -1814,6 +1828,29 @@ impl App {
         // becomes commandable instead of resuming at full slew.
         if self.throttle_blocker().is_some() {
             return;
+        }
+        // C15-lib2-F2: a flight-focus change mid-hold must not carry
+        // the OLD vessel's commanded axis onto the new focus — that
+        // would ramp a newly-recovered vessel's throttle from the
+        // previous craft's value with no signal. Rebase instead: the
+        // axis takes the new vessel's applied value when it has a
+        // body to read (the same rule a fresh hold uses — a body-less
+        // focus keeps the axis), the ease-in clock restarts, and the
+        // retarget lands on the cue channel. Checked here — after the
+        // blocker — so the notice fires exactly when the hold would
+        // actually command the new focus.
+        let focus = self.view.flight_focus();
+        if focus != self.throttle_hold_vessel {
+            self.throttle_hold_vessel = focus;
+            self.throttle_hold_s = 0.0;
+            if let Some(body) = focus
+                .and_then(|v| self.view.sim.vessels().get(&v))
+                .and_then(|v| v.body())
+            {
+                self.throttle_axis = body.throttle;
+            }
+            self.view
+                .flight_notice("THROTTLE HOLD — REBASED ON NEW FOCUS VESSEL");
         }
         let ease = (self.throttle_hold_s / THROTTLE_RAMP_SPINUP_S).min(1.0);
         self.throttle_hold_s += dt_wall;
@@ -1872,6 +1909,7 @@ impl App {
             .retain(|a| old.bindings.get(a) == new.bindings.get(a));
         if self.throttle_held.is_empty() {
             self.throttle_hold_s = 0.0;
+            self.throttle_hold_vessel = None;
         }
         if self.attitude_held.len() != attitude_before {
             if self.attitude_held.is_empty() {
@@ -1882,13 +1920,18 @@ impl App {
     }
 
     /// A focus loss can drop the releases that clear a captured key,
-    /// held attitude keys, and the throttle axis — clear all three here
-    /// (the craft gets a zero-rate hold instead of spinning offscreen
-    /// forever, and the throttle just keeps its last commanded value).
+    /// held attitude keys, the throttle axis — and the pointer state:
+    /// `map_dragging` and the LMB click candidate live off `MouseInput`
+    /// releases a focus change drops the same way, so they are cleared
+    /// here too (C15-lib2-F1 — a stale drag used to orbit the camera
+    /// on refocus with no button held).
     fn focus_lost(&mut self) {
         self.captured_key = None;
+        self.map_dragging = false;
+        self.lmb_press = None;
         self.throttle_held.clear();
         self.throttle_hold_s = 0.0;
+        self.throttle_hold_vessel = None;
         self.attitude_deferred = false;
         if !self.attitude_held.is_empty() {
             self.attitude_held.clear();
@@ -2052,13 +2095,27 @@ impl App {
             // outbox's UI-driven mode switch and Apply play — a
             // key-driven session event is the same class of event.
             KeyAction::OpenSettings => {
-                self.ui_confirm();
-                self.view.toggle_settings_panel();
-                // Restage on open — the window always edits the
-                // applied set; unapplied edits from a previous visit
-                // are discarded, not resurrected.
-                if self.view.settings_panel_open() {
-                    self.view.stage_settings(&self.settings);
+                // C14-F4: the default `escape` binding collides with
+                // the VAB's universal cancel (the egui pass puts a
+                // carried part back, or drops the selection, on the
+                // same press). A settings toggle that fires *alongside*
+                // the cancel turns one press into two actions — so
+                // while the editor has something armed to cancel, the
+                // toggle yields: Esc cancels first, and only opens
+                // settings once there is nothing left to put back.
+                let vab_armed = mode == ViewMode::Vab
+                    && self
+                        .view
+                        .with_vab_session(|v| v.carried().is_some() || v.selected().is_some());
+                if !vab_armed {
+                    self.ui_confirm();
+                    self.view.toggle_settings_panel();
+                    // Restage on open — the window always edits the
+                    // applied set; unapplied edits from a previous
+                    // visit are discarded, not resurrected.
+                    if self.view.settings_panel_open() {
+                        self.view.stage_settings(&self.settings);
+                    }
                 }
             }
             KeyAction::ToggleVab => {
@@ -2256,17 +2313,23 @@ impl ApplicationHandler for App {
             // focus — every verb swallowed with zero feedback (the
             // "no attitude response" trap). Only *text entry* justifies
             // hiding a press from the game: gate on
-            // `text_edit_focused` instead. A focused button/slider
-            // keeps its own egui key handling (egui sees the event
-            // regardless) without stealing the game's. A RELEASE always
-            // runs `keyboard_event`: a release egui swallowed would
+            // `text_edit_focused` instead, and then only for keys that
+            // actually produce text — `Key::Character`. A focused field
+            // has no use for Esc, the F-keys, or the arrows, but the
+            // game does (OpenSettings, the pans): hiding those too
+            // dead-keyed them whenever a TextEdit held focus
+            // (C15-lib2-F3). A focused button/slider keeps its own egui
+            // key handling (egui sees the event regardless) without
+            // stealing the game's. A RELEASE always runs
+            // `keyboard_event`: a release egui swallowed would
             // leak `attitude_held` (the craft would hold its last
             // commanded rate) or keep the throttle axis ramping until
             // a focus loss cleared it (the same reason LMB releases
             // clear `map_dragging` unconditionally — consumption gates
             // presses, never releases).
             WindowEvent::KeyboardInput { event, .. } => {
-                let typing = self.view.egui_context().text_edit_focused();
+                let typing = self.view.egui_context().text_edit_focused()
+                    && matches!(event.logical_key, winit::keyboard::Key::Character(_));
                 if event.state == ElementState::Released || !typing {
                     self.keyboard_event(&event);
                 }
@@ -3404,6 +3467,134 @@ mod tests {
         assert!(
             notes.iter().any(|n| n.contains("not fully readable")),
             "the salvage itself must be disclosed: {notes:?}"
+        );
+    }
+
+    /// C15-lib2-F1: a focus loss drops the pointer/button releases
+    /// `map_dragging` and `lmb_press` live off — the same argument the
+    /// held-key clears always used. A stale `map_dragging` made the
+    /// camera orbit on refocus with no button held; a stale
+    /// `lmb_press` armed a click candidate whose press never landed.
+    #[test]
+    fn focus_lost_clears_drag_and_click_candidate() {
+        let dir = tempdir("focus-loss");
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        // Stage every state `focus_lost` owns.
+        app.map_dragging = true;
+        app.lmb_press = Some(Some((10.0, 10.0)));
+        app.captured_key = Some(winit::keyboard::PhysicalKey::Code(
+            winit::keyboard::KeyCode::KeyW,
+        ));
+        app.throttle_held.insert(KeyAction::ThrottleUp);
+        app.throttle_hold_s = 0.4;
+        app.throttle_hold_vessel = app.view.flight_focus();
+        app.focus_lost();
+        assert!(!app.map_dragging, "stale drag survives focus loss");
+        assert_eq!(app.lmb_press, None, "stale click candidate survives");
+        assert_eq!(app.captured_key, None);
+        assert!(app.throttle_held.is_empty());
+        assert_eq!(app.throttle_hold_s, 0.0);
+        assert_eq!(app.throttle_hold_vessel, None);
+    }
+
+    /// C15-lib2-F2: a throttle key held through a flight-focus change
+    /// must NOT carry the old vessel's commanded axis onto the new
+    /// focus — the hold rebases (the ease-in clock restarts, the axis
+    /// takes the new vessel's applied value when it has one) and the
+    /// retarget lands on the cue channel. The real triggers are
+    /// recover-control pinning and the newest-staged fallback; the
+    /// test stages the state directly — a recorded vessel that is not
+    /// the live focus — and runs one ramp tick.
+    #[test]
+    fn throttle_hold_rebases_on_focus_change() {
+        let dir = tempdir("throttle-retarget");
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        // Settle the seeded pad craft so `flight_focus` is live and
+        // `throttle_blocker` is clear (a latched pad craft commands).
+        app.view.begin_frame();
+        app.view.sim_step(320).unwrap();
+        app.view.end_frame();
+        let vessel = app.view.flight_focus().unwrap();
+        app.dispatch(KeyAction::ThrottleUp);
+        assert_eq!(app.throttle_hold_vessel, Some(vessel));
+        // Simulate the focus moving: the recorded vessel stays behind.
+        app.throttle_hold_vessel = Some(csp_sim::VesselId(u64::MAX));
+        app.throttle_axis = 0.9;
+        app.throttle_hold_s = 2.0;
+        app.view.begin_frame();
+        app.tick_throttle_ramp(1.0 / 60.0);
+        app.view.end_frame();
+        assert_eq!(
+            app.throttle_hold_vessel,
+            Some(vessel),
+            "the hold must rebind to the live focus, not keep the stale id"
+        );
+        assert_eq!(
+            app.throttle_hold_s,
+            1.0 / 60.0,
+            "the ease-in clock restarts on the rebase frame"
+        );
+        {
+            let sfx = app.view.world.resource::<csp_view::flight::FlightSfx>();
+            assert!(
+                sfx.cues.iter().any(|c| c.text.contains("REBASED")),
+                "a focus retarget must surface a notice"
+            );
+        }
+        // And the hold still commands the LIVE vessel — the stale id
+        // never reaches the §7.6 log.
+        assert!(app.view.sim.command_log().iter().all(|(_, c)| match c {
+            SimCommand::SetThrottle { vessel: v, .. } => *v == vessel,
+            _ => true,
+        }));
+    }
+
+    /// C14-F4: Esc is bound to `OpenSettings` AND is the VAB's
+    /// universal cancel. While the editor has a carried part or a
+    /// selection the press resolves as the cancel (the egui pass's
+    /// `CancelPlacement`/`Select(None)`), and the settings toggle
+    /// yields — one press, one action. With nothing armed the same
+    /// key opens settings.
+    #[test]
+    fn esc_cancels_vab_carry_before_toggling_settings() {
+        let dir = tempdir("esc-route");
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        app.view.set_mode(ViewMode::Vab);
+        // Arm a placement — the seeded VAB craft supplies a real part id.
+        app.view.with_vab_session(|v| {
+            let root = v.session().root().expect("seeded VAB craft");
+            let part = v.session().node(root).unwrap().built().part_id.clone();
+            v.set_drag_part(Some(part));
+            assert!(v.carried().is_some());
+        });
+        app.dispatch(KeyAction::OpenSettings);
+        assert!(
+            !app.view.settings_panel_open(),
+            "Esc while carrying must cancel, not toggle settings"
+        );
+        // Disarm the carry but keep a selection armed — the same
+        // cancel-yields-to-Esc rule covers it.
+        app.view.with_vab_session(|v| {
+            v.apply(csp_ui::vab::VabAction::CancelPlacement).unwrap();
+            let root = v.session().root().unwrap();
+            v.apply(csp_ui::vab::VabAction::Select(Some(root))).unwrap();
+            assert!(v.selected().is_some());
+        });
+        app.dispatch(KeyAction::OpenSettings);
+        assert!(
+            !app.view.settings_panel_open(),
+            "Esc with a selection armed must deselect, not toggle settings"
+        );
+        // Fully disarmed — the next Esc reaches the settings toggle.
+        app.view.with_vab_session(|v| {
+            v.apply(csp_ui::vab::VabAction::Select(None)).unwrap();
+            assert!(v.carried().is_none());
+            assert!(v.selected().is_none());
+        });
+        app.dispatch(KeyAction::OpenSettings);
+        assert!(
+            app.view.settings_panel_open(),
+            "Esc with nothing armed still opens settings"
         );
     }
 }

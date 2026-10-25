@@ -403,9 +403,9 @@ pub struct VabSession {
     /// the attach planner and the right-click remove read it.
     hover: Option<HoverHit>,
     /// The pointer position in physical surface px while it is over
-    /// the 3D viewport — pushed by `vab_editor` from egui each frame.
-    /// `csp-view`'s hover ray is cast through it; `None` over a panel
-    /// or off-window.
+    /// the 3D viewport — pushed by `vab_pointer_input` from egui each
+    /// frame. `csp-view`'s hover ray is cast through it; `None` over a
+    /// masked window rect or off-window.
     cursor_px: Option<(f64, f64)>,
     /// Radial symmetry copies for surface mounts — 1, 2, or 4.
     symmetry: u8,
@@ -639,7 +639,7 @@ impl VabSession {
         self.cursor_px
     }
 
-    /// Push/clear the viewport cursor — `vab_editor` owns this.
+    /// Push/clear the viewport cursor — `vab_pointer_input` owns this.
     pub fn set_cursor_px(&mut self, px: Option<(f64, f64)>) {
         self.cursor_px = px;
     }
@@ -1896,7 +1896,9 @@ pub struct VabUiOutput {
 /// its buttons ride the `warp_step` outbox), and the Tutorial/Help
 /// affordances. Emits [`ModeSelect`] into the outbox; `csp-app` maps
 /// it to `View::set_mode`. `keys` is the live keymap — the mode
-/// labels print its bindings, not hardcoded names.
+/// labels print its bindings, not hardcoded names. Returns the drawn
+/// window rect — the host adds it to [`vab_pointer_input`]'s overlay
+/// mask so a click on the bar cannot reach the 3D scene behind it.
 pub fn top_bar(
     ctx: &egui::Context,
     current: ModeSelect,
@@ -1904,7 +1906,7 @@ pub fn top_bar(
     keys: &crate::settings::Keymap,
     key_labels: &std::collections::BTreeMap<String, String>,
     out: &mut VabUiOutput,
-) {
+) -> egui::Rect {
     egui::Window::new("mode_bar")
         .title_bar(false)
         .anchor(egui::Align2::LEFT_TOP, egui::vec2(0.0, 0.0))
@@ -1966,17 +1968,21 @@ pub fn top_bar(
                     out.help = true;
                 }
             });
-        });
+        })
+        .map(|r| r.response.rect)
+        .unwrap_or(egui::Rect::NOTHING)
 }
 
 /// The whole VAB editor pass — palette, craft tree, inspector +
-/// staging + readout, validation, craft-file bar, the action strip,
-/// and the pointer-side plumbing (hover cursor, palette drag-drop,
-/// right-click remove, hotkeys). Runs only while the mode is `Vab`.
-/// Session ops apply immediately through [`VabSession::apply`] (the
-/// §2.2-C channel); file IO and mode switches ride `out` for next
-/// frame's app-side Input. `keys` is the live keymap the hint bar
-/// prints bindings from.
+/// staging + readout, validation, craft-file bar, the action strip.
+/// Runs only while the mode is `Vab`. Session ops apply immediately
+/// through [`VabSession::apply`] (the §2.2-C channel); file IO and
+/// mode switches ride `out` for next frame's app-side Input. `keys`
+/// is the live keymap the hint bar prints bindings from. Returns the
+/// editor's own window rects — the host folds them into
+/// [`vab_pointer_input`]'s overlay mask alongside every *other*
+/// floating window it drew this pass (the pointer pass runs last for
+/// exactly that reason).
 pub fn vab_editor(
     ctx: &egui::Context,
     vab: &mut VabSession,
@@ -1984,18 +1990,24 @@ pub fn vab_editor(
     keys: &crate::settings::Keymap,
     key_labels: &std::collections::BTreeMap<String, String>,
     out: &mut VabUiOutput,
-) {
+) -> Vec<egui::Rect> {
     vab.recompute();
     let mut panels = Vec::with_capacity(4);
     panels.push(palette_panel(ctx, vab));
     panels.push(inspector_panel(ctx, vab, craft_files, out));
     panels.push(action_bar(ctx, vab));
     vab_hint_bar(ctx, vab, keys, key_labels);
-    vab_pointer_input(ctx, vab, &panels);
+    panels
 }
 
-/// The pointer/hotkey half of the editor pass — runs after the panels
-/// so their window rects are known. The KSP held-part gesture layer:
+/// The pointer/hotkey half of the editor pass — the host calls it
+/// LAST inside the egui pass so `masks` can carry the rect of every
+/// floating window drawn this frame: the editor's own panels AND the
+/// overlays drawn around them (top bar, help card, settings window,
+/// crash dialog, tutorial card). Pointer events inside any mask are
+/// the UI's business — they must never reach the 3D scene (a
+/// right-click on the settings window used to subtree-delete the
+/// craft part behind it). The KSP held-part gesture layer:
 ///
 /// - publishes the viewport cursor (physical px) into the session so
 ///   `csp-view` can cast the CPU hover ray — `None` while the pointer
@@ -2012,10 +2024,19 @@ pub fn vab_editor(
 ///   carrying nothing — removes the *hovered* part's subtree;
 /// - `Del`/`Backspace` removes the selected part, `Esc` puts the
 ///   carried part back or deselects, `X` cycles radial symmetry 1→2→4.
+///
+/// `palette` is the parts-catalog window's rect separately — a lifted
+/// part released over it is *deleted* (KSP's drag-to-bin), which is a
+/// different resolution than the generic overlay mask's "stays held".
 #[allow(clippy::too_many_lines)] // one gesture pass — each branch is one input's resolution
-fn vab_pointer_input(ctx: &egui::Context, vab: &mut VabSession, panels: &[egui::Rect]) {
+pub fn vab_pointer_input(
+    ctx: &egui::Context,
+    vab: &mut VabSession,
+    masks: &[egui::Rect],
+    palette: Option<egui::Rect>,
+) {
     use egui::PointerButton;
-    let (pos, pressed, primary_down, released, deciding, secondary, del, esc, sym_key, typing) =
+    let (pos, pressed, primary_down, released, deciding, secondary, del, esc, sym_key) =
         ctx.input(|i| {
             (
                 i.pointer.hover_pos(),
@@ -2027,15 +2048,19 @@ fn vab_pointer_input(ctx: &egui::Context, vab: &mut VabSession, panels: &[egui::
                 i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace),
                 i.key_pressed(egui::Key::Escape),
                 i.key_pressed(egui::Key::X),
-                i.focused,
             )
         });
+    // C14-F1: gate the hotkeys on TEXT-EDIT focus, never `InputState::focused`
+    // (native window focus — true during all normal play, which dead-keyed
+    // Del/Esc/X). Only a field actually taking typed text may hide them.
+    let typing = ctx.text_edit_focused();
     let ppp = ctx.pixels_per_point();
-    // The viewport is the content rect minus the floating panels —
-    // egui's `is_pointer_over_area` misreports during drags (the drag
-    // source's layer counts), so the panel set is geometric instead.
-    let over_viewport = pos
-        .is_some_and(|p| ctx.content_rect().contains(p) && !panels.iter().any(|r| r.contains(p)));
+    // The viewport is the content rect minus every masked window rect —
+    // the mask list is geometric because egui's pointer state reads the
+    // whole window regardless of which widget consumed the event (raw
+    // `button_pressed`/`secondary_clicked` have no consumption path).
+    let over_viewport =
+        pos.is_some_and(|p| ctx.content_rect().contains(p) && !masks.iter().any(|r| r.contains(p)));
     vab.set_cursor_px(if over_viewport {
         pos.map(|p| (p.x as f64 * f64::from(ppp), p.y as f64 * f64::from(ppp)))
     } else {
@@ -2078,7 +2103,7 @@ fn vab_pointer_input(ctx: &egui::Context, vab: &mut VabSession, panels: &[egui::
         // drag-to-the-parts-list bin; over the viewport it commits at
         // the hover target; over any other panel it stays held.
         if let Some(node) = vab.move_node() {
-            if pos.is_some_and(|p| panels.first().is_some_and(|r| r.contains(p))) {
+            if pos.is_some_and(|p| palette.is_some_and(|r| r.contains(p))) {
                 let _ = vab.apply(VabAction::Remove(node));
             } else if over_viewport {
                 let _ = vab.apply(VabAction::Drop);
@@ -4063,5 +4088,312 @@ mod tests {
         .unwrap();
         let placed = vab.selected().unwrap();
         assert!(vab.session().node(placed).unwrap().transform().offset.z < 0.0);
+    }
+
+    // ------------------------------------------------------------------
+    // egui-pass tests — `vab_pointer_input` driven headlessly through
+    // `Context::run_pass` with a fabricated `RawInput` (C14-F1/F2).
+    // ------------------------------------------------------------------
+
+    /// A `RawInput` sized to an 800×600 viewport carrying `events`.
+    fn egui_input(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            focused: true,
+            events,
+            ..Default::default()
+        }
+    }
+
+    fn key_press(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn secondary_click(pos: egui::Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    /// C14-F1 regression: the hotkey gate used to read
+    /// `InputState::focused` — the NATIVE window focus, true during all
+    /// normal play — so Del/Esc/X were dead keys. With a focused window
+    /// and no text edit, `Del` must remove the selected part.
+    #[test]
+    fn hotkeys_fire_under_plain_window_focus() {
+        let ctx = egui::Context::default();
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        vab.apply(VabAction::SetRoot(PartId::from("t.tank")))
+            .unwrap();
+        let root = vab.session().root().unwrap();
+        vab.apply(VabAction::Select(Some(root))).unwrap();
+        assert_eq!(vab.selected(), Some(root));
+
+        ctx.run_pass(egui_input(vec![key_press(egui::Key::Delete)]), |ctx| {
+            vab_pointer_input(ctx, &mut vab, &[], None);
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(
+            vab.session().len(),
+            0,
+            "Del must remove the selected part — window focus is not typing"
+        );
+        // Same for the symmetry key — an X press cycles 1→2.
+        ctx.run_pass(egui_input(vec![key_press(egui::Key::X)]), |ctx| {
+            vab_pointer_input(ctx, &mut vab, &[], None);
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(vab.symmetry(), 2, "X must cycle radial symmetry");
+    }
+
+    /// The same hotkeys stay hidden only while a real text field holds
+    /// focus — a save-name edit must never eat Del/X (and a plain
+    /// `Event::Key` for X is not consumed by a `TextEdit`, so the gate
+    /// itself is what suppresses it here).
+    #[test]
+    fn text_edit_focus_gates_hotkeys() {
+        let ctx = egui::Context::default();
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        vab.apply(VabAction::SetRoot(PartId::from("t.tank")))
+            .unwrap();
+        vab.apply(VabAction::Select(Some(vab.session().root().unwrap())))
+            .unwrap();
+        let mut name = String::new();
+        let mut edit_id = egui::Id::NULL;
+        // Frame 1: draw the field and claim focus for it.
+        ctx.run_pass(egui_input(Vec::new()), |ctx| {
+            egui::Window::new("editor_panel").show(ctx, |ui| {
+                let r = ui.add(egui::TextEdit::singleline(&mut name));
+                edit_id = r.id;
+                r.request_focus();
+            });
+        })
+        .drop_without_applying_deltas();
+        // Frame 2: focus established — X is gated by `text_edit_focused`.
+        assert!(ctx.text_edit_focused());
+        ctx.run_pass(egui_input(vec![key_press(egui::Key::X)]), |ctx| {
+            egui::Window::new("editor_panel").show(ctx, |ui| {
+                ui.add(egui::TextEdit::singleline(&mut name));
+            });
+            vab_pointer_input(ctx, &mut vab, &[], None);
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(
+            vab.symmetry(),
+            1,
+            "X must not reach the game while a TextEdit holds focus"
+        );
+        // Focus released → the very same press fires again.
+        ctx.run_pass(egui_input(Vec::new()), |ctx| {
+            ctx.memory_mut(|m| m.surrender_focus(edit_id));
+        })
+        .drop_without_applying_deltas();
+        assert!(!ctx.text_edit_focused());
+        ctx.run_pass(egui_input(vec![key_press(egui::Key::X)]), |ctx| {
+            vab_pointer_input(ctx, &mut vab, &[], None);
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(vab.symmetry(), 2, "X fires once the field surrenders");
+    }
+
+    /// C14-F2: pointer events inside a masked overlay rect resolve as
+    /// UI — no cursor ray, no right-click remove — while a free point
+    /// sees the scene. Enumerates EVERY overlay window the host draws
+    /// over the VAB (top bar, help, settings, crash, tutorial, the
+    /// editor's own panels): each must return its live rect so the
+    /// host can mask it — a window returning `NOTHING` would click
+    /// straight through to the craft.
+    #[test]
+    fn overlay_masks_block_pointer_but_free_viewport_sees_scene() {
+        let ctx = egui::Context::default();
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        vab.apply(VabAction::SetRoot(PartId::from("t.tank")))
+            .unwrap();
+        let root = vab.session().root().unwrap();
+        vab.set_hover(Some(HoverHit {
+            node: root,
+            local: DVec3::new(0.0, 0.0, 0.5),
+            region: AttachRegion::TopCap,
+        }));
+        // Draw every overlay the same pass order the host uses and
+        // collect the rects exactly the way `build_ui` feeds `masks`.
+        let mut out = VabUiOutput::default();
+        let mut state = crate::settings::SettingsPanelState {
+            open: true,
+            ..Default::default()
+        };
+        let mut settings_out = crate::settings::SettingsPanelOutput::default();
+        let mut tutorial = crate::tutorial::TutorialState::default();
+        let mut help_open = true;
+        let mut masks: Vec<egui::Rect> = Vec::new();
+        ctx.run_pass(egui_input(Vec::new()), |ctx| {
+            masks.push(top_bar(
+                ctx,
+                ModeSelect::Vab,
+                1,
+                &crate::settings::Keymap::default(),
+                &std::collections::BTreeMap::new(),
+                &mut out,
+            ));
+            masks.push(crate::help_panel(
+                ctx,
+                &crate::settings::Keymap::default(),
+                &std::collections::BTreeMap::new(),
+                &mut help_open,
+            ));
+            masks.extend(vab_editor(
+                ctx,
+                &mut vab,
+                &[],
+                &crate::settings::Keymap::default(),
+                &std::collections::BTreeMap::new(),
+                &mut out,
+            ));
+            masks.push(crate::settings::settings_panel(
+                ctx,
+                &mut state,
+                &mut settings_out,
+                &std::collections::BTreeMap::new(),
+            ));
+            masks.push(crate::crash_dialog(ctx, "test halt", None));
+            masks.push(crate::tutorial::tutorial_overlay(
+                ctx,
+                &mut tutorial,
+                &crate::settings::Keymap::default(),
+                &std::collections::BTreeMap::new(),
+                true,
+            ));
+        })
+        .drop_without_applying_deltas();
+        // Eight overlays: mode bar, help, palette, inspector, action
+        // strip, settings, crash, tutorial — every one a positive rect.
+        assert_eq!(masks.len(), 8, "overlay enumeration: {masks:?}");
+        for (i, rect) in masks.iter().enumerate() {
+            assert!(
+                rect.is_positive(),
+                "overlay mask {i} is empty — its window clicks through"
+            );
+            let pos = rect.center();
+            ctx.run_pass(egui_input(secondary_click(pos)), |ctx| {
+                vab_pointer_input(ctx, &mut vab, &masks, None);
+            })
+            .drop_without_applying_deltas();
+            assert_eq!(
+                vab.cursor_px(),
+                None,
+                "a click through overlay {i} at {pos:?} reached the viewport"
+            );
+            assert_eq!(
+                vab.session().len(),
+                1,
+                "a right-click through overlay {i} deleted the craft"
+            );
+        }
+        // The same click on free viewport resolves as the remove.
+        let free = egui::pos2(400.0, 500.0);
+        assert!(
+            !masks.iter().any(|r| r.contains(free)),
+            "test point {free:?} must be unmasked"
+        );
+        ctx.run_pass(egui_input(secondary_click(free)), |ctx| {
+            vab_pointer_input(ctx, &mut vab, &masks, None);
+        })
+        .drop_without_applying_deltas();
+        assert!(vab.cursor_px().is_some());
+        assert_eq!(vab.session().len(), 0);
+    }
+
+    /// The drag-to-bin rule keeps working with the split signature: a
+    /// lifted part released over the palette rect is deleted, released
+    /// over a non-palette mask it stays held.
+    #[test]
+    fn palette_rect_still_bins_lifted_parts() {
+        let ctx = egui::Context::default();
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        vab.apply(VabAction::SetRoot(PartId::from("t.tank")))
+            .unwrap();
+        let root = vab.session().root().unwrap();
+        vab.apply(VabAction::AttachAuto {
+            part: PartId::from("t.tank"),
+            parent: root,
+        })
+        .unwrap();
+        let mid = vab.selected().unwrap();
+        vab.apply(VabAction::Grab(mid)).unwrap();
+        assert_eq!(vab.move_node(), Some(mid));
+        let palette = egui::Rect::from_min_size(egui::pos2(0.0, 30.0), egui::vec2(310.0, 620.0));
+        let other_mask =
+            egui::Rect::from_min_size(egui::pos2(500.0, 200.0), egui::vec2(200.0, 100.0));
+        // Release over a NON-palette mask: stays held (masked, not binned).
+        ctx.run_pass(
+            egui_input(vec![
+                egui::Event::PointerMoved(egui::pos2(600.0, 250.0)),
+                egui::Event::PointerButton {
+                    pos: egui::pos2(600.0, 250.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: egui::pos2(600.0, 250.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]),
+            |ctx| vab_pointer_input(ctx, &mut vab, &[palette, other_mask], Some(palette)),
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(
+            vab.move_node(),
+            Some(mid),
+            "release over a non-palette window keeps the lift held"
+        );
+        // Release over the palette rect: the bin deletes the node.
+        ctx.run_pass(
+            egui_input(vec![
+                egui::Event::PointerMoved(egui::pos2(150.0, 300.0)),
+                egui::Event::PointerButton {
+                    pos: egui::pos2(150.0, 300.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: egui::pos2(150.0, 300.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]),
+            |ctx| vab_pointer_input(ctx, &mut vab, &[palette, other_mask], Some(palette)),
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(
+            vab.session().len(),
+            1,
+            "release over the palette bins the lifted part"
+        );
     }
 }

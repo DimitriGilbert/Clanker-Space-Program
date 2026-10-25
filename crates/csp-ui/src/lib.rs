@@ -135,8 +135,10 @@ pub fn debug_panel(
 /// session is halted; the bundle write itself is `csp-app`'s.
 ///
 /// `bundle` is the human-readable path (or the write failure's message)
-/// the app recorded.
-pub fn crash_dialog(ctx: &egui::Context, reason: &str, bundle: Option<&str>) {
+/// the app recorded. Returns the drawn window rect — the host masks the
+/// VAB's pointer input against it (a click on the dialog must not reach
+/// the craft behind it).
+pub fn crash_dialog(ctx: &egui::Context, reason: &str, bundle: Option<&str>) -> egui::Rect {
     egui::Window::new("Simulation halted")
         .collapsible(false)
         .resizable(false)
@@ -159,7 +161,9 @@ pub fn crash_dialog(ctx: &egui::Context, reason: &str, bundle: Option<&str>) {
                     ui.label("Writing the bug-report bundle failed; see the log.");
                 }
             }
-        });
+        })
+        .map(|r| r.response.rect)
+        .unwrap_or(egui::Rect::NOTHING)
 }
 
 /// One propellant resource's aggregate fill on the focused vessel —
@@ -882,15 +886,16 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
 /// The controls-help card — a toggleable window listing every bound
 /// action *from the live [`settings::Keymap`]* (so rebinding keeps it
 /// truthful) plus the fixed mouse controls. `open` mirrors the window's
-/// close button back into the session flag.
+/// close button back into the session flag. Returns the drawn window
+/// rect — the host masks the VAB's pointer input against it.
 pub fn help_panel(
     ctx: &egui::Context,
     keymap: &settings::Keymap,
     key_labels: &std::collections::BTreeMap<String, String>,
     open: &mut bool,
-) {
+) -> egui::Rect {
     let mut o = *open;
-    egui::Window::new("Controls")
+    let rect = egui::Window::new("Controls")
         .open(&mut o)
         .anchor(egui::Align2::RIGHT_CENTER, egui::vec2(-12.0, 0.0))
         .resizable(false)
@@ -936,8 +941,11 @@ pub fn help_panel(
                     ui.end_row();
                 }
             });
-        });
+        })
+        .map(|r| r.response.rect)
+        .unwrap_or(egui::Rect::NOTHING);
     *open = o;
+    rect
 }
 
 // ---------------------------------------------------------------------------

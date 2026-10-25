@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 csp-core = { workspace = true }
 csp-render = { workspace = true }
+csp-sim = { workspace = true }
 csp-view = { workspace = true }
 egui = { workspace = true }
 egui-wgpu = { workspace = true }
@@ -36,6 +37,11 @@ ron = { workspace = true }
 # §2.14: the bug-report bundle's fingerprint sidecar is JSON like the
 # §8.4 goldens' — not in the determinism domain, caret is honest.
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# Tests drive `VabSession` ops (`VabAction`) directly — csp-view only
+# re-exports the session wrapper, not the action vocabulary.
+csp-ui = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = { workspace = true }

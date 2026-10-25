@@ -727,14 +727,16 @@ pub struct SettingsPanelOutput {
 /// on `apply` and owns key-capture while `listening` is armed.
 /// `key_labels` is the host's observed physical-token → glyph map —
 /// the bindings column prints what the keys say on *this* keyboard.
+/// Returns the drawn window rect — the host masks the VAB's pointer
+/// input against it (a click on the window must not reach the craft).
 pub fn settings_panel(
     ctx: &egui::Context,
     state: &mut SettingsPanelState,
     out: &mut SettingsPanelOutput,
     key_labels: &BTreeMap<String, String>,
-) {
+) -> egui::Rect {
     let mut open = state.open;
-    egui::Window::new("Settings")
+    let rect = egui::Window::new("Settings")
         .open(&mut open)
         .collapsible(false)
         .show(ctx, |ui| {
@@ -809,7 +811,9 @@ pub fn settings_panel(
             if let Some(notice) = &state.notice {
                 ui.label(notice);
             }
-        });
+        })
+        .map(|r| r.response.rect)
+        .unwrap_or(egui::Rect::NOTHING);
     state.open = open;
     // An X-close while a rebind capture is armed must drop it — the
     // host reads `listening` for its pre-egui key intercept, and an
@@ -819,6 +823,7 @@ pub fn settings_panel(
     if !state.open {
         state.listening = None;
     }
+    rect
 }
 
 /// The keymap section's grid — one row per [`KeyAction`]: label, current

@@ -277,13 +277,15 @@ impl TutorialState {
 /// The anchor is mode-aware: the VAB's Craft inspector owns the
 /// right-top corner, so `in_vab` drops the card to center-top where
 /// it overlaps nothing; flight/map keep the free right-top slot.
+/// Returns the drawn window rect — the host masks the VAB's pointer
+/// input against it (the default-on card sits over the build area).
 pub fn tutorial_overlay(
     ctx: &egui::Context,
     state: &mut TutorialState,
     keys: &crate::settings::Keymap,
     key_labels: &std::collections::BTreeMap<String, String>,
     in_vab: bool,
-) {
+) -> egui::Rect {
     let anchor = if in_vab {
         (egui::Align2::CENTER_TOP, egui::vec2(0.0, 30.0))
     } else {
@@ -362,7 +364,9 @@ pub fn tutorial_overlay(
                     state.restart();
                 }
             });
-        });
+        })
+        .map(|r| r.response.rect)
+        .unwrap_or(egui::Rect::NOTHING)
 }
 
 #[cfg(test)]

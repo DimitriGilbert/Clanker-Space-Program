@@ -977,6 +977,8 @@ dependencies = [
  "console_log",
  "csp-core",
  "csp-render",
+ "csp-sim",
+ "csp-ui",
  "csp-view",
  "egui",
  "egui-wgpu",

@@ -341,14 +341,20 @@ fn build_ui(
     }
     let files = craft_files.0.clone(); // Vec<String> — cheap, frees the Res borrow
     egui.output = Some(ctx.run_ui(raw, |ctx| {
-        csp_ui::vab::top_bar(
+        // The VAB's click-through mask: every floating window drawn
+        // over the 3D build area pushes its rect here, and the pointer
+        // pass runs LAST so the set is complete before any gesture
+        // resolves — a press on a UI card must never reach the craft
+        // behind it (C14-F2).
+        let mut ui_masks: Vec<egui::Rect> = Vec::with_capacity(8);
+        ui_masks.push(csp_ui::vab::top_bar(
             ctx,
             mode,
             warp.0,
             &session.keys,
             &session.key_labels,
             &mut vab_out,
-        );
+        ));
         // The M0 scaffold is dev-facing (adapter/backend/tick internals)
         // — gated behind the ToggleDebug key so the shipped view is a
         // game screen, not a diagnostics dump.
@@ -359,7 +365,12 @@ fn build_ui(
             let mut open = true;
             // The LIVE keymap — the staged edit copy would show
             // pending changes the dispatch doesn't honor yet.
-            csp_ui::help_panel(ctx, &session.keys, &session.key_labels, &mut open);
+            ui_masks.push(csp_ui::help_panel(
+                ctx,
+                &session.keys,
+                &session.key_labels,
+                &mut open,
+            ));
             if !open {
                 panels.help = false;
             }
@@ -375,8 +386,9 @@ fn build_ui(
                 &mut outbox,
             );
         }
+        let mut palette_rect = None;
         if mode == csp_ui::ModeSelect::Vab {
-            csp_ui::vab::vab_editor(
+            let editor_rects = csp_ui::vab::vab_editor(
                 ctx,
                 &mut vab.0,
                 &files,
@@ -384,6 +396,11 @@ fn build_ui(
                 &session.key_labels,
                 &mut vab_out,
             );
+            // `vab_editor` returns [palette, inspector, action_bar] —
+            // the palette rect also feeds the drag-to-bin test, which
+            // deletes a lifted part released over the parts list.
+            palette_rect = editor_rects.first().copied();
+            ui_masks.extend(editor_rects);
         }
         if mode == csp_ui::ModeSelect::Flight {
             csp_ui::flight_hud(
@@ -437,14 +454,14 @@ fn build_ui(
         }
         // M10: the settings window + the §2.13 Fatal dialog + the
         // tutorial checklist — session-state panels, drawn every mode.
-        m10_panels(
+        ui_masks.extend(m10_panels(
             ctx,
             &mut settings_state.0,
             &session,
             &mut outbox,
             &mut tutorial.0,
             mode == csp_ui::ModeSelect::Vab,
-        );
+        ));
         // The §3.7 cue stack — the GLOBAL refusal/transition channel.
         // Drawn in every mode: a refusal that can only flash inside
         // `flight_hud` is invisible exactly where it fires (Map
@@ -453,6 +470,15 @@ fn build_ui(
         // stack; `flight_present` ages the TTLs every frame, so cues
         // pushed from any mode still fade on schedule.
         csp_ui::notice_overlay(ctx, &flight_ui.sfx);
+        // The VAB's pointer/hotkey pass runs LAST: `ui_masks` now
+        // holds every floating window rect drawn this frame (top bar,
+        // editor panels, help, settings, crash, tutorial), so a press
+        // or release landing on any of them resolves as UI — never a
+        // scene pick, subtree delete, lift, or drop on the craft
+        // behind the window (C14-F2).
+        if mode == csp_ui::ModeSelect::Vab {
+            csp_ui::vab::vab_pointer_input(ctx, &mut vab.0, &ui_masks, palette_rect);
+        }
     }));
     // The top bar's Tutorial button re-opens the checklist — session
     // state, folded back here rather than riding the app outbox.
@@ -650,6 +676,8 @@ fn map_pointer_input(
 /// dialog (while the halt mirror is set), and the first-flight
 /// tutorial checklist (while its session flag is active). Extracted
 /// from [`build_ui`] to keep that system under the line budget.
+/// Returns the rect of every window it drew — the caller masks the
+/// VAB's pointer input against them (C14-F2).
 fn m10_panels(
     ctx: &egui::Context,
     settings_state: &mut settings::SettingsPanelState,
@@ -657,15 +685,16 @@ fn m10_panels(
     outbox: &mut UiOutbox,
     tutorial: &mut csp_ui::tutorial::TutorialState,
     in_vab: bool,
-) {
+) -> Vec<egui::Rect> {
+    let mut rects = Vec::with_capacity(3);
     let mut settings_out = csp_ui::settings::SettingsPanelOutput::default();
     if settings_state.open {
-        csp_ui::settings::settings_panel(
+        rects.push(csp_ui::settings::settings_panel(
             ctx,
             settings_state,
             &mut settings_out,
             &session.key_labels,
-        );
+        ));
     }
     if settings_out.reset_defaults {
         settings_state.settings = csp_ui::settings::Settings::default();
@@ -677,20 +706,25 @@ fn m10_panels(
     }
     outbox.settings_apply = settings_out.apply;
     if let Some(fatal) = &session.fatal {
-        csp_ui::crash_dialog(ctx, fatal.reason(), session.fatal_bundle.as_deref());
+        rects.push(csp_ui::crash_dialog(
+            ctx,
+            fatal.reason(),
+            session.fatal_bundle.as_deref(),
+        ));
     }
     // The first-flight checklist — drawn in every mode while active
     // (it coaches the VAB steps from inside the editor, where its
     // anchor keeps it clear of the Craft inspector).
     if tutorial.active {
-        csp_ui::tutorial::tutorial_overlay(
+        rects.push(csp_ui::tutorial::tutorial_overlay(
             ctx,
             tutorial,
             &session.keys,
             &session.key_labels,
             in_vab,
-        );
+        ));
     }
+    rects
 }
 
 /// The six schedules from PLAN §2.5, run explicitly by `csp-app`.
@@ -2575,5 +2609,83 @@ mod tests {
         let fcam = view.world.resource::<flight::FlightCameraF64>();
         assert!(fcam.0.valid, "chase camera must solve with a staged vessel");
         assert_eq!(fcam.0.distance_m, flight_dist);
+    }
+
+    /// C14-F2's enumeration half: EVERY floating window the UiBuild
+    /// pass draws over the VAB must sit in `vab_pointer_input`'s mask
+    /// set — top bar, the three editor panels, help, settings, the
+    /// §2.13 crash dialog, and the default-on tutorial card. A click
+    /// through any of them used to reach the 3D scene behind it. The
+    /// probe is `cursor_px`: it publishes `Some` only while the
+    /// pointer is over unmasked viewport, so a window that forgot to
+    /// mask itself leaks `Some` back at its own center.
+    #[test]
+    fn every_vab_overlay_window_masks_the_viewport() {
+        let mut view = View::default();
+        view.set_mode(ViewMode::Vab);
+        // Turn every conditional overlay on: help + settings windows,
+        // the crash dialog, and the tutorial card.
+        view.toggle_help_panel();
+        view.toggle_settings_panel();
+        view.update_session(16.0, 1, 1, Some(SimError::Fatal("test halt")));
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(screen),
+            focused: true,
+            events,
+            ..Default::default()
+        };
+        // Probe the overlay windows at their anchors — the host-side
+        // half of C14-F2: `build_ui` must actually feed every drawn
+        // window's rect into the pointer pass (the per-window contract
+        // — that each returns a positive rect — is the csp-ui
+        // enumeration test's job).
+        let probes: [(&str, egui::Pos2); 6] = [
+            ("mode_bar (top bar)", egui::pos2(400.0, 10.0)),
+            ("Parts (palette)", egui::pos2(150.0, 300.0)),
+            ("Craft (inspector)", egui::pos2(650.0, 300.0)),
+            ("First flight (tutorial)", egui::pos2(400.0, 80.0)),
+            ("Simulation halted (crash)", egui::pos2(400.0, 300.0)),
+            ("Controls (help)", egui::pos2(700.0, 300.0)),
+        ];
+        for (title, pos) in probes {
+            view.set_egui_input(input(vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]));
+            view.begin_frame();
+            view.end_frame();
+            view.with_vab_session(|v| {
+                assert_eq!(
+                    v.cursor_px(),
+                    None,
+                    "a click through '{title}' reached the 3D viewport"
+                );
+            });
+        }
+        // …and a click on genuinely free viewport still publishes the
+        // hover ray — the mask set must not eat the whole screen.
+        view.set_egui_input(input(vec![egui::Event::PointerMoved(egui::pos2(
+            400.0, 500.0,
+        ))]));
+        view.begin_frame();
+        view.end_frame();
+        view.with_vab_session(|v| {
+            assert!(
+                v.cursor_px().is_some(),
+                "unmasked viewport no longer publishes the hover ray"
+            );
+        });
     }
 }
