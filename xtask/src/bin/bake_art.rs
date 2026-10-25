@@ -254,32 +254,16 @@ fn load_rgba8(path: &Path, w: u32, h: u32) -> Vec<u8> {
     img.into_raw()
 }
 
-/// Radiance .hdr → tone-mapped sRGB RGBA8. `image`'s hdr decoder yields
-/// Rgb32F; Reinhard + a modest exposure keep bright stars above the
-/// skyglow floor without clipping the Milky Way to a grey wash.
-fn load_hdr_rgba8(path: &Path, w: u32, h: u32, exposure: f32) -> Vec<u8> {
-    let img = image::load_from_memory_with_format(
-        &fs::read(path).unwrap_or_else(|e| panic!("{e}")),
-        image::ImageFormat::Hdr,
-    )
-    .unwrap_or_else(|e| panic!("decode {}: {e}", path.display()))
-    .to_rgb32f();
-    let (dw, dh) = img.dimensions();
-    let mut raw: Vec<u8> = Vec::with_capacity((dw * dh * 4) as usize);
-    for px in img.as_raw().chunks_exact(3) {
-        for &c in px {
-            let v: f32 = 1.0 - (-exposure * c).exp(); // soft roll-off
-            let s: f32 = if v <= 0.003_130_8 {
-                12.92 * v
-            } else {
-                1.055 * v.powf(1.0 / 2.4) - 0.055
-            };
-            raw.push((s.clamp(0.0, 1.0) * 255.0).round() as u8);
-        }
-        raw.push(255);
-    }
-    let img = image::RgbaImage::from_raw(dw, dh, raw).expect("hdr dims");
-    image::imageops::resize(&img, w, h, image::imageops::FilterType::Lanczos3).into_raw()
+/// The sky-dome source must be a *pure* star field. The first pass here
+/// baked Poly Haven's `lakeside_night` HDRI — a landscape panorama whose
+/// lower hemisphere is trees/water/shore and whose upper half blows out
+/// to a white twilight glow under tone-mapping; mapped onto the sky
+/// sphere it read as "the inside of a planet". The replacement is NASA
+/// SVS's Deep Star Map (svs.gsfc.nasa.gov/3895): a plate carrée
+/// (equirect) all-sky render of ~100 M catalogue stars + the Milky Way
+/// — dark sky in EVERY direction, no landscape anywhere.
+fn load_stars(path: &Path, w: u32, h: u32) -> Vec<u8> {
+    load_rgba8(path, w, h)
 }
 
 fn downsample(level: &[u8], w: usize, h: usize) -> (Vec<u8>, usize, usize) {
@@ -395,7 +379,7 @@ fn main() {
     }
     write_csar(&out.join("parts.csar"), &entries);
 
-    // --- terrain/sky textures (ambientCG + Poly Haven, CC0) ------------------
+    // --- terrain/sky textures (ambientCG CC0 + NASA SVS public-domain) ------
     let acg = |id: &str, map: &str| src.join(format!("{id}/{id}_1K-JPG_{map}.jpg"));
     const T: u32 = 512;
     let alb_layers: Vec<Vec<u8>> = [
@@ -417,7 +401,8 @@ fn main() {
     .map(|p| load_rgba8(p, T, T))
     .collect();
     let water = load_rgba8(&acg("Foam002", "NormalGL"), T, T);
-    let stars = load_hdr_rgba8(&src.join("lakeside_night_2k.hdr"), 1024, 512, 3.0);
+    // 2048×1024 keeps catalogue stars ~0.2°/texel — points, not smears.
+    let stars = load_stars(&src.join("starmap_4k.jpg"), 2048, 1024);
 
     let entries: Vec<(&str, Entry)> = vec![
         // layer order: 0 grass, 1 rock, 2 sand, 3 snow — terrain.wgsl keys it
@@ -433,7 +418,7 @@ fn main() {
             "water_nrm",
             Entry::Image(image_entry(T as u16, T as u16, vec![water])),
         ),
-        ("stars", Entry::Image(image_entry(1024, 512, vec![stars]))),
+        ("stars", Entry::Image(image_entry(2048, 1024, vec![stars]))),
     ];
     write_csar(&out.join("terrain.csar"), &entries);
 }

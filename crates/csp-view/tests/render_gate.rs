@@ -377,6 +377,161 @@ fn empty_flight_scene_is_what_the_gate_rejects() {
     );
 }
 
+/// Scratch sky-dome dump — renders the terrain sky pass alone with a
+/// vacuum-body packet (fs_sky's unattenuated space path) so the baked
+/// equirect star map is readable on its own. Three frames: north
+/// (map top), equator (map horizon row), south (map bottom — where a
+/// landscape HDRI's ground half used to live). Run explicitly:
+/// `cargo test -p csp-view --test render_gate dump_sky -- --ignored`.
+#[test]
+#[ignore]
+#[allow(clippy::too_many_lines)] // three render+readback blocks; it is a scratch dump
+fn dump_sky() {
+    let Some((device, queue)) = headless_device() else {
+        return;
+    };
+    let art = csp_view::art::load();
+    let terrain_art = art.0.terrain.clone().expect("terrain art pack loaded");
+    let mut terrain = csp_render::terrain::TerrainRenderer::new(&device, FORMAT);
+
+    let color_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("sky-dump-target"),
+        size: wgpu::Extent3d {
+            width: W,
+            height: H,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let flight = csp_render::flight::FlightRenderer::new(&device, FORMAT, (W, H));
+    let aspect = f64::from(W) / f64::from(H);
+    let t = (35.0f64.to_radians()).tan(); // ~70° vertical fov
+    // Column-major view→world rotations: the sky ray is
+    // rd = view_rot * (ndc·tan, -1) — centre pixel looks along −z_view.
+    let rot = |x: [f32; 4], y: [f32; 4], z: [f32; 4]| [x, y, z, [0.0, 0.0, 0.0, 1.0]];
+    let views = [
+        (
+            "north",
+            rot(
+                [-1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, -1.0, 0.0],
+            ),
+        ),
+        (
+            "equator",
+            rot(
+                [0.0, 0.0, -1.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+            ),
+        ),
+        (
+            "south",
+            rot(
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+            ),
+        ),
+    ];
+    for (name, view_rot) in views {
+        let packet = csp_render::terrain::TerrainPacket {
+            sky: true,
+            art: Some(terrain_art.clone()),
+            uniforms: csp_render::terrain::TerrainUniforms {
+                view_rot,
+                eye_rel_body: [600_100.0, 0.0, 0.0, 0.0],
+                sun_dir: [-0.6, 0.5, 0.62, 0.0],
+                planet: [600_000.0, 0.0, 0.0, 2_400.0],
+                misc: [(t * aspect) as f32, t as f32, 0.0, 0.0],
+                art: [1.0, 0.0, 0.0, 0.0],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let target = color_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("sky-dump"),
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("sky"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: flight.depth_view(),
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            terrain.draw(&mut pass, &device, &queue, &packet);
+        }
+        let row_bytes = W as usize * 4;
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sky-dump-readback"),
+            size: (row_bytes * H as usize) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &color_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row_bytes as u32),
+                    rows_per_image: Some(H),
+                },
+            },
+            wgpu::Extent3d {
+                width: W,
+                height: H,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([encoder.finish()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        buf.map_async(wgpu::MapMode::Read, .., move |r| {
+            let _ = tx.send(r);
+        });
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        rx.recv().unwrap().expect("map_async failed");
+        let img = buf.get_mapped_range(..).unwrap().to_vec();
+        buf.unmap();
+        let mut out = format!("P6 {W} {H} 255\n").into_bytes();
+        for px in img.chunks_exact(4) {
+            out.extend_from_slice(&px[..3]);
+        }
+        let path = format!("/tmp/sky_{name}.ppm");
+        std::fs::write(&path, &out).unwrap();
+        eprintln!("wrote {path}");
+    }
+}
+
 /// Scratch visual dump — write the seeded frame to /tmp/frame.ppm.
 /// Run explicitly: `cargo test -p csp-view --test render_gate dump -- --ignored`.
 #[test]

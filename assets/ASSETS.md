@@ -1,6 +1,6 @@
 # Art assets — sources & licenses
 
-All third-party art is CC0 (public-domain dedication); every file is
+All third-party art is CC0 or public-domain NASA imagery; every file is
 baked into `data/art/*.csar` packs by `cargo run -p xtask --bin bake_art`
 (`xtask/src/bin/bake_art.rs`) and decoded at startup by
 `csp_view::art`. Nothing under `assets/` is read at runtime — it is the
@@ -15,7 +15,7 @@ reproducible bake input. Rows below are also recorded in
 | `Ground080/…_Color.jpg`, `…_NormalGL.jpg` | ambientCG "Ground 080" (beach sand) | CC0-1.0 | https://ambientcg.com/view?id=Ground080 |
 | `Snow010A/…_Color.jpg`, `…_NormalGL.jpg` | ambientCG "Snow 010 A" | CC0-1.0 | https://ambientcg.com/view?id=Snow010A |
 | `Foam002/…_NormalGL.jpg` | ambientCG "Foam 002" (ocean foam → wave normals) | CC0-1.0 | https://ambientcg.com/view?id=Foam002 |
-| `lakeside_night_2k.hdr` | Poly Haven "Lakeside Night" HDRI (equirect star field, tone-mapped at bake) | CC0-1.0 | https://polyhaven.com/a/lakeside_night |
+| `starmap_4k.jpg` | NASA/GSFC Scientific Visualization Studio "Deep Star Maps" (plate carrée all-sky star field, celestial coords) | public-domain | https://svs.gsfc.nasa.gov/3895 |
 
-Attribution is not legally required (CC0) but given anyway — thanks
-Kenney, ambientCG, and Poly Haven.
+Attribution is not legally required (CC0 / NASA media guidelines) but
+given anyway — thanks Kenney, ambientCG, and NASA/GSFC SVS.

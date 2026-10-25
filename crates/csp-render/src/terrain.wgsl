@@ -31,7 +31,7 @@ struct U {
 @group(0) @binding(1) var heightmap: texture_2d<f32>;   // R32Float equirect
 @group(0) @binding(2) var tlut: texture_2d<f32>;        // RGBA32Float T(h, μ)
 @group(0) @binding(3) var biomemap: texture_2d<u32>;    // R8Uint slots
-// Real art (data/art/terrain.csar, CC0 ambientCG + Poly Haven — see
+// Real art (data/art/terrain.csar, ambientCG + NASA SVS — see
 // assets/ASSETS.md): class albedo/normal arrays keyed
 // [0 grass, 1 rock, 2 sand, 3 snow], the ocean wave normal map, and the
 // equirect star map. All 1×1 placeholders when the packet carries no
@@ -770,10 +770,12 @@ fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
     // by the atmosphere along the view ray.
     let disc = pow(max(dot(rd, sun), 0.0), 4000.0) * 24.0;
     let halo = pow(max(dot(rd, sun), 0.0), 16.0) * 0.10;
-    // Real star map when the art pack is loaded (Poly Haven
-    // lakeside_night HDRI, CC0 — tone-mapped at bake): an equirect
-    // lookup on the inertial ray. The procedural cell field is the
-    // fallback for art-less packets.
+    // Real star map when the art pack is loaded (NASA SVS Deep Star
+    // Map, svs.gsfc.nasa.gov/3895 — a pure all-sky plate carrée field,
+    // no landscape in any hemisphere): an equirect lookup on the
+    // inertial ray, north pole (+z) at v = 0 matching the map's
+    // Dec +90 top row. The procedural cell field is the fallback for
+    // art-less packets.
     var stars = star_field(rd);
     if (u.art.x > 0.5) {
         let su = atan2(rd.y, rd.x) / (2.0 * PI) + 0.5;

@@ -27,7 +27,8 @@
 #
 # path | source | license | urlart/parts.csar | Kenney "Space Kit" (rocket_baseA/B, rocket_topA/B, rocket_fuelB, rocket_sidesA, rocket_finsA, pipe_ring, structure, machine_wireless, machine_barrel), baked by xtask --bin bake_art | CC0-1.0 | https://kenney.nl/assets/space-kit
 data/art/parts.csar | Kenney Space Kit GLBs (see assets/ASSETS.md), baked by xtask bake_art | CC0-1.0 | https://kenney.nl/assets/space-kit
-data/art/terrain.csar | ambientCG Grass003/Rock035/Ground080/Snow010A/Foam002 PBR maps + Poly Haven lakeside_night HDR, baked by xtask bake_art | CC0-1.0 | https://ambientcg.com / https://polyhaven.com/a/lakeside_night
+data/art/terrain.csar | ambientCG Grass003/Rock035/Ground080/Snow010A/Foam002 PBR maps, baked by xtask bake_art | CC0-1.0 | https://ambientcg.com
+data/art/terrain.csar | NASA/GSFC SVS "Deep Star Maps" starmap_4k.jpg (all-sky equirect star field), baked by xtask bake_art | public-domain | https://svs.gsfc.nasa.gov/3895
 assets/src/kenney_space-kit/Models/GLTF format/rocket_baseA.glb | Kenney Space Kit | CC0-1.0 | https://kenney.nl/assets/space-kit
 assets/src/kenney_space-kit/Models/GLTF format/rocket_baseB.glb | Kenney Space Kit | CC0-1.0 | https://kenney.nl/assets/space-kit
 assets/src/kenney_space-kit/Models/GLTF format/rocket_topA.glb | Kenney Space Kit | CC0-1.0 | https://kenney.nl/assets/space-kit
@@ -49,4 +50,4 @@ assets/src/Snow010A/Snow010A_1K-JPG_Color.jpg | ambientCG Snow010A (snow) | CC0-
 assets/src/Snow010A/Snow010A_1K-JPG_NormalGL.jpg | ambientCG Snow010A (snow) | CC0-1.0 | https://ambientcg.com/view?id=Snow010A
 assets/src/Foam002/Foam002_1K-JPG_Color.jpg | ambientCG Foam002 (ocean-foam) | CC0-1.0 | https://ambientcg.com/view?id=Foam002
 assets/src/Foam002/Foam002_1K-JPG_NormalGL.jpg | ambientCG Foam002 (ocean-foam) | CC0-1.0 | https://ambientcg.com/view?id=Foam002
-assets/src/lakeside_night_2k.hdr | Poly Haven lakeside_night HDRI | CC0-1.0 | https://polyhaven.com/a/lakeside_night
+assets/src/starmap_4k.jpg | NASA/GSFC Scientific Visualization Studio Deep Star Maps (star catalogues: Bright Star, Tycho-2, UCAC3) | public-domain | https://svs.gsfc.nasa.gov/3895
