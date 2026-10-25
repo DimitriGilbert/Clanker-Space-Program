@@ -287,6 +287,7 @@ pub fn flight_craft() -> csp_sim::CraftDef {
         },
     };
     csp_sim::CraftDef {
+        part_ids: vec![],
         graph,
         parts: vec![booster],
         // M7-C: a modest 5 t booster's build cost — the manufacture

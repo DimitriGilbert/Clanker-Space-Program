@@ -1474,6 +1474,14 @@ pub struct WorldConfig {
     /// carries it so a replay that runs science commands replays the
     /// same validations.
     pub experiments: BTreeMap<ExperimentId, csp_data::ExperimentDef>,
+    /// The `data/parts/` def table the world was built with (M7-B) —
+    /// the same data-derived construction config channel; the
+    /// `CraftDef::part_ids` spawn/manufacture gate resolves authored
+    /// `tech_requirement`s against it. `default` keeps §7.6 artifacts
+    /// recorded before the field existed decodable — an empty table
+    /// is inert under the gate's identity-free convention.
+    #[serde(default)]
+    pub parts: BTreeMap<csp_data::PartId, csp_data::PartDef>,
     /// The merged `data/techtree/` view the world was built with
     /// (M7-B) — the same data-derived construction config channel;
     /// `None` for a world without a tree (research commands reject).
@@ -2061,6 +2069,12 @@ pub struct World {
     /// `set_experiments`/`WorldConfig`, never serialized or hashed —
     /// a def change is a data-hash change, not a state edit.
     experiments: BTreeMap<ExperimentId, csp_data::ExperimentDef>,
+    /// The `data/parts/` def table — construction config like
+    /// `experiments` (data-derived, §7.3): handed in via
+    /// `set_parts`/`WorldConfig`, never serialized or hashed.
+    /// `CraftDef::part_ids` resolves each id's authored
+    /// `tech_requirement` against it at the spawn/manufacture gate.
+    parts: BTreeMap<csp_data::PartId, csp_data::PartDef>,
     /// M8-B's `data/recipes/` table — data-derived construction
     /// config like `experiments` (re-installed post-restore), the
     /// `Converter` modules' `RecipeId` lookup.
@@ -2261,6 +2275,7 @@ impl World {
             science: ScienceState::default(),
             science_cfg: research::default_config(),
             experiments: BTreeMap::new(),
+            parts: BTreeMap::new(),
             recipes: BTreeMap::new(),
             tech: TechState::default(),
             tech_tree: None,
@@ -2431,6 +2446,7 @@ impl World {
                 dominant: p.dominant.clone(),
             }),
             experiments: self.experiments.clone(),
+            parts: self.parts.clone(),
             tech_tree: self.tech_tree.clone(),
             sites: self.site_defs.clone(),
             contracts: self.contract_defs.clone(),
@@ -2993,9 +3009,10 @@ impl World {
             // `site_defs` precedent — §7.3 re-derived-on-load).
             colony_env: BTreeMap::new(),
             // §7.3: the caller re-installs the data-derived config via
-            // `set_experiments`/`set_tech_tree`/`set_sites` (the `orbits`
-            // precedent — re-handed, not serialized).
+            // `set_experiments`/`set_tech_tree`/`set_sites`/`set_parts`
+            // (the `orbits` precedent — re-handed, not serialized).
             experiments: BTreeMap::new(),
+            parts: BTreeMap::new(),
             recipes: BTreeMap::new(),
             tech_tree: None,
             site_defs: BTreeMap::new(),
@@ -5176,6 +5193,10 @@ impl World {
                 "physical spawn: reliability table malformed",
             ));
         }
+        // M7-B §3.3: the availability gate — a craft carrying catalog
+        // identity launches only when every part's `tech_requirement`
+        // is researched (see `check_part_gate`).
+        self.check_part_gate(craft)?;
         // §3.5's part manufacture — the build charge is paid at the
         // pad (M8's order-and-time pipeline replaces this direct
         // debit, but the cost exists now). An action: unaffordable
@@ -6360,6 +6381,7 @@ impl World {
                         parts: craft.parts.clone(),
                         part_costs: craft.part_costs.clone(),
                         reliability: craft.reliability.clone(),
+                        part_ids: craft.part_ids.clone(),
                     }),
                 )
                 .map_err(|e| SimError::Fatal(e.reason()))?,
@@ -6413,6 +6435,7 @@ impl World {
             parts: craft.parts.clone(),
             part_costs: craft.part_costs.clone(),
             reliability: craft.reliability.clone(),
+            part_ids: craft.part_ids.clone(),
         });
         v.state = VesselState::InBubble(nb);
         v.aero_mask = csp_phys::ConfigMask(retained_mask);
@@ -6458,6 +6481,7 @@ impl World {
                     parts: craft.parts.clone(),
                     part_costs: craft.part_costs.clone(),
                     reliability: craft.reliability.clone(),
+                    part_ids: craft.part_ids.clone(),
                 }),
                 state: VesselState::InBubble(fb),
                 aero_mask: csp_phys::ConfigMask::ALL,
@@ -9278,6 +9302,11 @@ fn check_restored_craft(craft: &CraftDef) -> Result<(), SimError> {
             "snapshot: craft reliability table malformed",
         ));
     }
+    // M7-B: the identity table rides the same parallel convention —
+    // empty ("not recorded") or covering `parts` exactly.
+    if !craft.part_ids.is_empty() && craft.part_ids.len() != craft.parts.len() {
+        return Err(SimError::Fatal("snapshot: craft part_ids table malformed"));
+    }
     csp_phys::weld(&craft.graph, &craft.parts).map_err(|e| SimError::Fatal(e.reason()))?;
     Ok(())
 }
@@ -10052,6 +10081,7 @@ fn apply_breakup(
                     parts: craft.parts.clone(),
                     part_costs: craft.part_costs.clone(),
                     reliability: craft.reliability.clone(),
+                    part_ids: craft.part_ids.clone(),
                 }),
                 state: VesselState::InBubble(fb),
                 aero_mask: csp_phys::ConfigMask::ALL,
@@ -12562,6 +12592,7 @@ mod tests {
             csp_phys::PartNode::new(None, csp_phys::PartTransform::IDENTITY, 0),
         );
         CraftDef {
+            part_ids: vec![],
             graph,
             part_costs: vec![0.0],
             parts: vec![csp_phys::WeldPart {
@@ -12801,6 +12832,7 @@ mod tests {
             },
         };
         CraftDef {
+            part_ids: vec![],
             graph,
             part_costs: vec![0.0; 2],
             parts: vec![payload, plate],
@@ -13991,6 +14023,7 @@ mod tests {
             csp_phys::PartNode::new(None, csp_phys::PartTransform::IDENTITY, 0),
         );
         CraftDef {
+            part_ids: vec![],
             graph,
             part_costs: vec![0.0],
             parts: vec![csp_phys::WeldPart {
@@ -14150,6 +14183,7 @@ mod tests {
         };
         // Root tough (10 000 K cap), leaf fragile (400 K).
         let craft = CraftDef {
+            part_ids: vec![],
             graph,
             part_costs: vec![0.0; 2],
             parts: vec![mk(10_000.0), mk(400.0)],
@@ -14255,6 +14289,7 @@ mod tests {
         // Node 2 fragile; its healthy child must still fall with it.
         // Zero conduction isolates each lump's heating.
         let craft = CraftDef {
+            part_ids: vec![],
             graph,
             part_costs: vec![0.0; 4],
             parts: vec![
@@ -14333,6 +14368,7 @@ mod tests {
             ),
         );
         let craft = CraftDef {
+            part_ids: vec![],
             graph,
             part_costs: vec![0.0; 3],
             parts: vec![
@@ -14559,6 +14595,7 @@ mod tests {
             thermal,
         };
         CraftDef {
+            part_ids: vec![],
             graph,
             part_costs: vec![0.0; 2],
             parts: vec![engine, payload],
@@ -14687,6 +14724,7 @@ mod tests {
             );
         }
         CraftDef {
+            part_ids: vec![],
             graph,
             part_costs: vec![0.0; chain.len()],
             parts: chain
@@ -19988,6 +20026,7 @@ mod tests {
                 ..exploding.clone()
             };
             let craft = CraftDef {
+                part_ids: vec![],
                 graph,
                 part_costs: vec![0.0; 3],
                 parts: vec![

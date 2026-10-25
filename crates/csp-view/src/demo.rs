@@ -47,7 +47,7 @@ pub(crate) const DEMO_CRAFT_NAME: &str = "Demo Hopper";
 /// `(virtual path, bytes)` — the whole §6.3 reduced set, baked in.
 /// Keys are `DEMO_ROOT`-relative repo paths; the ordering is
 /// cosmetic (`EmbeddedSource` re-keys into a `BTreeMap`).
-static FILES: &[(&str, &[u8])] = &[
+pub(crate) static FILES: &[(&str, &[u8])] = &[
     (
         "data/balance.ron",
         include_bytes!("../../../apps/demo/data/balance.ron"),

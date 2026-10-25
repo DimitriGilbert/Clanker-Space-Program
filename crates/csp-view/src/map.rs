@@ -2164,6 +2164,7 @@ mod tests {
             0,
             SimCommand::SpawnPhysicalVessel {
                 craft: csp_sim::CraftDef {
+                    part_ids: vec![],
                     graph,
                     part_costs: vec![0.0],
                     parts: vec![part],

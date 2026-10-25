@@ -39,10 +39,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use csp_core::{SimError, StateHasher};
-use csp_data::{PartDef, StatPath, TechNodeId, TechTree, UpgradeTrackId, VariantId};
+use csp_data::{PartDef, PartId, StatPath, TechNodeId, TechTree, UpgradeTrackId, VariantId};
 use csp_phys::{BuiltPart, FamilyQualifications, ResolveError, TrackLevels};
 
-use crate::{TickShadow, World};
+use crate::{CraftDef, TickShadow, World};
 
 /// The program's §3.3/§3.4 progression record — serialized on the
 /// snapshot and walked into `state_hash` (§7.2 "tech state";
@@ -216,6 +216,78 @@ impl World {
     /// rebuild it).
     pub fn set_tech_tree(&mut self, tree: TechTree) {
         self.tech_tree = Some(tree);
+    }
+
+    /// The `data/parts/` def table — construction config like
+    /// `experiments` (data-derived, §7.3): handed in via
+    /// [`Self::set_parts`]/`WorldConfig`, never serialized or hashed.
+    /// `CraftDef::part_ids` resolves against it at the spawn/
+    /// manufacture gate — the authored `tech_requirement` lives on
+    /// the def, so the gate checks *data*, never a claimed node.
+    pub fn set_parts(&mut self, parts: BTreeMap<PartId, PartDef>) {
+        self.parts = parts;
+    }
+
+    /// The installed part catalog (construction config).
+    pub fn parts(&self) -> &BTreeMap<PartId, PartDef> {
+        &self.parts
+    }
+
+    /// The authored starting capability — grant every prerequisite-
+    /// free, zero-cost node the installed tree authors (the shipped
+    /// home tree's `tech.start` — "free root — the launch stack").
+    /// A pre-run write like [`Self::found_authored_colonies`]: the
+    /// grant is part of the baseline snapshot and never enters the
+    /// command log. Without it a fresh world would hold `researched
+    /// = {}` and the §3.3 gate would lock the whole launch stack out
+    /// of the catalog it ships as starting equipment. A no-op with
+    /// no tree installed.
+    pub fn grant_free_tech_roots(&mut self) {
+        let Some(tree) = &self.tech_tree else {
+            return;
+        };
+        let roots: Vec<TechNodeId> = tree
+            .nodes
+            .iter()
+            .filter(|n| n.requires.is_empty() && n.science_cost == 0.0)
+            .map(|n| n.id.clone())
+            .collect();
+        for id in roots {
+            self.tech.researched.insert(id);
+        }
+    }
+
+    /// The §3.3 availability gate the spawn and manufacture applies
+    /// share — the `part_costs`/`reliability` shape checks' sibling:
+    /// [`CraftDef::part_ids`] is empty ("identity not recorded" —
+    /// hand-built craft, the empty-table convention) or covers
+    /// `parts` exactly, every id resolves in the installed catalog,
+    /// and — when the world has a tech tree — every def's
+    /// `tech_requirement` is researched. A locked or unknown part is
+    /// a `Recoverable` rejection, never a silent launch. A world
+    /// without a tree runs ungated (no progression data, nothing to
+    /// enforce against — the research commands' own "no tech tree
+    /// installed" refusal precedent).
+    pub(crate) fn check_part_gate(&self, craft: &CraftDef) -> Result<(), SimError> {
+        if craft.part_ids.is_empty() {
+            return Ok(());
+        }
+        if craft.part_ids.len() != craft.parts.len() {
+            return Err(SimError::Recoverable(
+                "part gate: part_ids not parallel to parts",
+            ));
+        }
+        for id in &craft.part_ids {
+            let Some(def) = self.parts.get(id) else {
+                return Err(SimError::Recoverable(
+                    "part gate: part id not in the installed catalog",
+                ));
+            };
+            if self.tech_tree.is_some() && !self.tech.is_part_unlocked(def) {
+                return Err(SimError::Recoverable("part gate: part is tech-locked"));
+            }
+        }
+        Ok(())
     }
 
     /// `ResearchTech` — spend `science.banked` for the node's
@@ -710,6 +782,80 @@ mod tests {
             },
         );
         assert_eq!(b.state_hash().unwrap(), c.state_hash().unwrap());
+    }
+
+    /// The §3.3 spawn/manufacture gate: a craft whose `part_ids`
+    /// carries a catalog part launches only when its
+    /// `tech_requirement` is researched — the `def("tech.tier2")`
+    /// fixture's engine is locked until both tree nodes are.
+    #[test]
+    fn part_gate_enforces_research() {
+        let mut w = World::new();
+        w.set_tech_tree(tree());
+        let d = def("tech.tier2");
+        w.set_parts(std::collections::BTreeMap::from([(
+            d.id.clone(),
+            d.clone(),
+        )]));
+        // The gate resolves identity against the installed catalog —
+        // `parts` only supplies the parallel-table length (a zero-mass
+        // lump is legal weld input).
+        let lump = || csp_phys::WeldPart {
+            mass_kg: 1.0,
+            com: csp_core::DVec3::ZERO,
+            inertia: csp_phys::SymMat3::solid_box(1.0, csp_core::DVec3::new(0.1, 0.1, 0.1)),
+            collider: csp_phys::ColliderShape::Box {
+                half_extents: csp_core::DVec3::new(0.1, 0.1, 0.1),
+            },
+            force_sites: vec![],
+            aero: csp_data::AeroDef::constant(0.0, 0.0, 1.0),
+            thermal: csp_data::ThermalDef {
+                heat_capacity_j_per_k: 1.0,
+                max_temp_k: 1_000.0,
+                emissivity: 0.8,
+                conduction_w_per_k: 0.0,
+            },
+            structural: csp_data::StructuralDef::unlimited(),
+            dock_ports: vec![],
+            tanks: vec![],
+            crew_seats: 0,
+            experiments: vec![],
+            lab: None,
+            engine: None,
+        };
+        let craft = |ids: Vec<PartId>| crate::CraftDef {
+            graph: csp_phys::PartGraph::new(csp_phys::PartNodeId(0)),
+            parts: vec![lump()],
+            part_costs: vec![1.0],
+            reliability: vec![],
+            part_ids: ids,
+        };
+        // Locked: tier2 is unresearched.
+        let err = w.check_part_gate(&craft(vec![d.id.clone()])).unwrap_err();
+        assert!(err.reason().contains("tech-locked"), "{err}");
+        // Unknown ids and shape mismatches refuse too.
+        assert!(w.check_part_gate(&craft(vec!["missing".into()])).is_err(),);
+        assert!(
+            w.check_part_gate(&craft(vec![d.id.clone(), d.id.clone()]))
+                .is_err()
+        );
+        // Empty identity is the ungated convention.
+        let anon = crate::CraftDef {
+            graph: csp_phys::PartGraph::new(csp_phys::PartNodeId(0)),
+            parts: vec![],
+            part_costs: vec![],
+            reliability: vec![],
+            part_ids: vec![],
+        };
+        assert!(w.check_part_gate(&anon).is_ok());
+        // Research the chain — the part unlocks (a direct state write:
+        // the gate reads `tech`, it does not care how it got there).
+        w.tech.researched.insert("tech.tier2".into());
+        assert!(w.check_part_gate(&craft(vec![d.id.clone()])).is_ok());
+        // A tree-less world runs ungated.
+        let mut bare = World::new();
+        bare.set_parts(std::collections::BTreeMap::from([(d.id.clone(), d)]));
+        assert!(bare.check_part_gate(&craft(vec!["test.e".into()])).is_ok());
     }
 
     #[test]

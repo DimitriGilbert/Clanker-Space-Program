@@ -153,6 +153,9 @@ impl crate::World {
                 "manufacture: incoherent reliability table",
             ));
         }
+        // M7-B §3.3: the same availability gate the spawn apply runs —
+        // an un-researched part cannot be ordered, not just launched.
+        self.check_part_gate(&craft)?;
         csp_phys::weld::weld(&craft.graph, &craft.parts)
             .map_err(|_| SimError::Recoverable("manufacture: craft fails the weld gate"))?;
         let mut bom: BTreeMap<ResourceId, f64> = BTreeMap::new();
@@ -418,6 +421,7 @@ mod tests {
             csp_phys::PartNode::new(None, csp_phys::PartTransform::IDENTITY, 0),
         );
         crate::CraftDef {
+            part_ids: vec![],
             graph,
             parts: vec![csp_phys::WeldPart {
                 experiments: Vec::new(),

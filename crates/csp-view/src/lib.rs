@@ -750,6 +750,10 @@ pub enum ViewError {
     Load(csp_data::LoadError),
     /// The loaded body defs did not build a patched-conics model.
     Sim(SimError),
+    /// The loaded `data/` tree failed the §8.2 semantic validator —
+    /// refused loudly at startup rather than shipped silently. Carries
+    /// every failure the sweep found, not just the first.
+    Validation(Vec<csp_data::ValidationError>),
     /// The §6.3 demo's seeded scenario failed to build — the embedded
     /// data set is internally inconsistent (a startup failure like
     /// the others).
@@ -760,10 +764,80 @@ pub enum ViewError {
     Seed(String),
 }
 
+/// `from_source`'s loaded halves — every `data/` file kind the game
+/// consumes, loaded once and §8.2-validated before a byte reaches the
+/// sim. The `ViewError::Validation` refusal lives here so a bad tree
+/// can never be installed silently.
+struct LoadedDataset {
+    system: csp_data::LoadedSystem,
+    balance: csp_data::BalanceDef,
+    experiments: csp_data::LoadedExperiments,
+    techtree: csp_data::LoadedTechTree,
+    sites: csp_data::SiteFile,
+    contracts: csp_data::LoadedContracts,
+    recipes: csp_data::LoadedRecipes,
+    colonies: csp_data::ColonyFile,
+    parts: csp_data::LoadedParts,
+    resources: csp_data::ResourceFile,
+    loc: csp_data::LocFile,
+}
+
+/// §8.2: load the whole `data/` tree and run the semantic validator —
+/// [`ViewError::Validation`] on any failure, carrying every error the
+/// sweep found rather than the first.
+fn load_validated_dataset(
+    src: &dyn csp_data::DataSource,
+    root: &std::path::Path,
+) -> Result<LoadedDataset, ViewError> {
+    let d = LoadedDataset {
+        system: csp_data::load_system_from(src, &root.join("systems").join("home"))?,
+        balance: csp_data::load_balance_from(src, &root.join("balance.ron"))?,
+        experiments: csp_data::load_experiments_from(src, &root.join("experiments"))?,
+        techtree: csp_data::load_techtree_from(src, &root.join("techtree"))?,
+        sites: csp_data::load_sites_from(
+            src,
+            &root.join("systems").join("home").join("sites.ron"),
+        )?,
+        contracts: csp_data::load_contracts_from(src, &root.join("contracts"))?,
+        recipes: csp_data::load_recipes_from(src, &root.join("recipes"))?,
+        colonies: csp_data::load_colonies_from(
+            src,
+            &root.join("systems").join("home").join("colonies.ron"),
+        )?,
+        parts: csp_data::load_parts_from(src, &root.join("parts"))?,
+        resources: csp_data::load_resources_from(src, &root.join("resources.ron"))?,
+        loc: csp_data::load_loc_from(src, &root.join("loc").join("en.ron"))?,
+    };
+    let errors = csp_data::validate_dataset(&csp_data::Dataset {
+        system: &d.system,
+        balance: &d.balance,
+        resources: &d.resources,
+        sites: &d.sites,
+        colonies: &d.colonies,
+        recipes: &d.recipes,
+        experiments: &d.experiments,
+        techtree: &d.techtree,
+        contracts: &d.contracts,
+        parts: &d.parts,
+        loc: &d.loc,
+    });
+    if !errors.is_empty() {
+        return Err(ViewError::Validation(errors));
+    }
+    Ok(d)
+}
+
 impl std::fmt::Display for ViewError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Load(e) => write!(f, "data/ startup load failed: {e}"),
+            Self::Validation(errs) => {
+                write!(f, "data/ failed semantic validation ({}):", errs.len())?;
+                for e in errs.iter().take(10) {
+                    write!(f, " {e}")?;
+                }
+                Ok(())
+            }
             Self::Sim(e) => write!(f, "data/ bodies rejected by the orbit model: {e}"),
             Self::Demo(e) => write!(f, "demo scenario seed failed: {e}"),
             Self::Seed(e) => write!(f, "starter craft seed failed: {e}"),
@@ -801,11 +875,25 @@ impl View {
         src: &dyn csp_data::DataSource,
         root: &std::path::Path,
     ) -> Result<Self, ViewError> {
-        let sys = csp_data::load_system_from(src, &root.join("systems").join("home"))?;
+        // §8.2: load the whole `data/` tree up front and run the
+        // semantic validator BEFORE anything reaches the sim — the
+        // same sweep the data tests run, so an invalid tree refuses
+        // loudly at startup instead of shipping silently (the
+        // loaders' "the validator flags it loudly" docs, made true).
+        let d = load_validated_dataset(src, root)?;
+        let (sys, balance, experiments, techtree, sites, contracts) = (
+            d.system,
+            d.balance,
+            d.experiments,
+            d.techtree,
+            d.sites,
+            d.contracts,
+        );
+        let (recipes, colonies, parts, resources, loc) =
+            (d.recipes, d.colonies, d.parts, d.resources, d.loc);
         let defs: Vec<csp_data::BodyDef> = sys.bodies.iter().map(|b| b.def.clone()).collect();
         let orbits =
             csp_sim::orbit::PatchedConics::from_body_defs(&defs).map_err(ViewError::Sim)?;
-        let balance = csp_data::load_balance_from(src, &root.join("balance.ron"))?;
         // M4c presentation floor: the game world runs the physics
         // bubble over the home planet (same `Environment` convention
         // `csp-bench`'s flight scenarios use).
@@ -848,7 +936,6 @@ impl View {
         // the identical three calls); without them science commands
         // would run on the no-data defaults and reject every run.
         sim.set_science_config(csp_sim::ScienceConfig::from_balance(&balance));
-        let experiments = csp_data::load_experiments_from(src, &root.join("experiments"))?;
         sim.set_experiments(
             experiments
                 .by_id()
@@ -856,9 +943,23 @@ impl View {
                 .map(|(id, def)| (id, def.clone()))
                 .collect(),
         );
-        // M7-B §3.3: the merged tech tree — same data-derived wiring;
-        // without it research commands reject with "no tech tree".
-        sim.set_tech_tree(csp_data::load_techtree_from(src, &root.join("techtree"))?.merged());
+        // M7-B §3.3: the merged tech tree + the part catalog the
+        // `CraftDef::part_ids` gate resolves requirements against —
+        // same data-derived wiring; without them research commands
+        // reject with "no tech tree" and gated parts cannot resolve.
+        sim.set_tech_tree(techtree.merged());
+        sim.set_parts(
+            parts
+                .parts
+                .iter()
+                .map(|p| (p.def.id.clone(), p.def.clone()))
+                .collect(),
+        );
+        // The authored starting capability: every prerequisite-free
+        // zero-cost root (`tech.start` — the launch stack) is
+        // researched in the baseline world, or the gate would lock
+        // out the equipment the program starts with.
+        sim.grant_free_tech_roots();
         // M7-C §3.5: the economy tunables (starting funds, the salary
         // cadence, hire cost, milestone payout, recovery shares) and
         // the system's site table — the same data-derived wiring;
@@ -866,19 +967,23 @@ impl View {
         // and `RecoverVessel` has no sites to name.
         sim.set_economy_config(csp_sim::economy::EconomyConfig::from_balance(&balance))
             .map_err(ViewError::Sim)?;
-        let sites =
-            csp_data::load_sites_from(src, &root.join("systems").join("home").join("sites.ron"))?;
+        // The site's table collects first-wins on a duplicate id —
+        // the `by_id()` convention (`or_insert`), not the `collect`
+        // last-wins it replaced (the validator flags the duplicate
+        // loudly either way; the tie-break just has to be one rule).
         sim.set_sites(
             sites
                 .sites
                 .iter()
-                .map(|s| (s.id.clone(), s.clone()))
-                .collect(),
+                .fold(std::collections::BTreeMap::new(), |mut m, s| {
+                    m.entry(s.id.clone()).or_insert_with(|| s.clone());
+                    m
+                }),
         );
         // M7-D §3.6: the contract template table + the board-size
         // tunable — the same data-derived wiring.
         sim.set_contracts(
-            csp_data::load_contracts_from(src, &root.join("contracts"))?
+            contracts
                 .by_id()
                 .into_iter()
                 .map(|(id, def)| (id, def.clone()))
@@ -899,7 +1004,7 @@ impl View {
         // channel; `FoundColony`'s Converter modules resolve
         // `RecipeId`s against it.
         sim.set_recipes(
-            csp_data::load_recipes_from(src, &root.join("recipes"))?
+            recipes
                 .by_id()
                 .into_iter()
                 .map(|(id, def)| (id, def.clone()))
@@ -911,26 +1016,17 @@ impl View {
         // colony-env, and recipe tables are installed (the apply
         // resolves all three). A missing file reads as an empty set —
         // a system without authored colonies simply starts with none.
-        sim.found_authored_colonies(
-            &csp_data::load_colonies_from(
-                src,
-                &root.join("systems").join("home").join("colonies.ron"),
-            )?
-            .colonies,
-        )
-        .map_err(ViewError::Sim)?;
+        sim.found_authored_colonies(&colonies.colonies)
+            .map_err(ViewError::Sim)?;
         let mut view = Self::with_sim(sim);
         // M3 VAB: the part catalog + resource registry are data-derived
         // constants for the session model (like BodyTable — §7.3's
         // re-derived-on-load class).
-        let parts = csp_data::load_parts_from(src, &root.join("parts"))?;
-        let resources = csp_data::load_resources_from(src, &root.join("resources.ron"))?;
         view.install_vab_catalog(parts, resources);
         // The catalog's display-name half: `PartDef::display_name` is a
         // `LocKey`, so the English table is what lets the palette print
         // "Sparc Launch Engine" instead of the raw part id — same
         // data-derived-constant class as the catalog itself.
-        let loc = csp_data::load_loc_from(src, &root.join("loc").join("en.ron"))?;
         view.with_vab_session(|v| v.set_loc(loc));
         // R2: the authored terrain table (noise seeds, ocean datums,
         // decoded biome palettes) — installed over the empty default.
@@ -1231,6 +1327,9 @@ impl View {
             self.clear_flight_focus_override();
         }
         self.ticks_last_frame = 0;
+        // M7-B §3.3: restage the VAB's progression gate — research
+        // drained this frame flips palette availability next frame.
+        self.stage_vab_tech();
         self.schedules.sync.run(&mut self.world);
         self.schedules.presentation.run(&mut self.world);
         // P04-F3: the recover-control Player-lease transfer issues on
@@ -1758,7 +1857,7 @@ impl View {
                     "craft could not be resolved — is the part catalog loaded?".to_string()
                 })
             })?;
-            let (graph, _built) = session.to_part_graph().map_err(|e| e.to_string())?;
+            let (graph, built) = session.to_part_graph().map_err(|e| e.to_string())?;
             let parts: Vec<csp_phys::WeldPart> = analysis
                 .effective
                 .iter()
@@ -1773,17 +1872,37 @@ impl View {
                 .iter()
                 .map(csp_phys::ReliabilitySpec::from_effective)
                 .collect();
+            // M7-B §3.3: part identity rides the craft — `built[i]` is
+            // positionally bound to `effective_index` like `parts`, so
+            // the spawn gate can resolve each def's `tech_requirement`.
+            let part_ids: Vec<csp_data::PartId> = built.iter().map(|b| b.part_id.clone()).collect();
             Ok(csp_sim::CraftDef {
                 graph,
                 parts,
                 part_costs,
                 reliability,
+                part_ids,
             })
         })();
         let craft = match craft_def {
             Ok(c) => c,
             Err(reason) => return Err(self.launch_refused(reason)),
         };
+        // M7-B pre-flight: refuse an un-researched part BEFORE the mode
+        // switch — a craft file can carry parts the palette would never
+        // offer, and the sim apply re-checks identically at drain.
+        if self.sim.tech_tree().is_some() {
+            for id in &craft.part_ids {
+                if let Some(def) = self.sim.parts().get(id)
+                    && !self.sim.tech().is_part_unlocked(def)
+                {
+                    return Err(self.launch_refused(format!(
+                        "{id} is tech-locked — requires {}",
+                        def.tech_requirement
+                    )));
+                }
+            }
+        }
         let Some(env) = self.sim.environment().cloned() else {
             return Err(self.launch_refused("no system is loaded"));
         };
@@ -2099,6 +2218,27 @@ impl View {
             .resource_mut::<vab::VabSessionRes>()
             .0
             .set_catalog(parts, resources);
+        self.stage_vab_tech();
+    }
+
+    /// Push the sim's live §3.3 progression state into the VAB
+    /// session — the palette's unlock gate + the placement-time
+    /// upgrade freeze read it. `None` when the world has no tech
+    /// tree (an ungated editor, like a catalog-less one).
+    fn stage_vab_tech(&mut self) {
+        let tech = self
+            .sim
+            .tech_tree()
+            .cloned()
+            .map(|tree| csp_ui::vab::VabTech {
+                tree,
+                researched: self.sim.tech().researched.clone(),
+                track_levels: self.sim.tech().track_levels.clone(),
+            });
+        self.world
+            .resource_mut::<vab::VabSessionRes>()
+            .0
+            .set_tech(tech);
     }
 
     /// The craft-file name list the save/load UI shows — plumbed by
@@ -2262,6 +2402,7 @@ fn stock_flight_craft() -> csp_sim::CraftDef {
         ),
     );
     csp_sim::CraftDef {
+        part_ids: vec![],
         graph,
         parts: vec![engine, adapter, tank, pod],
         // M7-C: the stock craft's authored build cost — a modest
@@ -2271,6 +2412,47 @@ fn stock_flight_craft() -> csp_sim::CraftDef {
         // M9b: hand-authored debug craft — no reliability model
         // (the empty-table convention).
         reliability: vec![],
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod startup_tests {
+    use super::*;
+
+    /// §8.2 wired: a loadable-but-invalid `data/` tree is refused
+    /// loudly at startup — a duplicate site id loads fine but the
+    /// validator flags it, and `from_source` now runs that sweep
+    /// before installing anything.
+    #[test]
+    fn from_source_refuses_invalid_data() {
+        const BAD_SITES: &[u8] = br#"(
+            schema_version: 2,
+            sites: [
+                (schema_version: 2, id: "dup", display_name: "s.dup",
+                 body: "terrin", latitude_rad: 0.0, longitude_rad: 0.0,
+                 altitude_m: 0.0, launch: true, resource_yields: []),
+                (schema_version: 2, id: "dup", display_name: "s.dup",
+                 body: "terrin", latitude_rad: 0.1, longitude_rad: 0.0,
+                 altitude_m: 0.0, launch: false, resource_yields: []),
+            ],
+        )"#;
+        let mut files: Vec<(&'static str, &'static [u8])> = crate::demo::FILES.to_vec();
+        files.retain(|(p, _)| *p != "data/systems/home/sites.ron");
+        files.push(("data/systems/home/sites.ron", BAD_SITES));
+        let src = csp_data::EmbeddedSource::new(Box::leak(files.into_boxed_slice()));
+        match View::from_source(&src, std::path::Path::new("data")) {
+            Err(ViewError::Validation(errs)) => {
+                assert!(
+                    errs.iter()
+                        .any(|e| { matches!(e, csp_data::ValidationError::InvalidSite { .. }) })
+                );
+            }
+            other => panic!(
+                "expected Validation, got {}",
+                other.map(|_| "Ok").unwrap_or_else(|e| e.to_string().leak())
+            ),
+        }
     }
 }
 

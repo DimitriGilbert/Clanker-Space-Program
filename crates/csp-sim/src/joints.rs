@@ -923,6 +923,19 @@ pub(crate) fn apply_latch(
     } else {
         Vec::new()
     };
+    // M7-B: the identity table merges by the same rule — both halves
+    // must carry a table covering their own `parts` for the merged
+    // positions to bind (the reliability table's precedent); either
+    // half anonymous drops the record, never a wrong binding.
+    let part_ids_m = if crate::reliability::part_ids_parallel(&craft_p)
+        && crate::reliability::part_ids_parallel(&craft_s)
+    {
+        let mut t = craft_p.part_ids.clone();
+        t.extend(craft_s.part_ids.iter().cloned());
+        t
+    } else {
+        Vec::new()
+    };
     let mut body_m =
         csp_phys::weld(&merge.graph, &parts_m).map_err(|e| SimError::Fatal(e.reason()))?;
     // §2.9's hand-off: the merged body keeps the primary's pose and
@@ -1058,6 +1071,7 @@ pub(crate) fn apply_latch(
             parts: parts_m.clone(),
             part_costs: part_costs_m.clone(),
             reliability: reliability_table_m.clone(),
+            part_ids: part_ids_m.clone(),
         };
         body_m.aero = Some(Box::new(
             csp_phys::aero::build_aero_tables(
@@ -1080,6 +1094,7 @@ pub(crate) fn apply_latch(
             parts: parts_m,
             part_costs: part_costs_m,
             reliability: reliability_table_m,
+            part_ids: part_ids_m,
         });
         v.state = VesselState::InBubble(body_m);
         v.seams = seams;

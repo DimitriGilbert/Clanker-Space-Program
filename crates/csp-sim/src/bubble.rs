@@ -23,7 +23,7 @@
 use std::collections::BTreeMap;
 
 use csp_core::{DQuat, DVec3, SimTime, StableDiscriminant, TICK_HZ};
-use csp_data::BodyId;
+use csp_data::{BodyId, PartId};
 use csp_phys::{Environment, PartGraph, PartNodeId, WeldPart, WeldedBody};
 use serde::{Deserialize, Serialize};
 
@@ -99,6 +99,31 @@ pub struct CraftDef {
     /// table must cover `parts` exactly (the `part_costs` spawn
     /// gate).
     pub reliability: Vec<csp_phys::ReliabilitySpec>,
+    /// M7-B §3.3: each part's catalog identity — the `PartId` whose
+    /// `PartDef` authored it, parallel to `parts`/`part_costs`/
+    /// `reliability` (the same `effective_index` convention, frozen
+    /// at build). This is what lets the spawn/manufacture gate
+    /// enforce `tech_requirement`: the apply resolves each id
+    /// against the world's installed part catalog and refuses the
+    /// craft when the world has a tech tree and the def's node is
+    /// unresearched — a locked part is a rejected build, never a
+    /// silent launch.
+    ///
+    /// An EMPTY table is legal and means "identity not recorded"
+    /// (hand-built test craft, pre-gate saves, debug craft) — the
+    /// gate is a no-op on it, the same convention the reliability
+    /// table uses for "no model". A non-empty table must cover
+    /// `parts` exactly.
+    ///
+    /// Serialized but **not hashed**: post-apply it is inert
+    /// gate/build metadata — nothing reads it after the spawn
+    /// check (re-welds consume `parts`, payouts consume
+    /// `part_costs`), so two worlds differing only here evolve
+    /// bit-identically. The gate's verdict itself is deterministic:
+    /// the id table rides the logged command and resolves against
+    /// construction-config catalog + hashed `TechState` at drain.
+    #[serde(default)]
+    pub part_ids: Vec<PartId>,
 }
 
 /// Where a vessel lives (§2.4/§2.6.2): on rails, physics-resident in

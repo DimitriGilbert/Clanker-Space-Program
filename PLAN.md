@@ -493,9 +493,14 @@ Without this rule, measured frame time feeds sim state and T1 replay is broken f
 ever demoted — on a slower machine the same log produces a different world.
 
 Demotion rule, numerically: warp level is the largest `k` in the allowed ladder such that
-`measured_step_ms * TICK_HZ * k < budget_fraction * frame_budget_ms`, with `budget_fraction`
-defaulting to 0.5, and **hysteresis of 1.5×** (promote only when the inequality holds with 1.5×
-margin for 30 consecutive frames) to prevent oscillation.
+`measured_step_ms * TICK_HZ * k / FPS < budget_fraction * frame_budget_ms`, with `budget_fraction`
+defaulting to 0.5 and `FPS = 60` (so `frame_budget_ms = 1000/60 ≈ 16.67`). Both sides are per-frame:
+at multiplier `k` the sim executes `TICK_HZ * k` ticks per wall-second, i.e. `TICK_HZ * k / 60`
+ticks per 60 fps frame, so the left side is the per-frame sim-stepping cost and the right side is
+the sim's share of the frame budget. (An earlier reading compared ms-per-second against
+ms-per-frame — a 60× unit error that made promotion past ×1 unreachable on real scenes.)
+**Hysteresis of 1.5×** (promote only when the inequality holds with 1.5×
+margin for 30 consecutive frames) prevents oscillation.
 
 #### 2.6.4 Surface rails — landed vessels must not block warp
 

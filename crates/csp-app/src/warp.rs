@@ -35,8 +35,10 @@ pub const WARP_LADDER: [u64; 7] = [1, 2, 10, 100, 1_000, 10_000, 100_000];
 /// §2.6.3: `budget_fraction` — the share of the frame budget sim stepping
 /// may consume before the controller derates.
 const BUDGET_FRACTION: f64 = 0.5;
+/// The reference frame rate the budget is written against (60 fps).
+const FRAME_RATE_FPS: f64 = 60.0;
 /// Reference frame budget for the §2.6.3 inequality (60 fps).
-const FRAME_BUDGET_MS: f64 = 1000.0 / 60.0;
+const FRAME_BUDGET_MS: f64 = 1000.0 / FRAME_RATE_FPS;
 /// §2.6.3 hysteresis: promotion requires the inequality to hold with this
 /// margin…
 const PROMOTE_MARGIN: f64 = 1.5;
@@ -136,13 +138,18 @@ impl WarpController {
     }
 
     /// The §2.6.3 inequality at rung `idx`, optionally `margin`-scaled for
-    /// the promotion side: `per_tick_ms × TICK_HZ × multiplier × margin <
+    /// the promotion side: `per_tick_ms × ticks_per_frame × margin <
     /// BUDGET_FRACTION × FRAME_BUDGET_MS`. `measured_step_ms` is per-tick
-    /// step cost, so the left side extrapolates one measured tick to a
-    /// rung's full per-second sim load.
+    /// step cost, and at multiplier `k` the sim executes `TICK_HZ × k`
+    /// ticks per wall-second — `TICK_HZ × k / FRAME_RATE_FPS` per frame —
+    /// so the left side is the per-frame sim-stepping cost the
+    /// `BUDGET_FRACTION` share of the frame budget must cover.
+    /// (The pre-fix form compared ms-per-second against ms-per-frame —
+    /// a 60× unit error that made promotion past ×1 unreachable on any
+    /// real scene.)
     fn affordable(&self, idx: usize, margin: f64) -> bool {
-        self.measured_step_ms * TICK_HZ as f64 * WARP_LADDER[idx] as f64 * margin
-            < BUDGET_FRACTION * FRAME_BUDGET_MS
+        let ticks_per_frame = TICK_HZ as f64 * WARP_LADDER[idx] as f64 / FRAME_RATE_FPS;
+        self.measured_step_ms * ticks_per_frame * margin < BUDGET_FRACTION * FRAME_BUDGET_MS
     }
 
     /// Largest rung `≤ requested` satisfying [`Self::affordable`] — 0 when
@@ -351,6 +358,10 @@ mod tests {
 
     /// §2.6.3 demotion: a huge measured step cost collapses the allowed
     /// ladder to ×1, and recovery waits out the margined 30-frame window.
+    /// Inputs are honest scene costs — the pre-fix tests passed only
+    /// because they fed values 1000× too small (5 ns mislabeled as µs):
+    /// at the corrected per-frame inequality a heavy scene legitimately
+    /// derates and a real one re-promotes to a real rung.
     #[test]
     fn derate_demotes_and_recovers() {
         let mut c = WarpController::new();
@@ -359,17 +370,49 @@ mod tests {
             c.decide();
         }
         assert_eq!(c.multiplier(), 100_000);
-        // A stall: measured step cost blows the budget at every rung.
-        c.observe(1.0, 0.016);
+        // A stall: 8 ms/tick misses the budget even at ×1
+        // (8 × 64 / 60 = 8.53 > 8.33 ms/frame) — every rung derates.
+        c.observe(8.0, 0.016);
         assert_eq!(c.decide(), Some(1)); // immediate demotion
         assert_eq!(c.multiplier(), 1);
-        // Cost returns to normal — promotion still waits the window.
-        c.observe(0.0, 0.016);
+        // Cost returns to a real scene's: 0.672 ms/tick is the committed
+        // 200-part-atmo reference number (perf-log-devbox-release.ron) —
+        // promotion still waits the window, and the margined ceiling at
+        // that cost is ×2, not the requested ×10⁵.
+        c.observe(0.6719, 0.016);
         assert_eq!(c.decide(), None);
         for _ in 0..PROMOTE_FRAMES {
             c.decide();
         }
-        assert_eq!(c.multiplier(), 100_000);
+        assert_eq!(c.multiplier(), 2);
+    }
+
+    /// The §2.6.3 inequality against the committed perf log
+    /// (`docs/perf/perf-log-devbox-release.ron`): the 200-part-atmo
+    /// scene promotes to ×2 physics warp, the cheap 500-rails map
+    /// scene reaches ×10, and the 1000-part-orbit station correctly
+    /// stays at ×1. Pre-fix all three were locked at ×1 — promotion
+    /// needed ≤43 µs/tick against real scenes costing 0.15–4.6 ms.
+    #[test]
+    fn reference_scenes_reach_real_rungs() {
+        let promote_to = |per_tick_ms: f64, request: i32| -> u64 {
+            let mut c = WarpController::new();
+            c.request_step(request);
+            c.observe(per_tick_ms, 1.0 / 60.0);
+            for _ in 0..=PROMOTE_FRAMES {
+                c.decide();
+            }
+            c.multiplier()
+        };
+        // sim.200-part-atmo = 0.6719 ms/tick → ×2 (the ×10 rung fails
+        // the 1.5× promotion margin: 10.75 > 8.33 ms/frame).
+        assert_eq!(promote_to(0.6719, 6), 2);
+        // sim.map-500-rails = 0.145 ms/tick → ×10 (margined ×10 is
+        // 2.32 ms/frame; margined ×100 would be 23.2 — denied).
+        assert_eq!(promote_to(0.145, 6), 10);
+        // sim.1000-part-orbit = 4.6344 ms/tick → stays ×1 (even ×2
+        // costs 9.9 ms/frame unmargined).
+        assert_eq!(promote_to(4.6344, 6), 1);
     }
 
     /// §2.6.3's hysteresis binds the streak to ONE candidate rung: a
@@ -381,21 +424,24 @@ mod tests {
         let mut c = WarpController::new();
         c.request_step(6); // request the ×10⁵ ceiling
         c.decide();
-        // Alternate the margined ceiling between rung 5 (×10⁴, at a
-        // per-tick cost of 5µs) and rung 4 (×10³, at 50µs): neither holds
-        // for 30 consecutive frames, so nothing promotes.
+        // Alternate the margined ceiling between rung 4 (×10³, at a
+        // per-tick cost of 5 µs = 5e-3 ms) and rung 3 (×10², at 50 µs):
+        // neither holds for 30 consecutive frames, so nothing promotes.
+        // (The pre-fix test fed 5e-6/5e-5 ms — 5/50 ns mislabeled as µs,
+        // 1000× too small; at honest µs values the alternating ceiling
+        // is ×10³↔×10² under the corrected per-frame inequality.)
         for i in 0..80 {
-            let per_tick_ms = if i % 2 == 0 { 5e-6 } else { 5e-5 };
+            let per_tick_ms = if i % 2 == 0 { 5e-3 } else { 5e-2 };
             c.observe(per_tick_ms, 0.016);
             c.decide();
         }
         assert_eq!(c.multiplier(), 1);
-        // Hold the ×10⁴ candidate steady — it engages after the window.
-        c.observe(5e-6, 0.016);
+        // Hold the ×10³ candidate steady — it engages after the window.
+        c.observe(5e-3, 0.016);
         for _ in 0..PROMOTE_FRAMES {
             c.decide();
         }
-        assert_eq!(c.multiplier(), 10_000);
+        assert_eq!(c.multiplier(), 1_000);
     }
 
     /// §2.5/§2.6.3 target math: integer accumulation — 60 frames of

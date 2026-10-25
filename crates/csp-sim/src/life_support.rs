@@ -455,6 +455,7 @@ mod tests {
             PartNode::new(None, PartTransform::IDENTITY, 0),
         );
         crate::CraftDef {
+            part_ids: vec![],
             graph,
             parts: vec![csp_phys::WeldPart {
                 experiments: Vec::new(),

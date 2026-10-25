@@ -680,6 +680,13 @@ pub(crate) fn specs_parallel(craft: &crate::CraftDef) -> bool {
     craft.reliability.len() == craft.parts.len()
 }
 
+/// The M7-B twin of [`specs_parallel`]: the `part_ids` identity
+/// table covers `parts` exactly — the merge/split sites consult it
+/// before carrying a positional table across a reindexed graph.
+pub(crate) fn part_ids_parallel(craft: &crate::CraftDef) -> bool {
+    craft.part_ids.len() == craft.parts.len()
+}
+
 impl World {
     /// The reliability tunables — construction config (`balance.ron`
     /// in real worlds; [`default_config`] otherwise).

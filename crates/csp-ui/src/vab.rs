@@ -296,6 +296,14 @@ pub enum VabError {
     /// Craft-file import is disabled for this session — the §6.3
     /// demo's no-save rule (`VabAction::LoadBytes` is refused).
     FileIoDisabled,
+    /// §3.3: the op named a catalog part whose `tech_requirement` is
+    /// not researched — placement refuses, never silently downgrades.
+    PartLocked {
+        /// The tech-locked part.
+        part: PartId,
+        /// The node that would unlock it.
+        node: csp_data::TechNodeId,
+    },
 }
 
 impl fmt::Display for VabError {
@@ -318,11 +326,31 @@ impl fmt::Display for VabError {
             Self::FileIoDisabled => {
                 write!(f, "craft file import/export is disabled in the web demo")
             }
+            Self::PartLocked { part, node } => {
+                write!(f, "part '{part}' is tech-locked — requires {node}")
+            }
         }
     }
 }
 
 impl std::error::Error for VabError {}
+
+/// The §3.3 progression state the editor gates placement on — staged
+/// by the host (csp-view) from the sim's `TechState` + installed
+/// tree. `None` on the session means "no progression data" — an
+/// ungated editor (headless fixtures, tree-less worlds).
+#[derive(Clone, Debug)]
+pub struct VabTech {
+    /// The merged tech tree — track lookups for the placement-time
+    /// upgrade freeze (`BuiltPart::upgrade_levels_at_build`).
+    pub tree: csp_data::TechTree,
+    /// The researched node set — `PartDef::tech_requirement`
+    /// membership here is the whole availability gate.
+    pub researched: std::collections::BTreeSet<csp_data::TechNodeId>,
+    /// Purchased upgrade-track levels — composed into
+    /// `upgrade_levels_at_build` when a catalog part is placed.
+    pub track_levels: std::collections::BTreeMap<csp_data::UpgradeTrackId, u8>,
+}
 
 /// The VAB working session — see the module doc. `Default` is an empty
 /// session with no catalog (the headless state; the panel reports
@@ -408,6 +436,10 @@ pub struct VabSession {
     /// §6.3's no-save rule — `false` refuses `VabAction::LoadBytes` and
     /// hides the panel's save/load row. `true` is the desktop default.
     file_io: bool,
+    /// The §3.3 progression state — staged by the host each frame
+    /// (`View::stage_vab_tech`). `None` = no progression data: the
+    /// palette and placement gates are off, upgrades compose empty.
+    tech: Option<VabTech>,
     /// Craft-generation counter — bumped by `VabAction::New` and a
     /// successful `LoadBytes`. The 3D view watches it so the camera's
     /// one-shot fit re-arms on a craft that is not the one it framed
@@ -445,6 +477,7 @@ impl Default for VabSession {
             save_name: String::new(),
             part_limit: None,
             file_io: true,
+            tech: None,
             craft_epoch: 0,
         }
     }
@@ -700,6 +733,24 @@ impl VabSession {
         self.part_limit
     }
 
+    /// Stage the §3.3 progression state — the host pushes the sim's
+    /// `TechState` + tree each frame so the palette dims tech-locked
+    /// parts and placements freeze the purchased upgrade levels.
+    /// `None` disables the gate (no tree installed).
+    pub fn set_tech(&mut self, tech: Option<VabTech>) {
+        self.tech = tech;
+    }
+
+    /// The §3.3 availability gate: `true` when `def`'s
+    /// `tech_requirement` is researched — always `true` when the
+    /// session carries no progression data (the empty-gate
+    /// convention, like a missing catalog's honest-empty palette).
+    pub fn part_unlocked(&self, def: &PartDef) -> bool {
+        self.tech
+            .as_ref()
+            .is_none_or(|t| t.researched.contains(&def.tech_requirement))
+    }
+
     /// Enable/disable craft-file import/export — §6.3's "no save" rule.
     /// `false` refuses [`VabAction::LoadBytes`] and hides the panel's
     /// file row (the app additionally drops save/load outbox requests).
@@ -908,8 +959,17 @@ impl VabSession {
         // Refuse to arm a part the catalog doesn't carry — arming a
         // bad id would park the editor in a state whose only exits
         // are cancel and a guaranteed-failing attach.
-        self.def_by_id(part)
+        let def = self
+            .def_by_id(part)
             .ok_or(VabError::PartNotInCatalog { part: part.clone() })?;
+        // §3.3: a tech-locked part refuses to arm — the palette row
+        // is dimmed, but the op path gates identically.
+        if !self.part_unlocked(def) {
+            return Err(VabError::PartLocked {
+                part: part.clone(),
+                node: def.tech_requirement.clone(),
+            });
+        }
         // Re-clicking the armed row puts the part back — a click that
         // resolves to nothing must still do something honest.
         if self.pending_part.as_ref() == Some(part) && self.drag_part.is_none() {
@@ -1076,6 +1136,17 @@ impl VabSession {
     fn place_at_hover(&mut self, part: &PartId) -> Result<Option<String>, VabError> {
         if self.catalog.is_none() {
             return Err(VabError::NoCatalog);
+        }
+        // §3.3: same gate as `catalog_pick` — the headless/drag-drop
+        // path cannot arm a tech-locked part either.
+        let def = self
+            .def_by_id(part)
+            .ok_or(VabError::PartNotInCatalog { part: part.clone() })?;
+        if !self.part_unlocked(def) {
+            return Err(VabError::PartLocked {
+                part: part.clone(),
+                node: def.tech_requirement.clone(),
+            });
         }
         self.pending_part = Some(part.clone());
         self.drop_carried()
@@ -1556,17 +1627,39 @@ impl VabSession {
     }
 
     /// The stock `BuiltPart` for a catalog id — `variants[0]` is the
-    /// authored baseline (validator: non-empty).
+    /// authored baseline (validator: non-empty). §3.3: a tech-locked
+    /// part refuses (`PartLocked`) and purchased upgrade tracks freeze
+    /// into `upgrade_levels_at_build` at build, exactly like the
+    /// sim-side `TechState::build_part` manufacture helper.
     fn stock_build(&self, part_id: &PartId) -> Result<BuiltPart, VabError> {
         let def = self.def_by_id(part_id).ok_or(VabError::PartNotInCatalog {
             part: part_id.clone(),
         })?;
+        if !self.part_unlocked(def) {
+            return Err(VabError::PartLocked {
+                part: part_id.clone(),
+                node: def.tech_requirement.clone(),
+            });
+        }
         let variant = def
             .variants
             .first()
             .map(|v| v.id.clone())
             .unwrap_or_else(|| VariantId::from("stock"));
-        Ok(BuiltPart::stock(part_id.clone(), variant))
+        let mut built = BuiltPart::stock(part_id.clone(), variant);
+        if let Some(tech) = &self.tech {
+            // The family's purchased levels freeze at build — a
+            // compose failure on a stale/crafted track map degrades
+            // to stock, never blocks a legal placement.
+            built.upgrade_levels_at_build = csp_phys::compose_upgrade_levels(
+                def,
+                tech.tree
+                    .tracks_for_family(&def.family)
+                    .map(|t| (t, tech.track_levels.get(&t.id).copied().unwrap_or(0))),
+            )
+            .unwrap_or_default();
+        }
+        Ok(built)
     }
 
     /// The stock build resolved — the catalog part's shape and stats
@@ -2108,6 +2201,10 @@ struct PaletteRow {
     cat: csp_data::PartCategory,
     /// The `(z, radius)` side profile the thumbnail draws.
     profile: Vec<(f64, f64)>,
+    /// §3.3: `Some(node)` when the part's `tech_requirement` is not
+    /// researched — the row draws dimmed with a "not researched"
+    /// tag and cannot arm a placement.
+    locked: Option<String>,
 }
 
 /// A one-line summary of what a part IS and DOES — the catalog's
@@ -2317,6 +2414,8 @@ fn palette_panel(ctx: &egui::Context, vab: &mut VabSession) -> egui::Rect {
                                     blurb: part_blurb(&p.def),
                                     cat: *cat,
                                     profile: def_profile(&p.def),
+                                    locked: (!vab.part_unlocked(&p.def))
+                                        .then(|| p.def.tech_requirement.as_str().to_string()),
                                 })
                                 .collect();
                             (!rows.is_empty()).then_some((cat.name(), rows))
@@ -2377,7 +2476,18 @@ fn palette_row(ui: &mut egui::Ui, vab: &mut VabSession, row: &PaletteRow, armed:
         egui::vec2(ui.available_width().max(120.0), 42.0),
         egui::Sense::click_and_drag(),
     );
-    let tint = category_tint(row.cat);
+    let locked = row.locked.is_some();
+    let tint = if locked {
+        // §3.3: locked rows draw dimmed — visible but unavailable.
+        let c = category_tint(row.cat);
+        egui::Color32::from_rgb(
+            (u32::from(c.r()) * 55 / 255) as u8,
+            (u32::from(c.g()) * 55 / 255) as u8,
+            (u32::from(c.b()) * 55 / 255) as u8,
+        )
+    } else {
+        category_tint(row.cat)
+    };
     // Row chrome: armed rows light up; hovered rows lift.
     let fill = if armed {
         egui::Color32::from_rgb(60, 90, 60)
@@ -2389,20 +2499,45 @@ fn palette_row(ui: &mut egui::Ui, vab: &mut VabSession, row: &PaletteRow, armed:
     ui.painter().rect_filled(rect, 4.0, fill);
     let icon_rect = egui::Rect::from_min_size(rect.min, egui::vec2(30.0, rect.height()));
     paint_part_icon(ui, icon_rect.shrink(1.0), &row.profile, tint);
+    let name_col = if locked {
+        ui.visuals().weak_text_color()
+    } else {
+        ui.visuals().text_color()
+    };
     ui.painter().text(
         egui::pos2(rect.min.x + 36.0, rect.min.y + 8.0),
         egui::Align2::LEFT_TOP,
         &row.name,
         egui::FontId::proportional(13.5),
-        ui.visuals().text_color(),
+        name_col,
     );
+    let blurb = row
+        .locked
+        .as_ref()
+        .map(|n| format!("not researched — requires {n}"))
+        .unwrap_or_else(|| row.blurb.clone());
     ui.painter().text(
         egui::pos2(rect.min.x + 36.0, rect.min.y + 24.0),
         egui::Align2::LEFT_TOP,
-        &row.blurb,
+        &blurb,
         egui::FontId::proportional(11.0),
         ui.visuals().weak_text_color(),
     );
+    if let Some(node) = &row.locked {
+        resp.clone().on_hover_text(format!(
+            "{} — not researched (requires {node})",
+            row.id.as_str()
+        ));
+        // A locked row cannot arm — a click explains, a drag does
+        // nothing (the op path refuses identically).
+        if resp.clicked() {
+            vab.set_notice(Some(format!(
+                "{} is tech-locked — requires {node}",
+                row.name
+            )));
+        }
+        return;
+    }
     resp.clone()
         .on_hover_text(format!("{} — click or drag to {verb}", row.id.as_str()));
     if resp.clicked() {

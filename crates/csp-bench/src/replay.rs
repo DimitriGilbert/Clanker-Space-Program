@@ -749,6 +749,10 @@ pub fn replay(artifact: &Replay) -> Result<[u8; 32], ReplayError> {
     // run's `FoundColony`/`ManufactureCraft` resolves `RecipeId`s
     // against it.
     world.set_recipes(artifact.config.recipes.clone());
+    // M7-B §3.3: the part catalog the `CraftDef::part_ids` gate
+    // resolves `tech_requirement`s against — the recorded world's
+    // construction config, re-installed like the tables above.
+    world.set_parts(artifact.config.parts.clone());
     // M9a §2.10: the script host + autopilot driver are the same
     // construction-config channel — a recorded run whose snapshot
     // carried scripts/autopilots replays their `on_tick` calls; the

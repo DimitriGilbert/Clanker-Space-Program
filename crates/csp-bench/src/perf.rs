@@ -562,6 +562,7 @@ fn tower_craft(n: u32, engine: bool) -> csp_sim::CraftDef {
         parts.push(part);
     }
     csp_sim::CraftDef {
+        part_ids: vec![],
         graph,
         parts,
         part_costs: vec![1_000.0; n as usize],

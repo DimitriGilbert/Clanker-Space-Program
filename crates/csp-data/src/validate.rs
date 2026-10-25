@@ -3894,6 +3894,77 @@ pub fn validate_contract_loc_keys(
     out
 }
 
+/// The whole `data/` tree as the loaders hand it back — one field per
+/// file kind, the [`validate_dataset`] input. Borrowed, never owned:
+/// the caller loads once and hands the sweep views.
+#[derive(Clone, Copy, Debug)]
+pub struct Dataset<'a> {
+    /// `data/systems/home/` (manifest + bodies + biomes).
+    pub system: &'a crate::load::LoadedSystem,
+    /// `data/balance.ron`.
+    pub balance: &'a crate::balance::BalanceDef,
+    /// `data/resources.ron`.
+    pub resources: &'a ResourceFile,
+    /// `data/systems/home/sites.ron`.
+    pub sites: &'a SiteFile,
+    /// `data/systems/home/colonies.ron`.
+    pub colonies: &'a crate::colony::ColonyFile,
+    /// `data/recipes/`.
+    pub recipes: &'a crate::load::LoadedRecipes,
+    /// `data/experiments/`.
+    pub experiments: &'a crate::load::LoadedExperiments,
+    /// `data/techtree/`.
+    pub techtree: &'a crate::load::LoadedTechTree,
+    /// `data/contracts/`.
+    pub contracts: &'a crate::load::LoadedContracts,
+    /// `data/parts/`.
+    pub parts: &'a LoadedParts,
+    /// `data/loc/en.ron`.
+    pub loc: &'a LocFile,
+}
+
+/// The §8.2 semantic gate over a fully loaded `data/` tree — the same
+/// sweep the data tests run, callable from production startup so a
+/// bad tree is refused loudly instead of shipping silently. Returns
+/// every failure across every file kind, never just the first.
+pub fn validate_dataset(d: &Dataset<'_>) -> Vec<ValidationError> {
+    let mut out = Vec::new();
+    out.extend(validate_system(d.system));
+    out.extend(validate_resources(d.resources));
+    out.extend(validate_parts(
+        d.parts,
+        d.resources,
+        d.recipes,
+        d.experiments,
+    ));
+    out.extend(validate_sites(d.sites, d.system, d.resources));
+    out.extend(validate_experiments(d.experiments, d.system));
+    out.extend(validate_techtree(d.techtree, d.parts));
+    out.extend(validate_contracts(
+        d.contracts,
+        d.system,
+        d.experiments,
+        d.techtree,
+        d.resources,
+    ));
+    out.extend(validate_recipes(d.recipes, d.resources));
+    out.extend(validate_balance(d.balance, d.resources));
+    out.extend(validate_colonies(
+        d.colonies,
+        d.sites,
+        d.resources,
+        d.recipes,
+    ));
+    out.extend(validate_loc(d.loc));
+    out.extend(validate_loc_keys(d.system, d.loc));
+    out.extend(validate_site_loc_keys(d.sites, d.loc));
+    out.extend(validate_part_loc_keys(d.parts, d.resources, d.loc));
+    out.extend(validate_experiment_loc_keys(d.experiments, d.loc));
+    out.extend(validate_techtree_loc_keys(d.techtree, d.loc));
+    out.extend(validate_contract_loc_keys(d.contracts, d.loc));
+    out
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
