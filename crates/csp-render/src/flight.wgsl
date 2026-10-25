@@ -24,6 +24,24 @@ struct Light {
 
 @group(0) @binding(0) var<uniform> light: Light;
 
+// ACES filmic fit (Narkowicz) — the same curve the terrain pass
+// applies, so the lit hull shares the surface's highlight rolloff and
+// doesn't read over-bright next to the tonemapped ground. Unlit
+// streams (sky quads, plumes, dust, accents) return raw: their colors
+// are authored emissive, not lit material.
+fn tone_map(c: vec3<f32>) -> vec3<f32> {
+    let a = 2.51;
+    let b = 0.03;
+    let d = 2.43;
+    let e = 0.59;
+    let f = 0.14;
+    return clamp(
+        (c * (a * c + vec3<f32>(b))) / (c * (d * c + vec3<f32>(e)) + vec3<f32>(f)),
+        vec3<f32>(0.0),
+        vec3<f32>(1.0),
+    );
+}
+
 struct Vin {
     @location(0) pos: vec3<f32>,
     @location(1) world: vec3<f32>,
@@ -82,5 +100,5 @@ fn fs_main(i: Vout) -> @location(0) vec4<f32> {
     // silhouette from the backdrop.
     let fres = pow(clamp(1.0 - dot(n, v), 0.0, 1.0), 3.0) * light.hemi.w * i.mat.z;
     rgb += light.amb_up.rgb * fres;
-    return vec4<f32>(rgb, i.color.a);
+    return vec4<f32>(tone_map(rgb), i.color.a);
 }

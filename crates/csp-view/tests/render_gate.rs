@@ -536,6 +536,344 @@ fn dump_sky() {
 /// Run explicitly: `cargo test -p csp-view --test render_gate dump -- --ignored`.
 #[test]
 #[ignore]
+fn dump_low() {
+    let Some((device, queue)) = headless_device() else {
+        return;
+    };
+    let yaw: f64 = std::env::var("DUMP_YAW")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.7);
+    let pitch: f64 = std::env::var("DUMP_PITCH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1.2);
+    let dist: f64 = std::env::var("DUMP_DIST")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(710.0);
+    let mut view = View::new().unwrap();
+    view.seed_starter_craft().unwrap();
+    view.set_flight_viewport(320.0, 240.0);
+    {
+        let mut input = view.world.resource_mut::<csp_view::flight::FlightInput>();
+        input.distance_m = dist;
+        input.pitch = pitch;
+        input.yaw = yaw;
+    }
+    for _ in 0..3 {
+        frame(&mut view, 1);
+    }
+    let packet = view.take_flight_packet().unwrap();
+    let img = render_flight_scene(&device, &queue, &packet);
+    let name = std::env::var("DUMP_OUT").unwrap_or_else(|_| "/tmp/frame_low.ppm".into());
+    let mut out = b"P6 320 240 255\n".to_vec();
+    for px in img.chunks_exact(4) {
+        out.extend_from_slice(&px[..3]);
+    }
+    std::fs::write(&name, &out).unwrap();
+    // Count near-white pixels for the sweep.
+    let white = img
+        .chunks_exact(4)
+        .filter(|p| p[0] > 235 && p[1] > 235 && p[2] > 235)
+        .count();
+    eprintln!("{name}: white={white}");
+}
+
+/// Scratch dump of an actually-ascending craft: seed + throttle 1.0,
+/// step until ~700 m, then rasterize the real flight packet — the
+/// same VFX state the reported ~710 m screenshot came from.
+/// `cargo test -p csp-view --test render_gate dump_flight -- --ignored`.
+#[test]
+#[ignore]
+fn dump_flight() {
+    let Some((device, queue)) = headless_device() else {
+        return;
+    };
+    let mut view = View::new().unwrap();
+    view.seed_starter_craft().unwrap();
+    view.set_flight_viewport(320.0, 240.0);
+    {
+        let mut input = view.world.resource_mut::<csp_view::flight::FlightInput>();
+        input.yaw = env_f("DUMP_YAW", 0.7);
+        input.pitch = env_f("DUMP_PITCH", 0.25);
+        input.distance_m = env_f("DUMP_DIST", 60.0);
+    }
+    frame(&mut view, 1); // the focus resolves in flight_present
+    let vessel = view.flight_focus().expect("starter vessel");
+    view.enqueue_command(
+        csp_view::SourceClass::Ui,
+        0,
+        csp_view::SimCommand::SetThrottle {
+            vessel,
+            throttle: 1.0,
+        },
+    );
+    let alt = env_f("DUMP_ALT", 710.0);
+    // Step until the HUD's staged altitude passes the target (or ~60 s).
+    for _ in 0..400 {
+        frame(&mut view, 30);
+        let a = view
+            .world
+            .resource::<csp_view::flight::FlightUiData>()
+            .alt_m;
+        if a > alt {
+            break;
+        }
+    }
+    let a = view
+        .world
+        .resource::<csp_view::flight::FlightUiData>()
+        .alt_m;
+    let packet = view.take_flight_packet().unwrap();
+    let img = render_flight_scene(&device, &queue, &packet);
+    let name = std::env::var("DUMP_OUT").unwrap_or_else(|_| "/tmp/flight.ppm".into());
+    let mut out = format!("P6 {W} {H} 255\n").into_bytes();
+    for px in img.chunks_exact(4) {
+        out.extend_from_slice(&px[..3]);
+    }
+    std::fs::write(&name, &out).unwrap();
+    let white = img
+        .chunks_exact(4)
+        .filter(|p| p[0] > 235 && p[1] > 215)
+        .count();
+    eprintln!("{name}: alt={a:.0} white={white}");
+}
+
+fn env_f(k: &str, d: f64) -> f64 {
+    std::env::var(k)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(d)
+}
+
+/// Scratch terrain dump at an arbitrary surface point/heading —
+/// hand-builds the `TerrainPacket` (same builders `extract_flight`
+/// uses) so any location/altitude/pitch can be inspected without
+/// flying the sim. Env knobs: DUMP_LAT, DUMP_LON, DUMP_HEADING (deg),
+/// DUMP_ALT (m), DUMP_PITCH (rad, look-down), DUMP_OUT.
+/// `cargo test -p csp-view --test render_gate dump_surface -- --ignored`.
+#[test]
+#[ignore]
+#[allow(clippy::too_many_lines)]
+fn dump_surface() {
+    use csp_core::DVec3;
+    let Some((device, queue)) = headless_device() else {
+        return;
+    };
+    let env = |k: &str, d: f64| {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(d)
+    };
+    let lat = env("DUMP_LAT", -0.092).to_radians();
+    let lon = env("DUMP_LON", 2.916).to_radians();
+    let alt = env("DUMP_ALT", 710.0);
+    let pitch_down = env("DUMP_PITCH", 0.55); // rad below the local horizon
+    let heading = env("DUMP_HEADING", 0.0).to_radians();
+
+    let r_body = 600_000.0;
+    let field = csp_render::terrain::HeightField::bake(601, 1024, 512);
+    if std::env::var("DUMP_SCAN").is_ok() {
+        // Coarse normalized-height survey: + land, . shallow sea, ~ deep sea.
+        for la in (-80..=80i32).step_by(8) {
+            let mut row = String::new();
+            for lo in (0..360i32).step_by(6) {
+                let (slat, clat) = (la as f64).to_radians().sin_cos();
+                let (slon, clon) = (lo as f64).to_radians().sin_cos();
+                let d = DVec3::new(clat * clon, clat * slon, slat);
+                let h = field.sample_dir(d);
+                row.push(if h > 0.45 {
+                    '#'
+                } else if h > 0.1 {
+                    '+'
+                } else if h > 0.0 {
+                    '.'
+                } else if h > -0.15 {
+                    '-'
+                } else {
+                    '~'
+                });
+            }
+            eprintln!("{la:4} {row}");
+        }
+        return;
+    }
+    let art = csp_view::art::load()
+        .0
+        .terrain
+        .clone()
+        .expect("terrain art pack");
+    let biome = {
+        // The real Terrin biome map via the view's own loader path.
+        let view = View::new().unwrap();
+        let cfg = view.world.resource::<csp_view::terrain::TerrainConfig>();
+        cfg.bodies.get("terrin").and_then(|b| b.biome.clone())
+    };
+
+    // Surface direction under the eye.
+    let (slat, clat) = lat.sin_cos();
+    let (slon, clon) = lon.sin_cos();
+    let dir = DVec3::new(clat * clon, clat * slon, slat);
+    let h_here = field.sample_dir(dir) * 2_400.0;
+    let eye_rel = dir * (r_body + h_here.max(0.0) + alt);
+
+    // Camera basis: look `pitch_down` below the local horizon toward
+    // `heading` (0 = north, clockwise).
+    let up = dir;
+    let east0 = DVec3::Z.cross(up);
+    let east = if east0.norm_squared() > 1e-12 {
+        east0 / east0.norm()
+    } else {
+        DVec3::X
+    };
+    let north = up.cross(east);
+    let fwd_h = north * heading.cos() + east * heading.sin();
+    let fwd = (up * (-pitch_down.sin()) + fwd_h * pitch_down.cos()) / 1.0;
+    let z_out = -fwd;
+    let right0 = up.cross(z_out);
+    let right = if right0.norm_squared() > 1e-12 {
+        right0 / right0.norm()
+    } else {
+        east
+    };
+    let upv = z_out.cross(right);
+    let view = [
+        [right.x, right.y, right.z, 0.0],
+        [upv.x, upv.y, upv.z, 0.0],
+        [z_out.x, z_out.y, z_out.z, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ];
+    let aspect = f64::from(W) / f64::from(H);
+    let fovy = 0.9f64;
+    let f = 1.0 / (fovy * 0.5).tan();
+    let proj = [
+        [f / aspect, 0.0, 0.0, 0.0],
+        [0.0, f, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.1],
+        [0.0, 0.0, -1.0, 0.0],
+    ];
+    let mut view_proj = [[0.0f64; 4]; 4];
+    for r in 0..4 {
+        for c in 0..4 {
+            view_proj[r][c] = proj[r][0] * view[0][c]
+                + proj[r][1] * view[1][c]
+                + proj[r][2] * view[2][c]
+                + proj[r][3] * view[3][c];
+        }
+    }
+    // Rebuild the packet through the same builder extract_flight uses —
+    // but it is crate-private, so replicate its uniform/instance steps
+    // with the public pieces.
+    let leaves = csp_render::terrain::select_patches(
+        eye_rel,
+        r_body,
+        2_400.0,
+        &csp_render::terrain::LodConfig::default(),
+    );
+    let mut terrain_inst = Vec::new();
+    let mut ocean_inst = Vec::new();
+    for &id in &leaves {
+        terrain_inst.push(csp_render::terrain::patch_instance(
+            id, 0.0, eye_rel, r_body,
+        ));
+        // replicate patch_might_hold_sea's 5x5 sample rule
+        let (corner, du, dv) = csp_render::terrain::patch_cube(id);
+        let mut lo = f64::INFINITY;
+        for j in 0..5 {
+            for i in 0..5 {
+                let c = corner + du * (i as f64 / 4.0) + dv * (j as f64 / 4.0);
+                lo = lo.min(field.sample_dir(c / c.norm()));
+            }
+        }
+        if lo * 2_400.0 <= 600.0 {
+            ocean_inst.push(csp_render::terrain::patch_instance(
+                id, 1.0, eye_rel, r_body,
+            ));
+        }
+    }
+    // view_rot columns = camera axes (sky_view_rot convention).
+    let mut view_rot = [[0.0f32; 4]; 4];
+    for c in 0..3 {
+        view_rot[0][c] = view[0][c] as f32;
+        view_rot[1][c] = view[1][c] as f32;
+        view_rot[2][c] = view[2][c] as f32;
+    }
+    let tan_y = (fovy * 0.5).tan();
+    let eye_r2 = eye_rel.norm_squared();
+    let r_top = r_body + 70_000.0;
+    let mut biome_colors = [[0.0f32; 4]; 16];
+    if let Some(b) = &biome {
+        biome_colors = b.colors;
+    }
+    let packet = csp_render::terrain::TerrainPacket {
+        uniforms: csp_render::terrain::TerrainUniforms {
+            view_proj: {
+                let mut o = [[0.0f32; 4]; 4];
+                for r in 0..4 {
+                    for c in 0..4 {
+                        o[c][r] = view_proj[r][c] as f32;
+                    }
+                }
+                o
+            },
+            view_rot,
+            eye_rel_body: [eye_rel.x as f32, eye_rel.y as f32, eye_rel.z as f32, 0.0],
+            sun_dir: [-1.0, 0.0, 0.0, 0.0],
+            planet: [r_body as f32, 70_000.0, r_body as f32, 2_400.0],
+            atmo: [
+                5_600.0,
+                if biome.is_some() { 1.0 } else { 0.0 },
+                alt as f32,
+                0.0,
+            ],
+            misc: [
+                (tan_y * aspect) as f32,
+                tan_y as f32,
+                (eye_r2 - r_top * r_top) as f32,
+                (eye_r2 - r_body * r_body) as f32,
+            ],
+            spin: [0.0, 0.0, 1.0, 0.0],
+            rayleigh: [5.8e-6, 13.5e-6, 33.1e-6, 0.0],
+            biome_colors,
+            shadow: [0.0; 4],
+            art: [1.0, 0.0, 0.0, 0.0],
+        },
+        heightfield: Some(std::sync::Arc::new(field)),
+        biome,
+        atmo: Some(csp_render::terrain::AtmoDesc {
+            radius_m: r_body,
+            top_m: 70_000.0,
+            scale_height_m: 5_600.0,
+        }),
+        terrain: terrain_inst,
+        ocean: ocean_inst,
+        sky: true,
+        art: Some(art),
+    };
+    let fp = csp_render::flight::FlightPacket {
+        terrain: Some(packet),
+        ..Default::default()
+    };
+    let img = render_flight_scene(&device, &queue, &fp);
+    let name = std::env::var("DUMP_OUT").unwrap_or_else(|_| "/tmp/surf.ppm".into());
+    let mut out = format!("P6 {W} {H} 255\n").into_bytes();
+    for px in img.chunks_exact(4) {
+        out.extend_from_slice(&px[..3]);
+    }
+    std::fs::write(&name, &out).unwrap();
+    let white = img
+        .chunks_exact(4)
+        .filter(|p| p[0] > 235 && p[1] > 215)
+        .count();
+    eprintln!("{name}: h_here={h_here:.0} white={white}");
+}
+
+/// Scratch visual dump — write the seeded frame to /tmp/frame.ppm.
+/// Run explicitly: `cargo test -p csp-view --test render_gate dump -- --ignored`.
+#[test]
+#[ignore]
 fn dump() {
     let Some((device, queue)) = headless_device() else {
         return;

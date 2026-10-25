@@ -154,6 +154,25 @@ fn mie_phase(mu: f32) -> f32 {
 
 const MIE_BETA: vec3<f32> = vec3<f32>(2.9e-6, 2.9e-6, 2.9e-6); // 1/m, grey aerosol
 
+// ACES filmic fit (Narkowicz) — applied per-channel on the linear HDR
+// colour before the sRGB surface encode. The untone-mapped pipeline
+// clipped every lit-slope/glint term above 1.0 to flat white (the
+// "white worm" streaks) and let ~0.4-linear albedos land at ~0.75
+// sRGB (the washed-out pale terrain). The curve compresses the top
+// octave instead of clipping it, so texture detail survives.
+fn tone_map(c: vec3<f32>) -> vec3<f32> {
+    let a = 2.51;
+    let b = 0.03;
+    let d = 2.43;
+    let e = 0.59;
+    let f = 0.14;
+    return clamp(
+        (c * (a * c + vec3<f32>(b))) / (c * (d * c + vec3<f32>(e)) + vec3<f32>(f)),
+        vec3<f32>(0.0),
+        vec3<f32>(1.0),
+    );
+}
+
 // --- transmittance LUT: T(h, μ) manual bilinear (clamped both axes).
 // The bake is *endpoint*-centered (bake_transmittance: col/(W−1),
 // row/(H−1)), so the texel coordinate is `·(d − 1)` — NOT the
@@ -463,14 +482,19 @@ fn class_tile(layer: i32) -> f32 {
 // One class's normalized albedo detail: texel ÷ layer mean (the
 // deepest mip IS the mean — the detail pattern survives while the
 // authored palette keeps the hue), blended across the two dominant
-// projection planes.
+// projection planes. The mean floor has to sit BELOW every layer's
+// actual per-channel mean (the rock class averages ~0.01 linear, the
+// grass blue channel ~0.012): at the old 0.05 floor the dark layers
+// divided by ~5× their own mean, so the pattern's bright veins hit
+// the downstream detail clamp as isolated white streaks while the
+// rest of the layer went mud-dark.
 fn class_albedo(p: PlaneUV, layer: i32) -> vec3<f32> {
     let k = u.planet.x / class_tile(layer);
     let ta = textureSample(alb_arr, samp, p.a * k, layer).rgb;
     let tb = textureSample(alb_arr, samp, p.b * k, layer).rgb;
     let last = i32(textureNumLevels(alb_arr)) - 1;
     let mean = textureLoad(alb_arr, vec2<i32>(0, 0), layer, last).rgb;
-    return mix(ta, tb, p.wb) / max(mean, vec3<f32>(0.05, 0.05, 0.05));
+    return mix(ta, tb, p.wb) / max(mean, vec3<f32>(0.008, 0.008, 0.008));
 }
 
 // Matching normal-map sample for `layer` — tangent-space xy slope.
@@ -616,7 +640,11 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
         }
         let occ = sun_occlusion(dir_fix, u.planet.z - u.planet.x, sun_fix);
         let vis = occ * (1.0 - blob_shadow(dir));
-        let spec = pow(rsun, 700.0) * 2.6 + pow(rsun, 48.0) * 0.22;
+        // Sun glitter: the tight sparkle lobe rides the wave-normal
+        // map (Foam002's squiggly foam pattern) — at the old 2.6 gain
+        // every glint texel clipped to a glowing white worm. Keep the
+        // sparkle but at a gain that survives tonemapping.
+        let spec = pow(rsun, 700.0) * 1.1 + pow(rsun, 48.0) * 0.14;
         col = mix(water * (0.10 + 0.90 * sun_up * vis),
                   skyc * (0.22 + 0.78 * sun_up), fres)
               + sun_lum * vis * spec;
@@ -659,8 +687,13 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
                     if (w > dom_w) { dom_w = w; dom_layer = l; }
                 }
             }
+            // Detail modulates the authored albedo — bounded so the
+            // texture's bright veins/ripples can't multiply it into
+            // clipping (the old 3.0 ceiling let isolated texels blow
+            // out as white worm streaks while the layer mean sat
+            // near 1).
             let det_str = clamp(0.25 + 0.75 * det_fade, 0.0, 1.0);
-            alb = alb * mix(vec3<f32>(1.0), clamp(detail, vec3<f32>(0.0), vec3<f32>(3.0)), det_str);
+            alb = alb * mix(vec3<f32>(1.0), clamp(detail, vec3<f32>(0.25), vec3<f32>(1.5)), det_str);
             let ntex = class_normal(puv, dom_layer) * (0.35 + 0.65 * det_fade);
             n_fix = normalize(n_fix - basis.e * ntex.x * 0.55 - basis.n * ntex.y * 0.55);
         }
@@ -697,7 +730,7 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
         let t_view = trans_between(alt_a, alt_b, mua, mub);
         col = col * t_view + view_inscatter(pa, pb, ray, dist);
     }
-    return vec4<f32>(col, alpha);
+    return vec4<f32>(tone_map(col), alpha);
 }
 
 // --- sky pass: fullscreen triangle, per-pixel scattering ray ----------
@@ -787,7 +820,7 @@ fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
               + stars;
 
     if (u.planet.y <= 0.0) {
-        return vec4<f32>(space, 1.0);
+        return vec4<f32>(tone_map(space), 1.0);
     }
 
     // Ray/shell quadratic |pa + t·rd|² = r² ⇒ t² + 2b·t + c = 0,
@@ -801,7 +834,7 @@ fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
         // The ray misses the top shell entirely — nothing crosses the
         // atmosphere, so the space backdrop arrives unattenuated (the
         // clamped LUT row would falsely dim the annulus past the limb).
-        return vec4<f32>(space, 1.0);
+        return vec4<f32>(tone_map(space), 1.0);
     }
     let sq = sqrt(disc_top);
     var t0 = max(-b - sq, 0.0);
@@ -850,5 +883,5 @@ fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
         }
         col = acc * 4.2 + acc_m * 1.5 + space * bg_t;
     }
-    return vec4<f32>(col, 1.0);
+    return vec4<f32>(tone_map(col), 1.0);
 }
