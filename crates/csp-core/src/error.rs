@@ -40,6 +40,28 @@ impl SimError {
     }
 }
 
+/// The typed kind of a §2.2.1 drain rejection — the *branchable*
+/// complement to [`SimError`]'s diagnostic-only reason text.
+///
+/// `SimError`'s payload is explicitly never branch-determining (see
+/// its doc), so a consumer that must react to *which* command was
+/// refused — e.g. the flight focus pin releasing when the recover's
+/// own `ToBubble` drains rejected — matches on
+/// `RejectedCommand::kind`, never on `reason().starts_with(..)`
+/// across a crate boundary. `csp-sim` derives the kind from the
+/// rejected command itself at drain time, so a failure anywhere in
+/// the command's apply path carries it — including nested failures
+/// whose own `SimError` text lacks any command-name prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RejectKind {
+    /// A `SimCommand::ToBubble` rejection — the player-facing
+    /// "recover control" conversion refused. `csp-view` releases the
+    /// pending focus pin on this kind.
+    ToBubble,
+    /// Any other rejection — no consumer branches on it.
+    Other,
+}
+
 impl fmt::Display for SimError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let class = match self {

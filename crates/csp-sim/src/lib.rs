@@ -46,7 +46,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 
-use csp_core::{DQuat, DVec3, SimError, SimTime, StableDiscriminant, StateHasher};
+use csp_core::{DQuat, DVec3, RejectKind, SimError, SimTime, StableDiscriminant, StateHasher};
 use csp_data::{
     BiomeId, BodyId, ContractTypeId, ExperimentId, KeplerElements, ResourceId, SiteId, Situation,
 };
@@ -1211,8 +1211,29 @@ pub struct RejectedCommand {
     /// `(key.tick, dequeue_index)` is unique within a report and
     /// orders rejections in true dequeue order.
     pub dequeue_index: u64,
+    /// The typed kind of the rejected command — the branchable
+    /// complement to `error` for consumers that must react to *what*
+    /// was refused (`RejectKind`'s doc). `error.reason()` is
+    /// diagnostic text only and never branch-determining, so a
+    /// cross-crate match goes through this field — and because it is
+    /// derived from the command itself, a failure anywhere in the
+    /// command's apply path carries it (a weld/`state_at`/aero
+    /// failure inside `ToBubble` still reports
+    /// [`RejectKind::ToBubble`], where a text prefix on `error` could
+    /// not).
+    pub kind: RejectKind,
     /// Why the apply failed.
     pub error: SimError,
+}
+
+/// Map a rejected command to its typed [`RejectKind`] — the drain's
+/// one place that decides what a rejection *was*, so consumers match
+/// a kind, never `SimError` text.
+fn reject_kind(command: &SimCommand) -> RejectKind {
+    match command {
+        SimCommand::ToBubble { .. } => RejectKind::ToBubble,
+        _ => RejectKind::Other,
+    }
 }
 
 /// What `step_frame` did (§2.6.2): where the clock landed, what the
@@ -6673,6 +6694,7 @@ impl World {
                     rejected.push(RejectedCommand {
                         key,
                         dequeue_index: dequeue_index as u64,
+                        kind: reject_kind(&command),
                         error: e,
                     });
                 }
@@ -11342,6 +11364,45 @@ mod tests {
             assert!(matches!(r.rejected[0].error, SimError::Recoverable(_)));
             assert!(w.vessels.is_empty(), "no orbit minted: period_s={period_s}");
         }
+    }
+
+    /// The rejected channel carries a *typed* kind, not just a text
+    /// reason: a `ToBubble` rejection reports [`RejectKind::ToBubble`]
+    /// — what a cross-crate consumer (the view's focus-pin release)
+    /// matches on. The kind is derived from the command itself, so a
+    /// failure anywhere in the apply path carries it even when the
+    /// `SimError` text has no "to-bubble" prefix.
+    #[test]
+    fn to_bubble_rejection_reports_typed_kind() {
+        // A physics-less world: `ToBubble` rejects "no physics
+        // environment" — and the kind is still `ToBubble`.
+        let mut w = World::new();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::ToBubble {
+                vessel: VesselId(0),
+            },
+        );
+        let r = w.step_frame(1).unwrap();
+        assert_eq!(r.rejected.len(), 1);
+        assert_eq!(r.rejected[0].kind, csp_core::RejectKind::ToBubble);
+        assert!(matches!(r.rejected[0].error, SimError::Recoverable(_)));
+
+        // Another command's rejection stays `Other` — the kind names
+        // the refused command, not just the channel.
+        let mut w = World::with_system(test_system());
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SpawnVessel {
+                parent: BodyId::from("nope"),
+                elements: leo_elements(),
+            },
+        );
+        let r = w.step_frame(1).unwrap();
+        assert_eq!(r.rejected.len(), 1);
+        assert_eq!(r.rejected[0].kind, csp_core::RejectKind::Other);
     }
 
     /// The §2.6.6 full-cycle: the moon-crossing hyperbola produces

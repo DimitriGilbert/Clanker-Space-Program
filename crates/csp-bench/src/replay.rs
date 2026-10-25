@@ -73,6 +73,13 @@ pub struct Fingerprint {
     pub rand_chacha: Option<String>,
     /// See [`Self::parry3d_f64`].
     pub blake3: Option<String>,
+    /// See [`Self::parry3d_f64`]. `rhai` is squarely in the
+    /// determinism domain: the replay path installs `RhaiHost`,
+    /// script-issued commands ride the command log, and script
+    /// persist values hash — a rhai bump can move golden hashes, so
+    /// the fingerprint must name it (§7.1 exists so a red build is
+    /// diagnosable, not just red).
+    pub rhai: Option<String>,
     /// `csp_core::HASH_SCHEMA_VERSION` (§7.1 rule 1).
     pub hash_schema_version: u32,
     /// `csp_core::KDF_VERSION` (§2.7).
@@ -101,6 +108,7 @@ struct FingerprintSidecar {
     libm: Option<String>,
     rand_chacha: Option<String>,
     blake3: Option<String>,
+    rhai: Option<String>,
     hash_schema_version: u32,
     kdf_version: u8,
     data_hash_version: u32,
@@ -118,6 +126,7 @@ impl From<&Fingerprint> for FingerprintSidecar {
             libm: f.libm.clone(),
             rand_chacha: f.rand_chacha.clone(),
             blake3: f.blake3.clone(),
+            rhai: f.rhai.clone(),
             hash_schema_version: f.hash_schema_version,
             kdf_version: f.kdf_version,
             data_hash_version: f.data_hash_version,
@@ -136,6 +145,7 @@ impl From<FingerprintSidecar> for Fingerprint {
             libm: s.libm,
             rand_chacha: s.rand_chacha,
             blake3: s.blake3,
+            rhai: s.rhai,
             hash_schema_version: s.hash_schema_version,
             kdf_version: s.kdf_version,
             data_hash_version: s.data_hash_version,
@@ -297,6 +307,33 @@ pub enum ReplayError {
         /// What the on-disk fixture dir hashes to now.
         actual: [u8; 32],
     },
+    /// [`write_golden`] refused: the dir already holds a complete
+    /// golden whose `expected-hash.txt` differs from the incoming
+    /// `final_hash`. §8.4's anti-laundering rule lives in the library
+    /// so every writer inherits it — a hash-changing overwrite must go
+    /// through [`write_golden_overwrite`], which `xtask bless-goldens`
+    /// reaches only after its own refusals (schema bump or `--reason`)
+    /// and `csp-replay record` reaches only via `--force`.
+    GoldenOccupied {
+        /// The golden dir.
+        path: PathBuf,
+        /// The committed `expected-hash.txt` the write would replace.
+        committed: [u8; 32],
+        /// The incoming `RecordedGolden::final_hash`.
+        incoming: [u8; 32],
+    },
+    /// [`write_golden`] refused: the dir holds SOME of
+    /// [`ARTIFACT_FILES`] but not all — an ambiguous state that can
+    /// neither load as an existing golden nor be treated as brand-new
+    /// (a partial set would let an overwrite dodge the hash-change
+    /// refusal). Restore or delete the artifact files so the dir is
+    /// all-or-nothing.
+    PartialGolden {
+        /// The golden dir.
+        path: PathBuf,
+        /// How many of [`ARTIFACT_FILES`] are present.
+        present: usize,
+    },
 }
 
 impl fmt::Display for ReplayError {
@@ -345,6 +382,26 @@ impl fmt::Display for ReplayError {
                 "fixture drift: recorded fixture hash {}, on-disk fixture hashes {}",
                 hex(recorded),
                 hex(actual)
+            ),
+            Self::GoldenOccupied {
+                path,
+                committed,
+                incoming,
+            } => write!(
+                f,
+                "refusing to overwrite {}: committed hash {} differs from incoming {} — \
+                 a hash-changing write needs `xtask bless-goldens` (schema bump or \
+                 --reason) or `csp-replay record --force`",
+                path.display(),
+                hex(committed),
+                hex(incoming)
+            ),
+            Self::PartialGolden { path, present } => write!(
+                f,
+                "refusing to write into {}: it holds {present}/{} golden artifacts — \
+                 restore or delete the artifact files so the dir is all-or-nothing",
+                path.display(),
+                ARTIFACT_FILES.len()
             ),
         }
     }
@@ -397,6 +454,7 @@ pub fn fingerprint(data_fixture_hash: [u8; 32]) -> Fingerprint {
         libm: dep(option_env!("CSP_DEP_VERSION_LIBM")),
         rand_chacha: dep(option_env!("CSP_DEP_VERSION_RAND_CHACHA")),
         blake3: dep(option_env!("CSP_DEP_VERSION_BLAKE3")),
+        rhai: dep(option_env!("CSP_DEP_VERSION_RHAI")),
         hash_schema_version: HASH_SCHEMA_VERSION,
         kdf_version: KDF_VERSION,
         data_hash_version: DATA_HASH_VERSION,
@@ -439,6 +497,7 @@ pub fn fingerprint_warnings(recorded: &Fingerprint, current_fixture_hash: [u8; 3
         ("libm", &recorded.libm, &current.libm),
         ("rand_chacha", &recorded.rand_chacha, &current.rand_chacha),
         ("blake3", &recorded.blake3, &current.blake3),
+        ("rhai", &recorded.rhai, &current.rhai),
     ] {
         if was != now {
             diff(name, opt(was), opt(now));
@@ -972,7 +1031,63 @@ pub fn decode(bytes: &[u8]) -> Result<Replay, ReplayError> {
 
 /// Write a golden directory's three artifacts (§8.3): `replay.bin`,
 /// `expected-hash.txt`, `fingerprint.json`.
+///
+/// This is the **refusing writer** — §8.4's anti-laundering rule lives
+/// in the library so every caller inherits it (`csp-replay record`
+/// and `xtask bless-goldens` alike):
+///
+/// - **partial artifact set** — a dir holding SOME of
+///   [`ARTIFACT_FILES`] can neither load as an existing golden nor be
+///   treated as brand-new: refused [`ReplayError::PartialGolden`].
+/// - **occupied + mismatched** — a dir holding a complete golden whose
+///   `expected-hash.txt` differs from `golden.final_hash` is an
+///   overwrite of a committed expectation: refused
+///   [`ReplayError::GoldenOccupied`]. A hash-changing write must go
+///   through [`write_golden_overwrite`], reached by `xtask
+///   bless-goldens` only after its own refusals (schema bump or
+///   `--reason`) and by `csp-replay record --force` explicitly.
+/// - an unparseable "complete" set refuses too — a corrupt
+///   `expected-hash.txt` cannot be compared, so it cannot be
+///   overwritten silently.
+///
+/// A dir with NO artifacts writes freely (a new golden); a
+/// hash-identical rewrite (fingerprint refresh) writes freely.
 pub fn write_golden(dir: &Path, golden: &RecordedGolden) -> Result<(), ReplayError> {
+    let present = ARTIFACT_FILES
+        .iter()
+        .filter(|f| dir.join(f).exists())
+        .count();
+    match present {
+        0 => {}
+        n if n == ARTIFACT_FILES.len() => {
+            // Load the committed expectation — a dir that claims a
+            // golden but cannot parse is refused, not overwritten.
+            let (_, committed) = load_golden(dir)?;
+            if committed != golden.final_hash {
+                return Err(ReplayError::GoldenOccupied {
+                    path: dir.to_path_buf(),
+                    committed,
+                    incoming: golden.final_hash,
+                });
+            }
+        }
+        n => {
+            return Err(ReplayError::PartialGolden {
+                path: dir.to_path_buf(),
+                present: n,
+            });
+        }
+    }
+    write_golden_overwrite(dir, golden)
+}
+
+/// The unconditional artifact writer — [`write_golden`] minus the
+/// §8.4 occupancy refusals. Callers reach this only after applying
+/// their own refusal chain: `xtask bless-goldens` (dirty tree, schema
+/// version, `--reason`) and `csp-replay record --force` (the explicit
+/// override). Nothing may overwrite a *different* committed hash
+/// without one of those gates.
+pub fn write_golden_overwrite(dir: &Path, golden: &RecordedGolden) -> Result<(), ReplayError> {
     std::fs::create_dir_all(dir).map_err(|source| ReplayError::Io {
         path: dir.to_path_buf(),
         source,
@@ -1130,6 +1245,35 @@ mod tests {
         // beside, and the strict golden path — the one CI runs — accepts.
         assert_eq!(load_fingerprint(&dir).unwrap(), artifact.fingerprint);
         verify_golden(&dir).unwrap();
+    }
+
+    /// Every registered scenario recipe has a committed golden dir —
+    /// and every committed golden verifies through the strict
+    /// `verify_golden` path (the same check CI's golden step runs).
+    /// The recipe count is pinned so a registry change without a
+    /// matching golden (or a golden whose recipe vanished) fails by
+    /// name rather than silently shrinking the gate.
+    #[test]
+    fn every_registered_scenario_has_a_verified_golden() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/test-fixtures");
+        assert_eq!(
+            scenarios::SCENARIOS.len(),
+            2,
+            "scenario registry changed — bless the new scenario's golden \
+             and pin the new count here"
+        );
+        for recipe in scenarios::SCENARIOS {
+            let dir = fixtures.join(recipe.name);
+            for f in ARTIFACT_FILES {
+                assert!(
+                    dir.join(f).exists(),
+                    "{}: missing golden artifact {f}",
+                    recipe.name
+                );
+            }
+            verify_golden(&dir)
+                .unwrap_or_else(|e| panic!("golden '{}' failed verify_golden: {e}", recipe.name));
+        }
     }
 
     /// Record -> replay -> verify without touching the filesystem: the
@@ -1440,6 +1584,47 @@ mod tests {
         ));
     }
 
+    /// §8.4's anti-laundering refusal lives in the writer, so every
+    /// writer inherits it: a write onto an occupied dir whose
+    /// committed hash *differs* from the incoming golden is refused
+    /// (not overwritten), a partial artifact set is refused, and
+    /// [`write_golden_overwrite`] is the gated escape hatch.
+    #[test]
+    fn write_golden_refuses_occupied_mismatch_and_partial() {
+        let tmp = TempDir::new("golden-refusal");
+        std::fs::write(tmp.0.join("fixture.ron"), b"(stub: 1)\n").unwrap();
+        let golden = record(scenarios::find("trivial").unwrap(), &tmp.0).unwrap();
+        // New dir → writes freely; same-hash rewrite (fingerprint
+        // refresh) → also writes freely.
+        write_golden(&tmp.0, &golden).unwrap();
+        write_golden(&tmp.0, &golden).unwrap();
+
+        // A hash-changing write onto the occupied dir is refused —
+        // and the refusal leaves the committed artifacts untouched.
+        let mut changed = golden.clone();
+        changed.final_hash = [0xAB; 32];
+        assert!(matches!(
+            write_golden(&tmp.0, &changed),
+            Err(ReplayError::GoldenOccupied { .. })
+        ));
+        let (_, expected) = load_golden(&tmp.0).unwrap();
+        assert_eq!(expected, golden.final_hash);
+
+        // The gated escape (`xtask bless-goldens` post-refusal,
+        // `record --force`) does write the changed hash.
+        write_golden_overwrite(&tmp.0, &changed).unwrap();
+        let (_, expected) = load_golden(&tmp.0).unwrap();
+        assert_eq!(expected, changed.final_hash);
+
+        // A partial artifact set is ambiguous — refused even for a
+        // same-hash write.
+        std::fs::remove_file(tmp.0.join(FINGERPRINT_FILE)).unwrap();
+        assert!(matches!(
+            write_golden(&tmp.0, &changed),
+            Err(ReplayError::PartialGolden { .. })
+        ));
+    }
+
     /// A tampered command payload still reproduces its stamp — the
     /// divergence surfaces at the hash, which is the golden's verdict.
     /// (Log index 2 is the last writer in the tick-500 drain, so changing
@@ -1465,6 +1650,10 @@ mod tests {
         // These deps are in the tree today; parry/rapier are honestly absent.
         assert!(fp.blake3.is_some());
         assert!(fp.rand_chacha.is_some());
+        // rhai is pinned `=1.27.0` in the workspace and in the
+        // determinism domain — the fingerprint must name it (a rhai
+        // bump moves golden hashes through the script path).
+        assert_eq!(fp.rhai.as_deref(), Some("1.27.0"));
         assert!(fp.parry3d_f64.is_none());
     }
 

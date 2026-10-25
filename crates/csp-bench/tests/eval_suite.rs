@@ -191,6 +191,7 @@ fn scenario_format_failure_classes() {
     let unknown_fixture = r#"(
         schema_version: 1,
         name: "v", world: Fixture(name: "no-such"), agent: Idle,
+        goals: [(field: "tick", op: ge, value: 0)],
         tick_budget: 1, event_budget: 1,
     )"#;
     let file = scenario::parse_scenario(unknown_fixture).expect("parses");
@@ -202,12 +203,32 @@ fn scenario_format_failure_classes() {
         schema_version: 1,
         name: "v", world: Empty,
         agent: Program(name: "no-such-program", args: {}),
+        goals: [(field: "tick", op: ge, value: 0)],
         tick_budget: 1, event_budget: 1,
     )"#;
     let file = scenario::parse_scenario(unknown_program).expect("parses");
     assert!(matches!(
         scenario::run_scenario(&file, &fixtures_root()),
         Err(EvalError::Setup(_))
+    ));
+}
+
+/// A goal-less scenario is refused at `validate()` — `pass` on an
+/// empty goal list is vacuously true, so the format rejects it
+/// outright rather than green-lighting any run.
+#[test]
+fn zero_goal_scenario_is_rejected() {
+    let text = r#"(
+        schema_version: 1,
+        name: "vacuous",
+        world: Empty,
+        agent: Idle,
+        tick_budget: 2,
+        event_budget: 2,
+    )"#;
+    assert!(matches!(
+        scenario::parse_scenario(text),
+        Err(EvalError::Invalid(_))
     ));
 }
 

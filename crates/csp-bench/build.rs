@@ -22,6 +22,12 @@ const TRACKED_DEPS: &[(&str, &str)] = &[
     ("libm", "CSP_DEP_VERSION_LIBM"),
     ("rand_chacha", "CSP_DEP_VERSION_RAND_CHACHA"),
     ("blake3", "CSP_DEP_VERSION_BLAKE3"),
+    // The script host is inside the determinism domain: the replay
+    // path installs `RhaiHost` (replay.rs), script-issued commands
+    // land in the command log, and script persist values hash — a
+    // rhai bump can move golden hashes, so the fingerprint must name
+    // it or a red build is unexplained (§7.1's whole point).
+    ("rhai", "CSP_DEP_VERSION_RHAI"),
 ];
 
 fn main() {
@@ -147,7 +153,7 @@ fn locked_version(lock: &str, pkg: &str) -> Option<String> {
 
 /// Members whose dep spec pins the linked version, in preference
 /// order — the §2.1 determinism domain the fingerprint describes.
-const PIN_PREFERENCE: &[&str] = &["csp-core", "csp-data", "csp-sim", "csp-phys"];
+const PIN_PREFERENCE: &[&str] = &["csp-core", "csp-data", "csp-sim", "csp-phys", "csp-script"];
 
 /// Semver ordering for `"X.Y.Z[-pre][+meta]"` — the numeric core,
 /// then pre-release precedence (a release sorts ABOVE every one of

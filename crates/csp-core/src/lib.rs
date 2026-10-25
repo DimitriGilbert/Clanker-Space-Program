@@ -18,7 +18,7 @@ pub mod terrain;
 mod time;
 mod vec3;
 
-pub use error::SimError;
+pub use error::{RejectKind, SimError};
 pub use hash::{HASH_SCHEMA_VERSION, StableDiscriminant, StateHasher, bubble_mask};
 pub use quat::DQuat;
 pub use rng::{KDF_VERSION, StreamKey, StreamTag, derive_key, stream, uniform};

@@ -393,6 +393,15 @@ impl ScenarioFile {
                 "name must be 1-{MAX_NAME} chars"
             )));
         }
+        if self.goals.is_empty() {
+            // A goal-less scenario's `pass` is `goals.iter().all(..)`
+            // — vacuously true, so the file would green-light any run
+            // at all (an `Idle` agent over `Empty` "passes"). A
+            // scenario that asserts nothing is not a scenario.
+            return Err(EvalError::Invalid(
+                "goals is empty — a scenario with no goals passes vacuously".into(),
+            ));
+        }
         if self.goals.len() > MAX_GOALS {
             return Err(EvalError::Invalid(format!(
                 "goals {} > {MAX_GOALS}",

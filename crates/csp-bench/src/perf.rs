@@ -393,6 +393,97 @@ pub fn write_perf_log(log: &PerfLog, path: &Path) -> std::io::Result<()> {
     std::fs::write(path, text)
 }
 
+/// Load a committed perf log — the regression baseline the release CI
+/// job diffs the fresh measurement against (`csp-perf --baseline`).
+pub fn load_perf_log(path: &Path) -> std::io::Result<PerfLog> {
+    let text = std::fs::read_to_string(path)?;
+    ron::de::from_str(&text).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// The regression tolerance a committed perf log enforces — a row
+/// more than this fraction *slower* than the last committed
+/// measurement is a regression. The budget is the §5.3 number; the
+/// tolerance is what machine noise is allowed under (a real slowdown
+/// lives over it).
+pub const REGRESSION_TOLERANCE: f64 = 0.10;
+
+/// One row's regression verdict from [`regression_diff`] — the row,
+/// the two numbers, and the rule that fired.
+#[derive(Clone, Debug)]
+pub struct PerfRegression {
+    /// [`BudgetRow::id`].
+    pub id: String,
+    /// The committed baseline's measured value (`None` when the
+    /// baseline row carried none).
+    pub baseline: Option<f64>,
+    /// The fresh measurement (`None` when the measurable row failed
+    /// to measure at all).
+    pub measured: Option<f64>,
+    /// The budget bound the row is written against.
+    pub budget: f64,
+    /// The rule that fired, for the report line.
+    pub reason: String,
+}
+
+/// Diff `current` against the last committed `baseline` — the release
+/// CI regression gate. Rows match by `id`; a row **regresses** when:
+///
+/// - its measurement exceeds the baseline's by more than
+///   [`REGRESSION_TOLERANCE`] — a real slowdown above machine noise;
+/// - it **newly crosses its budget** (`baseline ≤ budget` but
+///   `measured > budget`) — a §5.3 Pass→Fail flip, however small;
+/// - a measurable row produced **no measurement** — a harness failure
+///   can never be a green row.
+///
+/// Rows absent from `baseline` are new — recorded, not regressions.
+/// Hardware-gated rows carry no measurement and never diff.
+pub fn regression_diff(current: &PerfLog, baseline: &PerfLog) -> Vec<PerfRegression> {
+    let base: std::collections::BTreeMap<&str, &PerfEntry> = baseline
+        .entries
+        .iter()
+        .map(|e| (e.id.as_str(), e))
+        .collect();
+    let mut out = Vec::new();
+    for e in &current.entries {
+        if e.status == PerfStatus::HardwareGated {
+            continue;
+        }
+        let b = base.get(e.id.as_str()).copied();
+        match (b.and_then(|b| b.measured_value), e.measured_value) {
+            (_, None) => out.push(PerfRegression {
+                id: e.id.clone(),
+                baseline: b.and_then(|b| b.measured_value),
+                measured: None,
+                budget: e.budget_value,
+                reason: "measurable row produced no measurement".to_string(),
+            }),
+            (Some(bv), Some(mv)) if mv > bv * (1.0 + REGRESSION_TOLERANCE) => {
+                out.push(PerfRegression {
+                    id: e.id.clone(),
+                    baseline: Some(bv),
+                    measured: Some(mv),
+                    budget: e.budget_value,
+                    reason: format!(
+                        "{mv:.3} > {:.0}% over committed {bv:.3}",
+                        REGRESSION_TOLERANCE * 100.0
+                    ),
+                });
+            }
+            (Some(bv), Some(mv)) if bv <= e.budget_value && mv > e.budget_value => {
+                out.push(PerfRegression {
+                    id: e.id.clone(),
+                    baseline: Some(bv),
+                    measured: Some(mv),
+                    budget: e.budget_value,
+                    reason: format!("newly over budget ({bv:.3} ≤ {} < {mv:.3})", e.budget_value),
+                });
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// The default artifact path — `docs/perf/perf-log-<name>-<profile>.ron`
 /// under the workspace root (the crate manifest's `../..`).
 pub fn default_log_path(machine: &Machine) -> PathBuf {
@@ -978,28 +1069,43 @@ fn measure_telemetry_1000() -> Result<Measurement, ReplayError> {
 mod tests {
     use super::*;
 
-    /// The bound a measurement test enforces, by machine class:
-    ///
-    /// - **`CSP_PERF_MACHINE=ref-*`** — the strict §5.3 number: on the
-    ///   reference machines the milestone's "met on REF-A/REF-B" is
-    ///   asserted, not reported.
-    /// - **release on any other host** — a diagnostic bound of 4× the
-    ///   budget: honest about slower-than-REF hardware while still
-    ///   catching a real regression (the strict verdict lives in the
-    ///   perf log's Pass/Fail either way).
-    /// - **debug** — a slack bound, like every `measure_*` test in
-    ///   `scenarios.rs`: debug is a diagnostic profile, never the
-    ///   claim.
-    fn bound(row: &'static BudgetRow) -> f64 {
-        let strict = std::env::var("CSP_PERF_MACHINE")
-            .map(|m| m.to_ascii_lowercase().starts_with("ref-"))
-            .unwrap_or(false);
-        if strict {
-            row.budget
-        } else if cfg!(debug_assertions) {
-            row.budget * 400.0
-        } else {
-            row.budget * 4.0
+    /// Strict-budget mode: `CSP_PERF_STRICT=1` or a
+    /// `CSP_PERF_MACHINE=ref-*` name asserts `measured <= budget` —
+    /// the §5.3 number as the milestone writes it. Everywhere else a
+    /// measurement test is a *diagnostic*: it asserts the value is
+    /// finite and prints measured-vs-budget, and the real enforcement
+    /// is the committed-log regression diff (`csp-perf --baseline`,
+    /// run by the release CI job) — never a `budget × 400` bound that
+    /// reads like the budget while gating nothing.
+    fn strict_budget() -> bool {
+        std::env::var("CSP_PERF_STRICT").is_ok_and(|v| !v.is_empty() && v != "0")
+            || std::env::var("CSP_PERF_MACHINE")
+                .map(|m| m.to_ascii_lowercase().starts_with("ref-"))
+                .unwrap_or(false)
+    }
+
+    /// The one assertion shape every measurement test shares: the
+    /// value must be finite (a NaN/±inf measurement is a harness
+    /// bug), the measured-vs-budget number is printed for the log —
+    /// and only in [`strict_budget`] mode is the §5.3 bound itself
+    /// asserted.
+    fn check_value(row: &'static BudgetRow, value: f64, detail: &str) {
+        assert!(value.is_finite(), "{}: non-finite measurement", row.id);
+        eprintln!(
+            "{}: {value:.3} {} (budget {:.3}; {:.2}×) — {detail}",
+            row.id,
+            row.unit,
+            row.budget,
+            value / row.budget,
+        );
+        if strict_budget() {
+            assert!(
+                value <= row.budget,
+                "{}: {value:.3} {} over the §5.3 budget {:.3}",
+                row.id,
+                row.unit,
+                row.budget
+            );
         }
     }
 
@@ -1051,63 +1157,108 @@ mod tests {
         assert_eq!(back.entries[0].status, PerfStatus::Pass);
     }
 
-    /// Each measurement resolves to a finite value inside its
-    /// (profile-adjusted) bound — the CI-HOST gate the nightly job
-    /// asserts; release pins the §5.3 number itself.
+    /// Each measurement resolves to a finite value and reports
+    /// measured-vs-budget — strict assertion of the §5.3 number only
+    /// in [`strict_budget`] mode; the release CI job's committed-log
+    /// regression diff is the always-on gate.
     #[test]
     fn sim_200_part_atmo_within_budget() {
         let m = measure_atmo_200().unwrap();
-        eprintln!("sim.200-part-atmo: {:.3} ms/tick ({})", m.value, m.detail);
-        assert!(m.value.is_finite() && m.value < bound(&BUDGET_ROWS[0]));
+        check_value(&BUDGET_ROWS[0], m.value, &m.detail);
     }
 
     #[test]
     fn sim_1000_part_orbit_within_budget() {
         let m = measure_orbit_1000().unwrap();
-        eprintln!("sim.1000-part-orbit: {:.3} ms/tick ({})", m.value, m.detail);
-        assert!(m.value.is_finite() && m.value < bound(&BUDGET_ROWS[1]));
+        check_value(&BUDGET_ROWS[1], m.value, &m.detail);
     }
 
     #[test]
     fn sim_300_part_landed_within_budget() {
         let m = measure_landed_300().unwrap();
-        eprintln!("sim.300-part-landed: {:.3} ms/tick ({})", m.value, m.detail);
-        assert!(m.value.is_finite() && m.value < bound(&BUDGET_ROWS[2]));
+        check_value(&BUDGET_ROWS[2], m.value, &m.detail);
     }
 
     #[test]
     fn sim_map_500_rails_within_budget() {
         let m = measure_rails_500().unwrap();
-        eprintln!("sim.map-500-rails: {:.3} ms/frame ({})", m.value, m.detail);
-        assert!(m.value.is_finite() && m.value < bound(&BUDGET_ROWS[3]));
+        check_value(&BUDGET_ROWS[3], m.value, &m.detail);
     }
 
     #[test]
     fn warp_20_colonies_within_budgets() {
         let (max_events, ms, detail) = colony_warp_run().unwrap();
-        eprintln!("warp.20-colonies: {max_events} events max/frame, {ms:.3} ms/frame ({detail})");
-        assert!((max_events as f64) < bound(&BUDGET_ROWS[4]));
-        assert!(ms.is_finite() && ms < bound(&BUDGET_ROWS[5]));
+        check_value(&BUDGET_ROWS[4], max_events as f64, &detail);
+        check_value(&BUDGET_ROWS[5], ms, &detail);
     }
 
     #[test]
     fn weld_stage1_1000_within_budget() {
         let m = measure_weld1_1000().unwrap();
-        eprintln!("weld.stage1-1000-part: {:.3} ms ({})", m.value, m.detail);
-        assert!(m.value.is_finite() && m.value < bound(&BUDGET_ROWS[6]));
+        check_value(&BUDGET_ROWS[6], m.value, &m.detail);
     }
 
     #[test]
     fn weld_stage2_300_within_budget() {
         let m = measure_voxelize_300().unwrap();
-        eprintln!("weld.stage2-300-part: {:.3} ms ({})", m.value, m.detail);
-        assert!(m.value.is_finite() && m.value < bound(&BUDGET_ROWS[7]));
+        check_value(&BUDGET_ROWS[7], m.value, &m.detail);
     }
 
     #[test]
     fn telemetry_1000_within_budget() {
         let m = measure_telemetry_1000().unwrap();
-        eprintln!("telemetry.1000-part: {:.0} B/s ({})", m.value, m.detail);
-        assert!(m.value.is_finite() && m.value < bound(&BUDGET_ROWS[8]));
+        check_value(&BUDGET_ROWS[8], m.value, &m.detail);
+    }
+
+    /// The committed-log regression gate's rule set, pinned on
+    /// synthetic logs: >10% slowdowns flag, a §5.3 Pass→Fail crossing
+    /// flags under the noise band, an unmeasured measurable row
+    /// flags, and noise / improvements / gated rows do not.
+    #[test]
+    fn regression_diff_flags_what_it_must() {
+        fn entry(id: &str, budget: f64, measured: Option<f64>, status: PerfStatus) -> PerfEntry {
+            PerfEntry {
+                id: id.to_string(),
+                scene: id.to_string(),
+                budget_value: budget,
+                unit: "ms".to_string(),
+                measured_value: measured,
+                detail: None,
+                status,
+            }
+        }
+        let log = |entries: Vec<PerfEntry>| PerfLog {
+            schema_version: PERF_LOG_SCHEMA_VERSION,
+            machine: detect_machine(),
+            entries,
+        };
+        let base = log(vec![
+            entry("noise", 2.0, Some(1.0), PerfStatus::Pass),
+            entry("slow", 1.0, Some(1.0), PerfStatus::Pass),
+            entry("crossing", 0.5, Some(0.49), PerfStatus::Pass),
+            entry("already-fail", 0.5, Some(0.7), PerfStatus::Fail),
+            entry("dead", 1.0, Some(1.0), PerfStatus::Pass),
+            entry("gated", 60.0, None, PerfStatus::HardwareGated),
+        ]);
+        let cur = log(vec![
+            entry("noise", 2.0, Some(1.09), PerfStatus::Pass), // +9% — noise
+            entry("slow", 1.0, Some(1.11), PerfStatus::Fail),  // +11% — regression
+            entry("crossing", 0.5, Some(0.51), PerfStatus::Fail), // under +10% but Pass→Fail
+            entry("already-fail", 0.5, Some(0.72), PerfStatus::Fail), // <+10% on a red row
+            entry("dead", 1.0, None, PerfStatus::Fail),        // unmeasured measurable row
+            entry("gated", 60.0, None, PerfStatus::HardwareGated),
+            entry("new-row", 1.0, Some(99.0), PerfStatus::Fail), // absent in baseline
+        ]);
+        let regs = regression_diff(&cur, &base);
+        let ids: Vec<&str> = regs.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["slow", "crossing", "dead"], "{regs:?}");
+        // And the real committed log parses — the baseline the
+        // release job diffs against must load or the gate is a no-op.
+        let committed = load_perf_log(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../docs/perf/perf-log-devbox-release.ron"),
+        )
+        .expect("committed perf log parses");
+        assert!(!committed.entries.is_empty());
     }
 }

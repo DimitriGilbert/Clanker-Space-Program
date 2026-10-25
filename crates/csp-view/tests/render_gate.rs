@@ -29,9 +29,13 @@
 //!   not the clear color).
 //!
 //! No adapter on the host (a machine without lavapipe or any Vulkan
-//! ICD): the tests print a note and return early rather than fail —
-//! the gate exists to catch renderer/content regressions where a GPU
-//! exists to run them, not to require one.
+//! ICD): the tests print a `SKIP` line and return early rather than
+//! fail — the gate exists to catch renderer/content regressions where
+//! a GPU exists to run them, not to require one. **Except** in
+//! required mode: `CSP_RENDER_GATE_REQUIRED=1` turns a missing
+//! adapter into a test failure, so CI (which installs lavapipe and
+//! sets the flag) can never degenerate into a permanent green no-op —
+//! the defect where the gate silently never ran.
 
 #![cfg(not(target_arch = "wasm32"))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -71,6 +75,35 @@ fn headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
     }))
     .ok()?;
     Some((device, queue))
+}
+
+/// Whether the render gate is REQUIRED on this host —
+/// `CSP_RENDER_GATE_REQUIRED` set (CI sets it, alongside the lavapipe
+/// install step). In required mode a missing adapter is a failure,
+/// not a skip: otherwise losing the Vulkan ICD turns the gate into a
+/// silent green no-op.
+fn render_gate_required() -> bool {
+    std::env::var("CSP_RENDER_GATE_REQUIRED").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// The gate's device — or a loud `SKIP` line and `None`. In required
+/// mode a missing adapter panics instead of skipping.
+fn gate_device(test: &str) -> Option<(wgpu::Device, wgpu::Queue)> {
+    match headless_device() {
+        Some(dq) => Some(dq),
+        None if render_gate_required() => panic!(
+            "render-gate({test}): CSP_RENDER_GATE_REQUIRED is set but no headless \
+             GPU adapter exists — install a Vulkan ICD (`mesa-vulkan-drivers` ships \
+             lavapipe's libvulkan_lvp.so) or unset the flag"
+        ),
+        None => {
+            eprintln!(
+                "render-gate: SKIP {test} — no headless GPU adapter (install lavapipe; \
+                 CSP_RENDER_GATE_REQUIRED=1 makes this a failure)"
+            );
+            None
+        }
+    }
 }
 
 /// One frame of the app's §2.5 loop, headlessly — enough for the
@@ -292,8 +325,7 @@ fn render_flight_scene_sized(
 /// the uniform clear color.
 #[test]
 fn boot_scene_has_real_geometry() {
-    let Some((device, queue)) = headless_device() else {
-        eprintln!("render-gate: no headless GPU adapter (install lavapipe) — skipping");
+    let Some((device, queue)) = gate_device("boot_scene_has_real_geometry") else {
         return;
     };
 
@@ -374,8 +406,7 @@ fn boot_scene_has_real_geometry() {
 /// is a white veil the old assertion set would have blessed.
 #[test]
 fn washed_out_scene_is_what_the_gate_rejects() {
-    let Some((device, queue)) = headless_device() else {
-        eprintln!("render-gate: no headless GPU adapter (install lavapipe) — skipping");
+    let Some((device, queue)) = gate_device("washed_out_scene_is_what_the_gate_rejects") else {
         return;
     };
 
@@ -433,8 +464,7 @@ fn washed_out_scene_is_what_the_gate_rejects() {
 /// readback was the uniform clear color.
 #[test]
 fn empty_flight_scene_is_what_the_gate_rejects() {
-    let Some((device, queue)) = headless_device() else {
-        eprintln!("render-gate: no headless GPU adapter (install lavapipe) — skipping");
+    let Some((device, queue)) = gate_device("empty_flight_scene_is_what_the_gate_rejects") else {
         return;
     };
 

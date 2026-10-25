@@ -229,7 +229,11 @@ fn check_schema_version_refusal(staged: &[Staged], reason: Option<&str>) {
 #[allow(clippy::expect_used)]
 fn write_goldens(staged: &[Staged], reason: Option<&str>) {
     for s in staged {
-        csp_bench::replay::write_golden(&s.dir, &s.golden).unwrap_or_else(|e| {
+        // The unconditional writer is correct here, not a bypass: the
+        // §8.4 refusal chain ran above (dirty tree, partial set, and
+        // the hash-change-without-schema-bump/`--reason` gate), so a
+        // hash-changing write reaching this point is authorized.
+        csp_bench::replay::write_golden_overwrite(&s.dir, &s.golden).unwrap_or_else(|e| {
             eprintln!("bless-goldens: writing '{}' failed: {e}", s.dir.display());
             exit(2);
         });

@@ -1304,15 +1304,19 @@ impl View {
         // eligibility check cannot see — an event re-parenting the
         // conic inside the same drain) leaves the vessel on rails and
         // the pin armed forever, hijacking focus on any later
-        // staging. A "to-bubble" rejection on the player channel is
+        // staging. A `ToBubble` rejection on the player channel is
         // the recover's own command failing — release the pending pin
-        // and say so on the global cue channel. Gated on `pending()`:
+        // and say so on the global cue channel. The match is the
+        // typed `RejectKind`, never `reason()` text: a `ToBubble`
+        // that fails at its weld/`state_at`/aero step reports a
+        // reason with no "to-bubble" prefix at all, and the string
+        // match would leave the pin armed. Gated on `pending()`:
         // a `seen` pin's vessel already converted, so a later
         // to-bubble rejection cannot be ours.
         let to_bubble_reject = report.rejected.iter().any(|r| {
             r.key.source_class == SourceClass::Ui
                 && r.key.source_id == PLAYER_SOURCE_ID
-                && r.error.reason().starts_with("to-bubble")
+                && r.kind == csp_core::RejectKind::ToBubble
         });
         if to_bubble_reject
             && self

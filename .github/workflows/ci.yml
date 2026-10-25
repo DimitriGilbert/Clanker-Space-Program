@@ -24,7 +24,19 @@ jobs:
       - name: clippy (native)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # The render gate's software Vulkan ICD — lavapipe ships in
+      # mesa-vulkan-drivers (`libvulkan_lvp.so`). Without it the
+      # headless adapter probe returns None and the gate skips.
+      - name: install lavapipe (software Vulkan for the render gate)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers libvulkan1
+
+      # CSP_RENDER_GATE_REQUIRED: the render gate must run here, not
+      # skip — a missing adapter is a failure, never a silent green.
       - name: test (native)
+        env:
+          CSP_RENDER_GATE_REQUIRED: "1"
         run: cargo test --workspace
 
       # wasm gate: exclude native-only crates (csp-server, csp-bench, xtask —
@@ -50,9 +62,33 @@ jobs:
       - name: cargo-deny (licenses + bans)
         run: cargo deny check
 
-      # §8.2 golden replays — the M0 fast subset is one scenario. The
-      # workspace test run above already covers the in-process round-trips;
-      # this step runs the strict `verify_golden` path (fixture freeze,
-      # sidecar agreement, replay verdict) against the committed artifacts.
-      - name: golden replays (M0 subset)
-        run: cargo run -p csp-bench --bin csp-replay -- verify data/test-fixtures/trivial
+      # §8.2 golden replays — EVERY registered scenario goes through the
+      # strict `verify_golden` path (fixture freeze, sidecar agreement,
+      # replay verdict), driven by `csp-replay list` so a new recipe is
+      # gated automatically. The workspace test
+      # `every_registered_scenario_has_a_verified_golden` pins the same
+      # set in-process.
+      - name: golden replays (every registered scenario)
+        run: |
+          cargo build -p csp-bench --bin csp-replay
+          for s in $(./target/debug/csp-replay list); do
+            ./target/debug/csp-replay verify "data/test-fixtures/$s" || exit 1
+          done
+
+  # §5.3 perf budgets — release profile (the budgets are release
+  # numbers). The gate is `csp-perf --baseline`: a >10% regression vs
+  # the last committed perf log, a §5.3 Pass→Fail crossing, or an
+  # unmeasured measurable row fails the job.
+  perf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: perf budgets (release, >10% regression vs committed log)
+        run: |
+          cargo build --release -p csp-bench --bin csp-perf
+          ./target/release/csp-perf \
+            --machine ci-host \
+            --out /tmp/perf-log-ci-host-release.ron \
+            --baseline docs/perf/perf-log-devbox-release.ron

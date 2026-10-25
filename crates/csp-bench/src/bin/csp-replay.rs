@@ -3,8 +3,12 @@
 //! ```text
 //! csp-replay list                        known scenario recipes
 //! csp-replay record <scenario> <dir>     drive the recipe; write the golden
-//!                                        artifacts (replay.bin,
+//!           [--force]                    artifacts (replay.bin,
 //!                                        expected-hash.txt, fingerprint.json)
+//!                                        `--force` authorizes overwriting an
+//!                                        occupied dir whose committed hash
+//!                                        differs (§8.4 — without it a
+//!                                        mismatched write is refused)
 //! csp-replay verify <dir>                replay the artifact; compare the
 //!                                        reconstructed hash against
 //!                                        expected-hash.txt
@@ -20,7 +24,7 @@ use std::process::ExitCode;
 use csp_bench::replay;
 use csp_bench::scenarios;
 
-const USAGE: &str = "usage: csp-replay <list | record <scenario> <dir> | verify <dir>>";
+const USAGE: &str = "usage: csp-replay <list | record <scenario> <dir> [--force] | verify <dir>>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -49,8 +53,12 @@ fn run(args: &[String]) -> Result<u8, replay::ReplayError> {
             Ok(0)
         }
         Some("record") => {
-            let [scenario, dir] = rest else {
-                return usage();
+            let (scenario, dir, force) = match rest {
+                [scenario, dir] => (scenario.as_str(), dir.as_str(), false),
+                [scenario, dir, flag] if flag == "--force" => {
+                    (scenario.as_str(), dir.as_str(), true)
+                }
+                _ => return usage(),
             };
             let Some(recipe) = scenarios::find(scenario) else {
                 eprintln!("csp-replay: unknown scenario '{scenario}' (see `csp-replay list`)");
@@ -58,7 +66,14 @@ fn run(args: &[String]) -> Result<u8, replay::ReplayError> {
             };
             let dir = Path::new(dir);
             let golden = replay::record(recipe, dir)?;
-            replay::write_golden(dir, &golden)?;
+            // §8.4's anti-laundering refusal lives in the library:
+            // `write_golden` refuses a hash-changing overwrite of an
+            // occupied dir; `--force` is the explicit authorization.
+            if force {
+                replay::write_golden_overwrite(dir, &golden)?;
+            } else {
+                replay::write_golden(dir, &golden)?;
+            }
             println!(
                 "recorded {}: {} commands, final hash {}",
                 recipe.name,
