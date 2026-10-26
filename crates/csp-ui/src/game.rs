@@ -65,9 +65,12 @@ pub fn game_menu(
     out: &mut GameMenuOutput,
 ) -> Vec<egui::Rect> {
     let mut rects = Vec::with_capacity(3);
+    // No title bar ⇒ drag-anywhere: the strip parks top-right by
+    // default but the player can pull it elsewhere like any panel.
+    let screen = ctx.content_rect();
     let rect = egui::Window::new("game_menu")
         .title_bar(false)
-        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(0.0, 0.0))
+        .default_pos(egui::pos2(screen.right() - 100.0, screen.top()))
         .resizable(false)
         .collapsible(false)
         .show(ctx, |ui| {
@@ -135,7 +138,10 @@ pub fn game_menu(
     if state.confirm_revert {
         let rect = egui::Window::new("revert_confirm")
             .title_bar(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .default_pos(egui::pos2(
+                screen.center().x - 190.0,
+                screen.center().y - 80.0,
+            ))
             .resizable(false)
             .collapsible(false)
             .show(ctx, |ui| {
@@ -165,7 +171,10 @@ pub fn game_menu(
     if state.confirm_new {
         let rect = egui::Window::new("new_game_confirm")
             .title_bar(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .default_pos(egui::pos2(
+                screen.center().x - 170.0,
+                screen.center().y - 60.0,
+            ))
             .resizable(false)
             .collapsible(false)
             .show(ctx, |ui| {

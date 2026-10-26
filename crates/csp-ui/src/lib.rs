@@ -50,6 +50,74 @@ pub use settings::{
 pub use tutorial::{STEP_LAUNCH, STEPS, TutorialInput, TutorialState, TutorialStep};
 pub use vab::{ModeSelect, VabSession};
 
+// ---------------------------------------------------------------------------
+// Shared HUD chrome (the readable-overlay rule): every floating strip
+// of HUD text — notice cues, the telemetry column, status strips, hint
+// bars — wears the same dark translucent chip, so a readout's contrast
+// is decided by the panel and never by whatever sky/terrain/scene
+// happens to be behind it.
+// ---------------------------------------------------------------------------
+
+/// The chip fill — near-opaque dark navy.
+pub(crate) const HUD_CHIP_FILL: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(9, 13, 19, 210);
+
+/// The chip's 1-px hairline — a faint cool tint that separates the
+/// panel from the scene without reading as a window border.
+pub(crate) const HUD_CHIP_EDGE: egui::Color32 =
+    egui::Color32::from_rgba_unmultiplied_const(140, 185, 220, 60);
+
+/// Text→chip-edge padding for painter-drawn chips.
+pub(crate) const HUD_CHIP_PAD: egui::Vec2 = egui::Vec2::new(9.0, 5.0);
+
+/// The notice-cue amber — kept on the dark chip, where it holds its
+/// contrast; raw over the scene it washed out.
+pub(crate) const NOTICE_AMBER: egui::Color32 = egui::Color32::from_rgb(255, 202, 84);
+
+/// The shared HUD panel frame — the `Ui`-side of the chip rule
+/// ([`paint_hud_chip`] is the `Painter`-side). Wraps a floating
+/// readout's contents in the dark translucent backing + hairline.
+pub(crate) fn hud_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(HUD_CHIP_FILL)
+        .stroke(egui::Stroke::new(1.0, HUD_CHIP_EDGE))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::symmetric(10, 7))
+}
+
+/// The `Painter`-side of the chip rule — draws the dark backing +
+/// hairline behind `text_rect` (expanded by [`HUD_CHIP_PAD`]) and
+/// returns the chip rect. Draw the text *after* this call.
+pub(crate) fn paint_hud_chip(painter: &egui::Painter, text_rect: egui::Rect) -> egui::Rect {
+    let chip = text_rect.expand2(HUD_CHIP_PAD);
+    painter.rect_filled(chip, egui::CornerRadius::same(6), HUD_CHIP_FILL);
+    painter.rect_stroke(
+        chip,
+        egui::CornerRadius::same(6),
+        egui::Stroke::new(1.0, HUD_CHIP_EDGE),
+        egui::StrokeKind::Inside,
+    );
+    chip
+}
+
+/// `painter.text` wearing the shared chip: lays `text` out no-wrap
+/// (single line — the chip widens, the text never folds), backs it
+/// with the dark backing, then draws it. `pos`/`align` anchor exactly
+/// like `painter.text` did, so call sites keep their coordinates.
+pub(crate) fn paint_chip_text(
+    painter: &egui::Painter,
+    pos: egui::Pos2,
+    align: egui::Align2,
+    text: impl Into<String>,
+    font: egui::FontId,
+    color: egui::Color32,
+) {
+    let galley = painter.layout_no_wrap(text.into(), font, color);
+    let text_rect = align.anchor_size(pos, galley.size());
+    paint_hud_chip(painter, text_rect);
+    painter.galley(text_rect.min, galley, color);
+}
+
 /// Everything the M0 debug panel needs — mirrors and session values only.
 ///
 /// Populated per frame by the `UiBuild` system in `csp-view`. Every field is
@@ -149,10 +217,14 @@ pub fn debug_panel(
 /// VAB's pointer input against it (a click on the dialog must not reach
 /// the craft behind it).
 pub fn crash_dialog(ctx: &egui::Context, reason: &str, bundle: Option<&str>) -> egui::Rect {
+    let screen = ctx.content_rect();
     egui::Window::new("Simulation halted")
         .collapsible(false)
         .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .default_pos(egui::pos2(
+            screen.center().x - 230.0,
+            screen.center().y - 90.0,
+        ))
         .show(ctx, |ui| {
             ui.colored_label(
                 egui::Color32::RED,
@@ -261,6 +333,7 @@ pub struct MapOrbitInfo {
 /// hint bar prints bindings, not hardcoded names, so a rebind never
 /// leaves the overlay lying about which key does what.
 #[allow(clippy::too_many_arguments)] // one overlay = one data bag
+#[allow(clippy::too_many_lines)] // labels + readout + hint bar in one pass
 pub fn map_overlay(
     ctx: &egui::Context,
     focus_name: &str,
@@ -292,49 +365,23 @@ pub fn map_overlay(
             }
 
             // The focused orbit's readout — top-right, out of the
-            // hint bar's way. Radii print as surface altitudes when the
-            // parent radius is known, else raw radii (star-center
-            // orbits have no "surface" to subtract).
+            // hint bar's way.
             if let Some(o) = orbit {
-                let alt = |r: f64| o.parent_radius_m.map_or(r, |rad| r - rad);
-                let lines = [
-                    (format!("{}  orbiting  {}", o.name, o.parent_name), 190),
-                    (
-                        match o.apo_r_m {
-                            Some(r) => format!("Ap   {}", fmt_distance(alt(r))),
-                            None => "Ap   — escape".to_string(),
-                        },
-                        170,
-                    ),
-                    (format!("Pe   {}", fmt_distance(alt(o.pe_r_m))), 170),
-                    (
-                        match o.period_s {
-                            Some(t) => format!("T    {}", fmt_period(t)),
-                            None => "T    —".to_string(),
-                        },
-                        150,
-                    ),
-                ];
-                let mono = egui::FontId::monospace(12.0);
-                let mut y = rect.top() + 34.0;
-                for (line, gray) in lines {
-                    painter.text(
-                        egui::pos2(rect.right() - 12.0, y),
-                        egui::Align2::RIGHT_TOP,
-                        &line,
-                        mono.clone(),
-                        egui::Color32::from_gray(gray),
-                    );
-                    y += 15.0;
-                }
+                paint_orbit_readout(painter, rect, o);
             }
 
             let pan = |a: settings::KeyAction| {
                 keys.first_binding_label(a, key_labels)
                     .unwrap_or_else(|| "—".to_string())
             };
-            painter.text(
-                egui::pos2(rect.left() + 10.0, rect.bottom() - 8.0),
+            // The hint bar gets the chip too — a long gray line raw on
+            // the scene illegible-mixed into whatever passed under it.
+            paint_chip_text(
+                painter,
+                egui::pos2(
+                    rect.left() + 10.0 + HUD_CHIP_PAD.x,
+                    rect.bottom() - 8.0 - HUD_CHIP_PAD.y,
+                ),
                 egui::Align2::LEFT_BOTTOM,
                 format!(
                     "MAP  ·  focus: {focus_name}  ·  camera {camera_distance_m:.3e} m  \
@@ -349,7 +396,7 @@ pub fn map_overlay(
                     pan(settings::KeyAction::PanRight),
                 ),
                 egui::FontId::proportional(13.0),
-                egui::Color32::from_gray(180),
+                egui::Color32::from_gray(215),
             );
         });
 }
@@ -398,6 +445,61 @@ fn paint_map_label(
     placed.push(rect_at);
     painter.galley_with_override_text_color(pos + egui::vec2(1.2, 1.2), galley.clone(), shadow);
     painter.galley(pos, galley, c);
+}
+
+/// The map's top-right orbit readout — the focused conic's apsides +
+/// period. Radii print as surface altitudes when the parent radius is
+/// known, else raw radii (star-center orbits have no "surface" to
+/// subtract). Extracted from [`map_overlay`] under the line budget;
+/// the block wears the shared chip — it used to sit raw on the scene.
+fn paint_orbit_readout(painter: &egui::Painter, rect: egui::Rect, o: &MapOrbitInfo) {
+    let alt = |r: f64| o.parent_radius_m.map_or(r, |rad| r - rad);
+    let lines = [
+        (format!("{}  orbiting  {}", o.name, o.parent_name), 215),
+        (
+            match o.apo_r_m {
+                Some(r) => format!("Ap   {}", fmt_distance(alt(r))),
+                None => "Ap   — escape".to_string(),
+            },
+            200,
+        ),
+        (format!("Pe   {}", fmt_distance(alt(o.pe_r_m))), 200),
+        (
+            match o.period_s {
+                Some(t) => format!("T    {}", fmt_period(t)),
+                None => "T    —".to_string(),
+            },
+            180,
+        ),
+    ];
+    let mono = egui::FontId::monospace(12.5);
+    let right = rect.right() - 12.0;
+    let line_h = 15.0;
+    let galleys: Vec<std::sync::Arc<egui::Galley>> = lines
+        .iter()
+        .map(|(line, gray)| {
+            painter.layout_no_wrap(line.clone(), mono.clone(), egui::Color32::from_gray(*gray))
+        })
+        .collect();
+    let line_rect = |i: usize, g: &egui::Galley| {
+        egui::Rect::from_min_size(
+            egui::pos2(right - g.size().x, rect.top() + 34.0 + i as f32 * line_h),
+            g.size(),
+        )
+    };
+    let text_rect = galleys
+        .iter()
+        .enumerate()
+        .fold(None::<egui::Rect>, |acc, (i, g)| {
+            let r = line_rect(i, g);
+            Some(acc.map_or(r, |u: egui::Rect| u.union(r)))
+        });
+    if let Some(tr) = text_rect {
+        paint_hud_chip(painter, tr);
+    }
+    for (i, g) in galleys.iter().enumerate() {
+        painter.galley(line_rect(i, g).min, g.clone(), egui::Color32::WHITE);
+    }
 }
 
 /// Mirrors for the M4c flight HUD — populated by `csp-view`'s
@@ -592,6 +694,11 @@ fn fmt_opt(v: Option<f64>, f: impl Fn(f64) -> String) -> String {
 /// Drawn by `csp-view`'s `UiBuild` unconditionally; TTL aging lives in
 /// `flight_present`, which runs in every mode, so the stack fades on
 /// schedule wherever it is read.
+///
+/// Readability: the cues wear the shared dark chip ([`hud_frame`]) —
+/// bare amber text washed out over bright terrain/sky — and every line
+/// is [`egui::TextWrapMode::Extend`], i.e. single-line: the bar widens
+/// to fit the longest cue instead of wrapping it to two rows.
 pub fn notice_overlay(ctx: &egui::Context, lines: &[String]) {
     if lines.is_empty() {
         return;
@@ -600,16 +707,24 @@ pub fn notice_overlay(ctx: &egui::Context, lines: &[String]) {
     egui::Area::new(egui::Id::unique("flight_sfx"))
         .order(egui::Order::Foreground)
         .interactable(false)
-        .fixed_pos(egui::pos2(rect.center().x, rect.top() + 48.0))
+        .fixed_pos(egui::pos2(rect.center().x, rect.top() + 44.0))
         .pivot(egui::Align2::CENTER_TOP)
         .show(ctx, |ui| {
-            for line in lines {
-                ui.label(
-                    egui::RichText::new(format!("« {line} »"))
-                        .font(egui::FontId::proportional(17.0))
-                        .color(egui::Color32::from_rgb(255, 196, 64)),
-                );
-            }
+            hud_frame().show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    for line in lines {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!("« {line} »"))
+                                    .font(egui::FontId::proportional(17.0))
+                                    .color(NOTICE_AMBER),
+                            )
+                            .wrap_mode(egui::TextWrapMode::Extend)
+                            .selectable(false),
+                        );
+                    }
+                });
+            });
         });
 }
 
@@ -633,15 +748,21 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
     let rect = ctx.content_rect();
     const BALL_R: f32 = 64.0;
     let ball_center = egui::pos2(rect.center().x, rect.bottom() - BALL_R - 30.0);
+    // `movable` — the readout block is a real overlay now: grab it
+    // anywhere on its surface and drag it out of the way (KSP-style).
     egui::Area::new(egui::Id::unique("flight_hud"))
         .order(egui::Order::Foreground)
-        .interactable(false)
-        .fixed_pos(egui::pos2(10.0, rect.bottom() - 170.0))
+        .movable(true)
+        .default_pos(egui::pos2(rect.left() + 10.0, rect.bottom() - 170.0))
         .show(ctx, |ui| {
+            // The shared chip: telemetry used to float gray text on the
+            // scene — unreadable over bright terrain. The panel backs
+            // every readout now (the navball is its own opaque draw).
+            hud_frame().show(ui, |ui| {
             if !input.has_vessel {
                 ui.label(
                     egui::RichText::new("FLIGHT — no vessel in the bubble")
-                        .color(egui::Color32::from_gray(200)),
+                        .color(egui::Color32::from_gray(225)),
                 );
                 ui.label(
                     egui::RichText::new(format!(
@@ -650,14 +771,14 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
                         input.keys.hint(settings::KeyAction::ToggleMap),
                         input.keys.hint(settings::KeyAction::ToggleHelp),
                     ))
-                    .color(egui::Color32::from_gray(150)),
+                    .color(egui::Color32::from_gray(185)),
                 );
                 return;
             }
-            let mono = egui::FontId::monospace(13.0);
-            let c = egui::Color32::from_gray(220);
-            let dim = egui::Color32::from_gray(160);
-            let head = egui::Color32::from_gray(115);
+            let mono = egui::FontId::monospace(14.0);
+            let c = egui::Color32::from_gray(225);
+            let dim = egui::Color32::from_gray(185);
+            let head = egui::Color32::from_rgb(150, 195, 225);
             // The readout grid: two `TAG value` cells per row — left
             // cell a 4-char tag + 12-wide value, right cell a 6-char
             // tag + 12-wide value (35 columns of mono).
@@ -857,7 +978,7 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
             );
             ui.label(
                 egui::RichText::new(format!(
-                    "[{}] controls  ·  [{}]/[{}] throttle [{}]/[{}]  ·  [{}] stage  ·  [{}] map  [{}] VAB",
+                    "[{}] controls  ·  [{}]/[{}] throttle [{}]/[{}]  ·  [{}] stage  ·  [{}] map  [{}] VAB  ·  [{}] program  ·  RMB on a part: actions",
                     input.keys.hint_labeled(settings::KeyAction::ToggleHelp, input.key_labels),
                     input
                         .keys
@@ -880,24 +1001,38 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
                     input
                         .keys
                         .hint_labeled(settings::KeyAction::ToggleVab, input.key_labels),
+                    input
+                        .keys
+                        .hint_labeled(settings::KeyAction::OpenProgram, input.key_labels),
                 ))
-                .color(egui::Color32::from_gray(140)),
+                .color(egui::Color32::from_gray(180)),
             );
+            });
         });
-    // The navball — a raw painter draw beside the Area so it can sit
-    // dead-center-bottom like the flight instrument it is.
-    let painter = ctx.layer_painter(egui::LayerId::new(
-        egui::Order::Foreground,
-        egui::Id::unique("flight_navball"),
-    ));
+    // The navball — its own movable instrument Area (ball + heading
+    // tape), drag-anywhere like the readout block. The allocated box
+    // leaves the tape's 16 px strip under the ball.
     if input.has_vessel {
-        navball::navball(&painter, ball_center, BALL_R, &input.navball);
-        navball::heading_tape(
-            &painter,
-            ball_center + egui::vec2(0.0, BALL_R + 4.0),
-            BALL_R * 2.0,
-            input.heading_deg,
-        );
+        const TAPE_H: f32 = 20.0;
+        let nav_size = egui::vec2(BALL_R * 2.0 + 8.0, BALL_R * 2.0 + TAPE_H + 4.0);
+        egui::Area::new(egui::Id::unique("flight_navball"))
+            .order(egui::Order::Foreground)
+            .movable(true)
+            .default_pos(egui::pos2(
+                ball_center.x - nav_size.x * 0.5,
+                rect.bottom() - nav_size.y - 6.0,
+            ))
+            .show(ctx, |ui| {
+                let (box_rect, _resp) = ui.allocate_exact_size(nav_size, egui::Sense::hover());
+                let center = egui::pos2(box_rect.center().x, box_rect.top() + 4.0 + BALL_R);
+                navball::navball(ui.painter(), center, BALL_R, &input.navball);
+                navball::heading_tape(
+                    ui.painter(),
+                    center + egui::vec2(0.0, BALL_R + 4.0),
+                    BALL_R * 2.0,
+                    input.heading_deg,
+                );
+            });
     }
 }
 
@@ -913,9 +1048,15 @@ pub fn help_panel(
     open: &mut bool,
 ) -> egui::Rect {
     let mut o = *open;
+    // Parks right-center on first open; the title bar drags it
+    // anywhere after that.
+    let screen = ctx.content_rect();
     let rect = egui::Window::new("Controls")
         .open(&mut o)
-        .anchor(egui::Align2::RIGHT_CENTER, egui::vec2(-12.0, 0.0))
+        .default_pos(egui::pos2(
+            screen.right() - 402.0,
+            screen.center().y - 210.0,
+        ))
         .resizable(false)
         .collapsible(false)
         .show(ctx, |ui| {
@@ -953,6 +1094,10 @@ pub fn help_panel(
                     ("RMB / MMB drag", "pan (map)"),
                     ("click (map)", "focus body / vessel"),
                     ("click (VAB)", "select part"),
+                    (
+                        "RMB (flight)",
+                        "part actions — run science, deploy chute, recover",
+                    ),
                 ] {
                     ui.label(egui::RichText::new(act).monospace());
                     ui.label(desc);

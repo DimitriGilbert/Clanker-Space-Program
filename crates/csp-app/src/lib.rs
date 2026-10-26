@@ -1377,6 +1377,75 @@ impl App {
     #[cfg(target_arch = "wasm32")]
     fn ui_confirm(&self) {}
 
+    /// One warp-ladder step, shared by the key verbs (`dispatch`) and
+    /// the panel outbox (`UiOutbox::warp_step`). The press is never a
+    /// dead key — every path that cannot take effect lands a reason on
+    /// the cue channel:
+    ///   * a §2.13 read-only session → "WARP NOT APPLIED";
+    ///   * a request already at the settings/ladder ceiling →
+    ///     "WARP ALREADY AT ×N" naming the cap that ate the press;
+    ///   * an active §2.6.2 rails refusal → "WARP REFUSED — <reason>"
+    ///     and NOTHING is recorded: the post-step `rails_warp_refusal`
+    ///     demote would hold the request at ×1 for its whole lifetime
+    ///     anyway, so the refusal owns the press outright — no
+    ///     surprise engagement minutes later when the state clears;
+    ///   * a rung above the §2.6.3 margined budget → the request still
+    ///     queues (the derate is the designed hold — it engages if the
+    ///     scene lightens) plus a "WARP LIMITED" reason.
+    ///
+    /// A legal step-up records and engages through the promotion
+    /// hysteresis, per §2.6.3's letter.
+    fn warp_step_request(&mut self, step: i32) {
+        if self.read_only {
+            // Same §2.13 discipline as before: a halted session's
+            // `decide` never runs, so the request would change
+            // nothing — say so.
+            self.view
+                .flight_notice("SESSION IS READ-ONLY — WARP NOT APPLIED");
+            return;
+        }
+        if step <= 0 {
+            self.warp.request_step(step);
+            return;
+        }
+        // The ceiling (settings cap or ladder top) eating the press is
+        // a dead key unless it says so.
+        if self.warp.request_preview(step) == self.warp.request_preview(0) {
+            let why = if self.warp.capped_below_ladder_top() {
+                "SETTINGS LIMIT"
+            } else {
+                "LADDER TOP"
+            };
+            self.view.flight_notice(format!(
+                "WARP ALREADY AT ×{} — {why}",
+                self.warp.multiplier_at(self.warp.request_preview(0))
+            ));
+            return;
+        }
+        // §2.6.2's gate at the press, not a frame later: the sim's
+        // own reason lands on the cue channel EVERY press — the
+        // `last_refusal` latch on the post-step side only covers the
+        // refusal's appearance, so a held refusal (the whole
+        // in-atmosphere climb) used to eat every later press silently.
+        if let Some(reason) = self.view.sim.rails_warp_refusal() {
+            self.view
+                .flight_notice(format!("WARP REFUSED — {}", reason.to_uppercase()));
+            return;
+        }
+        self.warp.request_step(step);
+        // §2.6.3's budget: the rung just asked for may sit above what
+        // the measured per-tick cost can promote — the request still
+        // queues (the derate is the designed hold; it engages when the
+        // scene lightens) but the press says why nothing changed yet.
+        let target = self.warp.request_preview(0);
+        if target > self.warp.promotable_ceiling() {
+            self.view.flight_notice(format!(
+                "WARP LIMITED — ×{} EXCEEDS THE STEP-TIME BUDGET",
+                self.warp.multiplier_at(target)
+            ));
+        }
+    }
+
     /// The one-frame-late half of the frame (§2.5): apply every request
     /// the last `UiBuild` pass wrote into its outbox — mode changes,
     /// craft file ops, the settings panel's Apply, node commands.
@@ -1384,15 +1453,7 @@ impl App {
     fn handle_ui_outbox(&mut self, mut outbox: csp_view::UiOutbox) {
         self.handle_game_verbs(&mut outbox);
         if outbox.warp_step != 0 {
-            if self.read_only {
-                // Same §2.13 discipline as the key-driven warp verbs:
-                // a halted session's `decide` never runs, so the
-                // request would change nothing — say so.
-                self.view
-                    .flight_notice("SESSION IS READ-ONLY — WARP NOT APPLIED");
-            } else {
-                self.warp.request_step(outbox.warp_step);
-            }
+            self.warp_step_request(outbox.warp_step);
         }
         if let Some(mode) = outbox.mode {
             self.ui_confirm();
@@ -2605,18 +2666,12 @@ impl App {
                     ViewMode::Map
                 });
             }
-            // §2.6.3: request_step lands in the controller and becomes a
-            // logged `SetWarp` on the next decide(). While halted the
-            // decide never runs — the press used to change literally
-            // nothing; say so instead of dying silently.
+            // §2.6.3: the step lands in the controller and becomes a
+            // logged `SetWarp` on the next decide() — or a reason on
+            // the cue channel when it can't (`warp_step_request`
+            // refuses dead keys loudly).
             KeyAction::WarpUp | KeyAction::WarpDown => {
-                if self.read_only {
-                    self.view
-                        .flight_notice("SESSION IS READ-ONLY — WARP NOT APPLIED");
-                } else {
-                    self.warp
-                        .request_step(if action == KeyAction::WarpUp { 1 } else { -1 });
-                }
+                self.warp_step_request(if action == KeyAction::WarpUp { 1 } else { -1 });
             }
             // M4c flight throttle — the §7.6 command channel, snap
             // verbs and the held axis share the mode gate and the
@@ -4061,6 +4116,87 @@ mod tests {
         assert_eq!(app.warp.requested_multiplier(), 1);
     }
 
+    /// The warp press is never a dead key: a legal step-up queues, an
+    /// active §2.6.2 refusal lands "WARP REFUSED — <reason>" on the cue
+    /// channel EVERY press and records nothing, and the ladder ceiling
+    /// names itself. The held-refusal case is the shipped hole — the
+    /// post-step `last_refusal` latch only narrates the refusal's
+    /// appearance, so an in-atmosphere climb used to eat every later
+    /// press silently.
+    #[test]
+    fn warp_press_always_says_why() {
+        let dir = tempdir("warp-feedback");
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        let cues = |app: &App| -> Vec<String> {
+            app.view
+                .world
+                .resource::<csp_view::flight::FlightSfx>()
+                .cues
+                .iter()
+                .map(|c| c.text.clone())
+                .collect()
+        };
+        let frame = |app: &mut App, ticks: u64| {
+            let target = app.view.sim.clock().ticks() + ticks;
+            app.view.begin_frame();
+            app.view.sim_step(target).unwrap();
+            app.view.end_frame();
+        };
+        frame(&mut app, 320); // settle the seeded pad craft to its latch
+        // Latched = out of the bubble → the §2.6.2 predicate is
+        // vacuous; a legal step-up queues (decide folds it; the
+        // §2.6.3 hysteresis engages it).
+        app.dispatch(KeyAction::WarpUp);
+        app.warp.decide();
+        assert_eq!(app.warp.requested_multiplier(), 2);
+        // Throttle the craft: under thrust + in atmosphere + in
+        // contact — the §2.6.2 refusal holds and EVERY press says why.
+        let vessel = app.view.flight_focus().unwrap();
+        app.view.enqueue_command(
+            SourceClass::Ui,
+            0,
+            SimCommand::SetThrottle {
+                vessel,
+                throttle: 1.0,
+            },
+        );
+        frame(&mut app, 8);
+        assert!(
+            app.view.sim.rails_warp_refusal().is_some(),
+            "a throttled in-atmosphere craft must refuse rails warp"
+        );
+        app.dispatch(KeyAction::WarpUp);
+        assert!(
+            cues(&app).iter().any(|c| c.contains("WARP REFUSED")),
+            "a refused press posted nothing: {:?}",
+            cues(&app)
+        );
+        app.warp.decide();
+        // The refusal owns the press — nothing was queued to engage
+        // silently when the state later clears.
+        assert_eq!(app.warp.requested_multiplier(), 2);
+        app.dispatch(KeyAction::WarpUp);
+        assert_eq!(
+            cues(&app)
+                .iter()
+                .filter(|c| c.contains("WARP REFUSED"))
+                .count(),
+            2,
+            "a held refusal must narrate EVERY press"
+        );
+        // Step-down is ungated — it still lands.
+        app.dispatch(KeyAction::WarpDown);
+        app.warp.decide();
+        assert_eq!(app.warp.requested_multiplier(), 1);
+        // The ceiling press names the cap that ate it — checked while
+        // the refusal still holds (the dead key outranks it).
+        app.warp.request_step(99);
+        app.warp.decide();
+        assert_eq!(app.warp.requested_multiplier(), 100_000);
+        app.dispatch(KeyAction::WarpUp);
+        assert!(cues(&app).iter().any(|c| c.contains("WARP ALREADY AT")));
+    }
+
     /// P02-F2's axis half: a ramp start on a focus with no bubble
     /// body — the latched pad craft — must NOT squash `throttle_axis`
     /// to 0; the axis is the wall-side commanded value and the sim's
@@ -4524,9 +4660,7 @@ mod tests {
                     SimCommand::SetWarp(level),
                 );
             }
-            let target = app
-                .warp
-                .target_tick(app.view.sim.clock().ticks(), dt_wall);
+            let target = app.warp.target_tick(app.view.sim.clock().ticks(), dt_wall);
             app.view.enqueue_command(
                 SourceClass::Ui,
                 WARP_SOURCE_ID,

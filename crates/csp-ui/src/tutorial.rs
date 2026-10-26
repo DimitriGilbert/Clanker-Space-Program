@@ -308,9 +308,11 @@ impl TutorialState {
 /// through this function. `keys` is the live keymap the coaching
 /// lines' `{key}` placeholders resolve against.
 ///
-/// The anchor is mode-aware: the VAB's Craft inspector owns the
-/// right-top corner, so `in_vab` drops the card to center-top where
-/// it overlaps nothing; flight/map keep the free right-top slot.
+/// The parking spot is mode-aware: the VAB's Craft inspector owns
+/// the right-top corner, so `in_vab` drops the card to center-top
+/// where it overlaps nothing; flight/map keep the free right-top
+/// slot. Once shown it is a normal window — the player drags it by
+/// the title bar wherever it bothers least.
 /// Returns the drawn window rect — the host masks the VAB's pointer
 /// input against it (the default-on card sits over the build area).
 pub fn tutorial_overlay(
@@ -320,13 +322,14 @@ pub fn tutorial_overlay(
     key_labels: &std::collections::BTreeMap<String, String>,
     in_vab: bool,
 ) -> egui::Rect {
-    let anchor = if in_vab {
-        (egui::Align2::CENTER_TOP, egui::vec2(0.0, 30.0))
+    let screen = ctx.content_rect();
+    let pos = if in_vab {
+        egui::pos2(screen.center().x - 145.0, screen.top() + 30.0)
     } else {
-        (egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 30.0))
+        egui::pos2(screen.right() - 298.0, screen.top() + 30.0)
     };
     egui::Window::new("First flight")
-        .anchor(anchor.0, anchor.1)
+        .default_pos(pos)
         .collapsible(true)
         .resizable(false)
         .default_width(290.0)

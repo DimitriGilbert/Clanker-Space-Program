@@ -257,6 +257,15 @@ pub struct ProgramMirror {
     pub lab_slots: std::collections::BTreeMap<u64, u32>,
 }
 
+/// The flight part-action menu's session state (§2.2-C) — the
+/// `csp_ui::program::PartMenuState` model wrapped as a resource, the
+/// same convention as [`ManeuverPanelRes`]/[`SettingsPanelRes`]: the
+/// right-click pick writes it, `part_menu` mutates it, and
+/// `build_ui` closes it when its vessel leaves the program mirror's
+/// focus.
+#[derive(Resource, Default)]
+pub struct PartMenuRes(pub csp_ui::program::PartMenuState);
+
 /// The rolling `script_log` tail (W2.5) — session/presentation state,
 /// never sim state. `AdvanceReport::script_log` is consumed per step
 /// (mem::take'd out of the world), so `csp-app` folds each report's
@@ -447,6 +456,8 @@ struct ProgramUi<'w> {
     mirror: Res<'w, ProgramMirror>,
     /// The §3.7 flight-notice cue stack (`flight_notice`'s channel).
     sfx: ResMut<'w, flight::FlightSfx>,
+    /// The right-click part menu's session state.
+    menu: ResMut<'w, PartMenuRes>,
 }
 
 /// The map-mode mirrors + panel session states as one system param —
@@ -473,6 +484,22 @@ struct MapUi<'w> {
     planning: ResMut<'w, map::MapPlanning>,
 }
 
+/// The flight-mode pointer-pick bundle — the staged scene, the solved
+/// chase camera, and the focus pin, kept as one SystemParam so
+/// [`build_ui`] stays under bevy's 16-parameter cap (the [`MapUi`]/
+/// [`ProgramUi`] precedent). The pick resolves the vessel the SAME way
+/// `stage_program` did — the menu's commands name the mirror's focused
+/// vessel, so the pick must too.
+#[derive(bevy_ecs::system::SystemParam)]
+struct FlightScene<'w> {
+    /// The mirrored flight scene — the pick targets.
+    snap: Res<'w, flight::FlightSnapshot>,
+    /// The solved chase camera — the projection.
+    cam: Res<'w, flight::FlightCameraF64>,
+    /// The flight-focus pin/override — the shared resolver.
+    focus: Res<'w, flight::FlightFocusOverride>,
+}
+
 /// The entire egui pass (§2.5 #5, Appendix A item 3): build the plain-data
 /// panel input from mirrors, run `csp_ui`'s pure panel functions under
 /// `egui::Context::run_ui`, store the `FullOutput` for `csp-app`'s painter,
@@ -490,6 +517,7 @@ fn build_ui(
     mut vab: ResMut<vab::VabSessionRes>,
     craft_files: Res<vab::CraftFileList>,
     flight_ui: Res<flight::FlightUiData>,
+    scene: FlightScene,
     mut map: MapUi,
     mut settings_state: ResMut<SettingsPanelRes>,
     mut prog_ui: ProgramUi,
@@ -594,6 +622,11 @@ fn build_ui(
             palette_rect = editor_rects.first().copied();
             ui_masks.extend(editor_rects);
         }
+        // The program-command queue — every surface that emits
+        // `ProgramCommand`s this pass (the Program window, the flight
+        // action strip, the right-click part menu) feeds one bag;
+        // resolution against the ProgramMirror happens once below.
+        let mut panel_cmds: Vec<csp_ui::program::ProgramCommand> = Vec::new();
         if mode == csp_ui::ModeSelect::Flight {
             csp_ui::flight_hud(
                 ctx,
@@ -644,15 +677,85 @@ fn build_ui(
                 },
             );
         }
+        if mode == csp_ui::ModeSelect::Flight {
+            // The in-flight action surfaces — the science/recovery
+            // loop reachable where the player looks: the always-
+            // visible Actions strip (bottom right) and the right-
+            // click part menu (the KSP-style per-part action list).
+            // Both emit `ProgramCommand`s that resolve against the
+            // same ProgramMirror below.
+            let mut action = csp_ui::program::FlightActionOutput::default();
+            ui_masks.push(csp_ui::program::flight_action_bar(
+                ctx,
+                &prog_ui.mirror.input,
+                &session.keys,
+                &session.key_labels,
+                &mut action,
+            ));
+            // Right-click = the part menu. The egui pointer owns the
+            // gesture; a click over UI is egui's business, never a
+            // scene pick. The two queries stay separate calls —
+            // `egui_wants_pointer_input` re-locks the input inside
+            // `ctx.input`'s reader and deadlocks if nested.
+            let rclick = ctx.input(|i| {
+                i.pointer
+                    .secondary_clicked()
+                    .then(|| i.pointer.interact_pos())
+                    .flatten()
+            });
+            let over_ui = ctx.egui_wants_pointer_input();
+            if let Some(pos) = rclick
+                && !over_ui
+            {
+                let (node, open) = match flight::pick_part(
+                    &scene.cam,
+                    scene.focus.resolve(&scene.snap.vessels),
+                    ctx.content_rect(),
+                    pos,
+                ) {
+                    Some(flight::FlightPick::Part(node)) => (Some(node), true),
+                    Some(flight::FlightPick::Vessel) => (None, true),
+                    None => (None, false),
+                };
+                prog_ui.menu.0 = csp_ui::program::PartMenuState {
+                    open,
+                    node,
+                    vessel: prog_ui.mirror.vessel.map_or(u64::MAX, |v| v.0),
+                    pos,
+                };
+            }
+            // A menu whose vessel left the mirror's focus is stale —
+            // a same-numbered node would fire on the new focus.
+            if prog_ui.menu.0.open
+                && prog_ui.menu.0.vessel != prog_ui.mirror.vessel.map_or(u64::MAX, |v| v.0)
+            {
+                prog_ui.menu.0.open = false;
+            }
+            if prog_ui.menu.0.open {
+                ui_masks.push(csp_ui::program::part_menu(
+                    ctx,
+                    &prog_ui.mirror.input,
+                    &mut prog_ui.menu.0,
+                    &mut action,
+                ));
+            }
+            if action.open_program {
+                prog_ui.panels.program = true;
+                prog_ui.menu.0.open = false;
+            }
+            panel_cmds.extend(action.commands);
+        }
         // The program economy readout — funds/science/contracts drawn
         // in EVERY mode so program state is never hidden behind a view
-        // switch; the Program window itself is toggleable.
-        csp_ui::program::program_status(
+        // switch; the strip is also a button — it opens the window.
+        if csp_ui::program::program_status(
             ctx,
             prog_ui.mirror.input.funds,
             prog_ui.mirror.input.science,
             prog_ui.mirror.input.active.len(),
-        );
+        ) {
+            prog_ui.panels.program = true;
+        }
         if prog_ui.panels.program {
             let mut open = true;
             let mut cmds = Vec::new();
@@ -665,15 +768,20 @@ fn build_ui(
             if !open {
                 prog_ui.panels.program = false;
             }
+            panel_cmds.extend(cmds);
+        }
+        // The §3.7 dead-click rule made loud: every panel command —
+        // window, action strip, or part menu — resolves against the
+        // ProgramMirror it was drawn from; a drop on a stale mirror
+        // posts a cue, never eats a click silently (W1.2's
+        // silent-`RunExperiment` class).
+        {
             let mut dropped = Vec::new();
-            outbox.program = cmds
-                .into_iter()
-                .filter_map(|c| program_command(&prog_ui.mirror, c, &mut dropped))
-                .collect();
-            // The §3.7 dead-click rule made loud: a panel command that
-            // drops on a stale mirror posts a cue — the channel can
-            // never again eat a click the button claimed was legal
-            // (W1.2's silent-`RunExperiment` class).
+            outbox.program.extend(
+                panel_cmds
+                    .into_iter()
+                    .filter_map(|c| program_command(&prog_ui.mirror, c, &mut dropped)),
+            );
             for text in dropped {
                 prog_ui.sfx.cues.push_back(flight::SfxCue {
                     text: format!("COMMAND DROPPED — {text}"),
@@ -1945,6 +2053,8 @@ impl View {
         // `stage_program` each `end_frame`; LocStrings/BiomeMaps/
         // BodyRadii are data-derived constants `from_source` fills in).
         world.insert_resource(ProgramMirror::default());
+        // The right-click part menu's session state.
+        world.insert_resource(PartMenuRes::default());
         world.insert_resource(ScriptLogMirror::default());
         world.insert_resource(LocStrings::default());
         world.insert_resource(BiomeMaps::default());
@@ -4804,6 +4914,13 @@ fn stage_program_world(
                     .and_then(|pid| sim.parts().get(pid))
                     .map(|d| name_of(&d.display_name, d.id.as_str()))
                     .unwrap_or_else(|| format!("part {}", nid.0));
+                // The part-action surfaces' name table — the
+                // right-click pick resolves a node against these
+                // rows (and the whole-vessel menu lists them).
+                input.parts.push(up::PartRow {
+                    node: nid.0,
+                    part: part_name.clone(),
+                });
                 if let Some(lab) = &part.lab {
                     lab_slots.insert(nid.0, lab.researcher_slots);
                     input.labs.push(up::LabRow {
@@ -5171,18 +5288,30 @@ mod tests {
             });
         }
         // …and a click on genuinely free viewport still publishes the
-        // hover ray — the mask set must not eat the whole screen.
-        view.set_egui_input(input(vec![egui::Event::PointerMoved(egui::pos2(
-            400.0, 500.0,
-        ))]));
-        view.begin_frame();
-        view.end_frame();
-        view.with_vab_session(|v| {
-            assert!(
-                v.cursor_px().is_some(),
-                "unmasked viewport no longer publishes the hover ray"
-            );
-        });
+        // hover ray — the mask set must not eat the whole screen. The
+        // overlay union shifts as panels grow rows (the help card's
+        // flight-controls list did), so probe a few candidate free
+        // pixels — one clear viewport point must survive.
+        let mut published = false;
+        for pos in [
+            egui::pos2(400.0, 500.0),
+            egui::pos2(700.0, 500.0),
+            egui::pos2(700.0, 400.0),
+            egui::pos2(750.0, 550.0),
+            egui::pos2(640.0, 450.0),
+        ] {
+            view.set_egui_input(input(vec![egui::Event::PointerMoved(pos)]));
+            view.begin_frame();
+            view.end_frame();
+            if view.with_vab_session(|v| v.cursor_px().is_some()) {
+                published = true;
+                break;
+            }
+        }
+        assert!(
+            published,
+            "every overlay mask still leaves a free viewport point"
+        );
     }
 
     /// §3.5's recovery verbs reach the sim: the panel's Recover /

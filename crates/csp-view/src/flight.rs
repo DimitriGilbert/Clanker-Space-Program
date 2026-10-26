@@ -160,6 +160,11 @@ pub enum PartKind {
 /// the collider bounds the sheath/dust VFX still measure against.
 #[derive(Clone, Debug)]
 pub struct FlightPart {
+    /// `PartNodeId.0` — the right-click part menu's pick key: the
+    /// screen-space pick resolves *this* node and the emitted
+    /// `RunExperiment`/`DeployPart` commands name it. `u64::MAX` for
+    /// the craft-less hull fallback (no graph node to name).
+    pub node: u64,
     /// Body-frame AABB min corner of the part's collider (plasma
     /// sheath + dust extent — the honest contact/glow bounds).
     pub lo: DVec3,
@@ -1398,6 +1403,7 @@ fn vessel_parts(
                     },
                     kind: PartKind::Structural,
                     model: None,
+                    node: u64::MAX,
                 }
             })
             .collect()
@@ -1443,6 +1449,7 @@ fn vessel_parts(
             shape,
             kind,
             model,
+            node: id.0,
         });
     }
     if parts.is_empty() { fallback() } else { parts }
@@ -1589,6 +1596,113 @@ fn solve_chase_camera(
 /// `vab::VabCameraF64`).
 #[derive(Resource, Default)]
 pub struct FlightCameraF64(pub MapCameraF64);
+
+/// What a flight-mode right-click resolved — the part-action menu's
+/// target (§3.7's in-context surface: the menu emits the same
+/// `RunExperiment`/`DeployPart`/data/recovery commands the Program
+/// window's SCIENCE section does).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlightPick {
+    /// A named part — `PartNodeId.0`, the menu's single-part target.
+    Part(u64),
+    /// The vessel's hull — the click sat on the craft's screen bounds
+    /// (or near it) but on no particular part; the menu lists every
+    /// actionable part instead.
+    Vessel,
+}
+
+/// Screen padding (points) around a part's projected AABB that still
+/// counts as a hit — thin parts (antennae, chute packs) project a few
+/// pixels wide, and a click on their silhouette should not miss.
+const PICK_PART_PAD_PX: f32 = 4.0;
+/// Forgiving-pick radius (points) around a part's projected center —
+/// a click between projected AABBs still names the nearest part.
+const PICK_NEAR_PX: f32 = 48.0;
+
+/// Right-click part picking: project `focus`'s part collider AABBs
+/// through the solved chase camera into `content` (egui points) and
+/// hit-test `cursor`. The frontmost containing part wins (nearest
+/// projected corner depth — the same camera-relative math the emit
+/// pass uses); a near miss picks the closest projected part center;
+/// a click inside the hull's bounding box but on nothing resolves
+/// [`FlightPick::Vessel`] (the whole-vessel action list). `None` = a
+/// total miss — the caller closes any open menu.
+///
+/// All presentation-side — the staged [`FlightBody`] transforms plus
+/// the presentation camera, never the sim.
+pub(crate) fn pick_part(
+    cam: &FlightCameraF64,
+    focus: Option<&FlightBody>,
+    content: egui::Rect,
+    cursor: egui::Pos2,
+) -> Option<FlightPick> {
+    let focus = focus?;
+    if !cam.0.valid || focus.parts.is_empty() {
+        return None;
+    }
+    let to_screen = |w: DVec3| -> Option<egui::Pos2> {
+        project_into(&cam.0.view_proj, cam.0.eye, w).map(|ndc| {
+            egui::pos2(
+                content.left() + (ndc[0] * 0.5 + 0.5) * content.width(),
+                content.top() + (0.5 - ndc[1] * 0.5) * content.height(),
+            )
+        })
+    };
+    let mut hull = egui::Rect::NOTHING;
+    let mut contained: Option<(f64, u64)> = None; // (nearest-corner depth², node)
+    let mut nearest: Option<(f32, u64)> = None; // (screen px, node)
+    for p in &focus.parts {
+        // The collider's body-frame AABB → 8 world corners → the part's
+        // screen-space bounding rect. A part entirely behind the eye
+        // projects nothing and is skipped.
+        let mut pts: Vec<egui::Pos2> = Vec::with_capacity(8);
+        let mut depth2 = f64::INFINITY;
+        for x in [p.lo.x, p.hi.x] {
+            for y in [p.lo.y, p.hi.y] {
+                for z in [p.lo.z, p.hi.z] {
+                    let w = focus.pos + focus.rot.rotate(DVec3::new(x, y, z));
+                    depth2 = depth2.min((w - cam.0.eye).norm_squared());
+                    if let Some(s) = to_screen(w) {
+                        pts.push(s);
+                    }
+                }
+            }
+        }
+        if pts.is_empty() {
+            continue;
+        }
+        let rect = egui::Rect::from_points(&pts);
+        hull = hull.union(rect);
+        let center_w = focus.pos + focus.rot.rotate((p.lo + p.hi) * 0.5);
+        if let Some(cs) = to_screen(center_w) {
+            let d = cs.distance(cursor);
+            if nearest.is_none_or(|(bd, _)| d < bd) {
+                nearest = Some((d, p.node));
+            }
+        }
+        if rect.expand(PICK_PART_PAD_PX).contains(cursor)
+            && contained.is_none_or(|(bd, _)| depth2 < bd)
+        {
+            contained = Some((depth2, p.node));
+        }
+    }
+    let resolve = |node: u64| {
+        if node == u64::MAX {
+            FlightPick::Vessel
+        } else {
+            FlightPick::Part(node)
+        }
+    };
+    if let Some((_, node)) = contained {
+        return Some(resolve(node));
+    }
+    if let Some((d, node)) = nearest
+        && d <= PICK_NEAR_PX
+    {
+        return Some(resolve(node));
+    }
+    (hull.is_positive() && hull.expand(PICK_NEAR_PX).contains(cursor)).then_some(FlightPick::Vessel)
+}
 
 /// `Presentation` schedule — chase-camera solve + HUD mirrors + the
 /// §3.7 SFX cue edges (the schedule's "VFX, audio cues" slot).
@@ -2898,6 +3012,7 @@ mod tests {
                 },
                 kind: PartKind::Structural,
                 model: None,
+                node: 0,
             }],
             // Thrust site at the body origin, dir +Z: the fan tip sits
             // at the vessel, the 1.5 m-radius base ring 36 m along −Z.
@@ -3088,5 +3203,91 @@ mod tests {
         assert_eq!(ui.fuel_depletion_s, Some(0.0));
         assert_eq!(ui.delta_v_mps, Some(0.0));
         assert_eq!(ui.thrust_n, 0.0);
+    }
+
+    /// The right-click pick: the frontmost part under the cursor
+    /// names its node, a near miss picks the closest projected
+    /// center, a hull-edge click resolves the whole vessel, and a
+    /// true miss returns `None` (the caller closes the menu).
+    #[test]
+    fn pick_part_names_the_clicked_node() {
+        let mk = |node: u64, lo: DVec3, hi: DVec3| FlightPart {
+            node,
+            lo,
+            hi,
+            transform: csp_phys::PartTransform::IDENTITY,
+            shape: crate::part_mesh::PartShape::Box { lo, hi },
+            kind: PartKind::Structural,
+            model: None,
+        };
+        let vessel = FlightBody {
+            id: 0,
+            pos: DVec3::ZERO,
+            rot: DQuat::IDENTITY,
+            vel: DVec3::ZERO,
+            throttle: 0.0,
+            debris: false,
+            contact: false,
+            plasma_w_m2: 0.0,
+            nodes: 2,
+            // Node 1 straddles the origin (screen center); node 2
+            // sits 3 m above it (up-screen).
+            parts: vec![
+                mk(1, DVec3::new(-1.0, -1.0, -1.0), DVec3::new(1.0, 1.0, 1.0)),
+                mk(2, DVec3::new(-1.0, 2.0, -1.0), DVec3::new(1.0, 4.0, 1.0)),
+            ],
+            plumes: Vec::new(),
+            com: DVec3::ZERO,
+            latched: false,
+            tanks: Vec::new(),
+        };
+        // Eye on −Z looking back at the origin (the established
+        // `solve_orbit_camera` convention — see the plume test above).
+        let cam = FlightCameraF64(crate::map::solve_orbit_camera(
+            0.0,
+            core::f64::consts::PI,
+            36.0,
+            (320.0, 240.0),
+            DVec3::ZERO,
+            FLIGHT_FOV_Y,
+            0.1,
+        ));
+        let content = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 240.0));
+        let to_screen = |w: DVec3| {
+            let ndc = project_into(&cam.0.view_proj, cam.0.eye, w).unwrap();
+            egui::pos2(
+                content.left() + (ndc[0] * 0.5 + 0.5) * content.width(),
+                content.top() + (0.5 - ndc[1] * 0.5) * content.height(),
+            )
+        };
+        let pick = |p: egui::Pos2| pick_part(&cam, Some(&vessel), content, p);
+        // Dead center = node 1's AABB.
+        assert_eq!(pick(to_screen(DVec3::ZERO)), Some(FlightPick::Part(1)));
+        // Node 2's projected center is up-screen → its menu.
+        assert_eq!(
+            pick(to_screen(DVec3::new(0.0, 3.0, 0.0))),
+            Some(FlightPick::Part(2))
+        );
+        // The forgiving fallback: ~35 px off node 2's projected
+        // center still names it.
+        let near = to_screen(DVec3::new(0.0, 3.0, 0.0)) + egui::vec2(35.0, 0.0);
+        assert_eq!(pick(near), Some(FlightPick::Part(2)));
+        // Beside the hull, outside every part's box but within the
+        // padded bounds → the whole-vessel menu.
+        let hull_side = to_screen(DVec3::new(7.3, 0.0, 0.0));
+        assert_eq!(pick(hull_side), Some(FlightPick::Vessel));
+        // Far away → nothing (menu closes).
+        assert_eq!(pick(to_screen(DVec3::new(0.0, -20.0, 0.0))), None);
+        // No staged camera or vessel → nothing.
+        assert_eq!(
+            pick_part(
+                &FlightCameraF64::default(),
+                Some(&vessel),
+                content,
+                to_screen(DVec3::ZERO)
+            ),
+            None
+        );
+        assert_eq!(pick_part(&cam, None, content, to_screen(DVec3::ZERO)), None);
     }
 }

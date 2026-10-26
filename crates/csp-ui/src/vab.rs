@@ -61,6 +61,8 @@ use csp_phys::resolve::EffectivePart;
 use csp_phys::session::{AttachEdge, CraftSession, Validation};
 use csp_phys::{BuiltPart, MissionProfile, PartNodeId};
 
+use crate::paint_chip_text;
+
 /// How a placement decides *where* the new part mounts — the attach
 /// UX toggle in the action bar. `Auto` reads the hovered face: top or
 /// bottom caps stack axially, the hull side surface-mounts.
@@ -2174,7 +2176,7 @@ pub fn top_bar(
 ) -> egui::Rect {
     egui::Window::new("mode_bar")
         .title_bar(false)
-        .anchor(egui::Align2::LEFT_TOP, egui::vec2(0.0, 0.0))
+        .default_pos(ctx.content_rect().left_top())
         .resizable(false)
         .collapsible(false)
         .show(ctx, |ui| {
@@ -2467,9 +2469,16 @@ pub fn vab_pointer_input(
 /// controls: radial symmetry, the attach-mode override, and the
 /// obvious remove/cancel affordances the old hint-only UI lacked.
 fn action_bar(ctx: &egui::Context, vab: &mut VabSession) -> egui::Rect {
+    // No title bar ⇒ egui drags the strip from anywhere on its
+    // surface (WindowDrag::Anywhere) — parked bottom-center by
+    // default, movable like every other overlay.
+    let screen = ctx.content_rect();
     egui::Window::new("vab_actions")
         .title_bar(false)
-        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -28.0))
+        .default_pos(egui::pos2(
+            screen.center().x - 360.0,
+            screen.bottom() - 58.0,
+        ))
         .resizable(false)
         .collapsible(false)
         .show(ctx, |ui| {
@@ -2738,7 +2747,7 @@ fn category_tint(cat: csp_data::PartCategory) -> egui::Color32 {
 /// pointer pass can mask the viewport cursor.
 fn palette_panel(ctx: &egui::Context, vab: &mut VabSession) -> egui::Rect {
     egui::Window::new("Parts")
-        .anchor(egui::Align2::LEFT_TOP, egui::vec2(0.0, 30.0))
+        .default_pos(ctx.content_rect().left_top() + egui::vec2(0.0, 30.0))
         .resizable(true)
         .default_size([310.0, 620.0])
         .show(ctx, |ui| {
@@ -3045,7 +3054,10 @@ fn inspector_panel(
     out: &mut VabUiOutput,
 ) -> egui::Rect {
     egui::Window::new("Craft")
-        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(0.0, 30.0))
+        .default_pos(egui::pos2(
+            ctx.content_rect().right() - 320.0,
+            ctx.content_rect().top() + 30.0,
+        ))
         .resizable(true)
         .default_size([320.0, 640.0])
         .show(ctx, |ui| {
@@ -3629,8 +3641,15 @@ fn vab_hint_bar(
         .show(ctx, |ui| {
             let painter = ui.painter();
             let parts = vab.session().len();
-            painter.text(
-                egui::pos2(rect.left() + 10.0, rect.bottom() - 8.0),
+            // Every strip here wears the shared HUD chip — the hint,
+            // the YELLOW op notice, and the carry/problem banners all
+            // used to sit raw on the scene (unreadable over the pad).
+            paint_chip_text(
+                painter,
+                egui::pos2(
+                    rect.left() + 10.0 + crate::HUD_CHIP_PAD.x,
+                    rect.bottom() - 8.0 - crate::HUD_CHIP_PAD.y,
+                ),
                 egui::Align2::LEFT_BOTTOM,
                 format!(
                     "VAB  ·  {parts} part(s)  —  [{}] exit  drag empty space: orbit  \
@@ -3639,19 +3658,23 @@ fn vab_hint_bar(
                     keys.hint_labeled(crate::settings::KeyAction::ToggleVab, key_labels)
                 ),
                 egui::FontId::proportional(13.0),
-                egui::Color32::from_gray(180),
+                egui::Color32::from_gray(215),
             );
             // The op notice rides the viewport too — the Craft window's
             // notice row can scroll out of sight, and "every action
             // produces a visible result or a clear notice" only holds
             // if the notice is where the player is looking.
             if let Some(n) = vab.notice() {
-                painter.text(
-                    egui::pos2(rect.left() + 10.0, rect.bottom() - 26.0),
+                paint_chip_text(
+                    painter,
+                    egui::pos2(
+                        rect.left() + 10.0 + crate::HUD_CHIP_PAD.x,
+                        rect.bottom() - 46.0,
+                    ),
                     egui::Align2::LEFT_BOTTOM,
                     n,
                     egui::FontId::proportional(13.0),
-                    egui::Color32::YELLOW,
+                    crate::NOTICE_AMBER,
                 );
             }
             // A carried part is the banner state — it outranks the
@@ -3660,7 +3683,8 @@ fn vab_hint_bar(
             // red, this says *why*.
             match vab.carried() {
                 Some(Carried::Placing(p)) => {
-                    painter.text(
+                    paint_chip_text(
+                        painter,
                         egui::pos2(rect.center().x, rect.top() + 46.0),
                         egui::Align2::CENTER_TOP,
                         format!(
@@ -3673,7 +3697,8 @@ fn vab_hint_bar(
                     );
                 }
                 Some(Carried::Moving(n)) => {
-                    painter.text(
+                    paint_chip_text(
+                        painter,
                         egui::pos2(rect.center().x, rect.top() + 46.0),
                         egui::Align2::CENTER_TOP,
                         format!(
@@ -3687,7 +3712,8 @@ fn vab_hint_bar(
                 }
                 None => {
                     if let Some(msg) = &problem {
-                        painter.text(
+                        paint_chip_text(
+                            painter,
                             egui::pos2(rect.center().x, rect.top() + 46.0),
                             egui::Align2::CENTER_TOP,
                             msg,
@@ -3698,12 +3724,13 @@ fn vab_hint_bar(
                 }
             }
             if let Some(status) = vab.ghost_status() {
-                painter.text(
-                    egui::pos2(rect.center().x, rect.top() + 64.0),
+                paint_chip_text(
+                    painter,
+                    egui::pos2(rect.center().x, rect.top() + 78.0),
                     egui::Align2::CENTER_TOP,
                     status,
                     egui::FontId::proportional(13.0),
-                    egui::Color32::from_rgb(255, 120, 100),
+                    egui::Color32::from_rgb(255, 140, 120),
                 );
             }
         });

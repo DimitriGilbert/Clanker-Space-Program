@@ -339,6 +339,18 @@ pub struct ChuteRow {
     pub deployed: bool,
 }
 
+/// One part node aboard the focused vessel — the part-action
+/// surfaces' name table: the flight right-click pick names a
+/// `PartNodeId`, this resolves it to the loc-resolved display name
+/// (and gives the whole-vessel menu its per-part list).
+#[derive(Clone, Debug)]
+pub struct PartRow {
+    /// `PartNodeId` — the pick/commands key.
+    pub node: u64,
+    /// Display name of the part.
+    pub part: String,
+}
+
 /// A pending player-facing event (`PlayerAlarm`/`TransferWindow`) —
 /// the AGENDA section's row.
 #[derive(Clone, Debug)]
@@ -477,6 +489,10 @@ pub struct ProgramInput {
     pub labs: Vec<LabRow>,
     /// Decelerator nodes aboard the focused vessel.
     pub chutes: Vec<ChuteRow>,
+    /// Every part node aboard the focused vessel — the right-click
+    /// part menu's name table (the pick resolves a `PartNodeId`; the
+    /// action verbs come from `experiments`/`chutes`/`pooled`).
+    pub parts: Vec<PartRow>,
     /// Pending player alarms / watched transfer windows.
     pub alarms: Vec<AlarmRow>,
     /// In-flight transfers (pending `TransferComplete`s).
@@ -828,27 +844,42 @@ fn sect(ui: &mut egui::Ui, name: &str) {
 /// The always-visible program readout — funds + science + active
 /// contracts, top-right, drawn in every mode so the program state is
 /// never hidden behind a view switch (§3.7's global-channel rule).
-/// Hoverable: the glyphs label themselves (W1.5's labeled-strip row —
-/// `interactable` stays click-free; a click opens nothing, the
-/// Program button does).
-pub fn program_status(ctx: &egui::Context, funds: f64, science: f64, contracts: usize) {
+/// The glyphs label themselves on hover, and the strip is now a real
+/// affordance: **clicking it opens the Program window** — the status
+/// was a dead end before (players could read the numbers but had no
+/// path to the loop behind them). Returns `true` on that click —
+/// `csp-view` folds it into the panel flag.
+pub fn program_status(ctx: &egui::Context, funds: f64, science: f64, contracts: usize) -> bool {
     let rect = ctx.content_rect();
+    let mut clicked = false;
     egui::Area::new(egui::Id::unique("program_status"))
         .order(egui::Order::Foreground)
-        .interactable(true)
-        .fixed_pos(egui::pos2(rect.right() - 12.0, rect.top() + 4.0))
+        .movable(true)
+        .default_pos(egui::pos2(rect.right() - 12.0, rect.top() + 4.0))
         .pivot(egui::Align2::RIGHT_TOP)
         .show(ctx, |ui| {
-            ui.label(
-                egui::RichText::new(format!("₣ {funds:.0}   ⚛ {science:.1}   ✉ {contracts}"))
-                    .font(egui::FontId::monospace(13.0))
-                    .color(egui::Color32::from_rgb(160, 220, 160)),
-            )
-            .on_hover_text(format!(
-                "₣ {funds:.0} funds · ⚛ {science:.1} science · ✉ {contracts} active contract(s)\n\
-                 open the Program window for contracts, research, and vessel science"
-            ));
+            // Shared chip — the strip used to float on the scene.
+            crate::hud_frame().show(ui, |ui| {
+                clicked = ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new(format!(
+                                "₣ {funds:.0}   ⚛ {science:.1}   ✉ {contracts}"
+                            ))
+                            .font(egui::FontId::monospace(13.5))
+                            .color(egui::Color32::from_rgb(160, 225, 165)),
+                        )
+                        .frame(false),
+                    )
+                    .on_hover_text(format!(
+                        "₣ {funds:.0} funds · ⚛ {science:.1} science · ✉ {contracts} active contract(s)\n\
+                         click for the Program window — contracts, research, vessel science\n\
+                         in flight: the Actions strip (bottom right) + right-click any part"
+                    ))
+                    .clicked();
+            });
         });
+    clicked
 }
 
 /// The CONTRACTS section — active rows with countdowns, offers with
@@ -1761,9 +1792,12 @@ pub fn program_panel(
 ) -> egui::Rect {
     let mut o = *open;
     let dim = egui::Color32::from_gray(160);
+    // Parks left-top on first open; the title bar drags it anywhere
+    // after that (and the resize grip still holds the lower-right).
+    let screen = ctx.content_rect();
     let rect = egui::Window::new("Program")
         .open(&mut o)
-        .anchor(egui::Align2::LEFT_TOP, egui::vec2(12.0, 34.0))
+        .default_pos(screen.left_top() + egui::vec2(12.0, 34.0))
         .default_size([420.0, 560.0])
         .show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -2164,4 +2198,662 @@ pub fn program_panel(
         .unwrap_or(egui::Rect::NOTHING);
     *open = o;
     rect
+}
+
+// ---------------------------------------------------------------------------
+// The in-flight action surfaces — the science/recovery loop reachable
+// where the player actually looks: a right-click part menu (the
+// KSP-style per-part action list) and an always-visible Actions strip.
+// Both emit the same [`ProgramCommand`]s the Program window does —
+// `csp-view` resolves them against the same `ProgramMirror`.
+// ---------------------------------------------------------------------------
+
+/// What the in-flight surfaces emit beside [`ProgramCommand`]s — the
+/// session-state "open the Program window" affordance is a panel
+/// flag, not a sim command, so it rides its own channel.
+#[derive(Clone, Debug, Default)]
+pub struct FlightActionOutput {
+    /// Emitted commands — `build_ui` resolves them against the
+    /// `ProgramMirror` exactly like the window's own clicks.
+    pub commands: Vec<ProgramCommand>,
+    /// Open the Program window (the "more" affordance).
+    pub open_program: bool,
+}
+
+/// The right-click part menu's session model — `csp-view` owns it as
+/// a resource (§2.2-C); this module owns the shape. `node = None` is
+/// the whole-vessel menu: a hull click (or a part the mirror cannot
+/// name) lists every part's actions instead.
+#[derive(Clone, Debug)]
+pub struct PartMenuState {
+    /// The menu is on screen.
+    pub open: bool,
+    /// The picked `PartNodeId` — `None` for the whole-vessel list.
+    pub node: Option<u64>,
+    /// The vessel the menu opened on (`VesselId.0`, `u64::MAX` when
+    /// none) — `build_ui` closes the menu when the program mirror's
+    /// focus moves off it: a stale menu's `node` would silently fire
+    /// the new focus's same-numbered part.
+    pub vessel: u64,
+    /// Anchor position (egui points) — the click's own pixel.
+    pub pos: egui::Pos2,
+}
+
+impl Default for PartMenuState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            node: None,
+            vessel: u64::MAX,
+            pos: egui::Pos2::ZERO,
+        }
+    }
+}
+
+/// One part-action row set — the experiments and decelerators on
+/// node `n`, shared by the single-part and whole-vessel menus.
+fn part_node_actions(
+    ui: &mut egui::Ui,
+    input: &ProgramInput,
+    n: u64,
+    out: &mut FlightActionOutput,
+    dim: egui::Color32,
+) {
+    for e in input.experiments.iter().filter(|e| e.node == n) {
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    e.runnable,
+                    egui::Button::new(format!("⚛ run {}", e.experiment)).small(),
+                )
+                .on_hover_text(if e.runnable {
+                    format!("collect {:.0} data units in this context", e.data_units)
+                } else {
+                    e.blocked.clone()
+                })
+                .clicked()
+            {
+                out.commands.push(ProgramCommand::RunExperiment {
+                    node: e.node,
+                    experiment: e.experiment.clone(),
+                });
+            }
+            if e.spent {
+                ui.label(egui::RichText::new("spent").color(dim).small());
+            }
+        });
+    }
+    for ch in input.chutes.iter().filter(|c| c.node == n) {
+        ui.horizontal(|ui| {
+            if ch.deployed {
+                ui.label(
+                    egui::RichText::new("parachute — deployed")
+                        .font(MONO)
+                        .color(dim),
+                );
+            } else {
+                let ok = input.residence == "bubble";
+                if ui
+                    .add_enabled(ok, egui::Button::new("deploy parachute").small())
+                    .on_hover_text(if ok {
+                        "deploy the decelerator (armed → deployed)".to_string()
+                    } else {
+                        "deployable only while flying — not on the surface".to_string()
+                    })
+                    .clicked()
+                {
+                    out.commands
+                        .push(ProgramCommand::DeployPart { node: ch.node });
+                }
+            }
+        });
+    }
+}
+
+/// The pooled-data rows — vessel-level (the pool merges by `DataKey`,
+/// not per part): transmit for the fraction now, recover for the
+/// full yield on the surface. Shared by both menus and the action
+/// strip.
+fn pooled_rows(
+    ui: &mut egui::Ui,
+    input: &ProgramInput,
+    out: &mut FlightActionOutput,
+    dim: egui::Color32,
+    full_label: bool,
+) {
+    for d in &input.pooled {
+        if full_label {
+            ui.label(
+                egui::RichText::new(format!("{} · {:.1} data", d.label, d.units))
+                    .font(MONO)
+                    .color(dim)
+                    .small(),
+            );
+        }
+        ui.horizontal(|ui| {
+            if !full_label {
+                ui.label(
+                    egui::RichText::new(format!("{:.1} data", d.units))
+                        .font(MONO)
+                        .color(dim)
+                        .small(),
+                );
+            }
+            let have_ec = input.vessel_ec.unwrap_or(0.0);
+            let ec_ok = have_ec >= d.transmit_ec_cost;
+            if ui
+                .add_enabled(
+                    ec_ok,
+                    egui::Button::new(format!("transmit +{:.1}⚛", d.transmit_yield)).small(),
+                )
+                .on_hover_text(if ec_ok {
+                    format!(
+                        "{} — banks now, drains {:.0} EC (have {:.0})",
+                        d.label, d.transmit_ec_cost, have_ec
+                    )
+                } else {
+                    format!(
+                        "{} — needs {:.0} EC (have {:.0})",
+                        d.label, d.transmit_ec_cost, have_ec
+                    )
+                })
+                .clicked()
+            {
+                out.commands.push(ProgramCommand::Transmit { row: d.index });
+            }
+            if ui
+                .add_enabled(
+                    input.latched,
+                    egui::Button::new(format!("recover +{:.1}⚛", d.recover_yield)).small(),
+                )
+                .on_hover_text(if input.latched {
+                    format!("{} — bank and close on the surface", d.label)
+                } else {
+                    format!("{} — land and settle first to recover", d.label)
+                })
+                .clicked()
+            {
+                out.commands.push(ProgramCommand::Recover { row: d.index });
+            }
+            if d.transmitted {
+                ui.label(egui::RichText::new("tx'd").color(dim).small());
+            }
+        });
+    }
+}
+
+/// The vessel-level recovery verbs — the whole-hull `RecoverVessel`
+/// the "how do I get the craft back" question names, gated on the
+/// same `SurfaceLatched` mirror the panel's row uses.
+fn vessel_recovery_row(
+    ui: &mut egui::Ui,
+    input: &ProgramInput,
+    out: &mut FlightActionOutput,
+    dim: egui::Color32,
+) {
+    ui.horizontal(|ui| {
+        let recover_label = match &input.recover_site {
+            Some(site) => format!("recover vessel → {site}"),
+            None => "recover vessel (remote salvage)".to_string(),
+        };
+        if ui
+            .add_enabled(input.latched, egui::Button::new(recover_label).small())
+            .on_hover_text(if input.latched {
+                "recover the vessel: funds, pooled science, and crew come home".to_string()
+            } else {
+                "land and settle first — the vessel must be on the surface".to_string()
+            })
+            .clicked()
+        {
+            out.commands.push(ProgramCommand::RecoverVessel);
+        }
+        if ui
+            .add_enabled(input.latched, egui::Button::new("terminate").small())
+            .on_hover_text(if input.latched {
+                "delete the vessel — no payout, frees its berth".to_string()
+            } else {
+                "vessel must be on the surface".to_string()
+            })
+            .clicked()
+        {
+            out.commands.push(ProgramCommand::TerminateVessel);
+        }
+        let _ = dim;
+    });
+}
+
+/// The right-click part menu — the KSP-style in-context action list,
+/// anchored at the click's own pixel. A picked node shows *that
+/// part's* experiments/chute plus the vessel-level rows (pooled data
+/// is vessel-pooled, not per-part); `state.node = None` lists every
+/// actionable part instead. Emits [`ProgramCommand`]s — `csp-view`
+/// resolves them against the same `ProgramMirror` the window uses.
+/// `state.open` flips `false` on the title ✕.
+pub fn part_menu(
+    ctx: &egui::Context,
+    input: &ProgramInput,
+    state: &mut PartMenuState,
+    out: &mut FlightActionOutput,
+) -> egui::Rect {
+    if !state.open {
+        return egui::Rect::NOTHING;
+    }
+    let dim = egui::Color32::from_gray(170);
+    let title = match state.node {
+        Some(n) => input
+            .parts
+            .iter()
+            .find(|p| p.node == n)
+            .map(|p| p.part.clone())
+            .unwrap_or_else(|| format!("part {n}")),
+        None => input
+            .context
+            .as_ref()
+            .map(|c| format!("{} — all parts", c.0))
+            .unwrap_or_else(|| "vessel".to_string()),
+    };
+    let mut open = true;
+    let rect = egui::Window::new(title)
+        .open(&mut open)
+        .fixed_pos(state.pos)
+        .constrain_to(ctx.content_rect())
+        .resizable(false)
+        .collapsible(false)
+        .max_width(340.0)
+        .show(ctx, |ui| {
+            egui::ScrollArea::vertical()
+                .max_height(360.0)
+                .show(ui, |ui| {
+                    // THIS PART — experiments and the decelerator.
+                    // `None` = the whole-vessel list (one group per
+                    // actionable part).
+                    let nodes: Vec<u64> = match state.node {
+                        Some(n) => vec![n],
+                        None => input.parts.iter().map(|p| p.node).collect(),
+                    };
+                    let mut any = false;
+                    for n in &nodes {
+                        let has = input.experiments.iter().any(|e| e.node == *n)
+                            || input.chutes.iter().any(|c| c.node == *n);
+                        if !has {
+                            continue;
+                        }
+                        any = true;
+                        if state.node.is_none() {
+                            let name = input
+                                .parts
+                                .iter()
+                                .find(|p| p.node == *n)
+                                .map(|p| p.part.as_str())
+                                .unwrap_or("part");
+                            ui.label(
+                                egui::RichText::new(name)
+                                    .font(MONO)
+                                    .color(egui::Color32::from_gray(220)),
+                            );
+                        }
+                        part_node_actions(ui, input, *n, out, dim);
+                    }
+                    if !any {
+                        ui.label(egui::RichText::new("no actions on this part").color(dim));
+                    }
+                    // THE VESSEL — pooled science and the recovery
+                    // verbs live on the hull, not on one part.
+                    if !input.pooled.is_empty() {
+                        sect(ui, "DATA ABOARD");
+                        pooled_rows(ui, input, out, dim, true);
+                    }
+                    sect(ui, "VESSEL");
+                    vessel_recovery_row(ui, input, out, dim);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .small_button("⚛ Program window")
+                            .on_hover_text("contracts · research · experiments · reliability")
+                            .clicked()
+                        {
+                            out.open_program = true;
+                        }
+                        ui.label(
+                            egui::RichText::new("right-click any part for its actions")
+                                .color(dim)
+                                .small(),
+                        );
+                    });
+                });
+        })
+        .map(|r| r.response.rect)
+        .unwrap_or(egui::Rect::NOTHING);
+    if !open {
+        state.open = false;
+    }
+    rect
+}
+
+/// The flight-mode Actions strip — the always-visible surface for
+/// the science/recovery loop, parked bottom-right of the flight view
+/// so the loop's verbs sit where the player is already looking (the
+/// right-click menu's sibling: nothing here needs a secret gesture).
+/// One click runs every runnable experiment aboard; pooled records
+/// get their transmit/recover buttons; armed decelerators a deploy;
+/// a landed vessel its big RECOVER row; and the Program window is
+/// one click further. Emits [`ProgramCommand`]s via `out` — `csp-view`
+/// resolves them against the `ProgramMirror`.
+#[allow(clippy::too_many_lines)] // one action strip = one pass
+pub fn flight_action_bar(
+    ctx: &egui::Context,
+    input: &ProgramInput,
+    keys: &crate::settings::Keymap,
+    key_labels: &std::collections::BTreeMap<String, String>,
+    out: &mut FlightActionOutput,
+) -> egui::Rect {
+    let screen = ctx.content_rect();
+    let dim = egui::Color32::from_gray(170);
+    egui::Window::new("Actions")
+        .default_pos(egui::pos2(screen.right() - 300.0, screen.bottom() - 260.0))
+        .collapsible(true)
+        .resizable(false)
+        .show(ctx, |ui| {
+            match &input.context {
+                None => {
+                    ui.label(egui::RichText::new("no vessel in focus").color(dim));
+                }
+                Some((vessel, situation, biome, body)) => {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{vessel} · {situation}{} @ {body}",
+                            if biome.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" · {biome}")
+                            }
+                        ))
+                        .font(MONO)
+                        .color(dim),
+                    );
+                }
+            }
+            // Science — one click runs every runnable module aboard;
+            // a blocked set says why instead of dead-clicking.
+            if !input.experiments.is_empty() {
+                let runnable: Vec<&ExperimentRow> =
+                    input.experiments.iter().filter(|e| e.runnable).collect();
+                let (label, hover) = if runnable.is_empty() {
+                    (
+                        "⚛ run science".to_string(),
+                        input
+                            .experiments
+                            .iter()
+                            .find(|e| !e.blocked.is_empty())
+                            .map(|e| e.blocked.clone())
+                            .unwrap_or_else(|| "no experiment can run in this context".to_string()),
+                    )
+                } else {
+                    (
+                        format!("⚛ run science ({})", runnable.len()),
+                        "run every runnable experiment aboard".to_string(),
+                    )
+                };
+                if ui
+                    .add_enabled(!runnable.is_empty(), egui::Button::new(label).small())
+                    .on_hover_text(hover)
+                    .clicked()
+                {
+                    for e in runnable {
+                        out.commands.push(ProgramCommand::RunExperiment {
+                            node: e.node,
+                            experiment: e.experiment.clone(),
+                        });
+                    }
+                }
+            }
+            // Pooled data — the two ways science leaves the hull.
+            if !input.pooled.is_empty() {
+                pooled_rows(ui, input, out, dim, false);
+            }
+            // Armed decelerators — `DeployPart` (in-flight only).
+            for ch in input.chutes.iter().filter(|c| !c.deployed) {
+                let ok = input.residence == "bubble";
+                if ui
+                    .add_enabled(ok, egui::Button::new(format!("deploy {}", ch.part)).small())
+                    .on_hover_text(if ok {
+                        "deploy the decelerator".to_string()
+                    } else {
+                        "deployable only while flying".to_string()
+                    })
+                    .clicked()
+                {
+                    out.commands
+                        .push(ProgramCommand::DeployPart { node: ch.node });
+                }
+            }
+            // The landed-recovery verb — surfaced loud, not buried:
+            // this is the button the "how do I recover the craft"
+            // question looks for.
+            if input.context.is_some() {
+                let label = match &input.recover_site {
+                    Some(site) => format!("⏏ RECOVER VESSEL → {site}"),
+                    None => "⏏ RECOVER VESSEL (remote salvage)".to_string(),
+                };
+                if ui
+                    .add_enabled(
+                        input.latched,
+                        egui::Button::new(
+                            egui::RichText::new(label)
+                                .color(egui::Color32::from_rgb(150, 230, 150)),
+                        ),
+                    )
+                    .on_hover_text(if input.latched {
+                        "recover the vessel: funds, pooled science, and crew come home"
+                    } else {
+                        "land and settle first — the vessel must be on the surface"
+                    })
+                    .clicked()
+                {
+                    out.commands.push(ProgramCommand::RecoverVessel);
+                }
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui
+                    .small_button(format!(
+                        "⚛ Program [{}]",
+                        keys.hint_labeled(crate::settings::KeyAction::OpenProgram, key_labels)
+                    ))
+                    .on_hover_text("contracts · research · experiments · reliability")
+                    .clicked()
+                {
+                    out.open_program = true;
+                }
+                ui.label(
+                    egui::RichText::new("right-click a part for its actions")
+                        .color(dim)
+                        .small(),
+                );
+            });
+        })
+        .map(|r| r.response.rect)
+        .unwrap_or(egui::Rect::NOTHING)
+}
+
+#[cfg(test)]
+// Tests signal failure by panicking; §2.13's no-panic rule covers the
+// shipping fallible paths.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// A minimal latched-vessel mirror: one experiment (node 3,
+    /// runnable), one pooled record, one armed chute (node 0).
+    fn demo_input() -> ProgramInput {
+        ProgramInput {
+            context: Some((
+                "vessel 1".to_string(),
+                "landed".to_string(),
+                "grass".to_string(),
+                "terrin".to_string(),
+            )),
+            latched: true,
+            recover_site: Some("terrin-launch".to_string()),
+            vessel_ec: Some(50.0),
+            residence: "latched".to_string(),
+            parts: vec![
+                PartRow {
+                    node: 0,
+                    part: "pod".to_string(),
+                },
+                PartRow {
+                    node: 3,
+                    part: "canister".to_string(),
+                },
+            ],
+            experiments: vec![ExperimentRow {
+                node: 3,
+                part: "canister".to_string(),
+                experiment: "goo".to_string(),
+                data_units: 10.0,
+                reusable: true,
+                spent: false,
+                runnable: true,
+                blocked: String::new(),
+            }],
+            pooled: vec![DataRow {
+                index: 0,
+                label: "goo@grass/terrin·landed".to_string(),
+                units: 10.0,
+                transmit_yield: 4.0,
+                transmit_ec_cost: 2.0,
+                recover_yield: 10.0,
+                transmitted: false,
+            }],
+            chutes: vec![ChuteRow {
+                node: 0,
+                part: "pod".to_string(),
+                deployed: false,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn egui_input(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            focused: true,
+            events,
+            ..Default::default()
+        }
+    }
+
+    fn primary_click(pos: egui::Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    /// The menu draws only while open, and a click on its "run" row
+    /// emits the picked node's `RunExperiment` — the in-context path
+    /// into the same command vocabulary the Program window uses.
+    #[test]
+    fn part_menu_runs_the_clicked_parts_experiment() {
+        let ctx = egui::Context::default();
+        let input = demo_input();
+        let mut state = PartMenuState::default();
+        let mut out = FlightActionOutput::default();
+        // Closed → draws nothing.
+        assert_eq!(
+            part_menu(&ctx, &input, &mut state, &mut out),
+            egui::Rect::NOTHING
+        );
+        // Open on node 3 (the canister) at a fixed anchor.
+        state = PartMenuState {
+            open: true,
+            node: Some(3),
+            vessel: 1,
+            pos: egui::pos2(200.0, 200.0),
+        };
+        let mut rect = egui::Rect::NOTHING;
+        ctx.run_pass(egui_input(Vec::new()), |ctx| {
+            rect = part_menu(ctx, &input, &mut state, &mut out);
+        })
+        .drop_without_applying_deltas();
+        assert!(rect.is_positive(), "an open part menu must draw");
+        // Scan the menu's upper rows for the "run" button — a click
+        // on it must emit RunExperiment for node 3.
+        let mut fired = false;
+        'scan: for iy in 0..8 {
+            for ix in 0..10 {
+                let pos = egui::pos2(210.0 + ix as f32 * 12.0, 225.0 + iy as f32 * 10.0);
+                let mut pass_out = FlightActionOutput::default();
+                ctx.run_pass(egui_input(primary_click(pos)), |ctx| {
+                    part_menu(ctx, &input, &mut state, &mut pass_out);
+                })
+                .drop_without_applying_deltas();
+                if pass_out
+                    .commands
+                    .iter()
+                    .any(|c| matches!(c, ProgramCommand::RunExperiment { node: 3, .. }))
+                {
+                    fired = true;
+                    break 'scan;
+                }
+            }
+        }
+        assert!(fired, "no click inside the part menu ran the experiment");
+    }
+
+    /// The Actions strip draws a real window and its Program button
+    /// asks for the window — the discoverable door into the loop.
+    #[test]
+    fn action_bar_draws_and_offers_the_program_window() {
+        let ctx = egui::Context::default();
+        let input = demo_input();
+        let keys = crate::settings::Keymap::default();
+        let labels = std::collections::BTreeMap::new();
+        let mut out = FlightActionOutput::default();
+        let mut rect = egui::Rect::NOTHING;
+        ctx.run_pass(egui_input(Vec::new()), |ctx| {
+            rect = flight_action_bar(ctx, &input, &keys, &labels, &mut out);
+        })
+        .drop_without_applying_deltas();
+        assert!(rect.is_positive(), "the Actions strip must draw");
+        // Click-scan the drawn window below its title bar — the
+        // collapse arrow lives in the title row and folding the
+        // strip would hide every button under the scan.
+        let mut opened = false;
+        'scan: for iy in 0..40 {
+            for ix in 0..24 {
+                let pos = egui::pos2(
+                    rect.left() + 8.0 + ix as f32 * 12.0,
+                    rect.top() + 30.0 + iy as f32 * 10.0,
+                );
+                if !rect.contains(pos) {
+                    continue;
+                }
+                let mut pass_out = FlightActionOutput::default();
+                ctx.run_pass(egui_input(primary_click(pos)), |ctx| {
+                    flight_action_bar(ctx, &input, &keys, &labels, &mut pass_out);
+                })
+                .drop_without_applying_deltas();
+                if pass_out.open_program {
+                    opened = true;
+                    break 'scan;
+                }
+            }
+        }
+        assert!(opened, "the Actions strip's Program button never clicked");
+    }
 }

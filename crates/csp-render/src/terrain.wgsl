@@ -284,13 +284,15 @@ fn view_inscatter(pa: vec3<f32>, pb: vec3<f32>, ray: vec3<f32>, dist: f32, px: v
     var acc = vec3<f32>(0.0);
     var acc_m = vec3<f32>(0.0);
     // 12 jittered steps — the old fixed 5-step lattice banded the
-    // inscatter integral into visible shells on long view segments;
-    // the per-pixel phase offset breaks the bands the same way the
-    // sky march's jitter does.
+    // inscatter integral into visible shells on long view segments.
+    // The jitter is PER-STEP now: each tap draws its own offset, so
+    // the per-pixel errors partially cancel (~√N quieter) while still
+    // decorrelating the lattice — a single phase for all taps removed
+    // the bands but left ±8% pixel grain in the smooth day sky.
     let steps = 12.0;
-    let jit = screen_hash(px);
     let ds = dist / steps;
     for (var i = 0.0; i < steps; i = i + 1.0) {
+        let jit = screen_hash(px + vec2<f32>(i * 17.13, i * 29.71));
         let p = pa + ray * ((i + 0.05 + jit * 0.9) * ds);
         let alt_i = max(length(p) - R, 0.0);
         let up = p / max(length(p), 1.0);
@@ -1050,10 +1052,12 @@ fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
     }
     var col = space;
     if (t1 > t0) {
-        // 20 jittered steps — the per-pixel phase offset breaks the
-        // banding a fixed lattice leaves in the thin shell.
-        let steps = 20.0;
-        let jit = screen_hash(i.ndc);
+        // 32 jittered steps — the jitter is PER-STEP: every tap draws
+        // its own offset, so the per-pixel misestimates partially
+        // cancel (~√N quieter than one phase for the whole lattice)
+        // while the decorrelation still breaks the banding a fixed
+        // lattice leaves in the thin shell.
+        let steps = 32.0;
         let ds = (t1 - t0) / steps;
         let H = max(u.atmo.x, 1.0);
         let Hm = max(H * 0.30, 1.0); // aerosols hug the low shell
@@ -1063,6 +1067,7 @@ fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
         var acc = vec3<f32>(0.0);
         var acc_m = vec3<f32>(0.0);
         for (var s = 0.0; s < steps; s = s + 1.0) {
+            let jit = screen_hash(i.ndc + vec2<f32>(s * 17.13, s * 29.71));
             let p = pa + rd * (t0 + (s + 0.05 + jit * 0.9) * ds);
             let pr = length(p);
             let alt_i = max(pr - R, 0.0);
@@ -1082,14 +1087,21 @@ fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
         }
         let ins = acc * 4.2 + acc_m * 1.5;
         // Daylight gate: stars survive only where the shell scatters
-        // essentially nothing into the ray. Day zenith integrates
-        // ins_lum ≈ 0.03–0.10 (exp(−160·lum) ≤ ~1%), a bright limb far
-        // more; the night side's t_is→0 collapses the gate to 1. The
-        // twilight band fades stars in as the sun drops below the
-        // samples' horizon — the same term that paints the bright
-        // horizon also clears the stars in front of it.
+        // essentially nothing into the ray. The old exp(−ins_lum·160)
+        // never reached ZERO — a bright star at ~1% gate still speckled
+        // the dim-blue day sky, and at ~10 km altitude the gate sat
+        // near 40% (stars arriving "way too early"). A hard smoothstep
+        // instead: full stars below ~6e-4 inscatter (deep night, or
+        // the genuinely black day sky above ~18–20 km), literally NO
+        // stars above ~4e-3 — day zenith integrates ins_lum ≈
+        // 0.03–0.10, a bright limb far more, so every blue sky is
+        // guaranteed speckle-free. The night side's t_is→0 collapses
+        // ins → 0 → gate 1; the twilight band fades stars in as the
+        // sun drops below the samples' horizon — the same term that
+        // paints the bright horizon also clears the stars in front
+        // of it.
         let ins_lum = dot(ins, vec3<f32>(0.2126, 0.7152, 0.0722));
-        let star_vis = exp(-ins_lum * 160.0);
+        let star_vis = 1.0 - smoothstep(6.0e-4, 4.0e-3, ins_lum);
         col = ins + (space_bg + stars * star_vis) * bg_t;
     }
     return vec4<f32>(tone_map(col), 1.0);

@@ -20,3 +20,12 @@
 ## Remaining: W2.6 reliability+manufacture, P3 VAB, P4 save/server/hygiene.
 ## Process: dispatch background implementers 5-at-a-time, commit+BUILD+SHIP each phase at 192.168.1.41:8420.
 ## W2.6 DONE (uncommitted, this session): launch is a ManufactureCraft build order — funds + seeded pad stockpile (sites.ron v3 starting_stock: metal 2000/composite 400) debit at order, craft delivers SurfaceLatched at ConstructionComplete (berth retry if pad occupied); delivery berths upright (surface_upright + belly clearance). FACILITIES section: build ETAs, per-family qualification, RunBenchTest stand buttons. PartFailed/IgnitionMisfire now HUD toasts on focused vessel (LOG kept). Known pre-existing-in-tree failure: csp-bench flight-launch golden bincode decode (concurrent W2 serialized-type churn, passes at HEAD).
+
+## LIVE USER REPORT (post-warp-freeze fix) — craft FLIES now. Remaining UX/quality issues:
+## 1. Science/recovery undiscoverable — no right-click part menus, can't find how to run science/recover/transmit. Needs discoverable affordances.
+## 2. UI widgets/panels fixed-position — can't drag/move them.
+## 3. Sky: blue sky still grainy on the ground + stars bleed in way too early at altitude.
+## 4. Warp refuses silently — no message why warp won't engage.
+## 5. Yellow notices unreadable (no bg, bad contrast, too narrow → wrap to 2 lines); flight data contrast bad.
+## 6. Research/science UI confusing — unclear how it works.
+## GOAL: fun + intuitive (KSP-style): right-click part context menus, discoverable science, readable UI, working warp with feedback.

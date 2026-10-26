@@ -361,6 +361,41 @@ impl WarpController {
     pub fn requested_multiplier(&self) -> u64 {
         WARP_LADDER[self.requested]
     }
+
+    /// The multiplier at ladder rung `idx` (clamped) — notices name the
+    /// rung a request asked for before it engages.
+    pub fn multiplier_at(&self, idx: usize) -> u64 {
+        WARP_LADDER[idx.min(WARP_LADDER.len() - 1)]
+    }
+
+    /// The ladder index `requested` would sit at once `pending_step`
+    /// plus `step` more requests fold in — capped at the settings
+    /// ceiling like `decide`'s fold. Press-time feedback needs this:
+    /// "what is this key actually asking for" is answered before the
+    /// request spends a frame in the queue.
+    pub fn request_preview(&self, step: i32) -> usize {
+        (self.requested as i64 + i64::from(self.pending_step) + i64::from(step))
+            .clamp(0, self.cap_idx as i64) as usize
+    }
+
+    /// Whether the settings cap sits below the ladder top — a "dead"
+    /// step-up names the cap when it, not the ladder, did the clamping.
+    pub fn capped_below_ladder_top(&self) -> bool {
+        self.cap_idx < WARP_LADDER.len() - 1
+    }
+
+    /// The largest rung `decide`'s promotion could reach at the current
+    /// measured cost — the §2.6.3 margined inequality over the WHOLE
+    /// ladder ([`Self::ladder_ceiling`] is bounded by `requested`; this
+    /// is not). A step-up request above this can never engage while the
+    /// measured cost holds — the caller surfaces that as a limit notice
+    /// at the press instead of a silently dead key.
+    pub fn promotable_ceiling(&self) -> usize {
+        (0..WARP_LADDER.len())
+            .rev()
+            .find(|&k| self.affordable(k, PROMOTE_MARGIN))
+            .unwrap_or(0)
+    }
 }
 
 impl Default for WarpController {
@@ -600,6 +635,31 @@ mod tests {
             c.decide();
         }
         assert_eq!(c.multiplier(), 2);
+    }
+
+    /// Press-time feedback helpers: `request_preview` folds `pending_step`
+    /// into `requested` exactly like `decide` (settings cap included),
+    /// and `promotable_ceiling` answers "could this ever engage" over
+    /// the WHOLE ladder at the measured cost — the signal a
+    /// limited/dead press is narrated from in `warp_step_request`.
+    #[test]
+    fn press_preview_and_promotable_ceiling() {
+        let mut c = WarpController::new();
+        assert_eq!(c.request_preview(3), 3);
+        c.request_step(2);
+        // The queued step counts too — the preview is the post-fold rung.
+        assert_eq!(c.request_preview(1), 3);
+        c.set_cap_multiplier(100);
+        assert_eq!(c.request_preview(9), 3); // clamped at the ×100 cap
+        assert!(c.capped_below_ladder_top());
+        assert_eq!(c.multiplier_at(3), 100);
+        // Zero measured cost → every rung promotable.
+        assert_eq!(c.promotable_ceiling(), WARP_LADDER.len() - 1);
+        // The committed 200-part-atmo reference cost: margined, only
+        // ×2 clears the §2.6.3 inequality — a ×10 request could never
+        // engage while the scene stays this heavy.
+        c.observe(0.6719, 0.016);
+        assert_eq!(c.promotable_ceiling(), 1);
     }
 
     /// §2.6.5 Clamping demotion: drops `effective` immediately, keeps
