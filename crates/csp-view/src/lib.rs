@@ -5700,6 +5700,99 @@ mod tests {
         );
     }
 
+    /// The real player flow end-to-end: a parked build on the pad, a
+    /// LAUNCH press that recovers it and places the build order, the
+    /// `ConstructionComplete` delivery, then the throttle key —
+    /// `SetThrottle` must unlatch the delivered craft, open the
+    /// throttle, and climb it off the pad.
+    #[test]
+    fn launch_deliver_throttle_flies() {
+        let mut view = View::new().expect("data/ load");
+        view.seed_starter_craft().expect("starter seed");
+        // The starter parks latched on the pad (the same berth the
+        // second launch must clear through its RecoverVessel arm).
+        view.begin_frame();
+        view.sim_step(view.sim.clock().ticks() + 8).unwrap();
+        view.end_frame();
+        assert_eq!(view.sim.vessels().len(), 1, "the seed parked one craft");
+
+        // LAUNCH with the pad occupied: the parked build recovers,
+        // the build order lands on the freed berth.
+        view.launch_craft().expect("launch places the order");
+        view.begin_frame();
+        let report = view
+            .sim_step(view.sim.clock().ticks() + 1)
+            .expect("advance");
+        assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+        view.end_frame();
+        assert_eq!(view.sim.builds().len(), 1, "the launch is a build order");
+        let complete = view.sim.builds().values().next().unwrap().complete_tick;
+        view.begin_frame();
+        let report = view.sim_step(complete).expect("advance");
+        assert!(
+            report
+                .fired_events
+                .iter()
+                .any(|e| matches!(e.kind, csp_sim::EventKind::ConstructionComplete { .. })),
+            "delivery arrives through ConstructionComplete"
+        );
+        view.end_frame();
+
+        // The delivered latched craft holds the flight focus — the
+        // throttle keys route to it.
+        let focus = view.flight_focus().expect("the delivery takes focus");
+        assert!(
+            matches!(
+                view.sim.vessels()[&focus].state,
+                csp_sim::VesselState::SurfaceLatched(_)
+            ),
+            "delivered surface-latched, got {:?}",
+            view.sim.vessels()[&focus].state
+        );
+
+        // The Z key — `throttle_dispatch`'s snap-to-full arm sends one
+        // `SetThrottle` on the player FIFO.
+        view.enqueue_command(
+            SourceClass::Ui,
+            PLAYER_SOURCE_ID,
+            SimCommand::SetThrottle {
+                vessel: focus,
+                throttle: 1.0,
+            },
+        );
+        view.begin_frame();
+        let report = view
+            .sim_step(view.sim.clock().ticks() + 1)
+            .expect("advance");
+        assert!(
+            report.rejected.is_empty(),
+            "the unlatching SetThrottle must not reject: {:?}",
+            report.rejected
+        );
+        view.end_frame();
+
+        let body = view.sim.vessels()[&focus]
+            .body()
+            .expect("throttle unlatched the delivered craft");
+        assert!(body.throttle > 0.0, "the throttle command applied");
+        let alt0 = body.pos.norm();
+
+        // Burn for a few seconds — the craft must actually leave the
+        // pad (climb), not sit unlatched-but-inert.
+        view.begin_frame();
+        view.sim_step(view.sim.clock().ticks() + 240).unwrap();
+        view.end_frame();
+        let body = view.sim.vessels()[&focus]
+            .body()
+            .expect("still flying InBubble");
+        assert!(
+            body.pos.norm() > alt0 + 1.0,
+            "full throttle climbs the delivered craft: r {} -> {}",
+            alt0,
+            body.pos.norm()
+        );
+    }
+
     /// The player save path end to end (§7.2 + §7.5): `save_game`'s
     /// payload round-trips the codec, `load_game` rebuilds a world
     /// that hashes identically and keeps ticking identically — the

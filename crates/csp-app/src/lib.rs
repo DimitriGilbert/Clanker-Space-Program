@@ -252,6 +252,18 @@ struct App {
     /// starts from released; the Z/X snaps write it too, so a snap
     /// mid-hold rebases the ramp instead of fighting it.
     throttle_axis: f64,
+    /// The vessel `throttle_axis` currently describes — set whenever
+    /// a `SetThrottle` is enqueued and on every focus rebase. `None`
+    /// until the first command goes out, in which case the axis is
+    /// the player's intent verbatim (the P02-F2 rule: a fresh ramp on
+    /// a body-less focus must not squash a nonzero axis a queued
+    /// `SetThrottle` will still land). When the focus moves to a
+    /// DIFFERENT vessel the axis cannot keep the old craft's
+    /// commanded value — a delivered `SurfaceLatched` craft's applied
+    /// throttle is 0 by construction, and a stale axis at the rail
+    /// makes `throttle_axis_step` a permanent no-op (the Shift key
+    /// literally cannot unlatch or move the needle).
+    throttle_axis_vessel: Option<csp_view::VesselId>,
     /// Wall seconds the current hold has spent *actively ramping* —
     /// the ease-in clock for [`THROTTLE_RAMP_SPINUP_S`]. Reset when
     /// the held set empties (the next press starts a fresh ramp), and
@@ -492,6 +504,7 @@ impl App {
             attitude_deferred: false,
             throttle_held: std::collections::BTreeSet::new(),
             throttle_axis: 0.0,
+            throttle_axis_vessel: None,
             throttle_hold_s: 0.0,
             throttle_hold_vessel: None,
             view,
@@ -2080,6 +2093,7 @@ impl App {
                     0.0
                 };
                 if let Some(vessel) = self.view.flight_focus() {
+                    self.throttle_axis_vessel = Some(vessel);
                     self.view.enqueue_command(
                         SourceClass::Ui,
                         // The shared player-command FIFO — launch's
@@ -2116,21 +2130,29 @@ impl App {
             // …and pins the focus it started on, so a focus change
             // mid-hold is detected as a retarget, not silently
             // applied to the new vessel (C15-lib2-F2).
-            self.throttle_hold_vessel = self.view.flight_focus();
+            let focus = self.view.flight_focus();
+            self.throttle_hold_vessel = focus;
             // A ramp starting from released re-reads the applied
             // throttle — but only a bubble-resident body HAS an
             // applied value to read (P02-F2). A latched or rails
-            // focus keeps the axis where it was: squashing it to 0
-            // would diverge the wall-side commanded axis from a
-            // nonzero commanded value with no signal.
-            if let Some(body) = self
-                .view
-                .flight_focus()
+            // focus keeps the axis where it was — while it still
+            // describes THIS vessel: a queued `SetThrottle` may still
+            // be in flight, and squashing to 0 would diverge the
+            // wall-side axis from a nonzero commanded value. The rule
+            // does NOT extend to a vessel the axis never described —
+            // a delivered latched craft's applied throttle is 0 by
+            // construction, and carrying the old craft's rail value
+            // over makes this press a permanent no-op.
+            let applied = focus
                 .and_then(|v| self.view.sim.vessels().get(&v))
                 .and_then(|v| v.body())
-            {
-                self.throttle_axis = body.throttle;
+                .map(|b| b.throttle);
+            if self.throttle_axis_vessel.is_some_and(|v| Some(v) != focus) {
+                self.throttle_axis = applied.unwrap_or(0.0);
+            } else if let Some(t) = applied {
+                self.throttle_axis = t;
             }
+            self.throttle_axis_vessel = focus;
         }
         match self.throttle_blocker() {
             // No doomed `SetThrottle` rides the player FIFO to a
@@ -2207,12 +2229,15 @@ impl App {
         if focus != self.throttle_hold_vessel {
             self.throttle_hold_vessel = focus;
             self.throttle_hold_s = 0.0;
-            if let Some(body) = focus
+            // A body-less retarget (a delivered latched craft, a
+            // railed hull) reads 0 — the latch destroyed the applied
+            // throttle with the body, so keeping the old axis would
+            // carry the previous vessel's command onto this one.
+            self.throttle_axis = focus
                 .and_then(|v| self.view.sim.vessels().get(&v))
                 .and_then(|v| v.body())
-            {
-                self.throttle_axis = body.throttle;
-            }
+                .map_or(0.0, |b| b.throttle);
+            self.throttle_axis_vessel = focus;
             self.view
                 .flight_notice("THROTTLE HOLD — REBASED ON NEW FOCUS VESSEL");
         }
@@ -2235,6 +2260,7 @@ impl App {
         let Some(vessel) = self.view.flight_focus() else {
             return;
         };
+        self.throttle_axis_vessel = Some(vessel);
         self.view.enqueue_command(
             SourceClass::Ui,
             csp_view::PLAYER_SOURCE_ID,
@@ -4222,6 +4248,112 @@ mod tests {
         assert!(
             app.view.settings_panel_open(),
             "Esc with nothing armed still opens settings"
+        );
+    }
+
+    /// The reported break's mechanism: a throttle axis left at the
+    /// rail by the previous flight makes throttle-up a permanently
+    /// dead key on the next delivered craft — the tap no-ops at the
+    /// rail, so no `SetThrottle` ever reaches the latched vessel and
+    /// it can never unlatch. The axis must rebase on the focus change.
+    #[test]
+    fn stale_axis_at_full_rebases_on_the_delivered_craft() {
+        let dir = tempdir("stale-axis");
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        let frame = |app: &mut App, ticks: u64| {
+            let target = app.view.sim.clock().ticks() + ticks;
+            app.view.begin_frame();
+            app.tick_throttle_ramp(1.0 / 60.0);
+            app.view.sim_step(target).unwrap();
+            app.view.end_frame();
+        };
+        frame(&mut app, 8);
+        app.handle_ui_outbox(csp_view::UiOutbox {
+            launch: true,
+            ..Default::default()
+        });
+        frame(&mut app, 1);
+        let deadline = app.view.sim.builds().values().next().unwrap().complete_tick;
+        while app.view.sim.clock().ticks() < deadline {
+            frame(&mut app, 64);
+        }
+        frame(&mut app, 8);
+        let focus = app.view.flight_focus().unwrap();
+        // The state a full-throttle climb leaves behind — the axis
+        // still describes the OLD (recovered) vessel.
+        app.throttle_axis = 1.0;
+        app.throttle_axis_vessel = Some(csp_view::VesselId(u64::MAX));
+        app.dispatch(KeyAction::ThrottleUp);
+        assert!(
+            app.throttle_axis < 1.0,
+            "the axis must rebase to the delivered craft's applied throttle (0)"
+        );
+        frame(&mut app, 1); // drain the player FIFO
+        let logged =
+            app.view.sim.command_log().iter().any(
+                |(_, c)| matches!(c, SimCommand::SetThrottle { vessel, .. } if *vessel == focus),
+            );
+        assert!(
+            logged,
+            "throttle-up must land a SetThrottle — the unlatch command"
+        );
+    }
+
+    /// The real player flow end to end: the seeded pad craft (itself
+    /// a delivered build), a VAB LAUNCH that recovers the parked
+    /// build and orders a new one, the `ConstructionComplete`
+    /// delivery, then the Z snap — the delivered craft must unlatch,
+    /// open the throttle, and climb.
+    #[test]
+    fn delivered_craft_flies_on_throttle() {
+        let dir = tempdir("delivered-flies");
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        let frame = |app: &mut App, ticks: u64| {
+            let target = app.view.sim.clock().ticks() + ticks;
+            app.view.begin_frame();
+            app.tick_throttle_ramp(1.0 / 60.0);
+            app.view.sim_step(target).unwrap();
+            app.view.end_frame();
+        };
+        frame(&mut app, 8); // settle the seeded pad craft
+        // The LAUNCH click — the parked build recovers, the order lands.
+        app.handle_ui_outbox(csp_view::UiOutbox {
+            launch: true,
+            ..Default::default()
+        });
+        frame(&mut app, 1);
+        assert_eq!(app.view.sim.builds().len(), 1, "the launch ordered a build");
+        let deadline = app.view.sim.builds().values().next().unwrap().complete_tick;
+        while app.view.sim.clock().ticks() < deadline {
+            frame(&mut app, 64);
+        }
+        frame(&mut app, 8); // let the delivery stage
+        let focus = app.view.flight_focus().expect("the delivery took focus");
+        assert!(
+            matches!(
+                app.view.sim.vessels()[&focus].state,
+                csp_view::VesselState::SurfaceLatched(_)
+            ),
+            "delivered surface-latched"
+        );
+        // Z — the snap-to-full throttle key.
+        app.dispatch(KeyAction::ThrottleFull);
+        frame(&mut app, 1);
+        let body = app.view.sim.vessels()[&focus]
+            .body()
+            .expect("throttle unlatched the delivered craft");
+        assert!(body.throttle > 0.0, "the throttle command applied");
+        let r0 = body.pos.norm();
+        for _ in 0..4 {
+            frame(&mut app, 60);
+        }
+        let body = app.view.sim.vessels()[&focus]
+            .body()
+            .expect("still InBubble");
+        assert!(
+            body.pos.norm() > r0 + 1.0,
+            "the delivered craft climbs: r {r0} -> {}",
+            body.pos.norm()
         );
     }
 }
