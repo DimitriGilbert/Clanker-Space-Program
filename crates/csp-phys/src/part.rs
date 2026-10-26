@@ -301,6 +301,12 @@ pub struct WeldPart {
     /// ignores it; the sim's per-tick propellant bookkeeping debits
     /// `throttle·rated_n·dt/(isp_vac·g₀)` split across `propellants`.
     pub engine: Option<EngineSpec>,
+    /// §3.1 `Parachute` resolution: the deployable-decelerator spec —
+    /// `None` for a part with no `Parachute` module (validator: at
+    /// most one per part). Stage 1 ignores it; the sim's `DeployPart`
+    /// apply and per-tick decel-site refresh read it to build the
+    /// body's [`crate::weld::DecelSite`]s.
+    pub parachute: Option<ParachuteSpec>,
 }
 
 /// The resolved `Engine` module's *consumption* half — what the sim's
@@ -356,6 +362,26 @@ pub struct LabSpec {
     pub multiplier: f64,
     /// Maximum assigned researchers.
     pub researcher_slots: u32,
+}
+
+/// The resolved `Parachute` module (§3.1): the deploy spec the sim's
+/// `DeployPart` apply reads — when the canopy may catch (altitude +
+/// air-relative-speed ceilings), the Cd·A it contributes packed and
+/// deployed, and the inflation ramp. Frozen at resolve like every
+/// `WeldPart` field; the drag areas are the resolved-scale values
+/// (a scaled part's canopy area scales `s²`, geometrically).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ParachuteSpec {
+    /// Altitude ceiling (m above the body datum) for the catch.
+    pub deploy_alt_m: f64,
+    /// Air-relative speed ceiling (m/s) for the catch.
+    pub deploy_speed_mps: f64,
+    /// Packed drag area Cd·A (m²) — applies while undeployed.
+    pub packed_drag_area_m2: f64,
+    /// Deployed drag area Cd·A (m²) — the open canopy.
+    pub deployed_drag_area_m2: f64,
+    /// Inflation ramp (s); `0` deploys instantly.
+    pub deploy_time_s: f64,
 }
 
 #[cfg(test)]

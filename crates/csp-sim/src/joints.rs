@@ -1012,6 +1012,13 @@ pub(crate) fn apply_latch(
         r.pending_failure_tick = None;
         reliability_m.insert(map(*id), r);
     }
+    // §3.1 `Parachute`: deploy records pool through the same remap —
+    // a canopy already out on the absorbed side stays out on the
+    // merged hull.
+    let mut deployed_m = vp.deployed.clone();
+    for (id, t) in &vs.deployed {
+        deployed_m.insert(map(*id), *t);
+    }
     // M8-B: the merged hull keeps either half's colony opt-in — it
     // still sits where a joined half sat (the join record is
     // per-vessel, so a second latched member of the same colony
@@ -1120,6 +1127,7 @@ pub(crate) fn apply_latch(
         v.science = science_m;
         v.joined_colony = joined_m;
         v.reliability = reliability_m;
+        v.deployed = deployed_m;
     }
     let absorbed_tracked = tracked.remove(&sec);
     if absorbed_tracked {

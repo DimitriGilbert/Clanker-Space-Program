@@ -1193,6 +1193,63 @@ fn science() -> MeshEntry {
     done(b)
 }
 
+/// `chute` — radial-mount parachute canister: superellipse pack,
+/// orange mortar-cap dome, mount plate on −x. Box collider
+/// 0.5 × 0.4 × 0.5 → model z ∈ [−0.25, 0.24].
+fn chute() -> MeshEntry {
+    let mut b = B::default();
+    const S: usize = 48;
+    let a_sq = 0.23f64;
+    let n_exp = 6.0f64;
+    // Superellipse cross-section — a rounded-square canister (the
+    // `battery` construction; `emit_model` fits it into the collider
+    // AABB).
+    let se = move |j: usize| -> f64 {
+        let t = TAU * j as f64 / S as f64;
+        let (c, s) = (t.cos().abs(), t.sin().abs());
+        a_sq * (c.powf(n_exp) + s.powf(n_exp)).powf(-1.0 / n_exp)
+    };
+    let prof = [(-0.25, 0.75), (-0.235, 1.0), (0.15, 1.0), (0.18, 0.9)];
+    lathe(
+        &mut b,
+        &prof,
+        S,
+        |_, j| se(j),
+        |i, _| {
+            if i == 0 {
+                METAL_DARK // base chamfer
+            } else if i == 3 {
+                FRAME // cap ring
+            } else {
+                HULL
+            }
+        },
+        (true, false),
+    );
+    // Mortar cap — the packed-canopy dome (the orange "pop me" read).
+    let mut lid: Vec<(f64, f64)> = vec![(0.18, 0.207)];
+    for k in 1..=5 {
+        let a = PI / 2.0 * k as f64 / 5.0;
+        lid.push((0.18 + 0.06 * a.sin(), 0.207 * a.cos()));
+    }
+    lathe(
+        &mut b,
+        &lid,
+        S,
+        |_, _| 1.0,
+        |i, _| if i == 0 { FRAME } else { ACCENT },
+        (false, false),
+    );
+    // Mount plate on −x.
+    cuboid(
+        &mut b,
+        [-0.26, -0.14, -0.14],
+        [-0.24, 0.14, 0.14],
+        METAL_DARK,
+    );
+    done(b)
+}
+
 /// `fins` — a three-fin can: swept trapezoid fins on a root hub.
 /// Radial extent 1.0, z ∈ [−0.4, 0.4].
 fn fins() -> MeshEntry {
@@ -1242,6 +1299,7 @@ pub fn build_all() -> Vec<(&'static str, MeshEntry)> {
         ("adapter", adapter),
         ("battery", battery),
         ("science", science),
+        ("chute", chute),
         ("fins", fins),
     ];
     builds

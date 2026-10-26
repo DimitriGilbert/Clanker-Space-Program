@@ -369,6 +369,7 @@ mod tests {
             experiments: Vec::new(),
             lab: None,
             engine: None,
+            parachute: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,

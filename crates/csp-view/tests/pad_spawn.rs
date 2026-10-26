@@ -18,7 +18,7 @@ fn frame(view: &mut View, ticks: u64) {
 }
 
 /// The seeded starter craft rests on the pad: surface-relative speed
-/// stays under 1 m/s from the first tick, the full 3-part stack
+/// stays under 1 m/s from the first tick, the full 5-part stack
 /// survives (no jettison, no debris), and within a few seconds it
 /// settles onto §2.6.4 surface rails — where the flight HUD keeps it
 /// visible and reads `latched`.
@@ -45,7 +45,7 @@ fn starter_craft_rests_on_the_pad() {
         );
         assert_eq!(
             vessel.craft.as_ref().unwrap().graph.nodes.len(),
-            3,
+            5, // pod + tank + engine + canister + battery (W1.5-b)
             "t={}s: a part was lost — the touchdown broke the stack",
             s + 1
         );

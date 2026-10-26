@@ -97,7 +97,7 @@ fn resources_validate_green() {
 fn authored_parts_load_and_validate_green() {
     let loaded = parts();
     let res = resources();
-    assert_eq!(loaded.parts.len(), 10, "the M3 starter set is 10 parts");
+    assert_eq!(loaded.parts.len(), 11, "the authored set is 11 parts");
     let errs = validate_parts(&loaded, &res, &recipes(), &experiments());
     assert!(errs.is_empty(), "validator errors: {errs:#?}");
 }

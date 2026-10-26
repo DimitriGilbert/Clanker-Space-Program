@@ -374,14 +374,18 @@ fn sync_mirrors(
     stats.frames += 1;
 }
 
-/// The panel flags + the progression mirror as one system param —
-/// keeps `build_ui` under the system-parameter cap.
+/// The panel flags + the progression mirror + the global cue channel
+/// as one system param — keeps `build_ui` under the system-parameter
+/// cap. `sfx` is where a dropped panel command lands its notice (the
+/// §3.7 rule: a click either does something or says why not).
 #[derive(bevy_ecs::system::SystemParam)]
 struct ProgramUi<'w> {
     /// Optional-panel toggles.
     panels: ResMut<'w, PanelFlags>,
     /// The staged Program-window mirror.
     mirror: Res<'w, ProgramMirror>,
+    /// The §3.7 flight-notice cue stack (`flight_notice`'s channel).
+    sfx: ResMut<'w, flight::FlightSfx>,
 }
 
 /// The entire egui pass (§2.5 #5, Appendix A item 3): build the plain-data
@@ -572,10 +576,21 @@ fn build_ui(
             if !open {
                 prog_ui.panels.program = false;
             }
+            let mut dropped = Vec::new();
             outbox.program = cmds
                 .into_iter()
-                .filter_map(|c| program_command(&prog_ui.mirror, c))
+                .filter_map(|c| program_command(&prog_ui.mirror, c, &mut dropped))
                 .collect();
+            // The §3.7 dead-click rule made loud: a panel command that
+            // drops on a stale mirror posts a cue — the channel can
+            // never again eat a click the button claimed was legal
+            // (W1.2's silent-`RunExperiment` class).
+            for text in dropped {
+                prog_ui.sfx.cues.push_back(flight::SfxCue {
+                    text: format!("COMMAND DROPPED — {text}"),
+                    ttl: flight::SFX_TTL_FRAMES,
+                });
+            }
         }
         // M10: the settings window + the §2.13 Fatal dialog + the
         // tutorial checklist — session-state panels, drawn every mode.
@@ -700,10 +715,13 @@ fn map_panels(
 /// (vessel, biome, situation, `DataKey`) come back out of the
 /// [`ProgramMirror`] the panel was drawn from. `None` when the
 /// mirrored context vanished between staging and the click (a
-/// one-frame-stale panel command is dropped, not misfired).
+/// one-frame-stale panel command is dropped, not misfired) — the
+/// drop is reported through `dropped` so `build_ui` can post a
+/// flight notice; a stale mirror must never eat a click silently.
 fn program_command(
     mirror: &ProgramMirror,
     cmd: csp_ui::program::ProgramCommand,
+    dropped: &mut Vec<&'static str>,
 ) -> Option<SimCommand> {
     use csp_ui::program::ProgramCommand as C;
     match cmd {
@@ -715,9 +733,16 @@ fn program_command(
         }),
         C::AcceptContract { offer } => Some(SimCommand::AcceptContract { offer }),
         C::RunExperiment { node, experiment } => {
-            let (biome, situation) = mirror.science_ctx.clone()?;
+            let Some((biome, situation)) = mirror.science_ctx.clone() else {
+                dropped.push("EXPERIMENT NOT RUN — NO SCIENCE CONTEXT");
+                return None;
+            };
+            let Some(vessel) = mirror.vessel else {
+                dropped.push("EXPERIMENT NOT RUN — NO FOCUSED VESSEL");
+                return None;
+            };
             Some(SimCommand::RunExperiment {
-                vessel: mirror.vessel?,
+                vessel,
                 node: csp_phys::PartNodeId(node),
                 experiment: csp_data::ExperimentId::from(experiment),
                 biome,
@@ -725,9 +750,16 @@ fn program_command(
             })
         }
         C::Transmit { row } | C::Recover { row } => {
-            let key = mirror.keys.get(row)?.key.clone();
-            let vessel = mirror.vessel?;
-            Some(if matches!(cmd, C::Transmit { .. }) {
+            let is_transmit = matches!(cmd, C::Transmit { .. });
+            let Some(key) = mirror.keys.get(row).map(|k| k.key.clone()) else {
+                dropped.push("DATA ROW DROPPED — STALE PANEL INDEX");
+                return None;
+            };
+            let Some(vessel) = mirror.vessel else {
+                dropped.push("DATA COMMAND DROPPED — NO FOCUSED VESSEL");
+                return None;
+            };
+            Some(if is_transmit {
                 SimCommand::TransmitData { vessel, key }
             } else {
                 SimCommand::RecoverData { vessel, key }
@@ -736,13 +768,23 @@ fn program_command(
         // §3.5's recovery verbs — the site was staged with the mirror
         // (launch site on the latched body, else its first site, else
         // the `None` remote-salvage leg).
-        C::RecoverVessel => Some(SimCommand::RecoverVessel {
-            vessel: mirror.vessel?,
-            site: mirror.recovery_site.clone(),
-        }),
-        C::TerminateVessel => Some(SimCommand::TerminateVessel {
-            vessel: mirror.vessel?,
-        }),
+        C::RecoverVessel => {
+            let Some(vessel) = mirror.vessel else {
+                dropped.push("RECOVER DROPPED — NO FOCUSED VESSEL");
+                return None;
+            };
+            Some(SimCommand::RecoverVessel {
+                vessel,
+                site: mirror.recovery_site.clone(),
+            })
+        }
+        C::TerminateVessel => {
+            let Some(vessel) = mirror.vessel else {
+                dropped.push("TERMINATE DROPPED — NO FOCUSED VESSEL");
+                return None;
+            };
+            Some(SimCommand::TerminateVessel { vessel })
+        }
     }
 }
 
@@ -1078,7 +1120,7 @@ impl View {
     /// crate's manifest (so tests/tools work from any directory).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn new() -> Result<Self, ViewError> {
-        Self::from_source(&csp_data::FsDataSource, &data_root())
+        Self::from_source(&csp_data::FsDataSource, &data_root(), native_save_seed())
     }
 
     /// The M10-C shared half: load a `data/` tree from any
@@ -1090,6 +1132,7 @@ impl View {
     fn from_source(
         src: &dyn csp_data::DataSource,
         root: &std::path::Path,
+        save_seed: u64,
     ) -> Result<Self, ViewError> {
         // §8.2: load the whole `data/` tree up front and run the
         // semantic validator BEFORE anything reaches the sim — the
@@ -1136,6 +1179,14 @@ impl View {
             max_vessels: balance.max_tracked_vessels,
             max_debris: balance.max_debris,
         });
+        // §2.7's save seed — selects the contract-offer and
+        // reliability draws. Never left at the `World::new` default:
+        // without this every fresh game drew the identical offer
+        // board and identical failure rolls (W1.5-a). Native gets
+        // wall-clock entropy ([`native_save_seed`]); the §6.3 demo
+        // passes [`demo::DEMO_SAVE_SEED`] so the fixed scenario stays
+        // reproducible.
+        sim.set_save_seed(save_seed);
         // M9a §2.10: the script host + autopilot driver (construction
         // config — re-installed identically by csp-bench's replay
         // harness) and the per-save op budget.
@@ -1269,7 +1320,11 @@ impl View {
     /// Compiled on every target: wasm's `View::new` IS this, and native
     /// tests exercise the same construction.
     pub fn new_demo() -> Result<Self, ViewError> {
-        let mut view = Self::from_source(&demo::source(), std::path::Path::new(demo::DEMO_ROOT))?;
+        let mut view = Self::from_source(
+            &demo::source(),
+            std::path::Path::new(demo::DEMO_ROOT),
+            demo::DEMO_SAVE_SEED,
+        )?;
         view.demo = true;
         view.with_vab_session(|v| {
             v.set_part_limit(Some(demo::DEMO_PART_LIMIT));
@@ -1689,6 +1744,19 @@ impl View {
     pub fn toggle_help_panel(&mut self) {
         let mut r = self.world.resource_mut::<PanelFlags>();
         r.help = !r.help;
+    }
+
+    /// Toggle the Program window (the `OpenProgram` binding, the
+    /// top-bar "Program" button).
+    pub fn toggle_program_panel(&mut self) {
+        let mut r = self.world.resource_mut::<PanelFlags>();
+        r.program = !r.program;
+    }
+
+    /// Whether the Program window is on screen — for tests and the
+    /// tutorial's progress read.
+    pub fn program_panel_open(&self) -> bool {
+        self.world.resource::<PanelFlags>().program
     }
 
     /// Whether the controls-help card is on screen — for tests and
@@ -2556,8 +2624,16 @@ impl View {
         }
         *self.world.resource_mut::<ProgramMirror>() = ProgramMirror {
             input,
-            vessel: vid.filter(|_| ctx_situation.is_some()),
-            science_ctx: ctx_biome.zip(ctx_situation),
+            vessel: vid,
+            // W1.2: the context stages on the SITUATION, not the biome —
+            // space situations (SpaceLow/SpaceHigh) have no biome, and
+            // the sim accepts the empty `BiomeId` for them
+            // (`research::apply_run_experiment` + the shipped canister's
+            // situation mask). Zipping on the biome made `science_ctx`
+            // `None` for every orbital context and dropped every
+            // `RunExperiment` the panel correctly showed as runnable.
+            science_ctx: ctx_situation
+                .map(|s| (ctx_biome.unwrap_or_else(|| csp_data::BiomeId::from("")), s)),
             keys,
             recovery_site,
         };
@@ -2708,6 +2784,15 @@ impl View {
         }
         // Pooled data — one row per (node, key), merged by key like
         // `VesselScience::units_at`.
+        // W1.5-(e): the transmit EC gate was undisclosed — stage the
+        // vessel's ElectricCharge and each row's cost so the button
+        // can gate and say why (same arithmetic `apply_transmit_data`
+        // enforces: `units × transmit_ec_per_data_unit`).
+        input.vessel_ec = Some(csp_sim::transfers::vessel_resource(
+            v,
+            &csp_data::ResourceId::from(csp_sim::research::ELECTRIC_CHARGE),
+        ));
+        let ec_per_unit = sim.science_config().transmit_ec_per_data_unit;
         let mut by_key: std::collections::BTreeMap<csp_sim::research::DataKey, f64> =
             std::collections::BTreeMap::new();
         for m in v.science.data.values() {
@@ -2737,6 +2822,7 @@ impl View {
                 ),
                 units,
                 transmit_yield: units * ratio,
+                transmit_ec_cost: units * ec_per_unit,
                 recover_yield: units
                     * if prior.transmitted {
                         (1.0 - ratio).max(0.0)
@@ -2862,6 +2948,20 @@ impl View {
     }
 }
 
+/// The native run's §2.7 save seed — wall-clock entropy folded with
+/// the pid so two games started in the same nanos-quantum still
+/// differ. Session entropy, not sim state: the seed itself is what
+/// the sim serializes and hashes, so a saved/replayed run reproduces
+/// its draws from `save_seed` regardless of how it was chosen.
+#[cfg(not(target_arch = "wasm32"))]
+fn native_save_seed() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos ^ (u64::from(std::process::id()) << 32) ^ 0x9E37_79B9_7F4A_7C15
+}
+
 /// The data/ directory root: `./data` when it exists (the app runs from
 /// the repo root), else the repo layout relative to this crate's manifest
 /// so tests and tools resolve the same files from any CWD. `pub` so
@@ -2968,22 +3068,79 @@ fn install_program_resources(
 /// and upgrade-track rows (same purchasability arithmetic the applies
 /// enforce), and the tail of the reliability notification log.
 /// Extracted from `stage_program` under the line budget.
+#[allow(clippy::too_many_lines)] // one staging pass per mirror section
 fn stage_program_overview(
     sim: &SimWorld,
     input: &mut csp_ui::program::ProgramInput,
     name_of: &dyn Fn(&csp_data::LocKey, &str) -> String,
 ) {
     use csp_ui::program as up;
+    // W1.5-(i): `contract.colony_resupply` needs colony logistics UI
+    // (`JoinColonyInventory`/`TransferColonyResource` — W2.3), so an
+    // accepted offer could only ever expire into its penalty. Gate
+    // the kind off the board — the interim-honesty filter the fix
+    // plan prescribes; drop it once the verbs ship.
+    let mut gated = 0usize;
     for o in sim.contracts().offers.values() {
+        if matches!(o.params, csp_data::ContractParams::ColonyResupply { .. }) {
+            gated += 1;
+            continue;
+        }
+        let template = sim.contract_defs().get(&o.template);
         input.offers.push(up::OfferRow {
             index: o.index,
-            label: format!("#{} {}", o.index, o.template.as_str()),
+            label: format!(
+                "#{} {}",
+                o.index,
+                template.map_or_else(
+                    || o.template.as_str().to_string(),
+                    |t| name_of(&t.display_name, o.template.as_str())
+                )
+            ),
+            detail: contract_params_summary(&o.params),
+            reward: template.map_or_else(String::new, |t| {
+                format!(
+                    "+₣{:.0} sign · +₣{:.0} done · −₣{:.0} expiry",
+                    t.rewards.advance_funds,
+                    t.rewards.completion_funds,
+                    t.rewards.failure_penalty_funds
+                )
+            }),
+            deadline: template
+                .and_then(|t| t.deadline_days)
+                .map_or_else(String::new, |d| format!("deadline {d:.1} days")),
         });
     }
+    if gated > 0 {
+        input.offers_note = Some(format!(
+            "{gated} colony-resupply offer(s) hidden — colony logistics are not reachable yet"
+        ));
+    }
+    let now = sim.clock().ticks();
     for c in sim.contracts().active.values() {
-        input
-            .active
-            .push(format!("#{} {}", c.id.0, c.template.as_str()));
+        let template = sim.contract_defs().get(&c.template);
+        input.active.push(up::ActiveRow {
+            label: format!(
+                "#{} {}",
+                c.id.0,
+                template.map_or_else(
+                    || c.template.as_str().to_string(),
+                    |t| name_of(&t.display_name, c.template.as_str())
+                )
+            ),
+            detail: format!(
+                "{}{}{}",
+                contract_params_summary(&c.params),
+                template.map_or_else(String::new, |t| format!(
+                    "  · +₣{:.0} on completion",
+                    t.rewards.completion_funds
+                )),
+                c.deadline_tick.map_or_else(String::new, |t| {
+                    let days = t.saturating_sub(now) as f64 / csp_core::TICK_HZ as f64 / 86_400.0;
+                    format!("  · {days:.1} days left")
+                })
+            ),
+        });
     }
     let tech = sim.tech();
     input.tech = sim.tech_tree().map(|tree| {
@@ -3022,24 +3179,100 @@ fn stage_program_overview(
                 .collect()
         })
         .unwrap_or_default();
-    for n in sim.notifications().iter().rev().take(8).rev() {
-        let text = match n.kind {
-            csp_sim::reliability::NotificationKind::PartFailed { mode, dormant } => {
-                format!(
-                    "vessel {} — PART FAILED {:?}{}",
-                    n.vessel.0,
-                    mode,
-                    if dormant { " (dormant)" } else { "" }
-                )
-            }
-            csp_sim::reliability::NotificationKind::IgnitionMisfire => {
-                format!("vessel {} — IGNITION MISFIRE", n.vessel.0)
-            }
-            csp_sim::reliability::NotificationKind::OnRails => {
-                format!("vessel {} — ON RAILS", n.vessel.0)
-            }
-        };
-        input.notices.push(up::NoticeRow { tick: n.tick, text });
+    // The LOG tail — the notification ring (vessel + program events)
+    // merged with the funds ledger's tail by tick, so contract
+    // lifecycle and money movement interleave correctly. Bounded at
+    // the same 8 rows.
+    let mut rows: Vec<(u64, String)> = sim
+        .notifications()
+        .iter()
+        .map(|n| (n.tick, notice_text(n)))
+        .collect();
+    rows.extend(sim.economy().ledger.iter().map(|e| {
+        (
+            e.tick,
+            format!(
+                "funds {:+}₣ — {:?}",
+                e.delta_micros as f64 / 1.0e6,
+                e.reason
+            ),
+        )
+    }));
+    rows.sort_by_key(|(tick, _)| *tick);
+    for (tick, text) in rows.into_iter().rev().take(8).rev() {
+        input.notices.push(up::NoticeRow { tick, text });
+    }
+}
+
+/// One notification-log line — the `LOG` section's per-kind format.
+/// [`csp_sim::reliability::PROGRAM_VESSEL`] entries (contracts,
+/// banked science) print no vessel prefix.
+fn notice_text(n: &csp_sim::reliability::Notification) -> String {
+    use csp_sim::reliability::NotificationKind as K;
+    let v = |id: csp_sim::VesselId| format!("vessel {} — ", id.0);
+    match n.kind {
+        K::PartFailed { mode, dormant } => format!(
+            "{}PART FAILED {:?}{}",
+            v(n.vessel),
+            mode,
+            if dormant { " (dormant)" } else { "" }
+        ),
+        K::IgnitionMisfire => format!("{}IGNITION MISFIRE", v(n.vessel)),
+        K::OnRails => format!("{}ON RAILS", v(n.vessel)),
+        K::ContractAccepted { contract } => format!("contract #{contract} — ACCEPTED"),
+        K::ContractCompleted { contract } => format!("contract #{contract} — COMPLETED"),
+        K::ContractFailed { contract } => {
+            format!("contract #{contract} — FAILED (deadline expired)")
+        }
+        K::ScienceBanked { micros } => {
+            format!("science banked +{:.1}⚛", micros as f64 / 1.0e6)
+        }
+    }
+}
+
+/// The kind-specific one-line summary of an offer's concrete params —
+/// what the accept predicate will actually evaluate (W1.5-d: offers
+/// were accept-blind, name-only).
+fn contract_params_summary(p: &csp_data::ContractParams) -> String {
+    use csp_data::ContractParams as P;
+    match p {
+        P::SatelliteOrbit {
+            body,
+            min_periapsis_alt_m,
+            max_apoapsis_alt_m,
+        } => format!(
+            "orbit {body}: Pe ≥ {:.0} km, Ap ≤ {:.0} km",
+            min_periapsis_alt_m / 1.0e3,
+            max_apoapsis_alt_m / 1.0e3
+        ),
+        P::SurveyData {
+            experiment,
+            body,
+            min_units,
+        } => format!("return {min_units:.0} data of {experiment} from {body}"),
+        P::PartTest { module, regime } => {
+            let module = match module {
+                csp_data::ModuleReq::Lab => "a lab".to_string(),
+                csp_data::ModuleReq::DockPort => "a docking port".to_string(),
+                csp_data::ModuleReq::CrewSeat => "a crew seat".to_string(),
+                csp_data::ModuleReq::Experiment(e) => format!("experiment {e}"),
+                csp_data::ModuleReq::Tank => "a tank".to_string(),
+                csp_data::ModuleReq::ThrustSite => "an engine".to_string(),
+            };
+            let regime = match regime {
+                csp_data::ContractRegime::Orbit { body, min_alt_m } => {
+                    format!("orbit {body} above {:.0} km", min_alt_m / 1.0e3)
+                }
+                csp_data::ContractRegime::Landed { body } => format!("land on {body}"),
+            };
+            format!("take {module} to {regime}")
+        }
+        P::Rescue { body } => format!("recover a vessel latched on {body}"),
+        P::ColonyResupply {
+            body,
+            resource,
+            amount,
+        } => format!("deliver {amount:.0} {resource} to colonies on {body}"),
     }
 }
 
@@ -3054,6 +3287,7 @@ fn stock_flight_craft() -> csp_sim::CraftDef {
         experiments: Vec::new(),
         lab: None,
         engine: None,
+        parachute: None,
         dock_ports: vec![],
         tanks: vec![],
         crew_seats: 0,
@@ -3177,7 +3411,7 @@ mod startup_tests {
         files.retain(|(p, _)| *p != "data/systems/home/sites.ron");
         files.push(("data/systems/home/sites.ron", BAD_SITES));
         let src = csp_data::EmbeddedSource::new(Box::leak(files.into_boxed_slice()));
-        match View::from_source(&src, std::path::Path::new("data")) {
+        match View::from_source(&src, std::path::Path::new("data"), 7) {
             Err(ViewError::Validation(errs)) => {
                 assert!(
                     errs.iter()
@@ -3399,39 +3633,142 @@ mod tests {
     #[test]
     fn program_command_maps_recovery_verbs() {
         use csp_ui::program::ProgramCommand as C;
+        let mut dropped = Vec::new();
         let mirror = ProgramMirror {
             vessel: Some(csp_sim::VesselId(7)),
             recovery_site: Some(csp_data::SiteId::from("terrin-launch")),
             ..ProgramMirror::default()
         };
         assert_eq!(
-            program_command(&mirror, C::RecoverVessel),
+            program_command(&mirror, C::RecoverVessel, &mut dropped),
             Some(SimCommand::RecoverVessel {
                 vessel: csp_sim::VesselId(7),
                 site: Some(csp_data::SiteId::from("terrin-launch")),
             })
         );
         assert_eq!(
-            program_command(&mirror, C::TerminateVessel),
+            program_command(&mirror, C::TerminateVessel, &mut dropped),
             Some(SimCommand::TerminateVessel {
                 vessel: csp_sim::VesselId(7),
             })
         );
+        assert!(dropped.is_empty());
         // No site on the latched body → the remote-salvage leg.
         let remote = ProgramMirror {
             vessel: Some(csp_sim::VesselId(7)),
             ..ProgramMirror::default()
         };
         assert_eq!(
-            program_command(&remote, C::RecoverVessel),
+            program_command(&remote, C::RecoverVessel, &mut dropped),
             Some(SimCommand::RecoverVessel {
                 vessel: csp_sim::VesselId(7),
                 site: None,
             })
         );
-        // No focused vessel → nothing emitted.
+        // No focused vessel → nothing emitted, but the drop is reported.
         let empty = ProgramMirror::default();
-        assert_eq!(program_command(&empty, C::RecoverVessel), None);
-        assert_eq!(program_command(&empty, C::TerminateVessel), None);
+        assert_eq!(
+            program_command(&empty, C::RecoverVessel, &mut dropped),
+            None
+        );
+        assert_eq!(
+            program_command(&empty, C::TerminateVessel, &mut dropped),
+            None
+        );
+        assert_eq!(dropped.len(), 2, "each drop reports itself");
+    }
+
+    /// W1.2's gate: a rails vessel in space stages a REAL science
+    /// context — the situation carries it (space situations have no
+    /// biome; the sim accepts the empty `BiomeId` there), so a
+    /// `RunExperiment` click in orbit resolves to a `SimCommand`
+    /// instead of being silently dropped. Before the fix,
+    /// `science_ctx` zipped on the absent biome and this command
+    /// could never leave the panel.
+    #[test]
+    fn rails_vessel_stages_orbital_science_ctx() {
+        let mut view = View::new_demo().expect("demo data loads");
+        let (mu, a) = (3.5316e12_f64, 700_000.0_f64);
+        view.sim.enqueue(
+            csp_sim::SourceClass::Ui,
+            0,
+            SimCommand::SpawnVessel {
+                parent: csp_data::BodyId::from("terrin"),
+                elements: csp_data::KeplerElements {
+                    semi_major_axis_m: a,
+                    eccentricity: 0.0,
+                    inclination_rad: 0.0,
+                    ascending_node_rad: 0.0,
+                    arg_periapsis_rad: 0.0,
+                    mean_anomaly_epoch_rad: 0.0,
+                    period_s: 2.0 * std::f64::consts::PI * (a * a * a / mu).sqrt(),
+                },
+            },
+        );
+        let report = view.sim_step(1).expect("advance");
+        assert!(
+            report.rejected.is_empty(),
+            "spawn rejected: {:?}",
+            report.rejected
+        );
+        // The pad craft (spawned by `new_demo`'s seed, staged InBubble)
+        // always wins the flight-focus half of the mirror's vessel
+        // pick — the map-focus path only runs when no flight vessel
+        // is staged, so retire the pad craft like a player would.
+        // (It materializes in the same drain as the elements spawn —
+        // the terminate has to land in the NEXT boundary.)
+        view.sim.enqueue(
+            csp_sim::SourceClass::Ui,
+            0,
+            SimCommand::TerminateVessel {
+                vessel: csp_sim::VesselId(1),
+            },
+        );
+        let report = view.sim_step(2).expect("advance");
+        assert!(
+            report.rejected.is_empty(),
+            "terminate rejected: {:?}",
+            report.rejected
+        );
+        // Focus the rails vessel (the map-focus path the player uses).
+        view.world
+            .resource_mut::<flight::FlightFocusOverride>()
+            .target = None;
+        view.world.resource_mut::<map::MapInput>().focus_vessel = Some(csp_sim::VesselId(0));
+        view.end_frame();
+        let mirror = view.world.resource::<ProgramMirror>();
+        let dump: Vec<String> = view
+            .sim
+            .vessels()
+            .iter()
+            .map(|(id, v)| format!("{}={:?}", id.0, v.state))
+            .collect();
+        assert_eq!(mirror.vessel, Some(csp_sim::VesselId(0)), "{dump:?}");
+        assert_eq!(
+            mirror.science_ctx.as_ref().map(|(_, s)| *s),
+            Some(csp_data::Situation::SpaceLow),
+            "orbit stages a context — the biome half is empty by design; vessels: {dump:?}"
+        );
+        let mut dropped = Vec::new();
+        let cmd = program_command(
+            mirror,
+            csp_ui::program::ProgramCommand::RunExperiment {
+                node: 0,
+                experiment: "exp.materials_study".into(),
+            },
+            &mut dropped,
+        );
+        assert!(dropped.is_empty(), "dropped: {dropped:?}");
+        assert_eq!(
+            cmd,
+            Some(SimCommand::RunExperiment {
+                vessel: csp_sim::VesselId(0),
+                node: csp_phys::PartNodeId(0),
+                experiment: csp_data::ExperimentId::from("exp.materials_study"),
+                biome: csp_data::BiomeId::from(""),
+                situation: csp_data::Situation::SpaceLow,
+            }),
+            "RunExperiment must reach the outbox in orbit"
+        );
     }
 }

@@ -65,6 +65,7 @@ pub(crate) fn tutorial_drive(
     focus_override: Res<crate::flight::FlightFocusOverride>,
     vab_input: Res<VabInput>,
     vab: Res<VabSessionRes>,
+    mirror: Res<crate::ProgramMirror>,
     mut tutorial: ResMut<TutorialRes>,
 ) {
     let env = snap.env.as_ref();
@@ -108,6 +109,19 @@ pub(crate) fn tutorial_drive(
         apoapsis_m,
         periapsis_m,
         atmosphere_top_m: env.map_or(0.0, |e| e.atm_top_m),
+        // The science tier (W1.5-c) — staged off the Program mirror
+        // like every other honest predicate: pooled data aboard the
+        // focused vessel, the program's banked total, and a spent
+        // (nonzero-cost) research node.
+        science_pooled: mirror.input.pooled.iter().map(|d| d.units).sum(),
+        science_banked: mirror.input.banked,
+        research_spent: mirror
+            .input
+            .tech
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|t| t.researched && t.cost > 0.0),
     };
     tutorial.0.observe(&input);
 }
@@ -172,6 +186,7 @@ mod tests {
             ..VabInput::default()
         });
         world.insert_resource(VabSessionRes::default());
+        world.insert_resource(crate::ProgramMirror::default());
         world.insert_resource(std::mem::take(tutorial));
         let mut sched = Schedule::default();
         sched.add_systems(tutorial_drive);
@@ -213,7 +228,67 @@ mod tests {
         };
         let mut t = TutorialRes::default();
         drive(snap, 1, false, &mut t);
-        assert!(t.0.finished, "orbital snapshot must finish the checklist");
+        // W1.5-c: orbit alone no longer finishes — the checklist now
+        // continues through the science tier, so the orbital
+        // snapshot parks on the first science step.
+        assert_eq!(t.0.step, 7, "orbit done → waiting on science");
+        assert!(!t.0.finished);
+    }
+
+    /// The science tier's honesty rule end-to-end: an orbital
+    /// snapshot plus a staged Program mirror carrying pooled data,
+    /// banked science, and a spent research node completes the full
+    /// checklist through the real pipeline.
+    #[test]
+    fn science_mirror_completes_tutorial() {
+        use csp_ui::program::{DataRow, TechRow};
+        let (mu, r) = (3.5316e12, 7.0e5);
+        let v = f64::sqrt(mu / r);
+        let snap = FlightSnapshot {
+            env: Some(env()),
+            vessels: vec![vessel(
+                DVec3::new(r, 0.0, 0.0),
+                DVec3::new(0.0, v, 0.0),
+                1.0,
+            )],
+        };
+        let mut world = World::new();
+        world.insert_resource(snap);
+        world.insert_resource(crate::flight::LiveVesselCount(1));
+        world.insert_resource(crate::flight::FlightFocusOverride::default());
+        world.insert_resource(VabInput::default());
+        world.insert_resource(VabSessionRes::default());
+        world.insert_resource(crate::ProgramMirror {
+            input: csp_ui::program::ProgramInput {
+                pooled: vec![DataRow {
+                    index: 0,
+                    label: "x".into(),
+                    units: 10.0,
+                    transmit_yield: 4.0,
+                    transmit_ec_cost: 10.0,
+                    recover_yield: 10.0,
+                    transmitted: false,
+                }],
+                banked: 12.0,
+                tech: Some(vec![TechRow {
+                    id: "n".into(),
+                    name: "n".into(),
+                    cost: 5.0,
+                    researched: true,
+                    prereqs_met: false,
+                    affordable: false,
+                }]),
+                ..csp_ui::program::ProgramInput::default()
+            },
+            ..crate::ProgramMirror::default()
+        });
+        let mut t = TutorialRes::default();
+        world.insert_resource(std::mem::take(&mut t));
+        let mut sched = Schedule::default();
+        sched.add_systems(tutorial_drive);
+        sched.run(&mut world);
+        t = world.remove_resource::<TutorialRes>().expect("resource");
+        assert!(t.0.finished, "science state must finish the checklist");
     }
 
     /// R15-F4: debris is not "a vessel" — a mid-flight shattering

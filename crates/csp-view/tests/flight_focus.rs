@@ -47,7 +47,33 @@ fn second_launch_moves_focus_to_the_new_vessel() {
     view.launch_craft().expect("second launch");
     frame(&mut view, 1);
 
-    assert_eq!(view.sim.vessels().len(), 2, "second launch did not spawn");
+    let dump: Vec<String> = view
+        .sim
+        .vessels()
+        .iter()
+        .map(|(id, v)| {
+            let parts = v.craft.as_ref().map_or(0, |c| c.graph.nodes.len());
+            let state = match &v.state {
+                csp_sim::VesselState::InBubble(_) => "bubble",
+                csp_sim::VesselState::OnRails(_) => "rails",
+                csp_sim::VesselState::SurfaceLatched(_) => "latched",
+            };
+            format!(
+                "{}:{state}({parts}){}",
+                id.0,
+                if v.debris_since.is_some() {
+                    "-debris"
+                } else {
+                    ""
+                }
+            )
+        })
+        .collect();
+    assert_eq!(
+        view.sim.vessels().len(),
+        2,
+        "second launch did not spawn: {dump:?}"
+    );
     let newest = *view.sim.vessels().keys().max().expect("vessels present");
     assert_ne!(newest, first, "the second spawn minted a fresh VesselId");
     assert_eq!(

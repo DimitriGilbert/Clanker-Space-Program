@@ -462,6 +462,7 @@ mod tests {
                 experiments: Vec::new(),
                 lab: None,
                 engine: None,
+                parachute: None,
                 dock_ports: vec![],
                 tanks: vec![
                     TankSpec {
@@ -544,6 +545,7 @@ mod tests {
                 joined_colony: None,
                 reliability: BTreeMap::new(),
                 control_lease: Lease::Player,
+                deployed: BTreeMap::new(),
             },
         );
         id

@@ -30,9 +30,10 @@ fn frame(view: &mut View, ticks: u64) {
 }
 
 /// The flight-side staging: the seeded "Stock Hopper" is pod/tank/
-/// engine, and each part must stage a *distinct* silhouette — a taper,
-/// a straight cylinder, and a bell — not the uniform box the M4c
-/// placeholder tier emitted three times over.
+/// engine + canister/battery on the nose (W1.5-b), and the propulsion
+/// parts must stage *distinct* silhouettes — a taper, a straight
+/// cylinder, and a bell — not the uniform box the M4c placeholder
+/// tier emitted three times over.
 #[test]
 fn starter_stack_stages_distinct_silhouettes() {
     let mut view = View::new().expect("data/ load");
@@ -47,18 +48,25 @@ fn starter_stack_stages_distinct_silhouettes() {
         &csp_view::art::ArtAssets::default(),
     );
     let vessel = staged.vessels.first().expect("seeded vessel staged");
-    assert_eq!(vessel.parts.len(), 3, "pod + tank + engine");
-    // Sort by body-frame z: the stack runs engine (bottom, −z) →
-    // tank → pod (top, +z) under §3.1's up-stack convention.
+    assert_eq!(
+        vessel.parts.len(),
+        5,
+        "pod + tank + engine + canister + battery"
+    );
+    // The stack is fully axial: engine (bottom, −z) → tank →
+    // battery → canister → pod (top, +z) — the W1.5-b science pair
+    // flies inline between pod and tank. Sort by z and take the
+    // propulsion triple: the lowest two plus the topmost.
     let mut parts = vessel.parts.clone();
     parts.sort_by(|a, b| a.transform.offset.z.total_cmp(&b.transform.offset.z));
-    let [engine, tank, pod]: [csp_view::flight::FlightPart; 3] =
-        parts.try_into().expect("three parts");
+    let engine = &parts[0];
+    let tank = &parts[1];
+    let pod = parts.last().expect("five parts");
 
     // Engine — the bell: max radius on the LOWEST station (nozzle
     // opens −z), a throat, and the mount stepping back up — the
     // non-monotonic signature a pod taper never has.
-    let bell = profile(&engine);
+    let bell = profile(engine);
     let r_max = bell.iter().map(|s| s.1).fold(0.0, f64::max);
     assert!(
         (bell[0].1 - r_max).abs() < 1e-12,
@@ -70,7 +78,7 @@ fn starter_stack_stages_distinct_silhouettes() {
     );
 
     // Tank — the cylinder: every station the same radius.
-    let cyl = profile(&tank);
+    let cyl = profile(tank);
     assert!(
         cyl.windows(2).all(|w| (w[1].1 - w[0].1).abs() < 1e-12),
         "tank must lathe a constant-radius profile: {cyl:?}"
@@ -78,7 +86,7 @@ fn starter_stack_stages_distinct_silhouettes() {
 
     // Pod — the capsule taper: monotone non-increasing to a narrower
     // top node class.
-    let pod_p = profile(&pod);
+    let pod_p = profile(pod);
     assert!(
         pod_p.windows(2).all(|w| w[1].1 <= w[0].1 + 1e-12),
         "pod must taper monotonically: {pod_p:?}"
@@ -90,7 +98,7 @@ fn starter_stack_stages_distinct_silhouettes() {
 
     // Distinct silhouettes → distinct mesh signatures (triangle
     // counts + vertex data), never the old uniform 12-tri box.
-    let tris: Vec<usize> = [&engine, &tank, &pod]
+    let tris: Vec<usize> = [engine, tank, pod]
         .into_iter()
         .map(|p| {
             let mut t = Vec::new();
@@ -109,9 +117,10 @@ fn starter_stack_stages_distinct_silhouettes() {
 }
 
 /// The VAB view carries the same shapes — the editor sees the craft
-/// as it will fly: every starter part a lathe, and the emitted packet
-/// well past the three-box vertex count (3·36 = 108) the placeholder
-/// pass produced.
+/// as it will fly: the propulsion starter parts are lathes (the
+/// battery's authored collider is an honest box), and the emitted
+/// packet well past the placeholder-box vertex count (36 per part)
+/// the old pass produced.
 #[test]
 fn vab_packet_is_kitbash_not_boxes() {
     let mut view = View::new().expect("data/ load");
@@ -120,19 +129,21 @@ fn vab_packet_is_kitbash_not_boxes() {
     frame(&mut view, 1);
 
     let scene = view.world.resource::<csp_view::vab::VabScene>();
-    assert_eq!(scene.parts.len(), 3);
-    for p in &scene.parts {
-        assert!(
-            matches!(p.shape, PartShape::Lathe { .. }),
-            "starter part {:?} must be a lathe silhouette",
-            p.node
-        );
-    }
-    let packet = view.take_vab_packet().expect("VAB packet emitted");
-    assert_eq!(packet.pick_ids.len(), 3, "one pick id per part");
+    assert_eq!(scene.parts.len(), 5);
+    let lathes = scene
+        .parts
+        .iter()
+        .filter(|p| matches!(p.shape, PartShape::Lathe { .. }))
+        .count();
     assert!(
-        packet.vertices.len() > 108,
-        "kitbash meshes must beat 3 placeholder boxes ({} verts)",
+        lathes >= 3,
+        "pod/tank/engine must be lathe silhouettes ({lathes} lathes staged)"
+    );
+    let packet = view.take_vab_packet().expect("VAB packet emitted");
+    assert_eq!(packet.pick_ids.len(), 5, "one pick id per part");
+    assert!(
+        packet.vertices.len() > 180,
+        "kitbash meshes must beat 5 placeholder boxes ({} verts)",
         packet.vertices.len()
     );
 }

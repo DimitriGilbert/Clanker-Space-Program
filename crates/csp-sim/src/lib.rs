@@ -379,6 +379,16 @@ pub struct Vessel {
     /// **Hashed and serialized** — it decides future applies, so it is
     /// state like any other gate.
     pub control_lease: Lease,
+    /// The §3.1 `Parachute` deploy record — node → the tick
+    /// [`SimCommand::DeployPart`] flipped it armed → deployed,
+    /// bound to `PartNodeId` so it partitions/merges with the part
+    /// graph exactly like `tank_contents` and `reliability` (§2.4).
+    /// The body's [`csp_phys::DecelSite`]s are refreshed from this
+    /// record every tick (a pure function of `(craft, deployed)`),
+    /// so it survives every re-weld and materialization path for
+    /// free. **Hashed and serialized** sim state. Empty for
+    /// craft-less and never-deployed vessels.
+    pub deployed: BTreeMap<csp_phys::PartNodeId, u64>,
 }
 
 impl Vessel {
@@ -1166,6 +1176,23 @@ pub enum SimCommand {
         /// The vessel to remove.
         vessel: VesselId,
     },
+    /// §3.1 `Parachute` deploy: flip the vessel's per-node decelerator
+    /// record armed → deployed. The node's part must carry a resolved
+    /// [`csp_phys::ParachuteSpec`]; `InBubble` only in v1 (the
+    /// `JettisonPart` convention — the drag term the flag activates
+    /// exists only in the bubble's force model anyway), and a node
+    /// whose reliability record holds §3.4's `PanelJam` refuses like
+    /// `StuckDecoupler` does `JettisonPart`. `Recoverable` for
+    /// unknown vessels/nodes, non-bubble states, parts with no
+    /// decelerator, or an already-deployed node. The canopy's drag
+    /// applies from the next tick — gated by the spec's
+    /// altitude/speed ceilings in the force accumulation.
+    DeployPart {
+        /// The vessel deploying.
+        vessel: VesselId,
+        /// The graph node carrying the decelerator.
+        node: csp_phys::PartNodeId,
+    },
 }
 
 impl SimCommand {
@@ -1213,7 +1240,8 @@ impl SimCommand {
             | Self::DisengageAutopilot { vessel }
             | Self::SetVesselTracked { vessel, .. }
             | Self::RecoverVessel { vessel, .. }
-            | Self::TerminateVessel { vessel } => Some(*vessel),
+            | Self::TerminateVessel { vessel }
+            | Self::DeployPart { vessel, .. } => Some(*vessel),
             _ => None,
         }
     }
@@ -3954,6 +3982,11 @@ impl World {
                     if let Some(craft) = &vessel.craft {
                         reliability::apply_thrust_factors(body, craft, &vessel.reliability);
                         apply_fuel_scales(body, craft, &fuel_plans);
+                        // §3.1 decelerators: the body's additive-drag
+                        // sites are a pure function of (craft,
+                        // deployed) — refreshed wholesale so every
+                        // re-weld/materialization path agrees.
+                        refresh_decel_sites(body, craft, &vessel.deployed);
                     }
                     // M5 burn executor — a first-class sim mechanism, not
                     // a command stream (the maneuver module docs): while a
@@ -5020,6 +5053,9 @@ impl World {
             SimCommand::JettisonPart { vessel, node } => {
                 self.apply_jettison_part(*vessel, *node, shadow)?
             }
+            SimCommand::DeployPart { vessel, node } => {
+                self.apply_deploy_part(*vessel, *node, shadow)?
+            }
             SimCommand::SetManeuver {
                 vessel,
                 tick,
@@ -5527,6 +5563,7 @@ impl World {
                 // Craft-less vessels carry no reliability model.
                 reliability: BTreeMap::new(),
                 control_lease: Lease::Player,
+                deployed: BTreeMap::new(),
             },
         );
         // §2.6.6: resolve the residence the authored conic already
@@ -5797,6 +5834,7 @@ impl World {
                 reliability: reliability_records,
                 crew: Vec::new(),
                 control_lease: Lease::Player,
+                deployed: BTreeMap::new(),
             },
         );
         // No SOI publish: a bubble-resident vessel has no conic.
@@ -6801,6 +6839,9 @@ impl World {
         // "reliability record on non-node" Fatal is what a stale one
         // trips (the part instance is never reused).
         v.reliability.remove(&node);
+        // A deployed decelerator flag leaves with the part the same
+        // way — the node's canopy went over the side with it.
+        v.deployed.remove(&node);
         v.state = VesselState::InBubble(body);
         // Roster half of the seat destruction — members in the
         // jettisoned seat die with the part (the `remove_vessel` /
@@ -6822,6 +6863,58 @@ impl World {
             p.aero.remove(&vessel);
         }
         self.ensure_aero(vessel)
+    }
+
+    /// `DeployPart` — flip one decelerator node armed → deployed.
+    /// `InBubble` only in v1 (the `JettisonPart` convention); the
+    /// site's additive drag activates from the next tick through the
+    /// per-tick [`refresh_decel_sites`] pass, gated by the spec's
+    /// altitude/speed ceilings in the force accumulation.
+    fn apply_deploy_part(
+        &mut self,
+        vessel: VesselId,
+        node: csp_phys::PartNodeId,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        let Some(v) = self.vessels.get(&vessel) else {
+            return Err(SimError::Recoverable("deploy: unknown vessel"));
+        };
+        if !matches!(v.state, VesselState::InBubble(_)) {
+            return Err(SimError::Recoverable("deploy: vessel not in bubble"));
+        }
+        let Some(craft) = &v.craft else {
+            return Err(SimError::Recoverable("deploy: vessel has no craft"));
+        };
+        let Some(n) = craft.graph.nodes.get(&node) else {
+            return Err(SimError::Recoverable("deploy: unknown part node"));
+        };
+        if craft.parts[n.effective_index as usize].parachute.is_none() {
+            return Err(SimError::Recoverable("deploy: part has no decelerator"));
+        }
+        if v.deployed.contains_key(&node) {
+            return Err(SimError::Recoverable(
+                "deploy: decelerator already deployed",
+            ));
+        }
+        // M9b §3.4's `PanelJam` — the recorded failure mode means the
+        // deploy hardware is dead (the `StuckDecoupler` precedent at
+        // `apply_jettison_part`).
+        if v.reliability
+            .get(&node)
+            .is_some_and(|r| r.has_mode(csp_data::FailureMode::PanelJam))
+        {
+            return Err(SimError::Recoverable(
+                "deploy: decelerator jammed (reliability failure)",
+            ));
+        }
+        self.shadow_vessel(shadow, vessel);
+        let tick = self.clock.ticks();
+        self.vessels
+            .get_mut(&vessel)
+            .ok_or(SimError::Fatal("deploy: vessel vanished"))?
+            .deployed
+            .insert(node, tick);
+        Ok(())
     }
 
     /// §2.4's undock — the `Undock` command apply: split `vessel`'s
@@ -6997,6 +7090,16 @@ impl World {
         // so their flags clear inside `split_records` for the publish
         // slot to re-derive under the new binding.
         let frag_reliability = reliability::split_records(v, &frag_nodes);
+        // §3.1 `Parachute`: deploy records partition by node
+        // membership like the tanks — a deployed canopy on the
+        // detached subtree rides with it.
+        let frag_deployed: BTreeMap<csp_phys::PartNodeId, u64> = v
+            .deployed
+            .iter()
+            .filter(|(k, _)| frag_nodes.contains(k))
+            .map(|(k, t)| (*k, *t))
+            .collect();
+        v.deployed.retain(|id, _| !frag_nodes.contains(id));
         // M7-A: the keyed data pool and spent marks partition by node
         // the same way; a project whose lab node departs finalizes at
         // this tick — accrued science banks, and its escrowed remainder
@@ -7046,6 +7149,9 @@ impl World {
                 // M9b: the subtree's reliability records (pending
                 // publishes cleared inside `split_records`).
                 reliability: frag_reliability,
+                // §3.1 `Parachute`: the subtree's deploy records ride
+                // with it (a canopy already out stays out).
+                deployed: frag_deployed,
                 // The split-off fragment starts unjoined — a fresh
                 // `JoinColonyInventory` opts it in explicitly.
                 joined_colony: None,
@@ -8383,6 +8489,50 @@ impl World {
 impl Default for World {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// §3.1 `Parachute` decelerator sites: refresh `body.decel` from the
+/// craft's resolved [`csp_phys::ParachuteSpec`]s and the vessel's
+/// deployed record — one site per parachute-carrying node, with the
+/// deploy stamp converted to sim seconds. Recomputed wholesale every
+/// tick (a pure function of `(craft, deployed)`), so every body
+/// mutation path — spawn, restore, `to_bubble`, unlatch, jettison,
+/// breakup, undock, latch merge, and the mass-bucket re-weld — sees
+/// the same sites with zero per-path bookkeeping; `WeldedBody::decel`
+/// is `#[serde(skip)]` for exactly this reason.
+fn refresh_decel_sites(
+    body: &mut WeldedBody,
+    craft: &CraftDef,
+    deployed: &BTreeMap<csp_phys::PartNodeId, u64>,
+) {
+    body.decel.clear();
+    if !craft.parts.iter().any(|p| p.parachute.is_some()) {
+        return;
+    }
+    // The craft welded to produce this body — `body_transforms`
+    // cannot fail on it; an empty site list is the no-chute answer
+    // anyway.
+    let Ok(transforms) = csp_phys::weld::body_transforms(&craft.graph, &craft.parts) else {
+        return;
+    };
+    for (id, node) in &craft.graph.nodes {
+        let Some(ep) = craft.parts.get(node.effective_index as usize) else {
+            continue;
+        };
+        let Some(spec) = &ep.parachute else {
+            continue;
+        };
+        body.decel.push(csp_phys::DecelSite {
+            node: *id,
+            local_pos: transforms[id].apply(ep.com),
+            packed_drag_area_m2: spec.packed_drag_area_m2,
+            deployed_drag_area_m2: spec.deployed_drag_area_m2,
+            deploy_alt_m: spec.deploy_alt_m,
+            deploy_speed_mps: spec.deploy_speed_mps,
+            deploy_time_s: spec.deploy_time_s,
+            deployed_at_s: deployed.get(id).map(|t| SimTime::from_ticks(*t).seconds()),
+        });
     }
 }
 
@@ -10342,6 +10492,16 @@ pub(crate) fn hash_craft(h: &mut StateHasher, craft: &CraftDef) {
                 h.f64(*f);
             });
         });
+        // §3.1 `Parachute` resolution: the deploy spec decides what a
+        // `DeployPart` may arm and how hard the canopy pulls — craft
+        // identity like the force sites it joins.
+        h.opt(&p.parachute, |h, c| {
+            h.f64(c.deploy_alt_m);
+            h.f64(c.deploy_speed_mps);
+            h.f64(c.packed_drag_area_m2);
+            h.f64(c.deployed_drag_area_m2);
+            h.f64(c.deploy_time_s);
+        });
     });
     // M7-C: the frozen resolved costs — hashed like the rest of the
     // craft identity (they decide the manufacture charge and the
@@ -10603,6 +10763,9 @@ fn apply_breakup(
     // name the old vessel, so the fragment's records are cleared
     // for the publish slot to re-derive under the new binding.
     let v_reliability = v.reliability.clone();
+    // §3.1 `Parachute`: deploy records partition by node the same
+    // way — a fragment's parts keep their canopy state.
+    let v_deployed = v.deployed.clone();
     // M7-A: the keyed data pool and spent marks partition by node the
     // same way; projects whose lab node departs finalize per fragment
     // below (their escrowed remainder lands in the fragment's pool).
@@ -10805,6 +10968,14 @@ fn apply_breakup(
                         .cloned()
                         .collect(),
                 },
+                // §3.1 `Parachute`: the fragment keeps the deploy
+                // records inside its member set — a canopy already
+                // out on that part stays out on the fragment.
+                deployed: v_deployed
+                    .iter()
+                    .filter(|(k, _)| frag_nodes.contains(k))
+                    .map(|(k, t)| (*k, *t))
+                    .collect(),
                 // A splitting fragment leaves the colony opt-in
                 // with the retained hull — it re-joins explicitly
                 // if it lands beside the colony.
@@ -10927,6 +11098,10 @@ fn apply_breakup(
     // holds — a pending publish naming this vessel stays valid (same
     // `VesselId`, same instance), so no flag clearing here.
     v.reliability
+        .retain(|id, _| craft.graph.nodes.contains_key(id));
+    // §3.1 `Parachute`: deploy records on departed/destroyed nodes
+    // drop with them.
+    v.deployed
         .retain(|id, _| craft.graph.nodes.contains_key(id));
     // M7-A: the pool and spent marks keep only the retained nodes the
     // same way; projects on departing lab nodes finalize next.
@@ -11085,6 +11260,18 @@ fn hash_vessel(h: &mut StateHasher, vessel: &Vessel) {
     // part instance" plus the pre-drawn thresholds, hashed like the
     // tank contents they partition with.
     reliability::hash_vessel_reliability(h, &vessel.reliability);
+    // §3.1 `Parachute`: the deploy record — it decides the per-tick
+    // decel sites like `throttle` decides thrust, so it is hashed
+    // state (§7.1's completeness rule).
+    h.btree_map(
+        &vessel.deployed,
+        |h, id| {
+            h.u64(id.0);
+        },
+        |h, t| {
+            h.u64(*t);
+        },
+    );
     // M9c: the control lease — it decides which commands apply, so it
     // is hashed state like every other gate (§7.1's completeness rule).
     h.stable_enum(&vessel.control_lease);
@@ -12861,6 +13048,7 @@ mod tests {
                 crew: Vec::new(),
                 reliability: BTreeMap::new(),
                 control_lease: Lease::Player,
+                deployed: BTreeMap::new(),
             },
         );
         s.next_vessel_id = 3;
@@ -12918,6 +13106,7 @@ mod tests {
             crew: Vec::new(),
             reliability: BTreeMap::new(),
             control_lease: Lease::Player,
+            deployed: BTreeMap::new(),
         }
     }
 
@@ -13432,6 +13621,7 @@ mod tests {
                 experiments: Vec::new(),
                 lab: None,
                 engine: None,
+                parachute: None,
                 dock_ports: vec![],
                 tanks: vec![],
                 crew_seats: 0,
@@ -13641,6 +13831,7 @@ mod tests {
             experiments: Vec::new(),
             lab: None,
             engine: None,
+            parachute: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -13664,6 +13855,7 @@ mod tests {
             experiments: Vec::new(),
             lab: None,
             engine: None,
+            parachute: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -13697,6 +13889,227 @@ mod tests {
     /// falling vessels — one keeps its fairing plate, one jettisons
     /// it. Mass leaves with the plate and the velocity profiles
     /// diverge measurably.
+    /// §3.1 `Parachute` craft: a pod root (1 000 kg box) plus a
+    /// chute node (55 kg, resolved deploy spec) stacked above it —
+    /// the canopy pull trails the flow once deployed.
+    fn chute_craft() -> CraftDef {
+        let (pod, chute) = (csp_phys::PartNodeId(1), csp_phys::PartNodeId(2));
+        let mut graph = csp_phys::PartGraph::new(pod);
+        graph.insert(
+            pod,
+            csp_phys::PartNode::new(None, csp_phys::PartTransform::IDENTITY, 0),
+        );
+        graph.insert(
+            chute,
+            csp_phys::PartNode::new(
+                Some(pod),
+                csp_phys::PartTransform::new(DVec3::new(0.0, 0.0, 0.7), csp_core::DQuat::IDENTITY),
+                1,
+            ),
+        );
+        let thermal = csp_data::ThermalDef {
+            heat_capacity_j_per_k: 400_000.0,
+            max_temp_k: 1_100.0,
+            emissivity: 0.8,
+            conduction_w_per_k: 60.0,
+        };
+        let pod_part = csp_phys::WeldPart {
+            experiments: Vec::new(),
+            lab: None,
+            engine: None,
+            parachute: None,
+            dock_ports: vec![],
+            tanks: vec![],
+            crew_seats: 0,
+            structural: csp_data::StructuralDef::unlimited(),
+            mass_kg: 1_000.0,
+            com: DVec3::ZERO,
+            inertia: csp_phys::SymMat3::solid_box(1_000.0, DVec3::new(0.5, 0.5, 0.5)),
+            collider: csp_phys::ColliderShape::Box {
+                half_extents: DVec3::new(0.5, 0.5, 0.5),
+            },
+            force_sites: vec![],
+            aero: csp_data::AeroDef::constant(0.8, 0.0, 1.0),
+            thermal: thermal.clone(),
+        };
+        let chute_part = csp_phys::WeldPart {
+            experiments: Vec::new(),
+            lab: None,
+            engine: None,
+            parachute: Some(csp_phys::ParachuteSpec {
+                deploy_alt_m: 6_000.0,
+                deploy_speed_mps: 260.0,
+                packed_drag_area_m2: 0.4,
+                deployed_drag_area_m2: 120.0,
+                deploy_time_s: 0.5,
+            }),
+            dock_ports: vec![],
+            tanks: vec![],
+            crew_seats: 0,
+            structural: csp_data::StructuralDef::unlimited(),
+            mass_kg: 55.0,
+            com: DVec3::ZERO,
+            inertia: csp_phys::SymMat3::solid_box(55.0, DVec3::new(0.25, 0.2, 0.2)),
+            collider: csp_phys::ColliderShape::Box {
+                half_extents: DVec3::new(0.25, 0.2, 0.2),
+            },
+            force_sites: vec![],
+            aero: csp_data::AeroDef::constant(0.5, 0.0, 0.5),
+            thermal,
+        };
+        CraftDef {
+            hash_memo: Default::default(),
+            graph,
+            parts: vec![pod_part, chute_part],
+            part_costs: vec![0.0, 0.0],
+            reliability: vec![],
+            part_ids: vec![],
+        }
+    }
+
+    /// §3.1 `DeployPart` end to end: a pod+chute falling from 1 km
+    /// deploys, the canopy's additive drag pulls it to a pod-class
+    /// terminal velocity (~12 m/s under 120 m² Cd·A), and it settles
+    /// into `SurfaceLatched` intact — a survivable landing where
+    /// `RecoverData` can close.
+    #[test]
+    fn deployed_chute_decelerates_and_lands() {
+        let mut w = physics_world(false); // no spin — v_rel == v
+        let pos = DVec3::new(TERRIN_R + 1_000.0, 0.0, 0.0);
+        spawn_physical(
+            &mut w,
+            SimCommand::SpawnPhysicalVessel {
+                craft: chute_craft(),
+                pos,
+                rot: csp_core::DQuat::IDENTITY,
+                vel: DVec3::new(-80.0, 0.0, 0.0),
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        // The deploy command flips the per-node record.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::DeployPart {
+                vessel: VesselId(0),
+                node: csp_phys::PartNodeId(2),
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(
+            w.vessels()[&VesselId(0)]
+                .deployed
+                .contains_key(&csp_phys::PartNodeId(2)),
+            "deploy record must be set"
+        );
+        // ~45 s of canopy braking: from −80 m/s to well under 30 —
+        // the undeployed craft would still be at ~150 m/s here.
+        w.step_frame(w.clock().ticks() + 2_880).unwrap();
+        let body = w.vessels()[&VesselId(0)].body().unwrap();
+        assert!(
+            body.vel.norm() < 40.0,
+            "canopy deceleration: |v| = {}",
+            body.vel.norm()
+        );
+        // It must then land and latch — intact (both nodes retained).
+        let mut latched = false;
+        for _ in 0..40 {
+            w.step_frame(w.clock().ticks() + 1_000).unwrap();
+            match &w.vessels()[&VesselId(0)].state {
+                VesselState::SurfaceLatched(_) => {
+                    latched = true;
+                    break;
+                }
+                VesselState::InBubble(_) => {}
+                _ => panic!("chute'd pod must not leave the bubble"),
+            }
+        }
+        assert!(latched, "deployed pod never settled to SurfaceLatched");
+        let v = &w.vessels()[&VesselId(0)];
+        assert_eq!(v.craft.as_ref().unwrap().graph.nodes.len(), 2);
+    }
+
+    /// `DeployPart` refusals: unknown node, a node with no decelerator
+    /// spec, a second deploy on the same node, and §3.4's `PanelJam`.
+    #[test]
+    fn deploy_part_rejects_bad_targets() {
+        let mut w = physics_world(false);
+        let pos = DVec3::new(TERRIN_R + 1_000.0, 0.0, 0.0);
+        spawn_physical(
+            &mut w,
+            SimCommand::SpawnPhysicalVessel {
+                craft: chute_craft(),
+                pos,
+                rot: csp_core::DQuat::IDENTITY,
+                vel: DVec3::new(-20.0, 0.0, 0.0),
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        let deploy = |node| SimCommand::DeployPart {
+            vessel: VesselId(0),
+            node,
+        };
+        // Unknown node.
+        w.enqueue(SourceClass::Ui, 0, deploy(csp_phys::PartNodeId(9)));
+        let rep = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(
+            rep.rejected
+                .iter()
+                .any(|e| format!("{e:?}").contains("deploy:")),
+            "unknown node must reject: {:?}",
+            rep.rejected
+        );
+        // The pod node carries no parachute spec.
+        w.enqueue(SourceClass::Ui, 0, deploy(csp_phys::PartNodeId(1)));
+        let rep = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(
+            rep.rejected
+                .iter()
+                .any(|e| format!("{e:?}").contains("decelerator")),
+            "specless node must reject: {:?}",
+            rep.rejected
+        );
+        // A real deploy applies; the repeat rejects.
+        w.enqueue(SourceClass::Ui, 0, deploy(csp_phys::PartNodeId(2)));
+        let rep = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(rep.rejected.is_empty(), "{:?}", rep.rejected);
+        w.enqueue(SourceClass::Ui, 0, deploy(csp_phys::PartNodeId(2)));
+        let rep = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(
+            rep.rejected
+                .iter()
+                .any(|e| format!("{e:?}").contains("already deployed")),
+            "double deploy must reject: {:?}",
+            rep.rejected
+        );
+        // §3.4's PanelJam on a second chute node (add a fresh record
+        // carrying the mode) blocks the deploy.
+        w.vessels.get_mut(&VesselId(0)).unwrap().reliability.insert(
+            csp_phys::PartNodeId(2),
+            reliability::PartReliability {
+                failures: vec![csp_data::FailureMode::PanelJam],
+                ..reliability::fresh_record(42, PartInstanceId(0), 0)
+            },
+        );
+        // Deploy is refused even though the record was already set —
+        // clear it first so the refusal (not the earlier deploy) is
+        // what PanelJam is checked against.
+        w.vessels
+            .get_mut(&VesselId(0))
+            .unwrap()
+            .deployed
+            .remove(&csp_phys::PartNodeId(2));
+        w.enqueue(SourceClass::Ui, 0, deploy(csp_phys::PartNodeId(2)));
+        let rep = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(
+            rep.rejected
+                .iter()
+                .any(|e| format!("{e:?}").contains("jammed")),
+            "PanelJam must reject: {:?}",
+            rep.rejected
+        );
+    }
+
     #[test]
     fn jettison_staged_vs_deployed_diverges() {
         let mut w = physics_world(false);
@@ -14899,6 +15312,7 @@ mod tests {
                 experiments: Vec::new(),
                 lab: None,
                 engine: None,
+                parachute: None,
                 dock_ports: vec![],
                 tanks: vec![],
                 crew_seats: 0,
@@ -15031,6 +15445,7 @@ mod tests {
             experiments: Vec::new(),
             lab: None,
             engine: None,
+            parachute: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -15092,6 +15507,7 @@ mod tests {
             experiments: Vec::new(),
             lab: None,
             engine: None,
+            parachute: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -15426,6 +15842,7 @@ mod tests {
             experiments: Vec::new(),
             lab: None,
             engine: None,
+            parachute: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -15449,6 +15866,7 @@ mod tests {
             experiments: Vec::new(),
             lab: None,
             engine: None,
+            parachute: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -15609,6 +16027,7 @@ mod tests {
                     experiments: Vec::new(),
                     lab: None,
                     engine: None,
+                    parachute: None,
                     dock_ports: vec![],
                     tanks: vec![],
                     crew_seats: 0,
@@ -15660,6 +16079,7 @@ mod tests {
                 crew: Vec::new(),
                 reliability: BTreeMap::new(),
                 control_lease: Lease::Player,
+                deployed: BTreeMap::new(),
             },
         );
         let mut physics = Physics {
@@ -17856,6 +18276,7 @@ mod tests {
                     crew: Vec::new(),
                     reliability: BTreeMap::new(),
                     control_lease: Lease::Player,
+                    deployed: BTreeMap::new(),
                 },
             );
         };
@@ -18001,6 +18422,7 @@ mod tests {
             crew: Vec::new(),
             reliability: BTreeMap::new(),
             control_lease: Lease::Player,
+            deployed: BTreeMap::new(),
         }
     }
 
@@ -19010,6 +19432,7 @@ mod tests {
                 joined_colony: None,
                 reliability: BTreeMap::new(),
                 control_lease: Lease::Player,
+                deployed: BTreeMap::new(),
             },
         );
         w.next_vessel_id = 2;
@@ -20045,6 +20468,7 @@ mod tests {
             crew: Vec::new(),
             reliability: BTreeMap::new(),
             control_lease: Lease::Player,
+            deployed: BTreeMap::new(),
         };
         let mut vessels = BTreeMap::new();
         vessels.insert(VesselId(0), mk(0, 0.0));
@@ -20989,6 +21413,7 @@ mod tests {
                 crew: Vec::new(),
                 reliability: BTreeMap::from([(node, rec)]),
                 control_lease: Lease::Player,
+                deployed: BTreeMap::new(),
             }
         }
 
@@ -21302,6 +21727,7 @@ mod tests {
                 crew: Vec::new(),
                 reliability: BTreeMap::new(),
                 control_lease: Lease::Player,
+                deployed: BTreeMap::new(),
             };
             assert!(World::spec_for(&v, node).is_none());
             // A covering table still resolves — the gate is not a

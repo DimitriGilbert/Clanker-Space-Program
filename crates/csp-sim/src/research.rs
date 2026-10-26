@@ -637,6 +637,13 @@ impl World {
         self.science_cfg = cfg;
     }
 
+    /// The installed science tunables — the `economy_config` precedent
+    /// (the transmit EC-rate readout needs it: the UI gates/hovers the
+    /// transmit button on `units × transmit_ec_per_data_unit`).
+    pub fn science_config(&self) -> ScienceConfig {
+        self.science_cfg
+    }
+
     /// Install the loaded experiment defs — construction config (the
     /// `World::orbits` precedent: data-derived, handed in, never
     /// serialized or hashed; `WorldConfig` carries it so §7.6 replays
@@ -823,6 +830,17 @@ impl World {
         // M7-C: banked science pays out at
         // `science_funds_per_point` — the milestone edge.
         self.credit_science_payout(banked, shadow);
+        self.notify(
+            crate::reliability::Notification {
+                tick: self.clock.ticks(),
+                vessel: crate::reliability::PROGRAM_VESSEL,
+                node: None,
+                kind: crate::reliability::NotificationKind::ScienceBanked {
+                    micros: (banked * 1.0e6) as u64,
+                },
+            },
+            shadow,
+        );
         // M7-D: a transmit banks returned data — the survey-contract
         // trigger.
         self.contract_notify(&crate::contracts::ContractTrigger::DataBanked, shadow)
@@ -912,6 +930,17 @@ impl World {
         // M7-C: banked science pays out at
         // `science_funds_per_point` — the milestone edge.
         self.credit_science_payout(banked, shadow);
+        self.notify(
+            crate::reliability::Notification {
+                tick: self.clock.ticks(),
+                vessel: crate::reliability::PROGRAM_VESSEL,
+                node: None,
+                kind: crate::reliability::NotificationKind::ScienceBanked {
+                    micros: (banked * 1.0e6) as u64,
+                },
+            },
+            shadow,
+        );
         // M7-D: a recovery closes+returns the key — the survey
         // trigger.
         self.contract_notify(&crate::contracts::ContractTrigger::DataBanked, shadow)?;
@@ -1123,6 +1152,17 @@ impl World {
         // M7-C: banked science pays out at
         // `science_funds_per_point` — the milestone edge.
         self.credit_science_payout(gained, shadow);
+        self.notify(
+            crate::reliability::Notification {
+                tick: self.clock.ticks(),
+                vessel: crate::reliability::PROGRAM_VESSEL,
+                node: None,
+                kind: crate::reliability::NotificationKind::ScienceBanked {
+                    micros: (gained * 1.0e6) as u64,
+                },
+            },
+            shadow,
+        );
         Ok(())
     }
 

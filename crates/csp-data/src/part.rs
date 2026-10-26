@@ -620,6 +620,35 @@ pub enum ModuleDef {
         /// Researcher seats.
         researcher_slots: u8,
     },
+    /// Deployable decelerator — a parachute. Plan-implied like
+    /// `Control`/`Decoupler`: §2.4.1's deploy/stow machinery and
+    /// §3.4's `PanelJam` failure mode both presuppose a deployable
+    /// part, and §3.2's `RecoverData` path needs a survivable
+    /// reentry to exist. The module is a *deploy spec*: the sim's
+    /// `DeployPart` command flips the vessel's per-node deployed
+    /// flag; while deployed the part contributes an additive
+    /// analytic drag term `½·ρ·|v_rel|·v_rel·CdA` at its node
+    /// position — no aero-table recomputation — once the canopy can
+    /// catch (inside the atmosphere, below `deploy_alt_m`, below
+    /// `deploy_speed_mps`), ramping over `deploy_time_s`. Areas are
+    /// Cd·A products (m²), not geometric areas.
+    Parachute {
+        /// Altitude ceiling (m above the body datum) for the canopy
+        /// catch — a supersonic/high-altitude deploy stays packed
+        /// until the flow can hold it.
+        deploy_alt_m: f64,
+        /// Air-relative speed ceiling (m/s) for the catch.
+        deploy_speed_mps: f64,
+        /// Packed drag area Cd·A (m²) — applied whenever the part is
+        /// in the flow, deployed or not (the canister's own drag).
+        packed_drag_area_m2: f64,
+        /// Deployed drag area Cd·A (m²) — the open canopy; must
+        /// exceed `packed_drag_area_m2` (validator).
+        deployed_drag_area_m2: f64,
+        /// Inflation ramp (s) from catch to full area; `0` deploys
+        /// instantly.
+        deploy_time_s: f64,
+    },
 }
 
 /// One knot of a [`QualCurve`]: at `qualification_units` accumulated

@@ -224,7 +224,7 @@ use csp_data::{AtmosphereDef, BodyDef};
 use crate::backend::{BodyHandle, Contact, Hit, JointDef, JointKind, PhysicsBackend, Ray};
 use crate::part::{ForceSiteKind, WeldPart};
 use crate::tensor::SymMat3;
-use crate::weld::WeldedBody;
+use crate::weld::{DecelSite, WeldedBody};
 
 /// The immutable physics timestep — `1/64` s exactly (§2.3/§2.6; a
 /// power of two, so this constant is exact in `f64`).
@@ -1340,6 +1340,7 @@ impl SimpleBackend {
     /// `contacts` is the manifold record from the last `step` for
     /// this body (`self.contacts(handle)`); passing it explicitly
     /// keeps the borrow discipline honest.
+    #[allow(clippy::too_many_lines)] // one section per force channel
     pub fn external_loads(
         &self,
         body: &WeldedBody,
@@ -1418,6 +1419,20 @@ impl SimpleBackend {
                                     }
                                 }
                             }
+                        }
+                    }
+                    // §3.1 decelerator sites — the same additive term
+                    // `accumulate_forces` applies, attributed to the
+                    // site-owning node (the canopy's pull loads its
+                    // own attachment).
+                    for site in &body.decel {
+                        let area = decel_area_m2(site, alt, speed, self.time_s.get() + PHYSICS_DT);
+                        if area > 0.0 {
+                            push(
+                                site.node,
+                                site.local_pos,
+                                conj.rotate(v_rel * (-0.5 * rho * area * speed)),
+                            );
                         }
                     }
                 }
@@ -1561,6 +1576,22 @@ impl SimpleBackend {
                         None => {
                             let area = cross_section_area(b, v_rel / speed);
                             force = force + v_rel * (-0.5 * rho * self.env.drag_cd * area * speed);
+                        }
+                    }
+                    // §3.1 decelerator sites — the additive analytic
+                    // drag term (no table recompute): packed Cd·A
+                    // always, the deployed Cd·A once the canopy can
+                    // catch (below the authored altitude/speed
+                    // ceilings), ramping in over `deploy_time_s` from
+                    // the deploy stamp. Applied at the site point —
+                    // a canopy above the CoM weathervanes correctly.
+                    for site in &b.decel {
+                        let area = decel_area_m2(site, alt, speed, self.time_s.get() + PHYSICS_DT);
+                        if area > 0.0 {
+                            let f_world = v_rel * (-0.5 * rho * area * speed);
+                            let r_world = b.rot.rotate(site.local_pos - b.com_local);
+                            force = force + f_world;
+                            torque = torque + r_world.cross(f_world);
                         }
                     }
                 }
@@ -2611,6 +2642,27 @@ impl PhysicsBackend for SimpleBackend {
 /// Deterministic (min/max are order-invariant), conservative for
 /// non-convex unions, and cheap. The §2.4.1 voxel tables' per-
 /// direction areas replace it at M4a.
+/// §3.1 decelerator catch: the site's effective Cd·A this tick —
+/// packed always, the deployed area ramping in over `deploy_time_s`
+/// from the deploy stamp `deployed_at_s` once the flow can hold the
+/// canopy (below the authored altitude/speed ceilings). Shared by
+/// `accumulate_forces` and `external_loads` so the two channels can
+/// never disagree.
+fn decel_area_m2(site: &DecelSite, alt_m: f64, speed_mps: f64, at_s: f64) -> f64 {
+    match site.deployed_at_s {
+        Some(t0) if alt_m <= site.deploy_alt_m && speed_mps <= site.deploy_speed_mps => {
+            let ramp = if site.deploy_time_s > 0.0 {
+                ((at_s - t0) / site.deploy_time_s).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            site.packed_drag_area_m2
+                + (site.deployed_drag_area_m2 - site.packed_drag_area_m2) * ramp
+        }
+        _ => site.packed_drag_area_m2,
+    }
+}
+
 fn cross_section_area(b: &WeldedBody, w: DVec3) -> f64 {
     let reference = if w.x.abs() <= w.y.abs() {
         DVec3::X
@@ -2695,6 +2747,7 @@ mod tests {
             experiments: Vec::new(),
             lab: None,
             engine: None,
+            parachute: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -2828,6 +2881,7 @@ mod tests {
             experiments: Vec::new(),
             lab: None,
             engine: None,
+            parachute: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -3046,6 +3100,7 @@ mod tests {
             experiments: Vec::new(),
             lab: None,
             engine: None,
+            parachute: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -3211,6 +3266,7 @@ mod tests {
             experiments: Vec::new(),
             lab: None,
             engine: None,
+            parachute: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -3377,6 +3433,7 @@ mod tests {
             experiments: Vec::new(),
             lab: None,
             engine: None,
+            parachute: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,

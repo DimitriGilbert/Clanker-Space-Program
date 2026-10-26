@@ -187,8 +187,14 @@ impl PartialEq for CraftHashMemo {
 ///
 /// Discriminants are the §7.1 rule-7 hash encoding — explicit, stable,
 /// append-only.
+///
+/// `InBubble` deliberately carries the `WeldedBody` by value — the
+/// vessel *is* the body while resident; boxing it would add a level of
+/// indirection on the hot path for a lint that reads size asymmetry,
+/// not a correctness risk.
 #[repr(u16)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum VesselState {
     /// On patched-conic rails — epoch-anchored closed-form state
     /// (§2.6.1: unchanged by interval advancement).

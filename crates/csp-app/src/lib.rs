@@ -634,6 +634,7 @@ impl App {
             command_log,
             data_set_hash,
             state_hash: self.view.sim.state_hash().ok(),
+            save_seed: Some(self.view.sim.save_seed()),
             gpu_adapter: self.gpu_info.as_ref().map(|(a, _)| a.clone()),
             gpu_backend: self.gpu_info.as_ref().map(|(_, b)| b.clone()),
             log_tail: logring::tail(),
@@ -922,67 +923,7 @@ impl App {
         if let Some(target) = target {
             let step_start = Instant::now();
             match self.view.sim_step(target) {
-                Ok(report) => {
-                    // §2.6.5: a fired Clamping event demotes warp — now,
-                    // before the next frame's step — so the player cannot
-                    // overshoot (PlayerAlarm, tracked-vessel SoiTransition).
-                    // The demotion itself is a logged SetWarp; re-promotion
-                    // still runs the §2.6.3 hysteresis.
-                    let clamping = report
-                        .fired_events
-                        .iter()
-                        .any(|e| e.class == EventClass::Clamping);
-                    // §2.2.1/§2.13's honest channels: rejected commands and
-                    // degraded events surface as log lines — they are the
-                    // app's view of Recoverable, never a halt. A rejected
-                    // PLAYER command is also a *refusal* — the press that
-                    // issued it did nothing — so it lands on the global cue
-                    // channel too, not just the log. The cue is scoped to
-                    // `SourceClass::Ui`: a Script/Agent channel's reject is
-                    // machine traffic, and a buggy script could otherwise
-                    // spam cues + blips every frame.
-                    for rej in &report.rejected {
-                        log::warn!(
-                            "command rejected on originating channel {:?}: {}",
-                            rej.key,
-                            rej.error
-                        );
-                        if rej.key.source_class == SourceClass::Ui {
-                            self.view.flight_notice(format!(
-                                "COMMAND REFUSED — {}",
-                                rej.error.reason().to_uppercase()
-                            ));
-                        }
-                    }
-                    for e in &report.degraded {
-                        log::warn!("event degraded (fallback applied): {e}");
-                    }
-                    // §2.6.2's rails-warp refusal seam: the sim-side
-                    // predicate, checked here every frame on post-step
-                    // state — the only place it can be. Honest about the
-                    // one-frame lag: the predicate reads state THIS
-                    // frame's step produced, and the demote is a queued
-                    // SetWarp that lands at the next frame's boundary —
-                    // the frame the refusal appeared in already ran at
-                    // the old level. Bounded, not compounding: the
-                    // refusal conditions (thrust, contact, atmosphere)
-                    // persist until commanded away, so the predicate
-                    // re-reports every frame until the state changes.
-                    let refusal = self.view.sim.rails_warp_refusal();
-                    if (clamping || refusal.is_some())
-                        && let Some(level) = self.warp.demote(0)
-                    {
-                        // §2.6.2: the refusal names the offending vessel.
-                        if let Some(reason) = &refusal {
-                            log::warn!("rails warp refused ({reason}) — demoting to ×{level}");
-                        }
-                        self.view.enqueue_command(
-                            SourceClass::Ui,
-                            WARP_SOURCE_ID,
-                            SimCommand::SetWarp(level),
-                        );
-                    }
-                }
+                Ok(report) => self.on_step_report(&report),
                 Err(e @ SimError::Fatal(_)) => {
                     // §2.13: only Fatal halts — step_frame keeps
                     // Recoverable inside its report channels. The full
@@ -1021,6 +962,91 @@ impl App {
                     .resource::<csp_view::flight::FlightSnapshot>(),
                 &self.settings.audio,
             );
+        }
+    }
+
+    /// The frame's successful `AdvanceReport` — rejected/degraded
+    /// channels, clamping + rails-refusal warp demotion, the W1.5
+    /// partial-backlog demotion, and the fired-event notice drain.
+    /// Extracted from `run_frame` under the complexity budget.
+    fn on_step_report(&mut self, report: &csp_view::AdvanceReport) {
+        // §2.6.5: a fired Clamping event demotes warp — now, before
+        // the next frame's step — so the player cannot overshoot
+        // (PlayerAlarm, tracked-vessel SoiTransition). The demotion
+        // itself is a logged SetWarp; re-promotion still runs the
+        // §2.6.3 hysteresis.
+        let clamping = report
+            .fired_events
+            .iter()
+            .any(|e| e.class == EventClass::Clamping);
+        // §2.2.1/§2.13's honest channels: rejected commands and
+        // degraded events surface as log lines — they are the app's
+        // view of Recoverable, never a halt. A rejected PLAYER command
+        // is also a *refusal* — the press that issued it did nothing —
+        // so it lands on the global cue channel too, not just the log.
+        // The cue is scoped to `SourceClass::Ui`: a Script/Agent
+        // channel's reject is machine traffic, and a buggy script
+        // could otherwise spam cues + blips every frame.
+        for rej in &report.rejected {
+            log::warn!(
+                "command rejected on originating channel {:?}: {}",
+                rej.key,
+                rej.error
+            );
+            if rej.key.source_class == SourceClass::Ui {
+                self.view.flight_notice(format!(
+                    "COMMAND REFUSED — {}",
+                    rej.error.reason().to_uppercase()
+                ));
+            }
+        }
+        for e in &report.degraded {
+            log::warn!("event degraded (fallback applied): {e}");
+        }
+        // §2.6.2's rails-warp refusal seam: the sim-side predicate,
+        // checked here every frame on post-step state — the only
+        // place it can be. Honest about the one-frame lag: the
+        // predicate reads state THIS frame's step produced, and the
+        // demote is a queued SetWarp that lands at the next frame's
+        // boundary — the frame the refusal appeared in already ran at
+        // the old level. Bounded, not compounding: the refusal
+        // conditions (thrust, contact, atmosphere) persist until
+        // commanded away, so the predicate re-reports every frame
+        // until the state changes.
+        let refusal = self.view.sim.rails_warp_refusal();
+        if (clamping || refusal.is_some())
+            && let Some(level) = self.warp.demote(0)
+        {
+            // §2.6.2: the refusal names the offending vessel.
+            if let Some(reason) = &refusal {
+                log::warn!("rails warp refused ({reason}) — demoting to ×{level}");
+            }
+            self.view
+                .enqueue_command(SourceClass::Ui, WARP_SOURCE_ID, SimCommand::SetWarp(level));
+        }
+        // W1.5-(f): `partial` = step_frame split at a budget — the
+        // advance never reached the frame's target, so time silently
+        // falls behind warp. Demote toward the largest rung one call
+        // can reach (TICK_HZ×mult/60 ≤ MAX_TICKS_PER_FRAME ⇒ rung 4,
+        // ×10⁴) and say so — §2.6.4's "carry the back-pressure" rule
+        // made visible.
+        if report.partial {
+            if let Some(level) = self.warp.demote(4) {
+                log::warn!("partial advance — warp demoted to ×{level}");
+                self.view.enqueue_command(
+                    SourceClass::Ui,
+                    WARP_SOURCE_ID,
+                    SimCommand::SetWarp(level),
+                );
+            }
+            self.view.flight_notice("WARP LIMITED — EVENT/TICK BACKLOG");
+        }
+        // W1.5-(g): fired event kinds the player asked for or pays
+        // for — alarms, deadlines, completions — post to the cue
+        // channel, bounded. The heap firing used to be invisible
+        // until its side-effects landed.
+        for text in fired_event_notices(&report.fired_events) {
+            self.view.flight_notice(text);
         }
     }
 
@@ -2136,6 +2162,7 @@ impl App {
     /// resolved (`key_press` passes it; programmatic dispatches pass
     /// `None` and the held verbs fall back to a `verb:<action>` token
     /// — a per-action placeholder no real key can produce).
+    #[allow(clippy::too_many_lines)] // one arm per verb — the enum IS the table
     fn dispatch_with_key(&mut self, action: KeyAction, held_token: Option<String>) {
         let mode = self.view.mode();
         match action {
@@ -2243,6 +2270,12 @@ impl App {
             KeyAction::ToggleDebug => {
                 self.ui_confirm();
                 self.view.toggle_debug_panel();
+            }
+            // The Program window — the science loop's panel verb
+            // (W1.5-c's tutorial points players here).
+            KeyAction::OpenProgram => {
+                self.ui_confirm();
+                self.view.toggle_program_panel();
             }
             // WASD positions are mode-split verbs: camera pans on the
             // map/VAB, held-to-turn attitude in flight (with the Q/E
@@ -2509,6 +2542,7 @@ pub fn bug_report_cli() -> Result<(), String> {
             .map_err(|e| e.to_string()),
         data_set_hash,
         state_hash: view.sim.state_hash().ok(),
+        save_seed: Some(view.sim.save_seed()),
         gpu_adapter: None,
         gpu_backend: None,
         log_tail: logring::tail(),
@@ -2654,6 +2688,76 @@ fn save_craft_file(_dir: &std::path::Path, _name: &str, _bytes: &[u8]) -> Result
     Ok(())
 }
 
+/// The fired-event → cue-text map (W1.5-g/h): which §2.6.5 event
+/// kinds post a flight notice, and with what text. Events the player
+/// ordered (alarms, transfer windows, construction, transfers,
+/// maneuver nodes, bench runs) or pays for (contract deadlines,
+/// insolvency, colony power/life-support, crew life-support) must be
+/// seen when they fire — never learned only from the side-effects.
+/// Bookkeeping kinds (rescans, terminator sweeps, store pulses,
+/// inspections, script wakes, salary accrual, part-failure shadow
+/// events — the notification ring covers the player-facing one)
+/// stay in the sim log only. Bounded by the caller's `.take`.
+fn fired_event_notices(events: &[csp_sim::events::ScheduledEvent]) -> Vec<String> {
+    use csp_sim::events::EventKind as K;
+    events
+        .iter()
+        .take(8)
+        .filter_map(|e| {
+            Some(match &e.kind {
+                K::PlayerAlarm { label } => format!("ALARM — {label}"),
+                K::ContractDeadline { contract } => {
+                    format!("CONTRACT DEADLINE — #{} expired", contract.0)
+                }
+                K::ConstructionComplete { build } => {
+                    format!("CONSTRUCTION COMPLETE — build #{}", build.0)
+                }
+                K::TransferWindow {
+                    origin,
+                    destination,
+                } => format!("TRANSFER WINDOW — {origin} → {destination}"),
+                K::TransferComplete { transfer } => {
+                    format!("TRANSFER COMPLETE — #{}", transfer.0)
+                }
+                K::ManeuverNodeStart { vessel } => {
+                    format!("vessel {} — MANEUVER NODE STARTED", vessel.0)
+                }
+                K::SoiTransition {
+                    vessel,
+                    body,
+                    direction,
+                } => format!(
+                    "vessel {} — {} {} SOI",
+                    vessel.0,
+                    match direction {
+                        csp_sim::orbit::SoiDirection::Enter => "ENTERED",
+                        csp_sim::orbit::SoiDirection::Exit => "LEFT",
+                    },
+                    body
+                ),
+                K::Insolvent { shortfall_micros } => format!(
+                    "INSOLVENT — ₣{:.0} unpaid (funds clamped at zero)",
+                    *shortfall_micros as f64 / 1.0e6
+                ),
+                K::ResearchProjectComplete { project } | K::ResearchDataExhausted { project } => {
+                    format!("RESEARCH COMPLETE — project #{}", project.0)
+                }
+                K::BenchTestComplete { run } => format!("BENCH TEST COMPLETE — run #{}", run.0),
+                K::DebrisDecay { vessel } => format!("vessel {} — DEBRIS DECAYED", vessel.0),
+                K::VesselLifeSupportDepleted { vessel } => {
+                    format!("vessel {} — LIFE SUPPORT DEPLETED (crew lost)", vessel.0)
+                }
+                K::LifeSupportDepleted { colony } => {
+                    format!("colony #{} — LIFE SUPPORT DEPLETED", colony.0)
+                }
+                K::PowerLost { colony } => format!("colony #{} — POWER LOST", colony.0),
+                K::PowerRestored { colony } => format!("colony #{} — POWER RESTORED", colony.0),
+                _ => return None,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 // §2.13's no-panic rule covers shipping fallible paths; tests signal
 // failure by panicking, so unwrap/expect stays legal inside test code.
@@ -2744,6 +2848,7 @@ mod tests {
             command_log: Ok(csp_view::save::encode_command_log(&[]).unwrap()),
             data_set_hash: Some([0x5Au8; 32]),
             state_hash: Some([0xA5u8; 32]),
+            save_seed: Some(42),
             gpu_adapter: Some("test adapter".into()),
             gpu_backend: Some("test backend".into()),
             log_tail: vec!["info  csp: hello".into()],
@@ -2847,9 +2952,10 @@ mod tests {
             app.view.flight_focus().is_some(),
             "no pad vessel at boot — the flight scene would be empty"
         );
-        // …and the same craft is loaded in the VAB for editing.
+        // …and the same craft is loaded in the VAB for editing —
+        // pod + tank + engine + canister + battery (W1.5-b).
         app.view
-            .with_vab_session(|v| assert_eq!(v.session().len(), 3));
+            .with_vab_session(|v| assert_eq!(v.session().len(), 5));
     }
 
     /// A rebound key resolves to its new action — the input layer reads
@@ -3318,22 +3424,29 @@ mod tests {
         // reached — the release's `SetAttitude` snapshot carries the
         // freshest rot, so the turn persists instead of rewinding.
         assert!(app.attitude_release("verb:RollRight"));
-        for _ in 0..3 {
+        frame(&mut app, 1);
+        // A rewind bug snaps the attitude ~the whole held turn back
+        // toward `rot0`; one frame of torque-driven drift is
+        // sub-radian by comparison.
+        let (rot_rel, w2) = body_of(&app).unwrap();
+        assert!(
+            angle(rot1, rot_rel) < 1.0,
+            "release rewound the attitude: {:.4} rad from post-hold",
+            angle(rot1, rot_rel)
+        );
+        // The release zeroes the COMMANDED rate — a climbing craft
+        // still carries real angular velocity from aero/gyroscopic
+        // torque, so the bound is well below the held 0.8 rad/s
+        // command, not zero. Nine more seconds gives residual torque
+        // time to matter if it were real; a live command cannot read
+        // this low.
+        for _ in 0..9 {
             frame(&mut app, 60);
         }
-        let (rot2, w2) = body_of(&app).unwrap();
-        // The release zeroes the COMMANDED rate — but a climbing craft
-        // still carries real angular velocity from aero/gyroscopic
-        // torque, so assert the rate dropped well below the held
-        // 0.8 rad/s command rather than demanding zero torque.
+        let (_, w3) = body_of(&app).unwrap();
         assert!(
-            w2.norm() < ATTITUDE_RATE_RAD_S * 0.5,
-            "released roll key still commands ~full rate: {w2:?}"
-        );
-        assert!(
-            angle(rot0, rot2) > turned * 0.5,
-            "release rewound the rotation: held turn {turned:.4} rad, post-release delta {:.4}",
-            angle(rot0, rot2)
+            w3.norm() < ATTITUDE_RATE_RAD_S * 0.5,
+            "released roll key still commands ~full rate: {w2:?} → {w3:?}"
         );
     }
 

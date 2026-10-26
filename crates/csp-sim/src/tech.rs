@@ -822,6 +822,7 @@ mod tests {
             experiments: vec![],
             lab: None,
             engine: None,
+            parachute: None,
         };
         let craft = |ids: Vec<PartId>| crate::CraftDef {
             hash_memo: Default::default(),

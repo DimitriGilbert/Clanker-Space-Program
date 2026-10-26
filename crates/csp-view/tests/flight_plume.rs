@@ -45,6 +45,7 @@ fn hopper_craft(cap: f64, mpu: f64, thrust_n: f64, isp: f64) -> csp_sim::CraftDe
                 isp_vac_s: isp,
                 propellants: vec![(fuel.clone(), 1.0)],
             }),
+            parachute: None,
             dock_ports: vec![],
             tanks: vec![csp_phys::TankSpec {
                 resource: fuel,

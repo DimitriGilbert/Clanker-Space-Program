@@ -915,6 +915,15 @@ impl World {
             FundsReason::ContractAdvance,
             shadow,
         );
+        self.notify(
+            crate::reliability::Notification {
+                tick: self.clock.ticks(),
+                vessel: crate::reliability::PROGRAM_VESSEL,
+                node: None,
+                kind: crate::reliability::NotificationKind::ContractAccepted { contract: id.0 },
+            },
+            shadow,
+        );
         // The already-satisfied case: complete at acceptance rather
         // than arming a deadline for a done contract.
         if self.objective_met(&self.contracts.active[&id].params, None) {
@@ -1139,6 +1148,15 @@ impl World {
                 .collect();
         }
         self.credit_funds(to_micros(reward), FundsReason::ContractCompletion, shadow);
+        self.notify(
+            crate::reliability::Notification {
+                tick: self.clock.ticks(),
+                vessel: crate::reliability::PROGRAM_VESSEL,
+                node: None,
+                kind: crate::reliability::NotificationKind::ContractCompleted { contract: id.0 },
+            },
+            shadow,
+        );
         Ok(())
     }
 
@@ -1180,6 +1198,15 @@ impl World {
             .entry(c.params.kind())
             .or_insert(0) += 1;
         self.charge_funds(to_micros(penalty), FundsReason::ContractPenalty, shadow)?;
+        self.notify(
+            crate::reliability::Notification {
+                tick: self.clock.ticks(),
+                vessel: crate::reliability::PROGRAM_VESSEL,
+                node: None,
+                kind: crate::reliability::NotificationKind::ContractFailed { contract: id.0 },
+            },
+            shadow,
+        );
         Ok(())
     }
 }

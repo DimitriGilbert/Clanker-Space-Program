@@ -2276,6 +2276,10 @@ fn part_blurb(def: &PartDef) -> String {
             ModuleDef::Drill { .. } => "resource drill".to_string(),
             ModuleDef::Converter { .. } => "ISRU converter".to_string(),
             ModuleDef::Lab { .. } => "science lab".to_string(),
+            ModuleDef::Parachute {
+                deployed_drag_area_m2,
+                ..
+            } => format!("parachute · {deployed_drag_area_m2:.0} m² CdA"),
         });
     }
     let mut s = format!("{:.0} kg · {:.0} funds", def.mass_dry_kg, def.cost_funds);

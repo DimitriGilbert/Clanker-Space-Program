@@ -234,6 +234,9 @@ pub enum KeyAction {
     ToggleHelp,
     /// Toggle the dev debug panel (adapter/tick internals).
     ToggleDebug,
+    /// Open/close the Program window (contracts / research /
+    /// vessel science) — the science loop's panel verb.
+    OpenProgram,
 }
 
 impl KeyAction {
@@ -259,6 +262,7 @@ impl KeyAction {
         Self::RollRight,
         Self::ToggleHelp,
         Self::ToggleDebug,
+        Self::OpenProgram,
     ];
 
     /// The panel label.
@@ -284,6 +288,7 @@ impl KeyAction {
             Self::RollRight => "roll right",
             Self::ToggleHelp => "controls help",
             Self::ToggleDebug => "debug panel",
+            Self::OpenProgram => "open program window",
         }
     }
 
@@ -558,6 +563,7 @@ impl Default for Keymap {
                 (KeyAction::RollRight, b(&["key-e"])),
                 (KeyAction::ToggleHelp, b(&["f1", "key-slash"])),
                 (KeyAction::ToggleDebug, b(&["f3"])),
+                (KeyAction::OpenProgram, b(&["key-p"])),
             ]),
         }
     }

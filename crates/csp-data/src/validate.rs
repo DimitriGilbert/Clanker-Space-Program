@@ -2956,6 +2956,52 @@ fn check_module(
                 });
             }
         }
+        ModuleDef::Parachute { .. } => check_parachute_module(part_id, m, out),
+    }
+}
+
+/// The `Parachute` module's own rules: positive catch ceilings,
+/// non-negative areas with deployed > packed (an equal-or-smaller
+/// canopy is a no-op deploy, not a decelerator), and a non-negative
+/// inflation ramp.
+fn check_parachute_module(part_id: &str, m: &ModuleDef, out: &mut Vec<ValidationError>) {
+    let ModuleDef::Parachute {
+        deploy_alt_m,
+        deploy_speed_mps,
+        packed_drag_area_m2,
+        deployed_drag_area_m2,
+        deploy_time_s,
+    } = m
+    else {
+        return;
+    };
+    part_positive(part_id, "parachute.deploy_alt_m", *deploy_alt_m, out);
+    part_positive(
+        part_id,
+        "parachute.deploy_speed_mps",
+        *deploy_speed_mps,
+        out,
+    );
+    if !(packed_drag_area_m2.is_finite() && *packed_drag_area_m2 >= 0.0) {
+        out.push(ValidationError::BadModule {
+            part: part_id.to_string(),
+            reason: "parachute packed_drag_area_m2 negative or non-finite",
+        });
+    }
+    if !(deployed_drag_area_m2.is_finite()
+        && packed_drag_area_m2.is_finite()
+        && *deployed_drag_area_m2 > *packed_drag_area_m2)
+    {
+        out.push(ValidationError::BadModule {
+            part: part_id.to_string(),
+            reason: "parachute deployed_drag_area_m2 must exceed packed_drag_area_m2",
+        });
+    }
+    if !(deploy_time_s.is_finite() && *deploy_time_s >= 0.0) {
+        out.push(ValidationError::BadModule {
+            part: part_id.to_string(),
+            reason: "parachute deploy_time_s negative or non-finite",
+        });
     }
 }
 
@@ -3107,6 +3153,20 @@ fn check_modules(
         out.push(ValidationError::BadModule {
             part: part_id.to_string(),
             reason: "more than one engine module",
+        });
+    }
+    // One decelerator per part — the sim's per-node deploy record is
+    // a single flag; a second spec would be ambiguous authored data.
+    if part
+        .modules
+        .iter()
+        .filter(|m| matches!(m, ModuleDef::Parachute { .. }))
+        .count()
+        > 1
+    {
+        out.push(ValidationError::BadModule {
+            part: part_id.to_string(),
+            reason: "more than one parachute module",
         });
     }
     // `ScaleRule::Discrete` carries no exponents, so the resolver
@@ -6277,5 +6337,98 @@ mod tests {
                 "edge {edge} must stay legal"
             );
         }
+    }
+
+    /// §3.1 `Parachute`: sane bounds pass; every degenerate family is
+    /// flagged (non-positive ceilings, negative areas, deployed ≤
+    /// packed, negative ramp, a second module).
+    #[test]
+    fn parachute_module_bounds() {
+        let good = |deployed_drag_area_m2| {
+            let mut d = part_fixture();
+            d.category = PartCategory::Utility;
+            d.modules = vec![ModuleDef::Parachute {
+                deploy_alt_m: 6_000.0,
+                deploy_speed_mps: 260.0,
+                packed_drag_area_m2: 0.4,
+                deployed_drag_area_m2,
+                deploy_time_s: 1.5,
+            }];
+            d
+        };
+        assert!(part_errors(good(120.0)).is_empty());
+        // Zero ramp = instant deploy — legal.
+        let mut d = good(120.0);
+        let ModuleDef::Parachute { deploy_time_s, .. } = &mut d.modules[0] else {
+            unreachable!()
+        };
+        *deploy_time_s = 0.0;
+        assert!(part_errors(d).is_empty());
+        // Deployed not exceeding packed is a no-op decelerator.
+        let errs = part_errors(good(0.3));
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::BadModule {
+                    reason: "parachute deployed_drag_area_m2 must exceed packed_drag_area_m2",
+                    ..
+                }
+            )),
+            "{errs:?}"
+        );
+        // Non-positive ceilings.
+        for (alt, speed) in [(0.0, 260.0), (6_000.0, -1.0)] {
+            let mut d = good(120.0);
+            let ModuleDef::Parachute {
+                deploy_alt_m,
+                deploy_speed_mps,
+                ..
+            } = &mut d.modules[0]
+            else {
+                unreachable!()
+            };
+            *deploy_alt_m = alt;
+            *deploy_speed_mps = speed;
+            assert!(
+                part_errors(d).iter().any(|e| matches!(
+                    e,
+                    ValidationError::BadModule { .. } | ValidationError::PartNonPositive { .. }
+                )),
+                "alt {alt} speed {speed} must be rejected"
+            );
+        }
+        // Negative packed area / ramp.
+        let mut d = good(120.0);
+        let ModuleDef::Parachute {
+            packed_drag_area_m2,
+            deploy_time_s,
+            ..
+        } = &mut d.modules[0]
+        else {
+            unreachable!()
+        };
+        *packed_drag_area_m2 = -0.5;
+        *deploy_time_s = -1.0;
+        assert_eq!(
+            part_errors(d)
+                .iter()
+                .filter(|e| matches!(e, ValidationError::BadModule { .. }))
+                .count(),
+            2
+        );
+        // Two decelerators on one part — ambiguous.
+        let mut d = good(120.0);
+        d.modules.push(d.modules[0].clone());
+        let errs = part_errors(d);
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::BadModule {
+                    reason: "more than one parachute module",
+                    ..
+                }
+            )),
+            "{errs:?}"
+        );
     }
 }

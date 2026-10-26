@@ -380,7 +380,9 @@ pub struct Notification {
     pub kind: NotificationKind,
 }
 
-/// What a [`Notification`] reports.
+/// What a [`Notification`] reports. Variants are append-only — the
+/// ring is serialized (bincode positional discriminants), so new
+/// kinds land at the end, never reordered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NotificationKind {
     /// A `Λ` crossing fired — `dormant` marks an unobserved (dormant-
@@ -399,7 +401,39 @@ pub enum NotificationKind {
     /// automatic coasting-above-atmosphere conversion (the
     /// transition must not be silent).
     OnRails,
+    /// A contract offer was accepted — `contract` is its arena id.
+    /// A program-level entry (`vessel` is [`PROGRAM_VESSEL`]).
+    ContractAccepted {
+        /// The accepted contract's arena id.
+        contract: u64,
+    },
+    /// A contract's completion predicate landed — the completion
+    /// reward credited in the same boundary.
+    ContractCompleted {
+        /// The completed contract's arena id.
+        contract: u64,
+    },
+    /// A contract expired at its `ContractDeadline` — the authored
+    /// penalty charged through the funds clamp.
+    ContractFailed {
+        /// The expired contract's arena id.
+        contract: u64,
+    },
+    /// Science was banked into the program ledger — a transmit, a
+    /// data/vessel recovery, or a lab project's exhaustion.
+    /// `micros` is science-points × 1e6 (the funds-micros
+    /// convention; keeps the enum `Eq`).
+    ScienceBanked {
+        /// Points banked, in 1e-6 units.
+        micros: u64,
+    },
 }
+
+/// `Notification::vessel` sentinel for program-level entries —
+/// contract lifecycle and banked-science records name no vessel, and
+/// the arena never mints `u64::MAX`, so the sentinel cannot collide
+/// with a real `VesselId`.
+pub const PROGRAM_VESSEL: VesselId = VesselId(u64::MAX);
 
 /// A fresh record for one instantiated part — the §3.4 "drawn once at
 /// part creation" point: `θ₀ = −ln U₀` from `{RELIABILITY, instance,

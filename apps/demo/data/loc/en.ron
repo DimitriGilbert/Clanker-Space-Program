@@ -24,6 +24,7 @@
         "part.csp.structure.adapter.name": "Rib Interstage Adapter",
         "part.csp.decoupler.s125.name": "Shear Stack Decoupler",
         "part.csp.nosecone.s125.name": "Dart Nose Cone",
+        "part.csp.chute.s125.name": "Umbrella Mk1 Radial Parachute",
         "part.csp.battery.z1k.name": "Cellblock 1kU Battery",
         "part.csp.science.canister.name": "Specimen Materials Canister",
         "part.variant.stock": "Stock",

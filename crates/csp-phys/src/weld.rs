@@ -159,6 +159,15 @@ pub struct WeldedBody {
     /// §2.4.1's "aero tables are never serialized in the save").
     #[serde(skip)]
     pub aero: Option<Box<crate::aero::CraftAeroTables>>,
+    /// §3.1 `Parachute` decelerator sites — the additive analytic-drag
+    /// terms the §2.9 force model sums after the aero-table
+    /// contribution. **Sim-owned state**: `weld` emits an empty list
+    /// (deploy state is not weld input); the world refreshes the
+    /// sites per tick from the craft's `ParachuteSpec`s and the
+    /// vessel's deployed record — a pure function, so skipped in
+    /// serialization and the hash walk exactly like `aero`.
+    #[serde(skip)]
+    pub decel: Vec<DecelSite>,
     /// The M4b conduction/radiation network — per-part lumps plus the
     /// attachment-edge conductances ([`crate::thermal`]). Weld output
     /// like `inertia_local`/`collider`: a pure function of
@@ -169,6 +178,38 @@ pub struct WeldedBody {
     /// Boxed: the net is cold data (touched once per tick) and
     /// `WeldedBody` lives inside `VesselState`'s enum layout.
     pub thermal: Box<ThermalNet>,
+}
+
+/// One decelerator drag site on a [`WeldedBody`] — a §3.1 `Parachute`
+/// part's additive analytic-drag channel (`F = −½·ρ·CdA·|v_rel|·v_rel`
+/// applied at the site point, torque about the CoM like a force
+/// site's `r×F`). The world rebuilds the body's site list each tick;
+/// `deployed_at_s` is the sim-time stamp the deploy apply recorded —
+/// `None` while packed. The catch gates (`deploy_alt_m`,
+/// `deploy_speed_mps`) and the `deploy_time_s` inflation ramp are
+/// evaluated per tick by the backend's force accumulation against the
+/// body's own altitude/speed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DecelSite {
+    /// Owning graph node — bookkeeping for the per-part force
+    /// attribution in `external_loads` (the site's drag loads its
+    /// own attachment).
+    pub node: PartNodeId,
+    /// Application point, body frame — the node's resolved CoM.
+    pub local_pos: DVec3,
+    /// Packed drag area Cd·A (m²) — applies whenever the site is in
+    /// the flow, deployed or not.
+    pub packed_drag_area_m2: f64,
+    /// Deployed drag area Cd·A (m²) — the open canopy's catch.
+    pub deployed_drag_area_m2: f64,
+    /// Altitude ceiling (m) for the canopy catch.
+    pub deploy_alt_m: f64,
+    /// Air-relative speed ceiling (m/s) for the catch.
+    pub deploy_speed_mps: f64,
+    /// Inflation ramp duration (s); `0` deploys instantly.
+    pub deploy_time_s: f64,
+    /// Deploy stamp in sim seconds — `None` = packed.
+    pub deployed_at_s: Option<f64>,
 }
 
 impl WeldedBody {
@@ -579,6 +620,7 @@ fn solve_transforms<'a>(
 /// shifted by parallel axis from its own CoM to the body's). Force
 /// sites, collider hulls, and the part index map accumulate in the
 /// same fixed order.
+#[allow(clippy::too_many_lines)] // the sequential mass → sites → hulls → thermal pipeline
 fn assemble(solved: &BTreeMap<PartNodeId, SolvedNode<'_>>) -> Result<WeldedBody, WeldError> {
     let mut total = 0.0;
     let mut moment = DVec3::ZERO;
@@ -693,6 +735,7 @@ fn assemble(solved: &BTreeMap<PartNodeId, SolvedNode<'_>>) -> Result<WeldedBody,
         collider: CompoundCollider { hulls },
         part_index,
         aero: None,
+        decel: Vec::new(),
         thermal,
     })
 }
@@ -835,6 +878,7 @@ mod tests {
             experiments: Vec::new(),
             lab: None,
             engine: None,
+            parachute: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
@@ -854,6 +898,7 @@ mod tests {
             experiments: Vec::new(),
             lab: None,
             engine: None,
+            parachute: None,
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,

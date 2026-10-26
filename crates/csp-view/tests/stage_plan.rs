@@ -189,7 +189,7 @@ fn stage_plan_fires_its_own_vessel_not_the_focus() {
             .graph
             .nodes
             .len(),
-        3,
+        5, // starter craft: pod + tank + engine + canister + battery
         "the focused vessel lost a node it never owned"
     );
 }

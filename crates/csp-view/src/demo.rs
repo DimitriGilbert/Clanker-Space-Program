@@ -30,12 +30,33 @@ pub const DEMO_PART_LIMIT: usize = 60;
 /// identical in shape to the desktop paths.
 pub const DEMO_ROOT: &str = "data";
 
-/// The starter craft — catalog ids for the three-part pad stack (pod /
-/// S160 tank / Sparc engine). Flight-capable by construction: ~200 kN
-/// against ~4 t wet is a liftoff TWR ≈ 5. Shared by the §6.3 demo's
-/// fixed scenario and the shipping build's first-run seed
+/// The §6.3 demo's fixed save seed — a shipped constant, not entropy:
+/// the demo scenario is defined reproducible (offer draws and
+/// reliability rolls are identical every boot), while the native
+/// build seeds from wall-clock entropy (`native_save_seed` in
+/// `crate::lib`).
+pub(crate) const DEMO_SAVE_SEED: u64 = 0xC5A3_5EED_0000_0001;
+
+/// The starter craft — `(catalog id, parent row)` pairs: `None` sets
+/// the root, `Some(i)` `AttachAuto`s under the part placed at index
+/// `i`. The pod/tank/engine propulsion chain is unchanged
+/// (liftoff TWR ≈ 5); the canister + battery are the science leg out
+/// of the box (W1.5-b): the canister runs `exp.materials_study`
+/// landed and in space, the battery's 1 kU of `electric_charge` pays
+/// for a transmit; both are `tech.start` parts so no research is
+/// required. They fly INLINE between the pod and the tank — both
+/// now carry 1.25-class stack interfaces — so the science leg rides
+/// mid-stack where a 0.625 nose mount would tumble the ascent and
+/// a radial bolt-on has no welded joint shape. Shared by the §6.3
+/// demo's fixed scenario and the shipping build's first-run seed
 /// ([`View::seed_starter_craft`](crate::View::seed_starter_craft)).
-const STARTER_CRAFT: [&str; 3] = ["csp.pod.mk1", "csp.tank.s160", "csp.engine.sparc"];
+const STARTER_CRAFT: [(&str, Option<usize>); 5] = [
+    ("csp.pod.mk1", None),
+    ("csp.science.canister", Some(0)),
+    ("csp.battery.z1k", Some(1)),
+    ("csp.tank.s160", Some(2)),
+    ("csp.engine.sparc", Some(3)),
+];
 
 /// The shipping build's display name for the seeded starter craft —
 /// what the VAB session (and a first craft-file save) calls it.
@@ -87,6 +108,10 @@ pub(crate) static FILES: &[(&str, &[u8])] = &[
     (
         "data/parts/csp.battery.z1k.ron",
         include_bytes!("../../../apps/demo/data/parts/csp.battery.z1k.ron"),
+    ),
+    (
+        "data/parts/csp.chute.s125.ron",
+        include_bytes!("../../../apps/demo/data/parts/csp.chute.s125.ron"),
     ),
     (
         "data/parts/csp.decoupler.s125.ron",
@@ -180,15 +205,23 @@ pub(crate) fn seed_pad_craft(view: &mut View, name: &str) -> Result<(), String> 
     let built = view.with_vab_session(|v| {
         v.apply(VabAction::Rename(name.to_string()))
             .map_err(|e| e.to_string())?;
-        v.apply(VabAction::SetRoot(csp_data::PartId::from(STARTER_CRAFT[0])))
-            .map_err(|e| e.to_string())?;
-        for part in &STARTER_CRAFT[1..] {
-            let parent = v.selected().ok_or("starter craft: no parent selected")?;
-            v.apply(VabAction::AttachAuto {
-                part: csp_data::PartId::from(*part),
-                parent,
-            })
-            .map_err(|e| e.to_string())?;
+        // The placed-node row each `STARTER_CRAFT` parent index names —
+        // `AttachAuto` needs the parent's `PartNodeId`, and
+        // `selected()` reports the freshly placed node after every
+        // attach.
+        let mut placed: Vec<csp_phys::PartNodeId> = Vec::with_capacity(STARTER_CRAFT.len());
+        for (part, parent) in STARTER_CRAFT {
+            let id = csp_data::PartId::from(part);
+            match parent {
+                None => v.apply(VabAction::SetRoot(id)).map_err(|e| e.to_string())?,
+                Some(i) => v
+                    .apply(VabAction::AttachAuto {
+                        part: id,
+                        parent: placed[i],
+                    })
+                    .map_err(|e| e.to_string())?,
+            }
+            placed.push(v.selected().ok_or("starter craft: no node placed")?);
         }
         // The launch path resolves the craft from the session's cached
         // analysis — recompute now (the VAB's own frames would do it,

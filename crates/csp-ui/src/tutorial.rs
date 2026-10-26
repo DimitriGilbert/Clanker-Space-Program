@@ -105,6 +105,26 @@ pub const STEPS: &[TutorialStep] = &[
                above the atmosphere.",
         key_action: None,
     },
+    // Second tier — the science loop (W1.5-c): the starter craft ships
+    // a canister + battery, so this tier is flyable out of the box.
+    TutorialStep {
+        title: "Run a science experiment",
+        hint: "Open the Program window — {key} — and press 'run' on the \
+               canister's experiment under SCIENCE.",
+        key_action: Some(crate::settings::KeyAction::OpenProgram),
+    },
+    TutorialStep {
+        title: "Bank the data",
+        hint: "Transmit the pooled record (drains ElectricCharge), or \
+               land and 'recover' it for the full yield.",
+        key_action: None,
+    },
+    TutorialStep {
+        title: "Research a tech node",
+        hint: "Spend banked science on a RESEARCH node in the Program \
+               window — {key}.",
+        key_action: Some(crate::settings::KeyAction::OpenProgram),
+    },
 ];
 
 /// The progress snapshot `csp-view` stages each frame — plain data,
@@ -131,6 +151,15 @@ pub struct TutorialInput {
     pub periapsis_m: Option<f64>,
     /// The home atmosphere's top (m); `0` on airless bodies.
     pub atmosphere_top_m: f64,
+    /// Pooled science-data units aboard the focused vessel — proof an
+    /// experiment ran (staged from the Program mirror).
+    pub science_pooled: f64,
+    /// The program's banked science total — proof a transmit/recovery
+    /// landed.
+    pub science_banked: f64,
+    /// A nonzero-cost tech node is researched — proof the player spent
+    /// science (free roots are excluded so the baseline doesn't count).
+    pub research_spent: bool,
 }
 
 /// One step's completion predicate — the tutorial's honesty rule made
@@ -147,6 +176,11 @@ fn step_complete(step: usize, i: &TutorialInput) -> bool {
         4 => i.has_vessel && i.alt_m > CLIMB_ALT_M,
         5 => i.has_vessel && i.alt_m > space_alt(i),
         6 => i.periapsis_m.is_some_and(|p| p > space_alt(i)),
+        // Science tier — banked science also satisfies "ran an
+        // experiment" for the skip-ahead player who already cashed it.
+        7 => i.science_pooled > 0.0 || i.science_banked > 0.0,
+        8 => i.science_banked > 0.0,
+        9 => i.research_spent,
         _ => false,
     }
 }
@@ -299,9 +333,19 @@ pub fn tutorial_overlay(
         .show(ctx, |ui| {
             if state.finished {
                 ui.label(
-                    egui::RichText::new("Orbit achieved — your first mission flew.")
-                        .strong()
-                        .color(egui::Color32::from_rgb(120, 220, 120)),
+                    egui::RichText::new(
+                        "Program airborne — orbit closed, science banked, research started.",
+                    )
+                    .strong()
+                    .color(egui::Color32::from_rgb(120, 220, 120)),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "The Program window ({}) is home now: contracts, research, vessel science.",
+                        keys.hint_labeled(crate::settings::KeyAction::OpenProgram, key_labels)
+                    ))
+                    .color(egui::Color32::from_gray(170)),
                 );
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
@@ -454,6 +498,31 @@ mod tests {
             atmosphere_top_m: 70_000.0,
             ..idle
         });
+        assert_eq!(t.step, 7);
+        // The experiment pooled data aboard.
+        t.observe(&TutorialInput {
+            has_vessel: true,
+            science_pooled: 10.0,
+            atmosphere_top_m: 70_000.0,
+            ..idle
+        });
+        assert_eq!(t.step, 8);
+        // Transmitted/recovered into the ledger.
+        t.observe(&TutorialInput {
+            has_vessel: true,
+            science_banked: 4.0,
+            atmosphere_top_m: 70_000.0,
+            ..idle
+        });
+        assert_eq!(t.step, 9);
+        // Spent on a paid tech node.
+        t.observe(&TutorialInput {
+            has_vessel: true,
+            science_banked: 4.0,
+            research_spent: true,
+            atmosphere_top_m: 70_000.0,
+            ..idle
+        });
         assert!(t.finished);
         assert!(t.current().is_none());
     }
@@ -510,6 +579,8 @@ mod tests {
             alt_m: 90_000.0,
             periapsis_m: Some(80_000.0),
             atmosphere_top_m: 70_000.0,
+            science_banked: 4.0,
+            research_spent: true,
             ..TutorialInput::default()
         }]);
         assert!(t.finished);

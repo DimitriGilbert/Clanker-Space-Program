@@ -1,0 +1,78 @@
+// csp.chute.s125 — "Umbrella" radial-mount parachute (§3.1 PartDef).
+// Hand-authored fiction.
+//
+// The recovery part: a side-mount canister carrying a `Parachute`
+// deployable-decelerator module. `SimCommand::DeployPart` pops the
+// canopy; the additive analytic drag term (no aero-table recompute)
+// catches once the flow can hold it — below 6 km and 260 m/s —
+// trading ~120 m² of Cd·A for a pod-class terminal velocity near
+// 12 m/s, slow enough to land intact and make `RecoverData` a real
+// path. Its authored dominant failure mode is §3.4's `PanelJam` —
+// the deploy hardware is the part.
+// Category Utility: a decelerator is a browser bucket, not a
+// module-bearing structural class.
+(
+    schema_version: 1,
+    id: "csp.chute.s125",
+    family: "csp.family.recovery",
+    display_name: "part.csp.chute.s125.name",
+    category: Utility,
+    mass_dry_kg: 55.0,
+    cost_funds: 420.0,
+    size_m: (x: 0.5, y: 0.4, z: 0.5),
+    build_resources: [("composite", 4.0), ("metal", 2.0)],
+    attach_nodes: [
+        // Radial mount: the canister's −x face mates a synthesized
+        // `surf:` node on the parent's hull (session convention).
+        (id: "mount", position_m: (x: -0.25, y: 0.0, z: 0.0), direction: (x: -1.0, y: 0.0, z: 0.0), diameter_m: 0.625),
+    ],
+    scale: None,
+    collider: Box(half_extents_m: (x: 0.25, y: 0.2, z: 0.25)),
+    aero: (
+        cd_curve: [(mach: 0.0, coeff: 0.5), (mach: 8.0, coeff: 0.35)],
+        cl_curve: [(mach: 0.0, coeff: 0.0)],
+        ref_len_m: 0.5,
+    ),
+    thermal: (
+        heat_capacity_j_per_k: 40_000.0,
+        max_temp_k: 900.0,
+        emissivity: 0.8,
+        conduction_w_per_k: 40.0,
+    ),
+    structural: (
+        max_axial_n: 150_000.0,
+        max_shear_n: 60_000.0,
+        max_torque_nm: 8_000.0,
+    ),
+    variants: [
+        (id: "stock", display_name: "part.variant.stock", cost_multiplier: 1.0, stat_multipliers: []),
+    ],
+    modules: [
+        Parachute(
+            deploy_alt_m: 6_000.0,
+            deploy_speed_mps: 260.0,
+            packed_drag_area_m2: 0.4,
+            deployed_drag_area_m2: 120.0,
+            deploy_time_s: 1.5,
+        ),
+    ],
+    reliability: (
+        base_mtbf_s: 2_000_000.0,
+        infant_mortality: 0.08,
+        qualification_curve: (knots: [
+            (qualification_units: 0.0,   hazard_multiplier: 1.0),
+            (qualification_units: 100.0, hazard_multiplier: 0.6),
+            (qualification_units: 400.0, hazard_multiplier: 0.4),
+        ]),
+        regime_stress: [
+            (kind: Overtemperature, threshold: 0.9,  multiplier: 4.0),
+            (kind: ExcessG,         threshold: 12.0, multiplier: 2.5),
+        ],
+        dormant_stress: 0.01,
+        failure_modes: [
+            (PanelJam,    0.7),
+            (SensorFault, 0.3),
+        ],
+    ),
+    tech_requirement: "tech.start",
+)

@@ -55,6 +55,11 @@ pub struct BugReportInput {
     /// first comparison against a replayed reproduction. `None` on the
     /// panic path (no sim access) or when hashing itself faulted.
     pub state_hash: Option<[u8; 32]>,
+    /// The §2.7 save seed — the KDF input the contract/reliability
+    /// draws ran under; a reproduction needs it to replay the same
+    /// offers/rolls (W1.5's "seed surfaced in the bug-report" row).
+    /// `None` on the panic path.
+    pub save_seed: Option<u64>,
     /// The GPU adapter name, when the session had one.
     pub gpu_adapter: Option<String>,
     /// The wgpu backend label, when the session had one.
@@ -188,6 +193,7 @@ pub fn write_panic_bundle(root: &Path, panic_text: &str, log_tail: Vec<String>) 
         command_log: Err("no sim access inside the panic hook".into()),
         data_set_hash: None,
         state_hash: None,
+        save_seed: None,
         gpu_adapter: None,
         gpu_backend: None,
         log_tail,
@@ -230,6 +236,7 @@ fn fingerprint(input: &BugReportInput) -> String {
         "data_hash_version": csp_view::DATA_HASH_VERSION,
         "data_set_hash": hex(input.data_set_hash),
         "state_hash": hex(input.state_hash),
+        "save_seed": input.save_seed,
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
     }))

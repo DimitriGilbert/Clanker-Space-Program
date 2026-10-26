@@ -197,7 +197,14 @@ use crate::SimError;
 /// stamped-2 bodies now prove the current schema byte-exact, and a
 /// body that fails the proof is refused `UnsupportedVersion` rather
 /// than silently decoding `engine: None`). The goldens rebless.
-pub const HASH_SCHEMA_VERSION: u32 = 20;
+///
+/// **Version 21** (§3.1 `Parachute` deployable decelerators): the
+/// craft walk appended `WeldPart::parachute` — the resolved
+/// `ParachuteSpec` a `DeployPart` apply reads — and the vessel walk
+/// appended `Vessel::deployed` — the per-node deploy record
+/// (node → deploy tick) that decides the body's per-tick
+/// `DecelSite`s. Both are hashed state; the goldens rebless.
+pub const HASH_SCHEMA_VERSION: u32 = 21;
 
 /// Rule-7 sum types: the source of an enum's *declared* stable `u16`
 /// discriminant (PLAN §7.1 rule 7).

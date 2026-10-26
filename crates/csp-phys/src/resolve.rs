@@ -1391,6 +1391,47 @@ fn resolve_module(
             }
             m.clone()
         }
+        ModuleDef::Parachute {
+            deploy_alt_m,
+            deploy_speed_mps,
+            packed_drag_area_m2,
+            deployed_drag_area_m2,
+            deploy_time_s,
+        } => {
+            // The validator's bounds, mirrored: positive catch
+            // ceilings, non-negative areas, deployed > packed (an
+            // equal-or-smaller canopy is a no-op deploy, not a
+            // decelerator), non-negative ramp. The drag areas scale
+            // `s²` in [`resolve_weld_input`] — geometry, like the
+            // collider and `ref_len_m`, not a stat-path family.
+            if !(deploy_alt_m.is_finite() && *deploy_alt_m > 0.0) {
+                return Err(bad(
+                    "resolve: parachute deploy_alt_m is not positive and finite",
+                ));
+            }
+            if !(deploy_speed_mps.is_finite() && *deploy_speed_mps > 0.0) {
+                return Err(bad(
+                    "resolve: parachute deploy_speed_mps is not positive and finite",
+                ));
+            }
+            if !(packed_drag_area_m2.is_finite() && *packed_drag_area_m2 >= 0.0) {
+                return Err(bad(
+                    "resolve: parachute packed_drag_area_m2 is negative or non-finite",
+                ));
+            }
+            if !(deployed_drag_area_m2.is_finite() && *deployed_drag_area_m2 > *packed_drag_area_m2)
+            {
+                return Err(bad(
+                    "resolve: parachute deployed_drag_area_m2 does not exceed packed",
+                ));
+            }
+            if !(deploy_time_s.is_finite() && *deploy_time_s >= 0.0) {
+                return Err(bad(
+                    "resolve: parachute deploy_time_s is negative or non-finite",
+                ));
+            }
+            m.clone()
+        }
         // `DockPort`/`Decoupler` carry no numeric families — the port's
         // node-name check lives in [`resolve_weld_input`] where the
         // face spec is produced.
@@ -1797,6 +1838,7 @@ fn resolve_weld_input(
     let mut experiments = Vec::new();
     let mut lab: Option<crate::part::LabSpec> = None;
     let mut engine: Option<crate::part::EngineSpec> = None;
+    let mut parachute: Option<crate::part::ParachuteSpec> = None;
     for m in modules {
         match m {
             ModuleDef::Engine {
@@ -1930,6 +1972,43 @@ fn resolve_weld_input(
                     researcher_slots: u32::from(*researcher_slots),
                 });
             }
+            // `Parachute` → the deploy spec the sim's `DeployPart`
+            // reads. One per part — a second is ambiguous authored
+            // data (which area/thresholds would the single per-node
+            // deploy flag arm?), refused like `Lab`/`Engine`. The
+            // Cd·A areas scale `s²` — canopy area is geometry like
+            // the collider and `ref_len_m`, not a stat-path family
+            // (the schema has no area exponent channel; same deferred
+            // convention as torque/conduction).
+            ModuleDef::Parachute {
+                deploy_alt_m,
+                deploy_speed_mps,
+                packed_drag_area_m2,
+                deployed_drag_area_m2,
+                deploy_time_s,
+            } => {
+                if parachute.is_some() {
+                    return Err(bad("resolve: more than one Parachute module on a part"));
+                }
+                let area_scale = s * s;
+                let spec = crate::part::ParachuteSpec {
+                    deploy_alt_m: *deploy_alt_m,
+                    deploy_speed_mps: *deploy_speed_mps,
+                    packed_drag_area_m2: packed_drag_area_m2 * area_scale,
+                    deployed_drag_area_m2: deployed_drag_area_m2 * area_scale,
+                    deploy_time_s: *deploy_time_s,
+                };
+                if !(spec.deploy_alt_m.is_finite() && spec.deploy_alt_m > 0.0)
+                    || !(spec.deploy_speed_mps.is_finite() && spec.deploy_speed_mps > 0.0)
+                    || !(spec.packed_drag_area_m2.is_finite() && spec.packed_drag_area_m2 >= 0.0)
+                    || !(spec.deployed_drag_area_m2.is_finite()
+                        && spec.deployed_drag_area_m2 > spec.packed_drag_area_m2)
+                    || !(spec.deploy_time_s.is_finite() && spec.deploy_time_s >= 0.0)
+                {
+                    return Err(bad("resolve: parachute spec is invalid after scaling"));
+                }
+                parachute = Some(spec);
+            }
             _ => {}
         }
     }
@@ -1952,6 +2031,7 @@ fn resolve_weld_input(
         experiments,
         lab,
         engine,
+        parachute,
     })
 }
 

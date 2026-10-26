@@ -330,6 +330,7 @@ impl crate::World {
                 joined_colony: None,
                 reliability,
                 control_lease: crate::Lease::Player,
+                deployed: BTreeMap::new(),
             },
         );
         // M9b: a freshly delivered vessel sits dormant — restamp the
@@ -428,6 +429,7 @@ mod tests {
                 experiments: Vec::new(),
                 lab: None,
                 engine: None,
+                parachute: None,
                 dock_ports: vec![],
                 tanks: vec![csp_phys::TankSpec {
                     resource: ResourceId::from("ore"),

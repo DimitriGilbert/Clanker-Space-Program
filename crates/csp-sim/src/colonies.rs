@@ -4197,6 +4197,7 @@ mod tests {
                 experiments: Vec::new(),
                 lab: None,
                 engine: None,
+                parachute: None,
                 dock_ports: vec![],
                 tanks: vec![csp_phys::TankSpec {
                     resource: ResourceId::from(resource),
@@ -4266,6 +4267,7 @@ mod tests {
                 joined_colony: None,
                 reliability: BTreeMap::new(),
                 control_lease: crate::Lease::Player,
+                deployed: BTreeMap::new(),
             },
         );
         id

@@ -42,13 +42,30 @@ pub struct TrackRow {
     pub affordable: bool,
 }
 
-/// A contract-board offer (the `AcceptContract` target).
+/// A contract-board offer (the `AcceptContract` target). W1.5-(d):
+/// rows carry the drawn params + reward + deadline — accepting was
+/// blind when the row was name-only.
 #[derive(Clone, Debug)]
 pub struct OfferRow {
     /// The offer index `AcceptContract` names.
     pub index: u64,
-    /// Human-readable summary (template + params).
+    /// `#index` + loc-resolved template name.
     pub label: String,
+    /// Kind-specific param summary ("orbit terrin: Pe ≥ 100 km …").
+    pub detail: String,
+    /// The funds lines ("+₣N sign · +₣N done · −₣N expiry").
+    pub reward: String,
+    /// The authored deadline in days, "" when the template has none.
+    pub deadline: String,
+}
+
+/// An accepted contract — the active row with its countdown.
+#[derive(Clone, Debug)]
+pub struct ActiveRow {
+    /// `#id` + loc-resolved template name.
+    pub label: String,
+    /// Params + completion reward + days-remaining.
+    pub detail: String,
 }
 
 /// One experiment module aboard the focused vessel.
@@ -85,6 +102,10 @@ pub struct DataRow {
     pub units: f64,
     /// Science a transmit would bank (`units · transmit_ratio`).
     pub transmit_yield: f64,
+    /// `ElectricCharge` a transmit drains (`units ·
+    /// transmit_ec_per_data_unit`) — the sim's gate, staged so the
+    /// button can say "needs N EC (have M)" (W1.5-e).
+    pub transmit_ec_cost: f64,
     /// Science a surface recovery would bank (1.0 or the `1−ratio`
     /// remainder for a transmitted key).
     pub recover_yield: f64,
@@ -131,8 +152,11 @@ pub struct ProgramInput {
     pub banked: f64,
     /// Contract offers on the board.
     pub offers: Vec<OfferRow>,
-    /// Active contract summaries.
-    pub active: Vec<String>,
+    /// A board-level honesty note (e.g. kinds gated off the board
+    /// because their completion verbs are unreachable).
+    pub offers_note: Option<String>,
+    /// Active contracts.
+    pub active: Vec<ActiveRow>,
     /// The tech tree — `None` for a world with no tree installed.
     pub tech: Option<Vec<TechRow>>,
     /// Upgrade tracks (empty without a tree).
@@ -153,6 +177,9 @@ pub struct ProgramInput {
     /// body). Label only; the command resolves the `SiteId`
     /// view-side.
     pub recover_site: Option<String>,
+    /// ElectricCharge aboard the focused vessel (`None` with no
+    /// vessel) — the transmit gate's "have" side (W1.5-e).
+    pub vessel_ec: Option<f64>,
     /// Per-node reliability rows for the focused vessel.
     pub reliability: Vec<ReliabilityRow>,
     /// Recent notifications (newest last), already capped.
@@ -219,13 +246,14 @@ fn sect(ui: &mut egui::Ui, name: &str) {
 /// The always-visible program readout — funds + science + active
 /// contracts, top-right, drawn in every mode so the program state is
 /// never hidden behind a view switch (§3.7's global-channel rule).
-/// Interactable: a click opens nothing (the Program button does) — the
-/// strip is a readout only.
+/// Hoverable: the glyphs label themselves (W1.5's labeled-strip row —
+/// `interactable` stays click-free; a click opens nothing, the
+/// Program button does).
 pub fn program_status(ctx: &egui::Context, funds: f64, science: f64, contracts: usize) {
     let rect = ctx.content_rect();
     egui::Area::new(egui::Id::unique("program_status"))
         .order(egui::Order::Foreground)
-        .interactable(false)
+        .interactable(true)
         .fixed_pos(egui::pos2(rect.right() - 12.0, rect.top() + 4.0))
         .pivot(egui::Align2::RIGHT_TOP)
         .show(ctx, |ui| {
@@ -233,8 +261,76 @@ pub fn program_status(ctx: &egui::Context, funds: f64, science: f64, contracts: 
                 egui::RichText::new(format!("₣ {funds:.0}   ⚛ {science:.1}   ✉ {contracts}"))
                     .font(egui::FontId::monospace(13.0))
                     .color(egui::Color32::from_rgb(160, 220, 160)),
-            );
+            )
+            .on_hover_text(format!(
+                "₣ {funds:.0} funds · ⚛ {science:.1} science · ✉ {contracts} active contract(s)\n\
+                 open the Program window for contracts, research, and vessel science"
+            ));
         });
+}
+
+/// The CONTRACTS section — active rows with countdowns, offers with
+/// the drawn params/reward/deadline (W1.5-d: no blind accepts), and
+/// the board-level honesty note (W1.5-i). Extracted from
+/// `program_panel` under the complexity budget.
+fn contracts_section(
+    ui: &mut egui::Ui,
+    input: &ProgramInput,
+    out: &mut Vec<ProgramCommand>,
+    dim: egui::Color32,
+) {
+    if input.active.is_empty() && input.offers.is_empty() {
+        ui.label(egui::RichText::new("no contracts on the board").color(dim));
+    }
+    for a in &input.active {
+        ui.label(
+            egui::RichText::new(format!("▸ {}", a.label))
+                .font(MONO)
+                .color(dim),
+        );
+        ui.label(
+            egui::RichText::new(format!("    {}", a.detail))
+                .font(MONO)
+                .color(dim)
+                .small(),
+        );
+    }
+    for offer in &input.offers {
+        ui.horizontal(|ui| {
+            if ui.small_button("accept").clicked() {
+                out.push(ProgramCommand::AcceptContract { offer: offer.index });
+            }
+            ui.label(egui::RichText::new(&offer.label).font(MONO).color(dim));
+        });
+        if !offer.detail.is_empty() {
+            ui.label(
+                egui::RichText::new(format!("    {}", offer.detail))
+                    .font(MONO)
+                    .color(dim)
+                    .small(),
+            );
+        }
+        if !offer.reward.is_empty() || !offer.deadline.is_empty() {
+            ui.label(
+                egui::RichText::new(format!(
+                    "    {}{}{}",
+                    offer.reward,
+                    if offer.reward.is_empty() || offer.deadline.is_empty() {
+                        ""
+                    } else {
+                        " · "
+                    },
+                    offer.deadline
+                ))
+                .font(MONO)
+                .color(dim)
+                .small(),
+            );
+        }
+    }
+    if let Some(note) = &input.offers_note {
+        ui.label(egui::RichText::new(note).color(dim).small());
+    }
 }
 
 /// The Program window — overview, contracts, research, vessel science,
@@ -272,20 +368,7 @@ pub fn program_panel(
                 // Contracts — offers are acceptable from here;
                 // acceptance rides `AcceptContract`.
                 sect(ui, "CONTRACTS");
-                if input.active.is_empty() && input.offers.is_empty() {
-                    ui.label(egui::RichText::new("no contracts on the board").color(dim));
-                }
-                for a in &input.active {
-                    ui.label(egui::RichText::new(format!("▸ {a}")).font(MONO).color(dim));
-                }
-                for offer in &input.offers {
-                    ui.horizontal(|ui| {
-                        if ui.small_button("accept").clicked() {
-                            out.push(ProgramCommand::AcceptContract { offer: offer.index });
-                        }
-                        ui.label(egui::RichText::new(&offer.label).font(MONO).color(dim));
-                    });
-                }
+                contracts_section(ui, input, out, dim);
 
                 // Research — the spend side of the loop.
                 sect(ui, "RESEARCH");
@@ -469,8 +552,22 @@ pub fn program_panel(
                                 .font(MONO)
                                 .color(egui::Color32::from_gray(200)),
                         );
+                        // W1.5-(e): the EC gate disclosed — disabled
+                        // with the cost/availability on hover instead
+                        // of a silent drain-time refusal.
+                        let have_ec = input.vessel_ec.unwrap_or(0.0);
+                        let ec_ok = have_ec >= d.transmit_ec_cost;
                         if ui
-                            .small_button(format!("transmit +{:.1}⚛", d.transmit_yield))
+                            .add_enabled(
+                                ec_ok,
+                                egui::Button::new(format!("transmit +{:.1}⚛", d.transmit_yield))
+                                    .small(),
+                            )
+                            .on_hover_text(if ec_ok {
+                                format!("drains {:.0} EC (have {:.0})", d.transmit_ec_cost, have_ec)
+                            } else {
+                                format!("needs {:.0} EC (have {:.0})", d.transmit_ec_cost, have_ec)
+                            })
                             .clicked()
                         {
                             out.push(ProgramCommand::Transmit { row: d.index });

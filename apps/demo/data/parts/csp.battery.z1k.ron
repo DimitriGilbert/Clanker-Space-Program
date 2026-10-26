@@ -16,7 +16,10 @@
     size_m: (x: 0.625, y: 0.625, z: 0.4),
     build_resources: [("metal", 3.0), ("composite", 2.0)],
     attach_nodes: [
-        (id: "bottom", position_m: (x: 0.0, y: 0.0, z: -0.2), direction: (x: 0.0, y: 0.0, z: -1.0), diameter_m: 0.625),
+        // 1.25-class stack interfaces — the canister precedent: the
+        // starter battery flies inline, mid-stack.
+        (id: "top",    position_m: (x: 0.0, y: 0.0, z: 0.2),  direction: (x: 0.0, y: 0.0, z: 1.0),  diameter_m: 1.25),
+        (id: "bottom", position_m: (x: 0.0, y: 0.0, z: -0.2), direction: (x: 0.0, y: 0.0, z: -1.0), diameter_m: 1.25),
     ],
     scale: None,
     collider: Box(half_extents_m: (x: 0.3125, y: 0.3125, z: 0.2)),

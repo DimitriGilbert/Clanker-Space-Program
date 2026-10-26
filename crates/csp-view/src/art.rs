@@ -406,6 +406,9 @@ pub fn model_key(
         if id.contains(".science.") || id.contains(".experiment.") || id.contains(".canister.") {
             return "science";
         }
+        if id.contains(".chute.") || id.contains(".parachute.") {
+            return "chute";
+        }
         if id.contains(".fin") {
             return "fins";
         }

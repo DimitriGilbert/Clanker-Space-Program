@@ -265,3 +265,43 @@ fn batch_errors_are_typed() {
     let eff = resolve_parts(&defs, &[ok], &res, &no_quals(), Some(&[worn])).unwrap();
     assert_eq!(eff[0].reliability.wear_multiplier, 1.5);
 }
+
+/// §3.1 `Parachute`: the authored chute's `Parachute` module resolves
+/// into the `WeldPart::parachute` deploy spec — the numbers a
+/// `DeployPart` apply reads (unscaled at s = 1).
+#[test]
+fn chute_resolves_parachute_spec() {
+    let defs = defs();
+    let res = resources();
+    let eff = resolve_parts(
+        &defs,
+        &[built(0, "csp.chute.s125", "stock")],
+        &res,
+        &no_quals(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(eff.len(), 1);
+    let ModuleDef::Parachute {
+        deploy_alt_m,
+        deploy_speed_mps,
+        packed_drag_area_m2,
+        deployed_drag_area_m2,
+        deploy_time_s,
+    } = &eff[0].modules[0]
+    else {
+        panic!("parachute module expected");
+    };
+    assert_eq!(*deploy_alt_m, 6_000.0);
+    assert_eq!(*deploy_speed_mps, 260.0);
+    let spec = eff[0].weld_input.parachute.unwrap();
+    assert_eq!(spec.deploy_alt_m, 6_000.0);
+    assert_eq!(spec.deploy_speed_mps, 260.0);
+    assert_eq!(spec.packed_drag_area_m2, 0.4);
+    assert_eq!(spec.deployed_drag_area_m2, 120.0);
+    assert_eq!(spec.deploy_time_s, 1.5);
+    // The deploy spec is craft identity — a resolved module set with
+    // no `Parachute` carries `None`.
+    assert!(*packed_drag_area_m2 < *deployed_drag_area_m2);
+    assert!(*deploy_time_s > 0.0);
+}

@@ -956,6 +956,17 @@ impl World {
         for (key, banked, closable) in science_bank {
             self.science.banked += banked;
             self.credit_science_payout(banked, shadow);
+            self.notify(
+                crate::reliability::Notification {
+                    tick: self.clock.ticks(),
+                    vessel: crate::reliability::PROGRAM_VESSEL,
+                    node: None,
+                    kind: crate::reliability::NotificationKind::ScienceBanked {
+                        micros: (banked * 1.0e6) as u64,
+                    },
+                },
+                shadow,
+            );
             if closable {
                 self.science.keys.entry(key).or_default().closed = true;
             }
@@ -1014,6 +1025,7 @@ mod tests {
                 experiments: Vec::new(),
                 lab: None,
                 engine: None,
+                parachute: None,
                 dock_ports: vec![],
                 tanks: vec![csp_phys::TankSpec {
                     resource: ResourceId::from("liquid_fuel"),
@@ -1074,6 +1086,7 @@ mod tests {
                 joined_colony: None,
                 reliability: BTreeMap::new(),
                 control_lease: Lease::Player,
+                deployed: BTreeMap::new(),
             },
         );
         id
