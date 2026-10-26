@@ -76,6 +76,11 @@ const MANEUVER_SOURCE_ID: u32 = 2;
 /// §2.2.1 source id for settings-applied commands (the difficulty
 /// flags' `SetLifeSupportEnabled` at new-game; Ui class, own FIFO).
 const SETTINGS_SOURCE_ID: u32 = 3;
+/// §2.2.1 source id for the Program window's progression commands
+/// (research, science runs/banking, contract accepts; Ui class, own
+/// FIFO). None of them is control-affecting, so a separate channel
+/// cannot reorder them against the player's craft verbs.
+const PROGRESSION_SOURCE_ID: u32 = 4;
 // The throttle keys' `SetThrottle` rides `csp_view::PLAYER_SOURCE_ID`
 // (id 1) — deliberately shared with the launch path's
 // `SpawnPhysicalVessel` so every player-initiated craft command keeps
@@ -1160,6 +1165,9 @@ impl App {
                     .enqueue_command(SourceClass::Ui, MANEUVER_SOURCE_ID, cmd);
             }
         }
+        // Program window → the progression commands (science runs,
+        // data banking, research spends, contract accepts).
+        self.dispatch_program(outbox.program);
         if let Some(name) = outbox.craft_load {
             if self.demo {
                 // §6.3: no craft-file import either — the VabSession's
@@ -1172,6 +1180,26 @@ impl App {
                     None => self.craft_refusal(format!("no craft file '{name}'")),
                 }
             }
+        }
+    }
+
+    /// The Program window's commands — science runs, data banking,
+    /// research spends, contract accepts — enqueued on the
+    /// progression FIFO (§2.5's one-frame hand-off, same as the
+    /// maneuver channel). Same §2.13 read-only discipline: a halted
+    /// session queues nothing.
+    fn dispatch_program(&mut self, cmds: Vec<SimCommand>) {
+        if cmds.is_empty() {
+            return;
+        }
+        if self.read_only {
+            self.view
+                .flight_notice("SESSION IS READ-ONLY — ACTION NOT APPLIED");
+            return;
+        }
+        for cmd in cmds {
+            self.view
+                .enqueue_command(SourceClass::Ui, PROGRESSION_SOURCE_ID, cmd);
         }
     }
 

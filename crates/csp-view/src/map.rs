@@ -103,6 +103,9 @@ const VESSEL_COLOR: [f32; 4] = [1.0, 0.55, 0.15, 1.0];
 const NODE_COLOR: [f32; 4] = [0.35, 0.95, 0.45, 1.0];
 /// Star marker/line color (parent-less body).
 const STAR_COLOR: [f32; 4] = [1.0, 0.85, 0.35, 1.0];
+/// Surface-site marker/label color — a cool cyan so a pad or recovery
+/// field reads distinct from bodies, vessels, and maneuver nodes.
+const SITE_COLOR: [f32; 4] = [0.45, 0.85, 0.90, 1.0];
 /// Assigned round-robin to non-star bodies.
 const BODY_PALETTE: [[f32; 4]; 5] = [
     [0.35, 0.65, 1.0, 1.0],
@@ -527,6 +530,11 @@ pub struct MapScene {
     /// conic (the star) or no vessel is focused and the focused body
     /// is the root.
     pub(crate) focus_apsis: Vec<DVec3>,
+    /// System-frame surface-site anchors (the launch complex and the
+    /// recovery sites on the dominant body) — solved in `map_present`
+    /// only while the camera is focused on the site body inside a few
+    /// radii, drawn as ring markers by `extract_map`.
+    pub(crate) site_markers: Vec<DVec3>,
 }
 
 /// One vessel's cached node preview: the `(orbit, node)` invalidation
@@ -615,11 +623,15 @@ pub struct MapFrame(pub Option<MapPacket>);
 /// (§2.5 #4: "camera solve, LOD selection"). Runs only in map mode;
 /// flight frames skip the whole derivation.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)] // the site marker adds the staged flight env + site/loc tables
 pub(crate) fn map_present(
     input: Res<MapInput>,
     model: Res<OrbitModelRes>,
     snap: Res<MapSnapshot>,
     table: Res<BodyTable>,
+    sites: Res<crate::structures::SiteTable>,
+    flight_snap: Res<crate::flight::FlightSnapshot>,
+    loc: Res<crate::LocStrings>,
     mut scene: ResMut<MapScene>,
     mut cam: ResMut<MapCameraF64>,
     mut ui: ResMut<MapUiData>,
@@ -795,6 +807,47 @@ pub(crate) fn map_present(
                     text: format!("{tag} {}", csp_ui::fmt_distance(shown)),
                     color: focus.line_color,
                     kind: csp_ui::MapLabelKind::Apsis,
+                });
+            }
+        }
+    }
+
+    // Surface sites on the dominant body — the launch complex and the
+    // recovery fields — marked while the camera is focused on their
+    // body inside a few radii (at system zoom the ring would sit
+    // under the body marker anyway). The staged flight env carries
+    // the dominant body's spin; a site on any other body has no
+    // staged rotation to place it by, so it is skipped honestly.
+    scene.site_markers.clear();
+    if input.vessel_focus(&table).is_none()
+        && let Some(env) = flight_snap.env.as_ref()
+        && let Some(dom) = env.body.as_ref()
+        && table.bodies.get(input.focus).is_some_and(|b| b.id == *dom)
+        && model
+            .body_radius(dom)
+            .is_some_and(|r| input.distance_m < 6.0 * r)
+        && let Some(body_pos) = table
+            .index_of(dom)
+            .and_then(|i| scene.body_pos.get(i))
+            .copied()
+            .flatten()
+    {
+        for site in &sites.sites {
+            if site.body != *dom {
+                continue;
+            }
+            let pos = crate::structures::site_world_pos(env, site, body_pos);
+            scene.site_markers.push(pos);
+            if let Some(ndc) = project(&cam, pos) {
+                ui.labels.push(csp_ui::MapLabel {
+                    ndc,
+                    text: loc
+                        .0
+                        .get(site.display_name.as_str())
+                        .cloned()
+                        .unwrap_or_else(|| site.id.as_str().to_string()),
+                    color: SITE_COLOR,
+                    kind: csp_ui::MapLabelKind::Site,
                 });
             }
         }
@@ -1176,6 +1229,31 @@ pub(crate) fn extract_map(
                 APSIS_MARKER_PX,
                 vp,
                 apsis_color,
+                MapVertex::KIND_RING,
+            );
+        }
+    }
+    // Surface-site rings — the launch complex + recovery fields on the
+    // focused body (populated by `map_present` only when the camera is
+    // close enough for a surface feature to resolve).
+    for p in &scene.site_markers {
+        if let Some(ndc) = project(&cam, *p) {
+            let mut glow = SITE_COLOR;
+            glow[3] *= 0.3;
+            emit_shape(
+                &mut markers.vertices,
+                ndc,
+                VESSEL_MARKER_PX * 2.4,
+                vp,
+                glow,
+                MapVertex::KIND_GLOW,
+            );
+            emit_shape(
+                &mut markers.vertices,
+                ndc,
+                BODY_MARKER_PX,
+                vp,
+                SITE_COLOR,
                 MapVertex::KIND_RING,
             );
         }

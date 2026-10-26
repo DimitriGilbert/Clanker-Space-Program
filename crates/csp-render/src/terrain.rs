@@ -963,8 +963,15 @@ impl TerrainRenderer {
 
     /// Real-art placeholders — 1×1 textures at the right dimension
     /// (the class arrays get 4 layers so `D2Array` views stay
-    /// structurally identical to real uploads) + the tri-linear wrap
-    /// sampler the packs sample through.
+    /// structurally identical to real uploads) + the wrap sampler the
+    /// packs sample through. The sampler asks for 8× anisotropy:
+    /// standing on the surface, nearly every visible texel is at a
+    /// grazing angle, where plain trilinear picks the mip for the
+    /// worst footprint axis and smears the ground along the view
+    /// direction. wgpu clamps the request to the device limit (and to
+    /// 1 where anisotropy is unsupported — e.g. WebGPU is allowed to
+    /// ignore it), so this is a free upgrade, never a validation
+    /// failure.
     fn init_art_tex(
         device: &wgpu::Device,
     ) -> (wgpu::Texture, wgpu::Texture, wgpu::Texture, wgpu::Sampler) {
@@ -985,6 +992,7 @@ impl TerrainRenderer {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            anisotropy_clamp: 8,
             ..Default::default()
         });
         (

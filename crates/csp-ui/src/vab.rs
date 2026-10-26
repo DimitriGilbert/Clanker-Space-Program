@@ -1896,6 +1896,9 @@ pub struct VabUiOutput {
     /// The "Help" button — toggle the controls card. Same fold-back
     /// convention as `tutorial` (the flag lives in `csp-view`).
     pub help: bool,
+    /// The "Program" button — toggle the progression window. Same
+    /// fold-back convention (the flag lives in `csp-view`).
+    pub program: bool,
 }
 
 /// The mode bar — always-present top strip with the three view modes,
@@ -1973,6 +1976,11 @@ pub fn top_bar(
                 // The controls card — same fold-back convention.
                 if ui.button("? Help").clicked() {
                     out.help = true;
+                }
+                // The progression window — funds, science, research,
+                // the vessel's experiment/reliability surface.
+                if ui.button("Program").clicked() {
+                    out.program = true;
                 }
             });
         })
@@ -4317,12 +4325,18 @@ mod tests {
                 "a right-click through overlay {i} deleted the craft"
             );
         }
-        // The same click on free viewport resolves as the remove.
-        let free = egui::pos2(400.0, 500.0);
-        assert!(
-            !masks.iter().any(|r| r.contains(free)),
-            "test point {free:?} must be unmasked"
-        );
+        // The same click on free viewport resolves as the remove. Pick a
+        // free point programmatically — the overlay union can cover most
+        // of the screen when every panel is open, so a hardcoded point
+        // breaks whenever a panel grows.
+        let free = (0..60)
+            .flat_map(|iy| {
+                (0..80).map(move |ix| {
+                    egui::pos2(ix as f32 * 10.0 + 2.0, iy as f32 * 10.0 + 2.0)
+                })
+            })
+            .find(|p| !masks.iter().any(|r| r.contains(*p)))
+            .expect("the overlay union should leave some viewport free");
         ctx.run_pass(egui_input(secondary_click(free)), |ctx| {
             vab_pointer_input(ctx, &mut vab, &masks, None);
         })

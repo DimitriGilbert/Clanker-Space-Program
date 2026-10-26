@@ -268,6 +268,29 @@ pub(crate) fn surface_floor_radius(
     env: &FlightEnv,
     dir: DVec3,
 ) -> f64 {
+    // Ring taps at ~1.5 equirect texels of angular offset (2π/W ≈
+    // 6.1 mrad at 1024 wide) — near the poles a fixed offset covers
+    // more longitude texels, which only widens the bound.
+    const TAP: f64 = 1.5 * 2.0 * core::f64::consts::PI / HEIGHTFIELD_W as f64;
+    ground_radius(cfg, cache, env, dir, TAP)
+}
+
+/// The rendered terrain surface radius along an inertial unit `dir`:
+/// `radius_m` plus the baked heightfield's bilinear sample scaled by
+/// the body's amplitude, taken as the MAX over `dir` plus a ±`tap_rad`
+/// ring of four taps around it (radians on the unit sphere — pass a
+/// structure's footprint/radius to bound the ground under it). The
+/// shared core of [`surface_floor_radius`]: same body resolution,
+/// same `R(axis, −phase)` inertial→fixed conjugate the shader applies
+/// before `height_at`, so callers measure the surface the pass draws.
+/// `crate::structures` anchors the launch-site buildings on it.
+pub(crate) fn ground_radius(
+    cfg: &TerrainConfig,
+    cache: &mut TerrainCache,
+    env: &FlightEnv,
+    dir: DVec3,
+    tap_rad: f64,
+) -> f64 {
     let body_id = env.body.as_ref().map_or("", |b| b.as_str());
     let body = cfg
         .bodies
@@ -281,10 +304,6 @@ pub(crate) fn surface_floor_radius(
     } else {
         dir
     };
-    // Ring taps at ~1.5 equirect texels of angular offset (2π/W ≈
-    // 6.1 mrad at 1024 wide) — near the poles a fixed offset covers
-    // more longitude texels, which only widens the bound.
-    const TAP: f64 = 1.5 * 2.0 * core::f64::consts::PI / HEIGHTFIELD_W as f64;
     let (t1, t2) = {
         let a = if fixed.z.abs() < 0.9 {
             DVec3::Z
@@ -302,7 +321,7 @@ pub(crate) fn surface_floor_radius(
         (t, fixed.cross(t))
     };
     let mut h = field.sample_dir(fixed);
-    for off in [t1 * TAP, -t1 * TAP, t2 * TAP, -t2 * TAP] {
+    for off in [t1 * tap_rad, -t1 * tap_rad, t2 * tap_rad, -t2 * tap_rad] {
         let d = fixed + off;
         if d.norm_squared() > 1.0e-12 {
             h = h.max(field.sample_dir(d / d.norm()));

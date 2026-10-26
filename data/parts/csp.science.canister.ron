@@ -64,5 +64,5 @@
             (PanelJam,    0.3),
         ],
     ),
-    tech_requirement: "tech.science.1",
+    tech_requirement: "tech.start",
 )

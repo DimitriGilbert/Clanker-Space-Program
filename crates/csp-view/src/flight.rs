@@ -2481,6 +2481,7 @@ pub(crate) fn extract_flight(
     cam: Res<FlightCameraF64>,
     terrain_cfg: Res<TerrainConfig>,
     mut terrain_cache: ResMut<TerrainCache>,
+    sites: Res<crate::structures::SiteTable>,
     clock: Res<crate::Clock>,
     mut frame: ResMut<FlightFrame>,
 ) {
@@ -2530,6 +2531,28 @@ pub(crate) fn extract_flight(
     }
     let vp = &cam.0.view_proj;
     let eye = cam.0.eye;
+
+    // The space center: pad/mount, gantry, VAB, crawlerway, propellant
+    // farm and support buildings at the authored launch site — lit
+    // geometry sharing the frame's staged sun via `packet.light`, with
+    // unlit contact-shadow quads, anchored to the same rendered
+    // terrain the craft rests on (the extract's `packet.terrain` gate
+    // is exactly "env + solved camera + flight mode").
+    if packet.terrain.is_some()
+        && let Some(env) = &snap.env
+        && let Some(body) = &env.body
+        && let Some(site) = sites.launch_site(body)
+    {
+        crate::structures::emit_launch_complex(
+            v,
+            vp,
+            eye,
+            env,
+            site,
+            &terrain_cfg,
+            &mut terrain_cache,
+        );
+    }
 
     // R2: the quadtree terrain + ocean in `packet.terrain` replaced
     // M4c's flat ground disc — nothing else to emit for the surface.
@@ -2793,6 +2816,7 @@ mod tests {
         world.insert_resource(FlightCameraF64(cam));
         world.insert_resource(TerrainConfig::default());
         world.insert_resource(TerrainCache::default());
+        world.insert_resource(crate::structures::SiteTable::default());
         world.insert_resource(crate::Clock::default());
         world.insert_resource(FlightFrame::default());
         let mut sched = Schedule::default();

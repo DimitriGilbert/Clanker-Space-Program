@@ -33,6 +33,12 @@ pub mod tutorial;
 /// pure egui over body-frame staged vectors.
 pub mod navball;
 
+/// The M7/M9b progression surface (PLAN §3.2–§3.6): the Program
+/// window — economy readout, contract board, tech tree, the focused
+/// vessel's experiment/data actions, and per-part reliability — plus
+/// the always-on funds/science status strip.
+pub mod program;
+
 pub use settings::{
     AudioSettings, DifficultySettings, GameplaySettings, GraphicsQuality, GraphicsSettings,
     KeyAction, KeyBinding, Keymap, Settings, SettingsPanelOutput, SettingsPanelState,
@@ -192,6 +198,9 @@ pub enum MapLabelKind {
     Node,
     /// An apsis mark (Ap/Pe) on the focused orbit.
     Apsis,
+    /// A surface site (launch complex / recovery field) — styled like
+    /// an apsis mark: small and secondary to object names.
+    Site,
 }
 
 /// One map-view label — a clip-space anchor + text, produced by
@@ -356,7 +365,7 @@ fn paint_map_label(
     placed: &mut Vec<egui::Rect>,
 ) {
     let (font, lift) = match label.kind {
-        MapLabelKind::Apsis => (egui::FontId::proportional(10.5), 5.0),
+        MapLabelKind::Apsis | MapLabelKind::Site => (egui::FontId::proportional(10.5), 5.0),
         _ => (egui::FontId::proportional(12.0), 8.0),
     };
     let c = egui::Color32::from_rgba_unmultiplied(

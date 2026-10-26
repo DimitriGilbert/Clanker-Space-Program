@@ -28,6 +28,13 @@ pub mod map;
 /// heightfield cache, and the `TerrainPacket` the flight view emits.
 pub mod terrain;
 
+/// The launch-site space center (PLAN §5.2's static structures): the
+/// authored `sites.ron` table as a `SiteTable` resource plus the pad /
+/// gantry / VAB / support-building geometry `extract_flight` emits
+/// into the flight vertex stream at the rendered terrain height — and
+/// the launch-site marker the map view draws.
+pub mod structures;
+
 /// The M3 VAB (editor mode): working-craft session hosting, the craft
 /// view's scene/camera/packet, and the GPU-pick event plumbing.
 pub mod vab;
@@ -152,6 +159,77 @@ pub struct PanelFlags {
     pub debug: bool,
     /// Show the controls-help card.
     pub help: bool,
+    /// Show the Program window (progression: research/science/
+    /// contracts/reliability) — top-bar "Program" button.
+    pub program: bool,
+}
+
+/// The localization table (`data/loc/en.ron`) as a resource so
+/// `stage_program` can resolve tech-node/track/part display names —
+/// data-derived constants like the part catalog (§7.3). `with_sim`
+/// worlds get the empty default and labels fall back to raw ids.
+#[derive(Resource, Default)]
+pub struct LocStrings(pub std::collections::BTreeMap<String, String>);
+
+/// A body's decoded §3.0.1 biome map — palette indices + the legend's
+/// `index → BiomeId` table. Presentation-side only: the sim never
+/// reads pixels (the `RunExperiment` caller supplies the biome).
+#[derive(Clone, Debug)]
+pub struct BiomeLookup {
+    /// Texels per row.
+    pub width: u32,
+    /// Rows (equirect north→south).
+    pub height: u32,
+    /// `width·height` raw PNG palette indices, row-major.
+    pub indices: Vec<u8>,
+    /// Palette index → `BiomeId`.
+    pub legend: std::collections::BTreeMap<u8, csp_data::BiomeId>,
+}
+
+/// Decoded biome maps keyed by body id — built by `from_source` from
+/// the loaded system; empty for `with_sim` worlds (space contexts and
+/// map-less bodies use the empty `BiomeId` anyway).
+#[derive(Resource, Default)]
+pub struct BiomeMaps(pub std::collections::BTreeMap<String, BiomeLookup>);
+
+/// Body radius table keyed by body id — needed to turn a rails
+/// vessel's osculating radius into an altitude for the science
+/// situation bands. Data-derived constants.
+#[derive(Resource, Default)]
+pub struct BodyRadii(pub std::collections::BTreeMap<String, f64>);
+
+/// §3.2 situation bands (presentation-side math — the sim's module
+/// doc: "the situation boundary definitions are presentation-side").
+/// Flying low/high split above the datum — the KSP Kerbin figure.
+pub const FLYING_SPLIT_M: f64 = 18_000.0;
+/// See [`FLYING_SPLIT_M`] — low/high space split above the datum.
+pub const SPACE_SPLIT_M: f64 = 250_000.0;
+
+/// One pooled science record kept sim-side for command resolution —
+/// the csp-ui row references it by `index` (`DataKey` may not cross
+/// the §2.1 boundary into csp-ui).
+#[derive(Clone, Debug)]
+pub struct PooledKey {
+    /// The science key `TransmitData`/`RecoverData` name.
+    pub key: csp_sim::research::DataKey,
+}
+
+/// The Program window's staged mirror — populated by
+/// [`View::stage_program`] in `end_frame` (the `stage_vab_tech`
+/// precedent: a direct sim→resource write in the staging phase,
+/// never read by systems as sim state). `csp_ui::program::ProgramInput`
+/// is built from this inside `build_ui`; `keys`/`science_ctx` are the
+/// sim-side facts the emitted commands need back.
+#[derive(Resource, Default)]
+pub struct ProgramMirror {
+    /// The csp-ui input rows.
+    pub input: csp_ui::program::ProgramInput,
+    /// The focused vessel the science rows belong to.
+    pub vessel: Option<csp_sim::VesselId>,
+    /// The staged context for `RunExperiment`.
+    pub science_ctx: Option<(csp_data::BiomeId, csp_data::Situation)>,
+    /// The pooled `DataKey`s the `DataRow.index` values address.
+    pub keys: Vec<PooledKey>,
 }
 
 /// Session-side values `csp-app` mirrors in for the UI — written through
@@ -242,6 +320,11 @@ pub struct UiOutbox {
     /// command `csp-app` enqueues at next Input (§2.5's one-frame
     /// UiBuild → Input hand-off, same as every other request here).
     pub maneuver: Option<SimCommand>,
+    /// Program-window output — the `RunExperiment`/`TransmitData`/
+    /// `RecoverData`/`ResearchTech`/`ResearchUpgradeLevel`/
+    /// `AcceptContract` commands the panel emitted, already resolved
+    /// into `SimCommand`s against the [`ProgramMirror`] context.
+    pub program: Vec<SimCommand>,
     /// The settings panel's "Apply" — `csp-app` copies the staged
     /// settings into its live set and persists them.
     pub settings_apply: bool,
@@ -285,6 +368,16 @@ fn sync_mirrors(
     stats.frames += 1;
 }
 
+/// The panel flags + the progression mirror as one system param —
+/// keeps `build_ui` under the system-parameter cap.
+#[derive(bevy_ecs::system::SystemParam)]
+struct ProgramUi<'w> {
+    /// Optional-panel toggles.
+    panels: ResMut<'w, PanelFlags>,
+    /// The staged Program-window mirror.
+    mirror: Res<'w, ProgramMirror>,
+}
+
 /// The entire egui pass (§2.5 #5, Appendix A item 3): build the plain-data
 /// panel input from mirrors, run `csp_ui`'s pure panel functions under
 /// `egui::Context::run_ui`, store the `FullOutput` for `csp-app`'s painter,
@@ -306,7 +399,7 @@ fn build_ui(
     map_snap: Res<map::MapSnapshot>,
     mut maneuver_state: ResMut<ManeuverPanelRes>,
     mut settings_state: ResMut<SettingsPanelRes>,
-    mut panels: ResMut<PanelFlags>,
+    mut prog_ui: ProgramUi,
     mut tutorial: ResMut<tutorial::TutorialRes>,
     mut outbox: ResMut<UiOutbox>,
 ) {
@@ -358,10 +451,10 @@ fn build_ui(
         // The M0 scaffold is dev-facing (adapter/backend/tick internals)
         // — gated behind the ToggleDebug key so the shipped view is a
         // game screen, not a diagnostics dump.
-        if panels.debug && mode != csp_ui::ModeSelect::Vab {
+        if prog_ui.panels.debug && mode != csp_ui::ModeSelect::Vab {
             csp_ui::debug_panel(ctx, &input, &mut panel_output);
         }
-        if panels.help {
+        if prog_ui.panels.help {
             let mut open = true;
             // The LIVE keymap — the staged edit copy would show
             // pending changes the dispatch doesn't honor yet.
@@ -372,7 +465,7 @@ fn build_ui(
                 &mut open,
             ));
             if !open {
-                panels.help = false;
+                prog_ui.panels.help = false;
             }
         }
         if map_ui.mode == map::MapMode::Map {
@@ -452,6 +545,32 @@ fn build_ui(
                 },
             );
         }
+        // The program economy readout — funds/science/contracts drawn
+        // in EVERY mode so program state is never hidden behind a view
+        // switch; the Program window itself is toggleable.
+        csp_ui::program::program_status(
+            ctx,
+            prog_ui.mirror.input.funds,
+            prog_ui.mirror.input.science,
+            prog_ui.mirror.input.active.len(),
+        );
+        if prog_ui.panels.program {
+            let mut open = true;
+            let mut cmds = Vec::new();
+            ui_masks.push(csp_ui::program::program_panel(
+                ctx,
+                &prog_ui.mirror.input,
+                &mut open,
+                &mut cmds,
+            ));
+            if !open {
+                prog_ui.panels.program = false;
+            }
+            outbox.program = cmds
+                .into_iter()
+                .filter_map(|c| program_command(&prog_ui.mirror, c))
+                .collect();
+        }
         // M10: the settings window + the §2.13 Fatal dialog + the
         // tutorial checklist — session-state panels, drawn every mode.
         ui_masks.extend(m10_panels(
@@ -489,7 +608,12 @@ fn build_ui(
     // same fold-back pattern as the tutorial (session state, never the
     // app outbox).
     if vab_out.help {
-        panels.help = !panels.help;
+        prog_ui.panels.help = !prog_ui.panels.help;
+    }
+    // The top bar's "Program" button toggles the progression window —
+    // same fold-back convention as help/tutorial.
+    if vab_out.program {
+        prog_ui.panels.program = !prog_ui.panels.program;
     }
     // Warp steps may come from the debug panel's buttons or the top
     // bar's −/+ now that the scaffold is dev-gated.
@@ -563,6 +687,47 @@ fn map_panels(
             vessel: csp_sim::VesselId(vessel),
         },
     });
+}
+
+/// Resolve one [`csp_ui::program::ProgramCommand`] into the
+/// `SimCommand` it names — the context fields the command needs
+/// (vessel, biome, situation, `DataKey`) come back out of the
+/// [`ProgramMirror`] the panel was drawn from. `None` when the
+/// mirrored context vanished between staging and the click (a
+/// one-frame-stale panel command is dropped, not misfired).
+fn program_command(
+    mirror: &ProgramMirror,
+    cmd: csp_ui::program::ProgramCommand,
+) -> Option<SimCommand> {
+    use csp_ui::program::ProgramCommand as C;
+    match cmd {
+        C::ResearchTech { node } => Some(SimCommand::ResearchTech {
+            node: csp_data::TechNodeId::from(node),
+        }),
+        C::ResearchTrack { track } => Some(SimCommand::ResearchUpgradeLevel {
+            track: csp_data::UpgradeTrackId::from(track),
+        }),
+        C::AcceptContract { offer } => Some(SimCommand::AcceptContract { offer }),
+        C::RunExperiment { node, experiment } => {
+            let (biome, situation) = mirror.science_ctx.clone()?;
+            Some(SimCommand::RunExperiment {
+                vessel: mirror.vessel?,
+                node: csp_phys::PartNodeId(node),
+                experiment: csp_data::ExperimentId::from(experiment),
+                biome,
+                situation,
+            })
+        }
+        C::Transmit { row } | C::Recover { row } => {
+            let key = mirror.keys.get(row)?.key.clone();
+            let vessel = mirror.vessel?;
+            Some(if matches!(cmd, C::Transmit { .. }) {
+                SimCommand::TransmitData { vessel, key }
+            } else {
+                SimCommand::RecoverData { vessel, key }
+            })
+        }
+    }
 }
 
 /// The map's pointer-side camera intake — a second `UiBuild` system
@@ -1061,7 +1226,7 @@ impl View {
         // `LocKey`, so the English table is what lets the palette print
         // "Sparc Launch Engine" instead of the raw part id — same
         // data-derived-constant class as the catalog itself.
-        view.with_vab_session(|v| v.set_loc(loc));
+        view.with_vab_session(|v| v.set_loc(loc.clone()));
         // R2: the authored terrain table (noise seeds, ocean datums,
         // decoded biome palettes) — installed over the empty default.
         let art = art::load();
@@ -1069,6 +1234,10 @@ impl View {
         tc.art = art.0.terrain.clone();
         view.world.insert_resource(tc);
         view.world.insert_resource(art);
+        // The progression surface's data-derived constants: loc strings
+        // (display names), decoded biome maps (the `RunExperiment`
+        // biome context), and body radii (rails-altitude situations).
+        install_program_resources(&mut view, &sys.bodies, &defs, &loc);
         Ok(view)
     }
 
@@ -1191,7 +1360,18 @@ impl View {
         // installs the authored table over it.
         world.insert_resource(terrain::TerrainConfig::default());
         world.insert_resource(terrain::TerrainCache::default());
+        // The authored site table — a data-derived constant like
+        // `BodyTable` above (`sim.config()`'s clone runs once, here at
+        // construction — never per frame).
+        world.insert_resource(structures::SiteTable::from_sim(&sim));
         world.insert_resource(art::ArtAssets::default());
+        // Progression surface resources (ProgramMirror is staged by
+        // `stage_program` each `end_frame`; LocStrings/BiomeMaps/
+        // BodyRadii are data-derived constants `from_source` fills in).
+        world.insert_resource(ProgramMirror::default());
+        world.insert_resource(LocStrings::default());
+        world.insert_resource(BiomeMaps::default());
+        world.insert_resource(BodyRadii::default());
         // §3.7 visual-SFX channel (flight.rs carries the audio deferral).
         world.insert_resource(flight::FlightSfx::default());
 
@@ -1368,6 +1548,9 @@ impl View {
         // M7-B §3.3: restage the VAB's progression gate — research
         // drained this frame flips palette availability next frame.
         self.stage_vab_tech();
+        // M7/M9b: the Program window's mirror — economy, contracts,
+        // tech, and the focused vessel's science/reliability rows.
+        self.stage_program();
         self.schedules.sync.run(&mut self.world);
         self.schedules.presentation.run(&mut self.world);
         // P04-F3: the recover-control Player-lease transfer issues on
@@ -2292,6 +2475,352 @@ impl View {
     pub fn set_craft_files(&mut self, files: Vec<String>) {
         self.world.resource_mut::<vab::CraftFileList>().0 = files;
     }
+
+    /// Stage the progression mirror — economy, contracts, the tech
+    /// tree, and the focused vessel's science/reliability rows — for
+    /// the Program window. Runs in `end_frame` beside
+    /// [`Self::stage_vab_tech`]: sim reads happen HERE (the staging
+    /// phase), systems only ever see the mirror (§2.5).
+    fn stage_program(&mut self) {
+        use csp_ui::program as up;
+        let sim = &self.sim;
+        let loc = self.world.resource::<LocStrings>().0.clone();
+        let name_of = |key: &csp_data::LocKey, fallback: &str| {
+            loc.get(key.as_str())
+                .cloned()
+                .unwrap_or_else(|| fallback.to_string())
+        };
+        let mut input = up::ProgramInput {
+            funds: sim.funds_micros() as f64 / 1.0e6,
+            science: sim.science_now(),
+            banked: sim.science().banked,
+            ..Default::default()
+        };
+        // Contracts, research rows, and the notification log.
+        stage_program_overview(sim, &mut input, &name_of);
+        // The vessel the science/reliability rows describe: the
+        // flight focus (InBubble/latched), else the map's focused
+        // on-rails vessel.
+        let staged = &self.world.resource::<flight::FlightSyncInput>().vessels;
+        let pin = self.world.resource::<flight::FlightFocusOverride>();
+        let mut vid = pin
+            .resolve(staged)
+            .map(|b| csp_sim::VesselId(b.id))
+            .filter(|id| sim.vessels().contains_key(id));
+        if vid.is_none() {
+            vid = self
+                .world
+                .resource::<map::MapInput>()
+                .focus_vessel
+                .filter(|id| {
+                    sim.vessels()
+                        .get(id)
+                        .is_some_and(|v| matches!(v.state, VesselState::OnRails(_)))
+                });
+        }
+        let (mut ctx_biome, mut ctx_situation, mut ctx_label) = (None, None, None);
+        let mut keys = Vec::new();
+        if let Some(vid) = vid
+            && let Some(v) = sim.vessels().get(&vid)
+        {
+            self.stage_program_vessel(
+                v,
+                &mut input,
+                &mut ctx_biome,
+                &mut ctx_situation,
+                &mut ctx_label,
+                &mut keys,
+                &name_of,
+            );
+        }
+        *self.world.resource_mut::<ProgramMirror>() = ProgramMirror {
+            input,
+            vessel: vid.filter(|_| ctx_situation.is_some()),
+            science_ctx: ctx_biome.zip(ctx_situation),
+            keys,
+        };
+    }
+
+    /// The per-vessel half of [`Self::stage_program`] — experiments,
+    /// pooled data, reliability rows, and the `(biome, situation)`
+    /// context a `RunExperiment` command will carry.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)] // one vessel = one staging pass
+    fn stage_program_vessel(
+        &self,
+        v: &csp_sim::Vessel,
+        input: &mut csp_ui::program::ProgramInput,
+        ctx_biome: &mut Option<csp_data::BiomeId>,
+        ctx_situation: &mut Option<csp_data::Situation>,
+        ctx_label: &mut Option<(String, String, String, String)>,
+        keys: &mut Vec<PooledKey>,
+        name_of: &dyn Fn(&csp_data::LocKey, &str) -> String,
+    ) {
+        use csp_ui::program as up;
+        let sim = &self.sim;
+        input.latched = matches!(v.state, VesselState::SurfaceLatched(_));
+        // Situation + biome — the presentation-side context math the
+        // research module doc assigns us.
+        let (body, alt_m, lat_rad, lon_rad) = self.vessel_context(v);
+        let env_atm_top = sim
+            .environment()
+            .map_or(0.0, |e| e.atmosphere.as_ref().map_or(0.0, |a| a.top_m));
+        let situation = match &v.state {
+            VesselState::SurfaceLatched(p) => Some(if p.altitude_m <= 0.0 {
+                csp_data::Situation::Splashed
+            } else {
+                csp_data::Situation::Landed
+            }),
+            VesselState::InBubble(_) => {
+                let contact = sim.ground_contact(v.id);
+                if contact && alt_m <= 50.0 {
+                    Some(if alt_m <= 0.0 {
+                        csp_data::Situation::Splashed
+                    } else {
+                        csp_data::Situation::Landed
+                    })
+                } else if alt_m < env_atm_top {
+                    Some(if alt_m < FLYING_SPLIT_M.min(env_atm_top) {
+                        csp_data::Situation::FlyingLow
+                    } else {
+                        csp_data::Situation::FlyingHigh
+                    })
+                } else {
+                    Some(if alt_m < SPACE_SPLIT_M {
+                        csp_data::Situation::SpaceLow
+                    } else {
+                        csp_data::Situation::SpaceHigh
+                    })
+                }
+            }
+            VesselState::OnRails(_) => Some(if alt_m < SPACE_SPLIT_M {
+                csp_data::Situation::SpaceLow
+            } else {
+                csp_data::Situation::SpaceHigh
+            }),
+        };
+        let biome = situation.and_then(|s| {
+            s.is_surface_side()
+                .then(|| self.biome_at(body.as_deref(), lat_rad, lon_rad))
+                .flatten()
+        });
+        *ctx_situation = situation;
+        *ctx_biome = biome.clone();
+        if let (Some(b), Some(s)) = (&body, &situation) {
+            *ctx_label = Some((
+                format!("vessel {}", v.id.0),
+                s.name().to_string(),
+                biome
+                    .as_ref()
+                    .map_or(String::new(), |b| b.as_str().to_string()),
+                b.clone(),
+            ));
+            input.context = ctx_label.clone();
+        }
+        // Experiments — module specs over the live graph, gated the
+        // same way `apply_run_experiment` gates them.
+        if let Some(craft) = &v.craft {
+            for (nid, node) in &craft.graph.nodes {
+                let Some(part) = craft.parts.get(node.effective_index as usize) else {
+                    continue;
+                };
+                let part_name = craft
+                    .part_ids
+                    .get(node.effective_index as usize)
+                    .and_then(|pid| {
+                        sim.parts()
+                            .get(pid)
+                            .map(|d| name_of(&d.display_name, pid.as_str()))
+                    })
+                    .unwrap_or_else(|| format!("part {}", nid.0));
+                for spec in &part.experiments {
+                    let spent = v.science.spent.contains(&(*nid, spec.kind.clone()));
+                    let mut blocked = String::new();
+                    if let Some(s) = situation {
+                        if !spec.situations.contains(s) {
+                            blocked = format!("cannot run while {}", s.name());
+                        } else if body.as_deref().is_none_or(|b| {
+                            sim.experiments()
+                                .get(&spec.kind)
+                                .and_then(|d| d.cap_for(&csp_data::BodyId::from(b), s))
+                                .is_none()
+                        }) {
+                            blocked = "no science cap for this context".to_string();
+                        }
+                    } else {
+                        blocked = "no context".to_string();
+                    }
+                    input.experiments.push(up::ExperimentRow {
+                        node: nid.0,
+                        part: part_name.clone(),
+                        experiment: spec.kind.as_str().to_string(),
+                        data_units: spec.data_units,
+                        reusable: spec.reusable,
+                        spent,
+                        runnable: blocked.is_empty() && !(spent && !spec.reusable),
+                        blocked: if spent && !spec.reusable {
+                            "already collected — not reusable".to_string()
+                        } else {
+                            blocked
+                        },
+                    });
+                }
+            }
+        }
+        // Pooled data — one row per (node, key), merged by key like
+        // `VesselScience::units_at`.
+        let mut by_key: std::collections::BTreeMap<csp_sim::research::DataKey, f64> =
+            std::collections::BTreeMap::new();
+        for m in v.science.data.values() {
+            for (k, u) in m {
+                *by_key.entry(k.clone()).or_insert(0.0) += u;
+            }
+        }
+        for (k, units) in by_key {
+            if units <= 0.0 {
+                continue;
+            }
+            let (ratio, prior) = (
+                sim.experiments()
+                    .get(&k.experiment)
+                    .map_or(0.4, |d| d.transmit_ratio),
+                sim.science().keys.get(&k).copied().unwrap_or_default(),
+            );
+            keys.push(PooledKey { key: k.clone() });
+            input.pooled.push(up::DataRow {
+                index: keys.len() - 1,
+                label: format!(
+                    "{}@{}/{}{}",
+                    k.experiment.as_str(),
+                    k.biome.as_str(),
+                    k.body.as_str(),
+                    k.situation.name()
+                ),
+                units,
+                transmit_yield: units * ratio,
+                recover_yield: units
+                    * if prior.transmitted {
+                        (1.0 - ratio).max(0.0)
+                    } else {
+                        1.0
+                    },
+                transmitted: prior.transmitted,
+            });
+        }
+        // Reliability rows — one per node with a record.
+        let now = sim.clock().ticks();
+        for (nid, rec) in &v.reliability {
+            let part_name = v
+                .craft
+                .as_ref()
+                .and_then(|c| {
+                    c.graph
+                        .nodes
+                        .get(nid)
+                        .and_then(|n| c.part_ids.get(n.effective_index as usize))
+                })
+                .and_then(|pid| sim.parts().get(pid))
+                .map(|d| name_of(&d.display_name, d.id.as_str()))
+                .unwrap_or_else(|| format!("part {}", nid.0));
+            input.reliability.push(up::ReliabilityRow {
+                node: nid.0,
+                part: part_name,
+                failures: rec.failures.iter().map(|m| format!("{m:?}")).collect(),
+                misfire: rec.misfire,
+                thrust_factor: rec.thrust_factor,
+                wear: rec
+                    .theta
+                    .is_finite()
+                    .then(|| (rec.hazard_at(now) / rec.theta).clamp(0.0, 1.0)),
+                dormant: rec.dormant_class,
+            });
+        }
+    }
+
+    /// The focused vessel's `(body, altitude_m, lat_rad, lon_rad)` for
+    /// situation/biome derivation — presentation-side science context.
+    /// InBubble positions unrotate by the spin phase (the
+    /// `surface_pose_capture` convention); rails vessels solve the
+    /// osculating conic at the clock.
+    fn vessel_context(&self, v: &csp_sim::Vessel) -> (Option<String>, f64, f64, f64) {
+        let sim = &self.sim;
+        match &v.state {
+            VesselState::SurfaceLatched(p) => (
+                Some(p.body.as_str().to_string()),
+                p.altitude_m,
+                p.latitude_rad,
+                p.longitude_rad,
+            ),
+            VesselState::InBubble(b) => {
+                let Some(env) = sim.environment() else {
+                    return (None, 0.0, 0.0, 0.0);
+                };
+                let omega = env.body_spin.norm();
+                let rel = if omega > 0.0 {
+                    let phase = csp_core::DQuat::from_axis_angle(
+                        env.body_spin / omega,
+                        omega * sim.clock().seconds(),
+                    );
+                    phase.conjugate().rotate(b.pos - env.body_center)
+                } else {
+                    b.pos - env.body_center
+                };
+                let r = rel.norm();
+                (
+                    sim.dominant_body().map(|d| d.as_str().to_string()),
+                    r - env.radius_m,
+                    if r > 0.0 {
+                        (rel.z / r).clamp(-1.0, 1.0).asin()
+                    } else {
+                        0.0
+                    },
+                    if rel.x != 0.0 || rel.y != 0.0 {
+                        rel.y.atan2(rel.x)
+                    } else {
+                        0.0
+                    },
+                )
+            }
+            VesselState::OnRails(o) => {
+                let alt = csp_sim::orbit::OrbitModel::state_at(sim.orbits(), o, sim.clock())
+                    .map(|(pos, _)| {
+                        let r = self
+                            .world
+                            .resource::<BodyRadii>()
+                            .0
+                            .get(o.parent.as_str())
+                            .copied()
+                            .unwrap_or(0.0);
+                        pos.norm() - r
+                    })
+                    .unwrap_or(0.0);
+                (Some(o.parent.as_str().to_string()), alt, 0.0, 0.0)
+            }
+        }
+    }
+
+    /// The `BiomeId` under `(lat, lon)` on `body` — equirect sample of
+    /// the decoded §3.0.1 map; `None` when the body has no map.
+    fn biome_at(
+        &self,
+        body: Option<&str>,
+        lat_rad: f64,
+        lon_rad: f64,
+    ) -> Option<csp_data::BiomeId> {
+        let maps = &self.world.resource::<BiomeMaps>().0;
+        let l = maps.get(body?)?;
+        if l.width == 0 || l.height == 0 {
+            return None;
+        }
+        let lat_deg = lat_rad.to_degrees().clamp(-90.0, 90.0);
+        let lon_deg = lon_rad.to_degrees().clamp(-180.0, 180.0);
+        let row = (((90.0 - lat_deg) / 180.0) * l.height as f64) as usize;
+        let col = (((lon_deg + 180.0) / 360.0) * l.width as f64) as usize;
+        let idx = *l.indices.get(
+            row.min(l.height as usize - 1) * l.width as usize + col.min(l.width as usize - 1),
+        )?;
+        l.legend.get(&idx).cloned()
+    }
 }
 
 /// The data/ directory root: `./data` when it exists (the app runs from
@@ -2352,6 +2881,124 @@ fn stage_plan_of(vab: &csp_ui::vab::VabSession) -> Vec<Vec<csp_phys::PartNodeId>
         }
     }
     plan
+}
+
+/// Install the progression surface's data-derived constants —
+/// extracted from `from_source` under the line budget: the loc
+/// strings (display names), the decoded biome maps the
+/// `RunExperiment` biome context samples, and the body radii that
+/// turn a rails conic radius into an altitude for situation bands.
+fn install_program_resources(
+    view: &mut View,
+    bodies: &[csp_data::LoadedBody],
+    defs: &[csp_data::BodyDef],
+    loc: &csp_data::LocFile,
+) {
+    view.world.insert_resource(LocStrings(loc.strings.clone()));
+    view.world.insert_resource(BiomeMaps(
+        bodies
+            .iter()
+            .filter_map(|b| {
+                let loaded = b.biomes.as_ref()?;
+                let img = csp_data::decode_indexed_png(&loaded.png).ok()?;
+                Some((
+                    b.def.id.as_str().to_owned(),
+                    BiomeLookup {
+                        width: img.info.width,
+                        height: img.info.height,
+                        indices: img.indices,
+                        legend: loaded
+                            .legend
+                            .entries
+                            .iter()
+                            .map(|e| (e.index, e.id.clone()))
+                            .collect(),
+                    },
+                ))
+            })
+            .collect(),
+    ));
+    view.world.insert_resource(BodyRadii(
+        defs.iter()
+            .map(|d| (d.id.as_str().to_owned(), d.radius_m))
+            .collect(),
+    ));
+}
+
+/// The Program window's non-vessel half — contract board, tech-tree
+/// and upgrade-track rows (same purchasability arithmetic the applies
+/// enforce), and the tail of the reliability notification log.
+/// Extracted from `stage_program` under the line budget.
+fn stage_program_overview(
+    sim: &SimWorld,
+    input: &mut csp_ui::program::ProgramInput,
+    name_of: &dyn Fn(&csp_data::LocKey, &str) -> String,
+) {
+    use csp_ui::program as up;
+    for o in sim.contracts().offers.values() {
+        input.offers.push(up::OfferRow {
+            index: o.index,
+            label: format!("#{} {}", o.index, o.template.as_str()),
+        });
+    }
+    for c in sim.contracts().active.values() {
+        input
+            .active
+            .push(format!("#{} {}", c.id.0, c.template.as_str()));
+    }
+    let tech = sim.tech();
+    input.tech = sim.tech_tree().map(|tree| {
+        tree.nodes
+            .iter()
+            .map(|n| up::TechRow {
+                id: n.id.as_str().to_string(),
+                name: name_of(&n.display_name, n.id.as_str()),
+                cost: n.science_cost,
+                researched: tech.is_researched(&n.id),
+                prereqs_met: n.requires.iter().all(|r| tech.is_researched(r)),
+                affordable: input.banked >= n.science_cost,
+            })
+            .collect()
+    });
+    input.tracks = sim
+        .tech_tree()
+        .map(|tree| {
+            tree.tracks
+                .iter()
+                .map(|t| {
+                    let level = tech.track_level(&t.id);
+                    let cap = tech.level_cap(tree, &t.id);
+                    let maxed = usize::from(level) >= t.levels.len();
+                    up::TrackRow {
+                        id: t.id.as_str().to_string(),
+                        name: name_of(&t.display_name, t.id.as_str()),
+                        level,
+                        cap,
+                        levels: t.levels.len() as u8,
+                        next_cost: (!maxed).then(|| t.levels[usize::from(level)].science_cost),
+                        affordable: !maxed
+                            && input.banked >= t.levels[usize::from(level)].science_cost,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    for n in sim.notifications().iter().rev().take(8).rev() {
+        let text = match n.kind {
+            csp_sim::reliability::NotificationKind::PartFailed { mode, dormant } => {
+                format!(
+                    "vessel {} — PART FAILED {:?}{}",
+                    n.vessel.0,
+                    mode,
+                    if dormant { " (dormant)" } else { "" }
+                )
+            }
+            csp_sim::reliability::NotificationKind::IgnitionMisfire => {
+                format!("vessel {} — IGNITION MISFIRE", n.vessel.0)
+            }
+        };
+        input.notices.push(up::NoticeRow { tick: n.tick, text });
+    }
 }
 
 /// The out-of-the-box stock craft — a three-part booster (pod over
