@@ -4672,6 +4672,7 @@ mod tests {
                 terrain: None,
             },
             dominant: BodyId::from("terra"),
+            bubble_radius_m: crate::DEFAULT_BUBBLE_RADIUS_M,
         }
     }
 

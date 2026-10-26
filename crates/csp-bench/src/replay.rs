@@ -1332,6 +1332,7 @@ mod tests {
                         terrain: None,
                     },
                     dominant: BodyId::from("p"),
+                    bubble_radius_m: csp_sim::DEFAULT_BUBBLE_RADIUS_M,
                 },
                 csp_sim::DEFAULT_MAX_EVENTS_PER_FRAME,
             );
@@ -1342,6 +1343,9 @@ mod tests {
         /// Orbiter spawn → `LoadScript` → control ticks — the guest's
         /// `set_throttle` lands `Script`-stamped entries in the log
         /// every tick it ticks, including inside the `AdvanceTo` warp.
+        /// The spawn rides a dipping conic (0.6-circular → periapsis
+        /// below the surface floor): the auto bubble→rails edge never
+        /// takes it, so the script keeps its `InBubble` control ticks.
         fn drive_scripted(w: &mut World) -> Result<(), SimError> {
             let pos = DVec3::new(800_000.0, 0.0, 0.0);
             w.enqueue(
@@ -1351,7 +1355,7 @@ mod tests {
                     craft: scenarios::flight_craft(),
                     pos,
                     rot: DQuat::IDENTITY,
-                    vel: DVec3::new(0.0, libm::sqrt(3.5316e12 / pos.norm()), 0.0),
+                    vel: DVec3::new(0.0, 0.6 * libm::sqrt(3.5316e12 / pos.norm()), 0.0),
                     ang_vel: DVec3::ZERO,
                 },
             );

@@ -562,6 +562,7 @@ fn shipping_world() -> Result<World, ReplayError> {
                 terrin.rotation_period_s,
             ),
             dominant: BodyId::from("terrin"),
+            bubble_radius_m: csp_sim::DEFAULT_BUBBLE_RADIUS_M,
         },
         balance.advance_to_max_events_per_frame,
     );
@@ -751,6 +752,9 @@ fn measure_atmo_200() -> Result<Measurement, ReplayError> {
 }
 
 /// §5.3 "1000-part station in orbit": the tower at 300 km, vacuum.
+/// The spawn rides a dipping conic (0.6-circular): a clearing conic
+/// auto-rails at the first stepped tick now, and the measurement is
+/// the *bubble* step cost — the tower must stay `InBubble` for it.
 fn measure_orbit_1000() -> Result<Measurement, ReplayError> {
     let w = fixture_world()?;
     let env = w
@@ -762,7 +766,7 @@ fn measure_orbit_1000() -> Result<Measurement, ReplayError> {
         tower_craft(1000, false),
         DVec3::new(r, 0.0, 0.0),
         DQuat::IDENTITY,
-        orbital_vel(&env, r),
+        orbital_vel(&env, r) * 0.6,
     )?;
     m.detail.push_str(", 1000 parts at 300 km");
     Ok(m)

@@ -76,11 +76,15 @@ fn hopper_craft(cap: f64, mpu: f64, thrust_n: f64, isp: f64) -> csp_sim::CraftDe
     }
 }
 
-/// Spawn the hopper into a 200 km circular orbit, throttle to full,
-/// and burn the tank dry mid-run — the exact bug shape: the command
-/// stays open after the engine starves. The staged `plumes` must go
-/// from one emitter (delivered ≈ 1, full coverage) to NONE once the
-/// tanks read zero — while `throttle` still reports the held command.
+/// Spawn the hopper onto a 200 km dipping trajectory — the auto
+/// bubble→rails edge keeps it `InBubble` only while the engine
+/// runs, and even then the 0.6-circular dipper is the honest shape:
+/// a clearing conic would rail the moment the burn ended. Throttle
+/// to full, burn the tank dry mid-run — the exact bug shape: the
+/// command stays open after the engine starves. The staged `plumes`
+/// must go from one emitter (delivered ≈ 1, full coverage) to NONE
+/// once the tanks read zero — while `throttle` still reports the
+/// held command.
 #[test]
 fn dry_engine_stages_no_plume() {
     let mut view = View::new().expect("data/ load");
@@ -90,7 +94,10 @@ fn dry_engine_stages_no_plume() {
     };
     let r = radius_m + 200_000.0;
     let pos = body_center + DVec3::new(r, 0.0, 0.0);
-    let vel = DVec3::new(0.0, (mu / r).sqrt(), 0.0);
+    // 0.6-circular: a dipping conic — the auto-rails edge only fires
+    // on a conic clearing the surface/atmosphere floor, and the
+    // vessel stays staged for the whole (short) run.
+    let vel = DVec3::new(0.0, 0.6 * (mu / r).sqrt(), 0.0);
     // 0.1 u of fuel ≈ a few seconds at 200 N — it drains mid-run.
     view.enqueue_command(
         csp_view::SourceClass::Ui,

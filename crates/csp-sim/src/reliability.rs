@@ -394,6 +394,11 @@ pub enum NotificationKind {
     /// An engine's start attempt failed its Bernoulli draw — the
     /// misfire clears when the throttle returns to zero.
     IgnitionMisfire,
+    /// The vessel left the bubble for rails — stamped by
+    /// `apply_to_rails_at`, so it covers the command path AND the
+    /// automatic coasting-above-atmosphere conversion (the
+    /// transition must not be silent).
+    OnRails,
 }
 
 /// A fresh record for one instantiated part — the §3.4 "drawn once at

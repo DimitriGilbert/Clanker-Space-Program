@@ -403,4 +403,14 @@ pub struct PhysicsConfig {
     /// `ToRails`/`ToBubble` conversions and the §2.6.4 latch record use
     /// it as the vessel's rails parent / latched-to body.
     pub dominant: BodyId,
+    /// PLAN §2.3's bubble radius (balance.ron's `bubble_radius_m`,
+    /// 20 km authored): the altitude at which vessels go on rails —
+    /// the rail floor the auto bubble→rails edge and `ToRails` read
+    /// as `radius_m + max(atmosphere.top_m, bubble_radius_m)`, so an
+    /// airless body's low ballistic hop stays physical while an
+    /// atmosphere-having world's floor is the atmosphere top.
+    /// Construction config — never hashed; `serde(default)` keeps
+    /// §7.6 artifacts recorded before the field existed decodable.
+    #[serde(default)]
+    pub bubble_radius_m: f64,
 }

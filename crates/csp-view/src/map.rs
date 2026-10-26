@@ -2400,6 +2400,7 @@ mod tests {
             csp_sim::PhysicsConfig {
                 environment: env,
                 dominant: BodyId::from("p"),
+                bubble_radius_m: csp_sim::DEFAULT_BUBBLE_RADIUS_M,
             },
             1024,
         );

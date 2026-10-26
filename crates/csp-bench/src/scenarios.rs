@@ -157,6 +157,7 @@ fn flight_initial(dir: &Path) -> Result<World, ReplayError> {
         PhysicsConfig {
             environment,
             dominant: BodyId::from("terrin"),
+            bubble_radius_m: csp_sim::DEFAULT_BUBBLE_RADIUS_M,
         },
         balance.advance_to_max_events_per_frame,
     );
@@ -400,6 +401,13 @@ pub fn flight_run(w: &mut World) -> Result<FlightReport, SimError> {
         let frame = FlightFrame::new(rel, vel, &env);
         let mut commands: Vec<SimCommand> = Vec::new();
         let frame_ticks: u64;
+        // The auto bubble→rails edge fires the first tick the conic
+        // clears the floor — mid-ascent, during a coast leg — so the
+        // explicit `ToRails` the Ascend phase used to need is
+        // redundant: a railed vessel promotes straight to Orbit.
+        if !matches!(phase, FlightPhase::Orbit) && w.vessels()[&FLIGHT_VESSEL].orbit().is_some() {
+            phase = FlightPhase::Orbit;
+        }
         match phase {
             FlightPhase::Ascend => {
                 let (cs, ft, next) = ascend_step(&frame, mu, radius);
@@ -413,7 +421,12 @@ pub fn flight_run(w: &mut World) -> Result<FlightReport, SimError> {
                     .orbit()
                     .map(|o| o.elements.clone());
                 // ~8 min on rails — an instant closed-form jump — then
-                // re-materialize for the deorbit leg.
+                // re-materialize for the deorbit leg. The retro throttle
+                // rides the SAME drain: on a clearing conic the auto
+                // bubble→rails edge would re-rail the hull at the very
+                // next tick unless the powered-flight gate already
+                // holds — ToBubble + burn in one batch keeps it
+                // bubble-resident for the deorbit.
                 w.enqueue(SourceClass::Ui, 0, SimCommand::AdvanceTo(clock + 30_000));
                 w.step_frame(clock + 1)?;
                 w.enqueue(
@@ -421,6 +434,23 @@ pub fn flight_run(w: &mut World) -> Result<FlightReport, SimError> {
                     0,
                     SimCommand::ToBubble {
                         vessel: FLIGHT_VESSEL,
+                    },
+                );
+                w.enqueue(
+                    SourceClass::Ui,
+                    0,
+                    SimCommand::SetAttitude {
+                        vessel: FLIGHT_VESSEL,
+                        rot: csp_core::DQuat::IDENTITY,
+                        ang_vel: DVec3::ZERO,
+                    },
+                );
+                w.enqueue(
+                    SourceClass::Ui,
+                    0,
+                    SimCommand::SetThrottle {
+                        vessel: FLIGHT_VESSEL,
+                        throttle: 1.0,
                     },
                 );
                 w.step_frame(w.clock().ticks() + 1)?;

@@ -223,6 +223,15 @@ pub const MAX_TICKS_PER_FRAME: u64 = 69_120;
 /// this mirror to the file so the two can never drift silently.
 pub const DEFAULT_MAX_EVENTS_PER_FRAME: u64 = 2_000;
 
+/// PLAN §2.3's default bubble radius — the no-data mirror of
+/// `data/balance.ron: bubble_radius_m` (20 km authored): the
+/// altitude at which vessels go on rails, read by the auto
+/// bubble→rails edge and `ToRails` as `radius_m + max(top_m,
+/// bubble_radius_m)`. Worlds built from a real data set take the
+/// loaded value through `PhysicsConfig::bubble_radius_m`; a zero
+/// here means "no extra floor beyond the atmosphere/surface".
+pub const DEFAULT_BUBBLE_RADIUS_M: f64 = 20_000.0;
+
 /// §2.6.5's hard per-batch ceiling: one tick's due-event batch fires
 /// atomically in chunks of at most this many events per loop iteration —
 /// the tail *defers to the next iteration* (the clock does not advance
@@ -1140,6 +1149,23 @@ pub enum SimCommand {
         /// The holder to install.
         lease: Lease,
     },
+    /// §3.5's `TerminateVessel` — delete a vessel outright (the
+    /// object-cap/debris-policy verb PLAN names and the pad trap's
+    /// unblock path: a latched hulk occupying the launch site stops
+    /// claiming its berth). No payout, no site bookkeeping — the
+    /// `RecoverVessel` economy leg is the other door. Crew rule
+    /// (documented): a `SurfaceLatched` vessel's aboard crew walk
+    /// home `Unassigned` (parked, not destroyed — the `RecoverVessel`
+    /// roster landing); aboard any other residence they go `Lost`
+    /// with the hull via `remove_vessel`'s `lose_aboard_crew` half.
+    /// Refused while a node burn is executing (cancel with
+    /// `DeleteManeuver` first — the executor's residence rule);
+    /// unknown vessels reject `Recoverable`. Pending events naming
+    /// the vessel scrub inside `remove_vessel`.
+    TerminateVessel {
+        /// The vessel to remove.
+        vessel: VesselId,
+    },
 }
 
 impl SimCommand {
@@ -1186,7 +1212,8 @@ impl SimCommand {
             | Self::EngageAutopilot { vessel, .. }
             | Self::DisengageAutopilot { vessel }
             | Self::SetVesselTracked { vessel, .. }
-            | Self::RecoverVessel { vessel, .. } => Some(*vessel),
+            | Self::RecoverVessel { vessel, .. }
+            | Self::TerminateVessel { vessel } => Some(*vessel),
             _ => None,
         }
     }
@@ -2359,6 +2386,11 @@ struct Physics {
     /// The environment's central body — bubble-frame parent for
     /// `ToRails`/`ToBubble` and the latch record's `body`.
     dominant: BodyId,
+    /// PLAN §2.3's bubble radius — the rail floor is `radius_m +
+    /// max(atmosphere.top_m, bubble_radius_m)` ([`PhysicsConfig`]'s
+    /// doc). Construction config — excluded from the snapshot and
+    /// the hash like the rest of `Physics`.
+    bubble_radius_m: f64,
     /// §2.4.1 Stage-2 derived cache: computed aero tables per
     /// `(vessel, ConfigMask)`, a pure function of the stored craft.
     /// Never serialized, never hashed, never shadowed — a cleared or
@@ -2584,6 +2616,7 @@ impl World {
         w.physics = Some(Physics {
             backend: SimpleBackend::new(physics.environment),
             dominant: physics.dominant,
+            bubble_radius_m: physics.bubble_radius_m,
             aero: BTreeMap::new(),
             thermal_rates: Vec::new(),
         });
@@ -2601,6 +2634,7 @@ impl World {
             physics: self.physics.as_ref().map(|p| PhysicsConfig {
                 environment: p.backend.environment().clone(),
                 dominant: p.dominant.clone(),
+                bubble_radius_m: p.bubble_radius_m,
             }),
             experiments: self.experiments.clone(),
             parts: self.parts.clone(),
@@ -3180,6 +3214,7 @@ impl World {
             physics: physics.map(|p| Physics {
                 backend: SimpleBackend::new(p.environment),
                 dominant: p.dominant,
+                bubble_radius_m: p.bubble_radius_m,
                 aero: BTreeMap::new(),
                 thermal_rates: Vec::new(),
             }),
@@ -3648,6 +3683,12 @@ impl World {
     /// bubble-resident body rests on it, in which case it stays
     /// `InBubble` as a static collider in the batch until the
     /// supporter moves on.
+    ///
+    /// Returns the tick the range actually reached — `t_next`, or the
+    /// earlier tick the auto bubble→rails conversion fired at. An
+    /// early end is a real tick boundary (the conversion stamps
+    /// epoch-anchored elements there), so the caller advances clock,
+    /// subsystems, and event firing to the returned tick only.
     #[allow(
         clippy::too_many_lines,
         clippy::too_many_arguments,
@@ -3662,14 +3703,14 @@ impl World {
         rejected: &mut Vec<RejectedCommand>,
         shadow: &mut TickShadow,
         degraded: &mut Vec<SimError>,
-    ) -> Result<(), SimError> {
+    ) -> Result<u64, SimError> {
         if self.physics.is_none()
             || !self
                 .vessels
                 .values()
                 .any(|v| matches!(v.state, VesselState::InBubble(_)))
         {
-            return Ok(());
+            return Ok(t_next);
         }
         // The arena shadow precedes EVERY write this range makes —
         // `ensure_aero` below stamps `body.aero` inside the arena, so
@@ -3702,6 +3743,19 @@ impl World {
         // processed once, after the tick loop, when `self` is whole
         // again and the rails conversion can be attempted.
         let mut burns_done: BTreeSet<VesselId> = BTreeSet::new();
+        // The auto bubble→rails conversion (§2.6.2's missing edge):
+        // the FIRST tick a coasting vessel's conic clears the
+        // surface + atmosphere top forces the range to end there —
+        // the `transition_latched` precedent. The qualifying tick
+        // is a pure function of the trajectory (per-tick stepping is
+        // partition-independent), so every §2.6.1 partition converts
+        // at the same tick and stamps identical epoch-anchored
+        // elements; converting only at the caller's range end would
+        // make the stamped conic partition-dependent. The candidates
+        // are re-validated through `apply_to_rails_at` below, so the
+        // detection predicate mirrors that function's refusals
+        // exactly plus the coasting rule.
+        let mut rail_break: Option<(u64, Vec<VesselId>)> = None;
         for t in now..t_next {
             // M9a §2.10: a bubble tick IS a tick boundary — drain the
             // previous tick's control-pass commands (stamped `t`;
@@ -4418,7 +4472,62 @@ impl World {
                 t + 1,
                 degraded,
             )?;
+            // Auto bubble→rails detection — runs on this tick's
+            // settled state (post-latch, post-consequence), the same
+            // predicates `apply_to_rails_at` enforces plus the
+            // coasting rules: `throttle == 0`, no maneuver (the burn
+            // executor's residence is `finish_burns`' business), not
+            // settle-latched. The cheap gates run for every body; the
+            // contact/conic checks only for coasters above the
+            // atmosphere top.
+            {
+                let env = physics.backend.environment();
+                // Terrain is body-fixed — the sample phase is the
+                // completed tick's, matching `surface_pose_capture`
+                // and the `set_sim_time(epoch)` the conversion itself
+                // applies.
+                physics.backend.set_sim_time(SimTime::from_ticks(t + 1));
+                let atm_top = env.atmosphere.as_ref().map_or(0.0, |a| a.top_m);
+                let mut candidates: Vec<VesselId> = Vec::new();
+                for (vid, vessel) in vessels.iter() {
+                    let VesselState::InBubble(body) = &vessel.state else {
+                        continue;
+                    };
+                    if vessel.maneuver.is_some() || body.throttle != 0.0 || body.settle.latched {
+                        continue;
+                    }
+                    let rel = body.com_world() - env.body_center;
+                    if rel.norm() - env.radius_m < atm_top {
+                        continue;
+                    }
+                    if physics.backend.ground_contact(body)
+                        || bubble_vessel_contact(&physics.backend, vessels, *vid, body, false)
+                    {
+                        continue;
+                    }
+                    let Ok(elements) =
+                        orbit::cartesian_to_elements(rel, body.vel, env.mu_m3_per_s2)
+                    else {
+                        continue;
+                    };
+                    let h2 = rel.cross(body.vel).norm_squared();
+                    let rp = h2 / env.mu_m3_per_s2 / (1.0 + elements.eccentricity);
+                    // The same floor `apply_to_rails_at` enforces:
+                    // atmosphere top, or PLAN §2.3's bubble radius
+                    // where there is no atmosphere.
+                    let floor = env.radius_m + atm_top.max(physics.bubble_radius_m);
+                    if rp.partial_cmp(&floor) != Some(core::cmp::Ordering::Greater) {
+                        continue;
+                    }
+                    candidates.push(*vid);
+                }
+                if !candidates.is_empty() {
+                    rail_break = Some((t + 1, candidates));
+                    break;
+                }
+            }
         }
+        let range_end = rail_break.as_ref().map(|(end, _)| *end).unwrap_or(t_next);
         // M9a: restore the pre-range clock — `step_frame`'s
         // `try_advance` moves `now → t_next` as before.
         self.clock = SimTime::from_ticks(now);
@@ -4447,7 +4556,42 @@ impl World {
         for vid in latched_total {
             self.contract_notify(&contracts::ContractTrigger::SurfaceLatched(vid), shadow)?;
         }
-        self.finish_burns(&burns_done, t_next, shadow, degraded)
+        self.finish_burns(&burns_done, range_end, shadow, degraded)?;
+        // The auto bubble→rails conversion — the candidates detected
+        // at the break tick re-apply through `apply_to_rails_at`, the
+        // same path `ToRails` and `finish_burns` take, so the stamp
+        // (epoch `range_end`), the notice, and the SOI publish are
+        // identical to a commanded conversion. A candidate whose
+        // residence moved under the post-loop passes is skipped; the
+        // `finish_burns` convention covers the post-stamp failure
+        // hole (`Recoverable` rides `degraded`, a bare `SoiRescan`
+        // republishes so the publish deadline is never lost).
+        if let Some((_, candidates)) = rail_break {
+            for vid in candidates {
+                let bubble = self
+                    .vessels
+                    .get(&vid)
+                    .is_some_and(|v| matches!(v.state, VesselState::InBubble(_)));
+                if !bubble {
+                    continue;
+                }
+                match self.apply_to_rails_at(vid, SimTime::from_ticks(range_end), shadow) {
+                    Ok(()) => {}
+                    Err(e @ SimError::Fatal(_)) => return Err(e),
+                    Err(e) => {
+                        degraded.push(e);
+                        if self.vessels.get(&vid).is_some_and(|v| v.orbit().is_some()) {
+                            self.schedule_event(
+                                EventKind::SoiRescan { vessel: vid },
+                                range_end.saturating_add(DEGRADED_RESCAN_TICKS),
+                                shadow,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(range_end)
     }
 
     /// M5 burn completions: the node delivered its Δv — consume it
@@ -4934,6 +5078,9 @@ impl World {
             SimCommand::RecoverVessel { vessel, site } => {
                 self.apply_recover_vessel(*vessel, site, shadow)?
             }
+            SimCommand::TerminateVessel { vessel } => {
+                self.apply_terminate_vessel(*vessel, shadow)?
+            }
             SimCommand::HireCrew {
                 name,
                 kind,
@@ -5128,6 +5275,55 @@ impl World {
                 .ok_or(SimError::Fatal("take_control: vessel vanished mid-apply"))?;
             v.control_lease = lease;
         }
+        Ok(())
+    }
+
+    /// `TerminateVessel` — §3.5's object-cap removal verb (the
+    /// variant's doc). Unlike `RecoverVessel` nothing pays out: this
+    /// is the hulk/debris/pad-trap cleanup path, not the recovery
+    /// economy. Refused while a node burn executes — the executor
+    /// owns the vessel until `DeleteManeuver` hands the stick back.
+    /// A `SurfaceLatched` vessel's aboard crew walk home
+    /// `Unassigned` before the removal (parked craft, recovered
+    /// people — the `RecoverVessel` roster rule); every other
+    /// residence leaves them aboard, so `remove_vessel`'s
+    /// `lose_aboard_crew` marks them `Lost` with the hull. The
+    /// removal scrubs pending vessel-named events, the tracked
+    /// opt-in, any bound autopilot, and — for a latched hulk — the
+    /// pose's occupancy claim on the pad.
+    fn apply_terminate_vessel(
+        &mut self,
+        vessel: VesselId,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        let (latched, crew_ids) = {
+            let Some(v) = self.vessels.get(&vessel) else {
+                return Err(SimError::Recoverable("terminate: unknown vessel"));
+            };
+            if matches!(
+                v.maneuver.as_ref().map(|n| &n.status),
+                Some(ManeuverStatus::Burning(_))
+            ) {
+                return Err(SimError::Recoverable(
+                    "terminate: burn in progress — delete the node first",
+                ));
+            }
+            (
+                matches!(v.state, VesselState::SurfaceLatched(_)),
+                v.crew.iter().map(|c| c.id).collect::<Vec<_>>(),
+            )
+        };
+        if latched && !crew_ids.is_empty() {
+            self.shadow_economy(shadow);
+            for id in crew_ids {
+                if let Some(m) = self.economy.crew.get_mut(&id)
+                    && m.location == CrewLocation::Vessel(vessel)
+                {
+                    m.location = CrewLocation::Unassigned;
+                }
+            }
+        }
+        self.remove_vessel(vessel, shadow);
         Ok(())
     }
 
@@ -5664,8 +5860,12 @@ impl World {
                     .as_ref()
                     .ok_or(SimError::Fatal("to-rails: physics vanished"))?;
                 // Terrain is body-fixed — the contact predicate
-                // samples it at the state's spin phase.
-                physics.backend.set_sim_time(self.clock);
+                // samples it at the stamped state's own spin phase
+                // (`epoch`, which runs ahead of the clock when the
+                // executor's range-end conversion calls here — the
+                // `self.clock` sample used to read the range-START
+                // phase, ω·(epoch−clock) stale).
+                physics.backend.set_sim_time(epoch);
                 if physics.backend.ground_contact(body)
                     || bubble_vessel_contact(&physics.backend, &self.vessels, vessel, body, false)
                 {
@@ -5681,14 +5881,28 @@ impl World {
             // (`pos = com_world − rot·com_local`).
             let (r, v2) = (body.com_world() - env.body_center, body.vel);
             let elements = orbit::cartesian_to_elements(r, v2, env.mu_m3_per_s2)?;
-            // The conic must clear the surface — an orbit that
-            // intersects the planet has no rails reading.
+            // The conic must clear the surface AND the atmosphere top —
+            // an orbit that intersects the planet has no rails reading,
+            // and an atmosphere-dipping one has no honest rails reading
+            // either: on rails there is no drag and no re-entry event,
+            // so the vessel would orbit through the atmosphere
+            // untouched forever (the `min_node_r` floor `SetManeuver`
+            // applies to the burn's end state is the same bound).
             let h2 = r.cross(v2).norm_squared();
             let e = elements.eccentricity;
             let rp = h2 / env.mu_m3_per_s2 / (1.0 + e);
-            if rp.partial_cmp(&env.radius_m) != Some(core::cmp::Ordering::Greater) {
+            // The rail floor: atmosphere top where there is one, else
+            // PLAN §2.3's bubble radius (`bubble_radius_m`) — an
+            // airless body's low ballistic hop stays physical.
+            let floor = env.radius_m
+                + env
+                    .atmosphere
+                    .as_ref()
+                    .map_or(0.0, |a| a.top_m)
+                    .max(self.physics.as_ref().map_or(0.0, |p| p.bubble_radius_m));
+            if rp.partial_cmp(&floor) != Some(core::cmp::Ordering::Greater) {
                 return Err(SimError::Recoverable(
-                    "to-rails: conic intersects the surface",
+                    "to-rails: conic dips below the surface/atmosphere floor",
                 ));
             }
             elements
@@ -5734,6 +5948,19 @@ impl World {
             // to the stamped tick, not the clock.
             self.schedule_debris_decay(vessel, &orbit.elements, epoch, shadow)?;
         }
+        // The transition must not be silent — the auto-conversion
+        // path rails a coasting vessel with no command behind it, so
+        // the notice rides the (unhashed) notification log: "vessel N
+        // on rails" shows in the Program LOG either way.
+        self.notify(
+            reliability::Notification {
+                tick: epoch.ticks(),
+                vessel,
+                node: None,
+                kind: reliability::NotificationKind::OnRails,
+            },
+            shadow,
+        );
         // M7-D: the rails stamp is an orbit-achieved transition —
         // the contract predicates evaluate now.
         self.contract_notify(&contracts::ContractTrigger::OrbitAchieved(vessel), shadow)?;
@@ -5942,6 +6169,31 @@ impl World {
         // `pos = com_world − rot·com_local`.
         body.pos = r + center - body.rot.rotate(body.com_local);
         body.vel = vel;
+        {
+            // The materialization gates the spawn rule already knows:
+            // a hull stamped penetrating the terrain surface (the
+            // displaced heightfield at this tick's spin phase) would
+            // start intersecting the ground — refuse rather than
+            // spawn underground; a hull stamped inside a resident's
+            // claimed volume would ghost-overlap forever (coincident
+            // hulls produce no contacts — the
+            // `apply_spawn_physical` occupancy note). The would-be
+            // vessel is still `OnRails` here, so the occupancy scan
+            // cannot collide with itself.
+            let physics = self
+                .physics
+                .as_ref()
+                .ok_or(SimError::Fatal("to-bubble: physics vanished"))?;
+            physics.backend.set_sim_time(self.clock);
+            if physics.backend.ground_contact(&body) {
+                return Err(SimError::Recoverable(
+                    "to-bubble: materialization penetrates the surface",
+                ));
+            }
+        }
+        if self.spawn_site_occupied_by(&body) {
+            return Err(SimError::Recoverable("to-bubble: volume occupied"));
+        }
         let vessel_mut = self
             .vessels
             .get_mut(&vessel)
@@ -7899,9 +8151,15 @@ impl World {
             // vessel, warp-independent. An empty interval (flush
             // iteration) drives nothing — both calls skip on `t_next ==
             // now` (`now..t_next` is empty; the subsystem advance is
-            // guarded).
-            if t_next > now
-                && let Err(e) = self.step_bubble_range(
+            // guarded). The range can end EARLY at a tick the auto
+            // bubble→rails conversion fired on — `range_end` is then
+            // that boundary: subsystems advance, the clock lands, and
+            // events fire against it exactly as if `t_next` had been
+            // computed there (a conversion boundary is just another
+            // deterministic tick boundary).
+            let mut range_end = t_next;
+            if t_next > now {
+                match self.step_bubble_range(
                     now,
                     t_next,
                     &mut effective_target,
@@ -7909,15 +8167,18 @@ impl World {
                     &mut rejected,
                     &mut shadow,
                     &mut degraded,
-                )
-            {
-                shadow.restore(self);
-                return Err(e);
+                ) {
+                    Ok(end) => range_end = end,
+                    Err(e) => {
+                        shadow.restore(self);
+                        return Err(e);
+                    }
+                }
             }
-            if t_next > now
+            if range_end > now
                 && let Err(e) = self.advance_interval_subsystems(
                     SimTime::from_ticks(now),
-                    SimTime::from_ticks(t_next),
+                    SimTime::from_ticks(range_end),
                     &mut shadow,
                     &mut degraded,
                 )
@@ -7925,16 +8186,16 @@ impl World {
                 shadow.restore(self);
                 return Err(e);
             }
-            // t_next >= now by construction — the subtraction cannot
+            // range_end >= now by construction — the subtraction cannot
             // underflow; `advance == 0` on a flush iteration.
-            let advance = t_next - now;
+            let advance = range_end - now;
             if let Err(e) = self.clock.try_advance(advance) {
                 shadow.restore(self);
                 return Err(e);
             }
             tick_budget -= advance;
             if let Err(e) = self.fire_due_events(
-                t_next,
+                range_end,
                 &mut events_processed,
                 &mut fired_events,
                 &mut degraded,
@@ -12140,6 +12401,7 @@ mod tests {
     /// scan phasing, seq assignment, per-tick bubble stepping — the
     /// hash would diverge.
     #[test]
+    #[allow(clippy::too_many_lines)] // one equivalence claim, one body
     fn warp_x1_vs_x1e5_equivalence_10_sim_days() {
         // §3.0's sim-day is Terrin's 21600 s rotation period.
         const DAY_TICKS: u64 = 21_600 * 64;
@@ -12152,6 +12414,7 @@ mod tests {
                 PhysicsConfig {
                     environment: test_env(true),
                     dominant: BodyId::from("p"),
+                    bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
                 },
                 DEFAULT_MAX_EVENTS_PER_FRAME,
             );
@@ -12227,10 +12490,15 @@ mod tests {
         sb.max_advance = sb.max_advance.max(sb2.max_advance);
         assert_eq!(a.clock().ticks(), TEN_DAYS);
         assert_eq!(b.clock().ticks(), TEN_DAYS);
-        // The mask is genuinely populated: vessel 2 is bubble-resident
-        // in both runs at the end.
+        // Vessel 2's dipping conic kept it InBubble through ~36k real
+        // per-tick steps in BOTH runs (the bubble-stepping claim
+        // stays honest) until the descent reached the surface — the
+        // touchdown and its aftermath are per-tick-identical too, so
+        // whatever the mask holds at the end, it holds in both, and
+        // the resident itself is out of the bubble in both.
         assert_eq!(a.in_bubble_ids(), b.in_bubble_ids());
-        assert_eq!(a.in_bubble_ids(), BTreeSet::from([2u64]));
+        assert!(!a.in_bubble_ids().contains(&2u64));
+        assert!(!b.in_bubble_ids().contains(&2u64));
         // Granularity pin: run a really is the ×1 shape (~TEN_DAYS/64
         // calls of ≤64 ticks) and run b really is the ×10⁵ shape (single
         // calls advancing ≫64 ticks, ~MAX_TICKS_PER_FRAME apart) — the
@@ -12622,6 +12890,7 @@ mod tests {
         Some(PhysicsConfig {
             environment: test_env(false),
             dominant: BodyId::from("p"),
+            bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
         })
     }
 
@@ -13199,25 +13468,44 @@ mod tests {
             PhysicsConfig {
                 environment: test_env(spin),
                 dominant: BodyId::from("p"),
+                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
             },
             DEFAULT_MAX_EVENTS_PER_FRAME,
         )
     }
 
     /// Spawn `craft` — drains at tick 0; asserts the vessel is resident.
+    /// A clearing conic auto-rails at the first stepped tick (the new
+    /// bubble→rails edge), so `OnRails` counts as resident here.
     fn spawn_physical(w: &mut World, cmd: SimCommand) {
         w.enqueue(SourceClass::Ui, 0, cmd);
         w.step_frame(1).unwrap();
         assert!(matches!(
             w.vessels()[&VesselId(0)].state,
-            VesselState::InBubble(_)
+            VesselState::InBubble(_) | VesselState::OnRails(_)
         ));
     }
 
-    /// Enqueue a `SpawnPhysicalVessel` for a ballistic orbiter 200 km
-    /// over Terrin — above `top_m`, circular, never latching: the
-    /// equivalence test's mid-run `InBubble` resident. The spawn drains
-    /// at the caller's next tick boundary.
+    /// A spawn velocity that keeps a 200 km resident `InBubble` —
+    /// the auto bubble→rails conversion would rail a coasting
+    /// *clearing* conic at the first stepped tick, so fixtures that
+    /// exercise in-bubble physics ride a 0.6-circular dipping conic
+    /// (periapsis below the surface/atmosphere floor: a suborbital
+    /// hop IS a bubble flight). The vessel coasts near apoapsis for
+    /// tens of thousands of ticks — longer than any fixture runs.
+    fn in_bubble_vel(r: f64) -> DVec3 {
+        DVec3::new(0.0, 0.6 * libm::sqrt(3.5316e12 / r), 0.0)
+    }
+
+    /// Enqueue a `SpawnPhysicalVessel` for a ballistic resident 200 km
+    /// over Terrin — above `top_m`, on the 0.6-circular dipping conic:
+    /// the auto bubble→rails edge never takes it (periapsis below the
+    /// surface), so it ticks per-tick physics for tens of thousands of
+    /// ticks — long enough for the script/lease/rollback fixtures that
+    /// need an honest `InBubble` vessel — before the descent finally
+    /// impacts the surface and the resident is removed, identically in
+    /// every partition. The spawn drains at the caller's next tick
+    /// boundary.
     fn enqueue_orbiter(w: &mut World) {
         let hi = DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0);
         w.enqueue(
@@ -13227,7 +13515,7 @@ mod tests {
                 craft: box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0),
                 pos: hi,
                 rot: csp_core::DQuat::IDENTITY,
-                vel: DVec3::new(0.0, libm::sqrt(3.5316e12 / hi.norm()), 0.0),
+                vel: in_bubble_vel(hi.norm()),
                 ang_vel: DVec3::ZERO,
             },
         );
@@ -13549,6 +13837,7 @@ mod tests {
             PhysicsConfig {
                 environment: env,
                 dominant: BodyId::from("p"),
+                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
             },
             DEFAULT_MAX_EVENTS_PER_FRAME,
         );
@@ -14034,6 +14323,7 @@ mod tests {
             Some(PhysicsConfig {
                 environment: test_env(true),
                 dominant: BodyId::from("p"),
+                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
             })
         };
         let mut r1 = World::restore(test_system(), physics(), snap.clone()).unwrap();
@@ -14327,9 +14617,13 @@ mod tests {
         );
     }
 
-    /// Bubble→rails→bubble: `ToRails` stamps elements from the
-    /// osculating state; `ToBubble` re-materializes at the advanced
-    /// conic's position — and the dead SOI events are dropped.
+    /// Bubble→rails→bubble: a clearing conic auto-rails at the first
+    /// stepped tick (the §2.6.2 edge — no `ToRails` needed);
+    /// `ToBubble` re-materializes at the advanced conic's position —
+    /// and the dead SOI events are dropped. The bubble leg rides a
+    /// *dipping* conic: on a clearing one the auto edge would re-rail
+    /// the vessel at the very next tick (the inversion, seen in
+    /// reverse).
     #[test]
     fn bubble_rails_bubble_roundtrip() {
         let mut w = physics_world(true);
@@ -14345,22 +14639,22 @@ mod tests {
                 ang_vel: DVec3::ZERO,
             },
         );
-        w.step_frame(129).unwrap();
-        w.enqueue(
-            SourceClass::Ui,
-            0,
-            SimCommand::ToRails {
-                vessel: VesselId(0),
-            },
-        );
-        w.step_frame(130).unwrap();
+        // Already on rails — the auto edge fired during `step_frame(1)`.
         let orbit = w.vessels()[&VesselId(0)].orbit().unwrap().clone();
         let a = orbit.elements.semi_major_axis_m;
         assert!((a - hi.norm()).abs() / a < 1e-3);
         assert!(orbit.elements.eccentricity < 0.01);
-        // Advance on rails (instant jump), then come back.
-        w.enqueue(SourceClass::Ui, 0, SimCommand::AdvanceTo(130 + 60_000));
-        w.step_frame(131).unwrap();
+        // Advance on rails (instant jump), then come back on a
+        // *dipping* conic so the materialization holds.
+        w.enqueue(SourceClass::Ui, 0, SimCommand::AdvanceTo(1 + 60_000));
+        w.step_frame(2).unwrap();
+        let elements =
+            orbit::cartesian_to_elements(hi, in_bubble_vel(hi.norm()), 3.5316e12).unwrap();
+        w.vessels.get_mut(&VesselId(0)).unwrap().state = VesselState::OnRails(OrbitState {
+            parent: BodyId::from("p"),
+            elements,
+            epoch: w.clock(),
+        });
         w.enqueue(
             SourceClass::Ui,
             0,
@@ -14381,6 +14675,13 @@ mod tests {
                 .iter()
                 .all(|e| !event_names_vessel(&e.kind, &VesselId(0)))
         );
+        // And it stays InBubble — the dipping conic never qualifies
+        // for the auto edge.
+        w.step_frame(w.clock().ticks() + 1_000).unwrap();
+        assert!(matches!(
+            w.vessels()[&VesselId(0)].state,
+            VesselState::InBubble(_)
+        ));
     }
 
     /// §2.6.2's `ToRails` refusals: atmosphere, contact, intersecting
@@ -14512,6 +14813,7 @@ mod tests {
             Some(PhysicsConfig {
                 environment: test_env(false),
                 dominant: BodyId::from("p"),
+                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
             }),
             snap.clone(),
         )
@@ -14537,6 +14839,7 @@ mod tests {
                 Some(PhysicsConfig {
                     environment: test_env(false),
                     dominant: BodyId::from("p"),
+                    bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
                 }),
                 broken
             ),
@@ -15075,6 +15378,7 @@ mod tests {
             Some(PhysicsConfig {
                 environment: test_env(false),
                 dominant: BodyId::from("p"),
+                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
             }),
             snap,
         )
@@ -15264,6 +15568,7 @@ mod tests {
             Some(PhysicsConfig {
                 environment: test_env(false),
                 dominant: BodyId::from("p"),
+                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
             }),
             snap,
         )
@@ -15360,6 +15665,7 @@ mod tests {
         let mut physics = Physics {
             backend: SimpleBackend::new(test_env(false)),
             dominant: BodyId::from("p"),
+            bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
             aero: BTreeMap::new(),
             thermal_rates: Vec::new(),
         };
@@ -15613,8 +15919,8 @@ mod tests {
         );
         w.step_frame(w.clock().ticks() + 1).unwrap();
         let id = VesselId(0);
-        w.enqueue(SourceClass::Ui, 0, SimCommand::ToRails { vessel: id });
-        w.step_frame(w.clock().ticks() + 1).unwrap();
+        // The auto bubble→rails edge already converted the clearing
+        // conic at the first stepped tick — no command needed.
         assert!(
             w.vessels()[&id].orbit().is_some(),
             "orbiter failed to reach rails"
@@ -15814,13 +16120,16 @@ mod tests {
         let r = w.step_frame(w.clock().ticks() + 1).unwrap();
         assert!(r.rejected.is_empty());
         assert!(w.vessels()[&id].maneuver.is_none());
-        assert_eq!(w.vessels()[&id].body().unwrap().throttle, 0.0);
-        assert!(matches!(w.vessels()[&id].state, VesselState::InBubble(_)));
+        // The cancel leaves a coasting vessel on a clearing conic —
+        // the auto bubble→rails edge takes it on the next tick (the
+        // old "no free rails ride" stay-in-bubble rule IS the ride
+        // now: the conic belongs on rails).
+        assert!(w.vessels()[&id].orbit().is_some());
         // And it stays where the cancel left it — the burn never
         // resumes.
         w.step_frame(w.clock().ticks() + 1_000).unwrap();
         assert!(w.vessels()[&id].maneuver.is_none());
-        assert_eq!(w.vessels()[&id].body().unwrap().throttle, 0.0);
+        assert!(w.vessels()[&id].orbit().is_some());
     }
 
     /// `DeleteManeuver` on a `Scheduled` node drops the pending event
@@ -15865,6 +16174,7 @@ mod tests {
             Some(PhysicsConfig {
                 environment: test_env(false),
                 dominant: BodyId::from("p"),
+                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
             }),
             snap,
         )
@@ -16044,6 +16354,7 @@ mod tests {
             PhysicsConfig {
                 environment: test_env(false),
                 dominant: BodyId::from("p"),
+                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
             },
             DEFAULT_MAX_EVENTS_PER_FRAME,
         );
@@ -16060,17 +16371,8 @@ mod tests {
             },
         );
         w.step_frame(1).unwrap();
-        w.enqueue(
-            SourceClass::Ui,
-            0,
-            SimCommand::ToRails {
-                vessel: VesselId(0),
-            },
-        );
-        let r = w.step_frame(2).unwrap();
-        assert!(r.rejected.is_empty(), "to-rails rejected: {:?}", r.rejected);
-        // The stamped conic's measured transit interval through the
-        // aimed SOI — the events' true ticks on the vessel's orbit.
+        // The clearing transit conic auto-railed at the first stepped
+        // tick — no `ToRails` needed.
         let orbit = w.vessels()[&VesselId(0)].orbit().cloned().unwrap();
         let moon = OrbitState {
             parent: BodyId::from("p"),
@@ -16733,6 +17035,7 @@ mod tests {
             PhysicsConfig {
                 environment: test_env(false),
                 dominant: BodyId::from("terrin"),
+                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
             },
             DEFAULT_MAX_EVENTS_PER_FRAME,
         );
@@ -16749,9 +17052,7 @@ mod tests {
         );
         w.step_frame(1).unwrap();
         let id = VesselId(0);
-        w.enqueue(SourceClass::Ui, 0, SimCommand::ToRails { vessel: id });
-        let r = w.step_frame(2).unwrap();
-        assert!(r.rejected.is_empty(), "to-rails rejected: {:?}", r.rejected);
+        // The clearing parking conic auto-railed at tick 1.
         assert!(w.vessels()[&id].orbit().is_some());
         assert!(
             w.clock().ticks() < inj.t_b,
@@ -16937,7 +17238,7 @@ mod tests {
         rot_b: DQuat,
     ) -> AdvanceReport {
         let base = DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0);
-        let v = DVec3::new(0.0, libm::sqrt(3.5316e12 / base.norm()), 0.0);
+        let v = in_bubble_vel(base.norm());
         w.enqueue(
             SourceClass::Ui,
             0,
@@ -17086,7 +17387,7 @@ mod tests {
         // B closing at 2 m/s along the port axis: the pair enters
         // range during the approach, captures, and damps.
         let base = DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0);
-        let v = DVec3::new(0.0, libm::sqrt(3.5316e12 / base.norm()), 0.0);
+        let v = in_bubble_vel(base.norm());
         w.enqueue(
             SourceClass::Ui,
             0,
@@ -17145,7 +17446,7 @@ mod tests {
         assert_eq!(w.joints().len(), 1);
         let far = DVec3::new(500.0, 0.0, 0.0);
         let base = DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0);
-        let v = DVec3::new(0.0, libm::sqrt(3.5316e12 / base.norm()), 0.0);
+        let v = in_bubble_vel(base.norm());
         w.enqueue(
             SourceClass::Ui,
             0,
@@ -17207,7 +17508,7 @@ mod tests {
             c
         };
         let base = DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0);
-        let v = DVec3::new(0.0, libm::sqrt(3.5316e12 / base.norm()), 0.0);
+        let v = in_bubble_vel(base.norm());
         w.enqueue(
             SourceClass::Ui,
             0,
@@ -17265,10 +17566,11 @@ mod tests {
             Some(PhysicsConfig {
                 environment: test_env(false),
                 dominant: BodyId::from("p"),
+                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
             })
         };
         let base = DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0);
-        let v = DVec3::new(0.0, libm::sqrt(3.5316e12 / base.norm()), 0.0);
+        let v = in_bubble_vel(base.norm());
         let mut w = physics_world(false);
         w.set_docking_config(latch_off()).unwrap();
         for (pos, rot) in [
@@ -17528,7 +17830,7 @@ mod tests {
         // Two welded bodies at arbitrary poses/velocities — the
         // conservation claim is about the stamps, not the trajectory.
         let base = DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0);
-        let v = DVec3::new(0.0, libm::sqrt(3.5316e12 / base.norm()), 0.0);
+        let v = in_bubble_vel(base.norm());
         let mut vessels = BTreeMap::new();
         let mut mk = |id: u64, pos, rot: DQuat, vel, av| {
             let craft = port_craft(csp_data::PortSize::Small);
@@ -17569,6 +17871,7 @@ mod tests {
         let mut physics = Physics {
             backend: SimpleBackend::new(test_env(false)),
             dominant: BodyId::from("p"),
+            bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
             aero: BTreeMap::new(),
             thermal_rates: Vec::new(),
         };
@@ -17763,7 +18066,7 @@ mod tests {
         // exact-unit (identity / a 180° flip) so every transform
         // composition below is bitwise exact.
         let base = DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0);
-        let v = DVec3::new(0.0, libm::sqrt(3.5316e12 / base.norm()), 0.0);
+        let v = in_bubble_vel(base.norm());
         w.vessels
             .insert(VesselId(0), port_vessel(0, base, DQuat::IDENTITY, v));
         w.vessels.insert(
@@ -17833,7 +18136,7 @@ mod tests {
     fn undock_middle_seam_splits_chain_and_partitions_seams() {
         let mut w = physics_world(false);
         let base = DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0);
-        let v = DVec3::new(0.0, libm::sqrt(3.5316e12 / base.norm()), 0.0);
+        let v = in_bubble_vel(base.norm());
         // Three equal-mass segments — the `vessel_a` tie-break makes
         // id 0 the absorber at latch 1; at latch 2 the merged station
         // (2000 kg) outweighs C and absorbs again.
@@ -17939,7 +18242,7 @@ mod tests {
             size: csp_data::PortSize::Small,
         });
         let base = DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0);
-        let v = DVec3::new(0.0, libm::sqrt(3.5316e12 / base.norm()), 0.0);
+        let v = in_bubble_vel(base.norm());
         w.enqueue(
             SourceClass::Ui,
             0,
@@ -18041,6 +18344,7 @@ mod tests {
             Some(PhysicsConfig {
                 environment: test_env(false),
                 dominant: BodyId::from("p"),
+                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
             })
         };
         let mut w = physics_world(false);
@@ -18561,6 +18865,310 @@ mod tests {
         assert_eq!(w.vessels().len(), 2);
     }
 
+    /// §2.6.2's bubble→rails edge: a launched vessel whose conic
+    /// clears the surface AND the atmosphere top converts to
+    /// `OnRails` at the first tick it coasts there — no `ToRails`
+    /// command, no player-facing producer needed. The transition
+    /// rides the notice log and publishes the SOI deadline, so the
+    /// orbit contract, maneuver, and transfer systems all wake.
+    #[test]
+    fn auto_rails_converts_a_coasting_orbiter() {
+        let mut w = physics_world(false);
+        let hi = DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0);
+        enqueue_physical(
+            &mut w,
+            box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0),
+            hi,
+        );
+        // `enqueue_physical`'s dipping conic stays InBubble forever —
+        // no conversion while the conic dips below the floor.
+        w.step_frame(500).unwrap();
+        assert!(matches!(
+            w.vessels()[&VesselId(0)].state,
+            VesselState::InBubble(_)
+        ));
+        // The clearing conic converts at the first stepped tick.
+        let v_circ = libm::sqrt(3.5316e12 / hi.norm());
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SpawnPhysicalVessel {
+                craft: box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0),
+                pos: hi,
+                rot: csp_core::DQuat::IDENTITY,
+                vel: DVec3::new(0.0, v_circ, 0.0),
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 2).unwrap();
+        assert!(
+            w.vessels()[&VesselId(1)].orbit().is_some(),
+            "coasting orbiter must auto-rail"
+        );
+        assert!(
+            w.notifications()
+                .iter()
+                .any(|n| matches!(n.kind, reliability::NotificationKind::OnRails)
+                    && n.vessel == VesselId(1)),
+            "the conversion must surface on the notice log"
+        );
+    }
+
+    /// The edge waits for the throttle: a powered vessel stays
+    /// `InBubble`; cutting to zero frees the coasting check and the
+    /// clearing conic converts on the next tick.
+    #[test]
+    fn auto_rails_waits_for_coast() {
+        let mut w = physics_world(false);
+        let hi = DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0);
+        let v_circ = libm::sqrt(3.5316e12 / hi.norm());
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SpawnPhysicalVessel {
+                craft: fueled_engine_craft(1_000.0, 5.0, 5_000.0, 300.0),
+                pos: hi,
+                rot: csp_core::DQuat::IDENTITY,
+                vel: DVec3::new(0.0, v_circ, 0.0),
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        // The throttle must land in the same drain — an unpowered
+        // first tick would rail the clearing conic immediately.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SetThrottle {
+                vessel: VesselId(0),
+                throttle: 0.5,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 4).unwrap();
+        assert!(
+            matches!(w.vessels()[&VesselId(0)].state, VesselState::InBubble(_)),
+            "thrusting flight stays in the bubble"
+        );
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SetThrottle {
+                vessel: VesselId(0),
+                throttle: 0.0,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 2).unwrap();
+        assert!(
+            w.vessels()[&VesselId(0)].orbit().is_some(),
+            "throttle cut frees the auto-rails edge"
+        );
+    }
+
+    /// `ToBubble`'s new materialization gates: a conic point that
+    /// would stamp the hull penetrating the terrain or inside a
+    /// resident's claimed volume refuses `Recoverable` — the
+    /// coincident-hull ghost-overlap cannot be re-materialized.
+    #[test]
+    fn to_bubble_gates_penetration_and_occupancy() {
+        let mut w = physics_world(false);
+        // A latched hulk claims the volume at `pos`.
+        let pos = DVec3::new(TERRIN_R + 50.0, 0.0, 0.0);
+        enqueue_parked(
+            &mut w,
+            box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0),
+            pos,
+        );
+        w.step_frame(1).unwrap();
+        w.vessels.get_mut(&VesselId(0)).unwrap().state = VesselState::SurfaceLatched(SurfacePose {
+            body: BodyId::from("p"),
+            latitude_rad: 0.0,
+            longitude_rad: 0.0,
+            altitude_m: 50.0,
+            orientation: DQuat::IDENTITY,
+        });
+        // Vessel 1 rides a hand-stamped OnRails conic whose current
+        // point sits inside the hulk's claimed volume.
+        let elements =
+            orbit::cartesian_to_elements(pos, in_bubble_vel(pos.norm()), 3.5316e12).unwrap();
+        w.vessels.insert(
+            VesselId(1),
+            Vessel {
+                id: VesselId(1),
+                craft: Some(box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0)),
+                state: VesselState::OnRails(OrbitState {
+                    parent: BodyId::from("p"),
+                    elements,
+                    epoch: w.clock(),
+                }),
+                aero_mask: csp_phys::ConfigMask::ALL,
+                thermal: VesselThermal::default(),
+                debris_since: None,
+                maneuver: None,
+                seams: Vec::new(),
+                tank_contents: BTreeMap::new(),
+                crew: Vec::new(),
+                science: VesselScience::default(),
+                joined_colony: None,
+                reliability: BTreeMap::new(),
+                control_lease: Lease::Player,
+            },
+        );
+        w.next_vessel_id = 2;
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::ToBubble {
+                vessel: VesselId(1),
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(
+            r.rejected.iter().any(|rej| matches!(
+                &rej.error,
+                SimError::Recoverable(m) if m.contains("occupied")
+            )),
+            "occupied-volume materialization must refuse: {:?}",
+            r.rejected
+        );
+        // A conic point stamped inside the planet refuses too.
+        let elements = orbit::cartesian_to_elements(
+            DVec3::new(TERRIN_R + 100_000.0, 0.0, 0.0),
+            in_bubble_vel(TERRIN_R + 100_000.0),
+            3.5316e12,
+        )
+        .unwrap();
+        // Push the conic's evaluated position below the surface: the
+        // stamped (r, v) point itself penetrates the heightfield at
+        // this tick's phase — a below-datum point is the honest
+        // penetration case (a dipper evaluates there mid-arc).
+        let deep = DVec3::new(TERRIN_R - 1.0, 0.0, 0.0);
+        let deep_elements =
+            orbit::cartesian_to_elements(deep, DVec3::new(0.0, 1.0, 0.0), 3.5316e12).unwrap();
+        w.vessels.get_mut(&VesselId(1)).unwrap().state = VesselState::OnRails(OrbitState {
+            parent: BodyId::from("p"),
+            elements: deep_elements,
+            epoch: w.clock(),
+        });
+        let _ = elements;
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::ToBubble {
+                vessel: VesselId(1),
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(
+            r.rejected.iter().any(|rej| matches!(
+                &rej.error,
+                SimError::Recoverable(m) if m.contains("penetrates")
+            )),
+            "terrain-penetrating materialization must refuse: {:?}",
+            r.rejected
+        );
+    }
+
+    /// `TerminateVessel` — the pad trap's unblock path: a latched
+    /// hulk blocks the site, the command removes it outright (no
+    /// payout, latched crew walk home `Unassigned`), and the site
+    /// spawns again. Unknown vessels reject `Recoverable`.
+    #[test]
+    fn terminate_vessel_frees_the_pad() {
+        let mut w = physics_world(false);
+        let pos = DVec3::new(TERRIN_R + 50.0, 0.0, 0.0);
+        enqueue_parked(
+            &mut w,
+            box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0),
+            pos,
+        );
+        w.step_frame(1).unwrap();
+        w.vessels.get_mut(&VesselId(0)).unwrap().state = VesselState::SurfaceLatched(SurfacePose {
+            body: BodyId::from("p"),
+            latitude_rad: 0.0,
+            longitude_rad: 0.0,
+            altitude_m: 50.0,
+            orientation: DQuat::IDENTITY,
+        });
+        // The hulk's pose claims the site — a launch refuses.
+        enqueue_parked(
+            &mut w,
+            box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0),
+            pos,
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(!r.rejected.is_empty(), "occupied site must refuse");
+        assert_eq!(w.vessels().len(), 1);
+        // Terminate it — the trap clears.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::TerminateVessel {
+                vessel: VesselId(0),
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "terminate: {:?}", r.rejected);
+        assert!(!w.vessels().contains_key(&VesselId(0)));
+        // And the same pad spawns again.
+        enqueue_parked(
+            &mut w,
+            box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0),
+            pos,
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        assert_eq!(w.vessels().len(), 1);
+        // Unknown vessel is a typed rejection.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::TerminateVessel {
+                vessel: VesselId(9_999),
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert_eq!(r.rejected.len(), 1);
+        assert!(matches!(r.rejected[0].error, SimError::Recoverable(_)));
+    }
+
+    /// `RecoverVessel` — the latched vessel banks its part value and
+    /// pooled science, returns crew `Unassigned`, and frees its
+    /// berth; `TerminateVessel` is the no-payout alternate door.
+    #[test]
+    fn recover_vessel_banks_and_frees_the_pad() {
+        let mut w = physics_world(false);
+        let mut cfg = economy::default_config();
+        cfg.starting_funds_micros = 10_000_000;
+        w.set_economy_config(cfg).unwrap();
+        let pos = DVec3::new(TERRIN_R + 50.0, 0.0, 0.0);
+        let mut craft = box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0);
+        craft.part_costs = vec![4.0];
+        let funds_after_purchase = 10_000_000u64 - 4_000_000;
+        enqueue_parked(&mut w, craft, pos);
+        w.step_frame(1).unwrap();
+        w.vessels.get_mut(&VesselId(0)).unwrap().state = VesselState::SurfaceLatched(SurfacePose {
+            body: BodyId::from("p"),
+            latitude_rad: 0.0,
+            longitude_rad: 0.0,
+            altitude_m: 50.0,
+            orientation: DQuat::IDENTITY,
+        });
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RecoverVessel {
+                vessel: VesselId(0),
+                site: None,
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "recover: {:?}", r.rejected);
+        assert!(!w.vessels().contains_key(&VesselId(0)));
+        assert!(
+            w.funds_micros() > funds_after_purchase,
+            "the part-value payout must credit the ledger"
+        );
+    }
+
     /// A one-part box with `seats` crew slots (no tanks).
     fn crew_craft(seats: u32) -> CraftDef {
         let mut c = box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0);
@@ -18587,7 +19195,7 @@ mod tests {
     /// Spawn `craft` 200 km up at `pos` — shared by the transfer tests.
     fn enqueue_physical(w: &mut World, craft: CraftDef, pos: DVec3) {
         let base = DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0);
-        let v = DVec3::new(0.0, libm::sqrt(3.5316e12 / base.norm()), 0.0);
+        let v = in_bubble_vel(base.norm());
         w.enqueue(
             SourceClass::Ui,
             0,
@@ -18625,7 +19233,7 @@ mod tests {
     /// capture inside the window (latch on → they merge).
     fn spawn_port_tank_pair(w: &mut World) {
         let base = DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0);
-        let v = DVec3::new(0.0, libm::sqrt(3.5316e12 / base.norm()), 0.0);
+        let v = in_bubble_vel(base.norm());
         w.enqueue(
             SourceClass::Ui,
             0,
@@ -18937,6 +19545,7 @@ mod tests {
             Some(PhysicsConfig {
                 environment: test_env(false),
                 dominant: BodyId::from("p"),
+                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
             })
         };
         let mut w = physics_world(false);
@@ -18979,6 +19588,7 @@ mod tests {
             Some(PhysicsConfig {
                 environment: test_env(false),
                 dominant: BodyId::from("p"),
+                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
             })
         };
         let mut w = physics_world(false);
@@ -20144,6 +20754,7 @@ mod tests {
             Some(PhysicsConfig {
                 environment: test_env(false),
                 dominant: BodyId::from("p"),
+                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
             }),
             snap,
         )
@@ -20230,6 +20841,7 @@ mod tests {
                 Some(PhysicsConfig {
                     environment: test_env(false),
                     dominant: BodyId::from("p"),
+                    bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
                 }),
                 snap,
             )
@@ -20270,6 +20882,7 @@ mod tests {
             Some(PhysicsConfig {
                 environment: test_env(false),
                 dominant: BodyId::from("p"),
+                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
             }),
             snap,
         )
@@ -20526,6 +21139,7 @@ mod tests {
                 Some(PhysicsConfig {
                     environment: test_env(false),
                     dominant: BodyId::from("p"),
+                    bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
                 }),
                 snap,
             )
@@ -20955,6 +21569,7 @@ mod tests {
                 Some(PhysicsConfig {
                     environment: test_env(false),
                     dominant: BodyId::from("p"),
+                    bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
                 }),
                 snap,
             )

@@ -1,0 +1,17 @@
+# Clanker workflow — edit the name, description, and steps below.
+name: thisisatest
+version: "1.0.0"
+description: Describe what this workflow does.
+
+# defaults:
+#   timeout: 600
+#   retry: 0
+
+steps:
+  - name: plan
+    prompts:
+      - text: Summarize the task and propose a plan.
+  - name: implement
+    depends_on: [plan]
+    prompts:
+      - text: Implement the plan produced by the previous step.

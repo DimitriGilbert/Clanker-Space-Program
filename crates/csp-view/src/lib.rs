@@ -230,6 +230,12 @@ pub struct ProgramMirror {
     pub science_ctx: Option<(csp_data::BiomeId, csp_data::Situation)>,
     /// The pooled `DataKey`s the `DataRow.index` values address.
     pub keys: Vec<PooledKey>,
+    /// The site a `RecoverVessel` command names — staged when the
+    /// focused vessel is `SurfaceLatched`: the launch site on the
+    /// latched body when one exists (recovery_efficiency 1.0), else
+    /// the body's first site, else `None` (the `abandon_recovery`
+    /// remote-salvage leg — still a valid recovery).
+    pub recovery_site: Option<csp_data::SiteId>,
 }
 
 /// Session-side values `csp-app` mirrors in for the UI — written through
@@ -727,6 +733,16 @@ fn program_command(
                 SimCommand::RecoverData { vessel, key }
             })
         }
+        // §3.5's recovery verbs — the site was staged with the mirror
+        // (launch site on the latched body, else its first site, else
+        // the `None` remote-salvage leg).
+        C::RecoverVessel => Some(SimCommand::RecoverVessel {
+            vessel: mirror.vessel?,
+            site: mirror.recovery_site.clone(),
+        }),
+        C::TerminateVessel => Some(SimCommand::TerminateVessel {
+            vessel: mirror.vessel?,
+        }),
     }
 }
 
@@ -1070,6 +1086,7 @@ impl View {
     /// resources from it. `View::new` (native) reads the filesystem;
     /// [`View::new_demo`] reads the §6.3 embedded set — identical wiring,
     /// identical file-shape checks, different source.
+    #[allow(clippy::too_many_lines)] // one load = one wiring pass
     fn from_source(
         src: &dyn csp_data::DataSource,
         root: &std::path::Path,
@@ -1111,6 +1128,7 @@ impl View {
                     terrin.rotation_period_s,
                 ),
                 dominant: terrin.id.clone(),
+                bubble_radius_m: balance.bubble_radius_m,
             },
             balance.advance_to_max_events_per_frame,
         );
@@ -2521,6 +2539,7 @@ impl View {
         }
         let (mut ctx_biome, mut ctx_situation, mut ctx_label) = (None, None, None);
         let mut keys = Vec::new();
+        let mut recovery_site = None;
         if let Some(vid) = vid
             && let Some(v) = sim.vessels().get(&vid)
         {
@@ -2531,6 +2550,7 @@ impl View {
                 &mut ctx_situation,
                 &mut ctx_label,
                 &mut keys,
+                &mut recovery_site,
                 &name_of,
             );
         }
@@ -2539,6 +2559,7 @@ impl View {
             vessel: vid.filter(|_| ctx_situation.is_some()),
             science_ctx: ctx_biome.zip(ctx_situation),
             keys,
+            recovery_site,
         };
     }
 
@@ -2555,11 +2576,28 @@ impl View {
         ctx_situation: &mut Option<csp_data::Situation>,
         ctx_label: &mut Option<(String, String, String, String)>,
         keys: &mut Vec<PooledKey>,
+        recovery_site: &mut Option<csp_data::SiteId>,
         name_of: &dyn Fn(&csp_data::LocKey, &str) -> String,
     ) {
         use csp_ui::program as up;
         let sim = &self.sim;
         input.latched = matches!(v.state, VesselState::SurfaceLatched(_));
+        // §3.5's flight recovery, player-reachable at last: a latched
+        // vessel can be recovered (site credit + part payout + crew +
+        // pooled science) or terminated outright — the pad trap's
+        // unblock path. The named site defaults to the latched
+        // body's launch site (recovery_efficiency 1.0), else its
+        // first site; no site at all still permits the
+        // `abandon_recovery` remote-salvage leg (`site: None`).
+        if let VesselState::SurfaceLatched(p) = &v.state {
+            let site = sim
+                .site_defs()
+                .values()
+                .find(|s| s.body == p.body && s.launch)
+                .or_else(|| sim.site_defs().values().find(|s| s.body == p.body));
+            input.recover_site = site.map(|s| name_of(&s.display_name, s.id.as_str()));
+            *recovery_site = site.map(|s| s.id.clone());
+        }
         // Situation + biome — the presentation-side context math the
         // research module doc assigns us.
         let (body, alt_m, lat_rad, lon_rad) = self.vessel_context(v);
@@ -2997,6 +3035,9 @@ fn stage_program_overview(
             csp_sim::reliability::NotificationKind::IgnitionMisfire => {
                 format!("vessel {} — IGNITION MISFIRE", n.vessel.0)
             }
+            csp_sim::reliability::NotificationKind::OnRails => {
+                format!("vessel {} — ON RAILS", n.vessel.0)
+            }
         };
         input.notices.push(up::NoticeRow { tick: n.tick, text });
     }
@@ -3348,5 +3389,49 @@ mod tests {
                 "unmasked viewport no longer publishes the hover ray"
             );
         });
+    }
+
+    /// §3.5's recovery verbs reach the sim: the panel's Recover /
+    /// Terminate actions map to `RecoverVessel` (naming the staged
+    /// launch site — `None` is the remote-salvage leg) and
+    /// `TerminateVessel`, against the focused latched vessel — the
+    /// commands the pad-trap refusal text's "recover" relies on.
+    #[test]
+    fn program_command_maps_recovery_verbs() {
+        use csp_ui::program::ProgramCommand as C;
+        let mirror = ProgramMirror {
+            vessel: Some(csp_sim::VesselId(7)),
+            recovery_site: Some(csp_data::SiteId::from("terrin-launch")),
+            ..ProgramMirror::default()
+        };
+        assert_eq!(
+            program_command(&mirror, C::RecoverVessel),
+            Some(SimCommand::RecoverVessel {
+                vessel: csp_sim::VesselId(7),
+                site: Some(csp_data::SiteId::from("terrin-launch")),
+            })
+        );
+        assert_eq!(
+            program_command(&mirror, C::TerminateVessel),
+            Some(SimCommand::TerminateVessel {
+                vessel: csp_sim::VesselId(7),
+            })
+        );
+        // No site on the latched body → the remote-salvage leg.
+        let remote = ProgramMirror {
+            vessel: Some(csp_sim::VesselId(7)),
+            ..ProgramMirror::default()
+        };
+        assert_eq!(
+            program_command(&remote, C::RecoverVessel),
+            Some(SimCommand::RecoverVessel {
+                vessel: csp_sim::VesselId(7),
+                site: None,
+            })
+        );
+        // No focused vessel → nothing emitted.
+        let empty = ProgramMirror::default();
+        assert_eq!(program_command(&empty, C::RecoverVessel), None);
+        assert_eq!(program_command(&empty, C::TerminateVessel), None);
     }
 }

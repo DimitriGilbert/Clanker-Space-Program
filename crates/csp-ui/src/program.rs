@@ -145,8 +145,14 @@ pub struct ProgramInput {
     /// Pooled data records aboard.
     pub pooled: Vec<DataRow>,
     /// The focused vessel is `SurfaceLatched` — gates the Recover
-    /// buttons (`RecoverData` requires it).
+    /// buttons (`RecoverData` requires it) and the vessel
+    /// recover/terminate actions (`RecoverVessel` requires it).
     pub latched: bool,
+    /// Display name of the site a vessel recovery credits to —
+    /// `None` = the remote-salvage leg (no site on the latched
+    /// body). Label only; the command resolves the `SiteId`
+    /// view-side.
+    pub recover_site: Option<String>,
     /// Per-node reliability rows for the focused vessel.
     pub reliability: Vec<ReliabilityRow>,
     /// Recent notifications (newest last), already capped.
@@ -192,6 +198,12 @@ pub enum ProgramCommand {
         /// The pooled-row index.
         row: usize,
     },
+    /// Recover the whole latched vessel → `RecoverVessel` (site
+    /// credit + part payout + crew home + pooled science banks).
+    RecoverVessel,
+    /// Delete the latched vessel outright → `TerminateVessel` (the
+    /// hulk/pad-trap cleanup — no payout).
+    TerminateVessel,
 }
 
 const MONO: egui::FontId = egui::FontId::monospace(12.0);
@@ -415,6 +427,40 @@ pub fn program_panel(
                 }
                 if input.experiments.is_empty() && input.context.is_some() {
                     ui.label(egui::RichText::new("no experiment modules aboard").color(dim));
+                }
+                // Vessel actions — §3.5's recovery verbs: a latched
+                // hull recovers into funds/science/crew or terminates
+                // to free its berth. Gated on `latched` (the sim's
+                // `RecoverVessel` requires `SurfaceLatched`).
+                if input.context.is_some() {
+                    ui.horizontal(|ui| {
+                        let recover_label = match &input.recover_site {
+                            Some(site) => format!("recover vessel → {site}"),
+                            None => "recover vessel (remote salvage)".to_string(),
+                        };
+                        if ui
+                            .add_enabled(input.latched, egui::Button::new(recover_label).small())
+                            .on_hover_text(if input.latched {
+                                "recover the vessel: funds, science, crew home".to_string()
+                            } else {
+                                "vessel must be on the surface".to_string()
+                            })
+                            .clicked()
+                        {
+                            out.push(ProgramCommand::RecoverVessel);
+                        }
+                        if ui
+                            .add_enabled(input.latched, egui::Button::new("terminate").small())
+                            .on_hover_text(if input.latched {
+                                "delete the vessel — no payout, frees its berth".to_string()
+                            } else {
+                                "vessel must be on the surface".to_string()
+                            })
+                            .clicked()
+                        {
+                            out.push(ProgramCommand::TerminateVessel);
+                        }
+                    });
                 }
                 for d in &input.pooled {
                     ui.horizontal(|ui| {
