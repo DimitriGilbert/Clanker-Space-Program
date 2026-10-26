@@ -715,6 +715,11 @@ struct SolveInput<'a> {
     /// Store levels at the solve tick, per resource (already
     /// re-anchored by the caller).
     levels: &'a BTreeMap<ResourceId, f64>,
+    /// Live store capacities, per resource — the sink half of
+    /// `levels`: a resource has absorbable output headroom iff its
+    /// store exists AND `level < capacity` (the caller keys `caps`
+    /// on the same set `levels` keys on).
+    caps: &'a BTreeMap<ResourceId, f64>,
     /// The light field + daylight step.
     light: &'a BodyLight,
     /// Crew aboard — scales `LifeSupport` requests.
@@ -859,6 +864,50 @@ fn allocation_pass(input: &SolveInput) -> Allocation {
     // and produce in the grant solve; the rest pin at fraction 0.
     let grounded = grounded_modules(input, &viable, &requests, &outputs);
     let active: Vec<bool> = (0..n).map(|i| viable[i] && grounded[i]).collect();
+    // Rule-3's sink side: a producing module whose EVERY output has
+    // nowhere to go — no store with headroom (its entry exists and
+    // `level < capacity − ε`) and no *other viable* module requesting
+    // it — pins at fraction 0. Without this a converter whose recipe
+    // outputs have no store runs full-tilt, drains its inputs, and
+    // the product ceases to exist: `net_rates` computes the produced
+    // rate but the write-back touches only `stores` entries, so a
+    // storeless resource is silently voided. Refusing (fraction 0,
+    // like a starved input) is the honest answer.
+    //
+    // The demand side reads LATENT demand — undamaged modules'
+    // would-be request rows, the same set `latent_ec_request` counts
+    // for `power_starved`: a consumer that is currently ungrounded,
+    // or inert under a Degraded state, is still a legitimate sink
+    // (once it can run it will take the output). Gating on `active`
+    // would deadlock the restore path: in a Degraded colony every
+    // consumer is inert, so a power producer would see "no sink" and
+    // never produce the charge that earns `PowerRestored`.
+    let latent_requests: Vec<BTreeSet<ResourceId>> = input
+        .modules
+        .iter()
+        .map(|m| {
+            if m.damaged {
+                BTreeSet::new()
+            } else {
+                module_requests(m, input.crew, input.recipes)
+                    .into_iter()
+                    .map(|(_, r, _)| r)
+                    .collect()
+            }
+        })
+        .collect();
+    let sinked: Vec<bool> = (0..n)
+        .map(|i| {
+            !active[i]
+                || outputs[i].is_empty()
+                || outputs[i].iter().any(|r| {
+                    let store_headroom = input.caps.get(r).is_some_and(|cap| {
+                        *cap > EPS && input.levels.get(r).copied().unwrap_or(0.0) < *cap - EPS
+                    });
+                    store_headroom || (0..n).any(|j| j != i && latent_requests[j].contains(r))
+                })
+        })
+        .collect();
     let consumers = consumer_map(&requests, &active);
     let mut fractions = vec![1.0f64; n];
     let mut grants: BTreeMap<(usize, ResourceId), f64>;
@@ -871,7 +920,7 @@ fn allocation_pass(input: &SolveInput) -> Allocation {
         // modules pin at 0.
         let mut changed = false;
         for (i, reqs) in requests.iter().enumerate() {
-            let f = if active[i] {
+            let f = if active[i] && sinked[i] {
                 reqs.iter().fold(1.0f64, |f, (_, r, q)| {
                     let g = grants.get(&(i, r.clone())).copied().unwrap_or(0.0);
                     f.min(g / q)
@@ -1974,6 +2023,11 @@ impl World {
             .iter()
             .map(|(r, s)| (r.clone(), s.level_at(tick)))
             .collect();
+        let caps: BTreeMap<ResourceId, f64> = colony
+            .stores
+            .iter()
+            .map(|(r, s)| (r.clone(), s.capacity))
+            .collect();
         let concentrations: BTreeMap<ResourceId, f64> = self
             .site_defs
             .get(&colony.site)
@@ -1983,6 +2037,7 @@ impl World {
             modules: &colony.modules,
             state: colony.state,
             levels: &levels,
+            caps: &caps,
             light: &light,
             crew: if self.life_support_enabled {
                 colony.crew.len()
@@ -2245,6 +2300,11 @@ impl World {
             .colonies
             .get(&id)
             .ok_or(SimError::Fatal("colony: vanished"))?;
+        let caps: BTreeMap<ResourceId, f64> = colony
+            .stores
+            .iter()
+            .map(|(r, s)| (r.clone(), s.capacity))
+            .collect();
         let concentrations: BTreeMap<ResourceId, f64> = self
             .site_defs
             .get(&colony.site)
@@ -2254,6 +2314,7 @@ impl World {
             modules: &colony.modules,
             state: colony.state,
             levels: &levels,
+            caps: &caps,
             light: &light,
             // M8-C §3.5's per-save toggle reads as zero crew for the
             // `LifeSupport` rows — the `crew > 0` gates in
@@ -2571,11 +2632,39 @@ mod tests {
     /// The `SolveInput` literal's mechanical tail — every test's
     /// construction names the pieces it varies; recipes/concentrations
     /// ride the locals each test binds.
+    /// The `caps` a test author means — the store table covers every
+    /// `levels`/`out` resource the fixture exercises, at effectively
+    /// unbounded capacity (the headroom check's "a store exists, not
+    /// full" reading).
+    fn test_caps(resources: &[&str]) -> BTreeMap<ResourceId, f64> {
+        resources
+            .iter()
+            .map(|r| (ResourceId::from(*r), f64::MAX))
+            .collect()
+    }
+
+    /// The fixtures' blanket store table — every resource the tests
+    /// produce, unbounded.
+    fn all_caps() -> BTreeMap<ResourceId, f64> {
+        test_caps(&[
+            "electric_charge",
+            "ore",
+            "metal",
+            "x",
+            "y",
+            "gold",
+            "food",
+            "water",
+            "oxygen",
+        ])
+    }
+
     #[allow(clippy::too_many_arguments)] // a test-side SolveInput builder
     fn inp<'a>(
         modules: &'a [ColonyModule],
         state: ColonyState,
         levels: &'a BTreeMap<ResourceId, f64>,
+        caps: &'a BTreeMap<ResourceId, f64>,
         light: &'a BodyLight,
         crew: usize,
         daylight: Daylight,
@@ -2586,6 +2675,7 @@ mod tests {
             modules,
             state,
             levels,
+            caps,
             light,
             crew,
             daylight,
@@ -2699,6 +2789,7 @@ mod tests {
             &modules,
             ColonyState::Nominal,
             &levels,
+            &all_caps(),
             &light,
             0,
             Daylight::Day,
@@ -2760,6 +2851,7 @@ mod tests {
             &modules,
             ColonyState::Nominal,
             &BTreeMap::new(),
+            &all_caps(),
             &light,
             0,
             Daylight::Day,
@@ -2815,6 +2907,7 @@ mod tests {
             &modules,
             ColonyState::Nominal,
             &levels,
+            &all_caps(),
             &light,
             0,
             Daylight::Day,
@@ -2828,6 +2921,7 @@ mod tests {
             &modules[..2],
             ColonyState::Nominal,
             &levels,
+            &all_caps(),
             &light,
             0,
             Daylight::Day,
@@ -3337,6 +3431,7 @@ mod tests {
             &modules,
             ColonyState::Nominal,
             &BTreeMap::new(),
+            &all_caps(),
             &light,
             0,
             Daylight::Day,
@@ -3390,6 +3485,7 @@ mod tests {
             &cyclic,
             ColonyState::Nominal,
             &BTreeMap::new(),
+            &all_caps(),
             &light,
             0,
             Daylight::Day,
@@ -3446,6 +3542,7 @@ mod tests {
             &modules,
             ColonyState::Nominal,
             &BTreeMap::new(),
+            &all_caps(),
             &light,
             0,
             Daylight::Day,
@@ -3493,6 +3590,7 @@ mod tests {
             &modules,
             ColonyState::Nominal,
             &BTreeMap::new(),
+            &all_caps(),
             &light,
             0,
             Daylight::Day,
@@ -3538,6 +3636,7 @@ mod tests {
             &modules,
             ColonyState::Nominal,
             &BTreeMap::new(),
+            &all_caps(),
             &light,
             0,
             Daylight::Day,
@@ -4935,5 +5034,134 @@ mod tests {
         r.set_sites(BTreeMap::from([(SiteId::from("pad"), test_site())]));
         r.set_colony_env(test_env());
         assert_eq!(r.state_hash().unwrap(), h);
+    }
+
+    /// C6-F3 institutionalized: a converter whose EVERY output has
+    /// nowhere to go — no store holding it, no other viable module
+    /// requesting it — pins at fraction 0 instead of draining its
+    /// input into product that ceases to exist (the write-back only
+    /// touches `stores` entries, so a storeless output silently
+    /// voided: ore drained, metal gone).
+    #[test]
+    fn sinkless_output_refuses_to_run() {
+        let mut levels = BTreeMap::new();
+        levels.insert(ResourceId::from("ore"), 10.0);
+        let mut recipes = BTreeMap::new();
+        let light = BodyLight {
+            synodic_rate: 0.0,
+            h0: 0.0,
+            day_insolation_w_m2: 0.0,
+            cos_lat: 1.0,
+        };
+        // A converter with power but an output nobody can take: no
+        // "metal" store, no consumer. `test_caps` names only what a
+        // colony stocks — metal is deliberately absent.
+        let modules = vec![
+            ColonyModule {
+                def: gen_module(10.0),
+                damaged: false,
+            },
+            ColonyModule {
+                def: conv(
+                    &mut recipes,
+                    "smelt",
+                    vec![(ec(), 0.5), (ResourceId::from("ore"), 1.0)],
+                    vec![(ResourceId::from("metal"), 0.5)],
+                    5,
+                    0.0,
+                ),
+                damaged: false,
+            },
+        ];
+        let conc = BTreeMap::new();
+        let solve = solve_network(&inp(
+            &modules,
+            ColonyState::Nominal,
+            &levels,
+            // ore store exists; metal store does NOT.
+            &test_caps(&["ore", "electric_charge"]),
+            &light,
+            0,
+            Daylight::Day,
+            &recipes,
+            &conc,
+        ));
+        assert_eq!(solve.fractions[1], 0.0, "no sink ⇒ no run");
+        assert_eq!(
+            solve
+                .net_rates
+                .get(&ResourceId::from("ore"))
+                .copied()
+                .unwrap_or(0.0),
+            0.0,
+            "ore is not drained for voided product"
+        );
+    }
+
+    /// C5-transfers-F2 institutionalized: a resource landing on a
+    /// DEAD colony still credits the frozen store (terminal
+    /// bookkeeping) but must NOT record the resupply fact nor
+    /// complete its contract — `colony_live` gates the predicate.
+    #[test]
+    fn dead_colony_delivery_does_not_complete_contract() {
+        let mut w = colony_world();
+        let ore = ResourceId::from("ore");
+        found(
+            &mut w,
+            vec![
+                gen_module(10.0),
+                ColonyModuleDef::Store {
+                    resource: ore.clone(),
+                    capacity: 100.0,
+                },
+            ],
+            vec![],
+        );
+        let colony = *w.colonies().keys().next().unwrap();
+        w.contracts.active.insert(
+            crate::contracts::ContractId(0),
+            crate::contracts::ActiveContract {
+                id: crate::contracts::ContractId(0),
+                template: csp_data::ContractTypeId::from("contract.colony_resupply"),
+                params: csp_data::ContractParams::ColonyResupply {
+                    body: BodyId::from("terra"),
+                    resource: ore.clone(),
+                    amount: 10.0,
+                },
+                deadline_tick: None,
+            },
+        );
+        w.contracts.next_contract_id = 1;
+        let vessel = latched_vessel(&mut w, "ore", 100.0, 50.0);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::JoinColonyInventory { vessel, colony },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        // The colony dies after the transfer launches.
+        w.colonies.get_mut(&colony).unwrap().state = ColonyState::Abandoned;
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::TransferColonyResource {
+                vessel,
+                colony,
+                resource: ore.clone(),
+                amount: 10.0,
+                to_colony: true,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        w.step_frame(w.clock().ticks() + 64 + 1).unwrap();
+        // The fact never recorded; the contract still waits.
+        assert!(
+            !w.contracts
+                .facts
+                .colony_deliveries
+                .contains_key(&(colony.0, ore.clone())),
+            "a landing on a dead colony is not a resupply fact"
+        );
+        assert_eq!(w.contracts.active.len(), 1, "the contract stays open");
     }
 }

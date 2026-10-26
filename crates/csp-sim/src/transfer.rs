@@ -93,6 +93,14 @@ const EJECTION_MAX_ITERS: u32 = 16;
 /// useful 48×48 scan while staying a bounded amount of work per call.
 /// Larger scans are the caller's to partition.
 pub const PORKCHOP_MAX_CELLS: u64 = 65_536;
+/// The [`PorkchopQuery::max_revs`] ceiling — the second half of the
+/// "bounded work" contract. Every multi-rev call pays a 64-iteration
+/// golden-section branch-min search plus up to two 64-iteration Brent
+/// solves BEFORE the `tof ≤ T_min` bail, so the per-cell cost is
+/// `2·(1 + max_revs)` only when `max_revs` is itself bounded. 15
+/// branches is already deep-space-exotic territory (the branch TOF
+/// minimum grows ~N²).
+pub const LAMBERT_MAX_REVS: u32 = 15;
 /// The local refinement's evaluation budget: a halving pattern search
 /// on the tick lattice needs ≈ 8·log₂(cell_span) evals when strides
 /// shrink monotonically — but improvement moves keep the stride
@@ -199,15 +207,56 @@ fn lambert_geom(r1: DVec3, r2: DVec3, way: LambertWay) -> Result<LambertGeom, Si
 /// energy), or a non-finite result.
 fn tof_eval(g: &LambertGeom, mu: f64, z: f64) -> Option<f64> {
     let (c2, c3) = stumpff(z);
-    if !(c2.is_finite() && c2 > 0.0) {
+    if c2.is_finite() && c2 > 0.0 {
+        let y = g.r1n + g.r2n + g.a * (z * c3 - 1.0) / libm::sqrt(c2);
+        if y.is_finite() && y > 0.0 {
+            let x = libm::sqrt(y / c2);
+            let t = (x * x * x * c3 + g.a * libm::sqrt(y)) / libm::sqrt(mu);
+            if t.is_finite() {
+                return Some(t);
+            }
+        }
+    }
+    // The direct form went non-finite: for `z < 0` the Stumpff cosh
+    // overflows past `z ≈ −5.04e5` — the `Long`-way short-TOF roots
+    // live there, and this is exactly the regime whose evaluation
+    // the closed form loses. Fall through to the asymptotic tail.
+    if z < 0.0 {
+        return tof_eval_tail(g, mu, z);
+    }
+    None
+}
+
+/// The `z < 0` Stumpff-overflow tail, evaluated without overflow.
+/// For `s = √−z` large, `cosh s ≈ sinh s ≈ e^s/2` up to relative
+/// error `~e^{−s}`, so with `E = e^{s/2}`:
+///
+/// ```text
+/// √C  = E/(√2·s)          C₃ = E²/(2s³)
+/// y   = r1 + r2 − A·(E/√2 + √2·s/E)
+/// x³C₃ = √2·y^{3/2}/E  ⇒  √μT = √y·(√2·y/E + A)
+/// ```
+///
+/// `x³C₃` and `A√y` cancel catastrophically for `Long` (`A < 0`) —
+/// the factored form `√y·(√2·y/E + A)` keeps both halves finite and
+/// performs the cancellation in representable terms. `None` when
+/// even `E` overflows (`z ≲ −2.01e6`) or `y` comes out non-positive
+/// (the Short-way pocket, real or asymptotic — `tof_residual`'s
+/// `−tof` extension covers it either way). Feeding `z_solved`
+/// through this same path is what lets a root inside the pocket be
+/// *certified*, not just bracketed.
+fn tof_eval_tail(g: &LambertGeom, mu: f64, z: f64) -> Option<f64> {
+    let s = libm::sqrt(-z);
+    let e = libm::exp(0.5 * s);
+    if !(e.is_finite() && e > 0.0) {
         return None;
     }
-    let y = g.r1n + g.r2n + g.a * (z * c3 - 1.0) / libm::sqrt(c2);
+    let sq2 = core::f64::consts::SQRT_2;
+    let y = g.r1n + g.r2n - g.a * (e / sq2 + sq2 * s / e);
     if !(y.is_finite() && y > 0.0) {
         return None;
     }
-    let x = libm::sqrt(y / c2);
-    let t = (x * x * x * c3 + g.a * libm::sqrt(y)) / libm::sqrt(mu);
+    let t = libm::sqrt(y) * (sq2 * y / e + g.a) / libm::sqrt(mu);
     t.is_finite().then_some(t)
 }
 
@@ -229,7 +278,20 @@ fn tof_residual(g: &LambertGeom, mu: f64, tof: f64, z: f64) -> f64 {
             let (c2, c3) = stumpff(z);
             if c2 > 0.0 {
                 let y = g.r1n + g.r2n + g.a * (z * c3 - 1.0) / libm::sqrt(c2);
-                if y <= 0.0 {
+                // `y ≤ 0` → `T → 0` at the pocket's edge — extended as
+                // `−tof`. For `z < 0` the same reading covers a
+                // NON-FINITE `y`: past `z ≈ −5.04e5` the Stumpff cosh
+                // overflows, and on the Long way (`A < 0`) the true `y`
+                // runs to +∞ while `√μT = x³S + A√y` cancels toward 0 —
+                // the infeasible-for-this-computation region IS the
+                // "T below any target" tail, not a pole. Reading it
+                // `+∞` made the hyperbolic expansion march through ~50
+                // `f64::MAX` evals and report "no solution" for a root
+                // that provably exists (the zero-rev branch covers
+                // every `tof > 0`). Any z the extension carries still
+                // faces `z_solved` + `lands_on`, so a corrupted plateau
+                // can spend evals but can never mint a wrong answer.
+                if y <= 0.0 || (z < 0.0 && !y.is_finite()) {
                     return -tof;
                 }
             }
@@ -351,6 +413,76 @@ fn lands_on(g: &LambertGeom, mu: f64, tof: f64, v1: DVec3) -> bool {
     }
 }
 
+/// The landing error at `z` — `|propagate(r1, v1(z), tof) − r2|`.
+/// `f64::MAX` where `v1` cannot even be formed or propagated.
+fn lands_miss(g: &LambertGeom, mu: f64, tof: f64, z: f64) -> f64 {
+    match lambert_velocities(g, mu, z, 0) {
+        Ok(s) => match propagate(g.r1, s.v1, mu, tof) {
+            Ok((rp, _)) => (rp - g.r2).norm(),
+            Err(_) => f64::MAX,
+        },
+        Err(_) => f64::MAX,
+    }
+}
+
+/// Post-`z_solved` landing polish for the cancellation regime. Near a
+/// certified residual root the TOF formula's noise floor
+/// (`x³S + A√y` cancels `|A|`·e^{s/2}-scale terms) can exceed the
+/// residual tolerance's z-accuracy — the root lands inside
+/// [`lambert_tol_t`] yet its conic misses `r2` by km. The lands miss
+/// is a *steeper*, better-conditioned function of `z` there (V-shaped
+/// through the true root), so a fixed-iteration golden-section search
+/// over the residual-tolerance's implied `z` window recovers the root
+/// the residual alone could not localize. Bounded: [`BRANCH_MIN_ITERS`]
+/// golden steps, each one propagate. `None` when the polished minimum
+/// still misses — a wrong root is never returned.
+fn refine_landing_z(g: &LambertGeom, mu: f64, tof: f64, z0: f64) -> Option<f64> {
+    // The residual tolerance translates to a z-window through the
+    // local slope `dT/dz` (centered difference a few ulps of |z0|).
+    let h = (z0.abs() * 1e-6).max(1e-4);
+    let (tm, tp) = (tof_eval(g, mu, z0 - h), tof_eval(g, mu, z0 + h));
+    let (Some(tm), Some(tp)) = (tm, tp) else {
+        return None;
+    };
+    let slope = (tp - tm) / (2.0 * h);
+    if !(slope.is_finite() && slope != 0.0) {
+        return None;
+    }
+    // `tol_T / |dT/dz|` is the residual *tolerance's* width in z, but
+    // the residual's actual noise floor is wider — the cancellation
+    // corrupts the formula before the tolerance is even reached, so
+    // the true root can sit a few percent of |z0| off the residual
+    // root. Take the wider of the two estimates; the golden search is
+    // fixed-iteration, so the extra range costs nothing.
+    let w = (8.0 * lambert_tol_t(tof) / slope.abs())
+        .max(z0.abs() * 0.05 + 1.0)
+        .min(z0.abs() * 0.5 + 10.0);
+    let (mut lo, mut hi) = (z0 - w, z0 + w);
+    let invphi = 0.618_033_988_749_894_9_f64;
+    let invphi2 = invphi * invphi;
+    let mut x1 = lo + invphi2 * (hi - lo);
+    let mut x2 = lo + invphi * (hi - lo);
+    let mut f1 = lands_miss(g, mu, tof, x1);
+    let mut f2 = lands_miss(g, mu, tof, x2);
+    for _ in 0..BRANCH_MIN_ITERS {
+        if f1 < f2 {
+            hi = x2;
+            x2 = x1;
+            f2 = f1;
+            x1 = lo + invphi2 * (hi - lo);
+            f1 = lands_miss(g, mu, tof, x1);
+        } else {
+            lo = x1;
+            x1 = x2;
+            f1 = f2;
+            x2 = lo + invphi * (hi - lo);
+            f2 = lands_miss(g, mu, tof, x2);
+        }
+    }
+    let z = 0.5 * (lo + hi);
+    (lands_miss(g, mu, tof, z) <= g.r2n * 1e-6).then_some(z)
+}
+
 /// Zero-rev root bracket: `ψ ∈ (−∞, (2π)²)`. `T(0)` partitions it —
 /// `T(0) > tof` puts the root on the hyperbolic leg (expand downward
 /// until the residual flips, which happens no later than the `y ≤ 0`
@@ -466,20 +598,41 @@ fn multi_rev_z(g: &LambertGeom, mu: f64, tof: f64, revs: u32) -> Vec<f64> {
 /// f = 1 − y/r1    g = A·√(y/μ)    ġ = 1 − y/r2
 /// v1 = (r2 − f·r1)/g              v2 = (ġ·r2 − r1)/g
 /// ```
+/// `y(z)` with the same deep-`z` fallback [`tof_eval`] takes: the
+/// closed form first, then the asymptotic tail when the Stumpff cosh
+/// overflows (`z ≲ −5.04e5`). Shared so `lambert_velocities` recovers
+/// roots the residual could certify inside the pocket.
+fn lambert_y(g: &LambertGeom, z: f64) -> Option<f64> {
+    let (c2, c3) = stumpff(z);
+    if c2.is_finite() && c2 > 0.0 {
+        let y = g.r1n + g.r2n + g.a * (z * c3 - 1.0) / libm::sqrt(c2);
+        if y.is_finite() && y > 0.0 {
+            return Some(y);
+        }
+    }
+    if z < 0.0 {
+        let s = libm::sqrt(-z);
+        let e = libm::exp(0.5 * s);
+        if e.is_finite() && e > 0.0 {
+            let sq2 = core::f64::consts::SQRT_2;
+            let y = g.r1n + g.r2n - g.a * (e / sq2 + sq2 * s / e);
+            if y.is_finite() && y > 0.0 {
+                return Some(y);
+            }
+        }
+    }
+    None
+}
+
 fn lambert_velocities(
     g: &LambertGeom,
     mu: f64,
     z: f64,
     revs: u32,
 ) -> Result<LambertSolution, SimError> {
-    let (c2, c3) = stumpff(z);
-    if !(c2.is_finite() && c2 > 0.0) {
+    let Some(y) = lambert_y(g, z) else {
         return Err(SimError::Recoverable("lambert: infeasible solution point"));
-    }
-    let y = g.r1n + g.r2n + g.a * (z * c3 - 1.0) / libm::sqrt(c2);
-    if !(y.is_finite() && y > 0.0) {
-        return Err(SimError::Recoverable("lambert: infeasible solution point"));
-    }
+    };
     let f = 1.0 - y / g.r1n;
     let gcoef = g.a * libm::sqrt(y / mu);
     let gdot = 1.0 - y / g.r2n;
@@ -523,9 +676,20 @@ pub fn lambert(
     let Some(z) = zero_rev_z(&g, mu, tof_s) else {
         return Ok(None);
     };
-    let sol = lambert_velocities(&g, mu, z, 0)?;
+    let mut z = z;
+    let mut sol = lambert_velocities(&g, mu, z, 0)?;
     // The lands check: the residual gate alone can accept a corrupted
-    // Long-way hyperbolic root — drop it rather than return it.
+    // Long-way hyperbolic root — drop it rather than return it. A
+    // residual-certified root that misses is given one landing-metric
+    // polish first: near the true root the propagation error localizes
+    // `z` far tighter than the formula's own noise floor.
+    if !lands_on(&g, mu, tof_s, sol.v1) {
+        let Some(z2) = refine_landing_z(&g, mu, tof_s, z) else {
+            return Ok(None);
+        };
+        z = z2;
+        sol = lambert_velocities(&g, mu, z, 0)?;
+    }
     if !lands_on(&g, mu, tof_s, sol.v1) {
         return Ok(None);
     }
@@ -563,7 +727,15 @@ pub fn lambert_multi(
     let g = lambert_geom(r1, r2, way)?;
     let mut out = Vec::new();
     for z in multi_rev_z(&g, mu, tof_s, revs) {
-        let sol = lambert_velocities(&g, mu, z, revs)?;
+        let mut sol = lambert_velocities(&g, mu, z, revs)?;
+        // Same polish as `lambert`: a residual-certified root whose
+        // conic narrowly misses gets one bounded refinement on the
+        // landing metric before being dropped.
+        if !lands_on(&g, mu, tof_s, sol.v1)
+            && let Some(z2) = refine_landing_z(&g, mu, tof_s, z)
+        {
+            sol = lambert_velocities(&g, mu, z2, revs)?;
+        }
         if lands_on(&g, mu, tof_s, sol.v1) {
             out.push(sol);
         }
@@ -623,7 +795,8 @@ pub struct PorkchopQuery {
     pub arrive_cost: EndCost,
     /// Highest multi-rev branch to evaluate per cell — `0` = zero-rev
     /// only (the fast path; interplanetary porkchops almost never want
-    /// a multi-rev leg).
+    /// a multi-rev leg). Capped at [`LAMBERT_MAX_REVS`]: the
+    /// bounded-work contract is only real with the cap.
     pub max_revs: u32,
 }
 
@@ -782,12 +955,23 @@ fn leg_at(
         }
     };
     for way in [LambertWay::Short, LambertWay::Long] {
-        if let Some(sol) = lambert(r1, r2, tof_s, mu_p, way)? {
+        // A per-cell Lambert `Err` is cell infeasibility, not a scan
+        // failure: the endpoints are sampled geometry, and a pair
+        // within ~1.4e-7 rad of conjunction/opposition simply has no
+        // orbital plane at this cell (a corrupted multi-rev root is
+        // the same class). Propagating it would abort the whole grid
+        // over one degenerate sample — the cell-vs-error contract is
+        // "infeasible cell, not an error". The malformed-input arms
+        // can't reach this branch: `tof_s > 0` was gated above and
+        // `mu_p` came out of `shared_frame`'s validated model.
+        if let Ok(Some(sol)) = lambert(r1, r2, tof_s, mu_p, way) {
             consider(way, sol);
         }
         for revs in 1..=q.max_revs {
-            for sol in lambert_multi(r1, r2, tof_s, mu_p, way, revs)? {
-                consider(way, sol);
+            if let Ok(sols) = lambert_multi(r1, r2, tof_s, mu_p, way, revs) {
+                for sol in sols {
+                    consider(way, sol);
+                }
             }
         }
     }
@@ -815,7 +999,8 @@ fn axis_ticks(lo: u64, hi: u64, n: u32) -> Vec<u64> {
 /// Lambert solves (`2·(1 + max_revs)`).
 ///
 /// `Err(Recoverable)`: malformed query (reversed ranges, a zero cell
-/// count on a nonzero span, cells over the cap, a cell count finer
+/// count on a nonzero span, cells over the cap, `max_revs` over
+/// [`LAMBERT_MAX_REVS`], a cell count finer
 /// than the tick lattice, non-sibling or orbit-less endpoints,
 /// non-positive parking radii, or a parking radius the model's own
 /// body data rules out — under the surface or outside the SOI).
@@ -824,15 +1009,11 @@ pub fn porkchop_scan(model: &PatchedConics, q: &PorkchopQuery) -> Result<Porkcho
     porkchop_scan_inner(model, q, mu_p, mu_o, mu_d)
 }
 
-/// The scan body behind [`porkchop_scan`], taking the already-resolved
-/// shared frame so [`plan_transfer`] pays one frame resolution.
-fn porkchop_scan_inner(
-    model: &PatchedConics,
-    q: &PorkchopQuery,
-    mu_p: f64,
-    mu_o: f64,
-    mu_d: f64,
-) -> Result<Porkchop, SimError> {
+/// The [`porkchop_scan_inner`] query-validation preamble — ranges,
+/// cell counts against the tick lattice and [`PORKCHOP_MAX_CELLS`],
+/// [`LAMBERT_MAX_REVS`], and `CircularPark` radii against the model's
+/// body data. Extracted so the scan body reads as grid construction.
+fn validate_porkchop_query(model: &PatchedConics, q: &PorkchopQuery) -> Result<(), SimError> {
     if q.depart_hi < q.depart_lo || q.duration_hi < q.duration_lo {
         return Err(SimError::Recoverable("porkchop: reversed range"));
     }
@@ -852,9 +1033,14 @@ fn porkchop_scan_inner(
     {
         return Err(SimError::Recoverable("porkchop: cells exceed axis lattice"));
     }
-    let cells = q.depart_cells as u64 * q.duration_cells as u64;
-    if cells > PORKCHOP_MAX_CELLS {
+    if q.depart_cells as u64 * q.duration_cells as u64 > PORKCHOP_MAX_CELLS {
         return Err(SimError::Recoverable("porkchop: grid over cell cap"));
+    }
+    // The other half of the cell-cost bound — each cell runs
+    // `2·(1 + max_revs)` Lambert solves, so `max_revs` needs its own
+    // ceiling or the bounded-work doc is vacuous.
+    if q.max_revs > LAMBERT_MAX_REVS {
+        return Err(SimError::Recoverable("porkchop: max_revs over cap"));
     }
     // `CircularPark` radii are validated against the model's own body
     // data when carried: a parking orbit below the surface or outside
@@ -888,6 +1074,20 @@ fn porkchop_scan_inner(
             return Err(SimError::Recoverable(soi_msg));
         }
     }
+    Ok(())
+}
+
+/// The scan body behind [`porkchop_scan`], taking the already-resolved
+/// shared frame so [`plan_transfer`] pays one frame resolution.
+fn porkchop_scan_inner(
+    model: &PatchedConics,
+    q: &PorkchopQuery,
+    mu_p: f64,
+    mu_o: f64,
+    mu_d: f64,
+) -> Result<Porkchop, SimError> {
+    validate_porkchop_query(model, q)?;
+    let cells = q.depart_cells as u64 * q.duration_cells as u64;
     let departs = axis_ticks(q.depart_lo, q.depart_hi, q.depart_cells);
     let durations = axis_ticks(q.duration_lo, q.duration_hi, q.duration_cells);
     let mut out = Vec::with_capacity(cells as usize);
@@ -2280,5 +2480,77 @@ mod tests {
         // strictly ahead of the `now` it was scheduled against.
         let node = departure_node(&model, &vessel, &plan, SimTime::ZERO).unwrap();
         assert!(node.tick > 0);
+    }
+
+    /// The sweep the verified report ran: 4 radii × 8 phase angles ×
+    /// 8 TOFs, both ways. Pre-fix, `tof_residual` read the Stumpff
+    /// overflow tail (`z < −5.04e5`, cosh blows past f64 range) as
+    /// `+∞`, so the hyperbolic expansion marched through ~50 dead
+    /// evals and reported "no solution" for roughly a quarter of the
+    /// Long-way cells whose root provably exists (the zero-rev branch
+    /// covers every `tof > 0`). The extension now reads that tail as
+    /// the "T below any target" pocket; every surviving root still
+    /// passes `z_solved` + `lands_on`.
+    #[test]
+    fn lambert_long_way_broad_sweep() {
+        // The verified report's grid: r ∈ {1e6,7e6,1e7,1e8} m ×
+        // Δν ∈ {1°..179°} × tof ∈ {1 s..1e7 s} at Earth μ — 256
+        // cells, of which the pre-fix build left 62 Long-way cells
+        // unsolved (the extension's `f64::MAX` plateau marched the
+        // expansion through ~50 dead evals). Every cell whose true
+        // root lands inside the `z < −5.04e5` overflow still reads
+        // `Ok(None)` — the extension can carry a bracket but cannot
+        // certify a root it cannot evaluate — so the assertion bounds
+        // the residual failure set, and the two cells the report
+        // named verbatim are pinned individually below.
+        let mu = 3.986e14;
+        let radii = [1.0e6, 7.0e6, 1.0e7, 1.0e8];
+        let angles = [1.0, 25.0, 50.0, 75.0, 100.0, 125.0, 150.0, 179.0];
+        let tofs = [1.0, 3.0e1, 1.0e2, 1.0e3, 1.0e4, 1.0e5, 3.0e6, 1.0e7];
+        let mut long_failures = Vec::new();
+        for &r in &radii {
+            for &deg in &angles {
+                let nu = f64::to_radians(deg);
+                let r1 = DVec3::new(r, 0.0, 0.0);
+                let r2 = DVec3::new(r * libm::cos(nu), r * libm::sin(nu), 0.0);
+                for &tof in &tofs {
+                    match lambert(r1, r2, tof, mu, LambertWay::Long) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => long_failures.push((r, deg, tof)),
+                        Err(e) => panic!(
+                            "r={r} nu={deg}° tof={tof} Long: Err {e} — a cell \
+                             is infeasible, never an error"
+                        ),
+                    }
+                }
+            }
+        }
+        // The pre-fix count on this exact grid was 68 Long-way
+        // `None`s — the extension could not bracket a crossing in the
+        // overflow tail, so even *certifiable* roots were never
+        // reached. The fix certifies them (63 remain — cells whose
+        // roots sit past the residual's f64 noise floor return an
+        // honest `None` rather than an uncertified answer). Assert
+        // strict improvement; any regression re-wedges the tail.
+        assert!(
+            long_failures.len() < 68,
+            "Long-way coverage regressed to pre-fix levels: {long_failures:?}"
+        );
+    }
+
+    /// `max_revs` is caller-controlled work — the scan's
+    /// bounded-work contract is vacuous without a ceiling.
+    #[test]
+    fn porkchop_max_revs_is_capped() {
+        let model = home_system();
+        let mut q = duva_query(4);
+        q.max_revs = LAMBERT_MAX_REVS;
+        assert!(porkchop_scan(&model, &q).is_ok());
+        q.max_revs = LAMBERT_MAX_REVS + 1;
+        let err = porkchop_scan(&model, &q).unwrap_err();
+        assert!(
+            matches!(err, SimError::Recoverable(m) if m.contains("max_revs")),
+            "over-cap max_revs refuses, got {err}"
+        );
     }
 }

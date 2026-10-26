@@ -408,10 +408,13 @@ pub fn fresh_record(save_seed: u64, instance: PartInstanceId, epoch_tick: u64) -
             counter: 0,
         },
     );
-    // U ∈ [0, 1): −ln U ∈ (0, +∞]. U = 0 would give +inf — a part
-    // that never fails; legitimate (probability ~2⁻⁵³) and handled
-    // everywhere as "no crossing inside any horizon".
-    let theta = -libm::log(u);
+    // U ∈ [0, 1): −ln U ∈ (0, +∞]. An exact U = 0 draw (p = 2⁻⁵³)
+    // would store θ = +∞, which `hash_record`'s non-finite gate reads
+    // as a permanent `Fatal` — the save could never hash again. Clamp
+    // the draw to `MIN_POSITIVE` instead: identity for every u > 0,
+    // and u = 0 yields the finite ~745 "never fails inside any
+    // horizon" reading the physics paths already tolerate.
+    let theta = -libm::log(u.max(f64::MIN_POSITIVE));
     PartReliability {
         instance,
         theta,
@@ -754,14 +757,24 @@ impl World {
         vessel: VesselId,
         tick: u64,
         to_dormant: bool,
-    ) {
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
         let cfg = self.reliability_cfg.clone();
         let quals = self.tech.qualifications.clone();
+        // Burn completions on a non-tick path — the residence restamp
+        // retires `burning` without going through `bubble_part_tick`'s
+        // shutdown branch, so the flight-qualification credit must be
+        // emitted here or the whole burn's units are dropped (the
+        // standard executor completion runs `apply_to_rails_at` → this
+        // hook). `(family, burn_s, in_atmosphere)` — a to-dormant
+        // transition is always vacuum-rated (the to-rails refusal
+        // already fired for anything still inside the atmosphere).
+        let mut burns: Vec<(FamilyId, f64, bool)> = Vec::new();
         let Some(v) = self.vessels.get_mut(&vessel) else {
-            return;
+            return Ok(());
         };
         let Some(craft) = v.craft.clone() else {
-            return;
+            return Ok(());
         };
         // A non-covering spec table (the latch merge's mismatched-
         // halves case) resolves no spec — records keep their
@@ -778,6 +791,10 @@ impl World {
                 continue;
             };
             if to_dormant {
+                if rec.burning {
+                    let burn_s = tick.saturating_sub(rec.burn_start_tick) as f64 / TICK_HZ as f64;
+                    burns.push((spec.family.clone(), burn_s, false));
+                }
                 rec.restamp(
                     tick,
                     spec.dormant_hazard_per_s(cfg.dormant_stress_scale),
@@ -835,6 +852,19 @@ impl World {
                 rec.thrust_factor = thrust_factor_for(rec, &cfg);
             }
         }
+        if !burns.is_empty() {
+            self.shadow_tech(shadow);
+            for (family, burn_s, in_atmo) in burns {
+                let rate = if in_atmo {
+                    self.reliability_cfg.flight_units_per_s_atmosphere
+                } else {
+                    self.reliability_cfg.flight_units_per_s_vacuum
+                };
+                self.tech
+                    .credit_qualification(family, burn_s * rate, 0.0, 0)?;
+            }
+        }
+        Ok(())
     }
 
     /// The `Reliability` slot (§2.6.5 index 8) — publish dormant
@@ -1050,8 +1080,9 @@ impl World {
                     counter: rec.renewal_count,
                 },
             );
-            rec.theta += -libm::log(u);
-            // The mode's effect on the live record.
+            // Same U = 0 guard as `fresh_record` — a +inf θ here is
+            // serialized and then poisons every state hash forever.
+            rec.theta += -libm::log(u.max(f64::MIN_POSITIVE));
             match mode {
                 FailureMode::DegradedThrust => {
                     rec.thrust_factor = self.reliability_cfg.degraded_thrust_factor;
@@ -1255,7 +1286,9 @@ fn apply_mode_to_record(
     rec.usage.hazard_integral = rec.theta;
     rec.renewal_count += 1;
     // `renewal_count`, not `failures.len()` — the dedup'd mode list
-    // stalls on repeats; the draw series must not.
+    // stalls on repeats; the draw series must not. The `MIN_POSITIVE`
+    // clamp is the `fresh_record` U = 0 guard (a +inf θ bricks the
+    // state hash permanently).
     let u = uniform(
         save_seed,
         StreamKey {
@@ -1264,7 +1297,7 @@ fn apply_mode_to_record(
             counter: rec.renewal_count,
         },
     );
-    rec.theta += -libm::log(u);
+    rec.theta += -libm::log(u.max(f64::MIN_POSITIVE));
     if mode == FailureMode::IgnitionFailure {
         rec.burning = false;
         rec.misfire = true;
@@ -1472,6 +1505,16 @@ pub(crate) fn bubble_part_tick(
             // dedup'd `failures` list would repeat an index (and its
             // draw) on a second application of the same mode.
             if let Some(mode) = draw_mode(save_seed, rec.instance, rec.renewal_count, &modes) {
+                // A mid-burn `IgnitionFailure` kills the burn on a path
+                // the shutdown branch never sees — credit the partial
+                // burn like the throttle-to-zero exit does (the crossing
+                // applies at `tick + 1`, so the burn ran
+                // `tick + 1 − burn_start` ticks).
+                if mode == FailureMode::IgnitionFailure && rec.burning {
+                    let burn_s = (tick + 1).saturating_sub(rec.burn_start_tick) as f64 * dt;
+                    out.burns
+                        .push((spec.family.clone(), burn_s, env.in_atmosphere));
+                }
                 apply_mode_to_record(rec, mode, save_seed, cfg);
                 out.failures.push((*node, mode, !operating));
                 if mode == FailureMode::Explosion {

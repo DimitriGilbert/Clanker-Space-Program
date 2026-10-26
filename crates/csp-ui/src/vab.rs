@@ -1538,9 +1538,16 @@ impl VabSession {
             let th = azimuth + k as f64 * 2.0 * core::f64::consts::PI / copies as f64;
             let (sy, cy) = libm::sincos(th);
             let u = DVec3::new(cy, sy, 0.0);
-            let r_p = collider_support_xy(&parent_def.collider, u) * p_scale;
-            let parent_pos = DVec3::new(u.x * r_p, u.y * r_p, z);
-            let parent_id = csp_phys::session::surface_node_id(parent_pos, u, mount_dia);
+            // `surf:` ids store DEF-LOCAL values (scale-1 geometry):
+            // `scaled_attach_node` applies the live scale/stretch at
+            // every snap, so a later resize re-derives the mount point
+            // instead of stranding it at today's size. The hit's z is
+            // measured in the parent's scaled frame — divide it back
+            // out; the diameter likewise divides by the side's own
+            // scale so both ends still compare scaled-to-scaled.
+            let r_p = collider_support_xy(&parent_def.collider, u);
+            let parent_pos = DVec3::new(u.x * r_p, u.y * r_p, z / (p_scale * p_stretch));
+            let parent_id = csp_phys::session::surface_node_id(parent_pos, u, mount_dia / p_scale);
             if bound.contains(&parent_id) {
                 plan.error = Some("that surface spot is already occupied".to_string());
                 return;
@@ -1550,11 +1557,11 @@ impl VabSession {
                     // Upright mount: the child's synthesized node faces
                     // −u in its own local frame, so the snap rotation
                     // is the identity — the part keeps its +z axis.
-                    let r_c = collider_support_xy(&child_def.collider, -u) * built.scale;
+                    let r_c = collider_support_xy(&child_def.collider, -u);
                     let child_id = csp_phys::session::surface_node_id(
                         DVec3::new(-u.x * r_c, -u.y * r_c, 0.0),
                         -u,
-                        mount_dia,
+                        mount_dia / built.scale,
                     );
                     // A moved part's own children can already own this
                     // synthesized hull node — no double-mating.

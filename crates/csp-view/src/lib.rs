@@ -1181,7 +1181,7 @@ impl View {
         // `LiveVesselCount`: `FlightSnapshot` cannot grow).
         world.insert_resource(flight::VesselPropulsionStaged::default());
         world.insert_resource(flight::FlightUiData::default());
-        world.insert_resource(flight::StagePlan::default());
+        world.insert_resource(flight::StagePlans::default());
         world.insert_resource(flight::FlightFrame::default());
         // §2.6.4: the latched-vessel weld cache — the staging path's
         // session state, so a parked craft isn't re-welded per frame.
@@ -2040,7 +2040,7 @@ impl View {
         // documented rule is newest-spawn-takes-focus, so the fresh
         // launch gets the camera, HUD, and command route.
         self.clear_flight_focus_override();
-        self.world.insert_resource(plan);
+        self.world.resource_mut::<flight::StagePlans>().push(plan);
         self.set_mode(ViewMode::Flight);
         Ok(())
     }
@@ -2069,30 +2069,38 @@ impl View {
     /// not. Honest limitation: a jettisoned part leaves the sim
     /// outright — no KSP-style debris fragment, and engines are
     /// globally armed so a firing separates but never ignites.
+    #[allow(clippy::too_many_lines)] // the per-vessel plan table adds arms
     pub fn fire_stage(&mut self) -> usize {
-        let (vessel, ambiguous, refuse) = {
-            let mut plan = self.world.resource_mut::<flight::StagePlan>();
+        // Per-vessel plans (C13-F4): every launch pushed its own
+        // `StagePlan` into `StagePlans`; a second launch no longer
+        // destroys the first craft's unfired stages. The press picks
+        // the plan bound to the focused vessel, else the newest plan
+        // that still holds stages — identical to the single-slot
+        // behaviour when only one launch is live.
+        let focus = self.flight_focus();
+        let Some((idx, vessel, ambiguous)) = self
+            .world
+            .resource_mut::<flight::StagePlans>()
+            .select_for_fire(&self.sim, focus)
+        else {
+            self.flight_notice("SINGLE-STAGE CRAFT — NOTHING TO STAGE".to_string());
+            return 0;
+        };
+        {
+            let mut plans = self.world.resource_mut::<flight::StagePlans>();
+            let plan = &mut plans.plans[idx];
             if plan.stages.is_empty() {
                 // `total` keeps the cases honest — an expended
                 // multi-stage plan and a single-stage craft are not
                 // the same "nothing".
-                (
-                    None,
-                    false,
-                    Some(if plan.total > 0 {
-                        "ALL STAGES FIRED — NOTHING LEFT"
-                    } else {
-                        "SINGLE-STAGE CRAFT — NOTHING TO STAGE"
-                    }),
-                )
-            } else {
-                let v = plan.vessel_for(&self.sim);
-                (v, plan.ambiguous, None)
+                let msg = if plan.total > 0 {
+                    "ALL STAGES FIRED — NOTHING LEFT"
+                } else {
+                    "SINGLE-STAGE CRAFT — NOTHING TO STAGE"
+                };
+                self.flight_notice(msg.to_string());
+                return 0;
             }
-        };
-        if let Some(msg) = refuse {
-            self.flight_notice(msg.to_string());
-            return 0;
         }
         if ambiguous {
             // P05-F1: two same-craft mints ≥ min_id — the plan can
@@ -2100,7 +2108,8 @@ impl View {
             // hit a random one. Retire it like the gone-vessel branch
             // rather than leaving a loaded trap for the next press.
             {
-                let mut plan = self.world.resource_mut::<flight::StagePlan>();
+                let mut plans = self.world.resource_mut::<flight::StagePlans>();
+                let plan = &mut plans.plans[idx];
                 plan.stages.clear();
                 plan.vessel = None;
             }
@@ -2132,7 +2141,8 @@ impl View {
                 // so the readout stops promising firings it cannot
                 // deliver.
                 {
-                    let mut plan = self.world.resource_mut::<flight::StagePlan>();
+                    let mut plans = self.world.resource_mut::<flight::StagePlans>();
+                    let plan = &mut plans.plans[idx];
                     plan.stages.clear();
                     plan.vessel = None;
                 }
@@ -2142,9 +2152,7 @@ impl View {
         }
         // `stages` is stored front-first firing order; `remove(0)`
         // takes the next firing (pop() would take the last).
-        let nodes = self
-            .world
-            .resource_mut::<flight::StagePlan>()
+        let nodes = self.world.resource_mut::<flight::StagePlans>().plans[idx]
             .stages
             .remove(0);
         let fired = nodes.len();

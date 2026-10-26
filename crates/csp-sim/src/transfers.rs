@@ -417,6 +417,21 @@ pub(crate) fn check_tank_masses(craft: &crate::CraftDef) -> Result<(), SimError>
         let Some(part) = craft.parts.get(node.effective_index as usize) else {
             continue;
         };
+        // Duplicate-resource tank specs are incoherent under the
+        // rest of the module's conventions: `vessel_capacity` sums
+        // every matching spec while `spawn_contents` keeps only the
+        // last and `debit`/`credit` address only the first — the
+        // resolver rejects them for authored crafts; a programmatic
+        // `CraftDef` must meet the same gate here at the spawn
+        // boundary.
+        {
+            let mut seen = std::collections::BTreeSet::new();
+            if part.tanks.iter().any(|t| !seen.insert(t.resource.as_str())) {
+                return Err(SimError::Recoverable(
+                    "physical spawn: duplicate tank resource on one part",
+                ));
+            }
+        }
         let full_wet: f64 = part
             .tanks
             .iter()
@@ -1023,9 +1038,18 @@ impl World {
                 // resupply fact — cumulative by `(colony, resource)`,
                 // counted by what actually landed, then the
                 // `ColonyDelivery` trigger evaluates the subscribed
-                // contracts.
+                // contracts. Gated on `colony_live`: the cargo still
+                // lands in a dead colony's frozen store (terminal
+                // bookkeeping, `credit_end`'s arm), but dumping into
+                // an abandoned colony must not complete a "supply a
+                // functioning colony" contract — the same gate the
+                // crew-landing (`land_crew`) and join paths apply.
                 if let TransferEnd::Colony(c) = t.to
                     && landed > 0.0
+                    && self
+                        .colonies
+                        .get(&c)
+                        .is_some_and(|co| crate::colonies::colony_live(&co.state))
                 {
                     crate::contracts::shadow_contracts(&self.contracts, &mut shadow.contracts);
                     *self

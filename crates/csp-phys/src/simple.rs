@@ -248,6 +248,14 @@ pub const BAUMGARTE_BETA: f64 = 0.2;
 /// the rest equilibrium (`g·dt² ≈ 2.4 mm` per tick) untouched.
 pub const MAX_TICK_POS_CORRECTION: f64 = 0.2;
 
+/// Per-body, per-tick cap on the total ANGULAR excursion the
+/// Baumgarte position pass may apply, radians — the rotational twin
+/// of [`MAX_TICK_POS_CORRECTION`]. The linear budget alone leaves
+/// `‖I⁻¹(r × n·σ)‖` unbounded (a deeply buried low-gyration hull
+/// could take radians of correction per application), and a bounded
+/// excursion is also what keeps the axis-angle step honest.
+pub const MAX_TICK_ANG_CORRECTION: f64 = 0.05;
+
 /// §2.6.4's named default: `‖v‖ < settle_v` with `settle_v = 0.05` m/s.
 pub const DEFAULT_SETTLE_V: f64 = 0.05;
 /// §2.6.4 names `settle_w` but gives no number; `0.05` rad/s matches
@@ -585,6 +593,15 @@ struct Constraint {
     /// The body's inverse inertia, body frame (`ZERO` for a singular
     /// tensor — no angular response).
     inv_i: SymMat3,
+    /// The normal-velocity target — `0` for a penetrating contact
+    /// (restitution 0), `depth/dt < 0` for a speculative one: the
+    /// vertex may keep closing until it just touches this tick, but
+    /// no faster — the anti-tunneling margin.
+    target_vn: f64,
+    /// Whether this constraint carries a public [`Contact`] record —
+    /// speculative contacts are solver-only: a near-miss is not a
+    /// touch (the sim's ground-contact/impact reads would misfire).
+    has_record: bool,
     /// Accumulated impulses this tick (Gauss–Seidel, cold-started).
     lambda_n: f64,
     lambda_t1: f64,
@@ -604,6 +621,8 @@ impl Constraint {
         depth: f64,
         body: &WeldedBody,
         env: &Environment,
+        target_vn: f64,
+        has_record: bool,
     ) -> (Self, Contact) {
         let conj = body.rot.conjugate();
         let r_body = vertex_body - body.com_local;
@@ -632,6 +651,8 @@ impl Constraint {
             kt2: effective(t2_body),
             surface_vel_body: conj.rotate(env.body_spin.cross(pos_world - env.body_center)),
             inv_i,
+            target_vn,
+            has_record,
             lambda_n: 0.0,
             lambda_t1: 0.0,
             lambda_t2: 0.0,
@@ -756,6 +777,15 @@ struct PairConstraint {
     /// solves correctly: `inv_m = inv_i = 0` makes it immovable).
     a_latched: bool,
     b_latched: bool,
+    /// The normal-velocity target — `0` for a penetrating contact,
+    /// `depth/dt < 0` for a speculative one (close to grazing, no
+    /// farther — the anti-tunneling margin, same rule as the ground
+    /// manifold).
+    target_vn: f64,
+    /// Whether this constraint carries public [`Contact`] records —
+    /// speculative contacts are solver-only (a near-miss is not a
+    /// touch for the sim's contact predicates).
+    has_record: bool,
     /// Accumulated impulses this tick (Gauss–Seidel, cold-started).
     lambda_n: f64,
     lambda_t1: f64,
@@ -782,6 +812,8 @@ impl PairConstraint {
         b: &WeldedBody,
         hull_a: u32,
         hull_b: u32,
+        target_vn: f64,
+        has_record: bool,
     ) -> (Self, Contact, Contact) {
         let (t1, t2) = friction_basis(normal_world);
         let r_a = pos_world - a.com_world();
@@ -836,6 +868,8 @@ impl PairConstraint {
             inv_i_b,
             a_latched,
             b_latched,
+            target_vn,
+            has_record,
             lambda_n: 0.0,
             lambda_t1: 0.0,
             lambda_t2: 0.0,
@@ -1095,6 +1129,26 @@ fn generate_joint_constraints(bodies: &[WeldedBody], joints: &[JointDef]) -> Vec
     out
 }
 
+/// Rotate `q` by a world-frame incremental rotation vector `dθ` —
+/// the exact axis-angle step (`from_axis_angle` composes left for a
+/// world-frame increment), replacing the first-order Euler advance
+/// `q += ½·(dθ⊗q)` whose linearization is only valid for tiny dθ.
+fn apply_rotation_delta(q: DQuat, dtheta_world: DVec3) -> DQuat {
+    let ang = dtheta_world.norm();
+    if ang <= 0.0 {
+        return q;
+    }
+    (DQuat::from_axis_angle(dtheta_world / ang, ang) * q).normalize()
+}
+
+/// The angular pseudo-impulse a ground-manifold correction of
+/// magnitude `σ` applies: `I⁻¹(r × n·σ)` in body frame — used to
+/// budget σ against [`MAX_TICK_ANG_CORRECTION`].
+fn ang_excursion_ground(c: &Constraint, b: &WeldedBody, sigma: f64) -> f64 {
+    let r_body = c.local_vertex - b.com_local;
+    c.inv_i.mul_vec(r_body.cross(c.n_body * sigma)).norm()
+}
+
 /// The position pass's pair write-back — pseudo-impulse `j` (world
 /// frame, `σ·n` signed) applied to `b` about its CoM: `x̄ += j/m`,
 /// quaternion advance by `I⁻¹(r×j)`, `pos` re-derived — the same
@@ -1108,15 +1162,7 @@ fn pair_position_correction(b: &mut WeldedBody, inv_i: SymMat3, p_world: DVec3, 
     let j_body = conj.rotate(j);
     let dtheta_body = inv_i.mul_vec(r_body.cross(j_body));
     let dtheta_world = b.rot.rotate(dtheta_body);
-    let wq = DQuat::new(dtheta_world.x, dtheta_world.y, dtheta_world.z, 0.0);
-    let dq = wq * b.rot;
-    b.rot = DQuat::new(
-        b.rot.x + 0.5 * dq.x,
-        b.rot.y + 0.5 * dq.y,
-        b.rot.z + 0.5 * dq.z,
-        b.rot.w + 0.5 * dq.w,
-    )
-    .normalize();
+    b.rot = apply_rotation_delta(b.rot, dtheta_world);
     b.pos = com - b.rot.rotate(b.com_local);
 }
 
@@ -1546,8 +1592,18 @@ impl SimpleBackend {
         b.vel = b.vel + force * (PHYSICS_DT / b.mass_kg);
         let inv_i = b.inertia_local.inverse().unwrap_or(SymMat3::ZERO);
         let tau_body = b.rot.conjugate().rotate(torque);
-        let gyro = b.ang_vel.cross(b.inertia_local.mul_vec(b.ang_vel));
-        b.ang_vel = b.ang_vel + inv_i.mul_vec(tau_body - gyro) * PHYSICS_DT;
+        // Midpoint evaluation of the gyroscopic term: explicit Euler
+        // (α at the old ω) pumps rotational energy by a strictly
+        // positive ½dt²·aᵀIa every tick for ω off a principal axis —
+        // a torque-free tumble spun up ~×e^11 per game-hour at
+        // debris-tumble speeds. The midpoint stage costs one extra
+        // evaluate, keeps the pinned order, and demotes the pump to
+        // alternating-sign O(dt³).
+        let gyro = |w: DVec3| w.cross(b.inertia_local.mul_vec(w));
+        let a0 = inv_i.mul_vec(tau_body - gyro(b.ang_vel));
+        let w_mid = b.ang_vel + a0 * (0.5 * PHYSICS_DT);
+        let a1 = inv_i.mul_vec(tau_body - gyro(w_mid));
+        b.ang_vel = b.ang_vel + a1 * PHYSICS_DT;
 
         // The position phase advances the CoM, then re-derives the
         // origin from the new rotation — `vel` is the CoM velocity, so
@@ -1597,25 +1653,54 @@ impl SimpleBackend {
                     } else {
                         self.env.radius_m - dist
                     };
-                    // Strict `> 0`: a vertex exactly grazing the
-                    // surface carries no penetration and no impulse
-                    // authority; it is caught next tick at depth
-                    // ≤ v·dt (module docs).
-                    if depth > 0.0 && dist > 0.0 {
+                    // Strict `> 0` generates a real manifold point.
+                    // A vertex NOT yet below the surface but closing
+                    // fast enough to reach it this tick generates a
+                    // SPECULATIVE contact instead: the velocity solve
+                    // lets it close to grazing (`target_vn = depth/dt`)
+                    // but no farther — the anti-tunneling margin for
+                    // fast landers. Speculative contacts carry no
+                    // public record: a near-miss is not a touch.
+                    if dist <= 0.0 {
+                        continue;
+                    }
+                    let n_w = rel / dist;
+                    let speculative = if depth <= 0.0 {
+                        // Vertex point velocity relative to the
+                        // (possibly spinning) surface, along n.
+                        let v_pt = b.vel + b.rot.rotate(b.ang_vel).cross(p - b.com_world())
+                            - self.env.body_spin.cross(rel);
+                        let closing = -v_pt.dot(n_w);
+                        // `depth` is negative outside the surface;
+                        // within `closing·dt` it arrives this tick.
+                        depth > -closing * PHYSICS_DT && closing > 0.0
+                    } else {
+                        false
+                    };
+                    if depth > 0.0 || speculative {
                         let ci = self.contacts[i].len();
+                        let target_vn = if depth <= 0.0 {
+                            depth / PHYSICS_DT
+                        } else {
+                            0.0
+                        };
                         let (c, record) = Constraint::new(
                             i,
                             ci,
                             hull_index as u32,
                             *v,
                             p,
-                            rel / dist,
+                            n_w,
                             depth,
                             b,
                             &self.env,
+                            target_vn,
+                            depth > 0.0,
                         );
                         constraints.push(c);
-                        self.contacts[i].push(record);
+                        if depth > 0.0 {
+                            self.contacts[i].push(record);
+                        }
                     }
                 }
             }
@@ -1646,6 +1731,37 @@ impl SimpleBackend {
         // facet-plane work happens (the common case: vessels sharing
         // a bubble but kilometres apart, pays only O(total verts)).
         let body_aabbs: Vec<Option<(DVec3, DVec3)>> = bodies.iter().map(body_world_aabb).collect();
+        // Per-BODY narrowphase data, hoisted out of the pair loop:
+        // per-hull world AABBs and facet planes depend on one body
+        // only — computing them per pair paid O(N²) reconstruction of
+        // static data (and `facet_planes` is the O(n⁴) sweep). `None`
+        // planes mark a degenerate hull that can never be a penetrated
+        // target.
+        let hull_aabbs: Vec<Vec<Option<(DVec3, DVec3)>>> = bodies
+            .iter()
+            .map(|b| {
+                b.collider
+                    .hulls
+                    .iter()
+                    .map(|h| hull_world_aabb(b, h))
+                    .collect()
+            })
+            .collect();
+        let hull_planes: Vec<Vec<Option<Vec<crate::hull::Plane>>>> = bodies
+            .iter()
+            .map(|b| {
+                b.collider
+                    .hulls
+                    .iter()
+                    .map(|h| {
+                        crate::hull::facet_planes(
+                            &h.vertices,
+                            crate::hull::plane_epsilon(&h.vertices),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
         for i in 0..bodies.len() {
             for j in (i + 1)..bodies.len() {
                 let (Some(bi), Some(bj)) = (body_aabbs[i], body_aabbs[j]) else {
@@ -1661,45 +1777,10 @@ impl SimpleBackend {
                     // impulse authority either way.
                     continue;
                 }
-                // Per-hull broadphase + facet planes for this pair.
-                // Planes are computed once per hull (lazily per pair —
-                // a hull may pair with several others) and `None`
-                // marks a degenerate hull that can never be a
-                // penetrated target.
-                let aabbs_a: Vec<Option<(DVec3, DVec3)>> = a
-                    .collider
-                    .hulls
-                    .iter()
-                    .map(|h| hull_world_aabb(a, h))
-                    .collect();
-                let aabbs_b: Vec<Option<(DVec3, DVec3)>> = b
-                    .collider
-                    .hulls
-                    .iter()
-                    .map(|h| hull_world_aabb(b, h))
-                    .collect();
-                let planes_a: Vec<Option<Vec<crate::hull::Plane>>> = a
-                    .collider
-                    .hulls
-                    .iter()
-                    .map(|h| {
-                        crate::hull::facet_planes(
-                            &h.vertices,
-                            crate::hull::plane_epsilon(&h.vertices),
-                        )
-                    })
-                    .collect();
-                let planes_b: Vec<Option<Vec<crate::hull::Plane>>> = b
-                    .collider
-                    .hulls
-                    .iter()
-                    .map(|h| {
-                        crate::hull::facet_planes(
-                            &h.vertices,
-                            crate::hull::plane_epsilon(&h.vertices),
-                        )
-                    })
-                    .collect();
+                let aabbs_a = &hull_aabbs[i];
+                let aabbs_b = &hull_aabbs[j];
+                let planes_a = &hull_planes[i];
+                let planes_b = &hull_planes[j];
                 for (hi, ha) in a.collider.hulls.iter().enumerate() {
                     for (hb_i, hb) in b.collider.hulls.iter().enumerate() {
                         let (Some(aa), Some(bb)) = (aabbs_a[hi], aabbs_b[hb_i]) else {
@@ -1713,6 +1794,46 @@ impl SimpleBackend {
                             for v in &ha.vertices {
                                 let p_w = a.pos + a.rot.rotate(*v);
                                 let p_b = b.rot.conjugate().rotate(p_w - b.pos);
+                                // Speculative anti-tunneling margin: a
+                                // vertex still OUTSIDE but closing on a
+                                // facet fast enough to cross this tick
+                                // gets a `target_vn < 0` constraint —
+                                // it may close to grazing, no farther.
+                                // Solver-only: no public record (a
+                                // near-miss is not a touch).
+                                let v_rel_b = b.rot.conjugate().rotate(
+                                    (a.vel + a.rot.rotate(a.ang_vel).cross(p_w - a.com_world()))
+                                        - (b.vel
+                                            + b.rot.rotate(b.ang_vel).cross(p_w - b.com_world())),
+                                );
+                                for (face, depth) in crate::hull::point_speculative(
+                                    pb,
+                                    p_b,
+                                    v_rel_b,
+                                    PHYSICS_DT,
+                                    crate::hull::vertex_margin(&hb.vertices),
+                                ) {
+                                    let n_w = b.rot.rotate(pb[face].n);
+                                    let (c, _ra, _rb) = PairConstraint::new(
+                                        i,
+                                        j,
+                                        0,
+                                        0,
+                                        *v,
+                                        pb[face].n,
+                                        pb[face].d,
+                                        p_w,
+                                        n_w,
+                                        depth,
+                                        a,
+                                        b,
+                                        hi as u32,
+                                        hb_i as u32,
+                                        depth / PHYSICS_DT,
+                                        false,
+                                    );
+                                    pairs.push(c);
+                                }
                                 // One manifold point per facet the
                                 // vertex entered — ascending facet
                                 // index, a fixed order like every
@@ -1740,6 +1861,8 @@ impl SimpleBackend {
                                         b,
                                         hi as u32,
                                         hb_i as u32,
+                                        0.0,
+                                        true,
                                     );
                                     pairs.push(c);
                                     self.contacts[i].push(ra);
@@ -1752,6 +1875,39 @@ impl SimpleBackend {
                             for v in &hb.vertices {
                                 let p_w = b.pos + b.rot.rotate(*v);
                                 let p_a = a.rot.conjugate().rotate(p_w - a.pos);
+                                let v_rel_a = a.rot.conjugate().rotate(
+                                    (b.vel + b.rot.rotate(b.ang_vel).cross(p_w - b.com_world()))
+                                        - (a.vel
+                                            + a.rot.rotate(a.ang_vel).cross(p_w - a.com_world())),
+                                );
+                                for (face, depth) in crate::hull::point_speculative(
+                                    pa,
+                                    p_a,
+                                    v_rel_a,
+                                    PHYSICS_DT,
+                                    crate::hull::vertex_margin(&ha.vertices),
+                                ) {
+                                    let n_w = a.rot.rotate(pa[face].n);
+                                    let (c, _rj, _ri) = PairConstraint::new(
+                                        j,
+                                        i,
+                                        0,
+                                        0,
+                                        *v,
+                                        pa[face].n,
+                                        pa[face].d,
+                                        p_w,
+                                        n_w,
+                                        depth,
+                                        b,
+                                        a,
+                                        hb_i as u32,
+                                        hi as u32,
+                                        depth / PHYSICS_DT,
+                                        false,
+                                    );
+                                    pairs.push(c);
+                                }
                                 for (face, depth) in crate::hull::point_penetration(
                                     pa,
                                     p_a,
@@ -1775,6 +1931,8 @@ impl SimpleBackend {
                                         a,
                                         hb_i as u32,
                                         hi as u32,
+                                        0.0,
+                                        true,
                                     );
                                     pairs.push(c);
                                     self.contacts[j].push(rj);
@@ -1834,7 +1992,7 @@ impl SimpleBackend {
                 // statement either way).
                 let vn = rel_point_velocity_body(*vel_b, b, c).dot(c.n_body);
                 let old = c.lambda_n;
-                c.lambda_n = (c.lambda_n - vn * c.kn).max(0.0);
+                c.lambda_n = (c.lambda_n - (vn - c.target_vn) * c.kn).max(0.0);
                 let dl = c.lambda_n - old;
                 if dl != 0.0 {
                     apply_impulse(b, vel_b, omega_w, c, c.n_body, dl);
@@ -1886,7 +2044,7 @@ impl SimpleBackend {
                     - (bodies[ib].vel + omega_world[ib].cross(c.r_b)))
                 .dot(c.n);
                 let old = c.lambda_n;
-                c.lambda_n = (c.lambda_n - vn * c.kn).max(0.0);
+                c.lambda_n = (c.lambda_n - (vn - c.target_vn) * c.kn).max(0.0);
                 let dl = c.lambda_n - old;
                 if dl != 0.0 {
                     apply_pair_impulse(bodies, &mut vel_body, &mut omega_world, c, c.n * dl);
@@ -2008,8 +2166,11 @@ impl SimpleBackend {
         pairs: &[PairConstraint],
     ) {
         // Per-body budget of CoM translation this pass may apply this
-        // tick — spent in fixed ascending constraint order.
+        // tick — spent in fixed ascending constraint order. The
+        // angular budget is the twin cap: ‖I⁻¹(r × n·σ)‖ summed per
+        // body, which the linear budget alone leaves unbounded.
         let mut spent = vec![0.0; bodies.len()];
+        let mut spent_ang = vec![0.0; bodies.len()];
         for _ in 0..SOLVER_ITERATIONS {
             for c in constraints {
                 let b = &mut bodies[c.body as usize];
@@ -2030,38 +2191,40 @@ impl SimpleBackend {
                     continue;
                 }
                 // σ is the pseudo-impulse magnitude; the CoM travels
-                // σ·n/m. Scale σ down to the remaining per-tick budget.
+                // σ·n/m. Scale σ down to the remaining per-tick budget
+                // — linear AND angular: ‖I⁻¹(r × n·σ)‖ gets its own
+                // per-tick cap, which the CoM budget alone leaves
+                // unbounded.
                 let remaining = (MAX_TICK_POS_CORRECTION - spent[c.body as usize]).max(0.0);
+                let remaining_ang = (MAX_TICK_ANG_CORRECTION - spent_ang[c.body as usize]).max(0.0);
                 let com_travel = |sigma: f64| sigma / b.mass_kg;
                 let mut sigma = BAUMGARTE_BETA * depth * c.kn;
                 if com_travel(sigma) > remaining {
                     sigma *= remaining / com_travel(sigma);
                 }
+                let ang = ang_excursion_ground(c, b, sigma);
+                if ang > remaining_ang && ang > 0.0 {
+                    sigma *= remaining_ang / ang;
+                }
                 if sigma <= 0.0 {
                     continue;
                 }
                 spent[c.body as usize] += com_travel(sigma);
+                spent_ang[c.body as usize] += ang_excursion_ground(c, b, sigma);
 
                 let normal = rel / dist;
                 let conj = b.rot.conjugate();
                 let n_body = conj.rotate(normal);
                 // CoM-consistent write-back: advance x̄ by the linear
-                // pseudo-impulse, rotate q by the angular one, then
+                // pseudo-impulse, rotate q by the angular one (exact
+                // axis-angle, not the first-order Euler step), then
                 // re-derive pos — same com/pose relation as
                 // `integrate_free`.
                 let com = b.com_world() + normal * com_travel(sigma);
                 let r_body = conj.rotate(p - b.com_world());
                 let dtheta_body = c.inv_i.mul_vec(r_body.cross(n_body * sigma));
                 let dtheta_world = b.rot.rotate(dtheta_body);
-                let wq = DQuat::new(dtheta_world.x, dtheta_world.y, dtheta_world.z, 0.0);
-                let dq = wq * b.rot;
-                b.rot = DQuat::new(
-                    b.rot.x + 0.5 * dq.x,
-                    b.rot.y + 0.5 * dq.y,
-                    b.rot.z + 0.5 * dq.z,
-                    b.rot.w + 0.5 * dq.w,
-                )
-                .normalize();
+                b.rot = apply_rotation_delta(b.rot, dtheta_world);
                 b.pos = com - b.rot.rotate(b.com_local);
             }
             for c in pairs {
@@ -2081,11 +2244,24 @@ impl SimpleBackend {
                 // CoM travels σ/m. The per-body budget caps both —
                 // a latched side moves nothing and spends nothing.
                 let mut sigma = BAUMGARTE_BETA * depth * c.kn;
+                // Each side's σ is capped by BOTH budgets: the CoM
+                // travel AND the angular excursion ‖I⁻¹(r × σn)‖ the
+                // correction applies about that body's CoM.
+                let pair_ang = |bodies: &[WeldedBody], i: usize, inv_i: SymMat3, j: DVec3| {
+                    let b = &bodies[i];
+                    let r_b = b.rot.conjugate().rotate(p_w - b.com_world());
+                    inv_i.mul_vec(r_b.cross(b.rot.conjugate().rotate(j))).norm()
+                };
                 if !c.a_latched {
                     let remaining = (MAX_TICK_POS_CORRECTION - spent[ia]).max(0.0);
                     let travel = sigma / bodies[ia].mass_kg;
                     if travel > remaining && travel > 0.0 {
                         sigma *= remaining / travel;
+                    }
+                    let remaining_ang = (MAX_TICK_ANG_CORRECTION - spent_ang[ia]).max(0.0);
+                    let ang = pair_ang(bodies, ia, c.inv_i_a, n_w * sigma);
+                    if ang > remaining_ang && ang > 0.0 {
+                        sigma *= remaining_ang / ang;
                     }
                 }
                 if !c.b_latched {
@@ -2094,16 +2270,23 @@ impl SimpleBackend {
                     if travel > remaining && travel > 0.0 {
                         sigma *= remaining / travel;
                     }
+                    let remaining_ang = (MAX_TICK_ANG_CORRECTION - spent_ang[ib]).max(0.0);
+                    let ang = pair_ang(bodies, ib, c.inv_i_b, n_w * -sigma);
+                    if ang > remaining_ang && ang > 0.0 {
+                        sigma *= remaining_ang / ang;
+                    }
                 }
                 if sigma <= 0.0 {
                     continue;
                 }
                 if !c.a_latched {
                     spent[ia] += sigma / bodies[ia].mass_kg;
+                    spent_ang[ia] += pair_ang(bodies, ia, c.inv_i_a, n_w * sigma);
                     pair_position_correction(&mut bodies[ia], c.inv_i_a, p_w, n_w * sigma);
                 }
                 if !c.b_latched {
                     spent[ib] += sigma / bodies[ib].mass_kg;
+                    spent_ang[ib] += pair_ang(bodies, ib, c.inv_i_b, n_w * -sigma);
                     pair_position_correction(&mut bodies[ib], c.inv_i_b, p_w, n_w * -sigma);
                 }
             }
@@ -2279,6 +2462,9 @@ impl PhysicsBackend for SimpleBackend {
         // collision data. Position-level Baumgarte corrections are
         // pseudo-impulses, not forces, and stay out.
         for c in &constraints {
+            if !c.has_record {
+                continue;
+            }
             let b = &bodies[c.body as usize];
             let j = b
                 .rot
@@ -2288,6 +2474,9 @@ impl PhysicsBackend for SimpleBackend {
         // Pair impulses are already world-frame: `+J` on the
         // penetrator's record, `−J` on the penetrated body's.
         for c in &pair_constraints {
+            if !c.has_record {
+                continue;
+            }
             let j = c.n * c.lambda_n + c.t1 * c.lambda_t1 + c.t2 * c.lambda_t2;
             self.contacts[c.a as usize][c.contact_index_a as usize].impulse = j;
             self.contacts[c.b as usize][c.contact_index_b as usize].impulse = -j;
@@ -3586,7 +3775,9 @@ mod tests {
                 rise <= MAX_TICK_POS_CORRECTION + 1e-9,
                 "uncapped correction: {rise} m in one tick"
             );
-            saw_capped_tick |= rise > 0.05;
+            saw_capped_tick |= rise > 0.01; // the angular budget can
+            // shave σ below the old 0.05 witness — the cap still
+            // engaged, just split across both budgets
             prev = bodies[0].pos;
             assert!(
                 bodies[0].vel.norm() < DEFAULT_SETTLE_V,
@@ -3954,5 +4145,53 @@ mod tests {
             bodies
         };
         assert_eq!(run(), run());
+    }
+
+    /// C9-simple1-F1: torque-free tumble must not pump rotational
+    /// energy. The explicit-Euler gyro term grew E by ~×1.12 per
+    /// game-hour on this inertia; the midpoint term holds it ~flat.
+    #[test]
+    fn torque_free_tumble_holds_rotational_energy() {
+        let mut b = box_body(10_000.0, DVec3::new(1.0, 1.0, 1.0));
+        let i0 = SymMat3::new(1.0e5, 1.0e6, 1.0e6, 0.0, 0.0, 0.0);
+        b.inertia_local = i0;
+        b.ang_vel = DVec3::new(0.05, 0.2, 0.1);
+        let mut be = SimpleBackend::new(terrin_env());
+        // Free space far from the surface: torque-free.
+        b.pos = DVec3::new(0.0, 0.0, TERRIN_R + 100_000.0);
+        let e0 = 0.5 * b.ang_vel.dot(i0.mul_vec(b.ang_vel));
+        let mut bodies = vec![b];
+        step_n(&mut be, &mut bodies, 64 * 60);
+        let b = &bodies[0];
+        let e1 = 0.5 * b.ang_vel.dot(i0.mul_vec(b.ang_vel));
+        assert!(
+            e1 <= e0 * 1.01,
+            "rotational energy pumped: {e0} -> {e1} (×{})",
+            e1 / e0
+        );
+    }
+
+    /// C9-simple1-F2: a fast faller must not bury metres into the
+    /// ground in a single tick — the speculative margin catches it.
+    #[test]
+    fn fast_lander_does_not_tunnel() {
+        let mut be = SimpleBackend::new(terrin_env());
+        let r = TERRIN_R;
+        let mut b = box_body(1_000.0, DVec3::new(0.5, 0.5, 0.5));
+        b.pos = DVec3::new(0.0, 0.0, r + 33.0);
+        b.vel = DVec3::new(0.0, 0.0, -2_000.0);
+        let mut bodies = vec![b];
+        step_n(&mut be, &mut bodies, 3);
+        let b = &bodies[0];
+        // Deepest vertex must be within a metre of the surface, not
+        // ~29 m buried (pre-margin behaviour).
+        let mut min_h = f64::MAX;
+        for h in &b.collider.hulls {
+            for v in &h.vertices {
+                let p = b.pos + b.rot.rotate(*v);
+                min_h = min_h.min((p - be.environment().body_center).norm() - r);
+            }
+        }
+        assert!(min_h > -1.0, "buried {min_h} m under the surface");
     }
 }

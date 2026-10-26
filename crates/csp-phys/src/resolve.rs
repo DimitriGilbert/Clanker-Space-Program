@@ -1398,6 +1398,40 @@ fn resolve_module(
     })
 }
 
+/// The whole-curve well-formedness gate the validator applies
+/// (validate.rs `check_reliability`): non-empty, every knot finite,
+/// `qualification_units` non-negative and strictly increasing, and
+/// every `hazard_multiplier` in `(0, 1]`. `qual_factor` evaluated at
+/// the resolve-time units alone cannot see a malformed knot further
+/// along the curve — and the sim re-evaluates the same curve at the
+/// family's *live* units — so the curve itself is gated here, where
+/// the resolver's own contract ("cannot assume validation ran") says
+/// the check belongs.
+pub fn qual_curve_valid(curve: &csp_data::QualCurve) -> bool {
+    let knots = &curve.knots;
+    if knots.is_empty() {
+        return false;
+    }
+    // Units are non-decreasing, not strictly increasing: equal-knot
+    // pairs are a supported pattern — the earlier window claims every
+    // `units` that could reach the 0/0 division, so the curve
+    // degenerates gracefully to the first knot's value.
+    let mut prev = f64::NEG_INFINITY;
+    for k in knots {
+        if !k.qualification_units.is_finite()
+            || !k.hazard_multiplier.is_finite()
+            || k.qualification_units < 0.0
+            || k.qualification_units < prev
+            || !(0.0..=1.0).contains(&k.hazard_multiplier)
+            || k.hazard_multiplier <= 0.0
+        {
+            return false;
+        }
+        prev = k.qualification_units;
+    }
+    true
+}
+
 /// Piecewise-linear `qual_factor` at `units` over the def's
 /// qualification curve, clamped to the end knots (the §3.0
 /// temperature-table convention `AeroKnot` docs reuse). An empty
@@ -1593,6 +1627,7 @@ impl ReliabilitySpec {
                     && r.multiplier.is_finite()
                     && r.multiplier >= 1.0
             })
+            && qual_curve_valid(&self.qualification_curve)
             && self
                 .engine
                 .is_none_or(|e| e.rated_burn_s.is_finite() && e.rated_burn_s >= 0.0)
@@ -2106,6 +2141,17 @@ fn resolve_reliability(
         return Err(ResolveError::InvalidStat {
             part_id: def.id.clone(),
             field: "resolve: failure-mode weight is non-finite",
+        });
+    }
+    // Whole-curve gate: the curve ships verbatim on the spec and the
+    // sim re-evaluates it at the family's *live* units, so a knot the
+    // resolve-time evaluation never reaches can still lerp a NaN or a
+    // >1 multiplier into a live λ — gate every knot, not just the
+    // point the resolve happens to sit at (validate.rs's rules).
+    if !qual_curve_valid(&def.reliability.qualification_curve) {
+        return Err(ResolveError::InvalidStat {
+            part_id: def.id.clone(),
+            field: "resolve: qualification curve is malformed",
         });
     }
     let qf = qual_factor(&def.reliability.qualification_curve, qual.units());

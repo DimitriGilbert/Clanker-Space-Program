@@ -701,9 +701,12 @@ fn find_def<'a>(defs: &'a LoadedParts, part_id: &PartId) -> Option<&'a PartDef> 
 pub const SURFACE_NODE_PREFIX: &str = "surf:";
 
 /// Encode a synthetic surface-mount node as an [`AttachEdge`] node id.
-/// `position`/`direction` are part-local at the mounting part's built
-/// scale (the caller resolves them); `diameter_m` is the size class
-/// the mate must match.
+/// `position`/`direction` are DEF-LOCAL — the mounting part's scale-1
+/// frame (the caller resolves them); `diameter_m` is the def-local
+/// size class the mate must match. Storing def-local values is what
+/// lets a resize move surface mounts: [`scaled_attach_node`] applies
+/// the live scale/stretch at every use, so the frozen id never pins
+/// an old size.
 pub fn surface_node_id(position: DVec3, direction: DVec3, diameter_m: f64) -> String {
     let mut s = String::with_capacity(96);
     s.push_str(SURFACE_NODE_PREFIX);
@@ -756,8 +759,10 @@ pub fn decode_surface_node(node_id: &str) -> Option<AttachNode> {
 /// scaling the resolver applies (`position·(s, s, s·t)`, `diameter·s`,
 /// direction unchanged; resolve.rs `resolve_envelopes`). `node_id` may
 /// also be a [`SURFACE_NODE_PREFIX`] synthetic surface-mount id —
-/// those decode inline and arrive already scaled, so `scale`/`stretch`
-/// do not apply to them. Kept local so snapping does not need a full
+/// those decode inline and scale identically: the id carries
+/// DEF-LOCAL coordinates (the mounting part's scale-1 geometry), so a
+/// resize re-derives the snap point instead of stranding it at the
+/// mount-time size. Kept local so snapping does not need a full
 /// resolve (no `ResourceFile`/qual inputs on the placement path).
 pub fn scaled_attach_node(
     def: &PartDef,
@@ -766,7 +771,16 @@ pub fn scaled_attach_node(
     stretch: f64,
 ) -> Option<AttachNode> {
     if let Some(n) = decode_surface_node(node_id) {
-        return Some(n);
+        return Some(AttachNode {
+            id: n.id,
+            position_m: DVec3::new(
+                n.position_m.x * scale,
+                n.position_m.y * scale,
+                n.position_m.z * scale * stretch,
+            ),
+            direction: n.direction,
+            diameter_m: n.diameter_m * scale,
+        });
     }
     def.attach_nodes
         .iter()
@@ -2038,13 +2052,23 @@ impl CraftSession {
             }
         }
         // Reachability from the root — anything left over is a cycle
-        // (dangling parents already failed above).
+        // (dangling parents already failed above). The parent→children
+        // index is built once so the walk is O(n), not a full map scan
+        // per popped node (the `body_transforms` pattern).
+        let mut children: BTreeMap<PartNodeId, Vec<PartNodeId>> = BTreeMap::new();
+        for (id, n) in &nodes {
+            if let Some(e) = &n.edge {
+                children.entry(e.parent).or_default().push(*id);
+            }
+        }
         let mut seen = BTreeSet::from([root]);
         let mut frontier = vec![root];
         while let Some(p) = frontier.pop() {
-            for (id, n) in &nodes {
-                if n.edge.as_ref().is_some_and(|e| e.parent == p) && seen.insert(*id) {
-                    frontier.push(*id);
+            if let Some(kids) = children.get(&p) {
+                for id in kids {
+                    if seen.insert(*id) {
+                        frontier.push(*id);
+                    }
                 }
             }
         }
@@ -3139,5 +3163,42 @@ mod tests {
         s.insert_stage(2).unwrap();
         assert_eq!(s.stage_of(tank), Some(3));
         assert_eq!(s.stage_of(eng), Some(4));
+    }
+
+    /// C9-session-F1: synthetic `surf:` ids carry DEF-LOCAL values —
+    /// `scaled_attach_node` applies the live scale/stretch at every
+    /// use, so a resize moves the mount point instead of stranding it
+    /// at the mount-time size.
+    #[test]
+    fn surface_node_scales_with_the_build() {
+        let d = def("surf.host", 1.0, 1.0, vec![]);
+        let id = surface_node_id(DVec3::new(1.0, 0.0, 2.0), DVec3::X, 0.5);
+        // scale=1: the def-local values pass through.
+        let n = scaled_attach_node(&d, &id, 1.0, 1.0).unwrap();
+        assert_eq!(n.position_m, DVec3::new(1.0, 0.0, 2.0));
+        assert_eq!(n.diameter_m, 0.5);
+        // scale=2, stretch=1.5: position·(s, s, s·t), diameter·s —
+        // identical rule to authored nodes.
+        let n = scaled_attach_node(&d, &id, 2.0, 1.5).unwrap();
+        assert_eq!(n.position_m, DVec3::new(2.0, 0.0, 6.0));
+        assert_eq!(n.diameter_m, 1.0);
+    }
+
+    /// C9-session-F2: `from_file`'s cycle rejection survives the
+    /// single-pass rewrite — an orphan 2-cycle still fails `Cycle`
+    /// (the reachability walk is now over a prebuilt child index).
+    #[test]
+    fn from_file_orphan_cycle_still_rejected() {
+        let (s, _, _, _, _) = stack();
+        let mut f = file_of(&s);
+        // Point the root's edge at node 2 — the two-node {1,2} loop is
+        // unreachable from root and must still read `Cycle`.
+        let nid = PartNodeId(f.nodes[0].id);
+        f.nodes[1].edge = Some(AttachEdge::new(nid, "a", "b"));
+        f.nodes[0].edge = Some(AttachEdge::new(PartNodeId(f.nodes[1].id), "a", "b"));
+        assert!(matches!(
+            CraftSession::from_bytes(&encode(&f)),
+            Err(CraftFileError::Cycle { .. }) | Err(CraftFileError::BadRootEdge { .. })
+        ));
     }
 }

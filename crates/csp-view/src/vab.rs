@@ -614,9 +614,14 @@ fn emit_markers(
             .starts_with(csp_phys::session::SURFACE_NODE_PREFIX)
         && let Some(sn) = csp_phys::session::decode_surface_node(&e.parent_node)
     {
-        scene
-            .markers
-            .push((t.apply(sn.position_m), [0.2, 1.0, 0.4, 1.0]));
+        // `surf:` ids store def-local values — scale to the node's
+        // live build before applying its transform.
+        let p = DVec3::new(
+            sn.position_m.x * bs,
+            sn.position_m.y * bs,
+            sn.position_m.z * bs * bt,
+        );
+        scene.markers.push((t.apply(p), [0.2, 1.0, 0.4, 1.0]));
     }
 }
 

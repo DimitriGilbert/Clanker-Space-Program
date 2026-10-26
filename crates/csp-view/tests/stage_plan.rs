@@ -14,7 +14,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use csp_view::View;
-use csp_view::flight::{FlightSfx, StagePlan};
+use csp_view::flight::{FlightSfx, StagePlan, StagePlans};
 
 /// One app frame's §2.5 loop, headlessly.
 fn frame(view: &mut View, ticks: u64) {
@@ -67,14 +67,15 @@ fn stage_press_on_a_parked_craft_refuses_instead_of_eating_the_stage() {
     // The starter craft is single-stage (no decouplers), so the launch
     // plan was empty; install a two-firing plan bound to this vessel —
     // `vessel` preset skips the lazy fingerprint bind.
-    view.world.insert_resource(StagePlan::bound_to(
-        vec![vec![drop_node], vec![drop_node]],
-        id,
-    ));
+    view.world
+        .insert_resource(StagePlans::single(StagePlan::bound_to(
+            vec![vec![drop_node], vec![drop_node]],
+            id,
+        )));
 
     assert_eq!(view.fire_stage(), 0, "a latched craft staged anyway");
     assert_eq!(
-        view.world.resource::<StagePlan>().stages.len(),
+        view.world.resource::<StagePlans>().plans[0].stages.len(),
         2,
         "the refused press ate a stage"
     );
@@ -163,7 +164,10 @@ fn stage_plan_fires_its_own_vessel_not_the_focus() {
 
     let drop_node = jettisonable(&view, first);
     view.world
-        .insert_resource(StagePlan::bound_to(vec![vec![drop_node]], first));
+        .insert_resource(StagePlans::single(StagePlan::bound_to(
+            vec![vec![drop_node]],
+            first,
+        )));
 
     assert_eq!(view.fire_stage(), 1);
     frame(&mut view, 1);

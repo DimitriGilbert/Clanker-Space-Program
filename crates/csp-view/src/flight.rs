@@ -721,6 +721,91 @@ impl StagePlan {
     }
 }
 
+/// Every live launch's [`StagePlan`] — per-VESSEL keyed, not a single
+/// slot: a second launch used to `insert_resource` over the first
+/// craft's unfired stages, making them permanently unfireable and
+/// pointing the HUD at the wrong craft. Each launch pushes its own
+/// plan; they bind their own vessels independently through
+/// [`StagePlan::vessel_for`]. Most-recent launch LAST, so
+/// [`Self::active`] prefers the focused vessel's plan and falls back
+/// to the newest plan — the single-plan behaviour is unchanged.
+#[derive(Resource, Default)]
+pub struct StagePlans {
+    /// Live plans in launch order (oldest first). Expended or
+    /// orphaned plans are retired out of the vec by `fire_stage`.
+    pub plans: Vec<StagePlan>,
+}
+
+impl StagePlans {
+    /// One-plan convenience for tests and scripted producers that
+    /// bind a plan themselves (`StagePlan::bound_to`).
+    pub fn single(plan: StagePlan) -> Self {
+        Self { plans: vec![plan] }
+    }
+
+    /// Push a launch's plan — never discards an incumbent.
+    pub fn push(&mut self, plan: StagePlan) {
+        self.plans.push(plan);
+    }
+
+    /// The plan a stage press should fire: the plan bound to `focus`
+    /// when one exists, else the most recent plan still holding
+    /// stages (or simply the newest — an expended newest plan is
+    /// still the honest "nothing left" report). `None` when empty.
+    fn active_index(&mut self, sim: &World, focus: Option<VesselId>) -> Option<usize> {
+        // Bind every unbound plan first so focus matching reads
+        // resolved vessels, not pending fingerprints.
+        for p in self.plans.iter_mut() {
+            let _ = p.vessel_for(sim);
+        }
+        if let Some(f) = focus
+            && let Some(i) = self.plans.iter().position(|p| p.vessel == Some(f))
+        {
+            return Some(i);
+        }
+        self.plans
+            .iter()
+            .rposition(|p| !p.stages.is_empty())
+            .or(if self.plans.is_empty() {
+                None
+            } else {
+                Some(self.plans.len() - 1)
+            })
+    }
+
+    /// Read-only view of the plan [`Self::active_index`] selects —
+    /// for the HUD mirror (no binding side-effects; unbound plans
+    /// still count their stored stages).
+    pub fn hud_plan(&self, focus: Option<VesselId>) -> Option<&StagePlan> {
+        if let Some(f) = focus
+            && let Some(p) = self.plans.iter().find(|p| p.vessel == Some(f))
+        {
+            return Some(p);
+        }
+        self.plans
+            .iter()
+            .rev()
+            .find(|p| !p.stages.is_empty())
+            .or(self.plans.last())
+    }
+
+    /// Fire the active plan's next stage at `sim`: resolves binding,
+    /// returns `(vessel, ambiguous, refuse_msg)`; `refuse_msg`
+    /// `Some("")` means "plan exists but nothing to fire" — the
+    /// caller composes the cue from `total`.
+    pub(crate) fn select_for_fire(
+        &mut self,
+        sim: &World,
+        focus: Option<VesselId>,
+    ) -> Option<(usize, Option<VesselId>, bool)> {
+        let i = self.active_index(sim, focus)?;
+        let p = &mut self.plans[i];
+        let v = p.vessel_for(sim);
+        let ambiguous = p.ambiguous;
+        Some((i, v, ambiguous))
+    }
+}
+
 /// Session-state cache for the §2.6.4 latched-vessel weld. The
 /// `SurfaceLatched` pose record stores no collider, so staging a
 /// parked craft's render data needs a re-weld of its stored craft —
@@ -1469,11 +1554,11 @@ pub struct FlightCameraF64(pub MapCameraF64);
 
 /// `Presentation` schedule — chase-camera solve + HUD mirrors + the
 /// §3.7 SFX cue edges (the schedule's "VFX, audio cues" slot).
-#[allow(clippy::too_many_arguments)] // the camera solve carries the terrain floor
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // the camera solve carries the terrain floor; per-vessel stage plans add the hud_plan read
 pub(crate) fn flight_present(
     input: Res<FlightInput>,
     snap: Res<FlightSnapshot>,
-    plan: Res<StagePlan>,
+    plans: Res<StagePlans>,
     prop: Res<VesselPropulsionStaged>,
     terrain_cfg: Res<TerrainConfig>,
     mut terrain_cache: ResMut<TerrainCache>,
@@ -1518,7 +1603,7 @@ pub(crate) fn flight_present(
         ui.focus = None;
         ui.propellant.clear();
         ui.stages_left = 0;
-        ui.stages_total = plan.total;
+        ui.stages_total = plans.hud_plan(None).map_or(0, |p| p.total);
         stage_propulsion(&mut ui, None, &[], 0.0, None, None);
         return;
     };
@@ -1533,8 +1618,9 @@ pub(crate) fn flight_present(
     ui.focus = Some(focus.id);
     ui.latched = focus.latched;
     ui.propellant = focus.tanks.clone();
-    ui.stages_left = plan.stages.len();
-    ui.stages_total = plan.total;
+    let hud = plans.hud_plan(Some(VesselId(focus.id)));
+    ui.stages_left = hud.map_or(0, |p| p.stages.len());
+    ui.stages_total = hud.map_or(0, |p| p.total);
     ui.orbital_speed_mps = focus.vel.norm();
     ui.throttle = focus.throttle;
     ui.parts = focus.nodes;
@@ -1601,11 +1687,11 @@ pub(crate) fn flight_present(
     // vessel. The plan's remaining drop sets apply only while it is
     // bound to this vessel (a newer spawn or a fragment can hold the
     // focus without owning the plan — `vessel_for`'s binding rule).
-    let drops: &[Vec<csp_phys::PartNodeId>] = if plan.vessel == Some(VesselId(focus.id)) {
-        &plan.stages
-    } else {
-        &[]
-    };
+    let drops: &[Vec<csp_phys::PartNodeId>] = plans
+        .plans
+        .iter()
+        .find(|p| p.vessel == Some(VesselId(focus.id)))
+        .map_or(&[][..], |p| &p.stages[..]);
     stage_propulsion(
         &mut ui,
         prop.0.iter().find(|p| p.vessel == focus.id),

@@ -36,7 +36,13 @@
 //!
 //! | version | body |
 //! |---|---|
-//! | 1 | bare [`v1::WorldSnapshotV1`] — the first public build's schema |
+//! | 1 | the first public build's schema — **not loadable**: the v1 |
+//! |   |   snapshot was declared with live shared types, so it drifted |
+//! |   |   with the tree instead of freezing (genuine v1 bodies predate |
+//! |   |   `WeldPart::engine` and several later fields and match no |
+//!   |   | schema this build can name). [`SAVE_VERSION_MIN`] is 2; a |
+//! |   |   stamped-1 file is refused `UnsupportedVersion` — the honest |
+//! |   |   answer, since no frozen v1 types exist to migrate. |
 //! | 2 | the live [`WorldSnapshot`] body stamped `2` — accepted only |
 //! |   |   when it byte-exact-decodes under the current schema (see |
 //! |   |   below) |
@@ -50,17 +56,14 @@
 //! decodes cleanly and loads) or a pre-engine write (which cannot be
 //! resolved — serde would field-default `engine` to `None`, silently
 //! unmetering every resolved engine). The dispatch therefore proves
-//! v1/v2 bodies against the schema they claim: a body that fails the
-//! byte-exact re-encode gate under its stamped version is refused
-//! [`SaveError::UnsupportedVersion`] — the honest "this build cannot
-//! name your schema" surface, never the cryptic `TrailingBytes` the
-//! gate alone produced (and never the silent `None` decode that made
-//! pre-engine saves restore with free-burning engines).
-//!
-//! [`decode_save`] folds the `migrate_vN_to_vN+1` chain until the current
-//! schema falls out; v2's semantic addition is envelope metadata, so the
-//! v1→v2 migration is a field-wise copy of the frozen snapshot and the
-//! envelope fields arrive as `None` from the header.
+//! the stamped-2 body against the schema it claims: a body that fails
+//! the byte-exact re-encode gate is refused
+//! [`SaveError::UnresolvableSchema`] — the honest "the stamp is in
+//! range but the schema cannot be resolved" surface, never the
+//! cryptic `TrailingBytes` the gate alone produced (and never the
+//! silent `None` decode that made pre-engine saves restore with
+//! free-burning engines). A `save_version` outside the chain is
+//! refused [`SaveError::UnsupportedVersion`].
 //!
 //! **Adding a version:** freeze the previous snapshot into a `vN` module
 //! (a *copy* — frozen types are never edited, §7.7), write
@@ -73,25 +76,22 @@
 //! the caller puts it (`csp-app` uses `$config_dir/csp/`, §7.8's sidecar
 //! class — the save itself is authoritative, unlike the other sidecars).
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    ActiveTransfer, AutopilotState, Colony, ColonyId, CommandKey, ContractConfig, ContractState,
-    DockingConfig, EconomyConfig, EconomyState, LifeSupportConfig, ScheduledEvent, ScienceConfig,
-    ScienceState, ScriptId, ScriptState, SimCommand, SourceClass, TechState, TransferConfig,
-    TransferId, Vessel, VesselCaps, VesselId, WorldSnapshot, manufacture, reliability,
-};
+use crate::{CommandKey, SimCommand, WorldSnapshot};
 
 /// `save_version` written by this build (§7.7). The chain begins at
-/// version 1, the first public build's schema, frozen in [`v1`].
+/// version 2 — see the module doc's version table for why version 1
+/// is refused rather than migrated (no frozen v1 types were ever
+/// written: the v1 struct aliased the live tree, so nothing here can
+/// decode a genuine v1 body).
 /// Version 3 carries the same body schema as 2 — the bump marks the
 /// `WeldPart::engine` payload change the `2` stamp missed.
 pub const SAVE_VERSION_CURRENT: u32 = 3;
 /// The oldest `save_version` this build can read.
-pub const SAVE_VERSION_MIN: u32 = 1;
+pub const SAVE_VERSION_MIN: u32 = 2;
 /// The §7.2 magic — the first 8 bytes of every save file, `CSPSAVE`
 /// plus its NUL terminator so the magic is never a prefix of a name.
 pub const SAVE_MAGIC: &[u8; 8] = b"CSPSAVE\0";
@@ -183,200 +183,6 @@ struct SaveBodyV3 {
     snapshot: WorldSnapshot,
 }
 
-/// The frozen v1 schema — the §7.2 serialized set exactly as the first
-/// public build wrote it. **Never edited** (§7.7): when `WorldSnapshot`
-/// changes, the *live* type moves and this copy stays. Field types are
-/// shared with the live schema deliberately — a v1 file's payload IS
-/// the same tree; only the top-level struct is frozen.
-///
-/// (If a later schema change touches a field's *type*, that field's
-/// type is frozen into `v1` too — the rule is the copy never edits, not
-/// that it re-derives from live types.)
-pub mod v1 {
-    use super::*;
-
-    /// The §7.2 set at save_version 1 — field-identical to the first
-    /// public build's `WorldSnapshot`.
-    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-    pub struct WorldSnapshotV1 {
-        /// `clock.ticks()` at snapshot time.
-        pub clock_ticks: u64,
-        /// The stored warp ladder rung.
-        pub warp_level: u32,
-        /// Per-source dequeue counters.
-        pub source_seqs: BTreeMap<(SourceClass, u32), u64>,
-        /// The §2.6.5 events-per-frame budget.
-        pub event_budget: u64,
-        /// §7.2 next-ID counter for the vessel arena.
-        pub next_vessel_id: u64,
-        /// The on-rails vessel arena.
-        pub vessels: BTreeMap<VesselId, Vessel>,
-        /// §2.6.5's Silent→Clamping per-object opt-in set.
-        pub tracked_vessels: BTreeSet<VesselId>,
-        /// The monotonic event-insertion counter.
-        pub next_event_seq: u64,
-        /// The event heap's contents in `(tick, seq)` order.
-        pub event_heap: Vec<ScheduledEvent>,
-        /// §2.9's object caps.
-        pub vessel_caps: VesselCaps,
-        /// §2.4's docking tunables.
-        pub docking: DockingConfig,
-        /// §2.4's refused vessel pairs, canonical `(a < b)` order.
-        pub joint_refused: BTreeSet<(VesselId, VesselId)>,
-        /// §3.5's transfer tunables.
-        pub transfer_cfg: TransferConfig,
-        /// M6-D's in-flight transfer arena.
-        pub transfers: BTreeMap<TransferId, ActiveTransfer>,
-        /// §7.2 next-ID counter for the transfer arena.
-        pub next_transfer_id: u64,
-        /// §7.2 next-ID counter for the crew arena.
-        pub next_crew_id: u64,
-        /// M7-A's §3.2 science tunables.
-        pub science_cfg: ScienceConfig,
-        /// M7-A's §3.2 book — banked science, ledgers, projects.
-        pub science: ScienceState,
-        /// M7-B's §3.3/§3.4 progression record.
-        pub tech: TechState,
-        /// M7-C's §3.5 economy book.
-        pub economy: EconomyState,
-        /// M7-C's §3.5 economy tunables.
-        pub economy_cfg: EconomyConfig,
-        /// §2.7's save seed.
-        pub save_seed: u64,
-        /// M7-D's §3.6 contract book.
-        pub contracts: ContractState,
-        /// §3.6's contract tunables.
-        pub contract_cfg: ContractConfig,
-        /// M8-A's §3.5.1 colony arena.
-        pub colonies: BTreeMap<ColonyId, Colony>,
-        /// §7.2 next-ID counter for the colony arena.
-        pub next_colony_id: u64,
-        /// M8-B's §3.5 build-order arena.
-        pub builds: BTreeMap<manufacture::BuildId, manufacture::ActiveBuild>,
-        /// §7.2 next-ID counter for the build arena.
-        pub next_build_id: u64,
-        /// M8-C's §3.5 per-save life-support toggle.
-        pub life_support_enabled: bool,
-        /// M8-C's vessel-side life-support tunables.
-        pub life_support_cfg: LifeSupportConfig,
-        /// M9a §2.10's script arena.
-        pub scripts: BTreeMap<ScriptId, ScriptState>,
-        /// §7.2 next-ID counter for the script arena.
-        pub next_script_id: u64,
-        /// §2.10's per-save op budget.
-        pub script_op_budget: u64,
-        /// M9a §2.10's engaged autopilots.
-        pub autopilots: BTreeMap<VesselId, AutopilotState>,
-        /// §7.2 next-ID counter for part instances (M9b §3.4).
-        pub next_part_instance_id: u64,
-        /// M9b §3.4's reliability tunables.
-        pub reliability_cfg: reliability::ReliabilityConfig,
-        /// M9b §3.4's notification log — serialized, never hashed.
-        pub notifications: VecDeque<reliability::Notification>,
-        /// M9b §3.4's test-stand arena.
-        pub bench_runs: BTreeMap<reliability::BenchId, reliability::ActiveBench>,
-        /// §7.2 next-ID counter for the bench arena.
-        pub next_bench_id: u64,
-    }
-
-    impl From<&WorldSnapshot> for WorldSnapshotV1 {
-        /// The downgrade direction — not a load path. Exists so tests and
-        /// fixture tooling can *write* a v1 artifact to prove the chain;
-        /// production never downgrades a save.
-        fn from(s: &WorldSnapshot) -> Self {
-            Self {
-                clock_ticks: s.clock_ticks,
-                warp_level: s.warp_level,
-                source_seqs: s.source_seqs.clone(),
-                event_budget: s.event_budget,
-                next_vessel_id: s.next_vessel_id,
-                vessels: s.vessels.clone(),
-                tracked_vessels: s.tracked_vessels.clone(),
-                next_event_seq: s.next_event_seq,
-                event_heap: s.event_heap.clone(),
-                vessel_caps: s.vessel_caps,
-                docking: s.docking,
-                joint_refused: s.joint_refused.clone(),
-                transfer_cfg: s.transfer_cfg,
-                transfers: s.transfers.clone(),
-                next_transfer_id: s.next_transfer_id,
-                next_crew_id: s.next_crew_id,
-                science_cfg: s.science_cfg,
-                science: s.science.clone(),
-                tech: s.tech.clone(),
-                economy: s.economy.clone(),
-                economy_cfg: s.economy_cfg,
-                save_seed: s.save_seed,
-                contracts: s.contracts.clone(),
-                contract_cfg: s.contract_cfg,
-                colonies: s.colonies.clone(),
-                next_colony_id: s.next_colony_id,
-                builds: s.builds.clone(),
-                next_build_id: s.next_build_id,
-                life_support_enabled: s.life_support_enabled,
-                life_support_cfg: s.life_support_cfg,
-                scripts: s.scripts.clone(),
-                next_script_id: s.next_script_id,
-                script_op_budget: s.script_op_budget,
-                autopilots: s.autopilots.clone(),
-                next_part_instance_id: s.next_part_instance_id,
-                reliability_cfg: s.reliability_cfg.clone(),
-                notifications: s.notifications.clone(),
-                bench_runs: s.bench_runs.clone(),
-                next_bench_id: s.next_bench_id,
-            }
-        }
-    }
-}
-
-/// v1 → v2: the first step of the §7.7 chain. v2 added envelope metadata
-/// (label + data-set hash — now in the JSON header) around an unchanged
-/// snapshot payload, so the snapshot half is a field-wise copy and the
-/// envelope fields default.
-fn migrate_v1_to_v2(s: v1::WorldSnapshotV1) -> WorldSnapshot {
-    WorldSnapshot {
-        clock_ticks: s.clock_ticks,
-        warp_level: s.warp_level,
-        source_seqs: s.source_seqs,
-        event_budget: s.event_budget,
-        next_vessel_id: s.next_vessel_id,
-        vessels: s.vessels,
-        tracked_vessels: s.tracked_vessels,
-        next_event_seq: s.next_event_seq,
-        event_heap: s.event_heap,
-        vessel_caps: s.vessel_caps,
-        docking: s.docking,
-        joint_refused: s.joint_refused,
-        transfer_cfg: s.transfer_cfg,
-        transfers: s.transfers,
-        next_transfer_id: s.next_transfer_id,
-        next_crew_id: s.next_crew_id,
-        science_cfg: s.science_cfg,
-        science: s.science,
-        tech: s.tech,
-        economy: s.economy,
-        economy_cfg: s.economy_cfg,
-        save_seed: s.save_seed,
-        contracts: s.contracts,
-        contract_cfg: s.contract_cfg,
-        colonies: s.colonies,
-        next_colony_id: s.next_colony_id,
-        builds: s.builds,
-        next_build_id: s.next_build_id,
-        life_support_enabled: s.life_support_enabled,
-        life_support_cfg: s.life_support_cfg,
-        scripts: s.scripts,
-        next_script_id: s.next_script_id,
-        script_op_budget: s.script_op_budget,
-        autopilots: s.autopilots,
-        next_part_instance_id: s.next_part_instance_id,
-        reliability_cfg: s.reliability_cfg,
-        notifications: s.notifications,
-        bench_runs: s.bench_runs,
-        next_bench_id: s.next_bench_id,
-    }
-}
-
 /// Failures of the save codec — refused loudly per §7.7 ("a save that
 /// cannot be migrated is refused with a message, never half-loaded").
 #[derive(Debug)]
@@ -396,6 +202,16 @@ pub enum SaveError {
     /// — an older-than-the-chain or newer-than-this-build save. The
     /// message names both sides, per §7.7's refusal contract.
     UnsupportedVersion {
+        /// The `save_version` the file declared.
+        found: u32,
+    },
+    /// The stamp is inside the chain but the body failed the
+    /// byte-exact decode proof under the schema its stamp claims —
+    /// the stamp predates a serialized-field change its version bump
+    /// missed (the stamped-2 ambiguity: pre-`WeldPart::engine`
+    /// bodies). The schema is unresolvable, not the version out of
+    /// range — the message says which.
+    UnresolvableSchema {
         /// The `save_version` the file declared.
         found: u32,
     },
@@ -437,6 +253,13 @@ impl fmt::Display for SaveError {
                 "save version {found} is outside this build's chain \
                  ({SAVE_VERSION_MIN}..={SAVE_VERSION_CURRENT})"
             ),
+            Self::UnresolvableSchema { found } => write!(
+                f,
+                "save version {found} body does not decode under this \
+                 build's v{found} schema — it predates serialized \
+                 fields the {found} stamp missed, and no frozen \
+                 v{found} types exist to migrate it"
+            ),
             Self::UnsupportedEncoding {
                 compression,
                 body_format,
@@ -466,8 +289,6 @@ impl std::error::Error for SaveError {}
 /// its frozen type, which is what keeps the fold honest: versions are
 /// structs, not branches over live types.
 enum VersionedBody {
-    /// `save_version` 1 — the frozen first-public-build snapshot.
-    V1(v1::WorldSnapshotV1),
     /// `save_version` 3 (and proven stamped-2 bodies — the schemas are
     /// identical) — the current body wrapping the live snapshot.
     V3(SaveBodyV3),
@@ -623,23 +444,15 @@ fn decode_body(version: u32, bytes: &[u8]) -> Result<VersionedBody, SaveError> {
         Ok(v)
     }
     match version {
-        // The version-proof rule from the module doc: a body stamped
-        // below CURRENT that cannot byte-exact-decode under the schema
-        // its stamp claims is an *unresolvable* schema (the `2` stamp
-        // predates `WeldPart::engine`'s payload change, so pre-engine
-        // bodies carry a tree this build has no name for). Refusing
-        // `UnsupportedVersion` names the real problem — the version —
-        // where the gate's raw `TrailingBytes` named only a framing
-        // symptom.
-        1 => Ok(VersionedBody::V1(
-            decode(bytes).map_err(|_| SaveError::UnsupportedVersion { found: 1 })?,
-        )),
         // Stamped-2 bodies decode under the v3 schema: post-`engine`
         // writers emit exactly this tree, so a clean decode is the
         // proof the file is what its stamp failed to say. A decode
-        // failure is the pre-`engine` case above.
+        // failure means the pre-`engine` write — an *unresolvable*
+        // schema, not an out-of-chain version: `UnresolvableSchema`
+        // names that honestly (the `1` stamp needs no arm at all —
+        // SAVE_VERSION_MIN is 2, so it lands on the generic refusal).
         2 => Ok(VersionedBody::V3(
-            decode(bytes).map_err(|_| SaveError::UnsupportedVersion { found: 2 })?,
+            decode(bytes).map_err(|_| SaveError::UnresolvableSchema { found: 2 })?,
         )),
         3 => Ok(VersionedBody::V3(decode(bytes)?)),
         found => Err(SaveError::UnsupportedVersion { found }),
@@ -651,12 +464,6 @@ fn decode_body(version: u32, bytes: &[u8]) -> Result<VersionedBody, SaveError> {
 /// and one more dispatch arm; the fold shape never changes.
 fn to_current(body: VersionedBody) -> Save {
     match body {
-        // The v1→current fold is one step: `migrate_v1_to_v2` already
-        // produces the live snapshot tree (v2 added envelope metadata
-        // only), and v2→v3 is a stamp-only change over the same body.
-        VersionedBody::V1(snapshot) => to_current(VersionedBody::V3(SaveBodyV3 {
-            snapshot: migrate_v1_to_v2(snapshot),
-        })),
         VersionedBody::V3(body) => Save {
             // Filled in by `decode_save` from the JSON header.
             game_version: String::new(),
@@ -693,8 +500,7 @@ pub fn decode_command_log(bytes: &[u8]) -> Result<Vec<(CommandKey, SimCommand)>,
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::World;
-    use crate::orbit::PatchedConics;
+    use crate::{SourceClass, World};
 
     fn live_snapshot() -> WorldSnapshot {
         World::new()
@@ -727,9 +533,16 @@ mod tests {
         out
     }
 
-    fn v1_bytes(snapshot: &WorldSnapshot, game_version: &str) -> Vec<u8> {
-        let v1 = v1::WorldSnapshotV1::from(snapshot);
-        fixture_bytes(1, &v1, game_version)
+    /// A stamped-N file whose body IS the current schema — the
+    /// "wrong stamp, right bytes" fixture.
+    fn stamped_bytes(version: u32, snapshot: &WorldSnapshot, game_version: &str) -> Vec<u8> {
+        fixture_bytes(
+            version,
+            &SaveBodyV3 {
+                snapshot: snapshot.clone(),
+            },
+            game_version,
+        )
     }
 
     #[test]
@@ -801,33 +614,29 @@ mod tests {
         assert_eq!(decode_save(&encode_save(&save).unwrap()).unwrap(), save);
     }
 
-    /// The §7.7 chain, exercised: v1 bytes decode through
-    /// `migrate_v1_to_v2` into a current-schema `Save` whose snapshot is
-    /// field-identical to what the v1 writer saw, with `None` envelope
-    /// metadata.
+    /// C8-F3 institutionalized: a stamped-1 file is refused
+    /// `UnsupportedVersion` — the honest answer, since the v1 snapshot
+    /// was never frozen into real v1 types (it aliased the live tree,
+    /// so no genuine first-public-build body can decode under any
+    /// schema this build names). The message must be TRUE: `1` is
+    /// outside the readable chain `2..=3` — not the old lie that named
+    /// it "outside 1..=3" while claiming to support it. Even a body
+    /// that happens to BE the current schema is refused — the stamp,
+    /// not the payload, is the contract.
     #[test]
-    fn v1_save_migrates_to_current() {
-        let snapshot = live_snapshot();
-        let bytes = v1_bytes(&snapshot, "1.0.0-public");
-        let save = decode_save(&bytes).unwrap();
-        assert_eq!(save.game_version, "1.0.0-public");
-        assert_eq!(save.label, None);
-        assert_eq!(save.data_set_hash, None);
-        assert_eq!(save.snapshot, snapshot);
-    }
-
-    /// §7.5 made loadable: a migrated v1 snapshot restores into a World
-    /// that hash-matches the world it was taken from — migration is not
-    /// merely bytes-identical, it is *sim*-identical.
-    #[test]
-    fn migrated_save_restores_identical_world() {
-        let world = World::new();
-        let original_hash = world.state_hash().unwrap();
-        let snapshot = world.snapshot().unwrap();
-        let bytes = v1_bytes(&snapshot, "1.0.0-public");
-        let migrated = decode_save(&bytes).unwrap().snapshot;
-        let restored = World::restore(PatchedConics::new(BTreeMap::new()), None, migrated).unwrap();
-        assert_eq!(restored.state_hash().unwrap(), original_hash);
+    fn stamped_v1_refused_as_outside_the_chain() {
+        let bytes = stamped_bytes(1, &live_snapshot(), "1.0.0-public");
+        match decode_save(&bytes) {
+            Err(SaveError::UnsupportedVersion { found }) => {
+                assert_eq!(found, 1);
+                let msg = format!("{}", SaveError::UnsupportedVersion { found });
+                assert!(
+                    msg.contains("outside this build's chain (2..=3)"),
+                    "honest message, got: {msg}"
+                );
+            }
+            other => panic!("expected UnsupportedVersion(1), got {other:?}"),
+        }
     }
 
     /// A stamped-2 body carrying the *current* schema (a post-`engine`
@@ -845,40 +654,25 @@ mod tests {
     }
 
     /// A stamped-2 body that cannot prove the current schema — the
-    /// pre-`WeldPart::engine` write — refuses `UnsupportedVersion`,
-    /// not the cryptic `TrailingBytes` the re-encode gate produced
+    /// pre-`WeldPart::engine` write — refuses `UnresolvableSchema`:
+    /// the stamp IS inside the chain, so "outside the chain" would be
+    /// a lie; the body simply matches no schema this build can name
     /// (and never the silent `engine: None` decode that unmetered
     /// every resolved engine).
     #[test]
     fn stamped_v2_unresolvable_body_refused_as_version() {
-        let bytes = fixture_bytes(
-            2,
-            &v1::WorldSnapshotV1::from(&live_snapshot()),
-            "1.x-pre-engine",
-        );
-        assert!(matches!(
-            decode_save(&bytes),
-            Err(SaveError::UnsupportedVersion { found: 2 })
-        ));
-    }
-
-    /// The same proof at the chain's floor: a stamped-1 body the
-    /// frozen v1 schema cannot decode byte-exact is an unresolvable
-    /// schema, refused as a version — never a framing error.
-    #[test]
-    fn stamped_v1_unresolvable_body_refused_as_version() {
-        let bytes = fixture_bytes(1, &42u64, "x");
-        assert!(matches!(
-            decode_save(&bytes),
-            Err(SaveError::UnsupportedVersion { found: 1 })
-        ));
+        let bytes = fixture_bytes(2, &42u64, "1.x-pre-engine");
+        match decode_save(&bytes) {
+            Err(SaveError::UnresolvableSchema { found }) => assert_eq!(found, 2),
+            other => panic!("expected UnresolvableSchema(2), got {other:?}"),
+        }
     }
 
     /// §7.7: a save outside the chain is refused with the versions named,
     /// never half-loaded.
     #[test]
     fn unsupported_version_refused() {
-        let bytes = fixture_bytes(99, &v1::WorldSnapshotV1::from(&live_snapshot()), "9.9.9");
+        let bytes = stamped_bytes(99, &live_snapshot(), "9.9.9");
         match decode_save(&bytes) {
             Err(SaveError::UnsupportedVersion { found }) => assert_eq!(found, 99),
             other => panic!("expected UnsupportedVersion, got {other:?}"),
@@ -890,7 +684,7 @@ mod tests {
     #[test]
     fn unknown_codec_refused() {
         let snapshot = live_snapshot();
-        let mut bytes = v1_bytes(&snapshot, "1.0.0-public");
+        let mut bytes = stamped_bytes(3, &snapshot, "3.0.0");
         // Rewrite the header with body_format "msgpack".
         let len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
         let mut header: serde_json::Value = serde_json::from_slice(&bytes[12..12 + len]).unwrap();

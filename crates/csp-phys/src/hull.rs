@@ -167,6 +167,47 @@ pub(crate) fn plane_epsilon(verts: &[DVec3]) -> f64 {
     1e-9 * (hi - lo).norm().max(1.0)
 }
 
+/// The speculative twin of [`point_penetration`]: for every facet
+/// `f` whose plane `p` sits just OUTSIDE (`depth_f ∈ (−margin_f, 0]`,
+/// `margin_f` = the distance `v_rel` closes along that facet's normal
+/// this tick) while staying inside every other facet's slab within
+/// `tol` — emit `(face, depth)` with `depth ≤ 0`. The contact solver
+/// turns each into a speculative constraint that lets the vertex
+/// close to grazing this tick but no farther — the anti-tunneling
+/// margin for fast relative motion (a vertex that would pass a thin
+/// hull entirely inside one tick gets caught at its boundary).
+pub(crate) fn point_speculative(
+    planes: &[Plane],
+    p: DVec3,
+    v_rel: DVec3,
+    dt: f64,
+    tol: f64,
+) -> Vec<(usize, f64)> {
+    let depths: Vec<f64> = planes.iter().map(|pl| pl.d - pl.n.dot(p)).collect();
+    if depths.iter().all(|&d| d > 0.0) {
+        // Strictly interior is `point_penetration`'s case.
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (i, &df) in depths.iter().enumerate() {
+        if df > 0.0 {
+            continue;
+        }
+        let closing = -v_rel.dot(planes[i].n) * dt;
+        if closing <= 0.0 || df <= -closing {
+            continue;
+        }
+        let inside_others = depths
+            .iter()
+            .enumerate()
+            .all(|(j, &dj)| j == i || dj >= -tol);
+        if inside_others {
+            out.push((i, df));
+        }
+    }
+    out
+}
+
 /// Point `p` (in the hull's own frame) against a facet-plane set:
 /// the list of `(face, depth)` pairs for every facet `p` entered
 /// through — empty when `p` is outside or only grazing.

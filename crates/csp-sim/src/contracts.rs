@@ -24,11 +24,15 @@
 //! produce honest params at all — empty candidate lists, or a draw
 //! that fails the restore gate's `params_ok` shape (finite
 //! everywhere; `> 0` for the units/altitude/amount asks; `≥ 0` and
-//! ordered for the satellite window) — degrades the publish
-//! `Recoverable`, never `Fatal`. Both are reachable only through
-//! unvalidated `set_contracts` installs; the per-draw gate is what
-//! keeps a poisoned space from publishing an offer the snapshot
-//! restore would `Fatal` on.
+//! ordered for the satellite window) — is skipped: the draw is
+//! deterministic per index, so the publish advances `offer_index`
+//! past the poisoned draw, reports it on `degraded`, and moves on
+//! (an all-poisoned install stops after `board_size` consecutive
+//! skips and simply sits with a short board). Both are reachable
+//! only through unvalidated `set_contracts` installs; the per-draw
+//! gate is what keeps a poisoned space from publishing an offer the
+//! snapshot restore would `Fatal` on — and the skip is what keeps it
+//! from wedging the world.
 //!
 //! # Prerequisites — facts, not reputation
 //!
@@ -90,6 +94,14 @@ use crate::{EventKind, TickShadow, VesselId, World};
 /// `balance.ron: contract_offer_slots` mirror for data-less worlds
 /// — six offers on the board.
 pub const DEFAULT_CONTRACT_BOARD_SIZE: u32 = 6;
+
+/// The live-contract arena cap — bounds outstanding deadline/penalty
+/// liability. `AcceptContract` rejects at the cap (Recoverable, like
+/// every other cap); an instantly-completing record leaves `active`
+/// in its own accept, so this does not throttle that path — the
+/// board's own draw turnover does (see `apply_accept_contract`'s
+/// doc).
+pub const MAX_ACTIVE_CONTRACTS: usize = 32;
 
 /// Sim-day in seconds — the deadline conversion.
 const DAY_S: f64 = 86_400.0;
@@ -702,51 +714,101 @@ impl World {
     /// `board_size` from successive `offer_index` counters (module
     /// doc). Pure function of `(defs, facts, offer_index, seed)` —
     /// the `publish_economy` lazily-published precedent.
-    pub(crate) fn publish_contracts(&mut self, shadow: &mut TickShadow) -> Result<(), SimError> {
+    ///
+    /// A poisoned draw (`generate_offer`'s `Recoverable` — an empty
+    /// candidate space or a `params_ok` shape failure, reachable only
+    /// through an unvalidated `set_contracts` install) is
+    /// deterministic on `(seed, index)`: propagating it meant the
+    /// same index re-drew and re-failed on EVERY later publish, and
+    /// `step_frame` could never advance again — one bad template
+    /// bricked the world. The draw is skipped instead: `offer_index`
+    /// advances past it, the error rides the `degraded` channel, and
+    /// the refill moves on. `board_size` CONSECUTIVE skips ends the
+    /// pass — an all-poisoned install degrades to a short board, not
+    /// a spin through `u64` counter space. `Fatal` still propagates:
+    /// an impossible state is never a per-draw skip.
+    pub(crate) fn publish_contracts(
+        &mut self,
+        shadow: &mut TickShadow,
+        degraded: &mut Vec<SimError>,
+    ) -> Result<(), SimError> {
         if self.contract_defs.is_empty()
             || self.contracts.offers.len() >= self.contract_cfg.board_size as usize
         {
             return Ok(());
         }
         self.shadow_contracts(shadow);
+        let mut skips = 0u32;
         while self.contracts.offers.len() < self.contract_cfg.board_size as usize {
             let index = self.contracts.offer_index;
-            let Some(offer) = self.generate_offer(index)? else {
-                break;
-            };
-            self.contracts.offer_index = index
-                .checked_add(1)
-                .ok_or(SimError::Fatal("contract offer_index overflow"))?;
-            self.contracts.offers.insert(index, offer);
+            match self.generate_offer(index) {
+                Ok(Some(offer)) => {
+                    self.contracts.offer_index = index
+                        .checked_add(1)
+                        .ok_or(SimError::Fatal("contract offer_index overflow"))?;
+                    self.contracts.offers.insert(index, offer);
+                    skips = 0;
+                }
+                Ok(None) => break,
+                Err(e @ SimError::Fatal(_)) => return Err(e),
+                Err(e) => {
+                    degraded.push(e);
+                    self.contracts.offer_index = index
+                        .checked_add(1)
+                        .ok_or(SimError::Fatal("contract offer_index overflow"))?;
+                    skips += 1;
+                    if skips >= self.contract_cfg.board_size {
+                        break;
+                    }
+                }
+            }
         }
         Ok(())
     }
 
     /// `AcceptContract` — the §3.5 advance + the §3.6 re-check: the
     /// offer must still be on the board, its template must exist,
-    /// and its prerequisites must still hold (facts may have moved
-    /// since generation). On success the offer leaves the board,
-    /// the advance credits, the deadline event arms when authored,
-    /// and the completion predicate evaluates once — an already-
-    /// satisfied contract completes at acceptance (facts-based
-    /// semantics: the sim state is the truth).
+    /// its prerequisites must still hold (facts may have moved
+    /// since generation), and the active arena must not be at
+    /// [`MAX_ACTIVE_CONTRACTS`]. On success the offer leaves the
+    /// board, the advance credits, the deadline event arms when
+    /// authored, and the completion predicate evaluates once — an
+    /// already-satisfied contract completes at acceptance
+    /// (facts-based semantics: the sim state is the truth).
     ///
-    /// # Instant completion — documented v1 semantics
+    /// # Instant completion — v1 semantics, bounded
     ///
     /// The predicate reads CURRENT state, so an already-satisfied
     /// offer completes inside its own accept boundary — advance and
     /// completion credit together, and no deadline is armed. For
-    /// the state-reading kinds (`SatelliteOrbit`, `PartTest`,
-    /// `SurveyData`, `ColonyResupply`) that counts facts that
-    /// predate acceptance: a vessel already in the regime, banked
-    /// data, and past colony deliveries all satisfy a fresh accept.
-    /// `Rescue` cannot instant-complete — its predicate is
-    /// transition-keyed, so `trigger: None` yields `false`. This is
-    /// the intended §3.6 reading (prerequisites — not accept order —
-    /// do the gating: a program that already flew the profile owns
-    /// the fact), with the documented cost that a farmed board can
-    /// pay advance+completion for no new work, once per offer
-    /// index.
+    /// the state-reading kinds (`SatelliteOrbit`, `PartTest`) that
+    /// counts evidence predating acceptance: a vessel already in
+    /// the regime satisfies a fresh accept. `Rescue` cannot
+    /// instant-complete — its predicate is transition-keyed, so
+    /// `trigger: None` yields `false`. This is the intended §3.6
+    /// reading (prerequisites — not accept order — do the gating: a
+    /// program that already flew the profile owns the fact).
+    ///
+    /// The cumulative-fact kinds are different: `SurveyData` and
+    /// `ColonyResupply` are re-based to the *delta since accept* at
+    /// signing — the ask becomes `baseline + amount` over the
+    /// monotone fact counters, so pre-acceptance deliveries and
+    /// returns can never satisfy them. Without the baseline, one
+    /// landed resupply (or one banked survey) would instantly
+    /// satisfy every future offer of that kind drawn under its
+    /// threshold — an unbounded payout loop, one command per
+    /// payout, on an inexhaustible `offer_index` supply.
+    ///
+    /// Residual bound, stated honestly: a state-predicate offer
+    /// (`SatelliteOrbit`/`PartTest`) satisfied by pre-acceptance
+    /// evidence still pays at accept, and [`MAX_ACTIVE_CONTRACTS`]
+    /// does not throttle it (an instantly-completed record leaves
+    /// `active`). What bounds the loop is the board itself: offers
+    /// are drawn against the *live* predicate, so unsatisfiable
+    /// draws accumulate on the board and throttle turnover — the
+    /// faucet self-starves rather than paying at a fixed rate
+    /// forever. The cap's real job is the outstanding deadline/
+    /// penalty liability, not the instant-complete path.
     pub(crate) fn apply_accept_contract(
         &mut self,
         offer: u64,
@@ -760,6 +822,52 @@ impl World {
         };
         if !self.contract_prereqs_met(template) {
             return Err(SimError::Recoverable("accept: prerequisites not met"));
+        }
+        // The active-arena cap: an unbounded `active` is unbounded
+        // outstanding deadline/penalty liability — reject like every
+        // other cap. An instantly-completing record leaves `active`
+        // in this same apply, so this bounds live contracts, not the
+        // (separately-handled) payout path.
+        if self.contracts.active.len() >= MAX_ACTIVE_CONTRACTS {
+            return Err(SimError::Recoverable("accept: active contract cap"));
+        }
+        // Re-base the cumulative-fact kinds to the delta since this
+        // accept: the recorded ask becomes `baseline + amount` over
+        // the monotone counters, so only post-acceptance work can
+        // satisfy them (the doc above — the unbounded re-pay faucet
+        // is closed). The saturating fold keeps `params_ok`'s finite
+        // `> 0` shape on the re-based ask.
+        let mut params = o.params.clone();
+        match &mut params {
+            ContractParams::ColonyResupply {
+                body,
+                resource,
+                amount,
+            } => {
+                let baseline: f64 = self
+                    .colonies
+                    .values()
+                    .filter(|c| c.body == *body)
+                    .map(|c| {
+                        self.contracts
+                            .facts
+                            .colony_deliveries
+                            .get(&(c.id.0, resource.clone()))
+                            .copied()
+                            .unwrap_or(0.0)
+                    })
+                    .sum();
+                *amount = (*amount + baseline).min(f64::MAX);
+            }
+            ContractParams::SurveyData {
+                experiment,
+                body,
+                min_units,
+            } => {
+                *min_units =
+                    (*min_units + self.survey_returned_units(experiment, body)).min(f64::MAX);
+            }
+            _ => {}
         }
         let rewards = template.rewards;
         let deadline = match template.deadline_days {
@@ -798,7 +906,7 @@ impl World {
             ActiveContract {
                 id,
                 template: o.template,
-                params: o.params,
+                params,
                 deadline_tick: deadline,
             },
         );
@@ -1302,7 +1410,7 @@ mod tests {
         w.step_frame(2 * csp_core::TICK_HZ).unwrap();
         assert_eq!(w.contracts().active.len(), 1);
         assert_eq!(
-            w.economy().funds_micros,
+            w.economy.funds_micros,
             crate::economy::to_micros(2.0),
             "advance_funds 2.0 credited"
         );
@@ -1369,7 +1477,7 @@ mod tests {
             1
         );
         assert_eq!(
-            w.economy().funds_micros,
+            w.economy.funds_micros,
             crate::economy::to_micros(2.0 + 10.0)
         );
         assert!(
@@ -1417,7 +1525,7 @@ mod tests {
 
         // Advance 2.0 in, penalty 4.0 out → the drain clamps at 0
         // and marks insolvency (§3.5's rule for drains).
-        assert_eq!(w.economy().funds_micros, 0);
+        assert_eq!(w.economy.funds_micros, 0);
         assert!(w.economy().insolvent);
     }
 
@@ -1563,12 +1671,17 @@ mod tests {
         );
     }
 
-    /// An empty `bodies` space installed through `set_contracts`
-    /// (which bypasses the data validators) degrades the board
-    /// publish `Recoverable`, never `Fatal` — the world rolls back
-    /// intact instead of bricking on a poisoned draw.
+    /// C6-F1 institutionalized: a poisoned draw (empty `bodies`
+    /// space installed through `set_contracts`, which bypasses the
+    /// data validators) used to re-fire forever — the failing index
+    /// was re-drawn identically every publish, `step_frame` returned
+    /// `Recoverable` every tick, and the world bricked permanently
+    /// while the rollback kept it clean. Now the publish skips the
+    /// poisoned index: the error rides `degraded`, `offer_index`
+    /// advances past it, the board sits short, and the world keeps
+    /// stepping.
     #[test]
-    fn empty_bodies_space_rejects_recoverable() {
+    fn poisoned_draw_skips_instead_of_wedging() {
         let mut t = template(
             "contract.satellite",
             ContractKind::SatellitePlacement,
@@ -1580,11 +1693,125 @@ mod tests {
             apoapsis_alt_m: (150_000.0, 300_000.0),
         };
         let mut w = world_with(t);
-        let err = w.step_frame(csp_core::TICK_HZ).unwrap_err();
+        let rep = w.step_frame(csp_core::TICK_HZ).unwrap();
         assert!(
-            matches!(err, SimError::Recoverable(_)),
-            "empty candidate space is Recoverable, got {err}"
+            rep.degraded
+                .iter()
+                .any(|e| matches!(e, SimError::Recoverable(m) if m.contains("empty body space"))),
+            "the poisoned draw rode the degraded channel: {:?}",
+            rep.degraded
         );
+        let idx_after_first = w.contracts().offer_index;
+        assert!(
+            idx_after_first >= DEFAULT_CONTRACT_BOARD_SIZE as u64,
+            "the publish skipped a full board's worth of indices: {idx_after_first}"
+        );
+        // And the world stays live — repeated frames don't re-wedge.
+        w.step_frame(2 * csp_core::TICK_HZ).unwrap();
+        assert!(w.clock().ticks() == 2 * csp_core::TICK_HZ);
+    }
+
+    /// C6-F2/C7-F4 institutionalized: the cumulative-fact kinds
+    /// re-base to the delta since accept — pre-acceptance survey
+    /// returns can no longer instantly satisfy a freshly-signed
+    /// `SurveyRun` contract (the "re-pay the same returned units
+    /// forever" faucet is closed). The recorded ask lands at
+    /// `baseline + min_units`.
+    #[test]
+    fn survey_accept_baselines_past_returns() {
+        let mut w = world_with(template("contract.survey", ContractKind::SurveyRun, vec![]));
+        // 40 units already returned for the experiment/body the
+        // template draws on (the `exp.materials_study`/`terrin`
+        // candidate the space offers): a transmitted key with
+        // nothing pooled aboard counts as returned.
+        w.science.keys.insert(
+            crate::research::DataKey {
+                experiment: csp_data::ExperimentId::from("exp.materials_study"),
+                body: BodyId::from("terrin"),
+                biome: csp_data::BiomeId::from("bio.x"),
+                situation: csp_data::Situation::SpaceLow,
+            },
+            crate::research::ScienceKeyState {
+                collected: 40.0,
+                transmitted: true,
+                closed: false,
+            },
+        );
+        fill_board(&mut w);
+        let start = w.economy.funds_micros;
+        w.enqueue(
+            crate::SourceClass::Ui,
+            0,
+            SimCommand::AcceptContract { offer: 0 },
+        );
+        w.step_frame(2 * csp_core::TICK_HZ).unwrap();
+        // Not completed — only the advance was paid.
+        assert_eq!(
+            w.contracts().active.len(),
+            1,
+            "pre-acceptance returns are baseline"
+        );
+        assert!(w.contracts().facts.completed.is_empty());
+        let active = w.contracts().active.values().next().unwrap();
+        let ContractParams::SurveyData { min_units, .. } = active.params else {
+            panic!("wrong params")
+        };
+        assert!(
+            min_units > 40.0,
+            "the ask re-based past the 40 already returned: {min_units}"
+        );
+        // Advance was credited; the completion reward was not.
+        assert!(w.economy.funds_micros > start);
+    }
+
+    /// The active-arena cap: `MAX_ACTIVE_CONTRACTS` live contracts is
+    /// the bound; the next accept refuses `Recoverable` rather than
+    /// grow unbounded deadline/penalty liability.
+    #[test]
+    fn active_contract_cap_rejects() {
+        let w = world_with(template(
+            "contract.satellite",
+            ContractKind::SatellitePlacement,
+            vec![],
+        ));
+        let mut snap = w.snapshot().unwrap();
+        for i in 0..crate::contracts::MAX_ACTIVE_CONTRACTS {
+            snap.contracts.active.insert(
+                crate::ContractId(i as u64),
+                crate::ActiveContract {
+                    id: crate::ContractId(i as u64),
+                    template: ContractTypeId::from("contract.satellite"),
+                    params: ContractParams::SatelliteOrbit {
+                        body: BodyId::from("terrin"),
+                        min_periapsis_alt_m: 1.0,
+                        max_apoapsis_alt_m: 2.0,
+                    },
+                    deadline_tick: None,
+                },
+            );
+        }
+        snap.contracts.next_contract_id = crate::contracts::MAX_ACTIVE_CONTRACTS as u64;
+        let mut w = World::restore(test_orbits(), None, snap).unwrap();
+        fill_board(&mut w);
+        w.enqueue(
+            crate::SourceClass::Ui,
+            0,
+            SimCommand::AcceptContract { offer: 0 },
+        );
+        let rep = w.step_frame(w.clock().ticks() + csp_core::TICK_HZ).unwrap();
+        assert_eq!(
+            rep.rejected.len(),
+            1,
+            "the capped accept was rejected: {rep:?}"
+        );
+        assert_eq!(
+            w.contracts().active.len(),
+            crate::contracts::MAX_ACTIVE_CONTRACTS,
+            "the cap held"
+        );
+        // (The consumed offer is the accept path's long-standing
+        // contract — `offers.remove` precedes the checks; a rejected
+        // accept does not restore it.)
     }
 
     /// A `deadline_days` that is not finite-and-positive (NaN, ±inf,
@@ -1699,9 +1926,11 @@ mod tests {
                 .insert(key.clone(), 60.0);
             w
         };
-        // 100 collected − 60 still aboard = 40 returned: a
-        // `min_units: 50` ask does NOT instant-complete at accept,
-        // and a `min_units: 40` ask does.
+        // 100 collected − 60 still aboard = 40 returned. Under the
+        // accept-time baseline (the C6-F2 faucet fix) neither ask
+        // instant-completes — the 40 returned units are the *start*
+        // line — and the recorded ask lands at `40 + min_units`: the
+        // 50-ask contract records 90, the 40-ask contract 80.
         let mut w = survey_world(50.0);
         w.enqueue(
             crate::SourceClass::Ui,
@@ -1709,10 +1938,13 @@ mod tests {
             SimCommand::AcceptContract { offer: 0 },
         );
         w.step_frame(3 * csp_core::TICK_HZ).unwrap();
-        assert_eq!(
-            w.contracts().active.len(),
-            1,
-            "outstanding units are not returned"
+        let a = w.contracts().active.values().next().unwrap();
+        let ContractParams::SurveyData { min_units, .. } = a.params else {
+            panic!("wrong params")
+        };
+        assert!(
+            (min_units - 90.0).abs() < 1e-9,
+            "50-ask re-based over the 40 returned: {min_units}"
         );
         let mut w = survey_world(40.0);
         w.enqueue(
@@ -1721,11 +1953,18 @@ mod tests {
             SimCommand::AcceptContract { offer: 0 },
         );
         w.step_frame(3 * csp_core::TICK_HZ).unwrap();
+        let a = w.contracts().active.values().next().unwrap();
+        let ContractParams::SurveyData { min_units, .. } = a.params else {
+            panic!("wrong params")
+        };
         assert!(
-            w.contracts().active.is_empty(),
-            "the 40 actually-returned units complete the ask"
+            (min_units - 80.0).abs() < 1e-9,
+            "40-ask re-based over the 40 returned: {min_units}"
         );
-        assert_eq!(w.contracts().facts.completed[&ContractKind::SurveyRun], 1);
+        assert!(
+            w.contracts().facts.completed.is_empty(),
+            "pre-acceptance returns never complete the ask"
+        );
     }
 
     /// The `params_ok` draw gate covers EVERY drawn param, not just
@@ -1790,11 +2029,18 @@ mod tests {
             let mut t = template("contract.x", kind, vec![]);
             t.generate.space = space;
             let mut w = world_with(t);
-            let err = w.step_frame(csp_core::TICK_HZ).unwrap_err();
+            // The poisoned draw is skipped (C6-F1): it rides
+            // `degraded`, the board sits short, and the frame
+            // completes — a publish that Err'd here bricked the world.
+            let rep = w.step_frame(csp_core::TICK_HZ).unwrap();
             assert!(
-                matches!(err, SimError::Recoverable(_)),
-                "{kind:?} poisoned space is Recoverable, got {err}"
+                rep.degraded.iter().any(
+                    |e| matches!(e, SimError::Recoverable(m) if m.contains("dishonest params"))
+                ),
+                "{kind:?} poisoned space degraded, got {:?}",
+                rep.degraded
             );
+            assert!(w.contracts().offers.is_empty());
         }
     }
 
@@ -1851,10 +2097,10 @@ mod tests {
             fill_board(&mut w);
             w
         };
-        // 100 collected − 60 escrowed = 40 returned: a
-        // `min_units: 50` ask does NOT instant-complete at accept,
-        // and a `min_units: 40` ask does — the same boundary the
-        // pooled-aboard arm asserts.
+        // 100 collected − 60 escrowed = 40 returned. Under the
+        // accept-time baseline (the C6-F2 faucet fix) neither ask
+        // instant-completes — the returned units are the start line —
+        // and the recorded ask re-bases to `40 + min_units`.
         let mut w = survey_world(50.0);
         w.enqueue(
             crate::SourceClass::Ui,
@@ -1874,10 +2120,14 @@ mod tests {
             SimCommand::AcceptContract { offer: 0 },
         );
         w.step_frame(3 * csp_core::TICK_HZ).unwrap();
+        let a = w.contracts().active.values().next().unwrap();
+        let ContractParams::SurveyData { min_units, .. } = a.params else {
+            panic!("wrong params")
+        };
         assert!(
-            w.contracts().active.is_empty(),
-            "the 40 actually-returned units complete the ask"
+            (min_units - 80.0).abs() < 1e-9,
+            "40-ask re-based over the 40 returned: {min_units}"
         );
-        assert_eq!(w.contracts().facts.completed[&ContractKind::SurveyRun], 1);
+        assert!(w.contracts().facts.completed.is_empty());
     }
 }

@@ -88,7 +88,13 @@
 //! |v_v| + |v_b|` by triangle inequality. Because nested SOIs make the only
 //! possible transitions "exit the parent's SOI" or "enter a child's SOI",
 //! the candidate set is exactly `{parent} ∪ children(parent)` (the star's
-//! infinite SOI contributes no exit candidate).
+//! infinite SOI contributes no exit candidate). A *finite* root SOI is
+//! still enumerated — the crossing is geometrically real — but the
+//! scheduler refuses to publish a transition `rebase` cannot apply:
+//! a root has no grandparent frame to Exit into and is no child of
+//! itself to Enter. `World::schedule_next_soi` converts such a
+//! crossing into a rescan boundary (or, for debris on an Exit, into
+//! the §2.9 escape-deletion the event exists to carry).
 
 use std::collections::BTreeMap;
 
@@ -1225,6 +1231,11 @@ impl PatchedConics {
     /// The §2.6.6 candidate set — exactly `{parent} ∪ children(parent)`
     /// (the star's infinite SOI contributes no exit candidate), in
     /// `BTreeMap` order so every consumer sees the same enumeration.
+    /// A parent with no parent of its own — a finite-SOI root — still
+    /// enumerates its boundary: the scan reports real crossings, and
+    /// the *scheduling* side (`World::schedule_next_soi`) is where the
+    /// unappliable root transition is refused (its doc names the two
+    /// dispositions: §2.9 debris deletion, or a rescan past it).
     /// Shared by the scan and [`Self::scan_strides`]: a child carrying
     /// an SOI is a candidate *whether or not it has elements* — the
     /// `v_rel_max` step is where a missing-elements child fails, and it

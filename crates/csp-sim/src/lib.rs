@@ -3409,11 +3409,19 @@ impl World {
                 // hull leaves the colony's inventory with the pose.
                 v.joined_colony = None;
                 // The residence-transition rule — `ToRails`/`ToBubble`
-                // both drop the node (a latched vessel's `Scheduled`
-                // node has no conic to materialize at, a `Burning` one
-                // has no executor running): leaving it would strand a
-                // zombie node on the unlatched hull.
-                v.maneuver = None;
+                // both drop the node, and a latched vessel's
+                // `Scheduled` node has no conic left to materialize at
+                // (its pending `ManeuverNodeStart` dies in the heap
+                // scrub below). A `Burning` node survives the §2.6.4
+                // round-trip by design: the countdown held while
+                // latched and `drive_node_burn` resumes it — the
+                // executor runs for every `InBubble` body each tick.
+                if v.maneuver
+                    .as_ref()
+                    .is_some_and(|n| matches!(n.status, ManeuverStatus::Scheduled))
+                {
+                    v.maneuver = None;
+                }
                 // M9b: the latched vessel's dormant `PartFailure`s
                 // die with the residence — scrub the heap the same
                 // way `apply_to_bubble` does, then restamp the
@@ -3425,7 +3433,7 @@ impl World {
                     .into_iter()
                     .filter(|e| !event_names_vessel(&e.kind, &vessel))
                     .collect();
-                self.reliability_residence_change(vessel, self.clock.ticks(), false);
+                self.reliability_residence_change(vessel, self.clock.ticks(), false, shadow)?;
             }
             // The arm below returns a `&mut` into the arena for direct
             // body writes (`SetThrottle`, `SetAttitude`) — the capture
@@ -3490,30 +3498,6 @@ impl World {
         // `ensure_aero` below stamps `body.aero` inside the arena, so
         // the capture must run before the first stale-table attach.
         self.shadow_vessels(shadow);
-        // §2.4.1: every InBubble body's attached tables must match its
-        // vessel's active mask AND its current craft graph before the
-        // first tick of this range — covers re-welded bodies (restore,
-        // unlatch, jettison, spawn), SetAeroConfig installs, and
-        // breakup debris still wearing the parent's tables. Collected
-        // first so the borrow split stays clean; ascending-id order is
-        // the fixed order.
-        let needing: Vec<VesselId> = self
-            .vessels
-            .iter()
-            .filter(|(_, v)| aero_tables_stale(v))
-            .map(|(id, _)| *id)
-            .collect();
-        for id in needing {
-            // An in-range `?` carries only `Fatal`: a table-build
-            // `Recoverable` escaping `step_frame` as a bare `Err`
-            // would skip the iteration `TickShadow`'s restore-verdict
-            // bookkeeping — promote the class at this boundary. (The
-            // event/command `ensure_aero` call sites keep
-            // `Recoverable`: theirs degrades or rejects just that one
-            // item; the range pre-pass owns no narrower channel.)
-            self.ensure_aero(id)
-                .map_err(|e| SimError::Fatal(e.reason()))?;
-        }
         let caps = self.caps;
         // M9b §3.4: the reliability tick's immutable captures — the
         // save seed and the construction config ride the borrow-split
@@ -3566,6 +3550,28 @@ impl World {
             }
             self.drain_at(t, effective_target, shadow, commands_applied, rejected)?;
             self.control_tick(t, shadow, degraded)?;
+            // §2.4.1: every InBubble body's attached tables must match
+            // its vessel's active mask AND its current craft graph
+            // BEFORE this tick's integration — a once-per-range
+            // pre-pass left mid-range creations (breakup debris,
+            // in-range undock fragments, latch-merged hulls) flying
+            // the parent's tables until the next range, which is
+            // partition-dependent physics. Re-check per tick: the
+            // drain can spawn fragments and last tick's consequences
+            // can re-weld graphs; ascending-id order is the fixed
+            // order. An in-range `?` carries only `Fatal` (the event/
+            // command `ensure_aero` sites keep `Recoverable`; the
+            // range owns no narrower channel).
+            let needing: Vec<VesselId> = self
+                .vessels
+                .iter()
+                .filter(|(_, v)| aero_tables_stale(v))
+                .map(|(id, _)| *id)
+                .collect();
+            for id in needing {
+                self.ensure_aero(id)
+                    .map_err(|e| SimError::Fatal(e.reason()))?;
+            }
             let Self {
                 vessels, physics, ..
             } = self;
@@ -3923,6 +3929,7 @@ impl World {
                 &latched_now,
                 SimTime::from_ticks(t + 1),
                 &rel_cfg,
+                &mut rel_burns,
             ));
             // M9b §3.4: the tick's collected side-effects land at
             // `t + 1`, inside the same tick iteration — the family
@@ -4043,6 +4050,24 @@ impl World {
                     if let Some(pos) = vessels.get(&vid).and_then(|v| v.body().map(|b| b.pos)) {
                         impacts.push((pos, t + 1));
                     }
+                    // §3.4: the hull's burn dies with it — credit the
+                    // burn-seconds its engine records still hold, the
+                    // same exit-credit rule `transition_latched` and
+                    // `reliability_residence_change` apply (a crash
+                    // landing still produced flight-qualification
+                    // data). Drained into `rel_burns` below.
+                    if let Some(dying) = vessels.get(&vid) {
+                        let in_atmo = physics.backend.environment().atmosphere.is_some();
+                        for (node, rec) in &dying.reliability {
+                            if rec.burning
+                                && let Some(spec) = World::spec_for(dying, *node)
+                            {
+                                let burn_s = (t + 1).saturating_sub(rec.burn_start_tick) as f64
+                                    / csp_core::TICK_HZ as f64;
+                                rel_burns.push((spec.family.clone(), burn_s, in_atmo));
+                            }
+                        }
+                    }
                     // Roster half of the removal (the `remove_vessel`
                     // rule): members still recorded aboard die with
                     // the hull — read from the record we still hold.
@@ -4114,6 +4139,21 @@ impl World {
                         vid,
                         shadow,
                     );
+                    // Same burn-exit credit as the impact path —
+                    // eviction retires the records, so the burn's
+                    // flight units are emitted first.
+                    if let Some(dying) = vessels.get(&vid) {
+                        let in_atmo = physics.backend.environment().atmosphere.is_some();
+                        for (node, rec) in &dying.reliability {
+                            if rec.burning
+                                && let Some(spec) = World::spec_for(dying, *node)
+                            {
+                                let burn_s = (t + 1).saturating_sub(rec.burn_start_tick) as f64
+                                    / csp_core::TICK_HZ as f64;
+                                rel_burns.push((spec.family.clone(), burn_s, in_atmo));
+                            }
+                        }
+                    }
                     // Roster half of the eviction — same as the
                     // impact removal above.
                     if let Some(gone) = vessels.remove(&vid)
@@ -4126,6 +4166,24 @@ impl World {
                     dead_vessels.push(vid);
                 } else {
                     break;
+                }
+            }
+            // Removal-path burn credits (impacts, evictions, latch
+            // touchdowns all pushed into `rel_burns` since the first
+            // drain) — same in-range `Fatal`-only rule.
+            if !rel_burns.is_empty() {
+                if shadow.tech.is_none() {
+                    shadow.tech = Some(self.tech.clone());
+                }
+                for (family, burn_s, in_atmo) in rel_burns.drain(..) {
+                    let rate = if in_atmo {
+                        self.reliability_cfg.flight_units_per_s_atmosphere
+                    } else {
+                        self.reliability_cfg.flight_units_per_s_vacuum
+                    };
+                    self.tech
+                        .credit_qualification(family, burn_s * rate, 0.0, 0)
+                        .map_err(|e| SimError::Fatal(e.reason()))?;
                 }
             }
             // M6-C §2.4 step 2 — the latch: every settled soft-capture
@@ -4768,6 +4826,20 @@ impl World {
                 if !self.vessels.contains_key(vessel) {
                     return Err(SimError::Recoverable("autopilot: unknown vessel"));
                 }
+                // The installed driver must be able to fly this
+                // program — `run_autopilot_tick` silently skips a
+                // driver-absent or discriminant-mismatched record, so
+                // accepting one would log an applied command that can
+                // never act.
+                let flies = self.autopilot_driver.as_ref().is_some_and(|d| {
+                    StableDiscriminant::discriminant(&d.program())
+                        == StableDiscriminant::discriminant(program)
+                });
+                if !flies {
+                    return Err(SimError::Recoverable(
+                        "autopilot: no installed driver for program",
+                    ));
+                }
                 self.shadow_autopilots(shadow);
                 self.autopilots.insert(
                     *vessel,
@@ -5084,15 +5156,19 @@ impl World {
                 control_lease: Lease::Player,
             },
         );
+        // §2.6.6: resolve the residence the authored conic already
+        // implies — an elements-authored spawn inside a child's SOI
+        // (or outside a finite parent's) re-parents at the spawn tick,
+        // the same stitch `apply_to_rails_at` runs for its stamped
+        // epoch. The walk's last transition is the publish's
+        // `suppress` (the post-rebase wrong-side artifact rule).
+        let suppress = self.resolve_soi_residence(id, self.clock, shadow)?;
         // M7-D: the spawn IS an orbit-achieved transition — the
         // contract predicates evaluate now (event-driven, §3.6).
         self.contract_notify(&contracts::ContractTrigger::OrbitAchieved(id), shadow)?;
         // §2.6.5: publish the new vessel's next event time now — the
         // heap must hold it before `t_next` is next computed.
-        // Latent edge (M5-A backlog): residence is NOT resolved at spawn —
-        // an authored spawn inside a child's SOI stays mis-parented
-        // (`resolve_soi_residence` is not run on this path).
-        self.schedule_next_soi(id, self.clock, shadow, None)
+        self.schedule_next_soi(id, self.clock, shadow, suppress)
     }
 
     /// The spawn-occupancy rule [`Self::apply_spawn_physical`] refuses
@@ -5456,7 +5532,7 @@ impl World {
         // M9b: the bubble→dormant transition — restamp every part's
         // record at `epoch` under the constant dormant λ (§2.6.1's
         // epoch re-anchor; the publish slot re-derives the crossing).
-        self.reliability_residence_change(vessel, epoch.ticks(), true);
+        self.reliability_residence_change(vessel, epoch.ticks(), true, shadow)?;
         // The stamped conic is only meaningful at-or-after `epoch` —
         // but `epoch` can sit ahead of the clock (the burn executor's
         // completion stamps `t_next` mid-range). Any transition the
@@ -5706,7 +5782,7 @@ impl World {
             .into_iter()
             .filter(|e| !event_names_vessel(&e.kind, &vessel))
             .collect();
-        self.reliability_residence_change(vessel, self.clock.ticks(), false);
+        self.reliability_residence_change(vessel, self.clock.ticks(), false, shadow)?;
         Ok(())
     }
 
@@ -5948,7 +6024,7 @@ impl World {
             .into_iter()
             .filter(|e| !event_names_vessel(&e.kind, &vessel))
             .collect();
-        self.reliability_residence_change(vessel, self.clock.ticks(), false);
+        self.reliability_residence_change(vessel, self.clock.ticks(), false, shadow)?;
         Ok(())
     }
 
@@ -6757,7 +6833,7 @@ impl World {
                 // pure function of `(defs, facts, offer_index,
                 // seed)`, so the same publish lands identically in
                 // every partition.
-                self.publish_contracts(shadow)?;
+                self.publish_contracts(shadow, degraded)?;
             }
             // Vessels..Alarms: the remaining §2.6.5 slots have no
             // interval state — their advance is a no-op by definition.
@@ -7498,20 +7574,38 @@ impl World {
         else {
             return Err(SimError::Recoverable("soi event: vessel not on rails"));
         };
-        // §2.9: debris leaving the outermost SOI is deleted — the
-        // grandparent-less Exit `rebase` would refuse anyway; this
-        // intercepts it as a removal instead of a degradation. (Guard
-        // mirrors `rebase`'s Exit checks so the intercept can't shadow
-        // a legitimate error.)
-        if direction == orbit::SoiDirection::Exit
-            && orbit.parent == *body
-            && self.orbits.body_orbit(body)?.parent.is_none()
-            && self
-                .vessels
-                .get(&vessel_id)
-                .is_some_and(|v| v.debris_since.is_some())
-        {
-            self.remove_vessel(vessel_id, shadow);
+        // §2.9 + the C5a publisher/applier fix: a crossing of the
+        // ROOT's own boundary (a finite `soi_m` on a parentless body
+        // is legal in a hand-built `PatchedConics`; the shipped home
+        // system's root is `soi_m: None`, so nothing reaches this arm
+        // there) has no frame to re-base into — `rebase`'s Exit arm
+        // needs a grandparent, its Enter arm needs the body to be a
+        // child of the current parent. The publisher and applier now
+        // agree on the resolution rather than playing
+        // Recoverable→rescan ping-pong:
+        //   - debris + Exit → deleted outright (the §2.9 escape rule).
+        //   - anything else → a deliberate NO-OP. No outer frame
+        //     exists to hold a different answer, so the vessel simply
+        //     continues on the root conic — that is not an error, it
+        //     is the only semantics the boundary can have. The
+        //     post-fire `schedule_next_soi` re-scans strictly past the
+        //     crossing (the scan's open-left interval can't re-find
+        //     it), so an escapee settles onto the rescan cadence and
+        //     a later re-entry still publishes.
+        // `debris_since` is read at FIRE time — a vessel that turned
+        // debris between scheduling and firing still gets deleted.
+        // The `orbit.parent == *body` guard keeps a stale firing (the
+        // vessel re-based between schedule and fire) on the ordinary
+        // stale-event path below.
+        if orbit.parent == *body && self.orbits.body_orbit(body)?.parent.is_none() {
+            if direction == orbit::SoiDirection::Exit
+                && self
+                    .vessels
+                    .get(&vessel_id)
+                    .is_some_and(|v| v.debris_since.is_some())
+            {
+                self.remove_vessel(vessel_id, shadow);
+            }
             return Ok(());
         }
         let new_orbit = self.orbits.rebase(&orbit, body, direction, t)?;
@@ -9858,6 +9952,7 @@ fn transition_latched(
     latched_now: &[VesselId],
     sim: SimTime,
     rel_cfg: &reliability::ReliabilityConfig,
+    rel_burns: &mut Vec<(csp_data::FamilyId, f64, bool)>,
 ) -> Vec<VesselId> {
     let mut transitioned = Vec::new();
     for vid in latched_now {
@@ -9887,16 +9982,30 @@ fn transition_latched(
             // record stamps λ = 0 (inert, never a wrong part's rate).
             if let Some(craft) = &vessel.craft {
                 let specs_ok = reliability::specs_parallel(craft);
+                // A touchdown with the throttle still up ends the burn
+                // outside `bubble_part_tick`'s shutdown branch — emit
+                // the flight-qualification credit here or a suicide
+                // burn's units are dropped whole (same rule as
+                // `reliability_residence_change`). Latched on the
+                // ground: in-atmosphere iff the body has one.
+                let in_atmo = physics.backend.environment().atmosphere.is_some();
                 for (node, rec) in vessel.reliability.iter_mut() {
-                    let lambda = craft
+                    let spec = craft
                         .graph
                         .nodes
                         .get(node)
                         .filter(|_| specs_ok)
-                        .and_then(|n| craft.reliability.get(n.effective_index as usize))
-                        .map_or(0.0, |s| {
-                            s.dormant_hazard_per_s(rel_cfg.dormant_stress_scale)
-                        });
+                        .and_then(|n| craft.reliability.get(n.effective_index as usize));
+                    if rec.burning
+                        && let Some(s) = spec
+                    {
+                        let burn_s = sim.ticks().saturating_sub(rec.burn_start_tick) as f64
+                            / csp_core::TICK_HZ as f64;
+                        rel_burns.push((s.family.clone(), burn_s, in_atmo));
+                    }
+                    let lambda = spec.map_or(0.0, |s| {
+                        s.dormant_hazard_per_s(rel_cfg.dormant_stress_scale)
+                    });
                     rec.restamp(sim.ticks(), lambda, true, false);
                     rec.misfire = false;
                     rec.ullage_stressed = false;
@@ -11526,6 +11635,115 @@ mod tests {
         assert_eq!(w.clock().ticks(), 30_000);
     }
 
+    /// C5a-F1 institutionalized: a NON-debris vessel crossing a
+    /// finite root SOI fires `SoiTransition` into
+    /// `apply_soi_transition`'s root arm — which must be a deliberate
+    /// no-op (there is no outer frame to re-base into), not a
+    /// `Recoverable` firing that bounces the event back as a rescan
+    /// every `DEGRADED_RESCAN_TICKS`. The vessel keeps its conic, the
+    /// clock advances, and no degraded entry accumulates.
+    #[test]
+    fn non_debris_root_exit_is_a_clean_noop() {
+        let mut bodies = BTreeMap::new();
+        bodies.insert(
+            BodyId::from("sol"),
+            BodyOrbit {
+                mu_m3_per_s2: MU_SOLEN,
+                soi_m: Some(8.4e7),
+                parent: None,
+                elements: None,
+            },
+        );
+        let mut w = World::with_system(PatchedConics::new(bodies));
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SpawnVessel {
+                parent: BodyId::from("sol"),
+                elements: crossing_vessel_elements(),
+            },
+        );
+        w.step_frame(1).unwrap();
+        let id = VesselId(0);
+        let rep = w.step_frame(20_000).unwrap();
+        // The vessel still exists, still on the root conic — the
+        // boundary crossing applied nothing because there is nothing
+        // to apply, and nothing was degraded.
+        assert!(w.vessels().contains_key(&id), "non-debris vessel survives");
+        assert!(
+            rep.degraded
+                .iter()
+                .all(|e| !matches!(e, SimError::Recoverable(m) if m.contains("soi exit"))),
+            "root-boundary transition must not degrade: {:?}",
+            rep.degraded
+        );
+        // And the world keeps stepping past the crossing.
+        w.step_frame(30_000).unwrap();
+        assert_eq!(w.clock().ticks(), 30_000);
+    }
+
+    /// C8-F4 institutionalized: latching a spec'd craft onto a
+    /// specless one cannot represent the absorbed half positionally —
+    /// merging used to drop the whole model (empty table → inert
+    /// records → permanent loss through every later split). The latch
+    /// refuses the pair instead — the same clean-separation
+    /// degradation a corrupt seam takes.
+    #[test]
+    fn mixed_reliability_latch_is_refused() {
+        let mut w = physics_world(false);
+        spawn_port_pair(&mut w, DVec3::new(0.0, 0.0, 1.8), flip_rot());
+        assert_eq!(w.joints().len(), 1);
+        // Give vessel A's craft a positional spec table — spawn left
+        // it specless, so install the parallel table + record the
+        // spec'd path would have produced.
+        {
+            let va = w.vessels.get_mut(&VesselId(0)).unwrap();
+            let craft = va.craft.as_mut().unwrap();
+            craft.reliability = vec![csp_phys::ReliabilitySpec {
+                family: csp_data::FamilyId::from("f"),
+                base_mtbf_s: 1.0e9,
+                infant_mortality: 0.0,
+                dormant_stress: 1.0,
+                regime_stress: vec![],
+                failure_modes: vec![(csp_data::FailureMode::Leak, 1.0)],
+                qualification_curve: csp_data::QualCurve {
+                    knots: vec![csp_data::QualKnot {
+                        qualification_units: 0.0,
+                        hazard_multiplier: 1.0,
+                    }],
+                },
+                engine: None,
+            }];
+            va.reliability.insert(
+                csp_phys::PartNodeId(0),
+                reliability::fresh_record(42, PartInstanceId(0), 0),
+            );
+        }
+        // Settle — the latch attempt refuses the pair: joint dropped,
+        // pair refused, both vessels keep their own crafts.
+        step_until(&mut w, 192, |w| w.joints().is_empty());
+        assert!(w.joints().is_empty(), "the joint resolved");
+        assert_eq!(
+            w.vessels().len(),
+            2,
+            "the unmergeable pair stays two vessels — nothing was silently absorbed"
+        );
+        assert_eq!(
+            w.vessels[&VesselId(0)]
+                .craft
+                .as_ref()
+                .unwrap()
+                .reliability
+                .len(),
+            1,
+            "the spec'd half kept its table"
+        );
+        assert!(
+            w.joint_refused.contains(&(VesselId(0), VesselId(1))),
+            "the refusal is recorded"
+        );
+    }
+
     /// §2.6.5's opt-in: tracking a vessel promotes its PENDING
     /// `SoiTransition` to Clamping (not just future ones), and untracking
     /// demotes it back — while the moon-crossing vessel's Enter{m}
@@ -11827,9 +12045,15 @@ mod tests {
     #[test]
     fn degenerate_soi_event_degrades_and_republishes_rescan() {
         let mut w = World::with_system(test_system());
-        // About m (μ_RASK), just outside r_soi = 2.43e6, inbound.
+        // About m (μ_RASK), just inside r_soi = 2.43e6, inbound. The
+        // C4a-OO1 spawn-residence walk means a spawn can no longer be
+        // authored mis-parented — a craft placed *outside* its stated
+        // parent's SOI is re-parented at the spawn tick — so the
+        // degenerate Enter is injected directly: the shape this test
+        // exercises is the ≤1-tick-early Brent landing's post-rebase
+        // wrong-side reading, which lands on the heap the same way.
         let elements = orbit::cartesian_to_elements(
-            csp_core::DVec3::new(2.44e6, 0.0, 0.0),
+            csp_core::DVec3::new(2.42e6, 0.0, 0.0),
             csp_core::DVec3::new(-80.0, 150.0, 0.0),
             MU_RASK,
         )
@@ -11843,9 +12067,22 @@ mod tests {
             },
         );
         w.step_frame(1).unwrap();
-        // The publish finds Enter{m} — degenerate (m is not a child of
-        // itself) but a real detection: suppression only applies to the
-        // post-rebase rescan.
+        // Enter{m} on a vessel already parented to m is degenerate (m
+        // is not a child of itself) — the apply must fail Recoverable
+        // and the frame must not wedge.
+        {
+            let mut sh = TickShadow::capture(&w);
+            w.schedule_event(
+                EventKind::SoiTransition {
+                    vessel: VesselId(0),
+                    body: BodyId::from("m"),
+                    direction: orbit::SoiDirection::Enter,
+                },
+                w.clock().ticks() + 100,
+                &mut sh,
+            )
+            .unwrap();
+        }
         let mut saw_degraded = false;
         for _ in 0..8 {
             let r = w.step_frame(w.clock().ticks() + 5000).unwrap();
@@ -16907,6 +17144,7 @@ mod tests {
     #[test]
     fn latch_absorb_drops_bound_autopilot_and_restores() {
         let mut w = physics_world(false);
+        w.set_autopilot_driver(Box::new(NoopPilot));
         spawn_port_pair(&mut w, DVec3::new(0.0, 0.0, 1.8), flip_rot());
         assert_eq!(w.joints().len(), 1);
         // Engage on vessel B — the equal-mass tie-break makes B the
@@ -21676,5 +21914,273 @@ mod tests {
             );
             assert_eq!(w.state_hash().unwrap(), pre);
         }
+    }
+
+    /// A driver that accepts `Ascent` and does nothing — used where a
+    /// test needs `EngageAutopilot` to pass the driver-presence gate.
+    struct NoopPilot;
+    impl AutopilotDriver for NoopPilot {
+        fn program(&self) -> AutopilotProgram {
+            AutopilotProgram::Ascent {
+                target_apoapsis_m: 0.0,
+                target_periapsis_m: 0.0,
+            }
+        }
+        fn run_tick(
+            &mut self,
+            _vessel: VesselId,
+            _state: &mut AutopilotState,
+            _tick: u64,
+            _io: &mut dyn TickIo,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// C4a-F3: `EngageAutopilot` with no installed driver used to apply
+    /// and sit inert forever (the tick skip was silent). It now rejects.
+    #[test]
+    fn engage_autopilot_without_driver_rejects() {
+        let mut w = physics_world(false);
+        enqueue_orbiter(&mut w);
+        w.step_frame(1).unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::EngageAutopilot {
+                vessel: VesselId(0),
+                program: AutopilotProgram::Ascent {
+                    target_apoapsis_m: 100_000.0,
+                    target_periapsis_m: 100_000.0,
+                },
+            },
+        );
+        w.step_frame(2).unwrap();
+        assert!(
+            w.autopilots().is_empty(),
+            "a driver-less engage must reject, not log inert"
+        );
+        // With a driver installed the same command applies.
+        let mut w2 = physics_world(false);
+        w2.set_autopilot_driver(Box::new(NoopPilot));
+        enqueue_orbiter(&mut w2);
+        w2.step_frame(1).unwrap();
+        w2.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::EngageAutopilot {
+                vessel: VesselId(0),
+                program: AutopilotProgram::Ascent {
+                    target_apoapsis_m: 100_000.0,
+                    target_periapsis_m: 100_000.0,
+                },
+            },
+        );
+        w2.step_frame(2).unwrap();
+        assert!(w2.autopilots().contains_key(&VesselId(0)));
+    }
+
+    /// C5-transfers-F1: a `Burning` node survives the latch/unlatch
+    /// round-trip (the documented contract) while a `Scheduled` node —
+    /// whose pending event died with the residence — is still dropped.
+    #[test]
+    fn unlatch_preserves_burning_node() {
+        let mut w = physics_world(false);
+        spawn_physical(
+            &mut w,
+            SimCommand::SpawnPhysicalVessel {
+                craft: box_craft(5_000.0, DVec3::new(0.5, 0.5, 1.5), 0.0),
+                pos: DVec3::new(TERRIN_R + 100.0, 0.0, 0.0),
+                rot: pad_rot(),
+                vel: DVec3::ZERO,
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        // Force a Burning node + latched state, then unlatch via the
+        // internal path (the Unlatch command arm calls `unlatched_body`
+        // the same way; stepping a full tick would let the burn executor
+        // consume the node and mask the preservation rule under test).
+        let pose = {
+            let v = &w.vessels[&VesselId(0)];
+            match &v.state {
+                VesselState::InBubble(b) => crate::bubble::surface_pose_capture(
+                    w.physics.as_ref().unwrap().backend.environment(),
+                    &w.physics.as_ref().unwrap().dominant,
+                    b,
+                    w.clock,
+                ),
+                _ => panic!("in bubble"),
+            }
+        };
+        let mut shadow = TickShadow::capture(&w);
+        {
+            let v = w.vessels.get_mut(&VesselId(0)).unwrap();
+            v.maneuver = Some(crate::maneuver::ManeuverNode {
+                tick: 10,
+                dv_prograde_mps: 0.0,
+                dv_normal_mps: 0.0,
+                dv_radial_mps: 0.0,
+                status: ManeuverStatus::Burning(crate::maneuver::ActiveBurn {
+                    burn_dir: DVec3::Z,
+                    dv_total_mps: 10.0,
+                    dv_remaining_mps: 5.0,
+                }),
+            });
+            v.state = VesselState::SurfaceLatched(pose.clone());
+        }
+        w.unlatched_body(VesselId(0), &mut shadow).unwrap();
+        let v = &w.vessels[&VesselId(0)];
+        assert!(
+            matches!(
+                v.maneuver.as_ref().map(|n| &n.status),
+                Some(ManeuverStatus::Burning(_))
+            ),
+            "a Burning node must survive unlatch"
+        );
+        // A Scheduled node's pending event died with the residence — it
+        // is still dropped (a zombie countdown is worse than an honest
+        // clear).
+        {
+            let v = w.vessels.get_mut(&VesselId(0)).unwrap();
+            v.maneuver = Some(crate::maneuver::ManeuverNode {
+                tick: 10,
+                dv_prograde_mps: 0.0,
+                dv_normal_mps: 0.0,
+                dv_radial_mps: 0.0,
+                status: ManeuverStatus::Scheduled,
+            });
+            v.state = VesselState::SurfaceLatched(pose.clone());
+        }
+        w.unlatched_body(VesselId(0), &mut shadow).unwrap();
+        assert!(w.vessels[&VesselId(0)].maneuver.is_none());
+    }
+
+    /// C4a-OO1: an authored spawn inside a child's SOI is parented to the
+    /// child AT the spawn tick — the §2.6.6 residence the conic already
+    /// implies, not the stale stated parent waiting for the first
+    /// crossing. (The degenerate-event test covers the reverse reading.)
+    #[test]
+    fn spawn_inside_child_soi_resolves_residence() {
+        let mut w = World::with_system(test_system());
+        // 1.0e6 m from m's centre — deep inside r_soi = 2.43e6 — authored
+        // against m's PARENT (the C4a-OO1 mis-parented spawn).
+        // m orbits p at RASK_A — at t=0 it sits at (RASK_A, 0, 0) about
+        // p. Spawn 1e6 m further out (inside r_soi = 2.43e6) on roughly m's
+        // circular speed, authored against p.
+        // m sits at (RASK_A, 0, 0) about p at t=0 on circular speed
+        // sqrt(MU_TERRIN/RASK_A). The vessel rides m's velocity plus a
+        // 1e6-radius circular speed about m — a clearly bound m-frame
+        // orbit deep inside r_soi = 2.43e6.
+        let v_m = libm::sqrt(MU_TERRIN / RASK_A);
+        let elements = orbit::cartesian_to_elements(
+            csp_core::DVec3::new(RASK_A + 1.0e6, 0.0, 0.0),
+            csp_core::DVec3::new(0.0, v_m + libm::sqrt(MU_RASK / 1.0e6), 0.0),
+            MU_TERRIN,
+        )
+        .unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SpawnVessel {
+                parent: BodyId::from("p"),
+                elements,
+            },
+        );
+        let rep = w.step_frame(1).unwrap();
+        assert!(!w.vessels.is_empty(), "spawn rejected: {:?}", rep.rejected);
+        let orbit = w.vessels[&VesselId(0)].orbit().unwrap().clone();
+        assert_eq!(
+            orbit.parent,
+            BodyId::from("m"),
+            "spawn inside m's SOI must resolve residence to m, got {}",
+            orbit.parent
+        );
+    }
+
+    /// C5-transfers-F3: a part carrying two `TankSpec`s for the same
+    /// resource is incoherent under every consumer (`vessel_capacity`
+    /// sums both, `spawn_contents` keeps the last, `debit`/`credit` read
+    /// the first) — `check_tank_masses` must reject it at the spawn gate,
+    /// not just the resolver for authored crafts.
+    #[test]
+    fn duplicate_tank_resource_rejected_at_spawn_gate() {
+        let mut c = box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0);
+        let spec = csp_phys::TankSpec {
+            resource: csp_data::ResourceId::from("lf"),
+            capacity: 100.0,
+            mass_per_unit_kg: 1.0,
+        };
+        c.parts[0].tanks = vec![spec.clone(), spec];
+        assert!(
+            transfers::check_tank_masses(&c).is_err(),
+            "duplicate-resource tank specs must fail the spawn gate"
+        );
+        // The single-spec form stays legal.
+        c.parts[0].tanks.pop();
+        assert!(transfers::check_tank_masses(&c).is_ok());
+    }
+
+    /// C9-reliability: a burn that ends on a NON-tick path (residence
+    /// restamp, latch touchdown, hull removal) must still emit its
+    /// flight-qualification credit — the standard executor's
+    /// `apply_to_rails_at` completion used to drop it whole.
+    #[test]
+    fn burn_completion_to_rails_credits_flight_units() {
+        let mut c = fueled_engine_craft(100.0, 1.0, 10_000.0, 300.0);
+        c.reliability = vec![csp_phys::ReliabilitySpec {
+            family: csp_data::FamilyId::from("test.family"),
+            base_mtbf_s: 1.0e9,
+            infant_mortality: 0.0,
+            dormant_stress: 0.0,
+            regime_stress: vec![],
+            failure_modes: vec![(csp_data::FailureMode::Explosion, 1.0)],
+            qualification_curve: csp_data::QualCurve {
+                knots: vec![csp_data::QualKnot {
+                    qualification_units: 0.0,
+                    hazard_multiplier: 1.0,
+                }],
+            },
+            engine: Some(csp_phys::EngineReliability {
+                rated_burn_s: 1.0e6,
+                ignitions: None,
+                ullage_required: false,
+            }),
+        }];
+        let mut w = physics_world(false);
+        spawn_physical(
+            &mut w,
+            SimCommand::SpawnPhysicalVessel {
+                craft: c,
+                pos: DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0),
+                rot: csp_core::DQuat::IDENTITY,
+                vel: DVec3::new(0.0, libm::sqrt(3.5316e12 / (TERRIN_R + 200_000.0)), 0.0),
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        // Mark the engine record mid-burn, then end the burn on the
+        // to-rails residence path (what `finish_burns` runs).
+        let rec_node = *w.vessels[&VesselId(0)].reliability.keys().next().unwrap();
+        {
+            let rec = w
+                .vessels
+                .get_mut(&VesselId(0))
+                .unwrap()
+                .reliability
+                .get_mut(&rec_node)
+                .unwrap();
+            rec.burning = true;
+            rec.burn_start_tick = 0;
+        }
+        let mut shadow = TickShadow::capture(&w);
+        w.reliability_residence_change(VesselId(0), w.clock().ticks() + 64, true, &mut shadow)
+            .unwrap();
+        let q = w
+            .tech
+            .qualifications
+            .get(&csp_data::FamilyId::from("test.family"));
+        assert!(
+            q.is_some_and(|q| q.units() > 0.0),
+            "residence-path burn exit dropped the flight credit"
+        );
     }
 }

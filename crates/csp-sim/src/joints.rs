@@ -911,12 +911,25 @@ pub(crate) fn apply_latch(
     // only when BOTH halves carry a table covering their own `parts`.
     // A specless half absorbed by a spec'd one has no positional
     // representation (the absorbed side's specs would bind at the
-    // other half's `effective_index` slots), so the merged craft
-    // drops the model: its records go inert, never wrong —
-    // `reliability::specs_parallel` gates every reader the same way.
-    let reliability_table_m = if crate::reliability::specs_parallel(&craft_p)
-        && crate::reliability::specs_parallel(&craft_s)
-    {
+    // other half's `effective_index` slots). Dropping to an empty
+    // table was the old answer — but the loss is PERMANENT: every
+    // reader gates on `specs_parallel`, and the undock/breakup split
+    // clones the emptied table into both fragments, so one
+    // mixed-spec latch silently killed the §3.4 model for both
+    // halves forever. The merge refuses the pair instead — the same
+    // clean-separation degradation a corrupt seam takes — so a
+    // spec'd craft keeps its model rather than losing it silently.
+    let p_specd = crate::reliability::specs_parallel(&craft_p);
+    let s_specd = crate::reliability::specs_parallel(&craft_s);
+    if p_specd != s_specd {
+        joints.retain(|j| j != joint);
+        refused.insert((joint.vessel_a, joint.vessel_b));
+        degraded.push(SimError::Recoverable(
+            "latch: mixed reliability-spec coverage is unmergeable",
+        ));
+        return Ok(false);
+    }
+    let reliability_table_m = if p_specd && s_specd {
         let mut t = craft_p.reliability.clone();
         t.extend(craft_s.reliability.iter().cloned());
         t

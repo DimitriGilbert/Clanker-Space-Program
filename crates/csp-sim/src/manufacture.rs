@@ -335,7 +335,7 @@ impl crate::World {
         // M9b: a freshly delivered vessel sits dormant — restamp the
         // records under the dormant rate now (the publish slot's
         // next pass derives the pending crossings from this stamp).
-        self.reliability_residence_change(id, self.clock.ticks(), true);
+        self.reliability_residence_change(id, self.clock.ticks(), true, shadow)?;
         Ok(())
     }
 }
