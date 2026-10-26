@@ -1836,23 +1836,38 @@ impl App {
     /// throttle axis — ignore repeats too: their press inserts into a
     /// held set the per-frame tick drives, so repeats are deduped no-ops.
     fn key_press(&mut self, event: &winit::event::KeyEvent) {
+        self.press_edge(&event.physical_key, &event.logical_key, event.repeat);
+    }
+
+    /// [`Self::key_press`] with the winit `KeyEvent` decomposed to its
+    /// two key identities + the repeat flag — `winit::event::KeyEvent`
+    /// is not constructible outside winit (its `platform_specific`
+    /// field is crate-private), so tests drive THIS with real
+    /// `PhysicalKey`/`Key` values and exercise the same resolution
+    /// and dispatch the window event produces.
+    fn press_edge(
+        &mut self,
+        physical: &winit::keyboard::PhysicalKey,
+        logical: &winit::keyboard::Key,
+        repeat: bool,
+    ) {
         // Rebind capture — before all other dispatch, swallowing the key.
         if self.view.rebind_target().is_some() {
-            if event.repeat {
+            if repeat {
                 // A held key must not count as a second "next press".
                 return;
             }
-            match settings_io::event_binding(event) {
+            match settings_io::binding_of(physical, logical) {
                 None => { /* unbindable key — keep listening */ }
                 Some(b) if b.as_str() == "escape" => {
-                    self.captured_key = Some(event.physical_key);
+                    self.captured_key = Some(*physical);
                     self.view.set_rebind_target(None);
                 }
                 Some(b) => {
                     let Some(action) = self.view.rebind_target() else {
                         return;
                     };
-                    self.captured_key = Some(event.physical_key);
+                    self.captured_key = Some(*physical);
                     self.view.bind_key(action, b);
                 }
             }
@@ -1865,14 +1880,14 @@ impl App {
         // user (or an old settings file) recorded by glyph. The held
         // token is whichever produced the action — it is what the
         // release must remove from `attitude_held`.
-        let phys = settings_io::keycode_token(&event.physical_key);
+        let phys = settings_io::keycode_token(physical);
         let (action, held_token) = match phys
             .as_deref()
             .and_then(|t| self.settings.keys.action_for(t))
         {
             Some(a) => (a, phys),
             None => {
-                let logical = settings_io::key_token(&event.logical_key);
+                let logical = settings_io::key_token(logical);
                 let Some(a) = logical
                     .as_deref()
                     .and_then(|t| self.settings.keys.action_for(t))
@@ -1882,21 +1897,25 @@ impl App {
                 (a, logical)
             }
         };
-        if event.repeat && !action.accepts_repeat() {
+        if repeat && !action.accepts_repeat() {
             return;
         }
         self.dispatch_with_key(action, held_token);
     }
 
     /// The release-side resolver — the same physical-first order
-    /// [`Self::key_press`] uses, so a key that fired an attitude action
-    /// releases exactly that action regardless of layout.
-    fn action_of(&self, event: &winit::event::KeyEvent) -> Option<KeyAction> {
-        settings_io::keycode_token(&event.physical_key)
+    /// [`Self::press_edge`] uses, so a key that fired an attitude action
+    /// releases exactly that action regardless of layout. Decomposed:
+    /// a `KeyEvent` is not constructible outside winit.
+    fn action_of_parts(
+        &self,
+        physical: &winit::keyboard::PhysicalKey,
+        logical: &winit::keyboard::Key,
+    ) -> Option<KeyAction> {
+        settings_io::keycode_token(physical)
             .and_then(|t| self.settings.keys.action_for(&t))
             .or_else(|| {
-                settings_io::key_token(&event.logical_key)
-                    .and_then(|t| self.settings.keys.action_for(&t))
+                settings_io::key_token(logical).and_then(|t| self.settings.keys.action_for(&t))
             })
     }
 
@@ -2251,10 +2270,35 @@ impl App {
     /// actually moved, enqueue the `SetThrottle` on the player FIFO
     /// (launch's `SpawnPhysicalVessel` rides it too — issue order is
     /// preserved in the §7.6 log).
+    ///
+    /// The no-movement early-return suppresses repeat commands on a
+    /// vessel already AT the axis's value — but only that case is a
+    /// real no-op: a §2.6.4 `SurfaceLatched` focus has no body to have
+    /// received the axis's claim (the latch destroyed it; the latched
+    /// throttle is 0 by construction — §2.6.2), so an axis pinned at
+    /// the rail still has an undelivered command to send, and
+    /// `SetThrottle` is the unlatch. Without it the key is dead: an
+    /// axis left at full by a landed flight clamps every Shift tap to
+    /// the same 1.0 the latch already erased (a landed craft can
+    /// never be throttled back up, tap or held ramp alike). A zero
+    /// axis commands nothing — a throttle-down-at-0 press must not
+    /// unlatch a parked craft for nothing. And a `SetThrottle` still
+    /// QUEUED for that craft means the claim is in transit, not lost
+    /// — re-sending it would just spam the player FIFO (`sim.throttle_
+    /// queued` is the in-flight check).
     fn throttle_axis_step(&mut self, delta: f64) {
         let next = (self.throttle_axis + delta).clamp(0.0, 1.0);
         if (next - self.throttle_axis).abs() <= f64::EPSILON {
-            return;
+            let Some(vessel) = self.view.flight_focus() else {
+                return;
+            };
+            let undelivered = matches!(
+                self.view.sim.vessels().get(&vessel).map(|v| &v.state),
+                Some(csp_view::VesselState::SurfaceLatched(_))
+            ) && !self.view.sim.throttle_queued(vessel);
+            if !(undelivered && next > 0.0) {
+                return;
+            }
         }
         self.throttle_axis = next;
         let Some(vessel) = self.view.flight_focus() else {
@@ -2406,25 +2450,36 @@ impl App {
         match event.state {
             ElementState::Pressed => self.key_press(event),
             ElementState::Released => {
-                // Attitude holds key off the *token* the press stored —
-                // try the physical token first, then the logical (a
-                // press whose physical key produced no token — an
-                // `Unidentified` key or an unbound `key-*` — stored the
-                // logical). One key = one entry; the first hit wins.
-                let _ = settings_io::keycode_token(&event.physical_key)
-                    .as_deref()
-                    .is_some_and(|t| self.attitude_release(t))
-                    || settings_io::key_token(&event.logical_key)
-                        .as_deref()
-                        .is_some_and(|t| self.attitude_release(t));
-                // The throttle axis still resolves the action (its
-                // held set is action-keyed).
-                if let Some(action) = self.action_of(event)
-                    && action.is_throttle_axis()
-                {
-                    self.throttle_release(action);
-                }
+                self.release_edge(&event.physical_key, &event.logical_key);
             }
+        }
+    }
+
+    /// The release half of [`Self::keyboard_event`] on the decomposed
+    /// key identities — the `press_edge` counterpart (a `KeyEvent` is
+    /// not constructible outside winit; tests drive this directly).
+    fn release_edge(
+        &mut self,
+        physical: &winit::keyboard::PhysicalKey,
+        logical: &winit::keyboard::Key,
+    ) {
+        // Attitude holds key off the *token* the press stored —
+        // try the physical token first, then the logical (a
+        // press whose physical key produced no token — an
+        // `Unidentified` key or an unbound `key-*` — stored the
+        // logical). One key = one entry; the first hit wins.
+        let _ = settings_io::keycode_token(physical)
+            .as_deref()
+            .is_some_and(|t| self.attitude_release(t))
+            || settings_io::key_token(logical)
+                .as_deref()
+                .is_some_and(|t| self.attitude_release(t));
+        // The throttle axis still resolves the action (its
+        // held set is action-keyed).
+        if let Some(action) = self.action_of_parts(physical, logical)
+            && action.is_throttle_axis()
+        {
+            self.throttle_release(action);
         }
     }
 
@@ -4354,6 +4409,130 @@ mod tests {
             body.pos.norm() > r0 + 1.0,
             "the delivered craft climbs: r {r0} -> {}",
             body.pos.norm()
+        );
+    }
+
+    /// The still-broken half of the stale-axis bug, on the REAL key
+    /// path: a flight that left `throttle_axis` at the rail lands and
+    /// the same vessel re-latches — the latch destroys the body the
+    /// axis's claim rode on, so the axis is stale *for the same
+    /// vessel* (`throttle_axis_vessel == focus` — the cross-vessel
+    /// rebase does not fire). Every Shift press then clamped
+    /// `1.0 + tap → 1.0`, saw no axis movement, and enqueued nothing:
+    /// throttle-up was a permanently dead key. A `press_edge` of the
+    /// real Shift `PhysicalKey`/`Key` pair must deliver the axis's
+    /// undelivered value — `SetThrottle` is the unlatch — and the
+    /// craft must fly again.
+    #[test]
+    fn shift_press_unlatches_the_relanded_craft() {
+        use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
+        let dir = tempdir("relanded-throttle");
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        let frame = |app: &mut App, ticks: u64| {
+            let target = app.view.sim.clock().ticks() + ticks;
+            app.view.begin_frame();
+            app.tick_throttle_ramp(1.0 / 60.0);
+            app.view.sim_step(target).unwrap();
+            app.view.end_frame();
+        };
+        let shift = (
+            PhysicalKey::Code(KeyCode::ShiftLeft),
+            Key::Named(NamedKey::Shift),
+        );
+        frame(&mut app, 320); // settle the seeded pad craft to its latch
+        let vessel = app.view.flight_focus().unwrap();
+        assert!(app.view.sim.vessels()[&vessel].body().is_none());
+        // The stale state a full-throttle flight that LANDED leaves
+        // behind: the axis still describes THIS vessel, still reads
+        // the rail — but the latch destroyed the body the claim rode
+        // on (`throttle_axis_vessel == focus`, so the cross-vessel
+        // rebase never fires — this is the hole dd3612a left).
+        app.throttle_axis = 1.0;
+        app.throttle_axis_vessel = Some(vessel);
+        // The real Shift key-press edge → the tap must STILL enqueue:
+        // the rail-clamped axis's claim was never delivered to the
+        // re-latched body (§2.6.2 zeroes latched throttle), and the
+        // `SetThrottle` is the unlatch command.
+        app.press_edge(&shift.0, &shift.1, false);
+        assert!(app.throttle_held.contains(&KeyAction::ThrottleUp));
+        frame(&mut app, 1); // drain the player FIFO
+        let logged = app.view.sim.command_log().iter().any(|(_, c)| {
+            matches!(c, SimCommand::SetThrottle { vessel: v, throttle } if *v == vessel && *throttle > 0.0)
+        });
+        assert!(logged, "the Shift press must land a SetThrottle");
+        let body = app.view.sim.vessels()[&vessel]
+            .body()
+            .expect("the throttle command unlatched the craft");
+        assert_eq!(body.throttle, 1.0, "the axis's rail value applied");
+        let r0 = body.pos.norm();
+        // Held through the liftoff frames — the kept-alive hold keeps
+        // ramp-frames issuing; the engine must carry it off the pad.
+        for _ in 0..4 {
+            frame(&mut app, 60);
+        }
+        let body = app.view.sim.vessels()[&vessel]
+            .body()
+            .expect("still InBubble");
+        assert!(
+            body.pos.norm() > r0 + 1.0,
+            "the relanded craft flies again: r {r0} -> {}",
+            body.pos.norm()
+        );
+        // The real release edge clears the held axis.
+        app.release_edge(&shift.0, &shift.1);
+        assert!(app.throttle_held.is_empty());
+    }
+
+    /// The guard the rail-deliver must not blow through: a
+    /// throttle-DOWN tap on a parked craft whose axis is already 0
+    /// commands nothing — a `SetThrottle{0}` would unlatch the parked
+    /// craft into an inert bubble body for literally no effect. And
+    /// a rail no-op on a bubble-resident craft (axis == applied)
+    /// stays a no-op — no repeat-command spam.
+    #[test]
+    fn rail_noop_stays_quiet_when_throttle_is_already_delivered() {
+        let dir = tempdir("rail-quiet");
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        let frame = |app: &mut App, ticks: u64| {
+            let target = app.view.sim.clock().ticks() + ticks;
+            app.view.begin_frame();
+            app.tick_throttle_ramp(1.0 / 60.0);
+            app.view.sim_step(target).unwrap();
+            app.view.end_frame();
+        };
+        frame(&mut app, 320);
+        let vessel = app.view.flight_focus().unwrap();
+        let logged = |app: &App| {
+            app.view
+                .sim
+                .command_log()
+                .iter()
+                .filter(|(_, c)| matches!(c, SimCommand::SetThrottle { .. }))
+                .count()
+        };
+        // Ctrl at axis 0 on the parked craft: the axis didn't move and
+        // there's nothing to deliver — no unlatch-for-nothing command.
+        let before = logged(&app);
+        app.dispatch(KeyAction::ThrottleDown);
+        app.throttle_release(KeyAction::ThrottleDown);
+        frame(&mut app, 1);
+        assert_eq!(logged(&app), before, "a 0-axis down tap must not unlatch");
+        assert!(app.view.sim.vessels()[&vessel].body().is_none());
+        // Up to full, fly a tick — the craft holds throttle 1.0 in the
+        // bubble, the axis == applied: a held-Shift frame at the rail
+        // enqueues nothing more.
+        app.dispatch(KeyAction::ThrottleFull);
+        frame(&mut app, 30);
+        assert!(app.view.sim.vessels()[&vessel].body().is_some());
+        let before = logged(&app);
+        app.dispatch(KeyAction::ThrottleUp);
+        for _ in 0..3 {
+            frame(&mut app, 30);
+        }
+        assert_eq!(
+            logged(&app),
+            before,
+            "rail no-op on an in-bubble craft must not spam commands"
         );
     }
 }

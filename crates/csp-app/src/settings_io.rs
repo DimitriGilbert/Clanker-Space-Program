@@ -631,9 +631,15 @@ pub fn keycode_token(key: &PhysicalKey) -> Option<String> {
 /// positionally, so a capture on an AZERTY `Z` records `key-w` and
 /// works as the W-position on every layout), else the logical token.
 pub fn event_binding(event: &winit::event::KeyEvent) -> Option<KeyBinding> {
-    keycode_token(&event.physical_key)
+    binding_of(&event.physical_key, &event.logical_key)
+}
+
+/// [`event_binding`] on the decomposed key identities — the capture
+/// path a `KeyEvent`-less caller (tests) drives.
+pub fn binding_of(physical: &PhysicalKey, logical: &Key) -> Option<KeyBinding> {
+    keycode_token(physical)
         .and_then(|t| KeyBinding::parse(&t))
-        .or_else(|| binding_for(&event.logical_key))
+        .or_else(|| binding_for(logical))
 }
 
 /// The character a saved binding token uses → its positional `key-*`

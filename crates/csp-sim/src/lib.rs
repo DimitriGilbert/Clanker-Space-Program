@@ -3640,6 +3640,19 @@ impl World {
             });
     }
 
+    /// Whether a `SetThrottle` naming `vessel` is still queued,
+    /// undrained — the app's wall-side throttle axis's "claim in
+    /// flight" check: a latched craft whose unlatching command is
+    /// already on its way must not be fed a duplicate every ramp
+    /// frame (the axis's rail value is in transit, not lost).
+    /// Observation only.
+    pub fn throttle_queued(&self, vessel: VesselId) -> bool {
+        self.pending
+            .values()
+            .flatten()
+            .any(|e| matches!(e.command, SimCommand::SetThrottle { vessel: v, .. } if v == vessel))
+    }
+
     /// Read-only access to the §2.8 orbit model — observation, never
     /// mutation (the model is construction config anyway, §7.3). The
     /// presentation layer's map view (M1-D) evaluates `state_at` through
