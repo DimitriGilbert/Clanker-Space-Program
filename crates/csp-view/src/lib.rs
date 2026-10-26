@@ -14,7 +14,7 @@
 use bevy_ecs::prelude::*;
 use bevy_ecs::schedule::SingleThreadedExecutor;
 use csp_core::{SimError, SimTime};
-use csp_sim::World as SimWorld;
+pub use csp_sim::World as SimWorld;
 
 /// The M1 map view (PLAN §5.1 R0 + the M1 exit row): mode/camera state,
 /// orbit polylines, markers, and the `csp_render::map::MapPacket` the
@@ -111,8 +111,16 @@ pub use csp_sim::save;
 /// (bubble / surface-latched / rails) to name the reason a control verb
 /// cannot apply.
 pub use csp_sim::{AdvanceReport, EventClass, SimCommand, SourceClass, VesselState};
+pub use csp_sim::{VesselId, events, orbit};
 // Re-exported so `csp-app` names mode requests without a csp-ui edge.
+/// The control-engine pair `from_source` installs — re-exported so
+/// hosts (`csp --serve`'s reconfigure hook, `session.load`) can name
+/// the exact same engines without a direct csp-script/csp-ai edge.
+pub use csp_ai::AscentAutopilot;
+pub use csp_script::RhaiHost;
 pub use csp_ui::ModeSelect;
+pub use csp_ui::game;
+
 /// M10: the settings model + panel (`csp_ui::settings`) — re-exported so
 /// `csp-app` owns the file IO without a `csp-ui` edge of its own.
 pub use csp_ui::settings;
@@ -357,6 +365,31 @@ pub struct UiOutbox {
     /// The settings panel's "Apply" — `csp-app` copies the staged
     /// settings into its live set and persists them.
     pub settings_apply: bool,
+    /// The Game menu's save verb — write the world snapshot to the
+    /// named slot (`"quicksave"` for the F5 path).
+    pub game_save: Option<String>,
+    /// The Game menu's load verb — restore the named slot's world.
+    pub game_load: Option<String>,
+    /// Revert-to-launch — restore the pre-launch snapshot
+    /// [`View::pre_launch`] captured at `launch_craft`.
+    pub revert: bool,
+    /// Abandon the session and start a fresh world.
+    pub new_game: bool,
+}
+
+/// The Game menu's session state — the slot list `csp-app` stages,
+/// the menu widget's own state, and the revert mirror staged each
+/// `end_frame`. Session state (§2.2-C): never sim state.
+#[derive(Resource, Default)]
+pub struct GameMenuRes {
+    /// Save slots the app found on disk (staged via
+    /// [`View::set_save_list`]).
+    pub saves: Vec<csp_ui::game::SaveSlotRow>,
+    /// The menu widget's mutable state (name field, armed confirms).
+    pub ui: csp_ui::game::GameMenuState,
+    /// The revert point's sim tick, mirrored for the prompt —
+    /// staged in `end_frame` (the schedules never read `sim`).
+    pub revert_tick: Option<u64>,
 }
 
 /// The maneuver panel's session state — `csp-view` owns it (§2.2 C),
@@ -461,6 +494,7 @@ fn build_ui(
     mut settings_state: ResMut<SettingsPanelRes>,
     mut prog_ui: ProgramUi,
     mut tutorial: ResMut<tutorial::TutorialRes>,
+    mut game: ResMut<GameMenuRes>,
     mut outbox: ResMut<UiOutbox>,
 ) {
     let mode = if vab_input.open {
@@ -655,6 +689,7 @@ fn build_ui(
             &session,
             &mut outbox,
             &mut tutorial.0,
+            &mut game,
             mode == csp_ui::ModeSelect::Vab,
         ));
         // The §3.7 cue stack — the GLOBAL refusal/transition channel.
@@ -1292,6 +1327,7 @@ fn m10_panels(
     session: &SessionMirror,
     outbox: &mut UiOutbox,
     tutorial: &mut csp_ui::tutorial::TutorialState,
+    game: &mut GameMenuRes,
     in_vab: bool,
 ) -> Vec<egui::Rect> {
     let mut rects = Vec::with_capacity(3);
@@ -1319,6 +1355,26 @@ fn m10_panels(
             fatal.reason(),
             session.fatal_bundle.as_deref(),
         ));
+    }
+    // The Game menu — save slots, load, revert-to-launch (with the
+    // PLAN:1180 "not a reroll" disclosure), new game. The app owns the
+    // file IO; the verbs ride the outbox like every other request.
+    {
+        let mut gm_out = csp_ui::game::GameMenuOutput::default();
+        let input = csp_ui::game::GameMenuInput {
+            saves: &game.saves,
+            revert_tick: game.revert_tick,
+        };
+        rects.extend(csp_ui::game::game_menu(
+            ctx,
+            &mut game.ui,
+            &input,
+            &mut gm_out,
+        ));
+        outbox.game_save = gm_out.save;
+        outbox.game_load = gm_out.load;
+        outbox.revert = gm_out.revert;
+        outbox.new_game = gm_out.new_game;
     }
     // The first-flight checklist — drawn in every mode while active
     // (it coaches the VAB steps from inside the editor, where its
@@ -1390,6 +1446,51 @@ pub struct View {
     /// evicted entries carry older ticks and can never resurface.
     /// Session state only — never sim state.
     notice_cursor: Option<(u64, u32)>,
+    /// The pre-launch snapshot for revert-to-launch (PLAN:1180 —
+    /// "revert is not a reroll": the same pre-drawn θ records ride the
+    /// restore, so the same parts still fail at the same Λ). Captured
+    /// in `launch_craft` before the spawn command lands; `Err` text
+    /// records why no revert point exists (a §7.4 snapshot refusal).
+    pre_launch: Option<Result<WorldSnapshot, String>>,
+}
+
+/// Replace the session's sim with a world rebuilt from `snapshot`,
+/// re-installing the originating world's own config channels
+/// ([`SimWorld::install_config`]) and the control engines the
+/// snapshot cannot carry (`RhaiHost`/`AscentAutopilot` — the same
+/// pair `from_source` installs). Resets every sim-keyed session
+/// mirror (`StagePlans`, `MapPlanning`, the focus pin, the latched
+/// weld cache, the script log, the notice cursor) and lands the
+/// session in Flight — the restored world is a different vessel set,
+/// so no stale binding may survive.
+fn rebuild_from_snapshot(
+    view: &mut View,
+    snapshot: WorldSnapshot,
+) -> Result<Vec<String>, SimError> {
+    let config = view.sim.config();
+    let mut sim = SimWorld::restore(
+        csp_sim::orbit::PatchedConics::new(config.orbits.clone()),
+        config.physics.clone(),
+        snapshot,
+    )?;
+    sim.install_config(&config);
+    sim.set_script_engine(Box::new(csp_script::RhaiHost::new()));
+    sim.set_autopilot_driver(Box::new(csp_ai::AscentAutopilot::new()));
+    let warnings: Vec<String> = sim
+        .missing_config_channels()
+        .into_iter()
+        .map(|c| format!("restored world is missing config channel `{c}`"))
+        .collect();
+    view.sim = sim;
+    view.notice_cursor = None;
+    view.world
+        .insert_resource(flight::LatchedWeldCache::default());
+    view.world.insert_resource(flight::StagePlans::default());
+    view.world.insert_resource(map::MapPlanning::default());
+    view.world.insert_resource(ScriptLogMirror::default());
+    view.clear_flight_focus_override();
+    view.set_mode(ViewMode::Flight);
+    Ok(warnings)
 }
 
 /// Startup construction failure — [`View::new`] loads `data/` (§8.3's
@@ -1786,6 +1887,9 @@ impl View {
         world.insert_resource(map::MapPlanning::default());
         // M10: the settings window's staged state (§2.2-C session data).
         world.insert_resource(SettingsPanelRes::default());
+        // The Game menu (save/load/revert/new-game) — the staged slot
+        // list + armed confirmations (§2.2-C session state).
+        world.insert_resource(GameMenuRes::default());
         // The optional-panel toggles (debug scaffold, controls help) —
         // session state flipped by the ToggleDebug/ToggleHelp keys.
         world.insert_resource(PanelFlags::default());
@@ -1891,6 +1995,7 @@ impl View {
             ticks_last_frame: 0,
             demo: false,
             notice_cursor: None,
+            pre_launch: None,
         }
     }
 
@@ -2039,6 +2144,8 @@ impl View {
         // M7/M9b: the Program window's mirror — economy, contracts,
         // tech, and the focused vessel's science/reliability rows.
         self.stage_program();
+        // The Game menu's revert mirror — same staging rule.
+        self.world.resource_mut::<GameMenuRes>().revert_tick = self.revert_tick();
         self.schedules.sync.run(&mut self.world);
         self.schedules.presentation.run(&mut self.world);
         // P04-F3: the recover-control Player-lease transfer issues on
@@ -2736,6 +2843,11 @@ impl View {
         // delivery mints the `VesselId` at its event — `StagePlan`'s
         // `(min_id, fingerprint)` binding tolerates exactly this late
         // materialization).
+        // PLAN:1180's revert point — the world as it stood before this
+        // launch order enqueued. A §7.4 refusal (pending queue, live
+        // contacts, live joints) is recorded verbatim: the revert verb
+        // then names its own refusal instead of silently missing.
+        self.pre_launch = Some(self.sim.snapshot().map_err(|e| e.to_string()));
         let plan = flight::StagePlan::for_launch(stage_plan, &self.sim, &craft);
         if let Some(site) = site {
             // §3.5's honest path: the LAUNCH click is a build order —
@@ -2795,6 +2907,110 @@ impl View {
         self.world.resource_mut::<flight::StagePlans>().push(plan);
         self.set_mode(ViewMode::Flight);
         Ok(())
+    }
+
+    /// The §7.2 save payload for the live world — snapshot at the
+    /// §7.4 boundary plus the recorded state hash; the caller adds
+    /// `game_version`/`data_set_hash`/`label` and encodes. The
+    /// `SaveBlocking` reason (pending queue, live contacts, live
+    /// joints, session taint) propagates for the UI to name.
+    pub fn save_game(&self) -> Result<save::Save, SimError> {
+        let snapshot = self.sim.snapshot()?;
+        Ok(save::Save {
+            game_version: String::new(),
+            label: None,
+            data_set_hash: None,
+            state_hash: self.sim.state_hash().ok(),
+            snapshot,
+        })
+    }
+
+    /// Restore the world from a decoded save — full §7.3 config
+    /// re-install, then reset every sim-keyed session mirror. Returns
+    /// the post-restore warnings (missing config channels, which the
+    /// caller renders as notices).
+    pub fn load_game(&mut self, snapshot: WorldSnapshot) -> Result<Vec<String>, SimError> {
+        rebuild_from_snapshot(self, snapshot)
+    }
+
+    /// Whether a revert point exists — the Game menu gates its
+    /// Revert button on this.
+    pub fn revert_available(&self) -> bool {
+        matches!(&self.pre_launch, Some(Ok(_)))
+    }
+
+    /// The revert point's sim tick for the prompt; `None` when no
+    /// captured snapshot exists (the `Err` arm's reason reads via
+    /// [`Self::revert_to_launch`]).
+    pub fn revert_tick(&self) -> Option<u64> {
+        match &self.pre_launch {
+            Some(Ok(snap)) => Some(snap.clock_ticks),
+            _ => None,
+        }
+    }
+
+    /// Why no revert point exists — the §7.4 capture refusal text,
+    /// for the menu's disabled-button hover.
+    pub fn revert_reason(&self) -> Option<&str> {
+        match &self.pre_launch {
+            Some(Err(r)) => Some(r.as_str()),
+            _ => None,
+        }
+    }
+
+    /// PLAN:1180 — revert-to-launch. Restores the pre-launch snapshot
+    /// captured at `launch_craft` — the same pre-drawn θ records ride
+    /// the restore (it is a retry of the flying, never a reroll; the
+    /// UI says so at the prompt). `Err` when no revert point exists.
+    pub fn revert_to_launch(&mut self) -> Result<Vec<String>, SimError> {
+        let snapshot = match &self.pre_launch {
+            Some(Ok(snap)) => snap.clone(),
+            // The capture's refusal text is surfaced through
+            // `revert_reason`, not smuggled in the static SimError.
+            Some(Err(_)) => {
+                return Err(SimError::Recoverable(
+                    "revert point could not be captured at launch",
+                ));
+            }
+            None => {
+                return Err(SimError::Recoverable(
+                    "no revert point — nothing launched yet",
+                ));
+            }
+        };
+        rebuild_from_snapshot(self, snapshot)
+    }
+
+    /// A fresh world — new game. Native loads `data/` again; the §6.3
+    /// demo rebuilds its fixed scenario. The whole `View` is replaced
+    /// so no presentation state can leak across the reset.
+    pub fn new_game(&mut self) -> Result<(), ViewError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            *self = Self::new_demo()?;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            *self = if self.demo {
+                Self::new_demo()?
+            } else {
+                Self::new()?
+            };
+        }
+        Ok(())
+    }
+
+    /// Stage the save-slot listing the Game menu renders — `csp-app`
+    /// rescans its save dir and pushes the rows here.
+    pub fn set_save_list(&mut self, saves: Vec<csp_ui::game::SaveSlotRow>) {
+        self.world.resource_mut::<GameMenuRes>().saves = saves;
+    }
+
+    /// Arm the revert confirmation — the RevertToLaunch key path,
+    /// which must show the same "not a reroll" disclosure the menu's
+    /// Revert button does.
+    pub fn arm_revert_confirm(&mut self) {
+        self.world.resource_mut::<GameMenuRes>().ui.confirm_revert = true;
     }
 
     /// Fire the launched craft's next stage: pop the front drop set

@@ -177,6 +177,42 @@ impl Drop for Server {
     }
 }
 
+/// The shipped hosting path (report-19/20 F1): build a
+/// `tokio::runtime`, start the server against `backend`, print the
+/// attach coordinates (`addr` + the `<pid>.token` discovery file +
+/// the SPA URL), and block until Ctrl-C or the serve task exits.
+/// `csp --serve` is a thin wrapper over this — keeping the runtime
+/// here means the app needs only `csp-server`, never `tokio`.
+pub fn run_blocking(
+    config: ServerConfig,
+    backend: Arc<dyn ControlBackend + Send + Sync>,
+) -> Result<(), ServeError> {
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| ServeError::Serve(format!("tokio runtime: {e}")))?;
+    rt.block_on(async move {
+        let mut server = Server::start(config, backend).await?;
+        eprintln!(
+            "csp-server: listening on http://{} (token file: {})",
+            server.addr,
+            server
+                .token_file
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "disabled".to_string())
+        );
+        // Ctrl-C or the serve task ending — whichever lands first.
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            r = &mut server.task => {
+                if let Err(e) = r {
+                    return Err(ServeError::Serve(format!("serve task: {e}")));
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
 /// Serve-side failures.
 #[derive(Debug)]
 pub enum ServeError {

@@ -1,25 +1,32 @@
 //! M3 VAB craft view + GPU picking (PLAN M3 exit row "GPU picking",
 //! §9 "Editor viewport is `csp-render` + GPU picking").
 //!
-//! Two pipelines over one vertex stream built by `csp-view` (clip-space
-//! f32, §2.3 — this crate never sees the f64 craft frame):
+//! Three pipelines over two vertex streams built by `csp-view`
+//! (clip-space f32, §2.3 — this crate never sees the f64 craft frame):
 //!
-//! - **Color pass** — flat-shaded kitbash part meshes (§3.7's
-//!   "silhouette-correct kitbashed parts" — the M4c floor that
-//!   replaced the through-M3 placeholder boxes) drawn into the app's
-//!   main pass. Depth-tested against a `Depth32Float` buffer this renderer
-//!   owns and the app attaches to its render pass
-//!   ([`VabRenderer::depth_view`]); reverse-Z convention like the map's
-//!   projection (z: 1 = near, 0 = far, clear 0.0, `Greater` wins).
-//! - **Pick pass** — the same vertices re-rasterized into an offscreen
-//!   `R32Uint` texture (with its own depth), each part's fragment
-//!   writing its 1-based index into [`VabPacket::pick_ids`]; 0 is
-//!   background. [`VabRenderer::encode_pick`] copies the pixel under
-//!   the cursor to a 4-byte readback buffer inside the frame's
-//!   submission; [`VabRenderer::map_pick`] (call after submit) hands
-//!   the result to a channel — selection lands via `csp-view`'s input
-//!   events a frame or two later, inside §5.4's pointer→response
-//!   budget.
+//! - **Environment pass** — [`VabPacket::env_vertices`]: the backdrop
+//!   gradient, hangar floor, contact blob, and reference grid. Drawn
+//!   first with the depth test on but **depth writes off**, so the
+//!   decoration can never occlude a part — an eye orbited beneath the
+//!   floor still sees the bottom cap it was blocking (PRD-11 H1).
+//! - **Color pass** — [`VabPacket::vertices`]: flat-shaded kitbash
+//!   part meshes (§3.7's "silhouette-correct kitbashed parts" — the
+//!   M4c floor that replaced the through-M3 placeholder boxes) drawn
+//!   into the app's main pass. Depth-tested AND depth-written against
+//!   a `Depth32Float` buffer this renderer owns and the app attaches
+//!   to its render pass ([`VabRenderer::depth_view`]); reverse-Z
+//!   convention like the map's projection (z: 1 = near, 0 = far,
+//!   clear 0.0, `Greater` wins).
+//! - **Pick pass** — ONLY `vertices` (the environment stream is never
+//!   rasterized here — a click aimed through the floor resolves to
+//!   the part behind it) re-rasterized into an offscreen `R32Uint`
+//!   texture (with its own depth), each part's fragment writing its
+//!   1-based index into [`VabPacket::pick_ids`]; 0 is background.
+//!   [`VabRenderer::encode_pick`] copies the pixel under the cursor to
+//!   a 4-byte readback buffer inside the frame's submission;
+//!   [`VabRenderer::map_pick`] (call after submit) hands the result to
+//!   a channel — selection lands via `csp-view`'s input events a frame
+//!   or two later, inside §5.4's pointer→response budget.
 
 use crate::GpuBuffer;
 
@@ -67,7 +74,18 @@ impl VabVertex {
 /// data, no route back to session state (§2.1/§2.5).
 #[derive(Clone, Debug, Default)]
 pub struct VabPacket {
-    /// Triangle-list part-mesh faces for every placed part.
+    /// The editor environment stream — backdrop gradient, hangar
+    /// floor, contact blob, reference grid. Deliberately a SEPARATE
+    /// stream: the color pass draws it first through a no-depth-write
+    /// pipeline (decoration can never occlude a part — an eye under
+    /// the floor still sees the bottom cap) and the pick pass never
+    /// rasterizes it at all (a click through the floor resolves to
+    /// the part behind it, not background — PRD-11 H1, "can't place
+    /// shit below").
+    pub env_vertices: Vec<VabVertex>,
+    /// Triangle-list part-mesh faces for every placed part — the
+    /// pickable stream the object-id pass rasterizes (ghosts,
+    /// markers, and selection shells ride it too, tagged pick 0).
     pub vertices: Vec<VabVertex>,
     /// `pick_ids[i]` is the `PartNodeId` (as `u64`) drawn with pick
     /// index `i + 1` — the pick readback decodes through this table.
@@ -105,9 +123,16 @@ struct PickTargets {
 pub struct VabRenderer {
     /// Part meshes → the surface (depth-tested).
     pipeline: wgpu::RenderPipeline,
+    /// The environment stream (backdrop, floor, blob, grid) → the
+    /// surface. Shares the part pipeline's shader and light binding
+    /// but NEVER writes depth: the floor decorates the scene behind
+    /// the craft and must never occlude it — an eye orbited under
+    /// the hangar floor still sees (and can click) the bottom cap.
+    env_pipeline: wgpu::RenderPipeline,
     /// Object-id rasterization → `pick.color`.
     pick_pipeline: wgpu::RenderPipeline,
     verts: GpuBuffer,
+    env_verts: GpuBuffer,
     /// `PartLight` uniform — rewritten per draw from the packet.
     light_buf: wgpu::Buffer,
     /// group(0) on the color pipeline — the `light` uniform binding.
@@ -145,6 +170,38 @@ impl VabRenderer {
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         };
+        // The environment variant — same depth test (the floor shades
+        // against itself and the parts' earlier writes do not apply:
+        // env draws first), but NO depth writes, so decoration can
+        // never occlude a part behind it.
+        let env_depth_state = wgpu::DepthStencilState {
+            depth_write_enabled: Some(false),
+            ..depth_state.clone()
+        };
+        // The lit pipelines share one explicit bind-group/pipeline
+        // layout for the `light` uniform so a single `light_bind`
+        // group serves both (auto layouts would give each pipeline a
+        // distinct layout object).
+        let light_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("vab-light"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(
+                        std::mem::size_of::<crate::PartLight>() as u64,
+                    ),
+                },
+                count: None,
+            }],
+        });
+        let lit_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("vab"),
+            bind_group_layouts: &[Some(&light_layout)],
+            immediate_size: 0,
+        });
         let vertex = wgpu::VertexState {
             module: &shader,
             entry_point: Some("vs_main"),
@@ -156,14 +213,18 @@ impl VabRenderer {
             cull_mode: None, // kitbash meshes are not guaranteed closed
             ..Default::default()
         };
-        let mk_pipeline = |label, samples: u32, fragment: wgpu::FragmentState<'_>| {
+        let mk_pipeline = |label,
+                           samples: u32,
+                           layout: Option<&wgpu::PipelineLayout>,
+                           depth: &wgpu::DepthStencilState,
+                           fragment: wgpu::FragmentState<'_>| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
-                layout: None,
+                layout,
                 vertex: vertex.clone(),
                 fragment: Some(fragment),
                 primitive,
-                depth_stencil: Some(depth_state.clone()),
+                depth_stencil: Some(depth.clone()),
                 multisample: wgpu::MultisampleState {
                     count: samples,
                     ..wgpu::MultisampleState::default()
@@ -175,6 +236,24 @@ impl VabRenderer {
         let pipeline = mk_pipeline(
             "vab",
             crate::MSAA_SAMPLES,
+            Some(&lit_layout),
+            &depth_state,
+            wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            },
+        );
+        let env_pipeline = mk_pipeline(
+            "vab-env",
+            crate::MSAA_SAMPLES,
+            Some(&lit_layout),
+            &env_depth_state,
             wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("fs_main"),
@@ -192,6 +271,8 @@ impl VabRenderer {
         let pick_pipeline = mk_pipeline(
             "vab-pick",
             1,
+            None,
+            &depth_state,
             wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("fs_pick"),
@@ -211,8 +292,9 @@ impl VabRenderer {
             "vab-depth",
         );
         let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
-        // The color pipeline's auto layout carries group(0) (`light`);
-        // the pick pipeline shares the shader module but never
+        // Both lit pipelines share `lit_layout`, whose group(0) is
+        // `light_layout` — one bind group serves the part and env
+        // draws. The pick pipeline shares the shader module but never
         // references the uniform, so its own layout stays empty and no
         // bind group is needed for it.
         let light_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -223,7 +305,7 @@ impl VabRenderer {
         });
         let light_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("vab-light"),
-            layout: &pipeline.get_bind_group_layout(0),
+            layout: &light_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: light_buf.as_entire_binding(),
@@ -231,6 +313,7 @@ impl VabRenderer {
         });
         Self {
             pipeline,
+            env_pipeline,
             pick_pipeline,
             light_buf,
             light_bind,
@@ -238,6 +321,11 @@ impl VabRenderer {
                 device,
                 "vab-verts",
                 (std::mem::size_of::<VabVertex>() * 8192) as u64,
+            ),
+            env_verts: GpuBuffer::new(
+                device,
+                "vab-env-verts",
+                (std::mem::size_of::<VabVertex>() * 4096) as u64,
             ),
             depth,
             depth_view,
@@ -277,7 +365,10 @@ impl VabRenderer {
         &self.depth_view
     }
 
-    /// Upload the packet's vertices and draw the part pass into `pass`.
+    /// Upload the packet's streams and draw them into `pass`:
+    /// environment first (it never writes depth — decoration can
+    /// never occlude a part), then the pickable part stream
+    /// (depth-tested and depth-written).
     pub fn draw(
         &mut self,
         pass: &mut wgpu::RenderPass<'_>,
@@ -285,15 +376,23 @@ impl VabRenderer {
         queue: &wgpu::Queue,
         packet: &VabPacket,
     ) {
+        let n_env = self.env_verts.upload(device, queue, &packet.env_vertices);
         let n = self.verts.upload(device, queue, &packet.vertices);
-        if n == 0 {
+        if n_env + n == 0 {
             return;
         }
         queue.write_buffer(&self.light_buf, 0, bytemuck::bytes_of(&packet.light));
-        pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.light_bind, &[]);
-        pass.set_vertex_buffer(0, self.verts.buffer.slice(..));
-        pass.draw(0..n, 0..1);
+        if n_env > 0 {
+            pass.set_pipeline(&self.env_pipeline);
+            pass.set_vertex_buffer(0, self.env_verts.buffer.slice(..));
+            pass.draw(0..n_env, 0..1);
+        }
+        if n > 0 {
+            pass.set_pipeline(&self.pipeline);
+            pass.set_vertex_buffer(0, self.verts.buffer.slice(..));
+            pass.draw(0..n, 0..1);
+        }
     }
 
     /// Record the object-id pass into `encoder` (offscreen, so it may

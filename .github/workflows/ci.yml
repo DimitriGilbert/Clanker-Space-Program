@@ -51,6 +51,7 @@ jobs:
         run: |
           cargo run -p xtask -- lint-deps
           cargo run -p xtask -- lint-attribution
+          cargo run -p xtask -- lint-reach
 
       # §8.2 cargo-deny gate: license allowlist + global bans (deny.toml).
       # cargo-deny is a prebuilt binary install; NOTE it is not vendored in

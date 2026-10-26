@@ -18,7 +18,9 @@ path = "src/main.rs"
 [dependencies]
 csp-core = { workspace = true }
 csp-render = { workspace = true }
-csp-sim = { workspace = true }
+# NOTE: no direct csp-sim edge — §2.1 gives only csp-view the
+# both-sim-and-render bridge; the app names sim types through
+# `csp_view`'s re-exports (`VesselId`, `events`, `orbit`, `save`).
 csp-view = { workspace = true }
 egui = { workspace = true }
 egui-wgpu = { workspace = true }
@@ -51,6 +53,10 @@ wasm-bindgen-futures = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 env_logger = { workspace = true }
+# §2.12's shipped hosting path — `csp --serve` runs GameHost +
+# Server::start against the packaged telemetry SPA. NATIVE ONLY:
+# the wasm tree must never see axum/tokio (§8.2's wasm-purity gate).
+csp-server = { workspace = true }
 
 [lints]
 workspace = true

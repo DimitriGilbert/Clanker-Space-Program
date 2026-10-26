@@ -30,6 +30,74 @@ pub struct TelemetrySnapshot {
     /// Vessel telemetry + control lease, keyed by `VesselId.0` —
     /// `BTreeMap` order is ascending id.
     pub vessels: BTreeMap<u64, SnapshotVessel>,
+    /// The host's focused vessel — `None` when no focus is set (the
+    /// sim has no focus concept; the host records the session's).
+    /// `focus.*` resolves the same row so a dashboard can name
+    /// `focus.altitude_m` instead of hard-coding `vessels.0`.
+    pub focus_vessel_id: Option<u64>,
+    /// The focused vessel's telemetry, duplicated — subscription
+    /// paths `focus.<field>` work without knowing the id.
+    pub focus: Option<SnapshotVessel>,
+    /// The program layer — funds/science/contracts/colonies/crew/
+    /// scripts. The old snapshot was write-only past vessels: an
+    /// agent could `HireCrew`/`FoundColony` and never read a byte of
+    /// it back (report-19 F3). Every field is subscribable for free
+    /// through the dotted-path projection.
+    pub program: ProgramSnapshot,
+}
+
+/// The program half of the snapshot — the read surface `sim.command`'s
+/// write surface never had (report-19 F3).
+#[derive(Clone, Debug, Serialize)]
+pub struct ProgramSnapshot {
+    /// `World::funds_micros` — the economy's funds counter.
+    pub funds_micros: u64,
+    /// Banked science points (`ScienceState::banked`).
+    pub science_banked: f64,
+    /// Open contract offers on the board.
+    pub contract_offers: usize,
+    /// Active (accepted, incomplete) contracts.
+    pub contracts_active: usize,
+    /// Researched tech nodes.
+    pub tech_researched: usize,
+    /// Crew roster size (`EconomyState::crew`).
+    pub crew_roster: usize,
+    /// Colony summaries — `id`, `body`, `state`, module/store counts.
+    pub colonies: Vec<ColonyRow>,
+    /// Bound scripts — id, bound vessel, enabled flag, strikes.
+    pub scripts: Vec<ScriptRow>,
+    /// Engaged autopilots by vessel id.
+    pub autopilots: Vec<u64>,
+    /// Site names with live state — the program's ground truth.
+    pub sites: usize,
+}
+
+/// One colony's wire row.
+#[derive(Clone, Debug, Serialize)]
+pub struct ColonyRow {
+    /// `ColonyId.0`.
+    pub id: u64,
+    /// The body it sits on.
+    pub body: String,
+    /// `ColonyState` rendered as a short tag.
+    pub state: String,
+    /// Installed module count.
+    pub modules: usize,
+    /// Live resource-kind count across stores.
+    pub stores: usize,
+}
+
+/// One script's wire row.
+#[derive(Clone, Debug, Serialize)]
+pub struct ScriptRow {
+    /// `ScriptId.0`.
+    pub id: u64,
+    /// The vessel it is bound to (`VesselId.0`).
+    pub vessel: u64,
+    /// `ScriptState::enabled`.
+    pub enabled: bool,
+    /// `ScriptState::strikes`.
+    pub strikes: u32,
 }
 
 /// One vessel's wire row: the sim's telemetry snapshot flattened with
@@ -51,7 +119,14 @@ impl TelemetrySnapshot {
     /// The publish point's build — observation only, one `Arc` per
     /// call, exactly the §2.12.3 "exactly one publish point" shape.
     pub fn from_world(world: &World) -> Self {
-        let vessels = world
+        Self::from_world_focus(world, None)
+    }
+
+    /// `from_world` carrying the host's focused vessel — `focus` is
+    /// cloned out of `vessels` so `focus.*` paths resolve without the
+    /// client knowing the id.
+    pub fn from_world_focus(world: &World, focus: Option<u64>) -> Self {
+        let vessels: BTreeMap<u64, SnapshotVessel> = world
             .vessels()
             .iter()
             .map(|(id, v)| {
@@ -64,10 +139,46 @@ impl TelemetrySnapshot {
                 )
             })
             .collect();
+        let focus_row = focus.and_then(|f| vessels.get(&f).cloned());
+        let focus_vessel_id = focus.filter(|f| vessels.contains_key(f));
+        let program = ProgramSnapshot {
+            funds_micros: world.funds_micros(),
+            science_banked: world.science().banked,
+            contract_offers: world.contracts().offers.len(),
+            contracts_active: world.contracts().active.len(),
+            tech_researched: world.tech().researched.len(),
+            crew_roster: world.economy().crew.len(),
+            colonies: world
+                .colonies()
+                .iter()
+                .map(|(id, c)| ColonyRow {
+                    id: id.0,
+                    body: c.body.as_str().to_string(),
+                    state: format!("{:?}", c.state),
+                    modules: c.modules.len(),
+                    stores: c.stores.len(),
+                })
+                .collect(),
+            scripts: world
+                .scripts()
+                .iter()
+                .map(|(id, sc)| ScriptRow {
+                    id: id.0,
+                    vessel: sc.vessel.0,
+                    enabled: sc.enabled,
+                    strikes: sc.strikes,
+                })
+                .collect(),
+            autopilots: world.autopilots().keys().map(|v| v.0).collect(),
+            sites: world.economy().sites.len(),
+        };
         Self {
             tick: world.clock().ticks(),
             warp_level: world.warp_level(),
             vessels,
+            focus_vessel_id,
+            focus: focus_row,
+            program,
         }
     }
 

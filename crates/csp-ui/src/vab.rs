@@ -48,10 +48,10 @@
 //! id, build, and subtree. [`VabSession::carried`] is the one
 //! accessor every affordance (ghost, banner, cancel, drop) reads.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 
-use csp_core::DVec3;
+use csp_core::{DQuat, DVec3};
 use csp_data::{
     LoadedParts, LocFile, ModuleDef, PartDef, PartId, ResourceFile, ScaleRule, VariantId,
 };
@@ -256,6 +256,21 @@ pub enum VabAction {
     RemoveStage(u32),
     /// Reindex populated stages to `0..k`.
     CompactStages,
+    /// Undo the last craft mutation — restores the pre-op
+    /// `CraftSession` snapshot from the bounded undo stack.
+    Undo,
+    /// Redo the last undone mutation.
+    Redo,
+    /// Translate the whole craft in the build frame — `delta` adds to
+    /// the root's stored offset; the stack follows rigidly (the
+    /// root's rotation is preserved). The free-reposition verb.
+    Translate(DVec3),
+    /// Remove `node` WITHOUT its subtree — each direct child promotes
+    /// to `node`'s parent, re-snapped through a free
+    /// size-class-matched attach node
+    /// ([`CraftSession::remove_and_reparent`]). Refuses on the root
+    /// and when a child finds no mate on the grandparent.
+    RemoveOnly(PartNodeId),
 }
 
 /// Why a [`VabAction`] was refused — session op failures plus the
@@ -445,6 +460,24 @@ pub struct VabSession {
     /// one-shot fit re-arms on a craft that is not the one it framed
     /// (edits don't bump it — only replacing the craft does).
     craft_epoch: u64,
+    /// The undo history — whole-session snapshots taken before every
+    /// mutating op (a `CraftSession` clone is the cheap, exact inverse
+    /// of any op — every mutation funnels through [`Self::apply`]).
+    /// Bounded at [`UNDO_DEPTH`]; the oldest entries fall off.
+    undo_stack: VecDeque<CraftSession>,
+    /// Sessions undone — cleared by the next mutating op.
+    redo_stack: VecDeque<CraftSession>,
+    /// The world-space point a carried ROOT drops at — the cursor ray
+    /// pushed to the craft-focus depth, computed by `csp-view` each
+    /// frame (it owns the camera). `None` while the cursor is off the
+    /// viewport.
+    drop_anchor: Option<DVec3>,
+    /// Whether the in-flight LMB press began over the viewport — the
+    /// `orbit_block` press anchor. A viewport press suppresses camera
+    /// orbit for the gesture's whole life even when the pointer slides
+    /// over a panel mid-drag (the old current-position check dropped
+    /// the block mid-drag over the palette — PRD-11 L6).
+    press_viewport: bool,
 }
 
 impl Default for VabSession {
@@ -479,9 +512,17 @@ impl Default for VabSession {
             file_io: true,
             tech: None,
             craft_epoch: 0,
+            undo_stack: VecDeque::new(),
+            redo_stack: VecDeque::new(),
+            drop_anchor: None,
+            press_viewport: false,
         }
     }
 }
+
+/// Undo history depth — a `CraftSession` clone per frame; far past
+/// any realistic edit chain.
+const UNDO_DEPTH: usize = 64;
 
 impl VabSession {
     /// Empty session with a catalog — the native startup state.
@@ -540,6 +581,32 @@ impl VabSession {
     /// frame the NEW craft at the OLD craft's distance).
     pub fn craft_epoch(&self) -> u64 {
         self.craft_epoch
+    }
+
+    /// Whether an undoable craft mutation is on the stack.
+    pub fn can_undo(&self) -> bool {
+        !self.undo_stack.is_empty()
+    }
+
+    /// Whether a redo is available.
+    pub fn can_redo(&self) -> bool {
+        !self.redo_stack.is_empty()
+    }
+
+    /// Push/clear the whole-craft drop anchor — `csp-view` owns this
+    /// (it computes the point from the camera + cursor each frame).
+    pub fn set_drop_anchor(&mut self, p: Option<DVec3>) {
+        self.drop_anchor = p;
+    }
+
+    /// The press anchor for `orbit_block` — see the field doc.
+    pub fn press_on_viewport(&self) -> bool {
+        self.press_viewport
+    }
+
+    /// Set/clear the press anchor — `vab_pointer_input` owns this.
+    pub fn set_press_on_viewport(&mut self, on: bool) {
+        self.press_viewport = on;
     }
 
     /// The armed pending placement, if any (see
@@ -799,13 +866,53 @@ impl VabSession {
     /// session dirty for the next `recompute`; every call lands a
     /// line in [`Self::notice`] — a confirmation on success, the
     /// refusal on failure — so no op is ever silent.
+    ///
+    /// Mutating ops push the pre-op session onto the bounded undo
+    /// stack FIRST, so every destructive gesture (delete, palette
+    /// drop, drag-to-remove, stage edits) is Ctrl+Z-recoverable —
+    /// the "editor ate my rocket" fix. A mutation that resolves to a
+    /// no-op (drop keeping the carry, a refused plan) pushes nothing.
     pub fn apply(&mut self, action: VabAction) -> Result<(), VabError> {
+        let before = Self::is_history_op(&action).then(|| self.session.clone());
         let r = self.apply_inner(action);
         match &r {
-            Ok(msg) => self.notice = msg.clone(),
+            Ok(msg) => {
+                self.notice = msg.clone();
+                if let Some(prev) = before
+                    && self.session != prev
+                {
+                    self.redo_stack.clear();
+                    self.undo_stack.push_back(prev);
+                    while self.undo_stack.len() > UNDO_DEPTH {
+                        self.undo_stack.pop_front();
+                    }
+                }
+            }
             Err(e) => self.notice = Some(e.to_string()),
         }
         r.map(|_| ())
+    }
+
+    /// Whether `action` can mutate the `CraftSession` — the undo
+    /// snapshot gate. Session-idle gestures (selection, palette
+    /// arming, camera-adjacent state) and the history ops themselves
+    /// are excluded; `Rename` is too (per-keystroke snapshots would
+    /// flood the stack).
+    fn is_history_op(action: &VabAction) -> bool {
+        !matches!(
+            action,
+            VabAction::Undo
+                | VabAction::Redo
+                | VabAction::CatalogPick(_)
+                | VabAction::CancelPlacement
+                | VabAction::Grab(_)
+                | VabAction::Select(_)
+                | VabAction::SetSymmetry(_)
+                | VabAction::SetAttachMode(_)
+                | VabAction::SetTargetDeltaV(_)
+                | VabAction::SetMinLaunchTwr(_)
+                | VabAction::Rename(_)
+        )
     }
 
     /// The op dispatch — see [`Self::apply`]. `Ok(Some(_))` is a
@@ -942,7 +1049,70 @@ impl VabSession {
                 self.dirty = true;
                 Some("compacted stage numbering".to_string())
             }
+            VabAction::Undo => self.undo(),
+            VabAction::Redo => self.redo(),
+            VabAction::Translate(delta) => {
+                let Some(root) = self.session.root() else {
+                    return Err(VabError::Session(
+                        csp_phys::session::SessionError::EmptySession,
+                    ));
+                };
+                let t = self
+                    .session
+                    .node(root)
+                    .map(|n| n.transform())
+                    .unwrap_or(PartTransform::IDENTITY);
+                self.session
+                    .set_transform(root, PartTransform::new(t.offset + delta, t.rotation))
+                    .map_err(VabError::Session)?;
+                self.dirty = true;
+                Some(format!(
+                    "moved the craft ({:+.2}, {:+.2}, {:+.2}) m",
+                    delta.x, delta.y, delta.z
+                ))
+            }
+            VabAction::RemoveOnly(node) => Some(self.remove_only(node)?),
         })
+    }
+
+    /// [`VabAction::Undo`]'s dispatch — restore the newest snapshot.
+    fn undo(&mut self) -> Option<String> {
+        let Some(prev) = self.undo_stack.pop_back() else {
+            return Some("nothing to undo".to_string());
+        };
+        self.redo_stack
+            .push_back(std::mem::replace(&mut self.session, prev));
+        self.after_history_restore("undone — Ctrl+Shift+Z redoes")
+    }
+
+    /// [`VabAction::Redo`]'s dispatch — replay the newest undo.
+    fn redo(&mut self) -> Option<String> {
+        let Some(next) = self.redo_stack.pop_back() else {
+            return Some("nothing to redo".to_string());
+        };
+        self.undo_stack
+            .push_back(std::mem::replace(&mut self.session, next));
+        self.after_history_restore("redone")
+    }
+
+    /// The shared tail of undo/redo: node references that name gone
+    /// ids are scrubbed, the craft generation bumps (an in-flight GPU
+    /// pick must not decode against the restored craft), and the
+    /// recompute re-arms.
+    fn after_history_restore(&mut self, msg: &str) -> Option<String> {
+        let gone = |s: &CraftSession, id: Option<PartNodeId>| id.is_some_and(|i| !s.contains(i));
+        if gone(&self.session, self.selected) {
+            self.selected = None;
+        }
+        if gone(&self.session, self.move_node) {
+            self.move_node = None;
+        }
+        if gone(&self.session, self.press_node) {
+            self.press_node = None;
+        }
+        self.craft_epoch += 1;
+        self.dirty = true;
+        Some(msg.to_string())
     }
 
     /// The palette's "pick up" — [`VabAction::CatalogPick`]'s
@@ -1006,9 +1176,34 @@ impl VabSession {
         }
         self.dirty = true;
         Ok(if removed.len() > 1 {
-            format!("removed {label} + subtree ({} parts)", removed.len())
+            format!(
+                "removed {label} + subtree ({} parts) — Ctrl+Z restores",
+                removed.len()
+            )
         } else {
-            format!("removed {label}")
+            format!("removed {label} — Ctrl+Z restores")
+        })
+    }
+
+    /// [`VabAction::RemoveOnly`]'s dispatch — delete just this part;
+    /// its children promote to the grandparent, re-snapped through
+    /// free size-class-matched attach nodes. The refusal (root, or a
+    /// child with nowhere to land) removes nothing.
+    fn remove_only(&mut self, node: PartNodeId) -> Result<String, VabError> {
+        let defs = self.catalog.as_ref().ok_or(VabError::NoCatalog)?;
+        let label = self.node_label(node);
+        let n_children = self.session.children_ids(node).len();
+        self.session
+            .remove_and_reparent(defs, node)
+            .map_err(VabError::Session)?;
+        if self.selected == Some(node) {
+            self.selected = None;
+        }
+        self.dirty = true;
+        Ok(if n_children > 0 {
+            format!("removed {label} — its {n_children} children moved up (Ctrl+Z restores)")
+        } else {
+            format!("removed {label} — Ctrl+Z restores")
         })
     }
 
@@ -1047,6 +1242,12 @@ impl VabSession {
         if let Some(node) = self.move_node {
             return Ok(Some(match target {
                 Some(parent) => self.move_planned(node, parent)?,
+                None if self.session.node(node).is_some_and(|n| n.edge().is_none()) => {
+                    // Carrying the root IS carrying the craft — an
+                    // empty-space click lands it (a free reposition),
+                    // it can never mount a part.
+                    self.drop_whole_craft(node)?
+                }
                 None => format!(
                     "carrying {} — click a craft part to reattach it",
                     self.node_label(node)
@@ -1077,7 +1278,10 @@ impl VabSession {
     /// [`VabAction::Grab`]'s dispatch — lift `node` onto the cursor
     /// for a move. The lift is presentation-only (the node keeps its
     /// edge until the drop rewrites it), so a cancel costs nothing.
-    /// The root refuses: it defines the build frame.
+    /// The root lifts the WHOLE craft — it anchors the build frame,
+    /// so the carry is the entire stack and can only drop onto empty
+    /// space (a free reposition via `set_transform`), never mount a
+    /// part.
     fn grab(&mut self, node: PartNodeId) -> Result<Option<String>, VabError> {
         let Some(rec) = self.session.node(node) else {
             return Err(VabError::Session(
@@ -1085,9 +1289,12 @@ impl VabSession {
             ));
         };
         if rec.edge().is_none() {
+            self.pending_part = None;
+            self.drag_part = None;
+            self.move_node = Some(node);
             return Ok(Some(
-                "the craft root can't be picked up — it defines the build frame \
-                 (reroot moves the origin)"
+                "picked up the whole craft — click empty space to move it there \
+                 (Esc puts it back)"
                     .to_string(),
             ));
         }
@@ -1107,6 +1314,12 @@ impl VabSession {
     /// click.
     fn drop_carried(&mut self) -> Result<Option<String>, VabError> {
         if let Some(node) = self.move_node {
+            if self.session.node(node).is_some_and(|n| n.edge().is_none()) {
+                // The carried root is the whole craft — it drops on
+                // empty space only (a part under the cursor is a
+                // refused mount, not a drop point).
+                return self.drop_whole_craft(node).map(Some);
+            }
             let Some(hit) = self.hover else {
                 return Ok(Some(format!(
                     "still carrying {} — aim at a craft part to drop it",
@@ -1128,6 +1341,34 @@ impl VabSession {
             return self.attach_planned(&part, hit.node).map(Some);
         }
         Ok(None)
+    }
+
+    /// The whole-craft drop — a carried ROOT can't mount a part (it
+    /// has no parent edge); on empty space it translates the root so
+    /// its origin lands at the view-pushed `drop_anchor` and the
+    /// stack follows rigidly. Hovering a part or missing an anchor
+    /// keeps the carry with an explanation.
+    fn drop_whole_craft(&mut self, node: PartNodeId) -> Result<String, VabError> {
+        if self.hover.is_some() {
+            return Ok(
+                "the craft root can't mount a part — aim at empty space to move the craft"
+                    .to_string(),
+            );
+        }
+        let Some(anchor) = self.drop_anchor else {
+            return Ok("still carrying the craft — aim at empty space to move it".to_string());
+        };
+        let rot = self
+            .session
+            .node(node)
+            .map(|n| n.transform().rotation)
+            .unwrap_or(DQuat::IDENTITY);
+        self.session
+            .set_transform(node, PartTransform::new(anchor, rot))
+            .map_err(VabError::Session)?;
+        self.move_node = None;
+        self.dirty = true;
+        Ok("moved the whole craft — Ctrl+Z restores".to_string())
     }
 
     /// [`VabAction::PlaceAtHover`]'s dispatch — the catalog
@@ -1157,6 +1398,14 @@ impl VabSession {
     /// subtree carried. Dropping onto the node's own subtree puts it
     /// back where it was (the graceful read of "onto yourself").
     fn move_planned(&mut self, node: PartNodeId, parent: PartNodeId) -> Result<String, VabError> {
+        // The carried root is the whole craft — it can never mount a
+        // part, it can only land on empty space (drop_whole_craft).
+        if self.session.node(node).is_some_and(|n| n.edge().is_none()) {
+            return Ok(
+                "the craft root can't mount a part — click empty space to move the whole craft"
+                    .to_string(),
+            );
+        }
         if self.session.subtree_ids(node).contains(&parent) {
             self.move_node = None;
             return Ok(format!("put {} back where it was", self.node_label(node)));
@@ -1283,6 +1532,12 @@ impl VabSession {
         let Some(node_rec) = self.session.node(node) else {
             fail!(format!("node {node:?} is not placed"));
         };
+        if node_rec.edge().is_none() {
+            fail!(
+                "the craft root can't mount a part — click empty space to move the whole craft"
+                    .to_string()
+            );
+        }
         if self.session.subtree_ids(node).contains(&parent) {
             fail!("a part cannot attach to its own subtree".to_string());
         }
@@ -2051,20 +2306,36 @@ pub fn vab_pointer_input(
     palette: Option<egui::Rect>,
 ) {
     use egui::PointerButton;
-    let (pos, pressed, primary_down, released, deciding, secondary, del, esc, sym_key) =
-        ctx.input(|i| {
-            (
-                i.pointer.hover_pos(),
-                i.pointer.button_pressed(PointerButton::Primary),
-                i.pointer.primary_down(),
-                i.pointer.button_released(PointerButton::Primary),
-                i.pointer.is_decidedly_dragging(),
-                i.pointer.secondary_clicked(),
-                i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace),
-                i.key_pressed(egui::Key::Escape),
-                i.key_pressed(egui::Key::X),
-            )
-        });
+    let (
+        pos,
+        pressed,
+        primary_down,
+        released,
+        deciding,
+        secondary,
+        del,
+        esc,
+        sym_key,
+        undo_key,
+        redo_key,
+    ) = ctx.input(|i| {
+        (
+            i.pointer.hover_pos(),
+            i.pointer.button_pressed(PointerButton::Primary),
+            i.pointer.primary_down(),
+            i.pointer.button_released(PointerButton::Primary),
+            i.pointer.is_decidedly_dragging(),
+            i.pointer.secondary_clicked(),
+            i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace),
+            i.key_pressed(egui::Key::Escape),
+            i.key_pressed(egui::Key::X),
+            // `command` is Cmd on macOS, Ctrl elsewhere — egui's
+            // platform-honest modifier.
+            i.key_pressed(egui::Key::Z) && i.modifiers.command && !i.modifiers.shift,
+            (i.key_pressed(egui::Key::Z) && i.modifiers.command && i.modifiers.shift)
+                || (i.key_pressed(egui::Key::Y) && i.modifiers.command),
+        )
+    });
     // C14-F1: gate the hotkeys on TEXT-EDIT focus, never `InputState::focused`
     // (native window focus — true during all normal play, which dead-keyed
     // Del/Esc/X). Only a field actually taking typed text may hide them.
@@ -2083,33 +2354,46 @@ pub fn vab_pointer_input(
     });
 
     // The press anchor: which placed part (if any) the LMB press
-    // began on — the drag-lift candidate.
+    // began on — the drag-lift candidate — and whether the press
+    // began over the viewport. Both anchor the gesture for its whole
+    // life: a press over a panel that slides into the viewport never
+    // becomes a scene gesture, and a viewport press that slides over
+    // a panel keeps its orbit suppression.
     if pressed {
         vab.set_press_node(if over_viewport {
             vab.hover().map(|h| h.node)
         } else {
             None
         });
+        vab.set_press_on_viewport(over_viewport);
     }
     if !primary_down {
         vab.set_press_node(None);
+        vab.set_press_on_viewport(false);
     }
 
     // An LMB press carrying a part — or begun on one, about to lift
     // it — is a placement/move gesture, not a camera drag: `csp-view`
-    // skips orbit deltas while this is set.
+    // skips orbit deltas while this is set. The anchor is the PRESS
+    // position, not the live cursor — mid-drag over the palette used
+    // to drop the block and orbit while a part rode the cursor.
     vab.set_orbit_block(
-        primary_down && over_viewport && (vab.carried().is_some() || vab.press_node().is_some()),
+        primary_down
+            && vab.press_on_viewport()
+            && (vab.carried().is_some() || vab.press_node().is_some()),
     );
 
     // The drag-lift: a press on a placed part that became a drag
-    // picks the part up. `carried` fills on the grab, so this fires
-    // once per press at most.
+    // picks the part up. One attempt per press — clearing
+    // `press_node` here means a refused grab (or one on the carried
+    // root that resolves) never refires, and a refusal falls through
+    // to the camera orbit rather than a dead gesture.
     if primary_down
         && deciding
         && vab.carried().is_none()
         && let Some(n) = vab.press_node()
     {
+        vab.set_press_node(None);
         let _ = vab.apply(VabAction::Grab(n));
     }
 
@@ -2152,6 +2436,12 @@ pub fn vab_pointer_input(
     // or a save-slot edit never eats them.
     if typing {
         return;
+    }
+    if undo_key {
+        let _ = vab.apply(VabAction::Undo);
+    }
+    if redo_key {
+        let _ = vab.apply(VabAction::Redo);
     }
     if del && let Some(id) = vab.selected() {
         let _ = vab.apply(VabAction::Remove(id));
@@ -2209,14 +2499,37 @@ fn action_bar(ctx: &egui::Context, vab: &mut VabSession) -> egui::Rect {
                     }
                 }
                 ui.separator();
+                // The history controls live beside the mount strip —
+                // undo is the destructive-gesture safety net.
+                if ui
+                    .add_enabled(vab.can_undo(), egui::Button::new("Undo (Ctrl+Z)"))
+                    .clicked()
+                {
+                    let _ = vab.apply(VabAction::Undo);
+                }
+                if ui
+                    .add_enabled(vab.can_redo(), egui::Button::new("Redo"))
+                    .clicked()
+                {
+                    let _ = vab.apply(VabAction::Redo);
+                }
+                ui.separator();
                 if let Some(id) = vab.selected()
                     && vab.carried().is_none()
                 {
                     if ui.button("Pick up (move)").clicked() {
                         let _ = vab.apply(VabAction::Grab(id));
                     }
+                    // "Remove this part only" — children promote to
+                    // the grandparent; distinct from the subtree
+                    // delete, which still eats everything below.
                     if ui.button("Remove").clicked() {
                         let _ = vab.apply(VabAction::Remove(id));
+                    }
+                    if vab.session().node(id).is_some_and(|n| n.edge().is_some())
+                        && ui.button("Remove part only").clicked()
+                    {
+                        let _ = vab.apply(VabAction::RemoveOnly(id));
                     }
                 }
                 if vab.carried().is_some() && ui.button("Put back (Esc)").clicked() {
@@ -2701,6 +3014,10 @@ fn craft_tree(ui: &mut egui::Ui, vab: &mut VabSession) {
                         pending.push(VabAction::Remove(id));
                         ui.close();
                     }
+                    if ui.button("remove part only").clicked() {
+                        pending.push(VabAction::RemoveOnly(id));
+                        ui.close();
+                    }
                 });
                 if let Some(m) = mount {
                     ui.weak(format!("@{m}"));
@@ -3135,6 +3452,13 @@ fn selected_actions(ui: &mut egui::Ui, vab: &mut VabSession, id: PartNodeId) {
         if ui.button("remove subtree").clicked() {
             let _ = vab.apply(VabAction::Remove(id));
         }
+        // The non-destructive sibling: the node's children promote to
+        // the grandparent (a mid-stack delete keeps the engine stack).
+        if vab.session().node(id).is_some_and(|n| n.edge().is_some())
+            && ui.button("remove part only").clicked()
+        {
+            let _ = vab.apply(VabAction::RemoveOnly(id));
+        }
         if ui.button("deselect").clicked() {
             let _ = vab.apply(VabAction::Select(None));
         }
@@ -3311,7 +3635,7 @@ fn vab_hint_bar(
                 format!(
                     "VAB  ·  {parts} part(s)  —  [{}] exit  drag empty space: orbit  \
                      wheel: zoom  click part: select  click/drag selected: move  \
-                     Del/right-click: remove",
+                     drag root: move craft  Del/right-click: remove  Ctrl+Z: undo",
                     keys.hint_labeled(crate::settings::KeyAction::ToggleVab, key_labels)
                 ),
                 egui::FontId::proportional(13.0),
@@ -3775,10 +4099,13 @@ mod tests {
         .unwrap();
         let mid = vab.selected().unwrap();
         let mid_edge = vab.session().node(mid).unwrap().edge().unwrap().clone();
-        // The root refuses — it defines the build frame.
+        // The root lifts the WHOLE craft — it anchors the build
+        // frame, so the carry is the entire stack; Esc puts it back.
         vab.apply(VabAction::Grab(root)).unwrap();
+        assert_eq!(vab.move_node(), Some(root));
+        assert!(vab.notice().unwrap().contains("whole craft"));
+        vab.apply(VabAction::CancelPlacement).unwrap();
         assert!(vab.move_node().is_none());
-        assert!(vab.notice().unwrap().contains("root"));
         // A cancel puts the lifted part back, edge untouched.
         vab.apply(VabAction::Grab(mid)).unwrap();
         assert_eq!(vab.move_node(), Some(mid));
@@ -4418,5 +4745,167 @@ mod tests {
             1,
             "release over the palette bins the lifted part"
         );
+    }
+
+    /// Phase-3 W3.2: the mid-stack subtree delete is undoable — the
+    /// snapshot restores the session bit-identically (ids, transforms,
+    /// stages, the id allocator), and Redo replays the removal.
+    #[test]
+    fn undo_restores_a_deleted_subtree() {
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        vab.apply(VabAction::SetRoot(PartId::from("t.tank")))
+            .unwrap();
+        let root = vab.session().root().unwrap();
+        vab.apply(VabAction::AttachAuto {
+            part: PartId::from("t.tank"),
+            parent: root,
+        })
+        .unwrap();
+        let mid = vab.selected().unwrap();
+        vab.apply(VabAction::AttachAuto {
+            part: PartId::from("t.eng"),
+            parent: mid,
+        })
+        .unwrap();
+        assert_eq!(vab.session().len(), 3);
+        let before = vab.session().clone();
+
+        // Delete the mid part — the engine goes with it.
+        vab.apply(VabAction::Remove(mid)).unwrap();
+        assert_eq!(vab.session().len(), 1);
+        assert!(vab.can_undo());
+        // A no-op (Select) leaves the stack untouched.
+        vab.apply(VabAction::Select(Some(root))).unwrap();
+        let undo_depth = vab.undo_stack.len();
+
+        vab.apply(VabAction::Undo).unwrap();
+        assert_eq!(
+            vab.session(),
+            &before,
+            "undo restores the craft bit-identically"
+        );
+        assert_eq!(vab.session().len(), 3);
+        assert!(vab.can_redo());
+        assert_eq!(vab.undo_stack.len(), undo_depth - 1);
+
+        vab.apply(VabAction::Redo).unwrap();
+        assert_eq!(vab.session().len(), 1);
+
+        // Undoing past the floor is a quiet notice, not a panic —
+        // drain the whole stack (4 frames: SetRoot + 2 AttachAuto +
+        // Remove), then the next one reports empty.
+        for _ in 0..6 {
+            vab.apply(VabAction::Undo).unwrap();
+        }
+        assert!(vab.notice().unwrap().contains("nothing to undo"));
+
+        // A new mutation clears the redo stack (the drained session
+        // is empty — SetRoot is a history op too).
+        vab.apply(VabAction::SetRoot(PartId::from("t.tank")))
+            .unwrap();
+        assert!(!vab.can_redo());
+    }
+
+    /// Phase-3 W3.3: the root lifts as the whole-craft carry — an
+    /// empty-space drop lands it at the view's drop anchor (the stack
+    /// follows rigidly), hovering a part refuses the mount, and
+    /// `Translate` nudges the same rigid way.
+    #[test]
+    fn root_grab_moves_the_whole_craft() {
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        vab.apply(VabAction::SetRoot(PartId::from("t.tank")))
+            .unwrap();
+        let root = vab.session().root().unwrap();
+        vab.apply(VabAction::AttachAuto {
+            part: PartId::from("t.eng"),
+            parent: root,
+        })
+        .unwrap();
+        let eng = vab.selected().unwrap();
+        let eng_local = vab.session().node(eng).unwrap().transform();
+
+        vab.apply(VabAction::Grab(root)).unwrap();
+        assert_eq!(vab.carried(), Some(Carried::Moving(root)));
+
+        // A drop ON a part refuses — the root cannot mount.
+        vab.set_hover(Some(HoverHit {
+            node: eng,
+            local: DVec3::ZERO,
+            region: AttachRegion::BottomCap,
+        }));
+        vab.apply(VabAction::Drop).unwrap();
+        assert_eq!(
+            vab.move_node(),
+            Some(root),
+            "a refused mount keeps the carry"
+        );
+
+        // Empty space: the craft lands at the pushed anchor.
+        vab.set_hover(None);
+        vab.set_drop_anchor(Some(DVec3::new(2.0, 3.0, -1.0)));
+        vab.apply(VabAction::Drop).unwrap();
+        assert!(vab.move_node().is_none());
+        let t = vab.session().node(root).unwrap().transform();
+        assert_eq!(t.offset, DVec3::new(2.0, 3.0, -1.0));
+        // The subtree moved rigidly — the child's local transform is
+        // byte-identical.
+        assert_eq!(vab.session().node(eng).unwrap().transform(), eng_local);
+        assert_eq!(
+            vab.session().node(eng).unwrap().edge().unwrap().parent,
+            root
+        );
+
+        // `Translate` is the same rigid move, programmatic.
+        vab.apply(VabAction::Translate(DVec3::new(0.0, 0.0, 5.0)))
+            .unwrap();
+        assert_eq!(
+            vab.session().node(root).unwrap().transform().offset,
+            DVec3::new(2.0, 3.0, 4.0)
+        );
+        // And it is undoable.
+        vab.apply(VabAction::Undo).unwrap();
+        assert_eq!(
+            vab.session().node(root).unwrap().transform().offset,
+            DVec3::new(2.0, 3.0, -1.0)
+        );
+    }
+
+    /// Phase-3 W3.4: `RemoveOnly` deletes just the mid part — the
+    /// engine stack promotes onto the root instead of vanishing; the
+    /// root refuses (no parent to promote to).
+    #[test]
+    fn remove_only_promotes_children() {
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        vab.apply(VabAction::SetRoot(PartId::from("t.tank")))
+            .unwrap();
+        let root = vab.session().root().unwrap();
+        vab.apply(VabAction::AttachAuto {
+            part: PartId::from("t.tank"),
+            parent: root,
+        })
+        .unwrap();
+        let mid = vab.selected().unwrap();
+        vab.apply(VabAction::AttachAuto {
+            part: PartId::from("t.eng"),
+            parent: mid,
+        })
+        .unwrap();
+        let eng = vab.selected().unwrap();
+
+        vab.apply(VabAction::RemoveOnly(mid)).unwrap();
+        assert_eq!(vab.session().len(), 2);
+        assert!(vab.session().contains(eng));
+        assert_eq!(
+            vab.session().node(eng).unwrap().edge().unwrap().parent,
+            root,
+            "the engine promoted onto the grandparent"
+        );
+        // The root refuses RemoveOnly outright.
+        assert!(vab.apply(VabAction::RemoveOnly(root)).is_err());
+        assert_eq!(vab.session().len(), 2);
+        // And the promote is undoable.
+        vab.apply(VabAction::Undo).unwrap();
+        assert_eq!(vab.session().len(), 3);
+        assert!(vab.session().contains(mid));
     }
 }

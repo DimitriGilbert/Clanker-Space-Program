@@ -237,6 +237,13 @@ pub enum KeyAction {
     /// Open/close the Program window (contracts / research /
     /// vessel science) — the science loop's panel verb.
     OpenProgram,
+    /// Quicksave — write the world to the `quicksave` slot.
+    QuickSave,
+    /// Quickload — restore the `quicksave` slot.
+    QuickLoad,
+    /// Revert-to-launch — restore the pre-launch snapshot (arms the
+    /// PLAN §3.4 "not a reroll" disclosure prompt).
+    RevertToLaunch,
 }
 
 impl KeyAction {
@@ -263,6 +270,9 @@ impl KeyAction {
         Self::ToggleHelp,
         Self::ToggleDebug,
         Self::OpenProgram,
+        Self::QuickSave,
+        Self::QuickLoad,
+        Self::RevertToLaunch,
     ];
 
     /// The panel label.
@@ -289,6 +299,9 @@ impl KeyAction {
             Self::ToggleHelp => "controls help",
             Self::ToggleDebug => "debug panel",
             Self::OpenProgram => "open program window",
+            Self::QuickSave => "quicksave",
+            Self::QuickLoad => "quickload",
+            Self::RevertToLaunch => "revert to launch",
         }
     }
 
@@ -564,6 +577,9 @@ impl Default for Keymap {
                 (KeyAction::ToggleHelp, b(&["f1", "key-slash"])),
                 (KeyAction::ToggleDebug, b(&["f3"])),
                 (KeyAction::OpenProgram, b(&["key-p"])),
+                (KeyAction::QuickSave, b(&["f5"])),
+                (KeyAction::QuickLoad, b(&["f9"])),
+                (KeyAction::RevertToLaunch, b(&["f10"])),
             ]),
         }
     }

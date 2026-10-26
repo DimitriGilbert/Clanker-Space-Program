@@ -315,6 +315,40 @@ pub enum SessionError {
         /// The requested new parent (inside that subtree).
         parent: PartNodeId,
     },
+    /// `reattach` on the root — the root has no parent edge to
+    /// rewrite (its ancestor chain tops out at itself, so the generic
+    /// check reports `WouldCycle`, which misreads as "the move loops
+    /// the tree"). Translate it with [`Self::set_transform`] or
+    /// re-anchor the tree with [`Self::reroot`].
+    RootImmovable {
+        /// The root node a reattach named.
+        node: PartNodeId,
+    },
+    /// `add_part`/`reattach`/`remove_and_reparent` named an attach
+    /// node another edge already mates — one stack node mates exactly
+    /// one neighbour (a second edge would weld coincident,
+    /// interpenetrating colliders). The VAB planners filter bound
+    /// nodes up front; this is the model-level invariant every other
+    /// writer (MCP `craft.build`, the design solver, a crafted file
+    /// surfaced by `validate`) gets for free.
+    AttachNodeOccupied {
+        /// The placed node carrying the occupied attach node.
+        node: PartNodeId,
+        /// `"parent"` or `"child"` — which side of the edge.
+        which: &'static str,
+        /// The already-bound `AttachNode::id` (or `surf:` id).
+        node_id: String,
+    },
+    /// `remove_and_reparent` refused — nothing was removed. `child`
+    /// names the child that found no free size-class-matched node on
+    /// the grandparent; `None` when `node` is the root, which has no
+    /// parent to promote its children to.
+    ReparentFailed {
+        /// The node whose single-part removal was refused.
+        node: PartNodeId,
+        /// The child that could not promote, when relevant.
+        child: Option<PartNodeId>,
+    },
     /// `set_transform` got a non-finite or non-unit transform — the
     /// same gate the weld applies, one boundary earlier.
     InvalidTransform {
@@ -409,6 +443,32 @@ impl fmt::Display for SessionError {
                 f,
                 "session: attaching {node:?} under {parent:?} would cycle the tree"
             ),
+            Self::RootImmovable { node } => write!(
+                f,
+                "session: node {node:?} is the craft root — it has no parent edge \
+                 to rewrite (set_transform moves it, reroot re-anchors the tree)"
+            ),
+            Self::AttachNodeOccupied {
+                node,
+                which,
+                node_id,
+            } => write!(
+                f,
+                "session: {which} attach node {node_id:?} on {node:?} is already \
+                 bound — one attach node mates exactly one neighbour"
+            ),
+            Self::ReparentFailed { node, child } => match child {
+                Some(c) => write!(
+                    f,
+                    "session: removing {node:?} alone would leave child {c:?} \
+                     without a free size-class-matched node on the grandparent"
+                ),
+                None => write!(
+                    f,
+                    "session: the root {node:?} has no parent — its children \
+                     cannot promote (remove the subtree or reroot first)"
+                ),
+            },
             Self::InvalidTransform { node } => {
                 write!(f, "session: invalid transform on node {node:?}")
             }
@@ -470,6 +530,10 @@ impl fmt::Display for SessionWarning {
             Self::AttachDiameterMismatch { child } => {
                 write!(f, "node {child:?}'s attach sizes disagree after scaling")
             }
+            Self::AttachNodeOccupied { node, node_id } => write!(
+                f,
+                "attach node {node_id:?} on node {node:?} is bound by two edges"
+            ),
         }
     }
 }
@@ -520,6 +584,17 @@ pub enum SessionWarning {
     AttachDiameterMismatch {
         /// The child-side node carrying the edge.
         child: PartNodeId,
+    },
+    /// Two edges bind the same attach node on `node` — a crafted file
+    /// can bypass the op-level one-neighbour-per-node rule
+    /// ([`SessionError::AttachNodeOccupied`]); the craft welds
+    /// (coincident, interpenetrating colliders) but the flag is the
+    /// honest read that its geometry is corrupt.
+    AttachNodeOccupied {
+        /// The placed node carrying the over-bound attach node.
+        node: PartNodeId,
+        /// The shared `AttachNode::id` (or `surf:` id).
+        node_id: String,
     },
 }
 
@@ -1048,11 +1123,10 @@ impl CraftSession {
     /// The attach-node ids on `id`'s def an edge already binds: the
     /// node `id` itself hangs from (its edge's `child_node`) plus the
     /// parent-side node of every child edge. A stack node mates
-    /// exactly one neighbour — placement helpers that *choose* a node
-    /// (the VAB's `AttachAuto`) must skip these, or the new part lands
-    /// coincident with the bound one. `add_part`/`reattach` do not
-    /// consult this: an explicit [`AttachEdge`] stays the caller's
-    /// responsibility.
+    /// exactly one neighbour — [`Self::add_part`]/[`Self::reattach`]
+    /// enforce the rule ([`SessionError::AttachNodeOccupied`]) and the
+    /// VAB's planners additionally filter this set up front so the
+    /// ghost previews the same verdict the commit reaches.
     pub fn bound_attach_nodes(&self, id: PartNodeId) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
         if let Some(e) = self.nodes.get(&id).and_then(|n| n.edge.as_ref()) {
@@ -1172,6 +1246,18 @@ impl CraftSession {
                 part_id: built.part_id.clone(),
             })?;
         check_built(child_def, &built, id)?;
+        // One stack node mates exactly one neighbour — refuse a
+        // second edge onto an already-bound parent node.
+        if self
+            .bound_attach_nodes(edge.parent)
+            .contains(&edge.parent_node)
+        {
+            return Err(SessionError::AttachNodeOccupied {
+                node: edge.parent,
+                which: "parent",
+                node_id: edge.parent_node.clone(),
+            });
+        }
         let transform = self.compute_attach(defs, id, &built, &edge)?;
         let node = SessionNode {
             built,
@@ -1315,11 +1401,108 @@ impl CraftSession {
         Ok(removed)
     }
 
+    /// Remove `id` WITHOUT its subtree — the "delete this part only"
+    /// complement to [`Self::remove_part`]: each direct child promotes
+    /// onto `id`'s parent, re-snapped through a free
+    /// size-class-matched attach node (the slot `id` vacated is tried
+    /// first, then authored order). Atomic: when `id` is the root (no
+    /// parent to promote to) or any child finds no mate on the
+    /// grandparent, the op refuses and nothing is removed. Returns
+    /// `[id]` — the single removed node.
+    pub fn remove_and_reparent(
+        &mut self,
+        defs: &LoadedParts,
+        id: PartNodeId,
+    ) -> Result<Vec<PartNodeId>, SessionError> {
+        let node = self
+            .nodes
+            .get(&id)
+            .ok_or(SessionError::UnknownNode { id })?;
+        let Some(edge) = node.edge.clone() else {
+            return Err(SessionError::ReparentFailed {
+                node: id,
+                child: None,
+            });
+        };
+        let children = self.children_ids(id);
+        if children.is_empty() {
+            // A leaf promotes nothing — identical to remove_part.
+            return self.remove_part(id);
+        }
+        let parent_rec = self
+            .nodes
+            .get(&edge.parent)
+            .ok_or(SessionError::UnknownNode { id: edge.parent })?;
+        let parent_def = find_def(defs, &parent_rec.built.part_id).ok_or_else(|| {
+            SessionError::UnknownPartDef {
+                node: Some(edge.parent),
+                part_id: parent_rec.built.part_id.clone(),
+            }
+        })?;
+        // Plan every promotion before mutating: candidates are the
+        // grandparent's free attach nodes, `id`'s own slot freed, in
+        // vacated-slot-first then authored order.
+        let mut bound = self.bound_attach_nodes(edge.parent);
+        bound.remove(&edge.parent_node);
+        let mut planned: Vec<(PartNodeId, AttachEdge, PartTransform)> =
+            Vec::with_capacity(children.len());
+        for c in children {
+            let (c_built, c_child_node) = {
+                let cn = self
+                    .nodes
+                    .get(&c)
+                    .ok_or(SessionError::UnknownNode { id: c })?;
+                let ce = cn.edge.clone().ok_or(SessionError::UnknownNode { id: c })?;
+                (cn.built.clone(), ce.child_node)
+            };
+            let mut candidates: Vec<&str> = vec![edge.parent_node.as_str()];
+            candidates.extend(
+                parent_def
+                    .attach_nodes
+                    .iter()
+                    .map(|n| n.id.as_str())
+                    .filter(|nid| *nid != edge.parent_node),
+            );
+            let mut found = None;
+            for pn_id in candidates {
+                if bound.contains(pn_id) {
+                    continue;
+                }
+                let trial = AttachEdge::new(edge.parent, pn_id, &c_child_node);
+                if let Ok(t) = self.compute_attach(defs, c, &c_built, &trial) {
+                    bound.insert(trial.parent_node.clone());
+                    found = Some((trial, t));
+                    break;
+                }
+            }
+            let Some((trial, t)) = found else {
+                return Err(SessionError::ReparentFailed {
+                    node: id,
+                    child: Some(c),
+                });
+            };
+            planned.push((c, trial, t));
+        }
+        self.nodes.remove(&id);
+        for (c, e, t) in planned {
+            let n = self
+                .nodes
+                .get_mut(&c)
+                .ok_or(SessionError::UnknownNode { id: c })?;
+            n.edge = Some(e);
+            n.transform = t;
+        }
+        Ok(vec![id])
+    }
+
     /// Re-snap `id` (with its subtree) under a new parent — the "move"
     /// half of editor drag-and-drop. Rejects a move under the node's
-    /// own subtree (`WouldCycle`) — which also refuses every root
-    /// re-attach, since the root is an ancestor of the whole tree;
-    /// root moves go through [`Self::reroot`].
+    /// own subtree (`WouldCycle`); the root refuses outright
+    /// (`RootImmovable` — it has no parent edge; translate it with
+    /// [`Self::set_transform`], re-anchor with [`Self::reroot`]).
+    /// An edge onto an already-mated attach node refuses with
+    /// [`SessionError::AttachNodeOccupied`], except the slot the
+    /// moving edge's own old binding frees.
     pub fn reattach(
         &mut self,
         defs: &LoadedParts,
@@ -1330,10 +1513,48 @@ impl CraftSession {
             .nodes
             .get(&id)
             .ok_or(SessionError::UnknownNode { id })?;
+        // The root tops every ancestor chain, so it always tripped
+        // the cycle check — report the real reason instead (the
+        // `WouldCycle` message misreads for what is "the root is the
+        // anchor"). Free moves go through `set_transform`;
+        // re-anchoring goes through `reroot`.
+        if node.edge.is_none() {
+            return Err(SessionError::RootImmovable { node: id });
+        }
         if is_ancestor_of(&self.nodes, id, edge.parent) {
             return Err(SessionError::WouldCycle {
                 node: id,
                 parent: edge.parent,
+            });
+        }
+        // Occupancy: the new edge must not double-bind a parent node
+        // another edge already mates — except the slot the moving
+        // edge's own old binding frees (re-attaching where it already
+        // hangs is a valid plan). Same on the child side: the node's
+        // children keep their mates, so the new `child_node` must be
+        // one they did not take; the node's old `child_node` frees.
+        let mut bound = self.bound_attach_nodes(edge.parent);
+        if let Some(old) = &node.edge
+            && old.parent == edge.parent
+        {
+            bound.remove(&old.parent_node);
+        }
+        if bound.contains(&edge.parent_node) {
+            return Err(SessionError::AttachNodeOccupied {
+                node: edge.parent,
+                which: "parent",
+                node_id: edge.parent_node.clone(),
+            });
+        }
+        let mut child_bound = self.bound_attach_nodes(id);
+        if let Some(old) = &node.edge {
+            child_bound.remove(&old.child_node);
+        }
+        if child_bound.contains(&edge.child_node) {
+            return Err(SessionError::AttachNodeOccupied {
+                node: id,
+                which: "child",
+                node_id: edge.child_node.clone(),
             });
         }
         let built = node.built.clone();
@@ -1827,8 +2048,48 @@ impl CraftSession {
                 _ => {}
             }
         }
+        self.validate_occupancy(&mut out);
         self.validate_staging(&def_of, &mut out);
         out
+    }
+
+    /// The occupancy half of `validate` — kept separate like the
+    /// staging half so the rule list (module doc) reads in one place.
+    /// One attach node mates exactly one neighbour; the ops enforce
+    /// it, a crafted file bypasses them. Tally the bound ids per node
+    /// (its own `child_node` + each child's `parent_node`) and flag
+    /// duplicates.
+    fn validate_occupancy(&self, out: &mut Validation) {
+        let mut children: BTreeMap<PartNodeId, Vec<PartNodeId>> = BTreeMap::new();
+        for (id, n) in &self.nodes {
+            if let Some(e) = &n.edge {
+                children.entry(e.parent).or_default().push(*id);
+            }
+        }
+        for (id, n) in &self.nodes {
+            let mut seen: BTreeSet<&str> = BTreeSet::new();
+            let mut dup: BTreeSet<&str> = BTreeSet::new();
+            if let Some(e) = &n.edge
+                && !seen.insert(e.child_node.as_str())
+            {
+                dup.insert(e.child_node.as_str());
+            }
+            if let Some(kids) = children.get(id) {
+                for c in kids {
+                    if let Some(e) = self.nodes.get(c).and_then(|n| n.edge.as_ref())
+                        && !seen.insert(e.parent_node.as_str())
+                    {
+                        dup.insert(e.parent_node.as_str());
+                    }
+                }
+            }
+            for node_id in dup {
+                out.warnings.push(SessionWarning::AttachNodeOccupied {
+                    node: *id,
+                    node_id: node_id.to_string(),
+                });
+            }
+        }
     }
 
     /// The staging half of `validate` — kept separate so the rule list
@@ -2419,24 +2680,34 @@ mod tests {
     #[test]
     fn reattach_moves_subtree_and_rejects_cycles() {
         let (mut s, defs, pod, tank, eng) = stack();
-        // Attach the engine directly under the pod (skipping the tank):
-        // re-snapped transform −0.5 − (+0.5) = −1.0.
-        s.reattach(&defs, eng, AttachEdge::new(pod, "bottom", "top"))
+        // Attach the engine directly under the pod's FREE top node
+        // (pod.bottom is bound by the tank — the occupancy rule now
+        // refuses that edge): top↔top opposes via a 180° roll, so
+        // +0.5 − (−0.5) = +1.0 above the pod.
+        s.reattach(&defs, eng, AttachEdge::new(pod, "top", "top"))
             .unwrap();
         assert_eq!(s.node(eng).unwrap().edge().unwrap().parent, pod);
-        assert_eq!(
-            s.node(eng).unwrap().transform().offset,
-            DVec3::new(0.0, 0.0, -1.0)
+        // (the roll leaves ~1e-17 residue in x)
+        assert!(
+            (s.node(eng).unwrap().transform().offset - DVec3::new(0.0, 0.0, 1.0)).norm() < 1e-12
         );
         assert_eq!(s.children_ids(pod), vec![tank, eng]);
-        // Cycle attempts: a node under itself, and the root under its
-        // own descendant.
+        // The root is not a cycle — it's the typed `RootImmovable`
+        // refusal (it has no parent edge at all).
         assert!(matches!(
             s.reattach(&defs, pod, AttachEdge::new(pod, "bottom", "top")),
-            Err(SessionError::WouldCycle { .. })
+            Err(SessionError::RootImmovable { .. })
         ));
         assert!(matches!(
             s.reattach(&defs, pod, AttachEdge::new(tank, "top", "top")),
+            Err(SessionError::RootImmovable { .. })
+        ));
+        // A genuine cycle: put the engine back under the tank, then
+        // try the tank under its own engine.
+        s.reattach(&defs, eng, AttachEdge::new(tank, "bottom", "top"))
+            .unwrap();
+        assert!(matches!(
+            s.reattach(&defs, tank, AttachEdge::new(eng, "bottom", "top")),
             Err(SessionError::WouldCycle { .. })
         ));
         // Missing nodes on either end are typed.
@@ -3200,5 +3471,114 @@ mod tests {
             CraftSession::from_bytes(&encode(&f)),
             Err(CraftFileError::Cycle { .. }) | Err(CraftFileError::BadRootEdge { .. })
         ));
+    }
+
+    /// PRD-10 M4: one attach node mates exactly one neighbour —
+    /// `add_part` refuses a second edge onto a bound node, `reattach`
+    /// refuses both parent- and child-side double binds, and the
+    /// moving edge's own old ends are exempt.
+    #[test]
+    fn attach_node_occupancy_is_enforced() {
+        let (mut s, defs, pod, tank, eng) = stack();
+        // Second edge onto pod.bottom — already mated to tank.top.
+        assert!(matches!(
+            s.add_part(
+                &defs,
+                stock("test.tank"),
+                AttachEdge::new(pod, "bottom", "top"),
+            ),
+            Err(SessionError::AttachNodeOccupied {
+                node,
+                which: "parent",
+                ref node_id,
+            }) if node == pod && node_id == "bottom"
+        ));
+        // Reattach to the slot the moving edge frees is legal.
+        s.reattach(&defs, eng, AttachEdge::new(tank, "bottom", "top"))
+            .unwrap();
+        // Reattach eng onto tank's side? no — onto pod.bottom is
+        // occupied (by tank's edge — the MOVED node is eng, not tank).
+        assert!(matches!(
+            s.reattach(&defs, eng, AttachEdge::new(pod, "bottom", "top")),
+            Err(SessionError::AttachNodeOccupied {
+                node,
+                which: "parent",
+                ..
+            }) if node == pod
+        ));
+        // Child side: tank's "bottom" is bound by eng's edge —
+        // reattaching tank with child_node "bottom" double-binds it.
+        assert!(matches!(
+            s.reattach(&defs, tank, AttachEdge::new(pod, "bottom", "bottom")),
+            Err(SessionError::AttachNodeOccupied {
+                node,
+                which: "child",
+                ref node_id,
+            }) if node == tank && node_id == "bottom"
+        ));
+        // The parent side alone is still legal when the child node is
+        // a free one — tank re-snaps back where it was.
+        s.reattach(&defs, tank, AttachEdge::new(pod, "bottom", "top"))
+            .unwrap();
+    }
+
+    /// The root has no parent edge — reattach reports the typed
+    /// `RootImmovable` (the old `WouldCycle` misread as a loop).
+    #[test]
+    fn reattach_root_is_typed() {
+        let (mut s, defs, pod, tank, _) = stack();
+        assert!(matches!(
+            s.reattach(&defs, pod, AttachEdge::new(tank, "top", "bottom")),
+            Err(SessionError::RootImmovable { node }) if node == pod
+        ));
+    }
+
+    /// `remove_and_reparent` deletes just the mid part — the engine
+    /// promotes onto the grandparent's freed slot, re-snapped.
+    #[test]
+    fn remove_and_reparent_promotes_children() {
+        let (mut s, defs, pod, tank, eng) = stack();
+        let removed = s.remove_and_reparent(&defs, tank).unwrap();
+        assert_eq!(removed, vec![tank]);
+        assert_eq!(s.len(), 2);
+        // eng's edge now names pod; it kept its child node and landed
+        // on the slot the tank vacated (pod.bottom/top: −0.5 − 0.5 = −1.0).
+        let e = s.node(eng).unwrap().edge().unwrap().clone();
+        assert_eq!(e.parent, pod);
+        assert_eq!(e.parent_node, "bottom");
+        assert_eq!(e.child_node, "top");
+        let t = s.node(eng).unwrap().transform();
+        assert_eq!(t.offset, DVec3::new(0.0, 0.0, -1.0));
+        // Root refuses — no parent to promote to.
+        assert!(matches!(
+            s.remove_and_reparent(&defs, pod),
+            Err(SessionError::ReparentFailed { node, child: None }) if node == pod
+        ));
+        // A leaf is a plain remove.
+        let (mut s, defs, _, _, eng) = stack();
+        assert_eq!(s.remove_and_reparent(&defs, eng).unwrap(), vec![eng]);
+        assert_eq!(s.len(), 2);
+    }
+
+    /// A crafted file can bypass the ops' occupancy rule — `validate`
+    /// flags the double-bound node so it never validates clean.
+    #[test]
+    fn validate_flags_a_double_bound_node() {
+        let (s, defs, pod, _tank, _) = stack();
+        let mut f = file_of(&s);
+        // Duplicate tank's node record under a fresh id sharing
+        // pod.bottom — two edges bind the same attach node.
+        let mut dup = f.nodes[1].clone();
+        dup.id = f.nodes.iter().map(|n| n.id).max().unwrap() + 1;
+        dup.edge = Some(AttachEdge::new(PartNodeId(pod.0), "bottom", "top"));
+        f.next_id = dup.id + 1;
+        f.nodes.push(dup);
+        let s = CraftSession::from_bytes(&encode(&f)).unwrap();
+        let v = s.validate(&defs);
+        assert!(v.warnings.iter().any(|w| matches!(
+            w,
+            SessionWarning::AttachNodeOccupied { node, node_id }
+                if *node == pod && node_id == "bottom"
+        )));
     }
 }

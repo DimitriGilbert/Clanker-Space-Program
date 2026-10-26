@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use csp_sim::orbit::PatchedConics;
-use csp_sim::{PhysicsConfig, SimCommand, World, WorldSnapshot};
+use csp_sim::{SimCommand, World};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -59,6 +59,11 @@ pub struct SessionSummary {
     pub tick: u64,
     /// The world's state hash, lowercase hex.
     pub hash: String,
+    /// Load-time warnings — config channels the snapshot's live state
+    /// still lacks, a state-hash mismatch against the save's recorded
+    /// hash. Empty on `session.snapshot`/`session.save`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// What one `submit`/`submit_batch` drain reports back — §2.2.1's
@@ -83,6 +88,27 @@ pub struct SubmitReport {
     /// The target the drain last chased — the `AdvanceTo`-extended
     /// effective target, or `clock + 1` for a plain boundary.
     pub target: u64,
+    /// Fired event kinds the drain published (bounded at
+    /// [`MAX_REPORT_EVENTS`] — an alarm, an SOI crossing, a node
+    /// start). `AdvanceTo` used to swallow them between the sim and
+    /// the wire (report-19 F4).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<String>,
+    /// §2.13 `Recoverable` event degradations the drain applied
+    /// (same bound; also logged at `warn`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degraded: Vec<String>,
+    /// Entries dropped past [`MAX_REPORT_EVENTS`] across `events` +
+    /// `degraded` — the bound is honest, never a silent truncation.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub events_truncated: u64,
+}
+
+/// `SubmitReport`'s per-drain events/degraded entry cap.
+pub const MAX_REPORT_EVENTS: usize = 64;
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 /// A backend refusal — ingress backpressure passes through as data;
@@ -253,41 +279,14 @@ fn normalize_client_name(name: &str) -> &str {
 // HostCore — the world-side half both hosts share
 // ---------------------------------------------------------------------------
 
-/// The save file on disk — `SaveInfo` header + the bincode snapshot.
-/// The replay-artifact precedent: bincode, version-scoped, no
-/// migration promise (§7.6/§7.7).
-#[derive(Serialize, Deserialize)]
-struct SaveFile {
-    /// Format tag — bumped deliberately, never migrated in-band.
-    schema: u32,
-    /// `World::clock().ticks()` at save time.
-    tick: u64,
-    /// The snapshot's state hash, hex — a sanity read, not a proof.
-    hash: String,
-    /// The §7.2 serialized set.
-    snapshot: WorldSnapshot,
-}
-
-/// The metadata-only leading slice of a [`SaveFile`] — the same
-/// leading fields in the same order, so `decode_from_slice` stops
-/// after `hash` and the embedded `WorldSnapshot` is never read or
-/// decoded. The file's own header *is* the index entry (C17-F1):
-/// `list_saves` decodes only this, keeping the call
-/// O(#saves × ~80 B) instead of O(total save bytes) on the serial
-/// game thread. The trade is declared: the index reports what the
-/// header claims; a save whose snapshot tail is truncated lists
-/// (its index entry is intact) and fails honestly at `load_save`.
-#[derive(Deserialize)]
-struct SaveHeader {
-    /// Format tag — [`SAVE_SCHEMA`].
-    schema: u32,
-    /// `World::clock().ticks()` at save time.
-    tick: u64,
-    /// The snapshot's state hash, hex.
-    hash: String,
-}
-
-const SAVE_SCHEMA: u32 = 1;
+/// §7.2's one save format: the CSPSAVE container from
+/// `csp_sim::save` (JSON header + DEFLATE-over-CBOR body, a real
+/// version chain, `data_set_hash`, byte-exact decode proof). The
+/// earlier bincode `SaveFile` fork is gone — two formats under one
+/// extension meant a `session.save` could never become a game save.
+/// Game saves, bug-report saves, and `session.save` are now the same
+/// bytes under one codec; the header's `tick`/`state_hash` fields
+/// make `list_saves` metadata-only.
 const SAVE_EXT: &str = "cspsave";
 
 /// The save store's entry bound — mirrors the dashboard store's
@@ -302,31 +301,25 @@ pub const MAX_SAVES: usize = 64;
 /// is bounded (C17-F1).
 pub const MAX_SAVE_BYTES: usize = 64 * 1024 * 1024;
 
-/// Bytes `list_saves` reads per `*.cspsave` — the [`SaveHeader`] is
-/// ~80 B (schema varint + tick varint + a 64-char hex hash); 4 KiB
-/// leaves generous headroom for a longer hash and never touches the
-/// snapshot payload.
+/// Bytes `list_saves` reads per `*.cspsave` — the CSPSAVE JSON
+/// header is ~400 B (it now carries `tick`/`state_hash`, so the
+/// metadata-only index survives the codec unification); 4 KiB is
+/// generous headroom and never touches the compressed body.
 const SAVE_INDEX_READ: u64 = 4096;
 
-/// Decode `path`'s [`SaveHeader`] alone — the `list_saves` index
+/// Decode `path`'s CSPSAVE header alone — the `list_saves` index
 /// read. `None` for an unreadable or undecodable prefix, exactly the
 /// disposition a full decode gave a corrupt entry.
-fn read_save_header(path: &std::path::Path) -> Option<SaveHeader> {
+fn read_save_header(path: &std::path::Path) -> Option<csp_sim::save::SaveMeta> {
     use std::io::Read;
     let file = std::fs::File::open(path).ok()?;
     let mut bytes = Vec::with_capacity(SAVE_INDEX_READ as usize);
     file.take(SAVE_INDEX_READ).read_to_end(&mut bytes).ok()?;
-    let (header, _) =
-        bincode::serde::decode_from_slice::<SaveHeader, _>(&bytes, bincode_cfg()).ok()?;
-    Some(header)
+    csp_sim::save::inspect_save(&bytes).ok()
 }
 
 fn hex(hash: &[u8; 32]) -> String {
     hash.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn bincode_cfg() -> bincode::config::Configuration {
-    bincode::config::standard()
 }
 
 fn safe_name(name: &str) -> Result<(), BackendError> {
@@ -354,10 +347,12 @@ type Reconfigure = Box<dyn Fn(&mut World) + Send>;
 /// See [`HostCore`]'s doc on `reconfigure`.
 struct HostCore {
     world: World,
-    /// The construction config `World::restore` needs — orbits +
-    /// physics are data-derived, never in the snapshot (§7.3).
-    orbits: PatchedConics,
-    physics: Option<PhysicsConfig>,
+    /// The construction config `World::restore` needs — the whole
+    /// §7.3 data-derived channel set (orbits + physics + every def
+    /// table), captured from the *originating* world. `session.load`
+    /// re-installs ALL of it through [`World::install_config`]; the
+    /// old 3-of-10 hand-rolled list silently diverged (report-04 D2).
+    config: csp_sim::WorldConfig,
     queue: IngressQueue,
     /// Post-restore construction-config hook — engines, drivers and
     /// budgets are §7.3's data-derived channel: `session.load`
@@ -375,8 +370,7 @@ impl HostCore {
     ) -> Self {
         let config = world.config();
         Self {
-            orbits: PatchedConics::new(config.orbits.clone()),
-            physics: config.physics.clone(),
+            config,
             world,
             queue,
             reconfigure,
@@ -409,6 +403,30 @@ impl HostCore {
             report
                 .rejected
                 .extend(r.rejected.iter().map(|rej| format!("{}", rej.error)));
+            // The sim reports every fired event + Recoverable event
+            // degradation "so a UI/log layer can surface notifications
+            // without re-querying sim state" — this IS that layer;
+            // dropping them made `SetAlarm` pointless over MCP. Both
+            // lists are bounded with a truncation count, and the
+            // degraded ones are the §2.14 warn channel too.
+            for e in &r.fired_events {
+                if report.events.len() < MAX_REPORT_EVENTS {
+                    report.events.push(format!("{:?} @{}", e.kind, e.tick));
+                } else {
+                    report.events_truncated = report.events_truncated.saturating_add(1);
+                }
+            }
+            for d in &r.degraded {
+                log::warn!("event degraded (fallback applied): {d}");
+                if report.degraded.len() < MAX_REPORT_EVENTS {
+                    report.degraded.push(d.to_string());
+                } else {
+                    report.events_truncated = report.events_truncated.saturating_add(1);
+                }
+            }
+            for rej in &r.rejected {
+                log::warn!("command rejected on {:?}: {}", rej.key, rej.error);
+            }
             report.reached = r.reached_tick;
             report.target = r.effective_target;
             report.partial = r.partial;
@@ -475,20 +493,20 @@ impl HostCore {
             if path.extension().and_then(|e| e.to_str()) != Some(SAVE_EXT) {
                 continue;
             }
-            let Some(header) = read_save_header(&path) else {
+            let Some(meta) = read_save_header(&path) else {
                 continue;
             };
-            if header.schema != SAVE_SCHEMA {
-                continue;
-            }
             out.push(SaveInfo {
                 name: path
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or_default()
                     .to_string(),
-                tick: header.tick,
-                hash: header.hash,
+                // Headers written before `tick`/`state_hash` existed
+                // report zero/empty — the index shows what the file
+                // claims; a truncated body still fails at `load_save`.
+                tick: meta.tick.unwrap_or(0),
+                hash: meta.state_hash.as_ref().map(hex).unwrap_or_default(),
             });
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -499,23 +517,45 @@ impl HostCore {
         safe_name(name)?;
         let bytes = std::fs::read(self.save_path(name))
             .map_err(|e| BackendError::Session(format!("load {name}: {e}")))?;
-        let (file, _) = bincode::serde::decode_from_slice::<SaveFile, _>(&bytes, bincode_cfg())
+        let save = csp_sim::save::decode_save(&bytes)
             .map_err(|e| BackendError::Session(format!("decode {name}: {e}")))?;
-        if file.schema != SAVE_SCHEMA {
-            return Err(BackendError::Session(format!(
-                "save {name}: schema {} != {SAVE_SCHEMA}",
-                file.schema
-            )));
-        }
-        let mut world = World::restore(self.orbits.clone(), self.physics.clone(), file.snapshot)
-            .map_err(|e| BackendError::Session(format!("restore {name}: {e}")))?;
-        // Re-install the data-derived channel the snapshot cannot
-        // carry (§7.3): engines, drivers, budgets.
+        let mut world = World::restore(
+            PatchedConics::new(self.config.orbits.clone()),
+            self.config.physics.clone(),
+            save.snapshot,
+        )
+        .map_err(|e| BackendError::Session(format!("restore {name}: {e}")))?;
+        // Re-install EVERY data-derived channel the snapshot cannot
+        // carry (§7.3) — the originating world's own config, then the
+        // host's engines/drivers hook. The checklist is the
+        // postcondition: any channel live state still lacks is a
+        // silent-divergence risk, surfaced as a warning.
+        world.install_config(&self.config);
         if let Some(f) = self.reconfigure.as_ref() {
             f(&mut world);
         }
+        let mut warnings: Vec<String> = Vec::new();
+        for ch in world.missing_config_channels() {
+            warnings.push(format!(
+                "save needs config channel `{ch}` the host never installed"
+            ));
+        }
+        // §7.5 as a load-time integrity check: the save recorded the
+        // writer's state hash — a restored world hashing differently
+        // is a divergence made loud (warning, not refusal: the world
+        // is still coherent).
+        if let Some(recorded) = save.state_hash
+            && world.state_hash().map(|h| h != recorded).unwrap_or(false)
+        {
+            warnings.push(
+                "restored state hash differs from the save's recorded hash — §7.5 divergence"
+                    .to_string(),
+            );
+        }
         self.world = world;
-        self.summary()
+        let mut summary = self.summary()?;
+        summary.warnings = warnings;
+        Ok(summary)
     }
 
     fn store_save(&self, name: &str) -> Result<SaveInfo, BackendError> {
@@ -544,14 +584,16 @@ impl HostCore {
             tick: self.world.clock().ticks(),
             hash: hex(&hash),
         };
-        let file = SaveFile {
-            schema: SAVE_SCHEMA,
-            tick: info.tick,
-            hash: info.hash.clone(),
+        let bytes = csp_sim::save::encode_save(&csp_sim::save::Save {
+            game_version: env!("CARGO_PKG_VERSION").into(),
+            label: Some(name.to_string()),
+            // The host cannot hash `data/` — the drift-warning key is
+            // "unknown", which §7.7 reads as exactly that.
+            data_set_hash: None,
+            state_hash: Some(hash),
             snapshot,
-        };
-        let bytes = bincode::serde::encode_to_vec(&file, bincode_cfg())
-            .map_err(|e| BackendError::Session(format!("encode: {e}")))?;
+        })
+        .map_err(|e| BackendError::Session(format!("encode: {e}")))?;
         // The byte cap runs before the write — a refused save must
         // not land on disk at all (C17-F1).
         if bytes.len() > MAX_SAVE_BYTES {
@@ -575,6 +617,7 @@ impl HostCore {
         Ok(SessionSummary {
             tick: self.world.clock().ticks(),
             hash: hex(&hash),
+            warnings: Vec::new(),
         })
     }
 }

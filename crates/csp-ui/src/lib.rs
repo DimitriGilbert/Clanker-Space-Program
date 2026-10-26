@@ -23,6 +23,10 @@ pub mod vab;
 /// [`settings::Keymap`], and the settings panel.
 pub mod settings;
 
+/// The Game menu — save slots, load, revert-to-launch (with the
+/// PLAN §3.4 "not a reroll" disclosure), new game.
+pub mod game;
+
 /// The M10 first-flight tutorial (PLAN M10 exit row): the
 /// [`tutorial::TutorialState`] session model — the step table and the
 /// real-progress predicates — plus the [`tutorial::tutorial_overlay`]

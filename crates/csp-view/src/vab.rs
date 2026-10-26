@@ -426,6 +426,10 @@ pub(crate) fn vab_present(
             cam.0.eye + dir * depth
         })
     });
+    // The whole-craft carry needs a world-space drop point that only
+    // the view can compute — push it every frame so `Drop`/`Select`
+    // on empty space can land the lifted root there.
+    vab.0.set_drop_anchor(float_anchor);
     match vab.0.carried() {
         Some(csp_ui::vab::Carried::Placing(part)) => {
             if let Some(eff) = vab.0.resolve_stock(part) {
@@ -771,12 +775,15 @@ pub(crate) fn extract_vab(
         craft_epoch: vab.0.craft_epoch(),
         ..VabPacket::default()
     };
-    // The editor environment — emitted BEFORE the craft so the parts
-    // depth-resolve over it: a backdrop gradient (97.8% of the frame
-    // was a dead void), a lit hangar floor under the craft's lowest
-    // extent, a soft contact blob grounding the craft, and a
-    // reference grid (vision-report VAB-3.1). All unpickable.
-    emit_environment(&mut packet.vertices, &cam.0, &scene);
+    // The editor environment — a backdrop gradient (97.8% of the
+    // frame was a dead void), a lit hangar floor under the craft's
+    // lowest extent, a soft contact blob grounding the craft, and a
+    // reference grid (vision-report VAB-3.1). It goes to its OWN
+    // stream: the color pass draws it without depth writes (it can
+    // never hide a part) and the pick pass never sees it (a click
+    // through the floor resolves to the part behind it — the
+    // "can't place shit below" fix).
+    emit_environment(&mut packet.env_vertices, &cam.0, &scene);
     let mut tris = Vec::new();
     for p in &scene.parts {
         // The selection outline: an inflated copy of the silhouette
@@ -826,9 +833,12 @@ pub(crate) fn extract_vab(
 /// in a 97.8%-uniform void): a far-plane backdrop gradient, a lit
 /// floor disc fading at its rim, a soft contact blob under the craft,
 /// and a Cartesian reference grid. Everything is emitted into the
-/// same vertex stream before the parts (pick id 0 — unpickable) and
-/// resolves through the shared depth test, so orbiting under the
-/// floor shows its underside like a real floor does.
+/// packet's `env_vertices` stream — drawn first WITHOUT depth writes
+/// (decoration never occludes a part) and never rasterized by the
+/// pick pass (a click through the floor resolves to the part behind
+/// it). Before the split the floor shared the pick stream's depth
+/// buffer, so from beneath the craft it won the depth test in both
+/// passes: the bottom cap was unviewable AND unpickable.
 #[allow(clippy::too_many_lines)] // one environment assembly pass; splitting fragments the scene
 fn emit_environment(verts: &mut Vec<VabVertex>, cam: &MapCameraF64, scene: &VabScene) {
     // Backdrop: a two-stop vertical gradient quad pinned just inside
@@ -863,8 +873,14 @@ fn emit_environment(verts: &mut Vec<VabVertex>, cam: &MapCameraF64, scene: &VabS
         }
     }
     let extent = scene.extent_m.max(1.0);
+    // A real gap below the lowest hull point (was 2% — the apron
+    // hugged the bottom cap, which is half of why the stack read as
+    // glued to the ground and why the cap was hard to reach). The
+    // floor no longer occludes or picks, so this margin is purely
+    // compositional — a wide enough gap that a low camera reads the
+    // cap as free space, not floor.
     let floor_z = if min_z.is_finite() {
-        min_z - (0.02 * extent).max(0.01)
+        min_z - (0.30 * extent).max(0.15)
     } else {
         scene.center.z - extent * 1.2
     };
@@ -1315,5 +1331,84 @@ mod tests {
         let hit = hover_pick(&input, &cam, &parts, w * 0.5, h * 0.5)
             .expect("center pixel must hit the box from above");
         assert_eq!(hit.region, csp_ui::vab::AttachRegion::TopCap);
+    }
+
+    /// PRD-11 H1 end-to-end through the real `View`: the camera
+    /// orbited straight under the craft, the cursor over the bottom
+    /// cap — the pick→select channel attaches the armed part BELOW
+    /// the stack, and the packet's environment stream never enters
+    /// the pickable stream (a floor pixel can't shadow a part id).
+    #[test]
+    fn bottom_cap_pick_attaches_below_and_env_never_picks() {
+        let data = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let parts = csp_data::load_parts(&data.join("parts")).unwrap();
+        let res = csp_data::load_resources(&data.join("resources.ron")).unwrap();
+        let mut view = crate::View::with_sim(csp_sim::World::new());
+        view.install_vab_catalog(parts, res);
+        view.set_mode(crate::ViewMode::Vab);
+        // The default-on tutorial card anchors center-top and masks
+        // dead-center of the viewport — dismiss it so the probe pixel
+        // reaches the scene.
+        view.set_tutorial_active(false);
+        view.set_vab_viewport(800.0, 600.0);
+        let tank = csp_data::PartId::from("csp.tank.s320");
+        view.with_vab_session(|v| {
+            v.apply(csp_ui::vab::VabAction::SetRoot(tank.clone()))
+                .unwrap()
+        });
+        let root_id = view.with_vab_session(|v| v.session().root().unwrap());
+        // Orbit straight under the craft (pitch clamps at PI) — the
+        // drag event lands through the real event drain.
+        view.vab_event(VabEvent::Orbit {
+            dyaw: 0.0,
+            dpitch: 10.0,
+        });
+        view.begin_frame();
+        // Pointer at viewport center; egui keeps it across frames.
+        view.set_egui_input(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            focused: true,
+            events: vec![egui::Event::PointerMoved(egui::pos2(400.0, 300.0))],
+            ..Default::default()
+        });
+        // Two frames: UiBuild publishes cursor_px into the session,
+        // Presentation turns it into `hover` on the NEXT frame.
+        view.end_frame();
+        view.begin_frame();
+        view.end_frame();
+        let hit = view
+            .with_vab_session(|v| v.hover())
+            .expect("cursor over the bottom cap from below");
+        assert_eq!(hit.node, root_id);
+        assert_eq!(hit.region, csp_ui::vab::AttachRegion::BottomCap);
+        // The pick stream carries ONLY pickable geometry: the floor /
+        // backdrop / grid ride `env_vertices` and are never
+        // rasterized by the object-id pass.
+        let packet = view.take_vab_packet().expect("a VAB packet this frame");
+        assert!(!packet.env_vertices.is_empty(), "the hangar is drawn");
+        assert!(packet.env_vertices.iter().all(|v| v.pick == 0));
+        let n_ids = packet.pick_ids.len() as u32;
+        assert!(
+            packet.vertices.iter().all(|v| v.pick <= n_ids),
+            "every pickable vertex decodes to a real part index (or 0)"
+        );
+        // Arm the tank and click the cap — the pick-landed Select
+        // places it BELOW the stack (canonical axial attach).
+        view.with_vab_session(|v| v.apply(csp_ui::vab::VabAction::CatalogPick(tank)).unwrap());
+        view.vab_event(VabEvent::Pick(Some(root_id.0)));
+        view.begin_frame();
+        view.end_frame();
+        assert_eq!(view.with_vab_session(|v| v.session().len()), 2);
+        let off = view.with_vab_session(|v| {
+            v.session()
+                .iter()
+                .find(|(id, _)| *id != root_id)
+                .map(|(_, n)| n.transform().offset)
+                .unwrap()
+        });
+        assert!(off.z < 0.0, "the new part landed below the stack");
     }
 }

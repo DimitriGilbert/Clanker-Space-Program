@@ -13,6 +13,15 @@ fn main() {
                 }
             });
         }
+        if std::env::args().skip(1).any(|a| a == "--serve") {
+            std::process::exit(match csp_app::serve_cli() {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("--serve: {e}");
+                    1
+                }
+            });
+        }
         csp_app::run();
     }
 }

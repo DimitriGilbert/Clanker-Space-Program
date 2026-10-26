@@ -121,8 +121,9 @@ fn bincode_config() -> bincode::config::Configuration {
 
 /// A decoded save file at the *current* schema — what [`decode_save`]
 /// returns and [`encode_save`] consumes. The envelope fields
-/// (`game_version`, `label`, `data_set_hash`) live in the JSON header
-/// (§7.2) but are surfaced here so callers never re-parse.
+/// (`game_version`, `label`, `data_set_hash`, `state_hash`, `tick`)
+/// live in the JSON header (§7.2) but are surfaced here so callers
+/// never re-parse.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Save {
     /// The writer's `game_version` string from the JSON header.
@@ -134,6 +135,12 @@ pub struct Save {
     /// §7.7's drift-warning key: `None` migrated from v1 means "unknown
     /// data set — the loader cannot check drift and says so".
     pub data_set_hash: Option<[u8; 32]>,
+    /// The world's §7.1 state hash at save time (v3-header writers).
+    /// Loader-side integrity metadata only — never fed back into sim
+    /// state: a restored world whose `state_hash()` differs from this
+    /// is a §7.5 divergence made loud, and slot listings can show it
+    /// without decoding the body.
+    pub state_hash: Option<[u8; 32]>,
     /// The §7.2 serialized set at the current schema.
     pub snapshot: WorldSnapshot,
 }
@@ -162,6 +169,16 @@ struct SaveHeader {
     /// Absent/`null` on v1 files (the field did not exist yet).
     #[serde(default)]
     label: Option<String>,
+    /// The snapshot's `clock_ticks` — envelope metadata so a slot
+    /// listing can show the save's tick without inflating the body.
+    /// Absent on headers written before the field existed.
+    #[serde(default)]
+    tick: Option<u64>,
+    /// The world's §7.1 state hash at save time, lowercase hex —
+    /// loader-side integrity metadata (see [`Save::state_hash`]).
+    /// Absent on headers written before the field existed.
+    #[serde(default)]
+    state_hash: Option<String>,
     /// The body codec — `"deflate"` today; anything else is
     /// [`SaveError::UnsupportedEncoding`], not a decode guess.
     compression: String,
@@ -357,6 +374,8 @@ pub fn encode_save(save: &Save) -> Result<Vec<u8>, SaveError> {
         data_hash_version: csp_data::DATA_HASH_VERSION,
         data_set_hash: save.data_set_hash.as_ref().map(hex_encode),
         label: save.label.clone(),
+        tick: Some(save.snapshot.clock_ticks),
+        state_hash: save.state_hash.as_ref().map(hex_encode),
         compression: COMPRESSION_DEFLATE.into(),
         body_format: BODY_FORMAT_CBOR.into(),
         body_len: compressed.len() as u64,
@@ -398,7 +417,56 @@ pub fn decode_save(bytes: &[u8]) -> Result<Save, SaveError> {
         Some(h) => Some(hex_decode(h).ok_or(SaveError::BadHeader)?),
         None => None,
     };
+    save.state_hash = match &header.state_hash {
+        Some(h) => Some(hex_decode(h).ok_or(SaveError::BadHeader)?),
+        None => None,
+    };
     Ok(save)
+}
+
+/// The plaintext-header fields a slot listing needs — what
+/// [`inspect_save`] returns without inflating or decoding the body.
+/// `tick`/`state_hash` are `Option`: headers written before the
+/// fields existed (and v1 files) carry neither.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SaveMeta {
+    /// The `save_version` chain key the body decodes as.
+    pub save_version: u32,
+    /// The writer's `game_version` string.
+    pub game_version: String,
+    /// The save slot's display label.
+    pub label: Option<String>,
+    /// The §3.1 data-set hash the save was written against.
+    pub data_set_hash: Option<[u8; 32]>,
+    /// The world's §7.1 state hash at save time.
+    pub state_hash: Option<[u8; 32]>,
+    /// The snapshot's `clock_ticks` at save time.
+    pub tick: Option<u64>,
+    /// The `hash_schema_version` the file was written under.
+    pub hash_schema_version: u32,
+}
+
+/// Read the plaintext JSON header only — magic + `header_len` +
+/// JSON, no body decode. The slot-listing/index path: O(header)
+/// per save, never O(body). The same refusals [`decode_save`]
+/// applies to the framing and to the hex hash fields it can see.
+pub fn inspect_save(bytes: &[u8]) -> Result<SaveMeta, SaveError> {
+    let (header, _) = parse_header(bytes)?;
+    Ok(SaveMeta {
+        save_version: header.save_version,
+        game_version: header.game_version,
+        label: header.label,
+        data_set_hash: match &header.data_set_hash {
+            Some(h) => Some(hex_decode(h).ok_or(SaveError::BadHeader)?),
+            None => None,
+        },
+        state_hash: match &header.state_hash {
+            Some(h) => Some(hex_decode(h).ok_or(SaveError::BadHeader)?),
+            None => None,
+        },
+        tick: header.tick,
+        hash_schema_version: header.hash_schema_version,
+    })
 }
 
 /// Split `CSPSAVE\0 || header_len:u32 || JSON || body` apart.
@@ -469,6 +537,7 @@ fn to_current(body: VersionedBody) -> Save {
             game_version: String::new(),
             label: None,
             data_set_hash: None,
+            state_hash: None,
             snapshot: body.snapshot,
         },
     }
@@ -551,12 +620,21 @@ mod tests {
             game_version: "0.0.0".into(),
             label: Some("first flight".into()),
             data_set_hash: Some([0xAB; 32]),
+            state_hash: Some([0xCD; 32]),
             snapshot: live_snapshot(),
         };
         let bytes = encode_save(&save).unwrap();
         assert!(bytes.starts_with(SAVE_MAGIC));
         let back = decode_save(&bytes).unwrap();
         assert_eq!(back, save);
+        // The slot-listing read: `inspect_save` sees every envelope
+        // field without touching the body.
+        let meta = inspect_save(&bytes).unwrap();
+        assert_eq!(meta.save_version, SAVE_VERSION_CURRENT);
+        assert_eq!(meta.label.as_deref(), Some("first flight"));
+        assert_eq!(meta.data_set_hash, Some([0xAB; 32]));
+        assert_eq!(meta.state_hash, Some([0xCD; 32]));
+        assert_eq!(meta.tick, Some(save.snapshot.clock_ticks));
     }
 
     /// §7.2 byte-stability: encoding the same `Save` twice produces the
@@ -568,6 +646,7 @@ mod tests {
             game_version: "0.0.0".into(),
             label: Some("stable".into()),
             data_set_hash: Some([0x01; 32]),
+            state_hash: None,
             snapshot: live_snapshot(),
         };
         assert_eq!(encode_save(&save).unwrap(), encode_save(&save).unwrap());
@@ -581,6 +660,7 @@ mod tests {
             game_version: "1.2.3".into(),
             label: Some("x".into()),
             data_set_hash: Some([0x5A; 32]),
+            state_hash: None,
             snapshot: live_snapshot(),
         };
         let bytes = encode_save(&save).unwrap();
@@ -609,6 +689,7 @@ mod tests {
             game_version: "0.0.0".into(),
             label: None,
             data_set_hash: None,
+            state_hash: None,
             snapshot: live_snapshot(),
         };
         assert_eq!(decode_save(&encode_save(&save).unwrap()).unwrap(), save);
@@ -734,6 +815,7 @@ mod tests {
             game_version: "0.0.0".into(),
             label: None,
             data_set_hash: None,
+            state_hash: None,
             snapshot: live_snapshot(),
         };
         let mut bytes = encode_save(&save).unwrap();

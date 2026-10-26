@@ -178,6 +178,19 @@ struct App {
     /// `settings_path` precedent). Read on every target — the wasm
     /// `save_craft_file` ignores it.
     craft_dir: std::path::PathBuf,
+    /// The `saves/` directory — sibling of `craft_dir` (the same
+    /// config-dir convention, the same test-injection precedent).
+    /// Read on every target; the wasm `do_save`/`do_load` refuse.
+    save_dir: std::path::PathBuf,
+    /// The session op (§7.2 save/load/revert/new-game) applied at
+    /// this frame's drained boundary — a §7.4 save only exists at a
+    /// moment where the queue is empty, so the verb waits for the
+    /// step rather than firing mid-apply.
+    session_op: Option<SessionOp>,
+    /// The world was rebuilt this frame (load/revert/new-game) —
+    /// the stale `AdvanceReport` from the pre-rebuild step is
+    /// discarded rather than surfaced against the new world.
+    world_rebuilt: bool,
     /// Left-drag state for map camera orbit — pointer position at the
     /// last `CursorMoved`, and whether the left button is held.
     last_cursor: Option<(f64, f64)>,
@@ -251,7 +264,7 @@ struct App {
     /// must not carry the OLD vessel's commanded axis onto the new
     /// focus: [`Self::tick_throttle_ramp`] rebases the axis from the
     /// new vessel's applied value and says so (C15-lib2-F2).
-    throttle_hold_vessel: Option<csp_sim::VesselId>,
+    throttle_hold_vessel: Option<csp_view::VesselId>,
     view: View,
     /// §2.6.3's controller — owns the warp ladder and the integer tick
     /// target; all wall-side, emitting only logged commands.
@@ -460,7 +473,15 @@ impl App {
             pick_decode_ids: None,
             pick_decode_epoch: None,
             craft_store: load_craft_store(&craft_dir),
-            craft_dir,
+            craft_dir: craft_dir.clone(),
+            // `saves/` sits beside `crafts/` — same convention, same
+            // test injection (the dir never exists until a save does).
+            save_dir: craft_dir
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("saves"),
+            session_op: None,
+            world_rebuilt: false,
             last_cursor: None,
             map_dragging: false,
             lmb_press: None,
@@ -491,6 +512,7 @@ impl App {
         };
         app.apply_startup_difficulty();
         app.apply_live_settings();
+        app.stage_save_list();
         app
     }
 
@@ -626,6 +648,7 @@ impl App {
                     game_version: env!("CARGO_PKG_VERSION").into(),
                     label: Some(format!("crash at tick {}", snapshot.clock_ticks)),
                     data_set_hash,
+                    state_hash: self.view.sim.state_hash().ok(),
                     snapshot,
                 })
                 .map_err(|e| e.to_string())
@@ -929,7 +952,17 @@ impl App {
         if let Some(target) = target {
             let step_start = Instant::now();
             match self.view.sim_step(target) {
-                Ok(report) => self.on_step_report(&report),
+                Ok(report) => {
+                    // The drained boundary — the one moment §7.4's
+                    // save guarantees hold (queue empty). Session ops
+                    // run here; a world-replacing op discards the
+                    // stale report rather than surfacing it.
+                    self.run_session_op();
+                    if !self.world_rebuilt {
+                        self.on_step_report(&report);
+                    }
+                    self.world_rebuilt = false;
+                }
                 Err(e @ SimError::Fatal(_)) => {
                     // §2.13: only Fatal halts — step_frame keeps
                     // Recoverable inside its report channels. The full
@@ -968,6 +1001,203 @@ impl App {
                     .resource::<csp_view::flight::FlightSnapshot>(),
                 &self.settings.audio,
             );
+        }
+    }
+
+    /// Queue a session op — a §2.13 read-only session and the §6.3
+    /// demo refuse the verb up front rather than failing it
+    /// silently at the boundary.
+    fn request_session_op(&mut self, op: SessionOp) {
+        if self.read_only || self.demo {
+            self.view
+                .flight_notice("saves are off while the session is read-only / in the web demo");
+            return;
+        }
+        self.session_op = Some(op);
+    }
+
+    /// Apply this frame's queued session op at the drained boundary.
+    fn run_session_op(&mut self) {
+        let Some(op) = self.session_op.take() else {
+            return;
+        };
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = op;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        match op {
+            SessionOp::Save(slot) => self.do_save(&slot),
+            SessionOp::Load(slot) => self.do_load(&slot),
+            SessionOp::Revert => match self.view.revert_to_launch() {
+                Ok(_) => {
+                    self.world_rebuilt = true;
+                    self.view.flight_notice("REVERTED TO LAUNCH");
+                }
+                Err(e) => self
+                    .view
+                    .flight_notice(format!("cannot revert: {}", e.reason())),
+            },
+            SessionOp::NewGame => match self.view.new_game() {
+                Ok(()) => {
+                    self.world_rebuilt = true;
+                    self.fatal = None;
+                    self.read_only = false;
+                    self.warp = WarpController::new();
+                    self.apply_startup_difficulty();
+                    self.view.flight_notice("NEW GAME");
+                }
+                Err(e) => self.view.flight_notice(format!("new game failed: {e}")),
+            },
+        }
+    }
+
+    /// Encode + write the live world to `saves/<slot>.cspsave` —
+    /// §7.2's codec end to end, the same format `session.save`
+    /// writes (report-04's format-unification fix).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn do_save(&mut self, slot: &str) {
+        if !safe_slot_name(slot) {
+            self.view
+                .flight_notice(format!("refused save name '{slot}'"));
+            return;
+        }
+        match self.view.save_game() {
+            Err(e) => {
+                let reason = self
+                    .view
+                    .sim
+                    .save_blocked_reason()
+                    .unwrap_or_else(|| e.reason());
+                self.view.flight_notice(format!("SAVE REFUSED — {reason}"));
+            }
+            Ok(mut save) => {
+                save.game_version = env!("CARGO_PKG_VERSION").into();
+                save.label = Some(slot.to_string());
+                save.data_set_hash = csp_view::data_set_hash(&csp_view::data_root()).ok();
+                let bytes = match csp_view::save::encode_save(&save) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        self.view.flight_notice(format!("save encode failed: {e}"));
+                        return;
+                    }
+                };
+                let dir = self.save_dir.clone();
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    self.view.flight_notice(format!("save failed: {e}"));
+                    return;
+                }
+                // The atomic-rename rule — a killed writer never
+                // leaves a half file for `inspect_save` to trip on.
+                let path = dir.join(format!("{slot}.cspsave"));
+                let tmp = dir.join(format!(".{slot}.cspsave.tmp"));
+                if let Err(e) =
+                    std::fs::write(&tmp, &bytes).and_then(|()| std::fs::rename(&tmp, &path))
+                {
+                    self.view.flight_notice(format!("save failed: {e}"));
+                    return;
+                }
+                self.view.flight_notice(format!("SAVED — {slot}"));
+                self.stage_save_list();
+            }
+        }
+    }
+
+    /// Decode `saves/<slot>.cspsave` and rebuild the world — the
+    /// §7.5 integrity check (recorded state hash vs restored hash)
+    /// and the §7.7 data-set drift warning both surface as notices.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn do_load(&mut self, slot: &str) {
+        if !safe_slot_name(slot) {
+            self.view
+                .flight_notice(format!("refused save name '{slot}'"));
+            return;
+        }
+        let path = self.save_dir.join(format!("{slot}.cspsave"));
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.view.flight_notice(format!("load failed: {e}"));
+                return;
+            }
+        };
+        let save = match csp_view::save::decode_save(&bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                self.view.flight_notice(format!("load failed: {e}"));
+                return;
+            }
+        };
+        // §7.7's data-set drift warning — the save's recorded hash vs
+        // the live data root's. `None` reads as "unknown data set".
+        match (
+            save.data_set_hash,
+            csp_view::data_set_hash(&csp_view::data_root()).ok(),
+        ) {
+            (Some(recorded), Some(current)) if recorded != current => {
+                self.view.flight_notice(
+                    "DATA DRIFT — this save was written against a different data set",
+                );
+            }
+            (None, _) => self
+                .view
+                .flight_notice("load: save predates data-set hashing"),
+            _ => {}
+        }
+        match self.view.load_game(save.snapshot) {
+            Ok(warnings) => {
+                self.world_rebuilt = true;
+                self.view.flight_notice(format!("LOADED — {slot}"));
+                for w in warnings {
+                    self.view.flight_notice(w);
+                }
+                if let Some(recorded) = save.state_hash
+                    && self.view.sim.state_hash().ok() != Some(recorded)
+                {
+                    self.view.flight_notice(
+                        "DIVERGED — restored world hash differs from the save's recorded hash",
+                    );
+                }
+            }
+            Err(e) => self
+                .view
+                .flight_notice(format!("load failed: {}", e.reason())),
+        }
+    }
+
+    /// Rescan the save dir and stage the Game menu's slot list.
+    /// O(header) per save — `inspect_save` never inflates a body.
+    fn stage_save_list(&mut self) {
+        #[cfg(target_arch = "wasm32")]
+        {}
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut rows = Vec::new();
+            if let Ok(read) = std::fs::read_dir(&self.save_dir) {
+                for entry in read.flatten() {
+                    let path = entry.path();
+                    if path.extension().is_none_or(|e| e != "cspsave") {
+                        continue;
+                    }
+                    let Some(name) = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(str::to_string)
+                    else {
+                        continue;
+                    };
+                    let meta = std::fs::read(&path)
+                        .ok()
+                        .and_then(|b| csp_view::save::inspect_save(&b).ok());
+                    rows.push(csp_view::game::SaveSlotRow {
+                        name,
+                        tick: meta.as_ref().and_then(|m| m.tick).unwrap_or(0),
+                        label: meta.and_then(|m| m.label),
+                    });
+                }
+            }
+            rows.sort_by(|a, b| b.tick.cmp(&a.tick).then_with(|| a.name.cmp(&b.name)));
+            self.view.set_save_list(rows);
         }
     }
 
@@ -1108,7 +1338,19 @@ impl App {
     /// the last `UiBuild` pass wrote into its outbox — mode changes,
     /// craft file ops, the settings panel's Apply, node commands.
     /// Extracted from `run_frame` under the complexity budget.
-    fn handle_ui_outbox(&mut self, outbox: csp_view::UiOutbox) {
+    fn handle_ui_outbox(&mut self, mut outbox: csp_view::UiOutbox) {
+        if let Some(slot) = outbox.game_save.take() {
+            self.request_session_op(SessionOp::Save(slot));
+        }
+        if let Some(slot) = outbox.game_load.take() {
+            self.request_session_op(SessionOp::Load(slot));
+        }
+        if outbox.revert {
+            self.request_session_op(SessionOp::Revert);
+        }
+        if outbox.new_game {
+            self.request_session_op(SessionOp::NewGame);
+        }
         if outbox.warp_step != 0 {
             if self.read_only {
                 // Same §2.13 discipline as the key-driven warp verbs:
@@ -2230,6 +2472,23 @@ impl App {
                     }
                 }
             }
+            // §7.2/§11.80 player session verbs — every one lands as a
+            // `SessionOp` applied at this frame's drained boundary.
+            // RevertToLaunch only ARMS the menu's disclosure prompt —
+            // the key must show the same "not a reroll" text the
+            // button does, never an instant restore.
+            KeyAction::QuickSave => self.request_session_op(SessionOp::Save("quicksave".into())),
+            KeyAction::QuickLoad => self.request_session_op(SessionOp::Load("quicksave".into())),
+            KeyAction::RevertToLaunch => {
+                if self.view.revert_available() {
+                    self.view.arm_revert_confirm();
+                } else if let Some(r) = self.view.revert_reason() {
+                    self.view.flight_notice(format!("cannot revert: {r}"));
+                } else {
+                    self.view
+                        .flight_notice("nothing to revert to — no launch yet");
+                }
+            }
             KeyAction::ToggleVab => {
                 self.ui_confirm();
                 self.view.set_mode(if mode == ViewMode::Vab {
@@ -2548,6 +2807,73 @@ fn install_panic_hook() {
     }));
 }
 
+/// The `csp --serve` command (§2.12, reports-19/20 F1): the shipped
+/// hosting path — a headless `GameHost` (the sim's `World` is not
+/// `Send`, so the dedicated-game-thread host is the only correct
+/// shape), `Server::start`, and the telemetry SPA's packaged `dist/`
+/// as `spa_dir`. The session shares the game's own `saves/` dir so a
+/// `session.save` is a real §7.2 CSPSAVE the menu can load.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn serve_cli() -> Result<(), String> {
+    use std::sync::Arc;
+    let save_dir = settings_io::config_dir().join("saves");
+    // The world builds inside the game thread — `World` is `!Send`
+    // (the script engine), so constructing it app-side and handing it
+    // over is not an option. `View::new()` does the whole §3.1 data
+    // load + engine install; the returned `View` is dropped there and
+    // its `sim` lives on the game thread end to end.
+    let host = csp_server::backend::GameHost::spawn_full(
+        move || {
+            csp_view::View::new()
+                .expect("data/ startup load failed")
+                .sim
+        },
+        save_dir,
+        csp_server::ingress::IngressQueue::new(),
+        Some(Box::new(|w: &mut csp_view::SimWorld| {
+            // §7.3's channel pair the snapshot cannot carry — the
+            // same engines `View::from_source` installs.
+            w.set_script_engine(Box::new(csp_view::RhaiHost::new()));
+            w.set_autopilot_driver(Box::new(csp_view::AscentAutopilot::new()));
+        })),
+    )
+    .map_err(|e| e.to_string())?;
+    let spa_dir = packaged_spa_dir();
+    let config = csp_server::serve::ServerConfig {
+        spa_dir: Some(spa_dir),
+        ..Default::default()
+    };
+    csp_server::serve::run_blocking(config, Arc::new(host)).map_err(|e| e.to_string())
+}
+
+/// The packaged telemetry SPA dist root — `apps/telemetry/dist/client`
+/// next to the workspace (dev checkout), then a `share/csp/telemetry`
+/// fallback next to the exe for packaged layouts.
+#[cfg(not(target_arch = "wasm32"))]
+fn packaged_spa_dir() -> std::path::PathBuf {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::PathBuf::from))
+        .unwrap_or_default();
+    for cand in [
+        // Dev checkout: binary at target/{profile}/csp — walk up to
+        // the workspace root.
+        exe_dir
+            .ancestors()
+            .nth(2)
+            .map(|r| r.join("apps/telemetry/dist/client")),
+        Some(exe_dir.join("../share/csp/telemetry")),
+        Some(std::path::PathBuf::from("apps/telemetry/dist/client")),
+    ] {
+        if let Some(dir) = cand
+            && dir.join("index.html").exists()
+        {
+            return dir;
+        }
+    }
+    std::path::PathBuf::from("apps/telemetry/dist/client")
+}
+
 /// The `csp --bug-report` command (§2.14): write a bundle for a fresh
 /// session headlessly and print its path. `Ok(())` → exit 0.
 #[cfg(not(target_arch = "wasm32"))]
@@ -2566,6 +2892,7 @@ pub fn bug_report_cli() -> Result<(), String> {
                 game_version: env!("CARGO_PKG_VERSION").into(),
                 label: None,
                 data_set_hash,
+                state_hash: view.sim.state_hash().ok(),
                 snapshot,
             })
             .map_err(|e| e.to_string())
@@ -2691,6 +3018,33 @@ fn load_craft_store(_dir: &std::path::Path) -> BTreeMap<String, Vec<u8>> {
 /// - `:` (a Windows drive prefix like `C:x` also escapes the join);
 /// - control characters (legal on unix, broken everywhere else and
 ///   unprintable in notices).
+/// One player session op, applied at the next drained boundary
+/// (§7.4: a save only exists at a moment where the queue is empty).
+#[derive(Debug)]
+enum SessionOp {
+    /// Write the live world to this save slot.
+    Save(String),
+    /// Restore this save slot's world.
+    Load(String),
+    /// PLAN:1180 — restore the pre-launch snapshot.
+    Revert,
+    /// Abandon the session and start a fresh world.
+    NewGame,
+}
+
+/// The `*.cspsave` slot-name rule — the craft-name rule's shape (no
+/// traversal, no control chars, bounded length) so a hostile UI
+/// string can never escape `saves/`.
+fn safe_slot_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ' '))
+        && name.trim() == name
+        && !name.starts_with('.')
+}
+
 fn validate_craft_name(name: &str) -> Result<(), &'static str> {
     if name.is_empty() {
         return Err("empty name");
@@ -2735,8 +3089,8 @@ fn save_craft_file(_dir: &std::path::Path, _name: &str, _bytes: &[u8]) -> Result
 /// inspections, script wakes, salary accrual, part-failure shadow
 /// events — the notification ring covers the player-facing one)
 /// stay in the sim log only. Bounded by the caller's `.take`.
-fn fired_event_notices(events: &[csp_sim::events::ScheduledEvent]) -> Vec<String> {
-    use csp_sim::events::EventKind as K;
+fn fired_event_notices(events: &[csp_view::events::ScheduledEvent]) -> Vec<String> {
+    use csp_view::events::EventKind as K;
     events
         .iter()
         .take(8)
@@ -2767,8 +3121,8 @@ fn fired_event_notices(events: &[csp_sim::events::ScheduledEvent]) -> Vec<String
                     "vessel {} — {} {} SOI",
                     vessel.0,
                     match direction {
-                        csp_sim::orbit::SoiDirection::Enter => "ENTERED",
-                        csp_sim::orbit::SoiDirection::Exit => "LEFT",
+                        csp_view::orbit::SoiDirection::Enter => "ENTERED",
+                        csp_view::orbit::SoiDirection::Exit => "LEFT",
                     },
                     body
                 ),
@@ -2874,6 +3228,7 @@ mod tests {
             game_version: "0.0.0".into(),
             label: Some("crash".into()),
             data_set_hash: None,
+            state_hash: None,
             snapshot: snapshot.clone(),
         })
         .unwrap();
@@ -3129,7 +3484,7 @@ mod tests {
             csp_view::SourceClass::Ui,
             0,
             SimCommand::TerminateVessel {
-                vessel: csp_sim::VesselId(0),
+                vessel: csp_view::VesselId(0),
             },
         );
         app.view.begin_frame();
@@ -3230,7 +3585,7 @@ mod tests {
             csp_view::SourceClass::Ui,
             0,
             SimCommand::TerminateVessel {
-                vessel: csp_sim::VesselId(0),
+                vessel: csp_view::VesselId(0),
             },
         );
         app.view.begin_frame();
@@ -3777,7 +4132,7 @@ mod tests {
         app.dispatch(KeyAction::ThrottleUp);
         assert_eq!(app.throttle_hold_vessel, Some(vessel));
         // Simulate the focus moving: the recorded vessel stays behind.
-        app.throttle_hold_vessel = Some(csp_sim::VesselId(u64::MAX));
+        app.throttle_hold_vessel = Some(csp_view::VesselId(u64::MAX));
         app.throttle_axis = 0.9;
         app.throttle_hold_s = 2.0;
         app.view.begin_frame();

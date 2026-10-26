@@ -549,6 +549,8 @@ pub enum SimCommand {
     /// command error: rejected onto [`AdvanceReport::rejected`]
     /// (§2.2.1's "rejected on the originating channel"), its effects
     /// rolled back — the boundary continues.
+    // ui-unreachable: the launch path uses `BuildVessel` +
+    // `SpawnPhysicalVessel`; elements-only spawn is MCP/test-only.
     SpawnVessel {
         /// The frame the elements are relative to.
         parent: BodyId,
@@ -559,6 +561,8 @@ pub enum SimCommand {
     /// vessel's events `Silent → Clamping` — including its already-
     /// queued `SoiTransition` — or demote back on `false`. Unknown ids
     /// are a command error (Recoverable), never a silent no-op.
+    // ui-unreachable: an MCP/agent tracking verb — the player's
+    // focus+tracking is view-side session state, not a sim command.
     SetVesselTracked {
         /// The vessel to (un)track.
         vessel: VesselId,
@@ -624,6 +628,8 @@ pub enum SimCommand {
     /// Meaningful only from `SurfaceLatched` — an `OnRails`, already
     /// `InBubble`, or unknown vessel is a `Recoverable` rejection on
     /// [`AdvanceReport::rejected`], never a silent no-op.
+    // ui-unreachable: the surface-ops UI (latch/unlatch verbs) is
+    // future scope — MCP/benchmarks issue it today.
     Unlatch {
         /// The latched vessel to release.
         vessel: VesselId,
@@ -635,6 +641,8 @@ pub enum SimCommand {
     /// (`r_p > radius_m`) — a command outside those is a `Recoverable`
     /// rejection. Throttle is forced to zero on exit — the plan's rule
     /// so a rails vessel can never wedge warp.
+    // ui-unreachable: §2.6.2's auto-rails transition and the
+    // bubble-exit path issue it internally; no player verb yet.
     ToRails {
         /// The bubble-resident vessel to put on rails.
         vessel: VesselId,
@@ -663,6 +671,8 @@ pub enum SimCommand {
     /// immediately. Debug builds additionally recompute the table
     /// sim-side and byte-compare (`CraftAeroTables::bit_eq`) — a
     /// mismatch is `Fatal` (a determinism break, not bad input).
+    // ui-unreachable: an agent/perf channel — the sim-side compute
+    // path (`ensure_aero`) covers the player case automatically.
     InstallAeroTables {
         /// The vessel the tables bind to.
         vessel: VesselId,
@@ -679,6 +689,8 @@ pub enum SimCommand {
     /// the command resolves to the nearest computed mask by Hamming
     /// distance (documented — not a rejection). Rails/latched vessels
     /// carry the mask for their next materialization.
+    // ui-unreachable: the aero-config UI (bay doors, stowed gear) is
+    // future scope — MCP only today.
     SetAeroConfig {
         /// The vessel to reconfigure.
         vessel: VesselId,
@@ -763,6 +775,8 @@ pub enum SimCommand {
     /// fragment's arena slot. Unknown vessels, non-bubble vessels, and
     /// a `node` that names no recorded seam are `Recoverable`
     /// rejections on the originating channel.
+    // ui-unreachable: the docking port UI is future scope —
+    // MCP/benchmarks only today.
     Undock {
         /// The vessel carrying the seam.
         vessel: VesselId,
@@ -922,6 +936,8 @@ pub enum SimCommand {
     /// (penalty — the clamp path, never a rejection). The command
     /// exists now so the §8.3 economy harness and the ledger
     /// exercise the funds path contracts will drive.
+    // ui-unreachable: the economy-harness stub — the real funds path
+    // drives through contract completion, not a player verb.
     ContractReward {
         /// Signed micro-funds — credit when ≥ 0, debit when < 0.
         micros: i64,
@@ -978,6 +994,8 @@ pub enum SimCommand {
     /// and drop the colony to `Degraded{ImpactDamage}` (the
     /// bubble-impact detection hook is M8-B's). `Recoverable`:
     /// unknown colony/module, already damaged, colony not live.
+    // ui-unreachable: the crash-damage stand-in for tests — M8-B's
+    // detection hook is the real path.
     DamageColonyModule {
         /// The colony whose module broke.
         colony: ColonyId,
@@ -2401,6 +2419,14 @@ pub struct World {
     bench_runs: BTreeMap<reliability::BenchId, reliability::ActiveBench>,
     /// §7.2's bench-arena counter.
     next_bench_id: u64,
+    /// §7.4 rule 4: the `SaveBlocking` session flag — set when a
+    /// construction-config install fails partway, checked by
+    /// [`World::check_serializable`]. **Session state, never serialized
+    /// or hashed**: a blocked world can never be snapshotted, so the
+    /// flag can never legitimately reach a save — and a restored world
+    /// re-validates every invariant from scratch, so a corrupted-then-
+    /// reloaded session is caught by restore, not by this flag.
+    save_blocked: Option<String>,
 }
 
 /// The world's physics half: the §2.9 backend it steps plus the
@@ -2534,6 +2560,7 @@ impl World {
             notifications: std::collections::VecDeque::new(),
             bench_runs: BTreeMap::new(),
             next_bench_id: 0,
+            save_blocked: None,
         }
     }
 
@@ -2672,6 +2699,112 @@ impl World {
             colony_env: self.colony_env.clone(),
             recipes: self.recipes.clone(),
         }
+    }
+
+    /// Re-install every §7.3 data-derived config channel a
+    /// [`World::restore`]'d world needs, from the `WorldConfig` the
+    /// *originating* world produced ([`World::config`]). The one
+    /// host-callable channel list — hosts used to hand-roll it and
+    /// every hand-rolled copy dropped channels (the MCP `session.load`
+    /// path re-installed 3 of ~10 and silently diverged).
+    /// `physics`/`orbits` are `restore`'s own arguments; the script
+    /// engine and autopilot driver are host objects, re-installed by
+    /// the host's reconfigure hook.
+    pub fn install_config(&mut self, config: &WorldConfig) {
+        self.set_experiments(config.experiments.clone());
+        self.set_parts(config.parts.clone());
+        if let Some(tree) = &config.tech_tree {
+            self.set_tech_tree(tree.clone());
+        }
+        self.set_sites(config.sites.clone());
+        self.set_contracts(config.contracts.clone());
+        self.set_colony_env(config.colony_env.clone());
+        self.set_recipes(config.recipes.clone());
+    }
+
+    /// The §7.3 channel checklist — names of config channels this
+    /// world's *live state* needs but does not have. `restore` leaves
+    /// every data-derived table empty by contract (the caller
+    /// re-installs); this is the honest "did the caller install what
+    /// the snapshot needs" postcondition — the contract stops being
+    /// documentation-only. An empty return means every channel live
+    /// state can reach is installed; a non-empty return names what a
+    /// continuing run will silently diverge on (an empty
+    /// `contract_defs` refills a different offer board, an empty
+    /// `experiments` rejects every `RunExperiment`, …).
+    ///
+    /// `script_engine`/`autopilot_driver` are channels too — listed
+    /// when bound scripts/engaged autopilots exist without their
+    /// engine — but `orbits`/`physics` are `restore` arguments and
+    /// are not checked here.
+    pub fn missing_config_channels(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        // `publish_contracts` refills the board as a pure function of
+        // `contract_defs` whenever it sits below `board_size` — an
+        // empty table produces a different board on the same live
+        // state (the `contracts.offers` hash diverges on the next
+        // interval boundary).
+        let board_below_cap = (self.contracts.offers.len() as u32) < self.contract_cfg.board_size;
+        if self.contract_defs.is_empty()
+            && (board_below_cap
+                || !self.contracts.offers.is_empty()
+                || !self.contracts.active.is_empty())
+        {
+            missing.push("contract_defs");
+        }
+        // Science commands resolve `experiments`; a live project or
+        // pooled vessel data makes the table load-bearing.
+        if self.experiments.is_empty()
+            && (!self.science.projects.is_empty()
+                || self.vessels.values().any(|v| !v.science.data.is_empty()))
+        {
+            missing.push("experiments");
+        }
+        // `FoundColony`/converter production and the terminator solve
+        // resolve `recipes`/`colony_env` against live colonies.
+        if self.colony_env.is_empty() && !self.colonies.is_empty() {
+            missing.push("colony_env");
+        }
+        if self.recipes.is_empty() && !self.colonies.is_empty() {
+            missing.push("recipes");
+        }
+        // `ManufactureCraft`/`SpawnPhysicalVessel` and the
+        // `CraftDef::part_ids` gate resolve `parts` — live vessels and
+        // in-flight builds make the table load-bearing.
+        if self.parts.is_empty() && (!self.vessels.is_empty() || !self.builds.is_empty()) {
+            missing.push("parts");
+        }
+        // Research commands and the part gate resolve the tree; live
+        // research state makes it load-bearing.
+        if self.tech_tree.is_none() && !self.tech.researched.is_empty() {
+            missing.push("tech_tree");
+        }
+        // `RecoverVessel`/site-inventory paths resolve `site_defs`
+        // against live site states.
+        if self.site_defs.is_empty() && !self.economy.sites.is_empty() {
+            missing.push("site_defs");
+        }
+        if self.script_engine.is_none() && !self.scripts.is_empty() {
+            missing.push("script_engine");
+        }
+        if self.autopilot_driver.is_none() && !self.autopilots.is_empty() {
+            missing.push("autopilot_driver");
+        }
+        missing
+    }
+
+    /// §7.4 rule 4's taint mark — an install path that hit a
+    /// `SaveBlocking`-class failure records it here and
+    /// [`World::check_serializable`] refuses saves until a fresh
+    /// world replaces this one. `None` restores saving.
+    pub fn set_save_blocked(&mut self, reason: Option<String>) {
+        self.save_blocked = reason;
+    }
+
+    /// The taint detail [`check_serializable`] refuses on — `Some`
+    /// while the session is §7.4-rule-4 blocked. Observation only.
+    pub fn save_blocked_reason(&self) -> Option<&str> {
+        self.save_blocked.as_deref()
     }
 
     /// The physics environment, when the world was built `with_physics`
@@ -3021,10 +3154,52 @@ impl World {
                     "snapshot: duplicate vessel life-support event",
                 ));
             }
-            if let Some(v) = vessel
-                && !snapshot.vessels.contains_key(&v)
-            {
-                return Err(SimError::Fatal("snapshot: event names unknown vessel"));
+            if let Some(v) = vessel {
+                let Some(rec) = snapshot.vessels.get(&v) else {
+                    return Err(SimError::Fatal("snapshot: event names unknown vessel"));
+                };
+                // Residence/body coherence (report-04 D3/D7): the
+                // producers schedule these only for on-rails vessels —
+                // a crafted event naming a bubble/latched vessel is
+                // refused, not tolerated. `DebrisDecay` is the
+                // destructive one: `remove_vessel` deletes whatever it
+                // fires on, crew or not, so the event may only ever
+                // name a vessel that IS debris.
+                match &e.kind {
+                    EventKind::DebrisDecay { vessel: _ } => {
+                        if rec.debris_since.is_none() {
+                            return Err(SimError::Fatal(
+                                "snapshot: debris-decay event on non-debris vessel",
+                            ));
+                        }
+                        if !matches!(rec.state, VesselState::OnRails(_)) {
+                            return Err(SimError::Fatal(
+                                "snapshot: debris-decay event on non-rails vessel",
+                            ));
+                        }
+                    }
+                    EventKind::SoiTransition { body, .. } => {
+                        if !matches!(rec.state, VesselState::OnRails(_)) {
+                            return Err(SimError::Fatal(
+                                "snapshot: SOI transition on non-rails vessel",
+                            ));
+                        }
+                        if !orbits.bodies().contains_key(body) {
+                            return Err(SimError::Fatal(
+                                "snapshot: SOI transition names unknown body",
+                            ));
+                        }
+                    }
+                    EventKind::SoiRescan { vessel: _ }
+                    | EventKind::ManeuverNodeStart { vessel: _ }
+                        if !matches!(rec.state, VesselState::OnRails(_)) =>
+                    {
+                        return Err(SimError::Fatal(
+                            "snapshot: rails-only event on non-rails vessel",
+                        ));
+                    }
+                    _ => {}
+                }
             }
             if let EventKind::ManeuverNodeStart { vessel: v } = &e.kind
                 && node_events.insert(*v, e.tick).is_some()
@@ -3131,6 +3306,16 @@ impl World {
             if !scripts::script_state_is_valid(s) {
                 return Err(SimError::Fatal("snapshot: incoherent script record"));
             }
+            // A script bound to an UNISSUED vessel id would silently
+            // bind the next `SpawnVessel` — the same hazard
+            // `check_refused_pairs` rejects for `joint_refused`.
+            // (Removed-but-issued stays legal: the doc keeps the
+            // script ticking on `Missing` telemetry.)
+            if s.vessel.0 >= snapshot.next_vessel_id {
+                return Err(SimError::Fatal(
+                    "snapshot: script bound to an unissued vessel id",
+                ));
+            }
         }
         if snapshot
             .scripts
@@ -3168,11 +3353,43 @@ impl World {
                 return Err(SimError::Fatal("snapshot: incoherent autopilot record"));
             }
         }
+        // `control_lease` coherence — the `apply_take_control` gate's
+        // mirror: a `Script` lease names a live script record (a dead
+        // one wedges the vessel under a controller that cannot act —
+        // the vacate paths assume the invariant), an `Agent` lease
+        // names a client the world has heard from (`source_seqs` is
+        // the sim's client registry). Runs after the scripts arena
+        // validates above.
+        for v in snapshot.vessels.values() {
+            let held = match v.control_lease {
+                Lease::Player => continue,
+                Lease::Script(id) => snapshot.scripts.contains_key(&id),
+                Lease::Agent(client) => snapshot
+                    .source_seqs
+                    .contains_key(&(SourceClass::External, client)),
+            };
+            if !held {
+                return Err(SimError::Fatal(
+                    "snapshot: control lease names a dead controller",
+                ));
+            }
+        }
         restore_transfer_state(&snapshot, &transfer_events)?;
         restore_build_state(&snapshot, &build_events)?;
         restore_reliability_state(&snapshot, &pf_events, &bench_events)?;
         restore_science_state(&snapshot, &research_exhausted, &research_complete)?;
         restore_economy_state(&snapshot)?;
+        // `facts.bodies_visited` entries must resolve against the
+        // handed-in orbit model — a crafted `BodyId` would satisfy
+        // prereqs/predicates a legitimate save cannot (the colony
+        // `body` resolution precedent).
+        for b in &snapshot.contracts.facts.bodies_visited {
+            if !orbits.bodies().contains_key(b) {
+                return Err(SimError::Fatal(
+                    "snapshot: contract fact names unknown body",
+                ));
+            }
+        }
         restore_contract_state(&snapshot, &deadline_events)?;
         // M7-B: the tech record's self-consistency is all restore can
         // check — node/track refs resolve against the *tree*, which is
@@ -3261,6 +3478,11 @@ impl World {
             notifications: snapshot.notifications,
             bench_runs: snapshot.bench_runs,
             next_bench_id: snapshot.next_bench_id,
+            // Restored worlds start unblocked: `restore`'s own checks
+            // are the loader-error gate, and a save written before the
+            // writer's session tainted cannot carry the flag (see the
+            // field doc — it is session state, not snapshot state).
+            save_blocked: None,
         })
     }
 
@@ -3271,6 +3493,18 @@ impl World {
     /// non-empty could never reproduce the run — the boundary refuses
     /// `SaveBlocking` rather than silently dropping the in-flight work.
     pub fn check_serializable(&self) -> Result<(), SimError> {
+        // §7.4 rule 4: a session tainted by loader/install errors
+        // refuses saves — the snapshot would carry a world the data
+        // set never fully defined.
+        if let Some(reason) = &self.save_blocked {
+            // `SimError` reasons are `'static` — the stored detail
+            // rides [`World::save_blocked_reason`] for the UI to
+            // append, and the refusal itself is this fixed text.
+            let _ = reason;
+            return Err(SimError::SaveBlocking(
+                "session is save-blocked from a loader/install error",
+            ));
+        }
         if self.pending.values().any(|fifo| !fifo.is_empty()) {
             return Err(SimError::SaveBlocking(
                 "commands pending at serialization boundary",
@@ -8085,7 +8319,17 @@ impl World {
             // periapsis tick. Idempotent — an already-removed vessel
             // makes the stale event a no-op, never an error.
             EventKind::DebrisDecay { vessel } => {
-                self.remove_vessel(*vessel, shadow);
+                // Only an on-rails DEBRIS vessel decays — the restore
+                // gate enforces it on load, and a stale/crafted fire
+                // on anything else is a no-op (the `TransferComplete`
+                // precedent), never an unconditional delete.
+                if self
+                    .vessels
+                    .get(vessel)
+                    .is_some_and(|v| v.debris_since.is_some())
+                {
+                    self.remove_vessel(*vessel, shadow);
+                }
                 Ok(())
             }
             // §2.6.6: re-base the vessel's elements into the new frame,
@@ -9644,6 +9888,26 @@ fn restore_transfer_state(
                 if !in_flight_crew.insert(*crew) {
                     return Err(SimError::Fatal("snapshot: crew in flight twice"));
                 }
+                // Seated-at-source (report-04 D7): the member's roster
+                // location must BE `t.from` — the apply keeps them
+                // seated at source until `land_crew` runs, so a
+                // crafted location would double-book on landing.
+                let seated_at_source = match t.from {
+                    transfers::TransferEnd::Vessel(v) => snapshot
+                        .vessels
+                        .get(&v)
+                        .is_some_and(|vessel| vessel.crew.iter().any(|c| c.id == *crew)),
+                    transfers::TransferEnd::Colony(c) => snapshot
+                        .economy
+                        .crew
+                        .get(crew)
+                        .is_some_and(|m| m.location == economy::CrewLocation::Colony(c)),
+                };
+                if !seated_at_source {
+                    return Err(SimError::Fatal(
+                        "snapshot: in-flight crew is not seated at the transfer's source",
+                    ));
+                }
             }
         }
         match transfer_events.get(id) {
@@ -10418,7 +10682,11 @@ fn restore_vessel_state(
                 if !craft.graph.nodes.contains_key(node) {
                     return Err(SimError::Fatal("snapshot: reliability record on non-node"));
                 }
-                if !(rec.theta.is_finite() || rec.theta == f64::INFINITY)
+                // θ = +∞ rejected: `hash_record` faults on it, so a
+                // save carrying it would wedge every later state hash
+                // — the `U=0` corner is unreachable anyway (fresh
+                // records clamp `U` to `MIN_POSITIVE`). Report-08 M1.
+                if !rec.theta.is_finite()
                     || rec.theta <= 0.0
                     || !rec.usage.is_valid()
                     || !(rec.thrust_factor.is_finite() && (0.0..=1.0).contains(&rec.thrust_factor))
@@ -10429,6 +10697,20 @@ fn restore_vessel_state(
                 {
                     return Err(SimError::Fatal("snapshot: incoherent reliability record"));
                 }
+            }
+            // `aero_mask` bits name graph-node positions — a crafted
+            // mask marks tables stale for a config that cannot exist
+            // (report-04 D7). `ConfigMask::ALL` is the spawn default —
+            // don't-care bits beyond the live graph are legitimate;
+            // anything else with bits above the graph's node count is
+            // a crafted mask the apply path would never produce.
+            if craft.graph.nodes.len() < 64
+                && vessel.aero_mask != csp_phys::ConfigMask::ALL
+                && (vessel.aero_mask.0 >> craft.graph.nodes.len()) != 0
+            {
+                return Err(SimError::Fatal(
+                    "snapshot: aero mask names nodes outside the craft graph",
+                ));
             }
             // M6-D: contents/crew coherence — live tanked nodes,
             // declared resources, capacity bounds, wet-vs-mass, and
@@ -10494,12 +10776,16 @@ fn restore_vessel_state(
                 .map_err(|e| SimError::Fatal(e.reason()))?;
             // The `SetAttitude`/spawn convention — a finite but
             // zero-norm quaternion would NaN at the first integrate.
+            // `SetThrottle` clamps [0,1] at apply — a crafted
+            // out-of-range throttle is refused at load, not carried
+            // into the fuel-plan/executor path (report-04 D5).
             if !(pos.is_finite()
                 && rot.is_finite()
                 && rot.norm() > 0.0
                 && vel.is_finite()
                 && ang_vel.is_finite()
-                && throttle.is_finite())
+                && throttle.is_finite()
+                && (0.0..=1.0).contains(&throttle))
             {
                 return Err(SimError::Fatal("snapshot: non-finite body state"));
             }
@@ -10527,9 +10813,13 @@ fn restore_vessel_state(
             // Same zero-norm rule as the bubble rot — a crafted
             // zero quat would NaN `surface_pose_restore`'s normalize
             // at unlatch.
+            // `altitude_m >= 0` — the colony pose gate's own bound; a
+            // crafted negative altitude would berth the hull under the
+            // datum at unlatch (report-04 D7).
             if !(pose.latitude_rad.is_finite()
                 && pose.longitude_rad.is_finite()
                 && pose.altitude_m.is_finite()
+                && pose.altitude_m >= 0.0
                 && pose.orientation.is_finite()
                 && pose.orientation.norm() > 0.0)
             {
@@ -13158,6 +13448,202 @@ mod tests {
 
     /// §7.2's restore invariants, exercised on crafted garbage: each
     /// violated invariant is a named `Fatal`, never a half-loaded world.
+    /// Report-04 D3/D7 + report-08 M1: the hostile-restore hardening
+    /// batch — every crafted field the apply path would have trusted
+    /// is refused `Fatal`, never partially loaded.
+    #[test]
+    fn restore_rejects_crafted_hardening_cases() {
+        let good = || World::new().snapshot().unwrap();
+        let empty = || PatchedConics::new(BTreeMap::new());
+        let bad = |s: WorldSnapshot| {
+            matches!(
+                World::restore(PatchedConics::new(BTreeMap::new()), None, s),
+                Err(SimError::Fatal(_))
+            )
+        };
+        let rails_vessel = |id| Vessel {
+            science: VesselScience::default(),
+            joined_colony: None,
+            id: VesselId(id),
+            craft: None,
+            aero_mask: csp_phys::ConfigMask::ALL,
+            debris_since: None,
+            maneuver: None,
+            thermal: VesselThermal::default(),
+            state: VesselState::OnRails(OrbitState {
+                parent: BodyId::from("p"),
+                elements: leo_elements(),
+                epoch: SimTime::from_ticks(0),
+            }),
+            seams: Vec::new(),
+            tank_contents: BTreeMap::new(),
+            crew: Vec::new(),
+            reliability: BTreeMap::new(),
+            control_lease: Lease::Player,
+            deployed: BTreeMap::new(),
+        };
+        let with_vessel = |mut s: WorldSnapshot, v: Vessel| {
+            s.vessels.insert(v.id, v);
+            s.next_vessel_id = s.vessels.len() as u64;
+            s
+        };
+        let ev = |kind| ScheduledEvent {
+            tick: 9,
+            seq: 0,
+            class: EventClass::Silent,
+            kind,
+        };
+
+        // D3: DebrisDecay on a non-debris vessel — the event that
+        // deletes whatever it names must only ever name debris.
+        let mut s = with_vessel(good(), rails_vessel(0));
+        s.event_heap = vec![ev(EventKind::DebrisDecay {
+            vessel: VesselId(0),
+        })];
+        s.next_event_seq = 1;
+        assert!(bad(s), "debris-decay on non-debris must refuse");
+        // ...and on a non-rails debris vessel (the InBubble arm needs
+        // physics; the event-walk's residence check fires first).
+        let mut s = with_vessel(good(), rails_vessel(0));
+        s.vessels.get_mut(&VesselId(0)).unwrap().debris_since = Some(0);
+        s.vessels.get_mut(&VesselId(0)).unwrap().state =
+            VesselState::SurfaceLatched(bubble::SurfacePose {
+                body: BodyId::from("p"),
+                latitude_rad: 0.0,
+                longitude_rad: 0.0,
+                altitude_m: 0.0,
+                orientation: DQuat::IDENTITY,
+            });
+        s.event_heap = vec![ev(EventKind::DebrisDecay {
+            vessel: VesselId(0),
+        })];
+        s.next_event_seq = 1;
+        assert!(bad(s), "debris-decay on non-rails must refuse");
+
+        // A legitimate rails debris vessel + its decay event restores.
+        let mut s = with_vessel(good(), rails_vessel(0));
+        s.vessels.get_mut(&VesselId(0)).unwrap().debris_since = Some(0);
+        s.event_heap = vec![ev(EventKind::DebrisDecay {
+            vessel: VesselId(0),
+        })];
+        s.next_event_seq = 1;
+        // The event is a legal silent event at tick 9 with seq 0 —
+        // but the restore ALSO needs the conic to resolve, which the
+        // empty orbit model refuses; keep the assertion to the
+        // hardening gate itself by checking the message.
+        let r = World::restore(empty(), None, s);
+        assert!(
+            !matches!(&r, Err(SimError::Fatal(m)) if m.contains("debris-decay")),
+            "legal debris decay must not hit the hardening gate"
+        );
+
+        // D4: control_lease coherence — Script lease without a live
+        // record, Agent lease without a seen source.
+        let mut s = with_vessel(good(), rails_vessel(0));
+        s.vessels.get_mut(&VesselId(0)).unwrap().control_lease = Lease::Script(ScriptId(9));
+        assert!(bad(s), "script lease with no script must refuse");
+        let mut s = with_vessel(good(), rails_vessel(0));
+        s.vessels.get_mut(&VesselId(0)).unwrap().control_lease = Lease::Agent(9);
+        assert!(bad(s), "agent lease with no seen client must refuse");
+        // The coherent Agent case passes the lease gate.
+        let mut s = with_vessel(good(), rails_vessel(0));
+        s.vessels.get_mut(&VesselId(0)).unwrap().control_lease = Lease::Agent(9);
+        s.source_seqs.insert((SourceClass::External, 9), 0);
+        let r = World::restore(empty(), None, s);
+        assert!(
+            !matches!(&r, Err(SimError::Fatal(m)) if m.contains("lease")),
+            "coherent agent lease must pass"
+        );
+
+        // D6: ScriptState.vessel must name an ISSUED vessel id.
+        let mut s = good();
+        s.next_vessel_id = 3;
+        s.scripts.insert(
+            ScriptId(0),
+            scripts::ScriptState {
+                id: ScriptId(0),
+                vessel: VesselId(7),
+                source: "x".into(),
+                enabled: true,
+                disabled_reason: None,
+                strikes: 0,
+                consecutive_polls: 0,
+                poll_demoted: false,
+                wake_tick: None,
+                persist: scripts::PersistMap::default(),
+            },
+        );
+        assert!(bad(s), "script on unissued vessel must refuse");
+        let mut s = good();
+        s.next_vessel_id = 8;
+        s.next_script_id = 1;
+        s.scripts.insert(
+            ScriptId(0),
+            scripts::ScriptState {
+                id: ScriptId(0),
+                vessel: VesselId(7),
+                source: "x".into(),
+                enabled: true,
+                disabled_reason: None,
+                strikes: 0,
+                consecutive_polls: 0,
+                poll_demoted: false,
+                wake_tick: None,
+                persist: scripts::PersistMap::default(),
+            },
+        );
+        let r = World::restore(empty(), None, s);
+        assert!(r.is_ok(), "script on an issued (removed) id is legal");
+
+        // D7: contract facts.bodies_visited must resolve against the
+        // handed-in orbit model.
+        let mut s = good();
+        s.contracts
+            .facts
+            .bodies_visited
+            .insert(BodyId::from("nope"));
+        assert!(bad(s), "bodies_visited naming a non-body must refuse");
+
+        // §7.4 rule 4: the save_blocked session flag refuses snapshots.
+        let mut w = World::new();
+        w.set_save_blocked(Some("install failed".into()));
+        assert!(matches!(w.snapshot(), Err(SimError::SaveBlocking(_))));
+        assert_eq!(w.save_blocked_reason(), Some("install failed"));
+        w.set_save_blocked(None);
+        assert!(w.snapshot().is_ok());
+
+        // World::install_config + missing_config_channels: an empty
+        // world needs nothing; a bound script makes the engine a
+        // load-bearing §7.3 channel.
+        let w = World::new();
+        assert!(w.missing_config_channels().is_empty());
+        let mut s = good();
+        s.next_vessel_id = 8;
+        s.next_script_id = 1;
+        s.scripts.insert(
+            ScriptId(0),
+            scripts::ScriptState {
+                id: ScriptId(0),
+                vessel: VesselId(7),
+                source: "x".into(),
+                enabled: true,
+                disabled_reason: None,
+                strikes: 0,
+                consecutive_polls: 0,
+                poll_demoted: false,
+                wake_tick: None,
+                persist: scripts::PersistMap::default(),
+            },
+        );
+        let mut w = World::restore(empty(), None, s).unwrap();
+        assert!(
+            w.missing_config_channels().contains(&"script_engine"),
+            "bound script with no engine must flag the channel"
+        );
+        w.install_config(&w.config());
+        assert!(w.missing_config_channels().is_empty());
+    }
+
     #[test]
     fn restore_rejects_crafted_snapshots() {
         let good = || World::new().snapshot().unwrap();
@@ -16178,7 +16664,11 @@ mod tests {
         // Hash coverage: snapshot mid-run is restored bit-identically.
         let snap = a.snapshot().unwrap();
         let mut restored = World::restore(
-            PatchedConics::new(BTreeMap::new()),
+            // The restore hardening's `bodies_visited` gate needs the
+            // visited bodies in the handed-in model — the same fixture
+            // system the run used (the model is config, not hashed
+            // state, so the roundtrip hash is unchanged).
+            test_system(),
             Some(PhysicsConfig {
                 environment: test_env(false),
                 dominant: BodyId::from("p"),

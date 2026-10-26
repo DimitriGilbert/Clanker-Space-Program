@@ -1620,7 +1620,7 @@ mod tests {
             .contracts
             .facts
             .bodies_visited
-            .insert(BodyId::from("rask"));
+            .insert(BodyId::from("sol"));
         let w2 = World::restore(test_orbits(), None, changed).unwrap();
         assert_ne!(w2.state_hash().unwrap(), base_hash);
         let mut changed = base;

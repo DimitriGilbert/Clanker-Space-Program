@@ -8,12 +8,14 @@
 
 mod lint_attr;
 mod lint_deps;
+mod lint_reach;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, exit};
 
 use lint_attr::lint_attribution;
 use lint_deps::lint_deps;
+use lint_reach::lint_reach;
 
 /// A golden re-recorded in memory but not yet written. Pass 1 of §8.4's
 /// bless stages everything up front so the refusals (dirty tree, schema
@@ -391,10 +393,13 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("lint-deps") => lint_deps(),
         Some("lint-attribution") => lint_attribution(),
+        Some("lint-reach") => lint_reach(),
         Some("bless-goldens") => bless_goldens(args.get(1..).unwrap_or(&[])),
         Some("build-web") => build_web(),
         _ => {
-            eprintln!("usage: cargo xtask <lint-deps|lint-attribution|bless-goldens|build-web>");
+            eprintln!(
+                "usage: cargo xtask <lint-deps|lint-attribution|lint-reach|bless-goldens|build-web>"
+            );
             exit(2);
         }
     }

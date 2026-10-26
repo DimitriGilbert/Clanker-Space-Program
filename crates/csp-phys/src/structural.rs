@@ -207,6 +207,13 @@ pub fn joint_loads(
         let c_s = a.com_m / a.mass;
         // Inertia about the subtree CoM, then about the joint point.
         let i_cs = a.inertia_origin.shift(-a.mass, c_s);
+        // KNOWN-DEFERRED (PRD-10 M3 / Phase-3 W3.4h): `p_j` is the
+        // part ORIGIN, not the snapped attach point — the torque arm
+        // is systematically off by (attach-node − origin). The real
+        // joint point is known at attach time (snap_transform has it)
+        // but carries it through `PartNode`/`WeldPart` — both
+        // serialized in `CraftDef`, so the fix needs a schema bump +
+        // golden rebless and was deferred out of the editor batch.
         let p_j = transforms[id].offset;
         let i_pj = i_cs.shift(a.mass, c_s - p_j);
         let f_j = a.force * -1.0 + point_accel(c_s) * a.mass;
