@@ -43,6 +43,25 @@ struct Vout {
     @location(4) @interpolate(flat) pick: u32,
 };
 
+// ACES filmic fit (Narkowicz) — the same curve the flight and terrain
+// passes apply, so VAB parts roll off highlights identically to the
+// flight hull instead of clipping to flat white (raw RGB here used to
+// read over-bright against the tonemapped scene). The unlit stream
+// (shells, markers, accents — the `nn < 0.25` early return below)
+// stays raw: those colors are authored emissive, not lit material.
+fn tone_map(c: vec3<f32>) -> vec3<f32> {
+    let a = 2.51;
+    let b = 0.03;
+    let d = 2.43;
+    let e = 0.59;
+    let f = 0.14;
+    return clamp(
+        (c * (a * c + vec3<f32>(b))) / (c * (d * c + vec3<f32>(e)) + vec3<f32>(f)),
+        vec3<f32>(0.0),
+        vec3<f32>(1.0),
+    );
+}
+
 @vertex
 fn vs_main(v: Vin) -> Vout {
     var o: Vout;
@@ -79,7 +98,7 @@ fn fs_main(i: Vout) -> @location(0) vec4<f32> {
     rgb += light.sun_col.rgb * spec;
     let fres = pow(clamp(1.0 - dot(n, v), 0.0, 1.0), 3.0) * light.hemi.w * i.mat.z;
     rgb += light.amb_up.rgb * fres;
-    return vec4<f32>(rgb, i.color.a);
+    return vec4<f32>(tone_map(rgb), i.color.a);
 }
 
 @fragment

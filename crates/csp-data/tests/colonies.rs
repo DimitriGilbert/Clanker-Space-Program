@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use csp_data::{
     LocFile, load_colonies, load_recipes, load_resources, load_sites, validate_colonies,
-    validate_recipes,
+    validate_colony_loc_keys, validate_recipe_loc_keys, validate_recipes,
 };
 
 fn repo_root() -> PathBuf {
@@ -56,20 +56,13 @@ fn shipping_recipes_load_and_validate_green() {
 }
 
 /// Every recipe's `display_name` LocKey resolves in `data/loc/en.ron`
-/// (the `validate_part_loc_keys` contract — no dedicated validator
-/// exists for recipes, so the gate asserts it directly).
+/// — the `validate_recipe_loc_keys` gate.
 #[test]
 fn shipping_recipe_loc_keys_resolve() {
     let recipes = load_recipes(&data().join("recipes")).unwrap();
     let loc = en_loc();
-    for r in &recipes.recipes {
-        assert!(
-            loc.contains(&r.def.display_name),
-            "recipe {:?} display_name {:?} unresolved in en.ron",
-            r.def.id,
-            r.def.display_name
-        );
-    }
+    let errs = validate_recipe_loc_keys(&recipes, &loc);
+    assert!(errs.is_empty(), "unresolved recipe loc keys: {errs:#?}");
 }
 
 /// `data/systems/home/colonies.ron`: the authored starting colonies
@@ -101,17 +94,11 @@ fn home_site_loc_keys_resolve() {
 }
 
 /// Every authored colony's `display_name` LocKey resolves in
-/// `data/loc/en.ron`.
+/// `data/loc/en.ron` — the `validate_colony_loc_keys` gate.
 #[test]
 fn home_colony_loc_keys_resolve() {
     let file = load_colonies(&home_dir().join("colonies.ron")).unwrap();
     let loc = en_loc();
-    for c in &file.colonies {
-        assert!(
-            loc.contains(&c.display_name),
-            "colony at site {:?} display_name {:?} unresolved in en.ron",
-            c.site,
-            c.display_name
-        );
-    }
+    let errs = validate_colony_loc_keys(&file, &loc);
+    assert!(errs.is_empty(), "unresolved colony loc keys: {errs:#?}");
 }

@@ -14,6 +14,9 @@
 // none is present the page renders a first-boot token gate.
 
 export const WIRE_PROTO = 1
+/** The 64-Hz divisors — pinned to the server's `VALID_RATES`
+ *  (csp-server/src/dashboard.rs); a stored `rate_hz` outside the set
+ *  is refused there, so it is refused here too rather than sent. */
 export const VALID_RATES = [64, 32, 16, 8, 4, 2, 1]
 
 export interface TelemetryFrame {
@@ -133,7 +136,13 @@ export function clearCspToken(): void {
  *  re-opens and re-subscribes with the same fields — see
  *  [`TelemetryClientOptions.reconnect`] for the server-restart caveat. */
 export function subscribeTelemetry(opts: TelemetryClientOptions): () => void {
-  const rate = opts.rateHz ?? 16
+  // A persisted/hand-assembled `rate_hz` outside the pinned divisor
+  // set would just earn a server refusal — degrade to the default
+  // locally so a bad stored value still subscribes.
+  const rate =
+    opts.rateHz !== undefined && VALID_RATES.includes(opts.rateHz)
+      ? opts.rateHz
+      : 16
   const url = new URL('/ws', window.location.href)
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
   url.searchParams.set('token', cspToken())

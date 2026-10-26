@@ -53,6 +53,17 @@ pub enum DataHashError {
         /// The file.
         path: PathBuf,
     },
+    /// Two paths differ only by ASCII case — the committed tree hashes
+    /// both on a case-sensitive filesystem, but a checkout on a
+    /// case-insensitive one collapses them into a different set (and a
+    /// different hash): the same repo would fingerprint differently by
+    /// platform.
+    CaseCollision {
+        /// The first path (byte-sorted order).
+        a: PathBuf,
+        /// The colliding path.
+        b: PathBuf,
+    },
 }
 
 impl fmt::Display for DataHashError {
@@ -65,6 +76,14 @@ impl fmt::Display for DataHashError {
             Self::NonUtf8Name { path } => {
                 write!(f, "non-UTF-8 file name at {}", path.display())
             }
+            Self::CaseCollision { a, b } => {
+                write!(
+                    f,
+                    "paths differ only by case: {} vs {}",
+                    a.display(),
+                    b.display()
+                )
+            }
         }
     }
 }
@@ -73,7 +92,7 @@ impl std::error::Error for DataHashError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
-            Self::Symlink { .. } | Self::NonUtf8Name { .. } => None,
+            Self::Symlink { .. } | Self::NonUtf8Name { .. } | Self::CaseCollision { .. } => None,
         }
     }
 }
@@ -112,6 +131,23 @@ fn hashed_files(root: &Path) -> Result<Vec<String>, DataHashError> {
     let mut out = Vec::new();
     collect(root, "", &mut out)?;
     out.sort();
+    // Two paths that differ only by ASCII case hash fine here but
+    // collapse to one file on a case-insensitive checkout — the same
+    // commit would produce a different data-set hash by platform, so
+    // the collision is refused like a symlink or non-UTF-8 name. The
+    // fold key is a full-string compare, not an adjacency scan: byte
+    // sort does NOT put case-folded-equal paths next to each other
+    // (`"FOO.txt" < "Zebra" < "foo.txt"`).
+    let mut folded: std::collections::BTreeMap<String, &str> = std::collections::BTreeMap::new();
+    for rel in &out {
+        let key = rel.to_ascii_lowercase();
+        if let Some(first) = folded.insert(key, rel) {
+            return Err(DataHashError::CaseCollision {
+                a: PathBuf::from(first),
+                b: PathBuf::from(rel),
+            });
+        }
+    }
     Ok(out)
 }
 
@@ -149,8 +185,10 @@ fn collect(dir: &Path, prefix: &str, out: &mut Vec<String>) -> Result<(), DataHa
             format!("{prefix}/{name}")
         };
         if entry.path().is_dir() {
-            // §3.1: data/test-fixtures/ is out of the shipping data set.
-            if rel == "test-fixtures" {
+            // §3.1: data/test-fixtures/ is out of the shipping data
+            // set — case-folded like `art/` so a differently-cased
+            // checkout excludes the same directory.
+            if rel.eq_ignore_ascii_case("test-fixtures") {
                 continue;
             }
             collect(&entry.path(), &rel, out)?;
@@ -163,10 +201,17 @@ fn collect(dir: &Path, prefix: &str, out: &mut Vec<String>) -> Result<(), DataHa
 
 /// §3.1 file inclusion: everything except `test-fixtures/**` (handled in
 /// [`collect`]) and `art/**` files with an [`ART_EXTENSIONS`] extension.
+/// Both the `art/` prefix and the extension match are
+/// ASCII-case-insensitive — `art/x.PNG` is the same presentation asset
+/// as `art/x.png` (a case-sensitive compare would hash it, flipping
+/// `data_set_hash` on an art-only change), and a `data/Art/` directory
+/// *is* `data/art/` on a case-insensitive checkout, so folding keeps
+/// the hashed set platform-identical.
 fn in_scope(rel: &str) -> bool {
-    if let Some(rest) = rel.strip_prefix("art/")
-        && let Some(ext) = rest.rsplit('.').next()
-        && ART_EXTENSIONS.contains(&ext)
+    let in_art = rel.len() > 4 && rel[..4].eq_ignore_ascii_case("art/");
+    if in_art
+        && let Some(ext) = rel[4..].rsplit('.').next()
+        && ART_EXTENSIONS.iter().any(|e| ext.eq_ignore_ascii_case(e))
     {
         return false;
     }
@@ -189,6 +234,9 @@ fn canonicalize(bytes: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(test)]
+// Tests signal failure by panicking; §2.13's no-panic rule covers shipping
+// fallible paths, not test code.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -225,5 +273,69 @@ mod tests {
             legacy(&[("a", b"X"), ("b", b"Y")]),
             "the retired framing demonstrably collided"
         );
+    }
+
+    /// `art/` exclusion folds ASCII case on both the directory prefix
+    /// and the extension — `art/x.PNG` is an art asset, not hashed
+    /// data (a case-sensitive match would flip `data_set_hash` on an
+    /// art-only change).
+    #[test]
+    fn in_scope_folds_case_on_art_prefix_and_extension() {
+        for rel in [
+            "art/tex.png",
+            "art/tex.PNG",
+            "Art/tex.png",
+            "aRt/sub/tex.JpG",
+        ] {
+            assert!(!in_scope(rel), "{rel} must be excluded as art");
+        }
+        for rel in [
+            "art/tex.ron",      // not an art extension — data
+            "artistic/tex.png", // not the art dir
+            "art",              // not under art/
+            "artx/tex.png",
+            "biomes/terrin.png", // png outside art/ IS hashed (§3.1)
+        ] {
+            assert!(in_scope(rel), "{rel} must be hashed");
+        }
+    }
+
+    /// Two files whose paths differ only by case collide on a
+    /// case-insensitive checkout — the same commit would fingerprint
+    /// differently by platform, so the hash refuses them.
+    #[test]
+    fn case_colliding_paths_are_refused() {
+        let root = std::env::temp_dir().join(format!("csp-datahash-case-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("parts")).unwrap();
+        std::fs::write(root.join("parts/FOO.ron"), b"a").unwrap();
+        std::fs::write(root.join("parts/foo.ron"), b"b").unwrap();
+        let err = data_set_hash(&root).unwrap_err();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            matches!(err, DataHashError::CaseCollision { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// An uppercase art extension is excluded end-to-end: hashing a
+    /// tree containing only `art/x.PNG` yields the empty-set hash.
+    #[test]
+    fn uppercase_art_extension_hashes_nothing() {
+        let root = std::env::temp_dir().join(format!("csp-datahash-png-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("art")).unwrap();
+        std::fs::write(root.join("art/x.PNG"), [0u8; 16]).unwrap();
+        let h = data_set_hash(&root).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        let empty = {
+            let r = std::env::temp_dir().join(format!("csp-datahash-empty-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&r);
+            std::fs::create_dir_all(&r).unwrap();
+            let h = data_set_hash(&r).unwrap();
+            let _ = std::fs::remove_dir_all(&r);
+            h
+        };
+        assert_eq!(h, empty, "an art-only tree must hash as the empty set");
     }
 }

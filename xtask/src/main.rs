@@ -37,10 +37,14 @@ struct Staged {
 /// Bootstrapping a NEW golden: commit the fixture dir
 /// (`data/test-fixtures/<name>/` data files) and the scenario recipe
 /// first; `bless-goldens` then writes the artifacts (the dir need not
-/// contain `replay.bin` yet — it is created). Equivalently,
-/// `csp-replay record <name> <dir>` writes them directly and the commit
-/// carries them; bless afterwards only refreshes fingerprints. Either
-/// way the committed diff is exactly the artifact files.
+/// contain `replay.bin` yet — it is created). `csp-replay record
+/// <name> <dir>` also writes them — but only the lib-side refusals
+/// apply there (`write_golden` refuses a partial set and a
+/// hash-changing overwrite of an occupied dir; `--force` is its
+/// escape hatch): the dirty-tree and schema-bump/`--reason` gates
+/// below are THIS command's, so `record` is the bootstrap path and
+/// `bless-goldens` is the gated re-generation path. Either way the
+/// committed diff is exactly the artifact files.
 ///
 /// Every staged artifact self-verifies before anything is written:
 /// `csp_bench::replay::record` replays its own output and refuses a

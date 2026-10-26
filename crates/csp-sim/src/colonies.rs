@@ -1566,7 +1566,7 @@ impl World {
         boundary_only: bool,
         shadow: &mut TickShadow,
     ) {
-        self.shadow_events(shadow);
+        self.shadow_events_whole(shadow);
         let heap = std::mem::take(&mut self.event_heap);
         self.event_heap = heap
             .into_iter()
@@ -4190,6 +4190,7 @@ mod tests {
             csp_phys::PartNode::new(None, csp_phys::PartTransform::IDENTITY, 0),
         );
         crate::CraftDef {
+            hash_memo: Default::default(),
             part_ids: vec![],
             graph,
             parts: vec![csp_phys::WeldPart {

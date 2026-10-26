@@ -114,9 +114,16 @@ pub enum LoadError {
         /// The parse error (positioned — `SpannedError` carries a line/col).
         source: Box<ron::error::SpannedError>,
     },
-    /// `schema_version` is present but not one this loader understands
-    /// (§3.1: current and previous are supported; only v1 exists today,
-    /// so anything else is rejected).
+    /// `schema_version` is present but not one this loader understands.
+    /// The accepted set is per file type, not a uniform
+    /// current-and-previous band: `sites.ron` accepts
+    /// [`crate::site::SITE_SCHEMA_SUPPORTED`] (v1 and v2 — v1 reads
+    /// `resource_yields` as empty via serde defaults), while
+    /// `colonies.ron` accepts only v2 — its v1→v2 restructure
+    /// (`rate_per_s` rename, `Converter` inline pairs → `RecipeId`
+    /// indirection) has no honest mechanical mapping, so v1 is refused
+    /// outright rather than mis-migrated. Every other file type takes
+    /// its current version exactly (`balance.ron` is at v11).
     UnsupportedSchemaVersion {
         /// The file carrying the bad version.
         path: PathBuf,

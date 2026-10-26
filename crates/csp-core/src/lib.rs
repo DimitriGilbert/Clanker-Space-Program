@@ -21,6 +21,6 @@ mod vec3;
 pub use error::{RejectKind, SimError};
 pub use hash::{HASH_SCHEMA_VERSION, StableDiscriminant, StateHasher, bubble_mask};
 pub use quat::DQuat;
-pub use rng::{KDF_VERSION, StreamKey, StreamTag, derive_key, stream, uniform};
+pub use rng::{KDF_VERSION, StreamKey, StreamTag, derive_key, stream, uniform, uniform01};
 pub use time::{SimTime, TICK_HZ};
 pub use vec3::DVec3;

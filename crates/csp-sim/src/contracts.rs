@@ -237,11 +237,11 @@ pub(crate) enum ContractTrigger {
     ColonyDelivery,
 }
 
-/// The `[0,1)` draw — the `csp_core::uniform` scaling applied to a
-/// stream position (the KDF reseeds per offer, then the fixed draw
-/// order consumes the stream).
+/// The `[0,1)` draw — `csp_core::uniform01` applied to a stream
+/// position (the KDF reseeds per offer, then the fixed draw order
+/// consumes the stream).
 fn next01(rng: &mut impl Rng) -> f64 {
-    (rng.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+    csp_core::uniform01(rng)
 }
 
 /// The weighted-pick uniform index over `len` candidates.
@@ -1131,7 +1131,7 @@ impl World {
         // A pending deadline is dead with the contract — drop it so
         // the restore pairing holds in both directions.
         if c.deadline_tick.is_some() {
-            self.shadow_events(shadow);
+            self.shadow_events_whole(shadow);
             let heap = std::mem::take(&mut self.event_heap);
             self.event_heap = heap
                 .into_iter()

@@ -124,6 +124,62 @@ pub struct CraftDef {
     /// construction-config catalog + hashed `TechState` at drain.
     #[serde(default)]
     pub part_ids: Vec<PartId>,
+    /// The `craft_graph_hash` memo — a pure cache, never content:
+    /// `Clone` drops it (clone-modify-reassign is THE craft-mutation
+    /// convention, so a clone inheriting the old hash would lie
+    /// stale — a cleared memo just recomputes), `PartialEq` ignores
+    /// it, `serde` skips it, and `hash_craft` never walks it.
+    /// **Write rule**: mutate a `CraftDef` only before it is shared,
+    /// or by replacing it wholesale — an in-place write to a memoized
+    /// def leaves the memo stale (wrong direction).
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub hash_memo: CraftHashMemo,
+}
+
+/// The `craft_graph_hash` memo living on [`CraftDef::hash_memo`].
+/// `0` encodes "not computed"; a stored value is `hash + 1`
+/// (wrapping), so a computed hash of `u64::MAX` simply never caches
+/// and the `0` a hasher fault produces costs a recompute, never a
+/// wrong answer.
+///
+/// The type's trait impls are the safety contract:
+/// [`Clone`] returns EMPTY (the clone may be about to change —
+/// memoizing across a clone would risk a stale hit), and
+/// [`PartialEq`] is always-true (a cache is not part of the def's
+/// identity — two defs equal by content must compare equal whatever
+/// their memo state).
+#[derive(Debug, Default)]
+pub struct CraftHashMemo(std::sync::atomic::AtomicU64);
+
+impl CraftHashMemo {
+    /// The cached hash, or `None` when uncomputed.
+    pub(crate) fn get(&self) -> Option<u64> {
+        std::num::NonZeroU64::new(self.0.load(std::sync::atomic::Ordering::Relaxed))
+            .map(|v| v.get().wrapping_sub(1))
+    }
+
+    /// Store a freshly computed hash (`0`-safe via the +1 encoding).
+    pub(crate) fn set(&self, hash: u64) {
+        self.0
+            .store(hash.wrapping_add(1), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+// See the type doc: cloning clears the memo — the clone-modify-
+// reassign convention makes a carried-over memo a stale-hit risk.
+impl Clone for CraftHashMemo {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+// See the type doc: a cache is not content — memo state never
+// affects `CraftDef` equality.
+impl PartialEq for CraftHashMemo {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
 }
 
 /// Where a vessel lives (§2.4/§2.6.2): on rails, physics-resident in

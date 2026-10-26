@@ -1,7 +1,7 @@
 # ATTRIBUTION (PLAN §3.7)
 #
-# One pipe-delimited line per **non-authored** asset, anywhere under data/
-# (recursive — all subdirs are walked):
+# One pipe-delimited line per **non-authored** asset, anywhere under
+# data/ or assets/ (recursive — `xtask lint-attribution` walks both):
 #
 #     path | source | license | url
 #

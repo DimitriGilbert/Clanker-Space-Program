@@ -1595,13 +1595,29 @@ enum VesselsShadow {
     PerItem(BTreeMap<VesselId, Option<Vessel>>),
 }
 
-/// The event-heap capture — the conservative whole-heap clone. The
-/// `mem::take`+filter scrub paths (vessel removal, residence
-/// transitions) rewrite the heap wholesale; per-item undo needs every
-/// write site funneled through a recorder, which the scrub sites keep
-/// out of reach — the clone stays the honest capture here (C4a-F5's
-/// arena half rides `VesselsShadow::PerItem` instead).
-type EventsShadow = BinaryHeap<ScheduledEvent>;
+/// The event-heap capture mode — see `TickShadow::event_heap`.
+///
+/// The invariant both modes reconstruct the boundary from is
+/// **`boundary = (heap minus seq ≥ cap) ∪ removed`**: `next_event_seq`
+/// is a strict watermark — every in-scope push consumed it — so pushes
+/// need no undo payload at all, only removals do (C4a-F5).
+enum EventsShadow {
+    /// The whole heap, cloned — the capture for write paths that
+    /// rewrite the heap wholesale: the `mem::take`+filter scrubs
+    /// (vessel removal, residence transitions, project/wake/colony
+    /// event drops) and the tracked-class restamp `.map`, where the
+    /// rewritten set is the scrub's own output. `shadow_events_whole`
+    /// upgrades an `Ops` capture by materializing the boundary heap —
+    /// the invariant above — so a scrub can never strand itself under
+    /// an ops-only record of the pushes it is about to discard.
+    Whole(BinaryHeap<ScheduledEvent>),
+    /// The removal log — entries the scope popped (the fire loop) or
+    /// dropped through an ops-aware path, verbatim. Push undo is the
+    /// `seq ≥ cap` drop; the only hazard is an *unrecorded* removal,
+    /// which is why every `mem::take`+filter site routes through
+    /// `shadow_events_whole` instead of recording — see the enum doc.
+    Ops(Vec<ScheduledEvent>),
+}
 
 /// The M1 fields are **lazy captures**: most iterations mutate neither
 /// the vessel arena nor the event heap (an event-free interval touches
@@ -1660,11 +1676,14 @@ struct TickShadow {
     next_part_instance_id: Option<u64>,
     /// `tracked_vessels` — captured before the first opt-in mutation.
     tracked_vessels: Option<BTreeSet<VesselId>>,
-    /// `event_heap` — captured before the first push/class rewrite.
-    /// `Whole` is the conservative clone (scrub paths rewrite the
-    /// heap wholesale); `Ops` is the per-item undo log the common
-    /// push/pop paths record into — a fired event's few pushes no
-    /// longer clone the whole heap per shadow (C4a-F5).
+    /// `event_heap` — captured before the first heap write. `Ops` is
+    /// the lazy default (`shadow_events`): an alloc-free delta that
+    /// undoes pushes via the `next_event_seq` watermark and removals
+    /// via the recorded verbatim entries — a fired event's reschedule
+    /// no longer clones the whole heap per shadow. `Whole` is what the
+    /// `mem::take`+filter scrub/restamp sites take via
+    /// `shadow_events_whole` — the rewrite paths where enumerating
+    /// drops is the scrub's own work (C4a-F5).
     event_heap: Option<EventsShadow>,
     /// `next_event_seq` — captured with `event_heap`.
     next_event_seq: Option<u64>,
@@ -1784,7 +1803,7 @@ impl TickShadow {
     /// caller on rejection, never here). `issued` counts fold
     /// additively: a committed `issue` is a queue push the
     /// iteration's restore must still pop.
-    #[allow(clippy::cognitive_complexity)]
+    #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
     fn merge_committed(&mut self, committed: TickShadow) {
         match (self.vessels.take(), committed.vessels) {
             // A `Whole` capture means the child may have written any
@@ -1823,8 +1842,34 @@ impl TickShadow {
         if self.tracked_vessels.is_none() {
             self.tracked_vessels = committed.tracked_vessels;
         }
-        if self.event_heap.is_none() {
-            self.event_heap = committed.event_heap;
+        // `event_heap` merge — the `vessels` precedent: earliest wins,
+        // with the mode combinations reconciled:
+        // - parent Whole → already the boundary heap; the child's
+        //   capture adds nothing;
+        // - parent Ops + child Ops → the removal logs concatenate
+        //   (order is irrelevant — restore re-pushes the set);
+        // - parent Ops + child Whole → the child's clone is the heap
+        //   at child-capture, i.e. mid-scope: the boundary heap is
+        //   rebuilt by the enum-doc invariant — drop seq ≥ the
+        //   parent's watermark (in-scope pushes) and re-add the
+        //   parent's recorded removals.
+        match (self.event_heap.take(), committed.event_heap) {
+            (Some(w @ EventsShadow::Whole(_)), _) => self.event_heap = Some(w),
+            (Some(EventsShadow::Ops(mut p)), Some(EventsShadow::Ops(c))) => {
+                p.extend(c);
+                self.event_heap = Some(EventsShadow::Ops(p));
+            }
+            (Some(EventsShadow::Ops(p)), Some(EventsShadow::Whole(w))) => {
+                let cap = self.next_event_seq.unwrap_or(0);
+                let boundary: BinaryHeap<ScheduledEvent> = w
+                    .into_iter()
+                    .filter(|e| e.seq < cap)
+                    .chain(p.into_iter().filter(|e| e.seq < cap))
+                    .collect();
+                self.event_heap = Some(EventsShadow::Whole(boundary));
+            }
+            (o @ Some(_), None) => self.event_heap = o,
+            (None, c) => self.event_heap = c,
         }
         if self.next_event_seq.is_none() {
             self.next_event_seq = committed.next_event_seq;
@@ -1967,7 +2012,28 @@ impl TickShadow {
             world.tracked_vessels = v;
         }
         if let Some(v) = self.event_heap {
-            world.event_heap = v;
+            match v {
+                EventsShadow::Whole(heap) => world.event_heap = heap,
+                // Ops restore — the enum-doc invariant rebuilt live:
+                // drop every in-scope push (`seq ≥ cap`) and re-push
+                // the recorded removals. In-scope pushes that were
+                // themselves removed land in the ops list too — the
+                // `seq < cap` filter on `removed` keeps them out of
+                // the restored heap (they died with the scope). Heap
+                // sift layout is allocator detail (the hash walks
+                // `(tick, seq)` order), so the rebuilt heap needs no
+                // order fidelity beyond contents.
+                EventsShadow::Ops(removed) => {
+                    let cap = self.next_event_seq.unwrap_or(world.next_event_seq);
+                    let mut heap: BinaryHeap<ScheduledEvent> =
+                        std::mem::take(&mut world.event_heap)
+                            .into_iter()
+                            .filter(|e| e.seq < cap)
+                            .collect();
+                    heap.extend(removed.into_iter().filter(|e| e.seq < cap));
+                    world.event_heap = heap;
+                }
+            }
         }
         if let Some(v) = self.next_event_seq {
             world.next_event_seq = v;
@@ -3408,9 +3474,29 @@ impl World {
         }
     }
 
-    /// Lazy-shadow capture for the event heap + seq counter.
+    /// Lazy-shadow capture for the event heap + seq counter — the
+    /// `Ops` mode (alloc-free; push/pop undo by watermark + removal
+    /// log). Write paths that rewrite the heap wholesale must take
+    /// [`Self::shadow_events_whole`] instead — see `EventsShadow`.
     fn shadow_events(&mut self, shadow: &mut TickShadow) {
         shadow_events_split(&self.event_heap, self.next_event_seq, shadow);
+    }
+
+    /// The `shadow_events` variant for wholesale rewrites — every
+    /// `mem::take`+filter scrub and the restamp `.map` take this, so
+    /// an `Ops` capture upgrades to `Whole` by materializing the
+    /// boundary heap rather than leaving drops unrecorded.
+    fn shadow_events_whole(&mut self, shadow: &mut TickShadow) {
+        shadow_events_whole_split(&self.event_heap, self.next_event_seq, shadow);
+    }
+
+    /// Ops-mode bookkeeping: record a verbatim removal (the fire
+    /// loop's pop) so restore can re-push it. No-op under `Whole` —
+    /// the boundary heap is already held.
+    fn record_event_removed(shadow: &mut TickShadow, ev: ScheduledEvent) {
+        if let Some(EventsShadow::Ops(ops)) = shadow.event_heap.as_mut() {
+            ops.push(ev);
+        }
     }
 
     /// Lazy-shadow capture for the M6-D transfer arena + both counters
@@ -3518,7 +3604,7 @@ impl World {
                 // way `apply_to_bubble` does, then restamp the
                 // records to their bubble classes (publish flags
                 // cleared inside).
-                self.shadow_events(shadow);
+                self.shadow_events_whole(shadow);
                 let heap = std::mem::take(&mut self.event_heap);
                 self.event_heap = heap
                     .into_iter()
@@ -4501,7 +4587,7 @@ impl World {
         }
         // Lazy no-op if the drop above already captured the heap —
         // needed when the vessel carried no projects at all.
-        self.shadow_events(shadow);
+        self.shadow_events_whole(shadow);
         let heap = std::mem::take(&mut self.event_heap);
         self.event_heap = heap
             .into_iter()
@@ -4765,7 +4851,7 @@ impl World {
                 // pending SoiTransitions. `class` is not part of the heap
                 // key, so rewriting it via drain/re-heapify keeps the
                 // `(tick, seq)` order intact.
-                self.shadow_events(shadow);
+                self.shadow_events_whole(shadow);
                 let heap = std::mem::take(&mut self.event_heap);
                 self.event_heap = heap
                     .into_iter()
@@ -5867,7 +5953,7 @@ impl World {
         // leaves rails — drop them in one re-heapify pass. M9b: the
         // same scrub covers the dormant `PartFailure`s (vessel-named);
         // the records restamp to their bubble classes next.
-        self.shadow_events(shadow);
+        self.shadow_events_whole(shadow);
         let heap = std::mem::take(&mut self.event_heap);
         self.event_heap = heap
             .into_iter()
@@ -5970,7 +6056,7 @@ impl World {
             .maneuver = Some(node);
         // Replacing a Scheduled node: drop the old pending start event
         // before scheduling the new one — one live event per node.
-        self.shadow_events(shadow);
+        self.shadow_events_whole(shadow);
         let heap = std::mem::take(&mut self.event_heap);
         self.event_heap = heap
             .into_iter()
@@ -6005,7 +6091,7 @@ impl World {
             body.throttle = 0.0;
         }
         v.maneuver = None;
-        self.shadow_events(shadow);
+        self.shadow_events_whole(shadow);
         let heap = std::mem::take(&mut self.event_heap);
         self.event_heap = heap
             .into_iter()
@@ -6109,7 +6195,7 @@ impl World {
         // scrub; the just-fired event is already popped). M9b: the
         // dormant `PartFailure`s ride the same filter, and the
         // records restamp to their bubble classes.
-        self.shadow_events(shadow);
+        self.shadow_events_whole(shadow);
         let heap = std::mem::take(&mut self.event_heap);
         self.event_heap = heap
             .into_iter()
@@ -6475,7 +6561,7 @@ impl World {
             [node].into_iter().collect();
         let tick = self.clock.ticks();
         self.shadow_science(shadow);
-        self.shadow_events(shadow);
+        self.shadow_events_whole(shadow);
         let (_, banked) = self.finalize_projects_on_nodes(vessel, &departing, tick);
         // M7-C: the jettison-finalized projects' accrual pays out —
         // science banked is science banked.
@@ -6585,6 +6671,7 @@ impl World {
                     &craft.parts,
                     csp_phys::ConfigMask(retained_mask),
                     craft_graph_hash(&CraftDef {
+                        hash_memo: Default::default(),
                         graph: retained.clone(),
                         parts: craft.parts.clone(),
                         part_costs: craft.part_costs.clone(),
@@ -6639,6 +6726,7 @@ impl World {
             .get_mut(&vessel)
             .ok_or(SimError::Fatal("undock: vessel vanished"))?;
         v.craft = Some(CraftDef {
+            hash_memo: Default::default(),
             graph: retained,
             parts: craft.parts.clone(),
             part_costs: craft.part_costs.clone(),
@@ -6662,7 +6750,7 @@ impl World {
         // this tick — accrued science banks, and its escrowed remainder
         // lands in the fragment's pool under the lab node.
         research::shadow_science(&self.science, &mut shadow.science);
-        shadow_events_split(&self.event_heap, self.next_event_seq, shadow);
+        shadow_events_whole_split(&self.event_heap, self.next_event_seq, shadow);
         let (frag_science, finalized, banked) = research::split_vessel_science(
             v,
             &frag_nodes,
@@ -6685,6 +6773,7 @@ impl World {
             Vessel {
                 id,
                 craft: Some(CraftDef {
+                    hash_memo: Default::default(),
                     graph: frag_g,
                     parts: craft.parts.clone(),
                     part_costs: craft.part_costs.clone(),
@@ -7243,7 +7332,7 @@ impl World {
             return Err(SimError::Recoverable("script: unknown id"));
         }
         self.shadow_scripts(shadow);
-        self.shadow_events(shadow);
+        self.shadow_events_whole(shadow);
         self.scripts.remove(&id);
         let kept: Vec<ScheduledEvent> = std::mem::take(&mut self.event_heap)
             .into_iter()
@@ -7354,11 +7443,15 @@ impl World {
         while self.event_heap.peek().is_some_and(|e| e.tick <= t_next)
             && batch < MAX_EVENTS_PER_BATCH
         {
-            // Capture BEFORE the pop mutates the heap.
+            // Capture BEFORE the pop mutates the heap — and record
+            // the pop verbatim into the ops log so an iteration
+            // rollback re-pushes it (a no-op under a `Whole`
+            // capture, which already holds the boundary heap).
             self.shadow_events(shadow);
             let Some(event) = self.event_heap.pop() else {
                 break;
             };
+            Self::record_event_removed(shadow, event.clone());
             *processed += 1;
             batch += 1;
             fired.push(event.clone());
@@ -8727,7 +8820,7 @@ impl TickIo for WorldTickIo<'_> {
         // Scrub any pending wake for this script (the strict pair
         // invariant — one wake per script), shadowed like every heap
         // mutation, then schedule the resolved `Clamping` event.
-        shadow_events_split(self.event_heap, *self.next_event_seq, self.shadow);
+        shadow_events_whole_split(self.event_heap, *self.next_event_seq, self.shadow);
         let kept: Vec<ScheduledEvent> = std::mem::take(self.event_heap)
             .into_iter()
             .filter(|e| !matches!(&e.kind, EventKind::ScriptWake { script: s } if *s == script))
@@ -8751,7 +8844,7 @@ impl TickIo for WorldTickIo<'_> {
         if self.bound_script != Some(script) {
             return Err(SimError::Recoverable("wake: script not bound to this io"));
         }
-        shadow_events_split(self.event_heap, *self.next_event_seq, self.shadow);
+        shadow_events_whole_split(self.event_heap, *self.next_event_seq, self.shadow);
         let kept: Vec<ScheduledEvent> = std::mem::take(self.event_heap)
             .into_iter()
             .filter(|e| !matches!(&e.kind, EventKind::ScriptWake { script: s } if *s == script))
@@ -8770,15 +8863,58 @@ impl TickIo for WorldTickIo<'_> {
 /// `step_bubble_range`'s destructure (`let Self { vessels, physics,
 /// .. } = self`) and `apply_breakup`'s parameter list keep `self` out
 /// of reach where the research bookkeeping mutates the heap. Captures
-/// `heap` + `next_event_seq` together, lazily, exactly like the method.
+/// `next_event_seq` lazily, exactly like the method — the `Ops` mode:
+/// the heap itself is not cloned, the scope's pushes undo via the
+/// seq watermark and its (recorded) removals re-push.
 fn shadow_events_split(
+    _heap: &BinaryHeap<ScheduledEvent>,
+    next_event_seq: u64,
+    shadow: &mut TickShadow,
+) {
+    // `Ops` capture never touches the heap — the watermark alone names
+    // the in-scope pushes; the parameter stays for call-site parity
+    // with `shadow_events_whole_split` (and the old whole-clone
+    // signature).
+    if shadow.event_heap.is_none() {
+        shadow.event_heap = Some(EventsShadow::Ops(Vec::new()));
+        shadow.next_event_seq = Some(next_event_seq);
+    }
+}
+
+/// The `World::shadow_events_whole` twin — the wholesale-rewrite
+/// capture for the field-split paths. Captures `Whole` lazily; an
+/// existing `Ops` capture upgrades by materializing the boundary heap
+/// from its invariant (`current minus seq ≥ cap, plus the recorded
+/// removals`) so the rewrite that follows can never strand a removal
+/// the ops log never saw.
+fn shadow_events_whole_split(
     heap: &BinaryHeap<ScheduledEvent>,
     next_event_seq: u64,
     shadow: &mut TickShadow,
 ) {
-    if shadow.event_heap.is_none() {
-        shadow.event_heap = Some(heap.clone());
-        shadow.next_event_seq = Some(next_event_seq);
+    match &mut shadow.event_heap {
+        None => {
+            shadow.event_heap = Some(EventsShadow::Whole(heap.clone()));
+            shadow.next_event_seq = Some(next_event_seq);
+        }
+        Some(slot @ EventsShadow::Ops(_)) => {
+            let cap = shadow.next_event_seq.unwrap_or(next_event_seq);
+            let EventsShadow::Ops(removed) = std::mem::replace(slot, EventsShadow::Ops(Vec::new()))
+            else {
+                unreachable!()
+            };
+            // Both sides of the invariant apply the `seq < cap` gate:
+            // pre-boundary entries out-live it, in-scope pushes and
+            // push-then-removed phantoms die with the scope.
+            let boundary: BinaryHeap<ScheduledEvent> = heap
+                .iter()
+                .filter(|e| e.seq < cap)
+                .cloned()
+                .chain(removed.into_iter().filter(|e| e.seq < cap))
+                .collect();
+            *slot = EventsShadow::Whole(boundary);
+        }
+        Some(EventsShadow::Whole(_)) => {}
     }
 }
 
@@ -9965,13 +10101,27 @@ pub(crate) fn hash_craft(h: &mut StateHasher, craft: &CraftDef) {
 /// state hash uses — a table built for one craft cannot install on
 /// another. `0` when the hash stream faults (non-finite craft data —
 /// weld rejects it anyway).
+///
+/// Memoized on the def (C4a-F4): `aero_tables_stale` asks this of
+/// every `InBubble` vessel every tick, and the full `hash_craft`
+/// blake3 walk is pure waste in the steady state. The memo lives on
+/// the value itself and `Clone` clears it, so the clone-modify-
+/// reassign convention makes a stale hit structurally impossible —
+/// a cleared memo costs one recompute (a spurious *staleness*
+/// verdict is impossible: the memo only ever holds a hash this
+/// exact def produced).
 fn craft_graph_hash(craft: &CraftDef) -> u64 {
+    if let Some(h) = craft.hash_memo.get() {
+        return h;
+    }
     let mut h = StateHasher::new();
     hash_craft(&mut h, craft);
-    match h.finish() {
+    let d = match h.finish() {
         Ok(d) => u64::from_le_bytes(d[..8].try_into().unwrap_or([0; 8])),
         Err(_) => 0,
-    }
+    };
+    craft.hash_memo.set(d);
+    d
 }
 
 /// §2.4.1's staleness predicate, shared by the step's pre-pass and
@@ -10319,6 +10469,7 @@ fn apply_breakup(
             Vessel {
                 id,
                 craft: Some(CraftDef {
+                    hash_memo: Default::default(),
                     graph: frag_g,
                     parts: craft.parts.clone(),
                     part_costs: craft.part_costs.clone(),
@@ -10548,7 +10699,7 @@ fn apply_breakup(
         // The loop below scrubs each finalized project's pending pair
         // out of the heap — capture it first so a later Recoverable
         // restores events and records together.
-        shadow_events_split(event_heap, next_event_seq, shadow);
+        shadow_events_whole_split(event_heap, next_event_seq, shadow);
         for pid in departing {
             let (banked, remnant) =
                 research::finalize_project(science, pid, science_cfg, tick, |p| p.lab_node);
@@ -13004,6 +13155,7 @@ mod tests {
             csp_phys::PartNode::new(None, csp_phys::PartTransform::IDENTITY, 0),
         );
         CraftDef {
+            hash_memo: Default::default(),
             part_ids: vec![],
             graph,
             part_costs: vec![0.0],
@@ -13244,6 +13396,7 @@ mod tests {
             },
         };
         CraftDef {
+            hash_memo: Default::default(),
             part_ids: vec![],
             graph,
             part_costs: vec![0.0; 2],
@@ -14435,6 +14588,7 @@ mod tests {
             csp_phys::PartNode::new(None, csp_phys::PartTransform::IDENTITY, 0),
         );
         CraftDef {
+            hash_memo: Default::default(),
             part_ids: vec![],
             graph,
             part_costs: vec![0.0],
@@ -14595,6 +14749,7 @@ mod tests {
         };
         // Root tough (10 000 K cap), leaf fragile (400 K).
         let craft = CraftDef {
+            hash_memo: Default::default(),
             part_ids: vec![],
             graph,
             part_costs: vec![0.0; 2],
@@ -14701,6 +14856,7 @@ mod tests {
         // Node 2 fragile; its healthy child must still fall with it.
         // Zero conduction isolates each lump's heating.
         let craft = CraftDef {
+            hash_memo: Default::default(),
             part_ids: vec![],
             graph,
             part_costs: vec![0.0; 4],
@@ -14780,6 +14936,7 @@ mod tests {
             ),
         );
         let craft = CraftDef {
+            hash_memo: Default::default(),
             part_ids: vec![],
             graph,
             part_costs: vec![0.0; 3],
@@ -15007,6 +15164,7 @@ mod tests {
             thermal,
         };
         CraftDef {
+            hash_memo: Default::default(),
             part_ids: vec![],
             graph,
             part_costs: vec![0.0; 2],
@@ -15136,6 +15294,7 @@ mod tests {
             );
         }
         CraftDef {
+            hash_memo: Default::default(),
             part_ids: vec![],
             graph,
             part_costs: vec![0.0; chain.len()],
@@ -20439,6 +20598,7 @@ mod tests {
                 ..exploding.clone()
             };
             let craft = CraftDef {
+                hash_memo: Default::default(),
                 part_ids: vec![],
                 graph,
                 part_costs: vec![0.0; 3],
@@ -22273,5 +22433,57 @@ mod tests {
             q.is_some_and(|q| q.units() > 0.0),
             "residence-path burn exit dropped the flight credit"
         );
+    }
+
+    /// C4a-F5: the event-heap `Ops` capture restores the boundary heap
+    /// exactly — pushes undo via the `next_event_seq` watermark and
+    /// recorded removals re-push — and an `Ops`→`Whole` upgrade under
+    /// a wholesale scrub restores the same boundary. Canonical order
+    /// is `(tick, seq)` (the hash's enumeration), so heaps compare as
+    /// sorted vecs, not sift layouts.
+    #[test]
+    fn event_heap_ops_restore_rebuilds_boundary() {
+        let sorted = |w: &World| -> Vec<(u64, u64)> {
+            let mut v: Vec<_> = w.event_heap.iter().map(|e| (e.tick, e.seq)).collect();
+            v.sort();
+            v
+        };
+        let ev = || EventKind::PlayerAlarm { label: "x".into() };
+        // Boundary: two pending events (seqs 0,1) — scheduled under a
+        // scratch shadow that is never restored.
+        let mut w = World::new();
+        let mut scratch = TickShadow::capture(&w);
+        w.schedule_event(ev(), 10, &mut scratch).unwrap();
+        w.schedule_event(ev(), 20, &mut scratch).unwrap();
+        let boundary = sorted(&w);
+        let boundary_seq = w.next_event_seq;
+
+        // Ops scope: one in-scope push, one recorded pop.
+        let mut shadow = TickShadow::capture(&w);
+        w.schedule_event(ev(), 30, &mut shadow).unwrap();
+        let popped = w.event_heap.pop().unwrap();
+        World::record_event_removed(&mut shadow, popped);
+        w.schedule_event(ev(), 40, &mut shadow).unwrap();
+        shadow.restore(&mut w);
+        assert_eq!(sorted(&w), boundary, "ops restore rebuilt the boundary");
+        assert_eq!(w.next_event_seq, boundary_seq);
+
+        // Ops scope that upgrades to Whole mid-scope (a scrub), then
+        // restores: the boundary comes back the same way.
+        let mut shadow = TickShadow::capture(&w);
+        w.schedule_event(ev(), 30, &mut shadow).unwrap();
+        w.shadow_events_whole(&mut shadow);
+        let heap = std::mem::take(&mut w.event_heap);
+        w.event_heap = heap
+            .into_iter()
+            .filter(|e| e.tick != 10)
+            .collect::<BinaryHeap<_>>();
+        shadow.restore(&mut w);
+        assert_eq!(
+            sorted(&w),
+            boundary,
+            "whole-upgraded restore rebuilt the boundary"
+        );
+        assert_eq!(w.next_event_seq, boundary_seq);
     }
 }

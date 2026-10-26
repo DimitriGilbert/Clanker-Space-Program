@@ -113,8 +113,9 @@ pub use techtree::{
 };
 pub use validate::{
     Dataset, PERIOD_REL_TOL, ValidationError, validate_balance, validate_colonies,
-    validate_contract_loc_keys, validate_contracts, validate_dataset, validate_experiment_loc_keys,
-    validate_experiments, validate_loc, validate_loc_keys, validate_part_loc_keys, validate_parts,
-    validate_recipes, validate_resources, validate_site_loc_keys, validate_sites, validate_system,
-    validate_techtree, validate_techtree_loc_keys,
+    validate_colony_loc_keys, validate_contract_loc_keys, validate_contracts, validate_dataset,
+    validate_experiment_loc_keys, validate_experiments, validate_loc, validate_loc_keys,
+    validate_part_loc_keys, validate_parts, validate_recipe_loc_keys, validate_recipes,
+    validate_resources, validate_site_loc_keys, validate_sites, validate_system, validate_techtree,
+    validate_techtree_loc_keys,
 };

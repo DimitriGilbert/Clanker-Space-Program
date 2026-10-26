@@ -26,7 +26,7 @@ primitives cannot bake into real hardware.
 | `Rock035/…_Color.jpg`, `…_NormalGL.jpg` | ambientCG "Rock 035" | CC0-1.0 | https://ambientcg.com/view?id=Rock035 |
 | `Ground080/…_Color.jpg`, `…_NormalGL.jpg` | ambientCG "Ground 080" (beach sand) | CC0-1.0 | https://ambientcg.com/view?id=Ground080 |
 | `Snow010A/…_Color.jpg`, `…_NormalGL.jpg` | ambientCG "Snow 010 A" | CC0-1.0 | https://ambientcg.com/view?id=Snow010A |
-| `Foam002/…_NormalGL.jpg` | ambientCG "Foam 002" (ocean foam → wave normals) | CC0-1.0 | https://ambientcg.com/view?id=Foam002 |
+| `Foam002/…_Color.jpg`, `…_NormalGL.jpg` | ambientCG "Foam 002" (ocean foam → wave normals; the Color map ships unused) | CC0-1.0 | https://ambientcg.com/view?id=Foam002 |
 
 Attribution is not legally required (CC0) but given anyway — thanks
 ambientCG.

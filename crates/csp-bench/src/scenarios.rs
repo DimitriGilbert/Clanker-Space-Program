@@ -287,6 +287,7 @@ pub fn flight_craft() -> csp_sim::CraftDef {
         },
     };
     csp_sim::CraftDef {
+        hash_memo: Default::default(),
         part_ids: vec![],
         graph,
         parts: vec![booster],

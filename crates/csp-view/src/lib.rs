@@ -2098,6 +2098,7 @@ impl View {
             // the spawn gate can resolve each def's `tech_requirement`.
             let part_ids: Vec<csp_data::PartId> = built.iter().map(|b| b.part_id.clone()).collect();
             Ok(csp_sim::CraftDef {
+                hash_memo: Default::default(),
                 graph,
                 parts,
                 part_costs,
@@ -3095,6 +3096,7 @@ fn stock_flight_craft() -> csp_sim::CraftDef {
         ),
     );
     csp_sim::CraftDef {
+        hash_memo: Default::default(),
         part_ids: vec![],
         graph,
         parts: vec![engine, adapter, tank, pod],

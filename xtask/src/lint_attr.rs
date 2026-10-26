@@ -226,7 +226,8 @@ pub fn lint_attribution() {
         .expect("data/ATTRIBUTION.md missing");
     let mut files = Vec::new();
     collect_files(&root.join("data"), "data", &mut files);
-    // §3.7 covers assets/ too; it does not exist yet — walk it when it does.
+    // §3.7 covers the bake sources too — assets/ exists (see
+    // assets/ASSETS.md) and is walked like data/.
     if root.join("assets").is_dir() {
         collect_files(&root.join("assets"), "assets", &mut files);
     }

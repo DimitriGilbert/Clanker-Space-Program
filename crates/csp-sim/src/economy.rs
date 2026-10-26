@@ -1007,6 +1007,7 @@ mod tests {
             csp_phys::PartNode::new(None, csp_phys::PartTransform::IDENTITY, 0),
         );
         CraftDef {
+            hash_memo: Default::default(),
             part_ids: vec![],
             graph,
             parts: vec![csp_phys::WeldPart {

@@ -105,6 +105,11 @@ use crate::SimError;
 /// `EventKind::{ResearchDataExhausted, ResearchProjectComplete}` land
 /// as append-only discriminants 7–8; the goldens rebless.
 ///
+/// **Version 12** (M7-B): the world walk appended the §3.3/§3.4 tech
+/// record — the researched node set, purchased upgrade-track levels,
+/// and family qualification records (`tech::hash_tech`). No variant or
+/// discriminant changes; the goldens rebless.
+///
 /// **Version 13** (M7-C): the world walk appended the §3.5 economy
 /// book — funds micro-units, the insolvency flag, the crew roster,
 /// the site inventory arena, and the serialized economy tunables
@@ -112,11 +117,6 @@ use crate::SimError;
 /// hashed — the `command_log` precedent); `EventKind` gained
 /// `SalaryDue` (9) and `Insolvent` (10) — new heap entries; and
 /// `hash_craft` walks the frozen `part_costs` table.
-///
-/// **Version 12** (M7-B): the world walk appended the §3.3/§3.4 tech
-/// record — the researched node set, purchased upgrade-track levels,
-/// and family qualification records (`tech::hash_tech`). No variant or
-/// discriminant changes; the goldens rebless.
 ///
 /// **Version 14** (M8-A): the world walk appended the §3.5.1 colony
 /// book — `next_colony_id` and the colony arena

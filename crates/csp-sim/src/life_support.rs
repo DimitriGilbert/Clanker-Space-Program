@@ -239,7 +239,7 @@ impl World {
         // depletion is a committed transition only while the
         // subsystem that scheduled it lives; a colony-side straggler
         // would fire one tick out and kill while disabled).
-        self.shadow_events(shadow);
+        self.shadow_events_whole(shadow);
         let heap = std::mem::take(&mut self.event_heap);
         self.event_heap = heap
             .into_iter()
@@ -455,6 +455,7 @@ mod tests {
             PartNode::new(None, PartTransform::IDENTITY, 0),
         );
         crate::CraftDef {
+            hash_memo: Default::default(),
             part_ids: vec![],
             graph,
             parts: vec![csp_phys::WeldPart {

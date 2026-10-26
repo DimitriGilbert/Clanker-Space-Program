@@ -1808,8 +1808,16 @@ fn resolve_weld_input(
                 // The consumption half rides the weld view too — the
                 // sim's per-tick propellant bookkeeping debits
                 // `throttle·rated/(isp_vac·g₀)` split by the resolved
-                // mass fractions (validator: at most one Engine module
-                // per part, mirrored by `check_engine_propellants`).
+                // mass fractions. At most one Engine module per part:
+                // the validator enforces it (`csp_data::validate`'s
+                // module-count rule), and an unvalidated def gets the
+                // same typed refusal here — the alternative is two
+                // disagreeing reads (this loop last-wins on `engine`
+                // while `ReliabilitySpec::from_effective` first-wins
+                // on `rated_burn_s`/`ignitions`).
+                if engine.is_some() {
+                    return Err(bad("resolve: more than one Engine module on a part"));
+                }
                 engine = Some(crate::part::EngineSpec {
                     isp_vac_s: *isp_vac_s,
                     propellants: propellants.clone(),
@@ -2561,6 +2569,20 @@ mod tests {
                 part_id: PartId::from("test.engine.unit"),
                 field,
             }
+        );
+    }
+
+    /// A second `Engine` module is ambiguous authored data — this loop
+    /// used to last-win on `engine` while `from_effective` first-wins
+    /// on `rated_burn_s`/`ignitions`; now it is a typed refusal (the
+    /// `Lab` rule's shape).
+    #[test]
+    fn second_engine_module_is_refused() {
+        let mut def = test_def();
+        def.modules.push(def.modules[0].clone());
+        assert_invalid_stat(
+            resolve_stock(&def),
+            "resolve: more than one Engine module on a part",
         );
     }
 

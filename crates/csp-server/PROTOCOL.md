@@ -48,9 +48,12 @@ a running game — that path is HTTP-only by §2.12.1's decision.
 Additive-only within the major version; a tool never silently changes
 semantics. Session-class tools declare `"class": "session"` in their
 descriptor and are **not replay-relevant**: `session.list_saves`,
-`session.save`, `session.load`, `session.snapshot`. Everything else is
-sim-class and maps to `SimCommand`s (stamped `source_class=External`,
-one-tick latency, §2.2.1 control lease) or telemetry reads.
+`session.save`, `session.load`, `session.snapshot`, and the M9d
+dashboard sidecar `dashboard.list`, `dashboard.get`, `dashboard.save`
+(dashboards are host-side documents — never in the save, the command
+log, or the hash). Everything else is sim-class and maps to
+`SimCommand`s (stamped `source_class=External`, one-tick latency,
+§2.2.1 control lease) or telemetry reads.
 
 ## Security (normative, not optional)
 

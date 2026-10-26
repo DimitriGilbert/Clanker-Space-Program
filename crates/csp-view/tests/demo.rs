@@ -75,7 +75,7 @@ fn demo_dataset_loads_and_validates() {
         csp_data::validate_loc(&loc).is_empty(),
         "demo set: loc/en.ron invalid"
     );
-    let loc_cases: [(&str, Vec<csp_data::ValidationError>); 6] = [
+    let loc_cases: [(&str, Vec<csp_data::ValidationError>); 8] = [
         ("system loc", csp_data::validate_loc_keys(&sys, &loc)),
         ("site loc", csp_data::validate_site_loc_keys(&sites, &loc)),
         (
@@ -93,6 +93,14 @@ fn demo_dataset_loads_and_validates() {
         (
             "contract loc",
             csp_data::validate_contract_loc_keys(&contracts, &loc),
+        ),
+        (
+            "recipe loc",
+            csp_data::validate_recipe_loc_keys(&recipes, &loc),
+        ),
+        (
+            "colony loc",
+            csp_data::validate_colony_loc_keys(&colonies, &loc),
         ),
     ];
     for (name, errors) in loc_cases {

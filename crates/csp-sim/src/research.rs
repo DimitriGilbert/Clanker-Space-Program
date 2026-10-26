@@ -580,7 +580,7 @@ pub(crate) fn drop_vessel_projects(
         return;
     }
     shadow_science(science, &mut shadow.science);
-    crate::shadow_events_split(heap, next_event_seq, shadow);
+    crate::shadow_events_whole_split(heap, next_event_seq, shadow);
     science.projects.retain(|_, p| p.vessel != vessel);
     let kept: Vec<_> = std::mem::take(heap)
         .into_iter()
@@ -1062,7 +1062,7 @@ impl World {
         }
         self.shadow_science(shadow);
         self.shadow_vessels(shadow);
-        self.shadow_events(shadow);
+        self.shadow_events_whole(shadow);
         let tick = self.clock.ticks();
         let owner = self.science.projects.get(&project).map(|p| p.vessel);
         let (banked, remnant) =

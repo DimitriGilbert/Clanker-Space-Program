@@ -824,6 +824,7 @@ mod tests {
             engine: None,
         };
         let craft = |ids: Vec<PartId>| crate::CraftDef {
+            hash_memo: Default::default(),
             graph: csp_phys::PartGraph::new(csp_phys::PartNodeId(0)),
             parts: vec![lump()],
             part_costs: vec![1.0],
@@ -841,6 +842,7 @@ mod tests {
         );
         // Empty identity is the ungated convention.
         let anon = crate::CraftDef {
+            hash_memo: Default::default(),
             graph: csp_phys::PartGraph::new(csp_phys::PartNodeId(0)),
             parts: vec![],
             part_costs: vec![],

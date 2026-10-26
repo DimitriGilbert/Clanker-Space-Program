@@ -92,6 +92,16 @@ pub fn stream(save_seed: u64, key: StreamKey) -> ChaCha8Rng {
 /// draw on every platform.
 pub fn uniform(save_seed: u64, key: StreamKey) -> f64 {
     let mut rng = stream(save_seed, key);
+    uniform01(&mut rng)
+}
+
+/// The `[0, 1)` draw applied to a stream position — top 53 bits of the
+/// next `u64` scaled by 2⁻⁵³. [`uniform`] is this applied to the first
+/// position of a key-derived stream; consumers that need several draws
+/// from one seeded stream (a fixed draw order, not per-key reseeding)
+/// call this directly so the determinism-critical constants (shift 11,
+/// 53-bit precision, 2⁻⁵³ scale) exist exactly once.
+pub fn uniform01(rng: &mut impl Rng) -> f64 {
     (rng.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
 }
 

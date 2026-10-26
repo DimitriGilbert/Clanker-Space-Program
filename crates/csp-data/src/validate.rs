@@ -179,6 +179,60 @@ pub enum ValidationError {
         /// The child's apoapsis `a·(1+e)` (m).
         apoapsis_m: f64,
     },
+    /// A parented body declares no `soi_m` — `None` reads as infinite
+    /// (the star's case), which on a satellite swallows its own parent.
+    SoiMissing {
+        /// The body.
+        body: String,
+    },
+    /// §3.0 rule: a child's periapsis must clear the parent's surface.
+    PeriapsisInsideParent {
+        /// The parent whose surface the orbit dips under.
+        parent: String,
+        /// The child orbiting through it.
+        child: String,
+        /// The child's periapsis `a·(1−e)` (m, center-to-center).
+        periapsis_m: f64,
+        /// `parent.radius_m + child.radius_m` — the clearance the
+        /// periapsis must exceed.
+        clearance_m: f64,
+    },
+    /// §3.0 rule: a body's own SOI must nest inside its own orbit —
+    /// `soi ≥ periapsis` puts the parent inside the child's SOI at
+    /// closest approach.
+    SoiExceedsOrbit {
+        /// The body.
+        body: String,
+        /// Its authored SOI (m).
+        soi_m: f64,
+        /// Its own periapsis `a·(1−e)` (m).
+        periapsis_m: f64,
+    },
+    /// §3.0 rule: two siblings' SOI spheres must not overlap. Flagged
+    /// only when their orbital radial shells are disjoint (the provable
+    /// static bound): `soi_a + soi_b` exceeds the shell gap.
+    SiblingSoiOverlap {
+        /// The shared parent.
+        parent: String,
+        /// The lower-id sibling.
+        a: String,
+        /// The other sibling.
+        b: String,
+        /// The gap between the two radial shells (m).
+        gap_m: f64,
+        /// `soi_a + soi_b` (m).
+        soi_sum_m: f64,
+    },
+    /// A `surface_resources` key is not a `resources.ron` id — the one
+    /// `ResourceId` cross-ref `validate_system` cannot check (the
+    /// resource file lives outside the system directory); gated in
+    /// [`validate_dataset`] instead.
+    UnknownSurfaceResource {
+        /// The body authoring the unknown key.
+        body: String,
+        /// The unknown resource ID.
+        resource: String,
+    },
     /// §3.0 rule: `period_s` must match `2π√(a³/μ_parent)` within
     /// [`PERIOD_REL_TOL`] relative.
     PeriodInconsistent {
@@ -338,6 +392,19 @@ pub enum ValidationError {
         stat: &'static str,
         /// The offending value.
         value: f64,
+    },
+    /// A variant multiplies a [`crate::part::StatPath`] the part def
+    /// does not carry — `resolve_built_part` fails this with
+    /// `UnresolvableStatPath` at manufacture, so it must not validate
+    /// green (the same `base_value(def)` predicate the tech-tree
+    /// upgrade-track check runs).
+    UnresolvableVariantStat {
+        /// The part.
+        part: String,
+        /// The variant.
+        variant: String,
+        /// `StatPath::name` of the path that does not resolve.
+        stat: &'static str,
     },
     /// The `scale` rule is malformed: a `Discrete` list empty,
     /// non-positive, unsorted, or missing the `1.0` baseline; or a
@@ -638,6 +705,43 @@ impl fmt::Display for ValidationError {
                 f,
                 "{child:?} apoapsis {apoapsis_m} m exceeds parent {parent:?} SOI {soi_m} m"
             ),
+            Self::SoiMissing { body } => write!(
+                f,
+                "{body:?}: parented body declares no soi_m — a non-star SOI is never unbounded"
+            ),
+            Self::PeriapsisInsideParent {
+                parent,
+                child,
+                periapsis_m,
+                clearance_m,
+            } => write!(
+                f,
+                "{child:?} periapsis {periapsis_m} m does not clear parent {parent:?} + own radius {clearance_m} m"
+            ),
+            Self::SoiExceedsOrbit {
+                body,
+                soi_m,
+                periapsis_m,
+            } => write!(
+                f,
+                "{body:?}: soi_m {soi_m} m reaches its own periapsis {periapsis_m} m — SOI must nest inside the orbit"
+            ),
+            Self::SiblingSoiOverlap {
+                parent,
+                a,
+                b,
+                gap_m,
+                soi_sum_m,
+            } => write!(
+                f,
+                "siblings {a:?} and {b:?} of {parent:?}: SOI sum {soi_sum_m} m exceeds the {gap_m} m shell gap — spheres can overlap"
+            ),
+            Self::UnknownSurfaceResource { body, resource } => {
+                write!(
+                    f,
+                    "{body:?}.surface_resources: resource {resource:?} is not in resources.ron"
+                )
+            }
             Self::PeriodInconsistent {
                 body,
                 authored_s,
@@ -702,6 +806,7 @@ impl fmt::Display for ValidationError {
             | Self::DuplicateVariantId { .. }
             | Self::DuplicateVariantStat { .. }
             | Self::BadVariantMultiplier { .. }
+            | Self::UnresolvableVariantStat { .. }
             | Self::BadScaleRule { .. }
             | Self::BadAttachNode { .. }
             | Self::CategoryModuleMismatch { .. }
@@ -782,6 +887,16 @@ impl ValidationError {
                 write!(
                     f,
                     "{part:?}: variant {variant:?} multiplier on {stat} is {value}, expected finite > 0"
+                )
+            }
+            Self::UnresolvableVariantStat {
+                part,
+                variant,
+                stat,
+            } => {
+                write!(
+                    f,
+                    "{part:?}: variant {variant:?} multiplies {stat}, which this part def does not carry"
                 )
             }
             Self::BadScaleRule { part, reason } => {
@@ -1203,8 +1318,18 @@ fn check_body_fields(b: &crate::load::LoadedBody, out: &mut Vec<ValidationError>
     check_positive(body, "radius_m", b.def.radius_m, out);
     check_positive(body, "mu_m3_per_s2", b.def.mu_m3_per_s2, out);
     check_finite(body, "tilt_rad", b.def.tilt_rad, out);
-    if let Some(soi) = b.def.soi_m {
-        check_positive(body, "soi_m", soi, out);
+    match b.def.soi_m {
+        Some(soi) => check_positive(body, "soi_m", soi, out),
+        // `None` reads as infinite — the star's case (`BodyDef::soi_m`'s
+        // doc). On a parented body an unbounded SOI swallows the whole
+        // system: nothing inside can ever transition out, and the
+        // child-side geometry rules in [`check_orbit_rules`] would have
+        // no finite boundary to check against (silently skipped there
+        // before this gate existed).
+        None if b.def.parent.is_some() => out.push(ValidationError::SoiMissing {
+            body: body.to_string(),
+        }),
+        None => {}
     }
     if let Some(rot) = b.def.rotation_period_s {
         check_positive(body, "rotation_period_s", rot, out);
@@ -1245,9 +1370,13 @@ fn check_file_refs(b: &crate::load::LoadedBody, out: &mut Vec<ValidationError>) 
     }
 }
 
-/// Orbit-element sanity plus the two §3.0 orbital rules: child apoapsis
-/// inside parent SOI, and `period_s` consistent with `2π√(a³/μ_parent)`
-/// to [`PERIOD_REL_TOL`] relative.
+/// Orbit-element sanity plus the §3.0 orbital rules: child apoapsis
+/// inside parent SOI, `period_s` consistent with `2π√(a³/μ_parent)`
+/// to [`PERIOD_REL_TOL`] relative, and the patched-conics geometry the
+/// apoapsis rule alone does not cover — periapsis above the parent's
+/// surface, the child's own SOI nested inside its own orbit, and
+/// sibling SOIs that cannot overlap while their radial shells stay
+/// disjoint.
 fn check_orbit_rules(b: &crate::load::LoadedBody, defs: &DefMap, out: &mut Vec<ValidationError>) {
     let body = b.def.id.as_str();
     let Some(o) = &b.def.orbit else { return };
@@ -1274,6 +1403,7 @@ fn check_orbit_rules(b: &crate::load::LoadedBody, defs: &DefMap, out: &mut Vec<V
         return;
     };
     let apoapsis = o.semi_major_axis_m * (1.0 + o.eccentricity);
+    let periapsis = o.semi_major_axis_m * (1.0 - o.eccentricity);
     if let Some(soi) = p.def.soi_m
         && apoapsis >= soi
     {
@@ -1284,6 +1414,35 @@ fn check_orbit_rules(b: &crate::load::LoadedBody, defs: &DefMap, out: &mut Vec<V
             apoapsis_m: apoapsis,
         });
     }
+    // A moon with a periapsis under the parent's surface is an authored
+    // orbit through solid ground — `periapsis` is center-to-center, so
+    // the clearance is both radii. (Non-finite `a`/`e` was already
+    // reported above; NaN comparisons are false, so this never
+    // double-reports.)
+    let clearance = p.def.radius_m + b.def.radius_m;
+    if periapsis <= clearance {
+        out.push(ValidationError::PeriapsisInsideParent {
+            parent: p.def.id.as_str().to_string(),
+            child: body.to_string(),
+            periapsis_m: periapsis,
+            clearance_m: clearance,
+        });
+    }
+    // The body's own SOI must nest strictly inside its own orbit:
+    // `soi >= periapsis` means the SOI sphere reaches its parent at
+    // closest approach — every vessel near the parent is then also
+    // inside the child's SOI (and the §2.6.6 transition scan sees a
+    // parent-inside-child contradiction).
+    if let Some(soi) = b.def.soi_m
+        && soi >= periapsis
+    {
+        out.push(ValidationError::SoiExceedsOrbit {
+            body: body.to_string(),
+            soi_m: soi,
+            periapsis_m: periapsis,
+        });
+    }
+    check_sibling_soi_overlap(b, defs, out);
     // T = 2π√(a³/μ_parent). libm::sqrt: f64::sqrt is banned by this
     // crate's clippy.toml (§8.2 determinism lints).
     let a = o.semi_major_axis_m;
@@ -1295,6 +1454,63 @@ fn check_orbit_rules(b: &crate::load::LoadedBody, defs: &DefMap, out: &mut Vec<V
             authored_s: o.period_s,
             computed_s: computed,
         });
+    }
+}
+
+/// §3.0 sibling rule: two children of one parent whose SOI spheres can
+/// overlap. The statically provable shape is *disjoint radial shells*:
+/// while `[rp_x, apo_x]` and `[rp_y, apo_y]` do not overlap, the bodies'
+/// center distance is bounded below by the shell gap regardless of
+/// inclination, so `soi_x + soi_y > gap` means the spheres can meet at
+/// closest approach (the §2.6.6 scan then sees a vessel inside two
+/// sibling SOIs at once — an ambiguous transition). Overlapping shells
+/// prove nothing statically — inclined orbits can share a radial range
+/// without ever nearing — so those pairs are not flagged here.
+///
+/// Runs once per unordered pair: `b` reports only siblings whose id
+/// sorts after its own. Siblings with `soi_m: None` (infinite) are
+/// already flagged by the `SoiMissing` gate and skipped here.
+fn check_sibling_soi_overlap(
+    b: &crate::load::LoadedBody,
+    defs: &DefMap,
+    out: &mut Vec<ValidationError>,
+) {
+    let (Some(o), Some(soi)) = (&b.def.orbit, b.def.soi_m) else {
+        return;
+    };
+    let rp = o.semi_major_axis_m * (1.0 - o.eccentricity);
+    let apo = o.semi_major_axis_m * (1.0 + o.eccentricity);
+    for s in defs.values() {
+        if s.def.id == b.def.id || s.def.parent != b.def.parent {
+            continue;
+        }
+        // Each unordered pair reports exactly once, under the sibling
+        // whose id sorts first.
+        if b.def.id.as_str() > s.def.id.as_str() {
+            continue;
+        }
+        let (Some(so), Some(s_soi)) = (&s.def.orbit, s.def.soi_m) else {
+            continue;
+        };
+        let s_rp = so.semi_major_axis_m * (1.0 - so.eccentricity);
+        let s_apo = so.semi_major_axis_m * (1.0 + so.eccentricity);
+        // The gap between the shells, positive only when they are
+        // disjoint (the lower orbit's apoapsis below the higher's
+        // periapsis); overlapping shells → not statically provable.
+        let gap = (rp - s_apo).max(s_rp - apo);
+        if gap > 0.0 && soi + s_soi > gap {
+            out.push(ValidationError::SiblingSoiOverlap {
+                parent: b
+                    .def
+                    .parent
+                    .as_ref()
+                    .map_or_else(String::new, |p| p.as_str().to_string()),
+                a: b.def.id.as_str().to_string(),
+                b: s.def.id.as_str().to_string(),
+                gap_m: gap,
+                soi_sum_m: soi + s_soi,
+            });
+        }
     }
 }
 
@@ -1996,6 +2212,28 @@ pub fn validate_recipes(
     out
 }
 
+/// Loc resolution for the recipe set (the [`validate_site_loc_keys`]
+/// pattern): every recipe's `display_name` must resolve in `en.ron`.
+/// Separate from [`validate_recipes`] because the loc file lives
+/// outside the recipes directory.
+pub fn validate_recipe_loc_keys(
+    loaded: &crate::load::LoadedRecipes,
+    loc: &LocFile,
+) -> Vec<ValidationError> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for lr in &loaded.recipes {
+        let key = &lr.def.display_name;
+        if seen.insert(key.as_str().to_string()) && !loc.contains(key) {
+            out.push(ValidationError::UnresolvedLocKey {
+                context: format!("recipe {}", lr.def.id),
+                key: key.as_str().to_string(),
+            });
+        }
+    }
+    out
+}
+
 fn bad_colony(site: &str, reason: String, out: &mut Vec<ValidationError>) {
     out.push(ValidationError::InvalidColony {
         site: site.to_string(),
@@ -2270,6 +2508,28 @@ pub fn validate_colonies(
                     &mut out,
                 );
             }
+        }
+    }
+    out
+}
+
+/// Loc resolution for the colony set (the [`validate_site_loc_keys`]
+/// pattern): every colony's `display_name` must resolve in `en.ron`.
+/// Separate from [`validate_colonies`] because the loc file lives
+/// outside the system directory.
+pub fn validate_colony_loc_keys(
+    file: &crate::colony::ColonyFile,
+    loc: &LocFile,
+) -> Vec<ValidationError> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for c in &file.colonies {
+        let key = &c.display_name;
+        if seen.insert(key.as_str().to_string()) && !loc.contains(key) {
+            out.push(ValidationError::UnresolvedLocKey {
+                context: format!("colony at site {}", c.site),
+                key: key.as_str().to_string(),
+            });
         }
     }
     out
@@ -2569,6 +2829,18 @@ fn check_variants(part: &PartDef, out: &mut Vec<ValidationError>) {
                     value: *m,
                 });
             }
+            // `csp_phys::resolve`'s `UnresolvableStatPath` gate, mirrored
+            // with its own predicate (`StatPath::base_value` — the same
+            // call `check_tree_tracks` runs for upgrade tracks): a
+            // multiplier on a stat the def lacks loads green today and
+            // only fails at manufacture.
+            if stat.base_value(part).is_none() {
+                out.push(ValidationError::UnresolvableVariantStat {
+                    part: part_id.to_string(),
+                    variant: v.id.as_str().to_string(),
+                    stat: stat.name(),
+                });
+            }
         }
     }
 }
@@ -2792,7 +3064,12 @@ fn check_engine_module(
     } else {
         check_resource_list(part_id, "engine.propellants", propellants, res, out);
         let sum: f64 = propellants.iter().map(|(_, f)| f).sum();
-        if sum.is_finite() && (sum - 1.0).abs() > PROPELLANT_SUM_TOL {
+        // `csp_phys::resolve::check_engine_propellants`' gate, mirrored
+        // with the same polarity: a non-finite sum (two authored
+        // fractions can overflow to +inf at ~1e308 apiece) is a
+        // rejection, not a pass — the resolver errors on it, so the
+        // validator must too.
+        if !(sum.is_finite() && (sum - 1.0).abs() <= PROPELLANT_SUM_TOL) {
             out.push(ValidationError::BadModule {
                 part: part_id.to_string(),
                 reason: "propellant mass fractions do not sum to 1",
@@ -3175,6 +3452,15 @@ pub fn validate_experiments(
             out.push(ValidationError::BadExperiment {
                 experiment: d.id.as_str().to_string(),
                 reason: "transmit_ratio outside the authored 0.2-1.0 band",
+            });
+        }
+        // No caps at all means `cap_for` returns `None` in every
+        // context — the experiment can never pay out anywhere (the
+        // recipe-side "produces nothing" rule's shape).
+        if d.caps.is_empty() {
+            out.push(ValidationError::BadExperiment {
+                experiment: d.id.as_str().to_string(),
+                reason: "caps is empty — the experiment runs in no context",
             });
         }
         let mut covered: BTreeSet<(&str, crate::part::Situation)> = BTreeSet::new();
@@ -3962,7 +4248,33 @@ pub fn validate_dataset(d: &Dataset<'_>) -> Vec<ValidationError> {
     out.extend(validate_experiment_loc_keys(d.experiments, d.loc));
     out.extend(validate_techtree_loc_keys(d.techtree, d.loc));
     out.extend(validate_contract_loc_keys(d.contracts, d.loc));
+    out.extend(validate_recipe_loc_keys(d.recipes, d.loc));
+    out.extend(validate_colony_loc_keys(d.colonies, d.loc));
+    check_surface_resources(d.system, d.resources, &mut out);
     out
+}
+
+/// `surface_resources` `ResourceId` keys must exist in `resources.ron`.
+/// Lives here rather than in [`validate_system`] for the same reason
+/// the loc gates live outside it: the resource file is not part of the
+/// system directory, so `validate_system`'s signature cannot express
+/// the check (the per-map `png` name refs are checked there — the
+/// keys were the skipped half).
+fn check_surface_resources(
+    sys: &crate::load::LoadedSystem,
+    res: &ResourceFile,
+    out: &mut Vec<ValidationError>,
+) {
+    for b in &sys.bodies {
+        for (r, _) in &b.def.surface_resources {
+            if !res.contains(r) {
+                out.push(ValidationError::UnknownSurfaceResource {
+                    body: b.def.id.as_str().to_string(),
+                    resource: r.as_str().to_string(),
+                });
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4072,6 +4384,93 @@ mod tests {
         assert!(
             errs.iter()
                 .any(|e| matches!(e, ValidationError::SoiTooSmall { .. })),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn periapsis_under_parent_surface_is_rejected() {
+        let mut sys = fixture();
+        // e ≈ 0.9999 on a = 1e9 puts periapsis at ~1e5 m — under the
+        // star's 1e6 m radius (the period check keys on `a`, unchanged).
+        planet(&mut sys).orbit.as_mut().unwrap().eccentricity = 0.9999;
+        let errs = validate_system(&sys);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::PeriapsisInsideParent { .. })),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn non_star_soi_missing_is_rejected() {
+        let mut sys = fixture();
+        // `soi_m: None` on the planet reads as an infinite SOI — the
+        // child-geometry rule then has nothing finite to check.
+        planet(&mut sys).soi_m = None;
+        let errs = validate_system(&sys);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::SoiMissing { .. })),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn own_soi_reaching_own_periapsis_is_rejected() {
+        let mut sys = fixture();
+        // 2e9 m SOI on a 1e9 m periapsis orbit — the star is inside the
+        // planet's SOI at closest approach.
+        planet(&mut sys).soi_m = Some(2.0e9);
+        let errs = validate_system(&sys);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::SoiExceedsOrbit { .. })),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn overlapping_sibling_sois_are_rejected_once() {
+        let mut sys = fixture();
+        // A second child of the star on a disjoint outer shell:
+        // [1e9] vs [1.5e9] — a 5e8 m gap. 1e8 + 5e8 SOIs exceed it.
+        let mut outer = sys.bodies[1].clone();
+        outer.def.id = "outer".into();
+        outer.def.soi_m = Some(5.0e8);
+        let a = 1.5e9;
+        let mu_star = sys.bodies[0].def.mu_m3_per_s2;
+        let o = outer.def.orbit.as_mut().unwrap();
+        o.semi_major_axis_m = a;
+        o.period_s = 2.0 * core::f64::consts::PI * libm::sqrt(a * a * a / mu_star);
+        sys.bodies.push(outer);
+        sys.system.bodies.push("outer".into());
+        let errs = validate_system(&sys);
+        let hits = errs
+            .iter()
+            .filter(|e| matches!(e, ValidationError::SiblingSoiOverlap { .. }))
+            .count();
+        assert_eq!(hits, 1, "the unordered pair reports exactly once: {errs:?}");
+    }
+
+    #[test]
+    fn disjoint_shell_sois_inside_the_gap_pass() {
+        let mut sys = fixture();
+        // Same outer sibling but with a small SOI: 1e8 + 1e8 < 5e8 gap.
+        let mut outer = sys.bodies[1].clone();
+        outer.def.id = "outer".into();
+        let a = 1.5e9;
+        let mu_star = sys.bodies[0].def.mu_m3_per_s2;
+        let o = outer.def.orbit.as_mut().unwrap();
+        o.semi_major_axis_m = a;
+        o.period_s = 2.0 * core::f64::consts::PI * libm::sqrt(a * a * a / mu_star);
+        sys.bodies.push(outer);
+        sys.system.bodies.push("outer".into());
+        let errs = validate_system(&sys);
+        assert!(
+            !errs
+                .iter()
+                .any(|e| matches!(e, ValidationError::SiblingSoiOverlap { .. })),
             "{errs:?}"
         );
     }
@@ -4688,6 +5087,40 @@ mod tests {
         assert!(
             errs.iter()
                 .any(|e| matches!(e, ValidationError::BadVariantMultiplier { .. })),
+            "{errs:?}"
+        );
+        // A stat path the def does not carry — `resolve_built_part`
+        // would fail it at manufacture (`UnresolvableStatPath`).
+        let mut d = part_fixture();
+        d.variants[0].stat_multipliers = vec![(StatPath::ControlTorqueNm, 1.5)];
+        let errs = part_errors(d);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::UnresolvableVariantStat { .. })),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn propellant_fraction_overflow_is_rejected() {
+        // Two finite positive fractions whose sum overflows to +inf:
+        // the resolver's gate rejects it, so the validator must too —
+        // the pre-fix `sum.is_finite() && …` form passed it green.
+        let mut d = part_fixture();
+        let ModuleDef::Engine { propellants, .. } = &mut d.modules[0] else {
+            unreachable!()
+        };
+        *propellants = vec![
+            ("liquid_fuel".into(), 1.0e308),
+            ("oxidizer".into(), 1.0e308),
+        ];
+        let errs = part_errors(d);
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::BadModule { reason, .. }
+                    if *reason == "propellant mass fractions do not sum to 1"
+            )),
             "{errs:?}"
         );
     }
@@ -5449,6 +5882,104 @@ mod tests {
         assert!(
             errs.iter()
                 .any(|e| matches!(e, ValidationError::SchemaVersion { found: 0, .. })),
+            "{errs:?}"
+        );
+    }
+
+    /// An experiment with no `caps` validates green no longer —
+    /// `cap_for` returns `None` for every context, so the kind can
+    /// never pay out anywhere.
+    #[test]
+    fn experiment_with_no_caps_is_rejected() {
+        let loaded = crate::load::LoadedExperiments {
+            experiments: vec![crate::load::LoadedExperiment {
+                path: PathBuf::from("exp.test.ron"),
+                def: crate::experiment::ExperimentDef {
+                    schema_version: crate::experiment::EXPERIMENT_SCHEMA_VERSION,
+                    id: "exp.test".into(),
+                    display_name: "exp.test.name".into(),
+                    transmit_ratio: 0.5,
+                    caps: Vec::new(),
+                },
+            }],
+        };
+        let errs = validate_experiments(&loaded, &fixture());
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::BadExperiment { experiment, .. } if experiment == "exp.test"
+            )),
+            "{errs:?}"
+        );
+    }
+
+    /// The `surface_resources` `ResourceId` keys resolve against
+    /// `resources.ron` — gated in [`validate_dataset`]'s
+    /// `check_surface_resources` (the resource file lives outside the
+    /// system directory, so `validate_system` itself cannot express
+    /// the check).
+    #[test]
+    fn unknown_surface_resource_is_rejected() {
+        let mut sys = fixture();
+        sys.bodies[1].def.surface_resources = vec![(
+            "unobtainium".into(),
+            crate::system::ConcentrationMapRef {
+                png: "ore.png".to_string(),
+            },
+        )];
+        let mut out = Vec::new();
+        check_surface_resources(&sys, &res_fixture(), &mut out);
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, ValidationError::UnknownSurfaceResource { .. })),
+            "{out:?}"
+        );
+        // The fixture's empty `surface_resources` reports nothing.
+        let mut out = Vec::new();
+        check_surface_resources(&fixture(), &res_fixture(), &mut out);
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    /// Colony and recipe `display_name` keys get the same loc gate
+    /// every other LocKey-carrying file already had.
+    #[test]
+    fn colony_and_recipe_loc_keys_are_checked() {
+        let loc = LocFile {
+            schema_version: SCHEMA_VERSION,
+            strings: BTreeMap::new(),
+        };
+        let colonies = crate::colony::ColonyFile {
+            schema_version: crate::colony::COLONY_SCHEMA_VERSION,
+            colonies: vec![crate::colony::ColonyDef {
+                site: "site.pad".into(),
+                display_name: "colony.pad.name".into(),
+                modules: Vec::new(),
+                stores: Vec::new(),
+            }],
+        };
+        let errs = validate_colony_loc_keys(&colonies, &loc);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::UnresolvedLocKey { key, .. } if key == "colony.pad.name")),
+            "{errs:?}"
+        );
+
+        let recipes = crate::load::LoadedRecipes {
+            recipes: vec![crate::load::LoadedRecipe {
+                path: PathBuf::from("recipe.test.ron"),
+                def: crate::recipe::RecipeDef {
+                    schema_version: crate::recipe::RECIPE_SCHEMA_VERSION,
+                    id: "recipe.test".into(),
+                    display_name: "recipe.test.name".into(),
+                    inputs: Vec::new(),
+                    outputs: Vec::new(),
+                },
+            }],
+        };
+        let errs = validate_recipe_loc_keys(&recipes, &loc);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::UnresolvedLocKey { key, .. } if key == "recipe.test.name")),
             "{errs:?}"
         );
     }
