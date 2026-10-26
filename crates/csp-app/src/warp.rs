@@ -85,16 +85,29 @@ pub struct WarpController {
     /// spirit: measured time drives a logged command, not hidden state).
     scaled_nanos: u128,
     /// Set by every downward step — `decide`'s immediate demotion,
-    /// [`Self::demote`], and the settings cap that routes through it.
-    /// The scaled-time backlog `scaled_nanos` banked at the previous
-    /// multiplier is not owed to the sim: a sustained-×10⁵ backlog
-    /// outruns the sim's per-call tick budget, so without a re-anchor
-    /// the clock keeps grinding toward the stale absolute target for
-    /// minutes after the HUD already shows ×1. The next
-    /// [`Self::target_tick`] re-anchors `scaled_nanos` at the live sim
-    /// clock (it owns `current_tick`), which is legal because a smaller
-    /// `AdvanceTo` is absorbed, never a retreat — csp-sim's
-    /// `advance_to_never_retreats_the_clock`.
+    /// [`Self::demote`], and the settings cap that routes through it —
+    /// and by [`Self::rebase`] when the app swaps worlds out from under
+    /// the accumulator (load/revert/new game). The scaled-time backlog
+    /// `scaled_nanos` banked at the previous multiplier is not owed to
+    /// the sim: a sustained-×10⁵ backlog outruns the sim's per-call
+    /// tick budget, so without a re-anchor the clock keeps grinding
+    /// toward the stale absolute target for minutes after the HUD
+    /// already shows ×1. The next [`Self::target_tick`] re-anchors
+    /// `scaled_nanos` at the live sim clock (it owns `current_tick`),
+    /// which is legal because a smaller `AdvanceTo` is absorbed, never
+    /// a retreat — csp-sim's `advance_to_never_retreats_the_clock`.
+    ///
+    /// Armed at construction too: the first `target_tick` of a fresh
+    /// controller anchors at the live clock rather than zero. The
+    /// zero anchor only ever produced `target = current_tick` — a
+    /// `step_frame` call that is no tick boundary and therefore
+    /// **drains nothing** — so a world whose clock did not start at 0
+    /// (the starter seed's build-delivery step to `complete_tick`, any
+    /// restored world) would sit frozen, every queued command
+    /// undrained, until enough wall time accumulated to pass the
+    /// jump. That is the shipped "pad craft will not launch" dead
+    /// sim: `SetThrottle` queued, never applied, `throttle_queued`
+    /// then suppressing the unlatch re-send forever.
     needs_rebase: bool,
     /// The settings-applied ladder ceiling (M10 "max time warp"): a QoL
     /// cap on `requested` — the §2.6.3 inequality still applies
@@ -104,7 +117,11 @@ pub struct WarpController {
 
 impl WarpController {
     /// Fresh controller: requested = effective = ×1 (real time, §2.6.2's
-    /// always-allowed regime — matching the sim's boot warp level).
+    /// always-allowed regime — matching the sim's boot warp level). The
+    /// accumulator starts unanchored — `needs_rebase` arms the first
+    /// [`Self::target_tick`] to anchor at whatever clock the world
+    /// actually holds (the startup seed's delivery step leaves it far
+    /// past 0).
     pub fn new() -> Self {
         Self {
             requested: 0,
@@ -114,7 +131,7 @@ impl WarpController {
             promote_candidate: None,
             measured_step_ms: 0.0,
             scaled_nanos: 0,
-            needs_rebase: false,
+            needs_rebase: true,
             cap_idx: WARP_LADDER.len() - 1,
         }
     }
@@ -238,13 +255,28 @@ impl WarpController {
     /// drops the backlog the previous multiplier banked, which stays
     /// legal because the emitted `AdvanceTo` only ever moves the clock
     /// forward — a target at or below it is absorbed, never a retreat.
+    ///
+    /// A behind-clock accumulator re-anchors on sight: `scaled_nanos`
+    /// IS the pre-quantization target stream, so the live clock can
+    /// never legitimately sit ahead of it (it produced every target the
+    /// clock advanced toward). Behind means the accumulator was never
+    /// anchored to this world — a fresh controller, or a world the
+    /// caller swapped without rebasing — and letting it lag would emit
+    /// `target = current_tick` frames that are not tick boundaries:
+    /// `step_frame` drains nothing below its target, so the queue
+    /// (throttle included) never applies. The self-heal is the same
+    /// write `needs_rebase` performs; the flag covers the opposite
+    /// direction (a stale *forward* backlog after a demotion or world
+    /// swap), which only the caller can distinguish from honest
+    /// accumulation.
     pub fn target_tick(&mut self, current_tick: u64, dt_wall: f64) -> u64 {
-        if self.needs_rebase {
+        let anchor = u128::from(current_tick) * NANOS_PER_TICK;
+        if self.needs_rebase || self.scaled_nanos < anchor {
             // Re-anchor at the live clock. `NANOS_PER_TICK` is exact,
             // so the floored tick target lands back on `current_tick`
             // — no round-trip loss beyond the usual ≤1-tick
             // quantization.
-            self.scaled_nanos = u128::from(current_tick) * NANOS_PER_TICK;
+            self.scaled_nanos = anchor;
             self.needs_rebase = false;
         }
         let dt_nanos = (dt_wall.max(0.0) * NANOS_PER_SEC as f64) as u64;
@@ -289,6 +321,18 @@ impl WarpController {
         self.effective = rung;
         self.needs_rebase = true;
         Some(WARP_LADDER[rung] as u32)
+    }
+
+    /// Re-anchor the accumulator at the next [`Self::target_tick`]'s
+    /// live clock — the app calls this when the world under the
+    /// controller was swapped (a loaded save, a revert, a new game):
+    /// the banked `scaled_nanos` describes the OLD world's clock, so a
+    /// stale *forward* backlog would otherwise read as a legitimate
+    /// target and the sim would sprint to it (a behind-clock backlog
+    /// `target_tick` already self-heals; only the caller can tell a
+    /// forward one is stale).
+    pub fn rebase(&mut self) {
+        self.needs_rebase = true;
     }
 
     /// The M10 "max time warp" settings cap: clamp `requested` to the
@@ -459,10 +503,13 @@ mod tests {
         // Documented bounded truncation, not float drift.
         assert_eq!(t, 63);
         // Monotonic: a zero-dt frame can't retreat, and never sits below
-        // the sim clock even if the clock ran ahead via AdvanceTo.
+        // the sim clock even if the clock ran ahead via AdvanceTo. A
+        // clock AHEAD of the accumulator is the stale state the
+        // self-heal covers — the call re-anchors scaled_nanos at
+        // 70 ticks (the backlog the clock already passed is not owed).
         assert_eq!(c.target_tick(70, 0.0), 70);
         // Warp up to index 2 (×10): another wall second adds ~640 ticks to
-        // the accumulated scaled time.
+        // the accumulated scaled time — now anchored at 70.
         c.request_step(2);
         for _ in 0..PROMOTE_FRAMES {
             c.decide();
@@ -471,8 +518,54 @@ mod tests {
         for _ in 0..60 {
             t = c.target_tick(0, dt);
         }
-        // scaled = 999_999_960 + 60×166_666_660 ns → 703.999… ticks → 703.
-        assert_eq!(t, 703);
+        // scaled = 70×15_625_000 + 60×166_666_660 ns → 709.999… ticks → 709.
+        assert_eq!(t, 709);
+    }
+
+    /// The shipped dead-sim regression: a fresh controller facing a
+    /// world whose clock did NOT start at 0 (the starter seed's
+    /// build-delivery step jumps it to `complete_tick`) must anchor
+    /// `scaled_nanos` at the live clock on the first `target_tick` —
+    /// a zero-anchored accumulator only ever emits
+    /// `target = current_tick`, a `step_frame` call that is not a
+    /// tick boundary and therefore drains NOTHING (the queued
+    /// `SetThrottle` never applied: the frozen pad). Same self-heal
+    /// covers an accumulator left behind by a later world jump —
+    /// and `rebase` re-anchors a stale FORWARD backlog the caller
+    /// flags after a world swap.
+    #[test]
+    fn target_tick_anchors_to_the_live_clock() {
+        let mut c = WarpController::new();
+        // A world already at tick 4941 (the seeded build delivery):
+        // the first real frame must emit a target AHEAD of the
+        // clock, not the clock itself.
+        let t = c.target_tick(4941, 1.0 / 60.0);
+        assert!(t > 4941, "first target must advance past 4941, got {t}");
+        // From there the accumulator tracks wall time normally.
+        let t2 = c.target_tick(4942, 1.0 / 60.0);
+        assert!(t2 > t, "targets keep advancing");
+        // A behind-clock accumulator self-heals without the flag:
+        // pretend the world jumped forward again (a second seed, a
+        // later save) — the next target re-anchors, not freezes.
+        let mut c2 = WarpController::new();
+        let _ = c2.target_tick(10, 1.0 / 60.0); // anchored at 10
+        let jumped = c2.target_tick(9_999, 1.0 / 60.0);
+        assert!(jumped > 9_999, "a world jump re-anchors, got {jumped}");
+        // `rebase` drops a stale FORWARD backlog: at ×1 the banked
+        // scaled time is the absolute target stream — after the
+        // caller flags a world swap the accumulator re-anchors at
+        // the new (earlier) clock instead of sprinting to the old
+        // world's horizon.
+        let mut c3 = WarpController::new();
+        for _ in 0..120 {
+            let _ = c3.target_tick(0, 1.0 / 60.0);
+        }
+        c3.rebase();
+        let t3 = c3.target_tick(4, 1.0 / 60.0);
+        assert!(
+            t3 <= 5,
+            "rebase anchors at the new clock (4 + this frame's dt), got {t3}"
+        );
     }
 
     /// The M10 settings cap: `requested` clamps to the largest rung `≤`

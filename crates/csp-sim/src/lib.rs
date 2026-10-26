@@ -1614,7 +1614,9 @@ pub struct VesselCaps {
 
 /// Mirror of `balance.ron`'s caps for data-less worlds (unit tests,
 /// the wasm slice) — the same roles as [`DEFAULT_MAX_EVENTS_PER_FRAME`].
-pub const DEFAULT_MAX_VESSELS: u64 = 512;
+/// The arena is effectively unbounded (`u64::MAX`): unlimited craft in
+/// flight is a product rule, so the cap only ever bounds `max_debris`.
+pub const DEFAULT_MAX_VESSELS: u64 = u64::MAX;
 /// See [`DEFAULT_MAX_VESSELS`].
 pub const DEFAULT_MAX_DEBRIS: u64 = 64;
 

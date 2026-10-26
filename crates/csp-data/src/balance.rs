@@ -73,7 +73,9 @@ pub struct BalanceDef {
     pub advance_to_max_events_per_frame: u64,
     /// PLAN §2.9: `max_tracked_vessels` — vessel-arena cap; spawns
     /// beyond it reject `Recoverable`. The sim-side mirror is
-    /// `csp_sim::DEFAULT_MAX_VESSELS` (512).
+    /// `csp_sim::DEFAULT_MAX_VESSELS` (`u64::MAX` — effectively
+    /// unlimited craft in flight; the shipped `data/balance.ron`
+    /// authors the same).
     pub max_tracked_vessels: u64,
     /// PLAN §2.9: `max_debris` — breakup debris cap; the sim evicts
     /// oldest-first by `(debris_since, id)`. Mirror:

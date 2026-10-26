@@ -973,7 +973,15 @@ impl App {
                     // run here; a world-replacing op discards the
                     // stale report rather than surfacing it.
                     self.run_session_op();
-                    if !self.world_rebuilt {
+                    if self.world_rebuilt {
+                        // The world under the warp controller was
+                        // swapped (load/revert/new game): its banked
+                        // scaled-time backlog describes the OLD
+                        // world's clock — re-anchor or the next frame
+                        // target is a stale absolute the sim either
+                        // freezes on or sprints toward.
+                        self.warp.rebase();
+                    } else {
                         self.on_step_report(&report);
                     }
                     self.world_rebuilt = false;
@@ -4479,6 +4487,126 @@ mod tests {
             body.pos.norm()
         );
         // The real release edge clears the held axis.
+        app.release_edge(&shift.0, &shift.1);
+        assert!(app.throttle_held.is_empty());
+    }
+
+    /// The shipped failure, end to end on the REAL path: the
+    /// production `new_inner` construction (real `data/` load,
+    /// `View::new` + `seed_starter_craft`, the real default keymap —
+    /// `new_with_settings_path` is `App::new`'s identical inner with
+    /// an injected, hermetic settings path), `run_frame`'s
+    /// sim-relevant sequence verbatim (outbox → warp decide/target →
+    /// update_session → throttle/attitude ticks → begin_frame →
+    /// sim_step → on_step_report → end_frame), and `press_edge`/
+    /// `release_edge` — the `WindowEvent::KeyboardInput` path. The
+    /// seeded pad craft must unlatch, fire, and climb.
+    ///
+    /// The regression this pins: the seed's build-delivery step jumps
+    /// the sim clock to `complete_tick` — but `WarpController`'s
+    /// scaled-time accumulator used to start at 0 and never anchor,
+    /// so `target_tick` returned `current_tick` every frame,
+    /// `step_frame` saw no tick boundary, and NOTHING (SetThrottle
+    /// included) ever drained: a frozen sim, a dead throttle.
+    #[test]
+    fn real_path_seeded_pad_craft_flies_on_real_keys() {
+        use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey, SmolStr};
+        let dir = tempdir("real-path-pad-launch");
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        let real_frame = |app: &mut App, dt_wall: f64| {
+            let outbox = app.view.take_ui_outbox();
+            app.handle_ui_outbox(outbox);
+            app.warp.observe(app.last_tick_ms, dt_wall);
+            if let Some(level) = app.warp.decide() {
+                app.view.enqueue_command(
+                    SourceClass::Ui,
+                    WARP_SOURCE_ID,
+                    SimCommand::SetWarp(level),
+                );
+            }
+            let target = app
+                .warp
+                .target_tick(app.view.sim.clock().ticks(), dt_wall);
+            app.view.enqueue_command(
+                SourceClass::Ui,
+                WARP_SOURCE_ID,
+                SimCommand::AdvanceTo(target),
+            );
+            app.view.update_session(
+                dt_wall * 1000.0,
+                app.warp.requested_multiplier(),
+                app.warp.multiplier(),
+                app.fatal,
+            );
+            app.tick_attitude();
+            app.tick_throttle_ramp(dt_wall);
+            app.view.begin_frame();
+            match app.view.sim_step(target) {
+                Ok(report) => app.on_step_report(&report),
+                Err(e) => app.on_sim_fatal(e),
+            }
+            app.view.end_frame();
+        };
+        let boot_clock = app.view.sim.clock().ticks();
+        for _ in 0..20 {
+            real_frame(&mut app, 1.0 / 60.0);
+        }
+        // The warp-driven frame target must advance the sim — a
+        // frozen clock means the queue never drains (the shipped
+        // dead-throttle symptom).
+        assert!(
+            app.view.sim.clock().ticks() > boot_clock,
+            "the sim must advance through real frames — boot clock {boot_clock}, now {}",
+            app.view.sim.clock().ticks()
+        );
+        let focus = app
+            .view
+            .flight_focus()
+            .expect("the seeded pad craft holds flight focus");
+        assert!(
+            app.view.sim.vessels()[&focus].body().is_none(),
+            "the seed parks surface-latched"
+        );
+        // Real Z press — `key-z` physical → ThrottleFull.
+        app.press_edge(
+            &PhysicalKey::Code(KeyCode::KeyZ),
+            &Key::Character(SmolStr::new("z")),
+            false,
+        );
+        for _ in 0..3 {
+            real_frame(&mut app, 1.0 / 60.0);
+        }
+        let logged = app.view.sim.command_log().iter().any(|(_, c)| {
+            matches!(c, SimCommand::SetThrottle { vessel: v, throttle } if *v == focus && *throttle > 0.0)
+        });
+        assert!(logged, "Z press must land a SetThrottle — the unlatch");
+        let body = app.view.sim.vessels()[&focus]
+            .body()
+            .expect("throttle unlatched the pad craft");
+        let r0 = body.pos.norm();
+        for _ in 0..240 {
+            real_frame(&mut app, 1.0 / 60.0);
+        }
+        let body = app.view.sim.vessels()[&focus]
+            .body()
+            .expect("still InBubble");
+        assert!(
+            body.pos.norm() > r0 + 1.0,
+            "the craft climbs: r {r0} -> {}",
+            body.pos.norm()
+        );
+        app.release_edge(
+            &PhysicalKey::Code(KeyCode::KeyZ),
+            &Key::Character(SmolStr::new("z")),
+        );
+        let shift = (
+            PhysicalKey::Code(KeyCode::ShiftLeft),
+            Key::Named(NamedKey::Shift),
+        );
+        app.press_edge(&shift.0, &shift.1, false);
+        for _ in 0..10 {
+            real_frame(&mut app, 1.0 / 60.0);
+        }
         app.release_edge(&shift.0, &shift.1);
         assert!(app.throttle_held.is_empty());
     }
