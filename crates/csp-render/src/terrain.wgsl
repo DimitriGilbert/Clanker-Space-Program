@@ -88,9 +88,23 @@ fn rot_axis(axis: vec3<f32>, angle: f32, v: vec3<f32>) -> vec3<f32> {
 // sphere. This is the "not a smudge" channel — the baked heightfield
 // tops out near ~4 km texels while the quadtree subdivides to ~300 m
 // patches, so everything finer than a texel is synthesized here at
-// fragment rate: micro-relief bump normals, albedo mottling, water
+// fragment rate: mid-scale relief bump normals, albedo mottling, water
 // waves, star cells. Deterministic by construction (u32 avalanche),
 // camera-independent (sampled on the body-fixed direction).
+//
+// STABILITY: every noise lookup below is a DIRECT `vnoise3(d·freq)`
+// evaluation — no anchor vector, no camera-derived term. The lattice
+// coordinate is a pure function of the body-fixed direction, so the
+// field is bit-identical frame to frame and identical across quadtree
+// re-partitions (the old per-patch anchor moved the pattern every LOD
+// event — the "ground looks like it is moving" crawl). The catch is
+// f32: `d·freq` rounds to ~freq·2⁻²⁴ cells of per-pixel error, so a
+// point-sampled octave sparkles once freq ≳ ~25k (its 1–2% boundary
+// flips re-randomize with sub-pixel camera motion — that WAS the
+// shimmer). Everything finer than ~40 m cells therefore comes from the
+// mip/aniso-FILTERED texture maps, which absorb sub-texel jitter,
+// instead of unfiltered hash noise. Keep every `vnoise3w` call at
+// freq ≤ ~16000.
 
 fn hash_i3(x: i32, y: i32, z: i32) -> f32 {
     var h = bitcast<u32>(x) * 0x8da6b343u;
@@ -116,20 +130,22 @@ fn vnoise3(p: vec3<f32>) -> f32 {
     return mix(mix(x00, x10, t.y), mix(x01, x11, t.y), t.z) * 2.0 - 1.0;
 }
 
-// Anchored lattice coordinates for the noise: `d·freq` reaches ~2e5
-// at the finest octaves, where f32's ~0.015 ulp lands ~1.5% of pixels
-// on the WRONG lattice cell — per-pixel sparkle at boot level, and it
-// shimmered whenever the camera moved. Subtracting the patch's flat
-// `dir0_fix` keeps the interpolated term small; `fract(d0·freq)`
-// shifts the lattice origin by a per-patch constant that differs from
-// a neighbour patch's only by integers, so the field is identical
-// across patch borders.
-fn lat3(d: vec3<f32>, d0: vec3<f32>, freq: f32) -> vec3<f32> {
-    return (d - d0) * freq + fract(d0 * freq);
+// World-stable noise sample (see the STABILITY note above): the raw
+// `d·freq` product is exact enough up to ~freq 20k that the lattice
+// evaluation never leaves the cell it should — and because the
+// coordinate depends on NOTHING but the body-fixed direction, there is
+// no anchor that could shift on a quadtree re-split. Never pass a
+// freq above ~24k: finer octaves must come from the filtered textures.
+fn vnoise3w(d: vec3<f32>, freq: f32) -> f32 {
+    return vnoise3(d * freq);
 }
 
-fn vnoise3_at(d: vec3<f32>, d0: vec3<f32>, freq: f32) -> f32 {
-    return vnoise3(lat3(d, d0, freq));
+// The fixed world-space anchor grid for TEXTURE coordinates (the
+// Repeat sampler absorbs whole-cell shifts, so a quantized anchor is
+// exact where it isn't for noise — see TriPlanes). 1/64 rad ≈ 9.4 km
+// cells on a 600 km body.
+fn dir_anchor(d: vec3<f32>) -> vec3<f32> {
+    return floor(d * 64.0 + 0.5) / 64.0;
 }
 
 // A local tangent frame on the sphere (fixed frame): east = d/dlon,
@@ -152,12 +168,12 @@ fn tangent_basis(d: vec3<f32>) -> Basis {
 // Geometric noise gradient at `dir·freq`: returns ∂n/∂x in noise units
 // (∼±0.6), so a virtual relief of height `h_eq` metres converts to a
 // surface slope as `grad · h_eq·freq/R`.
-fn ngrad(d: vec3<f32>, d0: vec3<f32>, e: vec3<f32>, n: vec3<f32>, freq: f32) -> vec2<f32> {
+fn ngrad(d: vec3<f32>, e: vec3<f32>, n: vec3<f32>, freq: f32) -> vec2<f32> {
     let off = 0.8 / freq;
-    let c0 = vnoise3_at(d, d0, freq);
+    let c0 = vnoise3w(d, freq);
     return vec2<f32>(
-        vnoise3_at(d + e * off, d0, freq) - c0,
-        vnoise3_at(d + n * off, d0, freq) - c0,
+        vnoise3w(d + e * off, freq) - c0,
+        vnoise3w(d + n * off, freq) - c0,
     ) / (off * freq);
 }
 
@@ -310,12 +326,6 @@ struct Vt {
     @location(2) h_norm: f32,
     @location(3) @interpolate(flat) kind: f32,
     @location(4) dir_fix: vec3<f32>,
-    // Patch-centre direction in the body-fixed frame — the anchor every
-    // high-frequency lookup (detail textures, fine noise lattices)
-    // subtracts so no f32 product ever reaches planetary magnitude
-    // (see `tex_uv`/`lat3`). Flat: constant across the patch, which is
-    // exactly what the anchoring math requires.
-    @location(5) @interpolate(flat) dir0_fix: vec3<f32>,
 };
 
 @vertex
@@ -351,7 +361,6 @@ fn vs_terrain(g: Gv, inst: Inst) -> Vt {
     o.h_norm = h_norm;
     o.kind = inst.dir0_kind.w;
     o.dir_fix = dir_fix;
-    o.dir0_fix = rot_axis(u.spin.xyz, -u.spin.w, inst.dir0_kind.xyz);
     return o;
 }
 
@@ -373,36 +382,39 @@ fn terrain_normal_fix(dir_fix: vec3<f32>, b: Basis) -> vec3<f32> {
 
 // Micro-relief bump: distance-banded noise octaves perturb the macro
 // normal. Frequencies are in cells per unit-direction — a cell spans
-// ~R/freq metres, so metre-scale grain needs freq ~1e5. Each octave
-// fades with view distance before it can sub-pixel shimmer. This is
-// what stops the surface reading as a smooth smudge at chase-camera
-// range: the baked heightfield carries nothing below ~4 km texels.
+// ~R/freq metres. Each octave fades with view distance before it can
+// sub-pixel shimmer. This is what stops the surface reading as a
+// smooth smudge at chase-camera range: the baked heightfield carries
+// nothing below ~4 km texels. ALL octaves stay at freq ≤ ~24k so the
+// direct `vnoise3w` lattice sample is bit-stable (see STABILITY);
+// finer grain comes from the filtered normal-map detail instead.
 // The far+mid octaves. These feed BOTH the lighting normal and the
 // slope that drives class weights/albedo banding — 65 m hillocks are
 // legitimately rocky on their flanks.
-fn bump_fix(dir_fix: vec3<f32>, d0: vec3<f32>, n: vec3<f32>, b: Basis, dist: f32) -> vec3<f32> {
+fn bump_fix(dir_fix: vec3<f32>, n: vec3<f32>, b: Basis, dist: f32) -> vec3<f32> {
     let R = u.planet.x;
     var g = vec2<f32>(0.0);
     // ~2 km / ~400 m features — visible from low orbit.
     let f_far = clamp(1.0 - dist / 2.4e5, 0.0, 1.0);
-    g = g + ngrad(dir_fix, d0, b.e, b.n, 2800.0) * (90.0 * 2800.0 / R * f_far);
+    g = g + ngrad(dir_fix, b.e, b.n, 2800.0) * (90.0 * 2800.0 / R * f_far);
     // ~65 m hillocks — fade out by ~60 km altitude.
     let f_mid = clamp(1.0 - dist / 6.0e4, 0.0, 1.0);
-    g = g + ngrad(dir_fix, d0, b.e, b.n, 9200.0) * (30.0 * 9200.0 / R * f_mid);
+    g = g + ngrad(dir_fix, b.e, b.n, 9200.0) * (30.0 * 9200.0 / R * f_mid);
     return normalize(n - b.e * g.x - b.n * g.y);
 }
 
-// The cm-scale octaves (~13 m and ~3.5 m cells), applied on top of
-// `bump_fix` for LIGHTING only — letting them into the class-weight
-// slope speckled rock/grass assignment at boot level.
-fn bump_fix_near(dir_fix: vec3<f32>, d0: vec3<f32>, n: vec3<f32>, b: Basis, dist: f32) -> vec3<f32> {
+// The fine octave (~40 m cells), applied on top of `bump_fix` for
+// LIGHTING only — letting it into the class-weight slope would speckle
+// rock/grass assignment at boot level. Metre-scale grain is the normal
+// maps' job (filtered, stable); this octave deliberately stops at the
+// coarsest "fine" band that stays f32-stable.
+fn bump_fix_near(dir_fix: vec3<f32>, n: vec3<f32>, b: Basis, dist: f32) -> vec3<f32> {
     let R = u.planet.x;
     let f_near = clamp(1.0 - dist / 1.5e4, 0.0, 1.0);
     if (f_near <= 0.001) {
         return n;
     }
-    let g = ngrad(dir_fix, d0, b.e, b.n, 48000.0) * (7.0 * 48000.0 / R * f_near)
-          + ngrad(dir_fix, d0, b.e, b.n, 170000.0) * (2.2 * 170000.0 / R * f_near);
+    let g = ngrad(dir_fix, b.e, b.n, 16000.0) * (5.0 * 16000.0 / R * f_near);
     return normalize(n - b.e * g.x - b.n * g.y);
 }
 
@@ -487,30 +499,37 @@ fn ramp_albedo(dir: vec3<f32>, h: f32, slope: f32, dither: f32) -> vec3<f32> {
 //    slope is sampled on the plane that actually faces it — the old
 //    position-direction weights foreshortened every hillside into an
 //    axially stretched smear;
-//  * texture coordinates are PATCH-ANCHORED: `fract(d0·k) + (d−d0)·k`
-//    equals `d·k` modulo an integer (identical texel under the Repeat
-//    sampler, seamless across quadtree patch borders) but never
-//    carries the ~7e4 magnitude whose f32 ulp is 2–4 texels — the
-//    raw product jittered every pixel's sample position and broke the
-//    implicit derivatives into random mip picks, which was most of
-//    the near-ground "blurry smear".
+//  * texture coordinates are ANCHORED: `fract(a·k) + (d−a)·k` equals
+//    `d·k` modulo an integer (identical texel under the Repeat
+//    sampler) but never carries the ~7e4 magnitude whose f32 ulp is
+//    2–4 texels — the raw product jittered every pixel's sample
+//    position and broke the implicit derivatives into random mip
+//    picks, which was most of the near-ground "blurry smear".
+//    The anchor `a` is `dir_anchor(d)` — a fixed world-space grid —
+//    NOT the patch centre: a per-patch anchor re-phased every texel
+//    field ~cm each time the quadtree re-split (the ground visibly
+//    crawled under a moving camera). The quantized anchor is also
+//    exact across its own cell borders: a border flip only changes
+//    `fract(a·k)`'s complement `floor(a·k)` by an integer, which the
+//    Repeat wrap drops entirely.
 struct TriPlanes {
-    // Per-plane `d − d0` projected on each axis-dropped pair
+    // Per-plane `d − a` projected on each axis-dropped pair
     // (yz for the x plane, xz for y, xy for z).
     dd: array<vec2<f32>, 3>,
-    // Per-plane anchor components of `d0` (same pairing).
+    // Per-plane anchor components of `a` (same pairing).
     pb: array<vec2<f32>, 3>,
     // Normalized |n|^4 blend weights.
     w: vec3<f32>,
 };
 
-fn tri_planes(d: vec3<f32>, n: vec3<f32>, d0: vec3<f32>) -> TriPlanes {
-    let dd = d - d0;
+fn tri_planes(d: vec3<f32>, n: vec3<f32>) -> TriPlanes {
+    let a = dir_anchor(d);
+    let dd = d - a;
     var o: TriPlanes;
     o.dd = array<vec2<f32>, 3>(dd.yz, dd.xz, dd.xy);
-    o.pb = array<vec2<f32>, 3>(d0.yz, d0.xz, d0.xy);
-    let a = abs(n);
-    let a4 = a * a * a * a;
+    o.pb = array<vec2<f32>, 3>(a.yz, a.xz, a.xy);
+    let an = abs(n);
+    let a4 = an * an * an * an;
     o.w = a4 / max(a4.x + a4.y + a4.z, 1.0e-9);
     return o;
 }
@@ -645,12 +664,12 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
         // Wave normal: a long swell plus chop octaves over the
         // geometric normal — static (no time uniform), but the
         // perturbed glint alone reads as water. Near the surface the
-        // ~7 m chop takes over the shading.
+        // ~40 m chop takes over the shading.
         let wf_near = clamp(1.0 - dist / 2.0e4, 0.0, 1.0);
-        var wg = ngrad(dir_fix, i.dir0_fix, basis.e, basis.n, 1200.0) * (4.5 * 1200.0 / u.planet.x)
-               + ngrad(dir_fix, i.dir0_fix, basis.e, basis.n, 6400.0) * (1.8 * 6400.0 / u.planet.x);
+        var wg = ngrad(dir_fix, basis.e, basis.n, 1200.0) * (4.5 * 1200.0 / u.planet.x)
+               + ngrad(dir_fix, basis.e, basis.n, 6400.0) * (1.8 * 6400.0 / u.planet.x);
         wg = wg * (0.4 + 0.6 * det_fade)
-           + ngrad(dir_fix, i.dir0_fix, basis.e, basis.n, 48000.0) * (0.9 * 48000.0 / u.planet.x)
+           + ngrad(dir_fix, basis.e, basis.n, 14000.0) * (0.9 * 14000.0 / u.planet.x)
              * wf_near;
         if (u.art.x > 0.5) {
             // Real wave normal map (Foam 002, ambientCG CC0) at two
@@ -658,7 +677,7 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
             // Scroll rides the sim-tick clock, so it stays deterministic.
             // Anchored UVs (see tex_uv): the raw `d·R/11` product ran
             // ~5e4 — its f32 ulp was a whole texel of jitter.
-            let tpw = tri_planes(dir_fix, dir_fix, i.dir0_fix);
+            let tpw = tri_planes(dir_fix, dir_fix);
             let t = u.art.y;
             let k1 = u.planet.x / 37.0;
             let k2 = u.planet.x / 11.0;
@@ -719,7 +738,7 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
               + sun_lum * vis * spec;
         // Shoreline foam: a noise-broken band where the seabed meets
         // the surface.
-        let foam_n = smoothstep(0.35, 0.85, 0.5 + 0.5 * vnoise3_at(dir_fix, i.dir0_fix, 5400.0));
+        let foam_n = smoothstep(0.35, 0.85, 0.5 + 0.5 * vnoise3w(dir_fix, 5400.0));
         let foam = (1.0 - smoothstep(0.2, 2.6, depth)) * foam_n;
         col = mix(col, vec3<f32>(0.80, 0.85, 0.87) * (0.10 + 0.90 * sun_up * vis),
                   clamp(foam, 0.0, 1.0) * 0.75);
@@ -730,19 +749,22 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
         // --- terrain --------------------------------------------------
         let n_macro = terrain_normal_fix(dir_fix, basis);
         // Class/albedo slope comes from the macro + far/mid relief
-        // only — the cm-scale bump octaves and the texture normals
+        // only — the fine bump octave and the texture normals
         // below would speckle the rock/grass weights per-pixel.
-        var n_fix = bump_fix(dir_fix, i.dir0_fix, n_macro, basis, dist);
+        var n_fix = bump_fix(dir_fix, n_macro, basis, dist);
         let slope = 1.0 - clamp(dot(n_fix, dir_fix), 0.0, 1.0);
         // Albedo grain — the same near-field banding as the bump:
-        // large patches mottle, close-ups get per-metre speckle.
+        // large patches mottle, close-ups get a finer octave. Every
+        // freq stays ≤ ~24k so the direct lattice sample is bit-stable
+        // (see STABILITY) — finer speckle lives in the filtered detail
+        // textures, not in point-sampled hash noise.
         let f_near = clamp(1.0 - dist / 1.5e4, 0.0, 1.0);
-        let mottle = vnoise3_at(dir_fix, i.dir0_fix, 1500.0) * 0.5
-                   + vnoise3_at(dir_fix, i.dir0_fix, 5300.0) * 0.3
-                   + vnoise3_at(dir_fix, i.dir0_fix, 46000.0) * 0.2 * max(f_near, 0.15);
+        let mottle = vnoise3w(dir_fix, 1500.0) * 0.5
+                   + vnoise3w(dir_fix, 5300.0) * 0.3
+                   + vnoise3w(dir_fix, 15000.0) * 0.2 * max(f_near, 0.15);
         var alb = biome_albedo(dir_fix, i.h_norm, slope, mottle);
-        // The cm-scale relief returns for lighting.
-        n_fix = bump_fix_near(dir_fix, i.dir0_fix, n_fix, basis, dist);
+        // The fine relief octave returns for lighting.
+        n_fix = bump_fix_near(dir_fix, n_fix, basis, dist);
         if (u.art.x > 0.5) {
             // Real PBR detail: class-weighted (grass/rock/sand/snow)
             // ambientCG textures normalized to unit mean so the
@@ -750,7 +772,7 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
             // carry the pattern — plus a real normal map perturbing
             // the shading normal on the dominant class.
             let wts = class_weights(i.h_norm, slope, abs(dir_fix.z), mottle);
-            let tp = tri_planes(dir_fix, n_macro, i.dir0_fix);
+            let tp = tri_planes(dir_fix, n_macro);
             // Distance bands: the mid octave (a ~2.4× coarser,
             // incommensurate retiling) decorrelates the visible
             // 10–20 m tile repeat out to aerial range; the near
@@ -800,7 +822,7 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
             n_fix = normalize(n_fix - basis.e * ntex.x * 0.62 - basis.n * ntex.y * 0.62);
         }
         let n = rot_axis(u.spin.xyz, u.spin.w, n_fix);
-        alb = alb * (1.0 + (0.09 * mottle + 0.10 * vnoise3_at(dir_fix, i.dir0_fix, 160000.0) * f_near));
+        alb = alb * (1.0 + (0.09 * mottle + 0.10 * vnoise3w(dir_fix, 16000.0) * f_near));
         // Sun dimmed by the atmosphere at the fragment's altitude.
         var sun_lum = vec3<f32>(1.0, 0.98, 0.92);
         if (has_atmo) {
@@ -861,25 +883,27 @@ fn vs_sky(@builtin(vertex_index) vi: u32) -> Vs {
 // texture: density is uniform at every latitude, poles included, and
 // nothing can smear — there is no image to blur). Each occupied cell
 // holds one star at a stable interior offset; the ray's distance to it
-// falls off as a sub-cell Gaussian, so stars land as sharp 1–2 px
-// points. The atmosphere dims them through the view ray's
-// transmittance; the planet occludes them on a ground strike.
+// falls off as a sub-cell Gaussian, so stars land as soft luminous
+// points with a small halo. The atmosphere dims them through the view
+// ray's transmittance; the planet occludes them on a ground strike.
+//
+// Density stays deliberately SPARSE — ~2k stars all-sky, not the
+// tens of thousands a finer lattice resolves as film grain (the old
+// 11–23%-occupancy faint layer was the "grainy static" sky). And no
+// star may ever go sub-pixel: `sig_ang` is floored at the per-pixel
+// ray footprint, so the dimmest stars read as soft dots instead of
+// aliased 1-px specks.
 //
 // One star's contribution: `rd` the view ray, `s` the shell scale,
-// `ci` the ray's lattice cell. The star's position is hashed inside
-// the cell, then PROJECTED onto the direction sphere — the distance
-// measured is the small-angle ray↔star offset (in cell units), so a
-// star anywhere in the cell's depth range shows at full brightness
-// (a 3D-position Gaussian would hide ~85% of stars off the shell).
-// `sharp` is the Gaussian coefficient in cell units — the profile
-// sigma is sqrt((0.6+bright)/(2·sharp)) cells. Every layer picks a
-// sigma ≥ ~0.5 px at 1080p: anything tighter is a sub-pixel delta
-// that aliases into per-pixel noise (the "grainy static" field), so
-// dimmer layers trade peak for width instead.
-fn star_cell(rd: vec3<f32>, s: f32, ci: vec3<i32>, gain: f32, sharp: f32) -> vec3<f32> {
-    // |off| < 0.5 → the star stays inside its own cell, so the
-    // single-cell lookup sees all of it (no border clipping, no
-    // neighbour bleed needed).
+// `ci` a lattice cell near the ray. The star's position is hashed
+// inside the cell, then PROJECTED onto the direction sphere — the
+// distance measured is the small-angle ray↔star offset (in cell
+// units), so a star anywhere in the cell's depth range shows at full
+// brightness (a 3D-position Gaussian would hide ~85% of stars off the
+// shell). `sig` is the Gaussian sigma in cell units — floored by the
+// caller so the core is ≥ ~1 px at any resolution.
+fn star_cell(rd: vec3<f32>, s: f32, ci: vec3<i32>, gain: f32, sig: f32) -> vec3<f32> {
+    // |off| < 0.5 → the star stays inside its own cell.
     let off = (vec3<f32>(
         hash_i3(ci.x + 11, ci.y + 5, ci.z - 7),
         hash_i3(ci.x - 3, ci.y + 17, ci.z + 9),
@@ -887,42 +911,77 @@ fn star_cell(rd: vec3<f32>, s: f32, ci: vec3<i32>, gain: f32, sharp: f32) -> vec
     ) - 0.5) * 0.7;
     let star_dir = normalize(vec3<f32>(ci) + 0.5 + off);
     let d = (star_dir - rd) * s;
-    // Magnitude: bent hash — most stars faint, a few burning bright;
-    // brighter stars bloom slightly wider.
+    let d2 = dot(d, d);
+    // Magnitude: bent hash — most stars sit near/below the visibility
+    // floor (a real sky is a handful of bright stars over a sparse dim
+    // field, not a uniform sheet of equal dots), a few burn bright.
     let mag = hash_i3(ci.x - 7, ci.y + 23, ci.z + 13);
-    let bright = 0.14 + 1.5 * pow(mag, 3.0);
+    let bright = 0.05 + 1.6 * pow(mag, 3.5);
     // Blue-white ↔ warm spread (B/A through K/M colours).
     let t = hash_i3(ci.x + 19, ci.y - 11, ci.z + 3);
     let tint = mix(vec3<f32>(0.70, 0.80, 1.0), vec3<f32>(1.0, 0.82, 0.62), t);
-    return tint * (exp(-dot(d, d) * (sharp / (0.6 + bright))) * bright * gain);
+    // Soft Gaussian core + a whisper of ~2σ halo — a luminous point,
+    // not a 1-px delta and not a glow ball. The caller's 3×3×3 cell
+    // walk keeps the halo whole at cell borders (a star sits ≤0.35
+    // cell from its own centre).
+    let inv = 1.0 / (2.0 * sig * sig);
+    let core = exp(-d2 * inv);
+    let halo = exp(-d2 * inv * 0.25) * 0.10;
+    return tint * ((core + halo) * bright * gain);
 }
 
-fn star_field(rd: vec3<f32>) -> vec3<f32> {
+// One sparse layer: the ray's 3×3×3 cell neighbourhood, each cell
+// holding a star with probability `occ`. `occ` may vary per pixel
+// (the Milky Way band feeds it) — the field stays deterministic.
+fn star_layer(
+    rd: vec3<f32>,
+    s: f32,
+    p: vec3<f32>,
+    occ: f32,
+    gain: f32,
+    sig_ang: f32,
+) -> vec3<f32> {
+    let base = vec3<i32>(floor(p));
+    let sig = sig_ang * s;
     var acc = vec3<f32>(0.0);
-    // Sparse bright layer (~7k stars all-sky at 3.2% occupancy). The
-    // sharp=34 profile lands σ ≈ 0.1–0.26 cells ≈ 0.8–2 px at 1080p —
-    // crisp points with a slight bloom on the brightest, not deltas.
-    let p1 = rd * 130.0;
-    let c1 = vec3<i32>(floor(p1));
-    if (hash_i3(c1.x, c1.y, c1.z) < 0.032) {
-        acc = acc + star_cell(rd, 130.0, c1, 1.7, 34.0);
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let ci = base + vec3<i32>(dx, dy, dz);
+                if (hash_i3(ci.x, ci.y, ci.z) < occ) {
+                    acc = acc + star_cell(rd, s, ci, gain, sig);
+                }
+            }
+        }
     }
-    // Milky Way: a fixed great-circle band (galactic pole n) that lifts
-    // the faint layer's density and adds a whisper of broadband glow —
-    // deliberately low contrast, just enough to read as a band.
+    return acc;
+}
+
+// `pr` = per-pixel ray footprint in radians (computed by the caller
+// from the NDC derivative — exact near axis, a slight underestimate
+// toward the frame edge) — the resolution-aware floor that keeps every
+// star a resolved dot instead of sub-pixel noise.
+fn star_field(rd: vec3<f32>, pr: f32) -> vec3<f32> {
+    // Bright layer: ~750 stars all-sky at ~1.1° cells. σ ≈ 0.65 px
+    // (0.35′ floor) — crisp points with a slight bloom.
+    var acc = star_layer(
+        rd, 52.0, rd * 52.0,
+        0.022, 2.1,
+        max(0.65 * pr, 3.5e-4),
+    );
+    // Milky Way: a fixed great-circle band (galactic pole n) that only
+    // thickens the faint layer's density — no additive glow, so the
+    // band reads as a star field, not haze.
     let mw_band = exp(-pow(dot(rd, vec3<f32>(0.3586, 0.2054, -0.9106)), 2.0) * 30.0);
-    // Sparse faint layer (finer cells, occupancy raised inside the
-    // band), offset so its lattice decorrelates from the bright one.
-    // The old 11–23% occupancy put ~100k sub-pixel stars on the dome —
-    // it resolved as noise, not stars. ~30k soft σ ≈ 0.8 px points read
-    // as a faint field; the band thickens it into the Milky Way.
-    let p2 = rd * 290.0 + vec3<f32>(0.37, 0.59, 0.83);
-    let c2 = vec3<i32>(floor(p2));
-    let faint = 0.028 + 0.075 * mw_band;
-    if (hash_i3(c2.x, c2.y, c2.z) < faint) {
-        acc = acc + star_cell(rd, 290.0, c2, 0.40, 7.0);
-    }
-    acc = acc + vec3<f32>(0.006, 0.007, 0.011) * mw_band;
+    // Faint layer: ~0.7k dimmer stars on ~0.6° cells, ~4× denser
+    // inside the band. The lattice is offset so it decorrelates from
+    // the bright one. Dim and still resolved (σ ≈ 0.6 px) — sparse
+    // resolved points read as stars, dense sub-pixel ones as grain.
+    acc = acc + star_layer(
+        rd, 96.0, rd * 96.0 + vec3<f32>(0.37, 0.59, 0.83),
+        0.006 + 0.018 * mw_band, 0.55,
+        max(0.55 * pr, 2.5e-4),
+    );
     return acc;
 }
 
@@ -947,8 +1006,11 @@ fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
     let disc = pow(max(dot(rd, sun), 0.0), 4000.0) * 24.0;
     let halo = pow(max(dot(rd, sun), 0.0), 16.0) * 0.10;
     // The procedural starfield (always — no baked star image exists);
-    // sun glare washes stars out toward the disc.
-    let stars = star_field(rd)
+    // sun glare washes stars out toward the disc. `pr` is the
+    // per-pixel ray footprint (tan(half-fov)·ndc/px) — the star
+    // profile floor.
+    let pr = u.misc.y * fwidth(i.ndc.y);
+    let stars = star_field(rd, pr)
               * (1.0 - 0.85 * pow(max(dot(rd, sun), 0.0), 12.0));
     let space_bg = vec3<f32>(0.004, 0.006, 0.014)
                  + vec3<f32>(1.0, 0.95, 0.85) * (disc + halo);
