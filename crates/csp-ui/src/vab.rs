@@ -4331,9 +4331,7 @@ mod tests {
         // breaks whenever a panel grows.
         let free = (0..60)
             .flat_map(|iy| {
-                (0..80).map(move |ix| {
-                    egui::pos2(ix as f32 * 10.0 + 2.0, iy as f32 * 10.0 + 2.0)
-                })
+                (0..80).map(move |ix| egui::pos2(ix as f32 * 10.0 + 2.0, iy as f32 * 10.0 + 2.0))
             })
             .find(|p| !masks.iter().any(|r| r.contains(*p)))
             .expect("the overlay union should leave some viewport free");

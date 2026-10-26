@@ -181,6 +181,15 @@ fn biome_field(loaded: &csp_data::LoadedBiomeMap) -> Option<Arc<rt::BiomeField>>
 
 /// The baked heightfield cache — one per dominant body, rebuilt when
 /// the staged body id/seed/dims change (SOI transfer mid-flight).
+/// The bake (524k texels × 13 octaves) used to run synchronously on
+/// whichever thread first sampled it — the frame a body became
+/// dominant stalled outright (C12-F5). On native it now runs on a
+/// worker thread: [`Self::field`] returns a flat datum stand-in
+/// until the real field lands, so every caller (camera floor,
+/// shadow anchor, ocean cull, packet displacement) still samples
+/// the SAME field the shader draws — the honest "surface" while the
+/// bake is in flight. wasm has no threads and keeps the synchronous
+/// path (a one-time hitch the demo already pays at startup).
 /// Presentation data only.
 #[derive(Resource, Default)]
 pub struct TerrainCache {
@@ -188,25 +197,133 @@ pub struct TerrainCache {
     key: Option<(String, u64)>,
     /// The baked field.
     field: Option<Arc<rt::HeightField>>,
+    /// Completed fields per `(body_id, seed)` — a body visited
+    /// before swaps back in instantly (bounded by body count).
+    done: BTreeMap<(String, u64), Arc<rt::HeightField>>,
+    /// The in-flight background bake for `key` (native only).
+    #[cfg(not(target_arch = "wasm32"))]
+    pending: Option<std::sync::Mutex<std::sync::mpsc::Receiver<Arc<rt::HeightField>>>>,
+    /// The flat datum stand-in drawn while `pending` runs —
+    /// zero-height, so the drawn surface equals `radius_m` and the
+    /// camera floor / shadow / ocean tests bound it exactly.
+    flat: Option<Arc<rt::HeightField>>,
 }
 
 impl TerrainCache {
-    /// The heightfield for `(body_id, seed)` — baked on first use, then
-    /// Arc-shared (the packet clones are free).
+    /// The heightfield for `(body_id, seed)` — the real field once
+    /// baked, the flat stand-in while a background bake is in flight
+    /// (both share the caller contract "this is the surface the frame
+    /// draws").
     fn field(&mut self, body_id: &str, seed: u64) -> Arc<rt::HeightField> {
         let key = (body_id.to_owned(), seed);
         if self.key.as_ref() != Some(&key) {
-            self.field = Some(Arc::new(rt::HeightField::bake(
-                seed,
-                HEIGHTFIELD_W,
-                HEIGHTFIELD_H,
-            )));
+            // A body visited before swaps back in for free.
+            self.field = self.done.get(&key).cloned();
+            self.flat = None;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                self.pending = None;
+                if self.field.is_none() {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    match std::thread::Builder::new()
+                        .name("terrain-heightfield-bake".into())
+                        .spawn(move || {
+                            let _ = tx.send(Arc::new(rt::HeightField::bake(
+                                seed,
+                                HEIGHTFIELD_W,
+                                HEIGHTFIELD_H,
+                            )));
+                        }) {
+                        Ok(_handle) => self.pending = Some(std::sync::Mutex::new(rx)),
+                        Err(e) => {
+                            log::warn!(
+                                "terrain: bake thread failed to spawn ({e}) — baking inline"
+                            );
+                            self.field = Some(Arc::new(rt::HeightField::bake(
+                                seed,
+                                HEIGHTFIELD_W,
+                                HEIGHTFIELD_H,
+                            )));
+                        }
+                    }
+                }
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                if self.field.is_none() {
+                    self.field = Some(Arc::new(rt::HeightField::bake(
+                        seed,
+                        HEIGHTFIELD_W,
+                        HEIGHTFIELD_H,
+                    )));
+                }
+            }
             self.key = Some(key);
         }
-        // `key == self.key` here by construction.
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.field.is_none()
+            && let Some(rx) = &self.pending
+        {
+            let done = match rx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .try_recv()
+            {
+                Ok(f) => {
+                    self.field = Some(f);
+                    true
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => false,
+                // The worker died mid-bake — take the one-time hit
+                // rather than draw a datum sphere forever.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    log::warn!("terrain: background bake lost — baking inline");
+                    self.field = Some(Arc::new(rt::HeightField::bake(
+                        seed,
+                        HEIGHTFIELD_W,
+                        HEIGHTFIELD_H,
+                    )));
+                    true
+                }
+            };
+            if done {
+                self.pending = None;
+            }
+        }
+        // `key == self.key` here by construction; a completed field
+        // also joins `done` so a return visit is free.
+        if let Some(f) = self.field.as_ref()
+            && let Some(k) = self.key.as_ref()
+        {
+            self.done.entry(k.clone()).or_insert_with(|| Arc::clone(f));
+        }
         match self.field.as_ref() {
             Some(f) => Arc::clone(f),
-            None => Arc::new(rt::HeightField::bake(seed, HEIGHTFIELD_W, HEIGHTFIELD_H)),
+            None => self.flat_field(),
+        }
+    }
+
+    /// The zero-height stand-in — same dims, a content key that can
+    /// never collide with a real bake (`mix64` is bijective and
+    /// `!seed != seed`), so the renderer re-uploads on the swap.
+    /// Built once per key miss. wasm compiles it too (the `pending`
+    /// machinery is cfg'd out there; the call stays reachable in the
+    /// match arm either way).
+    fn flat_field(&mut self) -> Arc<rt::HeightField> {
+        if self.flat.is_none() {
+            let (w, h) = (HEIGHTFIELD_W, HEIGHTFIELD_H);
+            let seed = self.key.as_ref().map_or(0, |(_, s)| *s);
+            self.flat = Some(Arc::new(rt::HeightField {
+                width: w,
+                height: h,
+                data: vec![0.0; w as usize * h as usize],
+                key: csp_core::terrain::mix64(!seed) ^ (u64::from(w) << 32 | u64::from(h)),
+            }));
+        }
+        // `flat` is Some by construction.
+        match self.flat.as_ref() {
+            Some(f) => Arc::clone(f),
+            None => Arc::new(rt::HeightField::bake(0, HEIGHTFIELD_W, HEIGHTFIELD_H)),
         }
     }
 }

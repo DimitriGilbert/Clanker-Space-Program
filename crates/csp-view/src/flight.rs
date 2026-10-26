@@ -819,6 +819,15 @@ impl StagePlans {
 pub struct LatchedWeldCache {
     /// `VesselId.0` → the cached weld-derived render data.
     entries: BTreeMap<u64, LatchedWeld>,
+    /// `VesselId.0` → `(craft_fingerprint, vessel_parts output)` for
+    /// the InBubble vessels — the same craft-identity key, reusing
+    /// the per-part derivation (the `body_transforms` fold, the
+    /// per-collider-vertex AABB fold, `classify_weld_part`) across
+    /// frames instead of redoing it for a craft that only moves
+    /// (C12-F3). Entries drop the frame the vessel leaves the
+    /// bubble; a staging/jettison/breakup re-graph changes the
+    /// fingerprint and re-derives.
+    bubble_parts: BTreeMap<u64, (u64, Vec<FlightPart>)>,
 }
 
 /// One latched vessel's cached weld output — the render data
@@ -952,12 +961,34 @@ pub fn capture_sync_input(
             Some(VesselState::SurfaceLatched(_))
         )
     });
+    cache.bubble_parts.retain(|vid, _| {
+        matches!(
+            sim.vessels().get(&VesselId(*vid)).map(|v| &v.state),
+            Some(VesselState::InBubble(_))
+        )
+    });
     let mut vessels = Vec::new();
     let mut propulsion = Vec::new();
     for (id, vessel) in sim.vessels() {
         match &vessel.state {
             VesselState::InBubble(body) => {
-                let parts = vessel_parts(vessel.craft.as_ref(), &body.collider.hulls, art);
+                // The per-part render data is a pure function of the
+                // craft topology — cache it on the same fingerprint
+                // the latched path uses (C12-F3). Craft-less bodies
+                // stage the cheap hull-AABB fallback uncached.
+                let parts = match vessel.craft.as_ref() {
+                    Some(craft) => {
+                        let key = craft_fingerprint(craft);
+                        let entry = cache.bubble_parts.entry(id.0).or_insert_with(|| {
+                            (key, vessel_parts(Some(craft), &body.collider.hulls, art))
+                        });
+                        if entry.0 != key {
+                            *entry = (key, vessel_parts(Some(craft), &body.collider.hulls, art));
+                        }
+                        entry.1.clone()
+                    }
+                    None => vessel_parts(None, &body.collider.hulls, art),
+                };
                 let plumes = live_plumes(vessel.craft.as_ref(), body);
                 // §3.7's plasma driver: the per-area convective input the
                 // M4b thermal tick itself integrates — same `flow_sample`,
@@ -1445,10 +1476,10 @@ pub(crate) fn sync_flight(
     mut live: ResMut<LiveVesselCount>,
     mut prop: ResMut<VesselPropulsionStaged>,
 ) {
-    snap.env = staged.env.clone();
-    snap.vessels = staged.vessels.clone();
+    snap.env.clone_from(&staged.env);
+    snap.vessels.clone_from(&staged.vessels);
     live.0 = staged.live_vessels;
-    prop.0 = staged.propulsion.clone();
+    prop.0.clone_from(&staged.propulsion);
 }
 
 /// The flight chase-camera solve: an orbit camera in the *local-level
@@ -1538,7 +1569,14 @@ fn solve_chase_camera(
     MapCameraF64 {
         view_proj: mat4_mul(&proj, &view),
         eye,
-        distance_m: input.distance_m,
+        // The POST-clamp eye–focus distance, not the requested one:
+        // `vessel_shadow` recovers the craft as `eye − z_out·d`, so a
+        // stale pre-clamp `input.distance_m` slid the blob shadow and
+        // its altitude term off the hull whenever the terrain clamp
+        // engaged (C12-F4). This matches the map convention
+        // (`distance_m` = actual |eye − focus|) — the no-clamp path
+        // reduces to `input.distance_m` exactly.
+        distance_m: (eye - focus.com).norm(),
         valid: true,
     }
 }
@@ -2436,11 +2474,12 @@ fn emit_model_part(
     m: &crate::art::PartModel,
     vp: &[[f64; 4]; 4],
     eye: DVec3,
+    mtris: &mut Vec<crate::part_mesh::ModelTri>,
 ) {
     let (mlo, mhi) = p.shape.local_aabb();
-    let mut mtris = Vec::new();
-    crate::part_mesh::emit_model(m, mlo, mhi, &mut mtris);
-    for t in &mtris {
+    mtris.clear(); // scratch — the sibling kitbash path reuses `tris` the same way (C12-F3)
+    crate::part_mesh::emit_model(m, mlo, mhi, mtris);
+    for t in mtris.iter() {
         let world = [t.a, t.b, t.c].map(|q| b.pos + b.rot.rotate(p.transform.apply(q)));
         let [Some(c0), Some(c1), Some(c2)] = world.map(|q| project_into(vp, eye, q)) else {
             continue;
@@ -2625,6 +2664,7 @@ pub(crate) fn extract_flight(
         }
     };
     let mut tris = Vec::new();
+    let mut mtris = Vec::new();
     for b in &snap.vessels {
         for p in &b.parts {
             let base: [f32; 3] = if b.debris {
@@ -2635,7 +2675,7 @@ pub(crate) fn extract_flight(
             let (lo, hi) = p.shape.local_aabb();
             let z_span = (hi.z - lo.z).max(1e-9);
             if let Some(m) = &p.model {
-                emit_model_part(v, b, p, m, vp, eye);
+                emit_model_part(v, b, p, m, vp, eye, &mut mtris);
                 continue;
             }
             tris.clear();

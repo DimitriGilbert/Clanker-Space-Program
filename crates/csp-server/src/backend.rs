@@ -268,8 +268,58 @@ struct SaveFile {
     snapshot: WorldSnapshot,
 }
 
+/// The metadata-only leading slice of a [`SaveFile`] — the same
+/// leading fields in the same order, so `decode_from_slice` stops
+/// after `hash` and the embedded `WorldSnapshot` is never read or
+/// decoded. The file's own header *is* the index entry (C17-F1):
+/// `list_saves` decodes only this, keeping the call
+/// O(#saves × ~80 B) instead of O(total save bytes) on the serial
+/// game thread. The trade is declared: the index reports what the
+/// header claims; a save whose snapshot tail is truncated lists
+/// (its index entry is intact) and fails honestly at `load_save`.
+#[derive(Deserialize)]
+struct SaveHeader {
+    /// Format tag — [`SAVE_SCHEMA`].
+    schema: u32,
+    /// `World::clock().ticks()` at save time.
+    tick: u64,
+    /// The snapshot's state hash, hex.
+    hash: String,
+}
+
 const SAVE_SCHEMA: u32 = 1;
 const SAVE_EXT: &str = "cspsave";
+
+/// The save store's entry bound — mirrors the dashboard store's
+/// `MAX_DASHBOARDS`: a curated dir, not a database. A *new* name at
+/// the cap refuses; overwriting an existing save never counts
+/// (C17-F1 — unbounded distinct names were a disk-fill vector any
+/// token holder could drive).
+pub const MAX_SAVES: usize = 64;
+
+/// A single save's encoded byte bound — a snapshot is world state,
+/// not a blob store. Combined with [`MAX_SAVES`] the whole save dir
+/// is bounded (C17-F1).
+pub const MAX_SAVE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Bytes `list_saves` reads per `*.cspsave` — the [`SaveHeader`] is
+/// ~80 B (schema varint + tick varint + a 64-char hex hash); 4 KiB
+/// leaves generous headroom for a longer hash and never touches the
+/// snapshot payload.
+const SAVE_INDEX_READ: u64 = 4096;
+
+/// Decode `path`'s [`SaveHeader`] alone — the `list_saves` index
+/// read. `None` for an unreadable or undecodable prefix, exactly the
+/// disposition a full decode gave a corrupt entry.
+fn read_save_header(path: &std::path::Path) -> Option<SaveHeader> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::with_capacity(SAVE_INDEX_READ as usize);
+    file.take(SAVE_INDEX_READ).read_to_end(&mut bytes).ok()?;
+    let (header, _) =
+        bincode::serde::decode_from_slice::<SaveHeader, _>(&bytes, bincode_cfg()).ok()?;
+    Some(header)
+}
 
 fn hex(hash: &[u8; 32]) -> String {
     hash.iter().map(|b| format!("{b:02x}")).collect()
@@ -394,6 +444,25 @@ impl HostCore {
         self.save_dir.join(format!("{name}.{SAVE_EXT}"))
     }
 
+    /// The `*.cspsave` entry count — the [`MAX_SAVES`] bookkeeping.
+    /// A missing dir is zero saves.
+    fn save_count(&self) -> Result<usize, BackendError> {
+        let dir = match std::fs::read_dir(&self.save_dir) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(BackendError::Session(format!("save dir: {e}"))),
+        };
+        Ok(dir
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some(SAVE_EXT))
+            .count())
+    }
+
+    /// The saves on disk, metadata-only: every entry's index record
+    /// is its [`SaveHeader`] prefix, so this scans
+    /// O(#saves × [`SAVE_INDEX_READ`]) bytes — never the embedded
+    /// snapshots (C17-F1; a full decode per save on the serial game
+    /// thread stalled every submit/telemetry publish behind it).
     fn list_saves(&self) -> Result<Vec<SaveInfo>, BackendError> {
         let mut out = Vec::new();
         let dir = match std::fs::read_dir(&self.save_dir) {
@@ -406,16 +475,10 @@ impl HostCore {
             if path.extension().and_then(|e| e.to_str()) != Some(SAVE_EXT) {
                 continue;
             }
-            let bytes = match std::fs::read(&path) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let Ok((file, _)) =
-                bincode::serde::decode_from_slice::<SaveFile, _>(&bytes, bincode_cfg())
-            else {
+            let Some(header) = read_save_header(&path) else {
                 continue;
             };
-            if file.schema != SAVE_SCHEMA {
+            if header.schema != SAVE_SCHEMA {
                 continue;
             }
             out.push(SaveInfo {
@@ -424,8 +487,8 @@ impl HostCore {
                     .and_then(|s| s.to_str())
                     .unwrap_or_default()
                     .to_string(),
-                tick: file.tick,
-                hash: file.hash,
+                tick: header.tick,
+                hash: header.hash,
             });
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -457,6 +520,17 @@ impl HostCore {
 
     fn store_save(&self, name: &str) -> Result<SaveInfo, BackendError> {
         safe_name(name)?;
+        // The count cap runs before the (heavy) snapshot encode — a
+        // refused name must be cheap. Overwriting an existing file is
+        // exempt: the cap binds *new* entries, not updates (C17-F1).
+        // The host mutex serializes check-and-write within this host,
+        // mirroring `DashboardStore::save`'s write_lock critical
+        // section.
+        if !self.save_path(name).exists() && self.save_count()? >= MAX_SAVES {
+            return Err(BackendError::Session(format!(
+                "save cap {MAX_SAVES} reached — overwrite an existing name"
+            )));
+        }
         let snapshot = self
             .world
             .snapshot()
@@ -478,6 +552,14 @@ impl HostCore {
         };
         let bytes = bincode::serde::encode_to_vec(&file, bincode_cfg())
             .map_err(|e| BackendError::Session(format!("encode: {e}")))?;
+        // The byte cap runs before the write — a refused save must
+        // not land on disk at all (C17-F1).
+        if bytes.len() > MAX_SAVE_BYTES {
+            return Err(BackendError::Session(format!(
+                "save {name}: {} bytes exceeds the {MAX_SAVE_BYTES}-byte cap",
+                bytes.len()
+            )));
+        }
         std::fs::create_dir_all(&self.save_dir)
             .map_err(|e| BackendError::Session(format!("save dir: {e}")))?;
         std::fs::write(self.save_path(name), bytes)
@@ -1025,5 +1107,64 @@ mod tests {
         assert_eq!(report.target, target);
         assert!(!report.partial, "{report:?}");
         assert_eq!(report.reached, target);
+    }
+
+    /// C17-F1: the save store is bounded like the dashboard store —
+    /// [`MAX_SAVES`] distinct names fill it, the next *new* name
+    /// refuses, and overwriting an existing name still works (the
+    /// cap binds new entries, not updates). Without this every token
+    /// holder could mint `*.cspsave` files until the disk filled.
+    #[test]
+    fn store_save_is_capped_but_overwrites() {
+        let dir = std::env::temp_dir().join(format!("csp-backend-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let game = LocalGame::new(World::new(), dir.clone());
+        for i in 0..MAX_SAVES {
+            game.store_save(&format!("s{i}")).expect("store under cap");
+        }
+        let err = game.store_save("one-too-many").expect_err("cap refusal");
+        assert!(matches!(err, BackendError::Session(_)), "{err:?}");
+        // An existing name is an overwrite, not a new entry — it
+        // must still land even at the cap.
+        game.store_save("s0").expect("overwrite at cap");
+        assert_eq!(game.list_saves().expect("list").len(), MAX_SAVES);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// C17-F1: `list_saves` is the metadata-only index — it decodes
+    /// each file's [`SaveHeader`] prefix alone, so a save whose
+    /// snapshot tail is missing still lists (its index entry is
+    /// intact) and fails honestly at `load_save`, while a header-
+    /// undecodable file is skipped exactly as full-decode skipped it.
+    #[test]
+    fn list_saves_reads_headers_only() {
+        let dir = std::env::temp_dir().join(format!("csp-backend-idx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let game = LocalGame::new(World::new(), dir.clone());
+        game.store_save("whole").expect("save");
+        // A copy truncated to just past the header: undecodable as a
+        // `SaveFile` (the snapshot is gone), but its index entry —
+        // schema/tick/hash — is intact. A full-decode listing would
+        // drop it; the metadata index must list it.
+        let whole = std::fs::read(dir.join("whole.cspsave")).expect("read");
+        assert!(whole.len() > 256, "test needs a >256-byte save");
+        std::fs::write(dir.join("truncated.cspsave"), &whole[..256]).expect("write");
+        // A header-undecodable file (schema byte, then EOF mid-tick):
+        // nothing to index — skipped.
+        std::fs::write(dir.join("garbage.cspsave"), [SAVE_SCHEMA as u8]).expect("write");
+        let saves = game.list_saves().expect("list");
+        let names: Vec<_> = saves.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["truncated", "whole"], "sorted, garbage skipped");
+        // The truncated entry carries the real header metadata.
+        let truncated = saves
+            .iter()
+            .find(|s| s.name == "truncated")
+            .expect("listed");
+        let whole_info = saves.iter().find(|s| s.name == "whole").expect("listed");
+        assert_eq!(truncated.tick, whole_info.tick);
+        assert_eq!(truncated.hash, whole_info.hash);
+        // …but it cannot load — the honest failure lands at load.
+        assert!(game.load_save("truncated").is_err());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

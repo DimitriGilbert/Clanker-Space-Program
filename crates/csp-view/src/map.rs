@@ -518,10 +518,16 @@ pub struct MapScene {
     /// Per-body orbit line, sampled once (body elements never change).
     /// `None` = the body has no orbit (the star) or sampling failed.
     body_lines: Vec<Option<Vec<DVec3>>>,
-    /// Vessel lines keyed by the exact `OrbitState` they were sampled
-    /// from — a `§2.6.6` re-base or a new spawn replaces the elements,
-    /// which is the invalidation signal.
-    vessel_lines: BTreeMap<VesselId, (OrbitState, Option<Vec<DVec3>>)>,
+    /// Vessel lines keyed by an epsilon-quantized digest of the
+    /// `OrbitState` they were sampled from — a `§2.6.6` re-base or a
+    /// new spawn replaces the elements past the quantization steps,
+    /// which is the invalidation signal. The polyline is a whole-
+    /// conic silhouette: an InBubble vessel's per-frame osculating
+    /// refit moves it far less than a texel, so keying on the exact
+    /// state (whose `epoch` advances every frame) made a hit
+    /// structurally impossible — ~65 refits × 129 `state_at` solves
+    /// per map frame at the debris cap (C12-F2).
+    vessel_lines: BTreeMap<VesselId, VesselLine>,
     /// M5 node previews — see [`NodePreview`].
     node_lines: BTreeMap<VesselId, NodePreview>,
     /// System-frame Ap/Pe points on the *focused* orbit (vessel or
@@ -537,12 +543,91 @@ pub struct MapScene {
     pub(crate) site_markers: Vec<DVec3>,
 }
 
-/// One vessel's cached node preview: the `(orbit, node)` invalidation
-/// key, the predicted post-burn conic (parent-centred, like every
-/// sampled line), and the node point's parent-centred position.
+/// One vessel's cached orbit line: the quantized staleness key, the
+/// `OrbitState` it was sampled from (extract needs the parent id for
+/// the ride-along offset), and the sampled parent-centred polyline.
+struct VesselLine {
+    /// See [`orbit_line_key`].
+    key: OrbitLineKey,
+    /// The state the line was sampled from — `state.parent` rides the
+    /// extract's per-parent offset.
+    state: OrbitState,
+    /// The sampled polyline (`None` = unsampleable).
+    line: Option<Vec<DVec3>>,
+}
+
+/// Epsilon-quantized digest of an `OrbitState` for the polyline
+/// caches. The sampled line is a whole-conic silhouette — for
+/// identical *shape* the only epoch dependence is the `t ≥ 0` clip
+/// on open orbits — so per-frame refit noise must not invalidate:
+/// `a` quantizes relatively (orbits span 10⁵–10¹¹ m), `e` and the
+/// angles absolutely, and `epoch` in tick buckets coarse enough that
+/// an in-bubble fleet resamples on the order of seconds, not frames.
+/// Quantization (not a tolerance compare) is what bounds staleness —
+/// drift crossing a step edge resamples once and re-anchors.
+#[derive(Clone, PartialEq)]
+struct OrbitLineKey {
+    /// Central body the elements orbit.
+    parent: BodyId,
+    /// `semi_major_axis_m` / (`A_REL`·|a| + 1 m), rounded.
+    a: i64,
+    /// `eccentricity` / 1e-5 — the e≈1 classification sliver stays
+    /// narrow; a crossing resamples when the conic family flips.
+    e: i64,
+    /// `inclination_rad` / 1e-3.
+    inc: i64,
+    /// `ascending_node_rad` / 1e-3.
+    node: i64,
+    /// `arg_periapsis_rad` / 1e-3.
+    argp: i64,
+    /// `mean_anomaly_epoch_rad` / 1e-3 — only the `t < 0` clip reads
+    /// it, so it quantizes as coarsely as the other angles.
+    m0: i64,
+    /// `epoch.ticks()` / [`EPOCH_STEP_TICKS`].
+    epoch: i64,
+}
+
+/// Epoch bucket width for [`OrbitLineKey::epoch`] (ticks — 4 s at
+/// 64 Hz). Bounds how long the `t < 0` clip can lag the true epoch
+/// while still letting a free-falling fleet's lines persist.
+const EPOCH_STEP_TICKS: u64 = 256;
+
+/// The quantized invalidation key for a vessel `OrbitState` — see
+/// [`OrbitLineKey`]. NaN/∞ fields saturate to a fixed bucket (the
+/// state draws nothing either way — the key only orders refresh).
+fn orbit_line_key(state: &OrbitState) -> OrbitLineKey {
+    let el = &state.elements;
+    let q = |v: f64, step: f64| (v / step).round() as i64;
+    OrbitLineKey {
+        parent: state.parent.clone(),
+        // `a` spans 10⁵–10¹¹ m — an absolute step big enough to
+        // swallow refit noise would never invalidate an outer-planet
+        // conic, and `a/(|a|·rel)` is a constant, so the bucket is
+        // the SIGNED `ln(a)` quantized at 1e-4 (a relative change
+        // resamples, a fixed few-meter drift does not; hyperbolic
+        // a < 0 lands in negative buckets, still relative).
+        a: (el.semi_major_axis_m.signum() * el.semi_major_axis_m.abs().ln() / 1e-4).round() as i64,
+        e: q(el.eccentricity, 1e-5),
+        inc: q(el.inclination_rad, 1e-3),
+        node: q(el.ascending_node_rad, 1e-3),
+        argp: q(el.arg_periapsis_rad, 1e-3),
+        m0: q(el.mean_anomaly_epoch_rad, 1e-3),
+        epoch: (state.epoch.ticks() / EPOCH_STEP_TICKS) as i64,
+    }
+}
+
+/// One vessel's cached node preview: the `(orbit key, node)`
+/// invalidation pair (the same quantized rule the vessel lines use —
+/// a live vessel's scheduled node used to re-solve the predicted
+/// conic every frame too), the predicted post-burn conic
+/// (parent-centred, like every sampled line), and the node point's
+/// parent-centred position.
 struct NodePreview {
     /// The inputs this preview was derived from.
-    key: (OrbitState, ManeuverNode),
+    key: (OrbitLineKey, ManeuverNode),
+    /// The orbit the preview was derived from — `parent` rides the
+    /// extract's per-parent offset.
+    state: OrbitState,
     /// The predicted post-burn polyline (`None` = unsampleable).
     line: Option<Vec<DVec3>>,
     /// The node point's parent-centred position.
@@ -682,19 +767,7 @@ pub(crate) fn map_present(
             scene.body_lines[i] = sample_orbit(model, &state);
         }
     }
-    for (id, orbit, _node, _rails) in &snap.vessels {
-        let stale = scene
-            .vessel_lines
-            .get(id)
-            .is_none_or(|(cached, _)| cached != orbit);
-        if stale {
-            let line = sample_orbit(model, orbit);
-            scene.vessel_lines.insert(*id, (orbit.clone(), line));
-        }
-    }
-    scene
-        .vessel_lines
-        .retain(|id, _| snap.vessels.iter().any(|(vid, ..)| vid == id));
+    refresh_vessel_lines(model, &snap, &mut scene);
 
     refresh_node_previews(model, &snap, &mut scene);
 
@@ -967,13 +1040,37 @@ fn perifocal_to_inertial(v: DVec3, el: &KeplerElements) -> DVec3 {
     )
 }
 
+/// Vessel orbit lines — refreshed only when the orbit's quantized key
+/// moves (see [`orbit_line_key`]). Extracted from `map_present` so the
+/// breakup-scenario budget test can drive it directly.
+fn refresh_vessel_lines(model: &PatchedConics, snap: &MapSnapshot, scene: &mut MapScene) {
+    for (id, orbit, _node, _rails) in &snap.vessels {
+        let key = orbit_line_key(orbit);
+        let stale = scene.vessel_lines.get(id).is_none_or(|l| l.key != key);
+        if stale {
+            let line = sample_orbit(model, orbit);
+            scene.vessel_lines.insert(
+                *id,
+                VesselLine {
+                    key,
+                    state: orbit.clone(),
+                    line,
+                },
+            );
+        }
+    }
+    scene
+        .vessel_lines
+        .retain(|id, _| snap.vessels.iter().any(|(vid, ..)| vid == id));
+}
+
 /// M5 node previews — the same invalidation rule the vessel lines use:
 /// the predicted post-burn conic and the node point re-derive only
 /// when the `(orbit, node)` pair they came from changes.
 fn refresh_node_previews(model: &PatchedConics, snap: &MapSnapshot, scene: &mut MapScene) {
     for (id, orbit, node, _rails) in &snap.vessels {
         let Some(node) = node else { continue };
-        let key = (orbit.clone(), node.clone());
+        let key = (orbit_line_key(orbit), node.clone());
         let stale = scene.node_lines.get(id).is_none_or(|p| p.key != key);
         if stale {
             let predicted = csp_sim::maneuver::predict_maneuver(model, orbit, node).ok();
@@ -982,9 +1079,15 @@ fn refresh_node_previews(model: &PatchedConics, snap: &MapSnapshot, scene: &mut 
                 .state_at(orbit, SimTime::from_ticks(node.tick))
                 .ok()
                 .map(|(r, _)| r);
-            scene
-                .node_lines
-                .insert(*id, NodePreview { key, line, point });
+            scene.node_lines.insert(
+                *id,
+                NodePreview {
+                    key,
+                    state: orbit.clone(),
+                    line,
+                    point,
+                },
+            );
         }
     }
     scene.node_lines.retain(|id, _| {
@@ -1062,9 +1165,11 @@ pub(crate) fn extract_map(
             half_px,
         );
     }
-    for (id, (state, line)) in &scene.vessel_lines {
-        let Some(points) = line else { continue };
-        let Some(offset) = parent_pos(&state.parent) else {
+    for (id, entry) in &scene.vessel_lines {
+        let Some(points) = &entry.line else {
+            continue;
+        };
+        let Some(offset) = parent_pos(&entry.state.parent) else {
             skipped_lines += 1;
             continue;
         };
@@ -1089,11 +1194,10 @@ pub(crate) fn extract_map(
     // M5 predicted post-burn conics — the same parent-centred offset
     // convention; a failed prediction is "no line", never defaulted.
     for preview in scene.node_lines.values() {
-        let state = &preview.key.0;
         let Some(points) = preview.line.as_ref() else {
             continue;
         };
-        let Some(offset) = parent_pos(&state.parent) else {
+        let Some(offset) = parent_pos(&preview.state.parent) else {
             skipped_lines += 1;
             continue;
         };
@@ -1195,8 +1299,7 @@ pub(crate) fn extract_map(
     }
     // Node markers — a hollow ring reads "planned point", not a body.
     for preview in scene.node_lines.values() {
-        let state = &preview.key.0;
-        let (Some(p), Some(off)) = (preview.point, parent_pos(&state.parent)) else {
+        let (Some(p), Some(off)) = (preview.point, parent_pos(&preview.state.parent)) else {
             continue;
         };
         if let Some(ndc) = project(&cam, p + off) {
@@ -2181,6 +2284,72 @@ mod tests {
         // 3 bodies × (glow + disc) + the focused star's ring + 1 vessel
         // × (glow + disc) = 9 quads × 6 verts.
         assert_eq!(packet.markers.vertices.len(), 9 * 6);
+    }
+
+    /// C12-F2: the polyline cache must actually hit. A breakup-scale
+    /// fleet of InBubble-style orbits — freshly fitted each frame, so
+    /// `epoch` advances every call — resamples each line ONCE, then
+    /// holds it while only `epoch` and sub-quantization noise move.
+    /// Before the quantized key, every frame re-solved ~65 × 129
+    /// `state_at`s (~8.4k Kepler solves per map frame).
+    #[test]
+    fn in_bubble_fleet_does_not_resample_every_frame() {
+        let model = test_system();
+        let fleet: Vec<OrbitState> = (0..64)
+            .map(|i| OrbitState {
+                parent: BodyId::from("p"),
+                elements: circular_elements(7.0e5 + i as f64 * 1.0e3, i as f64 * 0.01),
+                epoch: SimTime::from_ticks(10_000),
+            })
+            .collect();
+        let mut scene = MapScene::default();
+        let snap = |tick: u64, fleet: &[OrbitState]| MapSnapshot {
+            tick: SimTime::from_ticks(tick),
+            vessels: fleet
+                .iter()
+                .enumerate()
+                .map(|(i, o)| {
+                    let mut o = o.clone();
+                    // The staged InBubble conic refits each frame:
+                    // epoch = now, elements wobble below the quanta.
+                    o.epoch = SimTime::from_ticks(tick);
+                    o.elements.mean_anomaly_epoch_rad += 1e-5;
+                    (VesselId(i as u64), o, None, false)
+                })
+                .collect(),
+        };
+        for frame in 0..3u64 {
+            let s = snap(10_000 + frame, &fleet);
+            refresh_vessel_lines(&model, &s, &mut scene);
+        }
+        // 64 vessels, one resample each (the first frame) — the next
+        // two frames moved only `epoch` (within its bucket) and `m0`
+        // (below 1e-3 rad), so every cached line still carries the
+        // FIRST frame's state.
+        assert_eq!(scene.vessel_lines.len(), 64);
+        for (i, entry) in &scene.vessel_lines {
+            assert_eq!(
+                entry.state.epoch,
+                SimTime::from_ticks(10_000),
+                "vessel {} resampled on an epoch/drift-only frame",
+                i.0
+            );
+            assert!(entry.line.is_some());
+        }
+        // A real conic change still invalidates.
+        let mut moved = fleet[0].clone();
+        moved.epoch = SimTime::from_ticks(10_002);
+        moved.elements.semi_major_axis_m *= 1.01;
+        let s = MapSnapshot {
+            tick: SimTime::from_ticks(10_002),
+            vessels: vec![(VesselId(0), moved, None, false)],
+        };
+        refresh_vessel_lines(&model, &s, &mut scene);
+        assert_eq!(
+            scene.vessel_lines[&VesselId(0)].state.epoch,
+            SimTime::from_ticks(10_002),
+            "a genuine element change must resample"
+        );
     }
 
     /// Pass-1: a physics-resident (InBubble) vessel is staged into

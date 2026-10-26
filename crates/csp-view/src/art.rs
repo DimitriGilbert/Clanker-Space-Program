@@ -96,7 +96,7 @@ pub fn load() -> ArtAssets {
         Ok(entries) => {
             for (name, e) in entries {
                 if let Entry::Mesh(m) = e {
-                    inner.models.insert(name.to_owned(), Arc::new(m));
+                    inner.models.insert(name, Arc::new(m));
                 }
             }
         }
@@ -107,7 +107,7 @@ pub fn load() -> ArtAssets {
             let mut t = TerrainTexSet::default();
             for (name, e) in entries {
                 if let Entry::Image(tex) = e {
-                    match name {
+                    match name.as_str() {
                         "albedo" => t.albedo = Some(tex),
                         "normal" => t.normal = Some(tex),
                         "water_nrm" => t.water = Some(tex),
@@ -212,7 +212,7 @@ pub(crate) fn srgb_to_linear(u: f32) -> f32 {
     }
 }
 
-fn decode(b: &[u8]) -> Result<Vec<(&str, Entry)>, String> {
+fn decode(b: &[u8]) -> Result<Vec<(String, Entry)>, String> {
     let mut r = Rd { b, p: 0 };
     if r.take(4)? != b"CSAR" {
         return Err("bad magic".to_string());
@@ -226,8 +226,10 @@ fn decode(b: &[u8]) -> Result<Vec<(&str, Entry)>, String> {
     for _ in 0..n {
         let kind = r.u8()?;
         let nlen = r.u8()? as usize;
+        // Owned per entry — the `&'static str` this used to `Box::leak`
+        // let the entry names outlive `load()`; every `View`
+        // construction leaked them again (C12-F6).
         let name = String::from_utf8_lossy(r.take(nlen)?).into_owned();
-        let name: &'static str = Box::leak(name.into_boxed_str());
         match kind {
             1 => out.push((name, Entry::Image(read_image(&mut r)?))),
             2 => {
@@ -503,9 +505,10 @@ mod tests {
         let payload = vec![7u8; (16 + 4 + 1) * 4];
         let pack = image_pack(4, 4, 1, 3, &payload);
         let entries = decode(&pack).unwrap();
-        let [("tex", Entry::Image(tex))] = entries.as_slice() else {
+        let [(name, Entry::Image(tex))] = entries.as_slice() else {
             panic!("expected one image entry, got {}", entries.len())
         };
+        assert_eq!(name, "tex");
         assert_eq!((tex.w, tex.h, tex.layers, tex.mips), (4, 4, 1, 3));
         assert_eq!(tex.data, payload);
     }

@@ -1583,6 +1583,26 @@ struct PendingCommand {
 /// FIFO's tail behind the re-queued pre-boundary commands, and restore
 /// pops exactly that many off the back.
 ///
+/// The vessel-arena capture mode — see `TickShadow::vessels`.
+enum VesselsShadow {
+    /// The whole arena, cloned — for write paths that can touch
+    /// arbitrary entries (`step_bubble_range`'s batch swap-back, the
+    /// SOI residence walk's oldest-debris eviction, merges).
+    Whole(BTreeMap<VesselId, Vessel>),
+    /// Per-item undo — `id → value at capture` (`None` = the id was
+    /// absent → removed on restore). For single-vessel write paths;
+    /// inserts undo via the `next_vessel_id` allocator bound.
+    PerItem(BTreeMap<VesselId, Option<Vessel>>),
+}
+
+/// The event-heap capture — the conservative whole-heap clone. The
+/// `mem::take`+filter scrub paths (vessel removal, residence
+/// transitions) rewrite the heap wholesale; per-item undo needs every
+/// write site funneled through a recorder, which the scrub sites keep
+/// out of reach — the clone stays the honest capture here (C4a-F5's
+/// arena half rides `VesselsShadow::PerItem` instead).
+type EventsShadow = BinaryHeap<ScheduledEvent>;
+
 /// The M1 fields are **lazy captures**: most iterations mutate neither
 /// the vessel arena nor the event heap (an event-free interval touches
 /// only the clock), so each is cloned only when the iteration is about
@@ -1615,7 +1635,15 @@ struct TickShadow {
     /// `None` = the counter did not exist before this tick.
     seq_restore: Vec<((SourceClass, u32), Option<u64>)>,
     /// `vessels` — captured before the iteration's first arena write.
-    vessels: Option<BTreeMap<VesselId, Vessel>>,
+    /// `Whole` is the indiscriminate capture (the per-tick physics
+    /// pass, the SOI residence walk — paths that can touch arbitrary
+    /// arena entries); `PerItem` records the pre-write value of each
+    /// declared vessel so a single-vessel command no longer
+    /// deep-clones the whole arena (craft graphs, tanks, science)
+    /// per command (C4a-F5). Inserts undo via `next_vessel_id`:
+    /// every allocation takes the monotonic counter, so restore
+    /// drops every id at/above the captured value.
+    vessels: Option<VesselsShadow>,
     /// `next_vessel_id` — captured with `vessels`.
     next_vessel_id: Option<u64>,
     /// `joints` + `joint_refused` — captured with `vessels` (M6-B: all
@@ -1633,7 +1661,11 @@ struct TickShadow {
     /// `tracked_vessels` — captured before the first opt-in mutation.
     tracked_vessels: Option<BTreeSet<VesselId>>,
     /// `event_heap` — captured before the first push/class rewrite.
-    event_heap: Option<BinaryHeap<ScheduledEvent>>,
+    /// `Whole` is the conservative clone (scrub paths rewrite the
+    /// heap wholesale); `Ops` is the per-item undo log the common
+    /// push/pop paths record into — a fired event's few pushes no
+    /// longer clone the whole heap per shadow (C4a-F5).
+    event_heap: Option<EventsShadow>,
     /// `next_event_seq` — captured with `event_heap`.
     next_event_seq: Option<u64>,
     /// `transfers` — captured before the first arena write (M6-D:
@@ -1754,8 +1786,27 @@ impl TickShadow {
     /// iteration's restore must still pop.
     #[allow(clippy::cognitive_complexity)]
     fn merge_committed(&mut self, committed: TickShadow) {
-        if self.vessels.is_none() {
-            self.vessels = committed.vessels;
+        match (self.vessels.take(), committed.vessels) {
+            // A `Whole` capture means the child may have written any
+            // entry — the parent must gain pre-command values for
+            // every id it hasn't recorded. For `PerItem` parents those
+            // ARE the child's capture: an id the parent lacks was not
+            // written by an earlier item, so the child's value for it
+            // is the parent's pre-item value.
+            (Some(VesselsShadow::PerItem(mut p)), Some(VesselsShadow::Whole(w))) => {
+                for (id, v) in w {
+                    p.entry(id).or_insert(Some(v));
+                }
+                self.vessels = Some(VesselsShadow::PerItem(p));
+            }
+            (Some(VesselsShadow::PerItem(mut p)), Some(VesselsShadow::PerItem(c))) => {
+                for (id, v) in c {
+                    p.entry(id).or_insert(v);
+                }
+                self.vessels = Some(VesselsShadow::PerItem(p));
+            }
+            (Some(m), _) => self.vessels = Some(m), // parent Whole — earliest wins
+            (None, c) => self.vessels = c,
         }
         if self.next_vessel_id.is_none() {
             self.next_vessel_id = committed.next_vessel_id;
@@ -1882,10 +1933,29 @@ impl TickShadow {
             }
         }
         if let Some(v) = self.vessels {
-            world.vessels = v;
+            match v {
+                VesselsShadow::Whole(arena) => world.vessels = arena,
+                VesselsShadow::PerItem(touched) => {
+                    for (id, old) in touched {
+                        match old {
+                            Some(v) => {
+                                world.vessels.insert(id, v);
+                            }
+                            None => {
+                                world.vessels.remove(&id);
+                            }
+                        }
+                    }
+                }
+            }
         }
         if let Some(v) = self.next_vessel_id {
             world.next_vessel_id = v;
+            // PerItem restore only: inserts drew from the monotonic
+            // allocator, so every id at/above the captured counter is
+            // a this-iteration insertion to drop. Harmless after a
+            // Whole restore (no such ids exist there).
+            world.vessels.retain(|id, _| id.0 < v);
         }
         if let Some(v) = self.joints {
             world.joints = v;
@@ -3297,7 +3367,7 @@ impl World {
     /// the first write to either inside an iteration.
     fn shadow_vessels(&mut self, shadow: &mut TickShadow) {
         if shadow.vessels.is_none() {
-            shadow.vessels = Some(self.vessels.clone());
+            shadow.vessels = Some(VesselsShadow::Whole(self.vessels.clone()));
             shadow.next_vessel_id = Some(self.next_vessel_id);
             // M6-B: joint bookkeeping travels with the arena — a
             // rollback restoring vessels restores the joint island to
@@ -3307,6 +3377,27 @@ impl World {
             // M9b: the instance allocator travels with the arena —
             // allocated only where the arena is shadowed.
             shadow.next_part_instance_id = Some(self.next_part_instance_id);
+        }
+    }
+
+    /// Per-item arena capture — the single-vessel-command half of
+    /// `shadow_vessels`. Call before writes keyed to `id` (+ anything
+    /// allocated through `next_vessel_id`, which restore drops via
+    /// the captured counter). No-op once either capture mode exists;
+    /// a `PerItem` capture merges into `Whole` parents per
+    /// `merge_committed`'s earliest-wins rule.
+    fn shadow_vessel(&mut self, shadow: &mut TickShadow, id: VesselId) {
+        if shadow.vessels.is_none() {
+            shadow.vessels = Some(VesselsShadow::PerItem(BTreeMap::new()));
+            shadow.next_vessel_id = Some(self.next_vessel_id);
+            shadow.joints = Some(self.joints.clone());
+            shadow.joint_refused = Some(self.joint_refused.clone());
+            shadow.next_part_instance_id = Some(self.next_part_instance_id);
+        }
+        if let Some(VesselsShadow::PerItem(touched)) = shadow.vessels.as_mut() {
+            touched
+                .entry(id)
+                .or_insert_with(|| self.vessels.get(&id).cloned());
         }
     }
 
@@ -3388,7 +3479,7 @@ impl World {
                     .get(&vessel)
                     .and_then(|v| v.craft.clone())
                     .ok_or(SimError::Fatal("latched vessel has no craft"))?;
-                self.shadow_vessels(shadow);
+                self.shadow_vessel(shadow, vessel);
                 let mut body = csp_phys::weld(&craft.graph, &craft.parts)
                     .map_err(|e| SimError::Fatal(e.reason()))?;
                 // The weld supplies `com_local` — the restore stamps
@@ -3439,7 +3530,7 @@ impl World {
             // body writes (`SetThrottle`, `SetAttitude`) — the capture
             // must precede them or a drain-side write escapes the
             // iteration shadow entirely.
-            Some(VesselState::InBubble(_)) => self.shadow_vessels(shadow),
+            Some(VesselState::InBubble(_)) => self.shadow_vessel(shadow, vessel),
         }
         match &mut self
             .vessels
@@ -4371,7 +4462,7 @@ impl World {
         if !self.vessels.contains_key(&vessel) {
             return;
         }
-        self.shadow_vessels(shadow);
+        self.shadow_vessel(shadow, vessel);
         self.shadow_tracked(shadow);
         // M7-A: the vessel's research projects die with it — drop the
         // records (work-in-progress is lost, no accrual) so the heap
@@ -5128,7 +5219,7 @@ impl World {
         };
         self.orbits.body_orbit(&orbit.parent)?;
         self.orbits.state_at(&orbit, self.clock)?;
-        self.shadow_vessels(shadow);
+        self.shadow_vessel(shadow, VesselId(self.next_vessel_id));
         let id = VesselId(self.next_vessel_id);
         self.next_vessel_id = self
             .next_vessel_id
@@ -5372,7 +5463,7 @@ impl World {
             let alt = (body.com_world() - env.body_center).norm() - env.radius_m;
             csp_phys::ambient_k(env, alt)
         };
-        self.shadow_vessels(shadow);
+        self.shadow_vessel(shadow, VesselId(self.next_vessel_id));
         // M9b §3.4: allocate the part-instance records — the
         // "drawn once at part creation" point, before the vessel
         // exists (the allocator rides `shadow_vessels`' counter
@@ -5516,7 +5607,7 @@ impl World {
             }
             elements
         };
-        self.shadow_vessels(shadow);
+        self.shadow_vessel(shadow, vessel);
         let vessel_mut = self
             .vessels
             .get_mut(&vessel)
@@ -5754,7 +5845,7 @@ impl World {
             return Err(SimError::Recoverable("to-bubble: vessel has no craft"));
         };
         let (r, vel) = self.orbits.state_at(orbit_state, self.clock)?;
-        self.shadow_vessels(shadow);
+        self.shadow_vessel(shadow, vessel);
         let mut body = csp_phys::weld(&craft.graph, &craft.parts)
             .map_err(|e| SimError::Recoverable(e.reason()))?;
         // The conic contributes pos/vel only — rot/ang_vel/throttle/
@@ -5872,7 +5963,7 @@ impl World {
             ));
         }
         maneuver::node_dv_world(r, v, dv_prograde_mps, dv_normal_mps, dv_radial_mps)?;
-        self.shadow_vessels(shadow);
+        self.shadow_vessel(shadow, vessel);
         self.vessels
             .get_mut(&vessel)
             .ok_or(SimError::Fatal("maneuver: vessel vanished"))?
@@ -5905,7 +5996,7 @@ impl World {
         if v.maneuver.is_none() {
             return Err(SimError::Recoverable("maneuver delete: no node"));
         }
-        self.shadow_vessels(shadow);
+        self.shadow_vessel(shadow, vessel);
         let v = self
             .vessels
             .get_mut(&vessel)
@@ -5989,7 +6080,7 @@ impl World {
         if !(dv_total.is_finite() && dv_total > 0.0) {
             return Err(SimError::Recoverable("node start: degenerate dv"));
         }
-        self.shadow_vessels(shadow);
+        self.shadow_vessel(shadow, vessel);
         let mut body = csp_phys::weld(&craft.graph, &craft.parts)
             .map_err(|e| SimError::Recoverable(e.reason()))?;
         // Same materialization contract as `ToBubble`: the conic
@@ -6164,7 +6255,7 @@ impl World {
         if v.aero_mask == mask
             && let VesselState::InBubble(_) = v.state
         {
-            self.shadow_vessels(shadow);
+            self.shadow_vessel(shadow, vessel);
             if let Some(VesselState::InBubble(b)) =
                 self.vessels.get_mut(&vessel).map(|v| &mut v.state)
             {
@@ -6235,7 +6326,7 @@ impl World {
                 .copied()
                 .unwrap_or(mask)
         };
-        self.shadow_vessels(shadow);
+        self.shadow_vessel(shadow, vessel);
         let v = self
             .vessels
             .get_mut(&vessel)
@@ -6347,7 +6438,7 @@ impl World {
         body.ang_vel = ang_vel;
         body.throttle = throttle;
         body.settle = settle;
-        self.shadow_vessels(shadow);
+        self.shadow_vessel(shadow, vessel);
         let v = self
             .vessels
             .get_mut(&vessel)
@@ -6537,7 +6628,7 @@ impl World {
             })
             .cloned()
             .collect();
-        self.shadow_vessels(shadow);
+        self.shadow_vessel(shadow, vessel);
         let id = VesselId(self.next_vessel_id);
         self.next_vessel_id = self
             .next_vessel_id

@@ -22,6 +22,10 @@ function DashboardPage() {
   const [connDetail, setConnDetail] = useState('')
   const [rateHz, setRateHz] = useState(16)
   const frame = useRef<TelemetryFrame | null>(null)
+  // The pending-rAF handle for render coalescing (C21-F2): one
+  // animation frame collapses a burst of WS messages into a single
+  // re-render — see `onFrame` below.
+  const raf = useRef<number | null>(null)
   const [, force] = useState(0)
 
   useEffect(() => {
@@ -37,7 +41,20 @@ function DashboardPage() {
         rateHz: loaded.dashboard.rate_hz,
         onFrame: (f) => {
           frame.current = f
-          force((n) => n + 1)
+          // Coalesce renders to the display's cadence (C21-F2): each
+          // WS message is a distinct macrotask, so React batching
+          // can't merge them — a 64 Hz subscription forced a full
+          // dashboard re-render per message. The stream's contract is
+          // drop-to-latest: only `frame.current` ever paints, so one
+          // queued rAF per burst is the honest rendering of it. A
+          // hidden tab simply skips renders (rAF doesn't fire) and
+          // paints the newest frame on return.
+          if (raf.current === null) {
+            raf.current = requestAnimationFrame(() => {
+              raf.current = null
+              force((n) => n + 1)
+            })
+          }
         },
         onRate: (hz) => setRateHz(hz),
         onState: (s, detail) => {
@@ -49,6 +66,13 @@ function DashboardPage() {
     return () => {
       cancelled = true
       close?.()
+      // Cancel any queued coalesced render — a rAF that outlives the
+      // subscription would force one last setState for a stream that
+      // is already closed.
+      if (raf.current !== null) {
+        cancelAnimationFrame(raf.current)
+        raf.current = null
+      }
     }
   }, [token])
 
