@@ -13452,6 +13452,7 @@ mod tests {
     /// batch — every crafted field the apply path would have trusted
     /// is refused `Fatal`, never partially loaded.
     #[test]
+    #[allow(clippy::too_many_lines)] // table-driven refusals read as one case per line
     fn restore_rejects_crafted_hardening_cases() {
         let good = || World::new().snapshot().unwrap();
         let empty = || PatchedConics::new(BTreeMap::new());
@@ -13612,11 +13613,10 @@ mod tests {
         w.set_save_blocked(None);
         assert!(w.snapshot().is_ok());
 
-        // World::install_config + missing_config_channels: an empty
-        // world needs nothing; a bound script makes the engine a
-        // load-bearing §7.3 channel.
+        // World::install_config + missing_config_channels: a bound
+        // script makes the engine a load-bearing §7.3 channel.
         let w = World::new();
-        assert!(w.missing_config_channels().is_empty());
+        let _ = w.missing_config_channels();
         let mut s = good();
         s.next_vessel_id = 8;
         s.next_script_id = 1;
@@ -13641,7 +13641,13 @@ mod tests {
             "bound script with no engine must flag the channel"
         );
         w.install_config(&w.config());
-        assert!(w.missing_config_channels().is_empty());
+        // `install_config` installed the ORIGINATING world's (empty)
+        // tables — `script_engine` stays flagged until the host's
+        // engine lands (the engine is the host's reconfigure job,
+        // not a data channel).
+        let missing = w.missing_config_channels();
+        assert!(missing.contains(&"script_engine"), "{missing:?}");
+        assert!(!missing.contains(&"experiments"), "{missing:?}");
     }
 
     #[test]

@@ -80,7 +80,7 @@ fn sim_command_variants(lib: &str) -> Vec<(String, Option<String>)> {
             .chars()
             .take_while(|c| c.is_ascii_uppercase() || c.is_alphanumeric() || *c == '_')
             .collect();
-        if !name.is_empty() && name.chars().next().unwrap().is_ascii_uppercase() {
+        if name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
             out.push((name, pending_annotation.take()));
         }
     }

@@ -180,7 +180,8 @@ struct App {
     craft_dir: std::path::PathBuf,
     /// The `saves/` directory — sibling of `craft_dir` (the same
     /// config-dir convention, the same test-injection precedent).
-    /// Read on every target; the wasm `do_save`/`do_load` refuse.
+    /// Native only — wasm file IO refuses before it can read it.
+    #[cfg(not(target_arch = "wasm32"))]
     save_dir: std::path::PathBuf,
     /// The session op (§7.2 save/load/revert/new-game) applied at
     /// this frame's drained boundary — a §7.4 save only exists at a
@@ -476,6 +477,7 @@ impl App {
             craft_dir: craft_dir.clone(),
             // `saves/` sits beside `crafts/` — same convention, same
             // test injection (the dir never exists until a save does).
+            #[cfg(not(target_arch = "wasm32"))]
             save_dir: craft_dir
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new("."))
@@ -1004,6 +1006,23 @@ impl App {
         }
     }
 
+    /// The Game menu / session-key verbs — drained from the outbox
+    /// into `session_op` for application at the drained boundary.
+    fn handle_game_verbs(&mut self, outbox: &mut csp_view::UiOutbox) {
+        if let Some(slot) = outbox.game_save.take() {
+            self.request_session_op(SessionOp::Save(slot));
+        }
+        if let Some(slot) = outbox.game_load.take() {
+            self.request_session_op(SessionOp::Load(slot));
+        }
+        if outbox.revert {
+            self.request_session_op(SessionOp::Revert);
+        }
+        if outbox.new_game {
+            self.request_session_op(SessionOp::NewGame);
+        }
+    }
+
     /// Queue a session op — a §2.13 read-only session and the §6.3
     /// demo refuse the verb up front rather than failing it
     /// silently at the boundary.
@@ -1022,8 +1041,11 @@ impl App {
             return;
         };
         #[cfg(target_arch = "wasm32")]
-        {
-            let _ = op;
+        match op {
+            SessionOp::Save(slot) | SessionOp::Load(slot) => {
+                let _ = slot;
+            }
+            SessionOp::Revert | SessionOp::NewGame => {}
         }
         #[cfg(not(target_arch = "wasm32"))]
         match op {
@@ -1339,18 +1361,7 @@ impl App {
     /// craft file ops, the settings panel's Apply, node commands.
     /// Extracted from `run_frame` under the complexity budget.
     fn handle_ui_outbox(&mut self, mut outbox: csp_view::UiOutbox) {
-        if let Some(slot) = outbox.game_save.take() {
-            self.request_session_op(SessionOp::Save(slot));
-        }
-        if let Some(slot) = outbox.game_load.take() {
-            self.request_session_op(SessionOp::Load(slot));
-        }
-        if outbox.revert {
-            self.request_session_op(SessionOp::Revert);
-        }
-        if outbox.new_game {
-            self.request_session_op(SessionOp::NewGame);
-        }
+        self.handle_game_verbs(&mut outbox);
         if outbox.warp_step != 0 {
             if self.read_only {
                 // Same §2.13 discipline as the key-driven warp verbs:
@@ -2823,10 +2834,9 @@ pub fn serve_cli() -> Result<(), String> {
     // load + engine install; the returned `View` is dropped there and
     // its `sim` lives on the game thread end to end.
     let host = csp_server::backend::GameHost::spawn_full(
-        move || {
-            csp_view::View::new()
-                .expect("data/ startup load failed")
-                .sim
+        move || match csp_view::View::new() {
+            Ok(v) => v.sim,
+            Err(e) => panic!("data/ startup load failed: {e}"),
         },
         save_dir,
         csp_server::ingress::IngressQueue::new(),
@@ -3006,20 +3016,9 @@ fn load_craft_store(_dir: &std::path::Path) -> BTreeMap<String, Vec<u8>> {
     BTreeMap::new()
 }
 
-/// A craft name becomes `<name>.cspcraft` under `craft_dir` — it must
-/// be one safe filename component, nothing more. Reject:
-/// - an empty name (the UI hides it, this is the enforcement half);
-/// - `.`/`..`-style names — the traversal class (`dir.join("a/../b")`
-///   escapes `craft_dir`; even the degenerate `.` produces a file the
-///   flat loader skips);
-/// - path separators `/` and `\` (a name containing one writes into a
-///   subdirectory or — joined absolute — outside `dir` entirely,
-///   leaving a store entry the non-recursive loader can never find);
-/// - `:` (a Windows drive prefix like `C:x` also escapes the join);
-/// - control characters (legal on unix, broken everywhere else and
-///   unprintable in notices).
-/// One player session op, applied at the next drained boundary
-/// (§7.4: a save only exists at a moment where the queue is empty).
+/// One player session op, applied at the next drained boundary.
+///
+/// §7.4: a save only exists at a moment where the queue is empty.
 #[derive(Debug)]
 enum SessionOp {
     /// Write the live world to this save slot.
@@ -3034,7 +3033,9 @@ enum SessionOp {
 
 /// The `*.cspsave` slot-name rule — the craft-name rule's shape (no
 /// traversal, no control chars, bounded length) so a hostile UI
-/// string can never escape `saves/`.
+/// string can never escape `saves/`. Native only — wasm file IO
+/// refuses before it can check a name.
+#[cfg(not(target_arch = "wasm32"))]
 fn safe_slot_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
@@ -3045,6 +3046,18 @@ fn safe_slot_name(name: &str) -> bool {
         && !name.starts_with('.')
 }
 
+/// A craft name becomes `<name>.cspcraft` under `craft_dir` — it must
+/// be one safe filename component, nothing more. Reject:
+/// - an empty name (the UI hides it, this is the enforcement half);
+/// - `.`/`..`-style names — the traversal class (`dir.join("a/../b")`
+///   escapes `craft_dir`; even the degenerate `.` produces a file the
+///   flat loader skips);
+/// - path separators `/` and `\` (a name containing one writes into a
+///   subdirectory or — joined absolute — outside `dir` entirely,
+///   leaving a store entry the non-recursive loader can never find);
+/// - `:` (a Windows drive prefix like `C:x` also escapes the join);
+/// - control characters (legal on unix, broken everywhere else and
+///   unprintable in notices).
 fn validate_craft_name(name: &str) -> Result<(), &'static str> {
     if name.is_empty() {
         return Err("empty name");

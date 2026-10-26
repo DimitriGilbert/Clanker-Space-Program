@@ -5662,4 +5662,55 @@ mod tests {
             "the delivery takes focus like a spawn did"
         );
     }
+
+    /// The player save path end to end (§7.2 + §7.5): `save_game`'s
+    /// payload round-trips the codec, `load_game` rebuilds a world
+    /// that hashes identically and keeps ticking identically — the
+    /// same proof §7.5's replay golden demands, at the player seam.
+    #[test]
+    fn player_save_load_round_trips() {
+        let mut view = View::new_demo().unwrap();
+        view.begin_frame();
+        view.sim_step(view.sim.clock().ticks() + 64).unwrap();
+        view.end_frame();
+        let hash_before = view.sim.state_hash().unwrap();
+        let save = view.save_game().expect("save at drained boundary");
+        let bytes = save::encode_save(&save).unwrap();
+        let decoded = save::decode_save(&bytes).unwrap();
+        let warnings = view.load_game(decoded.snapshot).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(view.sim.state_hash().unwrap(), hash_before);
+        // And a restored world still ticks deterministically.
+        view.begin_frame();
+        view.sim_step(view.sim.clock().ticks() + 32).unwrap();
+        view.end_frame();
+    }
+
+    /// PLAN §11.80: `launch_craft` captures the pre-launch snapshot;
+    /// `revert_to_launch` restores IT — the reverted world is back at
+    /// the captured tick with the captured hash, not merely "a
+    /// coherent world". The demo seeds its starter craft through
+    /// `launch_craft`, so a revert point exists from boot.
+    #[test]
+    fn revert_to_launch_restores_pre_launch_snapshot() {
+        let mut view = View::new_demo().unwrap();
+        let revert_tick = view.revert_tick().expect("demo seeds a revert point");
+        let tick0 = view.sim.clock().ticks();
+        view.begin_frame();
+        view.sim_step(view.sim.clock().ticks() + 16).unwrap();
+        view.end_frame();
+        assert!(view.sim.clock().ticks() > tick0);
+        view.revert_to_launch().expect("revert");
+        // The reverted world is AT the launch tick — the snapshot the
+        // launch was issued from, not the live world's state.
+        assert_eq!(view.sim.clock().ticks(), revert_tick);
+        // And it is itself a coherent restorable world — re-save and
+        // re-load lands the same hash.
+        let hash = view.sim.state_hash().unwrap();
+        let save = view.save_game().unwrap();
+        let bytes = save::encode_save(&save).unwrap();
+        let decoded = save::decode_save(&bytes).unwrap();
+        view.load_game(decoded.snapshot).unwrap();
+        assert_eq!(view.sim.state_hash().unwrap(), hash);
+    }
 }

@@ -1174,8 +1174,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// C17-F1: `list_saves` is the metadata-only index — it decodes
-    /// each file's [`SaveHeader`] prefix alone, so a save whose
+    /// C17-F1: `list_saves` is the metadata-only index — it reads
+    /// each file's plaintext CSPSAVE header alone, so a save whose
     /// snapshot tail is missing still lists (its index entry is
     /// intact) and fails honestly at `load_save`, while a header-
     /// undecodable file is skipped exactly as full-decode skipped it.
@@ -1185,16 +1185,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let game = LocalGame::new(World::new(), dir.clone());
         game.store_save("whole").expect("save");
-        // A copy truncated to just past the header: undecodable as a
-        // `SaveFile` (the snapshot is gone), but its index entry —
-        // schema/tick/hash — is intact. A full-decode listing would
-        // drop it; the metadata index must list it.
+        // A copy truncated to just past the CSPSAVE JSON header:
+        // undecodable as a full save (the compressed body is gone),
+        // but its index entry — version/tick/state_hash — is intact.
+        // A full-decode listing would drop it; the metadata index
+        // must list it.
         let whole = std::fs::read(dir.join("whole.cspsave")).expect("read");
-        assert!(whole.len() > 256, "test needs a >256-byte save");
-        std::fs::write(dir.join("truncated.cspsave"), &whole[..256]).expect("write");
-        // A header-undecodable file (schema byte, then EOF mid-tick):
-        // nothing to index — skipped.
-        std::fs::write(dir.join("garbage.cspsave"), [SAVE_SCHEMA as u8]).expect("write");
+        // CSPSAVE layout: magic(8) || header_len(u32le) || JSON ||
+        // body. Truncate at the header's end — the index entry is
+        // intact, the compressed body is entirely gone.
+        let hlen = u32::from_le_bytes(whole[8..12].try_into().expect("len")) as usize;
+        let cut = 12 + hlen;
+        assert!(whole.len() > cut + 16, "test needs a body");
+        std::fs::write(dir.join("truncated.cspsave"), &whole[..cut]).expect("write");
+        // A header-undecodable file (the CSPSAVE magic is wrong from
+        // byte zero — a bincode-era save or random bytes): nothing to
+        // index — skipped.
+        std::fs::write(dir.join("garbage.cspsave"), b"BINCODE").expect("write");
         let saves = game.list_saves().expect("list");
         let names: Vec<_> = saves.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["truncated", "whole"], "sorted, garbage skipped");
@@ -1208,6 +1215,42 @@ mod tests {
         assert_eq!(truncated.hash, whole_info.hash);
         // …but it cannot load — the honest failure lands at load.
         assert!(game.load_save("truncated").is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The format-unification proof (report-04 D1): `session.save`
+    /// writes a §7.2 CSPSAVE — `csp_sim::save::decode_save` reads it
+    /// back, and `session.load` rebuilds a world that hashes
+    /// identically (the recorded `state_hash` cross-check included).
+    #[test]
+    fn session_save_is_cspsave_and_round_trips_hash() {
+        let dir = std::env::temp_dir().join(format!("csp-backend-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let game = LocalGame::new(World::new(), dir.clone());
+        game.submit(0, SimCommand::AdvanceTo(64)).expect("step");
+        let hash_before = game.with_world(|w| w.state_hash().unwrap());
+        game.store_save("rt").expect("save");
+        // The file IS the §7.2 container — magic + decodeable body.
+        let bytes = std::fs::read(dir.join("rt.cspsave")).expect("read");
+        let save = csp_sim::save::decode_save(&bytes).expect("cspsave decode");
+        assert_eq!(save.state_hash, Some(hash_before));
+        // Tick forward so a wrong restore is visible, then load.
+        game.submit(0, SimCommand::AdvanceTo(128)).expect("step");
+        let summary = game.load_save("rt").expect("load");
+        // The bare `World::new()` host genuinely lacks `contract_defs`
+        // (board_size > 0, empty table) — the checklist names it
+        // honestly. What must NOT appear is a hash-divergence warning.
+        assert!(
+            summary.warnings.iter().all(|w| !w.contains("diverg")),
+            "{:?}",
+            summary.warnings
+        );
+        assert_eq!(summary.tick, 64);
+        let hash_after = game.with_world(|w| w.state_hash().unwrap());
+        assert_eq!(hash_after, hash_before);
+        // A foreign file is refused loudly, not decoded as bincode.
+        std::fs::write(dir.join("foreign.cspsave"), b"NOT_A_SAVE").expect("write");
+        assert!(game.load_save("foreign").is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 }
