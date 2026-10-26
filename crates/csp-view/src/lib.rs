@@ -3158,12 +3158,14 @@ impl View {
         self.world.resource_mut::<GameMenuRes>().ui.confirm_revert = true;
     }
 
-    /// Fire the launched craft's next stage: pop the front drop set
-    /// off [`flight::StagePlan`] and issue one logged `JettisonPart`
-    /// per node — the session's decoupler semantics ("severs all its
-    /// child edges") mapped onto the sim's v1 command surface.
-    /// Returns the nodes jettisoned (`0` = no stage left, or the
-    /// press was refused before popping).
+    /// Fire the launched craft's next stage: pop the front action set
+    /// off [`flight::StagePlan`] and issue its logged commands — a
+    /// `DeployPart` per staged deployable (the KSP staged-chute rule:
+    /// a parachute fires its stage to deploy) then one `JettisonPart`
+    /// per drop-set node, the session's decoupler semantics ("severs
+    /// all its child edges") mapped onto the sim's v1 command
+    /// surface. Returns the nodes acted on (`0` = no stage left, or
+    /// the press was refused before popping).
     ///
     /// The plan belongs to the vessel its launch spawned — NOT the
     /// flight focus, which a newer spawn or a breakup fragment can
@@ -3172,16 +3174,17 @@ impl View {
     /// whatever holds focus). [`flight::StagePlan::vessel_for`] binds
     /// that vessel once the spawn lands.
     ///
-    /// `JettisonPart` is `InBubble`-only in v1, so the pop happens
-    /// only after the bound vessel checks bubble-resident: on a
-    /// surface-latched pad craft or a rails vessel the commands would
-    /// all reject while the stage was still eaten — a silent no-op
-    /// that permanently spent the firing. Every outcome now lands a
-    /// [`flight::FlightSfx`] cue (the HUD's visible feedback
-    /// channel): the press either visibly does something or says why
-    /// not. Honest limitation: a jettisoned part leaves the sim
-    /// outright — no KSP-style debris fragment, and engines are
-    /// globally armed so a firing separates but never ignites.
+    /// `JettisonPart`/`DeployPart` are both `InBubble`-only in v1, so
+    /// the pop happens only after the bound vessel checks
+    /// bubble-resident: on a surface-latched pad craft or a rails
+    /// vessel the commands would all reject while the stage was still
+    /// eaten — a silent no-op that permanently spent the firing.
+    /// Every outcome now lands a [`flight::FlightSfx`] cue (the HUD's
+    /// visible feedback channel): the press either visibly does
+    /// something or says why not. Honest limitation: a jettisoned
+    /// part leaves the sim outright — no KSP-style debris fragment,
+    /// and engines are globally armed so a firing separates but never
+    /// ignites.
     #[allow(clippy::too_many_lines)] // the per-vessel plan table adds arms
     pub fn fire_stage(&mut self) -> usize {
         // Per-vessel plans (C13-F4): every launch pushed its own
@@ -3264,20 +3267,38 @@ impl View {
             }
         }
         // `stages` is stored front-first firing order; `remove(0)`
-        // takes the next firing (pop() would take the last).
-        let nodes = self.world.resource_mut::<flight::StagePlans>().plans[idx]
+        // takes the next firing (pop() would take the last). Deploys
+        // issue BEFORE jettisons — a chute staged alongside the
+        // decoupler that drops its own subtree must get its deploy
+        // record while the node still exists (a `DeployPart` naming
+        // a jettisoned node just rejects).
+        let actions = self.world.resource_mut::<flight::StagePlans>().plans[idx]
             .stages
             .remove(0);
-        let fired = nodes.len();
-        for node in nodes {
+        let (n_deploys, n_jettisons) = (actions.deploys.len(), actions.jettisons.len());
+        for node in actions.deploys {
+            self.enqueue_command(
+                SourceClass::Ui,
+                PLAYER_SOURCE_ID,
+                SimCommand::DeployPart { vessel, node },
+            );
+        }
+        for node in actions.jettisons {
             self.enqueue_command(
                 SourceClass::Ui,
                 PLAYER_SOURCE_ID,
                 SimCommand::JettisonPart { vessel, node },
             );
         }
-        self.flight_notice(format!("STAGED — {fired} PART(S) JETTISONED"));
-        fired
+        // The cue names what the firing actually did — a chute-only
+        // stage reads "DEPLOYED", not "0 PART(S) JETTISONED".
+        let notice = match (n_jettisons, n_deploys) {
+            (j, 0) => format!("STAGED — {j} PART(S) JETTISONED"),
+            (0, d) => format!("STAGED — {d} PART(S) DEPLOYED"),
+            (j, d) => format!("STAGED — {j} JETTISONED + {d} DEPLOYED"),
+        };
+        self.flight_notice(notice);
+        n_jettisons + n_deploys
     }
 
     /// Push a player-visible flight notice — a cue on the HUD's §3.7
@@ -4052,35 +4073,55 @@ impl Default for View {
 }
 
 /// The launch-time staging capture — the session's `stage_order`
-/// firing sequence resolved into per-firing drop sets for
-/// [`flight::StagePlan`]: each stage's drop set is every node in the
-/// subtree below each decoupler assigned to that stage (the session's
-/// "severs all its child edges" rule — the decoupler stays
-/// parent-side). Stages with no decoupler, or a decoupler severing
-/// nothing, contribute nothing.
-fn stage_plan_of(vab: &csp_ui::vab::VabSession) -> Vec<Vec<csp_phys::PartNodeId>> {
+/// firing sequence resolved into per-firing [`flight::StageActions`]
+/// for [`flight::StagePlan`]. Each stage contributes:
+///
+/// - *jettisons* — every node in the subtree below each decoupler
+///   assigned to the stage (the session's "severs all its child
+///   edges" rule — the decoupler stays parent-side);
+/// - *deploys* — every staged part whose def carries a
+///   `ModuleDef::Parachute`, the KSP staged-chute rule (a parachute
+///   fires its stage to deploy, not a right-click verb).
+///
+/// A part may land in both halves (a chute under a staged decoupler
+/// deploys, then leaves the sim with the drop set — `fire_stage`
+/// emits deploys first). Stages holding no decoupler and no
+/// deployable, or a decoupler severing nothing, contribute no
+/// firing.
+fn stage_plan_of(vab: &csp_ui::vab::VabSession) -> Vec<flight::StageActions> {
     let session = vab.session();
     let mut plan = Vec::new();
     for stage in session.stage_order() {
         let mut drop_set = std::collections::BTreeSet::new();
+        let mut deploy_set = std::collections::BTreeSet::new();
         for id in session.parts_in_stage(stage) {
-            let is_decoupler = vab.def_of(id).is_some_and(|d| {
-                d.modules
-                    .iter()
-                    .any(|m| matches!(m, csp_data::ModuleDef::Decoupler))
-            });
-            if !is_decoupler {
-                continue;
-            }
-            let mut stack = session.children_ids(id);
-            while let Some(n) = stack.pop() {
-                if drop_set.insert(n) {
-                    stack.extend(session.children_ids(n));
+            let Some(def) = vab.def_of(id) else { continue };
+            if def
+                .modules
+                .iter()
+                .any(|m| matches!(m, csp_data::ModuleDef::Decoupler))
+            {
+                let mut stack = session.children_ids(id);
+                while let Some(n) = stack.pop() {
+                    if drop_set.insert(n) {
+                        stack.extend(session.children_ids(n));
+                    }
                 }
             }
+            if def
+                .modules
+                .iter()
+                .any(|m| matches!(m, csp_data::ModuleDef::Parachute { .. }))
+            {
+                deploy_set.insert(id);
+            }
         }
-        if !drop_set.is_empty() {
-            plan.push(drop_set.into_iter().collect());
+        let actions = flight::StageActions {
+            jettisons: drop_set.into_iter().collect(),
+            deploys: deploy_set.into_iter().collect(),
+        };
+        if !actions.jettisons.is_empty() || !actions.deploys.is_empty() {
+            plan.push(actions);
         }
     }
     plan

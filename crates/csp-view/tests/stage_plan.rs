@@ -14,7 +14,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use csp_view::View;
-use csp_view::flight::{FlightSfx, StagePlan, StagePlans};
+use csp_view::flight::{FlightSfx, StageActions, StagePlan, StagePlans};
 
 /// One app frame's §2.5 loop, headlessly.
 fn frame(view: &mut View, ticks: u64) {
@@ -69,7 +69,16 @@ fn stage_press_on_a_parked_craft_refuses_instead_of_eating_the_stage() {
     // `vessel` preset skips the lazy fingerprint bind.
     view.world
         .insert_resource(StagePlans::single(StagePlan::bound_to(
-            vec![vec![drop_node], vec![drop_node]],
+            vec![
+                StageActions {
+                    jettisons: vec![drop_node],
+                    ..StageActions::default()
+                },
+                StageActions {
+                    jettisons: vec![drop_node],
+                    ..StageActions::default()
+                },
+            ],
             id,
         )));
 
@@ -172,7 +181,10 @@ fn stage_plan_fires_its_own_vessel_not_the_focus() {
     let drop_node = jettisonable(&view, first);
     view.world
         .insert_resource(StagePlans::single(StagePlan::bound_to(
-            vec![vec![drop_node]],
+            vec![StageActions {
+                jettisons: vec![drop_node],
+                ..StageActions::default()
+            }],
             first,
         )));
 
@@ -198,5 +210,97 @@ fn stage_plan_fires_its_own_vessel_not_the_focus() {
             .len(),
         5, // starter craft: pod + tank + engine + canister + battery
         "the focused vessel lost a node it never owned"
+    );
+}
+
+/// The KSP staged chute: a parachute assigned to a stage deploys on
+/// SPACE — `stage_plan_of` folds the stage's `ModuleDef::Parachute`
+/// nodes into the firing's deploy set, and `fire_stage` issues a
+/// logged `DeployPart` next to the drop-set jettisons. A stage
+/// holding only the chute (no decoupler) is a real firing.
+#[test]
+fn staged_parachute_deploys_on_stage_press() {
+    let mut view = View::new().expect("data/ load");
+    // Pod root + a chute snapped to its free 0.625 "top" node
+    // (`AttachAuto` finds the only size-class-matched pair), the
+    // chute staged at 1 — fires before the stage-0 floor the rest
+    // of the craft sits in. Built before the first frame so the
+    // progression gate is still the ungated `None` (§3.3 stages the
+    // tech mirror on `end_frame`).
+    let chute = view.with_vab_session(|v| {
+        v.apply(csp_ui::vab::VabAction::SetRoot(csp_data::PartId::from(
+            "csp.pod.mk1",
+        )))
+        .expect("pod root");
+        let pod = v.selected().expect("pod placed");
+        v.apply(csp_ui::vab::VabAction::AttachAuto {
+            part: csp_data::PartId::from("csp.chute.s125"),
+            parent: pod,
+        })
+        .expect("chute attach");
+        let chute = v.selected().expect("chute placed");
+        v.apply(csp_ui::vab::VabAction::SetStage {
+            node: chute,
+            stage: 1,
+        })
+        .expect("stage the chute");
+        chute
+    });
+
+    view.launch_craft().expect("launch");
+    // ManufactureCraft delivery — the vessel materializes
+    // surface-latched on the pad.
+    for _ in 0..200 {
+        frame(&mut view, 64);
+        if view.sim.builds().is_empty() {
+            break;
+        }
+    }
+    let (&id, _) = view.sim.vessels().iter().next().unwrap();
+
+    // The launch captured a firing whose deploy set names the chute
+    // — the session stage survives the spawn (the graph drops stage
+    // metadata, so the plan is the carrier).
+    {
+        let plans = view.world.resource::<StagePlans>();
+        assert!(
+            plans
+                .plans
+                .iter()
+                .any(|p| p.stages.iter().any(|s| s.deploys == [chute])),
+            "no staged deploy captured for the chute"
+        );
+    }
+
+    // Throttle unlatches the parked craft — the command is what
+    // unlatches, no engine needed. One tick: too few for the §2.6.4
+    // settle latch (128 ticks) to reclaim it.
+    view.enqueue_command(
+        csp_sim::SourceClass::Ui,
+        csp_view::PLAYER_SOURCE_ID,
+        csp_sim::SimCommand::SetThrottle {
+            vessel: id,
+            throttle: 1.0,
+        },
+    );
+    frame(&mut view, 1);
+    assert!(
+        matches!(
+            view.sim.vessels()[&id].state,
+            csp_sim::VesselState::InBubble(_)
+        ),
+        "throttle did not unlatch the pad craft"
+    );
+
+    assert_eq!(view.fire_stage(), 1, "the staged chute did not fire");
+    frame(&mut view, 1);
+    assert!(
+        view.sim.vessels()[&id].deployed.contains_key(&chute),
+        "the chute never deployed"
+    );
+    assert!(
+        cues(&view).iter().any(|c| c.contains("DEPLOYED")),
+        "no deploy cue landed: {:?}",
+        cues(&view)
     );
 }

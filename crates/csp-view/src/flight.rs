@@ -593,23 +593,43 @@ pub(crate) const SFX_TTL_FRAMES: u32 = 90;
 #[derive(Resource, Default)]
 pub struct FlightFrame(pub Option<csp_render::flight::FlightPacket>);
 
+/// One stage firing's actions — what KSP's SPACE press does: the
+/// stage's decouplers sever their drop subtrees AND its deployables
+/// (the `ModuleDef::Parachute` parts — v1's only deployable) flip
+/// armed → deployed. Either list may be empty; a stage holding only
+/// a parachute is still a real firing — it is exactly how a chute
+/// stages in KSP.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StageActions {
+    /// The nodes that leave the sim — every node in the subtree below
+    /// each decoupler assigned to the stage (the session's "severs
+    /// all its child edges" rule; the decoupler itself stays
+    /// parent-side, the KSP convention), `PartNodeId`-ascending.
+    pub jettisons: Vec<csp_phys::PartNodeId>,
+    /// The stage's deployable nodes — every assigned part whose def
+    /// carries a `Parachute` module, `PartNodeId`-ascending.
+    /// `fire_stage` issues their `DeployPart`s BEFORE the jettisons
+    /// so a chute staged alongside the decoupler dropping its own
+    /// subtree still lands its deploy record (a `DeployPart` naming
+    /// an already-jettisoned node would just reject).
+    pub deploys: Vec<csp_phys::PartNodeId>,
+}
+
 /// The launched craft's remaining stage firings (§2.2-C session
 /// state — captured at [`crate::View::launch_craft`] from the VAB
 /// session's editor staging, which the spawned `PartGraph` itself
-/// does not carry). Each entry is one firing's drop set: the part
-/// nodes that leave the sim when it fires — every node in the subtree
-/// below each decoupler assigned to that stage (the session's
-/// "severs all its child edges" rule; the decoupler itself stays
-/// with the parent side, the KSP convention). Entries are in firing
+/// does not carry). Each entry is one firing's [`StageActions`] —
+/// decoupler drop-sets plus staged deployables. Entries are in firing
 /// order (the session's descending `stage_order`). Empty stages
-/// (no decoupler, or a decoupler severing nothing) are dropped at
-/// capture, so `stages.len()` counts real separations only.
+/// (no decoupler, no deployable, or a decoupler severing nothing)
+/// are dropped at capture, so `stages.len()` counts real firings
+/// only.
 ///
-/// `View::fire_stage` pops the front set and issues one logged
-/// `JettisonPart` per node — the sim's per-node jettison is the
-/// command surface v1 staging maps onto (a jettisoned part leaves
-/// the sim outright; KSP-style fragment spawn is not in the v1
-/// command vocabulary).
+/// `View::fire_stage` pops the front set and issues the logged
+/// per-node commands — `DeployPart` for each deployable, then one
+/// `JettisonPart` per drop-set node — the sim's v1 command surface
+/// staging maps onto (a jettisoned part leaves the sim outright;
+/// KSP-style fragment spawn is not in the v1 command vocabulary).
 ///
 /// The plan belongs to the vessel its launch spawned — NOT the
 /// flight focus: a newer spawn or a breakup fragment can take the
@@ -622,8 +642,8 @@ pub struct FlightFrame(pub Option<csp_render::flight::FlightPacket>);
 /// fingerprint keeps it.
 #[derive(Resource, Default)]
 pub struct StagePlan {
-    /// Remaining stage drop-sets, firing order.
-    pub stages: Vec<Vec<csp_phys::PartNodeId>>,
+    /// Remaining stage firings' action sets, firing order.
+    pub stages: Vec<StageActions>,
     /// Firings the plan held at launch — `stages.is_empty()` with
     /// `total > 0` means "expended", not "single stage" (the HUD's
     /// `stages_total` mirror).
@@ -659,7 +679,7 @@ impl StagePlan {
     /// spawn. `min_id`/`craft_key` are what [`Self::vessel_for`]
     /// binds against once the spawn lands.
     pub(crate) fn for_launch(
-        stages: Vec<Vec<csp_phys::PartNodeId>>,
+        stages: Vec<StageActions>,
         sim: &World,
         craft: &csp_sim::CraftDef,
     ) -> Self {
@@ -676,7 +696,7 @@ impl StagePlan {
     /// A plan pre-bound to a known vessel — for tests and scripted
     /// producers that mint the `VesselId` themselves. `min_id`/
     /// `craft_key` stay inert because [`Self::vessel`] is already set.
-    pub fn bound_to(stages: Vec<Vec<csp_phys::PartNodeId>>, vessel: VesselId) -> Self {
+    pub fn bound_to(stages: Vec<StageActions>, vessel: VesselId) -> Self {
         Self {
             total: stages.len(),
             stages,
@@ -1839,7 +1859,7 @@ pub(crate) fn flight_present(
     // vessel. The plan's remaining drop sets apply only while it is
     // bound to this vessel (a newer spawn or a fragment can hold the
     // focus without owning the plan — `vessel_for`'s binding rule).
-    let drops: &[Vec<csp_phys::PartNodeId>] = plans
+    let drops: &[StageActions] = plans
         .plans
         .iter()
         .find(|p| p.vessel == Some(VesselId(focus.id)))
@@ -2247,7 +2267,7 @@ fn build_walk(
 fn stage_propulsion(
     ui: &mut FlightUiData,
     prop: Option<&VesselPropulsion>,
-    drops: &[Vec<csp_phys::PartNodeId>],
+    drops: &[StageActions],
     throttle: f64,
     g_local: Option<f64>,
     g_surface: Option<f64>,
@@ -2319,7 +2339,7 @@ fn stage_propulsion(
 fn delta_v_walk_from(
     attached: &mut BTreeMap<csp_phys::PartNodeId, WalkNode>,
     mpu: &BTreeMap<csp_data::ResourceId, f64>,
-    drops: &[Vec<csp_phys::PartNodeId>],
+    drops: &[StageActions],
 ) -> (f64, f64) {
     let mut current = 0.0;
     let mut staged = 0.0;
@@ -2346,7 +2366,10 @@ fn delta_v_walk_from(
             consume_drawn(attached, mpu, &b.drawn);
         }
         if step < drops.len() {
-            for id in &drops[step] {
+            // The Δv walk cares about departing mass only — staged
+            // deploys keep their part aboard, so the drop set is the
+            // jettison half of the firing.
+            for id in &drops[step].jettisons {
                 attached.remove(id);
             }
         }
@@ -3186,7 +3209,10 @@ mod tests {
         stage_propulsion(
             &mut ui,
             Some(&dry),
-            &[vec![csp_phys::PartNodeId(2), csp_phys::PartNodeId(3)]],
+            &[StageActions {
+                jettisons: vec![csp_phys::PartNodeId(2), csp_phys::PartNodeId(3)],
+                ..StageActions::default()
+            }],
             1.0,
             Some(9.81),
             Some(9.81),
