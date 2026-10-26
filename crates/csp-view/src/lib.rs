@@ -2830,10 +2830,45 @@ impl View {
         candidate.rot = rot.normalize();
         candidate.vel = vel;
         candidate.ang_vel = ang_vel;
-        if let Some(reason) =
-            self.launch_preflight(&craft, &candidate, site.as_ref(), &build_resources)
-        {
+        // The pad is a single berth — but a *parked* vessel occupying
+        // it is the same build the player is iterating on: the VAB
+        // session IS that craft's working copy. When a surface-latched
+        // vessel claims the pad, recover it (funds/parts/science come
+        // back) as part of this launch instead of dead-refusing the
+        // very build the player is looking at. Only a vessel that
+        // cannot be recovered (in flight, on rails) still refuses.
+        let occupant = self.sim.spawn_site_occupant(&candidate).and_then(|id| {
+            self.sim
+                .vessels()
+                .get(&id)
+                .filter(|v| matches!(v.state, csp_sim::VesselState::SurfaceLatched(_)))
+                .map(|_| id)
+        });
+        if let Some(reason) = self.launch_preflight(
+            &craft,
+            &candidate,
+            site.as_ref(),
+            &build_resources,
+            occupant,
+        ) {
             return Err(reason);
+        }
+        // The parked build clears the pad before the new craft's
+        // delivery lands — the recovery is a normal logged command that
+        // credits its value back, then the build order proceeds.
+        if let Some(id) = occupant {
+            let recovery_site = site.as_ref().map(|s| s.id.clone());
+            self.enqueue_command(
+                SourceClass::Ui,
+                PLAYER_SOURCE_ID,
+                SimCommand::RecoverVessel {
+                    vessel: id,
+                    site: recovery_site,
+                },
+            );
+            self.flight_notice(
+                "PARKED BUILD RECOVERED — value credited, pad cleared for the new craft",
+            );
         }
         // The staged craft's firing plan rides session state (the
         // spawned graph drops stage metadata); `fire_stage` drains it
@@ -3278,6 +3313,7 @@ impl View {
         candidate: &csp_phys::WeldedBody,
         site: Option<&csp_data::SiteDef>,
         build_resources: &[(csp_data::ResourceId, f64)],
+        occupant: Option<csp_sim::VesselId>,
     ) -> Option<String> {
         // §2.9's cap — vessels + in-flight builds (each build already
         // reserved its delivery slot).
@@ -3327,15 +3363,16 @@ impl View {
                 }
             }
         }
-        // The pad is a single berth — the sim's occupancy predicate
-        // counts InBubble hulls directly and re-materializes each
-        // latched vessel's stored pose at the current phase, so a
-        // parked craft still blocks the site.
-        if self.sim.spawn_site_occupied(candidate) {
+        // The pad is a single berth — a *parked* surface-latched
+        // vessel occupying it is the same build under edit (the VAB
+        // session is its working copy), so launching recovers it and
+        // proceeds rather than dead-refusing the craft the player is
+        // looking at. Only a vessel that can't be recovered still
+        // refuses here (in flight or on rails — `occupant` is `Some`
+        // only for a surface-latched one the caller will recover).
+        if occupant.is_none() && self.sim.spawn_site_occupied(candidate) {
             return Some(
-                self.launch_refused(
-                    "launch site occupied — recover or move the parked vessel first",
-                ),
+                self.launch_refused("launch site occupied — an active vessel blocks the pad"),
             );
         }
         None

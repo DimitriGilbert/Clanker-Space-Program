@@ -5932,6 +5932,48 @@ impl World {
         self.spawn_site_occupied_by(candidate)
     }
 
+    /// The vessel occupying the launch pad, if any — the same
+    /// predicate `spawn_site_occupied` reports, but returning the
+    /// `VesselId` so a launch can recover/replace the parked build
+    /// rather than dead-refuse. `None` when unoccupied.
+    pub fn spawn_site_occupant(&self, candidate: &WeldedBody) -> Option<VesselId> {
+        let physics = self.physics.as_ref()?;
+        let env = physics.backend.environment();
+        for (id, v) in self.vessels.iter() {
+            let parked: Option<WeldedBody>;
+            let other = match &v.state {
+                VesselState::InBubble(b) => Some(b),
+                VesselState::OnRails(_) => None,
+                VesselState::SurfaceLatched(pose) => {
+                    if pose.body != physics.dominant {
+                        None
+                    } else {
+                        parked = v.craft.as_ref().and_then(|craft| {
+                            csp_phys::weld(&craft.graph, &craft.parts)
+                                .ok()
+                                .map(|mut b| {
+                                    let (pos, rot, _, _) = bubble::surface_pose_restore(
+                                        env,
+                                        pose,
+                                        b.com_local,
+                                        self.clock,
+                                    );
+                                    b.pos = pos;
+                                    b.rot = rot;
+                                    b
+                                })
+                        });
+                        parked.as_ref()
+                    }
+                }
+            };
+            if other.is_some_and(|o| physics.backend.volumes_overlap(candidate, o)) {
+                return Some(*id);
+            }
+        }
+        None
+    }
+
     /// `SpawnPhysicalVessel`: weld the craft graph into a fresh
     /// `WeldedBody` at the authored kinematics and insert it
     /// `InBubble`. Elements-only vessels (`SpawnVessel`) keep
