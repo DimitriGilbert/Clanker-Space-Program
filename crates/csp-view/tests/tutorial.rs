@@ -115,7 +115,15 @@ fn tutorial_first_flight_progression() {
     // VAB-built pod→tank→engine must mount its engine nozzle-down —
     // the AttachAuto regression this test pins end-to-end.
     view.launch_craft().expect("launch");
-    frame(&mut view, 1);
+    // W2.6: launch is a ManufactureCraft order — the vessel delivers
+    // surface-latched at `ConstructionComplete` (throttle unlatches
+    // it below, the same fly path a player takes).
+    for _ in 0..200 {
+        frame(&mut view, 64);
+        if view.sim.builds().is_empty() {
+            break;
+        }
+    }
     let vessel = view.flight_focus().expect("vessel on the pad");
     assert_eq!(view.tutorial_state().step, 3, "after launch");
 

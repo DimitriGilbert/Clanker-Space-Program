@@ -160,18 +160,21 @@ fn new_demo_builds_scenario_and_enforces_constraints() {
         assert_eq!(v.session().name(), "Demo Hopper");
     });
 
-    // The seed rides the §7.6 command log — it lands at the first
-    // stepped tick like every other spawn.
-    view.begin_frame();
-    view.sim_step(1).unwrap();
-    view.end_frame();
-    assert_eq!(view.sim.vessels().len(), 1, "pad craft spawned");
+    // W2.6: the seed is a ManufactureCraft order — `seed_pad_craft`
+    // steps the sim through the order + build at construction, so
+    // the starter craft is already delivered surface-latched (the
+    // pad's berth) when the scenario opens; a throttle unlatches it.
+    assert_eq!(view.sim.vessels().len(), 1, "pad craft delivered");
     let vessel = view.sim.vessels().values().next().unwrap();
     assert!(
-        vessel.body().is_some(),
-        "pad craft is a bubble-resident welded body, got {:?}",
+        matches!(vessel.state, csp_sim::VesselState::SurfaceLatched(_)),
+        "pad craft delivered surface-latched, got {:?}",
         vessel.state
     );
+    // A frame stages the latched craft into the flight view.
+    view.begin_frame();
+    view.sim_step(view.sim.clock().ticks() + 1).unwrap();
+    view.end_frame();
     // Seeded into the flight view — the demo opens on the pad.
     assert_eq!(view.mode(), ViewMode::Flight);
     assert!(view.flight_focus().is_some());
@@ -224,20 +227,18 @@ fn hold_radial_up(view: &mut View, vessel: csp_sim::VesselId) {
 #[test]
 fn demo_seed_craft_ascends() {
     let mut view = View::new_demo().unwrap();
-    // The seeded spawn lands on the first stepped tick.
+    // W2.6: the seed is already delivered surface-latched (the
+    // ManufactureCraft order's `ConstructionComplete`) — a frame
+    // stages it, then the throttle command unlatches it.
     view.begin_frame();
-    view.sim_step(1).unwrap();
+    view.sim_step(view.sim.clock().ticks() + 1).unwrap();
     view.end_frame();
-    let vessel = view.flight_focus().expect("pad craft spawned");
+    let vessel = view.flight_focus().expect("pad craft delivered");
     let env = view.sim.environment().unwrap().clone();
-    let pad_alt = view
-        .sim
-        .vessels()
-        .values()
-        .next()
-        .and_then(|v| v.body())
-        .map(|b| (b.com_world() - env.body_center).norm() - env.radius_m)
-        .unwrap();
+    let pad_alt = match &view.sim.vessels()[&vessel].state {
+        csp_sim::VesselState::SurfaceLatched(p) => p.altitude_m,
+        s => panic!("pad craft not latched: {s:?}"),
+    };
 
     view.enqueue_command(
         csp_view::SourceClass::Ui,

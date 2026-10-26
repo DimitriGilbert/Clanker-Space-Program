@@ -290,20 +290,48 @@ pub struct AutopilotState {
 /// registration*; the pending [`EventKind::ScriptWake`](crate::EventKind)
 /// is the wake itself. Not serialized — what persists is the resolved
 /// [`ScriptState::wake_tick`] ↔ pending-event pair.
+///
+/// **The in-bubble rule (documented semantics):** a wake never gates
+/// an `InBubble` script's ticking — the bubble's control pass runs
+/// `on_tick` every tick regardless, and a firing `ScriptWake` is
+/// consumed silently under the double-tick rule. So `wait_ticks` /
+/// `wait_until_tick` are *vacuous* while in-bubble (the script keeps
+/// ticking; use a `persist` counter for an in-bubble delay). Their
+/// value is as the tick carrier off-bubble: on `OnRails`/
+/// `SurfaceLatched` vessels the wake IS the only `on_tick` a script
+/// ever gets.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WakeCondition {
     /// An absolute sim tick — must be strictly ahead of the clock.
     AtTick(u64),
     /// `n` ticks from now — must be `> 0`.
     InTicks(u64),
-    /// Next apoapsis of the bound vessel's conic. Requires `OnRails`
-    /// with a closed orbit (`e < 1`); refused otherwise — on a bubble
-    /// or latched vessel there is no closed-form future apsis.
+    /// Next apoapsis of the bound vessel's conic. Resolved against
+    /// the stamped conic on `OnRails`, against the osculating conic
+    /// on `InBubble` (so an ascent script can arm the apsis before
+    /// the auto-rails edge — the wake then CARRIES the post-rails
+    /// tick); refused with no closed-form future apsis (open conic,
+    /// latched hull, unsolvable state).
     AtApoapsis,
-    /// Next periapsis of the bound vessel's conic. Requires `OnRails`
-    /// and a periapsis still ahead (a hyperbolic vessel already past
-    /// its periapsis is refused).
+    /// Next periapsis of the bound vessel's conic. Same osculating
+    /// rule as [`Self::AtApoapsis`]; refused when the conic has no
+    /// periapsis ahead (a hyperbolic vessel already past its
+    /// periapsis is refused).
     AtPeriapsis,
+    /// §2.10's "altitude crossing on rails" — the next crossing of
+    /// `above_m` above the frame body's datum, `ascending` selecting
+    /// the outbound or inbound branch. Closed-form like the apsides:
+    /// the ellipse's eccentric anomaly at `r = a(1 − e·cosE)`, the
+    /// hyperbola's `coshF` mirror. Refused when the conic never
+    /// crosses (target outside `[r_p, r_a)`, or the crossing is
+    /// behind a hyperbolic vessel already outbound), or for a
+    /// circular conic (`e ≈ 0` has no defined crossing phase).
+    AtAltitude {
+        /// Altitude above the central body's datum, m.
+        above_m: f64,
+        /// `true` = the outbound (climbing) crossing.
+        ascending: bool,
+    },
     /// The bound vessel's next pending `SoiTransition` — the script
     /// wakes in the new frame. Refused when the vessel is not on
     /// rails or has no SOI event queued.
@@ -379,6 +407,15 @@ pub struct VesselTelemetry {
     /// The vessel's scheduled maneuver node, if any — `(tick, dv
     /// prograde, normal, radial)`, so a script can arm/wait on it.
     pub maneuver_node: Option<(u64, DVec3)>,
+    /// Stored resource units aboard — `resource id → units` summed
+    /// over every tank node (the `vessel_resource` read,
+    /// denormalized so a script can inventory its propellant without
+    /// a part-graph walk). Empty for a craft-less vessel.
+    pub resources: BTreeMap<String, f64>,
+    /// The vessel's part graph as aimable handles — `(node id, part
+    /// id)` pairs, the targets `stage`/`jettison`/`deploy` take.
+    /// Empty for a craft-less vessel.
+    pub parts: Vec<(u64, String)>,
 }
 
 /// Where the vessel lives — the telemetry enum mirror of
@@ -493,6 +530,11 @@ pub trait TickIo {
     /// The bound vessel's telemetry snapshot — `found: false` fields
     /// when the id is unknown.
     fn telemetry(&self, vessel: VesselId) -> VesselTelemetry;
+
+    /// Every live vessel id — the enumeration `telemetry` reads
+    /// against (the guest's `vessels()`/`telemetry_of` surface).
+    /// Ascending-id order, same as the arena.
+    fn vessels(&self) -> Vec<VesselId>;
 
     /// Enqueue a command for the *next* tick's drain under
     /// `(class, source_id)` — production order per source is
@@ -664,6 +706,101 @@ pub fn resolve_apsis_ticks(
             return Ok(None);
         }
         -m / n
+    };
+    if !(dt_s.is_finite() && dt_s > 0.0) {
+        return Ok(None);
+    }
+    Ok(Some(
+        clock
+            .saturating_add((dt_s * csp_core::TICK_HZ as f64).ceil() as u64)
+            .max(1),
+    ))
+}
+
+/// §2.10's "altitude crossing on rails" — the closed-form twin of
+/// [`resolve_apsis_ticks`] for [`WakeCondition::AtAltitude`]: solve
+/// `r = radius_m + above_m` on the conic, convert the anomaly at the
+/// crossing to a mean anomaly, and measure the time ahead of the
+/// clock the same way.
+///
+/// `Ok(None)` = no crossing ahead in the requested direction
+/// (target outside the conic's radial range, crossing already past
+/// on an open conic); `Err` = degenerate inputs (no closed-form
+/// answer exists at all).
+pub fn resolve_altitude_ticks(
+    elements: &KeplerElements,
+    mu: f64,
+    radius_m: f64,
+    above_m: f64,
+    ascending: bool,
+    epoch_ticks: u64,
+    clock: u64,
+) -> Result<Option<u64>, SimError> {
+    let e = elements.eccentricity;
+    let a = elements.semi_major_axis_m;
+    if !e.is_finite() || e < 0.0 || !mu.is_finite() || mu <= 0.0 || !radius_m.is_finite() {
+        return Err(SimError::Recoverable("wake: degenerate conic"));
+    }
+    if !(above_m.is_finite() && above_m >= 0.0) {
+        return Err(SimError::Recoverable("wake: non-finite altitude"));
+    }
+    let r_t = radius_m + above_m;
+    let dt_epoch = (clock as i128 - epoch_ticks as i128) as f64 / csp_core::TICK_HZ as f64;
+    let m_now = elements.mean_anomaly_epoch_rad;
+    let two_pi = 2.0 * core::f64::consts::PI;
+    // Seconds until mean anomaly `m_t` from the current mean
+    // position, forward-only — `None` when the target is behind
+    // (open conics: the branch already flown).
+    let dt_s = if e < 1.0 {
+        // r = a(1 − e·cosE) ⇒ cosE = (a − r)/(a·e). `e ≈ 0` has no
+        // defined crossing phase (radius is constant), and a target
+        // outside [r_p, r_a] is never crossed.
+        if !(a.is_finite() && a > 0.0) {
+            return Err(SimError::Recoverable("wake: elliptic a <= 0"));
+        }
+        if e < 1.0e-9 {
+            return Err(SimError::Recoverable("wake: circular conic — no crossing"));
+        }
+        let c = (a - r_t) / (a * e);
+        if c.abs() > 1.0 {
+            return Ok(None);
+        }
+        let n = libm::sqrt(mu / (a * a * a));
+        let big_e = libm::acos(c.clamp(-1.0, 1.0)); // ∈ [0, π]
+        // E ∈ (0, π) is the ascending branch (dr/dE = a·e·sinE > 0);
+        // the descending crossing mirrors at 2π − E.
+        let e_cross = if ascending { big_e } else { two_pi - big_e };
+        let m_t = e_cross - e * libm::sin(e_cross);
+        let m = m_now + n * dt_epoch;
+        let mw = m - two_pi * libm::floor(m / two_pi);
+        let d = m_t - mw;
+        (if d <= 0.0 { d + two_pi } else { d }) / n
+    } else {
+        // Open conic: r = |a|(e·coshF − 1) ⇒ coshF = (r/|a| + 1)/e.
+        // F > 0 is the outbound (ascending) branch, F < 0 inbound;
+        // M = e·sinhF − F is 0 at periapsis.
+        if !(a.is_finite() && a < 0.0) {
+            return Err(SimError::Recoverable("wake: open conic a >= 0"));
+        }
+        let aa = -a;
+        let c = (r_t / aa + 1.0) / e;
+        if c < 1.0 {
+            // Below periapsis — never reached.
+            return Ok(None);
+        }
+        let n = libm::sqrt(mu / (aa * aa * aa));
+        let f = libm::acosh(c);
+        let m_t = if ascending {
+            e * libm::sinh(f) - f
+        } else {
+            -(e * libm::sinh(f) - f)
+        };
+        let m = m_now + n * dt_epoch;
+        let d = m_t - m;
+        if d <= 0.0 {
+            return Ok(None);
+        }
+        d / n
     };
     if !(dt_s.is_finite() && dt_s > 0.0) {
         return Ok(None);

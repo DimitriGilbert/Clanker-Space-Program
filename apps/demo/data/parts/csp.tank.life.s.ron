@@ -1,0 +1,73 @@
+// csp.tank.life.s — "Supplies" life-support provisions canister
+// (§3.1 PartDef). Hand-authored fiction — numbers frozen at M7.
+//
+// The vessel-side half of §3.5 life support: a `Tank` of `oxygen`
+// and `food` — the consumables `SetLifeSupportEnabled` draws at
+// `life_support_*_per_crew_s` once a save opts in (`electric_charge`
+// is the third draw; batteries already cover it). The capacities
+// provision a two-crew crew at the authored rates for roughly one
+// sim-day: 2 · 21 600 s · 0.02 ≈ 864 u oxygen and 2 · 21 600 s ·
+// 0.005 = 216 u food — a short hop, not an expedition; scale the
+// count or chain canisters for longer crews.
+//
+// A cargo tank is a FuelTank category part (§3.5: "a Cargo bay is
+// just a Tank"). 1.25-class stack interfaces — the inline-mount
+// convention.
+(
+    schema_version: 1,
+    id: "csp.tank.life.s",
+    family: "csp.family.tank.s",
+    display_name: "part.csp.tank.life.s.name",
+    category: FuelTank,
+    mass_dry_kg: 130.0,
+    cost_funds: 800.0,
+    size_m: (x: 1.25, y: 1.25, z: 0.7),
+    build_resources: [("metal", 12.0), ("composite", 6.0)],
+    attach_nodes: [
+        (id: "top",    position_m: (x: 0.0, y: 0.0, z: 0.35),  direction: (x: 0.0, y: 0.0, z: 1.0),  diameter_m: 1.25),
+        (id: "bottom", position_m: (x: 0.0, y: 0.0, z: -0.35), direction: (x: 0.0, y: 0.0, z: -1.0), diameter_m: 1.25),
+    ],
+    scale: None,
+    collider: Cylinder(radius_m: 0.625, half_height_m: 0.35),
+    aero: (
+        cd_curve: [(mach: 0.0, coeff: 0.45), (mach: 8.0, coeff: 0.3)],
+        cl_curve: [(mach: 0.0, coeff: 0.0)],
+        ref_len_m: 0.7,
+    ),
+    thermal: (
+        heat_capacity_j_per_k: 120_000.0,
+        max_temp_k: 900.0,
+        emissivity: 0.6,
+        conduction_w_per_k: 60.0,
+    ),
+    structural: (
+        max_axial_n: 300_000.0,
+        max_shear_n: 120_000.0,
+        max_torque_nm: 15_000.0,
+    ),
+    variants: [
+        (id: "stock", display_name: "part.variant.stock", cost_multiplier: 1.0, stat_multipliers: []),
+    ],
+    modules: [
+        // ~1 sim-day for a two-crew crew at the authored draw rates.
+        Tank(capacity: [("oxygen", 864.0), ("food", 216.0)]),
+    ],
+    reliability: (
+        base_mtbf_s: 3_500_000.0,
+        infant_mortality: 0.04,
+        qualification_curve: (knots: [
+            (qualification_units: 0.0,   hazard_multiplier: 1.0),
+            (qualification_units: 100.0, hazard_multiplier: 0.5),
+        ]),
+        regime_stress: [
+            (kind: Overtemperature, threshold: 0.9,  multiplier: 3.0),
+            (kind: ExcessG,         threshold: 15.0, multiplier: 1.5),
+        ],
+        dormant_stress: 0.005,
+        failure_modes: [
+            (Leak,        0.7),
+            (SensorFault, 0.3),
+        ],
+    ),
+    tech_requirement: "tech.rocketry.2",
+)

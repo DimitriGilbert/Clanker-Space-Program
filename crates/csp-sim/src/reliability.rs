@@ -1267,6 +1267,22 @@ impl World {
         )
     }
 
+    /// The installed §3.4 tunables — observation only (the
+    /// `economy_config()` precedent): the UI's bench-economics rows
+    /// and tests read it; writes are construction config
+    /// (`set_reliability_config`).
+    pub fn reliability_config(&self) -> &ReliabilityConfig {
+        &self.reliability_cfg
+    }
+
+    /// The test-stand arena — observation only (the `builds()`
+    /// precedent): the UI's in-flight bench rows and tests read it;
+    /// mutation is the `apply_bench_test`/`fire_bench_complete`
+    /// pair's job.
+    pub fn bench_runs(&self) -> &BTreeMap<BenchId, ActiveBench> {
+        &self.bench_runs
+    }
+
     /// `BenchTestComplete` firing — the run's bench units credit the
     /// family's §3.4 qualification record. Total (the event-pair
     /// precedent): a vanished record is a no-op.

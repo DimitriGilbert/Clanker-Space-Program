@@ -1,0 +1,72 @@
+// csp.legs.s125 — "Strut" radial landing leg (§3.1 PartDef).
+// Hand-authored fiction — numbers frozen at M7.
+//
+// The gentle-touchdown half of the recovery loop: a leg is just a
+// strong low collider — no module, it earns its keep through
+// geometry (a radial leg pushes the hull's lowest point below the
+// engine nozzle and its `structural` limits eat the touchdown
+// load a bare tank would not). Radial `mount` node mates a
+// synthesized `surf:` node on the parent hull — the chute's
+// mount convention — so radial symmetry can fan 1/2/4 legs
+// around a stack.
+//
+// Category Structure: passive load-bearing geometry, no module
+// requirement beyond well-formed nodes.
+(
+    schema_version: 1,
+    id: "csp.legs.s125",
+    family: "csp.family.structure",
+    display_name: "part.csp.legs.s125.name",
+    category: Structure,
+    mass_dry_kg: 90.0,
+    cost_funds: 350.0,
+    size_m: (x: 0.35, y: 0.3, z: 1.2),
+    build_resources: [("metal", 9.0), ("composite", 2.0)],
+    attach_nodes: [
+        // Radial mount: the leg's −x shoulder face mates a
+        // synthesized `surf:` node on the parent's hull. The leg
+        // hangs down the parent's flank; its foot sits ~0.9 m
+        // below the mount line.
+        (id: "mount", position_m: (x: -0.175, y: 0.0, z: 0.4), direction: (x: -1.0, y: 0.0, z: 0.0), diameter_m: 0.625),
+    ],
+    scale: None,
+    collider: Box(half_extents_m: (x: 0.175, y: 0.15, z: 0.6)),
+    aero: (
+        cd_curve: [(mach: 0.0, coeff: 0.6), (mach: 8.0, coeff: 0.4)],
+        cl_curve: [(mach: 0.0, coeff: 0.0)],
+        ref_len_m: 1.2,
+    ),
+    thermal: (
+        heat_capacity_j_per_k: 70_000.0,
+        max_temp_k: 1200.0,
+        emissivity: 0.75,
+        conduction_w_per_k: 45.0,
+    ),
+    structural: (
+        // The touchdown load path: legs are the strongest thing at
+        // the bottom of the stack by design — that is the part.
+        max_axial_n: 800_000.0,
+        max_shear_n: 300_000.0,
+        max_torque_nm: 50_000.0,
+    ),
+    variants: [
+        (id: "stock", display_name: "part.variant.stock", cost_multiplier: 1.0, stat_multipliers: []),
+    ],
+    modules: [],
+    reliability: (
+        base_mtbf_s: 4_000_000.0,
+        infant_mortality: 0.03,
+        qualification_curve: (knots: [
+            (qualification_units: 0.0, hazard_multiplier: 1.0),
+        ]),
+        regime_stress: [
+            (kind: ExcessG,         threshold: 25.0, multiplier: 1.5),
+            (kind: Overtemperature, threshold: 0.95, multiplier: 2.0),
+        ],
+        dormant_stress: 0.005,
+        failure_modes: [
+            (Explosion, 1.0),
+        ],
+    ),
+    tech_requirement: "tech.start",
+)

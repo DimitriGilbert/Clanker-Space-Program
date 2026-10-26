@@ -201,6 +201,9 @@ pub enum MapLabelKind {
     /// A surface site (launch complex / recovery field) — styled like
     /// an apsis mark: small and secondary to object names.
     Site,
+    /// A predicted SOI encounter (`predict_encounter`) — styled like
+    /// an apsis mark; the text carries the Enter/Exit + approach.
+    Encounter,
 }
 
 /// One map-view label — a clip-space anchor + text, produced by
@@ -365,7 +368,9 @@ fn paint_map_label(
     placed: &mut Vec<egui::Rect>,
 ) {
     let (font, lift) = match label.kind {
-        MapLabelKind::Apsis | MapLabelKind::Site => (egui::FontId::proportional(10.5), 5.0),
+        MapLabelKind::Apsis | MapLabelKind::Site | MapLabelKind::Encounter => {
+            (egui::FontId::proportional(10.5), 5.0)
+        }
         _ => (egui::FontId::proportional(12.0), 8.0),
     };
     let c = egui::Color32::from_rgba_unmultiplied(
@@ -1087,4 +1092,481 @@ pub fn maneuver_panel(
             }
         });
     });
+}
+
+// ---------------------------------------------------------------------------
+// W2.4 planning panel — the KAC-equivalent surface (PLAN §4 v1/M5):
+// player alarms + the transfer-window planner, shown in map mode.
+// ---------------------------------------------------------------------------
+
+/// Where one staged alarm sits in its lifecycle — plain data for the
+/// panel's row styling (`csp-ui` never sees sim types).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlarmState {
+    /// Scheduled and counting down.
+    Armed,
+    /// The event fired — surfaced, awaiting dismissal.
+    Fired,
+    /// Its tick passed with no fired event observed — the command
+    /// never landed (a drained rejection, or a past-tick request the
+    /// sim clamped differently). Reported honestly, not as a fire.
+    Lapsed,
+}
+
+/// One alarm/watch row — tick + label resolved into a countdown by
+/// `csp-view` against the mirrored clock.
+#[derive(Clone, Debug)]
+pub struct AlarmRow {
+    /// The label the player gave (or the panel generated — "Pe",
+    /// "terrin → duva window").
+    pub label: String,
+    /// Seconds until it fires; negative once past.
+    pub eta_s: f64,
+    /// Armed / fired / lapsed.
+    pub state: AlarmState,
+    /// Index into the view's alarm book — what `DismissAlarm` names.
+    pub index: usize,
+}
+
+/// One vessel row in the departure picker — eligibility staged by
+/// `csp-view` so a click on an unservable vessel is never offered.
+#[derive(Clone, Debug)]
+pub struct TransferVessel {
+    /// The `VesselId`.
+    pub id: u64,
+    /// The body its conic orbits.
+    pub parent: String,
+    /// `true` = on rails, orbiting the selected origin, node-eligible.
+    pub eligible: bool,
+    /// The honesty line for ineligible rows ("in physics bubble —
+    /// coast to rails first", "orbits rask, not terrin").
+    pub note: String,
+}
+
+/// The staged `departure_node` result as plain data.
+#[derive(Clone, Debug)]
+pub struct PlanNodeRow {
+    /// The vessel the node was resolved for.
+    pub vessel: u64,
+    /// Seconds until the burn tick.
+    pub in_s: f64,
+    /// Total Δv of the departure burn (m/s).
+    pub dv_mps: f64,
+}
+
+/// The staged `predict_encounter` result as plain data.
+#[derive(Clone, Debug)]
+pub struct PlanEncounterRow {
+    /// The body whose SOI is crossed.
+    pub body: String,
+    /// `true` = `Enter` (an approach), `false` = `Exit`.
+    pub enter: bool,
+    /// Seconds until the crossing.
+    pub in_s: f64,
+    /// Approach periapsis radius (m) — `Enter` only.
+    pub periapsis_m: Option<f64>,
+    /// Approach v∞ (m/s) — `Enter` on a hyperbolic approach only.
+    pub v_inf_mps: Option<f64>,
+    /// `periapsis < surface radius` — `None` when the model carries
+    /// no radius for the body.
+    pub impacts: Option<bool>,
+}
+
+/// The staged transfer plan, plain data — the panel's display copy of
+/// `csp-view`'s `PlannedTransfer` mirror.
+#[derive(Clone, Debug)]
+pub struct PlanRow {
+    /// Bodies carried through from the query.
+    pub origin: String,
+    /// See [`Self::origin`].
+    pub destination: String,
+    /// Seconds until the optimal departure tick.
+    pub depart_in_s: f64,
+    /// The transfer's duration (s).
+    pub duration_s: f64,
+    /// Departure burn cost under the query's park-orbit model (m/s).
+    pub dv_depart_mps: f64,
+    /// Arrival cost — v∞ at the destination (m/s).
+    pub dv_arrive_mps: f64,
+    /// The resolved departure burn for the picked vessel, when the
+    /// ejection geometry solved (`departure_node`).
+    pub node: Option<PlanNodeRow>,
+    /// Why no node resolved — the ejection's own refusal ("parking
+    /// orbit not closed", "burn precedes now").
+    pub node_error: Option<String>,
+    /// The conic's predicted first encounter (`predict_encounter`
+    /// with the origin's egress excluded).
+    pub encounter: Option<PlanEncounterRow>,
+}
+
+/// Everything the planning panel needs — mirrors and session values
+/// only, populated by `csp-view`'s `UiBuild`.
+#[derive(Clone, Debug)]
+pub struct PlanningPanelInput<'a> {
+    /// The mirrored sim tick — countdowns and `SetAlarm` tick math.
+    pub tick: u64,
+    /// `csp_core::TICK_HZ` as f64 (§2.1 keeps this crate off csp-core).
+    pub tick_hz: f64,
+    /// Body ids carrying orbits — the transfer endpoint pickers.
+    pub bodies: &'a [String],
+    /// Vessels for the departure picker (eligibility staged).
+    pub vessels: &'a [TransferVessel],
+    /// Armed/fired/lapsed alarm rows.
+    pub alarms: &'a [AlarmRow],
+    /// The last computed plan's display row.
+    pub plan: Option<&'a PlanRow>,
+    /// The last planner failure's reason.
+    pub plan_error: Option<&'a str>,
+    /// The map's focused vessel (id) — the apsis/node alarm targets.
+    pub focus_vessel: Option<u64>,
+    /// Whether the focused vessel carries a scheduled node — gates
+    /// the "at node" quick-alarm.
+    pub focus_has_node: bool,
+}
+
+/// What the panel asked `csp-view` to do — resolved into `SimCommand`s
+/// or planner calls by the view (the §2.1 rule: `csp-ui` cannot name
+/// sim types, and the scan stays off the command path).
+#[derive(Clone, Debug)]
+pub enum PlanningCommand {
+    /// Run `plan_transfer` origin → destination and stage the result.
+    FindWindow {
+        /// The departure body.
+        origin: String,
+        /// The arrival body.
+        destination: String,
+    },
+    /// `SetAlarm` at `tick + in_s` with `label`.
+    ArmAlarm {
+        /// Free-form label (the panel's text field).
+        label: String,
+        /// Seconds from now.
+        in_s: f64,
+    },
+    /// `SetAlarm` at the focused vessel's next apsis (`true` = Ap).
+    ArmApsis {
+        /// Apoapsis vs periapsis.
+        apoapsis: bool,
+    },
+    /// `SetAlarm` at the focused vessel's scheduled node tick.
+    ArmNodeAlarm,
+    /// `WatchTransferWindow` at the staged plan's departure tick.
+    WatchWindow,
+    /// `SetAlarm` at the staged plan's departure tick.
+    ArmWindowAlarm,
+    /// Resolve the staged plan into a `SetManeuver` for `vessel`
+    /// (`departure_node` runs in the view).
+    CreateNode {
+        /// The vessel the burn belongs to.
+        vessel: u64,
+    },
+    /// Remove a fired/lapsed row from the alarm book (alarms cannot
+    /// be cancelled once scheduled — armed rows show no dismiss).
+    DismissAlarm {
+        /// The row's book index.
+        index: usize,
+    },
+}
+
+/// The panel's session state — owned by `csp-view` (§2.2 C), mutated
+/// by [`planning_panel`].
+#[derive(Clone, Debug)]
+pub struct PlanningPanelState {
+    /// The departure picker (body id).
+    pub origin: String,
+    /// The arrival picker (body id).
+    pub destination: String,
+    /// The alarm label text field.
+    pub alarm_label: String,
+    /// "In N seconds" field for a manual alarm.
+    pub alarm_in_s: f64,
+    /// The picked departure vessel.
+    pub vessel: u64,
+}
+
+impl Default for PlanningPanelState {
+    fn default() -> Self {
+        Self {
+            origin: "terrin".to_string(),
+            destination: "duva".to_string(),
+            alarm_label: "alarm".to_string(),
+            alarm_in_s: 3600.0,
+            vessel: 0,
+        }
+    }
+}
+
+/// The W2.4 planning panel — alarms + the transfer-window planner,
+/// drawn in map mode beside the orbit lines it reasons about.
+///
+/// ALARMS: the armed list with countdowns, fired rows awaiting
+/// dismissal, the manual label/T+ form, and the focused vessel's
+/// quick alarms (at Pe / at Ap / at node). TRANSFER: origin and
+/// destination pickers, the departure-vessel picker (ineligibility
+/// staged honestly — never a dead click), "Find window" running the
+/// planner, the staged plan's Δv/encounter readout, and the verbs the
+/// plan implies: create the departure node, watch the window, or arm
+/// an alarm at it.
+///
+/// Emits [`PlanningCommand`]s — the view resolves every one (body
+/// names → ids, seconds → ticks, the staged plan → `SetManeuver`),
+/// so a stale panel can never smuggle a command the mirrors stopped
+/// justifying.
+#[allow(clippy::too_many_lines)] // one window = one pass
+pub fn planning_panel(
+    ctx: &egui::Context,
+    input: &PlanningPanelInput<'_>,
+    state: &mut PlanningPanelState,
+    out: &mut Vec<PlanningCommand>,
+) {
+    if !input.bodies.contains(&state.origin) {
+        state.origin = input.bodies.first().cloned().unwrap_or_default();
+    }
+    if !input.bodies.contains(&state.destination) {
+        state.destination = input
+            .bodies
+            .iter()
+            .find(|b| **b != state.origin)
+            .cloned()
+            .unwrap_or_default();
+    }
+    if !input
+        .vessels
+        .iter()
+        .any(|v| v.id == state.vessel && v.eligible)
+    {
+        state.vessel = input
+            .vessels
+            .iter()
+            .find(|v| v.eligible)
+            .map_or(0, |v| v.id);
+    }
+    egui::Window::new("Planning")
+        .default_pos(egui::pos2(12.0, 60.0))
+        .show(ctx, |ui| {
+            // ---- ALARMS ---------------------------------------------------
+            ui.label(
+                egui::RichText::new("ALARMS")
+                    .font(egui::FontId::monospace(12.0))
+                    .color(egui::Color32::from_gray(160)),
+            );
+            if input.alarms.is_empty() {
+                ui.label(
+                    egui::RichText::new("none armed — set one below")
+                        .color(egui::Color32::from_gray(120)),
+                );
+            }
+            for row in input.alarms {
+                ui.horizontal(|ui| {
+                    let (text, color) = match row.state {
+                        AlarmState::Armed => (
+                            format!("{} — T−{}", row.label, fmt_clock(row.eta_s.max(0.0))),
+                            egui::Color32::from_rgb(255, 196, 64),
+                        ),
+                        AlarmState::Fired => (
+                            format!("{} — FIRED", row.label),
+                            egui::Color32::from_rgb(120, 230, 120),
+                        ),
+                        AlarmState::Lapsed => (
+                            format!("{} — lapsed (never fired)", row.label),
+                            egui::Color32::from_gray(140),
+                        ),
+                    };
+                    ui.colored_label(color, text);
+                    if row.state != AlarmState::Armed
+                        && ui.small_button("×").on_hover_text("dismiss").clicked()
+                    {
+                        out.push(PlanningCommand::DismissAlarm { index: row.index });
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut state.alarm_label).desired_width(110.0));
+                ui.label("in");
+                ui.add(
+                    egui::DragValue::new(&mut state.alarm_in_s)
+                        .suffix(" s")
+                        .speed(1.0)
+                        .range(0.0..=f64::MAX),
+                );
+                if ui.button("Set").clicked() && !state.alarm_label.is_empty() {
+                    out.push(PlanningCommand::ArmAlarm {
+                        label: state.alarm_label.clone(),
+                        in_s: state.alarm_in_s,
+                    });
+                }
+            });
+            if input.focus_vessel.is_some() {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("at:").color(egui::Color32::from_gray(140)));
+                    if ui.small_button("Pe").clicked() {
+                        out.push(PlanningCommand::ArmApsis { apoapsis: false });
+                    }
+                    if ui.small_button("Ap").clicked() {
+                        out.push(PlanningCommand::ArmApsis { apoapsis: true });
+                    }
+                    if ui
+                        .add_enabled(input.focus_has_node, egui::Button::new("node").small())
+                        .clicked()
+                    {
+                        out.push(PlanningCommand::ArmNodeAlarm);
+                    }
+                });
+            }
+            ui.separator();
+            // ---- TRANSFER -------------------------------------------------
+            ui.label(
+                egui::RichText::new("TRANSFER")
+                    .font(egui::FontId::monospace(12.0))
+                    .color(egui::Color32::from_gray(160)),
+            );
+            egui::Grid::new("planning_transfer_grid")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    ui.label("origin");
+                    egui::ComboBox::from_id_salt("plan_origin")
+                        .selected_text(state.origin.clone())
+                        .show_ui(ui, |ui| {
+                            for b in input.bodies {
+                                ui.selectable_value(&mut state.origin, b.clone(), b);
+                            }
+                        });
+                    ui.end_row();
+                    ui.label("destination");
+                    egui::ComboBox::from_id_salt("plan_dest")
+                        .selected_text(state.destination.clone())
+                        .show_ui(ui, |ui| {
+                            for b in input.bodies {
+                                ui.selectable_value(&mut state.destination, b.clone(), b);
+                            }
+                        });
+                    ui.end_row();
+                    ui.label("vessel");
+                    egui::ComboBox::from_id_salt("plan_vessel")
+                        .selected_text(if input.vessels.iter().any(|v| v.id == state.vessel) {
+                            format!("vessel {}", state.vessel)
+                        } else {
+                            "— none —".to_string()
+                        })
+                        .show_ui(ui, |ui| {
+                            for v in input.vessels {
+                                let text = if v.eligible {
+                                    format!("vessel {}", v.id)
+                                } else {
+                                    format!("vessel {} — {}", v.id, v.note)
+                                };
+                                ui.add_enabled_ui(v.eligible, |ui| {
+                                    ui.selectable_value(&mut state.vessel, v.id, text);
+                                });
+                            }
+                        });
+                    ui.end_row();
+                });
+            if input.vessels.iter().all(|v| !v.eligible) && !input.vessels.is_empty() {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "no vessel can take the burn — {}",
+                        input
+                            .vessels
+                            .first()
+                            .map(|v| v.note.as_str())
+                            .unwrap_or("none on rails")
+                    ))
+                    .color(egui::Color32::from_gray(150)),
+                );
+            }
+            if ui.button("Find window").clicked() {
+                out.push(PlanningCommand::FindWindow {
+                    origin: state.origin.clone(),
+                    destination: state.destination.clone(),
+                });
+            }
+            if let Some(err) = input.plan_error {
+                ui.colored_label(egui::Color32::from_rgb(230, 120, 110), err);
+            }
+            if let Some(p) = input.plan {
+                let mono = egui::FontId::monospace(12.0);
+                let dim = egui::Color32::from_gray(190);
+                ui.label(
+                    egui::RichText::new(format!("{} → {}", p.origin, p.destination))
+                        .font(mono.clone())
+                        .color(egui::Color32::from_rgb(140, 220, 140)),
+                );
+                for line in [
+                    format!(
+                        "departs T−{} · transit {}",
+                        fmt_period(p.depart_in_s),
+                        fmt_period(p.duration_s)
+                    ),
+                    format!(
+                        "Δv depart {:.0} m/s · arrive {:.0} m/s · total {:.0} m/s",
+                        p.dv_depart_mps,
+                        p.dv_arrive_mps,
+                        p.dv_depart_mps + p.dv_arrive_mps
+                    ),
+                ] {
+                    ui.label(egui::RichText::new(line).font(mono.clone()).color(dim));
+                }
+                if let Some(e) = &p.encounter {
+                    let mut line = format!(
+                        "{} {} T−{}",
+                        if e.enter { "enters" } else { "leaves" },
+                        e.body,
+                        fmt_period(e.in_s)
+                    );
+                    if let Some(pe) = e.periapsis_m {
+                        line.push_str(&format!(" · Pe {}", fmt_distance(pe)));
+                    }
+                    if let Some(v) = e.v_inf_mps {
+                        line.push_str(&format!(" · v∞ {:.1} km/s", v / 1e3));
+                    }
+                    let warn = e.impacts == Some(true);
+                    ui.label(
+                        egui::RichText::new(if warn {
+                            format!("{line} — IMPACTS")
+                        } else {
+                            line
+                        })
+                        .font(mono.clone())
+                        .color(if warn {
+                            egui::Color32::from_rgb(240, 90, 80)
+                        } else {
+                            dim
+                        }),
+                    );
+                }
+                match (&p.node, &p.node_error) {
+                    (Some(n), _) => {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "node: vessel {} T−{} · Δv {:.0} m/s",
+                                n.vessel,
+                                fmt_period(n.in_s),
+                                n.dv_mps
+                            ))
+                            .font(mono.clone())
+                            .color(dim),
+                        );
+                        if ui.button("Set maneuver node").clicked() {
+                            out.push(PlanningCommand::CreateNode { vessel: n.vessel });
+                        }
+                    }
+                    (None, Some(err)) => {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(230, 160, 110),
+                            format!("no node — {err}"),
+                        );
+                    }
+                    (None, None) => {}
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Watch window").clicked() {
+                        out.push(PlanningCommand::WatchWindow);
+                    }
+                    if ui.button("Alarm at window").clicked() {
+                        out.push(PlanningCommand::ArmWindowAlarm);
+                    }
+                });
+            }
+        });
 }

@@ -118,12 +118,24 @@ pub(crate) static FILES: &[(&str, &[u8])] = &[
         include_bytes!("../../../apps/demo/data/parts/csp.decoupler.s125.ron"),
     ),
     (
+        "data/parts/csp.dockport.s125.ron",
+        include_bytes!("../../../apps/demo/data/parts/csp.dockport.s125.ron"),
+    ),
+    (
         "data/parts/csp.engine.ember.ron",
         include_bytes!("../../../apps/demo/data/parts/csp.engine.ember.ron"),
     ),
     (
         "data/parts/csp.engine.sparc.ron",
         include_bytes!("../../../apps/demo/data/parts/csp.engine.sparc.ron"),
+    ),
+    (
+        "data/parts/csp.lab.mk1.ron",
+        include_bytes!("../../../apps/demo/data/parts/csp.lab.mk1.ron"),
+    ),
+    (
+        "data/parts/csp.legs.s125.ron",
+        include_bytes!("../../../apps/demo/data/parts/csp.legs.s125.ron"),
     ),
     (
         "data/parts/csp.nosecone.s125.ron",
@@ -134,12 +146,20 @@ pub(crate) static FILES: &[(&str, &[u8])] = &[
         include_bytes!("../../../apps/demo/data/parts/csp.pod.mk1.ron"),
     ),
     (
+        "data/parts/csp.probe.s0625.ron",
+        include_bytes!("../../../apps/demo/data/parts/csp.probe.s0625.ron"),
+    ),
+    (
         "data/parts/csp.science.canister.ron",
         include_bytes!("../../../apps/demo/data/parts/csp.science.canister.ron"),
     ),
     (
         "data/parts/csp.structure.adapter.ron",
         include_bytes!("../../../apps/demo/data/parts/csp.structure.adapter.ron"),
+    ),
+    (
+        "data/parts/csp.tank.life.s.ron",
+        include_bytes!("../../../apps/demo/data/parts/csp.tank.life.s.ron"),
     ),
     (
         "data/parts/csp.tank.s160.ron",
@@ -241,6 +261,23 @@ pub(crate) fn seed_pad_craft(view: &mut View, name: &str) -> Result<(), String> 
     // the failure (the caller turns it into a startup error rather
     // than leaving a silent empty pad).
     view.launch_craft()?;
+    // W2.6: launch is now a `ManufactureCraft` order — the seed
+    // steps the sim through the order + the build so the starter
+    // craft is parked (delivered surface-latched) when the scene
+    // opens, the "seeded on the pad" contract. The two steps are
+    // `step_frame`, not the frame pipeline: seeding runs before the
+    // first `begin_frame`, and the delivery only needs sim advance —
+    // one tick to drain the command into a scheduled build, then the
+    // build's own completion tick.
+    view.sim
+        .step_frame(view.sim.clock().ticks() + 1)
+        .map_err(|e| format!("starter seed: order drain failed: {e}"))?;
+    if let Some(b) = view.sim.builds().values().next() {
+        let complete = b.complete_tick;
+        view.sim
+            .step_frame(complete)
+            .map_err(|e| format!("starter seed: build delivery failed: {e}"))?;
+    }
     Ok(())
 }
 

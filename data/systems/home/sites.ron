@@ -7,10 +7,10 @@
 // colony Drill extracts against. Terrin's pads are modest; Rask's
 // mining site is the rich pull into the colony game.
 (
-    schema_version: 2,
+    schema_version: 3,
     sites: [
         (
-            schema_version: 2,
+            schema_version: 3,
             id: "terrin-launch",
             display_name: "site.terrin-launch",
             body: "terrin",
@@ -37,9 +37,19 @@
                 ("ore", 0.35),
                 ("water", 0.15),
             ],
+            // W2.6 §3.5: the pad's starting stockpile — what
+            // ManufactureCraft BOMs (parts' `build_resources`) and
+            // RunBenchTest stands (`reliability_bench_resource` =
+            // metal) spend. ~12 starter-craft equivalents of metal
+            // plus composite for the electronics-heavy parts;
+            // recovery at the pad (efficiency 1.0) refills it.
+            starting_stock: [
+                ("metal", 2000.0),
+                ("composite", 400.0),
+            ],
         ),
         (
-            schema_version: 2,
+            schema_version: 3,
             id: "terrin-downrange",
             display_name: "site.terrin-downrange",
             body: "terrin",
@@ -52,7 +62,7 @@
             ],
         ),
         (
-            schema_version: 2,
+            schema_version: 3,
             id: "rask-mines",
             display_name: "site.rask-mines",
             body: "rask",

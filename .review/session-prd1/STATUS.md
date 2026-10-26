@@ -13,3 +13,10 @@
 ## IN-FLIGHT background verifiers: 11+10(VAB), 18+19+20(automation/server), 15+08+04(panels/save), 05+14+09(orbit/map/phys).
 ## Remaining unverified (mostly MED/LOW or cross-confirmed): 01,02,12,13,17,21,22,24.
 ## CRITICAL headline (3 reviewers agreed): NO PATH TO OnRails — player can never reach orbit (no ToRails producer, no auto bubble->rails); maneuver/SOI/transfer/recover all dead. THE top fix.
+
+## EXECUTION (fix-plan.md, 21 workstreams / 4 phases)
+## PHASE 1 DONE + SHIPPED (a02e496): auto InBubble->OnRails (player reaches orbit), RecoverVessel/TerminateVessel wired (pad trap fixed), csp.chute.s125 parachute (DeployPart, survives re-entry), science-in-space works, starter has canister+battery, tutorial teaches science, contracts show rewards, save_seed wired, NotificationKind widened.
+## PHASE 2 IN FLIGHT (background): W2.0+2.1+2.3 progression surface (colonies/crew/contracts/economy panels), W2.2 crew/lab+dockport+parts, W2.4 alarms/transfer/map-planning, W2.5 automation UI+sim fixes.
+## Remaining: W2.6 reliability+manufacture, P3 VAB, P4 save/server/hygiene.
+## Process: dispatch background implementers 5-at-a-time, commit+BUILD+SHIP each phase at 192.168.1.41:8420.
+## W2.6 DONE (uncommitted, this session): launch is a ManufactureCraft build order — funds + seeded pad stockpile (sites.ron v3 starting_stock: metal 2000/composite 400) debit at order, craft delivers SurfaceLatched at ConstructionComplete (berth retry if pad occupied); delivery berths upright (surface_upright + belly clearance). FACILITIES section: build ETAs, per-family qualification, RunBenchTest stand buttons. PartFailed/IgnitionMisfire now HUD toasts on focused vessel (LOG kept). Known pre-existing-in-tree failure: csp-bench flight-launch golden bincode decode (concurrent W2 serialized-type churn, passes at HEAD).

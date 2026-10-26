@@ -49,9 +49,14 @@
 //! orientation — the sim's attitude model is explicit `SetAttitude`),
 //! `stage(node)` (jettison part node — the staging primitive the sim
 //! ships), `add_node(tick, pro, norm, rad)` / `delete_node()`,
-//! `jettison(node)` (part actions), `transfer(from, to, resource,
-//! amount)`, `add_alarm(tick, label)`, `log(s)`/`print(s)`, and the
-//! `wait_*` family above. The Rust [`ControlApi`] is the same surface
+//! `jettison(node)` (part actions), `deploy(node)` (the decelerator
+//! verb — parachutes), `transfer(from, to, resource, amount)`,
+//! `add_alarm(tick, label)`, `engage_autopilot(apo_m, pe_m)` /
+//! `disengage_autopilot()` (the §2.11 `mission.ascend` verbs),
+//! `telemetry_of(id)` / `vessels()` (the frozen trait's read surface
+//! — every live vessel's telemetry map), `log(s)`/`print(s)`, and the
+//! `wait_*` family above (`wait_altitude(above_m, ascending)`
+//! included). The Rust [`ControlApi`] is the same surface
 //! `csp-ai`'s autopilot drives — the parity test asserts it.
 
 use std::cell::RefCell;
@@ -115,6 +120,19 @@ pub trait ControlApi {
     fn cancel_wake(&mut self) -> Result<(), SimError>;
     /// `log`/`print` — to the report's `script_log`.
     fn log(&mut self, line: String);
+    /// `DeployPart` — the decelerator deploy (parachute) verb.
+    fn deploy(&mut self, node: u64);
+    /// `EngageAutopilot` — hand the bound vessel to the installed
+    /// ascent driver (§2.11's `mission.ascend` in the plan's
+    /// vocabulary): the program is `AutopilotProgram::Ascent` with
+    /// the two target altitudes. A script hands the stick to the
+    /// Rust driver exactly like the player's engage verb.
+    fn engage_autopilot(&mut self, target_apoapsis_m: f64, target_periapsis_m: f64);
+    /// `DisengageAutopilot`.
+    fn disengage_autopilot(&mut self);
+    /// Every live vessel id — `telemetry_of`'s domain (the
+    /// `vessels()` guest binding returns the full telemetry array).
+    fn vessels(&mut self) -> Vec<VesselId>;
 }
 
 /// The plumbing-side [`ControlApi`] over a [`TickIo`] — what
@@ -251,6 +269,41 @@ impl ControlApi for IoControlApi<'_> {
         let id = self.script.unwrap_or(ScriptId(self.source_id as u64));
         self.io.log_line(id, &line);
     }
+    fn deploy(&mut self, node: u64) {
+        self.io.issue(
+            self.class,
+            self.source_id,
+            SimCommand::DeployPart {
+                vessel: self.vessel,
+                node: PartNodeId(node),
+            },
+        );
+    }
+    fn engage_autopilot(&mut self, target_apoapsis_m: f64, target_periapsis_m: f64) {
+        self.io.issue(
+            self.class,
+            self.source_id,
+            SimCommand::EngageAutopilot {
+                vessel: self.vessel,
+                program: csp_sim::AutopilotProgram::Ascent {
+                    target_apoapsis_m,
+                    target_periapsis_m,
+                },
+            },
+        );
+    }
+    fn disengage_autopilot(&mut self) {
+        self.io.issue(
+            self.class,
+            self.source_id,
+            SimCommand::DisengageAutopilot {
+                vessel: self.vessel,
+            },
+        );
+    }
+    fn vessels(&mut self) -> Vec<VesselId> {
+        self.io.vessels()
+    }
 }
 
 /// The set of guest-callable names **and their arities**, stated as
@@ -280,7 +333,13 @@ pub const CONTROL_API_SURFACE: &[(&str, &str)] = &[
     ("wait_periapsis", ""),
     ("wait_soi", ""),
     ("wait_node", ""),
+    ("wait_altitude", "80000.0, true"),
     ("cancel_wait", ""),
+    ("deploy", "0"),
+    ("engage_autopilot", "80000.0, 80000.0"),
+    ("disengage_autopilot", ""),
+    ("telemetry_of", "0"),
+    ("vessels", ""),
 ];
 
 // ---------------------------------------------------------------------------
@@ -725,6 +784,36 @@ impl RhaiHost {
         q.insert("y".into(), Dynamic::from_float(t.rot.y as FLOAT));
         q.insert("z".into(), Dynamic::from_float(t.rot.z as FLOAT));
         m.insert("rot".into(), Dynamic::from_map(q));
+        // Frame constants — the circular-orbit math a transfer or
+        // circularization script does needs μ; `body` names the
+        // frame's central body (`()` when unknown).
+        m.insert("mu".into(), f(t.mu_m3_per_s2));
+        m.insert(
+            "body".into(),
+            t.body
+                .as_ref()
+                .map_or(Dynamic::UNIT, |b| Dynamic::from(b.as_str().to_string())),
+        );
+        // The vessel ledger — `resources` (id → units aboard) and
+        // `parts` (`#{node, part}` — the ids `stage`/`jettison`/
+        // `deploy` target).
+        let resources: Map = t
+            .resources
+            .iter()
+            .map(|(k, v)| (k.clone().into(), Dynamic::from_float(*v as FLOAT)))
+            .collect();
+        m.insert("resources".into(), Dynamic::from_map(resources));
+        let parts: rhai::Array = t
+            .parts
+            .iter()
+            .map(|(node, part)| {
+                let mut p = Map::new();
+                p.insert("node".into(), Dynamic::from_int(*node as INT));
+                p.insert("part".into(), Dynamic::from(part.clone()));
+                Dynamic::from_map(p)
+            })
+            .collect();
+        m.insert("parts".into(), Dynamic::from_array(parts));
         if let Some((nt, dv)) = t.maneuver_node {
             m.insert("node_tick".into(), Dynamic::from_int(nt as INT));
             m.insert("node".into(), vec_map(dv));
@@ -903,9 +992,74 @@ impl RhaiHost {
         self.engine.register_fn("wait_node", move || {
             wake(&fx0, Ok(WakeCondition::AtManeuverNode));
         });
-        let fx0 = fx;
+        let fx0 = fx.clone();
         self.engine.register_fn("cancel_wait", move || {
             wake(&fx0, Err(()));
+        });
+        // `deploy(node)` — the decelerator verb (`DeployPart`): the
+        // parachute action `stage`/`jettison` don't cover.
+        let (v, fx0) = (bound.vessel, fx.clone());
+        self.engine.register_fn("deploy", move |node: INT| {
+            push(
+                &fx0,
+                SimCommand::DeployPart {
+                    vessel: v,
+                    node: PartNodeId(node as u64),
+                },
+            );
+        });
+        // `engage_autopilot(apo_m, pe_m)` / `disengage_autopilot()` —
+        // the §2.11 `mission.ascend` verb: a script hands the stick
+        // to the installed Rust driver (and takes it back). The
+        // commands are control-gated like every other issue — the
+        // player's automation passes under a vacant lease, and the
+        // residence gate rejects honestly (latched/rails).
+        let (v, fx0) = (bound.vessel, fx.clone());
+        self.engine
+            .register_fn("engage_autopilot", move |apo: FLOAT, pe: FLOAT| {
+                push(
+                    &fx0,
+                    SimCommand::EngageAutopilot {
+                        vessel: v,
+                        program: csp_sim::AutopilotProgram::Ascent {
+                            target_apoapsis_m: apo,
+                            target_periapsis_m: pe,
+                        },
+                    },
+                );
+            });
+        let (v, fx0) = (bound.vessel, fx.clone());
+        self.engine.register_fn("disengage_autopilot", move || {
+            push(&fx0, SimCommand::DisengageAutopilot { vessel: v });
+        });
+        // `wait_altitude(above_m, ascending)` — the §2.10 altitude
+        // wake (closed-form crossing of the frame's conic).
+        let fx0 = fx.clone();
+        self.engine
+            .register_fn("wait_altitude", move |above_m: FLOAT, ascending: bool| {
+                wake(&fx0, Ok(WakeCondition::AtAltitude { above_m, ascending }));
+            });
+        // `telemetry_of(id)` / `vessels()` — the read surface the
+        // frozen trait already declared but no guest name reached
+        // (report-18 F4): precomputed at bind time because a Rhai
+        // callback can't reach the borrowed `io`. `telemetry_of` on
+        // an unknown id returns `#{found: false}` — the same shape
+        // `ctx.vessel` reports for a dead vessel.
+        let by_id = bound.telemetry_by_id;
+        self.engine
+            .register_fn("telemetry_of", move |id: INT| -> Dynamic {
+                by_id.get(&(id.max(0) as u64)).map_or_else(
+                    || {
+                        let mut m = Map::new();
+                        m.insert("found".into(), Dynamic::from(false));
+                        Dynamic::from_map(m)
+                    },
+                    |m| Dynamic::from_map(m.clone()),
+                )
+            });
+        let list = bound.telemetry_list;
+        self.engine.register_fn("vessels", move || -> Dynamic {
+            Dynamic::from_array(list.as_ref().clone())
         });
     }
 }
@@ -917,6 +1071,12 @@ struct Bound {
     /// The bound vessel's orientation from this tick's telemetry
     /// snapshot — what `hold_attitude()` holds.
     rot: DQuat,
+    /// Every vessel's telemetry map keyed by id — `telemetry_of`'s
+    /// lookup table, precomputed this tick.
+    telemetry_by_id: Rc<BTreeMap<u64, Map>>,
+    /// Every vessel's telemetry map (with an `id` key) in arena
+    /// order — `vessels()`'s return array.
+    telemetry_list: Rc<rhai::Array>,
 }
 
 impl Default for RhaiHost {
@@ -937,9 +1097,22 @@ impl ScriptEngine for RhaiHost {
     fn prepare(&mut self, id: ScriptId, source: &str) -> Result<(), String> {
         preprocess(source)?;
         let ast = self.engine.compile(source).map_err(|e| e.to_string())?;
-        // §2.10: scripts are tick-entry programs — `on_tick` must exist.
-        if !ast.iter_functions().any(|f| f.name == "on_tick") {
-            return Err("script must define `fn on_tick(ctx)`".to_string());
+        // §2.10: scripts are tick-entry programs — `on_tick` must
+        // exist AND take exactly one parameter (the `ctx` map). An
+        // arity-mismatched definition compiled fine but faulted
+        // `FunctionNotFound` at every call — five strikes later the
+        // script was dead, and the load had accepted it anyway.
+        // Check the signature at prepare so a wrong-arity script is
+        // rejected like a syntax fault, never a stored dead script.
+        match ast.iter_functions().find(|f| f.name == "on_tick") {
+            None => return Err("script must define `fn on_tick(ctx)`".to_string()),
+            Some(f) if f.params.len() != 1 => {
+                return Err(format!(
+                    "`fn on_tick(ctx)` must take exactly one parameter (found {})",
+                    f.params.len()
+                ));
+            }
+            _ => {}
         }
         self.asts.insert(id, ast);
         Ok(())
@@ -977,12 +1150,27 @@ impl ScriptEngine for RhaiHost {
         // One snapshot serves both the `ctx.vessel` map and the
         // rotation `hold_attitude()` binds against.
         let telemetry = io.telemetry(script.vessel);
+        // The `telemetry_of`/`vessels` read surface: every live
+        // vessel's telemetry map, keyed for the id lookup and listed
+        // for the array return. Precomputed here — a registered Rhai
+        // closure can't reach the borrowed `io`, and the maps are
+        // this tick's frozen snapshot either way.
+        let mut telemetry_by_id = BTreeMap::new();
+        let mut telemetry_list = rhai::Array::new();
+        for vid in io.vessels() {
+            let mut m = Self::telemetry_to_map(&io.telemetry(vid));
+            m.insert("id".into(), Dynamic::from_int(vid.0 as INT));
+            telemetry_by_id.insert(vid.0, m.clone());
+            telemetry_list.push(Dynamic::from_map(m));
+        }
         let effects = Rc::new(RefCell::new(ScriptEffects::default()));
         self.bind_fns(
             Rc::clone(&effects),
             Bound {
                 vessel: script.vessel,
                 rot: telemetry.rot,
+                telemetry_by_id: Rc::new(telemetry_by_id),
+                telemetry_list: Rc::new(telemetry_list),
             },
         );
 
@@ -1068,8 +1256,14 @@ impl ScriptEngine for RhaiHost {
                 // 2. Resolve the wake intent — the only remaining
                 //    fallible step (§2.10: "refused at registration").
                 //    `request_wake`/`cancel_wake` resolve before they
-                //    mutate, so a refusal leaves the heap untouched
-                //    and this tick records nothing.
+                //    mutate, so a refusal leaves the heap untouched.
+                //    A refusal is a *diagnostic*, not a strike:
+                //    conditions that can't resolve are a normal
+                //    outcome (no node armed, hyperbolic apsis), and
+                //    striking for one made an honest `wait_*` a
+                //    disable risk. The refusal rides `script_log` so
+                //    the player sees it — and the tick's other
+                //    effects still apply.
                 let fx = effects.borrow();
                 if let Some(w) = &fx.wake {
                     let r = match w {
@@ -1077,10 +1271,7 @@ impl ScriptEngine for RhaiHost {
                         Err(()) => io.cancel_wake(script.id),
                     };
                     if let Err(e) = r {
-                        return ScriptRunReport {
-                            ops_used,
-                            fault: Some(ScriptFault::Runtime(format!("wake: {}", e.reason()))),
-                        };
+                        io.log_line(script.id, &format!("wake refused: {}", e.reason()));
                     }
                 }
                 // 3. Everything left is infallible: assign persist,
@@ -1228,7 +1419,7 @@ mod tests {
     /// runtime fault, so a drifted binding can never pass silently.
     #[test]
     fn control_api_surface_is_registered() {
-        assert_eq!(CONTROL_API_SURFACE.len(), 19);
+        assert_eq!(CONTROL_API_SURFACE.len(), 25);
         let mut host = RhaiHost::new();
         for (id, (name, args)) in CONTROL_API_SURFACE.iter().enumerate() {
             let src = format!("fn on_tick(ctx) {{ {name}({args}); }}");
@@ -1288,6 +1479,8 @@ mod tests {
                     body: None,
                     elements: None,
                     maneuver_node: None,
+                    resources: std::collections::BTreeMap::new(),
+                    parts: Vec::new(),
                 },
                 commands: Vec::new(),
                 logs: Vec::new(),
@@ -1309,6 +1502,9 @@ mod tests {
         }
         fn cancel_wake(&mut self, _s: ScriptId) -> Result<(), SimError> {
             Ok(())
+        }
+        fn vessels(&self) -> Vec<VesselId> {
+            vec![VesselId(0)]
         }
         fn log_line(&mut self, _s: ScriptId, line: &str) {
             self.logs.push(line.to_string());
@@ -1514,15 +1710,22 @@ mod tests {
         );
     }
 
-    /// §2.10's atomic tick: when wake registration refuses, the tick
-    /// lands NOTHING — no commands, no persist write — not the
-    /// half-drained state the old command-first order produced.
+    /// §2.10's "refused at registration" is a diagnostic, not a
+    /// strike (report-18 F5): a `wait_*` that can't resolve is a
+    /// normal outcome — no node armed, a hyperbolic apsis — so the
+    /// tick reports no fault, the refusal rides `script_log`, and
+    /// the tick's other effects (commands, persist write) still
+    /// apply. The old strike-on-refusal made an honest `wait_*` a
+    /// disable risk.
     #[test]
-    fn refused_wake_drains_no_effects() {
+    fn refused_wake_is_a_log_diagnostic_not_a_strike() {
         struct RefusingIo(StubIo);
         impl TickIo for RefusingIo {
             fn telemetry(&self, v: VesselId) -> VesselTelemetry {
                 self.0.telemetry(v)
+            }
+            fn vessels(&self) -> Vec<VesselId> {
+                self.0.vessels()
             }
             fn issue(&mut self, c: SourceClass, s: u32, cmd: SimCommand) {
                 self.0.issue(c, s, cmd);
@@ -1553,18 +1756,18 @@ mod tests {
         let mut s = script(src);
         let mut io = RefusingIo(StubIo::new());
         let r = host.run_tick(&mut s, 1, &mut io);
+        assert!(r.fault.is_none(), "{:?}", r.fault);
         assert!(
-            matches!(r.fault, Some(ScriptFault::Runtime(ref m)) if m.starts_with("wake:")),
-            "{:?}",
-            r.fault
+            io.0.logs.iter().any(|l| l.starts_with("wake refused:")),
+            "the refusal must ride script_log: {:?}",
+            io.0.logs
         );
         assert!(
-            io.0.commands.is_empty(),
-            "a refused wake must land no commands"
+            io.0.commands
+                .iter()
+                .any(|c| matches!(c, SimCommand::SetThrottle { .. })),
+            "the tick's other effects still apply"
         );
-        assert!(
-            s.persist.is_empty(),
-            "a refused wake must land no persist write"
-        );
+        assert_eq!(s.persist.get("n"), Some(&PersistValue::Int(1)));
     }
 }

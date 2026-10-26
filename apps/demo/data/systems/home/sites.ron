@@ -3,10 +3,10 @@
 // true` marks the body's launch site (recovery_efficiency 1.0); every
 // other site recovers at balance.ron's recovery_efficiency (0.9).
 (
-    schema_version: 2,
+    schema_version: 3,
     sites: [
         (
-            schema_version: 2,
+            schema_version: 3,
             id: "terrin-launch",
             display_name: "site.terrin-launch",
             body: "terrin",
@@ -27,9 +27,16 @@
                 ("ore", 0.35),
                 ("water", 0.15),
             ],
+            // Mirror of data/systems/home/sites.ron — the pad's
+            // starting stockpile ManufactureCraft BOMs and
+            // RunBenchTest stands spend.
+            starting_stock: [
+                ("metal", 2000.0),
+                ("composite", 400.0),
+            ],
         ),
         (
-            schema_version: 2,
+            schema_version: 3,
             id: "terrin-downrange",
             display_name: "site.terrin-downrange",
             body: "terrin",

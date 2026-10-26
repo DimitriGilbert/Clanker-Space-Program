@@ -777,6 +777,27 @@ impl World {
         &self.transfers
     }
 
+    /// `true` while `vessel` satisfies the `JoinColonyInventory`
+    /// proximity gate against `colony` — `SurfaceLatched` on the
+    /// colony's body within `transfer_radius_m` of the colony's site
+    /// pose (the [`Self::vessel_colony_linked`] predicate the apply
+    /// enforces). Observation-only read for the presentation layer's
+    /// button gating — liveness (`colony_live`) is checked by the
+    /// caller, exactly like the apply does.
+    pub fn colony_joinable(&self, vessel: VesselId, colony: crate::economy::ColonyId) -> bool {
+        self.vessel_colony_linked(vessel, colony)
+    }
+
+    /// `true` while the `TransferResource`/`TransferCrew` link
+    /// precondition holds between `a` and `b` — jointed, co-bubble
+    /// within `transfer_radius_m`, or co-latched on one body within
+    /// the radius (the [`Self::transfer_linked`] clauses). `a == b`
+    /// is never linked (the self-transfer rejection's reading).
+    /// Observation-only read for presentation gating.
+    pub fn vessels_linked(&self, a: VesselId, b: VesselId) -> bool {
+        a != b && self.transfer_linked(a, b)
+    }
+
     /// §3.5's transfer tunables — post-construction setter for worlds
     /// built from `balance.ron` ([`View`](csp_view)-side startup,
     /// `csp-bench` scenario setup). A construction-config write like

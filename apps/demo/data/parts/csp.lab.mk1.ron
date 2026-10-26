@@ -1,0 +1,82 @@
+// csp.lab.mk1 — "Meridian" orbital research lab (§3.1 PartDef).
+// Hand-authored fiction — numbers frozen at M7.
+//
+// The part that makes `StartResearch` reachable: its `Lab` module
+// resolves the `LabSpec` the apply gate reads (`research: node
+// carries no lab` without it), and the `CrewSeat` pair is what the
+// assigned researchers actually sit in — `researcher_slots: 2`
+// matches the seats so a fully-crewed lab always has somewhere to
+// put both researchers. §3.2's rate model reads
+// `R = Σ skill · multiplier` against `T = throughput_data_per_s`:
+// multiplier 2.0 doubles a researcher's skill into science/s, and
+// T 0.5 puts a 10-unit canister pool in the abundant (linear)
+// regime for most of its drain. Gated behind `tech.science.1` —
+// the node whose `facility.lab` unlock needed a part payload.
+//
+// 1.25 m stack interfaces: the lab flies inline like every
+// mid-stack canister. Category Utility — the browser's
+// "everything else" bucket (the Science category is reserved for
+// `Experiment`-carrying instruments by the category-module rule).
+(
+    schema_version: 1,
+    id: "csp.lab.mk1",
+    family: "csp.family.lab",
+    display_name: "part.csp.lab.mk1.name",
+    category: Utility,
+    mass_dry_kg: 1400.0,
+    cost_funds: 4200.0,
+    size_m: (x: 1.25, y: 1.25, z: 1.6),
+    build_resources: [("metal", 90.0), ("composite", 30.0)],
+    attach_nodes: [
+        (id: "top",    position_m: (x: 0.0, y: 0.0, z: 0.8),  direction: (x: 0.0, y: 0.0, z: 1.0),  diameter_m: 1.25),
+        (id: "bottom", position_m: (x: 0.0, y: 0.0, z: -0.8), direction: (x: 0.0, y: 0.0, z: -1.0), diameter_m: 1.25),
+    ],
+    scale: None,
+    collider: Cylinder(radius_m: 0.625, half_height_m: 0.8),
+    aero: (
+        cd_curve: [(mach: 0.0, coeff: 0.5), (mach: 8.0, coeff: 0.32)],
+        cl_curve: [(mach: 0.0, coeff: 0.05), (mach: 8.0, coeff: 0.05)],
+        ref_len_m: 1.6,
+    ),
+    thermal: (
+        heat_capacity_j_per_k: 700_000.0,
+        max_temp_k: 1100.0,
+        emissivity: 0.7,
+        conduction_w_per_k: 60.0,
+    ),
+    structural: (
+        max_axial_n: 500_000.0,
+        max_shear_n: 200_000.0,
+        max_torque_nm: 30_000.0,
+    ),
+    variants: [
+        (id: "stock", display_name: "part.variant.stock", cost_multiplier: 1.0, stat_multipliers: []),
+    ],
+    modules: [
+        CrewSeat(slots: 2),
+        Lab(
+            throughput_data_per_s: 0.5,
+            multiplier: 2.0,
+            researcher_slots: 2,
+        ),
+    ],
+    reliability: (
+        base_mtbf_s: 1_200_000.0,
+        infant_mortality: 0.08,
+        qualification_curve: (knots: [
+            (qualification_units: 0.0,   hazard_multiplier: 1.0),
+            (qualification_units: 100.0, hazard_multiplier: 0.55),
+            (qualification_units: 300.0, hazard_multiplier: 0.35),
+        ]),
+        regime_stress: [
+            (kind: Overtemperature, threshold: 0.9,  multiplier: 4.0),
+            (kind: ExcessG,         threshold: 10.0, multiplier: 2.0),
+        ],
+        dormant_stress: 0.02,
+        failure_modes: [
+            (SensorFault, 0.7),
+            (PanelJam,    0.3),
+        ],
+    ),
+    tech_requirement: "tech.science.1",
+)

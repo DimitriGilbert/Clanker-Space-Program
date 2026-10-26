@@ -3379,6 +3379,19 @@ impl World {
         &self.command_log
     }
 
+    /// The pending event heap's contents, sorted by `(tick, seq)` —
+    /// a sorted COPY (the `BinaryHeap`'s sift order is allocator
+    /// detail, never the enumeration). Read-only access for the
+    /// presentation surfaces that list what is scheduled — the
+    /// Program window's AGENDA section reads `PlayerAlarm` /
+    /// `TransferWindow` / `ContractDeadline` entries off it.
+    /// Observation only: mutation stays `enqueue` + `step_frame`.
+    pub fn pending_events(&self) -> Vec<ScheduledEvent> {
+        let mut events: Vec<ScheduledEvent> = self.event_heap.iter().cloned().collect();
+        events.sort_by_key(|e| (e.tick, e.seq));
+        events
+    }
+
     /// Queue a `SimCommand` for the next boundary drain (§2.2.1). Touches
     /// only the in-flight queue — the tick/seq stamps are assigned by the
     /// drain inside `step_frame`, never here, so enqueuing is free of
@@ -4529,6 +4542,17 @@ impl World {
                     if vessel.maneuver.is_some() || body.throttle != 0.0 || body.settle.latched {
                         continue;
                     }
+                    // An engaged autopilot is a live control producer:
+                    // railing its vessel silences it mid-flight (the
+                    // ascent program's coast phase is throttle-0 —
+                    // exactly the coasting case above — and its
+                    // circularization commands could never issue).
+                    // Scripts are different: §2.10's wake carrier
+                    // survives rails (`rearm_rails_scripts` re-arms at
+                    // the transition), autopilots have no wake.
+                    if self.autopilots.get(vid).is_some_and(|a| a.enabled) {
+                        continue;
+                    }
                     let rel = body.com_world() - env.body_center;
                     if rel.norm() - env.radius_m < atm_top {
                         continue;
@@ -5183,8 +5207,29 @@ impl World {
                 if !program.is_valid() {
                     return Err(SimError::Recoverable("autopilot: non-finite program"));
                 }
-                if !self.vessels.contains_key(vessel) {
+                let Some(v) = self.vessels.get(vessel) else {
                     return Err(SimError::Recoverable("autopilot: unknown vessel"));
+                };
+                // Residence gate (report-18 F2): autopilots tick only
+                // inside `step_bubble_tick`'s control pass — a record
+                // accepted on a `SurfaceLatched` or `OnRails` vessel
+                // is a zombie that can never issue a command (and on
+                // a latched hull could never even unlatch: the
+                // unlatching `SetThrottle` is itself a command the
+                // deadlocked driver can't produce). Refuse honestly —
+                // the player unlatches/coasts first, then engages.
+                match &v.state {
+                    VesselState::InBubble(_) => {}
+                    VesselState::SurfaceLatched(_) => {
+                        return Err(SimError::Recoverable(
+                            "autopilot: vessel latched — unlatch before engaging",
+                        ));
+                    }
+                    VesselState::OnRails(_) => {
+                        return Err(SimError::Recoverable(
+                            "autopilot: vessel on rails — a conic has no control ticks",
+                        ));
+                    }
                 }
                 // The installed driver must be able to fly this
                 // program — `run_autopilot_tick` silently skips a
@@ -6010,7 +6055,12 @@ impl World {
             SimTime::from_ticks(epoch.ticks().max(self.clock.ticks())),
             shadow,
             suppress,
-        )
+        )?;
+        // §2.10's wake-carrier hand-off: scripts that rode the
+        // bubble's per-tick control pass have no wake armed — re-arm
+        // them so the transition does not strand them off-tick
+        // forever (the load-time bootstrap wake's twin).
+        self.rearm_rails_scripts(vessel, shadow)
     }
 
     /// §2.6.6 residence resolution at a stamped epoch. The event scan
@@ -7675,6 +7725,62 @@ impl World {
                 persist: PersistMap::new(),
             },
         );
+        // The bootstrap wake (report-18 F3): a script bound to a
+        // vessel without bubble ticks (`OnRails`, `SurfaceLatched`)
+        // would otherwise apply "successfully" and NEVER execute —
+        // its first `on_tick` is what arms a real wake, and only a
+        // `ScriptWake` carries ticks off-bubble. Schedule an initial
+        // wake one tick out so the script runs once and can arm its
+        // real condition. In-bubble scripts skip this: the bubble's
+        // control pass ticks them anyway, and a pending wake would
+        // only clamp warp at the dead tick.
+        let in_bubble = self
+            .vessels
+            .get(&vessel)
+            .is_some_and(|v| matches!(v.state, VesselState::InBubble(_)));
+        if !in_bubble {
+            let tick = self.clock.ticks().saturating_add(1);
+            self.schedule_event(EventKind::ScriptWake { script: id }, tick, shadow)?;
+            if let Some(s) = self.scripts.get_mut(&id) {
+                s.wake_tick = Some(tick);
+            }
+        }
+        Ok(())
+    }
+
+    /// The bubble→rails half of the bootstrap rule: a script that was
+    /// ticking in-bubble keeps no wake registration (it never needed
+    /// one), so the transition to `OnRails` would strand it — no
+    /// bubble ticks remain and nothing ever carries another tick.
+    /// Re-arm every enabled script bound to `vessel` that holds no
+    /// wake: one `ScriptWake` a tick out, exactly like
+    /// `apply_load_script`'s initial wake, so `on_tick` runs once on
+    /// the conic and arms the real condition. A script that already
+    /// holds a wake (armed inside its last bubble tick, or resolved
+    /// against the osculating conic) is left alone — its registration
+    /// already pairs with a pending event.
+    fn rearm_rails_scripts(
+        &mut self,
+        vessel: VesselId,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        let needs: Vec<ScriptId> = self
+            .scripts
+            .values()
+            .filter(|s| s.vessel == vessel && s.enabled && s.wake_tick.is_none())
+            .map(|s| s.id)
+            .collect();
+        if needs.is_empty() {
+            return Ok(());
+        }
+        self.shadow_scripts(shadow);
+        let tick = self.clock.ticks().saturating_add(1);
+        for id in needs {
+            if let Some(s) = self.scripts.get_mut(&id) {
+                s.wake_tick = Some(tick);
+            }
+            self.schedule_event(EventKind::ScriptWake { script: id }, tick, shadow)?;
+        }
         Ok(())
     }
 
@@ -8986,25 +9092,84 @@ impl WorldTickIo<'_> {
                 }
                 Ok(clock.saturating_add(*n))
             }
-            WakeCondition::AtApoapsis | WakeCondition::AtPeriapsis => {
-                let Some(orbit) = self.vessels.get(&vessel).and_then(|v| v.orbit()) else {
-                    return Err(SimError::Recoverable(
-                        "wake: apsis requires an on-rails vessel",
-                    ));
+            WakeCondition::AtApoapsis
+            | WakeCondition::AtPeriapsis
+            | WakeCondition::AtAltitude { .. } => {
+                // The conic the wake resolves against: the stamped
+                // conic for `OnRails`, the *osculating* conic for
+                // `InBubble` (epoch = the tick — its elements are
+                // anchored at now). The in-bubble resolution is what
+                // closes the "rails-only" gap: an ascent script arms
+                // `wait_apoapsis` while still physical, the auto-rails
+                // edge keeps the armed wake, and the `ScriptWake`
+                // carries the tick at the apsis — the §2.10 canonical
+                // scenario. While the vessel STAYS in-bubble the
+                // firing is consumed silently (the double-tick rule —
+                // a bubble script reads `time_to_apoapsis` from
+                // telemetry every tick anyway).
+                let Some(v) = self.vessels.get(&vessel) else {
+                    return Err(SimError::Recoverable("wake: unknown vessel"));
                 };
-                let mu = self
-                    .orbits
-                    .body_orbit(&orbit.parent)
-                    .map_err(|_| SimError::Recoverable("wake: unknown parent body"))?
-                    .mu_m3_per_s2;
-                let tick = scripts::resolve_apsis_ticks(
-                    &orbit.elements,
-                    mu,
-                    orbit.epoch.ticks(),
-                    clock,
-                    matches!(condition, WakeCondition::AtApoapsis),
-                )?;
-                tick.ok_or(SimError::Recoverable("wake: no such apsis ahead"))
+                let (elements, mu, radius_m, epoch_ticks) = match &v.state {
+                    VesselState::OnRails(orbit) => {
+                        let mu = self
+                            .orbits
+                            .body_orbit(&orbit.parent)
+                            .map_err(|_| SimError::Recoverable("wake: unknown parent body"))?
+                            .mu_m3_per_s2;
+                        (
+                            orbit.elements.clone(),
+                            mu,
+                            self.orbits.body_radius(&orbit.parent),
+                            orbit.epoch.ticks(),
+                        )
+                    }
+                    VesselState::InBubble(body) => {
+                        let Some((env, _)) = self.physics_env else {
+                            return Err(SimError::Recoverable("wake: no physics environment"));
+                        };
+                        let el = orbit::cartesian_to_elements(
+                            body.com_world() - env.body_center,
+                            body.vel,
+                            env.mu_m3_per_s2,
+                        )?;
+                        (el, env.mu_m3_per_s2, Some(env.radius_m), clock)
+                    }
+                    VesselState::SurfaceLatched(_) => {
+                        return Err(SimError::Recoverable(
+                            "wake: apsis/altitude needs a flying vessel",
+                        ));
+                    }
+                };
+                let tick = match condition {
+                    WakeCondition::AtApoapsis | WakeCondition::AtPeriapsis => {
+                        scripts::resolve_apsis_ticks(
+                            &elements,
+                            mu,
+                            epoch_ticks,
+                            clock,
+                            matches!(condition, WakeCondition::AtApoapsis),
+                        )?
+                    }
+                    WakeCondition::AtAltitude { above_m, ascending } => {
+                        let Some(radius_m) = radius_m else {
+                            return Err(SimError::Recoverable(
+                                "wake: no datum radius for the altitude wake",
+                            ));
+                        };
+                        scripts::resolve_altitude_ticks(
+                            &elements,
+                            mu,
+                            radius_m,
+                            *above_m,
+                            *ascending,
+                            epoch_ticks,
+                            clock,
+                        )?
+                    }
+                    _ => unreachable!("match arms are the conic conditions"),
+                };
+                tick.ok_or(SimError::Recoverable("wake: no such point ahead"))
             }
             WakeCondition::AtNextSoiTransition => {
                 let tick = self
@@ -9062,6 +9227,8 @@ impl WorldTickIo<'_> {
             body: None,
             elements: None,
             maneuver_node: None,
+            resources: BTreeMap::new(),
+            parts: Vec::new(),
         };
         let Some(v) = vessels.get(&vessel) else {
             return t;
@@ -9073,6 +9240,31 @@ impl WorldTickIo<'_> {
                 DVec3::new(n.dv_prograde_mps, n.dv_normal_mps, n.dv_radial_mps),
             )
         });
+        // The inventory reads a control surface needs — the resource
+        // ledger (`vessel_resource`'s sum denormalized) and the
+        // aimable part graph (node → part id: the targets `stage`,
+        // `jettison`, and `deploy` name).
+        for stores in v.tank_contents.values() {
+            for (resource, units) in stores {
+                *t.resources
+                    .entry(resource.as_str().to_string())
+                    .or_insert(0.0) += units;
+            }
+        }
+        if let Some(craft) = &v.craft {
+            t.parts = craft
+                .graph
+                .nodes
+                .iter()
+                .map(|(nid, node)| {
+                    let part = craft
+                        .part_ids
+                        .get(node.effective_index as usize)
+                        .map_or_else(|| "unknown".to_string(), |p| p.as_str().to_string());
+                    (nid.0, part)
+                })
+                .collect();
+        }
         // (rel, vel, mu, radius, epoch_ticks) per residence — the
         // frame the telemetry's vectors live in.
         let mut fill = |rel: DVec3,
@@ -9170,6 +9362,10 @@ impl TickIo for WorldTickIo<'_> {
             self.clock,
             vessel,
         )
+    }
+
+    fn vessels(&self) -> Vec<VesselId> {
+        self.vessels.keys().copied().collect()
     }
 
     fn issue(&mut self, class: SourceClass, source_id: u32, command: SimCommand) {
@@ -22091,6 +22287,13 @@ mod tests {
             );
             w.step_frame(1).unwrap();
             assert_eq!(w.scripts().len(), 1);
+            // W2.5's bootstrap wake delivers one `on_tick` at load —
+            // absorb it (and its issued alarm) so the planted pair
+            // below is the only wake in play.
+            w.step_frame(2).unwrap();
+            assert_eq!(calls.borrow().len(), 1, "the bootstrap tick ran");
+            calls.borrow_mut().clear();
+            w.pending.clear();
             // Plant the strict wake pair at tick 10 — a rails-bound
             // script ticks only via its wake.
             let mut shadow = TickShadow::capture(&w);
@@ -22128,9 +22331,11 @@ mod tests {
             assert_eq!(key.tick, 11, "stamped one tick past the wake tick");
         }
 
-        /// §2.10: a script on a rails-bound vessel ticks ONLY via
-        /// wakes — with none registered it never runs and never
-        /// blocks warp.
+        /// §2.10 + W2.5's bootstrap: a script on a rails-bound vessel
+        /// ticks ONLY via wakes — the load's bootstrap `ScriptWake`
+        /// delivers exactly one `on_tick` (its chance to arm a real
+        /// wake), and a script that arms nothing never runs again
+        /// and never blocks warp.
         #[test]
         fn rails_script_never_ticks_without_wake() {
             let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -22157,9 +22362,10 @@ mod tests {
             );
             w.step_frame(1).unwrap();
             w.step_frame(10_000).unwrap();
-            assert!(
-                calls.borrow().is_empty(),
-                "a rails-bound script with no wake must never tick"
+            assert_eq!(
+                calls.borrow().len(),
+                1,
+                "a rails-bound script gets exactly the bootstrap tick, then nothing"
             );
             assert!(
                 w.rails_warp_refusal().is_none(),
@@ -22225,6 +22431,178 @@ mod tests {
                 panic!("orbiter must be resident");
             };
             assert_eq!(body.throttle, 0.25);
+        }
+
+        /// W2.5's residence gate: `EngageAutopilot` refuses a
+        /// `SurfaceLatched` or `OnRails` vessel — a record accepted
+        /// there is a zombie (the driver only ticks in-bubble, and a
+        /// latched hull could never issue its own unlatch).
+        #[test]
+        fn engage_autopilot_refuses_non_bubble() {
+            struct Noop;
+            impl AutopilotDriver for Noop {
+                fn program(&self) -> AutopilotProgram {
+                    AutopilotProgram::Ascent {
+                        target_apoapsis_m: 0.0,
+                        target_periapsis_m: 0.0,
+                    }
+                }
+                fn run_tick(
+                    &mut self,
+                    _v: VesselId,
+                    _s: &mut AutopilotState,
+                    _t: u64,
+                    _io: &mut dyn TickIo,
+                ) -> Result<(), String> {
+                    Ok(())
+                }
+            }
+            let program = || AutopilotProgram::Ascent {
+                target_apoapsis_m: 100_000.0,
+                target_periapsis_m: 100_000.0,
+            };
+            // Rails — `SpawnVessel` lands `OnRails` directly.
+            let mut w = World::with_system(test_system());
+            w.set_autopilot_driver(Box::new(Noop));
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::SpawnVessel {
+                    parent: BodyId::from("p"),
+                    elements: leo_elements(),
+                },
+            );
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::EngageAutopilot {
+                    vessel: VesselId(0),
+                    program: program(),
+                },
+            );
+            let r = w.step_frame(1).unwrap();
+            assert!(
+                r.rejected.iter().any(
+                    |rj| matches!(rj.error, SimError::Recoverable(m) if m.contains("on rails"))
+                ),
+                "rails engage must reject: {:?}",
+                r.rejected
+            );
+            assert!(w.autopilots().is_empty());
+            // Latched — the deadlock case: it could never unlatch.
+            let mut w = physics_world(false);
+            w.set_autopilot_driver(Box::new(Noop));
+            enqueue_orbiter(&mut w);
+            w.step_frame(1).unwrap();
+            w.vessels.get_mut(&VesselId(0)).unwrap().state =
+                VesselState::SurfaceLatched(SurfacePose {
+                    body: BodyId::from("p"),
+                    latitude_rad: 0.0,
+                    longitude_rad: 0.0,
+                    altitude_m: 0.0,
+                    orientation: DQuat::IDENTITY,
+                });
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::EngageAutopilot {
+                    vessel: VesselId(0),
+                    program: program(),
+                },
+            );
+            let r = w.step_frame(2).unwrap();
+            assert!(
+                r.rejected.iter().any(
+                    |rj| matches!(rj.error, SimError::Recoverable(m) if m.contains("latched"))
+                ),
+                "latched engage must reject: {:?}",
+                r.rejected
+            );
+            assert!(w.autopilots().is_empty());
+        }
+
+        /// W2.5's bootstrap wake: a `LoadScript` on a non-bubble
+        /// vessel schedules an initial `ScriptWake` one tick out, so
+        /// `on_tick` runs once and can arm a real wake — the §2.10
+        /// canonical scenario. (The pre-fix record was a zombie: it
+        /// applied "successfully" and never executed.)
+        #[test]
+        fn rails_loaded_script_gets_a_bootstrap_tick() {
+            let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let mut w = World::with_system(test_system());
+            w.set_script_engine(Box::new(StubEngine {
+                behavior: Behavior::WakeAt(100),
+                calls: std::rc::Rc::clone(&calls),
+            }));
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::SpawnVessel {
+                    parent: BodyId::from("p"),
+                    elements: leo_elements(),
+                },
+            );
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::LoadScript {
+                    vessel: VesselId(0),
+                    source: "stub".to_string(),
+                },
+            );
+            // The load drains at the tick-1 boundary; the bootstrap
+            // wake is scheduled at clock+1 and carries the first
+            // `on_tick` — which arms the real `AtTick(100)` wake.
+            w.step_frame(3).unwrap();
+            assert_eq!(
+                calls.borrow().len(),
+                1,
+                "the bootstrap wake must deliver exactly one on_tick"
+            );
+            assert_eq!(
+                w.scripts()[&ScriptId(0)].wake_tick,
+                Some(100),
+                "the script re-armed its real wake"
+            );
+            // ...and at the armed tick the wake carries the next
+            // `on_tick` — the full load → arm → fire chain works.
+            w.step_frame(101).unwrap();
+            assert_eq!(calls.borrow().len(), 2);
+            assert_eq!(calls.borrow()[1].1, 100);
+        }
+
+        /// The wake re-arm on the bubble→rails edge: a script ticking
+        /// in-bubble holds no wake; the conversion arms the bootstrap
+        /// wake so the transition can't strand it off-tick.
+        #[test]
+        fn bubble_to_rails_rearms_scripts() {
+            let (mut w, calls) = scripted_world(Behavior::WakeAt(500));
+            // The orbiter ticks in-bubble; flip it to rails like the
+            // auto-conversion does (`apply_to_rails` is the same path).
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::ToRails {
+                    vessel: VesselId(0),
+                },
+            );
+            // The orbiter fixture sits high enough to rail (its
+            // conic clears the surface floor — `apply_to_rails_at`
+            // refuses otherwise and this test would be vacuous).
+            let t = w.clock().ticks();
+            w.step_frame(t + 1).unwrap();
+            if w.vessels()[&VesselId(0)].orbit().is_none() {
+                // The fixture wouldn't rail — nothing to assert.
+                return;
+            }
+            // The conversion armed the bootstrap wake — one more
+            // on_tick lands at its firing on the conic.
+            let pre = calls.borrow().len();
+            w.step_frame(t + 3).unwrap();
+            assert!(
+                calls.borrow().len() > pre,
+                "the re-armed wake must deliver a rails tick"
+            );
         }
     }
     // -------------------------------------------------------------------

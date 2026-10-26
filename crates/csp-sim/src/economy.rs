@@ -644,14 +644,27 @@ impl World {
     /// serialized or hashed; `WorldConfig` carries it so §7.6
     /// replays rebuild it). Reconciles the `economy.sites` arena to
     /// the def set — a pre-run write like every `set_*`; an existing
-    /// state's inventory survives a same-id re-install.
+    /// state's inventory survives a same-id re-install. A fresh row
+    /// seeds from the def's `starting_stock` (§3.5 v3): the launch
+    /// site's authored stockpile is what `ManufactureCraft` BOMs and
+    /// `RunBenchTest` stands spend.
     pub fn set_sites(&mut self, defs: BTreeMap<SiteId, SiteDef>) {
         let states = &mut self.economy.sites;
         states.retain(|id, _| defs.contains_key(id));
-        for id in defs.keys() {
+        for (id, def) in &defs {
             states.entry(id.clone()).or_insert_with(|| SiteState {
                 id: id.clone(),
-                inventory: BTreeMap::new(),
+                // The arena's seed — `starting_stock` is a def-list
+                // (duplicate resources would need aggregation; the
+                // validator forbids them, but aggregate anyway so a
+                // hand-built def can never mint a corrupt row).
+                inventory: def
+                    .starting_stock
+                    .iter()
+                    .fold(BTreeMap::new(), |mut m, (r, u)| {
+                        *m.entry(r.clone()).or_insert(0.0) += u;
+                        m
+                    }),
             });
         }
         self.site_defs = defs;
@@ -1105,6 +1118,7 @@ mod tests {
                 altitude_m: 0.0,
                 launch,
                 resource_yields: vec![],
+                starting_stock: vec![],
             },
         )
     }

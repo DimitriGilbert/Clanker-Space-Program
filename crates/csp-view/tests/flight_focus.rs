@@ -45,7 +45,14 @@ fn second_launch_moves_focus_to_the_new_vessel() {
     }
 
     view.launch_craft().expect("second launch");
-    frame(&mut view, 1);
+    // W2.6: launch is a ManufactureCraft order — the second vessel
+    // materializes at `ConstructionComplete`, not the next tick.
+    for _ in 0..200 {
+        frame(&mut view, 64);
+        if view.sim.builds().is_empty() {
+            break;
+        }
+    }
 
     let dump: Vec<String> = view
         .sim

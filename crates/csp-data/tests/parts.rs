@@ -97,7 +97,7 @@ fn resources_validate_green() {
 fn authored_parts_load_and_validate_green() {
     let loaded = parts();
     let res = resources();
-    assert_eq!(loaded.parts.len(), 11, "the authored set is 11 parts");
+    assert_eq!(loaded.parts.len(), 16, "the authored set is 16 parts");
     let errs = validate_parts(&loaded, &res, &recipes(), &experiments());
     assert!(errs.is_empty(), "validator errors: {errs:#?}");
 }
@@ -223,6 +223,63 @@ fn authored_set_exercises_the_schema() {
         .unwrap();
     assert!(!mask.is_empty());
     assert_ne!(mask.0 & csp_data::SituationMask::SPACE_LOW.0, 0);
+
+    // The M7 content-path parts exist with the module shapes the sim
+    // gates read: the lab carries the `Lab` module `StartResearch`'s
+    // `LabSpec` gate resolves (plus `CrewSeat`s for its researchers),
+    // the docking port carries a `DockPort` naming a real attach
+    // node, and the life-support canister carries the `oxygen`/`food`
+    // stores `SetLifeSupportEnabled` consumes.
+    let lab = def(&loaded, "csp.lab.mk1");
+    let lab_spec = lab
+        .modules
+        .iter()
+        .find_map(|m| match m {
+            ModuleDef::Lab {
+                throughput_data_per_s,
+                multiplier,
+                researcher_slots,
+            } => Some((*throughput_data_per_s, *multiplier, *researcher_slots)),
+            _ => None,
+        })
+        .expect("csp.lab.mk1 carries no Lab module — StartResearch can never pass its gate");
+    assert!(lab_spec.0 > 0.0 && lab_spec.1 > 0.0 && lab_spec.2 > 0);
+    let lab_seats: u32 = lab
+        .modules
+        .iter()
+        .map(|m| match m {
+            ModuleDef::CrewSeat { slots } => u32::from(*slots),
+            _ => 0,
+        })
+        .sum();
+    assert!(
+        lab_seats >= u32::from(lab_spec.2),
+        "lab seats {lab_seats} < researcher_slots {}",
+        lab_spec.2
+    );
+
+    let port = def(&loaded, "csp.dockport.s125");
+    let port_node = port
+        .modules
+        .iter()
+        .find_map(|m| match m {
+            ModuleDef::DockPort { node, .. } => Some(node.as_str()),
+            _ => None,
+        })
+        .expect("csp.dockport.s125 carries no DockPort module");
+    assert!(
+        port.attach_nodes.iter().any(|n| n.id == port_node),
+        "dock port names attach node '{port_node}' that does not exist"
+    );
+
+    let life = def(&loaded, "csp.tank.life.s");
+    let has = |res: &str| {
+        life.modules.iter().any(|m| match m {
+            ModuleDef::Tank { capacity } => capacity.iter().any(|(r, _)| r.as_str() == res),
+            _ => false,
+        })
+    };
+    assert!(has("oxygen") && has("food"));
 
     // Every part has at least one attach node and a stock variant —
     // the editor's minimum viable shape.

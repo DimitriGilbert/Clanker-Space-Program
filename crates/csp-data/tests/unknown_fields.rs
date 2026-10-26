@@ -175,19 +175,20 @@ fn misspelled_engine_module_field_is_a_parse_error() {
     assert_rejects::<csp_data::PartDef>(&path, &misspelled(&text, "ignitions"));
 }
 
-/// v1 `sites.ron` (no `resource_yields`) still parses —
-/// `deny_unknown_fields` only rejects *undeclared* keys; the
-/// `#[serde(default)]` on the v2 field supplies the empty list. The
-/// frozen `flight-launch` fixture is the real v1 file.
+/// A previous-schema `sites.ron` still parses — the §3.1 "current
+/// and previous" rule: v2's missing `starting_stock` (v3's field)
+/// reads as the empty stockpile under `#[serde(default)]`, the same
+/// way v1's `resource_yields` read empty before it aged out. The
+/// frozen `flight-launch` fixture is the real v2 file.
 #[test]
-fn v1_sites_file_still_parses() {
+fn v2_sites_file_still_parses() {
     let sites =
         csp_data::load_sites(&data().join("test-fixtures/flight-launch/sites.ron")).unwrap();
     assert!(!sites.sites.is_empty());
     for s in &sites.sites {
         assert!(
-            s.resource_yields.is_empty(),
-            "v1 site {} gained yields from nowhere",
+            s.starting_stock.is_empty(),
+            "v2 site {} gained a stockpile from nowhere",
             s.id
         );
     }

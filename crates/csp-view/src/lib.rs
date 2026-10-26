@@ -236,6 +236,29 @@ pub struct ProgramMirror {
     /// the body's first site, else `None` (the `abandon_recovery`
     /// remote-salvage leg — still a valid recovery).
     pub recovery_site: Option<csp_data::SiteId>,
+    /// The sim clock at staging — `SetAlarm`/`ScheduleColonyInspection`
+    /// resolve their ticks against it.
+    pub now_ticks: u64,
+    /// The focused vessel's crew resolved to `(CrewId, skill)` — the
+    /// researcher pool `StartResearch` truncates to the lab's
+    /// `researcher_slots`. Roster members carry their `skill`; id-only
+    /// `BoardCrew` members stage at skill 1 (a zero total rate rejects
+    /// at apply — an unskilled seat-warmer still runs a lab, slowly).
+    pub researchers: Vec<(csp_sim::CrewId, u8)>,
+    /// The focused vessel's lab nodes: `PartNodeId` → researcher slots.
+    pub lab_slots: std::collections::BTreeMap<u64, u32>,
+}
+
+/// The rolling `script_log` tail (W2.5) — session/presentation state,
+/// never sim state. `AdvanceReport::script_log` is consumed per step
+/// (mem::take'd out of the world), so `csp-app` folds each report's
+/// lines back here through [`View::push_script_log`]; the Program
+/// window's AUTOMATION section renders the tail and the flight
+/// notices flash the lines live.
+#[derive(Resource, Default)]
+pub struct ScriptLogMirror {
+    /// `(tick, "script N: line")` — newest last, capped at 64.
+    pub lines: std::collections::VecDeque<(u64, String)>,
 }
 
 /// Session-side values `csp-app` mirrors in for the UI — written through
@@ -341,6 +364,11 @@ pub struct UiOutbox {
 #[derive(Resource, Default)]
 pub struct ManeuverPanelRes(pub csp_ui::ManeuverPanelState);
 
+/// The W2.4 planning panel's session state — `csp-view` owns it
+/// (§2.2 C), `csp_ui::planning_panel` mutates it inside `UiBuild`.
+#[derive(Resource, Default)]
+pub struct PlanningPanelRes(pub csp_ui::PlanningPanelState);
+
 /// The settings window's session state — `csp-view` owns it (§2.2 C),
 /// `csp_ui::settings_panel` mutates it inside `UiBuild`, and `csp-app`
 /// reaches it through the `settings_*`/`rebind_*` plumbing methods
@@ -388,6 +416,30 @@ struct ProgramUi<'w> {
     sfx: ResMut<'w, flight::FlightSfx>,
 }
 
+/// The map-mode mirrors + panel session states as one system param —
+/// the W2.4 panel's model/table/planning additions pushed `build_ui`
+/// past bevy's 16-parameter cap (a fn over the cap stops being a
+/// `System`, breaking `map_pointer_input.after(build_ui)`).
+#[derive(bevy_ecs::system::SystemParam)]
+struct MapUi<'w> {
+    /// Overlay input + mode + focus bookkeeping.
+    ui: Res<'w, map::MapUiData>,
+    /// The staged map snapshot.
+    snap: Res<'w, map::MapSnapshot>,
+    /// Click/focus input staging.
+    input: Res<'w, map::MapInput>,
+    /// The orbit model (transfer planning reads it).
+    model: Res<'w, map::OrbitModelRes>,
+    /// The body id → display row table.
+    table: Res<'w, map::BodyTable>,
+    /// The maneuver-node panel's session state.
+    maneuver: ResMut<'w, ManeuverPanelRes>,
+    /// The W2.4 planning panel's session state.
+    planning_state: ResMut<'w, PlanningPanelRes>,
+    /// The staged transfer plans.
+    planning: ResMut<'w, map::MapPlanning>,
+}
+
 /// The entire egui pass (§2.5 #5, Appendix A item 3): build the plain-data
 /// panel input from mirrors, run `csp_ui`'s pure panel functions under
 /// `egui::Context::run_ui`, store the `FullOutput` for `csp-app`'s painter,
@@ -401,13 +453,11 @@ fn build_ui(
     stats: Res<FrameStats>,
     warp: Res<WarpMirror>,
     session: Res<SessionMirror>,
-    map_ui: Res<map::MapUiData>,
     vab_input: Res<vab::VabInput>,
     mut vab: ResMut<vab::VabSessionRes>,
     craft_files: Res<vab::CraftFileList>,
     flight_ui: Res<flight::FlightUiData>,
-    map_snap: Res<map::MapSnapshot>,
-    mut maneuver_state: ResMut<ManeuverPanelRes>,
+    mut map: MapUi,
     mut settings_state: ResMut<SettingsPanelRes>,
     mut prog_ui: ProgramUi,
     mut tutorial: ResMut<tutorial::TutorialRes>,
@@ -415,7 +465,7 @@ fn build_ui(
 ) {
     let mode = if vab_input.open {
         csp_ui::ModeSelect::Vab
-    } else if map_ui.mode == map::MapMode::Map {
+    } else if map.ui.mode == map::MapMode::Map {
         csp_ui::ModeSelect::Map
     } else {
         csp_ui::ModeSelect::Flight
@@ -478,14 +528,19 @@ fn build_ui(
                 prog_ui.panels.help = false;
             }
         }
-        if map_ui.mode == map::MapMode::Map {
+        if map.ui.mode == map::MapMode::Map {
             map_panels(
                 ctx,
-                &map_ui,
-                &map_snap,
+                &map.ui,
+                &map.snap,
+                &map.input,
+                &map.model.0,
+                &map.table,
                 clock.0.ticks(),
                 &session,
-                &mut maneuver_state.0,
+                &mut map.maneuver.0,
+                &mut map.planning_state.0,
+                &mut map.planning,
                 &mut outbox,
             );
         }
@@ -656,13 +711,20 @@ fn build_ui(
 /// The map mode's UiBuild panels — the M1 overlay + the M5 node panel
 /// (its `SetManeuver`/`DeleteManeuver` output rides the outbox).
 /// Extracted from [`build_ui`] under the line budget.
+#[allow(clippy::too_many_arguments)] // the W2.4 panel adds the model/table/planning mirrors
+#[allow(clippy::too_many_lines)] // one panel roster = one pass
 fn map_panels(
     ctx: &egui::Context,
     map_ui: &map::MapUiData,
     map_snap: &map::MapSnapshot,
+    map_input: &map::MapInput,
+    map_model: &csp_sim::orbit::PatchedConics,
+    map_table: &map::BodyTable,
     tick: u64,
     session: &SessionMirror,
     maneuver_state: &mut csp_ui::ManeuverPanelState,
+    planning_state: &mut csp_ui::PlanningPanelState,
+    planning: &mut map::MapPlanning,
     outbox: &mut UiOutbox,
 ) {
     csp_ui::map_overlay(
@@ -687,10 +749,10 @@ fn map_panels(
             // `SetManeuver` on an InBubble vessel rejects "not on
             // rails" at drain — the picker used to list them anyway,
             // making every such Set press a silent refusal.
-            .filter(|(.., on_rails)| *on_rails)
-            .map(|(id, _, n, _)| csp_ui::ManeuverVessel {
-                id: id.0,
-                node: n.as_ref().map(|n| (n.tick, n.dv_magnitude())),
+            .filter(|v| v.3)
+            .map(|v| csp_ui::ManeuverVessel {
+                id: v.0.0,
+                node: v.2.as_ref().map(|n| (n.tick, n.dv_magnitude())),
             })
             .collect::<Vec<_>>(),
         maneuver_state,
@@ -708,6 +770,80 @@ fn map_panels(
             vessel: csp_sim::VesselId(vessel),
         },
     });
+
+    // W2.4: the planning panel — alarms + the transfer-window planner
+    // (PLAN §4 v1/M5). Endpoint pickers get orbiting bodies only; the
+    // vessel picker stages eligibility honestly (on rails + orbiting
+    // the picked origin) so an unservable vessel is never a dead
+    // click. Emitted commands resolve against the same mirrors here —
+    // SetAlarm/WatchTransferWindow/SetManeuver ride the program
+    // outbox (the progression FIFO); the pure planner calls run on
+    // the spot and stage into `planning`.
+    let focus_vid = map_input.focus_vessel;
+    let focus_has_node = focus_vid
+        .and_then(|id| map_snap.vessels.iter().find(|v| v.0 == id))
+        .is_some_and(|v| v.2.is_some());
+    let bodies: Vec<String> = map_table
+        .bodies
+        .iter()
+        .filter(|b| b.parent.is_some())
+        .map(|b| b.id.to_string())
+        .collect();
+    let vessels: Vec<csp_ui::TransferVessel> = map_snap
+        .vessels
+        .iter()
+        .map(|v| {
+            let (eligible, note) = if !v.3 {
+                (
+                    false,
+                    "in physics bubble — coast to rails first".to_string(),
+                )
+            } else if v.1.parent.as_str() != planning_state.origin {
+                (
+                    false,
+                    format!("orbits {}, not {}", v.1.parent, planning_state.origin),
+                )
+            } else {
+                (true, String::new())
+            };
+            csp_ui::TransferVessel {
+                id: v.0.0,
+                parent: v.1.parent.to_string(),
+                eligible,
+                note,
+            }
+        })
+        .collect();
+    let plan_row = planning.plan_row(tick);
+    let alarm_rows = planning.alarm_rows(tick);
+    let input = csp_ui::PlanningPanelInput {
+        tick,
+        tick_hz: csp_core::TICK_HZ as f64,
+        bodies: &bodies,
+        vessels: &vessels,
+        alarms: &alarm_rows,
+        plan: plan_row.as_ref(),
+        plan_error: planning.plan_error.as_deref(),
+        focus_vessel: focus_vid.map(|v| v.0),
+        focus_has_node,
+    };
+    let picked = vessels
+        .iter()
+        .find(|v| v.id == planning_state.vessel && v.eligible)
+        .map(|v| csp_sim::VesselId(v.id));
+    let mut pcmds = Vec::new();
+    csp_ui::planning_panel(ctx, &input, planning_state, &mut pcmds);
+    for cmd in pcmds {
+        map::resolve_planning_command(
+            cmd,
+            map_model,
+            map_snap,
+            focus_vid,
+            picked,
+            planning,
+            &mut outbox.program,
+        );
+    }
 }
 
 /// Resolve one [`csp_ui::program::ProgramCommand`] into the
@@ -718,6 +854,7 @@ fn map_panels(
 /// one-frame-stale panel command is dropped, not misfired) — the
 /// drop is reported through `dropped` so `build_ui` can post a
 /// flight notice; a stale mirror must never eat a click silently.
+#[allow(clippy::too_many_lines)] // one verb = one match arm
 fn program_command(
     mirror: &ProgramMirror,
     cmd: csp_ui::program::ProgramCommand,
@@ -785,6 +922,254 @@ fn program_command(
             };
             Some(SimCommand::TerminateVessel { vessel })
         }
+        // W2.0/W2.3 — the progression-surface verbs. Focused-vessel
+        // commands drop with a notice on a stale mirror (the §3.7
+        // rule); id-addressed commands go through as issued — a stale
+        // id rejects `Recoverable` at the drain, which the rejected-
+        // command channel surfaces.
+        C::HireCrew { kind } => {
+            let kind = match kind.as_str() {
+                "pilot" => csp_sim::CrewKind::Pilot,
+                "engineer" => csp_sim::CrewKind::Engineer,
+                "scientist" => csp_sim::CrewKind::Scientist,
+                _ => csp_sim::CrewKind::Tourist,
+            };
+            let name = format!("{kind:?} {}", mirror.input.roster.len() + 1).to_lowercase();
+            Some(SimCommand::HireCrew {
+                name,
+                kind,
+                salary_per_s: mirror.input.hire_salary_per_s,
+            })
+        }
+        C::BoardCrew => match mirror.vessel {
+            Some(vessel) => Some(SimCommand::BoardCrew { vessel }),
+            None => {
+                dropped.push("BOARD DROPPED — NO FOCUSED VESSEL");
+                None
+            }
+        },
+        C::TransferCrew { crew, to_vessel } => match mirror.vessel {
+            Some(vessel) => Some(SimCommand::TransferCrew {
+                from_vessel: vessel,
+                to_vessel: csp_sim::VesselId(to_vessel),
+                crew: csp_sim::CrewId(crew),
+            }),
+            None => {
+                dropped.push("CREW TRANSFER DROPPED — NO FOCUSED VESSEL");
+                None
+            }
+        },
+        C::TransferResource {
+            to_vessel,
+            resource,
+            amount,
+        } => match mirror.vessel {
+            Some(vessel) => Some(SimCommand::TransferResource {
+                from_vessel: vessel,
+                to_vessel: csp_sim::VesselId(to_vessel),
+                resource: csp_data::ResourceId::from(resource),
+                amount,
+            }),
+            None => {
+                dropped.push("TRANSFER DROPPED — NO FOCUSED VESSEL");
+                None
+            }
+        },
+        C::AssignCrewToColony { crew, colony } => Some(SimCommand::AssignCrewToColony {
+            colony: csp_sim::ColonyId(colony),
+            crew: csp_sim::CrewId(crew),
+        }),
+        C::EvacuateColony { colony } => Some(SimCommand::EvacuateColony {
+            colony: csp_sim::ColonyId(colony),
+        }),
+        C::AbandonColony { colony } => Some(SimCommand::AbandonColony {
+            colony: csp_sim::ColonyId(colony),
+        }),
+        C::ScheduleColonyInspection { colony } => Some(SimCommand::ScheduleColonyInspection {
+            colony: csp_sim::ColonyId(colony),
+            tick: mirror.now_ticks + csp_core::TICK_HZ * 86_400,
+        }),
+        C::FoundColony { site } => Some(SimCommand::FoundColony {
+            def: starter_colony_def(&site),
+        }),
+        C::JoinColony { colony } => match mirror.vessel {
+            Some(vessel) => Some(SimCommand::JoinColonyInventory {
+                vessel,
+                colony: csp_sim::ColonyId(colony),
+            }),
+            None => {
+                dropped.push("JOIN DROPPED — NO FOCUSED VESSEL");
+                None
+            }
+        },
+        C::LeaveColony => match mirror.vessel {
+            Some(vessel) => Some(SimCommand::LeaveColonyInventory { vessel }),
+            None => {
+                dropped.push("LEAVE DROPPED — NO FOCUSED VESSEL");
+                None
+            }
+        },
+        C::TransferColonyResource {
+            colony,
+            resource,
+            amount,
+            to_colony,
+        } => match mirror.vessel {
+            Some(vessel) => Some(SimCommand::TransferColonyResource {
+                vessel,
+                colony: csp_sim::ColonyId(colony),
+                resource: csp_data::ResourceId::from(resource),
+                amount,
+                to_colony,
+            }),
+            None => {
+                dropped.push("COLONY TRANSFER DROPPED — NO FOCUSED VESSEL");
+                None
+            }
+        },
+        C::TransferColonyCrew {
+            colony,
+            crew,
+            to_colony,
+        } => match mirror.vessel {
+            Some(vessel) => Some(SimCommand::TransferColonyCrew {
+                vessel,
+                colony: csp_sim::ColonyId(colony),
+                crew: csp_sim::CrewId(crew),
+                to_colony,
+            }),
+            None => {
+                dropped.push("COLONY CREW DROPPED — NO FOCUSED VESSEL");
+                None
+            }
+        },
+        C::DeployPart { node } => match mirror.vessel {
+            Some(vessel) => Some(SimCommand::DeployPart {
+                vessel,
+                node: csp_phys::PartNodeId(node),
+            }),
+            None => {
+                dropped.push("DEPLOY DROPPED — NO FOCUSED VESSEL");
+                None
+            }
+        },
+        C::StartResearch { lab_node, row } => {
+            let Some(vessel) = mirror.vessel else {
+                dropped.push("RESEARCH DROPPED — NO FOCUSED VESSEL");
+                return None;
+            };
+            let Some(key) = mirror.keys.get(row).map(|k| k.key.clone()) else {
+                dropped.push("RESEARCH DROPPED — STALE PANEL INDEX");
+                return None;
+            };
+            let slots = mirror.lab_slots.get(&lab_node).copied().unwrap_or(0) as usize;
+            let researchers: Vec<csp_sim::ResearcherAssign> = mirror
+                .researchers
+                .iter()
+                .take(slots)
+                .map(|(crew, skill)| csp_sim::ResearcherAssign {
+                    crew: *crew,
+                    skill: *skill,
+                })
+                .collect();
+            if researchers.is_empty() {
+                dropped.push("RESEARCH DROPPED — NO CREW ABOARD");
+                return None;
+            }
+            Some(SimCommand::StartResearch {
+                vessel,
+                lab_node: csp_phys::PartNodeId(lab_node),
+                key,
+                researchers,
+            })
+        }
+        C::StopResearch { project } => Some(SimCommand::StopResearch {
+            project: csp_sim::ResearchId(project),
+        }),
+        C::SetAlarm { in_seconds, label } => Some(SimCommand::SetAlarm {
+            tick: mirror.now_ticks + (in_seconds.max(1.0) * csp_core::TICK_HZ as f64) as u64,
+            label,
+        }),
+        C::LoadScript { source } => match mirror.vessel {
+            Some(vessel) => Some(SimCommand::LoadScript { vessel, source }),
+            None => {
+                dropped.push("SCRIPT LOAD DROPPED — NO FOCUSED VESSEL");
+                None
+            }
+        },
+        C::UnloadScript { script } => Some(SimCommand::UnloadScript {
+            script: csp_sim::ScriptId(script),
+        }),
+        C::SetScriptEnabled { script, enabled } => Some(SimCommand::SetScriptEnabled {
+            script: csp_sim::ScriptId(script),
+            enabled,
+        }),
+        C::EngageAutopilot { apo_m, pe_m } => match mirror.vessel {
+            Some(vessel) => Some(SimCommand::EngageAutopilot {
+                vessel,
+                program: csp_sim::AutopilotProgram::Ascent {
+                    target_apoapsis_m: apo_m,
+                    target_periapsis_m: pe_m,
+                },
+            }),
+            None => {
+                dropped.push("AUTOPILOT DROPPED — NO FOCUSED VESSEL");
+                None
+            }
+        },
+        C::DisengageAutopilot => match mirror.vessel {
+            Some(vessel) => Some(SimCommand::DisengageAutopilot { vessel }),
+            None => {
+                dropped.push("AUTOPILOT DROPPED — NO FOCUSED VESSEL");
+                None
+            }
+        },
+        C::RunBenchTest {
+            site,
+            family,
+            units,
+        } => Some(SimCommand::RunBenchTest {
+            site: csp_data::SiteId::from(site),
+            family: csp_data::FamilyId::from(family),
+            units,
+        }),
+        C::WatchTransferWindow {
+            origin,
+            destination,
+            tick,
+        } => Some(SimCommand::WatchTransferWindow {
+            origin: csp_data::BodyId::from(origin),
+            destination: csp_data::BodyId::from(destination),
+            tick,
+        }),
+    }
+}
+
+/// The salary the UI's hire buttons pay — the sim has no salary table
+/// (`HireCrew` carries the rate verbatim), so the panel authors a
+/// modest default: 0.02 ₣/s ≈ ₣1 728/sim-day.
+const HIRE_SALARY_PER_S: f64 = 0.02;
+
+/// The player-facing `FoundColony` payload — a starter outpost:
+/// a small solar array, a battery, and its founding EC charge. The
+/// apply resolves the site's body/pose and runs the founding solve.
+/// Honest scope: founding charges no funds (the sim has no colony
+/// founding cost — the panel labels the button "prototype, no cost").
+fn starter_colony_def(site: &str) -> csp_data::ColonyDef {
+    csp_data::ColonyDef {
+        site: csp_data::SiteId::from(site),
+        display_name: csp_data::LocKey::from(""),
+        modules: vec![
+            csp_data::ColonyModuleDef::Solar {
+                area_m2: 10.0,
+                efficiency: 0.2,
+            },
+            csp_data::ColonyModuleDef::Battery { capacity: 500.0 },
+        ],
+        stores: vec![csp_data::ColonyStoreInit {
+            resource: csp_data::ResourceId::from("electric_charge"),
+            level: 250.0,
+        }],
     }
 }
 
@@ -995,6 +1380,16 @@ pub struct View {
     /// session-level part cap and file-IO refusal are installed on the
     /// `VabSession` itself at construction).
     demo: bool,
+    /// W2.6: cursor into the sim's serialized notification ring —
+    /// `(tick of the last surfaced entry, entries surfaced at that
+    /// tick)`. `sim_step` diffs the ring against it so each
+    /// `PartFailed`/`IgnitionMisfire`/`OnRails` record lands exactly
+    /// one `flight_notice` toast (report-08 L3: the LOG was the only
+    /// surface — a dormant failure mid-flight read as nothing but
+    /// lost thrust). Ring eviction past `notification_cap` is safe:
+    /// evicted entries carry older ticks and can never resurface.
+    /// Session state only — never sim state.
+    notice_cursor: Option<(u64, u32)>,
 }
 
 /// Startup construction failure — [`View::new`] loads `data/` (§8.3's
@@ -1385,6 +1780,10 @@ impl View {
         world.insert_resource(flight::FlightFocusOverride::default());
         world.insert_resource(map::MapFrame::default());
         world.insert_resource(ManeuverPanelRes::default());
+        // W2.4: the planning surface — the panel's session state and
+        // the alarm book + staged transfer plan it works against.
+        world.insert_resource(PlanningPanelRes::default());
+        world.insert_resource(map::MapPlanning::default());
         // M10: the settings window's staged state (§2.2-C session data).
         world.insert_resource(SettingsPanelRes::default());
         // The optional-panel toggles (debug scaffold, controls help) —
@@ -1442,6 +1841,7 @@ impl View {
         // `stage_program` each `end_frame`; LocStrings/BiomeMaps/
         // BodyRadii are data-derived constants `from_source` fills in).
         world.insert_resource(ProgramMirror::default());
+        world.insert_resource(ScriptLogMirror::default());
         world.insert_resource(LocStrings::default());
         world.insert_resource(BiomeMaps::default());
         world.insert_resource(BodyRadii::default());
@@ -1490,6 +1890,7 @@ impl View {
             },
             ticks_last_frame: 0,
             demo: false,
+            notice_cursor: None,
         }
     }
 
@@ -1580,6 +1981,20 @@ impl View {
             self.clear_flight_focus_override();
             self.flight_notice("RECOVER FAILED — CONVERSION REFUSED".to_string());
         }
+        // W2.6/report-08 L3: the notification ring was window-only —
+        // a dormant failure or misfire on the flying vessel reached
+        // the player only through the Program LOG (and only as lost
+        // thrust in flight). New entries naming the FOCUSED vessel
+        // post one HUD toast each; the ring keeps them regardless —
+        // the toast is surfacing, not the record.
+        self.drain_part_notices();
+        // W2.4: fold fired alarms/watches into the planning mirror —
+        // armed book entries mark fired, and a fire the panel never
+        // armed (a script's or MCP alarm) still records a row, so the
+        // surfacing contract is view-side visible, not app-only.
+        self.world
+            .resource_mut::<map::MapPlanning>()
+            .note_fired(&report.fired_events);
         self.schedules.sim_step.run(&mut self.world);
         Ok(report)
     }
@@ -2151,48 +2566,72 @@ impl View {
             )
         });
         let (session, analysis, analysis_error, stage_plan) = craft;
-        let craft_def: Result<csp_sim::CraftDef, String> = (|| {
-            if session.is_empty() {
-                return Ok(stock_flight_craft());
-            }
-            // A non-empty session that failed to resolve cannot
-            // launch — the cached analysis error names why; without
-            // a catalog the session can hold parts (a loaded craft
-            // file) yet resolve nothing.
-            let analysis = analysis.ok_or_else(|| {
-                analysis_error.unwrap_or_else(|| {
-                    "craft could not be resolved — is the part catalog loaded?".to_string()
-                })
-            })?;
-            let (graph, built) = session.to_part_graph().map_err(|e| e.to_string())?;
-            let parts: Vec<csp_phys::WeldPart> = analysis
-                .effective
-                .iter()
-                .map(|e| e.weld_input.clone())
-                .collect();
-            let part_costs: Vec<f64> = analysis.effective.iter().map(|e| e.cost_funds).collect();
-            // M9b: the production spawn path populates the
-            // reliability table from the same resolved parts — the
-            // §3.4 model rides every launched craft.
-            let reliability: Vec<csp_phys::ReliabilitySpec> = analysis
-                .effective
-                .iter()
-                .map(csp_phys::ReliabilitySpec::from_effective)
-                .collect();
-            // M7-B §3.3: part identity rides the craft — `built[i]` is
-            // positionally bound to `effective_index` like `parts`, so
-            // the spawn gate can resolve each def's `tech_requirement`.
-            let part_ids: Vec<csp_data::PartId> = built.iter().map(|b| b.part_id.clone()).collect();
-            Ok(csp_sim::CraftDef {
-                hash_memo: Default::default(),
-                graph,
-                parts,
-                part_costs,
-                reliability,
-                part_ids,
-            })
-        })();
-        let craft = match craft_def {
+        // W2.6: launch is a §3.5 build order, not an instant spawn —
+        // the craft def rides `ManufactureCraft` with its aggregate
+        // BOM (`EffectivePart::build_resources` summed; the apply
+        // re-checks and debits the site's inventory). A craft with
+        // no catalog resolution (the stock fallback) carries no
+        // authored BOM — it still pays funds and build time.
+        let craft_def: Result<(csp_sim::CraftDef, Vec<(csp_data::ResourceId, f64)>), String> =
+            (|| {
+                if session.is_empty() {
+                    return Ok((stock_flight_craft(), Vec::new()));
+                }
+                // A non-empty session that failed to resolve cannot
+                // launch — the cached analysis error names why; without
+                // a catalog the session can hold parts (a loaded craft
+                // file) yet resolve nothing.
+                let analysis = analysis.ok_or_else(|| {
+                    analysis_error.unwrap_or_else(|| {
+                        "craft could not be resolved — is the part catalog loaded?".to_string()
+                    })
+                })?;
+                let (graph, built) = session.to_part_graph().map_err(|e| e.to_string())?;
+                let parts: Vec<csp_phys::WeldPart> = analysis
+                    .effective
+                    .iter()
+                    .map(|e| e.weld_input.clone())
+                    .collect();
+                let part_costs: Vec<f64> =
+                    analysis.effective.iter().map(|e| e.cost_funds).collect();
+                // The order's bill of materials — the command log is
+                // self-contained (the `part_costs` convention), so the
+                // per-part resolved BOMs ride it verbatim; the apply
+                // aggregates duplicates.
+                let mut bom: std::collections::BTreeMap<csp_data::ResourceId, f64> =
+                    std::collections::BTreeMap::new();
+                for e in &analysis.effective {
+                    for (r, u) in &e.build_resources {
+                        *bom.entry(r.clone()).or_insert(0.0) += u;
+                    }
+                }
+                let build_resources: Vec<(csp_data::ResourceId, f64)> = bom.into_iter().collect();
+                // M9b: the production spawn path populates the
+                // reliability table from the same resolved parts — the
+                // §3.4 model rides every launched craft.
+                let reliability: Vec<csp_phys::ReliabilitySpec> = analysis
+                    .effective
+                    .iter()
+                    .map(csp_phys::ReliabilitySpec::from_effective)
+                    .collect();
+                // M7-B §3.3: part identity rides the craft — `built[i]` is
+                // positionally bound to `effective_index` like `parts`, so
+                // the spawn gate can resolve each def's `tech_requirement`.
+                let part_ids: Vec<csp_data::PartId> =
+                    built.iter().map(|b| b.part_id.clone()).collect();
+                Ok((
+                    csp_sim::CraftDef {
+                        hash_memo: Default::default(),
+                        graph,
+                        parts,
+                        part_costs,
+                        reliability,
+                        part_ids,
+                    },
+                    build_resources,
+                ))
+            })();
+        let (craft, build_resources) = match craft_def {
             Ok(c) => c,
             Err(reason) => return Err(self.launch_refused(reason)),
         };
@@ -2230,7 +2669,7 @@ impl View {
             .sites
             .into_values()
             .find(|s| s.body == dominant && s.launch);
-        let (lat, lon, site_alt) = site.map_or((0.0, 0.0, 0.0), |s| {
+        let (lat, lon, site_alt) = site.as_ref().map_or((0.0, 0.0, 0.0), |s| {
             (s.latitude_rad, s.longitude_rad, s.altitude_m)
         });
         // Rest the craft ON the pad: `pos` is the body origin, so the
@@ -2274,36 +2713,79 @@ impl View {
         };
         let (pos, rot, vel, ang_vel) =
             csp_sim::bubble::surface_pose_restore(&env, &pose, com_local, self.sim.clock());
-        // `launch_preflight` runs `apply_spawn_physical`'s refusals
-        // BEFORE the enqueue + mode switch, so a doomed spawn keeps
-        // the player in the VAB with the reason on the notice row.
-        // The candidate is posed exactly as the spawn would insert it.
+        // `launch_preflight` runs the order's refusals BEFORE the
+        // enqueue + mode switch, so a doomed launch keeps the player
+        // in the VAB with the reason on the notice row. The candidate
+        // is posed exactly as the delivery would berth it — the pad
+        // is a single berth for build orders the same way it was for
+        // instant spawns.
         candidate.pos = pos;
         candidate.rot = rot.normalize();
         candidate.vel = vel;
         candidate.ang_vel = ang_vel;
-        if let Some(reason) = self.launch_preflight(&craft, &candidate) {
+        if let Some(reason) =
+            self.launch_preflight(&craft, &candidate, site.as_ref(), &build_resources)
+        {
             return Err(reason);
         }
         // The staged craft's firing plan rides session state (the
         // spawned graph drops stage metadata); `fire_stage` drains it
         // one set per press. The plan binds to THIS launch's vessel —
         // captured before the enqueue so `min_id` bounds the binding
-        // to ids minted after this point (the spawn's `VesselId` is
-        // allocated at drain, so prediction is impossible — the
-        // fingerprint + bound are the identity).
+        // to ids minted after this point (the `ConstructionComplete`
+        // delivery mints the `VesselId` at its event — `StagePlan`'s
+        // `(min_id, fingerprint)` binding tolerates exactly this late
+        // materialization).
         let plan = flight::StagePlan::for_launch(stage_plan, &self.sim, &craft);
-        self.enqueue_command(
-            SourceClass::Ui,
-            PLAYER_SOURCE_ID,
-            SimCommand::SpawnPhysicalVessel {
-                craft,
-                pos,
-                rot,
-                vel,
-                ang_vel,
-            },
-        );
+        if let Some(site) = site {
+            // §3.5's honest path: the LAUNCH click is a build order —
+            // funds + the site-inventory BOM pay now, the craft
+            // materializes surface-latched when `ConstructionComplete`
+            // fires `mass/rate` sim-seconds out (throttle unlatches
+            // it). The fired-event feed posts the delivery toast.
+            let rate = self.sim.economy_config().manufacture_rate_kg_per_s;
+            let mass: f64 = craft
+                .graph
+                .nodes
+                .values()
+                .map(|n| {
+                    craft
+                        .parts
+                        .get(n.effective_index as usize)
+                        .map_or(0.0, |p| p.mass_kg)
+                })
+                .sum();
+            self.enqueue_command(
+                SourceClass::Ui,
+                PLAYER_SOURCE_ID,
+                SimCommand::ManufactureCraft {
+                    site: site.id.clone(),
+                    craft,
+                    build_resources,
+                },
+            );
+            self.flight_notice(format!(
+                "BUILD ORDER PLACED — delivery in {}",
+                csp_ui::fmt_period(mass / rate.max(f64::MIN_POSITIVE))
+            ));
+        } else {
+            // No authored launch site on the dominant body — a
+            // build order needs a `launch` site's inventory to pay
+            // out of, so a site-less world keeps the instant spawn
+            // (funds still debit at apply). Sandbox/test worlds only;
+            // the shipped data set always authors `terrin-launch`.
+            self.enqueue_command(
+                SourceClass::Ui,
+                PLAYER_SOURCE_ID,
+                SimCommand::SpawnPhysicalVessel {
+                    craft,
+                    pos,
+                    rot,
+                    vel,
+                    ang_vel,
+                },
+            );
+        }
         // Only a successfully enqueued launch leaves the VAB — every
         // refusal above returned before this point. A recover-control
         // pin from an earlier T press must not survive it: the
@@ -2454,22 +2936,132 @@ impl View {
             });
     }
 
-    /// The pre-flight half of `apply_spawn_physical`'s refusals —
-    /// every gate the spawn's drain-time apply would reject on,
-    /// checked BEFORE [`View::launch_craft`] commits so a doomed spawn
-    /// keeps the player in the VAB with the reason on the notice row
-    /// instead of landing in an empty flight view with only a logged
-    /// command reject to show for it. `candidate` is the welded body
-    /// already posed at the spawn point. Returns the refusal text
-    /// (already posted through [`Self::launch_refused`]) or `None`
-    /// when the launch is clear. The drain re-runs every gate
-    /// regardless — a second source can spawn in between — so this
-    /// check only ever *refuses* early; it can never let a bad spawn
-    /// through.
+    /// W2.6/report-08 L3: fold newly appended notification-ring
+    /// entries into the HUD cue stack — `PartFailed` and
+    /// `IgnitionMisfire` records naming the FOCUSED vessel post one
+    /// toast each, so a dormant failure or a failed start is visible
+    /// in flight without opening the Program window. The cursor is
+    /// `(last tick surfaced, entries surfaced at that tick)`: ring
+    /// entries append in non-decreasing tick order, so the diff is
+    /// exactly the tail past the cursor — eviction past
+    /// `notification_cap` evicts older ticks, which can never
+    /// resurface. Program-level entries (`PROGRAM_VESSEL`) and
+    /// notices about OTHER vessels stay ring-only — the LOG carries
+    /// them; a toast about a vessel the player isn't flying would
+    /// be noise (the per-vessel ReliabilityRow mirror still shows
+    /// wear/failures on focus change).
+    fn drain_part_notices(&mut self) {
+        use csp_sim::reliability::NotificationKind as K;
+        let focus = self.flight_focus();
+        let Some(vid) = focus else {
+            // No focused vessel: still advance the cursor — the
+            // ring's per-vessel entries would all be stale toasts on
+            // the next focus anyway (the LOG is their surface).
+            if let Some(n) = self.sim.notifications().back() {
+                self.notice_cursor = Some((n.tick, u32::MAX));
+            }
+            return;
+        };
+        let (last_tick, mut seen_at_tick) = self.notice_cursor.unwrap_or((0, 0));
+        let mut new_tail = Vec::new();
+        for n in self.sim.notifications() {
+            if n.tick < last_tick {
+                continue;
+            }
+            if n.tick == last_tick && seen_at_tick > 0 {
+                // `u32::MAX` (the no-focus sentinel) collapses to
+                // "skip this tick's entries entirely".
+                seen_at_tick = seen_at_tick.saturating_sub(1);
+                continue;
+            }
+            new_tail.push(n);
+        }
+        let mut toasts = Vec::new();
+        for n in &new_tail {
+            if n.vessel != vid {
+                continue;
+            }
+            let part = n
+                .node
+                .and_then(|nid| {
+                    self.sim.vessels().get(&vid).and_then(|v| {
+                        v.craft.as_ref().and_then(|c| {
+                            c.graph.nodes.get(&nid).and_then(|node| {
+                                c.part_ids
+                                    .get(node.effective_index as usize)
+                                    .and_then(|pid| self.sim.parts().get(pid))
+                                    .map(|d| d.id.as_str().to_string())
+                            })
+                        })
+                    })
+                })
+                .unwrap_or_else(|| format!("part {}", n.node.map_or(0, |n| n.0)));
+            let text = match n.kind {
+                K::PartFailed { mode, dormant } => format!(
+                    "vessel {} — {part} PART FAILED {:?}{}",
+                    vid.0,
+                    mode,
+                    if dormant { " (dormant)" } else { "" }
+                ),
+                K::IgnitionMisfire => {
+                    format!("vessel {} — {part} IGNITION MISFIRE", vid.0)
+                }
+                _ => continue,
+            };
+            toasts.push(text);
+        }
+        let cursor = new_tail.last().map(|last| {
+            let at = self
+                .sim
+                .notifications()
+                .iter()
+                .filter(|n| n.tick == last.tick)
+                .count() as u32;
+            (last.tick, at)
+        });
+        for text in toasts {
+            self.flight_notice(text);
+        }
+        if let Some(c) = cursor {
+            self.notice_cursor = Some(c);
+        }
+    }
+
+    /// Fold one step's `AdvanceReport::script_log` into the rolling
+    /// mirror the AUTOMATION section renders (W2.5). `tick` is the
+    /// drain-side clock — display-only. Session state; the sim's own
+    /// `script_log` was already `take`n into the report.
+    pub fn push_script_log(&mut self, tick: u64, lines: &[(csp_sim::ScriptId, String)]) {
+        let mut mirror = self.world.resource_mut::<ScriptLogMirror>();
+        for (id, line) in lines {
+            mirror
+                .lines
+                .push_back((tick, format!("script {}: {line}", id.0)));
+        }
+        while mirror.lines.len() > 64 {
+            mirror.lines.pop_front();
+        }
+    }
+
+    /// The pre-flight half of the launch path's refusals —
+    /// `apply_manufacture_craft`'s gates for a site'd launch (site
+    /// row, BOM affordability, funds, cap), `apply_spawn_physical`'s
+    /// for the site-less fallback — checked BEFORE
+    /// [`View::launch_craft`] commits so a doomed launch keeps the
+    /// player in the VAB with the reason on the notice row instead
+    /// of landing in an empty flight view with only a logged command
+    /// reject to show for it. `candidate` is the welded body already
+    /// posed at the pad. Returns the refusal text (already posted
+    /// through [`Self::launch_refused`]) or `None` when the launch
+    /// is clear. The drain re-runs every gate regardless — a second
+    /// source can order in between — so this check only ever
+    /// *refuses* early; it can never let a bad order through.
     fn launch_preflight(
         &mut self,
         craft: &csp_sim::CraftDef,
         candidate: &csp_phys::WeldedBody,
+        site: Option<&csp_data::SiteDef>,
+        build_resources: &[(csp_data::ResourceId, f64)],
     ) -> Option<String> {
         // §2.9's cap — vessels + in-flight builds (each build already
         // reserved its delivery slot).
@@ -2490,6 +3082,34 @@ impl View {
                 cost_micros as f64 / csp_sim::economy::MICROS_PER_FUND,
                 funds_micros as f64 / csp_sim::economy::MICROS_PER_FUND,
             )));
+        }
+        // W2.6: the BOM half of the build order — `apply_manufacture_
+        // craft` debits every `build_resources` row out of the site's
+        // inventory, so a short stockpile refuses up front with the
+        // shortfall named, the funds gate's precedent.
+        if let Some(site) = site {
+            if !self.sim.economy().sites.contains_key(&site.id) {
+                return Some(self.launch_refused(format!(
+                    "site {} has no inventory row — nothing to build from",
+                    site.id
+                )));
+            }
+            for (r, need) in build_resources {
+                let have = self
+                    .sim
+                    .economy()
+                    .sites
+                    .get(&site.id)
+                    .and_then(|st| st.inventory.get(r))
+                    .copied()
+                    .unwrap_or(0.0);
+                if have < *need {
+                    return Some(self.launch_refused(format!(
+                        "insufficient {r} at {site} — craft needs {need:.1}, {have:.1} stockpiled",
+                        site = site.id
+                    )));
+                }
+            }
         }
         // The pad is a single berth — the sim's occupancy predicate
         // counts InBubble hulls directly and re-materializes each
@@ -2581,6 +3201,8 @@ impl View {
             funds: sim.funds_micros() as f64 / 1.0e6,
             science: sim.science_now(),
             banked: sim.science().banked,
+            hire_cost: sim.economy_config().hire_cost_micros as f64 / 1.0e6,
+            hire_salary_per_s: HIRE_SALARY_PER_S,
             ..Default::default()
         };
         // Contracts, research rows, and the notification log.
@@ -2608,6 +3230,8 @@ impl View {
         let (mut ctx_biome, mut ctx_situation, mut ctx_label) = (None, None, None);
         let mut keys = Vec::new();
         let mut recovery_site = None;
+        let mut researchers = Vec::new();
+        let mut lab_slots = std::collections::BTreeMap::new();
         if let Some(vid) = vid
             && let Some(v) = sim.vessels().get(&vid)
         {
@@ -2622,6 +3246,31 @@ impl View {
                 &name_of,
             );
         }
+        // W2.5 — the script-console tail, folded back from the
+        // report drain (`push_script_log` — the sim's own
+        // `script_log` is consumed by `AdvanceReport`).
+        input.script_log = self
+            .world
+            .resource::<ScriptLogMirror>()
+            .lines
+            .iter()
+            .map(|(tick, text)| up::NoticeRow {
+                tick: *tick,
+                text: text.clone(),
+            })
+            .collect();
+        // W2.0/W2.3 — the program arena: vessels, roster, colonies,
+        // sites, labs, agenda, in-flight transfers.
+        let now = sim.clock().ticks();
+        stage_program_world(
+            sim,
+            &mut input,
+            vid,
+            now,
+            &name_of,
+            &mut researchers,
+            &mut lab_slots,
+        );
         *self.world.resource_mut::<ProgramMirror>() = ProgramMirror {
             input,
             vessel: vid,
@@ -2636,6 +3285,9 @@ impl View {
                 .map(|s| (ctx_biome.unwrap_or_else(|| csp_data::BiomeId::from("")), s)),
             keys,
             recovery_site,
+            now_ticks: now,
+            researchers,
+            lab_slots,
         };
     }
 
@@ -2644,6 +3296,7 @@ impl View {
     /// context a `RunExperiment` command will carry.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_lines)] // one vessel = one staging pass
+    #[allow(clippy::cognitive_complexity)] // one vessel = one staging pass
     fn stage_program_vessel(
         &self,
         v: &csp_sim::Vessel,
@@ -2658,6 +3311,54 @@ impl View {
         use csp_ui::program as up;
         let sim = &self.sim;
         input.latched = matches!(v.state, VesselState::SurfaceLatched(_));
+        // W2.5 — the automation mirror: the engage gate needs the
+        // residence (only an in-bubble vessel can take
+        // `EngageAutopilot`), the console rows mirror the script
+        // arena, and the autopilot label mirrors its arena entry.
+        input.residence = match &v.state {
+            VesselState::InBubble(_) => "bubble",
+            VesselState::OnRails(_) => "rails",
+            VesselState::SurfaceLatched(_) => "latched",
+        }
+        .to_string();
+        input.autopilot = sim.autopilots().get(&v.id).map(|a| {
+            let program = match &a.program {
+                csp_sim::AutopilotProgram::Ascent {
+                    target_apoapsis_m,
+                    target_periapsis_m,
+                } => format!(
+                    "ascent → {:.0} km apo · {:.0} km pe",
+                    target_apoapsis_m / 1000.0,
+                    target_periapsis_m / 1000.0
+                ),
+            };
+            if a.enabled {
+                program
+            } else {
+                format!("{program} · paused")
+            }
+        });
+        input.scripts = sim
+            .scripts()
+            .values()
+            .filter(|s| s.vessel == v.id)
+            .map(|s| up::ScriptRow {
+                id: s.id.0,
+                label: s
+                    .source
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("(empty source)")
+                    .chars()
+                    .take(48)
+                    .collect(),
+                enabled: s.enabled,
+                strikes: s.strikes,
+                disabled_reason: s.disabled_reason.clone(),
+                wake_tick: s.wake_tick,
+            })
+            .collect();
         // §3.5's flight recovery, player-reachable at last: a latched
         // vessel can be recovered (site credit + part payout + crew +
         // pooled science) or terminated outright — the pad trap's
@@ -3075,18 +3776,25 @@ fn stage_program_overview(
     name_of: &dyn Fn(&csp_data::LocKey, &str) -> String,
 ) {
     use csp_ui::program as up;
-    // W1.5-(i): `contract.colony_resupply` needs colony logistics UI
-    // (`JoinColonyInventory`/`TransferColonyResource` — W2.3), so an
-    // accepted offer could only ever expire into its penalty. Gate
-    // the kind off the board — the interim-honesty filter the fix
-    // plan prescribes; drop it once the verbs ship.
-    let mut gated = 0usize;
+    // W2.1/W2.3: the resupply gate is gone — the colony-logistics
+    // verbs ship in this pass, so every generated offer is
+    // completable and renders with its description + prereqs.
+    let crew_lost = sim
+        .economy()
+        .crew
+        .values()
+        .filter(|m| m.status == csp_sim::CrewStatus::Lost)
+        .count() as u32;
     for o in sim.contracts().offers.values() {
-        if matches!(o.params, csp_data::ContractParams::ColonyResupply { .. }) {
-            gated += 1;
-            continue;
-        }
         let template = sim.contract_defs().get(&o.template);
+        let prereqs: Vec<(bool, String)> = template
+            .map(|t| {
+                t.prerequisites
+                    .iter()
+                    .map(|p| (prereq_met(sim, p, crew_lost), prereq_text(p)))
+                    .collect()
+            })
+            .unwrap_or_default();
         input.offers.push(up::OfferRow {
             index: o.index,
             label: format!(
@@ -3097,6 +3805,7 @@ fn stage_program_overview(
                     |t| name_of(&t.display_name, o.template.as_str())
                 )
             ),
+            description: template.map_or_else(String::new, |t| name_of(&t.description, "")),
             detail: contract_params_summary(&o.params),
             reward: template.map_or_else(String::new, |t| {
                 format!(
@@ -3109,12 +3818,9 @@ fn stage_program_overview(
             deadline: template
                 .and_then(|t| t.deadline_days)
                 .map_or_else(String::new, |d| format!("deadline {d:.1} days")),
+            accept_ok: template.is_some() && prereqs.iter().all(|(met, _)| *met),
+            prereqs,
         });
-    }
-    if gated > 0 {
-        input.offers_note = Some(format!(
-            "{gated} colony-resupply offer(s) hidden — colony logistics are not reachable yet"
-        ));
     }
     let now = sim.clock().ticks();
     for c in sim.contracts().active.values() {
@@ -3140,6 +3846,9 @@ fn stage_program_overview(
                     format!("  · {days:.1} days left")
                 })
             ),
+            // W2.1: the completion predicate's live reading — the
+            // per-kind progress line (delivery counts, band checks).
+            progress: contract_progress(sim, &c.params),
         });
     }
     let tech = sim.tech();
@@ -3210,14 +3919,20 @@ fn stage_program_overview(
 fn notice_text(n: &csp_sim::reliability::Notification) -> String {
     use csp_sim::reliability::NotificationKind as K;
     let v = |id: csp_sim::VesselId| format!("vessel {} — ", id.0);
+    // W2.6/report-08 L3: the failed part's node id joins the line —
+    // "vessel 3 — PART FAILED Leak" couldn't say WHICH part.
+    let p = |node: Option<csp_phys::PartNodeId>| {
+        node.map_or_else(String::new, |n| format!("part {} ", n.0))
+    };
     match n.kind {
         K::PartFailed { mode, dormant } => format!(
-            "{}PART FAILED {:?}{}",
+            "{}{}PART FAILED {:?}{}",
             v(n.vessel),
+            p(n.node),
             mode,
             if dormant { " (dormant)" } else { "" }
         ),
-        K::IgnitionMisfire => format!("{}IGNITION MISFIRE", v(n.vessel)),
+        K::IgnitionMisfire => format!("{}{}IGNITION MISFIRE", v(n.vessel), p(n.node)),
         K::OnRails => format!("{}ON RAILS", v(n.vessel)),
         K::ContractAccepted { contract } => format!("contract #{contract} — ACCEPTED"),
         K::ContractCompleted { contract } => format!("contract #{contract} — COMPLETED"),
@@ -3273,6 +3988,598 @@ fn contract_params_summary(p: &csp_data::ContractParams) -> String {
             resource,
             amount,
         } => format!("deliver {amount:.0} {resource} to colonies on {body}"),
+    }
+}
+
+/// The §3.6 fact-predicate, staged — the sim's `prereq_met`
+/// (`contracts.rs`) replicated read-side so an offer renders its
+/// unmet gates instead of refusing at accept. `crew_lost` is the
+/// roster's `Lost` count (the world counts it the same way).
+fn prereq_met(sim: &SimWorld, p: &csp_data::ContractPrereq, crew_lost: u32) -> bool {
+    use csp_data::ContractPrereq as Pr;
+    let facts = &sim.contracts().facts;
+    match p {
+        Pr::TechResearched(n) => sim.tech().is_researched(n),
+        Pr::ContractsCompleted { kind, count } => {
+            facts.completed.get(kind).copied().unwrap_or(0) >= *count
+        }
+        Pr::BodyVisited(b) => facts.bodies_visited.contains(b),
+        Pr::CrewLostAtMost(n) => crew_lost <= *n,
+    }
+}
+
+/// One-line prereq text for the offer row's ✓/✗ list.
+fn prereq_text(p: &csp_data::ContractPrereq) -> String {
+    use csp_data::ContractPrereq as Pr;
+    match p {
+        Pr::TechResearched(n) => format!("research {}", n.as_str()),
+        Pr::ContractsCompleted { kind, count } => {
+            format!("{count} {kind:?} contract(s) completed")
+        }
+        Pr::BodyVisited(b) => format!("visit {}", b.as_str()),
+        Pr::CrewLostAtMost(n) => format!("at most {n} crew lost"),
+    }
+}
+
+/// A `ColonyModuleDef` → its one-word row label — what the module IS
+/// for the colony card's module line.
+fn colony_module_label(d: &csp_data::ColonyModuleDef) -> String {
+    use csp_data::ColonyModuleDef as M;
+    match d {
+        M::Solar { area_m2, .. } => format!("solar {area_m2:.0}m²"),
+        M::Generator {
+            fuel_rate_per_s,
+            rate_per_s,
+            ..
+        } => {
+            if *fuel_rate_per_s > 0.0 {
+                format!("generator {rate_per_s:.1}ec/s")
+            } else {
+                format!("rtg {rate_per_s:.1}ec/s")
+            }
+        }
+        M::Drill {
+            resource,
+            base_rate_per_s,
+            ..
+        } => format!("drill {resource} {base_rate_per_s:.2}/s"),
+        M::Converter { recipe, .. } => format!("converter {}", recipe.as_str()),
+        M::Store { resource, capacity } => format!("store {resource} {capacity:.0}"),
+        M::Battery { capacity } => format!("battery {capacity:.0}"),
+        M::Radiator { area_m2, .. } => format!("radiator {area_m2:.0}m²"),
+        M::LifeSupport { .. } => "life support".to_string(),
+    }
+}
+
+/// The active contract's live progress line (W2.1) — the completion
+/// predicate's measurable half, per kind. Mirrors the sim's
+/// `objective_met`/`survey_returned_units` reads over the same state.
+#[allow(clippy::too_many_lines)] // one arm per contract kind
+fn contract_progress(sim: &SimWorld, params: &csp_data::ContractParams) -> String {
+    use csp_data::ContractParams as P;
+    match params {
+        P::SatelliteOrbit { body, .. } => {
+            // The predicate's orbit scan: any non-debris rails vessel
+            // inside the band (completes on the next orbit stamp).
+            let radius = sim.orbits().body_radius(body).unwrap_or(0.0);
+            if let P::SatelliteOrbit {
+                min_periapsis_alt_m,
+                max_apoapsis_alt_m,
+                ..
+            } = params
+            {
+                let held = sim.vessels().values().any(|v| {
+                    if v.debris_since.is_some() {
+                        return false;
+                    }
+                    let Some(o) = v.orbit() else { return false };
+                    let (a, e) = (o.elements.semi_major_axis_m, o.elements.eccentricity);
+                    o.parent == *body
+                        && e < 1.0
+                        && a * (1.0 - e) - radius >= *min_periapsis_alt_m
+                        && a * (1.0 + e) - radius <= *max_apoapsis_alt_m
+                });
+                if held {
+                    "a vessel holds the band".to_string()
+                } else {
+                    format!("awaiting orbit at {}", body.as_str())
+                }
+            } else {
+                String::new()
+            }
+        }
+        P::SurveyData {
+            experiment,
+            body,
+            min_units,
+        } => {
+            // `survey_returned_units`'s reading, replicated: collected
+            // minus pooled/escrowed, only over keys with a return.
+            let cfg = sim.science_config();
+            let clock = sim.clock().ticks();
+            let returned: f64 = sim
+                .science()
+                .keys
+                .iter()
+                .filter(|(k, s)| {
+                    k.experiment == *experiment && k.body == *body && (s.transmitted || s.closed)
+                })
+                .map(|(k, s)| {
+                    let pooled: f64 = sim.vessels().values().map(|v| v.science.units_at(k)).sum();
+                    let escrowed: f64 = sim
+                        .science()
+                        .projects
+                        .values()
+                        .filter(|p| p.key == *k)
+                        .map(|p| {
+                            csp_sim::research::data_at(
+                                p.data_start,
+                                p.rate_science_per_s,
+                                p.throughput_data_per_s,
+                                cfg.science_per_data,
+                                clock.saturating_sub(p.start_tick) as f64
+                                    / csp_core::TICK_HZ as f64,
+                            )
+                        })
+                        .sum();
+                    (s.collected - pooled - escrowed).max(0.0)
+                })
+                .sum();
+            format!("returned {returned:.1}/{min_units:.0} data")
+        }
+        P::PartTest { regime, .. } => {
+            let sat = match regime {
+                csp_data::ContractRegime::Orbit { body, min_alt_m } => {
+                    let radius = sim.orbits().body_radius(body).unwrap_or(0.0);
+                    sim.vessels().values().any(|v| {
+                        let Some(o) = v.orbit() else { return false };
+                        o.parent == *body
+                            && o.elements.eccentricity < 1.0
+                            && o.elements.semi_major_axis_m * (1.0 - o.elements.eccentricity)
+                                - radius
+                                >= *min_alt_m
+                    })
+                }
+                csp_data::ContractRegime::Landed { body } => sim
+                    .vessels()
+                    .values()
+                    .any(|v| matches!(&v.state, VesselState::SurfaceLatched(p) if p.body == *body)),
+            };
+            if sat {
+                "a vessel satisfies the regime".to_string()
+            } else {
+                "awaiting the test regime".to_string()
+            }
+        }
+        P::Rescue { body } => {
+            let parked = sim
+                .vessels()
+                .values()
+                .filter(|v| {
+                    matches!(&v.state, VesselState::SurfaceLatched(p) if p.body == *body)
+                        && v.debris_since.is_none()
+                })
+                .count();
+            format!("{parked} vessel(s) parked on {}", body.as_str())
+        }
+        P::ColonyResupply {
+            body,
+            resource,
+            amount,
+        } => {
+            // The predicate's cumulative read: deliveries into every
+            // colony on the body (the arena ids carry the binding).
+            let delivered: f64 = sim
+                .colonies()
+                .values()
+                .filter(|c| c.body == *body)
+                .map(|c| {
+                    sim.contracts()
+                        .facts
+                        .colony_deliveries
+                        .get(&(c.id.0, resource.clone()))
+                        .copied()
+                        .unwrap_or(0.0)
+                })
+                .sum();
+            format!("delivered {delivered:.1}/{amount:.0} {resource}")
+        }
+    }
+}
+
+/// W2.0/W2.3's staging pass — the program arena beyond the focused
+/// vessel: every vessel's residence/crew/link state, the crew roster,
+/// the colony table with join/transfer flags, the site stockpiles,
+/// live research projects, pending alarms, and in-flight transfers.
+/// Sim reads happen HERE (the staging phase); the panel sees only
+/// the mirror (§2.5).
+/// W2.6 — stage the FACILITIES rows: in-flight `builds`, the
+/// test-stand economics, and the per-family qualification table.
+/// The stand lives at the dominant body's launch site — the same
+/// site `launch_craft` resolves and `apply_bench_test` gates on.
+fn stage_facilities(
+    sim: &SimWorld,
+    input: &mut csp_ui::program::ProgramInput,
+    now: u64,
+    tick_s: f64,
+    name_of: &dyn Fn(&csp_data::LocKey, &str) -> String,
+) {
+    use csp_ui::program as up;
+    // W2.6 — the FACILITIES surface: in-flight build orders, the
+    // stand's economics, and per-family qualification rows. The
+    // stand lives at the dominant body's launch site — the same
+    // site `launch_craft` resolves and `apply_bench_test` gates on.
+    for b in sim.builds().values() {
+        input.builds.push(up::BuildRow {
+            id: b.id.0,
+            site: sim.site_defs().get(&b.site).map_or_else(
+                || b.site.as_str().to_string(),
+                |s| name_of(&s.display_name, s.id.as_str()),
+            ),
+            label: format!("{}-part craft", b.craft.parts.len()),
+            eta_s: b.complete_tick.saturating_sub(now) as f64 / tick_s,
+        });
+    }
+    let rcfg = sim.reliability_config();
+    input.bench_funds_per_unit = rcfg.bench_funds_per_unit;
+    input.bench_resource = rcfg.bench_resource.as_str().to_string();
+    input.bench_resource_per_unit = rcfg.bench_resource_per_unit;
+    input.bench_seconds_per_unit = rcfg.bench_seconds_per_unit;
+    let stand = sim
+        .dominant_body()
+        .and_then(|d| sim.site_defs().values().find(|s| s.body == *d && s.launch));
+    input.bench_site = stand.map(|s| s.id.as_str().to_string());
+    input.bench_site_name = stand
+        .map(|s| name_of(&s.display_name, s.id.as_str()))
+        .unwrap_or_default();
+    input.bench_stock = stand
+        .and_then(|s| sim.economy().sites.get(&s.id))
+        .and_then(|st| st.inventory.get(&rcfg.bench_resource))
+        .copied()
+        .unwrap_or(0.0);
+    // The family table: catalog ∪ the qualification arena (a family
+    // with no live record still deserves a row — the first bench
+    // run is what the stand exists for). The hazard reading
+    // evaluates the FIRST catalog part's authored curve — per-part
+    // curves differ, so the row names its basis honestly.
+    {
+        let quals = &sim.tech().qualifications;
+        let mut fams: std::collections::BTreeMap<String, (f64, u32)> =
+            std::collections::BTreeMap::new();
+        for f in sim.parts().values().map(|d| d.family.as_str().to_string()) {
+            fams.entry(f).or_insert((0.0, 0));
+        }
+        for (f, q) in quals {
+            fams.insert(
+                f.as_str().to_string(),
+                (q.flight_units + q.bench_units, q.observed_failures),
+            );
+        }
+        for (f, (units, failures)) in fams {
+            // The representative part: deterministic pick (the
+            // catalog's BTree order) so the row's basis never flickers.
+            let rep = sim
+                .parts()
+                .values()
+                .find(|d| d.family.as_str() == f.as_str());
+            let curve = rep.map(|d| &d.reliability.qualification_curve);
+            let hazard_factor = curve.map_or(1.0, |c| csp_phys::qual_factor(c, units));
+            let next_knot = curve
+                .and_then(|c| c.knots.iter().find(|k| k.qualification_units > units))
+                .map_or_else(String::new, |k| {
+                    format!(
+                        "→ ×{:.2} @ {:.0} u{}",
+                        k.hazard_multiplier,
+                        k.qualification_units,
+                        rep.map(|d| format!(" on {}", d.id.as_str()))
+                            .unwrap_or_default()
+                    )
+                });
+            let bench_eta_s = sim
+                .bench_runs()
+                .values()
+                .find(|b| b.family.as_str() == f.as_str())
+                .map(|b| b.complete_tick.saturating_sub(now) as f64 / tick_s);
+            input.families.push(up::FamilyRow {
+                id: f.clone(),
+                label: f,
+                units,
+                hazard_factor,
+                next_knot,
+                failures,
+                bench_eta_s,
+            });
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)] // one mirror = one staging pass
+fn stage_program_world(
+    sim: &SimWorld,
+    input: &mut csp_ui::program::ProgramInput,
+    focus: Option<csp_sim::VesselId>,
+    now: u64,
+    name_of: &dyn Fn(&csp_data::LocKey, &str) -> String,
+    researchers: &mut Vec<(csp_sim::CrewId, u8)>,
+    lab_slots: &mut std::collections::BTreeMap<u64, u32>,
+) {
+    use csp_ui::program as up;
+    let tick_s = csp_core::TICK_HZ as f64;
+    // The crew roster — the economy book's named individuals.
+    for (id, m) in &sim.economy().crew {
+        input.roster.push(up::CrewRow {
+            id: id.0,
+            name: m.name.clone(),
+            kind: format!("{:?}", m.kind).to_lowercase(),
+            skill: m.skill,
+            active: m.status == csp_sim::CrewStatus::Active,
+            status: format!("{:?}", m.status).to_lowercase(),
+            salary_per_s: m.salary_per_s,
+            location: match &m.location {
+                csp_sim::CrewLocation::Unassigned => up::CrewWhere::Unassigned,
+                csp_sim::CrewLocation::Vessel(v) => up::CrewWhere::Vessel(v.0),
+                csp_sim::CrewLocation::Colony(c) => up::CrewWhere::Colony(c.0),
+                csp_sim::CrewLocation::Facility(f) => {
+                    up::CrewWhere::Facility(f.as_str().to_string())
+                }
+            },
+        });
+    }
+    // The vessel arena — every vessel, residence + body + seats.
+    for (id, v) in sim.vessels() {
+        let (residence, body) = match &v.state {
+            VesselState::InBubble(_) => (
+                "in flight",
+                sim.dominant_body()
+                    .map(|b| b.as_str().to_string())
+                    .unwrap_or_default(),
+            ),
+            VesselState::OnRails(o) => ("on rails", o.parent.as_str().to_string()),
+            VesselState::SurfaceLatched(p) => ("landed", p.body.as_str().to_string()),
+        };
+        let inbound = sim
+            .transfers()
+            .values()
+            .filter(|t| {
+                t.to == csp_sim::transfers::TransferEnd::Vessel(*id)
+                    && matches!(t.cargo, csp_sim::transfers::TransferCargo::Crew { .. })
+            })
+            .count() as u64;
+        input.vessels.push(up::VesselRow {
+            id: id.0,
+            residence: residence.to_string(),
+            body,
+            debris: v.debris_since.is_some(),
+            focused: focus == Some(*id),
+            crew: v.crew.iter().map(|c| c.id.0).collect(),
+            free_seats: csp_sim::transfers::vessel_seats(v)
+                .saturating_sub(v.crew.len() as u64)
+                .saturating_sub(inbound),
+            joined_colony: v.joined_colony.map(|c| c.0),
+            linked_to_focus: focus.is_some_and(|f| sim.vessels_linked(f, *id)),
+        });
+    }
+    // The colony arena — modules, epoch-anchored stores, the state
+    // machine slot, and the focused vessel's join flags.
+    for (id, c) in sim.colonies() {
+        let live = matches!(
+            c.state,
+            csp_sim::ColonyState::Nominal | csp_sim::ColonyState::Degraded { .. }
+        );
+        input.colonies.push(up::ColonyRow {
+            id: id.0,
+            name: sim.site_defs().get(&c.site).map_or_else(
+                || c.site.as_str().to_string(),
+                |s| name_of(&s.display_name, s.id.as_str()),
+            ),
+            body: c.body.as_str().to_string(),
+            site: c.site.as_str().to_string(),
+            state: match &c.state {
+                csp_sim::ColonyState::Nominal => "nominal".to_string(),
+                csp_sim::ColonyState::Degraded { reason } => {
+                    format!("degraded: {reason:?}").to_lowercase()
+                }
+                csp_sim::ColonyState::Dormant => "dormant".to_string(),
+                csp_sim::ColonyState::Abandoned => "abandoned".to_string(),
+            },
+            live,
+            daylight: match c.daylight {
+                csp_sim::Daylight::Day => "day",
+                csp_sim::Daylight::Night => "night",
+            }
+            .to_string(),
+            crew: c.crew.iter().map(|c| c.0).collect(),
+            modules: c
+                .modules
+                .iter()
+                .zip(
+                    c.module_fractions
+                        .iter()
+                        .copied()
+                        .chain(std::iter::repeat(0.0)),
+                )
+                .map(|(m, f)| up::ColonyModuleRow {
+                    label: colony_module_label(&m.def),
+                    damaged: m.damaged,
+                    fraction: f,
+                })
+                .collect(),
+            stores: c
+                .stores
+                .iter()
+                .map(|(r, s)| up::ColonyStoreRow {
+                    resource: r.as_str().to_string(),
+                    level: s.level_at(now),
+                    capacity: s.capacity,
+                    rate_per_s: s.net_rate_per_s,
+                })
+                .collect(),
+            t_eq_k: c.t_eq_k,
+            inspection_days: c
+                .inspection_tick
+                .map(|t| t.saturating_sub(now) as f64 / tick_s / 86_400.0),
+            joinable: live && focus.is_some_and(|f| sim.colony_joinable(f, *id)),
+            joined: focus
+                .and_then(|f| sim.vessels().get(&f))
+                .and_then(|v| v.joined_colony)
+                == Some(*id),
+        });
+    }
+    // W2.6 — the FACILITIES surface: in-flight build orders, the
+    // stand's economics, and per-family qualification rows (split
+    // out for the complexity bound; needs only the world half).
+    stage_facilities(sim, input, now, tick_s, name_of);
+    // The site table — stockpiles + the found-outpost slots.
+    for s in sim.site_defs().values() {
+        input.sites.push(up::SiteRow {
+            id: s.id.as_str().to_string(),
+            name: name_of(&s.display_name, s.id.as_str()),
+            body: s.body.as_str().to_string(),
+            launch: s.launch,
+            has_colony: sim.colonies().values().any(|c| c.site == s.id),
+            inventory: sim
+                .economy()
+                .sites
+                .get(&s.id)
+                .map(|st| {
+                    st.inventory
+                        .iter()
+                        .map(|(r, u)| (r.as_str().to_string(), *u))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        });
+    }
+    // Live lab projects — closed-form reads at the staging tick.
+    let cfg = sim.science_config();
+    for p in sim.science().projects.values() {
+        let t_s = now.saturating_sub(p.start_tick) as f64 / tick_s;
+        input.projects.push(up::ProjectRow {
+            id: p.id.0,
+            vessel: p.vessel.0,
+            label: format!(
+                "{}@{}/{}{}",
+                p.key.experiment.as_str(),
+                p.key.biome.as_str(),
+                p.key.body.as_str(),
+                p.key.situation.name()
+            ),
+            rate_per_s: p.rate_science_per_s,
+            accrued: csp_sim::research::accrued(p, &cfg, t_s),
+            data_left: csp_sim::research::data_at(
+                p.data_start,
+                p.rate_science_per_s,
+                p.throughput_data_per_s,
+                cfg.science_per_data,
+                t_s,
+            ),
+            eta_s: p.exhaust_tick.saturating_sub(now) as f64 / tick_s,
+        });
+    }
+    // The agenda — pending player alarms and watched windows.
+    for e in sim.pending_events() {
+        let label = match &e.kind {
+            csp_sim::EventKind::PlayerAlarm { label } => Some(format!("alarm: {label}")),
+            csp_sim::EventKind::TransferWindow {
+                origin,
+                destination,
+            } => Some(format!(
+                "window {}→{}",
+                origin.as_str(),
+                destination.as_str()
+            )),
+            _ => None,
+        };
+        if let Some(label) = label {
+            input.alarms.push(up::AlarmRow {
+                tick: e.tick,
+                in_s: e.tick.saturating_sub(now) as f64 / tick_s,
+                label,
+            });
+        }
+    }
+    // In-flight transfers — pending `TransferComplete`s.
+    for t in sim.transfers().values() {
+        let end = |e: csp_sim::transfers::TransferEnd| match e {
+            csp_sim::transfers::TransferEnd::Vessel(v) => format!("vessel {}", v.0),
+            csp_sim::transfers::TransferEnd::Colony(c) => format!("colony {}", c.0),
+        };
+        let cargo = match &t.cargo {
+            csp_sim::transfers::TransferCargo::Resource { resource, amount } => {
+                format!("{resource} {amount:.1}")
+            }
+            csp_sim::transfers::TransferCargo::Crew { crew } => format!("crew {}", crew.0),
+        };
+        input.transfers.push(up::TransferRow {
+            label: format!("{}: {} → {}", cargo, end(t.from), end(t.to)),
+            eta_s: t.complete_tick.saturating_sub(now) as f64 / tick_s,
+        });
+    }
+    // The focused vessel's logistics/science extras: cargo pool,
+    // free seats, the joined colony, lab + chute nodes, and the
+    // resolved researcher pool `StartResearch` truncates.
+    if let Some(f) = focus
+        && let Some(v) = sim.vessels().get(&f)
+    {
+        input.focus_joined = v.joined_colony.map(|c| c.0);
+        let inbound = sim
+            .transfers()
+            .values()
+            .filter(|t| {
+                t.to == csp_sim::transfers::TransferEnd::Vessel(f)
+                    && matches!(t.cargo, csp_sim::transfers::TransferCargo::Crew { .. })
+            })
+            .count() as u64;
+        input.focus_free_seats = csp_sim::transfers::vessel_seats(v)
+            .saturating_sub(v.crew.len() as u64)
+            .saturating_sub(inbound);
+        let mut agg: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+        for stores in v.tank_contents.values() {
+            for (r, u) in stores {
+                *agg.entry(r.as_str().to_string()).or_insert(0.0) += u;
+            }
+        }
+        input.cargo = agg.into_iter().collect();
+        if let Some(craft) = &v.craft {
+            for (nid, node) in &craft.graph.nodes {
+                let Some(part) = craft.parts.get(node.effective_index as usize) else {
+                    continue;
+                };
+                let part_name = craft
+                    .part_ids
+                    .get(node.effective_index as usize)
+                    .and_then(|pid| sim.parts().get(pid))
+                    .map(|d| name_of(&d.display_name, d.id.as_str()))
+                    .unwrap_or_else(|| format!("part {}", nid.0));
+                if let Some(lab) = &part.lab {
+                    lab_slots.insert(nid.0, lab.researcher_slots);
+                    input.labs.push(up::LabRow {
+                        node: nid.0,
+                        part: part_name.clone(),
+                        slots: lab.researcher_slots,
+                        running: sim
+                            .science()
+                            .projects
+                            .values()
+                            .any(|p| p.vessel == f && p.lab_node == *nid),
+                    });
+                }
+                if part.parachute.is_some() {
+                    input.chutes.push(up::ChuteRow {
+                        node: nid.0,
+                        part: part_name,
+                        deployed: v.deployed.contains_key(nid),
+                    });
+                }
+            }
+        }
+        for c in &v.crew {
+            // Roster members carry their authored skill; an id-only
+            // `BoardCrew` member stages at skill 1 so an unskilled
+            // crew can still run a lab (rate > 0).
+            let skill = sim.economy().crew.get(&c.id).map_or(1, |m| m.skill).max(1);
+            researchers.push((c.id, skill));
+        }
     }
 }
 
@@ -3678,6 +4985,211 @@ mod tests {
         assert_eq!(dropped.len(), 2, "each drop reports itself");
     }
 
+    /// W2.0/W2.3's dispatch contract: every progression-surface
+    /// `ProgramCommand` resolves to its `SimCommand` (focused-vessel
+    /// verbs through the mirror's vessel, id-addressed verbs
+    /// verbatim), and focused-vessel verbs drop with a notice on a
+    /// stale mirror.
+    #[allow(clippy::too_many_lines)] // the mapping table IS the test
+    #[test]
+    fn program_command_maps_progression_verbs() {
+        use csp_ui::program::ProgramCommand as C;
+        let mut dropped = Vec::new();
+        let mirror = ProgramMirror {
+            vessel: Some(csp_sim::VesselId(7)),
+            now_ticks: 1_000,
+            ..ProgramMirror::default()
+        };
+        let maps: &[(C, SimCommand)] = &[
+            (
+                C::TransferCrew {
+                    crew: 2,
+                    to_vessel: 9,
+                },
+                SimCommand::TransferCrew {
+                    from_vessel: csp_sim::VesselId(7),
+                    to_vessel: csp_sim::VesselId(9),
+                    crew: csp_sim::CrewId(2),
+                },
+            ),
+            (
+                C::TransferResource {
+                    to_vessel: 9,
+                    resource: "ore".into(),
+                    amount: 10.0,
+                },
+                SimCommand::TransferResource {
+                    from_vessel: csp_sim::VesselId(7),
+                    to_vessel: csp_sim::VesselId(9),
+                    resource: csp_data::ResourceId::from("ore"),
+                    amount: 10.0,
+                },
+            ),
+            (
+                C::AssignCrewToColony { crew: 2, colony: 3 },
+                SimCommand::AssignCrewToColony {
+                    colony: csp_sim::ColonyId(3),
+                    crew: csp_sim::CrewId(2),
+                },
+            ),
+            (
+                C::EvacuateColony { colony: 3 },
+                SimCommand::EvacuateColony {
+                    colony: csp_sim::ColonyId(3),
+                },
+            ),
+            (
+                C::AbandonColony { colony: 3 },
+                SimCommand::AbandonColony {
+                    colony: csp_sim::ColonyId(3),
+                },
+            ),
+            (
+                C::ScheduleColonyInspection { colony: 3 },
+                SimCommand::ScheduleColonyInspection {
+                    colony: csp_sim::ColonyId(3),
+                    tick: 1_000 + csp_core::TICK_HZ * 86_400,
+                },
+            ),
+            (
+                C::JoinColony { colony: 3 },
+                SimCommand::JoinColonyInventory {
+                    vessel: csp_sim::VesselId(7),
+                    colony: csp_sim::ColonyId(3),
+                },
+            ),
+            (
+                C::LeaveColony,
+                SimCommand::LeaveColonyInventory {
+                    vessel: csp_sim::VesselId(7),
+                },
+            ),
+            (
+                C::TransferColonyResource {
+                    colony: 3,
+                    resource: "ore".into(),
+                    amount: 5.0,
+                    to_colony: true,
+                },
+                SimCommand::TransferColonyResource {
+                    vessel: csp_sim::VesselId(7),
+                    colony: csp_sim::ColonyId(3),
+                    resource: csp_data::ResourceId::from("ore"),
+                    amount: 5.0,
+                    to_colony: true,
+                },
+            ),
+            (
+                C::TransferColonyCrew {
+                    colony: 3,
+                    crew: 2,
+                    to_colony: false,
+                },
+                SimCommand::TransferColonyCrew {
+                    vessel: csp_sim::VesselId(7),
+                    colony: csp_sim::ColonyId(3),
+                    crew: csp_sim::CrewId(2),
+                    to_colony: false,
+                },
+            ),
+            (
+                C::DeployPart { node: 4 },
+                SimCommand::DeployPart {
+                    vessel: csp_sim::VesselId(7),
+                    node: csp_phys::PartNodeId(4),
+                },
+            ),
+            (
+                C::StopResearch { project: 5 },
+                SimCommand::StopResearch {
+                    project: csp_sim::ResearchId(5),
+                },
+            ),
+            (
+                C::SetAlarm {
+                    in_seconds: 60.0,
+                    label: "x".into(),
+                },
+                SimCommand::SetAlarm {
+                    tick: 1_000 + 60 * csp_core::TICK_HZ,
+                    label: "x".into(),
+                },
+            ),
+            (
+                C::DisengageAutopilot,
+                SimCommand::DisengageAutopilot {
+                    vessel: csp_sim::VesselId(7),
+                },
+            ),
+            (
+                C::BoardCrew,
+                SimCommand::BoardCrew {
+                    vessel: csp_sim::VesselId(7),
+                },
+            ),
+        ];
+        for (pc, want) in maps {
+            assert_eq!(
+                program_command(&mirror, pc.clone(), &mut dropped),
+                Some(want.clone()),
+                "{pc:?}"
+            );
+        }
+        // `FoundColony` builds the starter def (site verbatim).
+        match program_command(
+            &mirror,
+            C::FoundColony {
+                site: "rask-mines".into(),
+            },
+            &mut dropped,
+        ) {
+            Some(SimCommand::FoundColony { def }) => {
+                assert_eq!(def.site.as_str(), "rask-mines");
+                assert!(!def.modules.is_empty());
+            }
+            other => panic!("FoundColony → {other:?}"),
+        }
+        // `HireCrew` authors the kind/name/salary.
+        match program_command(
+            &mirror,
+            C::HireCrew {
+                kind: "scientist".into(),
+            },
+            &mut dropped,
+        ) {
+            Some(SimCommand::HireCrew { kind, .. }) => {
+                assert_eq!(kind, csp_sim::CrewKind::Scientist)
+            }
+            other => panic!("HireCrew → {other:?}"),
+        }
+        assert!(dropped.is_empty(), "no drops with a focused vessel");
+
+        // Stale mirror → focused-vessel verbs drop with notices.
+        let empty = ProgramMirror::default();
+        for pc in [
+            C::BoardCrew,
+            C::LeaveColony,
+            C::JoinColony { colony: 1 },
+            C::TransferColonyCrew {
+                colony: 1,
+                crew: 0,
+                to_colony: true,
+            },
+            C::DeployPart { node: 0 },
+        ] {
+            assert_eq!(program_command(&empty, pc, &mut dropped), None);
+        }
+        // Id-addressed verbs still go through without a focus (a stale
+        // id is the drain's Recoverable rejection, not a mirror drop).
+        assert_eq!(
+            program_command(&empty, C::EvacuateColony { colony: 3 }, &mut dropped),
+            Some(SimCommand::EvacuateColony {
+                colony: csp_sim::ColonyId(3),
+            })
+        );
+        assert_eq!(dropped.len(), 5, "every stale focus-drop reports");
+    }
+
     /// W1.2's gate: a rails vessel in space stages a REAL science
     /// context — the situation carries it (space situations have no
     /// biome; the sim accepts the empty `BiomeId` there), so a
@@ -3705,26 +5217,30 @@ mod tests {
                 },
             },
         );
-        let report = view.sim_step(1).expect("advance");
+        let report = view
+            .sim_step(view.sim.clock().ticks() + 1)
+            .expect("advance");
         assert!(
             report.rejected.is_empty(),
             "spawn rejected: {:?}",
             report.rejected
         );
-        // The pad craft (spawned by `new_demo`'s seed, staged InBubble)
-        // always wins the flight-focus half of the mirror's vessel
-        // pick — the map-focus path only runs when no flight vessel
-        // is staged, so retire the pad craft like a player would.
-        // (It materializes in the same drain as the elements spawn —
-        // the terminate has to land in the NEXT boundary.)
+        // The pad craft (delivered SurfaceLatched by `new_demo`'s
+        // seed — W2.6: the seed steps through its ManufactureCraft
+        // order at construction, so it is already vessel 0) always
+        // wins the flight-focus half of the mirror's vessel pick —
+        // the map-focus path only runs when no flight vessel is
+        // staged, so retire the pad craft like a player would.
         view.sim.enqueue(
             csp_sim::SourceClass::Ui,
             0,
             SimCommand::TerminateVessel {
-                vessel: csp_sim::VesselId(1),
+                vessel: csp_sim::VesselId(0),
             },
         );
-        let report = view.sim_step(2).expect("advance");
+        let report = view
+            .sim_step(view.sim.clock().ticks() + 1)
+            .expect("advance");
         assert!(
             report.rejected.is_empty(),
             "terminate rejected: {:?}",
@@ -3734,7 +5250,7 @@ mod tests {
         view.world
             .resource_mut::<flight::FlightFocusOverride>()
             .target = None;
-        view.world.resource_mut::<map::MapInput>().focus_vessel = Some(csp_sim::VesselId(0));
+        view.world.resource_mut::<map::MapInput>().focus_vessel = Some(csp_sim::VesselId(1));
         view.end_frame();
         let mirror = view.world.resource::<ProgramMirror>();
         let dump: Vec<String> = view
@@ -3743,7 +5259,7 @@ mod tests {
             .iter()
             .map(|(id, v)| format!("{}={:?}", id.0, v.state))
             .collect();
-        assert_eq!(mirror.vessel, Some(csp_sim::VesselId(0)), "{dump:?}");
+        assert_eq!(mirror.vessel, Some(csp_sim::VesselId(1)), "{dump:?}");
         assert_eq!(
             mirror.science_ctx.as_ref().map(|(_, s)| *s),
             Some(csp_data::Situation::SpaceLow),
@@ -3762,13 +5278,172 @@ mod tests {
         assert_eq!(
             cmd,
             Some(SimCommand::RunExperiment {
-                vessel: csp_sim::VesselId(0),
+                vessel: csp_sim::VesselId(1),
                 node: csp_phys::PartNodeId(0),
                 experiment: csp_data::ExperimentId::from("exp.materials_study"),
                 biome: csp_data::BiomeId::from(""),
                 situation: csp_data::Situation::SpaceLow,
             }),
             "RunExperiment must reach the outbox in orbit"
+        );
+    }
+
+    /// W2.6: the §3.4 test stand is player-reachable — the panel's
+    /// `RunBenchTest` maps through `program_command` to the sim
+    /// command (the FACILITIES rows the buttons gate on stage too),
+    /// the apply reserves funds + stockpile + time, and
+    /// `BenchTestComplete` credits the family's qualification.
+    #[test]
+    fn bench_test_reaches_the_stand() {
+        use csp_ui::program::ProgramCommand as C;
+        let mut view = View::new().expect("data/ load");
+        // Stage the Program mirror once — the FACILITIES rows the
+        // bench buttons read must name the stand and the family.
+        view.begin_frame();
+        view.end_frame();
+        let site = csp_data::SiteId::from("terrin-launch");
+        let family = csp_data::FamilyId::from("csp.family.engine.launch");
+        let mut dropped = Vec::new();
+        let cmd = {
+            let mirror = view.world.resource::<ProgramMirror>();
+            assert_eq!(
+                mirror.input.bench_site.as_deref(),
+                Some("terrin-launch"),
+                "the stand stages the dominant body's launch site"
+            );
+            assert!(
+                mirror
+                    .input
+                    .families
+                    .iter()
+                    .any(|f| f.id == "csp.family.engine.launch"),
+                "the catalog's engine family stages a qualification row"
+            );
+            assert!(
+                mirror.input.bench_stock >= 5.0,
+                "the seeded stockpile covers a 5-unit run"
+            );
+            program_command(
+                mirror,
+                C::RunBenchTest {
+                    site: site.as_str().to_string(),
+                    family: "csp.family.engine.launch".into(),
+                    units: 5.0,
+                },
+                &mut dropped,
+            )
+        };
+        assert!(dropped.is_empty(), "dropped: {dropped:?}");
+        let cmd = cmd.expect("RunBenchTest must reach the outbox");
+        assert_eq!(
+            cmd,
+            SimCommand::RunBenchTest {
+                site: site.clone(),
+                family: family.clone(),
+                units: 5.0,
+            },
+        );
+        let funds0 = view.sim.funds_micros();
+        view.sim.enqueue(SourceClass::Ui, 0, cmd);
+        view.begin_frame();
+        let report = view
+            .sim_step(view.sim.clock().ticks() + 1)
+            .expect("advance");
+        assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+        view.end_frame();
+        assert_eq!(view.sim.bench_runs().len(), 1, "the stand is running");
+        assert!(
+            view.sim.funds_micros() < funds0,
+            "the run reserved its funds"
+        );
+        let complete = view.sim.bench_runs().values().next().unwrap().complete_tick;
+        view.begin_frame();
+        view.sim_step(complete).expect("advance");
+        view.end_frame();
+        assert!(view.sim.bench_runs().is_empty());
+        assert_eq!(
+            view.sim.tech().qualifications[&family].bench_units,
+            5.0,
+            "completion credited the family's bench units"
+        );
+    }
+
+    /// W2.6: the VAB LAUNCH path is a `ManufactureCraft` build order
+    /// — funds + the pad's stockpile BOM pay at order, the craft
+    /// materializes `SurfaceLatched` at `ConstructionComplete`
+    /// (never earlier), and the delivery takes flight focus.
+    #[test]
+    fn launch_orders_a_manufactured_craft() {
+        let mut view = View::new().expect("data/ load");
+        view.seed_starter_craft().expect("starter seed");
+        // Free the berth so the second order can place (the pad is a
+        // single berth; the seeded craft claims it latched).
+        view.sim.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::TerminateVessel {
+                vessel: csp_sim::VesselId(0),
+            },
+        );
+        view.begin_frame();
+        let report = view
+            .sim_step(view.sim.clock().ticks() + 1)
+            .expect("advance");
+        assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+        view.end_frame();
+        let pad = csp_data::SiteId::from("terrin-launch");
+        let metal = csp_data::ResourceId::from("metal");
+        let funds0 = view.sim.funds_micros();
+        let stock0 = view.sim.economy().sites[&pad].inventory[&metal];
+
+        view.launch_craft().expect("second launch places the order");
+        view.begin_frame();
+        let report = view
+            .sim_step(view.sim.clock().ticks() + 1)
+            .expect("advance");
+        assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+        view.end_frame();
+        // The order: one in-flight build, nothing materialized, the
+        // BOM + funds already debited out of the pad's stockpile.
+        assert_eq!(view.sim.builds().len(), 1, "the launch is a build order");
+        assert!(
+            view.sim.vessels().is_empty(),
+            "no vessel exists before ConstructionComplete"
+        );
+        assert!(
+            view.sim.funds_micros() < funds0,
+            "the order debited the craft's funds"
+        );
+        assert!(
+            view.sim.economy().sites[&pad].inventory[&metal] < stock0,
+            "the order debited the stockpile BOM"
+        );
+        let complete = view.sim.builds().values().next().unwrap().complete_tick;
+        view.begin_frame();
+        let report = view.sim_step(complete).expect("advance");
+        assert!(
+            report
+                .fired_events
+                .iter()
+                .any(|e| matches!(e.kind, csp_sim::EventKind::ConstructionComplete { .. })),
+            "delivery arrives through ConstructionComplete"
+        );
+        view.end_frame();
+        assert_eq!(
+            view.sim.vessels().len(),
+            1,
+            "delivery materialized the craft"
+        );
+        let (id, v) = view.sim.vessels().iter().next().unwrap();
+        assert!(
+            matches!(v.state, csp_sim::VesselState::SurfaceLatched(_)),
+            "delivered surface-latched, got {:?}",
+            v.state
+        );
+        assert_eq!(
+            view.flight_focus(),
+            Some(*id),
+            "the delivery takes focus like a spawn did"
         );
     }
 }

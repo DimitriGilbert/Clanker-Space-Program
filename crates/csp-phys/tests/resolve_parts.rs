@@ -305,3 +305,80 @@ fn chute_resolves_parachute_spec() {
     assert!(*packed_drag_area_m2 < *deployed_drag_area_m2);
     assert!(*deploy_time_s > 0.0);
 }
+
+/// §3.1 `Lab`: the authored lab's `Lab` module resolves into
+/// `WeldPart::lab` — the exact field `apply_start_research`'s gate
+/// reads (`craft.parts[idx].lab`; without it the apply refuses
+/// "node carries no lab"). `CrewSeat` resolves `crew_seats`, which
+/// is what the assigned researchers sit in.
+#[test]
+fn lab_part_resolves_start_research_gate() {
+    let defs = defs();
+    let res = resources();
+    let eff = resolve_parts(
+        &defs,
+        &[built(0, "csp.lab.mk1", "stock")],
+        &res,
+        &no_quals(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(eff.len(), 1);
+    let spec = eff[0]
+        .weld_input
+        .lab
+        .expect("csp.lab.mk1 resolved no LabSpec — StartResearch cannot pass its gate");
+    assert_eq!(spec.throughput_data_per_s, 0.5);
+    assert_eq!(spec.multiplier, 2.0);
+    assert_eq!(spec.researcher_slots, 2);
+    // The researchers' seats resolve too — `researcher_slots` ≤ seats
+    // so a full assignment always boards.
+    assert!(eff[0].weld_input.crew_seats >= spec.researcher_slots);
+    // A part with no Lab module resolves `None` — the gate's refusal
+    // path stays armed for non-lab nodes.
+    let no_lab = resolve_parts(
+        &defs,
+        &[built(0, "csp.pod.mk1", "stock")],
+        &res,
+        &no_quals(),
+        None,
+    )
+    .unwrap();
+    assert!(no_lab[0].weld_input.lab.is_none());
+}
+
+/// §3.1 `DockPort`: the authored port resolves a `DockPortSpec`
+/// anchored at its named `face` node — the capture point the sim's
+/// soft-capture facing test reads — and satisfies validation as a
+/// part (the `Payload` category's dock-port arm).
+#[test]
+fn dockport_resolves_capture_face() {
+    let defs = defs();
+    let res = resources();
+    let eff = resolve_parts(
+        &defs,
+        &[built(0, "csp.dockport.s125", "stock")],
+        &res,
+        &no_quals(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(eff.len(), 1);
+    assert_eq!(eff[0].weld_input.dock_ports.len(), 1);
+    let spec = eff[0].weld_input.dock_ports[0];
+    assert_eq!(spec.size, csp_data::PortSize::Medium);
+    // The `face` node authors (0, 0, 0.175)/+z — the resolver emits
+    // it verbatim at s = 1.
+    assert!(close(spec.local_pos.z, 0.175));
+    assert_eq!(spec.local_dir, DVec3::Z);
+    // A part with no port module resolves an empty face list.
+    let no_port = resolve_parts(
+        &defs,
+        &[built(0, "csp.pod.mk1", "stock")],
+        &res,
+        &no_quals(),
+        None,
+    )
+    .unwrap();
+    assert!(no_port[0].weld_input.dock_ports.is_empty());
+}

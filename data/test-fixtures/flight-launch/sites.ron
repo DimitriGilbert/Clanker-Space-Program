@@ -1,11 +1,13 @@
 // Frozen fixture sites — the flight-launch golden's recovery site set:
 // Terrin's launch pad (recovery_efficiency 1.0) plus a downrange field
-// (balance default 0.9).
+// (balance default 0.9). v2: no `resource_yields`/`starting_stock`
+// authored — both default empty (the golden needs no stockpile: its
+// recorded spawn is a direct SpawnPhysicalVessel).
 (
-    schema_version: 1,
+    schema_version: 2,
     sites: [
         (
-            schema_version: 1,
+            schema_version: 2,
             id: "terrin-launch",
             display_name: "site.terrin-launch",
             body: "terrin",
@@ -15,7 +17,7 @@
             launch: true,
         ),
         (
-            schema_version: 1,
+            schema_version: 2,
             id: "terrin-downrange",
             display_name: "site.terrin-downrange",
             body: "terrin",

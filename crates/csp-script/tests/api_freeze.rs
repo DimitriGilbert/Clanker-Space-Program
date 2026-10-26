@@ -35,6 +35,13 @@ const FROZEN_METHODS: &[(&str, &str)] = &[
     ),
     ("cancel_wake", "(&mut self) -> Result<(), SimError>"),
     ("log", "(&mut self, line: String)"),
+    ("deploy", "(&mut self, node: u64)"),
+    (
+        "engage_autopilot",
+        "(&mut self, target_apoapsis_m: f64, target_periapsis_m: f64)",
+    ),
+    ("disengage_autopilot", "(&mut self)"),
+    ("vessels", "(&mut self) -> Vec<VesselId>"),
 ];
 
 /// The frozen guest-callable surface — the `(name, arg-list)` pairs
@@ -58,7 +65,13 @@ const FROZEN_GUEST_SURFACE: &[(&str, &str)] = &[
     ("wait_periapsis", ""),
     ("wait_soi", ""),
     ("wait_node", ""),
+    ("wait_altitude", "80000.0, true"),
     ("cancel_wait", ""),
+    ("deploy", "0"),
+    ("engage_autopilot", "80000.0, 80000.0"),
+    ("disengage_autopilot", ""),
+    ("telemetry_of", "0"),
+    ("vessels", ""),
 ];
 
 /// Whitespace-collapsed source — `"fn  foo ( &mut"` and

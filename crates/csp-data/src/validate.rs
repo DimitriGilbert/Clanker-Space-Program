@@ -50,7 +50,7 @@ use crate::load::{LoadedPart, LoadedParts, LoadedSystem};
 use crate::loc::LocFile;
 use crate::part::{ColliderDef, ModuleDef, PART_SCHEMA_VERSION, PartCategory, PartDef, ScaleRule};
 use crate::resource::{RESOURCE_SCHEMA_VERSION, ResourceFile};
-use crate::site::SiteFile;
+use crate::site::{SiteDef, SiteFile};
 use crate::system::SCHEMA_VERSION;
 use crate::techtree::{TechNode, UpgradeTrack};
 
@@ -2119,8 +2119,37 @@ pub fn validate_sites(
                 });
             }
         }
+        validate_site_stock(s, id, res, &mut out);
     }
     out
+}
+
+/// W2.6: one site's `starting_stock` rows — the seeded stockpile
+/// build orders and bench stands spend. Unique, known resources,
+/// finite non-negative units (zero is pointless but legal — an
+/// authored "this row exists" marker).
+fn validate_site_stock(s: &SiteDef, id: &str, res: &ResourceFile, out: &mut Vec<ValidationError>) {
+    let mut stock = BTreeSet::new();
+    for (r, u) in &s.starting_stock {
+        if !stock.insert(r.as_str()) {
+            out.push(ValidationError::InvalidSite {
+                id: id.to_string(),
+                reason: format!("duplicate stock resource {r:?}"),
+            });
+        }
+        if !res.contains(r) {
+            out.push(ValidationError::InvalidSite {
+                id: id.to_string(),
+                reason: format!("unknown stock resource {r:?}"),
+            });
+        }
+        if !(u.is_finite() && *u >= 0.0) {
+            out.push(ValidationError::InvalidSite {
+                id: id.to_string(),
+                reason: format!("stock units for {r:?} negative or non-finite"),
+            });
+        }
+    }
 }
 
 /// Loc resolution for the site set (the [`validate_loc_keys`]
@@ -5772,6 +5801,7 @@ mod tests {
                 altitude_m: 0.0,
                 launch: false,
                 resource_yields: vec![("ore".into(), 0.5)],
+                starting_stock: vec![],
             }],
         };
         let colonies = crate::colony::ColonyFile {
@@ -6425,6 +6455,122 @@ mod tests {
                 e,
                 ValidationError::BadModule {
                     reason: "more than one parachute module",
+                    ..
+                }
+            )),
+            "{errs:?}"
+        );
+    }
+
+    /// §3.1 `Lab`: the authored lab's module shape passes (Utility
+    /// bucket, positive throughput/multiplier, seats for the
+    /// researchers); the degenerate fields are flagged.
+    #[test]
+    fn lab_module_bounds() {
+        let lab_part = || {
+            let mut d = part_fixture();
+            d.id = "test.lab".into();
+            d.category = PartCategory::Utility;
+            d.modules = vec![
+                ModuleDef::CrewSeat { slots: 2 },
+                ModuleDef::Lab {
+                    throughput_data_per_s: 0.5,
+                    multiplier: 2.0,
+                    researcher_slots: 2,
+                },
+            ];
+            d
+        };
+        assert!(part_errors(lab_part()).is_empty());
+        // Non-positive throughput / multiplier.
+        for (t, m) in [(0.0, 2.0), (-1.0, 2.0), (0.5, 0.0), (f64::NAN, 2.0)] {
+            let mut d = lab_part();
+            let ModuleDef::Lab {
+                throughput_data_per_s,
+                multiplier,
+                ..
+            } = &mut d.modules[1]
+            else {
+                unreachable!()
+            };
+            *throughput_data_per_s = t;
+            *multiplier = m;
+            assert!(
+                part_errors(d).iter().any(|e| matches!(
+                    e,
+                    ValidationError::BadModule { .. }
+                        | ValidationError::PartNonPositive { .. }
+                        | ValidationError::PartNonFinite { .. }
+                )),
+                "throughput {t} multiplier {m} must be rejected"
+            );
+        }
+        // A lab nobody can staff is dead content.
+        let mut d = lab_part();
+        let ModuleDef::Lab {
+            researcher_slots, ..
+        } = &mut d.modules[1]
+        else {
+            unreachable!()
+        };
+        *researcher_slots = 0;
+        let errs = part_errors(d);
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::BadModule {
+                    reason: "lab with zero researcher slots",
+                    ..
+                }
+            )),
+            "{errs:?}"
+        );
+    }
+
+    /// §3.1 `DockPort`: a port naming a real attach node is a valid
+    /// part (and satisfies the Payload category rule); a port naming
+    /// no node, or two ports claiming one node, is rejected.
+    #[test]
+    fn dock_port_module_rules() {
+        let port_part = |node: &str| {
+            let mut d = part_fixture();
+            d.id = "test.dockport".into();
+            d.category = PartCategory::Payload;
+            d.attach_nodes.push(AttachNode {
+                id: "mount".into(),
+                position_m: csp_core::DVec3::new(0.0, 0.0, -0.9),
+                direction: -csp_core::DVec3::Z,
+                diameter_m: 1.25,
+            });
+            d.modules = vec![ModuleDef::DockPort {
+                size: crate::part::PortSize::Medium,
+                node: node.into(),
+            }];
+            d
+        };
+        // "top" is the fixture's only authored node.
+        assert!(part_errors(port_part("top")).is_empty());
+        // A port face that names no attach node anchors nothing.
+        let errs = part_errors(port_part("ghost"));
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::BadModule {
+                    reason: "dock_port node names no attach node",
+                    ..
+                }
+            )),
+            "{errs:?}"
+        );
+        // Two ports, one face — ambiguous authored data.
+        let mut d = port_part("top");
+        d.modules.push(d.modules[0].clone());
+        let errs = part_errors(d);
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::BadModule {
+                    reason: "two dock ports claim the same attach node",
                     ..
                 }
             )),

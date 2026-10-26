@@ -1,0 +1,70 @@
+// csp.probe.s0625 — "Relay" 0.625 m probe core (§3.1 PartDef).
+// Hand-authored fiction — numbers frozen at M7.
+//
+// Uncrewed command authority for the satellite program: a
+// `Control`-only module stack (no `CrewSeat`, nobody to feed) so a
+// probe bus holds attitude and stays controllable with no one
+// aboard — the `contract.satellite` payload bus's brain.
+// 0.625-class stack nodes match the small-part size class the
+// nose cone and payload mounts share.
+(
+    schema_version: 1,
+    id: "csp.probe.s0625",
+    family: "csp.family.probe",
+    display_name: "part.csp.probe.s0625.name",
+    category: Control,
+    mass_dry_kg: 120.0,
+    cost_funds: 900.0,
+    size_m: (x: 0.625, y: 0.625, z: 0.4),
+    build_resources: [("metal", 10.0), ("composite", 6.0)],
+    attach_nodes: [
+        // 1.25-class stack interfaces — the canister/battery
+        // precedent: small bus parts fly inline mid-stack.
+        (id: "top",    position_m: (x: 0.0, y: 0.0, z: 0.2),  direction: (x: 0.0, y: 0.0, z: 1.0),  diameter_m: 1.25),
+        (id: "bottom", position_m: (x: 0.0, y: 0.0, z: -0.2), direction: (x: 0.0, y: 0.0, z: -1.0), diameter_m: 1.25),
+    ],
+    scale: None,
+    collider: Cylinder(radius_m: 0.3125, half_height_m: 0.2),
+    aero: (
+        cd_curve: [(mach: 0.0, coeff: 0.45), (mach: 8.0, coeff: 0.3)],
+        cl_curve: [(mach: 0.0, coeff: 0.0)],
+        ref_len_m: 0.4,
+    ),
+    thermal: (
+        heat_capacity_j_per_k: 80_000.0,
+        max_temp_k: 1100.0,
+        emissivity: 0.7,
+        conduction_w_per_k: 35.0,
+    ),
+    structural: (
+        max_axial_n: 200_000.0,
+        max_shear_n: 80_000.0,
+        max_torque_nm: 10_000.0,
+    ),
+    variants: [
+        (id: "stock", display_name: "part.variant.stock", cost_multiplier: 1.0, stat_multipliers: []),
+    ],
+    modules: [
+        Control(torque_nm: 400.0, power_w: 25.0),
+    ],
+    reliability: (
+        base_mtbf_s: 1_800_000.0,
+        infant_mortality: 0.08,
+        qualification_curve: (knots: [
+            (qualification_units: 0.0,   hazard_multiplier: 1.0),
+            (qualification_units: 100.0, hazard_multiplier: 0.5),
+        ]),
+        regime_stress: [
+            (kind: Overtemperature, threshold: 0.9,  multiplier: 4.0),
+            (kind: ExcessG,         threshold: 12.0, multiplier: 2.0),
+        ],
+        // §3.4's dormant-failure example is exactly this part: a
+        // probe in orbit failing a reaction wheel.
+        dormant_stress: 0.03,
+        failure_modes: [
+            (SensorFault, 0.8),
+            (PanelJam,    0.2),
+        ],
+    ),
+    tech_requirement: "tech.rocketry.2",
+)

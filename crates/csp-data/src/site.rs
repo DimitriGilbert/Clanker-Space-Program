@@ -27,12 +27,21 @@ use crate::ids::{BodyId, LocKey, ResourceId, SiteId};
 /// concentrations a colony `Drill` module extracts against. A v1 file
 /// still parses: the field defaults to an empty list (no yields —
 /// drills founded there read concentration 0 and produce nothing).
-pub const SITE_SCHEMA_VERSION: u32 = 2;
+///
+/// Version 3 (W2.6): `starting_stock` landed — the site's seeded
+/// inventory, the stockpile `ManufactureCraft` build orders and
+/// `RunBenchTest` stands spend out of (§3.5's "the launch site's own
+/// inventory is the bill the order pays out of"). A v2 file still
+/// parses: the field defaults to an empty stockpile (manufacture and
+/// bench orders there simply have nothing to spend — the arena row
+/// exists and recovery keeps crediting into it).
+pub const SITE_SCHEMA_VERSION: u32 = 3;
 
 /// The `sites.ron` versions `load_sites` accepts: the current schema
 /// and the previous one under the §3.1 "current and previous, with
-/// explicit defaults" rule — v1's missing `resource_yields` reads as
-/// the empty list.
+/// explicit defaults" rule — v2's missing `starting_stock` reads as
+/// the empty stockpile (v1's `resource_yields` read the same way;
+/// a v1 file is now two versions back and refused outright).
 pub const SITE_SCHEMA_SUPPORTED: [u32; 2] = [SITE_SCHEMA_VERSION - 1, SITE_SCHEMA_VERSION];
 
 /// One authored surface site (§3.5). The geocentric pose uses the
@@ -74,6 +83,18 @@ pub struct SiteDef {
     /// flow network reads.
     #[serde(default)]
     pub resource_yields: Vec<(ResourceId, f64)>,
+    /// W2.6 §3.5: the site's seeded inventory — `(resource, units)`
+    /// credited into `economy.sites` when the site installs
+    /// (`World::set_sites` seeds the arena row; a re-install of an
+    /// existing id preserves the live inventory rather than
+    /// re-seeding, the same `or_insert` reconciliation the site
+    /// table itself runs). The launch site's stockpile is what a
+    /// `ManufactureCraft` BOM and a `RunBenchTest` stand spend;
+    /// recovery keeps crediting into the same rows (the §3.5 loop:
+    /// recovery ─► stockpile ─► manufacture). Empty for a site the
+    /// program starts with bare ground.
+    #[serde(default)]
+    pub starting_stock: Vec<(ResourceId, f64)>,
 }
 
 /// `data/systems/<sys>/sites.ron` — the system's site set. Optional:

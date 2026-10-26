@@ -1,0 +1,77 @@
+// csp.dockport.s125 — "Latch" 1.25 m docking port (§3.1 PartDef).
+// Hand-authored fiction — numbers frozen at M7.
+//
+// The docking half of the M6 content path: `DockPort { size:
+// Medium, node: "face" }` designates the part's `face` attach node
+// as the capture face — the resolver emits a `DockPortSpec`
+// anchored at that node's position, and the sim's soft-capture
+// test mates two `face` directions pointing at each other within
+// the Medium class. The `mount` node is the ordinary stack
+// interface that welds the port to its vessel.
+//
+// Category Payload — the category-module rule's "tank or dock
+// port" bucket is exactly this part (a port part is a payload
+// interface, not a structure spacer).
+(
+    schema_version: 1,
+    id: "csp.dockport.s125",
+    family: "csp.family.docking",
+    display_name: "part.csp.dockport.s125.name",
+    category: Payload,
+    mass_dry_kg: 90.0,
+    cost_funds: 650.0,
+    size_m: (x: 1.25, y: 1.25, z: 0.35),
+    build_resources: [("metal", 10.0), ("composite", 4.0)],
+    attach_nodes: [
+        // `face` is the capture face — `DockPort.node` names it; its
+        // +z direction is the axis the sim's facing test reads.
+        // `mount` is the ordinary stack node that welds the port
+        // onto the parent vessel.
+        (id: "face",  position_m: (x: 0.0, y: 0.0, z: 0.175),  direction: (x: 0.0, y: 0.0, z: 1.0),  diameter_m: 1.25),
+        (id: "mount", position_m: (x: 0.0, y: 0.0, z: -0.175), direction: (x: 0.0, y: 0.0, z: -1.0), diameter_m: 1.25),
+    ],
+    scale: None,
+    collider: Cylinder(radius_m: 0.625, half_height_m: 0.175),
+    aero: (
+        cd_curve: [(mach: 0.0, coeff: 0.5), (mach: 8.0, coeff: 0.32)],
+        cl_curve: [(mach: 0.0, coeff: 0.0)],
+        ref_len_m: 0.35,
+    ),
+    thermal: (
+        heat_capacity_j_per_k: 60_000.0,
+        max_temp_k: 1000.0,
+        emissivity: 0.65,
+        conduction_w_per_k: 50.0,
+    ),
+    structural: (
+        // The capture ring is the load path two latched vessels hang
+        // off — built heavier than its mass suggests.
+        max_axial_n: 400_000.0,
+        max_shear_n: 160_000.0,
+        max_torque_nm: 25_000.0,
+    ),
+    variants: [
+        (id: "stock", display_name: "part.variant.stock", cost_multiplier: 1.0, stat_multipliers: []),
+    ],
+    modules: [
+        DockPort(size: Medium, node: "face"),
+    ],
+    reliability: (
+        base_mtbf_s: 2_500_000.0,
+        infant_mortality: 0.06,
+        qualification_curve: (knots: [
+            (qualification_units: 0.0,   hazard_multiplier: 1.0),
+            (qualification_units: 100.0, hazard_multiplier: 0.5),
+        ]),
+        regime_stress: [
+            (kind: ExcessG,         threshold: 15.0, multiplier: 2.0),
+            (kind: Overtemperature, threshold: 0.9,  multiplier: 3.0),
+        ],
+        dormant_stress: 0.01,
+        failure_modes: [
+            (PanelJam,    0.6),
+            (SensorFault, 0.4),
+        ],
+    ),
+    tech_requirement: "tech.rocketry.3",
+)

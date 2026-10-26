@@ -103,6 +103,13 @@ fn craft_mass_kg(craft: &crate::CraftDef) -> f64 {
 }
 
 impl crate::World {
+    /// The live build-order arena — observation only (the `economy()`
+    /// precedent): the UI's "build order in progress" rows and tests
+    /// read it; mutation is the apply/event pair's job.
+    pub fn builds(&self) -> &BTreeMap<BuildId, ActiveBuild> {
+        &self.builds
+    }
+
     /// `ManufactureCraft` — the reservation: validate site, craft,
     /// BOM, funds, and the vessel-cap slot, then spend everything and
     /// schedule the delivery. Nothing about the craft exists until
@@ -269,12 +276,69 @@ impl crate::World {
         self.deliver_built_vessel(b, shadow)
     }
 
+    /// The berth check for [`Self::deliver_built_vessel`]: weld the
+    /// finished craft, pose it where the site would deliver it, and
+    /// run the same `spawn_site_occupied` predicate the launch
+    /// pre-flight and `SpawnPhysicalVessel` apply share — a parked
+    /// or in-bubble hull claiming the site defers the delivery. A
+    /// weld failure or a world without physics cannot block: the
+    /// order's weld gate already ran at apply, and a physics-less
+    /// world has no contact model to overlap in.
+    fn delivery_blocked(&self, b: &ActiveBuild) -> bool {
+        let (Some(def), Some(physics)) = (self.site_defs.get(&b.site), self.physics.as_ref())
+        else {
+            return false;
+        };
+        let Ok(mut candidate) = csp_phys::weld::weld(&b.craft.graph, &b.craft.parts) else {
+            return false;
+        };
+        let pose = crate::SurfacePose {
+            body: def.body.clone(),
+            latitude_rad: def.latitude_rad,
+            longitude_rad: def.longitude_rad,
+            altitude_m: def.altitude_m,
+            orientation: csp_core::DQuat::IDENTITY,
+        };
+        let (pos, rot, _, _) = crate::bubble::surface_pose_restore(
+            physics.backend.environment(),
+            &pose,
+            candidate.com_local,
+            self.clock,
+        );
+        candidate.pos = pos;
+        candidate.rot = rot;
+        self.spawn_site_occupied(&candidate)
+    }
+
     /// The shared delivery tail — insert the latched vessel record.
+    ///
+    /// W2.6's berth rule: the pad is a single berth. When a vessel
+    /// claims the delivery site at the deadline (parked since the
+    /// order, or a crash-landed hull), the delivery waits — the
+    /// record re-queues with a fresh `ConstructionComplete` one
+    /// sim-second out rather than materializing inside the parked
+    /// craft (coincident hulls ghost-overlap forever, the spawn
+    /// occupancy gate's reason) or evaporating a paid-for build.
     fn deliver_built_vessel(
         &mut self,
         b: ActiveBuild,
         shadow: &mut TickShadow,
     ) -> Result<(), SimError> {
+        if self.delivery_blocked(&b) {
+            let retry_tick = self.clock.ticks().saturating_add(TICK_HZ);
+            self.builds.insert(
+                b.id,
+                ActiveBuild {
+                    complete_tick: retry_tick,
+                    ..b
+                },
+            );
+            return self.schedule_event(
+                EventKind::ConstructionComplete { build: b.id },
+                retry_tick,
+                shadow,
+            );
+        }
         self.shadow_vessels(shadow);
         let id = VesselId(self.next_vessel_id);
         self.next_vessel_id = self
@@ -304,20 +368,37 @@ impl crate::World {
             self.clock.ticks(),
             &mut self.next_part_instance_id,
         )?;
+        // W2.6: the delivery berths the craft the way the pad spawn
+        // did — upright on its belly, not the identity pose buried
+        // `z_min` deep in the pad (the latch record restores verbatim
+        // on unlatch; an embedded or tipped delivery reads as a
+        // crash). `surface_upright` + the belly-depth offset is the
+        // `launch_craft` spawn convention, mirrored here.
+        let belly = csp_phys::weld::weld(&b.craft.graph, &b.craft.parts)
+            .ok()
+            .map(|w| {
+                w.collider
+                    .hulls
+                    .iter()
+                    .flat_map(|h| h.vertices.iter().map(|v| v.z))
+                    .fold(f64::INFINITY, f64::min)
+                    .min(0.0)
+            })
+            .unwrap_or(0.0);
         self.vessels.insert(
             id,
             crate::Vessel {
                 id,
                 craft: Some(b.craft),
                 state: crate::VesselState::SurfaceLatched(crate::SurfacePose {
-                    body: def.body,
+                    body: def.body.clone(),
                     latitude_rad: def.latitude_rad,
                     longitude_rad: def.longitude_rad,
-                    altitude_m: def.altitude_m,
-                    // Identity is the "parked at epoch orientation"
-                    // pose — the body-fixed frame the latched
-                    // convention captures anyway.
-                    orientation: csp_core::DQuat::IDENTITY,
+                    altitude_m: def.altitude_m - belly,
+                    orientation: crate::bubble::surface_upright(
+                        def.latitude_rad,
+                        def.longitude_rad,
+                    ),
                 }),
                 aero_mask: csp_phys::ConfigMask::ALL,
                 thermal,
@@ -401,6 +482,7 @@ mod tests {
                 altitude_m: 0.0,
                 launch: true,
                 resource_yields: vec![],
+                starting_stock: vec![],
             },
         );
         w.set_sites(sites);
@@ -529,6 +611,7 @@ mod tests {
                 altitude_m: 0.0,
                 launch: false,
                 resource_yields: vec![],
+                starting_stock: vec![],
             },
         );
         w.set_sites(sites);
@@ -588,6 +671,7 @@ mod tests {
                 altitude_m: 0.0,
                 launch: true,
                 resource_yields: vec![],
+                starting_stock: vec![],
             },
         )]));
         r.step_frame(300).unwrap();

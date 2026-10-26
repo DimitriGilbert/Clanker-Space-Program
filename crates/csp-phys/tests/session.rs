@@ -138,12 +138,14 @@ fn save_load_preserves_ids_and_bytes_are_canonical() {
         .unwrap();
     // Remove and re-add nothing — but poke the allocator so `next_id`
     // is ahead of the live set (a hole the file must preserve). The pod
-    // top is 0.625-class; the battery's `bottom` node matches it.
+    // top is 0.625-class; the chute's `mount` node matches it (the
+    // snap transform reorients the radial mount — the size class is
+    // what the attach gate reads).
     let spare = s
         .add_part(
             &defs,
-            stock("csp.battery.z1k"),
-            AttachEdge::new(ids[0], "top", "bottom"),
+            stock("csp.chute.s125"),
+            AttachEdge::new(ids[0], "top", "mount"),
         )
         .unwrap();
     s.remove_part(spare).unwrap();
@@ -165,8 +167,8 @@ fn save_load_preserves_ids_and_bytes_are_canonical() {
     let n = loaded
         .add_part(
             &defs,
-            stock("csp.battery.z1k"),
-            AttachEdge::new(ids[0], "top", "bottom"),
+            stock("csp.chute.s125"),
+            AttachEdge::new(ids[0], "top", "mount"),
         )
         .unwrap();
     assert!(n.0 > spare.0, "allocator continued past the hole");

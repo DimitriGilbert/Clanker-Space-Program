@@ -241,6 +241,7 @@ pub fn colony_production_run(months: u64) -> Result<ColonyEconomyReport, SimErro
             altitude_m: 0.0,
             launch: false,
             resource_yields: vec![(ore.clone(), 1.0)],
+            starting_stock: vec![],
         },
     )]));
     // The authored shape: a constant-power generator, a drill

@@ -36,11 +36,11 @@
 use std::collections::BTreeMap;
 
 use bevy_ecs::prelude::*;
-use csp_core::{DVec3, SimTime, TICK_HZ};
+use csp_core::{DVec3, SimError, SimTime, TICK_HZ};
 use csp_data::{BodyId, KeplerElements};
 use csp_render::map::{MapMesh, MapPacket, MapVertex};
-use csp_sim::orbit::{OrbitModel, OrbitState, PatchedConics};
-use csp_sim::{ManeuverNode, VesselId, World as SimWorld};
+use csp_sim::orbit::{OrbitModel, OrbitState, PatchedConics, SoiDirection};
+use csp_sim::{ManeuverNode, ManeuverStatus, SimCommand, VesselId, World as SimWorld};
 
 // ---------------------------------------------------------------------------
 // Tunables (presentation constants — §8.3 owns sim tuning; these are view
@@ -106,6 +106,28 @@ const STAR_COLOR: [f32; 4] = [1.0, 0.85, 0.35, 1.0];
 /// Surface-site marker/label color — a cool cyan so a pad or recovery
 /// field reads distinct from bodies, vessels, and maneuver nodes.
 const SITE_COLOR: [f32; 4] = [0.45, 0.85, 0.90, 1.0];
+/// W2.4: the staged transfer plan's conic + its encounter marker —
+/// a violet that reads "planned route" against the flown orange and
+/// the node green.
+const PLAN_COLOR: [f32; 4] = [0.68, 0.50, 1.0, 1.0];
+/// W2.4: an `Enter` encounter marker (SOI entry is the leg the player
+/// aimed for — it reads like a node).
+const ENCOUNTER_ENTER_COLOR: [f32; 4] = [0.45, 0.95, 0.65, 1.0];
+/// W2.4: an `Exit` encounter marker — the neutral vessel tint.
+const ENCOUNTER_EXIT_COLOR: [f32; 4] = [1.0, 0.70, 0.35, 1.0];
+/// W2.4: an approach the model reports as impacting (`pe < radius`).
+const ENCOUNTER_IMPACT_COLOR: [f32; 4] = [1.0, 0.35, 0.30, 1.0];
+/// Grace ticks past an armed alarm's tick before it is reported as
+/// lapsed rather than fired — long enough to cover the enqueue →
+/// drain → `clock+1` clamp chain (a `SetAlarm` can legally fire one
+/// tick *after* the requested tick), short enough that a rejected
+/// command's row stops pretending it is armed within seconds.
+const ALARM_LAPSE_TICKS: u64 = 2 * TICK_HZ;
+/// The alarm book's cap — oldest dismissed-eligible rows drop first
+/// so a script/alarm storm cannot grow the panel unboundedly.
+const ALARM_BOOK_CAP: usize = 32;
+/// Segments per drawn SOI ring — matches the orbit-line density.
+const SOI_RING_SAMPLES: usize = 64;
 /// Assigned round-robin to non-star bodies.
 const BODY_PALETTE: [[f32; 4]; 5] = [
     [0.35, 0.65, 1.0, 1.0],
@@ -446,17 +468,30 @@ pub(crate) fn apply_map_input(
 /// Positions are NOT staged: they derive from `OrbitModelRes` at the
 /// snapshot tick inside `map_present` — one place does all orbit
 /// evaluation.
+/// One map-side vessel row — `(id, orbit state, armed node,
+/// on-rails flag, burn estimate)`. W2.4's burn estimate pushed the
+/// tuple to five fields; the alias keeps the snapshot legible.
+pub type VesselMapRow = (
+    VesselId,
+    OrbitState,
+    Option<ManeuverNode>,
+    bool,
+    Option<f64>,
+);
+
 #[derive(Resource, Default)]
 pub(crate) struct MapSyncInput {
     /// The sim clock the vessel states were read at.
     pub tick: SimTime,
-    /// Every vessel's `(id, orbit, scheduled node, on_rails)` —
+    /// Every vessel's `(id, orbit, scheduled node, on_rails, burn_s)` —
     /// ascending-id order. `on_rails` marks the residence the entry's
     /// conic came from: a stored conic for `OnRails`, a freshly fitted
     /// osculating conic for `InBubble` — the distinction the maneuver
     /// panel needs (a `SetManeuver` applies only to an on-rails
-    /// vessel; P09-F2).
-    pub vessels: Vec<(VesselId, OrbitState, Option<ManeuverNode>, bool)>,
+    /// vessel; P09-F2). `burn_s` is the node's estimated burn duration
+    /// (Δv ÷ full-thrust accel over the stored craft) — `None` for a
+    /// craft-less or thrust-less vessel or no armed node.
+    pub vessels: Vec<VesselMapRow>,
 }
 
 /// The Sync-written map mirror — what Presentation and UiBuild read.
@@ -465,7 +500,7 @@ pub struct MapSnapshot {
     /// The sim tick this snapshot was taken at.
     pub tick: SimTime,
     /// See [`MapSyncInput::vessels`].
-    pub vessels: Vec<(VesselId, OrbitState, Option<ManeuverNode>, bool)>,
+    pub vessels: Vec<VesselMapRow>,
 }
 
 /// `Sync` schedule system: copy the staged map input into the mirror,
@@ -541,6 +576,36 @@ pub struct MapScene {
     /// only while the camera is focused on the site body inside a few
     /// radii, drawn as ring markers by `extract_map`.
     pub(crate) site_markers: Vec<DVec3>,
+    /// W2.4: predicted SOI encounter anchors — `(system-frame pos,
+    /// color)` pairs drawn as ring markers by `extract_map`. See
+    /// [`refresh_planning`].
+    pub(crate) encounter_marks: Vec<(DVec3, [f32; 4])>,
+    /// W2.4: SOI boundary rings — `(center, radius_m, color)` circles
+    /// in the ecliptic plane, regenerated per frame from the staged
+    /// ring set (the focused body, planned-transfer endpoints, and
+    /// `Enter`-encounter targets).
+    pub(crate) soi_rings: Vec<(DVec3, f64, [f32; 4])>,
+    /// W2.4: the staged transfer plan's conic — `(parent, polyline)`,
+    /// parent-centred like every sampled line. `None` while no plan
+    /// is staged (or its conic is unsampleable).
+    plan_line: Option<(BodyId, Vec<DVec3>)>,
+    /// The staged plan's invalidation key — its departure tick. A
+    /// re-planned transfer re-samples; an unchanged one rides.
+    plan_line_key: Option<u64>,
+    /// W2.4: Ap/Pe points on the focused vessel's predicted post-burn
+    /// conic — drawn in [`NODE_COLOR`] rings, distinct from the flown
+    /// conic's apsides.
+    pub(crate) pred_apsis: Vec<DVec3>,
+    /// §2.5's `presentation_tick`: the non-authoritative f64 tick the
+    /// map evaluates positions at — advanced by wall-dt × the stored
+    /// warp level and clamped to `[prev_snap_tick, snap.tick]` so it
+    /// may lie between the pre- and post-advance clock but never
+    /// extrapolates past what the sim produced.
+    present_tick: f64,
+    /// The last frame's snapshot tick — `present_tick`'s lower clamp.
+    prev_snap_tick: u64,
+    /// `false` until the first `map_present` anchors `present_tick`.
+    present_init: bool,
 }
 
 /// One vessel's cached orbit line: the quantized staleness key, the
@@ -701,8 +766,510 @@ pub enum MapFocusTarget {
 pub struct MapFrame(pub Option<MapPacket>);
 
 // ---------------------------------------------------------------------------
-// Presentation: orbit evaluation, polyline sampling, camera solve, labels
+// W2.4 — planning surface: the alarm book + the staged transfer plan
+// (PLAN §4 v1/M5, the KAC-equivalent row). Session state (§2.2-C):
+// the sim's event heap is authoritative; these mirror what the player
+// asked for and what `fired_events` confirmed.
 // ---------------------------------------------------------------------------
+
+/// What kind of deadline one alarm-book entry rides — the field the
+/// fired-event matcher keys on (`PlayerAlarm` by label,
+/// `TransferWindow` by body pair).
+#[derive(Clone, Debug)]
+pub enum AlarmKind {
+    /// A `SetAlarm` product — matches `EventKind::PlayerAlarm` by
+    /// label (the sim carries no id; the label is the handle).
+    Manual,
+    /// A `WatchTransferWindow` product — matches
+    /// `EventKind::TransferWindow` on `(origin, destination)`.
+    Window {
+        /// The departure body.
+        origin: BodyId,
+        /// The arrival body.
+        destination: BodyId,
+    },
+}
+
+/// One alarm the player armed through the planning panel — the
+/// panel's mirror of a scheduled `PlayerAlarm`/`TransferWindow`
+/// event. It counts down, flips to `Fired` when
+/// `AdvanceReport::fired_events` shows the event, or `Lapsed` when
+/// its tick passed unobserved (a drain-time rejection, or a past-tick
+/// request the apply re-clamped — honest either way).
+#[derive(Clone, Debug)]
+pub struct AlarmEntry {
+    /// The requested fire tick (`SetAlarm`/`WatchTransferWindow` may
+    /// still clamp it to `clock+1` at drain — display is approximate).
+    pub tick: u64,
+    /// The player's label (or the panel's generated one).
+    pub label: String,
+    /// What the entry names.
+    pub kind: AlarmKind,
+    /// The tick the matching event fired at, once observed.
+    pub fired: Option<u64>,
+    /// `tick + ALARM_LAPSE_TICKS` passed with no matching fire — the
+    /// command never landed. Set by [`MapPlanning::alarm_rows`].
+    pub lapsed: bool,
+}
+
+/// The W2.4 planning session state — the alarm book plus the staged
+/// `plan_transfer` result. Presentation-session data only: written
+/// inside `UiBuild`/`sim_step` plumbing, read by `map_present` and
+/// the panel. Never sim state, never logged, never hashed.
+#[derive(Resource, Default)]
+pub struct MapPlanning {
+    /// Alarms/watches armed through the panel (plus unmatched fires
+    /// recorded as fired rows — see [`Self::note_fired`]).
+    pub alarms: Vec<AlarmEntry>,
+    /// The last `plan_transfer` result + its resolutions.
+    pub plan: Option<PlannedTransfer>,
+    /// The last planner failure's reason ("no feasible cell in
+    /// window", "bodies share no parent") — the panel's error line.
+    pub plan_error: Option<String>,
+}
+
+/// The last `plan_transfer` result staged for the panel + the map:
+/// the plan itself (conic drawn as the planned route), the resolved
+/// `departure_node` for the picked vessel, the first predicted
+/// encounter, and the honest failure strings for each leg that could
+/// not resolve.
+pub struct PlannedTransfer {
+    /// The refined plan (bodies, ticks, leg, transfer conic).
+    pub plan: csp_sim::transfer::TransferPlan,
+    /// `departure_node` for the picked vessel — `Some` only when the
+    /// ejection geometry solved AND the node still sits ahead of the
+    /// clock it was resolved against.
+    pub node: Option<csp_sim::transfer::DepartureNode>,
+    /// The vessel the node was resolved for (`None` = no eligible
+    /// pick — the button stays unoffered, not dead).
+    pub node_vessel: Option<VesselId>,
+    /// Why no node resolved — the ejection's own refusal text.
+    pub node_error: Option<String>,
+    /// `predict_encounter_excluding` on `plan.conic` — the first real
+    /// SOI crossing with the origin's egress filtered out.
+    pub encounter: Option<csp_sim::transfer::EncounterPrediction>,
+}
+
+impl MapPlanning {
+    /// Fold `AdvanceReport::fired_events` into the book: mark each
+    /// armed entry fired on its first matching `PlayerAlarm` /
+    /// `TransferWindow`, and record an unmatched fire as a fired row
+    /// of its own — an alarm the panel never armed (a script's, an
+    /// MCP-set one) still surfaces rather than vanishing.
+    pub(crate) fn note_fired(&mut self, events: &[csp_sim::events::ScheduledEvent]) {
+        use csp_sim::events::EventKind as K;
+        for e in events {
+            let (label, kind): (String, AlarmKind) = match &e.kind {
+                K::PlayerAlarm { label } => (label.clone(), AlarmKind::Manual),
+                K::TransferWindow {
+                    origin,
+                    destination,
+                } => (
+                    format!("{origin} → {destination} window"),
+                    AlarmKind::Window {
+                        origin: origin.clone(),
+                        destination: destination.clone(),
+                    },
+                ),
+                _ => continue,
+            };
+            let matches = |a: &&mut AlarmEntry| -> bool {
+                a.fired.is_none()
+                    && match (&a.kind, &kind) {
+                        (AlarmKind::Manual, AlarmKind::Manual) => a.label == label,
+                        (
+                            AlarmKind::Window {
+                                origin: o1,
+                                destination: d1,
+                            },
+                            AlarmKind::Window {
+                                origin: o2,
+                                destination: d2,
+                            },
+                        ) => o1 == o2 && d1 == d2,
+                        _ => false,
+                    }
+            };
+            match self.alarms.iter_mut().find(matches) {
+                Some(a) => a.fired = Some(e.tick),
+                None => self.alarms.push(AlarmEntry {
+                    tick: e.tick,
+                    label,
+                    kind,
+                    fired: Some(e.tick),
+                    lapsed: false,
+                }),
+            }
+        }
+        // Bound the book: drop fired/lapsed rows oldest-first past the
+        // cap (armed rows are never evicted — an armed alarm can only
+        // leave by firing or lapsing).
+        while self.alarms.len() > ALARM_BOOK_CAP
+            && let Some(i) = self
+                .alarms
+                .iter()
+                .position(|a| a.fired.is_some() || a.lapsed)
+        {
+            self.alarms.remove(i);
+        }
+    }
+
+    /// The panel's alarm rows — resolved against `now`, marking
+    /// lapsed entries in place (an armed entry `ALARM_LAPSE_TICKS`
+    /// past its tick with no observed fire never landed).
+    pub(crate) fn alarm_rows(&mut self, now: u64) -> Vec<csp_ui::AlarmRow> {
+        let hz = TICK_HZ as f64;
+        let mut rows = Vec::with_capacity(self.alarms.len());
+        for (i, a) in self.alarms.iter_mut().enumerate() {
+            if a.fired.is_none() && !a.lapsed && now > a.tick.saturating_add(ALARM_LAPSE_TICKS) {
+                a.lapsed = true;
+            }
+            rows.push(csp_ui::AlarmRow {
+                label: a.label.clone(),
+                eta_s: (a.tick as i64 - now as i64) as f64 / hz,
+                state: if a.fired.is_some() {
+                    csp_ui::AlarmState::Fired
+                } else if a.lapsed {
+                    csp_ui::AlarmState::Lapsed
+                } else {
+                    csp_ui::AlarmState::Armed
+                },
+                index: i,
+            });
+        }
+        rows
+    }
+
+    /// The panel's plan row — `tick` resolves the countdowns.
+    pub(crate) fn plan_row(&self, tick: u64) -> Option<csp_ui::PlanRow> {
+        let p = self.plan.as_ref()?;
+        let hz = TICK_HZ as f64;
+        let until = |t: u64| (t as i64 - tick as i64) as f64 / hz;
+        Some(csp_ui::PlanRow {
+            origin: p.plan.origin.to_string(),
+            destination: p.plan.destination.to_string(),
+            depart_in_s: until(p.plan.departure_tick),
+            duration_s: p.plan.duration_ticks as f64 / hz,
+            dv_depart_mps: p.plan.leg.dv_depart_mps,
+            dv_arrive_mps: p.plan.leg.dv_arrive_mps,
+            node: p
+                .node
+                .as_ref()
+                .zip(p.node_vessel)
+                .map(|(n, v)| csp_ui::PlanNodeRow {
+                    vessel: v.0,
+                    in_s: until(n.tick),
+                    dv_mps: (n.dv_prograde_mps * n.dv_prograde_mps
+                        + n.dv_normal_mps * n.dv_normal_mps
+                        + n.dv_radial_mps * n.dv_radial_mps)
+                        .sqrt(),
+                }),
+            node_error: p.node_error.clone(),
+            encounter: p.encounter.as_ref().map(|e| csp_ui::PlanEncounterRow {
+                body: e.event.body.to_string(),
+                enter: e.event.direction == SoiDirection::Enter,
+                in_s: until(e.event.tick),
+                periapsis_m: e.approach.as_ref().map(|a| a.periapsis_m),
+                v_inf_mps: e.approach.as_ref().and_then(|a| a.v_inf_mps),
+                impacts: e.approach.as_ref().and_then(|a| a.impacts),
+            }),
+        })
+    }
+}
+
+/// The `PorkchopQuery` the panel's "Find window" implies — the same
+/// shape the sim's own transfer tests use, generalized to any
+/// sibling pair: departure window `[now + 1 day, now + 0.9·synodic]`,
+/// duration window `[0.4, 1.6]·T_hohmann`, 24×24 cells, zero-rev
+/// legs, Oberth-priced departure against `park_r` and v∞ arrival.
+fn porkchop_query(
+    model: &PatchedConics,
+    origin: &BodyId,
+    destination: &BodyId,
+    now: SimTime,
+    park_r: f64,
+) -> Result<csp_sim::transfer::PorkchopQuery, SimError> {
+    let o = model.body_orbit(origin)?;
+    let d = model.body_orbit(destination)?;
+    let (Some(oe), Some(de)) = (&o.elements, &d.elements) else {
+        return Err(SimError::Recoverable("plan: endpoint has no orbit"));
+    };
+    let (Some(op), Some(dp)) = (&o.parent, &d.parent) else {
+        return Err(SimError::Recoverable("plan: bodies share no parent"));
+    };
+    if op != dp {
+        return Err(SimError::Recoverable("plan: bodies share no parent"));
+    }
+    let mu_p = model.body_orbit(op)?.mu_m3_per_s2;
+    let hz = TICK_HZ as f64;
+    let n = |a: f64| (mu_p / (a * a * a)).sqrt();
+    let synodic_s = core::f64::consts::TAU
+        / (n(oe.semi_major_axis_m) - n(de.semi_major_axis_m))
+            .abs()
+            .max(1e-12);
+    let a_t = (oe.semi_major_axis_m + de.semi_major_axis_m) * 0.5;
+    let t_h_s = core::f64::consts::PI * (a_t * a_t * a_t / mu_p).sqrt();
+    Ok(csp_sim::transfer::PorkchopQuery {
+        origin: origin.clone(),
+        destination: destination.clone(),
+        depart_lo: now.ticks().saturating_add(21_600 * TICK_HZ),
+        depart_hi: now.ticks().saturating_add((synodic_s * 0.9 * hz) as u64),
+        duration_lo: (t_h_s * 0.4 * hz) as u64,
+        duration_hi: (t_h_s * 1.6 * hz).max(t_h_s * 0.4 * hz + 64.0) as u64,
+        depart_cells: 24,
+        duration_cells: 24,
+        depart_cost: csp_sim::transfer::EndCost::CircularPark(park_r),
+        arrive_cost: csp_sim::transfer::EndCost::AtInfinity,
+        max_revs: 0,
+    })
+}
+
+/// Resolve one [`csp_ui::PlanningCommand`] — panel output translated
+/// into its sim effect. `SetAlarm`/`WatchTransferWindow`/`SetManeuver`
+/// become `SimCommand`s on `out` (the outbox's next-tick hand-off,
+/// §2.5); the planner calls (`plan_transfer`/`departure_node`/
+/// `predict_encounter`) run on the spot — they are pure queries over
+/// the data-derived orbit model, not sim state — and stage their
+/// result in `planning` for the next frame's display + draw.
+/// `picked_vessel` is the panel's departure-vessel pick.
+///
+/// Every resolution happens HERE, against the same mirrors the panel
+/// was drawn from — a stale panel can never smuggle a command the
+/// mirrors stopped justifying (the `program_command` drop rule's
+/// sibling).
+#[allow(clippy::too_many_lines)] // one verb = one arm, like program_command
+pub(crate) fn resolve_planning_command(
+    cmd: csp_ui::PlanningCommand,
+    model: &PatchedConics,
+    snap: &MapSnapshot,
+    focus_vessel: Option<VesselId>,
+    picked_vessel: Option<VesselId>,
+    planning: &mut MapPlanning,
+    out: &mut Vec<SimCommand>,
+) {
+    use csp_ui::PlanningCommand as C;
+    let now = snap.tick;
+    let hz = TICK_HZ as f64;
+    match cmd {
+        C::FindWindow {
+            origin,
+            destination,
+        } => {
+            let (origin, destination) = (BodyId::from(origin), BodyId::from(destination));
+            // The departure pricing's parking radius: the picked
+            // vessel's semi-major axis when it orbits the origin (the
+            // burn it would actually fly), else the KSP-standard
+            // low orbit stand-in of radius + 200 km.
+            let park_r = picked_vessel
+                .and_then(|vid| snap.vessels.iter().find(|(id, ..)| *id == vid))
+                .filter(|(_, o, ..)| o.parent == origin)
+                .map(|(_, o, ..)| o.elements.semi_major_axis_m.abs())
+                .or_else(|| model.body_radius(&origin).map(|r| r + 2.0e5))
+                .unwrap_or(1.0e6);
+            planning.plan_error = None;
+            planning.plan = None;
+            match porkchop_query(model, &origin, &destination, now, park_r)
+                .and_then(|q| csp_sim::transfer::plan_transfer(model, &q))
+            {
+                Ok(plan) => {
+                    // The departure burn for the picked vessel — an
+                    // eligible pick rides a closed orbit about the
+                    // plan's origin (the ejection's own precondition).
+                    let (node, node_vessel, node_error) = match picked_vessel.and_then(|vid| {
+                        snap.vessels
+                            .iter()
+                            .find(|(id, ..)| *id == vid)
+                            .map(|(_, o, ..)| (vid, o))
+                    }) {
+                        Some((vid, orbit)) => {
+                            match csp_sim::transfer::departure_node(model, orbit, &plan, now) {
+                                Ok(n) => (Some(n), Some(vid), None),
+                                Err(e) => (None, None, Some(e.reason().to_string())),
+                            }
+                        }
+                        None => (None, None, None),
+                    };
+                    // First real encounter on the transfer conic —
+                    // the origin's egress is excluded (the conic is
+                    // stamped at the origin's centre, so the exit is
+                    // never a residence in its frame).
+                    let horizon = SimTime::from_ticks(
+                        plan.arrival_tick
+                            .saturating_add(plan.duration_ticks / 4)
+                            .max(now.ticks() + 1),
+                    );
+                    let encounter = csp_sim::transfer::predict_encounter_excluding(
+                        model,
+                        &plan.conic,
+                        SimTime::from_ticks(plan.departure_tick.max(now.ticks() + 1)),
+                        horizon,
+                        None,
+                        Some(&plan.origin),
+                    )
+                    .ok()
+                    .flatten();
+                    planning.plan = Some(PlannedTransfer {
+                        plan,
+                        node,
+                        node_vessel,
+                        node_error,
+                        encounter,
+                    });
+                }
+                Err(e) => {
+                    planning.plan_error = Some(e.reason().to_string());
+                }
+            }
+        }
+        C::ArmAlarm { label, in_s } => {
+            let tick = now.ticks().saturating_add((in_s.max(0.0) * hz) as u64 + 1);
+            planning.alarms.push(AlarmEntry {
+                tick,
+                label: label.clone(),
+                kind: AlarmKind::Manual,
+                fired: None,
+                lapsed: false,
+            });
+            out.push(SimCommand::SetAlarm { tick, label });
+        }
+        C::ArmApsis { apoapsis } => {
+            let Some(orbit) = focus_vessel
+                .and_then(|id| snap.vessels.iter().find(|(vid, ..)| *vid == id))
+                .map(|(_, o, ..)| o)
+            else {
+                return;
+            };
+            let Ok(mu) = model.body_orbit(&orbit.parent).map(|b| b.mu_m3_per_s2) else {
+                return;
+            };
+            let Ok(Some(tick)) = csp_sim::scripts::resolve_apsis_ticks(
+                &orbit.elements,
+                mu,
+                orbit.epoch.ticks(),
+                now.ticks(),
+                apoapsis,
+            ) else {
+                return;
+            };
+            let label = format!(
+                "vessel {} {}",
+                focus_vessel.map_or(0, |v| v.0),
+                if apoapsis { "apoapsis" } else { "periapsis" }
+            );
+            planning.alarms.push(AlarmEntry {
+                tick,
+                label: label.clone(),
+                kind: AlarmKind::Manual,
+                fired: None,
+                lapsed: false,
+            });
+            out.push(SimCommand::SetAlarm { tick, label });
+        }
+        C::ArmNodeAlarm => {
+            let Some(node) = focus_vessel
+                .and_then(|id| snap.vessels.iter().find(|(vid, ..)| *vid == id))
+                .and_then(|(_, _, n, ..)| n.as_ref())
+            else {
+                return;
+            };
+            let label = format!("vessel {} maneuver node", focus_vessel.map_or(0, |v| v.0));
+            planning.alarms.push(AlarmEntry {
+                tick: node.tick,
+                label: label.clone(),
+                kind: AlarmKind::Manual,
+                fired: None,
+                lapsed: false,
+            });
+            out.push(SimCommand::SetAlarm {
+                tick: node.tick,
+                label,
+            });
+        }
+        C::WatchWindow => {
+            let Some(plan) = planning.plan.as_ref().map(|p| &p.plan) else {
+                return;
+            };
+            planning.alarms.push(AlarmEntry {
+                tick: plan.departure_tick,
+                label: format!("{} → {} window", plan.origin, plan.destination),
+                kind: AlarmKind::Window {
+                    origin: plan.origin.clone(),
+                    destination: plan.destination.clone(),
+                },
+                fired: None,
+                lapsed: false,
+            });
+            out.push(SimCommand::WatchTransferWindow {
+                origin: plan.origin.clone(),
+                destination: plan.destination.clone(),
+                tick: plan.departure_tick,
+            });
+        }
+        C::ArmWindowAlarm => {
+            let Some(plan) = planning.plan.as_ref().map(|p| &p.plan) else {
+                return;
+            };
+            let label = format!("{} → {} window", plan.origin, plan.destination);
+            planning.alarms.push(AlarmEntry {
+                tick: plan.departure_tick,
+                label: label.clone(),
+                kind: AlarmKind::Manual,
+                fired: None,
+                lapsed: false,
+            });
+            out.push(SimCommand::SetAlarm {
+                tick: plan.departure_tick,
+                label,
+            });
+        }
+        C::CreateNode { vessel } => {
+            let Some(plan) = planning.plan.as_ref().map(|p| &p.plan) else {
+                return;
+            };
+            let Some(orbit) = snap
+                .vessels
+                .iter()
+                .find(|(id, ..)| *id == VesselId(vessel))
+                .map(|(_, o, ..)| o)
+            else {
+                planning.plan_error = Some(format!("vessel {vessel} left the snapshot"));
+                return;
+            };
+            // Re-resolve against the CURRENT orbit + clock — the
+            // staged node could sit in the past by press time, and
+            // `departure_node` refuses `tick <= now` rather than
+            // producing a mis-phased burn.
+            match csp_sim::transfer::departure_node(model, orbit, plan, now) {
+                Ok(n) => {
+                    out.push(SimCommand::SetManeuver {
+                        vessel: VesselId(vessel),
+                        tick: n.tick,
+                        dv_prograde_mps: n.dv_prograde_mps,
+                        dv_normal_mps: n.dv_normal_mps,
+                        dv_radial_mps: n.dv_radial_mps,
+                    });
+                }
+                Err(e) => {
+                    if let Some(p) = planning.plan.as_mut() {
+                        p.node_error = Some(e.reason().to_string());
+                    }
+                }
+            }
+        }
+        C::DismissAlarm { index } => {
+            // Only a resolved row may leave — an armed alarm cannot
+            // be cancelled (the sim has no unschedule verb), so the
+            // button is never offered for one; re-check honestly.
+            if planning
+                .alarms
+                .get(index)
+                .is_some_and(|a| a.fired.is_some() || a.lapsed)
+            {
+                planning.alarms.remove(index);
+            }
+        }
+    }
+}
 
 /// `Presentation` schedule system — all map derivation in one place
 /// (§2.5 #4: "camera solve, LOD selection"). Runs only in map mode;
@@ -717,6 +1284,9 @@ pub(crate) fn map_present(
     sites: Res<crate::structures::SiteTable>,
     flight_snap: Res<crate::flight::FlightSnapshot>,
     loc: Res<crate::LocStrings>,
+    session: Res<crate::SessionMirror>,
+    warp: Res<crate::WarpMirror>,
+    planning: Res<MapPlanning>,
     mut scene: ResMut<MapScene>,
     mut cam: ResMut<MapCameraF64>,
     mut ui: ResMut<MapUiData>,
@@ -728,19 +1298,43 @@ pub(crate) fn map_present(
     let model = &model.0;
     let t = snap.tick;
 
+    // §2.5's `presentation_tick`: a separate, non-authoritative f64
+    // clock that may lie between the pre- and post-advance clock.
+    // Advanced by wall-dt × the stored warp level — the same rate the
+    // sim advances — then clamped to the snapshot so it never
+    // extrapolates past what the sim produced. Under rails warp this
+    // is what keeps ~18-sim-minute-per-frame position jumps from
+    // strobing: the marker lands at the wall-time-proportional point
+    // each frame instead of the integer-tick grid.
+    {
+        let now_tick = t.ticks() as f64;
+        let rate_tps = f64::from(warp.0) * TICK_HZ as f64;
+        let dt_s = (session.dt_wall_ms / 1000.0).clamp(0.0, 0.1);
+        if !scene.present_init || scene.present_tick > now_tick {
+            scene.present_tick = now_tick; // first frame, or a rewound clock
+        }
+        scene.present_init = true;
+        scene.present_tick = (scene.present_tick + dt_s * rate_tps).min(now_tick);
+        scene.prev_snap_tick = scene.prev_snap_tick.min(t.ticks());
+    }
+    let pt = scene.present_tick.max(scene.prev_snap_tick as f64);
+    scene.prev_snap_tick = t.ticks();
+
     // System-frame positions: bodies via the parent chain, vessels via
-    // state_at + their parent's position.
+    // state_at + their parent's position — all evaluated at `pt`, the
+    // fractional presentation tick (integer-floor/ceil lerp; the
+    // conic solve only speaks whole ticks).
     scene.body_pos.clear();
     for body in &table.bodies {
         scene
             .body_pos
-            .push(body_system_pos(model, &body.id, t).ok());
+            .push(body_system_pos_frac(model, &body.id, pt).ok());
     }
     scene.vessel_pos.clear();
-    for (_id, orbit, _node, _rails) in &snap.vessels {
+    for (_id, orbit, ..) in &snap.vessels {
         let pos = (|| {
-            let (r, _v) = model.state_at(orbit, t).ok()?;
-            let parent = body_system_pos(model, &orbit.parent, t).ok()?;
+            let (r, _v) = state_at_frac(model, orbit, pt).ok()?;
+            let parent = body_system_pos_frac(model, &orbit.parent, pt).ok()?;
             Some(parent + r)
         })();
         scene.vessel_pos.push(pos);
@@ -804,7 +1398,7 @@ pub(crate) fn map_present(
             });
         }
     }
-    for ((id, _orbit, _node, _rails), pos) in snap.vessels.iter().zip(scene.vessel_pos.iter()) {
+    for ((id, _orbit, ..), pos) in snap.vessels.iter().zip(scene.vessel_pos.iter()) {
         if let Some(ndc) = pos.and_then(|p| project(&cam, p)) {
             ui.labels.push(csp_ui::MapLabel {
                 ndc,
@@ -819,7 +1413,7 @@ pub(crate) fn map_present(
         }
     }
     // Node labels — the point rides its parent like the lines do.
-    for (id, orbit, node, _rails) in &snap.vessels {
+    for (id, orbit, node, _rails, burn_s) in &snap.vessels {
         let Some(node) = node else { continue };
         let (Some(preview), Some(off)) = (
             scene.node_lines.get(id),
@@ -835,10 +1429,22 @@ pub(crate) fn map_present(
             continue;
         };
         if let Some(ndc) = project(&cam, point + off) {
-            let eta = (node.tick.saturating_sub(t.ticks())) as f64 / TICK_HZ as f64;
+            // W2.4: the node's own status + the staged burn-time
+            // estimate — "T−.. · Δv .. · ~Ns burn" while scheduled,
+            // the remaining Δv while the executor owns the throttle.
+            let text = match &node.status {
+                ManeuverStatus::Burning(b) => {
+                    format!("node BURNING  Δv left {:.0} m/s", b.dv_remaining_mps)
+                }
+                ManeuverStatus::Scheduled => {
+                    let eta = (node.tick.saturating_sub(t.ticks())) as f64 / TICK_HZ as f64;
+                    let est = burn_s.map_or(String::new(), |s| format!("  ~{s:.0} s burn"));
+                    format!("node  T−{eta:.0} s  Δv {:.0} m/s{est}", node.dv_magnitude())
+                }
+            };
             ui.labels.push(csp_ui::MapLabel {
                 ndc,
-                text: format!("node  T−{eta:.0} s  Δv {:.0} m/s", node.dv_magnitude()),
+                text,
                 color: NODE_COLOR,
                 kind: csp_ui::MapLabelKind::Node,
             });
@@ -925,6 +1531,287 @@ pub(crate) fn map_present(
             }
         }
     }
+
+    // W2.4: encounter prediction + SOI rings + the staged transfer
+    // plan's conic — the KAC-equivalent geometry the panel resolves.
+    refresh_planning(
+        model, &input, &snap, &table, &planning, &mut scene, &mut ui, &cam, t,
+    );
+}
+
+/// One [`predict_encounter`]-produced crossing, drawn: the marker at
+/// the crossing point (the conic's own position at the event tick,
+/// riding its parent's current position like the lines do), tinted
+/// by direction — red when the model reports the approach impacts —
+/// plus the labeled readout.
+#[allow(clippy::too_many_arguments)] // one mark = one data bag
+fn push_encounter(
+    model: &PatchedConics,
+    table: &BodyTable,
+    conic: &OrbitState,
+    pred: &csp_sim::transfer::EncounterPrediction,
+    t: SimTime,
+    scene: &mut MapScene,
+    ui: &mut MapUiData,
+    cam: &MapCameraF64,
+) {
+    let ev = &pred.event;
+    let enter = ev.direction == SoiDirection::Enter;
+    let mut label = format!(
+        "{} {} T−{}",
+        if enter { "enters" } else { "leaves" },
+        ev.body,
+        csp_ui::fmt_period((ev.tick.saturating_sub(t.ticks())) as f64 / TICK_HZ as f64),
+    );
+    let mut color = if enter {
+        ENCOUNTER_ENTER_COLOR
+    } else {
+        ENCOUNTER_EXIT_COLOR
+    };
+    if let Some(a) = &pred.approach {
+        let alt = model
+            .body_radius(&ev.body)
+            .map(|r| a.periapsis_m - r)
+            .unwrap_or(a.periapsis_m);
+        label.push_str(&format!("  Pe {}", csp_ui::fmt_distance(alt)));
+        if let Some(v) = a.v_inf_mps {
+            label.push_str(&format!("  v∞ {:.1} km/s", v / 1e3));
+        }
+        if a.impacts == Some(true) {
+            color = ENCOUNTER_IMPACT_COLOR;
+            label.push_str("  IMPACTS");
+        }
+    }
+    let Some(off) = table
+        .index_of(&conic.parent)
+        .and_then(|pi| scene.body_pos.get(pi))
+        .copied()
+        .flatten()
+    else {
+        return;
+    };
+    let Ok((rel, _)) = model.state_at(conic, SimTime::from_ticks(ev.tick)) else {
+        return;
+    };
+    let world = off + rel;
+    scene.encounter_marks.push((world, color));
+    if let Some(ndc) = project(cam, world) {
+        ui.labels.push(csp_ui::MapLabel {
+            ndc,
+            text: label,
+            color,
+            kind: csp_ui::MapLabelKind::Encounter,
+        });
+    }
+}
+
+/// The encounter scan's forward window — the same scale the sim's
+/// §2.6.6 publish uses (a few periods of the tightest closed orbit
+/// in play): 4× the smallest closed period among the conic itself
+/// and its parent's SOI-carrying children; a bounded fallback when
+/// nothing in play is closed.
+fn predict_horizon(model: &PatchedConics, conic: &OrbitState, now: SimTime) -> SimTime {
+    let mut tightest_s = f64::INFINITY;
+    let period = |mu: f64, el: &KeplerElements| {
+        (el.eccentricity < 1.0 - E_PARABOLIC_TOL && el.semi_major_axis_m > 0.0 && mu > 0.0)
+            .then(|| 2.0 * std::f64::consts::PI * (el.semi_major_axis_m.powi(3) / mu).sqrt())
+    };
+    if let Ok(mu) = model.body_orbit(&conic.parent).map(|b| b.mu_m3_per_s2)
+        && let Some(p) = period(mu, &conic.elements)
+    {
+        tightest_s = tightest_s.min(p);
+    }
+    for (id, body) in model.bodies() {
+        if body.parent.as_ref() == Some(&conic.parent)
+            && body.soi_m.is_some()
+            && *id != conic.parent
+            && let Ok(mu) = model.body_orbit(&conic.parent).map(|b| b.mu_m3_per_s2)
+            && let Some(el) = &body.elements
+            && let Some(p) = period(mu, el)
+        {
+            tightest_s = tightest_s.min(p);
+        }
+    }
+    // Fallback: nothing closed in play — a bounded guess, not an
+    // unbounded scan (the budget still caps the work).
+    let span_s = if tightest_s.is_finite() {
+        4.0 * tightest_s
+    } else {
+        86_400.0
+    };
+    SimTime::from_ticks(now.ticks().saturating_add((span_s * TICK_HZ as f64) as u64))
+}
+
+/// The W2.4 geometry pass — the focused vessel's own next SOI
+/// crossing, its predicted post-burn conic's apsides and first
+/// encounter, the staged transfer plan's route line + encounter +
+/// endpoint rings, and the focused body's SOI boundary. Pure queries
+/// over the data-derived model, recomputed each map frame; the
+/// plan's polyline re-samples only when the staged plan changes.
+#[allow(clippy::too_many_arguments)] // one pass = one data bag
+fn refresh_planning(
+    model: &PatchedConics,
+    input: &MapInput,
+    snap: &MapSnapshot,
+    table: &BodyTable,
+    planning: &MapPlanning,
+    scene: &mut MapScene,
+    ui: &mut MapUiData,
+    cam: &MapCameraF64,
+    t: SimTime,
+) {
+    scene.encounter_marks.clear();
+    scene.soi_rings.clear();
+    scene.pred_apsis.clear();
+    if planning.plan.is_none() {
+        scene.plan_line = None;
+        scene.plan_line_key = None;
+    }
+    // Bodies whose SOI ring draws — the focused body plus every body
+    // an Enter mark or the staged plan names.
+    let mut ring_bodies: Vec<BodyId> = Vec::new();
+    let mut ring = |id: &BodyId| {
+        if !ring_bodies.contains(id)
+            && let Some(i) = table.index_of(id)
+            && table.bodies[i].soi_m.is_some()
+        {
+            ring_bodies.push(id.clone());
+        }
+    };
+
+    // The focused vessel's live-conic crossing + the predicted
+    // post-burn conic's apsides and first encounter.
+    if let Some(i) = input.vessel_focus(table)
+        && let Some((_id, orbit, node, ..)) = snap.vessels.get(i)
+    {
+        if let Ok(Some(pred)) = csp_sim::transfer::predict_encounter(
+            model,
+            orbit,
+            t,
+            predict_horizon(model, orbit, t),
+            None,
+        ) {
+            if pred.event.direction == SoiDirection::Enter {
+                ring(&pred.event.body.clone());
+            }
+            push_encounter(model, table, orbit, &pred, t, scene, ui, cam);
+        }
+        if let Some(node) = node
+            && matches!(node.status, ManeuverStatus::Scheduled)
+            && let Ok(pred_conic) = csp_sim::maneuver::predict_maneuver(model, orbit, node)
+        {
+            // Apsides on the predicted conic — the burn's own Ap/Pe,
+            // drawn in node color so they read "planned, not flown".
+            if let Some(parent_pos) = table
+                .index_of(&pred_conic.parent)
+                .and_then(|pi| scene.body_pos.get(pi))
+                .copied()
+                .flatten()
+            {
+                for nu in [0.0, std::f64::consts::PI] {
+                    if nu != 0.0 && pred_conic.elements.eccentricity >= 1.0 - E_PARABOLIC_TOL {
+                        continue;
+                    }
+                    if let Some(rel) = apsis_point(&pred_conic.elements, nu) {
+                        scene.pred_apsis.push(parent_pos + rel);
+                    }
+                }
+            }
+            if let Ok(Some(pred)) = csp_sim::transfer::predict_encounter(
+                model,
+                &pred_conic,
+                t,
+                predict_horizon(model, &pred_conic, t),
+                None,
+            ) {
+                if pred.event.direction == SoiDirection::Enter {
+                    ring(&pred.event.body.clone());
+                }
+                push_encounter(model, table, &pred_conic, &pred, t, scene, ui, cam);
+            }
+        }
+    }
+
+    // The staged transfer plan: the route polyline (re-sampled when
+    // the plan changes), its predicted encounter, and both endpoint
+    // rings — the plan's geometry IS the SOI hand-off.
+    if let Some(planned) = &planning.plan {
+        let plan = &planned.plan;
+        if scene.plan_line_key != Some(plan.departure_tick) {
+            scene.plan_line =
+                sample_orbit(model, &plan.conic).map(|line| (plan.conic.parent.clone(), line));
+            scene.plan_line_key = Some(plan.departure_tick);
+        }
+        if let Some(pred) = &planned.encounter {
+            if pred.event.direction == SoiDirection::Enter {
+                ring(&pred.event.body.clone());
+            }
+            push_encounter(model, table, &plan.conic, pred, t, scene, ui, cam);
+        }
+        ring(&plan.origin.clone());
+        ring(&plan.destination.clone());
+    }
+    // The focused body's own boundary — even with nothing staged, an
+    // SOI circle answers "what am I inside" at a glance.
+    if input.vessel_focus(table).is_none()
+        && let Some(body) = table.bodies.get(input.focus)
+    {
+        ring(&body.id.clone());
+    }
+    // Emit the rings — circles in the ecliptic plane at each body's
+    // current (presentation-tick) position, tinted in the body's own
+    // palette color.
+    for id in &ring_bodies {
+        let Some(i) = table.index_of(id) else {
+            continue;
+        };
+        let (Some(soi), Some(pos)) = (
+            table.bodies[i].soi_m,
+            scene.body_pos.get(i).copied().flatten(),
+        ) else {
+            continue;
+        };
+        let mut color = table.bodies[i].color;
+        color[3] *= 0.6;
+        scene.soi_rings.push((pos, soi, color));
+    }
+}
+
+/// `body_system_pos` at a fractional tick — the §2.5 presentation
+/// tick's evaluation rule: `state_at` speaks whole ticks, so the
+/// position is the floor/ceil evaluations lerped. Positions move at
+/// most ~v·(1/64 s) between ticks — linear interpolation is exact to
+/// far under a texel.
+fn body_system_pos_frac(
+    model: &PatchedConics,
+    id: &BodyId,
+    t: f64,
+) -> Result<DVec3, csp_core::SimError> {
+    let lo = t.max(0.0).floor() as u64;
+    let f = (t.max(0.0) - lo as f64).min(1.0);
+    let p0 = body_system_pos(model, id, SimTime::from_ticks(lo))?;
+    if f <= 0.0 {
+        return Ok(p0);
+    }
+    let p1 = body_system_pos(model, id, SimTime::from_ticks(lo.saturating_add(1)))?;
+    Ok(p0 + (p1 - p0) * f)
+}
+
+/// `state_at` at a fractional tick — the lerp rule
+/// [`body_system_pos_frac`] uses, applied to a vessel's conic.
+fn state_at_frac(
+    model: &PatchedConics,
+    s: &OrbitState,
+    t: f64,
+) -> Result<(DVec3, DVec3), csp_core::SimError> {
+    let lo = t.max(0.0).floor() as u64;
+    let f = (t.max(0.0) - lo as f64).min(1.0);
+    let (r0, v0) = model.state_at(s, SimTime::from_ticks(lo))?;
+    if f <= 0.0 {
+        return Ok((r0, v0));
+    }
+    let (r1, v1) = model.state_at(s, SimTime::from_ticks(lo.saturating_add(1)))?;
+    Ok((r0 + (r1 - r0) * f, v0 + (v1 - v0) * f))
 }
 
 /// The conic the camera is focused on — the focused vessel's orbit or
@@ -1044,7 +1931,7 @@ fn perifocal_to_inertial(v: DVec3, el: &KeplerElements) -> DVec3 {
 /// moves (see [`orbit_line_key`]). Extracted from `map_present` so the
 /// breakup-scenario budget test can drive it directly.
 fn refresh_vessel_lines(model: &PatchedConics, snap: &MapSnapshot, scene: &mut MapScene) {
-    for (id, orbit, _node, _rails) in &snap.vessels {
+    for (id, orbit, ..) in &snap.vessels {
         let key = orbit_line_key(orbit);
         let stale = scene.vessel_lines.get(id).is_none_or(|l| l.key != key);
         if stale {
@@ -1068,7 +1955,7 @@ fn refresh_vessel_lines(model: &PatchedConics, snap: &MapSnapshot, scene: &mut M
 /// the predicted post-burn conic and the node point re-derive only
 /// when the `(orbit, node)` pair they came from changes.
 fn refresh_node_previews(model: &PatchedConics, snap: &MapSnapshot, scene: &mut MapScene) {
-    for (id, orbit, node, _rails) in &snap.vessels {
+    for (id, orbit, node, ..) in &snap.vessels {
         let Some(node) = node else { continue };
         let key = (orbit_line_key(orbit), node.clone());
         let stale = scene.node_lines.get(id).is_none_or(|p| p.key != key);
@@ -1093,7 +1980,7 @@ fn refresh_node_previews(model: &PatchedConics, snap: &MapSnapshot, scene: &mut 
     scene.node_lines.retain(|id, _| {
         snap.vessels
             .iter()
-            .any(|(vid, _, n, _rails)| vid == id && n.is_some())
+            .any(|(vid, _, n, ..)| vid == id && n.is_some())
     });
 }
 
@@ -1101,6 +1988,7 @@ fn refresh_node_previews(model: &PatchedConics, snap: &MapSnapshot, scene: &mut 
 /// `MapPacket` — clip-space vertices only. Points are projected
 /// per-frame (the camera moves); polylines stay cached.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::cognitive_complexity)] // the extract walk is one pass over one snapshot
 pub(crate) fn extract_map(
     input: Res<MapInput>,
     table: Res<BodyTable>,
@@ -1361,6 +2249,73 @@ pub(crate) fn extract_map(
             );
         }
     }
+    // W2.4: SOI boundary rings — ecliptic-plane circles at each
+    // staged body's current position (regenerated per frame: the
+    // centers move with the presentation tick like the markers do).
+    for (center, radius, color) in &scene.soi_rings {
+        let mut pts = Vec::with_capacity(SOI_RING_SAMPLES + 1);
+        for i in 0..=SOI_RING_SAMPLES {
+            let a = 2.0 * std::f64::consts::PI * i as f64 / SOI_RING_SAMPLES as f64;
+            let (s, c) = a.sin_cos();
+            pts.push(*center + DVec3::new(radius * c, radius * s, 0.0));
+        }
+        let mut c = *color;
+        c[3] *= 0.35;
+        emit_polyline(
+            &mut lines.vertices,
+            &pts,
+            DVec3::ZERO,
+            &cam,
+            vp,
+            c,
+            LINE_HALF_WIDTH_PX * 0.7,
+        );
+    }
+    // W2.4: the staged transfer plan's conic — parent-centred like
+    // every sampled line, riding the common parent's position.
+    if let Some((parent, points)) = &scene.plan_line
+        && let Some(off) = parent_pos(parent)
+    {
+        let mut c = PLAN_COLOR;
+        c[3] *= 0.8;
+        emit_polyline(
+            &mut lines.vertices,
+            points,
+            off,
+            &cam,
+            vp,
+            c,
+            LINE_HALF_WIDTH_PX * FOCUS_LINE_WIDTH,
+        );
+    }
+    // W2.4: predicted encounter marks — hollow rings tinted by the
+    // prediction's direction/impact read.
+    for (pos, color) in &scene.encounter_marks {
+        if let Some(ndc) = project(&cam, *pos) {
+            emit_shape(
+                &mut markers.vertices,
+                ndc,
+                APSIS_MARKER_PX * 1.3,
+                vp,
+                *color,
+                MapVertex::KIND_RING,
+            );
+        }
+    }
+    // W2.4: apsides on the predicted post-burn conic — node color,
+    // "planned" like the conic they mark.
+    for p in &scene.pred_apsis {
+        if let Some(ndc) = project(&cam, *p) {
+            emit_shape(
+                &mut markers.vertices,
+                ndc,
+                APSIS_MARKER_PX,
+                vp,
+                NODE_COLOR,
+                MapVertex::KIND_RING,
+            );
+        }
+    }
 
     frame.0 = Some(MapPacket { bg, lines, markers });
 }
@@ -1385,8 +2340,25 @@ pub(crate) fn capture_sync_input(sim: &SimWorld) -> MapSyncInput {
             .vessels()
             .iter()
             .filter_map(|(id, v)| {
+                // W2.4: the node label's burn-time estimate — Δv ÷
+                // full-thrust accel over the stored craft (`None` for
+                // craft-less/thrust-less vessels or no armed node).
+                let burn_s = v.maneuver.as_ref().and_then(|n| {
+                    let craft = v.craft.as_ref()?;
+                    let mass: f64 = craft.parts.iter().map(|p| p.mass_kg).sum();
+                    let thrust: f64 = craft
+                        .parts
+                        .iter()
+                        .flat_map(|p| p.force_sites.iter())
+                        .filter(|s| s.kind == csp_phys::ForceSiteKind::Thrust && s.rated_n > 0.0)
+                        .map(|s| s.rated_n)
+                        .sum();
+                    (mass > 0.0 && thrust > 0.0)
+                        .then(|| n.dv_magnitude() / (thrust / mass))
+                        .filter(|s| s.is_finite())
+                });
                 if let Some(o) = v.orbit() {
-                    return Some((*id, o.clone(), v.maneuver.clone(), true));
+                    return Some((*id, o.clone(), v.maneuver.clone(), true, burn_s));
                 }
                 let (env, dom, body) = (env?, dominant?, v.body()?);
                 let rel = body.com_world() - env.body_center;
@@ -1401,6 +2373,7 @@ pub(crate) fn capture_sync_input(sim: &SimWorld) -> MapSyncInput {
                     },
                     v.maneuver.clone(),
                     false,
+                    burn_s,
                 ))
             })
             .collect(),
@@ -2130,6 +3103,7 @@ mod tests {
                 },
                 None,
                 true,
+                None,
             )],
         };
         input.apply(MapKeyEvent::FocusVessel(vid), &table, &snap);
@@ -2339,7 +3313,7 @@ mod tests {
                     // epoch = now, elements wobble below the quanta.
                     o.epoch = SimTime::from_ticks(tick);
                     o.elements.mean_anomaly_epoch_rad += 1e-5;
-                    (VesselId(i as u64), o, None, false)
+                    (VesselId(i as u64), o, None, false, None)
                 })
                 .collect(),
         };
@@ -2367,7 +3341,7 @@ mod tests {
         moved.elements.semi_major_axis_m *= 1.01;
         let s = MapSnapshot {
             tick: SimTime::from_ticks(10_002),
-            vessels: vec![(VesselId(0), moved, None, false)],
+            vessels: vec![(VesselId(0), moved, None, false, None)],
         };
         refresh_vessel_lines(&model, &s, &mut scene);
         assert_eq!(
@@ -2470,5 +3444,167 @@ mod tests {
             .state_at(orbit, staged.tick)
             .expect("conic solves at its epoch");
         assert!((pos.norm() - r).abs() < 1.0);
+    }
+
+    // ---- W2.4: planning surface --------------------------------------------
+
+    /// solen → terrin + duva — the home system's two planets as a
+    /// sibling pair under the star (the transfer-planner fixture).
+    fn transfer_system() -> PatchedConics {
+        let mut bodies = BTreeMap::new();
+        bodies.insert(
+            BodyId::from("solen"),
+            BodyOrbit {
+                mu_m3_per_s2: MU_SOLEN,
+                soi_m: None,
+                parent: None,
+                elements: None,
+            },
+        );
+        bodies.insert(
+            BodyId::from("terrin"),
+            BodyOrbit {
+                mu_m3_per_s2: MU_TERRIN,
+                soi_m: Some(8.4e7),
+                parent: Some(BodyId::from("solen")),
+                elements: Some(circular_elements(1.36e10, 0.0)),
+            },
+        );
+        bodies.insert(
+            BodyId::from("duva"),
+            BodyOrbit {
+                mu_m3_per_s2: 3.0137e11,
+                soi_m: Some(4.79e7),
+                parent: Some(BodyId::from("solen")),
+                elements: Some(circular_elements(2.07e10, 1.0)),
+            },
+        );
+        let mut model = PatchedConics::new(bodies);
+        model.set_body_radius(&BodyId::from("terrin"), 6.0e5);
+        model.set_body_radius(&BodyId::from("duva"), 3.2e5);
+        model
+    }
+
+    /// W2.4 gate: `plan_transfer` is reachable from the map — a
+    /// `FindWindow` panel command resolves against the orbit model
+    /// and stages a real plan (departure tick, Δv, conic) for the
+    /// player to act on.
+    #[test]
+    fn plan_transfer_reachable_through_the_panel() {
+        let model = transfer_system();
+        let snap = MapSnapshot {
+            tick: SimTime::ZERO,
+            vessels: Vec::new(),
+        };
+        let mut planning = MapPlanning::default();
+        let mut out = Vec::new();
+        resolve_planning_command(
+            csp_ui::PlanningCommand::FindWindow {
+                origin: "terrin".to_string(),
+                destination: "duva".to_string(),
+            },
+            &model,
+            &snap,
+            None,
+            None,
+            &mut planning,
+            &mut out,
+        );
+        let plan = planning
+            .plan
+            .as_ref()
+            .unwrap_or_else(|| panic!("no plan staged — err: {:?}", planning.plan_error));
+        assert!(plan.plan.departure_tick > 0);
+        assert!(plan.plan.arrival_tick > plan.plan.departure_tick);
+        assert!(plan.plan.leg.total_dv_mps.is_finite() && plan.plan.leg.total_dv_mps > 0.0);
+        // The planned route samples into a polyline for the map.
+        assert!(
+            sample_orbit(&model, &plan.plan.conic).is_some(),
+            "the plan's transfer conic must draw"
+        );
+    }
+
+    /// W2.4 gate: a `SetAlarm` the player issued fires its
+    /// `PlayerAlarm` event and the planning mirror surfaces it — the
+    /// armed book entry flips to fired, and a fire the book never
+    /// armed still records a row.
+    #[test]
+    fn player_alarm_surfaces_in_the_planning_mirror() {
+        let mut view = map_view();
+        let tick = 128u64;
+        // Arm through the panel path: book entry + SimCommand, the
+        // same pair resolve_planning_command produces.
+        {
+            let model = view.world.resource::<OrbitModelRes>().0.clone();
+            let mut planning = view.world.resource_mut::<MapPlanning>();
+            let mut out = Vec::new();
+            resolve_planning_command(
+                csp_ui::PlanningCommand::ArmAlarm {
+                    label: "mid-course".to_string(),
+                    in_s: tick as f64 / TICK_HZ as f64,
+                },
+                &model,
+                &MapSnapshot {
+                    tick: SimTime::ZERO,
+                    vessels: Vec::new(),
+                },
+                None,
+                None,
+                &mut planning,
+                &mut out,
+            );
+            assert_eq!(out.len(), 1);
+            for cmd in out {
+                view.enqueue_command(SourceClass::Ui, 1, cmd);
+            }
+        }
+        // Also enqueue an alarm the book never armed — it must still
+        // surface as a fired row.
+        view.enqueue_command(
+            SourceClass::Ui,
+            1,
+            SimCommand::SetAlarm {
+                tick,
+                label: "unarmed".to_string(),
+            },
+        );
+        view.sim_step(tick + 2).expect("advance past the alarm");
+        let planning = view.world.resource::<MapPlanning>();
+        let armed = planning
+            .alarms
+            .iter()
+            .find(|a| a.label == "mid-course")
+            .expect("the armed entry exists");
+        // ArmAlarm schedules at `in_s + 1 tick` — the same +1 the
+        // sim's clamp applies to at-now requests.
+        assert_eq!(armed.fired, Some(tick + 1), "the armed alarm fired");
+        let unarmed = planning
+            .alarms
+            .iter()
+            .find(|a| a.label == "unarmed")
+            .expect("an unarmed fire still records a row");
+        assert!(unarmed.fired.is_some());
+        // And the rows read as fired, not armed or lapsed.
+        let rows = view
+            .world
+            .resource_mut::<MapPlanning>()
+            .alarm_rows(tick + 2);
+        assert!(rows.iter().all(|r| r.state == csp_ui::AlarmState::Fired));
+    }
+
+    /// The book's lapse rule: an armed entry whose tick passes with
+    /// no observed fire reports "lapsed" — never "fired".
+    #[test]
+    fn alarm_rows_lapse_when_nothing_fired() {
+        let mut planning = MapPlanning::default();
+        planning.alarms.push(AlarmEntry {
+            tick: 64,
+            label: "never landed".to_string(),
+            kind: AlarmKind::Manual,
+            fired: None,
+            lapsed: false,
+        });
+        let rows = planning.alarm_rows(64 + ALARM_LAPSE_TICKS + 1);
+        assert_eq!(rows[0].state, csp_ui::AlarmState::Lapsed);
     }
 }

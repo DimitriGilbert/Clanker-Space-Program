@@ -275,6 +275,11 @@ struct App {
     /// session refuses craft-file writes too (they would persist
     /// artifacts of a world that may be corrupt).
     read_only: bool,
+    /// The last rails-warp refusal text — the persistent-notice
+    /// latch: the refusal predicate re-reports every frame while it
+    /// holds, so the cue posts only when the reason *changes* (a
+    /// polling script named once, not spammed per frame).
+    last_refusal: Option<String>,
     /// Where `settings.ron` loads from and where Apply persists to —
     /// `Some(settings_io::settings_path())` in production, `None` on wasm
     /// (in-memory settings — never read there, hence the dead_code
@@ -474,6 +479,7 @@ impl App {
             settings,
             settings_path,
             read_only: false,
+            last_refusal: None,
             #[cfg(not(target_arch = "wasm32"))]
             bug_report_root: bugreport::bug_report_root(),
             gpu_info: None,
@@ -1014,6 +1020,17 @@ impl App {
         // commanded away, so the predicate re-reports every frame
         // until the state changes.
         let refusal = self.view.sim.rails_warp_refusal();
+        // The refusal reason is also a persistent HUD notice —
+        // `rails_warp_refusal` names the offender (a polling script,
+        // a burning vessel) and stderr was its only outlet before.
+        // Latch on the text so a held refusal doesn't cue-spam.
+        if refusal != self.last_refusal
+            && let Some(reason) = &refusal
+        {
+            self.view
+                .flight_notice(format!("RAILS WARP ×1 — {}", reason.to_uppercase()));
+        }
+        self.last_refusal = refusal.clone();
         if (clamping || refusal.is_some())
             && let Some(level) = self.warp.demote(0)
         {
@@ -1047,6 +1064,26 @@ impl App {
         // until its side-effects landed.
         for text in fired_event_notices(&report.fired_events) {
             self.view.flight_notice(text);
+        }
+        // §2.10's script console: `log`/`print` lines and the host's
+        // diagnostics (strike-disables, wake refusals, poll demotes)
+        // had zero consumers outside the bench agent — fold them into
+        // the AUTOMATION section's tail mirror AND flash them on the
+        // cue channel (bounded — a chatty script can only spend four
+        // cue slots a frame).
+        if !report.script_log.is_empty() {
+            self.view
+                .push_script_log(self.view.sim.clock().ticks(), &report.script_log);
+            for (id, line) in report.script_log.iter().take(4) {
+                self.view
+                    .flight_notice(format!("script {} — {}", id.0, line));
+            }
+            if report.script_log.len() > 4 {
+                self.view.flight_notice(format!(
+                    "script log — +{} more lines (Program → AUTOMATION)",
+                    report.script_log.len() - 4
+                ));
+            }
         }
     }
 
@@ -3083,8 +3120,21 @@ mod tests {
         assert!(app.craft_store.contains_key("demo-craft"));
         // …but launching is still playable in the demo (§6.3 caps
         // parts and refuses craft IO, not flight) — the launch gate
-        // is `read_only`, not `demo`.
+        // is `read_only`, not `demo`. W2.6: the seeded craft holds
+        // the pad's single berth (delivered latched at seed), so
+        // retire it like a recovery would before ordering a second
+        // build.
         let mut app = App::new_demo_with_settings_path(&dir.join("settings.ron"));
+        app.view.sim.enqueue(
+            csp_view::SourceClass::Ui,
+            0,
+            SimCommand::TerminateVessel {
+                vessel: csp_sim::VesselId(0),
+            },
+        );
+        app.view.begin_frame();
+        app.view.sim_step(app.view.sim.clock().ticks() + 1).unwrap();
+        app.view.end_frame();
         app.view.set_mode(ViewMode::Vab);
         app.handle_ui_outbox(csp_view::UiOutbox {
             launch: true,
@@ -3172,8 +3222,20 @@ mod tests {
             );
         }
         // And the un-gated path still works — launch is only refused
-        // while halted.
+        // while halted. W2.6: the seeded craft holds the pad's
+        // single berth (delivered latched at seed), so retire it
+        // like a recovery would before ordering the second build.
         let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        app.view.sim.enqueue(
+            csp_view::SourceClass::Ui,
+            0,
+            SimCommand::TerminateVessel {
+                vessel: csp_sim::VesselId(0),
+            },
+        );
+        app.view.begin_frame();
+        app.view.sim_step(app.view.sim.clock().ticks() + 1).unwrap();
+        app.view.end_frame();
         app.view.set_mode(ViewMode::Vab);
         app.handle_ui_outbox(csp_view::UiOutbox {
             launch: true,

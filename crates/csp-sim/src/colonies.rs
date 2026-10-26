@@ -2530,6 +2530,7 @@ mod tests {
                 (ResourceId::from("oxygen"), 1.0),
                 (ResourceId::from("food"), 1.0),
             ],
+            starting_stock: vec![],
         }
     }
 

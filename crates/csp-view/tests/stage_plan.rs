@@ -158,7 +158,14 @@ fn stage_plan_fires_its_own_vessel_not_the_focus() {
         frame(&mut view, 64); // ~8 s — well clear of the pad volume
     }
     view.launch_craft().expect("second launch");
-    frame(&mut view, 1);
+    // W2.6: launch is a ManufactureCraft order — the second vessel
+    // materializes at `ConstructionComplete` and takes focus then.
+    for _ in 0..200 {
+        frame(&mut view, 64);
+        if view.sim.builds().is_empty() {
+            break;
+        }
+    }
     let focus = view.flight_focus().expect("second spawn focused");
     assert_ne!(first, focus, "the second spawn did not take focus");
 
