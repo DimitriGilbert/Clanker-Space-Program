@@ -1692,6 +1692,14 @@ fn emit_shape(
 /// The backdrop starfield — `STAR_COUNT` points on a fixed hash-seeded
 /// sphere around the eye. Deterministic per index, so the sky is
 /// identical every frame with no stored table and no RNG state.
+///
+/// Stars draw as crisp POINTS (the flight sky's procedural field is
+/// sharp 1–2 px stars, and this matches it): a hard `KIND_DISC` core
+/// of ~2–4 px whose brightness bends with the magnitude hash — most
+/// faint, a few burning. The old field gave every star a 3–8 px
+/// `KIND_GLOW` quadratic puff at low alpha; at map scale those read as
+/// large grey blobs, not stars. Only the brightest few get a tight
+/// halo on top of the core.
 fn emit_starfield(verts: &mut Vec<MapVertex>, cam: &MapCameraF64, vp: (f64, f64)) {
     for i in 0..STAR_COUNT as u64 {
         // Uniform direction on the sphere (z = 2u−1, φ = 2πv) plus two
@@ -1707,25 +1715,42 @@ fn emit_starfield(verts: &mut Vec<MapVertex>, cam: &MapCameraF64, vp: (f64, f64)
         let Some(ndc) = project(cam, cam.eye + dir * STAR_DISTANCE_M) else {
             continue;
         };
-        // Mostly warm-white; a cool tail keeps the field from reading
+        // Mostly blue-white; a warm tail keeps the field from reading
         // as uniform noise.
         let (r, g, b): (f32, f32, f32) = if u_tint < 0.12 {
-            (1.0, 0.8, 0.62)
+            (1.0, 0.82, 0.62)
         } else if u_tint < 0.28 {
             (0.68, 0.8, 1.0)
         } else {
-            (0.9, 0.93, 1.0)
+            (0.92, 0.94, 1.0)
         };
-        let alpha = (0.22 + 0.6 * u_tint) as f32;
-        let half_px = 1.6 + 2.4 * u_size;
+        // Bent magnitude — most stars stay small and dim, a few carry
+        // the field. Squaring `u_size` keeps the tail sparse.
+        let mag = u_size * u_size;
+        // A ~1 px half-size disc is a sharp point, not a puff; bright
+        // stars run a little larger and a lot hotter.
+        let half_px = 0.9 + 1.1 * mag;
+        let alpha = (0.4 + 0.6 * mag) as f32;
         emit_shape(
             verts,
             ndc,
             half_px,
             vp,
             [r, g, b, alpha],
-            MapVertex::KIND_GLOW,
+            MapVertex::KIND_DISC,
         );
+        // The rare bright star gets a tight halo (~4× the core) so it
+        // reads as a star and not a pixel — ~8% of the field.
+        if u_size > 0.92 {
+            emit_shape(
+                verts,
+                ndc,
+                half_px * 4.0,
+                vp,
+                [r, g, b, alpha * 0.3],
+                MapVertex::KIND_GLOW,
+            );
+        }
     }
 }
 

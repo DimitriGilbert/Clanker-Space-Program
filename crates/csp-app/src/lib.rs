@@ -699,8 +699,11 @@ impl App {
     }
 
     /// wasm only: land the spawned GPU init — success finishes the
-    /// presentation setup, failure logs once and stays black (the demo
-    /// keeps running its headless frames; there is no GPU to recover).
+    /// presentation setup, failure reports to the page through
+    /// [`csp_report_gpu_error`] so the demo shell can swap its loading
+    /// screen for the styled fallback instead of hanging on a black
+    /// canvas (the old path only `log::error!`ed — `init()` had long
+    /// resolved, so nothing ever reached JS).
     #[cfg(target_arch = "wasm32")]
     fn poll_gpu_init(&mut self) {
         let Some(rx) = &self.gpu_rx else {
@@ -710,15 +713,18 @@ impl App {
             Ok(Ok(gpu)) => {
                 self.gpu_rx = None;
                 self.finish_gpu_init(gpu);
+                csp_report_gpu_ready();
             }
             Ok(Err(e)) => {
                 self.gpu_rx = None;
                 log::error!("GPU init failed: {e}");
+                csp_report_gpu_error(&e.to_string());
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.gpu_rx = None;
                 log::error!("GPU init task was dropped");
+                csp_report_gpu_error("GPU init task was dropped");
             }
         }
     }
@@ -2523,6 +2529,35 @@ pub fn run() {
     let event_loop = EventLoop::new().expect("failed to create event loop");
     let mut app = App::new();
     event_loop.run_app(&mut app).expect("event loop error");
+}
+
+/// The wasm→page init-status channel. GPU init resolves *after*
+/// `init()` returned (it is spawned onto the winit loop because the
+/// adapter/device requests are browser promises), so a failure can
+/// never propagate through `init()`'s promise — the page instead
+/// exposes `cspGpuInitFailed`/`cspGpuReady` hooks and reads the
+/// `__csp_gpu_*` globals this snippet sets. Both are set defensively:
+/// a page that only polls the globals still sees the outcome.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
+    export function csp_report_gpu_error(msg) {
+        globalThis.__csp_gpu_init_error = String(msg);
+        if (typeof globalThis.cspGpuInitFailed === "function") {
+            globalThis.cspGpuInitFailed(globalThis.__csp_gpu_init_error);
+        }
+    }
+    export function csp_report_gpu_ready() {
+        globalThis.__csp_gpu_ready = true;
+        if (typeof globalThis.cspGpuReady === "function") {
+            globalThis.cspGpuReady();
+        }
+    }
+"#)]
+extern "C" {
+    /// Report a GPU-init failure to the page (reason string).
+    fn csp_report_gpu_error(msg: &str);
+    /// Report that GPU init + renderer setup completed.
+    fn csp_report_gpu_ready();
 }
 
 /// wasm entry point — called automatically by wasm-bindgen.

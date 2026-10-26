@@ -37,6 +37,7 @@ use csp_core::{DQuat, DVec3};
 
 use crate::flight::FlightEnv;
 use crate::map::project_into;
+use crate::part_mesh::SmoothTri;
 use crate::terrain::{TerrainCache, TerrainConfig};
 
 /// One authored surface site — the `sites.ron` slice the structure
@@ -536,10 +537,93 @@ static SPACE_CENTER: &[Piece] = &[
     },
 ];
 
+/// Mottle grid (m): flat faces tessellate to roughly this cell size so
+/// the per-vertex albedo jitter has the density to read as
+/// concrete/metal surface variation rather than a corner ramp.
+const MOTTLE_CELL_M: f64 = 4.0;
+/// Midpoint-subdivision cap — 2^4 edge splits bounds a 40 m VAB wall
+/// to ~2.5 m cells (256 tris per source tri worst case).
+const MOTTLE_MAX_DEPTH: i32 = 4;
+
+/// Deterministic `[0,1)` hash of a structure-local position + prim
+/// seed — the albedo-mottle source. Positions quantize to ~1 mm so
+/// vertices coincident across a shared face edge jitter identically
+/// (no brightness crack at the seam), and the same building always
+/// mottles the same way.
+fn mottle01(p: DVec3, seed: usize) -> f64 {
+    let q = |v: f64| (v * 1024.0).round() as i64 as u64;
+    let mut x = q(p.x)
+        .wrapping_mul(0xA24B_AED4_963E_E407)
+        .wrapping_add(q(p.y).wrapping_mul(0x9FB2_1C65_1E98_DF25))
+        .wrapping_add(q(p.z).wrapping_mul(0xC2B2_AE3D_27D4_EB4F))
+        .wrapping_add((seed as u64).wrapping_mul(0x1656_67B1_9E37_79F9))
+        .wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    (x >> 11) as f64 * (1.0 / 9.007_199_254_740_992e15)
+}
+
+/// `color` with the mottle luminance applied — a ±15% albedo jitter:
+/// strong enough that large faces read as poured concrete / painted
+/// panels at typical viewing distance, quiet enough not to smudge.
+fn mottle_tint(color: [f32; 4], p: DVec3, seed: usize) -> [f32; 4] {
+    let lum = (0.85 + 0.30 * mottle01(p, seed)) as f32;
+    [color[0] * lum, color[1] * lum, color[2] * lum, color[3]]
+}
+
+/// Midpoint-split `t` until its longest edge is ~[`MOTTLE_CELL_M`]
+/// (bounded by [`MOTTLE_MAX_DEPTH`]) — large flat faces gain the
+/// vertex density the albedo mottle needs. Structure boxes shade
+/// flat, so the shared normal carries to every subtri; the lathe
+/// prims already tessellate densely enough to skip this.
+fn tessellate_face(t: SmoothTri, out: &mut Vec<SmoothTri>) {
+    let edge = (t.a - t.b)
+        .norm()
+        .max((t.b - t.c).norm())
+        .max((t.c - t.a).norm());
+    let depth = ((edge / MOTTLE_CELL_M).log2().ceil() as i32).clamp(0, MOTTLE_MAX_DEPTH);
+    if depth <= 0 {
+        out.push(t);
+        return;
+    }
+    let mut stack: Vec<(SmoothTri, i32)> = Vec::with_capacity(1usize << (2 * depth));
+    stack.push((t, 0));
+    while let Some((cur, d)) = stack.pop() {
+        if d >= depth {
+            out.push(cur);
+            continue;
+        }
+        let ab = (cur.a + cur.b) * 0.5;
+        let bc = (cur.b + cur.c) * 0.5;
+        let ca = (cur.c + cur.a) * 0.5;
+        let n = [cur.na, cur.nb, cur.nc];
+        for (a, b, c) in [
+            (cur.a, ab, ca),
+            (ab, cur.b, bc),
+            (ca, bc, cur.c),
+            (ab, bc, ca),
+        ] {
+            stack.push((
+                SmoothTri {
+                    a,
+                    b,
+                    c,
+                    na: n[0],
+                    nb: n[1],
+                    nc: n[2],
+                },
+                d + 1,
+            ));
+        }
+    }
+}
+
 /// Emit one triangle's lit vertices — the all-or-nothing projection
 /// rule `extract_flight`'s part pass uses (a corner behind the eye
 /// drops the whole tri). `world` carries the camera-relative position;
-/// `occ` is baked into `mat[2]` per vertex by the caller.
+/// `occ` is baked into `mat[2]` per vertex by the caller, and `col`
+/// carries the per-vertex mottle-tinted albedo.
 #[allow(clippy::too_many_arguments)]
 fn lit_tri(
     v: &mut Vec<csp_render::flight::FlightVertex>,
@@ -547,7 +631,7 @@ fn lit_tri(
     eye: DVec3,
     w: [DVec3; 3],
     n: [DVec3; 3],
-    color: [f32; 4],
+    col: [[f32; 4]; 3],
     spec_exp: [f32; 3],
     occ: [f32; 3],
 ) {
@@ -563,7 +647,7 @@ fn lit_tri(
                 (w[k].z - eye.z) as f32,
             ],
             nrm: [n[k].x as f32, n[k].y as f32, n[k].z as f32],
-            color,
+            color: col[k],
             mat: [spec_exp[0], spec_exp[1], occ[k]],
         });
     }
@@ -572,7 +656,10 @@ fn lit_tri(
 /// Emit a piece's primitives transformed by the ENU basis at
 /// `anchor`/`up`. Per-vertex baked occlusion: a 0.55→1.0 ramp over the
 /// first 3 m above the prim's own base, so wall bottoms read grounded
-/// against the contact-shadow quads the pieces sit on.
+/// against the contact-shadow quads the pieces sit on. A second
+/// per-vertex term — the [`mottle01`] albedo jitter over the
+/// [`tessellate_face`]d faces — keeps the large walls and pads from
+/// reading as flat untextured quads.
 #[allow(clippy::too_many_arguments)] // ENU basis + paint + scratch — one emit call
 fn emit_prims(
     v: &mut Vec<csp_render::flight::FlightVertex>,
@@ -585,12 +672,15 @@ fn emit_prims(
     color: [f32; 4],
     mat: [f32; 3],
     prims: &[Prim],
-    tris: &mut Vec<crate::part_mesh::SmoothTri>,
+    tris: &mut Vec<SmoothTri>,
 ) {
     let to_world = |p: DVec3| anchor + east * p.x + north * p.y + up * p.z;
     let n_world = |n: DVec3| east * n.x + north * n.y + up * n.z;
     let occ = |z: f64| (0.55 + 0.45 * (z / 3.0).clamp(0.0, 1.0)) as f32;
-    for prim in prims {
+    // Second scratch for the mottle tessellation — `tris` stays the
+    // emit_smooth target the caller allocated.
+    let mut tess: Vec<SmoothTri> = Vec::new();
+    for (pi, prim) in prims.iter().enumerate() {
         tris.clear();
         match prim {
             Prim::Bbox { lo, hi } => {
@@ -598,6 +688,14 @@ fn emit_prims(
                     &crate::part_mesh::PartShape::Box { lo: *lo, hi: *hi },
                     tris,
                 );
+                // Flat faces retessellate to the mottle grid so the
+                // per-vertex albedo jitter reads as concrete/metal
+                // surface variation, not a corner-to-corner ramp.
+                tess.clear();
+                for t in tris.iter() {
+                    tessellate_face(*t, &mut tess);
+                }
+                std::mem::swap(tris, &mut tess);
             }
             Prim::Lathe { axis, profile } => {
                 crate::part_mesh::emit_smooth(
@@ -619,7 +717,11 @@ fn emit_prims(
                 eye,
                 [wa, wb, wc],
                 [na, nb, nc],
-                color,
+                [
+                    mottle_tint(color, t.a, pi),
+                    mottle_tint(color, t.b, pi),
+                    mottle_tint(color, t.c, pi),
+                ],
                 mat,
                 [occ(t.a.z), occ(t.b.z), occ(t.c.z)],
             );

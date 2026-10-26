@@ -44,19 +44,47 @@
   // — `init()` instantiates the module and runs it; winit appends its
   // canvas to <body>. A no-WebGPU browser used to fall through to a
   // silent black canvas (vision-report 7.1/7.2): say so instead.
+  //
+  // GPU init resolves AFTER `init()` — the adapter/device requests are
+  // browser promises spawned onto the winit loop — so csp-app reports
+  // the outcome through the `cspGpuInitFailed`/`cspGpuReady` hooks
+  // below (it also sets `__csp_gpu_init_error`/`__csp_gpu_ready` for
+  // anything that prefers polling). Until the ready hook fires the
+  // loading screen stays up; the failure hook swaps in #fallback.
   const fail = (msg) => {
-    document.getElementById('loading').remove();
+    document.getElementById('loading')?.remove();
     const f = document.getElementById('fallback');
     f.hidden = false;
     document.getElementById('fallback-reason').textContent = msg;
   };
+  window.cspGpuInitFailed = (msg) => fail(`GPU init failed: ${msg}`);
+  window.cspGpuReady = () => document.getElementById('loading')?.remove();
+  // A wasm-side panic in an event handler can't propagate to the
+  // `await init()` catch — it surfaces as an uncaught error (wasm
+  // traps) or a stray rejection instead. Both mean the demo is dead;
+  // say so rather than leave the void.
+  window.addEventListener('unhandledrejection', (e) => {
+    fail(`demo crashed: ${e.reason}`);
+  });
+  window.addEventListener('error', (e) => {
+    if (!window.__csp_gpu_ready) {
+      fail(`demo crashed: ${e.message}`);
+    }
+  });
   if (!navigator.gpu) {
     fail('This browser has no WebGPU support — the demo cannot start its renderer.');
   } else {
     try {
       const init = (await import('./csp_app.js')).default;
       await init();
-      document.getElementById('loading').remove();
+      // Watchdog: hooks are installed before this resolves and fire on
+      // the app's own loop — silence for 30 s means the GPU promise
+      // never landed, which is the black-void failure mode.
+      setTimeout(() => {
+        if (!window.__csp_gpu_ready && !window.__csp_gpu_init_error) {
+          fail('GPU init never resolved — the demo could not start its renderer.');
+        }
+      }, 30000);
     } catch (e) {
       fail(`demo failed to start: ${e}`);
       throw e;
