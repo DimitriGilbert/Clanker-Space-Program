@@ -4451,132 +4451,30 @@ impl World {
             let mut batch: Vec<csp_phys::WeldedBody> = Vec::new();
             let mut pre_vel: Vec<(csp_core::DVec3, csp_core::DVec3)> = Vec::new();
             for (vid, vessel) in vessels.iter_mut() {
-                // Pass-1 propellant bookkeeping state for this vessel —
-                // the plans ride to the post-debit re-scale below.
-                let mut fuel_plans: Vec<FuelPlan> = Vec::new();
-                let mut fuel_debits: Vec<(ResourceId, f64)> = Vec::new();
-                {
-                    let VesselState::InBubble(body) = &mut vessel.state else {
-                        continue;
-                    };
-                    if !body.pos.is_finite() {
-                        return Err(SimError::Fatal("non-finite body state mid-tick"));
-                    }
-                    // M9b §3.4: the live `thrust_factor` reaches physics
-                    // through the body's `Thrust` sites — scaled from the
-                    // craft baseline each tick (idempotent across every
-                    // re-weld; the site's `rated_n` is a derived view).
-                    // This runs BEFORE the burn executor reads the sites'
-                    // `rated_n` (`net_thrust_axis`) so the executor sees
-                    // this tick's derate, not last tick's.
-                    if let Some(craft) = &vessel.craft {
-                        reliability::apply_thrust_factors(body, craft, &vessel.reliability);
-                        // Pass-1: propellant coverage — the engines'
-                        // `rated_n` is now scaled by `base·factor·cov`,
-                        // so a starved engine's site already reads the
-                        // limited thrust when the executor (and later
-                        // the force model) reads it. The pool is
-                        // normalized by the throttle the tick will
-                        // command: `body.throttle` is already final
-                        // here for every vessel the executor does not
-                        // own (the drain applied `SetThrottle`
-                        // upstream); a `Burning` node gets the
-                        // full-throttle bound — the executor's
-                        // final-tick partial then under-debits
-                        // conservatively.
-                        let burning = matches!(
-                            vessel.maneuver.as_ref().map(|n| &n.status),
-                            Some(ManeuverStatus::Burning(_))
-                        );
-                        fuel_plans = propellant_plans(
-                            craft,
-                            body,
-                            &vessel.tank_contents,
-                            &vessel.reliability,
-                            if burning {
-                                1.0
-                            } else {
-                                body.throttle.clamp(0.0, 1.0)
-                            },
-                        );
-                        apply_fuel_scales(body, craft, &fuel_plans);
-                    }
-                    // The tick's propellant draw at the *commanded*
-                    // throttle — collected here, debited below where the
-                    // whole vessel is borrowable (`debit` walks
-                    // `tank_contents` + part masses, then the §2.4
-                    // re-weld). A `Burning` node's throttle is set by
-                    // `drive_node_burn`, which now runs on the
-                    // *post-debit* body below (the Δv bookkeeping needs
-                    // the mass the step will actually integrate); the
-                    // debit therefore reads the executor's decision
-                    // previewed at the pre-debit mass — identical on
-                    // every non-bucket-flip tick, and only ever higher
-                    // on a flip (the post-debit `full` can shrink the
-                    // committed throttle, never grow it — a slight
-                    // over-debit on a mass-crossing completion tick,
-                    // never a free impulse).
-                    let throttle = planned_burn_throttle(&vessel.maneuver, body)
-                        .unwrap_or_else(|| body.throttle.clamp(0.0, 1.0));
-                    if throttle > 0.0 {
-                        for p in &fuel_plans {
-                            for (r, u) in &p.needs {
-                                let amt = u * p.scale * throttle;
-                                if amt > 0.0 && amt.is_finite() {
-                                    fuel_debits.push((r.clone(), amt));
-                                }
-                            }
-                        }
-                    }
+                // Pass-1 propellant bookkeeping for this vessel —
+                // `propellant_pass` scales the derated thrust sites,
+                // debits the tick's draw at the commanded throttle,
+                // and restores the factor/coverage scales after a
+                // contents-quantum re-weld, all BEFORE the executor
+                // reads the sites below.
+                propellant_pass(vessel)?;
+                let VesselState::InBubble(body) = &mut vessel.state else {
+                    continue;
+                };
+                // M5 burn executor — a first-class sim mechanism, not
+                // a command stream (the maneuver module docs): while a
+                // node is `Burning` it owns this body's `throttle`,
+                // `rot`, and `ang_vel` every integer tick. It runs on
+                // the post-debit weld so `throttle·|F|·dt/m` books
+                // against the mass the step actually integrates — a
+                // bucket-flip tick booked at the pre-debit mass
+                // overshot the node's commanded Δv.
+                if drive_node_burn(&mut vessel.maneuver, body) {
+                    burns_done.insert(*vid);
                 }
-                // Pass-1: the debits + the possible contents-quantum
-                // re-weld — `transfers::debit` needs `&mut Vessel`, so
-                // the body borrow above had to close first. Ascending
-                // plan order = ascending node order = the fixed drain
-                // order; `debit` itself drains ascending `PartNodeId`.
-                if !fuel_debits.is_empty() {
-                    let mut mass_changed = false;
-                    for (r, amt) in &fuel_debits {
-                        let (_, m) = transfers::debit(vessel, r, *amt);
-                        mass_changed |= m;
-                    }
-                    // The `rel_rebody` convention: a re-weld failure in
-                    // range is an invariant bug → `Fatal`.
-                    transfers::reweld_if_mass_changed(vessel, mass_changed)
-                        .map_err(|e| SimError::Fatal(e.reason()))?;
-                }
-                {
-                    let VesselState::InBubble(body) = &mut vessel.state else {
-                        continue;
-                    };
-                    // A re-weld rebuilt the sites at craft baseline —
-                    // restore the tick's factor + coverage scales so
-                    // the batch clone reads the same thrust the
-                    // executor booked. Idempotent when nothing moved.
-                    if let Some(craft) = &vessel.craft {
-                        reliability::apply_thrust_factors(body, craft, &vessel.reliability);
-                        apply_fuel_scales(body, craft, &fuel_plans);
-                        // §3.1 decelerators: the body's additive-drag
-                        // sites are a pure function of (craft,
-                        // deployed) — refreshed wholesale so every
-                        // re-weld/materialization path agrees.
-                        refresh_decel_sites(body, craft, &vessel.deployed);
-                    }
-                    // M5 burn executor — a first-class sim mechanism, not
-                    // a command stream (the maneuver module docs): while a
-                    // node is `Burning` it owns this body's `throttle`,
-                    // `rot`, and `ang_vel` every integer tick. It runs on
-                    // the post-debit weld so `throttle·|F|·dt/m` books
-                    // against the mass the step actually integrates — a
-                    // bucket-flip tick booked at the pre-debit mass
-                    // overshot the node's commanded Δv.
-                    if drive_node_burn(&mut vessel.maneuver, body) {
-                        burns_done.insert(*vid);
-                    }
-                    pre_vel.push((body.vel, body.ang_vel));
-                    batch.push(body.clone());
-                    batch_vids.push(*vid);
-                }
+                pre_vel.push((body.vel, body.ang_vel));
+                batch.push(body.clone());
+                batch_vids.push(*vid);
             }
             // M6-B §2.4: translate the live transient joints into the
             // backend's per-tick `JointDef`s — anchors re-posed through
@@ -4921,186 +4819,32 @@ impl World {
                 }
             }
             // Apply the tick's consequences in ascending-vessel-id
-            // order: impacts remove, then §2.4 breakups split.
-            let mut affected: std::collections::BTreeSet<VesselId> =
-                failures.keys().copied().collect();
-            affected.extend(impacted.iter().copied());
-            for vid in affected {
-                if impacted.contains(&vid) {
-                    // Inline removal, not `remove_vessel`: the
-                    // borrow-split above keeps the heap out of reach,
-                    // and the scrub is provably dead code here —
-                    // vessel-named event kinds (SoiTransition,
-                    // SoiRescan, DebrisDecay, ManeuverNodeStart) are
-                    // scheduled ONLY for on-rails conics and are
-                    // dropped at `ToBubble`,
-                    // so an `InBubble` vessel is never named by a
-                    // pending event. Same invariant at the
-                    // `max_debris` eviction and the thermal-root
-                    // removal inside `apply_breakup`.
-                    debug_assert!(
-                        !self
-                            .event_heap
-                            .iter()
-                            .any(|e| event_names_vessel(&e.kind, &vid)),
-                        "in-bubble removal: a pending event outlived its conic"
-                    );
-                    // M7-A: the vessel's research projects die with it —
-                    // drop them (no accrual) and scrub their pending
-                    // pair, which names projects, not vessels. The drop
-                    // shadows the science book and the event heap itself
-                    // (post-removal Recoverables restore them together).
-                    research::drop_vessel_projects(
-                        &mut self.science,
-                        &mut self.event_heap,
-                        self.next_event_seq,
-                        vid,
-                        shadow,
-                    );
-                    // M8-C §3.5: record the impact point for the
-                    // colony-radius damage check (post-loop) — and the
-                    // completed tick `t + 1` it lands at, so the damage
-                    // anchors at the impact tick rather than rewinding
-                    // the colony to `now`.
-                    if let Some(pos) = vessels.get(&vid).and_then(|v| v.body().map(|b| b.pos)) {
-                        impacts.push((pos, t + 1));
-                    }
-                    // §3.4: the hull's burn dies with it — credit the
-                    // burn-seconds its engine records still hold, the
-                    // same exit-credit rule `transition_latched` and
-                    // `reliability_residence_change` apply (a crash
-                    // landing still produced flight-qualification
-                    // data). Drained into `rel_burns` below.
-                    if let Some(dying) = vessels.get(&vid) {
-                        let in_atmo = physics.backend.environment().atmosphere.is_some();
-                        for (node, rec) in &dying.reliability {
-                            if rec.burning
-                                && let Some(spec) = World::spec_for(dying, *node)
-                            {
-                                let burn_s = (t + 1).saturating_sub(rec.burn_start_tick) as f64
-                                    / csp_core::TICK_HZ as f64;
-                                rel_burns.push((spec.family.clone(), burn_s, in_atmo));
-                            }
-                        }
-                    }
-                    // Roster half of the removal (the `remove_vessel`
-                    // rule): members still recorded aboard die with
-                    // the hull — read from the record we still hold.
-                    if let Some(gone) = vessels.remove(&vid)
-                        && !gone.crew.is_empty()
-                    {
-                        economy::shadow_economy(&self.economy, &mut shadow.economy);
-                        economy::lose_aboard_crew(&mut self.economy, vid, &gone.crew);
-                    }
-                    physics.aero.remove(&vid);
-                    dead_vessels.push(vid);
-                    continue;
-                }
-                let (sh, th) = failures.get(&vid).cloned().unwrap_or_default();
-                apply_breakup(
-                    vessels,
-                    physics,
-                    &mut self.next_vessel_id,
-                    caps,
-                    self.builds.len() as u64,
-                    &mut self.science,
-                    &self.science_cfg,
-                    &mut self.economy,
-                    &self.economy_cfg,
-                    &mut self.event_heap,
-                    self.next_event_seq,
-                    vid,
-                    &sh,
-                    &th,
-                    t + 1,
-                    &mut dead_vessels,
-                    shadow,
-                )?;
-            }
-            // §3.5's `max_debris` — oldest-debris eviction by
-            // `(debris_since, id)`, deterministic per the plan.
-            loop {
-                let mut count = 0u64;
-                let mut oldest: Option<VesselId> = None;
-                for v in vessels.values() {
-                    if let Some(since) = v.debris_since {
-                        count += 1;
-                        if oldest.is_none_or(|o| {
-                            let os = vessels[&o].debris_since.unwrap_or(0);
-                            (since, v.id.0) < (os, o.0)
-                        }) {
-                            oldest = Some(v.id);
-                        }
-                    }
-                }
-                if count <= caps.max_debris {
-                    break;
-                }
-                if let Some(vid) = oldest {
-                    // Same inline-removal invariant as the impact
-                    // path above: evicted debris is `InBubble`, so no
-                    // pending event can name it.
-                    debug_assert!(
-                        !self
-                            .event_heap
-                            .iter()
-                            .any(|e| event_names_vessel(&e.kind, &vid)),
-                        "in-bubble eviction: a pending event outlived its conic"
-                    );
-                    research::drop_vessel_projects(
-                        &mut self.science,
-                        &mut self.event_heap,
-                        self.next_event_seq,
-                        vid,
-                        shadow,
-                    );
-                    // Same burn-exit credit as the impact path —
-                    // eviction retires the records, so the burn's
-                    // flight units are emitted first.
-                    if let Some(dying) = vessels.get(&vid) {
-                        let in_atmo = physics.backend.environment().atmosphere.is_some();
-                        for (node, rec) in &dying.reliability {
-                            if rec.burning
-                                && let Some(spec) = World::spec_for(dying, *node)
-                            {
-                                let burn_s = (t + 1).saturating_sub(rec.burn_start_tick) as f64
-                                    / csp_core::TICK_HZ as f64;
-                                rel_burns.push((spec.family.clone(), burn_s, in_atmo));
-                            }
-                        }
-                    }
-                    // Roster half of the eviction — same as the
-                    // impact removal above.
-                    if let Some(gone) = vessels.remove(&vid)
-                        && !gone.crew.is_empty()
-                    {
-                        economy::shadow_economy(&self.economy, &mut shadow.economy);
-                        economy::lose_aboard_crew(&mut self.economy, vid, &gone.crew);
-                    }
-                    physics.aero.remove(&vid);
-                    dead_vessels.push(vid);
-                } else {
-                    break;
-                }
-            }
-            // Removal-path burn credits (impacts, evictions, latch
-            // touchdowns all pushed into `rel_burns` since the first
-            // drain) — same in-range `Fatal`-only rule.
-            if !rel_burns.is_empty() {
-                if shadow.tech.is_none() {
-                    shadow.tech = Some(self.tech.clone());
-                }
-                for (family, burn_s, in_atmo) in rel_burns.drain(..) {
-                    let rate = if in_atmo {
-                        self.reliability_cfg.flight_units_per_s_atmosphere
-                    } else {
-                        self.reliability_cfg.flight_units_per_s_vacuum
-                    };
-                    self.tech
-                        .credit_qualification(family, burn_s * rate, 0.0, 0)
-                        .map_err(|e| SimError::Fatal(e.reason()))?;
-                }
-            }
+            // order — `bubble_consequences` owns the impact removals,
+            // the §2.4 breakups, §3.5's `max_debris` eviction, and the
+            // removal-path burn-credit drain under this same borrow
+            // split.
+            bubble_consequences(
+                vessels,
+                physics,
+                &failures,
+                &impacted,
+                t,
+                &mut impacts,
+                &mut rel_burns,
+                &mut dead_vessels,
+                &mut self.next_vessel_id,
+                caps,
+                self.builds.len() as u64,
+                &mut self.science,
+                &self.science_cfg,
+                &mut self.economy,
+                &self.economy_cfg,
+                &mut self.event_heap,
+                self.next_event_seq,
+                &mut self.tech,
+                &self.reliability_cfg,
+                shadow,
+            )?;
             // M6-C §2.4 step 2 — the latch: every settled soft-capture
             // merges into ONE WeldedBody with a recorded DockSeam and
             // the island collapses. Runs after every consequence (the
@@ -5175,67 +4919,13 @@ impl World {
             // Auto bubble→rails detection — runs on this tick's
             // settled state (post-latch, post-consequence), the same
             // predicates `apply_to_rails_at` enforces plus the
-            // coasting rules: `throttle == 0`, no maneuver (the burn
-            // executor's residence is `finish_burns`' business), not
-            // settle-latched. The cheap gates run for every body; the
-            // contact/conic checks only for coasters above the
-            // atmosphere top.
-            {
-                let env = physics.backend.environment();
-                // Terrain is body-fixed — the sample phase is the
-                // completed tick's, matching `surface_pose_capture`
-                // and the `set_sim_time(epoch)` the conversion itself
-                // applies.
-                physics.backend.set_sim_time(SimTime::from_ticks(t + 1));
-                let atm_top = env.atmosphere.as_ref().map_or(0.0, |a| a.top_m);
-                let mut candidates: Vec<VesselId> = Vec::new();
-                for (vid, vessel) in vessels.iter() {
-                    let VesselState::InBubble(body) = &vessel.state else {
-                        continue;
-                    };
-                    if vessel.maneuver.is_some() || body.throttle != 0.0 || body.settle.latched {
-                        continue;
-                    }
-                    // An engaged autopilot is a live control producer:
-                    // railing its vessel silences it mid-flight (the
-                    // ascent program's coast phase is throttle-0 —
-                    // exactly the coasting case above — and its
-                    // circularization commands could never issue).
-                    // Scripts are different: §2.10's wake carrier
-                    // survives rails (`rearm_rails_scripts` re-arms at
-                    // the transition), autopilots have no wake.
-                    if self.autopilots.get(vid).is_some_and(|a| a.enabled) {
-                        continue;
-                    }
-                    let rel = body.com_world() - env.body_center;
-                    if rel.norm() - env.radius_m < atm_top {
-                        continue;
-                    }
-                    if physics.backend.ground_contact(body)
-                        || bubble_vessel_contact(&physics.backend, vessels, *vid, body, false)
-                    {
-                        continue;
-                    }
-                    let Ok(elements) =
-                        orbit::cartesian_to_elements(rel, body.vel, env.mu_m3_per_s2)
-                    else {
-                        continue;
-                    };
-                    let h2 = rel.cross(body.vel).norm_squared();
-                    let rp = h2 / env.mu_m3_per_s2 / (1.0 + elements.eccentricity);
-                    // The same floor `apply_to_rails_at` enforces:
-                    // atmosphere top, or PLAN §2.3's bubble radius
-                    // where there is no atmosphere.
-                    let floor = env.radius_m + atm_top.max(physics.bubble_radius_m);
-                    if rp.partial_cmp(&floor) != Some(core::cmp::Ordering::Greater) {
-                        continue;
-                    }
-                    candidates.push(*vid);
-                }
-                if !candidates.is_empty() {
-                    rail_break = Some((t + 1, candidates));
-                    break;
-                }
+            // coasting rules (see `detect_auto_rails_candidates`). A
+            // nonempty hit ends the range at the completed tick
+            // `t + 1`, a fixed boundary under every §2.6.1 partition.
+            let candidates = detect_auto_rails_candidates(vessels, physics, &self.autopilots, t);
+            if !candidates.is_empty() {
+                rail_break = Some((t + 1, candidates));
+                break;
             }
             // C12-F5's release boundary — the same early-end
             // convention the rail break above uses: the flagged
@@ -5452,31 +5142,28 @@ impl World {
         }
         self.shadow_vessel(shadow, vessel);
         self.shadow_tracked(shadow);
-        // M7-A: the vessel's research projects die with it — drop the
-        // records (work-in-progress is lost, no accrual) so the heap
-        // scrub below takes their events with them. The drop shadows
-        // the science book and the heap itself, BEFORE either mutates —
-        // a post-removal Recoverable restores projects and their
-        // pending pair together.
-        research::drop_vessel_projects(
+        // M7-A: the vessel's research projects die with it — dropped
+        // inside `retire_debris_vessel`, the shared retirement tail
+        // (project drop, arena removal, aboard-crew loss, aero-cache
+        // drop) the in-bubble removal sites run under
+        // `step_bubble_range`'s borrow split. The drop shadows the
+        // science book and the heap itself BEFORE either mutates, so
+        // the heap scrub below takes their events with them — a
+        // post-removal Recoverable restores projects and their
+        // pending pair together. The returned record is unused here:
+        // unlike the bubble paths this site has no burn-exit credit
+        // to read off it and its roster bookkeeping runs eagerly
+        // below.
+        let _ = retire_debris_vessel(
+            &mut self.vessels,
+            self.physics.as_mut(),
             &mut self.science,
+            &mut self.economy,
             &mut self.event_heap,
             self.next_event_seq,
             vessel,
             shadow,
         );
-        let gone = self.vessels.remove(&vessel);
-        // Roster half of the removal: members still recorded aboard
-        // die with the vessel — the `fire_vessel_ls_depleted`
-        // precedent. `RecoverVessel` lands its crew `Unassigned`
-        // *before* calling here, so the helper's location gate leaves
-        // survivors alone.
-        if let Some(v) = &gone
-            && !v.crew.is_empty()
-        {
-            self.shadow_economy(shadow);
-            economy::lose_aboard_crew(&mut self.economy, vessel, &v.crew);
-        }
         self.tracked_vessels.remove(&vessel);
         // The focus record dies with its vessel too — a dangling
         // `active_vessel` would fail the restore gate's membership
@@ -5491,9 +5178,6 @@ impl World {
         // global, not per-vessel state).
         self.shadow_autopilots(shadow);
         self.autopilots.remove(&vessel);
-        if let Some(p) = self.physics.as_mut() {
-            p.aero.remove(&vessel);
-        }
         // Lazy no-op if the drop above already captured the heap —
         // needed when the vessel carried no projects at all.
         self.shadow_events_whole(shadow);
@@ -10022,6 +9706,133 @@ fn drive_node_burn(node: &mut Option<ManeuverNode>, body: &mut WeldedBody) -> bo
     false
 }
 
+/// §2.6.2 batch-build pass 1 — one vessel's propellant bookkeeping,
+/// extracted from `step_bubble_range`'s batch-build loop: scale the
+/// live `thrust_factor`s into the body's `Thrust` sites (M9b §3.4 —
+/// the site's `rated_n` is a derived view, re-scaled each tick so the
+/// burn executor and the force model read this tick's derate), bound
+/// each engine's coverage by the tick's tank inventory
+/// (`propellant_plans` + `apply_fuel_scales`), collect the draw those
+/// scales commit at the commanded throttle, debit it
+/// (`transfers::debit` + the contents-quantum re-weld), then restore
+/// the factor/coverage scales the re-weld reset to craft baseline and
+/// refresh the §3.1 decelerator sites. Non-`InBubble` vessels are
+/// skipped at the first boundary — their debit list stays empty, so
+/// the pass is a no-op for them.
+fn propellant_pass(vessel: &mut Vessel) -> Result<(), SimError> {
+    // Pass-1 propellant bookkeeping state for this vessel —
+    // the plans ride to the post-debit re-scale below.
+    let mut fuel_plans: Vec<FuelPlan> = Vec::new();
+    let mut fuel_debits: Vec<(ResourceId, f64)> = Vec::new();
+    {
+        let VesselState::InBubble(body) = &mut vessel.state else {
+            return Ok(());
+        };
+        if !body.pos.is_finite() {
+            return Err(SimError::Fatal("non-finite body state mid-tick"));
+        }
+        // M9b §3.4: the live `thrust_factor` reaches physics
+        // through the body's `Thrust` sites — scaled from the
+        // craft baseline each tick (idempotent across every
+        // re-weld; the site's `rated_n` is a derived view).
+        // This runs BEFORE the burn executor reads the sites'
+        // `rated_n` (`net_thrust_axis`) so the executor sees
+        // this tick's derate, not last tick's.
+        if let Some(craft) = &vessel.craft {
+            reliability::apply_thrust_factors(body, craft, &vessel.reliability);
+            // Pass-1: propellant coverage — the engines'
+            // `rated_n` is now scaled by `base·factor·cov`,
+            // so a starved engine's site already reads the
+            // limited thrust when the executor (and later
+            // the force model) reads it. The pool is
+            // normalized by the throttle the tick will
+            // command: `body.throttle` is already final
+            // here for every vessel the executor does not
+            // own (the drain applied `SetThrottle`
+            // upstream); a `Burning` node gets the
+            // full-throttle bound — the executor's
+            // final-tick partial then under-debits
+            // conservatively.
+            let burning = matches!(
+                vessel.maneuver.as_ref().map(|n| &n.status),
+                Some(ManeuverStatus::Burning(_))
+            );
+            fuel_plans = propellant_plans(
+                craft,
+                body,
+                &vessel.tank_contents,
+                &vessel.reliability,
+                if burning {
+                    1.0
+                } else {
+                    body.throttle.clamp(0.0, 1.0)
+                },
+            );
+            apply_fuel_scales(body, craft, &fuel_plans);
+        }
+        // The tick's propellant draw at the *commanded*
+        // throttle — collected here, debited below where the
+        // whole vessel is borrowable (`debit` walks
+        // `tank_contents` + part masses, then the §2.4
+        // re-weld). A `Burning` node's throttle is set by
+        // `drive_node_burn`, which now runs on the
+        // *post-debit* body below (the Δv bookkeeping needs
+        // the mass the step will actually integrate); the
+        // debit therefore reads the executor's decision
+        // previewed at the pre-debit mass — identical on
+        // every non-bucket-flip tick, and only ever higher
+        // on a flip (the post-debit `full` can shrink the
+        // committed throttle, never grow it — a slight
+        // over-debit on a mass-crossing completion tick,
+        // never a free impulse).
+        let throttle = planned_burn_throttle(&vessel.maneuver, body)
+            .unwrap_or_else(|| body.throttle.clamp(0.0, 1.0));
+        if throttle > 0.0 {
+            for p in &fuel_plans {
+                for (r, u) in &p.needs {
+                    let amt = u * p.scale * throttle;
+                    if amt > 0.0 && amt.is_finite() {
+                        fuel_debits.push((r.clone(), amt));
+                    }
+                }
+            }
+        }
+    }
+    // Pass-1: the debits + the possible contents-quantum
+    // re-weld — `transfers::debit` needs `&mut Vessel`, so
+    // the body borrow above had to close first. Ascending
+    // plan order = ascending node order = the fixed drain
+    // order; `debit` itself drains ascending `PartNodeId`.
+    if !fuel_debits.is_empty() {
+        let mut mass_changed = false;
+        for (r, amt) in &fuel_debits {
+            let (_, m) = transfers::debit(vessel, r, *amt);
+            mass_changed |= m;
+        }
+        // The `rel_rebody` convention: a re-weld failure in
+        // range is an invariant bug → `Fatal`.
+        transfers::reweld_if_mass_changed(vessel, mass_changed)
+            .map_err(|e| SimError::Fatal(e.reason()))?;
+    }
+    let VesselState::InBubble(body) = &mut vessel.state else {
+        return Ok(());
+    };
+    // A re-weld rebuilt the sites at craft baseline —
+    // restore the tick's factor + coverage scales so
+    // the batch clone reads the same thrust the
+    // executor booked. Idempotent when nothing moved.
+    if let Some(craft) = &vessel.craft {
+        reliability::apply_thrust_factors(body, craft, &vessel.reliability);
+        apply_fuel_scales(body, craft, &fuel_plans);
+        // §3.1 decelerators: the body's additive-drag
+        // sites are a pure function of (craft,
+        // deployed) — refreshed wholesale so every
+        // re-weld/materialization path agrees.
+        refresh_decel_sites(body, craft, &vessel.deployed);
+    }
+    Ok(())
+}
+
 /// M9a: what a script's tick did to its wake registration — recorded
 /// by the io and written back to `ScriptState::wake_tick` after the
 /// engine call (the script record itself is borrowed by the engine
@@ -12708,6 +12519,315 @@ fn apply_breakup(
         }
     }
     Ok(())
+}
+
+/// §3.4's burn-exit credit — a hull's burn dies with it: credit the
+/// burn-seconds its engine records still hold, the same exit-credit
+/// rule `transition_latched` and `reliability_residence_change` apply
+/// (a crash landing still produced flight-qualification data).
+/// Emitted into `rel_burns` for the removal-path drain to credit;
+/// `completed_tick` is the tick the removal landed at.
+fn push_burn_exit_credit(
+    dying: &Vessel,
+    in_atmo: bool,
+    completed_tick: u64,
+    rel_burns: &mut Vec<(csp_data::FamilyId, f64, bool)>,
+) {
+    for (node, rec) in &dying.reliability {
+        if rec.burning
+            && let Some(spec) = World::spec_for(dying, *node)
+        {
+            let burn_s = completed_tick.saturating_sub(rec.burn_start_tick) as f64
+                / csp_core::TICK_HZ as f64;
+            rel_burns.push((spec.family.clone(), burn_s, in_atmo));
+        }
+    }
+}
+
+/// The shared in-bubble retirement tail — [`World::remove_vessel`]
+/// and the borrow-split sites inside `step_bubble_range` (surface
+/// impact, `max_debris` eviction) all run this sequence: drop the
+/// vessel's research projects (M7-A — the drop shadows the science
+/// book and the heap together), remove the arena entry while losing
+/// the members still recorded aboard (the roster rule — members die
+/// with the hull, the `fire_vessel_ls_depleted` precedent), and drop
+/// the Stage-2 aero cache. Returns the removed record so the caller
+/// can finish its site-specific bookkeeping — the in-bubble sites
+/// read the hull's open burns off it for [`push_burn_exit_credit`]
+/// and push the id onto `dead_vessels`.
+///
+/// The event-heap scrub is NOT here: `remove_vessel`'s callers can
+/// meet pending vessel-named events (on-rails conics schedule them),
+/// so it rewrites the heap itself; the in-bubble sites
+/// `debug_assert` the scrub's vacuity before calling — an `InBubble`
+/// vessel is never named by a pending event.
+#[allow(clippy::too_many_arguments)]
+fn retire_debris_vessel(
+    vessels: &mut BTreeMap<VesselId, Vessel>,
+    physics: Option<&mut Physics>,
+    science: &mut ScienceState,
+    economy: &mut EconomyState,
+    event_heap: &mut BinaryHeap<ScheduledEvent>,
+    next_event_seq: u64,
+    vid: VesselId,
+    shadow: &mut TickShadow,
+) -> Option<Vessel> {
+    // M7-A: the vessel's research projects die with it — drop them
+    // (no accrual) and scrub their pending pair, which names
+    // projects, not vessels. The drop shadows the science book and
+    // the event heap itself (post-removal Recoverables restore them
+    // together).
+    research::drop_vessel_projects(science, event_heap, next_event_seq, vid, shadow);
+    // Roster half of the removal (the `remove_vessel` rule): members
+    // still recorded aboard die with the hull — read from the record
+    // we still hold.
+    let gone = vessels.remove(&vid);
+    if let Some(g) = &gone
+        && !g.crew.is_empty()
+    {
+        economy::shadow_economy(economy, &mut shadow.economy);
+        economy::lose_aboard_crew(economy, vid, &g.crew);
+    }
+    if let Some(p) = physics {
+        p.aero.remove(&vid);
+    }
+    gone
+}
+
+/// §2.6.2's per-tick consequences, extracted from
+/// `step_bubble_range`'s tick loop: apply the tick's failures and
+/// surface impacts in ascending-vessel-id order (impacts remove,
+/// §2.4 breakups split), then §3.5's `max_debris` oldest-first
+/// eviction, then the removal-path burn-credit drain. Runs under the
+/// range's borrow split, so the removals route through
+/// [`retire_debris_vessel`] and `debug_assert` the heap-scrub's
+/// vacuity instead of running it — vessel-named event kinds
+/// (SoiTransition, SoiRescan, DebrisDecay, ManeuverNodeStart) are
+/// scheduled ONLY for on-rails conics and dropped at `ToBubble`, so
+/// an `InBubble` vessel is never named by a pending event (same
+/// invariant the thermal-root removal inside `apply_breakup`
+/// relies on). `t` is the tick being completed — removals and
+/// credits stamp `t + 1`.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
+fn bubble_consequences(
+    vessels: &mut BTreeMap<VesselId, Vessel>,
+    physics: &mut Physics,
+    failures: &BTreeMap<VesselId, (Vec<csp_phys::PartNodeId>, Vec<csp_phys::PartNodeId>)>,
+    impacted: &[VesselId],
+    t: u64,
+    impacts: &mut Vec<(csp_core::DVec3, u64)>,
+    rel_burns: &mut Vec<(csp_data::FamilyId, f64, bool)>,
+    dead_vessels: &mut Vec<VesselId>,
+    next_vessel_id: &mut u64,
+    caps: VesselCaps,
+    pending_builds: u64,
+    science: &mut ScienceState,
+    science_cfg: &ScienceConfig,
+    economy: &mut EconomyState,
+    economy_cfg: &economy::EconomyConfig,
+    event_heap: &mut BinaryHeap<ScheduledEvent>,
+    next_event_seq: u64,
+    tech: &mut TechState,
+    rel_cfg: &reliability::ReliabilityConfig,
+    shadow: &mut TickShadow,
+) -> Result<(), SimError> {
+    // Apply the tick's consequences in ascending-vessel-id
+    // order: impacts remove, then §2.4 breakups split.
+    let mut affected: std::collections::BTreeSet<VesselId> = failures.keys().copied().collect();
+    affected.extend(impacted.iter().copied());
+    for vid in affected {
+        if impacted.contains(&vid) {
+            debug_assert!(
+                !event_heap.iter().any(|e| event_names_vessel(&e.kind, &vid)),
+                "in-bubble removal: a pending event outlived its conic"
+            );
+            // M8-C §3.5: record the impact point for the
+            // colony-radius damage check (post-loop) — and the
+            // completed tick `t + 1` it lands at, so the damage
+            // anchors at the impact tick rather than rewinding
+            // the colony to `now`.
+            if let Some(pos) = vessels.get(&vid).and_then(|v| v.body().map(|b| b.pos)) {
+                impacts.push((pos, t + 1));
+            }
+            let gone = retire_debris_vessel(
+                vessels,
+                Some(&mut *physics),
+                science,
+                economy,
+                event_heap,
+                next_event_seq,
+                vid,
+                shadow,
+            );
+            // §3.4: the hull's burn dies with it — credit the
+            // burn-seconds its engine records still hold, the same
+            // exit-credit rule `transition_latched` and
+            // `reliability_residence_change` apply (a crash
+            // landing still produced flight-qualification
+            // data). Drained into `rel_burns` below.
+            if let Some(dying) = &gone {
+                let in_atmo = physics.backend.environment().atmosphere.is_some();
+                push_burn_exit_credit(dying, in_atmo, t + 1, rel_burns);
+            }
+            dead_vessels.push(vid);
+            continue;
+        }
+        let (sh, th) = failures.get(&vid).cloned().unwrap_or_default();
+        apply_breakup(
+            vessels,
+            physics,
+            next_vessel_id,
+            caps,
+            pending_builds,
+            science,
+            science_cfg,
+            economy,
+            economy_cfg,
+            event_heap,
+            next_event_seq,
+            vid,
+            &sh,
+            &th,
+            t + 1,
+            dead_vessels,
+            shadow,
+        )?;
+    }
+    // §3.5's `max_debris` — oldest-debris eviction by
+    // `(debris_since, id)`, deterministic per the plan.
+    loop {
+        let mut count = 0u64;
+        let mut oldest: Option<VesselId> = None;
+        for v in vessels.values() {
+            if let Some(since) = v.debris_since {
+                count += 1;
+                if oldest.is_none_or(|o| {
+                    let os = vessels[&o].debris_since.unwrap_or(0);
+                    (since, v.id.0) < (os, o.0)
+                }) {
+                    oldest = Some(v.id);
+                }
+            }
+        }
+        if count <= caps.max_debris {
+            break;
+        }
+        if let Some(vid) = oldest {
+            // Same inline-removal invariant as the impact
+            // path above: evicted debris is `InBubble`, so no
+            // pending event can name it.
+            debug_assert!(
+                !event_heap.iter().any(|e| event_names_vessel(&e.kind, &vid)),
+                "in-bubble eviction: a pending event outlived its conic"
+            );
+            let gone = retire_debris_vessel(
+                vessels,
+                Some(&mut *physics),
+                science,
+                economy,
+                event_heap,
+                next_event_seq,
+                vid,
+                shadow,
+            );
+            // Same burn-exit credit as the impact path —
+            // eviction retires the records, so the burn's
+            // flight units are emitted first.
+            if let Some(dying) = &gone {
+                let in_atmo = physics.backend.environment().atmosphere.is_some();
+                push_burn_exit_credit(dying, in_atmo, t + 1, rel_burns);
+            }
+            dead_vessels.push(vid);
+        } else {
+            break;
+        }
+    }
+    // Removal-path burn credits (impacts, evictions, latch
+    // touchdowns all pushed into `rel_burns` since the first
+    // drain) — same in-range `Fatal`-only rule.
+    if !rel_burns.is_empty() {
+        if shadow.tech.is_none() {
+            shadow.tech = Some(tech.clone());
+        }
+        for (family, burn_s, in_atmo) in rel_burns.drain(..) {
+            let rate = if in_atmo {
+                rel_cfg.flight_units_per_s_atmosphere
+            } else {
+                rel_cfg.flight_units_per_s_vacuum
+            };
+            tech.credit_qualification(family, burn_s * rate, 0.0, 0)
+                .map_err(|e| SimError::Fatal(e.reason()))?;
+        }
+    }
+    Ok(())
+}
+
+/// §2.6.2's auto bubble→rails detection — the scan
+/// `step_bubble_range` runs on a tick's settled state (post-latch,
+/// post-consequence). The predicates are the same
+/// [`World::apply_to_rails_at`] enforces plus the coasting rules:
+/// `throttle == 0`, no maneuver (the burn executor's residence is
+/// `finish_burns`' business), not settle-latched. The cheap gates run
+/// for every body; the contact/conic checks only for coasters above
+/// the atmosphere top. Returns the qualifying vessels in
+/// ascending-id order — empty when no conversion fires this tick.
+fn detect_auto_rails_candidates(
+    vessels: &BTreeMap<VesselId, Vessel>,
+    physics: &Physics,
+    autopilots: &BTreeMap<VesselId, AutopilotState>,
+    t: u64,
+) -> Vec<VesselId> {
+    let env = physics.backend.environment();
+    // Terrain is body-fixed — the sample phase is the
+    // completed tick's, matching `surface_pose_capture`
+    // and the `set_sim_time(epoch)` the conversion itself
+    // applies.
+    physics.backend.set_sim_time(SimTime::from_ticks(t + 1));
+    let atm_top = env.atmosphere.as_ref().map_or(0.0, |a| a.top_m);
+    let mut candidates: Vec<VesselId> = Vec::new();
+    for (vid, vessel) in vessels.iter() {
+        let VesselState::InBubble(body) = &vessel.state else {
+            continue;
+        };
+        if vessel.maneuver.is_some() || body.throttle != 0.0 || body.settle.latched {
+            continue;
+        }
+        // An engaged autopilot is a live control producer:
+        // railing its vessel silences it mid-flight (the
+        // ascent program's coast phase is throttle-0 —
+        // exactly the coasting case above — and its
+        // circularization commands could never issue).
+        // Scripts are different: §2.10's wake carrier
+        // survives rails (`rearm_rails_scripts` re-arms at
+        // the transition), autopilots have no wake.
+        if autopilots.get(vid).is_some_and(|a| a.enabled) {
+            continue;
+        }
+        let rel = body.com_world() - env.body_center;
+        if rel.norm() - env.radius_m < atm_top {
+            continue;
+        }
+        if physics.backend.ground_contact(body)
+            || bubble_vessel_contact(&physics.backend, vessels, *vid, body, false)
+        {
+            continue;
+        }
+        let Ok(elements) = orbit::cartesian_to_elements(rel, body.vel, env.mu_m3_per_s2) else {
+            continue;
+        };
+        let h2 = rel.cross(body.vel).norm_squared();
+        let rp = h2 / env.mu_m3_per_s2 / (1.0 + elements.eccentricity);
+        // The same floor `apply_to_rails_at` enforces:
+        // atmosphere top, or PLAN §2.3's bubble radius
+        // where there is no atmosphere.
+        let floor = env.radius_m + atm_top.max(physics.bubble_radius_m);
+        if rp.partial_cmp(&floor) != Some(core::cmp::Ordering::Greater) {
+            continue;
+        }
+        candidates.push(*vid);
+    }
+    candidates
 }
 
 #[allow(clippy::too_many_lines)] // field-per-line walk — splitting hides order
