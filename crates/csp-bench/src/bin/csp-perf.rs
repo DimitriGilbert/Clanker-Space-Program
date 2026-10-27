@@ -15,11 +15,14 @@
 //! log (the release CI job's gate): a row more than
 //! [`perf::REGRESSION_TOLERANCE`] slower than the committed
 //! measurement, a §5.3 Pass→Fail crossing, or an unmeasured
-//! measurable row is a **regression** and fails the run.
+//! measurable row is a **regression** and fails the run. `--out`
+//! resolving to the same file as `--baseline` is refused outright —
+//! the write would clobber the baseline and the "diff" would compare
+//! the fresh log against itself.
 //!
 //! Exit codes: 0 = every measurable row inside budget and no
 //! regression, 1 = a measured row failed or regressed, 2 = usage or
-//! harness error.
+//! harness error (including the `--out` == `--baseline` refusal).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -60,6 +63,38 @@ fn run(
     if let Some(name) = machine_name {
         machine.name = name;
     }
+    let path = out.unwrap_or_else(|| perf::default_log_path(&machine));
+    // `--out` defaults to the committed per-machine log — exactly the
+    // file `--baseline` names when diffing against it. Writing first
+    // would clobber the baseline and then "diff" the fresh log
+    // against itself (a vacuous green that also dirties the tree), so
+    // the same-file case is refused outright.
+    if let Some(base_path) = &baseline_path
+        && same_file(&path, base_path)
+    {
+        eprintln!(
+            "csp-perf: refusing to overwrite the baseline — pass a different --out \
+             ({} and {} resolve to the same file)",
+            path.display(),
+            base_path.display()
+        );
+        return ExitCode::from(2);
+    }
+    // Load the baseline before the suite runs: an unreadable baseline
+    // fails fast instead of burning a full measurement pass, and the
+    // parsed log the diff below uses can never be the bytes `--out`
+    // is about to write — even for a same-file pair the guard could
+    // not prove equal (hardlinks, dangling symlink targets).
+    let baseline = match &baseline_path {
+        Some(base_path) => match perf::load_perf_log(base_path) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                eprintln!("csp-perf: baseline {} unreadable: {e}", base_path.display());
+                return ExitCode::from(2);
+            }
+        },
+        None => None,
+    };
     let log = perf::run_perf_log(Some(machine));
     println!(
         "perf log — {} ({} {}, {}, rustc {})",
@@ -83,7 +118,6 @@ fn run(
             println!("       {}", shorten(d));
         }
     }
-    let path = out.unwrap_or_else(|| perf::default_log_path(&log.machine));
     match perf::write_perf_log(&log, &path) {
         Ok(()) => println!("wrote {}", path.display()),
         Err(e) => {
@@ -92,20 +126,17 @@ fn run(
         }
     }
     // The release-CI gate: diff the fresh log against the last
-    // committed log. An unreadable baseline is a harness failure
-    // (exit 2), never a silent green — a gate that cannot load its
-    // baseline gates nothing. With `--baseline` the diff is the
-    // verdict: rows already red in the committed log stay reported
-    // but the gate checks *movement* (a permanently-red gate is a
-    // gate nobody keeps). Without it the verdict is the §5.3 budget
-    // itself (`all_passed`) — the REF-machine check.
-    let diff_mode = baseline_path.is_some();
-    let regressions = match baseline_path {
-        Some(base_path) => match baseline_diff(&log, &base_path) {
-            Ok(r) => r,
-            Err(code) => return ExitCode::from(code),
-        },
-        None => Vec::new(),
+    // committed log — already parsed above, so this compares against
+    // the committed bytes even though the write already landed. With
+    // `--baseline` the diff is the verdict: rows already red in the
+    // committed log stay reported but the gate checks *movement* (a
+    // permanently-red gate is a gate nobody keeps). Without it the
+    // verdict is the §5.3 budget itself (`all_passed`) — the
+    // REF-machine check.
+    let diff_mode = baseline.is_some();
+    let regressions = match (&baseline, &baseline_path) {
+        (Some(b), Some(base_path)) => baseline_diff(&log, b, base_path),
+        _ => Vec::new(),
     };
     if !log.all_passed() {
         eprintln!("csp-perf: at least one measurable row is over budget");
@@ -125,24 +156,21 @@ fn run(
     }
 }
 
-/// The `--baseline` half: load the committed log and report the
-/// regression diff. `Err(2)` is the unreadable-baseline harness
-/// failure.
+/// The `--baseline` half: report the regression diff against the
+/// already-loaded committed log (`base_path` is for messages only —
+/// the bytes were read before `--out` was written).
 fn baseline_diff(
     log: &perf::PerfLog,
+    baseline: &perf::PerfLog,
     base_path: &std::path::Path,
-) -> Result<Vec<perf::PerfRegression>, u8> {
-    let baseline = perf::load_perf_log(base_path).map_err(|e| {
-        eprintln!("csp-perf: baseline {} unreadable: {e}", base_path.display());
-        2
-    })?;
+) -> Vec<perf::PerfRegression> {
     if baseline.machine.name != log.machine.name {
         println!(
             "note: baseline was measured on '{}' — the diff is cross-machine",
             baseline.machine.name
         );
     }
-    let regressions = perf::regression_diff(log, &baseline);
+    let regressions = perf::regression_diff(log, baseline);
     if regressions.is_empty() {
         println!(
             "regression diff vs {}: no row regressed >{:.0}%",
@@ -163,7 +191,33 @@ fn baseline_diff(
             eprintln!("  REGRESSED {:32} {b} -> {m}: {}", r.id, r.reason);
         }
     }
-    Ok(regressions)
+    regressions
+}
+
+/// Canonical-path equality for the `--out`/`--baseline` guard.
+/// `canonicalize` wins when the file exists (resolves symlinks and
+/// `..`); a not-yet-written `--out` falls back to a normalized
+/// absolute path so `./log.ron` / `a/../log.ron` spellings still
+/// match the baseline they would clobber.
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    fn resolve(p: &std::path::Path) -> PathBuf {
+        if let Ok(c) = p.canonicalize() {
+            return c;
+        }
+        let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+        let mut n = PathBuf::new();
+        for c in abs.components() {
+            match c {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    n.pop();
+                }
+                other => n.push(other.as_os_str()),
+            }
+        }
+        n
+    }
+    resolve(a) == resolve(b)
 }
 
 /// Trim a detail line for the summary table. The byte cut is floored
@@ -187,4 +241,40 @@ fn shorten(s: &str) -> String {
 fn usage() -> ExitCode {
     eprintln!("usage: csp-perf [--out <path>] [--machine <name>] [--baseline <path>]");
     ExitCode::from(2)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// The guard's whole job: spelling variants of one file must
+    /// compare equal, different files must not.
+    #[test]
+    fn same_file_catches_spelling_variants() {
+        let dir = std::env::temp_dir().join(format!("csp-perf-same-file-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let real = dir.join("log.ron");
+        std::fs::write(&real, b"x").unwrap();
+        // Existing file → canonicalize resolves `.`/`..` and symlinks.
+        assert!(same_file(&real, &dir.join("./log.ron")));
+        assert!(same_file(&real, &dir.join("sub/../log.ron")));
+        assert!(!same_file(&real, &dir.join("other.ron")));
+    }
+
+    /// `--out` usually does not exist yet — the absolute+normalize
+    /// fallback must still prove `x` == `./x` == `a/../x`.
+    #[test]
+    fn same_file_falls_back_for_unwritten_out() {
+        let missing = Path::new("csp-perf-never-written-a/../csp-perf-never-written.ron");
+        let plain = Path::new("csp-perf-never-written.ron");
+        let dotted = Path::new("./csp-perf-never-written.ron");
+        assert!(same_file(missing, plain));
+        assert!(same_file(missing, dotted));
+        assert!(!same_file(
+            plain,
+            Path::new("csp-perf-never-written-other.ron")
+        ));
+    }
 }
