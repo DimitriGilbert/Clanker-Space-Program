@@ -42,12 +42,55 @@ pub(crate) const FLIGHT_FOV_Y: f64 = 0.9;
 /// the old vessel's range).
 const FLIGHT_DEFAULT_DIST: f64 = 60.0;
 /// Plasma sheath display window (W/m² of convective input,
-/// `FlightBody::plasma_w_m2`): first glow ≈ a fast low pass, full
-/// saturation at mild-reentry flux. Display normalization only — the
-/// sim's lethality is the M4b temperature record, not this curve.
-const PLASMA_ONSET_W_M2: f64 = 5.0e3;
+/// `FlightBody::plasma_w_m2`) — the flux half of
+/// [`plasma_intensity`]. C19-F1 recalibration: a plasma sheath is
+/// shock-layer ionization, whose onset is keyed to *speed*, not raw
+/// heat flux — and the verified Terrin table forces the two-factor
+/// shape, since a normal mid-ascent carries MORE flux than a high
+/// reentry leg (12 km @ 450 m/s → η·½ρv³ ≈ 4.4e4 W/m² vs 40 km @
+/// 2200 m/s → ≈ 3.0e4). No monotone flux window can keep that ascent
+/// dark while lighting the reentry, so:
+///
+/// ```text
+/// i = clamp((flux − ONSET)/(FULL − ONSET))      <- window
+///   · clamp((v_rel − GATE_ON)/(GATE_FULL − GATE_ON))  <- speed gate
+/// ```
+///
+/// `ONSET` 1.0e4 / `FULL` 4.0e4 reads the 40 km @ 2200 leg at
+/// i ≈ 0.66 and saturates the deep corridor (35 km @ 2300 → flux
+/// ≈ 8.5e4); the gate keeps every stock-ascent row (≤450 m/s through
+/// 7–24 km) at zero and opens fully only in the near-orbital regime
+/// (Terrin LEO ≈ 2287 m/s) a sheath belongs to. Display
+/// normalization only — the sim's lethality is the M4b temperature
+/// record, not this curve.
+const PLASMA_ONSET_W_M2: f64 = 1.0e4;
 /// See [`PLASMA_ONSET_W_M2`].
-const PLASMA_FULL_W_M2: f64 = 8.0e4;
+const PLASMA_FULL_W_M2: f64 = 4.0e4;
+/// Speed-gate lower edge (surface-relative m/s) — see
+/// [`PLASMA_ONSET_W_M2`]. Below this the sheath is dark regardless
+/// of flux: a dense slow pass heats but does not ionize.
+const PLASMA_GATE_ONSET_MPS: f64 = 1.4e3;
+/// See [`PLASMA_GATE_ONSET_MPS`] — the gate is fully open here, a
+/// margin under circular-orbit speed so a decaying entry still
+/// burns at full weight.
+const PLASMA_GATE_FULL_MPS: f64 = 2.0e3;
+
+/// The §3.7 plasma intensity — `window(flux) · gate(speed)`, the
+/// calibration documented at [`PLASMA_ONSET_W_M2`]. `speed_mps` is
+/// the surface-relative flow speed (the same `|v_rel|` the staged
+/// `plasma_w_m2` was sampled at). Shared with `csp-app`'s whoosh
+/// voice so the audible and visible plasma never drift — the old
+/// mirrored constants did (C19-F1). Non-finite inputs yield NaN,
+/// which the callers' `> 0`/`is_finite` handling rejects — the same
+/// semantics the inline window had.
+pub fn plasma_intensity(flux_w_m2: f64, speed_mps: f64) -> f64 {
+    let window =
+        ((flux_w_m2 - PLASMA_ONSET_W_M2) / (PLASMA_FULL_W_M2 - PLASMA_ONSET_W_M2)).clamp(0.0, 1.0);
+    let gate = ((speed_mps - PLASMA_GATE_ONSET_MPS)
+        / (PLASMA_GATE_FULL_MPS - PLASMA_GATE_ONSET_MPS))
+        .clamp(0.0, 1.0);
+    window * gate
+}
 
 /// One chase-camera input event — `csp-app` translates drags/wheel.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3056,17 +3099,17 @@ pub(crate) fn extract_flight(
 
         // §3.7 reentry plasma: an emissive sheath grown off the hull —
         // the leading side burns white-orange, the wake side a faint
-        // red rim (`emit_sheath` carries the details).
-        let plasma_i = ((b.plasma_w_m2 - PLASMA_ONSET_W_M2)
-            / (PLASMA_FULL_W_M2 - PLASMA_ONSET_W_M2))
-            .clamp(0.0, 1.0);
+        // red rim (`emit_sheath` carries the details). Stagnation side
+        // = the surface-relative velocity direction (the sim's own
+        // `v_rel` convention) — its magnitude is also the speed the
+        // C19-F1 gate reads, so the sheath can't light on a slow
+        // ascent pass however dense the air.
+        let v_rel = snap
+            .env
+            .as_ref()
+            .map_or(b.vel, |e| b.vel - e.body_spin.cross(b.com - e.body_center));
+        let plasma_i = plasma_intensity(b.plasma_w_m2, v_rel.norm());
         if plasma_i > 0.0 {
-            // Stagnation side = the surface-relative velocity
-            // direction (the sim's own `v_rel` convention).
-            let v_rel = snap
-                .env
-                .as_ref()
-                .map_or(b.vel, |e| b.vel - e.body_spin.cross(b.com - e.body_center));
             let flow = if v_rel.norm_squared() > 1.0 {
                 v_rel / v_rel.norm()
             } else {
@@ -3500,5 +3543,88 @@ mod tests {
             None
         );
         assert_eq!(pick_part(&cam, None, content, to_screen(DVec3::ZERO)), None);
+    }
+
+    /// C19-F1's regression guard, over the verified altitude/speed
+    /// table (verified-report-C19). Fluxes are re-derived here from
+    /// the shipped Terrin atmosphere and the staged driver's own
+    /// `η·½ρv³` formula rather than trusting the report's arithmetic:
+    /// the flux rows genuinely overlap (mid-ascent 4.4e4 > 40 km
+    /// reentry 3.0e4), so only the speed gate separates them — every
+    /// ascent row must read dark while the reentry corridor lights.
+    #[test]
+    fn plasma_window_separates_ascent_from_reentry() {
+        // `data/systems/home/terrin/body.ron`'s authored atmosphere,
+        // mirrored literally so the table evaluates under the shipped
+        // constants (p0 101325 Pa, H 5600 m, M 0.02897, γ 1.40, the
+        // four temperature knots).
+        let atm = csp_data::AtmosphereDef {
+            sea_level_pressure_pa: 101325.0,
+            scale_height_m: 5600.0,
+            top_m: 70_000.0,
+            molar_mass_kg_per_mol: 0.02897,
+            heat_capacity_ratio: 1.40,
+            temperature_knots: [
+                (0.0, 288.15),
+                (12_000.0, 216.65),
+                (40_000.0, 250.35),
+                (70_000.0, 200.15),
+            ]
+            .into_iter()
+            .map(|(altitude_m, temperature_k)| csp_data::TemperatureKnot {
+                altitude_m,
+                temperature_k,
+            })
+            .collect(),
+        };
+        // The staging code's own driver (flight.rs `plasma_w_m2`).
+        let flux = |alt_m: f64, v_mps: f64| {
+            csp_phys::CONVECTIVE_HEAT_FRACTION
+                * 0.5
+                * csp_phys::atmosphere_density_kg_m3(&atm, alt_m)
+                * v_mps.powi(3)
+        };
+        let i = |alt_m: f64, v_mps: f64| plasma_intensity(flux(alt_m, v_mps), v_mps);
+
+        // The stock-ascent band: the pre-fix window lit these to
+        // i ≈ 0.25–0.51 — every launch carried a sheath. All must
+        // read dark now (flux alone would still cross the window's
+        // onset at 12 km @ 450; only the speed gate holds it off).
+        for (alt, v) in [
+            (0.0, 200.0),
+            (8_000.0, 300.0),
+            (10_000.0, 350.0),
+            (12_000.0, 450.0),
+        ] {
+            assert!(
+                i(alt, v) <= 0.1,
+                "ascent {alt} m @ {v} m/s glowed: {}",
+                i(alt, v)
+            );
+        }
+        // The reentry corridor: partial burn on the thin 40 km pass,
+        // full saturation in the deep corridor.
+        assert!(
+            i(40_000.0, 2_200.0) >= 0.5,
+            "40 km @ 2200 reentry under-lit: {}",
+            i(40_000.0, 2_200.0)
+        );
+        assert_eq!(
+            i(35_000.0, 2_300.0),
+            1.0,
+            "35 km @ 2300 must saturate the sheath"
+        );
+        // The gate's edges: an orbital-speed pass in thin air is a
+        // faint rim, not full burn (45 km @ 2400 → flux ≈ 1.6e4), and
+        // no atmosphere means no sheath at any speed.
+        let rim = i(45_000.0, 2_400.0);
+        assert!(
+            rim > 0.0 && rim < 0.5,
+            "45 km @ 2400 should be a partial rim, got {rim}"
+        );
+        assert_eq!(plasma_intensity(0.0, 2_300.0), 0.0);
+        // Speed alone is not enough either — below the gate onset no
+        // flux level lights (a sea-level Mach-number edge case).
+        assert_eq!(plasma_intensity(1.0e6, 200.0), 0.0);
     }
 }

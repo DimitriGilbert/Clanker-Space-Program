@@ -98,14 +98,11 @@ const ENGINE_GAIN: f32 = 0.9;
 /// The plasma voice's full-saturation gain (pre-master).
 const WHOOSH_GAIN: f32 = 0.6;
 
-/// The whoosh's display normalization — the same convective-flux
-/// window `csp_view::flight` normalizes the plasma sheath by (its
-/// `PLASMA_ONSET_W_M2`/`PLASMA_FULL_W_M2` — private there; the window
-/// is a presentation curve, not sim state, so mirroring the constants
-/// here is honest).
-const PLASMA_ONSET_W_M2: f64 = 5.0e3;
-/// See `PLASMA_ONSET_W_M2`.
-const PLASMA_FULL_W_M2: f64 = 8.0e4;
+// The whoosh's intensity is `csp_view::flight::plasma_intensity`
+// itself — the same flux-window × speed-gate curve the §3.7 sheath
+// draws. (These used to be mirrored constants; C19-F1's speed gate
+// needs the vessel's `v_rel` too, so sharing the function is the
+// only honest way to keep the audible plasma on the visible one.)
 
 /// The cue text → one-shot map. The `sfx_edges` transition vocabulary
 /// maps literally — those strings are the wire format. Everything else
@@ -569,8 +566,15 @@ impl AudioBackend {
         });
         let plasma_target = focus.map_or(0.0, |v| {
             if v.plasma_w_m2.is_finite() {
-                ((v.plasma_w_m2 - PLASMA_ONSET_W_M2) / (PLASMA_FULL_W_M2 - PLASMA_ONSET_W_M2))
-                    .clamp(0.0, 1.0) as f32
+                // The gate's speed is the same surface-relative
+                // `v_rel` the sheath solves (`flow_sample`'s
+                // convention) — `vel` alone under the view's own
+                // no-environment fallback.
+                let v_rel = snap
+                    .env
+                    .as_ref()
+                    .map_or(v.vel, |e| v.vel - e.body_spin.cross(v.com - e.body_center));
+                csp_view::flight::plasma_intensity(v.plasma_w_m2, v_rel.norm()) as f32
             } else {
                 0.0
             }
@@ -814,7 +818,10 @@ mod tests {
                 id: 1,
                 pos: csp_core::DVec3::ZERO,
                 rot: csp_core::DQuat::IDENTITY,
-                vel: csp_core::DVec3::ZERO,
+                // Reentry speed: C19-F1's speed gate reads `|v_rel|`
+                // (`env: None` → v_rel = vel), so a stationary vessel
+                // carrying flux alone must — and does — read silent.
+                vel: csp_core::DVec3::new(0.0, 0.0, -2200.0),
                 throttle: 0.7,
                 debris: false,
                 contact: false,
