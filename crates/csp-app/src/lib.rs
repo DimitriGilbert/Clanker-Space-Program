@@ -1089,11 +1089,36 @@ impl App {
                     self.world_rebuilt = true;
                     self.fatal = None;
                     self.read_only = false;
+                    // The fresh native world is EMPTY — `View::new`
+                    // seeds colonies but no vessel, the same void
+                    // `App::new_inner`'s starter seed exists to avoid;
+                    // re-run it so New Game lands on the pad, not the
+                    // purple void (C24-F1). The demo world self-seeds
+                    // inside `new_game`, hence the `is_demo` guard.
+                    // A seed failure means the data set broke between
+                    // boots — the world swap already happened and is
+                    // valid, so the reason goes on the cue channel
+                    // rather than failing an op that cannot roll back.
+                    if !self.view.is_demo()
+                        && let Err(e) = self.view.seed_starter_craft()
+                    {
+                        self.view
+                            .flight_notice(format!("starter craft seed failed: {e}"));
+                    }
                     self.warp = WarpController::new();
                     // Fresh vessel set, fresh ids — the old axis binding
                     // is stale by definition.
                     self.reset_throttle_axis();
                     self.apply_startup_difficulty();
+                    // The controller swap reset the M10 "max time warp"
+                    // cap to the ladder top — re-apply the live
+                    // settings so the cap survives New Game (C25-F1).
+                    // On a fresh controller `set_cap_multiplier` hits
+                    // `demote`'s rung≥effective early return, so no
+                    // phantom `SetWarp` lands in the §7.6 log, and the
+                    // zoom factor needs re-applying anyway: `new_game`
+                    // replaced the whole `View`, egui context included.
+                    self.apply_live_settings();
                     self.view.flight_notice("NEW GAME");
                 }
                 Err(e) => self.view.flight_notice(format!("new game failed: {e}")),
@@ -3568,6 +3593,84 @@ mod tests {
         // pod + tank + engine + canister + battery (W1.5-b).
         app.view
             .with_vab_session(|v| assert_eq!(v.session().len(), 5));
+    }
+
+    /// C24-F1: the Game-menu verb, not just the constructor. The
+    /// session-op `NewGame` calls `view.new_game()`, which replaces the
+    /// whole `View` with a `View::new()` that seeds colonies but NO
+    /// vessel — without the re-seed the player lands on the verified
+    /// "purple void": no flight focus, a blank VAB session.
+    /// `new_game_boots_with_a_pad_vessel` above pins the constructor
+    /// half; this drives `request_session_op`/`run_session_op` — the
+    /// path the menu's New Game button actually takes.
+    #[test]
+    fn new_game_session_op_reseeds_the_pad_vessel() {
+        let dir = tempdir("new-game-op-seed");
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        app.request_session_op(SessionOp::NewGame);
+        app.run_session_op();
+        app.view.begin_frame();
+        app.view.sim_step(1).unwrap();
+        app.view.end_frame();
+        assert_eq!(app.view.mode(), ViewMode::Flight);
+        assert!(
+            app.view.flight_focus().is_some(),
+            "New Game landed on an empty world — the purple void"
+        );
+        // …and the VAB session carries the starter craft, not a blank
+        // editor (the seed's `seed_pad_craft` half).
+        app.view
+            .with_vab_session(|v| assert_eq!(v.session().len(), 5));
+    }
+
+    /// C25-F1: New Game must not drop the M10 "max time warp" cap. The
+    /// session op swaps in a fresh `WarpController` (cap_idx = ladder
+    /// top) and only `apply_live_settings` re-installs the settings
+    /// ceiling — without it the cap silently resets and a WarpUp press
+    /// at the REAL ceiling refuses with "LADDER TOP", naming a limit
+    /// the player never set. Drive it through a settings file with the
+    /// cap at ×100, the real verb, then a press past the cap.
+    #[test]
+    fn new_game_keeps_the_settings_warp_cap() {
+        let dir = tempdir("new-game-warp-cap");
+        let path = dir.join("settings.ron");
+        let mut settings = Settings::default();
+        settings.gameplay.max_warp_multiplier = 100;
+        settings_io::save_settings_to(&path, &settings).unwrap();
+        let mut app = App::new_with_settings_path(&path);
+        // The constructor applied the cap — pinned so the session op
+        // is what must preserve it.
+        assert!(app.warp.capped_below_ladder_top());
+        app.request_session_op(SessionOp::NewGame);
+        app.run_session_op();
+        // The seed delivered the starter craft surface-latched, so the
+        // §2.6.2 rails predicate is vacuous and presses reach the
+        // ceiling check.
+        assert!(app.view.sim.rails_warp_refusal().is_none());
+        assert!(
+            app.warp.capped_below_ladder_top(),
+            "New Game dropped the settings warp cap"
+        );
+        app.warp.request_step(99);
+        app.warp.decide();
+        assert_eq!(app.warp.requested_multiplier(), 100);
+        app.dispatch(KeyAction::WarpUp);
+        let cues: Vec<String> = app
+            .view
+            .world
+            .resource::<csp_view::flight::FlightSfx>()
+            .cues
+            .iter()
+            .map(|c| c.text.clone())
+            .collect();
+        assert!(
+            cues.iter().any(|c| c.contains("SETTINGS LIMIT")),
+            "the ceiling press must name the settings cap: {cues:?}"
+        );
+        assert!(
+            !cues.iter().any(|c| c.contains("LADDER TOP")),
+            "the press blamed the ladder, not the settings cap: {cues:?}"
+        );
     }
 
     /// A rebound key resolves to its new action — the input layer reads
