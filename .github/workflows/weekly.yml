@@ -1,0 +1,68 @@
+# §8.2's weekly tier — mutation testing, MSRV, and the quality rows
+# whose runtime has no place on the per-commit path (§8.7.6).
+# `workflow_dispatch` for on-demand runs.
+#
+# Recorded deferral (§8.2 "Code quality" row): `xtask lint-quality`
+# (cognitive-complexity budgets, cargo-geiger, duplication stats) is not
+# implemented — there is no verb to schedule. This job family picks it
+# up when the xtask side lands.
+name: weekly
+
+on:
+  schedule:
+    - cron: "41 5 * * 1" # Mondays
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # §8.2: cargo-mutants on the determinism crates, capped at ~45 min.
+  # Mutants are how we know the property tests bite — the row's gate
+  # semantics: harness failure is red, a missed mutant is a tracked
+  # metric (the report prints it; §8.2 assigns the follow-up to
+  # process, not to the job).
+  mutants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+      - name: cargo-mutants (45-minute cap, determinism crates)
+        run: |
+          set +e
+          timeout -s TERM 2700 \
+            cargo mutants -p csp-core -p csp-data -p csp-phys -p csp-sim \
+              --timeout 120
+          code=$?
+          set -e
+          if [ ! -d mutants.out ]; then
+            echo "cargo-mutants produced no report — harness failure (exit $code)"
+            exit 1
+          fi
+          if [ "$code" -eq 124 ]; then
+            echo "hit the 45-minute cap — reporting the partial run"
+          fi
+          echo "=== missed mutants (tracked, not gated — §8.2) ==="
+          cat mutants.out/missed.txt 2>/dev/null || echo "(none reported)"
+          cat mutants.out/timeout.txt 2>/dev/null || true
+          exit 0
+
+  # §8.2 MSRV row: verify `rust-version = "1.95"` actually builds the
+  # workspace. Direct toolchain check rather than `cargo msrv` — the
+  # question asked is "does 1.95 compile this", and `cargo +1.95.0
+  # check` answers it without a second tool's manifest quirks (the
+  # workspace manifest is virtual; cargo-msrv's rust-version probe is
+  # built for package manifests).
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: install the declared MSRV toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal
+      - name: MSRV check (rust-version = "1.95")
+        run: cargo +1.95.0 check --workspace --locked

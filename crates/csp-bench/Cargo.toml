@@ -24,6 +24,11 @@ csp-server = { workspace = true }
 # Scripted-controller math (atan2/acos/apsis estimates) — deterministic
 # math only, matching the sim's own rule.
 libm = { workspace = true }
+# §5.4's VAB-latency perf row measures the real op+frame path — the
+# session lives in csp-ui and the frame pipeline in csp-view (C17-F5).
+# Native-only crate; these edges never reach a wasm tree.
+csp-ui = { workspace = true }
+csp-view = { workspace = true }
 # §3.1 fixture hashing (the replay artifact's data_fixture_hash).
 blake3 = { workspace = true }
 # §7.6: replay logs stay bincode, version-scoped by T3. `serde` feature for

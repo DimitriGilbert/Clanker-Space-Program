@@ -85,7 +85,10 @@ pub const BUDGET_ROWS: &[BudgetRow] = &[
         unit: UNIT_MS_TICK,
         measurable: true,
         note: "step_frame mean over the flight-launch fixture's Terrin, \
-               200-part tower at 20 km on an orbital tangent",
+               200-part tower at 20 km on an orbital tangent. C29-F1 \
+               triage: red since the post-baseline growth phase (57 \
+               commits / +58k LOC past the 2026-10-23 log) — the \
+               deviation is recorded here, not re-budgeted away",
     },
     BudgetRow {
         id: "sim.1000-part-orbit",
@@ -93,7 +96,10 @@ pub const BUDGET_ROWS: &[BudgetRow] = &[
         budget: 2.0,
         unit: UNIT_MS_TICK,
         measurable: true,
-        note: "step_frame mean, 1000-part tower on a 300 km circular orbit",
+        note: "step_frame mean, 1000-part tower on a 300 km circular \
+               orbit. C29-F1 triage: red since the post-baseline growth \
+               phase (57 commits / +58k LOC past the 2026-10-23 log) — \
+               the deviation is recorded here, not re-budgeted away",
     },
     BudgetRow {
         id: "sim.300-part-landed",
@@ -153,6 +159,18 @@ pub const BUDGET_ROWS: &[BudgetRow] = &[
         measurable: true,
         note: "dashboard field-set projection serialized to JSON; ≤16 KiB \
                per frame at 16 Hz",
+    },
+    BudgetRow {
+        id: "vab.interaction-300-part",
+        scene: "VAB interaction latency, 300-part craft (op + frame)",
+        budget: 16.0,
+        unit: UNIT_MS,
+        measurable: true,
+        note: "worst of 5 trials: one session op + one full end_frame \
+               (dirty recompute + egui pass + packet build) — the §5.4 \
+               kill criterion is CPU work and headless-measurable; the \
+               hard release assert lives in csp-view/tests/vab_latency.rs \
+               (C17-F5)",
     },
     // --- hardware-gated fps rows (§8.2: reference-machine gates) ---
     BudgetRow {
@@ -513,6 +531,7 @@ fn measure_row(id: &str) -> Result<Measurement, ReplayError> {
         "weld.stage1-1000-part" => measure_weld1_1000(),
         "weld.stage2-300-part" => measure_voxelize_300(),
         "telemetry.1000-part" => measure_telemetry_1000(),
+        "vab.interaction-300-part" => measure_vab_300(),
         _ => Err(ReplayError::MalformedGolden(
             "perf: measurable row without a benchmark arm",
         )),
@@ -1065,6 +1084,86 @@ fn measure_telemetry_1000() -> Result<Measurement, ReplayError> {
     })
 }
 
+/// §5.4's kill criterion, measured headless — the latency is CPU work
+/// (session op + dirty-gated recompute + egui pass + RenderExtract
+/// packet build), so no GPU is needed. Mirrors the probe in
+/// `csp-view/tests/vab_latency.rs` (that test owns the hard 16 ms
+/// release assert; this row exists so the committed log carries the
+/// same measurement under the movement band — C17-F5). The 300-part
+/// stack is built through the real op channel, same as the test.
+fn measure_vab_300() -> Result<Measurement, ReplayError> {
+    use csp_ui::vab::VabAction;
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
+    let parts = csp_data::load_parts(&root.join("parts")).map_err(ReplayError::Load)?;
+    let res = csp_data::load_resources(&root.join("resources.ron")).map_err(ReplayError::Load)?;
+
+    let mut view = csp_view::View::with_sim(World::new());
+    view.install_vab_catalog(parts, res);
+    view.set_mode(csp_view::ViewMode::Vab);
+
+    view.with_vab_session(|v| v.apply(VabAction::SetRoot(csp_data::PartId::from("csp.tank.s320"))))
+        .map_err(|_| ReplayError::MalformedGolden("perf: vab SetRoot rejected"))?;
+    let mut parent =
+        view.with_vab_session(|v| v.session().root())
+            .ok_or(ReplayError::MalformedGolden(
+                "perf: vab session has no root",
+            ))?;
+    for _ in 1..300 {
+        view.with_vab_session(|v| {
+            v.apply(VabAction::AttachAuto {
+                part: csp_data::PartId::from("csp.tank.s320"),
+                parent,
+            })
+        })
+        .map_err(|_| ReplayError::MalformedGolden("perf: vab AttachAuto rejected"))?;
+        parent = view
+            .with_vab_session(|v| v.session().iter().last().map(|(id, _)| id))
+            .ok_or(ReplayError::MalformedGolden("perf: vab session emptied"))?;
+    }
+    if view.with_vab_session(|v| v.session().len()) != 300 {
+        return Err(ReplayError::MalformedGolden(
+            "perf: vab stack did not reach 300 parts",
+        ));
+    }
+
+    // One unmeasured frame first — the 300-op build left the session
+    // dirty, and measuring THAT frame would bill the full recompute to
+    // the "clean" warm-up. Same ordering the test uses.
+    view.begin_frame();
+    view.end_frame();
+
+    let mut worst_ms = 0.0f64;
+    for _ in 0..5 {
+        let top = view
+            .with_vab_session(|v| v.session().iter().last().map(|(id, _)| id))
+            .ok_or(ReplayError::MalformedGolden("perf: vab session emptied"))?;
+        let t = Instant::now();
+        view.with_vab_session(|v| {
+            let _ = v.apply(VabAction::SetStage {
+                node: top,
+                stage: 0,
+            });
+            let n = v.session().iter().nth(10).map(|(id, _)| id);
+            if let Some(n) = n {
+                let _ = v.apply(VabAction::SetScale {
+                    node: n,
+                    scale: 1.0,
+                });
+            }
+        });
+        let op_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let t = Instant::now();
+        view.begin_frame();
+        view.end_frame();
+        worst_ms = worst_ms.max(op_ms + t.elapsed().as_secs_f64() * 1000.0);
+    }
+    Ok(Measurement {
+        value: worst_ms,
+        detail: "worst of 5 trials, 300-part stack via VabAction ops".to_string(),
+    })
+}
+
 #[cfg(test)]
 // Tests signal failure by panicking; §2.13's no-panic rule covers the
 // shipping fallible paths. Debug runs assert the measurements resolve
@@ -1126,10 +1225,12 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(ids.len(), sorted.len(), "duplicate budget row ids");
-        // The §5.3 table: 9 measurable CPU rows + 9 gated (8 fps + wasm voxelize).
+        // The §5.3 table: 9 measurable CPU rows + 9 gated (8 fps + wasm
+        // voxelize); the C17-F5 `vab.interaction-300-part` row is the
+        // §5.4 kill criterion riding this log, so measurable is 10.
         assert_eq!(
             BUDGET_ROWS.iter().filter(|r| r.measurable).count(),
-            9,
+            10,
             "the §5.3 CPU rows drifted from the table"
         );
         assert_eq!(

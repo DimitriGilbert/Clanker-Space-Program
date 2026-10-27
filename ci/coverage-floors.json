@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "note": "PLAN §8.2 coverage floors. `floor` is the §8.2 spec floor; `recorded` is the last measured line coverage and the ratchet reference — a floored crate may not drop >0.5 pp below it. Bump `recorded` (and `floor` where it exceeds spec) upward only. Seeded from a devbox `cargo llvm-cov --workspace --all-targets` run at the CI-tier commit.",
+  "ratchet_pp": 0.5,
+  "crates": {
+    "csp-core": { "floor": 90.0, "recorded": 97.29 },
+    "csp-data": { "floor": 80.0, "recorded": 83.74 },
+    "csp-phys": { "floor": 80.0, "recorded": 93.58 },
+    "csp-sim":  { "floor": 80.0, "recorded": 92.94 },
+    "csp-view": { "floor": 60.0, "recorded": 84.11 }
+  }
+}

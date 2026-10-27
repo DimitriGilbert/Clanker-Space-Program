@@ -1,0 +1,31 @@
+# §8.2 "Dead code / deps" row: `cargo-machete` (unused deps) runs weekly
+# AND on every dependency-touching PR — a dep manifest is where unused
+# deps are born, so the PR that adds one pays for the check it needs.
+name: deps
+
+on:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - "crates/*/Cargo.toml"
+      - "xtask/Cargo.toml"
+  schedule:
+    - cron: "41 5 * * 1" # Mondays, beside the weekly tier
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  machete:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete
+      - name: cargo-machete (unused deps)
+        run: cargo machete

@@ -1010,6 +1010,8 @@ dependencies = [
  "csp-script",
  "csp-server",
  "csp-sim",
+ "csp-ui",
+ "csp-view",
  "libm",
  "ron",
  "serde",
@@ -5018,6 +5020,7 @@ version = "0.0.0"
 dependencies = [
  "csp-bench",
  "image",
+ "libm",
  "miniz_oxide 0.9.1",
  "ron",
  "serde",

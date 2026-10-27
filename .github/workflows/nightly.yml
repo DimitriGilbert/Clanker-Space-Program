@@ -1,0 +1,168 @@
+# §8.2's nightly tier — the slow gates that don't fit the per-commit
+# <5 min budget (§8.7.6). `workflow_dispatch` stays so a suspect commit
+# can be re-checked without waiting for the clock.
+#
+# §8.2 rows this workflow deliberately does NOT carry (recorded
+# deferrals, not silent gaps):
+#
+# - **Physics oracle** (SimpleBackend vs RapierBackend): RapierBackend
+#   does not exist — `parry3d-f64`/`rapier3d-f64` are workspace
+#   declarations with no type behind them (the 7.x backend decision is
+#   open). Scheduled if/when the backend lands.
+# - **Baseline screenshots** (lavapipe, loose tolerance): no
+#   golden-image comparison harness exists; `csp-view/tests/
+#   render_gate.rs` is the adjacent real check and already runs
+#   per-commit.
+# - **`csp --smoke` app e2e** (§8.5): the flag doesn't exist yet.
+# - **`xtask lint-quality`** (§8.2 code-quality row): the verb is not
+#   implemented — needs the complexity-budget machinery.
+name: nightly
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # §8.2 "Golden replays (full)": every registered scenario under the
+  # release profile — the long scenarios the per-commit debug loop
+  # can't afford live here. The registry drives the list, so new
+  # recipes are picked up automatically.
+  golden-full:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: golden replays (release, every registered scenario)
+        run: |
+          cargo build --release -p csp-bench --bin csp-replay
+          for s in $(./target/release/csp-replay list); do
+            ./target/release/csp-replay verify "data/test-fixtures/$s" || exit 1
+          done
+
+  # §8.3 economy harness — the 100-sim-year fast-forward on shipping
+  # data (drain band, ≤32 MB save bound, insolvency transition).
+  # Release profile: the horizon is too long for a debug build to be
+  # a sane nightly step.
+  economy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: economy harness (100 sim-years, §8.3 bands)
+        run: "cargo test --release -p csp-bench economy::"
+
+  # §8.5 sim e2e — the full committed eval-scenario suite (the
+  # per-commit `cargo test` run covers it too; this is the release-
+  # profile reading and the place longer scenarios land).
+  eval-suite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: eval suite (release)
+        run: cargo run --release -p csp-bench --bin csp-eval -- \
+          --suite data/eval-scenarios --fixtures-root data/test-fixtures
+
+  # §8.2 cross-platform divergence REPORT — T1 replays on the other
+  # hosted platforms. The spec is explicit: report, never fail — a
+  # divergence is a finding to triage, not a merge blocker. Each row's
+  # verdict lands in the step summary; the job itself stays green as
+  # long as the harness ran (a csp-replay BUILD failure is a failure —
+  # a verify verdict never is).
+  cross-platform:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: build csp-replay
+        run: cargo build --release -p csp-bench --bin csp-replay
+      - name: T1 replays (report-only)
+        shell: bash
+        run: |
+          {
+            echo "### cross-platform golden replay report (${{ matrix.os }})"
+            echo ""
+            echo '| scenario | verdict |'
+            echo '|---|---|'
+          } >> "$GITHUB_STEP_SUMMARY"
+          for s in $(./target/release/csp-replay list); do
+            if out=$(./target/release/csp-replay verify "data/test-fixtures/$s" 2>&1); then
+              verdict="ok"
+            else
+              verdict="DIVERGED or failed"
+            fi
+            echo "$s: $verdict"
+            echo "$out" | tail -3
+            echo "| $s | $verdict |" >> "$GITHUB_STEP_SUMMARY"
+          done
+          # Never exit non-zero on a verdict — §8.2 names this row a
+          # report, not a gate.
+
+  # §8.2 dead-code/deps row (the udeps half — machete lives in
+  # deps.yml). cargo-udeps needs a nightly cargo; the workspace pin is
+  # the 1.97.1 stable channel, so a minimal nightly is installed just
+  # for this job.
+  udeps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-udeps
+      - name: nightly toolchain (cargo-udeps needs it)
+        run: rustup toolchain install nightly --profile minimal
+      - name: cargo-udeps
+        run: cargo +nightly udeps --workspace
+
+  # C29-F2: refresh the committed ci-host perf baseline so the
+  # per-commit 10% regression band diffs same-machine numbers instead
+  # of comparing a GitHub runner against the devbox log. The artifact
+  # is a measurement log, not code: the commit lands like any
+  # regeneration (docs/perf/ is the committed-baseline home per
+  # AGENTS.md). Requires contents:write; if branch protection rejects
+  # the push this job fails loudly and the per-commit job keeps using
+  # the devbox seed (it prints which baseline it used).
+  perf-baseline:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: perf-baseline-refresh
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: measure the ci-host baseline (release)
+        # `|| true`: csp-perf exits non-zero when a measurable row is
+        # over budget — the two known-red rows do that on every run —
+        # but it writes the log before the verdict, and a red row
+        # still wants a committed baseline.
+        run: |
+          cargo build --release -p csp-bench --bin csp-perf
+          ./target/release/csp-perf --machine ci-host \
+            --out docs/perf/perf-log-ci-host-release.ron || true
+      - name: commit the refreshed baseline
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/perf/perf-log-ci-host-release.ron
+          if git diff --cached --quiet; then
+            echo "baseline unchanged — nothing to commit"
+            exit 0
+          fi
+          git commit -m "chore(perf): refresh ci-host baseline"
+          # Main may have moved since checkout — rebase the refresh on
+          # top so the push is a fast-forward; a collision on this file
+          # fails loudly rather than force-pushing.
+          git fetch origin main
+          git rebase origin/main
+          git push origin HEAD:main

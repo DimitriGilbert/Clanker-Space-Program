@@ -348,8 +348,8 @@ blast radius:
 | Any hashed file under `data/` (all of it except `data/art/*` art extensions and `data/test-fixtures/`) | `data_set_hash` → new saves record the new hash; loading an old save **warns on drift** (PLAN §7.7); in-flight craft are safe (BuiltPart froze their numbers) | None required; expect the drift warning on old saves |
 | Shipping data (parts/bodies/balance) | **Golden replays do NOT red** — they load frozen copies under `data/test-fixtures/<scenario>/` (PLAN §8.3) | None |
 | Fixture data or sim serialization | Golden replays red; bincode artifact may fail to decode | `cargo run -p xtask -- bless-goldens --reason "<behavioural change>"` |
-| Biome map rules (the generator's authored region rules) | `data/systems/home/*/biomes.png` must stay byte-identical to the generator | Run `cargo run -p xtask --bin gen_biome_maps --check` manually — **not CI-gated** (no workflow or test invokes it); regenerate without `--check` |
-| Art sources (`assets/src/`) | `data/art/*.csar` packs | `cargo run -p xtask --bin bake_art` |
+| Biome map rules (the generator's authored region rules) | `data/systems/home/*/biomes.png` must stay byte-identical to the generator | `cargo run -p xtask --bin gen_biome_maps -- --check` — **CI-gated** per commit; regenerate without `--check` |
+| Art sources (`assets/src/`) | `data/art/*.csar` packs | `cargo run -p xtask --bin bake_art`; `bake_art -- --check` byte-compares the packs in CI — the mesh path's floats go through libm so the compare is cross-machine stable |
 | A schema field | Bump the file-type's `SCHEMA_VERSION` const in the same commit; decide the acceptance band (exact vs current+previous) per §1.2 |
 
 ### 2.1 bless-goldens (`xtask/src/main.rs::bless_goldens`)

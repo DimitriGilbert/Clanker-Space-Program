@@ -128,18 +128,17 @@ pub fn check_reach(root: &Path) -> Vec<String> {
     }
     let mut failures = Vec::new();
     for (name, annotation) in &variants {
-        let mut issuers = Vec::new();
-        for (path, text) in &sources {
-            if text.contains(&format!("SimCommand::{name}")) {
-                issuers.push(path.clone());
-            }
-        }
+        // Only the presence of an issuer matters to the verdict — the
+        // file list itself is not reported, so `any` (not a collected
+        // Vec) is the honest shape.
+        let has_issuer = sources
+            .iter()
+            .any(|(_, text)| text.contains(&format!("SimCommand::{name}")));
         let disposition = match annotation {
             Some(reason) => Disposition::OptedOut(reason.clone()),
-            None if issuers.is_empty() => Disposition::Missing,
+            None if !has_issuer => Disposition::Missing,
             None => Disposition::Issued,
         };
-        let _ = &issuers;
         match disposition {
             Disposition::Issued => {}
             Disposition::OptedOut(r) => {

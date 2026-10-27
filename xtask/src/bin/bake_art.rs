@@ -1,6 +1,19 @@
-//! `cargo run -p xtask --bin bake_art` — bake the real art assets in
-//! `assets/src/` (see `assets/ASSETS.md` for provenance/licenses) into the
-//! `.csar` packs the shipped build loads from `data/art/`.
+//! `cargo run -p xtask --bin bake_art [--check]` — bake the real art
+//! assets in `assets/src/` (see `assets/ASSETS.md` for
+//! provenance/licenses) into the `.csar` packs the shipped build loads
+//! from `data/art/`.
+//!
+//! `--check` rebakes in memory and byte-compares against the committed
+//! packs without writing — the CI staleness gate (C35-F2). The packs
+//! are `include_bytes!`-embedded and the data-set hash deliberately
+//! excludes `data/art/**`, so nothing else catches a bake-input commit
+//! that forgot the rebake. The byte-compare needs the bake to be
+//! cross-machine deterministic: the mesh path's transcendentals go
+//! through `libm` (see parts/mod.rs), and miniz_oxide is pure Rust.
+//! The one residual platform-bound step is the `image` crate's
+//! Lanczos3 resampler inside `load_rgba8` — its sinc kernel uses std
+//! `sin`; if `--check` ever false-reds across glibc versions, the fix
+//! is a vendored integer resampler, not a tolerance compare.
 //!
 //! ## `.csar` (Clanker Space Art Resource) — little-endian
 //!
@@ -207,7 +220,11 @@ fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     ]
 }
 fn len(a: [f64; 3]) -> f64 {
-    dot(a, a).sqrt()
+    // libm, not `f64::sqrt`: the `--check` gate byte-compares a fresh
+    // bake on CI-HOST against packs baked elsewhere, and std
+    // transcendentals resolve to the host libm (ulp drift across glibc
+    // versions). See the determinism note in parts/mod.rs.
+    libm::sqrt(dot(a, a))
 }
 fn unit(a: [f64; 3]) -> [f64; 3] {
     let l = len(a);
@@ -388,7 +405,7 @@ fn finish(pos: &[[f64; 3]], faces: &[Face], tint: &[f32]) -> MeshEntry {
             let k = f.v.iter().position(|&x| x == v).unwrap();
             let e1 = unit(sub(pos[f.v[(k + 1) % 3] as usize], pos[v as usize]));
             let e2 = unit(sub(pos[f.v[(k + 2) % 3] as usize], pos[v as usize]));
-            let ang = dot(e1, e2).clamp(-1.0, 1.0).acos();
+            let ang = libm::acos(dot(e1, e2).clamp(-1.0, 1.0));
             let n = scale(fns[fi], ang.max(1e-6));
             let wedge_list = &mut wedge_nrm[v as usize];
             match wedge_list.iter_mut().find(|(id, _)| *id == w) {
@@ -499,7 +516,7 @@ fn downsample(level: &[u8], w: usize, h: usize, normal: bool) -> (Vec<u8>, usize
                         }
                     }
                 }
-                let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+                let l = libm::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
                 // Degenerate (opposing normals cancel) → up vector.
                 let s = if l > 1e-6 { 1.0 / l } else { 0.0 };
                 for c in 0..3 {
@@ -588,17 +605,30 @@ fn image_entry(w: u16, h: u16, level0_layers: Vec<Vec<u8>>, normal: bool) -> Ima
 // ---------------------------------------------------------------------------
 
 fn main() {
+    // Strict flags — `--check` must not silently swallow a typo'd
+    // argument (e.g. `--chek` would run the WRITE path and overwrite
+    // the committed packs). Same contract as gen_biome_maps.
+    let mut check = false;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--check" => check = true,
+            other => {
+                eprintln!("usage: bake_art [--check]\nunknown arg {other}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let src = root.join("assets/src");
     let out = root.join("data/art");
-    fs::create_dir_all(&out).unwrap();
 
     // --- rocket part models (procedurally authored — see parts.rs) ---
-    // Both packs ASSEMBLE fully before either writes: the old order
-    // committed parts.csar before the terrain sources decoded, so a
-    // corrupt jpg left a fresh parts pack beside a stale terrain pack
-    // — silently mixed generations embedded by include_bytes
-    // (C19bake-F3).
+    // Both packs ASSEMBLE fully before either writes (or compares):
+    // the old order committed parts.csar before the terrain sources
+    // decoded, so a corrupt jpg left a fresh parts pack beside a stale
+    // terrain pack — silently mixed generations embedded by
+    // include_bytes (C19bake-F3).
     let entries: Vec<(&str, Entry)> = parts::build_all()
         .into_iter()
         .map(|(k, m)| (k, Entry::Mesh(m)))
@@ -649,7 +679,34 @@ fn main() {
     ];
     let terrain_bytes = assemble_csar(&entries);
 
-    // Both packs assembled — publish each atomically.
+    // Both packs assembled — `--check` compares, the write path
+    // publishes each atomically.
+    if check {
+        let mut stale = Vec::new();
+        for (name, bytes) in [
+            ("parts.csar", &parts_bytes),
+            ("terrain.csar", &terrain_bytes),
+        ] {
+            let path = out.join(name);
+            match fs::read(&path) {
+                Ok(on_disk) if on_disk == *bytes => {}
+                Ok(_) => stale.push(path.display().to_string()),
+                // A missing/unreadable pack is stale by definition — a
+                // gate that needs a file it cannot read is not green.
+                Err(e) => stale.push(format!("{} ({e})", path.display())),
+            }
+        }
+        if !stale.is_empty() {
+            eprintln!(
+                "bake_art: stale art packs (run without --check to rebake): {}",
+                stale.join(", ")
+            );
+            std::process::exit(1);
+        }
+        println!("bake_art: all committed .csar packs match bake output");
+        return;
+    }
+    fs::create_dir_all(&out).unwrap();
     atomic_write(&out.join("parts.csar"), &parts_bytes);
     atomic_write(&out.join("terrain.csar"), &terrain_bytes);
 }

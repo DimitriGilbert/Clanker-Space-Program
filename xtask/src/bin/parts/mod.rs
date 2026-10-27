@@ -33,6 +33,13 @@
 //! so the `.csar` format and the `csp-view` decoder are untouched.
 //! Authored at real part dimensions (m, z-up stack axis);
 //! `emit_model` affine-fits each model into its collider AABB.
+//!
+//! All transcendentals here go through the `libm` crate, never
+//! `f64::sin`/`cos`/`powf`/`sqrt` etc: `bake_art --check` byte-compares
+//! a fresh bake against the committed packs on CI-HOST, and std
+//! transcendentals resolve to the *host's* libm, whose ulps differ
+//! across glibc versions. libm is pure Rust and identical everywhere
+//! (the same rule the sim itself follows).
 
 use std::collections::BTreeMap;
 
@@ -173,7 +180,7 @@ fn lathe(
         let (z, r) = profile[i];
         let a = TAU * j as f64 / segs as f64;
         let rr = r * rmod(i, j);
-        [rr * a.cos(), rr * a.sin(), z]
+        [rr * libm::cos(a), rr * libm::sin(a), z]
     };
     let axis = |i: usize| -> [f64; 3] { [0.0, 0.0, profile[i].0] };
     // Intended visible-side direction for strip i at angular mid θ:
@@ -184,7 +191,7 @@ fn lathe(
             profile[i + 1].1 - profile[i].1,
         );
         let am = TAU * (j as f64 + 0.5) / segs as f64;
-        unit([dz * am.cos(), dz * am.sin(), -dr])
+        unit([dz * libm::cos(am), dz * libm::sin(am), -dr])
     };
     for i in 0..n - 1 {
         let lo = profile[i].1 <= 1e-9;
@@ -293,7 +300,7 @@ fn tube(b: &mut B, path: &[[f64; 3]], r: f64, segs: usize, col: [u8; 4]) {
     let ring = |i: usize, j: usize| -> [f64; 3] {
         let a = TAU * j as f64 / segs as f64;
         let (u, v) = frames[i];
-        let (ca, sa) = (a.cos(), a.sin());
+        let (ca, sa) = (libm::cos(a), libm::sin(a));
         [
             path[i][0] + r * (ca * u[0] + sa * v[0]),
             path[i][1] + r * (ca * u[1] + sa * v[1]),
@@ -376,7 +383,7 @@ fn prism(b: &mut B, poly: &[(f64, f64)], y0: f64, y1: f64, rot: f64, side: [u8; 
     if poly.len() < 3 {
         return;
     }
-    let (cr, sr) = (rot.cos(), rot.sin());
+    let (cr, sr) = (libm::cos(rot), libm::sin(rot));
     let rz = |x: f64, y: f64, z: f64| -> [f64; 3] { [x * cr - y * sr, x * sr + y * cr, z] };
     // Signed area → polygon winding in the (x,z) plane.
     let mut area = 0.0;
@@ -437,7 +444,7 @@ fn sphere(b: &mut B, c: [f64; 3], r: f64, segs: usize, col: [u8; 4]) {
     let prof: Vec<(f64, f64)> = (0..=n)
         .map(|k| {
             let a = -PI / 2.0 + PI * k as f64 / n as f64;
-            (c[2] + r * a.sin(), r * a.cos().max(0.0))
+            (c[2] + r * libm::sin(a), libm::cos(a).max(0.0))
         })
         .collect();
     shell(b, &prof, segs, col, (false, false));
@@ -476,7 +483,7 @@ fn bell_nozzle(
     const N: usize = 16;
     // Rao-class expansion: fast growth just past the throat, relaxing
     // toward the lip (t: 0 = lip, 1 = throat).
-    let curve = |t: f64| t.powf(2.4);
+    let curve = |t: f64| libm::pow(t, 2.4);
     let wall = |t: f64, inset: f64| -> (f64, f64) {
         (
             z_lip + inset + t * (z_throat - z_lip - inset),
@@ -504,7 +511,7 @@ fn bell_nozzle(
             if outer && corr_amp > 0.0 {
                 let t = if i <= N { i as f64 / N as f64 } else { 0.0 };
                 let a = TAU * corr_lobes as f64 * j as f64 / segs as f64;
-                1.0 + corr_amp * (0.35 + 0.65 * (1.0 - t)) * (0.5 + 0.5 * a.cos())
+                1.0 + corr_amp * (0.35 + 0.65 * (1.0 - t)) * (0.5 + 0.5 * libm::cos(a))
             } else {
                 1.0
             }
@@ -720,7 +727,7 @@ fn pod() -> MeshEntry {
             let t = k as f64 / NC as f64;
             (
                 -0.435 + t * 0.735,
-                0.602 + (0.330 - 0.602) * (t + 0.045 * (PI * t).sin()),
+                0.602 + (0.330 - 0.602) * (t + 0.045 * libm::sin(PI * t)),
             )
         })
         .collect();
@@ -790,7 +797,7 @@ fn pod() -> MeshEntry {
     // Four RCS nubs on the upper cone.
     for k in 0..4 {
         let a = TAU * (k as f64 + 0.5) / 4.0;
-        let (ca, sa) = (a.cos(), a.sin());
+        let (ca, sa) = (libm::cos(a), libm::sin(a));
         let (cx, cy) = (0.375 * ca, 0.375 * sa);
         cuboid(
             &mut b,
@@ -832,7 +839,7 @@ fn nosecone() -> MeshEntry {
         .map(|k| {
             let z = z_base + (z_tip - z_base) * k as f64 / N as f64;
             let x = z_tip - z;
-            let r = (rho * rho - (len - x) * (len - x)).max(0.0).sqrt() + r_base - rho;
+            let r = libm::sqrt((rho * rho - (len - x) * (len - x)).max(0.0)) + r_base - rho;
             (z, r.max(0.008))
         })
         .collect();
@@ -867,7 +874,7 @@ fn tank() -> MeshEntry {
     // Bottom dome — quarter-ellipse from the −z apex to the barrel.
     for k in 0..=8 {
         let a = PI / 2.0 * k as f64 / 8.0;
-        prof.push((-1.0 + dome * (1.0 - a.cos()), rb * a.sin()));
+        prof.push((-1.0 + dome * (1.0 - libm::cos(a)), rb * libm::sin(a)));
     }
     // Barrel with three real weld beads (2 raised stations each).
     prof.extend_from_slice(&[
@@ -886,7 +893,7 @@ fn tank() -> MeshEntry {
     // Top dome — mirrored ellipse up to the +z apex.
     for k in 1..=8 {
         let a = PI / 2.0 * k as f64 / 8.0;
-        prof.push((0.85 + dome * a.sin(), rb * a.cos()));
+        prof.push((0.85 + dome * libm::sin(a), rb * libm::cos(a)));
     }
     lathe(
         &mut b,
@@ -930,7 +937,10 @@ fn booster() -> MeshEntry {
     // Nose frustum with a flat cap.
     for k in 1..=8 {
         let t = k as f64 / 8.0;
-        prof.push((0.48 + t * 0.36, 0.440 - 0.330 * t + 0.030 * (PI * t).sin()));
+        prof.push((
+            0.48 + t * 0.36,
+            0.440 - 0.330 * t + 0.030 * libm::sin(PI * t),
+        ));
     }
     prof.push((0.90, 0.110));
     prof.push((0.90, 0.0));
@@ -1010,7 +1020,7 @@ fn decoupler() -> MeshEntry {
                 // Bolt bumps around the main band — a subtle
                 // machined-fastener read.
                 let a = TAU * 18.0 * j as f64 / S as f64;
-                1.0 + 0.007 * (0.5 + 0.5 * a.cos())
+                1.0 + 0.007 * (0.5 + 0.5 * libm::cos(a))
             } else {
                 1.0
             }
@@ -1056,7 +1066,7 @@ fn adapter() -> MeshEntry {
             if i == 6 {
                 // Corrugated stringer wall between the flanges.
                 let a = TAU * 24.0 * j as f64 / S as f64;
-                1.0 + 0.008 * a.cos()
+                1.0 + 0.008 * libm::cos(a)
             } else {
                 1.0
             }
@@ -1085,8 +1095,8 @@ fn battery() -> MeshEntry {
     // Superellipse cross-section — a square with rounded corners.
     let se = move |j: usize| -> f64 {
         let t = TAU * j as f64 / S as f64;
-        let (c, s) = (t.cos().abs(), t.sin().abs());
-        a_sq * (c.powf(n_exp) + s.powf(n_exp)).powf(-1.0 / n_exp)
+        let (c, s) = (libm::cos(t).abs(), libm::sin(t).abs());
+        a_sq * libm::pow(libm::pow(c, n_exp) + libm::pow(s, n_exp), -1.0 / n_exp)
     };
     let prof = [
         (-0.20, 0.80),
@@ -1160,7 +1170,7 @@ fn science() -> MeshEntry {
     let mut lid: Vec<(f64, f64)> = vec![(0.15, 0.268)];
     for k in 1..=6 {
         let a = PI / 2.0 * k as f64 / 6.0;
-        lid.push((0.15 + 0.075 * a.sin(), 0.268 * a.cos()));
+        lid.push((0.15 + 0.075 * libm::sin(a), 0.268 * libm::cos(a)));
     }
     lathe(
         &mut b,
@@ -1206,8 +1216,8 @@ fn chute() -> MeshEntry {
     // AABB).
     let se = move |j: usize| -> f64 {
         let t = TAU * j as f64 / S as f64;
-        let (c, s) = (t.cos().abs(), t.sin().abs());
-        a_sq * (c.powf(n_exp) + s.powf(n_exp)).powf(-1.0 / n_exp)
+        let (c, s) = (libm::cos(t).abs(), libm::sin(t).abs());
+        a_sq * libm::pow(libm::pow(c, n_exp) + libm::pow(s, n_exp), -1.0 / n_exp)
     };
     let prof = [(-0.25, 0.75), (-0.235, 1.0), (0.15, 1.0), (0.18, 0.9)];
     lathe(
@@ -1230,7 +1240,7 @@ fn chute() -> MeshEntry {
     let mut lid: Vec<(f64, f64)> = vec![(0.18, 0.207)];
     for k in 1..=5 {
         let a = PI / 2.0 * k as f64 / 5.0;
-        lid.push((0.18 + 0.06 * a.sin(), 0.207 * a.cos()));
+        lid.push((0.18 + 0.06 * libm::sin(a), 0.207 * libm::cos(a)));
     }
     lathe(
         &mut b,

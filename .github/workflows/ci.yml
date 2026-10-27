@@ -12,10 +12,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-          components: clippy, rustfmt
+      # No toolchain action: rustup reads rust-toolchain.toml itself —
+      # the pinned channel (1.97.1), components, and the wasm target
+      # all resolve from the file, so a floating-stable install would
+      # be redundant noise (C35-F7).
       - uses: Swatinem/rust-cache@v2
 
       - name: fmt
@@ -53,6 +53,19 @@ jobs:
           cargo run -p xtask -- lint-attribution
           cargo run -p xtask -- lint-reach
 
+      # §8.2's generated-artifact staleness gates. The committed
+      # artifacts are embedded (the .csar packs via `include_bytes!`,
+      # biome PNGs read by name) and the data-set hash deliberately
+      # excludes `data/art/**`, so nothing else catches a bake-input or
+      # region-rule commit that forgot the regeneration (C35-F2: 1 of
+      # the last 6 bake-input commits shipped without a rebake).
+      # `bake_art --check` byte-compares a fresh bake; the mesh path's
+      # floats go through libm for cross-machine byte stability.
+      - name: generated artifacts match their generators
+        run: |
+          cargo run -p xtask --bin bake_art -- --check
+          cargo run -p xtask --bin gen_biome_maps -- --check
+
       # §8.2 cargo-deny gate: license allowlist + global bans (deny.toml).
       # cargo-deny is a prebuilt binary install; NOTE it is not vendored in
       # this workspace, so this step could not be pre-verified locally —
@@ -68,7 +81,9 @@ jobs:
       # replay verdict), driven by `csp-replay list` so a new recipe is
       # gated automatically. The workspace test
       # `every_registered_scenario_has_a_verified_golden` pins the same
-      # set in-process.
+      # set in-process. The nightly job re-runs the full set in release —
+      # that tier is where the §8.2 long scenarios (colony century,
+      # pathological event density) land once they are registered.
       - name: golden replays (every registered scenario)
         run: |
           cargo build -p csp-bench --bin csp-replay
@@ -78,18 +93,114 @@ jobs:
 
   # §5.3 perf budgets — release profile (the budgets are release
   # numbers). The gate is `csp-perf --baseline`: a >10% regression vs
-  # the last committed perf log, a §5.3 Pass→Fail crossing, or an
+  # the committed perf log, a §5.3 Pass→Fail crossing, or an
   # unmeasured measurable row fails the job.
   perf:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+
+      # C17-F5: the 16 ms §5.4 kill-criterion assert only exists in
+      # release profile (debug asserts a 200 ms regression band), and
+      # only this job ever builds release. The probe is pure CPU work —
+      # no GPU needed. Margin note: devbox measures ~8 ms vs the 16 ms
+      # budget, so a ~2x-slower hosted runner can still pass; if it
+      # ever flakes red, the answer is a reference-machine reading —
+      # not a widened budget.
+      - name: vab latency (release) — §5.4's 16 ms assert
+        run: cargo test --release -p csp-view --test vab_latency
+
+      # C29-F2: diff against the ci-host-measured baseline when the
+      # nightly `perf-baseline` job has committed one — applying a 10%
+      # band across machines was the blind application this fixes.
+      # Until that first refresh lands, the devbox log is the seed and
+      # csp-perf prints its own cross-machine note in the log.
       - name: perf budgets (release, >10% regression vs committed log)
         run: |
           cargo build --release -p csp-bench --bin csp-perf
+          BASELINE=docs/perf/perf-log-ci-host-release.ron
+          if [ ! -f "$BASELINE" ]; then
+            BASELINE=docs/perf/perf-log-devbox-release.ron
+          fi
+          echo "perf baseline: $BASELINE"
           ./target/release/csp-perf \
             --machine ci-host \
             --out /tmp/perf-log-ci-host-release.ron \
-            --baseline docs/perf/perf-log-devbox-release.ron
+            --baseline "$BASELINE"
+
+  # C28-F4: the telemetry SPA's gates — typecheck, tests, and a real
+  # build. `vite build` transpiles without typechecking, so a type
+  # error would ship silently without `tsc --noEmit` here.
+  telemetry:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/telemetry
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/telemetry/package-lock.json
+      - name: install
+        run: npm ci
+      - name: typecheck
+        run: npm run typecheck
+      - name: test
+        run: npm test
+      - name: build
+        run: npm run build
+
+  # §8.2 Docs row, per-commit. `cargo doc` under `-D warnings` is the
+  # spec text — but the tree carries a doc-link backlog (private +
+  # unresolved intra-doc links) that would red the gate on day one, so
+  # the gate is a warnings-count ceiling instead: `missing_docs` runs
+  # at warn (§8.2's ask) and ANY new rustdoc warning pushes the count
+  # over `ci/doc-warning-budget.txt` — the backlog ratchets down only.
+  # When the backlog is fixed, tighten this to `-D warnings`.
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo doc + warning-count ceiling
+        run: |
+          set -o pipefail
+          RUSTDOCFLAGS="-W missing_docs" cargo doc --workspace --no-deps --locked \
+            2>&1 | tee /tmp/doc-warnings.log
+          count=$(grep -c "^warning" /tmp/doc-warnings.log || true)
+          budget=$(grep -v '^#' ci/doc-warning-budget.txt | tr -d '[:space:]')
+          echo "rustdoc warnings: $count (ceiling $budget — see ci/doc-warning-budget.txt)"
+          [ "$count" -le "$budget" ] || {
+            echo "::error::doc warnings grew past the ceiling — fix the new warnings or, if docs were deleted intentionally, lower ci/doc-warning-budget.txt"
+            exit 1
+          }
+
+  # §8.2 Coverage row, per-commit: cargo-llvm-cov over the workspace,
+  # floored + ratcheted by ci/coverage-floors.json (no floored crate may
+  # drop >0.5 pp vs the recorded measurement; floors bump upward only).
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: llvm-tools component
+        run: rustup component add llvm-tools-preview
+      # Same lavapipe + required-flag reasoning as the check job: the
+      # render gate must actually run so its coverage is real.
+      - name: install lavapipe (software Vulkan for the render gate)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers libvulkan1
+      - name: coverage + floors
+        env:
+          CSP_RENDER_GATE_REQUIRED: "1"
+        run: |
+          cargo llvm-cov --workspace --all-targets --summary-only --json \
+            --output-path /tmp/coverage.json
+          python3 ci/check_coverage.py /tmp/coverage.json ci/coverage-floors.json
