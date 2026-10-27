@@ -278,7 +278,10 @@ pub fn merge_graphs(
             // carries the secondary's *frame*; the root's own stored
             // transform (non-identity for fragment graphs — an
             // undock split writes the merged-frame pose there) rides
-            // on top, so the subtree lands at `T_rel ∘ t'_m`.
+            // on top, so the subtree lands at `T_rel ∘ t'_m`. The
+            // seam edge's `joint` (the sealed port anchor, in
+            // `attach_node`'s frame) is the caller's to stamp — the
+            // sim's latch merge sets it from the live joint record.
             PartNode::new(Some(attach_node), seam.compose(node.transform), eff)
         } else {
             let Some(&parent) = node.parent.as_ref().and_then(|p| remap.get(p)) else {
@@ -287,7 +290,10 @@ pub fn merge_graphs(
                     parent: node.parent,
                 });
             };
-            PartNode::new(Some(parent), node.transform, eff)
+            // Internal edges keep their transforms verbatim, so the
+            // joint record survives the merge unchanged — the point
+            // is expressed in the (preserved) parent-local frame.
+            PartNode::new(Some(parent), node.transform, eff).with_joint(node.joint)
         };
         graph.insert(merged_id, mapped);
     }

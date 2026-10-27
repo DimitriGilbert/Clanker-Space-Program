@@ -90,11 +90,11 @@
 //! of serialized state, no time trigger. `OnRails`/`SurfaceLatched`
 //! vessels update the stored `WeldPart`s only; the next
 //! materialization welds the new mass fresh. A side effect the
-//! reader should know: `craft_graph_hash` covers `mass_kg`, so a
-//! quantum flip invalidates the vessel's derived aero-table binding
-//! and `ensure_aero` re-derives the (mass-independent, so identical)
-//! table at the next range — conservative invalidation, accepted for
-//! v1 over a second hash definition.
+//! reader should know: `craft_graph_hash` is geometry-only (C14-F2)
+//! — `mass_kg`/`inertia` are not in the aero-table key, so the
+//! in-place bucket write below can never invalidate the binding,
+//! and the table's one mass-derived field (`com_local`) is restamped
+//! by `rebody` on the weld it already runs.
 //!
 //! # State class (§7.2/§7.4)
 //!
@@ -680,6 +680,14 @@ fn rebody(vessel: &mut Vessel) -> Result<(), SimError> {
     body.throttle = old.throttle;
     body.settle = old.settle;
     body.aero = old.aero.clone();
+    // C14-F2: the table's `com_local` is the aero torque arm's
+    // reference and the one mass-derived field it carries — the mass
+    // move the re-weld just integrated shifts the real CoM, so
+    // restamp it (geometry itself is untouched by the mass change,
+    // which is why the table survives at all).
+    if let Some(t) = body.aero.as_mut() {
+        t.com_local = body.com_local;
+    }
     vessel.state = VesselState::InBubble(body);
     Ok(())
 }

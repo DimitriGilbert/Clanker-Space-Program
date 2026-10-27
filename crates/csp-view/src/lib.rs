@@ -1932,14 +1932,18 @@ impl View {
             .ok_or(ViewError::Sim(SimError::Fatal(
                 "home system has no 'terrin' body",
             )))?;
+        let mut environment = csp_phys::Environment::for_body(
+            terrin,
+            csp_core::DVec3::ZERO,
+            terrin.rotation_period_s,
+        );
+        // C14-F3: the convective-heating η is authored — `for_body`
+        // stamps the no-data default; the balance file overrides it.
+        environment.convective_heat_fraction = balance.convective_heat_fraction;
         let mut sim = SimWorld::with_physics(
             orbits,
             csp_sim::PhysicsConfig {
-                environment: csp_phys::Environment::for_body(
-                    terrin,
-                    csp_core::DVec3::ZERO,
-                    terrin.rotation_period_s,
-                ),
+                environment,
                 dominant: terrin.id.clone(),
                 bubble_radius_m: balance.bubble_radius_m,
             },
@@ -3148,12 +3152,13 @@ impl View {
             v.recompute();
             (
                 v.session().clone(),
+                v.catalog().cloned(),
                 v.analysis().cloned(),
                 v.analysis_error().map(str::to_string),
                 stage_plan_of(v),
             )
         });
-        let (session, analysis, analysis_error, stage_plan) = craft;
+        let (session, catalog, analysis, analysis_error, stage_plan) = craft;
         // W2.6: launch is a §3.5 build order, not an instant spawn —
         // the craft def rides `ManufactureCraft` with its aggregate
         // BOM (`EffectivePart::build_resources` summed; the apply
@@ -3174,7 +3179,16 @@ impl View {
                         "craft could not be resolved — is the part catalog loaded?".to_string()
                     })
                 })?;
-                let (graph, built) = session.to_part_graph().map_err(|e| e.to_string())?;
+                // `to_part_graph` needs the catalog to stamp each
+                // edge's `joint` record (the snapped attach point,
+                // C14-F4); a resolved analysis implies it is loaded.
+                let (graph, built) = session
+                    .to_part_graph(
+                        catalog
+                            .as_ref()
+                            .ok_or_else(|| "part catalog is not loaded".to_string())?,
+                    )
+                    .map_err(|e| e.to_string())?;
                 let parts: Vec<csp_phys::WeldPart> = analysis
                     .effective
                     .iter()

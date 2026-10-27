@@ -880,7 +880,7 @@ pub(crate) fn apply_latch(
         // the dissolution; nothing to merge.
         return Ok(false);
     };
-    let merge = match csp_phys::merge_graphs(
+    let mut merge = match csp_phys::merge_graphs(
         &craft_p.graph,
         &craft_s.graph,
         node_p,
@@ -900,6 +900,13 @@ pub(crate) fn apply_latch(
             return Ok(false);
         }
     };
+    // C14-F4: the seam edge's joint point is the primary-side sealed
+    // anchor — `local_p` is already in `attach_node`'s (the seam
+    // edge's parent's) local frame, exactly the `PartNode::joint`
+    // convention `joint_loads` reads for the torque arm.
+    if let Some(n) = merge.graph.nodes.get_mut(&merge.seam_node) {
+        n.joint = Some(local_p);
+    }
     let mut parts_m = craft_p.parts.clone();
     parts_m.extend(craft_s.parts.iter().cloned());
     // M7-C: the frozen part-cost table merges positionally exactly

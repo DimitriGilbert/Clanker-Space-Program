@@ -1181,10 +1181,7 @@ pub fn capture_sync_input(
                 // a lookalike.
                 let plasma_w_m2 = env_ref.map_or(0.0, |e| {
                     let flow = csp_phys::flow_sample(e, body);
-                    csp_phys::CONVECTIVE_HEAT_FRACTION
-                        * 0.5
-                        * flow.density_kg_m3
-                        * flow.speed_mps.powi(3)
+                    flow.convective_fraction * 0.5 * flow.density_kg_m3 * flow.speed_mps.powi(3)
                 });
                 vessels.push(FlightBody {
                     id: id.0,
@@ -3694,7 +3691,7 @@ mod tests {
         };
         // The staging code's own driver (flight.rs `plasma_w_m2`).
         let flux = |alt_m: f64, v_mps: f64| {
-            csp_phys::CONVECTIVE_HEAT_FRACTION
+            csp_phys::DEFAULT_CONVECTIVE_HEAT_FRACTION
                 * 0.5
                 * csp_phys::atmosphere_density_kg_m3(&atm, alt_m)
                 * v_mps.powi(3)

@@ -69,13 +69,18 @@
 //! surface `csp-render` draws) when the environment carries a
 //! [`TerrainSurface`] — `Environment::for_body` always attaches one,
 //! so authored worlds contact the rendered ground (§2.3: at 600 km
-//! the surface is locally flat to µm and the sphere keeps lat/long
-//! meaningful). Generation: every collider vertex whose world
-//! position falls below the surface (`‖p − c‖ < surface_radius(p̂)`)
-//! produces one manifold point `{pos, normal = up, depth}` —
-//! vertex-only contact per the M2 scope with a radial "up" normal;
-//! face/edge contacts on a curved surface differ from the vertex
-//! manifold by ≪ µm at home-planet radius.
+//! the sphere keeps lat/long meaningful). Generation: every collider
+//! vertex whose world position falls below the surface
+//! (`‖p − c‖ < surface_radius(p̂)`) produces one manifold point
+//! `{pos, normal = up, depth}` — vertex-only contact per the M2
+//! scope with a radial "up" normal. The normal's error vs the true
+//! heightfield normal is the local slope angle (measured ≤ ~6° on
+//! the shipped seeded fields — C12-F2's empirical bound), not µm;
+//! the µm-scale claim survives only for the *manifold* half (vertex
+//! vs face/edge on a near-planar footprint). Its static-friction
+//! corollary: μ = 0.5 gives a 26.6° friction angle, so no shipped
+//! slope (tan ≤ 0.10) would slide even under the correct normal —
+//! the radial approximation changes no authored behavior today.
 //!
 //! **Vessel-vessel contact** (M6 sub-phase A): bodies in one `step`
 //! slice see each other through a symmetric vertex-vs-hull rule — a
@@ -273,6 +278,14 @@ pub const DEFAULT_FRICTION_MU: f64 = 0.5;
 /// Pre-voxel drag coefficient — flat-plate order of magnitude. The
 /// §2.4.1 Mach/Reynolds Cd/Cl curves replace it at M4a.
 pub const DEFAULT_DRAG_CD: f64 = 1.0;
+/// The no-data convective-heating coefficient — `for_body` stamps it;
+/// `balance.ron`'s `convective_heat_fraction` is the authored tunable
+/// (C14-F3). Re-exported from [`crate::thermal`] where the model lives.
+pub const DEFAULT_CONVECTIVE_HEAT_FRACTION: f64 = crate::thermal::DEFAULT_CONVECTIVE_HEAT_FRACTION;
+
+fn default_convective_heat_fraction() -> f64 {
+    DEFAULT_CONVECTIVE_HEAT_FRACTION
+}
 
 /// Universal gas constant, J/(mol·K) — CODATA exact value; §3.0's
 /// ideal-gas density `ρ = pM/(RT)` needs it.
@@ -413,6 +426,15 @@ pub struct Environment {
     pub friction_mu: f64,
     /// Pre-voxel drag coefficient (see [`DEFAULT_DRAG_CD`]).
     pub drag_cd: f64,
+    /// The M4b convective-heating coefficient η — the fraction of the
+    /// kinetic flux `½ρv³` a part's exposed area absorbs as skin heat
+    /// (the thermal tick's [`crate::thermal::ThermalFlow`] input).
+    /// `balance.ron`'s `convective_heat_fraction` is the authored
+    /// value (C14-F3); [`DEFAULT_CONVECTIVE_HEAT_FRACTION`] is the
+    /// no-data default `for_body` stamps. `serde(default)` keeps
+    /// pre-field artifacts decodable at the shipped value.
+    #[serde(default = "default_convective_heat_fraction")]
+    pub convective_heat_fraction: f64,
     /// The seeded heightfield contact surface (see [`TerrainSurface`]):
     /// `Some` ⇒ ground contact evaluates against the displaced surface
     /// `radius_m + h(dir_fixed)` the renderer draws; `None` ⇒ the bare
@@ -450,6 +472,7 @@ impl Environment {
             settle_ticks: DEFAULT_SETTLE_TICKS,
             friction_mu: DEFAULT_FRICTION_MU,
             drag_cd: DEFAULT_DRAG_CD,
+            convective_heat_fraction: DEFAULT_CONVECTIVE_HEAT_FRACTION,
             // The seeded surface the renderer draws — `noise_seed` is
             // the authored `TerrainDef` identity and the amplitude the
             // shared `AMPLITUDE_FRAC · radius` rule `csp-view`'s
@@ -1781,21 +1804,22 @@ impl SimpleBackend {
                     .collect()
             })
             .collect();
-        let hull_planes: Vec<Vec<Option<Vec<crate::hull::Plane>>>> = bodies
+        // C12-F4: facet planes stay LAZY — the O(n⁴) sweep runs only
+        // for a hull that survives the body- AND hull-AABB filters
+        // (part.rs's doc already scopes it to pair candidates), not
+        // for every hull of every body in the batch. `OnceCell` fills
+        // in place on first pair use; `bodies` is immutable here, so
+        // the memo is exact for the call and changes no order.
+        let hull_planes: Vec<Vec<OnceCell<Option<Vec<crate::hull::Plane>>>>> = bodies
             .iter()
-            .map(|b| {
-                b.collider
-                    .hulls
-                    .iter()
-                    .map(|h| {
-                        crate::hull::facet_planes(
-                            &h.vertices,
-                            crate::hull::plane_epsilon(&h.vertices),
-                        )
-                    })
-                    .collect()
-            })
+            .map(|b| b.collider.hulls.iter().map(|_| OnceCell::new()).collect())
             .collect();
+        let planes_of = |i: usize, h: usize| -> &Option<Vec<crate::hull::Plane>> {
+            hull_planes[i][h].get_or_init(|| {
+                let verts = &bodies[i].collider.hulls[h].vertices;
+                crate::hull::facet_planes(verts, crate::hull::plane_epsilon(verts))
+            })
+        };
         for i in 0..bodies.len() {
             for j in (i + 1)..bodies.len() {
                 let (Some(bi), Some(bj)) = (body_aabbs[i], body_aabbs[j]) else {
@@ -1813,8 +1837,6 @@ impl SimpleBackend {
                 }
                 let aabbs_a = &hull_aabbs[i];
                 let aabbs_b = &hull_aabbs[j];
-                let planes_a = &hull_planes[i];
-                let planes_b = &hull_planes[j];
                 for (hi, ha) in a.collider.hulls.iter().enumerate() {
                     for (hb_i, hb) in b.collider.hulls.iter().enumerate() {
                         let (Some(aa), Some(bb)) = (aabbs_a[hi], aabbs_b[hb_i]) else {
@@ -1824,7 +1846,7 @@ impl SimpleBackend {
                             continue;
                         }
                         // Direction i→j: a's vertices inside hull hb_i.
-                        if let Some(pb) = &planes_b[hb_i] {
+                        if let Some(pb) = planes_of(j, hb_i) {
                             for v in &ha.vertices {
                                 let p_w = a.pos + a.rot.rotate(*v);
                                 let p_b = b.rot.conjugate().rotate(p_w - b.pos);
@@ -1905,7 +1927,7 @@ impl SimpleBackend {
                             }
                         }
                         // Direction j→i: b's vertices inside hull hi.
-                        if let Some(pa) = &planes_a[hi] {
+                        if let Some(pa) = planes_of(i, hi) {
                             for v in &hb.vertices {
                                 let p_w = b.pos + b.rot.rotate(*v);
                                 let p_a = a.rot.conjugate().rotate(p_w - a.pos);
@@ -2592,6 +2614,13 @@ impl PhysicsBackend for SimpleBackend {
             }
             d - self.env.surface_radius(rel / d, self.time_s.get())
         };
+        // Fixed counts like every other loop here. Known limitation
+        // (C12-F6): the 96-step scan can stride over a peak the ray
+        // crosses twice inside one interval (both endpoint signs
+        // stay equal and the graze goes unnoticed) — the window can
+        // span the whole shell (~12.5 km/step on Terrin vs 3.7 km
+        // texels). Deterministic, bounded, and currently test-only —
+        // tighten the step count if a production caller lands.
         const STEPS: usize = 96;
         const BISECT: usize = 40;
         let mut ta = w0;
@@ -2748,6 +2777,7 @@ mod tests {
             settle_ticks: DEFAULT_SETTLE_TICKS,
             friction_mu: DEFAULT_FRICTION_MU,
             drag_cd: DEFAULT_DRAG_CD,
+            convective_heat_fraction: DEFAULT_CONVECTIVE_HEAT_FRACTION,
         }
     }
 

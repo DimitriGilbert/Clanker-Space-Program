@@ -123,8 +123,12 @@ pub struct Hit {
     pub toi: f64,
     /// World(-bubble)-frame hit point.
     pub point: DVec3,
-    /// Surface normal at the hit point, pointing back toward the ray
-    /// origin side (outward for the terrain sphere).
+    /// Surface normal at the hit point — the outward radial at the
+    /// root the implementation returns. When the ray originates
+    /// *inside* the surface the first crossing is an EXIT root and
+    /// the normal points away from the origin side, not back toward
+    /// it (C12-F6: the earlier "toward the origin" wording was wrong
+    /// for that case; there is no production caller today).
     pub normal: DVec3,
     /// The stepped body that was hit, or `None` for the terrain body.
     pub body: Option<BodyHandle>,

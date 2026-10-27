@@ -66,7 +66,13 @@ use crate::ids::ResourceId;
 /// facilities" arrow for `FoundColony` (founding was free while
 /// `AbandonColony` salvaged 25% — an asymmetric mint). Mirror:
 /// `csp_sim::economy::DEFAULT_COLONY_FOUNDING_FUNDS`.
-pub const BALANCE_SCHEMA_VERSION: u32 = 13;
+/// 14 (C14-F3): `convective_heat_fraction` — the M4b thermal
+/// model's η, the fraction of the kinetic energy flux `½ρv³` a part's
+/// exposed area absorbs as skin heat. Its own doc always named this
+/// file as the tunable's home; the shipped value is unchanged
+/// (lethality calibration is a design question, not a constant move).
+/// Mirror: `csp_phys::DEFAULT_CONVECTIVE_HEAT_FRACTION`.
+pub const BALANCE_SCHEMA_VERSION: u32 = 14;
 
 /// `data/balance.ron` — the tunables every later milestone consumes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -289,4 +295,11 @@ pub struct BalanceDef {
     /// free founding a net mint, which is why the charge exists.
     /// Mirror: `csp_sim::economy::DEFAULT_COLONY_FOUNDING_FUNDS`.
     pub colony_founding_cost_funds: f64,
+    /// C14-F3 §2.4's convective-heating coefficient η — the
+    /// dimensionless fraction of `½ρv³` on a part's exposed area
+    /// absorbed as skin heat in the M4b thermal tick. Authored 0.005:
+    /// a real but survivable pulse against authored `max_temp_k`
+    /// 800–1600 K parts (measured entry peaks sit ~200–260 K).
+    /// Mirror: `csp_phys::DEFAULT_CONVECTIVE_HEAT_FRACTION`.
+    pub convective_heat_fraction: f64,
 }

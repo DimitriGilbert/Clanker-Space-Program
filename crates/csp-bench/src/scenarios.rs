@@ -151,7 +151,10 @@ fn flight_initial(dir: &Path) -> Result<World, ReplayError> {
         .iter()
         .find(|b| b.id == BodyId::from("terrin"))
         .ok_or(ReplayError::MalformedGolden("fixture lacks terrin"))?;
-    let environment = Environment::for_body(terrin, DVec3::ZERO, terrin.rotation_period_s);
+    let mut environment = Environment::for_body(terrin, DVec3::ZERO, terrin.rotation_period_s);
+    // C14-F3: the convective-heating η is authored in the fixture's
+    // balance.ron like every other tunable.
+    environment.convective_heat_fraction = balance.convective_heat_fraction;
     let mut world = World::with_physics(
         orbits,
         PhysicsConfig {

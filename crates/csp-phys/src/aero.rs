@@ -681,9 +681,13 @@ pub struct CraftAeroTables {
     pub graph_hash: u64,
     /// The configuration the table was built under.
     pub mask: ConfigMask,
-    /// The welded body's `com_local` at build time — the torque
-    /// reference; the weld-derived field it mirrors is a pure function
-    /// of the same craft, so it cannot drift.
+    /// The welded body's `com_local` the torque arm measures about —
+    /// stamped from the build body, and the ONE mass-derived field a
+    /// table carries (C14-F2). The `graph_hash` binding is geometry-
+    /// only, so a cached or worker-installed table can outlive a
+    /// fuel-burn re-weld: every attach and every `rebody` restamps
+    /// this from the live body's `com_local`, keeping the arm honest
+    /// while the geometry-priced payload survives mass changes.
     pub com_local: DVec3,
     /// The geodesic direction hull the per-part arrays index.
     pub directions: DirectionSet,

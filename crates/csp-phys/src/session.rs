@@ -1983,20 +1983,39 @@ impl CraftSession {
     /// `resolve_parts` + `weld` reproduce this craft bit-identically.
     /// Staging and attach-node ids are editor metadata and do not
     /// enter the weld input (the graph carries topology + transform;
-    /// the file carries the rest).
-    pub fn to_part_graph(&self) -> Result<(PartGraph, Vec<BuiltPart>), SessionError> {
+    /// the file carries the rest). `defs` supplies the part catalog so
+    /// each edge's `joint` record — the snapped attach point the §2.4
+    /// joint-load torque arm measures about (C14-F4) — resolves to the
+    /// parent node's scaled `AttachNode::position_m`; an edge naming a
+    /// missing node leaves `joint` empty (the `validate` pass already
+    /// flags it) and the load model falls back to the part origin.
+    pub fn to_part_graph(
+        &self,
+        defs: &LoadedParts,
+    ) -> Result<(PartGraph, Vec<BuiltPart>), SessionError> {
         let root = self.root.ok_or(SessionError::EmptySession)?;
         let mut graph = PartGraph::new(root);
         let mut built = Vec::with_capacity(self.nodes.len());
         for (i, (id, n)) in self.nodes.iter().enumerate() {
             let effective_index = u32::try_from(i).map_err(|_| SessionError::IndexOverflow)?;
+            // The snapped joint point in the PARENT node's local frame
+            // — the same scaled position `compute_attach` snapped the
+            // child onto (recomputed here so a rescaled or file-loaded
+            // session derives it identically).
+            let joint = n.edge.as_ref().and_then(|e| {
+                let rec = self.nodes.get(&e.parent)?;
+                let def = find_def(defs, &rec.built.part_id)?;
+                scaled_attach_node(def, &e.parent_node, rec.built.scale, rec.built.stretch)
+                    .map(|pn| pn.position_m)
+            });
             graph.insert(
                 *id,
                 PartNode::new(
                     n.edge.as_ref().map(|e| e.parent),
                     n.transform,
                     effective_index,
-                ),
+                )
+                .with_joint(joint),
             );
             built.push(n.built.clone());
         }
@@ -3225,8 +3244,8 @@ mod tests {
 
     #[test]
     fn to_part_graph_is_canonical_and_bound_positionally() {
-        let (s, _, pod, tank, eng) = stack();
-        let (g, built) = s.to_part_graph().unwrap();
+        let (s, defs, pod, tank, eng) = stack();
+        let (g, built) = s.to_part_graph(&defs).unwrap();
         assert_eq!(g.root, pod);
         assert_eq!(g.nodes.len(), 3);
         // built[i] is the node with effective_index == i, ascending ids.
@@ -3249,7 +3268,7 @@ mod tests {
         assert_eq!(built[2].part_id.as_str(), "test.engine");
         // Empty session cannot produce a graph.
         assert!(matches!(
-            CraftSession::new().to_part_graph(),
+            CraftSession::new().to_part_graph(&defs),
             Err(SessionError::EmptySession)
         ));
     }

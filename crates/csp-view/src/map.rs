@@ -3466,6 +3466,7 @@ mod tests {
             settle_ticks: 128,
             friction_mu: 0.4,
             drag_cd: 1.0,
+            convective_heat_fraction: csp_phys::DEFAULT_CONVECTIVE_HEAT_FRACTION,
             terrain: None,
         };
         let mut sim = SimWorld::with_physics(

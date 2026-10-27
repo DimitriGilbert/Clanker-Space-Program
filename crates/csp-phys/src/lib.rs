@@ -139,8 +139,9 @@ pub use structural::{
 pub use tensor::{Axis, SymMat3};
 pub use thermal::step as thermal_step;
 pub use thermal::{
-    CONVECTIVE_HEAT_FRACTION, SPACE_SINK_K, STEFAN_BOLTZMANN_W_M2_K4, ThermalEdge, ThermalFlow,
-    ThermalNet, ThermalNode, ambient_k, flow_sample, joint_conductance, steady_state_temp_k,
+    DEFAULT_CONVECTIVE_HEAT_FRACTION, SPACE_SINK_K, STEFAN_BOLTZMANN_W_M2_K4, ThermalEdge,
+    ThermalFlow, ThermalNet, ThermalNode, ambient_k, flow_sample, joint_conductance,
+    steady_state_temp_k,
 };
 pub use weld::{
     CompoundCollider, ConvexHull, DecelSite, PartWeld, SettleState, WeldError, WeldedBody, weld,

@@ -4181,7 +4181,54 @@ impl World {
                 .values()
                 .any(|v| matches!(v.state, VesselState::InBubble(_)))
         {
-            return Ok(t_next);
+            // C12-F5: an all-parked world never enters the tick loop,
+            // so the periodic support recheck (below) never runs —
+            // without this a hull whose supporter departed would hang
+            // in mid-air forever. Parked records are static within the
+            // range (no `InBubble` body exists to evolve the supporter
+            // set), so the verdict is identical at `now` and at the
+            // grid boundary `t*` — evaluate once, release, then end
+            // the segment AT `t*` (the `rail_break` convention): the
+            // released hull is `InBubble` for the caller's next
+            // segment and integrates exactly `[t*, t_next)` under
+            // every §2.6.1 partition.
+            let parked = self.physics.is_some()
+                && self
+                    .vessels
+                    .values()
+                    .any(|v| matches!(&v.state, VesselState::SurfaceLatched(_)));
+            let boundary =
+                now.div_ceil(LATCHED_SUPPORT_RECHECK_TICKS) * LATCHED_SUPPORT_RECHECK_TICKS;
+            if parked && boundary < t_next {
+                let physics = self
+                    .physics
+                    .as_ref()
+                    .ok_or(SimError::Fatal("latched vessel but no physics"))?;
+                let mut released = false;
+                for vid in
+                    unsupported_statics(&self.vessels, physics, SimTime::from_ticks(boundary + 1))
+                {
+                    match self.unlatched_body(vid, shadow) {
+                        Ok(_) => released = true,
+                        Err(e @ SimError::Fatal(_)) => return Err(e),
+                        Err(e) => degraded.push(e),
+                    }
+                }
+                if boundary > now {
+                    return Ok(boundary);
+                }
+                if !released {
+                    // `boundary == now`, nothing floated: still all
+                    // parked — the verdict is static within a parked
+                    // range, so the early-return stands. (A nonzero
+                    // `boundary` end would stall the advance loop.)
+                    return Ok(t_next);
+                }
+                // `boundary == now` and hulls released: fall through —
+                // the freshly `InBubble` bodies integrate this range.
+            } else {
+                return Ok(t_next);
+            }
         }
         // The arena shadow precedes EVERY write this range makes —
         // `ensure_aero` below stamps `body.aero` inside the arena, so
@@ -4203,6 +4250,12 @@ impl World {
         // dedups those repeat nominations into the one real
         // transition `transition_latched` reports.
         let mut latched_total: BTreeSet<VesselId> = BTreeSet::new();
+        // C12-F5: `SurfaceLatched` records the periodic support
+        // recheck (below) found floating — applied after the tick
+        // loop where `self` is whole (`unlatched_body` needs the
+        // full bookkeeping surface). In-loop `InBubble`+latched
+        // cases are released where they are found.
+        let mut floating_surface: Vec<VesselId> = Vec::new();
         // M8-C §3.5: debris impact points (environment frame) + the
         // tick each impact landed — the colony-radius damage check
         // runs once `self` is whole again and must anchor its recompute
@@ -4672,6 +4725,46 @@ impl World {
                 &rel_cfg,
                 &mut rel_burns,
             ));
+            // C12-F5 support-departure re-evaluation (§2.6.4's
+            // "nearby impact" trigger family, read as a fixed-grid
+            // recheck): a `SurfaceLatched` record keeps its pose
+            // verbatim, so a hull parked on a supporter that later
+            // flew, was removed, or broke up would hang in mid-air
+            // until a control verb unlatched it — and an
+            // `InBubble`+latched static collider can float the same
+            // way once its own support leaves. Every
+            // `LATCHED_SUPPORT_RECHECK_TICKS` ticks, re-materialize
+            // the parked hulls and drop the unsupported ones back
+            // into the bubble (one weld per parked hull per
+            // sim-second — deterministic and bounded). Cascades —
+            // a supporter freed by this very pass — unwind one level
+            // per recheck, a fixed order like every other pass.
+            if t % LATCHED_SUPPORT_RECHECK_TICKS == 0 {
+                for vid in unsupported_statics(vessels, physics, SimTime::from_ticks(t + 1)) {
+                    match vessels.get(&vid).map(|v| &v.state) {
+                        Some(VesselState::SurfaceLatched(_)) => {
+                            // `unlatched_body` re-materializes at the
+                            // stored pose with the full bookkeeping
+                            // (colony join, node scrub, reliability
+                            // restamp) — the self-healing path made
+                            // automatic. It needs the whole `self`,
+                            // so the release lands after the tick
+                            // loop (the pose restore is stamp-
+                            // independent, so this is bit-identical).
+                            floating_surface.push(vid);
+                        }
+                        Some(VesselState::InBubble(b)) if b.settle.latched => {
+                            if let Some(v) = vessels.get_mut(&vid)
+                                && let VesselState::InBubble(b) = &mut v.state
+                            {
+                                b.settle.latched = false;
+                                b.settle.settled_ticks = 0;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
             // M9b §3.4: the tick's collected side-effects land at
             // `t + 1`, inside the same tick iteration — the family
             // credits are live for `t + 1`'s evaluation (the
@@ -5098,6 +5191,21 @@ impl World {
         // dedup'd and ascending-ordered by `BTreeSet`.
         for vid in latched_total {
             self.contract_notify(&contracts::ContractTrigger::SurfaceLatched(vid), shadow)?;
+        }
+        // C12-F5: release the parked hulls the support recheck found
+        // floating — `unlatched_body` is the same self-healing path a
+        // control unlatch takes, so colony joins, scheduled nodes,
+        // pending part-failure events and reliability restamps all
+        // behave identically.
+        for vid in floating_surface {
+            match self.unlatched_body(vid, shadow) {
+                Ok(_) => {}
+                // A vessel removed mid-range (breakup, recovery) is
+                // a no-op, not a range fault — the `degraded`
+                // convention, same as `finish_burns`.
+                Err(e @ SimError::Fatal(_)) => return Err(e),
+                Err(e) => degraded.push(e),
+            }
         }
         self.finish_burns(&burns_done, range_end, shadow, degraded)?;
         // The auto bubble→rails conversion — the candidates detected
@@ -7246,6 +7354,10 @@ impl World {
             return Err(SimError::Fatal("aero: vessel vanished"));
         };
         if let (Some(t), VesselState::InBubble(b)) = (tables, &mut v.state) {
+            let mut t = t;
+            // C14-F2: restamp the torque arm's CoM reference — a
+            // cached table predating a burn carries the old `com_local`.
+            t.com_local = b.com_local;
             b.aero = Some(Box::new(t));
         }
         Ok(())
@@ -7322,7 +7434,12 @@ impl World {
             if let Some(VesselState::InBubble(b)) =
                 self.vessels.get_mut(&vessel).map(|v| &mut v.state)
             {
-                b.aero = Some(Box::new(tables.clone()));
+                let mut t = tables.clone();
+                // C14-F2: restamp `com_local` for the live weld — the
+                // binding is geometric, so an install may legitimately
+                // carry a pre-burn CoM.
+                t.com_local = b.com_local;
+                b.aero = Some(Box::new(t));
             }
         }
         Ok(())
@@ -7405,7 +7522,11 @@ impl World {
                 .get(&vessel)
                 .and_then(|c| c.tables.get(&resolved))
             {
-                b.aero = Some(Box::new(t.clone()));
+                let mut t = t.clone();
+                // C14-F2: restamp `com_local` for the live weld — see
+                // `ensure_aero`.
+                t.com_local = b.com_local;
+                b.aero = Some(Box::new(t));
             }
         }
         Ok(())
@@ -11491,6 +11612,14 @@ pub(crate) fn hash_craft(h: &mut StateHasher, craft: &CraftDef) {
             h.f64(t.rotation.z);
             h.f64(t.rotation.w);
             h.u32(node.effective_index);
+            // C14-F4: the snapped joint point is weld input — the
+            // §2.4 joint-load torque arm reads it, so it is craft
+            // identity like the transform.
+            h.opt(&node.joint, |h, j| {
+                h.f64(j.x);
+                h.f64(j.y);
+                h.f64(j.z);
+            });
         },
     );
     h.vec(&craft.parts, |h, p| {
@@ -11619,26 +11748,96 @@ pub(crate) fn hash_craft(h: &mut StateHasher, craft: &CraftDef) {
     });
 }
 
+/// The aero-table geometry walk — exactly the `CraftDef` fields
+/// [`csp_phys::aero::build_aero_tables`] consumes: the attachment
+/// graph (topology, transforms, effective indices) and each part's
+/// collider + `aero` curves. `mass_kg`/`inertia`/`com` are
+/// deliberately OUT (C14-F2): the §2.4 quantized-inertia rule folds
+/// fuel into `mass_kg` in place, and a mass-inclusive key both makes
+/// the staleness predicate blind — the `CraftHashMemo` write rule
+/// forbids the in-place mass write, so the memo stays pre-burn — and
+/// would turn every burn into a per-quantum table-rebuild storm the
+/// moment the memo were honoured. A table's `com_local` (the one
+/// mass-derived field) is patched at attach/re-weld instead.
+pub(crate) fn hash_craft_geometry(h: &mut StateHasher, craft: &CraftDef) {
+    h.u64(craft.graph.root.0);
+    h.btree_map(
+        &craft.graph.nodes,
+        |h, id| {
+            h.u64(id.0);
+        },
+        |h, node| {
+            h.opt(&node.parent, |h, p| {
+                h.u64(p.0);
+            });
+            let t = &node.transform;
+            h.f64(t.offset.x);
+            h.f64(t.offset.y);
+            h.f64(t.offset.z);
+            h.f64(t.rotation.x);
+            h.f64(t.rotation.y);
+            h.f64(t.rotation.z);
+            h.f64(t.rotation.w);
+            h.u32(node.effective_index);
+            // The snapped joint point is geometry — it sits in the
+            // attach node's frame like the transform itself.
+            h.opt(&node.joint, |h, j| {
+                h.f64(j.x);
+                h.f64(j.y);
+                h.f64(j.z);
+            });
+        },
+    );
+    h.vec(&craft.parts, |h, p| {
+        match &p.collider {
+            csp_phys::ColliderShape::Points(points) => {
+                h.u16(0);
+                h.vec(points, |h, v| {
+                    h.f64(v.x);
+                    h.f64(v.y);
+                    h.f64(v.z);
+                });
+            }
+            csp_phys::ColliderShape::Box { half_extents } => {
+                h.u16(1);
+                h.f64(half_extents.x);
+                h.f64(half_extents.y);
+                h.f64(half_extents.z);
+            }
+        }
+        h.vec(&p.aero.cd_curve, |h, k| {
+            h.f64(k.mach);
+            h.f64(k.coeff);
+        });
+        h.vec(&p.aero.cl_curve, |h, k| {
+            h.f64(k.mach);
+            h.f64(k.coeff);
+        });
+        h.f64(p.aero.ref_len_m);
+    });
+}
+
 /// The §2.4 craft identity the aero-table install command binds on:
-/// first 8 bytes (LE) of the same canonical `hash_craft` walk the
-/// state hash uses — a table built for one craft cannot install on
-/// another. `0` when the hash stream faults (non-finite craft data —
-/// weld rejects it anyway).
+/// first 8 bytes (LE) of the canonical [`hash_craft_geometry`] walk —
+/// a table built for one craft's geometry cannot install on another.
+/// `0` when the hash stream faults (non-finite craft data — weld
+/// rejects it anyway).
 ///
 /// Memoized on the def (C4a-F4): `aero_tables_stale` asks this of
-/// every `InBubble` vessel every tick, and the full `hash_craft`
-/// blake3 walk is pure waste in the steady state. The memo lives on
-/// the value itself and `Clone` clears it, so the clone-modify-
-/// reassign convention makes a stale hit structurally impossible —
-/// a cleared memo costs one recompute (a spurious *staleness*
-/// verdict is impossible: the memo only ever holds a hash this
-/// exact def produced).
+/// every `InBubble` vessel every tick, and the full walk is pure
+/// waste in the steady state. The memo lives on the value itself and
+/// `Clone` clears it, so the clone-modify-reassign convention makes a
+/// stale hit structurally impossible — a cleared memo costs one
+/// recompute (a spurious *staleness* verdict is impossible: the memo
+/// only ever holds a hash this exact def produced). The geometry-only
+/// walk is also what makes the debit path's in-place `mass_kg` write
+/// safe here: mass is not part of the key (C14-F2).
 fn craft_graph_hash(craft: &CraftDef) -> u64 {
     if let Some(h) = craft.hash_memo.get() {
         return h;
     }
     let mut h = StateHasher::new();
-    hash_craft(&mut h, craft);
+    hash_craft_geometry(&mut h, craft);
     let d = match h.finish() {
         Ok(d) => u64::from_le_bytes(d[..8].try_into().unwrap_or([0; 8])),
         Err(_) => 0,
@@ -11694,6 +11893,98 @@ fn bubble_vessel_contact(
         *vid != self_id
             && matches!(&v.state, VesselState::InBubble(o) if (!moving_only || !o.settle.latched) && backend.vessel_contact(body, o))
     })
+}
+
+/// C12-F5's support recheck cadence — ticks between parked-hull
+/// support evaluations (64 = 1 s at 64 Hz). Fixed-grid like every
+/// other loop: a floating hull re-enters the bubble within a second
+/// of its supporter leaving, at a bounded re-materialization cost.
+const LATCHED_SUPPORT_RECHECK_TICKS: u64 = 64;
+
+/// C12-F5: the ground half of [`unsupported_statics`]'s support
+/// test. The strict [`SimpleBackend::ground_contact`] needs a vertex
+/// *penetrating* the surface (`depth > 0`), but a recorded pose can
+/// legitimately sit at exactly zero — `berth_pose` bottoms the belly
+/// on the datum by construction — where "no penetration" would read
+/// as airborne and the recheck would release a parked hull (and
+/// unblock its berth). `eps` is the resting margin: a lowest vertex
+/// less than `eps` above the surface counts as supported.
+fn ground_supported(env: &csp_phys::Environment, b: &WeldedBody, time_s: f64, eps: f64) -> bool {
+    for hull in &b.collider.hulls {
+        for v in &hull.vertices {
+            let p = b.pos + b.rot.rotate(*v);
+            let rel = p - env.body_center;
+            let dist = rel.norm();
+            if dist > 0.0 && env.surface_radius(rel / dist, time_s) - dist > -eps {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The resting margin for [`ground_supported`] — covers authored
+/// zero-penetration poses and settle residual, far below the gap a
+/// genuinely floating hull shows.
+const GROUND_SUPPORT_EPS_M: f64 = 0.05;
+
+/// C12-F5: the `SurfaceLatched`/`InBubble`-latched vessels whose
+/// support has departed — the re-evaluation the settle doc's unwired
+/// unlatch triggers never ran. "Supported" means *something still
+/// beneath*: a lowest hull vertex within [`GROUND_SUPPORT_EPS_M`] of
+/// the surface ([`ground_supported`] — the strict contact predicate
+/// misses authored zero-penetration poses) or a vertex inside another
+/// hull ([`SimpleBackend::vessel_contact`], the same rule the settle
+/// latch qualified on), evaluated on the live poses.
+/// Ascending-`VesselId` result; callers apply the unlatch.
+fn unsupported_statics(
+    vessels: &BTreeMap<VesselId, Vessel>,
+    physics: &Physics,
+    sim: SimTime,
+) -> Vec<VesselId> {
+    let env = physics.backend.environment();
+    // Materialize every parked hull once — the supporter set itself
+    // is part of the query (a latched hull can rest on another).
+    let mut parked: BTreeMap<VesselId, WeldedBody> = BTreeMap::new();
+    for (vid, v) in vessels {
+        let (VesselState::SurfaceLatched(pose), Some(craft)) = (&v.state, &v.craft) else {
+            continue;
+        };
+        let Ok(mut body) = csp_phys::weld(&craft.graph, &craft.parts) else {
+            continue;
+        };
+        let (pos, rot, vel, ang_vel) = bubble::surface_pose_restore(env, pose, body.com_local, sim);
+        body.pos = pos;
+        body.rot = rot;
+        body.vel = vel;
+        body.ang_vel = ang_vel;
+        parked.insert(*vid, body);
+    }
+    let mut out = Vec::new();
+    for (vid, v) in vessels {
+        let supported_probe = |body: &WeldedBody| -> bool {
+            ground_supported(env, body, sim.seconds(), GROUND_SUPPORT_EPS_M)
+                || vessels.iter().any(|(oid, ov)| {
+                    *oid != *vid
+                        && match &ov.state {
+                            VesselState::InBubble(b) => physics.backend.vessel_contact(body, b),
+                            VesselState::SurfaceLatched(_) => parked
+                                .get(oid)
+                                .is_some_and(|pb| physics.backend.vessel_contact(body, pb)),
+                            VesselState::OnRails(_) => false,
+                        }
+                })
+        };
+        let unsupported = match &v.state {
+            VesselState::InBubble(b) => b.settle.latched && !supported_probe(b),
+            VesselState::SurfaceLatched(_) => parked.get(vid).is_some_and(|b| !supported_probe(b)),
+            VesselState::OnRails(_) => false,
+        };
+        if unsupported {
+            out.push(*vid);
+        }
+    }
+    out
 }
 
 /// M6-A latch departure: each body the backend's settle counter
@@ -15056,6 +15347,7 @@ mod tests {
             settle_ticks: 128,
             friction_mu: 0.5,
             drag_cd: 1.0,
+            convective_heat_fraction: csp_phys::DEFAULT_CONVECTIVE_HEAT_FRACTION,
             // Bare-sphere ground — the suite's landing/impact fixtures
             // are authored against the datum, not a seeded field.
             terrain: None,
@@ -17053,6 +17345,91 @@ mod tests {
         assert!(
             w.vessels().get(&VesselId(0)).is_none(),
             "overheated vessel must be destroyed"
+        );
+    }
+
+    /// C14-F2: the aero-table key is geometry-only. An in-place
+    /// `mass_kg` write — exactly what the contents debit path does —
+    /// must NOT invalidate the binding (the memo may even stay stale
+    /// by the write-rule: the key simply cannot see mass, so the
+    /// answer stays right). A geometry change still re-keys.
+    #[test]
+    fn aero_geometry_key_ignores_mass() {
+        let mut craft = box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0);
+        let h1 = craft_graph_hash(&craft);
+        craft.parts[0].mass_kg = 700.0; // the debit path's in-place write
+        assert_eq!(craft_graph_hash(&craft), h1, "mass is not key material");
+        let mut moved = craft.clone(); // clone clears the memo — recompute
+        moved
+            .graph
+            .nodes
+            .get_mut(&csp_phys::PartNodeId(0))
+            .unwrap()
+            .transform
+            .offset
+            .x += 1.0;
+        assert_ne!(
+            craft_graph_hash(&moved),
+            h1,
+            "transform is geometry — the binding must move"
+        );
+    }
+
+    /// C12-F5: a `SurfaceLatched` record whose support is gone —
+    /// parked mid-air — is released back into the bubble by the
+    /// periodic support recheck instead of hanging until a control
+    /// verb. A ground-supported hull stays latched.
+    #[test]
+    fn latched_floating_unlatches_on_recheck() {
+        let mut w = physics_world(false);
+        spawn_physical(
+            &mut w,
+            SimCommand::SpawnPhysicalVessel {
+                craft: box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0),
+                pos: DVec3::new(TERRIN_R + 100.0, 0.0, 0.0),
+                rot: csp_core::DQuat::IDENTITY,
+                vel: DVec3::ZERO,
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        let latch = |altitude_m: f64| {
+            VesselState::SurfaceLatched(bubble::SurfacePose {
+                body: BodyId::from("p"),
+                latitude_rad: 0.0,
+                longitude_rad: 0.0,
+                altitude_m,
+                orientation: csp_core::DQuat::IDENTITY,
+            })
+        };
+        // Parked 100 m up — nothing beneath it. Step past the
+        // 64-tick recheck boundary.
+        w.vessels.get_mut(&VesselId(0)).unwrap().state = latch(100.0);
+        let flagged = unsupported_statics(
+            &w.vessels,
+            w.physics.as_ref().unwrap(),
+            SimTime::from_ticks(64),
+        );
+        assert_eq!(
+            flagged,
+            vec![VesselId(0)],
+            "the recheck probe must flag the floating hull"
+        );
+        w.step_frame(66).unwrap();
+        assert!(
+            matches!(w.vessels()[&VesselId(0)].state, VesselState::InBubble(_)),
+            "a floating latched hull must be released at the recheck"
+        );
+        // Ground-supported stays latched — the recheck is a support
+        // probe, not an unconditional unlatch.
+        w.vessels.get_mut(&VesselId(0)).unwrap().state = latch(0.0);
+        let t = w.clock().ticks() + 64 - w.clock().ticks() % 64;
+        w.step_frame(t + 64).unwrap();
+        assert!(
+            matches!(
+                w.vessels()[&VesselId(0)].state,
+                VesselState::SurfaceLatched(_)
+            ),
+            "a ground-supported hull must stay latched"
         );
     }
 

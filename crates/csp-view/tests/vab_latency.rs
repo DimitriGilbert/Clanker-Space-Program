@@ -111,7 +111,8 @@ fn vab_interaction_latency_at_300_parts() {
     // resolve + validate + analyze + body_transforms.
     let t = Instant::now();
     let (g, b) = view
-        .with_vab_session(|v| v.session().to_part_graph())
+        .with_vab_session(|v| v.catalog().map(|c| v.session().to_part_graph(c)))
+        .unwrap()
         .unwrap();
     let graph_ms = t.elapsed().as_secs_f64() * 1000.0;
 

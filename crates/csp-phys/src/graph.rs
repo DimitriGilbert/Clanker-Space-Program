@@ -145,6 +145,19 @@ pub struct PartNode {
     pub transform: PartTransform,
     /// Index into the `effective: &[WeldPart]` weld argument.
     pub effective_index: u32,
+    /// The attachment's snapped joint point, expressed in the
+    /// **parent** node's local frame — the `p_J` the §2.4 joint-load
+    /// torque arm is measured about (`structural::joint_loads`; C14-F4).
+    /// Stamped at attach time (`CraftSession::to_part_graph` derives it
+    /// from the parent's named `AttachNode`, the latch merge records
+    /// the sealed port anchor); `None` means "not recorded" —
+    /// hand-built graphs, pre-field saves — and the load model falls
+    /// back to the part origin, the pre-field approximation. An edge
+    /// record like `AttachEdge`: it lives on the child, is serialized
+    /// with the craft, and is hashed as weld input (the joint load it
+    /// feeds decides breakup).
+    #[serde(default)]
+    pub joint: Option<DVec3>,
 }
 
 impl PartNode {
@@ -157,7 +170,15 @@ impl PartNode {
             parent,
             transform,
             effective_index,
+            joint: None,
         }
+    }
+
+    /// `self` with the [`Self::joint`] record stamped — the snapped
+    /// attach point in the parent's local frame (see the field doc).
+    pub const fn with_joint(mut self, joint: Option<DVec3>) -> Self {
+        self.joint = joint;
+        self
     }
 }
 

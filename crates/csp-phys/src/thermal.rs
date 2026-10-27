@@ -110,14 +110,18 @@ pub const SPACE_SINK_K: f64 = 2.7;
 
 /// The dimensionless fraction of the kinetic energy flux `½ρv³`
 /// incident on a part's exposed area that is absorbed as skin heat —
-/// the v1 convective-heating coefficient. At reentry conditions
-/// (ρ ~ 4·10⁻² kg/m³, v ~ 2 km/s, A ~ 2.25 m²) η = 5·10⁻³ drives a
-/// ~400 kJ/K lump at ~5–6 K/s through the heat pulse — a real but
-/// survivable pulse for authored `max_temp_k` 900–1600 K parts, and
-/// lethal above them or at lower capacity. A stand-in in the same
-/// sense as [`crate::aero::AIR_VISCOSITY_PA_S`]: the pinned v1 value
-/// pending a `balance.ron`-level tunable.
-pub const CONVECTIVE_HEAT_FRACTION: f64 = 0.005;
+/// the v1 convective-heating coefficient's **default**. At reentry
+/// conditions (ρ ~ 4·10⁻² kg/m³, v ~ 2 km/s, A ~ 2.25 m²) η = 5·10⁻³
+/// drives a ~400 kJ/K lump at ~5–6 K/s through the heat pulse — a
+/// real but survivable pulse for authored `max_temp_k` 900–1600 K
+/// parts, and lethal above them or at lower capacity.
+///
+/// The live value is `balance.ron`'s `convective_heat_fraction`
+/// (C14-F3 — §8.3's "ALL tuning lives here", the home this constant's
+/// doc always named), carried on [`crate::simple::Environment`] into
+/// [`ThermalFlow`]; this constant is only the no-data default, the
+/// same role [`crate::simple::DEFAULT_FRICTION_MU`] plays.
+pub const DEFAULT_CONVECTIVE_HEAT_FRACTION: f64 = 0.005;
 
 /// One part's weld-resolved thermal statics — the lumped node the
 /// per-tick [`step`] integrates. Geometry fields are body-frame:
@@ -202,6 +206,11 @@ pub struct ThermalFlow {
     /// Unit flow direction in body frame, `ŵ = −v̂_rel` — meaningful
     /// iff `speed_mps > 0`.
     pub dir_body: DVec3,
+    /// The convective-heating coefficient η the step applies —
+    /// copied from [`Environment::convective_heat_fraction`] (the
+    /// `balance.ron` tunable, C14-F3), carried here so the heating
+    /// model and every consumer read one number.
+    pub convective_fraction: f64,
 }
 
 /// The sink temperature the radiation term sees at `altitude_m`:
@@ -240,6 +249,7 @@ pub fn flow_sample(env: &Environment, body: &WeldedBody) -> ThermalFlow {
         density_kg_m3: density,
         speed_mps: speed,
         dir_body: dir,
+        convective_fraction: env.convective_heat_fraction,
     }
 }
 
@@ -317,7 +327,7 @@ pub fn step(
     // projected-area fallback (both per the module doc).
     if flow.density_kg_m3 > 0.0 && flow.speed_mps > 0.0 && flow.dir_body.is_finite() {
         let v = flow.speed_mps;
-        let per_area = CONVECTIVE_HEAT_FRACTION * 0.5 * flow.density_kg_m3 * v * v * v;
+        let per_area = flow.convective_fraction * 0.5 * flow.density_kg_m3 * v * v * v;
         match aero {
             Some(tables) => {
                 let (ids, wt) = tables.directions.weights(flow.dir_body);
@@ -498,6 +508,7 @@ mod tests {
             density_kg_m3: 0.0,
             speed_mps: 0.0,
             dir_body: DVec3::new(0.0, 0.0, -1.0),
+            convective_fraction: DEFAULT_CONVECTIVE_HEAT_FRACTION,
         };
         let mut temps = BTreeMap::from([(PartNodeId(0), 800.0), (PartNodeId(1), 800.0)]);
         let mut rates = Vec::new();
@@ -547,6 +558,7 @@ mod tests {
             density_kg_m3: 0.0,
             speed_mps: 0.0,
             dir_body: DVec3::new(0.0, 0.0, -1.0),
+            convective_fraction: DEFAULT_CONVECTIVE_HEAT_FRACTION,
         };
         let mut temps = BTreeMap::from([(PartNodeId(0), 300.0), (PartNodeId(1), 500.0)]);
         let mut rates = Vec::new();
@@ -591,8 +603,9 @@ mod tests {
             density_kg_m3: rho,
             speed_mps: v,
             dir_body: DVec3::new(0.0, 0.0, -1.0),
+            convective_fraction: DEFAULT_CONVECTIVE_HEAT_FRACTION,
         };
-        let per_area = CONVECTIVE_HEAT_FRACTION * 0.5 * rho * v * v * v;
+        let per_area = DEFAULT_CONVECTIVE_HEAT_FRACTION * 0.5 * rho * v * v * v;
         let q_conv = per_area * node.projected_area(flow.dir_body);
         let t_ss = steady_state_temp_k(q_conv, node.emissivity, node.radiative_area_m2, 288.15);
         assert!(t_ss > 288.15 && t_ss.is_finite());
@@ -633,6 +646,7 @@ mod tests {
             density_kg_m3: 0.0,
             speed_mps: 0.0,
             dir_body: DVec3::new(0.0, 0.0, -1.0),
+            convective_fraction: DEFAULT_CONVECTIVE_HEAT_FRACTION,
         };
         let mut temps = BTreeMap::from([(PartNodeId(0), 300.0), (PartNodeId(1), 401.0)]);
         let hot = step(
@@ -684,6 +698,7 @@ mod tests {
             density_kg_m3: 0.02,
             speed_mps: 900.0,
             dir_body: DVec3::new(0.1, -0.2, -0.97),
+            convective_fraction: DEFAULT_CONVECTIVE_HEAT_FRACTION,
         };
         let run = || {
             let mut temps = BTreeMap::from([(PartNodeId(0), 290.0), (PartNodeId(1), 310.0)]);
@@ -741,6 +756,7 @@ mod tests {
             density_kg_m3: 0.0,
             speed_mps: 0.0,
             dir_body: DVec3::new(0.0, 0.0, -1.0),
+            convective_fraction: DEFAULT_CONVECTIVE_HEAT_FRACTION,
         };
         let mut temps = BTreeMap::from([(PartNodeId(0), 300.0), (PartNodeId(1), 500.0)]);
         let mut rates = Vec::new();
@@ -828,5 +844,56 @@ mod tests {
         assert!((joint_conductance(50.0, 50.0, 2.0, 1.0) - 50.0).abs() < 1e-12);
         // Quarter coverage.
         assert!((joint_conductance(50.0, 50.0, 0.25, 1.0) - 12.5).abs() < 1e-12);
+    }
+
+    /// C14-F3: η lives on the flow — `balance.ron`'s
+    /// `convective_heat_fraction` via the environment. η = 0 must
+    /// switch convective input off entirely (an ambient lump then
+    /// holds temperature: no source, radiation balanced), and the
+    /// shipped 0.005 must heat at the authored rate.
+    #[test]
+    fn eta_scales_convective_input() {
+        let mut g = PartGraph::new(PartNodeId(0));
+        g.insert(
+            PartNodeId(0),
+            PartNode::new(None, PartTransform::IDENTITY, 0),
+        );
+        let td = thermal_def(100_000.0, 10_000.0, 0.9, 0.0);
+        let body = weld(&g, &[part(1_000.0, 1.0, td)]).unwrap();
+        let net = *body.thermal;
+        let mut flow = ThermalFlow {
+            ambient_k: 288.15,
+            density_kg_m3: 0.01,
+            speed_mps: 1_500.0,
+            dir_body: DVec3::new(0.0, 0.0, -1.0),
+            convective_fraction: 0.0,
+        };
+        let mut temps = BTreeMap::from([(PartNodeId(0), 288.15)]);
+        let mut rates = Vec::new();
+        step(
+            &net,
+            None,
+            &flow,
+            &mut temps,
+            &mut rates,
+            crate::simple::PHYSICS_DT,
+        )
+        .unwrap();
+        assert_eq!(temps[&PartNodeId(0)], 288.15, "η=0 adds no heat");
+        flow.convective_fraction = DEFAULT_CONVECTIVE_HEAT_FRACTION;
+        step(
+            &net,
+            None,
+            &flow,
+            &mut temps,
+            &mut rates,
+            crate::simple::PHYSICS_DT,
+        )
+        .unwrap();
+        assert!(
+            temps[&PartNodeId(0)] > 288.15,
+            "authored η must heat: {}",
+            temps[&PartNodeId(0)]
+        );
     }
 }

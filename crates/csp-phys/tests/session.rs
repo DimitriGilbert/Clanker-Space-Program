@@ -79,7 +79,7 @@ fn sounding_stack() -> (CraftSession, LoadedParts) {
 fn session_to_weld_end_to_end() {
     let (s, defs) = sounding_stack();
     let res = resources();
-    let (graph, built) = s.to_part_graph().unwrap();
+    let (graph, built) = s.to_part_graph(&defs).unwrap();
     assert_eq!(built.len(), 4);
     let eff = resolve_parts(&defs, &built, &res, &no_quals(), None).unwrap();
     let parts: Vec<csp_phys::WeldPart> = eff.iter().map(|e| e.weld_input.clone()).collect();
@@ -104,7 +104,7 @@ fn reroot_preserves_the_weld() {
     let (mut s, defs) = sounding_stack();
     let res = resources();
     let weld_of = |s: &CraftSession| {
-        let (g, b) = s.to_part_graph().unwrap();
+        let (g, b) = s.to_part_graph(&defs).unwrap();
         let eff = resolve_parts(&defs, &b, &res, &no_quals(), None).unwrap();
         let parts: Vec<csp_phys::WeldPart> = eff.iter().map(|e| e.weld_input.clone()).collect();
         weld(&g, &parts).unwrap()

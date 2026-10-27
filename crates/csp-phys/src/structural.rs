@@ -21,10 +21,12 @@
 //! tick's actual Δv/Δω (so contact, thrust, aero, and gravity all
 //! enter `a_c` — gravity cancels out of `F_J` identically, which is
 //! what makes uniform gravity produce no joint load), `p_J` is the
-//! node's body-frame attach point (`PartTransform::offset`), `I_J`
-//! the subtree inertia about `p_J`, and `F_ext,i` the external
-//! forces applied to part `i` this tick (gravity, per-part aero,
-//! thrust sites, ground-contact impulses ÷ dt).
+//! node's body-frame attach point (`PartNode::joint` — the snapped
+//! `AttachNode` position, falling back to `PartTransform::offset`
+//! when unrecorded), `I_J` the subtree inertia about `p_J`, and
+//! `F_ext,i` the external forces applied to part `i` this tick
+//! (gravity, per-part aero, thrust sites, ground-contact impulses
+//! ÷ dt).
 //!
 //! `F_J` decomposes against the attachment axis (the dominant axis
 //! of the AABB-centre separation between the node and its parent —
@@ -207,14 +209,17 @@ pub fn joint_loads(
         let c_s = a.com_m / a.mass;
         // Inertia about the subtree CoM, then about the joint point.
         let i_cs = a.inertia_origin.shift(-a.mass, c_s);
-        // KNOWN-DEFERRED (PRD-10 M3 / Phase-3 W3.4h): `p_j` is the
-        // part ORIGIN, not the snapped attach point — the torque arm
-        // is systematically off by (attach-node − origin). The real
-        // joint point is known at attach time (snap_transform has it)
-        // but carries it through `PartNode`/`WeldPart` — both
-        // serialized in `CraftDef`, so the fix needs a schema bump +
-        // golden rebless and was deferred out of the editor batch.
-        let p_j = transforms[id].offset;
+        // `p_j` is the edge's snapped attach point in body frame —
+        // `PartNode::joint` records it in the PARENT's local frame
+        // (C14-F4: the load's torque arm is measured about the point
+        // the joint physically mates at, not the child's origin, which
+        // can sit a full part-length away). A node with no recorded
+        // joint — hand-built graphs, pre-field saves — falls back to
+        // the child origin, the pre-field approximation.
+        let p_j = node
+            .joint
+            .and_then(|j| transforms.get(&parent).map(|t| t.apply(j)))
+            .unwrap_or(transforms[id].offset);
         let i_pj = i_cs.shift(a.mass, c_s - p_j);
         let f_j = a.force * -1.0 + point_accel(c_s) * a.mass;
         let tau_j = i_pj.mul_vec(alpha_body)
@@ -377,7 +382,14 @@ pub fn fragment_graph_of(
                 if id == root { None } else { node.parent },
                 transform,
                 node.effective_index,
-            ),
+            )
+            // The joint record rides its edge into the fragment — a
+            // non-root member keeps both its parent and the snapped
+            // point's parent-frame meaning. The fragment root's edge
+            // is severed, so its record is dropped (a `Some` would
+            // dangle: the point is expressed in a frame this graph no
+            // longer contains).
+            .with_joint(if id == root { None } else { node.joint }),
         );
     }
     Ok(frag)
@@ -548,5 +560,46 @@ mod tests {
         // The pod's own joint is unlimited too.
         graph.nodes.remove(&PartNodeId(2));
         let _ = graph;
+    }
+
+    /// C14-F4: the recorded `PartNode::joint` — the snapped attach
+    /// point in the parent's frame — is the torque arm's `p_J`, not
+    /// the child's origin. The `{adapter,pod}` subtree (300 kg, CoM
+    /// at z = 5/3 in the body frame) under a lateral 10 m/s² body
+    /// acceleration reacts `M_S·(c_S−p_J)×a`: measured about the
+    /// adapter's origin (z = 1) that is 300·(2/3)·10 = 2000 N·m;
+    /// measured about a joint stamped at z = 0.5 on the parent face
+    /// it is 300·(7/6)·10 = 3500 N·m.
+    #[test]
+    fn recorded_joint_moves_the_torque_arm() {
+        let (graph, parts) = stack();
+        let body = crate::weld(&graph, &parts).unwrap();
+        let ext: BTreeMap<PartNodeId, Vec<PartForce>> = BTreeMap::new();
+        let a = DVec3::new(10.0, 0.0, 0.0);
+        let origin_arm = joint_loads(&body, &graph, &parts, &ext, a, DVec3::ZERO)
+            .unwrap()
+            .iter()
+            .find(|l| l.node == PartNodeId(2))
+            .unwrap()
+            .torque_nm;
+        // Same craft with the edge's snapped attach point recorded at
+        // z = 0.5 on the root's face — the physical mating surface.
+        let mut graph2 = graph.clone();
+        let adapter = graph2.nodes.get_mut(&PartNodeId(2)).unwrap();
+        adapter.joint = Some(DVec3::new(0.0, 0.0, 0.5));
+        let joint_arm = joint_loads(&body, &graph2, &parts, &ext, a, DVec3::ZERO)
+            .unwrap()
+            .iter()
+            .find(|l| l.node == PartNodeId(2))
+            .unwrap()
+            .torque_nm;
+        assert!(
+            (origin_arm - 2_000.0).abs() < 1.0,
+            "origin-fallback torque arm: {origin_arm}"
+        );
+        assert!(
+            (joint_arm - 3_500.0).abs() < 1.0,
+            "snapped-joint torque arm: {joint_arm}"
+        );
     }
 }
