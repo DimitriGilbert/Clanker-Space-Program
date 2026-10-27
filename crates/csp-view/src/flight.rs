@@ -3627,4 +3627,246 @@ mod tests {
         // flux level lights (a sea-level Mach-number edge case).
         assert_eq!(plasma_intensity(1.0e6, 200.0), 0.0);
     }
+
+    /// A minimal `PartDef` for the readout-parity fixture — stack
+    /// `top`/`bottom` attach nodes and one stock variant; `modules`
+    /// carries whatever the part needs.
+    fn readout_def(id: &str, mass: f64, modules: Vec<csp_data::ModuleDef>) -> csp_data::PartDef {
+        csp_data::PartDef {
+            schema_version: csp_data::PART_SCHEMA_VERSION,
+            id: csp_data::PartId::from(id),
+            family: csp_data::FamilyId::from("f"),
+            display_name: "n".into(),
+            category: csp_data::PartCategory::Utility,
+            mass_dry_kg: mass,
+            cost_funds: 1.0,
+            size_m: DVec3::new(1.0, 1.0, 1.0),
+            build_resources: Vec::new(),
+            attach_nodes: vec![
+                csp_data::AttachNode {
+                    id: "top".into(),
+                    position_m: DVec3::new(0.0, 0.0, 0.5),
+                    direction: DVec3::Z,
+                    diameter_m: 1.0,
+                },
+                csp_data::AttachNode {
+                    id: "bottom".into(),
+                    position_m: DVec3::new(0.0, 0.0, -0.5),
+                    direction: DVec3::new(0.0, 0.0, -1.0),
+                    diameter_m: 1.0,
+                },
+            ],
+            scale: csp_data::ScaleRule::None,
+            collider: csp_data::ColliderDef::Box {
+                half_extents_m: DVec3::new(0.5, 0.5, 0.5),
+            },
+            aero: csp_data::AeroDef {
+                cd_curve: Vec::new(),
+                cl_curve: Vec::new(),
+                ref_len_m: 1.0,
+            },
+            thermal: csp_data::ThermalDef {
+                heat_capacity_j_per_k: 1.0,
+                max_temp_k: 1.0,
+                emissivity: 0.5,
+                conduction_w_per_k: 1.0,
+            },
+            structural: csp_data::StructuralDef {
+                max_axial_n: 1.0,
+                max_shear_n: 1.0,
+                max_torque_nm: 1.0,
+            },
+            variants: vec![csp_data::PartVariant {
+                id: csp_data::VariantId::from("stock"),
+                display_name: "v".into(),
+                cost_multiplier: 1.0,
+                stat_multipliers: Vec::new(),
+            }],
+            modules,
+            reliability: csp_data::ReliabilityDef {
+                base_mtbf_s: 1.0e9,
+                infant_mortality: 0.0,
+                qualification_curve: csp_data::QualCurve {
+                    knots: vec![csp_data::QualKnot {
+                        qualification_units: 0.0,
+                        hazard_multiplier: 1.0,
+                    }],
+                },
+                regime_stress: Vec::new(),
+                dormant_stress: 0.02,
+                failure_modes: vec![(csp_data::FailureMode::SensorFault, 1.0)],
+            },
+            tech_requirement: csp_data::TechNodeId::from("t"),
+        }
+    }
+
+    /// The canonical two-engine stack's catalog + resource file —
+    /// the same numbers the readout fixture uses (fuel at 5 kg/u).
+    fn readout_catalog() -> (csp_data::LoadedParts, csp_data::ResourceFile) {
+        let fuel = csp_data::ResourceId::from("fuel");
+        let engine = |id: &str, thrust: f64, isp: f64| {
+            readout_def(
+                id,
+                80.0,
+                vec![csp_data::ModuleDef::Engine {
+                    thrust_vac_n: thrust,
+                    isp_vac_s: isp,
+                    isp_sl_s: 250.0,
+                    throttle_range: csp_data::ThrottleRange { min: 0.0, max: 1.0 },
+                    gimbal_deg: 0.0,
+                    ignitions: None,
+                    rated_burn_s: 600.0,
+                    propellants: vec![(fuel.clone(), 1.0)],
+                    ullage_required: false,
+                }],
+            )
+        };
+        let defs = csp_data::LoadedParts {
+            parts: vec![
+                readout_def(
+                    "r.hull",
+                    100.0,
+                    vec![csp_data::ModuleDef::Control {
+                        torque_nm: 10.0,
+                        power_w: 1.0,
+                    }],
+                ),
+                readout_def(
+                    "r.tank",
+                    50.0,
+                    vec![csp_data::ModuleDef::Tank {
+                        capacity: vec![(fuel.clone(), 200.0)],
+                    }],
+                ),
+                engine("r.eng", 10_000.0, 300.0),
+                readout_def("r.dec", 20.0, vec![csp_data::ModuleDef::Decoupler]),
+                engine("r.beng", 20_000.0, 280.0),
+            ]
+            .into_iter()
+            .map(|def| csp_data::LoadedPart {
+                def,
+                path: "x".into(),
+            })
+            .collect(),
+        };
+        let res = csp_data::ResourceFile {
+            schema_version: 1,
+            resources: vec![csp_data::ResourceDef {
+                id: fuel,
+                display_name: "r.fuel".into(),
+                mass_per_unit_kg: 5.0,
+            }],
+        };
+        (defs, res)
+    }
+
+    /// C13-F1 parity: the VAB's stage rows must equal the figures the
+    /// flight model delivers — the readout's first row is the pooled
+    /// `burn_step` over the whole attached set (stage boundaries
+    /// jettison, they do not ignite), and its post-drop row matches
+    /// the Δv walk over the survivors. The canonical stack: hull
+    /// 100 kg → tank 50 + 1000 kg fuel → sustainer 10 kN/300 s →
+    /// decoupler 20 kg → booster tank → booster 20 kN/280 s.
+    #[test]
+    #[allow(clippy::too_many_lines)] // fixture + assertions read as one narrative
+    fn vab_stage_readout_matches_flight_burn_step() {
+        let (defs, res) = readout_catalog();
+        let stock = |id: &str| {
+            csp_phys::BuiltPart::stock(
+                csp_data::PartId::from(id),
+                csp_data::VariantId::from("stock"),
+            )
+        };
+        let mut s = csp_phys::CraftSession::new();
+        let hull = s.add_root(&defs, stock("r.hull")).unwrap();
+        let tank = s
+            .add_part(
+                &defs,
+                stock("r.tank"),
+                csp_phys::AttachEdge::new(hull, "bottom", "top"),
+            )
+            .unwrap();
+        let eng = s
+            .add_part(
+                &defs,
+                stock("r.eng"),
+                csp_phys::AttachEdge::new(tank, "bottom", "top"),
+            )
+            .unwrap();
+        let dec = s
+            .add_part(
+                &defs,
+                stock("r.dec"),
+                csp_phys::AttachEdge::new(eng, "bottom", "top"),
+            )
+            .unwrap();
+        let btank = s
+            .add_part(
+                &defs,
+                stock("r.tank"),
+                csp_phys::AttachEdge::new(dec, "bottom", "top"),
+            )
+            .unwrap();
+        let beng = s
+            .add_part(
+                &defs,
+                stock("r.beng"),
+                csp_phys::AttachEdge::new(btank, "bottom", "top"),
+            )
+            .unwrap();
+        s.set_stage(dec, 1).unwrap();
+        s.set_stage(beng, 1).unwrap();
+        let a = csp_phys::readout::analyze(&s, &defs, &res).unwrap();
+        assert_eq!(a.stages.len(), 2);
+        let (r1, r0) = (&a.stages[0], &a.stages[1]);
+        assert_eq!(r1.stage, 1);
+
+        // The flight side on the same attached set — node masses are
+        // dry + contents, the `WalkNode` convention `build_walk` reads.
+        let nodes = vec![
+            prop_node(hull.0, 100.0, 0.0, 0.0, &[], &[]),
+            prop_node(tank.0, 1050.0, 0.0, 0.0, &[], &[("fuel", 200.0, 5.0)]),
+            prop_node(eng.0, 80.0, 10_000.0, 300.0, &[("fuel", 1.0)], &[]),
+            prop_node(dec.0, 20.0, 0.0, 0.0, &[], &[]),
+            prop_node(btank.0, 1050.0, 0.0, 0.0, &[], &[("fuel", 200.0, 5.0)]),
+            prop_node(beng.0, 80.0, 20_000.0, 280.0, &[("fuel", 1.0)], &[]),
+        ];
+        let (attached, mpu) = build_walk(&nodes);
+        let full = burn_step(&attached, &mpu, 1.0);
+        assert!(
+            (r1.thrust_vac_n - full.thrust_n).abs() < 1e-9,
+            "{r1:?} vs {} N",
+            full.thrust_n
+        );
+        assert!((r1.isp_vac_s - full.isp_s).abs() < 1e-9);
+        assert!((r1.mass_flow_kg_s - full.mass_flow_kg_s).abs() < 1e-9);
+        assert!((r1.burn_time_s - full.burn_s).abs() < 1e-9);
+        let wet: f64 = attached.values().map(|n| n.mass_kg).sum();
+        assert!((r1.wet_mass_kg - wet).abs() < 1e-9);
+        assert!((r1.twr_surface - full.thrust_n / (wet * csp_data::G0)).abs() < 1e-9);
+        // Δv: the walk's current segment is the stage-1 row; the row's
+        // own severed set is the walk's drop list, so the post-drop
+        // (starved) row must equal the staged remainder — 0 here.
+        let (mut attached2, mpu2) = build_walk(&nodes);
+        let drops = [StageActions {
+            jettisons: r1.separated_ids.clone(),
+            ..StageActions::default()
+        }];
+        let (dv_now, dv_staged) = delta_v_walk_from(&mut attached2, &mpu2, &drops);
+        assert!(
+            (r1.delta_v_m_per_s - dv_now).abs() < 1e-9,
+            "{r1:?} vs {dv_now}"
+        );
+        assert!(
+            (r0.delta_v_m_per_s - dv_staged).abs() < 1e-9,
+            "{r0:?} vs {dv_staged}"
+        );
+        // The starved row agrees on the coverage-zeroed figures too:
+        // no deliverable thrust, no burn — the "0:00" case.
+        let post = burn_step(&attached2, &mpu2, 1.0);
+        assert!(post.deprived && post.thrust_n == 0.0);
+        assert_eq!(r0.thrust_vac_n, 0.0);
+        assert_eq!(r0.burn_time_s, 0.0);
+        assert_eq!(r0.twr_surface, 0.0);
+    }
 }

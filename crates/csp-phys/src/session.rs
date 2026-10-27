@@ -83,15 +83,23 @@
 //! files or callers mutating behind the session's back. *Warnings*
 //! are editor surfacing: an empty stage index in the firing sequence,
 //! a decoupler with no children to sever, a post-scale diameter
-//! mismatch, and **an engine whose stage leaves it no propellant** —
-//! computed over the engine's *supply region*: the tree component
-//! still attached after every decoupler in a *higher* stage has
-//! severed (a decoupler in the engine's own stage fires with it —
-//! KSP's simultaneous fire-and-separate — so it does not starve it).
-//! If no region
-//! tank carries a resource the engine burns, that's a warning, never
-//! an error — the plan's staging text is thin and a borderline craft
-//! must still save.
+//! mismatch, **an engine whose stage leaves it no propellant**, and
+//! **an engine whose supply the pooled feed can strand across the
+//! stage boundary**. Both propellant warnings are computed over the
+//! engine's *supply region*: the tree component still attached after
+//! every decoupler in a *higher* stage has severed (a decoupler in
+//! the engine's own stage fires with it — KSP's simultaneous
+//! fire-and-separate — so it does not starve it). The first is a
+//! *capability* check: if no region tank carries a resource the
+//! engine burns, that's a warning. The second (C13-F2) is a
+//! *depletion* check the capability test cannot express: the pooled
+//! feed debits tanks ascending `PartNodeId` regardless of stage
+//! boundaries, so when the last tank in drain order holding a burned
+//! resource sits outside the region, a burn can leave the stage dry
+//! while propellant still aboard is jettisoned — the starved stage
+//! row `readout` reports. Both are warnings, never errors — the
+//! plan's staging text is thin and a borderline craft must still
+//! save.
 //!
 //! # Craft file format
 //!
@@ -527,6 +535,19 @@ impl fmt::Display for SessionWarning {
             Self::DecouplerSeversNothing { node, stage } => {
                 write!(f, "decoupler {node:?} (stage {stage}) severs nothing")
             }
+            Self::CrossStagePropellantDrain {
+                node,
+                stage,
+                resources,
+            } => {
+                let names: Vec<&str> = resources.iter().map(|r| r.as_str()).collect();
+                write!(
+                    f,
+                    "engine {node:?} (stage {stage}) can starve at separation — the pooled \
+                     feed drains its {} before fuel that drops with the earlier stage",
+                    names.join(", ")
+                )
+            }
             Self::AttachDiameterMismatch { child } => {
                 write!(f, "node {child:?}'s attach sizes disagree after scaling")
             }
@@ -576,6 +597,27 @@ pub enum SessionWarning {
         node: PartNodeId,
         /// Its stage.
         stage: u32,
+    },
+    /// The pooled feed does not respect stage boundaries: it drains
+    /// every attached tank ascending `PartNodeId`, so where the last
+    /// propellant sits is fixed by drain order, not by the decoupler
+    /// layout. When the last tank in that order holding a resource
+    /// this engine burns sits *outside* its post-separation supply
+    /// region — in a subtree an earlier stage drops — a burn can
+    /// empty the region while fuel the departing half still carries
+    /// is jettisoned: the starved stage row the readout reports
+    /// honestly and [`Self::EngineWithoutPropellant`] cannot see (it
+    /// checks tank *capability* in the region, never cross-stage
+    /// depletion — C13-F2). A real crossfeed/feed-priority model is
+    /// 7.x feature work.
+    CrossStagePropellantDrain {
+        /// The engine whose post-separation supply is exposed.
+        node: PartNodeId,
+        /// Its stage.
+        stage: u32,
+        /// The propellant resources that can strand in departing
+        /// tanks, authored order.
+        resources: Vec<ResourceId>,
     },
     /// A stored edge's scaled size classes disagree — possible after a
     /// `set_scale` post-attach. Permitted (the weld only needs
@@ -2117,7 +2159,8 @@ impl CraftSession {
                 let ModuleDef::Engine { propellants, .. } = m else {
                     continue;
                 };
-                let missing = self.missing_propellants(def_of, *id, n.stage, propellants);
+                let region = self.supply_region(def_of, *id, n.stage);
+                let missing = self.missing_propellants(def_of, &region, propellants);
                 if !missing.is_empty() {
                     out.warnings.push(SessionWarning::EngineWithoutPropellant {
                         node: *id,
@@ -2125,23 +2168,29 @@ impl CraftSession {
                         missing,
                     });
                 }
+                let stranded = self.cross_stage_drain(def_of, &region, propellants);
+                if !stranded.is_empty() {
+                    out.warnings
+                        .push(SessionWarning::CrossStagePropellantDrain {
+                            node: *id,
+                            stage: n.stage,
+                            resources: stranded,
+                        });
+                }
             }
         }
     }
 
-    /// Engine fuel check: the engine's *supply region* at its stage —
-    /// the tree component still connected after every decoupler in a
-    /// *higher* stage has severed its child edges — is searched for
-    /// `Tank`
-    /// capacity covering each `Engine.propellants` resource. Returns
-    /// the uncovered resources (authored order).
-    fn missing_propellants(
+    /// The engine's *supply region* at `stage`: the tree component
+    /// still connected after every decoupler in a *higher* stage has
+    /// severed its child edges — everything the session holds but the
+    /// region misses has already departed when `stage` fires.
+    fn supply_region(
         &self,
         def_of: &BTreeMap<PartNodeId, &PartDef>,
         engine: PartNodeId,
         stage: u32,
-        propellants: &[(ResourceId, f64)],
-    ) -> Vec<ResourceId> {
+    ) -> BTreeSet<PartNodeId> {
         // Decouplers that have fired by the time `stage` activates:
         // firing order is strictly descending, so only a decoupler at a
         // *higher* index has already severed. A same-stage decoupler
@@ -2180,8 +2229,21 @@ impl CraftSession {
                 frontier.push(p);
             }
         }
+        region
+    }
+
+    /// Engine fuel check: `region` — the engine's [`Self::supply_region`]
+    /// at its stage — is searched for `Tank` capacity covering each
+    /// `Engine.propellants` resource. Returns the uncovered resources
+    /// (authored order).
+    fn missing_propellants(
+        &self,
+        def_of: &BTreeMap<PartNodeId, &PartDef>,
+        region: &BTreeSet<PartNodeId>,
+        propellants: &[(ResourceId, f64)],
+    ) -> Vec<ResourceId> {
         let mut available = BTreeSet::new();
-        for id in &region {
+        for id in region {
             let Some(d) = def_of.get(id) else { continue };
             for m in &d.modules {
                 if let ModuleDef::Tank { capacity } = m {
@@ -2195,6 +2257,62 @@ impl CraftSession {
             .iter()
             .map(|(r, _)| r.clone())
             .filter(|r| !available.contains(r))
+            .collect()
+    }
+
+    /// Cross-stage depletion check (C13-F2): the pooled feed debits
+    /// every attached tank ascending `PartNodeId` (the drain order
+    /// `transfers::debit`, the readout, and flight's `consume_drawn`
+    /// share), so the *last* units of a resource always sit in the
+    /// highest-id tank holding it. When that tank is outside
+    /// `region` — in a subtree an earlier stage drops — a burn can
+    /// empty this engine's post-separation supply while propellant
+    /// still aboard is jettisoned with the departing half. Returns
+    /// the resources that can strand that way (authored order).
+    /// Companion to [`Self::missing_propellants`]: that one checks
+    /// capability in the region, this one checks drain order across
+    /// the stage boundary — an engine can pass the first and still
+    /// reach separation dry.
+    fn cross_stage_drain(
+        &self,
+        def_of: &BTreeMap<PartNodeId, &PartDef>,
+        region: &BTreeSet<PartNodeId>,
+        propellants: &[(ResourceId, f64)],
+    ) -> Vec<ResourceId> {
+        propellants
+            .iter()
+            .filter(|(_, frac)| *frac > 0.0)
+            .map(|(r, _)| r)
+            .filter(|r| {
+                // Ascending-id iteration leaves the highest id in
+                // each slot — the pool's last units of `r` sit in the
+                // higher of the two.
+                let mut last_inside = None;
+                let mut last_outside = None;
+                for id in self.nodes.keys() {
+                    let holds = def_of.get(id).is_some_and(|d| {
+                        d.modules.iter().any(|m| match m {
+                            ModuleDef::Tank { capacity } => capacity.iter().any(|(cr, _)| cr == *r),
+                            _ => false,
+                        })
+                    });
+                    if !holds {
+                        continue;
+                    }
+                    if region.contains(id) {
+                        last_inside = Some(*id);
+                    } else {
+                        last_outside = Some(*id);
+                    }
+                }
+                // Stranded only when both sides hold `r` and the last
+                // tank in drain order departs. An empty `inside` is
+                // `missing_propellants`' case, not this one's; an
+                // empty `outside` means nothing the engine burns ever
+                // leaves the craft.
+                matches!((last_inside, last_outside), (Some(i), Some(o)) if o > i)
+            })
+            .cloned()
             .collect()
     }
 
@@ -2896,6 +3014,111 @@ mod tests {
             w,
             SessionWarning::DecouplerSeversNothing { node, .. } if *node == leaf
         )));
+    }
+
+    /// C13-F2: the pooled feed debits tanks ascending `PartNodeId`
+    /// regardless of stage boundaries, so in the canonical top-down
+    /// stack — sustainer tank at the lowest id — the stage-1 burn
+    /// drains the sustainer's supply *through* the decoupler before
+    /// the booster's own tank empties. `EngineWithoutPropellant`
+    /// cannot see it (the region keeps its tank — capability is
+    /// fine); the drain-order check must say so instead.
+    #[test]
+    fn validate_warns_cross_stage_propellant_drain() {
+        let defs = stack_catalog();
+        let mut s = CraftSession::new();
+        let pod = s.add_root(&defs, stock("test.hull")).unwrap();
+        let tank = s
+            .add_part(
+                &defs,
+                stock("test.tank"),
+                AttachEdge::new(pod, "bottom", "top"),
+            )
+            .unwrap();
+        let eng = s
+            .add_part(
+                &defs,
+                stock("test.engine"),
+                AttachEdge::new(tank, "bottom", "top"),
+            )
+            .unwrap();
+        let dec = s
+            .add_part(
+                &defs,
+                stock("test.decoupler"),
+                AttachEdge::new(eng, "bottom", "top"),
+            )
+            .unwrap();
+        let btank = s
+            .add_part(
+                &defs,
+                stock("test.tank"),
+                AttachEdge::new(dec, "bottom", "top"),
+            )
+            .unwrap();
+        let beng = s
+            .add_part(
+                &defs,
+                stock("test.engine"),
+                AttachEdge::new(btank, "bottom", "top"),
+            )
+            .unwrap();
+        s.set_stage(dec, 1).unwrap();
+        s.set_stage(beng, 1).unwrap();
+        let v = s.validate(&defs);
+        // The sustainer's post-separation region keeps its own tank —
+        // no capability warning — but the ascending-id drain strands
+        // it: both authored resources flag.
+        assert!(
+            !v.warnings.iter().any(|w| matches!(
+                w,
+                SessionWarning::EngineWithoutPropellant { node, .. } if *node == eng
+            )),
+            "region keeps its tank — capability passes: {v:?}"
+        );
+        assert!(
+            v.warnings.iter().any(|w| matches!(
+                w,
+                SessionWarning::CrossStagePropellantDrain { node, resources, .. }
+                    if *node == eng && resources.len() == 2
+            )),
+            "sustainer supply must flag cross-stage drain: {v:?}"
+        );
+        // The booster engine's region is the whole craft — nothing
+        // departs it, so no drain warning for it.
+        assert!(
+            !v.warnings.iter().any(|w| matches!(
+                w,
+                SessionWarning::CrossStagePropellantDrain { node, .. } if *node == beng
+            )),
+            "{v:?}"
+        );
+        // Single-stage: nothing sits outside any region — silent.
+        let (s2, defs2, ..) = stack();
+        assert!(
+            !s2.validate(&defs2)
+                .warnings
+                .iter()
+                .any(|w| matches!(w, SessionWarning::CrossStagePropellantDrain { .. })),
+        );
+        // A late-added tank aboard the surviving half holds the last
+        // fuel in drain order (higher id than the booster's), so the
+        // order then preserves the sustainer's supply and the warning
+        // clears.
+        s.add_part(
+            &defs,
+            stock("test.tank"),
+            AttachEdge::new(pod, "top", "bottom"),
+        )
+        .unwrap();
+        let v = s.validate(&defs);
+        assert!(
+            !v.warnings.iter().any(|w| matches!(
+                w,
+                SessionWarning::CrossStagePropellantDrain { node, .. } if *node == eng
+            )),
+            "inside-last drain order must clear the warning: {v:?}"
+        );
     }
 
     /// A crafted file can stage a part at `u32::MAX` — the ops refuse

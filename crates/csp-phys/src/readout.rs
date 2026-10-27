@@ -14,23 +14,54 @@
 //!   already gone — the same supply-region ordering
 //!   [`CraftSession::validate`] applies, reached here by *removing*
 //!   severed subtrees as stages fire.
-//! - **Burn.** A stage's engines burn against the propellant remaining
-//!   in the attached tanks. Per-engine mass flow is `ṁᵢ = Fᵢ / (Ispᵢ ·
-//!   g₀)`; per-resource demand is `Σᵢ ṁᵢ·fracᵢ,r` over the engines'
-//!   authored propellant mixes. Burn time is the limiting resource's
-//!   `available_kg / demand_kg_s`; the same-stage decoupler case is
-//!   fire-and-separate (the departing half feeds this stage's engines —
-//!   session.rs's module doc), so separation applies **after** the
-//!   stage's burn is accounted.
-//! - **Δv.** Tsiolkovsky on the attached mass: `dv = Isp_eff·g₀·
-//!   ln(m_wet / (m_wet − m_burned))` with `Isp_eff = ΣF / (g₀·Σṁ)` —
-//!   the mass-flow-weighted value for mixed-engine stages. A sea-level
-//!   figure substitutes `isp_sl_s` on the same mass ratio (only
-//!   `thrust_vac_n` is authored, so thrust does not change).
-//! - **TWR** is `ΣF / (m_wet · g₀)`. `csp_data::G0` *is* Terrin's
-//!   surface gravity by authoring convention (part.rs), so the
-//!   launchpad number needs no body lookup; [`crate::profile`] carries
-//!   the body-parameterized form for the profile comparison.
+//! - **Engine set — the attached-set model (C13-F1).** The sim has no
+//!   per-stage ignition: `propellant_plans` plans every engine-spec
+//!   node regardless of stage and thrust applies at every attached
+//!   `Thrust` site at the vessel's single throttle, so a stage
+//!   boundary *jettisons*, it never ignites. Each row therefore
+//!   models the segment flight's `delta_v_walk_from` walks over the
+//!   same attached set: **every still-attached engine** burns, not
+//!   just the parts assigned to the stage. (The rejected alternative
+//!   — per-engine activation in the sim — is 7.x feature work; the
+//!   readout aligns to the shipped model, one-directional today.)
+//! - **Burn — pooled, in depletion passes.** Per-engine mass flow is
+//!   `ṁᵢ = Fᵢ / (Ispᵢ · g₀)`; per-resource demand is `Σᵢ ṁᵢ·fracᵢ,r`
+//!   over the burning engines' authored propellant mixes, pooled
+//!   against the propellant remaining in every attached tank — the
+//!   same vessel-wide pool `propellant_plans` and flight's
+//!   `burn_step` resolve. A pass ends when its limiting resource
+//!   empties (`available_kg / demand_kg_s`); engines it fed starve
+//!   out — flight's zero-coverage rule — and the survivors burn on
+//!   in the next pass, so a mixed-propellant fleet drains exactly the
+//!   way the flight walk does. The same-stage decoupler case is
+//!   fire-and-separate (the departing half feeds this segment's
+//!   engines — session.rs's module doc), so separation applies
+//!   **after** the stage's burn is accounted.
+//! - **Δv** accumulates per pass: `dv += Isp_eff·g₀·ln(m_wet /
+//!   (m_wet − m_burned))` with `Isp_eff = ΣF / (g₀·Σṁ)` over the
+//!   engines still burning — the mass-flow-weighted value for
+//!   mixed-engine segments. A sea-level figure substitutes
+//!   `isp_sl_s` on the same ratios (only `thrust_vac_n` is authored,
+//!   so thrust does not change).
+//! - **Segment-start figures.** `thrust_vac_n`, `isp_*`,
+//!   `mass_flow_kg_s`, and `twr_surface = F / (m_wet · g₀)` report
+//!   the first burnable evaluation — what flight's
+//!   `burn_step(θ = 1)` delivers at the top of the segment (starved
+//!   engines contribute nothing, the coverage-zeroed convention).
+//!   `csp_data::G0` *is* Terrin's surface gravity by authoring
+//!   convention (part.rs), so the launchpad number needs no body
+//!   lookup; [`crate::profile`] carries the body-parameterized form
+//!   for the profile comparison.
+//! - **Drain order (C13-F2).** Each pass debits its draw ascending
+//!   `PartNodeId` — the fixed order `transfers::debit` and flight's
+//!   `consume_drawn` share. Under the v1 pooled feed there is no
+//!   tank priority: in the canonical top-down build the upper
+//!   stage's tank sits at the lower id and drains *through the
+//!   decoupler* before the booster's own, which is what
+//!   [`crate::session::SessionWarning::CrossStagePropellantDrain`]
+//!   warns about — a burn can strand propellant in the departing
+//!   half and leave the next stage dry. A real crossfeed/feed-
+//!   priority model is 7.x feature work.
 //!
 //! Stages with no engines get a row anyway — their decouplers still
 //! drop mass that later stages' totals must not carry.
@@ -46,9 +77,11 @@ use crate::graph::PartNodeId;
 use crate::resolve::{EffectivePart, FamilyQualifications, ResolveError, resolve_parts};
 use crate::session::CraftSession;
 
-/// One firing stage's readout row. Fields are `0`/empty on a stage
-/// with no engines; `separated_ids` still reports what its decouplers
-/// drop.
+/// One firing stage's readout row — the segment between its firing
+/// and the next stage's, evaluated the way flight's propulsion walk
+/// evaluates the same attached set (module doc). Fields are `0`/empty
+/// on a stage with nothing burning or burning nothing; `separated_ids`
+/// still reports what its decouplers drop.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StageStats {
     /// The stage index (the `stages` vec is in firing order —
@@ -57,33 +90,41 @@ pub struct StageStats {
     /// Parts assigned to this stage that are still attached when it
     /// fires, ascending id.
     pub part_ids: Vec<PartNodeId>,
-    /// Engines this stage ignites (`engine_ids ⊆ part_ids`).
+    /// Engines burning through this stage's segment — **every engine
+    /// still attached** when it fires, not a subset of `part_ids`
+    /// (the attached-set model: the sim fires all attached engines at
+    /// the one vessel throttle; the boundary jettisons rather than
+    /// ignites).
     pub engine_ids: Vec<PartNodeId>,
     /// Parts this stage's decouplers drop, ascending id — their
     /// subtrees leave after the burn is accounted.
     pub separated_ids: Vec<PartNodeId>,
-    /// Σ resolved `thrust_vac_n` of `engine_ids` (N).
+    /// Σ deliverable vacuum thrust at segment start (N) — starved
+    /// engines contribute `0`, matching flight's coverage-zeroed
+    /// `burn_step(θ = 1)`.
     pub thrust_vac_n: f64,
-    /// Effective vacuum Isp, mass-flow weighted: `ΣF / (g₀·Σṁ)` (s).
-    /// `0` when the stage has no engines.
+    /// Effective vacuum Isp at segment start, mass-flow weighted
+    /// over the metered engines: `ΣF / (g₀·Σṁ)` (s). `0` when nothing
+    /// metered burns.
     pub isp_vac_s: f64,
     /// Effective sea-level Isp on the same weighting (s).
     pub isp_sl_s: f64,
-    /// Σ propellant mass flow at rated vacuum thrust (kg/s).
+    /// Σ propellant mass flow at segment start (kg/s).
     pub mass_flow_kg_s: f64,
     /// Mass still attached while this stage burns — dry mass plus the
     /// propellant remaining in every attached tank (kg).
     pub wet_mass_kg: f64,
-    /// Propellant this stage's engines draw before the limiting
-    /// resource runs out (kg).
+    /// Propellant this segment's engines draw before the pooled
+    /// supply is spent (kg) — summed over the depletion passes.
     pub propellant_burned_kg: f64,
-    /// `propellant_burned / mass_flow` — seconds at full rated thrust.
+    /// Σ depletion-pass durations — the segment's burn time (s).
     pub burn_time_s: f64,
-    /// `isp_vac · g₀ · ln(wet / (wet − burned))` (m/s).
+    /// `Σ isp_vac·g₀·ln(wet / (wet − burned))` over the passes (m/s).
     pub delta_v_m_per_s: f64,
-    /// The same ratio at `isp_sl` — the launchpad figure (m/s).
+    /// The same at `isp_sl` — the launchpad figure (m/s).
     pub delta_v_sl_m_per_s: f64,
-    /// `thrust / (wet · g₀)` — TWR vs Terrin surface gravity.
+    /// `thrust_vac_n / (wet · g₀)` at segment start — TWR vs Terrin
+    /// surface gravity.
     pub twr_surface: f64,
 }
 
@@ -214,8 +255,11 @@ pub fn analyze(
             part_ids,
             ..StageStats::default()
         };
-        row.engine_ids = row
-            .part_ids
+        // The attached-set engine model (module doc, C13-F1): every
+        // engine still aboard burns through this segment — the sim
+        // fires all attached engines at the one vessel throttle, and
+        // a stage boundary jettisons rather than ignites.
+        row.engine_ids = attached
             .iter()
             .copied()
             .filter(|id| has_module(*id, &|m| matches!(m, ModuleDef::Engine { .. })))
@@ -227,123 +271,207 @@ pub fn analyze(
             .sum();
 
         if !row.engine_ids.is_empty() {
-            row.thrust_vac_n = row
-                .engine_ids
-                .iter()
-                .filter_map(|id| eff_of.get(id))
-                .map(|e| engine_thrust(e))
-                .sum();
-            // Per-engine mass flow, then per-resource demand (kg/s).
-            let mut demand: BTreeMap<ResourceId, f64> = BTreeMap::new();
-            let mut mdot_total = 0.0f64;
-            let mut sl_mdot_equiv = 0.0f64;
+            // An engine starves when a propellant it draws is
+            // un-holdable (`mass_per_unit ≤ 0` — a massless charge, or
+            // a resource no tank carries: the sim's ∞-demand →
+            // 0-coverage rule) or when the pooled supply of one runs
+            // out mid-segment. The survivors burn on — the depletion
+            // passes below are the same loop flight's
+            // `delta_v_walk_from` iterates.
+            let mut starved: BTreeSet<PartNodeId> = BTreeSet::new();
             for id in &row.engine_ids {
-                let Some(eff) = eff_of.get(id) else { continue };
-                for m in &eff.modules {
-                    let ModuleDef::Engine {
-                        thrust_vac_n,
-                        isp_vac_s,
-                        isp_sl_s,
-                        propellants,
-                        ..
-                    } = m
-                    else {
+                let Some(eff) = eff_of.get(id) else {
+                    continue;
+                };
+                let unholdable = eff.modules.iter().any(|m| match m {
+                    ModuleDef::Engine { propellants, .. } => propellants
+                        .iter()
+                        .any(|(r, f)| *f > 0.0 && res.mass_per_unit(r).unwrap_or(0.0) <= 0.0),
+                    _ => false,
+                });
+                if unholdable {
+                    starved.insert(*id);
+                }
+            }
+
+            // Depletion passes (module doc): each pass burns the
+            // engines still alight until the limiting pooled resource
+            // empties, debits the draw ascending `PartNodeId` — the
+            // drain order `transfers::debit` and `consume_drawn` share
+            // (C13-F2) — then starves the engines it fed and repeats.
+            // The bound is defence, matching the flight walk's. The
+            // row's thrust/Isp/mass-flow/TWR report the *first*
+            // burnable evaluation — the segment-start delivery; burn
+            // time, propellant, and Δv accumulate across passes.
+            //
+            // Starved engines claim nothing from the pool — a stated
+            // simplification of the sim's shared-denominator coverage
+            // (they inflate demand there while delivering zero); at
+            // rated-until-depletion granularity the totals are equal.
+            let mut segment_start = true;
+            for _pass in 0..64 {
+                // Per-resource demand (kg/s) and ΣF over the engines
+                // still burning. Engines with no positive-fraction
+                // propellant (or a non-positive Isp) are unmetered —
+                // real thrust, nothing drawn, excluded from the
+                // effective Isp (the sim's free-thrust convention).
+                let mut demand: BTreeMap<ResourceId, f64> = BTreeMap::new();
+                let mut mdot_total = 0.0f64;
+                let mut sl_mdot_equiv = 0.0f64;
+                let mut thrust_n = 0.0f64;
+                let mut metered_thrust_n = 0.0f64;
+                for id in &row.engine_ids {
+                    if starved.contains(id) {
+                        continue;
+                    }
+                    let Some(eff) = eff_of.get(id) else {
                         continue;
                     };
-                    let mdot = thrust_vac_n / (isp_vac_s * G0);
-                    mdot_total += mdot;
-                    sl_mdot_equiv += thrust_vac_n / (isp_sl_s * G0);
-                    for (r, frac) in propellants {
-                        *demand.entry(r.clone()).or_default() += mdot * frac;
+                    for m in &eff.modules {
+                        let ModuleDef::Engine {
+                            thrust_vac_n,
+                            isp_vac_s,
+                            isp_sl_s,
+                            propellants,
+                            ..
+                        } = m
+                        else {
+                            continue;
+                        };
+                        thrust_n += thrust_vac_n;
+                        if *isp_vac_s > 0.0 && propellants.iter().any(|(_, f)| *f > 0.0) {
+                            metered_thrust_n += thrust_vac_n;
+                            let mdot = thrust_vac_n / (isp_vac_s * G0);
+                            mdot_total += mdot;
+                            sl_mdot_equiv += thrust_vac_n / (isp_sl_s * G0);
+                            for (r, frac) in propellants {
+                                if *frac > 0.0 {
+                                    *demand.entry(r.clone()).or_default() += mdot * frac;
+                                }
+                            }
+                        }
                     }
                 }
-            }
-            row.mass_flow_kg_s = mdot_total;
-            if mdot_total > 0.0 {
-                row.isp_vac_s = row.thrust_vac_n / (G0 * mdot_total);
-                row.isp_sl_s = row.thrust_vac_n / (G0 * sl_mdot_equiv);
-            }
-
-            // Propellant on the attached set — the supply region (module
-            // doc: `attached` already encodes the severed-edge cuts).
-            //
-            // LATENT EDGE (documented, accepted at this tier): massless
-            // resources (`mass_per_unit_kg == 0`, e.g. electric charge)
-            // are skipped here — they carry no burnable mass, so
-            // `available` never gains an entry for them. An engine whose
-            // authored propellant mix demands one then reads
-            // `available == 0` below and burns for 0 s — a massless-
-            // propellant engine silently contributes thrust but no Δv.
-            // No authored engine does this today (the validator gates
-            // propellant mixes); the honest fix when one lands is
-            // demand/supply accounting in *units*, not kg — the
-            // consumption loop's `mpu.max(1e-12)` fallback is the same
-            // approximation's other half.
-            let mut available: BTreeMap<ResourceId, f64> = BTreeMap::new();
-            for id in &attached {
-                let Some(nm) = mass.get(id) else { continue };
-                for (r, units) in &nm.tanks {
-                    let mpu = res.mass_per_unit(r).unwrap_or(0.0);
-                    if mpu > 0.0 {
-                        *available.entry(r.clone()).or_default() += units * mpu;
-                    }
-                }
-            }
-
-            // Burn time is limited by the first propellant to run out.
-            let mut burn = f64::INFINITY;
-            for (r, kg_s) in &demand {
-                if *kg_s > 0.0 {
-                    burn = burn.min(available.get(r).copied().unwrap_or(0.0) / kg_s);
-                }
-            }
-            if !burn.is_finite() {
-                burn = 0.0;
-            }
-            row.burn_time_s = burn;
-            row.propellant_burned_kg = demand
-                .iter()
-                .map(|(r, kg_s)| (kg_s * burn).min(available.get(r).copied().unwrap_or(0.0)))
-                .sum();
-            let dry_end = (row.wet_mass_kg - row.propellant_burned_kg).max(1e-9);
-            let ratio = row.wet_mass_kg / dry_end;
-            if ratio > 1.0 && row.isp_vac_s > 0.0 {
-                row.delta_v_m_per_s = row.isp_vac_s * G0 * libm::log(ratio);
-                row.delta_v_sl_m_per_s = row.isp_sl_s * G0 * libm::log(ratio);
-            }
-            if row.wet_mass_kg > 0.0 {
-                row.twr_surface = row.thrust_vac_n / (row.wet_mass_kg * G0);
-            }
-
-            // Consume the propellant — ascending `PartNodeId`, each
-            // resource drawn down until the stage's burn is met.
-            //
-            // DRAW ORDER (documented, R14-F6): `attached` is a
-            // `BTreeSet`, so tanks drain in *allocation* order — the
-            // order parts were added to the session, not any authored
-            // priority. The order is stable and deterministic for a
-            // given session (ids are never reused), but it is not a
-            // game rule: which tank empties first only matters when a
-            // stage's burn cannot empty them all — a partial draw
-            // drains low-id tanks first, and a decoupler dropping the
-            // drained half leaves later stages more propellant than
-            // dropping the full half would. A stable *authored* rule
-            // (tank feed priority, bottom-up draining) is a schema
-            // question, deferred like the other v1 simplifications.
-            for (r, kg_s) in &demand {
-                let mpu = res.mass_per_unit(r).unwrap_or(1.0).max(1e-12);
-                let mut need_units = kg_s * burn / mpu;
+                // Pooled availability over the attached set (kg) — the
+                // same vessel-wide pool `propellant_plans` resolves.
+                // Massless resources carry no burnable mass, so only
+                // `mpu > 0` resources enter (un-holdable demanders are
+                // already starved, above).
+                let mut available: BTreeMap<ResourceId, f64> = BTreeMap::new();
                 for id in &attached {
-                    if need_units <= 0.0 {
-                        break;
-                    }
-                    let Some(nm) = mass.get_mut(id) else { continue };
-                    let Some(have) = nm.tanks.get_mut(r) else {
+                    let Some(nm) = mass.get(id) else {
                         continue;
                     };
-                    let take = (*have).min(need_units);
-                    *have -= take;
-                    need_units -= take;
+                    for (r, units) in &nm.tanks {
+                        let mpu = res.mass_per_unit(r).unwrap_or(0.0);
+                        if mpu > 0.0 {
+                            *available.entry(r.clone()).or_default() += units * mpu;
+                        }
+                    }
+                }
+                // A demanded resource already empty starves every
+                // engine drawing it — drop them and re-evaluate
+                // without their claims.
+                let mut starved_any = false;
+                for id in &row.engine_ids {
+                    if starved.contains(id) {
+                        continue;
+                    }
+                    let Some(eff) = eff_of.get(id) else {
+                        continue;
+                    };
+                    let starves = eff.modules.iter().any(|m| match m {
+                        ModuleDef::Engine { propellants, .. } => {
+                            propellants.iter().any(|(r, f)| {
+                                *f > 0.0
+                                    && demand.get(r).is_some_and(|d| *d > 0.0)
+                                    && available.get(r).copied().unwrap_or(0.0) <= 0.0
+                            })
+                        }
+                        _ => false,
+                    });
+                    if starves {
+                        starved.insert(*id);
+                        starved_any = true;
+                    }
+                }
+                if starved_any {
+                    continue;
+                }
+                // First burnable evaluation → the segment-start
+                // figures flight's `burn_step(θ = 1)` reports.
+                if segment_start {
+                    segment_start = false;
+                    row.thrust_vac_n = thrust_n;
+                    row.mass_flow_kg_s = mdot_total;
+                    if mdot_total > 0.0 {
+                        row.isp_vac_s = metered_thrust_n / (G0 * mdot_total);
+                    }
+                    if sl_mdot_equiv > 0.0 {
+                        row.isp_sl_s = metered_thrust_n / (G0 * sl_mdot_equiv);
+                    }
+                    if row.wet_mass_kg > 0.0 {
+                        row.twr_surface = row.thrust_vac_n / (row.wet_mass_kg * G0);
+                    }
+                }
+                if demand.is_empty() {
+                    break;
+                }
+                // The pass ends when the limiting pooled resource
+                // empties — the same first-depletion bound
+                // `burn_step`'s `burn_s` reports.
+                let mut burn = f64::INFINITY;
+                for (r, kg_s) in &demand {
+                    if *kg_s > 0.0 {
+                        burn = burn.min(available.get(r).copied().unwrap_or(0.0) / kg_s);
+                    }
+                }
+                if !burn.is_finite() || burn <= 0.0 {
+                    break;
+                }
+                let burned: f64 = demand
+                    .iter()
+                    .map(|(r, kg_s)| (kg_s * burn).min(available.get(r).copied().unwrap_or(0.0)))
+                    .sum();
+                // Per-pass Tsiolkovsky on the live attached mass —
+                // tanks shrink as earlier passes debit them.
+                let wet_now: f64 = attached
+                    .iter()
+                    .filter_map(|id| mass.get(id))
+                    .map(|m| m.total(res))
+                    .sum();
+                let dry_end = (wet_now - burned).max(1e-9);
+                let ratio = wet_now / dry_end;
+                if ratio > 1.0 && mdot_total > 0.0 {
+                    row.delta_v_m_per_s +=
+                        (metered_thrust_n / (G0 * mdot_total)) * G0 * libm::log(ratio);
+                }
+                if ratio > 1.0 && sl_mdot_equiv > 0.0 {
+                    row.delta_v_sl_m_per_s +=
+                        (metered_thrust_n / (G0 * sl_mdot_equiv)) * G0 * libm::log(ratio);
+                }
+                row.burn_time_s += burn;
+                row.propellant_burned_kg += burned;
+                // Debit the draw ascending `PartNodeId`, each resource
+                // drawn down until the pass's burn is met — the fixed
+                // drain order (module doc, C13-F2).
+                for (r, kg_s) in &demand {
+                    let mpu = res.mass_per_unit(r).unwrap_or(1.0).max(1e-12);
+                    let mut need_units = kg_s * burn / mpu;
+                    for id in &attached {
+                        if need_units <= 0.0 {
+                            break;
+                        }
+                        let Some(nm) = mass.get_mut(id) else {
+                            continue;
+                        };
+                        let Some(have) = nm.tanks.get_mut(r) else {
+                            continue;
+                        };
+                        let take = (*have).min(need_units);
+                        *have -= take;
+                        need_units -= take;
+                    }
                 }
             }
         }
@@ -381,17 +509,6 @@ pub fn analyze(
         launch_mass_kg,
         cost_funds,
     })
-}
-
-/// Σ `thrust_vac_n` across the part's `Engine` modules.
-fn engine_thrust(eff: &EffectivePart) -> f64 {
-    eff.modules
-        .iter()
-        .map(|m| match m {
-            ModuleDef::Engine { thrust_vac_n, .. } => *thrust_vac_n,
-            _ => 0.0,
-        })
-        .sum()
 }
 
 #[cfg(test)]
@@ -581,9 +698,11 @@ mod tests {
     }
 
     /// Two stages: booster decoupler+engine+tank staged at 1 under the
-    /// sustainer engine, sustainer stage 0. The booster burn lifts
-    /// everything; the sustainer sees only post-separation mass and its
-    /// own (full) tank.
+    /// sustainer engine, sustainer stage 0. Under the attached-set
+    /// model (C13-F1) BOTH engines fire from launch — the stage-1 row
+    /// is the pooled burn of the whole stack and matches flight's
+    /// `burn_step` numbers; the sustainer then sees post-separation
+    /// mass and its own (drained) tank.
     #[test]
     fn two_stage_readout_separates_mass_and_propellant() {
         let (mut s, defs, res) = single_stage();
@@ -644,24 +763,166 @@ mod tests {
         assert_eq!(a.stages.len(), 2);
         let (s1, s0) = (&a.stages[0], &a.stages[1]);
         assert_eq!(s1.stage, 1);
-        assert_eq!(s1.engine_ids, vec![beng_id]);
+        // C13-F1: the row's engine set is every attached engine —
+        // sustainer AND booster — matching the sim's vessel-wide
+        // fire (the boundary jettisons, it does not ignite).
+        assert_eq!(s1.engine_ids, vec![eng_id, beng_id]);
         // Stage 1 burns with EVERYTHING attached: wet = 1230 + 20+50+80+1000
-        // = 2380. The supply region is the whole attached set, so the
-        // booster drains BOTH tanks — 2000 kg — before any separation.
+        // = 2380. The supply pool is the whole attached set, so the
+        // engines drain BOTH tanks — 2000 kg — before any separation.
         assert!((s1.wet_mass_kg - 2380.0).abs() < 1e-9, "{s1:?}");
         assert!((s1.propellant_burned_kg - 2000.0).abs() < 1e-9);
-        let dv1 = 280.0 * G0 * libm::log(2380.0 / 380.0);
+        // Flight-identical figures: ΣF = 30 kN, pooled ṁ =
+        // 10k/(300·g₀) + 20k/(280·g₀), Isp_eff mass-flow weighted.
+        assert!((s1.thrust_vac_n - 30_000.0).abs() < 1e-9, "{s1:?}");
+        let mdot = 10_000.0 / (300.0 * G0) + 20_000.0 / (280.0 * G0);
+        assert!((s1.mass_flow_kg_s - mdot).abs() < 1e-9);
+        let isp_eff = 30_000.0 / (10_000.0 / 300.0 + 20_000.0 / 280.0);
+        assert!((s1.isp_vac_s - isp_eff).abs() < 1e-9);
+        assert!((s1.burn_time_s - 2000.0 / mdot).abs() < 1e-6);
+        assert!((s1.twr_surface - 30_000.0 / (2380.0 * G0)).abs() < 1e-9);
+        let dv1 = isp_eff * G0 * libm::log(2380.0 / 380.0);
         assert!((s1.delta_v_m_per_s - dv1).abs() < 1e-6);
         // The decoupler drops btank+beng (the dec stays parent-side).
         assert_eq!(s1.separated_ids, vec![btank_id, beng_id]);
         // Stage 0: pod+sustainer tank+engine+the spent decoupler —
         // wet is dry-only 250 (the dec stays parent-side; the tank is
-        // empty), so the sustainer gets zero Δv: an honest starved
-        // stage, matching EngineWithoutPropellant's advisory.
+        // empty), so the sustainer delivers nothing: an honest starved
+        // stage — the coverage-zeroed figures flight's burn_step
+        // reports on a dry pool (thrust 0, TWR 0, "0:00").
         assert!((s0.wet_mass_kg - 250.0).abs() < 1e-9, "{s0:?}");
         assert!((s0.propellant_burned_kg).abs() < 1e-9);
         assert_eq!(s0.delta_v_m_per_s, 0.0);
+        assert_eq!(s0.thrust_vac_n, 0.0);
+        assert_eq!(s0.twr_surface, 0.0);
         assert!((a.total_delta_v_m_per_s - dv1).abs() < 1e-6);
+    }
+
+    /// Disjoint propellant sets exercise the depletion passes: when
+    /// the oxidizer runs out the ox-fed engine starves while the
+    /// fuel-only engine burns on — the same pass boundary flight's
+    /// `delta_v_walk_from` iterates, so burn time and Δv are the
+    /// two-segment sums, not a single first-depletion figure.
+    #[test]
+    #[allow(clippy::too_many_lines)] // the fixture and the two-pass math read as one narrative
+    fn mixed_propellant_stage_burns_in_depletion_passes() {
+        let res = ResourceFile {
+            schema_version: 1,
+            resources: vec![
+                ResourceDef {
+                    id: ResourceId::from("fuel"),
+                    display_name: "r.fuel".into(),
+                    mass_per_unit_kg: 5.0,
+                },
+                ResourceDef {
+                    id: ResourceId::from("ox"),
+                    display_name: "r.ox".into(),
+                    mass_per_unit_kg: 5.0,
+                },
+            ],
+        };
+        let mut pod = base_def("t.pod", PartCategory::Control, 100.0);
+        pod.modules = vec![ModuleDef::Control {
+            torque_nm: 10.0,
+            power_w: 1.0,
+        }];
+        let mut tank = base_def("t.tank2", PartCategory::FuelTank, 50.0);
+        tank.modules = vec![ModuleDef::Tank {
+            capacity: vec![
+                (ResourceId::from("fuel"), 200.0),
+                (ResourceId::from("ox"), 200.0),
+            ],
+        }];
+        let engine = |id: &str, thrust: f64, isp: f64, mix: Vec<(ResourceId, f64)>| {
+            let mut d = base_def(id, PartCategory::Engine, 80.0);
+            d.modules = vec![ModuleDef::Engine {
+                thrust_vac_n: thrust,
+                isp_vac_s: isp,
+                isp_sl_s: 250.0,
+                throttle_range: ThrottleRange { min: 0.0, max: 1.0 },
+                gimbal_deg: 0.0,
+                ignitions: None,
+                rated_burn_s: 600.0,
+                propellants: mix,
+                ullage_required: false,
+            }];
+            d
+        };
+        // A: ox-heavy biprop; B: fuel-only — the ox depletion starves
+        // A alone.
+        let defs = catalog(vec![
+            pod,
+            tank,
+            engine(
+                "t.engA",
+                10_000.0,
+                300.0,
+                vec![
+                    (ResourceId::from("fuel"), 0.1),
+                    (ResourceId::from("ox"), 0.9),
+                ],
+            ),
+            engine(
+                "t.engB",
+                5_000.0,
+                200.0,
+                vec![(ResourceId::from("fuel"), 1.0)],
+            ),
+        ]);
+        let stock = |id: &str| BuiltPart::stock(PartId::from(id), VariantId::from("stock"));
+        let mut s = CraftSession::new();
+        let pod_id = s.add_root(&defs, stock("t.pod")).unwrap();
+        let tank_id = s
+            .add_part(
+                &defs,
+                stock("t.tank2"),
+                AttachEdge::new(pod_id, "bottom", "top"),
+            )
+            .unwrap();
+        let eng_a = s
+            .add_part(
+                &defs,
+                stock("t.engA"),
+                AttachEdge::new(tank_id, "bottom", "top"),
+            )
+            .unwrap();
+        let eng_b = s
+            .add_part(
+                &defs,
+                stock("t.engB"),
+                AttachEdge::new(eng_a, "bottom", "top"),
+            )
+            .unwrap();
+
+        let a = analyze(&s, &defs, &res).unwrap();
+        assert_eq!(a.stages.len(), 1);
+        let st = &a.stages[0];
+        assert_eq!(st.engine_ids, vec![eng_a, eng_b]);
+        // Segment-start: both engines deliver — ΣF 15 kN.
+        assert!((st.thrust_vac_n - 15_000.0).abs() < 1e-9, "{st:?}");
+        let mdot_a = 10_000.0 / (300.0 * G0);
+        let mdot_b = 5_000.0 / (200.0 * G0);
+        assert!((st.mass_flow_kg_s - (mdot_a + mdot_b)).abs() < 1e-9);
+        let fuel_d = mdot_a * 0.1 + mdot_b;
+        let ox_d = mdot_a * 0.9;
+        // Pass 1 ends on the ox pool (1000 kg each side): burn1 =
+        // 1000/ox_d < 1000/fuel_d.
+        let burn1 = 1000.0 / ox_d;
+        assert!(burn1 < 1000.0 / fuel_d);
+        let fuel_left = 1000.0 - fuel_d * burn1;
+        // Pass 2: A starved, B alone drains the fuel remnant.
+        let burn2 = fuel_left / mdot_b;
+        assert!((st.burn_time_s - (burn1 + burn2)).abs() < 1e-6, "{st:?}");
+        // Every tank ends dry — Σ burned is the whole 2000 kg.
+        assert!((st.propellant_burned_kg - 2000.0).abs() < 1e-6);
+        // Two Tsiolkovsky terms: the mixed-Isp pass, then B alone.
+        let wet = 2310.0;
+        let isp1 = 15_000.0 / (G0 * (mdot_a + mdot_b));
+        let wet2 = wet - (fuel_d + ox_d) * burn1;
+        let dv1 = isp1 * G0 * libm::log(wet / wet2);
+        let dv2 = 200.0 * G0 * libm::log(wet2 / (wet2 - fuel_left));
+        assert!((st.delta_v_m_per_s - (dv1 + dv2)).abs() < 1e-6, "{st:?}");
+        assert!((st.twr_surface - 15_000.0 / (wet * G0)).abs() < 1e-9);
     }
 
     /// An engine with no propellant in its attached set produces a
@@ -691,7 +952,11 @@ mod tests {
         assert_eq!(st.delta_v_m_per_s, 0.0);
         assert_eq!(st.burn_time_s, 0.0);
         assert_eq!(st.propellant_burned_kg, 0.0);
-        assert!(st.twr_surface > 0.0); // thrust/mass still honest
+        // Delivered thrust is coverage-zeroed — the same 0 flight's
+        // `burn_step` reports on a dry pool, so the TWR row reads 0
+        // rather than an unachievable rated figure.
+        assert_eq!(st.thrust_vac_n, 0.0);
+        assert_eq!(st.twr_surface, 0.0);
     }
 
     /// An empty session analyzes to empty — no error.
