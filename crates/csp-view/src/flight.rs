@@ -197,6 +197,9 @@ pub enum PartKind {
     Science,
     /// Docking port.
     Port,
+    /// Deployable decelerator — the part resolves a `ParachuteSpec`
+    /// (the recovery canister the `"chute"` model keys).
+    Chute,
     /// Everything else — nose cones, adapters, decouplers, hull
     /// fallbacks.
     Structural,
@@ -1581,8 +1584,12 @@ fn vessel_propulsion(
 /// precedence `part_mesh::classify` uses for silhouettes (engine and
 /// crew beat the collider), then the carried inventories: propellant
 /// tanks (mass-bearing `TankSpec`s) vs batteries (massless stores),
-/// science payloads, docking ports, and everything else structural.
-fn part_kind(wp: &csp_phys::WeldPart) -> PartKind {
+/// science payloads, docking ports, parachutes, and everything else
+/// structural. **Shared with the VAB** (`vab.rs` runs it over
+/// `EffectivePart::weld_input`): one classifier feeding `model_key`'s
+/// kind arm is what keeps the editor↔flight model keys in lockstep
+/// (C20-F1 — this function used to omit `parachute` entirely).
+pub(crate) fn part_kind(wp: &csp_phys::WeldPart) -> PartKind {
     if wp.engine.is_some()
         || wp
             .force_sites
@@ -1607,6 +1614,11 @@ fn part_kind(wp: &csp_phys::WeldPart) -> PartKind {
     if !wp.dock_ports.is_empty() {
         return PartKind::Port;
     }
+    // A chute claims the part only when no functional identity above
+    // did — a tank that also packs a chute still reads as a tank.
+    if wp.parachute.is_some() {
+        return PartKind::Chute;
+    }
     PartKind::Structural
 }
 
@@ -1622,6 +1634,9 @@ fn kind_tint(kind: PartKind) -> [f32; 3] {
         PartKind::Battery => [0.19, 0.23, 0.26],
         PartKind::Science => [0.44, 0.46, 0.50],
         PartKind::Port => [0.30, 0.32, 0.35],
+        // Safety-orange — the packed-canopy recovery class reads
+        // warm against the stage-white tanks.
+        PartKind::Chute => [0.78, 0.38, 0.22],
         PartKind::Structural => [0.60, 0.63, 0.69],
     }
 }
@@ -1720,10 +1735,15 @@ fn vessel_parts(
         }
         let shape = crate::part_mesh::classify_weld_part(wp);
         let kind = part_kind(wp);
-        // The weld view carries no def id — key the model by module
-        // family; a pointed lathe profile upgrades Structural → nose cone.
+        // The node's recorded def id — `part_ids` parallels `parts`
+        // (empty on hand-built craft, then the kind arm decides) —
+        // feeds the same id-first `model_key` the VAB resolves, so
+        // editor and flight agree on one model per part (C20-F1).
         let model = art.model(crate::art::model_key(
-            None,
+            craft
+                .part_ids
+                .get(node.effective_index as usize)
+                .map(|id| id.as_str()),
             kind,
             crate::part_mesh::is_pointed(&shape),
         ));
@@ -2915,6 +2935,8 @@ fn kind_mat(kind: PartKind) -> [f32; 3] {
         PartKind::Battery => [0.45, 36.0, 1.0],
         PartKind::Science => [0.50, 44.0, 1.0],
         PartKind::Port => [0.42, 36.0, 1.0],
+        // Packed fabric + canister: matte, not nozzle steel.
+        PartKind::Chute => [0.25, 14.0, 1.0],
         PartKind::Structural => [0.52, 48.0, 1.0],
     }
 }

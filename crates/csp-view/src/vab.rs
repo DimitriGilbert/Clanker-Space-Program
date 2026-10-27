@@ -317,31 +317,15 @@ pub(crate) fn vab_present(
         let color = category_color(vab.0.def_of(id).map(|d| d.category), sel == Some(id));
         let shape = crate::part_mesh::classify_effective(eff);
         let model = art.as_ref().and_then(|a| {
-            let kind = if eff
-                .modules
-                .iter()
-                .any(|m| matches!(m, csp_data::part::ModuleDef::Engine { .. }))
-            {
-                crate::flight::PartKind::Engine
-            } else if eff
-                .modules
-                .iter()
-                .any(|m| matches!(m, csp_data::part::ModuleDef::CrewSeat { .. }))
-            {
-                crate::flight::PartKind::Crew
-            } else if eff
-                .modules
-                .iter()
-                .any(|m| matches!(m, csp_data::part::ModuleDef::Tank { .. }))
-            {
-                crate::flight::PartKind::Tank
-            } else {
-                crate::flight::PartKind::Structural
-            };
+            // The shared module-family classifier — the same
+            // `part_kind` flight runs over the same resolved
+            // `WeldPart` (`EffectivePart::weld_input`), so the kind
+            // arm `model_key` falls back on agrees across the
+            // editor↔flight seam (C20-F1).
             a.0.models
                 .get(crate::art::model_key(
                     Some(eff.part_id.as_str()),
-                    kind,
+                    crate::flight::part_kind(&eff.weld_input),
                     crate::part_mesh::is_pointed(&shape),
                 ))
                 .cloned()
@@ -443,9 +427,13 @@ pub(crate) fn vab_present(
                         if let Some(&pt) = vab.0.body_transforms().get(&hit.node) {
                             scene.ghosts.push(GhostMesh {
                                 transform: PartTransform::new(pt.apply(hit.local), pt.rotation),
-                                shape,
+                                shape: shape.clone(),
                                 color: [0.95, 0.30, 0.25, 0.55],
-                                model: ghost_model(&art, &eff),
+                                model: ghost_model(
+                                    &art,
+                                    &eff,
+                                    crate::part_mesh::is_pointed(&shape),
+                                ),
                             });
                         }
                     } else {
@@ -455,7 +443,11 @@ pub(crate) fn vab_present(
                                     transform: parent_t.compose(*t),
                                     shape: shape.clone(),
                                     color: [0.35, 0.95, 0.45, 0.45],
-                                    model: ghost_model(&art, &eff),
+                                    model: ghost_model(
+                                        &art,
+                                        &eff,
+                                        crate::part_mesh::is_pointed(&shape),
+                                    ),
                                 });
                             }
                         }
@@ -470,9 +462,9 @@ pub(crate) fn vab_present(
                 } else if let Some(anchor) = float_anchor {
                     scene.ghosts.push(GhostMesh {
                         transform: PartTransform::new(anchor, DQuat::IDENTITY),
-                        shape,
+                        shape: shape.clone(),
                         color: [0.65, 0.78, 1.0, 0.40],
-                        model: ghost_model(&art, &eff),
+                        model: ghost_model(&art, &eff, crate::part_mesh::is_pointed(&shape)),
                     });
                 }
             }
@@ -493,7 +485,11 @@ pub(crate) fn vab_present(
                 };
                 if let Some(eff) = vab.0.resolve_built(rec.built()) {
                     let shape = crate::part_mesh::classify_effective(&eff);
-                    members.push((*rel, shape, ghost_model(&art, &eff)));
+                    members.push((
+                        *rel,
+                        shape.clone(),
+                        ghost_model(&art, &eff, crate::part_mesh::is_pointed(&shape)),
+                    ));
                 }
             }
             if members.is_empty() {
@@ -1160,19 +1156,23 @@ fn emit_octa(verts: &mut Vec<VabVertex>, cam: &MapCameraF64, pos: DVec3, m: f64,
     }
 }
 
-/// Resolve a ghost/carried part's model through the def id —
-/// the same keying `vab_present` uses for placed parts.
+/// Resolve a ghost/carried part's model through the same id-first
+/// keying `vab_present` uses for placed parts — `pointed` comes from
+/// the caller's already-classified `PartShape` (C20-F1: the ghost
+/// used to hard-code Structural/flat and could resolve a different
+/// key than the placed part it previews).
 fn ghost_model(
     art: &Option<Res<crate::art::ArtAssets>>,
     eff: &csp_phys::EffectivePart,
+    pointed: bool,
 ) -> Option<std::sync::Arc<crate::art::PartModel>> {
     art.as_ref()?
         .0
         .models
         .get(crate::art::model_key(
             Some(eff.part_id.as_str()),
-            crate::flight::PartKind::Structural,
-            false,
+            crate::flight::part_kind(&eff.weld_input),
+            pointed,
         ))
         .cloned()
 }

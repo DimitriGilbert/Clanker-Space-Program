@@ -368,10 +368,18 @@ fn image_payload_len(w: u32, h: u32, layers: u32, mips: u32) -> Result<usize, St
     usize::try_from(total).map_err(|_| "image payload length overflow".to_string())
 }
 
-/// The baked model key for a part — the def id wins when known
-/// (VAB path), otherwise the render kind + silhouette hint decides
-/// (flight path). `pointed` = the collider profile ends in a top apex
-/// (nose-cone class) — structural parts only.
+/// The baked model key for a part — the ONE classifier the VAB and
+/// flight views share (C20-F1: the editor's preview and the flown
+/// craft must resolve the same model for the same part). Resolution
+/// is **id-first, kind-second**: a catalog `PartId`'s substring
+/// selects the precise family when an id is known — the VAB always
+/// has `EffectivePart::part_id`, and flight passes the node's
+/// `CraftDef::part_ids` slot (empty on hand-built craft). Only when
+/// no id exists does the module-family `kind` decide — and both
+/// surfaces feed it through the shared `crate::flight::part_kind`,
+/// so the two arms cannot drift apart again. `pointed` = the
+/// collider profile ends in a top apex (nose-cone class) — the
+/// silhouette upgrade on `Structural` alone.
 pub fn model_key(
     part_id: Option<&str>,
     kind: crate::flight::PartKind,
@@ -424,6 +432,7 @@ pub fn model_key(
         K::Battery => "battery",
         K::Science => "science",
         K::Port => "decoupler",
+        K::Chute => "chute",
         K::Structural => {
             if pointed {
                 "nosecone"
@@ -452,6 +461,78 @@ mod tests {
         let t = art.0.terrain.as_ref().unwrap();
         assert_eq!(t.albedo.layers, 4);
         assert!(t.water.mips > 4);
+    }
+
+    /// C20-F1: every shipped catalog part resolves the SAME baked
+    /// model key through the VAB's `EffectivePart` path and flight's
+    /// `WeldPart` + `part_ids` path. The two disjoint classifiers
+    /// used to swap models across the editor→flight seam (chute →
+    /// adapter, ember → engine_a, decoupler → adapter, dockport →
+    /// decoupler); sharing `model_key` + `crate::flight::part_kind`
+    /// makes that structurally impossible — this gates the whole
+    /// catalog so a new part or id scheme cannot reopen it.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn editor_flight_model_key_parity() {
+        let root = crate::data_root();
+        let src = csp_data::FsDataSource;
+        let catalog = csp_data::load_parts_from(&src, &root.join("parts")).unwrap();
+        let res = csp_data::load_resources_from(&src, &root.join("resources.ron")).unwrap();
+        let art = load();
+        assert!(!catalog.parts.is_empty(), "shipped catalog is empty");
+        for entry in &catalog.parts {
+            let def = &entry.def;
+            let variant = def
+                .variants
+                .first()
+                .map(|v| v.id.clone())
+                .unwrap_or_else(|| csp_data::VariantId::from("stock"));
+            let built = csp_phys::BuiltPart::stock(def.id.clone(), variant);
+            let eff = csp_phys::resolve::resolve_built_part(
+                def,
+                &built,
+                &res,
+                &csp_phys::FamilyQualification::FRESH,
+            )
+            .unwrap();
+            let id = eff.part_id.as_str();
+            // The shared kind — the same call both surfaces run.
+            let kind = crate::flight::part_kind(&eff.weld_input);
+            // The editor keys off `EffectivePart::part_id` and the
+            // `classify_effective` silhouette (attach nodes included)…
+            let editor_key = model_key(
+                Some(id),
+                kind,
+                crate::part_mesh::is_pointed(&crate::part_mesh::classify_effective(&eff)),
+            );
+            // …flight keys off the node's `part_ids` slot (the same
+            // id for a catalog craft) and the `classify_weld_part`
+            // silhouette.
+            let flight_key = model_key(
+                Some(id),
+                kind,
+                crate::part_mesh::is_pointed(&crate::part_mesh::classify_weld_part(
+                    &eff.weld_input,
+                )),
+            );
+            assert_eq!(editor_key, flight_key, "model key differs for {id}");
+            assert!(
+                art.0.models.contains_key(editor_key),
+                "{id} resolves {editor_key} — no baked model under that key"
+            );
+        }
+    }
+
+    /// The kind arm the old flight classifier lacked: a `ParachuteSpec`
+    /// on an id-less (hand-built) part still keys the chute model —
+    /// the C20-F1 gap now covered by `PartKind::Chute`.
+    #[test]
+    fn model_key_kind_fallback_covers_chute() {
+        use crate::flight::PartKind as K;
+        assert_eq!(model_key(None, K::Chute, false), "chute");
+        assert_eq!(model_key(None, K::Port, false), "decoupler");
+        assert_eq!(model_key(None, K::Structural, true), "nosecone");
+        assert_eq!(model_key(None, K::Structural, false), "adapter");
     }
 
     /// A minimal in-memory pack with one image entry — `w,h` level-0
