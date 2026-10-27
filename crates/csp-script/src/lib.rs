@@ -40,7 +40,11 @@
 //! `periapsis`, `time_to_apoapsis`, `time_to_periapsis`, `throttle`,
 //! `mass`, `residence`, `found`, `pos`, `vel`, `rot` (the orientation
 //! quat as `{w, x, y, z}`), `node`, `node_tick`), `persist`
-//! (the live map — writes land in the save).
+//! (the live map — writes land in the save). `persist` is the only
+//! key read back after the call, and it must stay a map of
+//! primitives: indexed writes (`ctx.persist["k"] = v`) and wholesale
+//! replacement (`ctx.persist = #{…}`) are both honored; leaving it a
+//! non-map is a runtime fault. Extra keys added to `ctx` are inert.
 //!
 //! Host functions bound on `this`-free names: `set_throttle(f)`,
 //! `steer(x, y, z)` (aim the craft's fore axis along the world
@@ -1174,13 +1178,19 @@ impl ScriptEngine for RhaiHost {
             },
         );
 
-        // Build ctx: tick + vessel telemetry + live persist. The
-        // `persist` map is shared-ref (`Dynamic::into_shared`) — the
-        // script's `ctx.persist[...]` writes mutate through the
-        // shared cell and are read back after the call. The rest of
-        // ctx is a plain map: telemetry is a snapshot, never written
-        // back.
-        let persist_dyn = Dynamic::from_map(persist_map_to_rhai(&script.persist)).into_shared();
+        // Build ctx: tick + vessel telemetry + live persist — all
+        // PLAIN values. `ctx` itself is the shared cell (`into_shared`
+        // at the call below): the callee's `ctx` param binds to the
+        // same cell, so every guest mutation writes through it and is
+        // read back from our handle afterwards. `persist` must NOT be
+        // the shared cell — a `Union::Shared` nested inside a map is
+        // exactly what made any `ctx.<k> = …` assignment hit rhai
+        // 1.27's `unreachable!("shared values discovered within data")`
+        // in `calc_map_sizes` (eval/data_check.rs) once the
+        // set_max_*_size limits engaged — one pasted line killed the
+        // process (C26-F1). A shared cell at the ROOT is the supported
+        // shape: `calc_data_sizes` reads a top-level `Union::Shared`
+        // through its cell instead of panicking.
         let mut ctx = Map::new();
         ctx.insert("tick".into(), Dynamic::from_int(tick as INT));
         ctx.insert("script".into(), Dynamic::from_int(script.id.0 as INT));
@@ -1188,7 +1198,10 @@ impl ScriptEngine for RhaiHost {
             "vessel".into(),
             Dynamic::from_map(Self::telemetry_to_map(&telemetry)),
         );
-        ctx.insert("persist".into(), persist_dyn.clone());
+        ctx.insert(
+            "persist".into(),
+            Dynamic::from_map(persist_map_to_rhai(&script.persist)),
+        );
 
         // §2.10's enforcement point: the engine's `max_operations`
         // (forwarded from the world's per-save budget via
@@ -1196,17 +1209,34 @@ impl ScriptEngine for RhaiHost {
         // ops for the report's poll detector.
         *self.ops.borrow_mut() = 0;
         let mut scope = Scope::new();
-        let ctx_dynamic = Dynamic::from_map(ctx);
-        let result: Result<Dynamic, _> =
-            self.engine
-                .call_fn(&mut scope, &ast, "on_tick", (ctx_dynamic,));
+        let ctx_shared = Dynamic::from_map(ctx).into_shared();
+        let arg = ctx_shared.clone();
+        // Panic containment: the call runs inline on the game thread
+        // and rhai internals CAN panic (C26-F1's calc_map_sizes — plus
+        // any future one a limit or config change wakes up). Degrade
+        // to a `Runtime` fault — a strike — instead of process death.
+        let call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.engine.call_fn(&mut scope, &ast, "on_tick", (arg,))
+        }));
         let ops_used = *self.ops.borrow();
+        let result: Result<Dynamic, _> = match call {
+            Ok(r) => r,
+            Err(payload) => {
+                let msg = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                return ScriptRunReport {
+                    ops_used,
+                    fault: Some(ScriptFault::Runtime(format!("host-internal panic: {msg}"))),
+                };
+            }
+        };
 
-        // Persist write-back — read the shared map the script
-        // mutated. `flatten_clone` materializes through the shared
-        // cell; a non-map result means the script reassigned
-        // `ctx.persist` wholesale — also legal, read whatever it left.
-        let persist_out = persist_dyn.flatten_clone().try_cast::<Map>();
+        // The post-call ctx, materialized through the shared cell —
+        // every mutation the script made is visible here.
+        let ctx_out = ctx_shared.flatten_clone().try_cast::<Map>();
 
         match result {
             Err(e) => {
@@ -1240,17 +1270,34 @@ impl ScriptEngine for RhaiHost {
                 //
                 // 1. Convert the persist write-back — pure; a
                 //    non-primitive value is a runtime fault before
-                //    anything has moved.
-                let persist_next = match persist_out {
-                    Some(m) => match rhai_map_to_persist(&m) {
-                        Ok(p) => Some(p),
-                        Err(e) => {
+                //    anything has moved. The persist slot itself must
+                //    still be a map (see the ctx contract in the
+                //    module doc): wholesale `ctx.persist = #{…}` is
+                //    honored, but leaving it a scalar or deleting it
+                //    breaks the contract — also a fault.
+                let persist_next = match &ctx_out {
+                    Some(m) => match m.get("persist").and_then(|v| v.clone().try_cast::<Map>()) {
+                        Some(pm) => match rhai_map_to_persist(&pm) {
+                            Ok(p) => Some(p),
+                            Err(e) => {
+                                return ScriptRunReport {
+                                    ops_used,
+                                    fault: Some(ScriptFault::Runtime(e)),
+                                };
+                            }
+                        },
+                        None => {
                             return ScriptRunReport {
                                 ops_used,
-                                fault: Some(ScriptFault::Runtime(e)),
+                                fault: Some(ScriptFault::Runtime(
+                                    "ctx.persist must remain a map of primitives".to_string(),
+                                )),
                             };
                         }
                     },
+                    // `ctx` itself no longer holds a map — the persist
+                    // slot is unreachable, so the previous map is kept
+                    // rather than faulting on a destroyed handle.
                     None => None,
                 };
                 // 2. Resolve the wake intent — the only remaining
@@ -1769,5 +1816,119 @@ mod tests {
             "the tick's other effects still apply"
         );
         assert_eq!(s.persist.get("n"), Some(&PersistValue::Int(1)));
+    }
+
+    /// C26-F1 regression: property assignment into `ctx` used to panic
+    /// the process — `ctx.persist` was planted as a shared cell INSIDE
+    /// the ctx map, and rhai 1.27's `calc_map_sizes` hits
+    /// `unreachable!("shared values discovered within data")` on any
+    /// `ctx.<k> = …` under the set_max_*_size limits. `ctx` itself is
+    /// the shared cell now, so no `Union::Shared` is ever nested in a
+    /// map. Every verified panic form must complete normally; the ok
+    /// forms keep working; leaving `ctx.persist` a non-map is a
+    /// `Runtime` strike per the ctx contract.
+    #[test]
+    fn ctx_property_assignment_never_panics() {
+        let mut host = RhaiHost::new();
+        // Verified panic forms — each must return a report, never
+        // unwind. `want` is what script.persist must hold after the
+        // tick (`Some` exact match, `None` = previous map untouched).
+        for (i, (body, want)) in [
+            // Wholesale reassignment to a map — honored, replaces.
+            (
+                "ctx.persist = #{ n: 1 };",
+                Some(vec![("n", PersistValue::Int(1))]),
+            ),
+            // Indexed write then clear — the clear lands.
+            ("ctx.persist[\"n\"] = 1; ctx.persist = #{};", Some(vec![])),
+            // Adding an unrelated top-level property — inert.
+            ("ctx.extra = 1;", None),
+            // `let c = ctx` is a `let` binding — rhai flattens the
+            // initializer, so `c` is a private copy, not an alias;
+            // the write lands on the copy and is discarded with the
+            // callee scope. No fault, persist untouched — the same
+            // semantics as any guest map.
+            ("let c = ctx; c.persist = #{ n: 1 };", None),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let src = format!("fn on_tick(ctx) {{ {body} }}");
+            host.prepare(ScriptId(i as u64), &src)
+                .unwrap_or_else(|e| panic!("{body}: {e}"));
+            let mut s = script(&src);
+            s.id = ScriptId(i as u64);
+            s.persist.insert("keep".to_string(), PersistValue::Int(7));
+            let mut io = StubIo::new();
+            let r = host.run_tick(&mut s, 1, &mut io);
+            assert!(r.fault.is_none(), "{body}: {r:?}");
+            match want {
+                Some(entries) => {
+                    let mut expect = PersistMap::new();
+                    for (k, v) in entries {
+                        expect.insert(k.to_string(), v.clone());
+                    }
+                    assert_eq!(s.persist, expect, "{body}: persist mismatch");
+                }
+                None => assert_eq!(
+                    s.persist.get("keep"),
+                    Some(&PersistValue::Int(7)),
+                    "{body}: persist must be untouched"
+                ),
+            }
+        }
+        // The ok forms — indexed write, remove, aliased read of the
+        // persist value inside an array — never faulted.
+        for (i, body) in [
+            "ctx.persist[\"n\"] = 1;",
+            "ctx.persist[\"n\"] = 1; ctx.persist.remove(\"n\");",
+            "let a = [ctx.persist]; let x = ctx.persist[\"n\"];",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let src = format!("fn on_tick(ctx) {{ {body} }}");
+            host.prepare(ScriptId(100 + i as u64), &src)
+                .unwrap_or_else(|e| panic!("{body}: {e}"));
+            let mut s = script(&src);
+            s.id = ScriptId(100 + i as u64);
+            let mut io = StubIo::new();
+            let r = host.run_tick(&mut s, 1, &mut io);
+            assert!(r.fault.is_none(), "{body}: {r:?}");
+        }
+        // Contract violation — `ctx.persist` left as a non-map is a
+        // `Runtime` strike, not a silent pass.
+        let bad = "fn on_tick(ctx) { ctx.persist = 5; }";
+        host.prepare(ScriptId(200), bad).unwrap();
+        let mut s = script(bad);
+        s.id = ScriptId(200);
+        let mut io = StubIo::new();
+        let r = host.run_tick(&mut s, 1, &mut io);
+        assert!(
+            matches!(r.fault, Some(ScriptFault::Runtime(_))),
+            "ctx.persist = 5 must strike, not silently pass: {r:?}"
+        );
+    }
+
+    /// Panic containment around `engine.call_fn`: a panic anywhere
+    /// inside the script call — rhai internals or a host function —
+    /// degrades to a `Runtime` strike instead of unwinding to the game
+    /// thread (scripts run inline; pre-fix a rhai-internal panic was
+    /// process death — C26-F1). Simulated with a panicking host
+    /// function; rhai's own panics unwind on the same path.
+    #[test]
+    fn host_fn_panic_degrades_to_runtime_fault() {
+        let mut host = RhaiHost::new();
+        host.engine
+            .register_fn("boom", || -> () { panic!("simulated internal panic") });
+        let src = "fn on_tick(ctx) { boom(); }";
+        host.prepare(ScriptId(0), src).unwrap();
+        let mut s = script(src);
+        let mut io = StubIo::new();
+        let r = host.run_tick(&mut s, 1, &mut io);
+        assert!(
+            matches!(r.fault, Some(ScriptFault::Runtime(ref m)) if m.contains("panic")),
+            "a panic inside the call must become a Runtime strike: {r:?}"
+        );
     }
 }
