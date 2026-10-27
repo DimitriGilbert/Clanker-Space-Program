@@ -1075,6 +1075,9 @@ impl App {
             SessionOp::Revert => match self.view.revert_to_launch() {
                 Ok(_) => {
                     self.world_rebuilt = true;
+                    // The restored world's vessels are not the vessels
+                    // the wall-side axis described — see the method.
+                    self.reset_throttle_axis();
                     self.view.flight_notice("REVERTED TO LAUNCH");
                 }
                 Err(e) => self
@@ -1087,6 +1090,9 @@ impl App {
                     self.fatal = None;
                     self.read_only = false;
                     self.warp = WarpController::new();
+                    // Fresh vessel set, fresh ids — the old axis binding
+                    // is stale by definition.
+                    self.reset_throttle_axis();
                     self.apply_startup_difficulty();
                     self.view.flight_notice("NEW GAME");
                 }
@@ -1190,6 +1196,10 @@ impl App {
         match self.view.load_game(save.snapshot) {
             Ok(warnings) => {
                 self.world_rebuilt = true;
+                // The restored arena re-issues the same deterministic
+                // ids the old world's axis may still be bound to —
+                // drop the binding rather than collide (C24-F3).
+                self.reset_throttle_axis();
                 self.view.flight_notice(format!("LOADED — {slot}"));
                 for w in warnings {
                     self.view.flight_notice(w);
@@ -2470,6 +2480,29 @@ impl App {
             self.attitude_held.clear();
             self.apply_attitude();
         }
+    }
+
+    /// The world-swap version of `focus_lost`'s throttle half — run by
+    /// every world-replacing session op (Load / Revert / New Game).
+    /// Vessel ids are deterministic from 0, so the NEW world's focus can
+    /// carry the same id the OLD axis described: `throttle_press`'s
+    /// cross-vessel rebase then reads `throttle_axis_vessel == focus`,
+    /// skips the re-read, and the first Shift tap's `throttle_axis_step`
+    /// fires the latched no-movement path — `SetThrottle` at the stale
+    /// rail value: full-throttle pad ignition off a 1% tap (C24-F3, the
+    /// same stale-axis class as dd3612a/b698eb2). A window blip keeps
+    /// the axis — the player's commanded value still points at the same
+    /// world — but a swapped world's vessels are not the vessels that
+    /// value described, so the binding AND the value both reset.
+    /// Native only: its only callers are the session ops, which wasm
+    /// refuses before they run.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn reset_throttle_axis(&mut self) {
+        self.throttle_held.clear();
+        self.throttle_hold_s = 0.0;
+        self.throttle_hold_vessel = None;
+        self.throttle_axis = 0.0;
+        self.throttle_axis_vessel = None;
     }
 
     /// LMB press/release for the VAB click-vs-drag decision — lifted
@@ -4812,6 +4845,108 @@ mod tests {
         // The real release edge clears the held axis.
         app.release_edge(&shift.0, &shift.1);
         assert!(app.throttle_held.is_empty());
+    }
+
+    /// C24-F3: the same stale-axis bug across a WORLD SWAP. Vessel ids
+    /// are deterministic from 0, so a loaded save's focused pad craft
+    /// carries the SAME id the pre-load axis described —
+    /// `throttle_press`'s cross-vessel rebase reads
+    /// `throttle_axis_vessel == focus`, skips the re-read, and the first
+    /// Shift tap's `throttle_axis_step` fires the latched no-movement
+    /// path: `SetThrottle` at the stale rail value — full-throttle pad
+    /// ignition off a 1% tap (the Z → latch → F5 → F9 → Shift chain).
+    /// `run_session_op`'s load must reset the axis state machine the way
+    /// `focus_lost` does, so the tap commands only its own step.
+    /// `shift_press_unlatches_the_relanded_craft` pins the same-world
+    /// half this must not regress: with no world swap between, the rail
+    /// axis still unlatches at the rail.
+    #[test]
+    fn load_resets_the_stale_throttle_axis() {
+        use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
+        let dir = tempdir("load-stale-axis");
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        let frame = |app: &mut App, ticks: u64| {
+            let target = app.view.sim.clock().ticks() + ticks;
+            app.view.begin_frame();
+            app.tick_throttle_ramp(1.0 / 60.0);
+            app.view.sim_step(target).unwrap();
+            app.view.end_frame();
+        };
+        let shift = (
+            PhysicalKey::Code(KeyCode::ShiftLeft),
+            Key::Named(NamedKey::Shift),
+        );
+        frame(&mut app, 320); // settle the seeded pad craft to its latch
+        let vessel = app.view.flight_focus().unwrap();
+        assert!(
+            app.view.sim.vessels()[&vessel].body().is_none(),
+            "seeded craft should be surface-latched"
+        );
+        // F5 at the drained boundary — the save the F9 below reloads.
+        app.request_session_op(SessionOp::Save("latched".into()));
+        app.run_session_op();
+        assert!(
+            app.save_dir.join("latched.cspsave").exists(),
+            "the save file must exist for the load to replace the world"
+        );
+        // The stale wall-side state a landed full-throttle flight
+        // leaves behind: the axis still at the rail, bound to the id
+        // the restore re-issues (deterministic from 0 — a collision,
+        // not continuity).
+        app.throttle_axis = 1.0;
+        app.throttle_axis_vessel = Some(vessel);
+        // F9 — the world under the axis is swapped; the state machine
+        // must reset with it.
+        app.request_session_op(SessionOp::Load("latched".into()));
+        app.run_session_op();
+        assert_eq!(
+            app.throttle_axis, 0.0,
+            "a stale axis value must not survive the world swap"
+        );
+        assert_eq!(
+            app.throttle_axis_vessel, None,
+            "a stale vessel binding must not survive the world swap"
+        );
+        assert!(app.throttle_held.is_empty() && app.throttle_hold_vessel.is_none());
+        // The collision premise, verified: the restored world's focus
+        // is the SAME vessel id the old axis described, still latched.
+        frame(&mut app, 1); // let the rebuilt world's focus resolve
+        let loaded = app.view.flight_focus().unwrap();
+        assert_eq!(loaded, vessel, "vessel ids are deterministic from 0");
+        assert!(app.view.sim.vessels()[&loaded].body().is_none());
+        // One Shift tap — it must command its own step, never the
+        // previous world's rail value.
+        app.press_edge(&shift.0, &shift.1, false);
+        frame(&mut app, 1); // drain the player FIFO
+        app.release_edge(&shift.0, &shift.1);
+        let commanded: Vec<f64> = app
+            .view
+            .sim
+            .command_log()
+            .iter()
+            .filter_map(|(_, c)| match c {
+                SimCommand::SetThrottle {
+                    vessel: v,
+                    throttle,
+                } if *v == loaded => Some(*throttle),
+                _ => None,
+            })
+            .collect();
+        let top = commanded.iter().copied().fold(0.0f64, f64::max);
+        assert!(
+            top <= THROTTLE_TAP_STEP + 1e-9,
+            "the previous world's rail value escaped into this one: {commanded:?}"
+        );
+        // …and the tap is not a dead key — the reset must not take the
+        // unlatch with it (the latched focus still counts).
+        let body = app.view.sim.vessels()[&loaded]
+            .body()
+            .expect("the tap's SetThrottle still unlatches the loaded craft");
+        assert!(
+            body.throttle <= THROTTLE_TAP_STEP + 1e-9,
+            "the applied throttle is the tap step, not the stale rail: {}",
+            body.throttle
+        );
     }
 
     /// The shipped failure, end to end on the REAL path: the
