@@ -125,7 +125,10 @@ const THROTTLE_RAMP_SPINUP_S: f64 = 1.0;
 const ATTITUDE_RATE_RAD_S: f64 = 0.8;
 /// Max cursor travel (px) between LMB down/up that still counts as a
 /// click — anything further is a camera orbit drag and must not also
-/// fire a VAB pick.
+/// fire a VAB pick. `csp-ui`'s `ARMED_DRAG_PROMOTE_PX` (vab.rs)
+/// mirrors this value — it is the armed-drag promotion threshold —
+/// and the two MUST stay equal: past this distance the pick is
+/// suppressed and the promotion is what resolves the drag instead.
 const CLICK_MAX_DRAG_PX: f64 = 4.0;
 
 struct App {
