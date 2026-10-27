@@ -1126,7 +1126,13 @@ impl World {
             })
             .collect();
         self.event_heap = kept.into_iter().collect();
-        Ok(())
+        // C08-F4: stopping banks the accrued conversion AND releases
+        // the live escrow — the survey predicate's outstanding-units
+        // subtraction drops to the full `collected` here, the same
+        // `DataBanked` transition transmit/recovery fire. Without
+        // the notify an already-satisfied survey sat `active` until
+        // its deadline arrived to charge the penalty.
+        self.contract_notify(&crate::contracts::ContractTrigger::DataBanked, shadow)
     }
 
     /// `ResearchDataExhausted` firing: bank `η·D0` (the residual is
@@ -1163,7 +1169,13 @@ impl World {
             },
             shadow,
         );
-        Ok(())
+        // C08-F4: exhaustion banks the whole escrow and consumes the
+        // project — the survey predicate's outstanding-units
+        // subtraction drops to the full `collected` here, the same
+        // `DataBanked` transition transmit/recovery fire. Without
+        // the notify an already-satisfied survey sat `active` until
+        // its deadline arrived to charge the penalty.
+        self.contract_notify(&crate::contracts::ContractTrigger::DataBanked, shadow)
     }
 
     /// `ResearchProjectComplete` firing: the player-facing completion

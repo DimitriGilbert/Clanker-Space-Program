@@ -3953,11 +3953,13 @@ pub fn validate_techtree_loc_keys(
 /// id sets — extracted from [`validate_contracts`] for the line
 /// budget. `bad` stamps the template's error variant.
 #[allow(clippy::too_many_lines)] // one arm per kind reads as a table
+#[allow(clippy::too_many_arguments)] // the cross-reference sets are the signature
 fn validate_contract_space(
     cid: &str,
     kind: &crate::contract::ContractKind,
     space: &crate::contract::ContractParamSpace,
     body_ids: &BTreeSet<&str>,
+    site_bodies: &BTreeSet<&str>,
     experiment_ids: &BTreeSet<&str>,
     res: &ResourceFile,
     out: &mut Vec<ValidationError>,
@@ -4086,6 +4088,19 @@ fn validate_contract_space(
             },
         ) => {
             check_bodies(bodies, out);
+            // C32-F1: every resupply candidate body must host ≥1
+            // site — colonies only ever exist at authored sites
+            // (`FoundColony` rejects unknown site ids and no
+            // site-creation verb exists), so a siteless body can
+            // never grow the store a delivery lands in. The sim's
+            // generation gate filters live-capacity per draw, but
+            // that is the runtime net, not a license to author a
+            // siteless candidate (duva was exactly this miss).
+            for b in bodies {
+                if body_ids.contains(b.as_str()) && !site_bodies.contains(b.as_str()) {
+                    out.push(bad("resupply candidate body has no authored site"));
+                }
+            }
             if resources.is_empty() {
                 out.push(bad("resupply candidates: no resources authored"));
             }
@@ -4102,8 +4117,8 @@ fn validate_contract_space(
 
 /// §3.6's template rules over the `data/contracts/` set, checked
 /// against the system bodies, the experiment defs, the resource
-/// registry, and the merged tech tree (the cross-reference set the
-/// prereqs/candidates name):
+/// registry, the site table, and the merged tech tree (the
+/// cross-reference set the prereqs/candidates name):
 ///
 /// - `schema_version` current, `id` ↔ file-stem agreement, unique
 ///   ids, well-formed id;
@@ -4118,8 +4133,14 @@ fn validate_contract_space(
 ///   the bands must not be fully inverted (`apoapsis_alt_m.hi <
 ///   periapsis_alt_m.lo` would invert every draw; partial overlap
 ///   stays legal — the sim orders the pair);
+/// - `ColonyResupply` candidate bodies each host ≥1 site — colonies
+///   exist only at authored sites, so a siteless body can never
+///   grow the store a delivery needs (C32-F1);
 /// - prerequisites well-formed: no duplicates, `count > 0`, tech
-///   ids resolvable in the merged tree, body ids in the system;
+///   ids resolvable in the merged tree, body ids in the system, and
+///   `ContractsCompleted { kind }` naming an authored template kind
+///   (an unauthored kind is a silently unsatisfiable gate —
+///   C32-F6);
 /// - the tree's `unlocks.contract_types` ids each name an authored
 ///   template — the other direction is free (a template may exist
 ///   ununlocked).
@@ -4130,10 +4151,15 @@ pub fn validate_contracts(
     experiments: &crate::load::LoadedExperiments,
     techtree: &crate::load::LoadedTechTree,
     res: &ResourceFile,
+    sites: &SiteFile,
 ) -> Vec<ValidationError> {
     use crate::contract::ContractPrereq;
     let mut out = Vec::new();
     let body_ids: BTreeSet<&str> = sys.bodies.iter().map(|b| b.def.id.as_str()).collect();
+    // The bodies any colony can ever sit on: `FoundColony` resolves
+    // authored sites only, so the resupply candidate check reads
+    // this set (C32-F1).
+    let site_bodies: BTreeSet<&str> = sites.sites.iter().map(|s| s.body.as_str()).collect();
     let experiment_ids: BTreeSet<&str> = experiments
         .experiments
         .iter()
@@ -4141,6 +4167,10 @@ pub fn validate_contracts(
         .collect();
     let tree = techtree.merged();
     let node_ids: BTreeSet<&str> = tree.nodes.iter().map(|n| n.id.as_str()).collect();
+    // The kind set `ContractsCompleted` prereqs may name — an
+    // unauthored kind is a prereq no run can satisfy (C32-F6).
+    let authored_kinds: BTreeSet<crate::contract::ContractKind> =
+        loaded.contracts.iter().map(|c| c.def.kind).collect();
     let mut seen_ids = BTreeSet::new();
     let mut template_ids: BTreeSet<&str> = BTreeSet::new();
     for lc in &loaded.contracts {
@@ -4203,6 +4233,7 @@ pub fn validate_contracts(
             &d.kind,
             &d.generate.space,
             &body_ids,
+            &site_bodies,
             &experiment_ids,
             res,
             &mut out,
@@ -4218,9 +4249,16 @@ pub fn validate_contracts(
                         out.push(bad("prerequisite tech node is not in the tree"));
                     }
                 }
-                ContractPrereq::ContractsCompleted { count, .. } => {
+                ContractPrereq::ContractsCompleted { kind, count } => {
                     if *count == 0 {
                         out.push(bad("ContractsCompleted count of 0 is a tautology"));
+                    }
+                    // C32-F6: the kind must name an authored template
+                    // kind — an unauthored one is a prereq no run can
+                    // ever satisfy, which silently gates the whole
+                    // template off the board.
+                    if !authored_kinds.contains(kind) {
+                        out.push(bad("ContractsCompleted names an unauthored contract kind"));
                     }
                 }
                 ContractPrereq::BodyVisited(b) => {
@@ -4321,6 +4359,7 @@ pub fn validate_dataset(d: &Dataset<'_>) -> Vec<ValidationError> {
         d.experiments,
         d.techtree,
         d.resources,
+        d.sites,
     ));
     out.extend(validate_recipes(d.recipes, d.resources));
     out.extend(validate_balance(d.balance, d.resources));
@@ -6118,7 +6157,18 @@ mod tests {
         };
         let (_, experiments) = empty_registries();
         let tree = tree_fixture();
-        let errs = validate_contracts(&contracts, &fixture(), &experiments, &tree, &res_fixture());
+        let no_sites = SiteFile {
+            schema_version: crate::site::SITE_SCHEMA_VERSION,
+            sites: vec![],
+        };
+        let errs = validate_contracts(
+            &contracts,
+            &fixture(),
+            &experiments,
+            &tree,
+            &res_fixture(),
+            &no_sites,
+        );
         assert!(
             errs.iter()
                 .any(|e| matches!(e, ValidationError::SchemaVersion { found: 0, .. })),

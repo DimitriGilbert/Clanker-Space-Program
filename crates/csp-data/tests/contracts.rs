@@ -20,6 +20,7 @@ fn loaded() -> (
     csp_data::LoadedExperiments,
     csp_data::LoadedTechTree,
     csp_data::ResourceFile,
+    csp_data::SiteFile,
 ) {
     let root = repo_root();
     let contracts = csp_data::load_contracts(&root.join("data/contracts")).unwrap();
@@ -27,7 +28,8 @@ fn loaded() -> (
     let experiments = csp_data::load_experiments(&root.join("data/experiments")).unwrap();
     let tree = csp_data::load_techtree(&root.join("data/techtree")).unwrap();
     let res = csp_data::load_resources(&root.join("data/resources.ron")).unwrap();
-    (contracts, sys, experiments, tree, res)
+    let sites = csp_data::load_sites(&root.join("data/systems/home/sites.ron")).unwrap();
+    (contracts, sys, experiments, tree, res, sites)
 }
 
 /// Every authored template parses at the current schema, passes the
@@ -37,9 +39,9 @@ fn loaded() -> (
 /// `resources.ron`.
 #[test]
 fn contract_templates_validate_against_shipping_data() {
-    let (contracts, sys, experiments, tree, res) = loaded();
+    let (contracts, sys, experiments, tree, res, sites) = loaded();
     assert_eq!(contracts.contracts.len(), 6);
-    let errors = csp_data::validate_contracts(&contracts, &sys, &experiments, &tree, &res);
+    let errors = csp_data::validate_contracts(&contracts, &sys, &experiments, &tree, &res, &sites);
     assert!(errors.is_empty(), "{errors:?}");
 }
 
@@ -60,7 +62,7 @@ fn contract_loc_keys_resolve() {
 /// check as a `bool` and every call site discarded it).
 #[test]
 fn empty_body_space_is_a_validation_error() {
-    let (mut contracts, sys, experiments, tree, res) = loaded();
+    let (mut contracts, sys, experiments, tree, res, sites) = loaded();
     let sat = contracts
         .contracts
         .iter_mut()
@@ -72,7 +74,7 @@ fn empty_body_space_is_a_validation_error() {
         panic!("contract.satellite is not a SatellitePlacement")
     };
     bodies.clear();
-    let errors = csp_data::validate_contracts(&contracts, &sys, &experiments, &tree, &res);
+    let errors = csp_data::validate_contracts(&contracts, &sys, &experiments, &tree, &res, &sites);
     assert!(
         errors.iter().any(|e| matches!(
             e,
@@ -115,11 +117,11 @@ fn set_satellite_bands(
 /// itself overlaps partially and validates green.
 #[test]
 fn fully_inverted_satellite_bands_are_a_validation_error() {
-    let (mut contracts, sys, experiments, tree, res) = loaded();
+    let (mut contracts, sys, experiments, tree, res, sites) = loaded();
     // apo ceiling (60 km) under the peri floor (100 km): fully
     // inverted — every draw comes out of the sim's pair-ordering swap.
     set_satellite_bands(&mut contracts, (100_000.0, 250_000.0), (50_000.0, 60_000.0));
-    let errors = csp_data::validate_contracts(&contracts, &sys, &experiments, &tree, &res);
+    let errors = csp_data::validate_contracts(&contracts, &sys, &experiments, &tree, &res, &sites);
     assert!(
         errors.iter().any(|e| matches!(
             e,
@@ -137,7 +139,7 @@ fn fully_inverted_satellite_bands_are_a_validation_error() {
         (100_000.0, 250_000.0),
         (50_000.0, 100_000.0),
     );
-    let errors = csp_data::validate_contracts(&contracts, &sys, &experiments, &tree, &res);
+    let errors = csp_data::validate_contracts(&contracts, &sys, &experiments, &tree, &res, &sites);
     assert!(
         !errors.iter().any(|e| matches!(
             e,
@@ -145,5 +147,60 @@ fn fully_inverted_satellite_bands_are_a_validation_error() {
                 if contract == "contract.satellite"
         )),
         "boundary-touching bands must stay legal: {errors:?}"
+    );
+}
+
+/// C32-F1: a `ColonyResupply` candidate body with no authored site can
+/// never grow the colony a delivery lands in — the validator rejects
+/// it even though the body resolves in the system (duva was exactly
+/// this miss: in `system.bodies`, absent from `sites.ron`).
+#[test]
+fn resupply_candidate_body_without_sites_is_a_validation_error() {
+    let (mut contracts, sys, experiments, tree, res, sites) = loaded();
+    // Duva is a real body in the home system with no site — the exact
+    // regression shape.
+    assert!(sys.bodies.iter().any(|b| b.def.id.as_str() == "duva"));
+    assert!(!sites.sites.iter().any(|s| s.body.as_str() == "duva"));
+    let resupply = contracts
+        .contracts
+        .iter_mut()
+        .find(|c| c.def.id.as_str() == "contract.colony_resupply")
+        .unwrap();
+    let csp_data::ContractParamSpace::ColonyResupply { bodies, .. } =
+        &mut resupply.def.generate.space
+    else {
+        panic!("contract.colony_resupply is not a ColonyResupply")
+    };
+    bodies.push(csp_data::BodyId::from("duva"));
+    let errors = csp_data::validate_contracts(&contracts, &sys, &experiments, &tree, &res, &sites);
+    assert!(
+        errors.iter().any(|e| matches!(
+            e,
+            csp_data::ValidationError::BadContract { contract, reason }
+                if contract == "contract.colony_resupply" && reason.contains("no authored site")
+        )),
+        "a siteless resupply body must fail validation: {errors:?}"
+    );
+}
+
+/// C32-F6: `ContractsCompleted { kind }` must name an authored
+/// template kind — an unauthored kind is a prereq no run can satisfy,
+/// silently gating the template off the board. Removing the satellite
+/// template makes `contract.rescue`'s `SatellitePlacement` prereq
+/// exactly that.
+#[test]
+fn contracts_completed_prereq_must_name_an_authored_kind() {
+    let (mut contracts, sys, experiments, tree, res, sites) = loaded();
+    contracts
+        .contracts
+        .retain(|c| c.def.kind != csp_data::ContractKind::SatellitePlacement);
+    let errors = csp_data::validate_contracts(&contracts, &sys, &experiments, &tree, &res, &sites);
+    assert!(
+        errors.iter().any(|e| matches!(
+            e,
+            csp_data::ValidationError::BadContract { contract, reason }
+                if contract == "contract.rescue" && reason.contains("unauthored contract kind")
+        )),
+        "an unauthored ContractsCompleted kind must fail validation: {errors:?}"
     );
 }

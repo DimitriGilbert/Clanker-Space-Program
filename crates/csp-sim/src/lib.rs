@@ -1246,6 +1246,28 @@ pub enum SimCommand {
         /// The focused vessel, or `None` for "no focus".
         vessel: Option<VesselId>,
     },
+    /// C08-F5/C34-F1's board un-jam — refuse an offer WITHOUT
+    /// accepting it: the offer leaves the board, nothing pays in
+    /// either direction (no advance, no penalty, no fact record),
+    /// and the next `Contracts` publish refills the slot under a
+    /// fresh `offer_index`. `AcceptContract` was the board's only
+    /// exit, so an unsatisfiable draw pinned a slot forever and —
+    /// once accepted — burned one of `MAX_ACTIVE_CONTRACTS`
+    /// permanently; decline is the player's recourse, scoped to
+    /// offers deliberately (a free abandon of ACTIVE contracts
+    /// would re-open the free-advance faucet it closes — the
+    /// deadline is the active side's exit). `Recoverable` for an
+    /// unknown offer index. Appended last per the enum's
+    /// append-only variant order — the `command_log` stream encodes
+    /// variant indices.
+    // ui-unreachable: the program window's decline button is the
+    // fix-plan UI phase's wiring; `sim.command` reaches it until
+    // then.
+    DeclineContract {
+        /// The offer's index — its `offer_index`, the same id
+        /// `AcceptContract` names.
+        offer: u64,
+    },
 }
 
 impl SimCommand {
@@ -5573,6 +5595,7 @@ impl World {
             } => self.apply_hire_crew(name, *kind, *salary_per_s, shadow)?,
             SimCommand::ContractReward { micros } => self.apply_contract_reward(*micros, shadow)?,
             SimCommand::AcceptContract { offer } => self.apply_accept_contract(*offer, shadow)?,
+            SimCommand::DeclineContract { offer } => self.apply_decline_contract(*offer, shadow)?,
             SimCommand::FoundColony { def } => self.apply_found_colony(def, shadow)?,
             SimCommand::AbandonColony { colony } => self.apply_abandon_colony(*colony, shadow)?,
             SimCommand::AssignCrewToColony { colony, crew } => {

@@ -54,7 +54,7 @@ fn demo_dataset_loads_and_validates() {
         ("techtree", csp_data::validate_techtree(&techtree, &parts)),
         (
             "contracts",
-            csp_data::validate_contracts(&contracts, &sys, &experiments, &techtree, &res),
+            csp_data::validate_contracts(&contracts, &sys, &experiments, &techtree, &res, &sites),
         ),
         ("recipes", csp_data::validate_recipes(&recipes, &res)),
         ("balance", csp_data::validate_balance(&balance, &res)),

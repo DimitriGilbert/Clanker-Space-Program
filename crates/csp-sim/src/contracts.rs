@@ -14,8 +14,9 @@
 //! always draws the same template + params for a given
 //! `(save_seed, eligible set)`. The board is lazily refilled by the
 //! subsystem's publish step — `contract_offer_slots` entries — a pure
-//! function of `(templates, facts, offer_index, save_seed)`, so the
-//! same publish lands identically in every §2.6.1 partition. Draw
+//! function of `(templates, facts, offer_index, save_seed)` plus the
+//! live colony set the resupply draw gates on, all of it sim state,
+//! so the same publish lands identically in every §2.6.1 partition. Draw
 //! order is fixed: template (weighted pick over the prereq-eligible
 //! set in ascending-id order), then the param draws in the authored
 //! field order. A drawn satellite pair whose apoapsis cap lands under
@@ -33,6 +34,19 @@
 //! gate is what keeps a poisoned space from publishing an offer the
 //! snapshot restore would `Fatal` on — and the skip is what keeps it
 //! from wedging the world.
+//!
+//! `ColonyResupply` draws get one further gate that reads live
+//! state, not just the authored space: the candidate bodies and —
+//! for the drawn body — the candidate resources are filtered to
+//! those a live colony can actually store ([`resupply_capacity`]),
+//! because a resupply offer against zero store capacity can never
+//! complete (C09-F5/C34-F1). The narrowing re-checks at every
+//! publish — colony state is sim state like the facts record, so
+//! the draw stays deterministic — and an all-filtered space takes
+//! the same `Recoverable` skip path, letting the next index re-roll
+//! rather than jamming the slot. `DeclineContract` is the player's
+//! half of the same un-jam story (an offer leaves the board unpaid
+//! and the publish refills).
 //!
 //! # Prerequisites — facts, not reputation
 //!
@@ -66,8 +80,10 @@
 //! template authors one. Firing expires the contract: the record
 //! leaves the board, `failed` counts, and `failure_penalty_funds`
 //! is charged through the funds clamp (a drain, like salary —
-//! §3.5's bankruptcy rule). Completion removes the pending event
-//! so the restore pairing stays strict.
+//! §3.5's bankruptcy rule) — unless the objective already reads met
+//! in state, in which case firing completes instead (C08-F4: the
+//! penalty must never outrank finished work). Completion removes
+//! the pending event so the restore pairing stays strict.
 //!
 //! # Serialized facts (§7.2 "completed-contract facts")
 //!
@@ -290,7 +306,15 @@ pub(crate) fn params_ok(p: &ContractParams) -> bool {
 /// unvalidated install would publish the dishonest offer and
 /// `World::restore` would `Fatal` on the snapshot (`snapshot:
 /// offer with non-finite params`).
+///
+/// `colonies` gates the `ColonyResupply` draw: the offer asks for a
+/// delivery into colony stores, so a body whose live colonies can
+/// hold none of the candidate resources is removed from the space
+/// before the pick — see [`resupply_capacity`]. The draw then reads
+/// the same stream positions it always did (body pick, resource
+/// pick, amount draw); only the candidate sets narrowed.
 fn draw_params(
+    colonies: &BTreeMap<crate::ColonyId, crate::Colony>,
     rng: &mut impl Rng,
     template: &ContractTemplate,
 ) -> Result<ContractParams, SimError> {
@@ -372,23 +396,11 @@ fn draw_params(
                 .ok_or(SimError::Recoverable("contract gen: empty body space"))?
                 .clone(),
         },
-        // M8-C §3.6: draw the body, the resource, then the delivery
-        // amount uniform in the authored range.
         ContractParamSpace::ColonyResupply {
             bodies,
             resources,
             amount,
-        } => ContractParams::ColonyResupply {
-            body: bodies
-                .get(pick(rng, bodies.len()))
-                .ok_or(SimError::Recoverable("contract gen: empty body space"))?
-                .clone(),
-            resource: resources
-                .get(pick(rng, resources.len()))
-                .ok_or(SimError::Recoverable("contract gen: empty resource space"))?
-                .clone(),
-            amount: amount.0 + next01(rng) * (amount.1 - amount.0),
-        },
+        } => draw_resupply_params(colonies, rng, bodies, resources, *amount)?,
     };
     // Every drawn scalar — the authored `min_units` included — must
     // pass the restore gate's own predicate before the params leave
@@ -399,6 +411,79 @@ fn draw_params(
         return Err(SimError::Recoverable("contract gen: dishonest params"));
     }
     Ok(params)
+}
+
+/// The `ColonyResupply` arm of [`draw_params`]: draw the body, the
+/// resource, then the delivery amount uniform in the authored range.
+/// C09-F5/C34-F1: both candidate sets are gated on live colony
+/// store capacity BEFORE the pick — a resupply offer names a
+/// delivery the transfer gate (`free >= amount` against `Store`
+/// capacity) must be able to land, and a draw whose colonies hold
+/// none of the candidate resources could never complete: it would
+/// squat a board slot forever and, once accepted, burn one of
+/// `MAX_ACTIVE_CONTRACTS` permanently. An all-filtered space
+/// degrades `Recoverable` like any dishonest draw — the publish
+/// skips the index and the next one re-rolls, so an unsatisfiable
+/// template jams the board only until the skip bound ends the pass
+/// (colonies founded later re-open the space on the next publish).
+fn draw_resupply_params(
+    colonies: &BTreeMap<crate::ColonyId, crate::Colony>,
+    rng: &mut impl Rng,
+    bodies: &[BodyId],
+    resources: &[ResourceId],
+    amount: (f64, f64),
+) -> Result<ContractParams, SimError> {
+    let viable_bodies: Vec<&BodyId> = bodies
+        .iter()
+        .filter(|b| {
+            resources
+                .iter()
+                .any(|r| resupply_capacity(colonies, b, r) > 0.0)
+        })
+        .collect();
+    let body =
+        (*viable_bodies
+            .get(pick(rng, viable_bodies.len()))
+            .ok_or(SimError::Recoverable(
+                "contract gen: no resupply target body",
+            ))?)
+        .clone();
+    let viable_resources: Vec<&ResourceId> = resources
+        .iter()
+        .filter(|r| resupply_capacity(colonies, &body, r) > 0.0)
+        .collect();
+    let resource = (*viable_resources
+        .get(pick(rng, viable_resources.len()))
+        .ok_or(SimError::Recoverable(
+            "contract gen: no resupply target resource",
+        ))?)
+    .clone();
+    Ok(ContractParams::ColonyResupply {
+        body,
+        resource,
+        amount: amount.0 + next01(rng) * (amount.1 - amount.0),
+    })
+}
+
+/// The resupply draw's completability gate (C09-F5/C34-F1): the
+/// aggregate store capacity for `resource` across the LIVE colonies
+/// on `body`. `capacity` is the same field `credit_end` credits
+/// against and the transfer initiation's free-capacity check reads
+/// — a zero here means no delivery of that resource can ever land
+/// on that body, so the draw filters it out instead of publishing a
+/// permanently uncompletable offer. `colony_live` matches the
+/// delivery fact's own gate: a dormant/abandoned colony's frozen
+/// store credits terminal bookkeeping, never a resupply.
+fn resupply_capacity(
+    colonies: &BTreeMap<crate::ColonyId, crate::Colony>,
+    body: &BodyId,
+    resource: &ResourceId,
+) -> f64 {
+    colonies
+        .values()
+        .filter(|c| c.body == *body && crate::colonies::colony_live(&c.state))
+        .map(|c| c.stores.get(resource).map_or(0.0, |s| s.capacity))
+        .sum()
 }
 
 /// One predicate of the fact set — `TechResearched` reads the tech
@@ -702,7 +787,7 @@ impl World {
                 break;
             }
         }
-        let params = draw_params(&mut rng, template)?;
+        let params = draw_params(&self.colonies, &mut rng, template)?;
         Ok(Some(ContractOffer {
             index,
             template: template.id.clone(),
@@ -931,6 +1016,36 @@ impl World {
         } else if let Some(tick) = deadline {
             self.schedule_event(EventKind::ContractDeadline { contract: id }, tick, shadow)?;
         }
+        Ok(())
+    }
+
+    /// `DeclineContract` — refuse an offer WITHOUT accepting it
+    /// (C08-F5/C34-F1): the offer leaves the board and the next
+    /// [`publish_contracts`](Self::publish_contracts) pass refills
+    /// the slot under a fresh `offer_index`. Nothing moves in either
+    /// direction — no advance credits, no penalty charges, no fact
+    /// records — so the verb is pure board hygiene: an unsatisfiable
+    /// draw (a capability the program lacks, a resupply target that
+    /// died mid-game) can never pin one of the `board_size` slots
+    /// forever, which was the only exit a jammed board had under
+    /// `AcceptContract`-as-sole-verb. `Recoverable` for an unknown
+    /// offer index — declined twice names nothing the second time.
+    ///
+    /// Deliberately offer-scope only: an ACCEPTED contract still
+    /// exits only by completion or its deadline — a free abandon
+    /// would re-open the free-advance faucet this verb closes
+    /// (accept, pocket the advance, walk away before the penalty).
+    /// The `deadline_days` authoring is the active-side exit.
+    pub(crate) fn apply_decline_contract(
+        &mut self,
+        offer: u64,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        if !self.contracts.offers.contains_key(&offer) {
+            return Err(SimError::Recoverable("decline: no such offer"));
+        }
+        self.shadow_contracts(shadow);
+        self.contracts.offers.remove(&offer);
         Ok(())
     }
 
@@ -1163,9 +1278,12 @@ impl World {
     /// `ContractDeadline` firing — the contract expires: the record
     /// leaves the arena, `failed` counts, and the authored penalty
     /// charges through the funds clamp (a drain — §3.5's bankruptcy
-    /// rule, never a rejection). Idempotent: a deadline naming a
-    /// non-active contract is a no-op (the completion path already
-    /// drops pending events; the tolerance is defensive).
+    /// rule, never a rejection). One exception, checked first: an
+    /// objective already met in state completes instead — the
+    /// deadline is the unfinished contract's exit, not a way to
+    /// penalize finished work (C08-F4). Idempotent: a deadline
+    /// naming a non-active contract is a no-op (the completion path
+    /// already drops pending events; the tolerance is defensive).
     pub(crate) fn fire_contract_deadline(
         &mut self,
         id: ContractId,
@@ -1183,6 +1301,20 @@ impl World {
             // without the other. Same severity as that sibling
             // check: `Fatal`, never a degradation.
             return Err(SimError::Fatal("contract deadline: tick mismatch"));
+        }
+        // C08-F4: expiry is the contract's last-resort exit, not a
+        // penalty override — an objective already met in current
+        // state COMPLETES instead of charging the authored penalty
+        // for work that is done. The reachable shape was the survey
+        // predicate rising inside lab stop/exhaustion (both bank the
+        // escrow but fire no completion trigger on their own — now
+        // covered), but the check is kind-blind: any state predicate
+        // that drifted true between triggers earns the same rescue.
+        // `trigger: None` keeps `Rescue` honest — its transition-
+        // keyed predicate reads only `VesselRecovered`, so a missed
+        // recovery still fails.
+        if self.objective_met(&c.params, None) {
+            return self.complete_contract(id, shadow);
         }
         let penalty = self
             .contract_defs
@@ -1318,6 +1450,41 @@ mod tests {
     /// board until it holds `board_size` offers.
     fn fill_board(w: &mut World) {
         w.step_frame(w.clock().ticks() + csp_core::TICK_HZ).unwrap();
+    }
+
+    /// A minimal live colony on `body` holding `resource` — the
+    /// resupply draw gate's fixture (`capacity > 0` on a live colony
+    /// is all the gate reads).
+    fn plant_colony(w: &mut World, body: &str, resource: &str) {
+        let id = crate::ColonyId(0);
+        w.colonies.insert(
+            id,
+            crate::Colony {
+                id,
+                site: csp_data::SiteId::from("pad"),
+                body: BodyId::from(body),
+                latitude_rad: 0.0,
+                longitude_rad: 0.0,
+                altitude_m: 0.0,
+                state: crate::ColonyState::Nominal,
+                modules: vec![],
+                stores: BTreeMap::from([(
+                    ResourceId::from(resource),
+                    crate::colonies::ColonyStore {
+                        anchor_level: 0.0,
+                        anchor_tick: 0,
+                        capacity: 100.0,
+                        net_rate_per_s: 0.0,
+                    },
+                )]),
+                daylight: crate::Daylight::Day,
+                crew: BTreeSet::new(),
+                t_eq_k: None,
+                module_fractions: vec![],
+                solved_tick: 0,
+                inspection_tick: None,
+            },
+        );
     }
 
     /// A bound Terrin orbit with `a = radius + alt` — inside every
@@ -1819,7 +1986,24 @@ mod tests {
         }
         snap.contracts.next_contract_id = crate::contracts::MAX_ACTIVE_CONTRACTS as u64;
         let mut w = World::restore(test_orbits(), None, snap).unwrap();
+        // `contract_defs` is construction config, never serialized —
+        // without the re-install the board stays empty and the
+        // accept rejected on "no such offer", never reaching the
+        // cap this test names.
+        w.set_contracts(
+            BTreeMap::from([(
+                ContractTypeId::from("contract.satellite"),
+                template(
+                    "contract.satellite",
+                    ContractKind::SatellitePlacement,
+                    vec![],
+                ),
+            )])
+            .into_iter()
+            .collect(),
+        );
         fill_board(&mut w);
+        assert_eq!(w.contracts().offers.len(), 6);
         w.enqueue(
             crate::SourceClass::Ui,
             0,
@@ -1831,14 +2015,23 @@ mod tests {
             1,
             "the capped accept was rejected: {rep:?}"
         );
+        assert!(
+            rep.rejected
+                .iter()
+                .any(|r| matches!(&r.error, SimError::Recoverable(m) if m.contains("cap"))),
+            "the rejection was the active cap, not an earlier check: {:?}",
+            rep.rejected
+        );
         assert_eq!(
             w.contracts().active.len(),
             crate::contracts::MAX_ACTIVE_CONTRACTS,
             "the cap held"
         );
-        // (The consumed offer is the accept path's long-standing
-        // contract — `offers.remove` precedes the checks; a rejected
-        // accept does not restore it.)
+        // (C08-F10: the offer is NOT consumed — `offers.remove` runs
+        // only after every check passes, so a rejected accept leaves
+        // offer 0 on the board; the publish's board_size check then
+        // keeps the slot filled rather than drawing a replacement.)
+        assert!(w.contracts().offers.contains_key(&0));
     }
 
     /// A `deadline_days` that is not finite-and-positive (NaN, ±inf,
@@ -2056,6 +2249,11 @@ mod tests {
             let mut t = template("contract.x", kind, vec![]);
             t.generate.space = space;
             let mut w = world_with(t);
+            // The resupply draw gate filters on live colony capacity
+            // BEFORE the pick — plant a store so the poisoned amount
+            // band reaches the `params_ok` check this test names
+            // instead of being absorbed by the capacity filter.
+            plant_colony(&mut w, "terrin", "ore");
             // The poisoned draw is skipped (C6-F1): it rides
             // `degraded`, the board sits short, and the frame
             // completes — a publish that Err'd here bricked the world.
@@ -2156,5 +2354,141 @@ mod tests {
             "40-ask re-based over the 40 returned: {min_units}"
         );
         assert!(w.contracts().facts.completed.is_empty());
+    }
+
+    /// `DeclineContract` — the C08-F5 un-jam verb: the offer leaves
+    /// the board, nothing pays in either direction, and the next
+    /// publish refills the slot under a fresh `offer_index`. An
+    /// unknown index rejects `Recoverable` and touches nothing.
+    #[test]
+    fn decline_frees_the_slot_and_pays_nothing() {
+        let mut w = world_with(template(
+            "contract.satellite",
+            ContractKind::SatellitePlacement,
+            vec![],
+        ));
+        w.economy.funds_micros = 0;
+        fill_board(&mut w);
+        assert_eq!(w.contracts().offers.len(), 6);
+        assert_eq!(w.contracts().offer_index, 6);
+        w.enqueue(
+            crate::SourceClass::Ui,
+            0,
+            SimCommand::DeclineContract { offer: 0 },
+        );
+        w.step_frame(2 * csp_core::TICK_HZ).unwrap();
+        // The slot refilled on the same pass — with a NEW index;
+        // offer 0 stayed declined.
+        assert_eq!(w.contracts().offers.len(), 6);
+        assert!(!w.contracts().offers.contains_key(&0));
+        assert_eq!(
+            w.contracts().offer_index,
+            7,
+            "one fresh draw refilled the freed slot"
+        );
+        // Nothing paid or recorded: decline is pure board hygiene.
+        assert_eq!(w.economy.funds_micros, 0);
+        assert!(w.economy().ledger.is_empty());
+        assert!(w.contracts().active.is_empty());
+        assert!(w.contracts().facts.completed.is_empty());
+        assert!(w.contracts().facts.failed.is_empty());
+        // An unknown index rejects typed and leaves the board alone.
+        w.enqueue(
+            crate::SourceClass::Ui,
+            0,
+            SimCommand::DeclineContract { offer: 99 },
+        );
+        let rep = w.step_frame(w.clock().ticks() + csp_core::TICK_HZ).unwrap();
+        assert_eq!(rep.rejected.len(), 1, "the unknown offer was rejected");
+        assert_eq!(w.contracts().offers.len(), 6);
+    }
+
+    /// The resupply generation gate (C09-F5/C34-F1): with no live
+    /// colony anywhere, every `ColonyResupply` draw is uncompletable
+    /// — the publish skips the index `Recoverable` instead of
+    /// publishing an offer that would squat a board slot forever.
+    #[test]
+    fn resupply_draws_skip_on_a_colonyless_world() {
+        let mut w = world_with(template(
+            "contract.resupply",
+            ContractKind::ColonyResupply,
+            vec![],
+        ));
+        let rep = w.step_frame(csp_core::TICK_HZ).unwrap();
+        assert!(
+            rep.degraded.iter().any(
+                |e| matches!(e, SimError::Recoverable(m) if m.contains("no resupply target body"))
+            ),
+            "storeless draws degraded, got {:?}",
+            rep.degraded
+        );
+        assert!(
+            w.contracts().offers.is_empty(),
+            "no resupply offer may publish against zero store capacity"
+        );
+        // The skips are bounded by `board_size` consecutive failures
+        // — the index advanced past exactly that many draws.
+        assert_eq!(w.contracts().offer_index, 6);
+    }
+
+    /// C08-F4: a deadline is the UNFINISHED contract's exit — an
+    /// objective already met in state completes at firing instead of
+    /// charging the penalty. The survey cover: `StopResearch`/
+    /// exhaustion bank the escrow but (previously) fired no
+    /// completion trigger, so the deadline arrived first.
+    #[test]
+    fn satisfied_survey_completes_at_deadline_not_penalized() {
+        let key = crate::research::DataKey {
+            experiment: csp_data::ExperimentId::from("exp.materials_study"),
+            body: BodyId::from("terrin"),
+            biome: csp_data::BiomeId::from("bio.x"),
+            situation: csp_data::Situation::SpaceLow,
+        };
+        let mut w = world_with(template("contract.survey", ContractKind::SurveyRun, vec![]));
+        w.economy.funds_micros = 0;
+        fill_board(&mut w);
+        w.enqueue(
+            crate::SourceClass::Ui,
+            0,
+            SimCommand::AcceptContract { offer: 0 },
+        );
+        w.step_frame(2 * csp_core::TICK_HZ).unwrap();
+        assert_eq!(w.contracts().active.len(), 1);
+        let ask = match &w.contracts().active.values().next().unwrap().params {
+            ContractParams::SurveyData { min_units, .. } => *min_units,
+            _ => panic!("wrong params"),
+        };
+        // The objective goes true with NO contract event in between
+        // (the lab-side banking path C08-F4 names): the returned
+        // units cross the re-based ask before the deadline lands.
+        w.science.keys.insert(
+            key,
+            crate::research::ScienceKeyState {
+                collected: ask,
+                transmitted: true,
+                closed: false,
+            },
+        );
+        let mut saw_deadline = false;
+        while w.clock().ticks() < 2 * 86_400 * csp_core::TICK_HZ {
+            let report = w.step_frame(2 * 86_400 * csp_core::TICK_HZ).unwrap();
+            saw_deadline |= report
+                .fired_events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::ContractDeadline { .. }));
+        }
+        assert!(saw_deadline, "the ContractDeadline event fired");
+        assert!(w.contracts().active.is_empty());
+        assert_eq!(
+            w.contracts().facts.completed[&ContractKind::SurveyRun],
+            1,
+            "a met objective completes at the deadline"
+        );
+        assert!(
+            w.contracts().facts.failed.is_empty(),
+            "no failure may be recorded for finished work"
+        );
+        // Advance 2.0 + completion 10.0; the 4.0 penalty never moved.
+        assert_eq!(w.economy.funds_micros, crate::economy::to_micros(12.0));
     }
 }

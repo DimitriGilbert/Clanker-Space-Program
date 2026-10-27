@@ -4,6 +4,22 @@
 // earned the contract); completion rides the `TransferComplete`
 // colony landing, never a poll. Unlocked at tech.rocketry.3 beside
 // the part test — colony logistics is the same tier of program.
+//
+// C34-F1/C09-F5 (fix-plan 3.2): the candidate set is the completable
+// core, not a wish list. `rask` is the only body a cargo-capable
+// colony can exist on — duva authors no site (FoundColony has no
+// siteless path) and terrin's starter def carries no `Store` module,
+// so every other body draw died at "insufficient colony store
+// capacity". ore/metal/composite are exactly the rask-mines store
+// set AND the csp.tank.ore.s cargo set; food/oxygen had neither a
+// store nor a tank. The sim's generation gate re-checks live colony
+// capacity per draw regardless — this list is what stays completable
+// in a shipped game, and the validator requires every candidate body
+// to host ≥1 site. The 120-day deadline (the tier's shared value)
+// gives an accepted contract an exit that is not "completion or a
+// burned active slot forever"; the objective-met re-check inside
+// `fire_contract_deadline` keeps a slow-but-done delivery safe from
+// the penalty.
 (
     schema_version: 1,
     id: "contract.colony_resupply",
@@ -13,8 +29,8 @@
     generate: (
         weight: 2.0,
         space: ColonyResupply(
-            bodies: ["terrin", "duva", "rask"],
-            resources: ["ore", "food", "oxygen"],
+            bodies: ["rask"],
+            resources: ["ore", "metal", "composite"],
             amount: (50.0, 500.0),
         ),
     ),
@@ -26,5 +42,5 @@
         completion_funds: 45_000.0,
         failure_penalty_funds: 5_000.0,
     ),
-    deadline_days: None,
+    deadline_days: Some(120.0),
 )

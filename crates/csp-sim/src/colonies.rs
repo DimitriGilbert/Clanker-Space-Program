@@ -5358,4 +5358,154 @@ mod tests {
         );
         assert_eq!(w.contracts.active.len(), 1, "the contract stays open");
     }
+
+    /// A resupply template for the generation/lifecycle tests —
+    /// bodies span the colony's body plus one that can never host a
+    /// store, resources span the colony's store plus one it cannot
+    /// hold. The draw gate must narrow both to the viable set.
+    fn resupply_template() -> csp_data::ContractTemplate {
+        csp_data::ContractTemplate {
+            schema_version: 1,
+            id: csp_data::ContractTypeId::from("contract.resupply"),
+            display_name: csp_data::LocKey::from("x"),
+            description: csp_data::LocKey::from("x"),
+            kind: csp_data::ContractKind::ColonyResupply,
+            generate: csp_data::ContractGenerator {
+                weight: 1.0,
+                space: csp_data::ContractParamSpace::ColonyResupply {
+                    bodies: vec![BodyId::from("terra"), BodyId::from("nowhere")],
+                    resources: vec![ResourceId::from("ore"), ResourceId::from("noware")],
+                    amount: (10.0, 10.0),
+                },
+            },
+            prerequisites: vec![],
+            rewards: csp_data::ContractRewards {
+                advance_funds: 2.0,
+                completion_funds: 10.0,
+                failure_penalty_funds: 4.0,
+            },
+            deadline_days: None,
+        }
+    }
+
+    /// C09-F5/C34-F1's generation gate: candidate bodies and — on
+    /// the drawn body — candidate resources are filtered by live
+    /// colony store capacity, so every published offer names a
+    /// delivery the transfer gate can actually land.
+    #[test]
+    fn resupply_draws_filter_to_viable_stores() {
+        let mut w = colony_world();
+        let ore = ResourceId::from("ore");
+        found(
+            &mut w,
+            vec![
+                gen_module(10.0),
+                ColonyModuleDef::Store {
+                    resource: ore.clone(),
+                    capacity: 100.0,
+                },
+            ],
+            vec![],
+        );
+        let t = resupply_template();
+        w.set_contracts(BTreeMap::from([(t.id.clone(), t)]));
+        w.step_frame(w.clock().ticks() + TICK_HZ).unwrap();
+        assert_eq!(w.contracts.offers.len(), 6);
+        for o in w.contracts.offers.values() {
+            let csp_data::ContractParams::ColonyResupply { body, resource, .. } = &o.params else {
+                panic!("wrong params")
+            };
+            // "nowhere"/"noware" can never draw: no live colony holds
+            // store capacity for either.
+            assert_eq!(*body, BodyId::from("terra"));
+            assert_eq!(*resource, ore);
+        }
+    }
+
+    /// The full §3.6 resupply arc C34-F1 said could never close:
+    /// publish → accept (advance + baseline re-base) → ore aboard
+    /// the csp.tank.ore.s-shaped hauler → `TransferColonyResource`
+    /// delivery → `TransferComplete` lands the fact → the contract
+    /// completes and pays.
+    #[test]
+    fn resupply_full_lifecycle_accept_deliver_complete() {
+        let mut w = colony_world();
+        let ore = ResourceId::from("ore");
+        found(
+            &mut w,
+            vec![
+                gen_module(10.0),
+                ColonyModuleDef::Store {
+                    resource: ore.clone(),
+                    capacity: 100.0,
+                },
+            ],
+            vec![],
+        );
+        let colony = *w.colonies().keys().next().unwrap();
+        let t = resupply_template();
+        w.set_contracts(BTreeMap::from([(t.id.clone(), t)]));
+        w.economy.funds_micros = 0;
+        w.step_frame(w.clock().ticks() + TICK_HZ).unwrap();
+        let offer = *w.contracts.offers.keys().next().unwrap();
+        w.enqueue(SourceClass::Ui, 0, SimCommand::AcceptContract { offer });
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert_eq!(w.contracts.active.len(), 1);
+        // The advance credited; the ask re-based to baseline + 10
+        // (baseline 0 on a fresh colony).
+        assert_eq!(w.economy.funds_micros, 2_000_000);
+        // The hauler: ore/metal/composite cargo slots — the
+        // csp.tank.ore.s shape 3.1 shipped — loaded with ore.
+        let vessel = latched_vessel_multi(
+            &mut w,
+            &[
+                ("ore", 200.0, 50.0),
+                ("metal", 60.0, 0.0),
+                ("composite", 30.0, 0.0),
+            ],
+        );
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::JoinColonyInventory { vessel, colony },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::TransferColonyResource {
+                vessel,
+                colony,
+                resource: ore.clone(),
+                amount: 10.0,
+                to_colony: true,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        // 10 units at the authored 10 u/s flow rate = 64 ticks to
+        // `TransferComplete`, which lands the fact and completes
+        // the contract in the same firing.
+        w.step_frame(w.clock().ticks() + 64 + 1).unwrap();
+        assert_eq!(
+            w.contracts
+                .facts
+                .colony_deliveries
+                .get(&(colony.0, ore.clone()))
+                .copied()
+                .unwrap_or(0.0),
+            10.0
+        );
+        assert!(w.contracts.active.is_empty(), "the resupply completed");
+        assert_eq!(
+            w.contracts
+                .facts
+                .completed
+                .get(&csp_data::ContractKind::ColonyResupply)
+                .copied()
+                .unwrap_or(0),
+            1
+        );
+        // Advance 2.0 + completion 10.0.
+        assert_eq!(w.economy.funds_micros, 12_000_000);
+    }
 }
