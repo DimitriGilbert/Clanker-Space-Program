@@ -88,6 +88,18 @@ function urlToken(): string | null {
   }
 }
 
+/** `VITE_CSP_TOKEN` — a `vite dev` convenience only. The
+ *  `import.meta.env.DEV` gate is static: Vite defines it to `false`
+ *  in production builds, the minifier drops the dead arm, and the
+ *  served bundle resolves to `''` unconditionally. `/` and
+ *  `/assets/*` are served token-free (§2.12.3, csp-server's
+ *  http.rs), so a baked-in bearer would be a public secret —
+ *  `scripts/finalize.mjs` fails the build if one still leaks. */
+function devEnvToken(): string {
+  if (!import.meta.env.DEV) return ''
+  return import.meta.env.VITE_CSP_TOKEN ?? ''
+}
+
 /** The bearer token for `/ws`'s `?token=` and `/api/*`'s
  *  `Authorization` header — `''` when none has been provided (the
  *  page then renders the token gate). */
@@ -108,7 +120,7 @@ export function cspToken(): string {
     .querySelector('meta[name="csp-token"]')
     ?.getAttribute('content')
   if (meta) return meta
-  return import.meta.env.VITE_CSP_TOKEN ?? ''
+  return devEnvToken()
 }
 
 /** Store a token entered at the first-boot gate (this tab only — the
