@@ -2657,7 +2657,11 @@ impl View {
                         v_rel_max_mps: s.v_rel_max_m_per_s,
                     })
                     .collect(),
-                unavailable: None,
+                // Same honesty as the None/Err arms — an empty scan
+                // names its reason rather than rendering zero rows.
+                unavailable: scans
+                    .is_empty()
+                    .then(|| "no SOI candidates — no encounters in the scan horizon".into()),
             },
             Ok(None) => csp_ui::SoiScanReport {
                 vessel: Some(vessel.0),
