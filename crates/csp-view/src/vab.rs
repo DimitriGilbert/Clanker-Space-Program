@@ -1411,4 +1411,157 @@ mod tests {
         });
         assert!(off.z < 0.0, "the new part landed below the stack");
     }
+
+    /// Signed 2D edge function — twice the signed area of (a, b, c).
+    fn edge2(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
+        (c[0] - a[0]) * (b[1] - a[1]) - (c[1] - a[1]) * (b[0] - a[0])
+    }
+
+    /// Rasterize `verts` through the pick pipeline's math — the C17
+    /// verifier's probe: NDC positions as a w=1 passthrough
+    /// (`vs_main` writes `vec4(v.pos, 1)`), reverse-Z depth with
+    /// `Greater` winning against a 0.0 clear, pixel-center sampling,
+    /// triangle list, no cull. `ranges` selects WHICH vertices draw:
+    /// production draws [`csp_render::vab::pickable_ranges`]; the
+    /// pre-fix pass drew `0..len`. Returns the pick index per pixel
+    /// of the `w`×`h` target (0 = background).
+    fn raster_pick(
+        verts: &[csp_render::vab::VabVertex],
+        ranges: &[std::ops::Range<u32>],
+        w: usize,
+        h: usize,
+    ) -> Vec<u32> {
+        let mut depth = vec![0.0f32; w * h];
+        let mut ids = vec![0u32; w * h];
+        for r in ranges {
+            for tri in verts[r.start as usize..r.end as usize].chunks_exact(3) {
+                let p = [tri[0].pos, tri[1].pos, tri[2].pos];
+                let area = edge2(p[0], p[1], p[2]);
+                if area == 0.0 {
+                    continue;
+                }
+                let (mut x0, mut x1, mut y0, mut y1) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+                for q in p {
+                    x0 = x0.min(q[0]);
+                    x1 = x1.max(q[0]);
+                    y0 = y0.min(q[1]);
+                    y1 = y1.max(q[1]);
+                }
+                // NDC → pixel: px = (x+1)/2·w, py = (1−y)/2·h.
+                let px0 = (((x0 + 1.0) * 0.5 * w as f32).floor() as i32).max(0);
+                let px1 = (((x1 + 1.0) * 0.5 * w as f32).ceil() as i32).min(w as i32);
+                let py0 = (((1.0 - y1) * 0.5 * h as f32).floor() as i32).max(0);
+                let py1 = (((1.0 - y0) * 0.5 * h as f32).ceil() as i32).min(h as i32);
+                for py in py0..py1 {
+                    for px in px0..px1 {
+                        // Pixel center → NDC.
+                        let nx = (px as f32 + 0.5) / w as f32 * 2.0 - 1.0;
+                        let ny = 1.0 - (py as f32 + 0.5) / h as f32 * 2.0;
+                        let c = [nx, ny, 0.0];
+                        let w0 = edge2(p[1], p[2], c);
+                        let w1 = edge2(p[2], p[0], c);
+                        let w2 = edge2(p[0], p[1], c);
+                        // No cull: either winding counts as inside.
+                        if w0 * area < 0.0 || w1 * area < 0.0 || w2 * area < 0.0 {
+                            continue;
+                        }
+                        let z = (w0 * p[0][2] + w1 * p[1][2] + w2 * p[2][2]) / area;
+                        let i = py as usize * w + px as usize;
+                        // `Greater` wins, strict — a 0.0 fragment
+                        // can never land on the 0.0-cleared target.
+                        if z > depth[i] {
+                            depth[i] = z;
+                            ids[i] = tri[0].pick;
+                        }
+                    }
+                }
+            }
+        }
+        ids
+    }
+
+    /// C17-F1 probe — software-rasterize the REAL packet two ways and
+    /// show the fix end-to-end: the stream with the root SELECTED
+    /// carries the inflated pick-0 shell, which strictly encloses the
+    /// part and beats it at every covered pixel under `Greater`-wins
+    /// reverse-Z (the verifier measured the click pixel decoding 0 at
+    /// 1440/1440 samples). Drawing the whole stream reproduces that
+    /// shadow; drawing [`csp_render::vab::pickable_ranges`] — what
+    /// `encode_pick` now issues — decodes the root's pick index at
+    /// the click pixel. Same rasterizer, same packet: only the vertex
+    /// selection differs, which IS the fix.
+    #[test]
+    fn pick_probe_decodes_the_part_not_the_decoration() {
+        let data = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let parts = csp_data::load_parts(&data.join("parts")).unwrap();
+        let res = csp_data::load_resources(&data.join("resources.ron")).unwrap();
+        let mut view = crate::View::with_sim(csp_sim::World::new());
+        view.install_vab_catalog(parts, res);
+        view.set_mode(crate::ViewMode::Vab);
+        view.set_tutorial_active(false);
+        view.set_vab_viewport(800.0, 600.0);
+        let tank = csp_data::PartId::from("csp.tank.s320");
+        view.with_vab_session(|v| {
+            v.apply(csp_ui::vab::VabAction::SetRoot(tank.clone()))
+                .unwrap()
+        });
+        // `SetRoot` selects the root — the packet's `vertices` then
+        // carries the pick-0 inflated shell around it.
+        let root_id = view.with_vab_session(|v| v.session().root().unwrap());
+        view.begin_frame();
+        view.set_egui_input(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            focused: true,
+            events: vec![egui::Event::PointerMoved(egui::pos2(400.0, 300.0))],
+            ..Default::default()
+        });
+        view.end_frame();
+        view.begin_frame();
+        view.end_frame();
+        let packet = view.take_vab_packet().expect("a VAB packet this frame");
+        // Non-vacuous: the stream DOES carry decoration — and the
+        // cursor is on the root.
+        assert!(
+            packet.vertices.iter().any(|v| v.pick == 0),
+            "the selection shell never made the stream"
+        );
+        let hit = view
+            .with_vab_session(|v| v.hover())
+            .expect("cursor over the root");
+        assert_eq!(hit.node, root_id);
+
+        let click = 300 * 800 + 400;
+        let all: Vec<std::ops::Range<u32>> =
+            std::iter::once(0..packet.vertices.len() as u32).collect();
+        let pre_fix = raster_pick(&packet.vertices, &all, 800, 600);
+        assert_eq!(
+            pre_fix[click], 0,
+            "the old pass should shadow the click pixel under the shell"
+        );
+        let post_fix = raster_pick(
+            &packet.vertices,
+            &csp_render::vab::pickable_ranges(&packet.vertices),
+            800,
+            600,
+        );
+        let px = post_fix[click];
+        assert!(
+            px >= 1 && packet.pick_ids[(px - 1) as usize] == root_id.0,
+            "the click pixel must decode the root, got pick {px}"
+        );
+        // And the shell's shadow was broad, not a fringe case: most
+        // of the root's projected pixels sat under pick-0 geometry.
+        let shadowed = pre_fix
+            .iter()
+            .zip(&post_fix)
+            .filter(|(old, new)| **old == 0 && **new != 0)
+            .count();
+        assert!(
+            shadowed > 100,
+            "only {shadowed} pixels changed — the probe barely exercises the shell"
+        );
+    }
 }

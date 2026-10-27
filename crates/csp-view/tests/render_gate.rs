@@ -1060,3 +1060,86 @@ fn dump() {
     }
     std::fs::write("/tmp/frame.ppm", &out).unwrap();
 }
+
+/// C17-F1 device-side check — the pick pass must emit no 0-tagged
+/// geometry. `VabPacket.vertices` interleaves pick-0 decoration
+/// (selection shells, ghosts, markers) with the real part triangles;
+/// under `Greater`-wins reverse-Z an inflated shell encloses its
+/// part and beats it at every covered pixel, so the pre-fix pass
+/// decoded real parts as background (the click-to-place killer).
+/// This packet puts pick-0 triangles strictly NEARER than two part
+/// triangles over their pixels — the readback must still decode the
+/// part ids through the real `encode_pick`/`map_pick` path.
+#[test]
+fn vab_pick_pass_emits_no_pick_zero_geometry() {
+    let Some((device, queue)) = gate_device("vab_pick_pass_emits_no_pick_zero_geometry") else {
+        return;
+    };
+    let mut vab = csp_render::vab::VabRenderer::new(&device, FORMAT, (W, H));
+    let v = |x: f32, y: f32, z: f32, pick: u32| csp_render::vab::VabVertex {
+        pos: [x, y, z],
+        world: [0.0; 3],
+        nrm: [0.0; 3],
+        color: [1.0; 4],
+        mat: [0.0; 3],
+        pick,
+    };
+    let packet = csp_render::vab::VabPacket {
+        vertices: vec![
+            // A full-frame pick-0 "selection shell" — z 0.9 is NEARER
+            // than the parts' 0.5 under reverse-Z, so rasterizing it
+            // writes 0 (and depth) over every pixel below.
+            v(-1.5, -1.5, 0.9, 0),
+            v(1.5, -1.5, 0.9, 0),
+            v(1.5, 1.5, 0.9, 0),
+            v(-1.5, -1.5, 0.9, 0),
+            v(1.5, 1.5, 0.9, 0),
+            v(-1.5, 1.5, 0.9, 0),
+            // Part A — pick id 1, centered on NDC (0, 0).
+            v(-0.2, -0.2, 0.5, 1),
+            v(0.2, -0.2, 0.5, 1),
+            v(0.0, 0.2, 0.5, 1),
+            // A pick-0 marker covering the same pixel.
+            v(0.0, 0.0, 0.9, 0),
+            v(0.1, 0.0, 0.9, 0),
+            v(0.0, 0.1, 0.9, 0),
+            // Part B — pick id 2, centered on NDC (0.5, −0.5); a
+            // second pickable run so the multi-draw path is hit.
+            v(0.4, -0.6, 0.5, 2),
+            v(0.6, -0.6, 0.5, 2),
+            v(0.5, -0.4, 0.5, 2),
+            // A trailing pick-0 ghost over the center again.
+            v(-0.05, -0.05, 0.9, 0),
+            v(0.05, -0.05, 0.9, 0),
+            v(0.0, 0.05, 0.9, 0),
+        ],
+        pick_ids: vec![11, 22],
+        ..Default::default()
+    };
+    let pick_at = |vab: &mut csp_render::vab::VabRenderer, x: u32, y: u32| -> u32 {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("render-gate-pick"),
+        });
+        assert!(vab.encode_pick(&mut encoder, &device, &queue, &packet, x, y));
+        queue.submit([encoder.finish()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        vab.map_pick(tx);
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        rx.recv().unwrap()
+    };
+    // Pixel (160, 120) = NDC (0, 0) — inside part A AND covered by
+    // three pick-0 triangles. The pre-fix pass decoded 0 here.
+    assert_eq!(
+        pick_at(&mut vab, W / 2, H / 2),
+        1,
+        "pick-0 decoration shadowed the part"
+    );
+    // Pixel (240, 180) = NDC (0.5, −0.5) — inside part B.
+    assert_eq!(
+        pick_at(&mut vab, 240, 180),
+        2,
+        "the second pickable run did not rasterize"
+    );
+    // Outside every part the pixel still decodes background.
+    assert_eq!(pick_at(&mut vab, 5, 5), 0);
+}

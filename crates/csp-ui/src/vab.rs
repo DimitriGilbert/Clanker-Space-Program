@@ -2287,6 +2287,10 @@ pub fn vab_editor(
 /// - tracks the LMB press: a press that began on a placed part and
 ///   became a drag *lifts* the part for a move (the camera orbit is
 ///   suppressed by `orbit_block` for the press's whole life);
+/// - promotes a click-armed part (`pending_part`) whose viewport press
+///   became a real drag onto the drag channel — the release then
+///   resolves through the same `Drop`/panel-cancel rule as a palette
+///   drag instead of dying silently (C17-F2);
 /// - resolves the LMB release: a lifted part dropped over the
 ///   viewport commits at the hover target ([`VabAction::Drop`]),
 ///   dropped over the palette is deleted (KSP's bin), dropped over
@@ -2310,6 +2314,7 @@ pub fn vab_pointer_input(
     use egui::PointerButton;
     let (
         pos,
+        press_origin,
         pressed,
         primary_down,
         released,
@@ -2323,6 +2328,7 @@ pub fn vab_pointer_input(
     ) = ctx.input(|i| {
         (
             i.pointer.hover_pos(),
+            i.pointer.press_origin(),
             i.pointer.button_pressed(PointerButton::Primary),
             i.pointer.primary_down(),
             i.pointer.button_released(PointerButton::Primary),
@@ -2338,6 +2344,14 @@ pub fn vab_pointer_input(
                 || (i.key_pressed(egui::Key::Y) && i.modifiers.command),
         )
     });
+    // REAL pointer travel past egui's click threshold — `deciding`
+    // alone also flips true on a motionless 0.8 s hold, which must
+    // not count as a drag here: a hold-still release still resolves
+    // as a click through the app's GPU pick, and promoting the arm
+    // would double-resolve the gesture (this `Drop` AND that pick).
+    let drag_travel = pos
+        .zip(press_origin)
+        .is_some_and(|(p, o)| p.distance(o) > ctx.options(|o| o.input_options.max_click_dist));
     // C14-F1: gate the hotkeys on TEXT-EDIT focus, never `InputState::focused`
     // (native window focus — true during all normal play, which dead-keyed
     // Del/Esc/X). Only a field actually taking typed text may hide them.
@@ -2355,49 +2369,17 @@ pub fn vab_pointer_input(
         None
     });
 
-    // The press anchor: which placed part (if any) the LMB press
-    // began on — the drag-lift candidate — and whether the press
-    // began over the viewport. Both anchor the gesture for its whole
-    // life: a press over a panel that slides into the viewport never
-    // becomes a scene gesture, and a viewport press that slides over
-    // a panel keeps its orbit suppression.
-    if pressed {
-        vab.set_press_node(if over_viewport {
-            vab.hover().map(|h| h.node)
-        } else {
-            None
-        });
-        vab.set_press_on_viewport(over_viewport);
-    }
-    if !primary_down {
-        vab.set_press_node(None);
-        vab.set_press_on_viewport(false);
-    }
-
-    // An LMB press carrying a part — or begun on one, about to lift
-    // it — is a placement/move gesture, not a camera drag: `csp-view`
-    // skips orbit deltas while this is set. The anchor is the PRESS
-    // position, not the live cursor — mid-drag over the palette used
-    // to drop the block and orbit while a part rode the cursor.
-    vab.set_orbit_block(
-        primary_down
-            && vab.press_on_viewport()
-            && (vab.carried().is_some() || vab.press_node().is_some()),
+    // The press half — anchors, the armed-drag promotion (C17-F2),
+    // orbit suppression, and the drag-lift — split out under the
+    // complexity budget; it mutates only session gesture state.
+    vab_press_gesture(
+        vab,
+        pressed,
+        primary_down,
+        deciding,
+        drag_travel,
+        over_viewport,
     );
-
-    // The drag-lift: a press on a placed part that became a drag
-    // picks the part up. One attempt per press — clearing
-    // `press_node` here means a refused grab (or one on the carried
-    // root that resolves) never refires, and a refusal falls through
-    // to the camera orbit rather than a dead gesture.
-    if primary_down
-        && deciding
-        && vab.carried().is_none()
-        && let Some(n) = vab.press_node()
-    {
-        vab.set_press_node(None);
-        let _ = vab.apply(VabAction::Grab(n));
-    }
 
     if released {
         // A lifted part dropped over the palette is deleted — KSP's
@@ -2462,6 +2444,90 @@ pub fn vab_pointer_input(
             _ => 1,
         };
         let _ = vab.apply(VabAction::SetSymmetry(next));
+    }
+}
+
+/// The LMB-press half of [`vab_pointer_input`] — press anchors, the
+/// armed-drag promotion, `orbit_block`, and the drag-lift — split out
+/// under the complexity budget. `drag_travel` is the real pointer
+/// distance past egui's click threshold (the caller computes it;
+/// `deciding` alone also flips on a motionless long hold).
+fn vab_press_gesture(
+    vab: &mut VabSession,
+    pressed: bool,
+    primary_down: bool,
+    deciding: bool,
+    drag_travel: bool,
+    over_viewport: bool,
+) {
+    // The press anchor: which placed part (if any) the LMB press
+    // began on — the drag-lift candidate — and whether the press
+    // began over the viewport. Both anchor the gesture for its whole
+    // life: a press over a panel that slides into the viewport never
+    // becomes a scene gesture, and a viewport press that slides over
+    // a panel keeps its orbit suppression.
+    if pressed {
+        vab.set_press_node(if over_viewport {
+            vab.hover().map(|h| h.node)
+        } else {
+            None
+        });
+        vab.set_press_on_viewport(over_viewport);
+    }
+    // A click-armed part under a viewport-anchored press that became
+    // a real drag: promote the arm onto the drag channel so the
+    // release resolves like a palette drag — `Drop` at the hover over
+    // the viewport, put back over a panel. Without this the gesture
+    // was dead: `orbit_block` ate the camera deltas, the carry barred
+    // the drag-lift, and neither release branch matched (C17-F2).
+    // Runs BEFORE the `!primary_down` anchor clear so a press that
+    // only crosses the threshold on its release frame (still frames,
+    // then a move+release in one batch) still promotes; anchored on
+    // the PRESS so a drag begun on a panel never arms a drop/cancel.
+    let promote_armed_drag = deciding
+        && drag_travel
+        && vab.press_on_viewport()
+        && vab.drag_part().is_none()
+        && matches!(vab.carried(), Some(Carried::Placing(_)));
+    if promote_armed_drag {
+        // `Placing` with an empty drag channel can only be the
+        // click-armed `pending_part` (`armed_part` checks the drag
+        // channel first) — promote THAT part. The clone binds to a
+        // local first: a scrutinee `pending_part().cloned()` would
+        // hold the session borrow through the `if let` body.
+        let part = vab.pending_part().cloned();
+        if let Some(part) = part {
+            vab.set_drag_part(Some(part));
+        }
+    }
+    if !primary_down {
+        vab.set_press_node(None);
+        vab.set_press_on_viewport(false);
+    }
+
+    // An LMB press carrying a part — or begun on one, about to lift
+    // it — is a placement/move gesture, not a camera drag: `csp-view`
+    // skips orbit deltas while this is set. The anchor is the PRESS
+    // position, not the live cursor — mid-drag over the palette used
+    // to drop the block and orbit while a part rode the cursor.
+    vab.set_orbit_block(
+        primary_down
+            && vab.press_on_viewport()
+            && (vab.carried().is_some() || vab.press_node().is_some()),
+    );
+
+    // The drag-lift: a press on a placed part that became a drag
+    // picks the part up. One attempt per press — clearing
+    // `press_node` here means a refused grab (or one on the carried
+    // root that resolves) never refires, and a refusal falls through
+    // to the camera orbit rather than a dead gesture.
+    if primary_down
+        && deciding
+        && vab.carried().is_none()
+        && let Some(n) = vab.press_node()
+    {
+        vab.set_press_node(None);
+        let _ = vab.apply(VabAction::Grab(n));
     }
 }
 
@@ -4771,6 +4837,178 @@ mod tests {
             vab.session().len(),
             1,
             "release over the palette bins the lifted part"
+        );
+    }
+
+    /// LMB primary press/drag/release events for the gesture tests.
+    fn primary_button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// C17-F2: a click-armed part (`CatalogPick`) under a viewport LMB
+    /// press that became a drag used to die silently — `orbit_block`
+    /// ate every camera delta, the carry barred the drag-lift, and
+    /// neither release branch matched (`move_node`/`drag_part` both
+    /// `None`), while the app refused the click pick over its drag
+    /// threshold. The press now promotes the arm onto the drag
+    /// channel once the pointer travels past the click threshold, so
+    /// the release drops at the hover target like a palette drag.
+    #[test]
+    fn armed_part_viewport_drag_drops_at_release() {
+        let ctx = egui::Context::default();
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        vab.apply(VabAction::SetRoot(PartId::from("t.tank")))
+            .unwrap();
+        let root = vab.session().root().unwrap();
+        vab.apply(VabAction::CatalogPick(PartId::from("t.eng")))
+            .unwrap();
+        // The hover the view publishes — the drop's attach target.
+        vab.set_hover(Some(HoverHit {
+            node: root,
+            local: DVec3::new(0.0, 0.0, -0.5),
+            region: AttachRegion::BottomCap,
+        }));
+        // Press over the free viewport while armed — still a click
+        // candidate, no drag yet.
+        ctx.run_pass(
+            egui_input(vec![
+                egui::Event::PointerMoved(egui::pos2(400.0, 300.0)),
+                primary_button(egui::pos2(400.0, 300.0), true),
+            ]),
+            |ctx| vab_pointer_input(ctx, &mut vab, &[], None),
+        )
+        .drop_without_applying_deltas();
+        assert!(
+            vab.orbit_block(),
+            "the armed viewport press still suppresses the camera orbit"
+        );
+        assert!(vab.drag_part().is_none(), "no drag yet — still a click");
+        // Travel past the click threshold while held — the arm
+        // promotes onto the drag channel.
+        ctx.run_pass(
+            egui_input(vec![egui::Event::PointerMoved(egui::pos2(450.0, 340.0))]),
+            |ctx| vab_pointer_input(ctx, &mut vab, &[], None),
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(
+            vab.drag_part(),
+            Some(&PartId::from("t.eng")),
+            "the armed part must promote once the press becomes a drag"
+        );
+        // Release over the viewport — the drag-drop attaches at the
+        // hover (the part is placed, not left silently held).
+        ctx.run_pass(
+            egui_input(vec![
+                egui::Event::PointerMoved(egui::pos2(460.0, 350.0)),
+                primary_button(egui::pos2(460.0, 350.0), false),
+            ]),
+            |ctx| vab_pointer_input(ctx, &mut vab, &[], None),
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(
+            vab.session().len(),
+            2,
+            "the armed drag's release must place the part at the hover"
+        );
+        assert!(vab.carried().is_none(), "the placed part leaves the hand");
+    }
+
+    /// The same armed drag released over a masked window puts the
+    /// part back — the palette drag's panel-release rule, applied to
+    /// the promoted arm.
+    #[test]
+    fn armed_part_drag_release_over_panel_cancels() {
+        let ctx = egui::Context::default();
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        vab.apply(VabAction::SetRoot(PartId::from("t.tank")))
+            .unwrap();
+        vab.apply(VabAction::CatalogPick(PartId::from("t.eng")))
+            .unwrap();
+        let mask = egui::Rect::from_min_size(egui::pos2(500.0, 200.0), egui::vec2(200.0, 100.0));
+        ctx.run_pass(
+            egui_input(vec![
+                egui::Event::PointerMoved(egui::pos2(400.0, 300.0)),
+                primary_button(egui::pos2(400.0, 300.0), true),
+            ]),
+            |ctx| vab_pointer_input(ctx, &mut vab, &[mask], None),
+        )
+        .drop_without_applying_deltas();
+        ctx.run_pass(
+            egui_input(vec![egui::Event::PointerMoved(egui::pos2(550.0, 250.0))]),
+            |ctx| vab_pointer_input(ctx, &mut vab, &[mask], None),
+        )
+        .drop_without_applying_deltas();
+        assert!(vab.drag_part().is_some(), "the drag promoted the arm");
+        ctx.run_pass(
+            egui_input(vec![
+                egui::Event::PointerMoved(egui::pos2(600.0, 250.0)),
+                primary_button(egui::pos2(600.0, 250.0), false),
+            ]),
+            |ctx| vab_pointer_input(ctx, &mut vab, &[mask], None),
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(vab.session().len(), 1, "a panel release must not place");
+        assert!(
+            vab.carried().is_none(),
+            "release over a window puts the armed part back"
+        );
+        assert!(
+            vab.notice().is_some_and(|n| n.contains("put back")),
+            "the cancel reports itself: {:?}",
+            vab.notice()
+        );
+    }
+
+    /// The press anchor still gates the promotion: a drag that began
+    /// on a masked window and slid onto the viewport must never arm a
+    /// drop or a cancel for a part it never touched — the arm
+    /// survives the whole gesture untouched.
+    #[test]
+    fn panel_anchored_drag_never_promotes_the_arm() {
+        let ctx = egui::Context::default();
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        vab.apply(VabAction::SetRoot(PartId::from("t.tank")))
+            .unwrap();
+        vab.apply(VabAction::CatalogPick(PartId::from("t.eng")))
+            .unwrap();
+        let mask = egui::Rect::from_min_size(egui::pos2(500.0, 200.0), egui::vec2(200.0, 100.0));
+        // Press INSIDE the mask, drag out onto the viewport, release
+        // on the free viewport.
+        ctx.run_pass(
+            egui_input(vec![
+                egui::Event::PointerMoved(egui::pos2(550.0, 250.0)),
+                primary_button(egui::pos2(550.0, 250.0), true),
+            ]),
+            |ctx| vab_pointer_input(ctx, &mut vab, &[mask], None),
+        )
+        .drop_without_applying_deltas();
+        ctx.run_pass(
+            egui_input(vec![egui::Event::PointerMoved(egui::pos2(400.0, 300.0))]),
+            |ctx| vab_pointer_input(ctx, &mut vab, &[mask], None),
+        )
+        .drop_without_applying_deltas();
+        assert!(
+            vab.drag_part().is_none(),
+            "a panel-anchored press must not promote the arm"
+        );
+        ctx.run_pass(
+            egui_input(vec![
+                egui::Event::PointerMoved(egui::pos2(350.0, 320.0)),
+                primary_button(egui::pos2(350.0, 320.0), false),
+            ]),
+            |ctx| vab_pointer_input(ctx, &mut vab, &[mask], None),
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(vab.session().len(), 1, "no drop may fire");
+        assert_eq!(
+            vab.pending_part(),
+            Some(&PartId::from("t.eng")),
+            "the arm survives a panel-anchored drag released over the viewport"
         );
     }
 

@@ -806,8 +806,12 @@ fn build_ui(
         // recover-control, VAB launch, warp demotion) — the dead-click
         // complaint. `flight_ui.sfx` is the Presentation-mirrored live
         // stack; `flight_present` ages the TTLs every frame, so cues
-        // pushed from any mode still fade on schedule.
-        csp_ui::notice_overlay(ctx, &flight_ui.sfx);
+        // pushed from any mode still fade on schedule. Its chip rect
+        // joins `ui_masks` — the Area is `interactable(false)`, so
+        // egui never owns a click on a cue line and an unmasked
+        // right-click would resolve as a viewport gesture, deleting
+        // the VAB part behind the chip (C17-F7).
+        ui_masks.extend(csp_ui::notice_overlay(ctx, &flight_ui.sfx));
         // The VAB's pointer/hotkey pass runs LAST: `ui_masks` now
         // holds every floating window rect drawn this frame (top bar,
         // editor panels, help, settings, crash, tutorial), so a press

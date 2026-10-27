@@ -19,9 +19,15 @@
 //!   clear 0.0, `Greater` wins).
 //! - **Pick pass** — ONLY `vertices` (the environment stream is never
 //!   rasterized here — a click aimed through the floor resolves to
-//!   the part behind it) re-rasterized into an offscreen `R32Uint`
-//!   texture (with its own depth), each part's fragment writing its
-//!   1-based index into [`VabPacket::pick_ids`]; 0 is background.
+//!   the part behind it), and only the stream's nonzero-pick runs:
+//!   the same buffer carries pick-0 decoration (selection shells,
+//!   ghosts, markers) which must never reach the id target — under
+//!   `Greater`-wins reverse-Z an inflated shell strictly encloses its
+//!   part and would beat it at every covered pixel, decoding real
+//!   parts as background (C17-F1). [`pickable_ranges`] is the vertex
+//!   selection the pass draws: an offscreen `R32Uint` texture (with
+//!   its own depth), each part's fragment writing its 1-based index
+//!   into [`VabPacket::pick_ids`]; 0 is background.
 //!   [`VabRenderer::encode_pick`] copies the pixel under the cursor to
 //!   a 4-byte readback buffer inside the frame's submission;
 //!   [`VabRenderer::map_pick`] (call after submit) hands the result to
@@ -85,7 +91,10 @@ pub struct VabPacket {
     pub env_vertices: Vec<VabVertex>,
     /// Triangle-list part-mesh faces for every placed part — the
     /// pickable stream the object-id pass rasterizes (ghosts,
-    /// markers, and selection shells ride it too, tagged pick 0).
+    /// markers, and selection shells ride it too, tagged pick 0 —
+    /// [`pickable_ranges`] is what the pick pass draws, so the
+    /// decoration can never shadow a part id under `Greater`-wins
+    /// reverse-Z).
     pub vertices: Vec<VabVertex>,
     /// `pick_ids[i]` is the `PartNodeId` (as `u64`) drawn with pick
     /// index `i + 1` — the pick readback decodes through this table.
@@ -420,6 +429,15 @@ impl VabRenderer {
         if n == 0 {
             return false;
         }
+        // Draw ONLY the nonzero-pick runs: the stream interleaves
+        // pick-0 decoration (selection shells, ghosts, markers) with
+        // the real part triangles, and rasterizing it would shadow
+        // the part ids — an inflated shell encloses its part and wins
+        // every covered pixel under `Greater` (C17-F1).
+        let ranges = pickable_ranges(&packet.vertices);
+        if ranges.is_empty() {
+            return false;
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("vab-pick"),
@@ -448,7 +466,9 @@ impl VabRenderer {
             });
             pass.set_pipeline(&self.pick_pipeline);
             pass.set_vertex_buffer(0, self.verts.buffer.slice(..));
-            pass.draw(0..n, 0..1);
+            for range in ranges {
+                pass.draw(range, 0..1);
+            }
         }
         self.pick.copy_pixel(encoder, &self.read_buf, x_px, y_px);
         true
@@ -478,6 +498,34 @@ impl VabRenderer {
                 let _ = tx.send(v);
             });
     }
+}
+
+/// The vertex ranges the pick pass rasterizes — the maximal runs of
+/// `verts` carrying a nonzero pick index. The packet's `vertices`
+/// stream interleaves pick-0 decoration (selection shells, ghosts,
+/// attach-node markers) with the real part triangles; under
+/// `Greater`-wins reverse-Z the inflated shell strictly encloses its
+/// part, so rasterizing it would beat the part at every covered pixel
+/// and decode the click as background (C17-F1). [`VabRenderer::
+/// encode_pick`] draws exactly these ranges; `csp-view`'s tests probe
+/// the same selection through the pick pipeline's math.
+pub fn pickable_ranges(verts: &[VabVertex]) -> Vec<std::ops::Range<u32>> {
+    let mut ranges = Vec::new();
+    let mut start = None;
+    for (i, v) in verts.iter().enumerate() {
+        match (v.pick != 0, start) {
+            (true, None) => start = Some(i as u32),
+            (false, Some(s)) => {
+                ranges.push(s..i as u32);
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        ranges.push(s..verts.len() as u32);
+    }
+    ranges
 }
 
 impl PickTargets {
@@ -546,5 +594,73 @@ fn pick_targets(device: &wgpu::Device, size: (u32, u32)) -> PickTargets {
         color_view: color.create_view(&wgpu::TextureViewDescriptor::default()),
         color,
         depth_view: depth.create_view(&wgpu::TextureViewDescriptor::default()),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn v(pick: u32) -> VabVertex {
+        VabVertex {
+            pos: [0.0; 3],
+            world: [0.0; 3],
+            nrm: [0.0; 3],
+            color: [0.0; 4],
+            mat: [0.0; 3],
+            pick,
+        }
+    }
+
+    /// C17-F1: the pick pass must emit only nonzero-pick vertices —
+    /// the interleaved decoration runs (selection shells, ghosts,
+    /// markers tagged 0) fall out of the draw list while every real
+    /// part vertex stays, in order.
+    #[test]
+    fn pickable_ranges_emit_no_pick_zero_geometry() {
+        // The real stream's shape: shell, part, part, ghost, marker.
+        // Adjacent pickable vertices coalesce into ONE run — the
+        // boundary between two parts is not a draw break.
+        let verts = vec![
+            v(0),
+            v(0),
+            v(0),
+            v(1),
+            v(1),
+            v(1),
+            v(2),
+            v(2),
+            v(2),
+            v(0),
+            v(0),
+            v(0),
+            v(0),
+        ];
+        assert_eq!(pickable_ranges(&verts), vec![3..9]);
+        // Nothing but decoration draws nothing — `encode_pick` then
+        // reports `false` rather than clearing the target to 0s.
+        assert!(pickable_ranges(&[v(0), v(0), v(0)]).is_empty());
+        // Nothing but parts is one run (the single-draw fast case).
+        assert_eq!(pickable_ranges(&[v(1), v(7), v(3)]), vec![0..3]);
+        // A leading run and a trailing run are both kept.
+        assert_eq!(pickable_ranges(&[v(1), v(0), v(0), v(2)]), vec![0..1, 3..4]);
+        // Both directions together over a mixed stream: every emitted
+        // index is pickable AND every pickable index is emitted.
+        let mixed = vec![v(0), v(3), v(3), v(0), v(4), v(0), v(5)];
+        let ranges = pickable_ranges(&mixed);
+        for r in &ranges {
+            assert!(
+                mixed[r.start as usize..r.end as usize]
+                    .iter()
+                    .all(|v| v.pick != 0),
+                "a 0-tagged vertex slipped into {r:?}"
+            );
+        }
+        let covered: Vec<u32> = ranges.into_iter().flatten().collect();
+        let expected: Vec<u32> = (0..mixed.len() as u32)
+            .filter(|&i| mixed[i as usize].pick != 0)
+            .collect();
+        assert_eq!(covered, expected);
     }
 }

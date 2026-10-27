@@ -699,12 +699,19 @@ fn fmt_opt(v: Option<f64>, f: impl Fn(f64) -> String) -> String {
 /// bare amber text washed out over bright terrain/sky — and every line
 /// is [`egui::TextWrapMode::Extend`], i.e. single-line: the bar widens
 /// to fit the longest cue instead of wrapping it to two rows.
-pub fn notice_overlay(ctx: &egui::Context, lines: &[String]) {
+///
+/// Returns the chip's rect (`None` when there is nothing to draw) so
+/// the host can mask it: the Area is `interactable(false)`, so egui
+/// never consumes a click on a cue line — an unmasked right-click on
+/// the chip would resolve as a viewport gesture and delete the VAB
+/// part behind it (C17-F7, the same class C14-F2's window masking
+/// closed).
+pub fn notice_overlay(ctx: &egui::Context, lines: &[String]) -> Option<egui::Rect> {
     if lines.is_empty() {
-        return;
+        return None;
     }
     let rect = ctx.content_rect();
-    egui::Area::new(egui::Id::unique("flight_sfx"))
+    let shown = egui::Area::new(egui::Id::unique("flight_sfx"))
         .order(egui::Order::Foreground)
         .interactable(false)
         .fixed_pos(egui::pos2(rect.center().x, rect.top() + 44.0))
@@ -726,6 +733,7 @@ pub fn notice_overlay(ctx: &egui::Context, lines: &[String]) {
                 });
             });
         });
+    Some(shown.response.rect)
 }
 
 /// The M4c flight HUD (§3.7's presentation floor, upgraded): the
