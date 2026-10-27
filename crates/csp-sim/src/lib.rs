@@ -5432,6 +5432,11 @@ impl World {
                     return Err(SimError::Recoverable("script: unknown id"));
                 };
                 s.enabled = *enabled;
+                // The re-arm check below needs the bound vessel's
+                // residence and the pre-existing wake registration —
+                // capture both before the borrow ends.
+                let bound_vessel = s.vessel;
+                let wake_held = s.wake_tick.is_some();
                 if *enabled {
                     s.disabled_reason = None;
                     // Re-enable is the operator's clean slate — the
@@ -5453,6 +5458,34 @@ impl World {
                 if !*enabled {
                     self.retire_script_wake(*script, shadow);
                     self.vacate_script_lease(*script, shadow);
+                }
+                // The enable half of that scrub rule: disable retires
+                // the pending `ScriptWake`, so re-enable must restore
+                // the tick carrier the scrub removed. A script bound
+                // to an off-bubble vessel (`OnRails`,
+                // `SurfaceLatched`, or a removed hull — none carry
+                // bubble ticks) has no other tick source, and would
+                // sit `enabled` yet dead until a bubble→rails
+                // transition happened to run `rearm_rails_scripts`.
+                // Mirror `apply_load_script`'s bootstrap (and
+                // `rearm_rails_scripts`): one `ScriptWake` a tick out
+                // so `on_tick` runs once and arms the real condition.
+                // A registration already held keeps its paired event,
+                // and an `InBubble` vessel's control pass ticks the
+                // script anyway — a wake there would only clamp warp
+                // at a dead tick.
+                if *enabled
+                    && !wake_held
+                    && !self
+                        .vessels
+                        .get(&bound_vessel)
+                        .is_some_and(|v| matches!(v.state, VesselState::InBubble(_)))
+                {
+                    let tick = self.clock.ticks().saturating_add(1);
+                    self.schedule_event(EventKind::ScriptWake { script: *script }, tick, shadow)?;
+                    if let Some(s) = self.scripts.get_mut(script) {
+                        s.wake_tick = Some(tick);
+                    }
                 }
             }
             SimCommand::RunBenchTest {
@@ -23503,6 +23536,162 @@ mod tests {
             let snap = w.snapshot().unwrap();
             let w2 = World::restore(test_system(), None, snap).unwrap();
             assert_eq!(w2.state_hash().unwrap(), hash_before);
+        }
+
+        /// The re-enable half of C11-F1: `SetScriptEnabled{false}`
+        /// scrubs the pending `ScriptWake`; `{true}` on a script bound
+        /// to a vessel with no bubble ticks (`OnRails` here) must
+        /// re-arm the bootstrap wake — otherwise the record sits
+        /// `enabled` with `wake_tick=None` and no tick source, dead
+        /// until a bubble→rails transition happens to run
+        /// `rearm_rails_scripts`. The re-armed wake must actually
+        /// deliver an `on_tick`, the `wake_tick`↔event pairing must
+        /// stay coherent at every stage, and each shape must
+        /// round-trip snapshot→restore.
+        #[test]
+        fn reenabled_rails_script_rearms_wake() {
+            let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let mut w = World::with_system(test_system());
+            w.set_script_engine(Box::new(StubEngine {
+                behavior: Behavior::WakeAt(200),
+                calls: std::rc::Rc::clone(&calls),
+            }));
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::SpawnVessel {
+                    parent: BodyId::from("p"),
+                    elements: leo_elements(),
+                },
+            );
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::LoadScript {
+                    vessel: VesselId(0),
+                    source: "stub".to_string(),
+                },
+            );
+            let wake_event_at = |w: &World| -> Option<u64> {
+                w.event_heap.iter().find_map(|e| match &e.kind {
+                    EventKind::ScriptWake { script } if *script == ScriptId(0) => Some(e.tick),
+                    _ => None,
+                })
+            };
+            // The bootstrap wake delivers the first `on_tick`, which
+            // arms `AtTick(200)` — a live Some↔event pairing.
+            w.step_frame(3).unwrap();
+            assert_eq!(w.scripts()[&ScriptId(0)].wake_tick, Some(200));
+            assert_eq!(wake_event_at(&w), Some(200));
+            assert_eq!(calls.borrow().len(), 1);
+            let hash = w.state_hash().unwrap();
+            let w2 = World::restore(test_system(), None, w.snapshot().unwrap()).unwrap();
+            assert_eq!(w2.state_hash().unwrap(), hash);
+            // Disable scrubs both halves of the pair.
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::SetScriptEnabled {
+                    script: ScriptId(0),
+                    enabled: false,
+                },
+            );
+            w.step_frame(4).unwrap();
+            assert_eq!(w.scripts()[&ScriptId(0)].wake_tick, None);
+            assert_eq!(wake_event_at(&w), None);
+            // Re-enable applies at the tick-4 boundary while the clock
+            // still reads 4 — the re-armed bootstrap wake lands at 5
+            // and fires inside the same frame.
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::SetScriptEnabled {
+                    script: ScriptId(0),
+                    enabled: true,
+                },
+            );
+            let report = w.step_frame(5).unwrap();
+            assert!(report.rejected.is_empty());
+            assert!(w.scripts()[&ScriptId(0)].enabled);
+            assert!(
+                report.fired_events.iter().any(|e| {
+                    matches!(&e.kind, EventKind::ScriptWake { script } if *script == ScriptId(0))
+                        && e.tick == 5
+                }),
+                "the re-armed wake must fire at clock+1"
+            );
+            assert_eq!(
+                calls.borrow().len(),
+                2,
+                "the re-armed wake must deliver an on_tick"
+            );
+            assert_eq!(calls.borrow()[1], (ScriptId(0), 5));
+            // The firing consumed the registration and the stub only
+            // arms on its first call — a coherent None↔nothing pairing
+            // that must round-trip too.
+            assert_eq!(w.scripts()[&ScriptId(0)].wake_tick, None);
+            assert_eq!(wake_event_at(&w), None);
+            let hash = w.state_hash().unwrap();
+            let w2 = World::restore(test_system(), None, w.snapshot().unwrap()).unwrap();
+            assert_eq!(w2.state_hash().unwrap(), hash);
+        }
+
+        /// The bubble-resident half of the re-arm rule: an `InBubble`
+        /// script ticks in `control_tick` and holds no wake — disable
+        /// then re-enable must NOT schedule one. A pending
+        /// `ScriptWake` on a resident vessel only clamps warp at a
+        /// dead tick; the control pass is the tick carrier.
+        #[test]
+        fn reenabled_bubble_script_does_not_arm_wake() {
+            let (mut w, calls) = scripted_world(Behavior::Nop);
+            // The orbiter is resident — the first `on_tick` ran in the
+            // load tick's control pass.
+            assert!(matches!(
+                w.vessels()[&VesselId(0)].state,
+                VesselState::InBubble(_)
+            ));
+            assert_eq!(calls.borrow().len(), 1);
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::SetScriptEnabled {
+                    script: ScriptId(0),
+                    enabled: false,
+                },
+            );
+            w.step_frame(3).unwrap();
+            assert!(!w.scripts()[&ScriptId(0)].enabled);
+            assert_eq!(
+                calls.borrow().len(),
+                1,
+                "a disabled script must not tick in the control pass"
+            );
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::SetScriptEnabled {
+                    script: ScriptId(0),
+                    enabled: true,
+                },
+            );
+            w.step_frame(4).unwrap();
+            let s = &w.scripts()[&ScriptId(0)];
+            assert!(s.enabled);
+            assert_eq!(
+                s.wake_tick, None,
+                "a bubble-resident script must not hold a wake"
+            );
+            assert!(
+                !w.event_heap.iter().any(|e| matches!(
+                    &e.kind,
+                    EventKind::ScriptWake { script } if *script == ScriptId(0)
+                )),
+                "re-enable on a resident vessel must not arm a wake"
+            );
+            assert!(
+                calls.borrow().len() > 1,
+                "the control pass must tick the re-enabled script again"
+            );
         }
 
         /// The strike-disable half of C11-F1: a wake the faulting
