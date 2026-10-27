@@ -209,7 +209,14 @@ use crate::SimError;
 /// player's focus record (`Option<VesselId>`) after `warp_level` —
 /// §7.2's serialized set names it, so a lost record must not pass the
 /// hash silently. The goldens rebless.
-pub const HASH_SCHEMA_VERSION: u32 = 22;
+///
+/// **Version 23** (§3.1 `Parachute` gate-anchored inflation, C14-F1):
+/// `Vessel::deployed`'s value widens from the bare deploy tick to
+/// `DeployRecord` — `deployed_tick` plus `opened_tick`, the first
+/// tick the catch gates held, which anchors the inflation ramp the
+/// body's `DecelSite`s read. Hashed state deciding future forces;
+/// the goldens rebless.
+pub const HASH_SCHEMA_VERSION: u32 = 23;
 
 /// Rule-7 sum types: the source of an enum's *declared* stable `u16`
 /// discriminant (PLAN §7.1 rule 7).
