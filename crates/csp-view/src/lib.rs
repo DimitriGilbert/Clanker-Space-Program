@@ -1576,16 +1576,44 @@ pub struct View {
 /// snapshot: a retry of the flying, never a re-pay of the build wait).
 /// `launch_craft` can only snapshot the pre-ORDER world — its own
 /// commands are still pending at that point — so `sim_step` re-takes
-/// the point once the `ConstructionComplete` firing lands the craft
-/// surface-latched on the pad.
-#[derive(Clone, Copy, Debug)]
+/// the point once the armed order's own delivery boundary lands the
+/// craft surface-latched on the pad (see
+/// [`View::advance_revert_capture`] for the match).
+#[derive(Clone, Debug)]
 enum RevertCapture {
-    /// Order enqueued; armed for the delivery firing. The site-less
-    /// `SpawnPhysicalVessel` fallback has no delivery event — it never
-    /// leaves this state, and the launch-time capture stays the point.
-    AwaitingDelivery,
-    /// The firing was seen; retry the §7.4 snapshot every `sim_step`
-    /// until the boundary admits one — a transient refusal (live
+    /// Order enqueued; armed for THIS order's delivery, not any
+    /// `ConstructionComplete` — a concurrent `ManufactureCraft` (a
+    /// second launch's superseded arm aside, the server/MCP ingress
+    /// carries `SourceClass::External` orders) delivers on its own
+    /// event and must not spend the arm.
+    ///
+    /// `site` + `craft` name the order's product and `min_build_id` is
+    /// the `StagePlan`-convention bound (`builds().next_back() + 1` at
+    /// arm — `next_build_id` itself is not observable; ids are
+    /// monotonic, never reused): the `BuildId` is minted inside the
+    /// drain, so it cannot be named at enqueue, and an already-queued
+    /// foreign order takes the lower ids — the watermark bounds the
+    /// `builds()` scan to records minted at-or-after this order.
+    /// `armed_tick` is the clock at enqueue: the player FIFO
+    /// drains the order at the first boundary the next step crosses,
+    /// so a `reached_tick` past it has consumed the order one way or
+    /// the other. The site-less `SpawnPhysicalVessel` fallback never
+    /// ENTERS this state — its branch arms nothing, and the
+    /// launch-time capture stays the point.
+    AwaitingDelivery {
+        /// The launch site the order delivers to.
+        site: csp_data::SiteId,
+        /// The ordered craft — the record/log match key (the same
+        /// instance the command carries verbatim).
+        craft: csp_sim::CraftDef,
+        /// `builds().next_back() + 1` at arm: records minted before
+        /// this order are pre-existing builds, never its delivery.
+        min_build_id: u64,
+        /// Clock at enqueue — the boundary stamp the order drains at.
+        armed_tick: u64,
+    },
+    /// The armed order's own boundary passed; retry the §7.4 snapshot
+    /// every `sim_step` until it admits one — a transient refusal (live
     /// contacts on another vessel, a joint island) must not strand the
     /// point at the pre-order capture, which is the "revert un-pays
     /// the build" hole this recapture exists to close.
@@ -2210,20 +2238,15 @@ impl View {
         // the sim contract at `manufacture.rs` expects the post-delivery
         // snapshot): `launch_craft` captured the pre-ORDER world — its
         // own commands were necessarily still pending there — so the
-        // point is re-taken once `ConstructionComplete` lands the craft
-        // surface-latched. `Delivered` retries every step until the
-        // §7.4 boundary admits a snapshot: a transient refusal (live
-        // contacts, a joint island, a partial drain) must not strand
-        // the point at the pre-order capture, which is the "revert
-        // un-pays the build" hole this recapture exists to close.
-        if matches!(self.revert_capture, Some(RevertCapture::AwaitingDelivery))
-            && report
-                .fired_events
-                .iter()
-                .any(|e| matches!(e.kind, csp_sim::EventKind::ConstructionComplete { .. }))
-        {
-            self.revert_capture = Some(RevertCapture::Delivered);
-        }
+        // point is re-taken once the ARMED order's delivery lands the
+        // craft surface-latched (see `advance_revert_capture` for the
+        // match; a foreign `ConstructionComplete` must not spend the
+        // arm). `Delivered` retries every step until the §7.4 boundary
+        // admits a snapshot: a transient refusal (live contacts, a
+        // joint island, a partial drain) must not strand the point at
+        // the pre-order capture, which is the "revert un-pays the
+        // build" hole this recapture exists to close.
+        self.advance_revert_capture(&report);
         if matches!(self.revert_capture, Some(RevertCapture::Delivered))
             && let Ok(snap) = self.sim.snapshot()
         {
@@ -2276,6 +2299,89 @@ impl View {
             .note_fired(&report.fired_events);
         self.schedules.sim_step.run(&mut self.world);
         Ok(report)
+    }
+
+    /// The `AwaitingDelivery` arm's per-step matcher — see
+    /// [`RevertCapture`]. Run after `step_frame` so the step's drains,
+    /// log writes, and event firings are all visible.
+    ///
+    /// The arm names the ORDER, not the event: `EventKind::
+    /// ConstructionComplete { build }` carries the `BuildId`, but the id
+    /// is minted inside the drain — the enqueue site cannot know it,
+    /// and a foreign order ahead in the same drain takes the lower
+    /// ids — so the match runs on the order's identity: `(site, craft)`
+    /// for the product plus `min_build_id` (`builds().next_back() + 1`
+    /// at arm time — `next_build_id` is not observable) bounding the
+    /// `builds()` scan to records minted at-or-after this order.
+    ///
+    /// Phase one proves the order APPLIED: `command_log` is the applied
+    /// channel — a drain-rejected `ManufactureCraft` writes no entry
+    /// (its `source_seq` and effects roll back; the rejection reports
+    /// only on `report.rejected`, which carries no command identity),
+    /// and the player FIFO drains at the first boundary the frame
+    /// crosses, stamped `armed_tick`. A step whose `reached_tick` has
+    /// passed `armed_tick` therefore consumed the order; no matching
+    /// log entry means it REJECTED. The arm then disarms rather than
+    /// waiting on a delivery that can never come and latching onto an
+    /// unrelated later `ConstructionComplete` — `pre_launch` keeps the
+    /// pre-order capture, the honest point for a launch whose order
+    /// never took.
+    ///
+    /// Phase two waits out the build: an `ActiveBuild` leaves the arena
+    /// only at its terminal `ConstructionComplete` firing — a
+    /// berth-blocked delivery re-queues the record with a fresh
+    /// deadline — so "applied and no matching record in flight" IS the
+    /// delivery boundary. Two pending builds of an identical craft to
+    /// the same site cannot be told apart by any key the sim exposes
+    /// (the `vessel_for` ambiguity class): the match then waits out
+    /// every matching record, so a wrong pick can only recapture LATE
+    /// (the point moves to a world where an extra identical order may
+    /// still be building) — never EARLY, which would re-pay the build
+    /// wait this recapture exists to erase.
+    fn advance_revert_capture(&mut self, report: &AdvanceReport) {
+        let Some(RevertCapture::AwaitingDelivery {
+            site,
+            craft,
+            min_build_id,
+            armed_tick,
+        }) = &self.revert_capture
+        else {
+            return;
+        };
+        let armed_tick = *armed_tick;
+        let min_build_id = *min_build_id;
+        let applied = self
+            .sim
+            .command_log()
+            .iter()
+            .rev()
+            .take_while(|(key, _)| key.tick >= armed_tick)
+            .any(|(key, command)| {
+                key.source_class == SourceClass::Ui
+                    && key.source_id == PLAYER_SOURCE_ID
+                    && matches!(
+                        command,
+                        SimCommand::ManufactureCraft { site: s, craft: c, .. }
+                            if *s == *site && *c == *craft
+                    )
+            });
+        if !applied {
+            if report.reached_tick > armed_tick {
+                self.revert_capture = None;
+                self.flight_notice(
+                    "BUILD ORDER REFUSED AT APPLY — revert point holds the pre-order world",
+                );
+            }
+            return;
+        }
+        let building = self
+            .sim
+            .builds()
+            .values()
+            .any(|b| b.id.0 >= min_build_id && b.site == *site && b.craft == *craft);
+        if !building {
+            self.revert_capture = Some(RevertCapture::Delivered);
+        }
     }
 
     /// Once per frame, after SimStep: Sync → Presentation → UiBuild →
@@ -3088,17 +3194,35 @@ impl View {
                 PLAYER_SOURCE_ID,
                 SimCommand::ManufactureCraft {
                     site: site.id.clone(),
-                    craft,
+                    craft: craft.clone(),
                     build_resources,
                 },
             );
             // Arm the delivery-boundary recapture: `sim_step` moves the
-            // revert point from the pre-order world to the
-            // `ConstructionComplete` tick — the paid world with the
-            // craft parked — so a revert retries the flying instead of
-            // refunding the order (the site-less fallback below keeps
-            // its pre-spawn point: it has no delivery event).
-            self.revert_capture = Some(RevertCapture::AwaitingDelivery);
+            // revert point from the pre-order world to the boundary
+            // where THIS order's delivery lands — the paid world with
+            // the craft parked — so a revert retries the flying instead
+            // of refunding the order (the site-less fallback below keeps
+            // its pre-spawn point: it has no delivery event). The arm
+            // keys on the order's `(site, craft)` identity plus the
+            // `next_build_id` watermark — the `BuildId` itself is minted
+            // inside the drain and cannot be named here — and expires
+            // if the order rejects at its drain.
+            self.revert_capture = Some(RevertCapture::AwaitingDelivery {
+                site: site.id.clone(),
+                craft,
+                // `next_build_id` is not observable — the `StagePlan`
+                // `min_id` convention instead: ids are monotonic and
+                // never reused, so `last pending id + 1` admits only
+                // records this order or a later-minted one created.
+                min_build_id: self
+                    .sim
+                    .builds()
+                    .keys()
+                    .next_back()
+                    .map_or(0, |id| id.0 + 1),
+                armed_tick: self.sim.clock().ticks(),
+            });
             self.flight_notice(format!(
                 "BUILD ORDER PLACED — delivery in {}",
                 csp_ui::fmt_period(mass / rate.max(f64::MIN_POSITIVE))
@@ -6076,7 +6200,11 @@ mod tests {
     /// `revert_to_launch` restores IT — the reverted world is back at
     /// the captured tick with the captured hash, not merely "a
     /// coherent world". The demo seeds its starter craft through
-    /// `launch_craft`, so a revert point exists from boot.
+    /// `launch_craft`, so a revert point exists from boot — and the
+    /// seed's own `AwaitingDelivery` arm resolves on the first real
+    /// `sim_step`, moving the point to the post-delivery world (the
+    /// seed delivered through direct `sim.step_frame` calls the
+    /// matcher cannot see, so that step is the first boundary it can).
     #[test]
     fn revert_to_launch_restores_pre_launch_snapshot() {
         let mut view = View::new_demo().unwrap();
@@ -6086,10 +6214,16 @@ mod tests {
         view.sim_step(view.sim.clock().ticks() + 16).unwrap();
         view.end_frame();
         assert!(view.sim.clock().ticks() > tick0);
+        // The recapture lands at this step's reached tick — the first
+        // post-delivery boundary the session observed. The pre-order
+        // capture (the empty, unspent world) must NOT be the point.
+        let delivered_tick = view.sim.clock().ticks();
+        assert_ne!(delivered_tick, revert_tick);
+        assert_eq!(view.revert_tick(), Some(delivered_tick));
         view.revert_to_launch().expect("revert");
-        // The reverted world is AT the launch tick — the snapshot the
-        // launch was issued from, not the live world's state.
-        assert_eq!(view.sim.clock().ticks(), revert_tick);
+        // The reverted world is AT the captured tick — the snapshot
+        // the delivery boundary re-took, not the live world's state.
+        assert_eq!(view.sim.clock().ticks(), delivered_tick);
         // And it is itself a coherent restorable world — re-save and
         // re-load lands the same hash.
         let hash = view.sim.state_hash().unwrap();
@@ -6238,6 +6372,261 @@ mod tests {
         assert!(
             view.revert_to_launch().is_err(),
             "revert refuses — session B never launched"
+        );
+    }
+
+    /// A minimal one-node 10 kg craft for a FOREIGN `ManufactureCraft`
+    /// order — deliberately unlike the starter craft so the arm's
+    /// `(site, craft)` match cannot confuse the two builds.
+    fn tiny_foreign_craft() -> csp_sim::CraftDef {
+        let mut graph = csp_phys::PartGraph::new(csp_phys::PartNodeId(0));
+        graph.nodes.insert(
+            csp_phys::PartNodeId(0),
+            csp_phys::PartNode::new(None, csp_phys::PartTransform::IDENTITY, 0),
+        );
+        csp_sim::CraftDef {
+            hash_memo: Default::default(),
+            part_ids: vec![],
+            graph,
+            parts: vec![csp_phys::WeldPart {
+                experiments: Vec::new(),
+                lab: None,
+                engine: None,
+                parachute: None,
+                dock_ports: vec![],
+                tanks: vec![],
+                crew_seats: 0,
+                structural: csp_data::StructuralDef::unlimited(),
+                mass_kg: 10.0,
+                com: csp_core::DVec3::ZERO,
+                inertia: csp_phys::SymMat3::solid_box(10.0, csp_core::DVec3::new(0.5, 0.5, 0.5)),
+                collider: csp_phys::ColliderShape::Box {
+                    half_extents: csp_core::DVec3::new(0.5, 0.5, 0.5),
+                },
+                force_sites: vec![],
+                aero: csp_data::AeroDef::constant(0.0, 0.0, 1.0),
+                thermal: csp_data::ThermalDef {
+                    heat_capacity_j_per_k: 10_000.0,
+                    max_temp_k: 1_000.0,
+                    emissivity: 0.8,
+                    conduction_w_per_k: 10.0,
+                },
+            }],
+            part_costs: vec![0.0],
+            reliability: vec![],
+        }
+    }
+
+    /// The dominant body's authored launch site — the same lookup
+    /// `launch_craft` performs, for enqueuing a foreign order to the
+    /// same pad.
+    fn launch_site_id(view: &View) -> csp_data::SiteId {
+        let dominant = view.sim.dominant_body().expect("dominant body").clone();
+        view.sim
+            .config()
+            .sites
+            .into_values()
+            .find(|s| s.body == dominant && s.launch)
+            .expect("authored launch site")
+            .id
+    }
+
+    /// The recapture must wait for the ARMED order's delivery, not any
+    /// `ConstructionComplete`: a concurrent foreign `ManufactureCraft`
+    /// (the server ingress enqueues on `SourceClass::External`) whose
+    /// build completes first used to spend the arm and move the revert
+    /// point to a world where the launched craft was still building.
+    /// Here the foreign order is the lighter craft, so its delivery
+    /// lands strictly before the armed launch's.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one boundary per arrange/act/assert beat
+    fn revert_recapture_ignores_a_foreign_builds_delivery() {
+        let mut view = View::new().expect("data/ load");
+        view.seed_starter_craft().expect("starter seed");
+        let site_id = launch_site_id(&view);
+        // Free the berth — the foreign hull must park when it delivers
+        // (a parked occupant defers a later delivery under the
+        // single-berth rule, which is not what this test exercises).
+        view.sim.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::TerminateVessel {
+                vessel: csp_sim::VesselId(0),
+            },
+        );
+        // This first real step also resolves the SEED launch's arm: its
+        // order applied and delivered inside the seed's direct
+        // `step_frame`s, so the arm flips to `Delivered` and recaptures.
+        view.begin_frame();
+        let report = view
+            .sim_step(view.sim.clock().ticks() + 1)
+            .expect("advance");
+        assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+        view.end_frame();
+        assert!(view.sim.vessels().is_empty(), "berth is free");
+
+        view.launch_craft().expect("launch places the order");
+        let order_tick = view.revert_tick().expect("launch arms a point");
+        // The foreign order: a different, much lighter craft on a
+        // different channel — enqueued AFTER the arm, drained at the
+        // same boundary, delivering strictly earlier.
+        view.sim.enqueue(
+            SourceClass::External,
+            7,
+            SimCommand::ManufactureCraft {
+                site: site_id,
+                craft: tiny_foreign_craft(),
+                build_resources: vec![],
+            },
+        );
+        view.begin_frame();
+        let report = view
+            .sim_step(view.sim.clock().ticks() + 1)
+            .expect("advance");
+        assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+        view.end_frame();
+        assert_eq!(view.sim.builds().len(), 2, "both orders are building");
+        let foreign = view
+            .sim
+            .builds()
+            .values()
+            .find(|b| b.craft.parts.len() == 1)
+            .expect("the tiny foreign record");
+        let ours = view
+            .sim
+            .builds()
+            .values()
+            .find(|b| b.craft.parts.len() != 1)
+            .expect("the armed launch's record");
+        let foreign_complete = foreign.complete_tick;
+        let ours_complete = ours.complete_tick;
+        assert!(
+            foreign_complete < ours_complete,
+            "the tiny craft must deliver first for this test to mean anything"
+        );
+
+        // The foreign delivery fires — the arm must NOT move.
+        view.begin_frame();
+        let report = view.sim_step(foreign_complete).expect("advance");
+        assert!(
+            report
+                .fired_events
+                .iter()
+                .any(|e| matches!(e.kind, csp_sim::EventKind::ConstructionComplete { .. })),
+            "the foreign build delivered"
+        );
+        view.end_frame();
+        assert_eq!(
+            view.revert_tick(),
+            Some(order_tick),
+            "a foreign build's delivery must not move the armed launch's point"
+        );
+        assert!(
+            matches!(
+                view.revert_capture,
+                Some(RevertCapture::AwaitingDelivery { .. })
+            ),
+            "still awaiting the armed build's own boundary"
+        );
+
+        // Clear the foreign hull so the berth is free at our deadline,
+        // then step there: the point moves to OUR delivery tick.
+        let foreign_vessel = *view
+            .sim
+            .vessels()
+            .keys()
+            .next_back()
+            .expect("the foreign hull delivered");
+        view.sim.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::TerminateVessel {
+                vessel: foreign_vessel,
+            },
+        );
+        view.begin_frame();
+        let report = view
+            .sim_step(view.sim.clock().ticks() + 1)
+            .expect("advance");
+        assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+        view.end_frame();
+        view.begin_frame();
+        view.sim_step(ours_complete).expect("advance");
+        view.end_frame();
+        assert_eq!(
+            view.revert_tick(),
+            Some(ours_complete),
+            "the recapture lands at the ARMED build's delivery tick"
+        );
+        assert!(view.sim.builds().is_empty(), "no build left pending");
+        assert_eq!(
+            view.sim.vessels().len(),
+            1,
+            "only the armed launch's craft parks"
+        );
+    }
+
+    /// The arm must not outlive its order: a `ManufactureCraft` that
+    /// rejects at the drain mints no build and fires no
+    /// `ConstructionComplete`, so `AwaitingDelivery` would wait forever
+    /// — and latch onto an unrelated later firing. Once the consuming
+    /// boundary has run without a matching `command_log` entry the arm
+    /// is gone and the pre-order point stands.
+    #[test]
+    fn revert_arm_disarms_when_the_order_rejects_at_drain() {
+        let mut view = View::new().expect("data/ load");
+        view.seed_starter_craft().expect("starter seed");
+        view.begin_frame();
+        view.sim_step(view.sim.clock().ticks() + 1)
+            .expect("advance");
+        view.end_frame();
+
+        // Arm exactly what `launch_craft` installs, then queue an order
+        // the apply must reject (an unknown launch site). The arm and
+        // the command carry the same `(site, craft)` — the match key —
+        // so only the reject outcome is exercised.
+        let arm_site = csp_data::SiteId::from("csp.test.no-such-site");
+        let arm_craft = tiny_foreign_craft();
+        view.pre_launch = Some(Ok(view.sim.snapshot().expect("snapshot at rest")));
+        view.revert_capture = Some(RevertCapture::AwaitingDelivery {
+            site: arm_site.clone(),
+            craft: arm_craft.clone(),
+            min_build_id: 0,
+            armed_tick: view.sim.clock().ticks(),
+        });
+        view.sim.enqueue(
+            SourceClass::Ui,
+            PLAYER_SOURCE_ID,
+            SimCommand::ManufactureCraft {
+                site: arm_site,
+                craft: arm_craft,
+                build_resources: vec![],
+            },
+        );
+        view.begin_frame();
+        let report = view
+            .sim_step(view.sim.clock().ticks() + 1)
+            .expect("advance");
+        assert!(
+            !report.rejected.is_empty(),
+            "the bogus order must reject at the drain"
+        );
+        view.end_frame();
+        assert!(
+            view.revert_capture.is_none(),
+            "a rejected order must not leave the arm armed"
+        );
+        assert!(
+            view.revert_available(),
+            "the pre-order revert point survives the disarm"
+        );
+        assert!(
+            view.world
+                .resource::<flight::FlightSfx>()
+                .cues
+                .iter()
+                .any(|c| c.text.contains("BUILD ORDER REFUSED")),
+            "the disarm surfaces on the cue channel"
         );
     }
 }
