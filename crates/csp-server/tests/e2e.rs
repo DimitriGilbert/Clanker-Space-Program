@@ -1022,25 +1022,35 @@ async fn ws_subscription_stays_within_byte_budget() {
 
     // The field set the shipped default dashboard subscribes —
     // apps/telemetry's default.json in mirrored form (the comment
-    // documents the coupling).
+    // documents the coupling). The dashboard keys the `focus.*`
+    // indirection rather than `vessels.N` — monotonic ids make a
+    // hard-coded index die on the first recovery (C28-F1).
     let fields = [
         "tick",
         "warp_level",
-        "vessels.0.altitude_m",
-        "vessels.0.speed_mps",
-        "vessels.0.vertical_speed_mps",
-        "vessels.0.horizontal_speed_mps",
-        "vessels.0.apoapsis_altitude_m",
-        "vessels.0.periapsis_altitude_m",
-        "vessels.0.time_to_apoapsis_s",
-        "vessels.0.throttle",
-        "vessels.0.mass_kg",
-        "vessels.0.residence",
-        "vessels.0.pos_m",
-        "vessels.0.vel_mps",
-        "vessels.0.elements",
-        "vessels.0.maneuver_node",
-        "vessels.0.control_lease",
+        "focus_vessel_id",
+        "focus.altitude_m",
+        "focus.speed_mps",
+        "focus.vertical_speed_mps",
+        "focus.apoapsis_altitude_m",
+        "focus.periapsis_altitude_m",
+        "focus.time_to_apoapsis_s",
+        "focus.throttle",
+        "focus.mass_kg",
+        "focus.residence",
+        "focus.pos_m",
+        "focus.elements",
+        "focus.control_lease",
+        "program.funds_micros",
+        "program.science_banked",
+        "program.contract_offers",
+        "program.contracts_active",
+        "program.tech_researched",
+        "program.crew_roster",
+        "program.sites",
+        "program.colonies",
+        "program.scripts",
+        "program.autopilots",
     ];
     let url = format!("ws://{}/ws?token=e2e-token&client=budget", server.addr);
     let (mut ws, _) = tokio_tungstenite::connect_async(url)
@@ -1077,6 +1087,115 @@ async fn ws_subscription_stays_within_byte_budget() {
         "telemetry frame {max_frame} B over the 16 Hz × 16 KiB budget"
     );
     server.shutdown();
+}
+
+/// C28-F1 over the wire: the `focus.*` indirection must re-key when
+/// the focused vessel leaves the arena — a `vessels.N` subscription
+/// goes dark forever on monotonic ids, `focus.*` follows the newest
+/// live vessel. `TerminateVessel` stands in for `RecoverVessel` (the
+/// same `remove_vessel` path, without the landed precondition).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ws_focus_rekeys_when_the_focused_vessel_leaves() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite;
+
+    let dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/test-fixtures/flight-launch");
+    let make = move || {
+        let recipe = csp_bench::scenarios::find("flight-launch").expect("recipe");
+        (recipe.initial)(&dir).expect("fixture world")
+    };
+    let (server, _host) = boot_with(make).await;
+    mcp_init(server.addr, None);
+    let spawn = json!({"SpawnVessel": {
+    "parent": "terrin",
+    "elements": {
+        "semi_major_axis_m": 700_000.0, "eccentricity": 0.0,
+        "inclination_rad": 0.0, "ascending_node_rad": 0.0,
+        "arg_periapsis_rad": 0.0, "mean_anomaly_epoch_rad": 0.0,
+        "period_s": 1958.1284360312443
+    }}});
+    let command = |id: u64, cmd: Value| {
+        http(
+            server.addr,
+            "POST",
+            "/mcp",
+            &bearer(),
+            &tool(id, "sim.command", json!({"command": cmd})),
+        )
+    };
+    // Two vessels, focus recorded on the first, then the first leaves.
+    let (_, body) = command(1, spawn.clone());
+    assert!(body.contains("\"isError\":false"), "{body}");
+    let (_, body) = command(2, spawn);
+    assert!(body.contains("\"isError\":false"), "{body}");
+    let (_, body) = command(3, json!({"SetActiveVessel": {"vessel": 0}}));
+    assert!(body.contains("\"isError\":false"), "{body}");
+    // `TerminateVessel` is §2.2.1 control-gated: an `External` client
+    // must hold the vessel's lease — the same `?client=` channel that
+    // issues it acquires `Agent(0)` first (the holder is `Player`, so
+    // a self-acquire is legal).
+    let (_, body) = http(
+        server.addr,
+        "POST",
+        "/mcp",
+        &bearer(),
+        &tool(4, "vessel.take_control", json!({"vessel": 0})),
+    );
+    assert!(body.contains("\"isError\":false"), "{body}");
+    let (_, body) = command(5, json!({"TerminateVessel": {"vessel": 0}}));
+    let v: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(v["result"]["isError"], false, "{body}");
+    // `isError` covers tool failure only — a drain-time lease/unknown
+    // rejection still reports success, so pin the applied-report too.
+    let report: Value =
+        serde_json::from_str(v["result"]["content"][0]["text"].as_str().unwrap_or(""))
+            .expect("report json");
+    assert_eq!(report["rejected"], json!([]), "terminate rejected: {body}");
+
+    // The widget's own read path — a `focus.*` subscription keeps
+    // resolving after the keyed vessel is gone (against vessel 1,
+    // the newest live), while `vessels.0` is honestly unknown.
+    let url = format!("ws://{}/ws?token=e2e-token&client=focus", server.addr);
+    let (mut ws, _) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("ws connect");
+    ws.send(tungstenite::Message::Text(
+        json!({
+            "proto": 1,
+            "kind": "subscribe",
+            "fields": ["focus_vessel_id", "focus.altitude_m", "vessels.0.altitude_m"],
+            "rate_hz": 16,
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("subscribe");
+    for _ in 0..12 {
+        let msg = ws.next().await.expect("frame").expect("ok");
+        let v: Value = serde_json::from_str(&msg.into_text().expect("text")).expect("json");
+        if v["kind"] != "telemetry" {
+            continue;
+        }
+        assert_eq!(
+            v["payload"]["focus_vessel_id"],
+            json!(1),
+            "focus must re-key to the newest live vessel: {v}"
+        );
+        assert!(
+            v["payload"]["focus.altitude_m"].is_number(),
+            "focus.altitude_m must resolve post-removal: {v}"
+        );
+        assert_eq!(
+            v["unknown_fields"],
+            json!(["vessels.0.altitude_m"]),
+            "the dead id reports unknown — the indirection is what hides it: {v}"
+        );
+        server.shutdown();
+        return;
+    }
+    panic!("no telemetry frame arrived");
 }
 
 /// M9d's SPA-serving path end to end (§2.12.3): with a real `spa_dir`

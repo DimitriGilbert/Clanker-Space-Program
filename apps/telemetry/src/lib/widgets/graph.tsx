@@ -2,10 +2,7 @@
 // `window_s` seconds of frames (default 60 s of samples).
 import { useRef, useEffect } from 'react'
 import type { WidgetProps } from './registry'
-
-function num(v: unknown): number | null {
-  return typeof v === 'number' && Number.isFinite(v) ? v : null
-}
+import { num } from '../utils'
 
 /** The rolling buffer's hard bound (C21-F1). `window_s` is free-form
  *  dashboard JSON — `window_s: 3600` at 64 Hz asks for 230,400

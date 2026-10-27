@@ -1,10 +1,7 @@
 // gauge — a single-field numeric readout with unit + optional
 // min/max bar. fields[0] is the value.
 import type { WidgetProps } from './registry'
-
-function num(v: unknown): number | null {
-  return typeof v === 'number' && Number.isFinite(v) ? v : null
-}
+import { num } from '../utils'
 
 export function GaugeWidget({ def, frame }: WidgetProps) {
   const path = def.fields[0]

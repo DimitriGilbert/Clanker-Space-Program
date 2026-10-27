@@ -30,10 +30,14 @@ pub struct TelemetrySnapshot {
     /// Vessel telemetry + control lease, keyed by `VesselId.0` —
     /// `BTreeMap` order is ascending id.
     pub vessels: BTreeMap<u64, SnapshotVessel>,
-    /// The host's focused vessel — `None` when no focus is set (the
-    /// sim has no focus concept; the host records the session's).
-    /// `focus.*` resolves the same row so a dashboard can name
-    /// `focus.altitude_m` instead of hard-coding `vessels.0`.
+    /// The resolved focused vessel — `None` only when the arena is
+    /// empty. Resolution (see [`Self::from_world_focus`]): the host's
+    /// or §2.2 `active_vessel`'s recorded focus while its vessel is
+    /// live, else the newest live vessel. `focus.*` resolves the same
+    /// row so a dashboard can name `focus.altitude_m` instead of
+    /// hard-coding `vessels.0` — vessel ids are monotonic and never
+    /// reused, so a recovery would brick a `vessels.N` dashboard
+    /// forever (C28-F1).
     pub focus_vessel_id: Option<u64>,
     /// The focused vessel's telemetry, duplicated — subscription
     /// paths `focus.<field>` work without knowing the id.
@@ -118,13 +122,23 @@ pub struct SnapshotVessel {
 impl TelemetrySnapshot {
     /// The publish point's build — observation only, one `Arc` per
     /// call, exactly the §2.12.3 "exactly one publish point" shape.
+    /// Focus starts from §2.2's `active_vessel` (the focus record
+    /// `SetActiveVessel` maintains — the sim scrubs it when the named
+    /// vessel leaves the arena); the newest-live fallback in
+    /// [`Self::from_world_focus`] still applies when it is `None`.
     pub fn from_world(world: &World) -> Self {
-        Self::from_world_focus(world, None)
+        Self::from_world_focus(world, world.active_vessel().map(|v| v.0))
     }
 
     /// `from_world` carrying the host's focused vessel — `focus` is
     /// cloned out of `vessels` so `focus.*` paths resolve without the
-    /// client knowing the id.
+    /// client knowing the id. A passed focus that is `None` or names
+    /// a dead id falls back to the newest live vessel (the last
+    /// `BTreeMap` key — ids are monotonic, never reused): a headless
+    /// host has no focus producer at all, and publishing `focus:
+    /// null` while vessels fly would leave every `focus.*`
+    /// subscription dark — the same brick the `vessels.0` hard-coding
+    /// was (C28-F1).
     pub fn from_world_focus(world: &World, focus: Option<u64>) -> Self {
         let vessels: BTreeMap<u64, SnapshotVessel> = world
             .vessels()
@@ -139,8 +153,10 @@ impl TelemetrySnapshot {
                 )
             })
             .collect();
-        let focus_row = focus.and_then(|f| vessels.get(&f).cloned());
-        let focus_vessel_id = focus.filter(|f| vessels.contains_key(f));
+        let focus_vessel_id = focus
+            .filter(|f| vessels.contains_key(f))
+            .or_else(|| vessels.keys().next_back().copied());
+        let focus_row = focus_vessel_id.and_then(|f| vessels.get(&f).cloned());
         let program = ProgramSnapshot {
             funds_micros: world.funds_micros(),
             science_banked: world.science().banked,
@@ -238,8 +254,10 @@ impl TelemetrySnapshot {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // test assertions
 mod tests {
     use super::*;
+    use csp_sim::{SimCommand, SourceClass, VesselId};
 
     #[test]
     fn empty_world_snapshot_projects_scalars() {
@@ -251,5 +269,126 @@ mod tests {
         assert!(unknown.is_empty());
         assert_eq!(out["tick"], serde_json::json!(0));
         assert!(snap.field("vessels.0.altitude_m").is_none());
+    }
+
+    /// The flight-launch fixture world with two spawned rails vessels
+    /// — `VesselId(0)` and `VesselId(1)` (ids are monotonic and never
+    /// reused, the property C28-F1's re-key depends on).
+    fn two_vessel_world() -> World {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../data/test-fixtures/flight-launch");
+        let recipe = csp_bench::scenarios::find("flight-launch").expect("recipe");
+        let mut w = (recipe.initial)(&dir).expect("fixture world");
+        // csp-server never names csp-data's ids/elements types — the
+        // spawn decodes through the same serde_json shape `sim.command`
+        // takes on the wire.
+        let spawn: SimCommand = serde_json::from_value(serde_json::json!({
+            "SpawnVessel": {
+                "parent": "terrin",
+                "elements": {
+                    "semi_major_axis_m": 700_000.0,
+                    "eccentricity": 0.0,
+                    "inclination_rad": 0.0,
+                    "ascending_node_rad": 0.0,
+                    "arg_periapsis_rad": 0.0,
+                    "mean_anomaly_epoch_rad": 0.0,
+                    "period_s": 1958.1284360312443
+                }
+            }
+        }))
+        .expect("spawn command json");
+        for _ in 0..2 {
+            w.enqueue(SourceClass::Ui, 0, spawn.clone());
+        }
+        let t = w.clock().ticks();
+        w.step_frame(t + 1).expect("spawn step");
+        assert!(w.vessels().contains_key(&VesselId(0)));
+        assert!(w.vessels().contains_key(&VesselId(1)));
+        w
+    }
+
+    /// C28-F1: a headless host has no focus producer — `focus.*`
+    /// must still resolve, against the newest live vessel, or the
+    /// shipped dashboard would publish `focus: null` while vessels fly.
+    #[test]
+    fn focus_falls_back_to_newest_live_vessel() {
+        let w = two_vessel_world();
+        assert_eq!(w.active_vessel(), None);
+        let snap = TelemetrySnapshot::from_world(&w);
+        assert_eq!(snap.focus_vessel_id, Some(1));
+        assert!(snap.field("focus.altitude_m").is_some());
+        assert!(snap.field("focus.control_lease").is_some());
+        let fields = vec![
+            "focus_vessel_id".to_string(),
+            "focus.altitude_m".to_string(),
+        ];
+        let (out, unknown) = snap.project(&fields);
+        assert!(unknown.is_empty(), "{unknown:?}");
+        assert_eq!(out["focus_vessel_id"], serde_json::json!(1));
+    }
+
+    /// The recorded §2.2 `active_vessel` wins over the newest-live
+    /// fallback while its vessel is in the arena.
+    #[test]
+    fn focus_tracks_the_active_vessel_record() {
+        let mut w = two_vessel_world();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SetActiveVessel {
+                vessel: Some(VesselId(0)),
+            },
+        );
+        let t = w.clock().ticks();
+        w.step_frame(t + 1).expect("step");
+        let snap = TelemetrySnapshot::from_world(&w);
+        assert_eq!(snap.focus_vessel_id, Some(0));
+        assert!(snap.field("focus.altitude_m").is_some());
+    }
+
+    /// The C28-F1 regression shape: the dashboard's keyed vessel
+    /// leaves the arena (recovery — `TerminateVessel` stands in,
+    /// same `remove_vessel` path without the landed precondition) and
+    /// every `focus.*` path must keep resolving against a live vessel
+    /// instead of going "unknown field" forever.
+    #[test]
+    fn focus_rekeys_when_the_focused_vessel_leaves() {
+        let mut w = two_vessel_world();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SetActiveVessel {
+                vessel: Some(VesselId(0)),
+            },
+        );
+        let t = w.clock().ticks();
+        w.step_frame(t + 1).expect("step");
+        // `TerminateVessel` is §2.2.1 control-gated — `Ui` preempts
+        // (the player's removal verb); an `External` source would
+        // need the vessel's lease first.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::TerminateVessel {
+                vessel: VesselId(0),
+            },
+        );
+        let t = w.clock().ticks();
+        w.step_frame(t + 1).expect("step");
+        assert_eq!(w.active_vessel(), None, "removal scrubs the record");
+        let snap = TelemetrySnapshot::from_world(&w);
+        // Re-keyed to the surviving vessel — and `vessels.0` is gone
+        // for good (monotonic ids), the failure the focus indirection
+        // exists to hide.
+        assert_eq!(snap.focus_vessel_id, Some(1));
+        assert!(snap.field("focus.altitude_m").is_some());
+        assert!(snap.field("vessels.0.altitude_m").is_none());
+        // The program half stays subscribable through the same event.
+        let fields = vec![
+            "focus.altitude_m".to_string(),
+            "program.funds_micros".to_string(),
+        ];
+        let (_out, unknown) = snap.project(&fields);
+        assert!(unknown.is_empty(), "{unknown:?}");
     }
 }

@@ -1,6 +1,6 @@
 // M9d — the widget registry: kind → renderer. The server's
-// dashboard.rs mirrors the kind list (`WIDGET_KINDS`); adding a kind
-// is additive in both places.
+// dashboard.rs mirrors the kind set (its own `WIDGET_KINDS` —
+// this module's map keys); adding a kind is additive in both places.
 import type { ComponentType } from 'react'
 import type { TelemetryFrame } from '../ws'
 import type { WidgetDef, WidgetKind } from '../dashboard'
@@ -27,5 +27,3 @@ export const WIDGET_REGISTRY: Record<WidgetKind, ComponentType<WidgetProps>> = {
   table: TableWidget,
   'orbit-map': OrbitMapWidget,
 }
-
-export const WIDGET_KINDS = Object.keys(WIDGET_REGISTRY) as WidgetKind[]

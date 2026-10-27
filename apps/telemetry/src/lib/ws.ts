@@ -13,6 +13,8 @@
 // `csp-token` meta tag, or `VITE_CSP_TOKEN` under `vite dev`. When
 // none is present the page renders a first-boot token gate.
 
+import { asRecord, num } from './utils'
+
 export const WIRE_PROTO = 1
 /** The 64-Hz divisors — pinned to the server's `VALID_RATES`
  *  (csp-server/src/dashboard.rs); a stored `rate_hz` outside the set
@@ -59,6 +61,18 @@ export interface TelemetryClientOptions {
    *  transient socket drop — after a restart the token gate asks for
    *  the new token. `false` disables retries. */
   reconnect?: Partial<ReconnectPolicy> | false
+}
+
+/** The subscription's handle — `close` stops it, `retry` is the
+ *  manual affordance after the bounded policy gives up (C28-F6). */
+export interface TelemetryHandle {
+  /** Stop the stream — no further reconnects, callbacks, or retries. */
+  close: () => void
+  /** Re-open now: resets the attempt budget and connects immediately
+   *  (also legal while a backoff timer is pending — it skips the
+   *  wait). No-op once closed. A server *restart* still rotates the
+   *  token — retry recovers transient drops only. */
+  retry: () => void
 }
 
 const DEFAULT_RECONNECT: ReconnectPolicy = {
@@ -143,11 +157,22 @@ export function clearCspToken(): void {
   }
 }
 
-/** Open the subscription; returns a close handle. On a socket drop the
- *  frame is reported stale (`onFrame(null)`), then bounded reconnect
- *  re-opens and re-subscribes with the same fields — see
- *  [`TelemetryClientOptions.reconnect`] for the server-restart caveat. */
-export function subscribeTelemetry(opts: TelemetryClientOptions): () => void {
+/** `unknown_fields`' element check — the wire lists every declared
+ *  path the snapshot could not resolve; anything else is dropped. */
+function stringList(v: unknown): string[] {
+  return Array.isArray(v)
+    ? v.filter((x): x is string => typeof x === 'string')
+    : []
+}
+
+/** Open the subscription; returns the [`TelemetryHandle`]. On a
+ *  socket drop the frame is reported stale (`onFrame(null)`), then
+ *  bounded reconnect re-opens and re-subscribes with the same fields
+ *  — see [`TelemetryClientOptions.reconnect`] for the server-restart
+ *  caveat and [`TelemetryHandle.retry`] for the manual path back. */
+export function subscribeTelemetry(
+  opts: TelemetryClientOptions,
+): TelemetryHandle {
   // A persisted/hand-assembled `rate_hz` outside the pinned divisor
   // set would just earn a server refusal — degrade to the default
   // locally so a bad stored value still subscribes.
@@ -185,45 +210,54 @@ export function subscribeTelemetry(opts: TelemetryClientOptions): () => void {
       )
     }
     ws.onmessage = (ev) => {
-      let msg: any
+      // The wire boundary stays `unknown` — JSON.parse is untrusted
+      // input, so every field read below runs through a narrowing
+      // guard (`asRecord`/`num`/`stringList`) instead of trusting an
+      // `any` (C28-F7).
+      let msg: unknown
       try {
         msg = JSON.parse(String(ev.data))
       } catch {
         return
       }
+      const env = asRecord(msg)
+      if (env === null) return
       // Inbound `proto` gate: the server stamps `proto` on every
       // envelope and enforces it client→server; a mismatch is a
       // wire-version break (the `proto` bump contract), never a frame
       // to dispatch on `kind` alone.
-      if (msg?.proto !== WIRE_PROTO) {
+      if (env.proto !== WIRE_PROTO) {
         // A wire-version break means no usable stream — mark the frame
         // stale too, so the UI doesn't paint live-looking data under
         // the error state.
         opts.onFrame(null)
         opts.onState?.(
           'error',
-          `wire proto ${String(msg?.proto)} — client speaks ${WIRE_PROTO}`,
+          `wire proto ${String(env.proto)} — client speaks ${WIRE_PROTO}`,
         )
         return
       }
-      if (msg.kind === 'telemetry') {
+      if (env.kind === 'telemetry') {
         opts.onFrame({
-          seq: msg.seq ?? 0,
-          tick: msg.tick ?? 0,
-          payload: msg.payload ?? {},
-          unknown_fields: msg.unknown_fields ?? [],
+          seq: num(env.seq) ?? 0,
+          tick: num(env.tick) ?? 0,
+          payload: asRecord(env.payload) ?? {},
+          unknown_fields: stringList(env.unknown_fields),
         })
-      } else if (msg.kind === 'subscribed') {
+      } else if (env.kind === 'subscribed') {
         // A live ack, not `open`, resets the retry budget — a socket
         // that dies mid-handshake must not buy back attempts.
         attempts = 0
-        opts.onRate?.(Number(msg.rate_hz) || rate)
+        opts.onRate?.(num(env.rate_hz) ?? rate)
         opts.onState?.('live')
-      } else if (msg.kind === 'error') {
+      } else if (env.kind === 'error') {
         // A protocol-level refusal (bad fields/rate/proto) means no
         // stream follows — mark the frame stale, don't keep painting.
         opts.onFrame(null)
-        opts.onState?.('error', String(msg.error ?? 'server error'))
+        opts.onState?.(
+          'error',
+          typeof env.error === 'string' ? env.error : 'server error',
+        )
       }
     }
     ws.onerror = () => {
@@ -258,9 +292,40 @@ export function subscribeTelemetry(opts: TelemetryClientOptions): () => void {
   }
 
   connect()
-  return () => {
-    stopped = true
-    if (timer !== undefined) clearTimeout(timer)
-    ws?.close()
+
+  // Detaching before `close()` keeps the replaced socket's onclose
+  // from racing a fresh reconnect timer onto the ledger — a stale
+  // socket's handlers belong to its own lifecycle only.
+  const detach = (s: WebSocket) => {
+    s.onopen = null
+    s.onmessage = null
+    s.onerror = null
+    s.onclose = null
+  }
+
+  return {
+    close: () => {
+      stopped = true
+      if (timer !== undefined) clearTimeout(timer)
+      ws?.close()
+    },
+    // The manual affordance for the give-up state (C28-F6) — and a
+    // "retry now" for a pending backoff: reset the budget, drop the
+    // current socket (detached so its close schedules nothing), and
+    // connect immediately.
+    retry: () => {
+      if (stopped) return
+      if (timer !== undefined) {
+        clearTimeout(timer)
+        timer = undefined
+      }
+      attempts = 0
+      if (ws) {
+        detach(ws)
+        ws.close()
+        ws = undefined
+      }
+      connect()
+    },
   }
 }

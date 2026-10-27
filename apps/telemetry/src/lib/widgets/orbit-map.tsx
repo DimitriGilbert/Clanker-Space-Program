@@ -15,10 +15,7 @@
 // marker's out-of-plane component is dropped, which is exact while
 // the vessel is on its conic).
 import type { WidgetProps } from './registry'
-
-function num(v: unknown): number | null {
-  return typeof v === 'number' && Number.isFinite(v) ? v : null
-}
+import { asRecord, num } from '../utils'
 
 interface Elements {
   semi_major_axis_m?: number
@@ -28,18 +25,57 @@ interface Elements {
   arg_periapsis_rad?: number
 }
 
+interface Vec3 {
+  x?: number
+  y?: number
+  z?: number
+}
+
+/** The wire-value → `Elements` decode: a record's numeric fields,
+ *  anything else is `null` (the "no conic" branch). Replaces the old
+ *  `as` cast — the payload off the wire is `unknown`, not typed. */
+function asElements(v: unknown): Elements | null {
+  const r = asRecord(v)
+  if (r === null) return null
+  return {
+    semi_major_axis_m: num(r.semi_major_axis_m) ?? undefined,
+    eccentricity: num(r.eccentricity) ?? undefined,
+    inclination_rad: num(r.inclination_rad) ?? undefined,
+    ascending_node_rad: num(r.ascending_node_rad) ?? undefined,
+    arg_periapsis_rad: num(r.arg_periapsis_rad) ?? undefined,
+  }
+}
+
+/** Same decode for `pos_m` — `{x,y,z}` numbers or `null`. */
+function asVec3(v: unknown): Vec3 | null {
+  const r = asRecord(v)
+  if (r === null) return null
+  return {
+    x: num(r.x) ?? undefined,
+    y: num(r.y) ?? undefined,
+    z: num(r.z) ?? undefined,
+  }
+}
+
 export function OrbitMapWidget({ def, frame }: WidgetProps) {
   const elementsPath: string | undefined = def.fields[0]
   const posPath: string | undefined = def.fields[1]
   const unknown = frame?.unknown_fields ?? []
-  const elements = (
-    elementsPath !== undefined ? frame?.payload[elementsPath] : null
-  ) as Elements | null | undefined
-  const pos = (
-    posPath !== undefined ? frame?.payload[posPath] : null
-  ) as { x?: number; y?: number; z?: number } | null | undefined
+  const elements =
+    elementsPath !== undefined ? asElements(frame?.payload[elementsPath]) : null
+  const pos = posPath !== undefined ? asVec3(frame?.payload[posPath]) : null
 
-  if (elementsPath === undefined || unknown.includes(elementsPath)) {
+  if (elementsPath === undefined) {
+    // Same explanatory shape the fields[1] branch below uses — a
+    // dashboard that declares no elements path is a config gap, not
+    // a resolved-but-unknown field.
+    return (
+      <div className="widget-unknown flex-1">
+        elements: no fields[0] configured — dashboard gap
+      </div>
+    )
+  }
+  if (unknown.includes(elementsPath)) {
     return (
       <div className="widget-unknown flex-1">
         unknown field {elementsPath}
@@ -65,11 +101,16 @@ export function OrbitMapWidget({ def, frame }: WidgetProps) {
     return <div className="widget-unknown flex-1">open conic — not drawn</div>
   }
   // Project the conic into the SVG frame: semi-major along the
-  // periapsis direction, scaled so apoapsis fits the viewbox.
+  // periapsis direction, scaled so apoapsis — `ra`, the ellipse's
+  // farthest point from the focus — fits BOTH viewbox axes with the
+  // same 12 px margin (focus sits at (100, 80) in a 200×160 box:
+  // x-budget 88, y-budget 68). The old x-only scale clipped
+  // near-circular orbits top/bottom by up to 8 px — a parking orbit
+  // rendered as a cut ring (C28-F5).
   const b = a * Math.sqrt(Math.max(0, 1 - e * e))
   const ra = a * (1 + e)
   const c = a * e
-  const scale = 88 / ra
+  const scale = Math.min(88, 68) / ra
   const cos = Math.cos(omega)
   const sin = Math.sin(omega)
   // Ellipse centre offset from focus by c toward -periapsis.
@@ -84,9 +125,9 @@ export function OrbitMapWidget({ def, frame }: WidgetProps) {
   let vy: number | null = null
   const posUnknown = posPath === undefined || unknown.includes(posPath)
   if (pos && !posUnknown) {
-    const x = num(pos.x)
-    const y = num(pos.y)
-    const z = num(pos.z)
+    const x = pos.x ?? null
+    const y = pos.y ?? null
+    const z = pos.z ?? null
     if (x !== null && y !== null && z !== null) {
       const co = Math.cos(node)
       const so = Math.sin(node)

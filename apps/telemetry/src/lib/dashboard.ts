@@ -5,6 +5,7 @@
 // lays out fields, never mutates the sim.
 
 import { cspToken } from './ws'
+import { asRecord } from './utils'
 
 export const DASHBOARD_SCHEMA_VERSION = 1
 
@@ -65,6 +66,24 @@ export interface LoadedDashboard {
 
 async function bundledDefault(): Promise<Dashboard> {
   return (await import('../../dashboards/default.json')).default as Dashboard
+}
+
+/** The stored dashboard names — `GET /api/dashboards`, the server's
+ *  `{"dashboards": […]}` shape. The list is chrome, not data: an
+ *  unreachable or unconfigured store, a refusal, or a malformed body
+ *  all resolve to `[]`, and the switcher simply doesn't render. */
+export async function listDashboards(): Promise<string[]> {
+  try {
+    const res = await apiFetch('/api/dashboards')
+    if (!res.ok) return []
+    const body = asRecord(await res.json())
+    if (body === null || !Array.isArray(body.dashboards)) return []
+    return body.dashboards.filter(
+      (n): n is string => typeof n === 'string',
+    )
+  } catch {
+    return []
+  }
 }
 
 /** Load the named dashboard. Falls back to the bundled default for a

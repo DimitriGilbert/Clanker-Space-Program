@@ -8,7 +8,7 @@
       "id": "altitude",
       "kind": "gauge",
       "title": "Altitude",
-      "fields": ["vessels.0.altitude_m"],
+      "fields": ["focus.altitude_m"],
       "rect": { "x": 0, "y": 0, "w": 3, "h": 2 },
       "options": { "unit": "m", "min": 0, "max": 120000 }
     },
@@ -16,7 +16,7 @@
       "id": "speed",
       "kind": "gauge",
       "title": "Speed",
-      "fields": ["vessels.0.speed_mps"],
+      "fields": ["focus.speed_mps"],
       "rect": { "x": 3, "y": 0, "w": 3, "h": 2 },
       "options": { "unit": "m/s", "min": 0, "max": 3000 }
     },
@@ -24,7 +24,7 @@
       "id": "throttle",
       "kind": "gauge",
       "title": "Throttle",
-      "fields": ["vessels.0.throttle"],
+      "fields": ["focus.throttle"],
       "rect": { "x": 6, "y": 0, "w": 3, "h": 2 },
       "options": { "min": 0, "max": 1 }
     },
@@ -33,10 +33,10 @@
       "kind": "table",
       "title": "Orbit",
       "fields": [
-        "vessels.0.apoapsis_altitude_m",
-        "vessels.0.periapsis_altitude_m",
-        "vessels.0.time_to_apoapsis_s",
-        "vessels.0.residence"
+        "focus.apoapsis_altitude_m",
+        "focus.periapsis_altitude_m",
+        "focus.time_to_apoapsis_s",
+        "focus.residence"
       ],
       "rect": { "x": 9, "y": 0, "w": 3, "h": 4 },
       "options": {}
@@ -45,7 +45,7 @@
       "id": "alt-trace",
       "kind": "graph",
       "title": "Altitude trace",
-      "fields": ["vessels.0.altitude_m"],
+      "fields": ["focus.altitude_m"],
       "rect": { "x": 0, "y": 2, "w": 4, "h": 4 },
       "options": { "window_s": 60 }
     },
@@ -53,7 +53,7 @@
       "id": "vspeed-trace",
       "kind": "graph",
       "title": "Vertical speed",
-      "fields": ["vessels.0.vertical_speed_mps"],
+      "fields": ["focus.vertical_speed_mps"],
       "rect": { "x": 4, "y": 2, "w": 5, "h": 4 },
       "options": { "window_s": 60 }
     },
@@ -61,7 +61,7 @@
       "id": "orbit",
       "kind": "orbit-map",
       "title": "Orbit map",
-      "fields": ["vessels.0.elements", "vessels.0.pos_m"],
+      "fields": ["focus.elements", "focus.pos_m"],
       "rect": { "x": 9, "y": 4, "w": 3, "h": 4 },
       "options": {}
     },
@@ -69,8 +69,32 @@
       "id": "world",
       "kind": "table",
       "title": "World",
-      "fields": ["tick", "warp_level", "vessels.0.mass_kg", "vessels.0.control_lease"],
+      "fields": ["tick", "warp_level", "focus_vessel_id", "focus.mass_kg", "focus.control_lease"],
       "rect": { "x": 0, "y": 6, "w": 4, "h": 2 },
+      "options": {}
+    },
+    {
+      "id": "program",
+      "kind": "table",
+      "title": "Program",
+      "fields": [
+        "program.funds_micros",
+        "program.science_banked",
+        "program.contract_offers",
+        "program.contracts_active",
+        "program.tech_researched",
+        "program.crew_roster",
+        "program.sites"
+      ],
+      "rect": { "x": 4, "y": 6, "w": 5, "h": 3 },
+      "options": {}
+    },
+    {
+      "id": "holdings",
+      "kind": "table",
+      "title": "Colonies & Scripts",
+      "fields": ["program.colonies", "program.scripts", "program.autopilots"],
+      "rect": { "x": 9, "y": 8, "w": 3, "h": 3 },
       "options": {}
     }
   ]

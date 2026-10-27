@@ -1,6 +1,11 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { useEffect, useRef, useState } from 'react'
-import { loadDashboard, subscriptionFields, type Dashboard } from '~/lib/dashboard'
+import {
+  listDashboards,
+  loadDashboard,
+  subscriptionFields,
+  type Dashboard,
+} from '~/lib/dashboard'
 import {
   clearCspToken,
   cspToken,
@@ -8,6 +13,7 @@ import {
   subscribeTelemetry,
   type ConnectionState,
   type TelemetryFrame,
+  type TelemetryHandle,
 } from '~/lib/ws'
 import { WIDGET_REGISTRY } from '~/lib/widgets/registry'
 import { Card, CardContent, CardHeader } from '~/components/ui/card'
@@ -16,27 +22,46 @@ export const Route = createFileRoute('/')({ component: DashboardPage })
 
 function DashboardPage() {
   const [token, setToken] = useState(() => cspToken())
+  const [dashName, setDashName] = useState('default')
+  const [dashList, setDashList] = useState<string[]>([])
   const [dash, setDash] = useState<Dashboard | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [conn, setConn] = useState<ConnectionState>('connecting')
   const [connDetail, setConnDetail] = useState('')
   const [rateHz, setRateHz] = useState(16)
   const frame = useRef<TelemetryFrame | null>(null)
+  // The live subscription handle — the "retry" affordance's target.
+  // A ref (not state): the handle's identity never drives render.
+  const client = useRef<TelemetryHandle | null>(null)
   // The pending-rAF handle for render coalescing (C21-F2): one
   // animation frame collapses a burst of WS messages into a single
   // re-render — see `onFrame` below.
   const raf = useRef<number | null>(null)
   const [, force] = useState(0)
 
+  // The dashboard store's name list — powers the switcher. `[]`
+  // (unconfigured/refused store) just hides it; `default` is always
+  // selectable regardless.
   useEffect(() => {
     if (!token) return
-    let close: (() => void) | undefined
     let cancelled = false
-    loadDashboard('default').then((loaded) => {
+    listDashboards().then((names) => {
+      if (!cancelled) setDashList(names)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [token])
+
+  useEffect(() => {
+    if (!token) return
+    let handle: TelemetryHandle | undefined
+    let cancelled = false
+    loadDashboard(dashName).then((loaded) => {
       if (cancelled) return
       setDash(loaded.dashboard)
       setNotice(loaded.notice ?? null)
-      close = subscribeTelemetry({
+      handle = subscribeTelemetry({
         fields: subscriptionFields(loaded.dashboard),
         rateHz: loaded.dashboard.rate_hz,
         onFrame: (f) => {
@@ -62,10 +87,12 @@ function DashboardPage() {
           setConnDetail(detail ?? '')
         },
       })
+      client.current = handle
     })
     return () => {
       cancelled = true
-      close?.()
+      client.current = null
+      handle?.close()
       // Cancel any queued coalesced render — a rAF that outlives the
       // subscription would force one last setState for a stream that
       // is already closed.
@@ -74,7 +101,7 @@ function DashboardPage() {
         raf.current = null
       }
     }
-  }, [token])
+  }, [token, dashName])
 
   if (!token) {
     return (
@@ -97,9 +124,40 @@ function DashboardPage() {
           {connDetail ? ` — ${connDetail}` : ''}
           {frame.current ? ` · tick ${frame.current.tick}` : ' · no live frame'}
         </span>
+        {/* The manual way back after the bounded reconnect gives up
+            (C28-F6) — "reset token" → re-paste is still there for the
+            rotated-secret case, but a transient drop shouldn't need
+            the ceremony. Also a "retry now" while a backoff timer
+            is pending. */}
+        {(conn === 'closed' || conn === 'error') && (
+          <button
+            type="button"
+            className="text-xs"
+            style={{ color: 'var(--muted)', textDecoration: 'underline' }}
+            onClick={() => client.current?.retry()}
+          >
+            retry
+          </button>
+        )}
+        {/* The stored-dashboard switcher — `listDashboards` answers
+            `[]` for an unconfigured/refused store, which still leaves
+            the bundled 'default' selectable. Switching re-runs the
+            load+subscribe effect via `dashName`. */}
+        <select
+          className="text-xs ml-auto"
+          style={{ color: 'var(--muted)', background: 'transparent' }}
+          value={dashName}
+          onChange={(e) => setDashName(e.target.value)}
+        >
+          {['default', ...dashList.filter((n) => n !== 'default')].map((n) => (
+            <option key={n} value={n}>
+              {n}
+            </option>
+          ))}
+        </select>
         <button
           type="button"
-          className="text-xs ml-auto"
+          className="text-xs"
           style={{ color: 'var(--muted)', textDecoration: 'underline' }}
           onClick={() => {
             clearCspToken()
@@ -115,7 +173,10 @@ function DashboardPage() {
           const C = WIDGET_REGISTRY[w.kind]
           return (
             <Card
-              key={w.id}
+              // Keyed by dashboard AND widget id — a same-id widget in
+              // a different dashboard must remount (graph buffers, or
+              // any per-kind state, belong to the loaded document).
+              key={`${dash?.name ?? ''}:${w.id}`}
               style={{
                 gridColumn: `${w.rect.x + 1} / span ${w.rect.w}`,
                 gridRow: `${w.rect.y + 1} / span ${w.rect.h}`,
