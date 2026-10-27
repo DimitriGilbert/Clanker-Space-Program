@@ -22807,6 +22807,168 @@ mod tests {
         );
     }
 
+    /// C08-F1/C05-F4: `RecoverVessel` against a vessel with a live
+    /// `StartResearch` project finalizes it instead of dropping the
+    /// escrow — the `StopResearch` contract: accrual banks, the
+    /// unconverted remainder returns to the pool and banks with it at
+    /// the recover fraction, the record and its pending event pair
+    /// are gone. (The pad-clear auto-recovery in `csp-view` issues
+    /// this same command, so it rides the same apply.) Contrast with
+    /// vessel *destruction*, which still loses work-in-progress.
+    #[test]
+    fn recover_vessel_finalizes_live_lab_project() {
+        let mut w = science_world();
+        science_vessel(&mut w);
+        let key = science_key("plains", Situation::SpaceLow);
+        run_experiment(&mut w, &key);
+        let d0 = w.vessels()[&VesselId(0)].science.units_at(&key);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::StartResearch {
+                vessel: VesselId(0),
+                lab_node: csp_phys::PartNodeId(0),
+                key: key.clone(),
+                researchers: vec![ResearcherAssign {
+                    crew: CrewId(0),
+                    skill: 3,
+                }],
+            },
+        );
+        let start = w.clock().ticks();
+        let r = w.step_frame(start + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        assert_eq!(
+            w.science().projects.len(),
+            1,
+            "the project must be live going into recovery"
+        );
+        // Run 0.5 s of conversion (R = 3·2 = 6, T = 5 — past the
+        // linear head into the exponential leg), land, and recover
+        // mid-run. The command drains at the `rec` tick, so the
+        // finalize sees elapsed = 0.5 s.
+        let rec = start + 32;
+        w.step_frame(rec).unwrap();
+        w.vessels.get_mut(&VesselId(0)).unwrap().state = VesselState::SurfaceLatched(SurfacePose {
+            body: BodyId::from("p"),
+            latitude_rad: 0.0,
+            longitude_rad: 0.0,
+            altitude_m: 0.0,
+            orientation: DQuat::IDENTITY,
+        });
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RecoverVessel {
+                vessel: VesselId(0),
+                site: None,
+            },
+        );
+        let r = w.step_frame(rec + 1).unwrap();
+        assert!(r.rejected.is_empty(), "recover: {:?}", r.rejected);
+        assert!(!w.vessels().contains_key(&VesselId(0)));
+        // The project state, explicitly: finalized — record gone, and
+        // no orphan Exhausted/Complete pair rides the heap.
+        assert!(
+            w.science().projects.is_empty(),
+            "recovery must finalize the project, not drop it"
+        );
+        assert!(
+            w.event_heap.iter().all(|e| !matches!(
+                e.kind,
+                EventKind::ResearchDataExhausted { .. } | EventKind::ResearchProjectComplete { .. }
+            )),
+            "orphan research events left pending"
+        );
+        // η = 1: the 0.5 s accrual banks plus the remnant returns and
+        // banks at fraction 1.0 (never transmitted) — every escrowed
+        // unit comes home.
+        let rem = research::data_at(d0, 6.0, 5.0, 1.0, 0.5);
+        let accrual = d0 - rem;
+        assert!(
+            accrual > 0.0 && rem > 0.0,
+            "both legs must be non-trivial: accrual {accrual}, remnant {rem}"
+        );
+        assert!(
+            (w.science().banked - (accrual + rem)).abs() < 1e-9,
+            "banked {} vs {}",
+            w.science().banked,
+            accrual + rem
+        );
+        assert!((w.science_now() - d0).abs() < 1e-9, "{}", w.science_now());
+        // And the recovery closed the key — no other vessel pools it
+        // and no live project holds it anymore.
+        assert!(w.science().keys[&key].closed);
+    }
+
+    /// C05-F1 — the §3.2 flagship chain in one test: spawn →
+    /// auto-rails into orbit → run the instrument in space → land →
+    /// `RecoverVessel` banks the pooled science and closes the key.
+    /// The orbital leg rides the `auto_rails_converts_a_coasting_orbiter`
+    /// circular-velocity spawn trick; the surface latch is the suite's
+    /// stamped-state convention (the recover apply reads `VesselState`
+    /// only).
+    #[test]
+    fn recover_vessel_banks_orbital_science() {
+        let mut w = science_world();
+        // Launch: the science craft spawns 200 km up on a clearing
+        // circular conic…
+        let hi = DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0);
+        let v_circ = libm::sqrt(3.5316e12 / hi.norm());
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SpawnPhysicalVessel {
+                craft: science_craft(),
+                pos: hi,
+                rot: csp_core::DQuat::IDENTITY,
+                vel: DVec3::new(0.0, v_circ, 0.0),
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 2).unwrap();
+        // …auto-rails into orbit at the first coasting tick…
+        assert!(
+            w.vessels()[&VesselId(0)].orbit().is_some(),
+            "the coasting orbiter must be on rails"
+        );
+        // …runs the instrument in space (a space situation accepts the
+        // rails residence — the `apply_run_experiment` gate)…
+        let key = science_key("plains", Situation::SpaceLow);
+        run_experiment(&mut w, &key);
+        let pooled = w.vessels()[&VesselId(0)].science.units_at(&key);
+        assert!(pooled > 0.0, "the run must pool data aboard");
+        // …and lands: stamp the homecoming latch, then recover.
+        w.vessels.get_mut(&VesselId(0)).unwrap().state = VesselState::SurfaceLatched(SurfacePose {
+            body: BodyId::from("p"),
+            latitude_rad: 0.0,
+            longitude_rad: 0.0,
+            altitude_m: 0.0,
+            orientation: DQuat::IDENTITY,
+        });
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RecoverVessel {
+                vessel: VesselId(0),
+                site: None,
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "recover: {:?}", r.rejected);
+        assert!(
+            !w.vessels().contains_key(&VesselId(0)),
+            "the recovered hull leaves the world"
+        );
+        // Never transmitted → the full pool banks and the key closes.
+        assert!(
+            (w.science().banked - pooled).abs() < 1e-9,
+            "banked {} vs pooled {pooled}",
+            w.science().banked
+        );
+        assert!(w.science().keys[&key].closed);
+    }
+
     /// The close gate's second-vessel half: recovery closes a key
     /// *program-wide*, so it refuses while another vessel still pools
     /// data at it — the stranded units would trip the snapshot gate's

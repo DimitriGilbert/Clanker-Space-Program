@@ -924,41 +924,98 @@ impl World {
             / (MICROS_PER_FUND as u128))
             .min(u64::MAX as u128) as u64;
         let crew_home: Vec<CrewId> = v.crew.iter().map(|c| c.id).collect();
-        // Pooled science banks at the §3.2 recover fraction per key —
-        // closed only where the closed-key invariant is safe (no
-        // other vessel pools the key, no live project holds it). The
-        // `1 − transmit_ratio` remainder is the per-key blanket
-        // [`crate::research::ScienceKeyState::transmitted`] names: it
-        // applies to all units pooled at recovery, including any
-        // collected after the transmit.
-        let mut science_bank: Vec<(crate::research::DataKey, f64, bool)> = Vec::new();
-        for m in v.science.data.values() {
-            for (key, units) in m {
-                if *units <= 0.0 || !units.is_finite() {
-                    continue;
-                }
-                let prior = self.science.keys.get(key).copied().unwrap_or_default();
-                if prior.closed {
-                    continue;
-                }
-                let fraction = if prior.transmitted {
-                    self.experiments
-                        .get(&key.experiment)
-                        .map_or(0.0, |d| (1.0 - d.transmit_ratio).max(0.0))
-                } else {
-                    1.0
-                };
-                let closable = !self
-                    .vessels
-                    .iter()
-                    .any(|(id, o)| *id != vessel && o.science.units_at(key) > 0.0)
-                    && !self.science.projects.values().any(|p| p.key == *key);
-                science_bank.push((key.clone(), units * fraction, closable));
-            }
-        }
         self.shadow_vessels(shadow);
         self.shadow_economy(shadow);
         self.shadow_science(shadow);
+        // C08-F1: a running lab project holds its data in escrow —
+        // invisible to the pooled loop below, so dropping it with the
+        // vessel (`drop_vessel_projects`'s "no accrual" rule) silently
+        // destroys both the accrued science AND the unconverted
+        // remainder on a recovery the UI frames as banking. Finalize
+        // the vessel's projects at the recovery tick instead — the
+        // `apply_stop_research` contract: accrual banks, the remnant
+        // returns to the pool, where it prices like any pooled unit
+        // (fraction + close rules below). The pending
+        // Exhausted/Complete pair is scrubbed inside
+        // `finalize_projects_on_nodes`, so the heap shadows first; a
+        // lab-less recovery sees an empty set and skips everything.
+        self.shadow_events_whole(shadow);
+        let lab_nodes: std::collections::BTreeSet<csp_phys::PartNodeId> = self
+            .science
+            .projects
+            .values()
+            .filter(|p| p.vessel == vessel)
+            .map(|p| p.lab_node)
+            .collect();
+        if !lab_nodes.is_empty() {
+            let (remnants, lab_banked) =
+                self.finalize_projects_on_nodes(vessel, &lab_nodes, self.clock.ticks());
+            if let Some(v) = self.vessels.get_mut(&vessel) {
+                for (node, key, units) in remnants {
+                    *v.science
+                        .data
+                        .entry(node)
+                        .or_default()
+                        .entry(key)
+                        .or_insert(0.0) += units;
+                }
+            }
+            // The banked accrual pays out at the milestone edge — the
+            // same `credit_science_payout` + ScienceBanked pairing the
+            // pooled loop and the Exhausted firing use.
+            self.credit_science_payout(lab_banked, shadow);
+            if lab_banked > 0.0 {
+                self.notify(
+                    crate::reliability::Notification {
+                        tick: self.clock.ticks(),
+                        vessel: crate::reliability::PROGRAM_VESSEL,
+                        node: None,
+                        kind: crate::reliability::NotificationKind::ScienceBanked {
+                            micros: (lab_banked * 1.0e6) as u64,
+                        },
+                    },
+                    shadow,
+                );
+            }
+        }
+        // Pooled science banks at the §3.2 recover fraction per key —
+        // closed only where the closed-key invariant is safe (no
+        // other vessel pools the key, no live project holds it — the
+        // vessel's own projects finalized above, so their keys are
+        // closeable again). The `1 − transmit_ratio` remainder is the
+        // per-key blanket
+        // [`crate::research::ScienceKeyState::transmitted`] names: it
+        // applies to all units pooled at recovery, including any
+        // collected after the transmit and the lab remnants just
+        // returned above. Computed here, after the finalize: the
+        // remnant return mutates the pool this loop prices.
+        let mut science_bank: Vec<(crate::research::DataKey, f64, bool)> = Vec::new();
+        if let Some(v) = self.vessels.get(&vessel) {
+            for m in v.science.data.values() {
+                for (key, units) in m {
+                    if *units <= 0.0 || !units.is_finite() {
+                        continue;
+                    }
+                    let prior = self.science.keys.get(key).copied().unwrap_or_default();
+                    if prior.closed {
+                        continue;
+                    }
+                    let fraction = if prior.transmitted {
+                        self.experiments
+                            .get(&key.experiment)
+                            .map_or(0.0, |d| (1.0 - d.transmit_ratio).max(0.0))
+                    } else {
+                        1.0
+                    };
+                    let closable = !self
+                        .vessels
+                        .iter()
+                        .any(|(id, o)| *id != vessel && o.science.units_at(key) > 0.0)
+                        && !self.science.projects.values().any(|p| p.key == *key);
+                    science_bank.push((key.clone(), units * fraction, closable));
+                }
+            }
+        }
         if let Some(id) = site
             && let Some(st) = self.economy.sites.get_mut(id)
         {

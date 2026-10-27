@@ -75,6 +75,9 @@
 //! `merge_graphs` preserves primary node ids so primary projects need
 //! no remap; vessel destruction drops its projects and their pending
 //! events without accrual (the lab burned — work-in-progress is lost).
+//! `RecoverVessel` is the carve-out: a *successful* homecoming
+//! finalizes the vessel's projects first (accrual banks, the remnant
+//! returns to the pool and prices with it) — C08-F1.
 //!
 //! # v1 simplifications (documented)
 //!
