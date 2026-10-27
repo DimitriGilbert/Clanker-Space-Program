@@ -1554,12 +1554,42 @@ pub struct View {
     /// evicted entries carry older ticks and can never resurface.
     /// Session state only — never sim state.
     notice_cursor: Option<(u64, u32)>,
-    /// The pre-launch snapshot for revert-to-launch (PLAN:1180 —
+    /// The launch snapshot for revert-to-launch (PLAN:1180 —
     /// "revert is not a reroll": the same pre-drawn θ records ride the
     /// restore, so the same parts still fail at the same Λ). Captured
-    /// in `launch_craft` before the spawn command lands; `Err` text
-    /// records why no revert point exists (a §7.4 snapshot refusal).
+    /// in `launch_craft` before the order's commands enqueue, then
+    /// recaptured at the delivery boundary (see [`RevertCapture`]) —
+    /// `launch_craft` itself can only ever see the pre-ORDER world,
+    /// its own commands still being pending. `Err` text records why
+    /// no revert point exists (a §7.4 snapshot refusal).
     pre_launch: Option<Result<WorldSnapshot, String>>,
+    /// A launch awaiting its delivery-boundary recapture — see
+    /// [`RevertCapture`]. Session state tied to this session's launch
+    /// press: `rebuild_from_snapshot` clears it alongside `pre_launch`
+    /// so a loaded world's next `ConstructionComplete` cannot write
+    /// itself in as a revert point the loaded session never ordered.
+    revert_capture: Option<RevertCapture>,
+}
+
+/// The launch revert point's delivery-boundary recapture (PLAN:1177-1180
+/// — the sim contract at `manufacture.rs` expects the post-delivery
+/// snapshot: a retry of the flying, never a re-pay of the build wait).
+/// `launch_craft` can only snapshot the pre-ORDER world — its own
+/// commands are still pending at that point — so `sim_step` re-takes
+/// the point once the `ConstructionComplete` firing lands the craft
+/// surface-latched on the pad.
+#[derive(Clone, Copy, Debug)]
+enum RevertCapture {
+    /// Order enqueued; armed for the delivery firing. The site-less
+    /// `SpawnPhysicalVessel` fallback has no delivery event — it never
+    /// leaves this state, and the launch-time capture stays the point.
+    AwaitingDelivery,
+    /// The firing was seen; retry the §7.4 snapshot every `sim_step`
+    /// until the boundary admits one — a transient refusal (live
+    /// contacts on another vessel, a joint island) must not strand the
+    /// point at the pre-order capture, which is the "revert un-pays
+    /// the build" hole this recapture exists to close.
+    Delivered,
 }
 
 /// Replace the session's sim with a world rebuilt from `snapshot`,
@@ -1591,6 +1621,15 @@ fn rebuild_from_snapshot(
         .collect();
     view.sim = sim;
     view.notice_cursor = None;
+    // The revert point belongs to the world being replaced — a load
+    // must never let F10/Game-menu revert resurrect the previous
+    // session's snapshot over the loaded world (C21-F5/C22-F1), and a
+    // stale delivery arm must not turn the loaded world's next
+    // construction into a revert point it never launched.
+    // `revert_to_launch` re-arms its own point after this call — that
+    // restore IS the armed session's point.
+    view.pre_launch = None;
+    view.revert_capture = None;
     view.world
         .insert_resource(flight::LatchedWeldCache::default());
     view.world.insert_resource(flight::StagePlans::default());
@@ -2106,6 +2145,7 @@ impl View {
             demo: false,
             notice_cursor: None,
             pre_launch: None,
+            revert_capture: None,
         }
     }
 
@@ -2166,6 +2206,30 @@ impl View {
         let start = self.sim.clock().ticks();
         let report = self.sim.step_frame(target_tick)?;
         self.ticks_last_frame = report.reached_tick - start;
+        // The launch revert point's delivery boundary (PLAN:1177-1180 —
+        // the sim contract at `manufacture.rs` expects the post-delivery
+        // snapshot): `launch_craft` captured the pre-ORDER world — its
+        // own commands were necessarily still pending there — so the
+        // point is re-taken once `ConstructionComplete` lands the craft
+        // surface-latched. `Delivered` retries every step until the
+        // §7.4 boundary admits a snapshot: a transient refusal (live
+        // contacts, a joint island, a partial drain) must not strand
+        // the point at the pre-order capture, which is the "revert
+        // un-pays the build" hole this recapture exists to close.
+        if matches!(self.revert_capture, Some(RevertCapture::AwaitingDelivery))
+            && report
+                .fired_events
+                .iter()
+                .any(|e| matches!(e.kind, csp_sim::EventKind::ConstructionComplete { .. }))
+        {
+            self.revert_capture = Some(RevertCapture::Delivered);
+        }
+        if matches!(self.revert_capture, Some(RevertCapture::Delivered))
+            && let Ok(snap) = self.sim.snapshot()
+        {
+            self.pre_launch = Some(Ok(snap));
+            self.revert_capture = None;
+        }
         // The focus pin's drain-reject release (P04-F2): `end_frame`
         // covers the pinned vessel gone from the arena and
         // `flight_present` the staged-then-left case, but a `ToBubble`
@@ -2963,6 +3027,18 @@ impl View {
         ) {
             return Err(reason);
         }
+        // PLAN:1180's revert point — the world as it stood before this
+        // launch press. It MUST be taken here, before the order's
+        // commands enqueue: a snapshot after the `RecoverVessel` /
+        // `ManufactureCraft` enqueues refuses at the §7.4 boundary
+        // ("commands pending at serialization boundary") and leaves a
+        // parked-build launch with no revert point at all. The
+        // delivery-boundary recapture in `sim_step` (`RevertCapture`)
+        // replaces this point when the build lands — a revert retries
+        // the flying, never re-pays the wait. A §7.4 refusal here is
+        // still recorded verbatim: the revert verb then names its own
+        // refusal instead of silently missing.
+        self.pre_launch = Some(self.sim.snapshot().map_err(|e| e.to_string()));
         // The parked build clears the pad before the new craft's
         // delivery lands — the recovery is a normal logged command that
         // credits its value back, then the build order proceeds.
@@ -2988,11 +3064,6 @@ impl View {
         // delivery mints the `VesselId` at its event — `StagePlan`'s
         // `(min_id, fingerprint)` binding tolerates exactly this late
         // materialization).
-        // PLAN:1180's revert point — the world as it stood before this
-        // launch order enqueued. A §7.4 refusal (pending queue, live
-        // contacts, live joints) is recorded verbatim: the revert verb
-        // then names its own refusal instead of silently missing.
-        self.pre_launch = Some(self.sim.snapshot().map_err(|e| e.to_string()));
         let plan = flight::StagePlan::for_launch(stage_plan, &self.sim, &craft);
         if let Some(site) = site {
             // §3.5's honest path: the LAUNCH click is a build order —
@@ -3021,6 +3092,13 @@ impl View {
                     build_resources,
                 },
             );
+            // Arm the delivery-boundary recapture: `sim_step` moves the
+            // revert point from the pre-order world to the
+            // `ConstructionComplete` tick — the paid world with the
+            // craft parked — so a revert retries the flying instead of
+            // refunding the order (the site-less fallback below keeps
+            // its pre-spawn point: it has no delivery event).
+            self.revert_capture = Some(RevertCapture::AwaitingDelivery);
             self.flight_notice(format!(
                 "BUILD ORDER PLACED — delivery in {}",
                 csp_ui::fmt_period(mass / rate.max(f64::MIN_POSITIVE))
@@ -3123,7 +3201,15 @@ impl View {
                 ));
             }
         };
-        rebuild_from_snapshot(self, snapshot)
+        // `rebuild_from_snapshot` clears `pre_launch` (a load must
+        // never resurrect another session's point) — this restore IS
+        // that point's own world, so re-arm it: revert stays
+        // repeatable, a second press returning to the same pad-bound
+        // state rather than reporting "nothing launched yet" while the
+        // delivered craft sits on the pad.
+        let warnings = rebuild_from_snapshot(self, snapshot.clone())?;
+        self.pre_launch = Some(Ok(snapshot));
+        Ok(warnings)
     }
 
     /// A fresh world — new game. Native loads `data/` again; the §6.3
@@ -6012,5 +6098,146 @@ mod tests {
         let decoded = save::decode_save(&bytes).unwrap();
         view.load_game(decoded.snapshot).unwrap();
         assert_eq!(view.sim.state_hash().unwrap(), hash);
+    }
+
+    /// C21-F1: a parked build occupying the pad must not kill the
+    /// revert point — `launch_craft` captures it BEFORE enqueueing the
+    /// `RecoverVessel` that clears the berth, so the §7.4
+    /// "commands pending at serialization boundary" refusal can never
+    /// fire on this path.
+    #[test]
+    fn parked_build_launch_keeps_revert_available() {
+        let mut view = View::new().expect("data/ load");
+        view.seed_starter_craft().expect("starter seed");
+        view.begin_frame();
+        view.sim_step(view.sim.clock().ticks() + 8).unwrap();
+        view.end_frame();
+        assert_eq!(view.sim.vessels().len(), 1, "the seed parked one craft");
+
+        // LAUNCH with the pad occupied: the occupant's RecoverVessel
+        // enqueue used to poison the snapshot capture that followed it.
+        view.launch_craft().expect("launch places the order");
+        assert!(
+            view.revert_available(),
+            "a parked-build launch still holds a revert point"
+        );
+        assert!(view.revert_reason().is_none());
+
+        // …and the point survives the order drain intact.
+        view.begin_frame();
+        let report = view
+            .sim_step(view.sim.clock().ticks() + 1)
+            .expect("advance");
+        assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+        view.end_frame();
+        assert!(view.revert_available());
+    }
+
+    /// C21-F3: the revert point lives at the DELIVERY boundary
+    /// (`manufacture.rs`'s post-delivery contract — "a retry of the
+    /// flying", PLAN:1180), not the pre-order world: a revert after
+    /// `ConstructionComplete` keeps the paid build's product latched on
+    /// the pad and debits nothing again. The pad is cleared first
+    /// (empty-berth launch) so the funds delta is the order's own
+    /// debit — a launch-site `RecoverVessel` refunds at 1.0 efficiency
+    /// and would net the funds comparison to ~zero.
+    #[test]
+    fn revert_after_delivery_does_not_repay_the_build() {
+        let mut view = View::new().expect("data/ load");
+        view.seed_starter_craft().expect("starter seed");
+        // Free the berth so this launch carries no recovery credit.
+        view.sim.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::TerminateVessel {
+                vessel: csp_sim::VesselId(0),
+            },
+        );
+        view.begin_frame();
+        let report = view
+            .sim_step(view.sim.clock().ticks() + 1)
+            .expect("advance");
+        assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+        view.end_frame();
+        let funds0 = view.sim.funds_micros();
+
+        view.launch_craft().expect("launch places the order");
+        // The interim point is the pre-ORDER capture — its tick is
+        // before the order drains, which is what makes the delivery
+        // boundary assertion below non-vacuous.
+        let order_tick = view.revert_tick().expect("launch arms a point");
+        view.begin_frame();
+        let report = view
+            .sim_step(view.sim.clock().ticks() + 1)
+            .expect("advance");
+        assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+        view.end_frame();
+        assert_eq!(view.sim.builds().len(), 1, "the launch is a build order");
+        let complete = view.sim.builds().values().next().unwrap().complete_tick;
+        assert!(complete > order_tick);
+
+        view.begin_frame();
+        let report = view.sim_step(complete).expect("advance");
+        assert!(
+            report
+                .fired_events
+                .iter()
+                .any(|e| matches!(e.kind, csp_sim::EventKind::ConstructionComplete { .. })),
+            "delivery arrives through ConstructionComplete"
+        );
+        view.end_frame();
+
+        // The delivery boundary: the recaptured point IS the delivery
+        // tick, and the world it holds is the paid one — funds debited
+        // once, the craft parked, no build left to wait out.
+        assert_eq!(
+            view.revert_tick(),
+            Some(complete),
+            "the revert point moved to the delivery boundary"
+        );
+        let funds_paid = view.sim.funds_micros();
+        assert!(funds_paid < funds0, "the order debited the craft");
+        view.revert_to_launch().expect("revert");
+        assert_eq!(view.sim.clock().ticks(), complete);
+        assert_eq!(
+            view.sim.funds_micros(),
+            funds_paid,
+            "revert restores the paid world — no second debit, no refund"
+        );
+        assert!(
+            view.sim.builds().is_empty(),
+            "revert must not re-arm the build wait"
+        );
+        assert_eq!(
+            view.sim.vessels().len(),
+            1,
+            "the delivered craft is what the revert retries"
+        );
+    }
+
+    /// C21-F5 + C22-F1: `load_game` clears the revert point — a revert
+    /// on a loaded world can never resurrect the prior session's
+    /// launch snapshot over it.
+    #[test]
+    fn load_game_drops_the_prior_sessions_revert_point() {
+        let mut view = View::new().expect("data/ load");
+        view.seed_starter_craft().expect("starter seed");
+        view.begin_frame();
+        view.sim_step(view.sim.clock().ticks() + 1).unwrap();
+        view.end_frame();
+        let save = view.save_game().expect("save at drained boundary");
+
+        view.launch_craft().expect("launch A places the order");
+        assert!(view.revert_available(), "launch A armed a point");
+
+        view.load_game(save.snapshot).expect("load B");
+        assert!(
+            !view.revert_available(),
+            "the loaded world carries no revert point"
+        );
+        assert!(
+            view.revert_to_launch().is_err(),
+            "revert refuses — session B never launched"
+        );
     }
 }
