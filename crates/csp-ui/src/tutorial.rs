@@ -57,6 +57,15 @@ impl TutorialStep {
 /// arrive.
 pub const STEP_LAUNCH: usize = 2;
 
+/// Index of the first science-tier step — the boundary the
+/// vessel-loss rewind keys on. The flight tier above it measures
+/// live telemetry only a surviving vessel produces (throttle,
+/// altitude, closed apsides); this tier's predicates read the
+/// program ledger — pooled, banked, spent — which outlives the ship
+/// that earned it (C23-F3). Must index [`STEPS`]' "Run a science
+/// experiment" entry.
+pub const SCIENCE_TIER_START: usize = 7;
+
 /// The climb milestone altitude (m).
 pub const CLIMB_ALT_M: f64 = 10_000.0;
 
@@ -212,9 +221,11 @@ pub struct TutorialState {
     /// Every step completed — the overlay switches to the
     /// congratulation card.
     pub finished: bool,
-    /// A vessel the tutorial was tracking left the bubble while a
-    /// flight step was pending — the overlay's "vessel lost" banner;
-    /// the step rewound to [`STEP_LAUNCH`].
+    /// A vessel the tutorial was tracking left the bubble while the
+    /// pending step still needed one — the overlay's "vessel lost"
+    /// banner; the step rewound to the tier's resumable checkpoint
+    /// ([`STEP_LAUNCH`] on the flight tier, [`SCIENCE_TIER_START`]
+    /// on the science tier).
     pub vessel_lost: bool,
     /// Peak altitude observed (m) — the overlay's progress readout.
     pub best_alt_m: f64,
@@ -241,13 +252,20 @@ impl Default for TutorialState {
 impl TutorialState {
     /// Fold one frame's staged progress snapshot into the checklist.
     ///
-    /// - *rewind*: a lost vessel mid-flight-steps steps back to
-    ///   [`STEP_LAUNCH`] and sets `vessel_lost` — the tutorial re-guides
-    ///   instead of waiting on telemetry that never comes;
-    /// - *advance*: every step whose predicate the snapshot already
-    ///   satisfies completes in one pass — a player who skipped ahead
-    ///   (launched the stock craft, loaded a finished craft file) sees
-    ///   the checklist catch up, not nag;
+    /// - *advance first*: every step whose predicate the snapshot
+    ///   already satisfies completes before a vessel loss is judged —
+    ///   a player who skipped ahead sees the checklist catch up, and
+    ///   the coached "land and 'recover'" banks pooled science while
+    ///   removing the ship in the same sim apply, so that frame
+    ///   (`has_vessel: false`, banked science on the ledger) must
+    ///   complete the pending step, not rewind it (C23-F3);
+    /// - *rewind*: a lost vessel steps back only to the checkpoint
+    ///   the coached path can still resume from — [`STEP_LAUNCH`]
+    ///   while a telemetry step is pending, [`SCIENCE_TIER_START`]
+    ///   when the ship went down with an unbanked record — and sets
+    ///   `vessel_lost`. Banked science carries the science tier
+    ///   vessel-free, so a deliberate recovery is progress, not a
+    ///   loss;
     /// - *latch*: `finished` is sticky — a completed tutorial is not
     ///   un-completed by a later crash.
     pub fn observe(&mut self, input: &TutorialInput) {
@@ -261,10 +279,43 @@ impl TutorialState {
         if self.finished {
             return;
         }
-        if self.step > STEP_LAUNCH && !input.has_vessel {
-            self.step = STEP_LAUNCH;
-            self.vessel_lost = true;
+        self.advance(input);
+        if self.finished {
+            return;
         }
+        // The rewind fires only when progress needs a replacement
+        // vessel: a pending telemetry step always does — its
+        // predicate reads live flight state — while a pending
+        // science-tier step does only with an empty ledger (banked
+        // science satisfies the early tier and funds the research
+        // step from the Program window, no ship required). The
+        // checkpoint is the tier's own resumable step, never a full
+        // reset: relaunch for the flight tier; the tier's first step
+        // for the science tier, where any replacement vessel — even
+        // a pad hopper that never re-flies the ascent — re-runs the
+        // experiment.
+        if !input.has_vessel
+            && self.step > STEP_LAUNCH
+            && (self.step < SCIENCE_TIER_START || input.science_banked <= 0.0)
+        {
+            self.step = if self.step < SCIENCE_TIER_START {
+                STEP_LAUNCH
+            } else {
+                SCIENCE_TIER_START
+            };
+            self.vessel_lost = true;
+            // The rewind may have landed on a step the ledger still
+            // satisfies — re-advance so the checklist never displays
+            // a step the snapshot already passed.
+            self.advance(input);
+        }
+    }
+
+    /// Run the positional advance loop and latch `finished` —
+    /// factored out because [`Self::observe`] applies it before AND
+    /// after the loss rewind: the coached recovery's snapshot must
+    /// complete its pending step before the loss is judged.
+    fn advance(&mut self, input: &TutorialInput) {
         while self.step < STEPS.len() && step_complete(self.step, input) {
             self.step += 1;
         }
@@ -574,6 +625,125 @@ mod tests {
         });
         assert!(!t.vessel_lost);
         assert_eq!(t.step, 3);
+    }
+
+    /// C23-F3 — the coached "land and 'recover'" path banks the
+    /// pooled record and removes the vessel in the same sim apply,
+    /// so the post-recovery frame reads `has_vessel: false` with
+    /// banked science on the ledger. That frame must ADVANCE the
+    /// checklist — the ledger satisfies the pending step vessel-free
+    /// — not rewind it to launch under a spurious "vessel lost"
+    /// banner.
+    #[test]
+    fn coached_recovery_advances_instead_of_rewinding() {
+        let idle = TutorialInput::default();
+        // Fly the flight tier and pool data aboard — the checklist
+        // parks on "Bank the data".
+        let mut t = run_script(&[TutorialInput {
+            has_vessel: true,
+            throttle: 1.0,
+            alt_m: 90_000.0,
+            periapsis_m: Some(80_000.0),
+            atmosphere_top_m: 70_000.0,
+            science_pooled: 10.0,
+            ..idle
+        }]);
+        assert_eq!(t.step, 8);
+        // Landed and recovered: the bank landed, the vessel is gone.
+        t.observe(&TutorialInput {
+            science_banked: 4.0,
+            atmosphere_top_m: 70_000.0,
+            ..idle
+        });
+        assert_eq!(t.step, 9, "banked science must carry the tier");
+        assert!(!t.vessel_lost, "recovery is the coached path, not a loss");
+        // The research node needs no ship — buying it finishes.
+        t.observe(&TutorialInput {
+            science_banked: 4.0,
+            research_spent: true,
+            ..idle
+        });
+        assert!(t.finished);
+        assert!(!t.vessel_lost);
+    }
+
+    /// C23-F3 — the verifier's second shape: the checklist sat on the
+    /// research step when the spent flag arrived on a vessel-free
+    /// frame (the ship was recovered first, then the node bought —
+    /// draining the ledger to zero). The advance must complete the
+    /// tier before the empty-ledger rewind is judged; judging the
+    /// loss first would reopen a finished checklist.
+    #[test]
+    fn research_spent_on_vessel_free_frame_finishes() {
+        let idle = TutorialInput::default();
+        let mut t = run_script(&[TutorialInput {
+            has_vessel: true,
+            throttle: 1.0,
+            alt_m: 90_000.0,
+            periapsis_m: Some(80_000.0),
+            atmosphere_top_m: 70_000.0,
+            science_pooled: 10.0,
+            science_banked: 4.0,
+            ..idle
+        }]);
+        assert_eq!(t.step, 9);
+        t.observe(&TutorialInput {
+            research_spent: true,
+            ..idle
+        });
+        assert!(t.finished);
+        assert!(!t.vessel_lost);
+    }
+
+    /// C23-F3 — the empty-ledger complement: a vessel lost mid
+    /// science-tier with nothing banked can't progress on the ledger,
+    /// so the checklist steps back — but only to the tier's first
+    /// step, where ANY replacement vessel resumes it. Rewinding to
+    /// LAUNCH would re-demand the whole ascent and dead-end a pad
+    /// science run behind the telemetry steps.
+    #[test]
+    fn unbanked_loss_rewinds_to_science_tier_start() {
+        let idle = TutorialInput::default();
+        let mut t = run_script(&[TutorialInput {
+            has_vessel: true,
+            throttle: 1.0,
+            alt_m: 90_000.0,
+            periapsis_m: Some(80_000.0),
+            atmosphere_top_m: 70_000.0,
+            science_pooled: 10.0,
+            ..idle
+        }]);
+        assert_eq!(t.step, 8);
+        // The ship went down with the record aboard — ledger empty.
+        t.observe(&idle);
+        assert_eq!(t.step, SCIENCE_TIER_START);
+        assert!(t.vessel_lost);
+        // A pad hopper re-runs the experiment: the checkpoint is
+        // resumable without re-flying the ascent.
+        t.observe(&TutorialInput {
+            has_vessel: true,
+            science_pooled: 6.0,
+            atmosphere_top_m: 70_000.0,
+            ..idle
+        });
+        assert!(!t.vessel_lost);
+        assert_eq!(t.step, 8);
+        // Transmit banks it; the ship then burns up on the way home —
+        // banked science still carries the tier, no rewind.
+        t.observe(&TutorialInput {
+            science_banked: 4.0,
+            ..idle
+        });
+        assert_eq!(t.step, 9);
+        assert!(!t.vessel_lost);
+    }
+
+    /// The tier constants must index the table entries they name —
+    /// `step_complete` and the loss rewind key on both.
+    #[test]
+    fn tier_constants_index_their_steps() {
+        assert_eq!(STEPS[STEP_LAUNCH].title, "Launch from the pad");
+        assert_eq!(STEPS[SCIENCE_TIER_START].title, "Run a science experiment");
     }
 
     /// `finished` is a latch — a post-orbit crash does not reopen the
