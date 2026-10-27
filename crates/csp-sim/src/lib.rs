@@ -1277,12 +1277,10 @@ pub enum SimCommand {
     /// offers deliberately (a free abandon of ACTIVE contracts
     /// would re-open the free-advance faucet it closes — the
     /// deadline is the active side's exit). `Recoverable` for an
-    /// unknown offer index. Appended last per the enum's
+    /// unknown offer index. Issued by the program window's decline
+    /// button on offer rows. Appended last per the enum's
     /// append-only variant order — the `command_log` stream encodes
     /// variant indices.
-    // ui-unreachable: the program window's decline button is the
-    // fix-plan UI phase's wiring; `sim.command` reaches it until
-    // then.
     DeclineContract {
         /// The offer's index — its `offer_index`, the same id
         /// `AcceptContract` names.
@@ -1295,12 +1293,10 @@ pub enum SimCommand {
     /// `ConstructionComplete`/`ConstructionRetry` — the strict
     /// build↔event pairing makes the scrub mandatory. `Recoverable`
     /// for an unknown `BuildId` (a delivered or already-cancelled
-    /// order names no live record). Appended last per the enum's
-    /// append-only variant order — the `command_log` stream encodes
-    /// variant indices.
-    // ui-unreachable: the FACILITIES build rows carry the order id
-    // but no cancel button yet — the fix-plan's UI phase owns that
-    // wire; `sim.command` reaches it until then.
+    /// order names no live record). Issued by the program window's
+    /// FACILITIES cancel button on in-flight build rows. Appended
+    /// last per the enum's append-only variant order — the
+    /// `command_log` stream encodes variant indices.
     CancelBuild {
         /// The build order to cancel.
         build: manufacture::BuildId,

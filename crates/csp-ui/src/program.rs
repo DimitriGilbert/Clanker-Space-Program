@@ -593,6 +593,16 @@ pub enum ProgramCommand {
         /// The offer index.
         offer: u64,
     },
+    /// Refuse a board offer without accepting → `DeclineContract`
+    /// (C08-F5's un-jam verb: the offer leaves the board and nothing
+    /// pays in either direction). Offer-scope only — an accepted
+    /// contract is NOT a decline target; its only exits are
+    /// completion and the deadline, so the active rows render no
+    /// button.
+    DeclineContract {
+        /// The offer index.
+        offer: u64,
+    },
     /// Run an experiment module in the current context →
     /// `RunExperiment` (view supplies vessel/biome/situation).
     RunExperiment {
@@ -786,6 +796,15 @@ pub enum ProgramCommand {
         /// The predicted optimal departure tick.
         tick: u64,
     },
+    /// Cancel an in-flight manufacture order → `CancelBuild` (the
+    /// C11-F3 exit: the order's BOM restocks the ordering site's
+    /// inventory and its `craft_cost_micros` refund through the
+    /// ledger). Only in-flight orders render the button — a
+    /// delivered build holds no live record to name.
+    CancelBuild {
+        /// The `BuildId` the build row carries.
+        build: u64,
+    },
 }
 
 const MONO: egui::FontId = egui::FontId::monospace(12.0);
@@ -945,77 +964,103 @@ fn contracts_section(
         }
     }
     for offer in &input.offers {
-        ui.horizontal(|ui| {
-            // W2.1: the accept predicate's prereqs gate the button —
-            // a refused accept used to be a silent drain rejection.
-            let hover = if offer.accept_ok {
-                "accept the contract — the advance credits now".to_string()
-            } else {
-                let missing: Vec<&str> = offer
-                    .prereqs
-                    .iter()
-                    .filter(|(met, _)| !*met)
-                    .map(|(_, t)| t.as_str())
-                    .collect();
-                format!("prerequisites unmet: {}", missing.join("; "))
-            };
-            if ui
-                .add_enabled(offer.accept_ok, egui::Button::new("accept").small())
-                .on_hover_text(hover)
-                .clicked()
-            {
-                out.push(ProgramCommand::AcceptContract { offer: offer.index });
-            }
-            ui.label(egui::RichText::new(&offer.label).font(MONO).color(dim));
-        });
-        if !offer.description.is_empty() {
-            ui.label(
-                egui::RichText::new(format!("    {}", offer.description))
-                    .font(MONO)
-                    .color(dim)
-                    .small(),
-            );
-        }
-        if !offer.detail.is_empty() {
-            ui.label(
-                egui::RichText::new(format!("    {}", offer.detail))
-                    .font(MONO)
-                    .color(dim)
-                    .small(),
-            );
-        }
-        for (met, text) in &offer.prereqs {
-            ui.label(
-                egui::RichText::new(format!("    {} {}", if *met { "✓" } else { "✗" }, text))
-                    .font(MONO)
-                    .color(if *met {
-                        egui::Color32::from_rgb(140, 200, 140)
-                    } else {
-                        egui::Color32::from_rgb(235, 150, 80)
-                    })
-                    .small(),
-            );
-        }
-        if !offer.reward.is_empty() || !offer.deadline.is_empty() {
-            ui.label(
-                egui::RichText::new(format!(
-                    "    {}{}{}",
-                    offer.reward,
-                    if offer.reward.is_empty() || offer.deadline.is_empty() {
-                        ""
-                    } else {
-                        " · "
-                    },
-                    offer.deadline
-                ))
-                .font(MONO)
-                .color(dim)
-                .small(),
-            );
-        }
+        offer_row(ui, offer, out, dim);
     }
     if let Some(note) = &input.offers_note {
         ui.label(egui::RichText::new(note).color(dim).small());
+    }
+}
+
+/// One contract-board offer — the button row (accept gated on the
+/// §3.6 prereq read, decline as the C08-F5 un-jam exit) plus the
+/// drawn params/reward/deadline lines. Extracted from
+/// `contracts_section` under the same complexity budget it was.
+fn offer_row(
+    ui: &mut egui::Ui,
+    offer: &OfferRow,
+    out: &mut Vec<ProgramCommand>,
+    dim: egui::Color32,
+) {
+    ui.horizontal(|ui| {
+        // W2.1: the accept predicate's prereqs gate the button —
+        // a refused accept used to be a silent drain rejection.
+        let hover = if offer.accept_ok {
+            "accept the contract — the advance credits now".to_string()
+        } else {
+            let missing: Vec<&str> = offer
+                .prereqs
+                .iter()
+                .filter(|(met, _)| !*met)
+                .map(|(_, t)| t.as_str())
+                .collect();
+            format!("prerequisites unmet: {}", missing.join("; "))
+        };
+        if ui
+            .add_enabled(offer.accept_ok, egui::Button::new("accept").small())
+            .on_hover_text(hover)
+            .clicked()
+        {
+            out.push(ProgramCommand::AcceptContract { offer: offer.index });
+        }
+        // C08-F5's board un-jam — offered on every offer row,
+        // enabled even when the accept button isn't: the offers
+        // decline exists FOR are exactly the unsatisfiable ones.
+        // Active rows carry no decline (their exits are
+        // completion/deadline — a free abandon would reopen the
+        // advance faucet the verb closes).
+        if ui
+            .small_button("decline")
+            .on_hover_text("refuse the offer — it leaves the board, nothing pays either way")
+            .clicked()
+        {
+            out.push(ProgramCommand::DeclineContract { offer: offer.index });
+        }
+        ui.label(egui::RichText::new(&offer.label).font(MONO).color(dim));
+    });
+    if !offer.description.is_empty() {
+        ui.label(
+            egui::RichText::new(format!("    {}", offer.description))
+                .font(MONO)
+                .color(dim)
+                .small(),
+        );
+    }
+    if !offer.detail.is_empty() {
+        ui.label(
+            egui::RichText::new(format!("    {}", offer.detail))
+                .font(MONO)
+                .color(dim)
+                .small(),
+        );
+    }
+    for (met, text) in &offer.prereqs {
+        ui.label(
+            egui::RichText::new(format!("    {} {}", if *met { "✓" } else { "✗" }, text))
+                .font(MONO)
+                .color(if *met {
+                    egui::Color32::from_rgb(140, 200, 140)
+                } else {
+                    egui::Color32::from_rgb(235, 150, 80)
+                })
+                .small(),
+        );
+    }
+    if !offer.reward.is_empty() || !offer.deadline.is_empty() {
+        ui.label(
+            egui::RichText::new(format!(
+                "    {}{}{}",
+                offer.reward,
+                if offer.reward.is_empty() || offer.deadline.is_empty() {
+                    ""
+                } else {
+                    " · "
+                },
+                offer.deadline
+            ))
+            .font(MONO)
+            .color(dim)
+            .small(),
+        );
     }
 }
 
@@ -1578,17 +1623,30 @@ fn facilities_section(
     dim: egui::Color32,
 ) {
     for b in &input.builds {
-        ui.label(
-            egui::RichText::new(format!(
-                "building #{} {} @ {} — delivers in {}",
-                b.id,
-                b.label,
-                b.site,
-                fmt_eta(b.eta_s)
-            ))
-            .font(MONO)
-            .color(egui::Color32::from_rgb(140, 200, 140)),
-        );
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "building #{} {} @ {} — delivers in {}",
+                    b.id,
+                    b.label,
+                    b.site,
+                    fmt_eta(b.eta_s)
+                ))
+                .font(MONO)
+                .color(egui::Color32::from_rgb(140, 200, 140)),
+            );
+            // C11-F3's mis-order exit. Every staged row is an
+            // in-flight order (a delivered build holds no `builds`
+            // record, so no row names one) — the refund hover is
+            // the honest read of what the click does.
+            if ui
+                .small_button("cancel")
+                .on_hover_text("cancel the order — the BOM restocks the site and the funds refund")
+                .clicked()
+            {
+                out.push(ProgramCommand::CancelBuild { build: b.id });
+            }
+        });
     }
     if input.families.is_empty() {
         ui.label(egui::RichText::new("no part families").color(dim));
@@ -3110,6 +3168,131 @@ mod tests {
         assert!(
             out.is_empty(),
             "a parked vessel's deploy button cannot emit: {out:?}"
+        );
+    }
+
+    /// C08-F5's board un-jam is clickable: an offer row's decline
+    /// button emits `DeclineContract` with the row's offer index —
+    /// enabled even when the offer's own accept gate is closed (the
+    /// unsatisfiable draw is exactly what decline exists for).
+    #[test]
+    fn offer_row_decline_emits_on_prereq_unmet_offer() {
+        let ctx = egui::Context::default();
+        let input = ProgramInput {
+            offers: vec![OfferRow {
+                index: 4,
+                label: "#4 sat orbit".to_string(),
+                description: String::new(),
+                detail: String::new(),
+                reward: String::new(),
+                deadline: String::new(),
+                prereqs: vec![(false, "needs a tracking station".to_string())],
+                accept_ok: false,
+            }],
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        'scan: for iy in 0..6 {
+            for ix in 0..24 {
+                let pos = egui::pos2(10.0 + ix as f32 * 12.0, 15.0 + iy as f32 * 10.0);
+                ctx.run_pass(egui_input(primary_click(pos)), |ctx| {
+                    egui::Area::new(egui::Id::unique("contract_test")).show(ctx, |ui| {
+                        contracts_section(ui, &input, &mut out, egui::Color32::from_gray(170));
+                    });
+                })
+                .drop_without_applying_deltas();
+                if out
+                    .iter()
+                    .any(|c| matches!(c, ProgramCommand::DeclineContract { offer: 4 }))
+                {
+                    break 'scan;
+                }
+            }
+        }
+        assert!(
+            out.iter()
+                .any(|c| matches!(c, ProgramCommand::DeclineContract { offer: 4 })),
+            "the offer row's decline button must emit DeclineContract: {out:?}"
+        );
+        // The same scan crossed the accept button — its gate held,
+        // so nothing accepted.
+        assert!(
+            out.iter()
+                .all(|c| !matches!(c, ProgramCommand::AcceptContract { .. })),
+            "a prereq-unmet offer must not emit AcceptContract: {out:?}"
+        );
+    }
+
+    /// An accepted contract renders no decline affordance — its
+    /// only exits are completion and the deadline (the free-abandon
+    /// faucet the sim deliberately keeps closed). A full click-scan
+    /// of a section holding only active rows emits nothing.
+    #[test]
+    fn active_contract_row_offers_no_verb() {
+        let ctx = egui::Context::default();
+        let input = ProgramInput {
+            active: vec![ActiveRow {
+                label: "#7 ore run".to_string(),
+                detail: "deliver 10 ore · 3.2 d left".to_string(),
+                progress: "delivered 4/10".to_string(),
+            }],
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        for iy in 0..6 {
+            for ix in 0..24 {
+                let pos = egui::pos2(10.0 + ix as f32 * 12.0, 15.0 + iy as f32 * 10.0);
+                ctx.run_pass(egui_input(primary_click(pos)), |ctx| {
+                    egui::Area::new(egui::Id::unique("contract_active")).show(ctx, |ui| {
+                        contracts_section(ui, &input, &mut out, egui::Color32::from_gray(170));
+                    });
+                })
+                .drop_without_applying_deltas();
+            }
+        }
+        assert!(
+            out.is_empty(),
+            "an accepted-contract row must carry no verb: {out:?}"
+        );
+    }
+
+    /// C11-F3's mis-order exit is clickable: an in-flight build
+    /// row's cancel button emits `CancelBuild` with the row's
+    /// `BuildId`.
+    #[test]
+    fn build_row_cancel_emits_cancel_build() {
+        let ctx = egui::Context::default();
+        let input = ProgramInput {
+            builds: vec![BuildRow {
+                id: 9,
+                site: "terrin-launch".to_string(),
+                label: "5-part craft".to_string(),
+                eta_s: 120.0,
+            }],
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        'scan: for iy in 0..6 {
+            for ix in 0..40 {
+                let pos = egui::pos2(10.0 + ix as f32 * 12.0, 15.0 + iy as f32 * 10.0);
+                ctx.run_pass(egui_input(primary_click(pos)), |ctx| {
+                    egui::Area::new(egui::Id::unique("facilities_test")).show(ctx, |ui| {
+                        facilities_section(ui, &input, &mut out, egui::Color32::from_gray(170));
+                    });
+                })
+                .drop_without_applying_deltas();
+                if out
+                    .iter()
+                    .any(|c| matches!(c, ProgramCommand::CancelBuild { build: 9 }))
+                {
+                    break 'scan;
+                }
+            }
+        }
+        assert!(
+            out.iter()
+                .any(|c| matches!(c, ProgramCommand::CancelBuild { build: 9 })),
+            "the build row's cancel button must emit CancelBuild: {out:?}"
         );
     }
 }

@@ -1024,6 +1024,7 @@ fn program_command(
             track: csp_data::UpgradeTrackId::from(track),
         }),
         C::AcceptContract { offer } => Some(SimCommand::AcceptContract { offer }),
+        C::DeclineContract { offer } => Some(SimCommand::DeclineContract { offer }),
         C::RunExperiment { node, experiment } => {
             let Some((biome, situation)) = mirror.science_ctx.clone() else {
                 dropped.push("EXPERIMENT NOT RUN — NO SCIENCE CONTEXT");
@@ -1296,6 +1297,12 @@ fn program_command(
             site: csp_data::SiteId::from(site),
             family: csp_data::FamilyId::from(family),
             units,
+        }),
+        // The FACILITIES build row's cancel — id-addressed like the
+        // colony verbs: a stale `BuildId` rejects `Recoverable` at
+        // the drain rather than needing mirror context.
+        C::CancelBuild { build } => Some(SimCommand::CancelBuild {
+            build: csp_sim::manufacture::BuildId(build),
         }),
         C::WatchTransferWindow {
             origin,
@@ -6080,6 +6087,16 @@ mod tests {
                     vessel: csp_sim::VesselId(7),
                 },
             ),
+            (
+                C::DeclineContract { offer: 6 },
+                SimCommand::DeclineContract { offer: 6 },
+            ),
+            (
+                C::CancelBuild { build: 8 },
+                SimCommand::CancelBuild {
+                    build: csp_sim::manufacture::BuildId(8),
+                },
+            ),
         ];
         for (pc, want) in maps {
             assert_eq!(
@@ -6140,6 +6157,16 @@ mod tests {
             program_command(&empty, C::EvacuateColony { colony: 3 }, &mut dropped),
             Some(SimCommand::EvacuateColony {
                 colony: csp_sim::ColonyId(3),
+            })
+        );
+        assert_eq!(
+            program_command(&empty, C::DeclineContract { offer: 6 }, &mut dropped),
+            Some(SimCommand::DeclineContract { offer: 6 })
+        );
+        assert_eq!(
+            program_command(&empty, C::CancelBuild { build: 8 }, &mut dropped),
+            Some(SimCommand::CancelBuild {
+                build: csp_sim::manufacture::BuildId(8),
             })
         );
         assert_eq!(dropped.len(), 5, "every stale focus-drop reports");
