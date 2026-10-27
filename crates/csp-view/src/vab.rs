@@ -757,9 +757,11 @@ fn category_color(cat: Option<csp_data::PartCategory>, selected: bool) -> [f32; 
 
 /// `RenderExtract` schedule system: emit the `VabPacket` — the
 /// kitbash triangles projected to clip space, each part's verts
-/// tagged with its 1-based pick index. `craft_epoch` stamps the
-/// packet's `pick_ids` generation so a late GPU readback decoded
-/// against a CHANGED session is dropped, not mis-applied (P10-F3).
+/// tagged with its 1-based pick index. `pick_generation` stamps the
+/// packet's `pick_ids` table so a late GPU readback decoded against
+/// a REPLACED session is dropped, not mis-applied (P10-F3) — it is
+/// the session-replacement counter, not `craft_epoch` (which only
+/// New/load bump, for the camera refit — C17-F3).
 pub(crate) fn extract_vab(
     input: Res<VabInput>,
     vab: Res<VabSessionRes>,
@@ -772,7 +774,7 @@ pub(crate) fn extract_vab(
         return;
     }
     let mut packet = VabPacket {
-        craft_epoch: vab.0.craft_epoch(),
+        pick_generation: vab.0.pick_generation(),
         ..VabPacket::default()
     };
     // The editor environment — a backdrop gradient (97.8% of the
@@ -1563,5 +1565,78 @@ mod tests {
             shadowed > 100,
             "only {shadowed} pixels changed — the probe barely exercises the shell"
         );
+    }
+
+    /// C17-F3 end-to-end: an undo keeps the camera exactly where the
+    /// player framed it — distance, pan, and the consumed one-shot
+    /// fit all survive — while the packet's `pick_generation` still
+    /// advances (the stale-pick guard keeps its teeth on a session
+    /// restore). The pre-split `craft_epoch` bump failed every one
+    /// of these.
+    #[test]
+    fn undo_keeps_the_camera_and_advances_pick_generation() {
+        let data = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let parts = csp_data::load_parts(&data.join("parts")).unwrap();
+        let res = csp_data::load_resources(&data.join("resources.ron")).unwrap();
+        let mut view = crate::View::with_sim(csp_sim::World::new());
+        view.install_vab_catalog(parts, res);
+        view.set_mode(crate::ViewMode::Vab);
+        view.set_tutorial_active(false);
+        view.set_vab_viewport(800.0, 600.0);
+        let tank = csp_data::PartId::from("csp.tank.s320");
+        view.with_vab_session(|v| {
+            v.apply(csp_ui::vab::VabAction::SetRoot(tank.clone()))
+                .unwrap()
+        });
+        let root = view.with_vab_session(|v| v.session().root().unwrap());
+        // A frame pair: Presentation runs `vab_present`, the one-shot
+        // fit frames the craft.
+        view.begin_frame();
+        view.end_frame();
+        // The player reframes — orbit + zoom + pan land through the
+        // real event drain.
+        view.vab_event(VabEvent::Orbit {
+            dyaw: 0.4,
+            dpitch: -0.3,
+        });
+        view.vab_event(VabEvent::Zoom { factor: 0.5 });
+        view.vab_event(VabEvent::Pan {
+            dx_px: 60.0,
+            dy_px: -40.0,
+        });
+        view.begin_frame();
+        view.end_frame();
+        let (dist, pan) = {
+            let i = view.world.resource::<VabInput>();
+            (i.distance_m, i.pan_offset)
+        };
+        // Make history, then walk it: attach + remove + undo.
+        let child = view.with_vab_session(|v| {
+            v.apply(csp_ui::vab::VabAction::AttachAuto {
+                part: tank.clone(),
+                parent: root,
+            })
+            .unwrap();
+            v.selected().unwrap()
+        });
+        view.with_vab_session(|v| v.apply(csp_ui::vab::VabAction::Remove(child)).unwrap());
+        let gen_before = view.with_vab_session(|v| v.pick_generation());
+        let epoch_before = view.with_vab_session(|v| v.craft_epoch());
+        view.with_vab_session(|v| v.apply(csp_ui::vab::VabAction::Undo).unwrap());
+        assert_eq!(
+            view.with_vab_session(|v| v.craft_epoch()),
+            epoch_before,
+            "undo must not bump the camera-refit epoch"
+        );
+        view.begin_frame();
+        view.end_frame();
+        let i = view.world.resource::<VabInput>();
+        assert_eq!(i.distance_m, dist, "undo must not re-derive zoom");
+        assert_eq!(i.pan_offset, pan, "undo must not drop the pan");
+        assert!(i.focused_once, "the consumed fit stays consumed");
+        // ... while the stale-pick guard still invalidated the old
+        // `pick_ids` table.
+        let packet = view.take_vab_packet().expect("a VAB packet this frame");
+        assert_eq!(packet.pick_generation, gen_before + 1);
     }
 }

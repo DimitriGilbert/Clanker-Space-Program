@@ -410,10 +410,10 @@ fn dump_vab() {
         .take_vab_packet()
         .expect("RenderExtract produced a vab packet");
     eprintln!(
-        "vab packet: vertices={} pick_ids={} epoch={}",
+        "vab packet: vertices={} pick_ids={} pick_generation={}",
         packet.vertices.len(),
         packet.pick_ids.len(),
-        packet.craft_epoch
+        packet.pick_generation
     );
 
     let tex = offscreen_target(&device, "vab-dump-target");

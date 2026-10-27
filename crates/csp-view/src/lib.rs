@@ -846,9 +846,17 @@ fn build_ui(
     // Save carries the serialized bytes — the app owns the file store.
     // The `if let` keeps `to_bytes` (a bincode pass over the session)
     // behind the actual save request — `Option::zip` would serialize on
-    // every VAB frame.
+    // every VAB frame. A serialization failure lands on the notice
+    // channel like every other op refusal (C17-F8 — `.ok()` used to
+    // swallow it, the one silent op path in the module).
     outbox.craft_save = if let Some(name) = vab_out.save_name {
-        vab.0.to_bytes().ok().map(|bytes| (name, bytes))
+        match vab.0.to_bytes() {
+            Ok(bytes) => Some((name, bytes)),
+            Err(e) => {
+                vab.0.set_notice(Some(format!("craft save failed: {e}")));
+                None
+            }
+        }
     } else {
         None
     };
@@ -3940,6 +3948,11 @@ impl View {
                 tree,
                 researched: self.sim.tech().researched.clone(),
                 track_levels: self.sim.tech().track_levels.clone(),
+                // §3.4's confidence input — the same table the
+                // FACILITIES rows report from (`stage_program`); a
+                // bench-bought family must move the editor's number
+                // (C10-F3).
+                qualifications: self.sim.tech().qualifications.clone(),
             });
         self.world
             .resource_mut::<vab::VabSessionRes>()

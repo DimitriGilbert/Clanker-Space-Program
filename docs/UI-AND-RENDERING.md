@@ -397,14 +397,17 @@ region }` the attach plan consumes); `extract_vab` (RenderExtract) emits the
 `VabPacket`. `VabScene`/`PartMesh`/`GhostMesh` carry the drawn craft, ghost,
 and attach-node markers; `emit_environment` (`:843`) the editor backdrop.
 
-**GPU picking**: each `VabPacket` carries `pick_ids` + `craft_epoch`
+**GPU picking**: each `VabPacket` carries `pick_ids` + `pick_generation`
 (`csp-render/src/vab.rs:76-94`). On a click, `csp-app` rasterizes the same
 vertices into an offscreen R32Uint object-id target (`VabRenderer::encode_pick`,
 `csp-render/src/vab.rs:404`) and copies the one clicked pixel back
 (`map_pick`, `:462`). The readback lands a frame or two later; the app
-snapshots the id table + craft epoch at encode time and **drops the readback
-as background if the epoch moved** (a craft edit between encode and landing —
-`run_frame` pick drain, `csp-app/src/lib.rs:874-895`). One pick in flight at
+snapshots the id table + pick generation at encode time and **drops the
+readback as background if the generation moved** (a session replacement —
+New/load/undo/redo — between encode and landing; `pick_generation` bumps on
+every wholesale swap while `craft_epoch`, which only the camera refit
+watches, bumps on New/load alone, C17-F3 — `run_frame` pick drain,
+`csp-app/src/lib.rs:874-895`). One pick in flight at
 a time; an in-bounds click that cannot rasterize still resolves as
 background so the click lands (P10-F1/F2/F3). **Caveat**: the pickable stream
 also carries decoration tagged pick 0 (ghosts, selection shells, markers —
@@ -847,8 +850,6 @@ these:
 - **Click-armed part + viewport drag is a dead gesture** (C17-F2): with a
   palette-armed part, an LMB viewport drag produces no orbit, no drop, no
   pick.
-- **Undo/redo resets the VAB camera zoom/pan** (C17-F3): the shared
-  `craft_epoch` bump on history restore invalidates the camera.
 - **`notice_overlay` is not in the pointer mask** (C17-F7): a right-click on
   a cue chip resolves as a viewport gesture and can delete the part behind
   it.

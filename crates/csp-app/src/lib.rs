@@ -163,12 +163,13 @@ struct App {
     /// map_async landing, and a stale table would silently mis-decode
     /// (selecting the wrong part).
     pick_decode_ids: Option<Vec<u64>>,
-    /// The `VabPacket::craft_epoch` snapshotted beside
-    /// `pick_decode_ids` — the stale-pick stamp (P10-F3). A craft
-    /// edit between the pick encode and the map_async landing makes
-    /// the snapshotted id belong to a different generation: the
-    /// readback is dropped, not applied to the wrong node.
-    pick_decode_epoch: Option<u64>,
+    /// The `VabPacket::pick_generation` snapshotted beside
+    /// `pick_decode_ids` — the stale-pick stamp (P10-F3). A session
+    /// replacement (New/load/undo/redo) between the pick encode and
+    /// the map_async landing makes the snapshotted id belong to a
+    /// different generation: the readback is dropped, not applied to
+    /// the wrong node.
+    pick_decode_generation: Option<u64>,
     /// Craft-file store: name → `CSPCRAFT` bytes. Memory-first; on
     /// native the store is mirrored to `crafts/*.cspcraft` files under
     /// [`Self::craft_dir`]. The §6.3 wasm demo refuses craft IO entirely
@@ -487,7 +488,7 @@ impl App {
             pick_rx,
             pick_in_flight: false,
             pick_decode_ids: None,
-            pick_decode_epoch: None,
+            pick_decode_generation: None,
             craft_store: load_craft_store(&craft_dir),
             craft_dir: craft_dir.clone(),
             // `saves/` sits beside `crafts/` — same convention, same
@@ -877,12 +878,13 @@ impl App {
         while let Ok(pid) = self.pick_rx.try_recv() {
             self.pick_in_flight = false;
             // The snapshotted id table is only meaningful while the
-            // session still reports the epoch it was rasterized from
-            // (P10-F3): a craft edit between encode and landing makes
-            // the decoded id stale — drop the readback rather than
-            // select or attach a different generation's node.
-            let live_epoch = self.view.with_vab_session(|v| v.craft_epoch());
-            if matches!(self.pick_decode_epoch, Some(ep) if ep != live_epoch) {
+            // session still reports the generation it was rasterized
+            // from (P10-F3): a session replacement between encode and
+            // landing makes the decoded id stale — drop the readback
+            // rather than select or attach a different generation's
+            // node.
+            let live_generation = self.view.with_vab_session(|v| v.pick_generation());
+            if matches!(self.pick_decode_generation, Some(g) if g != live_generation) {
                 // The snapshotted id table belongs to another craft
                 // generation, so the decoded node cannot be trusted —
                 // but a pure drop swallows the click outright. Resolve
@@ -890,7 +892,7 @@ impl App {
                 // id-safe (the session filters by `contains`, and the
                 // new generation's selection is cleared anyway).
                 log::info!(
-                    "stale VAB pick readback — craft_epoch moved since encode; resolving as background"
+                    "stale VAB pick readback — pick_generation moved since encode; resolving as background"
                 );
                 self.view.vab_event(VabEvent::Pick(None));
                 continue;
@@ -1882,7 +1884,7 @@ impl App {
         // of dropping silently.
         let mut encode_pick = false;
         let mut encoded_ids = None;
-        let mut encoded_epoch = None;
+        let mut encoded_generation = None;
         let mut resolve_background = false;
         if let Some((x, y)) = self.pending_pick.take() {
             if self.pick_in_flight {
@@ -1906,12 +1908,12 @@ impl App {
                             // Snapshot the decode table alongside the
                             // rasterized pixels — the readback decodes
                             // a frame or two later and `last_vab_packet`
-                            // may have moved on by then. The craft epoch
-                            // rides beside it so a pick encoded against
-                            // one craft generation can't decode into the
-                            // next (P10-F3).
+                            // may have moved on by then. The pick
+                            // generation rides beside it so a pick
+                            // encoded against one session generation
+                            // can't decode into the next (P10-F3).
                             encoded_ids = Some(packet.pick_ids.clone());
-                            encoded_epoch = Some(packet.craft_epoch);
+                            encoded_generation = Some(packet.pick_generation);
                         }
                         ok
                     }
@@ -1929,7 +1931,7 @@ impl App {
         }
         if let Some(ids) = encoded_ids {
             self.pick_decode_ids = Some(ids);
-            self.pick_decode_epoch = encoded_epoch;
+            self.pick_decode_generation = encoded_generation;
         }
         gpu.submit(*frame);
         if encode_pick {

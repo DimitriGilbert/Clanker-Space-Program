@@ -6,7 +6,7 @@
 //! [`VabSession`] is the working-craft *instance* §2.1 assigns to
 //! `csp-ui`: it owns the `csp_phys::session::CraftSession` (the type
 //! lives in `csp-phys` — see its module doc for why), the loaded part
-//! catalog + resource registry, the [`MissionProfile`] stub, the
+//! catalog + resource registry, the editable [`MissionProfile`], the
 //! selection, and the cached [`CraftAnalysis`]/validation. The instance
 //! itself is hosted as a resource in `csp-view`'s presentation world —
 //! the same hosting pattern `SessionMirror`/`MapInput` use — so the
@@ -252,6 +252,14 @@ pub enum VabAction {
     SetTargetDeltaV(f64),
     /// Set the mission profile's minimum launch TWR.
     SetMinLaunchTwr(f64),
+    /// Replace the mission profile's burn segments — the plan the
+    /// §3.4 confidence number integrates over. The panel edits
+    /// duration/throttle/regime per row and adds/removes segments;
+    /// non-finite or negative durations and non-finite throttles are
+    /// refused field-wise (clamped/dropped) like the other profile
+    /// setters, and the op is excluded from undo history (per-row
+    /// drag spam would flood it, same as `SetTargetDeltaV`).
+    SetBurnSegments(Vec<csp_phys::BurnSegment>),
     /// Insert an empty stage at index `at` (shift populated up).
     InsertStage(u32),
     /// Delete stage `at` (its parts fold to `at − 1`).
@@ -263,10 +271,6 @@ pub enum VabAction {
     Undo,
     /// Redo the last undone mutation.
     Redo,
-    /// Translate the whole craft in the build frame — `delta` adds to
-    /// the root's stored offset; the stack follows rigidly (the
-    /// root's rotation is preserved). The free-reposition verb.
-    Translate(DVec3),
     /// Remove `node` WITHOUT its subtree — each direct child promotes
     /// to `node`'s parent, re-snapped through a free
     /// size-class-matched attach node
@@ -367,6 +371,12 @@ pub struct VabTech {
     /// Purchased upgrade-track levels — composed into
     /// `upgrade_levels_at_build` when a catalog part is placed.
     pub track_levels: std::collections::BTreeMap<csp_data::UpgradeTrackId, u8>,
+    /// The save's live §3.4 family qualification table — the
+    /// confidence readout's `exp(−Λ_expected)` input: bench and
+    /// flight units bought against a family must move the editor's
+    /// number, or the test-stand payoff never reaches the designer
+    /// (C10-F3/C13-F7).
+    pub qualifications: csp_phys::FamilyQualifications,
 }
 
 /// The VAB working session — see the module doc. `Default` is an empty
@@ -458,10 +468,23 @@ pub struct VabSession {
     /// palette and placement gates are off, upgrades compose empty.
     tech: Option<VabTech>,
     /// Craft-generation counter — bumped by `VabAction::New` and a
-    /// successful `LoadBytes`. The 3D view watches it so the camera's
-    /// one-shot fit re-arms on a craft that is not the one it framed
-    /// (edits don't bump it — only replacing the craft does).
+    /// successful `LoadBytes` ONLY. The 3D view watches it so the
+    /// camera's one-shot fit re-arms on a craft that is not the one
+    /// it framed (edits don't bump it — only replacing the craft
+    /// does; undo/redo deliberately don't either — a history restore
+    /// must not yank the player's zoom and pan back to the default
+    /// framing, C17-F3). The stale-pick guard rides
+    /// [`Self::pick_generation`] instead.
     craft_epoch: u64,
+    /// Session-replacement counter — bumped by EVERY wholesale
+    /// `CraftSession` swap: `New`, a successful `LoadBytes`, and
+    /// undo/redo (which restore a snapshot whose `next_id` rolled
+    /// back, so an id minted before the restore can name a different
+    /// node after it). `VabPacket::pick_generation` stamps this so a
+    /// late GPU pick readback can't decode against the restored
+    /// craft (P10-F3). Distinct from `craft_epoch`: the camera refit
+    /// is a subset of the replacement set, not the whole of it.
+    pick_generation: u64,
     /// The undo history — whole-session snapshots taken before every
     /// mutating op (a `CraftSession` clone is the cheap, exact inverse
     /// of any op — every mutation funnels through [`Self::apply`]).
@@ -514,6 +537,7 @@ impl Default for VabSession {
             file_io: true,
             tech: None,
             craft_epoch: 0,
+            pick_generation: 0,
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
             drop_anchor: None,
@@ -578,11 +602,26 @@ impl VabSession {
     }
 
     /// The craft-generation counter — bumped on `New` and a
-    /// successful `LoadBytes`. The craft view resets its one-shot
-    /// camera fit when it changes (a `focused_once` left armed would
-    /// frame the NEW craft at the OLD craft's distance).
+    /// successful `LoadBytes` only (see the field doc). The craft
+    /// view resets its one-shot camera fit when it changes (a
+    /// `focused_once` left armed would frame the NEW craft at the
+    /// OLD craft's distance). History restores bump
+    /// [`Self::pick_generation`], not this — undo/redo keep the
+    /// camera where the player put it.
     pub fn craft_epoch(&self) -> u64 {
         self.craft_epoch
+    }
+
+    /// The session-replacement counter — bumped on every wholesale
+    /// `CraftSession` swap (`New`/`LoadBytes`/undo/redo). The GPU
+    /// pick packet stamps it so a readback issued against a
+    /// pre-restore `pick_ids` table is dropped instead of decoding a
+    /// recycled node id onto the wrong part (P10-F3). Unlike
+    /// [`Self::craft_epoch`], edits do NOT need a bump: `PartNodeId`s
+    /// are never reused within one session generation (`next_id` is
+    /// monotonic), so a stale id only ever dead-ends there.
+    pub fn pick_generation(&self) -> u64 {
+        self.pick_generation
     }
 
     /// Whether an undoable craft mutation is on the stack.
@@ -810,6 +849,14 @@ impl VabSession {
         self.tech = tech;
     }
 
+    /// The staged §3.4 family qualification table, when progression
+    /// data is installed — the confidence readout's input. `None`
+    /// means "no save-side table" (headless fixtures, tree-less
+    /// worlds): the readout evaluates FRESH.
+    pub fn qualifications(&self) -> Option<&csp_phys::FamilyQualifications> {
+        self.tech.as_ref().map(|t| &t.qualifications)
+    }
+
     /// The §3.3 availability gate: `true` when `def`'s
     /// `tech_requirement` is researched — always `true` when the
     /// session carries no progression data (the empty-gate
@@ -913,6 +960,7 @@ impl VabSession {
                 | VabAction::SetAttachMode(_)
                 | VabAction::SetTargetDeltaV(_)
                 | VabAction::SetMinLaunchTwr(_)
+                | VabAction::SetBurnSegments(_)
                 | VabAction::Rename(_)
         )
     }
@@ -932,6 +980,7 @@ impl VabSession {
                 self.move_node = None;
                 self.press_node = None;
                 self.craft_epoch += 1;
+                self.pick_generation += 1;
                 self.dirty = true;
                 Some("new craft — pick up a catalog part and click the build area".to_string())
             }
@@ -1034,6 +1083,23 @@ impl VabSession {
                 }
                 None
             }
+            VabAction::SetBurnSegments(segs) => {
+                // Quiet sanitize, same convention as the scalar
+                // profile setters: a row the DragValue can't produce
+                // (non-finite, negative duration) never enters the
+                // profile; throttle clamps to the commanded range.
+                self.profile.burn_segments = segs
+                    .into_iter()
+                    .filter(|s| {
+                        s.duration_s.is_finite() && s.duration_s >= 0.0 && s.throttle.is_finite()
+                    })
+                    .map(|mut s| {
+                        s.throttle = s.throttle.clamp(0.0, 1.0);
+                        s
+                    })
+                    .collect();
+                None
+            }
             VabAction::InsertStage(at) => {
                 self.session.insert_stage(at).map_err(VabError::Session)?;
                 self.dirty = true;
@@ -1053,26 +1119,6 @@ impl VabSession {
             }
             VabAction::Undo => self.undo(),
             VabAction::Redo => self.redo(),
-            VabAction::Translate(delta) => {
-                let Some(root) = self.session.root() else {
-                    return Err(VabError::Session(
-                        csp_phys::session::SessionError::EmptySession,
-                    ));
-                };
-                let t = self
-                    .session
-                    .node(root)
-                    .map(|n| n.transform())
-                    .unwrap_or(PartTransform::IDENTITY);
-                self.session
-                    .set_transform(root, PartTransform::new(t.offset + delta, t.rotation))
-                    .map_err(VabError::Session)?;
-                self.dirty = true;
-                Some(format!(
-                    "moved the craft ({:+.2}, {:+.2}, {:+.2}) m",
-                    delta.x, delta.y, delta.z
-                ))
-            }
             VabAction::RemoveOnly(node) => Some(self.remove_only(node)?),
         })
     }
@@ -1098,9 +1144,12 @@ impl VabSession {
     }
 
     /// The shared tail of undo/redo: node references that name gone
-    /// ids are scrubbed, the craft generation bumps (an in-flight GPU
-    /// pick must not decode against the restored craft), and the
-    /// recompute re-arms.
+    /// ids are scrubbed, the session-replacement generation bumps
+    /// (an in-flight GPU pick must not decode against the restored
+    /// craft — the snapshot's rolled-back `next_id` can re-mint a
+    /// stale id onto a different node, P10-F3), and the recompute
+    /// re-arms. `craft_epoch` deliberately stays put: the camera
+    /// keeps the player's zoom/pan across a history walk (C17-F3).
     fn after_history_restore(&mut self, msg: &str) -> Option<String> {
         let gone = |s: &CraftSession, id: Option<PartNodeId>| id.is_some_and(|i| !s.contains(i));
         if gone(&self.session, self.selected) {
@@ -1112,7 +1161,7 @@ impl VabSession {
         if gone(&self.session, self.press_node) {
             self.press_node = None;
         }
-        self.craft_epoch += 1;
+        self.pick_generation += 1;
         self.dirty = true;
         Some(msg.to_string())
     }
@@ -1225,6 +1274,7 @@ impl VabSession {
         self.move_node = None;
         self.press_node = None;
         self.craft_epoch += 1;
+        self.pick_generation += 1;
         self.dirty = true;
         Ok(format!("loaded craft '{}'", self.session.name()))
     }
@@ -3175,6 +3225,16 @@ fn inspector_panel(
         .unwrap_or(egui::Rect::NOTHING)
 }
 
+/// The burn-segment regime's row label — short, matching the segment
+/// editor's compact row.
+fn regime_label(r: csp_phys::Regime) -> &'static str {
+    match r {
+        csp_phys::Regime::Atmosphere => "atmo",
+        csp_phys::Regime::Vacuum => "vacuum",
+        csp_phys::Regime::Surface => "surface",
+    }
+}
+
 /// Craft name, totals, file save/load, mission check.
 #[allow(clippy::too_many_lines)]
 fn craft_section(
@@ -3231,19 +3291,38 @@ fn craft_section(
             ));
         }
         // M9b §3.4: the profile's real confidence — `exp(−Λ_expected)`
-        // over the burn segments, evaluated with zero qualification
-        // units (the editor session has no save-side family table —
-        // flight-tested families improve on this number).
+        // over the burn segments, evaluated against the save's LIVE
+        // family qualification table (staged onto `VabTech` by the
+        // host each frame): bench- and flight-tested families improve
+        // this number — the test-stand payoff reaching the designer
+        // (C10-F3). With no progression data staged the table reads
+        // FRESH and the label says so.
         let specs: Vec<csp_phys::ReliabilitySpec> = a
             .effective
             .iter()
             .map(csp_phys::ReliabilitySpec::from_effective)
             .collect();
         if !specs.is_empty() {
-            let quals = csp_phys::FamilyQualifications::default();
-            let c = csp_phys::confidence(&specs, &quals, vab.profile());
+            let quals = vab.qualifications();
+            let empty = csp_phys::FamilyQualifications::default();
+            let quals = quals.unwrap_or(&empty);
+            let c = csp_phys::confidence(&specs, quals, vab.profile());
             if c.is_finite() {
-                ui.label(format!("confidence {:.1}% (unqualified family)", c * 100.0));
+                // Honest basis tag: "(unqualified)" only when every
+                // family on the craft reads zero units — a qualified
+                // craft drops the tag rather than claiming credit.
+                let any_units = specs
+                    .iter()
+                    .any(|s| quals.get(&s.family).is_some_and(|q| q.units() > 0.0));
+                ui.label(format!(
+                    "confidence {:.1}%{}",
+                    c * 100.0,
+                    if any_units {
+                        ""
+                    } else {
+                        " (unqualified family)"
+                    }
+                ));
             }
         }
     }
@@ -3251,9 +3330,12 @@ fn craft_section(
         ui.colored_label(egui::Color32::RED, format!("resolve: {e}"));
     }
 
-    // Mission profile stub — editable targets (§3.4's real
-    // burn-segment confidence lands at M9b).
-    ui.collapsing("Mission profile (stub)", |ui| {
+    // Mission profile — §3.4's "editable in the editor": the Δv/TWR
+    // targets AND the burn-segment plan the confidence number
+    // integrates over (C10-F3/C13-F7 — the fixed `terran_ascent`
+    // preset scored a lander or long-ascent mission against the
+    // wrong plan).
+    ui.collapsing("Mission profile", |ui| {
         let mut dv = vab.profile().target_delta_v_m_per_s;
         ui.horizontal(|ui| {
             ui.label("target Δv m/s");
@@ -3274,11 +3356,68 @@ fn craft_section(
                 let _ = vab.apply(VabAction::SetMinLaunchTwr(twr));
             }
         });
-        ui.weak(format!(
-            "{} burn segments · g₀ ref {:.2} m/s²",
-            vab.profile().burn_segments.len(),
-            vab.profile().reference_g_m_s2
-        ));
+        // Burn segments — one row each: duration (s), commanded
+        // throttle, regime (the tag the stress rules key on). The
+        // table ships as ONE `SetBurnSegments` op so a row edit can
+        // never half-commit, and the op is outside undo history like
+        // the other profile drags.
+        let mut segs = vab.profile().burn_segments.clone();
+        let mut edited = false;
+        let mut remove_at = None;
+        for (i, seg) in segs.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.weak(format!("{}", i + 1));
+                edited |= ui
+                    .add(
+                        egui::DragValue::new(&mut seg.duration_s)
+                            .range(0.0..=3_600.0)
+                            .suffix(" s"),
+                    )
+                    .changed();
+                ui.label("thr");
+                edited |= ui
+                    .add(
+                        egui::DragValue::new(&mut seg.throttle)
+                            .range(0.0..=1.0)
+                            .speed(0.02),
+                    )
+                    .changed();
+                egui::ComboBox::from_id_salt(("seg_regime", i))
+                    .selected_text(regime_label(seg.regime))
+                    .show_ui(ui, |ui| {
+                        for r in [
+                            csp_phys::Regime::Atmosphere,
+                            csp_phys::Regime::Vacuum,
+                            csp_phys::Regime::Surface,
+                        ] {
+                            edited |= ui
+                                .selectable_value(&mut seg.regime, r, regime_label(r))
+                                .changed();
+                        }
+                    });
+                if ui.small_button("✕").clicked() {
+                    remove_at = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove_at {
+            segs.remove(i);
+            edited = true;
+        }
+        if ui.small_button("+ segment").clicked() {
+            // A new row inherits the vacuum-cruise default — the
+            // regime the appended leg most often is.
+            segs.push(csp_phys::BurnSegment {
+                duration_s: 60.0,
+                throttle: 1.0,
+                regime: csp_phys::Regime::Vacuum,
+            });
+            edited = true;
+        }
+        if edited {
+            let _ = vab.apply(VabAction::SetBurnSegments(segs));
+        }
+        ui.weak(format!("g₀ ref {:.2} m/s²", vab.profile().reference_g_m_s2));
     });
 
     // Craft file IO — the bytes ride the outbox; the app owns the
@@ -5181,8 +5320,10 @@ mod tests {
 
     /// Phase-3 W3.3: the root lifts as the whole-craft carry — an
     /// empty-space drop lands it at the view's drop anchor (the stack
-    /// follows rigidly), hovering a part refuses the mount, and
-    /// `Translate` nudges the same rigid way.
+    /// follows rigidly) and hovering a part refuses the mount. This
+    /// grab-and-drop path is also the player's only free-reposition
+    /// gesture — the never-issued `VabAction::Translate` verb was
+    /// removed for it (C17-F6).
     #[test]
     fn root_grab_moves_the_whole_craft() {
         let mut vab = VabSession::new(mini_catalog(), mini_resources());
@@ -5228,18 +5369,11 @@ mod tests {
             root
         );
 
-        // `Translate` is the same rigid move, programmatic.
-        vab.apply(VabAction::Translate(DVec3::new(0.0, 0.0, 5.0)))
-            .unwrap();
-        assert_eq!(
-            vab.session().node(root).unwrap().transform().offset,
-            DVec3::new(2.0, 3.0, 4.0)
-        );
-        // And it is undoable.
+        // And the whole-craft move is undoable.
         vab.apply(VabAction::Undo).unwrap();
         assert_eq!(
             vab.session().node(root).unwrap().transform().offset,
-            DVec3::new(2.0, 3.0, -1.0)
+            DVec3::new(0.0, 0.0, 0.0)
         );
     }
 
@@ -5280,5 +5414,117 @@ mod tests {
         vab.apply(VabAction::Undo).unwrap();
         assert_eq!(vab.session().len(), 3);
         assert!(vab.session().contains(mid));
+    }
+
+    /// C17-F3: undo/redo bump the stale-pick `pick_generation` but
+    /// leave the camera-refit `craft_epoch` alone — a history walk
+    /// must not reset the player's zoom/pan. Only `New`/`LoadBytes`
+    /// move both counters.
+    #[test]
+    fn history_restore_moves_pick_generation_not_craft_epoch() {
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        vab.apply(VabAction::SetRoot(PartId::from("t.tank")))
+            .unwrap();
+        let bytes = vab.to_bytes().unwrap();
+        let (epoch0, gen0) = (vab.craft_epoch(), vab.pick_generation());
+
+        // Plain edits move NEITHER counter — ids are never reused
+        // inside one session generation (`next_id` is monotonic), so
+        // a stale pick only dead-ends, and the framed craft is the
+        // same one.
+        let root = vab.session().root().unwrap();
+        vab.apply(VabAction::AttachAuto {
+            part: PartId::from("t.eng"),
+            parent: root,
+        })
+        .unwrap();
+        assert_eq!(vab.craft_epoch(), epoch0, "an edit must not refit");
+        assert_eq!(vab.pick_generation(), gen0);
+
+        // Undo/redo: the pick generation advances (the restored
+        // snapshot's rolled-back `next_id` can re-mint a stale id
+        // onto a different node) — the camera epoch stays put.
+        vab.apply(VabAction::Undo).unwrap();
+        assert_eq!(vab.craft_epoch(), epoch0, "undo must not refit the camera");
+        assert_eq!(vab.pick_generation(), gen0 + 1);
+        vab.apply(VabAction::Redo).unwrap();
+        assert_eq!(vab.craft_epoch(), epoch0);
+        assert_eq!(vab.pick_generation(), gen0 + 2);
+
+        // New/load are wholesale replacements: they reframe the
+        // camera AND invalidate an in-flight pick.
+        vab.apply(VabAction::New).unwrap();
+        assert_eq!(vab.craft_epoch(), epoch0 + 1);
+        assert_eq!(vab.pick_generation(), gen0 + 3);
+        vab.apply(VabAction::LoadBytes(bytes)).unwrap();
+        assert_eq!(vab.craft_epoch(), epoch0 + 2);
+        assert_eq!(vab.pick_generation(), gen0 + 4);
+    }
+
+    /// C10-F3/C13-F7: the profile's burn segments are editable
+    /// session data — `SetBurnSegments` replaces the plan wholesale,
+    /// sanitizes out-of-domain rows, and stays out of undo history
+    /// (per-row drag spam, same as the scalar profile setters).
+    #[test]
+    fn set_burn_segments_edits_the_profile() {
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        let undo_depth = vab.undo_stack.len();
+        vab.apply(VabAction::SetBurnSegments(vec![
+            csp_phys::BurnSegment {
+                duration_s: 90.0,
+                throttle: 0.8,
+                regime: csp_phys::Regime::Atmosphere,
+            },
+            // Refused field-wise: a negative duration.
+            csp_phys::BurnSegment {
+                duration_s: -5.0,
+                throttle: 1.0,
+                regime: csp_phys::Regime::Vacuum,
+            },
+            csp_phys::BurnSegment {
+                duration_s: 30.0,
+                throttle: 7.0, // clamps into the commanded range
+                regime: csp_phys::Regime::Surface,
+            },
+        ]))
+        .unwrap();
+        let segs = &vab.profile().burn_segments;
+        assert_eq!(segs.len(), 2, "the negative-duration row dropped");
+        assert_eq!(segs[0].duration_s, 90.0);
+        assert_eq!(segs[0].regime, csp_phys::Regime::Atmosphere);
+        assert_eq!(segs[1].throttle, 1.0, "throttle clamped to [0, 1]");
+        assert_eq!(
+            vab.undo_stack.len(),
+            undo_depth,
+            "profile edits aren't history ops"
+        );
+    }
+
+    /// C10-F3: the confidence readout's qualification table is the
+    /// staged save-side one — `VabTech` carries it verbatim, and an
+    /// unstaged session honestly reports `None` (FRESH eval).
+    #[test]
+    fn staged_qualifications_reach_the_session() {
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        assert!(vab.qualifications().is_none());
+        let mut quals = csp_phys::FamilyQualifications::default();
+        quals.insert(
+            csp_data::FamilyId::from("f"),
+            csp_phys::FamilyQualification {
+                flight_units: 3.0,
+                bench_units: 2.0,
+                observed_failures: 1,
+            },
+        );
+        vab.set_tech(Some(VabTech {
+            tree: csp_data::TechTree::default(),
+            researched: Default::default(),
+            track_levels: Default::default(),
+            qualifications: quals,
+        }));
+        assert_eq!(
+            vab.qualifications().unwrap()[&csp_data::FamilyId::from("f")].units(),
+            5.0
+        );
     }
 }

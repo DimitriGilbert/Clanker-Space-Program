@@ -55,6 +55,21 @@ pub struct GameMenuOutput {
     pub new_game: bool,
 }
 
+/// The menu-side mirror of the app's `safe_slot_name` rule (the
+/// authoritative check stays in `csp-app` as defense in depth — this
+/// one exists so a refused name never reaches it: the button disables
+/// and the field keeps the typed text, C22-F6). Keep the two in
+/// lockstep: same char class, same length cap, same trim/dot rules.
+fn slot_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ' '))
+        && name.trim() == name
+        && !name.starts_with('.')
+}
+
 /// Draw the menu's own bar button + its windows — returns the rects
 /// drawn so the VAB pointer mask can exclude them.
 #[allow(clippy::too_many_lines)] // one menu pass — the windows are the list
@@ -82,8 +97,24 @@ pub fn game_menu(
                             .desired_width(110.0)
                             .hint_text("slot name"),
                     );
+                    // Gate on the slot-name rule BEFORE emitting — the
+                    // app keeps its own check (defense in depth), but
+                    // clearing the field ahead of that validation meant
+                    // a refused name ate the typed text (C22-F6). A name
+                    // the rule refuses never leaves the field; the
+                    // player edits it in place instead of retyping.
                     let name = state.save_name.trim();
-                    if ui.button("Save").clicked() && !name.is_empty() {
+                    let save = ui.add_enabled(slot_name_ok(name), egui::Button::new("Save"));
+                    // `on_disabled_hover_text` consumes the Response —
+                    // rebind; a disabled button can never click anyway.
+                    let save = if slot_name_ok(name) {
+                        save
+                    } else {
+                        save.on_disabled_hover_text(
+                            "letters, digits, space, - _ . only · ≤ 64 chars · no leading '.'",
+                        )
+                    };
+                    if save.clicked() {
                         out.save = Some(name.to_string());
                         state.save_name.clear();
                         ui.close();
@@ -195,4 +226,27 @@ pub fn game_menu(
         rects.push(rect);
     }
     rects
+}
+
+#[cfg(test)]
+mod tests {
+    /// C22-F6: the menu-side gate mirrors the app's `safe_slot_name`
+    /// — every refusal class stays typed-in-field instead of being
+    /// emitted and eaten by the app-side check.
+    #[test]
+    fn slot_name_rule_mirrors_the_app_gate() {
+        use super::slot_name_ok;
+        assert!(slot_name_ok("apollo-11"));
+        assert!(slot_name_ok("a b_c.d 1"));
+        assert!(!slot_name_ok(""));
+        assert!(!slot_name_ok("a/b"));
+        assert!(!slot_name_ok("a\\b"));
+        assert!(!slot_name_ok(".hidden"));
+        assert!(!slot_name_ok("trailing "));
+        assert!(!slot_name_ok(" leading"));
+        assert!(!slot_name_ok("ünïcode"));
+        assert!(!slot_name_ok("ctrl\nchar"));
+        assert!(!slot_name_ok(&"x".repeat(65)));
+        assert!(slot_name_ok(&"x".repeat(64)));
+    }
 }
