@@ -1473,195 +1473,367 @@ pub struct AdvanceReport {
     pub script_log: Vec<(ScriptId, String)>,
 }
 
-/// The world's §7.2 serialized set — everything `World::restore` needs to
-/// resume a world that produces identical stamps, hashes, and state.
+/// The §7.2 serialized-set field list — the ONE declaration of which
+/// `World` fields the snapshot carries. `define_world_snapshot` reads
+/// it to emit `WorldSnapshot`, [`World::snapshot_fields`] (the
+/// `snapshot()` field copy), and [`World::from_validated_snapshot`]
+/// (the `restore()` constructor tail): adding a serialized field used
+/// to be three hand-kept parallel lists that could drift — a missed
+/// `restore` arm lost the field across save→load with no error.
 ///
-/// Deliberately excludes the in-flight `pending` queue and the
-/// `command_log`: the log is an output artifact (§7.6), and snapshot
-/// boundaries are defined at *drained* boundaries — an enqueued command is
-/// not yet world state; it becomes state only at the drain that stamps it
-/// (which is also why the log can reproduce the run from this set alone).
-/// [`World::snapshot`] refuses while the queue is non-empty
-/// ([`World::check_serializable`], §7.4), so the exclusion can never
-/// silently drop an undrained command.
+/// Entry forms:
+/// - `name : Ty = copy` — `snapshot()` copies `world.name` (a `Copy`
+///   field: scalars and plain-data configs);
+/// - `name : Ty = clone` — `snapshot()` clones `world.name`;
+/// - `name : Ty = special` — each consumer spells the field out
+///   (`clock_ticks` ↔ `clock`'s `SimTime` conversions, `event_heap` ↔
+///   `BinaryHeap`);
+/// - `=> w` — the `World` field's name differs from the snapshot's
+///   (`clock_ticks` → `clock`, `vessel_caps` → `caps`).
 ///
-/// The orbit model is excluded too: it is a pure function of the data set
-/// (§7.3's re-derived-on-load class), handed in at construction.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct WorldSnapshot {
-    /// `clock.ticks()` at snapshot time.
-    pub clock_ticks: u64,
-    /// The stored warp ladder rung.
-    pub warp_level: u32,
-    /// §2.2's `active_vessel` — the player's focused vessel (the
-    /// `World` field's doc carries the full rule). `#[serde(default)]`
-    /// is CBOR-forward tolerance only — `decode_body`'s byte-exact
-    /// re-encode gate (`save.rs`) still refuses a pre-field stamped-3
-    /// body (`TrailingBytes`: the re-encode writes the key back), so
-    /// the load contract is "present in every body that loads" and
-    /// `None` is the inert value.
-    #[serde(default)]
-    pub active_vessel: Option<VesselId>,
-    /// Per-source dequeue counters — restoring them is what lets a resumed
-    /// world keep stamping the recorded `source_seq`s.
-    pub source_seqs: BTreeMap<(SourceClass, u32), u64>,
-    /// The §2.6.5 events-per-frame budget — construction config,
-    /// serialized so a restored world enforces the same cap.
-    pub event_budget: u64,
-    /// §7.2 next-ID counter for the vessel arena (monotonic, never reused).
-    pub next_vessel_id: u64,
-    /// The on-rails vessel arena. `BTreeMap` key order is ascending-ID;
-    /// ids are monotonic and never reused — removal (`RecoverVessel`,
-    /// `TerminateVessel`, debris eviction) deletes the map entry but
-    /// never frees the id — so no free list or slot generations exist
-    /// to serialize (§7.1 rule 5 — they would be allocator state
-    /// anyway).
-    pub vessels: BTreeMap<VesselId, Vessel>,
-    /// §2.6.5's Silent→Clamping per-object opt-in set.
-    pub tracked_vessels: BTreeSet<VesselId>,
-    /// §7.2 "including `event_seq` and `next_event_seq`" — the monotonic
-    /// insertion counter that makes heap ordering total under ties.
-    pub next_event_seq: u64,
-    /// The event heap's contents in `(tick, seq)` order — the canonical
-    /// enumeration; restore re-heapifies deterministically.
-    pub event_heap: Vec<ScheduledEvent>,
-    /// §3.5's object caps — construction config, serialized so a
-    /// restored world enforces the same limits.
-    pub vessel_caps: VesselCaps,
-    /// §2.4's docking tunables — construction config, serialized so a
-    /// restored world enforces the same predicate/compliance/cap.
-    /// (Live joints themselves are never in a snapshot — §7.4 refuses
-    /// the boundary while any exist; see [`crate::joints`].)
-    pub docking: DockingConfig,
-    /// §2.4's refused vessel pairs — captures that degraded to a clean
-    /// separation (a full cap) or whose joint expired while the pair
-    /// was still posed. **Serialized**, unlike the live joints: a
-    /// refusal can outlive every transient (the pair stays posed after
-    /// the joint is gone — exactly the state the §7.4 boundary
-    /// admits), and a restore that dropped it would let the next
-    /// detection pass re-capture the pair, diverging the run on its
-    /// first tick. Canonical `(a < b)` pair order; `BTreeSet` is the
-    /// canonical enumeration.
-    pub joint_refused: BTreeSet<(VesselId, VesselId)>,
-    /// §3.5's transfer tunables — construction config, serialized so a
-    /// restored world enforces the same precondition/rate/delay
-    /// (M6-D; the `docking` precedent).
-    pub transfer_cfg: TransferConfig,
-    /// M6-D's in-flight transfer arena — the `ResourceTransfer`/crew
-    /// process records, keyed by their monotonic ids. **Serialized**
-    /// (§7.4 does not refuse them): each record pairs with exactly one
-    /// pending `TransferComplete` event at `complete_tick` — the
-    /// restore coherence check enforces both directions.
-    pub transfers: BTreeMap<TransferId, ActiveTransfer>,
-    /// §7.2 next-ID counter for the transfer arena (monotonic, never
-    /// reused).
-    pub next_transfer_id: u64,
-    /// §7.2 next-ID counter for the crew arena (monotonic, never
-    /// reused) — [`SimCommand::BoardCrew`] allocates from it.
-    pub next_crew_id: u64,
-    /// M7-A's §3.2 tunables — construction config, serialized so a
-    /// restored world enforces the same yield curve / exhaustion
-    /// epsilon / transmit economics (the `transfer_cfg` precedent).
-    pub science_cfg: ScienceConfig,
-    /// M7-A's §3.2 book — banked science, the per-key ledger, and the
-    /// project arena. **Serialized** (§7.4 does not refuse it): each
-    /// project pairs with its exhaustion event pair at
-    /// `exhaust_tick` — the restore coherence check enforces that
-    /// direction; orphan research events are tolerated like
-    /// `TransferComplete` orphans (they fire as no-ops).
-    pub science: ScienceState,
-    /// M7-B's §3.3/§3.4 progression record — §7.2 "tech state" and
-    /// "`FamilyQualification` per family": the researched node set,
-    /// purchased upgrade-track levels, and family qualification
-    /// records. **Serialized and hashed** — a lost researched node or
-    /// level silently re-locks parts and unspends science.
-    pub tech: TechState,
-    /// M7-C's §3.5 economy book — funds (micro-units), the insolvency
-    /// flag, the crew roster, and the site inventory arena.
-    /// **Serialized and hashed** (the ledger inside is serialized but
-    /// never hashed — recorded history, the `command_log` precedent).
-    pub economy: EconomyState,
-    /// M7-C's §3.5 economy tunables — construction config, serialized
-    /// so a restored world enforces the same cadence/costs/shares
-    /// (the `science_cfg` precedent).
-    pub economy_cfg: EconomyConfig,
-    /// §2.7's save seed — the KDF input the contract generator
-    /// draws under. Serialized and hashed: the seed selects the
-    /// offer params (M7-D).
-    pub save_seed: u64,
-    /// M7-D's §3.6 contract book — the offer board, the
-    /// `offer_index` counter (§7.2's named monotonic index), the
-    /// active arena, and the completed-contract fact record.
-    /// **Serialized and hashed** — a lost fact silently re-locks
-    /// gated offers.
-    pub contracts: ContractState,
-    /// §3.6's contract tunables — construction config, serialized
-    /// so a restored world enforces the same board size (the
-    /// `economy_cfg` precedent).
-    pub contract_cfg: ContractConfig,
-    /// M8-A's §3.5.1 colony arena — site refs, body-fixed poses, the
-    /// module lists, the `ColonyState`s, the epoch-anchored linear
-    /// stores, and the held solve outputs. **Serialized and hashed**
-    /// (§7.2's "colony stores, `ColonyState`, flow-network levels").
-    pub colonies: BTreeMap<ColonyId, Colony>,
-    /// §7.2 next-ID counter for the colony arena (monotonic, never
-    /// reused).
-    pub next_colony_id: u64,
-    /// M8-B's §3.5 build-order arena — one record per in-flight
-    /// `ManufactureCraft`, keyed by monotonic `BuildId`. **Serialized
-    /// and hashed**: each record pairs with exactly one pending
-    /// `ConstructionComplete` at `complete_tick` (the `transfers`
-    /// precedent — restore enforces both directions).
-    pub builds: BTreeMap<manufacture::BuildId, manufacture::ActiveBuild>,
-    /// §7.2 next-ID counter for the build arena.
-    pub next_build_id: u64,
-    /// M8-C's §3.5 per-save life-support toggle — serialized and
-    /// hashed (it selects whether the subsystem evolves). Opt-in:
-    /// `World::new` starts with it `false` (see [`life_support`]).
-    pub life_support_enabled: bool,
-    /// M8-C's vessel-side life-support tunables — construction
-    /// config, serialized so a restored world enforces the same
-    /// cadence/rates (the `economy_cfg` precedent).
-    pub life_support_cfg: LifeSupportConfig,
-    /// M9a §2.10's script arena — source, strikes, poll bookkeeping,
-    /// wake pairing, and the `persist` maps. **Serialized and
-    /// hashed** (§2.10: "persist … serialized into the save and
-    /// included in the state hash"; the rest is strike/wake state
-    /// that changes evolution). A `wake_tick` pairs with exactly one
-    /// pending `ScriptWake` at that tick — the restore coherence
-    /// check enforces both directions (the `transfers` precedent).
-    pub scripts: BTreeMap<ScriptId, ScriptState>,
-    /// §7.2 next-ID counter for the script arena (monotonic, never
-    /// reused).
-    pub next_script_id: u64,
-    /// §2.10's per-save op budget — construction config, serialized
-    /// so a restored world enforces the same call limit (the
-    /// `event_budget` precedent).
-    pub script_op_budget: u64,
-    /// M9a §2.10's engaged autopilots — one record per vessel
-    /// carrying a program (phase state lives in `persist`).
-    /// **Serialized and hashed** sim state.
-    pub autopilots: BTreeMap<VesselId, AutopilotState>,
-    /// §7.2 next-ID counter for part instances (M9b §3.4 —
-    /// monotonic, never reused; the `{RELIABILITY}`/`{IGNITION}`
-    /// KDF entity allocator).
-    pub next_part_instance_id: u64,
-    /// M9b §3.4's reliability tunables — construction config,
-    /// serialized so a restored world enforces the same rates
-    /// (the `transfer_cfg` precedent).
-    pub reliability_cfg: reliability::ReliabilityConfig,
-    /// M9b §3.4's notification log — dormant-failure and misfire
-    /// records, bounded by `notification_cap`. **Serialized, never
-    /// hashed** — recorded history, the ledger precedent.
-    pub notifications: std::collections::VecDeque<reliability::Notification>,
-    /// M9b §3.4's test-stand arena — one record per in-flight
-    /// `RunBenchTest`, keyed by monotonic `BenchId`. **Serialized
-    /// and hashed** — each pairs with exactly one pending
-    /// `BenchTestComplete` (the `builds` precedent).
-    pub bench_runs: BTreeMap<reliability::BenchId, reliability::ActiveBench>,
-    /// §7.2 next-ID counter for the bench arena.
-    pub next_bench_id: u64,
+/// List order is the struct's declaration order — keep it stable:
+/// serde writes fields in it.
+macro_rules! for_each_snapshot_field {
+    ($consumer:ident) => {
+        $consumer! {
+            /// `clock.ticks()` at snapshot time.
+            clock_ticks : u64 = special => clock;
+            /// The stored warp ladder rung.
+            warp_level : u32 = copy;
+            /// §2.2's `active_vessel` — the player's focused vessel (the
+            /// `World` field's doc carries the full rule). `#[serde(default)]`
+            /// is CBOR-forward tolerance only — `decode_body`'s byte-exact
+            /// re-encode gate (`save.rs`) still refuses a pre-field stamped-3
+            /// body (`TrailingBytes`: the re-encode writes the key back), so
+            /// the load contract is "present in every body that loads" and
+            /// `None` is the inert value.
+            #[serde(default)]
+            active_vessel : Option<VesselId> = copy;
+            /// Per-source dequeue counters — restoring them is what lets a resumed
+            /// world keep stamping the recorded `source_seq`s.
+            source_seqs : BTreeMap<(SourceClass, u32), u64> = clone;
+            /// The §2.6.5 events-per-frame budget — construction config,
+            /// serialized so a restored world enforces the same cap.
+            event_budget : u64 = copy;
+            /// §7.2 next-ID counter for the vessel arena (monotonic, never reused).
+            next_vessel_id : u64 = copy;
+            /// The on-rails vessel arena. `BTreeMap` key order is ascending-ID;
+            /// ids are monotonic and never reused — removal (`RecoverVessel`,
+            /// `TerminateVessel`, debris eviction) deletes the map entry but
+            /// never frees the id — so no free list or slot generations exist
+            /// to serialize (§7.1 rule 5 — they would be allocator state
+            /// anyway).
+            vessels : BTreeMap<VesselId, Vessel> = clone;
+            /// §2.6.5's Silent→Clamping per-object opt-in set.
+            tracked_vessels : BTreeSet<VesselId> = clone;
+            /// §7.2 "including `event_seq` and `next_event_seq`" — the monotonic
+            /// insertion counter that makes heap ordering total under ties.
+            next_event_seq : u64 = copy;
+            /// The event heap's contents in `(tick, seq)` order — the canonical
+            /// enumeration; restore re-heapifies deterministically.
+            event_heap : Vec<ScheduledEvent> = special;
+            /// §3.5's object caps — construction config, serialized so a
+            /// restored world enforces the same limits.
+            vessel_caps : VesselCaps = copy => caps;
+            /// §2.4's docking tunables — construction config, serialized so a
+            /// restored world enforces the same predicate/compliance/cap.
+            /// (Live joints themselves are never in a snapshot — §7.4 refuses
+            /// the boundary while any exist; see [`crate::joints`].)
+            docking : DockingConfig = copy;
+            /// §2.4's refused vessel pairs — captures that degraded to a clean
+            /// separation (a full cap) or whose joint expired while the pair
+            /// was still posed. **Serialized**, unlike the live joints: a
+            /// refusal can outlive every transient (the pair stays posed after
+            /// the joint is gone — exactly the state the §7.4 boundary
+            /// admits), and a restore that dropped it would let the next
+            /// detection pass re-capture the pair, diverging the run on its
+            /// first tick. Canonical `(a < b)` pair order; `BTreeSet` is the
+            /// canonical enumeration.
+            joint_refused : BTreeSet<(VesselId, VesselId)> = clone;
+            /// §3.5's transfer tunables — construction config, serialized so a
+            /// restored world enforces the same precondition/rate/delay
+            /// (M6-D; the `docking` precedent).
+            transfer_cfg : TransferConfig = copy;
+            /// M6-D's in-flight transfer arena — the `ResourceTransfer`/crew
+            /// process records, keyed by their monotonic ids. **Serialized**
+            /// (§7.4 does not refuse them): each record pairs with exactly one
+            /// pending `TransferComplete` event at `complete_tick` — the
+            /// restore coherence check enforces both directions.
+            transfers : BTreeMap<TransferId, ActiveTransfer> = clone;
+            /// §7.2 next-ID counter for the transfer arena (monotonic, never
+            /// reused).
+            next_transfer_id : u64 = copy;
+            /// §7.2 next-ID counter for the crew arena (monotonic, never
+            /// reused) — [`SimCommand::BoardCrew`] allocates from it.
+            next_crew_id : u64 = copy;
+            /// M7-A's §3.2 tunables — construction config, serialized so a
+            /// restored world enforces the same yield curve / exhaustion
+            /// epsilon / transmit economics (the `transfer_cfg` precedent).
+            science_cfg : ScienceConfig = copy;
+            /// M7-A's §3.2 book — banked science, the per-key ledger, and the
+            /// project arena. **Serialized** (§7.4 does not refuse it): each
+            /// project pairs with its exhaustion event pair at
+            /// `exhaust_tick` — the restore coherence check enforces that
+            /// direction; orphan research events are tolerated like
+            /// `TransferComplete` orphans (they fire as no-ops).
+            science : ScienceState = clone;
+            /// M7-B's §3.3/§3.4 progression record — §7.2 "tech state" and
+            /// "`FamilyQualification` per family": the researched node set,
+            /// purchased upgrade-track levels, and family qualification
+            /// records. **Serialized and hashed** — a lost researched node or
+            /// level silently re-locks parts and unspends science.
+            tech : TechState = clone;
+            /// M7-C's §3.5 economy book — funds (micro-units), the insolvency
+            /// flag, the crew roster, and the site inventory arena.
+            /// **Serialized and hashed** (the ledger inside is serialized but
+            /// never hashed — recorded history, the `command_log` precedent).
+            economy : EconomyState = clone;
+            /// M7-C's §3.5 economy tunables — construction config, serialized
+            /// so a restored world enforces the same cadence/costs/shares
+            /// (the `science_cfg` precedent).
+            economy_cfg : EconomyConfig = copy;
+            /// §2.7's save seed — the KDF input the contract generator
+            /// draws under. Serialized and hashed: the seed selects the
+            /// offer params (M7-D).
+            save_seed : u64 = copy;
+            /// M7-D's §3.6 contract book — the offer board, the
+            /// `offer_index` counter (§7.2's named monotonic index), the
+            /// active arena, and the completed-contract fact record.
+            /// **Serialized and hashed** — a lost fact silently re-locks
+            /// gated offers.
+            contracts : ContractState = clone;
+            /// §3.6's contract tunables — construction config, serialized
+            /// so a restored world enforces the same board size (the
+            /// `economy_cfg` precedent).
+            contract_cfg : ContractConfig = copy;
+            /// M8-A's §3.5.1 colony arena — site refs, body-fixed poses, the
+            /// module lists, the `ColonyState`s, the epoch-anchored linear
+            /// stores, and the held solve outputs. **Serialized and hashed**
+            /// (§7.2's "colony stores, `ColonyState`, flow-network levels").
+            colonies : BTreeMap<ColonyId, Colony> = clone;
+            /// §7.2 next-ID counter for the colony arena (monotonic, never
+            /// reused).
+            next_colony_id : u64 = copy;
+            /// M8-B's §3.5 build-order arena — one record per in-flight
+            /// `ManufactureCraft`, keyed by monotonic `BuildId`. **Serialized
+            /// and hashed**: each record pairs with exactly one pending
+            /// `ConstructionComplete` at `complete_tick` (the `transfers`
+            /// precedent — restore enforces both directions).
+            builds : BTreeMap<manufacture::BuildId, manufacture::ActiveBuild> = clone;
+            /// §7.2 next-ID counter for the build arena.
+            next_build_id : u64 = copy;
+            /// M8-C's §3.5 per-save life-support toggle — serialized and
+            /// hashed (it selects whether the subsystem evolves). Opt-in:
+            /// `World::new` starts with it `false` (see [`life_support`]).
+            life_support_enabled : bool = copy;
+            /// M8-C's vessel-side life-support tunables — construction
+            /// config, serialized so a restored world enforces the same
+            /// cadence/rates (the `economy_cfg` precedent).
+            life_support_cfg : LifeSupportConfig = copy;
+            /// M9a §2.10's script arena — source, strikes, poll bookkeeping,
+            /// wake pairing, and the `persist` maps. **Serialized and
+            /// hashed** (§2.10: "persist … serialized into the save and
+            /// included in the state hash"; the rest is strike/wake state
+            /// that changes evolution). A `wake_tick` pairs with exactly one
+            /// pending `ScriptWake` at that tick — the restore coherence
+            /// check enforces both directions (the `transfers` precedent).
+            scripts : BTreeMap<ScriptId, ScriptState> = clone;
+            /// §7.2 next-ID counter for the script arena (monotonic, never
+            /// reused).
+            next_script_id : u64 = copy;
+            /// §2.10's per-save op budget — construction config, serialized
+            /// so a restored world enforces the same call limit (the
+            /// `event_budget` precedent).
+            script_op_budget : u64 = copy;
+            /// M9a §2.10's engaged autopilots — one record per vessel
+            /// carrying a program (phase state lives in `persist`).
+            /// **Serialized and hashed** sim state.
+            autopilots : BTreeMap<VesselId, AutopilotState> = clone;
+            /// §7.2 next-ID counter for part instances (M9b §3.4 —
+            /// monotonic, never reused; the `{RELIABILITY}`/`{IGNITION}`
+            /// KDF entity allocator).
+            next_part_instance_id : u64 = copy;
+            /// M9b §3.4's reliability tunables — construction config,
+            /// serialized so a restored world enforces the same rates
+            /// (the `transfer_cfg` precedent).
+            reliability_cfg : reliability::ReliabilityConfig = clone;
+            /// M9b §3.4's notification log — dormant-failure and misfire
+            /// records, bounded by `notification_cap`. **Serialized, never
+            /// hashed** — recorded history, the ledger precedent.
+            notifications : std::collections::VecDeque<reliability::Notification> = clone;
+            /// M9b §3.4's test-stand arena — one record per in-flight
+            /// `RunBenchTest`, keyed by monotonic `BenchId`. **Serialized
+            /// and hashed** — each pairs with exactly one pending
+            /// `BenchTestComplete` (the `builds` precedent).
+            bench_runs : BTreeMap<reliability::BenchId, reliability::ActiveBench> = clone;
+            /// §7.2 next-ID counter for the bench arena.
+            next_bench_id : u64 = copy;
+        }
+    };
 }
+
+/// One `snapshot()` field's value — invoked per list entry by
+/// `define_world_snapshot`. `copy`/`clone` are the uniform arms; the
+/// `special`s spell their own conversion.
+macro_rules! snapshot_write_value {
+    ($slf:ident ; clock_ticks = special $(=> $wf:ident)? ;) => {
+        $slf.clock.ticks()
+    };
+    ($slf:ident ; event_heap = special ;) => {{
+        // `(tick, seq)` is the canonical enumeration (the field's
+        // doc) — the heap's sift order is allocator detail, so the
+        // snapshot sorts it out.
+        let mut heap: Vec<ScheduledEvent> = $slf.event_heap.iter().cloned().collect();
+        heap.sort_by_key(|e| (e.tick, e.seq));
+        heap
+    }};
+    ($slf:ident ; $name:ident = special ;) => {
+        compile_error!("snapshot `special` field lacks a `snapshot()` arm — spell it out here")
+    };
+    ($slf:ident ; $name:ident = special => $wf:ident ;) => {
+        compile_error!("snapshot `special` field lacks a `snapshot()` arm — spell it out here")
+    };
+    ($slf:ident ; $name:ident = copy ;) => {
+        $slf.$name
+    };
+    ($slf:ident ; $name:ident = clone ;) => {
+        $slf.$name.clone()
+    };
+    ($slf:ident ; $name:ident = copy => $wf:ident ;) => {
+        $slf.$wf
+    };
+    ($slf:ident ; $name:ident = clone => $wf:ident ;) => {
+        $slf.$wf.clone()
+    };
+    ($slf:ident ; $name:ident = $mode:ident $(=> $wf:ident)? ;) => {
+        compile_error!("snapshot field mode must be `copy`, `clone`, or `special`")
+    };
+}
+
+/// One `restore()` field's value — invoked by the
+/// `snapshot_restore_literal` muncher per list entry. The generic arm
+/// moves the field; the `special`s spell their own conversion.
+macro_rules! snapshot_restore_value {
+    ($s:ident ; clock_ticks = special) => {
+        SimTime::from_ticks($s.clock_ticks)
+    };
+    ($s:ident ; event_heap = special) => {
+        BinaryHeap::from($s.event_heap)
+    };
+    ($s:ident ; $name:ident = special) => {
+        compile_error!("snapshot `special` field lacks a `restore()` arm — spell it out here")
+    };
+    ($s:ident ; $name:ident = $mode:ident) => {
+        $s.$name
+    };
+}
+
+/// Folds the field list into `World`-literal fields `w: <value>` for
+/// `from_validated_snapshot` — a tt-muncher because the `World` field
+/// name (the literal's left side) defaults to the snapshot name but
+/// `=> w` renames it (`vessel_caps` → `caps`), and a `$(...)*`
+/// repetition can't make that per-entry choice. The non-snapshot
+/// fields seed the accumulator at the call site.
+macro_rules! snapshot_restore_literal {
+    ({ $s:ident ; [$($acc:tt)*] }) => {
+        Self { $($acc)* }
+    };
+    ({ $s:ident ; [$($acc:tt)*] } $(#[$m:meta])* $name:ident : $ty:ty = $mode:ident => $wf:ident ; $($rest:tt)*) => {
+        snapshot_restore_literal!({ $s ; [$($acc)* $wf: snapshot_restore_value!($s ; $name = $mode),] } $($rest)*)
+    };
+    ({ $s:ident ; [$($acc:tt)*] } $(#[$m:meta])* $name:ident : $ty:ty = $mode:ident ; $($rest:tt)*) => {
+        snapshot_restore_literal!({ $s ; [$($acc)* $name: snapshot_restore_value!($s ; $name = $mode),] } $($rest)*)
+    };
+}
+
+/// Emits [`WorldSnapshot`], [`World::snapshot_fields`], and
+/// [`World::from_validated_snapshot`] from the
+/// `for_each_snapshot_field` list — see that macro's doc for the entry
+/// grammar and why the list is single-sourced.
+macro_rules! define_world_snapshot {
+    ($( $(#[$meta:meta])* $name:ident : $ty:ty = $mode:ident $(=> $wf:ident)? ;)*) => {
+        /// The world's §7.2 serialized set — everything `World::restore` needs to
+        /// resume a world that produces identical stamps, hashes, and state.
+        ///
+        /// Deliberately excludes the in-flight `pending` queue and the
+        /// `command_log`: the log is an output artifact (§7.6), and snapshot
+        /// boundaries are defined at *drained* boundaries — an enqueued command is
+        /// not yet world state; it becomes state only at the drain that stamps it
+        /// (which is also why the log can reproduce the run from this set alone).
+        /// [`World::snapshot`] refuses while the queue is non-empty
+        /// ([`World::check_serializable`], §7.4), so the exclusion can never
+        /// silently drop an undrained command.
+        ///
+        /// The orbit model is excluded too: it is a pure function of the data set
+        /// (§7.3's re-derived-on-load class), handed in at construction.
+        ///
+        /// The field list itself is `for_each_snapshot_field`'s — it also
+        /// drives `snapshot_fields`/`from_validated_snapshot`, so the
+        /// three sites cannot disagree about what the serialized set is.
+        #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+        pub struct WorldSnapshot {
+            $( $(#[$meta])* pub $name: $ty, )*
+        }
+
+        impl World {
+            /// The field-copy half of [`World::snapshot`] — the
+            /// `for_each_snapshot_field` list emitted whole; the pub
+            /// method adds the §7.4 boundary gate.
+            fn snapshot_fields(&self) -> WorldSnapshot {
+                WorldSnapshot {
+                    $( $name: snapshot_write_value!{ self ; $name = $mode $(=> $wf)? ; }, )*
+                }
+            }
+
+            /// The constructor half of [`World::restore`] — moves the
+            /// snapshot's fields into a `World` the same list names.
+            /// Every coherence check is `restore`'s job BEFORE this
+            /// runs (`mut snapshot` arrives fully validated); the
+            /// non-snapshot fields re-init to their boundary states —
+            /// `pending`/`command_log`/`script_log` empty (the §7.4
+            /// drained boundary and the §7.6 output-artifact rules),
+            /// `joints` empty (§7.4 refuses live joints), `physics`
+            /// rebuilt from the handed-in config like `with_physics`,
+            /// the data-derived tables empty for `WorldConfig` to
+            /// re-install (the `orbits` precedent — §7.3), and
+            /// `save_blocked` unset (session state — a blocked world
+            /// could never have been snapshotted).
+            fn from_validated_snapshot(
+                orbits: PatchedConics,
+                physics: Option<PhysicsConfig>,
+                snapshot: WorldSnapshot,
+            ) -> Self {
+                snapshot_restore_literal!({ snapshot ; [
+                    pending: BTreeMap::new(),
+                    command_log: Vec::new(),
+                    orbits,
+                    joints: Vec::new(),
+                    tech_tree: None,
+                    experiments: BTreeMap::new(),
+                    parts: BTreeMap::new(),
+                    recipes: BTreeMap::new(),
+                    site_defs: BTreeMap::new(),
+                    contract_defs: BTreeMap::new(),
+                    colony_env: BTreeMap::new(),
+                    physics: physics.map(|p| Physics {
+                        backend: SimpleBackend::new(p.environment),
+                        dominant: p.dominant,
+                        bubble_radius_m: p.bubble_radius_m,
+                        aero: BTreeMap::new(),
+                        thermal_rates: Vec::new(),
+                    }),
+                    script_engine: None,
+                    autopilot_driver: None,
+                    script_log: Vec::new(),
+                    save_blocked: None,
+                ] }
+                    $( $(#[$meta])* $name : $ty = $mode $(=> $wf)? ; )*)
+            }
+        }
+    };
+}
+
+for_each_snapshot_field!(define_world_snapshot);
 
 /// The world's construction config — data-derived (§7.3): the orbit
 /// model's body table plus the physics environment and dominant body
@@ -1808,414 +1980,245 @@ enum EventsShadow {
     Ops(Vec<ScheduledEvent>),
 }
 
-/// The M1 fields are **lazy captures**: most iterations mutate neither
-/// the vessel arena nor the event heap (an event-free interval touches
-/// only the clock), so each is cloned only when the iteration is about
-/// to mutate it — `Option` = "captured"; `None` on restore means "this
-/// field was never touched this iteration". A capture always precedes
-/// the first write to its field inside an iteration.
-struct TickShadow {
-    /// `clock` at the boundary.
-    clock: SimTime,
-    /// `warp_level` at the boundary.
-    warp_level: u32,
-    /// `command_log.len()` at the boundary — restore truncates to it.
-    log_len: usize,
-    /// `script_log.len()` at the boundary — restore truncates to it
-    /// (the `log_len` precedent: lines a doomed iteration pushed roll
-    /// back with the rest of the tick).
-    script_log_len: usize,
-    /// Commands the drain popped, in drain order (per source, production
-    /// order). Restored back into `pending` on rollback.
-    drained: Vec<((SourceClass, u32), PendingCommand)>,
-    /// Commands `issue`d into `pending` during the iteration, counted
-    /// per source — restore pops that many entries off each FIFO's
-    /// tail after the `drained` re-queue rebuilds the front. Per the
-    /// struct doc, an issued command always sits behind every
-    /// pre-boundary command in its FIFO (drained-or-not), so the tail
-    /// pop restores the boundary queue exactly, preserving
-    /// per-`(class, source_id)` FIFO order.
-    issued: BTreeMap<(SourceClass, u32), usize>,
-    /// Each source the drain touched, with its pre-increment counter —
-    /// `None` = the counter did not exist before this tick.
-    seq_restore: Vec<((SourceClass, u32), Option<u64>)>,
-    /// `vessels` — captured before the iteration's first arena write.
-    /// `Whole` is the indiscriminate capture (the per-tick physics
-    /// pass, the SOI residence walk — paths that can touch arbitrary
-    /// arena entries); `PerItem` records the pre-write value of each
-    /// declared vessel so a single-vessel command no longer
-    /// deep-clones the whole arena (craft graphs, tanks, science)
-    /// per command (C4a-F5). Inserts undo via `next_vessel_id`:
-    /// every allocation takes the monotonic counter, so restore
-    /// drops every id at/above the captured value.
-    vessels: Option<VesselsShadow>,
-    /// `next_vessel_id` — captured with `vessels`.
-    next_vessel_id: Option<u64>,
-    /// `joints` + `joint_refused` — captured with `vessels` (M6-B: all
-    /// joint mutations happen inside `step_bubble_range`, which always
-    /// shadows the arena first, so the pair travels with it).
-    joints: Option<Vec<LiveJoint>>,
-    /// See `joints`.
-    joint_refused: Option<BTreeSet<(VesselId, VesselId)>>,
-    /// `next_part_instance_id` — captured with `vessels` (M9b:
-    /// instance ids allocate only at vessel-craft instantiation, all
-    /// inside vessel-shadowed paths; the rollback must restore the
-    /// counter or a retried spawn would reallocate under ids already
-    /// burned — the `next_vessel_id` precedent).
-    next_part_instance_id: Option<u64>,
-    /// `tracked_vessels` — captured before the first opt-in mutation.
-    tracked_vessels: Option<BTreeSet<VesselId>>,
-    /// `active_vessel` — captured before the first focus-record write
-    /// (`SetActiveVessel`, the vessel-removal scrubs). `Some(None)`
-    /// means "captured, and it was already unset" — the outer Option
-    /// is the capture flag, the inner the pre-write value.
-    active_vessel: Option<Option<VesselId>>,
-    /// `event_heap` — captured before the first heap write. `Ops` is
-    /// the lazy default (`shadow_events`): an alloc-free delta that
-    /// undoes pushes via the `next_event_seq` watermark and removals
-    /// via the recorded verbatim entries — a fired event's reschedule
-    /// no longer clones the whole heap per shadow. `Whole` is what the
-    /// `mem::take`+filter scrub/restamp sites take via
-    /// `shadow_events_whole` — the rewrite paths where enumerating
-    /// drops is the scrub's own work (C4a-F5).
-    event_heap: Option<EventsShadow>,
-    /// `next_event_seq` — captured with `event_heap`.
-    next_event_seq: Option<u64>,
-    /// `transfers` — captured before the first arena write (M6-D:
-    /// transfer applies insert, completions remove).
-    transfers: Option<BTreeMap<TransferId, ActiveTransfer>>,
-    /// `next_transfer_id` + `next_crew_id` — captured with
-    /// `transfers` (both counters travel with it).
-    next_transfer_id: Option<u64>,
-    /// See `next_transfer_id`.
-    next_crew_id: Option<u64>,
-    /// `science` — captured before the first science-book write
-    /// (M7-A: collection/transfer applies, project lifecycle, event
-    /// landings; the vessel-side pool rides `vessels`).
-    science: Option<ScienceState>,
-    /// `tech` — captured before the first tech-book write (M7-B:
-    /// `ResearchTech`/`ResearchUpgradeLevel` applies; the science
-    /// debit rides `science`).
-    tech: Option<TechState>,
-    /// `economy` — captured before the first economy-book write
-    /// (M7-C: every charge/credit, hire, recovery, roster or
-    /// inventory write; the bounded ledger rides inside it).
-    economy: Option<EconomyState>,
-    /// `contracts` — captured before the first contract-book write
-    /// (M7-D: offers, active arena, fact record, counters).
-    contracts: Option<ContractState>,
-    /// `builds` + `next_build_id` — captured before the first
-    /// build-order write (M8-B: `ManufactureCraft`,
-    /// `ConstructionComplete` — the `transfers` precedent).
-    builds: Option<BTreeMap<manufacture::BuildId, manufacture::ActiveBuild>>,
-    /// See `builds`.
-    next_build_id: Option<u64>,
-    /// `colonies` + `next_colony_id` — captured before the first
-    /// colony-arena write (M8-A: founding, abandons, crew posts,
-    /// and every boundary recompute).
-    colonies: Option<BTreeMap<ColonyId, Colony>>,
-    /// See `colonies`.
-    next_colony_id: Option<u64>,
-    /// `life_support_enabled` — captured before the flag flips
-    /// (M8-C's `SetLifeSupportEnabled`; the config never mutates
-    /// inside a tick — a pre-run write like `economy_cfg`).
-    life_support_enabled: Option<bool>,
-    /// M9a: `scripts` + `next_script_id` — captured before the
-    /// first script-arena write (LoadScript/UnloadScript/
-    /// SetScriptEnabled applies, wake registration, the tick-pass
-    /// bookkeeping writes strikes/poll/wake fields).
-    scripts: Option<BTreeMap<ScriptId, ScriptState>>,
-    /// See `scripts`.
-    next_script_id: Option<u64>,
-    /// `autopilots` — captured before the first autopilot write
-    /// (Engage/Disengage applies, the driver's persist writes).
-    autopilots: Option<BTreeMap<VesselId, AutopilotState>>,
-    /// M9b: `bench_runs` + `next_bench_id` — captured before the
-    /// first bench-arena write (the `builds` precedent).
-    benches: Option<BTreeMap<reliability::BenchId, reliability::ActiveBench>>,
-    /// See `benches`.
-    next_bench_id: Option<u64>,
-    /// `notifications` — captured before the first log push (the
-    /// reliability writers' notification path).
-    notifications: Option<std::collections::VecDeque<reliability::Notification>>,
+/// The §2.13 lazy-capture field list — the ONE declaration of what a
+/// `step_frame` iteration can dirty. `define_tick_shadow` reads it to
+/// emit `TickShadow`, `capture`, `merge_committed`, and `restore`, so
+/// a new `World` field that needs rollback joins all four sites at
+/// once: the hand-kept lists this replaces could drift — a missed
+/// restore arm was a silent `state_hash` divergence, not a compile
+/// error.
+///
+/// Entry forms:
+/// - `name : Ty = lazy` — the uniform protocol: an `Option<Ty>`
+///   field, `None` at capture, earliest-`Some`-wins on merge (a held
+///   `Some` is the older boundary state), `world.name = v` on
+///   restore;
+/// - `name : Ty = special` — the consumers spell the field out:
+///   `vessels`/`event_heap` carry capture *modes* (see
+///   [`VesselsShadow`]/[`EventsShadow`]), and `next_vessel_id` sweeps
+///   the `PerItem` allocator ids off the arena on restore;
+/// - `=> w` — the `World` field's name differs from the shadow's
+///   (only `benches` → `bench_runs` today).
+///
+/// List order is the merge/restore emission order; only the
+/// `event_heap`-before-`next_event_seq` pairing is load-bearing
+/// (both consumers read the parent's captured watermark while
+/// reconciling the heap — every other field is independent).
+macro_rules! for_each_shadow_field {
+    ($consumer:ident) => {
+        $consumer! {
+            /// `vessels` — captured before the iteration's first arena write.
+            /// `Whole` is the indiscriminate capture (the per-tick physics
+            /// pass, the SOI residence walk — paths that can touch arbitrary
+            /// arena entries); `PerItem` records the pre-write value of each
+            /// declared vessel so a single-vessel command no longer
+            /// deep-clones the whole arena (craft graphs, tanks, science)
+            /// per command (C4a-F5). Inserts undo via `next_vessel_id`:
+            /// every allocation takes the monotonic counter, so restore
+            /// drops every id at/above the captured value.
+            vessels : VesselsShadow = special;
+            /// `next_vessel_id` — captured with `vessels`.
+            next_vessel_id : u64 = special;
+            /// `joints` + `joint_refused` — captured with `vessels` (M6-B: all
+            /// joint mutations happen inside `step_bubble_range`, which always
+            /// shadows the arena first, so the pair travels with it).
+            joints : Vec<LiveJoint> = lazy;
+            /// See `joints`.
+            joint_refused : BTreeSet<(VesselId, VesselId)> = lazy;
+            /// `next_part_instance_id` — captured with `vessels` (M9b:
+            /// instance ids allocate only at vessel-craft instantiation, all
+            /// inside vessel-shadowed paths; the rollback must restore the
+            /// counter or a retried spawn would reallocate under ids already
+            /// burned — the `next_vessel_id` precedent).
+            next_part_instance_id : u64 = lazy;
+            /// `tracked_vessels` — captured before the first opt-in mutation.
+            tracked_vessels : BTreeSet<VesselId> = lazy;
+            /// `active_vessel` — captured before the first focus-record write
+            /// (`SetActiveVessel`, the vessel-removal scrubs). `Some(None)`
+            /// means "captured, and it was already unset" — the outer Option
+            /// is the capture flag, the inner the pre-write value.
+            active_vessel : Option<VesselId> = lazy;
+            /// `event_heap` — captured before the first heap write. `Ops` is
+            /// the lazy default (`shadow_events`): an alloc-free delta that
+            /// undoes pushes via the `next_event_seq` watermark and removals
+            /// via the recorded verbatim entries — a fired event's reschedule
+            /// no longer clones the whole heap per shadow. `Whole` is what the
+            /// `mem::take`+filter scrub/restamp sites take via
+            /// `shadow_events_whole` — the rewrite paths where enumerating
+            /// drops is the scrub's own work (C4a-F5).
+            event_heap : EventsShadow = special;
+            /// `next_event_seq` — captured with `event_heap`.
+            next_event_seq : u64 = lazy;
+            /// `transfers` — captured before the first arena write (M6-D:
+            /// transfer applies insert, completions remove).
+            transfers : BTreeMap<TransferId, ActiveTransfer> = lazy;
+            /// `next_transfer_id` + `next_crew_id` — captured with
+            /// `transfers` (both counters travel with it).
+            next_transfer_id : u64 = lazy;
+            /// See `next_transfer_id`.
+            next_crew_id : u64 = lazy;
+            /// `science` — captured before the first science-book write
+            /// (M7-A: collection/transfer applies, project lifecycle, event
+            /// landings; the vessel-side pool rides `vessels`).
+            science : ScienceState = lazy;
+            /// `tech` — captured before the first tech-book write (M7-B:
+            /// `ResearchTech`/`ResearchUpgradeLevel` applies; the science
+            /// debit rides `science`).
+            tech : TechState = lazy;
+            /// `economy` — captured before the first economy-book write
+            /// (M7-C: every charge/credit, hire, recovery, roster or
+            /// inventory write; the bounded ledger rides inside it).
+            economy : EconomyState = lazy;
+            /// `contracts` — captured before the first contract-book write
+            /// (M7-D: offers, active arena, fact record, counters).
+            contracts : ContractState = lazy;
+            /// `builds` + `next_build_id` — captured before the first
+            /// build-order write (M8-B: `ManufactureCraft`,
+            /// `ConstructionComplete` — the `transfers` precedent).
+            builds : BTreeMap<manufacture::BuildId, manufacture::ActiveBuild> = lazy;
+            /// See `builds`.
+            next_build_id : u64 = lazy;
+            /// `colonies` + `next_colony_id` — captured before the first
+            /// colony-arena write (M8-A: founding, abandons, crew posts,
+            /// and every boundary recompute).
+            colonies : BTreeMap<ColonyId, Colony> = lazy;
+            /// See `colonies`.
+            next_colony_id : u64 = lazy;
+            /// `life_support_enabled` — captured before the flag flips
+            /// (M8-C's `SetLifeSupportEnabled`; the config never mutates
+            /// inside a tick — a pre-run write like `economy_cfg`).
+            life_support_enabled : bool = lazy;
+            /// M9a: `scripts` + `next_script_id` — captured before the
+            /// first script-arena write (LoadScript/UnloadScript/
+            /// SetScriptEnabled applies, wake registration, the tick-pass
+            /// bookkeeping writes strikes/poll/wake fields).
+            scripts : BTreeMap<ScriptId, ScriptState> = lazy;
+            /// See `scripts`.
+            next_script_id : u64 = lazy;
+            /// `autopilots` — captured before the first autopilot write
+            /// (Engage/Disengage applies, the driver's persist writes).
+            autopilots : BTreeMap<VesselId, AutopilotState> = lazy;
+            /// M9b: `bench_runs` + `next_bench_id` — captured before the
+            /// first bench-arena write (the `builds` precedent).
+            benches : BTreeMap<reliability::BenchId, reliability::ActiveBench> = lazy => bench_runs;
+            /// See `benches`.
+            next_bench_id : u64 = lazy;
+            /// `notifications` — captured before the first log push (the
+            /// reliability writers' notification path).
+            notifications : std::collections::VecDeque<reliability::Notification> = lazy;
+        }
+    };
 }
 
-impl TickShadow {
-    /// Snapshot the cheap pre-iteration fields; the expensive fields are
-    /// captured lazily by the `World::shadow_*` helpers.
-    fn capture(world: &World) -> Self {
-        Self {
-            clock: world.clock,
-            warp_level: world.warp_level,
-            log_len: world.command_log.len(),
-            script_log_len: world.script_log.len(),
-            drained: Vec::new(),
-            issued: BTreeMap::new(),
-            seq_restore: Vec::new(),
-            vessels: None,
-            next_vessel_id: None,
-            joints: None,
-            joint_refused: None,
-            tracked_vessels: None,
-            active_vessel: None,
-            event_heap: None,
-            next_event_seq: None,
-            transfers: None,
-            next_transfer_id: None,
-            next_crew_id: None,
-            science: None,
-            tech: None,
-            economy: None,
-            contracts: None,
-            colonies: None,
-            builds: None,
-            next_build_id: None,
-            next_colony_id: None,
-            life_support_enabled: None,
-            scripts: None,
-            next_script_id: None,
-            autopilots: None,
-            benches: None,
-            next_bench_id: None,
-            notifications: None,
-            next_part_instance_id: None,
-        }
-    }
-
-    /// Fold a committed sub-shadow's captures into `self`.
-    ///
-    /// The per-command (`drain_at`) and per-event (`fire_due_events`)
-    /// shadows exist to roll back a *failed* item; when the item
-    /// commits, its lazy captures would die with the sub-shadow —
-    /// leaving the iteration shadow blind to writes the item made.
-    /// Merging keeps each field's EARLIEST capture: a `Some` already
-    /// held is the older boundary state and always wins. The cheap
-    /// scalars (`clock`, `warp_level`, `log_len`, `script_log_len`)
-    /// stay the parent's — they were captured at the earlier
-    /// boundary. `drained`/`seq_restore` are parent-owned
-    /// accumulators (only the drain itself records into them — the
-    /// child's lone would-be seq entry is consumed by the merge's
-    /// caller on rejection, never here). `issued` counts fold
-    /// additively: a committed `issue` is a queue push the
-    /// iteration's restore must still pop.
-    #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
-    fn merge_committed(&mut self, committed: TickShadow) {
-        match (self.vessels.take(), committed.vessels) {
-            // A `Whole` capture means the child may have written any
-            // entry — the parent must gain pre-command values for
-            // every id it hasn't recorded. For `PerItem` parents those
-            // ARE the child's capture: an id the parent lacks was not
-            // written by an earlier item, so the child's value for it
-            // is the parent's pre-item value.
+/// One `merge_committed` field — invoked per list entry by
+/// `define_tick_shadow`. `lazy` is the uniform earliest-`Some`-wins
+/// fold; the `special` arms carry the two capture-mode
+/// reconciliations (a `special` without its own arm takes the same
+/// fold — `next_vessel_id`'s merge IS the fold).
+macro_rules! shadow_merge_field {
+    // `vessels` — a `Whole` capture means the child may have written
+    // any entry, so the parent must gain pre-command values for every
+    // id it hasn't recorded. For `PerItem` parents those ARE the
+    // child's capture: an id the parent lacks was not written by an
+    // earlier item, so the child's value for it is the parent's
+    // pre-item value.
+    ($slf:ident $com:ident ; vessels = special ;) => {
+        match ($slf.vessels.take(), $com.vessels) {
             (Some(VesselsShadow::PerItem(mut p)), Some(VesselsShadow::Whole(w))) => {
                 for (id, v) in w {
                     p.entry(id).or_insert(Some(v));
                 }
-                self.vessels = Some(VesselsShadow::PerItem(p));
+                $slf.vessels = Some(VesselsShadow::PerItem(p));
             }
             (Some(VesselsShadow::PerItem(mut p)), Some(VesselsShadow::PerItem(c))) => {
                 for (id, v) in c {
                     p.entry(id).or_insert(v);
                 }
-                self.vessels = Some(VesselsShadow::PerItem(p));
+                $slf.vessels = Some(VesselsShadow::PerItem(p));
             }
-            (Some(m), _) => self.vessels = Some(m), // parent Whole — earliest wins
-            (None, c) => self.vessels = c,
+            (Some(m), _) => $slf.vessels = Some(m), // parent Whole — earliest wins
+            (None, c) => $slf.vessels = c,
         }
-        if self.next_vessel_id.is_none() {
-            self.next_vessel_id = committed.next_vessel_id;
-        }
-        if self.joints.is_none() {
-            self.joints = committed.joints;
-        }
-        if self.joint_refused.is_none() {
-            self.joint_refused = committed.joint_refused;
-        }
-        if self.next_part_instance_id.is_none() {
-            self.next_part_instance_id = committed.next_part_instance_id;
-        }
-        if self.tracked_vessels.is_none() {
-            self.tracked_vessels = committed.tracked_vessels;
-        }
-        if self.active_vessel.is_none() {
-            self.active_vessel = committed.active_vessel;
-        }
-        // `event_heap` merge — the `vessels` precedent: earliest wins,
-        // with the mode combinations reconciled:
-        // - parent Whole → already the boundary heap; the child's
-        //   capture adds nothing;
-        // - parent Ops + child Ops → the removal logs concatenate
-        //   (order is irrelevant — restore re-pushes the set);
-        // - parent Ops + child Whole → the child's clone is the heap
-        //   at child-capture, i.e. mid-scope: the boundary heap is
-        //   rebuilt by the enum-doc invariant — drop seq ≥ the
-        //   parent's watermark (in-scope pushes) and re-add the
-        //   parent's recorded removals.
-        match (self.event_heap.take(), committed.event_heap) {
-            (Some(w @ EventsShadow::Whole(_)), _) => self.event_heap = Some(w),
+    };
+    // `event_heap` — the `vessels` precedent (earliest wins) with the
+    // mode combinations reconciled: a parent `Whole` is already the
+    // boundary heap (the child's capture adds nothing); `Ops`+`Ops`
+    // concatenates the removal logs (order is irrelevant — restore
+    // re-pushes the set); `Ops`+`Whole` rebuilds the boundary by the
+    // enum-doc invariant — drop seq ≥ the parent's watermark (in-scope
+    // pushes) and re-add the parent's recorded removals.
+    ($slf:ident $com:ident ; event_heap = special ;) => {
+        match ($slf.event_heap.take(), $com.event_heap) {
+            (Some(w @ EventsShadow::Whole(_)), _) => $slf.event_heap = Some(w),
             (Some(EventsShadow::Ops(mut p)), Some(EventsShadow::Ops(c))) => {
                 p.extend(c);
-                self.event_heap = Some(EventsShadow::Ops(p));
+                $slf.event_heap = Some(EventsShadow::Ops(p));
             }
             (Some(EventsShadow::Ops(p)), Some(EventsShadow::Whole(w))) => {
-                let cap = self.next_event_seq.unwrap_or(0);
+                let cap = $slf.next_event_seq.unwrap_or(0);
                 let boundary: BinaryHeap<ScheduledEvent> = w
                     .into_iter()
                     .filter(|e| e.seq < cap)
                     .chain(p.into_iter().filter(|e| e.seq < cap))
                     .collect();
-                self.event_heap = Some(EventsShadow::Whole(boundary));
+                $slf.event_heap = Some(EventsShadow::Whole(boundary));
             }
-            (o @ Some(_), None) => self.event_heap = o,
-            (None, c) => self.event_heap = c,
+            (o @ Some(_), None) => $slf.event_heap = o,
+            (None, c) => $slf.event_heap = c,
         }
-        if self.next_event_seq.is_none() {
-            self.next_event_seq = committed.next_event_seq;
+    };
+    ($slf:ident $com:ident ; $name:ident = $mode:ident ;) => {
+        if $slf.$name.is_none() {
+            $slf.$name = $com.$name;
         }
-        if self.transfers.is_none() {
-            self.transfers = committed.transfers;
+    };
+    ($slf:ident $com:ident ; $name:ident = $mode:ident => $wf:ident ;) => {
+        if $slf.$name.is_none() {
+            $slf.$name = $com.$name;
         }
-        if self.next_transfer_id.is_none() {
-            self.next_transfer_id = committed.next_transfer_id;
-        }
-        if self.next_crew_id.is_none() {
-            self.next_crew_id = committed.next_crew_id;
-        }
-        if self.science.is_none() {
-            self.science = committed.science;
-        }
-        if self.tech.is_none() {
-            self.tech = committed.tech;
-        }
-        if self.economy.is_none() {
-            self.economy = committed.economy;
-        }
-        if self.contracts.is_none() {
-            self.contracts = committed.contracts;
-        }
-        if self.builds.is_none() {
-            self.builds = committed.builds;
-        }
-        if self.next_build_id.is_none() {
-            self.next_build_id = committed.next_build_id;
-        }
-        if self.colonies.is_none() {
-            self.colonies = committed.colonies;
-        }
-        if self.next_colony_id.is_none() {
-            self.next_colony_id = committed.next_colony_id;
-        }
-        if self.life_support_enabled.is_none() {
-            self.life_support_enabled = committed.life_support_enabled;
-        }
-        if self.scripts.is_none() {
-            self.scripts = committed.scripts;
-        }
-        if self.next_script_id.is_none() {
-            self.next_script_id = committed.next_script_id;
-        }
-        if self.autopilots.is_none() {
-            self.autopilots = committed.autopilots;
-        }
-        if self.benches.is_none() {
-            self.benches = committed.benches;
-        }
-        if self.next_bench_id.is_none() {
-            self.next_bench_id = committed.next_bench_id;
-        }
-        if self.notifications.is_none() {
-            self.notifications = committed.notifications;
-        }
-        for (src, count) in committed.issued {
-            *self.issued.entry(src).or_default() += count;
-        }
-    }
+    };
+}
 
-    /// Roll the world back to the captured pre-iteration state — the
-    /// whole state, so `state_hash()` is the pre-boundary hash again
-    /// (§2.13). `None` fields were never mutated.
-    #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
-    fn restore(self, world: &mut World) {
-        world.clock = self.clock;
-        world.warp_level = self.warp_level;
-        world.command_log.truncate(self.log_len);
-        world.script_log.truncate(self.script_log_len);
-        // Reverse drain order + push_front rebuilds each FIFO's
-        // production order exactly.
-        for (src, command) in self.drained.into_iter().rev() {
-            world.pending.entry(src).or_default().push_front(command);
-        }
-        // In-iteration `issue` pushes sit at their FIFO's tail behind
-        // every restored pre-boundary command (a drain empties its
-        // FIFO, so nothing pre-boundary can follow an issued command
-        // in-queue). Pop exactly the recorded count off the back; a
-        // FIFO left empty drops so the queue's emptiness stays the
-        // map's (the §7.4 invariant `check_serializable` reads).
-        for (src, count) in self.issued {
-            let emptied = match world.pending.get_mut(&src) {
-                Some(fifo) => {
-                    for _ in 0..count {
-                        fifo.pop_back();
-                    }
-                    fifo.is_empty()
-                }
-                None => false,
-            };
-            if emptied {
-                world.pending.remove(&src);
-            }
-        }
-        for (src, seq) in self.seq_restore {
-            match seq {
-                Some(v) => {
-                    world.source_seqs.insert(src, v);
-                }
-                None => {
-                    world.source_seqs.remove(&src);
-                }
-            }
-        }
-        if let Some(v) = self.vessels {
+/// One `restore` field — invoked per list entry by
+/// `define_tick_shadow`. `lazy` is the uniform `world.name = v`;
+/// `=> w` redirects the write when the `World` field's name differs.
+/// Every `special` needs its own arm here — a `special` that falls
+/// through is a compile error, not a silent drop.
+macro_rules! shadow_restore_field {
+    ($slf:ident $w:ident ; vessels = special ;) => {
+        if let Some(v) = $slf.vessels {
             match v {
-                VesselsShadow::Whole(arena) => world.vessels = arena,
+                VesselsShadow::Whole(arena) => $w.vessels = arena,
                 VesselsShadow::PerItem(touched) => {
                     for (id, old) in touched {
                         match old {
                             Some(v) => {
-                                world.vessels.insert(id, v);
+                                $w.vessels.insert(id, v);
                             }
                             None => {
-                                world.vessels.remove(&id);
+                                $w.vessels.remove(&id);
                             }
                         }
                     }
                 }
             }
         }
-        if let Some(v) = self.next_vessel_id {
-            world.next_vessel_id = v;
-            // PerItem restore only: inserts drew from the monotonic
-            // allocator, so every id at/above the captured counter is
-            // a this-iteration insertion to drop. Harmless after a
-            // Whole restore (no such ids exist there).
-            world.vessels.retain(|id, _| id.0 < v);
+    };
+    // `next_vessel_id` — PerItem restore only: inserts drew from the
+    // monotonic allocator, so every id at/above the captured counter
+    // is a this-iteration insertion to drop. Harmless after a `Whole`
+    // restore (no such ids exist there).
+    ($slf:ident $w:ident ; next_vessel_id = special ;) => {
+        if let Some(v) = $slf.next_vessel_id {
+            $w.next_vessel_id = v;
+            $w.vessels.retain(|id, _| id.0 < v);
         }
-        if let Some(v) = self.joints {
-            world.joints = v;
-        }
-        if let Some(v) = self.joint_refused {
-            world.joint_refused = v;
-        }
-        if let Some(v) = self.tracked_vessels {
-            world.tracked_vessels = v;
-        }
-        if let Some(v) = self.active_vessel {
-            world.active_vessel = v;
-        }
-        if let Some(v) = self.event_heap {
+    };
+    ($slf:ident $w:ident ; event_heap = special ;) => {
+        if let Some(v) = $slf.event_heap {
             match v {
-                EventsShadow::Whole(heap) => world.event_heap = heap,
-                // Ops restore — the enum-doc invariant rebuilt live:
+                EventsShadow::Whole(heap) => $w.event_heap = heap,
+                // `Ops` restore — the enum-doc invariant rebuilt live:
                 // drop every in-scope push (`seq ≥ cap`) and re-push
                 // the recorded removals. In-scope pushes that were
                 // themselves removed land in the ops list too — the
@@ -2225,79 +2228,169 @@ impl TickShadow {
                 // `(tick, seq)` order), so the rebuilt heap needs no
                 // order fidelity beyond contents.
                 EventsShadow::Ops(removed) => {
-                    let cap = self.next_event_seq.unwrap_or(world.next_event_seq);
-                    let mut heap: BinaryHeap<ScheduledEvent> =
-                        std::mem::take(&mut world.event_heap)
-                            .into_iter()
-                            .filter(|e| e.seq < cap)
-                            .collect();
+                    let cap = $slf.next_event_seq.unwrap_or($w.next_event_seq);
+                    let mut heap: BinaryHeap<ScheduledEvent> = std::mem::take(&mut $w.event_heap)
+                        .into_iter()
+                        .filter(|e| e.seq < cap)
+                        .collect();
                     heap.extend(removed.into_iter().filter(|e| e.seq < cap));
-                    world.event_heap = heap;
+                    $w.event_heap = heap;
                 }
             }
         }
-        if let Some(v) = self.next_event_seq {
-            world.next_event_seq = v;
+    };
+    ($slf:ident $w:ident ; $name:ident = special ;) => {
+        compile_error!("shadow `special` field lacks a `restore` arm — spell it out here")
+    };
+    ($slf:ident $w:ident ; $name:ident = special => $wf:ident ;) => {
+        compile_error!("shadow `special` field lacks a `restore` arm — spell it out here")
+    };
+    ($slf:ident $w:ident ; $name:ident = $mode:ident ;) => {
+        if let Some(v) = $slf.$name {
+            $w.$name = v;
         }
-        if let Some(v) = self.transfers {
-            world.transfers = v;
+    };
+    ($slf:ident $w:ident ; $name:ident = $mode:ident => $wf:ident ;) => {
+        if let Some(v) = $slf.$name {
+            $w.$wf = v;
         }
-        if let Some(v) = self.next_transfer_id {
-            world.next_transfer_id = v;
-        }
-        if let Some(v) = self.next_crew_id {
-            world.next_crew_id = v;
-        }
-        if let Some(v) = self.science {
-            world.science = v;
-        }
-        if let Some(v) = self.tech {
-            world.tech = v;
-        }
-        if let Some(v) = self.economy {
-            world.economy = v;
-        }
-        if let Some(v) = self.contracts {
-            world.contracts = v;
-        }
-        if let Some(v) = self.colonies {
-            world.colonies = v;
-        }
-        if let Some(v) = self.builds {
-            world.builds = v;
-        }
-        if let Some(v) = self.next_build_id {
-            world.next_build_id = v;
-        }
-        if let Some(v) = self.next_colony_id {
-            world.next_colony_id = v;
-        }
-        if let Some(v) = self.life_support_enabled {
-            world.life_support_enabled = v;
-        }
-        if let Some(v) = self.scripts {
-            world.scripts = v;
-        }
-        if let Some(v) = self.next_script_id {
-            world.next_script_id = v;
-        }
-        if let Some(v) = self.autopilots {
-            world.autopilots = v;
-        }
-        if let Some(v) = self.benches {
-            world.bench_runs = v;
-        }
-        if let Some(v) = self.next_bench_id {
-            world.next_bench_id = v;
-        }
-        if let Some(v) = self.notifications {
-            world.notifications = v;
-        }
-        if let Some(v) = self.next_part_instance_id {
-            world.next_part_instance_id = v;
-        }
-    }
+    };
 }
+
+/// Emits [`TickShadow`] plus its `capture`/`merge_committed`/`restore`
+/// bodies from the `for_each_shadow_field` list — see that macro's doc
+/// for the entry grammar and why the list is single-sourced.
+macro_rules! define_tick_shadow {
+    ($( $(#[$meta:meta])* $name:ident : $ty:ty = $mode:ident $(=> $wf:ident)? ;)*) => {
+        /// The M1 fields are **lazy captures**: most iterations mutate neither
+        /// the vessel arena nor the event heap (an event-free interval touches
+        /// only the clock), so each is cloned only when the iteration is about
+        /// to mutate it — `Option` = "captured"; `None` on restore means "this
+        /// field was never touched this iteration". A capture always precedes
+        /// the first write to its field inside an iteration. The lazy set
+        /// itself is `for_each_shadow_field`'s — the hand-written fields
+        /// below are the cheap scalars and the queue bookkeeping a
+        /// sub-shadow never lazily captures.
+        struct TickShadow {
+            /// `clock` at the boundary.
+            clock: SimTime,
+            /// `warp_level` at the boundary.
+            warp_level: u32,
+            /// `command_log.len()` at the boundary — restore truncates to it.
+            log_len: usize,
+            /// `script_log.len()` at the boundary — restore truncates to it
+            /// (the `log_len` precedent: lines a doomed iteration pushed roll
+            /// back with the rest of the tick).
+            script_log_len: usize,
+            /// Commands the drain popped, in drain order (per source, production
+            /// order). Restored back into `pending` on rollback.
+            drained: Vec<((SourceClass, u32), PendingCommand)>,
+            /// Commands `issue`d into `pending` during the iteration, counted
+            /// per source — restore pops that many entries off each FIFO's
+            /// tail after the `drained` re-queue rebuilds the front. Per the
+            /// struct doc, an issued command always sits behind every
+            /// pre-boundary command in its FIFO (drained-or-not), so the tail
+            /// pop restores the boundary queue exactly, preserving
+            /// per-`(class, source_id)` FIFO order.
+            issued: BTreeMap<(SourceClass, u32), usize>,
+            /// Each source the drain touched, with its pre-increment counter —
+            /// `None` = the counter did not exist before this tick.
+            seq_restore: Vec<((SourceClass, u32), Option<u64>)>,
+            $( $(#[$meta])* $name: Option<$ty>, )*
+        }
+
+        impl TickShadow {
+            /// Snapshot the cheap pre-iteration fields; the expensive fields are
+            /// captured lazily by the `World::shadow_*` helpers.
+            fn capture(world: &World) -> Self {
+                Self {
+                    clock: world.clock,
+                    warp_level: world.warp_level,
+                    log_len: world.command_log.len(),
+                    script_log_len: world.script_log.len(),
+                    drained: Vec::new(),
+                    issued: BTreeMap::new(),
+                    seq_restore: Vec::new(),
+                    $( $name: None, )*
+                }
+            }
+
+            /// Fold a committed sub-shadow's captures into `self`.
+            ///
+            /// The per-command (`drain_at`) and per-event (`fire_due_events`)
+            /// shadows exist to roll back a *failed* item; when the item
+            /// commits, its lazy captures would die with the sub-shadow —
+            /// leaving the iteration shadow blind to writes the item made.
+            /// Merging keeps each field's EARLIEST capture: a `Some` already
+            /// held is the older boundary state and always wins. The cheap
+            /// scalars (`clock`, `warp_level`, `log_len`, `script_log_len`)
+            /// stay the parent's — they were captured at the earlier
+            /// boundary. `drained`/`seq_restore` are parent-owned
+            /// accumulators (only the drain itself records into them — the
+            /// child's lone would-be seq entry is consumed by the merge's
+            /// caller on rejection, never here). `issued` counts fold
+            /// additively: a committed `issue` is a queue push the
+            /// iteration's restore must still pop.
+            #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+            fn merge_committed(&mut self, committed: TickShadow) {
+                $( shadow_merge_field!{ self committed ; $name = $mode $(=> $wf)? ; } )*
+                for (src, count) in committed.issued {
+                    *self.issued.entry(src).or_default() += count;
+                }
+            }
+
+            /// Roll the world back to the captured pre-iteration state — the
+            /// whole state, so `state_hash()` is the pre-boundary hash again
+            /// (§2.13). `None` fields were never mutated. The queue
+            /// bookkeeping below is the struct doc's trick made code:
+            /// `drained` pushes back `push_front`-first in reverse drain
+            /// order (rebuilding each FIFO's production order exactly), the
+            /// `issued` tail-pop drops the in-iteration pushes that sit
+            /// behind the restored front, and `seq_restore` writes the
+            /// counters back or drops ones the drain created.
+            #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+            fn restore(self, world: &mut World) {
+                world.clock = self.clock;
+                world.warp_level = self.warp_level;
+                world.command_log.truncate(self.log_len);
+                world.script_log.truncate(self.script_log_len);
+                for (src, command) in self.drained.into_iter().rev() {
+                    world.pending.entry(src).or_default().push_front(command);
+                }
+                // A FIFO left empty by the tail-pop drops so the queue's
+                // emptiness stays the map's (the §7.4 invariant
+                // `check_serializable` reads).
+                for (src, count) in self.issued {
+                    let emptied = match world.pending.get_mut(&src) {
+                        Some(fifo) => {
+                            for _ in 0..count {
+                                fifo.pop_back();
+                            }
+                            fifo.is_empty()
+                        }
+                        None => false,
+                    };
+                    if emptied {
+                        world.pending.remove(&src);
+                    }
+                }
+                for (src, seq) in self.seq_restore {
+                    match seq {
+                        Some(v) => {
+                            world.source_seqs.insert(src, v);
+                        }
+                        None => {
+                            world.source_seqs.remove(&src);
+                        }
+                    }
+                }
+                $( shadow_restore_field!{ self world ; $name = $mode $(=> $wf)? ; } )*
+            }
+        }
+    };
+}
+
+for_each_shadow_field!(define_tick_shadow);
 
 /// The authoritative world. Owns the integer clock (§2.3), the stored warp
 /// rung (§2.6.3), the command queue + log (§2.2.1, §7.6), the per-source
@@ -3573,88 +3666,7 @@ impl World {
         }
         restore_colony_state(&snapshot, &orbits, &colony_inspections)?;
         trim_notification_log(&mut snapshot);
-        Ok(Self {
-            clock: SimTime::from_ticks(snapshot.clock_ticks),
-            warp_level: snapshot.warp_level,
-            active_vessel: snapshot.active_vessel,
-            pending: BTreeMap::new(),
-            command_log: Vec::new(),
-            source_seqs: snapshot.source_seqs,
-            orbits,
-            event_budget: snapshot.event_budget,
-            next_vessel_id: snapshot.next_vessel_id,
-            vessels: snapshot.vessels,
-            tracked_vessels: snapshot.tracked_vessels,
-            event_heap: BinaryHeap::from(snapshot.event_heap),
-            caps: snapshot.vessel_caps,
-            docking: snapshot.docking,
-            // §7.4: no snapshot can contain live joints — the boundary
-            // refuses while any exist — so a restored world always
-            // starts joint-free. The *refused* pairs it DOES carry:
-            // they outlive the transients (a still-posed pair stays
-            // refused after its joint expired) and losing them across
-            // save→load would re-capture the pair on the next tick.
-            joints: Vec::new(),
-            joint_refused: snapshot.joint_refused,
-            next_event_seq: snapshot.next_event_seq,
-            transfer_cfg: snapshot.transfer_cfg,
-            transfers: snapshot.transfers,
-            next_transfer_id: snapshot.next_transfer_id,
-            next_crew_id: snapshot.next_crew_id,
-            science: snapshot.science,
-            science_cfg: snapshot.science_cfg,
-            tech: snapshot.tech,
-            economy: snapshot.economy,
-            economy_cfg: snapshot.economy_cfg,
-            save_seed: snapshot.save_seed,
-            contracts: snapshot.contracts,
-            contract_cfg: snapshot.contract_cfg,
-            colonies: snapshot.colonies,
-            next_colony_id: snapshot.next_colony_id,
-            builds: snapshot.builds,
-            next_build_id: snapshot.next_build_id,
-            life_support_enabled: snapshot.life_support_enabled,
-            life_support_cfg: snapshot.life_support_cfg,
-            // Re-installed post-restore via `set_colony_env` (the
-            // `site_defs` precedent — §7.3 re-derived-on-load).
-            colony_env: BTreeMap::new(),
-            // §7.3: the caller re-installs the data-derived config via
-            // `set_experiments`/`set_tech_tree`/`set_sites`/`set_parts`
-            // (the `orbits` precedent — re-handed, not serialized).
-            experiments: BTreeMap::new(),
-            parts: BTreeMap::new(),
-            recipes: BTreeMap::new(),
-            tech_tree: None,
-            site_defs: BTreeMap::new(),
-            contract_defs: BTreeMap::new(),
-            physics: physics.map(|p| Physics {
-                backend: SimpleBackend::new(p.environment),
-                dominant: p.dominant,
-                bubble_radius_m: p.bubble_radius_m,
-                aero: BTreeMap::new(),
-                thermal_rates: Vec::new(),
-            }),
-            scripts: snapshot.scripts,
-            next_script_id: snapshot.next_script_id,
-            script_op_budget: snapshot.script_op_budget,
-            autopilots: snapshot.autopilots,
-            // §7.3: engines are construction config — re-installed
-            // post-restore via `set_script_engine`/
-            // `set_autopilot_driver` (the `set_experiments` precedent).
-            script_engine: None,
-            autopilot_driver: None,
-            script_log: Vec::new(),
-            next_part_instance_id: snapshot.next_part_instance_id,
-            reliability_cfg: snapshot.reliability_cfg,
-            notifications: snapshot.notifications,
-            bench_runs: snapshot.bench_runs,
-            next_bench_id: snapshot.next_bench_id,
-            // Restored worlds start unblocked: `restore`'s own checks
-            // are the loader-error gate, and a save written before the
-            // writer's session tainted cannot carry the flag (see the
-            // field doc — it is session state, not snapshot state).
-            save_blocked: None,
-        })
+        Ok(Self::from_validated_snapshot(orbits, physics, snapshot))
     }
 
     /// The §7.4 serialization-boundary refusal class. Enforced here:
@@ -3734,50 +3746,10 @@ impl World {
     /// reproduce the run from this set alone.
     pub fn snapshot(&self) -> Result<WorldSnapshot, SimError> {
         self.check_serializable()?;
-        let mut event_heap: Vec<ScheduledEvent> = self.event_heap.iter().cloned().collect();
-        event_heap.sort_by_key(|e| (e.tick, e.seq));
-        Ok(WorldSnapshot {
-            clock_ticks: self.clock.ticks(),
-            warp_level: self.warp_level,
-            active_vessel: self.active_vessel,
-            source_seqs: self.source_seqs.clone(),
-            event_budget: self.event_budget,
-            next_vessel_id: self.next_vessel_id,
-            vessels: self.vessels.clone(),
-            tracked_vessels: self.tracked_vessels.clone(),
-            next_event_seq: self.next_event_seq,
-            event_heap,
-            vessel_caps: self.caps,
-            docking: self.docking,
-            joint_refused: self.joint_refused.clone(),
-            transfer_cfg: self.transfer_cfg,
-            transfers: self.transfers.clone(),
-            next_transfer_id: self.next_transfer_id,
-            next_crew_id: self.next_crew_id,
-            science_cfg: self.science_cfg,
-            science: self.science.clone(),
-            tech: self.tech.clone(),
-            economy: self.economy.clone(),
-            economy_cfg: self.economy_cfg,
-            save_seed: self.save_seed,
-            contracts: self.contracts.clone(),
-            contract_cfg: self.contract_cfg,
-            colonies: self.colonies.clone(),
-            next_colony_id: self.next_colony_id,
-            builds: self.builds.clone(),
-            next_build_id: self.next_build_id,
-            life_support_enabled: self.life_support_enabled,
-            life_support_cfg: self.life_support_cfg,
-            scripts: self.scripts.clone(),
-            next_script_id: self.next_script_id,
-            script_op_budget: self.script_op_budget,
-            autopilots: self.autopilots.clone(),
-            next_part_instance_id: self.next_part_instance_id,
-            reliability_cfg: self.reliability_cfg.clone(),
-            notifications: self.notifications.clone(),
-            bench_runs: self.bench_runs.clone(),
-            next_bench_id: self.next_bench_id,
-        })
+        // The field copy is the `for_each_snapshot_field` list emitted
+        // whole (`snapshot_fields`) — the gate above is the only
+        // snapshot-specific logic left.
+        Ok(self.snapshot_fields())
     }
 
     /// The integer sim clock (§2.3).
