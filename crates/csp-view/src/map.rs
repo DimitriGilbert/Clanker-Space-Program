@@ -589,9 +589,14 @@ pub struct MapScene {
     /// parent-centred like every sampled line. `None` while no plan
     /// is staged (or its conic is unsampleable).
     plan_line: Option<(BodyId, Vec<DVec3>)>,
-    /// The staged plan's invalidation key — its departure tick. A
-    /// re-planned transfer re-samples; an unchanged one rides.
-    plan_line_key: Option<u64>,
+    /// The staged plan's invalidation key — `(departure_tick,
+    /// duration_ticks)`. The conic is a Lambert leg fixed by BOTH
+    /// grid coordinates: a re-plan can hold the departure cell while
+    /// moving in duration, so keying on the departure tick alone
+    /// redrew the old conic beside the new numbers (C18-F3). Latched
+    /// only on a successful sample — an unsampleable conic retries
+    /// next frame rather than pinning "no line" to the plan.
+    plan_line_key: Option<(u64, u64)>,
     /// W2.4: Ap/Pe points on the focused vessel's predicted post-burn
     /// conic — drawn in [`NODE_COLOR`] rings, distinct from the flown
     /// conic's apsides.
@@ -773,12 +778,13 @@ pub struct MapFrame(pub Option<MapPacket>);
 // ---------------------------------------------------------------------------
 
 /// What kind of deadline one alarm-book entry rides — the field the
-/// fired-event matcher keys on (`PlayerAlarm` by label,
-/// `TransferWindow` by body pair).
+/// fired-event matcher keys on (`PlayerAlarm` by label + nearest
+/// tick, `TransferWindow` by body pair + nearest tick).
 #[derive(Clone, Debug)]
 pub enum AlarmKind {
     /// A `SetAlarm` product — matches `EventKind::PlayerAlarm` by
-    /// label (the sim carries no id; the label is the handle).
+    /// label, nearest requested tick winning ties (the sim carries no
+    /// id; the label is the handle — C18-F4).
     Manual,
     /// A `WatchTransferWindow` product — matches
     /// `EventKind::TransferWindow` on `(origin, destination)`.
@@ -851,8 +857,8 @@ pub struct PlannedTransfer {
 }
 
 impl MapPlanning {
-    /// Fold `AdvanceReport::fired_events` into the book: mark each
-    /// armed entry fired on its first matching `PlayerAlarm` /
+    /// Fold `AdvanceReport::fired_events` into the book: mark the
+    /// nearest-tick matching armed entry fired on each `PlayerAlarm` /
     /// `TransferWindow`, and record an unmatched fire as a fired row
     /// of its own — an alarm the panel never armed (a script's, an
     /// MCP-set one) still surfaces rather than vanishing.
@@ -873,24 +879,33 @@ impl MapPlanning {
                 ),
                 _ => continue,
             };
-            let matches = |a: &&mut AlarmEntry| -> bool {
-                a.fired.is_none()
-                    && match (&a.kind, &kind) {
-                        (AlarmKind::Manual, AlarmKind::Manual) => a.label == label,
-                        (
-                            AlarmKind::Window {
-                                origin: o1,
-                                destination: d1,
-                            },
-                            AlarmKind::Window {
-                                origin: o2,
-                                destination: d2,
-                            },
-                        ) => o1 == o2 && d1 == d2,
-                        _ => false,
-                    }
-            };
-            match self.alarms.iter_mut().find(matches) {
+            // Of the same-kind candidates, bind the row whose
+            // requested tick is NEAREST the observed fire (C18-F4):
+            // arm order and tick order can disagree — "burn" T+1h
+            // armed before "burn" T+1min — and first-in-book matching
+            // then marked the far row FIRED on the near fire.
+            let best = self
+                .alarms
+                .iter_mut()
+                .filter(|a| {
+                    a.fired.is_none()
+                        && match (&a.kind, &kind) {
+                            (AlarmKind::Manual, AlarmKind::Manual) => a.label == label,
+                            (
+                                AlarmKind::Window {
+                                    origin: o1,
+                                    destination: d1,
+                                },
+                                AlarmKind::Window {
+                                    origin: o2,
+                                    destination: d2,
+                                },
+                            ) => o1 == o2 && d1 == d2,
+                            _ => false,
+                        }
+                })
+                .min_by_key(|a| a.tick.abs_diff(e.tick));
+            match best {
                 Some(a) => a.fired = Some(e.tick),
                 None => self.alarms.push(AlarmEntry {
                     tick: e.tick,
@@ -980,7 +995,7 @@ impl MapPlanning {
 
 /// The `PorkchopQuery` the panel's "Find window" implies — the same
 /// shape the sim's own transfer tests use, generalized to any
-/// sibling pair: departure window `[now + 1 day, now + 0.9·synodic]`,
+/// sibling pair: departure window `[now + 6 h, now + 0.9·synodic]`,
 /// duration window `[0.4, 1.6]·T_hohmann`, 24×24 cells, zero-rev
 /// legs, Oberth-priced departure against `park_r` and v∞ arrival.
 fn porkchop_query(
@@ -1134,28 +1149,61 @@ pub(crate) fn resolve_planning_command(
             out.push(SimCommand::SetAlarm { tick, label });
         }
         C::ArmApsis { apoapsis } => {
-            let Some(orbit) = focus_vessel
-                .and_then(|id| snap.vessels.iter().find(|(vid, ..)| *vid == id))
-                .map(|(_, o, ..)| o)
+            // C18-F1: the Pe/Ap buttons are offered for ANY focused
+            // vessel while the resolver can legitimately have nothing
+            // to schedule — every refusal must reach the panel's error
+            // line rather than click dead.
+            planning.plan_error = None;
+            let Some((vid, orbit, _, on_rails, _)) =
+                focus_vessel.and_then(|id| snap.vessels.iter().find(|(v, ..)| *v == id))
             else {
+                planning.plan_error = Some("no focused vessel to arm on".to_string());
                 return;
             };
-            let Ok(mu) = model.body_orbit(&orbit.parent).map(|b| b.mu_m3_per_s2) else {
-                return;
+            let mu = match model.body_orbit(&orbit.parent).map(|b| b.mu_m3_per_s2) {
+                Ok(mu) => mu,
+                Err(e) => {
+                    planning.plan_error = Some(e.reason().to_string());
+                    return;
+                }
             };
-            let Ok(Some(tick)) = csp_sim::scripts::resolve_apsis_ticks(
+            let tick = match csp_sim::scripts::resolve_apsis_ticks(
                 &orbit.elements,
                 mu,
                 orbit.epoch.ticks(),
                 now.ticks(),
                 apoapsis,
-            ) else {
-                return;
+            ) {
+                Ok(Some(t)) => t,
+                // Ok(None): the conic has no such apsis AHEAD — Ap on
+                // any open trajectory (it never returns), Pe once the
+                // vessel is outbound past it (m ≥ 0, e.g. right after
+                // a prograde escape burn at periapsis).
+                Ok(None) => {
+                    planning.plan_error = Some(if apoapsis {
+                        "no apoapsis — the orbit is open".to_string()
+                    } else {
+                        "periapsis already passed — outbound".to_string()
+                    });
+                    return;
+                }
+                Err(e) => {
+                    planning.plan_error = Some(e.reason().to_string());
+                    return;
+                }
             };
+            // An InBubble focus rides a per-frame osculating refit
+            // (`capture_sync_input`) — a live burn moves the conic
+            // under the resolved tick, so the row carries the caveat.
             let label = format!(
-                "vessel {} {}",
-                focus_vessel.map_or(0, |v| v.0),
-                if apoapsis { "apoapsis" } else { "periapsis" }
+                "vessel {} {}{}",
+                vid.0,
+                if apoapsis { "apoapsis" } else { "periapsis" },
+                if *on_rails {
+                    ""
+                } else {
+                    " (approx — osculating refit)"
+                },
             );
             planning.alarms.push(AlarmEntry {
                 tick,
@@ -1650,6 +1698,7 @@ fn predict_horizon(model: &PatchedConics, conic: &OrbitState, now: SimTime) -> S
 /// over the data-derived model, recomputed each map frame; the
 /// plan's polyline re-samples only when the staged plan changes.
 #[allow(clippy::too_many_arguments)] // one pass = one data bag
+#[allow(clippy::too_many_lines)] // one sweep over the staged geometry
 fn refresh_planning(
     model: &PatchedConics,
     input: &MapInput,
@@ -1738,10 +1787,13 @@ fn refresh_planning(
     // rings — the plan's geometry IS the SOI hand-off.
     if let Some(planned) = &planning.plan {
         let plan = &planned.plan;
-        if scene.plan_line_key != Some(plan.departure_tick) {
+        let key = (plan.departure_tick, plan.duration_ticks);
+        if scene.plan_line_key != Some(key) {
             scene.plan_line =
                 sample_orbit(model, &plan.conic).map(|line| (plan.conic.parent.clone(), line));
-            scene.plan_line_key = Some(plan.departure_tick);
+            if scene.plan_line.is_some() {
+                scene.plan_line_key = Some(key);
+            }
         }
         if let Some(pred) = &planned.encounter {
             if pred.event.direction == SoiDirection::Enter {
@@ -2435,13 +2487,18 @@ pub(crate) fn body_system_vel(
 /// Sample an orbit into a parent-centered polyline (§2.8 `state_at`).
 ///
 /// Closed orbits (`e < 1 − E_PARABOLIC_TOL`, the sim's elliptic band):
-/// `ORBIT_LINE_SAMPLES` segments uniform in
-/// mean anomaly over one full period starting at `epoch` — first and
-/// last sample coincide. Open orbits: samples uniform in *true* anomaly
-/// over [`OPEN_ORBIT_NU_FILL`] of the asymptotic range — mean-anomaly
-/// sampling would pile every point at periapsis. Samples landing before
-/// sim-time 0 are skipped (`state_at` propagates backward fine, but the
-/// integer clock cannot go negative).
+/// `ORBIT_LINE_SAMPLES` segments uniform in *eccentric* anomaly over
+/// one full revolution — first and last sample coincide. Uniform in E
+/// (not mean anomaly = not time): dν/dM at periapsis is
+/// √((1+e)/(1−e)³) ≈ 44 at e = 0.9, so uniform-M sampling left a
+/// measured 82.6° true-anomaly gap beside periapsis and the exact Pe
+/// marker sat ~15% of r_pe inside the drawn chord (C18-F2). Uniform-E
+/// bounds the gap at √((1+e)/(1−e))·τ/N ≈ 12.2° at e = 0.9 for the
+/// same 129 `state_at` calls. Open orbits: samples uniform in *true*
+/// anomaly over [`OPEN_ORBIT_NU_FILL`] of the asymptotic range —
+/// mean-anomaly sampling would pile every point at periapsis. Samples
+/// landing before sim-time 0 are skipped (`state_at` propagates
+/// backward fine, but the integer clock cannot go negative).
 ///
 /// `None` when the orbit cannot be sampled at all (bad μ, solver
 /// failure at every sample) — callers treat `None` as "no line".
@@ -2456,15 +2513,31 @@ fn sample_orbit(model: &PatchedConics, state: &OrbitState) -> Option<Vec<DVec3>>
         if !(a > 0.0 && a.is_finite() && mu > 0.0) {
             return None;
         }
-        let period = 2.0 * std::f64::consts::PI * f64::sqrt(a * a * a / mu);
-        if !period.is_finite() {
+        let n = f64::sqrt(mu / (a * a * a));
+        if !(n > 0.0 && n.is_finite()) {
             return None;
         }
+        // Uniform in eccentric anomaly E. The grid anchors at
+        // periapsis (E = 0) — a closed silhouette's vertex placement
+        // is phase-free — and each sample's evaluation time backs out
+        // of Kepler's M = E − e·sinE, wrapped forward of the epoch's
+        // mean anomaly so every time stays at or ahead of `epoch`.
+        // M is monotone in E (dM/dE = 1 − e·cosE > 0), so the E grid
+        // still covers exactly one revolution.
+        let tau = std::f64::consts::TAU;
+        let m0 = state.elements.mean_anomaly_epoch_rad.rem_euclid(tau);
         for i in 0..=ORBIT_LINE_SAMPLES {
-            let t_ticks = epoch_ticks
-                + (period * TICK_HZ as f64 * i as f64 / ORBIT_LINE_SAMPLES as f64).round() as i64;
-            let Ok((r, _v)) = model.state_at(state, SimTime::from_ticks(t_ticks.max(0) as u64))
-            else {
+            let ea = tau * i as f64 / ORBIT_LINE_SAMPLES as f64;
+            let m = ea - e * f64::sin(ea);
+            let dt_s = (m - m0).rem_euclid(tau) / n;
+            if !dt_s.is_finite() {
+                continue;
+            }
+            let t_ticks = epoch_ticks + (dt_s * TICK_HZ as f64).round() as i64;
+            if t_ticks < 0 {
+                continue; // the integer clock cannot go below zero
+            }
+            let Ok((r, _v)) = model.state_at(state, SimTime::from_ticks(t_ticks as u64)) else {
                 continue;
             };
             if r.is_finite() {
@@ -3632,5 +3705,334 @@ mod tests {
         });
         let rows = planning.alarm_rows(64 + ALARM_LAPSE_TICKS + 1);
         assert_eq!(rows[0].state, csp_ui::AlarmState::Lapsed);
+    }
+
+    /// C18-F2: the closed-orbit sampler is uniform in eccentric
+    /// anomaly, so the true-anomaly gap at periapsis stays bounded at
+    /// √((1+e)/(1−e))·τ/N ≈ 12.2° for e = 0.9 — the old uniform-M grid
+    /// measured 82.6° and left the exact Pe marker ~15% of r_pe off
+    /// the drawn chord.
+    #[test]
+    fn closed_orbit_sampling_tracks_periapsis() {
+        let model = test_system();
+        let e = 0.9;
+        let a = 6.0e9;
+        let mut el = circular_elements(a, 1.1); // m0 ≠ 0 — any phase
+        el.eccentricity = e;
+        let state = OrbitState {
+            parent: BodyId::from("sol"),
+            elements: el,
+            epoch: SimTime::ZERO,
+        };
+        let line = sample_orbit(&model, &state).expect("ellipse samples");
+        assert_eq!(line.len(), ORBIT_LINE_SAMPLES + 1);
+        // argp = node = inc = 0 ⇒ the sampled frame IS perifocal, so a
+        // vertex's polar angle atan2(y, x) is its true anomaly.
+        let nus: Vec<f64> = line.iter().map(|p| f64::atan2(p.y, p.x)).collect();
+        let tau = std::f64::consts::TAU;
+        let max_gap = nus
+            .windows(2)
+            .map(|w| (w[1] - w[0]).rem_euclid(tau))
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_gap < 0.30,
+            "periapsis gap must stay near the uniform-E bound (~0.21 rad at e=0.9): {max_gap}"
+        );
+        // And the loop still closes.
+        assert!(line[0].distance(*line.last().unwrap()) < a * 1e-6);
+    }
+
+    /// C18-F4: two same-label manual alarms arm out of tick order —
+    /// "burn" T+1h before "burn" T+1min. The T+1min fire must mark the
+    /// T+1min row, not the first-armed one (label-only, first-in-book
+    /// matching cross-fired them).
+    #[test]
+    fn same_label_alarms_bind_the_nearest_tick() {
+        use csp_sim::events::{EventClass, EventKind, ScheduledEvent};
+        let mut planning = MapPlanning::default();
+        let far = 3600 * TICK_HZ;
+        let near = 60 * TICK_HZ;
+        for tick in [far, near] {
+            planning.alarms.push(AlarmEntry {
+                tick,
+                label: "burn".to_string(),
+                kind: AlarmKind::Manual,
+                fired: None,
+                lapsed: false,
+            });
+        }
+        planning.note_fired(&[ScheduledEvent {
+            tick: near + 1, // the sim's +1-tick clamp is legal drift
+            seq: 0,
+            class: EventClass::Clamping,
+            kind: EventKind::PlayerAlarm {
+                label: "burn".to_string(),
+            },
+        }]);
+        assert!(
+            planning.alarms[0].fired.is_none(),
+            "the T+1h row must not claim the T+1min fire"
+        );
+        assert_eq!(planning.alarms[1].fired, Some(near + 1));
+    }
+
+    /// C18-F1: the Ap/Pe quick-alarms must never dead-click — an
+    /// unservable press reaches `plan_error`. Ap on an open conic
+    /// (never returns) and Pe once outbound past it are the verified
+    /// dead paths.
+    #[test]
+    fn arm_apsis_reports_open_conic_refusals() {
+        let model = transfer_system();
+        let hyper = |m0: f64| OrbitState {
+            parent: BodyId::from("terrin"),
+            elements: KeplerElements {
+                semi_major_axis_m: -2.0e6,
+                eccentricity: 1.5,
+                inclination_rad: 0.0,
+                ascending_node_rad: 0.0,
+                arg_periapsis_rad: 0.0,
+                mean_anomaly_epoch_rad: m0,
+                period_s: f64::INFINITY,
+            },
+            epoch: SimTime::ZERO,
+        };
+        let snap = |o: OrbitState| MapSnapshot {
+            tick: SimTime::ZERO,
+            vessels: vec![(VesselId(3), o, None, true, None)],
+        };
+        let vid = Some(VesselId(3));
+        // Ap on any open conic → a surfaced reason, no command, no row.
+        let mut planning = MapPlanning::default();
+        let mut out = Vec::new();
+        resolve_planning_command(
+            csp_ui::PlanningCommand::ArmApsis { apoapsis: true },
+            &model,
+            &snap(hyper(-0.5)),
+            vid,
+            None,
+            &mut planning,
+            &mut out,
+        );
+        assert!(out.is_empty() && planning.alarms.is_empty());
+        let err = planning.plan_error.clone().expect("a reason surfaces");
+        assert!(err.contains("apoapsis"), "unexpected reason: {err}");
+        // Pe once outbound past it (m > 0) → likewise.
+        let mut planning = MapPlanning::default();
+        resolve_planning_command(
+            csp_ui::PlanningCommand::ArmApsis { apoapsis: false },
+            &model,
+            &snap(hyper(0.5)),
+            vid,
+            None,
+            &mut planning,
+            &mut out,
+        );
+        let err = planning.plan_error.clone().expect("a reason surfaces");
+        assert!(err.contains("periapsis"), "unexpected reason: {err}");
+        // …while Pe still inbound (m < 0) arms for real.
+        let mut planning = MapPlanning::default();
+        resolve_planning_command(
+            csp_ui::PlanningCommand::ArmApsis { apoapsis: false },
+            &model,
+            &snap(hyper(-0.5)),
+            vid,
+            None,
+            &mut planning,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(planning.alarms.len(), 1);
+        assert!(planning.plan_error.is_none());
+        // And a missing focus is reported, not dropped.
+        let mut planning = MapPlanning::default();
+        let mut out = Vec::new();
+        resolve_planning_command(
+            csp_ui::PlanningCommand::ArmApsis { apoapsis: true },
+            &model,
+            &snap(hyper(-0.5)),
+            None,
+            None,
+            &mut planning,
+            &mut out,
+        );
+        assert!(out.is_empty());
+        assert!(planning.plan_error.is_some());
+    }
+
+    /// C18-F1: an InBubble focus rides a per-frame osculating refit —
+    /// the armed apsis row carries the "approximate" caveat rather
+    /// than reading like a rails-precise alarm.
+    #[test]
+    fn arm_apsis_marks_in_bubble_approximate() {
+        let model = transfer_system();
+        let snap = MapSnapshot {
+            tick: SimTime::ZERO,
+            vessels: vec![(
+                VesselId(4),
+                OrbitState {
+                    parent: BodyId::from("terrin"),
+                    elements: circular_elements(7.0e5, 0.3),
+                    epoch: SimTime::ZERO,
+                },
+                None,
+                false, // InBubble — the conic is a per-frame refit
+                None,
+            )],
+        };
+        let mut planning = MapPlanning::default();
+        let mut out = Vec::new();
+        resolve_planning_command(
+            csp_ui::PlanningCommand::ArmApsis { apoapsis: true },
+            &model,
+            &snap,
+            Some(VesselId(4)),
+            None,
+            &mut planning,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1);
+        let label = &planning.alarms[0].label;
+        assert!(
+            label.contains("osculating refit"),
+            "the caveat rides the row: {label}"
+        );
+        // The book row and the scheduled event share the label, so
+        // the fired match still binds.
+        let SimCommand::SetAlarm {
+            label: cmd_label, ..
+        } = &out[0]
+        else {
+            panic!("ArmApsis emits SetAlarm");
+        };
+        assert_eq!(cmd_label, label);
+    }
+
+    /// C18-F3: the plan-route polyline is keyed on
+    /// `(departure_tick, duration_ticks)` — a re-plan that moves in
+    /// duration while holding the departure cell resamples (each cell
+    /// is a distinct Lambert leg), and a failed sample leaves the key
+    /// unlatched so the next frame retries.
+    #[test]
+    fn plan_line_rekeys_on_duration_and_retries_failures() {
+        let model = transfer_system();
+        let table = BodyTable::from_model(&model);
+        let input = MapInput::new(&table);
+        let snap = MapSnapshot::default();
+        let mut planning = MapPlanning::default();
+        let mut out = Vec::new();
+        resolve_planning_command(
+            csp_ui::PlanningCommand::FindWindow {
+                origin: "terrin".to_string(),
+                destination: "duva".to_string(),
+            },
+            &model,
+            &snap,
+            None,
+            None,
+            &mut planning,
+            &mut out,
+        );
+        let plan_a = planning.plan.as_ref().expect("the pair plans").plan.clone();
+        // A sibling plan: same departure cell, moved in duration (and
+        // therefore a different conic).
+        let mut plan_b = plan_a.clone();
+        plan_b.duration_ticks += TICK_HZ;
+        plan_b.arrival_tick += TICK_HZ;
+        plan_b.conic.elements.semi_major_axis_m *= 1.05;
+
+        let stage = |plan: &csp_sim::transfer::TransferPlan| MapPlanning {
+            plan: Some(PlannedTransfer {
+                plan: plan.clone(),
+                node: None,
+                node_vessel: None,
+                node_error: None,
+                encounter: None,
+            }),
+            ..MapPlanning::default()
+        };
+        let mut scene = MapScene::default();
+        let mut ui = MapUiData::default();
+        let cam = MapCameraF64::default();
+        let t = SimTime::ZERO;
+
+        refresh_planning(
+            &model,
+            &input,
+            &snap,
+            &table,
+            &stage(&plan_a),
+            &mut scene,
+            &mut ui,
+            &cam,
+            t,
+        );
+        let line_a = scene.plan_line.clone().expect("plan A draws");
+        // Re-run unchanged → the cached line rides (same pointer of truth).
+        refresh_planning(
+            &model,
+            &input,
+            &snap,
+            &table,
+            &stage(&plan_a),
+            &mut scene,
+            &mut ui,
+            &cam,
+            t,
+        );
+        assert_eq!(scene.plan_line.as_ref().unwrap().1, line_a.1);
+        // Same departure tick, different duration → resample.
+        refresh_planning(
+            &model,
+            &input,
+            &snap,
+            &table,
+            &stage(&plan_b),
+            &mut scene,
+            &mut ui,
+            &cam,
+            t,
+        );
+        let line_b = scene.plan_line.clone().expect("plan B draws");
+        assert_ne!(
+            line_b.1, line_a.1,
+            "a duration change must invalidate the cached polyline"
+        );
+        // An unsampleable conic does not latch the key — a same-plan
+        // next frame retries instead of pinning "no line".
+        let mut plan_bad = plan_a.clone();
+        plan_bad.conic.parent = BodyId::from("no-such-body");
+        refresh_planning(
+            &model,
+            &input,
+            &snap,
+            &table,
+            &stage(&plan_bad),
+            &mut scene,
+            &mut ui,
+            &cam,
+            t,
+        );
+        assert!(scene.plan_line.is_none());
+        assert_ne!(
+            scene.plan_line_key,
+            Some((plan_bad.departure_tick, plan_bad.duration_ticks)),
+            "a failed sample must not latch the key — the next frame retries"
+        );
+        refresh_planning(
+            &model,
+            &input,
+            &snap,
+            &table,
+            &stage(&plan_a),
+            &mut scene,
+            &mut ui,
+            &cam,
+            t,
+        );
+        assert_eq!(
+            scene.plan_line.as_ref().unwrap().1,
+            line_a.1,
+            "the retry after the failed sample still draws"
+        );
     }
 }
