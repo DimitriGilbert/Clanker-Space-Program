@@ -85,8 +85,11 @@ fn ticks_for(mass_kg: f64, rate_kg_per_s: f64) -> u64 {
     t.max(1)
 }
 
-/// The craft's live-graph mass — `WeldPart::mass_kg` (wet: tanks
-/// build full, so filling them is part of the job) over nodes only.
+/// The craft's live-graph mass — `WeldPart::mass_kg` (the authored
+/// wet-full figure: propellant tanks build full, and the cargo slots
+/// `spawn_contents` empties at delivery still rode the order's mass
+/// clock — a slightly conservative build time, accepted) over nodes
+/// only.
 fn craft_mass_kg(craft: &crate::CraftDef) -> f64 {
     craft
         .graph
@@ -321,7 +324,7 @@ impl crate::World {
     /// occupancy gate's reason) or evaporating a paid-for build.
     fn deliver_built_vessel(
         &mut self,
-        b: ActiveBuild,
+        mut b: ActiveBuild,
         shadow: &mut TickShadow,
     ) -> Result<(), SimError> {
         if self.delivery_blocked(&b) {
@@ -354,7 +357,12 @@ impl crate::World {
             .physics
             .as_ref()
             .map(|p| csp_phys::ambient_k(p.backend.environment(), def.altitude_m));
-        let tank_contents = crate::transfers::spawn_contents(&b.craft);
+        // The spawn-fill write is part of delivery — propellant tanks
+        // full, §3.5 build-material/cargo tanks EMPTY with their
+        // authored wet mass handed back (the manufacture→recover
+        // faucet `spawn_contents`'s doc names). `b.craft` is the
+        // delivered record, so the strip lands on the vessel itself.
+        let tank_contents = crate::transfers::spawn_contents(&mut b.craft);
         let thermal = ambient.map_or_else(crate::VesselThermal::default, |a| {
             crate::VesselThermal::at_ambient(&b.craft.graph, a)
         });
@@ -571,9 +579,69 @@ mod tests {
         assert!(w.builds.is_empty());
         let v = w.vessels().values().next().unwrap();
         assert!(matches!(v.state, crate::VesselState::SurfaceLatched(_)));
-        // Tanks build full (the spawn convention): 10 ore aboard.
+        // `ore` is a §3.5 build material — the cargo tank delivers
+        // EMPTY (the manufacture→recover faucet fix): nothing aboard,
+        // `free = capacity`, and the 10 kg of authored wet mass went
+        // back with the contents (100 kg authored − 10 u · 1 kg/u).
+        let ore = ResourceId::from("ore");
+        assert_eq!(crate::transfers::vessel_resource(v, &ore), 0.0);
+        assert_eq!(
+            crate::transfers::vessel_capacity(v, &ore) - crate::transfers::vessel_resource(v, &ore),
+            10.0,
+            "a delivered cargo tank must offer its full capacity"
+        );
+        let part = &v.craft.as_ref().unwrap().parts[0];
         assert!(
-            (crate::transfers::vessel_resource(v, &ResourceId::from("ore")) - 10.0).abs() < 1e-9
+            (part.mass_kg - 90.0).abs() < 1e-9,
+            "cargo wet mass strips at delivery: {}",
+            part.mass_kg
+        );
+    }
+
+    /// The faucet regression, end to end (fix-plan 3.1): build a bare
+    /// ore tank, recover it at the launch site — the cycle must move
+    /// ONLY the paid BOM out of the site inventory. Pre-fix the
+    /// delivered tank arrived full and `RecoverVessel` credited the
+    /// contents back at efficiency 1.0: −20 ore + 10 ore netted the
+    /// build 10 ore (and `metal`/`composite` slots would mint the
+    /// build currencies outright). Post-fix the recovery credits zero
+    /// contents — the inventory stays at its post-BOM level.
+    #[test]
+    fn manufactured_cargo_tank_recovers_empty() {
+        let mut w = world();
+        let ore = ResourceId::from("ore");
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::ManufactureCraft {
+                site: SiteId::from("pad"),
+                craft: craft(),
+                build_resources: vec![(ore.clone(), 20.0)],
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        // Deliver (100 kg at 50 kg/s → 128 ticks) and recover at the
+        // pad it landed on — `launch: true`, so contents would credit
+        // at 1.0 if there were any.
+        w.step_frame(w.clock().ticks() + 128).unwrap();
+        let vessel = *w.vessels().keys().next().unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RecoverVessel {
+                vessel,
+                site: Some(SiteId::from("pad")),
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        // A rejected recovery would leave the same 80 — prove the
+        // vessel is actually gone before crediting the assertion.
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        assert!(!w.vessels().contains_key(&vessel));
+        let inv = &w.economy().sites[&SiteId::from("pad")].inventory;
+        assert_eq!(
+            inv[&ore], 80.0,
+            "build−recover cycle must net only the BOM spend ({inv:?})"
         );
     }
 

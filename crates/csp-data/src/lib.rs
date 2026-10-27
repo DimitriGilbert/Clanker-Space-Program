@@ -101,7 +101,9 @@ pub use part::{
     StructuralDef, ThermalDef, ThrottleRange,
 };
 pub use recipe::{RECIPE_SCHEMA_VERSION, RecipeDef};
-pub use resource::{RESOURCE_SCHEMA_VERSION, ResourceDef, ResourceFile};
+pub use resource::{
+    BUILD_MATERIALS, RESOURCE_SCHEMA_VERSION, ResourceDef, ResourceFile, is_build_material,
+};
 pub use site::{SITE_SCHEMA_SUPPORTED, SITE_SCHEMA_VERSION, SiteDef, SiteFile};
 pub use system::{
     AtmosphereDef, BiomeMapRef, BodyDef, ConcentrationMapRef, KeplerElements, OceanDef,

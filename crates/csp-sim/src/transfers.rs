@@ -382,27 +382,61 @@ fn choose_seat(vessel: &Vessel) -> Option<PartNodeId> {
     None
 }
 
-/// The spawn-time contents map — every declared tank slot FULL (the
-/// resolver's wet-mass convention: `mass_kg` already includes
-/// `Σ capacity·mass_per_unit_kg`). Nodes without tanks get no entry.
+/// The spawn-time contents map — every declared tank slot gets an
+/// entry, and the craft's `mass_kg`/`inertia` are rewritten to match
+/// (call ONCE per craft, before it is shared or welded — the mass
+/// strip is not idempotent).
+///
+/// Two fill rules, split by resource class:
+///
+/// - **Propellant/consumable slots spawn FULL** — the resolver's
+///   wet-mass convention (`mass_kg` already includes
+///   `Σ capacity·mass_per_unit_kg`), value-neutral under
+///   `RecoverVessel`: a recovered unit of propellant credits site
+///   stock nothing spends.
+/// - **§3.5 build-material/cargo slots
+///   ([`csp_data::resource::is_build_material`] — ore/metal/composite)
+///   spawn EMPTY.** `RecoverVessel` credits contents to the recovery
+///   site's inventory at its efficiency (1.0 at a launch pad), so a
+///   cargo tank delivered full would be a manufacture→recover faucet
+///   minting the exact resources build orders spend — and a full tank
+///   could never haul (`free = 0` at delivery). An empty slot lands
+///   `free = capacity` for the colony→vessel supply loop instead.
+///
+/// The strip is physical, not just bookkeeping: the maintained
+/// invariant is `mass_kg = dry + Σ bucketed wet` (module doc), so each
+/// empty-spawned slot returns its `capacity·mass_per_unit_kg` through
+/// the same [`apply_bucket_delta`] a full→empty debit would apply —
+/// a later colony→vessel fill then adds the mass back exactly.
 pub(crate) fn spawn_contents(
-    craft: &crate::CraftDef,
+    craft: &mut crate::CraftDef,
 ) -> BTreeMap<PartNodeId, BTreeMap<ResourceId, f64>> {
     let mut out = BTreeMap::new();
     for (id, node) in &craft.graph.nodes {
-        let Some(part) = craft.parts.get(node.effective_index as usize) else {
+        let Some(part) = craft.parts.get_mut(node.effective_index as usize) else {
             continue;
         };
         if part.tanks.is_empty() {
             continue;
         }
-        out.insert(
-            *id,
-            part.tanks
-                .iter()
-                .map(|t| (t.resource.clone(), t.capacity))
-                .collect(),
-        );
+        // Snapshot the spec list so the strip can mutate the part.
+        let tanks: Vec<(ResourceId, f64, f64)> = part
+            .tanks
+            .iter()
+            .map(|t| (t.resource.clone(), t.capacity, t.mass_per_unit_kg))
+            .collect();
+        let mut stores = BTreeMap::new();
+        for (resource, capacity, mpu) in tanks {
+            if csp_data::resource::is_build_material(&resource) {
+                // Cargo slot: empty contents, authored wet mass handed
+                // back — the `debit` path's own full→empty move.
+                apply_bucket_delta(part, capacity, mpu, capacity, 0.0);
+                stores.insert(resource, 0.0);
+            } else {
+                stores.insert(resource, capacity);
+            }
+        }
+        out.insert(*id, stores);
     }
     out
 }
@@ -455,7 +489,7 @@ pub(crate) fn check_tank_masses(craft: &crate::CraftDef) -> Result<(), SimError>
 /// the delta is exact — there is no `mass − wet_exact` dry-mass
 /// recovery to drift, and rewriting the same contents is a bitwise
 /// no-op (`dq == 0.0`). Returns whether the part's mass moved.
-fn apply_bucket_delta(
+pub(crate) fn apply_bucket_delta(
     part: &mut csp_phys::WeldPart,
     capacity: f64,
     mass_per_unit_kg: f64,

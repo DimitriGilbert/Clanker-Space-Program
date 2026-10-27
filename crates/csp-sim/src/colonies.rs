@@ -4235,12 +4235,25 @@ mod tests {
     fn latched_vessel(w: &mut World, resource: &str, capacity: f64, fill: f64) -> VesselId {
         let id = VesselId(w.next_vessel_id);
         w.next_vessel_id += 1;
-        let craft = tank_craft(resource, capacity);
-        let mut tank_contents = crate::transfers::spawn_contents(&craft);
+        let mut craft = tank_craft(resource, capacity);
+        let mut tank_contents = crate::transfers::spawn_contents(&mut craft);
+        // The spawn map reads `fill` after this override — reconcile
+        // the part's mass through the same bucketed delta the strip
+        // (build-material slots spawn empty) or a full-slot rewrite
+        // would apply, keeping `mass_kg = dry + Σ bucketed wet` true.
         for stores in tank_contents.values_mut() {
             for (r, c) in stores.iter_mut() {
                 if r.as_str() == resource {
+                    let spawned = *c;
                     *c = fill;
+                    let part = &mut craft.parts[0];
+                    let (cap, mpu) = part
+                        .tanks
+                        .iter()
+                        .find(|t| t.resource == *r)
+                        .map(|t| (t.capacity, t.mass_per_unit_kg))
+                        .unwrap_or((0.0, 0.0));
+                    crate::transfers::apply_bucket_delta(part, cap, mpu, spawned, fill);
                 }
             }
         }
@@ -4300,11 +4313,23 @@ mod tests {
         part.mass_kg = 100.0 + full_wet;
         part.inertia =
             csp_phys::SymMat3::solid_box(part.mass_kg, csp_core::DVec3::new(0.5, 0.5, 0.5));
-        let mut tank_contents = crate::transfers::spawn_contents(&craft);
+        let mut tank_contents = crate::transfers::spawn_contents(&mut craft);
+        // As `latched_vessel`: rewrite the spawn map to the authored
+        // fills, then reconcile each tank's bucketed wet mass (the
+        // build-material slots spawned empty — their strip already ran).
         for (res, _, fill) in tanks {
             for stores in tank_contents.values_mut() {
                 if let Some(c) = stores.get_mut(&ResourceId::from(*res)) {
+                    let spawned = *c;
                     *c = *fill;
+                    let part = &mut craft.parts[0];
+                    let (cap, mpu) = part
+                        .tanks
+                        .iter()
+                        .find(|t| t.resource.as_str() == *res)
+                        .map(|t| (t.capacity, t.mass_per_unit_kg))
+                        .unwrap_or((0.0, 0.0));
+                    crate::transfers::apply_bucket_delta(part, cap, mpu, spawned, *fill);
                 }
             }
         }

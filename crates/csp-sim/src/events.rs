@@ -165,7 +165,7 @@ pub enum EventKind {
         /// Free-form label for the notification surface.
         label: String,
     } = 2,
-    /// §2.9's debris-decay removal (Silent member): a debris-flagged
+    /// §3.5's debris-decay removal (Silent member): a debris-flagged
     /// vessel whose rails periapsis dips below its parent's atmosphere
     /// top (or the surface, on an airless body) burns up / impacts at
     /// the periapsis tick. Scheduled by `ToRails` on debris vessels.

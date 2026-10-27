@@ -1,10 +1,20 @@
 // The home system's authored starting colonies (PLAN §3.5.1) — one
 // Rask mining outpost exercising the M8-B module set: solar + battery
 // power, an ore drill on the site's 0.9 ore yield, a smelter running
-// recipe.smelt_ore, and ore/metal stores. Its EC math: solar at
-// Rask's authored insolation covers the drill + smelter (Rask is
-// tidally locked — no terminator crossings, a permanently daylit
-// site; the battery rides the transient, not a night).
+// recipe.smelt_ore, a sinter running recipe.composite (fix-plan 3.1:
+// the recipe shipped but no authored colony ran it — dead data), and
+// ore/metal/composite stores. Its EC math: solar at Rask's authored
+// insolation covers the drill + both converters with orders of
+// magnitude of headroom (Rask is tidally locked — no terminator
+// crossings, a permanently daylit site; the battery rides the
+// transient, not a night). The sinter is priority 6 — it eats the
+// smelter's metal output, so it queues BEHIND the smelter for the
+// shared ore feedstock rather than outbidding it. The composite
+// store exists because the §3.5.1 sink rule pins a converter at
+// fraction 0 when its output has nowhere to go; capacity 30 matches
+// the csp.tank.ore.s composite slot (~2 starter-craft BOMs' worth).
+// The 3.6 rebalance re-tunes these numbers — this wiring lands the
+// module's existence, not its final economics.
 (
     schema_version: 2,
     colonies: [
@@ -25,8 +35,14 @@
                     priority: 5,
                     power_ec_per_s: 1.5,
                 ),
+                Converter(
+                    recipe: "recipe.composite",
+                    priority: 6,
+                    power_ec_per_s: 1.0,
+                ),
                 Store( resource: "ore", capacity: 100.0 ),
                 Store( resource: "metal", capacity: 60.0 ),
+                Store( resource: "composite", capacity: 30.0 ),
             ],
             stores: [
                 (resource: "electric_charge", level: 3000.0),

@@ -29,6 +29,34 @@ pub const RESOURCE_SCHEMA_VERSION: u32 = 1;
 /// resource — see `csp_sim::research`'s note).
 pub const ELECTRIC_CHARGE: &str = "electric_charge";
 
+/// §3.5's build-currency/cargo set — the resources launch-site and
+/// colony inventories stockpile and `build_resources` BOMs spend (or
+/// the smelter chain converts into spendable feedstock: `ore` smelts
+/// to `metal`, `ore` + `metal` sinter to `composite`). §3.5 pins the
+/// v1 resource set at ten, so naming the subset here — the
+/// `ELECTRIC_CHARGE` precedent — keeps the spelling to one source of
+/// truth rather than growing a schema flag the sim could not read at
+/// spawn time anyway (a resolved `TankSpec` carries no resource
+/// table).
+///
+/// Why the sim cares: `RecoverVessel` credits a latched vessel's tank
+/// contents to the recovery site's inventory at its efficiency (1.0 at
+/// a launch pad), so a cargo tank delivered *full* would mint the
+/// exact resources build orders consume — a manufacture→recover
+/// faucet. The sim's spawn-contents rule therefore delivers these
+/// tanks EMPTY (and strips their authored wet mass): a hauler
+/// launches with `free = capacity`, and nothing free enters the
+/// inventory loop. Propellant/consumable tanks keep the spawn-full
+/// convention — nothing spends a recovered unit of them, so the
+/// faucet argument does not apply (and the goldens rely on it).
+pub const BUILD_MATERIALS: &[&str] = &["composite", "metal", "ore"];
+
+/// Whether `id` is one of the §3.5 [`BUILD_MATERIALS`] — the
+/// spawn-empty tank set (see the const's doc for the faucet argument).
+pub fn is_build_material(id: &ResourceId) -> bool {
+    BUILD_MATERIALS.contains(&id.as_str())
+}
+
 /// One resource type: identity, display name, and the mass of one
 /// unit. `mass_per_unit_kg` is the only physical datum the sim needs —
 /// a `Tank`'s wet mass is `Σ units·mass_per_unit_kg`, and

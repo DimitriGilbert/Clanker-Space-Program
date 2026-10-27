@@ -161,7 +161,7 @@ fn flight_initial(dir: &Path) -> Result<World, ReplayError> {
         },
         balance.advance_to_max_events_per_frame,
     );
-    // §2.9's object caps come from the fixture's balance.ron — the
+    // §3.5's object caps come from the fixture's balance.ron — the
     // same wiring `csp-view` startup does, so fixture-authored caps
     // are honoured instead of the no-data defaults.
     world.set_vessel_caps(csp_sim::VesselCaps {

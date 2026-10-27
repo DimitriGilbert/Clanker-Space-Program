@@ -102,3 +102,49 @@ fn home_colony_loc_keys_resolve() {
     let errs = validate_colony_loc_keys(&file, &loc);
     assert!(errs.is_empty(), "unresolved colony loc keys: {errs:#?}");
 }
+
+/// Fix-plan 3.1's dead-recipe gate: `data/recipes/recipe.composite.ron`
+/// ships but is dead data unless an authored `Converter` names it
+/// (colony modules are fixed at founding — no code path adds one
+/// later). Pin that the authored Rask colony runs it, and that its
+/// `composite` output has a `Store` to land in — the §3.5.1 sink rule
+/// pins a storeless-output converter at fraction 0.
+#[test]
+fn authored_colony_runs_recipe_composite() {
+    let file = load_colonies(&home_dir().join("colonies.ron")).unwrap();
+    let rask = file
+        .colonies
+        .iter()
+        .find(|c| c.site.as_str() == "rask-mines")
+        .expect("colonies.ron must author the rask-mines colony");
+    assert!(
+        rask.modules.iter().any(|m| matches!(
+            m,
+            csp_data::ColonyModuleDef::Converter { recipe, .. }
+                if recipe.as_str() == "recipe.composite"
+        )),
+        "rask-mines must author a Converter on recipe.composite — \
+         the recipe is dead data otherwise: {:?}",
+        rask.modules
+    );
+    assert!(
+        rask.modules.iter().any(|m| matches!(
+            m,
+            csp_data::ColonyModuleDef::Store { resource, capacity }
+                if resource.as_str() == "composite" && *capacity > 0.0
+        )),
+        "rask-mines needs a composite Store — the §3.5.1 sink rule \
+         pins the converter at 0 without one: {:?}",
+        rask.modules
+    );
+    // And the shipped recipe table must actually contain it — the
+    // converter's RecipeId resolves against `load_recipes`.
+    let recipes = load_recipes(&data().join("recipes")).unwrap();
+    assert!(
+        recipes
+            .recipes
+            .iter()
+            .any(|r| r.def.id.as_str() == "recipe.composite"),
+        "data/recipes lost recipe.composite while a colony consumes it"
+    );
+}

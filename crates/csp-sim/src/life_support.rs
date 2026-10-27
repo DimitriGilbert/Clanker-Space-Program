@@ -510,7 +510,7 @@ mod tests {
     /// colonies.rs test pattern — direct insertion for the
     /// command-free world).
     fn crewed_vessel(w: &mut World, cap: f64, seats: u32) -> VesselId {
-        let craft = crew_craft(cap);
+        let mut craft = crew_craft(cap);
         let id = VesselId(w.next_vessel_id);
         w.next_vessel_id += 1;
         let mut crew = Vec::new();
@@ -522,11 +522,16 @@ mod tests {
                 seat: PartNodeId(0),
             });
         }
+        // `spawn_contents` mutates the craft (the build-material mass
+        // strip — none of these tanks qualify, but the stored record
+        // must still be the post-spawn craft, not a pre-strip clone).
+        let tank_contents = crate::transfers::spawn_contents(&mut craft);
+        let thermal = VesselThermal::at_ambient(&craft.graph, 288.0);
         w.vessels.insert(
             id,
             Vessel {
                 id,
-                craft: Some(craft.clone()),
+                craft: Some(craft),
                 state: VesselState::SurfaceLatched(crate::SurfacePose {
                     body: BodyId::from("terra"),
                     latitude_rad: 0.0,
@@ -535,11 +540,11 @@ mod tests {
                     orientation: csp_core::DQuat::IDENTITY,
                 }),
                 aero_mask: csp_phys::ConfigMask::ALL,
-                thermal: VesselThermal::at_ambient(&craft.graph, 288.0),
+                thermal,
                 debris_since: None,
                 maneuver: None,
                 seams: Vec::new(),
-                tank_contents: crate::transfers::spawn_contents(&craft),
+                tank_contents,
                 crew,
                 science: crate::VesselScience::default(),
                 joined_colony: None,

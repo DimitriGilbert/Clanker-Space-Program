@@ -94,7 +94,7 @@
 //! a root has no grandparent frame to Exit into and is no child of
 //! itself to Enter. `World::schedule_next_soi` converts such a
 //! crossing into a rescan boundary (or, for debris on an Exit, into
-//! the §2.9 escape-deletion the event exists to carry).
+//! the §3.5 escape-deletion the event exists to carry).
 
 use std::collections::BTreeMap;
 
@@ -1235,7 +1235,7 @@ impl PatchedConics {
     /// enumerates its boundary: the scan reports real crossings, and
     /// the *scheduling* side (`World::schedule_next_soi`) is where the
     /// unappliable root transition is refused (its doc names the two
-    /// dispositions: §2.9 debris deletion, or a rescan past it).
+    /// dispositions: §3.5 debris deletion, or a rescan past it).
     /// Shared by the scan and [`Self::scan_strides`]: a child carrying
     /// an SOI is a candidate *whether or not it has elements* — the
     /// `v_rel_max` step is where a missing-elements child fails, and it

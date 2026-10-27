@@ -3803,7 +3803,7 @@ impl View {
         build_resources: &[(csp_data::ResourceId, f64)],
         occupant: Option<csp_sim::VesselId>,
     ) -> Option<String> {
-        // §2.9's cap — vessels + in-flight builds (each build already
+        // §3.5's cap — vessels + in-flight builds (each build already
         // reserved its delivery slot).
         if self.sim.vessel_slots_in_use() >= self.sim.vessel_caps().max_vessels {
             return Some(self.launch_refused(format!(

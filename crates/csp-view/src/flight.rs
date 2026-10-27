@@ -2116,7 +2116,7 @@ fn sfx_edges(
                 push("BREAKUP");
             }
             if c.debris < p.debris {
-                // §2.9: in-bubble debris leaves only via impact removal
+                // §3.5: in-bubble debris leaves only via impact removal
                 // (it never latches).
                 push("DEBRIS IMPACT");
             }

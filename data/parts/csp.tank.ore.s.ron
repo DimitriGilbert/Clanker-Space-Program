@@ -11,9 +11,16 @@
 // inventory via `RecoverVessel`'s contents credit (1.0 at the
 // launch pad).
 //
-// Like every tank in the set it builds FULL at manufacture — the
-// contents ride the build order the same way propellant does on
-// the Drum tanks; the BOM buys the hull.
+// Unlike the propellant Drum tanks it builds EMPTY at manufacture —
+// ore/metal/composite are the §3.5 build-currency set
+// (`BUILD_MATERIALS`), and `RecoverVessel` credits tank contents to
+// the site inventory at 1.0 on the pad: a delivered-full cargo tank
+// would be a manufacture→recover faucet minting the very resources
+// the BOM spends (18 m / 4 c in, 42 m / 26 c / 200 ore back out).
+// Empty spawn also leaves `free = capacity` at delivery — a full
+// hauler could never haul. The BOM buys the hull only; the resolver's
+// wet mass is handed back at spawn, so the 2.84 t figure below is
+// the *loaded* number, not the delivered one.
 //
 // 200 u ore covers a mid-range resupply draw in one run, 60 u metal
 // matches the rask-mines store cap, and 30 u composite is ~2

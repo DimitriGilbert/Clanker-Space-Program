@@ -204,7 +204,7 @@ pub struct VesselRow {
     pub residence: String,
     /// The body it orbits or sits on ("" when none applies).
     pub body: String,
-    /// Debris-flagged (§2.9 object caps).
+    /// Debris-flagged (§3.5 object caps).
     pub debris: bool,
     /// This is the focused vessel (the science/crew/transfer target).
     pub focused: bool,

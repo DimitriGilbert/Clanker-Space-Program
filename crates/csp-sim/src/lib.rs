@@ -4211,7 +4211,7 @@ impl World {
                 (Vec<csp_phys::PartNodeId>, Vec<csp_phys::PartNodeId>),
             > = BTreeMap::new();
             // Debris vessels that touched the surface this tick —
-            // §2.9's "suborbital debris is removed on impact".
+            // §3.5's "suborbital debris is removed on impact".
             let mut impacted: Vec<VesselId> = Vec::new();
             // Bodies the backend's settle counter latched this tick —
             // their SurfaceLatched transition waits for the
@@ -4565,7 +4565,7 @@ impl World {
                             .iter()
                             .any(|c| c.peer.is_none()))
                 {
-                    // §2.9: suborbital debris is removed on impact —
+                    // §3.5: suborbital debris is removed on impact —
                     // a debris body that touches the surface (or
                     // settles there) leaves the sim, never latches.
                     // Ground contacts only (`peer.is_none()`): leaning
@@ -6284,6 +6284,15 @@ impl World {
                 "physical spawn: insufficient funds to manufacture",
             ));
         }
+        // The delivered craft: §3.5 build-material/cargo tanks spawn
+        // EMPTY — `spawn_contents` writes the contents map AND strips
+        // those slots' authored wet mass in one pass (the
+        // manufacture→recover faucet its doc names), so the clone it
+        // mutates is the craft every downstream reader sees — the
+        // weld's body mass, the graph hash, the stored record.
+        let mut spawn_craft = craft.clone();
+        let tank_contents = transfers::spawn_contents(&mut spawn_craft);
+        let craft = &spawn_craft;
         let mut body = csp_phys::weld(&craft.graph, &craft.parts)
             .map_err(|e| SimError::Recoverable(e.reason()))?;
         body.pos = pos;
@@ -6379,9 +6388,12 @@ impl World {
                 debris_since: None,
                 maneuver: None,
                 seams: Vec::new(),
-                // M6-D: tanks resolve FULL — the resolver's wet-mass
-                // convention (`mass_kg` already counts them).
-                tank_contents: transfers::spawn_contents(craft),
+                // M6-D: propellant tanks resolve FULL (the resolver's
+                // wet-mass convention); §3.5 build-material cargo
+                // tanks spawn EMPTY — `spawn_contents` already wrote
+                // the map and stripped those slots' wet mass on the
+                // stored clone above.
+                tank_contents,
                 // M9b: the craft instantiation IS part creation —
                 // one instance id + pre-drawn θ per node (§3.4).
                 reliability: reliability_records,
@@ -6529,11 +6541,11 @@ impl World {
         let Some(orbit) = self.vessels.get(&vessel).and_then(|v| v.orbit()).cloned() else {
             // The residence walk can consume the vessel outright — a
             // debris escape past the root's SOI deletes it in place
-            // (§2.9, `apply_soi_transition`'s Exit arm).
+            // (§3.5, `apply_soi_transition`'s Exit arm).
             return Ok(());
         };
         if is_debris {
-            // §2.9: a debris vessel whose conic decays burns up at
+            // §3.5: a debris vessel whose conic decays burns up at
             // periapsis — schedule its own removal before the SOI
             // scan. Measured from `epoch`: the elements' `M0` refers
             // to the stamped tick, not the clock.
@@ -8680,7 +8692,7 @@ impl World {
                 shadow,
                 None,
             ),
-            // §2.9's debris-decay removal: burn-up / impact at the
+            // §3.5's debris-decay removal: burn-up / impact at the
             // periapsis tick. Idempotent — an already-removed vessel
             // makes the stale event a no-op, never an error.
             EventKind::DebrisDecay { vessel } => {
@@ -8707,7 +8719,7 @@ impl World {
                 direction,
             } => {
                 self.apply_soi_transition(*vessel, body, *direction, event.tick, shadow)?;
-                // §2.9: a debris Exit past the outermost SOI deletes
+                // §3.5: a debris Exit past the outermost SOI deletes
                 // the vessel in place — there is no conic left to
                 // rescan, and `schedule_next_soi` would Fatal on the
                 // unknown id (mirrors `apply_to_rails_at`'s
@@ -8802,7 +8814,7 @@ impl World {
     /// [`PatchedConics::rebase`] (one seam, shared with the
     /// `transfer` module's hypothetical-conic queries) — this method
     /// owns only the vessel-side prologue (stale-event refusals) and
-    /// the §2.9 debris-escape special case, then writes the rebased
+    /// the §3.5 debris-escape special case, then writes the rebased
     /// conic onto the vessel.
     ///
     /// A failed re-derivation (`Recoverable`) propagates: the boundary
@@ -8831,7 +8843,7 @@ impl World {
         else {
             return Err(SimError::Recoverable("soi event: vessel not on rails"));
         };
-        // §2.9 + the C5a publisher/applier fix: a crossing of the
+        // §3.5 + the C5a publisher/applier fix: a crossing of the
         // ROOT's own boundary (a finite `soi_m` on a parentless body
         // is legal in a hand-built `PatchedConics`; the shipped home
         // system's root is `soi_m: None`, so nothing reaches this arm
@@ -8840,7 +8852,7 @@ impl World {
         // child of the current parent. The publisher and applier now
         // agree on the resolution rather than playing
         // Recoverable→rescan ping-pong:
-        //   - debris + Exit → deleted outright (the §2.9 escape rule).
+        //   - debris + Exit → deleted outright (the §3.5 escape rule).
         //   - anything else → a deliberate NO-OP. No outer frame
         //     exists to hold a different answer, so the vessel simply
         //     continues on the root conic — that is not an error, it
@@ -13189,7 +13201,7 @@ mod tests {
         assert_eq!(v.orbit().unwrap().parent, BodyId::from("sol"));
     }
 
-    /// C4a-F1 regression (§2.9): a debris vessel on an escape
+    /// C4a-F1 regression (§3.5): a debris vessel on an escape
     /// hyperbola that exits a finite-*root* SOI is deleted outright by
     /// `apply_soi_transition` — the firing arm must then NOT publish a
     /// rescan for the removed id. Pre-fix the unconditional
@@ -13236,7 +13248,7 @@ mod tests {
             )),
             "the escape hyperbola must publish an Exit at the root SOI"
         );
-        // §2.9's marker — breakup debris, deletable on the outermost
+        // §3.5's marker — breakup debris, deletable on the outermost
         // exit.
         w.vessels.get_mut(&id).unwrap().debris_since = Some(0);
         // Drive past the crossing: the event deletes the vessel and
@@ -17398,7 +17410,7 @@ mod tests {
     /// §2.4 end-to-end: the weak joint overloads on impact, the
     /// payload subtree detaches as a debris-flagged fragment vessel,
     /// the retained body is re-welded smaller — and the debris is
-    /// removed when it reaches the surface (§2.9's "suborbital debris
+    /// removed when it reaches the surface (§3.5's "suborbital debris
     /// is removed on impact").
     #[test]
     fn structural_overload_breaks_off_debris_fragment() {
@@ -20655,7 +20667,7 @@ mod tests {
         let mut c = fueled_engine_craft(100.0, 5.0, 1_000.0, 300.0);
         c.parts[0].engine.as_mut().unwrap().propellants = vec![(ResourceId::from("oxidizer"), 1.0)];
         let mut body = csp_phys::weld(&c.graph, &c.parts).unwrap();
-        let contents = transfers::spawn_contents(&c);
+        let contents = transfers::spawn_contents(&mut c);
         let plans = propellant_plans(&c, &body, &contents, &records, 1.0);
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].scale, 0.0, "un-holdable propellant starves");
@@ -20663,8 +20675,8 @@ mod tests {
         assert!(body.force_sites.iter().all(|s| s.rated_n == 0.0));
         // Holdable but empty: debit the tank dry, re-plan — the same
         // zero, now from availability rather than the spec.
-        let c2 = fueled_engine_craft(100.0, 5.0, 1_000.0, 300.0);
-        let mut contents2 = transfers::spawn_contents(&c2);
+        let mut c2 = fueled_engine_craft(100.0, 5.0, 1_000.0, 300.0);
+        let mut contents2 = transfers::spawn_contents(&mut c2);
         for stores in contents2.values_mut() {
             for u in stores.values_mut() {
                 *u = 0.0;
@@ -20683,8 +20695,8 @@ mod tests {
         // Half a tick's draw aboard → coverage 0.5, so the scale is
         // observable.
         let u = 1_000.0 * csp_phys::PHYSICS_DT / (300.0 * csp_data::G0 * 5.0);
-        let c = fueled_engine_craft(0.5 * u, 5.0, 1_000.0, 300.0);
-        let contents = transfers::spawn_contents(&c);
+        let mut c = fueled_engine_craft(0.5 * u, 5.0, 1_000.0, 300.0);
+        let contents = transfers::spawn_contents(&mut c);
         let records: BTreeMap<csp_phys::PartNodeId, reliability::PartReliability> = BTreeMap::new();
         let mut body = csp_phys::weld(&c.graph, &c.parts).unwrap();
         let plans = propellant_plans(&c, &body, &contents, &records, 1.0);
