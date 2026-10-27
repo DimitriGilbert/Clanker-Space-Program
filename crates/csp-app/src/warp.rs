@@ -19,17 +19,24 @@ use csp_core::TICK_HZ;
 /// loop evaluates `World::rails_warp_refusal` on post-step state every
 /// frame, and while it reports a refusal (a bubble-resident vessel under
 /// thrust, in unsettled contact, or in atmosphere) the controller is
-/// demoted to rung 0 — see `App::run_frame`. The check reads state the
-/// step just produced, so a refusal that appears mid-step lands at the
-/// NEXT frame's command drain: a documented one-frame lag, bounded
-/// because the refusal conditions persist until commanded away.
+/// capped at rung 1 — the predicate's conditions are the §2.6.2 RAILS
+/// row's allowed-when (×10…×10⁵); ×2 physics warp is the "bubble
+/// occupied" regime they describe, so the floor stops there instead of
+/// pinning ×1 (a fired §2.6.5 `Clamping` event still drops to rung 0)
+/// — see `App::on_step_report`. The check reads state the step just
+/// produced, so a refusal that appears mid-step lands at the NEXT
+/// frame's command drain: a documented one-frame lag, bounded because
+/// the refusal conditions persist until commanded away.
 ///
 /// The persistence is also what closes the gate against `decide`'s
 /// promotion side: the frame loop re-invokes [`WarpController::demote`]
-/// EVERY frame the refusal holds — including at rung 0 where the demote
-/// is a no-op emit — and that heartbeat re-clears the §2.6.3 promotion
-/// streak, so `decide` (which runs pre-step) can never rebuild the
-/// 30-frame window and re-promote under a held refusal.
+/// EVERY frame the refusal holds — including at-or-below the floor
+/// where the demote is a no-op emit — and that heartbeat re-clears any
+/// §2.6.3 promotion streak aimed ABOVE the floor, so `decide` (which
+/// runs pre-step) can never rebuild the 30-frame window into a gated
+/// rung. A streak at-or-below the floor survives on purpose — rung 1
+/// is a rung the refusal itself allows, so ×2 can still engage while
+/// the predicate holds.
 pub const WARP_LADDER: [u64; 7] = [1, 2, 10, 100, 1_000, 10_000, 100_000];
 
 /// §2.6.3: `budget_fraction` — the share of the frame budget sim stepping
@@ -291,13 +298,20 @@ impl WarpController {
     /// §2.6.5 `Clamping` / §2.6.2 rails-refusal demotion: drop `effective`
     /// to ladder index `rung` NOW — the §2.6.3 hysteresis deliberately does
     /// not apply downward (a fired Clamping event means the player could
-    /// already be overshooting). Any in-flight promotion streak is
-    /// cleared — unconditionally, even when `rung` is at-or-above
-    /// `effective` and there is nothing to emit. The frame loop
-    /// re-invokes `demote` every frame a refusal holds, so that no-op
-    /// call is the §2.6.2 heartbeat: while the gate holds, `decide`
-    /// (which runs pre-step) can never accumulate the 30-frame promotion
-    /// window — a persistent refusal cannot be promoted through.
+    /// already be overshooting). An in-flight promotion streak aimed
+    /// ABOVE `rung` is cleared — unconditionally, even when `rung` is
+    /// at-or-above `effective` and there is nothing to emit. The frame
+    /// loop re-invokes `demote` every frame a gate holds, so that no-op
+    /// call is the heartbeat: while the gate holds, `decide` (which
+    /// runs pre-step) can never accumulate the 30-frame promotion
+    /// window into a rung the gate forbids — a persistent refusal
+    /// cannot be promoted through. A streak at-or-below `rung`
+    /// survives on purpose: the demote declares `rung` reachable, and
+    /// for the rails refusal that floor is rung 1 — ×2 physics warp,
+    /// the "bubble occupied" regime the predicate describes. Clearing
+    /// the streak that reaches it would hold `effective` below the
+    /// floor the gate itself set, keeping the one allowed promotion
+    /// unreachable for the refusal's whole life.
     /// `requested` is untouched: a one-shot event should not rewrite
     /// player intent (re-promotion still waits the hysteresis once the
     /// refusal clears), and a persistent refusal re-demotes every frame
@@ -311,10 +325,14 @@ impl WarpController {
     pub fn demote(&mut self, rung: usize) -> Option<u32> {
         let rung = rung.min(WARP_LADDER.len() - 1);
         // Cleared before the early return on purpose — see the doc: the
-        // refusal heartbeat calls `demote` every frame it holds, and an
-        // in-flight streak must not survive it.
-        self.promote_streak = 0;
-        self.promote_candidate = None;
+        // gate heartbeat calls `demote` every frame it holds, and a
+        // streak aimed above the floor must not survive it. A streak
+        // bound for `rung` itself (or lower) is a promotion the gate
+        // allows — killing it would pin `effective` under the floor.
+        if self.promote_candidate.is_some_and(|c| c > rung) {
+            self.promote_streak = 0;
+            self.promote_candidate = None;
+        }
         if rung >= self.effective {
             return None;
         }
@@ -788,5 +806,43 @@ mod tests {
         // …and the next frame's target is the live clock plus this
         // frame's ×1 slice, not the banked ×10⁵ remainder.
         assert_eq!(c.target_tick(clock, dt), clock + 1);
+    }
+
+    /// The demote heartbeat's floor semantics: a gate at `rung` kills
+    /// a promotion streak aimed ABOVE it every frame (a held refusal
+    /// cannot be promoted through) but leaves a streak at-or-below the
+    /// floor alive — rung 1 under a rails refusal is §2.6.2's legal
+    /// "bubble occupied" ×2, so its promotion must still complete.
+    /// Killing it would pin `effective` under the floor the gate set.
+    #[test]
+    fn demote_clears_only_streaks_above_the_floor() {
+        let mut c = WarpController::new();
+        c.request_step(1); // aim at ×2
+        c.decide(); // the rung-1 streak begins
+        for _ in 1..PROMOTE_FRAMES {
+            // The heartbeat at floor 1 must not kill the ×2 promotion.
+            assert_eq!(c.demote(1), None);
+            c.decide();
+        }
+        assert_eq!(c.multiplier(), 2, "the rung-1 streak survives demote(1)");
+        // A streak aimed ABOVE the floor dies under the same heartbeat:
+        // ×10⁵ engaged, the refusal's floor drops the controller to
+        // ×2, and no re-promotion into the gated rungs can complete.
+        let mut c = WarpController::new();
+        c.request_step(6);
+        for _ in 0..=PROMOTE_FRAMES {
+            c.decide();
+        }
+        assert_eq!(c.multiplier(), 100_000);
+        assert_eq!(c.demote(1), Some(2));
+        for _ in 0..2 * PROMOTE_FRAMES {
+            c.decide();
+            c.demote(1);
+        }
+        assert_eq!(
+            c.multiplier(),
+            2,
+            "streaks into the gated rungs never complete"
+        );
     }
 }

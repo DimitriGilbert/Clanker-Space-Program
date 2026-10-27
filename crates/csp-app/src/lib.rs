@@ -1296,16 +1296,33 @@ impl App {
         // The refusal reason is also a persistent HUD notice —
         // `rails_warp_refusal` names the offender (a polling script,
         // a burning vessel) and stderr was its only outlet before.
-        // Latch on the text so a held refusal doesn't cue-spam.
+        // Latch on the text so a held refusal doesn't cue-spam. The
+        // wording says "unavailable", not a level: the gate caps the
+        // ladder at ×2 now, not ×1 (see the floor below).
         if refusal != self.last_refusal
             && let Some(reason) = &refusal
         {
-            self.view
-                .flight_notice(format!("RAILS WARP ×1 — {}", reason.to_uppercase()));
+            self.view.flight_notice(format!(
+                "RAILS WARP UNAVAILABLE — {}",
+                reason.to_uppercase()
+            ));
         }
         self.last_refusal = refusal.clone();
+        // §2.6.2's regime table splits the floor: a fired Clamping
+        // event drops to ×1 NOW (§2.6.5's overshoot guard — the
+        // player could already be past the event it guards), but a
+        // held rails refusal alone caps at rung 1. The predicate's
+        // conditions are the RAILS row's allowed-when; ×2 physics
+        // warp is the "bubble occupied" regime they describe, so
+        // pinning an engaged ×2 to ×1 on a transient atmospheric dip
+        // would gate a rung the table allows — the ×2 row's own
+        // derate is §2.6.3's budget mechanism, independent of this
+        // gate. The per-frame heartbeat still runs either way: at
+        // rung 1 `demote` is a no-op emit that keeps killing
+        // promotion streaks aimed at the gated rails rungs.
+        let floor = if clamping { 0 } else { 1 };
         if (clamping || refusal.is_some())
-            && let Some(level) = self.warp.demote(0)
+            && let Some(level) = self.warp.demote(floor)
         {
             // §2.6.2: the refusal names the offending vessel.
             if let Some(reason) = &refusal {
@@ -1317,18 +1334,20 @@ impl App {
         // W1.5-(f): `partial` = step_frame split at a budget — the
         // advance never reached the frame's target, so time silently
         // falls behind warp. Demote toward the largest rung one call
-        // can reach (TICK_HZ×mult/60 ≤ MAX_TICKS_PER_FRAME ⇒ rung 4,
-        // ×10⁴) and say so — §2.6.4's "carry the back-pressure" rule
-        // made visible.
-        if report.partial {
-            if let Some(level) = self.warp.demote(4) {
-                log::warn!("partial advance — warp demoted to ×{level}");
-                self.view.enqueue_command(
-                    SourceClass::Ui,
-                    WARP_SOURCE_ID,
-                    SimCommand::SetWarp(level),
-                );
-            }
+        // can reach (TICK_HZ×mult/60 ≤ MAX_TICKS_PER_FRAME ⇒ rung 5,
+        // ×10⁴: 64×10⁴/60 = 10 666.7 ≤ 69 120 ticks/frame, while ×10⁵
+        // needs 106 666.7) and say so — §2.6.4's "carry the
+        // back-pressure" rule made visible. The notice rides the
+        // demote edge like `last_refusal`'s latch: a sustained
+        // backlog re-reports `partial` every frame, and an unlatched
+        // chip per frame stacks ~90 identical notices on the cue
+        // channel.
+        if report.partial
+            && let Some(level) = self.warp.demote(5)
+        {
+            log::warn!("partial advance — warp demoted to ×{level}");
+            self.view
+                .enqueue_command(SourceClass::Ui, WARP_SOURCE_ID, SimCommand::SetWarp(level));
             self.view.flight_notice("WARP LIMITED — EVENT/TICK BACKLOG");
         }
         // W1.5-(g): fired event kinds the player asked for or pays
@@ -1384,11 +1403,15 @@ impl App {
     ///   * a §2.13 read-only session → "WARP NOT APPLIED";
     ///   * a request already at the settings/ladder ceiling →
     ///     "WARP ALREADY AT ×N" naming the cap that ate the press;
-    ///   * an active §2.6.2 rails refusal → "WARP REFUSED — <reason>"
-    ///     and NOTHING is recorded: the post-step `rails_warp_refusal`
-    ///     demote would hold the request at ×1 for its whole lifetime
-    ///     anyway, so the refusal owns the press outright — no
-    ///     surprise engagement minutes later when the state clears;
+    ///   * an active §2.6.2 rails refusal, for a press landing above
+    ///     rung 1 → "WARP REFUSED — <reason>" and NOTHING is recorded:
+    ///     the post-step refusal heartbeat holds the ladder at rung 1
+    ///     for the refusal's whole lifetime anyway, so the refusal
+    ///     owns a rails-rung press outright — no surprise engagement
+    ///     minutes later when the state clears. A press landing
+    ///     at-or-below rung 1 queues normally: ×2 physics warp is the
+    ///     "bubble occupied" regime the refusal describes, not one of
+    ///     the states it gates;
     ///   * a rung above the §2.6.3 margined budget → the request still
     ///     queues (the derate is the designed hold — it engages if the
     ///     scene lightens) plus a "WARP LIMITED" reason.
@@ -1422,12 +1445,19 @@ impl App {
             ));
             return;
         }
-        // §2.6.2's gate at the press, not a frame later: the sim's
-        // own reason lands on the cue channel EVERY press — the
-        // `last_refusal` latch on the post-step side only covers the
-        // refusal's appearance, so a held refusal (the whole
-        // in-atmosphere climb) used to eat every later press silently.
-        if let Some(reason) = self.view.sim.rails_warp_refusal() {
+        // §2.6.2's gate at the press, not a frame later — but only the
+        // RAILS rungs: the predicate's conditions are the rails row's
+        // allowed-when, and rung 1 (×2 physics warp) is the "bubble
+        // occupied" regime they describe, so a press landing at-or-
+        // below it stays legal even while the refusal holds. For the
+        // gated rungs the sim's own reason lands on the cue channel
+        // EVERY press — the `last_refusal` latch on the post-step side
+        // only covers the refusal's appearance, so a held refusal (the
+        // whole in-atmosphere climb) used to eat every later press
+        // silently.
+        if let Some(reason) = self.view.sim.rails_warp_refusal()
+            && self.warp.request_preview(step) > 1
+        {
             self.view
                 .flight_notice(format!("WARP REFUSED — {}", reason.to_uppercase()));
             return;
@@ -4195,6 +4225,163 @@ mod tests {
         assert_eq!(app.warp.requested_multiplier(), 100_000);
         app.dispatch(KeyAction::WarpUp);
         assert!(cues(&app).iter().any(|c| c.contains("WARP ALREADY AT")));
+    }
+
+    /// §2.6.2's regime table: the rails predicate gates the ×10…×10⁵
+    /// rungs — rung 1 (×2 physics warp) IS the "bubble occupied" regime
+    /// the refusal describes. A ×1→×2 press under a held refusal must
+    /// queue and ENGAGE through the §2.6.3 hysteresis: the refusal
+    /// heartbeat caps the ladder at rung 1, killing only promotion
+    /// streaks aimed above it — it must not pin the controller to ×1
+    /// the way the pre-fix `demote(0)` did, which made atmospheric
+    /// ascent a ×1-only regime. Presses into the rails rungs stay
+    /// refused.
+    #[test]
+    fn physics_warp_engages_under_a_held_rails_refusal() {
+        let dir = tempdir("warp-physics-refusal");
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        let cues = |app: &App| -> Vec<String> {
+            app.view
+                .world
+                .resource::<csp_view::flight::FlightSfx>()
+                .cues
+                .iter()
+                .map(|c| c.text.clone())
+                .collect()
+        };
+        // The run_frame sim-relevant slice: step + on_step_report, so
+        // the refusal heartbeat runs every frame the way production
+        // runs it (decide → step → report → demote-floor).
+        let frame = |app: &mut App, ticks: u64| {
+            let target = app.view.sim.clock().ticks() + ticks;
+            app.view.begin_frame();
+            let report = app.view.sim_step(target).unwrap();
+            app.on_step_report(&report);
+            app.view.end_frame();
+        };
+        frame(&mut app, 320); // settle the seeded pad craft to its latch
+        // Throttle up: the craft unlatches into the bubble, in
+        // atmosphere, under thrust — the §2.6.2 rails refusal holds.
+        let vessel = app.view.flight_focus().unwrap();
+        app.view.enqueue_command(
+            SourceClass::Ui,
+            0,
+            SimCommand::SetThrottle {
+                vessel,
+                throttle: 1.0,
+            },
+        );
+        frame(&mut app, 8);
+        assert!(
+            app.view.sim.rails_warp_refusal().is_some(),
+            "a throttled in-atmosphere craft must refuse rails warp"
+        );
+        // The press the pre-fix gate ate: ×1→×2 under the refusal is a
+        // legal request — it queues and posts no WARP REFUSED cue.
+        app.dispatch(KeyAction::WarpUp);
+        assert_eq!(
+            cues(&app)
+                .iter()
+                .filter(|c| c.contains("WARP REFUSED"))
+                .count(),
+            0,
+            "the ×2 rung is not the refusal's to gate: {:?}",
+            cues(&app)
+        );
+        app.warp.decide();
+        assert_eq!(app.warp.requested_multiplier(), 2);
+        // …and it engages while the refusal still holds: each frame's
+        // heartbeat demote(1) leaves the rung-1 promotion streak
+        // alive, so §2.6.3's 30-frame window completes.
+        for _ in 0..40 {
+            app.warp.decide();
+            frame(&mut app, 1);
+        }
+        assert_eq!(
+            app.warp.multiplier(),
+            2,
+            "×2 physics warp must engage under a held rails refusal"
+        );
+        assert!(
+            app.view.sim.rails_warp_refusal().is_some(),
+            "setup must still hold the refusal — the ×2 engaged under it"
+        );
+        // The rails rungs are still refused — every press says why.
+        app.dispatch(KeyAction::WarpUp);
+        assert!(
+            cues(&app).iter().any(|c| c.contains("WARP REFUSED")),
+            "a press into the rails rungs must refuse: {:?}",
+            cues(&app)
+        );
+    }
+
+    /// W1.5-(f)/§2.6.5 back-pressure at the honest rung: `partial`
+    /// means the advance hit MAX_TICKS_PER_FRAME, so the demote target
+    /// is the largest rung one call can reach — rung 5 (×10⁴:
+    /// 64×10⁴/60 = 10 666.7 ≤ 69 120 ticks/frame, where ×10⁵ needs
+    /// 106 666.7). The pre-fix `demote(4)` dropped a ×10⁵ player to
+    /// ×10³, and its notice re-posted every frame the backlog held —
+    /// ~90 identical chips. Now the notice rides the demote edge.
+    #[test]
+    fn partial_backlog_demotes_to_the_reachable_rung_once() {
+        let dir = tempdir("warp-partial");
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        let cues = |app: &App| -> Vec<String> {
+            app.view
+                .world
+                .resource::<csp_view::flight::FlightSfx>()
+                .cues
+                .iter()
+                .map(|c| c.text.clone())
+                .collect()
+        };
+        // Engage ×10⁵ — no measured cost, so every rung is affordable
+        // and the request promotes once the §2.6.3 window completes.
+        app.warp.request_step(6);
+        for _ in 0..40 {
+            app.warp.decide();
+        }
+        assert_eq!(app.warp.multiplier(), 100_000);
+        let partial_report = |app: &App| csp_view::AdvanceReport {
+            reached_tick: app.view.sim.clock().ticks(),
+            commands_applied: 0,
+            events_processed: 0,
+            fired_events: Vec::new(),
+            rejected: Vec::new(),
+            degraded: Vec::new(),
+            partial: true,
+            effective_target: app.view.sim.clock().ticks() + 1,
+            script_log: Vec::new(),
+        };
+        app.on_step_report(&partial_report(&app));
+        assert_eq!(
+            app.warp.multiplier(),
+            10_000,
+            "partial must land at ×10⁴ — the largest rung a call can reach"
+        );
+        assert_eq!(
+            cues(&app)
+                .iter()
+                .filter(|c| c.contains("EVENT/TICK BACKLOG"))
+                .count(),
+            1,
+            "the demote edge posts the backlog notice once"
+        );
+        // A sustained backlog re-reports `partial` every frame — the
+        // demote edge already fired, so no second chip stacks.
+        for _ in 0..90 {
+            app.on_step_report(&partial_report(&app));
+        }
+        assert_eq!(app.warp.multiplier(), 10_000);
+        assert_eq!(
+            cues(&app)
+                .iter()
+                .filter(|c| c.contains("EVENT/TICK BACKLOG"))
+                .count(),
+            1,
+            "a held backlog must not flood the cue channel: {:?}",
+            cues(&app)
+        );
     }
 
     /// P02-F2's axis half: a ramp start on a focus with no bubble
