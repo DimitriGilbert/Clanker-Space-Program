@@ -61,12 +61,18 @@
 //!   [`POLL_OPS_NUM`]/[`POLL_OPS_DEN`] or more of the budget and
 //!   returned. [`POLL_DEMOTE_TICKS`] consecutive heavy ticks set
 //!   `poll_demoted`, which [`World::rails_warp_refusal`](crate::World::rails_warp_refusal)
-//!   reports by name — a visible warp demotion to ×1. A clean tick
+//!   reports by name — a visible warp refusal that caps the ladder at
+//!   the ×2 physics-warp floor (rung 1, the "bubble occupied" regime
+//!   the refusal describes) while the refusal holds, per the app's
+//!   rails-refusal floor rules. A clean tick
 //!   resets the counter and clears the flag. (The plan's literal
 //!   "budget-exhausting for 10 consecutive ticks" cannot mean aborted
 //!   calls only — `strikes >= 5` would disable the script first — so
 //!   near-exhaust completions count too: a script that spins right up
-//!   to the limit every tick without tripping it is still a poller.)
+//!   to the limit every tick without tripping it is still a poller.
+//!   PLAN §2.10 says the poll demotes warp "to ×1"; post-C24-F2 the
+//!   refusal floors at ×2 like every other `rails_warp_refusal`
+//!   producer — that divergence is tracked as a spec question.)
 //! - A script with no pending wake and no throttle blocks nothing.
 //!
 //! # What is sim state (hashed + serialized, §7.2)
