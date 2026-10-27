@@ -54,6 +54,8 @@ const UNIT_EVENTS: &str = "events/frame";
 const UNIT_BYTES_S: &str = "B/s";
 /// `fps` — the hardware-gated rows.
 const UNIT_FPS: &str = "fps";
+/// `px` — artefact pixel counts (the §5.4 depth row).
+const UNIT_PX: &str = "px";
 
 /// One §5.3 table row, flattened to the checkable fields. `measurable`
 /// splits the headless-measurable CPU rows from the REF-hardware fps
@@ -171,6 +173,18 @@ pub const BUDGET_ROWS: &[BudgetRow] = &[
                kill criterion is CPU work and headless-measurable; the \
                hard release assert lives in csp-view/tests/vab_latency.rs \
                (C17-F5)",
+    },
+    BudgetRow {
+        id: "render.depth-fight-1e7",
+        scene: "§5.4 R1 depth strategy — 1 m object crossing a surface at 10⁷ m",
+        budget: 1.0,
+        unit: UNIT_PX,
+        measurable: true,
+        note: "order-dependent pixels at 1080p across two draw orders of \
+               the §5.4 scene on the shipped flight pipeline (reverse-Z \
+               f32 clip, Depth32Float, GreaterEqual, 4×MSAA); measured by \
+               csp_view::depth_probe on a headless adapter (lavapipe on \
+               CI — C16-F5). Over the bound, §2.3's far-field pass is owed",
     },
     // --- hardware-gated fps rows (§8.2: reference-machine gates) ---
     BudgetRow {
@@ -532,6 +546,7 @@ fn measure_row(id: &str) -> Result<Measurement, ReplayError> {
         "weld.stage2-300-part" => measure_voxelize_300(),
         "telemetry.1000-part" => measure_telemetry_1000(),
         "vab.interaction-300-part" => measure_vab_300(),
+        "render.depth-fight-1e7" => measure_depth_fight_1e7(),
         _ => Err(ReplayError::MalformedGolden(
             "perf: measurable row without a benchmark arm",
         )),
@@ -1164,6 +1179,79 @@ fn measure_vab_300() -> Result<Measurement, ReplayError> {
     })
 }
 
+/// A surfaceless adapter + device for the §5.4 depth row — `None` when
+/// no driver exists (the probe's honest harness error). LowPower
+/// prefers the CPU adapter (lavapipe): measurements should run on the
+/// weakest conformant implementation — the same policy the render gate
+/// applies (`csp-view/tests/render_gate.rs`).
+fn headless_gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::PRIMARY,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::LowPower,
+        compatible_surface: None,
+        ..Default::default()
+    }))
+    .ok()?;
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("perf-depth-row"),
+        required_features: wgpu::Features::empty(),
+        required_limits: wgpu::Limits::default(),
+        ..Default::default()
+    }))
+    .ok()?;
+    Some((device, queue))
+}
+
+/// §5.4 R1's row — the 10⁷ m / 1 m-object depth-fight count the PRD
+/// requires "recorded in the perf log" (C16-F5). The scene and the
+/// shipped flight pipeline it renders through live in
+/// `csp_view::depth_probe`; this arm owns the harness controls so a
+/// bogus count can never read as a measurement:
+///
+/// - a run at 1 km with the same construction must report ZERO
+///   order-dependent pixels — f32 depth resolves trivially there, so
+///   a nonzero control means the probe is broken, not the format;
+/// - a fully coplanar run (0 m spread) must report a large count —
+///   every covered pixel IS order-dependent by construction, so a
+///   small count means the differ is blind.
+fn measure_depth_fight_1e7() -> Result<Measurement, ReplayError> {
+    let Some((device, queue)) = headless_gpu() else {
+        return Err(ReplayError::MalformedGolden(
+            "perf: no headless GPU adapter — the §5.4 depth row needs a \
+             Vulkan ICD (mesa-vulkan-drivers ships lavapipe)",
+        ));
+    };
+    let probe = |depth_m: f64, spread_m: f64| {
+        csp_view::depth_probe::depth_fight_pixels(&device, &queue, depth_m, spread_m)
+            .map_err(|_| ReplayError::MalformedGolden("perf: depth probe readback failed"))
+    };
+    let near = probe(1.0e3, 1.0)?;
+    if near.order_dependent_px != 0 {
+        return Err(ReplayError::MalformedGolden(
+            "perf: depth probe shows order-dependent pixels at 1 km — \
+             the harness is broken, not the depth format",
+        ));
+    }
+    let coplanar = probe(1.0e3, 0.0)?;
+    if coplanar.order_dependent_px < 100_000 {
+        return Err(ReplayError::MalformedGolden(
+            "perf: depth probe undercounts a fully coplanar pair — \
+             the differ is blind",
+        ));
+    }
+    let m = probe(1.0e7, 1.0)?;
+    Ok(Measurement {
+        value: f64::from(m.order_dependent_px),
+        detail: format!(
+            "{}×{} two-order diff, controls 1 km/1 m → {} px and 1 km/coplanar → {} px",
+            m.width, m.height, near.order_dependent_px, coplanar.order_dependent_px
+        ),
+    })
+}
+
 #[cfg(test)]
 // Tests signal failure by panicking; §2.13's no-panic rule covers the
 // shipping fallible paths. Debug runs assert the measurements resolve
@@ -1227,10 +1315,12 @@ mod tests {
         assert_eq!(ids.len(), sorted.len(), "duplicate budget row ids");
         // The §5.3 table: 9 measurable CPU rows + 9 gated (8 fps + wasm
         // voxelize); the C17-F5 `vab.interaction-300-part` row is the
-        // §5.4 kill criterion riding this log, so measurable is 10.
+        // §5.4 kill criterion riding this log, and the C16-F5
+        // `render.depth-fight-1e7` row is §5.4's R1 depth measurement —
+        // so measurable is 11.
         assert_eq!(
             BUDGET_ROWS.iter().filter(|r| r.measurable).count(),
-            10,
+            11,
             "the §5.3 CPU rows drifted from the table"
         );
         assert_eq!(
@@ -1315,6 +1405,32 @@ mod tests {
     fn telemetry_1000_within_budget() {
         let m = measure_telemetry_1000().unwrap();
         check_value(&BUDGET_ROWS[8], m.value, &m.detail);
+    }
+
+    /// §5.4 R1's row — the only GPU-backed measurement in the suite,
+    /// so it follows the render gate's skip policy: no adapter is a
+    /// `SKIP` line locally and a FAILURE under
+    /// `CSP_RENDER_GATE_REQUIRED` (CI installs lavapipe so the row can
+    /// never quietly degenerate into a green no-op — the same defect
+    /// class the render gate's required mode exists for).
+    #[test]
+    fn render_depth_fight_row_measures() {
+        if headless_gpu().is_none() {
+            assert!(
+                !(std::env::var("CSP_RENDER_GATE_REQUIRED")
+                    .is_ok_and(|v| !v.is_empty() && v != "0")),
+                "render.depth-fight-1e7: CSP_RENDER_GATE_REQUIRED is set but \
+                 no headless GPU adapter exists — install a Vulkan ICD"
+            );
+            eprintln!("perf: SKIP render.depth-fight-1e7 — no headless GPU adapter");
+            return;
+        }
+        let m = measure_depth_fight_1e7().unwrap();
+        let row = BUDGET_ROWS
+            .iter()
+            .find(|r| r.id == "render.depth-fight-1e7")
+            .unwrap();
+        check_value(row, m.value, &m.detail);
     }
 
     /// The committed-log regression gate's rule set, pinned on

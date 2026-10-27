@@ -29,6 +29,14 @@ libm = { workspace = true }
 # Native-only crate; these edges never reach a wasm tree.
 csp-ui = { workspace = true }
 csp-view = { workspace = true }
+# §5.4 R1's depth-fight row renders through a headless device the probe
+# itself is handed (csp_view::depth_probe owns the scene + the shipped
+# pipeline — csp-bench may NOT take a direct csp-render edge: the §2.1
+# both-sim-and-render rule reserves that bridge for csp-view, and this
+# crate already deps csp-sim). wgpu for the surfaceless adapter/device,
+# pollster to drive the async requests (C16-F5).
+wgpu = { workspace = true }
+pollster = { workspace = true }
 # §3.1 fixture hashing (the replay artifact's data_fixture_hash).
 blake3 = { workspace = true }
 # §7.6: replay logs stay bincode, version-scoped by T3. `serde` feature for

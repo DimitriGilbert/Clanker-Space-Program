@@ -281,7 +281,7 @@ fn render_flight_scene_sized(
     debug_assert_eq!(row_bytes % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize, 0);
     let buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("render-gate-readback"),
-        size: (row_bytes * H as usize) as u64,
+        size: (row_bytes * h as usize) as u64,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
@@ -301,8 +301,8 @@ fn render_flight_scene_sized(
             },
         },
         wgpu::Extent3d {
-            width: W,
-            height: H,
+            width: w,
+            height: h,
             depth_or_array_layers: 1,
         },
     );
@@ -504,6 +504,148 @@ fn empty_flight_scene_is_what_the_gate_rejects() {
          color again ({}/{})",
         stats.non_clear,
         total
+    );
+}
+
+/// A zenith-looking sky-only packet on an atmosphere-armed Terrin —
+/// the camera sits at `alt_m` over the +x datum looking straight up
+/// (every ray crosses the shell, so `fs_sky` runs the gated
+/// shell-march path, never the vacuum early-return). `sun_dir` is a
+/// unit direction in the body frame; keep it outside the ~45°
+/// half-fov around zenith or its disc legitimately whites pixels.
+fn zenith_sky_packet(
+    alt_m: f64,
+    sun_dir: [f32; 4],
+    art: &std::sync::Arc<csp_render::terrain::TerrainArt>,
+) -> csp_render::terrain::TerrainPacket {
+    const R: f64 = 600_000.0;
+    const TOP: f64 = 70_000.0;
+    const H_SCALE: f64 = 5_600.0;
+    const AMP: f64 = 2_400.0;
+    let eye = R + alt_m;
+    let aspect = f64::from(W) / f64::from(H);
+    let t = (35.0f64.to_radians()).tan();
+    csp_render::terrain::TerrainPacket {
+        sky: true,
+        art: Some(art.clone()),
+        uniforms: csp_render::terrain::TerrainUniforms {
+            // Columns (right, up, −fwd): the centre ray `rd = view_rot
+            // · (0,0,−1)` lands on +x — straight up from the eye.
+            view_rot: [
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [-1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            eye_rel_body: [eye as f32, 0.0, 0.0, 0.0],
+            sun_dir,
+            planet: [R as f32, TOP as f32, R as f32, AMP as f32],
+            atmo: [H_SCALE as f32, 0.0, alt_m as f32, 0.0],
+            misc: [
+                (t * aspect) as f32,
+                t as f32,
+                (eye * eye - (R + TOP) * (R + TOP)) as f32,
+                (eye * eye - R * R) as f32,
+            ],
+            spin: [0.0, 0.0, 1.0, 0.0],
+            rayleigh: [5.8e-6, 13.5e-6, 33.1e-6, 0.0],
+            art: [1.0, 0.0, 0.0, 0.0],
+            class_means: test_means(art),
+            ..Default::default()
+        },
+        atmo: Some(csp_render::terrain::AtmoDesc {
+            radius_m: R,
+            top_m: TOP,
+            scale_height_m: H_SCALE,
+        }),
+        ..Default::default()
+    }
+}
+
+/// Star/sky regression gate (C16-F1). The old assertion set passed
+/// even with the daylight gate broken (`star_vis = 1` injected): the
+/// coarse image stats only grew, so a blue day sky peppered with
+/// white stars read as a *better* frame. This test renders the gated
+/// path directly — a zenith view on a sun-lit atmosphere — and
+/// asserts the distinguishing signal: **zero near-white pixels**,
+/// because a day sky is a smooth blue gradient and every star that
+/// survives the gate is a regression.
+///
+/// Two renders pin both halves of the contract so the bound is not
+/// vacuous: with the sun ~25° above the horizon behind the view axis
+/// the sky is day-lit and `star_vis` must be 0; with the sun ~53°
+/// below it the same frame is deep night and stars MUST appear — a
+/// starless night sky would mean the starfield itself broke, which
+/// the day assertion alone cannot see.
+#[test]
+fn day_sky_shows_no_stars_night_sky_shows_them() {
+    let Some((device, queue)) = gate_device("day_sky_shows_no_stars_night_sky_shows_them") else {
+        return;
+    };
+    let art = csp_view::art::load()
+        .0
+        .terrain
+        .clone()
+        .expect("terrain art pack loaded");
+    let count_near_white = |img: &[u8]| -> usize {
+        img.chunks_exact(4)
+            .filter(|p| p[0] >= 210 && p[1] >= 210 && p[2] >= 210)
+            .count()
+    };
+
+    // Day: sun ~25° up, ~65° off the view axis — lit shell, no disc
+    // in frame.
+    let day = zenith_sky_packet(5_000.0, [0.42, 0.0, 0.9075, 0.0], &art);
+    let img = render_flight_scene(
+        &device,
+        &queue,
+        &csp_render::flight::FlightPacket {
+            terrain: Some(day),
+            ..Default::default()
+        },
+    );
+    let stats = analyze(&img);
+    let day_white = count_near_white(&img);
+    eprintln!(
+        "day sky:   non_clear={}/{} distinct={} near_white={}",
+        stats.non_clear,
+        (W * H) as usize,
+        stats.distinct,
+        day_white
+    );
+    // Sanity: the sky actually rendered (a broken sky draw would also
+    // satisfy the star bound — the gate must not pass on a void).
+    assert!(
+        stats.non_clear as f64 / (W * H) as f64 > 0.9,
+        "day-sky frame did not rasterize ({}/{}) — the star assertion \
+         would be vacuous",
+        stats.non_clear,
+        (W * H) as usize
+    );
+    assert_eq!(
+        day_white, 0,
+        "{day_white} near-white pixels in the day sky — the fs_sky \
+         daylight gate let stars through (the star_vis = 1 failure shape)"
+    );
+
+    // Night: same view, sun 53° below the horizon — inscatter
+    // collapses, star_vis → 1, the field must be up there.
+    let night = zenith_sky_packet(5_000.0, [-0.8, 0.0, 0.6, 0.0], &art);
+    let img = render_flight_scene(
+        &device,
+        &queue,
+        &csp_render::flight::FlightPacket {
+            terrain: Some(night),
+            ..Default::default()
+        },
+    );
+    let night_white = count_near_white(&img);
+    eprintln!("night sky: near_white={night_white}");
+    assert!(
+        night_white > 20,
+        "only {night_white} star pixels in the night zenith sky — the \
+         starfield is not rendering at all, so the day assertion above \
+         proves nothing"
     );
 }
 

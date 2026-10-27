@@ -111,6 +111,16 @@ jobs:
       - name: vab latency (release) — §5.4's 16 ms assert
         run: cargo test --release -p csp-view --test vab_latency
 
+      # The §5.4 render.depth-fight-1e7 perf row renders through a
+      # headless adapter — lavapipe is the software Vulkan ICD the
+      # render gate uses in the check job. Without it the row records
+      # a harness error and the baseline diff reads it as a regression
+      # (a measurable row that cannot measure is never a green row).
+      - name: install lavapipe (software Vulkan for the depth-fight row)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers libvulkan1
+
       # C29-F2: diff against the ci-host-measured baseline when the
       # nightly `perf-baseline` job has committed one — applying a 10%
       # band across machines was the blind application this fixes.

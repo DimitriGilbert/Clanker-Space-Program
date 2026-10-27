@@ -62,6 +62,14 @@ pub mod demo;
 /// progress predicates (the model lives in `csp_ui::tutorial`).
 pub mod tutorial;
 
+/// PLAN §5.4's depth-strategy probe (R1 — C16-F5): the headless render
+/// measurement that records the 10⁷ m / 1 m-object depth-fight count
+/// the perf log's `render.depth-fight-1e7` row carries. Native-only —
+/// it rasterizes through a caller-supplied device on the shipped
+/// flight pipeline.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod depth_probe;
+
 /// Pad-spawn clearance (m): the lowest collider vertex starts this far
 /// above the datum. Kept at zero — a nonzero drop, even centimetres,
 /// reads as a one-tick `Δv/dt` load spike and fails weak joints (the

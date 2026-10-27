@@ -36,6 +36,11 @@ log = { workspace = true }
 # PLAN §2.5: multi_threaded executor is a NATIVE-only feature (fixup 10).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 bevy_ecs = { workspace = true, features = ["std", "multi_threaded", "async_executor"] }
+# §5.4 R1's depth probe (depth_probe.rs) — the headless render
+# measurement csp-perf's `render.depth-fight-1e7` row runs through the
+# shipped flight pipeline (C16-F5). Native-only: the probe module is
+# cfg-gated the same way, so the wasm dep tree is unchanged.
+wgpu = { workspace = true }
 
 [dev-dependencies]
 # tests/render_gate.rs — the headless render verification (no surface):

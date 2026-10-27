@@ -987,6 +987,16 @@ fn star_field(rd: vec3<f32>, pr: f32) -> vec3<f32> {
     return acc;
 }
 
+// The starfield with its one shared attenuation: sun glare washes
+// stars out toward the disc. Split into a helper so `fs_sky` can call
+// it ONLY where the result survives — the daylight gate below zeroes
+// `star_vis` across the whole day side, so running both 27-cell walks
+// there (~60 lattice hashes per fragment) was pure waste (C16-F4).
+fn sky_stars(rd: vec3<f32>, sun: vec3<f32>, pr: f32) -> vec3<f32> {
+    return star_field(rd, pr)
+         * (1.0 - 0.85 * pow(max(dot(rd, sun), 0.0), 12.0));
+}
+
 @fragment
 fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
     let pa = u.eye_rel_body.xyz;
@@ -1007,21 +1017,18 @@ fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
     // only), so they must be addable separately.
     let disc = pow(max(dot(rd, sun), 0.0), 4000.0) * 24.0;
     let halo = pow(max(dot(rd, sun), 0.0), 16.0) * 0.10;
-    // The procedural starfield (always — no baked star image exists);
-    // sun glare washes stars out toward the disc. `pr` is the
-    // per-pixel ray footprint (tan(half-fov)·ndc/px) — the star
-    // profile floor.
+    // `pr` is the per-pixel ray footprint (tan(half-fov)·ndc/px) —
+    // the star profile floor. It must be computed HERE, in uniform
+    // control flow: fwidth is forbidden inside the data-dependent
+    // branches below that now gate `star_field` (C16-F4).
     let pr = u.misc.y * fwidth(i.ndc.y);
-    let stars = star_field(rd, pr)
-              * (1.0 - 0.85 * pow(max(dot(rd, sun), 0.0), 12.0));
     let space_bg = vec3<f32>(0.004, 0.006, 0.014)
                  + vec3<f32>(1.0, 0.95, 0.85) * (disc + halo);
-    // Vacuum bodies and rays that never cross the shell see the raw
-    // night sky — nothing scatters sunlight into them.
-    let space = space_bg + stars;
 
     if (u.planet.y <= 0.0) {
-        return vec4<f32>(tone_map(space), 1.0);
+        // Vacuum bodies see the raw night sky — nothing scatters
+        // sunlight into the ray, so no daylight gate applies.
+        return vec4<f32>(tone_map(space_bg + sky_stars(rd, sun, pr)), 1.0);
     }
 
     // Ray/shell quadratic |pa + t·rd|² = r² ⇒ t² + 2b·t + c = 0,
@@ -1035,7 +1042,7 @@ fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
         // The ray misses the top shell entirely — nothing crosses the
         // atmosphere, so the space backdrop arrives unattenuated (the
         // clamped LUT row would falsely dim the annulus past the limb).
-        return vec4<f32>(tone_map(space), 1.0);
+        return vec4<f32>(tone_map(space_bg + sky_stars(rd, sun, pr)), 1.0);
     }
     let sq = sqrt(disc_top);
     var t0 = max(-b - sq, 0.0);
@@ -1050,7 +1057,7 @@ fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
             hit_ground = true;
         }
     }
-    var col = space;
+    var col = vec3<f32>(0.0);
     if (t1 > t0) {
         // 32 jittered steps — the jitter is PER-STEP: every tap draws
         // its own offset, so the per-pixel misestimates partially
@@ -1102,7 +1109,21 @@ fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
         // of it.
         let ins_lum = dot(ins, vec3<f32>(0.2126, 0.7152, 0.0722));
         let star_vis = 1.0 - smoothstep(6.0e-4, 4.0e-3, ins_lum);
-        col = ins + (space_bg + stars * star_vis) * bg_t;
+        // C16-F4: the two 27-cell star walks run only where their
+        // output can be nonzero — `star_vis` is 0 across the whole
+        // day side, and a ground strike (`bg_t` = 0) has no backdrop
+        // to scatter stars into at all.
+        var stars = vec3<f32>(0.0);
+        if (star_vis > 0.0 && !hit_ground) {
+            stars = sky_stars(rd, sun, pr) * star_vis;
+        }
+        col = ins + (space_bg + stars) * bg_t;
+    } else {
+        // The shell is entirely behind the ray's forward range
+        // (observer outside it, looking away) — nothing scatters,
+        // so the ungated night sky stands (the old `col = space`
+        // initializer's case, made an explicit arm).
+        col = space_bg + sky_stars(rd, sun, pr);
     }
     return vec4<f32>(tone_map(col), 1.0);
 }
