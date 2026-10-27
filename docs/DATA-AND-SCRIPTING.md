@@ -384,12 +384,11 @@ legitimately move a golden hash: rustc version, target triple, parry/rapier/libm
 rand_chacha/blake3/**rhai** versions, `HASH_SCHEMA_VERSION`, `KDF_VERSION`,
 `DATA_HASH_VERSION`, and the fixture's own data hash. Verify one golden:
 `cargo run -p csp-bench --bin csp-replay -- verify data/test-fixtures/flight-launch`
-(exit 1 = hash mismatch, 2 = harness error).
-
-**Known issue (working tree)**: the `flight-launch` golden currently fails at the
-bincode **decode** step against the uncommitted W2.6 serialized-type churn — passes
-at HEAD; noted in `.review/session-prd1/STATUS.md`. A `bless-goldens --reason` run is
-the documented path once the churn lands.
+(exit 1 = hash mismatch, 2 = harness error). `replay.bin` is framed
+`CSPREPLAY\0 | format_version: u32 LE | bincode payload`; a file that fails the
+framing or decode step is reported with the `fingerprint.json` sidecar's
+recorded-vs-current version lines (a stale artifact names its versions — replays
+carry no migration promise, so re-record or `bless-goldens`).
 
 ### 2.3 gen_biome_maps (`xtask/src/bin/gen_biome_maps.rs`)
 

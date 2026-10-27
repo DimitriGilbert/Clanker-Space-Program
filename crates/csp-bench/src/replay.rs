@@ -4,9 +4,15 @@
 //!
 //! Artifact shape (§7.6 + `final_tick`): `{ fingerprint, save_seed,
 //! data_fixture_hash, initial snapshot, final_tick, Vec<(CommandKey,
-//! SimCommand)> }`, bincode-encoded with a fixed configuration.
-//! **Not a save format** — replays are version-scoped by T3 and carry no
-//! migration promise (§7.2, §7.7).
+//! SimCommand)> }`, bincode-encoded with a fixed configuration and framed
+//! `CSPREPLAY\0 | format_version: u32 LE | payload` ([`REPLAY_MAGIC`],
+//! [`REPLAY_FORMAT_VERSION`]). **Not a save format** — replays are
+//! version-scoped by T3 and carry no migration promise (§7.2, §7.7); the
+//! framing header exists for diagnostics, not migration: a stale or
+//! foreign `replay.bin` is refused *by name* (which format it claims vs
+//! what this build reads, plus the `fingerprint.json` sidecar's
+//! recorded-vs-current version lines) instead of surfacing as an
+//! undifferentiated bincode decode error.
 //!
 //! Golden layout (§8.3): `data/test-fixtures/<scenario>/` holds the frozen
 //! data files plus three harness artifacts —
@@ -39,6 +45,19 @@ fn bincode_config() -> bincode::config::Configuration {
 
 /// The bincode artifact inside a golden directory (§7.6).
 pub const REPLAY_FILE: &str = "replay.bin";
+/// The `replay.bin` file magic — `CSPREPLAY` plus its NUL terminator so
+/// the magic is never a prefix of a name (the `CSPSAVE\0` convention).
+/// The first framing field of every artifact this build writes; a file
+/// that lacks it is a pre-header (v0) artifact or foreign bytes —
+/// [`ReplayError::MissingMagic`] names that honestly.
+pub const REPLAY_MAGIC: &[u8; 10] = b"CSPREPLAY\0";
+/// The framing version [`encode`] writes and [`decode`] accepts —
+/// `u32 LE` immediately after [`REPLAY_MAGIC`], before the bincode
+/// payload. Bumped when the framing or payload schema changes
+/// incompatibly; §7.6's answer to a version the reader predates is
+/// `csp-replay record`, not a migration chain (there is deliberately no
+/// `[MIN, CURRENT]` band here — replays have no backward-compat promise).
+pub const REPLAY_FORMAT_VERSION: u32 = 1;
 /// The recorded final state hash, lowercase hex + newline (§7.1).
 pub const EXPECTED_HASH_FILE: &str = "expected-hash.txt";
 /// The §7.1 determinism fingerprint sidecar.
@@ -220,6 +239,37 @@ pub enum ReplayError {
     Encode(bincode::error::EncodeError),
     /// bincode decode failed — truncated or foreign artifact bytes.
     Decode(bincode::error::DecodeError),
+    /// `replay.bin` does not begin with [`REPLAY_MAGIC`] — foreign
+    /// bytes or a pre-header (v0) artifact. §7.6 gives replays no
+    /// migration promise, so a v0 artifact is re-recorded, not decoded:
+    /// refusing by name beats a bincode error that is indistinguishable
+    /// from corruption.
+    MissingMagic,
+    /// The artifact's framing version is not the one this build reads —
+    /// a newer or older `replay.bin`. Names the stamped version so the
+    /// refusal says *which* side moved (the §7.7 refusal contract,
+    /// applied to the format replays DO carry).
+    UnsupportedReplayVersion {
+        /// The `format_version` the file declared.
+        found: u32,
+    },
+    /// `replay.bin` failed its decode step — a stale artifact (recorded
+    /// under a serialized schema this build no longer matches), a
+    /// foreign file, or corruption. [`load_golden`] produces this:
+    /// `cause` is the decode-level verdict and `drift` is the
+    /// `fingerprint.json` sidecar's recorded-vs-current version lines —
+    /// the C29-F3 diagnostic, so a stale artifact names its versions
+    /// instead of laundering into exit 2's generic "harness error".
+    UndecodableArtifact {
+        /// The decode-level verdict ([`Self::MissingMagic`],
+        /// [`Self::Decode`], [`Self::UnsupportedReplayVersion`], …).
+        cause: Box<ReplayError>,
+        /// Sidecar-derived version lines — one per fingerprint field
+        /// that differs from this build, or a single line stating the
+        /// versions matched (corruption, not staleness) / the sidecar
+        /// itself was unreadable.
+        drift: Vec<String>,
+    },
     /// A fingerprint sidecar is not the JSON this harness writes.
     Json(serde_json::Error),
     /// The sim itself failed during record or replay (§2.13).
@@ -342,6 +392,24 @@ impl fmt::Display for ReplayError {
             Self::Io { path, source } => write!(f, "io at {}: {source}", path.display()),
             Self::Encode(e) => write!(f, "bincode encode: {e}"),
             Self::Decode(e) => write!(f, "bincode decode: {e}"),
+            Self::MissingMagic => write!(
+                f,
+                "not a replay.bin artifact (missing CSPREPLAY\\0 magic — \
+                 a pre-header v0 artifact or foreign bytes)"
+            ),
+            Self::UnsupportedReplayVersion { found } => write!(
+                f,
+                "replay.bin format version {found} is not this build's \
+                 {REPLAY_FORMAT_VERSION} — re-record; replays carry no \
+                 migration promise (§7.6)"
+            ),
+            Self::UndecodableArtifact { cause, drift } => {
+                write!(f, "replay.bin failed to decode: {cause}")?;
+                for line in drift {
+                    write!(f, "; {line}")?;
+                }
+                Ok(())
+            }
             Self::Json(e) => write!(f, "fingerprint.json: {e}"),
             Self::Sim(e) => write!(f, "sim: {e}"),
             Self::Load(e) => write!(f, "fixture data: {e}"),
@@ -413,6 +481,7 @@ impl std::error::Error for ReplayError {
             Self::Io { source, .. } => Some(source),
             Self::Encode(e) => Some(e),
             Self::Decode(e) => Some(e),
+            Self::UndecodableArtifact { cause, .. } => Some(cause.as_ref()),
             Self::Json(e) => Some(e),
             Self::Sim(e) => Some(e),
             Self::Load(e) => Some(e),
@@ -707,6 +776,60 @@ pub fn record(recipe: &ScenarioRecipe, fixture_dir: &Path) -> Result<RecordedGol
     })
 }
 
+/// Rebuild a world from a recorded [`csp_sim::WorldConfig`] and a
+/// snapshot — [`World::restore`] plus the full construction-config
+/// re-install [`replay`] needs (the §7.3 data-derived channels:
+/// experiments, tech tree, sites, contracts, colony environments,
+/// recipes, the part catalog, and the §2.10 script host + autopilot
+/// driver). Shared with the §7.5 save→load gate, which restores a
+/// CSPSAVE-decoded snapshot under the same construction config the
+/// save was taken from.
+fn restore_world(
+    config: &csp_sim::WorldConfig,
+    snapshot: WorldSnapshot,
+) -> Result<World, ReplayError> {
+    let mut world = World::restore(
+        PatchedConics::new(config.orbits.clone()),
+        config.physics.clone(),
+        snapshot,
+    )?;
+    // §7.3 data-derived config like the orbit model — the artifact's
+    // recorded `experiments` table is what the science commands
+    // validated against at record time.
+    world.set_experiments(config.experiments.clone());
+    // M7-B: the merged tech tree rides the same channel — a recorded
+    // `tech_tree` is what the run's research commands validated
+    // against; `None` means the record ran tree-less.
+    if let Some(tree) = &config.tech_tree {
+        world.set_tech_tree(tree.clone());
+    }
+    // M7-C: the site table rides the same channel — a recorded run's
+    // `RecoverVessel` resolves its site against it; without it the
+    // command rejects and the log diverges.
+    world.set_sites(config.sites.clone());
+    world.set_contracts(config.contracts.clone());
+    // M8-A: the per-body colony environments ride the same channel —
+    // a recorded run's `FoundColony`/terminator math resolves
+    // rotation and insolation against it.
+    world.set_colony_env(config.colony_env.clone());
+    // M8-B: the recipe table rides the same channel — a recorded
+    // run's `FoundColony`/`ManufactureCraft` resolves `RecipeId`s
+    // against it.
+    world.set_recipes(config.recipes.clone());
+    // M7-B §3.3: the part catalog the `CraftDef::part_ids` gate
+    // resolves `tech_requirement`s against — the recorded world's
+    // construction config, re-installed like the tables above.
+    world.set_parts(config.parts.clone());
+    // M9a §2.10: the script host + autopilot driver are the same
+    // construction-config channel — a recorded run whose snapshot
+    // carried scripts/autopilots replays their `on_tick` calls; the
+    // per-save op budget is serialized sim state and restores with
+    // the snapshot (the engine install forwards it).
+    world.set_script_engine(Box::new(csp_script::RhaiHost::new()));
+    world.set_autopilot_driver(Box::new(csp_ai::AscentAutopilot::new()));
+    Ok(world)
+}
+
 /// Feed an artifact's command log back through a world restored from its
 /// initial snapshot; return the resulting state hash — the §7.6
 /// reconstruction, and the actual determinism check.
@@ -780,45 +903,7 @@ pub fn replay(artifact: &Replay) -> Result<[u8; 32], ReplayError> {
     // The construction config is §7.3 data-derived state the artifact
     // carries verbatim — the orbit model + physics environment the run
     // was recorded against.
-    let mut world = World::restore(
-        PatchedConics::new(artifact.config.orbits.clone()),
-        artifact.config.physics.clone(),
-        artifact.initial_snapshot.clone(),
-    )?;
-    // §7.3 data-derived config like the orbit model — the artifact's
-    // recorded `experiments` table is what the science commands
-    // validated against at record time.
-    world.set_experiments(artifact.config.experiments.clone());
-    // M7-B: the merged tech tree rides the same channel — a recorded
-    // `tech_tree` is what the run's research commands validated
-    // against; `None` means the record ran tree-less.
-    if let Some(tree) = &artifact.config.tech_tree {
-        world.set_tech_tree(tree.clone());
-    }
-    // M7-C: the site table rides the same channel — a recorded run's
-    // `RecoverVessel` resolves its site against it; without it the
-    // command rejects and the log diverges.
-    world.set_sites(artifact.config.sites.clone());
-    world.set_contracts(artifact.config.contracts.clone());
-    // M8-A: the per-body colony environments ride the same channel —
-    // a recorded run's `FoundColony`/terminator math resolves
-    // rotation and insolation against it.
-    world.set_colony_env(artifact.config.colony_env.clone());
-    // M8-B: the recipe table rides the same channel — a recorded
-    // run's `FoundColony`/`ManufactureCraft` resolves `RecipeId`s
-    // against it.
-    world.set_recipes(artifact.config.recipes.clone());
-    // M7-B §3.3: the part catalog the `CraftDef::part_ids` gate
-    // resolves `tech_requirement`s against — the recorded world's
-    // construction config, re-installed like the tables above.
-    world.set_parts(artifact.config.parts.clone());
-    // M9a §2.10: the script host + autopilot driver are the same
-    // construction-config channel — a recorded run whose snapshot
-    // carried scripts/autopilots replays their `on_tick` calls; the
-    // per-save op budget is serialized sim state and restores with
-    // the snapshot (the engine install forwards it).
-    world.set_script_engine(Box::new(csp_script::RhaiHost::new()));
-    world.set_autopilot_driver(Box::new(csp_ai::AscentAutopilot::new()));
+    let mut world = restore_world(&artifact.config, artifact.initial_snapshot.clone())?;
     // §2.7: `Replay::save_seed` is a cross-check — `restore` already
     // took the snapshot's seed (the record stamped it pre-snapshot), so
     // a disagreement is a doctored or spliced artifact, not an input to
@@ -1009,24 +1094,55 @@ pub fn verify_golden(dir: &Path) -> Result<Verified, ReplayError> {
     })
 }
 
-/// bincode-encode the artifact with the fixed §7.6 config.
+/// bincode-encode the artifact with the fixed §7.6 config, framed as
+/// `CSPREPLAY\0 | format_version: u32 LE | payload` (see [`REPLAY_MAGIC`]).
 pub fn encode(artifact: &Replay) -> Result<Vec<u8>, ReplayError> {
-    bincode::serde::encode_to_vec(artifact, bincode_config()).map_err(ReplayError::Encode)
+    let payload =
+        bincode::serde::encode_to_vec(artifact, bincode_config()).map_err(ReplayError::Encode)?;
+    let mut out = Vec::with_capacity(REPLAY_MAGIC.len() + 4 + payload.len());
+    out.extend_from_slice(REPLAY_MAGIC);
+    out.extend_from_slice(&REPLAY_FORMAT_VERSION.to_le_bytes());
+    out.extend_from_slice(&payload);
+    Ok(out)
 }
 
-/// bincode-decode an artifact produced by [`encode`]. Rejects trailing
-/// bytes — `replay.bin` is a whole-file artifact, so a short read means
-/// appended garbage or a truncated-then-padded file, not a valid artifact.
+/// bincode-decode an artifact produced by [`encode`]. The framing header
+/// is checked before the payload is touched — a missing magic or a
+/// foreign `format_version` is a named refusal ([`ReplayError::MissingMagic`],
+/// [`ReplayError::UnsupportedReplayVersion`]), never a bincode guess.
+/// Rejects trailing payload bytes — `replay.bin` is a whole-file
+/// artifact, so a short read means appended garbage or a
+/// truncated-then-padded file, not a valid artifact.
 pub fn decode(bytes: &[u8]) -> Result<Replay, ReplayError> {
+    let payload = artifact_payload(bytes)?;
     let (artifact, bytes_read) =
-        bincode::serde::decode_from_slice::<Replay, _>(bytes, bincode_config())
+        bincode::serde::decode_from_slice::<Replay, _>(payload, bincode_config())
             .map_err(ReplayError::Decode)?;
-    if bytes_read != bytes.len() {
+    if bytes_read != payload.len() {
         return Err(ReplayError::MalformedGolden(
             "replay.bin has trailing bytes after the artifact",
         ));
     }
     Ok(artifact)
+}
+
+/// Strip `CSPREPLAY\0 | format_version: u32 LE` off the front of a
+/// `replay.bin` candidate — the framing check [`decode`] runs before the
+/// bincode payload is touched.
+fn artifact_payload(bytes: &[u8]) -> Result<&[u8], ReplayError> {
+    let rest = bytes
+        .strip_prefix(REPLAY_MAGIC.as_slice())
+        .ok_or(ReplayError::MissingMagic)?;
+    let version_bytes = rest.get(..4).ok_or(ReplayError::MalformedGolden(
+        "replay.bin truncated inside the format-version field",
+    ))?;
+    // `get(..4)` guarantees exactly 4 bytes; `unwrap_or` is the total
+    // form rather than an unwrap per §2.13 — it cannot fire here.
+    let version = u32::from_le_bytes(version_bytes.try_into().unwrap_or([0; 4]));
+    if version != REPLAY_FORMAT_VERSION {
+        return Err(ReplayError::UnsupportedReplayVersion { found: version });
+    }
+    Ok(&rest[4..])
 }
 
 /// Write a golden directory's three artifacts (§8.3): `replay.bin`,
@@ -1104,8 +1220,14 @@ pub fn write_golden_overwrite(dir: &Path, golden: &RecordedGolden) -> Result<(),
 }
 
 /// Load a golden directory: the §7.6 artifact and the expected final hash.
+/// A `replay.bin` that fails its decode step is reported as
+/// [`ReplayError::UndecodableArtifact`] with the `fingerprint.json`
+/// sidecar's recorded-vs-current version lines attached — the C29-F3
+/// diagnostic (a stale artifact names its versions; it does not
+/// launder into a generic bincode error).
 pub fn load_golden(dir: &Path) -> Result<(Replay, [u8; 32]), ReplayError> {
-    let artifact = decode(&read_file(&dir.join(REPLAY_FILE))?)?;
+    let artifact =
+        decode(&read_file(&dir.join(REPLAY_FILE))?).map_err(|cause| undecodable(dir, cause))?;
     let text = read_string(&dir.join(EXPECTED_HASH_FILE))?;
     let expected = parse_hex(text.trim()).ok_or(ReplayError::MalformedGolden(
         "expected-hash.txt is not 64 hex chars",
@@ -1120,6 +1242,34 @@ pub fn load_fingerprint(dir: &Path) -> Result<Fingerprint, ReplayError> {
     let text = read_string(&dir.join(FINGERPRINT_FILE))?;
     let sidecar: FingerprintSidecar = serde_json::from_str(&text).map_err(ReplayError::Json)?;
     Ok(sidecar.into())
+}
+
+/// Wrap a `replay.bin` decode failure in
+/// [`ReplayError::UndecodableArtifact`], consulting the
+/// `fingerprint.json` sidecar for the recorded-vs-current version diff —
+/// the C29-F3 diagnostic: a stale artifact names the toolchain/schema
+/// versions it was recorded under instead of surfacing as an
+/// unclassified bincode error. The fixture-hash field is deliberately
+/// excluded from the diff (the recorded hash is passed as "current" so
+/// it can never diff): `verify_golden` reports fixture drift separately
+/// as [`ReplayError::FixtureDrift`], and the question a decode failure
+/// asks is "which build wrote these bytes", not "did the data move".
+fn undecodable(dir: &Path, cause: ReplayError) -> ReplayError {
+    let mut drift = match load_fingerprint(dir) {
+        Ok(recorded) => fingerprint_warnings(&recorded, recorded.data_fixture_hash),
+        Err(e) => vec![format!("fingerprint.json could not be consulted: {e}")],
+    };
+    if drift.is_empty() {
+        drift.push(
+            "fingerprint.json matches this build's versions — the bytes are \
+             corrupt or tampered, not stale"
+                .to_string(),
+        );
+    }
+    ReplayError::UndecodableArtifact {
+        cause: Box::new(cause),
+        drift,
+    }
 }
 
 /// Lowercase hex, §7.1's golden-file convention.
@@ -1823,5 +1973,217 @@ mod tests {
         assert_eq!(log[1].0.source_class, SourceClass::Ui);
         assert_eq!(log[2].0.source_class, SourceClass::External);
         assert_eq!(log[1].0.tick, log[2].0.tick);
+    }
+
+    // ---- §7.5 save→load gate at N = 10 000 (C35-F4) -----------------
+
+    /// §7.5's gate width: "save → load → N ticks, hash-compared against
+    /// uninterrupted N ticks, for N = 10 000".
+    const SAVE_LOAD_GATE_TICKS: u64 = 10_000;
+
+    /// One §7.5 seam check on a live world: snapshot it into a real
+    /// CSPSAVE file, decode the file back, restore a second world under
+    /// the same construction config, then advance both N ticks and
+    /// hash-compare. A divergence is reported by class, per the plan's
+    /// "byte-exact or name the drift" contract:
+    ///
+    /// - **container drift** — re-encoding the decoded `Save` does not
+    ///   reproduce the file byte-for-byte (the §7.2 canonical-CBOR
+    ///   contract). Struct `PartialEq` is deliberately NOT asserted:
+    ///   `#[serde(skip)]` derived caches (`WeldedBody::aero`/`decel`,
+    ///   `CraftDef::hash_memo`) legitimately decode to defaults —
+    ///   byte-exact re-encode is what proves the *serialized* set
+    ///   survived, and the hash checks below prove the live state did;
+    /// - **load-time drift** — the restored world's hash differs from
+    ///   the live world's at the same tick: a serialized field did not
+    ///   survive the round-trip;
+    /// - **evolution drift** — the hashes agree at load but diverge
+    ///   across the N-tick window: §7.5's named bug class, a derived
+    ///   cache that is a function of history rather than of state.
+    fn check_save_load_seam(live: &mut World, seam: &str) {
+        let save = csp_sim::save::Save {
+            game_version: "gate".into(),
+            label: Some(format!("§7.5 seam {seam}")),
+            data_set_hash: None,
+            state_hash: Some(live.state_hash().unwrap()),
+            snapshot: live.snapshot().unwrap(),
+        };
+        let bytes = csp_sim::save::encode_save(&save).unwrap();
+        let back = csp_sim::save::decode_save(&bytes).unwrap();
+        assert_eq!(
+            csp_sim::save::encode_save(&back).unwrap(),
+            bytes,
+            "{seam}: CSPSAVE re-encode is not byte-exact — container drift"
+        );
+        let config = live.config();
+        let mut restored = restore_world(&config, back.snapshot).unwrap();
+        assert_eq!(
+            restored.state_hash().unwrap(),
+            live.state_hash().unwrap(),
+            "{seam}: restored hash differs at load time — a serialized \
+             field did not survive the round-trip (load-time drift)"
+        );
+        let target = live.clock().ticks() + SAVE_LOAD_GATE_TICKS;
+        advance_to(live, target).unwrap();
+        advance_to(&mut restored, target).unwrap();
+        assert_eq!(
+            restored.state_hash().unwrap(),
+            live.state_hash().unwrap(),
+            "{seam}: hashes diverged over {} ticks after a clean load — \
+             §7.5 evolution drift (a derived cache is a function of \
+             history, not state)",
+            SAVE_LOAD_GATE_TICKS
+        );
+    }
+
+    /// PLAN §7.5's per-commit gate at the spec's scale, across the
+    /// scenario set: every registered recipe's world is driven to its
+    /// recorded end state, round-tripped through the real CSPSAVE
+    /// codec, then advanced N = 10 000 ticks against its uninterrupted
+    /// twin. (`record`'s self-check covers snapshot→restore→replay;
+    /// this covers the *forward* seam — new ticks, not replayed
+    /// commands — plus the container's byte-exactness.)
+    #[test]
+    fn save_load_gate_10k_ticks_across_scenarios() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/test-fixtures");
+        for recipe in scenarios::SCENARIOS {
+            let dir = fixtures.join(recipe.name);
+            let mut live = (recipe.initial)(&dir).unwrap();
+            live.set_save_seed(recipe.save_seed);
+            (recipe.drive)(&mut live).unwrap();
+            check_save_load_seam(&mut live, recipe.name);
+        }
+    }
+
+    /// The same gate with a live bubble vessel at the seam: the
+    /// flight-launch recipe's end state is post-recovery (the vessel
+    /// is gone), so a mid-ascent seam exercises the §7.3 re-weld
+    /// path — bit-identical mass properties off the part graph — that
+    /// the post-run gate above cannot reach.
+    #[test]
+    fn save_load_gate_10k_ticks_mid_flight() {
+        let recipe = scenarios::find("flight-launch").unwrap();
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../data/test-fixtures")
+            .join(recipe.name);
+        let mut live = (recipe.initial)(&dir).unwrap();
+        live.set_save_seed(recipe.save_seed);
+        scenarios::spawn_pad(&mut live).unwrap();
+        live.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SetThrottle {
+                vessel: scenarios::FLIGHT_VESSEL,
+                throttle: 1.0,
+            },
+        );
+        // Climb ~8 s so the seam sits mid-ascent with the vessel
+        // InBubble — welded body, live contacts history, spinning
+        // environment.
+        let seam = live.clock().ticks() + 512;
+        advance_to(&mut live, seam).unwrap();
+        check_save_load_seam(&mut live, "flight-launch mid-ascent");
+    }
+
+    // ---- §7.6 artifact framing + stale-artifact diagnostics (C29-F3) ----
+
+    /// `encode` frames every artifact `CSPREPLAY\0 | u32-LE version |
+    /// payload` — the header a reader checks before touching bincode.
+    #[test]
+    fn encode_writes_framing_header() {
+        let golden = record(scenarios::find("trivial").unwrap(), &trivial_dir()).unwrap();
+        let bytes = encode(&golden.artifact).unwrap();
+        assert!(bytes.starts_with(REPLAY_MAGIC));
+        let version = u32::from_le_bytes(
+            bytes[REPLAY_MAGIC.len()..REPLAY_MAGIC.len() + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(version, REPLAY_FORMAT_VERSION);
+        assert_eq!(decode(&bytes).unwrap(), golden.artifact);
+    }
+
+    /// A headerless artifact — the pre-header v0 format, or foreign
+    /// bytes — is refused by name, never handed to bincode to guess.
+    #[test]
+    fn decode_refuses_missing_magic() {
+        let golden = record(scenarios::find("trivial").unwrap(), &trivial_dir()).unwrap();
+        // The v0 layout verbatim: whole-file bincode, no framing.
+        let legacy = bincode::serde::encode_to_vec(&golden.artifact, bincode_config()).unwrap();
+        assert!(matches!(decode(&legacy), Err(ReplayError::MissingMagic)));
+        assert!(matches!(
+            decode(b"definitely not a replay"),
+            Err(ReplayError::MissingMagic)
+        ));
+        assert!(matches!(decode(b""), Err(ReplayError::MissingMagic)));
+    }
+
+    /// A framing version this build does not read is refused with the
+    /// stamped version named — and a header truncated inside the
+    /// version field is malformed, not a decode guess.
+    #[test]
+    fn decode_refuses_foreign_format_version() {
+        let mut bytes = REPLAY_MAGIC.to_vec();
+        bytes.extend_from_slice(&99u32.to_le_bytes());
+        bytes.extend_from_slice(&[0xAA; 8]);
+        match decode(&bytes) {
+            Err(ReplayError::UnsupportedReplayVersion { found }) => assert_eq!(found, 99),
+            other => panic!("expected UnsupportedReplayVersion(99), got {other:?}"),
+        }
+        let mut truncated = REPLAY_MAGIC.to_vec();
+        truncated.extend_from_slice(&[1, 0]);
+        assert!(matches!(
+            decode(&truncated),
+            Err(ReplayError::MalformedGolden(_))
+        ));
+    }
+
+    /// The C29-F3 diagnostic end-to-end: a `replay.bin` that fails to
+    /// decode is reported by [`load_golden`] as `UndecodableArtifact`,
+    /// and the attached drift lines name the recorded-vs-current
+    /// fingerprint fields read off `fingerprint.json` — a stale
+    /// artifact names its versions; a same-version sidecar reports the
+    /// bytes as corrupt/tampered instead.
+    #[test]
+    fn load_golden_names_stale_artifact_versions() {
+        let tmp = TempDir::new("stale-artifact");
+        std::fs::write(tmp.0.join("fixture.ron"), b"(stub: 1)\n").unwrap();
+        std::fs::write(tmp.0.join(REPLAY_FILE), b"\xDE\xAD\xBE\xEF v0 bytes").unwrap();
+
+        // A sidecar recorded under a different hash schema: the drift
+        // report must name that field with both versions.
+        let mut recorded = fingerprint(fixture_hash(&tmp.0).unwrap());
+        recorded.hash_schema_version = HASH_SCHEMA_VERSION.wrapping_sub(1);
+        let json = serde_json::to_string_pretty(&FingerprintSidecar::from(&recorded)).unwrap();
+        std::fs::write(tmp.0.join(FINGERPRINT_FILE), json).unwrap();
+        match load_golden(&tmp.0) {
+            Err(ReplayError::UndecodableArtifact { cause, drift }) => {
+                assert!(matches!(*cause, ReplayError::MissingMagic));
+                assert!(
+                    drift.iter().any(|l| l.contains("HASH_SCHEMA_VERSION")
+                        && l.contains(&HASH_SCHEMA_VERSION.to_string())),
+                    "drift must name the schema-version diff, got {drift:?}"
+                );
+            }
+            other => panic!("expected UndecodableArtifact, got {other:?}"),
+        }
+
+        // A sidecar that matches this build's versions: the verdict is
+        // corruption/tampering, not staleness — the report says so.
+        let json = serde_json::to_string_pretty(&FingerprintSidecar::from(&fingerprint(
+            fixture_hash(&tmp.0).unwrap(),
+        )))
+        .unwrap();
+        std::fs::write(tmp.0.join(FINGERPRINT_FILE), json).unwrap();
+        match load_golden(&tmp.0) {
+            Err(ReplayError::UndecodableArtifact { cause, drift }) => {
+                assert!(matches!(*cause, ReplayError::MissingMagic));
+                assert!(
+                    drift.iter().any(|l| l.contains("corrupt or tampered")),
+                    "same-version sidecar must report corruption, got {drift:?}"
+                );
+            }
+            other => panic!("expected UndecodableArtifact, got {other:?}"),
+        }
     }
 }
