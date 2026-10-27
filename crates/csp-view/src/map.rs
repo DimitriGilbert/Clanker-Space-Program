@@ -3907,13 +3907,16 @@ mod tests {
         assert_eq!(cmd_label, label);
     }
 
-    /// C18-F3: the plan-route polyline is keyed on
-    /// `(departure_tick, duration_ticks)` — a re-plan that moves in
-    /// duration while holding the departure cell resamples (each cell
-    /// is a distinct Lambert leg), and a failed sample leaves the key
-    /// unlatched so the next frame retries.
-    #[test]
-    fn plan_line_rekeys_on_duration_and_retries_failures() {
+    /// Shared arrange for the plan-line cache tests: a terrin→duva
+    /// `FindWindow` plan plus the map plumbing `refresh_planning`
+    /// consumes (model, body table, input, empty snapshot).
+    fn plan_line_fixture() -> (
+        PatchedConics,
+        BodyTable,
+        MapInput,
+        MapSnapshot,
+        csp_sim::transfer::TransferPlan,
+    ) {
         let model = transfer_system();
         let table = BodyTable::from_model(&model);
         let input = MapInput::new(&table);
@@ -3932,15 +3935,14 @@ mod tests {
             &mut planning,
             &mut out,
         );
-        let plan_a = planning.plan.as_ref().expect("the pair plans").plan.clone();
-        // A sibling plan: same departure cell, moved in duration (and
-        // therefore a different conic).
-        let mut plan_b = plan_a.clone();
-        plan_b.duration_ticks += TICK_HZ;
-        plan_b.arrival_tick += TICK_HZ;
-        plan_b.conic.elements.semi_major_axis_m *= 1.05;
+        let plan = planning.plan.as_ref().expect("the pair plans").plan.clone();
+        (model, table, input, snap, plan)
+    }
 
-        let stage = |plan: &csp_sim::transfer::TransferPlan| MapPlanning {
+    /// A `MapPlanning` staging `plan` the way the panel leaves it —
+    /// `refresh_planning` draws the route conic off this alone.
+    fn staged_plan(plan: &csp_sim::transfer::TransferPlan) -> MapPlanning {
+        MapPlanning {
             plan: Some(PlannedTransfer {
                 plan: plan.clone(),
                 node: None,
@@ -3949,7 +3951,23 @@ mod tests {
                 encounter: None,
             }),
             ..MapPlanning::default()
-        };
+        }
+    }
+
+    /// C18-F3: the plan-route polyline is keyed on
+    /// `(departure_tick, duration_ticks)` — a re-plan that moves in
+    /// duration while holding the departure cell resamples (each cell
+    /// is a distinct Lambert leg).
+    #[test]
+    fn plan_line_rekeys_on_duration() {
+        let (model, table, input, snap, plan_a) = plan_line_fixture();
+        // A sibling plan: same departure cell, moved in duration (and
+        // therefore a different conic).
+        let mut plan_b = plan_a.clone();
+        plan_b.duration_ticks += TICK_HZ;
+        plan_b.arrival_tick += TICK_HZ;
+        plan_b.conic.elements.semi_major_axis_m *= 1.05;
+
         let mut scene = MapScene::default();
         let mut ui = MapUiData::default();
         let cam = MapCameraF64::default();
@@ -3960,7 +3978,7 @@ mod tests {
             &input,
             &snap,
             &table,
-            &stage(&plan_a),
+            &staged_plan(&plan_a),
             &mut scene,
             &mut ui,
             &cam,
@@ -3973,7 +3991,7 @@ mod tests {
             &input,
             &snap,
             &table,
-            &stage(&plan_a),
+            &staged_plan(&plan_a),
             &mut scene,
             &mut ui,
             &cam,
@@ -3986,7 +4004,7 @@ mod tests {
             &input,
             &snap,
             &table,
-            &stage(&plan_b),
+            &staged_plan(&plan_b),
             &mut scene,
             &mut ui,
             &cam,
@@ -3997,8 +4015,48 @@ mod tests {
             line_b.1, line_a.1,
             "a duration change must invalidate the cached polyline"
         );
-        // An unsampleable conic does not latch the key — a same-plan
-        // next frame retries instead of pinning "no line".
+    }
+
+    /// C18-F3: an unsampleable conic does not latch the plan-line key —
+    /// a same-plan next frame retries instead of pinning "no line".
+    #[test]
+    fn plan_line_retries_failed_samples() {
+        let (model, table, input, snap, plan_a) = plan_line_fixture();
+        // A sibling key so the latched key differs from plan_bad's —
+        // the resample only runs on a key miss.
+        let mut plan_b = plan_a.clone();
+        plan_b.duration_ticks += TICK_HZ;
+        plan_b.arrival_tick += TICK_HZ;
+        plan_b.conic.elements.semi_major_axis_m *= 1.05;
+
+        let mut scene = MapScene::default();
+        let mut ui = MapUiData::default();
+        let cam = MapCameraF64::default();
+        let t = SimTime::ZERO;
+
+        refresh_planning(
+            &model,
+            &input,
+            &snap,
+            &table,
+            &staged_plan(&plan_a),
+            &mut scene,
+            &mut ui,
+            &cam,
+            t,
+        );
+        let line_a = scene.plan_line.clone().expect("plan A draws");
+        refresh_planning(
+            &model,
+            &input,
+            &snap,
+            &table,
+            &staged_plan(&plan_b),
+            &mut scene,
+            &mut ui,
+            &cam,
+            t,
+        );
         let mut plan_bad = plan_a.clone();
         plan_bad.conic.parent = BodyId::from("no-such-body");
         refresh_planning(
@@ -4006,7 +4064,7 @@ mod tests {
             &input,
             &snap,
             &table,
-            &stage(&plan_bad),
+            &staged_plan(&plan_bad),
             &mut scene,
             &mut ui,
             &cam,
@@ -4023,7 +4081,7 @@ mod tests {
             &input,
             &snap,
             &table,
-            &stage(&plan_a),
+            &staged_plan(&plan_a),
             &mut scene,
             &mut ui,
             &cam,
