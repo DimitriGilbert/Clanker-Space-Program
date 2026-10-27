@@ -964,6 +964,8 @@ name = "csp-ai"
 version = "0.0.0"
 dependencies = [
  "csp-core",
+ "csp-data",
+ "csp-phys",
  "csp-script",
  "csp-sim",
  "libm",

@@ -14,5 +14,11 @@ csp-core = { workspace = true }
 # §2.10's transcendental rule: libm only, never platform floats.
 libm = { workspace = true }
 
+[dev-dependencies]
+# The world-level tests build a real bubble: `Environment`/weld inputs
+# (csp-phys) and `BodyId`/element types (csp-data).
+csp-phys = { workspace = true }
+csp-data = { workspace = true }
+
 [lints]
 workspace = true

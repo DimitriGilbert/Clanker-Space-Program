@@ -983,7 +983,28 @@ mod tests {
         let (apo, pe) = reached.expect("autopilot never reached orbit");
         assert!(apo < 400_000.0, "runaway apoapsis {apo}");
         eprintln!("autopilot orbit: apo {apo:.0} pe {pe:.0}");
-        assert!(w.autopilots()[&FLIGHT_VESSEL].enabled);
+        // C26-F2's terminal state: a completed ascent disengages
+        // itself — an `enabled` record would suppress the auto
+        // bubble→rails edge forever. The record's removal lets the
+        // coasting, clearing vessel rail on the tick after the
+        // disengage drains.
+        for _ in 0..100_000u64 {
+            if !w.autopilots().contains_key(&FLIGHT_VESSEL)
+                && w.vessels()[&FLIGHT_VESSEL].orbit().is_some()
+            {
+                break;
+            }
+            let t = w.clock().ticks();
+            w.step_frame(t + 1).unwrap();
+        }
+        assert!(
+            !w.autopilots().contains_key(&FLIGHT_VESSEL),
+            "completed ascent left the autopilot record engaged"
+        );
+        assert!(
+            w.vessels()[&FLIGHT_VESSEL].orbit().is_some(),
+            "disengaged vessel did not auto-rail"
+        );
     }
 
     /// M9a §2.10 acceptance: a real Rhai ascent script — `on_tick`
