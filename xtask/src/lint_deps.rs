@@ -925,13 +925,12 @@ mod tests {
         let text = std::fs::read_to_string(root.join("data/balance.ron"))
             .expect("data/balance.ron missing");
         let b: Balance = ron::from_str(&text).expect("data/balance.ron is not valid RON");
-        // Schema v11 — M9b added §3.4's reliability block (the
-        // dormant-hazard switch, ignition window, mode magnitudes,
-        // infant decay, notification cap, flight-qual rates, and the
-        // test-stand economics incl. `reliability_bench_resource`);
-        // the loader-side pin is `csp_data::BALANCE_SCHEMA_VERSION`
-        // (kept in lockstep by csp-data's own balance gate test).
-        assert_eq!(b.schema_version, 11);
+        // Schema v13 — M9b added §3.4's reliability block (v11), the
+        // C12 economy extension followed (v12), and C21-F8 added
+        // `colony_founding_cost_funds` (v13). The loader-side pin is
+        // `csp_data::BALANCE_SCHEMA_VERSION` (kept in lockstep by
+        // csp-data's own balance gate test).
+        assert_eq!(b.schema_version, 13);
         assert_eq!(b.bubble_radius_m, 20_000.0);
         assert_eq!(b.advance_to_max_events_per_frame, 2_000);
         // And the other shipped data file parses too.
