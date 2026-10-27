@@ -993,9 +993,6 @@ impl World {
         let Some(v) = self.vessels.get(&vessel) else {
             return Ok(());
         };
-        if matches!(v.state, crate::VesselState::InBubble(_)) {
-            return Ok(());
-        }
         let Some(node) = v
             .reliability
             .iter()
@@ -1004,6 +1001,30 @@ impl World {
         else {
             return Ok(());
         };
+        if matches!(v.state, crate::VesselState::InBubble(_)) {
+            // Stale event on a bubble vessel — the crossing belongs
+            // to the tick pass, so no failure applies. But a record
+            // whose `pending_failure_tick` still names this event
+            // must not keep it: consumed here, the flag would orphan
+            // — `publish_reliability` skips `is_some` records (and
+            // `InBubble` vessels entirely), and the restore pairing
+            // gate Fatals on a pending tick with no live event, so
+            // the next save would brick its own reload (the
+            // fatal-mode branch below's wedge, reached through the
+            // other arm). Clear it like the stale-fire path — the
+            // to-bubble transition already clears legit flags, so a
+            // set one here is always leftover state.
+            self.shadow_vessels(shadow);
+            let v = self
+                .vessels
+                .get_mut(&vessel)
+                .ok_or(SimError::Fatal("part failure: vessel vanished"))?;
+            v.reliability
+                .get_mut(&node)
+                .ok_or(SimError::Fatal("part failure: record vanished"))?
+                .pending_failure_tick = None;
+            return Ok(());
+        }
         if mode.is_fatal() {
             // A fatal mode on a dormant record is a crafted/stale
             // event — the publish only ever draws the non-fatal

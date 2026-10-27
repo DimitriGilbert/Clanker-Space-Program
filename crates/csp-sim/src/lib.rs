@@ -3405,6 +3405,7 @@ impl World {
             }
         }
         restore_colony_state(&snapshot, &orbits, &colony_inspections)?;
+        trim_notification_log(&mut snapshot);
         Ok(Self {
             clock: SimTime::from_ticks(snapshot.clock_ticks),
             warp_level: snapshot.warp_level,
@@ -10657,6 +10658,19 @@ fn restore_colony_state(
     Ok(())
 }
 
+/// `World::restore`'s notification-log bound (C04-F3): the cap is a
+/// writer-side rule only — `notify`'s push-trim and the bubble pass's
+/// matching loop — so a crafted oversized deque would otherwise ride,
+/// and re-save, until the next notification fired. The log is
+/// serialized history, never hashed, so trimming the oldest entries
+/// on the way in applies the writer's own drop rule rather than
+/// refusing the snapshot.
+fn trim_notification_log(snapshot: &mut WorldSnapshot) {
+    while snapshot.notifications.len() > snapshot.reliability_cfg.notification_cap {
+        snapshot.notifications.pop_front();
+    }
+}
+
 /// `World::restore`'s refused-pair gate (§2.4/§7.2): every serialized
 /// `joint_refused` entry must be a canonical `(a < b)` pair over the
 /// live-id domain — a crafted entry could otherwise silently suppress
@@ -10719,7 +10733,8 @@ fn check_restored_craft(craft: &CraftDef) -> Result<(), SimError> {
 /// pending `PartFailure` at that tick (events without matching
 /// records are tolerated staleness — a record that departed on a
 /// fragment cleared its flag but the old event may still ride the
-/// heap), and the bench arena pairs with `BenchTestComplete` events
+/// heap), every pending `PartFailure` names a dormant-residence
+/// vessel, and the bench arena pairs with `BenchTestComplete` events
 /// both directions.
 fn restore_reliability_state(
     snapshot: &WorldSnapshot,
@@ -10750,6 +10765,26 @@ fn restore_reliability_state(
                     "snapshot: pending failure tick / event mismatch",
                 ));
             }
+        }
+    }
+    // C10-F6: the dormant publish writes `PartFailure`s for every
+    // non-`InBubble` vessel — `OnRails` AND `SurfaceLatched` (the
+    // latch restamps `to_dormant` and keeps pending publishes), so
+    // the residence rule is dormant-only, never rails-only. A
+    // bubble-resident event can never be legit: the to-bubble
+    // transition scrubs vessel-named events and clears the flags,
+    // and `fire_part_failure` no-ops there — carrying it would
+    // orphan the record's pending tick and wedge this pairing gate
+    // on the next save.
+    for (vessel, _) in pf_events.keys() {
+        if snapshot
+            .vessels
+            .get(vessel)
+            .is_some_and(|v| matches!(v.state, VesselState::InBubble(_)))
+        {
+            return Err(SimError::Fatal(
+                "snapshot: part-failure event on bubble vessel",
+            ));
         }
     }
     for (id, b) in &snapshot.bench_runs {
@@ -22552,6 +22587,138 @@ mod tests {
                 w.state_hash_masked(&w.in_bubble_ids()).unwrap(),
                 w2.state_hash_masked(&w2.in_bubble_ids()).unwrap()
             );
+        }
+
+        /// The restore half of the notification bound: the cap is a
+        /// writer-side rule (`notify`'s push-trim), so a crafted
+        /// oversized deque must be trimmed on the way in — otherwise
+        /// it rides, and re-saves, until the next notification fires.
+        /// The writer's drop order is oldest-first.
+        #[test]
+        fn restore_trims_notification_log_to_cap() {
+            let mut snap = World::new().snapshot().unwrap();
+            let cap = snap.reliability_cfg.notification_cap;
+            snap.notifications = (0..cap + 5)
+                .map(|i| reliability::Notification {
+                    tick: i as u64,
+                    vessel: VesselId(0),
+                    node: None,
+                    kind: NotificationKind::IgnitionMisfire,
+                })
+                .collect();
+            let w = World::restore(test_system(), None, snap).unwrap();
+            assert_eq!(w.notifications().len(), cap);
+            assert_eq!(w.notifications().front().unwrap().tick, 5);
+            assert_eq!(w.notifications().back().unwrap().tick, (cap + 4) as u64);
+        }
+
+        /// The residence half of the `PartFailure` coherence rule:
+        /// the dormant publish only ever names a non-`InBubble`
+        /// vessel, so a crafted in-bubble record whose pending tick
+        /// pairs with a live event is refused — the no-op firing
+        /// would orphan the flag and the NEXT save would then fail
+        /// its own pairing gate. `SurfaceLatched` is dormant-class
+        /// (the latch restamps `to_dormant` and keeps pending
+        /// publishes): the same record/event pair on a latched hull
+        /// is legitimate serialized state and must still restore.
+        #[test]
+        fn restore_part_failure_residence_coherence() {
+            let kind = || EventKind::PartFailure {
+                vessel: VesselId(0),
+                part: PartInstanceId(0),
+                mode: FailureMode::Leak,
+            };
+            let crafted = |v: Vessel| {
+                let mut snap = World::new().snapshot().unwrap();
+                snap.vessels.insert(VesselId(0), v);
+                snap.next_vessel_id = 1;
+                snap.next_part_instance_id = 1;
+                let k = kind();
+                snap.event_heap = vec![ScheduledEvent {
+                    tick: 10,
+                    seq: 0,
+                    class: events::class_of(&k, &snap.tracked_vessels),
+                    kind: k,
+                }];
+                snap.next_event_seq = 1;
+                snap
+            };
+            let pending = |mut v: Vessel| {
+                v.reliability
+                    .get_mut(&csp_phys::PartNodeId(0))
+                    .unwrap()
+                    .pending_failure_tick = Some(10);
+                v
+            };
+
+            // A bubble-resident vessel carrying the pending pair —
+            // unreachable legit (the to-bubble transition clears the
+            // flags and scrubs vessel-named events) — must refuse.
+            let mut v = pending(dormant_vessel(0));
+            let body = csp_phys::weld(
+                &v.craft.as_ref().unwrap().graph,
+                &v.craft.as_ref().unwrap().parts,
+            )
+            .unwrap();
+            v.state = VesselState::InBubble(body);
+            let r = World::restore(test_system(), crafted_physics(), crafted(v));
+            assert!(
+                matches!(r, Err(SimError::Fatal(_))),
+                "in-bubble PartFailure pairing must refuse restore"
+            );
+
+            // The latched and rails pairings — the dormant residences
+            // the publish actually writes — still restore.
+            let mut v = pending(dormant_vessel(0));
+            v.state = VesselState::SurfaceLatched(SurfacePose {
+                body: BodyId::from("p"),
+                latitude_rad: 0.0,
+                longitude_rad: 0.0,
+                altitude_m: 0.0,
+                orientation: DQuat::IDENTITY,
+            });
+            World::restore(test_system(), crafted_physics(), crafted(v)).unwrap();
+            let v = pending(dormant_vessel(0));
+            World::restore(test_system(), None, crafted(v)).unwrap();
+        }
+
+        /// The fire half: a `PartFailure` reaching an `InBubble`
+        /// vessel is a stale no-op — but it must release the record's
+        /// pending flag, or the flag outlives its consumed event and
+        /// the next snapshot fails the restore pairing gate
+        /// ("pending failure tick / event mismatch").
+        #[test]
+        fn bubble_part_failure_fire_releases_pending_flag() {
+            let mut w = World::with_system(test_system());
+            let mut v = dormant_vessel(w.save_seed);
+            let body = csp_phys::weld(
+                &v.craft.as_ref().unwrap().graph,
+                &v.craft.as_ref().unwrap().parts,
+            )
+            .unwrap();
+            v.state = VesselState::InBubble(body);
+            let node = csp_phys::PartNodeId(0);
+            v.reliability.get_mut(&node).unwrap().pending_failure_tick = Some(1);
+            w.vessels.insert(VesselId(0), v);
+            w.next_vessel_id = 1;
+            w.next_part_instance_id = 1;
+            let mut shadow = TickShadow::capture(&w);
+            let mut degraded = Vec::new();
+            w.fire_part_failure(
+                VesselId(0),
+                PartInstanceId(0),
+                FailureMode::Leak,
+                1,
+                &mut shadow,
+                &mut degraded,
+            )
+            .unwrap();
+            let rec = &w.vessels[&VesselId(0)].reliability[&node];
+            assert!(rec.pending_failure_tick.is_none());
+            // The in-bubble crossing is the tick pass's — no failure
+            // was applied and the renewal clock did not advance.
+            assert!(rec.failures.is_empty());
+            assert_eq!(rec.renewal_count, 0);
         }
 
         /// Jettison must drop the node's reliability record with the
