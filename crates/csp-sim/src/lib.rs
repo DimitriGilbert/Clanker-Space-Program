@@ -1411,8 +1411,11 @@ pub struct WorldSnapshot {
     pub warp_level: u32,
     /// §2.2's `active_vessel` — the player's focused vessel (the
     /// `World` field's doc carries the full rule). `#[serde(default)]`
-    /// keeps pre-field saves decodable — `None` is the inert value
-    /// (the `WorldConfig.parts` precedent).
+    /// is CBOR-forward tolerance only — `decode_body`'s byte-exact
+    /// re-encode gate (`save.rs`) still refuses a pre-field stamped-3
+    /// body (`TrailingBytes`: the re-encode writes the key back), so
+    /// the load contract is "present in every body that loads" and
+    /// `None` is the inert value.
     #[serde(default)]
     pub active_vessel: Option<VesselId>,
     /// Per-source dequeue counters — restoring them is what lets a resumed

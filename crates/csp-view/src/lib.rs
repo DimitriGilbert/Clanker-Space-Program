@@ -1697,6 +1697,17 @@ fn rebuild_from_snapshot(
             view.world.resource_mut::<map::MapInput>().focus_vessel = None;
         }
     }
+    // `FlightUiData.focus` is last frame's pin-aware resolution and
+    // the value `resolved_focus`'s flight half reads — the pin only
+    // reaches it through the next `flight_present` run. Leaving the
+    // pre-load value would let the first post-load
+    // `sync_focus_commands` resolve a stale VesselId that collides
+    // with a live vessel in the restored arena, enqueueing
+    // track/active commands for a vessel the player never focused.
+    // Seed it from the restored record (`None` included — a stale id
+    // must not outlive a focus-less restore) so the boundary resolves
+    // the pin's own target until the present pass catches up.
+    view.world.resource_mut::<flight::FlightUiData>().focus = restored_focus.map(|id| id.0);
     // The issued mirror restarts empty: the restored world's tracked
     // set may predate the boundary's commands, so the next frame
     // restamps the focus (track + active) fresh.
@@ -6330,6 +6341,114 @@ mod tests {
         view.begin_frame();
         view.sim_step(view.sim.clock().ticks() + 32).unwrap();
         view.end_frame();
+    }
+
+    /// C02-F3 regression: the first post-load `sync_focus_commands`
+    /// resolves the RESTORED focus, not the pre-load session's stale
+    /// `FlightUiData.focus`. The mirror is session state that survives
+    /// `rebuild_from_snapshot`, so a stale VesselId colliding with a
+    /// live vessel in the restored arena used to enqueue
+    /// `SetVesselTracked`/`SetActiveVessel` for a vessel the player
+    /// never focused — one frame before `flight_present` re-resolved
+    /// the armed pin. Here the save's `active_vessel` is vessel B
+    /// while a different live vessel sits on A's id in the arena; the
+    /// boundary must issue nothing for A.
+    #[test]
+    fn load_game_seeds_the_restored_focus_into_the_boundary() {
+        let mut view = View::new().expect("data/ load");
+        let (center, r, mu, atm_top) = {
+            let env = view.sim.environment().expect("physics");
+            (
+                env.body_center,
+                env.radius_m,
+                env.mu_m3_per_s2,
+                env.atmosphere.as_ref().map_or(0.0, |a| a.top_m),
+            )
+        };
+        // Two orbiters on opposite sides of the same clearing orbit:
+        // A (id 0) coasts — it may rail off on the first tick and only
+        // needs to exist in the arena — while B (id 1) runs powered so
+        // it stays staged long enough for the focus boundary to record
+        // it as `active_vessel` (the `auto_rails` test's pattern).
+        let alt = atm_top.max(200_000.0) + 50_000.0;
+        let orb_r = r + alt;
+        let speed = (mu / orb_r).sqrt();
+        for sign in [1.0_f64, -1.0] {
+            view.enqueue_command(
+                SourceClass::Ui,
+                PLAYER_SOURCE_ID,
+                SimCommand::SpawnPhysicalVessel {
+                    craft: stock_flight_craft(),
+                    pos: center + csp_core::DVec3::new(sign * orb_r, 0.0, 0.0),
+                    rot: csp_core::DQuat::IDENTITY,
+                    vel: csp_core::DVec3::new(0.0, sign * speed, 0.0),
+                    ang_vel: csp_core::DVec3::ZERO,
+                },
+            );
+        }
+        view.enqueue_command(
+            SourceClass::Ui,
+            PLAYER_SOURCE_ID,
+            SimCommand::SetThrottle {
+                vessel: csp_sim::VesselId(1),
+                throttle: 1.0,
+            },
+        );
+        // Spawn drain → B stages as the newest vessel → the boundary
+        // tracks it and records `active_vessel`; the last step drains
+        // those commands so the snapshot lands at a §7.4 boundary.
+        for _ in 0..4 {
+            view.begin_frame();
+            view.sim_step(view.sim.clock().ticks() + 1).expect("step");
+            view.end_frame();
+        }
+        let a = csp_sim::VesselId(0);
+        let b = csp_sim::VesselId(1);
+        assert_eq!(
+            view.sim.active_vessel(),
+            Some(b),
+            "the boundary recorded B before the save"
+        );
+        let snap = view.sim.snapshot().expect("serializable");
+
+        // The stale half of the scenario: the previous session's last
+        // resolved focus named A's id (a foreign save's arena legit
+        // holds a different vessel on that id — the boundary cannot
+        // tell the ids apart, which is the collision under test).
+        view.world.resource_mut::<flight::FlightUiData>().focus = Some(a.0);
+        view.load_game(snap).expect("load");
+        assert_eq!(
+            view.resolved_focus(),
+            Some(b),
+            "the restored record resolves immediately, not the stale mirror"
+        );
+        // Two steps: the first runs `sync_focus_commands`; the second
+        // drains whatever it issued into the §7.6 log — which the
+        // restored world starts EMPTY, so every post-load issue is
+        // visible here.
+        for _ in 0..2 {
+            view.begin_frame();
+            view.sim_step(view.sim.clock().ticks() + 1).expect("step");
+            view.end_frame();
+        }
+        let focus_cmds: Vec<&SimCommand> = view
+            .sim
+            .command_log()
+            .iter()
+            .map(|(_, c)| c)
+            .filter(|c| {
+                matches!(
+                    c,
+                    SimCommand::SetVesselTracked { .. } | SimCommand::SetActiveVessel { .. }
+                )
+            })
+            .collect();
+        assert!(
+            focus_cmds.is_empty(),
+            "the restored track/active records already match the pin — \
+             the boundary must restamp nothing: {focus_cmds:?}"
+        );
+        assert_eq!(view.sim.active_vessel(), Some(b));
     }
 
     /// PLAN §11.80: `launch_craft` captures the pre-launch snapshot;
