@@ -604,8 +604,19 @@ impl HostCore {
         }
         std::fs::create_dir_all(&self.save_dir)
             .map_err(|e| BackendError::Session(format!("save dir: {e}")))?;
-        std::fs::write(self.save_path(name), bytes)
+        // The atomic-rename rule (C27-F2) — the same temp+rename
+        // discipline `DashboardStore::save` and the Game menu's
+        // `do_save` already follow. The target path is never opened
+        // for writing: a crash or mid-write failure leaves at worst a
+        // stray `.*.tmp`, and a failed overwrite keeps the previous
+        // good save intact instead of truncating it.
+        let tmp = self.save_dir.join(format!(".{name}.{SAVE_EXT}.tmp"));
+        std::fs::write(&tmp, &bytes)
             .map_err(|e| BackendError::Session(format!("write {name}: {e}")))?;
+        if let Err(e) = std::fs::rename(&tmp, self.save_path(name)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(BackendError::Session(format!("rename {name}: {e}")));
+        }
         Ok(info)
     }
 
@@ -1171,6 +1182,39 @@ mod tests {
         // must still land even at the cap.
         game.store_save("s0").expect("overwrite at cap");
         assert_eq!(game.list_saves().expect("list").len(), MAX_SAVES);
+        // C27-F2: the write went through temp+rename — a successful
+        // overwrite leaves no stray `.*.tmp` behind.
+        let stray_tmps = || -> Vec<String> {
+            std::fs::read_dir(&dir)
+                .expect("read save dir")
+                .flatten()
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| n.ends_with(".tmp"))
+                .collect()
+        };
+        assert!(stray_tmps().is_empty(), "{:?}", stray_tmps());
+        // …and a mid-write failure can never truncate the previous
+        // good save: the target is only ever renamed over, so the
+        // prior bytes must come back untouched. A directory planted
+        // at the tmp path makes the tmp write fail (EISDIR / access
+        // denied on every platform), standing in for a killed write.
+        let good = std::fs::read(dir.join("s0.cspsave")).expect("read good save");
+        let tmp_dir = dir.join(".s0.cspsave.tmp");
+        std::fs::create_dir(&tmp_dir).expect("plant blocking dir");
+        assert!(
+            game.store_save("s0").is_err(),
+            "a blocked tmp write must fail"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("s0.cspsave")).expect("re-read save"),
+            good,
+            "the previous good save must survive a failed overwrite"
+        );
+        std::fs::remove_dir(&tmp_dir).expect("unblock tmp path");
+        // Once unblocked the store recovers cleanly — and still
+        // leaves nothing but `*.cspsave` behind.
+        game.store_save("s0").expect("overwrite after failure");
+        assert!(stray_tmps().is_empty(), "{:?}", stray_tmps());
         let _ = std::fs::remove_dir_all(dir);
     }
 
