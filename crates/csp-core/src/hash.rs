@@ -216,7 +216,19 @@ use crate::SimError;
 /// tick the catch gates held, which anchors the inflation ramp the
 /// body's `DecelSite`s read. Hashed state deciding future forces;
 /// the goldens rebless.
-pub const HASH_SCHEMA_VERSION: u32 = 23;
+///
+/// **Version 24** (§3.5 insolvency consequences, C08-F2/F3): the
+/// `economy_cfg` walk appended `crew_salary_per_s`,
+/// `site_upkeep_funds_per_s`, and `attrition_grace_periods` (the
+/// authored hire default, the per-site facility upkeep, and the
+/// attrition grace — construction config that changes evolution),
+/// `hash_economy` appended `EconomyState::unpaid_salary_streak`,
+/// `EventKind` gained `StaffAttrition` (25 — `Clamping`) and
+/// `FacilityDormant` (26 — `Clamping`), `FundsReason` gained
+/// `SiteUpkeep` (10), and `NotificationKind` gained
+/// `StaffAttrition`/`FacilityDormant` — all appended, never
+/// renumbered. The goldens rebless.
+pub const HASH_SCHEMA_VERSION: u32 = 24;
 
 /// Rule-7 sum types: the source of an enum's *declared* stable `u16`
 /// discriminant (PLAN §7.1 rule 7).
