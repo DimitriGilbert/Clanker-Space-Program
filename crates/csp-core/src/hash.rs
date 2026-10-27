@@ -246,7 +246,18 @@ use crate::SimError;
 /// `ColonyDamaged` — both appended, never renumbered. Crewed
 /// colonies without a `LifeSupport` module now consume the baseline
 /// set in the network solve. The goldens rebless.
-pub const HASH_SCHEMA_VERSION: u32 = 26;
+///
+/// **Version 27** (C14-F3/F4 + C12 physics): the `CraftDef` node
+/// walk appended `PartNode::joint` — the snapped attach point in
+/// the parent's local frame, hashed as weld input because the §2.4
+/// joint-load torque arm now measures about it instead of the part
+/// origin. `Environment` gained `convective_heat_fraction` (the
+/// authored thermal η from `balance.ron`, construction config) and
+/// the aero-table binding key became a geometry-only walk
+/// (`hash_craft_geometry`) — mass is no longer key material.
+/// `PartNode`'s serialized layout changed, so pre-field replay logs
+/// do not decode; the goldens re-record via `record --force`.
+pub const HASH_SCHEMA_VERSION: u32 = 27;
 
 /// Rule-7 sum types: the source of an enum's *declared* stable `u16`
 /// discriminant (PLAN §7.1 rule 7).

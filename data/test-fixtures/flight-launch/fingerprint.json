@@ -7,8 +7,8 @@
   "rand_chacha": "0.10.0",
   "blake3": "1.8.3",
   "rhai": "1.27.0",
-  "hash_schema_version": 26,
+  "hash_schema_version": 27,
   "kdf_version": 1,
   "data_hash_version": 2,
-  "data_fixture_hash": "a02d53332b1b2e328af869d5acee293e739c35618e4772b6949b57af5daa21e7"
+  "data_fixture_hash": "86e758b2a1ba6c54e7a11997c9ebd6306c3900bd18e5ad68e284af5ff9c03d50"
 }
