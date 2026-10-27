@@ -4156,10 +4156,12 @@ impl World {
     /// supporter moves on.
     ///
     /// Returns the tick the range actually reached — `t_next`, or the
-    /// earlier tick the auto bubble→rails conversion fired at. An
+    /// earlier tick the auto bubble→rails conversion fired at, or the
+    /// completed flag tick of a `SurfaceLatched` support release. An
     /// early end is a real tick boundary (the conversion stamps
-    /// epoch-anchored elements there), so the caller advances clock,
-    /// subsystems, and event firing to the returned tick only.
+    /// epoch-anchored elements there; the release drains at that
+    /// tick's phase), so the caller advances clock, subsystems, and
+    /// event firing to the returned tick only.
     #[allow(
         clippy::too_many_lines,
         clippy::too_many_arguments,
@@ -4187,10 +4189,10 @@ impl World {
             // in mid-air forever. Parked records are static within the
             // range (no `InBubble` body exists to evolve the supporter
             // set), so the verdict is identical at `now` and at the
-            // grid boundary `t*` — evaluate once, release, then end
-            // the segment AT `t*` (the `rail_break` convention): the
-            // released hull is `InBubble` for the caller's next
-            // segment and integrates exactly `[t*, t_next)` under
+            // grid boundary `t*` — evaluate once, then release at
+            // `t* + 1`, the in-loop convention's flag-tick boundary:
+            // the released hull is `InBubble` for the caller's next
+            // segment and integrates exactly `[t* + 1, t_next)` under
             // every §2.6.1 partition.
             let parked = self.physics.is_some()
                 && self
@@ -4204,28 +4206,48 @@ impl World {
                     .physics
                     .as_ref()
                     .ok_or(SimError::Fatal("latched vessel but no physics"))?;
-                let mut released = false;
-                for vid in
-                    unsupported_statics(&self.vessels, physics, SimTime::from_ticks(boundary + 1))
-                {
-                    match self.unlatched_body(vid, shadow) {
-                        Ok(_) => released = true,
-                        Err(e @ SimError::Fatal(_)) => return Err(e),
-                        Err(e) => degraded.push(e),
-                    }
-                }
+                let floating =
+                    unsupported_statics(&self.vessels, physics, SimTime::from_ticks(boundary + 1));
                 if boundary > now {
+                    if !floating.is_empty() {
+                        // The release lands AT `boundary + 1` — the
+                        // probe's own effective tick — so the pose
+                        // restore and the reliability restamp inside
+                        // `unlatched_body` must read that tick's phase,
+                        // not the range-start `now` still on the clock
+                        // (the `apply_to_rails_at` epoch-stamp
+                        // precedent: `ω·(t*+1−now)` of anchor error on
+                        // a spinning body otherwise). Restored below —
+                        // `try_advance` counts from `now`.
+                        self.clock = SimTime::from_ticks(boundary + 1);
+                        let mut released = false;
+                        for vid in floating {
+                            match self.unlatched_body(vid, shadow) {
+                                Ok(_) => released = true,
+                                Err(e @ SimError::Fatal(_)) => return Err(e),
+                                Err(e) => degraded.push(e),
+                            }
+                        }
+                        self.clock = SimTime::from_ticks(now);
+                        if released {
+                            return Ok(boundary + 1);
+                        }
+                    }
                     return Ok(boundary);
                 }
-                if !released {
+                if floating.is_empty() {
                     // `boundary == now`, nothing floated: still all
                     // parked — the verdict is static within a parked
                     // range, so the early-return stands. (A nonzero
                     // `boundary` end would stall the advance loop.)
                     return Ok(t_next);
                 }
-                // `boundary == now` and hulls released: fall through —
-                // the freshly `InBubble` bodies integrate this range.
+                // `boundary == now` and hulls float: fall through
+                // WITHOUT releasing — the tick loop's own recheck
+                // fires at `t == now` (a grid tick), re-probes
+                // `now + 1`, and releases on the in-loop convention:
+                // post-loop, at `now + 1`, with the pose stamped at
+                // the release tick's phase.
             } else {
                 return Ok(t_next);
             }
@@ -4256,6 +4278,14 @@ impl World {
         // full bookkeeping surface). In-loop `InBubble`+latched
         // cases are released where they are found.
         let mut floating_surface: Vec<VesselId> = Vec::new();
+        // C12-F5's release boundary — the `rail_break` convention:
+        // a recheck that flags a floating `SurfaceLatched` hull ends
+        // the range at the completed flag tick `t + 1`, so the
+        // post-loop drain releases it at a FIXED tick under every
+        // §2.6.1 partition instead of at the containing segment's
+        // end (a partition artifact `ω·r·Δt` deep on a spinning
+        // body — the flag tick is a pure function of the grid).
+        let mut release_end: Option<u64> = None;
         // M8-C §3.5: debris impact points (environment frame) + the
         // tick each impact landed — the colony-radius damage check
         // runs once `self` is whole again and must anchor its recompute
@@ -4748,9 +4778,9 @@ impl World {
                             // (colony join, node scrub, reliability
                             // restamp) — the self-healing path made
                             // automatic. It needs the whole `self`,
-                            // so the release lands after the tick
-                            // loop (the pose restore is stamp-
-                            // independent, so this is bit-identical).
+                            // so the release drains after the tick
+                            // loop — at `release_end`'s `t + 1`, the
+                            // flag tick's own boundary (below).
                             floating_surface.push(vid);
                         }
                         Some(VesselState::InBubble(b)) if b.settle.latched => {
@@ -4763,6 +4793,9 @@ impl World {
                         }
                         _ => {}
                     }
+                }
+                if !floating_surface.is_empty() {
+                    release_end = Some(t + 1);
                 }
             }
             // M9b §3.4: the tick's collected side-effects land at
@@ -5156,8 +5189,23 @@ impl World {
                     break;
                 }
             }
+            // C12-F5's release boundary — the same early-end
+            // convention the rail break above uses: the flagged
+            // `SurfaceLatched` hulls release at the completed flag
+            // tick `t + 1`, a fixed boundary under every partition.
+            // The break sits at the tick's END so every one of
+            // tick `t`'s consequences (notifications, latch, joint
+            // lifecycle, the rail probe) still lands at `t + 1`
+            // exactly as a natural `t_next == t + 1` range would.
+            if release_end.is_some() {
+                break;
+            }
         }
-        let range_end = rail_break.as_ref().map(|(end, _)| *end).unwrap_or(t_next);
+        let range_end = rail_break
+            .as_ref()
+            .map(|(end, _)| *end)
+            .or(release_end)
+            .unwrap_or(t_next);
         // M9a: restore the pre-range clock — `step_frame`'s
         // `try_advance` moves `now → t_next` as before.
         self.clock = SimTime::from_ticks(now);
@@ -5196,16 +5244,27 @@ impl World {
         // floating — `unlatched_body` is the same self-healing path a
         // control unlatch takes, so colony joins, scheduled nodes,
         // pending part-failure events and reliability restamps all
-        // behave identically.
-        for vid in floating_surface {
-            match self.unlatched_body(vid, shadow) {
-                Ok(_) => {}
-                // A vessel removed mid-range (breakup, recovery) is
-                // a no-op, not a range fault — the `degraded`
-                // convention, same as `finish_burns`.
-                Err(e @ SimError::Fatal(_)) => return Err(e),
-                Err(e) => degraded.push(e),
+        // behave identically. The release lands AT `range_end` — the
+        // flag tick's completed boundary under every partition — so
+        // the clock must sit there while it drains:
+        // `surface_pose_restore` and the reliability restamp inside
+        // read `self.clock`, and the restored range-start `now` is
+        // `ω·(range_end − now)` stale on a spinning body (the
+        // `apply_to_rails_at` "range-START phase" bug class —
+        // lib.rs:6670's `set_sim_time(epoch)` precedent).
+        if !floating_surface.is_empty() {
+            self.clock = SimTime::from_ticks(range_end);
+            for vid in floating_surface {
+                match self.unlatched_body(vid, shadow) {
+                    Ok(_) => {}
+                    // A vessel removed mid-range (breakup, recovery)
+                    // is a no-op, not a range fault — the `degraded`
+                    // convention, same as `finish_burns`.
+                    Err(e @ SimError::Fatal(_)) => return Err(e),
+                    Err(e) => degraded.push(e),
+                }
             }
+            self.clock = SimTime::from_ticks(now);
         }
         self.finish_burns(&burns_done, range_end, shadow, degraded)?;
         // The auto bubble→rails conversion — the candidates detected
@@ -17430,6 +17489,204 @@ mod tests {
                 VesselState::SurfaceLatched(_)
             ),
             "a ground-supported hull must stay latched"
+        );
+    }
+
+    /// C12-F5 partition fix: a `SurfaceLatched` hull the support
+    /// recheck flags at grid tick `t*` must release at `t* + 1`
+    /// under EVERY §2.6.1 partition — the `rail_break` boundary
+    /// convention. The pre-fix drain landed at the containing
+    /// segment's end, so `[s,e1),[e1,e)` with `t* < e1 < e`
+    /// released at `e1` while the flat run released at `e` — the
+    /// same hull, different free-fall durations, different worlds.
+    #[test]
+    fn support_release_lands_at_flag_tick_every_partition() {
+        // Parked 100 m up on the 1-rad meridian (away from the
+        // keeper's sub-orbital track) — nothing beneath it at any
+        // spin phase.
+        let floating = || {
+            VesselState::SurfaceLatched(bubble::SurfacePose {
+                body: BodyId::from("p"),
+                latitude_rad: 0.0,
+                longitude_rad: 1.0,
+                altitude_m: 100.0,
+                orientation: csp_core::DQuat::IDENTITY,
+            })
+        };
+        let build = || {
+            let mut w = physics_world(true);
+            // The ballistic keeper keeps the world un-parked so the
+            // tick loop — and its mid-range support recheck — runs.
+            // (The all-parked fast path is exercised separately
+            // below.)
+            enqueue_orbiter(&mut w);
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::SpawnPhysicalVessel {
+                    craft: box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0),
+                    pos: DVec3::new(TERRIN_R + 100.0, 0.0, 0.0),
+                    rot: csp_core::DQuat::IDENTITY,
+                    vel: DVec3::ZERO,
+                    ang_vel: DVec3::ZERO,
+                },
+            );
+            w.step_frame(1).unwrap();
+            w.vessels.get_mut(&VesselId(1)).unwrap().state = floating();
+            w
+        };
+        // The flag fires at `t* = 64` — the first recheck-grid tick
+        // in the range — so the release must land at 65 wherever
+        // the caller's frame boundaries fall: parked through 64,
+        // `InBubble` from 65.
+        let mut flat = build();
+        flat.step_frame(64).unwrap();
+        assert!(
+            matches!(
+                flat.vessels()[&VesselId(1)].state,
+                VesselState::SurfaceLatched(_)
+            ),
+            "the recheck fires during tick 64 — still parked at its start"
+        );
+        flat.step_frame(65).unwrap();
+        assert!(
+            matches!(flat.vessels()[&VesselId(1)].state, VesselState::InBubble(_)),
+            "the release must land at t* + 1 = 65, not the range's end"
+        );
+        // Split at 100 — between the flag boundary 65 and the run
+        // end — the pre-fix release-landing artifact.
+        let mut split = build();
+        split.step_frame(100).unwrap();
+        split.step_frame(200).unwrap();
+        flat.step_frame(200).unwrap();
+        assert_eq!(flat.clock().ticks(), 200);
+        assert_eq!(split.clock().ticks(), 200);
+        assert_eq!(
+            flat.state_hash().unwrap(),
+            split.state_hash().unwrap(),
+            "the release must land at the same tick under every partition"
+        );
+    }
+
+    /// C12-F5 partition fix, all-parked arm: with no `InBubble`
+    /// body the recheck runs in `step_bubble_range`'s early path —
+    /// the release must still land at `t* + 1` under every
+    /// partition, including the segment that starts exactly AT the
+    /// grid tick (which falls through to the in-loop drain).
+    #[test]
+    fn support_release_all_parked_partition_independent() {
+        let floating = || {
+            VesselState::SurfaceLatched(bubble::SurfacePose {
+                body: BodyId::from("p"),
+                latitude_rad: 0.0,
+                longitude_rad: 0.0,
+                altitude_m: 100.0,
+                orientation: csp_core::DQuat::IDENTITY,
+            })
+        };
+        let build = || {
+            // A spinning world: the release's pose restore reads a
+            // spin phase, so a partition-dependent restore tick is
+            // `ω·r·Δt` of anchor error — visible in the hash, not a
+            // rounding nuance.
+            let mut w = physics_world(true);
+            spawn_physical(
+                &mut w,
+                SimCommand::SpawnPhysicalVessel {
+                    craft: box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0),
+                    pos: DVec3::new(TERRIN_R + 100.0, 0.0, 0.0),
+                    rot: csp_core::DQuat::IDENTITY,
+                    vel: DVec3::ZERO,
+                    ang_vel: DVec3::ZERO,
+                },
+            );
+            w.vessels.get_mut(&VesselId(0)).unwrap().state = floating();
+            w
+        };
+        let end = |w: &mut World, splits: &[u64]| {
+            for &t in splits {
+                w.step_frame(t).unwrap();
+            }
+        };
+        let mut flat = build();
+        flat.step_frame(64).unwrap();
+        assert!(
+            matches!(
+                flat.vessels()[&VesselId(0)].state,
+                VesselState::SurfaceLatched(_)
+            ),
+            "the recheck fires at the 64-grid boundary — still parked at 64"
+        );
+        flat.step_frame(65).unwrap();
+        assert!(
+            matches!(flat.vessels()[&VesselId(0)].state, VesselState::InBubble(_)),
+            "the release must land at t* + 1 = 65"
+        );
+        flat.step_frame(200).unwrap();
+        // Split mid-release (30 < 64), AT the grid boundary (64),
+        // and past the flag tick (100 > 65): every shape must agree.
+        for splits in [&[30u64, 200][..], &[64, 200][..], &[100, 200][..]] {
+            let mut w = build();
+            end(&mut w, splits);
+            assert_eq!(w.clock().ticks(), 200);
+            assert_eq!(
+                flat.state_hash().unwrap(),
+                w.state_hash().unwrap(),
+                "split at {splits:?}: release must land at 65 under every partition"
+            );
+        }
+    }
+
+    /// C12-F5 phase fix: the released hull's pose is restored at
+    /// the RELEASE tick's spin phase — the drain tick `t* + 1`,
+    /// not the range-start `now` the clock still sits at when the
+    /// post-loop drain runs (the `apply_to_rails_at` epoch-stamp
+    /// bug class). At Terrin's equator `ω·r ≈ 174.5 m/tick-s`, so a
+    /// stale `now` restore lands the anchor tens to hundreds of
+    /// metres off.
+    #[test]
+    fn support_release_restores_pose_at_release_tick() {
+        let pose = bubble::SurfacePose {
+            body: BodyId::from("p"),
+            latitude_rad: 0.0,
+            longitude_rad: 0.0,
+            altitude_m: 100.0,
+            orientation: csp_core::DQuat::IDENTITY,
+        };
+        let mut w = physics_world(true);
+        enqueue_orbiter(&mut w);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SpawnPhysicalVessel {
+                craft: box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0),
+                pos: DVec3::new(TERRIN_R + 100.0, 0.0, 0.0),
+                rot: csp_core::DQuat::IDENTITY,
+                vel: DVec3::ZERO,
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        w.step_frame(1).unwrap();
+        w.vessels.get_mut(&VesselId(1)).unwrap().state = VesselState::SurfaceLatched(pose.clone());
+        // The range starts at `now = 1`, flags at `t* = 64`, and
+        // drains the release at 65 — the hull integrates nothing
+        // yet, so its pose IS the verbatim restore at 65.
+        w.step_frame(65).unwrap();
+        let env = w.physics.as_ref().unwrap().backend.environment().clone();
+        let VesselState::InBubble(b) = &w.vessels()[&VesselId(1)].state else {
+            panic!("the recheck must have released the floating hull at 65");
+        };
+        let (release_phase, _, _, _) =
+            bubble::surface_pose_restore(&env, &pose, b.com_local, SimTime::from_ticks(65));
+        assert!(
+            (b.pos - release_phase).norm() < 1e-6,
+            "the released pose must be the restore at the release tick's phase"
+        );
+        let (stale_phase, _, _, _) =
+            bubble::surface_pose_restore(&env, &pose, b.com_local, SimTime::from_ticks(1));
+        assert!(
+            (b.pos - stale_phase).norm() > 100.0,
+            "a range-start-phase restore sits ~175 m east — the fix pins the release tick"
         );
     }
 
