@@ -7746,6 +7746,18 @@ impl World {
         if let Some(p) = self.physics.as_mut() {
             p.aero.remove(&vessel);
         }
+        // C10-F1: refuse the split pair before returning — without
+        // the refusal the next tick's `joints::lifecycle` detection
+        // re-captures the still-mated, zero-relative-speed halves and
+        // a following `latch_pass` re-merges them, making the undock
+        // a silent no-op on the live path (command → re-capture same
+        // tick → re-merge next tick). This reuses §2.4's refusal
+        // lifecycle: the entry self-prunes once the pair leaves
+        // capture geometry, so a later genuine re-approach
+        // re-attempts normally. `shadow_vessel` above already
+        // captured `joint_refused`, so a command rollback drops this
+        // insert with the rest of the split.
+        self.joint_refused.insert((vessel.min(id), vessel.max(id)));
         self.ensure_aero(vessel)
     }
 
@@ -19641,7 +19653,12 @@ mod tests {
 
     /// Undock splits the merged vessel at the seam: retained keeps the
     /// primary's graph BITWISE (merge only added nodes), the fragment
-    /// carries the secondary's subtree at the seam's transform.
+    /// carries the secondary's subtree at the seam's transform — and
+    /// the split must SURVIVE the live loop (C10-F1: pre-refusal the
+    /// undock tick's lifecycle re-captured the still-mated pair and
+    /// the next `latch_pass` re-merged it, so one-tick stepping
+    /// certified a split the loop undid; ≥3 ticks covers
+    /// capture → latch → settle).
     #[test]
     fn undock_splits_at_seam_and_restores_two_vessels() {
         let mut w = physics_world(false);
@@ -19665,8 +19682,19 @@ mod tests {
                 node: seam_node,
             },
         );
-        w.step_frame(w.clock().ticks() + 1).unwrap();
-        assert_eq!(w.vessels().len(), 2, "undock must split into two");
+        // Three ticks, not one: the command drains on the first, and
+        // the two that follow are where the pre-C10-F1 live loop
+        // re-captured and re-merged the pair.
+        w.step_frame(w.clock().ticks() + 3).unwrap();
+        assert_eq!(
+            w.vessels().len(),
+            2,
+            "undock must split into two — and stay split"
+        );
+        assert!(
+            w.joints().is_empty(),
+            "the refused pair must not re-capture while still posed"
+        );
         let retained = &w.vessels()[&VesselId(0)];
         let detached = &w.vessels()[&VesselId(2)];
         // Retained: the seam is consumed, the graph is the primary's
@@ -19687,6 +19715,59 @@ mod tests {
         // Both bodies welded: mass split back to the two boxes.
         assert_eq!(retained.body().unwrap().mass_kg, 1000.0);
         assert_eq!(detached.body().unwrap().mass_kg, 1000.0);
+    }
+
+    /// C10-F1 regression, through the real command path only: spawn →
+    /// capture → latch-merge → `SimCommand::Undock` → keep stepping.
+    /// Pre-fix, the undock tick's own `joints::lifecycle` detection
+    /// re-captured the still-mated zero-rel-speed halves (the pair was
+    /// never in `joint_refused`) and the next tick's `latch_pass`
+    /// re-merged them — the command silently undid itself in 2 ticks.
+    /// `apply_undock` now plants the canonical pair in `joint_refused`,
+    /// which detection skips and whose entry self-prunes only once the
+    /// halves leave capture geometry.
+    #[test]
+    fn undock_refuses_recapture_on_the_live_path() {
+        let mut w = physics_world(false);
+        spawn_port_pair(&mut w, DVec3::new(0.0, 0.0, 1.8), flip_rot());
+        step_until(&mut w, 192, |w| {
+            w.joints().is_empty() && w.vessels().len() == 1
+        });
+        assert_eq!(w.vessels().len(), 1, "the pair must have latch-merged");
+        let seam_node = w.vessels()[&VesselId(0)].seams[0].seam_node;
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::Undock {
+                vessel: VesselId(0),
+                node: seam_node,
+            },
+        );
+        // The refusal lands inside the undock tick itself — detection
+        // runs after the command drain in the same range step, so the
+        // pair must already be recorded when lifecycle sees it.
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert_eq!(w.vessels().len(), 2);
+        assert!(
+            w.joints().is_empty(),
+            "the split pair must not re-capture on the undock tick"
+        );
+        assert!(
+            w.joint_refused.contains(&(VesselId(0), VesselId(2))),
+            "undock must refuse the split pair while it sits posed"
+        );
+        // Two more ticks cover the window where a captured joint would
+        // settle and re-merge — the split must persist untouched.
+        w.step_frame(w.clock().ticks() + 2).unwrap();
+        assert_eq!(
+            w.vessels().len(),
+            2,
+            "undock must stay split — re-capture + re-merge makes it a no-op"
+        );
+        assert!(
+            w.joints().is_empty(),
+            "no joint may re-form while the pair sits refused"
+        );
     }
 
     /// Undock rejects cleanly: unknown vessel, no such seam, non-bubble.
@@ -19888,6 +19969,17 @@ mod tests {
         let dl2 = (l3 - l2).norm() / l2.norm().max(1.0);
         assert!(dp2 < 1e-9, "split linear momentum error {dp2:e}");
         assert!(dl2 < 1e-9, "split angular momentum error {dl2:e}");
+        // C10-F1: the direct apply still owes the live path its
+        // refusal — the split pair must sit in `joint_refused` so the
+        // next ticks' detection cannot re-capture the still-mated
+        // halves and re-merge them.
+        assert!(
+            w.joint_refused.contains(&(VesselId(0), VesselId(2))),
+            "undock must refuse the pair it split"
+        );
+        w.step_frame(w.clock().ticks() + 3).unwrap();
+        assert_eq!(w.vessels().len(), 2, "the split must survive the live loop");
+        assert!(w.joints().is_empty(), "no re-capture while refused");
     }
 
     /// A test vessel: a `port_craft` at an authored pose — same
