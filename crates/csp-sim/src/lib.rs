@@ -324,7 +324,7 @@ pub struct Vessel {
     /// record lives on the vessel (not the body) so it survives the
     /// body's re-welds and bubble↔rails↔latched transitions.
     pub thermal: VesselThermal,
-    /// M4c debris bookkeeping (§2.9's object caps): `Some(created_tick)`
+    /// M4c debris bookkeeping (§3.5's object caps): `Some(created_tick)`
     /// marks this vessel as breakup debris — counted against
     /// `max_debris` with oldest-first eviction (the pair
     /// `(debris_since, id)` is the deterministic eviction order), removed
@@ -1458,7 +1458,7 @@ pub struct WorldSnapshot {
     /// The event heap's contents in `(tick, seq)` order — the canonical
     /// enumeration; restore re-heapifies deterministically.
     pub event_heap: Vec<ScheduledEvent>,
-    /// §2.9's object caps — construction config, serialized so a
+    /// §3.5's object caps — construction config, serialized so a
     /// restored world enforces the same limits.
     pub vessel_caps: VesselCaps,
     /// §2.4's docking tunables — construction config, serialized so a
@@ -1645,7 +1645,7 @@ pub struct WorldConfig {
     pub recipes: BTreeMap<csp_data::RecipeId, csp_data::RecipeDef>,
 }
 
-/// §2.9's object caps — construction config (from `balance.ron`),
+/// §3.5's object caps — construction config (from `balance.ron`),
 /// serialized and hashed like `event_budget` because they change
 /// state evolution (spawn rejections, debris eviction).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -1659,9 +1659,11 @@ pub struct VesselCaps {
 
 /// Mirror of `balance.ron`'s caps for data-less worlds (unit tests,
 /// the wasm slice) — the same roles as [`DEFAULT_MAX_EVENTS_PER_FRAME`].
-/// The arena is effectively unbounded (`u64::MAX`): unlimited craft in
-/// flight is a product rule, so the cap only ever bounds `max_debris`.
-pub const DEFAULT_MAX_VESSELS: u64 = u64::MAX;
+/// §3.5 authors `max_tracked_vessels = 512` ("the sim and save must not
+/// grow without bound over 100 sim-years of launches"); the shipped
+/// `data/balance.ron` and this default agree — a `csp-bench` mirror
+/// test pins them.
+pub const DEFAULT_MAX_VESSELS: u64 = 512;
 /// See [`DEFAULT_MAX_VESSELS`].
 pub const DEFAULT_MAX_DEBRIS: u64 = 64;
 
@@ -2298,7 +2300,7 @@ pub struct World {
     /// order follows the §2.6.5 subsystem order array, the counter is
     /// hashed sim state.
     next_event_seq: u64,
-    /// §2.9's vessel/debris caps — construction config, hashed and
+    /// §3.5's vessel/debris caps — construction config, hashed and
     /// serialized (they change state evolution).
     caps: VesselCaps,
     /// §2.4's docking tunables — construction config, hashed and
@@ -2633,7 +2635,7 @@ impl World {
         }
     }
 
-    /// §2.9's object caps — post-construction setter for worlds built
+    /// §3.5's object caps — post-construction setter for worlds built
     /// from `balance.ron` ([`View`](csp_view)-side startup,
     /// `csp-bench` scenario setup). A construction-config write like
     /// [`Self::with_physics`]: call before the first `step_frame`.
@@ -2687,7 +2689,7 @@ impl World {
         &self.autopilots
     }
 
-    /// §2.9's cap accounting — every live build order has already
+    /// §3.5's cap accounting — every live build order has already
     /// reserved the vessel slot its `ConstructionComplete` delivery
     /// needs (the `apply_manufacture_craft` reservation), so every
     /// arena-growing path must count vessels + in-flight builds, not
@@ -4764,7 +4766,7 @@ impl World {
                     shadow,
                 )?;
             }
-            // §2.9's `max_debris` — oldest-debris eviction by
+            // §3.5's `max_debris` — oldest-debris eviction by
             // `(debris_since, id)`, deterministic per the plan.
             loop {
                 let mut count = 0u64;
@@ -5210,7 +5212,7 @@ impl World {
             .collect();
     }
 
-    /// §2.9's debris-decay scheduling: after `ToRails` stamps the
+    /// §3.5's debris-decay scheduling: after `ToRails` stamps the
     /// debris vessel's conic, if its periapsis dips below the parent's
     /// atmosphere top (or the surface on an airless body) the vessel
     /// burns up / impacts there — schedule `DebrisDecay` at the next
@@ -11622,7 +11624,7 @@ fn transition_latched(
 /// aero table until a Stage-2 recompute lands (the `ensure_aero`
 /// graph-hash staleness check rebuilds it), and start
 /// `aero_mask`-active with throttle zeroed — debris has no crew.
-/// Beyond `caps.max_vessels` a fragment is dropped (§2.9's cap;
+/// Beyond `caps.max_vessels` a fragment is dropped (§3.5's cap;
 /// documented, deterministic) — and in-flight build orders count
 /// against that cap (`pending_builds`), since each has already
 /// reserved the vessel slot its delivery needs.
@@ -11792,7 +11794,7 @@ fn apply_breakup(
         Vec::new();
     for &d in &frag_roots {
         if vessels.len() as u64 + pending_builds >= caps.max_vessels {
-            break; // §2.9 cap — fragments beyond it are discarded
+            break; // §3.5 cap — fragments beyond it are discarded
         }
         let members = &members_of[&d];
         let frag_g = csp_phys::fragment_graph_of(&craft.graph, &transforms, d, members)

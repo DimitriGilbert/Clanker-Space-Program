@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use csp_data::{
     G0, LoadedExperiments, LoadedParts, LoadedRecipes, LocFile, ModuleDef, PartDef, ResourceFile,
-    load_experiments, load_parts, load_recipes, load_resources, validate_part_loc_keys,
+    load_experiments, load_parts, load_recipes, load_resources, load_sites, validate_part_loc_keys,
     validate_parts, validate_resources,
 };
 
@@ -97,7 +97,7 @@ fn resources_validate_green() {
 fn authored_parts_load_and_validate_green() {
     let loaded = parts();
     let res = resources();
-    assert_eq!(loaded.parts.len(), 16, "the authored set is 16 parts");
+    assert_eq!(loaded.parts.len(), 17, "the authored set is 17 parts");
     let errs = validate_parts(&loaded, &res, &recipes(), &experiments());
     assert!(errs.is_empty(), "validator errors: {errs:#?}");
 }
@@ -300,4 +300,95 @@ fn authored_set_exercises_the_schema() {
     }
     assert_eq!(masses["electric_charge"], 0.0);
     assert!(masses["liquid_fuel"] > 0.0);
+}
+
+/// §3.5's logistics carrier (fix-plan 3.1): the authored set must
+/// include a tank that can hold the build/stock resources — without
+/// one, `vessel_capacity` is zero for them and no designed path can
+/// move colony ISRU output (the "resources ◄── colonies/ISRU" edge)
+/// or complete an ore resupply draw. `csp.tank.ore.s` is that part;
+/// this pins the cargo set its Tank declares.
+#[test]
+fn ore_cargo_tank_is_authored_and_valid() {
+    let loaded = parts();
+    let tank = def(&loaded, "csp.tank.ore.s");
+    let caps: BTreeMap<&str, f64> = tank
+        .modules
+        .iter()
+        .flat_map(|m| match m {
+            ModuleDef::Tank { capacity } => capacity
+                .iter()
+                .map(|(r, units)| (r.as_str(), *units))
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        })
+        .collect();
+    for res in ["ore", "metal", "composite"] {
+        assert!(
+            caps.get(res).copied().unwrap_or(0.0) > 0.0,
+            "the cargo carrier holds no {res} — the §3.5 supply edge is unwired again"
+        );
+    }
+    // The whole set still validates — the tank's resource ids resolve
+    // against resources.ron.
+    let errs = validate_parts(&loaded, &resources(), &recipes(), &experiments());
+    assert!(errs.is_empty(), "validator errors: {errs:#?}");
+}
+
+/// The starter-craft fuse, priced from the files: the Stock Hopper
+/// (`csp-view`'s seeded starter — pod + canister + battery + s160 +
+/// sparc) BOM is what `ManufactureCraft` debits from terrin-launch's
+/// `starting_stock`, so `floor(stock / bom)` is the launch count the
+/// pad supports before the supply loop must run. Any part re-price
+/// or stockpile re-size moves this number — the test is the fuse's
+/// ledger so the drift is loud, not silent.
+#[test]
+fn starter_craft_bom_sets_the_site_fuse() {
+    let loaded = parts();
+    let mut metal = 0.0;
+    let mut composite = 0.0;
+    for id in [
+        "csp.pod.mk1",
+        "csp.science.canister",
+        "csp.battery.z1k",
+        "csp.tank.s160",
+        "csp.engine.sparc",
+    ] {
+        for (r, units) in &def(&loaded, id).build_resources {
+            match r.as_str() {
+                "metal" => metal += units,
+                "composite" => composite += units,
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(metal, 163.0, "starter-craft metal BOM re-priced");
+    assert_eq!(composite, 16.0, "starter-craft composite BOM re-priced");
+
+    let sites = load_sites(&repo_root().join("data/systems/home/sites.ron")).unwrap();
+    let pad = sites
+        .sites
+        .iter()
+        .find(|s| s.id.as_str() == "terrin-launch")
+        .unwrap();
+    let stock = |res: &str| {
+        pad.starting_stock
+            .iter()
+            .find(|(r, _)| r.as_str() == res)
+            .map(|(_, u)| *u)
+            .unwrap_or(0.0)
+    };
+    // 2000/163 ≈ 12.27 → metal binds at 12 builds; 400/16 = 25 →
+    // composite is never the constraint at this ratio.
+    assert!(
+        stock("metal") / metal < stock("composite") / composite,
+        "composite now binds before metal — re-check the stockpile ratio"
+    );
+    let fuse = (stock("metal") / metal)
+        .min(stock("composite") / composite)
+        .floor();
+    assert_eq!(
+        fuse, 12.0,
+        "the starter-craft launch fuse moved — re-check §3.5 stockpile sizing"
+    );
 }

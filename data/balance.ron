@@ -9,10 +9,12 @@
     // PLAN:548 / §2.6.5: `advance_to` processes at most this many events per
     // frame; overflow continues next frame as a Clamping-class event.
     advance_to_max_events_per_frame: 2_000,
-    // PLAN §2.9 object caps: the vessel arena is effectively unbounded
-    // (u64::MAX — unlimited craft in flight); the debris cap stays
-    // (oldest-first eviction under breakup back-pressure).
-    max_tracked_vessels: 18446744073709551615,
+    // PLAN §3.5 object caps: `max_tracked_vessels = 512` bounds the
+    // vessel arena — the plan's number for "the sim and save must not
+    // grow without bound over 100 sim-years of launches"; the debris
+    // cap stays (oldest-first eviction under breakup back-pressure).
+    // Mirror: `csp_sim::DEFAULT_MAX_VESSELS`.
+    max_tracked_vessels: 512,
     max_debris: 64,
     // PLAN §2.4: hard cap 16 live transient joints per bubble; creation
     // beyond the cap degrades to an immediate clean separation.

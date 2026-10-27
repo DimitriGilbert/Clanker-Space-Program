@@ -4274,6 +4274,70 @@ mod tests {
         id
     }
 
+    /// The multi-cargo variant of `latched_vessel`: one part carrying
+    /// every `(resource, capacity, fill)` tank row — the
+    /// `csp.tank.ore.s` shape the §3.5 supply loop needs (a real ore
+    /// carrier holds several stock resources at once).
+    fn latched_vessel_multi(w: &mut World, tanks: &[(&str, f64, f64)]) -> VesselId {
+        let id = VesselId(w.next_vessel_id);
+        w.next_vessel_id += 1;
+        let mut craft = tank_craft(tanks[0].0, tanks[0].1);
+        let part = &mut craft.parts[0];
+        for (res, cap, _) in &tanks[1..] {
+            part.tanks.push(csp_phys::TankSpec {
+                resource: ResourceId::from(*res),
+                capacity: *cap,
+                mass_per_unit_kg: 1.0,
+            });
+        }
+        // Keep the `check_tank_masses` convention honest: the part's
+        // mass covers a full wet load (the resolver's wet-mass rule).
+        let full_wet: f64 = part
+            .tanks
+            .iter()
+            .map(|t| t.capacity * t.mass_per_unit_kg)
+            .sum();
+        part.mass_kg = 100.0 + full_wet;
+        part.inertia =
+            csp_phys::SymMat3::solid_box(part.mass_kg, csp_core::DVec3::new(0.5, 0.5, 0.5));
+        let mut tank_contents = crate::transfers::spawn_contents(&craft);
+        for (res, _, fill) in tanks {
+            for stores in tank_contents.values_mut() {
+                if let Some(c) = stores.get_mut(&ResourceId::from(*res)) {
+                    *c = *fill;
+                }
+            }
+        }
+        let thermal = crate::VesselThermal::at_ambient(&craft.graph, 288.0);
+        w.vessels.insert(
+            id,
+            crate::Vessel {
+                id,
+                craft: Some(craft),
+                state: VesselState::SurfaceLatched(crate::SurfacePose {
+                    body: BodyId::from("terra"),
+                    latitude_rad: 0.0,
+                    longitude_rad: 0.000001,
+                    altitude_m: 0.0,
+                    orientation: csp_core::DQuat::IDENTITY,
+                }),
+                aero_mask: csp_phys::ConfigMask::ALL,
+                thermal,
+                debris_since: None,
+                maneuver: None,
+                seams: Vec::new(),
+                tank_contents,
+                crew: Vec::new(),
+                science: crate::VesselScience::default(),
+                joined_colony: None,
+                reliability: BTreeMap::new(),
+                control_lease: crate::Lease::Player,
+                deployed: BTreeMap::new(),
+            },
+        );
+        id
+    }
+
     /// Drill rate = base·min(1, yield/min_concentration): a site
     /// yielding 0.5 against min_concentration 1.0 runs the drill at
     /// half its base rate — ore fills at 0.25 u/s while the EC draw
@@ -4569,6 +4633,106 @@ mod tests {
         assert!(
             (crate::transfers::vessel_resource(&w.vessels()[&vessel], &ore) - 20.0).abs() < 1e-9
         );
+    }
+
+    /// §3.5's "resources ◄── colonies/ISRU" edge, end to end
+    /// (fix-plan 3.1, route (b)): a cargo vessel delivers ore
+    /// vessel→colony (the `colony_resupply` direction), loads colony
+    /// metal colony→vessel, and `RecoverVessel` at the site credits
+    /// the tank CONTENTS to the site's inventory at the recovery
+    /// efficiency — the run that refills `starting_stock`. Every leg
+    /// rides shipped commands; the only thing the sim ever lacked was
+    /// a tank that could hold the cargo.
+    #[test]
+    fn colony_cargo_loop_credits_site_inventory() {
+        let mut w = colony_world();
+        let ore = ResourceId::from("ore");
+        let metal = ResourceId::from("metal");
+        found(
+            &mut w,
+            vec![
+                gen_module(10.0),
+                ColonyModuleDef::Store {
+                    resource: ore.clone(),
+                    capacity: 100.0,
+                },
+                ColonyModuleDef::Store {
+                    resource: metal.clone(),
+                    capacity: 100.0,
+                },
+            ],
+            vec![csp_data::ColonyStoreInit {
+                resource: metal.clone(),
+                level: 80.0,
+            }],
+        );
+        let colony = *w.colonies().keys().next().unwrap();
+        // The cargo carrier: 40 ore aboard for delivery, an empty
+        // metal tank for the ride home.
+        let vessel = latched_vessel_multi(&mut w, &[("ore", 100.0, 40.0), ("metal", 100.0, 0.0)]);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::JoinColonyInventory { vessel, colony },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        // Leg 1 — resupply: 20 ore vessel→colony (2 s pipe).
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::TransferColonyResource {
+                vessel,
+                colony,
+                resource: ore.clone(),
+                amount: 20.0,
+                to_colony: true,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        // Leg 2 — the export: 60 metal colony→vessel (6 s pipe).
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::TransferColonyResource {
+                vessel,
+                colony,
+                resource: metal.clone(),
+                amount: 60.0,
+                to_colony: false,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        // Past both pipes (the metal leg is the long one): the vessel
+        // rides home with 20 ore + 60 metal.
+        w.step_frame(w.clock().ticks() + 384 + 1).unwrap();
+        assert!(
+            (crate::transfers::vessel_resource(&w.vessels()[&vessel], &ore) - 20.0).abs() < 1e-9
+        );
+        assert!(
+            (crate::transfers::vessel_resource(&w.vessels()[&vessel], &metal) - 60.0).abs() < 1e-9
+        );
+        // The colony's books balance: +20 ore in, −60 metal out.
+        let co = &w.colonies()[&colony];
+        let now = w.clock().ticks();
+        assert!((co.stores[&ore].level_at(now) - 20.0).abs() < 1e-9);
+        assert!((co.stores[&metal].level_at(now) - 20.0).abs() < 1e-9);
+        // Leg 3 — recovery at the site lands the contents at the
+        // recovery efficiency (the test site is not a launch site:
+        // `recovery_efficiency` 0.9 applies).
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RecoverVessel {
+                vessel,
+                site: Some(SiteId::from("pad")),
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(!w.vessels().contains_key(&vessel));
+        let eff = w.economy_config().recovery_efficiency;
+        let inv = &w.economy().sites[&SiteId::from("pad")].inventory;
+        assert!((inv[&ore] - 20.0 * eff).abs() < 1e-9, "ore {inv:?}");
+        assert!((inv[&metal] - 60.0 * eff).abs() < 1e-9, "metal {inv:?}");
     }
 
     /// Out of range rejects the join — a vessel latched a radian

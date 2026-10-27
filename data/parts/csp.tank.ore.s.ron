@@ -1,0 +1,87 @@
+// csp.tank.ore.s — "Hauler" ore/cargo carrier (§3.1 PartDef).
+// Hand-authored fiction — numbers frozen at M8-B.
+//
+// The part that makes §3.5's "resources ◄── colonies/ISRU" edge
+// reachable (fix-plan 3.1, route (b)): a cargo bay is just a `Tank`
+// ("§3.5: a Cargo bay is just a Tank with ResourceId capacity") and
+// the colony→vessel `TransferColonyResource` end already exists —
+// it was dead only because no tank could hold the cargo. `ore`
+// covers `contract.colony_resupply` draws; `metal`/`composite` let
+// colony smelter output ride home and credit the recovery site's
+// inventory via `RecoverVessel`'s contents credit (1.0 at the
+// launch pad).
+//
+// Like every tank in the set it builds FULL at manufacture — the
+// contents ride the build order the same way propellant does on
+// the Drum tanks; the BOM buys the hull.
+//
+// 200 u ore covers a mid-range resupply draw in one run, 60 u metal
+// matches the rask-mines store cap, and 30 u composite is ~2
+// starter-craft BOMs' worth. Wet load ≈ 2.84 t at resources.ron
+// densities (ore/metal 10 kg/u, composite 8). 1.25-class stack
+// interfaces — the inline-mount convention; Continuous scaling for
+// the hauler that has to grow with the colony.
+(
+    schema_version: 1,
+    id: "csp.tank.ore.s",
+    family: "csp.family.tank.s",
+    display_name: "part.csp.tank.ore.s.name",
+    category: FuelTank,
+    mass_dry_kg: 160.0,
+    cost_funds: 700.0,
+    size_m: (x: 1.25, y: 1.25, z: 1.6),
+    build_resources: [("metal", 18.0), ("composite", 4.0)],
+    attach_nodes: [
+        (id: "top",    position_m: (x: 0.0, y: 0.0, z: 0.8),  direction: (x: 0.0, y: 0.0, z: 1.0),  diameter_m: 1.25),
+        (id: "bottom", position_m: (x: 0.0, y: 0.0, z: -0.8), direction: (x: 0.0, y: 0.0, z: -1.0), diameter_m: 1.25),
+    ],
+    scale: Continuous(
+        min: 0.5,
+        max: 2.0,
+        exponents: (mass: 3.0, cost: 3.0, thrust: 0.0, capacity: 3.0, structural: 2.0),
+    ),
+    collider: Cylinder(radius_m: 0.625, half_height_m: 0.8),
+    aero: (
+        cd_curve: [(mach: 0.0, coeff: 0.45), (mach: 8.0, coeff: 0.3)],
+        cl_curve: [(mach: 0.0, coeff: 0.0)],
+        ref_len_m: 1.6,
+    ),
+    thermal: (
+        heat_capacity_j_per_k: 120_000.0,
+        max_temp_k: 900.0,
+        emissivity: 0.6,
+        conduction_w_per_k: 70.0,
+    ),
+    structural: (
+        max_axial_n: 500_000.0,
+        max_shear_n: 180_000.0,
+        max_torque_nm: 25_000.0,
+    ),
+    variants: [
+        (id: "stock", display_name: "part.variant.stock", cost_multiplier: 1.0, stat_multipliers: []),
+    ],
+    modules: [
+        // One Tank, three cargo resources — the colony-logistics set:
+        // ore for resupply contracts, metal/composite for the
+        // ISRU→site loop.
+        Tank(capacity: [("ore", 200.0), ("metal", 60.0), ("composite", 30.0)]),
+    ],
+    reliability: (
+        base_mtbf_s: 3_500_000.0,
+        infant_mortality: 0.04,
+        qualification_curve: (knots: [
+            (qualification_units: 0.0,   hazard_multiplier: 1.0),
+            (qualification_units: 100.0, hazard_multiplier: 0.5),
+        ]),
+        regime_stress: [
+            (kind: Overtemperature, threshold: 0.9,  multiplier: 3.0),
+            (kind: ExcessG,         threshold: 15.0, multiplier: 1.5),
+        ],
+        dormant_stress: 0.005,
+        failure_modes: [
+            (Leak,        0.7),
+            (SensorFault, 0.3),
+        ],
+    ),
+    tech_requirement: "tech.rocketry.2",
+)

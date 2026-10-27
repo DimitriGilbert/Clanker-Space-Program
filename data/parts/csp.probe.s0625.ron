@@ -5,8 +5,9 @@
 // `Control`-only module stack (no `CrewSeat`, nobody to feed) so a
 // probe bus holds attitude and stays controllable with no one
 // aboard — the `contract.satellite` payload bus's brain.
-// 0.625-class stack nodes match the small-part size class the
-// nose cone and payload mounts share.
+// 1.25-class stack nodes on a 0.625 m bus — the inline-mount
+// convention the canister and battery set for small parts; the
+// "s0625" in the id names the body, not the interface.
 (
     schema_version: 1,
     id: "csp.probe.s0625",

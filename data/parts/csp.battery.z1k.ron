@@ -4,7 +4,8 @@
 // A battery is a Tank of electric_charge (§3.5: "a Cargo bay is just a
 // Tank" — the same trick, applied to charge). 1 000 units of a
 // massless resource: capacity is real, wet-mass delta is zero.
-// 0.625 m node class — mounts under pods and small structures.
+// 1.25 m node class on a 0.625 m body — mounts inline mid-stack
+// under pods (the canister precedent).
 (
     schema_version: 1,
     id: "csp.battery.z1k",

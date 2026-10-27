@@ -1,0 +1,15 @@
+// Composite synthesis — the colony's second ISRU recipe: smelted
+// metal plus more ore sintered into the composite stock the
+// electronics-heavy parts consume (§3.5: "advanced parts need
+// Composite, which is import-only at first" — this is the recipe a
+// colony grows into). Chained, not parallel: it eats
+// `recipe.smelt_ore`'s product, so the recipe graph stays acyclic;
+// 4 units in for 1 out keeps the converter net-negative like its
+// siblings.
+(
+    schema_version: 1,
+    id: "recipe.composite",
+    display_name: "recipe.composite.name",
+    inputs: [("ore", 3.0), ("metal", 1.0)],
+    outputs: [("composite", 1.0)],
+)
