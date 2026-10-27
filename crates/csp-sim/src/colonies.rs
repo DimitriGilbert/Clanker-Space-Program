@@ -6951,4 +6951,318 @@ mod tests {
         );
         assert_eq!(w.colonies().len(), 1);
     }
+
+    /// The fix-plan's phase-3-level validation: ONE coherence pass
+    /// over the whole §3.5 economy loop, every leg a real
+    /// `SimCommand` a shipped game can issue — no leg may dead-end:
+    ///
+    ///   found (funds debited, C21-F8) → crew (LS-gated, C09-F4) →
+    ///   earn (resupply accept → ore delivery → complete, C34-F1) →
+    ///   produce (drill + converter ore→metal, C09-F1) → haul back
+    ///   (the ore-tank hauler, C33-F1) → recover (site inventory +
+    ///   part value credited) → spend (ManufactureCraft BOM +
+    ///   funds, C11-F4).
+    ///
+    /// The loop's honesty is the assertion: the colony's own
+    /// hauled-back metal is literally the build's BOM — recover →
+    /// site inventory → manufacture is the resource edge §3.5's
+    /// diagram demands. The craft shapes are the test harness's
+    /// sandbox convention (no parts catalog → `verify_bill`'s
+    /// envelope no-ops; the catalog-verified path is covered by
+    /// `manufacture::tests`), matching `latched_vessel_multi`'s
+    /// `csp.tank.ore.s` hauler shape.
+    #[allow(clippy::too_many_lines, clippy::cognitive_complexity)] // the loop's legs read as one pass
+    #[test]
+    fn economy_loop_end_to_end() {
+        let ore = ResourceId::from("ore");
+        let metal = ResourceId::from("metal");
+        // A launch pad (recovery credit at 1.0 + the manufacture
+        // bill site) on terra, and a bare outpost site for the
+        // LS-gate leg.
+        let mut w = World::with_system(test_system());
+        w.set_colony_env(test_env());
+        let mut pad = test_site();
+        pad.launch = true;
+        let mut mine = test_site();
+        mine.id = SiteId::from("mine");
+        w.set_sites(BTreeMap::from([
+            (SiteId::from("pad"), pad),
+            (SiteId::from("mine"), mine),
+        ]));
+        w.set_life_support_enabled(true);
+        // The ore→metal smelter — the converter leg's recipe.
+        let mut recipes = BTreeMap::new();
+        let smelt = conv(
+            &mut recipes,
+            "smelt",
+            vec![(ore.clone(), 1.0)],
+            vec![(metal.clone(), 0.5)],
+            5,
+            0.5,
+        );
+        w.set_recipes(recipes);
+        let t = resupply_template();
+        w.set_contracts(BTreeMap::from([(t.id.clone(), t)]));
+
+        // ── Found: the cost debits before the colony exists. ──
+        let founding = w.economy_config().colony_founding_cost_micros;
+        let funds0 = w.funds_micros();
+        let r = found(
+            &mut w,
+            vec![
+                gen_module(10.0), // RTG — 10 EC/s through day and night
+                ColonyModuleDef::Battery { capacity: 500.0 },
+                ColonyModuleDef::LifeSupport {
+                    consumes_per_crew: vec![
+                        (ResourceId::from("oxygen"), 0.02),
+                        (ResourceId::from("food"), 0.005),
+                    ],
+                    power_ec_per_s: 0.05,
+                },
+                ColonyModuleDef::Drill {
+                    resource: ore.clone(),
+                    base_rate_per_s: 1.0,
+                    min_concentration: 1.0,
+                    power_ec_per_s: 0.5,
+                },
+                smelt,
+                ColonyModuleDef::Store {
+                    resource: ore.clone(),
+                    capacity: 500.0,
+                },
+                ColonyModuleDef::Store {
+                    resource: metal.clone(),
+                    capacity: 500.0,
+                },
+                ColonyModuleDef::Store {
+                    resource: ResourceId::from("oxygen"),
+                    capacity: 500.0,
+                },
+                ColonyModuleDef::Store {
+                    resource: ResourceId::from("food"),
+                    capacity: 500.0,
+                },
+            ],
+            vec![
+                csp_data::ColonyStoreInit {
+                    resource: ResourceId::from("oxygen"),
+                    level: 500.0,
+                },
+                csp_data::ColonyStoreInit {
+                    resource: ResourceId::from("food"),
+                    level: 500.0,
+                },
+                csp_data::ColonyStoreInit {
+                    resource: ec(),
+                    level: 100.0,
+                },
+            ],
+        );
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        assert_eq!(w.funds_micros(), funds0 - founding);
+        let colony = *w.colonies().keys().next().unwrap();
+        // The outpost stands a bare generator — deliberately LS-less.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::FoundColony {
+                def: ColonyDef {
+                    site: SiteId::from("mine"),
+                    display_name: csp_data::LocKey::from("colony.mine"),
+                    modules: vec![gen_module(10.0)],
+                    stores: vec![],
+                },
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        assert_eq!(w.funds_micros(), funds0 - 2 * founding);
+        let outpost = *w.colonies().keys().nth(1).unwrap();
+
+        // ── Crew: the LS-equipped colony takes the posting; the
+        // LS-less outpost refuses it. ──
+        let salary = w.economy_config().crew_salary_per_s;
+        let hire = w.economy_config().hire_cost_micros;
+        for (i, name) in [(0u64, "eng"), (1, "sci")] {
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::HireCrew {
+                    name: name.into(),
+                    kind: crate::CrewKind::Engineer,
+                    skill: 2,
+                    salary_per_s: salary,
+                },
+            );
+            let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+            assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+            assert_eq!(w.funds_micros(), funds0 - 2 * founding - (i + 1) * 2 * hire);
+        }
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::AssignCrewToColony {
+                colony,
+                crew: CrewId(0),
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        assert!(w.colonies()[&colony].crew.contains(&CrewId(0)));
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::AssignCrewToColony {
+                colony: outpost,
+                crew: CrewId(1),
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(
+            r.rejected.iter().any(
+                |x| matches!(&x.error, SimError::Recoverable(m) if m.contains("life-support"))
+            ),
+            "the LS-less outpost must refuse the posting: {:?}",
+            r.rejected
+        );
+
+        // ── Earn: publish → accept → deliver ore → the contract
+        // completes and pays. ──
+        w.step_frame(w.clock().ticks() + TICK_HZ).unwrap();
+        assert!(
+            !w.contracts.offers.is_empty(),
+            "the board published nothing"
+        );
+        let offer = *w.contracts.offers.keys().next().unwrap();
+        w.enqueue(SourceClass::Ui, 0, SimCommand::AcceptContract { offer });
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        let funds_after_accept = w.funds_micros();
+        let hauler = latched_vessel_multi(
+            &mut w,
+            &[
+                ("ore", 200.0, 50.0),
+                ("metal", 60.0, 0.0),
+                ("composite", 30.0, 0.0),
+            ],
+        );
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::JoinColonyInventory {
+                vessel: hauler,
+                colony,
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::TransferColonyResource {
+                vessel: hauler,
+                colony,
+                resource: ore.clone(),
+                amount: 10.0,
+                to_colony: true,
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        w.step_frame(w.clock().ticks() + 64).unwrap();
+        assert!(
+            w.contracts.active.is_empty(),
+            "the resupply did not complete on delivery"
+        );
+        // Advance 2.0 + completion 10.0.
+        assert_eq!(w.funds_micros(), funds_after_accept + 10_000_000);
+
+        // ── Produce: drill ore at the authored yield, smelt it to
+        // metal — the ISRU half of the loop. ──
+        w.step_frame(w.clock().ticks() + 20 * TICK_HZ).unwrap();
+        let now = w.clock().ticks();
+        let stock = w.colonies()[&colony].stores[&metal].level_at(now);
+        assert!(
+            stock >= 5.0,
+            "the smelter produced {stock} metal in ~25 s — the converter leg is broken"
+        );
+
+        // ── Haul back + recover: metal into the ore carrier's tank,
+        // recovery credits the pad's site inventory at 1.0. ──
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::TransferColonyResource {
+                vessel: hauler,
+                colony,
+                resource: metal.clone(),
+                amount: 5.0,
+                to_colony: false,
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        w.step_frame(w.clock().ticks() + 32).unwrap();
+        assert_eq!(
+            crate::transfers::vessel_resource(&w.vessels()[&hauler], &metal),
+            5.0
+        );
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RecoverVessel {
+                vessel: hauler,
+                site: Some(SiteId::from("pad")),
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        assert!(!w.vessels().contains_key(&hauler));
+        let inv = &w.economy().sites[&SiteId::from("pad")].inventory;
+        assert_eq!(inv[&ore], 40.0, "the 50−10 ore aboard credits at 1.0");
+        assert_eq!(inv[&metal], 5.0, "the hauled-back metal credits at 1.0");
+
+        // ── Spend: the recovered metal IS the build's BOM — the
+        // §3.5 "resources ◄── colonies/ISRU" edge funding a build. ──
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::ManufactureCraft {
+                site: SiteId::from("pad"),
+                craft: tank_craft("metal", 20.0),
+                build_resources: vec![(metal.clone(), 5.0)],
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        assert_eq!(w.builds.len(), 1);
+        assert_eq!(
+            w.economy().sites[&SiteId::from("pad")].inventory[&metal],
+            0.0
+        );
+        // 100 kg at 50 kg/s → 128 ticks to ConstructionComplete.
+        w.step_frame(w.clock().ticks() + 128).unwrap();
+        assert!(w.builds.is_empty(), "the order did not deliver");
+        assert_eq!(w.vessels().len(), 1, "the manufactured craft materialized");
+
+        // The honest ledger: 2 foundings + 2 hires out, advance +
+        // completion + recovery part value − build cost in.
+        assert_eq!(
+            w.funds_micros(),
+            funds0 - 2 * founding - 2 * 2 * hire + 2_000_000 + 10_000_000 + 10_000_000 - 10_000_000,
+            "the loop's cumulative funds ledger is dishonest"
+        );
+        assert!(
+            w.economy()
+                .ledger
+                .iter()
+                .any(|e| e.reason == crate::economy::FundsReason::ColonyFounding)
+        );
+        assert!(
+            w.economy()
+                .ledger
+                .iter()
+                .any(|e| e.reason == crate::economy::FundsReason::Recovery)
+        );
+    }
 }
