@@ -204,7 +204,12 @@ use crate::SimError;
 /// appended `Vessel::deployed` — the per-node deploy record
 /// (node → deploy tick) that decides the body's per-tick
 /// `DecelSite`s. Both are hashed state; the goldens rebless.
-pub const HASH_SCHEMA_VERSION: u32 = 21;
+///
+/// **Version 22** (§2.2 `active_vessel`): the world walk appends the
+/// player's focus record (`Option<VesselId>`) after `warp_level` —
+/// §7.2's serialized set names it, so a lost record must not pass the
+/// hash silently. The goldens rebless.
+pub const HASH_SCHEMA_VERSION: u32 = 22;
 
 /// Rule-7 sum types: the source of an enum's *declared* stable `u16`
 /// discriminant (PLAN §7.1 rule 7).
