@@ -377,6 +377,58 @@ pub struct FlightSyncInput {
 #[derive(Resource, Default)]
 pub struct RailsStaged(pub Vec<u64>);
 
+/// The §3.4 flight display's g-load input (C10-F2/C22-F5): sustained
+/// acceleration per vessel, measured the way the sim's per-tick
+/// `RegimeMetrics.g_load` is — `‖Δv‖/dt` over the inertial CoM
+/// velocity — but over the staged frame window, since the tick's own
+/// reading never persists outside the step. `stage_program` refreshes
+/// it before the RELIABILITY rows read it; a paused frame (no elapsed
+/// ticks) keeps the last reading, and a vanished vessel drops out.
+#[derive(Resource, Default)]
+pub struct RegimeLoads {
+    /// `VesselId.0` → `(last staged inertial CoM velocity, its sim
+    /// tick)` — the window's near edge.
+    prev_vel: BTreeMap<u64, (DVec3, u64)>,
+    /// `VesselId.0` → the sustained g over the last measured window.
+    g_load: BTreeMap<u64, f64>,
+}
+
+impl RegimeLoads {
+    /// Refresh from the freshly staged `(VesselId.0, vel)` rows —
+    /// non-latched bodies only (the caller filters): a parked pose's
+    /// co-rotation velocity would report phantom centripetal load,
+    /// and a latched vessel's records are dormant-class anyway.
+    pub fn stage(&mut self, rows: &[(u64, DVec3)], now_ticks: u64) {
+        self.prev_vel
+            .retain(|id, _| rows.iter().any(|(v, _)| v == id));
+        let mut next = BTreeMap::new();
+        for (id, vel) in rows {
+            let g = match self.prev_vel.insert(*id, (*vel, now_ticks)) {
+                // The windowed ‖Δv‖/dt — the same inertial measure
+                // the sim samples per tick (the norm is
+                // rotation-invariant, so the frame choice is moot).
+                Some((v0, t0)) if now_ticks > t0 => {
+                    (*vel - v0).norm()
+                        / ((now_ticks - t0) as f64 / csp_core::TICK_HZ as f64)
+                        / csp_data::G0
+                }
+                // A paused frame — keep the last reading; a first
+                // sighting has no window to measure over yet.
+                Some(_) => self.g_load.get(id).copied().unwrap_or(0.0),
+                None => 0.0,
+            };
+            next.insert(*id, g);
+        }
+        self.g_load = next;
+    }
+
+    /// The vessel's last measured sustained g (`0` before its first
+    /// measured window).
+    pub fn g_for(&self, vessel: u64) -> f64 {
+        self.g_load.get(&vessel).copied().unwrap_or(0.0)
+    }
+}
+
 /// Pass-1 dead-stick recovery: the vessel the flight focus should pin
 /// to once it is staged (set by `View::recover_control` alongside the
 /// `ToBubble` command). The pin is NOT forever — it releases when the
@@ -3868,5 +3920,39 @@ mod tests {
         assert_eq!(r0.thrust_vac_n, 0.0);
         assert_eq!(r0.burn_time_s, 0.0);
         assert_eq!(r0.twr_surface, 0.0);
+    }
+
+    /// C10-F2/C22-F5's staged input: the windowed `‖Δv‖/dt` g-load —
+    /// first sighting reads 0, an advancing window divides the inertial
+    /// Δv by the elapsed sim seconds, a paused frame keeps the last
+    /// reading, and a vanished vessel drops its entry.
+    #[test]
+    fn regime_loads_measures_the_frame_window() {
+        let hz = csp_core::TICK_HZ as f64;
+        let mut loads = RegimeLoads::default();
+        // First sighting — no window yet.
+        loads.stage(&[(1, DVec3::ZERO)], 0);
+        assert_eq!(loads.g_for(1), 0.0);
+        // 64 ticks later the vessel gained 9.81 m/s → 1.0 g sustained.
+        loads.stage(&[(1, DVec3::new(0.0, 9.81, 0.0))], 64);
+        assert!((loads.g_for(1) - 1.0).abs() < 1e-9, "g {}", loads.g_for(1));
+        // Another second at +19.62 m/s² over the window → 2.0 g.
+        loads.stage(&[(1, DVec3::new(0.0, 9.81 * 3.0, 0.0))], 128);
+        assert!((loads.g_for(1) - 2.0).abs() < 1e-9, "g {}", loads.g_for(1));
+        // A paused frame (same tick) keeps the last reading.
+        loads.stage(&[(1, DVec3::new(0.0, 9.81 * 3.0, 0.0))], 128);
+        assert!((loads.g_for(1) - 2.0).abs() < 1e-9);
+        // A second vessel measures its own window independently.
+        loads.stage(
+            &[(1, DVec3::new(0.0, 9.81 * 3.0, 0.0)), (2, DVec3::ZERO)],
+            128 + (hz * 0.5) as u64,
+        );
+        assert_eq!(loads.g_for(2), 0.0);
+        // Vessel 1 vanishes — its entry drops with it.
+        loads.stage(&[(2, DVec3::new(0.0, 0.0, 9.81))], 128 + hz as u64);
+        assert_eq!(loads.g_for(1), 0.0);
+        // …and vessel 2's half-second window still reads its own Δv:
+        // +9.81 m/s over 32 ticks = 2.0 g.
+        assert!((loads.g_for(2) - 2.0).abs() < 1e-9, "g {}", loads.g_for(2));
     }
 }

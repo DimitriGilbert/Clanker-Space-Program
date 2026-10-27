@@ -143,6 +143,16 @@ pub struct ReliabilityRow {
     pub wear: Option<f64>,
     /// Dormant-class accrual is in force.
     pub dormant: bool,
+    /// §3.4's live stress table — `(rule, active)` per authored
+    /// `regime_stress` rule, evaluated at staging on the same
+    /// regime metrics the sim's per-tick hazard pass reads
+    /// (C10-F2/C22-F5: "displayed to the player in editor and
+    /// flight"). Empty when the record resolves no spec. Dormant
+    /// rows do not render it — the dormant λ ignores the rules.
+    pub stress: Vec<(csp_data::StressRule, bool)>,
+    /// The live `Π(stress_i)` over `stress` — the multiplier folded
+    /// into the part's `lambda_per_s` (`1.0` while no rule fires).
+    pub stress_product: f64,
 }
 
 /// A recent reliability/lab event line from the sim's notification log.
@@ -467,6 +477,11 @@ pub struct ProgramInput {
     /// buttons (`RecoverData` requires it) and the vessel
     /// recover/terminate actions (`RecoverVessel` requires it).
     pub latched: bool,
+    /// Crew aboard the focused vessel — the LABS `StartResearch`
+    /// gate (C22-F3: the resolver drops a crewless start with "NO
+    /// CREW ABOARD", so the buttons disable with the reason on
+    /// hover instead of dead-clicking).
+    pub crew_aboard: bool,
     /// Display name of the site a vessel recovery credits to —
     /// `None` = the remote-salvage leg (no site on the latched
     /// body). Label only; the command resolves the `SiteId`
@@ -1050,7 +1065,13 @@ fn vessels_section(
                     continue;
                 }
                 for (label, amount) in [
-                    (format!("→v{} 10", v.id), 10.0_f64.min(*units)),
+                    // C22-F7: the button names exactly what it
+                    // sends — under a light stock "10" sent the
+                    // residue and silently duplicated "all".
+                    (
+                        format!("→v{} {}", v.id, fmt_amount(10.0_f64.min(*units))),
+                        10.0_f64.min(*units),
+                    ),
                     (format!("→v{} all", v.id), *units),
                 ] {
                     if ui
@@ -1366,8 +1387,11 @@ fn colonies_section(
                         continue;
                     }
                     for (label, amount) in [
-                        ("deliver 10", 10.0_f64.min(*units)),
-                        ("deliver all", *units),
+                        (
+                            format!("deliver {}", fmt_amount(10.0_f64.min(*units))),
+                            10.0_f64.min(*units),
+                        ),
+                        ("deliver all".to_string(), *units),
                     ] {
                         if ui
                             .small_button(format!("{resource} {label}"))
@@ -1389,19 +1413,24 @@ fn colonies_section(
                     if s.level <= 0.0 {
                         continue;
                     }
-                    let label = format!("withdraw {}", s.resource);
+                    // C22-F7: the label and hover name the sent
+                    // amount — `min(10, level)` on a light store.
+                    let amount = 10.0_f64.min(s.level);
+                    let label = format!("withdraw {} {}", s.resource, fmt_amount(amount));
                     if ui
                         .small_button(label)
                         .on_hover_text(format!(
-                            "colony → vessel: 10 {} (store holds {:.1})",
-                            s.resource, s.level
+                            "colony → vessel: {} {} (store holds {:.1})",
+                            fmt_amount(amount),
+                            s.resource,
+                            s.level
                         ))
                         .clicked()
                     {
                         out.push(ProgramCommand::TransferColonyResource {
                             colony: c.id,
                             resource: s.resource.clone(),
-                            amount: 10.0_f64.min(s.level),
+                            amount,
                             to_colony: false,
                         });
                     }
@@ -1521,6 +1550,18 @@ fn agenda_section(
 /// Seconds → a coarse countdown ("12:34", "2.3 d") for agenda/transfer rows.
 fn fmt_eta(s: f64) -> String {
     crate::fmt_period(s.max(0.0))
+}
+
+/// A resource amount for a transfer button's label — the button must
+/// name exactly what it sends (C22-F7: a "10" that sends `min(10,
+/// stock)` mislabels the verb under a light stock and silently
+/// duplicates "all"). Whole amounts print without the fraction.
+fn fmt_amount(u: f64) -> String {
+    if (u - u.round()).abs() < 1e-9 {
+        format!("{u:.0}")
+    } else {
+        format!("{u:.1}")
+    }
 }
 
 /// The FACILITIES section (W2.6) — §3.5's manufacture + §3.4's test
@@ -1833,6 +1874,32 @@ fn automation_section(
     }
 }
 
+/// The window's armed-chute deploy button — emits a [`ProgramCommand`]
+/// on click. C22-F2: gated on `residence == "bubble"` like the part
+/// menu and action strip copies — the sim refuses a deploy on a
+/// latched/rails vessel, so the ungated window row dead-clicked onto
+/// the generic refusal. Split out so the gate is testable without
+/// opening the whole (scrollable) window.
+fn chute_deploy_button(
+    ui: &mut egui::Ui,
+    residence: &str,
+    node: u64,
+    out: &mut Vec<ProgramCommand>,
+) {
+    let ok = residence == "bubble";
+    if ui
+        .add_enabled(ok, egui::Button::new("deploy").small())
+        .on_hover_text(if ok {
+            "deploy the decelerator (armed → deployed)".to_string()
+        } else {
+            "deployable only while flying — not on the surface".to_string()
+        })
+        .clicked()
+    {
+        out.push(ProgramCommand::DeployPart { node });
+    }
+}
+
 /// The Program window — overview, contracts, research, vessel science,
 /// reliability. `open` mirrors the close button into the session flag.
 /// Emits [`ProgramCommand`]s; `csp-view` resolves them into
@@ -1922,7 +1989,20 @@ pub fn program_panel(
                                     if !n.prereqs_met {
                                         ui.label(egui::RichText::new("prereqs").color(dim).small());
                                     } else if !n.affordable {
-                                        ui.label(egui::RichText::new("need ⚛").color(dim).small());
+                                        // C22-F8: the tag fires on
+                                        // BANKED science while the
+                                        // headline number folds in
+                                        // live lab accrual — the
+                                        // hover keeps the bigger
+                                        // figure from reading as a
+                                        // gate bug.
+                                        ui.label(egui::RichText::new("need ⚛").color(dim).small())
+                                            .on_hover_text(format!(
+                                                "spending uses banked science only — ⚛{:.1} banked \
+                                                 of {:.0} needed; the headline ⚛{:.1} counts live \
+                                                 lab accrual, which cannot be spent",
+                                                input.banked, n.cost, input.science
+                                            ));
                                     }
                                 }
                             });
@@ -2122,12 +2202,8 @@ pub fn program_panel(
                         );
                         if ch.deployed {
                             ui.label(egui::RichText::new("deployed").color(dim).small());
-                        } else if ui
-                            .small_button("deploy")
-                            .on_hover_text("deploy the decelerator (armed → deployed)")
-                            .clicked()
-                        {
-                            out.push(ProgramCommand::DeployPart { node: ch.node });
+                        } else {
+                            chute_deploy_button(ui, input.residence.as_str(), ch.node, out);
                         }
                     });
                 }
@@ -2151,15 +2227,26 @@ pub fn program_panel(
                             );
                         });
                         // An idle lab converts any pooled record —
-                        // one button per pooled row.
+                        // one button per pooled row. C22-F3: gated on
+                        // crew aboard — the resolver drops a crewless
+                        // start with "NO CREW ABOARD", so the button
+                        // says why on hover instead of dead-clicking.
                         if !l.running {
                             for d in &input.pooled {
                                 if ui
-                                    .small_button(format!("  research {}", d.label))
-                                    .on_hover_text(format!(
-                                        "start the lab on {:.1} data (crew aboard staff it)",
-                                        d.units
-                                    ))
+                                    .add_enabled(
+                                        input.crew_aboard,
+                                        egui::Button::new(format!("  research {}", d.label))
+                                            .small(),
+                                    )
+                                    .on_hover_text(if input.crew_aboard {
+                                        format!(
+                                            "start the lab on {:.1} data (crew aboard staff it)",
+                                            d.units
+                                        )
+                                    } else {
+                                        "no crew aboard — a lab needs staff to run".to_string()
+                                    })
                                     .clicked()
                                 {
                                     out.push(ProgramCommand::StartResearch {
@@ -2236,6 +2323,49 @@ pub fn program_panel(
                             )
                         };
                         ui.label(egui::RichText::new(text).font(MONO).color(col));
+                        // §3.4's flight half (C10-F2/C22-F5): the
+                        // authored stress rules marked against the
+                        // live regime the staging mirror evaluated —
+                        // the same `▶`-active/weak idiom the VAB
+                        // inspector uses. A dormant row carries no
+                        // product: the dormant λ ignores the rules,
+                        // so showing them would claim stress the sim
+                        // is not accruing.
+                        if !r.dormant {
+                            for (rule, active) in &r.stress {
+                                let text = crate::vab::stress_rule_text(rule);
+                                if *active {
+                                    ui.label(
+                                        egui::RichText::new(format!("    ▶ {text}"))
+                                            .font(MONO)
+                                            .color(egui::Color32::YELLOW)
+                                            .small(),
+                                    );
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new(format!("      {text}"))
+                                            .font(MONO)
+                                            .color(dim)
+                                            .small(),
+                                    );
+                                }
+                            }
+                            if !r.stress.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "    Π stress ×{:.3}",
+                                        r.stress_product
+                                    ))
+                                    .font(MONO)
+                                    .color(if r.stress_product > 1.0 {
+                                        egui::Color32::from_rgb(235, 180, 80)
+                                    } else {
+                                        dim
+                                    })
+                                    .small(),
+                                );
+                            }
+                        }
                     }
                 }
                 if !input.notices.is_empty() {
@@ -2911,5 +3041,75 @@ mod tests {
             }
         }
         assert!(opened, "the Actions strip's Program button never clicked");
+    }
+
+    /// C22-F7: the transfer labels name the amount the button
+    /// actually sends — whole units print bare, fractions keep one
+    /// decimal, so a "10" that would send 3.4 reads "3.4".
+    #[test]
+    fn fmt_amount_names_the_sent_units() {
+        assert_eq!(fmt_amount(10.0_f64.min(25.0)), "10");
+        assert_eq!(fmt_amount(10.0_f64.min(3.4)), "3.4");
+        assert_eq!(fmt_amount(7.0), "7");
+        assert_eq!(fmt_amount(0.25), "0.2");
+    }
+
+    /// C22-F2: the window's deploy button carries the same
+    /// `residence == "bubble"` gate as the part menu and action
+    /// strip — enabled in flight, dead-click-proof on the pad.
+    #[test]
+    fn chute_deploy_button_gates_on_bubble() {
+        let ctx = egui::Context::default();
+        let draw = |residence: &'static str, out: &mut Vec<ProgramCommand>| {
+            ctx.run_pass(egui_input(Vec::new()), |ctx| {
+                egui::Area::new(egui::Id::unique("chute_test")).show(ctx, |ui| {
+                    chute_deploy_button(ui, residence, 7, out);
+                });
+            })
+            .drop_without_applying_deltas();
+        };
+        // Bubble residence → the button draws and clicks.
+        let mut out = Vec::new();
+        draw("bubble", &mut out);
+        'scan: for iy in 0..4 {
+            for ix in 0..8 {
+                let pos = egui::pos2(10.0 + ix as f32 * 10.0, 15.0 + iy as f32 * 10.0);
+                ctx.run_pass(egui_input(primary_click(pos)), |ctx| {
+                    egui::Area::new(egui::Id::unique("chute_test")).show(ctx, |ui| {
+                        chute_deploy_button(ui, "bubble", 7, &mut out);
+                    });
+                })
+                .drop_without_applying_deltas();
+                if out
+                    .iter()
+                    .any(|c| matches!(c, ProgramCommand::DeployPart { node: 7 }))
+                {
+                    break 'scan;
+                }
+            }
+        }
+        assert!(
+            out.iter()
+                .any(|c| matches!(c, ProgramCommand::DeployPart { node: 7 })),
+            "an in-flight deploy must emit DeployPart"
+        );
+        // Latched residence → disabled: no click can emit the verb.
+        let mut out = Vec::new();
+        draw("latched", &mut out);
+        for iy in 0..4 {
+            for ix in 0..8 {
+                let pos = egui::pos2(10.0 + ix as f32 * 10.0, 15.0 + iy as f32 * 10.0);
+                ctx.run_pass(egui_input(primary_click(pos)), |ctx| {
+                    egui::Area::new(egui::Id::unique("chute_test")).show(ctx, |ui| {
+                        chute_deploy_button(ui, "latched", 7, &mut out);
+                    });
+                })
+                .drop_without_applying_deltas();
+            }
+        }
+        assert!(
+            out.is_empty(),
+            "a parked vessel's deploy button cannot emit: {out:?}"
+        );
     }
 }

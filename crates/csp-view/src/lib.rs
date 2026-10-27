@@ -1218,11 +1218,19 @@ fn program_command(
                 dropped.push("RESEARCH DROPPED — STALE PANEL INDEX");
                 return None;
             };
-            let slots = mirror.lab_slots.get(&lab_node).copied().unwrap_or(0) as usize;
+            // C21-F7: a lab node absent from the staged table is not
+            // the empty-roster case — the lab isn't aboard the focus
+            // (a stale row between staging and the click). The two
+            // drops used to share "NO CREW ABOARD"; §3.7's "says why
+            // not" rule wants the real one.
+            let Some(slots) = mirror.lab_slots.get(&lab_node).copied() else {
+                dropped.push("RESEARCH DROPPED — LAB NOT ON FOCUSED VESSEL");
+                return None;
+            };
             let researchers: Vec<csp_sim::ResearcherAssign> = mirror
                 .researchers
                 .iter()
-                .take(slots)
+                .take(slots as usize)
                 .map(|(crew, skill)| csp_sim::ResearcherAssign {
                     crew: *crew,
                     skill: *skill,
@@ -2186,6 +2194,9 @@ impl View {
         // burn-time figures (same standalone-resource pattern as
         // `LiveVesselCount`: `FlightSnapshot` cannot grow).
         world.insert_resource(flight::VesselPropulsionStaged::default());
+        // The §3.4 flight display's sustained-g mirror — staged each
+        // `end_frame` beside the flight vessels it measures.
+        world.insert_resource(flight::RegimeLoads::default());
         world.insert_resource(flight::FlightUiData::default());
         world.insert_resource(flight::StagePlans::default());
         world.insert_resource(flight::FlightFrame::default());
@@ -4023,9 +4034,27 @@ impl View {
         let mut recovery_site = None;
         let mut researchers = Vec::new();
         let mut lab_slots = std::collections::BTreeMap::new();
+        // C10-F2/C22-F5: the §3.4 flight display's sustained-g input.
+        // The sim's per-tick `RegimeMetrics.g_load` never persists, so
+        // `RegimeLoads` measures the same ‖Δv‖/dt over the staged
+        // frame window — non-latched bodies only (a latched pose's
+        // co-rotation velocity would read as phantom load, and its
+        // records are dormant anyway).
+        let vel_rows: Vec<(u64, csp_core::DVec3)> = self
+            .world
+            .resource::<flight::FlightSyncInput>()
+            .vessels
+            .iter()
+            .filter(|b| !b.latched)
+            .map(|b| (b.id, b.vel))
+            .collect();
+        self.world
+            .resource_mut::<flight::RegimeLoads>()
+            .stage(&vel_rows, sim.clock().ticks());
         if let Some(vid) = vid
             && let Some(v) = sim.vessels().get(&vid)
         {
+            let g_load = self.world.resource::<flight::RegimeLoads>().g_for(vid.0);
             self.stage_program_vessel(
                 v,
                 &mut input,
@@ -4034,6 +4063,7 @@ impl View {
                 &mut ctx_label,
                 &mut keys,
                 &mut recovery_site,
+                g_load,
                 &name_of,
             );
         }
@@ -4097,6 +4127,7 @@ impl View {
         ctx_label: &mut Option<(String, String, String, String)>,
         keys: &mut Vec<PooledKey>,
         recovery_site: &mut Option<csp_data::SiteId>,
+        g_load: f64,
         name_of: &dyn Fn(&csp_data::LocKey, &str) -> String,
     ) {
         use csp_ui::program as up;
@@ -4326,6 +4357,20 @@ impl View {
         }
         // Reliability rows — one per node with a record.
         let now = sim.clock().ticks();
+        // C10-F2/C22-F5 (§3.4 "displayed to the player in editor and
+        // flight"): the live stress table needs the tick's
+        // `RegimeMetrics`, which the sim never persists — so the row
+        // rebuilds it from the same sources `bubble_part_tick` reads:
+        // the body's throttle, the record's burn clock / ullage latch
+        // / ignition count, the vessel's per-part temps, and the
+        // `RegimeLoads` windowed g above. `specs_parallel`'s rule
+        // applies verbatim: a non-covering spec table resolves no
+        // spec, so positional reads are gated the same way.
+        let throttle = v.body().map_or(0.0, |b| b.throttle);
+        let specs_ok = v
+            .craft
+            .as_ref()
+            .is_some_and(|c| c.reliability.len() == c.parts.len());
         for (nid, rec) in &v.reliability {
             let part_name = v
                 .craft
@@ -4339,6 +4384,40 @@ impl View {
                 .and_then(|pid| sim.parts().get(pid))
                 .map(|d| name_of(&d.display_name, d.id.as_str()))
                 .unwrap_or_else(|| format!("part {}", nid.0));
+            let (stress, stress_product) = v
+                .craft
+                .as_ref()
+                .filter(|_| specs_ok)
+                .and_then(|c| {
+                    let eff = c.graph.nodes.get(nid)?.effective_index as usize;
+                    let spec = c.reliability.get(eff)?;
+                    let temp_k = v.thermal.part_temps_k.get(nid).copied().unwrap_or(0.0);
+                    let max_k = c
+                        .parts
+                        .get(eff)
+                        .map_or(1.0, |p| p.thermal.max_temp_k.max(1.0));
+                    let burn_s = if rec.burning {
+                        now.saturating_sub(rec.burn_start_tick) as f64 / csp_core::TICK_HZ as f64
+                    } else {
+                        0.0
+                    };
+                    let m = csp_phys::RegimeMetrics {
+                        throttle,
+                        burn_s,
+                        temp_fraction: temp_k / max_k,
+                        g_load,
+                        ullage_negative: rec.ullage_stressed,
+                        restarts: rec.usage.ignitions.saturating_sub(1) as f64,
+                    };
+                    Some((
+                        csp_phys::stress_breakdown(spec, &m)
+                            .into_iter()
+                            .map(|(r, a)| (r.clone(), a))
+                            .collect::<Vec<_>>(),
+                        csp_phys::stress_product(spec, &m),
+                    ))
+                })
+                .unwrap_or_default();
             input.reliability.push(up::ReliabilityRow {
                 node: nid.0,
                 part: part_name,
@@ -4350,6 +4429,8 @@ impl View {
                     .is_finite()
                     .then(|| (rec.hazard_at(now) / rec.theta).clamp(0.0, 1.0)),
                 dormant: rec.dormant_class,
+                stress,
+                stress_product,
             });
         }
     }
@@ -5424,6 +5505,11 @@ fn stage_program_world(
                 }
             }
         }
+        // C22-F3: the LABS research buttons gate on the same crew
+        // pool the `StartResearch` resolver truncates — staged once
+        // so the panel disables with the reason instead of
+        // dead-clicking onto the "NO CREW ABOARD" drop.
+        input.crew_aboard = !v.crew.is_empty();
         for c in &v.crew {
             // C08-F7: the roster record is the claimed skill's source
             // of truth — `apply_start_research` cross-checks it
@@ -6057,6 +6143,144 @@ mod tests {
             })
         );
         assert_eq!(dropped.len(), 5, "every stale focus-drop reports");
+    }
+
+    /// C21-F7: a `StartResearch` drop names the real reason — a lab
+    /// node absent from the staged `lab_slots` table is a stale row
+    /// ("LAB NOT ON FOCUSED VESSEL"), distinct from the empty roster
+    /// the same cue used to blame ("NO CREW ABOARD").
+    #[test]
+    fn start_research_drop_names_the_real_reason() {
+        use csp_ui::program::ProgramCommand as C;
+        let key = || PooledKey {
+            key: csp_sim::research::DataKey {
+                experiment: csp_data::ExperimentId::from("exp.materials_study"),
+                body: csp_data::BodyId::from("terrin"),
+                biome: csp_data::BiomeId::from(""),
+                situation: csp_data::Situation::SpaceLow,
+            },
+        };
+        let mut dropped = Vec::new();
+        // Lab node absent from `lab_slots` — not aboard the focus.
+        let stale = ProgramMirror {
+            vessel: Some(csp_sim::VesselId(7)),
+            keys: vec![key()],
+            ..ProgramMirror::default()
+        };
+        assert_eq!(
+            program_command(
+                &stale,
+                C::StartResearch {
+                    lab_node: 9,
+                    row: 0
+                },
+                &mut dropped
+            ),
+            None
+        );
+        assert_eq!(dropped, ["RESEARCH DROPPED — LAB NOT ON FOCUSED VESSEL"]);
+        // Lab aboard but the roster is empty — the resolver's own
+        // crew check is the reason.
+        dropped.clear();
+        let crewless = ProgramMirror {
+            vessel: Some(csp_sim::VesselId(7)),
+            keys: vec![key()],
+            lab_slots: [(9_u64, 2_u32)].into_iter().collect(),
+            ..ProgramMirror::default()
+        };
+        assert_eq!(
+            program_command(
+                &crewless,
+                C::StartResearch {
+                    lab_node: 9,
+                    row: 0
+                },
+                &mut dropped
+            ),
+            None
+        );
+        assert_eq!(dropped, ["RESEARCH DROPPED — NO CREW ABOARD"]);
+        // Crewed → the command resolves, researchers truncated to
+        // the lab's slot count.
+        let crewed = ProgramMirror {
+            vessel: Some(csp_sim::VesselId(7)),
+            keys: vec![key()],
+            lab_slots: [(9_u64, 1_u32)].into_iter().collect(),
+            researchers: vec![(csp_sim::CrewId(3), 2), (csp_sim::CrewId(4), 5)],
+            ..ProgramMirror::default()
+        };
+        match program_command(
+            &crewed,
+            C::StartResearch {
+                lab_node: 9,
+                row: 0,
+            },
+            &mut dropped,
+        ) {
+            Some(SimCommand::StartResearch {
+                vessel,
+                lab_node,
+                researchers,
+                ..
+            }) => {
+                assert_eq!(vessel, csp_sim::VesselId(7));
+                assert_eq!(lab_node, csp_phys::PartNodeId(9));
+                assert_eq!(researchers.len(), 1, "truncated to the lab's slots");
+                assert_eq!(researchers[0].crew, csp_sim::CrewId(3));
+            }
+            other => panic!("StartResearch → {other:?}"),
+        }
+    }
+
+    /// C10-F2/C22-F5 + C22-F3's staged mirrors: the starter craft's
+    /// reliability rows carry the §3.4 stress table (authored rules
+    /// evaluated on the reconstructed regime), and `crew_aboard`
+    /// tracks the focused vessel's crew for the LABS gate.
+    #[test]
+    fn program_mirror_stages_stress_table_and_crew_gate() {
+        let mut view = View::new().expect("data/ load");
+        view.seed_starter_craft().expect("starter seed");
+        view.begin_frame();
+        view.end_frame();
+        {
+            let mirror = view.world.resource::<ProgramMirror>();
+            assert!(
+                mirror
+                    .input
+                    .reliability
+                    .iter()
+                    .any(|r| !r.stress.is_empty()),
+                "the shipped parts stage their authored stress rules: {:?}",
+                mirror.input.reliability
+            );
+            assert!(
+                mirror
+                    .input
+                    .reliability
+                    .iter()
+                    .all(|r| r.stress_product >= 1.0),
+                "stress multipliers are ≥ 1 authored"
+            );
+            assert!(!mirror.input.crew_aboard, "the seed flies uncrewed");
+        }
+        view.sim.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::BoardCrew {
+                vessel: csp_sim::VesselId(0),
+            },
+        );
+        view.begin_frame();
+        let report = view
+            .sim_step(view.sim.clock().ticks() + 1)
+            .expect("advance");
+        assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+        view.end_frame();
+        let mirror = view.world.resource::<ProgramMirror>();
+        assert!(
+            mirror.input.crew_aboard,
+            "a boarded member flips the LABS gate"
+        );
     }
 
     /// W1.2's gate: a rails vessel in space stages a REAL science

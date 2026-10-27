@@ -3728,8 +3728,10 @@ fn selected_spec(vab: &VabSession, id: PartNodeId) -> Option<csp_phys::Reliabili
 
 /// A readable one-line rendering of an authored stress rule — the
 /// kind's metric vs its threshold, and the multiplier the rule
-/// applies while active.
-fn stress_rule_text(rule: &csp_data::StressRule) -> String {
+/// applies while active. `pub(crate)`: the Program window's
+/// RELIABILITY rows render the same table (§3.4: one text for one
+/// rule, editor and flight alike).
+pub(crate) fn stress_rule_text(rule: &csp_data::StressRule) -> String {
     use csp_data::StressKind;
     let cond = match rule.kind {
         StressKind::OverThrottle => format!("throttle > {:.2}", rule.threshold),
