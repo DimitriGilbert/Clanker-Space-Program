@@ -3852,6 +3852,32 @@ impl World {
         &self.vessels
     }
 
+    /// §2.6.6 item 4's report for `vessel`: the SOI scan's per-candidate
+    /// stride `h` (and the `v_rel_max` each derives from) — the "never
+    /// misses a residence longer than `h`" bound is only observable when
+    /// `h` is surfaced. The rows come from
+    /// [`PatchedConics::scan_strides`], which shares the scan's own
+    /// candidate enumeration and stride formula, so the report can never
+    /// drift from what the scan actually walks.
+    ///
+    /// `Ok(None)` for a vessel without a stamped conic (bubble-resident
+    /// or surface-latched): `schedule_next_soi` only ever publishes SOI
+    /// events while on rails, so there is no `h` to report — surfaces
+    /// (the debug overlay, the bug-report bundle) must show *that*,
+    /// never a fabricated stride. `Recoverable` on an unknown id, like
+    /// the other vessel-named queries. Observation only.
+    pub fn soi_scan_strides(
+        &self,
+        vessel: VesselId,
+    ) -> Result<Option<Vec<orbit::SoiScan>>, SimError> {
+        self.vessels
+            .get(&vessel)
+            .ok_or(SimError::Recoverable("soi scan report: unknown vessel"))?
+            .orbit()
+            .map(|orbit| self.orbits.scan_strides(orbit))
+            .transpose()
+    }
+
     /// §2.6.5's tracked-vessel set — the Silent→Clamping opt-in
     /// (`SetVesselTracked`). Observation only (the `vessels()`
     /// precedent): membership decides event classes at schedule and
@@ -15367,6 +15393,66 @@ mod tests {
         assert!(matches!(ev, Some(ref e) if e.body == BodyId::from("m")
             && e.direction == orbit::SoiDirection::Enter));
         assert!(samples < orbit::SOI_SCAN_MAX_SAMPLES / 4);
+    }
+
+    /// §2.6.6 item 4, wired to a surface: `World::soi_scan_strides`
+    /// reports the scan's own `h`/`v_rel_max` for a fixture conic —
+    /// asserted against `scan_strides` directly AND against an
+    /// independent in-test recomputation of the spec formula — and
+    /// `Ok(None)` (never a fabricated `h`) for a vessel with no
+    /// stamped conic.
+    #[test]
+    fn soi_scan_strides_reports_the_scans_own_h() {
+        let mut w = World::with_system(test_system());
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SpawnVessel {
+                parent: BodyId::from("p"),
+                elements: leo_elements(),
+            },
+        );
+        w.step_frame(1).unwrap();
+        // The report IS the scan's own stride set — one shared seam.
+        let orbit = w.vessels[&VesselId(0)].orbit().unwrap().clone();
+        assert_eq!(
+            w.soi_scan_strides(VesselId(0)).unwrap().unwrap(),
+            w.orbits().scan_strides(&orbit).unwrap()
+        );
+        // And each row is the spec formula recomputed independently:
+        // `h = ceil(0.1·r_soi / v_rel_max · TICK_HZ)` over the
+        // {parent p} ∪ {child m} candidate set.
+        let scans = w.soi_scan_strides(VesselId(0)).unwrap().unwrap();
+        assert_eq!(scans.len(), 2);
+        let v_v = orbit::speed_bound(&leo_elements(), MU_TERRIN).unwrap();
+        let v_m = orbit::speed_bound(&circular_elements(RASK_A, 0.0), MU_TERRIN).unwrap();
+        let h = |v_rel: f64, r_soi: f64| {
+            (0.1 * r_soi / v_rel * csp_core::TICK_HZ as f64)
+                .ceil()
+                .max(1.0) as u64
+        };
+        assert_eq!(scans[0].body, BodyId::from("p"));
+        assert_eq!(scans[0].stride_ticks, h(v_v, TERRIN_SOI));
+        assert_eq!(scans[0].v_rel_max_m_per_s, v_v);
+        assert_eq!(scans[1].body, BodyId::from("m"));
+        assert_eq!(scans[1].stride_ticks, h(v_v + v_m, RASK_SOI));
+        assert_eq!(scans[1].v_rel_max_m_per_s, v_v + v_m);
+        // Unknown ids refuse like the other vessel-named queries…
+        assert!(matches!(
+            w.soi_scan_strides(VesselId(99)),
+            Err(SimError::Recoverable(_))
+        ));
+        // …and a vessel off rails carries no stamped conic — the scan
+        // never runs on it, so the report is `None`, not an invented
+        // stride.
+        w.vessels.get_mut(&VesselId(0)).unwrap().state = VesselState::SurfaceLatched(SurfacePose {
+            body: BodyId::from("p"),
+            latitude_rad: 0.0,
+            longitude_rad: 0.0,
+            altitude_m: 50.0,
+            orientation: DQuat::IDENTITY,
+        });
+        assert_eq!(w.soi_scan_strides(VesselId(0)).unwrap(), None);
     }
 
     // ==================== M2-C: the physics bubble ====================

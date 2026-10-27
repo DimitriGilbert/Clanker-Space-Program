@@ -674,6 +674,23 @@ impl App {
             });
         let command_log = csp_view::save::encode_command_log(self.view.sim.command_log())
             .map_err(|e| e.to_string());
+        // §2.6.6 item 4: the scan's `h`/`v_rel_max` report for the
+        // active vessel — the debug overlay's bundle twin. A refusal
+        // ("no active vessel", "not on rails", a model error) is
+        // diagnostic like the save/command-log refusals: it lands in
+        // error.txt rather than dropping the file silently.
+        let soi_scan = self
+            .view
+            .sim
+            .active_vessel()
+            .ok_or_else(|| "no active vessel".to_string())
+            .and_then(|id| {
+                self.view
+                    .sim
+                    .soi_scan_strides(id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "active vessel not on rails — nothing scanned".to_string())
+            });
         bugreport::BugReportInput {
             title,
             error: error.to_string(),
@@ -683,6 +700,7 @@ impl App {
             data_set_hash,
             state_hash: self.view.sim.state_hash().ok(),
             save_seed: Some(self.view.sim.save_seed()),
+            soi_scan,
             gpu_adapter: self.gpu_info.as_ref().map(|(a, _)| a.clone()),
             gpu_backend: self.gpu_info.as_ref().map(|(_, b)| b.clone()),
             log_tail: logring::tail(),
@@ -3254,6 +3272,18 @@ pub fn bug_report_cli() -> Result<(), String> {
         data_set_hash,
         state_hash: view.sim.state_hash().ok(),
         save_seed: Some(view.sim.save_seed()),
+        // §2.6.6 item 4's report — a fresh session may have no active
+        // vessel; the reason lands in error.txt like a save refusal.
+        soi_scan: view
+            .sim
+            .active_vessel()
+            .ok_or_else(|| "no active vessel".to_string())
+            .and_then(|id| {
+                view.sim
+                    .soi_scan_strides(id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "active vessel not on rails — nothing scanned".to_string())
+            }),
         gpu_adapter: None,
         gpu_backend: None,
         log_tail: logring::tail(),
@@ -3623,6 +3653,13 @@ mod tests {
             data_set_hash: Some([0x5Au8; 32]),
             state_hash: Some([0xA5u8; 32]),
             save_seed: Some(42),
+            // §2.6.6 item 4's bundle artifact — one row proves the
+            // file lands and formats the scan's own numbers.
+            soi_scan: Ok(vec![csp_view::orbit::SoiScan {
+                body: "terrin".into(),
+                stride_ticks: 4_096,
+                v_rel_max_m_per_s: 2_287.0,
+            }]),
             gpu_adapter: Some("test adapter".into()),
             gpu_backend: Some("test backend".into()),
             log_tail: vec!["info  csp: hello".into()],
@@ -3636,10 +3673,14 @@ mod tests {
             "fingerprint.json",
             "save.cspsave",
             "commands.bin",
+            "soi_scan.txt",
             "log.txt",
         ] {
             assert!(bundle.join(name).exists(), "{name} missing");
         }
+        // The stride file carries the report — h in ticks and seconds.
+        let strides = std::fs::read_to_string(bundle.join("soi_scan.txt")).unwrap();
+        assert!(strides.contains("terrin: h = 4096 ticks (64.000 s)"));
         let decoded =
             csp_view::save::decode_save(&std::fs::read(bundle.join("save.cspsave")).unwrap())
                 .unwrap();

@@ -157,6 +157,16 @@ impl Default for WarpMirror {
     }
 }
 
+/// The §2.6.6-item-4 SOI scan report for the resolved-focus vessel —
+/// mirrored each frame by [`sync_mirrors`] out of `SyncInput`, which
+/// `end_frame` stages from [`SimWorld::soi_scan_strides`]. The debug
+/// panel prints these `h` values verbatim: they are the scan's own
+/// strides, so the overlay can never drift from the scan (the reason
+/// [`orbit::PatchedConics::scan_strides`] shares the scan's helpers).
+/// Never authoritative — a COPY like every mirror (Appendix A item 1).
+#[derive(Resource, Default)]
+pub struct SoiScanMirror(pub csp_ui::SoiScanReport);
+
 /// Session toggles for the player-optional panels (§2.2-C session
 /// data — never sim state): the M0 debug scaffold (adapter/tick
 /// internals — dev-facing, off by default) and the controls-help card
@@ -427,27 +437,33 @@ struct SyncInput {
     clock: SimTime,
     warp_level: u32,
     ticks_last_frame: u64,
+    /// The §2.6.6-item-4 report staged by `end_frame` — see
+    /// [`SoiScanMirror`].
+    soi_scan: csp_ui::SoiScanReport,
 }
 
 /// The Sync bridge (§2.5 #3): copy the staged post-step sim values into the
 /// presentation-only mirrors. The sole writer of [`Clock`], [`WarpMirror`],
-/// and [`FrameStats`].
+/// [`SoiScanMirror`], and [`FrameStats`].
 fn sync_mirrors(
     input: Res<SyncInput>,
     mut clock: ResMut<Clock>,
     mut stats: ResMut<FrameStats>,
     mut warp: ResMut<WarpMirror>,
+    mut soi_scan: ResMut<SoiScanMirror>,
 ) {
     clock.0 = input.clock;
     warp.0 = input.warp_level;
     stats.ticks_last_frame = input.ticks_last_frame;
     stats.frames += 1;
+    soi_scan.0 = input.soi_scan.clone();
 }
 
-/// The panel flags + the progression mirror + the global cue channel
-/// as one system param — keeps `build_ui` under the system-parameter
-/// cap. `sfx` is where a dropped panel command lands its notice (the
-/// §3.7 rule: a click either does something or says why not).
+/// The panel flags, the progression mirror, the global cue channel,
+/// and the §2.6.6 scan mirror as one system param — keeps `build_ui`
+/// under the system-parameter cap. `sfx` is where a dropped panel
+/// command lands its notice (the §3.7 rule: a click either does
+/// something or says why not).
 #[derive(bevy_ecs::system::SystemParam)]
 struct ProgramUi<'w> {
     /// Optional-panel toggles.
@@ -458,6 +474,9 @@ struct ProgramUi<'w> {
     sfx: ResMut<'w, flight::FlightSfx>,
     /// The right-click part menu's session state.
     menu: ResMut<'w, PartMenuRes>,
+    /// The debug panel's §2.6.6-item-4 SOI scan mirror — a `Sync`-written
+    /// copy like `Clock`/`WarpMirror`, read-only here.
+    soi_scan: Res<'w, SoiScanMirror>,
 }
 
 /// The map-mode mirrors + panel session states as one system param —
@@ -543,6 +562,7 @@ fn build_ui(
         warp_level: warp.0,
         warp_requested: session.warp_requested,
         warp_effective: session.warp_effective,
+        soi_scan: &prog_ui.soi_scan.0,
         fatal_reason: session.fatal.map(|e| e.reason()),
     };
     let mut panel_output = csp_ui::DebugPanelOutput::default();
@@ -2143,6 +2163,9 @@ impl View {
         world.insert_resource(EguiPass::default());
         world.insert_resource(UiOutbox::default());
         world.insert_resource(SyncInput::default());
+        // The §2.6.6-item-4 scan mirror — `sync_mirrors`'s fifth
+        // write target (Clock/WarpMirror/FrameStats are the others).
+        world.insert_resource(SoiScanMirror::default());
 
         // M1-D map resources (see map.rs): the body table/orbit model are
         // data-derived constants; MapInput/MapSnapshot/… are session state.
@@ -2508,10 +2531,16 @@ impl View {
     /// post-step sim values into `SyncInput` first so the mirror writes are
     /// the `sync` schedule's [`sync_mirrors`] system, not bare statements.
     pub fn end_frame(&mut self) {
+        // §2.6.6 item 4: the debug overlay's `h` report rides the
+        // same SyncInput→mirror staging as the clock — the values are
+        // the scan's own (computed at `Self::soi_scan_report`), never
+        // re-derived presentation-side.
+        let soi_scan = self.soi_scan_report();
         self.world.insert_resource(SyncInput {
             clock: self.sim.clock(),
             warp_level: self.sim.warp_level(),
             ticks_last_frame: self.ticks_last_frame,
+            soi_scan,
         });
         // The map's sim reads are staged here too (§2.5: Sync/Presentation
         // never read csp-sim) — vessel orbit states + the clock; positions
@@ -2602,6 +2631,45 @@ impl View {
             return Some(v);
         }
         self.flight_focus()
+    }
+
+    /// §2.6.6 item 4's report for the resolved-focus vessel, flattened
+    /// to the panel's plain rows for `SyncInput`→[`SoiScanMirror`].
+    /// The strides come from [`SimWorld::soi_scan_strides`] — the
+    /// scan's own helpers, so the overlay can never disagree with the
+    /// scan it describes. A non-rails focus carries no stamped conic
+    /// (the `schedule_next_soi` invariant: SOI events are only ever
+    /// scheduled while on rails), and a model refusal is reported the
+    /// same way — `unavailable` always names the reason rather than
+    /// showing an empty list that reads as "no SOIs exist".
+    fn soi_scan_report(&self) -> csp_ui::SoiScanReport {
+        let Some(vessel) = self.resolved_focus() else {
+            return csp_ui::SoiScanReport::default();
+        };
+        match self.sim.soi_scan_strides(vessel) {
+            Ok(Some(scans)) => csp_ui::SoiScanReport {
+                vessel: Some(vessel.0),
+                rows: scans
+                    .iter()
+                    .map(|s| csp_ui::SoiScanRow {
+                        body: s.body.as_str().to_string(),
+                        stride_ticks: s.stride_ticks,
+                        v_rel_max_mps: s.v_rel_max_m_per_s,
+                    })
+                    .collect(),
+                unavailable: None,
+            },
+            Ok(None) => csp_ui::SoiScanReport {
+                vessel: Some(vessel.0),
+                rows: Vec::new(),
+                unavailable: Some("focused vessel not on rails — its conic isn't scanned".into()),
+            },
+            Err(e) => csp_ui::SoiScanReport {
+                vessel: Some(vessel.0),
+                rows: Vec::new(),
+                unavailable: Some(e.to_string()),
+            },
+        }
     }
 
     /// C02-F1/C02-F2: the view's focus boundary pushes the resolved

@@ -209,6 +209,10 @@ pub struct SoiScan {
     pub body: BodyId,
     /// `h` in whole ticks: `ceil(0.1·r_soi / v_rel_max · TICK_HZ)`, min 1.
     pub stride_ticks: u64,
+    /// The relative-speed bound `h` was computed from (m/s) — the spec's
+    /// "increasing `v_rel_max` fidelity reduces `h`" is only checkable
+    /// when the bound itself is reported alongside the stride.
+    pub v_rel_max_m_per_s: f64,
 }
 
 /// §2.8 verbatim: a conic is elements plus the sim-time they are stamped
@@ -1299,6 +1303,7 @@ impl PatchedConics {
             out.push(SoiScan {
                 body: cand.body,
                 stride_ticks: stride_ticks(cand.r_soi, v_rel_max),
+                v_rel_max_m_per_s: v_rel_max,
             });
         }
         Ok(out)
@@ -2256,11 +2261,16 @@ mod tests {
         assert_eq!(scans[0].body, BodyId::from("p"));
         assert_eq!(scans[1].body, BodyId::from("m"));
         // The reported strides are the spec formula evaluated
-        // independently — the same values `scan_candidate` steps by.
+        // independently — the same values `scan_candidate` steps by —
+        // and each row reports the `v_rel_max` its `h` derives from
+        // (the parent's bound is the vessel's own; a child's adds the
+        // child's bound by triangle inequality).
         let v_v = speed_bound(&s.elements, MU_TERRIN).unwrap();
         let v_m = speed_bound(&circular_elements(moon_a, 0.0), MU_TERRIN).unwrap();
         assert_eq!(scans[0].stride_ticks, stride_h(v_v, 0.0, TERRIN_SOI).1);
+        assert_eq!(scans[0].v_rel_max_m_per_s, v_v);
         assert_eq!(scans[1].stride_ticks, stride_h(v_v, v_m, moon_soi).1);
+        assert_eq!(scans[1].v_rel_max_m_per_s, v_v + v_m);
     }
 
     /// A child carrying an SOI but no elements is a model error — and

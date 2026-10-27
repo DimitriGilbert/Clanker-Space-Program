@@ -9,6 +9,7 @@
 //! | `save.cspsave` | the §7.7 versioned save (the world at the halt) |
 //! | `commands.bin` | the §7.6 command log (bincode) |
 //! | `fingerprint.json` | the §7.1 determinism fingerprint |
+//! | `soi_scan.txt` | the §2.6.6-item-4 `h`/`v_rel_max` report for the active vessel |
 //! | `error.txt` | the halt reason + sim tick |
 //! | `system.txt` | OS/arch/adapter report |
 //! | `log.txt` | the last [`crate::logring::TAIL_LINES`] log lines |
@@ -60,6 +61,12 @@ pub struct BugReportInput {
     /// offers/rolls (W1.5's "seed surfaced in the bug-report" row).
     /// `None` on the panic path.
     pub save_seed: Option<u64>,
+    /// The §2.6.6-item-4 SOI scan report for the active vessel at the
+    /// halt — the debug overlay's `h`/`v_rel_max` rows, produced by
+    /// `World::soi_scan_strides` so the postmortem sees the scan's own
+    /// numbers. `Err` carries why there is none (the `save`/
+    /// `command_log` convention: the reason is itself diagnostic).
+    pub soi_scan: Result<Vec<csp_view::orbit::SoiScan>, String>,
     /// The GPU adapter name, when the session had one.
     pub gpu_adapter: Option<String>,
     /// The wgpu backend label, when the session had one.
@@ -150,7 +157,8 @@ pub fn write_bundle_dir(dir: &Path, input: &BugReportInput) -> Result<(), Bundle
         b"Bug report bundle for Clanker Space Program.\n\
           Send this whole folder to the developer. It contains the save\n\
           (save.cspsave), the deterministic command log (commands.bin),\n\
-          the determinism fingerprint (fingerprint.json), the halt\n\
+          the determinism fingerprint (fingerprint.json), the SOI scan\n\
+          strides the debug overlay showed (soi_scan.txt), the halt\n\
           reason (error.txt), system info (system.txt), and the last\n\
           500 log lines (log.txt).\n",
     );
@@ -164,6 +172,9 @@ pub fn write_bundle_dir(dir: &Path, input: &BugReportInput) -> Result<(), Bundle
     if let Err(reason) = &input.command_log {
         error_text.push_str(&format!("command-log encode failed: {reason}\n"));
     }
+    if let Err(reason) = &input.soi_scan {
+        error_text.push_str(&format!("soi scan report unavailable: {reason}\n"));
+    }
     write("error.txt", error_text.as_bytes());
     write("system.txt", system_info(input).as_bytes());
     write("fingerprint.json", fingerprint(input).as_bytes());
@@ -172,6 +183,9 @@ pub fn write_bundle_dir(dir: &Path, input: &BugReportInput) -> Result<(), Bundle
     }
     if let Ok(log) = &input.command_log {
         write("commands.bin", log);
+    }
+    if let Ok(scans) = &input.soi_scan {
+        write("soi_scan.txt", soi_scan_text(scans).as_bytes());
     }
     write("log.txt", (input.log_tail.join("\n") + "\n").as_bytes());
     match first_err {
@@ -194,11 +208,34 @@ pub fn write_panic_bundle(root: &Path, panic_text: &str, log_tail: Vec<String>) 
         data_set_hash: None,
         state_hash: None,
         save_seed: None,
+        soi_scan: Err("no sim access inside the panic hook".into()),
         gpu_adapter: None,
         gpu_backend: None,
         log_tail,
     };
     write_bug_report(root, "panic", &input).ok()
+}
+
+/// `soi_scan.txt` — the §2.6.6-item-4 report the debug overlay was
+/// showing: one line per scan candidate, `h` in ticks *and* seconds
+/// (the guarantee is stated in wall terms — "never misses a residence
+/// longer than `h`") plus the `v_rel_max` bound it derives from.
+fn soi_scan_text(scans: &[csp_view::orbit::SoiScan]) -> String {
+    let mut s = String::from(
+        "# §2.6.6 SOI scan strides for the active vessel — the scan may\n\
+         # miss an SOI residence shorter than h. h = ceil(0.1·r_soi /\n\
+         # v_rel_max · 64) ticks; v_rel_max bounds relative speed.\n",
+    );
+    for scan in scans {
+        s.push_str(&format!(
+            "{}: h = {} ticks ({:.3} s), v_rel_max = {:.3} m/s\n",
+            scan.body,
+            scan.stride_ticks,
+            scan.stride_ticks as f64 / csp_core::TICK_HZ as f64,
+            scan.v_rel_max_m_per_s,
+        ));
+    }
+    s
 }
 
 /// `system.txt` — the OS/arch/adapter report. Std-only fields (there

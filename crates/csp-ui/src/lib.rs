@@ -118,12 +118,56 @@ pub(crate) fn paint_chip_text(
     painter.galley(text_rect.min, galley, color);
 }
 
+/// One SOI-scan candidate's reported stride — the §2.6.6-item-4 `h`,
+/// flattened to plain data by `csp-view` (`csp-ui` never sees sim
+/// types, so `csp_sim::orbit::SoiScan` arrives as this row).
+#[derive(Clone, Debug)]
+pub struct SoiScanRow {
+    /// The candidate body's data id ("terrin", "rask").
+    pub body: String,
+    /// `h` in whole sim ticks — a residence shorter than this may be
+    /// missed by the scan (that IS the guarantee, stated plainly).
+    pub stride_ticks: u64,
+    /// The relative-speed bound `h` was computed from (m/s) — carried
+    /// so the report shows *why* `h` is what it is ("increasing
+    /// `v_rel_max` fidelity reduces `h`").
+    pub v_rel_max_mps: f64,
+}
+
+/// The debug panel's §2.6.6-item-4 section — the resolved-focus
+/// vessel's SOI scan report, mirrored plain. `unavailable` exists so
+/// a missing report always says *why* ("not on rails" reads very
+/// differently from "no SOIs exist"): SOI events are only ever
+/// scheduled while on rails, so a bubble/latched focus has no `h`.
+#[derive(Clone, Debug)]
+pub struct SoiScanReport {
+    /// The vessel the report covers (`None` = nothing focused).
+    pub vessel: Option<u64>,
+    /// Per-candidate `h` rows — the scan's own values.
+    pub rows: Vec<SoiScanRow>,
+    /// Why `rows` is empty; `None` while the report is live.
+    pub unavailable: Option<String>,
+}
+
+impl Default for SoiScanReport {
+    /// The pre-staging state: nothing focused, no live report — shown
+    /// as "unavailable", never as an empty candidate set.
+    fn default() -> Self {
+        Self {
+            vessel: None,
+            rows: Vec::new(),
+            unavailable: Some("no focused vessel".to_string()),
+        }
+    }
+}
+
 /// Everything the M0 debug panel needs — mirrors and session values only.
 ///
 /// Populated per frame by the `UiBuild` system in `csp-view`. Every field is
 /// either a presentation mirror of sim state (`sim_seconds`, `tick`,
-/// `warp_level`, `ticks_last_frame`) or session/presentation data that never
-/// reaches the sim (`frame_dt_ms`, adapter strings, `warp_requested`).
+/// `warp_level`, `ticks_last_frame`, `soi_scan`) or session/presentation
+/// data that never reaches the sim (`frame_dt_ms`, adapter strings,
+/// `warp_requested`).
 #[derive(Clone, Debug)]
 pub struct DebugPanelInput<'a> {
     /// GPU adapter name — session info written once by `csp-app`.
@@ -149,6 +193,10 @@ pub struct DebugPanelInput<'a> {
     /// The multiplier the controller emits after §2.6.3 auto-derate; when it
     /// differs from `warp_requested` the panel says so.
     pub warp_effective: u64,
+    /// The §2.6.6-item-4 SOI scan report for the focused vessel —
+    /// `SoiScanMirror` staged each frame by `csp-view` from
+    /// `World::soi_scan_strides`.
+    pub soi_scan: &'a SoiScanReport,
     /// §2.13 halt reason when the sim is stopped, else `None`.
     pub fatal_reason: Option<&'a str>,
 }
@@ -200,6 +248,36 @@ pub fn debug_panel(
                 output.warp_step += 1;
             }
         });
+        ui.separator();
+        // §2.6.6 item 4: the SOI scan's stride guarantee is only
+        // honest while `h` is observable — a residence shorter than
+        // `h` may be missed, so the panel prints the scan's own
+        // strides (mirrored, never recomputed here). An absent report
+        // always says why — "not on rails" is a different fact from
+        // "no SOI candidates".
+        let scan = input.soi_scan;
+        match &scan.unavailable {
+            Some(reason) => {
+                ui.label(format!("soi scan: {reason}"));
+            }
+            None => {
+                let subject = scan
+                    .vessel
+                    .map_or_else(|| "focused".to_string(), |v| format!("vessel {v}"));
+                ui.label(format!(
+                    "soi scan ({subject}) — may miss a residence shorter than h:"
+                ));
+                for row in &scan.rows {
+                    ui.label(format!(
+                        "  {}: h = {} ticks ({:.2} s) @ v_rel_max {:.1} m/s",
+                        row.body,
+                        row.stride_ticks,
+                        row.stride_ticks as f64 / csp_core::TICK_HZ as f64,
+                        row.v_rel_max_mps,
+                    ));
+                }
+            }
+        }
         if let Some(reason) = input.fatal_reason {
             ui.colored_label(egui::Color32::RED, format!("SIM HALTED — {reason}"));
         }
