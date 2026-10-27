@@ -725,7 +725,14 @@ fn get_quat(args: &Value, key: &str) -> Result<Option<csp_core::DQuat>, ToolFail
                 a[i].as_f64()
                     .ok_or_else(|| ToolFail::Invalid(format!("{key}[{i}] must be a number")))
             };
-            // DQuat's serde order is (w, x, y, z).
+            // The WIRE order is [w, x, y, z] — scalar-first, matching
+            // the Rhai `steer_quat(w, x, y, z)` convention — hence the
+            // manual unpack: `DQuat`'s own serde order is the struct
+            // declaration order {x, y, z, w}, and telemetry emits
+            // `rot` as an {"x":…,"y":…,"z":…,"w":…} object. An agent
+            // echoing a telemetry quaternion back must therefore map
+            // {x,y,z,w} → [w,x,y,z]; a permutation passes the sim's
+            // norm-only ingest gate silently (C27-F3).
             Ok(Some(csp_core::DQuat::new(f(1)?, f(2)?, f(3)?, f(0)?)))
         }
         _ => Err(ToolFail::Invalid(format!("{key} must be [w, x, y, z]"))),
@@ -745,7 +752,6 @@ pub fn tools_v1() -> Value {
     let f = || json!({"type": "number"});
     let b = || json!({"type": "boolean"});
     let v3 = || json!({"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3});
-    let v4 = || json!({"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4});
     json!([
         sim(
             "telemetry.get",
@@ -760,13 +766,21 @@ pub fn tools_v1() -> Value {
         sim(
             "vessel.control",
             "Control verbs for one vessel: throttle, steer_dir (world dir), explicit \
-             attitude, or hold_attitude. Requires the caller's lease (take_control first).",
+             attitude, or hold_attitude. Requires the caller's lease (take_control first). \
+             `attitude.rot` is a quaternion in scalar-first wire order [w, x, y, z] — \
+             telemetry emits rot as an {\"x\":…,\"y\":…,\"z\":…,\"w\":…} object, so a \
+             telemetry-to-command round-trip must re-map the components (the sim's \
+             ingest gate checks the norm only; a permutation applies silently).",
             obj(
                 json!({
                     "vessel": u(),
                     "throttle": f(),
                     "steer_dir": v3(),
-                    "attitude": {"type": "object", "properties": {"rot": v4(), "ang_vel": v3()}},
+                    "attitude": {"type": "object", "properties": {
+                        "rot": {"type": "array", "items": {"type": "number"},
+                                "minItems": 4, "maxItems": 4,
+                                "description": "quaternion [w, x, y, z] (scalar-first)"},
+                        "ang_vel": v3()}},
                     "hold_attitude": b(),
                 }),
                 &["vessel"]
@@ -963,6 +977,66 @@ mod tests {
             )
             .expect("response");
         assert_eq!(out["error"]["code"], INVALID_PARAMS);
+    }
+
+    /// C27-F3: `attitude.rot` is scalar-first `[w, x, y, z]` on the
+    /// wire — a permutation passes the sim's norm-only ingest gate
+    /// silently, so the order is pinned through a real drain: the
+    /// committed `SetAttitude` in the command log must carry exactly
+    /// `DQuat::new(x, y, z, w)` for wire `[w, x, y, z]`, all-distinct
+    /// components so a swap is observable.
+    #[test]
+    fn attitude_rot_is_scalar_first_on_the_wire() {
+        // A physical vessel is required — `SetAttitude` rejects on
+        // rails/unknown vessels and a rejected command never reaches
+        // the log. The flight-launch fixture world + the bench's pad
+        // spawn give a real InBubble body.
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../data/test-fixtures/flight-launch");
+        let recipe = csp_bench::scenarios::find("flight-launch").expect("recipe");
+        let mut world = (recipe.initial)(&dir).expect("fixture world");
+        csp_bench::scenarios::spawn_pad(&mut world).expect("pad spawn");
+        let game = Arc::new(LocalGame::new(
+            world,
+            std::env::temp_dir().join("csp-mcp-quat-saves"),
+        ));
+        let m = Mcp::new(game.clone());
+        init(&m, 0);
+        let out = m
+            .handle(
+                0,
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": {"name": "vessel.take_control",
+                                   "arguments": {"vessel": 0}}}),
+            )
+            .expect("response");
+        assert_eq!(out["result"]["isError"], false, "{out}");
+        // [w=0.9, x=0.1, y=0.2, z=0.3] — distinct components; norm² =
+        // 0.95 > 0 passes the ingest gate as-is.
+        let out = m
+            .handle(
+                0,
+                &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                        "params": {"name": "vessel.control",
+                                   "arguments": {"vessel": 0,
+                                                 "attitude": {"rot": [0.9, 0.1, 0.2, 0.3],
+                                                              "ang_vel": [0.0, 0.0, 0.0]}}}}),
+            )
+            .expect("response");
+        assert_eq!(out["result"]["isError"], false, "{out}");
+        game.with_world(|w| {
+            let Some((_, SimCommand::SetAttitude { rot, .. })) = w.command_log().last() else {
+                panic!(
+                    "the SetAttitude must have committed to the command log: {:?}",
+                    w.command_log()
+                );
+            };
+            assert_eq!(
+                *rot,
+                csp_core::DQuat::new(0.1, 0.2, 0.3, 0.9),
+                "wire [w,x,y,z] must unpack to DQuat{{x,y,z,w}} — a permutation is silent"
+            );
+        });
     }
 
     /// R19-F20: a non-object `attitude` is Invalid-params — it must

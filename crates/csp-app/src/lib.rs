@@ -1256,7 +1256,8 @@ impl App {
     }
 
     /// Rescan the save dir and stage the Game menu's slot list.
-    /// O(header) per save — `inspect_save` never inflates a body.
+    /// O(header) per save — [`save_header_bytes`] reads only the
+    /// framing + JSON header; `inspect_save` never inflates a body.
     fn stage_save_list(&mut self) {
         #[cfg(target_arch = "wasm32")]
         {}
@@ -1276,8 +1277,7 @@ impl App {
                     else {
                         continue;
                     };
-                    let meta = std::fs::read(&path)
-                        .ok()
+                    let meta = save_header_bytes(&path)
                         .and_then(|b| csp_view::save::inspect_save(&b).ok());
                     rows.push(csp_view::game::SaveSlotRow {
                         name,
@@ -3062,25 +3062,104 @@ fn install_panic_hook() {
     }));
 }
 
+/// The `csp --serve` flag surface (§2.12.3): `--port <u16>` overrides
+/// the fixed default port and `--bind-lan` takes the deliberate LAN
+/// bind — nothing else is a serve flag, and an unrecognized argument
+/// is a loud refusal (C27-F1: `csp --serve --port 5000` used to look
+/// honored while silently binding 47900).
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ServeFlags {
+    /// `--port`'s override — `None` keeps
+    /// `csp_server::serve::DEFAULT_PORT`.
+    pub port: Option<u16>,
+    /// `--bind-lan` — bind `0.0.0.0` instead of loopback (the
+    /// token still gates every endpoint; no TLS in v1).
+    pub bind_lan: bool,
+}
+
+/// Parse the full argv tail for `--serve` mode — `--serve` itself is
+/// the mode token, and every OTHER argument must be a known flag
+/// (`--port <u16>` / `--port=<u16>` / `--bind-lan`). Anything else is
+/// a usage error, not a silently dropped flag — the pre-C27-F1 shape
+/// let `--port 5000` read as honored while the server bound 47900.
+/// Args ahead of `--serve` are rejected too: in serve mode they are
+/// just as unclaimed.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn parse_serve_flags(args: &[String]) -> Result<ServeFlags, String> {
+    let mut flags = ServeFlags::default();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--serve" || a == "--bind-lan" {
+            if a == "--bind-lan" {
+                flags.bind_lan = true;
+            }
+            i += 1;
+            continue;
+        }
+        if a == "--port" {
+            flags.port = Some(
+                args.get(i + 1)
+                    .ok_or("--port needs a <u16> value")?
+                    .parse()
+                    .map_err(|_| "--port must be a u16 (0-65535)".to_string())?,
+            );
+            i += 2;
+            continue;
+        }
+        if let Some(v) = a.strip_prefix("--port=") {
+            flags.port = Some(
+                v.parse()
+                    .map_err(|_| "--port must be a u16 (0-65535)".to_string())?,
+            );
+            i += 1;
+            continue;
+        }
+        return Err(format!(
+            "unknown --serve flag '{a}' (expected --port <u16> or --bind-lan)"
+        ));
+    }
+    Ok(flags)
+}
+
 /// The `csp --serve` command (§2.12, reports-19/20 F1): the shipped
 /// hosting path — a headless `GameHost` (the sim's `World` is not
 /// `Send`, so the dedicated-game-thread host is the only correct
 /// shape), `Server::start`, and the telemetry SPA's packaged `dist/`
-/// as `spa_dir`. The session shares the game's own `saves/` dir so a
-/// `session.save` is a real §7.2 CSPSAVE the menu can load.
+/// as `spa_dir`. The session shares the game's own `saves/` dir —
+/// the same CWD-relative path the windowed app writes — so a
+/// `session.save` is a real §7.2 CSPSAVE the Game menu can load
+/// (C24-F5: it used to write `$XDG_CONFIG_HOME/csp/saves` instead,
+/// invisible to the menu).
+///
+/// Attach deviation (C21-F4): PLAN §2.12 calls the HTTP host
+/// "attach to a running game"; the windowed app hosts no server, so
+/// `--serve` hosts its own fresh headless world — seeded with the
+/// same starter craft the app opens on so the hosted world is
+/// flyable out of the box (recorded in DATA-AND-SCRIPTING §8).
 #[cfg(not(target_arch = "wasm32"))]
-pub fn serve_cli() -> Result<(), String> {
+pub fn serve_cli(flags: &ServeFlags) -> Result<(), String> {
     use std::sync::Arc;
-    let save_dir = settings_io::config_dir().join("saves");
+    // The same `saves/` the windowed app uses — CWD-relative like
+    // `crafts/` (the game must run from the data root anyway).
+    let save_dir = std::path::PathBuf::from("saves");
     // The world builds inside the game thread — `World` is `!Send`
     // (the script engine), so constructing it app-side and handing it
     // over is not an option. `View::new()` does the whole §3.1 data
     // load + engine install; the returned `View` is dropped there and
-    // its `sim` lives on the game thread end to end.
+    // its `sim` lives on the game thread end to end. The build is
+    // *fallible* — a broken `data/` is a startup refusal (spawn_full
+    // surfaces it; the old panic left a zombie server answering 200
+    // on the empty snapshot forever — C27-F4). The starter-craft seed
+    // mirrors the windowed app's first-run path (C21-F4).
     let host = csp_server::backend::GameHost::spawn_full(
         move || match csp_view::View::new() {
-            Ok(v) => v.sim,
-            Err(e) => panic!("data/ startup load failed: {e}"),
+            Ok(mut v) => v
+                .seed_starter_craft()
+                .map(|()| v.sim)
+                .map_err(|e| format!("starter craft seed failed: {e}")),
+            Err(e) => Err(format!("data/ startup load failed: {e}")),
         },
         save_dir,
         csp_server::ingress::IngressQueue::new(),
@@ -3093,7 +3172,21 @@ pub fn serve_cli() -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     let spa_dir = packaged_spa_dir();
+    let port = flags.port.unwrap_or(csp_server::serve::DEFAULT_PORT);
+    let bind = if flags.bind_lan {
+        // §2.12.3's LAN rule: the flag is explicit, the warning is
+        // printed, and the bearer token still gates every endpoint —
+        // `auth_disabled` stays false; no TLS in v1.
+        eprintln!(
+            "csp-server: WARNING --bind-lan: listening on all interfaces; \
+             the bearer token is the only auth boundary (no TLS)"
+        );
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port)
+    } else {
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port)
+    };
     let config = csp_server::serve::ServerConfig {
+        bind,
         spa_dir: Some(spa_dir),
         ..Default::default()
     };
@@ -3288,6 +3381,38 @@ fn safe_slot_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ' '))
         && name.trim() == name
         && !name.starts_with('.')
+}
+
+/// The CSPSAVE JSON header's byte bound for the slot-listing read —
+/// a real header is ~400 B; the cap keeps a corrupt `header_len`
+/// from slurping the file the way the old `std::fs::read` did
+/// (C24-F6 — the index path is O(header), never O(body)).
+#[cfg(not(target_arch = "wasm32"))]
+const SAVE_HEADER_BYTES_CAP: usize = 64 * 1024;
+
+/// Read only a `*.cspsave`'s framing + JSON header — the
+/// `magic(8) || header_len:u32le || JSON || body` prefix
+/// `inspect_save` consumes — never the compressed body (C24-F6: the
+/// slot-listing used to `std::fs::read` the whole file first).
+/// `None` for a short/unreadable file or a header_len past
+/// [`SAVE_HEADER_BYTES_CAP`]; `inspect_save` then decides validity —
+/// the same dispositions the full read gave.
+#[cfg(not(target_arch = "wasm32"))]
+fn save_header_bytes(path: &std::path::Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut framing = [0u8; 12];
+    file.read_exact(&mut framing).ok()?;
+    let header_len = u32::from_le_bytes(framing[8..12].try_into().ok()?) as usize;
+    // A claimed length past the cap: stop here — a garbage len on a
+    // non-save file must not become a bounded-but-pointless read.
+    if header_len > SAVE_HEADER_BYTES_CAP {
+        return None;
+    }
+    let mut bytes = framing.to_vec();
+    bytes.resize(12 + header_len, 0);
+    file.read_exact(&mut bytes[12..]).ok()?;
+    Some(bytes)
 }
 
 /// A craft name becomes `<name>.cspcraft` under `craft_dir` — it must
@@ -5233,5 +5358,78 @@ mod tests {
             before,
             "rail no-op on an in-bubble craft must not spam commands"
         );
+    }
+
+    /// C27-F1: `--serve`'s flag surface — `--port`/`--bind-lan` parse,
+    /// and anything else is a loud refusal (the old shape silently
+    /// bound 47900 whatever followed `--serve`).
+    #[test]
+    fn serve_flags_parse_and_reject() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            parse_serve_flags(&s(&["--serve"])).unwrap(),
+            ServeFlags::default()
+        );
+        assert_eq!(
+            parse_serve_flags(&s(&["--serve", "--port", "5000"]))
+                .unwrap()
+                .port,
+            Some(5000)
+        );
+        assert_eq!(
+            parse_serve_flags(&s(&["--serve", "--port=47901"]))
+                .unwrap()
+                .port,
+            Some(47901)
+        );
+        assert!(
+            parse_serve_flags(&s(&["--serve", "--bind-lan"]))
+                .unwrap()
+                .bind_lan
+        );
+        // Unknown flags — before or after --serve — refuse loudly.
+        for args in [
+            s(&["--serve", "--bogus"]),
+            s(&["--foo", "--serve"]),
+            s(&["--serve", "--port"]),
+            s(&["--serve", "--port", "99999"]),
+            s(&["--serve", "--port", "abc"]),
+            s(&["--serve", "positional"]),
+        ] {
+            assert!(parse_serve_flags(&args).is_err(), "{args:?}");
+        }
+    }
+
+    /// C24-F6: the save-listing read is the CSPSAVE framing + JSON
+    /// header only — never the body: a file whose tail dwarfs the
+    /// header returns `12 + header_len` bytes, a corrupt length past
+    /// the cap refuses, and a file shorter than the framing is None.
+    #[test]
+    fn save_header_bytes_reads_the_prefix_only() {
+        let dir = tempdir("savehdr");
+        // A save-shaped file: magic(8) || len(u32le) || header || a
+        // body that dwarfs it — the read must stop at the header.
+        let header = b"{}";
+        let mut bytes = b"CSPSAVE\0".to_vec();
+        bytes.extend_from_slice(&(header.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(&vec![0xAB; 512 * 1024]);
+        let path = dir.join("big.cspsave");
+        std::fs::write(&path, &bytes).unwrap();
+        let got = save_header_bytes(&path).expect("prefix read");
+        assert_eq!(got.len(), 12 + header.len());
+        assert_eq!(&got[..8], b"CSPSAVE\0");
+        // A corrupt claimed length past the cap refuses.
+        let mut bad = b"CSPSAVE\0".to_vec();
+        bad.extend_from_slice(&((SAVE_HEADER_BYTES_CAP as u32) + 1).to_le_bytes());
+        bad.extend_from_slice(&[0u8; 64]);
+        let path = dir.join("corrupt.cspsave");
+        std::fs::write(&path, &bad).unwrap();
+        assert!(save_header_bytes(&path).is_none());
+        // A file shorter than the framing is None.
+        let path = dir.join("tiny.cspsave");
+        std::fs::write(&path, b"CSPSA").unwrap();
+        assert!(save_header_bytes(&path).is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

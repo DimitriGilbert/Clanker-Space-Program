@@ -613,7 +613,7 @@ Native-only (wasm ban asserted in CI). axum + tokio live only here. Protocol pin
 |---|---|---|
 | `LocalGame` | In-process world + bounded ingress; the reference headless host (tests, `csp-mcp` bin) | `backend.rs:633` |
 | `GameHost` | Dedicated **game thread** owns the `World` (it is `!Send`); publishes snapshots into an `ArcSwap`; commands land on a channel; `inspect()` for diagnostics | `backend.rs:826` |
-| **`csp --serve`** | `csp-app` CLI flag → `serve_cli()` (`csp-app/src/lib.rs:2972`): spawns `GameHost::spawn_full` with a **fresh** `View::new()` world (full data load; Rhai engine + ascent autopilot installed; **no starter craft seeded** — the windowed app's `seed_starter_craft` is app-only), shares the game's `saves/` dir, serves the packaged telemetry SPA | `csp-app/src/lib.rs`, `csp-server/src/serve.rs::run_blocking` |
+| **`csp --serve`** | `csp-app` CLI flag → `serve_cli(&ServeFlags)` (`csp-app/src/lib.rs`): spawns `GameHost::spawn_full` with a **fresh** `View::new()` world (full data load; Rhai engine + ascent autopilot installed; starter craft **seeded** via `seed_starter_craft` like the windowed app), shares the game's CWD-relative `saves/` dir, serves the packaged telemetry SPA. Flags: `--port <u16>` (default 47900), `--bind-lan` (wildcard bind + printed warning; token still required). Unknown flags refuse loudly | `csp-app/src/lib.rs`, `csp-server/src/serve.rs::run_blocking` |
 | `csp-mcp` | The **stdio** MCP host (PLAN §2.12.1): newline-delimited JSON-RPC over its own headless sim. Flags: `--empty` (bare `World::new()` — **the default**) \| `--fixture <dir>` (the flight-launch world, engines re-installed on `session.load`), `--save-dir`, `--dashboard-dir`, `--client <name>` | `csp-bench/src/bin/csp-mcp.rs` |
 
 Honest note vs PLAN §2.12 ("attach to a running game"): **the windowed app hosts no
@@ -648,10 +648,11 @@ Every endpoint sits behind the auth guard (§5.3).
 - **Bounds**: 64 KiB max message (HTTP body + WS frame), bounded ingress queue,
   **≤32 commands per client per drain**, ≤16 live `/ws` sessions (503 over), WS ping
   every 30 s / dead-reader close at 90 s.
-- Default bind `127.0.0.1` only. PLAN §2.12.3's `--bind-lan` flag **does not exist**
-  — `serve_cli` uses `ServerConfig::default()`; the allowlist machinery for
-  non-loopback binds exists (`http.rs::BindAllowlist::for_bind`, covered by
-  `http.rs` unit tests) but no shipped flag reaches it.
+- Default bind `127.0.0.1` only. `--bind-lan` (§2.12.3) opts into a wildcard
+  (`0.0.0.0`) bind, prints a warning, and keeps the bearer-token requirement —
+  the allowlist machinery (`http.rs::BindAllowlist::for_bind`, covered by
+  `http.rs` unit tests and the `lan_bind_allowlist_*` e2e) then accepts
+  IP-literal authorities. `--port <u16>` overrides the default port.
 
 ### 5.4 MCP transport & lifecycle
 
@@ -672,7 +673,7 @@ latency, §2.2.1 control lease; or telemetry reads):
 |---|---|
 | `telemetry.get` | `{vessel?}` → one vessel's `VesselTelemetry`, or the whole table |
 | `vessel.list` | roster: id, residence, control lease, altitude, speed |
-| `vessel.control` | `{vessel, throttle?, steer_dir [3]?, attitude {rot[4], ang_vel[3]}?, hold_attitude?}` — requires the caller's lease |
+| `vessel.control` | `{vessel, throttle?, steer_dir [3]?, attitude {rot[4], ang_vel[3]}?, hold_attitude?}` — requires the caller's lease. `rot` is a quaternion in scalar-first order **`[w, x, y, z]`** — telemetry emits `rot` as an `{x,y,z,w}` object, so a round-trip must re-map components |
 | `vessel.take_control` | acquire the lease (`Lease::Agent`); vacant vessels only |
 | `vessel.release_control` | release back to Player (holder-only) |
 | `mission.nodes` | `{vessel, set {tick, dv_*}? , delete?}` — read/schedule/delete a maneuver node |
@@ -706,9 +707,13 @@ fired events (alarms, failures) are included in every report.
 
 Envelope `{proto: 1, kind, seq, tick, payload}`. Client declares `fields` — dotted
 paths into the snapshot (`vessels.0.altitude_m`, `focus.throttle`,
-`program.funds_micros`, `program.colonies`, …; source: `telemetry.rs::TelemetrySnapshot`,
+`program.funds_micros`, `program.colonies`, `program.sites`, `program.parts`, …;
+source: `telemetry.rs::TelemetrySnapshot`,
 which nests `VesselTelemetry` per vessel plus a `focus.*` alias and a
-`ProgramSnapshot` with funds/science/contracts/crew/colonies/scripts rows). There is
+`ProgramSnapshot` with funds/science/contracts/crew/colonies/scripts rows
+**plus the authoring surface** — `program.sites` rows (site id, launch flag,
+live stockpile) and `program.parts` catalog summaries (id, mass, cost, tech
+gate, BOM) so `ManufactureCraft` is authorable over the protocol). There is
 **no "send everything"**; ≤64 paths; `rate_hz` ∈ {64,32,16,8,4,2,1} (default 16);
 unresolvable paths reported in `unknown_fields`. Backpressure is drop-to-latest —
 the server re-reads the `ArcSwap` per send and never queues. `{kind: "command"}`
@@ -729,7 +734,10 @@ TOKEN=$(sed -n 1p "$XDG_RUNTIME_DIR/csp/$PID_OF_CSP.token")
 1. **Connect** — handshake (per client name):
    `POST /mcp` `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2026-07-28","capabilities":{},"clientInfo":{"name":"agent","version":"0"}}}`
    then `tools/list` if you want the descriptors.
-2. **Launch** — the fresh `--serve` world has no vessels. Either load a save
+2. **Launch** — the seeded `--serve` world opens with the starter craft
+   latched on the pad (vessel ids come from `vessel.list`; site ids and the
+   part BOM live under `program.sites`/`program.parts` in the telemetry
+   snapshot). To build another vessel, either load a save
    (`session.load {"name":"quicksave"}`) or build one through raw commands, e.g.
    `sim.command` with `{"ManufactureCraft": {...}}` (the costed launch path — build
    order against the pad's stockpile, craft delivered `SurfaceLatched` at
@@ -750,15 +758,20 @@ TOKEN=$(sed -n 1p "$XDG_RUNTIME_DIR/csp/$PID_OF_CSP.token")
 5. **Save** — `session.save {"name":"agent-run"}` → `<saves>/agent-run.cspsave`,
    loadable from the windowed app's Game menu (shared saves dir).
 
-Every step is exercised in `crates/csp-server/tests/e2e.rs` — the suite boots a real
-server over a socket and covers: token lifecycle/symlink refusal, Origin/Host
-allowlists (loopback binds; the **wildcard/LAN-bind allowlist shape is covered by
-`http.rs` unit tests** — `BindAllowlist::for_bind("0.0.0.0:47900")` — since every
-e2e bind is 127.0.0.1), `mcp_round_trip_and_external_ordering` (External
+The suite `crates/csp-server/tests/e2e.rs` boots a real server over a socket and
+covers: token lifecycle/symlink refusal, Origin/Host allowlists (loopback binds;
+the **wildcard/LAN-bind allowlist shape is covered by
+`lan_bind_allowlist_accepts_ip_authorities`** binding `0.0.0.0:0` directly),
+`mcp_round_trip_and_external_ordering` (External
 stamping + client-index assignment — the §2.2.1 proof), bounded-ingress
 backpressure, lease enforcement over the wire, local-vs-server hash parity, WS
 subscription/command/cap/envelope rules and byte budget, dashboards API+tools,
-token-free-but-allowlisted SPA serving, and `backend_calls_leave_workers_free`.
+token-free-but-allowlisted SPA serving, `backend_calls_leave_workers_free`, and
+`session_save_and_load_over_the_wire` (the step-5 save/load round-trip). Steps
+not covered at the wire level: the science verbs (`RunExperiment`/`TransmitData`/
+`RecoverData`) and `ManufactureCraft` — those are exercised in `csp-sim`'s unit
+tests and the `csp-bench` scenarios, reachable over the wire only through
+`sim.command`'s raw passthrough.
 
 ---
 
@@ -767,8 +780,6 @@ token-free-but-allowlisted SPA serving, and `backend_calls_leave_workers_free`.
 TanStack/Vite SPA (~1.1k TS; versions pinned exactly in its `package.json`; build
 output `dist/` is what `--serve` ships as `spa_dir` — `packaged_spa_dir()` resolves
 `apps/telemetry/dist/client` in dev checkouts, `share/csp/telemetry` when packaged).
-Note: `http.rs`'s "no binary wiring yet" comment about `spa_dir` is stale —
-`serve_cli` sets it.
 
 - **What it shows**: the flight dashboard from `dashboards/default.json` — gauges
   (altitude/speed/throttle), an orbit table (apsides, time-to-apsis, residence),
@@ -813,7 +824,7 @@ an agent over MCP/stdio but with no in-game UI · **[ABSENT]** not in the tree.
 | Design assistant / `MissionProfile` / LLM adapter | **[ABSENT]** (post-v1 per PLAN) | — |
 | `craft.load` / `editor.build` named MCP tools | **[ABSENT]** (use `sim.command`) | `mcp.rs::tools_v1` |
 | Attach MCP to the *windowed* app's live session | **[ABSENT]** | windowed app hosts no server |
-| `--bind-lan` flag | **[ABSENT]** (allowlist machinery exists, unflagged) | `serve_cli` uses defaults |
+| `--bind-lan` / `--port` flags | **[WIRED]** | `parse_serve_flags` + `serve_cli` (`csp-app/src/lib.rs`) |
 | Command reachability guarantee (every `SimCommand` has a production issuer or an explicit opt-out) | **[WIRED]** — CI gate | `xtask/src/lint_reach.rs`; 9 remaining `// ui-unreachable:` opt-outs in `csp-sim/src/lib.rs` (L552, 564, 631, 644, 674, 692, 778, 939, 997) |
 
 ---
@@ -825,8 +836,9 @@ an agent over MCP/stdio but with no in-game UI · **[ABSENT]** not in the tree.
    passthrough for everything else (`mcp.rs::tools_v1`).
 2. **"Attach to a running game"** — PLAN §2.12 makes HTTP-MCP the attach path to a
    running game; today only `csp --serve` hosts, with a **fresh headless world**
-   (no starter craft; shares the saves dir). The windowed app runs no server, and
-   `--bind-lan` (§2.12.3) is unimplemented.
+   (seeded with the starter craft; shares the game's CWD-relative `saves/` dir).
+   The windowed app runs no server — frame-loop attach is unimplemented (v1
+   deviation, recorded per §6.5).
 3. **AI scope** — PLAN §2.11 scopes v1 ascent *and* transfer autopilots plus a
    design assistant; only the ascent autopilot exists (`csp-ai`, 222 lines). The
    transfer *planner* exists as sim machinery + map UI, not as an autopilot.
@@ -840,8 +852,11 @@ an agent over MCP/stdio but with no in-game UI · **[ABSENT]** not in the tree.
    and tourist flight are explicitly deferred (`contract.rs` module doc).
 7. **Wire encoding** — PLAN §2.12.2's "MessagePack for arrays" is deferred; the WS
    stream is JSON-only with `proto` as the bump mechanism (`http.rs` deferral note).
-8. **Stale in-tree comment** — `http.rs` claims `spa_dir` has no binary wiring;
-   `serve_cli` does set it (`csp-app/src/lib.rs::packaged_spa_dir`). The tree wins.
+8. **Quaternion wire order** — `vessel.control`'s `attitude.rot` takes
+   scalar-first `[w, x, y, z]` while `DQuat`'s serde and telemetry emit
+   `{x, y, z, w}` objects; the orders are documented in the tool descriptor
+   and pinned by `attitude_rot_is_scalar_first_on_the_wire` (a component
+   permutation passes the sim's norm-only ingest gate silently).
 
 For the authoritative testing/regeneration workflow see [BUILD-AND-DEV.md](BUILD-AND-DEV.md);
 for how the sim consumes these verbs, [SIMULATION.md](SIMULATION.md); for the panels

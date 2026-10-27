@@ -13,14 +13,20 @@ fn main() {
                 }
             });
         }
-        if std::env::args().skip(1).any(|a| a == "--serve") {
-            std::process::exit(match csp_app::serve_cli() {
-                Ok(()) => 0,
-                Err(e) => {
-                    eprintln!("--serve: {e}");
-                    1
-                }
-            });
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        if args.iter().any(|a| a == "--serve") {
+            // §2.12.3's flag surface is *parsed* — an unrecognized
+            // argument is a loud refusal, never a silently ignored
+            // `--port 5000` (C27-F1).
+            std::process::exit(
+                match csp_app::parse_serve_flags(&args).and_then(|f| csp_app::serve_cli(&f)) {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        eprintln!("--serve: {e}");
+                        1
+                    }
+                },
+            );
         }
         csp_app::run();
     }

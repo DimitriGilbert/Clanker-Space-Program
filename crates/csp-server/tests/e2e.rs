@@ -34,7 +34,8 @@ async fn boot_with_full(
             .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned()),
     )
     .join(format!("csp-e2e-{}", std::process::id()));
-    let host = Arc::new(GameHost::spawn_full(make, dir, queue, None).expect("game host"));
+    let host =
+        Arc::new(GameHost::spawn_full(move || Ok(make()), dir, queue, None).expect("game host"));
     let backend: Arc<dyn ControlBackend + Send + Sync> = host.clone();
     let cfg = ServerConfig {
         bind: "127.0.0.1:0".parse().expect("bind"),
@@ -57,7 +58,7 @@ async fn boot_dashboards() -> (Server, Arc<GameHost>, PathBuf) {
     )
     .join(format!("csp-e2e-dash-{}", std::process::id()));
     let host = Arc::new(
-        GameHost::spawn_full(World::new, dir.clone(), IngressQueue::new(), None)
+        GameHost::spawn_full(|| Ok(World::new()), dir.clone(), IngressQueue::new(), None)
             .expect("game host"),
     );
     let backend: Arc<dyn ControlBackend + Send + Sync> = host.clone();
@@ -74,9 +75,10 @@ async fn boot_dashboards() -> (Server, Arc<GameHost>, PathBuf) {
 }
 
 /// `boot` with a temp `spa_dir` shaped like the `apps/telemetry`
-/// build output (`index.html` + `assets/app.js`) — the M9d
-/// SPA-serving path no binary wires up yet. Returns the spa root so
-/// the test can prove which file was served.
+/// build output (`index.html` + `assets/app.js`) — the same serving
+/// path `csp --serve` wires to `packaged_spa_dir()` (`serve_cli`
+/// sets `ServerConfig::spa_dir` to the built `dist/client`). Returns
+/// the spa root so the test can prove which file was served.
 async fn boot_spa() -> (Server, Arc<GameHost>, PathBuf) {
     let dir = PathBuf::from(
         std::env::var("CARGO_TARGET_TMPDIR")
@@ -93,8 +95,13 @@ async fn boot_spa() -> (Server, Arc<GameHost>, PathBuf) {
     .expect("index.html");
     std::fs::write(spa.join("assets").join("app.js"), "const csp_marker = 1;\n").expect("app.js");
     let host = Arc::new(
-        GameHost::spawn_full(World::new, dir.join("saves"), IngressQueue::new(), None)
-            .expect("game host"),
+        GameHost::spawn_full(
+            || Ok(World::new()),
+            dir.join("saves"),
+            IngressQueue::new(),
+            None,
+        )
+        .expect("game host"),
     );
     let backend: Arc<dyn ControlBackend + Send + Sync> = host.clone();
     let cfg = ServerConfig {
@@ -228,7 +235,8 @@ async fn server_boots_and_serves() {
 async fn generated_token_is_prompt_and_never_served() {
     let dir = scratch("csp-e2e-gen");
     let host = Arc::new(
-        GameHost::spawn_full(World::new, dir, IngressQueue::new(), None).expect("game host"),
+        GameHost::spawn_full(|| Ok(World::new()), dir, IngressQueue::new(), None)
+            .expect("game host"),
     );
     let backend: Arc<dyn ControlBackend + Send + Sync> = host.clone();
     let cfg = ServerConfig {
@@ -315,8 +323,13 @@ async fn token_file_lifecycle_is_0600_and_cleaned_up() {
     let dir = scratch("csp-e2e-tokenfile");
     let token_dir = dir.join("runtime");
     let host = Arc::new(
-        GameHost::spawn_full(World::new, dir.join("saves"), IngressQueue::new(), None)
-            .expect("game host"),
+        GameHost::spawn_full(
+            || Ok(World::new()),
+            dir.join("saves"),
+            IngressQueue::new(),
+            None,
+        )
+        .expect("game host"),
     );
     let backend: Arc<dyn ControlBackend + Send + Sync> = host.clone();
     let cfg = ServerConfig {
@@ -371,8 +384,13 @@ async fn token_file_refuses_a_preplanted_symlink() {
     std::os::unix::fs::symlink(&target, dir.join(format!("{}.token", std::process::id())))
         .expect("symlink");
     let host = Arc::new(
-        GameHost::spawn_full(World::new, dir.join("saves"), IngressQueue::new(), None)
-            .expect("game host"),
+        GameHost::spawn_full(
+            || Ok(World::new()),
+            dir.join("saves"),
+            IngressQueue::new(),
+            None,
+        )
+        .expect("game host"),
     );
     let backend: Arc<dyn ControlBackend + Send + Sync> = host.clone();
     let cfg = ServerConfig {
@@ -1198,6 +1216,53 @@ async fn ws_focus_rekeys_when_the_focused_vessel_leaves() {
     panic!("no telemetry frame arrived");
 }
 
+/// The wire save/load round-trip the worked example's step 5
+/// promises (C27-F6): `session.save` lands a real `.cspsave` on the
+/// host's save dir, `session.list_saves` indexes it, and
+/// `session.load` restores the tick it recorded — all over POST /mcp.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_save_and_load_over_the_wire() {
+    let (server, _host) = boot().await;
+    mcp_init(server.addr, None);
+    let mcp = |id: u64, name: &str, args: Value| -> Value {
+        let (_, body) = http(
+            server.addr,
+            "POST",
+            "/mcp",
+            &[
+                ("Authorization", "Bearer e2e-token"),
+                ("Content-Type", "application/json"),
+            ],
+            &tool(id, name, args),
+        );
+        serde_json::from_str(&body).expect("json")
+    };
+    // Advance so the save records a non-zero tick.
+    let v = mcp(1, "timewarp.advance_to", json!({"tick": 64}));
+    assert_eq!(v["result"]["isError"], false, "{v}");
+    // Save → the file exists in the host's save dir and lists.
+    let v = mcp(2, "session.save", json!({"name": "wire-save"}));
+    assert_eq!(v["result"]["isError"], false, "{v}");
+    let v = mcp(3, "session.list_saves", json!({}));
+    let text = v["result"]["content"][0]["text"].as_str().expect("text");
+    assert!(text.contains("wire-save"), "{text}");
+    assert!(
+        text.contains("\"tick\":64") || text.contains("\"tick\": 64"),
+        "{text}"
+    );
+    // Advance past it, then load — the world restores the recorded
+    // tick (and the summary answers without a divergence warning).
+    let v = mcp(4, "timewarp.advance_to", json!({"tick": 128}));
+    assert_eq!(v["result"]["isError"], false, "{v}");
+    let v = mcp(5, "session.load", json!({"name": "wire-save"}));
+    assert_eq!(v["result"]["isError"], false, "{v}");
+    let text = v["result"]["content"][0]["text"].as_str().expect("text");
+    let summary: Value = serde_json::from_str(text).expect("summary json");
+    assert_eq!(summary["tick"], json!(64), "{text}");
+    assert!(summary["hash"].as_str().is_some_and(|h| !h.is_empty()));
+    server.shutdown();
+}
+
 /// M9d's SPA-serving path end to end (§2.12.3): with a real `spa_dir`
 /// the server serves the built `index.html` verbatim — token-free and
 /// carrying no secret — serves `/assets/*` token-free for the
@@ -1300,7 +1365,8 @@ async fn dashboards_unconfigured_returns_503() {
 async fn lan_bind_allowlist_accepts_ip_authorities() {
     let dir = scratch("csp-e2e-lan");
     let host = Arc::new(
-        GameHost::spawn_full(World::new, dir, IngressQueue::new(), None).expect("game host"),
+        GameHost::spawn_full(|| Ok(World::new()), dir, IngressQueue::new(), None)
+            .expect("game host"),
     );
     let backend: Arc<dyn ControlBackend + Send + Sync> = host.clone();
     let cfg = ServerConfig {

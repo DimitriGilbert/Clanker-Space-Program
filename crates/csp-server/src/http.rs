@@ -49,9 +49,10 @@
 //!   the state hash — so the tools stay session-class and
 //!   replay-irrelevant with or without a future SessionCommand
 //!   channel behind them.
-//! - **`spa_dir` has no binary wiring yet.** [`AppState::spa_dir`] is
-//!   `None` in every shipped path (no binary sets it), so `/` serves
-//!   the placeholder in production today. The verbatim `/` +
+//! - **`spa_dir` is wired by `csp --serve`.** `serve_cli` sets
+//!   [`AppState::spa_dir`] to `packaged_spa_dir()` — the built
+//!   `apps/telemetry/dist/client` — so `/` serves the real shell; a
+//!   missing dist falls back to the placeholder. The verbatim `/` +
 //!   `/assets/*` path is exercised by the `spa_serving_*` e2e, which
 //!   boots the router against a temp `spa_dir`.
 

@@ -72,8 +72,19 @@ pub struct ProgramSnapshot {
     pub scripts: Vec<ScriptRow>,
     /// Engaged autopilots by vessel id.
     pub autopilots: Vec<u64>,
-    /// Site names with live state — the program's ground truth.
-    pub sites: usize,
+    /// Surface sites — id, launch flag, live stockpile. The
+    /// `ManufactureCraft` authoring surface (C27-F5): an agent reads
+    /// the site ids here rather than guessing — this used to be a
+    /// bare count, so the launch site's id was undiscoverable over
+    /// the protocol.
+    pub sites: Vec<SiteRow>,
+    /// The installed part catalog, summarized for authoring — the
+    /// `CraftDef`/`build_resources` inputs a `ManufactureCraft`
+    /// command needs (C27-F5): id, cost, dry mass, the tech gate,
+    /// and the authored BOM per part. Config data republished per
+    /// snapshot; the table is small (one row per `data/parts/*.ron`)
+    /// and there is no other config-read channel to hang it on.
+    pub parts: Vec<PartRow>,
 }
 
 /// One colony's wire row.
@@ -89,6 +100,45 @@ pub struct ColonyRow {
     pub modules: usize,
     /// Live resource-kind count across stores.
     pub stores: usize,
+}
+
+/// One surface site's wire row — the `ManufactureCraft` `site`
+/// argument's discoverable form (C27-F5): the site id, its def's
+/// launch flag (only launch sites accept build orders), and the
+/// live stockpile the order spends.
+#[derive(Clone, Debug, Serialize)]
+pub struct SiteRow {
+    /// The `SiteId` string — `ManufactureCraft.site`'s value.
+    pub id: String,
+    /// The body the site sits on (`""` when the arena row outlives
+    /// its def — a config skew the row reports rather than hides).
+    pub body: String,
+    /// `true` = the body's launch site (`ManufactureCraft` requires it).
+    pub launch: bool,
+    /// Live stockpile `{resource: units}` — what a build order
+    /// (and `RecoverVessel` credit) spends.
+    pub inventory: BTreeMap<String, f64>,
+}
+
+/// One part-catalog entry's wire row — the authoring summary an
+/// agent needs to compose a `CraftDef`/`build_resources` for
+/// `ManufactureCraft` (C27-F5), not the whole `PartDef`.
+#[derive(Clone, Debug, Serialize)]
+pub struct PartRow {
+    /// The `PartId` string — a `CraftDef::part_ids` member's value.
+    pub id: String,
+    /// `PartCategory` rendered as its debug tag.
+    pub category: String,
+    /// Dry mass at `scale = 1` (kg).
+    pub mass_dry_kg: f64,
+    /// Funds cost at `scale = 1`, stock variant.
+    pub cost_funds: f64,
+    /// The `TechNodeId` the tech tree must have researched — the
+    /// spawn/manufacture gate's key.
+    pub tech_requirement: String,
+    /// The authored bill of materials `{resource: units}` — the
+    /// per-part share of `build_resources`.
+    pub build_resources: BTreeMap<String, f64>,
 }
 
 /// One script's wire row.
@@ -186,7 +236,45 @@ impl TelemetrySnapshot {
                 })
                 .collect(),
             autopilots: world.autopilots().keys().map(|v| v.0).collect(),
-            sites: world.economy().sites.len(),
+            sites: world
+                .economy()
+                .sites
+                .iter()
+                .map(|(id, state)| {
+                    // Geography/launch flag live in the def table
+                    // (construction config); the arena row carries
+                    // the live stockpile. A row without a def is a
+                    // config skew — report it body-less rather than
+                    // drop it silently.
+                    let def = world.site_defs().get(id);
+                    SiteRow {
+                        id: id.as_str().to_string(),
+                        body: def.map(|d| d.body.as_str().to_string()).unwrap_or_default(),
+                        launch: def.is_some_and(|d| d.launch),
+                        inventory: state
+                            .inventory
+                            .iter()
+                            .map(|(r, u)| (r.as_str().to_string(), *u))
+                            .collect(),
+                    }
+                })
+                .collect(),
+            parts: world
+                .parts()
+                .iter()
+                .map(|(id, def)| PartRow {
+                    id: id.as_str().to_string(),
+                    category: format!("{:?}", def.category),
+                    mass_dry_kg: def.mass_dry_kg,
+                    cost_funds: def.cost_funds,
+                    tech_requirement: def.tech_requirement.as_str().to_string(),
+                    build_resources: def
+                        .build_resources
+                        .iter()
+                        .map(|(r, u)| (r.as_str().to_string(), *u))
+                        .collect(),
+                })
+                .collect(),
         };
         Self {
             tick: world.clock().ticks(),
@@ -344,6 +432,70 @@ mod tests {
         let snap = TelemetrySnapshot::from_world(&w);
         assert_eq!(snap.focus_vessel_id, Some(0));
         assert!(snap.field("focus.altitude_m").is_some());
+    }
+
+    /// C27-F5: `program.sites` carries the discoverable authoring
+    /// surface — the site ids `ManufactureCraft` names, the launch
+    /// flag its apply gates on, and the live stockpile — not a bare
+    /// count. The fixture's two-site set (launch pad + downrange
+    /// field) is the assertion.
+    #[test]
+    fn program_sites_expose_ids_launch_and_inventory() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../data/test-fixtures/flight-launch");
+        let recipe = csp_bench::scenarios::find("flight-launch").expect("recipe");
+        let w = (recipe.initial)(&dir).expect("fixture world");
+        let snap = TelemetrySnapshot::from_world(&w);
+        let launch = snap
+            .program
+            .sites
+            .iter()
+            .find(|s| s.id == "terrin-launch")
+            .expect("the launch site must be listed");
+        assert!(launch.launch, "terrin-launch is the launch site");
+        assert_eq!(launch.body, "terrin");
+        let downrange = snap
+            .program
+            .sites
+            .iter()
+            .find(|s| s.id == "terrin-downrange")
+            .expect("downrange site listed");
+        assert!(!downrange.launch);
+        // The rows stay subscribable through the dotted path.
+        assert!(snap.field("program.sites").is_some());
+    }
+
+    /// C27-F5: `program.parts` carries the catalog summary a
+    /// `CraftDef`/`build_resources` author needs — id, mass, cost,
+    /// the tech gate, and the authored BOM — read off the real
+    /// `data/parts/` table.
+    #[test]
+    fn program_parts_expose_the_catalog_summary() {
+        let mut w = World::new();
+        let loaded = csp_data::load_parts(
+            &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/parts"),
+        )
+        .expect("part catalog loads");
+        w.set_parts(
+            loaded
+                .parts
+                .iter()
+                .map(|p| (p.def.id.clone(), p.def.clone()))
+                .collect(),
+        );
+        let snap = TelemetrySnapshot::from_world(&w);
+        assert!(!snap.program.parts.is_empty());
+        let pod = snap
+            .program
+            .parts
+            .iter()
+            .find(|p| p.id == "csp.pod.mk1")
+            .expect("the pod must be listed");
+        assert_eq!(pod.category, "Control");
+        assert_eq!(pod.mass_dry_kg, 800.0);
+        assert_eq!(pod.cost_funds, 2400.0);
+        assert!(!pod.tech_requirement.is_empty());
+        assert_eq!(pod.build_resources.get("metal"), Some(&60.0));
     }
 
     /// The C28-F1 regression shape: the dashboard's keyed vessel

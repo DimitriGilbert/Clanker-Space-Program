@@ -51,6 +51,9 @@ tokio-tungstenite = "0.30"
 # Fixture-built worlds for the e2e tests (the flight recipe's
 # `initial`). A dev-dep so the normal tree stays lean.
 csp-bench = { workspace = true }
+# The production def tables, for tests that install a real part/site
+# catalog into a world (the `program.parts`/`program.sites` rows).
+csp-data = { workspace = true }
 
 [lints]
 workspace = true

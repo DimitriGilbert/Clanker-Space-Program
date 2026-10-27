@@ -786,6 +786,20 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(120);
 /// hanging.
 const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Render a `catch_unwind` payload as text — a panicking world
+/// builder's message is the diagnostic the startup refusal needs
+/// (the standard hook prints it too, but the caller's error should
+/// carry the same words).
+fn panic_payload(payload: &dyn std::any::Any) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
 /// A request to the game thread — `reply` is the rendezvous channel
 /// the answer rides back on.
 enum Request {
@@ -852,14 +866,19 @@ impl GameHost {
         make: impl FnOnce() -> World + Send + 'static,
         save_dir: PathBuf,
     ) -> Result<Self, BackendError> {
-        Self::spawn_full(make, save_dir, IngressQueue::new(), None)
+        Self::spawn_full(move || Ok(make()), save_dir, IngressQueue::new(), None)
     }
 
     /// `spawn` with explicit ingress bounds and the post-restore
     /// construction-config hook (`LocalGame::with_reconfigure`'s
-    /// threaded twin).
+    /// threaded twin). `make` is *fallible*: a builder that returns
+    /// `Err` — or panics — surfaces here as a `BackendError` instead
+    /// of dying inside the thread while the pre-spawn empty snapshot
+    /// keeps serving forever (the zombie-host shape, C27-F4). The
+    /// build result rendezvouses back before `spawn_full` returns, so
+    /// a `Ok` host has its real first snapshot already published.
     pub fn spawn_full(
-        make: impl FnOnce() -> World + Send + 'static,
+        make: impl FnOnce() -> Result<World, String> + Send + 'static,
         save_dir: PathBuf,
         queue: IngressQueue,
         reconfigure: Option<Reconfigure>,
@@ -869,11 +888,33 @@ impl GameHost {
         )));
         let pub_in = published.clone();
         let (tx, rx) = std::sync::mpsc::channel::<Request>();
+        // The world-build rendezvous: the thread reports `make()`'s
+        // outcome BEFORE `spawn_full` returns — a failed build is a
+        // startup refusal, not a live-looking host serving the empty
+        // tick-0 world while every mutation answers "game thread
+        // gone" (C27-F4).
+        let (built_tx, built_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let join = std::thread::Builder::new()
             .name("csp-game".into())
             .spawn(move || {
-                let mut core = HostCore::new(make(), save_dir, queue, reconfigure);
+                // `catch_unwind` converts a panicking builder into the
+                // same honest Err — the panic message is the useful
+                // diagnostic (a broken `data/` load names itself).
+                let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(make))
+                    .map_err(|p| format!("world builder panicked: {}", panic_payload(&*p)))
+                    .and_then(|r| r);
+                let mut core = match built {
+                    Ok(world) => HostCore::new(world, save_dir, queue, reconfigure),
+                    Err(e) => {
+                        let _ = built_tx.send(Err(e));
+                        return;
+                    }
+                };
+                // Publish the REAL world first, then release the
+                // spawner: a host that answers `Ok` never shows the
+                // pre-spawn placeholder as its first read.
                 pub_in.store(Arc::new(TelemetrySnapshot::from_world(&core.world)));
+                let _ = built_tx.send(Ok(()));
                 while let Ok(req) = rx.recv() {
                     // A failed `reply.send` means *this requester*
                     // went away (a timed-out or cancelled call drops
@@ -915,11 +956,32 @@ impl GameHost {
         // library: the caller decides what a dead host means.
         let join =
             join.map_err(|e| BackendError::Session(format!("csp-game thread spawn: {e}")))?;
-        Ok(Self {
-            tx,
-            published,
-            join: Mutex::new(Some(join)),
-        })
+        // Wait out the world build: the thread signals after `make()`
+        // + the first real publish, so an `Ok` host is actually alive
+        // — a failed build is a startup refusal, never the zombie
+        // host that kept 200-ing the empty snapshot (C27-F4). A wedged
+        // *builder* still blocks here, which is honest — the same
+        // build on the calling thread would block identically.
+        match built_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                tx,
+                published,
+                join: Mutex::new(Some(join)),
+            }),
+            built => {
+                // The build failed (or the thread died before
+                // reporting — a panic past `catch_unwind`, an abort).
+                // The thread already exited; join is prompt.
+                let _ = join.join();
+                let reason = match built {
+                    Ok(Err(e)) => e,
+                    _ => "csp-game thread died before the world built".to_string(),
+                };
+                Err(BackendError::Session(format!(
+                    "game world build failed: {reason}"
+                )))
+            }
+        }
     }
 
     /// Read access on the game thread — the test/diagnostic channel
@@ -1260,6 +1322,42 @@ mod tests {
         // …but it cannot load — the honest failure lands at load.
         assert!(game.load_save("truncated").is_err());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// C27-F4: a world builder that fails — or panics — must come
+    /// back as a `BackendError`, not a dead game thread under a
+    /// live-looking host (the zombie-server shape: the pre-spawn
+    /// empty snapshot 200-ing forever while mutations answer "game
+    /// thread gone"). `serve_cli` maps this into its non-zero exit.
+    #[test]
+    fn game_host_build_failure_is_an_error_not_a_zombie() {
+        let dir = std::env::temp_dir().join(format!("csp-backend-zombie-{}", std::process::id()));
+        // The honest Err path — a `View::new()`-style data-load
+        // refusal.
+        // (`GameHost` is not `Debug`, hence the `let-else` shape over
+        // `expect_err`.)
+        let Err(err) = GameHost::spawn_full(
+            || Err("data/ startup load failed: no system".to_string()),
+            dir.clone(),
+            IngressQueue::new(),
+            None,
+        ) else {
+            panic!("a failed build must refuse");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("data/ startup load failed"), "{msg}");
+        // The panic path — `catch_unwind` converts it into the same
+        // refusal, carrying the panic's own message.
+        let Err(err) = GameHost::spawn_full(
+            || -> Result<World, String> { panic!("builder exploded") },
+            dir,
+            IngressQueue::new(),
+            None,
+        ) else {
+            panic!("a panicking build must refuse");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("builder exploded"), "{msg}");
     }
 
     /// The format-unification proof (report-04 D1): `session.save`

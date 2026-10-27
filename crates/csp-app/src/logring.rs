@@ -23,6 +23,37 @@ const TAIL_LEVEL: log::LevelFilter = log::LevelFilter::Info;
 /// a second `init` (a test binary is one process) reuses the buffer.
 static TAIL: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
 
+/// The home-dir prefix scrubbed out of ring-captured lines — `log.txt`
+/// ships in bug-report bundles to strangers, so `/home/<user>` /
+/// `%USERPROFILE%` never leaves the machine inside one (C25-F3). The
+/// console copy keeps the real path; only the tail is redacted.
+/// `OnceLock`: the prefix can't change mid-process, and `log` must
+/// stay cheap on every record.
+static HOME_PREFIX: OnceLock<Option<String>> = OnceLock::new();
+
+/// The resolved home-dir prefix to scrub, or `None` when there is
+/// nothing safe to scrub (no `HOME`/`USERPROFILE`, or a trivially
+/// short prefix like `/` that would redact every separator).
+fn home_prefix() -> Option<&'static str> {
+    HOME_PREFIX
+        .get_or_init(|| {
+            #[cfg(target_os = "windows")]
+            let home = std::env::var_os("USERPROFILE");
+            #[cfg(not(target_os = "windows"))]
+            let home = std::env::var_os("HOME");
+            home.and_then(|h| {
+                let mut s = h.to_string_lossy().into_owned();
+                // A trailing separator would turn `~/x` redaction into
+                // `~x` — strip it so the prefix always ends at the dir.
+                while s.len() > 1 && s.ends_with(['/', '\\']) {
+                    s.pop();
+                }
+                if s.len() > 1 { Some(s) } else { None }
+            })
+        })
+        .as_deref()
+}
+
 /// Install the tee logger: `env_logger`'s configuration (RUST_LOG,
 /// formatting) forwards records onward, and each record's formatted
 /// line also lands in the ring buffer. Fails soft — logging is a
@@ -48,8 +79,16 @@ pub fn tail() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Push one formatted line into the ring, evicting the oldest at the cap.
+/// Push one formatted line into the ring, evicting the oldest at the
+/// cap. The home-dir prefix is scrubbed here — one choke point, so
+/// every path-embedding log site (settings warns, bundle errors)
+/// stays simple while `log.txt` never carries `/home/<user>` into a
+/// shipped bundle (C25-F3).
 fn push(line: String) {
+    let line = match home_prefix() {
+        Some(home) => line.replace(home, "~"),
+        None => line,
+    };
     if let Some(m) = TAIL.get()
         && let Ok(mut tail) = m.lock()
     {
@@ -88,5 +127,31 @@ impl log::Log for TeeLog {
 
     fn flush(&self) {
         self.inner.flush();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // test assertions
+mod tests {
+    use super::*;
+
+    /// C25-F3: a log line embedding `$HOME` lands in the ring with
+    /// the prefix scrubbed to `~` — `log.txt` never ships the user's
+    /// absolute home path inside a bug-report bundle.
+    #[test]
+    fn tail_lines_redact_the_home_dir() {
+        init();
+        let Some(home) = home_prefix().map(|h| h.to_string()) else {
+            return; // no HOME on this host — nothing to leak
+        };
+        push(format!(
+            "WARN settings: cannot read {home}/.config/csp/settings.ron"
+        ));
+        let last = tail().last().cloned().unwrap_or_default();
+        assert!(
+            last.contains("~/.config/csp/settings.ron"),
+            "the home prefix must render as ~: {last}"
+        );
+        assert!(!last.contains(&home), "the absolute path leaked: {last}");
     }
 }
