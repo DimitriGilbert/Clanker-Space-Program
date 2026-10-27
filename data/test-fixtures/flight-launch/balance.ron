@@ -1,7 +1,7 @@
 // Global balance constants. ALL tuning lives here (PLAN §8.3).
 // Named fields only — positional tuples drift silently under reordering.
 (
-    schema_version: 11,
+    schema_version: 12,
     // Physics bubble radius (PLAN §2.3): 20 km. Vessels go on rails at the
     // radius and rejoin at 90% (18 km) — the hysteresis is csp-sim logic,
     // not a second constant.
@@ -85,4 +85,9 @@
     reliability_bench_resource: "metal",
     reliability_bench_resource_per_unit: 1.0,
     reliability_bench_seconds_per_unit: 60.0,
+    // C08 §3.5 economy block — same fields as data/balance.ron (the
+    // hire default, the per-site upkeep, the attrition grace).
+    crew_salary_per_s: 0.0005,
+    site_upkeep_funds_per_s: 0.0002,
+    attrition_grace_periods: 1,
 )

@@ -52,7 +52,17 @@ use crate::ids::ResourceId;
 /// rates, and the test-stand economics (funds per unit, the consumed
 /// `reliability_bench_resource` + its rate, seconds per unit).
 /// Mirrors `csp_sim::reliability::default_config`.
-pub const BALANCE_SCHEMA_VERSION: u32 = 11;
+/// 12 (C08-F2/F3): the §3.5 insolvency-consequence block —
+/// `crew_salary_per_s` (the UI's authored hire default, replacing the
+/// view-only hardcode that put one crew at 5.18%/month of starting
+/// funds — over PLAN:1196-1200's 2–5% staffed-base band),
+/// `site_upkeep_funds_per_s` (the "facility upkeep" half of the
+/// recurring drain, billed per installed site), and
+/// `attrition_grace_periods` (the consecutive unpaid salary periods
+/// before `StaffAttrition` starts retiring crew). Mirrors
+/// `csp_sim::economy::{DEFAULT_HIRE_SALARY_PER_S,
+/// DEFAULT_SITE_UPKEEP_FUNDS_PER_S, DEFAULT_ATTRITION_GRACE_PERIODS}`.
+pub const BALANCE_SCHEMA_VERSION: u32 = 12;
 
 /// `data/balance.ron` — the tunables every later milestone consumes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -248,4 +258,24 @@ pub struct BalanceDef {
     pub reliability_bench_resource_per_unit: f64,
     /// Sim-seconds one bench unit takes. Default `60`.
     pub reliability_bench_seconds_per_unit: f64,
+    /// C08-F2 §3.5: the hire default the UI pays (funds/sim-second) —
+    /// `SimCommand::HireCrew` carries its rate verbatim, so this is
+    /// the authored default the presentation layer reads through
+    /// `csp_sim::economy::EconomyConfig`. Authored inside the
+    /// PLAN:1196-1200 band: 20 crew at this rate plus the shipping
+    /// sites' upkeep drain ≈3.1% of the post-hire balance per
+    /// sim-month. Mirror: `csp_sim::economy::DEFAULT_HIRE_SALARY_PER_S`.
+    pub crew_salary_per_s: f64,
+    /// C08-F3 §3.5's "facility upkeep" — the recurring drain's
+    /// second half: funds/sim-second billed per installed site (the
+    /// `economy.sites` arena IS the facility surface — launch pads
+    /// and test stands) at the same monthly boundary as salaries.
+    /// Mirror: `csp_sim::economy::DEFAULT_SITE_UPKEEP_FUNDS_PER_S`.
+    pub site_upkeep_funds_per_s: f64,
+    /// C08-F3 §3.5: consecutive unpaid salary periods granted before
+    /// `StaffAttrition` retires a roster member — 1 means the first
+    /// missed payroll only warns (`Insolvent` + `FacilityDormant`)
+    /// and each further consecutive miss retires one member. Mirror:
+    /// `csp_sim::economy::DEFAULT_ATTRITION_GRACE_PERIODS`.
+    pub attrition_grace_periods: u64,
 }

@@ -5,14 +5,17 @@
 //! stays under the **≤32 MB at 100 sim-years** bound, and watches
 //! the insolvency transition fire on schedule.
 //!
-//! At M7-C the "fully staffed base" is the crew roster itself — the
-//! salary drain is the economy's recurring cost (facilities and
-//! their upkeep land with M8's colony/economy block; the harness's
-//! contract is the same: fund the program, staff it, watch the
-//! monthly ratio). The staff's `salary_per_s` total is *solved* for
-//! a target drain rate of the starting balance — the harness proves
-//! the recurring-drain machinery lands the authored rate on the
-//! money, deterministically, month after month.
+//! The "fully staffed base" is the crew roster plus the program's
+//! site facilities — C08-F3 landed the §3.5 "salaries + facility
+//! upkeep" pair: `site_upkeep_funds_per_s` drains per installed site
+//! at the same monthly boundary. The staff's `salary_per_s` total is
+//! *solved* for a target drain rate of the starting balance — the
+//! harness proves the recurring-drain machinery lands the authored
+//! rate on the money, deterministically, month after month. C08-F2
+//! adds the SHIPPED-rate gate: `shipped_salary_lands_in_band` pays
+//! `balance.ron`'s authored `crew_salary_per_s` verbatim (never the
+//! solved rate) so an out-of-band default fails the §8.3 check it
+//! was written to enforce.
 //!
 //! Everything runs through the public `World` interface — enqueue
 //! `HireCrew`/`AdvanceTo`, `step_frame`, read `funds_micros` and the
@@ -51,8 +54,16 @@ pub struct EconomyProbe {
     pub staff: usize,
     /// Target monthly drain as a fraction of the post-hire balance
     /// — the harness solves `salary_per_s` so the total charge hits
-    /// this exactly.
+    /// this exactly. Unused when `salary_per_s` is `Some`.
     pub drain_fraction: f64,
+    /// C08-F2: `Some` pays this verbatim per-hire salary (the probe
+    /// for the SHIPPED `balance.crew_salary_per_s`); `None` keeps the
+    /// solved-from-`drain_fraction` behaviour.
+    pub salary_per_s: Option<f64>,
+    /// C08-F2: install the shipping `sites.ron` so the per-site
+    /// facility upkeep joins the drain — the plan's "fully staffed
+    /// base" includes its facilities.
+    pub install_sites: bool,
     /// Months to measure the band over.
     pub band_months: u64,
     /// Total sim-years to fast-forward (the run continues at zero
@@ -84,6 +95,21 @@ pub fn staffed_base_run(probe: &EconomyProbe) -> Result<EconomyReport, SimError>
         balance.advance_to_max_events_per_frame,
     );
     w.set_economy_config(cfg)?;
+    if probe.install_sites {
+        // The shipping `sites.ron` — the staffed base's facility
+        // surface; the per-site upkeep drains at the salary boundary.
+        let sites = csp_data::load_sites(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/systems/home/sites.ron"),
+        )
+        .map_err(|_| SimError::Fatal("economy: shipping sites.ron failed to load"))?;
+        w.set_sites(
+            sites
+                .sites
+                .iter()
+                .map(|s| (s.id.clone(), s.clone()))
+                .collect(),
+        );
+    }
     let period_ticks = cfg.salary_period_ticks;
     let period_s = period_ticks as f64 / TICK_HZ as f64;
     // The monthly charge is a pure function of the roster's salary
@@ -94,7 +120,9 @@ pub fn staffed_base_run(probe: &EconomyProbe) -> Result<EconomyReport, SimError>
         .saturating_sub(cfg.hire_cost_micros.saturating_mul(probe.staff as u64));
     let total_salary =
         probe.drain_fraction * funds_after_hire as f64 / economy::MICROS_PER_FUND / period_s;
-    let salary = total_salary / probe.staff.max(1) as f64;
+    let salary = probe
+        .salary_per_s
+        .unwrap_or(total_salary / probe.staff.max(1) as f64);
     for i in 0..probe.staff {
         w.enqueue(
             csp_sim::SourceClass::Ui,
@@ -362,6 +390,52 @@ mod tests {
             b.life_support_ec_per_crew_s,
             csp_sim::life_support::DEFAULT_EC_PER_CREW_S
         );
+        // C08-F2/F3's insolvency block — same pinning contract.
+        assert_eq!(b.crew_salary_per_s, economy::DEFAULT_HIRE_SALARY_PER_S);
+        assert_eq!(
+            b.site_upkeep_funds_per_s,
+            economy::DEFAULT_SITE_UPKEEP_FUNDS_PER_S
+        );
+        assert_eq!(
+            b.attrition_grace_periods,
+            economy::DEFAULT_ATTRITION_GRACE_PERIODS
+        );
+    }
+
+    /// C08-F2: the SHIPPED hire default — `balance.ron`'s authored
+    /// `crew_salary_per_s` paid verbatim, never the solved rate —
+    /// lands the fully-staffed base inside the plan's **2–5% per
+    /// sim-month** band: 20 crew plus the three shipping sites'
+    /// authored upkeep (the facilities the plan's "base" includes).
+    /// An out-of-band default now fails the §8.3 gate it was written
+    /// to enforce — the solved probe could never see it (the report
+    /// verified: the retired view hardcode paid 5.18%/month for ONE
+    /// crew and nothing caught it).
+    #[test]
+    fn shipped_salary_lands_in_band() {
+        let authored = shipping_balance().unwrap();
+        let probe = EconomyProbe {
+            staff: 20,
+            drain_fraction: 0.0,
+            salary_per_s: Some(authored.crew_salary_per_s),
+            install_sites: true,
+            band_months: 6,
+            years: 1,
+        };
+        let report = staffed_base_run(&probe).unwrap();
+        assert_eq!(report.crew_count, probe.staff);
+        assert!(report.months.len() >= probe.band_months as usize);
+        for (tick, start, end) in report.months.iter().take(probe.band_months as usize) {
+            assert!(
+                *start > 0 && *end <= *start,
+                "month at {tick}: {start} → {end}"
+            );
+            let ratio = (*start - *end) as f64 / *start as f64;
+            assert!(
+                (0.02..=0.05).contains(&ratio),
+                "month at {tick}: shipped-rate drain {ratio:.4} outside 2–5% ({start} → {end})"
+            );
+        }
     }
 
     /// The core §8.3 check: a fully staffed base's recurring drain
@@ -373,6 +447,8 @@ mod tests {
         let probe = EconomyProbe {
             staff: 20,
             drain_fraction: 0.022, // solved just above the floor
+            salary_per_s: None,
+            install_sites: false,
             band_months: 24,
             years: 4,
         };
@@ -411,6 +487,8 @@ mod tests {
         let probe = EconomyProbe {
             staff: 20,
             drain_fraction: 0.03,
+            salary_per_s: None,
+            install_sites: false,
             band_months: 0,
             years: 100,
         };
@@ -467,6 +545,8 @@ mod tests {
         let probe = EconomyProbe {
             staff: 8,
             drain_fraction: 0.03,
+            salary_per_s: None,
+            install_sites: false,
             band_months: 0,
             years: 2,
         };

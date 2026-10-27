@@ -64,16 +64,30 @@
 //!
 //! # Insolvency
 //!
-//! §3.5: *"funds clamp at zero; unpaid salaries trigger … an
-//! `Insolvent` state is a `Clamping` event that auto-demotes warp to
-//! ×1 and notifies."* A [`charge_funds`](World::charge_funds)
-//! shortfall sets `insolvent` and schedules `EventKind::Insolvent`
-//! (`Clamping`, carrying the unpaid micros) at `clock + 1` — once
-//! per insolvency: the flag clears when a credit lifts funds above
-//! zero, and a second clamp while already insolvent schedules no
-//! duplicate. *Actions* that cost funds (hire, manufacture) instead
-//! reject `Recoverable` — you cannot buy what you cannot afford;
-//! only the *drains* (salary, contract penalties) clamp.
+//! §3.5: *"funds clamp at zero; unpaid salaries trigger
+//! `StaffAttrition` and `FacilityDormant` events; an `Insolvent`
+//! state is a `Clamping` event that auto-demotes warp to ×1 and
+//! notifies."* A [`charge_funds`](World::charge_funds) shortfall sets
+//! `insolvent` and schedules `EventKind::Insolvent` AND
+//! `EventKind::FacilityDormant` (both `Clamping`) at `clock + 1` —
+//! once per insolvency: the flag clears when a credit lifts funds
+//! above zero, and a second clamp while already insolvent schedules
+//! no duplicates. Dormant IS the flag: while `insolvent` holds, the
+//! program's facility verbs (`ManufactureCraft`, `RunBenchTest` —
+//! gated once in `apply_command`) reject `Recoverable`, and any
+//! credit lifting funds above zero restores them. *Actions* that
+//! cost funds (hire, manufacture) instead reject `Recoverable` —
+//! you cannot buy what you cannot afford; only the *drains*
+//! (salary, upkeep, contract penalties) clamp.
+//!
+//! `StaffAttrition` is the salary firing's own bookkeeping:
+//! [`fire_salary_due`](World::fire_salary_due) counts consecutive
+//! salary shortfalls in `unpaid_salary_streak`; past the authored
+//! `attrition_grace_periods` each further missed payroll retires one
+//! member — the highest-salary `Active` member first (attrition
+//! relieves the drain fastest), lowest `CrewId` on ties — scheduled
+//! as the `Clamping` event plus a notification-log entry. A fully
+//! paid period resets the streak.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -131,6 +145,21 @@ pub const DEFAULT_ABANDON_RECOVERY: f64 = 0.25;
 /// build-order throughput: a craft takes
 /// `mass_kg / rate` sim-seconds at its launch site.
 pub const DEFAULT_MANUFACTURE_KG_PER_S: f64 = 50.0;
+/// `balance.ron: crew_salary_per_s` mirror — C08-F2's authored hire
+/// default (funds/sim-second): the rate the UI's hire buttons pay.
+/// 0.0005 ≈ ₣1 296/crew/sim-month — 20 crew ≈ 2.9% of the post-hire
+/// balance, inside PLAN:1196-1200's 2–5% band (the view's retired
+/// `HIRE_SALARY_PER_S = 0.02` put one crew alone at 5.18%).
+pub const DEFAULT_HIRE_SALARY_PER_S: f64 = 0.0005;
+/// `balance.ron: site_upkeep_funds_per_s` mirror — C08-F3's §3.5
+/// "facility upkeep": funds/sim-second billed per installed site at
+/// the salary boundary. 0.0002 ≈ ₣518/site/sim-month.
+pub const DEFAULT_SITE_UPKEEP_FUNDS_PER_S: f64 = 0.0002;
+/// `balance.ron: attrition_grace_periods` mirror — C08-F3: the
+/// consecutive unpaid salary periods before `StaffAttrition` starts
+/// retiring crew (1 = the first miss only warns; the second and each
+/// further miss retires a member).
+pub const DEFAULT_ATTRITION_GRACE_PERIODS: u64 = 1;
 
 /// Sim-day in seconds (86400) — the salary cadence conversion.
 const DAY_S: f64 = 86_400.0;
@@ -162,6 +191,23 @@ pub struct EconomyConfig {
     /// seconds before `ConstructionComplete` delivers it. Hashed like
     /// every tunable: it moves the event grid.
     pub manufacture_rate_kg_per_s: f64,
+    /// C08-F2: the authored hire default (funds/sim-second) — the
+    /// presentation layer's salary when `HireCrew` doesn't name its
+    /// own. The sim never consumes it (`apply_hire_crew` keeps its
+    /// parameterized shape), but it is serialized + hashed with the
+    /// rest of the config: a restored world enforces the value set it
+    /// was built under.
+    pub crew_salary_per_s: f64,
+    /// C08-F3: the per-site facility upkeep (funds/sim-second) —
+    /// debited `× period_s × sites.len()` at each `SalaryDue`
+    /// boundary under `FundsReason::SiteUpkeep`. Hashed: it moves
+    /// the funds trajectory.
+    pub site_upkeep_funds_per_s: f64,
+    /// C08-F3: consecutive unpaid salary periods granted before
+    /// `StaffAttrition` retires a member (`fire_salary_due` retires
+    /// when `unpaid_salary_streak` exceeds this). Hashed: it moves
+    /// the roster evolution.
+    pub attrition_grace_periods: u64,
 }
 
 /// The `DEFAULT_*` config — `World::new()`'s no-data fallback.
@@ -174,6 +220,9 @@ pub fn default_config() -> EconomyConfig {
         recovery_efficiency: DEFAULT_RECOVERY_EFFICIENCY,
         abandon_recovery: DEFAULT_ABANDON_RECOVERY,
         manufacture_rate_kg_per_s: DEFAULT_MANUFACTURE_KG_PER_S,
+        crew_salary_per_s: DEFAULT_HIRE_SALARY_PER_S,
+        site_upkeep_funds_per_s: DEFAULT_SITE_UPKEEP_FUNDS_PER_S,
+        attrition_grace_periods: DEFAULT_ATTRITION_GRACE_PERIODS,
     }
 }
 
@@ -188,6 +237,9 @@ impl EconomyConfig {
             recovery_efficiency: b.recovery_efficiency,
             abandon_recovery: b.abandon_recovery,
             manufacture_rate_kg_per_s: b.manufacture_rate_kg_per_s,
+            crew_salary_per_s: b.crew_salary_per_s,
+            site_upkeep_funds_per_s: b.site_upkeep_funds_per_s,
+            attrition_grace_periods: b.attrition_grace_periods,
         }
     }
 
@@ -204,6 +256,10 @@ impl EconomyConfig {
             && (0.0..=1.0).contains(&self.abandon_recovery)
             && self.manufacture_rate_kg_per_s.is_finite()
             && self.manufacture_rate_kg_per_s > 0.0
+            && self.crew_salary_per_s.is_finite()
+            && self.crew_salary_per_s >= 0.0
+            && self.site_upkeep_funds_per_s.is_finite()
+            && self.site_upkeep_funds_per_s >= 0.0
     }
 }
 
@@ -346,6 +402,10 @@ pub enum FundsReason {
     /// (reservation: charged at apply, delivered at
     /// `BenchTestComplete`).
     BenchTest = 9,
+    /// C08-F3 §3.5's facility upkeep — the per-site drain billed at
+    /// the `SalaryDue` boundary (`site_upkeep_funds_per_s · period_s`
+    /// per installed site).
+    SiteUpkeep = 10,
 }
 
 impl StableDiscriminant for FundsReason {
@@ -389,10 +449,18 @@ pub struct EconomyState {
     /// the type's own floor (module doc). Hashed + serialized.
     pub funds_micros: u64,
     /// §3.5's "`Insolvent` state": set by the first shortfall a
-    /// charge clamps into (and the one `Insolvent` event it
-    /// schedules); cleared when a credit lifts funds above zero —
-    /// a new insolvency then notifies afresh. Hashed + serialized.
+    /// charge clamps into (and the one `Insolvent` + `FacilityDormant`
+    /// event pair it schedules); cleared when a credit lifts funds
+    /// above zero — a new insolvency then notifies afresh. The flag
+    /// IS the facility-dormancy state: `apply_command` rejects the
+    /// facility verbs while it holds. Hashed + serialized.
     pub insolvent: bool,
+    /// C08-F3's `StaffAttrition` input — consecutive `SalaryDue`
+    /// firings whose salary charge shortfell. Past
+    /// `attrition_grace_periods` each further miss retires one
+    /// member; a fully paid period resets it to zero. Hashed +
+    /// serialized (it decides the next firing's retirement).
+    pub unpaid_salary_streak: u64,
     /// The §3.5 crew roster, keyed by `CrewId` (`next_crew_id`
     /// allocates — the same counter `BoardCrew` draws from; a
     /// roster member is a full `CrewMember`, a `BoardCrew` seat is
@@ -435,6 +503,7 @@ fn hash_location(h: &mut StateHasher, l: &CrewLocation) {
 pub fn hash_economy(h: &mut StateHasher, e: &EconomyState) {
     h.u64(e.funds_micros);
     h.bool(e.insolvent);
+    h.u64(e.unpaid_salary_streak);
     h.arena(e.crew.iter().map(|(id, c)| (id.0, c)), |h, c| {
         h.str(&c.name);
         h.stable_enum(&c.kind);
@@ -709,13 +778,30 @@ impl World {
         let (paid, shortfall) = charge(&mut self.economy, self.clock.ticks(), micros, reason);
         if shortfall > 0 && !self.economy.insolvent {
             self.economy.insolvent = true;
+            let at = self.clock.ticks().saturating_add(1);
             self.schedule_event(
                 EventKind::Insolvent {
                     shortfall_micros: shortfall,
                 },
-                self.clock.ticks().saturating_add(1),
+                at,
                 shadow,
             )?;
+            // C08-F3 §3.5: the same clamp suspends the program's
+            // facility surfaces — dormant IS the `insolvent` flag
+            // (any credit lifting funds above zero restores them),
+            // so the announcement rides the same once-per-insolvency
+            // gate: one `Clamping` event + one notification-log entry
+            // per insolvency.
+            self.schedule_event(EventKind::FacilityDormant, at, shadow)?;
+            self.notify(
+                crate::reliability::Notification {
+                    tick: self.clock.ticks(),
+                    vessel: crate::reliability::PROGRAM_VESSEL,
+                    node: None,
+                    kind: crate::reliability::NotificationKind::FacilityDormant,
+                },
+                shadow,
+            );
         }
         Ok(paid)
     }
@@ -767,9 +853,19 @@ impl World {
     }
 
     /// `SalaryDue` firing: debit `Σ salary_per_s · period_s` over the
-    /// `Active` roster (the recurring drain), then re-arm one period
-    /// further along the absolute grid. The charge clamps into
-    /// `Insolvent` at zero — §3.5's warp-to-the-window bankruptcy.
+    /// `Active` roster plus `site_upkeep_funds_per_s · period_s` per
+    /// installed site (the §3.5 "salaries + facility upkeep"
+    /// recurring drain — the site arena IS the facility surface:
+    /// launch pads and test stands), then re-arm one period further
+    /// along the absolute grid. Both charges clamp into `Insolvent`
+    /// at zero — §3.5's warp-to-the-window bankruptcy — and the
+    /// salary shortfall is one unpaid period on
+    /// `unpaid_salary_streak`: past the authored
+    /// `attrition_grace_periods` each further missed payroll retires
+    /// one `Active` member — the highest-salary first (attrition
+    /// relieves the drain fastest), lowest `CrewId` on ties — with a
+    /// `StaffAttrition` event + log entry (module doc). A fully paid
+    /// period resets the streak.
     pub(crate) fn fire_salary_due(
         &mut self,
         event_tick: u64,
@@ -784,7 +880,58 @@ impl World {
             .filter(|c| c.status == CrewStatus::Active)
             .map(|c| c.salary_per_s)
             .sum();
-        self.charge_funds(to_micros(due * period_s), FundsReason::Salary, shadow)?;
+        let salary_micros = to_micros(due * period_s);
+        let upkeep_micros = to_micros(
+            self.economy_cfg.site_upkeep_funds_per_s * period_s * self.economy.sites.len() as f64,
+        );
+        let paid_salary = self.charge_funds(salary_micros, FundsReason::Salary, shadow)?;
+        self.charge_funds(upkeep_micros, FundsReason::SiteUpkeep, shadow)?;
+        // C08-F3 §3.5's `StaffAttrition` — sustained insolvency makes
+        // staff leave, never silently: `Retired` members stay on the
+        // roster (the §7.2 crew arena) but draw nothing.
+        if paid_salary < salary_micros {
+            self.shadow_economy(shadow);
+            self.economy.unpaid_salary_streak = self.economy.unpaid_salary_streak.saturating_add(1);
+            if self.economy.unpaid_salary_streak > self.economy_cfg.attrition_grace_periods {
+                // Highest-salary `Active` member first, lowest id on
+                // ties — the ascending-BTreeMap first-wins scan is the
+                // monotonic-id order mutation elsewhere requires.
+                let leaver = self
+                    .economy
+                    .crew
+                    .iter()
+                    .filter(|(_, c)| c.status == CrewStatus::Active)
+                    .fold(None, |best, (id, c)| match best {
+                        Some((_, s)) if c.salary_per_s <= s => best,
+                        _ => Some((*id, c.salary_per_s)),
+                    })
+                    .map(|(id, _)| id);
+                if let Some(crew) = leaver {
+                    if let Some(m) = self.economy.crew.get_mut(&crew) {
+                        m.status = CrewStatus::Retired;
+                    }
+                    self.schedule_event(
+                        EventKind::StaffAttrition { crew },
+                        self.clock.ticks().saturating_add(1),
+                        shadow,
+                    )?;
+                    self.notify(
+                        crate::reliability::Notification {
+                            tick: self.clock.ticks(),
+                            vessel: crate::reliability::PROGRAM_VESSEL,
+                            node: None,
+                            kind: crate::reliability::NotificationKind::StaffAttrition {
+                                crew: crew.0,
+                            },
+                        },
+                        shadow,
+                    );
+                }
+            }
+        } else if self.economy.unpaid_salary_streak != 0 {
+            self.shadow_economy(shadow);
+            self.economy.unpaid_salary_streak = 0;
+        }
         // Re-arm at the next grid tick — `event_tick + period` keeps
         // the cadence absolute even when a deferred batch fires the
         // event at `clock` (`.max(clock+1)` covers the same corner).
@@ -1444,8 +1591,10 @@ mod tests {
         assert_eq!(a.state_hash().unwrap(), b.state_hash().unwrap());
         b.economy.funds_micros += 1;
         assert_ne!(a.state_hash().unwrap(), b.state_hash().unwrap());
-        // Snapshot → restore preserves the whole book.
+        // Snapshot → restore preserves the whole book — the C08-F3
+        // streak counter included.
         b.economy.insolvent = false; // keep the flag coherent
+        b.economy.unpaid_salary_streak = 2;
         let snap = b.snapshot().unwrap();
         let r = World::restore(a.orbits().clone(), None, snap).unwrap();
         assert_eq!(r.economy(), b.economy());
@@ -1487,5 +1636,232 @@ mod tests {
         x2.step_frame(2 * period + 1).unwrap();
         assert_eq!(x1.funds_micros(), x2.funds_micros());
         assert_eq!(x1.state_hash().unwrap(), x2.state_hash().unwrap());
+    }
+
+    /// C08-F3 §3.5's facility upkeep: every installed site draws
+    /// `site_upkeep_funds_per_s · period_s` at the salary boundary,
+    /// ledgered under `SiteUpkeep` — the recurring drain's second
+    /// half rides the same clamp.
+    #[test]
+    fn site_upkeep_drains_at_the_salary_boundary() {
+        let mut w = world();
+        w.set_sites(
+            [site("terrin-launch", true), site("terrin-downrange", false)]
+                .into_iter()
+                .collect(),
+        );
+        let period = w.economy_config().salary_period_ticks;
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::HireCrew {
+                name: "a".into(),
+                kind: CrewKind::Engineer,
+                salary_per_s: 1.0,
+            },
+        );
+        w.step_frame(1).unwrap();
+        let before = w.funds_micros();
+        w.step_frame(period + 1).unwrap();
+        let period_s = period as f64 / 64.0;
+        let upkeep = to_micros(w.economy_config().site_upkeep_funds_per_s * period_s * 2.0);
+        assert_eq!(before - w.funds_micros(), to_micros(period_s) + upkeep);
+        assert_eq!(
+            w.economy()
+                .ledger
+                .iter()
+                .filter(|e| e.reason == FundsReason::SiteUpkeep)
+                .count(),
+            1
+        );
+    }
+
+    /// C08-F3's `StaffAttrition`: the authored grace (1 unpaid
+    /// period) means the first missed payroll only warns —
+    /// `Insolvent` + `FacilityDormant` — and each further
+    /// consecutive miss retires one member, highest-salary first.
+    /// An emptied `Active` roster lets the salary grid die; a paid
+    /// month resets the streak.
+    #[test]
+    fn attrition_retires_after_the_grace() {
+        let mut w = world();
+        let period = w.economy_config().salary_period_ticks;
+        for (name, salary) in [("cheap", 0.5), ("dear", 2.0)] {
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::HireCrew {
+                    name: name.into(),
+                    kind: CrewKind::Pilot,
+                    salary_per_s: salary,
+                },
+            );
+        }
+        w.step_frame(1).unwrap();
+        let id_of = |w: &World, n: &str| {
+            w.economy()
+                .crew
+                .iter()
+                .find(|(_, c)| c.name == n)
+                .map(|(id, _)| *id)
+                .unwrap()
+        };
+        let (cheap, dear) = (id_of(&w, "cheap"), id_of(&w, "dear"));
+        w.economy.funds_micros = 1_000; // nearly broke — the payroll misses
+        // Month 1: streak 1 ≤ grace 1 — warns, nobody leaves.
+        let r = w.step_frame(period + 1).unwrap();
+        assert!(w.economy().insolvent);
+        assert!(
+            r.fired_events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::FacilityDormant)),
+            "no FacilityDormant on the first miss: {r:?}"
+        );
+        assert!(
+            !r.fired_events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::StaffAttrition { .. })),
+            "grace period retired someone: {r:?}"
+        );
+        assert!(
+            w.economy()
+                .crew
+                .values()
+                .all(|c| c.status == CrewStatus::Active)
+        );
+        assert_eq!(w.economy().unpaid_salary_streak, 1);
+        // Month 2: streak 2 > grace — the expensive seat goes first,
+        // announced by the Clamping event + the log entry.
+        let r = w.step_frame(2 * period + 1).unwrap();
+        assert!(
+            r.fired_events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::StaffAttrition { crew } if crew == dear)),
+            "the dear seat did not resign: {r:?}"
+        );
+        assert_eq!(w.economy().crew[&dear].status, CrewStatus::Retired);
+        assert_eq!(w.economy().crew[&cheap].status, CrewStatus::Active);
+        assert!(
+            w.notifications().iter().any(|n| matches!(
+                n.kind,
+                crate::reliability::NotificationKind::StaffAttrition { crew } if crew == dear.0
+            )),
+            "attrition never reached the notification log"
+        );
+        // Month 3: the cheap seat follows — the emptied Active
+        // roster lets the grid die (no further SalaryDue pending).
+        let r = w.step_frame(3 * period + 1).unwrap();
+        assert!(
+            r.fired_events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::StaffAttrition { crew } if crew == cheap)),
+            "the cheap seat did not resign: {r:?}"
+        );
+        assert_eq!(w.economy().crew[&cheap].status, CrewStatus::Retired);
+        assert!(
+            !w.event_heap
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::SalaryDue)),
+            "the salary grid should die with the Active roster"
+        );
+        // A paid month after re-solvency resets the streak — the
+        // `ContractReward` credit clears `insolvent` and covers the
+        // re-hire cost, so the re-armed grid pays clean.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::ContractReward { micros: 2_000_000 },
+        );
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::HireCrew {
+                name: "new".into(),
+                kind: CrewKind::Scientist,
+                salary_per_s: 0.001,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(!w.economy().insolvent);
+        w.step_frame(4 * period + 1).unwrap();
+        assert_eq!(w.economy().unpaid_salary_streak, 0);
+    }
+
+    /// C08-F3's `FacilityDormant`: while `insolvent` holds, the
+    /// facility verbs (`RunBenchTest`, `ManufactureCraft`) reject
+    /// dormant — the stands and pads are shut — and a credit lifting
+    /// funds above zero restores them.
+    #[test]
+    fn insolvency_suspends_facilities_until_solvency() {
+        let mut w = world();
+        let period = w.economy_config().salary_period_ticks;
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::HireCrew {
+                name: "a".into(),
+                kind: CrewKind::Pilot,
+                salary_per_s: 1.0,
+            },
+        );
+        w.step_frame(1).unwrap();
+        w.economy.funds_micros = 1_000;
+        let r = w.step_frame(period + 1).unwrap();
+        assert!(w.economy().insolvent);
+        assert!(
+            r.fired_events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::FacilityDormant))
+        );
+        assert!(w.notifications().iter().any(|n| matches!(
+            n.kind,
+            crate::reliability::NotificationKind::FacilityDormant
+        )));
+        // The dormant gate: a stand order rejects with the dormancy
+        // diagnostic — never reaching the stand's own checks.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RunBenchTest {
+                site: SiteId::from("terrin-launch"),
+                family: csp_data::FamilyId::from("f"),
+                units: 1.0,
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert_eq!(r.rejected.len(), 1);
+        match &r.rejected[0].error {
+            SimError::Recoverable(m) => {
+                assert!(m.contains("dormant"), "not the dormant gate: {m}")
+            }
+            other => panic!("expected a Recoverable dormant rejection, got {other:?}"),
+        }
+        // Solvency restores: a credit clears `insolvent`, and the
+        // same order now fails on its own merits (unknown site) —
+        // the dormant gate is gone.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::ContractReward { micros: 10_000 },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(!w.economy().insolvent);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RunBenchTest {
+                site: SiteId::from("terrin-launch"),
+                family: csp_data::FamilyId::from("f"),
+                units: 1.0,
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert_eq!(r.rejected.len(), 1);
+        match &r.rejected[0].error {
+            SimError::Recoverable(m) => {
+                assert!(!m.contains("dormant"), "still dormant after solvency: {m}")
+            }
+            other => panic!("expected a Recoverable rejection, got {other:?}"),
+        }
     }
 }

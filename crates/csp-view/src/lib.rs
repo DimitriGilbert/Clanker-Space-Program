@@ -1292,11 +1292,6 @@ fn program_command(
     }
 }
 
-/// The salary the UI's hire buttons pay — the sim has no salary table
-/// (`HireCrew` carries the rate verbatim), so the panel authors a
-/// modest default: 0.02 ₣/s ≈ ₣1 728/sim-day.
-const HIRE_SALARY_PER_S: f64 = 0.02;
-
 /// The player-facing `FoundColony` payload — a starter outpost:
 /// a small solar array, a battery, and its founding EC charge. The
 /// apply resolves the site's body/pose and runs the founding solve.
@@ -3943,7 +3938,12 @@ impl View {
             science: sim.science_now(),
             banked: sim.science().banked,
             hire_cost: sim.economy_config().hire_cost_micros as f64 / 1.0e6,
-            hire_salary_per_s: HIRE_SALARY_PER_S,
+            // C08-F2 §8.3: the hire default is authored in
+            // `data/balance.ron` (`crew_salary_per_s`) and reaches the
+            // panel through the sim's economy config — the retired
+            // view-side `HIRE_SALARY_PER_S` hardcode put one crew at
+            // 5.18%/month of starting funds, over the §3.5 band.
+            hire_salary_per_s: sim.economy_config().crew_salary_per_s,
             ..Default::default()
         };
         // Contracts, research rows, and the notification log.
@@ -4703,6 +4703,13 @@ fn notice_text(n: &csp_sim::reliability::Notification) -> String {
         K::ScienceBanked { micros } => {
             format!("science banked +{:.1}⚛", micros as f64 / 1.0e6)
         }
+        // C08-F3 §3.5's insolvency consequences — both program-level
+        // entries (the contract-lifecycle prefix convention: no
+        // vessel name).
+        K::StaffAttrition { crew } => {
+            format!("crew #{crew} — RESIGNED (unpaid salaries)")
+        }
+        K::FacilityDormant => "FACILITIES DORMANT — program insolvent".to_string(),
     }
 }
 

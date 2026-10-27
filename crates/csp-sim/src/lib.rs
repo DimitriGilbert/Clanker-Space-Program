@@ -3160,7 +3160,11 @@ impl World {
                 | EventKind::SalaryDue
                 | EventKind::Insolvent { .. }
                 | EventKind::ContractDeadline { .. }
-                | EventKind::ConstructionComplete { .. } => None,
+                | EventKind::ConstructionComplete { .. }
+                // C08-F3: the insolvency-consequence pair names a
+                // crew member / nothing — never a vessel.
+                | EventKind::StaffAttrition { .. }
+                | EventKind::FacilityDormant => None,
                 // M8-A: colony events name a colony, never a vessel —
                 // the colony-id existence check lives below with the
                 // event-walk's duplicate rules.
@@ -5434,6 +5438,23 @@ impl World {
         });
         if let Some(vessel) = gated_vessel {
             self.check_control_lease(vessel, src)?;
+        }
+        // C08-F3 §3.5's `FacilityDormant` consequence: while
+        // `insolvent` holds, the program's facility surfaces (the
+        // launch-site pads and test stands) are suspended — the
+        // `Clamping` event + log entry announced it, and any credit
+        // lifting funds above zero restores them. One gate here so
+        // every facility verb shares the rule; the applies' own
+        // funds checks still stand on a solvent world.
+        if self.economy.insolvent
+            && matches!(
+                command,
+                SimCommand::ManufactureCraft { .. } | SimCommand::RunBenchTest { .. }
+            )
+        {
+            return Err(SimError::Recoverable(
+                "facility dormant — the program is insolvent",
+            ));
         }
         match command {
             SimCommand::SetWarp(level) => self.warp_level = *level,
@@ -8660,7 +8681,11 @@ impl World {
                         // slot's publish re-derives the dormant
                         // crossing; the bench completion names a run.
                         | EventKind::PartFailure { .. }
-                        | EventKind::BenchTestComplete { .. } => None,
+                        | EventKind::BenchTestComplete { .. }
+                        // C08-F3: the insolvency-consequence pair
+                        // names no vessel — no rescan to republish.
+                        | EventKind::StaffAttrition { .. }
+                        | EventKind::FacilityDormant => None,
                     };
                     if let Some(vessel) = vessel {
                         // §2.6.1: the republish tick is a pure function
@@ -8830,6 +8855,12 @@ impl World {
                 self.fire_part_failure(*vessel, *part, *mode, event.tick, shadow, degraded)
             }
             EventKind::BenchTestComplete { run } => self.fire_bench_complete(*run, shadow),
+            // C08-F3 §3.5's insolvency consequences — both mutate at
+            // schedule time (the retirement at the salary boundary,
+            // the dormancy as `insolvent` itself); firing only
+            // surfaces them (`fired_events` — the `Insolvent`
+            // contract).
+            EventKind::StaffAttrition { .. } | EventKind::FacilityDormant => Ok(()),
         }
     }
 
@@ -9201,6 +9232,13 @@ impl World {
         h.f64(self.economy_cfg.recovery_efficiency);
         h.f64(self.economy_cfg.abandon_recovery);
         h.f64(self.economy_cfg.manufacture_rate_kg_per_s);
+        // C08-F2/F3: the §3.5 insolvency-consequence tunables — the
+        // authored hire default, the per-site upkeep, and the
+        // attrition grace all change state evolution (the upkeep
+        // moves funds; the grace moves the roster).
+        h.f64(self.economy_cfg.crew_salary_per_s);
+        h.f64(self.economy_cfg.site_upkeep_funds_per_s);
+        h.u64(self.economy_cfg.attrition_grace_periods);
         economy::hash_economy(&mut h, &self.economy);
         // M7-D: the §2.7 save seed (the offer draw input), the
         // contract tunables, and the §3.6 contract book — offers,
@@ -10265,7 +10303,11 @@ fn event_names_vessel(kind: &EventKind, vessel: &VesselId) -> bool {
         // M9b: the bench completion names a run — it survives vessel
         // removal by design (the credit is program-level, like the
         // transfer completion's fallback).
-        | EventKind::BenchTestComplete { .. } => false,
+        | EventKind::BenchTestComplete { .. }
+        // C08-F3: the insolvency-consequence pair is program-level —
+        // `StaffAttrition` names a roster member, not a vessel.
+        | EventKind::StaffAttrition { .. }
+        | EventKind::FacilityDormant => false,
     }
 }
 

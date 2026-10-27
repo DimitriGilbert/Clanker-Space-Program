@@ -408,6 +408,27 @@ pub enum EventKind {
         /// The bench arena id the run completes.
         run: crate::reliability::BenchId,
     } = 24,
+    /// §3.5's unpaid-salary attrition (C08-F3): a `SalaryDue` firing
+    /// whose salary charge shortfell past the authored grace streak
+    /// retired a roster member — the event carries who left. The
+    /// retirement already happened at the salary boundary that
+    /// scheduled this; firing mutates nothing — surfacing rides
+    /// `fired_events` + the notification log (the `Insolvent`
+    /// contract). `Clamping`: a crew member walking out is the "a
+    /// transition, not a periodic" kind the player must not sleep
+    /// through.
+    StaffAttrition {
+        /// The roster member who went `Retired`.
+        crew: crate::transfers::CrewId,
+    } = 25,
+    /// §3.5's unpaid-salary dormancy (C08-F3): a funds charge clamped
+    /// at zero suspended the program's facility surfaces — dormant
+    /// IS `economy.insolvent`, so the firing mutates nothing (the
+    /// `Insolvent` contract; solvency — any credit lifting funds
+    /// above zero — restores the surfaces with no event). Scheduled
+    /// once per insolvency alongside `Insolvent` itself. `Clamping`,
+    /// same transition contract as `StaffAttrition`.
+    FacilityDormant = 26,
 }
 
 impl StableDiscriminant for EventKind {
@@ -438,6 +459,8 @@ impl StableDiscriminant for EventKind {
             Self::ScriptWake { .. } => 22,
             Self::PartFailure { .. } => 23,
             Self::BenchTestComplete { .. } => 24,
+            Self::StaffAttrition { .. } => 25,
+            Self::FacilityDormant => 26,
         }
     }
 }
@@ -489,7 +512,12 @@ pub fn class_of(kind: &EventKind, tracked: &BTreeSet<VesselId>) -> EventClass {
         // M9a §2.10: the script wake is a named §2.6.5 `Clamping`
         // member — warp demotes so a sleeping script's wake tick is
         // never streamed past.
-        | EventKind::ScriptWake { .. } => EventClass::Clamping,
+        | EventKind::ScriptWake { .. }
+        // C08-F3 §3.5's insolvency consequences — transitions, not
+        // periodics (the `PowerLost` contract): a resignation and the
+        // facility suspension must not be slept through.
+        | EventKind::StaffAttrition { .. }
+        | EventKind::FacilityDormant => EventClass::Clamping,
         EventKind::PlayerAlarm { .. }
         | EventKind::ManeuverNodeStart { .. }
         | EventKind::TransferWindow { .. }
@@ -603,6 +631,10 @@ impl ScheduledEvent {
             EventKind::BenchTestComplete { run } => {
                 h.u64(run.0);
             }
+            EventKind::StaffAttrition { crew } => {
+                h.u64(crew.0);
+            }
+            EventKind::FacilityDormant => {}
         }
     }
 }

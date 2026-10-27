@@ -427,6 +427,19 @@ pub enum NotificationKind {
         /// Points banked, in 1e-6 units.
         micros: u64,
     },
+    /// §3.5's `StaffAttrition` consequence (C08-F3): an unpaid salary
+    /// streak past the authored grace retired a roster member —
+    /// `crew` is the roster arena id (the contract-id convention;
+    /// `PROGRAM_VESSEL`-level entry).
+    StaffAttrition {
+        /// The `CrewId` that went `Retired`.
+        crew: u64,
+    },
+    /// §3.5's `FacilityDormant` consequence (C08-F3): a funds charge
+    /// clamped at zero suspended the program's facility surfaces —
+    /// logged once per insolvency alongside the `Insolvent`/
+    /// `FacilityDormant` event pair (`PROGRAM_VESSEL`-level entry).
+    FacilityDormant,
 }
 
 /// `Notification::vessel` sentinel for program-level entries —
