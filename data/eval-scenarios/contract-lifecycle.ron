@@ -1,0 +1,54 @@
+// M9d eval suite — §8.5's "contract lifecycle" proof on shipped
+// content (C30-F1/C34-F4): a `WorldSpec::Data` world (the same
+// construction `View::new` performs) publishes the seeded offer
+// board; the schedule accepts offer 0 — on a fresh `tech.start`
+// world every eligible template is `contract.survey`, so the index
+// is content-stable — builds the science hopper at the launch site
+// (ManufactureCraft → ConstructionComplete → SurfaceLatched), runs
+// `exp.materials_study` on it, and recovers it: the pooled data
+// banks at recovery, `DataBanked` fires the SurveyData predicate,
+// and the completion payout lands. Goals pin the whole arc:
+// accepted (active dropped to 0), completed (fact count ≥ 1 —
+// `contracts_active: 0` alone can't tell completion from a
+// deadline failure), science banked, and funds grew by the
+// advance + completion + science payout.
+(
+    schema_version: 1,
+    name: "contract-lifecycle",
+    world: Data(root: None),
+    save_seed: 0,
+    setup: [
+        // The board refills on the Contracts slot's first advance.
+        Command(AdvanceTo(640)),
+        SiteCraft(site: "terrin-launch", craft: science_hopper),
+    ],
+    agent: Schedule([
+        // Offer 0 is live now (the board published during setup's
+        // advance) — on a fresh `tech.start` world every eligible
+        // template is `contract.survey`.
+        [AcceptContract(offer: 0)],
+        // ~2 s of build time (100 kg at 50 kg/s) plus margin; the
+        // delivery lands the vessel SurfaceLatched at the berth.
+        [AdvanceTo(2_000)],
+        // §2.2.1: vessel-affecting verbs need the control lease.
+        [TakeControl(vessel: 0, lease: Agent(0))],
+        [RunExperiment(
+            vessel: 0,
+            node: 0,
+            experiment: "exp.materials_study",
+            biome: "terrin.grassland",
+            situation: Landed,
+        )],
+        [RecoverVessel(vessel: 0, site: Some("terrin-launch"))],
+        [AdvanceTo(2_064)],
+    ]),
+    goals: [
+        (field: "program.contracts_active", op: eq, value: 0),
+        (field: "program.contracts_completed", op: ge, value: 1),
+        (field: "program.contracts_failed", op: eq, value: 0),
+        (field: "program.science_banked", op: gt, value: 0.0),
+        (field: "program.funds_micros", op: gt, value: 1_000_000_000_000.0),
+    ],
+    tick_budget: 10_000,
+    event_budget: 256,
+)

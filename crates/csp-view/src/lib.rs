@@ -1879,6 +1879,168 @@ fn load_validated_dataset(
     Ok(d)
 }
 
+/// The sim half of [`View::from_source`]: wire a `SimWorld` from an
+/// already-validated dataset — orbit model, physics bubble, every
+/// `set_*` construction-config channel, the free tech roots, and the
+/// authored starting colonies. Kept as the ONE wiring pass so
+/// non-presentation hosts (csp-bench's `WorldSpec::Data` eval worlds)
+/// build the same world the game starts with instead of hand-rolling
+/// a subset of these calls (the divergence class
+/// [`SimWorld::install_config`]'s doc names).
+fn build_sim_from_dataset(d: &LoadedDataset, save_seed: u64) -> Result<SimWorld, ViewError> {
+    let balance = &d.balance;
+    let defs: Vec<csp_data::BodyDef> = d.system.bodies.iter().map(|b| b.def.clone()).collect();
+    let orbits = csp_sim::orbit::PatchedConics::from_body_defs(&defs).map_err(ViewError::Sim)?;
+    // M4c presentation floor: the game world runs the physics
+    // bubble over the home planet (same `Environment` convention
+    // `csp-bench`'s flight scenarios use).
+    let terrin = defs
+        .iter()
+        .find(|b| b.id.as_str() == "terrin")
+        .ok_or(ViewError::Sim(SimError::Fatal(
+            "home system has no 'terrin' body",
+        )))?;
+    let mut environment =
+        csp_phys::Environment::for_body(terrin, csp_core::DVec3::ZERO, terrin.rotation_period_s);
+    // C14-F3: the convective-heating η is authored — `for_body`
+    // stamps the no-data default; the balance file overrides it.
+    environment.convective_heat_fraction = balance.convective_heat_fraction;
+    let mut sim = SimWorld::with_physics(
+        orbits,
+        csp_sim::PhysicsConfig {
+            environment,
+            dominant: terrin.id.clone(),
+            bubble_radius_m: balance.bubble_radius_m,
+        },
+        balance.advance_to_max_events_per_frame,
+    );
+    sim.set_vessel_caps(csp_sim::VesselCaps {
+        max_vessels: balance.max_tracked_vessels,
+        max_debris: balance.max_debris,
+    });
+    // §2.7's save seed — selects the contract-offer and
+    // reliability draws. Never left at the `World::new` default:
+    // without this every fresh game drew the identical offer
+    // board and identical failure rolls (W1.5-a). Native gets
+    // wall-clock entropy ([`native_save_seed`]); the §6.3 demo
+    // passes [`demo::DEMO_SAVE_SEED`] so the fixed scenario stays
+    // reproducible.
+    sim.set_save_seed(save_seed);
+    // M9a §2.10: the script host + autopilot driver (construction
+    // config — re-installed identically by csp-bench's replay
+    // harness) and the per-save op budget.
+    sim.set_script_op_budget(balance.script_op_budget);
+    sim.set_script_engine(Box::new(csp_script::RhaiHost::new()));
+    sim.set_autopilot_driver(Box::new(csp_ai::AscentAutopilot::new()));
+    sim.set_docking_config(csp_sim::DockingConfig::from_balance(balance))
+        .map_err(ViewError::Sim)?;
+    sim.set_transfer_config(csp_sim::TransferConfig::from_balance(balance));
+    // M9b §3.4: the reliability tunables — dormant scale,
+    // ignition window, effect magnitudes, test-stand economics.
+    sim.set_reliability_config(csp_sim::ReliabilityConfig::from_balance(balance));
+    // M7-A §3.2: the science tunables and the experiment-def table —
+    // same data-derived wiring; without them science commands
+    // would run on the no-data defaults and reject every run.
+    sim.set_science_config(csp_sim::ScienceConfig::from_balance(balance));
+    sim.set_experiments(
+        d.experiments
+            .by_id()
+            .into_iter()
+            .map(|(id, def)| (id, def.clone()))
+            .collect(),
+    );
+    // M7-B §3.3: the merged tech tree + the part catalog the
+    // `CraftDef::part_ids` gate resolves requirements against —
+    // same data-derived wiring; without them research commands
+    // reject with "no tech tree" and gated parts cannot resolve.
+    sim.set_tech_tree(d.techtree.merged());
+    sim.set_parts(
+        d.parts
+            .parts
+            .iter()
+            .map(|p| (p.def.id.clone(), p.def.clone()))
+            .collect(),
+    );
+    // The authored starting capability: every prerequisite-free
+    // zero-cost root (`tech.start` — the launch stack) is
+    // researched in the baseline world, or the gate would lock
+    // out the equipment the program starts with.
+    sim.grant_free_tech_roots();
+    // M7-C §3.5: the economy tunables (starting funds, the salary
+    // cadence, hire cost, milestone payout, recovery shares) and
+    // the system's site table — the same data-derived wiring;
+    // without them the funds paths run on the no-data defaults
+    // and `RecoverVessel` has no sites to name.
+    sim.set_economy_config(csp_sim::economy::EconomyConfig::from_balance(balance))
+        .map_err(ViewError::Sim)?;
+    // The site's table collects first-wins on a duplicate id —
+    // the `by_id()` convention (`or_insert`), not the `collect`
+    // last-wins it replaced (the validator flags the duplicate
+    // loudly either way; the tie-break just has to be one rule).
+    sim.set_sites(
+        d.sites
+            .sites
+            .iter()
+            .fold(std::collections::BTreeMap::new(), |mut m, s| {
+                m.entry(s.id.clone()).or_insert_with(|| s.clone());
+                m
+            }),
+    );
+    // M7-D §3.6: the contract template table + the board-size
+    // tunable — the same data-derived wiring.
+    sim.set_contracts(
+        d.contracts
+            .by_id()
+            .into_iter()
+            .map(|(id, def)| (id, def.clone()))
+            .collect(),
+    );
+    sim.set_contract_config(csp_sim::ContractConfig::from_balance(balance));
+    // M8-A §3.5.1: the per-body colony environments — rotation
+    // and authored insolation from the loaded body defs (the
+    // `set_sites` precedent).
+    sim.set_colony_env(csp_sim::colony_env_from_body_defs(&defs));
+    // M8-C §3.5: the life-support tunables — same data-derived
+    // wiring (the `set_economy_config` precedent); without it the
+    // check cadence/rates run on the no-data `DEFAULT_*` mirrors.
+    // The per-save flag itself is sim state, not config — it
+    // stays opt-in (`World::new` starts disabled).
+    sim.set_life_support_config(csp_sim::LifeSupportConfig::from_balance(balance));
+    // M8-B §3.5.1: the recipe table — the same data-derived
+    // channel; `FoundColony`'s Converter modules resolve
+    // `RecipeId`s against it.
+    sim.set_recipes(
+        d.recipes
+            .by_id()
+            .into_iter()
+            .map(|(id, def)| (id, def.clone()))
+            .collect(),
+    );
+    // M8-B §3.5.1: the home system's authored starting colonies
+    // (`colonies.ron`) — founded at world build through the same
+    // apply the `FoundColony` command drains to, after the site,
+    // colony-env, and recipe tables are installed (the apply
+    // resolves all three). A missing file reads as an empty set —
+    // a system without authored colonies simply starts with none.
+    sim.found_authored_colonies(&d.colonies.colonies)
+        .map_err(ViewError::Sim)?;
+    Ok(sim)
+}
+
+/// A `SimWorld` built from an authored `data/` tree — the same
+/// world `View::new` starts with (orbit model, physics bubble,
+/// parts/tech/contracts/colonies wired, `tech.start` granted),
+/// minus the presentation resources and the first-run starter
+/// craft. Native-only like `View::new`: reads the filesystem
+/// through [`csp_data::FsDataSource`]. `csp-bench`'s eval tier
+/// drives its `WorldSpec::Data` scenarios from this so the §8.5
+/// proofs run on shipped content, not a fixture's subset (C30-F1).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_sim_world(root: &std::path::Path, save_seed: u64) -> Result<SimWorld, ViewError> {
+    let d = load_validated_dataset(&csp_data::FsDataSource, root)?;
+    build_sim_from_dataset(&d, save_seed)
+}
+
 impl std::fmt::Display for ViewError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1935,177 +2097,29 @@ impl View {
         // loudly at startup instead of shipping silently (the
         // loaders' "the validator flags it loudly" docs, made true).
         let d = load_validated_dataset(src, root)?;
-        let (sys, balance, experiments, techtree, sites, contracts) = (
-            d.system,
-            d.balance,
-            d.experiments,
-            d.techtree,
-            d.sites,
-            d.contracts,
-        );
-        let (recipes, colonies, parts, resources, loc) =
-            (d.recipes, d.colonies, d.parts, d.resources, d.loc);
-        let defs: Vec<csp_data::BodyDef> = sys.bodies.iter().map(|b| b.def.clone()).collect();
-        let orbits =
-            csp_sim::orbit::PatchedConics::from_body_defs(&defs).map_err(ViewError::Sim)?;
-        // M4c presentation floor: the game world runs the physics
-        // bubble over the home planet (same `Environment` convention
-        // `csp-bench`'s flight scenarios use).
-        let terrin = defs
-            .iter()
-            .find(|b| b.id.as_str() == "terrin")
-            .ok_or(ViewError::Sim(SimError::Fatal(
-                "home system has no 'terrin' body",
-            )))?;
-        let mut environment = csp_phys::Environment::for_body(
-            terrin,
-            csp_core::DVec3::ZERO,
-            terrin.rotation_period_s,
-        );
-        // C14-F3: the convective-heating η is authored — `for_body`
-        // stamps the no-data default; the balance file overrides it.
-        environment.convective_heat_fraction = balance.convective_heat_fraction;
-        let mut sim = SimWorld::with_physics(
-            orbits,
-            csp_sim::PhysicsConfig {
-                environment,
-                dominant: terrin.id.clone(),
-                bubble_radius_m: balance.bubble_radius_m,
-            },
-            balance.advance_to_max_events_per_frame,
-        );
-        sim.set_vessel_caps(csp_sim::VesselCaps {
-            max_vessels: balance.max_tracked_vessels,
-            max_debris: balance.max_debris,
-        });
-        // §2.7's save seed — selects the contract-offer and
-        // reliability draws. Never left at the `World::new` default:
-        // without this every fresh game drew the identical offer
-        // board and identical failure rolls (W1.5-a). Native gets
-        // wall-clock entropy ([`native_save_seed`]); the §6.3 demo
-        // passes [`demo::DEMO_SAVE_SEED`] so the fixed scenario stays
-        // reproducible.
-        sim.set_save_seed(save_seed);
-        // M9a §2.10: the script host + autopilot driver (construction
-        // config — re-installed identically by csp-bench's replay
-        // harness) and the per-save op budget.
-        sim.set_script_op_budget(balance.script_op_budget);
-        sim.set_script_engine(Box::new(csp_script::RhaiHost::new()));
-        sim.set_autopilot_driver(Box::new(csp_ai::AscentAutopilot::new()));
-        sim.set_docking_config(csp_sim::DockingConfig::from_balance(&balance))
-            .map_err(ViewError::Sim)?;
-        sim.set_transfer_config(csp_sim::TransferConfig::from_balance(&balance));
-        // M9b §3.4: the reliability tunables — dormant scale,
-        // ignition window, effect magnitudes, test-stand economics.
-        sim.set_reliability_config(csp_sim::ReliabilityConfig::from_balance(&balance));
-        // M7-A §3.2: the science tunables and the experiment-def table —
-        // same data-derived wiring (`csp-bench`'s scenario builder does
-        // the identical three calls); without them science commands
-        // would run on the no-data defaults and reject every run.
-        sim.set_science_config(csp_sim::ScienceConfig::from_balance(&balance));
-        sim.set_experiments(
-            experiments
-                .by_id()
-                .into_iter()
-                .map(|(id, def)| (id, def.clone()))
-                .collect(),
-        );
-        // M7-B §3.3: the merged tech tree + the part catalog the
-        // `CraftDef::part_ids` gate resolves requirements against —
-        // same data-derived wiring; without them research commands
-        // reject with "no tech tree" and gated parts cannot resolve.
-        sim.set_tech_tree(techtree.merged());
-        sim.set_parts(
-            parts
-                .parts
-                .iter()
-                .map(|p| (p.def.id.clone(), p.def.clone()))
-                .collect(),
-        );
-        // The authored starting capability: every prerequisite-free
-        // zero-cost root (`tech.start` — the launch stack) is
-        // researched in the baseline world, or the gate would lock
-        // out the equipment the program starts with.
-        sim.grant_free_tech_roots();
-        // M7-C §3.5: the economy tunables (starting funds, the salary
-        // cadence, hire cost, milestone payout, recovery shares) and
-        // the system's site table — the same data-derived wiring;
-        // without them the funds paths run on the no-data defaults
-        // and `RecoverVessel` has no sites to name.
-        sim.set_economy_config(csp_sim::economy::EconomyConfig::from_balance(&balance))
-            .map_err(ViewError::Sim)?;
-        // The site's table collects first-wins on a duplicate id —
-        // the `by_id()` convention (`or_insert`), not the `collect`
-        // last-wins it replaced (the validator flags the duplicate
-        // loudly either way; the tie-break just has to be one rule).
-        sim.set_sites(
-            sites
-                .sites
-                .iter()
-                .fold(std::collections::BTreeMap::new(), |mut m, s| {
-                    m.entry(s.id.clone()).or_insert_with(|| s.clone());
-                    m
-                }),
-        );
-        // M7-D §3.6: the contract template table + the board-size
-        // tunable — the same data-derived wiring.
-        sim.set_contracts(
-            contracts
-                .by_id()
-                .into_iter()
-                .map(|(id, def)| (id, def.clone()))
-                .collect(),
-        );
-        sim.set_contract_config(csp_sim::ContractConfig::from_balance(&balance));
-        // M8-A §3.5.1: the per-body colony environments — rotation
-        // and authored insolation from the loaded body defs (the
-        // `set_sites` precedent).
-        sim.set_colony_env(csp_sim::colony_env_from_body_defs(&defs));
-        // M8-C §3.5: the life-support tunables — same data-derived
-        // wiring (the `set_economy_config` precedent); without it the
-        // check cadence/rates run on the no-data `DEFAULT_*` mirrors.
-        // The per-save flag itself is sim state, not config — it
-        // stays opt-in (`World::new` starts disabled).
-        sim.set_life_support_config(csp_sim::LifeSupportConfig::from_balance(&balance));
-        // M8-B §3.5.1: the recipe table — the same data-derived
-        // channel; `FoundColony`'s Converter modules resolve
-        // `RecipeId`s against it.
-        sim.set_recipes(
-            recipes
-                .by_id()
-                .into_iter()
-                .map(|(id, def)| (id, def.clone()))
-                .collect(),
-        );
-        // M8-B §3.5.1: the home system's authored starting colonies
-        // (`colonies.ron`) — founded at world build through the same
-        // apply the `FoundColony` command drains to, after the site,
-        // colony-env, and recipe tables are installed (the apply
-        // resolves all three). A missing file reads as an empty set —
-        // a system without authored colonies simply starts with none.
-        sim.found_authored_colonies(&colonies.colonies)
-            .map_err(ViewError::Sim)?;
+        let sim = build_sim_from_dataset(&d, save_seed)?;
         let mut view = Self::with_sim(sim);
         // M3 VAB: the part catalog + resource registry are data-derived
         // constants for the session model (like BodyTable — §7.3's
         // re-derived-on-load class).
-        view.install_vab_catalog(parts, resources);
+        view.install_vab_catalog(d.parts, d.resources);
         // The catalog's display-name half: `PartDef::display_name` is a
         // `LocKey`, so the English table is what lets the palette print
         // "Sparc Launch Engine" instead of the raw part id — same
         // data-derived-constant class as the catalog itself.
-        view.with_vab_session(|v| v.set_loc(loc.clone()));
+        view.with_vab_session(|v| v.set_loc(d.loc.clone()));
         // R2: the authored terrain table (noise seeds, ocean datums,
         // decoded biome palettes) — installed over the empty default.
         let art = art::load();
-        let mut tc = terrain::config_from_bodies(&sys.bodies);
+        let mut tc = terrain::config_from_bodies(&d.system.bodies);
         tc.art = art.0.terrain.clone();
         view.world.insert_resource(tc);
         view.world.insert_resource(art);
         // The progression surface's data-derived constants: loc strings
         // (display names), decoded biome maps (the `RunExperiment`
         // biome context), and body radii (rails-altitude situations).
-        install_program_resources(&mut view, &sys.bodies, &defs, &loc);
+        let defs: Vec<csp_data::BodyDef> = d.system.bodies.iter().map(|b| b.def.clone()).collect();
+        install_program_resources(&mut view, &d.system.bodies, &defs, &d.loc);
         Ok(view)
     }
 

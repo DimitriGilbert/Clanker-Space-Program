@@ -1,0 +1,24 @@
+// M9d eval suite — §8.5's "agent completing a mission" proof,
+// beyond the ascent climb (C30-F1/C34-F4): the `survey-mission`
+// program reads only the published snapshot — the board's offer
+// indices (`program.offers`), the active count, the delivered
+// vessel's residence — and completes a `contract.survey` end to
+// end: accept → ManufactureCraft → RunExperiment → RecoverVessel.
+// Every decision is telemetry-feedback; the scenario is green only
+// if the agent finished the mission (`contracts_completed ≥ 1`)
+// without a fault or a contract failure.
+(
+    schema_version: 1,
+    name: "agent-mission",
+    world: Data(root: None),
+    save_seed: 0,
+    agent: Program(name: "survey-mission", args: {}),
+    goals: [
+        (field: "program.contracts_completed", op: ge, value: 1),
+        (field: "program.contracts_failed", op: eq, value: 0),
+        (field: "program.contracts_active", op: eq, value: 0),
+        (field: "program.science_banked", op: gt, value: 0.0),
+    ],
+    tick_budget: 20_000,
+    event_budget: 256,
+)

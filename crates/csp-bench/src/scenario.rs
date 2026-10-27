@@ -69,6 +69,23 @@ pub enum WorldSpec {
         /// `crate::scenarios::find(name)` and `fixtures_root/name`.
         name: String,
     },
+    /// A world built from an authored `data/` tree — the same
+    /// construction `View::new` performs (`csp_view::load_sim_world`:
+    /// system + physics bubble + parts/tech tree/contracts/recipes/
+    /// colonies + `tech.start` granted), so contract, colony,
+    /// manufacture, and science commands have real content to act on
+    /// (C30-F1 — the `Empty`/`Fixture` worlds ship none of it, making
+    /// the §8.5 lifecycle proofs structurally inexpressible).
+    ///
+    /// `root: None` resolves to the runner's `--data-root` (the bin
+    /// defaults `./data`), so the committed suite names the shipped
+    /// set without baking a path into the file; `Some(path)` pins a
+    /// different tree (absolute, or relative to the data root).
+    Data {
+        /// The `data/` tree root — see the variant doc.
+        #[serde(default)]
+        root: Option<std::path::PathBuf>,
+    },
 }
 
 /// Pre-loop world mutation — applied in order before the agents
@@ -85,6 +102,29 @@ pub enum SetupSpec {
     /// Terrin pad (requires a fixture world; `Empty` rejects at run
     /// time with `EvalError::Setup`).
     PadLaunch,
+    /// A `ManufactureCraft` order at the named launch site with a
+    /// registered bench craft — the §8.5 scenarios' build verb; the
+    /// weld inputs stay in the recipe like `PadLaunch`'s (a
+    /// `CraftDef` inline in RON would dwarf the file).
+    SiteCraft {
+        /// The `SiteId` string (`"terrin-launch"`).
+        site: String,
+        /// Which registered craft the order carries.
+        craft: SiteCraftKind,
+    },
+}
+
+/// The registered craft a `SiteCraft` order builds — the bench's
+/// authored weld tables (`crate::scenarios::{science_craft,
+/// cargo_craft}`), each naming real `part_ids` so the §3.3 part gate
+/// and the §3.5 bill envelope check against shipped content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SiteCraftKind {
+    /// `exp.materials_study` hopper (`csp.science.canister`).
+    ScienceHopper,
+    /// The EC-tank hauler (`csp.battery.z1k`).
+    CargoBattery,
 }
 
 /// One `Log` entry — re-issue `command` so it is *stamped* `tick`:
@@ -444,8 +484,17 @@ impl ScenarioFile {
     }
 
     /// Build the world (`world` + `setup`) — the recipe-frozen half
-    /// of the run.
-    fn build_world(&self, fixtures_root: &Path) -> Result<World, EvalError> {
+    /// of the run. Returns the world plus the score boundary the run
+    /// measures against: the clock and funds captured AFTER world
+    /// construction but BEFORE `setup` drains, so the §2.12.1 score
+    /// covers everything setup moved (C30-F4 — a `ManufactureCraft`'s
+    /// debit or an `AdvanceTo`'s sim-seconds in `setup` are part of
+    /// the run's cost, not free work the report hides).
+    fn build_world(
+        &self,
+        fixtures_root: &Path,
+        data_root: &Path,
+    ) -> Result<(World, u64, u64), EvalError> {
         let mut world = match &self.world {
             WorldSpec::Empty => World::new(),
             WorldSpec::Fixture { name } => {
@@ -455,11 +504,24 @@ impl ScenarioFile {
                 (recipe.initial)(&dir)
                     .map_err(|e: ReplayError| EvalError::Setup(format!("fixture {name:?}: {e}")))?
             }
+            WorldSpec::Data { root } => {
+                let dir = match root {
+                    Some(r) if r.is_absolute() => r.clone(),
+                    Some(r) => data_root.join(r),
+                    None => data_root.to_path_buf(),
+                };
+                csp_view::load_sim_world(&dir, self.save_seed)
+                    .map_err(|e| EvalError::Setup(format!("data root {}: {e}", dir.display())))?
+            }
         };
         // §2.7's seed is a construction-time write — stamp it before
         // the first drain so every seeded draw the run makes (and the
-        // hashed state itself) carries it.
+        // hashed state itself) carries it. `Data` worlds were seeded
+        // inside `load_sim_world` already; the restamp is the same
+        // write the other specs get, keeping the semantics identical.
         world.set_save_seed(self.save_seed);
+        let start_tick = world.clock().ticks();
+        let funds_start = world.funds_micros();
         let mut pending: Vec<SimCommand> = Vec::new();
         for spec in &self.setup {
             match spec {
@@ -471,6 +533,17 @@ impl ScenarioFile {
                     drain_pending(&mut world, &mut pending, &self.name)?;
                     crate::scenarios::spawn_pad(&mut world)
                         .map_err(|e| EvalError::Setup(format!("pad launch: {e}")))?;
+                }
+                SetupSpec::SiteCraft { site, craft } => {
+                    let (craft, build_resources) = match craft {
+                        SiteCraftKind::ScienceHopper => crate::scenarios::science_craft(),
+                        SiteCraftKind::CargoBattery => crate::scenarios::cargo_craft(),
+                    };
+                    pending.push(SimCommand::ManufactureCraft {
+                        site: csp_data::SiteId::from(site.as_str()),
+                        craft,
+                        build_resources,
+                    });
                 }
             }
         }
@@ -484,7 +557,7 @@ impl ScenarioFile {
             });
         }
         drain_pending(&mut world, &mut pending, &self.name)?;
-        Ok(world)
+        Ok((world, start_tick, funds_start))
     }
 }
 
@@ -612,9 +685,13 @@ impl Agent for LogAgent {
 ///
 /// `fixtures_root` is the directory the `Fixture{name}` worlds live
 /// under (`data/test-fixtures` in this repo — a CLI flag on
-/// `csp-eval`).
-pub fn run_scenario(file: &ScenarioFile, fixtures_root: &Path) -> Result<EvalReport, EvalError> {
-    run_scenario_full(file, fixtures_root).map(|(report, _)| report)
+/// `csp-eval`); `data_root` resolves `WorldSpec::Data` (`./data`).
+pub fn run_scenario(
+    file: &ScenarioFile,
+    fixtures_root: &Path,
+    data_root: &Path,
+) -> Result<EvalReport, EvalError> {
+    run_scenario_full(file, fixtures_root, data_root).map(|(report, _)| report)
 }
 
 /// [`run_scenario`] plus the lockstep transcript — the "agent runs
@@ -623,9 +700,9 @@ pub fn run_scenario(file: &ScenarioFile, fixtures_root: &Path) -> Result<EvalRep
 pub fn run_scenario_full(
     file: &ScenarioFile,
     fixtures_root: &Path,
+    data_root: &Path,
 ) -> Result<(EvalReport, Vec<crate::agent::TranscriptEntry>), EvalError> {
-    let world = file.build_world(fixtures_root)?;
-    let funds_start = world.funds_micros() as i64;
+    let (world, start_tick, funds_start) = file.build_world(fixtures_root, data_root)?;
     let mut run = Lockstep::new(world);
 
     // The command source -> registered agent (single-agent runs are
@@ -716,8 +793,13 @@ pub fn run_scenario_full(
             final_hash: crate::replay::hex(&hash),
             score: EvalScore {
                 dv_used_mps: run.dv_used_mps(),
-                sim_time_s: run.elapsed_ticks() as f64 / TICK_HZ as f64,
-                funds_spent_micros: run.world().funds_micros() as i64 - funds_start,
+                // The §2.12.1 score boundary is the PRE-SETUP world:
+                // setup's sim-seconds and funds deltas count toward
+                // the run (C30-F4), so `sim_time_s` is measured from
+                // the constructed world's clock, not the loop's start.
+                sim_time_s: (run.world().clock().ticks().saturating_sub(start_tick)) as f64
+                    / TICK_HZ as f64,
+                funds_spent_micros: run.world().funds_micros() as i64 - funds_start as i64,
             },
             events_applied: run.applied(),
             goals,

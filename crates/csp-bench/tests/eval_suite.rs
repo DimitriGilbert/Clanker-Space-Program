@@ -20,6 +20,10 @@ fn fixtures_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/test-fixtures")
 }
 
+fn data_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")
+}
+
 fn load(name: &str) -> ScenarioFile {
     scenario::load_scenario(&suite_dir().join(format!("{name}.ron"))).expect("scenario parses")
 }
@@ -33,7 +37,7 @@ fn load(name: &str) -> ScenarioFile {
 /// name.
 #[test]
 fn committed_eval_suite_all_pass() {
-    let entries = run_suite(&suite_dir(), &fixtures_root()).expect("suite reads");
+    let entries = run_suite(&suite_dir(), &fixtures_root(), &data_root()).expect("suite reads");
     assert!(!entries.is_empty(), "suite dir has no .ron files");
     let mut failures = Vec::new();
     for entry in &entries {
@@ -82,8 +86,10 @@ fn committed_eval_suite_all_pass() {
 #[test]
 fn lockstep_determinism_byte_identical() {
     let file = load("ascent-mission");
-    let (a, ta) = scenario::run_scenario_full(&file, &fixtures_root()).expect("run a");
-    let (b, tb) = scenario::run_scenario_full(&file, &fixtures_root()).expect("run b");
+    let (a, ta) =
+        scenario::run_scenario_full(&file, &fixtures_root(), &data_root()).expect("run a");
+    let (b, tb) =
+        scenario::run_scenario_full(&file, &fixtures_root(), &data_root()).expect("run b");
     assert_eq!(a.final_tick, b.final_tick);
     assert_eq!(a.final_hash, b.final_hash);
     assert_eq!(ta.len(), tb.len());
@@ -99,8 +105,8 @@ fn lockstep_determinism_byte_identical() {
 #[test]
 fn schedule_scenario_deterministic() {
     let file = load("idle-warp");
-    let a = scenario::run_scenario(&file, &fixtures_root()).expect("run a");
-    let b = scenario::run_scenario(&file, &fixtures_root()).expect("run b");
+    let a = scenario::run_scenario(&file, &fixtures_root(), &data_root()).expect("run a");
+    let b = scenario::run_scenario(&file, &fixtures_root(), &data_root()).expect("run b");
     assert_eq!((a.final_tick, a.final_hash), (b.final_tick, b.final_hash));
     assert!(a.pass);
 }
@@ -122,7 +128,7 @@ fn setup_advance_to_survives_frame_budget_partials() {
         event_budget: 16,
     )"#;
     let file = scenario::parse_scenario(text).expect("parses");
-    let report = scenario::run_scenario(&file, &fixtures_root()).expect("runs");
+    let report = scenario::run_scenario(&file, &fixtures_root(), &data_root()).expect("runs");
     // The setup advance landed the full 200 000 — the Idle agent then
     // gets its one boundary before `Done`, so the clock stands one
     // past it.
@@ -150,8 +156,8 @@ fn save_seed_changes_final_hash() {
         );
         scenario::parse_scenario(&text).expect("parses")
     };
-    let a = scenario::run_scenario(&make(0), &fixtures_root()).expect("run a");
-    let b = scenario::run_scenario(&make(42), &fixtures_root()).expect("run b");
+    let a = scenario::run_scenario(&make(0), &fixtures_root(), &data_root()).expect("run a");
+    let b = scenario::run_scenario(&make(42), &fixtures_root(), &data_root()).expect("run b");
     assert!(a.pass && b.pass);
     assert_ne!(a.final_hash, b.final_hash);
 }
@@ -196,7 +202,7 @@ fn scenario_format_failure_classes() {
     )"#;
     let file = scenario::parse_scenario(unknown_fixture).expect("parses");
     assert!(matches!(
-        scenario::run_scenario(&file, &fixtures_root()),
+        scenario::run_scenario(&file, &fixtures_root(), &data_root()),
         Err(EvalError::Setup(_))
     ));
     let unknown_program = r#"(
@@ -208,7 +214,7 @@ fn scenario_format_failure_classes() {
     )"#;
     let file = scenario::parse_scenario(unknown_program).expect("parses");
     assert!(matches!(
-        scenario::run_scenario(&file, &fixtures_root()),
+        scenario::run_scenario(&file, &fixtures_root(), &data_root()),
         Err(EvalError::Setup(_))
     ));
 }
@@ -246,7 +252,7 @@ fn unmet_goal_is_a_verdict_not_an_error() {
         event_budget: 16,
     )"#;
     let file = scenario::parse_scenario(text).expect("parses");
-    let report = scenario::run_scenario(&file, &fixtures_root()).expect("runs");
+    let report = scenario::run_scenario(&file, &fixtures_root(), &data_root()).expect("runs");
     assert!(!report.pass);
     assert_eq!(report.goals.len(), 1);
     assert!(!report.goals[0].passed);
@@ -266,7 +272,7 @@ fn event_budget_bounds_the_run() {
         event_budget: 1,
     )"#;
     let file = scenario::parse_scenario(text).expect("parses");
-    let report = scenario::run_scenario(&file, &fixtures_root()).expect("runs");
+    let report = scenario::run_scenario(&file, &fixtures_root(), &data_root()).expect("runs");
     assert_eq!(
         report.stop_reason,
         csp_bench::agent::StopReason::EventBudget
@@ -286,6 +292,8 @@ fn csp_eval_bin_reports_and_exits() {
         .arg(suite_dir().join("idle-warp.ron"))
         .arg("--fixtures-root")
         .arg(fixtures_root())
+        .arg("--data-root")
+        .arg(data_root())
         .arg("--transcript")
         .arg(std::env::temp_dir().join(format!("csp-eval-t-{}", std::process::id())))
         .output()
@@ -301,6 +309,30 @@ fn csp_eval_bin_reports_and_exits() {
     assert!(report["score"]["sim_time_s"].as_f64().unwrap() > 0.0);
 }
 
+/// C30-F4: the §2.12.1 score covers `setup` — the
+/// `contract-lifecycle` scenario's setup `AdvanceTo(640)` spends
+/// 10 sim-seconds before the agent loop binds, and its
+/// `ManufactureCraft` debits funds before the loop too. Both must
+/// land inside `score.sim_time_s`/`score.funds_spent_micros` — a
+/// score that measured only the post-setup lockstep would bill the
+/// run's setup work to nobody.
+#[test]
+fn the_score_covers_setup_work() {
+    let file = scenario::load_scenario(&suite_dir().join("contract-lifecycle.ron")).expect("parse");
+    let report = scenario::run_scenario(&file, &fixtures_root(), &data_root()).expect("runs");
+    assert!(report.pass, "scenario failed: {:?}", report.stop_reason);
+    // 10 s of setup advance alone, plus the loop's time.
+    assert!(
+        report.score.sim_time_s >= 10.0,
+        "setup's advance must bill into sim_time_s: {:?}",
+        report.score
+    );
+    // Funds moved — manufacture's debit is inside the delta (the
+    // contract pays it back plus profit, so the sign is negative;
+    // zero would mean setup spent nothing).
+    assert_ne!(report.score.funds_spent_micros, 0);
+}
+
 /// `csp-eval --suite` runs the whole directory; a passing suite is
 /// exit 0 (the committed suite is asserted green by
 /// `committed_eval_suite_all_pass` — this pins the bin's verdict
@@ -312,6 +344,8 @@ fn csp_eval_bin_suite_exit_code() {
         .arg(suite_dir())
         .arg("--fixtures-root")
         .arg(fixtures_root())
+        .arg("--data-root")
+        .arg(data_root())
         .output()
         .expect("spawn csp-eval");
     assert!(
@@ -499,6 +533,36 @@ fn mcp_mission_agent_flies_ascent() {
     assert_eq!(
         summary["tick"].as_u64().unwrap(),
         done["tick"].as_u64().unwrap()
+    );
+
+    // C30-F3: `session.save`/`session.load` round-trip through the
+    // bin's `with_reconfigure` hook — the closure that re-installs
+    // the script engine, autopilot driver, and op budget on the
+    // restored world (the gap in MCP e2e coverage: every prior run
+    // stopped at `session.snapshot`). Save the flown state, load it
+    // back, and prove the restored world is still usable — a
+    // missing reconfigure would surface here as an advance/script
+    // rejection, not a quiet divergence.
+    let save = mcp.tool("session.save", json!({"name": "mission-tail"}));
+    assert!(save["name"].as_str().is_some(), "save failed: {save}");
+    let loaded = mcp.tool("session.load", json!({"name": "mission-tail"}));
+    assert_eq!(
+        loaded["tick"].as_u64().unwrap(),
+        done["tick"].as_u64().unwrap(),
+        "loaded world dropped the clock"
+    );
+    // The restored world still advances — the reconfigure-installed
+    // channels (engine, budget, autopilot) are live, not just the
+    // serialized state.
+    let tick0 = loaded["tick"].as_u64().unwrap();
+    mcp.tool("timewarp.advance_to", json!({"tick": tick0 + 64}));
+    let after = mcp.tool("session.snapshot", json!({}));
+    assert_eq!(after["tick"].as_u64().unwrap(), tick0 + 64);
+    let list = mcp.tool("vessel.list", json!({}));
+    assert_eq!(
+        list["vessels"].as_array().map(Vec::len),
+        Some(1),
+        "the vessel survived the round-trip"
     );
 }
 

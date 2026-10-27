@@ -1,0 +1,74 @@
+// M9d eval suite — §8.5's "colony supply loop" proof on shipped
+// content (C30-F1/C34-F4, enabled by Phase 3's cargo-capable
+// content): the schedule founds a depot colony at the launch site
+// (Solar + Battery — an electric_charge store), manufactures the
+// cargo hauler there (it delivers SurfaceLatched inside
+// `transfer_radius_m` of the colony pose), joins its inventory,
+// delivers EC into the store (the resupply direction), withdraws
+// some back (the export direction), then abandons the colony —
+// salvage lands the store's contents in the site inventory the
+// economy reads. Goals pin: the colony was founded (id 1 — the
+// authored rask outpost is id 0), the delivered units landed
+// (store level ≥ net delivery), and the salvage reached the site.
+(
+    schema_version: 1,
+    name: "colony-supply",
+    world: Data(root: None),
+    save_seed: 0,
+    setup: [
+        Command(AdvanceTo(640)),
+        // Battery-ONLY depot — a solar charger fills the EC store to
+        // capacity before the delivery lands (the pipe's `free <
+        // amount` rejection), and a full store would mask a rejected
+        // delivery. An empty store makes `level == net transfers`
+        // an exact assertion of the loop.
+        Command(FoundColony(
+            def: (
+                site: "terrin-launch",
+                display_name: "colony.eval-depot",
+                modules: [Battery(capacity: 5_000.0)],
+                stores: [],
+            ),
+        )),
+        SiteCraft(site: "terrin-launch", craft: cargo_battery),
+    ],
+    agent: Schedule([
+        // ~1 s of build time (40 kg at 50 kg/s) plus margin — the
+        // delivered hull sits latched on the berth beside the colony.
+        [AdvanceTo(2_000)],
+        // §2.2.1: vessel-affecting verbs need the control lease.
+        [TakeControl(vessel: 0, lease: Agent(0))],
+        [JoinColonyInventory(vessel: 0, colony: 1)],
+        // 200 EC out of the full 1000-unit tank into the colony
+        // store (10 u/s pipe ⇒ ~20 s), then 50 back aboard.
+        [TransferColonyResource(
+            vessel: 0, colony: 1,
+            resource: "electric_charge", amount: 200.0, to_colony: true,
+        )],
+        [AdvanceTo(4_000)],
+        [TransferColonyResource(
+            vessel: 0, colony: 1,
+            resource: "electric_charge", amount: 50.0, to_colony: false,
+        )],
+        [AdvanceTo(6_000)],
+        [AbandonColony(colony: 1)],
+        [AdvanceTo(6_064)],
+    ]),
+    goals: [
+        // The depot founded as ColonyId(1) — rask-mines is the
+        // authored id 0 (founded at world build).
+        (field: "program.colonies.1.id", op: eq, value: 1),
+        // 200 delivered − 50 withdrawn, exactly — no producer or
+        // consumer touches the store, so the level IS the net
+        // transfer (a rejected delivery reads 0).
+        (field: "program.colonies.1.store_levels.electric_charge", op: eq, value: 150.0),
+        // The abandon salvaged the store into the launch site's
+        // inventory — the §3.5 supply loop's economy edge.
+        // SiteId order is alphabetical: rask-mines, terrin-downrange,
+        // terrin-launch — index 2 is the depot's site.
+        (field: "program.sites.2.inventory.electric_charge", op: gt, value: 0.0),
+        (field: "program.colonies.1.state", op: eq, value: "Abandoned"),
+    ],
+    tick_budget: 10_000,
+    event_budget: 256,
+)

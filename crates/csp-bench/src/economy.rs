@@ -206,118 +206,55 @@ pub fn staffed_base_run(probe: &EconomyProbe) -> Result<EconomyReport, SimError>
 /// of the §8.3 harness: colony production feeding the economy.
 #[derive(Clone, Debug)]
 pub struct ColonyEconomyReport {
-    /// Ore units the colony's drill produced into its store by the
-    /// end of the run (the production side).
-    pub ore_produced: f64,
-    /// Ore units the `AbandonColony` salvage landed in the site's
-    /// inventory (the economy side — the inventory the program's
-    /// recovery/build machinery draws on) — the authored
-    /// `abandon_recovery` fraction of the produced level.
-    pub salvaged: f64,
+    /// Live store levels `{resource: units}` at the run's end — the
+    /// production side (drill output buffered, converter inputs
+    /// drained, converter outputs accrued, EC sustained).
+    pub store_levels: BTreeMap<String, f64>,
+    /// The colony's state at the run's end — `Nominal` says the
+    /// authored power budget held across the whole fast-forward
+    /// (a `Degraded`/`PowerLost` episode would read otherwise).
+    pub final_state: String,
+    /// The site inventory the `AbandonColony` salvage landed
+    /// `{resource: units}` — the economy side: the authored
+    /// `abandon_recovery` fraction of every store.
+    pub salvaged: BTreeMap<String, f64>,
     /// Serialized `WorldSnapshot` size at the run's end (bytes).
     pub final_save_bytes: u64,
 }
 
-/// M8-C §8.3's colony/economy probe: a mining colony runs `months`
-/// sim-months — the drill's production accrues into the colony's
-/// store (piecewise-linear, event-bounded — one recompute per
-/// boundary, never a per-tick integrator), then `AbandonColony`
-/// salvages the stores into the site inventory the rest of the
-/// economy reads. The world carries no physics/orbit model: the
-/// colony's light environment is synthetic (`colony_env` is
-/// construction config), so the run is a pure production book.
-#[allow(clippy::too_many_lines)] // site/env fixture + run read as one pass
+/// M8-C §8.3's colony/economy probe — the AUTHORED colony, not a
+/// synthetic fixture (C30-F5): the world is `View::new`'s own
+/// construction (`csp_view::load_sim_world` over `data/`), which
+/// founds `data/systems/home/colonies.ron`'s rask mining outpost at
+/// world build. The probe fast-forwards `months` sim-months — the
+/// drill/converter/power solves run over the authored day-night
+/// cycle and the real site yields — then `AbandonColony` salvages
+/// the stores into the `rask-mines` site inventory the economy
+/// reads. Production is piecewise-linear, event-bounded — one
+/// recompute per boundary, never a per-tick integrator.
+#[allow(clippy::too_many_lines)] // the run reads as one pass
 pub fn colony_production_run(months: u64) -> Result<ColonyEconomyReport, SimError> {
-    use csp_data::{BodyId, ColonyModuleDef, ResourceId, SiteId};
-    let balance = shipping_balance()
-        .map_err(|_| SimError::Fatal("economy: shipping balance.ron failed to load"))?;
-    let mut bodies = BTreeMap::new();
-    bodies.insert(
-        BodyId::from("terra"),
-        csp_sim::orbit::BodyOrbit {
-            mu_m3_per_s2: 4.0e14,
-            soi_m: None,
-            parent: None,
-            elements: None,
-        },
-    );
-    let mut w = World::with_config(
-        csp_sim::orbit::PatchedConics::new(bodies),
-        balance.advance_to_max_events_per_frame,
-    );
-    w.set_economy_config(economy::EconomyConfig::from_balance(&balance))?;
-    w.set_life_support_config(csp_sim::life_support::LifeSupportConfig::from_balance(
-        &balance,
-    ));
-    w.set_colony_env(BTreeMap::from([(
-        BodyId::from("terra"),
-        csp_sim::ColonyBodyEnv {
-            rotation_period_s: Some(21_600.0),
-            insolation_w_m2: Some(1361.0),
-            radius_m: 6.0e6,
-        },
-    )]));
-    let ore = ResourceId::from("ore");
-    w.set_sites(BTreeMap::from([(
-        SiteId::from("pad"),
-        csp_data::SiteDef {
-            schema_version: 1,
-            id: SiteId::from("pad"),
-            display_name: csp_data::LocKey::from("site.pad"),
-            body: BodyId::from("terra"),
-            latitude_rad: 0.0,
-            longitude_rad: 0.0,
-            altitude_m: 0.0,
-            launch: false,
-            resource_yields: vec![(ore.clone(), 1.0)],
-            starting_stock: vec![],
-        },
-    )]));
-    // The authored shape: a constant-power generator, a drill
-    // pulling ore at the site's full concentration, and the store
-    // it fills. 50 days of production at 0.5 u/s ≈ 2.16 M units —
-    // the store capacity reads as unbounded for the probe.
-    w.enqueue(
-        csp_sim::SourceClass::Ui,
-        0,
-        SimCommand::FoundColony {
-            def: csp_data::ColonyDef {
-                site: SiteId::from("pad"),
-                display_name: csp_data::LocKey::from("colony.probe"),
-                modules: vec![
-                    ColonyModuleDef::Generator {
-                        fuel: ore.clone(),
-                        fuel_rate_per_s: 0.0,
-                        rate_per_s: 10.0,
-                        priority: 0,
-                    },
-                    ColonyModuleDef::Drill {
-                        resource: ore.clone(),
-                        base_rate_per_s: 0.5,
-                        min_concentration: 1.0,
-                        power_ec_per_s: 1.0,
-                    },
-                    ColonyModuleDef::Store {
-                        resource: ore.clone(),
-                        capacity: 1.0e12,
-                    },
-                ],
-                stores: vec![],
-            },
-        },
-    );
-    w.step_frame(w.clock().ticks() + 1)?;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
+    let mut w = csp_view::load_sim_world(&root, 0)
+        .map_err(|_| SimError::Fatal("economy: data-world build failed"))?;
+    // The authored seed — `colonies.ron`'s rask-mines outpost is
+    // the first (and only) founding at world build.
     let colony = *w
         .colonies()
         .keys()
         .next()
-        .ok_or(SimError::Fatal("economy: colony did not found"))?;
+        .ok_or(SimError::Fatal("economy: authored colony not founded"))?;
     let month_ticks = (30.0 * 86_400.0 * TICK_HZ as f64) as u64;
     let target = months * month_ticks;
     while w.clock().ticks() < target {
         w.step_frame(w.clock().ticks() + month_ticks)?;
     }
-    let ore_produced = w.colonies()[&colony].stores[&ore].level_at(w.clock().ticks());
+    let store_levels = w.colonies()[&colony]
+        .stores
+        .iter()
+        .map(|(r, s)| (r.as_str().to_string(), s.level_at(w.clock().ticks())))
+        .collect();
+    let final_state = format!("{:?}", w.colonies()[&colony].state);
     w.enqueue(
         csp_sim::SourceClass::Ui,
         0,
@@ -327,12 +264,17 @@ pub fn colony_production_run(months: u64) -> Result<ColonyEconomyReport, SimErro
     let site = w
         .economy()
         .sites
-        .get(&SiteId::from("pad"))
+        .get(&csp_data::SiteId::from("rask-mines"))
         .ok_or(SimError::Fatal("economy: abandon left no site inventory"))?;
-    let salvaged = site.inventory.get(&ore).copied().unwrap_or(0.0);
+    let salvaged = site
+        .inventory
+        .iter()
+        .map(|(r, q)| (r.as_str().to_string(), *q))
+        .collect();
     let snapshot = w.snapshot()?;
     Ok(ColonyEconomyReport {
-        ore_produced,
+        store_levels,
+        final_state,
         salvaged,
         final_save_bytes: bincode::serde::encode_to_vec(&snapshot, bincode::config::standard())
             .map_err(|_| SimError::Fatal("economy: snapshot encode failed"))?
@@ -504,26 +446,51 @@ mod tests {
         );
     }
 
-    /// M8-C §8.3's colony/economy seam: a mining colony's production
-    /// accrues into its store across sim-months, and `AbandonColony`
-    /// feeds the produced units back into the site inventory the
-    /// economy's recovery/build machinery draws on — the same
-    /// bounded ledger/save-size contract holds through it.
+    /// M8-C §8.3's colony/economy seam on the AUTHORED outpost
+    /// (C30-F5): `data/systems/home/colonies.ron`'s rask mines run
+    /// three sim-months — the drill buffers ore (bounded by its
+    /// authored 100-unit store), the smelter produces metal, the
+    /// sinter produces composite — the recipe data the file was
+    /// written to exercise — and the power budget holds Nominal.
+    /// `AbandonColony` then feeds the stores back into the site
+    /// inventory at the authored `abandon_recovery` fraction.
     #[test]
     fn colony_production_feeds_the_economy() {
         let report = colony_production_run(3).unwrap();
-        // Three months at 0.5 u/s ≈ 3.9 M units — production accrued.
-        assert!(report.ore_produced > 1.0e6, "ore {report:?}");
-        // The abandon salvaged the produced units into the site
-        // inventory at the authored `abandon_recovery` fraction —
-        // colony production feeding the economy.
-        let cfg = economy::EconomyConfig::from_balance(&shipping_balance().unwrap());
+        let levels = &report.store_levels;
+        // The drill ran: ore sits at/above its 10-unit founding
+        // seed (the store's cap is 100 — production saturates, the
+        // converter draw decides the level).
         assert!(
-            (report.salvaged - report.ore_produced * cfg.abandon_recovery).abs()
-                < report.ore_produced * 1e-9,
-            "salvage {report:?} vs recovery {}·ore",
-            cfg.abandon_recovery
+            levels.get("ore").copied().unwrap_or(0.0) >= 10.0,
+            "ore level {levels:?}"
         );
+        // The authored recipes RAN — metal and composite accrued:
+        // the §3.5.1 converter path on shipped recipes, not a
+        // synthetic fixture.
+        assert!(
+            levels.get("metal").copied().unwrap_or(0.0) > 0.0,
+            "smelter produced {levels:?}"
+        );
+        assert!(
+            levels.get("composite").copied().unwrap_or(0.0) > 0.0,
+            "sinter produced {levels:?}"
+        );
+        // The authored 340 000-EC battery held the night — the
+        // colonies.ron header's own bound.
+        assert_eq!(report.final_state, "Nominal");
+        // The abandon salvaged every store into the site inventory
+        // at the authored `abandon_recovery` fraction — colony
+        // production feeding the economy.
+        let cfg = economy::EconomyConfig::from_balance(&shipping_balance().unwrap());
+        for (r, level) in levels {
+            let got = report.salvaged.get(r).copied().unwrap_or(0.0);
+            assert!(
+                (got - level * cfg.abandon_recovery).abs() < level.max(1.0) * 1e-6,
+                "salvage {r}: {got} vs {level}·{}",
+                cfg.abandon_recovery
+            );
+        }
         assert!(report.final_save_bytes <= 32 * 1024 * 1024);
     }
 
@@ -533,7 +500,7 @@ mod tests {
     fn colony_probe_is_deterministic() {
         let a = colony_production_run(1).unwrap();
         let b = colony_production_run(1).unwrap();
-        assert_eq!(a.ore_produced, b.ore_produced);
+        assert_eq!(a.store_levels, b.store_levels);
         assert_eq!(a.salvaged, b.salvaged);
         assert_eq!(a.final_save_bytes, b.final_save_bytes);
     }

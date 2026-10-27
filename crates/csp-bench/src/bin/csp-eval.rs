@@ -25,7 +25,7 @@ use std::process::ExitCode;
 
 use csp_bench::scenario::{self, EvalError, EvalReport};
 
-const USAGE: &str = "usage: csp-eval <scenario.ron | --suite <dir>> [--fixtures-root <dir>] [--transcript <out.json>]";
+const USAGE: &str = "usage: csp-eval <scenario.ron | --suite <dir>> [--fixtures-root <dir>] [--data-root <dir>] [--transcript <out.json>]";
 
 fn main() -> ExitCode {
     match run() {
@@ -41,6 +41,7 @@ fn run() -> Result<ExitCode, EvalError> {
     let mut scenario_path: Option<PathBuf> = None;
     let mut suite_dir: Option<PathBuf> = None;
     let mut fixtures_root = PathBuf::from("data/test-fixtures");
+    let mut data_root = PathBuf::from("data");
     let mut transcript_out: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -55,6 +56,12 @@ fn run() -> Result<ExitCode, EvalError> {
                 fixtures_root = PathBuf::from(
                     args.next()
                         .ok_or_else(|| EvalError::Invalid("--fixtures-root needs a dir".into()))?,
+                );
+            }
+            "--data-root" => {
+                data_root = PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| EvalError::Invalid("--data-root needs a dir".into()))?,
                 );
             }
             "--transcript" => {
@@ -85,7 +92,7 @@ fn run() -> Result<ExitCode, EvalError> {
                 "{USAGE}\n--transcript is single-scenario mode only; not valid with --suite"
             )));
         }
-        let entries = csp_bench::eval::run_suite(&dir, &fixtures_root)?;
+        let entries = csp_bench::eval::run_suite(&dir, &fixtures_root, &data_root)?;
         let mut all_pass = true;
         for entry in &entries {
             match &entry.outcome {
@@ -111,7 +118,7 @@ fn run() -> Result<ExitCode, EvalError> {
         return Ok(ExitCode::from(2));
     };
     let file = scenario::load_scenario(&path)?;
-    let (report, transcript) = scenario::run_scenario_full(&file, &fixtures_root)?;
+    let (report, transcript) = scenario::run_scenario_full(&file, &fixtures_root, &data_root)?;
     print_report(&report);
     if let Some(out) = transcript_out {
         let json = serde_json::to_string_pretty(&transcript)

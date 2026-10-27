@@ -1,0 +1,39 @@
+// M9d eval suite — the land/recover science scenario (C34-F4,
+// C05-F6): the §3.2 recovery edge a "launch → collect → land →
+// recover" chain ends on. The science hopper is manufactured at
+// the launch site, runs `exp.materials_study` landed (data pools
+// aboard), and `RecoverVessel` banks the pooled units at the
+// recover fraction — the science-recovery-via-RecoverVessel seam
+// C05-F1 found untested anywhere. Goals pin the banked science,
+// the milestone payout (funds grew past the build+recovery cycle's
+// net-zero), and the vessel leaving the arena.
+(
+    schema_version: 1,
+    name: "science-recover",
+    world: Data(root: None),
+    save_seed: 0,
+    setup: [
+        Command(AdvanceTo(640)),
+        SiteCraft(site: "terrin-launch", craft: science_hopper),
+    ],
+    agent: Schedule([
+        [AdvanceTo(2_000)],
+        // §2.2.1: vessel-affecting verbs need the control lease.
+        [TakeControl(vessel: 0, lease: Agent(0))],
+        [RunExperiment(
+            vessel: 0,
+            node: 0,
+            experiment: "exp.materials_study",
+            biome: "terrin.grassland",
+            situation: Landed,
+        )],
+        [RecoverVessel(vessel: 0, site: Some("terrin-launch"))],
+        [AdvanceTo(2_064)],
+    ]),
+    goals: [
+        (field: "program.science_banked", op: gt, value: 0.0),
+        (field: "program.funds_micros", op: gt, value: 1_000_000_000_000.0),
+    ],
+    tick_budget: 10_000,
+    event_budget: 256,
+)

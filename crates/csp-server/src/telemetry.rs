@@ -62,6 +62,18 @@ pub struct ProgramSnapshot {
     pub contract_offers: usize,
     /// Active (accepted, incomplete) contracts.
     pub contracts_active: usize,
+    /// The board's offers, summarized — the `AcceptContract` `offer`
+    /// index an agent needs is otherwise undiscoverable (the
+    /// `program.sites`/`program.parts` discoverability precedent,
+    /// C30-F1): a count alone can't drive an accept.
+    pub offers: Vec<OfferRow>,
+    /// `contracts.facts.completed` summed over kinds — the §3.6
+    /// lifecycle's "did it complete" read (completion removes the
+    /// record from `active`, which alone can't distinguish complete
+    /// from deadline-fail).
+    pub contracts_completed: u64,
+    /// `contracts.facts.failed` summed over kinds.
+    pub contracts_failed: u64,
     /// Researched tech nodes.
     pub tech_researched: usize,
     /// Crew roster size (`EconomyState::crew`).
@@ -100,6 +112,23 @@ pub struct ColonyRow {
     pub modules: usize,
     /// Live resource-kind count across stores.
     pub stores: usize,
+    /// Live store levels `{resource: units}` at the snapshot tick —
+    /// the §3.5.1 supply loop's observable surface (a delivered
+    /// resupply or a drill's production reads here; the bare count
+    /// can't distinguish a filled store from an empty one).
+    pub store_levels: BTreeMap<String, f64>,
+}
+
+/// One contract offer's wire row — the `AcceptContract` index plus
+/// the template it would activate (C30-F1: the offer indices are
+/// KDF counters, not positional, so an agent must read them, not
+/// guess).
+#[derive(Clone, Debug, Serialize)]
+pub struct OfferRow {
+    /// The offer's index — `AcceptContract.offer`'s value.
+    pub index: u64,
+    /// The template id (`"contract.survey"`, …).
+    pub template: String,
 }
 
 /// One surface site's wire row — the `ManufactureCraft` `site`
@@ -189,6 +218,7 @@ impl TelemetrySnapshot {
     /// null` while vessels fly would leave every `focus.*`
     /// subscription dark — the same brick the `vessels.0` hard-coding
     /// was (C28-F1).
+    #[allow(clippy::too_many_lines)] // one snapshot = one read pass
     pub fn from_world_focus(world: &World, focus: Option<u64>) -> Self {
         let vessels: BTreeMap<u64, SnapshotVessel> = world
             .vessels()
@@ -212,6 +242,29 @@ impl TelemetrySnapshot {
             science_banked: world.science().banked,
             contract_offers: world.contracts().offers.len(),
             contracts_active: world.contracts().active.len(),
+            offers: world
+                .contracts()
+                .offers
+                .values()
+                .map(|o| OfferRow {
+                    index: o.index,
+                    template: o.template.as_str().to_string(),
+                })
+                .collect(),
+            contracts_completed: world
+                .contracts()
+                .facts
+                .completed
+                .values()
+                .map(|n| *n as u64)
+                .sum(),
+            contracts_failed: world
+                .contracts()
+                .facts
+                .failed
+                .values()
+                .map(|n| *n as u64)
+                .sum(),
             tech_researched: world.tech().researched.len(),
             crew_roster: world.economy().crew.len(),
             colonies: world
@@ -223,6 +276,11 @@ impl TelemetrySnapshot {
                     state: format!("{:?}", c.state),
                     modules: c.modules.len(),
                     stores: c.stores.len(),
+                    store_levels: c
+                        .stores
+                        .iter()
+                        .map(|(r, s)| (r.as_str().to_string(), s.level_at(world.clock().ticks())))
+                        .collect(),
                 })
                 .collect(),
             scripts: world

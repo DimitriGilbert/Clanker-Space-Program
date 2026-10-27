@@ -306,6 +306,179 @@ pub fn flight_craft() -> csp_sim::CraftDef {
     }
 }
 
+/// The bench's authored science hopper — a single-part craft carrying
+/// the `exp.materials_study` module (mask 49 = Landed | SpaceLow |
+/// SpaceHigh, the `csp.science.canister` authoring) for the §8.5
+/// eval scenarios: `RunExperiment` from a surface-latched vessel, then
+/// `RecoverVessel` banks the pool — the land/recover science seam
+/// (C05-F6/C34-F4). `part_ids` names the catalog row so the
+/// `ManufactureCraft` bill checks against real content; the weld
+/// inputs themselves are the recipe's hand-authored values (the
+/// `flight_craft` convention).
+pub fn science_craft() -> (csp_sim::CraftDef, Vec<(csp_data::ResourceId, f64)>) {
+    let mut graph = PartGraph::new(PartNodeId(0));
+    graph.nodes.insert(
+        PartNodeId(0),
+        PartNode::new(None, PartTransform::IDENTITY, 0),
+    );
+    let canister = WeldPart {
+        experiments: vec![csp_phys::ExperimentSpec {
+            kind: csp_data::ExperimentId::from("exp.materials_study"),
+            // 100 units/run — well above every `survey.data` draw
+            // (min_units ∈ [5, 10]); the terrin cap soft-caps the
+            // yield at ~11.8, still enough for the largest draw.
+            data_units: 100.0,
+            reusable: false,
+            situations: csp_data::SituationMask(49),
+        }],
+        lab: None,
+        engine: None,
+        parachute: None,
+        dock_ports: vec![],
+        tanks: vec![],
+        crew_seats: 0,
+        structural: csp_data::StructuralDef::unlimited(),
+        mass_kg: 100.0,
+        com: DVec3::ZERO,
+        inertia: SymMat3::solid_box(100.0, DVec3::new(0.3, 0.3, 0.3)),
+        collider: ColliderShape::Box {
+            half_extents: DVec3::new(0.3, 0.3, 0.3),
+        },
+        force_sites: vec![],
+        aero: csp_data::AeroDef::constant(1.0, 0.0, 1.0),
+        thermal: csp_data::ThermalDef {
+            heat_capacity_j_per_k: 50_000.0,
+            max_temp_k: 1_000.0,
+            emissivity: 0.65,
+            conduction_w_per_k: 30.0,
+        },
+    };
+    (
+        csp_sim::CraftDef {
+            hash_memo: Default::default(),
+            part_ids: vec![csp_data::PartId::from("csp.science.canister")],
+            graph,
+            parts: vec![canister],
+            part_costs: vec![500.0],
+            reliability: vec![],
+        },
+        // `csp.science.canister`'s authored BOM (scale: None ⇒ the
+        // bill envelope is the authored point).
+        vec![
+            (csp_data::ResourceId::from("metal"), 8.0),
+            (csp_data::ResourceId::from("composite"), 4.0),
+        ],
+    )
+}
+
+/// The bench's authored cargo hauler — a single-part `csp.battery.z1k`
+/// carrier (tech.start, so the part gate admits it on a fresh
+/// `WorldSpec::Data` world) whose full 1000-unit EC tank is the
+/// deliverable in the §8.5 colony-supply scenario: colony Store/
+/// Battery modules accept `electric_charge` like any resource.
+/// The `(craft, build_resources)` pair is the `ManufactureCraft`
+/// command's two arguments (the `science_craft` convention).
+pub fn cargo_craft() -> (csp_sim::CraftDef, Vec<(csp_data::ResourceId, f64)>) {
+    let mut graph = PartGraph::new(PartNodeId(0));
+    graph.nodes.insert(
+        PartNodeId(0),
+        PartNode::new(None, PartTransform::IDENTITY, 0),
+    );
+    let battery = WeldPart {
+        experiments: Vec::new(),
+        lab: None,
+        engine: None,
+        parachute: None,
+        dock_ports: vec![],
+        tanks: vec![csp_phys::TankSpec {
+            resource: csp_data::ResourceId::from("electric_charge"),
+            capacity: 1_000.0,
+            mass_per_unit_kg: 0.0,
+        }],
+        crew_seats: 0,
+        structural: csp_data::StructuralDef::unlimited(),
+        mass_kg: 40.0,
+        com: DVec3::ZERO,
+        inertia: SymMat3::solid_box(40.0, DVec3::new(0.25, 0.25, 0.25)),
+        collider: ColliderShape::Box {
+            half_extents: DVec3::new(0.25, 0.25, 0.25),
+        },
+        force_sites: vec![],
+        aero: csp_data::AeroDef::constant(1.0, 0.0, 1.0),
+        thermal: csp_data::ThermalDef {
+            heat_capacity_j_per_k: 40_000.0,
+            max_temp_k: 800.0,
+            emissivity: 0.6,
+            conduction_w_per_k: 20.0,
+        },
+    };
+    (
+        csp_sim::CraftDef {
+            hash_memo: Default::default(),
+            part_ids: vec![csp_data::PartId::from("csp.battery.z1k")],
+            graph,
+            parts: vec![battery],
+            part_costs: vec![200.0],
+            reliability: vec![],
+        },
+        // `csp.battery.z1k`'s authored BOM (scale: None ⇒ exact).
+        vec![
+            (csp_data::ResourceId::from("metal"), 3.0),
+            (csp_data::ResourceId::from("composite"), 2.0),
+        ],
+    )
+}
+
+/// The bench's anonymous orbiter — a single part carrying BOTH
+/// `ModuleKind`s the `contract.part_test` template draws (a crew
+/// seat AND a thrust site), so one craft satisfies either draw.
+/// Anonymous (`part_ids` empty — the `SpawnPhysicalVessel` sandbox
+/// convention) because the probe poses it, not manufactures it.
+pub fn orbiter_craft() -> csp_sim::CraftDef {
+    let mut graph = PartGraph::new(PartNodeId(0));
+    graph.nodes.insert(
+        PartNodeId(0),
+        PartNode::new(None, PartTransform::IDENTITY, 0),
+    );
+    let part = WeldPart {
+        experiments: Vec::new(),
+        lab: None,
+        engine: None,
+        parachute: None,
+        dock_ports: vec![],
+        tanks: vec![],
+        crew_seats: 1,
+        structural: csp_data::StructuralDef::unlimited(),
+        mass_kg: 200.0,
+        com: DVec3::ZERO,
+        inertia: SymMat3::solid_box(200.0, DVec3::new(0.5, 0.5, 0.5)),
+        collider: ColliderShape::Box {
+            half_extents: DVec3::new(0.5, 0.5, 0.5),
+        },
+        force_sites: vec![csp_phys::ForceSite::new(
+            DVec3::new(0.0, 0.0, -0.5),
+            DVec3::new(0.0, 0.0, 1.0),
+            csp_phys::ForceSiteKind::Thrust,
+            10_000.0,
+        )],
+        aero: csp_data::AeroDef::constant(1.0, 0.0, 1.0),
+        thermal: csp_data::ThermalDef {
+            heat_capacity_j_per_k: 100_000.0,
+            max_temp_k: 1_000.0,
+            emissivity: 0.6,
+            conduction_w_per_k: 30.0,
+        },
+    };
+    csp_sim::CraftDef {
+        hash_memo: Default::default(),
+        part_ids: vec![],
+        graph,
+        parts: vec![part],
+        part_costs: vec![0.0],
+        reliability: vec![],
+    }
+}
+
 /// Quaternion taking body +z (the thrust axis) to `dir` — the scripted
 /// controller's attitude surface. `pub` for M9d: the eval suite's
 /// ascent program steers with the same convention.
