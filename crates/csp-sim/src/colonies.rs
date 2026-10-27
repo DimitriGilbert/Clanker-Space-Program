@@ -3076,14 +3076,38 @@ mod tests {
             .join("data/systems/home")
     }
 
-    /// `body_light` over the REAL system + the shipped rask-mines
-    /// pose: synodic = n_rask − n_terrin ≈ 4.4525e-5 rad/s → a
-    /// ~141 115 s solar day, and the 2.4 rad spawn longitude sits
-    /// ~0.74 rad into the day side (|cos H0| = 0.737 — the real
-    /// margin the terminator verifier recommends, not the +6.1e-17
-    /// residue π/2 left).
-    #[test]
-    fn authored_rask_light_is_parent_locked() {
+    /// The authored-data fixture both `authored_rask_*` pins load:
+    /// the real home system as patched conics + colony env, the
+    /// authored rask-mines site (a clone — callers re-pose its
+    /// longitude for the founding hour angle they need), the
+    /// authored rask-mines colony def, and the shipped recipe table.
+    struct HomeRask {
+        orbits: PatchedConics,
+        envs: BTreeMap<BodyId, ColonyBodyEnv>,
+        site: SiteDef,
+        colony: csp_data::ColonyDef,
+        recipes: csp_data::LoadedRecipes,
+    }
+
+    impl HomeRask {
+        /// `body_light` for the (possibly re-posed) site — the pin
+        /// both tests anchor their day/night claims on.
+        fn light(&self) -> BodyLight {
+            let rask = BodyId::from("rask");
+            body_light(
+                &rask,
+                self.site.latitude_rad,
+                self.site.longitude_rad,
+                &self.orbits,
+                &self.envs[&rask],
+            )
+        }
+    }
+
+    /// Load the [`HomeRask`] fixture from `data/systems/home` +
+    /// `data/recipes` — one preamble serving both authored-data
+    /// tests.
+    fn home_rask() -> HomeRask {
         let dir = home_dir();
         let defs: Vec<BodyDef> = csp_data::load_system(&dir)
             .unwrap()
@@ -3098,15 +3122,40 @@ mod tests {
             .sites
             .iter()
             .find(|s| s.id.as_str() == "rask-mines")
-            .unwrap();
-        let rask = BodyId::from("rask");
-        let light = body_light(
-            &rask,
-            site.latitude_rad,
-            site.longitude_rad,
-            &orbits,
-            &envs[&rask],
-        );
+            .unwrap()
+            .clone();
+        let colonies = csp_data::load_colonies(&dir.join("colonies.ron")).unwrap();
+        let colony = colonies
+            .colonies
+            .iter()
+            .find(|c| c.site.as_str() == "rask-mines")
+            .unwrap()
+            .clone();
+        let recipes = csp_data::load_recipes(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join("data/recipes"),
+        )
+        .unwrap();
+        HomeRask {
+            orbits,
+            envs,
+            site,
+            colony,
+            recipes,
+        }
+    }
+
+    /// `body_light` over the REAL system + the shipped rask-mines
+    /// pose: synodic = n_rask − n_terrin ≈ 4.4525e-5 rad/s → a
+    /// ~141 115 s solar day, and the 2.4 rad spawn longitude sits
+    /// ~0.74 rad into the day side (|cos H0| = 0.737 — the real
+    /// margin the terminator verifier recommends, not the +6.1e-17
+    /// residue π/2 left).
+    #[test]
+    fn authored_rask_light_is_parent_locked() {
+        let fx = home_rask();
+        let light = fx.light();
         // The C09-F3/C34-F3 verified numbers: synodic 4.4525e-5 →
         // 141 115 s solar day, 70 558 s night.
         let n_rask = TWO_PI / 138984.37657447575;
@@ -3133,61 +3182,30 @@ mod tests {
     /// `TerminatorCrossing` into a recharging dawn.
     #[test]
     fn authored_rask_outpost_rides_the_night() {
-        let dir = home_dir();
-        let defs: Vec<BodyDef> = csp_data::load_system(&dir)
-            .unwrap()
-            .bodies
-            .iter()
-            .map(|b| b.def.clone())
-            .collect();
-        let colonies = csp_data::load_colonies(&dir.join("colonies.ron")).unwrap();
-        let def = colonies
-            .colonies
-            .iter()
-            .find(|c| c.site.as_str() == "rask-mines")
-            .unwrap()
-            .clone();
-        let sites = csp_data::load_sites(&dir.join("sites.ron")).unwrap();
+        let mut fx = home_rask();
         // A dusk-anchored clone of the authored site: h0 ≈ π/2 + 0.09
         // at lon 4.8 → Night at founding with the whole ~70 500 s
         // night ahead (the authored 2.4 rad site saturates its stores
         // in the first ~2 ks of a 51.9 ks day and would idle the
         // night away — this pose forces the battery to carry real
         // production through it).
-        let mut site = sites
-            .sites
-            .iter()
-            .find(|s| s.id.as_str() == "rask-mines")
-            .unwrap()
-            .clone();
-        site.longitude_rad = 4.8;
-        let recipes = csp_data::load_recipes(
-            &Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .join("data/recipes"),
-        )
-        .unwrap();
-        let orbits = PatchedConics::from_body_defs(&defs).unwrap();
-        let rask = BodyId::from("rask");
-        let env = colony_env_from_body_defs(&defs);
-        let light = body_light(
-            &rask,
-            site.latitude_rad,
-            site.longitude_rad,
-            &orbits,
-            &env[&rask],
-        );
-        let mut w = World::with_system(orbits);
-        w.set_colony_env(env);
-        w.set_sites(BTreeMap::from([(site.id.clone(), site)]));
+        fx.site.longitude_rad = 4.8;
+        let light = fx.light();
+        let mut w = World::with_system(fx.orbits);
+        w.set_colony_env(fx.envs);
+        w.set_sites(BTreeMap::from([(fx.site.id.clone(), fx.site)]));
         w.set_recipes(
-            recipes
+            fx.recipes
                 .recipes
                 .iter()
                 .map(|r| (r.def.id.clone(), r.def.clone()))
                 .collect(),
         );
-        w.enqueue(SourceClass::Ui, 0, SimCommand::FoundColony { def });
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::FoundColony { def: fx.colony },
+        );
         let r = w.step_frame(w.clock().ticks() + 1).unwrap();
         let id = *w.colonies().keys().next().unwrap();
         assert!(
