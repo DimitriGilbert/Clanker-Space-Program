@@ -51,12 +51,27 @@ use crate::loc::LocFile;
 use crate::part::{ColliderDef, ModuleDef, PART_SCHEMA_VERSION, PartCategory, PartDef, ScaleRule};
 use crate::resource::{RESOURCE_SCHEMA_VERSION, ResourceFile};
 use crate::site::{SiteDef, SiteFile};
-use crate::system::SCHEMA_VERSION;
+use crate::system::{KeplerElements, SCHEMA_VERSION};
 use crate::techtree::{TechNode, UpgradeTrack};
 
 /// Relative tolerance for the §3.0 period-consistency rule:
 /// `|T_authored − 2π√(a³/μ_parent)| / T_computed ≤ PERIOD_REL_TOL`.
 pub const PERIOD_REL_TOL: f64 = 1e-9;
+
+/// Minimum `|cos H · cos φ|` a site on a fixed-sun (zero-synodic)
+/// body must keep from the permanent terminator — ~2.9° of real
+/// angle at the equator. On such a body the Day/Night verdict is
+/// decided ONCE by that product; a site within the floor lets a
+/// floating-point residue flip its entire power budget (rask-mines
+/// shipped at π/2 on a +6.1e-17 cosine — C09-F2). Non-synodic-zero
+/// bodies cycle day/night anyway, so the rule only applies where the
+/// verdict is permanent.
+pub const FIXED_SUN_TERMINATOR_MIN_COS: f64 = 0.05;
+
+/// The fixed-sun floor under `|ω − n_sun|` — mirrors `colonies::EPS`,
+/// the `next_terminator_tick` "no crossings" bound (kept in step
+/// manually: the sim depends on this crate, never the reverse).
+const FIXED_SUN_SYNODIC_EPS: f64 = 1e-9;
 
 /// One validation failure. `body`/`parent` fields carry the string form
 /// of IDs — diagnostics are never hashed, so plain `String`s are fine
@@ -2099,6 +2114,25 @@ pub fn validate_sites(
                 reason: "altitude negative or non-finite".to_string(),
             });
         }
+        // C09-F2/C34-F3's terminator-distance guard: on a zero-synodic
+        // body the site's daylight is a PERMANENT verdict hung on
+        // `cos H · cos φ` — a site authored near the line lets one
+        // longitude ulp flip its whole power budget forever.
+        // `None` covers an unresolved body (already flagged above) or
+        // a non-fixed sun (the verdict cycles — grazing is legal).
+        if let Some(margin) = fixed_sun_cos_margin(sys, s)
+            && margin < FIXED_SUN_TERMINATOR_MIN_COS
+        {
+            out.push(ValidationError::InvalidSite {
+                id: id.to_string(),
+                reason: format!(
+                    "site sits {margin:.3e} of |cos H·cos φ| off a FIXED terminator \
+                     (zero-synodic body {:?}) — the permanent Day/Night verdict must not \
+                     hang on a rounding residue; keep ≥ {FIXED_SUN_TERMINATOR_MIN_COS}",
+                    s.body.as_str()
+                ),
+            });
+        }
         if s.launch && !launch_bodies.insert(s.body.as_str()) {
             out.push(ValidationError::InvalidSite {
                 id: id.to_string(),
@@ -2160,6 +2194,72 @@ fn validate_site_stock(s: &SiteDef, id: &str, res: &ResourceFile, out: &mut Vec<
             });
         }
     }
+}
+
+/// The site's `|cos H0 · cos φ|` terminator margin — `Some` only when
+/// the body carries a FIXED sun (`|ω − n_sun|` under
+/// [`FIXED_SUN_SYNODIC_EPS`], `csp-sim::colonies::next_terminator_tick`'s
+/// no-crossings bound), where the product is a permanent Day/Night
+/// verdict rather than a momentary phase. Replicates
+/// `body_light`'s closed form — the sim depends on this crate, never
+/// the reverse, so the predicate is re-derived rather than imported:
+/// `n = 2π/T`, `L0 = M0 + ω_arg + Ω_node`, `H0 = λ − L0 − π`, and for
+/// a tidally-locked body (`rotation_period_s` absent or ≤ 0 — spin IS
+/// the orbital mean motion) the sun-direction sweep is the
+/// star-orbiting ancestor's `(n, L0)`, walked up `parent` links while
+/// parents still carry elements (a planet locked to the star itself
+/// resolves to its own orbit — the genuinely fixed sun). A rotating
+/// body keeps its own orbit's `n` — `body_light`'s non-locked path,
+/// verbatim.
+fn fixed_sun_cos_margin(sys: &LoadedSystem, s: &SiteDef) -> Option<f64> {
+    const TWO_PI: f64 = 2.0 * core::f64::consts::PI;
+    let bodies: BTreeMap<&str, &crate::system::BodyDef> = sys
+        .bodies
+        .iter()
+        .map(|b| (b.def.id.as_str(), &b.def))
+        .collect();
+    let def = bodies.get(s.body.as_str())?;
+    let motion = |d: &crate::system::BodyDef| -> (f64, f64) {
+        d.orbit.as_ref().map_or((0.0, 0.0), |e: &KeplerElements| {
+            let n = if e.period_s.is_finite() && e.period_s > 0.0 {
+                TWO_PI / e.period_s
+            } else {
+                0.0
+            };
+            (
+                n,
+                e.mean_anomaly_epoch_rad + e.arg_periapsis_rad + e.ascending_node_rad,
+            )
+        })
+    };
+    let (n_body, _) = motion(def);
+    let locked = !def.rotation_period_s.is_some_and(|p| p > 0.0);
+    let omega = def
+        .rotation_period_s
+        .map_or(n_body, |p| if p > 0.0 { TWO_PI / p } else { n_body });
+    let (n_sun, l0_sun) = if locked {
+        // Walk the parent chain while parents still orbit — the walk
+        // ends at the body that orbits the star directly (its parent
+        // carries no elements). Bounded by the body count: parent
+        // chains are `validate_system`-proven acyclic, and an
+        // unvalidated cycle resolves to the last ancestor reached.
+        let mut current = def;
+        for _ in 0..bodies.len() {
+            match current.parent.as_ref().and_then(|p| bodies.get(p.as_str())) {
+                Some(parent) if parent.orbit.is_some() => current = parent,
+                _ => break,
+            }
+        }
+        motion(current)
+    } else {
+        let (_, l0) = motion(def);
+        (n_body, l0)
+    };
+    if (omega - n_sun).abs() >= FIXED_SUN_SYNODIC_EPS {
+        return None;
+    }
+    let h0 = s.longitude_rad - l0_sun - core::f64::consts::PI;
+    Some((libm::cos(h0) * libm::cos(s.latitude_rad)).abs())
 }
 
 /// Loc resolution for the site set (the [`validate_loc_keys`]
@@ -6247,6 +6347,48 @@ mod tests {
                 .any(|e| matches!(e, ValidationError::SchemaVersion { found: 0, .. })),
             "{errs:?}"
         );
+    }
+
+    /// C09-F2's loader-time guard: on a zero-synodic body (the
+    /// fixture's planet is `rotation_period_s: None` — locked to the
+    /// star, a permanently fixed sun) the site's Day/Night verdict is
+    /// decided ONCE by `cos H0·cos φ`, so a longitude authored within
+    /// `FIXED_SUN_TERMINATOR_MIN_COS` of the line is rejected — the
+    /// shipped rask-mines π/2 (Day hung on a +6.1e-17 residue) is
+    /// exactly the shape this blocks.
+    #[test]
+    fn zero_synodic_site_must_clear_the_terminator() {
+        let (_, sites, res, _) = colony_fixture();
+        // L0 = 0 in the fixture ⇒ h0 = lon − π; lon π/2 sits on the
+        // line itself (|cos| = 6.1e-17 — the shipped bug, verbatim).
+        let mut on_line = sites.clone();
+        on_line.sites[0].body = "planet".into();
+        on_line.sites[0].longitude_rad = core::f64::consts::FRAC_PI_2;
+        let errs = validate_sites(&on_line, &fixture(), &res);
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidSite { reason, .. } if reason.contains("FIXED terminator")
+            )),
+            "{errs:?}"
+        );
+        // Off the line: the shipped fix's 2.4 rad (|cos| = 0.737) and
+        // the antipode's permanent-night side (|cos| = 1.0 — dark is
+        // a verdict, not an error) both carry real margins.
+        for lon in [2.4, 0.0] {
+            let mut ok = sites.clone();
+            ok.sites[0].body = "planet".into();
+            ok.sites[0].longitude_rad = lon;
+            let errs = validate_sites(&ok, &fixture(), &res);
+            assert!(errs.is_empty(), "lon {lon}: {errs:?}");
+        }
+        // A ROTATING body keeps cycling through day/night — grazing
+        // the terminator is a phase, not a permanent verdict, so the
+        // rule does not fire even at π/2.
+        let mut sys = fixture();
+        planet(&mut sys).rotation_period_s = Some(10_000.0);
+        let errs = validate_sites(&on_line, &sys, &res);
+        assert!(errs.is_empty(), "rotating body: {errs:?}");
     }
 
     /// `validate_contracts` runs the per-template schema_version gate.

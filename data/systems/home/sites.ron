@@ -81,7 +81,16 @@
             display_name: "site.rask-mines",
             body: "rask",
             latitude_rad: 0.0,
-            longitude_rad: 1.5707963267948966,
+            // lon 2.4 puts the spawn meridian ~0.74 rad into daylight
+            // — |cos H0| = 0.737 of terminator margin (C09-F2/C34-F3):
+            // the shipped π/2 parked the outpost ON the line, where
+            // its permanent Day verdict hung on a +6.1e-17 cosine
+            // residue (one longitude ulp flipped it to permanent
+            // Night). Rask's day/night still cycles — it is locked to
+            // Terrin, not the sun — so this margin buys a clean
+            // day-side spawn (~52 ks to first dusk), not a
+            // permanently-lit claim; see the colonies.ron header.
+            longitude_rad: 2.4,
             altitude_m: 0.0,
             launch: false,
             resource_yields: [

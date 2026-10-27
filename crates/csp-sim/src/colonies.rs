@@ -346,8 +346,12 @@ pub struct Colony {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ColonyBodyEnv {
     /// Sidereal rotation period (s); `None` = tidally locked — the
-    /// rotation rate resolves to the orbital mean motion and the
-    /// synodic rate is 0 (a fixed sun: no terminators ever).
+    /// spin resolves to the body's own orbital mean motion (the
+    /// `body.ron` convention: "the rotation period is the orbital
+    /// period"). A moon locked to its PLANET still sees a solar day —
+    /// the parent carries it around the star — so the synodic rate is
+    /// `ω − n` of the star-orbiting ancestor (`body_light`), not the
+    /// identically-0 fixed sun a star-locked planet gets.
     pub rotation_period_s: Option<f64>,
     /// Authored insolation at this body's orbit (W/m²) — the `S` in
     /// the tilt-0 daylit average `(2/π)·S·cos φ`.
@@ -380,16 +384,20 @@ pub fn colony_env_from_body_defs(defs: &[BodyDef]) -> BTreeMap<BodyId, ColonyBod
 /// model and env table (all construction config, never state).
 ///
 /// `H(t)` is the local solar hour angle: with tilt 0 the sun's
-/// body-fixed longitude is `L(t) + π − ω·t` (orbital phase minus the
-/// rotation angle — the prime-meridian convention anchors the
-/// rotation angle at epoch 0), so
-/// `H(t) = λ − (L0 + n·t) − π + ω·t = (λ − L0 − π) + (ω−n)·t`.
+/// body-fixed longitude is `L(t) + π − ω·t` (the sun-direction
+/// source's orbital phase minus the rotation angle — the
+/// prime-meridian convention anchors the rotation angle at epoch 0),
+/// so `H(t) = λ − (L0 + n·t) − π + ω·t = (λ − L0 − π) + (ω−n)·t`,
+/// where `(n, L0)` name the orbit the sun direction tracks — the
+/// body's own, or the star-orbiting ancestor's when the body is
+/// tidally locked ([`sun_sweep`]).
 /// Daylight is `cos H · cos φ > 0` — terminator at `H ≡ π/2 (mod π)`,
 /// which is what [`next_terminator_tick`] solves.
 #[derive(Clone, Copy, Debug)]
 pub struct BodyLight {
-    /// `ω − n`: sub-solar longitude drift (rad/s) — the synodic rate.
-    /// `0` = tidally locked / rotationless: a fixed sun, no crossings.
+    /// `ω − n_sun`: sub-solar longitude drift (rad/s) — the synodic
+    /// rate. `0` = star-locked / rotationless: a fixed sun, no
+    /// crossings.
     pub synodic_rate: f64,
     /// `λ_colony − L0 − π`: the hour-angle offset at epoch 0.
     pub h0: f64,
@@ -405,7 +413,9 @@ pub struct BodyLight {
 /// env table's rotation/insolation. Missing pieces default honestly:
 /// no elements → `n = 0, L0 = 0` (the star itself — a fixed
 /// inertial sun direction); `rotation_period_s: None` → tidally
-/// locked (`ω = n`); no insolation → dark solar.
+/// locked to the PARENT (`ω` = the body's own orbital mean motion,
+/// and the sun-direction sweep is the star-orbiting ancestor's — see
+/// [`sun_sweep`]); no insolation → dark solar.
 pub fn body_light(
     body: &BodyId,
     latitude_rad: f64,
@@ -415,29 +425,80 @@ pub fn body_light(
 ) -> BodyLight {
     let (n, l0) = orbits
         .body_orbit(body)
-        .ok()
-        .and_then(|o| o.elements.as_ref())
-        .map_or((0.0, 0.0), |e| {
-            let n = if e.period_s.is_finite() && e.period_s > 0.0 {
-                TWO_PI / e.period_s
-            } else {
-                0.0
-            };
-            (
-                n,
-                e.mean_anomaly_epoch_rad + e.arg_periapsis_rad + e.ascending_node_rad,
-            )
-        });
+        .map_or((0.0, 0.0), |o| orbit_motion(o.elements.as_ref()));
     let omega = env
         .rotation_period_s
         .map_or(n, |p| if p > 0.0 { TWO_PI / p } else { n });
+    // A body locked to its parent is not locked to the STAR: the
+    // sun's body-fixed longitude still sweeps at the parent's
+    // heliocentric rate — Rask's solar day is the synodic month
+    // (~141 ks, night ~70.5 ks), not the fixed sun the `omega − n`
+    // self-difference used to give (synodic ≡ 0 ⇒ the authored
+    // outpost read as permanently daylit, C09-F3/C34-F3). The scope
+    // is the locked branch only: a rotating body's `n_sun` stays its
+    // own orbital rate — a rotating MOON's sweep is equally the
+    // parent's, but none is authored and the pre-fix path is kept.
+    let locked = !env.rotation_period_s.is_some_and(|p| p > 0.0);
+    let (n_sun, l0_sun) = if locked {
+        sun_sweep(body, orbits)
+    } else {
+        (n, l0)
+    };
     let cos_lat = libm::cos(latitude_rad);
     BodyLight {
-        synodic_rate: omega - n,
-        h0: longitude_rad - l0 - PI,
+        synodic_rate: omega - n_sun,
+        h0: longitude_rad - l0_sun - PI,
         day_insolation_w_m2: env.insolation_w_m2.unwrap_or(0.0) * cos_lat * (2.0 / PI),
         cos_lat,
     }
+}
+
+/// `(n, L0)` of one orbit's elements — mean motion `2π/T` and epoch
+/// longitude `M0 + ω_arg + Ω_node`. Missing or degenerate elements
+/// read `(0, 0)` — a fixed inertial sun direction.
+fn orbit_motion(e: Option<&csp_data::KeplerElements>) -> (f64, f64) {
+    e.map_or((0.0, 0.0), |e| {
+        let n = if e.period_s.is_finite() && e.period_s > 0.0 {
+            TWO_PI / e.period_s
+        } else {
+            0.0
+        };
+        (
+            n,
+            e.mean_anomaly_epoch_rad + e.arg_periapsis_rad + e.ascending_node_rad,
+        )
+    })
+}
+
+/// The sun-direction sweep for a tidally-locked body: the `(n, L0)`
+/// of the ancestor that orbits the star directly — the `parent`
+/// chain walked while parents still carry orbit elements. A planet
+/// locked to the star resolves to its own orbit (`n_sun = n` — the
+/// genuinely fixed sun); a moon resolves to its planet's orbit, so
+/// `synodic = n_moon − n_planet`, the synodic month. The walk is
+/// bounded by the body count — parent chains are validator-proven
+/// acyclic, and a table that is not resolves to the last ancestor
+/// the walk reached rather than hanging.
+fn sun_sweep(body: &BodyId, orbits: &PatchedConics) -> (f64, f64) {
+    let mut current = body.clone();
+    let mut motion = (0.0, 0.0);
+    for _ in 0..orbits.bodies().len() {
+        let Ok(b) = orbits.body_orbit(&current) else {
+            return (0.0, 0.0);
+        };
+        motion = orbit_motion(b.elements.as_ref());
+        match &b.parent {
+            Some(parent)
+                if orbits
+                    .body_orbit(parent)
+                    .is_ok_and(|p| p.elements.is_some()) =>
+            {
+                current = parent.clone();
+            }
+            _ => return motion,
+        }
+    }
+    motion
 }
 
 /// `H(t)` wrapped to `(-π, π]`.
@@ -466,9 +527,10 @@ pub fn daylight_at(light: &BodyLight, tick: u64) -> Daylight {
 /// The next `H ≡ π/2 (mod π)` crossing after `now` — the closed-form
 /// terminator time (rule 1). Crossings are spaced `π/|synodic|`
 /// (half a solar day); the tick is `now + ceil(dt·TICK_HZ)` — the
-/// whole-tick bound, strictly ahead. `None` for a tidally-locked or
-/// non-rotating body (fixed sun) and at the poles (a permanent
-/// terminator — [`POLE_COS_EPS`]).
+/// whole-tick bound, strictly ahead. `None` when the sun is fixed
+/// (a star-locked or non-rotating body — a planet-locked moon still
+/// crosses) and at the poles (a permanent terminator —
+/// [`POLE_COS_EPS`]).
 pub fn next_terminator_tick(light: &BodyLight, now: u64) -> Option<u64> {
     let syn = light.synodic_rate.abs();
     if syn < EPS || light.cos_lat.abs() < POLE_COS_EPS {
@@ -2646,6 +2708,7 @@ mod tests {
     use super::*;
     use crate::{MAX_TICKS_PER_FRAME, SimCommand, SourceClass, VesselId, VesselState};
     use csp_data::{KeplerElements, SiteDef};
+    use std::path::Path;
 
     /// A two-body test system: a sun and a 6 h day planet — the
     /// terminator math's toy.
@@ -2921,6 +2984,272 @@ mod tests {
             ..light
         };
         assert_eq!(next_terminator_tick(&locked, 0), None);
+    }
+
+    /// Fix-plan 3.6's tidal model (C09-F3/C34-F3): a body with
+    /// `rotation_period_s: None` is locked to its PARENT — ω is its
+    /// own orbital mean motion — while the sun direction sweeps at
+    /// the star-orbiting ancestor's rate, so
+    /// `synodic = n_moon − n_planet` (the synodic month), NOT the
+    /// identically-0 the old `omega − n` self-difference produced.
+    #[test]
+    fn locked_moon_synodic_rate_uses_parent_mean_motion() {
+        const T_PLANET: f64 = 9_203_835.5;
+        const T_MOON: f64 = 138_984.4;
+        const PLANET_M0: f64 = 0.5;
+        let mut bodies = BTreeMap::new();
+        bodies.insert(
+            BodyId::from("sol"),
+            crate::orbit::BodyOrbit {
+                mu_m3_per_s2: 1.0e20,
+                soi_m: None,
+                parent: None,
+                elements: None,
+            },
+        );
+        bodies.insert(
+            BodyId::from("planet"),
+            crate::orbit::BodyOrbit {
+                mu_m3_per_s2: 4.0e14,
+                soi_m: Some(1.0e9),
+                parent: Some(BodyId::from("sol")),
+                elements: Some(KeplerElements {
+                    semi_major_axis_m: 1.5e11,
+                    eccentricity: 0.0,
+                    inclination_rad: 0.0,
+                    ascending_node_rad: 0.0,
+                    arg_periapsis_rad: 0.0,
+                    mean_anomaly_epoch_rad: PLANET_M0,
+                    period_s: T_PLANET,
+                }),
+            },
+        );
+        bodies.insert(
+            BodyId::from("moon"),
+            crate::orbit::BodyOrbit {
+                mu_m3_per_s2: 4.0e10,
+                soi_m: Some(1.0e7),
+                parent: Some(BodyId::from("planet")),
+                elements: Some(KeplerElements {
+                    semi_major_axis_m: 1.0e7,
+                    eccentricity: 0.0,
+                    inclination_rad: 0.0,
+                    ascending_node_rad: 0.0,
+                    arg_periapsis_rad: 0.0,
+                    mean_anomaly_epoch_rad: 0.0,
+                    period_s: T_MOON,
+                }),
+            },
+        );
+        let orbits = PatchedConics::new(bodies);
+        let locked_env = ColonyBodyEnv {
+            rotation_period_s: None,
+            insolation_w_m2: Some(1.0),
+            radius_m: 1.0,
+        };
+        let light = body_light(&BodyId::from("moon"), 0.0, 0.3, &orbits, &locked_env);
+        // ω = n_moon (locked = the moon's own orbital period); the
+        // sun sweep is the planet's heliocentric n — the synodic
+        // month, exactly the parent-derived value.
+        let n_moon = TWO_PI / T_MOON;
+        let n_planet = TWO_PI / T_PLANET;
+        assert_eq!(light.synodic_rate, n_moon - n_planet);
+        assert!(light.synodic_rate > 0.0);
+        // h0 keys off the PARENT's epoch longitude (0.5), not the
+        // moon's own (0): h0 = λ − L0_planet − π.
+        assert!((light.h0 - (0.3 - PLANET_M0 - PI)).abs() < 1e-12);
+        // Crossings exist again — the terminator clock is live.
+        assert!(next_terminator_tick(&light, 0).is_some());
+        // A planet locked to the STAR keeps the genuinely fixed sun:
+        // synodic ≡ 0, no crossings ever.
+        let pl = body_light(&BodyId::from("planet"), 0.0, 0.0, &orbits, &locked_env);
+        assert_eq!(pl.synodic_rate, 0.0);
+        assert_eq!(next_terminator_tick(&pl, 0), None);
+    }
+
+    /// The authored `data/systems/home` column — the real ground
+    /// truth the 3.6 day/night pins hold (the lib.rs suite's
+    /// `authored_home_defs` precedent).
+    fn home_dir() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("data/systems/home")
+    }
+
+    /// `body_light` over the REAL system + the shipped rask-mines
+    /// pose: synodic = n_rask − n_terrin ≈ 4.4525e-5 rad/s → a
+    /// ~141 115 s solar day, and the 2.4 rad spawn longitude sits
+    /// ~0.74 rad into the day side (|cos H0| = 0.737 — the real
+    /// margin the terminator verifier recommends, not the +6.1e-17
+    /// residue π/2 left).
+    #[test]
+    fn authored_rask_light_is_parent_locked() {
+        let dir = home_dir();
+        let defs: Vec<BodyDef> = csp_data::load_system(&dir)
+            .unwrap()
+            .bodies
+            .iter()
+            .map(|b| b.def.clone())
+            .collect();
+        let orbits = PatchedConics::from_body_defs(&defs).unwrap();
+        let envs = colony_env_from_body_defs(&defs);
+        let sites = csp_data::load_sites(&dir.join("sites.ron")).unwrap();
+        let site = sites
+            .sites
+            .iter()
+            .find(|s| s.id.as_str() == "rask-mines")
+            .unwrap();
+        let rask = BodyId::from("rask");
+        let light = body_light(
+            &rask,
+            site.latitude_rad,
+            site.longitude_rad,
+            &orbits,
+            &envs[&rask],
+        );
+        // The C09-F3/C34-F3 verified numbers: synodic 4.4525e-5 →
+        // 141 115 s solar day, 70 558 s night.
+        let n_rask = TWO_PI / 138984.37657447575;
+        let n_terrin = TWO_PI / 9203835.510438265;
+        assert_eq!(light.synodic_rate, n_rask - n_terrin);
+        let solar_day = TWO_PI / light.synodic_rate;
+        assert!(
+            (solar_day - 141_115.0).abs() < 100.0,
+            "solar day {solar_day} s vs the verified 141 115 s"
+        );
+        // Daylit at epoch with a real terminator margin — and the
+        // crossing clock runs.
+        assert_eq!(daylight_at(&light, 0), Daylight::Day);
+        assert!(libm::cos(light.h0) * light.cos_lat > 0.5);
+        assert!(next_terminator_tick(&light, 0).is_some());
+    }
+
+    /// The 3.6 rebalance, end to end (C34-F3): the REAL rask-mines
+    /// def — the 340 kEC battery over the 4.5 EC/s × 70 558 s =
+    /// 317 511 EC bound — founded at a dusk longitude so its modules
+    /// actually run through a full night. It must ride the whole
+    /// night Nominal (no `Degraded{PowerLost}` window is authored),
+    /// drain but never empty the battery, and cross a real
+    /// `TerminatorCrossing` into a recharging dawn.
+    #[test]
+    fn authored_rask_outpost_rides_the_night() {
+        let dir = home_dir();
+        let defs: Vec<BodyDef> = csp_data::load_system(&dir)
+            .unwrap()
+            .bodies
+            .iter()
+            .map(|b| b.def.clone())
+            .collect();
+        let colonies = csp_data::load_colonies(&dir.join("colonies.ron")).unwrap();
+        let def = colonies
+            .colonies
+            .iter()
+            .find(|c| c.site.as_str() == "rask-mines")
+            .unwrap()
+            .clone();
+        let sites = csp_data::load_sites(&dir.join("sites.ron")).unwrap();
+        // A dusk-anchored clone of the authored site: h0 ≈ π/2 + 0.09
+        // at lon 4.8 → Night at founding with the whole ~70 500 s
+        // night ahead (the authored 2.4 rad site saturates its stores
+        // in the first ~2 ks of a 51.9 ks day and would idle the
+        // night away — this pose forces the battery to carry real
+        // production through it).
+        let mut site = sites
+            .sites
+            .iter()
+            .find(|s| s.id.as_str() == "rask-mines")
+            .unwrap()
+            .clone();
+        site.longitude_rad = 4.8;
+        let recipes = csp_data::load_recipes(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join("data/recipes"),
+        )
+        .unwrap();
+        let orbits = PatchedConics::from_body_defs(&defs).unwrap();
+        let rask = BodyId::from("rask");
+        let env = colony_env_from_body_defs(&defs);
+        let light = body_light(
+            &rask,
+            site.latitude_rad,
+            site.longitude_rad,
+            &orbits,
+            &env[&rask],
+        );
+        let mut w = World::with_system(orbits);
+        w.set_colony_env(env);
+        w.set_sites(BTreeMap::from([(site.id.clone(), site)]));
+        w.set_recipes(
+            recipes
+                .recipes
+                .iter()
+                .map(|r| (r.def.id.clone(), r.def.clone()))
+                .collect(),
+        );
+        w.enqueue(SourceClass::Ui, 0, SimCommand::FoundColony { def });
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        let id = *w.colonies().keys().next().unwrap();
+        assert!(
+            r.rejected.is_empty() && r.degraded.is_empty(),
+            "founding errors: {:?} {:?}",
+            r.rejected,
+            r.degraded
+        );
+        let colony = &w.colonies()[&id];
+        assert_eq!(colony.daylight, Daylight::Night);
+        assert_eq!(colony.state, ColonyState::Nominal);
+        // The battery IS the authored capacity — the rebalance landed.
+        let ec_id = ec();
+        let cap = colony.stores[&ec_id].capacity;
+        assert_eq!(cap, 340_000.0);
+        // Dawn = the next terminator crossing (~68.6 ks out); step to
+        // one tick before it and read the battery mid-flight.
+        let dawn = next_terminator_tick(&light, 0).unwrap();
+        let pre_dawn = dawn - 1;
+        let mut fired = Vec::new();
+        while w.clock().ticks() < pre_dawn {
+            let r = w.step_frame(pre_dawn).unwrap();
+            fired.extend(r.fired_events);
+        }
+        let colony = &w.colonies()[&id];
+        let level = colony.stores[&ec_id].level_at(pre_dawn);
+        // The drill alone draws 2.0 EC/s for the whole night (ore
+        // never saturates — the smelter drains it as fast as it
+        // lands) ⇒ ≥137 kEC must have left the battery; the authored
+        // bound (4.5 EC/s) caps it at 317 511 — well under capacity.
+        assert!(level < cap - 100_000.0, "battery never drained: {level}");
+        assert!(level > 0.0, "battery emptied at {level}");
+        assert_eq!(colony.daylight, Daylight::Night);
+        assert_eq!(colony.state, ColonyState::Nominal);
+        // Past dawn: Day, still Nominal, charging again — and the
+        // whole run fired no PowerLost (a Degraded window would have
+        // left one in the log).
+        let target = dawn + 500 * TICK_HZ;
+        while w.clock().ticks() < target {
+            let r = w.step_frame(target).unwrap();
+            fired.extend(r.fired_events);
+        }
+        let colony = &w.colonies()[&id];
+        assert_eq!(colony.daylight, Daylight::Day);
+        assert_eq!(colony.state, ColonyState::Nominal);
+        assert!(
+            colony.stores[&ec_id].net_rate_per_s > 0.0,
+            "dawn recharge: net {}",
+            colony.stores[&ec_id].net_rate_per_s
+        );
+        assert!(
+            fired.iter().any(
+                |e| matches!(e.kind, EventKind::TerminatorCrossing { colony } if colony == id)
+            ),
+            "no terminator crossing fired"
+        );
+        assert!(
+            !fired
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::PowerLost { colony } if colony == id)),
+            "the authored outpost must not degrade: {fired:?}"
+        );
     }
 
     /// Rule 3's allocation: scarce supply pro-rates the remainder by

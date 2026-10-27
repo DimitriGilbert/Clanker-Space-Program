@@ -61,6 +61,18 @@ fn home_system_loc_keys_resolve() {
     assert!(errs.is_empty(), "unresolved loc keys: {errs:#?}");
 }
 
+/// The authored site set passes `validate_sites` — including the
+/// fixed-sun terminator-distance guard (fix-plan 3.6): rask-mines
+/// sits at lon 2.4 with |cos H0| = 0.737 of margin, and rask is not
+/// zero-synodic anymore (locked to Terrin, not the sun).
+#[test]
+fn home_sites_validate_green() {
+    let sites = csp_data::load_sites(&repo_root().join("data/systems/home/sites.ron")).unwrap();
+    let res = csp_data::load_resources(&repo_root().join("data/resources.ron")).unwrap();
+    let errs = csp_data::validate_sites(&sites, &home(), &res);
+    assert!(errs.is_empty(), "site validator errors: {errs:#?}");
+}
+
 /// Every site `display_name` in `data/systems/home/sites.ron`
 /// resolves in `data/loc/en.ron` — the `validate_site_loc_keys` gate.
 #[test]
