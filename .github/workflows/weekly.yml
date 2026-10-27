@@ -39,12 +39,19 @@ jobs:
               --timeout 120
           code=$?
           set -e
-          if [ ! -d mutants.out ]; then
-            echo "cargo-mutants produced no report — harness failure (exit $code)"
-            exit 1
-          fi
+          # mutants.out/ is created at startup for the log, so the
+          # directory alone proves nothing — a completed run writes
+          # the .txt outcome files. A nonzero exit (other than 124,
+          # the report-tier 45-minute cap) with no outcome files is
+          # a harness failure: baseline build/test failure, crash,
+          # or kill.
           if [ "$code" -eq 124 ]; then
             echo "hit the 45-minute cap — reporting the partial run"
+          elif [ "$code" -ne 0 ] && \
+               [ ! -f mutants.out/missed.txt ] && \
+               [ ! -f mutants.out/caught.txt ]; then
+            echo "cargo-mutants exited $code without a report — harness failure"
+            exit "$code"
           fi
           echo "=== missed mutants (tracked, not gated — §8.2) ==="
           cat mutants.out/missed.txt 2>/dev/null || echo "(none reported)"
