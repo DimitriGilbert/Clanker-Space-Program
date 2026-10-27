@@ -963,6 +963,7 @@ impl MapPlanning {
                         + n.dv_normal_mps * n.dv_normal_mps
                         + n.dv_radial_mps * n.dv_radial_mps)
                         .sqrt(),
+                    arrival_miss_m: n.arrival_miss_m,
                 }),
             node_error: p.node_error.clone(),
             encounter: p.encounter.as_ref().map(|e| csp_ui::PlanEncounterRow {

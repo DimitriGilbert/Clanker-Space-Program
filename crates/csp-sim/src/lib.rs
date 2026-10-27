@@ -752,7 +752,9 @@ pub enum SimCommand {
     SetManeuver {
         /// The vessel the node belongs to.
         vessel: VesselId,
-        /// The sim tick the burn starts at.
+        /// The node's design tick — the point the Δv components
+        /// resolve against; the executor arms up to a half-burn
+        /// earlier so the delivered impulse centres on it (C06-F2).
         tick: u64,
         /// Δv along the node point's prograde direction `v̂`, m/s.
         dv_prograde_mps: f64,
@@ -3415,20 +3417,30 @@ impl World {
             }
         }
         // The node↔event pairing, both directions: every `Scheduled`
-        // node has exactly one pending start event AT `node.tick` (a
-        // pairing that records only the vessel id would accept a
-        // start event at the wrong tick), and every pending start
-        // event names a `Scheduled` node. `node.tick` itself must be a
-        // live future-or-flushing tick — the same `>= clock` bound the
-        // event passed above.
+        // node has exactly one pending start event inside its arming
+        // window — `[node.tick − lead, node.tick]` where `lead` is the
+        // C06-F2 half-burn estimate, recomputed from the serialized
+        // craft so the window is deterministic (a pairing that records
+        // only the vessel id would accept a start event at the wrong
+        // tick) — and every pending start event names a `Scheduled`
+        // node. `node.tick` itself must be a live future-or-flushing
+        // tick — the same `>= clock` bound the event passed above.
         for (id, vessel) in &snapshot.vessels {
-            let node_tick = vessel
+            let node = vessel
                 .maneuver
                 .as_ref()
-                .and_then(|n| matches!(n.status, ManeuverStatus::Scheduled).then_some(n.tick));
-            match (node_tick, node_events.get(id)) {
+                .filter(|n| matches!(n.status, ManeuverStatus::Scheduled));
+            let lead = node.map_or(0, |n| {
+                vessel
+                    .craft
+                    .as_ref()
+                    .map_or(0, |c| maneuver::node_lead_ticks(c, n.dv_magnitude()))
+            });
+            match (node.map(|n| n.tick), node_events.get(id)) {
                 (Some(tick), Some(&event_tick))
-                    if tick == event_tick && tick >= snapshot.clock_ticks => {}
+                    if event_tick <= tick
+                        && tick - event_tick <= lead
+                        && tick >= snapshot.clock_ticks => {}
                 (None, None) => {}
                 _ => {
                     return Err(SimError::Fatal(
@@ -6987,6 +6999,17 @@ impl World {
             dv_radial_mps,
             status: ManeuverStatus::Scheduled,
         };
+        // C06-F2: the executor burns FORWARD from its arming tick, so
+        // scheduling the start event AT `at` centres the delivered
+        // impulse at `at + T_burn/2` — first-order late against the
+        // impulsive model `predict_maneuver` and the transfer planner
+        // solve against. Arm a half-burn early instead so the impulse
+        // centres on `at`. A lead that reaches behind the command
+        // boundary clamps to `clock + 1` — the burn just starts
+        // immediately, the same honesty rule `at` itself follows.
+        let start = at
+            .saturating_sub(maneuver::node_lead_ticks(craft, node.dv_magnitude()))
+            .max(self.clock.ticks().saturating_add(1));
         // Feasibility of the node point itself: the state at the burn
         // tick must solve and the orbital frame there must exist —
         // evaluated now so a bogus node rejects instead of degrading
@@ -7013,7 +7036,7 @@ impl World {
                 |e| !matches!(&e.kind, EventKind::ManeuverNodeStart { vessel: v } if v == &vessel),
             )
             .collect();
-        self.schedule_event(EventKind::ManeuverNodeStart { vessel }, at, shadow)
+        self.schedule_event(EventKind::ManeuverNodeStart { vessel }, start, shadow)
     }
 
     /// `DeleteManeuver`: drop the node and its pending start event —
@@ -7052,12 +7075,14 @@ impl World {
     }
 
     /// `ManeuverNodeStart` firing — the executor's arming point:
-    /// evaluate the vessel's conic at the node tick, resolve the
-    /// commanded Δv through the node point's velocity frame, re-weld
-    /// the stored craft into the bubble at that state, and mark the
-    /// node `Burning` with the inertial burn direction frozen. The
-    /// vessel's now-dead SOI events are dropped in the same scrub
-    /// `ToBubble` applies.
+    /// evaluate the vessel's conic at the ARMING tick (up to a
+    /// half-burn ahead of `node.tick`, the C06-F2 lead that centres
+    /// the delivered impulse on the design point), re-weld the stored
+    /// craft into the bubble at that state, and mark the node
+    /// `Burning` with the inertial burn direction frozen — the node's
+    /// Δv resolved at the NODE tick's frame, the point the components
+    /// were authored against. The vessel's now-dead SOI events are
+    /// dropped in the same scrub `ToBubble` applies.
     ///
     /// A stale firing (no node, vessel gone, no longer on rails) is a
     /// `Recoverable` degradation — the caller's per-event rollback +
@@ -7104,9 +7129,16 @@ impl World {
         };
         let t = SimTime::from_ticks(tick);
         let (r, vel) = self.orbits.state_at(&orbit, t)?;
+        // The Δv resolves at the NODE tick — the design point the
+        // components were authored against — not the arming tick the
+        // vessel materializes at (the half-burn lead separates them;
+        // see `apply_set_maneuver`).
+        let (r_n, v_n) = self
+            .orbits
+            .state_at(&orbit, SimTime::from_ticks(node.tick))?;
         let dv = maneuver::node_dv_world(
-            r,
-            vel,
+            r_n,
+            v_n,
             node.dv_prograde_mps,
             node.dv_normal_mps,
             node.dv_radial_mps,
@@ -18025,8 +18057,9 @@ mod tests {
     }
 
     /// `SetManeuver` stores the node and schedules the `Clamping`
-    /// `ManeuverNodeStart`, which fires at the node tick and arms the
-    /// burn (vessel materializes InBubble, status `Burning`).
+    /// `ManeuverNodeStart`, which fires at `node.tick − lead` (the
+    /// C06-F2 half-burn arming lead) and arms the burn (vessel
+    /// materializes InBubble, status `Burning`).
     #[test]
     fn maneuver_node_fires_clamping_at_tick() {
         let mut w = physics_world(false);
@@ -18036,14 +18069,20 @@ mod tests {
         let node = w.vessels()[&id].maneuver.as_ref().unwrap();
         assert_eq!(node.tick, node_tick);
         assert!(matches!(node.status, ManeuverStatus::Scheduled));
+        // 25 m/s at 50 m/s² → 0.5 s burn → 32 ticks → lead 16: the
+        // event arms at `node.tick − 16`, not at the node tick.
+        let craft = w.vessels()[&id].craft.clone().unwrap();
+        let lead = maneuver::node_lead_ticks(&craft, 25.0);
+        assert_eq!(lead, 16);
+        let arm_tick = node_tick - lead;
         // One tick short: nothing yet.
-        w.step_frame(node_tick - 1).unwrap();
+        w.step_frame(arm_tick - 1).unwrap();
         assert!(matches!(
             w.vessels()[&id].maneuver.as_ref().unwrap().status,
             ManeuverStatus::Scheduled
         ));
-        // The tick itself: the Clamping event fires and the burn arms.
-        let report = w.step_frame(node_tick).unwrap();
+        // The arming tick: the Clamping event fires and the burn arms.
+        let report = w.step_frame(arm_tick).unwrap();
         let start = report
             .fired_events
             .iter()
@@ -18100,6 +18139,62 @@ mod tests {
         assert!(got.eccentricity > 1e-4);
         let rp = got.semi_major_axis_m * (1.0 - got.eccentricity);
         assert!((rp - 8.0e5).abs() / 8.0e5 < 0.02, "rp {rp}");
+    }
+
+    /// C06-F2: a long burn centres on the node tick — the executor
+    /// arms a half-burn early, so the achieved conic matches
+    /// `predict_maneuver`'s impulse-at-tick model. 90 m/s at 0.3 m/s²
+    /// is a 300 s burn: long enough that arming at the node tick
+    /// would trail the impulse by 150 s of longitude (the C06-F2
+    /// bug), while the centred burn matches to the 1e-3 element
+    /// budget the short-burn test already uses. The orbit rides
+    /// high (r = 2.6e6 m, ~8° of arc over the burn) so the assert
+    /// measures the LEAD, not the second-order finite-burn loss a
+    /// ~29° LEO arc would honestly carry.
+    #[test]
+    fn long_burn_centres_on_the_node_tick() {
+        let mut w = physics_world(false);
+        // 1000 kg, 300 N → 0.3 m/s² → 300 s for 90 m/s.
+        let id = orbital_vessel(&mut w, 2_000_000.0, 300.0);
+        let node_tick = w.clock().ticks() + 30_000;
+        set_node(&mut w, id, node_tick, [90.0, 0.0, 0.0]);
+        let craft = w.vessels()[&id].craft.clone().unwrap();
+        let lead = maneuver::node_lead_ticks(&craft, 90.0);
+        assert_eq!(lead, 9_600, "300 s → 19 200 ticks → 9 600 lead");
+        let predicted = maneuver::predict_maneuver(
+            w.orbits(),
+            w.vessels()[&id].orbit().unwrap(),
+            w.vessels()[&id].maneuver.as_ref().unwrap(),
+        )
+        .unwrap();
+        // The arming event fires at node − lead, not at the node.
+        let report = w.step_frame(node_tick - lead).unwrap();
+        assert!(
+            report.fired_events.iter().any(
+                |e| matches!(&e.kind, EventKind::ManeuverNodeStart { vessel } if *vessel == id)
+            ),
+            "ManeuverNodeStart must fire at node − lead"
+        );
+        // Cruise past the burn's end (node + another half-burn + slack).
+        w.step_frame(node_tick + lead + 1_000).unwrap();
+        let orbit = w.vessels()[&id]
+            .orbit()
+            .expect("post-burn vessel did not return to rails")
+            .clone();
+        assert!(w.vessels()[&id].maneuver.is_none());
+        let (got, want) = (&orbit.elements, &predicted.elements);
+        assert!(
+            (got.semi_major_axis_m - want.semi_major_axis_m).abs() / want.semi_major_axis_m < 1e-3,
+            "a: got {} want {}",
+            got.semi_major_axis_m,
+            want.semi_major_axis_m
+        );
+        assert!(
+            (got.eccentricity - want.eccentricity).abs() < 1e-3,
+            "e: got {} want {}",
+            got.eccentricity,
+            want.eccentricity
+        );
     }
 
     /// A node on a hyperbolic orbit executes the same way — open
@@ -19184,16 +19279,16 @@ mod tests {
         // SetManeuver: the node's Δv is `v_H(t_b) − v_vessel(t_b)`
         // resolved in the §2.8 frame at the NODE tick (the executor's
         // own evaluation point — the delivered world vector is exactly
-        // `dv_world`). The node is pulled half a burn early so the
-        // ~0.4 s burn arc centres on t_b — the achieved conic then
-        // reads as the impulsive burn AT the design point.
+        // `dv_world`). The node rides the DESIGN tick `t_b` directly:
+        // `SetManeuver` now arms the executor a half-burn early itself
+        // (C06-F2), so the ~0.4 s burn arc centres on t_b without the
+        // manual pull this test used to need.
         let stamped = w.vessels()[&id].orbit().unwrap().clone();
         let (_, v_v_b) = model
             .state_at(&stamped, SimTime::from_ticks(inj.t_b))
             .unwrap();
         let dv_world = inj.burn.1 - v_v_b;
-        let burn_ticks = (dv_world.norm() / (1.0e7 / 1_000.0) * hz as f64).ceil() as u64;
-        let node_tick = inj.t_b.saturating_sub(burn_ticks / 2);
+        let node_tick = inj.t_b;
         let (r_v_n, v_v_n) = model
             .state_at(&stamped, SimTime::from_ticks(node_tick))
             .unwrap();
@@ -19276,6 +19371,157 @@ mod tests {
             arr.elements.eccentricity > 1.0,
             "duva arrival conic is not hyperbolic: e={}",
             arr.elements.eccentricity
+        );
+    }
+
+    /// A plain ecliptic LKO orbiter about terrin — no phasing, no
+    /// designed plane: the world `departure_node` faces. `r_park` is
+    /// the 200 km orbit the map's porkchop query prices.
+    fn spawn_lko_orbiter(model: &PatchedConics) -> (World, VesselId) {
+        let r_park = TERRIN_R + 2.0e5;
+        let mut w = World::with_physics(
+            model.clone(),
+            PhysicsConfig {
+                environment: test_env(false),
+                dominant: BodyId::from("terrin"),
+                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
+            },
+            DEFAULT_MAX_EVENTS_PER_FRAME,
+        );
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SpawnPhysicalVessel {
+                craft: box_craft(1_000.0, DVec3::new(0.5, 0.5, 1.5), 1.0e7),
+                pos: DVec3::new(r_park, 0.0, 0.0),
+                rot: csp_core::DQuat::IDENTITY,
+                vel: DVec3::new(0.0, libm::sqrt(MU_TERRIN / r_park), 0.0),
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        w.step_frame(1).unwrap();
+        let id = VesselId(0);
+        assert!(w.vessels()[&id].orbit().is_some());
+        (w, id)
+    }
+
+    /// C07-F1, the player-path proof: the PUBLIC staging chain —
+    /// `plan_transfer` → `departure_node` → `SetManeuver` — flown
+    /// end-to-end reaches the destination's SOI. This is exactly the
+    /// flow the verified report showed missing Duva by 19.7 SOI radii:
+    /// the composed solve now designs the burn that actually arrives.
+    /// The ejection runs on an ordinary ecliptic LKO (`spawn_lko_
+    /// orbiter`), not the designed-injection test's bespoke phasing.
+    #[test]
+    fn departure_node_staged_node_reaches_duva() {
+        let model = home_system();
+        let duva = BodyId::from("duva");
+        let hz = csp_core::TICK_HZ;
+        let plan = transfer::plan_transfer(&model, &duva_query()).unwrap();
+        let (mut w, id) = spawn_lko_orbiter(&model);
+        let orbit = w.vessels()[&id].orbit().unwrap().clone();
+        let node = transfer::departure_node(&model, &orbit, &plan, w.clock()).unwrap();
+        assert!(node.tick > w.clock().ticks());
+        assert!(
+            node.arrival_miss_m.is_some_and(|m| m < DUVA_SOI),
+            "the composed node must report a sub-SOI residual: {:?}",
+            node.arrival_miss_m
+        );
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SetManeuver {
+                vessel: id,
+                tick: node.tick,
+                dv_prograde_mps: node.dv_prograde_mps,
+                dv_normal_mps: node.dv_normal_mps,
+                dv_radial_mps: node.dv_radial_mps,
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(
+            r.rejected.is_empty(),
+            "SetManeuver rejected: {:?}",
+            r.rejected
+        );
+        let bound = plan
+            .arrival_tick
+            .saturating_add(hz.saturating_mul(1_000_000));
+        let (seen_exit, enter) = cruise_duva(&mut w, id, bound);
+        assert!(seen_exit, "Exit{{terrin}} never fired");
+        let enter_tick = enter.expect("Enter{duva} never fired — the staged node missed the SOI");
+        assert!(
+            enter_tick <= bound,
+            "Enter{{duva}} fired late: {enter_tick}"
+        );
+        assert_eq!(
+            w.vessels()[&id].orbit().unwrap().parent,
+            duva,
+            "the Enter re-base must leave the vessel duva-parented"
+        );
+    }
+
+    /// C07-F2, the player path: arm the window watch, let the alarm
+    /// fire, THEN create the node — the flow that dead-ended in
+    /// "ejection: burn precedes now". The solve's next-passage rule
+    /// returns a node strictly ahead of the clock, and `SetManeuver`
+    /// accepts it.
+    #[test]
+    fn window_watch_then_create_node_succeeds() {
+        let model = home_system();
+        let terrin = BodyId::from("terrin");
+        let duva = BodyId::from("duva");
+        let plan = transfer::plan_transfer(&model, &duva_query()).unwrap();
+        let (mut w, id) = spawn_lko_orbiter(&model);
+        // The panel's "Watch window" verb, verbatim.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::WatchTransferWindow {
+                origin: terrin.clone(),
+                destination: duva.clone(),
+                tick: plan.departure_tick,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        // Cruise to the window — event-driven advance, so the ~6 h
+        // jump is cheap for an on-rails vessel.
+        while w.clock().ticks() < plan.departure_tick {
+            let target = w
+                .clock()
+                .ticks()
+                .saturating_add(MAX_TICKS_PER_FRAME)
+                .min(plan.departure_tick);
+            w.step_frame(target).unwrap();
+        }
+        assert!(
+            w.event_heap
+                .iter()
+                .all(|e| !matches!(&e.kind, EventKind::TransferWindow { .. })),
+            "the window event must have fired by its tick"
+        );
+        // The dead-end, now closed: `departure_node` at/past the
+        // window resolves the NEXT burn passage rather than refusing.
+        let orbit = w.vessels()[&id].orbit().unwrap().clone();
+        let node = transfer::departure_node(&model, &orbit, &plan, w.clock())
+            .expect("the window-watch dead-end must be closed — next pass offered");
+        assert!(node.tick > w.clock().ticks());
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SetManeuver {
+                vessel: id,
+                tick: node.tick,
+                dv_prograde_mps: node.dv_prograde_mps,
+                dv_normal_mps: node.dv_normal_mps,
+                dv_radial_mps: node.dv_radial_mps,
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(
+            r.rejected.is_empty(),
+            "post-window SetManeuver rejected: {:?}",
+            r.rejected
         );
     }
 

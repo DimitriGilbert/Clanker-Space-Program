@@ -174,16 +174,19 @@ pub enum EventKind {
         vessel: VesselId,
     } = 3,
     /// §2.6.5 `Clamping` member + the M5 maneuver executor's trigger
-    /// (module docs): a scheduled [`ManeuverNode`] reached its burn
-    /// tick — firing materializes the vessel in the bubble at the node
-    /// point and arms the executor. Always `Clamping` per the §2.6.5
+    /// (module docs): a scheduled [`ManeuverNode`] reached its arming
+    /// tick — up to a half-burn ahead of `node.tick` — firing
+    /// materializes the vessel in the bubble at its live conic state
+    /// and arms the executor. Always `Clamping` per the §2.6.5
     /// member table (unlike `SoiTransition` it is not tracked-gated —
     /// the player armed the node themselves, so warp must stop for it).
     /// Scheduled by `SimCommand::SetManeuver`; dropped alongside the
     /// node by `DeleteManeuver` and by the residence transitions that
     /// discard the scheduled intent.
     ManeuverNodeStart {
-        /// The vessel whose node reached its burn tick.
+        /// The vessel whose node reached its arming tick — up to a
+        /// half-burn ahead of `node.tick` (the C06-F2 lead that
+        /// centres the delivered impulse on the design point).
         vessel: VesselId,
     } = 4,
     /// A predicted transfer window's optimal departure (M5

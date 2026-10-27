@@ -1333,6 +1333,13 @@ pub struct PlanNodeRow {
     pub in_s: f64,
     /// Total Δv of the departure burn (m/s).
     pub dv_mps: f64,
+    /// The composed solve's verified residual — how far the burn's
+    /// achieved patched trajectory lands from the destination's
+    /// centre at arrival (m). `Some` is an arrival claim the panel
+    /// may show; `None` (the legacy path) means no arrival was
+    /// verified — the encounter line must not read as this burn's
+    /// outcome.
+    pub arrival_miss_m: Option<f64>,
 }
 
 /// The staged `predict_encounter` result as plain data.
@@ -1695,6 +1702,14 @@ pub fn planning_panel(
                         e.body,
                         fmt_period(e.in_s)
                     );
+                    // Honesty (C07-F1): the encounter is computed on
+                    // the plan's own conic. It is the burn's outcome
+                    // only while a verified node backs it — without
+                    // one, the row describes the ideal, not anything
+                    // the player can fly.
+                    if p.node.is_none() {
+                        line.push_str(" · plan conic — no burn staged");
+                    }
                     if let Some(pe) = e.periapsis_m {
                         line.push_str(&format!(" · Pe {}", fmt_distance(pe)));
                     }
@@ -1718,9 +1733,13 @@ pub fn planning_panel(
                 }
                 match (&p.node, &p.node_error) {
                     (Some(n), _) => {
+                        let outcome = match n.arrival_miss_m {
+                            Some(m) => format!(" · arrives ±{}", fmt_distance(m)),
+                            None => String::new(),
+                        };
                         ui.label(
                             egui::RichText::new(format!(
-                                "node: vessel {} T−{} · Δv {:.0} m/s",
+                                "node: vessel {} T−{} · Δv {:.0} m/s{outcome}",
                                 n.vessel,
                                 fmt_period(n.in_s),
                                 n.dv_mps

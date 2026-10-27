@@ -34,13 +34,15 @@
 //!   geometry, and the post-transition conic for chaining.
 //! - [`departure_node`] — the plan → `SetManeuver` bridge: the
 //!   single-impulse ejection geometry for a vessel on a closed parking
-//!   orbit, resolved to `{tick, prograde, normal, radial}`.
-//!   **Limitation:** the burn fires up to one parking period before
-//!   `departure_tick` and the SOI egress transit is modeled as
-//!   instantaneous, so the node does NOT compose to arrival on its
-//!   own — the vessel misses `r2` at `arrival_tick` without correction.
-//!   The [`predict_encounter`] → re-plan correction loop is REQUIRED,
-//!   not optional (see the function's docs).
+//!   orbit, resolved to `{tick, prograde, normal, radial}`. For the
+//!   sibling-pair case (every [`TransferPlan`] the planner emits) the
+//!   node is *composed*: the classical ejection seeds a bounded Newton
+//!   solve on the post-burn velocity so the achieved patched
+//!   trajectory — real SOI transit, real re-base at the crossing —
+//!   lands on `r2` at `arrival_tick`, and the verified residual rides
+//!   [`DepartureNode::arrival_miss_m`]. The degenerate fallback (an
+//!   origin with no SOI to compose through) keeps the asymptote-only
+//!   node and reports `None` there instead of claiming an arrival.
 //!
 //! # Solver coverage (stated honestly)
 //!
@@ -73,7 +75,7 @@ use csp_data::{BodyId, KeplerElements};
 use crate::maneuver::burn_frame;
 use crate::orbit::{
     E_PARABOLIC_TOL, OrbitModel, OrbitState, PatchedConics, SoiDirection, SoiEvent,
-    cartesian_to_elements, perifocal_to_inertial, propagate, stumpff,
+    cartesian_to_elements, elements_to_cartesian, perifocal_to_inertial, propagate, stumpff,
 };
 
 const TAU: f64 = core::f64::consts::TAU;
@@ -88,6 +90,29 @@ const BRANCH_MIN_ITERS: u32 = 64;
 /// escape eccentricity depends on `r_b`, which depends on the burn
 /// longitude it feeds back into. Bounded, converged-checked.
 const EJECTION_MAX_ITERS: u32 = 16;
+/// The composed solve's Newton bound — quadratic convergence from the
+/// ejection seed lands the target residual in a handful of steps; the
+/// cap bounds the reachable adversarial case like every other solve
+/// here.
+const EGRESS_SOLVE_MAX_ITERS: u32 = 16;
+/// Halvings a Newton step may take before the solve declares itself
+/// stalled — the deterministic line-search schedule.
+const EGRESS_SOLVE_LS_STEPS: u32 = 7;
+/// Finite-difference step for the solve's Jacobian (m/s): the
+/// shooting map's sensitivity is ~time-of-flight per m/s (~10⁶–10⁷ m),
+/// so a 1 m/s probe sits orders of magnitude above the evaluation's
+/// own noise floor.
+const EGRESS_SOLVE_JACOBIAN_H: f64 = 1.0;
+/// The SOI-egress crossing scan's propagation stride (s) — bounds the
+/// bracket the bisection refines.
+const EGRESS_STRIDE_S: f64 = 512.0;
+/// The composed solve's arrival-miss target: this fraction of the
+/// destination's SOI radius…
+const EGRESS_SOLVE_TOL_SOI_FRAC: f64 = 0.05;
+/// …bounded above by this absolute value — the burn lands inside
+/// `min(frac·r_soi, cap)` of the destination's centre at arrival
+/// before a node is handed out (Duva: ~2.4e6 m of a 4.79e7 m SOI).
+const EGRESS_SOLVE_TOL_M: f64 = 1.0e6;
 /// The porkchop grid's total-cell ceiling — the §2.6.5 back-pressure
 /// philosophy applied to a planning query: `(2¹⁶)` cells is ~30× a
 /// useful 48×48 scan while staying a bounded amount of work per call.
@@ -1481,16 +1506,19 @@ fn encounter_approach(el: &KeplerElements, mu_b: f64, radius: Option<f64>) -> En
 /// frame, ready to hand to `SimCommand::SetManeuver` verbatim.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DepartureNode {
-    /// The tick the burn executes — the vessel's last passage through
-    /// the ejection longitude at-or-before the plan's departure tick
-    /// (the "node at window" convention; see [`departure_node`]).
-    /// Guaranteed strictly ahead of the `now` the query was given —
-    /// `SimCommand::SetManeuver` clamps an at-or-past tick to
-    /// `clock + 1` and re-resolves the stored components at the
-    /// CLAMPED tick, which would burn the designed vector at the wrong
-    /// orbital longitude; the query refuses rather than produce that
-    /// node. Re-check `tick > clock` if wall time passed between the
-    /// query and the command.
+    /// The node's design tick — the vessel's passage through the burn
+    /// point whose achieved trajectory meets the solve's target (for
+    /// the composed path: the passage whose SOI egress lands nearest
+    /// the plan conic's own crossing, past the query's `now`; for the
+    /// legacy path: the last ejection-longitude passage at-or-before
+    /// `departure_tick`). Guaranteed strictly ahead of the `now` the
+    /// query was given — `SimCommand::SetManeuver` clamps an
+    /// at-or-past tick to `clock + 1` and re-resolves the stored
+    /// components at the CLAMPED tick, which would burn the designed
+    /// vector at the wrong orbital longitude; the query refuses or
+    /// rolls to the next passage rather than produce that node.
+    /// Re-check `tick > clock` if wall time passed between the query
+    /// and the command.
     pub tick: u64,
     /// Δv components — `SimCommand::SetManeuver`'s fields verbatim.
     pub dv_prograde_mps: f64,
@@ -1502,11 +1530,87 @@ pub struct DepartureNode {
     /// the UI (the components above are the same vector resolved at
     /// the burn point).
     pub dv_world: DVec3,
+    /// The composed solve's verified residual (C07-F1): how far the
+    /// burn's achieved patched trajectory lands from the
+    /// destination's centre at `plan.arrival_tick`, in metres —
+    /// converged below the solver's target tolerance before the node
+    /// was handed out. `None` on the legacy path, where the node is
+    /// the asymptote approximation and no arrival claim exists — the
+    /// honest distinction the panel displays.
+    pub arrival_miss_m: Option<f64>,
 }
 
 /// Resolve a [`TransferPlan`] into a [`DepartureNode`] for a vessel on
-/// a **closed** (`e < 1`) orbit about `plan.origin` — the
-/// single-impulse ejection, done honestly:
+/// a **closed** (`e < 1`) orbit about `plan.origin`.
+///
+/// Two paths, dispatched honestly:
+///
+/// - **Composed (C07-F1)** — every sibling-pair plan (all
+///   [`TransferPlan`]s are sibling-pair: [`plan_transfer`]'s
+///   `shared_frame` requires it) whose origin carries an SOI. The
+///   classical cone∩plane ejection seeds a burn longitude and escape
+///   velocity; a bounded Newton solve then refines the post-burn
+///   velocity so the *achieved patched trajectory* — real SOI transit
+///   through the origin's frame, real re-base at the crossing — lands
+///   on `r2` at `arrival_tick`, within
+///   [`EGRESS_SOLVE_TOL_SOI_FRAC`]·`r_soi` (≤
+///   [`EGRESS_SOLVE_TOL_M`]). This is the node that actually arrives
+///   (see [`departure_node_composed`]).
+/// - **Legacy** — the degenerate leftover (an origin with no SOI to
+///   compose through): the asymptote-only ejection, documented in
+///   [`departure_node_legacy`] — it does NOT compose to arrival, and
+///   [`DepartureNode::arrival_miss_m`] stays `None` so callers can
+///   never mistake it for a verified one.
+///
+/// `now` is the clock the resulting node will be scheduled against —
+/// see [`DepartureNode::tick`] for the strict-future guarantee and
+/// the C07-F2 next-passage rule.
+///
+/// `Recoverable` when no honest node exists: a closed-orbit/v∞/parent
+/// gate failure, an asymptote the parking plane cannot reach (the
+/// honest answer is a split plane change, which is the AI job's to
+/// decompose), a composed solve that stalls or misses its target
+/// residual, or no future burn passage at all.
+pub fn departure_node(
+    model: &PatchedConics,
+    vessel_orbit: &OrbitState,
+    plan: &TransferPlan,
+    now: SimTime,
+) -> Result<DepartureNode, SimError> {
+    if vessel_orbit.parent != plan.origin {
+        return Err(SimError::Recoverable(
+            "ejection: vessel does not orbit the plan's origin",
+        ));
+    }
+    let e_v = vessel_orbit.elements.eccentricity;
+    if !(0.0..1.0).contains(&e_v) {
+        return Err(SimError::Recoverable("ejection: parking orbit not closed"));
+    }
+    let vinf = plan.leg.v_inf_depart.norm();
+    if !(vinf.is_finite() && vinf > 0.0) {
+        return Err(SimError::Recoverable("ejection: zero departure v_inf"));
+    }
+    let origin_body = model.body_orbit(&plan.origin)?;
+    let dest_body = model.body_orbit(&plan.destination)?;
+    // The composed path needs a boundary to compose through and the
+    // transfer's shared frame — sibling endpoints under one parent.
+    // `plan.conic.parent` IS that parent by construction; the
+    // endpoint-parents check keeps a hand-built plan honest too.
+    let composed = origin_body.soi_m.is_some()
+        && origin_body.parent.is_some()
+        && origin_body.parent == dest_body.parent
+        && origin_body.parent.as_ref() == Some(&plan.conic.parent);
+    if composed {
+        departure_node_composed(model, vessel_orbit, plan, now)
+    } else {
+        departure_node_legacy(model, vessel_orbit, plan, now)
+    }
+}
+
+/// The legacy asymptote ejection — kept for the degenerate inputs the
+/// composed solve cannot serve (an origin carrying no SOI: nothing to
+/// egress through, so the "transit" the compose corrects is not even
+/// defined). The single-impulse ejection, done honestly:
 ///
 /// 1. The escape hyperbola must end with outgoing asymptote `v∞̂`
 ///    (`plan.leg.v_inf_depart`, in the origin's frame). At burn speed
@@ -1531,26 +1635,20 @@ pub struct DepartureNode {
 /// and the egress transit through the origin's SOI is modeled as
 /// instantaneous, so the vessel's real post-egress state is the
 /// transfer conic shifted in time: it misses `r2` at `arrival_tick`
-/// without a mid-course correction. The correction loop is REQUIRED,
-/// not optional — [`predict_encounter`] the resulting trajectory,
-/// measure the missed approach, and re-plan around the remainder
-/// until the encounter closes.
-///
-/// `now` is the clock the resulting node will be scheduled against.
-/// The burn can sit up to one parking period before `departure_tick`,
-/// so a plan queried late can design a node in the past — and
-/// `SetManeuver` clamps an at-or-past tick to `clock + 1`, then
-/// resolves the components at the CLAMPED longitude: same |Δv|, wrong
-/// inertial direction. The query refuses `tick ≤ now` instead of
-/// handing back that trap.
+/// without a mid-course correction — which is exactly why the
+/// composed path above exists, and why this fallback reports
+/// `arrival_miss_m: None` rather than a number.
 ///
 /// `Recoverable` when the geometry can't produce the asymptote: an
 /// open parking orbit, a `v∞` pointing nearly along the parking
 /// normal (the cone never reaches the plane — the honest answer is a
 /// split plane change, which is the AI job's to decompose), a burn
 /// longitude the iteration fails to converge, or a burn tick that
-/// lands at-or-before epoch 0 or `now`.
-pub fn departure_node(
+/// lands at-or-before epoch 0 or `now` (`SetManeuver` would clamp the
+/// tick and re-resolve the components at the CLAMPED longitude —
+/// same |Δv|, wrong inertial direction; a typed refusal, not a
+/// silently re-timed node).
+fn departure_node_legacy(
     model: &PatchedConics,
     vessel_orbit: &OrbitState,
     plan: &TransferPlan,
@@ -1576,22 +1674,7 @@ pub fn departure_node(
     let t_dep = SimTime::from_ticks(plan.departure_tick);
     // The parking orbit's inertial basis: periapsis direction ê,
     // orbit normal ŵ, and the in-plane quadrature q̂ = ŵ×ê.
-    let e_hat = perifocal_to_inertial(
-        DVec3::X,
-        el.ascending_node_rad,
-        el.inclination_rad,
-        el.arg_periapsis_rad,
-    );
-    let w_hat = perifocal_to_inertial(
-        DVec3::Z,
-        el.ascending_node_rad,
-        el.inclination_rad,
-        el.arg_periapsis_rad,
-    );
-    if !w_hat.is_finite() {
-        return Err(SimError::Recoverable("ejection: degenerate parking plane"));
-    }
-    let q_hat = w_hat.cross(e_hat);
+    let (e_hat, w_hat, q_hat) = parking_basis(el)?;
     let a_v = el.semi_major_axis_m;
     if !(a_v.is_finite() && a_v > 0.0) {
         return Err(SimError::Recoverable("ejection: degenerate parking orbit"));
@@ -1640,7 +1723,484 @@ pub fn departure_node(
         dv_normal_mps: dv_world.dot(nrm),
         dv_radial_mps: dv_world.dot(rad),
         dv_world,
+        arrival_miss_m: None,
     })
+}
+
+/// The parking orbit's inertial basis — periapsis direction ê, orbit
+/// normal ŵ, and the in-plane quadrature q̂ = ŵ×ê — shared by the
+/// legacy and composed ejection paths.
+fn parking_basis(el: &KeplerElements) -> Result<(DVec3, DVec3, DVec3), SimError> {
+    let e_hat = perifocal_to_inertial(
+        DVec3::X,
+        el.ascending_node_rad,
+        el.inclination_rad,
+        el.arg_periapsis_rad,
+    );
+    let w_hat = perifocal_to_inertial(
+        DVec3::Z,
+        el.ascending_node_rad,
+        el.inclination_rad,
+        el.arg_periapsis_rad,
+    );
+    if !w_hat.is_finite() {
+        return Err(SimError::Recoverable("ejection: degenerate parking plane"));
+    }
+    Ok((e_hat, w_hat, w_hat.cross(e_hat)))
+}
+
+/// The composed solve's residual for one post-burn velocity guess:
+/// propagate the burn-point state through the origin's SOI crossing,
+/// re-base into the shared parent frame at the achieved crossing, and
+/// report how far the resulting conic lands from `r2` at
+/// `arrival_tick`. `Recoverable` when the guess is not a servable
+/// trajectory (periapsis inside the surface, no SOI crossing before
+/// the transit ceiling, egress past arrival) — a failed evaluation is
+/// a failed iterate, never a silently-clamped one.
+struct EgressEval {
+    /// Arrival miss vector, common-parent frame (m).
+    miss: DVec3,
+}
+
+/// A body's parent-frame cartesian state at `t_s` seconds — the
+/// continuous-time twin of `body_state` (epoch-0 elements
+/// convention), so the composed solve's residual stays smooth for
+/// Newton rather than stair-stepping on the tick lattice.
+fn body_state_at_s(
+    model: &PatchedConics,
+    body: &BodyId,
+    t_s: f64,
+) -> Result<(DVec3, DVec3), SimError> {
+    let b = model.body_orbit(body)?;
+    let el = b
+        .elements
+        .as_ref()
+        .ok_or(SimError::Recoverable("ejection: endpoint has no orbit"))?;
+    let parent = b
+        .parent
+        .as_ref()
+        .ok_or(SimError::Recoverable("ejection: endpoint has no parent"))?;
+    let mu_p = model.body_orbit(parent)?.mu_m3_per_s2;
+    let (r0, v0) = elements_to_cartesian(el, mu_p)?;
+    propagate(r0, v0, mu_p, t_s)
+}
+
+/// Propagate `(p0, v0)` about `mu` until `|r| ≥ r_target` — the
+/// post-burn conic's real crossing of the origin's SOI radius,
+/// strided then bisected to sub-second, ceilinged at `cap_s`.
+/// `Ok(None)` when no crossing exists inside the cap (a bound conic,
+/// or one too slow to matter).
+fn escape_crossing(
+    p0: DVec3,
+    v0: DVec3,
+    mu: f64,
+    r_target: f64,
+    cap_s: f64,
+) -> Result<Option<(f64, DVec3, DVec3)>, SimError> {
+    let mut t_lo = 0.0;
+    let mut t_hi = EGRESS_STRIDE_S;
+    loop {
+        if t_hi > cap_s {
+            return Ok(None);
+        }
+        let (r, _) = propagate(p0, v0, mu, t_hi)?;
+        if r.norm() >= r_target {
+            break;
+        }
+        t_lo = t_hi;
+        t_hi += EGRESS_STRIDE_S;
+    }
+    for _ in 0..40 {
+        if t_hi - t_lo <= 1e-3 {
+            break;
+        }
+        let mid = (t_lo + t_hi) / 2.0;
+        let (r, _) = propagate(p0, v0, mu, mid)?;
+        if r.norm() < r_target {
+            t_lo = mid;
+        } else {
+            t_hi = mid;
+        }
+    }
+    let (r, v) = propagate(p0, v0, mu, t_hi)?;
+    Ok(Some((t_hi, r, v)))
+}
+
+/// `plan.conic`'s real OUTBOUND crossing of `r_soi` about `body` —
+/// the tick the patched-conics model actually egresses at (the
+/// `departure_tick` the plan stamps is the conic's epoch at the
+/// origin's centre; the boundary crossing trails it by the SOI
+/// transit, ~20 h for Terrin). Strided separation scan then
+/// bisection, in seconds.
+fn plan_egress_s(
+    model: &PatchedConics,
+    plan: &TransferPlan,
+    r_soi: f64,
+    mu_p: f64,
+) -> Result<f64, SimError> {
+    let (r0, v0) = elements_to_cartesian(&plan.conic.elements, mu_p)?;
+    let epoch_s = plan.conic.epoch.seconds();
+    let dep_s = SimTime::from_ticks(plan.departure_tick).seconds();
+    let arr_s = SimTime::from_ticks(plan.arrival_tick).seconds();
+    let sep = |t_s: f64| -> Result<f64, SimError> {
+        let (rc, _) = propagate(r0, v0, mu_p, t_s - epoch_s)?;
+        let (rb, _) = body_state_at_s(model, &plan.origin, t_s)?;
+        Ok(rc.distance(rb) - r_soi)
+    };
+    let mut lo = dep_s;
+    let mut hi = dep_s;
+    loop {
+        hi += 4_096.0;
+        if hi > arr_s {
+            return Err(SimError::Recoverable(
+                "ejection: the plan's own conic never egresses",
+            ));
+        }
+        if sep(lo)? < 0.0 && sep(hi)? >= 0.0 {
+            break;
+        }
+        lo = hi;
+    }
+    for _ in 0..40 {
+        if hi - lo <= 1e-3 {
+            break;
+        }
+        let mid = (lo + hi) / 2.0;
+        if sep(mid)? < 0.0 {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(hi)
+}
+
+/// One [`EgressEval`] of the composed shooting map `v_post ↦
+/// arrival miss` — the residual Newton drives to zero.
+#[allow(clippy::too_many_arguments)]
+fn eval_departure(
+    model: &PatchedConics,
+    p_b: DVec3,
+    v_post: DVec3,
+    burn_s: f64,
+    plan: &TransferPlan,
+    r_soi: f64,
+    mu_o: f64,
+    mu_p: f64,
+    r2: DVec3,
+    arr_s: f64,
+    transit_cap_s: f64,
+) -> Result<EgressEval, SimError> {
+    // Surface floor first: a guess that dips inside the origin's
+    // surface before it egresses is not a servable trajectory.
+    let el = cartesian_to_elements(p_b, v_post, mu_o)?;
+    let a = el.semi_major_axis_m;
+    let e = el.eccentricity;
+    let r_p = if (e - 1.0).abs() <= E_PARABOLIC_TOL {
+        a.abs() / 2.0 // parabolic encoding: a = −p, r_p = p/2
+    } else if e > 1.0 {
+        a.abs() * (e - 1.0)
+    } else {
+        a * (1.0 - e)
+    };
+    let floor = model.body_radius(&plan.origin).unwrap_or(0.0);
+    if !(r_p.is_finite() && r_p > floor) {
+        return Err(SimError::Recoverable(
+            "ejection: burn dips into the surface",
+        ));
+    }
+    let Some((transit_s, x_e, v_e)) = escape_crossing(p_b, v_post, mu_o, r_soi, transit_cap_s)?
+    else {
+        return Err(SimError::Recoverable(
+            "ejection: conic never reaches the SOI",
+        ));
+    };
+    let t_e_s = burn_s + transit_s;
+    if !(t_e_s.is_finite() && t_e_s < arr_s) {
+        return Err(SimError::Recoverable("ejection: egress lands past arrival"));
+    }
+    // The patched-conics stitch, verbatim: re-base the origin-frame
+    // egress state into the shared parent's frame at the crossing,
+    // then read where that conic stands at the plan's arrival.
+    let (r_o, v_o) = body_state_at_s(model, &plan.origin, t_e_s)?;
+    let (r_arr, _) = propagate(x_e + r_o, v_e + v_o, mu_p, arr_s - t_e_s)?;
+    Ok(EgressEval { miss: r_arr - r2 })
+}
+
+/// `J·x = b` for the solve's 3×3 column Jacobian — Cramer's rule with
+/// a relative-degeneracy gate: a `|det|` below `1e-24·|c0||c1||c2|`
+/// reads the shooting map as flat (a burn geometry whose arrival no
+/// longer responds to the burn velocity), which is a typed failure,
+/// never a divide-by-noise step.
+fn solve3(cols: [DVec3; 3], b: DVec3) -> Option<DVec3> {
+    let d = cols[0].dot(cols[1].cross(cols[2]));
+    let scale = cols[0].norm() * cols[1].norm() * cols[2].norm();
+    if !(d.is_finite() && scale.is_finite() && d.abs() > 1e-24 * scale) {
+        return None;
+    }
+    Some(DVec3::new(
+        b.dot(cols[1].cross(cols[2])) / d,
+        cols[0].dot(b.cross(cols[2])) / d,
+        cols[0].dot(cols[1].cross(b)) / d,
+    ))
+}
+
+/// The sibling-pair solve (C07-F1): compose the egress at plan time —
+/// the single-impulse burn whose achieved patched trajectory arrives
+/// at `r2` at `arrival_tick`. The classical cone∩plane ejection
+/// (same [`ejection_point`] the legacy path uses) seeds the burn
+/// longitude `p̂` and the escape velocity `û·v_esc`; then:
+///
+/// 1. **Anchor the timing to the model's own egress.** The burn rides
+///    the parking-orbit passage whose achieved SOI crossing lands
+///    nearest the plan conic's real crossing `t_c` — not "last
+///    passage before `departure_tick`" (the convention that stranded
+///    the burn up to a period early and the egress ~a transit late).
+///    A query made at-or-past the window — the C07-F2 dead-end —
+///    rolls to the vessel's NEXT passage: the window alarm firing
+///    then `CreateNode` produces a node instead of "burn precedes
+///    now". The solve re-aims the velocity for whatever passage was
+///    picked, so a later passage is a different Δv, not a lie.
+/// 2. **Newton on the post-burn velocity.** The shooting map
+///    `v_post ↦ arrival miss` (egress state → re-base → propagate to
+///    `arrival_tick`) is smooth enough for a finite-difference
+///    Jacobian; three degrees of freedom meet three constraints. The
+///    seed is the ejection answer, whose miss is the C07 finding's
+///    ~10⁹ m — well inside this map's convergence basin. Bounded:
+///    [`EGRESS_SOLVE_MAX_ITERS`] iterations, a fixed halving
+///    line-search schedule, every evaluation bounded itself.
+/// 3. **Hand out only a verified residual.** `arrival_miss_m` carries
+///    the converged miss — under `min(`[`EGRESS_SOLVE_TOL_SOI_FRAC`]`
+///    ·r_soi, `[`EGRESS_SOLVE_TOL_M`]`)` or the solve reports
+///    `Recoverable` rather than staging a burn that misses.
+///
+/// Finite-burn honesty, stated: the executor integrates the real
+/// burn, so the achieved conic is the impulsive design smeared over
+/// the burn arc — centred on the node tick by the C06-F2 arming lead,
+/// second-order residual.
+fn departure_node_composed(
+    model: &PatchedConics,
+    vessel_orbit: &OrbitState,
+    plan: &TransferPlan,
+    now: SimTime,
+) -> Result<DepartureNode, SimError> {
+    let el = &vessel_orbit.elements;
+    let e_v = el.eccentricity;
+    let origin_body = model.body_orbit(&plan.origin)?;
+    let dest_body = model.body_orbit(&plan.destination)?;
+    let (Some(r_soi), Some(gp)) = (origin_body.soi_m, origin_body.parent.clone()) else {
+        return Err(SimError::Recoverable("ejection: origin has no SOI/parent"));
+    };
+    let mu_o = origin_body.mu_m3_per_s2;
+    let mu_p = model.body_orbit(&gp)?.mu_m3_per_s2;
+    let v_inf = plan.leg.v_inf_depart;
+    let vinf = v_inf.norm();
+    let v_hat = v_inf / vinf;
+    // The classical seed: burn longitude + escape speed for the
+    // plan's own v∞ — the ejection that gets the geometry right and
+    // the timing wrong.
+    let (e_hat, w_hat, q_hat) = parking_basis(el)?;
+    let a_v = el.semi_major_axis_m;
+    if !(a_v.is_finite() && a_v > 0.0) {
+        return Err(SimError::Recoverable("ejection: degenerate parking orbit"));
+    }
+    let (p_hat, u_hat, v_esc) = ejection_point(el, v_hat, vinf, mu_o, w_hat, e_hat, q_hat, a_v)?;
+    // The seed hyperbola's SOI transit — the interval the legacy
+    // path pretended was zero.
+    let nu_b = libm::atan2(p_hat.dot(q_hat), p_hat.dot(e_hat));
+    let p_latus = a_v * (1.0 - e_v * e_v);
+    let r_b = p_latus / (1.0 + e_v * libm::cos(nu_b));
+    let arr_s = SimTime::from_ticks(plan.arrival_tick).seconds();
+    let seed_cap_s = (4.0 * r_soi / v_esc).max(EGRESS_STRIDE_S * 64.0);
+    let Some((transit0, ..)) = escape_crossing(
+        p_hat * r_b,
+        u_hat * v_esc,
+        mu_o,
+        r_soi,
+        seed_cap_s.min(arr_s),
+    )?
+    else {
+        return Err(SimError::Recoverable(
+            "ejection: seed hyperbola never egresses",
+        ));
+    };
+    // The plan conic's real boundary crossing — the timing anchor the
+    // legacy "node at window" convention never knew.
+    let t_c_s = plan_egress_s(model, plan, r_soi, mu_p)?;
+    let n_v = libm::sqrt(mu_o / (a_v * a_v * a_v));
+    let burn_tick = burn_passage(
+        vessel_orbit,
+        nu_b,
+        n_v,
+        t_c_s - transit0,
+        arr_s,
+        transit0,
+        now,
+    )?;
+    let (p_b, v_v) = model.state_at(vessel_orbit, SimTime::from_ticks(burn_tick))?;
+    let (r2, _) = body_state_at_s(model, &plan.destination, arr_s)?;
+    let (v_post, miss) = solve_departure_velocity(
+        model,
+        p_b,
+        u_hat * v_esc,
+        burn_tick,
+        plan,
+        r_soi,
+        mu_o,
+        mu_p,
+        r2,
+        arr_s,
+        dest_body.soi_m,
+        transit0,
+    )?;
+    let dv_world = v_post - v_v;
+    let (pro, nrm, rad) = burn_frame(p_b, v_v)?;
+    Ok(DepartureNode {
+        tick: burn_tick,
+        dv_prograde_mps: dv_world.dot(pro),
+        dv_normal_mps: dv_world.dot(nrm),
+        dv_radial_mps: dv_world.dot(rad),
+        dv_world,
+        arrival_miss_m: Some(miss),
+    })
+}
+
+/// The burn's passage: the vessel's passages through burn longitude
+/// `nu_b` are `t_k = t_epoch + (m_b − M_0 + 2πk)/n` — pick the one
+/// nearest the ideal burn `t_ideal` subject to landing strictly ahead
+/// of `now`, and refuse `Recoverable` only when the pick's own egress
+/// lands at-or-past the arrival (the one dead end left). The
+/// next-passage rule is the C07-F2 fix: a query at-or-past the window
+/// gets the vessel's NEXT passage — the window alarm firing then
+/// `CreateNode` produces a node instead of "burn precedes now".
+#[allow(clippy::too_many_arguments)]
+fn burn_passage(
+    vessel_orbit: &OrbitState,
+    nu_b: f64,
+    n_v: f64,
+    ideal_s: f64,
+    arr_s: f64,
+    transit_s: f64,
+    now: SimTime,
+) -> Result<u64, SimError> {
+    let el = &vessel_orbit.elements;
+    let period_s = TAU / n_v;
+    let m_b = mean_anomaly_of_nu(el.eccentricity, nu_b);
+    let epoch_s = vessel_orbit.epoch.seconds();
+    let pass0_s = epoch_s + (m_b - el.mean_anomaly_epoch_rad).rem_euclid(TAU) / n_v;
+    let k_min = ((now.seconds() - pass0_s) / period_s).floor() as i64 + 1;
+    let k_pref = ((ideal_s - pass0_s) / period_s).round() as i64;
+    let mut k = k_min.max(k_pref);
+    let mut burn_s = pass0_s + k as f64 * period_s;
+    let mut burn_tick = (burn_s * TICK_HZ as f64).round() as u64;
+    // `k_min` is computed on seconds — the tick-rounded passage can
+    // still land on `now`; advance until it clears.
+    while burn_tick <= now.ticks() {
+        k += 1;
+        burn_s = pass0_s + k as f64 * period_s;
+        burn_tick = (burn_s * TICK_HZ as f64).round() as u64;
+    }
+    // A burn whose egress lands at-or-past the arrival serves no
+    // transfer — the one dead end left, and it is a typed refusal.
+    if !(burn_s.is_finite() && burn_s >= 0.0) || burn_s + transit_s >= arr_s {
+        return Err(SimError::Recoverable(
+            "ejection: no burn passage lands before arrival",
+        ));
+    }
+    Ok(burn_tick)
+}
+
+/// The Newton solve on the post-burn velocity (item 2 of
+/// [`departure_node_composed`]'s doc): the shooting map
+/// `v_post ↦ arrival miss` (egress state → re-base → propagate to
+/// `arrival_tick`) has three honest constraints for its three
+/// degrees of freedom. Finite-difference Jacobian, fixed halving
+/// line search, `Err` on stall/singularity/non-convergence — never a
+/// burn that misses handed back as one that arrives. Returns
+/// `(v_post, achieved_miss_m)`.
+#[allow(clippy::too_many_arguments)]
+fn solve_departure_velocity(
+    model: &PatchedConics,
+    p_b: DVec3,
+    v_seed: DVec3,
+    burn_tick: u64,
+    plan: &TransferPlan,
+    r_soi: f64,
+    mu_o: f64,
+    mu_p: f64,
+    r2: DVec3,
+    arr_s: f64,
+    dest_soi: Option<f64>,
+    transit0: f64,
+) -> Result<(DVec3, f64), SimError> {
+    let tol = dest_soi.map_or(EGRESS_SOLVE_TOL_M, |s| {
+        (s * EGRESS_SOLVE_TOL_SOI_FRAC).min(EGRESS_SOLVE_TOL_M)
+    });
+    let burn_s = SimTime::from_ticks(burn_tick).seconds();
+    let transit_cap = (4.0 * transit0).max(EGRESS_STRIDE_S * 8.0);
+    let eval = |v: DVec3| {
+        eval_departure(
+            model,
+            p_b,
+            v,
+            burn_s,
+            plan,
+            r_soi,
+            mu_o,
+            mu_p,
+            r2,
+            arr_s,
+            transit_cap.min(arr_s - burn_s),
+        )
+    };
+    let mut v = v_seed;
+    let mut cur = eval(v)?;
+    for _ in 0..EGRESS_SOLVE_MAX_ITERS {
+        if cur.miss.norm() <= tol {
+            break;
+        }
+        // Finite-difference Jacobian — a failed probe means the step
+        // left servable geometry; the solve fails with it, honestly.
+        let mut cols = [DVec3::ZERO; 3];
+        for (j, col) in cols.iter_mut().enumerate() {
+            let mut vp = v;
+            match j {
+                0 => vp.x += EGRESS_SOLVE_JACOBIAN_H,
+                1 => vp.y += EGRESS_SOLVE_JACOBIAN_H,
+                _ => vp.z += EGRESS_SOLVE_JACOBIAN_H,
+            }
+            let ej = eval(vp)?;
+            *col = (ej.miss - cur.miss) / EGRESS_SOLVE_JACOBIAN_H;
+        }
+        let Some(step) = solve3(cols, cur.miss) else {
+            return Err(SimError::Recoverable("ejection: arrival solve singular"));
+        };
+        // Line search on the Newton step — accept the first halving
+        // that improves the residual; none improving is a stall.
+        let mut alpha = 1.0;
+        let mut improved = false;
+        for _ in 0..EGRESS_SOLVE_LS_STEPS {
+            let cand = v - step * alpha;
+            if let Ok(next) = eval(cand)
+                && next.miss.norm() < cur.miss.norm()
+            {
+                v = cand;
+                cur = next;
+                improved = true;
+                break;
+            }
+            alpha *= 0.5;
+        }
+        if !improved {
+            return Err(SimError::Recoverable("ejection: arrival solve stalled"));
+        }
+    }
+    if cur.miss.norm() > tol {
+        return Err(SimError::Recoverable(
+            "ejection: arrival solve did not converge",
+        ));
+    }
+    Ok((v, cur.miss.norm()))
 }
 
 /// The ejection geometry solve, extracted from [`departure_node`]:
@@ -2333,13 +2893,16 @@ mod tests {
 
     // -- Departure node ------------------------------------------------
 
-    /// The ejection produces a node whose post-burn conic escapes with
-    /// the required v∞: propagate the post-burn state far forward and
-    /// the velocity asymptotes to `plan.leg.v_inf_depart`.
+    /// C07-F1, the claim that replaces the old asymptote check: the
+    /// staged node's post-burn trajectory COMPOSES to arrival — apply
+    /// the node impulsively at its tick, and the achieved conic's own
+    /// `predict_encounter` chain reports `Exit{terrin}` then
+    /// `Enter{duva}`. The asymptote-direction reading is gone by
+    /// design: the Newton solve re-aims the egress velocity to land
+    /// `r2`, which is deliberately not `v_inf_depart`.
     #[test]
-    fn departure_node_ejects_along_v_inf() {
+    fn departure_node_composes_to_the_destination_soi() {
         let model = home_system();
-        // A small window query just to get a real plan's v_inf vector.
         let q = PorkchopQuery {
             depart_cells: 12,
             duration_cells: 12,
@@ -2355,11 +2918,19 @@ mod tests {
             epoch: SimTime::from_ticks(0),
         };
         let node = departure_node(&model, &vessel, &plan, SimTime::ZERO).unwrap();
-        // The node is finite and sits at-or-before the window.
-        assert!(node.tick <= plan.departure_tick);
-        assert!(node.dv_prograde_mps.is_finite());
-        // Post-burn conic about terrin: hyperbolic, and its outgoing
-        // asymptote matches the plan's v_inf direction.
+        assert!(node.tick > 0 && node.dv_world.is_finite());
+        // The verified residual the panel shows: under the solver's
+        // tolerance, and a small fraction of Duva's SOI.
+        let miss = node
+            .arrival_miss_m
+            .expect("the composed path must report its residual");
+        assert!(
+            miss < DUVA_SOI * EGRESS_SOLVE_TOL_SOI_FRAC,
+            "arrival residual {miss} m over tolerance"
+        );
+        // Fly it at the model level: impulse at the node tick → the
+        // terrin-frame conic must egress, and the rebased conic must
+        // Enter duva — the same chain the live sim fires.
         let (rb, vb) = model
             .state_at(&vessel, SimTime::from_ticks(node.tick))
             .unwrap();
@@ -2371,20 +2942,32 @@ mod tests {
             node.dv_radial_mps,
         )
         .unwrap();
-        let (r_far, v_far) = propagate(rb, vb + dv, MU_TERRIN, 2.0e5).unwrap();
-        let v_inf_hat = plan.leg.v_inf_depart / plan.leg.v_inf_depart.norm();
-        let got_hat = v_far / v_far.norm();
-        // The far-field velocity direction ≈ v∞̂ (patched-conics:
-        // the hyperbola's asymptote). Direction agreement is the
-        // ejection's real assertion; magnitude follows by energy.
-        assert!(
-            vec_rel_err(got_hat, v_inf_hat) < 0.05,
-            "ejection asymptote off target: r_far={r_far:?} got={got_hat:?} want={v_inf_hat:?}"
-        );
-        // Magnitude: |v_far| should be within a few % of v_inf.
-        let mag_err =
-            (v_far.norm() - plan.leg.v_inf_depart.norm()).abs() / plan.leg.v_inf_depart.norm();
-        assert!(mag_err < 0.05, "v_inf magnitude off: {mag_err}");
+        let h = OrbitState {
+            parent: BodyId::from("terrin"),
+            elements: cartesian_to_elements(rb, vb + dv, MU_TERRIN).unwrap(),
+            epoch: SimTime::from_ticks(node.tick),
+        };
+        let horizon = SimTime::from_ticks(plan.arrival_tick.saturating_add(TICK_HZ * 86_400));
+        let terrin = BodyId::from("terrin");
+        let exit = predict_encounter(&model, &h, SimTime::from_ticks(node.tick), horizon, None)
+            .unwrap()
+            .expect("the post-burn conic must egress terrin's SOI");
+        assert_eq!(exit.event.body, terrin);
+        assert_eq!(exit.event.direction, SoiDirection::Exit);
+        let rebased = exit.rebased.expect("an Exit re-bases to solen");
+        // Chained from the just-fired Exit — the first real event on
+        // the solen cruise must be Duva's SOI.
+        let enter = predict_encounter(
+            &model,
+            &rebased,
+            SimTime::from_ticks(exit.event.tick),
+            horizon,
+            Some((&terrin, SoiDirection::Exit)),
+        )
+        .unwrap()
+        .expect("the achieved solen conic must reach duva");
+        assert_eq!(enter.event.body, BodyId::from("duva"));
+        assert_eq!(enter.event.direction, SoiDirection::Enter);
     }
 
     /// BLOCK-3: the porkchop's `CircularPark` objective is a COPLANAR
@@ -2454,13 +3037,13 @@ mod tests {
         assert!(departure_node(&model, &open, &plan, SimTime::ZERO).is_err());
     }
 
-    /// The burn sits up to one parking period BEFORE `departure_tick`,
-    /// so a plan queried late produces a node in the past — which
-    /// `SetManeuver` would silently clamp to `clock + 1` and fire at
-    /// the wrong orbital longitude. `now` bounds the node: a burn at
-    /// or behind it is a typed refusal.
+    /// C07-F2: a query at-or-past the window — the window-watch
+    /// dead-end — no longer refuses. The solve rolls to the vessel's
+    /// NEXT burn-longitude passage: the node tick is strictly ahead
+    /// of `now`, within one parking period of it, and still a
+    /// composed (verified-residual) arrival.
     #[test]
-    fn departure_node_refuses_a_past_burn() {
+    fn departure_node_offers_the_next_pass_past_the_window() {
         let model = home_system();
         let q = duva_query(12);
         let plan = plan_transfer(&model, &q).unwrap();
@@ -2469,17 +3052,32 @@ mod tests {
             elements: circular_elements(TERRIN_R + 75e3, 0.0),
             epoch: SimTime::from_ticks(0),
         };
-        // `now` at the departure window itself: the "last passage
-        // at-or-before" burn tick can never sit strictly ahead of it.
+        // `now` at the departure window itself: the old code refused
+        // "burn precedes now" here — the dead-end. The composed solve
+        // instead offers the burn-longitude passage nearest the ideal
+        // burn, ahead of the clock.
         let late = SimTime::from_ticks(plan.departure_tick);
-        assert!(matches!(
-            departure_node(&model, &vessel, &plan, late),
-            Err(SimError::Recoverable(_))
-        ));
-        // The same query against clock 0 succeeds — and its node is
-        // strictly ahead of the `now` it was scheduled against.
-        let node = departure_node(&model, &vessel, &plan, SimTime::ZERO).unwrap();
-        assert!(node.tick > 0);
+        let node = departure_node(&model, &vessel, &plan, late).unwrap();
+        assert!(
+            node.tick > late.ticks(),
+            "the node must sit ahead of the query clock"
+        );
+        assert!(
+            node.tick < plan.arrival_tick,
+            "a useful node still precedes the arrival"
+        );
+        assert!(
+            node.arrival_miss_m
+                .is_some_and(|m| m < DUVA_SOI * EGRESS_SOLVE_TOL_SOI_FRAC),
+            "the next-pass node still composes to arrival: {:?}",
+            node.arrival_miss_m
+        );
+        // And genuinely past the designed passage — the next-pass
+        // fallback holds: a query hours after the ideal still gets a
+        // future node.
+        let later = SimTime::from_ticks(node.tick + 1);
+        let node2 = departure_node(&model, &vessel, &plan, later).unwrap();
+        assert!(node2.tick > later.ticks());
     }
 
     /// The sweep the verified report ran: 4 radii × 8 phase angles ×

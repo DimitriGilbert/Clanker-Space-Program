@@ -12,15 +12,24 @@
 //!
 //! # Execution model — thrust-integrated, never impulsive
 //!
-//! Setting a node schedules [`EventKind::ManeuverNodeStart`] at the
-//! node's tick — a §2.6.5 `Clamping` member, so warp demotes before the
-//! burn and the player cannot overshoot. When the event fires the
-//! vessel's conic is evaluated at that tick, the `WeldedBody`
-//! re-materializes in the bubble at exactly the node point, and the
+//! Setting a node schedules [`EventKind::ManeuverNodeStart`] up to a
+//! half-estimated-burn BEFORE the node's tick — the C06-F2 arming
+//! lead. The executor burns *forward* from whatever tick arms it, so
+//! an event at `node.tick` would centre the delivered impulse at
+//! `node.tick + T_burn/2` — first-order late against the impulsive
+//! model [`predict_maneuver`] and the planner solve against. Arming
+//! at `node.tick − ⌈T_burn/2⌉` (the [`est_burn_ticks`] estimate)
+//! centres the delivered impulse on the node tick instead (±1 tick on
+//! odd burn lengths). The event is still a §2.6.5 `Clamping` member,
+//! so warp demotes before the burn and the player cannot overshoot.
+//! When the event fires the vessel's conic is evaluated at the arming
+//! tick, the `WeldedBody` re-materializes in the bubble there, and the
 //! node becomes [`ManeuverStatus::Burning`]: the **executor** — a
 //! first-class mechanism inside `World::step_bubble_range`, not a
 //! command stream — owns `throttle` and `attitude` each integer tick,
 //! aligning the weld's net thrust axis to the inertial burn direction
+//! (the node's Δv resolved at the *node* tick — the design point the
+//! components were authored against, not the earlier arming point)
 //! and driving throttle so the delivered Δv (`throttle · F / m · dt`,
 //! the exact quantity the §2.9 integrator applies) counts down to zero
 //! without overshoot. On completion the node is consumed, throttle
@@ -61,7 +70,7 @@
 //!   latch/unlatch round-trip (a latched vessel cannot burn; unlatching
 //!   resumes the countdown where it stopped).
 
-use csp_core::{DQuat, DVec3, SimTime, StableDiscriminant, StateHasher};
+use csp_core::{DQuat, DVec3, SimTime, StableDiscriminant, StateHasher, TICK_HZ};
 use serde::{Deserialize, Serialize};
 
 use crate::orbit::{OrbitModel, OrbitState, PatchedConics};
@@ -70,13 +79,17 @@ use crate::orbit::{OrbitModel, OrbitState, PatchedConics};
 /// vessel, hashed by [`hash_maneuver`], mutated only through
 /// `SimCommand::SetManeuver`/`DeleteManeuver` and the executor itself.
 ///
-/// `tick` is the sim tick the burn starts at (the `ManeuverNodeStart`
-/// event's tick — always strictly ahead of the clock at schedule time;
+/// `tick` is the node's design point — the tick the Δv components
+/// resolve against and [`predict_maneuver`] models the impulse at.
+/// The `ManeuverNodeStart` event arms the executor up to a half-burn
+/// EARLIER (the [`est_burn_ticks`] lead, C06-F2) so the delivered
+/// impulse centres on `tick` rather than trailing it. `tick` itself
+/// is always strictly ahead of the clock at schedule time;
 /// `SetManeuver` clamps at-or-past ticks to `clock + 1`, matching
-/// `SetAlarm`'s may-not-rewrite-the-past rule).
+/// `SetAlarm`'s may-not-rewrite-the-past rule.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ManeuverNode {
-    /// The sim tick the burn starts at.
+    /// The sim tick the delivered impulse centres on (the node point).
     pub tick: u64,
     /// Δv along the node point's prograde direction `v̂`, m/s.
     pub dv_prograde_mps: f64,
@@ -247,6 +260,51 @@ pub fn craft_has_thrust(craft: &crate::CraftDef) -> bool {
             .iter()
             .any(|s| s.kind == csp_phys::ForceSiteKind::Thrust && s.rated_n > 0.0)
     })
+}
+
+/// The burn-duration estimate `SetManeuver` spends on the C06-F2
+/// arming lead: `dv_mps ÷ (rated thrust ÷ part-mass sum)`, in ticks —
+/// the same estimate the map's node label shows as "~Ns burn". An
+/// *estimate*, honestly documented: it ignores propellant draw (the
+/// weld's mass steps discretely anyway — module doc) and reads rated
+/// thrust, so the real burn runs a touch shorter or longer; the lead
+/// only needs the centre, not the endpoint. `None` for a thrustless
+/// or massless craft or a non-positive Δv — all cases `SetManeuver`
+/// refuses before the lead matters.
+///
+/// The formula lives here, not in `csp-view`, so the snapshot's
+/// node↔event pairing check recomputes the identical window — a
+/// drift between estimate and check would read a legitimate event as
+/// a forged one.
+pub fn est_burn_ticks(craft: &crate::CraftDef, dv_mps: f64) -> Option<u64> {
+    let mass: f64 = craft.parts.iter().map(|p| p.mass_kg).sum();
+    let thrust: f64 = craft
+        .parts
+        .iter()
+        .flat_map(|p| p.force_sites.iter())
+        .filter(|s| s.kind == csp_phys::ForceSiteKind::Thrust && s.rated_n > 0.0)
+        .map(|s| s.rated_n)
+        .sum();
+    if !(mass.is_finite()
+        && mass > 0.0
+        && thrust.is_finite()
+        && thrust > 0.0
+        && dv_mps.is_finite()
+        && dv_mps > 0.0)
+    {
+        return None;
+    }
+    Some((dv_mps * mass / thrust * TICK_HZ as f64).ceil() as u64)
+}
+
+/// The arming lead — half the [`est_burn_ticks`] estimate, ceilinged:
+/// a burn starting at `node.tick − lead` centres its delivered
+/// impulse at-or-within a tick of `node.tick` (never after — a late
+/// impulse is the bug C06-F2 fixes). `0` for a craft with no honest
+/// estimate — the event then arms at the node tick, the pre-lead
+/// behaviour for a burn the estimate cannot see anyway.
+pub fn node_lead_ticks(craft: &crate::CraftDef, dv_mps: f64) -> u64 {
+    est_burn_ticks(craft, dv_mps).unwrap_or(0).div_ceil(2)
 }
 
 /// Rotation taking the body-frame unit `from` to the bubble-frame unit
