@@ -9895,7 +9895,9 @@ fn event_names_vessel(kind: &EventKind, vessel: &VesselId) -> bool {
 /// a live transfer at the same tick, and both counters stay ahead of
 /// every live id. Vessel ids may name *removed* vessels (a mid-flight
 /// removal is legal — the completion's fallback resolves it) but
-/// never unissued ones; crew cargos may only name issued ids, and
+/// never unissued ones; crew cargos may only name issued ids — an
+/// in-flight member need not still sit at the source, the same
+/// fallback resolving every placement the loss paths leave — and
 /// crew ids are a single arena: unique across every vessel.
 fn restore_transfer_state(
     snapshot: &WorldSnapshot,
@@ -9903,7 +9905,9 @@ fn restore_transfer_state(
 ) -> Result<(), SimError> {
     // Crew ids are a single arena: unique across every vessel's seats,
     // every colony's crew set, and (separately) the in-flight cargo —
-    // an in-flight member still holds their source seat until landing.
+    // an in-flight member normally keeps their source seat until
+    // landing, though the loss paths can move or delete the record
+    // mid-flight (no seat/roster placement is required of them here).
     let mut crew_seen = std::collections::BTreeSet::new();
     let mut in_flight_crew = std::collections::BTreeSet::new();
     for (id, t) in &snapshot.transfers {
@@ -9945,26 +9949,23 @@ fn restore_transfer_state(
                 if !in_flight_crew.insert(*crew) {
                     return Err(SimError::Fatal("snapshot: crew in flight twice"));
                 }
-                // Seated-at-source (report-04 D7): the member's roster
-                // location must BE `t.from` — the apply keeps them
-                // seated at source until `land_crew` runs, so a
-                // crafted location would double-book on landing.
-                let seated_at_source = match t.from {
-                    transfers::TransferEnd::Vessel(v) => snapshot
-                        .vessels
-                        .get(&v)
-                        .is_some_and(|vessel| vessel.crew.iter().any(|c| c.id == *crew)),
-                    transfers::TransferEnd::Colony(c) => snapshot
-                        .economy
-                        .crew
-                        .get(crew)
-                        .is_some_and(|m| m.location == economy::CrewLocation::Colony(c)),
-                };
-                if !seated_at_source {
-                    return Err(SimError::Fatal(
-                        "snapshot: in-flight crew is not seated at the transfer's source",
-                    ));
-                }
+                // Deliberately NO seated-at-source gate (the report-04
+                // D7 hazard is prevented at fire time, not here): the
+                // apply keeps the member at `t.from` until `land_crew`
+                // runs, but every source-loss path is legal mid-flight
+                // — `TerminateVessel`, crash removal, breakup reseat,
+                // seat jettison, colony evacuation — and leaves the
+                // record somewhere else or nowhere at all (a roster-less
+                // `BoardCrew` member loses their seat with the hull and
+                // keeps no record). `land_crew` already resolves every
+                // one of those placements: it only *moves* a record it
+                // finds at `t.from`, degrading to the documented no-op
+                // otherwise, so a missing/moved record can never
+                // double-book. The member's actual placement stays
+                // coherent through the sibling roster↔seat and
+                // colony-set↔roster pairing gates — a seated-at-source
+                // requirement here only `Fatal`ed saves the sim itself
+                // produced (the poison-save C04-F1).
             }
         }
         match transfer_events.get(id) {
@@ -20746,6 +20747,185 @@ mod tests {
             transfers::vessel_resource(&w2.vessels()[&VesselId(1)], &res),
             70.0
         );
+    }
+
+    /// §7.5's mid-window shape applied to a CREW transfer (C05-F2 —
+    /// the resource pipe above was the only mid-transfer save the
+    /// suite ran): snapshot halfway through the 640-tick traversal,
+    /// restore, and the completion lands the member aboard the
+    /// destination bit-for-bit.
+    #[test]
+    fn save_load_mid_crew_transfer() {
+        let mut w = physics_world(false);
+        let base = DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0);
+        enqueue_physical(&mut w, crew_craft(2), base);
+        enqueue_physical(&mut w, crew_craft(2), base + DVec3::new(0.0, 0.0, 50.0));
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::BoardCrew {
+                vessel: VesselId(0),
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::TransferCrew {
+                from_vessel: VesselId(0),
+                to_vessel: VesselId(1),
+                crew: CrewId(0),
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        assert_eq!(w.transfers().len(), 1);
+        let complete = w.transfers()[&TransferId(0)].complete_tick;
+        // Half the traversal has elapsed; the member is in flight,
+        // still holding the source seat until `land_crew` runs.
+        w.step_frame(w.clock().ticks() + 320).unwrap();
+        let snap = w.snapshot().unwrap();
+        let mut w2 = World::restore(test_system(), w.config().physics.clone(), snap).unwrap();
+        assert_eq!(w2.state_hash().unwrap(), w.state_hash().unwrap());
+        w.step_frame(complete).unwrap();
+        w2.step_frame(complete).unwrap();
+        assert_eq!(w2.state_hash().unwrap(), w.state_hash().unwrap());
+        assert!(
+            w2.vessels()[&VesselId(1)]
+                .crew
+                .iter()
+                .any(|c| c.id == CrewId(0)),
+            "the member must land aboard the destination"
+        );
+    }
+
+    /// C04-F1 regression — the verified poison-save probe: an
+    /// in-flight `TransferCrew` whose source vessel is removed while
+    /// the member is in flight. `TerminateVessel` stands in for every
+    /// legal source-loss producer (crash removal, breakup reseat, seat
+    /// jettison): all leave the same shape — the transfer and its
+    /// `TransferComplete` event survive while the seat record dies.
+    /// `snapshot()` accepted but the restore `Fatal`ed "in-flight crew
+    /// is not seated at the transfer's source" — the save was
+    /// unloadable forever. The completion's `land_crew` fallback
+    /// already resolves the dead source as a documented no-op, so the
+    /// restore must accept and both worlds must evolve identically.
+    #[test]
+    fn save_load_crew_transfer_source_terminated() {
+        let mut w = physics_world(false);
+        let base = DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0);
+        enqueue_physical(&mut w, crew_craft(2), base);
+        enqueue_physical(&mut w, crew_craft(2), base + DVec3::new(0.0, 0.0, 50.0));
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::BoardCrew {
+                vessel: VesselId(0),
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::TransferCrew {
+                from_vessel: VesselId(0),
+                to_vessel: VesselId(1),
+                crew: CrewId(0),
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        assert_eq!(w.transfers().len(), 1);
+        let complete = w.transfers()[&TransferId(0)].complete_tick;
+        // Kill the source hull mid-window: the transfer survives, the
+        // member's seat record dies with it (a `BoardCrew` member
+        // holds no roster entry — nothing of them remains).
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::TerminateVessel {
+                vessel: VesselId(0),
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        assert!(!w.vessels().contains_key(&VesselId(0)));
+        assert_eq!(w.transfers().len(), 1, "the transfer survives the hull");
+        // The poison save: this exact snapshot was unrestorable.
+        let snap = w.snapshot().unwrap();
+        let mut w2 = World::restore(test_system(), w.config().physics.clone(), snap).unwrap();
+        assert_eq!(w2.state_hash().unwrap(), w.state_hash().unwrap());
+        // Through the completion: the fallback's no-op landing — the
+        // member went down with the source and never arrives aboard B —
+        // identical in the original and restored worlds.
+        w.step_frame(complete).unwrap();
+        w2.step_frame(complete).unwrap();
+        assert_eq!(w2.state_hash().unwrap(), w.state_hash().unwrap());
+        assert!(
+            !w2.vessels()[&VesselId(1)]
+                .crew
+                .iter()
+                .any(|c| c.id == CrewId(0)),
+            "a member whose source died mid-flight must not land"
+        );
+        assert!(w2.transfers().is_empty());
+    }
+
+    /// C05-F2 — the mid-window shape with the source loss *inside*
+    /// the window: a roster member's transfer is 320 ticks in when
+    /// the source hull is terminated and the snapshot is then taken.
+    /// `remove_vessel`'s `lose_aboard_crew` marks them `Lost` +
+    /// `Unassigned`; the restore accepts the dead-source transfer and
+    /// both worlds run the fallback's no-op landing identically.
+    #[test]
+    fn save_load_crew_transfer_source_lost_mid_window() {
+        let mut w = physics_world(false);
+        let base = DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0);
+        enqueue_physical(&mut w, crew_craft(2), base);
+        enqueue_physical(&mut w, crew_craft(2), base + DVec3::new(0.0, 0.0, 50.0));
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        let cid = hire_and_seat(&mut w, VesselId(0), csp_phys::PartNodeId(0));
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::TransferCrew {
+                from_vessel: VesselId(0),
+                to_vessel: VesselId(1),
+                crew: cid,
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        // Half the traversal in, then the source dies mid-window.
+        w.step_frame(w.clock().ticks() + 320).unwrap();
+        let complete = w.transfers()[&TransferId(0)].complete_tick;
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::TerminateVessel {
+                vessel: VesselId(0),
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        assert_eq!(w.economy.crew[&cid].status, CrewStatus::Lost);
+        assert_eq!(w.economy.crew[&cid].location, CrewLocation::Unassigned);
+        // Mid-window snapshot of the dead-source shape — restore must
+        // accept and evolve identically through the no-op landing.
+        let snap = w.snapshot().unwrap();
+        let mut w2 = World::restore(test_system(), w.config().physics.clone(), snap).unwrap();
+        assert_eq!(w2.state_hash().unwrap(), w.state_hash().unwrap());
+        w.step_frame(complete).unwrap();
+        w2.step_frame(complete).unwrap();
+        assert_eq!(w2.state_hash().unwrap(), w.state_hash().unwrap());
+        assert!(
+            !w2.vessels()[&VesselId(1)].crew.iter().any(|c| c.id == cid),
+            "the lost member must not land aboard the destination"
+        );
+        assert_eq!(w2.economy.crew[&cid].status, CrewStatus::Lost);
+        assert_eq!(w2.economy.crew[&cid].location, CrewLocation::Unassigned);
     }
 
     /// N1 regression: the restore-time wet-mass bound is the §2.4
