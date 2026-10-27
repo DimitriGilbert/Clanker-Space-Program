@@ -690,6 +690,30 @@ impl Keymap {
             .unwrap_or_else(|| "unbound".to_string())
     }
 
+    /// The bindings-column display for `action`: every bound key's
+    /// [`KeyBinding::display_label`] joined with `sep`, or `"—"` when
+    /// the action is unbound. Shared by the controls-help card and the
+    /// settings keymap grid — the two used to carry a copy of this
+    /// join+fallback each (differing only in the separator), which is
+    /// how C23-F5's drift class starts.
+    pub fn bindings_label(
+        &self,
+        action: KeyAction,
+        labels: &BTreeMap<String, String>,
+        sep: &str,
+    ) -> String {
+        self.bindings
+            .get(&action)
+            .map(|v| {
+                v.iter()
+                    .map(|k| k.display_label(labels))
+                    .collect::<Vec<_>>()
+                    .join(sep)
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "—".to_string())
+    }
+
     /// The action's first bound key — the compact hint form for a
     /// row that would otherwise stack every alternative.
     pub fn first_binding(&self, action: KeyAction) -> Option<&str> {
@@ -863,23 +887,7 @@ fn keymap_grid(
         .show(ui, |ui| {
             for action in KeyAction::ALL {
                 ui.label(action.label());
-                let keys = state
-                    .settings
-                    .keys
-                    .bindings
-                    .get(action)
-                    .map(|v| {
-                        v.iter()
-                            .map(|k| k.display_label(labels))
-                            .collect::<Vec<_>>()
-                            .join("  ")
-                    })
-                    .unwrap_or_default();
-                ui.label(if keys.is_empty() {
-                    "—".to_string()
-                } else {
-                    keys
-                });
+                ui.label(state.settings.keys.bindings_label(*action, labels, "  "));
                 if state.listening == Some(*action) {
                     ui.label("press a key…  (esc cancels)");
                 } else {

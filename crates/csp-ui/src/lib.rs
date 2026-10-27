@@ -644,7 +644,9 @@ fn fmt_clock(s: f64) -> String {
     let a = s.abs();
     if a < 36_000.0 {
         let m = (a / 60.0).floor();
-        let sec = a - m * 60.0;
+        // Floor the seconds — `{sec:02.0}` rounds a raw remainder, so
+        // 119.7 s printed "1:60" and 3599.9 s printed "59:60" (C23-F4).
+        let sec = (a - m * 60.0).floor();
         format!("{m:.0}:{sec:02.0}")
     } else {
         fmt_period(s)
@@ -767,19 +769,31 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
             // scene — unreadable over bright terrain. The panel backs
             // every readout now (the navball is its own opaque draw).
             hud_frame().show(ui, |ui| {
+            // Every label in this Area is `.selectable(false)`: egui
+            // 0.37's `selectable_labels` default gives `ui.label` a
+            // `click_and_drag` sense, and labels created after the
+            // Area's whole-rect move widget are hit-tested on top of
+            // it — a selectable label claims the drag press, so the
+            // panel cannot be grabbed by its own text (C23-F1).
             if !input.has_vessel {
-                ui.label(
-                    egui::RichText::new("FLIGHT — no vessel in the bubble")
-                        .color(egui::Color32::from_gray(225)),
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("FLIGHT — no vessel in the bubble")
+                            .color(egui::Color32::from_gray(225)),
+                    )
+                    .selectable(false),
                 );
-                ui.label(
-                    egui::RichText::new(format!(
-                        "[{}] VAB  ·  [{}] map  ·  [{}] controls",
-                        input.keys.hint(settings::KeyAction::ToggleVab),
-                        input.keys.hint(settings::KeyAction::ToggleMap),
-                        input.keys.hint(settings::KeyAction::ToggleHelp),
-                    ))
-                    .color(egui::Color32::from_gray(185)),
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!(
+                            "[{}] VAB  ·  [{}] map  ·  [{}] controls",
+                            input.keys.hint(settings::KeyAction::ToggleVab),
+                            input.keys.hint(settings::KeyAction::ToggleMap),
+                            input.keys.hint(settings::KeyAction::ToggleHelp),
+                        ))
+                        .color(egui::Color32::from_gray(185)),
+                    )
+                    .selectable(false),
                 );
                 return;
             }
@@ -796,34 +810,46 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
                         r: &str,
                         rv: String,
                         col: egui::Color32| {
-                ui.label(
-                    egui::RichText::new(format!("{l:<4}{lv:>12}  {r:<6}{rv:>12}"))
-                        .font(mono.clone())
-                        .color(col),
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("{l:<4}{lv:>12}  {r:<6}{rv:>12}"))
+                            .font(mono.clone())
+                            .color(col),
+                    )
+                    .selectable(false),
                 );
             };
             let row = |ui: &mut egui::Ui, tag: &str, val: String, col: egui::Color32| {
-                ui.label(
-                    egui::RichText::new(format!("{tag:<4}{val:>31}"))
-                        .font(mono.clone())
-                        .color(col),
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("{tag:<4}{val:>31}"))
+                            .font(mono.clone())
+                            .color(col),
+                    )
+                    .selectable(false),
                 );
             };
             let sect = |ui: &mut egui::Ui, name: &str| {
-                ui.label(
-                    egui::RichText::new(format!("── {name} ─────────────────────────────"))
-                        .font(mono.clone())
-                        .color(head),
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("── {name} ─────────────────────────────"))
+                            .font(mono.clone())
+                            .color(head),
+                    )
+                    .selectable(false),
                 );
             };
             if input.latched {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "ON PAD — [{}] to launch",
-                        input.keys.hint(settings::KeyAction::ThrottleFull)
-                    ))
-                    .font(mono.clone())
-                    .color(egui::Color32::from_rgb(140, 220, 140)),
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!(
+                            "ON PAD — [{}] to launch",
+                            input.keys.hint(settings::KeyAction::ThrottleFull)
+                        ))
+                        .font(mono.clone())
+                        .color(egui::Color32::from_rgb(140, 220, 140)),
+                    )
+                    .selectable(false),
                 );
             }
             // Orbit — the osculating conic at the CoM: apsides,
@@ -984,36 +1010,41 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
                 format!("parts {}  ·  warp ×{}", input.parts, input.warp),
                 dim,
             );
-            ui.label(
-                egui::RichText::new(format!(
-                    "[{}] controls  ·  [{}]/[{}] throttle [{}]/[{}]  ·  [{}] stage  ·  [{}] map  [{}] VAB  ·  [{}] program  ·  RMB on a part: actions",
-                    input.keys.hint_labeled(settings::KeyAction::ToggleHelp, input.key_labels),
-                    input
-                        .keys
-                        .hint_labeled(settings::KeyAction::ThrottleFull, input.key_labels),
-                    input
-                        .keys
-                        .hint_labeled(settings::KeyAction::ThrottleCut, input.key_labels),
-                    input
-                        .keys
-                        .hint_labeled(settings::KeyAction::ThrottleUp, input.key_labels),
-                    input
-                        .keys
-                        .hint_labeled(settings::KeyAction::ThrottleDown, input.key_labels),
-                    input
-                        .keys
-                        .hint_labeled(settings::KeyAction::Stage, input.key_labels),
-                    input
-                        .keys
-                        .hint_labeled(settings::KeyAction::ToggleMap, input.key_labels),
-                    input
-                        .keys
-                        .hint_labeled(settings::KeyAction::ToggleVab, input.key_labels),
-                    input
-                        .keys
-                        .hint_labeled(settings::KeyAction::OpenProgram, input.key_labels),
-                ))
-                .color(egui::Color32::from_gray(180)),
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!(
+                        "[{}] controls  ·  [{}]/[{}] throttle [{}]/[{}]  ·  [{}] stage  ·  [{}] map  [{}] VAB  ·  [{}] program  ·  RMB on a part: actions",
+                        input
+                            .keys
+                            .hint_labeled(settings::KeyAction::ToggleHelp, input.key_labels),
+                        input
+                            .keys
+                            .hint_labeled(settings::KeyAction::ThrottleFull, input.key_labels),
+                        input
+                            .keys
+                            .hint_labeled(settings::KeyAction::ThrottleCut, input.key_labels),
+                        input
+                            .keys
+                            .hint_labeled(settings::KeyAction::ThrottleUp, input.key_labels),
+                        input
+                            .keys
+                            .hint_labeled(settings::KeyAction::ThrottleDown, input.key_labels),
+                        input
+                            .keys
+                            .hint_labeled(settings::KeyAction::Stage, input.key_labels),
+                        input
+                            .keys
+                            .hint_labeled(settings::KeyAction::ToggleMap, input.key_labels),
+                        input
+                            .keys
+                            .hint_labeled(settings::KeyAction::ToggleVab, input.key_labels),
+                        input
+                            .keys
+                            .hint_labeled(settings::KeyAction::OpenProgram, input.key_labels),
+                    ))
+                    .color(egui::Color32::from_gray(180)),
+                )
+                .selectable(false),
             );
             });
         });
@@ -1026,6 +1057,13 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
         egui::Area::new(egui::Id::unique("flight_navball"))
             .order(egui::Order::Foreground)
             .movable(true)
+            // `default_size` must be the real content size: without it
+            // the first-open sizing pass clamps `default_pos` against
+            // egui's nominal 600×400 `default_area_size`, parking the
+            // ball ~242 px above the bottom edge forever on narrow
+            // windows (the real 136×152 rect fits under the clamp, so
+            // it never self-corrects — C23-F2).
+            .default_size(nav_size)
             .default_pos(egui::pos2(
                 ball_center.x - nav_size.x * 0.5,
                 rect.bottom() - nav_size.y - 6.0,
@@ -1071,23 +1109,9 @@ pub fn help_panel(
             ui.label("Keyboard (rebindable in Settings → Key bindings)");
             egui::Grid::new("help_keys").num_columns(2).show(ui, |ui| {
                 for action in settings::KeyAction::ALL {
-                    let keys = keymap
-                        .bindings
-                        .get(action)
-                        .map(|v| {
-                            v.iter()
-                                .map(|k| k.display_label(key_labels))
-                                .collect::<Vec<_>>()
-                                .join(" / ")
-                        })
-                        .unwrap_or_default();
                     ui.label(
-                        egui::RichText::new(if keys.is_empty() {
-                            "—".to_string()
-                        } else {
-                            keys
-                        })
-                        .monospace(),
+                        egui::RichText::new(keymap.bindings_label(*action, key_labels, " / "))
+                            .monospace(),
                     );
                     ui.label(action.label());
                     ui.end_row();
@@ -1726,4 +1750,191 @@ pub fn planning_panel(
                 });
             }
         });
+}
+
+#[cfg(test)]
+// Tests signal failure by panicking — unwrap/expect stays legal here
+// (§2.13's no-panic rule covers shipping fallible paths).
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// A live-vessel HUD input — enough for the readout block + the
+    /// navball Area to draw in a headless pass.
+    fn hud_input<'a>(
+        keys: &'a settings::Keymap,
+        key_labels: &'a BTreeMap<String, String>,
+        propellant: &'a [PropellantGauge],
+    ) -> FlightHudInput<'a> {
+        FlightHudInput {
+            has_vessel: true,
+            latched: false,
+            alt_m: 12_480.0,
+            surface_speed_mps: 812.4,
+            orbital_speed_mps: 1_204.6,
+            vspeed_mps: 138.2,
+            heading_deg: 87.5,
+            pitch_deg: 42.0,
+            roll_deg: -8.0,
+            throttle: 0.68,
+            parts: 7,
+            navball: navball::NavballInput::default(),
+            warp: 4,
+            vessel_count: 1,
+            debris_count: 0,
+            apo_alt_m: Some(84_210.0),
+            pe_alt_m: Some(-6_400.0),
+            t_apo_s: Some(214.0),
+            t_pe_s: None,
+            period_s: None,
+            propellant,
+            stages_left: 2,
+            stages_total: 3,
+            mass_kg: 12_840.0,
+            thrust_n: 148_300.0,
+            thrust_full_n: 218_000.0,
+            twr: Some(1.18),
+            twr_surface: Some(1.72),
+            accel_mps2: Some(11.55),
+            accel_gee: Some(1.18),
+            isp_s: Some(310.0),
+            mass_flow_kg_s: Some(48.6),
+            fuel_depletion_s: Some(94.0),
+            burn_full_s: Some(64.0),
+            delta_v_mps: Some(1_940.0),
+            delta_v_stages_mps: 420.0,
+            keys,
+            key_labels,
+        }
+    }
+
+    /// A headless egui pass-runner (the C23 verifier's method): a
+    /// `Context` + fixed-size `RawInput` the tests feed pointer-event
+    /// scripts into, one `run_pass` per frame.
+    fn hud_rig(w: f32, h: f32) -> (egui::Context, egui::RawInput) {
+        (
+            egui::Context::default(),
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(w, h),
+                )),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn press(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    #[test]
+    fn fmt_clock_floors_seconds() {
+        // C23-F4: the seconds field used to round the remainder —
+        // 119.7 s printed "1:60" and 3599.9 s printed "59:60".
+        assert_eq!(fmt_clock(119.7), "1:59");
+        assert_eq!(fmt_clock(3599.9), "59:59");
+        assert_eq!(fmt_clock(0.0), "0:00");
+        assert_eq!(fmt_clock(45.0), "0:45");
+        assert_eq!(fmt_clock(60.0), "1:00");
+        // Past ten hours the coarse period formatter takes over.
+        assert_eq!(fmt_clock(36_000.0), fmt_period(36_000.0));
+    }
+
+    /// One headless frame. `FullOutput::textures_delta` is
+    /// drop-guarded (`#[must_use]`-style: unapplied deltas panic on
+    /// drop) — the tests assert on memory state, not pixels, so the
+    /// font-atlas upload is simply acknowledged and dropped.
+    fn run_frame(ctx: &egui::Context, raw: egui::RawInput, input: &FlightHudInput<'_>) {
+        let mut out = ctx.run_pass(raw, |ctx| flight_hud(ctx, input));
+        out.textures_delta.clear();
+    }
+
+    /// C23-F2: the navball's first-open parking spot. Without
+    /// `.default_size(nav_size)` egui's sizing pass clamps
+    /// `default_pos` against the nominal 600×400 `default_area_size`
+    /// and the ball parks ~242 px high (`[360,200]` on 960×600) for
+    /// every subsequent frame. With the real size it must land at
+    /// `(W/2 − 68, H − 152 − 6)` = `(412, 442)` and stay there.
+    #[test]
+    fn navball_first_open_parks_bottom_center() {
+        let keys = settings::Keymap::default();
+        let key_labels = BTreeMap::new();
+        let prop: [PropellantGauge; 0] = [];
+        let input = hud_input(&keys, &key_labels, &prop);
+        let (ctx, raw) = hud_rig(960.0, 600.0);
+        let navball_id = egui::Id::unique("flight_navball");
+        let mut min = None;
+        for _ in 0..3 {
+            run_frame(&ctx, raw.clone(), &input);
+            min = ctx.memory(|m| m.area_rect(navball_id)).map(|r| r.min);
+        }
+        let min = min.expect("navball area registered");
+        let expected = egui::pos2(480.0 - 68.0, 600.0 - 152.0 - 6.0);
+        assert!(
+            (min - expected).length() < 4.0,
+            "navball first-open parked at {min:?}, expected ≈{expected:?}"
+        );
+    }
+
+    /// C23-F1: the readout block must drag when grabbed ON a text row —
+    /// egui 0.37's default-selectable labels used to claim the press
+    /// over the Area's whole-rect move widget, so the panel never
+    /// moved. The assertion checks both that the *move* widget is the
+    /// dragged id mid-gesture and that the panel actually moved.
+    #[test]
+    fn readout_block_drags_from_its_text() {
+        let keys = settings::Keymap::default();
+        let key_labels = BTreeMap::new();
+        let prop: [PropellantGauge; 0] = [];
+        let input = hud_input(&keys, &key_labels, &prop);
+        let (ctx, mut raw) = hud_rig(960.0, 600.0);
+        let hud_id = egui::Id::unique("flight_hud");
+        // egui hit-tests each pass against the PREVIOUS pass's widget
+        // rects, and the Area registers its move widget before the
+        // off-screen correction is applied — so the first real pass
+        // records a stale rect. Three warm-up frames leave the parked
+        // position stable before the press.
+        for _ in 0..3 {
+            run_frame(&ctx, raw.clone(), &input);
+        }
+        let before = ctx
+            .memory(|m| m.area_rect(hud_id))
+            .expect("hud area registered");
+        // A point inside the first label row (the "── ORBIT ──"
+        // section line): `hud_frame`'s inner margin puts the first
+        // mono row ~7 px below the chip's top.
+        let grab = egui::pos2(before.left() + 80.0, before.top() + 15.0);
+        let move_id = hud_id.with("move");
+        let mut saw_move_drag = false;
+        for events in [
+            vec![press(grab, true)],
+            vec![egui::Event::PointerMoved(grab + egui::vec2(16.0, -8.0))],
+            vec![egui::Event::PointerMoved(grab + egui::vec2(140.0, -60.0))],
+        ] {
+            raw.events = events;
+            run_frame(&ctx, raw.clone(), &input);
+            saw_move_drag |= ctx.interaction_snapshot(|s| s.dragged) == Some(move_id);
+        }
+        assert!(
+            saw_move_drag,
+            "drag over the readout's text must reach the Area's move widget"
+        );
+        raw.events = vec![press(grab + egui::vec2(140.0, -60.0), false)];
+        run_frame(&ctx, raw, &input);
+        let after = ctx
+            .memory(|m| m.area_rect(hud_id))
+            .expect("hud area registered");
+        let delta = after.min - before.min;
+        assert!(
+            delta.length() > 60.0,
+            "readout block should have followed the drag (moved {delta:?})"
+        );
+    }
 }

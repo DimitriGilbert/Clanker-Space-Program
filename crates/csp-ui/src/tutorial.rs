@@ -310,9 +310,10 @@ impl TutorialState {
 ///
 /// The parking spot is mode-aware: the VAB's Craft inspector owns
 /// the right-top corner, so `in_vab` drops the card to center-top
-/// where it overlaps nothing; flight/map keep the free right-top
-/// slot. Once shown it is a normal window — the player drags it by
-/// the title bar wherever it bothers least.
+/// where it overlaps nothing; flight/map park left-top — the
+/// right-top slot collides with the map's orbit readout chip
+/// (C23-F6). Once shown it is a normal window — the player drags it
+/// by the title bar wherever it bothers least.
 /// Returns the drawn window rect — the host masks the VAB's pointer
 /// input against it (the default-on card sits over the build area).
 pub fn tutorial_overlay(
@@ -326,7 +327,10 @@ pub fn tutorial_overlay(
     let pos = if in_vab {
         egui::pos2(screen.center().x - 145.0, screen.top() + 30.0)
     } else {
-        egui::pos2(screen.right() - 298.0, screen.top() + 30.0)
+        // Left-top, under the top bar — the right-top corner belongs
+        // to the map overlay's orbit readout (C23-F6). Same row the
+        // Planning window uses; both are draggable once parked.
+        egui::pos2(screen.left() + 12.0, screen.top() + 60.0)
     };
     egui::Window::new("First flight")
         .default_pos(pos)

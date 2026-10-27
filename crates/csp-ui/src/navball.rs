@@ -334,11 +334,15 @@ pub fn heading_tape(painter: &egui::Painter, top_center: Pos2, width: f32, headi
     }
     let h = 16.0;
     let rect = egui::Rect::from_center_size(top_center + vec2(0.0, h * 0.5), vec2(width, h));
-    painter.rect_filled(rect, 2.0, Color32::from_black_alpha(160));
+    // The shared HUD chip rule (lib.rs: `HUD_CHIP_FILL`/`HUD_CHIP_EDGE`,
+    // `paint_hud_chip`'s recipe) — the tape is a floating readout like
+    // every other HUD strip, so it wears the same dark chip + hairline.
+    // The strip rect IS the chip, so no `HUD_CHIP_PAD` expansion.
+    painter.rect_filled(rect, egui::CornerRadius::same(6), crate::HUD_CHIP_FILL);
     painter.rect_stroke(
         rect,
-        2.0,
-        Stroke::new(1.0, Color32::from_gray(120)),
+        egui::CornerRadius::same(6),
+        Stroke::new(1.0, crate::HUD_CHIP_EDGE),
         egui::StrokeKind::Inside,
     );
     let clip = painter.with_clip_rect(rect);
