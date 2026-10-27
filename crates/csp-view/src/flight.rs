@@ -37,7 +37,9 @@ use crate::terrain::{TerrainCache, TerrainConfig};
 
 /// Chase-camera FOV (radians, vertical).
 pub(crate) const FLIGHT_FOV_Y: f64 = 0.9;
-/// Default camera distance (m) — reframed on focus changes.
+/// Default camera distance (m) — restored by `flight_present` on
+/// every focus-id change (C19-F4: a kept zoom framed the new focus at
+/// the old vessel's range).
 const FLIGHT_DEFAULT_DIST: f64 = 60.0;
 /// Plasma sheath display window (W/m² of convective input,
 /// `FlightBody::plasma_w_m2`): first glow ≈ a fast low pass, full
@@ -318,7 +320,19 @@ pub struct FlightSyncInput {
     /// struct is literal-constructed by downstream tests and cannot
     /// grow either). Mirrored into [`VesselPropulsionStaged`].
     pub propulsion: Vec<VesselPropulsion>,
+    /// Ids in `vessels` staged from `VesselState::OnRails` — the C19-F2
+    /// handoff set (at most the pinned/focused ids). Mirrored into
+    /// [`RailsStaged`]: a rails-staged focus is NOT a materialized
+    /// one, and `flight_present` needs the distinction for the pin's
+    /// `seen` edge and the SFX conversion cue.
+    pub rails: Vec<u64>,
 }
+
+/// [`FlightSyncInput::rails`] mirrored — a standalone resource for the
+/// same reason [`LiveVesselCount`] is one (the audio test literal-
+/// constructs `FlightSnapshot`, so that struct cannot grow).
+#[derive(Resource, Default)]
+pub struct RailsStaged(pub Vec<u64>);
 
 /// Pass-1 dead-stick recovery: the vessel the flight focus should pin
 /// to once it is staged (set by `View::recover_control` alongside the
@@ -355,6 +369,20 @@ impl FlightFocusOverride {
         self.target = Some(vessel);
         self.seen = false;
         self.lease_pending = true;
+    }
+
+    /// Pin the flight focus to `vessel` WITHOUT arming the lease
+    /// transfer — the `rebuild_from_snapshot` restore path, where the
+    /// loaded world's `active_vessel` reclaims the camera and the
+    /// restored record already carries its own leases (C02-F2: a
+    /// load must not re-preempt control). A rails-resident target
+    /// stages through the `capture_sync_input` handoff hint, so the
+    /// pin can hold across a rails residence — `seen` still waits
+    /// for a non-rails staging (the lease edge's materialization).
+    pub(crate) fn pin(&mut self, vessel: csp_sim::VesselId) {
+        self.target = Some(vessel);
+        self.seen = false;
+        self.lease_pending = false;
     }
 
     /// Release the pin — the newest-spawn focus rule applies again.
@@ -558,8 +586,13 @@ struct SfxPrev {
     nodes: usize,
     /// Debris-flagged vessel count — the breakup edge.
     debris: usize,
-    /// InBubble vessel count — the impact-removal edge.
-    vessels: usize,
+    /// Non-debris vessel count across ALL residences — the removal
+    /// edge (a bubble→rails conversion must NOT read as removal;
+    /// [`LiveVesselCount`] exists exactly for this distinction —
+    /// C19-F2/P12-F2).
+    live: usize,
+    /// Focused vessel staged from `OnRails` — the conversion edge.
+    rails: bool,
     /// Focused vessel's contact flag — the touchdown edge.
     contact: bool,
     /// Focused vessel is surface-latched — the landing edge.
@@ -945,12 +978,25 @@ fn sun_direction(sim: &World) -> DVec3 {
 
 /// `end_frame` staging: pull the flight view's slice out of `World`
 /// (the only sim read this module does — §2.5). `cache` is the
-/// session's [`LatchedWeldCache`] — surface-latched vessels reuse its
-/// weld-derived render data instead of re-welding every frame.
+/// session's [`LatchedWeldCache`]: non-`InBubble` vessels (latched,
+/// and the rails-staged focus below) reuse its weld-derived render
+/// data instead of re-welding every frame.
+///
+/// `rails_focus` is the C19-F2 handoff hint — the vessel ids the
+/// chase camera may need to FOLLOW through a bubble→rails conversion
+/// (the armed focus pin's target plus the last-resolved focus). A
+/// vessel in `rails_focus` that is `VesselState::OnRails` still
+/// stages — pose evaluated off its conic — so the camera/HUD hold it
+/// rather than popping to the next staged vessel or a dead frame.
+/// Only the hinted vessels stage this way: staging every rails conic
+/// would flood the staged list AND corrupt the newest-spawn focus
+/// rule (`focus_vessel` = `vessels.last()`).
+#[allow(clippy::too_many_lines)] // one staging arm per vessel state — splitting the loop mid-scan would scatter the order guarantees
 pub fn capture_sync_input(
     sim: &World,
     cache: &mut LatchedWeldCache,
     art: &crate::art::ArtAssets,
+    rails_focus: &[VesselId],
 ) -> FlightSyncInput {
     let env = sim.environment().map(|e| {
         // The §2.6.4 phase convention (`csp_sim::bubble`'s
@@ -984,7 +1030,7 @@ pub fn capture_sync_input(
         matches!(
             sim.vessels().get(&VesselId(*vid)).map(|v| &v.state),
             Some(VesselState::SurfaceLatched(_))
-        )
+        ) || rails_focus.contains(&VesselId(*vid))
     });
     cache.bubble_parts.retain(|vid, _| {
         matches!(
@@ -994,6 +1040,7 @@ pub fn capture_sync_input(
     });
     let mut vessels = Vec::new();
     let mut propulsion = Vec::new();
+    let mut rails = Vec::new();
     for (id, vessel) in sim.vessels() {
         match &vessel.state {
             VesselState::InBubble(body) => {
@@ -1056,7 +1103,23 @@ pub fn capture_sync_input(
                     propulsion.push(vessel_propulsion(*id, vessel, None));
                 }
             }
-            VesselState::OnRails(_) => {}
+            // C19-F2: the focus handoff — a vessel that converted to
+            // rails while it held (or pins) the focus keeps staging
+            // off its conic, so `resolve` still returns it. Entries
+            // keep arena order (ascending `VesselId`), so a hinted
+            // newest vessel stays `vessels.last()` — the same
+            // resolver picks it again. Unhinted rails vessels stage
+            // nothing, exactly as before.
+            VesselState::OnRails(orbit) => {
+                if rails_focus.contains(id)
+                    && let Some((body, prop)) =
+                        stage_rails(sim, env_ref, *id, vessel, orbit, cache, art)
+                {
+                    rails.push(id.0);
+                    vessels.push(body);
+                    propulsion.push(prop);
+                }
+            }
         }
     }
     // Every non-debris vessel counts as ALIVE regardless of residence —
@@ -1074,7 +1137,99 @@ pub fn capture_sync_input(
         vessels,
         live_vessels,
         propulsion,
+        rails,
     }
+}
+
+/// Stage the focus-hinted `OnRails` vessel for the C19-F2 handoff.
+/// `state_at` is parent-centered inertial; the bubble frame is the
+/// system frame translated to the dominant body, so the pose composes
+/// through the parent↔dominant offset (identity when the conic's
+/// parent IS the dominant — the common case). Attitude is the weld
+/// default (identity): the stamped conic anchors the CoM only — the
+/// same fields `apply_to_bubble` leaves at defaults on a real
+/// re-materialization, so the render cannot claim an attitude the sim
+/// never tracked. `None` when the conic fails to evaluate or no
+/// environment exists to express the frame — unstageable reads as
+/// absent, never guessed (the `stage_latched` convention).
+fn stage_rails(
+    sim: &World,
+    env: Option<&csp_phys::Environment>,
+    id: VesselId,
+    vessel: &csp_sim::Vessel,
+    orbit: &csp_sim::orbit::OrbitState,
+    cache: &mut LatchedWeldCache,
+    art: &crate::art::ArtAssets,
+) -> Option<(FlightBody, VesselPropulsion)> {
+    let env = env?;
+    let dominant = sim.dominant_body()?.clone();
+    let t = sim.clock();
+    let (r, v) = csp_sim::orbit::OrbitModel::state_at(sim.orbits(), orbit, t).ok()?;
+    let (pos_off, vel_off) = if orbit.parent == dominant {
+        (DVec3::ZERO, DVec3::ZERO)
+    } else {
+        (
+            body_system_pos(sim.orbits(), &orbit.parent, t).ok()?
+                - body_system_pos(sim.orbits(), &dominant, t).ok()?,
+            crate::map::body_system_vel(sim.orbits(), &orbit.parent, t).ok()?
+                - crate::map::body_system_vel(sim.orbits(), &dominant, t).ok()?,
+        )
+    };
+    let com = env.body_center + pos_off + r;
+    let vel = vel_off + v;
+    // Weld-derived render data — the latched path's cache (the craft
+    // is immutable while railed, so the fingerprint key holds).
+    let (parts, com_local, plumes, nodes) = match vessel.craft.as_ref() {
+        Some(craft) => {
+            let key = craft_fingerprint(craft);
+            if cache.entries.get(&id.0).is_none_or(|e| e.key != key) {
+                let welded = csp_phys::weld(&craft.graph, &craft.parts).ok()?;
+                let plumes = live_plumes(vessel.craft.as_ref(), &welded);
+                cache.entries.insert(
+                    id.0,
+                    LatchedWeld {
+                        key,
+                        com_local: welded.com_local,
+                        plumes,
+                        parts: vessel_parts(vessel.craft.as_ref(), &welded.collider.hulls, art),
+                    },
+                );
+            }
+            let entry = cache.entries.get(&id.0)?;
+            (
+                entry.parts.clone(),
+                entry.com_local,
+                entry.plumes.clone(),
+                craft.graph.nodes.len(),
+            )
+        }
+        // Craft-less (elements-only) vessel: the hull-AABB fallback has
+        // no hulls to box — an empty part list still leaves the staged
+        // pose/HUD honest (the camera and telemetry keep working).
+        None => (Vec::new(), DVec3::ZERO, Vec::new(), 0),
+    };
+    let rot = DQuat::IDENTITY;
+    Some((
+        FlightBody {
+            id: id.0,
+            pos: com - rot.rotate(com_local),
+            rot,
+            vel,
+            // A railed vessel coasts — the stamped conic carries no
+            // throttle, contact, or heating state to mirror.
+            throttle: 0.0,
+            debris: vessel.debris_since.is_some(),
+            contact: false,
+            plasma_w_m2: 0.0,
+            nodes,
+            parts,
+            plumes,
+            com,
+            latched: false,
+            tanks: vessel_tanks(vessel),
+        },
+        vessel_propulsion(id, vessel, None),
+    ))
 }
 
 /// Stage one §2.6.4 surface-latched vessel. The restored inertial
@@ -1502,11 +1657,13 @@ pub(crate) fn sync_flight(
     mut snap: ResMut<FlightSnapshot>,
     mut live: ResMut<LiveVesselCount>,
     mut prop: ResMut<VesselPropulsionStaged>,
+    mut rails: ResMut<RailsStaged>,
 ) {
     snap.env.clone_from(&staged.env);
     snap.vessels.clone_from(&staged.vessels);
     live.0 = staged.live_vessels;
     prop.0.clone_from(&staged.propulsion);
+    rails.0.clone_from(&staged.rails);
 }
 
 /// The flight chase-camera solve: an orbit camera in the *local-level
@@ -1728,8 +1885,10 @@ pub(crate) fn pick_part(
 /// §3.7 SFX cue edges (the schedule's "VFX, audio cues" slot).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // the camera solve carries the terrain floor; per-vessel stage plans add the hud_plan read
 pub(crate) fn flight_present(
-    input: Res<FlightInput>,
+    mut input: ResMut<FlightInput>,
     snap: Res<FlightSnapshot>,
+    live: Res<LiveVesselCount>,
+    rails: Res<RailsStaged>,
     plans: Res<StagePlans>,
     prop: Res<VesselPropulsionStaged>,
     terrain_cfg: Res<TerrainConfig>,
@@ -1751,7 +1910,13 @@ pub(crate) fn flight_present(
     // sim's arena entirely (it can never stage).
     if let Some(id) = focus_override.target {
         if snap.vessels.iter().any(|b| b.id == id.0) {
-            focus_override.seen = true;
+            // `seen` marks the materialization the lease edge waits
+            // on — a rails-staged target (the C19-F2 handoff) is
+            // staged but not yet `InBubble`, so the lease still owes
+            // a real conversion (P04-F3).
+            if !rails.0.contains(&id.0) {
+                focus_override.seen = true;
+            }
         } else if focus_override.seen {
             focus_override.clear();
         }
@@ -1761,11 +1926,19 @@ pub(crate) fn flight_present(
     // (`sfx_edges` used to baseline on `vessels.last()` alone, so a
     // recover_control pin tracked cues on the wrong vessel — P04-F4.)
     let focus = focus_override.resolve(&snap.vessels);
+    // C19-F4: reframe on a focus-id change — a kept zoom would frame
+    // the NEW vessel at the OLD one's distance (zoom to 3 m on a
+    // canister, then a fragment or second launch inherits a 3 m
+    // chase). Orientation keeps (the player's orbit drag is session
+    // intent); only the range resets to the default frame.
+    if sfx.prev.map(|p| p.focus) != focus.map(|f| f.id) {
+        input.distance_m = FLIGHT_DEFAULT_DIST;
+    }
     // §3.7 edge detection on the staged snapshot — cue pushes and
     // TTL aging live in `sfx_edges` (kept out of this system under
     // the line budget). The edges baseline on the same resolved
     // focus the camera follows.
-    ui.sfx = sfx_edges(&mut sfx, &snap.vessels, ui.debris_count, focus);
+    ui.sfx = sfx_edges(&mut sfx, ui.debris_count, live.0, &rails.0, focus);
     // The audio backend's focus mirror: voices key off this, not a
     // `vessels.last()` of their own (P07-F1).
     sfx.focus_vessel = focus.map(|f| f.id);
@@ -1886,8 +2059,9 @@ pub(crate) fn flight_present(
 /// actually controls, not whichever staged last (P04-F4).
 fn sfx_edges(
     sfx: &mut FlightSfx,
-    vessels: &[FlightBody],
     debris_count: usize,
+    live_vessels: usize,
+    rails: &[u64],
     focus: Option<&FlightBody>,
 ) -> Vec<String> {
     let cur = focus.map(|f| SfxPrev {
@@ -1895,7 +2069,8 @@ fn sfx_edges(
         throttle_on: f.throttle > 0.0,
         nodes: f.nodes,
         debris: debris_count,
-        vessels: vessels.len(),
+        live: live_vessels,
+        rails: rails.contains(&f.id),
         contact: f.contact,
         latched: f.latched,
     });
@@ -1926,6 +2101,16 @@ fn sfx_edges(
                 } else if !c.latched && p.latched {
                     push("LIFTOFF");
                 }
+                // C19-F2: the bubble↔rails conversion edge — the vessel
+                // is alive and still focused (it keeps staging through
+                // the handoff); the cue is the honest "now on rails"
+                // mark where "VESSEL REMOVED"/"VESSEL LEFT BUBBLE"
+                // used to lie.
+                if c.rails && !p.rails {
+                    push("ON RAILS");
+                } else if !c.rails && p.rails {
+                    push("IN BUBBLE — CONTROL");
+                }
             }
             if c.debris > p.debris {
                 push("BREAKUP");
@@ -1935,7 +2120,7 @@ fn sfx_edges(
                 // (it never latches).
                 push("DEBRIS IMPACT");
             }
-            if c.vessels < p.vessels && c.debris >= p.debris {
+            if c.live < p.live && c.debris >= p.debris {
                 push("VESSEL REMOVED");
             }
         }

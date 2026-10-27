@@ -46,6 +46,7 @@ fn starter_stack_stages_distinct_silhouettes() {
         &view.sim,
         &mut csp_view::flight::LatchedWeldCache::default(),
         &csp_view::art::ArtAssets::default(),
+        &[],
     );
     let vessel = staged.vessels.first().expect("seeded vessel staged");
     assert_eq!(

@@ -128,6 +128,7 @@ fn dry_engine_stages_no_plume() {
         &view.sim,
         &mut flight::LatchedWeldCache::default(),
         &ArtAssets::default(),
+        &[],
     );
     let b = staged
         .vessels
@@ -150,6 +151,7 @@ fn dry_engine_stages_no_plume() {
         &view.sim,
         &mut flight::LatchedWeldCache::default(),
         &ArtAssets::default(),
+        &[],
     );
     let b = staged
         .vessels

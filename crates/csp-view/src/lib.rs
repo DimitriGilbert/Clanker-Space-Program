@@ -1569,6 +1569,14 @@ pub struct View {
     /// so a loaded world's next `ConstructionComplete` cannot write
     /// itself in as a revert point the loaded session never ordered.
     revert_capture: Option<RevertCapture>,
+    /// The resolved focus the view last issued `SetVesselTracked` +
+    /// `SetActiveVessel` commands for (C02-F1/C02-F2). The sim can't
+    /// see a queued-but-undrained command, so `end_frame` diffs the
+    /// resolved focus against THIS mirror — not the sim's
+    /// `active_vessel` — or a paused sim would flood the player FIFO
+    /// with re-issues. `None` after a world-replacing op so the next
+    /// frame restamps the focus fresh.
+    focused_issued: Option<csp_sim::VesselId>,
 }
 
 /// The launch revert point's delivery-boundary recapture (PLAN:1177-1180
@@ -1633,6 +1641,10 @@ fn rebuild_from_snapshot(
     view: &mut View,
     snapshot: WorldSnapshot,
 ) -> Result<Vec<String>, SimError> {
+    // C02-F2: the focus record rides the snapshot — read it before
+    // `restore` consumes the struct, then re-anchor the session on it
+    // below instead of falling to `vessels.last()`'s newest-spawn rule.
+    let restored_focus = snapshot.active_vessel;
     let config = view.sim.config();
     let mut sim = SimWorld::restore(
         csp_sim::orbit::PatchedConics::new(config.orbits.clone()),
@@ -1663,7 +1675,28 @@ fn rebuild_from_snapshot(
     view.world.insert_resource(flight::StagePlans::default());
     view.world.insert_resource(map::MapPlanning::default());
     view.world.insert_resource(ScriptLogMirror::default());
-    view.clear_flight_focus_override();
+    // The restored `active_vessel` becomes the session's focus: the
+    // quiet flight pin (no lease re-arm — the restored record carries
+    // its own leases) re-anchors the camera/HUD — a rails record
+    // stages through the C19-F2 hint — and the map's vessel focus
+    // re-anchors itself in `sync_map` (or drops to the body default
+    // when the vessel carries no conic, e.g. surface-latched).
+    match restored_focus {
+        Some(id) => {
+            view.world
+                .resource_mut::<flight::FlightFocusOverride>()
+                .pin(id);
+            view.world.resource_mut::<map::MapInput>().focus_vessel = Some(id);
+        }
+        None => {
+            view.clear_flight_focus_override();
+            view.world.resource_mut::<map::MapInput>().focus_vessel = None;
+        }
+    }
+    // The issued mirror restarts empty: the restored world's tracked
+    // set may predate the boundary's commands, so the next frame
+    // restamps the focus (track + active) fresh.
+    view.focused_issued = None;
     view.set_mode(ViewMode::Flight);
     Ok(warnings)
 }
@@ -2096,6 +2129,9 @@ impl View {
         // The non-debris vessel count across all residences — the
         // tutorial's alive-or-lost mirror (P12-F2).
         world.insert_resource(flight::LiveVesselCount::default());
+        // The rails-staged id set — the C19-F2 focus handoff's mirror
+        // (same standalone-resource pattern as `LiveVesselCount`).
+        world.insert_resource(flight::RailsStaged::default());
         // The propulsion walk mirror — the HUD's live TWR/Δv/
         // burn-time figures (same standalone-resource pattern as
         // `LiveVesselCount`: `FlightSnapshot` cannot grow).
@@ -2174,6 +2210,7 @@ impl View {
             notice_cursor: None,
             pre_launch: None,
             revert_capture: None,
+            focused_issued: None,
         }
     }
 
@@ -2234,6 +2271,15 @@ impl View {
         let start = self.sim.clock().ticks();
         let report = self.sim.step_frame(target_tick)?;
         self.ticks_last_frame = report.reached_tick - start;
+        // C02-F1/C02-F2's focus boundary rides THIS seam — AFTER the
+        // drain, so the arena reflects every removal this step's
+        // earlier commands committed (a RecoverVessel batch can drop
+        // the focused id mid-step): a stale `ui.focus` naming it
+        // defers rather than firing a Recoverable rejection for a
+        // dead vessel. The enqueued track/active commands drain ahead
+        // of anything enqueued later — a same-batch removal can never
+        // beat them.
+        self.sync_focus_commands();
         // The launch revert point's delivery boundary (PLAN:1177-1180 —
         // the sim contract at `manufacture.rs` expects the post-delivery
         // snapshot): `launch_craft` captured the pre-ORDER world — its
@@ -2404,9 +2450,25 @@ impl View {
         // §2.6.4 latched vessels reuse `LatchedWeldCache` instead of
         // re-welding per frame.
         let staged_flight = {
+            // C19-F2's rails-staging hint — the vessels the camera may
+            // need to follow through a bubble→rails conversion: the
+            // armed focus pin's target and last frame's resolved focus
+            // (`FlightUiData.focus`, still un-run this frame). Only
+            // these can stage off-rails; see `capture_sync_input`.
+            // Read BEFORE the `cache` mutable borrow below.
+            let mut rails_hint: Vec<csp_sim::VesselId> = Vec::with_capacity(2);
+            if let Some(t) = self.world.resource::<flight::FlightFocusOverride>().target {
+                rails_hint.push(t);
+            }
+            if let Some(f) = self.world.resource::<flight::FlightUiData>().focus {
+                let f = csp_sim::VesselId(f);
+                if !rails_hint.contains(&f) {
+                    rails_hint.push(f);
+                }
+            }
             let art = self.world.resource::<art::ArtAssets>().clone();
             let mut cache = self.world.resource_mut::<flight::LatchedWeldCache>();
-            flight::capture_sync_input(&self.sim, &mut cache, &art)
+            flight::capture_sync_input(&self.sim, &mut cache, &art, &rails_hint)
         };
         self.world.insert_resource(staged_flight);
         // The focus pin's sim-side release rule: a pinned vessel gone
@@ -2453,6 +2515,76 @@ impl View {
         }
         self.schedules.ui_build.run(&mut self.world);
         self.schedules.render_extract.run(&mut self.world);
+    }
+
+    /// The vessel the session's focus names — the map's explicit
+    /// vessel focus while the map is up (a click-tracked vessel IS
+    /// the player's "watch this" mark — the ×10⁵-through-an-SOI case
+    /// §2.6.5's Clamping row exists for), else the pin-aware flight
+    /// resolution. Session state, never sim state.
+    fn resolved_focus(&self) -> Option<csp_sim::VesselId> {
+        if self.mode() == ViewMode::Map
+            && let Some(v) = self.world.resource::<map::MapInput>().focus_vessel
+        {
+            return Some(v);
+        }
+        self.flight_focus()
+    }
+
+    /// C02-F1/C02-F2: the view's focus boundary pushes the resolved
+    /// focus into sim state when it changes — untrack the previous
+    /// focus's `SetVesselTracked` (skipped when it already left the
+    /// arena — the removal paths scrub it), track the new one
+    /// (skipped when already tracked — a restored or agent-tracked
+    /// vessel needs no re-issue), and record §2.2's `active_vessel`
+    /// (skipped when the record already matches). Runs from
+    /// [`Self::sim_step`] right after `step_frame` — the drain just
+    /// applied this step's batches, so a resolved focus naming a
+    /// vessel the arena already dropped defers (the corrected focus
+    /// resolves next frame) instead of landing a `Recoverable`
+    /// rejection for a dead id. `focused_issued` is the issue mirror
+    /// — not the sim's fields — because the sim can't see a
+    /// queued-but-undrained command.
+    fn sync_focus_commands(&mut self) {
+        let resolved = self.resolved_focus();
+        if resolved == self.focused_issued {
+            return;
+        }
+        if resolved.is_some_and(|v| !self.sim.vessels().contains_key(&v)) {
+            return;
+        }
+        if let Some(old) = self.focused_issued
+            && self.sim.vessels().contains_key(&old)
+        {
+            self.enqueue_command(
+                SourceClass::Ui,
+                PLAYER_SOURCE_ID,
+                SimCommand::SetVesselTracked {
+                    vessel: old,
+                    tracked: false,
+                },
+            );
+        }
+        if let Some(new) = resolved
+            && !self.sim.tracked_vessels().contains(&new)
+        {
+            self.enqueue_command(
+                SourceClass::Ui,
+                PLAYER_SOURCE_ID,
+                SimCommand::SetVesselTracked {
+                    vessel: new,
+                    tracked: true,
+                },
+            );
+        }
+        if self.sim.active_vessel() != resolved {
+            self.enqueue_command(
+                SourceClass::Ui,
+                PLAYER_SOURCE_ID,
+                SimCommand::SetActiveVessel { vessel: resolved },
+            );
+        }
+        self.focused_issued = resolved;
     }
 
     /// Stage this frame's `egui::RawInput` for the `UiBuild` system —
@@ -6627,6 +6759,241 @@ mod tests {
                 .iter()
                 .any(|c| c.text.contains("BUILD ORDER REFUSED")),
             "the disarm surfaces on the cue channel"
+        );
+    }
+
+    /// C19-F4 regression: the chase camera reframes on a focus-id
+    /// change — a zoom held on one vessel must not carry to the next.
+    #[test]
+    fn camera_reframes_on_focus_change() {
+        let mut view = View::new().expect("data/ load");
+        let (center, r) = {
+            let env = view.sim.environment().expect("physics");
+            (env.body_center, env.radius_m)
+        };
+        // Two parked vessels; the newest (id 1) takes focus.
+        for i in 0..2 {
+            view.enqueue_command(
+                SourceClass::Ui,
+                PLAYER_SOURCE_ID,
+                SimCommand::SpawnPhysicalVessel {
+                    craft: stock_flight_craft(),
+                    pos: center + csp_core::DVec3::new(r + 5.0 + i as f64 * 20.0, 0.0, 0.0),
+                    rot: csp_core::DQuat::IDENTITY,
+                    vel: csp_core::DVec3::ZERO,
+                    ang_vel: csp_core::DVec3::ZERO,
+                },
+            );
+        }
+        view.begin_frame();
+        view.sim_step(1).expect("step");
+        view.end_frame();
+        let focus = view.flight_focus().expect("a vessel is focused");
+        // Zoom in, then remove the focused vessel — focus moves.
+        view.flight_event(flight::FlightEvent::Zoom { factor: 0.05 });
+        view.begin_frame();
+        view.end_frame();
+        assert!(
+            view.world.resource::<flight::FlightInput>().distance_m < 30.0,
+            "the zoom applied"
+        );
+        view.enqueue_command(
+            SourceClass::Ui,
+            PLAYER_SOURCE_ID,
+            SimCommand::TerminateVessel { vessel: focus },
+        );
+        view.begin_frame();
+        view.sim_step(view.sim.clock().ticks() + 1).expect("step");
+        view.end_frame();
+        assert_ne!(view.flight_focus(), Some(focus));
+        assert_eq!(
+            view.world.resource::<flight::FlightInput>().distance_m,
+            60.0,
+            "a focus-id change must reframe to the default distance"
+        );
+    }
+
+    /// C19-F2 regression: the focused vessel's bubble→rails
+    /// conversion keeps the camera/HUD on it — the vessel stages
+    /// through the handoff hint, the cue reads "ON RAILS" (never
+    /// "VESSEL REMOVED"), and the focus boundary tracks + records it
+    /// (C02-F1/C02-F2: `tracked_vessels` + `active_vessel`).
+    #[allow(clippy::too_many_lines)] // one end-to-end regression: spawn → powered hold → coast → rails → cue → save→load
+    #[test]
+    fn auto_rails_keeps_focus_and_marks_the_cue() {
+        let mut view = View::new().expect("data/ load");
+        let (center, r, mu, atm_top) = {
+            let env = view.sim.environment().expect("physics");
+            (
+                env.body_center,
+                env.radius_m,
+                env.mu_m3_per_s2,
+                env.atmosphere.as_ref().map_or(0.0, |a| a.top_m),
+            )
+        };
+        // A clearing circular orbit above the atmosphere top — the
+        // auto-rails predicate (coasting, conic clears surface + atm)
+        // converts it the first tick it coasts. Throttle up first so
+        // the vessel spends real frames InBubble and focused — the
+        // conversion mid-flight is the handoff under test, not an
+        // instant spawn→rails.
+        let alt = atm_top.max(200_000.0) + 50_000.0;
+        let orb_r = r + alt;
+        let speed = (mu / orb_r).sqrt();
+        view.enqueue_command(
+            SourceClass::Ui,
+            PLAYER_SOURCE_ID,
+            SimCommand::SpawnPhysicalVessel {
+                craft: stock_flight_craft(),
+                pos: center + csp_core::DVec3::new(orb_r, 0.0, 0.0),
+                rot: csp_core::DQuat::IDENTITY,
+                vel: csp_core::DVec3::new(0.0, speed, 0.0),
+                ang_vel: csp_core::DVec3::ZERO,
+            },
+        );
+        view.enqueue_command(
+            SourceClass::Ui,
+            PLAYER_SOURCE_ID,
+            SimCommand::SetThrottle {
+                vessel: csp_sim::VesselId(0),
+                throttle: 1.0,
+            },
+        );
+        for _ in 0..4 {
+            view.begin_frame();
+            view.sim_step(view.sim.clock().ticks() + 1).expect("step");
+            view.end_frame();
+        }
+        let id = view
+            .flight_focus()
+            .expect("powered vessel staged + focused");
+        // Cut to coast: the clearing conic converts next tick.
+        view.enqueue_command(
+            SourceClass::Ui,
+            PLAYER_SOURCE_ID,
+            SimCommand::SetThrottle {
+                vessel: id,
+                throttle: 0.0,
+            },
+        );
+        let mut on_rails_at = None;
+        for i in 0..20 {
+            view.begin_frame();
+            view.sim_step(view.sim.clock().ticks() + 1).expect("step");
+            view.end_frame();
+            if matches!(
+                view.sim.vessels().values().next().map(|v| &v.state),
+                Some(csp_sim::VesselState::OnRails(_))
+            ) {
+                on_rails_at = Some(i);
+                break;
+            }
+        }
+        assert!(on_rails_at.is_some(), "the vessel converted to rails");
+        // Focus held through the conversion — the vessel still stages
+        // (as rails), the camera stays valid, the HUD tracks it.
+        assert_eq!(
+            view.flight_focus(),
+            Some(id),
+            "focus must follow the railed vessel"
+        );
+        assert!(
+            view.world
+                .resource::<flight::RailsStaged>()
+                .0
+                .contains(&id.0),
+            "the staged focus is marked rails-resident"
+        );
+        let cues: Vec<String> = view
+            .world
+            .resource::<flight::FlightSfx>()
+            .cues
+            .iter()
+            .map(|c| c.text.clone())
+            .collect();
+        assert!(
+            cues.iter().any(|c| c == "ON RAILS"),
+            "the conversion cue fired: {cues:?}"
+        );
+        assert!(
+            !cues.iter().any(|c| c == "VESSEL REMOVED"),
+            "a live railed vessel must not read as removed: {cues:?}"
+        );
+        // C02-F1/C02-F2: the focus boundary landed the sim-side records.
+        view.begin_frame();
+        view.sim_step(view.sim.clock().ticks() + 1).expect("step");
+        view.end_frame();
+        assert!(
+            view.sim.tracked_vessels().contains(&id),
+            "focused ⇒ tracked"
+        );
+        assert_eq!(
+            view.sim.active_vessel(),
+            Some(id),
+            "focused ⇒ active_vessel"
+        );
+        // And the record survives a save→load — the camera re-anchors
+        // on it instead of the newest-spawn fallback.
+        let snap = view.sim.snapshot().expect("serializable");
+        view.load_game(snap).expect("load");
+        view.begin_frame();
+        view.sim_step(view.sim.clock().ticks() + 1).expect("step");
+        view.end_frame();
+        assert_eq!(
+            view.flight_focus(),
+            Some(id),
+            "the restored active_vessel re-anchors the flight focus"
+        );
+        assert_eq!(view.sim.active_vessel(), Some(id));
+    }
+
+    /// C19-F2 cue fix, other half: a vessel that actually LEAVES the
+    /// arena still reports "VESSEL REMOVED" — the live-count edge is
+    /// honest in both directions.
+    #[test]
+    fn removal_still_fires_vessel_removed() {
+        let mut view = View::new().expect("data/ load");
+        let (center, r) = {
+            let env = view.sim.environment().expect("physics");
+            (env.body_center, env.radius_m)
+        };
+        for i in 0..2 {
+            view.enqueue_command(
+                SourceClass::Ui,
+                PLAYER_SOURCE_ID,
+                SimCommand::SpawnPhysicalVessel {
+                    craft: stock_flight_craft(),
+                    pos: center + csp_core::DVec3::new(r + 5.0 + i as f64 * 20.0, 0.0, 0.0),
+                    rot: csp_core::DQuat::IDENTITY,
+                    vel: csp_core::DVec3::ZERO,
+                    ang_vel: csp_core::DVec3::ZERO,
+                },
+            );
+        }
+        view.begin_frame();
+        view.sim_step(1).expect("step");
+        view.end_frame();
+        // Remove the NON-focused vessel (the older id): a live-count
+        // drop with unchanged debris — the "VESSEL REMOVED" edge.
+        let gone = *view.sim.vessels().keys().next().expect("older vessel");
+        view.enqueue_command(
+            SourceClass::Ui,
+            PLAYER_SOURCE_ID,
+            SimCommand::TerminateVessel { vessel: gone },
+        );
+        view.begin_frame();
+        view.sim_step(view.sim.clock().ticks() + 1).expect("step");
+        view.end_frame();
+        let cues: Vec<String> = view
+            .world
+            .resource::<flight::FlightSfx>()
+            .cues
+            .iter()
+            .map(|c| c.text.clone())
+            .collect();
+        assert!(
+            cues.iter().any(|c| c == "VESSEL REMOVED"),
+            "a real removal still cues: {cues:?}"
         );
     }
 }

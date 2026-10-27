@@ -2406,6 +2406,31 @@ pub(crate) fn body_system_pos(
     Ok(body_system_pos(model, parent, t)? + r)
 }
 
+/// The velocity counterpart of [`body_system_pos`]: each link's
+/// parent-centered `state_at` velocity composes the same way the
+/// position does — the chain frames are inertial (translations
+/// differ, never rotations). `pub(crate)` for the flight view's
+/// rails-staged focus vessel (C19-F2): its `FlightBody::vel` is
+/// dominant-frame inertial, so a non-dominant parent's conic velocity
+/// needs the parent's system-frame velocity folded in.
+pub(crate) fn body_system_vel(
+    model: &PatchedConics,
+    id: &BodyId,
+    t: SimTime,
+) -> Result<DVec3, csp_core::SimError> {
+    let body = model.body_orbit(id)?;
+    let (Some(parent), Some(elements)) = (&body.parent, &body.elements) else {
+        return Ok(DVec3::ZERO); // the star is the frame's rest origin
+    };
+    let state = OrbitState {
+        parent: parent.clone(),
+        elements: elements.clone(),
+        epoch: SimTime::ZERO,
+    };
+    let (_r, v) = model.state_at(&state, t)?;
+    Ok(body_system_vel(model, parent, t)? + v)
+}
+
 /// Sample an orbit into a parent-centered polyline (§2.8 `state_at`).
 ///
 /// Closed orbits (`e < 1 − E_PARABOLIC_TOL`, the sim's elliptic band):

@@ -561,8 +561,10 @@ pub enum SimCommand {
     /// vessel's events `Silent → Clamping` — including its already-
     /// queued `SoiTransition` — or demote back on `false`. Unknown ids
     /// are a command error (Recoverable), never a silent no-op.
-    // ui-unreachable: an MCP/agent tracking verb — the player's
-    // focus+tracking is view-side session state, not a sim command.
+    /// Issued by csp-view's focus boundary (`View::sync_focus_commands`
+    /// — the resolved focus is the player-reachable half of §2.6.5's
+    /// "focused/tracked" row); still an MCP/agent verb via
+    /// `sim.command`.
     SetVesselTracked {
         /// The vessel to (un)track.
         vessel: VesselId,
@@ -1211,6 +1213,20 @@ pub enum SimCommand {
         /// The graph node carrying the decelerator.
         node: csp_phys::PartNodeId,
     },
+    /// §2.2's `active_vessel` — the player's focused vessel recorded as
+    /// sim state so a save→load restores the camera/HUD target instead
+    /// of falling back to the newest spawn (C02-F2; §7.2's serialized
+    /// set names it). **Not** a control gate: per-vessel [`Lease`]s
+    /// carry control authority (§2.2.1) — this is only the "which
+    /// vessel was the player flying" record, changed exclusively by
+    /// command so the §7.6 log reproduces it. `Some` of an unknown id
+    /// rejects `Recoverable` (the `SetVesselTracked` convention —
+    /// never a silent no-op); `None` clears the record. Issued by
+    /// csp-view's focus boundary alongside `SetVesselTracked`.
+    SetActiveVessel {
+        /// The focused vessel, or `None` for "no focus".
+        vessel: Option<VesselId>,
+    },
 }
 
 impl SimCommand {
@@ -1228,9 +1244,10 @@ impl SimCommand {
     /// `TransferCrew`, `BoardCrew`, the colony transfers) are
     /// deliberately ungated: they move cargo, they do not steer the
     /// craft — and the vessel-less world commands (`SetWarp`,
-    /// `SetAlarm`, `SetLifeSupportEnabled`, science, economy) have no
-    /// vessel to gate on; session-class actions keep their own
-    /// channels.
+    /// `SetAlarm`, `SetActiveVessel`, `SetLifeSupportEnabled`,
+    /// science, economy) have no vessel to gate on or — for
+    /// `SetActiveVessel` — record the session's focus rather than
+    /// steer a craft; session-class actions keep their own channels.
     ///
     /// `UnloadScript`/`SetScriptEnabled` are also control-affecting —
     /// unloading a lease-holding script vacates its lease, disabling
@@ -1392,6 +1409,12 @@ pub struct WorldSnapshot {
     pub clock_ticks: u64,
     /// The stored warp ladder rung.
     pub warp_level: u32,
+    /// §2.2's `active_vessel` — the player's focused vessel (the
+    /// `World` field's doc carries the full rule). `#[serde(default)]`
+    /// keeps pre-field saves decodable — `None` is the inert value
+    /// (the `WorldConfig.parts` precedent).
+    #[serde(default)]
+    pub active_vessel: Option<VesselId>,
     /// Per-source dequeue counters — restoring them is what lets a resumed
     /// world keep stamping the recorded `source_seq`s.
     pub source_seqs: BTreeMap<(SourceClass, u32), u64>,
@@ -1751,6 +1774,11 @@ struct TickShadow {
     next_part_instance_id: Option<u64>,
     /// `tracked_vessels` — captured before the first opt-in mutation.
     tracked_vessels: Option<BTreeSet<VesselId>>,
+    /// `active_vessel` — captured before the first focus-record write
+    /// (`SetActiveVessel`, the vessel-removal scrubs). `Some(None)`
+    /// means "captured, and it was already unset" — the outer Option
+    /// is the capture flag, the inner the pre-write value.
+    active_vessel: Option<Option<VesselId>>,
     /// `event_heap` — captured before the first heap write. `Ops` is
     /// the lazy default (`shadow_events`): an alloc-free delta that
     /// undoes pushes via the `next_event_seq` watermark and removals
@@ -1838,6 +1866,7 @@ impl TickShadow {
             joints: None,
             joint_refused: None,
             tracked_vessels: None,
+            active_vessel: None,
             event_heap: None,
             next_event_seq: None,
             transfers: None,
@@ -1916,6 +1945,9 @@ impl TickShadow {
         }
         if self.tracked_vessels.is_none() {
             self.tracked_vessels = committed.tracked_vessels;
+        }
+        if self.active_vessel.is_none() {
+            self.active_vessel = committed.active_vessel;
         }
         // `event_heap` merge — the `vessels` precedent: earliest wins,
         // with the mode combinations reconciled:
@@ -2086,6 +2118,9 @@ impl TickShadow {
         if let Some(v) = self.tracked_vessels {
             world.tracked_vessels = v;
         }
+        if let Some(v) = self.active_vessel {
+            world.active_vessel = v;
+        }
         if let Some(v) = self.event_heap {
             match v {
                 EventsShadow::Whole(heap) => world.event_heap = heap,
@@ -2186,6 +2221,15 @@ pub struct World {
     /// Stored warp ladder rung. In the hash, never interpreted: the
     /// multiplier ladder is `csp-app`'s warp controller's business.
     warp_level: u32,
+    /// §2.2's `active_vessel` — the player's focused vessel, recorded
+    /// as sim state (§7.2's serialized set names it) so a save→load
+    /// restores the view's focus instead of falling to the newest
+    /// spawn. Set only by [`SimCommand::SetActiveVessel`]; scrubbed
+    /// when the named vessel leaves the arena. **Not** the control
+    /// gate — per-vessel [`Lease`]s carry control authority
+    /// (§2.2.1); this is the focus record, hashed like `warp_level`
+    /// (a lost record silently changes what the restore serves).
+    active_vessel: Option<VesselId>,
     /// Enqueued but undrained commands: per-source FIFOs under
     /// `(source_class, source_id)` keys. The map's key order IS the
     /// §2.2.1 same-tick drain order, each `VecDeque` preserves one
@@ -2496,6 +2540,7 @@ impl World {
         Self {
             clock: SimTime::ZERO,
             warp_level: 1,
+            active_vessel: None,
             pending: BTreeMap::new(),
             command_log: Vec::new(),
             source_seqs: BTreeMap::new(),
@@ -2882,7 +2927,9 @@ impl World {
     /// - `vessel.id == key` per arena entry and `next_vessel_id` exceeds
     ///   every live id (monotonic, never reused);
     /// - `tracked_vessels ⊆ vessels` and `autopilots ⊆ vessels` (a bound
-    ///   autopilot must not outlive its vessel);
+    ///   autopilot must not outlive its vessel) — and `active_vessel`
+    ///   names a live vessel or is `None` (the same rule for the
+    ///   §2.2 focus record);
     /// - `script_op_budget ≥ 1` (the `event_budget` rule — the setter's
     ///   clamp is not repeated here);
     /// - every `joint_refused` pair is canonical `(a < b)` with both
@@ -2983,6 +3030,13 @@ impl World {
             if !snapshot.vessels.contains_key(id) {
                 return Err(SimError::Fatal("snapshot: tracked vessel not in arena"));
             }
+        }
+        // Same membership rule for the focus record: a dangling
+        // `active_vessel` would restore the camera onto a dead id.
+        if let Some(active) = snapshot.active_vessel
+            && !snapshot.vessels.contains_key(&active)
+        {
+            return Err(SimError::Fatal("snapshot: active vessel not in arena"));
         }
         let mut seen = std::collections::BTreeSet::new();
         // Vessels a pending `ManeuverNodeStart` names, with the event's
@@ -3409,6 +3463,7 @@ impl World {
         Ok(Self {
             clock: SimTime::from_ticks(snapshot.clock_ticks),
             warp_level: snapshot.warp_level,
+            active_vessel: snapshot.active_vessel,
             pending: BTreeMap::new(),
             command_log: Vec::new(),
             source_seqs: snapshot.source_seqs,
@@ -3561,6 +3616,7 @@ impl World {
         Ok(WorldSnapshot {
             clock_ticks: self.clock.ticks(),
             warp_level: self.warp_level,
+            active_vessel: self.active_vessel,
             source_seqs: self.source_seqs.clone(),
             event_budget: self.event_budget,
             next_vessel_id: self.next_vessel_id,
@@ -3609,6 +3665,14 @@ impl World {
     /// The stored warp ladder rung (§2.6.3). Sim state, in the hash.
     pub fn warp_level(&self) -> u32 {
         self.warp_level
+    }
+
+    /// §2.2's `active_vessel` — the focus record `SetActiveVessel`
+    /// maintains (see the field's doc: sim state, hashed +
+    /// serialized, **not** the control gate — `Lease`s carry that).
+    /// Observation only; mutation stays `enqueue` + `step_frame`.
+    pub fn active_vessel(&self) -> Option<VesselId> {
+        self.active_vessel
     }
 
     /// Every applied command in `CommandKey` order — the §7.6 log.
@@ -3685,6 +3749,14 @@ impl World {
     /// `enqueue` + `step_frame`.
     pub fn vessels(&self) -> &BTreeMap<VesselId, Vessel> {
         &self.vessels
+    }
+
+    /// §2.6.5's tracked-vessel set — the Silent→Clamping opt-in
+    /// (`SetVesselTracked`). Observation only (the `vessels()`
+    /// precedent): membership decides event classes at schedule and
+    /// restamp time, never here.
+    pub fn tracked_vessels(&self) -> &BTreeSet<VesselId> {
+        &self.tracked_vessels
     }
 
     /// §2.6.2's rails-warp refusal predicate — checked every frame by
@@ -3797,6 +3869,13 @@ impl World {
     fn shadow_tracked(&mut self, shadow: &mut TickShadow) {
         if shadow.tracked_vessels.is_none() {
             shadow.tracked_vessels = Some(self.tracked_vessels.clone());
+        }
+    }
+
+    /// Lazy-shadow capture for the `active_vessel` focus record.
+    fn shadow_active_vessel(&mut self, shadow: &mut TickShadow) {
+        if shadow.active_vessel.is_none() {
+            shadow.active_vessel = Some(self.active_vessel);
         }
     }
 
@@ -4755,6 +4834,22 @@ impl World {
                 degraded,
                 shadow,
             )?;
+            // `apply_latch` absorbs the secondary's arena entry (its
+            // `tracked_vessels` re-keys sec→prim inside the merge).
+            // `active_vessel` sits outside `latch_pass`'s borrow
+            // split, so its scrub lands here: clearing an absorbed
+            // focus id keeps the restore gate's membership rule, and
+            // the view's focus boundary re-issues the record next
+            // frame against whatever the merge left.
+            if self
+                .active_vessel
+                .is_some_and(|a| !vessels.contains_key(&a))
+            {
+                if shadow.active_vessel.is_none() {
+                    shadow.active_vessel = Some(self.active_vessel);
+                }
+                self.active_vessel = None;
+            }
             // M6-B §2.4: the joint lifecycle runs last in the tick,
             // after every consequence above — dissolution sees this
             // tick's departures (latch, impact, breakup, eviction) and
@@ -4845,9 +4940,15 @@ impl World {
         if !dead_vessels.is_empty() {
             self.shadow_tracked(shadow);
             self.shadow_autopilots(shadow);
+            // The focus record scrubs here too — the `remove_vessel`
+            // rule, same restore-gate invariant.
+            self.shadow_active_vessel(shadow);
         }
         for vid in dead_vessels {
             self.tracked_vessels.remove(&vid);
+            if self.active_vessel == Some(vid) {
+                self.active_vessel = None;
+            }
             // Same invariant as `remove_vessel`: a bound autopilot
             // dies with its vessel; global `scripts` records survive.
             self.autopilots.remove(&vid);
@@ -5027,6 +5128,13 @@ impl World {
             economy::lose_aboard_crew(&mut self.economy, vessel, &v.crew);
         }
         self.tracked_vessels.remove(&vessel);
+        // The focus record dies with its vessel too — a dangling
+        // `active_vessel` would fail the restore gate's membership
+        // check on the next save's load.
+        self.shadow_active_vessel(shadow);
+        if self.active_vessel == Some(vessel) {
+            self.active_vessel = None;
+        }
         // A bound autopilot must not outlive its vessel — it would
         // run a full control pass against a vessel that no longer
         // exists. `scripts` records survive by design (a script is
@@ -5287,6 +5395,15 @@ impl World {
             SimCommand::Unlatch { vessel } => self.apply_unlatch(*vessel, shadow)?,
             SimCommand::ToRails { vessel } => self.apply_to_rails(*vessel, shadow)?,
             SimCommand::ToBubble { vessel } => self.apply_to_bubble(*vessel, shadow)?,
+            SimCommand::SetActiveVessel { vessel } => {
+                if let Some(v) = vessel
+                    && !self.vessels.contains_key(v)
+                {
+                    return Err(SimError::Recoverable("active vessel: unknown vessel"));
+                }
+                self.shadow_active_vessel(shadow);
+                self.active_vessel = *vessel;
+            }
             SimCommand::SetVesselTracked { vessel, tracked } => {
                 if !self.vessels.contains_key(vessel) {
                     return Err(SimError::Recoverable("track: unknown vessel"));
@@ -8878,6 +8995,12 @@ impl World {
         let mut h = StateHasher::new();
         h.u64(self.clock.ticks());
         h.u32(self.warp_level);
+        // §2.2's `active_vessel` — the focus record is hashed like
+        // `warp_level` (§7.2 names it in the serialized set; a lost
+        // restore would otherwise pass the hash silently).
+        h.opt(&self.active_vessel, |h, id| {
+            h.u64(id.0);
+        });
         h.btree_map(
             &self.source_seqs,
             |h, &(class, id)| {
@@ -12321,6 +12444,7 @@ mod tests {
                 autopilots: BTreeMap::new(),
                 clock_ticks: 5,
                 warp_level: 3,
+                active_vessel: None,
                 source_seqs: seqs.clone(),
                 event_budget: DEFAULT_MAX_EVENTS_PER_FRAME,
                 next_vessel_id: 0,
@@ -13178,6 +13302,154 @@ mod tests {
         let r = w.step_frame(4).unwrap();
         assert_eq!(r.rejected.len(), 1);
         assert!(matches!(r.rejected[0].error, SimError::Recoverable(_)));
+    }
+
+    /// C02-F1 institutionalized: the focused-vessel half of §2.6.5's
+    /// Clamping row. A vessel tracked through the focus boundary fires
+    /// its `SoiTransition` as `Clamping` — the class `csp-app`'s warp
+    /// controller demotes on — while the identical untracked run fires
+    /// it `Silent`.
+    #[test]
+    fn tracked_vessel_soi_transition_fires_clamping() {
+        let is_focused_soi = |e: &ScheduledEvent| {
+            e.class == EventClass::Clamping
+                && matches!(
+                    e.kind,
+                    EventKind::SoiTransition { vessel, .. } if vessel == VesselId(0)
+                )
+        };
+        // Untracked baseline: the same crossing fires Silent.
+        let mut w = World::with_system(test_system_crossing());
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SpawnVessel {
+                parent: BodyId::from("p"),
+                elements: crossing_vessel_elements(),
+            },
+        );
+        w.step_frame(1).unwrap();
+        // Drive until the crossing actually fires — intervening
+        // `SoiRescan`s re-publish the transition, so the heap's first
+        // entry is not authoritative for its final tick.
+        let mut fired: Vec<ScheduledEvent> = Vec::new();
+        while w.clock().ticks() < 300_000 * 64
+            && !fired
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::SoiTransition { .. }))
+        {
+            let rep = w.step_frame(w.clock().ticks() + 8192).unwrap();
+            fired.extend(rep.fired_events);
+        }
+        assert!(
+            fired
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::SoiTransition { vessel, .. } if vessel == VesselId(0))
+                    && e.class == EventClass::Silent),
+            "untracked crossing must fire Silent"
+        );
+        assert!(!fired.iter().any(&is_focused_soi));
+        // The tracked run: same spawn, the opt-in lands before the
+        // crossing — the fired event carries Clamping.
+        let mut w = World::with_system(test_system_crossing());
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SpawnVessel {
+                parent: BodyId::from("p"),
+                elements: crossing_vessel_elements(),
+            },
+        );
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SetVesselTracked {
+                vessel: VesselId(0),
+                tracked: true,
+            },
+        );
+        w.step_frame(2).unwrap();
+        let mut fired: Vec<ScheduledEvent> = Vec::new();
+        while w.clock().ticks() < 300_000 * 64
+            && !fired
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::SoiTransition { .. }))
+        {
+            let rep = w.step_frame(w.clock().ticks() + 8192).unwrap();
+            fired.extend(rep.fired_events);
+        }
+        assert!(
+            fired.iter().any(&is_focused_soi),
+            "tracked vessel's SOI transition must fire Clamping"
+        );
+    }
+
+    /// C02-F2: §2.2's `active_vessel` is sim state — set only by
+    /// command, serialized + restored, scrubbed on removal, and the
+    /// restore gate refuses a dangling id.
+    #[test]
+    fn active_vessel_roundtrips_and_scrubs() {
+        let mut w = World::with_system(test_system());
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SpawnVessel {
+                parent: BodyId::from("p"),
+                elements: leo_elements(),
+            },
+        );
+        w.step_frame(1).unwrap();
+        assert_eq!(w.active_vessel(), None);
+        // An unknown id rejects Recoverable — never a silent write.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SetActiveVessel {
+                vessel: Some(VesselId(9)),
+            },
+        );
+        let rep = w.step_frame(2).unwrap();
+        assert_eq!(rep.rejected.len(), 1);
+        assert_eq!(w.active_vessel(), None);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SetActiveVessel {
+                vessel: Some(VesselId(0)),
+            },
+        );
+        w.step_frame(3).unwrap();
+        assert_eq!(w.active_vessel(), Some(VesselId(0)));
+        // The §7.2 round-trip: snapshot → restore preserves it, and a
+        // snapshot naming a dead id refuses the load.
+        let snap = w.snapshot().unwrap();
+        assert_eq!(snap.active_vessel, Some(VesselId(0)));
+        let mut bad = snap.clone();
+        bad.active_vessel = Some(VesselId(9));
+        assert!(matches!(
+            World::restore(test_system(), None, bad),
+            Err(SimError::Fatal(_))
+        ));
+        let mut w2 = World::restore(test_system(), None, snap).unwrap();
+        assert_eq!(w2.active_vessel(), Some(VesselId(0)));
+        // Removal scrubs the record — TerminateVessel → remove_vessel.
+        w2.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::TerminateVessel {
+                vessel: VesselId(0),
+            },
+        );
+        w2.step_frame(w2.clock().ticks() + 1).unwrap();
+        assert_eq!(w2.active_vessel(), None);
+        // `None` is a legal write — a save with no focus stays so.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SetActiveVessel { vessel: None },
+        );
+        w.step_frame(4).unwrap();
+        assert_eq!(w.active_vessel(), None);
     }
 
     /// The §7.2 serialized set covers the new state: snapshot mid-run,
@@ -17004,6 +17276,7 @@ mod tests {
             joints: None,
             joint_refused: None,
             tracked_vessels: None,
+            active_vessel: None,
             event_heap: None,
             next_event_seq: None,
             transfers: None,
@@ -19226,6 +19499,7 @@ mod tests {
             joints: None,
             joint_refused: None,
             tracked_vessels: None,
+            active_vessel: None,
             event_heap: None,
             next_event_seq: None,
             transfers: None,
