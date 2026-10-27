@@ -241,6 +241,15 @@ const MAT_PAINT: [f32; 3] = mat(0.22, 26.0);
 static TANK_PROFILE: &[(f64, f64)] =
     &[(-0.6, 2.3), (0.0, 2.5), (5.6, 2.5), (6.6, 1.9), (7.3, 0.02)];
 
+/// The §3.4 test stand's site anchor (east, north metres) — the
+/// FACILITIES panel's "test stand @ {site}" row needs a rendered
+/// counterpart at the launch site (C20-F3). Northeast of the pad:
+/// the gantry complex ends at x ≈ 20 and the propellant farm /
+/// support sheds hold the south strip, so this quadrant is clear.
+/// Named for the layout test, which keys on the constant rather
+/// than re-deriving the coordinates.
+pub(crate) const TEST_STAND_AT: (f64, f64) = (30.0, 14.0);
+
 /// The whole space-center layout, site-local ENU metres. The pad sits
 /// ON the origin — the craft spawns at the site itself, resting at
 /// terrain level in the flame-trench slot between the two mount
@@ -497,6 +506,86 @@ static SPACE_CENTER: &[Piece] = &[
             Prim::Lathe {
                 axis: [0.0, 0.0],
                 profile: TANK_PROFILE,
+            },
+        ],
+    },
+    // ---- Test stand northeast — the §3.4 bench the FACILITIES
+    // panel's `RunBenchTest` buttons claim (C20-F3): a concrete
+    // apron, the firing pedestal split around its flame channel,
+    // the scorch plate under it, and the steel hold-down frame the
+    // bench article clamps into. ----
+    Piece {
+        at: TEST_STAND_AT,
+        foot_m: (7.0, 6.0),
+        shadow: true,
+        color: APRON,
+        mat: MAT_CONCRETE,
+        prims: &[Prim::Bbox {
+            lo: DVec3::new(-6.5, -5.5, -0.45),
+            hi: DVec3::new(6.5, 5.5, 0.12),
+        }],
+    },
+    Piece {
+        at: TEST_STAND_AT,
+        foot_m: (2.5, 2.5),
+        shadow: false,
+        color: MOUNT,
+        mat: MAT_CONCRETE,
+        prims: &[
+            // Firing pedestal halves — the bench article hangs
+            // nozzle-down over the channel between them.
+            Prim::Bbox {
+                lo: DVec3::new(-2.2, -2.2, -0.1),
+                hi: DVec3::new(-0.45, 2.2, 1.7),
+            },
+            Prim::Bbox {
+                lo: DVec3::new(0.45, -2.2, -0.1),
+                hi: DVec3::new(2.2, 2.2, 1.7),
+            },
+        ],
+    },
+    Piece {
+        at: TEST_STAND_AT,
+        foot_m: (1.0, 2.5),
+        shadow: false,
+        color: SCORCH,
+        mat: MAT_CONCRETE,
+        prims: &[Prim::Bbox {
+            // The flame channel's scorched floor between the
+            // pedestal halves.
+            lo: DVec3::new(-0.45, -2.2, -0.1),
+            hi: DVec3::new(0.45, 2.2, 0.25),
+        }],
+    },
+    Piece {
+        at: TEST_STAND_AT,
+        foot_m: (2.6, 2.6),
+        shadow: false,
+        color: STEEL,
+        mat: MAT_STEEL,
+        prims: &[
+            // Hold-down frame: four corner posts rising out of the
+            // pedestal, capped by the crown ring the article mounts
+            // under.
+            Prim::Bbox {
+                lo: DVec3::new(-2.0, -2.0, 0.0),
+                hi: DVec3::new(-1.55, -1.55, 6.4),
+            },
+            Prim::Bbox {
+                lo: DVec3::new(1.55, -2.0, 0.0),
+                hi: DVec3::new(2.0, -1.55, 6.4),
+            },
+            Prim::Bbox {
+                lo: DVec3::new(-2.0, 1.55, 0.0),
+                hi: DVec3::new(-1.55, 2.0, 6.4),
+            },
+            Prim::Bbox {
+                lo: DVec3::new(1.55, 1.55, 0.0),
+                hi: DVec3::new(2.0, 2.0, 6.4),
+            },
+            Prim::Bbox {
+                lo: DVec3::new(-2.15, -2.15, 6.4),
+                hi: DVec3::new(2.15, 2.15, 7.0),
             },
         ],
     },
@@ -864,4 +953,47 @@ pub(crate) fn site_world_pos(env: &FlightEnv, site: &SiteEntry, body_pos: DVec3)
         dir_fixed
     };
     body_pos + rel
+}
+
+#[cfg(test)]
+// Tests signal failure by panicking (§2.13 covers shipping paths).
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// C20-F3: the FACILITIES panel's "test stand @ {site}" row has a
+    /// rendered counterpart at the launch site — the layout must
+    /// still carry a recognizable firing stand at `TEST_STAND_AT`:
+    /// several pieces (apron + pedestal + scorch + frame) and at
+    /// least one prim reaching stand height. A silent deletion of
+    /// the pieces fails here, not in a screenshot.
+    #[test]
+    fn the_test_stand_is_rendered_at_the_launch_site() {
+        let stand: Vec<&Piece> = SPACE_CENTER
+            .iter()
+            .filter(|p| p.at == TEST_STAND_AT)
+            .collect();
+        assert!(
+            stand.len() >= 3,
+            "the stand needs its apron, pedestal, and frame pieces (got {})",
+            stand.len()
+        );
+        let tallest = stand
+            .iter()
+            .flat_map(|p| p.prims.iter())
+            .fold(0.0_f64, |m, prim| {
+                m.max(match prim {
+                    Prim::Bbox { hi, .. } => hi.z,
+                    Prim::Lathe { profile, .. } => profile.iter().fold(0.0_f64, |z, s| z.max(s.0)),
+                })
+            });
+        assert!(
+            tallest >= 5.0,
+            "the hold-down frame must reach ≥5 m to read as a stand (got {tallest})"
+        );
+        // The stand anchors clear of the pad apron (the origin block
+        // spans ±15 m east / ±13 m north) — no piece may intrude on
+        // the spawn volume.
+        assert!(TEST_STAND_AT.0 - 7.0 > 15.0, "stand apron overlaps the pad");
+    }
 }

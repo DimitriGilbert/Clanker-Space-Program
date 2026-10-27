@@ -164,7 +164,7 @@ mod tests {
             contact: false,
             plasma_w_m2: 0.0,
             nodes: 3,
-            parts: Vec::new(),
+            parts: std::sync::Arc::new(Vec::new()),
             plumes: Vec::new(),
             com: rel,
             latched: false,

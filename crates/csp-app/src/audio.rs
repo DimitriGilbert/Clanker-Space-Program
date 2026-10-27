@@ -518,10 +518,13 @@ impl AudioBackend {
     /// queue is fresh, the snapshot is staged): check liveness, drain
     /// new cues into one-shots, then re-derive the continuous voices'
     /// gains. All inputs are read-only presentation resources.
+    /// `snap: None` = "no live scene" — the caller passes it while the
+    /// sim is halted (C25-F4) so both continuous voices decay to
+    /// silence instead of holding the last throttled frame forever.
     pub(crate) fn update(
         &mut self,
         sfx: &FlightSfx,
-        snap: &FlightSnapshot,
+        snap: Option<&FlightSnapshot>,
         settings: &AudioSettings,
     ) {
         if self.alive {
@@ -545,40 +548,7 @@ impl AudioBackend {
             self.play(cue_shot(&text));
         }
 
-        // Continuous voices: amplitude follows the focused vessel —
-        // the SAME pin-aware resolution `flight_present` applies to
-        // the chase camera, HUD, and cue edges (a `recover_control`
-        // pin must not leave the voices on the newest spawn while the
-        // player flies the recovered vessel — P07-F1).
-        let focus = sfx
-            .focus_vessel
-            .and_then(|id| snap.vessels.iter().find(|v| v.id == id));
-        // P13-F4: a NaN throttle/flux frame must not poison the
-        // smoother — `NaN.clamp` passes NaN through, and a NaN level
-        // would pin the gain at 0 forever (NaN > LEVEL_EPS is false).
-        // Non-finite input reads as silence for that frame.
-        let engine_target = focus.map_or(0.0, |v| {
-            if v.throttle.is_finite() {
-                v.throttle.clamp(0.0, 1.0) as f32
-            } else {
-                0.0
-            }
-        });
-        let plasma_target = focus.map_or(0.0, |v| {
-            if v.plasma_w_m2.is_finite() {
-                // The gate's speed is the same surface-relative
-                // `v_rel` the sheath solves (`flow_sample`'s
-                // convention) — `vel` alone under the view's own
-                // no-environment fallback.
-                let v_rel = snap
-                    .env
-                    .as_ref()
-                    .map_or(v.vel, |e| v.vel - e.body_spin.cross(v.com - e.body_center));
-                csp_view::flight::plasma_intensity(v.plasma_w_m2, v_rel.norm()) as f32
-            } else {
-                0.0
-            }
-        });
+        let (engine_target, plasma_target) = voice_targets(sfx, snap);
         self.engine_level += (engine_target - self.engine_level) * LEVEL_SMOOTH;
         self.plasma_level += (plasma_target - self.plasma_level) * LEVEL_SMOOTH;
         // …and the same guard on the state itself: if a non-finite
@@ -618,6 +588,53 @@ impl Drop for AudioBackend {
         }
         let _ = self.child.wait();
     }
+}
+
+/// The continuous voices' per-frame gain targets `(engine, plasma)`,
+/// derived from the staged snapshot — the pure half of
+/// [`AudioBackend::update`], factored so the test needs no player
+/// process. `snap: None` means "no live scene" (the halted-sim case,
+/// C25-F4): both targets read silence so the smoothers decay instead
+/// of pinning the last throttled frame's rumble forever.
+///
+/// Amplitude follows the focused vessel — the SAME pin-aware
+/// resolution `flight_present` applies to the chase camera, HUD, and
+/// cue edges (a `recover_control` pin must not leave the voices on
+/// the newest spawn while the player flies the recovered vessel —
+/// P07-F1).
+fn voice_targets(sfx: &FlightSfx, snap: Option<&FlightSnapshot>) -> (f32, f32) {
+    let Some(snap) = snap else {
+        return (0.0, 0.0);
+    };
+    let focus = sfx
+        .focus_vessel
+        .and_then(|id| snap.vessels.iter().find(|v| v.id == id));
+    // P13-F4: a NaN throttle/flux frame must not poison the
+    // smoother — `NaN.clamp` passes NaN through, and a NaN level
+    // would pin the gain at 0 forever (NaN > LEVEL_EPS is false).
+    // Non-finite input reads as silence for that frame.
+    let engine = focus.map_or(0.0, |v| {
+        if v.throttle.is_finite() {
+            v.throttle.clamp(0.0, 1.0) as f32
+        } else {
+            0.0
+        }
+    });
+    let plasma = focus.map_or(0.0, |v| {
+        if v.plasma_w_m2.is_finite() {
+            // The gate's speed is the same surface-relative `v_rel`
+            // the sheath solves (`flow_sample`'s convention) — `vel`
+            // alone under the view's own no-environment fallback.
+            let v_rel = snap
+                .env
+                .as_ref()
+                .map_or(v.vel, |e| v.vel - e.body_spin.cross(v.com - e.body_center));
+            csp_view::flight::plasma_intensity(v.plasma_w_m2, v_rel.norm()) as f32
+        } else {
+            0.0
+        }
+    });
+    (engine, plasma)
 }
 
 /// The settings fold: `muted` collapses the mix to silence regardless
@@ -795,6 +812,39 @@ mod tests {
         }
     }
 
+    /// C25-F4: a `None` snapshot — the halted-sim case — targets
+    /// silence on both continuous voices, so the smoothers decay
+    /// instead of pinning the last throttled frame's rumble forever.
+    /// A live snapshot with a focused, throttled vessel still drives
+    /// the voices (the no-regression half).
+    #[test]
+    fn halted_scene_targets_silence() {
+        let mut sfx = FlightSfx::default();
+        sfx.focus_vessel = Some(1);
+        let snap = FlightSnapshot {
+            vessels: vec![csp_view::flight::FlightBody {
+                id: 1,
+                pos: csp_core::DVec3::ZERO,
+                rot: csp_core::DQuat::IDENTITY,
+                vel: csp_core::DVec3::new(0.0, 0.0, -2200.0),
+                throttle: 0.7,
+                debris: false,
+                contact: false,
+                plasma_w_m2: 4.0e4,
+                nodes: 3,
+                parts: std::sync::Arc::new(Vec::new()),
+                plumes: Vec::new(),
+                com: csp_core::DVec3::ZERO,
+                latched: false,
+                tanks: Vec::new(),
+            }],
+            env: None,
+        };
+        let (engine, plasma) = voice_targets(&sfx, Some(&snap));
+        assert!(engine > 0.0 && plasma > 0.0, "live scene must drive voices");
+        assert_eq!(voice_targets(&sfx, None), (0.0, 0.0));
+    }
+
     /// Open + pump + drop, exercising the real subprocess path whenever
     /// a player binary exists (headless/minimal boxes get `None` — the
     /// graceful-absence contract this test guards: `open` never panics).
@@ -827,7 +877,7 @@ mod tests {
                 contact: false,
                 plasma_w_m2: 4.0e4,
                 nodes: 3,
-                parts: Vec::new(),
+                parts: std::sync::Arc::new(Vec::new()),
                 plumes: Vec::new(),
                 com: csp_core::DVec3::ZERO,
                 latched: false,
@@ -836,7 +886,7 @@ mod tests {
             env: None,
         };
         for _ in 0..3 {
-            backend.update(&sfx, &snap, &settings);
+            backend.update(&sfx, Some(&snap), &settings);
         }
         assert!(backend.engine_level > 0.0);
         assert!(backend.plasma_level > 0.0);

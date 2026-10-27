@@ -295,6 +295,7 @@ fn flight_input<'a>(
         propellant: prop,
         stages_left: 2,
         stages_total: 3,
+        stages_plan_vessel: None,
         mass_kg: 12_840.0,
         thrust_n: 148_300.0,
         thrust_full_n: 218_000.0,

@@ -25,6 +25,7 @@
 //! state, never sim state.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 
 use bevy_ecs::prelude::*;
 use csp_core::{DQuat, DVec3};
@@ -319,8 +320,12 @@ pub struct FlightBody {
     pub nodes: usize,
     /// Per-part render entries (silhouette + collider bounds),
     /// ascending `PartNodeId` — the M4c box tier's hull AABBs carried
-    /// forward as `lo`/`hi` on each part.
-    pub parts: Vec<FlightPart>,
+    /// forward as `lo`/`hi` on each part. `Arc`-shared with the
+    /// fingerprint caches that produced it: the vec is immutable per
+    /// craft revision (a re-graph bumps the fingerprint and
+    /// re-derives), so staging clones the pointer, not the parts —
+    /// C19-F5 ended the per-frame deep clone.
+    pub parts: Arc<Vec<FlightPart>>,
     /// Live plume emitters `(local_pos, local_dir, delivered)` — only
     /// the Thrust sites the sim still rates: each tick rewrites a
     /// craft engine site's `rated_n` as `base·factor·coverage` (the
@@ -619,6 +624,13 @@ pub struct FlightUiData {
     /// a genuinely single-stage craft (or no plan), `> 0` with
     /// `stages_left == 0` = an expended multi-stage craft.
     pub stages_total: usize,
+    /// The vessel the DISPLAYED stage plan is bound to when it isn't
+    /// the focus — `hud_plan` falls back to the newest live plan when
+    /// the focused vessel holds none, so the readout can otherwise
+    /// pass another vessel's firings off as this craft's (C19-F6).
+    /// `Some(id)` labels the readout "vessel {id}'s plan"; `None` =
+    /// the plan is the focus's own, unbound, or absent.
+    pub stages_plan_vessel: Option<u64>,
     /// Live wet mass of the focused vessel (kg) — `0` unknown.
     pub mass_kg: f64,
     /// Thrust delivered at the commanded throttle (N) — the
@@ -979,8 +991,10 @@ pub struct LatchedWeldCache {
     /// frames instead of redoing it for a craft that only moves
     /// (C12-F3). Entries drop the frame the vessel leaves the
     /// bubble; a staging/jettison/breakup re-graph changes the
-    /// fingerprint and re-derives.
-    bubble_parts: BTreeMap<u64, (u64, Vec<FlightPart>)>,
+    /// fingerprint and re-derives. The parts vec is `Arc`-shared
+    /// into each staged [`FlightBody`] — the cache entry is
+    /// immutable per fingerprint, so the share is honest (C19-F5).
+    bubble_parts: BTreeMap<u64, (u64, Arc<Vec<FlightPart>>)>,
 }
 
 /// One latched vessel's cached weld output — the render data
@@ -993,8 +1007,9 @@ struct LatchedWeld {
     /// Live plume emitters `(local_pos, local_dir, delivered)` — see
     /// [`FlightBody::plumes`]. A fresh baseline weld stages `1.0`.
     plumes: Vec<(DVec3, DVec3, f64)>,
-    /// `vessel_parts`' output over the welded hulls.
-    parts: Vec<FlightPart>,
+    /// `vessel_parts`' output over the welded hulls — `Arc`-shared
+    /// into the staged bodies (immutable per fingerprint, C19-F5).
+    parts: Arc<Vec<FlightPart>>,
 }
 
 /// The [`LatchedWeldCache`] staleness key: FNV-1a over the
@@ -1152,7 +1167,7 @@ pub fn capture_sync_input(
                         if entry.0 != key {
                             *entry = (key, vessel_parts(Some(craft), &body.collider.hulls, art));
                         }
-                        entry.1.clone()
+                        Arc::clone(&entry.1)
                     }
                     None => vessel_parts(None, &body.collider.hulls, art),
                 };
@@ -1292,7 +1307,7 @@ fn stage_rails(
             }
             let entry = cache.entries.get(&id.0)?;
             (
-                entry.parts.clone(),
+                Arc::clone(&entry.parts),
                 entry.com_local,
                 entry.plumes.clone(),
                 craft.graph.nodes.len(),
@@ -1301,7 +1316,7 @@ fn stage_rails(
         // Craft-less (elements-only) vessel: the hull-AABB fallback has
         // no hulls to box — an empty part list still leaves the staged
         // pose/HUD honest (the camera and telemetry keep working).
-        None => (Vec::new(), DVec3::ZERO, Vec::new(), 0),
+        None => (Arc::new(Vec::new()), DVec3::ZERO, Vec::new(), 0),
     };
     let rot = DQuat::IDENTITY;
     Some((
@@ -1386,7 +1401,7 @@ fn stage_latched(
         contact: false,
         plasma_w_m2: 0.0,
         nodes: craft.graph.nodes.len(),
-        parts: entry.parts.clone(),
+        parts: Arc::clone(&entry.parts),
         plumes: entry.plumes.clone(),
         com: pos + rot.rotate(entry.com_local),
         latched: true,
@@ -1646,7 +1661,7 @@ fn vessel_parts(
     craft: Option<&csp_sim::CraftDef>,
     hulls: &[csp_phys::ConvexHull],
     art: &crate::art::ArtAssets,
-) -> Vec<FlightPart> {
+) -> Arc<Vec<FlightPart>> {
     let fallback = || {
         hulls
             .iter()
@@ -1679,11 +1694,11 @@ fn vessel_parts(
             .collect()
     };
     let Some(craft) = craft else {
-        return fallback();
+        return Arc::new(fallback());
     };
     let Ok(transforms) = csp_phys::weld::body_transforms(&craft.graph, &craft.parts) else {
         log::warn!("flight: craft graph failed body_transforms — boxing hulls");
-        return fallback();
+        return Arc::new(fallback());
     };
     let mut parts = Vec::with_capacity(craft.graph.nodes.len());
     for (id, node) in &craft.graph.nodes {
@@ -1722,7 +1737,11 @@ fn vessel_parts(
             node: id.0,
         });
     }
-    if parts.is_empty() { fallback() } else { parts }
+    if parts.is_empty() {
+        Arc::new(fallback())
+    } else {
+        Arc::new(parts)
+    }
 }
 
 /// `Input` schedule — drain camera events into `FlightInput`.
@@ -1745,20 +1764,24 @@ pub(crate) fn apply_flight_input(
     }
 }
 
-/// `Sync` schedule — copy the staged input into the presentation
-/// mirror.
+/// `Sync` schedule — move the staged input into the presentation
+/// mirror. `FlightSyncInput` is rebuilt wholesale at the next
+/// `end_frame` and read by nothing after `stage_program` (its sole
+/// consumer runs before this schedule), so the mirror takes the
+/// staged buffers outright instead of `clone_from`-ing the whole
+/// fleet a second time (C19-F5).
 pub(crate) fn sync_flight(
-    staged: Res<FlightSyncInput>,
+    mut staged: ResMut<FlightSyncInput>,
     mut snap: ResMut<FlightSnapshot>,
     mut live: ResMut<LiveVesselCount>,
     mut prop: ResMut<VesselPropulsionStaged>,
     mut rails: ResMut<RailsStaged>,
 ) {
     snap.env.clone_from(&staged.env);
-    snap.vessels.clone_from(&staged.vessels);
+    snap.vessels = std::mem::take(&mut staged.vessels);
     live.0 = staged.live_vessels;
-    prop.0.clone_from(&staged.propulsion);
-    rails.0.clone_from(&staged.rails);
+    prop.0 = std::mem::take(&mut staged.propulsion);
+    rails.0 = std::mem::take(&mut staged.rails);
 }
 
 /// The flight chase-camera solve: an orbit camera in the *local-level
@@ -1923,7 +1946,7 @@ pub(crate) fn pick_part(
     let mut hull = egui::Rect::NOTHING;
     let mut contained: Option<(f64, u64)> = None; // (nearest-corner depth², node)
     let mut nearest: Option<(f32, u64)> = None; // (screen px, node)
-    for p in &focus.parts {
+    for p in focus.parts.iter() {
         // The collider's body-frame AABB → 8 world corners → the part's
         // screen-space bounding rect. A part entirely behind the eye
         // projects nothing and is skipped.
@@ -2044,6 +2067,7 @@ pub(crate) fn flight_present(
         ui.propellant.clear();
         ui.stages_left = 0;
         ui.stages_total = plans.hud_plan(None).map_or(0, |p| p.total);
+        ui.stages_plan_vessel = None;
         stage_propulsion(&mut ui, None, &[], 0.0, None, None);
         return;
     };
@@ -2061,6 +2085,13 @@ pub(crate) fn flight_present(
     let hud = plans.hud_plan(Some(VesselId(focus.id)));
     ui.stages_left = hud.map_or(0, |p| p.stages.len());
     ui.stages_total = hud.map_or(0, |p| p.total);
+    // C19-F6: name the plan's owner when the fallback borrowed another
+    // vessel's plan — the fire press lands on THAT vessel's parts, not
+    // the craft the camera is on, so the readout says whose it is.
+    ui.stages_plan_vessel = hud
+        .and_then(|p| p.vessel)
+        .filter(|v| *v != VesselId(focus.id))
+        .map(|v| v.0);
     ui.orbital_speed_mps = focus.vel.norm();
     ui.throttle = focus.throttle;
     ui.parts = focus.nodes;
@@ -2236,14 +2267,24 @@ fn sfx_edges(
 }
 
 /// The chase target / HUD / throttle-command vessel: the most recently
-/// spawned staged vessel. `vessels` is staged ascending `VesselId` and
-/// the sim's `next_vessel_id` counter is monotonic, so `last()` is the
-/// newest spawn — a fresh launch (or a new breakup fragment) takes the
-/// camera, the HUD mirrors, and `SetThrottle` routing with it. When it
-/// leaves the staging set the next-newest vessel inherits focus; an
-/// empty scene has none.
+/// spawned NON-DEBRIS staged vessel. `vessels` is staged ascending
+/// `VesselId` and the sim's `next_vessel_id` counter is monotonic, so
+/// `last()` is the newest spawn — a fresh launch takes the camera, the
+/// HUD mirrors, and `SetThrottle` routing with it. The debris filter is
+/// C19-F7: `apply_breakup` mints its fragments at HIGHER ids than the
+/// retained hull, so a bare `last()` handed focus to an uncommandable
+/// fragment by construction on every breakup. The newest live vessel
+/// wins instead; a scene whose only staged vessels are debris (the
+/// hull is gone entirely) still falls back to `last()` — the newest
+/// wreck reads better than a dead frame. When the focus leaves the
+/// staging set the next-newest vessel inherits it; an empty scene has
+/// none.
 pub(crate) fn focus_vessel(vessels: &[FlightBody]) -> Option<&FlightBody> {
-    vessels.last()
+    vessels
+        .iter()
+        .rev()
+        .find(|b| !b.debris)
+        .or_else(|| vessels.last())
 }
 
 /// The attitude/velocity half of the HUD mirrors: surface-relative
@@ -2829,7 +2870,7 @@ fn emit_sheath(
     plasma_i: f64,
     tris: &mut Vec<crate::part_mesh::SmoothTri>,
 ) {
-    for p in &b.parts {
+    for p in b.parts.iter() {
         let (lo, hi) = p.shape.local_aabb();
         let size = ((hi - lo).norm() * 0.5).max(0.05);
         let shell = crate::part_mesh::inflated(&p.shape, size * (0.04 + 0.08 * plasma_i) + 0.015);
@@ -3083,7 +3124,7 @@ pub(crate) fn extract_flight(
     let mut tris = Vec::new();
     let mut mtris = Vec::new();
     for b in &snap.vessels {
-        for p in &b.parts {
+        for p in b.parts.iter() {
             let base: [f32; 3] = if b.debris {
                 [0.72, 0.38, 0.16]
             } else {
@@ -3178,7 +3219,7 @@ pub(crate) fn extract_flight(
             let mut low = b.com;
             let mut low_alt = f64::MAX;
             let mut extent = 1.0_f64;
-            for p in &b.parts {
+            for p in b.parts.iter() {
                 for c in [
                     DVec3::new(p.lo.x, p.lo.y, p.lo.z),
                     DVec3::new(p.hi.x, p.lo.y, p.lo.z),
@@ -3305,7 +3346,7 @@ mod tests {
             contact: false,
             plasma_w_m2: 0.0,
             nodes: 1,
-            parts: vec![FlightPart {
+            parts: Arc::new(vec![FlightPart {
                 lo: DVec3::new(-0.5, -0.5, -0.5),
                 hi: DVec3::new(0.5, 0.5, 0.5),
                 transform: csp_phys::PartTransform::IDENTITY,
@@ -3316,7 +3357,7 @@ mod tests {
                 kind: PartKind::Structural,
                 model: None,
                 node: 0,
-            }],
+            }]),
             // Thrust site at the body origin, dir +Z: the fan tip sits
             // at the vessel, the 1.5 m-radius base ring 36 m along −Z.
             plumes: vec![(DVec3::ZERO, DVec3::Z, 1.0)],
@@ -3538,10 +3579,10 @@ mod tests {
             nodes: 2,
             // Node 1 straddles the origin (screen center); node 2
             // sits 3 m above it (up-screen).
-            parts: vec![
+            parts: Arc::new(vec![
                 mk(1, DVec3::new(-1.0, -1.0, -1.0), DVec3::new(1.0, 1.0, 1.0)),
                 mk(2, DVec3::new(-1.0, 2.0, -1.0), DVec3::new(1.0, 4.0, 1.0)),
-            ],
+            ]),
             plumes: Vec::new(),
             com: DVec3::ZERO,
             latched: false,
@@ -3954,5 +3995,136 @@ mod tests {
         // …and vessel 2's half-second window still reads its own Δv:
         // +9.81 m/s over 32 ticks = 2.0 g.
         assert!((loads.g_for(2) - 2.0).abs() < 1e-9, "g {}", loads.g_for(2));
+    }
+
+    /// A bare `FlightBody` for the focus-rule tests — every field the
+    /// rule ignores sits at its zero value.
+    fn bare_body(id: u64, debris: bool) -> FlightBody {
+        FlightBody {
+            id,
+            pos: DVec3::ZERO,
+            rot: DQuat::IDENTITY,
+            vel: DVec3::ZERO,
+            throttle: 0.0,
+            debris,
+            contact: false,
+            plasma_w_m2: 0.0,
+            nodes: 1,
+            parts: Arc::new(Vec::new()),
+            plumes: Vec::new(),
+            com: DVec3::ZERO,
+            latched: false,
+            tanks: Vec::new(),
+        }
+    }
+
+    /// C19-F7: breakup fragments mint higher ids than the retained
+    /// hull, so a bare `last()` handed the camera to uncommandable
+    /// debris by construction. `focus_vessel` must prefer the newest
+    /// NON-DEBRIS staged vessel — and still follow a fresh launch
+    /// (non-debris) or a debris-only scene (the newest wreck).
+    #[test]
+    fn focus_vessel_prefers_the_retained_hull_over_breakup_debris() {
+        // The bug's shape: hull at id 1, two fragments minted after it.
+        let scene = [bare_body(1, false), bare_body(2, true), bare_body(3, true)];
+        assert_eq!(
+            focus_vessel(&scene).map(|b| b.id),
+            Some(1),
+            "focus must land on the retained hull, not the newest fragment"
+        );
+        // A fresh launch is non-debris — the newest-spawn rule is
+        // unchanged for live vessels.
+        let launch = [bare_body(1, true), bare_body(2, false)];
+        assert_eq!(focus_vessel(&launch).map(|b| b.id), Some(2));
+        // Debris only: the hull is gone entirely — the newest wreck
+        // reads better than a dead frame.
+        let wreck = [bare_body(4, true), bare_body(5, true)];
+        assert_eq!(focus_vessel(&wreck).map(|b| b.id), Some(5));
+        assert!(focus_vessel(&[]).is_none());
+    }
+
+    /// C19-F5's sync half: `sync_flight` MOVES the staged buffers into
+    /// the mirror — `FlightSyncInput` is rebuilt per `end_frame` and
+    /// read by nothing after `stage_program`, so the mirror takes the
+    /// vec outright instead of deep-cloning the fleet a second time.
+    #[test]
+    fn sync_flight_moves_the_staged_buffers() {
+        let mut world = bevy_ecs::world::World::new();
+        world.insert_resource(FlightSyncInput {
+            env: None,
+            vessels: vec![bare_body(7, false)],
+            live_vessels: 1,
+            propulsion: vec![VesselPropulsion {
+                vessel: 7,
+                ..VesselPropulsion::default()
+            }],
+            rails: vec![7],
+        });
+        world.insert_resource(FlightSnapshot::default());
+        world.insert_resource(LiveVesselCount::default());
+        world.insert_resource(VesselPropulsionStaged::default());
+        world.insert_resource(RailsStaged::default());
+        let mut sched = Schedule::default();
+        sched.add_systems(sync_flight);
+        sched.run(&mut world);
+        assert_eq!(
+            world.resource::<FlightSnapshot>().vessels[0].id,
+            7,
+            "the staged vessel must land in the mirror"
+        );
+        assert_eq!(world.resource::<LiveVesselCount>().0, 1);
+        assert_eq!(world.resource::<VesselPropulsionStaged>().0[0].vessel, 7);
+        assert_eq!(world.resource::<RailsStaged>().0, vec![7]);
+        assert!(
+            world.resource::<FlightSyncInput>().vessels.is_empty()
+                && world.resource::<FlightSyncInput>().propulsion.is_empty()
+                && world.resource::<FlightSyncInput>().rails.is_empty(),
+            "the staged input must be consumed, not copied"
+        );
+    }
+
+    /// C19-F6's staging half: when `hud_plan`'s fallback borrows
+    /// another vessel's plan, the mirror names the owner — and reads
+    /// `None` while the plan IS the focused vessel's own.
+    #[test]
+    fn flight_present_names_the_borrowed_plan_owner() {
+        let run = |plan_vessel: VesselId| -> Option<u64> {
+            let mut world = bevy_ecs::world::World::new();
+            world.insert_resource(FlightInput::default());
+            world.insert_resource(FlightSnapshot {
+                env: None,
+                vessels: vec![bare_body(7, false)],
+            });
+            world.insert_resource(LiveVesselCount::default());
+            world.insert_resource(RailsStaged::default());
+            // The plan is bound to `plan_vessel`; the staged focus is
+            // vessel 7 — `hud_plan` borrows the newest live plan.
+            world.insert_resource(StagePlans::single(StagePlan::bound_to(
+                vec![StageActions::default()],
+                plan_vessel,
+            )));
+            world.insert_resource(VesselPropulsionStaged::default());
+            world.insert_resource(TerrainConfig::default());
+            world.insert_resource(TerrainCache::default());
+            world.insert_resource(FlightCameraF64::default());
+            world.insert_resource(FlightUiData::default());
+            world.insert_resource(FlightSfx::default());
+            world.insert_resource(crate::Clock::default());
+            world.insert_resource(FlightFocusOverride::default());
+            let mut sched = Schedule::default();
+            sched.add_systems(flight_present);
+            sched.run(&mut world);
+            world.resource::<FlightUiData>().stages_plan_vessel
+        };
+        assert_eq!(
+            run(VesselId(9)),
+            Some(9),
+            "a plan bound to another vessel must be labeled"
+        );
+        assert_eq!(
+            run(VesselId(7)),
+            None,
+            "the focused vessel's own plan needs no owner label"
+        );
     }
 }

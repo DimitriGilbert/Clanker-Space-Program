@@ -1019,14 +1019,21 @@ impl App {
         // M10 audio (native only): the `FlightSfx` cue queue and the
         // flight snapshot are fresh post-`end_frame` — drain new cues
         // into one-shots and re-drive the continuous voices. Read-only
-        // on the presentation world; nothing feeds back.
+        // on the presentation world; nothing feeds back. C25-F4: a
+        // Fatal halt freezes the sim mid-throttle — `end_frame` keeps
+        // restaging the same snapshot, so a live `Some` would hold the
+        // rumble at its last gain forever. `None` reads as "no scene":
+        // the voices decay to silence while the halt dialog sits.
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(backend) = &mut self.audio {
-            backend.update(
-                self.view.world.resource::<csp_view::flight::FlightSfx>(),
+            let snap = self.fatal.is_none().then(|| {
                 self.view
                     .world
-                    .resource::<csp_view::flight::FlightSnapshot>(),
+                    .resource::<csp_view::flight::FlightSnapshot>()
+            });
+            backend.update(
+                self.view.world.resource::<csp_view::flight::FlightSfx>(),
+                snap,
                 &self.settings.audio,
             );
         }

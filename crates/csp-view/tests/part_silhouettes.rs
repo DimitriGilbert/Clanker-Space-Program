@@ -58,7 +58,7 @@ fn starter_stack_stages_distinct_silhouettes() {
     // battery → canister → pod (top, +z) — the W1.5-b science pair
     // flies inline between pod and tank. Sort by z and take the
     // propulsion triple: the lowest two plus the topmost.
-    let mut parts = vessel.parts.clone();
+    let mut parts = vessel.parts.to_vec();
     parts.sort_by(|a, b| a.transform.offset.z.total_cmp(&b.transform.offset.z));
     let engine = &parts[0];
     let tank = &parts[1];
@@ -114,6 +114,26 @@ fn starter_stack_stages_distinct_silhouettes() {
     assert!(
         tris[0] != tris[1] || tris[1] != tris[2] || tris[0] != tris[2],
         "pod/tank/engine must not share one mesh signature: {tris:?}"
+    );
+}
+
+/// C19-F5: the per-part render data is `Arc`-shared between the
+/// fingerprint cache and every staged `FlightBody` — a second
+/// capture of an unchanged craft must return the SAME allocation,
+/// not a deep clone of every part's lathe profile.
+#[test]
+fn repeated_captures_share_the_parts_allocation() {
+    let mut view = View::new().expect("data/ load");
+    view.seed_starter_craft().expect("starter seed");
+    frame(&mut view, 1);
+    let mut cache = csp_view::flight::LatchedWeldCache::default();
+    let art = csp_view::art::ArtAssets::default();
+    let a = csp_view::flight::capture_sync_input(&view.sim, &mut cache, &art, &[]);
+    let b = csp_view::flight::capture_sync_input(&view.sim, &mut cache, &art, &[]);
+    assert_eq!(a.vessels.len(), 1);
+    assert!(
+        std::sync::Arc::ptr_eq(&a.vessels[0].parts, &b.vessels[0].parts),
+        "an unchanged craft's parts must share the cache's allocation"
     );
 }
 

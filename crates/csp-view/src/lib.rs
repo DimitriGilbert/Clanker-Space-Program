@@ -659,6 +659,7 @@ fn build_ui(
                     propellant: &flight_ui.propellant,
                     stages_left: flight_ui.stages_left,
                     stages_total: flight_ui.stages_total,
+                    stages_plan_vessel: flight_ui.stages_plan_vessel,
                     mass_kg: flight_ui.mass_kg,
                     thrust_n: flight_ui.thrust_n,
                     thrust_full_n: flight_ui.thrust_full_n,
@@ -3703,11 +3704,19 @@ impl View {
             );
         }
         // The cue names what the firing actually did — a chute-only
-        // stage reads "DEPLOYED", not "0 PART(S) JETTISONED".
+        // stage reads "DEPLOYED", not "0 PART(S) JETTISONED". C19-F6:
+        // when the fired plan belongs to a vessel that ISN'T the
+        // focus, name it — jettisoning another craft's parts must
+        // never read as if the focused vessel staged.
         let notice = match (n_jettisons, n_deploys) {
             (j, 0) => format!("STAGED — {j} PART(S) JETTISONED"),
             (0, d) => format!("STAGED — {d} PART(S) DEPLOYED"),
             (j, d) => format!("STAGED — {j} JETTISONED + {d} DEPLOYED"),
+        };
+        let notice = if focus != Some(vessel) {
+            format!("{notice} · VESSEL {}", vessel.0)
+        } else {
+            notice
         };
         self.flight_notice(notice);
         n_jettisons + n_deploys
@@ -5777,7 +5786,7 @@ mod tests {
                 contact: false,
                 plasma_w_m2: 0.0,
                 nodes: 1,
-                parts: Vec::new(),
+                parts: std::sync::Arc::new(Vec::new()),
                 plumes: Vec::new(),
                 com: csp_core::DVec3::ZERO,
                 latched: false,

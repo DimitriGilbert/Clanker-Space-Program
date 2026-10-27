@@ -560,6 +560,13 @@ pub struct FlightHudInput<'a> {
     /// `0` = single-stage (or no plan); `> 0` with `stages_left == 0`
     /// = expended.
     pub stages_total: usize,
+    /// The vessel the displayed stage plan belongs to when it ISN'T
+    /// the focused one — the view's plan readout falls back to the
+    /// newest live plan when the focus holds none, and the stage key
+    /// fires that plan's vessel. `Some(id)` names the owner in the
+    /// STG row so the readout can't pass another vessel's firings off
+    /// as this craft's (C19-F6).
+    pub stages_plan_vessel: Option<u64>,
     /// Live wet mass of the focused vessel (kg).
     pub mass_kg: f64,
     /// Thrust delivered at the commanded throttle (N) —
@@ -684,6 +691,26 @@ fn fmt_speed(v: f64) -> String {
 /// (parked, no engine, open orbit, closed throttle).
 fn fmt_opt(v: Option<f64>, f: impl Fn(f64) -> String) -> String {
     v.map_or("—".to_string(), f)
+}
+
+/// The "STG" row's text — factored out for the test. "single stage"
+/// is only honest when the craft never had a firing to spend
+/// (`stages_total == 0`); an expended multi-stage craft reads
+/// "0 firing(s) left". `stages_plan_vessel` is the C19-F6 owner
+/// label: the view's plan readout can borrow ANOTHER vessel's plan
+/// when the focus holds none, and the stage key fires that vessel —
+/// the row names the owner so the borrowed count isn't mistaken for
+/// this craft's.
+fn stages_label(input: &FlightHudInput<'_>) -> String {
+    let base = if input.stages_total == 0 {
+        "single stage".to_string()
+    } else {
+        format!("{} firing(s) left", input.stages_left)
+    };
+    match input.stages_plan_vessel {
+        Some(v) => format!("{base} — vessel {v}'s plan"),
+        None => base,
+    }
 }
 
 /// The §3.7 visual-SFX channel as a GLOBAL overlay — the cue stack
@@ -991,19 +1018,7 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
                 dim,
             );
             // Staging — the launch-captured plan's remaining firings.
-            // "single stage" is only honest when the craft never had
-            // a firing to spend (`stages_total == 0`); an expended
-            // multi-stage craft reads "0 firing(s) left" instead.
-            row(
-                ui,
-                "STG",
-                if input.stages_total == 0 {
-                    "single stage".to_string()
-                } else {
-                    format!("{} firing(s) left", input.stages_left)
-                },
-                dim,
-            );
+            row(ui, "STG", stages_label(input), dim);
             row(
                 ui,
                 "",
@@ -1810,6 +1825,7 @@ mod tests {
             propellant,
             stages_left: 2,
             stages_total: 3,
+            stages_plan_vessel: None,
             mass_kg: 12_840.0,
             thrust_n: 148_300.0,
             thrust_full_n: 218_000.0,
@@ -1851,6 +1867,25 @@ mod tests {
             pressed,
             modifiers: egui::Modifiers::default(),
         }
+    }
+
+    /// C19-F6: a borrowed plan's owner is named in the STG row — the
+    /// readout can't pass another vessel's firings off as this
+    /// craft's, and an unowned readout stays clean.
+    #[test]
+    fn stg_label_names_a_borrowed_plan_owner() {
+        let keys = settings::Keymap::default();
+        let key_labels = BTreeMap::new();
+        let prop: [PropellantGauge; 0] = [];
+        let mut input = hud_input(&keys, &key_labels, &prop);
+        assert_eq!(stages_label(&input), "2 firing(s) left");
+        input.stages_plan_vessel = Some(9);
+        assert_eq!(stages_label(&input), "2 firing(s) left — vessel 9's plan");
+        // A borrowed plan with nothing left still names its owner —
+        // "0 firing(s) left" is about THAT vessel's plan, not "this
+        // craft is single-stage".
+        input.stages_left = 0;
+        assert_eq!(stages_label(&input), "0 firing(s) left — vessel 9's plan");
     }
 
     #[test]
