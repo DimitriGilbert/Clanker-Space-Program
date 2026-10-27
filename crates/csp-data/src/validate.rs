@@ -51,7 +51,7 @@ use crate::loc::LocFile;
 use crate::part::{ColliderDef, ModuleDef, PART_SCHEMA_VERSION, PartCategory, PartDef, ScaleRule};
 use crate::resource::{RESOURCE_SCHEMA_VERSION, ResourceFile};
 use crate::site::{SiteDef, SiteFile};
-use crate::system::{KeplerElements, SCHEMA_VERSION};
+use crate::system::{BODY_SCHEMA_VERSION, KeplerElements, SCHEMA_VERSION};
 use crate::techtree::{TechNode, UpgradeTrack};
 
 /// Relative tolerance for the §3.0 period-consistency rule:
@@ -669,6 +669,40 @@ pub enum ValidationError {
         /// What is wrong with it.
         reason: String,
     },
+    /// A file or directory under `data/systems/<sys>/` that the
+    /// manifest never references — an unlisted `<body>/` directory
+    /// (a body that loads nowhere), or an entry inside a body dir the
+    /// def does not name (a stray `biomes.png` beside a
+    /// `biome_map: None` body). The manifest-driven load skips these
+    /// silently while the data-set hash still covers them, so the
+    /// tree could drift with zero diagnostics (C31-F3).
+    OrphanContent {
+        /// The unreferenced path, as the loader recorded it.
+        path: String,
+    },
+    /// §7.7's ID-stability tripwire: the committed baseline
+    /// (`data/id-baseline.ron`) names a `PartId` the loaded set no
+    /// longer carries and `deprecated` records no replacement — the
+    /// CI failure §7.7 requires for an ID that disappears.
+    PartIdDisappeared {
+        /// The vanished ID.
+        id: String,
+    },
+    /// §7.7's other half: a loaded `PartId` is absent from the
+    /// committed baseline — IDs are permanent the moment they ship,
+    /// so the baseline must be updated in the same commit that
+    /// authors the part.
+    PartIdUnrecorded {
+        /// The unrecorded ID.
+        id: String,
+    },
+    /// `data/id-baseline.ron` is internally inconsistent — a
+    /// duplicated `parts` entry, a `deprecated` key still shipped as
+    /// a live id, or a replacement naming no live id.
+    BadIdBaseline {
+        /// Why it failed.
+        reason: String,
+    },
 }
 
 impl fmt::Display for ValidationError {
@@ -805,6 +839,12 @@ impl fmt::Display for ValidationError {
             Self::UnresolvedLocKey { context, key } => {
                 write!(f, "{context}: loc key {key:?} has no entry in en.ron")
             }
+            Self::OrphanContent { path } => write!(
+                f,
+                "{path}: unreferenced content — not listed in system.ron's manifest \
+                 (or not referenced by its body.ron); loads nowhere but still feeds \
+                 the data-set hash"
+            ),
             // Part/resource/recipe/contract/tech/site/colony
             // diagnostics are grouped into `fmt_part`/`fmt_tech` — one
             // arm per variant would triple this function's length. The
@@ -847,6 +887,9 @@ impl fmt::Display for ValidationError {
             | Self::UnknownRecipe { .. }
             | Self::UnknownExperimentKind { .. }
             | Self::BadFileRef { .. }
+            | Self::PartIdDisappeared { .. }
+            | Self::PartIdUnrecorded { .. }
+            | Self::BadIdBaseline { .. }
             | Self::InvalidSite { .. }
             | Self::InvalidColony { .. } => self.fmt_part(f),
         }
@@ -985,6 +1028,19 @@ impl ValidationError {
                     "{body:?}: {field} is not a tame single-segment file name"
                 )
             }
+            Self::PartIdDisappeared { id } => write!(
+                f,
+                "id-baseline.ron: part id {id:?} disappeared — §7.7 requires a \
+                 `deprecated` replacement entry (or a migration) for a removed id"
+            ),
+            Self::PartIdUnrecorded { id } => write!(
+                f,
+                "id-baseline.ron: part id {id:?} is new — record it in the §7.7 \
+                 baseline in the same commit"
+            ),
+            Self::BadIdBaseline { reason } => {
+                write!(f, "id-baseline.ron: {reason}")
+            }
             // The tech/site/colony tail delegates to `fmt_tech` —
             // explicit alternation like `fmt`'s, so the routing is
             // compile-checked.
@@ -1075,7 +1131,9 @@ impl ValidationError {
 impl std::error::Error for ValidationError {}
 
 /// IDs are directory names under `data/systems/<sys>/` — keep them tame:
-/// non-empty, `[a-z0-9._-]` only, never a `.`/`..` segment.
+/// non-empty, `[a-z0-9._-]` only, never a `.`/`..` segment, and never a
+/// DOS device name (the same Windows trap [`crate::load::authored_name_ok`]
+/// guards file refs against — an id named `con` is a directory name too).
 fn id_well_formed(id: &str) -> bool {
     !id.is_empty()
         && id != "."
@@ -1083,6 +1141,7 @@ fn id_well_formed(id: &str) -> bool {
         && id.chars().all(|c| {
             c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '_' || c == '-'
         })
+        && !crate::load::is_dos_device_name(id)
 }
 
 fn check_id(id: &str, out: &mut Vec<ValidationError>) {
@@ -1157,6 +1216,17 @@ pub fn validate_system(sys: &LoadedSystem) -> Vec<ValidationError> {
             check_biomes(b, bm, &mut out);
         }
     }
+    // C31-F3: whatever the loader found under the system directory
+    // that the manifest never referenced — each orphan is dead content
+    // the data-set hash sees but nothing loads, so it is authored
+    // noise (or a forgotten manifest entry) and must not validate
+    // green. Recorded by `load_system_from`; hand-rolled systems carry
+    // an empty list.
+    for path in &sys.orphans {
+        out.push(ValidationError::OrphanContent {
+            path: path.display().to_string(),
+        });
+    }
     out
 }
 
@@ -1171,15 +1241,15 @@ fn check_schema_versions(sys: &LoadedSystem, out: &mut Vec<ValidationError>) {
         });
     }
     for b in &sys.bodies {
-        if b.def.schema_version != SCHEMA_VERSION {
+        if b.def.schema_version != BODY_SCHEMA_VERSION {
             out.push(ValidationError::SchemaVersion {
                 file: format!("{}/body.ron", b.def.id),
                 found: b.def.schema_version,
-                expected: SCHEMA_VERSION,
+                expected: BODY_SCHEMA_VERSION,
             });
         }
         if let Some(bm) = &b.biomes
-            && bm.legend.schema_version != SCHEMA_VERSION
+            && bm.legend.schema_version != crate::biome::BIOME_SCHEMA_VERSION
         {
             out.push(ValidationError::SchemaVersion {
                 file: format!(
@@ -1191,7 +1261,7 @@ fn check_schema_versions(sys: &LoadedSystem, out: &mut Vec<ValidationError>) {
                         .map_or("biomes.ron", |r| r.legend.as_str())
                 ),
                 found: bm.legend.schema_version,
-                expected: SCHEMA_VERSION,
+                expected: crate::biome::BIOME_SCHEMA_VERSION,
             });
         }
     }
@@ -2045,11 +2115,11 @@ pub fn validate_balance(
 /// convention). The key-resolution half lives in the
 /// `validate_*_loc_keys` family.
 pub fn validate_loc(loc: &LocFile) -> Vec<ValidationError> {
-    if loc.schema_version != SCHEMA_VERSION {
+    if loc.schema_version != crate::loc::LOC_SCHEMA_VERSION {
         vec![ValidationError::SchemaVersion {
             file: "loc/en.ron".to_string(),
             found: loc.schema_version,
-            expected: SCHEMA_VERSION,
+            expected: crate::loc::LOC_SCHEMA_VERSION,
         }]
     } else {
         Vec::new()
@@ -2059,9 +2129,12 @@ pub fn validate_loc(loc: &LocFile) -> Vec<ValidationError> {
 /// §3.5's `sites.ron` checks: `schema_version` (the loader's
 /// `current|previous` band), unique ids, every site on a declared
 /// system body, a finite in-range geocentric pose, at most one launch
-/// site per body (§3.5's "1.0 at the launch site" needs a definite
-/// site to mean it), and M8-B's `resource_yields` rows — unique,
-/// known resources, finite fractions in `[0,1]`.
+/// site per body AND at least one launch site in a non-empty file
+/// (§3.5's "1.0 at the launch site" needs a definite site to mean it —
+/// a file with sites but no pad validates green today while every
+/// `ManufactureCraft` order is refused at runtime with a message that
+/// never names the missing pad, C32-F5), and M8-B's `resource_yields`
+/// rows — unique, known resources, finite fractions in `[0,1]`.
 pub fn validate_sites(
     file: &SiteFile,
     sys: &LoadedSystem,
@@ -2078,101 +2151,143 @@ pub fn validate_sites(
     let bodies: BTreeSet<&str> = sys.bodies.iter().map(|b| b.def.id.as_str()).collect();
     let mut seen = BTreeSet::new();
     let mut launch_bodies = BTreeSet::new();
-    let half_pi = core::f64::consts::FRAC_PI_2;
     for s in &file.sites {
-        let id = s.id.as_str();
-        check_id(id, &mut out);
-        // Each entry re-declares its own version (§3.1 first-field
-        // convention): the same current-or-previous band as the file.
-        if !crate::site::SITE_SCHEMA_SUPPORTED.contains(&s.schema_version) {
-            out.push(ValidationError::SchemaVersion {
-                file: format!("sites.ron entry {id:?}"),
-                found: s.schema_version,
-                expected: crate::site::SITE_SCHEMA_VERSION,
-            });
-        }
-        if !seen.insert(id) {
-            out.push(ValidationError::InvalidSite {
-                id: id.to_string(),
-                reason: "duplicate site id".to_string(),
-            });
-        }
-        if !bodies.contains(s.body.as_str()) {
-            out.push(ValidationError::InvalidSite {
-                id: id.to_string(),
-                reason: format!("body {:?} not in this system", s.body.as_str()),
-            });
-        }
-        if !(s.latitude_rad.is_finite() && s.latitude_rad.abs() <= half_pi) {
-            out.push(ValidationError::InvalidSite {
-                id: id.to_string(),
-                reason: "latitude out of [-pi/2, pi/2] or non-finite".to_string(),
-            });
-        }
-        if !s.longitude_rad.is_finite() {
-            out.push(ValidationError::InvalidSite {
-                id: id.to_string(),
-                reason: "longitude non-finite".to_string(),
-            });
-        }
-        if !(s.altitude_m.is_finite() && s.altitude_m >= 0.0) {
-            out.push(ValidationError::InvalidSite {
-                id: id.to_string(),
-                reason: "altitude negative or non-finite".to_string(),
-            });
-        }
-        // C09-F2/C34-F3's terminator-distance guard: on a zero-synodic
-        // body the site's daylight is a PERMANENT verdict hung on
-        // `cos H · cos φ` — a site authored near the line lets one
-        // longitude ulp flip its whole power budget forever.
-        // `None` covers an unresolved body (already flagged above) or
-        // a non-fixed sun (the verdict cycles — grazing is legal).
-        if let Some(margin) = fixed_sun_cos_margin(sys, s)
-            && margin < FIXED_SUN_TERMINATOR_MIN_COS
-        {
-            out.push(ValidationError::InvalidSite {
-                id: id.to_string(),
-                reason: format!(
-                    "site sits {margin:.3e} of |cos H·cos φ| off a FIXED terminator \
-                     (zero-synodic body {:?}) — the permanent Day/Night verdict must not \
-                     hang on a rounding residue; keep ≥ {FIXED_SUN_TERMINATOR_MIN_COS}",
-                    s.body.as_str()
-                ),
-            });
-        }
-        if s.launch && !launch_bodies.insert(s.body.as_str()) {
-            out.push(ValidationError::InvalidSite {
-                id: id.to_string(),
-                reason: format!(
-                    "second launch site on {:?} — one launch site per body",
-                    s.body.as_str()
-                ),
-            });
-        }
-        let mut yields = BTreeSet::new();
-        for (r, y) in &s.resource_yields {
-            if !yields.insert(r.as_str()) {
-                out.push(ValidationError::InvalidSite {
-                    id: id.to_string(),
-                    reason: format!("duplicate yield resource {r:?}"),
-                });
-            }
-            if !res.contains(r) {
-                out.push(ValidationError::InvalidSite {
-                    id: id.to_string(),
-                    reason: format!("unknown yield resource {r:?}"),
-                });
-            }
-            if !(y.is_finite() && (0.0..=1.0).contains(y)) {
-                out.push(ValidationError::InvalidSite {
-                    id: id.to_string(),
-                    reason: format!("yield fraction for {r:?} outside [0,1] or non-finite"),
-                });
-            }
-        }
-        validate_site_stock(s, id, res, &mut out);
+        check_site(
+            s,
+            sys,
+            &bodies,
+            &mut seen,
+            &mut launch_bodies,
+            res,
+            &mut out,
+        );
+    }
+    // C32-F5's file-level floor: a NON-EMPTY site set must carry at
+    // least one launch site — otherwise every `ManufactureCraft`
+    // order is refused at runtime ("build orders consume a
+    // launch-site inventory") and the pad-spawn path falls back to
+    // lat/lon (0,0) alt 0, neither naming the missing pad. An
+    // intentionally site-less system authors an empty file (the
+    // loader's missing-file convention), never this state.
+    if !file.sites.is_empty() && launch_bodies.is_empty() {
+        out.push(ValidationError::InvalidSite {
+            id: String::new(),
+            reason: "no site carries launch: true — a non-empty sites.ron must \
+                     author at least one launch site (a site-less system ships \
+                     an empty sites list)"
+                .to_string(),
+        });
     }
     out
+}
+
+/// One `sites.ron` entry: id/version hygiene, the body membership and
+/// geocentric-pose rules, the fixed-sun terminator guard, the
+/// one-launch-site-per-body uniqueness accumulation, the
+/// `resource_yields` rows, and the `starting_stock` rows.
+#[allow(clippy::too_many_arguments)] // the check list needs the shared tables it reads
+fn check_site<'a>(
+    s: &'a SiteDef,
+    sys: &LoadedSystem,
+    bodies: &BTreeSet<&str>,
+    seen: &mut BTreeSet<&'a str>,
+    launch_bodies: &mut BTreeSet<&'a str>,
+    res: &ResourceFile,
+    out: &mut Vec<ValidationError>,
+) {
+    let id = s.id.as_str();
+    check_id(id, out);
+    // The per-entry version is the legacy optional duplicate
+    // (`SiteDef::schema_version`): a declared (nonzero) value gets the
+    // same current-or-previous band as the file; `0` = "not declared",
+    // the current authoring form.
+    if s.schema_version != 0 && !crate::site::SITE_SCHEMA_SUPPORTED.contains(&s.schema_version) {
+        out.push(ValidationError::SchemaVersion {
+            file: format!("sites.ron entry {id:?}"),
+            found: s.schema_version,
+            expected: crate::site::SITE_SCHEMA_VERSION,
+        });
+    }
+    if !seen.insert(id) {
+        out.push(ValidationError::InvalidSite {
+            id: id.to_string(),
+            reason: "duplicate site id".to_string(),
+        });
+    }
+    if !bodies.contains(s.body.as_str()) {
+        out.push(ValidationError::InvalidSite {
+            id: id.to_string(),
+            reason: format!("body {:?} not in this system", s.body.as_str()),
+        });
+    }
+    if !(s.latitude_rad.is_finite() && s.latitude_rad.abs() <= core::f64::consts::FRAC_PI_2) {
+        out.push(ValidationError::InvalidSite {
+            id: id.to_string(),
+            reason: "latitude out of [-pi/2, pi/2] or non-finite".to_string(),
+        });
+    }
+    if !s.longitude_rad.is_finite() {
+        out.push(ValidationError::InvalidSite {
+            id: id.to_string(),
+            reason: "longitude non-finite".to_string(),
+        });
+    }
+    if !(s.altitude_m.is_finite() && s.altitude_m >= 0.0) {
+        out.push(ValidationError::InvalidSite {
+            id: id.to_string(),
+            reason: "altitude negative or non-finite".to_string(),
+        });
+    }
+    // C09-F2/C34-F3's terminator-distance guard: on a zero-synodic
+    // body the site's daylight is a PERMANENT verdict hung on
+    // `cos H · cos φ` — a site authored near the line lets one
+    // longitude ulp flip its whole power budget forever.
+    // `None` covers an unresolved body (already flagged above) or
+    // a non-fixed sun (the verdict cycles — grazing is legal).
+    if let Some(margin) = fixed_sun_cos_margin(sys, s)
+        && margin < FIXED_SUN_TERMINATOR_MIN_COS
+    {
+        out.push(ValidationError::InvalidSite {
+            id: id.to_string(),
+            reason: format!(
+                "site sits {margin:.3e} of |cos H·cos φ| off a FIXED terminator \
+                 (zero-synodic body {:?}) — the permanent Day/Night verdict must not \
+                 hang on a rounding residue; keep ≥ {FIXED_SUN_TERMINATOR_MIN_COS}",
+                s.body.as_str()
+            ),
+        });
+    }
+    if s.launch && !launch_bodies.insert(s.body.as_str()) {
+        out.push(ValidationError::InvalidSite {
+            id: id.to_string(),
+            reason: format!(
+                "second launch site on {:?} — one launch site per body",
+                s.body.as_str()
+            ),
+        });
+    }
+    let mut yields = BTreeSet::new();
+    for (r, y) in &s.resource_yields {
+        if !yields.insert(r.as_str()) {
+            out.push(ValidationError::InvalidSite {
+                id: id.to_string(),
+                reason: format!("duplicate yield resource {r:?}"),
+            });
+        }
+        if !res.contains(r) {
+            out.push(ValidationError::InvalidSite {
+                id: id.to_string(),
+                reason: format!("unknown yield resource {r:?}"),
+            });
+        }
+        if !(y.is_finite() && (0.0..=1.0).contains(y)) {
+            out.push(ValidationError::InvalidSite {
+                id: id.to_string(),
+                reason: format!("yield fraction for {r:?} outside [0,1] or non-finite"),
+            });
+        }
+    }
+    validate_site_stock(s, id, res, out);
 }
 
 /// W2.6: one site's `starting_stock` rows — the seeded stockpile
@@ -2552,9 +2667,16 @@ fn check_power_collision(
 
 /// §3.5.1's `colonies.ron` checks: `schema_version`, every colony
 /// founded on a declared `sites.ron` site, every resource ref known
-/// to `resources.ron` and unique within its list, and every
+/// to `resources.ron` and unique within its list, every
 /// rate/capacity/level field finite and non-negative (a zero rate is
-/// legal — an inert module; negative is not a flow).
+/// legal — an inert module; negative is not a flow), and the
+/// site↔colony cross-fields (C32-F4): a `Drill` module's resource
+/// must carry a positive `resource_yields` entry at the founding site
+/// (otherwise the drill reads concentration 0 forever — authored dead
+/// weight), and each founding `stores` row must have aggregate
+/// `Store`/`Battery` capacity it fits inside (a store-less resource
+/// clamps its founding level to 0; an over-capacity level clamps
+/// down — both silent at apply, so they are caught here).
 #[allow(clippy::too_many_lines)] // the per-module-field check list reads as a list
 #[allow(clippy::cognitive_complexity)] // ditto: it is one flat per-module switch
 pub fn validate_colonies(
@@ -2572,6 +2694,19 @@ pub fn validate_colonies(
         });
     }
     let site_ids: BTreeSet<&str> = sites.sites.iter().map(|s| s.id.as_str()).collect();
+    // First site def wins on a duplicate id — the `by_id` convention
+    // (the duplicate itself is already flagged by `validate_sites`);
+    // the drill-yield and any future site cross-check reads the def
+    // the sim would resolve.
+    let site_defs: BTreeMap<&str, &SiteDef> =
+        sites
+            .sites
+            .iter()
+            .map(|s| (s.id.as_str(), s))
+            .fold(BTreeMap::new(), |mut m, (k, v)| {
+                m.entry(k).or_insert(v);
+                m
+            });
     let recipe_ids: BTreeSet<&str> = recipes.recipes.iter().map(|r| r.def.id.as_str()).collect();
     // First def wins on a duplicate id — the same convention
     // `LoadedRecipes::by_id` gives the sim (`BTreeMap::collect` would
@@ -2651,6 +2786,27 @@ pub fn validate_colonies(
                         bad_colony(
                             site,
                             format!("module {i}: drill min_concentration outside [0,1]"),
+                            &mut out,
+                        );
+                    }
+                    // C32-F4's barren-ground check: the drill's
+                    // concentration comes from the FOUNDING site's
+                    // `resource_yields` — absent (or zero) it produces
+                    // nothing forever while still drawing its EC.
+                    // `None` on the site lookup means the site itself
+                    // is unresolvable (already flagged above).
+                    if let Some(site_def) = site_defs.get(site)
+                        && !site_def
+                            .resource_yields
+                            .iter()
+                            .any(|(r, y)| r == resource && *y > 0.0)
+                    {
+                        bad_colony(
+                            site,
+                            format!(
+                                "module {i}: drill resource {resource:?} has no positive \
+                                 yield at founding site {site:?} — it produces nothing"
+                            ),
                             &mut out,
                         );
                     }
@@ -2743,6 +2899,30 @@ pub fn validate_colonies(
                 }
             }
         }
+        // Aggregate capacity per resource, mirroring
+        // `apply_found_colony`'s Store/Battery fold (the `or_insert`
+        // sum — the sim depends on this crate, never the reverse, so
+        // the fold is re-derived rather than shared). Battery rows
+        // hold `electric_charge` only.
+        let mut capacity: BTreeMap<&str, f64> = BTreeMap::new();
+        for m in &def.modules {
+            match m {
+                crate::colony::ColonyModuleDef::Store {
+                    resource,
+                    capacity: c,
+                } if c.is_finite() && *c >= 0.0 => {
+                    *capacity.entry(resource.as_str()).or_insert(0.0) += *c;
+                }
+                crate::colony::ColonyModuleDef::Battery { capacity: c }
+                    if c.is_finite() && *c >= 0.0 =>
+                {
+                    *capacity
+                        .entry(crate::resource::ELECTRIC_CHARGE)
+                        .or_insert(0.0) += *c;
+                }
+                _ => {}
+            }
+        }
         let mut seen = BTreeSet::new();
         for s in &def.stores {
             if !seen.insert(s.resource.as_str()) {
@@ -2765,6 +2945,35 @@ pub fn validate_colonies(
                     format!("bad store level for {:?}", s.resource),
                     &mut out,
                 );
+            }
+            // C32-F4's store↔capacity cross-check: founding levels
+            // clamp to the aggregate capacities at apply — a store
+            // row naming a resource NO module holds anchors at 0 (the
+            // founding stock silently vanishes), and a level over
+            // capacity clamps down. Both are authored mistakes, not
+            // intent, so both fail validation.
+            if s.level.is_finite() && s.level >= 0.0 {
+                match capacity.get(s.resource.as_str()) {
+                    None => bad_colony(
+                        site,
+                        format!(
+                            "founding store {:?} has no Store/Battery capacity — \
+                             clamps to 0 at founding",
+                            s.resource
+                        ),
+                        &mut out,
+                    ),
+                    Some(&cap) if s.level > cap => bad_colony(
+                        site,
+                        format!(
+                            "founding store {:?} level {} exceeds aggregate capacity {} — \
+                             clamps at founding",
+                            s.resource, s.level, cap
+                        ),
+                        &mut out,
+                    ),
+                    _ => {}
+                }
             }
         }
     }
@@ -4559,6 +4768,73 @@ pub fn validate_contract_loc_keys(
     out
 }
 
+/// §7.7's ID-stability gate over the loaded part set and the committed
+/// baseline (`data/id-baseline.ron`, [`crate::ids::IdBaseline`]):
+///
+/// - every baseline `parts` id must still load, or carry a
+///   `deprecated` → replacement row ([`ValidationError::PartIdDisappeared`]);
+/// - every loaded part id must be in the baseline
+///   ([`ValidationError::PartIdUnrecorded`]) — a new id is permanent
+///   the moment it ships, so the baseline update lands in the same
+///   commit;
+/// - the baseline itself must be coherent: no duplicate `parts`
+///   entries, a `deprecated` key must not still ship, and a
+///   replacement must name a live id ([`ValidationError::BadIdBaseline`]).
+///
+/// The `schema_version` gate runs here too — `load_id_baseline` checks
+/// it at parse, but the "validator re-checks what serde enforced"
+/// convention applies to hand-rolled baselines.
+pub fn validate_id_stability(
+    loaded: &LoadedParts,
+    baseline: &crate::ids::IdBaseline,
+) -> Vec<ValidationError> {
+    let mut out = Vec::new();
+    if baseline.schema_version != crate::ids::ID_BASELINE_SCHEMA_VERSION {
+        out.push(ValidationError::SchemaVersion {
+            file: "id-baseline.ron".to_string(),
+            found: baseline.schema_version,
+            expected: crate::ids::ID_BASELINE_SCHEMA_VERSION,
+        });
+    }
+    let live: BTreeSet<&str> = loaded.parts.iter().map(|p| p.def.id.as_str()).collect();
+    let mut recorded = BTreeSet::new();
+    for id in &baseline.parts {
+        let id = id.as_str();
+        if !recorded.insert(id) {
+            out.push(ValidationError::BadIdBaseline {
+                reason: format!("parts lists {id:?} twice"),
+            });
+        }
+        if !live.contains(id) && !baseline.deprecated.keys().any(|k| k.as_str() == id) {
+            out.push(ValidationError::PartIdDisappeared { id: id.to_string() });
+        }
+    }
+    for id in &live {
+        if !recorded.contains(id) {
+            out.push(ValidationError::PartIdUnrecorded {
+                id: (*id).to_string(),
+            });
+        }
+    }
+    for (old, new) in &baseline.deprecated {
+        if live.contains(old.as_str()) {
+            out.push(ValidationError::BadIdBaseline {
+                reason: format!(
+                    "deprecated id {old:?} still loads — retire the part file or drop the row"
+                ),
+            });
+        }
+        if !live.contains(new.as_str()) {
+            out.push(ValidationError::BadIdBaseline {
+                reason: format!(
+                    "deprecated id {old:?} names replacement {new:?}, which no live part carries"
+                ),
+            });
+        }
+    }
+    out
+}
+
 /// The whole `data/` tree as the loaders hand it back — one field per
 /// file kind, the [`validate_dataset`] input. Borrowed, never owned:
 /// the caller loads once and hands the sweep views.
@@ -4586,6 +4862,10 @@ pub struct Dataset<'a> {
     pub parts: &'a LoadedParts,
     /// `data/loc/en.ron`.
     pub loc: &'a LocFile,
+    /// `data/id-baseline.ron` when the tree authors one — `None`
+    /// disables the §7.7 tripwire for that data set (the demo's
+    /// reduced tree ships no baseline).
+    pub id_baseline: Option<&'a crate::ids::IdBaseline>,
 }
 
 /// The §8.2 semantic gate over a fully loaded `data/` tree — the same
@@ -4621,6 +4901,9 @@ pub fn validate_dataset(d: &Dataset<'_>) -> Vec<ValidationError> {
         d.resources,
         d.recipes,
     ));
+    if let Some(baseline) = d.id_baseline {
+        out.extend(validate_id_stability(d.parts, baseline));
+    }
     out.extend(validate_loc(d.loc));
     out.extend(validate_loc_keys(d.system, d.loc));
     out.extend(validate_site_loc_keys(d.sites, d.loc));
@@ -4676,7 +4959,7 @@ mod tests {
         let period = 2.0 * core::f64::consts::PI * libm::sqrt(a * a * a / mu_star);
         let star = LoadedBody {
             def: BodyDef {
-                schema_version: SCHEMA_VERSION,
+                schema_version: BODY_SCHEMA_VERSION,
                 id: "star".into(),
                 display_name: "body.star.name".into(),
                 parent: None,
@@ -4700,7 +4983,7 @@ mod tests {
         };
         let planet = LoadedBody {
             def: BodyDef {
-                schema_version: SCHEMA_VERSION,
+                schema_version: BODY_SCHEMA_VERSION,
                 id: "planet".into(),
                 display_name: "body.planet.name".into(),
                 parent: Some("star".into()),
@@ -4741,6 +5024,7 @@ mod tests {
                 epoch_note: "system.test.epoch_note".into(),
             },
             bodies: vec![star, planet],
+            orphans: Vec::new(),
         }
     }
 
@@ -5032,7 +5316,7 @@ mod tests {
         });
         b.biomes = Some(LoadedBiomeMap {
             legend: crate::biome::BiomeLegend {
-                schema_version: SCHEMA_VERSION,
+                schema_version: crate::biome::BIOME_SCHEMA_VERSION,
                 entries: vec![
                     BiomeLegendEntry {
                         index: 0,
@@ -5134,7 +5418,7 @@ mod tests {
         loc.insert("body.star.name".to_string(), "x".to_string());
         // Deliberately omit body.planet.name.
         let loc = LocFile {
-            schema_version: SCHEMA_VERSION,
+            schema_version: crate::loc::LOC_SCHEMA_VERSION,
             strings: loc,
         };
         let errs = validate_loc_keys(&fixture(), &loc);
@@ -5847,7 +6131,7 @@ mod tests {
     fn part_loc_key_resolution_is_rejected_when_missing() {
         let loaded = loaded_part(part_fixture());
         let loc = LocFile {
-            schema_version: SCHEMA_VERSION,
+            schema_version: crate::loc::LOC_SCHEMA_VERSION,
             strings: std::collections::BTreeMap::new(),
         };
         let errs = validate_part_loc_keys(&loaded, &res_fixture(), &loc);
@@ -6083,14 +6367,14 @@ mod tests {
         let sites = SiteFile {
             schema_version: crate::site::SITE_SCHEMA_VERSION,
             sites: vec![crate::site::SiteDef {
-                schema_version: crate::site::SITE_SCHEMA_VERSION,
+                schema_version: 0,
                 id: "pad".into(),
                 display_name: LocKey::from("site.pad"),
-                body: "terrin".into(),
+                body: "planet".into(),
                 latitude_rad: 0.0,
                 longitude_rad: 0.0,
                 altitude_m: 0.0,
-                launch: false,
+                launch: true,
                 resource_yields: vec![("ore".into(), 0.5)],
                 starting_stock: vec![],
             }],
@@ -6326,7 +6610,7 @@ mod tests {
     #[test]
     fn colony_and_recipe_loc_keys_are_checked() {
         let loc = LocFile {
-            schema_version: SCHEMA_VERSION,
+            schema_version: crate::loc::LOC_SCHEMA_VERSION,
             strings: BTreeMap::new(),
         };
         let colonies = crate::colony::ColonyFile {
@@ -6365,18 +6649,26 @@ mod tests {
         );
     }
 
-    /// Each `SiteDef` entry re-declares its own version — the same
-    /// current-or-previous band as the `SiteFile` wrapper.
+    /// The legacy per-entry version (`SiteDef::schema_version`, now
+    /// optional): a declared value gets the same current-or-previous
+    /// band as the `SiteFile` wrapper; `0` — "not declared", the
+    /// current authoring form — needs nothing.
     #[test]
     fn site_entry_schema_version_is_checked() {
         let (_, mut sites, res, _) = colony_fixture();
-        sites.sites[0].schema_version = 0;
+        sites.sites[0].schema_version = 99;
         let errs = validate_sites(&sites, &fixture(), &res);
         assert!(
             errs.iter()
-                .any(|e| matches!(e, ValidationError::SchemaVersion { found: 0, .. })),
+                .any(|e| matches!(e, ValidationError::SchemaVersion { found: 99, .. })),
             "{errs:?}"
         );
+        // Undeclared (0) is clean; so is a declared version in the band.
+        let (_, mut sites, res, _) = colony_fixture();
+        sites.sites[0].schema_version = 0;
+        assert!(validate_sites(&sites, &fixture(), &res).is_empty());
+        sites.sites[0].schema_version = crate::site::SITE_SCHEMA_VERSION;
+        assert!(validate_sites(&sites, &fixture(), &res).is_empty());
     }
 
     /// C09-F2's loader-time guard: on a zero-synodic body (the

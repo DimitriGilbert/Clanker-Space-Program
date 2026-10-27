@@ -1,0 +1,37 @@
+// §7.7 ID-stability baseline — the committed record of every `PartId`
+// the data set ships. `PartId` strings are permanent: renaming or
+// deleting one requires a `deprecated` row mapping the old id to its
+// replacement (the pre-1.0 stand-in for a migration entry), and
+// `validate_id_stability` (wired into `validate_dataset`) fails in CI
+// on an id that disappears without one — or appears without being
+// recorded here. Keep `parts` in lockstep with `data/parts/**`: the
+// validator rejects both directions of drift.
+//
+// Hashed like every other file under `data/` (§3.1): a baseline edit
+// IS a data-set change, which is exactly the fingerprint semantics
+// §7.7's drift warning wants.
+(
+    schema_version: 1,
+    parts: [
+        "csp.battery.z1k",
+        "csp.chute.s125",
+        "csp.decoupler.s125",
+        "csp.dockport.s125",
+        "csp.engine.ember",
+        "csp.engine.sparc",
+        "csp.lab.mk1",
+        "csp.legs.s125",
+        "csp.nosecone.s125",
+        "csp.pod.mk1",
+        "csp.probe.s0625",
+        "csp.science.canister",
+        "csp.structure.adapter",
+        "csp.tank.life.s",
+        "csp.tank.ore.s",
+        "csp.tank.s160",
+        "csp.tank.s320",
+    ],
+    // Retired id → live replacement. Empty today — nothing has been
+    // retired since the baseline was cut (fix-plan 5.4, C32-F3).
+    deprecated: {},
+)

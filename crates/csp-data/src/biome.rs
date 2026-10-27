@@ -34,12 +34,19 @@ pub struct BiomeLegendEntry {
     pub name: LocKey,
 }
 
+/// The `schema_version` this loader/validator pair understands for
+/// `biomes.ron` legends — its own namespace, like
+/// [`crate::system::BODY_SCHEMA_VERSION`] (§3.1's per-file-type
+/// versioning; previously shared `crate::system::SCHEMA_VERSION`, which
+/// coupled the legend's version to the system manifest's — C31-F2).
+pub const BIOME_SCHEMA_VERSION: u32 = 1;
+
 /// `biomes.ron` — the versioned legend for a body's `biomes.png`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BiomeLegend {
     /// First field of every data file (§3.1). Must equal
-    /// [`crate::system::SCHEMA_VERSION`].
+    /// [`BIOME_SCHEMA_VERSION`].
     pub schema_version: u32,
     /// Legend rows. Indices must be unique and within the PNG's palette.
     pub entries: Vec<BiomeLegendEntry>,

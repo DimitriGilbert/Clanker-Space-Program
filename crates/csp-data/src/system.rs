@@ -11,10 +11,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{BodyId, LocKey, ResourceId, SystemId};
 
-/// The `schema_version` this loader/validator pair understands (§3.1).
-/// Bump when the schema changes; old versions get explicit defaults in
-/// the loader rather than bare serde errors.
+/// The `schema_version` this loader/validator pair understands for
+/// `system.ron` (§3.1). Bump when the schema changes; old versions get
+/// explicit defaults in the loader rather than bare serde errors.
+///
+/// This constant gates `system.ron` ONLY — `body.ron` carries its own
+/// [`BODY_SCHEMA_VERSION`]: a `BodyDef` schema bump must not refuse
+/// every system manifest, and vice versa (C31-F2 — the four file types
+/// used to share this one constant, which coupled their version
+/// histories).
 pub const SCHEMA_VERSION: u32 = 1;
+
+/// The `schema_version` this loader/validator pair understands for
+/// `<body>/body.ron` — its own namespace (§3.1's per-file-type
+/// versioning; see [`SCHEMA_VERSION`]).
+pub const BODY_SCHEMA_VERSION: u32 = 1;
 
 /// Classical Keplerian elements for a body or vessel on rails (§2.8
 /// `OrbitState` consumes this; `epoch` lives there — a body's epoch is
@@ -174,7 +185,7 @@ pub struct SystemDef {
 #[serde(deny_unknown_fields)]
 pub struct BodyDef {
     /// First field of every data file (§3.1). Must equal
-    /// [`SCHEMA_VERSION`].
+    /// [`BODY_SCHEMA_VERSION`].
     pub schema_version: u32,
     /// Body identifier — must equal its entry in [`SystemDef::bodies`]
     /// (and therefore its directory name).

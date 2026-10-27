@@ -35,6 +35,12 @@ use crate::ids::{BodyId, LocKey, ResourceId, SiteId};
 /// parses: the field defaults to an empty stockpile (manufacture and
 /// bench orders there simply have nothing to spend — the arena row
 /// exists and recovery keeps crediting into it).
+///
+/// Still v3 after the per-entry `schema_version` duplication was
+/// dropped (fix-plan 5.4, C31-F2): entries now *may* declare it
+/// (`Option`, band-checked when present) but no longer must — a
+/// compatibility relaxation inside the same file format, not a new
+/// version.
 pub const SITE_SCHEMA_VERSION: u32 = 3;
 
 /// The `sites.ron` versions `load_sites` accepts: the current schema
@@ -52,8 +58,17 @@ pub const SITE_SCHEMA_SUPPORTED: [u32; 2] = [SITE_SCHEMA_VERSION - 1, SITE_SCHEM
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SiteDef {
-    /// First field of every data file (§3.1). Must equal
-    /// [`SITE_SCHEMA_VERSION`].
+    /// **Legacy** per-entry version. V1–v3 files re-declared
+    /// `schema_version` on every entry — a duplication of the
+    /// file-level field that made entries the only in-file collection
+    /// rows carrying their own version (C31-F2). Authored files no
+    /// longer declare it: `#[serde(default)]` reads the omission as
+    /// `0` = "not declared" so the [`SITE_SCHEMA_SUPPORTED`] band keeps
+    /// parsing the files that do declare it (the §3.1 "current and
+    /// previous" promise), and the validator still band-checks a
+    /// nonzero declared value. The `SiteFile::schema_version` is the
+    /// only one that means anything.
+    #[serde(default)]
     pub schema_version: u32,
     /// Stable site ID (`"terrin-launch"` — §3.1's stable-strings rule).
     pub id: SiteId,

@@ -21,7 +21,6 @@
     schema_version: 3,
     sites: [
         (
-            schema_version: 3,
             id: "terrin-launch",
             display_name: "site.terrin-launch",
             body: "terrin",
@@ -63,7 +62,6 @@
             ],
         ),
         (
-            schema_version: 3,
             id: "terrin-downrange",
             display_name: "site.terrin-downrange",
             body: "terrin",
@@ -76,7 +74,6 @@
             ],
         ),
         (
-            schema_version: 3,
             id: "rask-mines",
             display_name: "site.rask-mines",
             body: "rask",

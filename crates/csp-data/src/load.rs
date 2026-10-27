@@ -26,16 +26,17 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::balance::{BALANCE_SCHEMA_VERSION, BalanceDef};
-use crate::biome::BiomeLegend;
+use crate::biome::{BIOME_SCHEMA_VERSION, BiomeLegend};
 use crate::colony::{COLONY_SCHEMA_VERSION, ColonyFile};
 use crate::contract::{CONTRACT_SCHEMA_VERSION, ContractTemplate};
 use crate::experiment::{EXPERIMENT_SCHEMA_VERSION, ExperimentDef};
-use crate::ids::ExperimentId;
+use crate::ids::{ExperimentId, ID_BASELINE_SCHEMA_VERSION, IdBaseline};
+use crate::loc::LOC_SCHEMA_VERSION;
 use crate::part::{PART_SCHEMA_VERSION, PartDef};
 use crate::recipe::{RECIPE_SCHEMA_VERSION, RecipeDef};
 use crate::resource::{RESOURCE_SCHEMA_VERSION, ResourceFile};
 use crate::site::{SITE_SCHEMA_SUPPORTED, SITE_SCHEMA_VERSION, SiteFile};
-use crate::system::{BodyDef, SCHEMA_VERSION, SystemDef};
+use crate::system::{BODY_SCHEMA_VERSION, BodyDef, SCHEMA_VERSION, SystemDef};
 use crate::techtree::{TECHTREE_SCHEMA_VERSION, TechTree, TechTreeDef};
 
 /// A biome map as loaded: legend (parsed) plus the PNG's raw bytes.
@@ -69,6 +70,16 @@ pub struct LoadedSystem {
     pub system: SystemDef,
     /// One [`LoadedBody`] per manifest entry, in manifest order.
     pub bodies: Vec<LoadedBody>,
+    /// Content under the system directory the manifest does NOT
+    /// reference, ascending path order — an unlisted `<body>/`
+    /// directory, or a file inside a body directory that the def
+    /// never names (a stray `biomes.png` beside a `biome_map: None`
+    /// body is the classic case). The manifest-driven load silently
+    /// skips these; they are recorded here so the validator can flag
+    /// them ([`crate::validate::validate_system`] →
+    /// [`crate::ValidationError::OrphanContent`]) — C31-F3. Empty for
+    /// a clean tree.
+    pub orphans: Vec<PathBuf>,
 }
 
 /// One loaded part def plus the file it came from — the validator
@@ -117,20 +128,27 @@ pub enum LoadError {
     /// `schema_version` is present but not one this loader understands.
     /// The accepted set is per file type, not a uniform
     /// current-and-previous band: `sites.ron` accepts
-    /// [`crate::site::SITE_SCHEMA_SUPPORTED`] (v1 and v2 — v1 reads
-    /// `resource_yields` as empty via serde defaults), while
+    /// [`crate::site::SITE_SCHEMA_SUPPORTED`] (`[2, 3]` — a v2 file
+    /// reads `starting_stock` as empty via serde defaults), while
     /// `colonies.ron` accepts only v2 — its v1→v2 restructure
     /// (`rate_per_s` rename, `Converter` inline pairs → `RecipeId`
     /// indirection) has no honest mechanical mapping, so v1 is refused
     /// outright rather than mis-migrated. Every other file type takes
     /// its current version exactly (`balance.ron` is at v11).
+    ///
+    /// §3.1 asks for a current-and-previous band on *every* file type;
+    /// the per-file-type policy is the recorded §7.7 deferral (see
+    /// PLAN §7.7's note): a band is added to a file type's
+    /// `*_SCHEMA_VERSION` when its second version actually ships, not
+    /// speculatively.
     UnsupportedSchemaVersion {
         /// The file carrying the bad version.
         path: PathBuf,
         /// What the file declared.
         found: u32,
-        /// The schema version the loader for this file type knows.
-        expected: u32,
+        /// The schema versions the loader for this file type accepts,
+        /// ascending — a one-element band for exact-match types.
+        supported: Vec<u32>,
     },
     /// An authored name — a `system.bodies` entry or a file reference
     /// (`biomes.ron` legend/png, `heightmap`, concentration map) — is
@@ -162,11 +180,12 @@ impl fmt::Display for LoadError {
             Self::UnsupportedSchemaVersion {
                 path,
                 found,
-                expected,
+                supported,
             } => write!(
                 f,
-                "{}: unsupported schema_version {found} (loader knows {expected})",
-                path.display()
+                "{}: unsupported schema_version {found} (loader accepts {})",
+                path.display(),
+                version_band(supported)
             ),
             Self::UnsafeName { path, name } => write!(
                 f,
@@ -211,6 +230,22 @@ pub trait DataSource {
     /// Every `*.ron` file under `dir`, ascending path order — the
     /// `collect_ron_files` determinism contract.
     fn ron_files(&self, dir: &Path) -> Result<Vec<PathBuf>, LoadError>;
+    /// The immediate children of `dir` — files AND directories, one
+    /// level deep, ascending path order. `ron_files` only ever
+    /// surfaces `*.ron` files, so the manifest-vs-tree cross-check
+    /// (orphan body directories, stray biome maps) needs this view.
+    /// [`LoadError::Io`] when `dir` cannot be listed.
+    fn entries(&self, dir: &Path) -> Result<Vec<SourceEntry>, LoadError>;
+}
+
+/// One immediate child of a [`DataSource::entries`] listing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceEntry {
+    /// The entry's full path (`dir` joined with its name).
+    pub path: PathBuf,
+    /// `true` for a directory — including the directories an
+    /// [`EmbeddedSource`] synthesizes from deeper file paths.
+    pub is_dir: bool,
 }
 
 /// Read `data/` from the filesystem — the native/default source.
@@ -243,6 +278,39 @@ impl DataSource for FsDataSource {
     fn ron_files(&self, dir: &Path) -> Result<Vec<PathBuf>, LoadError> {
         let mut out = Vec::new();
         collect_ron_files(dir, &mut out)?;
+        Ok(out)
+    }
+
+    fn entries(&self, dir: &Path) -> Result<Vec<SourceEntry>, LoadError> {
+        let entries = std::fs::read_dir(dir)
+            .map_err(|source| LoadError::Io {
+                path: dir.to_path_buf(),
+                source,
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| LoadError::Io {
+                path: dir.to_path_buf(),
+                source,
+            })?;
+        let mut out = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let path = entry.path();
+            // `file_type` does not follow symlinks — same refusal as
+            // `gather_ron_files`: a link's target could live outside
+            // the directory the caller handed the loader.
+            let ft = entry.file_type().map_err(|source| LoadError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if ft.is_symlink() {
+                return Err(LoadError::Symlink { path });
+            }
+            out.push(SourceEntry {
+                path,
+                is_dir: ft.is_dir(),
+            });
+        }
+        out.sort_by(|a, b| a.path.as_os_str().cmp(b.path.as_os_str()));
         Ok(out)
     }
 }
@@ -321,6 +389,39 @@ impl DataSource for EmbeddedSource {
         out.sort_by_cached_key(|p| ron_sort_key(dir, p));
         Ok(out)
     }
+
+    /// An embedded tree has no real directories — they are synthesized
+    /// from deeper file paths: a file `data/sys/a/b/c.ron` lists `a` as
+    /// a directory under `data/sys`. A `dir` nothing sits under reads
+    /// as empty (the `exists` convention), never an error.
+    fn entries(&self, dir: &Path) -> Result<Vec<SourceEntry>, LoadError> {
+        let mut out: Vec<SourceEntry> = Vec::new();
+        for key in self.files.keys() {
+            let Ok(rel) = key.strip_prefix(dir) else {
+                continue;
+            };
+            let mut components = rel.components();
+            let Some(first) = components.next() else {
+                // `key == dir` — the path itself, not a child.
+                continue;
+            };
+            let child = dir.join(first.as_os_str());
+            let is_dir = components.next().is_some();
+            match out.last_mut() {
+                // Consecutive keys share the first component — fold
+                // them into one entry. A path that is BOTH a file and
+                // a directory can exist only in a synthetic table (the
+                // filesystem forbids it); reporting `is_dir` there is
+                // the louder read for the orphan check.
+                Some(last) if last.path == child => last.is_dir |= is_dir,
+                _ => out.push(SourceEntry {
+                    path: child,
+                    is_dir,
+                }),
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// A `schema_version`-only view of a versioned data file — every file's
@@ -336,6 +437,21 @@ struct SchemaProbe {
     schema_version: Option<u32>,
 }
 
+/// Render a supported-version band for diagnostics: `[2]` → `v2`,
+/// `[2, 3]` → `v2 or v3`, `[2, 3, 4]` → `v2, v3, or v4`.
+fn version_band(supported: &[u32]) -> String {
+    match supported {
+        [] => "nothing".to_string(),
+        [v] => format!("v{v}"),
+        many => {
+            let (last, rest) = many.split_last().map_or((&0, &[][..]), |(l, r)| (l, r));
+            let mut s = rest.iter().map(|v| format!("v{v}")).collect::<Vec<_>>();
+            s.push(format!("or v{last}"));
+            s.join(", ")
+        }
+    }
+}
+
 fn check_version(path: &Path, found: u32, supported: &[u32]) -> Result<(), LoadError> {
     if supported.contains(&found) {
         Ok(())
@@ -343,7 +459,7 @@ fn check_version(path: &Path, found: u32, supported: &[u32]) -> Result<(), LoadE
         Err(LoadError::UnsupportedSchemaVersion {
             path: path.to_path_buf(),
             found,
-            expected: *supported.last().unwrap_or(&0),
+            supported: supported.to_vec(),
         })
     }
 }
@@ -376,11 +492,34 @@ fn read_versioned_ron<T: serde::de::DeserializeOwned>(
 /// `true` for a tame one-segment file/dir name — what authored names
 /// (body ids, `biomes.ron`/`*.png` refs, heightmaps, concentration
 /// maps) must satisfy before they may be joined under a data dir:
-/// non-empty, not `.`/`..`, and free of `/`, `\`, and NUL. The
-/// validator repeats the check ([`crate::validate`]) so a hand-rolled
+/// non-empty, not `.`/`..`, free of `/`, `\`, NUL, and `:` (a
+/// drive-prefixed `C:x` has a Windows prefix but no root —
+/// `dir.join("C:x")` there *replaces* the base, escaping the handed
+/// tree; the check is applied on every platform so the data set is
+/// portable), and not a DOS device name (C31-F4). The validator
+/// repeats the check ([`crate::validate`]) so a hand-rolled
 /// `LoadedSystem` cannot smuggle an unsafe ref to later consumers.
 pub(crate) fn authored_name_ok(name: &str) -> bool {
-    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', '\0'])
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains(['/', '\\', '\0', ':'])
+        && !is_dos_device_name(name)
+}
+
+/// Windows reserves these device stems in *every* directory, with or
+/// without an extension (`con`, `nul.png`, `COM1` all resolve to the
+/// device, not a file) — so an authored name matching one would read
+/// the device instead of a data file on a Windows host. The stem is
+/// the text before the first `.`.
+pub(crate) fn is_dos_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name);
+    let upper = stem.to_ascii_uppercase();
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.as_bytes()[3].is_ascii_digit()
+            && upper.as_bytes()[3] != b'0')
 }
 
 /// `dir.join(name)` for an *authored* single-segment relative name —
@@ -419,6 +558,25 @@ pub fn load_system_from(src: &dyn DataSource, dir: &Path) -> Result<LoadedSystem
             d.schema_version
         })?;
 
+    // C31-F3's manifest-vs-tree cross-check: the manifest names every
+    // body directory, so a top-level directory the manifest does NOT
+    // name is an orphan — a body that loads nowhere and whose only
+    // observable effect would be a data-set-hash flip. Files at
+    // system scope are NOT flagged: `sites.ron`/`colonies.ron` (and
+    // fixture sidecars under `data/test-fixtures/`) legitimately sit
+    // beside the manifest without appearing in it.
+    let mut orphans = Vec::new();
+    for e in src.entries(dir)? {
+        if e.is_dir
+            && !system
+                .bodies
+                .iter()
+                .any(|id| e.path.file_name().is_some_and(|n| n == id.as_str()))
+        {
+            orphans.push(e.path.clone());
+        }
+    }
+
     let mut bodies = Vec::with_capacity(system.bodies.len());
     for id in &system.bodies {
         // Authored names become path components here — tame names only
@@ -427,7 +585,7 @@ pub fn load_system_from(src: &dyn DataSource, dir: &Path) -> Result<LoadedSystem
         let body_dir = join_authored(dir, id.as_str(), &system_path)?;
         let body_path = body_dir.join("body.ron");
         let def: BodyDef =
-            read_versioned_ron(src, &body_path, &[SCHEMA_VERSION], |d: &BodyDef| {
+            read_versioned_ron(src, &body_path, &[BODY_SCHEMA_VERSION], |d: &BodyDef| {
                 d.schema_version
             })?;
 
@@ -435,18 +593,46 @@ pub fn load_system_from(src: &dyn DataSource, dir: &Path) -> Result<LoadedSystem
             None => None,
             Some(r) => {
                 let legend_path = join_authored(&body_dir, &r.legend, &body_path)?;
-                let legend: BiomeLegend =
-                    read_versioned_ron(src, &legend_path, &[SCHEMA_VERSION], |l: &BiomeLegend| {
-                        l.schema_version
-                    })?;
+                let legend: BiomeLegend = read_versioned_ron(
+                    src,
+                    &legend_path,
+                    &[BIOME_SCHEMA_VERSION],
+                    |l: &BiomeLegend| l.schema_version,
+                )?;
                 let png_path = join_authored(&body_dir, &r.png, &body_path)?;
                 let png = src.read_bytes(&png_path)?;
                 Some(LoadedBiomeMap { legend, png })
             }
         };
+        // Everything the def references by name is expected inside its
+        // directory; any other entry (a stray `biomes.png` beside a
+        // `biome_map: None` body, an unlisted subdirectory) is orphan
+        // content the manifest never reads (C31-F3). `entries` cannot
+        // fail here — `body.ron` already read out of this directory.
+        let mut expected: BTreeMap<std::ffi::OsString, ()> = BTreeMap::new();
+        expected.insert(std::ffi::OsString::from("body.ron"), ());
+        if let Some(r) = &def.biome_map {
+            expected.insert(r.legend.clone().into(), ());
+            expected.insert(r.png.clone().into(), ());
+        }
+        if let Some(h) = &def.terrain.heightmap {
+            expected.insert(h.clone().into(), ());
+        }
+        for (_, map) in &def.surface_resources {
+            expected.insert(map.png.clone().into(), ());
+        }
+        for e in src.entries(&body_dir)? {
+            if !e.path.file_name().is_some_and(|n| expected.contains_key(n)) {
+                orphans.push(e.path.clone());
+            }
+        }
         bodies.push(LoadedBody { def, biomes });
     }
-    Ok(LoadedSystem { system, bodies })
+    Ok(LoadedSystem {
+        system,
+        bodies,
+        orphans,
+    })
 }
 
 /// Load `data/balance.ron` — the global tuning file (§8.3). Its path is
@@ -915,9 +1101,38 @@ pub fn load_loc(path: &Path) -> Result<crate::loc::LocFile, LoadError> {
 
 /// [`load_loc`] against an arbitrary [`DataSource`].
 pub fn load_loc_from(src: &dyn DataSource, path: &Path) -> Result<crate::loc::LocFile, LoadError> {
-    read_versioned_ron(src, path, &[SCHEMA_VERSION], |l: &crate::loc::LocFile| {
-        l.schema_version
-    })
+    read_versioned_ron(
+        src,
+        path,
+        &[LOC_SCHEMA_VERSION],
+        |l: &crate::loc::LocFile| l.schema_version,
+    )
+}
+
+/// Load `data/id-baseline.ron` — the §7.7 ID-stability baseline
+/// [`crate::ids::IdBaseline`]. A MISSING file reads as `None`: the
+/// gate is opt-in per data set (the §6.3 demo's reduced tree ships no
+/// baseline, so it must not shadow the shipping set's).
+/// [`crate::validate::validate_id_stability`] runs the check itself.
+pub fn load_id_baseline(path: &Path) -> Result<Option<IdBaseline>, LoadError> {
+    load_id_baseline_from(&FsDataSource, path)
+}
+
+/// [`load_id_baseline`] against an arbitrary [`DataSource`].
+pub fn load_id_baseline_from(
+    src: &dyn DataSource,
+    path: &Path,
+) -> Result<Option<IdBaseline>, LoadError> {
+    if !src.exists(path) {
+        return Ok(None);
+    }
+    read_versioned_ron(
+        src,
+        path,
+        &[ID_BASELINE_SCHEMA_VERSION],
+        |b: &IdBaseline| b.schema_version,
+    )
+    .map(Some)
 }
 
 #[cfg(test)]

@@ -53,10 +53,22 @@ convention). `sites.ron`/`colonies.ron` are optional per system. `resources.ron`
   current **and previous** (v2 lacks `starting_stock` → reads empty; `SITE_SCHEMA_SUPPORTED = [2, 3]`);
   `colonies.ron` accepts **only v2** (its v1→v2 restructure has no honest mapping —
   refused outright). Pre-1.0 policy: a schema bump may invalidate data files with no
-  migration written (PLAN §7.7).
+  migration written (PLAN §7.7, whose recorded note defers §3.1's uniform
+  current-and-previous band per file type — each `*_SCHEMA_VERSION` grows a
+  `[v-1, v]` band when that type's second version actually ships). Each file type
+  has its own constant (`system::SCHEMA_VERSION`, `BODY_SCHEMA_VERSION`,
+  `BIOME_SCHEMA_VERSION`, `LOC_SCHEMA_VERSION`, …); `SiteDef` entries no longer
+  re-declare the file version (`schema_version` on a site entry is a legacy
+  optional field — `0`/absent is the current authoring form, a declared value is
+  still band-checked).
 - **Stable string IDs everywhere** (`csp.engine.sparc`) — never indices; saves and
   science keys depend on them (PLAN §3.1). For registry files, the **id must equal
-  the file stem** (validator rule).
+  the file stem** (validator rule). `PartId`s are additionally permanent
+  (PLAN §7.7): `data/id-baseline.ron` records the shipped set plus
+  `deprecated` → replacement rows, and `validate_id_stability` (wired into
+  `validate_dataset`) fails on a baseline id that disappears without a
+  replacement or a loaded id the baseline does not record — update the
+  baseline in the same commit that adds or retires a part.
 - **Every struct is `#[serde(deny_unknown_fields)]`** — an unknown key is a load
   error, not a silent skip.
 - **No path traversal**: authored names that become path components (`system.bodies`

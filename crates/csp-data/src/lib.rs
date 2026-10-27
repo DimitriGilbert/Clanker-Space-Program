@@ -71,7 +71,8 @@ pub mod validate;
 
 pub use balance::{BALANCE_SCHEMA_VERSION, BalanceDef};
 pub use biome::{
-    BiomeLegend, BiomeLegendEntry, IndexedPng, PngInfo, decode_indexed_png, inspect_indexed_png,
+    BIOME_SCHEMA_VERSION, BiomeLegend, BiomeLegendEntry, IndexedPng, PngInfo, decode_indexed_png,
+    inspect_indexed_png,
 };
 pub use colony::{COLONY_SCHEMA_VERSION, ColonyDef, ColonyFile, ColonyModuleDef, ColonyStoreInit};
 pub use contract::{
@@ -81,19 +82,21 @@ pub use contract::{
 pub use datahash::{DataHashError, data_set_hash};
 pub use experiment::{EXPERIMENT_SCHEMA_VERSION, ExperimentCap, ExperimentDef};
 pub use ids::{
-    BiomeId, BodyId, ContractTypeId, ExperimentId, FacilityId, FamilyId, LocKey, PartId, RecipeId,
-    ResourceId, SiteId, SystemId, TechNodeId, UpgradeTrackId, VariantId,
+    BiomeId, BodyId, ContractTypeId, ExperimentId, FacilityId, FamilyId,
+    ID_BASELINE_SCHEMA_VERSION, IdBaseline, LocKey, PartId, RecipeId, ResourceId, SiteId, SystemId,
+    TechNodeId, UpgradeTrackId, VariantId,
 };
 pub use load::{
     DataSource, EmbeddedSource, FsDataSource, LoadError, LoadedBiomeMap, LoadedBody,
     LoadedContract, LoadedContracts, LoadedExperiment, LoadedExperiments, LoadedPart, LoadedParts,
-    LoadedRecipe, LoadedRecipes, LoadedSystem, LoadedTechFile, LoadedTechTree, load_balance,
-    load_balance_from, load_colonies, load_colonies_from, load_contracts, load_contracts_from,
-    load_experiments, load_experiments_from, load_loc, load_loc_from, load_parts, load_parts_from,
-    load_recipes, load_recipes_from, load_resources, load_resources_from, load_sites,
-    load_sites_from, load_system, load_system_from, load_techtree, load_techtree_from,
+    LoadedRecipe, LoadedRecipes, LoadedSystem, LoadedTechFile, LoadedTechTree, SourceEntry,
+    load_balance, load_balance_from, load_colonies, load_colonies_from, load_contracts,
+    load_contracts_from, load_experiments, load_experiments_from, load_id_baseline,
+    load_id_baseline_from, load_loc, load_loc_from, load_parts, load_parts_from, load_recipes,
+    load_recipes_from, load_resources, load_resources_from, load_sites, load_sites_from,
+    load_system, load_system_from, load_techtree, load_techtree_from,
 };
-pub use loc::LocFile;
+pub use loc::{LOC_SCHEMA_VERSION, LocFile};
 pub use part::{
     AeroDef, AeroKnot, AttachNode, ColliderDef, FailureMode, G0, ModuleDef, PART_SCHEMA_VERSION,
     PartCategory, PartDef, PartVariant, PortSize, QualCurve, QualKnot, ReliabilityDef,
@@ -106,8 +109,8 @@ pub use resource::{
 };
 pub use site::{SITE_SCHEMA_SUPPORTED, SITE_SCHEMA_VERSION, SiteDef, SiteFile};
 pub use system::{
-    AtmosphereDef, BiomeMapRef, BodyDef, ConcentrationMapRef, KeplerElements, OceanDef,
-    SCHEMA_VERSION, SystemDef, TemperatureKnot, TerrainDef,
+    AtmosphereDef, BODY_SCHEMA_VERSION, BiomeMapRef, BodyDef, ConcentrationMapRef, KeplerElements,
+    OceanDef, SCHEMA_VERSION, SystemDef, TemperatureKnot, TerrainDef,
 };
 pub use techtree::{
     TECHTREE_SCHEMA_VERSION, TechNode, TechTree, TechTreeDef, TechUnlocks, UpgradeEffect,
@@ -116,8 +119,8 @@ pub use techtree::{
 pub use validate::{
     Dataset, PERIOD_REL_TOL, ValidationError, validate_balance, validate_colonies,
     validate_colony_loc_keys, validate_contract_loc_keys, validate_contracts, validate_dataset,
-    validate_experiment_loc_keys, validate_experiments, validate_loc, validate_loc_keys,
-    validate_part_loc_keys, validate_parts, validate_recipe_loc_keys, validate_recipes,
-    validate_resources, validate_site_loc_keys, validate_sites, validate_system, validate_techtree,
-    validate_techtree_loc_keys,
+    validate_experiment_loc_keys, validate_experiments, validate_id_stability, validate_loc,
+    validate_loc_keys, validate_part_loc_keys, validate_parts, validate_recipe_loc_keys,
+    validate_recipes, validate_resources, validate_site_loc_keys, validate_sites, validate_system,
+    validate_techtree, validate_techtree_loc_keys,
 };

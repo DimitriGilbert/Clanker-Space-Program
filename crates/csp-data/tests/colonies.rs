@@ -15,8 +15,8 @@
 use std::path::{Path, PathBuf};
 
 use csp_data::{
-    LocFile, load_colonies, load_recipes, load_resources, load_sites, validate_colonies,
-    validate_colony_loc_keys, validate_recipe_loc_keys, validate_recipes,
+    LocFile, ValidationError, load_colonies, load_recipes, load_resources, load_sites,
+    validate_colonies, validate_colony_loc_keys, validate_recipe_loc_keys, validate_recipes,
 };
 
 fn repo_root() -> PathBuf {
@@ -146,5 +146,163 @@ fn authored_colony_runs_recipe_composite() {
             .iter()
             .any(|r| r.def.id.as_str() == "recipe.composite"),
         "data/recipes lost recipe.composite while a colony consumes it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// C32-F4: colony cross-field gates (synthetic fixtures — the shipped set is
+// the green path covered above).
+// ---------------------------------------------------------------------------
+
+/// A colony at site "pad" (one ore yield) with a drill on it plus the
+/// minimal resource set — every negative below mutates one piece.
+fn cross_fixture() -> (
+    csp_data::ColonyFile,
+    csp_data::SiteFile,
+    csp_data::ResourceFile,
+    csp_data::LoadedRecipes,
+) {
+    let site = csp_data::SiteDef {
+        schema_version: 0,
+        id: "pad".into(),
+        display_name: csp_data::LocKey::from("site.pad"),
+        body: "terra".into(),
+        latitude_rad: 0.0,
+        longitude_rad: 0.0,
+        altitude_m: 0.0,
+        launch: true,
+        resource_yields: vec![("ore".into(), 0.5)],
+        starting_stock: Vec::new(),
+    };
+    let sites = csp_data::SiteFile {
+        schema_version: csp_data::SITE_SCHEMA_VERSION,
+        sites: vec![site],
+    };
+    let colony = csp_data::ColonyDef {
+        site: "pad".into(),
+        display_name: csp_data::LocKey::from("colony.pad"),
+        modules: vec![
+            csp_data::ColonyModuleDef::Drill {
+                resource: "ore".into(),
+                base_rate_per_s: 0.5,
+                min_concentration: 0.5,
+                power_ec_per_s: 1.0,
+            },
+            csp_data::ColonyModuleDef::Store {
+                resource: "ore".into(),
+                capacity: 100.0,
+            },
+            csp_data::ColonyModuleDef::Battery { capacity: 50.0 },
+        ],
+        stores: vec![
+            csp_data::ColonyStoreInit {
+                resource: "ore".into(),
+                level: 10.0,
+            },
+            csp_data::ColonyStoreInit {
+                resource: "electric_charge".into(),
+                level: 20.0,
+            },
+        ],
+    };
+    let file = csp_data::ColonyFile {
+        schema_version: csp_data::COLONY_SCHEMA_VERSION,
+        colonies: vec![colony],
+    };
+    let res = csp_data::ResourceFile {
+        schema_version: csp_data::RESOURCE_SCHEMA_VERSION,
+        resources: ["ore", "metal", "electric_charge"]
+            .iter()
+            .map(|id| csp_data::ResourceDef {
+                id: (*id).into(),
+                display_name: csp_data::LocKey::from(format!("resource.{id}")),
+                mass_per_unit_kg: 1.0,
+            })
+            .collect(),
+    };
+    let recipes = csp_data::LoadedRecipes { recipes: vec![] };
+    (file, sites, res, recipes)
+}
+
+/// A founding `stores` row naming a resource NO `Store`/`Battery`
+/// module holds clamps to 0 at apply — the founding stock silently
+/// vanishes; the validator must flag it (C32-F4).
+#[test]
+fn store_without_capacity_is_rejected() {
+    let (mut file, sites, res, recipes) = cross_fixture();
+    assert!(validate_colonies(&file, &sites, &res, &recipes).is_empty());
+    // "metal" stock with no Store module anywhere.
+    file.colonies[0].stores.push(csp_data::ColonyStoreInit {
+        resource: "metal".into(),
+        level: 5.0,
+    });
+    let errs = validate_colonies(&file, &sites, &res, &recipes);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::InvalidColony { reason, .. } if reason.contains("capacity"))),
+        "{errs:?}"
+    );
+    // A zero-level row for a capacity-less resource is still dead
+    // authored surface — the sim installs a 0-capacity row that can
+    // never accumulate.
+    file.colonies[0].stores[2].level = 0.0;
+    let errs = validate_colonies(&file, &sites, &res, &recipes);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::InvalidColony { reason, .. } if reason.contains("capacity"))),
+        "{errs:?}"
+    );
+}
+
+/// A founding level over the aggregate `Store` capacity clamps down
+/// silently at apply — an authored mistake, flagged (C32-F4).
+#[test]
+fn over_capacity_store_level_is_rejected() {
+    let (mut file, sites, res, recipes) = cross_fixture();
+    file.colonies[0].stores[0].level = 150.0; // ore capacity is 100
+    let errs = validate_colonies(&file, &sites, &res, &recipes);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::InvalidColony { reason, .. } if reason.contains("exceeds"))),
+        "{errs:?}"
+    );
+    // At capacity exactly is fine.
+    file.colonies[0].stores[0].level = 100.0;
+    assert!(validate_colonies(&file, &sites, &res, &recipes).is_empty());
+}
+
+/// A `Drill` on a resource the founding site's `resource_yields` does
+/// not carry (or carries at zero) reads concentration 0 forever while
+/// drawing EC — authored dead weight, flagged (C32-F4).
+#[test]
+fn drill_on_barren_ground_is_rejected() {
+    let (mut file, sites, res, recipes) = cross_fixture();
+    // Drill "metal": known resource, but the site yields only ore.
+    file.colonies[0].modules[0] = csp_data::ColonyModuleDef::Drill {
+        resource: "metal".into(),
+        base_rate_per_s: 0.5,
+        min_concentration: 0.5,
+        power_ec_per_s: 1.0,
+    };
+    let errs = validate_colonies(&file, &sites, &res, &recipes);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::InvalidColony { reason, .. } if reason.contains("yield"))),
+        "{errs:?}"
+    );
+    // A zero yield is equally barren.
+    let (mut file, mut sites, res, recipes) = cross_fixture();
+    sites.sites[0].resource_yields.push(("metal".into(), 0.0));
+    file.colonies[0].modules[0] = csp_data::ColonyModuleDef::Drill {
+        resource: "metal".into(),
+        base_rate_per_s: 0.5,
+        min_concentration: 0.5,
+        power_ec_per_s: 1.0,
+    };
+    let errs = validate_colonies(&file, &sites, &res, &recipes);
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, ValidationError::InvalidColony { reason, .. } if reason.contains("yield"))),
+        "{errs:?}"
     );
 }

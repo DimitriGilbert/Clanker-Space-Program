@@ -1698,7 +1698,15 @@ sharing. **Not a save format.**
 - A save that cannot be migrated is **refused with a message**, never silently half-loaded.
 - **ID stability**: `PartId` strings are permanent. Renaming or deleting one requires a migration
   entry mapping old → new, or `Deprecated(replacement)`. The data validator fails in CI on an ID
-  that disappears without one.
+  that disappears without one. (Implemented as `data/id-baseline.ron` +
+  `validate_id_stability` — `deprecated` rows are the pre-1.0 stand-in for migrations.)
+- **Schema-band policy, recorded** (deferral): §3.1 asks every file type to accept current and
+  previous versions with explicit defaults. In practice the band is **per file type**: each
+  `*_SCHEMA_VERSION` grows a `[v-1, v]` band when that type's second version actually ships
+  (`sites.ron` `[2, 3]` is the only multi-version type today); types with no honest mechanical
+  mapping between versions refuse old files outright (`colonies.ron` v1). Adding a speculative
+  band to a type that has never had two versions would promise a migration nobody wrote — so the
+  uniform band is deferred until each type needs it.
 - **Data-set drift**: the save records the data-set hash (§3.1). Loading with changed data **warns
   and lists what changed** (part stats, biome maps, balance constants). Silent stat changes on
   existing craft are a support nightmare. Note that `BuiltPart` already froze the numbers that

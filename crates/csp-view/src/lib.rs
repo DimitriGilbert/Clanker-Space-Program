@@ -1827,6 +1827,9 @@ struct LoadedDataset {
     parts: csp_data::LoadedParts,
     resources: csp_data::ResourceFile,
     loc: csp_data::LocFile,
+    /// `data/id-baseline.ron` — the §7.7 ID-stability baseline, when
+    /// the data set authors one (the demo's reduced tree ships none).
+    id_baseline: Option<csp_data::IdBaseline>,
 }
 
 /// §8.2: load the whole `data/` tree and run the semantic validator —
@@ -1854,6 +1857,7 @@ fn load_validated_dataset(
         parts: csp_data::load_parts_from(src, &root.join("parts"))?,
         resources: csp_data::load_resources_from(src, &root.join("resources.ron"))?,
         loc: csp_data::load_loc_from(src, &root.join("loc").join("en.ron"))?,
+        id_baseline: csp_data::load_id_baseline_from(src, &root.join("id-baseline.ron"))?,
     };
     let errors = csp_data::validate_dataset(&csp_data::Dataset {
         system: &d.system,
@@ -1867,6 +1871,7 @@ fn load_validated_dataset(
         contracts: &d.contracts,
         parts: &d.parts,
         loc: &d.loc,
+        id_baseline: d.id_baseline.as_ref(),
     });
     if !errors.is_empty() {
         return Err(ViewError::Validation(errors));

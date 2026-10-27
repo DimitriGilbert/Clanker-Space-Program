@@ -11,6 +11,7 @@
 //! `serde(transparent)` keeps the RON spelling a bare string
 //! (`id: "terrin"`, not `id: (…)`) so data files stay terse.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -141,4 +142,41 @@ id_newtype! {
     /// where vessels launch from and where `RecoverVessel` credits
     /// resources; a launch site recovers at `recovery_efficiency` 1.0.
     SiteId
+}
+
+/// The `schema_version` this loader/validator pair understands for
+/// `data/id-baseline.ron` — its own namespace (§3.1).
+pub const ID_BASELINE_SCHEMA_VERSION: u32 = 1;
+
+/// `data/id-baseline.ron` — the §7.7 ID-stability baseline. `PartId`
+/// strings are permanent once shipped ("Renaming or deleting one
+/// requires a migration entry mapping old → new, or
+/// `Deprecated(replacement)`"), and §7.7 requires *the data validator
+/// to fail in CI on an ID that disappears without one* — impossible
+/// without a committed record of the ID set, which is what this file
+/// is. `BTreeMap` keeps iteration deterministic (§2.2).
+///
+/// Semantics ([`crate::validate::validate_id_stability`] enforces):
+/// every loaded part id must appear in `parts` (a new id is permanent
+/// the moment it ships — the baseline update lands in the same
+/// commit), every `parts` id must still load or carry a `deprecated`
+/// row, and a `deprecated` row's replacement must name a live id.
+///
+/// A MISSING `id-baseline.ron` disables the check
+/// ([`crate::load::load_id_baseline`] reads it as `None`) — the gate
+/// is opt-in per data set so the §6.3 demo's reduced tree need not
+/// shadow the shipping baseline.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdBaseline {
+    /// First field of every data file (§3.1). Must equal
+    /// [`ID_BASELINE_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// Every `PartId` the data set ships — the permanent set.
+    pub parts: Vec<PartId>,
+    /// Retired id → its replacement (§7.7's `Deprecated(replacement)`).
+    /// A key must not still be shipped; a value must name a live
+    /// `parts` id.
+    #[serde(default)]
+    pub deprecated: BTreeMap<PartId, PartId>,
 }
