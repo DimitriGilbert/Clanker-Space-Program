@@ -764,6 +764,11 @@ struct Allocation {
     /// `active[module]` — false for inert/damaged (the callers' gating
     /// checks reuse it).
     active: Vec<bool>,
+    /// `pins[module]` — C09-F1: conservation-pinned by
+    /// [`unanchored_mint_pins`] (a strict subset of the `!active`
+    /// set: pinned modules are excluded both from `active` and from
+    /// the latent-demand sets, unlike merely ungrounded ones).
+    pins: Vec<bool>,
 }
 
 /// The grounding closure (module doc rule 3): the least fixpoint of
@@ -802,6 +807,55 @@ fn grounded_modules(
     grounded
 }
 
+/// The static per-module tables `allocation_pass` solves over —
+/// built once from `input`; inert modules register nothing in any
+/// field.
+struct ModuleTables {
+    /// `(priority, resource, rate)` consumer rows per module.
+    requests: Vec<Vec<(u8, ResourceId, f64)>>,
+    /// Full-rate `(resource, rate)` production rows per module.
+    prods: Vec<Vec<(ResourceId, f64)>>,
+    /// The production resource sets `prods` keys on.
+    outputs: Vec<BTreeSet<ResourceId>>,
+}
+
+/// The tables' build — one pass over the module list per solve.
+fn module_tables(input: &SolveInput, viable: &[bool]) -> ModuleTables {
+    let requests: Vec<Vec<(u8, ResourceId, f64)>> = input
+        .modules
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            if viable[i] {
+                module_requests(m, input.crew, input.recipes)
+            } else {
+                Vec::new()
+            }
+        })
+        .collect();
+    let prods: Vec<Vec<(ResourceId, f64)>> = input
+        .modules
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            if viable[i] {
+                module_productions(m, input)
+            } else {
+                Vec::new()
+            }
+        })
+        .collect();
+    let outputs: Vec<BTreeSet<ResourceId>> = prods
+        .iter()
+        .map(|ps| ps.iter().map(|(r, _)| r.clone()).collect())
+        .collect();
+    ModuleTables {
+        requests,
+        prods,
+        outputs,
+    }
+}
+
 /// Rule-3's allocation pass — resources ascend `ResourceId`; within a
 /// resource, consumers sort `(priority, ModuleIndex)` (the `ColonyId`
 /// key is constant inside a colony); grants are full-rate until the
@@ -822,6 +876,14 @@ fn grounded_modules(
 /// greatest-fixpoint grant solve unchanged: the "run as much as the
 /// network supports" reading, honest because every input traces back
 /// to stock or a real source.
+///
+/// Between the two fixpoints sits the conservation pin
+/// ([`unanchored_mint_pins`]): grounding's "stocked OR produced"
+/// test lets a cyclic web anchor on founding stock alone, and a
+/// sourceless cycle whose aggregate net rate is positive mints the
+/// surplus forever at fraction 1. Pinning those SCC members out of
+/// `active` restores "every input traces back to stock or a real
+/// source" to also mean "no free surplus" (C09-F1).
 fn allocation_pass(input: &SolveInput) -> Allocation {
     let n = input.modules.len();
     // `viable` = not inert under state/damage — a viable module may
@@ -832,38 +894,31 @@ fn allocation_pass(input: &SolveInput) -> Allocation {
         .map(|m| !module_inert(m, &input.state))
         .collect();
     // Static per-module request/production tables — inert modules
-    // register neither.
-    let requests: Vec<Vec<(u8, ResourceId, f64)>> = input
-        .modules
-        .iter()
-        .enumerate()
-        .map(|(i, m)| {
-            if viable[i] {
-                module_requests(m, input.crew, input.recipes)
-            } else {
-                Vec::new()
-            }
-        })
-        .collect();
-    let outputs: Vec<BTreeSet<ResourceId>> = input
-        .modules
-        .iter()
-        .enumerate()
-        .map(|(i, m)| {
-            if viable[i] {
-                module_productions(m, input)
-                    .into_iter()
-                    .map(|(r, _)| r)
-                    .collect()
-            } else {
-                BTreeSet::new()
-            }
-        })
-        .collect();
+    // register neither. The grounding closure keys on the output
+    // resource sets, the conservation pin sums the rates, and the
+    // fixpoint sweeps scale `prods` by fraction.
+    let ModuleTables {
+        requests,
+        prods,
+        outputs,
+    } = module_tables(input, &viable);
     // Only grounded modules run at all: they register the consumers
     // and produce in the grant solve; the rest pin at fraction 0.
     let grounded = grounded_modules(input, &viable, &requests, &outputs);
-    let active: Vec<bool> = (0..n).map(|i| viable[i] && grounded[i]).collect();
+    let mut active: Vec<bool> = (0..n).map(|i| viable[i] && grounded[i]).collect();
+    // C09-F1's conservation pin: grounding accepts "stocked OR
+    // produced by a grounded module", so a cyclic converter web with
+    // a positive aggregate net rate grounds on nothing but founding
+    // stock and mints the surplus forever (the verifier's
+    // `a 1.0→b 0.5` / `b 0.5→a 1.2` probe grew 10 units of `a` into
+    // 130 in 600 s). Pin every member of an unanchored minting SCC
+    // out of `active` before the grant sweep.
+    let pins = unanchored_mint_pins(input, &active, &requests, &prods, &outputs);
+    for (i, pinned) in pins.iter().enumerate() {
+        if *pinned {
+            active[i] = false;
+        }
+    }
     // Rule-3's sink side: a producing module whose EVERY output has
     // nowhere to go — no store with headroom (its entry exists and
     // `level < capacity − ε`) and no *other viable* module requesting
@@ -881,12 +936,16 @@ fn allocation_pass(input: &SolveInput) -> Allocation {
     // (once it can run it will take the output). Gating on `active`
     // would deadlock the restore path: in a Degraded colony every
     // consumer is inert, so a power producer would see "no sink" and
-    // never produce the charge that earns `PowerRestored`.
+    // never produce the charge that earns `PowerRestored`. A
+    // conservation-pinned module is the exception: it cannot run
+    // under this web topology at all — not "once it can run" — so it
+    // claims no sink and no producer stays sinked for it.
     let latent_requests: Vec<BTreeSet<ResourceId>> = input
         .modules
         .iter()
-        .map(|m| {
-            if m.damaged {
+        .enumerate()
+        .map(|(i, m)| {
+            if m.damaged || pins[i] {
                 BTreeSet::new()
             } else {
                 module_requests(m, input.crew, input.recipes)
@@ -914,7 +973,7 @@ fn allocation_pass(input: &SolveInput) -> Allocation {
     let mut produced: BTreeMap<ResourceId, f64>;
     // Monotone fixpoint — each sweep's fractions are min(prev, computed).
     for _ in 0..n.saturating_add(1) {
-        produced = production_at(input, &active, &fractions);
+        produced = production_at(&prods, &active, &fractions);
         grants = grant_map(&consumers, &produced, input.levels);
         // New fractions — min over the module's input grants; inert
         // modules pin at 0.
@@ -942,13 +1001,14 @@ fn allocation_pass(input: &SolveInput) -> Allocation {
     // the converged fractions so the returned `Allocation` is always
     // one consistent solve (a clean break recomputes bitwise the same
     // table — the extra pass is idempotent).
-    produced = production_at(input, &active, &fractions);
+    produced = production_at(&prods, &active, &fractions);
     grants = grant_map(&consumers, &produced, input.levels);
     Allocation {
         grants,
         fractions,
         produced,
         active,
+        pins,
     }
 }
 
@@ -988,6 +1048,121 @@ fn grant_map(
     grants
 }
 
+/// C09-F1's conservation pin — the SCC check the grounding closure
+/// cannot express. Grounding admits "stocked OR produced by a
+/// grounded module", so a strongly connected component of producers
+/// — ≥2 modules each feeding another's request, or a single module
+/// requesting its own output — grounds whenever ANY member's
+/// external input is merely stocked, and the grant solve then runs
+/// the web at fraction 1 forever. When the SCC's aggregate net rate
+/// (Σ full-rate outputs − Σ full-rate requests over its members)
+/// is positive and no member is a Drill/Solar/Generator — the
+/// sanctioned exogenous sources — the web mints its surplus out of
+/// nothing: the verifier's `a 1.0→b 0.5` + `b 0.5→a 1.2` pair netted
+/// +0.2 `a`/s from a 10-unit founding store (10 → 130 in 600 s).
+/// Every member of such an SCC pins out of `active`.
+///
+/// Balanced or net-negative cycles are real conversion — their
+/// surplus traces to stock or an external producer — and run. So do
+/// source-membered webs: a Drill/Solar/Generator inside the SCC is
+/// exactly where its positive net comes from (the
+/// `grounded_cycle_still_runs` precedent).
+///
+/// The graph spans `active` modules only: a pinned/inert/ungrounded
+/// module carries no flow, so no edge can route through it. Colony
+/// module counts are small; the O(n²) adjacency plus per-source BFS
+/// is trivial, and every scan iterates ascending `ModuleIndex` — the
+/// SCC partition is exactly the deterministic order state-mutating
+/// iteration requires.
+fn unanchored_mint_pins(
+    input: &SolveInput,
+    active: &[bool],
+    requests: &[Vec<(u8, ResourceId, f64)>],
+    prods: &[Vec<(ResourceId, f64)>],
+    outputs: &[BTreeSet<ResourceId>],
+) -> Vec<bool> {
+    let n = input.modules.len();
+    // The request resource sets — an edge's demand endpoint.
+    let wants: Vec<BTreeSet<ResourceId>> = requests
+        .iter()
+        .map(|rs| rs.iter().map(|(_, r, _)| r.clone()).collect())
+        .collect();
+    // `adjacent[i]` = the modules i feeds directly (i produces a
+    // resource j requests), ascending — a self-edge never enters
+    // here; singleton self-feeders are detected off `outputs`∩`wants`
+    // at the SCC check below.
+    let adjacent: Vec<Vec<usize>> = (0..n)
+        .map(|i| {
+            if !active[i] {
+                Vec::new()
+            } else {
+                (0..n)
+                    .filter(|&j| {
+                        j != i && active[j] && outputs[i].iter().any(|r| wants[j].contains(r))
+                    })
+                    .collect()
+            }
+        })
+        .collect();
+    // `reach[i]` — everything i feeds transitively.
+    let reach: Vec<BTreeSet<usize>> = (0..n)
+        .map(|i| {
+            let mut seen = BTreeSet::new();
+            let mut stack: Vec<usize> = adjacent[i].clone();
+            while let Some(j) = stack.pop() {
+                if seen.insert(j) {
+                    stack.extend(adjacent[j].iter().copied());
+                }
+            }
+            seen
+        })
+        .collect();
+    let mut pins = vec![false; n];
+    let mut assigned = vec![false; n];
+    for i in 0..n {
+        if !active[i] || assigned[i] {
+            continue;
+        }
+        // i's SCC: the mutually reachable members — `j` reaches `i`
+        // AND `i` reaches `j` — in ascending module order.
+        let members: Vec<usize> = (0..n)
+            .filter(|&j| j == i || (reach[i].contains(&j) && reach[j].contains(&i)))
+            .collect();
+        for &j in &members {
+            assigned[j] = true;
+        }
+        let self_loop = outputs[i].iter().any(|r| wants[i].contains(r));
+        if members.len() < 2 && !self_loop {
+            continue;
+        }
+        let sourced = members.iter().any(|&j| {
+            matches!(
+                input.modules[j].def,
+                ColonyModuleDef::Drill { .. }
+                    | ColonyModuleDef::Solar { .. }
+                    | ColonyModuleDef::Generator { .. }
+            )
+        });
+        if sourced {
+            continue;
+        }
+        let net: f64 = members
+            .iter()
+            .map(|&j| {
+                let produced: f64 = prods[j].iter().map(|(_, q)| *q).sum();
+                let consumed: f64 = requests[j].iter().map(|(_, _, q)| *q).sum();
+                produced - consumed
+            })
+            .sum();
+        if net > EPS {
+            for j in members {
+                pins[j] = true;
+            }
+        }
+    }
+    pins
+}
+
 /// The per-resource consumer tables — rows only from `active`
 /// modules, sorted `(priority, ModuleIndex)` (rule 3's ordering).
 fn consumer_map(
@@ -1014,19 +1189,20 @@ fn consumer_map(
 }
 
 /// Aggregate production rates at a given fraction vector — one
-/// accumulator shared by the fixpoint sweeps and the final recompute.
+/// accumulator shared by the fixpoint sweeps and the final recompute,
+/// over the `prods` table `allocation_pass` already built.
 fn production_at(
-    input: &SolveInput,
+    prods: &[Vec<(ResourceId, f64)>],
     active: &[bool],
     fractions: &[f64],
 ) -> BTreeMap<ResourceId, f64> {
     let mut produced: BTreeMap<ResourceId, f64> = BTreeMap::new();
-    for (i, m) in input.modules.iter().enumerate() {
+    for (i, ps) in prods.iter().enumerate() {
         if !active[i] {
             continue;
         }
-        for (r, q) in module_productions(m, input) {
-            *produced.entry(r).or_insert(0.0) += q * fractions[i];
+        for (r, q) in ps {
+            *produced.entry(r.clone()).or_insert(0.0) += q * fractions[i];
         }
     }
     produced
@@ -1044,6 +1220,7 @@ fn solve_network(input: &SolveInput) -> NetSolve {
         fractions,
         produced,
         active,
+        pins,
     } = alloc;
     let mut net_rates: BTreeMap<ResourceId, f64> = BTreeMap::new();
     // Consumption is charged at `fraction · request`, NOT the raw
@@ -1099,13 +1276,16 @@ fn solve_network(input: &SolveInput) -> NetSolve {
     // the Degraded inert gating must not feed back into the
     // starvation predicate, or `PowerLost` oscillates every tick
     // (its own remedy — converters stop — would read as the cure).
-    // Damaged modules count nothing; everything else counts its
-    // would-be draw.
+    // Damaged modules count nothing; conservation-pinned modules
+    // likewise claim nothing — a web pinned dead by
+    // `unanchored_mint_pins` cannot condemn the colony to a phantom
+    // `PowerLost`. Everything else counts its would-be draw.
     let latent_ec_request: f64 = input
         .modules
         .iter()
-        .filter(|m| !m.damaged)
-        .flat_map(|m| module_requests(m, input.crew, input.recipes))
+        .enumerate()
+        .filter(|(i, m)| !m.damaged && !pins[*i])
+        .flat_map(|(_, m)| module_requests(m, input.crew, input.recipes))
         .filter(|(_, r, _)| *r == ec)
         .map(|(_, _, q)| q)
         .sum();
@@ -3551,6 +3731,178 @@ mod tests {
             &conc,
         ));
         assert_eq!(solve.fractions, vec![1.0, 1.0, 1.0]);
+    }
+
+    /// C09-F1's verifier probe, end to end through `FoundColony`:
+    /// `a 1.0→b 0.5` + `b 0.5→a 1.2` founding on `a = 10` is a
+    /// stock-anchored net-positive cycle — grounding's "stocked OR
+    /// produced" test used to run it at fraction 1 forever, minting
+    /// +0.2 `a`/s (10 → 130 units in 600 s, bounded only by the
+    /// store cap). `unanchored_mint_pins` now holds both converters
+    /// at fraction 0 and the store never moves.
+    #[test]
+    fn unanchored_net_positive_cycle_pins_at_zero() {
+        let a = ResourceId::from("a");
+        let b = ResourceId::from("b");
+        let mut w = colony_world();
+        let mut recipes = BTreeMap::new();
+        let modules = vec![
+            ColonyModuleDef::Store {
+                resource: a.clone(),
+                capacity: 1000.0,
+            },
+            conv(
+                &mut recipes,
+                "recipe.ab",
+                vec![(a.clone(), 1.0)],
+                vec![(b.clone(), 0.5)],
+                5,
+                0.0,
+            ),
+            conv(
+                &mut recipes,
+                "recipe.ba",
+                vec![(b.clone(), 0.5)],
+                vec![(a.clone(), 1.2)],
+                5,
+                0.0,
+            ),
+        ];
+        w.set_recipes(recipes);
+        found(
+            &mut w,
+            modules,
+            vec![csp_data::ColonyStoreInit {
+                resource: a.clone(),
+                level: 10.0,
+            }],
+        );
+        let colony = w.colonies().values().next().unwrap();
+        // The Store runs; both converters pin at fraction 0.
+        assert_eq!(colony.module_fractions, vec![1.0, 0.0, 0.0]);
+        assert!(colony.stores[&a].net_rate_per_s.abs() < EPS);
+        // The probe's horizon — 600 s must not mint a single unit.
+        w.step_frame(w.clock().ticks() + 600 * TICK_HZ).unwrap();
+        let now = w.clock().ticks();
+        let colony = w.colonies().values().next().unwrap();
+        assert!(
+            (colony.stores[&a].level_at(now) - 10.0).abs() < EPS,
+            "store a minted to {}",
+            colony.stores[&a].level_at(now)
+        );
+    }
+
+    /// The pin names POSITIVE nets only: the same two-converter web
+    /// at a loss (`a` back at 0.8 for 1.0 in) is ordinary conversion
+    /// — stock-anchored, it runs at fraction 1 and drains the store
+    /// it was founded on.
+    #[test]
+    fn net_negative_cycle_still_runs() {
+        let a = ResourceId::from("a");
+        let b = ResourceId::from("b");
+        let mut recipes = BTreeMap::new();
+        let conc: BTreeMap<ResourceId, f64> = BTreeMap::new();
+        let modules = vec![
+            ColonyModule {
+                def: conv(
+                    &mut recipes,
+                    "recipe.t19",
+                    vec![(a.clone(), 1.0)],
+                    vec![(b.clone(), 0.5)],
+                    5,
+                    0.0,
+                ),
+                damaged: false,
+            },
+            ColonyModule {
+                def: conv(
+                    &mut recipes,
+                    "recipe.t20",
+                    vec![(b.clone(), 0.5)],
+                    vec![(a.clone(), 0.8)],
+                    5,
+                    0.0,
+                ),
+                damaged: false,
+            },
+        ];
+        let light = BodyLight {
+            synodic_rate: 0.0,
+            h0: 0.0,
+            day_insolation_w_m2: 0.0,
+            cos_lat: 1.0,
+        };
+        let levels = BTreeMap::from([(a.clone(), 10.0)]);
+        let solve = solve_network(&inp(
+            &modules,
+            ColonyState::Nominal,
+            &levels,
+            &all_caps(),
+            &light,
+            0,
+            Daylight::Day,
+            &recipes,
+            &conc,
+        ));
+        assert_eq!(solve.fractions, vec![1.0, 1.0]);
+        // Net `a` = 0.8 out − 1.0 in = −0.2/s: the store drains.
+        assert!((solve.net_rates[&a] + 0.2).abs() < EPS);
+    }
+
+    /// The exemption clause: a Drill/Solar/Generator member IS the
+    /// web's sanctioned source. A drill→converter→EC cycle with a
+    /// positive aggregate net still runs — the surplus is real ore
+    /// pulled out of the ground, not minted stock.
+    #[test]
+    fn drill_membered_cycle_is_sanctioned() {
+        let ore = ResourceId::from("ore");
+        let ec_id = ec();
+        let mut recipes = BTreeMap::new();
+        let mut conc: BTreeMap<ResourceId, f64> = BTreeMap::new();
+        conc.insert(ore.clone(), 1.0);
+        let modules = vec![
+            ColonyModule {
+                def: ColonyModuleDef::Drill {
+                    resource: ore.clone(),
+                    base_rate_per_s: 1.0,
+                    min_concentration: 1.0,
+                    power_ec_per_s: 0.5,
+                },
+                damaged: false,
+            },
+            ColonyModule {
+                def: conv(
+                    &mut recipes,
+                    "recipe.t21",
+                    vec![(ore.clone(), 1.0)],
+                    vec![(ec_id.clone(), 1.0)],
+                    5,
+                    0.0,
+                ),
+                damaged: false,
+            },
+        ];
+        let light = BodyLight {
+            synodic_rate: 0.0,
+            h0: 0.0,
+            day_insolation_w_m2: 0.0,
+            cos_lat: 1.0,
+        };
+        // Founding ore stock anchors the web: the converter grounds
+        // on the store, the drill grounds on the converter's EC.
+        let levels = BTreeMap::from([(ore.clone(), 10.0)]);
+        let solve = solve_network(&inp(
+            &modules,
+            ColonyState::Nominal,
+            &levels,
+            &all_caps(),
+            &light,
+            0,
+            Daylight::Day,
+            &recipes,
+            &conc,
+        ));
+        assert_eq!(solve.fractions, vec![1.0, 1.0]);
     }
 
     /// H1: a converter whose input is absent runs at fraction 0 and

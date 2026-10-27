@@ -2173,8 +2173,15 @@ pub fn validate_site_loc_keys(file: &SiteFile, loc: &LocFile) -> Vec<ValidationE
 
 /// `data/recipes/*.ron` checks: `schema_version`, `id` ↔ file stem,
 /// unique ids, every `inputs`/`outputs` row a known resource with a
-/// finite non-negative rate, and at least one positive-rate output
-/// (a recipe with no product is dead data).
+/// finite non-negative rate, at least one positive-rate output (a
+/// recipe with no product is dead data), no resource on both sides
+/// of one recipe (a self-loop — the recipe graph's degenerate
+/// cycle), no net-positive yield (Σ outputs > Σ inputs mints units
+/// against no real supply), and an ACYCLIC cross-recipe digraph —
+/// §8.2's "cycles" gate: a cyclic converter web can hold itself
+/// grounded in the colony solver and, at a non-negative net, mint
+/// forever (C32-F2; the runtime pin that catches the same class is
+/// `unanchored_mint_pins` in csp-sim).
 pub fn validate_recipes(
     loaded: &crate::load::LoadedRecipes,
     res: &ResourceFile,
@@ -2237,8 +2244,113 @@ pub fn validate_recipes(
         if !d.outputs.iter().any(|(_, q)| *q > 0.0) {
             bad(d.id.as_str(), "recipe produces nothing", &mut out);
         }
+        // A positive-rate resource on BOTH sides of one recipe is a
+        // self-loop — the recipe graph's degenerate cycle (C32-F2):
+        // net-positive it mints, net-negative it quietly eats itself.
+        for (r, q) in &d.inputs {
+            if *q > 0.0 && d.outputs.iter().any(|(or, oq)| or == r && *oq > 0.0) {
+                bad(
+                    d.id.as_str(),
+                    &format!("resource {r:?} is both an input and an output"),
+                    &mut out,
+                );
+            }
+        }
+        // Net yield: Σ inputs ≥ Σ outputs — every authored recipe
+        // refines at a loss; a net-positive recipe mints units
+        // against no real supply even before graph cycles (C32-F2).
+        let in_total: f64 = d.inputs.iter().map(|(_, q)| *q).sum();
+        let out_total: f64 = d.outputs.iter().map(|(_, q)| *q).sum();
+        if out_total - in_total > 1e-9 {
+            bad(
+                d.id.as_str(),
+                "net-positive yield: outputs exceed inputs",
+                &mut out,
+            );
+        }
     }
+    check_recipe_graph(loaded, &mut out);
     out
+}
+
+/// The cross-recipe digraph must be ACYCLIC (PLAN §8.2's "cycles"
+/// gate, C32-F2): edge r→s when a positive-rate output of r is a
+/// positive-rate input of s. Any directed cycle lets a converter
+/// web hold itself grounded in the colony solver and — at a
+/// non-negative aggregate net — mint forever (the C09-F1 runtime
+/// hole, now pinned sim-side; this is the authored-data gate that
+/// keeps it unshippable). Duplicate ids are already flagged by
+/// [`validate_recipes`]; `by_id`'s first-wins table keeps this
+/// build deterministic regardless. Every cyclic recipe is flagged
+/// once, naming the whole component, in ascending id order.
+fn check_recipe_graph(loaded: &crate::load::LoadedRecipes, out: &mut Vec<ValidationError>) {
+    let by_id = loaded.by_id();
+    let ids: Vec<_> = by_id.keys().cloned().collect();
+    // `feeds[i]` — the recipes whose outputs i consumes.
+    let feeds: Vec<BTreeSet<usize>> = ids
+        .iter()
+        .map(|id| {
+            let def = by_id[id];
+            let ins: BTreeSet<_> = def
+                .inputs
+                .iter()
+                .filter(|(_, q)| *q > 0.0)
+                .map(|(r, _)| r)
+                .collect();
+            ids.iter()
+                .enumerate()
+                .filter(|(_, other)| {
+                    **other != *id
+                        && by_id[*other]
+                            .outputs
+                            .iter()
+                            .any(|(r, q)| *q > 0.0 && ins.contains(r))
+                })
+                .map(|(j, _)| j)
+                .collect()
+        })
+        .collect();
+    // Mutual reachability partitions the graph into SCCs — the
+    // recipe count is small, so the per-source walk stays trivial,
+    // and ascending `ids` order (BTreeMap) makes the report
+    // deterministic. An SCC of ≥2 IS a directed cycle.
+    let reach: Vec<BTreeSet<usize>> = (0..ids.len())
+        .map(|i| {
+            let mut seen = BTreeSet::new();
+            let mut stack: Vec<usize> = feeds[i].iter().copied().collect();
+            while let Some(j) = stack.pop() {
+                if seen.insert(j) {
+                    stack.extend(feeds[j].iter().copied());
+                }
+            }
+            seen
+        })
+        .collect();
+    let mut assigned = vec![false; ids.len()];
+    for i in 0..ids.len() {
+        if assigned[i] {
+            continue;
+        }
+        let members: Vec<usize> = (0..ids.len())
+            .filter(|&j| j == i || (reach[i].contains(&j) && reach[j].contains(&i)))
+            .collect();
+        for &j in &members {
+            assigned[j] = true;
+        }
+        if members.len() > 1 {
+            let cycle = members
+                .iter()
+                .map(|&j| ids[j].as_str())
+                .collect::<Vec<_>>()
+                .join(" ↔ ");
+            for &j in &members {
+                out.push(ValidationError::InvalidRecipe {
+                    id: ids[j].as_str().to_string(),
+                    reason: format!("recipe graph cycle: {cycle}"),
+                });
+            }
+        }
+    }
 }
 
 /// Loc resolution for the recipe set (the [`validate_site_loc_keys`]
@@ -6332,6 +6444,116 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, ValidationError::InvalidColony { .. })),
             "{errs:?}"
+        );
+    }
+
+    /// A `LoadedRecipe` builder for the recipe-graph tests — `id`
+    /// names file stem and def alike so the id↔stem check stays
+    /// green and only the rule under test fires.
+    fn recipe_fixture(
+        id: &str,
+        inputs: &[(&str, f64)],
+        outputs: &[(&str, f64)],
+    ) -> crate::load::LoadedRecipe {
+        crate::load::LoadedRecipe {
+            path: std::path::PathBuf::from(format!("{id}.ron")),
+            def: crate::recipe::RecipeDef {
+                schema_version: crate::recipe::RECIPE_SCHEMA_VERSION,
+                id: id.into(),
+                display_name: "recipe.test.name".into(),
+                inputs: inputs.iter().map(|(r, q)| ((*r).into(), *q)).collect(),
+                outputs: outputs.iter().map(|(r, q)| ((*r).into(), *q)).collect(),
+            },
+        }
+    }
+
+    /// C32-F2, the verifier's probe pair: `a 1.0 → b 0.5` +
+    /// `b 0.5 → a 1.2` — the cycle that minted +0.2 `a`/s through
+    /// the colony solver — is rejected twice over: `recipe.ba` is
+    /// net-positive on its own, and the pair is a directed cycle.
+    /// A self-referential row and a lone net-positive recipe fail
+    /// too; an acyclic net-negative chain stays green.
+    #[test]
+    fn recipe_graph_rejects_cycles_and_net_positive_yield() {
+        let (_, _, mut res, _) = colony_fixture();
+        for r in ["a", "b"] {
+            res.resources.push(crate::resource::ResourceDef {
+                id: r.into(),
+                display_name: "resource.test".into(),
+                mass_per_unit_kg: 1.0,
+            });
+        }
+        // The probe pair — a directed 2-cycle, and `recipe.ba` is
+        // independently net-positive.
+        let cyclic = crate::load::LoadedRecipes {
+            recipes: vec![
+                recipe_fixture("recipe.ab", &[("a", 1.0)], &[("b", 0.5)]),
+                recipe_fixture("recipe.ba", &[("b", 0.5)], &[("a", 1.2)]),
+            ],
+        };
+        let errs = validate_recipes(&cyclic, &res);
+        for id in ["recipe.ab", "recipe.ba"] {
+            assert!(
+                errs.iter().any(|e| matches!(
+                    e,
+                    ValidationError::InvalidRecipe { id: eid, reason }
+                        if eid == id && reason.contains("cycle")
+                )),
+                "{id} must name the cycle: {errs:?}"
+            );
+        }
+        // `recipe.ba`'s 1.2-out for 0.5-in trips the net-yield gate
+        // as well — one recipe id, two reasons.
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidRecipe { id, reason }
+                    if id == "recipe.ba" && reason.contains("net-positive")
+            )),
+            "{errs:?}"
+        );
+        // A self-referential row is the degenerate cycle.
+        let selfish = crate::load::LoadedRecipes {
+            recipes: vec![recipe_fixture(
+                "recipe.self",
+                &[("a", 1.0)],
+                &[("a", 0.5), ("b", 0.2)],
+            )],
+        };
+        let errs = validate_recipes(&selfish, &res);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::InvalidRecipe { .. })),
+            "{errs:?}"
+        );
+        // A lone ACYCLIC net-positive recipe mints units the same
+        // way — the yield gate, not the cycle gate, catches it.
+        let mint = crate::load::LoadedRecipes {
+            recipes: vec![recipe_fixture(
+                "recipe.mint",
+                &[("ore", 1.0)],
+                &[("metal", 1.5)],
+            )],
+        };
+        let errs = validate_recipes(&mint, &res);
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidRecipe { id, reason }
+                    if id == "recipe.mint" && reason.contains("net-positive")
+            )),
+            "{errs:?}"
+        );
+        // The sanctioned shape: an acyclic chain refining at a loss.
+        let chained = crate::load::LoadedRecipes {
+            recipes: vec![
+                recipe_fixture("recipe.smelt", &[("ore", 1.0)], &[("metal", 0.6)]),
+                recipe_fixture("recipe.cast", &[("metal", 1.0)], &[("a", 0.5)]),
+            ],
+        };
+        assert!(
+            validate_recipes(&chained, &res).is_empty(),
+            "acyclic net-negative chain must stay green"
         );
     }
 
