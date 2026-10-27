@@ -2,7 +2,7 @@
 // `index.html` — the static contract csp-server's `spa_dir` serves
 // (`/` → index.html, `/assets/*` → assets/*).
 import { copyFileSync, existsSync, readdirSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { extname, join, relative } from 'node:path'
 
 const shell = 'dist/client/_shell.html'
 if (!existsSync(shell)) {
@@ -19,17 +19,37 @@ console.log('finalize: dist/client/index.html written')
 // `''` in production, but the var can also reach `vite build` through
 // a `.env` file this process never sees — scan the emitted assets
 // rather than trusting the gate alone.
-const assetsDir = 'dist/client/assets'
-const bundles = existsSync(assetsDir)
-  ? readdirSync(assetsDir)
-      .filter((name) => name.endsWith('.js'))
-      .map((name) => ({
-        name,
-        text: readFileSync(join(assetsDir, name), 'utf8'),
-      }))
-  : []
+//
+// Coverage mirrors what `spa_asset` can serve as text: index.html at
+// `/`, plus every file under `assets/` (nested directories included —
+// `clean_asset_path` admits multi-segment paths) whose extension maps
+// to a text response. Binary types (png/woff/woff2/…) can't carry a
+// readable token and are skipped.
+const clientDir = 'dist/client'
+const assetsDir = join(clientDir, 'assets')
+const TEXT_EXT = new Set(['.js', '.mjs', '.css', '.html', '.json', '.map', '.svg'])
+
+function* walkTextFiles(dir) {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name)
+    if (entry.isDirectory()) {
+      yield* walkTextFiles(path)
+    } else if (entry.isFile() && TEXT_EXT.has(extname(entry.name))) {
+      yield path
+    }
+  }
+}
+
+const served = [
+  join(clientDir, 'index.html'),
+  ...(existsSync(assetsDir) ? [...walkTextFiles(assetsDir)] : []),
+]
+const bundles = served.map((path) => ({
+  name: relative(clientDir, path),
+  text: readFileSync(path, 'utf8'),
+}))
 if (bundles.length === 0) {
-  console.error('finalize: no dist/client/assets/*.js — did the client build emit?')
+  console.error('finalize: no served text files under dist/client — did the client build emit?')
   process.exit(1)
 }
 
@@ -66,4 +86,4 @@ if (leaks.length > 0) {
   for (const leak of leaks) console.error(`  - ${leak}`)
   process.exit(1)
 }
-console.log(`finalize: token-leak scan clean (${bundles.length} asset bundle(s))`)
+console.log(`finalize: token-leak scan clean (${bundles.length} served file(s) scanned)`)
