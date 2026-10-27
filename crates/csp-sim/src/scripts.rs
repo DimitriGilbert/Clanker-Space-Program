@@ -99,6 +99,17 @@ use crate::{SimCommand, SourceClass, VesselId};
 /// `set_script_op_budget`; no-data worlds and unit tests use this.
 pub const DEFAULT_SCRIPT_OP_BUDGET: u64 = 20_000;
 
+/// The `LoadScript` source cap in bytes — the op budget bounds a
+/// script's EXECUTION, but nothing else bounded the command path:
+/// `prepare` compiles the source inside the tick's command drain, and
+/// every §7.1 hash walk (`hash_script` → `h.str(&source)`) and save
+/// re-walks it forever. 64 KiB is ~1 500 lines of Rhai — far past any
+/// honest ControlApi program (the stock library's largest is a few
+/// hundred lines) and small enough that compile-in-tick stays
+/// negligible. Enforced by the apply before `prepare`, so it holds
+/// even with no engine installed (the record is stored verbatim).
+pub const MAX_SCRIPT_SOURCE_LEN: usize = 64 * 1024;
+
 /// §2.10: consecutive faulting calls that disable a script ("strikes
 /// >= 5 (consecutive) disables the script, visibly").
 pub const STRIKE_DISABLE_LIMIT: u32 = 5;

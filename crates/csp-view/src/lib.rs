@@ -93,8 +93,12 @@ pub enum ViewMode {
 }
 
 /// The §3.1 data-set hash + its scheme version — the bug-report bundle's
-/// fingerprint fields (§2.14) and §7.7's drift-warning key.
-pub use csp_data::{DATA_HASH_VERSION, datahash::data_set_hash};
+/// fingerprint fields (§2.14) and §7.7's drift-warning key — plus the
+/// §7.7 per-kind breakdown that lets the warning "list what changed".
+pub use csp_data::{
+    DATA_HASH_VERSION,
+    datahash::{self, data_set_hash, data_set_hashes, data_set_kind_hashes},
+};
 /// The §7.2 serialized set — the payload [`save`] wraps. Re-exported on
 /// the same §2.1 edge-sharing rationale.
 pub use csp_sim::WorldSnapshot;
@@ -3575,6 +3579,7 @@ impl View {
             game_version: String::new(),
             label: None,
             data_set_hash: None,
+            data_kind_hashes: None,
             state_hash: self.sim.state_hash().ok(),
             snapshot,
         })

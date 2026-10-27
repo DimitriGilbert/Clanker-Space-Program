@@ -193,10 +193,10 @@ pub use research::{
     ScienceState, VesselScience,
 };
 pub use scripts::{
-    AutopilotDriver, AutopilotProgram, AutopilotState, DEFAULT_SCRIPT_OP_BUDGET, POLL_DEMOTE_TICKS,
-    POLL_OPS_DEN, POLL_OPS_NUM, PersistMap, PersistValue, STRIKE_DISABLE_LIMIT, ScriptEngine,
-    ScriptFault, ScriptId, ScriptRunReport, ScriptState, TelemetryResidence, TickIo,
-    VesselTelemetry, WakeCondition,
+    AutopilotDriver, AutopilotProgram, AutopilotState, DEFAULT_SCRIPT_OP_BUDGET,
+    MAX_SCRIPT_SOURCE_LEN, POLL_DEMOTE_TICKS, POLL_OPS_DEN, POLL_OPS_NUM, PersistMap, PersistValue,
+    STRIKE_DISABLE_LIMIT, ScriptEngine, ScriptFault, ScriptId, ScriptRunReport, ScriptState,
+    TelemetryResidence, TickIo, VesselTelemetry, WakeCondition,
 };
 pub use tech::TechState;
 pub use transfers::{
@@ -571,8 +571,11 @@ pub enum SimCommand {
     /// command error: rejected onto [`AdvanceReport::rejected`]
     /// (§2.2.1's "rejected on the originating channel"), its effects
     /// rolled back — the boundary continues.
-    // ui-unreachable: the launch path uses `BuildVessel` +
-    // `SpawnPhysicalVessel`; elements-only spawn is MCP/test-only.
+    // ui-unreachable: play spawns vessels through `ManufactureCraft` →
+    // `ConstructionComplete` at a launch site (the site-less sandbox
+    // fallback is `SpawnPhysicalVessel`); elements-only spawn is
+    // issued by csp-bench harnesses and the MCP `sim.command`
+    // passthrough — never by a shipped UI path.
     SpawnVessel {
         /// The frame the elements are relative to.
         parent: BodyId,
@@ -1501,9 +1504,11 @@ pub struct WorldSnapshot {
     /// §7.2 next-ID counter for the vessel arena (monotonic, never reused).
     pub next_vessel_id: u64,
     /// The on-rails vessel arena. `BTreeMap` key order is ascending-ID;
-    /// at M1 there is no vessel removal, so no free list or slot
-    /// generations exist to serialize (§7.1 rule 5 — they would be
-    /// allocator state anyway).
+    /// ids are monotonic and never reused — removal (`RecoverVessel`,
+    /// `TerminateVessel`, debris eviction) deletes the map entry but
+    /// never frees the id — so no free list or slot generations exist
+    /// to serialize (§7.1 rule 5 — they would be allocator state
+    /// anyway).
     pub vessels: BTreeMap<VesselId, Vessel>,
     /// §2.6.5's Silent→Clamping per-object opt-in set.
     pub tracked_vessels: BTreeSet<VesselId>,
@@ -2336,10 +2341,10 @@ pub struct World {
     /// §2.2 next-ID counter for the vessel arena — monotonic, never
     /// reused, serialized and hashed.
     next_vessel_id: u64,
-    /// The on-rails vessel arena. `BTreeMap` order is ascending-ID order,
-    /// which §2.2 requires of every state-affecting iteration (the M1
-    /// slot/generation arena machinery lands with removal; with none,
-    /// the map IS the arena).
+    /// The on-rails vessel arena. `BTreeMap` order is ascending-ID
+    /// order, which §2.2 requires of every state-affecting iteration.
+    /// Removal deletes entries but never reuses ids, so no
+    /// slot/generation machinery exists — the map IS the arena.
     vessels: BTreeMap<VesselId, Vessel>,
     /// §2.6.5's per-object opt-in — members' `SoiTransition`s schedule and
     /// re-class as `Clamping`. Hashed state.
@@ -3645,21 +3650,22 @@ impl World {
         })
     }
 
-    /// The §7.4 serialization-boundary refusal class, applied to the one
-    /// M1 case that can violate it: undrained commands in flight. An
-    /// enqueued command is not yet world state (its tick/seq stamps are
-    /// assigned by the drain), so a snapshot taken while the queue is
-    /// non-empty could never reproduce the run — the boundary refuses
-    /// `SaveBlocking` rather than silently dropping the in-flight work.
+    /// The §7.4 serialization-boundary refusal class. Enforced here:
+    /// rule 4 (a save-blocked session), the undrained-command gate (an
+    /// enqueued command is not yet world state — its tick/seq stamps
+    /// are assigned by the drain — so a snapshot taken mid-queue could
+    /// never reproduce the run), rule 1 (a live joint island), and
+    /// rule 2 (a bubble body with live contacts, not surface-latched).
+    /// The boundary refuses `SaveBlocking` rather than silently
+    /// dropping the in-flight work.
     pub fn check_serializable(&self) -> Result<(), SimError> {
         // §7.4 rule 4: a session tainted by loader/install errors
         // refuses saves — the snapshot would carry a world the data
         // set never fully defined.
-        if let Some(reason) = &self.save_blocked {
+        if self.save_blocked.is_some() {
             // `SimError` reasons are `'static` — the stored detail
             // rides [`World::save_blocked_reason`] for the UI to
             // append, and the refusal itself is this fixed text.
-            let _ = reason;
             return Err(SimError::SaveBlocking(
                 "session is save-blocked from a loader/install error",
             ));
@@ -3703,6 +3709,15 @@ impl World {
                 }
             }
         }
+        // §7.4 rule 3 (a pending Stage-2 weld/aero recompute) is
+        // vacuous today: `ensure_aero` solves tables synchronously in
+        // the tick and `InstallAeroTables` attaches at apply — no
+        // deferred-work state exists to check. The deferred
+        // voxelization REVIEW2 contemplated (incremental across
+        // frames on wasm, child bodies inheriting the parent's table
+        // until the recompute lands) would reintroduce exactly the
+        // pending state this rule guards — its check lands with that
+        // implementation, not before.
         Ok(())
     }
 
@@ -8567,6 +8582,14 @@ impl World {
         source: &str,
         shadow: &mut TickShadow,
     ) -> Result<(), SimError> {
+        // The op budget bounds execution only — this bounds the
+        // unmeasured costs: compile inside the tick's drain, and the
+        // full-source walk every state hash and save performs on the
+        // stored record. Checked before `prepare` so the cap holds
+        // even with no engine installed.
+        if source.len() > MAX_SCRIPT_SOURCE_LEN {
+            return Err(SimError::Recoverable("script: source too large"));
+        }
         if !self.vessels.contains_key(&vessel) {
             return Err(SimError::Recoverable("script: unknown vessel"));
         }
@@ -12117,9 +12140,9 @@ fn transition_latched(
             // part's record restamps dormant at `sim` (the constant
             // dormant λ makes the publish tick exact; the slot
             // re-derives it next interval). The spec read is
-            // positional over `parts` — a non-covering table (the
-            // latch merge's mismatched halves) resolves none, so the
-            // record stamps λ = 0 (inert, never a wrong part's rate).
+            // positional over `parts` — a non-covering table resolves
+            // no spec (`specs_parallel`), so the record stamps
+            // λ = 0 (inert, never a wrong part's rate).
             if let Some(craft) = &vessel.craft {
                 let specs_ok = reliability::specs_parallel(craft);
                 // A touchdown with the throttle still up ends the burn
@@ -25677,6 +25700,39 @@ mod tests {
             w.step_frame(101).unwrap();
             assert_eq!(calls.borrow().len(), 2);
             assert_eq!(calls.borrow()[1].1, 100);
+        }
+
+        /// C26-F8: `LoadScript` bounds its source on the command
+        /// path — the op budget caps execution only, while an
+        /// oversized source pays compile-in-tick now and a
+        /// full-source walk in every §7.1 hash and save forever.
+        /// `MAX_SCRIPT_SOURCE_LEN`+1 refuses `Recoverable` before
+        /// `prepare` and stores no record.
+        #[test]
+        fn load_script_rejects_oversized_source() {
+            let mut w = physics_world(false);
+            enqueue_orbiter(&mut w);
+            w.step_frame(1).unwrap();
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::LoadScript {
+                    vessel: VesselId(0),
+                    source: "s".repeat(MAX_SCRIPT_SOURCE_LEN + 1),
+                },
+            );
+            let r = w.step_frame(2).unwrap();
+            assert!(
+                r.rejected.iter().any(
+                    |rj| matches!(rj.error, SimError::Recoverable(m) if m.contains("too large"))
+                ),
+                "oversized source must reject: {:?}",
+                r.rejected
+            );
+            assert!(
+                w.scripts().is_empty(),
+                "a refused load must store no script record"
+            );
         }
 
         /// The wake re-arm on the bubble→rails edge: a script ticking

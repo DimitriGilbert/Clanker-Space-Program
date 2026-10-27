@@ -2005,6 +2005,7 @@ mod tests {
             game_version: "gate".into(),
             label: Some(format!("§7.5 seam {seam}")),
             data_set_hash: None,
+            data_kind_hashes: None,
             state_hash: Some(live.state_hash().unwrap()),
             snapshot: live.snapshot().unwrap(),
         };

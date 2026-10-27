@@ -655,8 +655,11 @@ impl App {
     #[cfg(not(target_arch = "wasm32"))]
     fn collect_bug_report(&self, title: &'static str, error: &str) -> bugreport::BugReportInput {
         // The §3.1 data-set hash rides both the save envelope and the
-        // fingerprint — one walk of `data/`, never two.
-        let data_set_hash = csp_view::data_set_hash(&csp_view::data_root()).ok();
+        // fingerprint — one walk of `data/`, never two. The §7.7
+        // per-kind breakdown rides the envelope beside it so a load
+        // names what drifted.
+        let hashes = csp_view::data_set_hashes(&csp_view::data_root()).ok();
+        let data_set_hash = hashes.as_ref().map(|h| h.aggregate);
         let save = self
             .view
             .sim
@@ -667,6 +670,7 @@ impl App {
                     game_version: env!("CARGO_PKG_VERSION").into(),
                     label: Some(format!("crash at tick {}", snapshot.clock_ticks)),
                     data_set_hash,
+                    data_kind_hashes: hashes.as_ref().map(|h| h.by_kind.clone()),
                     state_hash: self.view.sim.state_hash().ok(),
                     snapshot,
                 })
@@ -1178,7 +1182,12 @@ impl App {
             Ok(mut save) => {
                 save.game_version = env!("CARGO_PKG_VERSION").into();
                 save.label = Some(slot.to_string());
-                save.data_set_hash = csp_view::data_set_hash(&csp_view::data_root()).ok();
+                // One `data/` walk stamps both hashes — the §7.7
+                // per-kind map beside the aggregate so a later load
+                // names the drifted file classes.
+                let hashes = csp_view::data_set_hashes(&csp_view::data_root()).ok();
+                save.data_set_hash = hashes.as_ref().map(|h| h.aggregate);
+                save.data_kind_hashes = hashes.map(|h| h.by_kind);
                 let bytes = match csp_view::save::encode_save(&save) {
                     Ok(b) => b,
                     Err(e) => {
@@ -1239,9 +1248,27 @@ impl App {
             csp_view::data_set_hash(&csp_view::data_root()).ok(),
         ) {
             (Some(recorded), Some(current)) if recorded != current => {
-                self.view.flight_notice(
-                    "DATA DRIFT — this save was written against a different data set",
-                );
+                // §7.7's "lists what changed": diff the recorded
+                // per-kind map against the live one and name the
+                // drifted classes; saves written before the map
+                // existed fall back to the bare notice.
+                let kinds = save.data_kind_hashes.as_ref().and_then(|recorded| {
+                    csp_view::data_set_kind_hashes(&csp_view::data_root())
+                        .ok()
+                        .map(|current| csp_view::datahash::changed_kinds(recorded, &current))
+                });
+                self.view.flight_notice(match kinds {
+                    Some(changed) if !changed.is_empty() => format!(
+                        "DATA DRIFT — save written against a different data set; changed: {}",
+                        changed
+                            .iter()
+                            .map(|k| k.label())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    _ => "DATA DRIFT — this save was written against a different data set"
+                        .to_string(),
+                });
             }
             (None, _) => self
                 .view
@@ -3245,9 +3272,11 @@ fn packaged_spa_dir() -> std::path::PathBuf {
 pub fn bug_report_cli() -> Result<(), String> {
     let view = View::new().map_err(|e| e.to_string())?;
     let root = bugreport::bug_report_root();
-    // One `data/` walk — the hash lands in both the save envelope and
-    // the fingerprint (the `collect_bug_report` precedent).
-    let data_set_hash = csp_view::data_set_hash(&csp_view::data_root()).ok();
+    // One `data/` walk — the aggregate lands in both the save
+    // envelope and the fingerprint, the §7.7 kind map in the envelope
+    // (the `collect_bug_report` precedent).
+    let hashes = csp_view::data_set_hashes(&csp_view::data_root()).ok();
+    let data_set_hash = hashes.as_ref().map(|h| h.aggregate);
     let save = view
         .sim
         .snapshot()
@@ -3257,6 +3286,7 @@ pub fn bug_report_cli() -> Result<(), String> {
                 game_version: env!("CARGO_PKG_VERSION").into(),
                 label: None,
                 data_set_hash,
+                data_kind_hashes: hashes.as_ref().map(|h| h.by_kind.clone()),
                 state_hash: view.sim.state_hash().ok(),
                 snapshot,
             })
@@ -3640,6 +3670,7 @@ mod tests {
             game_version: "0.0.0".into(),
             label: Some("crash".into()),
             data_set_hash: None,
+            data_kind_hashes: None,
             state_hash: None,
             snapshot: snapshot.clone(),
         })

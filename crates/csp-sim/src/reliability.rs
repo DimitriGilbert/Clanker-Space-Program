@@ -33,9 +33,9 @@
 //!   the snapshot that contains the record, so the engine still
 //!   fails at the same `Λ` — a retry, not a reroll (§3.4).
 //!   Revert is a *state-level* restore (`World::restore` of a §7.3
-//!   snapshot); no UI prompt or revert-policy surface exists at M9b —
-//!   the milestone's "revert policy in the UI" is deferred to the
-//!   save/slot UI milestone, documented here so the gap is explicit.
+//!   snapshot); its M9b UI surface is the Game menu's F10 "Revert to
+//!   launch" — a confirmed restore of the pre-launch snapshot under
+//!   §3.4's disclosure that records are NOT rerolled by it.
 //! - **Epoch anchoring (§2.6.1).** Rails/latched parts do not integrate
 //!   per boundary — Λ at a tick is `hazard_integral + λ·(t − epoch)`,
 //!   with the stamp refreshed only at absolute-tick transitions and
@@ -65,11 +65,12 @@
 //!   `degraded_thrust_factor`; `IgnitionFailure` refuses ignitions;
 //!   `Leak` debits the part's tank contents at `leak_units_per_s`;
 //!   `Explosion` destroys the part via the §2.4 thermal-hit machinery
-//!   (unreachable dormant — the non-fatal filter). `StuckGimbal`,
-//!   `SensorFault`, `StuckDecoupler`, and `PanelJam` record flags —
-//!   the sim has no gimbal channel, sensor-fusion model, decouple
-//!   command, or deployable state at v1, so their gameplay effect is
-//!   honest absence (documented, surfaced in the notification log).
+//!   (unreachable dormant — the non-fatal filter). `StuckDecoupler`
+//!   refuses `JettisonPart` on the recorded part and `PanelJam`
+//!   refuses `DeployPart` — both wired, real effects. `StuckGimbal`
+//!   and `SensorFault` record flags — the sim has no gimbal channel
+//!   or sensor-fusion model at v1, so their gameplay effect is honest
+//!   absence (documented, surfaced in the notification log).
 //!   `usage.gimbal_cycles` likewise never accrues — the field hashes
 //!   anyway so enabling accrual later is a hash-schema change, not a
 //!   silent format shift.
@@ -752,11 +753,11 @@ pub fn hash_spec(h: &mut StateHasher, s: &ReliabilitySpec) {
 // ---------------------------------------------------------------------------
 
 /// Whether `craft.reliability` is positional over `craft.parts` — the
-/// spawn/manufacture gates' "empty or covering" invariant. The M6-C
-/// latch merge can produce a non-covering table (a specless half
-/// concatenated with a spec'd one — the absorbed specs would bind at
-/// the wrong `effective_index`), so every positional spec read must
-/// gate on this: a non-parallel table resolves NO spec at all — the
+/// spawn/manufacture gates' "empty or covering" invariant. No live
+/// path produces a non-covering table — `apply_latch` refuses
+/// mixed-spec pairs outright and the spawn/restore gates enforce
+/// coverage — so this is the defensive gate every positional spec
+/// read takes: a non-parallel table resolves NO spec at all — the
 /// part's record goes inert, never wrong.
 pub(crate) fn specs_parallel(craft: &crate::CraftDef) -> bool {
     craft.reliability.len() == craft.parts.len()
@@ -855,9 +856,9 @@ impl World {
         let Some(craft) = v.craft.clone() else {
             return Ok(());
         };
-        // A non-covering spec table (the latch merge's mismatched-
-        // halves case) resolves no spec — records keep their
-        // in-force rate rather than restamp against a wrong part.
+        // A non-covering spec table resolves no spec (the
+        // `specs_parallel` gate) — records keep their in-force rate
+        // rather than restamp against a wrong part's table.
         let specs_ok = specs_parallel(&craft);
         for (node, rec) in v.reliability.iter_mut() {
             let Some(spec) = craft
@@ -1498,8 +1499,8 @@ pub(crate) fn bubble_part_tick(
     let g_load = env.g_load;
     let axial = env.axial;
     let mut out = TickEffects::default();
-    // A non-covering spec table (the latch merge's mismatched-halves
-    // case) resolves no spec — positional reads would bind the wrong
+    // A non-covering spec table resolves no spec (the
+    // `specs_parallel` gate) — positional reads would bind the wrong
     // part's spec, so every record sits this pass out (inert, never
     // wrong).
     let specs_ok = specs_parallel(craft);

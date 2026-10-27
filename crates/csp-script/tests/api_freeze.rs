@@ -180,3 +180,212 @@ fn frozen_surface_covers_the_trait_verbs() {
         "frozen guest surface lost coverage of ControlApi verbs: {uncovered:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The `ctx` schema — the map contract is part of the same frozen
+// surface as the method set (a renamed key breaks scripts and MCP
+// docs exactly like a renamed verb). Pinned BEHAVIORALLY: a stub
+// `TickIo` drives the real `RhaiHost` and the guest itself logs the
+// keys it sees, so the pin covers the wire the script actually
+// reads, not a secondary description of it.
+// ---------------------------------------------------------------------------
+
+/// The frozen top-level `ctx` key set (sorted — a Rhai `Map` is a
+/// `BTreeMap`, so `keys()` enumerates in byte order).
+const FROZEN_CTX_KEYS: &[&str] = &["persist", "script", "tick", "vessel"];
+
+/// The frozen `ctx.vessel` telemetry-map key set (sorted). Shared by
+/// `ctx.vessel`, `telemetry_of(id)`, and every `vessels()` entry —
+/// all three are built by the one `telemetry_to_map`. The
+/// `node`/`node_tick` pair is CONDITIONAL (present only while a
+/// maneuver node is armed) — the stub io here reports none, so they
+/// are correctly absent from this list.
+const FROZEN_CTX_VESSEL_KEYS: &[&str] = &[
+    "altitude",
+    "apoapsis",
+    "body",
+    "found",
+    "horizontal_speed",
+    "id",
+    "mass",
+    "mu",
+    "parts",
+    "periapsis",
+    "pos",
+    "residence",
+    "resources",
+    "rot",
+    "speed",
+    "throttle",
+    "tick",
+    "time_to_apoapsis",
+    "time_to_periapsis",
+    "vel",
+    "vertical_speed",
+];
+
+/// A stub `TickIo` — the smallest `VesselTelemetry` that exercises
+/// the optional-field encoding (`apoapsis: None` → the NaN sentinel
+/// the ctx contract documents).
+struct StubIo {
+    telemetry: csp_sim::VesselTelemetry,
+    commands: Vec<csp_sim::SimCommand>,
+    logs: Vec<String>,
+}
+
+impl StubIo {
+    fn new() -> Self {
+        Self {
+            telemetry: csp_sim::VesselTelemetry {
+                tick: 0,
+                found: true,
+                residence: csp_sim::TelemetryResidence::InBubble,
+                pos_m: csp_core::DVec3::new(6.0e5, 0.0, 0.0),
+                vel_mps: csp_core::DVec3::new(0.0, 10.0, 0.0),
+                rot: csp_core::DQuat::IDENTITY,
+                ang_vel_mps: csp_core::DVec3::ZERO,
+                throttle: 0.0,
+                altitude_m: Some(100.0),
+                speed_mps: 10.0,
+                vertical_speed_mps: 0.0,
+                horizontal_speed_mps: 10.0,
+                mass_kg: Some(1_000.0),
+                apoapsis_altitude_m: None, // open-conic → NaN sentinel
+                periapsis_altitude_m: Some(40_000.0),
+                time_to_apoapsis_s: None,
+                time_to_periapsis_s: Some(300.0),
+                mu_m3_per_s2: Some(3.5e12),
+                body: None,
+                elements: None,
+                maneuver_node: None,
+                resources: std::collections::BTreeMap::new(),
+                parts: Vec::new(),
+            },
+            commands: Vec::new(),
+            logs: Vec::new(),
+        }
+    }
+}
+
+impl csp_sim::TickIo for StubIo {
+    fn telemetry(&self, _v: csp_sim::VesselId) -> csp_sim::VesselTelemetry {
+        self.telemetry.clone()
+    }
+    fn vessels(&self) -> Vec<csp_sim::VesselId> {
+        vec![csp_sim::VesselId(0)]
+    }
+    fn issue(&mut self, _c: csp_sim::SourceClass, _s: u32, cmd: csp_sim::SimCommand) {
+        self.commands.push(cmd);
+    }
+    fn request_wake(
+        &mut self,
+        _s: csp_sim::ScriptId,
+        _cond: &csp_sim::WakeCondition,
+    ) -> Result<u64, csp_core::SimError> {
+        Ok(99)
+    }
+    fn cancel_wake(&mut self, _s: csp_sim::ScriptId) -> Result<(), csp_core::SimError> {
+        Ok(())
+    }
+    fn log_line(&mut self, _s: csp_sim::ScriptId, line: &str) {
+        self.logs.push(line.to_string());
+    }
+}
+
+/// Run `body` as `fn on_tick(ctx)` for one tick against a fresh
+/// host + stub io; returns the report and the guest's `log` lines.
+fn tick_script(body: &str) -> (csp_sim::ScriptRunReport, StubIo) {
+    use csp_sim::ScriptEngine as _;
+    let src = format!("fn on_tick(ctx) {{ {body} }}");
+    let mut host = csp_script::RhaiHost::new();
+    host.prepare(csp_sim::ScriptId(0), &src)
+        .unwrap_or_else(|e| panic!("{body}: prepare: {e}"));
+    let mut state = csp_sim::ScriptState {
+        id: csp_sim::ScriptId(0),
+        vessel: csp_sim::VesselId(0),
+        source: src,
+        enabled: true,
+        disabled_reason: None,
+        strikes: 0,
+        consecutive_polls: 0,
+        poll_demoted: false,
+        wake_tick: None,
+        persist: csp_sim::PersistMap::new(),
+    };
+    let mut io = StubIo::new();
+    let report = host.run_tick(&mut state, 1, &mut io);
+    (report, io)
+}
+
+#[test]
+fn ctx_top_level_key_set_is_frozen() {
+    let (r, io) = tick_script(r#"for k in ctx.keys() { log(k); }"#);
+    assert!(r.fault.is_none(), "{:?}", r.fault);
+    assert_eq!(
+        io.logs,
+        FROZEN_CTX_KEYS.to_vec(),
+        "ctx top-level keys drifted — a rename/add/remove is a \
+         csp.mcp.tools major-version event (§6)"
+    );
+}
+
+#[test]
+fn ctx_vessel_key_set_is_frozen() {
+    let (r, io) = tick_script(r#"for k in ctx.vessel.keys() { log(k); }"#);
+    assert!(r.fault.is_none(), "{:?}", r.fault);
+    assert_eq!(
+        io.logs,
+        FROZEN_CTX_VESSEL_KEYS.to_vec(),
+        "ctx.vessel keys drifted — a rename/add/remove is a \
+         csp.mcp.tools major-version event (§6)"
+    );
+}
+
+/// `telemetry_of(id)` and every `vessels()` entry carry the SAME
+/// frozen key set as `ctx.vessel` — one builder, one schema.
+#[test]
+fn vessels_and_telemetry_of_share_the_vessel_schema() {
+    let (r, io) = tick_script(
+        r#"
+        for k in vessels()[0].keys() { log(`l:${k}`); }
+        for k in telemetry_of(ctx.vessel.id).keys() { log(`o:${k}`); }
+        "#,
+    );
+    assert!(r.fault.is_none(), "{:?}", r.fault);
+    let listed: Vec<String> = io
+        .logs
+        .iter()
+        .filter(|l| l.starts_with("l:"))
+        .map(|l| l[2..].to_string())
+        .collect();
+    let of: Vec<String> = io
+        .logs
+        .iter()
+        .filter(|l| l.starts_with("o:"))
+        .map(|l| l[2..].to_string())
+        .collect();
+    assert_eq!(listed, FROZEN_CTX_VESSEL_KEYS.to_vec(), "vessels() keys");
+    assert_eq!(of, FROZEN_CTX_VESSEL_KEYS.to_vec(), "telemetry_of() keys");
+}
+
+/// The documented NaN contract, pinned at both ends: an unknown
+/// optional numeric reads as NaN to the guest (`v.is_nan()`), and a
+/// NaN copied into `ctx.persist` faults at write-back — the
+/// `dynamic_to_persist` trap the ctx contract warns about.
+#[test]
+fn ctx_nan_contract_is_pinned() {
+    // Stub telemetry has `apoapsis: None` — the sentinel value must
+    // reach the guest as NaN (the guest test is `is_nan()`; Rhai's
+    // total-order `==` makes `v != v` false even for NaN).
+    let (r, io) = tick_script(r#"log(ctx.vessel.apoapsis.is_nan());"#);
+    assert!(r.fault.is_none(), "{:?}", r.fault);
+    assert_eq!(io.logs, vec!["true"], "apoapsis must read as NaN");
+    // Copying that NaN into persist is a Runtime fault (a strike) —
+    // "unsupported or non-finite value", never a silent save poison.
+    let (r, _io) = tick_script(r#"ctx.persist["apo"] = ctx.vessel.apoapsis;"#);
+    assert!(
+        matches!(r.fault, Some(csp_sim::ScriptFault::Runtime(ref m)) if m.contains("non-finite")),
+        "NaN into persist must fault as documented: {:?}",
+        r.fault
+    );
+}

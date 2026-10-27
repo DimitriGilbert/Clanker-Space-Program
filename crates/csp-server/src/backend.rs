@@ -590,6 +590,7 @@ impl HostCore {
             // The host cannot hash `data/` — the drift-warning key is
             // "unknown", which §7.7 reads as exactly that.
             data_set_hash: None,
+            data_kind_hashes: None,
             state_hash: Some(hash),
             snapshot,
         })

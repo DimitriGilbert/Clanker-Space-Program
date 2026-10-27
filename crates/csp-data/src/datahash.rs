@@ -20,7 +20,17 @@
 //!
 //! Canonicalization (§3.1): UTF-8 text → LF line endings, trailing
 //! whitespace stripped; non-UTF-8 bytes (PNG maps) hash verbatim.
+//!
+//! §7.7's drift listing: [`data_set_kind_hashes`] runs the same walk
+//! feeding one BLAKE3 per [`DataKind`] (the file classes a drift
+//! warning can name — "part stats, biome maps, balance constants"),
+//! and the save header records the map so a later load's
+//! [`changed_kinds`] can enumerate what moved. The kind breakdown is
+//! additive metadata — the aggregate [`data_set_hash`] preimage is
+//! unchanged, so [`DATA_HASH_VERSION`](crate::DATA_HASH_VERSION)
+//! stays put.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -30,6 +40,134 @@ use std::path::{Path, PathBuf};
 pub const ART_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "tga", "webp", "ktx2", "ogg", "wav", "glb", "csar",
 ];
+
+/// The §7.7 drift-listing granularity — the coarse file classes a
+/// data-set drift warning names ("part stats, biome maps, balance
+/// constants"). Every hashed file lands in exactly one kind, so an
+/// aggregate-hash drift always names at least one kind.
+///
+/// The classification is deliberately stable and hand-keyed on the
+/// committed `data/` layout (top-level component plus the §3.1
+/// image-map rule): kind names are the wire vocabulary of the save
+/// header's `data_kind_hashes` map, so a rename is a deliberate
+/// compatibility event, not an accident of directory churn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DataKind {
+    /// `parts/**` — part definitions (§7.7's "part stats").
+    PartStats,
+    /// `balance.ron` and `resources.ron` — §7.7's "balance
+    /// constants": the economy/resource tables a tuning pass touches.
+    BalanceConstants,
+    /// Files with an [`ART_EXTENSIONS`] extension *outside* `art/` —
+    /// the §3.1 biome/concentration maps (§7.7's "biome maps").
+    BiomeMaps,
+    /// `contracts/**` — contract definitions.
+    Contracts,
+    /// `experiments/**` — science experiment definitions.
+    Experiments,
+    /// `recipes/**` — manufacture recipes.
+    Recipes,
+    /// `techtree/**` — tech tree definitions.
+    TechTree,
+    /// `systems/**` non-map files — body/site/colony/system defs.
+    SystemDefs,
+    /// `loc/**` — localization tables.
+    Localization,
+    /// `eval-scenarios/**` — the eval-tier committed scenarios.
+    EvalScenarios,
+    /// Everything else the hash covers: `ATTRIBUTION.md`, `LICENSE`,
+    /// `id-baseline.ron`, keep-files — meta-content with no sim
+    /// meaning, grouped so a docs edit never impersonates a stat
+    /// change.
+    Metadata,
+}
+
+impl DataKind {
+    /// Every kind, in declaration (sorted) order — what a full
+    /// drift listing iterates.
+    pub const ALL: &[Self] = &[
+        Self::PartStats,
+        Self::BalanceConstants,
+        Self::BiomeMaps,
+        Self::Contracts,
+        Self::Experiments,
+        Self::Recipes,
+        Self::TechTree,
+        Self::SystemDefs,
+        Self::Localization,
+        Self::EvalScenarios,
+        Self::Metadata,
+    ];
+
+    /// The save-header map key — kebab-case, stable forever (a save
+    /// written by this build must read on later builds).
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::PartStats => "part-stats",
+            Self::BalanceConstants => "balance-constants",
+            Self::BiomeMaps => "biome-maps",
+            Self::Contracts => "contracts",
+            Self::Experiments => "experiments",
+            Self::Recipes => "recipes",
+            Self::TechTree => "tech-tree",
+            Self::SystemDefs => "system-defs",
+            Self::Localization => "localization",
+            Self::EvalScenarios => "eval-scenarios",
+            Self::Metadata => "metadata",
+        }
+    }
+
+    /// Inverse of [`Self::key`]; `None` for names a newer build might
+    /// have added — unknown keys are skipped, never a load fault (the
+    /// header is the tolerant layer, and the aggregate hash still
+    /// catches the drift itself).
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|k| k.key() == key)
+    }
+
+    /// The human label §7.7's drift notice names ("part stats"…).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PartStats => "part stats",
+            Self::BalanceConstants => "balance constants",
+            Self::BiomeMaps => "biome maps",
+            Self::Contracts => "contracts",
+            Self::Experiments => "experiments",
+            Self::Recipes => "recipes",
+            Self::TechTree => "tech tree",
+            Self::SystemDefs => "system defs",
+            Self::Localization => "localization",
+            Self::EvalScenarios => "eval scenarios",
+            Self::Metadata => "metadata",
+        }
+    }
+}
+
+/// Classify one hashed file (a `/`-joined path relative to `data/`,
+/// already inside the §3.1 scope) into its [`DataKind`]. Keyed on the
+/// top-level component — `parts/…` is part stats, `systems/…` is
+/// system defs — with the §3.1 image rule applied first: an
+/// [`ART_EXTENSIONS`] file outside `art/` is hashed *because* it is a
+/// biome/concentration map, so it is its own kind wherever it sits.
+fn kind_of(rel: &str) -> DataKind {
+    if let Some(ext) = rel.rsplit('.').next()
+        && ART_EXTENSIONS.iter().any(|e| ext.eq_ignore_ascii_case(e))
+    {
+        return DataKind::BiomeMaps;
+    }
+    match rel.split('/').next() {
+        Some("parts") => DataKind::PartStats,
+        Some("balance.ron" | "resources.ron") => DataKind::BalanceConstants,
+        Some("contracts") => DataKind::Contracts,
+        Some("experiments") => DataKind::Experiments,
+        Some("recipes") => DataKind::Recipes,
+        Some("techtree") => DataKind::TechTree,
+        Some("systems") => DataKind::SystemDefs,
+        Some("loc") => DataKind::Localization,
+        Some("eval-scenarios") => DataKind::EvalScenarios,
+        _ => DataKind::Metadata,
+    }
+}
 
 /// `data_set_hash` failures — plain io diagnostics, like the loader's.
 #[derive(Debug)]
@@ -97,19 +235,87 @@ impl std::error::Error for DataHashError {
     }
 }
 
+/// The two §3.1/§7.7 products of one walk: the aggregate data-set
+/// hash and the per-[`DataKind`] breakdown. Callers that need both
+/// (a save write stamps both) take this so `data/` is read once.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DataSetHashes {
+    /// The §3.1 aggregate — what [`data_set_hash`] returns.
+    pub aggregate: [u8; 32],
+    /// The §7.7 per-kind breakdown — what [`data_set_kind_hashes`]
+    /// returns.
+    pub by_kind: BTreeMap<DataKind, [u8; 32]>,
+}
+
 /// Hash the shipping data set rooted at `data_root` (the `data/`
 /// directory). Deterministic by construction: paths are sorted before
 /// hashing, so filesystem enumeration order is irrelevant.
 pub fn data_set_hash(data_root: &Path) -> Result<[u8; 32], DataHashError> {
-    let mut h = blake3::Hasher::new();
+    Ok(walk_hashes(data_root)?.aggregate)
+}
+
+/// Aggregate + per-kind in one filesystem walk — the save-write and
+/// bug-report paths' call (one read of `data/`, never two).
+pub fn data_set_hashes(data_root: &Path) -> Result<DataSetHashes, DataHashError> {
+    walk_hashes(data_root)
+}
+
+/// The §7.7 per-kind breakdown of [`data_set_hash`]: one BLAKE3 per
+/// [`DataKind`] over the same `path || 0x00 || len || content`
+/// framing, restricted to that kind's files. The aggregate hash alone
+/// can say *that* the set drifted but never *what* — the save records
+/// this map so a later load names the changed kinds ("part stats,
+/// biome maps") per §7.7's "warns and lists what changed". `BTreeMap`
+/// key order is the deterministic enumeration.
+pub fn data_set_kind_hashes(
+    data_root: &Path,
+) -> Result<BTreeMap<DataKind, [u8; 32]>, DataHashError> {
+    Ok(walk_hashes(data_root)?.by_kind)
+}
+
+/// §7.7's "lists what changed": the kinds whose hash differs between
+/// the save's recorded map and the live data root's. A kind present
+/// on only one side counts as changed — its file set appeared or
+/// disappeared entirely.
+pub fn changed_kinds(
+    recorded: &BTreeMap<DataKind, [u8; 32]>,
+    current: &BTreeMap<DataKind, [u8; 32]>,
+) -> Vec<DataKind> {
+    // `ALL` iterates in declaration (Ord) order — the listing is
+    // already sorted. A kind this build does not know (recorded by a
+    // newer one) has by definition drifted in content terms, but
+    // `ALL` cannot name it — the aggregate `!=` check upstream is
+    // what still reports the drift at all.
+    DataKind::ALL
+        .iter()
+        .copied()
+        .filter(|k| recorded.get(k) != current.get(k))
+        .collect()
+}
+
+/// One walk over the hashed set feeding both hashers: the §3.1
+/// aggregate and the per-kind breakdown. One filesystem traversal,
+/// one read per file — the two products never disagree about which
+/// bytes they saw.
+fn walk_hashes(data_root: &Path) -> Result<DataSetHashes, DataHashError> {
+    let mut aggregate = blake3::Hasher::new();
+    let mut kinds: BTreeMap<DataKind, blake3::Hasher> = BTreeMap::new();
     for rel in hashed_files(data_root)? {
         let bytes = std::fs::read(data_root.join(&rel)).map_err(|source| DataHashError::Io {
             path: data_root.join(&rel),
             source,
         })?;
-        feed_file(&mut h, &rel, &canonicalize(&bytes));
+        let canonical = canonicalize(&bytes);
+        feed_file(&mut aggregate, &rel, &canonical);
+        feed_file(kinds.entry(kind_of(&rel)).or_default(), &rel, &canonical);
     }
-    Ok(*h.finalize().as_bytes())
+    Ok(DataSetHashes {
+        aggregate: *aggregate.finalize().as_bytes(),
+        by_kind: kinds
+            .into_iter()
+            .map(|(k, h)| (k, *h.finalize().as_bytes()))
+            .collect(),
+    })
 }
 
 /// One file's contribution to the §3.1 stream: `path || 0x00 || len ||
@@ -239,6 +445,7 @@ fn canonicalize(bytes: &[u8]) -> Vec<u8> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     /// The framing must be injective: under the pre-v2 scheme
     /// (`path || 0x00 || content`) the file set `{("a", "Xb\0Y")}`
@@ -316,6 +523,144 @@ mod tests {
             matches!(err, DataHashError::CaseCollision { .. }),
             "got {err:?}"
         );
+    }
+
+    /// A scratch `data/` tree under the temp dir — returns its root
+    /// for cleanup. Each call uses a unique name so parallel tests
+    /// never share a tree.
+    fn scratch_root(tag: &str, files: &[(&str, &[u8])]) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "csp-datahash-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        for (rel, bytes) in files {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+        }
+        root
+    }
+
+    /// §7.7's granularity: every hashed file lands in exactly the
+    /// kind its directory (or the §3.1 image rule) names.
+    #[test]
+    fn kind_of_classifies_the_committed_layout() {
+        for (rel, want) in [
+            ("parts/csp.pod.mk1.ron", DataKind::PartStats),
+            ("balance.ron", DataKind::BalanceConstants),
+            ("resources.ron", DataKind::BalanceConstants),
+            // §3.1: image extensions outside `art/` are the hashed
+            // maps — their own kind wherever they sit.
+            ("systems/home/terrin/biomes.png", DataKind::BiomeMaps),
+            ("systems/home/terrin/biomes.PNG", DataKind::BiomeMaps),
+            ("systems/home/system.ron", DataKind::SystemDefs),
+            ("contracts/contract.survey.ron", DataKind::Contracts),
+            ("experiments/exp.x.ron", DataKind::Experiments),
+            ("recipes/recipe.smelt_ore.ron", DataKind::Recipes),
+            ("techtree/home.ron", DataKind::TechTree),
+            ("loc/en.ron", DataKind::Localization),
+            ("eval-scenarios/ascent-mission.ron", DataKind::EvalScenarios),
+            ("ATTRIBUTION.md", DataKind::Metadata),
+            ("id-baseline.ron", DataKind::Metadata),
+            // A non-art-extension file under `art/` IS hashed (the
+            // §3.1 rule cuts on extension, not directory alone) and
+            // has no better kind than Metadata.
+            ("art/pack.ron", DataKind::Metadata),
+        ] {
+            assert_eq!(kind_of(rel), want, "{rel}");
+        }
+    }
+
+    /// `key`/`from_key` round-trip and uniqueness — the save header's
+    /// wire vocabulary must be one-to-one.
+    #[test]
+    fn data_kind_keys_round_trip_and_are_unique() {
+        let mut seen = std::collections::BTreeSet::new();
+        for k in DataKind::ALL {
+            assert!(seen.insert(k.key()), "duplicate key {}", k.key());
+            assert_eq!(DataKind::from_key(k.key()), Some(*k));
+        }
+        assert_eq!(DataKind::from_key("bogus-kind"), None);
+    }
+
+    /// The per-kind breakdown buckets by `kind_of`, feeds the same
+    /// framing, and leaves `data_set_hash` untouched — the aggregate
+    /// over a tree is identical whether or not kinds are computed.
+    #[test]
+    fn kind_hashes_partition_the_aggregate_walk() {
+        let root = scratch_root(
+            "kinds",
+            &[
+                ("parts/a.ron", b"part a"),
+                ("parts/b.ron", b"part b"),
+                ("systems/home/x/biomes.png", &[1u8; 32]),
+                ("balance.ron", b"balance"),
+                ("README.txt", b"meta"),
+            ],
+        );
+        let kinds = data_set_kind_hashes(&root).unwrap();
+        // No `systems/*.ron` was written — the png is the only
+        // systems file, so `SystemDefs` is absent, not empty.
+        assert_eq!(
+            kinds.keys().copied().collect::<Vec<_>>(),
+            vec![
+                DataKind::PartStats,
+                DataKind::BalanceConstants,
+                DataKind::BiomeMaps,
+                DataKind::Metadata,
+            ],
+        );
+        // One kind's files changed → only that kind's hash moves; the
+        // aggregate still moves (any change is a data-set change).
+        let before_agg = data_set_hash(&root).unwrap();
+        let before_kinds = kinds.clone();
+        std::fs::write(root.join("parts/a.ron"), b"part a CHANGED").unwrap();
+        let after_agg = data_set_hash(&root).unwrap();
+        let after_kinds = data_set_kind_hashes(&root).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_ne!(before_agg, after_agg);
+        for k in DataKind::ALL {
+            if *k == DataKind::PartStats {
+                assert_ne!(before_kinds[k], after_kinds[k]);
+            } else {
+                assert_eq!(
+                    before_kinds.get(k),
+                    after_kinds.get(k),
+                    "{k:?} must not move on a parts edit"
+                );
+            }
+        }
+        // `changed_kinds` names exactly the touched kind.
+        assert_eq!(
+            changed_kinds(&before_kinds, &after_kinds),
+            vec![DataKind::PartStats]
+        );
+    }
+
+    /// A kind that appears or disappears between the recorded and
+    /// current maps counts as changed (its file set did).
+    #[test]
+    fn changed_kinds_flags_added_and_removed_kinds() {
+        let recorded: BTreeMap<DataKind, [u8; 32]> =
+            [(DataKind::PartStats, [1; 32])].into_iter().collect();
+        let current: BTreeMap<DataKind, [u8; 32]> = [
+            (DataKind::PartStats, [1; 32]),
+            (DataKind::Contracts, [2; 32]),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            changed_kinds(&recorded, &current),
+            vec![DataKind::Contracts]
+        );
+        assert_eq!(
+            changed_kinds(&current, &recorded),
+            vec![DataKind::Contracts]
+        );
+        assert!(changed_kinds(&current, &current).is_empty());
     }
 
     /// An uppercase art extension is excluded end-to-end: hashing a

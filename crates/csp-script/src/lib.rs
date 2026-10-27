@@ -35,16 +35,26 @@
 //!
 //! # The `ctx` contract
 //!
-//! `on_tick(ctx)` receives a Rhai map: `tick`, `vessel` (a telemetry
-//! map — `altitude`, `speed`, `vertical_speed`, `apoapsis`,
-//! `periapsis`, `time_to_apoapsis`, `time_to_periapsis`, `throttle`,
-//! `mass`, `residence`, `found`, `pos`, `vel`, `rot` (the orientation
-//! quat as `{w, x, y, z}`), `node`, `node_tick`), `persist`
-//! (the live map — writes land in the save). `persist` is the only
-//! key read back after the call, and it must stay a map of
-//! primitives: indexed writes (`ctx.persist["k"] = v`) and wholesale
-//! replacement (`ctx.persist = #{…}`) are both honored; leaving it a
-//! non-map is a runtime fault. Extra keys added to `ctx` are inert.
+//! `on_tick(ctx)` receives a Rhai map: `tick`, `script` (its own
+//! [`ScriptId`]), `vessel` (a telemetry map — `id` (the bound
+//! vessel's own [`VesselId`], so the script can find itself in
+//! `vessels()`), `altitude`, `speed`, `vertical_speed`,
+//! `horizontal_speed`, `apoapsis`, `periapsis`, `time_to_apoapsis`,
+//! `time_to_periapsis`, `throttle`, `mass`, `residence`, `found`,
+//! `pos`, `vel`, `rot` (the orientation quat as `{w, x, y, z}`),
+//! `mu`, `body`, `resources`, `parts`, `node`, `node_tick`),
+//! `persist` (the live map — writes land in the save). **Optional
+//! numerics encode "unknown" as NaN** — `apoapsis` on an open conic,
+//! `mass` before the resolver sums it — so `v.is_nan()` is the
+//! guest's test for "no value" (Rhai's total-order `==` makes
+//! `v != v` false even for NaN — do not use it). Copying a NaN into
+//! `persist` faults
+//! (a non-finite float is not a primitive — see
+//! [`dynamic_to_persist`]). `persist` is the only key read back
+//! after the call, and it must stay a map of primitives: indexed
+//! writes (`ctx.persist["k"] = v`) and wholesale replacement
+//! (`ctx.persist = #{…}`) are both honored; leaving it a non-map is
+//! a runtime fault. Extra keys added to `ctx` are inert.
 //!
 //! Host functions bound on `this`-free names: `set_throttle(f)`,
 //! `steer(x, y, z)` (aim the craft's fore axis along the world
@@ -155,7 +165,8 @@ pub struct IoControlApi<'a> {
     /// The bound vessel.
     pub vessel: VesselId,
     /// The bound script (`None` for autopilot callers — wake calls
-    /// then refuse, matching the sim's io rule).
+    /// then refuse and `log` drops, matching the sim's io rule: the
+    /// record has no script id to attribute to).
     pub script: Option<ScriptId>,
 }
 
@@ -270,7 +281,15 @@ impl ControlApi for IoControlApi<'_> {
         self.io.cancel_wake(id)
     }
     fn log(&mut self, line: String) {
-        let id = self.script.unwrap_or(ScriptId(self.source_id as u64));
+        // The line rides `script_log` keyed by `ScriptId` — an
+        // autopilot caller has none, and `source_id` is the
+        // vessel-derived channel key, NOT a script id: attributing
+        // the line to `ScriptId(source_id)` would fabricate a script
+        // that never existed (and could collide with a real one).
+        // `log` returns `()` — the trait is frozen at M9c — so the
+        // refusal is a drop, the same honest-absence answer
+        // `request_wake` gives through its `Result`.
+        let Some(id) = self.script else { return };
         self.io.log_line(id, &line);
     }
     fn deploy(&mut self, node: u64) {
@@ -550,7 +569,14 @@ impl Scan<'_> {
 /// Convert a Rhai `Dynamic` to a [`PersistValue`] — the plan's "map
 /// of primitives": bool / INT / FLOAT / String (+char). Anything else
 /// (arrays, nested maps, timestamps) is refused loudly rather than
-/// silently degrading in the save.
+/// silently degrading in the save. Note the trap this creates with
+/// the `ctx.vessel` encoding: optional numerics surface to the guest
+/// as **NaN** ([`RhaiHost::telemetry_to_map`]), and a non-finite
+/// float refuses here — `ctx.persist["apo"] = ctx.vessel.apoapsis`
+/// faults ("unsupported or non-finite value", a strike) whenever the
+/// apsis is unknown. A script that may copy telemetry into persist
+/// must gate it first — `v.is_nan()` is the guest's test for the
+/// sentinel (Rhai's total-order `==` makes `v != v` useless for it).
 pub fn dynamic_to_persist(v: &Dynamic) -> Option<PersistValue> {
     if v.is_bool() {
         v.as_bool().ok().map(PersistValue::Bool)
@@ -651,6 +677,14 @@ pub struct RhaiHost {
     ops: Rc<RefCell<u64>>,
     /// Compiled scripts — pure functions of `ScriptState::source`.
     asts: BTreeMap<ScriptId, AST>,
+    /// The per-tick binding snapshot the host closures read — set
+    /// fresh by every `run_tick` before `call_fn` (the functions are
+    /// registered ONCE at construction, so this cell is how a tick's
+    /// vessel/rotation/telemetry reach them).
+    bound: Rc<RefCell<Bound>>,
+    /// The per-tick effects cell the closures write — reset by every
+    /// `run_tick` before `call_fn` and drained after it.
+    fx: Rc<RefCell<ScriptEffects>>,
 }
 
 impl RhaiHost {
@@ -684,10 +718,20 @@ impl RhaiHost {
             *c.borrow_mut() = n;
             None // keep running — `max_operations` does the abort
         });
+        // The ControlApi functions register ONCE here — ~25
+        // registrations, not ~25 × every script tick. They read the
+        // tick's vessel/rotation/telemetry through `bound` and write
+        // effects into `fx`; `run_tick` installs both cells before
+        // `call_fn` and the closures only ever run inside it.
+        let bound = Rc::new(RefCell::new(Bound::placeholder()));
+        let fx = Rc::new(RefCell::new(ScriptEffects::default()));
+        Self::bind_fns(&mut engine, Rc::clone(&fx), Rc::clone(&bound));
         Self {
             engine,
             ops,
             asts: BTreeMap::new(),
+            bound,
+            fx,
         }
     }
 
@@ -738,10 +782,19 @@ impl RhaiHost {
         });
     }
 
-    /// Telemetry → the `ctx.vessel` map.
-    fn telemetry_to_map(t: &VesselTelemetry) -> Map {
+    /// Telemetry → the `ctx.vessel` map — one builder for every
+    /// vessel-shaped map the guest sees (`ctx.vessel`, `vessels()`,
+    /// `telemetry_of`), so the key schema cannot drift between call
+    /// sites. Optional numerics encode `None` as **NaN** — the
+    /// guest-visible "unknown" sentinel (a script tests `v.is_nan()`;
+    /// storing a NaN back into `ctx.persist` faults at write-back,
+    /// see [`dynamic_to_persist`]). `id` is the vessel's own id —
+    /// what `transfer(to, …)`/`telemetry_of` take — included so a
+    /// script can find itself inside `vessels()`.
+    fn telemetry_to_map(t: &VesselTelemetry, id: VesselId) -> Map {
         let mut m = Map::new();
         let f = |v: Option<f64>| v.map_or(Dynamic::from_float(f64::NAN), Dynamic::from_float);
+        m.insert("id".into(), Dynamic::from_int(id.0 as INT));
         m.insert("tick".into(), Dynamic::from_int(t.tick as INT));
         m.insert("found".into(), Dynamic::from(t.found));
         m.insert(
@@ -771,6 +824,9 @@ impl RhaiHost {
             Dynamic::from_float(t.horizontal_speed_mps as FLOAT),
         );
         m.insert("throttle".into(), Dynamic::from_float(t.throttle as FLOAT));
+        // Same NaN-for-`None` encoding as `f` above — `mass` is the
+        // other optional numeric (unknown off-bubble or when the
+        // resolver could not sum the weld).
         m.insert(
             "mass".into(),
             t.mass_kg
@@ -825,11 +881,16 @@ impl RhaiHost {
         m
     }
 
-    /// Register every `ControlApi` host function on `engine`,
-    /// closing over `fx`/`bound` — the commands stamp
-    /// (`SourceClass::Script`, script id, §2.10's ordering).
+    /// Register every `ControlApi` host function on `engine` — ONCE
+    /// per engine, at construction. The closures read the tick's
+    /// binding (vessel, hold-rotation, the telemetry tables) through
+    /// `bound` and record effects into `fx`; `run_tick` installs both
+    /// cells before `call_fn`, which is the only place the fns can
+    /// run. (Same-name `register_fn` replaces rather than stacks, so
+    /// the old per-tick re-registration was cost only — but cost it
+    /// was.)
     #[allow(clippy::too_many_lines)]
-    fn bind_fns(&mut self, fx: Rc<RefCell<ScriptEffects>>, bound: Bound) {
+    fn bind_fns(engine: &mut Engine, fx: Rc<RefCell<ScriptEffects>>, bound: Rc<RefCell<Bound>>) {
         let push = |fx: &Rc<RefCell<ScriptEffects>>, c: SimCommand| {
             fx.borrow_mut().commands.push(c);
         };
@@ -840,43 +901,43 @@ impl RhaiHost {
             fx.borrow_mut().wake = Some(r);
         };
 
-        let (v, fx0) = (bound.vessel, fx.clone());
-        self.engine.register_fn("set_throttle", move |x: FLOAT| {
+        let (b, fx0) = (bound.clone(), fx.clone());
+        engine.register_fn("set_throttle", move |x: FLOAT| {
             push(
                 &fx0,
                 SimCommand::SetThrottle {
-                    vessel: v,
+                    vessel: b.borrow().vessel,
                     throttle: x,
                 },
             );
         });
-        let (v, fx0, cur_rot) = (bound.vessel, fx.clone(), bound.rot);
-        self.engine
-            .register_fn("steer", move |x: FLOAT, y: FLOAT, z: FLOAT| {
-                let d = DVec3::new(x, y, z);
-                let n = d.norm();
-                let rot = if n > 0.0 {
-                    // `align_rotation(from, to)` — body +Z (the thrust
-                    // axis) onto the world direction.
-                    csp_sim::maneuver::align_rotation(DVec3::Z, d / n)
-                } else {
-                    // Zero direction = hold: the same verb as
-                    // `IoControlApi::steer_dir`, whose fallback is the
-                    // telemetry rotation — `cur_rot` is exactly that
-                    // snapshot (`Bound::rot`).
-                    cur_rot
-                };
-                push(
-                    &fx0,
-                    SimCommand::SetAttitude {
-                        vessel: v,
-                        rot,
-                        ang_vel: DVec3::ZERO,
-                    },
-                );
-            });
-        let (v, fx0) = (bound.vessel, fx.clone());
-        self.engine.register_fn(
+        let (b, fx0) = (bound.clone(), fx.clone());
+        engine.register_fn("steer", move |x: FLOAT, y: FLOAT, z: FLOAT| {
+            let bound = b.borrow();
+            let d = DVec3::new(x, y, z);
+            let n = d.norm();
+            let rot = if n > 0.0 {
+                // `align_rotation(from, to)` — body +Z (the thrust
+                // axis) onto the world direction.
+                csp_sim::maneuver::align_rotation(DVec3::Z, d / n)
+            } else {
+                // Zero direction = hold: the same verb as
+                // `IoControlApi::steer_dir`, whose fallback is the
+                // telemetry rotation — `Bound::rot` is exactly that
+                // snapshot.
+                bound.rot
+            };
+            push(
+                &fx0,
+                SimCommand::SetAttitude {
+                    vessel: bound.vessel,
+                    rot,
+                    ang_vel: DVec3::ZERO,
+                },
+            );
+        });
+        let (b, fx0) = (bound.clone(), fx.clone());
+        engine.register_fn(
             "steer_quat",
             move |w: FLOAT, x: FLOAT, y: FLOAT, z: FLOAT| {
                 // `DQuat::new` is (x, y, z, w) — the guest's convention
@@ -884,7 +945,7 @@ impl RhaiHost {
                 push(
                     &fx0,
                     SimCommand::SetAttitude {
-                        vessel: v,
+                        vessel: b.borrow().vessel,
                         rot: DQuat::new(x, y, z, w),
                         ang_vel: DVec3::ZERO,
                     },
@@ -894,45 +955,46 @@ impl RhaiHost {
         // `hold_attitude()` — the ControlApi's 0-arg "hold current":
         // `SetAttitude` at the orientation the tick's telemetry
         // snapshot reports (`Bound::rot`).
-        let (v, fx0, rot) = (bound.vessel, fx.clone(), bound.rot);
-        self.engine.register_fn("hold_attitude", move || {
+        let (b, fx0) = (bound.clone(), fx.clone());
+        engine.register_fn("hold_attitude", move || {
+            let bound = b.borrow();
             push(
                 &fx0,
                 SimCommand::SetAttitude {
-                    vessel: v,
-                    rot,
+                    vessel: bound.vessel,
+                    rot: bound.rot,
                     ang_vel: DVec3::ZERO,
                 },
             );
         });
-        let (v, fx0) = (bound.vessel, fx.clone());
-        self.engine.register_fn("stage", move |node: INT| {
+        let (b, fx0) = (bound.clone(), fx.clone());
+        engine.register_fn("stage", move |node: INT| {
             push(
                 &fx0,
                 SimCommand::JettisonPart {
-                    vessel: v,
+                    vessel: b.borrow().vessel,
                     node: PartNodeId(node as u64),
                 },
             );
         });
-        let (v, fx0) = (bound.vessel, fx.clone());
-        self.engine.register_fn("jettison", move |node: INT| {
+        let (b, fx0) = (bound.clone(), fx.clone());
+        engine.register_fn("jettison", move |node: INT| {
             push(
                 &fx0,
                 SimCommand::JettisonPart {
-                    vessel: v,
+                    vessel: b.borrow().vessel,
                     node: PartNodeId(node as u64),
                 },
             );
         });
-        let (v, fx0) = (bound.vessel, fx.clone());
-        self.engine.register_fn(
+        let (b, fx0) = (bound.clone(), fx.clone());
+        engine.register_fn(
             "add_node",
             move |tick: INT, pro: FLOAT, norm: FLOAT, rad: FLOAT| {
                 push(
                     &fx0,
                     SimCommand::SetManeuver {
-                        vessel: v,
+                        vessel: b.borrow().vessel,
                         tick: tick as u64,
                         dv_prograde_mps: pro,
                         dv_normal_mps: norm,
@@ -941,73 +1003,74 @@ impl RhaiHost {
                 );
             },
         );
-        let (v, fx0) = (bound.vessel, fx.clone());
-        self.engine.register_fn("delete_node", move || {
-            push(&fx0, SimCommand::DeleteManeuver { vessel: v });
+        let (b, fx0) = (bound.clone(), fx.clone());
+        engine.register_fn("delete_node", move || {
+            push(
+                &fx0,
+                SimCommand::DeleteManeuver {
+                    vessel: b.borrow().vessel,
+                },
+            );
         });
-        let (v, fx0) = (bound.vessel, fx.clone());
-        self.engine
-            .register_fn("transfer", move |to: INT, resource: &str, amount: FLOAT| {
-                push(
-                    &fx0,
-                    SimCommand::TransferResource {
-                        from_vessel: v,
-                        to_vessel: VesselId(to as u64),
-                        resource: ResourceId(resource.to_string()),
-                        amount,
-                    },
-                );
+        let (b, fx0) = (bound.clone(), fx.clone());
+        engine.register_fn("transfer", move |to: INT, resource: &str, amount: FLOAT| {
+            push(
+                &fx0,
+                SimCommand::TransferResource {
+                    from_vessel: b.borrow().vessel,
+                    to_vessel: VesselId(to as u64),
+                    resource: ResourceId(resource.to_string()),
+                    amount,
+                },
+            );
+        });
+        let fx0 = fx.clone();
+        engine.register_fn("add_alarm", move |tick: INT, label: &str| {
+            fx0.borrow_mut().commands.push(SimCommand::SetAlarm {
+                tick: tick as u64,
+                label: label.to_string(),
             });
+        });
         let fx0 = fx.clone();
-        self.engine
-            .register_fn("add_alarm", move |tick: INT, label: &str| {
-                fx0.borrow_mut().commands.push(SimCommand::SetAlarm {
-                    tick: tick as u64,
-                    label: label.to_string(),
-                });
-            });
+        engine.register_fn("log", move |s: Dynamic| log(&fx0, s));
         let fx0 = fx.clone();
-        self.engine
-            .register_fn("log", move |s: Dynamic| log(&fx0, s));
+        engine.register_fn("print", move |s: Dynamic| log(&fx0, s));
         let fx0 = fx.clone();
-        self.engine
-            .register_fn("print", move |s: Dynamic| log(&fx0, s));
-        let fx0 = fx.clone();
-        self.engine.register_fn("wait_ticks", move |n: INT| {
+        engine.register_fn("wait_ticks", move |n: INT| {
             wake(&fx0, Ok(WakeCondition::InTicks(n.max(0) as u64)));
         });
         let fx0 = fx.clone();
-        self.engine.register_fn("wait_until_tick", move |t: INT| {
+        engine.register_fn("wait_until_tick", move |t: INT| {
             wake(&fx0, Ok(WakeCondition::AtTick(t.max(0) as u64)));
         });
         let fx0 = fx.clone();
-        self.engine.register_fn("wait_apoapsis", move || {
+        engine.register_fn("wait_apoapsis", move || {
             wake(&fx0, Ok(WakeCondition::AtApoapsis));
         });
         let fx0 = fx.clone();
-        self.engine.register_fn("wait_periapsis", move || {
+        engine.register_fn("wait_periapsis", move || {
             wake(&fx0, Ok(WakeCondition::AtPeriapsis));
         });
         let fx0 = fx.clone();
-        self.engine.register_fn("wait_soi", move || {
+        engine.register_fn("wait_soi", move || {
             wake(&fx0, Ok(WakeCondition::AtNextSoiTransition));
         });
         let fx0 = fx.clone();
-        self.engine.register_fn("wait_node", move || {
+        engine.register_fn("wait_node", move || {
             wake(&fx0, Ok(WakeCondition::AtManeuverNode));
         });
         let fx0 = fx.clone();
-        self.engine.register_fn("cancel_wait", move || {
+        engine.register_fn("cancel_wait", move || {
             wake(&fx0, Err(()));
         });
         // `deploy(node)` — the decelerator verb (`DeployPart`): the
         // parachute action `stage`/`jettison` don't cover.
-        let (v, fx0) = (bound.vessel, fx.clone());
-        self.engine.register_fn("deploy", move |node: INT| {
+        let (b, fx0) = (bound.clone(), fx.clone());
+        engine.register_fn("deploy", move |node: INT| {
             push(
                 &fx0,
                 SimCommand::DeployPart {
-                    vessel: v,
+                    vessel: b.borrow().vessel,
                     node: PartNodeId(node as u64),
                 },
             );
@@ -1018,41 +1081,46 @@ impl RhaiHost {
         // commands are control-gated like every other issue — the
         // player's automation passes under a vacant lease, and the
         // residence gate rejects honestly (latched/rails).
-        let (v, fx0) = (bound.vessel, fx.clone());
-        self.engine
-            .register_fn("engage_autopilot", move |apo: FLOAT, pe: FLOAT| {
-                push(
-                    &fx0,
-                    SimCommand::EngageAutopilot {
-                        vessel: v,
-                        program: csp_sim::AutopilotProgram::Ascent {
-                            target_apoapsis_m: apo,
-                            target_periapsis_m: pe,
-                        },
+        let (b, fx0) = (bound.clone(), fx.clone());
+        engine.register_fn("engage_autopilot", move |apo: FLOAT, pe: FLOAT| {
+            push(
+                &fx0,
+                SimCommand::EngageAutopilot {
+                    vessel: b.borrow().vessel,
+                    program: csp_sim::AutopilotProgram::Ascent {
+                        target_apoapsis_m: apo,
+                        target_periapsis_m: pe,
                     },
-                );
-            });
-        let (v, fx0) = (bound.vessel, fx.clone());
-        self.engine.register_fn("disengage_autopilot", move || {
-            push(&fx0, SimCommand::DisengageAutopilot { vessel: v });
+                },
+            );
+        });
+        let (b, fx0) = (bound.clone(), fx.clone());
+        engine.register_fn("disengage_autopilot", move || {
+            push(
+                &fx0,
+                SimCommand::DisengageAutopilot {
+                    vessel: b.borrow().vessel,
+                },
+            );
         });
         // `wait_altitude(above_m, ascending)` — the §2.10 altitude
         // wake (closed-form crossing of the frame's conic).
         let fx0 = fx.clone();
-        self.engine
-            .register_fn("wait_altitude", move |above_m: FLOAT, ascending: bool| {
-                wake(&fx0, Ok(WakeCondition::AtAltitude { above_m, ascending }));
-            });
+        engine.register_fn("wait_altitude", move |above_m: FLOAT, ascending: bool| {
+            wake(&fx0, Ok(WakeCondition::AtAltitude { above_m, ascending }));
+        });
         // `telemetry_of(id)` / `vessels()` — the read surface the
         // frozen trait already declared but no guest name reached
-        // (report-18 F4): precomputed at bind time because a Rhai
-        // callback can't reach the borrowed `io`. `telemetry_of` on
-        // an unknown id returns `#{found: false}` — the same shape
+        // (report-18 F4): precomputed per tick into `Bound` because a
+        // Rhai callback can't reach the borrowed `io`. `telemetry_of`
+        // on an unknown id returns `#{found: false}` — the same shape
         // `ctx.vessel` reports for a dead vessel.
-        let by_id = bound.telemetry_by_id;
-        self.engine
-            .register_fn("telemetry_of", move |id: INT| -> Dynamic {
-                by_id.get(&(id.max(0) as u64)).map_or_else(
+        let b = bound.clone();
+        engine.register_fn("telemetry_of", move |id: INT| -> Dynamic {
+            b.borrow()
+                .telemetry_by_id
+                .get(&(id.max(0) as u64))
+                .map_or_else(
                     || {
                         let mut m = Map::new();
                         m.insert("found".into(), Dynamic::from(false));
@@ -1060,15 +1128,17 @@ impl RhaiHost {
                     },
                     |m| Dynamic::from_map(m.clone()),
                 )
-            });
-        let list = bound.telemetry_list;
-        self.engine.register_fn("vessels", move || -> Dynamic {
-            Dynamic::from_array(list.as_ref().clone())
+        });
+        let b = bound.clone();
+        engine.register_fn("vessels", move || -> Dynamic {
+            Dynamic::from_array(b.borrow().telemetry_list.as_ref().clone())
         });
     }
 }
 
-/// What the host must know to bind the script's functions.
+/// What the host's registered functions read per tick — installed
+/// into the shared cell by `run_tick` before `call_fn` (the fns
+/// register once at construction, so this is the per-tick binding).
 struct Bound {
     /// The bound vessel.
     vessel: VesselId,
@@ -1081,6 +1151,20 @@ struct Bound {
     /// Every vessel's telemetry map (with an `id` key) in arena
     /// order — `vessels()`'s return array.
     telemetry_list: Rc<rhai::Array>,
+}
+
+impl Bound {
+    /// The construction-time cell content — never observed: every
+    /// `run_tick` installs the tick's real bound before `call_fn`,
+    /// and the registered fns only exist inside that call.
+    fn placeholder() -> Self {
+        Self {
+            vessel: VesselId(0),
+            rot: DQuat::IDENTITY,
+            telemetry_by_id: Rc::new(BTreeMap::new()),
+            telemetry_list: Rc::new(rhai::Array::new()),
+        }
+    }
 }
 
 impl Default for RhaiHost {
@@ -1162,21 +1246,20 @@ impl ScriptEngine for RhaiHost {
         let mut telemetry_by_id = BTreeMap::new();
         let mut telemetry_list = rhai::Array::new();
         for vid in io.vessels() {
-            let mut m = Self::telemetry_to_map(&io.telemetry(vid));
-            m.insert("id".into(), Dynamic::from_int(vid.0 as INT));
+            let m = Self::telemetry_to_map(&io.telemetry(vid), vid);
             telemetry_by_id.insert(vid.0, m.clone());
             telemetry_list.push(Dynamic::from_map(m));
         }
-        let effects = Rc::new(RefCell::new(ScriptEffects::default()));
-        self.bind_fns(
-            Rc::clone(&effects),
-            Bound {
-                vessel: script.vessel,
-                rot: telemetry.rot,
-                telemetry_by_id: Rc::new(telemetry_by_id),
-                telemetry_list: Rc::new(telemetry_list),
-            },
-        );
+        // Install this tick's binding + a fresh effects cell — the
+        // fns were registered once at construction and read both
+        // through the shared cells.
+        *self.bound.borrow_mut() = Bound {
+            vessel: script.vessel,
+            rot: telemetry.rot,
+            telemetry_by_id: Rc::new(telemetry_by_id),
+            telemetry_list: Rc::new(telemetry_list),
+        };
+        *self.fx.borrow_mut() = ScriptEffects::default();
 
         // Build ctx: tick + vessel telemetry + live persist — all
         // PLAIN values. `ctx` itself is the shared cell (`into_shared`
@@ -1196,7 +1279,7 @@ impl ScriptEngine for RhaiHost {
         ctx.insert("script".into(), Dynamic::from_int(script.id.0 as INT));
         ctx.insert(
             "vessel".into(),
-            Dynamic::from_map(Self::telemetry_to_map(&telemetry)),
+            Dynamic::from_map(Self::telemetry_to_map(&telemetry, script.vessel)),
         );
         ctx.insert(
             "persist".into(),
@@ -1311,7 +1394,7 @@ impl ScriptEngine for RhaiHost {
                 //    disable risk. The refusal rides `script_log` so
                 //    the player sees it — and the tick's other
                 //    effects still apply.
-                let fx = effects.borrow();
+                let fx = self.fx.borrow();
                 if let Some(w) = &fx.wake {
                     let r = match w {
                         Ok(cond) => io.request_wake(script.id, cond).map(|_| ()),
@@ -1908,6 +1991,33 @@ mod tests {
             matches!(r.fault, Some(ScriptFault::Runtime(_))),
             "ctx.persist = 5 must strike, not silently pass: {r:?}"
         );
+    }
+
+    /// C26-F9 regression: the host fns register once at construction
+    /// and read the tick's binding through the shared cell — a second
+    /// script's `run_tick` MUST reinstall the bound vessel or its
+    /// commands would stamp the previous script's.
+    #[test]
+    fn per_tick_binding_is_reinstalled() {
+        let mut host = RhaiHost::new();
+        for id in [0_u64, 1] {
+            let src = "fn on_tick(ctx) { set_throttle(0.5); }";
+            host.prepare(ScriptId(id), src).unwrap();
+            let mut s = script(src);
+            s.id = ScriptId(id);
+            s.vessel = VesselId(id * 7); // distinct vessels: 0 and 7
+            let mut io = StubIo::new();
+            let r = host.run_tick(&mut s, 1, &mut io);
+            assert!(r.fault.is_none(), "{:?}", r.fault);
+            assert!(
+                io.commands
+                    .iter()
+                    .any(|c| matches!(c, SimCommand::SetThrottle { vessel, .. } if *vessel == VesselId(id * 7))),
+                "script {id}'s command must stamp vessel {}: {:?}",
+                id * 7,
+                io.commands
+            );
+        }
     }
 
     /// Panic containment around `engine.call_fn`: a panic anywhere

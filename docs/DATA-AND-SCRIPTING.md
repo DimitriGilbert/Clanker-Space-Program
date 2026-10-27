@@ -443,12 +443,19 @@ per tick; there is no resumable VM.
 
 `on_tick(ctx)` receives a map with `tick`, `script` (its own id), `persist` (the live
 map — writes land in the save), and `vessel` — the bound vessel's telemetry:
+`id` (the vessel's own id — find yourself inside `vessels()`),
 `altitude, apoapsis, periapsis, time_to_apoapsis, time_to_periapsis, speed,
 vertical_speed, horizontal_speed, throttle, mass, residence ("rails"|"bubble"|
 "latched"|"missing"), found, pos {x,y,z}, vel {x,y,z}, rot {w,x,y,z}, mu, body,
 resources (map id→units), parts (array of `#{node, part}` — the handles
 `stage`/`jettison`/`deploy` take), node/node_tick (maneuver, when scheduled)`.
-Missing values surface as `NaN`. (Built in `csp-script/src/lib.rs::telemetry_to_map`
+Missing optional numerics surface as `NaN` — the guest tests `v.is_nan()`
+(Rhai's total-order `==` makes `v != v` false even for NaN — do not use it).
+Beware the write-back trap: a NaN copied into `ctx.persist` is a non-primitive
+at conversion and faults (a strike) — gate the copy on `!v.is_nan()` first.
+`telemetry_of(id)`/`vessels()` entries carry the same key set plus the same
+`id` (one builder); a key change here is a frozen-surface change, pinned by
+`tests/api_freeze.rs`. (Built in `csp-script/src/lib.rs::telemetry_to_map`
 over `csp_sim::VesselTelemetry`.)
 
 ### 3.3 The ControlApi surface — FROZEN at M9c

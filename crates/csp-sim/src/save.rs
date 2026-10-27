@@ -15,6 +15,7 @@
 //! ```json
 //! { "save_version": 2, "game_version": "…", "hash_schema_version": N,
 //!   "kdf_version": N, "data_hash_version": N, "data_set_hash": "<hex>|null",
+//!   "data_kind_hashes": {"<kind>": "<hex>", …}|null,
 //!   "label": "…|null", "compression": "deflate", "body_format": "cbor",
 //!   "body_len": N }
 //! ```
@@ -76,6 +77,7 @@
 //! the caller puts it (`csp-app` uses `$config_dir/csp/`, §7.8's sidecar
 //! class — the save itself is authoritative, unlike the other sidecars).
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -135,6 +137,13 @@ pub struct Save {
     /// §7.7's drift-warning key: `None` migrated from v1 means "unknown
     /// data set — the loader cannot check drift and says so".
     pub data_set_hash: Option<[u8; 32]>,
+    /// The §7.7 per-[`csp_data::datahash::DataKind`] breakdown recorded
+    /// alongside [`Self::data_set_hash`] — what lets the drift warning
+    /// "list what changed" instead of naming only the aggregate. `None`
+    /// on saves written before the field existed (and on `data_set_hash`
+    /// `None` saves); the warning then falls back to the bare "different
+    /// data set" notice.
+    pub data_kind_hashes: Option<BTreeMap<csp_data::datahash::DataKind, [u8; 32]>>,
     /// The world's §7.1 state hash at save time (v3-header writers).
     /// Loader-side integrity metadata only — never fed back into sim
     /// state: a restored world whose `state_hash()` differs from this
@@ -165,6 +174,14 @@ struct SaveHeader {
     /// (a v1 writer did not know the hash — "unknown" is honest).
     #[serde(default)]
     data_set_hash: Option<String>,
+    /// The §7.7 per-kind breakdown of `data_set_hash` — `DataKind`'s
+    /// kebab-case key to that kind's lowercase-hex hash. Absent/`null`
+    /// on headers written before the field existed; the drift warning
+    /// then lists nothing (the aggregate still says drift happened).
+    /// Keys this build does not know are skipped at decode — a newer
+    /// kind name must not fault an older reader.
+    #[serde(default)]
+    data_kind_hashes: Option<BTreeMap<String, String>>,
     /// The save slot's display label — user metadata, never hashed.
     /// Absent/`null` on v1 files (the field did not exist yet).
     #[serde(default)]
@@ -373,6 +390,11 @@ pub fn encode_save(save: &Save) -> Result<Vec<u8>, SaveError> {
         kdf_version: csp_core::KDF_VERSION,
         data_hash_version: csp_data::DATA_HASH_VERSION,
         data_set_hash: save.data_set_hash.as_ref().map(hex_encode),
+        data_kind_hashes: save.data_kind_hashes.as_ref().map(|m| {
+            m.iter()
+                .map(|(k, v)| (k.key().to_string(), hex_encode(v)))
+                .collect()
+        }),
         label: save.label.clone(),
         tick: Some(save.snapshot.clock_ticks),
         state_hash: save.state_hash.as_ref().map(hex_encode),
@@ -415,6 +437,23 @@ pub fn decode_save(bytes: &[u8]) -> Result<Save, SaveError> {
     save.label = header.label;
     save.data_set_hash = match &header.data_set_hash {
         Some(h) => Some(hex_decode(h).ok_or(SaveError::BadHeader)?),
+        None => None,
+    };
+    save.data_kind_hashes = match &header.data_kind_hashes {
+        Some(m) => {
+            let mut kinds = BTreeMap::new();
+            for (key, hex) in m {
+                // A kind name this build does not know is skipped —
+                // the header is the tolerant layer and the aggregate
+                // hash still catches the drift itself. A malformed
+                // hex value is a malformed header, same rule as
+                // `data_set_hash`.
+                if let Some(kind) = csp_data::datahash::DataKind::from_key(key) {
+                    kinds.insert(kind, hex_decode(hex).ok_or(SaveError::BadHeader)?);
+                }
+            }
+            Some(kinds)
+        }
         None => None,
     };
     save.state_hash = match &header.state_hash {
@@ -537,6 +576,7 @@ fn to_current(body: VersionedBody) -> Save {
             game_version: String::new(),
             label: None,
             data_set_hash: None,
+            data_kind_hashes: None,
             state_hash: None,
             snapshot: body.snapshot,
         },
@@ -620,6 +660,14 @@ mod tests {
             game_version: "0.0.0".into(),
             label: Some("first flight".into()),
             data_set_hash: Some([0xAB; 32]),
+            data_kind_hashes: Some(
+                [
+                    (csp_data::datahash::DataKind::PartStats, [0x11; 32]),
+                    (csp_data::datahash::DataKind::BiomeMaps, [0x22; 32]),
+                ]
+                .into_iter()
+                .collect(),
+            ),
             state_hash: Some([0xCD; 32]),
             snapshot: live_snapshot(),
         };
@@ -646,6 +694,7 @@ mod tests {
             game_version: "0.0.0".into(),
             label: Some("stable".into()),
             data_set_hash: Some([0x01; 32]),
+            data_kind_hashes: None,
             state_hash: None,
             snapshot: live_snapshot(),
         };
@@ -660,6 +709,11 @@ mod tests {
             game_version: "1.2.3".into(),
             label: Some("x".into()),
             data_set_hash: Some([0x5A; 32]),
+            data_kind_hashes: Some(
+                [(csp_data::datahash::DataKind::PartStats, [0x33; 32])]
+                    .into_iter()
+                    .collect(),
+            ),
             state_hash: None,
             snapshot: live_snapshot(),
         };
@@ -675,6 +729,12 @@ mod tests {
             header["data_set_hash"],
             "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
         );
+        // §7.7's per-kind breakdown rides the header as kebab-case
+        // kind → hex, so a hex editor can diff what changed.
+        assert_eq!(
+            header["data_kind_hashes"]["part-stats"],
+            "3333333333333333333333333333333333333333333333333333333333333333"
+        );
         assert_eq!(header["compression"], "deflate");
         assert_eq!(header["body_format"], "cbor");
         assert_eq!(
@@ -689,6 +749,7 @@ mod tests {
             game_version: "0.0.0".into(),
             label: None,
             data_set_hash: None,
+            data_kind_hashes: None,
             state_hash: None,
             snapshot: live_snapshot(),
         };
@@ -783,6 +844,60 @@ mod tests {
         ));
     }
 
+    /// §7.7's kind breakdown is tolerant metadata: an unknown kind
+    /// name (a newer build's vocabulary) is skipped rather than
+    /// faulting the load, while a malformed hex value is the same
+    /// `BadHeader` a bad `data_set_hash` is.
+    #[test]
+    fn kind_hash_header_tolerates_unknown_kinds_not_bad_hex() {
+        let save = Save {
+            game_version: "0.0.0".into(),
+            label: None,
+            data_set_hash: Some([0x01; 32]),
+            data_kind_hashes: Some(
+                [(csp_data::datahash::DataKind::PartStats, [0x33; 32])]
+                    .into_iter()
+                    .collect(),
+            ),
+            state_hash: None,
+            snapshot: live_snapshot(),
+        };
+        let bytes = encode_save(&save).unwrap();
+        let rewrite = |f: &dyn Fn(&mut serde_json::Value)| -> Vec<u8> {
+            let len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+            let mut header: serde_json::Value =
+                serde_json::from_slice(&bytes[12..12 + len]).unwrap();
+            f(&mut header);
+            let header_json = serde_json::to_vec(&header).unwrap();
+            let mut out = Vec::new();
+            out.extend_from_slice(SAVE_MAGIC);
+            out.extend_from_slice(&(header_json.len() as u32).to_le_bytes());
+            out.extend_from_slice(&header_json);
+            out.extend_from_slice(&bytes[12 + len..]);
+            out
+        };
+        // A future kind name is skipped at decode — the known kind
+        // still round-trips, the unknown one is not a fault.
+        let forward = rewrite(&|h: &mut serde_json::Value| {
+            h["data_kind_hashes"]["future-kind"] = "aa".repeat(32).into();
+        });
+        let save_f = decode_save(&forward).unwrap();
+        assert_eq!(
+            save_f.data_kind_hashes.as_ref().unwrap().len(),
+            1,
+            "the unknown kind must be skipped, not kept"
+        );
+        assert_eq!(
+            save_f.data_kind_hashes.as_ref().unwrap()[&csp_data::datahash::DataKind::PartStats],
+            [0x33; 32]
+        );
+        // A malformed hex value under a KNOWN kind is `BadHeader`.
+        let bad = rewrite(&|h: &mut serde_json::Value| {
+            h["data_kind_hashes"]["part-stats"] = "not-hex".into();
+        });
+        assert!(matches!(decode_save(&bad), Err(SaveError::BadHeader)));
+    }
+
     #[test]
     fn foreign_bytes_refused() {
         assert!(matches!(
@@ -815,6 +930,7 @@ mod tests {
             game_version: "0.0.0".into(),
             label: None,
             data_set_hash: None,
+            data_kind_hashes: None,
             state_hash: None,
             snapshot: live_snapshot(),
         };
