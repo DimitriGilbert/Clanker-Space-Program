@@ -1114,7 +1114,7 @@ fn measure_vab_300() -> Result<Measurement, ReplayError> {
     let res = csp_data::load_resources(&root.join("resources.ron")).map_err(ReplayError::Load)?;
 
     let mut view = csp_view::View::with_sim(World::new());
-    view.install_vab_catalog(parts, res);
+    view.install_vab_catalog(parts, res, csp_data::data_set_hash(&root).ok());
     view.set_mode(csp_view::ViewMode::Vab);
 
     view.with_vab_session(|v| v.apply(VabAction::SetRoot(csp_data::PartId::from("csp.tank.s320"))))

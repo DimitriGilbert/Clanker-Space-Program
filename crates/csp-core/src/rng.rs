@@ -29,7 +29,13 @@ pub enum StreamTag {
     Reliability = 0,
     Ignition = 1,
     Contracts = 2,
-    Generation = 3,
+    /// Reserved — discriminant 3 was allocated to a `Generation` stream
+    /// that was never wired (no draw site ever shipped). It stays in
+    /// the enum so the slot's history is explicit: renumbering it away
+    /// would invite a later variant to silently reuse 3 (C01-F4). The
+    /// goldens below pin its KDF preimage exactly so the tag-3 bytes
+    /// can never drift. Do NOT draw from this tag.
+    Reserved = 3,
 }
 
 impl StreamTag {
@@ -121,7 +127,7 @@ mod tests {
     //   Reliability 7 0   a18e7b6e578db8fe1d8e6d07ccb713b65a7dc0ce47b65cde4b2ddaf195fe5f36
     //   Ignition    7 0   383ed60a778b048846f40da1e63253b70081f4e833c30071268792738d626c55
     //   Contracts   0 0   465c18bae4613662a686a48e05ca22b687e9cac6316d7717105a2994de72db19
-    //   Generation  1234 9 c92220bcd173e15b788279f59465a5d454ce338122b8b84ef482347e567d7527
+    //   Reserved    1234 9 c92220bcd173e15b788279f59465a5d454ce338122b8b84ef482347e567d7527
     //   Reliability 7 1   c867d8f28cd6ad03ca743923ea172ff715209b287883f00939d853b867899626
     //   Ignition    8 0   4c54e21de948d60f919014669ed55309386d41688018d9d098321694a44c1aea
     //   stream (256 B)    b03f286c39fc9e5b18f56819df0e392c125f814cf54cec7c9014c8d0492a8d85
@@ -134,7 +140,7 @@ mod tests {
     //                     dbfaf58a2630a24adccac0dcffa7ba9fddc1b5c997c797b6030e1bb7a6b350d7
     //   uniform f64 bits (save_seed 42)
     //   Reliability 7 0   0x3fd6e7bf0e5b0a0e   Ignition 7 0     0x3fec221d073a375f
-    //   Generation 1234 9 0x3fea945b5db97049
+    //   Reserved   1234 9 0x3fea945b5db97049
 
     /// Expected `derive_key(42, …)` outputs for `kdf_golden_set`, in case order.
     const EXPECTED_KEYS: [[u8; 32]; 6] = [
@@ -217,7 +223,9 @@ mod tests {
         assert_eq!(StreamTag::Reliability.discriminant(), 0);
         assert_eq!(StreamTag::Ignition.discriminant(), 1);
         assert_eq!(StreamTag::Contracts.discriminant(), 2);
-        assert_eq!(StreamTag::Generation.discriminant(), 3);
+        // 3 is the reserved never-drawn slot (the removed `Generation`
+        // allocation) — pinned so the tag-3 preimage bytes can't drift.
+        assert_eq!(StreamTag::Reserved.discriminant(), 3);
     }
 
     /// The preimage is assembled byte-by-byte straight from the §2.7 spec —
@@ -255,14 +263,15 @@ mod tests {
     // a `KDF_VERSION` bump and a changelog entry.
 
     /// Full 32-byte KDF output pinned for a fixed set of keys covering every
-    /// `StreamTag`, plus entity and counter variation.
+    /// `StreamTag`, plus entity and counter variation. The `Reserved` row
+    /// pins tag 3's preimage bytes — reserved, never a live stream.
     #[test]
     fn kdf_golden_set() {
         let cases: [(StreamTag, u64, u64); 6] = [
             (StreamTag::Reliability, 7, 0),
             (StreamTag::Ignition, 7, 0),
             (StreamTag::Contracts, 0, 0),
-            (StreamTag::Generation, 1234, 9),
+            (StreamTag::Reserved, 1234, 9),
             (StreamTag::Reliability, 7, 1),
             (StreamTag::Ignition, 8, 0),
         ];
@@ -308,7 +317,7 @@ mod tests {
         let cases: [(StreamTag, u64, u64, u64); 3] = [
             (StreamTag::Reliability, 7, 0, 0x3fd6_e7bf_0e5b_0a0e),
             (StreamTag::Ignition, 7, 0, 0x3fec_221d_073a_375f),
-            (StreamTag::Generation, 1234, 9, 0x3fea_945b_5db9_7049),
+            (StreamTag::Reserved, 1234, 9, 0x3fea_945b_5db9_7049),
         ];
         for (tag, entity, counter, bits) in cases {
             let got = uniform(

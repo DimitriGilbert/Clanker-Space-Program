@@ -1446,6 +1446,13 @@ pub struct AdvanceReport {
     /// (the vessel keeps its last valid state — epoch-anchored, nothing
     /// was written). `step_frame` only ever returns `Err` for `Fatal`.
     pub degraded: Vec<SimError>,
+    /// Free-text diagnostics produced alongside `degraded` — the channel
+    /// for §2.13's "log the elements" obligations `SimError`'s
+    /// `&'static str` payload cannot carry (§2.8 item 4's failing
+    /// `OrbitState` dump on solver non-convergence is the first member).
+    /// Never hashed or serialized (output, like `script_log`) — a UI/log
+    /// layer surfaces each line verbatim.
+    pub diagnostics: Vec<String>,
     /// `true` when [`MAX_TICKS_PER_FRAME`] or the event budget split the
     /// advance and the caller must re-issue the same target —
     /// back-pressure, never a stall: a partial still advanced the clock,
@@ -8261,11 +8268,12 @@ impl World {
         t_next: SimTime,
         shadow: &mut TickShadow,
         degraded: &mut Vec<SimError>,
+        diagnostics: &mut Vec<String>,
     ) -> Result<(), SimError> {
         debug_assert!(t_next >= now, "interval must not be reversed");
         for subsystem in SUBSYSTEM_ORDER {
             if subsystem == Subsystem::Orbits {
-                self.advance_orbits(t_next, degraded)?;
+                self.advance_orbits(t_next, degraded, diagnostics)?;
             }
             // M8-A §3.5.1: the colony slot is publish-only — the
             // network's deadlines are re-published at every boundary
@@ -8323,16 +8331,19 @@ impl World {
     /// The interval advance therefore *mutates nothing*: it re-solves
     /// each vessel's conic at `t_next` to prove the closed form still
     /// evaluates (§2.8's solvability contract — a failed solve is
-    /// `Recoverable` — reported on `degraded`, and the orbit keeps its
-    /// last valid state because nothing was written). Mutation belongs
+    /// `Recoverable` — reported on `degraded`, the failing
+    /// `OrbitState`'s elements logged on `diagnostics` per §2.8 item 4,
+    /// and the orbit keeps its last valid state because nothing was
+    /// written). Mutation belongs
     /// to events (the SOI re-base) and commands (spawn), never to the
     /// interval itself. Ascending-ID iteration per §2.2.
     fn advance_orbits(
         &mut self,
         t_next: SimTime,
         degraded: &mut Vec<SimError>,
+        diagnostics: &mut Vec<String>,
     ) -> Result<(), SimError> {
-        for vessel in self.vessels.values() {
+        for (id, vessel) in self.vessels.iter() {
             // Bubble-resident and latched vessels have no conic — the
             // physics tick and the pose record are their truth.
             let Some(orbit) = vessel.orbit() else {
@@ -8340,7 +8351,18 @@ impl World {
             };
             match self.orbits.state_at(orbit, t_next) {
                 Err(e @ SimError::Fatal(_)) => return Err(e),
-                Err(e) => degraded.push(e),
+                Err(e) => {
+                    // §2.8 item 4: "log the elements" — `SimError`
+                    // payloads are `&'static str` by design, so the
+                    // failing `OrbitState` rides `diagnostics`, the
+                    // report's unhashed free-text channel.
+                    diagnostics.push(format!(
+                        "state_at failed at tick {} for vessel {} — {e}; orbit {orbit:?}",
+                        t_next.ticks(),
+                        id.0,
+                    ));
+                    degraded.push(e);
+                }
                 Ok(_) => {}
             }
         }
@@ -9315,6 +9337,7 @@ impl World {
         let mut fired_events = Vec::new();
         let mut rejected = Vec::new();
         let mut degraded = Vec::new();
+        let mut diagnostics = Vec::new();
         loop {
             // §2.6.2's break conditions precede the drain: a call with no
             // advance owed is not a tick boundary — drains nothing.
@@ -9384,6 +9407,7 @@ impl World {
                     SimTime::from_ticks(range_end),
                     &mut shadow,
                     &mut degraded,
+                    &mut diagnostics,
                 )
             {
                 shadow.restore(self);
@@ -9423,6 +9447,7 @@ impl World {
             fired_events,
             rejected,
             degraded,
+            diagnostics,
             partial: self.clock.ticks() < effective_target,
             effective_target,
             script_log: std::mem::take(&mut self.script_log),
@@ -13669,6 +13694,61 @@ mod tests {
             assert!(matches!(r.rejected[0].error, SimError::Recoverable(_)));
             assert!(w.vessels.is_empty(), "no orbit minted: period_s={period_s}");
         }
+    }
+
+    /// §2.8 item 4's "log the elements": a `state_at` failure inside
+    /// the interval advance reports `Recoverable` on `degraded` AND
+    /// dumps the failing `OrbitState` on `diagnostics` — `SimError`'s
+    /// `&'static str` payload cannot carry them (C06-F4).
+    #[test]
+    fn advance_orbits_logs_failing_elements_on_solve_failure() {
+        let mut w = World::with_system(test_system());
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SpawnVessel {
+                parent: BodyId::from("p"),
+                elements: leo_elements(),
+            },
+        );
+        w.step_frame(1).unwrap();
+        // Corrupt the orbit post-spawn — the spawn path's own
+        // solvability gate (`apply_spawn_vessel`'s `state_at` probe)
+        // is what makes the interval failure unreachable through the
+        // command channel, so the defect is planted directly.
+        w.vessels.get_mut(&VesselId(0)).unwrap().state = VesselState::OnRails(OrbitState {
+            parent: BodyId::from("p"),
+            elements: KeplerElements {
+                semi_major_axis_m: f64::NAN,
+                ..leo_elements()
+            },
+            epoch: SimTime::ZERO,
+        });
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(
+            r.degraded
+                .iter()
+                .any(|e| matches!(e, SimError::Recoverable(_))),
+            "the failed solve must report Recoverable: {:?}",
+            r.degraded
+        );
+        assert_eq!(
+            r.diagnostics.len(),
+            1,
+            "exactly one element dump: {:?}",
+            r.diagnostics
+        );
+        let line = &r.diagnostics[0];
+        assert!(line.contains("state_at failed"), "{line}");
+        assert!(line.contains("vessel 0"), "{line}");
+        // The elements themselves — the whole point of the channel.
+        assert!(line.contains("semi_major_axis_m: NaN"), "{line}");
+        // The failed solve mutates nothing — the epoch-anchored state
+        // survives verbatim.
+        assert!(
+            matches!(w.vessels()[&VesselId(0)].state, VesselState::OnRails(_)),
+            "the orbit keeps its last valid state"
+        );
     }
 
     /// The rejected channel carries a *typed* kind, not just a text

@@ -345,8 +345,9 @@ carried in the enum: `Clamping` (auto-demotes warp) vs `Silent`, with per-vessel
 
 `csp-core/src/rng.rs`: `derive_key(save_seed, StreamKey) -> [u8; 32]` = BLAKE3 over
 `KDF_VERSION(1) ‖ save_seed ‖ tag ‖ entity ‖ counter` (fixed LE widths); `stream()` builds a
-`ChaCha8Rng` from it. `StreamTag` = `{Reliability=0, Ignition=1, Contracts=2, Generation=3}` —
-append-only. The scheme **reseeds per key** (a stored counter replays the exact draw — reloading
+`ChaCha8Rng` from it. `StreamTag` = `{Reliability=0, Ignition=1, Contracts=2, Reserved=3}` —
+append-only (3 is a reserved never-drawn slot; a `Generation` stream was
+allocated there but never shipped). The scheme **reseeds per key** (a stored counter replays the exact draw — reloading
 a save and re-flying cannot reroll a failure threshold; anti-save-scum by construction).
 `SeedableRng::seed_from_u64` is lint-banned. Fixed arity everywhere
 (`{CONTRACTS, 0, offer_index}`).

@@ -307,6 +307,17 @@ pub fn node_lead_ticks(craft: &crate::CraftDef, dv_mps: f64) -> u64 {
     est_burn_ticks(craft, dv_mps).unwrap_or(0).div_ceil(2)
 }
 
+/// The near-aligned shortcut bound of [`align_rotation`]: a `cos` above
+/// this returns `IDENTITY` instead of the exact axis-angle. `1 − 1e-12`
+/// caps the residual pointing error at ~1.4e-6 rad; the earlier
+/// `0.999_999` bound could leave ~1.4e-3 rad of slop — ~1.4 m/s of
+/// transverse Δv on a 1 km/s burn (C06-F5) — and the exact branch is
+/// only a cross product + one `libm::acos`, so the looser gate bought
+/// nothing. `csp-bench`'s scripted controller (`thrust_attitude`,
+/// `scenarios.rs`) shares this constant — the duplicated convention
+/// must never drift.
+pub const NEAR_ALIGNED_COS: f64 = 1.0 - 1e-12;
+
 /// Rotation taking the body-frame unit `from` to the bubble-frame unit
 /// `to` — the executor's attitude solve. Axis-angle on the cross
 /// product; the `to` axis's orthogonal complement is used for the
@@ -314,7 +325,7 @@ pub fn node_lead_ticks(craft: &crate::CraftDef, dv_mps: f64) -> u64 {
 /// controller's `thrust_attitude` uses).
 pub fn align_rotation(from: DVec3, to: DVec3) -> DQuat {
     let cos = from.dot(to);
-    if cos > 0.999_999 {
+    if cos > NEAR_ALIGNED_COS {
         return DQuat::IDENTITY;
     }
     if cos < -0.999_999 {
@@ -401,6 +412,23 @@ mod tests {
         let d = dv / dv.norm();
         let t = tv / tv.norm();
         assert!((align_rotation(d, t).rotate(d) - t).norm() < 1e-12);
+    }
+
+    /// C06-F5: the near-aligned shortcut's band is `1 − 1e-12` — a
+    /// `cos` in the old `0.999_999` shortcut range (≈1.4e-4 rad of
+    /// slop below) now gets the exact axis-angle, not `IDENTITY`.
+    #[test]
+    fn align_rotation_band_uses_the_exact_branch() {
+        // cos ≈ 1 − 2e-8: inside the retired `0.999_999` shortcut, well
+        // outside the new `1 − 1e-12` one.
+        let v = DVec3::Z + DVec3::X * 2.0e-4;
+        let from = v / v.norm();
+        let q = align_rotation(from, DVec3::Z);
+        assert_ne!(q, DQuat::IDENTITY, "the old band must not short-circuit");
+        assert!((q.rotate(from) - DVec3::Z).norm() < 1e-12);
+        // And the surviving shortcut still holds: an exactly-aligned
+        // pair stays `IDENTITY`.
+        assert_eq!(align_rotation(DVec3::Z, DVec3::Z), DQuat::IDENTITY);
     }
 
     /// `node_dv_world` composes components through the frame — a pure

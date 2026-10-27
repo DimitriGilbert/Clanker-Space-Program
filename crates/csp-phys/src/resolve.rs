@@ -269,8 +269,13 @@ pub struct BuiltPart {
 
 impl BuiltPart {
     /// A stock build: scale 1, stretch 1, the `variant` named, no
-    /// upgrades, zeroed data-set hash. Convenience for tests and
-    /// early call sites; the manufacture path fills every field.
+    /// upgrades, **zeroed data-set hash**. Convenience for tests and
+    /// early call sites — the caller stamps the hash at the session
+    /// boundary: the VAB's `stock_build` fills it from the installed
+    /// catalog hash, and `csp_sim`'s `SimState::build_part` takes the
+    /// stamp as an argument. A `stock()` part placed without a
+    /// stamping wrapper keeps the zero sentinel (nothing consumes the
+    /// field yet — see the field doc).
     pub fn stock(part_id: PartId, variant: VariantId) -> Self {
         Self {
             part_id,

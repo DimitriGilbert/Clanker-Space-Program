@@ -2113,8 +2113,12 @@ impl View {
         let mut view = Self::with_sim(sim);
         // M3 VAB: the part catalog + resource registry are data-derived
         // constants for the session model (like BodyTable — §7.3's
-        // re-derived-on-load class).
-        view.install_vab_catalog(d.parts, d.resources);
+        // re-derived-on-load class). The §3.1 aggregate rides along so
+        // `BuiltPart::data_set_hash` gets the real stamp (C15-F2);
+        // `data_set_hash` walks the filesystem, so a non-fs source
+        // (the embedded demo set) installs `None` and the parts keep
+        // the zero sentinel — nothing consumes the field yet.
+        view.install_vab_catalog(d.parts, d.resources, data_set_hash(root).ok());
         // The catalog's display-name half: `PartDef::display_name` is a
         // `LocKey`, so the English table is what lets the palette print
         // "Sparc Launch Engine" instead of the raw part id — same
@@ -4067,16 +4071,20 @@ impl View {
     /// Install the part catalog + resource registry (called by
     /// `View::from_source` after the `data/` tree loads — native reads
     /// the filesystem, the §6.3 demo reads the embedded set; an unset
-    /// catalog leaves the VAB honest-but-empty).
+    /// catalog leaves the VAB honest-but-empty). `data_set_hash` is
+    /// the §3.1 aggregate of the set the catalog loaded from — the
+    /// session stamps it onto every `BuiltPart` it builds (§7.7's
+    /// per-part drift key); `None` leaves the zero sentinel.
     pub fn install_vab_catalog(
         &mut self,
         parts: csp_data::LoadedParts,
         resources: csp_data::ResourceFile,
+        data_set_hash: Option<[u8; 32]>,
     ) {
         self.world
             .resource_mut::<vab::VabSessionRes>()
             .0
-            .set_catalog(parts, resources);
+            .set_catalog(parts, resources, data_set_hash);
         self.stage_vab_tech();
     }
 

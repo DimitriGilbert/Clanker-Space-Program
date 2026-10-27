@@ -386,6 +386,12 @@ pub struct VabSession {
     session: CraftSession,
     catalog: Option<LoadedParts>,
     resources: Option<ResourceFile>,
+    /// The §3.1 aggregate `csp_data::data_set_hash` of the installed
+    /// data set — stamped onto every `BuiltPart` this session builds
+    /// (§7.7's per-part drift key). `None` = unknown (headless/demo
+    /// sessions where the hash could not be computed) — the zero
+    /// sentinel `BuiltPart::stock` starts with then survives verbatim.
+    data_set_hash: Option<[u8; 32]>,
     /// The English loc table — the catalog's display-name half
     /// (`PartDef::display_name` is a `LocKey`). Data-derived, same
     /// class as the catalog; absent in headless fixtures, where names
@@ -512,6 +518,7 @@ impl Default for VabSession {
             session: CraftSession::default(),
             catalog: None,
             resources: None,
+            data_set_hash: None,
             loc: None,
             profile: MissionProfile::default(),
             selected: None,
@@ -564,9 +571,19 @@ impl VabSession {
 
     /// Install/replace the part catalog + resource registry (called by
     /// `View::install_vab_catalog` once `data/` is loaded).
-    pub fn set_catalog(&mut self, catalog: LoadedParts, resources: ResourceFile) {
+    /// `data_set_hash` is the §3.1 aggregate of the set the catalog
+    /// came from — `None` when the host cannot compute it (the
+    /// embedded demo source), leaving [`BuiltPart::stock`]'s zero
+    /// sentinel in place.
+    pub fn set_catalog(
+        &mut self,
+        catalog: LoadedParts,
+        resources: ResourceFile,
+        data_set_hash: Option<[u8; 32]>,
+    ) {
         self.catalog = Some(catalog);
         self.resources = Some(resources);
+        self.data_set_hash = data_set_hash;
         self.dirty = true;
     }
 
@@ -1113,7 +1130,7 @@ impl VabSession {
                 ))
             }
             VabAction::CompactStages => {
-                self.session.compact_stages();
+                self.session.compact_stages().map_err(VabError::Session)?;
                 self.dirty = true;
                 Some("compacted stage numbering".to_string())
             }
@@ -1961,6 +1978,11 @@ impl VabSession {
             .map(|v| v.id.clone())
             .unwrap_or_else(|| VariantId::from("stock"));
         let mut built = BuiltPart::stock(part_id.clone(), variant);
+        // §3.1/§7.7: the per-part drift key is stamped at the
+        // session boundary — the catalog's installed set hash. A
+        // session with no installed hash keeps `stock`'s zero
+        // sentinel (documented on the field; nothing consumes it yet).
+        built.data_set_hash = self.data_set_hash.unwrap_or([0; 32]);
         if let Some(tech) = &self.tech {
             // The family's purchased levels freeze at build — a
             // compose failure on a stale/crafted track map degrades

@@ -1078,6 +1078,25 @@ fn report_stage_gaps(populated: &[u32], out: &mut Validation) {
     }
 }
 
+/// The parent → children index in one O(n) pass — the shared shape
+/// `body_transforms`, `validate_occupancy`, `from_file`, the staging
+/// checks, and `subtree_ids` all need (C15-F5). Iterate `nodes` (a
+/// `BTreeMap`) in ascending-id order so each child list is already
+/// sorted — the same order `children_ids`'s per-node scan yields.
+/// `children_ids` stays the one-off accessor; callers that visit more
+/// than one node's children build this once.
+fn children_map(
+    nodes: &BTreeMap<PartNodeId, SessionNode>,
+) -> BTreeMap<PartNodeId, Vec<PartNodeId>> {
+    let mut children: BTreeMap<PartNodeId, Vec<PartNodeId>> = BTreeMap::new();
+    for (id, n) in nodes {
+        if let Some(e) = &n.edge {
+            children.entry(e.parent).or_default().push(*id);
+        }
+    }
+    children
+}
+
 /// `true` when `ancestor` is `id` or appears on `id`'s parent chain —
 /// the `reattach` cycle check. Terminates because the maintained
 /// invariant is a tree.
@@ -1153,7 +1172,9 @@ impl CraftSession {
         self.nodes.contains_key(&id)
     }
 
-    /// The node's direct children, ascending id.
+    /// The node's direct children, ascending id — an O(n) scan per
+    /// call, fine for one-off lookups. Anything walking more than one
+    /// node's children builds [`children_map`] once instead (C15-F5).
     pub fn children_ids(&self, id: PartNodeId) -> Vec<PartNodeId> {
         self.nodes
             .iter()
@@ -1185,11 +1206,14 @@ impl CraftSession {
     /// `id` plus its whole descendant subtree, ascending id — the set
     /// `remove_part` takes out and the UI's subtree selection mirrors.
     pub fn subtree_ids(&self, id: PartNodeId) -> Vec<PartNodeId> {
+        let children = children_map(&self.nodes);
         let mut out = BTreeSet::new();
         let mut frontier = vec![id];
         while let Some(n) = frontier.pop() {
-            if out.insert(n) {
-                frontier.extend(self.children_ids(n));
+            if out.insert(n)
+                && let Some(kids) = children.get(&n)
+            {
+                frontier.extend(kids.iter().copied());
             }
         }
         out.into_iter().collect()
@@ -1208,12 +1232,7 @@ impl CraftSession {
         let Some(root) = self.root else {
             return out;
         };
-        let mut children: BTreeMap<PartNodeId, Vec<PartNodeId>> = BTreeMap::new();
-        for (id, n) in &self.nodes {
-            if let Some(e) = &n.edge {
-                children.entry(e.parent).or_default().push(*id);
-            }
-        }
+        let children = children_map(&self.nodes);
         let mut stack = vec![(root, PartTransform::IDENTITY)];
         while let Some((id, up)) = stack.pop() {
             let Some(n) = self.nodes.get(&id) else {
@@ -1288,18 +1307,7 @@ impl CraftSession {
                 part_id: built.part_id.clone(),
             })?;
         check_built(child_def, &built, id)?;
-        // One stack node mates exactly one neighbour — refuse a
-        // second edge onto an already-bound parent node.
-        if self
-            .bound_attach_nodes(edge.parent)
-            .contains(&edge.parent_node)
-        {
-            return Err(SessionError::AttachNodeOccupied {
-                node: edge.parent,
-                which: "parent",
-                node_id: edge.parent_node.clone(),
-            });
-        }
+        self.check_parent_slot_free(&edge)?;
         let transform = self.compute_attach(defs, id, &built, &edge)?;
         let node = SessionNode {
             built,
@@ -1413,6 +1421,27 @@ impl CraftSession {
         Ok(transform)
     }
 
+    /// The parent-side half of the occupancy rule — one stack node
+    /// mates exactly one neighbour, so an edge onto an already-bound
+    /// parent node refuses. Shared verbatim by [`Self::add_part`] and
+    /// [`Self::preview_attach`] so the preview oracle can never `Ok`
+    /// where the commit would refuse (C15-F1). `reattach` runs the
+    /// same rule with its own exemption — the slot the moving edge's
+    /// old binding frees — so it keeps its dedicated site.
+    fn check_parent_slot_free(&self, edge: &AttachEdge) -> Result<(), SessionError> {
+        if self
+            .bound_attach_nodes(edge.parent)
+            .contains(&edge.parent_node)
+        {
+            return Err(SessionError::AttachNodeOccupied {
+                node: edge.parent,
+                which: "parent",
+                node_id: edge.parent_node.clone(),
+            });
+        }
+        Ok(())
+    }
+
     /// The transform `add_part` would compute for `edge` — the same
     /// checks, no session mutation. The editor's ghost preview uses it
     /// so the drop lands exactly what was previewed.
@@ -1422,6 +1451,10 @@ impl CraftSession {
         built: &BuiltPart,
         edge: &AttachEdge,
     ) -> Result<PartTransform, SessionError> {
+        // Occupancy precedes `compute_attach` exactly as `add_part`
+        // orders it — a doubly-rejecting edge reports the same error
+        // the commit would.
+        self.check_parent_slot_free(edge)?;
         self.compute_attach(defs, PartNodeId(self.next_id), built, edge)
     }
 
@@ -1961,8 +1994,24 @@ impl CraftSession {
     }
 
     /// Reindex populated stages to `0..k` preserving order — the
-    /// staging panel's "tidy" op; empty gaps disappear.
-    pub fn compact_stages(&mut self) {
+    /// staging panel's "tidy" op; empty gaps disappear. An out-of-cap
+    /// stage index (crafted file only — `validate` flags it and the
+    /// ops gate it) is **refused**, not remapped into a legal-looking
+    /// dense index: silently rewriting it would launder the defect
+    /// `validate` is meant to report (C15-F4).
+    pub fn compact_stages(&mut self) -> Result<(), SessionError> {
+        if let Some((id, stage)) = self
+            .nodes
+            .iter()
+            .find(|(_, n)| n.stage > MAX_STAGE_INDEX)
+            .map(|(id, n)| (*id, n.stage))
+        {
+            return Err(SessionError::InvalidStage {
+                node: Some(id),
+                stage,
+                detail: "session: stage index exceeds the maximum",
+            });
+        }
         let order = self.populated_stages();
         let remap: BTreeMap<u32, u32> = order
             .iter()
@@ -1974,6 +2023,7 @@ impl CraftSession {
                 n.stage = *new;
             }
         }
+        Ok(())
     }
 
     /// The weld-shaped view of the session (module doc): a `PartGraph`
@@ -2121,12 +2171,7 @@ impl CraftSession {
     /// (its own `child_node` + each child's `parent_node`) and flag
     /// duplicates.
     fn validate_occupancy(&self, out: &mut Validation) {
-        let mut children: BTreeMap<PartNodeId, Vec<PartNodeId>> = BTreeMap::new();
-        for (id, n) in &self.nodes {
-            if let Some(e) = &n.edge {
-                children.entry(e.parent).or_default().push(*id);
-            }
-        }
+        let children = children_map(&self.nodes);
         for (id, n) in &self.nodes {
             let mut seen: BTreeSet<&str> = BTreeSet::new();
             let mut dup: BTreeSet<&str> = BTreeSet::new();
@@ -2163,8 +2208,13 @@ impl CraftSession {
         let has = |id: &PartNodeId, f: &dyn Fn(&ModuleDef) -> bool| {
             def_of.get(id).is_some_and(|d| d.modules.iter().any(f))
         };
+        // The decoupler check and every engine's `supply_region` flood
+        // share one child index — `children_ids`'s per-node O(n) scan
+        // inside either loop would make `validate` quadratic (C15-F5).
+        let children = children_map(&self.nodes);
         for (id, n) in &self.nodes {
-            if has(id, &|m| matches!(m, ModuleDef::Decoupler)) && self.children_ids(*id).is_empty()
+            if has(id, &|m| matches!(m, ModuleDef::Decoupler))
+                && children.get(id).is_none_or(|kids| kids.is_empty())
             {
                 out.warnings.push(SessionWarning::DecouplerSeversNothing {
                     node: *id,
@@ -2178,7 +2228,7 @@ impl CraftSession {
                 let ModuleDef::Engine { propellants, .. } = m else {
                     continue;
                 };
-                let region = self.supply_region(def_of, *id, n.stage);
+                let region = self.supply_region(def_of, &children, *id, n.stage);
                 let missing = self.missing_propellants(def_of, &region, propellants);
                 if !missing.is_empty() {
                     out.warnings.push(SessionWarning::EngineWithoutPropellant {
@@ -2204,9 +2254,13 @@ impl CraftSession {
     /// still connected after every decoupler in a *higher* stage has
     /// severed its child edges — everything the session holds but the
     /// region misses has already departed when `stage` fires.
+    /// `children` is the caller's one-pass [`children_map`] — the flood
+    /// runs once per engine, so rebuilding the index inside it would
+    /// be O(engines · n).
     fn supply_region(
         &self,
         def_of: &BTreeMap<PartNodeId, &PartDef>,
+        children: &BTreeMap<PartNodeId, Vec<PartNodeId>>,
         engine: PartNodeId,
         stage: u32,
     ) -> BTreeSet<PartNodeId> {
@@ -2232,9 +2286,11 @@ impl CraftSession {
         let mut region = BTreeSet::from([engine]);
         let mut frontier = vec![engine];
         while let Some(n) = frontier.pop() {
-            for c in self.children_ids(n) {
-                if !fired.contains(&n) && region.insert(c) {
-                    frontier.push(c);
+            if let Some(kids) = children.get(&n) {
+                for c in kids {
+                    if !fired.contains(&n) && region.insert(*c) {
+                        frontier.push(*c);
+                    }
                 }
             }
             if let Some(p) = self
@@ -2452,13 +2508,8 @@ impl CraftSession {
         // Reachability from the root — anything left over is a cycle
         // (dangling parents already failed above). The parent→children
         // index is built once so the walk is O(n), not a full map scan
-        // per popped node (the `body_transforms` pattern).
-        let mut children: BTreeMap<PartNodeId, Vec<PartNodeId>> = BTreeMap::new();
-        for (id, n) in &nodes {
-            if let Some(e) = &n.edge {
-                children.entry(e.parent).or_default().push(*id);
-            }
-        }
+        // per popped node (the shared `children_map` shape).
+        let children = children_map(&nodes);
         let mut seen = BTreeSet::from([root]);
         let mut frontier = vec![root];
         while let Some(p) = frontier.pop() {
@@ -2955,9 +3006,57 @@ mod tests {
         assert_eq!(s.stage_of(eng), Some(2));
         // Sparse out to stage 9 then compact back to dense.
         s.set_stage(eng, 9).unwrap();
-        s.compact_stages();
+        s.compact_stages().unwrap();
         assert_eq!(s.stage_order(), vec![2, 1, 0]);
         assert_eq!(s.stage_of(eng), Some(2));
+    }
+
+    /// C15-F4: a crafted out-of-cap stage index refuses `compact_stages`
+    /// instead of being laundered into a legal-looking dense index —
+    /// and the session is left untouched so `validate`'s error stands.
+    #[test]
+    fn compact_stages_refuses_out_of_cap_index() {
+        let (mut s, _, _, tank, _) = stack();
+        // Only a crafted file can carry this — `set_stage`/`insert_stage`
+        // gate at MAX_STAGE_INDEX; `validate` flags it as InvalidStage.
+        s.nodes.get_mut(&tank).unwrap().stage = u32::MAX;
+        assert!(matches!(
+            s.compact_stages(),
+            Err(SessionError::InvalidStage {
+                stage: u32::MAX,
+                ..
+            })
+        ));
+        // Nothing remapped: the defect still reads exactly what the
+        // file authored, so `validate` keeps reporting it.
+        assert_eq!(s.stage_of(tank), Some(u32::MAX));
+    }
+
+    /// C15-F1: `preview_attach` runs the same parent-side occupancy
+    /// gate `add_part` enforces — the pub oracle can never `Ok` where
+    /// the commit would refuse `AttachNodeOccupied`.
+    #[test]
+    fn preview_attach_enforces_parent_occupancy() {
+        let (s, defs, pod, _, _) = stack();
+        // `pod.bottom` is bound by the tank — preview must refuse the
+        // same way `add_part` does (the doc's "the same checks" claim).
+        let edge = AttachEdge::new(pod, "bottom", "top");
+        assert_eq!(
+            s.preview_attach(&defs, &stock("test.tank"), &edge),
+            Err(SessionError::AttachNodeOccupied {
+                node: pod,
+                which: "parent",
+                node_id: "bottom".to_string(),
+            })
+        );
+        // A free parent node still previews, and the transform is the
+        // one `add_part` would commit.
+        let free = AttachEdge::new(pod, "top", "bottom");
+        let built = stock("test.hull");
+        let previewed = s.preview_attach(&defs, &built, &free).unwrap();
+        let mut s2 = s.clone();
+        let id = s2.add_part(&defs, built, free).unwrap();
+        assert_eq!(s2.node(id).unwrap().transform(), previewed);
     }
 
     #[test]

@@ -489,7 +489,10 @@ pub fn thrust_attitude(dir: DVec3) -> DQuat {
     }
     let d = dir / n;
     let cos = DVec3::Z.dot(d);
-    if cos > 0.999_999 {
+    // The sim executor's `align_rotation` convention, duplicated here
+    // for the scripted controller — the shared constant keeps the two
+    // near-aligned shortcuts at the same bound (C06-F5).
+    if cos > csp_sim::maneuver::NEAR_ALIGNED_COS {
         return DQuat::IDENTITY;
     }
     if cos < -0.999_999 {

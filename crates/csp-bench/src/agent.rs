@@ -450,6 +450,7 @@ fn merge_report(acc: &mut AdvanceReport, next: AdvanceReport) {
     acc.fired_events.extend(next.fired_events);
     acc.rejected.extend(next.rejected);
     acc.degraded.extend(next.degraded);
+    acc.diagnostics.extend(next.diagnostics);
     acc.partial = next.partial;
     acc.effective_target = next.effective_target;
     acc.script_log.extend(next.script_log);

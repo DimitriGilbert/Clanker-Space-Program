@@ -487,6 +487,18 @@ impl StableDiscriminant for EventKind {
 /// tracked-vessel opt-in promotes that object's `SoiTransition`
 /// `Silent → Clamping`; `PlayerAlarm` is always `Clamping`; `SoiRescan`
 /// is always `Silent` (a re-query must never clamp warp).
+///
+/// **Reading of the opt-in sentence (C03-F4, deliberate):** §2.6.5's
+/// prose says per-object opt-in "promotes that object's events
+/// `Silent → Clamping`", but its own member table qualifies only
+/// `SoiTransition` by "focused/tracked vessel" and lists `DebrisDecay`
+/// and `PartFailure` under `Silent` unconditionally — the spec is
+/// internally ambiguous, and this function takes the table's narrow
+/// reading: `SoiTransition` is the only tracked-gated kind. The
+/// toggle's heap rewrite (`lib.rs` `SetVesselTracked`) restamps only
+/// `SoiTransition` entries to match. A tracked vessel's `DebrisDecay`
+/// and `PartFailure` therefore stay `Silent` — their surfacing rides
+/// the notification log, never a warp demote.
 pub fn class_of(kind: &EventKind, tracked: &BTreeSet<VesselId>) -> EventClass {
     match kind {
         EventKind::SoiTransition { vessel, .. } => {
@@ -497,6 +509,9 @@ pub fn class_of(kind: &EventKind, tracked: &BTreeSet<VesselId>) -> EventClass {
             }
         }
         EventKind::SoiRescan { .. }
+        // §2.6.5's table lists decay under `Silent` unconditionally —
+        // the tracked opt-in does not promote it (the narrow reading
+        // documented on `class_of`).
         | EventKind::DebrisDecay { .. }
         | EventKind::SalaryDue
         // §3.5.1's boundary deadlines — the §2.6.5 `Silent` members
@@ -511,7 +526,9 @@ pub fn class_of(kind: &EventKind, tracked: &BTreeSet<VesselId>) -> EventClass {
         | EventKind::LifeSupportCheck
         // M9b §3.4: the failure crossing and the bench delivery are
         // `Silent` bookkeeping — surfacing rides the notification
-        // log, never warp demotion.
+        // log, never warp demotion. Also `Silent` for a *tracked*
+        // vessel: the same narrow reading of §2.6.5's opt-in that
+        // leaves `DebrisDecay` unpromoted (see `class_of`'s doc).
         | EventKind::PartFailure { .. }
         | EventKind::BenchTestComplete { .. }
         // C21-F2: the berth-blocked re-check is bookkeeping like the

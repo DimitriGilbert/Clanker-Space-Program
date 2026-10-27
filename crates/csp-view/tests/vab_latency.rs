@@ -40,7 +40,7 @@ fn vab_interaction_latency_at_300_parts() {
     let res = load_resources(&root.join("resources.ron")).unwrap();
 
     let mut view = View::with_sim(SimWorld::new());
-    view.install_vab_catalog(parts, res);
+    view.install_vab_catalog(parts, res, csp_data::data_set_hash(&root).ok());
     view.set_mode(ViewMode::Vab);
 
     // Build a 300-part stack through the real op channel — root tank +

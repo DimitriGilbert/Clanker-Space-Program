@@ -424,6 +424,11 @@ impl HostCore {
                     report.events_truncated = report.events_truncated.saturating_add(1);
                 }
             }
+            // `diagnostics` (the §2.8 element dumps) are log-only — the
+            // wire `degraded` list stays the typed Recoverable channel.
+            for d in &r.diagnostics {
+                log::warn!("sim diagnostic: {d}");
+            }
             for rej in &r.rejected {
                 log::warn!("command rejected on {:?}: {}", rej.key, rej.error);
             }

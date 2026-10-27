@@ -1374,6 +1374,12 @@ impl App {
         for e in &report.degraded {
             log::warn!("event degraded (fallback applied): {e}");
         }
+        // §2.8 item 4's element dumps and kin — free-text lines the sim
+        // produces next to a `degraded` entry; the log ring is the only
+        // consumer (they are diagnostic, never player-facing).
+        for d in &report.diagnostics {
+            log::warn!("sim diagnostic: {d}");
+        }
         // §2.6.2's rails-warp refusal seam: the sim-side predicate,
         // checked here every frame on post-step state — the only
         // place it can be. Honest about the one-frame lag: the
@@ -4694,6 +4700,7 @@ mod tests {
             fired_events: Vec::new(),
             rejected: Vec::new(),
             degraded: Vec::new(),
+            diagnostics: Vec::new(),
             partial: true,
             effective_target: app.view.sim.clock().ticks() + 1,
             script_log: Vec::new(),

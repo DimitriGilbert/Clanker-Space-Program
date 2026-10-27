@@ -461,6 +461,19 @@ pub enum ValidationError {
         /// Why it failed (stable reason token).
         reason: &'static str,
     },
+    /// A module's attach-node *reference* is inconsistent — a
+    /// `DockPort` naming no attach node, or two port modules claiming
+    /// the same one. Carries the node so the diagnostic can name it —
+    /// every other check in the file names the offending id (C32-F8);
+    /// `BadModule`'s `&'static str` reason alone could not.
+    BadModuleNode {
+        /// The part.
+        part: String,
+        /// The attach-node id the module names or claims.
+        node: String,
+        /// Why it failed (stable reason token).
+        reason: &'static str,
+    },
     /// A `ReliabilityDef` field violates §3.4's stated ranges
     /// (qualification-curve shape, stress-rule multipliers, dormant
     /// stress bounds, failure-mode weights).
@@ -866,6 +879,7 @@ impl fmt::Display for ValidationError {
             | Self::BadAttachNode { .. }
             | Self::CategoryModuleMismatch { .. }
             | Self::BadModule { .. }
+            | Self::BadModuleNode { .. }
             | Self::BadReliability { .. }
             | Self::BadCollider { .. }
             | Self::BadAeroCurve { .. }
@@ -974,6 +988,9 @@ impl ValidationError {
                 )
             }
             Self::BadModule { part, reason } => write!(f, "{part:?}: module: {reason}"),
+            Self::BadModuleNode { part, node, reason } => {
+                write!(f, "{part:?}: module node {node:?}: {reason}")
+            }
             Self::BadReliability { part, reason } => {
                 write!(f, "{part:?}: reliability: {reason}")
             }
@@ -3655,13 +3672,15 @@ fn check_modules(
     for m in &part.modules {
         if let ModuleDef::DockPort { node, .. } = m {
             if !part.attach_nodes.iter().any(|n| &n.id == node) {
-                out.push(ValidationError::BadModule {
+                out.push(ValidationError::BadModuleNode {
                     part: part_id.to_string(),
+                    node: node.clone(),
                     reason: "dock_port node names no attach node",
                 });
             } else if !port_nodes.insert(node.as_str()) {
-                out.push(ValidationError::BadModule {
+                out.push(ValidationError::BadModuleNode {
                     part: part_id.to_string(),
+                    node: node.clone(),
                     reason: "two dock ports claim the same attach node",
                 });
             }
@@ -7296,29 +7315,32 @@ mod tests {
         };
         // "top" is the fixture's only authored node.
         assert!(part_errors(port_part("top")).is_empty());
-        // A port face that names no attach node anchors nothing.
+        // A port face that names no attach node anchors nothing —
+        // and the diagnostic names the offending node (C32-F8).
         let errs = part_errors(port_part("ghost"));
         assert!(
             errs.iter().any(|e| matches!(
                 e,
-                ValidationError::BadModule {
+                ValidationError::BadModuleNode {
+                    node,
                     reason: "dock_port node names no attach node",
                     ..
-                }
+                } if node == "ghost"
             )),
             "{errs:?}"
         );
-        // Two ports, one face — ambiguous authored data.
+        // Two ports, one face — ambiguous authored data, again named.
         let mut d = port_part("top");
         d.modules.push(d.modules[0].clone());
         let errs = part_errors(d);
         assert!(
             errs.iter().any(|e| matches!(
                 e,
-                ValidationError::BadModule {
+                ValidationError::BadModuleNode {
+                    node,
                     reason: "two dock ports claim the same attach node",
                     ..
-                }
+                } if node == "top"
             )),
             "{errs:?}"
         );

@@ -110,6 +110,18 @@ pub enum MergeError {
     /// or a non-unit rotation. A corrupt seam would weld, silently,
     /// into mis-scaled geometry.
     InvalidSeam,
+    /// `effective_base` does not exceed every primary
+    /// `effective_index` — the doc's precondition. A too-small base
+    /// silently aliases secondary nodes onto primary `WeldPart` slots,
+    /// which no downstream check can see (the aliased index is still
+    /// in range), so this is a typed refusal in every build profile —
+    /// the `debug_assert` it replaces was release-stripped (C15-F3).
+    EffectiveBaseUndersized {
+        /// The base the caller passed.
+        base: u32,
+        /// The largest `effective_index` the primary graph uses.
+        max_effective_index: u32,
+    },
     /// A remapped id or effective index overflowed — `base + id`
     /// exceeded `u64`/`u32`. Carried names the overflowing counter.
     IndexOverflow(&'static str),
@@ -125,6 +137,9 @@ impl MergeError {
             Self::SecondaryShape(r) => r,
             Self::SecondaryParent { .. } => "merge: secondary node has a broken parent",
             Self::InvalidSeam => "merge: seam transform is not finite-unit",
+            Self::EffectiveBaseUndersized { .. } => {
+                "merge: effective_base below the primary's used effective indices"
+            }
             Self::IndexOverflow(f) => f,
         }
     }
@@ -187,12 +202,13 @@ pub struct MergedGraph {
 ///   `parts_primary ++ parts_secondary` (the sim concatenates the
 ///   slices itself; `merge_graphs` is a graph edit, and keeping the
 ///   parts vec out of the signature keeps the function pure over
-///   exactly what it transforms). **Precondition:** the base must be
-///   at least `max(primary effective_index) + 1` — a too-small base
-///   cannot be detected here (the parts slice is out of signature by
-///   design) and would silently alias secondary nodes onto primary
-///   `WeldPart`s; a `debug_assert` against the primary's used
-///   indices catches the violation in debug builds.
+///   exactly what it transforms). **Precondition enforced:** the base
+///   must be at least `max(primary effective_index) + 1` — the
+///   primary's used indices are in signature (the parts slice is not),
+///   so a too-small base refuses with
+///   [`MergeError::EffectiveBaseUndersized`] in every build profile
+///   instead of silently aliasing secondary nodes onto primary
+///   `WeldPart`s.
 ///
 /// Errors instead of panicking on every malformed input: missing
 /// attach/port nodes, a malformed secondary graph, a non-unit seam,
@@ -230,15 +246,17 @@ pub fn merge_graphs(
     // `effective_base` must exceed every primary `effective_index`
     // (doc precondition) — undersizing it silently aliases secondary
     // nodes onto primary `WeldPart`s, which no check downstream can
-    // see. The parts slice is out of signature, so only the
-    // primary's used indices can prove the bound: debug-assert it.
-    debug_assert!(
-        primary
-            .nodes
-            .values()
-            .all(|n| n.effective_index < effective_base),
-        "merge: effective_base below the primary's used effective indices"
-    );
+    // see. The bound is derivable from the primary graph alone (its
+    // used indices are in signature even though the parts slice is
+    // not), so it is a typed refusal, not a release-stripped assert.
+    if let Some(max_effective_index) = primary.nodes.values().map(|n| n.effective_index).max()
+        && effective_base <= max_effective_index
+    {
+        return Err(MergeError::EffectiveBaseUndersized {
+            base: effective_base,
+            max_effective_index,
+        });
+    }
     check_secondary_structure(secondary)?;
     // The remap base: every merged secondary id sorts above every
     // primary id, so the weld's ascending-id summation order is the
@@ -807,6 +825,23 @@ mod tests {
         assert!(matches!(
             merge_graphs(&gp, &big, PartNodeId(1), PartNodeId(0), seam(), 2),
             Err(MergeError::IndexOverflow(_))
+        ));
+        // `effective_base` below the primary's used indices — the
+        // release-stripped `debug_assert` this replaces let a
+        // release build return `Ok` with secondary nodes aliasing
+        // primary `WeldPart` slots. Now a typed refusal in every
+        // profile (C15-F3). The primary uses {0, 1}: base 1 or 0
+        // aliases node 1's slot; base 2 is the legal floor.
+        assert_eq!(
+            merge_graphs(&gp, &gs, PartNodeId(1), PartNodeId(1), seam(), 1),
+            Err(MergeError::EffectiveBaseUndersized {
+                base: 1,
+                max_effective_index: 1,
+            })
+        );
+        assert!(matches!(
+            merge_graphs(&gp, &gs, PartNodeId(1), PartNodeId(1), seam(), 0),
+            Err(MergeError::EffectiveBaseUndersized { .. })
         ));
     }
 

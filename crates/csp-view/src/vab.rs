@@ -1346,7 +1346,7 @@ mod tests {
         let parts = csp_data::load_parts(&data.join("parts")).unwrap();
         let res = csp_data::load_resources(&data.join("resources.ron")).unwrap();
         let mut view = crate::View::with_sim(csp_sim::World::new());
-        view.install_vab_catalog(parts, res);
+        view.install_vab_catalog(parts, res, csp_data::data_set_hash(&data).ok());
         view.set_mode(crate::ViewMode::Vab);
         // The default-on tutorial card anchors center-top and masks
         // dead-center of the viewport — dismiss it so the probe pixel
@@ -1498,7 +1498,7 @@ mod tests {
         let parts = csp_data::load_parts(&data.join("parts")).unwrap();
         let res = csp_data::load_resources(&data.join("resources.ron")).unwrap();
         let mut view = crate::View::with_sim(csp_sim::World::new());
-        view.install_vab_catalog(parts, res);
+        view.install_vab_catalog(parts, res, csp_data::data_set_hash(&data).ok());
         view.set_mode(crate::ViewMode::Vab);
         view.set_tutorial_active(false);
         view.set_vab_viewport(800.0, 600.0);
@@ -1579,7 +1579,7 @@ mod tests {
         let parts = csp_data::load_parts(&data.join("parts")).unwrap();
         let res = csp_data::load_resources(&data.join("resources.ron")).unwrap();
         let mut view = crate::View::with_sim(csp_sim::World::new());
-        view.install_vab_catalog(parts, res);
+        view.install_vab_catalog(parts, res, csp_data::data_set_hash(&data).ok());
         view.set_mode(crate::ViewMode::Vab);
         view.set_tutorial_active(false);
         view.set_vab_viewport(800.0, 600.0);
