@@ -1884,7 +1884,8 @@ pub fn validate_balance(
         &mut out,
     );
     // §3.5 economy — `EconomyConfig::is_valid`: salary cadence nonzero,
-    // payout ≥ 0, shares in [0,1], manufacture rate > 0.
+    // payout ≥ 0, shares in [0,1], salary/upkeep rates ≥ 0, manufacture
+    // rate > 0.
     if b.salary_period_days == 0 {
         out.push(ValidationError::BadBalance {
             field: "salary_period_days",
@@ -1892,6 +1893,15 @@ pub fn validate_balance(
         });
     }
     nonneg("crew_hire_cost_funds", b.crew_hire_cost_funds, &mut out);
+    // `EconomyConfig::is_valid`'s finite-≥0 mirror — a NaN or negative
+    // salary/upkeep passes the loader but `set_economy_config`/
+    // `World::restore` rejects it.
+    nonneg("crew_salary_per_s", b.crew_salary_per_s, &mut out);
+    nonneg(
+        "site_upkeep_funds_per_s",
+        b.site_upkeep_funds_per_s,
+        &mut out,
+    );
     nonneg(
         "science_funds_per_point",
         b.science_funds_per_point,

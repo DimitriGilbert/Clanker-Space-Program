@@ -121,3 +121,51 @@ fn balance_out_of_range_tunables_are_rejected() {
         "{errs:#?}"
     );
 }
+
+/// The v12 economy rates — `crew_salary_per_s` and
+/// `site_upkeep_funds_per_s` — mirror `csp-sim`
+/// `EconomyConfig::is_valid`'s finite-≥0 domain: negative reports
+/// `PartNonPositive`, NaN `PartNonFinite`, and the authored file stays
+/// green.
+#[test]
+fn balance_economy_rates_are_gated() {
+    let mut b = csp_data::load_balance(&repo_root().join("data/balance.ron")).unwrap();
+    b.crew_salary_per_s = -1.0;
+    b.site_upkeep_funds_per_s = -1.0;
+    let errs = csp_data::validate_balance(&b, &resources());
+    for field in ["crew_salary_per_s", "site_upkeep_funds_per_s"] {
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                csp_data::ValidationError::PartNonPositive { field: f, .. } if *f == field
+            )),
+            "{field} negative: {errs:#?}"
+        );
+    }
+
+    let mut b = csp_data::load_balance(&repo_root().join("data/balance.ron")).unwrap();
+    b.crew_salary_per_s = f64::NAN;
+    b.site_upkeep_funds_per_s = f64::NAN;
+    let errs = csp_data::validate_balance(&b, &resources());
+    for field in ["crew_salary_per_s", "site_upkeep_funds_per_s"] {
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                csp_data::ValidationError::PartNonFinite { field: f, .. } if *f == field
+            )),
+            "{field} NaN: {errs:#?}"
+        );
+    }
+
+    let b = csp_data::load_balance(&repo_root().join("data/balance.ron")).unwrap();
+    let errs = csp_data::validate_balance(&b, &resources());
+    assert!(
+        !errs.iter().any(|e| matches!(
+            e,
+            csp_data::ValidationError::PartNonPositive { field, .. }
+            | csp_data::ValidationError::PartNonFinite { field, .. }
+                if matches!(*field, "crew_salary_per_s" | "site_upkeep_funds_per_s")
+        )),
+        "authored economy rates rejected: {errs:#?}"
+    );
+}
