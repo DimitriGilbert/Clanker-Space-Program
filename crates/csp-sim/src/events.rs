@@ -429,6 +429,20 @@ pub enum EventKind {
     /// once per insolvency alongside `Insolvent` itself. `Clamping`,
     /// same transition contract as `StaffAttrition`.
     FacilityDormant = 26,
+    /// C21-F2's berth-blocked re-queue (M8-B): a `ConstructionComplete`
+    /// firing that found the delivery site occupied re-publishes as
+    /// this kind one sim-second out instead of re-firing the
+    /// completion — the deadline keeps moving, but the fired kind no
+    /// longer says "complete" every second (the toast loop and the
+    /// ~1 s `eta_s` pin the firing produced). Same delivery attempt
+    /// on pop, same build↔event pairing at restore. Always `Silent`:
+    /// a re-check is bookkeeping, never a warp clamp — the first
+    /// deferral's `BuildBerthBlocked` log entry and the eventual
+    /// `BuildDelivered` carry the surfacing.
+    ConstructionRetry {
+        /// The build order re-attempting delivery.
+        build: crate::manufacture::BuildId,
+    } = 27,
 }
 
 impl StableDiscriminant for EventKind {
@@ -461,6 +475,7 @@ impl StableDiscriminant for EventKind {
             Self::BenchTestComplete { .. } => 24,
             Self::StaffAttrition { .. } => 25,
             Self::FacilityDormant => 26,
+            Self::ConstructionRetry { .. } => 27,
         }
     }
 }
@@ -495,7 +510,12 @@ pub fn class_of(kind: &EventKind, tracked: &BTreeSet<VesselId>) -> EventClass {
         // `Silent` bookkeeping — surfacing rides the notification
         // log, never warp demotion.
         | EventKind::PartFailure { .. }
-        | EventKind::BenchTestComplete { .. } => {
+        | EventKind::BenchTestComplete { .. }
+        // C21-F2: the berth-blocked re-check is bookkeeping like the
+        // bench delivery — surfacing rides the notification log (one
+        // `BuildBerthBlocked` per episode + `BuildDelivered` at the
+        // landing), never a per-second Clamping toast/demote.
+        | EventKind::ConstructionRetry { .. } => {
             EventClass::Silent
         }
         EventKind::ContractDeadline { .. }
@@ -613,7 +633,7 @@ impl ScheduledEvent {
                 h.u64(colony.0);
                 h.str(resource.as_str());
             }
-            EventKind::ConstructionComplete { build } => {
+            EventKind::ConstructionComplete { build } | EventKind::ConstructionRetry { build } => {
                 h.u64(build.0);
             }
             EventKind::LifeSupportCheck => {}

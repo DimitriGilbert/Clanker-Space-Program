@@ -1268,6 +1268,23 @@ pub enum SimCommand {
         /// `AcceptContract` names.
         offer: u64,
     },
+    /// C11-F3's build-order cancel/refund (§3.5): drop the in-flight
+    /// order, crediting its spent BOM back into the ordering site's
+    /// inventory and its `craft_cost_micros` funds back through the
+    /// ledger (`FundsReason::BuildRefund`), and scrub the pending
+    /// `ConstructionComplete`/`ConstructionRetry` — the strict
+    /// build↔event pairing makes the scrub mandatory. `Recoverable`
+    /// for an unknown `BuildId` (a delivered or already-cancelled
+    /// order names no live record). Appended last per the enum's
+    /// append-only variant order — the `command_log` stream encodes
+    /// variant indices.
+    // ui-unreachable: the FACILITIES build rows carry the order id
+    // but no cancel button yet — the fix-plan's UI phase owns that
+    // wire; `sim.command` reaches it until then.
+    CancelBuild {
+        /// The build order to cancel.
+        build: manufacture::BuildId,
+    },
 }
 
 impl SimCommand {
@@ -3161,6 +3178,10 @@ impl World {
                 | EventKind::Insolvent { .. }
                 | EventKind::ContractDeadline { .. }
                 | EventKind::ConstructionComplete { .. }
+                // C21-F2: the berth-blocked re-queue names a build —
+                // the same `None` its `ConstructionComplete` parent
+                // takes.
+                | EventKind::ConstructionRetry { .. }
                 // C08-F3: the insolvency-consequence pair names a
                 // crew member / nothing — never a vessel.
                 | EventKind::StaffAttrition { .. }
@@ -3319,7 +3340,11 @@ impl World {
                     "snapshot: duplicate transfer complete event",
                 ));
             }
-            if let EventKind::ConstructionComplete { build: b } = &e.kind
+            // C21-F2: a berth-blocked build's pending event is its
+            // `ConstructionRetry` — either kind satisfies the
+            // build↔event pairing, still exactly one event per build.
+            if let EventKind::ConstructionComplete { build: b }
+            | EventKind::ConstructionRetry { build: b } = &e.kind
                 && build_events.insert(*b, e.tick).is_some()
             {
                 return Err(SimError::Fatal(
@@ -5639,6 +5664,7 @@ impl World {
                 build_resources.clone(),
                 shadow,
             )?,
+            SimCommand::CancelBuild { build } => self.apply_cancel_build(*build, shadow)?,
             SimCommand::SetLifeSupportEnabled { enabled } => {
                 self.apply_set_life_support(*enabled, shadow)?
             }
@@ -8653,6 +8679,10 @@ impl World {
                         // survive removal like the transfer/research
                         // events (the `TransferComplete` precedent).
                         | EventKind::ConstructionComplete { .. }
+                        // C21-F2: the retry names a build, never a
+                        // vessel — a failed firing rolls back with
+                        // its own shadow like the completion.
+                        | EventKind::ConstructionRetry { .. }
                         | EventKind::SalaryDue
                         | EventKind::Insolvent { .. }
                         | EventKind::ContractDeadline { .. }
@@ -8800,8 +8830,18 @@ impl World {
             }
             // M8-B: the build order's delivery — the ordered craft
             // becomes a surface-latched vessel at its site.
-            EventKind::ConstructionComplete { build } => {
-                self.fire_construction_complete(*build, shadow)
+            // `ConstructionRetry` is the berth-blocked re-queue
+            // (C21-F2): the same delivery attempt, but Silent — the
+            // first deferral's `BuildBerthBlocked` log entry and the
+            // landing's `BuildDelivered` carry the surfacing the
+            // re-fire's per-second `ConstructionComplete` toast used
+            // to spam.
+            EventKind::ConstructionComplete { build } | EventKind::ConstructionRetry { build } => {
+                self.fire_construction_complete(
+                    *build,
+                    shadow,
+                    matches!(event.kind, EventKind::ConstructionRetry { .. }),
+                )
             }
             // M7-A: the lab's escrowed data crossed the `data_epsilon`
             // floor — bank the conversion, consume the record.
@@ -10267,6 +10307,9 @@ fn event_names_vessel(kind: &EventKind, vessel: &VesselId) -> bool {
         EventKind::PlayerAlarm { .. }
         | EventKind::TransferWindow { .. }
         | EventKind::ConstructionComplete { .. }
+        // C21-F2: the retry names a build, not a vessel — it survives
+        // vessel removal the way the completion does.
+        | EventKind::ConstructionRetry { .. }
         // `TransferComplete` names a *transfer*, not a vessel — it
         // survives vessel removal by design (the completion's
         // fallback rule resolves the dead endpoint). M7-A's research
@@ -10452,6 +10495,16 @@ fn restore_build_state(
         // refuses a craft that fails the spawn checks, so a stored one
         // must pass them — its `craft` is hashed state.
         check_restored_craft(&b.craft)?;
+        // The order-time BOM gate's mirror: the apply only records
+        // positive finite amounts (C11-F3's refund bill rides the
+        // record now), so a stored entry is checked the same way.
+        for q in b.build_resources.values() {
+            if !(q.is_finite() && *q > 0.0) {
+                return Err(SimError::Fatal(
+                    "snapshot: incoherent build resource amount",
+                ));
+            }
+        }
         match build_events.get(id) {
             Some(&tick) if tick == b.complete_tick => {}
             _ => {
@@ -14633,6 +14686,7 @@ mod tests {
                 site: SiteId::from("pad"),
                 craft: box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0),
                 complete_tick: 10,
+                build_resources: BTreeMap::new(),
             },
         );
         s.next_build_id = 1;

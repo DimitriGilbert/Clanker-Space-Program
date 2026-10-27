@@ -29,7 +29,7 @@
 use std::collections::BTreeMap;
 
 use csp_core::{SimError, StableDiscriminant, StateHasher, TICK_HZ};
-use csp_data::{ResourceId, SiteId};
+use csp_data::{ResourceId, SiteDef, SiteId};
 use serde::{Deserialize, Serialize};
 
 use crate::TickShadow;
@@ -57,8 +57,17 @@ pub struct ActiveBuild {
     pub site: SiteId,
     /// The craft under construction.
     pub craft: crate::CraftDef,
-    /// The `ConstructionComplete` deadline.
+    /// The `ConstructionComplete`/`ConstructionRetry` deadline.
     pub complete_tick: u64,
+    /// The aggregated BOM the apply actually spent (C11-F3) — the
+    /// `CancelBuild` refund returns exactly this, so it rides the
+    /// record (the declared `(resource, units)` pairs the order
+    /// verified and aggregated, deduplicated like the spend).
+    /// `#[serde(default)]` is the §7.7 field-addition convention:
+    /// pre-field stamped-3 bodies still refuse at `decode_body`'s
+    /// byte-exact re-encode gate rather than silently defaulting.
+    #[serde(default)]
+    pub build_resources: BTreeMap<ResourceId, f64>,
 }
 
 /// §7.1's state-hash walk for the build arena.
@@ -73,6 +82,15 @@ pub fn hash_builds(h: &mut StateHasher, builds: &BTreeMap<BuildId, ActiveBuild>)
             h.str(b.site.as_str());
             crate::hash_craft(h, &b.craft);
             h.u64(b.complete_tick);
+            h.btree_map(
+                &b.build_resources,
+                |h, r| {
+                    h.str(r.as_str());
+                },
+                |h, q| {
+                    h.f64(*q);
+                },
+            );
         },
     );
 }
@@ -85,11 +103,13 @@ fn ticks_for(mass_kg: f64, rate_kg_per_s: f64) -> u64 {
     t.max(1)
 }
 
-/// The craft's live-graph mass — `WeldPart::mass_kg` (the authored
-/// wet-full figure: propellant tanks build full, and the cargo slots
-/// `spawn_contents` empties at delivery still rode the order's mass
-/// clock — a slightly conservative build time, accepted) over nodes
-/// only.
+/// The craft's live-graph mass — `WeldPart::mass_kg` over nodes
+/// only. The resolver's figure is `mass_dry + Σ capacity·mpu` over
+/// EVERY tank slot (`resolve_built_part`/`propellant_mass`), so the
+/// order's mass clock runs on the authored wet-full number: tanks
+/// deliver propellant-full and the §3.5 cargo slots `spawn_contents`
+/// strips at delivery still paid build time on their wet mass — a
+/// slightly conservative ETA, accepted.
 fn craft_mass_kg(craft: &crate::CraftDef) -> f64 {
     craft
         .graph
@@ -103,6 +123,46 @@ fn craft_mass_kg(craft: &crate::CraftDef) -> f64 {
                 .unwrap_or(0.0)
         })
         .sum()
+}
+
+/// The order's build duration in ticks — `ceil(mass_kg / rate ·
+/// TICK_HZ)` over the live graph (min 1), the same arithmetic the
+/// apply's `complete_tick` lands on. `pub` so the launch toast's ETA
+/// reads the order's deadline arithmetic instead of re-summing part
+/// masses (C11-F7 — two mass bases drifted).
+pub fn build_ticks(craft: &crate::CraftDef, rate_kg_per_s: f64) -> u64 {
+    ticks_for(craft_mass_kg(craft), rate_kg_per_s)
+}
+
+/// The stack's belly depth — the lowest collider vertex along the
+/// local up axis (+Z, the VAB's build direction), floored at 0 so an
+/// origin-below-parts craft can't push its own origin under the
+/// datum. The ONE rule the delivery berth, its occupancy probe, and
+/// the launch pre-flight share (C12-F1): `altitude_m − belly` rests
+/// the craft ON the site's datum.
+pub fn collider_belly(welded: &csp_phys::weld::WeldedBody) -> f64 {
+    welded
+        .collider
+        .hulls
+        .iter()
+        .flat_map(|h| h.vertices.iter().map(|v| v.z))
+        .fold(f64::INFINITY, f64::min)
+        .min(0.0)
+}
+
+/// The berth pose the pad delivers a craft at — upright on its belly
+/// at the site, the `launch_craft` spawn convention (C12-F1). Shared
+/// so the occupancy probe and the launch path pose their candidates
+/// exactly as the delivery materializes them: a probe posed any
+/// other way tests a volume the berth never occupies.
+pub fn berth_pose(def: &SiteDef, belly: f64) -> crate::SurfacePose {
+    crate::SurfacePose {
+        body: def.body.clone(),
+        latitude_rad: def.latitude_rad,
+        longitude_rad: def.longitude_rad,
+        altitude_m: def.altitude_m - belly,
+        orientation: crate::bubble::surface_upright(def.latitude_rad, def.longitude_rad),
+    }
 }
 
 impl crate::World {
@@ -177,6 +237,13 @@ impl crate::World {
             }
             *bom.entry(r.clone()).or_insert(0.0) += q;
         }
+        // C11-F4: the catalog is authoritative for what a craft costs —
+        // a caller-declared bill must sit inside its resolution
+        // envelope (and an anonymous craft in a catalog world is the
+        // free-build bypass `check_part_gate`'s empty-`part_ids`
+        // convention leaves open — closed here, at the money door only;
+        // the spawn paths keep their sandbox craft rule).
+        self.verify_bill(&craft, &bom)?;
         let cost = crate::economy::craft_cost_micros(&craft);
         if cost > self.economy.funds_micros {
             return Err(SimError::Recoverable("manufacture: insufficient funds"));
@@ -248,6 +315,7 @@ impl crate::World {
                 site,
                 craft,
                 complete_tick,
+                build_resources: bom,
             },
         );
         self.schedule_event(
@@ -257,15 +325,69 @@ impl crate::World {
         )
     }
 
-    /// `ConstructionComplete` — delivery: the craft becomes a
-    /// surface-latched vessel at its site. TOTAL like every event
-    /// firing (a mid-air failure would orphan the record under the
-    /// snapshot pairing): a vanished record or site is a no-op, the
-    /// slot was reserved at order time.
+    /// `CancelBuild` — the C11-F3 exit a mis-order needed: refund the
+    /// order's funds (`craft_cost_micros` — the same figure the apply
+    /// charged) and its spent BOM back into the ordering site's
+    /// inventory, remove the record, and scrub its pending
+    /// `ConstructionComplete`/`ConstructionRetry` (the strict
+    /// build↔event pairing makes the scrub mandatory — the
+    /// `apply_unload_script`/`retire_script_wake` convention).
+    pub(crate) fn apply_cancel_build(
+        &mut self,
+        build: BuildId,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        let Some(b) = self.builds.get(&build) else {
+            return Err(SimError::Recoverable("manufacture: unknown build order"));
+        };
+        let site = b.site.clone();
+        let bom = b.build_resources.clone();
+        let refund = crate::economy::craft_cost_micros(&b.craft);
+        // §2.6.4's rollback law: shadow before the write. One economy
+        // capture covers the stock credit and the funds credit.
+        self.shadow_economy(shadow);
+        if let Some(st) = self.economy.sites.get_mut(&site) {
+            for (r, q) in &bom {
+                *st.inventory.entry(r.clone()).or_insert(0.0) += q;
+            }
+        }
+        // A site row that vanished mid-build can't take the stock
+        // back — the delivery path's own drop rule, mirrored.
+        crate::economy::credit(
+            &mut self.economy,
+            self.clock.ticks(),
+            refund,
+            FundsReason::BuildRefund,
+        );
+        self.shadow_builds(shadow);
+        self.builds.remove(&build);
+        self.shadow_events_whole(shadow);
+        let kept: Vec<crate::ScheduledEvent> = std::mem::take(&mut self.event_heap)
+            .into_iter()
+            .filter(|e| {
+                !matches!(&e.kind,
+                    EventKind::ConstructionComplete { build: b }
+                    | EventKind::ConstructionRetry { build: b }
+                        if *b == build)
+            })
+            .collect();
+        self.event_heap = kept.into_iter().collect();
+        Ok(())
+    }
+
+    /// `ConstructionComplete`/`ConstructionRetry` — delivery: the
+    /// craft becomes a surface-latched vessel at its site. TOTAL
+    /// like every event firing (a mid-air failure would orphan the
+    /// record under the snapshot pairing): a vanished record or site
+    /// is a no-op, the slot was reserved at order time. `retried`
+    /// marks a berth-blocked re-fire — it picks the re-queue kind
+    /// and gates the once-per-episode `BuildBerthBlocked` notice
+    /// (C21-F2).
     pub(crate) fn fire_construction_complete(
         &mut self,
         build: BuildId,
         shadow: &mut TickShadow,
+        retried: bool,
     ) -> Result<(), SimError> {
         self.shadow_builds(shadow);
         let Some(b) = self.builds.remove(&build) else {
@@ -276,17 +398,21 @@ impl crate::World {
             // the record (total: an event never fails).
             return Ok(());
         }
-        self.deliver_built_vessel(b, shadow)
+        self.deliver_built_vessel(b, shadow, retried)
     }
 
     /// The berth check for [`Self::deliver_built_vessel`]: weld the
-    /// finished craft, pose it where the site would deliver it, and
-    /// run the same `spawn_site_occupied` predicate the launch
-    /// pre-flight and `SpawnPhysicalVessel` apply share — a parked
-    /// or in-bubble hull claiming the site defers the delivery. A
-    /// weld failure or a world without physics cannot block: the
-    /// order's weld gate already ran at apply, and a physics-less
-    /// world has no contact model to overlap in.
+    /// finished craft, pose it where the site would deliver it
+    /// ([`berth_pose`] — upright, belly on the datum, the same
+    /// `SurfaceLatched` record the vessel lands with and the launch
+    /// path's own convention; an identity/flat probe would test a
+    /// volume the delivery never materializes, C12-F1), and run the
+    /// same `spawn_site_occupied` predicate the launch pre-flight and
+    /// `SpawnPhysicalVessel` apply share — a parked or in-bubble hull
+    /// claiming the site defers the delivery. A weld failure or a
+    /// world without physics cannot block: the order's weld gate
+    /// already ran at apply, and a physics-less world has no contact
+    /// model to overlap in.
     fn delivery_blocked(&self, b: &ActiveBuild) -> bool {
         let (Some(def), Some(physics)) = (self.site_defs.get(&b.site), self.physics.as_ref())
         else {
@@ -295,13 +421,7 @@ impl crate::World {
         let Ok(mut candidate) = csp_phys::weld::weld(&b.craft.graph, &b.craft.parts) else {
             return false;
         };
-        let pose = crate::SurfacePose {
-            body: def.body.clone(),
-            latitude_rad: def.latitude_rad,
-            longitude_rad: def.longitude_rad,
-            altitude_m: def.altitude_m,
-            orientation: csp_core::DQuat::IDENTITY,
-        };
+        let pose = berth_pose(def, collider_belly(&candidate));
         let (pos, rot, _, _) = crate::bubble::surface_pose_restore(
             physics.backend.environment(),
             &pose,
@@ -318,17 +438,40 @@ impl crate::World {
     /// W2.6's berth rule: the pad is a single berth. When a vessel
     /// claims the delivery site at the deadline (parked since the
     /// order, or a crash-landed hull), the delivery waits — the
-    /// record re-queues with a fresh `ConstructionComplete` one
+    /// record re-queues with a fresh `ConstructionRetry` one
     /// sim-second out rather than materializing inside the parked
     /// craft (coincident hulls ghost-overlap forever, the spawn
     /// occupancy gate's reason) or evaporating a paid-for build.
+    /// C21-F2: the retry rides a distinct `Silent` kind — the
+    /// re-queue used to re-fire `ConstructionComplete` every
+    /// sim-second, so each pop re-toasted "CONSTRUCTION COMPLETE"
+    /// and re-pinned `eta_s` at ~1 s. The first deferral logs one
+    /// `BuildBerthBlocked`; the eventual delivery logs
+    /// `BuildDelivered`; between them the chain is quiet.
     fn deliver_built_vessel(
         &mut self,
         mut b: ActiveBuild,
         shadow: &mut TickShadow,
+        retried: bool,
     ) -> Result<(), SimError> {
         if self.delivery_blocked(&b) {
             let retry_tick = self.clock.ticks().saturating_add(TICK_HZ);
+            if !retried {
+                // The episode's one announcement — a retry firing
+                // knows the block was already logged, so the chain
+                // re-queues silently from here.
+                self.notify(
+                    crate::reliability::Notification {
+                        tick: self.clock.ticks(),
+                        vessel: crate::reliability::PROGRAM_VESSEL,
+                        node: None,
+                        kind: crate::reliability::NotificationKind::BuildBerthBlocked {
+                            build: b.id.0,
+                        },
+                    },
+                    shadow,
+                );
+            }
             self.builds.insert(
                 b.id,
                 ActiveBuild {
@@ -337,7 +480,7 @@ impl crate::World {
                 },
             );
             return self.schedule_event(
-                EventKind::ConstructionComplete { build: b.id },
+                EventKind::ConstructionRetry { build: b.id },
                 retry_tick,
                 shadow,
             );
@@ -377,37 +520,22 @@ impl crate::World {
             &mut self.next_part_instance_id,
         )?;
         // W2.6: the delivery berths the craft the way the pad spawn
-        // did — upright on its belly, not the identity pose buried
-        // `z_min` deep in the pad (the latch record restores verbatim
-        // on unlatch; an embedded or tipped delivery reads as a
-        // crash). `surface_upright` + the belly-depth offset is the
-        // `launch_craft` spawn convention, mirrored here.
-        let belly = csp_phys::weld::weld(&b.craft.graph, &b.craft.parts)
+        // did — [`berth_pose`]'s upright-on-its-belly convention, not
+        // the identity pose buried `z_min` deep in the pad (the latch
+        // record restores verbatim on unlatch; an embedded or tipped
+        // delivery reads as a crash). The occupancy probe reads the
+        // identical pose, so a hull the probe cleared is the volume
+        // this record materializes (C12-F1).
+        let pose = csp_phys::weld::weld(&b.craft.graph, &b.craft.parts)
             .ok()
-            .map(|w| {
-                w.collider
-                    .hulls
-                    .iter()
-                    .flat_map(|h| h.vertices.iter().map(|v| v.z))
-                    .fold(f64::INFINITY, f64::min)
-                    .min(0.0)
-            })
-            .unwrap_or(0.0);
+            .map(|w| berth_pose(&def, collider_belly(&w)))
+            .unwrap_or_else(|| berth_pose(&def, 0.0));
         self.vessels.insert(
             id,
             crate::Vessel {
                 id,
                 craft: Some(b.craft),
-                state: crate::VesselState::SurfaceLatched(crate::SurfacePose {
-                    body: def.body.clone(),
-                    latitude_rad: def.latitude_rad,
-                    longitude_rad: def.longitude_rad,
-                    altitude_m: def.altitude_m - belly,
-                    orientation: crate::bubble::surface_upright(
-                        def.latitude_rad,
-                        def.longitude_rad,
-                    ),
-                }),
+                state: crate::VesselState::SurfaceLatched(pose),
                 aero_mask: csp_phys::ConfigMask::ALL,
                 thermal,
                 debris_since: None,
@@ -426,8 +554,235 @@ impl crate::World {
         // records under the dormant rate now (the publish slot's
         // next pass derives the pending crossings from this stamp).
         self.reliability_residence_change(id, self.clock.ticks(), true, shadow)?;
+        if retried {
+            // A retry-delivered build never fired `ConstructionComplete`
+            // — the log line closes the episode the `BuildBerthBlocked`
+            // entry opened (C21-F2).
+            self.notify(
+                crate::reliability::Notification {
+                    tick: self.clock.ticks(),
+                    vessel: crate::reliability::PROGRAM_VESSEL,
+                    node: None,
+                    kind: crate::reliability::NotificationKind::BuildDelivered { build: b.id.0 },
+                },
+                shadow,
+            );
+        }
         Ok(())
     }
+
+    /// §3.5's server-side bill check (C11-F4). The command declares
+    /// the resolved bill (`part_costs`, the aggregated `bom`), but
+    /// the catalog is authoritative — under the old positivity-only
+    /// gate an external caller could order a weldable hull with an
+    /// empty `part_ids`/BOM and pay nothing. What the command does
+    /// NOT carry is the `BuiltPart` (scale, stretch, variant, frozen
+    /// upgrade levels), so the exact resolved figure is not
+    /// re-derivable here — what IS provable is the resolution
+    /// ENVELOPE: every authored variant × every legal `(scale,
+    /// stretch)` corner × every purchasable upgrade composition
+    /// produces a per-part cost range and a per-resource BOM range,
+    /// and a declared value outside it is forged. A world with no
+    /// installed catalog has no authoritative bill to check against —
+    /// the sandbox convention `check_part_gate` keeps.
+    fn verify_bill(
+        &self,
+        craft: &crate::CraftDef,
+        bom: &BTreeMap<ResourceId, f64>,
+    ) -> Result<(), SimError> {
+        if self.parts.is_empty() {
+            return Ok(());
+        }
+        if craft.part_ids.len() != craft.parts.len() {
+            return Err(SimError::Recoverable(
+                "manufacture: every part needs a catalog identity to bill against",
+            ));
+        }
+        let mut bom_lo: BTreeMap<ResourceId, f64> = BTreeMap::new();
+        let mut bom_hi: BTreeMap<ResourceId, f64> = BTreeMap::new();
+        for node in craft.graph.nodes.values() {
+            let idx = node.effective_index as usize;
+            let Some(def) = craft.part_ids.get(idx).and_then(|id| self.parts.get(id)) else {
+                continue;
+            };
+            let (cost_lo, cost_hi) = self.part_cost_envelope(def)?;
+            let declared = craft.part_costs.get(idx).copied().unwrap_or(0.0);
+            // The envelope's corners are evaluated with the resolver's
+            // own libm arithmetic, but `pow` is not bitwise-monotone —
+            // the hair of slack keeps a legitimate interior point from
+            // failing on rounding at the bound.
+            if !(declared >= cost_lo * (1.0 - BILL_EPS) && declared <= cost_hi * (1.0 + BILL_EPS)) {
+                return Err(SimError::Recoverable(
+                    "manufacture: declared part cost outside the catalog envelope",
+                ));
+            }
+            for (r, u) in &def.build_resources {
+                // The BOM is mass-like (`resolve_stats`: `u · s^mass
+                // · t^max(mass−2,0)`) — variant and upgrade multipliers
+                // never touch it, only the scale corners do.
+                let (lo, hi) = scale_bom_bounds(&def.scale, *u);
+                *bom_lo.entry(r.clone()).or_insert(0.0) += lo;
+                *bom_hi.entry(r.clone()).or_insert(0.0) += hi;
+            }
+        }
+        for (r, lo) in &bom_lo {
+            let declared = bom.get(r).copied().unwrap_or(0.0);
+            let hi = bom_hi[r];
+            if !(declared >= *lo * (1.0 - BILL_EPS) && declared <= hi * (1.0 + BILL_EPS)) {
+                return Err(SimError::Recoverable(
+                    "manufacture: declared bill of materials outside the catalog envelope",
+                ));
+            }
+        }
+        for r in bom.keys() {
+            if !bom_lo.contains_key(r) {
+                return Err(SimError::Recoverable(
+                    "manufacture: bill names a resource no part authors",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// One def's resolved-cost envelope — `cost_funds · f.cost ·
+    /// variant.cost_multiplier · (variant × upgrade CostFunds mults)`
+    /// over every authored variant and the scale rule's legal corners
+    /// (the stat factors are monotone per axis, so the corners carry
+    /// the extrema), with the upgrade leg ranged over every
+    /// purchasable level composition — the command freezes neither
+    /// variant nor levels, so both walk the whole authored space.
+    /// `Recoverable` when no variant/scale combination can resolve at
+    /// all — a def that cannot legitimately produce the part.
+    fn part_cost_envelope(&self, def: &csp_data::PartDef) -> Result<(f64, f64), SimError> {
+        if def.variants.is_empty() {
+            return Err(SimError::Recoverable(
+                "manufacture: part has no authored variant to bill against",
+            ));
+        }
+        let (u_lo, u_hi) = self.upgrade_mult_envelope(def, csp_data::StatPath::CostFunds)?;
+        let mut lo = f64::INFINITY;
+        let mut hi = 0.0f64;
+        for v in &def.variants {
+            let v_cost = v
+                .stat_multipliers
+                .iter()
+                .find(|(p, _)| *p == csp_data::StatPath::CostFunds)
+                .map_or(1.0, |(_, m)| *m);
+            let base = def.cost_funds * v.cost_multiplier * v_cost;
+            for f_cost in scale_corners(&def.scale, |e| e.map(|e| e.cost)) {
+                lo = lo.min(base * f_cost * u_lo);
+                hi = hi.max(base * f_cost * u_hi);
+            }
+        }
+        if !(lo.is_finite() && hi.is_finite() && lo <= hi) {
+            return Err(SimError::Recoverable(
+                "manufacture: part has no legal scale to bill against",
+            ));
+        }
+        Ok((lo, hi))
+    }
+
+    /// The composed upgrade multiplier's purchasable range for
+    /// `path` on `def`'s family — `compose_upgrade_levels`'s fold
+    /// evaluated at every level prefix (level 0 contributes 1.0, so
+    /// 1 is always inside). `(1, 1)` when the world has no tree —
+    /// nothing is purchasable, so no upgrade leg exists.
+    fn upgrade_mult_envelope(
+        &self,
+        def: &csp_data::PartDef,
+        path: csp_data::StatPath,
+    ) -> Result<(f64, f64), SimError> {
+        let Some(tree) = &self.tech_tree else {
+            return Ok((1.0, 1.0));
+        };
+        let (mut lo, mut hi) = (1.0f64, 1.0f64);
+        for track in tree.tracks_for_family(&def.family) {
+            if track.stat_path != path {
+                continue;
+            }
+            // The resolver's reachability gate: a track naming a stat
+            // this def lacks can never compose a nonzero level on it,
+            // so it contributes only its level-0 factor.
+            let Some(base) = track.stat_path.base_value(def) else {
+                continue;
+            };
+            let (mut t_lo, mut t_hi) = (1.0f64, 1.0f64);
+            let (mut mult, mut delta) = (1.0f64, 0.0f64);
+            for level in &track.levels {
+                match level.multiplier_or_delta {
+                    csp_data::UpgradeEffect::Multiplier(m) => mult *= m,
+                    csp_data::UpgradeEffect::Delta(d) => delta += d,
+                }
+                let m = if delta != 0.0 {
+                    mult * (base + delta) / base
+                } else {
+                    mult
+                };
+                // The compose gate admits only finite positive
+                // products — a level that can't compose admits no
+                // declared figure either.
+                if m.is_finite() && m > 0.0 {
+                    t_lo = t_lo.min(m);
+                    t_hi = t_hi.max(m);
+                }
+            }
+            lo *= t_lo;
+            hi *= t_hi;
+        }
+        Ok((lo, hi))
+    }
+}
+
+/// ±1e-9 — the bill envelope's slack band (see `verify_bill`).
+const BILL_EPS: f64 = 1.0e-9;
+
+/// The scale rule's stat-factor corners — `s^e · t^max(e−2,0)` at
+/// every legal `(scale, stretch)` extreme. Stat factors are monotone
+/// per axis (the stretch exponent is `max(e−2, 0) ≥ 0`), so the
+/// corner box bounds every interior point — `resolve_stats`'s own
+/// `pow2`/`stretch_exp` arithmetic, evaluated only where extrema can
+/// live. `None`/`Discrete` rules scale geometry only: stat factors
+/// are identically 1.
+fn scale_corners(
+    rule: &csp_data::ScaleRule,
+    exp: impl Fn(Option<&csp_data::ScaleExponents>) -> Option<f64>,
+) -> Vec<f64> {
+    let corners: &[(f64, f64)] = match rule {
+        csp_data::ScaleRule::None => &[(1.0, 1.0)],
+        // Discrete menus move geometry only — every stat factor is
+        // `pow2(1.0)` regardless of the picked size.
+        csp_data::ScaleRule::Discrete(_) => &[(1.0, 1.0)],
+        csp_data::ScaleRule::Continuous { min, max, .. } => {
+            &[(*min, *min), (*min, *max), (*max, *min), (*max, *max)]
+        }
+    };
+    let e = match rule {
+        csp_data::ScaleRule::Continuous { exponents, .. } => exp(Some(exponents)),
+        _ => None,
+    };
+    corners
+        .iter()
+        .map(|&(s, t)| {
+            let (se, te) = (e.unwrap_or(0.0), e.map_or(0.0, |e| (e - 2.0).max(0.0)));
+            if e.is_none() {
+                1.0
+            } else {
+                libm::pow(s, se) * libm::pow(t, te)
+            }
+        })
+        .collect()
+}
+
+/// One BOM line's `(lo, hi)` over the scale corners — `u · f.mass`,
+/// the resolver's own factor (see `verify_bill`).
+fn scale_bom_bounds(rule: &csp_data::ScaleRule, units: f64) -> (f64, f64) {
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for f in scale_corners(rule, |e| e.map(|e| e.mass)) {
+        lo = lo.min(units * f);
+        hi = hi.max(units * f);
+    }
+    (lo, hi)
 }
 
 #[cfg(test)]
@@ -746,5 +1101,303 @@ mod tests {
         a.step_frame(300).unwrap();
         assert_eq!(a.state_hash().unwrap(), r.state_hash().unwrap());
         assert_eq!(r.vessels().len(), 1);
+    }
+
+    /// C11-F3: `CancelBuild` is the order's exit — the funds spend
+    /// and every stock unit return exactly, the record and its
+    /// pending `ConstructionComplete` die together (the strict
+    /// build↔event pairing), and a second cancel rejects unknown-id.
+    #[test]
+    fn cancel_build_refunds_the_full_spend() {
+        let mut w = world();
+        let ore = ResourceId::from("ore");
+        let funds0 = w.economy().funds_micros;
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::ManufactureCraft {
+                site: SiteId::from("pad"),
+                craft: craft(),
+                build_resources: vec![(ore.clone(), 20.0)],
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        let build = *w.builds.keys().next().unwrap();
+        assert!(
+            w.pending_events().iter().any(
+                |e| matches!(e.kind, EventKind::ConstructionComplete { build: b } if b == build)
+            ),
+            "the order's completion event is pending"
+        );
+        w.enqueue(SourceClass::Ui, 0, SimCommand::CancelBuild { build });
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        assert!(w.builds.is_empty(), "the record is gone");
+        assert!(
+            !w.pending_events().iter().any(
+                |e| matches!(&e.kind, EventKind::ConstructionComplete { build: b }
+                    | EventKind::ConstructionRetry { build: b } if *b == build)
+            ),
+            "the paired event was scrubbed"
+        );
+        assert_eq!(
+            w.economy().sites[&SiteId::from("pad")].inventory[&ore],
+            100.0,
+            "every BOM unit returned"
+        );
+        assert_eq!(
+            w.economy().funds_micros,
+            funds0,
+            "the funds spend came back to the micros"
+        );
+        assert!(
+            w.economy()
+                .ledger
+                .iter()
+                .any(|e| matches!(e.reason, FundsReason::BuildRefund)),
+            "the refund rode its own ledger reason"
+        );
+        // A second cancel names no live record — Recoverable, never
+        // a silent no-op.
+        w.enqueue(SourceClass::Ui, 0, SimCommand::CancelBuild { build });
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(!r.rejected.is_empty());
+    }
+
+    /// A launch-site world holding a physics bubble plus a parked
+    /// hull — the berth-blocked delivery needs both (`delivery_blocked`
+    /// is vacuous without the contact model).
+    fn physics_world() -> World {
+        let mut w = World::with_physics(
+            test_system(),
+            crate::PhysicsConfig {
+                environment: csp_phys::Environment {
+                    body_center: csp_core::DVec3::ZERO,
+                    radius_m: 600_000.0,
+                    mu_m3_per_s2: 4.0e14,
+                    body_spin: csp_core::DVec3::ZERO,
+                    atmosphere: None,
+                    settle_v: 0.05,
+                    settle_w: 0.05,
+                    settle_ticks: 128,
+                    friction_mu: 0.5,
+                    drag_cd: 1.0,
+                    terrain: None,
+                },
+                dominant: BodyId::from("terra"),
+                bubble_radius_m: crate::DEFAULT_BUBBLE_RADIUS_M,
+            },
+            crate::DEFAULT_MAX_EVENTS_PER_FRAME,
+        );
+        let mut sites = BTreeMap::new();
+        sites.insert(
+            SiteId::from("pad"),
+            SiteDef {
+                schema_version: csp_data::SITE_SCHEMA_VERSION,
+                id: SiteId::from("pad"),
+                display_name: LocKey::from("site.pad"),
+                body: BodyId::from("terra"),
+                latitude_rad: 0.0,
+                longitude_rad: 0.0,
+                altitude_m: 0.0,
+                launch: true,
+                resource_yields: vec![],
+                starting_stock: vec![],
+            },
+        );
+        w.set_sites(sites);
+        w.economy.sites.insert(
+            SiteId::from("pad"),
+            crate::economy::SiteState {
+                id: SiteId::from("pad"),
+                inventory: BTreeMap::from([(ResourceId::from("ore"), 100.0)]),
+            },
+        );
+        w
+    }
+
+    /// A vessel record parked at the delivery berth — the pose the
+    /// delivery would take, so `spawn_site_occupied` reads the claim.
+    fn parked_vessel(w: &World, craft: crate::CraftDef) -> crate::Vessel {
+        let def = &w.site_defs[&SiteId::from("pad")];
+        let belly = csp_phys::weld::weld(&craft.graph, &craft.parts)
+            .map(|wb| collider_belly(&wb))
+            .unwrap_or(0.0);
+        crate::Vessel {
+            id: VesselId(0),
+            craft: Some(craft),
+            state: crate::VesselState::SurfaceLatched(berth_pose(def, belly)),
+            aero_mask: csp_phys::ConfigMask::ALL,
+            thermal: crate::VesselThermal::default(),
+            debris_since: None,
+            maneuver: None,
+            seams: Vec::new(),
+            tank_contents: BTreeMap::new(),
+            crew: Vec::new(),
+            science: crate::VesselScience::default(),
+            joined_colony: None,
+            reliability: BTreeMap::new(),
+            control_lease: crate::Lease::Player,
+            deployed: BTreeMap::new(),
+        }
+    }
+
+    /// C12-F1 + C21-F2: a claimed berth defers the delivery — the
+    /// deadline fires once as `ConstructionComplete`, then the order
+    /// re-queues on the `Silent` `ConstructionRetry` kind (one
+    /// `BuildBerthBlocked` log entry, not a per-second toast loop).
+    /// Clearing the berth lands the craft and logs `BuildDelivered`.
+    #[test]
+    fn blocked_berth_retries_silently_then_delivers() {
+        let mut w = physics_world();
+        let ore = ResourceId::from("ore");
+        // The parked hull claims the pad before the order completes.
+        w.vessels.insert(VesselId(0), parked_vessel(&w, craft()));
+        w.next_vessel_id = 1;
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::ManufactureCraft {
+                site: SiteId::from("pad"),
+                craft: craft(),
+                build_resources: vec![(ore.clone(), 20.0)],
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        let build = *w.builds.keys().next().unwrap();
+        // Past the deadline: the completion fired once, then retries.
+        let mut complete_fires = 0u32;
+        let mut retry_fires = 0u32;
+        for _ in 0..4 {
+            let r = w.step_frame(w.clock().ticks() + TICK_HZ).unwrap();
+            for e in &r.fired_events {
+                match &e.kind {
+                    EventKind::ConstructionComplete { build: b } if *b == build => {
+                        complete_fires += 1
+                    }
+                    EventKind::ConstructionRetry { build: b } if *b == build => retry_fires += 1,
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(complete_fires, 1, "the deadline fires exactly once");
+        assert!(
+            retry_fires >= 2,
+            "the Silent retry re-queues: {retry_fires}"
+        );
+        assert_eq!(w.vessels().len(), 1, "the berth still blocks delivery");
+        assert_eq!(w.builds.len(), 1, "the paid order waits, not drops");
+        let blocked_notes = w
+            .notifications()
+            .iter()
+            .filter(|n| matches!(
+                n.kind,
+                crate::reliability::NotificationKind::BuildBerthBlocked { build: b } if b == build.0
+            ))
+            .count();
+        assert_eq!(blocked_notes, 1, "one notice per blockage episode");
+        // The berth clears — the pending retry lands the craft.
+        w.vessels.remove(&VesselId(0));
+        let r = w.step_frame(w.clock().ticks() + TICK_HZ).unwrap();
+        assert!(
+            r.fired_events.iter().any(|e| matches!(&e.kind,
+                EventKind::ConstructionRetry { build: b } if *b == build)),
+            "delivery lands through the retry kind"
+        );
+        assert_eq!(w.vessels().len(), 1);
+        assert!(w.builds.is_empty());
+        assert!(w.notifications().iter().any(|n| matches!(
+            n.kind,
+            crate::reliability::NotificationKind::BuildDelivered { build: b } if b == build.0
+        )));
+    }
+
+    /// C11-F4: with a catalog installed the bill is verified — the
+    /// empty-`part_ids` free build and an understated declared cost or
+    /// BOM all reject, while the honest order applies.
+    #[test]
+    fn catalog_bill_verification_refuses_forged_orders() {
+        use csp_data::*;
+        let mut w = world();
+        let d = PartDef {
+            schema_version: PART_SCHEMA_VERSION,
+            id: PartId::from("test.tank"),
+            family: FamilyId::from("fam.t"),
+            display_name: "n".into(),
+            category: PartCategory::Utility,
+            mass_dry_kg: 90.0,
+            cost_funds: 10.0,
+            size_m: csp_core::DVec3::new(1.0, 1.0, 1.0),
+            build_resources: vec![(ResourceId::from("ore"), 20.0)],
+            attach_nodes: vec![],
+            scale: ScaleRule::None,
+            collider: ColliderDef::Box {
+                half_extents_m: csp_core::DVec3::new(0.5, 0.5, 0.5),
+            },
+            aero: AeroDef::constant(0.0, 0.0, 1.0),
+            thermal: ThermalDef {
+                heat_capacity_j_per_k: 1.0,
+                max_temp_k: 1_000.0,
+                emissivity: 0.8,
+                conduction_w_per_k: 0.0,
+            },
+            structural: StructuralDef::unlimited(),
+            variants: vec![PartVariant {
+                id: VariantId::from("stock"),
+                display_name: "v".into(),
+                cost_multiplier: 1.0,
+                stat_multipliers: vec![],
+            }],
+            modules: vec![],
+            reliability: ReliabilityDef {
+                base_mtbf_s: 1_000.0,
+                infant_mortality: 0.0,
+                qualification_curve: QualCurve {
+                    knots: vec![QualKnot {
+                        qualification_units: 0.0,
+                        hazard_multiplier: 1.0,
+                    }],
+                },
+                regime_stress: vec![],
+                dormant_stress: 0.0,
+                failure_modes: vec![],
+            },
+            tech_requirement: TechNodeId::from("tech.root"),
+        };
+        w.set_parts(BTreeMap::from([(d.id.clone(), d)]));
+        let ore = ResourceId::from("ore");
+        let mut order = |craft, bom: Vec<(ResourceId, f64)>| {
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::ManufactureCraft {
+                    site: SiteId::from("pad"),
+                    craft,
+                    build_resources: bom,
+                },
+            );
+            w.step_frame(w.clock().ticks() + 1).unwrap()
+        };
+        // The bypass: an anonymous craft in a catalog world.
+        let r = order(craft(), vec![(ore.clone(), 20.0)]);
+        assert!(!r.rejected.is_empty(), "anonymous part_ids must refuse");
+        // Catalog-identified but forged bills.
+        let mut honest = craft();
+        honest.part_ids = vec![PartId::from("test.tank")];
+        let mut cheap = honest.clone();
+        cheap.part_costs = vec![1.0];
+        let r = order(cheap, vec![(ore.clone(), 20.0)]);
+        assert!(!r.rejected.is_empty(), "declared cost below envelope");
+        let r = order(honest.clone(), vec![(ore.clone(), 1.0)]);
+        assert!(!r.rejected.is_empty(), "declared BOM below envelope");
+        let r = order(honest.clone(), vec![]);
+        assert!(!r.rejected.is_empty(), "the empty BOM must refuse");
+        let r = order(honest.clone(), vec![(ResourceId::from("unobtanium"), 5.0)]);
+        assert!(!r.rejected.is_empty(), "unauthored resource must refuse");
+        // The honest bill (def cost + authored BOM) applies.
+        let r = order(honest, vec![(ore.clone(), 20.0)]);
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        assert_eq!(w.builds.len(), 1);
     }
 }

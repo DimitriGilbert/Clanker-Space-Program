@@ -440,6 +440,23 @@ pub enum NotificationKind {
     /// logged once per insolvency alongside the `Insolvent`/
     /// `FacilityDormant` event pair (`PROGRAM_VESSEL`-level entry).
     FacilityDormant,
+    /// C21-F2's "berth blocked" reason (§3.5's build orders): the
+    /// `ConstructionComplete` deadline arrived with the delivery site
+    /// occupied, so the order re-queued as a `Silent`
+    /// `ConstructionRetry` — one entry per blockage episode, not per
+    /// retry (`PROGRAM_VESSEL`-level; `build` is the `BuildId`).
+    BuildBerthBlocked {
+        /// The deferred build order's arena id.
+        build: u64,
+    },
+    /// C21-F2's delivery landing after a berth-blocked episode — the
+    /// `ConstructionComplete` toast the retry path deliberately does
+    /// not re-fire, logged once the craft materializes
+    /// (`PROGRAM_VESSEL`-level; `build` is the `BuildId`).
+    BuildDelivered {
+        /// The delivered build order's arena id.
+        build: u64,
+    },
 }
 
 /// `Notification::vessel` sentinel for program-level entries —

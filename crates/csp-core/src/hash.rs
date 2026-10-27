@@ -228,7 +228,15 @@ use crate::SimError;
 /// `SiteUpkeep` (10), and `NotificationKind` gained
 /// `StaffAttrition`/`FacilityDormant` — all appended, never
 /// renumbered. The goldens rebless.
-pub const HASH_SCHEMA_VERSION: u32 = 24;
+///
+/// **Version 25** (§3.5 manufacture hardening, C11-F3/C21-F2):
+/// `ActiveBuild` gained `build_resources` — the order's spent BOM,
+/// serialized so `CancelBuild` refunds exactly and hashed as part of
+/// the build walk — `EventKind` gained `ConstructionRetry` (27 —
+/// `Silent`), `FundsReason` gained `BuildRefund` (11), and
+/// `NotificationKind` gained `BuildBerthBlocked`/`BuildDelivered` —
+/// all appended, never renumbered. The goldens rebless.
+pub const HASH_SCHEMA_VERSION: u32 = 25;
 
 /// Rule-7 sum types: the source of an enum's *declared* stable `u16`
 /// discriminant (PLAN §7.1 rule 7).

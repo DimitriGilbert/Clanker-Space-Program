@@ -406,6 +406,9 @@ pub enum FundsReason {
     /// the `SalaryDue` boundary (`site_upkeep_funds_per_s · period_s`
     /// per installed site).
     SiteUpkeep = 10,
+    /// C11-F3's `CancelBuild` refund — the order's funds spend
+    /// credited back (the `Manufacture` entry's inverse).
+    BuildRefund = 11,
 }
 
 impl StableDiscriminant for FundsReason {

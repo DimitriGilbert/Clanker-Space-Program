@@ -3219,13 +3219,7 @@ impl View {
             Ok(b) => b,
             Err(e) => return Err(self.launch_refused(e)),
         };
-        let z_min = candidate
-            .collider
-            .hulls
-            .iter()
-            .flat_map(|h| h.vertices.iter().map(|v| v.z))
-            .fold(f64::INFINITY, f64::min)
-            .min(0.0);
+        let z_min = csp_sim::manufacture::collider_belly(&candidate);
         let com_local = candidate.com_local;
         // The spawn kinematics are the §2.6.4 latch record's exact
         // restore: upright ENU pose at the site, position resolved at
@@ -3233,13 +3227,21 @@ impl View {
         // at the stale t=0 longitude would put the craft downrange of
         // the site), velocity the surface co-rotation `ω × r` of the
         // CoM — a pad-resting craft, not an inertially-dropped one.
-        let pose = csp_sim::SurfacePose {
-            body: dominant,
-            latitude_rad: lat,
-            longitude_rad: lon,
-            altitude_m: site_alt + PAD_CLEARANCE_M - z_min,
-            orientation: csp_sim::bubble::surface_upright(lat, lon),
-        };
+        // `berth_pose` is the ONE upright-on-belly convention the
+        // delivery probe and the berth share (C12-F1) — the candidate
+        // below is posed exactly as the order's delivery will berth
+        // it. `z_min − PAD_CLEARANCE_M` keeps the (currently zero)
+        // authored hover folded into the shared arithmetic.
+        let pose = site.as_ref().map_or_else(
+            || csp_sim::SurfacePose {
+                body: dominant.clone(),
+                latitude_rad: lat,
+                longitude_rad: lon,
+                altitude_m: site_alt + PAD_CLEARANCE_M - z_min,
+                orientation: csp_sim::bubble::surface_upright(lat, lon),
+            },
+            |s| csp_sim::manufacture::berth_pose(s, z_min - PAD_CLEARANCE_M),
+        );
         let (pos, rot, vel, ang_vel) =
             csp_sim::bubble::surface_pose_restore(&env, &pose, com_local, self.sim.clock());
         // `launch_preflight` runs the order's refusals BEFORE the
@@ -3313,24 +3315,24 @@ impl View {
         // `(min_id, fingerprint)` binding tolerates exactly this late
         // materialization).
         let plan = flight::StagePlan::for_launch(stage_plan, &self.sim, &craft);
-        if let Some(site) = site {
+        if let Some(site) = site.filter(|_| !craft.part_ids.is_empty()) {
             // §3.5's honest path: the LAUNCH click is a build order —
             // funds + the site-inventory BOM pay now, the craft
             // materializes surface-latched when `ConstructionComplete`
-            // fires `mass/rate` sim-seconds out (throttle unlatches
+            // fires `build_ticks` sim-seconds out (throttle unlatches
             // it). The fired-event feed posts the delivery toast.
+            // A catalog-resolved craft is required: the apply's bill
+            // check (C11-F4) refuses anonymous parts in a catalog
+            // world, so the stock/debug fallback drops through to the
+            // sandbox spawn like a site-less world.
             let rate = self.sim.economy_config().manufacture_rate_kg_per_s;
-            let mass: f64 = craft
-                .graph
-                .nodes
-                .values()
-                .map(|n| {
-                    craft
-                        .parts
-                        .get(n.effective_index as usize)
-                        .map_or(0.0, |p| p.mass_kg)
-                })
-                .sum();
+            // C11-F7: read the order's own deadline arithmetic
+            // (`build_ticks` is the apply's `complete_tick`
+            // computation), never a re-summed mass/rate — the
+            // FACILITIES rows read `complete_tick` the same way.
+            let eta_s = csp_sim::manufacture::build_ticks(&craft, rate.max(f64::MIN_POSITIVE))
+                as f64
+                / csp_core::TICK_HZ as f64;
             self.enqueue_command(
                 SourceClass::Ui,
                 PLAYER_SOURCE_ID,
@@ -3367,7 +3369,7 @@ impl View {
             });
             self.flight_notice(format!(
                 "BUILD ORDER PLACED — delivery in {}",
-                csp_ui::fmt_period(mass / rate.max(f64::MIN_POSITIVE))
+                csp_ui::fmt_period(eta_s)
             ));
         } else {
             // No authored launch site on the dominant body — a
@@ -4710,6 +4712,12 @@ fn notice_text(n: &csp_sim::reliability::Notification) -> String {
             format!("crew #{crew} — RESIGNED (unpaid salaries)")
         }
         K::FacilityDormant => "FACILITIES DORMANT — program insolvent".to_string(),
+        // C21-F2: the berth-blocked episode's two bookends — program-
+        // level entries (no vessel prefix, the contract convention).
+        K::BuildBerthBlocked { build } => {
+            format!("build #{build} — BERTH BLOCKED (delivery deferred)")
+        }
+        K::BuildDelivered { build } => format!("build #{build} — DELIVERED"),
     }
 }
 
@@ -6731,14 +6739,27 @@ mod tests {
         let order_tick = view.revert_tick().expect("launch arms a point");
         // The foreign order: a different, much lighter craft on a
         // different channel — enqueued AFTER the arm, drained at the
-        // same boundary, delivering strictly earlier.
+        // same boundary, delivering strictly earlier. C11-F4: it must
+        // pass the bill check like every order — a real catalog
+        // identity with its authored cost/BOM (anonymous hulls reject
+        // in a catalog world now). `Discrete`-scale adapter: stats
+        // stay authored, so the declared figures are verbatim.
+        let adapter = view
+            .sim
+            .parts()
+            .get(&csp_data::PartId::from("csp.structure.adapter"))
+            .expect("catalog adapter")
+            .clone();
+        let mut foreign = tiny_foreign_craft();
+        foreign.part_ids = vec![adapter.id.clone()];
+        foreign.part_costs = vec![adapter.cost_funds];
         view.sim.enqueue(
             SourceClass::External,
             7,
             SimCommand::ManufactureCraft {
                 site: site_id,
-                craft: tiny_foreign_craft(),
-                build_resources: vec![],
+                craft: foreign,
+                build_resources: adapter.build_resources.clone(),
             },
         );
         view.begin_frame();
