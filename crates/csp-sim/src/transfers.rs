@@ -1614,6 +1614,18 @@ impl World {
                     "colony crew transfer: crew not aboard vessel",
                 ));
             }
+            // C09-F4: the vessel→colony half shares
+            // `AssignCrewToColony`'s posting precondition — landing
+            // crew at an LS-less colony would starve them on the
+            // baseline draw the solve now models.
+            let col = self.colonies.get(&colony).ok_or(SimError::Recoverable(
+                "colony crew transfer: unknown colony",
+            ))?;
+            if !self.colony_accepts_crew(col) {
+                return Err(SimError::Recoverable(
+                    "colony crew transfer: colony has no working life-support module",
+                ));
+            }
         } else {
             if member.location != crate::economy::CrewLocation::Colony(colony) {
                 return Err(SimError::Recoverable(

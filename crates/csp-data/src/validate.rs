@@ -1908,6 +1908,13 @@ pub fn validate_balance(
         });
     }
     nonneg("crew_hire_cost_funds", b.crew_hire_cost_funds, &mut out);
+    // C21-F8: founding may be authored free (colony bootstrap worlds)
+    // but never negative/non-finite — `to_micros` is the mirror.
+    nonneg(
+        "colony_founding_cost_funds",
+        b.colony_founding_cost_funds,
+        &mut out,
+    );
     // `EconomyConfig::is_valid`'s finite-≥0 mirror — a NaN or negative
     // salary/upkeep passes the loader but `set_economy_config`/
     // `World::restore` rejects it.
@@ -4494,12 +4501,35 @@ pub fn validate_contracts(
     }
     // The tree's `contract_types` unlocks must resolve — an unlock
     // naming a template nobody authored is dead authored surface.
+    // C08-F6's drift guard, second half: generation now gates on the
+    // unlock AND the template's own `prerequisites` — a template
+    // unlocked by node N whose prereqs do not `TechResearched(N)`
+    // makes the two authored gates disagree (offered-or-not vs
+    // offered-and-eligible), so the validator pins them together.
     for n in &tree.nodes {
         for c in &n.unlocks.contract_types {
             if !template_ids.contains(c.as_str()) {
                 out.push(ValidationError::UnknownContractType {
                     node: n.id.as_str().to_string(),
                     contract_type: c.as_str().to_string(),
+                });
+                continue;
+            }
+            let template = loaded
+                .contracts
+                .iter()
+                .map(|lc| &lc.def)
+                .find(|d| d.id == *c);
+            if let Some(d) = template
+                && !d
+                    .prerequisites
+                    .iter()
+                    .any(|p| matches!(p, ContractPrereq::TechResearched(id) if id == &n.id))
+            {
+                out.push(ValidationError::BadContract {
+                    contract: c.as_str().to_string(),
+                    reason: "unlocked by a tech node its prerequisites do not require \
+                         (add TechResearched of the unlocking node)",
                 });
             }
         }

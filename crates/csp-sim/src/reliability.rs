@@ -457,6 +457,16 @@ pub enum NotificationKind {
         /// The delivered build order's arena id.
         build: u64,
     },
+    /// C09-F6 §3.5.1's colony impact damage — a module marked inert
+    /// by `DamageColonyModule`/`apply_surface_impacts`
+    /// (`PROGRAM_VESSEL`-level; `colony`/`module` are the colony
+    /// arena id and the `ModuleIndex` that broke).
+    ColonyDamaged {
+        /// The damaged colony's arena id.
+        colony: u64,
+        /// The module index marked inert.
+        module: u64,
+    },
 }
 
 /// `Notification::vessel` sentinel for program-level entries —
@@ -1237,6 +1247,14 @@ impl World {
             return Err(SimError::Recoverable(
                 "bench test: test stands live at launch sites",
             ));
+        }
+        // C08-F6/C33-F3 §3.3: the stand is a facility unlock — the
+        // tree's `unlocks.facilities` finally gates something. A
+        // treeless world runs ungated (the `check_part_gate`
+        // precedent); a treed world needs `facility.test_stand`
+        // researched (authored at tech.rocketry.3).
+        if !self.facility_unlocked(&csp_data::FacilityId::from("facility.test_stand")) {
+            return Err(SimError::Recoverable("bench test: test stand not unlocked"));
         }
         if !self.economy.sites.contains_key(&site) {
             return Err(SimError::Recoverable("bench test: site has no state row"));

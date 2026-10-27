@@ -249,4 +249,35 @@ impl TechTree {
     pub fn part_unlocked(&self, def: &PartDef, researched: &BTreeSet<TechNodeId>) -> bool {
         researched.contains(&def.tech_requirement)
     }
+
+    /// Whether any researched node grants `facility` via
+    /// `unlocks.facilities` — the §3.3 gate the sim's facility
+    /// surfaces (test stand, lab, pad, VAB) read (C08-F6/C33-F3:
+    /// the field was authored-but-dead until the gates landed).
+    pub fn facility_unlocked(
+        &self,
+        facility: &FacilityId,
+        researched: &BTreeSet<TechNodeId>,
+    ) -> bool {
+        self.nodes
+            .iter()
+            .filter(|n| researched.contains(&n.id))
+            .any(|n| n.unlocks.facilities.contains(facility))
+    }
+
+    /// Whether any researched node grants `template` via
+    /// `unlocks.contract_types` — the offer generator's
+    /// progression gate (C08-F6/C33-F3); the validator cross-checks
+    /// it against each template's `TechResearched` prereq so the two
+    /// authored gates cannot silently diverge.
+    pub fn contract_type_unlocked(
+        &self,
+        template: &ContractTypeId,
+        researched: &BTreeSet<TechNodeId>,
+    ) -> bool {
+        self.nodes
+            .iter()
+            .filter(|n| researched.contains(&n.id))
+            .any(|n| n.unlocks.contract_types.contains(template))
+    }
 }

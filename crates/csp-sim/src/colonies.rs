@@ -56,13 +56,15 @@
 //!    (`Clamping`) → `Degraded{PowerLost}`; `PowerRestored` → `Nominal`;
 //!    `LifeSupportDepleted` (`Clamping`, §2.6.5 member) → crew `Lost` +
 //!    `Dormant`; `AbandonColony` → `Abandoned` at `abandon_recovery`
-//!    salvage. `Dormant`/`Abandoned` **consume, produce, and schedule
-//!    nothing** — the mechanism that keeps 20 half-dead colonies out of
-//!    the event budget. `DegradeReason::ImpactDamage` is the
-//!    crash-damage class — M8-A exercises it through
-//!    `SimCommand::DamageColonyModule`; the bubble-impact detection
-//!    hook remains outstanding (it is not part of M8-B's resource-
-//!    flow scope — manufacture/transfers are).
+//!    salvage — and every terminal transition vacates the joined
+//!    vessels' `joined_colony` opt-ins with it (C09-F8). `Dormant`/
+//!    `Abandoned` **consume, produce, and schedule nothing** — the
+//!    mechanism that keeps 20 half-dead colonies out of the event
+//!    budget. `DegradeReason::ImpactDamage` is the crash-damage class —
+//!    M8-C's `apply_surface_impacts` drives it in play (debris landing
+//!    inside `transfer_radius_m`), `SimCommand::DamageColonyModule` is
+//!    the test stand-in, and a `ColonyDamaged` notification records the
+//!    hit in the log ring (C09-F6).
 //!
 //! # What "Degraded" means
 //!
@@ -84,10 +86,12 @@
 //! power-pinned module cannot run at all; unsatisfied requests are
 //! depletion evidence).
 //! `PowerRestored` is the ONLY way out of `Degraded`, and only
-//! for `reason: PowerLost`: **`Degraded{ImpactDamage}` is terminal in
-//! M8-A** — there is no repair command (one lands post-M8-A with the
-//! impact-detection hook), so impact damage marks a colony dead
-//! without killing its crew. If damage lands while a colony is already
+//! for `reason: PowerLost`: **`Degraded{ImpactDamage}` is terminal**
+//! — the repair command the M8-A doc promised stays unlanded even
+//! though the impact-detection hook (M8-C) has; that terminal-ness
+//! is the recorded v1 decision (§6.5's ritual), not a hook to come.
+//! Impact damage marks a colony dead without killing its crew, and
+//! every hit logs a `ColonyDamaged` notification (C09-F6). If damage lands while a colony is already
 //! `Degraded{PowerLost}`, the `PowerLost` reason wins (the apply only
 //! records `ImpactDamage` from `Nominal`) — `PowerRestored` can still
 //! return it to `Nominal`, damaged modules and all.
@@ -794,6 +798,15 @@ struct SolveInput<'a> {
     /// M8-B: the colony site's `SiteDef::resource_yields` resolved to
     /// a per-resource concentration map (construction config).
     concentrations: &'a BTreeMap<ResourceId, f64>,
+    /// C09-F4's baseline crew demand — `(resource, units/s per crew
+    /// member)`, the vessel-side `LifeSupportConfig::demands` set.
+    /// Crew at a colony with NO `LifeSupport` module consume these
+    /// from the colony's stores regardless of module presence — the
+    /// consequence model that ends LS-less colonist free-riding.
+    /// When a `LifeSupport` module exists (even a wrecked one) the
+    /// module's own `consumes_per_crew` authors the whole demand and
+    /// this set registers nothing — no double-counting.
+    crew_demands: &'a [(ResourceId, f64)],
 }
 
 /// The solve's outputs — everything a recompute writes or schedules
@@ -831,6 +844,22 @@ struct Allocation {
     /// set: pinned modules are excluded both from `active` and from
     /// the latent-demand sets, unlike merely ungrounded ones).
     pins: Vec<bool>,
+    /// C09-F4's baseline crew rows — `(priority, resource, request)`
+    /// at the pseudo-module index `modules.len()` — non-empty only
+    /// when crew stand at a `LifeSupport`-less colony AND the demand
+    /// is grounded (stocked or produced like any module's request;
+    /// an ungrounded baseline registers no consumer rows — the
+    /// module precedent — while `solve_network`'s depletion scan
+    /// still sees the would-be demand and kills the crew).
+    baseline_reqs: Vec<(u8, ResourceId, f64)>,
+    /// The baseline's granted fraction — `min(grant/request)` over
+    /// `baseline_reqs` at the converged solve (0 when ungrounded).
+    baseline_fraction: f64,
+    /// The baseline demand set when ANY `LifeSupport` module is
+    /// absent — populated even ungrounded, so `sinked` and
+    /// `latent_ec_request` count crew needs like every other
+    /// would-be consumer.
+    baseline_demand: BTreeSet<ResourceId>,
 }
 
 /// The grounding closure (module doc rule 3): the least fixpoint of
@@ -946,6 +975,7 @@ fn module_tables(input: &SolveInput, viable: &[bool]) -> ModuleTables {
 /// surplus forever at fraction 1. Pinning those SCC members out of
 /// `active` restores "every input traces back to stock or a real
 /// source" to also mean "no free surplus" (C09-F1).
+#[allow(clippy::too_many_lines)] // the grounding → sweep → fixpoint → grant pipeline reads as one pass
 fn allocation_pass(input: &SolveInput) -> Allocation {
     let n = input.modules.len();
     // `viable` = not inert under state/damage — a viable module may
@@ -1017,6 +1047,13 @@ fn allocation_pass(input: &SolveInput) -> Allocation {
             }
         })
         .collect();
+    // C09-F4: the baseline crew demand — a `LifeSupport`-less colony's
+    // crew still breathe, eat, and draw power from colony stores at
+    // the vessel-side `life_support` rates. [`crew_baseline`] reads it
+    // as LATENT demand (a sink for real producers and a
+    // `power_starved` claim) even when ungrounded — the crew's need
+    // does not vanish because it cannot currently be served.
+    let (baseline_demand, baseline_reqs) = crew_baseline(input, &grounded, &outputs);
     let sinked: Vec<bool> = (0..n)
         .map(|i| {
             !active[i]
@@ -1025,11 +1062,27 @@ fn allocation_pass(input: &SolveInput) -> Allocation {
                     let store_headroom = input.caps.get(r).is_some_and(|cap| {
                         *cap > EPS && input.levels.get(r).copied().unwrap_or(0.0) < *cap - EPS
                     });
-                    store_headroom || (0..n).any(|j| j != i && latent_requests[j].contains(r))
+                    store_headroom
+                        || baseline_demand.contains(r)
+                        || (0..n).any(|j| j != i && latent_requests[j].contains(r))
                 })
         })
         .collect();
-    let consumers = consumer_map(&requests, &active);
+    let mut consumers = consumer_map(&requests, &active);
+    // Crew at PRIORITY_LIFE_SUPPORT sort WITH the module rows at the
+    // same key — pseudo index `n` always loses the tie-break to a
+    // real module (crew never outrank an installed LS module's own
+    // rows, matching the depletion scan's module-first reading).
+    for (priority, r, q) in &baseline_reqs {
+        consumers.entry(r.clone()).or_default().push(Consumer {
+            module: n,
+            priority: *priority,
+            request: *q,
+        });
+    }
+    for list in consumers.values_mut() {
+        list.sort_by_key(|c| (c.priority, c.module));
+    }
     let mut fractions = vec![1.0f64; n];
     let mut grants: BTreeMap<(usize, ResourceId), f64>;
     let mut produced: BTreeMap<ResourceId, f64>;
@@ -1065,13 +1118,123 @@ fn allocation_pass(input: &SolveInput) -> Allocation {
     // table — the extra pass is idempotent).
     produced = production_at(&prods, &active, &fractions);
     grants = grant_map(&consumers, &produced, input.levels);
+    // The baseline's fraction is the converged grant over its rows —
+    // a pure read of the final table (it produces nothing, so nothing
+    // about it feeds back into the fixpoint).
+    let baseline_fraction = baseline_reqs.iter().fold(1.0f64, |f, (_, r, q)| {
+        let g = grants.get(&(n, r.clone())).copied().unwrap_or(0.0);
+        f.min(g / q)
+    });
     Allocation {
         grants,
         fractions,
         produced,
         active,
         pins,
+        baseline_reqs,
+        baseline_fraction,
+        baseline_demand,
     }
+}
+
+/// C09-F4's baseline crew demand — a `LifeSupport`-less colony's
+/// crew consume `input.crew_demands` (the vessel-side rates, × crew)
+/// from colony stores regardless of module presence. Returns
+/// `(demand, reqs)` where `demand` is the LATENT resource set — the
+/// sink/`power_starved` read — and `reqs` are the consumer rows
+/// actually registered at pseudo-module index `modules.len()`,
+/// non-empty only when the demand grounds on the modules' own rule
+/// (every wanted resource stocked OR produced by a grounded module;
+/// crew produce nothing, so the baseline can never feed a cycle and
+/// needs no SCC pin).
+fn crew_baseline(
+    input: &SolveInput,
+    grounded: &[bool],
+    outputs: &[BTreeSet<ResourceId>],
+) -> (BTreeSet<ResourceId>, Vec<(u8, ResourceId, f64)>) {
+    let has_ls_module = input
+        .modules
+        .iter()
+        .any(|m| matches!(m.def, ColonyModuleDef::LifeSupport { .. }));
+    let mut demand = BTreeSet::new();
+    let mut reqs = Vec::new();
+    if input.crew == 0 || has_ls_module {
+        return (demand, reqs);
+    }
+    let wants: Vec<(u8, ResourceId, f64)> = input
+        .crew_demands
+        .iter()
+        .filter(|(_, q)| *q > 0.0)
+        .map(|(r, q)| (PRIORITY_LIFE_SUPPORT, r.clone(), q * input.crew as f64))
+        .collect();
+    let grounded_baseline = !wants.is_empty()
+        && wants.iter().all(|(_, r, _)| {
+            input.levels.get(r).copied().unwrap_or(0.0) > EPS
+                || (0..input.modules.len()).any(|j| grounded[j] && outputs[j].contains(r))
+        });
+    demand = wants.iter().map(|(_, r, _)| r.clone()).collect();
+    if grounded_baseline {
+        reqs = wants;
+    }
+    (demand, reqs)
+}
+
+/// The `LifeSupportDepleted` predicate — `true` when any required
+/// life-support resource is both unstocked and under-granted. The
+/// scan covers EVERY `LifeSupport` module — NOT just `active` ones:
+/// a damaged or ungrounded module has no grant row (`g` reads 0),
+/// so crew aboard deplete the moment a required store is empty —
+/// damage kills. Stocked reserves still cover the request (the
+/// "switches to reserves" reading). The scanned rows are the
+/// module's WHOLE request set — `module_requests` again — so
+/// `power_ec_per_s` counts as a required resource too: an unpowered
+/// (ungrounded) module whose EC request cannot be served is
+/// unsatisfied life support, and a stocked O2 reserve does not keep
+/// its crew alive (the request rows are identical to what the
+/// allocation pass registered — one source of truth for "what life
+/// support needs"). C09-F4's baseline arm is the `LifeSupport`-less
+/// twin: the demand rows the crew baseline *would* register,
+/// grounded or not — the need is evidence either way.
+fn ls_depletion_scan(
+    input: &SolveInput,
+    grants: &BTreeMap<(usize, ResourceId), f64>,
+    baseline_demand: &BTreeSet<ResourceId>,
+) -> bool {
+    if input.crew == 0 {
+        return false;
+    }
+    for (i, m) in input.modules.iter().enumerate() {
+        if let ColonyModuleDef::LifeSupport { .. } = &m.def {
+            for (_, r, req) in module_requests(m, input.crew, input.recipes) {
+                let g = grants.get(&(i, r.clone())).copied().unwrap_or(0.0);
+                let stock = input.levels.get(&r).copied().unwrap_or(0.0);
+                if stock <= EPS && g < req - EPS {
+                    return true;
+                }
+            }
+        }
+    }
+    // The baseline twin — stock covers the request until the store
+    // empties at its own boundary event; unstocked and under-granted
+    // is starvation.
+    for r in baseline_demand {
+        let req = input
+            .crew_demands
+            .iter()
+            .find(|(d, _)| d == r)
+            .map(|(_, q)| *q)
+            .unwrap_or(0.0)
+            * input.crew as f64;
+        let g = grants
+            .get(&(input.modules.len(), r.clone()))
+            .copied()
+            .unwrap_or(0.0);
+        let stock = input.levels.get(r).copied().unwrap_or(0.0);
+        if stock <= EPS && g < req - EPS {
+            return true;
+        }
+    }
+    false
 }
 
 /// One sweep's grant table over `consumers` — the rule-3 fill: full
@@ -1283,6 +1446,9 @@ fn solve_network(input: &SolveInput) -> NetSolve {
         produced,
         active,
         pins,
+        baseline_reqs,
+        baseline_fraction,
+        baseline_demand,
     } = alloc;
     let mut net_rates: BTreeMap<ResourceId, f64> = BTreeMap::new();
     // Consumption is charged at `fraction · request`, NOT the raw
@@ -1297,6 +1463,12 @@ fn solve_network(input: &SolveInput) -> NetSolve {
         for (_, r, q) in module_requests(m, input.crew, input.recipes) {
             *consumed.entry(r).or_insert(0.0) += q * fractions[i];
         }
+    }
+    // C09-F4: the baseline crew draw — charged at its granted
+    // fraction like every module's `fraction · request` (a starved
+    // crew draw consumes nothing, not its full request).
+    for (_, r, q) in &baseline_reqs {
+        *consumed.entry(r.clone()).or_insert(0.0) += q * baseline_fraction;
     }
     for r in produced.keys().chain(consumed.keys()) {
         net_rates.insert(
@@ -1350,7 +1522,23 @@ fn solve_network(input: &SolveInput) -> NetSolve {
         .flat_map(|(_, m)| module_requests(m, input.crew, input.recipes))
         .filter(|(_, r, _)| *r == ec)
         .map(|(_, _, q)| q)
-        .sum();
+        .sum::<f64>()
+        // C09-F4: the LS-less crew baseline's EC row is latent demand
+        // too — an unpowered colony's crew still need charge, and a
+        // dark battery-less base must earn `PowerLost`, not free-ride.
+        + baseline_demand
+            .iter()
+            .filter(|r| **r == ec)
+            .map(|r| {
+                input
+                    .crew_demands
+                    .iter()
+                    .find(|(d, _)| d == r)
+                    .map(|(_, q)| *q)
+                    .unwrap_or(0.0)
+                    * input.crew as f64
+            })
+            .sum::<f64>();
     // `power_starved` compares a DEMAND RATE (units/s) against the
     // supply side in matching units — the produced rate AND the
     // buffered level are separate terms, never summed (a rate plus a
@@ -1359,32 +1547,13 @@ fn solve_network(input: &SolveInput) -> NetSolve {
     let ec_produced = produced.get(&ec).copied().unwrap_or(0.0);
     let ec_stock = input.levels.get(&ec).copied().unwrap_or(0.0);
     let power_starved = latent_ec_request > EPS && ec_produced <= EPS && ec_stock <= EPS;
-    // The depletion predicate scans EVERY LifeSupport module — NOT
-    // just `active` ones: a damaged or ungrounded module has no grant
-    // row (`g` reads 0), so crew aboard deplete the moment a required
-    // store is empty — damage kills. Stocked reserves still cover the
-    // request (the "switches to reserves" reading). The scanned rows
-    // are the module's WHOLE request set — `module_requests` again —
-    // so `power_ec_per_s` counts as a required resource too: an
-    // unpowered (ungrounded) module whose EC request cannot be served
-    // is unsatisfied life support, and a stocked O2 reserve does not
-    // keep its crew alive (the request rows are identical to what the
-    // allocation pass registered — one source of truth for "what
-    // life support needs").
-    let mut ls_depleted = false;
-    if input.crew > 0 {
-        for (i, m) in input.modules.iter().enumerate() {
-            if let ColonyModuleDef::LifeSupport { .. } = &m.def {
-                for (_, r, req) in module_requests(m, input.crew, input.recipes) {
-                    let g = grants.get(&(i, r.clone())).copied().unwrap_or(0.0);
-                    let stock = input.levels.get(&r).copied().unwrap_or(0.0);
-                    if stock <= EPS && g < req - EPS {
-                        ls_depleted = true;
-                    }
-                }
-            }
-        }
-    }
+    // The depletion predicate — [`ls_depletion_scan`] scans EVERY
+    // LifeSupport module's whole request set (a damaged or ungrounded
+    // module has no grant row, so a missing store kills) AND the
+    // C09-F4 baseline arm: the demand rows an LS-less colony's crew
+    // would register, grounded or not — starvation is evidence either
+    // way, landing `LifeSupportDepleted` one tick out.
+    let ls_depleted = ls_depletion_scan(input, &grants, &baseline_demand);
     NetSolve {
         fractions,
         net_rates,
@@ -1779,7 +1948,7 @@ impl World {
     pub fn found_authored_colonies(&mut self, defs: &[ColonyDef]) -> Result<(), SimError> {
         let mut shadow = TickShadow::capture(self);
         for def in defs {
-            if let Err(e) = self.apply_found_colony(def, &mut shadow) {
+            if let Err(e) = self.apply_found_colony_impl(def, false, &mut shadow) {
                 shadow.restore(self);
                 return Err(e);
             }
@@ -1819,17 +1988,36 @@ impl World {
             .collect();
     }
 
+    /// `FoundColony` — the command path: the authored founding cost
+    /// is charged, then the shared build runs (see
+    /// [`Self::apply_found_colony_impl`]).
+    pub(crate) fn apply_found_colony(
+        &mut self,
+        def: &ColonyDef,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        self.apply_found_colony_impl(def, true, shadow)
+    }
+
     /// `FoundColony` — place `def` at its site: resolve the site's
     /// body/pose, build the aggregate stores (Store/Battery caps +
     /// founding levels), install the module list, and run the
     /// founding solve — daylight, allocation, terminator, and the
     /// first published deadlines. `Recoverable` rejections: unknown
     /// site, no colony env for the site body, non-finite or negative
-    /// rates/levels.
+    /// rates/levels, a live colony already occupying the site
+    /// (C09-F9), or — on the command path — funds short of the
+    /// authored `colony_founding_cost_funds` (C21-F8: §3.5's
+    /// "funds ─► facilities" arrow — `AbandonColony` already salvages
+    /// store contents, so a free found would mint site inventory).
+    /// `charge_cost` is `false` only for `found_authored_colonies`'s
+    /// world-bootstrap writes — authored starting colonies are world
+    /// state, never a purchase.
     #[allow(clippy::too_many_lines)] // a sequential validate → build → solve pipeline
-    pub(crate) fn apply_found_colony(
+    fn apply_found_colony_impl(
         &mut self,
         def: &ColonyDef,
+        charge_cost: bool,
         shadow: &mut TickShadow,
     ) -> Result<(), SimError> {
         let Some(site) = self.site_defs.get(&def.site) else {
@@ -1848,6 +2036,21 @@ impl World {
                 "found colony: no colony environment for site body",
             ));
         };
+        // C09-F9: one live colony per site — the apply-side occupancy
+        // check the UI's `has_colony` gate mirrors (the raw command
+        // path double-founded freely before this). `Abandoned` frees
+        // the site for re-founding — the abandon-recovery economics
+        // already price the wreck's salvage into the site inventory;
+        // `Dormant`/`Degraded`/`Nominal` all still occupy it.
+        if self
+            .colonies
+            .values()
+            .any(|c| c.site == def.site && !matches!(c.state, ColonyState::Abandoned))
+        {
+            return Err(SimError::Recoverable(
+                "found colony: site already hosts a live colony",
+            ));
+        }
         if !(site_lat.is_finite()
             && site_lon.is_finite()
             && site_alt.is_finite()
@@ -1913,6 +2116,19 @@ impl World {
             if !(s.capacity.is_finite() && s.capacity >= 0.0) {
                 return Err(SimError::Recoverable("found colony: bad store capacity"));
             }
+        }
+        if charge_cost {
+            let cost = self.economy_cfg.colony_founding_cost_micros;
+            if cost > self.economy.funds_micros {
+                return Err(SimError::Recoverable("found colony: insufficient funds"));
+            }
+            self.shadow_economy(shadow);
+            crate::economy::charge(
+                &mut self.economy,
+                self.clock.ticks(),
+                cost,
+                crate::economy::FundsReason::ColonyFounding,
+            );
         }
         self.shadow_colonies(shadow);
         let id = ColonyId(self.next_colony_id);
@@ -1984,6 +2200,17 @@ impl World {
                 m.location = crate::economy::CrewLocation::Unassigned;
             }
         }
+        // C09-F8: the terminal transition vacates every joined
+        // vessel's inventory opt-in — a `joined_colony` naming a dead
+        // colony is a stale tag (serialized, and it reads as "COLONY"
+        // on a recovered vessel's crew row) that only the manual
+        // `LeaveColonyInventory` could clear before.
+        self.shadow_vessels(shadow);
+        for v in self.vessels.values_mut() {
+            if v.joined_colony == Some(id) {
+                v.joined_colony = None;
+            }
+        }
         let colony = self
             .colonies
             .get_mut(&id)
@@ -2003,6 +2230,18 @@ impl World {
         }
         self.drop_colony_events(id, false, shadow);
         Ok(())
+    }
+
+    /// C09-F4's posting precondition — a live colony can host crew
+    /// iff the subsystem is off (no demand runs at all) or SOME
+    /// `LifeSupport` module stands undamaged. `apply_assign_crew` and
+    /// `apply_transfer_colony_crew`'s `to_colony` arm share it.
+    pub(crate) fn colony_accepts_crew(&self, colony: &Colony) -> bool {
+        !self.life_support_enabled
+            || colony
+                .modules
+                .iter()
+                .any(|m| !m.damaged && matches!(m.def, ColonyModuleDef::LifeSupport { .. }))
     }
 
     /// `AssignCrewToColony` — post a roster member at the colony. The
@@ -2035,6 +2274,18 @@ impl World {
         }
         if member.status != CrewStatus::Active {
             return Err(SimError::Recoverable("assign crew: member not active"));
+        }
+        // C09-F4: posting to an LS-less colony is refused while life
+        // support is enabled — the baseline consumption in the solve
+        // would starve the member on a timer (the F4 probe's
+        // immortal-crew reading was the bug; refusing is the honest
+        // gate — `TransferColonyCrew` checks the same). A colony with
+        // a working module takes crew; a disabled subsystem takes no
+        // demand and the gate lifts with it.
+        if !self.colony_accepts_crew(colony) {
+            return Err(SimError::Recoverable(
+                "assign crew: colony has no working life-support module",
+            ));
         }
         self.shadow_colonies(shadow);
         self.shadow_economy(shadow);
@@ -2090,15 +2341,16 @@ impl World {
     }
 
     /// `DamageColonyModule` — §3.5.1's crash-damage stand-in: mark a
-    /// module inert and drop the colony to `Degraded{ImpactDamage}`.
-    /// (The bubble-impact detection that drives this in play is not
-    /// part of M8-B's resource-flow scope.) A dormant or abandoned
-    /// colony takes no new damage —
-    /// it is already inert by state. M8-A has no repair path —
+    /// module inert and drop the colony to `Degraded{ImpactDamage}`
+    /// (M8-C's `apply_surface_impacts` is the real in-play driver;
+    /// this command exercises the same bookkeeping in tests). A
+    /// dormant or abandoned colony takes no new damage —
+    /// it is already inert by state. There is no repair path —
     /// `ImpactDamage` is a terminal `Degraded` reason (only a
     /// `PowerLost` reason can leave `Degraded`, via `PowerRestored`),
     /// and a `Degraded{PowerLost}` colony keeps its existing reason
-    /// rather than switching.
+    /// rather than switching. Every landed hit posts a
+    /// `ColonyDamaged` notification (C09-F6).
     /// `tick` is the tick the damage lands at — the recompute anchors
     /// there. The command path passes the drain boundary's clock; the
     /// impact seam passes the impact's own tick so the damage is not
@@ -2133,6 +2385,22 @@ impl World {
                 reason: DegradeReason::ImpactDamage,
             };
         }
+        // C09-F6: the damage was terminal-but-silent — the LOG ring
+        // now carries it (program-level entry, the contract-kind
+        // convention; impact damage stays a terminal `Degraded`
+        // reason — the repair verb is post-v1 scope, §6.5's ritual).
+        self.notify(
+            crate::reliability::Notification {
+                tick: self.clock.ticks(),
+                vessel: crate::reliability::PROGRAM_VESSEL,
+                node: None,
+                kind: crate::reliability::NotificationKind::ColonyDamaged {
+                    colony: id.0,
+                    module: module as u64,
+                },
+            },
+            shadow,
+        );
         self.recompute_colony(id, tick, shadow)
     }
 
@@ -2275,6 +2543,7 @@ impl World {
             .get(&colony.site)
             .map(|d| d.resource_yields.iter().cloned().collect())
             .unwrap_or_default();
+        let crew_demands = self.life_support_cfg.demands();
         Some(solve_network(&SolveInput {
             modules: &colony.modules,
             state: colony.state,
@@ -2289,6 +2558,7 @@ impl World {
             daylight: colony.daylight,
             recipes: &self.recipes,
             concentrations: &concentrations,
+            crew_demands: &crew_demands,
         }))
     }
 
@@ -2459,6 +2729,15 @@ impl World {
                         m.location = crate::economy::CrewLocation::Unassigned;
                     }
                 }
+                // C09-F8: Dormant is terminal like Abandoned — clear
+                // the joined-vessel opt-ins so a latched hull beside
+                // the wreck doesn't carry a stale `joined_colony`.
+                self.shadow_vessels(shadow);
+                for v in self.vessels.values_mut() {
+                    if v.joined_colony == Some(id) {
+                        v.joined_colony = None;
+                    }
+                }
                 let colony = self
                     .colonies
                     .get_mut(&id)
@@ -2552,6 +2831,7 @@ impl World {
             .get(&colony.site)
             .map(|d| d.resource_yields.iter().cloned().collect())
             .unwrap_or_default();
+        let crew_demands = self.life_support_cfg.demands();
         let solve = solve_network(&SolveInput {
             modules: &colony.modules,
             state: colony.state,
@@ -2570,6 +2850,10 @@ impl World {
             daylight: colony.daylight,
             recipes: &self.recipes,
             concentrations: &concentrations,
+            // C09-F4: crewed colonies WITHOUT a `LifeSupport` module
+            // consume the vessel-side baseline set from colony stores
+            // (the toggle's zero-crew reading closes this arm too).
+            crew_demands: &crew_demands,
         });
         let colony = self
             .colonies
@@ -2903,6 +3187,13 @@ mod tests {
         ])
     }
 
+    /// The baseline demand set the solve reads for an LS-less
+    /// crewed colony — the production `life_support_cfg.demands()`.
+    /// Tests bind it to a local and pass `&demands` into `inp`.
+    fn crew_demands() -> [(ResourceId, f64); 3] {
+        crate::life_support::default_config().demands()
+    }
+
     #[allow(clippy::too_many_arguments)] // a test-side SolveInput builder
     fn inp<'a>(
         modules: &'a [ColonyModule],
@@ -2914,6 +3205,7 @@ mod tests {
         daylight: Daylight,
         recipes: &'a BTreeMap<RecipeId, RecipeDef>,
         concentrations: &'a BTreeMap<ResourceId, f64>,
+        crew_demands: &'a [(ResourceId, f64)],
     ) -> SolveInput<'a> {
         SolveInput {
             modules,
@@ -2925,6 +3217,7 @@ mod tests {
             daylight,
             recipes,
             concentrations,
+            crew_demands,
         }
     }
 
@@ -3323,6 +3616,7 @@ mod tests {
             Daylight::Day,
             &recipes,
             &conc,
+            &crew_demands(),
         ));
         // Demand 12, supply 10 — grants run in (priority,
         // ModuleIndex) order: module 1 fully funded (8), module 2 is
@@ -3385,6 +3679,7 @@ mod tests {
             Daylight::Day,
             &recipes,
             &conc,
+            &crew_demands(),
         ));
         // Priority 1 (module 2) fully funded first — 6 of 10; module 1
         // (priority 9) shares the remainder pro-rata by request —
@@ -3441,6 +3736,7 @@ mod tests {
             Daylight::Day,
             &recipes,
             &conc,
+            &crew_demands(),
         ));
         let expected = libm::sqrt(libm::sqrt(100.0 / (STEFAN_BOLTZMANN * 9.0)));
         assert!((solve.t_eq_k.unwrap() - expected).abs() < 1e-9);
@@ -3455,6 +3751,7 @@ mod tests {
             Daylight::Day,
             &recipes,
             &conc,
+            &crew_demands(),
         ));
         assert_eq!(bare.t_eq_k, None);
     }
@@ -3597,6 +3894,7 @@ mod tests {
             SimCommand::HireCrew {
                 name: "jeb".into(),
                 kind: crate::CrewKind::Engineer,
+                skill: 1,
                 salary_per_s: 1.0,
             },
         );
@@ -3965,6 +4263,7 @@ mod tests {
             Daylight::Day,
             &recipes,
             &conc,
+            &crew_demands(),
         ));
         assert_eq!(solve.fractions, vec![0.0]);
         // Nothing produces or consumes → no net-rate entries at all.
@@ -4019,6 +4318,7 @@ mod tests {
             Daylight::Day,
             &recipes,
             &conc,
+            &crew_demands(),
         ));
         assert_eq!(solve.fractions, vec![0.0, 0.0]);
     }
@@ -4076,6 +4376,7 @@ mod tests {
             Daylight::Day,
             &recipes,
             &conc,
+            &crew_demands(),
         ));
         assert_eq!(solve.fractions, vec![1.0, 1.0, 1.0]);
     }
@@ -4190,6 +4491,7 @@ mod tests {
             Daylight::Day,
             &recipes,
             &conc,
+            &crew_demands(),
         ));
         assert_eq!(solve.fractions, vec![1.0, 1.0]);
         // Net `a` = 0.8 out − 1.0 in = −0.2/s: the store drains.
@@ -4248,6 +4550,7 @@ mod tests {
             Daylight::Day,
             &recipes,
             &conc,
+            &crew_demands(),
         ));
         assert_eq!(solve.fractions, vec![1.0, 1.0]);
     }
@@ -4296,6 +4599,7 @@ mod tests {
             Daylight::Day,
             &recipes,
             &conc,
+            &crew_demands(),
         ));
         assert_eq!(solve.fractions[1], 0.0);
         assert!((solve.net_rates[&ec_id] - 2.0).abs() < 1e-9);
@@ -4342,6 +4646,7 @@ mod tests {
             Daylight::Day,
             &recipes,
             &conc,
+            &crew_demands(),
         ));
         // Folded request = 12 EC/s = supply → the module runs full
         // (the colliding pair used to read fraction 0.5).
@@ -4392,6 +4697,7 @@ mod tests {
                 SimCommand::HireCrew {
                     name: name.into(),
                     kind: crate::CrewKind::Engineer,
+                    skill: 1,
                     salary_per_s: 1.0,
                 },
             );
@@ -4455,6 +4761,7 @@ mod tests {
             SimCommand::HireCrew {
                 name: "a".into(),
                 kind: crate::CrewKind::Engineer,
+                skill: 1,
                 salary_per_s: 1.0,
             },
         );
@@ -4581,6 +4888,7 @@ mod tests {
             SimCommand::HireCrew {
                 name: "a".into(),
                 kind: crate::CrewKind::Engineer,
+                skill: 1,
                 salary_per_s: 1.0,
             },
         );
@@ -4651,6 +4959,7 @@ mod tests {
             SimCommand::HireCrew {
                 name: "a".into(),
                 kind: crate::CrewKind::Engineer,
+                skill: 1,
                 salary_per_s: 1.0,
             },
         );
@@ -4713,6 +5022,7 @@ mod tests {
             SimCommand::HireCrew {
                 name: "a".into(),
                 kind: crate::CrewKind::Engineer,
+                skill: 1,
                 salary_per_s: 1.0,
             },
         );
@@ -5498,11 +5808,25 @@ mod tests {
             SimCommand::HireCrew {
                 name: "a".into(),
                 kind: crate::CrewKind::Pilot,
+                skill: 1,
                 salary_per_s: 0.0,
             },
         );
         w.step_frame(w.clock().ticks() + 1).unwrap();
-        found(&mut w, vec![gen_module(10.0)], vec![]);
+        // C09-F4: the landing gate shares `colony_accepts_crew` — the
+        // fixture needs an undamaged `LifeSupport` module to take the
+        // member (consumes nothing, the test is about the seat move).
+        found(
+            &mut w,
+            vec![
+                gen_module(10.0),
+                ColonyModuleDef::LifeSupport {
+                    consumes_per_crew: vec![],
+                    power_ec_per_s: 0.0,
+                },
+            ],
+            vec![],
+        );
         let colony = *w.colonies().keys().next().unwrap();
         let vessel = latched_vessel(&mut w, "ore", 100.0, 0.0);
         // Seat the roster member aboard — roster location Vessel.
@@ -5593,6 +5917,7 @@ mod tests {
             SimCommand::HireCrew {
                 name: "a".into(),
                 kind: crate::CrewKind::Engineer,
+                skill: 1,
                 salary_per_s: 0.0,
             },
         );
@@ -5665,6 +5990,7 @@ mod tests {
             SimCommand::HireCrew {
                 name: "jeb".into(),
                 kind: crate::CrewKind::Engineer,
+                skill: 1,
                 salary_per_s: 0.0,
             },
         );
@@ -5978,6 +6304,7 @@ mod tests {
             Daylight::Day,
             &recipes,
             &conc,
+            &crew_demands(),
         ));
         assert_eq!(solve.fractions[1], 0.0, "no sink ⇒ no run");
         assert_eq!(
@@ -6206,5 +6533,422 @@ mod tests {
         );
         // Advance 2.0 + completion 10.0.
         assert_eq!(w.economy.funds_micros, 12_000_000);
+    }
+
+    /// C09-F4's consumption half, solve-side: crew standing at a
+    /// `LifeSupport`-less colony draw the vessel-baseline set from
+    /// the colony's stores — `0.02 · crew` oxygen/s, `0.05 · crew`
+    /// EC/s — and an unstocked, unproduced demand flags
+    /// `ls_depleted` (the F4 probe's immortal colonists are
+    /// impossible again). The module table is a lone free EC
+    /// producer so the baseline's grounding has something to sit on.
+    #[allow(clippy::too_many_lines)] // the stocked/starved/module-arm sweep reads as one pass
+    #[test]
+    fn ls_less_colony_crew_consumes_baseline() {
+        let mut recipes = BTreeMap::new();
+        let _ = &mut recipes;
+        let recipes = recipes;
+        let conc = BTreeMap::new();
+        let demands = crew_demands();
+        let modules = vec![
+            ColonyModule {
+                def: gen_module(10.0),
+                damaged: false,
+            },
+            ColonyModule {
+                def: ColonyModuleDef::Store {
+                    resource: ResourceId::from("oxygen"),
+                    capacity: 500.0,
+                },
+                damaged: false,
+            },
+        ];
+        let light = BodyLight {
+            synodic_rate: 0.0,
+            h0: 0.0,
+            day_insolation_w_m2: 0.0,
+            cos_lat: 1.0,
+        };
+        // 2 crew; every demanded resource stocked — the baseline
+        // grounds (the modules' own "every request stocked or
+        // produced" rule, all-or-nothing) and its rows register.
+        let levels: BTreeMap<ResourceId, f64> = [
+            (ResourceId::from("oxygen"), 100.0),
+            (ResourceId::from("food"), 100.0),
+            (ec(), 50.0),
+        ]
+        .into_iter()
+        .collect();
+        let solve = solve_network(&inp(
+            &modules,
+            ColonyState::Nominal,
+            &levels,
+            &all_caps(),
+            &light,
+            2,
+            Daylight::Day,
+            &recipes,
+            &conc,
+            &demands,
+        ));
+        // The baseline draws O2 at 0.02·2 = 0.04 and EC at 0.05·2 =
+        // 0.1 against the 10/s generator.
+        assert!(
+            (solve.net_rates[&ResourceId::from("oxygen")] + 0.04).abs() < 1e-12,
+            "O2 net {}",
+            solve.net_rates[&ResourceId::from("oxygen")]
+        );
+        assert!((solve.net_rates[&ec()] - 9.9).abs() < 1e-9);
+        assert!(!solve.ls_depleted);
+        // Food unstocked → the whole baseline stands ungrounded (the
+        // module precedent: a partially stocked need registers
+        // nothing and the depletion scan still sees the demand — the
+        // crew starves rather than half-eating).
+        let short: BTreeMap<ResourceId, f64> = [(ResourceId::from("oxygen"), 100.0), (ec(), 50.0)]
+            .into_iter()
+            .collect();
+        let solve = solve_network(&inp(
+            &modules,
+            ColonyState::Nominal,
+            &short,
+            &all_caps(),
+            &light,
+            2,
+            Daylight::Day,
+            &recipes,
+            &conc,
+            &demands,
+        ));
+        assert!(solve.ls_depleted, "unstocked crew need must deplete");
+        assert!(
+            !solve.net_rates.contains_key(&ResourceId::from("oxygen")),
+            "an ungrounded baseline registers no rows: {:?}",
+            solve.net_rates
+        );
+        // Stock everything — the same crew is satisfied, no
+        // depletion, and the store drains at the baseline rate.
+        let full: BTreeMap<ResourceId, f64> = [
+            (ResourceId::from("oxygen"), 100.0),
+            (ResourceId::from("food"), 100.0),
+            (ec(), 50.0),
+        ]
+        .into_iter()
+        .collect();
+        let solve = solve_network(&inp(
+            &modules,
+            ColonyState::Nominal,
+            &full,
+            &all_caps(),
+            &light,
+            2,
+            Daylight::Day,
+            &recipes,
+            &conc,
+            &demands,
+        ));
+        assert!(!solve.ls_depleted);
+        assert!(
+            (solve.net_rates[&ResourceId::from("food")] + 0.005 * 2.0).abs() < 1e-12,
+            "food net {}",
+            solve.net_rates[&ResourceId::from("food")]
+        );
+        // And the twin gate: a `LifeSupport` module — even a bare
+        // one — owns the demand itself; the baseline registers
+        // nothing (no double-counting).
+        let modules_ls = vec![
+            ColonyModule {
+                def: gen_module(10.0),
+                damaged: false,
+            },
+            ColonyModule {
+                def: ColonyModuleDef::LifeSupport {
+                    consumes_per_crew: vec![],
+                    power_ec_per_s: 0.0,
+                },
+                damaged: false,
+            },
+        ];
+        let solve = solve_network(&inp(
+            &modules_ls,
+            ColonyState::Nominal,
+            &levels,
+            &all_caps(),
+            &light,
+            2,
+            Daylight::Day,
+            &recipes,
+            &conc,
+            &demands,
+        ));
+        assert!(
+            !solve.net_rates.contains_key(&ResourceId::from("oxygen")),
+            "the LS module's table owns the crew draw: {:?}",
+            solve.net_rates
+        );
+        assert!(!solve.ls_depleted);
+    }
+
+    /// C09-F4's gate half, command-side: while life support is
+    /// enabled, `AssignCrewToColony` refuses a colony with no
+    /// undamaged `LifeSupport` module — the posting would starve the
+    /// member on the baseline draw. A colony that stands one takes
+    /// the member; a world with the subsystem off posts anywhere.
+    #[test]
+    fn assign_crew_refuses_ls_less_colony() {
+        let mut w = colony_world(); // life support enabled
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::HireCrew {
+                name: "a".into(),
+                kind: crate::CrewKind::Pilot,
+                skill: 1,
+                salary_per_s: 0.0,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        found(&mut w, vec![gen_module(10.0)], vec![]);
+        let colony = *w.colonies().keys().next().unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::AssignCrewToColony {
+                colony,
+                crew: CrewId(0),
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(
+            r.rejected.iter().any(
+                |x| matches!(&x.error, SimError::Recoverable(m) if m.contains("life-support"))
+            ),
+            "{:?}",
+            r.rejected
+        );
+        assert!(!w.colonies()[&colony].crew.contains(&CrewId(0)));
+        // A colony standing a working LS module takes the member.
+        let mut w = colony_world();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::HireCrew {
+                name: "a".into(),
+                kind: crate::CrewKind::Pilot,
+                skill: 1,
+                salary_per_s: 0.0,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        found(
+            &mut w,
+            vec![
+                gen_module(10.0),
+                ColonyModuleDef::LifeSupport {
+                    consumes_per_crew: vec![],
+                    power_ec_per_s: 0.0,
+                },
+            ],
+            vec![],
+        );
+        let colony = *w.colonies().keys().next().unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::AssignCrewToColony {
+                colony,
+                crew: CrewId(0),
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        assert!(w.colonies()[&colony].crew.contains(&CrewId(0)));
+    }
+
+    /// C09-F6: a landed impact is no longer silent — the damage
+    /// apply posts a program-level `ColonyDamaged` notification with
+    /// the colony and the broken `ModuleIndex`.
+    #[test]
+    fn damage_posts_colony_damaged_notification() {
+        let mut w = colony_world();
+        found(&mut w, vec![gen_module(10.0)], vec![]);
+        let colony = *w.colonies().keys().next().unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::DamageColonyModule { colony, module: 0 },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(
+            w.notifications().iter().any(|n| matches!(
+                n.kind,
+                crate::reliability::NotificationKind::ColonyDamaged { colony: c, module: 0 }
+                    if c == colony.0
+            )),
+            "no ColonyDamaged entry: {:?}",
+            w.notifications()
+        );
+        assert_eq!(
+            w.colonies()[&colony].state,
+            ColonyState::Degraded {
+                reason: DegradeReason::ImpactDamage
+            }
+        );
+    }
+
+    /// C09-F8's terminal-transition cleanup: `AbandonColony` vacates
+    /// every vessel's `joined_colony` — a stale tag would freeze the
+    /// member's transfer surface (the gate refuses non-live
+    /// colonies) and serialize a lie onto a recovered hull.
+    #[test]
+    fn abandon_clears_joined_colony() {
+        let mut w = colony_world();
+        let ore = ResourceId::from("ore");
+        found(
+            &mut w,
+            vec![
+                gen_module(10.0),
+                ColonyModuleDef::Store {
+                    resource: ore.clone(),
+                    capacity: 100.0,
+                },
+            ],
+            vec![],
+        );
+        let colony = *w.colonies().keys().next().unwrap();
+        let vessel = latched_vessel(&mut w, "ore", 100.0, 0.0);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::JoinColonyInventory { vessel, colony },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert_eq!(w.vessels()[&vessel].joined_colony, Some(colony));
+        w.enqueue(SourceClass::Ui, 0, SimCommand::AbandonColony { colony });
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert_eq!(w.vessels()[&vessel].joined_colony, None);
+        // And the freed site takes a re-found (the C09-F9 half):
+        // `Abandoned` does not occupy.
+        let r = found(&mut w, vec![gen_module(10.0)], vec![]);
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        assert_eq!(w.colonies().len(), 2);
+    }
+
+    /// The same cleanup on the depletion path: a starved colony
+    /// goes `Dormant` and its joined hulls lose the opt-in in the
+    /// same firing.
+    #[test]
+    fn ls_depletion_clears_joined_colony() {
+        let mut w = colony_world();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::HireCrew {
+                name: "a".into(),
+                kind: crate::CrewKind::Pilot,
+                skill: 1,
+                salary_per_s: 0.0,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        // An LS module demanding oxygen nothing stocks — crewed, it
+        // depletes on the first recompute.
+        found(
+            &mut w,
+            vec![
+                gen_module(10.0),
+                ColonyModuleDef::LifeSupport {
+                    consumes_per_crew: vec![(ResourceId::from("oxygen"), 0.1)],
+                    power_ec_per_s: 0.0,
+                },
+            ],
+            vec![],
+        );
+        let colony = *w.colonies().keys().next().unwrap();
+        let vessel = latched_vessel(&mut w, "ore", 100.0, 0.0);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::JoinColonyInventory { vessel, colony },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert_eq!(w.vessels()[&vessel].joined_colony, Some(colony));
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::AssignCrewToColony {
+                colony,
+                crew: CrewId(0),
+            },
+        );
+        // The assign's recompute finds no oxygen to serve the module
+        // — `LifeSupportDepleted` lands a tick out; its firing
+        // dormants the colony AND vacates the join (the C09-F8
+        // half: the tag dies with the colony, not a manual leave).
+        w.step_frame(w.clock().ticks() + 8).unwrap();
+        assert_eq!(w.colonies()[&colony].state, ColonyState::Dormant);
+        assert_eq!(w.vessels()[&vessel].joined_colony, None);
+    }
+
+    /// C09-F9: a second `FoundColony` at an occupied site refuses —
+    /// `Nominal`/`Degraded`/`Dormant` all occupy; only `Abandoned`
+    /// frees the slot for re-founding.
+    #[test]
+    fn double_found_rejected_and_refound_after_abandon() {
+        let mut w = colony_world();
+        let r = found(&mut w, vec![gen_module(10.0)], vec![]);
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        let r = found(&mut w, vec![gen_module(10.0)], vec![]);
+        assert!(
+            r.rejected
+                .iter()
+                .any(|x| matches!(&x.error, SimError::Recoverable(m) if m.contains("hosts a live colony"))),
+            "{:?}",
+            r.rejected
+        );
+        assert_eq!(w.colonies().len(), 1);
+        // Abandon the wreck — the site re-founds (the salvage pays
+        // out separately; occupancy is the live-state check).
+        let colony = *w.colonies().keys().next().unwrap();
+        w.enqueue(SourceClass::Ui, 0, SimCommand::AbandonColony { colony });
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        let r = found(&mut w, vec![gen_module(10.0)], vec![]);
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        assert_eq!(w.colonies().len(), 2);
+    }
+
+    /// C21-F8: the command path debits the authored
+    /// `colony_founding_cost_funds` — the "funds ─► facilities"
+    /// arrow `AbandonColony`'s salvage made a mint without it —
+    /// and refuses outright when the balance can't pay (an action
+    /// reject, never a clamp).
+    #[test]
+    fn founding_charges_funds_and_refuses_when_short() {
+        let mut w = colony_world();
+        let cost = w.economy_config().colony_founding_cost_micros;
+        let before = w.funds_micros();
+        let r = found(&mut w, vec![gen_module(10.0)], vec![]);
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        assert_eq!(w.funds_micros(), before - cost);
+        assert!(
+            w.economy()
+                .ledger
+                .iter()
+                .any(|e| e.reason == crate::economy::FundsReason::ColonyFounding),
+            "no ColonyFounding ledger row"
+        );
+        // Broke → the next founding refuses and nothing founds.
+        w.economy.funds_micros = 0;
+        let colony = *w.colonies().keys().next().unwrap();
+        w.enqueue(SourceClass::Ui, 0, SimCommand::AbandonColony { colony });
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        let r = found(&mut w, vec![gen_module(10.0)], vec![]);
+        assert!(
+            r.rejected.iter().any(
+                |x| matches!(&x.error, SimError::Recoverable(m) if m.contains("insufficient funds"))
+            ),
+            "{:?}",
+            r.rejected
+        );
+        assert_eq!(w.colonies().len(), 1);
     }
 }

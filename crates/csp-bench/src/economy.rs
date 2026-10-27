@@ -134,6 +134,7 @@ pub fn staffed_base_run(probe: &EconomyProbe) -> Result<EconomyReport, SimError>
                     1 => economy::CrewKind::Engineer,
                     _ => economy::CrewKind::Scientist,
                 },
+                skill: 1,
                 salary_per_s: salary,
             },
         );

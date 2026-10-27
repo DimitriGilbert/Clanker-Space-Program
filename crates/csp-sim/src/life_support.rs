@@ -681,6 +681,7 @@ mod tests {
             SimCommand::HireCrew {
                 name: "pilot".into(),
                 kind: crate::economy::CrewKind::Pilot,
+                skill: 1,
                 salary_per_s: 0.0,
             },
         );

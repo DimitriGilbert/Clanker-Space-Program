@@ -762,7 +762,18 @@ impl World {
         let eligible: Vec<&ContractTemplate> = self
             .contract_defs
             .values()
-            .filter(|t| t.generate.weight > 0.0 && self.contract_prereqs_met(t))
+            // C08-F6/C33-F3 §3.3: the tree's `unlocks.contract_types`
+            // grants gate generation alongside the template's own
+            // prereqs — the unlock was dead authored data until this
+            // half landed (the validator pins the two together, so a
+            // shipped tree's every unlock has a matching
+            // `TechResearched` prereq; the gate is the same fact read
+            // a second way, not a second source of truth).
+            .filter(|t| {
+                t.generate.weight > 0.0
+                    && self.contract_type_unlocked(&t.id)
+                    && self.contract_prereqs_met(t)
+            })
             .collect();
         if eligible.is_empty() {
             return Ok(None);
@@ -894,6 +905,7 @@ impl World {
     /// faucet self-starves rather than paying at a fixed rate
     /// forever. The cap's real job is the outstanding deadline/
     /// penalty liability, not the instant-complete path.
+    #[allow(clippy::too_many_lines)] // the gate → activation → advance → deadline pipeline reads as one pass
     pub(crate) fn apply_accept_contract(
         &mut self,
         offer: u64,
@@ -905,6 +917,9 @@ impl World {
         let Some(template) = self.contract_defs.get(&o.template) else {
             return Err(SimError::Recoverable("accept: template not installed"));
         };
+        if !self.contract_type_unlocked(&template.id) {
+            return Err(SimError::Recoverable("accept: contract type not unlocked"));
+        }
         if !self.contract_prereqs_met(template) {
             return Err(SimError::Recoverable("accept: prerequisites not met"));
         }
@@ -1583,6 +1598,83 @@ mod tests {
         let report = w2.step_frame(2 * csp_core::TICK_HZ).unwrap();
         assert!(w2.contracts().active.is_empty());
         assert_eq!(report.rejected.len(), 1);
+    }
+
+    /// C08-F6/C33-F3's second gate: the tree's
+    /// `unlocks.contract_types` grants gate generation AND accept —
+    /// the authored field gates something now (it was dead data).
+    /// A template whose prereqs pass but whose type no researched
+    /// node unlocks never reaches the board; once the node is
+    /// researched it does — and a crafted accept of the locked type
+    /// rejects too.
+    #[test]
+    fn contract_type_unlock_gates_the_board() {
+        // A prereq-free template — the ONLY gate standing between it
+        // and the board is the contract_types unlock.
+        let t = template(
+            "contract.satellite",
+            ContractKind::SatellitePlacement,
+            vec![],
+        );
+        let mut w = world_with(t);
+        w.set_tech_tree(csp_data::TechTree {
+            nodes: vec![csp_data::TechNode {
+                id: csp_data::TechNodeId::from("tech.n"),
+                display_name: "n".into(),
+                description: "d".into(),
+                science_cost: 0.0,
+                requires: vec![],
+                unlocks: csp_data::TechUnlocks {
+                    track_levels: vec![],
+                    facilities: vec![],
+                    contract_types: vec![csp_data::ContractTypeId::from("contract.satellite")],
+                },
+            }],
+            tracks: vec![],
+        });
+        fill_board(&mut w);
+        assert!(
+            w.contracts().offers.is_empty(),
+            "locked type offered: {:?}",
+            w.contracts().offers
+        );
+        w.tech
+            .researched
+            .insert(csp_data::TechNodeId::from("tech.n"));
+        fill_board(&mut w);
+        assert_eq!(w.contracts().offers.len(), 6);
+        // The accept-side re-check: a crafted offer of a locked type
+        // refuses even with the prereq table satisfied.
+        let mut w2 = world_with(template(
+            "contract.satellite",
+            ContractKind::SatellitePlacement,
+            vec![],
+        ));
+        w2.set_tech_tree(w.tech_tree().unwrap().clone());
+        w2.contracts.offers.insert(
+            0,
+            ContractOffer {
+                index: 0,
+                template: ContractTypeId::from("contract.satellite"),
+                params: ContractParams::Rescue {
+                    body: BodyId::from("terrin"),
+                },
+            },
+        );
+        w2.enqueue(
+            crate::SourceClass::Ui,
+            0,
+            SimCommand::AcceptContract { offer: 0 },
+        );
+        let report = w2.step_frame(2 * csp_core::TICK_HZ).unwrap();
+        assert!(
+            report.rejected.iter().any(
+                |r| matches!(&r.error, SimError::Recoverable(m) if m.contains("not unlocked"))
+            ),
+            "{:?}",
+            report.rejected
+        );
+        assert!(w2.contracts().active.is_empty());
     }
 
     /// Accept → advance credits; the contract enters the arena;

@@ -966,6 +966,14 @@ impl World {
         if !self.science_cfg.is_valid() {
             return Err(SimError::Recoverable("science: invalid config"));
         }
+        // C08-F6/C33-F3 §3.3: a lab is a facility unlock — in a
+        // treed world `facility.lab` must be researched before a
+        // project starts (the part's `tech_requirement` gates its
+        // hull; this gates the verb — a hull built pre-research or
+        // smuggled via an untreed world cannot run science).
+        if !self.facility_unlocked(&csp_data::FacilityId::from("facility.lab")) {
+            return Err(SimError::Recoverable("research: lab facility not unlocked"));
+        }
         let Some(v) = self.vessels.get(&vessel) else {
             return Err(SimError::Recoverable("research: unknown vessel"));
         };
@@ -1004,6 +1012,17 @@ impl World {
             }
             if !v.crew.iter().any(|c| c.id == r.crew) {
                 return Err(SimError::Recoverable("research: researcher not aboard"));
+            }
+            // C08-F7: the claimed skill must match the roster record —
+            // `ResearcherAssign.skill` was trusted verbatim before,
+            // letting a command mint lab rate out of thin air. An
+            // id-only member (`BoardCrew`, no roster row) reads as the
+            // floor 1 — the view's `map_or(1, …)` effective convention.
+            let actual = self.economy.crew.get(&r.crew).map_or(1, |m| m.skill);
+            if r.skill != actual {
+                return Err(SimError::Recoverable(
+                    "research: claimed skill does not match the roster record",
+                ));
             }
             skill_sum += f64::from(r.skill);
         }

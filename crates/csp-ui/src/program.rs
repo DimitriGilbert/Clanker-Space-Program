@@ -263,6 +263,10 @@ pub struct ColonyRow {
     pub daylight: String,
     /// Crew ids posted here.
     pub crew: Vec<u64>,
+    /// C09-F4: the sim's `colony_accepts_crew` mirrored — the colony
+    /// can take crew (life support disabled, or an undamaged
+    /// `LifeSupport` module stands). Posting buttons dim on false.
+    pub has_ls: bool,
     /// Module rows (index = `ModuleIndex`).
     pub modules: Vec<ColonyModuleRow>,
     /// Store rows.
@@ -289,7 +293,8 @@ pub struct SiteRow {
     pub body: String,
     /// A launch site (recovery_efficiency 1.0).
     pub launch: bool,
-    /// A colony already occupies the site.
+    /// A LIVE colony already occupies the site (C09-F9 — an
+    /// `Abandoned` wreck frees the slot for re-founding).
     pub has_colony: bool,
     /// The site's stockpiled inventory (`(resource, units)`).
     pub inventory: Vec<(String, f64)>,
@@ -510,6 +515,10 @@ pub struct ProgramInput {
     /// The salary/s a UI hire pays — the panel's authored default
     /// (the sim has no salary table; `HireCrew` carries it verbatim).
     pub hire_salary_per_s: f64,
+    /// C21-F8: `FoundColony`'s authored debit
+    /// (`colony_founding_cost_funds`, whole funds) — the sites
+    /// section's "found outpost" gate/label.
+    pub colony_founding_cost: f64,
     /// W2.5 — the automation surface. Scripts bound to the focused
     /// vessel.
     pub scripts: Vec<ScriptRow>,
@@ -599,9 +608,13 @@ pub enum ProgramCommand {
     // resolves the sim-side context (vessel, tick, ids, names).
     /// Hire a roster member → `HireCrew` (view authors the name +
     /// salary). `kind`: "pilot"/"engineer"/"scientist"/"tourist".
+    /// `skill` is the purchased 1..=5 — each point bills the hire
+    /// fee (C08-F7).
     HireCrew {
         /// The crew kind id.
         kind: String,
+        /// The purchased skill (the roster record's seed).
+        skill: u8,
     },
     /// Seat a fresh crew member aboard the focused vessel →
     /// `BoardCrew` (the id-only local hire; roster members reach
@@ -1067,23 +1080,41 @@ fn crew_section(
     out: &mut Vec<ProgramCommand>,
     dim: egui::Color32,
 ) {
-    let afford = input.funds >= input.hire_cost;
+    // C08-F7's hire band — the purchased skill, persisted across
+    // frames; each point bills `hire_cost` (the sim rejects 0 and
+    // >5, the widget cannot emit them).
+    let skill_id = ui.scope_id().with("program_hire_skill");
+    let mut skill: u8 = ui
+        .data_mut(|d| d.get_persisted::<u8>(skill_id))
+        .unwrap_or(1);
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::DragValue::new(&mut skill)
+                .range(1..=5)
+                .prefix("skill "),
+        )
+        .on_hover_text("skill of the next hire — each point costs the hire fee");
+    });
+    ui.data_mut(|d| d.insert_persisted(skill_id, skill));
+    let cost = input.hire_cost * f64::from(skill);
+    let afford = input.funds >= cost;
     ui.horizontal(|ui| {
         for kind in ["pilot", "engineer", "scientist", "tourist"] {
             if ui
                 .add_enabled(afford, egui::Button::new(format!("+{kind}")).small())
                 .on_hover_text(if afford {
                     format!(
-                        "hire a {kind} — ₣{:.0} now, ₣{:.3}/s salary",
-                        input.hire_cost, input.hire_salary_per_s
+                        "hire a {kind} — ₣{cost:.0} now (skill {skill}), ₣{:.3}/s salary",
+                        input.hire_salary_per_s
                     )
                 } else {
-                    format!("hire costs ₣{:.0} — not enough funds", input.hire_cost)
+                    format!("hire costs ₣{cost:.0} — not enough funds")
                 })
                 .clicked()
             {
                 out.push(ProgramCommand::HireCrew {
                     kind: kind.to_string(),
+                    skill,
                 });
             }
         }
@@ -1127,12 +1158,22 @@ fn crew_section(
             );
             if r.active {
                 match &r.location {
-                    // Unassigned members post to a live colony.
+                    // Unassigned members post to a live colony —
+                    // C09-F4: dim on `has_ls` (the sim refuses a
+                    // posting to an LS-less colony outright; the
+                    // baseline draw would starve the member).
                     CrewWhere::Unassigned => {
                         for c in input.colonies.iter().filter(|c| c.live) {
                             if ui
-                                .small_button(format!("→col{}", c.id))
-                                .on_hover_text(format!("post to {}", c.name))
+                                .add_enabled(
+                                    c.has_ls,
+                                    egui::Button::new(format!("→col{}", c.id)).small(),
+                                )
+                                .on_hover_text(if c.has_ls {
+                                    format!("post to {}", c.name)
+                                } else {
+                                    format!("{} has no working life-support module", c.name)
+                                })
                                 .clicked()
                             {
                                 out.push(ProgramCommand::AssignCrewToColony {
@@ -1385,13 +1426,28 @@ fn colonies_section(
                     .font(MONO)
                     .color(dim),
                 );
-                if !s.has_colony
-                    && ui
-                        .small_button("found outpost")
-                        .on_hover_text(
-                            "found a starter colony here (solar + battery — prototype, no cost)",
+                // C21-F8/C09-F9: founding costs the authored charge —
+                // "prototype, no cost" is gone — and the button only
+                // offers itself on a free site with the funds to pay
+                // (`has_colony` is live-only, so a salvaged wreck's
+                // site can be re-founded).
+                let can_found = !s.has_colony && input.funds >= input.colony_founding_cost;
+                if ui
+                    .add_enabled(can_found, egui::Button::new("found outpost").small())
+                    .on_hover_text(if can_found {
+                        format!(
+                            "found a starter colony here (solar + battery + life support — ₣{:.0})",
+                            input.colony_founding_cost
                         )
-                        .clicked()
+                    } else if s.has_colony {
+                        "a live colony already occupies this site".to_string()
+                    } else {
+                        format!(
+                            "founding costs ₣{:.0} — not enough funds",
+                            input.colony_founding_cost
+                        )
+                    })
+                    .clicked()
                 {
                     out.push(ProgramCommand::FoundColony { site: s.id.clone() });
                 }

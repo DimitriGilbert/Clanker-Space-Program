@@ -1074,7 +1074,7 @@ fn program_command(
         // rule); id-addressed commands go through as issued — a stale
         // id rejects `Recoverable` at the drain, which the rejected-
         // command channel surfaces.
-        C::HireCrew { kind } => {
+        C::HireCrew { kind, skill } => {
             let kind = match kind.as_str() {
                 "pilot" => csp_sim::CrewKind::Pilot,
                 "engineer" => csp_sim::CrewKind::Engineer,
@@ -1085,6 +1085,7 @@ fn program_command(
             Some(SimCommand::HireCrew {
                 name,
                 kind,
+                skill,
                 salary_per_s: mirror.input.hire_salary_per_s,
             })
         }
@@ -1293,10 +1294,16 @@ fn program_command(
 }
 
 /// The player-facing `FoundColony` payload — a starter outpost:
-/// a small solar array, a battery, and its founding EC charge. The
-/// apply resolves the site's body/pose and runs the founding solve.
-/// Honest scope: founding charges no funds (the sim has no colony
-/// founding cost — the panel labels the button "prototype, no cost").
+/// a small solar array, a battery, a `LifeSupport` module with its
+/// founding consumables, and the founding EC charge. The apply
+/// resolves the site's body/pose, runs the founding solve, and
+/// charges the authored `colony_founding_cost_funds` (C21-F8 — the
+/// "prototype, no cost" era ended; the panel prints the price).
+/// C09-F4: the LS module is what makes `AssignCrewToColony` legal
+/// here — its `consumes_per_crew` mirrors the authored
+/// `life_support_*_per_crew_s` balance rates, and the founding
+/// oxygen/food stocks cover ≈12 ks of one crew's need before
+/// resupply must arrive.
 fn starter_colony_def(site: &str) -> csp_data::ColonyDef {
     csp_data::ColonyDef {
         site: csp_data::SiteId::from(site),
@@ -1307,11 +1314,36 @@ fn starter_colony_def(site: &str) -> csp_data::ColonyDef {
                 efficiency: 0.2,
             },
             csp_data::ColonyModuleDef::Battery { capacity: 500.0 },
+            csp_data::ColonyModuleDef::LifeSupport {
+                consumes_per_crew: vec![
+                    (csp_data::ResourceId::from("oxygen"), 0.02),
+                    (csp_data::ResourceId::from("food"), 0.005),
+                ],
+                power_ec_per_s: 0.05,
+            },
+            csp_data::ColonyModuleDef::Store {
+                resource: csp_data::ResourceId::from("oxygen"),
+                capacity: 500.0,
+            },
+            csp_data::ColonyModuleDef::Store {
+                resource: csp_data::ResourceId::from("food"),
+                capacity: 500.0,
+            },
         ],
-        stores: vec![csp_data::ColonyStoreInit {
-            resource: csp_data::ResourceId::from("electric_charge"),
-            level: 250.0,
-        }],
+        stores: vec![
+            csp_data::ColonyStoreInit {
+                resource: csp_data::ResourceId::from("electric_charge"),
+                level: 250.0,
+            },
+            csp_data::ColonyStoreInit {
+                resource: csp_data::ResourceId::from("oxygen"),
+                level: 250.0,
+            },
+            csp_data::ColonyStoreInit {
+                resource: csp_data::ResourceId::from("food"),
+                level: 250.0,
+            },
+        ],
     }
 }
 
@@ -3946,6 +3978,9 @@ impl View {
             // view-side `HIRE_SALARY_PER_S` hardcode put one crew at
             // 5.18%/month of starting funds, over the §3.5 band.
             hire_salary_per_s: sim.economy_config().crew_salary_per_s,
+            // C21-F8: the authored founding charge the colonies
+            // section's button gates and labels on.
+            colony_founding_cost: sim.economy_config().colony_founding_cost_micros as f64 / 1.0e6,
             ..Default::default()
         };
         // Contracts, research rows, and the notification log.
@@ -4718,6 +4753,11 @@ fn notice_text(n: &csp_sim::reliability::Notification) -> String {
             format!("build #{build} — BERTH BLOCKED (delivery deferred)")
         }
         K::BuildDelivered { build } => format!("build #{build} — DELIVERED"),
+        // C09-F6: the impact hit's log line — program-level entry
+        // (no vessel prefix, the contract convention).
+        K::ColonyDamaged { colony, module } => {
+            format!("colony {colony} — MODULE {module} DAMAGED (impact)")
+        }
     }
 }
 
@@ -5165,6 +5205,14 @@ fn stage_program_world(
             }
             .to_string(),
             crew: c.crew.iter().map(|c| c.0).collect(),
+            // C09-F4: the panel's posting buttons mirror the sim's
+            // `colony_accepts_crew` — only a colony with an undamaged
+            // `LifeSupport` module can take crew while life support
+            // is enabled.
+            has_ls: !sim.life_support_enabled()
+                || c.modules.iter().any(|m| {
+                    !m.damaged && matches!(m.def, csp_data::ColonyModuleDef::LifeSupport { .. })
+                }),
             modules: c
                 .modules
                 .iter()
@@ -5212,7 +5260,14 @@ fn stage_program_world(
             name: name_of(&s.display_name, s.id.as_str()),
             body: s.body.as_str().to_string(),
             launch: s.launch,
-            has_colony: sim.colonies().values().any(|c| c.site == s.id),
+            // C09-F9: occupancy = a LIVE colony — `Abandoned` frees
+            // the site for re-founding (the apply-side check agrees:
+            // `AbandonColony` salvages the wreck, then the slot can
+            // be re-founded).
+            has_colony: sim
+                .colonies()
+                .values()
+                .any(|c| c.site == s.id && !matches!(c.state, csp_sim::ColonyState::Abandoned)),
             inventory: sim
                 .economy()
                 .sites
@@ -5357,10 +5412,14 @@ fn stage_program_world(
             }
         }
         for c in &v.crew {
-            // Roster members carry their authored skill; an id-only
-            // `BoardCrew` member stages at skill 1 so an unskilled
-            // crew can still run a lab (rate > 0).
-            let skill = sim.economy().crew.get(&c.id).map_or(1, |m| m.skill).max(1);
+            // C08-F7: the roster record is the claimed skill's source
+            // of truth — `apply_start_research` cross-checks it
+            // verbatim. An id-only `BoardCrew` member (no roster row)
+            // claims the floor 1, the sim's `map_or(1, …)` convention;
+            // a legacy skill-0 row claims its honest 0 (rate 0 —
+            // `StartResearch` refuses, and no `.max(1)` may launder
+            // it back into a legal assignment).
+            let skill = sim.economy().crew.get(&c.id).map_or(1, |m| m.skill);
             researchers.push((c.id, skill));
         }
     }
@@ -5944,11 +6003,13 @@ mod tests {
             }
             other => panic!("FoundColony → {other:?}"),
         }
-        // `HireCrew` authors the kind/name/salary.
+        // `HireCrew` authors the kind/name/salary — the panel's
+        // purchased skill rides through verbatim (C08-F7).
         match program_command(
             &mirror,
             C::HireCrew {
                 kind: "scientist".into(),
+                skill: 2,
             },
             &mut dropped,
         ) {
@@ -6138,6 +6199,39 @@ mod tests {
                 units: 5.0,
             },
         );
+        // C08-F6: the stand is a facility verb — the shipped tree
+        // gates `facility.test_stand` at `tech.rocketry.3`, a 60-
+        // science chain this fixture cannot afford. Install a tiny
+        // tree that locks the stand behind a free node, then take
+        // the unlock through the real `ResearchTech` verb.
+        view.sim.set_tech_tree(csp_data::TechTree {
+            nodes: vec![csp_data::TechNode {
+                id: csp_data::TechNodeId::from("tech.n"),
+                display_name: "n".into(),
+                description: "d".into(),
+                science_cost: 0.0,
+                requires: vec![],
+                unlocks: csp_data::TechUnlocks {
+                    track_levels: vec![],
+                    facilities: vec![csp_data::FacilityId::from("facility.test_stand")],
+                    contract_types: vec![],
+                },
+            }],
+            tracks: vec![],
+        });
+        view.sim.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::ResearchTech {
+                node: csp_data::TechNodeId::from("tech.n"),
+            },
+        );
+        view.begin_frame();
+        let r = view
+            .sim_step(view.sim.clock().ticks() + 1)
+            .expect("advance");
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        view.end_frame();
         let funds0 = view.sim.funds_micros();
         view.sim.enqueue(SourceClass::Ui, 0, cmd);
         view.begin_frame();

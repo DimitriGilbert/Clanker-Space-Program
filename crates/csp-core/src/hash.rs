@@ -236,7 +236,17 @@ use crate::SimError;
 /// `Silent`), `FundsReason` gained `BuildRefund` (11), and
 /// `NotificationKind` gained `BuildBerthBlocked`/`BuildDelivered` —
 /// all appended, never renumbered. The goldens rebless.
-pub const HASH_SCHEMA_VERSION: u32 = 25;
+///
+/// **Version 26** (§3.5 colony consequence model, C09/C08/C21):
+/// `EconomyConfig` gained `colony_founding_cost_micros` (hashed with
+/// the config walk — it moves the funds trajectory), `HireCrew`
+/// gained `skill` (a command-shape change — old logs lacking the
+/// field won't decode, and none is recorded), `FundsReason` gained
+/// `ColonyFounding` (12) and `NotificationKind` gained
+/// `ColonyDamaged` — both appended, never renumbered. Crewed
+/// colonies without a `LifeSupport` module now consume the baseline
+/// set in the network solve. The goldens rebless.
+pub const HASH_SCHEMA_VERSION: u32 = 26;
 
 /// Rule-7 sum types: the source of an enum's *declared* stable `u16`
 /// discriminant (PLAN §7.1 rule 7).

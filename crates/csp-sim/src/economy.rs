@@ -160,6 +160,12 @@ pub const DEFAULT_SITE_UPKEEP_FUNDS_PER_S: f64 = 0.0002;
 /// retiring crew (1 = the first miss only warns; the second and each
 /// further miss retires a member).
 pub const DEFAULT_ATTRITION_GRACE_PERIODS: u64 = 1;
+/// `balance.ron: colony_founding_cost_funds` mirror — C21-F8's §3.5
+/// "funds ─► facilities" arrow: `FoundColony`'s debit (authored
+/// starting colonies bypass it — they are world state, not a
+/// purchase). 25 000 funds ≈ 2.5% of the starting balance, a mid-tier
+/// purchase next to the authored contract payouts.
+pub const DEFAULT_COLONY_FOUNDING_FUNDS: f64 = 25_000.0;
 
 /// Sim-day in seconds (86400) — the salary cadence conversion.
 const DAY_S: f64 = 86_400.0;
@@ -208,6 +214,10 @@ pub struct EconomyConfig {
     /// when `unpaid_salary_streak` exceeds this). Hashed: it moves
     /// the roster evolution.
     pub attrition_grace_periods: u64,
+    /// C21-F8 §3.5: `FoundColony`'s funds debit (micros) — the
+    /// command path's founding charge. Hashed: a restored world
+    /// enforces the founding economics it was built under.
+    pub colony_founding_cost_micros: u64,
 }
 
 /// The `DEFAULT_*` config — `World::new()`'s no-data fallback.
@@ -223,6 +233,7 @@ pub fn default_config() -> EconomyConfig {
         crew_salary_per_s: DEFAULT_HIRE_SALARY_PER_S,
         site_upkeep_funds_per_s: DEFAULT_SITE_UPKEEP_FUNDS_PER_S,
         attrition_grace_periods: DEFAULT_ATTRITION_GRACE_PERIODS,
+        colony_founding_cost_micros: to_micros(DEFAULT_COLONY_FOUNDING_FUNDS),
     }
 }
 
@@ -240,6 +251,7 @@ impl EconomyConfig {
             crew_salary_per_s: b.crew_salary_per_s,
             site_upkeep_funds_per_s: b.site_upkeep_funds_per_s,
             attrition_grace_periods: b.attrition_grace_periods,
+            colony_founding_cost_micros: to_micros(b.colony_founding_cost_funds),
         }
     }
 
@@ -409,6 +421,9 @@ pub enum FundsReason {
     /// C11-F3's `CancelBuild` refund — the order's funds spend
     /// credited back (the `Manufacture` entry's inverse).
     BuildRefund = 11,
+    /// C21-F8 §3.5's `FoundColony` founding charge — the
+    /// `colony_founding_cost_funds` debit (facilities spend).
+    ColonyFounding = 12,
 }
 
 impl StableDiscriminant for FundsReason {
@@ -964,13 +979,29 @@ impl World {
         &mut self,
         name: &str,
         kind: CrewKind,
+        skill: u8,
         salary_per_s: f64,
         shadow: &mut TickShadow,
     ) -> Result<(), SimError> {
         if !(salary_per_s.is_finite() && salary_per_s >= 0.0) {
             return Err(SimError::Recoverable("hire: non-finite or negative salary"));
         }
-        let cost = self.economy_cfg.hire_cost_micros;
+        // C08-F7: skill rides the command now — the roster record is
+        // the truth `StartResearch` cross-checks against (the
+        // hardcoded `skill: 0` made every hire identical). `1..=5`
+        // is the hire band: 0 is §3.5's type-level floor, not a
+        // purchase — a skill-0 member draws salary while its lab
+        // contribution (`Σ skill`) is provably zero.
+        if !(1..=5).contains(&skill) {
+            return Err(SimError::Recoverable("hire: skill outside 1..=5"));
+        }
+        // Skilled labour costs more: each point of skill bills the
+        // authored `crew_hire_cost_funds`, so the hire band is a real
+        // price/quality choice rather than always-max-skill.
+        let cost = self
+            .economy_cfg
+            .hire_cost_micros
+            .saturating_mul(u64::from(skill));
         if cost > self.economy.funds_micros {
             return Err(SimError::Recoverable("hire: insufficient funds"));
         }
@@ -986,7 +1017,7 @@ impl World {
             CrewMember {
                 name: name.to_string(),
                 kind,
-                skill: 0,
+                skill,
                 location: CrewLocation::Unassigned,
                 salary_per_s,
                 status: CrewStatus::Active,
@@ -1355,6 +1386,7 @@ mod tests {
             SimCommand::HireCrew {
                 name: "a".into(),
                 kind: CrewKind::Pilot,
+                skill: 1,
                 salary_per_s: 0.0,
             },
         );
@@ -1380,6 +1412,7 @@ mod tests {
                 SimCommand::HireCrew {
                     name: format!("s{i}"),
                     kind: CrewKind::Scientist,
+                    skill: 1,
                     salary_per_s: 0.0,
                 },
             );
@@ -1388,6 +1421,47 @@ mod tests {
         assert_eq!(r.rejected.len(), 2, "the world afforded all four hires");
         assert_eq!(w.economy().crew.len(), 2);
         assert!(!w.economy().insolvent);
+    }
+
+    /// C08-F7: `skill` is a hire parameter — the roster record
+    /// carries it verbatim (the `StartResearch` cross-check reads
+    /// it), the fee scales per point (`hire_cost · skill` so the
+    /// 1..=5 band is a real price/quality choice), and the band
+    /// itself is enforced — 0 is the type-level floor for legacy
+    /// records, not a purchase.
+    #[test]
+    fn hire_records_skill_and_scales_cost() {
+        let mut w = world();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::HireCrew {
+                name: "ace".into(),
+                kind: CrewKind::Pilot,
+                skill: 3,
+                salary_per_s: 0.0,
+            },
+        );
+        w.step_frame(1).unwrap();
+        let hire = w.economy_config().hire_cost_micros;
+        assert_eq!(w.funds_micros(), 1_000_000_000_000 - 3 * hire);
+        assert_eq!(w.economy().crew[&CrewId(0)].skill, 3);
+        // The band refuses outright — skill 0 and skill 6 both.
+        for skill in [0u8, 6] {
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::HireCrew {
+                    name: "x".into(),
+                    kind: CrewKind::Pilot,
+                    skill,
+                    salary_per_s: 0.0,
+                },
+            );
+        }
+        let r = w.step_frame(2).unwrap();
+        assert_eq!(r.rejected.len(), 2, "{:?}", r.rejected);
+        assert_eq!(w.economy().crew.len(), 1);
     }
 
     /// The salary drain: `Σ salary_per_s · period_s` debited exactly
@@ -1403,6 +1477,7 @@ mod tests {
             SimCommand::HireCrew {
                 name: "a".into(),
                 kind: CrewKind::Engineer,
+                skill: 1,
                 salary_per_s: 1.0,
             },
         );
@@ -1439,6 +1514,7 @@ mod tests {
             SimCommand::HireCrew {
                 name: "a".into(),
                 kind: CrewKind::Pilot,
+                skill: 1,
                 salary_per_s: 1.0,
             },
         );
@@ -1624,6 +1700,7 @@ mod tests {
                 SimCommand::HireCrew {
                     name: "a".into(),
                     kind: CrewKind::Pilot,
+                    skill: 1,
                     salary_per_s: 0.5,
                 },
             );
@@ -1660,6 +1737,7 @@ mod tests {
             SimCommand::HireCrew {
                 name: "a".into(),
                 kind: CrewKind::Engineer,
+                skill: 1,
                 salary_per_s: 1.0,
             },
         );
@@ -1696,6 +1774,7 @@ mod tests {
                 SimCommand::HireCrew {
                     name: name.into(),
                     kind: CrewKind::Pilot,
+                    skill: 1,
                     salary_per_s: salary,
                 },
             );
@@ -1781,6 +1860,7 @@ mod tests {
             SimCommand::HireCrew {
                 name: "new".into(),
                 kind: CrewKind::Scientist,
+                skill: 1,
                 salary_per_s: 0.001,
             },
         );
@@ -1804,6 +1884,7 @@ mod tests {
             SimCommand::HireCrew {
                 name: "a".into(),
                 kind: CrewKind::Pilot,
+                skill: 1,
                 salary_per_s: 1.0,
             },
         );

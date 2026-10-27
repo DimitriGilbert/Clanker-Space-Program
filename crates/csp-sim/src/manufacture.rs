@@ -226,6 +226,18 @@ impl crate::World {
         // M7-B §3.3: the same availability gate the spawn apply runs —
         // an un-researched part cannot be ordered, not just launched.
         self.check_part_gate(&craft)?;
+        // C08-F6/C33-F3 §3.3: the build order is assembled in the VAB
+        // and rolled to the pad — both authored facility unlocks gate
+        // the verb (a treeless world runs ungated, the
+        // `check_part_gate` precedent; shipped trees author both at
+        // tech.start).
+        if !self.facility_unlocked(&csp_data::FacilityId::from("facility.vab"))
+            || !self.facility_unlocked(&csp_data::FacilityId::from("facility.launchpad"))
+        {
+            return Err(SimError::Recoverable(
+                "manufacture: facility not unlocked (vab/launchpad)",
+            ));
+        }
         csp_phys::weld::weld(&craft.graph, &craft.parts)
             .map_err(|_| SimError::Recoverable("manufacture: craft fails the weld gate"))?;
         let mut bom: BTreeMap<ResourceId, f64> = BTreeMap::new();
@@ -1399,5 +1411,109 @@ mod tests {
         let r = order(honest, vec![(ore.clone(), 20.0)]);
         assert!(r.rejected.is_empty(), "{:?}", r.rejected);
         assert_eq!(w.builds.len(), 1);
+    }
+
+    /// C08-F6/C33-F3's facility gates — `unlocks.facilities` on
+    /// researched nodes now gates the facility verbs: the test
+    /// stand refuses while `facility.test_stand` is unresearched
+    /// and opens on the research, and the build order itself checks
+    /// `facility.vab` + `facility.launchpad`. A treeless world runs
+    /// ungated — the `check_part_gate` precedent.
+    #[test]
+    fn facility_unlocks_gate_bench_and_manufacture() {
+        let mut w = world();
+        // The stand consumes `reliability_bench_resource` ("metal")
+        // — stock it so the gate is the only thing standing.
+        w.economy
+            .sites
+            .get_mut(&SiteId::from("pad"))
+            .unwrap()
+            .inventory
+            .insert(ResourceId::from("metal"), 10.0);
+        w.set_tech_tree(csp_data::TechTree {
+            nodes: vec![csp_data::TechNode {
+                id: csp_data::TechNodeId::from("tech.n"),
+                display_name: "n".into(),
+                description: "d".into(),
+                science_cost: 0.0,
+                requires: vec![],
+                unlocks: csp_data::TechUnlocks {
+                    track_levels: vec![],
+                    facilities: vec![
+                        csp_data::FacilityId::from("facility.test_stand"),
+                        csp_data::FacilityId::from("facility.vab"),
+                        csp_data::FacilityId::from("facility.launchpad"),
+                    ],
+                    contract_types: vec![],
+                },
+            }],
+            tracks: vec![],
+        });
+        let bench = |w: &mut World| {
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::RunBenchTest {
+                    site: SiteId::from("pad"),
+                    family: csp_data::FamilyId::from("f"),
+                    units: 1.0,
+                },
+            );
+            w.step_frame(w.clock().ticks() + 1).unwrap()
+        };
+        let build = |w: &mut World| {
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::ManufactureCraft {
+                    site: SiteId::from("pad"),
+                    craft: craft(),
+                    build_resources: vec![],
+                },
+            );
+            w.step_frame(w.clock().ticks() + 1).unwrap()
+        };
+        // Unresearched — both verbs refuse on the facility gate.
+        let r = bench(&mut w);
+        assert!(
+            r.rejected
+                .iter()
+                .any(|x| matches!(&x.error, SimError::Recoverable(m) if m.contains("test stand"))),
+            "{:?}",
+            r.rejected
+        );
+        let r = build(&mut w);
+        assert!(
+            r.rejected.iter().any(
+                |x| matches!(&x.error, SimError::Recoverable(m) if m.contains("vab/launchpad"))
+            ),
+            "{:?}",
+            r.rejected
+        );
+        // Researched — the bench reserves; the build's BOM is empty
+        // here so it rejects LATER, on the bill, not the gate.
+        w.tech
+            .researched
+            .insert(csp_data::TechNodeId::from("tech.n"));
+        let r = bench(&mut w);
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        let r = build(&mut w);
+        assert!(
+            !r.rejected.iter().any(
+                |x| matches!(&x.error, SimError::Recoverable(m) if m.contains("vab/launchpad"))
+            ),
+            "the facility gate must not fire post-research: {:?}",
+            r.rejected
+        );
+        // And the treeless world's ungated bench applies outright.
+        let mut w = world();
+        w.economy
+            .sites
+            .get_mut(&SiteId::from("pad"))
+            .unwrap()
+            .inventory
+            .insert(ResourceId::from("metal"), 10.0);
+        let r = bench(&mut w);
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
     }
 }

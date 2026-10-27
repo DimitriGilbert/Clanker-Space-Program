@@ -257,6 +257,29 @@ impl World {
         }
     }
 
+    /// The §3.3 facility gate — `true` when `facility` is unlocked
+    /// by a researched node's `unlocks.facilities` grant, or when no
+    /// tree is installed (the `check_part_gate` precedent: treeless
+    /// worlds run ungated). C08-F6/C33-F3 wires the authored
+    /// `facility.*` ids onto the surfaces they name — the test
+    /// stand, the lab, the pad, the assembly building.
+    pub(crate) fn facility_unlocked(&self, facility: &csp_data::FacilityId) -> bool {
+        self.tech_tree
+            .as_ref()
+            .is_none_or(|t| t.facility_unlocked(facility, &self.tech.researched))
+    }
+
+    /// The §3.3 contract-type gate — `true` when the template id is
+    /// granted by a researched node's `unlocks.contract_types`, or
+    /// when no tree is installed. Generation and accept share it —
+    /// the validator cross-check keeps it aligned with the
+    /// template's own `TechResearched` prereq.
+    pub(crate) fn contract_type_unlocked(&self, template: &csp_data::ContractTypeId) -> bool {
+        self.tech_tree
+            .as_ref()
+            .is_none_or(|t| t.contract_type_unlocked(template, &self.tech.researched))
+    }
+
     /// The §3.3 availability gate the spawn and manufacture applies
     /// share — the `part_costs`/`reliability` shape checks' sibling:
     /// [`CraftDef::part_ids`] is empty ("identity not recorded" —

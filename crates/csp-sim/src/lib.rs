@@ -377,7 +377,10 @@ pub struct Vessel {
     /// vessel↔colony transfers read. `None` = no join; membership is
     /// never automatic (a latched vessel beside a colony transfers
     /// nothing until this is set). Cleared on unlatch, a `ToRails`,
-    /// or `LeaveColonyInventory`; a latch merge keeps either side's
+    /// `LeaveColonyInventory`, or the colony's own terminal
+    /// transition (`AbandonColony`, life-support depletion — C09-F8;
+    /// a stale tag would freeze the member's transfer surface and
+    /// serialize a lie); a latch merge keeps either side's
     /// membership (`primary.or(secondary)` — the merged hull still
     /// sits where a joined half sat).
     pub joined_colony: Option<crate::economy::ColonyId>,
@@ -939,15 +942,21 @@ pub enum SimCommand {
         /// The recovery site — `None` = remote abandon salvage.
         site: Option<csp_data::SiteId>,
     },
-    /// M7-C §3.5's hire — charge `crew_hire_cost_funds` and add a
-    /// `CrewMember` to the roster `Unassigned`, drawing
-    /// `salary_per_s` per `SalaryDue` firing. An action: unaffordable
-    /// or non-finite salary rejects `Recoverable`, never clamps.
+    /// M7-C §3.5's hire — charge `crew_hire_cost_funds · skill` and
+    /// add a `CrewMember` to the roster `Unassigned`, drawing
+    /// `salary_per_s` per `SalaryDue` firing. C08-F7: `skill` rides
+    /// the command — the roster record it seeds is the truth
+    /// `StartResearch` cross-checks. `1..=5` is the hire band (the
+    /// 0 floor is a restore shape, not a purchase). An action:
+    /// unaffordable, out-of-band, or non-finite salary rejects
+    /// `Recoverable`, never clamps.
     HireCrew {
         /// The member's display name (logged like a `SetAlarm` label).
         name: String,
         /// The member's kind.
         kind: CrewKind,
+        /// The purchased skill (1..=5) — the roster's recorded truth.
+        skill: u8,
         /// Payroll rate, funds/sim-second.
         salary_per_s: f64,
     },
@@ -980,8 +989,13 @@ pub enum SimCommand {
     /// (daylight, allocation, terminator, the first deadlines). The
     /// command carries the whole def verbatim — the log-contained
     /// `SpawnPhysicalVessel`/`craft` pattern, so replays need no def
-    /// table. `Recoverable` rejections: unknown site, no colony env
-    /// for the body, non-finite fields.
+    /// table. C21-F8: founding charges the authored
+    /// `colony_founding_cost_funds` (the "funds ─► facilities"
+    /// arrow — `AbandonColony`'s salvage made a free found a mint)
+    /// and C09-F9: a site hosting a non-`Abandoned` colony refuses —
+    /// re-founding after abandonment is the intended loop.
+    /// `Recoverable` rejections: unknown site, no colony env for the
+    /// body, non-finite fields, site occupied, insufficient funds.
     FoundColony {
         /// The authored colony — site, modules, founding stores.
         def: csp_data::ColonyDef,
@@ -997,7 +1011,9 @@ pub enum SimCommand {
     /// M8-A's crew posting — move an `Unassigned` roster member to
     /// the colony (scales its life-support demand). `Recoverable`:
     /// unknown colony/crew, member not `Unassigned`/`Active`, colony
-    /// not live.
+    /// not live; C09-F4 — while life support is enabled the colony
+    /// must stand a working `LifeSupport` module (an LS-less posting
+    /// would starve on the baseline draw the solve now models).
     AssignCrewToColony {
         /// The colony receiving the member.
         colony: ColonyId,
@@ -1012,11 +1028,13 @@ pub enum SimCommand {
         colony: ColonyId,
     },
     /// M8-A §3.5.1's crash-damage stand-in — mark one module inert
-    /// and drop the colony to `Degraded{ImpactDamage}` (the
-    /// bubble-impact detection hook is M8-B's). `Recoverable`:
-    /// unknown colony/module, already damaged, colony not live.
-    // ui-unreachable: the crash-damage stand-in for tests — M8-B's
-    // detection hook is the real path.
+    /// and drop the colony to `Degraded{ImpactDamage}` (M8-C's
+    /// `apply_surface_impacts` is the real in-play hook — landed;
+    /// every hit posts a `ColonyDamaged` notification, C09-F6).
+    /// `Recoverable`: unknown colony/module, already damaged, colony
+    /// not live.
+    // ui-unreachable: the crash-damage stand-in for tests — the
+    // surface-impact seam is the real path.
     DamageColonyModule {
         /// The colony whose module broke.
         colony: ColonyId,
@@ -5637,8 +5655,9 @@ impl World {
             SimCommand::HireCrew {
                 name,
                 kind,
+                skill,
                 salary_per_s,
-            } => self.apply_hire_crew(name, *kind, *salary_per_s, shadow)?,
+            } => self.apply_hire_crew(name, *kind, *skill, *salary_per_s, shadow)?,
             SimCommand::ContractReward { micros } => self.apply_contract_reward(*micros, shadow)?,
             SimCommand::AcceptContract { offer } => self.apply_accept_contract(*offer, shadow)?,
             SimCommand::DeclineContract { offer } => self.apply_decline_contract(*offer, shadow)?,
@@ -9279,6 +9298,7 @@ impl World {
         h.f64(self.economy_cfg.crew_salary_per_s);
         h.f64(self.economy_cfg.site_upkeep_funds_per_s);
         h.u64(self.economy_cfg.attrition_grace_periods);
+        h.u64(self.economy_cfg.colony_founding_cost_micros);
         economy::hash_economy(&mut h, &self.economy);
         // M7-D: the §2.7 save seed (the offer draw input), the
         // contract tunables, and the §3.6 contract book — offers,
@@ -22116,6 +22136,7 @@ mod tests {
             SimCommand::HireCrew {
                 name: "pilot".into(),
                 kind: CrewKind::Pilot,
+                skill: 1,
                 salary_per_s: 0.0,
             },
         );
@@ -22469,6 +22490,26 @@ mod tests {
         VesselId(0)
     }
 
+    /// C08-F7's roster-side truth — `BoardCrew` seats id-only
+    /// members (no roster row), which `StartResearch` reads at the
+    /// floor skill 1. The lab tests' claims name real skills, so the
+    /// fixture writes the roster rows the cross-check now reads.
+    fn give_skills(w: &mut World, skills: &[(u64, u8)]) {
+        for (id, skill) in skills {
+            w.economy.crew.insert(
+                CrewId(*id),
+                CrewMember {
+                    name: "lab".into(),
+                    kind: CrewKind::Scientist,
+                    skill: *skill,
+                    location: CrewLocation::Vessel(VesselId(0)),
+                    salary_per_s: 0.0,
+                    status: CrewStatus::Active,
+                },
+            );
+        }
+    }
+
     fn run_experiment(w: &mut World, key: &DataKey) -> AdvanceReport {
         w.enqueue(
             SourceClass::Ui,
@@ -22637,6 +22678,9 @@ mod tests {
     fn lab_exhausts_at_predicted_tick() {
         let mut w = science_world();
         science_vessel(&mut w);
+        // C08-F7: the claims below name real skills — the roster
+        // records must carry them (id-only BoardCrew members read 1).
+        give_skills(&mut w, &[(0, 3), (1, 2)]);
         let key = science_key("plains", Situation::SpaceLow);
         run_experiment(&mut w, &key);
         let d0 = w.vessels()[&VesselId(0)].science.units_at(&key);
@@ -22709,6 +22753,9 @@ mod tests {
     fn lab_scarce_regime_exhausts() {
         let mut w = science_world();
         science_vessel(&mut w);
+        // C08-F7: the claims below name real skills — the roster
+        // records must carry them (id-only BoardCrew members read 1).
+        give_skills(&mut w, &[(0, 5)]);
         let key = science_key("plains", Situation::SpaceLow);
         run_experiment(&mut w, &key);
         let d0 = w.vessels()[&VesselId(0)].science.units_at(&key); // 6.32 > T=5…
@@ -22753,6 +22800,9 @@ mod tests {
     fn stop_research_banks_and_returns_data() {
         let mut w = science_world();
         science_vessel(&mut w);
+        // C08-F7: the claims below name real skills — the roster
+        // records must carry them (id-only BoardCrew members read 1).
+        give_skills(&mut w, &[(0, 3)]);
         let key = science_key("plains", Situation::SpaceLow);
         run_experiment(&mut w, &key);
         let d0 = w.vessels()[&VesselId(0)].science.units_at(&key);
@@ -22836,6 +22886,9 @@ mod tests {
             );
         }
         w.step_frame(w.clock().ticks() + 1).unwrap();
+        // C08-F7: the claim names skill 3 — the roster record must
+        // carry it (id-only members read the floor 1).
+        give_skills(&mut w, &[(0, 3)]);
         let key = science_key("plains", Situation::SpaceLow);
         w.enqueue(
             SourceClass::Ui,
@@ -22915,6 +22968,9 @@ mod tests {
     fn recover_vessel_finalizes_live_lab_project() {
         let mut w = science_world();
         science_vessel(&mut w);
+        // C08-F7: the claims below name real skills — the roster
+        // records must carry them (id-only BoardCrew members read 1).
+        give_skills(&mut w, &[(0, 3)]);
         let key = science_key("plains", Situation::SpaceLow);
         run_experiment(&mut w, &key);
         let d0 = w.vessels()[&VesselId(0)].science.units_at(&key);
@@ -23158,6 +23214,9 @@ mod tests {
     fn recover_rejects_while_project_holds_key() {
         let mut w = science_world();
         science_vessel(&mut w);
+        // C08-F7: the claims below name real skills — the roster
+        // records must carry them (id-only BoardCrew members read 1).
+        give_skills(&mut w, &[(0, 3)]);
         let key = science_key("plains", Situation::SpaceLow);
         run_experiment(&mut w, &key);
         w.enqueue(
@@ -23251,6 +23310,9 @@ mod tests {
     fn closed_key_refuses_new_banking() {
         let mut w = science_world();
         science_vessel(&mut w);
+        // C08-F7: the claims below name real skills — the roster
+        // records must carry them (id-only BoardCrew members read 1).
+        give_skills(&mut w, &[(0, 3)]);
         let key = science_key("plains", Situation::SpaceLow);
         run_experiment(&mut w, &key);
         // Land + recover — the key closes.
@@ -23338,6 +23400,9 @@ mod tests {
     fn snapshot_restore_mid_research() {
         let mut w = science_world();
         science_vessel(&mut w);
+        // C08-F7: the claims below name real skills — the roster
+        // records must carry them (id-only BoardCrew members read 1).
+        give_skills(&mut w, &[(0, 3)]);
         let key = science_key("plains", Situation::SpaceLow);
         run_experiment(&mut w, &key);
         w.enqueue(
@@ -23375,6 +23440,79 @@ mod tests {
         r.step_frame(exhaust + 8).unwrap();
         assert_eq!(r.state_hash().unwrap(), w.state_hash().unwrap());
         assert_eq!(r.science_now(), w.science_now());
+    }
+
+    /// C08-F7: `StartResearch` cross-checks the claimed skill against
+    /// the roster record — a claim that inflates a member's skill
+    /// mints lab rate from nothing (previously trusted verbatim).
+    /// The roster row is the truth; id-only `BoardCrew` members read
+    /// as the floor 1 on both sides.
+    #[test]
+    fn start_research_rejects_skill_mismatch() {
+        let mut w = science_world();
+        science_vessel(&mut w);
+        let key = science_key("plains", Situation::SpaceLow);
+        run_experiment(&mut w, &key);
+        // The crew are id-only members → effective skill 1. A claim
+        // of 3 rejects; the honest 1 applies.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::StartResearch {
+                vessel: VesselId(0),
+                lab_node: csp_phys::PartNodeId(0),
+                key: key.clone(),
+                researchers: vec![ResearcherAssign {
+                    crew: CrewId(0),
+                    skill: 3,
+                }],
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(
+            r.rejected.iter().any(
+                |x| matches!(&x.error, SimError::Recoverable(m) if m.contains("roster record"))
+            ),
+            "{:?}",
+            r.rejected
+        );
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::StartResearch {
+                vessel: VesselId(0),
+                lab_node: csp_phys::PartNodeId(0),
+                key,
+                researchers: vec![ResearcherAssign {
+                    crew: CrewId(0),
+                    skill: 1,
+                }],
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        assert_eq!(w.science().projects.len(), 1);
+        // A roster member's recorded skill must be claimed verbatim —
+        // skill 3 recorded, claim 1 understates → same rejection.
+        let mut w = science_world();
+        science_vessel(&mut w);
+        give_skills(&mut w, &[(0, 3)]);
+        run_experiment(&mut w, &science_key("plains", Situation::SpaceLow));
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::StartResearch {
+                vessel: VesselId(0),
+                lab_node: csp_phys::PartNodeId(0),
+                key: science_key("plains", Situation::SpaceLow),
+                researchers: vec![ResearcherAssign {
+                    crew: CrewId(0),
+                    skill: 1,
+                }],
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert_eq!(r.rejected.len(), 1, "{:?}", r.rejected);
     }
 
     /// Hash coverage: a world with collected data, banked science, and

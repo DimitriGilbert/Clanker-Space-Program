@@ -62,7 +62,11 @@ use crate::ids::ResourceId;
 /// before `StaffAttrition` starts retiring crew). Mirrors
 /// `csp_sim::economy::{DEFAULT_HIRE_SALARY_PER_S,
 /// DEFAULT_SITE_UPKEEP_FUNDS_PER_S, DEFAULT_ATTRITION_GRACE_PERIODS}`.
-pub const BALANCE_SCHEMA_VERSION: u32 = 12;
+/// 13 (C21-F8): `colony_founding_cost_funds` — §3.5's "funds ─►
+/// facilities" arrow for `FoundColony` (founding was free while
+/// `AbandonColony` salvaged 25% — an asymmetric mint). Mirror:
+/// `csp_sim::economy::DEFAULT_COLONY_FOUNDING_FUNDS`.
+pub const BALANCE_SCHEMA_VERSION: u32 = 13;
 
 /// `data/balance.ron` — the tunables every later milestone consumes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -278,4 +282,11 @@ pub struct BalanceDef {
     /// and each further consecutive miss retires one member. Mirror:
     /// `csp_sim::economy::DEFAULT_ATTRITION_GRACE_PERIODS`.
     pub attrition_grace_periods: u64,
+    /// C21-F8 §3.5's colony founding charge (funds) — `FoundColony`'s
+    /// debit at apply, the "funds ─► facilities" arrow of the economy
+    /// diagram. Authored starting colonies bypass it (world state,
+    /// not a purchase); `AbandonColony`'s 25% store salvage makes a
+    /// free founding a net mint, which is why the charge exists.
+    /// Mirror: `csp_sim::economy::DEFAULT_COLONY_FOUNDING_FUNDS`.
+    pub colony_founding_cost_funds: f64,
 }
