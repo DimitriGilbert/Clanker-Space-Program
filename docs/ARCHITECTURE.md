@@ -116,15 +116,15 @@ edges are CI-enforced by `cargo run -p xtask -- lint-deps` (`xtask/src/lint_deps
 | **csp-core** | Determinism primitives: integer clock, f64 math, state hasher, RNG KDF, error taxonomy. Depends on nothing below. | `SimTime`, `TICK_HZ`, `DVec3`/`DQuat`, `StateHasher`, `HASH_SCHEMA_VERSION`, `StreamKey`/`StreamTag`/`derive_key`, `SimError`, `RejectKind` (`src/{time,vec3,quat,hash,rng,error}.rs`) | — | 1.9k |
 | **csp-data** | RON schemas + loaders + validators + data-set hash. No sim logic. | `PartDef`/`ModuleDef`, `SystemDef`/`BodyDef`/`KeplerElements`, `TechTree`, `ContractTemplate`, `ExperimentDef`, `RecipeDef`, `SiteDef`, `ColonyDef`, `BalanceDef`, `load_system`/`load_parts`/…, `validate_dataset`, `data_set_hash`, `DATA_HASH_VERSION` (`src/{part,system,techtree,contract,experiment,recipe,site,colony,balance,load,validate,datahash}.rs`) | csp-core | 12.4k (validate.rs alone 6.6k) |
 | **csp-phys** | Vessel physics: weld, contact + integration (`SimpleBackend`), aero tables, thermal, structural breakup, and the editor's craft session model. | `weld()` → `WeldedBody`, `SimpleBackend`, `PhysicsBackend`, `Environment`, `PartGraph`, `EffectivePart`/`resolve_part`, `CraftSession`, `analyze()` → `CraftAnalysis`, `build_aero_tables` (`src/{weld,simple,backend,aero,thermal,structural,resolve,session,readout,graph,merge,hull,tensor,part,profile}.rs`) | csp-core, csp-data | 21.0k |
-| **csp-sim** | The authoritative headless sim. Everything gameplay: tick machine, commands, events, orbits, progression, colonies, reliability, save codec. | `World`, `SimCommand` (52 variants), `CommandKey`, `SourceClass`, `Lease`, `AdvanceReport`, `WorldSnapshot`, `step_frame`, `state_hash`, `snapshot`/`restore`, `SUBSYSTEM_ORDER`; feature modules `orbit, transfer, maneuver, bubble, joints, transfers, research, tech, economy, contracts, colonies, manufacture, life_support, reliability, scripts, events, save` (`src/lib.rs` + 17 modules) | csp-core, csp-data, csp-phys | 50.0k (`lib.rs` 24.5k: ~11.9k code + ~12.6k inline tests) |
+| **csp-sim** | The authoritative headless sim. Everything gameplay: tick machine, commands, events, orbits, progression, colonies, reliability, save codec. | `World`, `SimCommand` (53 variants), `CommandKey`, `SourceClass`, `Lease`, `AdvanceReport`, `WorldSnapshot`, `step_frame`, `state_hash`, `snapshot`/`restore`, `SUBSYSTEM_ORDER`; feature modules `orbit, transfer, maneuver, bubble, joints, transfers, research, tech, economy, contracts, colonies, manufacture, life_support, reliability, scripts, events, save` (`src/lib.rs` + 17 modules) | csp-core, csp-data, csp-phys | 50.0k (`lib.rs` 24.5k: ~11.9k code + ~12.6k inline tests) |
 | **csp-script** | The Rhai guest-language host + the frozen `ControlApi` control surface (kOS-equivalent). | `RhaiHost`, `ControlApi`/`IoControlApi`, `preprocess` (bare `wait` is a compile error), libm-shadowed guest math (`src/lib.rs`) | csp-sim, csp-core, csp-data, csp-phys | 2.0k (+ api_freeze test) |
 | **csp-ai** | Classical automation: the ascent (gravity-turn) autopilot only. No LLM adapter yet. | `AscentAutopilot` (`src/lib.rs`) | csp-sim, csp-script, csp-core | 0.2k |
 | **csp-view** | bevy_ecs presentation world, the six schedules, sim↔render bridge, VAB hosting, map/flight/terrain scenes, Program window staging. The **only** crate allowed to depend on both csp-sim and csp-render. | `View` (+ `View::new`/`new_demo`/`begin_frame`/`sim_step`/`end_frame`), `ViewMode`, `ProgramMirror`, `UiOutbox`, `EguiPass`, `launch_craft`, `recover_control`, `PLAYER_SOURCE_ID`; modules `flight, map, terrain, structures, vab, part_mesh, art, demo, tutorial` (`src/lib.rs`) | csp-core, csp-sim, csp-script, csp-ai, csp-data, csp-ui, csp-render, csp-phys | 21.0k |
 | **csp-render** | wgpu renderer: device/surface lifecycle, terrain/sky/ocean, flight kitbash, map primitives, VAB pass + GPU picking. Must not depend on csp-sim. | `Gpu` (`begin_frame`/`submit`), `TerrainRenderer`, `FlightRenderer`, `MapRenderer`, `VabRenderer`, packet types, `PartLight`, `MSAA_SAMPLES = 4` (`src/{lib,terrain,flight,map,vab}.rs` + WGSL) | csp-core (math only) | 3.0k |
-| **csp-ui** | Pure-egui panels + the settings/keymap model. Never sees bevy_ecs, csp-sim, wgpu, or winit. | `vab::VabSession`/`VabAction`, `program::*` (Program window), `settings::Settings`/`Keymap`/`KeyAction` (21 actions), `game::game_menu`, `navball`, `tutorial`, `flight HUD` (`src/lib.rs`) | csp-phys, csp-data, csp-core | 12.3k (vab.rs 4.9k, program.rs 2.9k) |
+| **csp-ui** | Pure-egui panels + the settings/keymap model. Never sees bevy_ecs, csp-sim, wgpu, or winit. | `vab::VabSession`/`VabAction`, `program::*` (Program window), `settings::Settings`/`Keymap`/`KeyAction` (24 actions), `game::game_menu`, `navball`, `tutorial`, `flight HUD` (`src/lib.rs`) | csp-phys, csp-data, csp-core | 12.3k (vab.rs 4.9k, program.rs 2.9k) |
 | **csp-app** | The binary: winit shell, input dispatch, warp controller, renderers, audio, settings IO, bug reports, wasm entry, `--serve`/`--bug-report` CLIs. **No direct csp-sim dependency** — sim types arrive via `csp-view` re-exports (`Cargo.toml` comment). | `run()`, `wasm_start()`, `App` (private), `WarpController`, `settings_io::*`, `AudioBackend`, `write_bug_report`, `logring` (`src/{lib,warp,audio,synth,settings_io,bugreport,logring,main}.rs`) | csp-core, csp-render, csp-view (+ csp-server on native; csp-ui dev-dep) | 7.9k |
 | **csp-server** | Native-only axum+tokio server: Streamable-HTTP MCP, WS telemetry, static SPA hosting, auth. | `Server`/`ServerConfig`/`run_blocking`, `Mcp` (`PROTOCOL_REVISION = 2026-07-28`, `TOOL_SCHEMA_VERSION = csp.mcp.tools.v1`), `ControlBackend`, `GameHost` (attach to running game), `LocalGame` (headless), `IngressQueue`, `DashboardStore` (`src/{serve,http,mcp,backend,ingress,telemetry,dashboard}.rs`, `PROTOCOL.md`) | csp-core, csp-sim | 6.1k (+ e2e tests) |
-| **csp-bench** | Native-only headless runner: golden replay record/verify, perf budget log, lockstep agent loop, declarative scenarios, economy/contract probes. Bins: `csp-replay`, `csp-perf`, `csp-eval`, `csp-mcp` (stdio MCP over `LocalGame`). | `replay::{record, verify_golden, ARTIFACT_FILES}`, `scenarios` registry, `perf::run_perf_log`, `agent`, `scenario` (`src/*`) | csp-core, csp-data, csp-sim, csp-script, csp-ai, csp-phys, csp-server | 7.7k |
+| **csp-bench** | Native-only headless runner: golden replay record/verify, perf budget log, lockstep agent loop, declarative scenarios, economy/contract probes. Bins: `csp-replay`, `csp-perf`, `csp-eval`, `csp-mcp` (stdio MCP over `LocalGame`). | `replay::{record, verify_golden, ARTIFACT_FILES}`, `scenarios` registry, `perf::run_perf_log`, `agent`, `scenario` (`src/*`) | csp-core, csp-data, csp-sim, csp-script, csp-ai, csp-phys, csp-server | 7.9k |
 | **xtask** | Repo tasks: `lint-deps`, `lint-attribution`, `lint-reach`, `bless-goldens`; bins `bake_art` (.csar art packs from CC0 sources) and `gen_biome_maps`. | `src/main.rs`, `src/{lint_deps,lint_attr,lint_reach}.rs` | csp-bench, serde_json, image, miniz_oxide | 4.2k |
 
 Non-crate workspace members:
@@ -201,7 +201,8 @@ unsettled contact, or in atmosphere) and demotes to rung 0 while it holds (`App:
 ### 4.3 The frame body (§2.5 schedule order)
 
 `View::begin_frame()` → **Input schedule**: `map::apply_map_input`, `vab::apply_vab_input`,
-`flight::apply_flight_input` (`csp-view/src/lib.rs → View::build_schedules` region, ~line 2066).
+`flight::apply_flight_input` (schedules are built inline in the `View` constructor,
+`csp-view/src/lib.rs` ~line 2066).
 These consume resources the app staged (pointer events, key actions) and may enqueue commands.
 
 `View::sim_step(target)` → **one** `SimWorld::step_frame(target)` call (see §5.2), then runs the
@@ -241,8 +242,8 @@ synthesized one-shots and continuous voices (§7.3).
 
 `View::launch_craft` (`csp-view/src/lib.rs`) is the reference end-to-end verb:
 
-1. Recompute the VAB analysis (`CraftSession::recompute`) — a stale cache would pair a fresh graph
-   with another revision's resolved parts.
+1. Recompute the VAB analysis (`csp_ui::VabSession::recompute`, driving `csp_phys::readout::analyze`)
+   — a stale cache would pair a fresh graph with another revision's resolved parts.
 2. Build a `csp_sim::CraftDef` (graph + weld parts + part costs + reliability specs + part ids)
    and the aggregate bill of materials. Empty VAB session → `stock_flight_craft()` fallback.
 3. Refuse pre-flight on: unresolved parts, tech-locked parts (`sim.tech().is_part_unlocked`),
@@ -256,8 +257,11 @@ synthesized one-shots and continuous voices (§7.3).
    event berths it surface-latched on the pad; `csp-sim/src/manufacture.rs`). The stage plan binds
    to the future vessel via `flight::StagePlan::for_launch`.
 
-(The instant free spawn `SimCommand::SpawnPhysicalVessel` still exists but is the MCP/test path —
-its declaration carries a `// ui-unreachable:` marker.)
+(The instant free spawn `SimCommand::SpawnPhysicalVessel` still exists: the player launch path
+issues it only as the fallback when no authored launch site exists (sandbox/test worlds — the
+shipped data set always authors `terrin-launch`), and the wasm demo's LAUNCH button emits it.
+The elements-only `SimCommand::SpawnVessel` is the MCP/test-only variant — *that* declaration
+carries the `// ui-unreachable:` marker.)
 
 ---
 
@@ -386,7 +390,7 @@ a save and re-flying cannot reroll a failure threshold; anti-save-scum by constr
 - **Main thread**: winit event loop, all schedules, `step_frame`, wgpu. The sim is single-threaded
   by construction.
 - **Executors**: `sim_step` and `sync` pin `SingleThreadedExecutor` explicitly (`csp-view/src/lib.rs`,
-  `View::build_schedules`). The other schedules use bevy_ecs's default executor — the
+  View constructor's schedule setup, ~line 2073). The other schedules use bevy_ecs's default executor — the
   `multi_threaded` bevy_ecs feature is enabled **only on native**
   (`[target.'cfg(not(target_arch = "wasm32"))'.dependencies]` in `csp-view/Cargo.toml`), so wasm
   resolves single-threaded (PLAN §2.5).

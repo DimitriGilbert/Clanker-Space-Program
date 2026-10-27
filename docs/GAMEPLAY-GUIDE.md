@@ -202,7 +202,8 @@ the craft and starts the climb. Fly with `Shift/Ctrl` (throttle), `WASD` (pitch/
 ### 4.2 HUD and navball (what the numbers mean)
 
 Left telemetry block (`csp-ui/src/lib.rs: flight_hud`; the block and the navball are **movable
-windows** — drag them anywhere):
+windows** — drag them anywhere; caveat: the readout block must be dragged by its margins, not
+its text, and the navball first opens parked too high — see Known issues):
 
 - **ORBIT**: `AP/PE` osculating apoapsis/periapsis altitudes; `T-AP/T-PE` times to apsis; `T`
   orbital period. `—` while parked or on an open (escape) trajectory.
@@ -214,7 +215,8 @@ windows** — drag them anywhere):
 - **PROP**: throttle bar, per-resource tank gauges, `FLOW` kg/s, `DEP` time to fuel depletion,
   `BURN` full-throttle burn time, `ISP` mass-flow-weighted vacuum Isp, `STG` firings left,
   parts/warp line.
-- **Navball** (bottom-center, `csp-ui/src/navball.rs`): attitude ball with sky/ground, pitch
+- **Navball** (bottom-center by intent — its first-open parking position is mis-placed ~242 px
+  high, a known issue; `csp-ui/src/navball.rs`): attitude ball with sky/ground, pitch
   ladder, compass letters, heading tape, plus **green prograde/retrograde markers** in the
   surface frame (hidden while parked).
 - Top-center **notice stack** (« cues »): engine/stage/impact SFX edges, warp/refusal reasons,
@@ -288,8 +290,12 @@ craft carries one, plus the `z1k` battery to pay transmits).
    **one-shot** (10 data units) and runs only in **Landed / SpaceLow / SpaceHigh** situations
    (situation mask 49, `data/parts/csp.science.canister.ron`); a blocked button says why on
    hover.
-2. **Diminishing repeats**: yield per run is `cap · exp(−k·collected/cap)·units` — run 1 ≈ 63%
-   of the per-key cap, run 2 ≈ 86%, run 3 ≈ 95% (k = 1.0). Caps per body:
+2. **Diminishing repeats**: the sim applies the plan rule's exact integral —
+   `C' = C + (cap − C)·(1 − exp(−k·u/cap))` per run of `u` units (k = 1.0;
+   `research.rs:741–753`). The oft-quoted 63/86/95% sequence holds only for runs of
+   `cap` units; the shipped canister runs `u = 10`, so on Terrin (cap 30) three runs
+   bank ≈28% / ≈49% / ≈64% of the cap cumulative (≈8.5, ≈6.1, ≈4.4 units) — Rask (60)
+   and Duva (90) fill slower still. Caps per body:
    Terrin 30, Rask 60, Duva 90, Solen 50 (space-only) (`data/experiments/`, cap table).
 3. **Transmit vs recover**: `transmit_ratio = 0.4` — transmitting banks **40%** of pooled
    units' value immediately and drains **1 EC per data unit** (`transmit_ec_per_data_unit`);
@@ -307,7 +313,11 @@ craft carries one, plus the `z1k` battery to pay transmits).
 7. **Tutorial coverage**: the first-flight checklist's second tier is exactly this loop —
    "Run a science experiment → Bank the data → Research a tech node"
    (`csp-ui/src/tutorial.rs: STEPS[7..10]`), with predicates on real state (pooled units,
-   banked science, a paid node researched).
+   banked science, a paid node researched). Known defect: the tutorial's rewind check
+   (`tutorial.rs:264–267`, `step > STEP_LAUNCH && !has_vessel`, unscoped) fires when you
+   follow the coached land-and-recover path — recovering the vessel resets the tutorial to
+   the launch step ("vessel lost") and blocks the banking step until you launch again
+   (verified session-full-20261026, report C23 Finding 3).
 
 ---
 
@@ -327,7 +337,7 @@ is wired to a real `SimCommand` — no dead buttons; disabled buttons carry the 
   | Template | Ask | How a player completes it |
   |---|---|---|
   | `contract.survey` | 1 unit of materials-study data from Terrin | Run the canister, transmit or recover (starter-completable) |
-  | `contract.survey.data` | ≥5 units (tech.science.1) | Same, more runs (the cap forces multiple situations/biomes) |
+      | `contract.survey.data` | ≥5 units (tech.science.1 + one completed survey) | A single fresh-key run covers it (≈8.5 units on Terrin); more runs help at drained keys |
   | `contract.satellite` | Closed orbit in a drawn Pe 80–250 km / Ap ≤1500 km band | Put any non-debris vessel's orbit inside the band (`objective_met`) |
   | `contract.part_test` | A named module type in a drawn regime (orbit altitude / landed body) | Fly a craft carrying that module into the regime (bench tests do **not** satisfy it — it reads vessel state) |
   | `contract.rescue` | Recover a vessel on the drawn body | Land + latch + `RecoverVessel` there (transition-keyed) |
@@ -357,7 +367,8 @@ is wired to a real `SimCommand` — no dead buttons; disabled buttons carry the 
 - **RESEARCH** — the 4-node tech tree (`data/techtree/home.ron`: `tech.start` free →
   `tech.science.1` 15⚛ / `tech.rocketry.2` 30⚛ → `tech.rocketry.3` 60⚛) with **research**
   buttons (prereq- and cost-gated), plus the 5 **upgrade tracks** (Sparc Isp ×1.03/level ×4,
-  Sparc thrust, Ember Isp +5 s, small-tank mass −5%, pod MTBF ×1.25) bought level-by-level
+  Sparc thrust, Ember Isp +5/+5/+10 s across its 3 levels, small-tank mass −5%, pod MTBF
+  ×1.25) bought level-by-level
   with **+cost** buttons. Unlocks apply to *newly manufactured* parts only (frozen at build,
   PLAN §3.3 — implemented via `BuiltPart.upgrade_levels_at_build`).
 - **SCIENCE** — the focused vessel's situation context line, experiment rows (run), pooled
@@ -501,19 +512,33 @@ one path) · **HIDDEN** (exists, no player UI) · **MISSING** (absent).
 | # | Complaint | Verdict | Evidence |
 |---|---|---|---|
 | 1 | Science/recovery undiscoverable — no part menus | **FIXED** | Right-click part menu (`part_menu`), always-visible Actions strip (`flight_action_bar`), clickable status strip, tutorial science tier |
-| 2 | UI widgets fixed-position, can't move | **FIXED** | Flight HUD block and navball are movable Areas (`flight_hud`), status strip movable, Game strip drag-anywhere, every panel a standard draggable egui window |
+| 2 | UI widgets fixed-position, can't move | **PARTIALLY FIXED** | Flight HUD block and navball are movable Areas (`flight_hud`), status strip movable, Game strip drag-anywhere, every panel a standard draggable egui window — **but** the readout block cannot be dragged by its own text (the row labels at `csp-ui/src/lib.rs:786–810` are selectable `ui.label`s that win the hit-test over the Area's move widget — drag it by its margins/edges), and the navball Area **parks ~242 px too high on first open** (no `default_size`, `csp-ui/src/lib.rs:1018–1024`; it overlaps the readout block until dragged). Both verified in session-full-20261026 |
 | 3 | Sky grainy on the ground, stars bleed in early | **ADDRESSED IN CODE, visually unverified** | Per-step jittered 12-tap inscatter kills band/grain and a hard `smoothstep(6e-4, 4e-3)` star gate guarantees zero stars under any blue sky (`csp-render/src/terrain.wgsl` ~283–296 and ~1098–1105) |
 | 4 | Warp refuses silently | **FIXED** | `WARP REFUSED — reason` on every gated press + latched `RAILS WARP ×1 — reason` HUD notice + cap/budget notices (`csp-app/src/lib.rs: warp_step_request/on_step_report`) |
 | 5 | Yellow notices unreadable (no bg, wrap to 2 lines), flight data contrast | **FIXED** | Notice stack wears the shared dark chip and lays out single-line (`TextWrapMode::Extend`); the whole telemetry column is chip-backed (`notice_overlay`, `hud_frame`) |
 | 6 | Research/science UI confusing | **PARTIALLY FIXED** | Tutorial teaches the loop; EC cost and latched gates are disclosed on hover; situation context line names body/biome/situation. Residual: it is still one dense Program window — usability beyond this is subjective and open |
+
+### Known issues (verified session-full-20261026)
+
+Live defects confirmed against this tree (verified reports C17/C23):
+
+- **Readout block not draggable by its text** — the flight-HUD row labels are selectable
+  `ui.label`s that win the hit-test over the Area's move widget (`csp-ui/src/lib.rs:786–810`);
+  drag the block by its margins/edges instead.
+- **Navball parks ~242 px too high on first open** (no `default_size`,
+  `csp-ui/src/lib.rs:1018–1024`), overlapping the readout block until dragged.
+- **Tutorial rewinds on its own coached path** — recovering the vessel trips the unscoped
+  `vessel lost` rewind (`csp-ui/src/tutorial.rs:264–267`) and re-blocks the science tier until
+  a new launch (see §5 item 7).
 
 ---
 
 ## 11. Troubleshooting / FAQ
 
 **Why won't warp engage?**
-Read the toast. `WARP REFUSED — VESSEL UNDER THRUST`: cut throttle (X) — a vessel that left the
-bubble keeps a stale throttle until zeroed. `IN ATMOSPHERE`: climb above 70 km or land and
+Read the toast. `WARP REFUSED — VESSEL UNDER THRUST`: cut throttle (X) — only an in-bubble
+vessel can be under thrust (leaving the bubble zeroes it; on rails there is no throttle).
+`IN ATMOSPHERE`: climb above 70 km or land and
 settle (latched craft never block warp). `LIVE CONTACT`: you're touching something. `SCRIPT N
 IS POLLING`: pause or unload it (AUTOMATION). `WARP ALREADY AT ×N — SETTINGS LIMIT`: raise
 *max time warp* in Settings. `WARP LIMITED`: your machine's step budget — it will engage if
@@ -560,7 +585,8 @@ deploy is the opposite: only while flying. Neither works on rails: press **T** f
 
 **My data row says the key is closed.**
 Recovery closes a science key once its full value is banked; further runs at that exact
-(body, biome, situation) key bank almost nothing (63%→86%→95% curve). Change situation
+(body, biome, situation) key yield diminishing amounts (≈28/49/64% of the Terrin cap over
+three 10-unit runs). Change situation
 (landed vs space) or body to open fresh caps.
 
 **Rescue contract won't complete though I'm on the body.**
@@ -584,4 +610,6 @@ Windows): `settings.ron`, `crafts/*.cspcraft`, `saves/*.cspsave`.
 *Verification method: every section above was confirmed against the working tree on
 2026-10-26 by direct read of the cited files (post-`session-prd1` phases 1–2 landed, including
 the formerly-uncommitted csp-app/csp-ui/csp-view changes, now committed). No gameplay was
-executed; purely visual qualities (sky, "feel") are marked unverified where they apply.*
+executed: purely visual qualities (sky, "feel") **and** interaction/feel claims (e.g. widget
+drag behavior) are marked unverified or carried as known issues where direct code read cannot
+settle them.*

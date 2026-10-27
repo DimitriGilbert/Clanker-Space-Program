@@ -75,10 +75,11 @@ There are no cargo feature flags; native-only behavior is `cfg`-gated.
   and refuses unexplained hash changes. Saves are CSPSAVE/CBOR; replay logs are
   bincode — don't swap codecs casually (§7.2).
 - **Where tests go**: sim behavior → inline `#[cfg(test)]` in `csp-sim`
-  (the 24k-line lib.rs already carries ~360); data validation →
-  `csp-data/tests/*`; player-flow e2e → `csp-bench` scenarios/eval suite;
-  server wire behavior → `csp-server/tests/e2e.rs`. No code lands without its
-  test (§8.7).
+  (~200 in the 24k-line lib.rs; ~360 across the crate — the rest live in
+  `colonies.rs`, `orbit.rs`, `transfer.rs`, `contracts.rs`, etc.); data
+  validation → `csp-data/tests/*`; player-flow e2e → `csp-bench` scenarios/eval
+  suite; server wire behavior → `csp-server/tests/e2e.rs`. No code lands
+  without its test (§8.7).
 - **Uncommitted work**: check `git status` before blessing goldens (they refuse
   a dirty tree by design) and before rebasing onto mid-flight work — this repo
   frequently has uncommitted in-progress edits in `csp-app`/`csp-ui`/`csp-view`.
@@ -99,7 +100,10 @@ There are no cargo feature flags; native-only behavior is `cfg`-gated.
   don't hand-edit it — regenerate with `csp-perf`.
 - `apps/demo/dist/` is generated (git-ignored); `data/art/*.csar` is generated
   but **committed** (embedded via `include_bytes!`).
-- The game must run from the repo root (loads `./data`).
+- Prefer running from the repo root: `csp_view::data_root()` probes `./data`
+  first, then falls back to the compile-time manifest-relative repo `data/`
+  (`crates/csp-view/src/lib.rs` ~line 4055), so binaries work from any CWD —
+  but a stray `data/` directory in the CWD wins the probe.
 
 ## Definition of done
 

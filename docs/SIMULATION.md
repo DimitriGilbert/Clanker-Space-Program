@@ -35,10 +35,10 @@ transcendentals only; iteration that affects state is ascending-ID.
 
 | Section | Lines (approx.) | Contents |
 |---|---|---|
-| **A. Command contract + World shell** | 1–3,985 | Crate docs (the §2.6.1/§2.6.2 design essays — read these first); module decls (L58–165); re-exports + the four load-bearing constants (below); `VesselId`/`Vessel` (L281/292 — a vessel is: craft weld inputs, residence `VesselState`, aero mask, thermal record, debris flag, maneuver slot, dock seams, tank contents, crew, science, colony join, reliability, control lease, parachute-deploy record); `SourceClass` (L421: Script=0 < Autopilot=1 < Ui=2 < External=3), `Lease` (L460), `CommandKey` (L505); **`enum SimCommand`** (L534–1216, 53 variants — the whole game-verb surface) + `SimCommand::control_gated_vessel` (L1243, which commands the control lease gates); `AdvanceReport` (L1317); `WorldSnapshot` (L1390); `WorldConfig` (L1560); `TickShadow` (L1703, one-tick rollback capture/restore: `capture` L1827, `merge_committed` L1882, `restore` L2015); `struct World` (L2183); `impl World` shell: constructors `new`/`with_system`/`with_config` (L2480–2495), config installers `set_*` (L2573–2832), **`World::restore`** (L2926), **`check_serializable`** (L3497), **`snapshot`** (L3556), `enqueue` (L3635), `telemetry` (L3670), `rails_warp_refusal` (L3707), shadow helpers (L3759–3831) |
+| **A. Command contract + World shell** | 1–3,985 | Crate docs (the §2.6.1/§2.6.2 design essays — read these first); module decls (L58–165); re-exports + the five load-bearing constants (below); `VesselId`/`Vessel` (L281/292 — a vessel is: craft weld inputs, residence `VesselState`, aero mask, thermal record, debris flag, maneuver slot, dock seams, tank contents, crew, science, colony join, reliability, control lease, parachute-deploy record); `SourceClass` (L421: Script=0 < Autopilot=1 < Ui=2 < External=3), `Lease` (L460), `CommandKey` (L505); **`enum SimCommand`** (L534–1216, 53 variants — the whole game-verb surface) + `SimCommand::control_gated_vessel` (L1243, which commands the control lease gates); `AdvanceReport` (L1317); `WorldSnapshot` (L1390); `WorldConfig` (L1560); `TickShadow` (L1703, one-tick rollback capture/restore: `capture` L1827, `merge_committed` L1882, `restore` L2015); `struct World` (L2183); `impl World` shell: constructors `new`/`with_system`/`with_config` (L2480–2495), config installers `set_*` (L2573–2832), **`World::restore`** (L2926), **`check_serializable`** (L3497), **`snapshot`** (L3556), `enqueue` (L3635), `telemetry` (L3670), `rails_warp_refusal` (L3707), shadow helpers (L3759–3831) |
 | **B. The tick machine** | 3,986–8,753 | **`step_bubble_range`** (L3987, the per-integer-tick physics pass); `finish_burns` L4929; `remove_vessel` L4997; `schedule_debris_decay` L5064; `schedule_event` L5119; `schedule_next_soi` L5171; **`apply_command` dispatch** (L5223) + all `apply_*` handlers (L5527–7547: `check_control_lease`, `apply_take_control`, `apply_terminate_vessel`, `apply_transfer_command`, `apply_set_alarm`, `apply_watch_window`, `apply_unlatch`, `apply_spawn_vessel`, `apply_spawn_physical`, `apply_to_rails`/`apply_to_rails_at`, `resolve_soi_residence`, `apply_to_bubble`, `apply_set_maneuver`, `apply_delete_maneuver`, `fire_maneuver_start`, `ensure_aero`, `apply_install_aero`, `apply_set_aero_config`, `apply_jettison_part`, `apply_deploy_part`, `apply_undock`); **`drain_boundary`/`drain_at`** (L7548/7570 — CommandKey stamping); **`advance_interval_subsystems`** (L7668) + `advance_orbits` (L7740); `control_tick` (L7781) → `run_script_tick`/`run_autopilot_tick` (L7819/7937); script applies + `fire_script_wake` (L7985–8188); **`fire_due_events`** (L8189) / `fire_event` (L8354) / `apply_soi_transition` (L8504); **`World::step_frame`** (L8620); **`state_hash`/`state_hash_masked`** (L8754/8767) |
 | **C. Fuel, tick-IO, restore/breakup/hash walk** | 8,754–11,880 | `Default for World` L8896; `refresh_decel_sites` L8911; the `FuelPlan` propellant machinery (L8950–9268: `propellant_mpu`, `propellant_plans`, `apply_fuel_scales`, `engine_can_draw`, `planned_burn_throttle`, `drive_node_burn` — the maneuver executor); `WakeAction` L9269; **`WorldTickIo`** (L9287, the `TickIo` impl scripts/autopilots see: telemetry, `issue`, `request_wake`, `log_line`); shadow split helpers L9777–9834; the `restore_*` validation family (L9900–10914: transfer/build/science/economy/contract/vessel-contents/colony/reliability/vessel state — `World::restore`'s coherence gates); `hash_craft` L10915; **`transition_latched`** (L11154, bubble→surface-latch); **`apply_breakup`** (L11252, structural/thermal split with momentum conservation); `hash_vessel` L11731 |
-| **D. Inline tests** | 11,881–24,461 | `mod tests` — ~12,600 lines, **199 `#[test]`s**, organized by milestone banners: M0 command-log set (L12027), M1-B event queue + ×1-vs-×10⁵ equivalence (L12445), M2-C physics bubble (L14309), M4b thermal (L16041), M5 maneuver + Duva end-to-end (L17071/17771), M6-B/C/D docking + transfers (L18375/18815/19557), M7-A science (L21246), M9c control-lease `mod m9c` (L23163), `mod fatal_rollback` TickShadow coverage (L23894) |
+| **D. Inline tests** | 11,881–24,461 | `mod tests` — ~12,600 lines, **199 `#[test]`s**, organized by milestone banners: M0 command-log set (L12027), M1-B event queue + ×1-vs-×10⁵ equivalence (L12445), M2-C physics bubble (L14309), M4b thermal (L16041), M5 maneuver + Duva end-to-end (L17071/17771), M6-B/C/D docking + transfers (L18375/18815/19557), M7-A science (L21246), M9c control-lease `mod m9c` (L23164), `mod fatal_rollback` TickShadow coverage (L23901) |
 
 Constants at the top of section A (each mirrors a `data/balance.ron` key for
 data-less worlds; a `csp-bench` test pins the mirror):
@@ -201,9 +201,12 @@ in `csp-view`/`csp-app` (player path) vs `csp-server`'s generic `sim.command` MC
 `SetWarp`, `AdvanceTo` — emitted only by `csp-app`'s `WarpController`
 (`crates/csp-app/src/warp.rs`); warp is a logged command, never a measurement.
 `SetAlarm` — map planning panel (`map.rs:1133–1220`) + Program window.
-`SetLifeSupportEnabled` — issued **once at app startup** with `enabled: true`
-(`csp-app/src/lib.rs:608`); there is no player toggle (the module default is OFF,
-`life_support.rs` module doc).
+`SetLifeSupportEnabled` — issued **once at app startup** with `enabled: true` **only when
+the new-game difficulty flag is set** (`apply_startup_difficulty`, `csp-app/src/lib.rs:604`
+— the flag `life_support_enabled` defaults to **false**, `csp-ui/src/settings.rs:152`).
+There *is* a player toggle: the settings panel's "life support" checkbox under
+"Difficulty (applies to new games)" (`csp-ui/src/settings.rs:810–814`). The sim module
+default is OFF (`life_support.rs` module doc).
 
 ### Science / research
 `RunExperiment`, `TransmitData`, `RecoverData`, `StartResearch`, `StopResearch` —
@@ -215,7 +218,7 @@ all Program-window buttons (`csp-view/src/lib.rs:1015–1231`). `RecoverData` re
 
 ### Economy / crew / recovery
 `RecoverVessel` — Program window + auto-recovery of a pad-occupying parked build at
-launch (`csp-view/src/lib.rs:2976`); credits resource contents at
+launch (`csp-view/src/lib.rs:2974`); credits resource contents at
 `recovery_efficiency` (0.9; 1.0 at launch site per `data/balance.ron`).
 `HireCrew`, `BoardCrew`, `TerminateVessel` — Program window / app key.
 `ContractReward` — **MCP-only** (a raw funds credit; the sim's own contract
@@ -229,9 +232,10 @@ completion pays through the event path, not this command).
 `ScheduleColonyInspection`, `JoinColonyInventory`, `LeaveColonyInventory`,
 `TransferColonyResource`, `TransferColonyCrew` — all Program window
 (`csp-view/src/lib.rs:1121–1188`). `ManufactureCraft` — the **Launch button**
-(`csp-view/src/lib.rs:3020`): pays BOM + funds at apply, delivers a latched craft at
+(`csp-view/src/lib.rs:3018`): pays BOM + funds at apply, delivers a latched craft at
 `ConstructionComplete`. `DamageColonyModule` — **MCP-only** (the sim's own
-vessel-impact detection applies damage internally, `colonies.rs:3924`).
+vessel-impact detection applies damage internally at the impact seam,
+`colonies.rs:1925–1970`).
 
 ### Maneuver / transfer planning
 `SetManeuver`, `DeleteManeuver` — map node editor (`map.rs:1244`,
@@ -260,10 +264,10 @@ install-by-command worker path is never exercised by the game).
 
 Also player-reachable but not SimCommands: save/load/revert ride the **Game menu**
 (session-side, `crates/csp-ui/src/game.rs` → `View::save_game`/`load_game`,
-`csp-view/src/lib.rs:3064/3079`, revert restores the `pre_launch` snapshot taken at
-`csp-view/src/lib.rs:2997` with the §3.4 "revert is not a reroll" disclosure).
+`csp-view/src/lib.rs:3062/3077`, revert restores the `pre_launch` snapshot taken at
+`csp-view/src/lib.rs:2995` with the §3.4 "revert is not a reroll" disclosure).
 
-What scripts may issue (`ControlApi`, `crates/csp-script/src/lib.rs:169–299`):
+What scripts may issue (`ControlApi`, `crates/csp-script/src/lib.rs:89–299` — trait + default impl):
 `SetThrottle`, `SetAttitude`, `JettisonPart`, `SetManeuver`, `DeleteManeuver`,
 `TransferResource`, `SetAlarm`, `DeployPart`, `EngageAutopilot`, `DisengageAutopilot`
 — everything goes through the same queue, stamped `SourceClass::Script`.
@@ -373,9 +377,9 @@ plus per-tick pose-delta limits).
 - **PLAN-vs-code divergence #3 (documented in code):** PLAN §2.9 specifies a
   `RapierBackend` (`rapier3d-f64`) for jointed islands. **No RapierBackend exists**;
   `rapier3d-f64`/`parry3d-f64` are workspace-declared but unused by any crate
-  (`crates/csp-phys/src/backend.rs:29-31`). Soft-capture joints are solved inside
+  (`crates/csp-phys/src/backend.rs` module doc, ~L19–22). Soft-capture joints are solved inside
   `SimpleBackend`'s PGS velocity pass — the deviation is documented at
-  `crates/csp-sim/src/joints.rs:14-18`.
+  `crates/csp-sim/src/joints.rs:12-18`.
 
 **Thermal** (`thermal.rs`): one lumped node per part; conduction across attach edges,
 convective reentry heating `½ρ|v|³·A_eff` off the aero tables (shielded parts take no
@@ -539,12 +543,15 @@ slot. **Player-reachable**: this IS the Launch button (`csp-view/src/lib.rs:3020
 the old free-instant spawn survives only as the site-less sandbox fallback.
 `manufacture_rate_kg_per_s = 50.0` (`data/balance.ron`).
 
-**Life support** (`life_support.rs`): per-save toggle (default OFF;
-`csp-app` enables at startup), `LifeSupportCheck` (Silent) per
+**Life support** (`life_support.rs`): per-save toggle (sim default OFF; `csp-app`
+issues `SetLifeSupportEnabled{true}` at startup **only when the new-game difficulty
+flag `life_support_enabled` is set** — default OFF, `csp-ui/src/settings.rs:152`;
+the settings panel exposes the checkbox under "Difficulty (applies to new games)",
+`csp-ui/src/settings.rs:810–814`), `LifeSupportCheck` (Silent) per
 `check_period_ticks` debits `rate·period` per crew member from tank contents;
 shortfalls schedule `VesselLifeSupportDepleted` (Clamping) one tick out, which marks
 crew `Lost` after re-checking. A `tank.life.s` part exists.
-**Player-reachable**: behavior only (no toggle UI).
+**Player-reachable**: behavior + the settings-panel toggle (new games only).
 
 **Reliability** (`reliability.rs`): `λ(t) = λ_base·Π(stress)·qual_factor` operating,
 `λ_base·dormant_stress·scale` dormant; Λ accrues; failure at pre-drawn
@@ -599,7 +606,10 @@ DEFLATE(CBOR body)`. Header records `save_version`, `game_version`,
 `hash_schema_version`, `kdf_version`, `data_hash_version`, `data_set_hash`, label,
 codecs, and `body_len` (truncation guard). `save_version` selects a frozen schema;
 v1 bodies are **not loadable** (the v1 schema drifted with live types — documented
-in the module table); v2 is current. Pre-1.0 policy: a bump may invalidate saves;
+in the module table). **v3 is current** (`SAVE_VERSION_CURRENT = 3`, `save.rs:92`);
+v3 shares v2's body schema — the bump marks the `WeldPart::engine` payload change
+the v2 stamp missed — and v2 is the oldest loadable (`SAVE_VERSION_MIN = 2`).
+Pre-1.0 policy: a bump may invalidate saves;
 migration chains begin at the first public build. Replays stay bincode and are never
 migrated.
 
@@ -664,7 +674,7 @@ fixture hash). Scenarios today: `trivial`, `flight-launch`.
    computed by stepping is a bug under rails warp.
 10. **`step_frame` never panics in release**; `Fatal` rolls the whole iteration back
     via `TickShadow` (coverage is itself tested — `mod fatal_rollback`, lib.rs
-    L23894). Rejected commands and degraded events roll back completely and report.
+    L23901). Rejected commands and degraded events roll back completely and report.
 11. **Commands are absolute, never relative** (`SetThrottle(f64)`, never
     `AdjustThrottle(Δ)`) — rate-based input is integrated app-side against
     `ticks_consumed` first.

@@ -49,7 +49,7 @@ cargo run --release -p csp-app --bin csp # release build (see perf note below)
   a `cdylib` for wasm.
 - **Run from the repo root**: startup loads the shipping `data/` tree.
   `csp_view::data_root()` resolves `./data` when it exists, else falls back to a
-  manifest-relative path (`crates/csp-view/src/lib.rs` ~line 4034), so tools work
+  manifest-relative path (`crates/csp-view/src/lib.rs` ~line 4055), so tools work
   from any CWD — but prefer the repo root. A missing/corrupt tree aborts startup
   loudly ("data/ startup load failed").
 - **Debug vs release**: perf budgets in `PLAN.md §5.3` are release numbers, and
@@ -79,7 +79,7 @@ Static `#[test]`/`#[tokio::test]` counts (counted 2026-10-26; treat as ~):
 | csp-sim | 363 | — | all inline in the 24.5k-line `crates/csp-sim/src/lib.rs` (`mod tests` ≈ half the file) + per-module inline tests across `orbit.rs`, `colonies.rs`, etc. |
 | csp-phys | 157 | 14 | `tests/resolve_parts.rs`, `tests/session.rs` |
 | csp-data | 81 | 40 | `tests/`: balance, colonies, contracts, experiments, home_system, parts, techtree, unknown_fields — they run the loader/validator over the real `data/` tree |
-| csp-view | 60 | 28 | `tests/`: demo, flight_focus, flight_plume, pad_spawn, part_silhouettes, render_dump_extra, render_gate, stage_plan, startup_colonies, tutorial, vab_latency |
+| csp-view | 60 | 29 | `tests/`: demo, flight_focus, flight_plume, pad_spawn, part_silhouettes, render_dump_extra, render_gate, stage_plan, startup_colonies, tutorial, vab_latency |
 | csp-app | 51 | — | inline only |
 | csp-bench | 53 | 12 | `tests/eval_suite.rs` (spawns the `csp-eval`/`csp-mcp` binaries) |
 | csp-ui | 43 | 2 | `tests/hud_dump.rs` |
@@ -94,7 +94,7 @@ One crate / one test:
 
 ```bash
 cargo test -p csp-sim
-cargo test -p csp-sim advance_to_equivalence   # filter by test-name substring
+cargo test -p csp-sim warp_x1_vs_x1e5_equivalence_10_sim_days   # filter by test-name substring
 cargo test -p csp-view --test render_gate      # one integration-test binary
 ```
 
@@ -219,7 +219,7 @@ Dispatcher: `xtask/src/main.rs` (`main()`, lines 391–406).
 | `cargo run -p xtask -- bless-goldens [--reason "<text>"]` | §8.4 golden regeneration: re-records every registered scenario's `replay.bin`/`expected-hash.txt`/`fingerprint.json`. **Refuses**: dirty tree (`git status --porcelain` non-empty), partial artifact sets, and a changed hash without a `HASH_SCHEMA_VERSION` bump or `--reason`. Bootstrap of a new golden: commit the fixture dir + recipe, then `bless-goldens` or `csp-replay record <name> <dir>` | `xtask/src/main.rs bless_goldens` |
 | `cargo run -p xtask -- build-web` | Package the §6.3 web demo: wasm release build of `csp-app --lib`, `wasm-bindgen --target web` into `apps/demo/dist` (staged, atomic rename; prints the exact manual commands if `wasm-bindgen-cli` is missing) | `xtask/src/main.rs build_web` |
 | `cargo run -p xtask --bin bake_art` | Bake art: `assets/src/` + procedurally-authored part meshes → `data/art/{parts.csar,terrain.csar}` | `xtask/src/bin/bake_art.rs` |
-| `cargo run -p xtask --bin gen_biome_maps [--check]` | Regenerate the authored biome PNGs under `data/systems/home/*/biomes.png`; `--check` verifies the committed files are byte-identical to the program's output (CI-style) | `xtask/src/bin/gen_biome_maps.rs` |
+| `cargo run -p xtask --bin gen_biome_maps [--check]` | Regenerate the authored biome PNGs under `data/systems/home/*/biomes.png`; `--check` verifies the committed files are byte-identical to the program's output (run manually — CI does not invoke it) | `xtask/src/bin/gen_biome_maps.rs` |
 
 ## 7. apps/telemetry and apps/demo
 
@@ -266,8 +266,8 @@ Two generators, both deterministic:
   `assets/src/` changes, then commit the `.csar` files.
 - **`gen_biome_maps`** → `data/systems/home/{terrin,rask,duva}/biomes.png`. The
   committed PNGs must be byte-identical to the program's output — after editing
-  the region rules or a body's `biomes.ron` legend, rerun it (and
-  `--check` in CI style verifies).
+  the region rules or a body's `biomes.ron` legend, rerun it and verify with
+  `--check` (manual; CI does not gate this).
 
 **Hash implications** (`crates/csp-data/src/datahash.rs`): the `data_set_hash`
 covers every file under `data/` **except** `data/test-fixtures/**` (hashed
