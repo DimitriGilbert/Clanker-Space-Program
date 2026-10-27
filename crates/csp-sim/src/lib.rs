@@ -5443,7 +5443,15 @@ impl World {
                 // never act again, so vacate EVERY vessel it controls
                 // back to `Player` rather than stranding a craft under
                 // a dead controller (the `apply_unload_script` rule).
+                // Its pending `ScriptWake` dies with it the same way:
+                // a straggler `Clamping` event would demote warp at a
+                // tick a dead script can never run, and its firing
+                // would strand `wake_tick = Some(t)` against no event
+                // — the pairing shape restore Fatals on (the
+                // `apply_set_life_support(false)` precedent: a disabled
+                // subsystem's scheduled work dies with the flag).
                 if !*enabled {
+                    self.retire_script_wake(*script, shadow);
                     self.vacate_script_lease(*script, shadow);
                 }
             }
@@ -7920,10 +7928,14 @@ impl World {
         // M9c: a disabled script cannot hold a lease — it can never
         // act again, so vacate EVERY vessel it controls back to
         // `Player` rather than stranding a craft under a dead
-        // controller (the `apply_unload_script` rule). This runs last
-        // because `script` borrows the arena until here — the
-        // `&mut self` helper needs the borrow ended.
+        // controller (the `apply_unload_script` rule). Its pending
+        // `ScriptWake` dies with it for the same reason — possibly
+        // armed by the faulting call itself, since the io's wake
+        // write-back lands before the strike bookkeeping. This runs
+        // last because `script` borrows the arena until here — the
+        // `&mut self` helpers need the borrow ended.
         if strike_disabled {
+            self.retire_script_wake(id, shadow);
             self.vacate_script_lease(id, shadow);
         }
         Ok(())
@@ -8075,6 +8087,39 @@ impl World {
         Ok(())
     }
 
+    /// The disable-side half of the strict `wake_tick`↔event pairing:
+    /// a disabled script's pending `ScriptWake` dies with the flag —
+    /// it can never act again, so a straggler `Clamping` event would
+    /// only demote warp at a tick nobody runs, and its firing would
+    /// strand `Some(t)` against no event (the pairing shape restore
+    /// Fatals on). The heap scrub mirrors `apply_unload_script`; the
+    /// clear mirrors `fire_script_wake`'s consumption. Both disable
+    /// paths — `SetScriptEnabled{false}` and the strike limit — run
+    /// this (the `apply_set_life_support(false)` precedent: a disabled
+    /// subsystem's scheduled work dies with it).
+    fn retire_script_wake(&mut self, id: ScriptId, shadow: &mut TickShadow) {
+        let pending = self
+            .event_heap
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::ScriptWake { script } if *script == id));
+        if pending {
+            self.shadow_events_whole(shadow);
+            let kept: Vec<ScheduledEvent> = std::mem::take(&mut self.event_heap)
+                .into_iter()
+                .filter(|e| !matches!(&e.kind, EventKind::ScriptWake { script } if *script == id))
+                .collect();
+            self.event_heap = kept.into_iter().collect();
+        }
+        // Clear the registration even when the heap held nothing — a
+        // `Some(t)` pairing with no event is exactly the shape the
+        // restore gate rejects. Callers already hold the scripts
+        // shadow; the lazy capture costs nothing the second time.
+        self.shadow_scripts(shadow);
+        if let Some(s) = self.scripts.get_mut(&id) {
+            s.wake_tick = None;
+        }
+    }
+
     /// `UnloadScript` apply: drop the record, scrub its pending
     /// `ScriptWake` (the strict pair invariant), release engine
     /// state.
@@ -8108,7 +8153,9 @@ impl World {
     /// script whose vessel has no bubble ticks. Runs the script's
     /// `on_tick` at the event tick when the registration still pairs
     /// (a stale firing — script unloaded, disabled, or re-registered
-    /// — is a tolerated no-op, the `TransferComplete` precedent).
+    /// — is a tolerated no-op, the `TransferComplete` precedent; it
+    /// still retires a stranded `wake_tick` so the strict pairing
+    /// cannot outlive its event).
     ///
     /// Residence rule: the wake only *carries* ticks for vessels
     /// without bubble ticks. A script bound to an `InBubble` vessel
@@ -8129,6 +8176,35 @@ impl World {
             .get(&id)
             .is_some_and(|s| s.enabled && s.wake_tick == Some(tick));
         if !live {
+            // A stale firing still consumed the event —
+            // `fire_due_events` popped it before dispatch. If the
+            // record's `wake_tick` names a tick whose event is now
+            // gone (a script disabled while its wake sat pending —
+            // the shape a pre-scrub save legitimately carried — or a
+            // registration re-pointed without its event), leaving
+            // `Some(t)` behind strands the strict pairing the next
+            // snapshot must pass, and the dead script's stale
+            // `Clamping` surfacing in `fired_events` demotes warp for
+            // a tick nobody runs. Clear only when the named event is
+            // truly gone: a registration whose paired event still sits
+            // in the heap (a re-armed wake whose predecessor popped
+            // first) keeps its pair.
+            let stranded = self
+                .scripts
+                .get(&id)
+                .and_then(|s| s.wake_tick)
+                .is_some_and(|t| {
+                    !self.event_heap.iter().any(|e| {
+                        e.tick == t
+                            && matches!(&e.kind, EventKind::ScriptWake { script } if *script == id)
+                    })
+                });
+            if stranded {
+                self.shadow_scripts(shadow);
+                if let Some(s) = self.scripts.get_mut(&id) {
+                    s.wake_tick = None;
+                }
+            }
             return Ok(());
         }
         self.shadow_scripts(shadow);
@@ -22718,6 +22794,10 @@ mod tests {
             Wake(u64),
             /// First call registers `AtTick(t)`; counts calls.
             WakeAt(u64),
+            /// First call registers `AtTick(t)` AND faults — every
+            /// call faults, so the strike counter climbs while a wake
+            /// stays pending (the strike-disable-with-wake shape).
+            WakeThenFault(u64),
             /// `issue` a `SetAlarm` (residence-agnostic, applies
             /// cleanly for a rails vessel) on every call.
             IssueAlarm,
@@ -22789,6 +22869,16 @@ mod tests {
                         ScriptRunReport {
                             ops_used: 10,
                             fault: None,
+                        }
+                    }
+                    Behavior::WakeThenFault(t) => {
+                        if self.calls.borrow().len() == 1 {
+                            io.request_wake(script.id, &WakeCondition::AtTick(*t))
+                                .unwrap();
+                        }
+                        ScriptRunReport {
+                            ops_used: 5,
+                            fault: Some(ScriptFault::Runtime("boom".to_string())),
                         }
                     }
                     Behavior::IssueAlarm => {
@@ -23336,6 +23426,212 @@ mod tests {
                 calls.borrow().len() > pre,
                 "the re-armed wake must deliver a rails tick"
             );
+        }
+
+        /// C11-F1's poison-save probe: a script that armed
+        /// `AtTick(200)` and is then DISABLED must lose both halves of
+        /// the wake pair — the pending `Clamping` event is scrubbed
+        /// (no warp demotion at a tick a dead script never runs) and
+        /// `wake_tick` clears, so the strict pairing survives into the
+        /// snapshot. The pre-fix sequence left `Some(200)` pairing
+        /// with nothing once the event fired — every later save
+        /// restored `Fatal`.
+        #[test]
+        fn disabled_script_drops_pending_wake() {
+            let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let mut w = World::with_system(test_system());
+            w.set_script_engine(Box::new(StubEngine {
+                behavior: Behavior::WakeAt(200),
+                calls: std::rc::Rc::clone(&calls),
+            }));
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::SpawnVessel {
+                    parent: BodyId::from("p"),
+                    elements: leo_elements(),
+                },
+            );
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::LoadScript {
+                    vessel: VesselId(0),
+                    source: "stub".to_string(),
+                },
+            );
+            // The bootstrap wake delivers the first `on_tick`, which
+            // arms `AtTick(200)` — the probe's armed state.
+            w.step_frame(3).unwrap();
+            assert_eq!(w.scripts()[&ScriptId(0)].wake_tick, Some(200));
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::SetScriptEnabled {
+                    script: ScriptId(0),
+                    enabled: false,
+                },
+            );
+            let mut fired = Vec::new();
+            for t in w.clock().ticks() + 1..=201 {
+                fired.extend(w.step_frame(t).unwrap().fired_events);
+            }
+            let s = &w.scripts()[&ScriptId(0)];
+            assert!(!s.enabled);
+            assert_eq!(
+                s.wake_tick, None,
+                "disabling must retire the wake registration"
+            );
+            assert!(
+                !fired.iter().any(|e| matches!(
+                    &e.kind,
+                    EventKind::ScriptWake { script } if *script == ScriptId(0)
+                )),
+                "a disabled script's pending wake must never fire"
+            );
+            assert!(
+                !w.event_heap.iter().any(|e| matches!(
+                    &e.kind,
+                    EventKind::ScriptWake { script } if *script == ScriptId(0)
+                )),
+                "the pending wake event must be scrubbed"
+            );
+            // The poison-save half: snapshot writes, restore accepts
+            // (the pre-fix shape Fatals on the pairing gap), and the
+            // restored world hashes identically.
+            let hash_before = w.state_hash().unwrap();
+            let snap = w.snapshot().unwrap();
+            let w2 = World::restore(test_system(), None, snap).unwrap();
+            assert_eq!(w2.state_hash().unwrap(), hash_before);
+        }
+
+        /// The strike-disable half of C11-F1: a wake the faulting
+        /// call armed dies with the script the same way — the heap
+        /// scrub and the registration clear run on the auto-disable
+        /// path too. (`FaultEngine` never arms a wake, so this stub
+        /// arms `AtTick(200)` on its first call and faults every call
+        /// to climb the strike counter.)
+        #[test]
+        fn strike_disable_drops_pending_wake() {
+            let (mut w, _calls) = scripted_world(Behavior::WakeThenFault(200));
+            // The tick-1 call armed the wake AND faulted — the io's
+            // wake write-back lands before the strike bookkeeping.
+            assert_eq!(w.scripts()[&ScriptId(0)].wake_tick, Some(200));
+            let mut t = w.clock().ticks();
+            while w.scripts()[&ScriptId(0)].enabled {
+                t += 1;
+                w.step_frame(t).unwrap();
+                assert!(t < 100, "the strike limit must arrive");
+            }
+            let s = &w.scripts()[&ScriptId(0)];
+            assert_eq!(s.strikes, STRIKE_DISABLE_LIMIT);
+            assert_eq!(
+                s.wake_tick, None,
+                "the strike-disable must retire the wake registration"
+            );
+            assert!(
+                !w.event_heap.iter().any(|e| matches!(
+                    &e.kind,
+                    EventKind::ScriptWake { script } if *script == ScriptId(0)
+                )),
+                "the pending wake event must be scrubbed"
+            );
+            let mut fired = Vec::new();
+            for t in w.clock().ticks() + 1..=201 {
+                fired.extend(w.step_frame(t).unwrap().fired_events);
+            }
+            assert!(
+                !fired.iter().any(|e| matches!(
+                    &e.kind,
+                    EventKind::ScriptWake { script } if *script == ScriptId(0)
+                )),
+                "a disabled script's pending wake must never fire"
+            );
+            let hash_before = w.state_hash().unwrap();
+            let snap = w.snapshot().unwrap();
+            let w2 = World::restore(
+                test_system(),
+                Some(PhysicsConfig {
+                    environment: test_env(false),
+                    dominant: BodyId::from("p"),
+                    bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
+                }),
+                snap,
+            )
+            .unwrap();
+            assert_eq!(w2.state_hash().unwrap(), hash_before);
+        }
+
+        /// The firing-side half: a wake registration that survives to
+        /// its event's firing on a DISABLED script — the shape a
+        /// pre-scrub save legitimately carried, restore accepts it —
+        /// must end `None`-paired once the stale firing consumes the
+        /// event, or the next snapshot strands the `Some(t)`/no-event
+        /// shape restore Fatals on.
+        #[test]
+        fn stale_wake_firing_clears_registration() {
+            let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let mut w = World::with_system(test_system());
+            w.set_script_engine(Box::new(StubEngine {
+                behavior: Behavior::Nop,
+                calls: std::rc::Rc::clone(&calls),
+            }));
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::SpawnVessel {
+                    parent: BodyId::from("p"),
+                    elements: leo_elements(),
+                },
+            );
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::LoadScript {
+                    vessel: VesselId(0),
+                    source: "stub".to_string(),
+                },
+            );
+            w.step_frame(3).unwrap(); // the bootstrap on_tick ran
+            // Plant the pre-fix disable shape directly — the same
+            // manual-pair technique `wake_issued_command_stamps_next_tick`
+            // uses: a pending event at 200, the registration naming
+            // it, and the disabled flag the verb would have set.
+            let mut shadow = TickShadow::capture(&w);
+            w.schedule_event(
+                EventKind::ScriptWake {
+                    script: ScriptId(0),
+                },
+                200,
+                &mut shadow,
+            )
+            .unwrap();
+            {
+                let s = w.scripts.get_mut(&ScriptId(0)).unwrap();
+                s.wake_tick = Some(200);
+                s.enabled = false;
+            }
+            let r = w.step_frame(201).unwrap();
+            assert!(
+                r.fired_events.iter().any(|e| matches!(
+                    &e.kind,
+                    EventKind::ScriptWake { script } if *script == ScriptId(0) && e.tick == 200
+                )),
+                "the stale event still fires and surfaces"
+            );
+            assert!(
+                calls.borrow().iter().all(|(_, t)| *t != 200),
+                "a disabled script's wake never runs on_tick"
+            );
+            assert_eq!(
+                w.scripts()[&ScriptId(0)].wake_tick,
+                None,
+                "the consumed firing must clear the registration"
+            );
+            let hash_before = w.state_hash().unwrap();
+            let snap = w.snapshot().unwrap();
+            let w2 = World::restore(test_system(), None, snap).unwrap();
+            assert_eq!(w2.state_hash().unwrap(), hash_before);
         }
     }
     // -------------------------------------------------------------------
