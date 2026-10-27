@@ -185,10 +185,14 @@ pub struct WeldedBody {
 /// applied at the site point, torque about the CoM like a force
 /// site's `r×F`). The world rebuilds the body's site list each tick;
 /// `deployed_at_s` is the sim-time stamp the deploy apply recorded —
-/// `None` while packed. The catch gates (`deploy_alt_m`,
-/// `deploy_speed_mps`) and the `deploy_time_s` inflation ramp are
-/// evaluated per tick by the backend's force accumulation against the
-/// body's own altitude/speed.
+/// `None` while packed; `open_at_s` is the first stamp at which BOTH
+/// catch gates (`deploy_alt_m`, `deploy_speed_mps`) held under flow —
+/// the `deploy_time_s` inflation ramp's anchor, so a deploy-early
+/// command cannot pre-complete inflation before the flow can hold the
+/// canopy (C14-F1). `reef_n` bounds the canopy load the mount was
+/// authored for. Gates and reef are evaluated per tick by the
+/// backend's force accumulation against the body's own altitude,
+/// speed, and density.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DecelSite {
     /// Owning graph node — bookkeeping for the per-part force
@@ -210,6 +214,15 @@ pub struct DecelSite {
     pub deploy_time_s: f64,
     /// Deploy stamp in sim seconds — `None` = packed.
     pub deployed_at_s: Option<f64>,
+    /// First sim second BOTH catch gates held under this deploy —
+    /// `None` until the flow can hold the canopy. The ramp opens from
+    /// here, not from `deployed_at_s`.
+    pub open_at_s: Option<f64>,
+    /// Canopy load bound (N) — the site's reefed ceiling on
+    /// `½·ρ·v²·A_canopy`, derived from the mount's authored
+    /// `StructuralDef` (weakest reachable channel). `f64::INFINITY`-class
+    /// values (an unlimited mount) leave the canopy unreefed.
+    pub reef_n: f64,
 }
 
 impl WeldedBody {

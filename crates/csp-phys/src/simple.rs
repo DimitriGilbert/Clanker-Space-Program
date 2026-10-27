@@ -1426,7 +1426,8 @@ impl SimpleBackend {
                     // site-owning node (the canopy's pull loads its
                     // own attachment).
                     for site in &body.decel {
-                        let area = decel_area_m2(site, alt, speed, self.time_s.get() + PHYSICS_DT);
+                        let area =
+                            decel_area_m2(site, alt, speed, rho, self.time_s.get() + PHYSICS_DT);
                         if area > 0.0 {
                             push(
                                 site.node,
@@ -1583,10 +1584,12 @@ impl SimpleBackend {
                     // always, the deployed Cd·A once the canopy can
                     // catch (below the authored altitude/speed
                     // ceilings), ramping in over `deploy_time_s` from
-                    // the deploy stamp. Applied at the site point —
+                    // the gate-pass stamp and reefed to the mount's
+                    // load rating. Applied at the site point —
                     // a canopy above the CoM weathervanes correctly.
                     for site in &b.decel {
-                        let area = decel_area_m2(site, alt, speed, self.time_s.get() + PHYSICS_DT);
+                        let area =
+                            decel_area_m2(site, alt, speed, rho, self.time_s.get() + PHYSICS_DT);
                         if area > 0.0 {
                             let f_world = v_rel * (-0.5 * rho * area * speed);
                             let r_world = b.rot.rotate(site.local_pos - b.com_local);
@@ -2644,20 +2647,32 @@ impl PhysicsBackend for SimpleBackend {
 /// direction areas replace it at M4a.
 /// §3.1 decelerator catch: the site's effective Cd·A this tick —
 /// packed always, the deployed area ramping in over `deploy_time_s`
-/// from the deploy stamp `deployed_at_s` once the flow can hold the
-/// canopy (below the authored altitude/speed ceilings). Shared by
-/// `accumulate_forces` and `external_loads` so the two channels can
-/// never disagree.
-fn decel_area_m2(site: &DecelSite, alt_m: f64, speed_mps: f64, at_s: f64) -> f64 {
-    match site.deployed_at_s {
+/// once the flow can hold the canopy (below the authored
+/// altitude/speed ceilings). The ramp anchors at `open_at_s` — the
+/// first gate-passing tick, stamped by the world post-step — not at
+/// the deploy command's stamp: a deploy-early command waits out the
+/// ceilings packed instead of arriving fully inflated (C14-F1). The
+/// canopy term is then reefed to the mount's authored load rating —
+/// `area ≤ reef_n / q̄` — so a hard catch pulls at the mount limit
+/// rather than snapping it (the ~2 MN gate-pass load the unbounded
+/// ramp produced vs the s125's 150 kN/60 kN mount). The packed term
+/// is never reefed — the canister's own drag is the mount's honest
+/// load on a hot entry. Shared by `accumulate_forces` and
+/// `external_loads` so the two channels can never disagree.
+fn decel_area_m2(site: &DecelSite, alt_m: f64, speed_mps: f64, rho_kg_m3: f64, at_s: f64) -> f64 {
+    match site.open_at_s {
         Some(t0) if alt_m <= site.deploy_alt_m && speed_mps <= site.deploy_speed_mps => {
             let ramp = if site.deploy_time_s > 0.0 {
                 ((at_s - t0) / site.deploy_time_s).clamp(0.0, 1.0)
             } else {
                 1.0
             };
-            site.packed_drag_area_m2
-                + (site.deployed_drag_area_m2 - site.packed_drag_area_m2) * ramp
+            let mut canopy = (site.deployed_drag_area_m2 - site.packed_drag_area_m2) * ramp;
+            let qbar = 0.5 * rho_kg_m3 * speed_mps * speed_mps;
+            if qbar > 0.0 && site.reef_n.is_finite() {
+                canopy = canopy.min(site.reef_n / qbar).max(0.0);
+            }
+            site.packed_drag_area_m2 + canopy
         }
         _ => site.packed_drag_area_m2,
     }

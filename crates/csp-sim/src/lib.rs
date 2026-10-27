@@ -280,6 +280,24 @@ pub const DEGRADED_RESCAN_TICKS: u64 = MAX_TICKS_PER_FRAME;
 #[serde(transparent)]
 pub struct VesselId(pub u64);
 
+/// §3.1 `Parachute` deploy lifecycle for one node — the record
+/// [`Vessel::deployed`] holds. `deployed_tick` is the apply tick
+/// ([`SimCommand::DeployPart`] armed → deployed); `opened_tick` is the
+/// first tick BOTH catch gates (the spec's altitude/speed ceilings)
+/// held at a post-step flow sample — the inflation ramp's anchor the
+/// body's [`csp_phys::DecelSite::open_at_s`] carries. `None` while
+/// packed or still waiting out the gates: a deploy-early command
+/// records `deployed_tick` and waits, so the inflation ramp cannot
+/// pre-complete above the ceilings (C14-F1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeployRecord {
+    /// The tick [`SimCommand::DeployPart`] applied.
+    pub deployed_tick: u64,
+    /// First post-step tick both catch gates held — `None` until
+    /// the flow can hold the canopy.
+    pub opened_tick: Option<u64>,
+}
+
 /// A vessel — the §2.4 unit of craft. `state` is the residence triple
 /// (§2.6.2): on rails, in the bubble, or surface-latched.
 ///
@@ -379,16 +397,17 @@ pub struct Vessel {
     /// **Hashed and serialized** — it decides future applies, so it is
     /// state like any other gate.
     pub control_lease: Lease,
-    /// The §3.1 `Parachute` deploy record — node → the tick
-    /// [`SimCommand::DeployPart`] flipped it armed → deployed,
-    /// bound to `PartNodeId` so it partitions/merges with the part
-    /// graph exactly like `tank_contents` and `reliability` (§2.4).
-    /// The body's [`csp_phys::DecelSite`]s are refreshed from this
-    /// record every tick (a pure function of `(craft, deployed)`),
-    /// so it survives every re-weld and materialization path for
-    /// free. **Hashed and serialized** sim state. Empty for
-    /// craft-less and never-deployed vessels.
-    pub deployed: BTreeMap<csp_phys::PartNodeId, u64>,
+    /// The §3.1 `Parachute` deploy record — node → its
+    /// [`DeployRecord`] (the `DeployPart` tick plus the first
+    /// gate-passing tick), bound to `PartNodeId` so it
+    /// partitions/merges with the part graph exactly like
+    /// `tank_contents` and `reliability` (§2.4). The body's
+    /// [`csp_phys::DecelSite`]s are refreshed from this record every
+    /// tick (a pure function of `(craft, deployed)`), so it survives
+    /// every re-weld and materialization path for free. **Hashed and
+    /// serialized** sim state. Empty for craft-less and
+    /// never-deployed vessels.
+    pub deployed: BTreeMap<csp_phys::PartNodeId, DeployRecord>,
 }
 
 impl Vessel {
@@ -4421,6 +4440,40 @@ impl World {
                         failures.entry(vid).or_default().0 = failed;
                     }
                 }
+                // §3.1 `Parachute` (C14-F1): stamp `opened_tick` — the
+                // first tick each deployed canopy's catch gates hold —
+                // the inflation ramp's anchor `refresh_decel_sites`
+                // copies into `open_at_s` next tick. A deploy-early
+                // command CANNOT pre-complete the ramp parked above
+                // the ceilings: the canopy starts inflating only when
+                // the flow can hold it. Post-step flow read, the same
+                // altitude datum and co-rotating `v_rel`
+                // `accumulate_forces`/`external_loads` use (the `rho >
+                // 0` precondition included — gates can't "pass" in
+                // vacuum). Stamping in the write-back order (ascending
+                // vessel, `body.decel` in ascending-node order) keeps
+                // it deterministic.
+                if !body.decel.is_empty()
+                    && let Some(atm) = &env.atmosphere
+                {
+                    let rel = body.com_world() - env.body_center;
+                    let alt = rel.norm() - env.radius_m;
+                    if alt < atm.top_m && csp_phys::atmosphere_density_kg_m3(atm, alt) > 0.0 {
+                        let speed = (body.vel - env.body_spin.cross(rel)).norm();
+                        for site in &body.decel {
+                            if site.deployed_at_s.is_none()
+                                || !(alt <= site.deploy_alt_m && speed <= site.deploy_speed_mps)
+                            {
+                                continue;
+                            }
+                            if let Some(rec) = vessel.deployed.get_mut(&site.node)
+                                && rec.opened_tick.is_none()
+                            {
+                                rec.opened_tick = Some(t);
+                            }
+                        }
+                    }
+                }
                 // M4b: the per-part lumped thermal tick — sampled
                 // post-step, so `flow_sample` reads the *end-of-tick*
                 // state, O(dt) off the flow the force model actually
@@ -7371,8 +7424,10 @@ impl World {
     /// `DeployPart` — flip one decelerator node armed → deployed.
     /// `InBubble` only in v1 (the `JettisonPart` convention); the
     /// site's additive drag activates from the next tick through the
-    /// per-tick [`refresh_decel_sites`] pass, gated by the spec's
-    /// altitude/speed ceilings in the force accumulation.
+    /// per-tick [`refresh_decel_sites`] pass — packed until the
+    /// spec's altitude/speed ceilings pass (the record's
+    /// `opened_tick`, stamped at gate-crossing, anchors the
+    /// inflation ramp), then reefed to the mount's load rating.
     fn apply_deploy_part(
         &mut self,
         vessel: VesselId,
@@ -7416,7 +7471,16 @@ impl World {
             .get_mut(&vessel)
             .ok_or(SimError::Fatal("deploy: vessel vanished"))?
             .deployed
-            .insert(node, tick);
+            .insert(
+                node,
+                DeployRecord {
+                    deployed_tick: tick,
+                    // The catch gates stamp `opened_tick` post-step;
+                    // until both hold the canopy stays packed and the
+                    // inflation ramp has no anchor.
+                    opened_tick: None,
+                },
+            );
         Ok(())
     }
 
@@ -7596,11 +7660,11 @@ impl World {
         // §3.1 `Parachute`: deploy records partition by node
         // membership like the tanks — a deployed canopy on the
         // detached subtree rides with it.
-        let frag_deployed: BTreeMap<csp_phys::PartNodeId, u64> = v
+        let frag_deployed: BTreeMap<csp_phys::PartNodeId, DeployRecord> = v
             .deployed
             .iter()
             .filter(|(k, _)| frag_nodes.contains(k))
-            .map(|(k, t)| (*k, *t))
+            .map(|(k, r)| (*k, *r))
             .collect();
         v.deployed.retain(|id, _| !frag_nodes.contains(id));
         // M7-A: the keyed data pool and spent marks partition by node
@@ -9138,7 +9202,9 @@ impl Default for World {
 /// §3.1 `Parachute` decelerator sites: refresh `body.decel` from the
 /// craft's resolved [`csp_phys::ParachuteSpec`]s and the vessel's
 /// deployed record — one site per parachute-carrying node, with the
-/// deploy stamp converted to sim seconds. Recomputed wholesale every
+/// deploy/open ticks converted to sim seconds and the canopy reef
+/// bound derived from the node's authored `StructuralDef`.
+/// Recomputed wholesale every
 /// tick (a pure function of `(craft, deployed)`), so every body
 /// mutation path — spawn, restore, `to_bubble`, unlatch, jettison,
 /// breakup, undock, latch merge, and the mass-bucket re-weld — sees
@@ -9147,7 +9213,7 @@ impl Default for World {
 fn refresh_decel_sites(
     body: &mut WeldedBody,
     craft: &CraftDef,
-    deployed: &BTreeMap<csp_phys::PartNodeId, u64>,
+    deployed: &BTreeMap<csp_phys::PartNodeId, DeployRecord>,
 ) {
     body.decel.clear();
     if !craft.parts.iter().any(|p| p.parachute.is_some()) {
@@ -9166,18 +9232,48 @@ fn refresh_decel_sites(
         let Some(spec) = &ep.parachute else {
             continue;
         };
+        let local_pos = transforms[id].apply(ep.com);
+        // The mount rates the canopy: bound the site's pull to the
+        // weakest joint channel the `failed_joints` eval can see —
+        // the axial and shear caps bound the force's components
+        // outright, and the torque cap binds through the site→joint
+        // lever (its `p_j` convention: the node origin). REEF_MARGIN
+        // leaves the joint eval's inertia/weight addends (~the part's
+        // own mass under canopy decel) their headroom, so a reefed
+        // canopy holds at the bound instead of riding the strict->
+        // threshold. An `unlimited()` mount yields a huge bound —
+        // effectively unreefed.
+        let lever_m = (local_pos - transforms[id].offset).norm();
+        let s = &ep.structural;
+        let mut reef_n = s.max_axial_n.min(s.max_shear_n);
+        if lever_m > 0.0 {
+            reef_n = reef_n.min(s.max_torque_nm / lever_m);
+        }
+        reef_n *= DECEL_REEF_MARGIN;
+        let rec = deployed.get(id);
         body.decel.push(csp_phys::DecelSite {
             node: *id,
-            local_pos: transforms[id].apply(ep.com),
+            local_pos,
             packed_drag_area_m2: spec.packed_drag_area_m2,
             deployed_drag_area_m2: spec.deployed_drag_area_m2,
             deploy_alt_m: spec.deploy_alt_m,
             deploy_speed_mps: spec.deploy_speed_mps,
             deploy_time_s: spec.deploy_time_s,
-            deployed_at_s: deployed.get(id).map(|t| SimTime::from_ticks(*t).seconds()),
+            deployed_at_s: rec.map(|r| SimTime::from_ticks(r.deployed_tick).seconds()),
+            open_at_s: rec
+                .and_then(|r| r.opened_tick)
+                .map(|t| SimTime::from_ticks(t).seconds()),
+            reef_n,
         });
     }
 }
+
+/// §3.1 decelerator reef derate (C14-F1): the canopy's effective
+/// area is clamped to `reef_n / q̄` where `reef_n` is this fraction
+/// of the weakest mount channel — a working-load derate so the
+/// joint eval's inertia/weight addends on top of the bounded canopy
+/// force cannot push a channel over its authored limit.
+const DECEL_REEF_MARGIN: f64 = 0.9;
 
 /// One engine node's fuel plan for the tick — the propellant
 /// bookkeeping the bubble step consumes. `needs` is the per-resource
@@ -11788,7 +11884,7 @@ fn apply_breakup(
                 deployed: v_deployed
                     .iter()
                     .filter(|(k, _)| frag_nodes.contains(k))
-                    .map(|(k, t)| (*k, *t))
+                    .map(|(k, r)| (*k, *r))
                     .collect(),
                 // A splitting fragment leaves the colony opt-in
                 // with the retained hull — it re-joins explicitly
@@ -12076,14 +12172,18 @@ fn hash_vessel(h: &mut StateHasher, vessel: &Vessel) {
     reliability::hash_vessel_reliability(h, &vessel.reliability);
     // §3.1 `Parachute`: the deploy record — it decides the per-tick
     // decel sites like `throttle` decides thrust, so it is hashed
-    // state (§7.1's completeness rule).
+    // state (§7.1's completeness rule). `opened_tick` is hashed too:
+    // it anchors the inflation ramp, so it decides future forces.
     h.btree_map(
         &vessel.deployed,
         |h, id| {
             h.u64(id.0);
         },
-        |h, t| {
-            h.u64(*t);
+        |h, r| {
+            h.u64(r.deployed_tick);
+            h.opt(&r.opened_tick, |h, t| {
+                h.u64(*t);
+            });
         },
     );
     // M9c: the control lease — it decides which commands apply, so it
@@ -15056,7 +15156,11 @@ mod tests {
     /// diverge measurably.
     /// §3.1 `Parachute` craft: a pod root (1 000 kg box) plus a
     /// chute node (55 kg, resolved deploy spec) stacked above it —
-    /// the canopy pull trails the flow once deployed.
+    /// the canopy pull trails the flow once deployed. Both parts
+    /// carry the shipped parts' authored structural limits
+    /// (csp.pod.mk1 / csp.chute.s125) so the canopy-vs-mount checks
+    /// are exercised — the unlimited-def fixture masked the C14-F1
+    /// gate-pass tear.
     fn chute_craft() -> CraftDef {
         let (pod, chute) = (csp_phys::PartNodeId(1), csp_phys::PartNodeId(2));
         let mut graph = csp_phys::PartGraph::new(pod);
@@ -15086,7 +15190,14 @@ mod tests {
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
-            structural: csp_data::StructuralDef::unlimited(),
+            // csp.pod.mk1's authored mount limits (the pod is the
+            // root here, so no joint eval reaches them — recorded
+            // for honesty, not for the check).
+            structural: csp_data::StructuralDef {
+                max_axial_n: 500_000.0,
+                max_shear_n: 200_000.0,
+                max_torque_nm: 30_000.0,
+            },
             mass_kg: 1_000.0,
             com: DVec3::ZERO,
             inertia: csp_phys::SymMat3::solid_box(1_000.0, DVec3::new(0.5, 0.5, 0.5)),
@@ -15111,7 +15222,13 @@ mod tests {
             dock_ports: vec![],
             tanks: vec![],
             crew_seats: 0,
-            structural: csp_data::StructuralDef::unlimited(),
+            // csp.chute.s125's authored mount limits — the canopy
+            // reef bound and the joint eval read these.
+            structural: csp_data::StructuralDef {
+                max_axial_n: 150_000.0,
+                max_shear_n: 60_000.0,
+                max_torque_nm: 8_000.0,
+            },
             mass_kg: 55.0,
             com: DVec3::ZERO,
             inertia: csp_phys::SymMat3::solid_box(55.0, DVec3::new(0.25, 0.2, 0.2)),
@@ -15170,13 +15287,28 @@ mod tests {
         // ~45 s of canopy braking: from −80 m/s to well under 30 —
         // the undeployed craft would still be at ~150 m/s here.
         w.step_frame(w.clock().ticks() + 2_880).unwrap();
-        let body = w.vessels()[&VesselId(0)].body().unwrap();
+        let v = &w.vessels()[&VesselId(0)];
+        // The gates already held at spawn (1 km, 80 m/s — under both
+        // ceilings), so the gate-pass stamp landed and the site's
+        // ramp anchor flowed into `body.decel`.
+        let rec = v.deployed.get(&csp_phys::PartNodeId(2)).unwrap();
+        assert!(
+            rec.opened_tick.is_some(),
+            "gates held from the start: opened_tick must be stamped"
+        );
+        assert!(
+            v.body().unwrap().decel[0].open_at_s.is_some(),
+            "the decel site must carry the gate-pass anchor"
+        );
+        let body = v.body().unwrap();
         assert!(
             body.vel.norm() < 40.0,
             "canopy deceleration: |v| = {}",
             body.vel.norm()
         );
-        // It must then land and latch — intact (both nodes retained).
+        // It must then land and latch — intact (both nodes retained):
+        // the authored s125 mount (150 kN axial / 60 kN shear) is
+        // never exceeded because the canopy reefs to it.
         let mut latched = false;
         for _ in 0..40 {
             w.step_frame(w.clock().ticks() + 1_000).unwrap();
@@ -15192,6 +15324,195 @@ mod tests {
         assert!(latched, "deployed pod never settled to SurfaceLatched");
         let v = &w.vessels()[&VesselId(0)];
         assert_eq!(v.craft.as_ref().unwrap().graph.nodes.len(), 2);
+    }
+
+    /// C14-F1: a deploy-early command must NOT pre-complete the
+    /// inflation ramp — the ramp anchors at the first tick both catch
+    /// gates hold, not at the deploy stamp. Spawned at 12 km on a
+    /// −400 m/s descent (above the 6 km altitude ceiling AND above
+    /// the 260 m/s speed ceiling), deployed immediately: `opened_tick`
+    /// must stay unset while either gate fails, stamp exactly the
+    /// first gate-passing tick, and the canopy must ramp in over
+    /// `deploy_time_s` — not arrive at 120 m² in one tick. With the
+    /// authored mount limits the reefed canopy then decelerates the
+    /// craft to an intact latch (the profile the unbounded ramp
+    /// destroyed).
+    #[test]
+    fn deploy_early_chute_anchors_inflation_at_gate_pass() {
+        let mut w = physics_world(false); // no spin — v_rel == v
+        let pos = DVec3::new(TERRIN_R + 12_000.0, 0.0, 0.0);
+        spawn_physical(
+            &mut w,
+            SimCommand::SpawnPhysicalVessel {
+                craft: chute_craft(),
+                pos,
+                rot: csp_core::DQuat::IDENTITY,
+                vel: DVec3::new(-400.0, 0.0, 0.0),
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::DeployPart {
+                vessel: VesselId(0),
+                node: csp_phys::PartNodeId(2),
+            },
+        );
+        let node = csp_phys::PartNodeId(2);
+        let mut gate_tick = None;
+        let mut prev_speed = f64::INFINITY;
+        // Tick-by-tick so the first gate-passing tick is identified
+        // exactly; the stamp is written during that tick's post-step
+        // write-back, so an observation at clock `c` reports the pose
+        // for `c`'s predecessor `c - 1`.
+        for _ in 0..20_000 {
+            w.step_frame(w.clock().ticks() + 1).unwrap();
+            let v = &w.vessels()[&VesselId(0)];
+            let VesselState::InBubble(body) = &v.state else {
+                panic!("the pod must stay physics-resident")
+            };
+            let alt = body.com_world().norm() - TERRIN_R;
+            let speed = body.vel.norm();
+            let gates_hold = alt <= 6_000.0 && speed <= 260.0;
+            let opened = v.deployed.get(&node).and_then(|r| r.opened_tick);
+            if let Some(t) = gate_tick {
+                // The first canopy-active tick is the step after the
+                // stamp landed (the stamp is post-step, the site's
+                // `open_at_s` flows in on the next refresh). The
+                // unbounded-ramp tick dropped |v| by ~30 m/s at this
+                // gate corner; the ramped, reefed catch moves well
+                // under 3 m/s.
+                if w.clock().ticks() == t + 1 {
+                    assert!(
+                        prev_speed - speed < 3.0,
+                        "the first canopy tick must not be a snap: Δ|v| = {}",
+                        prev_speed - speed
+                    );
+                }
+            } else if opened.is_some() {
+                // The stamp must name the tick the gates first held —
+                // the tick that just completed, never the deploy
+                // command's tick.
+                assert_eq!(
+                    opened,
+                    Some(w.clock().ticks() - 1),
+                    "opened_tick must anchor at gate-pass, not the deploy stamp"
+                );
+                gate_tick = Some(w.clock().ticks());
+            } else {
+                assert!(
+                    !gates_hold,
+                    "gates held at alt {alt:.0} m / {speed:.1} m/s but opened_tick stayed unset"
+                );
+                // While the gates fail the site must still sit packed
+                // — the deploy stamp alone cannot open it.
+                assert!(body.decel[0].open_at_s.is_none());
+            }
+            prev_speed = speed;
+            if gate_tick.is_some() && speed < 30.0 {
+                break;
+            }
+        }
+        assert!(gate_tick.is_some(), "the descent must cross the gates");
+        // The reefed canopy then flies it to an intact latch.
+        let mut latched = false;
+        for _ in 0..60 {
+            w.step_frame(w.clock().ticks() + 1_000).unwrap();
+            match &w.vessels()[&VesselId(0)].state {
+                VesselState::SurfaceLatched(_) => {
+                    latched = true;
+                    break;
+                }
+                VesselState::InBubble(_) => {}
+                _ => panic!("chute'd pod must not leave the bubble"),
+            }
+        }
+        assert!(
+            latched,
+            "reefed canopy must still land the deploy-early pod"
+        );
+        assert_eq!(
+            w.vessels()[&VesselId(0)]
+                .craft
+                .as_ref()
+                .unwrap()
+                .graph
+                .nodes
+                .len(),
+            2,
+            "the authored s125 mount must survive its own canopy"
+        );
+    }
+
+    /// C14-F1's companion: the mount limits are real — a hot entry
+    /// still kills the chute. Spawned INSIDE the altitude ceiling but
+    /// far above the speed ceiling (4 km, −1 600 m/s): the speed gate
+    /// keeps the canopy packed, but the packed site's own drag plus
+    /// the part's aero load at ~0.8 MPa dynamic pressure exceed the
+    /// authored mount — the joint eval fails it and the chute leaves
+    /// the craft as breakup debris. `opened_tick` never stamps: the
+    /// canopy never caught.
+    #[test]
+    fn deployed_chute_tears_on_hot_entry() {
+        let mut w = physics_world(false); // no spin — v_rel == v
+        let pos = DVec3::new(TERRIN_R + 4_000.0, 0.0, 0.0);
+        spawn_physical(
+            &mut w,
+            SimCommand::SpawnPhysicalVessel {
+                craft: chute_craft(),
+                pos,
+                rot: csp_core::DQuat::IDENTITY,
+                vel: DVec3::new(-1_600.0, 0.0, 0.0),
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::DeployPart {
+                vessel: VesselId(0),
+                node: csp_phys::PartNodeId(2),
+            },
+        );
+        let node = csp_phys::PartNodeId(2);
+        let mut torn = false;
+        for _ in 0..640 {
+            w.step_frame(w.clock().ticks() + 1).unwrap();
+            let Some(v) = w.vessels().get(&VesselId(0)) else {
+                break;
+            };
+            if !v
+                .craft
+                .as_ref()
+                .is_some_and(|c| c.graph.nodes.contains_key(&node))
+            {
+                torn = true;
+                break;
+            }
+        }
+        assert!(torn, "a hot entry must tear the chute off its mount");
+        // The canopy never caught — the speed gate held it packed —
+        // so no fragment's deploy record may carry an open stamp;
+        // and the pod root survives on the retained vessel.
+        assert!(
+            w.vessels()
+                .values()
+                .flat_map(|v| v.deployed.values())
+                .all(|r| r.opened_tick.is_none()),
+            "a torn canopy must never have opened"
+        );
+        assert_eq!(
+            w.vessels()[&VesselId(0)]
+                .craft
+                .as_ref()
+                .unwrap()
+                .graph
+                .nodes
+                .len(),
+            1,
+            "the retained hull is the pod alone"
+        );
     }
 
     /// `DeployPart` refusals: unknown node, a node with no decelerator
