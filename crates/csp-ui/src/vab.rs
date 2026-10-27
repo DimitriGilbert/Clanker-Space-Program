@@ -2272,6 +2272,20 @@ pub fn vab_editor(
     panels
 }
 
+/// Pointer travel (physical px) past which a press stops being a
+/// click — mirrored from `CLICK_MAX_DRAG_PX` in `csp-app/src/lib.rs`,
+/// which keeps its own copy (csp-ui cannot depend on csp-app). The
+/// app suppresses its GPU pick for any release that travelled further
+/// than this, so it is also the armed-drag promotion threshold, and
+/// the two MUST stay equal: a wider promotion threshold leaves a dead
+/// band where the pick is suppressed but the arm never promotes (the
+/// C17-F2 residual — an armed 4–6 px drag did nothing), and a
+/// narrower one double-resolves a borderline drag (the promoted
+/// `Drop` AND the pick's `Select`-attach). Deliberately NOT egui's
+/// `max_click_dist` (6 pt — 6 px at 1× ppp, 12 px at 2×), which is
+/// wider than the pick boundary.
+const ARMED_DRAG_PROMOTE_PX: f32 = 4.0;
+
 /// The pointer/hotkey half of the editor pass — the host calls it
 /// LAST inside the egui pass so `masks` can carry the rect of every
 /// floating window drawn this frame: the editor's own panels AND the
@@ -2344,19 +2358,23 @@ pub fn vab_pointer_input(
                 || (i.key_pressed(egui::Key::Y) && i.modifiers.command),
         )
     });
-    // REAL pointer travel past egui's click threshold — `deciding`
-    // alone also flips true on a motionless 0.8 s hold, which must
-    // not count as a drag here: a hold-still release still resolves
-    // as a click through the app's GPU pick, and promoting the arm
-    // would double-resolve the gesture (this `Drop` AND that pick).
+    let ppp = ctx.pixels_per_point();
+    // REAL pointer travel past the app's click/drag boundary —
+    // `deciding` alone also flips true on a motionless 0.8 s hold,
+    // which must not count as a drag here: a hold-still release still
+    // resolves as a click through the app's GPU pick, and promoting
+    // the arm would double-resolve the gesture (this `Drop` AND that
+    // pick). Travel is measured in physical px (`ppp` scales the
+    // egui-point distance) against `ARMED_DRAG_PROMOTE_PX` — the same
+    // boundary the app uses to suppress that pick, so every release
+    // the app refuses to pick is one the promotion/lift covers.
     let drag_travel = pos
         .zip(press_origin)
-        .is_some_and(|(p, o)| p.distance(o) > ctx.options(|o| o.input_options.max_click_dist));
+        .is_some_and(|(p, o)| p.distance(o) * ppp > ARMED_DRAG_PROMOTE_PX);
     // C14-F1: gate the hotkeys on TEXT-EDIT focus, never `InputState::focused`
     // (native window focus — true during all normal play, which dead-keyed
     // Del/Esc/X). Only a field actually taking typed text may hide them.
     let typing = ctx.text_edit_focused();
-    let ppp = ctx.pixels_per_point();
     // The viewport is the content rect minus every masked window rect —
     // the mask list is geometric because egui's pointer state reads the
     // whole window regardless of which widget consumed the event (raw
@@ -2450,8 +2468,10 @@ pub fn vab_pointer_input(
 /// The LMB-press half of [`vab_pointer_input`] — press anchors, the
 /// armed-drag promotion, `orbit_block`, and the drag-lift — split out
 /// under the complexity budget. `drag_travel` is the real pointer
-/// distance past egui's click threshold (the caller computes it;
-/// `deciding` alone also flips on a motionless long hold).
+/// distance past the app's click boundary ([`ARMED_DRAG_PROMOTE_PX`];
+/// the caller computes it — `deciding` alone also flips on a
+/// motionless long hold and, below egui's wider `max_click_dist`,
+/// stays false for a quick sub-6 pt drag that already counts as one).
 fn vab_press_gesture(
     vab: &mut VabSession,
     pressed: bool,
@@ -2480,12 +2500,22 @@ fn vab_press_gesture(
     // the viewport, put back over a panel. Without this the gesture
     // was dead: `orbit_block` ate the camera deltas, the carry barred
     // the drag-lift, and neither release branch matched (C17-F2).
-    // Runs BEFORE the `!primary_down` anchor clear so a press that
-    // only crosses the threshold on its release frame (still frames,
-    // then a move+release in one batch) still promotes; anchored on
-    // the PRESS so a drag begun on a panel never arms a drop/cancel.
-    let promote_armed_drag = deciding
-        && drag_travel
+    // Gated on `drag_travel` alone — `deciding` stays false for a
+    // quick sub-`max_click_dist` drag and must not gate it out;
+    // anchored on the PRESS so a drag begun on a panel never arms a
+    // drop/cancel. The check sits ahead of the `!primary_down` anchor
+    // clear because it reads that anchor — ordering is defensive, not
+    // load-bearing: egui clears `press_origin` while processing the
+    // release event inside `begin_pass` (egui 0.37
+    // `input_state/mod.rs`), so `drag_travel` is never true on a
+    // release frame and the promotion only ever fires while the
+    // button is still held. The residual hole: a gesture whose travel
+    // first crosses the threshold inside the release's own event
+    // batch (still frames, then a move+release in one batch) never
+    // promotes — the arm survives (`pending_part` stays set and the
+    // ghost keeps rendering, so the next click still places it): a
+    // dead flick, not a lost part.
+    let promote_armed_drag = drag_travel
         && vab.press_on_viewport()
         && vab.drag_part().is_none()
         && matches!(vab.carried(), Some(Carried::Placing(_)));
@@ -2517,12 +2547,16 @@ fn vab_press_gesture(
     );
 
     // The drag-lift: a press on a placed part that became a drag
-    // picks the part up. One attempt per press — clearing
-    // `press_node` here means a refused grab (or one on the carried
-    // root that resolves) never refires, and a refusal falls through
-    // to the camera orbit rather than a dead gesture.
+    // picks the part up. `deciding` alone would miss a quick drag in
+    // the 4 px–`max_click_dist` band — the app already refuses to
+    // pick there and `orbit_block` eats the camera deltas, so
+    // `drag_travel` must count as a drag too or the gesture dies.
+    // One attempt per press — clearing `press_node` here means a
+    // refused grab (or one on the carried root that resolves) never
+    // refires, and a refusal falls through to the camera orbit
+    // rather than a dead gesture.
     if primary_down
-        && deciding
+        && (deciding || drag_travel)
         && vab.carried().is_none()
         && let Some(n) = vab.press_node()
     {
@@ -4914,6 +4948,80 @@ mod tests {
             vab.session().len(),
             2,
             "the armed drag's release must place the part at the hover"
+        );
+        assert!(vab.carried().is_none(), "the placed part leaves the hand");
+    }
+
+    /// The promotion threshold is the app's click/drag boundary
+    /// (`ARMED_DRAG_PROMOTE_PX`, mirroring `CLICK_MAX_DRAG_PX` = 4 px
+    /// in csp-app), NOT egui's wider `max_click_dist` (6 pt at 1× ppp)
+    /// — otherwise an armed drag of 4–6 px died in the gap: the app
+    /// suppressed the pick but egui had not decided the drag. A 5 px
+    /// move must promote even while `is_decidedly_dragging` is still
+    /// false; a move at-or-inside 4 px must NOT (that release still
+    /// resolves as the app's click pick — promoting it too would
+    /// double-resolve the gesture).
+    #[test]
+    fn armed_part_sub_click_dist_drag_promotes() {
+        let ctx = egui::Context::default();
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        vab.apply(VabAction::SetRoot(PartId::from("t.tank")))
+            .unwrap();
+        let root = vab.session().root().unwrap();
+        vab.apply(VabAction::CatalogPick(PartId::from("t.eng")))
+            .unwrap();
+        vab.set_hover(Some(HoverHit {
+            node: root,
+            local: DVec3::new(0.0, 0.0, -0.5),
+            region: AttachRegion::BottomCap,
+        }));
+        ctx.run_pass(
+            egui_input(vec![
+                egui::Event::PointerMoved(egui::pos2(400.0, 300.0)),
+                primary_button(egui::pos2(400.0, 300.0), true),
+            ]),
+            |ctx| vab_pointer_input(ctx, &mut vab, &[], None),
+        )
+        .drop_without_applying_deltas();
+        // 3 px of travel — inside the click boundary: still a click,
+        // the pick will resolve it; no promotion.
+        ctx.run_pass(
+            egui_input(vec![egui::Event::PointerMoved(egui::pos2(403.0, 300.0))]),
+            |ctx| vab_pointer_input(ctx, &mut vab, &[], None),
+        )
+        .drop_without_applying_deltas();
+        assert!(
+            vab.drag_part().is_none(),
+            "a sub-threshold wobble must not promote — the click pick still owns it"
+        );
+        // 5 px — past the app's 4 px pick boundary but inside egui's
+        // 6 pt `max_click_dist` at the test's 1× ppp, so egui has NOT
+        // decided this is a drag. The promotion must fire anyway.
+        ctx.run_pass(
+            egui_input(vec![egui::Event::PointerMoved(egui::pos2(405.0, 300.0))]),
+            |ctx| {
+                assert!(
+                    !ctx.input(|i| i.pointer.is_decidedly_dragging()),
+                    "test premise: egui has not decided a sub-6 pt drag"
+                );
+                vab_pointer_input(ctx, &mut vab, &[], None);
+            },
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(
+            vab.drag_part(),
+            Some(&PartId::from("t.eng")),
+            "a >4 px armed drag must promote even below egui's click distance"
+        );
+        ctx.run_pass(
+            egui_input(vec![primary_button(egui::pos2(405.0, 300.0), false)]),
+            |ctx| vab_pointer_input(ctx, &mut vab, &[], None),
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(
+            vab.session().len(),
+            2,
+            "the promoted drag's release drops at the hover"
         );
         assert!(vab.carried().is_none(), "the placed part leaves the hand");
     }
