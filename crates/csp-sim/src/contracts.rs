@@ -40,13 +40,17 @@
 //! for the drawn body — the candidate resources are filtered to
 //! those a live colony can actually store ([`resupply_capacity`]),
 //! because a resupply offer against zero store capacity can never
-//! complete (C09-F5/C34-F1). The narrowing re-checks at every
-//! publish — colony state is sim state like the facts record, so
-//! the draw stays deterministic — and an all-filtered space takes
-//! the same `Recoverable` skip path, letting the next index re-roll
-//! rather than jamming the slot. `DeclineContract` is the player's
-//! half of the same un-jam story (an offer leaves the board unpaid
-//! and the publish refills).
+//! complete (C09-F5/C34-F1). `CrewTransport` draws (fix-plan 7.3 /
+//! C34-F5) gate the same way one level down: the candidate sites
+//! are filtered to those hosting a live colony that can take crew
+//! ([`draw_transport_params`]), because a transport offer against
+//! nowhere to post could never complete. The narrowing re-checks
+//! at every publish — colony state is sim state like the facts
+//! record, so the draw stays deterministic — and an all-filtered
+//! space takes the same `Recoverable` skip path, letting the next
+//! index re-roll rather than jamming the slot. `DeclineContract`
+//! is the player's half of the same un-jam story (an offer leaves
+//! the board unpaid and the publish refills).
 //!
 //! # Prerequisites — facts, not reputation
 //!
@@ -69,8 +73,13 @@
 //! — and evaluates the subscribed contracts' predicates over current
 //! state. `Rescue` is the one transition-keyed predicate (the
 //! recovered vessel leaves the sim, so the event carries the body).
-//! Because the predicates read current state, an already-satisfied
-//! offer completes inside its own `AcceptContract` boundary —
+//! `TouristFlight` is the one multi-leg predicate: the orbit/surface
+//! triggers also WITNESS — a tourist riding the triggering vessel
+//! into the contract's drawn regime joins that record's `flown`
+//! progress set — and the completion leg reads the flown member's
+//! roster facts (`Active` + `Unassigned`: home, alive). Because the
+//! predicates read current state, an already-satisfied offer
+//! completes inside its own `AcceptContract` boundary —
 //! documented on [`World::apply_accept_contract`].
 //!
 //! # Deadline
@@ -101,7 +110,7 @@ use serde::{Deserialize, Serialize};
 use csp_core::{SimError, StateHasher, StreamKey, StreamTag, TICK_HZ};
 use csp_data::{
     BodyId, ContractKind, ContractParamSpace, ContractParams, ContractPrereq, ContractRegime,
-    ContractTemplate, ContractTypeId, ModuleReq, RegimeSpace, ResourceId,
+    ContractTemplate, ContractTypeId, ModuleReq, RegimeSpace, ResourceId, SiteId,
 };
 
 use crate::economy::{FundsReason, to_micros};
@@ -156,6 +165,34 @@ pub struct ActiveContract {
     /// authors a deadline. Pairs with exactly one pending event
     /// (the restore coherence check).
     pub deadline_tick: Option<u64>,
+    /// The kind-scoped progress record — `None` for every kind
+    /// whose predicate is a pure state/transition read (the five
+    /// M7-D/M8-C kinds and `CrewTransport`); `Some` once a kind
+    /// needs memory across triggers (`TouristFlight`'s flown-then-
+    /// returned sequence). `#[serde(default)]` keeps pre-field
+    /// snapshots loading; the hash walk writes only when `Some`,
+    /// so a `None`-progress record hashes bit-identically to the
+    /// pre-7.3 stream.
+    #[serde(default)]
+    pub progress: Option<ContractProgress>,
+}
+
+/// The multi-leg predicates' progress state — sim-side only (the
+/// params stay the frozen offer draw; this is the record's memory
+/// between triggers). Discriminants append-only.
+#[repr(u16)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum ContractProgress {
+    /// `TouristFlight` leg one's record: the roster ids observed
+    /// riding a vessel that satisfied the contract's drawn regime
+    /// while the contract was active. Leg two completes when one
+    /// reads `Active` + `Unassigned` — recovered or otherwise home,
+    /// alive (§3.6's "return them alive").
+    TouristFlight {
+        /// The tourists who flew the profile, ascending `CrewId`.
+        flown: BTreeSet<crate::transfers::CrewId>,
+    },
 }
 
 /// §7.2's "completed-contract facts" — the prerequisite inputs the
@@ -251,6 +288,11 @@ pub(crate) enum ContractTrigger {
     /// M8-C §3.6: a `TransferComplete` landed resource units into a
     /// colony's stores — the `ColonyResupply` predicate's trigger.
     ColonyDelivery,
+    /// 7.3 §3.6: a roster member was posted at a colony — the
+    /// `AssignCrewToColony` and vessel↔colony `land_crew` writes
+    /// that grow the `CrewTransport` predicate's posted count.
+    /// Stateless payload: the predicate re-reads the roster.
+    CrewPosted,
 }
 
 /// The `[0,1)` draw — `csp_core::uniform01` applied to a stream
@@ -287,12 +329,22 @@ pub(crate) fn params_ok(p: &ContractParams) -> bool {
                 && min_periapsis_alt_m <= max_apoapsis_alt_m
         }
         ContractParams::SurveyData { min_units, .. } => ok(*min_units) && *min_units > 0.0,
-        ContractParams::PartTest { regime, .. } => match regime {
-            ContractRegime::Orbit { min_alt_m, .. } => ok(*min_alt_m) && *min_alt_m > 0.0,
-            ContractRegime::Landed { .. } => true,
-        },
+        ContractParams::PartTest { regime, .. } | ContractParams::TouristFlight { regime } => {
+            regime_ok(regime)
+        }
         ContractParams::Rescue { .. } => true,
         ContractParams::ColonyResupply { amount, .. } => ok(*amount) && *amount > 0.0,
+        ContractParams::CrewTransport { count, .. } => *count > 0,
+    }
+}
+
+/// The drawn-regime shape [`params_ok`] enforces — shared by the
+/// `PartTest` and `TouristFlight` params (a drawn altitude band is
+/// finite and positive; a landed regime holds no scalar).
+fn regime_ok(regime: &ContractRegime) -> bool {
+    match regime {
+        ContractRegime::Orbit { min_alt_m, .. } => min_alt_m.is_finite() && *min_alt_m > 0.0,
+        ContractRegime::Landed { .. } => true,
     }
 }
 
@@ -307,14 +359,17 @@ pub(crate) fn params_ok(p: &ContractParams) -> bool {
 /// `World::restore` would `Fatal` on the snapshot (`snapshot:
 /// offer with non-finite params`).
 ///
-/// `colonies` gates the `ColonyResupply` draw: the offer asks for a
-/// delivery into colony stores, so a body whose live colonies can
-/// hold none of the candidate resources is removed from the space
-/// before the pick — see [`resupply_capacity`]. The draw then reads
-/// the same stream positions it always did (body pick, resource
-/// pick, amount draw); only the candidate sets narrowed.
+/// `world` gates the `ColonyResupply` and `CrewTransport` draws:
+/// the resupply offer asks for a delivery into colony stores, so a
+/// body whose live colonies can hold none of the candidate
+/// resources is removed from the space before the pick — see
+/// [`resupply_capacity`]; the transport offer asks for a crew
+/// posting, so a site whose live colonies take no crew is removed
+/// the same way — see [`draw_transport_params`]. The draws then
+/// read the same stream positions they always did; only the
+/// candidate sets narrowed.
 fn draw_params(
-    colonies: &BTreeMap<crate::ColonyId, crate::Colony>,
+    world: &World,
     rng: &mut impl Rng,
     template: &ContractTemplate,
 ) -> Result<ContractParams, SimError> {
@@ -369,26 +424,10 @@ fn draw_params(
                 .get(pick(rng, modules.len()))
                 .ok_or(SimError::Recoverable("contract gen: empty module space"))?
                 .clone();
-            let regime = match regime {
-                RegimeSpace::Orbit { bodies, min_alt_m } => {
-                    let body = bodies
-                        .get(pick(rng, bodies.len()))
-                        .ok_or(SimError::Recoverable("contract gen: empty body space"))?
-                        .clone();
-                    let alt = min_alt_m.0 + next01(rng) * (min_alt_m.1 - min_alt_m.0);
-                    ContractRegime::Orbit {
-                        body,
-                        min_alt_m: alt,
-                    }
-                }
-                RegimeSpace::Landed { bodies } => ContractRegime::Landed {
-                    body: bodies
-                        .get(pick(rng, bodies.len()))
-                        .ok_or(SimError::Recoverable("contract gen: empty body space"))?
-                        .clone(),
-                },
-            };
-            ContractParams::PartTest { module, regime }
+            ContractParams::PartTest {
+                module,
+                regime: draw_regime(rng, regime)?,
+            }
         }
         ContractParamSpace::Rescue { bodies } => ContractParams::Rescue {
             body: bodies
@@ -400,7 +439,13 @@ fn draw_params(
             bodies,
             resources,
             amount,
-        } => draw_resupply_params(colonies, rng, bodies, resources, *amount)?,
+        } => draw_resupply_params(&world.colonies, rng, bodies, resources, *amount)?,
+        ContractParamSpace::CrewTransport { sites, count } => {
+            draw_transport_params(world, rng, sites, *count)?
+        }
+        ContractParamSpace::TouristFlight { regime } => ContractParams::TouristFlight {
+            regime: draw_regime(rng, regime)?,
+        },
     };
     // Every drawn scalar — the authored `min_units` included — must
     // pass the restore gate's own predicate before the params leave
@@ -463,6 +508,75 @@ fn draw_resupply_params(
         resource,
         amount: amount.0 + next01(rng) * (amount.1 - amount.0),
     })
+}
+
+/// The shared regime draw — `PartTest` and `TouristFlight` read the
+/// same `RegimeSpace` shape: a bound orbit at a drawn body with a
+/// drawn altitude floor, or a surface latch at a drawn body.
+fn draw_regime(rng: &mut impl Rng, regime: &RegimeSpace) -> Result<ContractRegime, SimError> {
+    Ok(match regime {
+        RegimeSpace::Orbit { bodies, min_alt_m } => {
+            let body = bodies
+                .get(pick(rng, bodies.len()))
+                .ok_or(SimError::Recoverable("contract gen: empty body space"))?
+                .clone();
+            let alt = min_alt_m.0 + next01(rng) * (min_alt_m.1 - min_alt_m.0);
+            ContractRegime::Orbit {
+                body,
+                min_alt_m: alt,
+            }
+        }
+        RegimeSpace::Landed { bodies } => ContractRegime::Landed {
+            body: bodies
+                .get(pick(rng, bodies.len()))
+                .ok_or(SimError::Recoverable("contract gen: empty body space"))?
+                .clone(),
+        },
+    })
+}
+
+/// The `CrewTransport` arm of [`draw_params`]: draw the site, then
+/// the headcount uniform over the inclusive `(lo, hi)` range. The
+/// completability gate is [`draw_resupply_params`]'s sibling: the
+/// candidate sites are filtered BEFORE the pick to those hosting a
+/// live colony that can take crew ([`World::colony_accepts_crew`]
+/// — the same precondition `AssignCrewToColony` and
+/// `TransferColonyCrew` enforce), because a transport offer naming
+/// nowhere to post could never complete. An all-filtered space
+/// degrades `Recoverable` like any dishonest draw — the publish
+/// skips the index and the next one re-rolls, so a colony-less
+/// program skips the template until a posting site exists.
+fn draw_transport_params(
+    world: &World,
+    rng: &mut impl Rng,
+    sites: &[SiteId],
+    count: (u32, u32),
+) -> Result<ContractParams, SimError> {
+    let viable_sites: Vec<&SiteId> = sites
+        .iter()
+        .filter(|s| {
+            world.colonies.values().any(|c| {
+                c.site == **s
+                    && crate::colonies::colony_live(&c.state)
+                    && world.colony_accepts_crew(c)
+            })
+        })
+        .collect();
+    let site = (*viable_sites
+        .get(pick(rng, viable_sites.len()))
+        .ok_or(SimError::Recoverable(
+            "contract gen: no crew-transport target site",
+        ))?)
+    .clone();
+    // Inclusive integer range; the saturating span keeps an
+    // unvalidated `lo > hi` install deterministic (draws `lo`)
+    // instead of panicking on the subtraction — `params_ok`'s
+    // `count > 0` gate still applies to the result.
+    let span = count.1.saturating_sub(count.0).saturating_add(1);
+    let n = count
+        .0
+        .saturating_add((next01(rng) * f64::from(span)) as u32);
+    Ok(ContractParams::CrewTransport { site, count: n })
 }
 
 /// The resupply draw's completability gate (C09-F5/C34-F1): the
@@ -611,6 +725,15 @@ fn hash_params(h: &mut StateHasher, p: &ContractParams) {
             h.str(resource.as_str());
             h.f64(*amount);
         }
+        ContractParams::CrewTransport { site, count } => {
+            h.u16(5);
+            h.str(site.as_str());
+            h.u32(*count);
+        }
+        ContractParams::TouristFlight { regime } => {
+            h.u16(6);
+            hash_regime(h, regime);
+        }
     }
 }
 
@@ -636,6 +759,23 @@ pub fn hash_contracts(h: &mut StateHasher, c: &ContractState) {
             }
             None => {
                 h.u16(0);
+            }
+        }
+        // The multi-leg kinds' progress record — written ONLY when
+        // present: every pure-predicate kind carries `None` and this
+        // emits nothing, so pre-7.3 states hash bit-identically to
+        // the pre-field stream (the hand-walk's append-only rule —
+        // `HASH_SCHEMA_VERSION` holds because no previously
+        // reachable state changes its bytes).
+        if let Some(progress) = &a.progress {
+            match progress {
+                ContractProgress::TouristFlight { flown } => {
+                    h.u16(0);
+                    h.u32(flown.len() as u32);
+                    for id in flown {
+                        h.u64(id.0);
+                    }
+                }
             }
         }
     });
@@ -798,7 +938,7 @@ impl World {
                 break;
             }
         }
-        let params = draw_params(&self.colonies, &mut rng, template)?;
+        let params = draw_params(self, &mut rng, template)?;
         Ok(Some(ContractOffer {
             index,
             template: template.id.clone(),
@@ -967,6 +1107,15 @@ impl World {
                 *min_units =
                     (*min_units + self.survey_returned_units(experiment, body)).min(f64::MAX);
             }
+            // `CrewTransport` is a LEVEL ask — "N crew posted at the
+            // site" — so the re-base makes the recorded ask
+            // `posted_at_accept + drawn`: postings before signing
+            // never satisfy it, and a posting that later departs
+            // honestly un-meets the level (the re-anchored amount is
+            // the absolute headcount the predicate reads).
+            ContractParams::CrewTransport { site, count } => {
+                *count = count.saturating_add(self.crew_posted_at(site));
+            }
             _ => {}
         }
         let rewards = template.rewards;
@@ -1001,6 +1150,16 @@ impl World {
             .next_contract_id
             .checked_add(1)
             .ok_or(SimError::Fatal("contract id counter overflow"))?;
+        // The multi-leg kinds seed their progress record at accept
+        // — `TouristFlight`'s empty `flown` set is what leg one
+        // stamps into (the pure-predicate kinds carry `None`, which
+        // the hash walk emits nothing for).
+        let progress = match &params {
+            ContractParams::TouristFlight { .. } => Some(ContractProgress::TouristFlight {
+                flown: BTreeSet::new(),
+            }),
+            _ => None,
+        };
         self.contracts.active.insert(
             id,
             ActiveContract {
@@ -1008,6 +1167,7 @@ impl World {
                 template: o.template,
                 params,
                 deadline_tick: deadline,
+                progress,
             },
         );
         self.credit_funds(
@@ -1026,7 +1186,7 @@ impl World {
         );
         // The already-satisfied case: complete at acceptance rather
         // than arming a deadline for a done contract.
-        if self.objective_met(&self.contracts.active[&id].params, None) {
+        if self.objective_met(&self.contracts.active[&id], None) {
             self.complete_contract(id, shadow)?;
         } else if let Some(tick) = deadline {
             self.schedule_event(EventKind::ContractDeadline { contract: id }, tick, shadow)?;
@@ -1065,12 +1225,14 @@ impl World {
     }
 
     /// The completion predicate — evaluated on triggers (and once at
-    /// acceptance with `trigger: None`). Returns `true` when the
-    /// params' claim holds in current state. `Rescue` reads the
-    /// recovery event's body (the vessel is gone — no state answers
-    /// it), so `None`/any other trigger yields `false` for it.
-    fn objective_met(&self, params: &ContractParams, trigger: Option<&ContractTrigger>) -> bool {
-        match params {
+    /// acceptance with `trigger: None`). Takes the whole record (the
+    /// `TouristFlight` leg reads the progress state the params don't
+    /// carry). Returns `true` when the params' claim holds in
+    /// current state. `Rescue` reads the recovery event's body (the
+    /// vessel is gone — no state answers it), so `None`/any other
+    /// trigger yields `false` for it.
+    fn objective_met(&self, contract: &ActiveContract, trigger: Option<&ContractTrigger>) -> bool {
+        match &contract.params {
             ContractParams::SatelliteOrbit {
                 body,
                 min_periapsis_alt_m,
@@ -1096,24 +1258,9 @@ impl World {
                 min_units,
             } => self.survey_returned_units(experiment, body) >= *min_units,
             ContractParams::PartTest { module, regime } => self.vessels.values().any(|v| {
-                if v.debris_since.is_some() || !craft_has_module(v, module) {
-                    return false;
-                }
-                match regime {
-                    ContractRegime::Orbit { body, min_alt_m } => {
-                        let Some(o) = v.orbit() else { return false };
-                        if o.parent != *body || o.elements.eccentricity >= 1.0 {
-                            return false;
-                        }
-                        let radius = self.orbits.body_radius(body).unwrap_or(0.0);
-                        let rp = o.elements.semi_major_axis_m * (1.0 - o.elements.eccentricity);
-                        rp - radius >= *min_alt_m
-                    }
-                    ContractRegime::Landed { body } => match &v.state {
-                        crate::VesselState::SurfaceLatched(p) => p.body == *body,
-                        _ => false,
-                    },
-                }
+                v.debris_since.is_none()
+                    && craft_has_module(v, module)
+                    && self.vessel_in_regime(v, regime)
             }),
             ContractParams::Rescue { body } => {
                 matches!(trigger, Some(ContractTrigger::VesselRecovered(b)) if b == body)
@@ -1144,6 +1291,70 @@ impl World {
                     .sum();
                 delivered >= *amount
             }
+            // 7.3 §3.6's crew transport: the posted headcount at
+            // colonies occupying `site` reaches the (re-based) ask.
+            // A level read, not a ledger — a member who leaves the
+            // posting honestly drops the count.
+            ContractParams::CrewTransport { site, count } => self.crew_posted_at(site) >= *count,
+            // 7.3 §3.6's tourist flight — the two-leg predicate: leg
+            // one is the progress record (a tourist rode a vessel
+            // into `regime` under contract — `contract_notify`'s
+            // witness stamp), leg two is the return: that flown
+            // member reads `Active` + `Unassigned` — recovered or
+            // otherwise home, alive. `trigger: None` at accept is
+            // honest for it: `flown` is empty until a regime
+            // transition witnesses a rider, so it can never
+            // instant-complete.
+            ContractParams::TouristFlight { .. } => match &contract.progress {
+                Some(ContractProgress::TouristFlight { flown }) => flown.iter().any(|id| {
+                    self.economy.crew.get(id).is_some_and(|m| {
+                        m.kind == crate::CrewKind::Tourist
+                            && m.status == crate::CrewStatus::Active
+                            && m.location == crate::CrewLocation::Unassigned
+                    })
+                }),
+                _ => false,
+            },
+        }
+    }
+
+    /// The `CrewTransport` fact — `Active` roster members posted at
+    /// colonies occupying `site` (`CrewLocation::Colony` is the only
+    /// "at a place" crew record; a member's colony arena id resolves
+    /// its site through the colony record). Counts whatever the
+    /// roster records — both the `AssignCrewToColony` posting and
+    /// the vessel↔colony transfer landing write it.
+    fn crew_posted_at(&self, site: &SiteId) -> u32 {
+        self.economy
+            .crew
+            .values()
+            .filter(|m| {
+                m.status == crate::CrewStatus::Active
+                    && matches!(&m.location, crate::CrewLocation::Colony(c)
+                        if self.colonies.get(c).is_some_and(|co| co.site == *site))
+            })
+            .count() as u32
+    }
+
+    /// Whether `v` currently satisfies `regime` — the check the
+    /// `PartTest` predicate and the `TouristFlight` witness stamp
+    /// share (a bound orbit above the drawn floor, or a surface
+    /// latch at the drawn body).
+    fn vessel_in_regime(&self, v: &crate::Vessel, regime: &ContractRegime) -> bool {
+        match regime {
+            ContractRegime::Orbit { body, min_alt_m } => {
+                let Some(o) = v.orbit() else { return false };
+                if o.parent != *body || o.elements.eccentricity >= 1.0 {
+                    return false;
+                }
+                let radius = self.orbits.body_radius(body).unwrap_or(0.0);
+                let rp = o.elements.semi_major_axis_m * (1.0 - o.elements.eccentricity);
+                rp - radius >= *min_alt_m
+            }
+            ContractRegime::Landed { body } => match &v.state {
+                crate::VesselState::SurfaceLatched(p) => p.body == *body,
+                _ => false,
+            },
         }
     }
 
@@ -1229,15 +1440,82 @@ impl World {
             }
             _ => {}
         }
+        // `TouristFlight` leg one — the regime transitions also
+        // WITNESS: a tourist riding the triggering vessel into a
+        // contract's drawn regime joins that record's `flown` set.
+        // Stamping rides the event, so a profile demonstrated before
+        // signing never counts — the resupply re-base's sibling rule
+        // for a witnessed fact. Runs before the completion pass so a
+        // stamp and its return can land in one boundary.
+        match trigger {
+            ContractTrigger::OrbitAchieved(v) | ContractTrigger::SurfaceLatched(v) => {
+                self.stamp_tourist_flown(*v, shadow)?;
+            }
+            _ => {}
+        }
         let done: Vec<ContractId> = self
             .contracts
             .active
             .iter()
-            .filter(|(_, a)| self.objective_met(&a.params, Some(trigger)))
+            .filter(|(_, a)| self.objective_met(a, Some(trigger)))
             .map(|(id, _)| *id)
             .collect();
         for id in done {
             self.complete_contract(id, shadow)?;
+        }
+        Ok(())
+    }
+
+    /// `TouristFlight` leg one's witness — the `OrbitAchieved`/
+    /// `SurfaceLatched` transition stamps every `CrewKind::Tourist`
+    /// roster member riding `vessel` into each active tourist
+    /// contract whose drawn regime the vessel now satisfies. Kind
+    /// reads the roster (a `BoardCrew` id-only member has no record
+    /// and never stamps — the tourist is §3.5's named-individual
+    /// contract cargo). Ascending-`ContractId` order; a debris
+    /// vessel witnesses nothing.
+    fn stamp_tourist_flown(
+        &mut self,
+        vessel: VesselId,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        let Some(v) = self.vessels.get(&vessel) else {
+            return Ok(());
+        };
+        if v.debris_since.is_some() {
+            return Ok(());
+        }
+        let riders: Vec<crate::transfers::CrewId> = v
+            .crew
+            .iter()
+            .map(|c| c.id)
+            .filter(|id| {
+                self.economy.crew.get(id).is_some_and(|m| {
+                    m.kind == crate::CrewKind::Tourist
+                        && m.location == crate::CrewLocation::Vessel(vessel)
+                })
+            })
+            .collect();
+        if riders.is_empty() {
+            return Ok(());
+        }
+        let matched: Vec<ContractId> = self
+            .contracts
+            .active
+            .iter()
+            .filter(|(_, a)| {
+                matches!(&a.params, ContractParams::TouristFlight { regime }
+                    if self.vessel_in_regime(v, regime))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in matched {
+            self.shadow_contracts(shadow);
+            if let Some(a) = self.contracts.active.get_mut(&id)
+                && let Some(ContractProgress::TouristFlight { flown }) = &mut a.progress
+            {
+                flown.extend(riders.iter().copied());
+            }
         }
         Ok(())
     }
@@ -1326,7 +1604,7 @@ impl World {
         // `trigger: None` keeps `Rescue` honest — its transition-
         // keyed predicate reads only `VesselRecovered`, so a missed
         // recovery still fails.
-        if self.objective_met(&c.params, None) {
+        if self.objective_met(&c, None) {
             return self.complete_contract(id, shadow);
         }
         let penalty = self
@@ -1361,7 +1639,7 @@ impl World {
 // failure by panicking, so unwrap/expect stays legal inside test code.
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use csp_data::{
         BodyId, ContractGenerator, ContractKind, ContractParamSpace, ContractParams,
@@ -1399,6 +1677,16 @@ mod tests {
                 bodies: vec![BodyId::from("terrin")],
                 resources: vec![ResourceId::from("ore")],
                 amount: (10.0, 10.0),
+            },
+            ContractKind::CrewTransport => ContractParamSpace::CrewTransport {
+                sites: vec![csp_data::SiteId::from("pad")],
+                count: (1, 1),
+            },
+            ContractKind::TouristFlight => ContractParamSpace::TouristFlight {
+                regime: RegimeSpace::Orbit {
+                    bodies: vec![BodyId::from("terrin")],
+                    min_alt_m: (100_000.0, 200_000.0),
+                },
             },
         };
         ContractTemplate {
@@ -2071,6 +2359,7 @@ mod tests {
                         max_apoapsis_alt_m: 2.0,
                     },
                     deadline_tick: None,
+                    progress: None,
                 },
             );
         }
@@ -2170,6 +2459,7 @@ mod tests {
                     body: BodyId::from("terrin"),
                 },
                 deadline_tick: Some(1_000),
+                progress: None,
             },
         );
         let mut shadow = crate::TickShadow::capture(&w);
@@ -2580,5 +2870,450 @@ mod tests {
         );
         // Advance 2.0 + completion 10.0; the 4.0 penalty never moved.
         assert_eq!(w.economy.funds_micros, crate::economy::to_micros(12.0));
+    }
+
+    // ---- 7.3 (C34-F5): the two crewed kinds ----
+
+    /// A roster crew member seeded into `w` — the hire record the
+    /// crewed-kind tests build on (`Unassigned`, `Active`, zero
+    /// salary so no `SalaryDue` intervenes).
+    fn roster_member(w: &mut World, id: u64, kind: crate::CrewKind) -> crate::transfers::CrewId {
+        let cid = crate::transfers::CrewId(id);
+        w.economy.crew.insert(
+            cid,
+            crate::CrewMember {
+                name: format!("crew{id}"),
+                kind,
+                skill: 1,
+                location: crate::CrewLocation::Unassigned,
+                salary_per_s: 0.0,
+                status: crate::CrewStatus::Active,
+            },
+        );
+        w.next_crew_id = w.next_crew_id.max(id + 1);
+        cid
+    }
+
+    /// A live colony at site `pad` on `body` that takes crew
+    /// (`life_support_enabled` is off in `world_with`, so the
+    /// module-less fixture passes `colony_accepts_crew`). The
+    /// `colony_env` install is what `recompute_colony` reads — a
+    /// posting without it rejects `Recoverable` on the missing
+    /// solve frame.
+    fn crew_colony(w: &mut World, body: &str) -> crate::ColonyId {
+        w.set_colony_env(BTreeMap::from([(
+            BodyId::from(body),
+            crate::ColonyBodyEnv {
+                rotation_period_s: Some(21_600.0),
+                insolation_w_m2: Some(1361.0),
+                radius_m: 6.0e6,
+            },
+        )]));
+        plant_colony(w, body, "ore");
+        crate::ColonyId(0)
+    }
+
+    /// An on-rails vessel over terrin carrying the given roster
+    /// crew — the tourist witness's ride. Craft-less: the witness
+    /// stamp reads `vessel.crew` + the roster record, and the
+    /// return leg sets roster facts directly.
+    fn rails_vessel(w: &mut World, alt_m: f64, crew: &[crate::transfers::CrewId]) -> VesselId {
+        let id = VesselId(w.next_vessel_id);
+        w.next_vessel_id += 1;
+        w.vessels.insert(
+            id,
+            crate::Vessel {
+                id,
+                craft: None,
+                state: crate::VesselState::OnRails(crate::orbit::OrbitState {
+                    parent: BodyId::from("terrin"),
+                    elements: terrin_orbit(alt_m),
+                    epoch: csp_core::SimTime::from_ticks(w.clock().ticks()),
+                }),
+                aero_mask: csp_phys::ConfigMask::ALL,
+                thermal: crate::VesselThermal::default(),
+                debris_since: None,
+                maneuver: None,
+                seams: Vec::new(),
+                tank_contents: BTreeMap::new(),
+                crew: crew
+                    .iter()
+                    .map(|id| crate::transfers::VesselCrew {
+                        id: *id,
+                        seat: csp_phys::PartNodeId(0),
+                    })
+                    .collect(),
+                science: crate::VesselScience::default(),
+                joined_colony: None,
+                reliability: BTreeMap::new(),
+                control_lease: crate::Lease::Player,
+                deployed: BTreeMap::new(),
+            },
+        );
+        id
+    }
+
+    /// The offer-generation gate: with no crew-accepting colony at
+    /// any candidate site, every transport draw is uncompletable —
+    /// the publish skips it (`Recoverable`, bounded by
+    /// `board_size`) instead of printing a squatting offer.
+    #[test]
+    fn transport_draw_needs_a_crew_colony() {
+        let mut w = world_with(template(
+            "contract.crew_transport",
+            ContractKind::CrewTransport,
+            vec![],
+        ));
+        let rep = w.step_frame(csp_core::TICK_HZ).unwrap();
+        assert!(
+            rep.degraded
+                .iter()
+                .any(|e| matches!(e, SimError::Recoverable(m) if m.contains("crew-transport"))),
+            "colony-less draws degraded, got {:?}",
+            rep.degraded
+        );
+        assert!(w.contracts().offers.is_empty());
+        // A crew-capable colony at the candidate site re-opens the
+        // space on the next publish.
+        crew_colony(&mut w, "terra");
+        w.step_frame(w.clock().ticks() + csp_core::TICK_HZ).unwrap();
+        assert_eq!(w.contracts().offers.len(), 6);
+        assert!(
+            w.contracts().offers.values().all(|o| matches!(
+                &o.params,
+                ContractParams::CrewTransport { site, count: 1 }
+                    if site.as_str() == "pad"
+            )),
+            "{:?}",
+            w.contracts().offers
+        );
+    }
+
+    /// The full crew-transport arc on real commands: accept → the
+    /// ask re-bases to `posted + drawn` → `HireCrew` +
+    /// `AssignCrewToColony` posts → the `CrewPosted` trigger
+    /// completes it.
+    #[test]
+    fn transport_completes_on_crew_posting() {
+        let mut w = world_with(template(
+            "contract.crew_transport",
+            ContractKind::CrewTransport,
+            vec![],
+        ));
+        w.economy.funds_micros = 0;
+        let colony = crew_colony(&mut w, "terra");
+        fill_board(&mut w);
+        w.enqueue(
+            crate::SourceClass::Ui,
+            0,
+            SimCommand::AcceptContract { offer: 0 },
+        );
+        w.step_frame(2 * csp_core::TICK_HZ).unwrap();
+        assert_eq!(w.contracts().active.len(), 1);
+        let crew = roster_member(&mut w, 0, crate::CrewKind::Pilot);
+        w.enqueue(
+            crate::SourceClass::Ui,
+            0,
+            SimCommand::AssignCrewToColony { colony, crew },
+        );
+        w.step_frame(w.clock().ticks() + csp_core::TICK_HZ).unwrap();
+        assert!(
+            w.contracts().active.is_empty(),
+            "the posting completed the contract"
+        );
+        assert_eq!(
+            w.contracts().facts.completed[&ContractKind::CrewTransport],
+            1
+        );
+        // Advance 2.0 + completion 10.0 credited (the test
+        // template's authored lines).
+        assert_eq!(w.economy.funds_micros, crate::economy::to_micros(12.0));
+    }
+
+    /// The re-base rule: crew already posted at the site when the
+    /// contract signs count toward the BASELINE, not the ask — the
+    /// recorded demand is `posted_at_accept + drawn`, so the level
+    /// must grow by the draw after signing.
+    #[test]
+    fn transport_rebases_past_postings() {
+        let mut w = world_with(template(
+            "contract.crew_transport",
+            ContractKind::CrewTransport,
+            vec![],
+        ));
+        let colony = crew_colony(&mut w, "terra");
+        // Two members posted BEFORE the offer is accepted.
+        for i in 0..2u64 {
+            let crew = roster_member(&mut w, i, crate::CrewKind::Pilot);
+            w.enqueue(
+                crate::SourceClass::Ui,
+                0,
+                SimCommand::AssignCrewToColony { colony, crew },
+            );
+        }
+        let rep = w.step_frame(w.clock().ticks() + csp_core::TICK_HZ).unwrap();
+        assert!(
+            rep.rejected.is_empty(),
+            "assigns rejected: {:?}",
+            rep.rejected
+        );
+        fill_board(&mut w);
+        w.enqueue(
+            crate::SourceClass::Ui,
+            0,
+            SimCommand::AcceptContract { offer: 0 },
+        );
+        let rep = w.step_frame(w.clock().ticks() + csp_core::TICK_HZ).unwrap();
+        assert!(
+            rep.rejected.is_empty(),
+            "accept rejected: {:?}",
+            rep.rejected
+        );
+        // The draw (count 1) re-based onto the 2 posted: ask = 3 —
+        // the level at accept (2) must NOT satisfy it.
+        let c = w.contracts().active.values().next().unwrap();
+        assert_eq!(
+            c.params,
+            ContractParams::CrewTransport {
+                site: csp_data::SiteId::from("pad"),
+                count: 3,
+            }
+        );
+        let crew = roster_member(&mut w, 2, crate::CrewKind::Pilot);
+        w.enqueue(
+            crate::SourceClass::Ui,
+            0,
+            SimCommand::AssignCrewToColony { colony, crew },
+        );
+        w.step_frame(w.clock().ticks() + csp_core::TICK_HZ).unwrap();
+        assert!(w.contracts().active.is_empty());
+        assert_eq!(
+            w.contracts().facts.completed[&ContractKind::CrewTransport],
+            1
+        );
+    }
+
+    /// Tourist leg one: a `CrewKind::Tourist` roster member riding
+    /// the vessel that stamps the drawn regime joins the record's
+    /// `flown` set — witnessed on the real `OrbitAchieved` trigger,
+    /// not polled.
+    #[test]
+    fn tourist_flown_stamp_rides_the_regime_trigger() {
+        let mut w = world_with(template(
+            "contract.tourist_flight",
+            ContractKind::TouristFlight,
+            vec![],
+        ));
+        fill_board(&mut w);
+        w.enqueue(
+            crate::SourceClass::Ui,
+            0,
+            SimCommand::AcceptContract { offer: 0 },
+        );
+        w.step_frame(2 * csp_core::TICK_HZ).unwrap();
+        let cid = w.contracts().active.keys().next().copied().unwrap();
+        let tourist = roster_member(&mut w, 0, crate::CrewKind::Tourist);
+        // 250 km — above every `min_alt_m` the template's
+        // (100,200) km band can draw.
+        let vessel = rails_vessel(&mut w, 250_000.0, &[tourist]);
+        w.economy.crew.get_mut(&tourist).unwrap().location = crate::CrewLocation::Vessel(vessel);
+        // A pilot riding the same hull does NOT stamp — the kind
+        // reads the roster.
+        let pilot = roster_member(&mut w, 1, crate::CrewKind::Pilot);
+        w.vessels
+            .get_mut(&vessel)
+            .unwrap()
+            .crew
+            .push(crate::transfers::VesselCrew {
+                id: pilot,
+                seat: csp_phys::PartNodeId(0),
+            });
+        w.economy.crew.get_mut(&pilot).unwrap().location = crate::CrewLocation::Vessel(vessel);
+        let mut shadow = crate::TickShadow::capture(&w);
+        w.contract_notify(&ContractTrigger::OrbitAchieved(vessel), &mut shadow)
+            .unwrap();
+        let Some(ContractProgress::TouristFlight { flown }) = &w.contracts().active[&cid].progress
+        else {
+            panic!("no tourist progress record")
+        };
+        assert!(flown.contains(&tourist));
+        assert!(!flown.contains(&pilot));
+        // Still aboard — the return leg is unmet, the contract live.
+        assert_eq!(w.contracts().active.len(), 1);
+    }
+
+    /// The full tourist arc: the flown member comes home
+    /// `Active` + `Unassigned` — the recovery walk the
+    /// `VesselRecovered` trigger lands — and the contract completes.
+    #[test]
+    fn tourist_flight_completes_on_return_home() {
+        let mut w = world_with(template(
+            "contract.tourist_flight",
+            ContractKind::TouristFlight,
+            vec![],
+        ));
+        w.economy.funds_micros = 0;
+        fill_board(&mut w);
+        w.enqueue(
+            crate::SourceClass::Ui,
+            0,
+            SimCommand::AcceptContract { offer: 0 },
+        );
+        w.step_frame(2 * csp_core::TICK_HZ).unwrap();
+        let tourist = roster_member(&mut w, 0, crate::CrewKind::Tourist);
+        let vessel = rails_vessel(&mut w, 250_000.0, &[tourist]);
+        w.economy.crew.get_mut(&tourist).unwrap().location = crate::CrewLocation::Vessel(vessel);
+        let mut shadow = crate::TickShadow::capture(&w);
+        w.contract_notify(&ContractTrigger::OrbitAchieved(vessel), &mut shadow)
+            .unwrap();
+        assert_eq!(w.contracts().active.len(), 1);
+        // The recovery walk: the member leaves the hull `Unassigned`
+        // — the roster fact `RecoverVessel` writes before it fires
+        // `VesselRecovered`.
+        w.economy.crew.get_mut(&tourist).unwrap().location = crate::CrewLocation::Unassigned;
+        let mut shadow = crate::TickShadow::capture(&w);
+        w.contract_notify(
+            &ContractTrigger::VesselRecovered(BodyId::from("terrin")),
+            &mut shadow,
+        )
+        .unwrap();
+        assert!(w.contracts().active.is_empty());
+        assert_eq!(
+            w.contracts().facts.completed[&ContractKind::TouristFlight],
+            1
+        );
+        assert_eq!(w.economy.funds_micros, crate::economy::to_micros(12.0));
+    }
+
+    /// "Return them ALIVE" — a flown tourist who reads `Lost` (the
+    /// hull went down, `aboard any other residence they go Lost`)
+    /// completes nothing even once their location is moved home.
+    #[test]
+    fn tourist_lost_member_never_completes() {
+        let mut w = world_with(template(
+            "contract.tourist_flight",
+            ContractKind::TouristFlight,
+            vec![],
+        ));
+        fill_board(&mut w);
+        w.enqueue(
+            crate::SourceClass::Ui,
+            0,
+            SimCommand::AcceptContract { offer: 0 },
+        );
+        w.step_frame(2 * csp_core::TICK_HZ).unwrap();
+        let tourist = roster_member(&mut w, 0, crate::CrewKind::Tourist);
+        let vessel = rails_vessel(&mut w, 250_000.0, &[tourist]);
+        w.economy.crew.get_mut(&tourist).unwrap().location = crate::CrewLocation::Vessel(vessel);
+        let mut shadow = crate::TickShadow::capture(&w);
+        w.contract_notify(&ContractTrigger::OrbitAchieved(vessel), &mut shadow)
+            .unwrap();
+        let m = w.economy.crew.get_mut(&tourist).unwrap();
+        m.status = crate::CrewStatus::Lost;
+        m.location = crate::CrewLocation::Unassigned;
+        let mut shadow = crate::TickShadow::capture(&w);
+        w.contract_notify(
+            &ContractTrigger::VesselRecovered(BodyId::from("terrin")),
+            &mut shadow,
+        )
+        .unwrap();
+        assert_eq!(
+            w.contracts().active.len(),
+            1,
+            "a dead tourist is no completion"
+        );
+    }
+
+    /// The post-acceptance rule: a tourist ALREADY in the regime
+    /// when the contract signs does not stamp — leg one rides the
+    /// transition, never a stale state read (the resupply re-base's
+    /// sibling rule for witnessed facts).
+    #[test]
+    fn tourist_pre_signature_flight_never_stamps() {
+        let mut w = world_with(template(
+            "contract.tourist_flight",
+            ContractKind::TouristFlight,
+            vec![],
+        ));
+        let tourist = roster_member(&mut w, 0, crate::CrewKind::Tourist);
+        let vessel = rails_vessel(&mut w, 250_000.0, &[tourist]);
+        w.economy.crew.get_mut(&tourist).unwrap().location = crate::CrewLocation::Vessel(vessel);
+        fill_board(&mut w);
+        w.enqueue(
+            crate::SourceClass::Ui,
+            0,
+            SimCommand::AcceptContract { offer: 0 },
+        );
+        w.step_frame(2 * csp_core::TICK_HZ).unwrap();
+        let cid = w.contracts().active.keys().next().copied().unwrap();
+        // No regime transition fired under the contract — `flown`
+        // stays empty even though the rider sat in the band the
+        // whole time.
+        let Some(ContractProgress::TouristFlight { flown }) = &w.contracts().active[&cid].progress
+        else {
+            panic!("no tourist progress record")
+        };
+        assert!(flown.is_empty());
+        // The same rider under a FRESH orbit stamp counts — the
+        // profile demonstrated under contract.
+        let mut shadow = crate::TickShadow::capture(&w);
+        w.contract_notify(&ContractTrigger::OrbitAchieved(vessel), &mut shadow)
+            .unwrap();
+        let Some(ContractProgress::TouristFlight { flown }) = &w.contracts().active[&cid].progress
+        else {
+            panic!("no tourist progress record")
+        };
+        assert!(flown.contains(&tourist));
+    }
+
+    /// The progress record rides the save boundary: a stamped
+    /// `flown` set round-trips through `snapshot`/`restore`, and a
+    /// crafted record pairing progress with the wrong params kind
+    /// is `Fatal` (the restore gate's coherence rule).
+    #[test]
+    fn tourist_progress_round_trips_the_save_boundary() {
+        let mut w = world_with(template(
+            "contract.tourist_flight",
+            ContractKind::TouristFlight,
+            vec![],
+        ));
+        let tourist = crate::transfers::CrewId(0);
+        w.contracts.active.insert(
+            ContractId(0),
+            ActiveContract {
+                id: ContractId(0),
+                template: ContractTypeId::from("contract.tourist_flight"),
+                params: ContractParams::TouristFlight {
+                    regime: csp_data::ContractRegime::Orbit {
+                        body: BodyId::from("terrin"),
+                        min_alt_m: 100_000.0,
+                    },
+                },
+                deadline_tick: None,
+                progress: Some(ContractProgress::TouristFlight {
+                    flown: BTreeSet::from([tourist]),
+                }),
+            },
+        );
+        w.contracts.next_contract_id = 1;
+        let snap = w.snapshot().unwrap();
+        let mut r = World::restore(test_orbits(), None, snap).unwrap();
+        r.set_contracts(w.contract_defs().clone());
+        let Some(ContractProgress::TouristFlight { flown }) =
+            &r.contracts().active[&ContractId(0)].progress
+        else {
+            panic!("progress lost across the save boundary")
+        };
+        assert!(flown.contains(&tourist));
+        // The crafted-mismatch arm: progress on a `Rescue` record.
+        let mut snap = w.snapshot().unwrap();
+        let a = snap.contracts.active.get_mut(&ContractId(0)).unwrap();
+        a.params = ContractParams::Rescue {
+            body: BodyId::from("terrin"),
+        };
+        let err = World::restore(test_orbits(), None, snap)
+            .err()
+            .expect("a params/progress mismatch must refuse");
+        assert!(matches!(err, SimError::Fatal(_)), "got {err:?}");
     }
 }

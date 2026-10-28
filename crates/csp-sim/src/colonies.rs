@@ -2316,7 +2316,11 @@ impl World {
             .ok_or(SimError::Fatal("assign crew: colony vanished"))?
             .crew
             .insert(crew);
-        self.recompute_colony(id, self.clock.ticks(), shadow)
+        self.recompute_colony(id, self.clock.ticks(), shadow)?;
+        // 7.3 §3.6: a direct posting is the `CrewTransport`
+        // predicate's trigger — same fact the `land_crew` landing
+        // fires.
+        self.contract_notify(&crate::contracts::ContractTrigger::CrewPosted, shadow)
     }
 
     /// `EvacuateColony` — every crew member aboard goes `Unassigned`;
@@ -5955,6 +5959,93 @@ mod tests {
         );
     }
 
+    /// 7.3 §3.6: the vessel→colony crew landing is the
+    /// `CrewTransport` predicate's other producer — a member landed
+    /// by `TransferColonyCrew` fires `CrewPosted` and completes the
+    /// posted-count ask exactly like the direct
+    /// `AssignCrewToColony` posting.
+    #[test]
+    fn crew_landing_completes_transport_contract() {
+        let mut w = colony_world();
+        w.contracts.active.insert(
+            crate::contracts::ContractId(0),
+            crate::contracts::ActiveContract {
+                id: crate::contracts::ContractId(0),
+                template: csp_data::ContractTypeId::from("contract.crew_transport"),
+                params: csp_data::ContractParams::CrewTransport {
+                    site: SiteId::from("pad"),
+                    count: 1,
+                },
+                deadline_tick: None,
+                progress: None,
+            },
+        );
+        w.contracts.next_contract_id = 1;
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::HireCrew {
+                name: "a".into(),
+                kind: crate::CrewKind::Pilot,
+                skill: 1,
+                salary_per_s: 0.0,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        found(
+            &mut w,
+            vec![
+                gen_module(10.0),
+                ColonyModuleDef::LifeSupport {
+                    consumes_per_crew: vec![],
+                    power_ec_per_s: 0.0,
+                },
+            ],
+            vec![],
+        );
+        let colony = *w.colonies().keys().next().unwrap();
+        let vessel = latched_vessel(&mut w, "ore", 100.0, 0.0);
+        {
+            let v = w.vessels.get_mut(&vessel).unwrap();
+            v.crew.push(crate::transfers::VesselCrew {
+                id: CrewId(0),
+                seat: csp_phys::PartNodeId(0),
+            });
+        }
+        w.economy.crew.get_mut(&CrewId(0)).unwrap().location =
+            crate::economy::CrewLocation::Vessel(vessel);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::JoinColonyInventory { vessel, colony },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::TransferColonyCrew {
+                vessel,
+                colony,
+                crew: CrewId(0),
+                to_colony: true,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        // The crew-traversal delay lands the member — and the
+        // `CrewPosted` trigger completes the contract in the same
+        // boundary.
+        w.step_frame(w.clock().ticks() + 640 + 1).unwrap();
+        assert!(w.colonies()[&colony].crew.contains(&CrewId(0)));
+        assert!(
+            w.contracts().active.is_empty(),
+            "the landing completed the transport contract"
+        );
+        assert_eq!(
+            w.contracts().facts.completed[&csp_data::ContractKind::CrewTransport],
+            1
+        );
+    }
+
     // ---- M8-C: the toggle, the impact seam, the resupply fact ----
 
     /// The dominant-body physics env the impact/resupply tests
@@ -6285,6 +6376,7 @@ mod tests {
                     amount: 10.0,
                 },
                 deadline_tick: None,
+                progress: None,
             },
         );
         w.contracts.next_contract_id = 1;
@@ -6438,6 +6530,7 @@ mod tests {
                     amount: 10.0,
                 },
                 deadline_tick: None,
+                progress: None,
             },
         );
         w.contracts.next_contract_id = 1;

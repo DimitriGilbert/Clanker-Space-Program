@@ -429,6 +429,16 @@ pub fn cargo_craft() -> (csp_sim::CraftDef, Vec<(csp_data::ResourceId, f64)>) {
     )
 }
 
+/// The bench's single-seat hull — `cargo_craft`'s frame with a crew
+/// seat welded on, for the crew-transfer legs (the tourist flight's
+/// ride). Same `csp.battery.z1k` id + BOM: the tech gate reads the
+/// id, the seat is what the weld record carries.
+pub fn crew_craft() -> (csp_sim::CraftDef, Vec<(csp_data::ResourceId, f64)>) {
+    let (mut craft, bom) = cargo_craft();
+    craft.parts[0].crew_seats = 1;
+    (craft, bom)
+}
+
 /// The bench's anonymous orbiter — a single part carrying BOTH
 /// `ModuleKind`s the `contract.part_test` template draws (a crew
 /// seat AND a thrust site), so one craft satisfies either draw.

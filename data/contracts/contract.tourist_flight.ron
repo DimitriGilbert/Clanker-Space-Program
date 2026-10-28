@@ -1,0 +1,38 @@
+// §3.6 tourist flight (fix-plan 7.3, C34-F5) — fly a
+// `CrewKind::Tourist` roster member through the drawn orbit and
+// bring them home alive. The two legs: a tourist riding a vessel
+// that stamps the drawn regime joins the contract's `flown`
+// progress set (the orbit/latch triggers witness it), and the
+// contract completes when a flown member reads `Active` +
+// `Unassigned` — the recovery crew walk home. A flown tourist lost
+// with the hull completes nothing.
+//
+// Unlocks at tech.rocketry.3 with the rest of the crewed-program
+// tier; `CrewLostAtMost(0)` is the honest §3.6 gate — a program
+// with a death toll gets no tourist work.
+(
+    schema_version: 1,
+    id: "contract.tourist_flight",
+    display_name: "contract.tourist_flight.name",
+    description: "contract.tourist_flight.desc",
+    kind: TouristFlight,
+    generate: (
+        weight: 1.0,
+        space: TouristFlight(
+            regime: Orbit(
+                bodies: ["terrin"],
+                min_alt_m: (80_000.0, 200_000.0),
+            ),
+        ),
+    ),
+    prerequisites: [
+        TechResearched("tech.rocketry.3"),
+        CrewLostAtMost(0),
+    ],
+    rewards: (
+        advance_funds: 7_000.0,
+        completion_funds: 42_000.0,
+        failure_penalty_funds: 9_000.0,
+    ),
+    deadline_days: Some(90.0),
+)

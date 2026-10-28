@@ -1258,6 +1258,10 @@ impl World {
                     }
                     let now = self.clock.ticks();
                     self.recompute_colony(c, now, shadow)?;
+                    // 7.3 §3.6: a landed posting is the
+                    // `CrewTransport` predicate's trigger — the
+                    // posted-count fact the contract reads just grew.
+                    self.contract_notify(&crate::contracts::ContractTrigger::CrewPosted, shadow)?;
                 }
             }
             // colony → vessel: the member leaves the colony's crew

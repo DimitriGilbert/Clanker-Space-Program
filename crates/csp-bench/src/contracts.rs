@@ -246,6 +246,55 @@ pub fn contract_run(root: &Path, probe: &ContractProbe) -> Result<ContractReport
     })
 }
 
+/// The coverage legs' residence splice — the same save-boundary
+/// honesty class as `mark_facts` and the `PartTest` orbit splice:
+/// snapshot, rewrite the first vessel's residence, restore, and
+/// re-install the construction config restore drops.
+fn splice_vessel_state(
+    w: &mut World,
+    balance: &csp_data::BalanceDef,
+    seed: u64,
+    state: csp_sim::VesselState,
+) -> Result<(), ReplayError> {
+    let cfg = w.config();
+    let physics = cfg.physics.clone();
+    let mut snap = w.snapshot().map_err(ReplayError::Sim)?;
+    let v = snap
+        .vessels
+        .values_mut()
+        .next()
+        .ok_or(SimError::Fatal("coverage: no vessel to splice"))
+        .map_err(ReplayError::Sim)?;
+    // A colony join binds a LATCHED vessel — the restore gate
+    // refuses a joined vessel that is not `SurfaceLatched`, so the
+    // splice leaves the join behind when the residence does.
+    if !matches!(state, csp_sim::VesselState::SurfaceLatched(_)) {
+        v.joined_colony = None;
+    }
+    let vid = v.id;
+    v.state = state.clone();
+    // The pending rails-only events for that vessel die with the
+    // residence the same way `apply_to_bubble` drops them — a
+    // `SoiTransition`/`DebrisDecay`/`ManeuverNodeStart`/`PartFailure`
+    // on a latched vessel is exactly what the restore gate fatals on.
+    if matches!(state, csp_sim::VesselState::SurfaceLatched(_)) {
+        snap.event_heap.retain(|e| {
+            !matches!(
+                &e.kind,
+                csp_sim::EventKind::SoiTransition { vessel, .. }
+                    | csp_sim::EventKind::SoiRescan { vessel, .. }
+                    | csp_sim::EventKind::DebrisDecay { vessel, .. }
+                    | csp_sim::EventKind::ManeuverNodeStart { vessel, .. }
+                    | csp_sim::EventKind::PartFailure { vessel, .. }
+                    if *vessel == vid
+            )
+        });
+    }
+    *w = World::restore(w.orbits().clone(), physics, snap).map_err(ReplayError::Sim)?;
+    w.install_config(&cfg);
+    retune(w, balance, seed)
+}
+
 /// Re-install the tuning channels `WorldConfig` doesn't carry — a
 /// restore (`mark_facts`, the craft splice) resets them to the
 /// no-data `DEFAULT_*` mirrors, so the coverage world re-derives
@@ -280,6 +329,10 @@ pub enum CoverageKind {
     PartTest,
     /// `contract.colony_resupply` — body-scoped delivery sums.
     ColonyResupply,
+    /// `contract.crew_transport` — posted headcount at a site's colony.
+    CrewTransport,
+    /// `contract.tourist_flight` — regime witness + alive return.
+    TouristFlight,
 }
 
 /// One coverage run's verdict — which template, which offer, whether
@@ -347,6 +400,12 @@ pub fn coverage_run(
                 (csp_data::ContractKind::SatellitePlacement, 1),
             ][..],
         ),
+        // The 7.3 kinds gate on `tech.rocketry.3` alone (the
+        // tourist's `CrewLostAtMost(0)` holds on a no-death roster).
+        CoverageKind::CrewTransport | CoverageKind::TouristFlight => (
+            &["tech.science.1", "tech.rocketry.2", "tech.rocketry.3"][..],
+            &[][..],
+        ),
     };
     mark_facts(
         &mut w,
@@ -357,6 +416,33 @@ pub fn coverage_run(
         done,
     )?;
     retune(&mut w, &balance, seed)?;
+    // The crewed legs' staging: a crew-taking depot at the launch
+    // site BEFORE the publish re-draws — the transport draw's
+    // viability gate reads live colonies, and the tourist leg's
+    // roster→vessel posting path needs a colony to route through.
+    // The `LifeSupport` module keeps it crew-accepting under either
+    // life-support toggle (the authored rask-mines only qualifies
+    // with the toggle off).
+    if matches!(
+        kind,
+        CoverageKind::CrewTransport | CoverageKind::TouristFlight
+    ) {
+        let depot = csp_data::ColonyDef {
+            site: csp_data::SiteId::from("terrin-launch"),
+            display_name: csp_data::LocKey::from("colony.coverage-crew"),
+            modules: vec![
+                csp_data::ColonyModuleDef::Battery { capacity: 5_000.0 },
+                csp_data::ColonyModuleDef::LifeSupport {
+                    consumes_per_crew: vec![],
+                    power_ec_per_s: 0.0,
+                },
+            ],
+            stores: vec![],
+        };
+        w.enqueue(SourceClass::Ui, 0, SimCommand::FoundColony { def: depot });
+        w.step_frame(w.clock().ticks() + csp_core::TICK_HZ)
+            .map_err(ReplayError::Sim)?;
+    }
     w.step_frame(w.clock().ticks() + csp_core::TICK_HZ)
         .map_err(ReplayError::Sim)?;
 
@@ -412,6 +498,8 @@ pub fn coverage_run(
         CoverageKind::SurveyData => csp_data::ContractKind::SurveyRun,
         CoverageKind::PartTest => csp_data::ContractKind::PartTest,
         CoverageKind::ColonyResupply => csp_data::ContractKind::ColonyResupply,
+        CoverageKind::CrewTransport => csp_data::ContractKind::CrewTransport,
+        CoverageKind::TouristFlight => csp_data::ContractKind::TouristFlight,
     };
     let baseline = *w.contracts().facts.completed.get(&fact_kind).unwrap_or(&0);
     let mut accepted_params: Option<ContractParams> = None;
@@ -428,6 +516,12 @@ pub fn coverage_run(
             CoverageKind::PartTest => matches!(&o.params, ContractParams::PartTest { .. }),
             CoverageKind::ColonyResupply => {
                 matches!(&o.params, ContractParams::ColonyResupply { .. })
+            }
+            CoverageKind::CrewTransport => {
+                matches!(&o.params, ContractParams::CrewTransport { .. })
+            }
+            CoverageKind::TouristFlight => {
+                matches!(&o.params, ContractParams::TouristFlight { .. })
             }
         });
         if let Some(o) = fitting {
@@ -503,6 +597,165 @@ pub fn coverage_run(
                 0,
                 SimCommand::RecoverVessel {
                     vessel: csp_sim::VesselId(0),
+                    site: Some(csp_data::SiteId::from("terrin-launch")),
+                },
+            );
+            w.step_frame(w.clock().ticks() + csp_core::TICK_HZ)
+                .map_err(ReplayError::Sim)?;
+        }
+        Some(ContractParams::CrewTransport { site, count }) => {
+            // The draw's viability gate picked a site a live
+            // crew-taking colony occupies — post the (re-based)
+            // headcount through the real posting verbs. `count` is
+            // the active record's `posted_at_accept + drawn` ask.
+            let site = site.clone();
+            let need = *count;
+            let colony = *w
+                .colonies()
+                .iter()
+                .find(|(_, c)| c.site == site)
+                .map(|(id, _)| id)
+                .ok_or(SimError::Recoverable(
+                    "coverage: no colony at the drawn site",
+                ))
+                .map_err(ReplayError::Sim)?;
+            for i in 0..need {
+                w.enqueue(
+                    SourceClass::Ui,
+                    0,
+                    SimCommand::HireCrew {
+                        name: format!("hand{i}"),
+                        kind: csp_sim::CrewKind::Pilot,
+                        skill: 1,
+                        salary_per_s: 0.0,
+                    },
+                );
+                w.step_frame(w.clock().ticks() + csp_core::TICK_HZ)
+                    .map_err(ReplayError::Sim)?;
+                let crew = *w
+                    .economy()
+                    .crew
+                    .keys()
+                    .next_back()
+                    .ok_or(SimError::Fatal("coverage: hire produced no member"))
+                    .map_err(ReplayError::Sim)?;
+                w.enqueue(
+                    SourceClass::Ui,
+                    0,
+                    SimCommand::AssignCrewToColony { colony, crew },
+                );
+                w.step_frame(w.clock().ticks() + csp_core::TICK_HZ)
+                    .map_err(ReplayError::Sim)?;
+            }
+        }
+        Some(ContractParams::TouristFlight { .. }) => {
+            // The honest roster→vessel path: hire a tourist, post at
+            // the depot colony (id 1 — rask-mines is authored at 0),
+            // transfer aboard the latched crew hull, fly the regime,
+            // and bring them home through `RecoverVessel`.
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::HireCrew {
+                    name: "tourist".into(),
+                    kind: csp_sim::CrewKind::Tourist,
+                    skill: 1,
+                    salary_per_s: 0.0,
+                },
+            );
+            w.step_frame(w.clock().ticks() + csp_core::TICK_HZ)
+                .map_err(ReplayError::Sim)?;
+            let tourist = *w
+                .economy()
+                .crew
+                .keys()
+                .next_back()
+                .ok_or(SimError::Fatal("coverage: hire produced no member"))
+                .map_err(ReplayError::Sim)?;
+            let depot = csp_sim::ColonyId(1);
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::AssignCrewToColony {
+                    colony: depot,
+                    crew: tourist,
+                },
+            );
+            w.step_frame(w.clock().ticks() + csp_core::TICK_HZ)
+                .map_err(ReplayError::Sim)?;
+            let (craft, bom) = crate::scenarios::crew_craft();
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::ManufactureCraft {
+                    site: csp_data::SiteId::from("terrin-launch"),
+                    craft,
+                    build_resources: bom,
+                },
+            );
+            w.step_frame(w.clock().ticks() + 4_000)
+                .map_err(ReplayError::Sim)?;
+            let vessel = csp_sim::VesselId(0);
+            for cmd in [
+                SimCommand::JoinColonyInventory {
+                    vessel,
+                    colony: depot,
+                },
+                SimCommand::TransferColonyCrew {
+                    vessel,
+                    colony: depot,
+                    crew: tourist,
+                    to_colony: false,
+                },
+            ] {
+                w.enqueue(SourceClass::Ui, 0, cmd);
+                w.step_frame(w.clock().ticks() + csp_core::TICK_HZ)
+                    .map_err(ReplayError::Sim)?;
+            }
+            // The crew pipe's traversal delay lands the member aboard.
+            w.step_frame(w.clock().ticks() + 640 + csp_core::TICK_HZ)
+                .map_err(ReplayError::Sim)?;
+            // Splice the crewed hull onto a 500 km terrin orbit —
+            // the PartTest leg's honesty class — then fly it back
+            // through REAL commands: `ToBubble` + `ToRails`, whose
+            // `OrbitAchieved` notify is the production witness.
+            let epoch = csp_core::SimTime::from_ticks(w.clock().ticks());
+            splice_vessel_state(
+                &mut w,
+                &balance,
+                seed,
+                csp_sim::VesselState::OnRails(csp_sim::orbit::OrbitState {
+                    parent: csp_data::BodyId::from("terrin"),
+                    elements: terrin_circular(500_000.0),
+                    epoch,
+                }),
+            )?;
+            w.enqueue(SourceClass::Ui, 0, SimCommand::ToBubble { vessel });
+            w.step_frame(w.clock().ticks() + csp_core::TICK_HZ)
+                .map_err(ReplayError::Sim)?;
+            w.enqueue(SourceClass::Ui, 0, SimCommand::ToRails { vessel });
+            w.step_frame(w.clock().ticks() + csp_core::TICK_HZ)
+                .map_err(ReplayError::Sim)?;
+            // The return leg: splice to a surface latch at the pad
+            // (same honesty class), then the real `RecoverVessel`
+            // walks the flown tourist home `Active` + `Unassigned`.
+            splice_vessel_state(
+                &mut w,
+                &balance,
+                seed,
+                csp_sim::VesselState::SurfaceLatched(csp_sim::SurfacePose {
+                    body: csp_data::BodyId::from("terrin"),
+                    latitude_rad: -0.092,
+                    longitude_rad: 2.916,
+                    altitude_m: 0.0,
+                    orientation: csp_core::DQuat::IDENTITY,
+                }),
+            )?;
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::RecoverVessel {
+                    vessel,
                     site: Some(csp_data::SiteId::from("terrin-launch")),
                 },
             );
@@ -654,7 +907,10 @@ mod tests {
     /// real command verbs (manufacture → latch → run → recover);
     /// part_test completes on a craft-carrying rails vessel;
     /// colony_resupply's body-scoped sum is proven by NOT completing
-    /// on real terrin deliveries while the ledger grows.
+    /// on real terrin deliveries while the ledger grows; 7.3's
+    /// crew_transport completes on real `HireCrew` →
+    /// `AssignCrewToColony` postings and tourist_flight on the
+    /// roster→colony→vessel→`ToRails`→`RecoverVessel` arc.
     #[test]
     fn every_template_is_exercisable() {
         let root = data_root();
@@ -667,6 +923,8 @@ mod tests {
             // does NOT count terrin deliveries (documented in
             // `coverage_run`).
             (CoverageKind::ColonyResupply, 0),
+            (CoverageKind::CrewTransport, 1),
+            (CoverageKind::TouristFlight, 1),
         ] {
             let report = coverage_run(&root, kind, 5).unwrap();
             assert_eq!(

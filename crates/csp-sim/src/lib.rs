@@ -170,7 +170,8 @@ pub use colonies::{
     colony_env_from_body_defs,
 };
 pub use contracts::{
-    ActiveContract, ContractConfig, ContractFacts, ContractId, ContractOffer, ContractState,
+    ActiveContract, ContractConfig, ContractFacts, ContractId, ContractOffer, ContractProgress,
+    ContractState,
 };
 pub use economy::{
     ColonyId, CrewKind, CrewLocation, CrewMember, CrewStatus, EconomyConfig, EconomyState,
@@ -10925,6 +10926,24 @@ fn restore_contract_state(
         }
         if !contracts::params_ok(&a.params) {
             return Err(SimError::Fatal("snapshot: contract with non-finite params"));
+        }
+        // The progress record is kind-scoped: `Some` only on a
+        // `TouristFlight` record, and then the `TouristFlight`
+        // variant — a crafted pairing would carry progress the
+        // params can't read (the deadline-pairing precedent: an
+        // incoherent record is a crafted lie, `Fatal`).
+        if a.progress.is_some()
+            && !matches!(
+                (&a.params, &a.progress),
+                (
+                    csp_data::ContractParams::TouristFlight { .. },
+                    Some(contracts::ContractProgress::TouristFlight { .. })
+                )
+            )
+        {
+            return Err(SimError::Fatal(
+                "snapshot: contract progress / params mismatch",
+            ));
         }
     }
     check_record_event_pair(

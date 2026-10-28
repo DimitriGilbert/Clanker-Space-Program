@@ -40,7 +40,7 @@ fn loaded() -> (
 #[test]
 fn contract_templates_validate_against_shipping_data() {
     let (contracts, sys, experiments, tree, res, sites) = loaded();
-    assert_eq!(contracts.contracts.len(), 6);
+    assert_eq!(contracts.contracts.len(), 8);
     let errors = csp_data::validate_contracts(&contracts, &sys, &experiments, &tree, &res, &sites);
     assert!(errors.is_empty(), "{errors:?}");
 }
@@ -203,4 +203,65 @@ fn contracts_completed_prereq_must_name_an_authored_kind() {
         )),
         "an unauthored ContractsCompleted kind must fail validation: {errors:?}"
     );
+}
+
+/// 7.3 (C34-F5): a `CrewTransport` candidate site must resolve in
+/// `sites.ron` — colonies (the posting the predicate counts) exist
+/// only at authored sites, so an unknown site id is a draw that can
+/// never complete.
+#[test]
+fn transport_candidate_site_must_resolve() {
+    let (mut contracts, sys, experiments, tree, res, sites) = loaded();
+    let transport = contracts
+        .contracts
+        .iter_mut()
+        .find(|c| c.def.id.as_str() == "contract.crew_transport")
+        .unwrap();
+    let csp_data::ContractParamSpace::CrewTransport {
+        sites: candidates, ..
+    } = &mut transport.def.generate.space
+    else {
+        panic!("contract.crew_transport is not a CrewTransport")
+    };
+    candidates.push(csp_data::SiteId::from("nowhere"));
+    let errors = csp_data::validate_contracts(&contracts, &sys, &experiments, &tree, &res, &sites);
+    assert!(
+        errors.iter().any(|e| matches!(
+            e,
+            csp_data::ValidationError::BadContract { contract, reason }
+                if contract == "contract.crew_transport" && reason.contains("sites.ron")
+        )),
+        "an unresolved transport site must fail validation: {errors:?}"
+    );
+}
+
+/// 7.3 (C34-F5): the transport headcount draw is `1 <= lo <= hi` —
+/// a zero floor draws a trivially-met ask, an inverted range is
+/// authored nonsense.
+#[test]
+fn transport_count_range_is_validated() {
+    let (mut contracts, sys, experiments, tree, res, sites) = loaded();
+    for range in [(0u32, 2u32), (4u32, 2u32)] {
+        let transport = contracts
+            .contracts
+            .iter_mut()
+            .find(|c| c.def.id.as_str() == "contract.crew_transport")
+            .unwrap();
+        let csp_data::ContractParamSpace::CrewTransport { count, .. } =
+            &mut transport.def.generate.space
+        else {
+            panic!("contract.crew_transport is not a CrewTransport")
+        };
+        *count = range;
+        let errors =
+            csp_data::validate_contracts(&contracts, &sys, &experiments, &tree, &res, &sites);
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                csp_data::ValidationError::BadContract { contract, reason }
+                    if contract == "contract.crew_transport" && reason.contains("count range")
+            )),
+            "count range {range:?} must fail validation: {errors:?}"
+        );
+    }
 }

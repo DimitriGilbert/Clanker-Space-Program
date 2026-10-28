@@ -12,10 +12,12 @@
 //!
 //! §3.6 names seven: satellite placement, crew transport, rescue,
 //! survey data run, part test at regime, base resupply, tourist
-//! flight. Four are implemented in M7-D, chosen for what the sim
-//! can *evaluate* today — completion is a predicate over sim state
-//! checked on relevant events, so a kind whose truth lives in
-//! machinery that does not exist yet cannot be authored honestly:
+//! flight. M7-D shipped the four whose predicates had honest
+//! sim-state machinery, M8-C added the resupply, and fix-plan 7.3
+//! (C34-F5) landed the two crewed kinds once the crew machinery
+//! (`TransferCargo::Crew`, `land_crew`, `CrewLocation`) could prove
+//! their facts. Completion is a predicate over sim state checked on
+//! relevant events:
 //!
 //! - [`ContractKind::SatellitePlacement`] — a vessel reaches a
 //!   matching orbit (checked on orbit-achieved triggers).
@@ -30,11 +32,17 @@
 //!   units delivered into the stores of colonies on a body (checked on
 //!   `TransferComplete` landings — the vessel↔colony transfer is the
 //!   only producer of the delivery fact).
+//! - [`ContractKind::CrewTransport`] — deliver N crew to a named site:
+//!   roster members posted at the colony occupying the site, via
+//!   `AssignCrewToColony` or the vessel↔colony crew transfer (checked
+//!   on the crew-posting transitions).
+//! - [`ContractKind::TouristFlight`] — fly a `CrewKind::Tourist`
+//!   through a drawn regime and return them alive: leg one stamps the
+//!   rider on the orbit/surface triggers, leg two completes when the
+//!   flown member is home (`Unassigned`) and `Active` — the recovery
+//!   transition's crew walk.
 //!
-//! Crew transport and tourist flight are deferred: their predicates
-//! bind facilities and crew itineraries in ways v1 has no honest
-//! sim-state reading for. Their `contract_types` unlock markers in the
-//! tech tree stay opaque until they land.
+//! All seven §3.6 v1 kinds are authored (C34-F5 / fix-plan 7.3).
 //!
 //! # Prerequisites — facts, not reputation
 //!
@@ -47,7 +55,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{BodyId, ContractTypeId, ExperimentId, LocKey, ResourceId, TechNodeId};
+use crate::ids::{BodyId, ContractTypeId, ExperimentId, LocKey, ResourceId, SiteId, TechNodeId};
 
 /// The `schema_version` this loader understands for
 /// `data/contracts/*.ron` — its own namespace (§3.1 first-field
@@ -74,6 +82,12 @@ pub enum ContractKind {
     /// Resource units are delivered into colony stores on a body —
     /// the base resupply (M8-C).
     ColonyResupply = 4,
+    /// Crew posted at the colony occupying a named site — the crew
+    /// transport.
+    CrewTransport = 5,
+    /// A tourist rides a vessel through a regime and returns alive —
+    /// the tourist flight.
+    TouristFlight = 6,
 }
 
 impl csp_core::StableDiscriminant for ContractKind {
@@ -193,9 +207,32 @@ pub enum ContractParamSpace {
         /// `(lo, hi)` draw range for the required delivered units.
         amount: (f64, f64),
     },
+    /// `CrewTransport`: draw `site`, then the headcount uniform over
+    /// `count`'s INCLUSIVE `(lo, hi)` integer range. The sim filters
+    /// `sites` to those hosting a live colony that can take crew
+    /// before the pick (the resupply draw's completability gate —
+    /// a transport offer against nowhere to post could never
+    /// complete).
+    CrewTransport {
+        /// Candidate sites whose colonies receive the crew —
+        /// non-empty; every entry must resolve in `sites.ron`
+        /// (colonies exist only at authored sites).
+        sites: Vec<SiteId>,
+        /// `(lo, hi)` draw range for the required headcount —
+        /// `1 <= lo <= hi` (validator).
+        count: (u32, u32),
+    },
+    /// `TouristFlight`: draw the regime the tourist must ride
+    /// through before coming home — the same `RegimeSpace` the part
+    /// test draws (orbit with an altitude draw, or landed).
+    TouristFlight {
+        /// The flight-profile regime space.
+        regime: RegimeSpace,
+    },
 }
 
-/// The regime a [`ContractKind::PartTest`] offer demands — the
+/// The regime a [`ContractKind::PartTest`] or
+/// [`ContractKind::TouristFlight`] offer demands — the
 /// generation-space form (with candidate bodies and draw ranges).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -239,7 +276,8 @@ pub enum ModuleReq {
 }
 
 /// A concrete generated regime — the sim-state form of
-/// [`RegimeSpace`] after the draw.
+/// [`RegimeSpace`] after the draw (shared by `PartTest` and
+/// `TouristFlight` params).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum ContractRegime {
@@ -315,6 +353,27 @@ pub enum ContractParams {
         /// on the body.
         amount: f64,
     },
+    /// `CrewTransport`: at least `count` `Active` roster members are
+    /// posted at colonies occupying `site`. The accept re-bases the
+    /// ask to `posted_at_accept + drawn` — crew already stationed
+    /// never satisfies a fresh signature (the resupply re-base
+    /// precedent for cumulative asks).
+    CrewTransport {
+        /// The site whose colony(ies) receive the crew.
+        site: SiteId,
+        /// Required posted headcount — post-re-base an absolute
+        /// level, not a delta.
+        count: u32,
+    },
+    /// `TouristFlight`: a `CrewKind::Tourist` roster member rode a
+    /// vessel satisfying `regime` while the contract was active
+    /// (recorded in the sim-side progress, not here — the params
+    /// stay the frozen offer draw), then reads `Active` +
+    /// `Unassigned`: home, alive.
+    TouristFlight {
+        /// The regime the flight profile had to demonstrate.
+        regime: ContractRegime,
+    },
 }
 
 impl ContractParams {
@@ -327,6 +386,8 @@ impl ContractParams {
             Self::PartTest { .. } => ContractKind::PartTest,
             Self::Rescue { .. } => ContractKind::Rescue,
             Self::ColonyResupply { .. } => ContractKind::ColonyResupply,
+            Self::CrewTransport { .. } => ContractKind::CrewTransport,
+            Self::TouristFlight { .. } => ContractKind::TouristFlight,
         }
     }
 }

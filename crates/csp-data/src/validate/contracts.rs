@@ -27,6 +27,7 @@ fn validate_contract_space(
     space: &crate::contract::ContractParamSpace,
     body_ids: &BTreeSet<&str>,
     site_bodies: &BTreeSet<&str>,
+    site_ids: &BTreeSet<&str>,
     experiment_ids: &BTreeSet<&str>,
     res: &ResourceFile,
     out: &mut Vec<ValidationError>,
@@ -58,6 +59,21 @@ fn validate_contract_space(
         } else {
             out.push(bad(what));
             false
+        }
+    };
+    // The regime-space check `PartTest` and `TouristFlight` share —
+    // same authored shape, same rules.
+    let check_regime = |regime: &RegimeSpace, out: &mut Vec<ValidationError>| match regime {
+        RegimeSpace::Orbit { bodies, min_alt_m } => {
+            check_bodies(bodies, out);
+            range_ok(
+                *min_alt_m,
+                "regime orbit min_alt range is not 0 < lo <= hi",
+                out,
+            );
+        }
+        RegimeSpace::Landed { bodies } => {
+            check_bodies(bodies, out);
         }
     };
     match (kind, space) {
@@ -129,19 +145,7 @@ fn validate_contract_space(
                     out.push(bad("module requirement names an unloaded experiment"));
                 }
             }
-            match regime {
-                RegimeSpace::Orbit { bodies, min_alt_m } => {
-                    check_bodies(bodies, out);
-                    range_ok(
-                        *min_alt_m,
-                        "part-test orbit min_alt range is not 0 < lo <= hi",
-                        out,
-                    );
-                }
-                RegimeSpace::Landed { bodies } => {
-                    check_bodies(bodies, out);
-                }
-            }
+            check_regime(regime, out);
         }
         (crate::contract::ContractKind::Rescue, ContractParamSpace::Rescue { bodies }) => {
             check_bodies(bodies, out);
@@ -178,6 +182,33 @@ fn validate_contract_space(
             }
             range_ok(*amount, "resupply amount range is not 0 < lo <= hi", out);
         }
+        (
+            crate::contract::ContractKind::CrewTransport,
+            ContractParamSpace::CrewTransport { sites, count },
+        ) => {
+            // The C32-F1 resupply rule a level down: colonies exist
+            // only at authored sites, so a transport candidate must
+            // NAME an authored site — the draw's live-colony filter
+            // is the runtime net, not a license to author a site the
+            // system doesn't have.
+            if sites.is_empty() {
+                out.push(bad("transport candidates: no sites authored"));
+            }
+            for s in sites {
+                if !site_ids.contains(s.as_str()) {
+                    out.push(bad("transport candidate site is not in sites.ron"));
+                }
+            }
+            if !(count.0 >= 1 && count.0 <= count.1) {
+                out.push(bad("transport count range is not 1 <= lo <= hi"));
+            }
+        }
+        (
+            crate::contract::ContractKind::TouristFlight,
+            ContractParamSpace::TouristFlight { regime },
+        ) => {
+            check_regime(regime, out);
+        }
         _ => out.push(bad("kind and generate.space variants disagree")),
     }
 }
@@ -203,6 +234,9 @@ fn validate_contract_space(
 /// - `ColonyResupply` candidate bodies each host ≥1 site — colonies
 ///   exist only at authored sites, so a siteless body can never
 ///   grow the store a delivery needs (C32-F1);
+/// - `CrewTransport` candidate sites each resolve in `sites.ron` and
+///   `count` is `1 <= lo <= hi` — colonies (the posting the
+///   predicate counts) exist only at authored sites;
 /// - prerequisites well-formed: no duplicates, `count > 0`, tech
 ///   ids resolvable in the merged tree, body ids in the system, and
 ///   `ContractsCompleted { kind }` naming an authored template kind
@@ -227,6 +261,10 @@ pub fn validate_contracts(
     // authored sites only, so the resupply candidate check reads
     // this set (C32-F1).
     let site_bodies: BTreeSet<&str> = sites.sites.iter().map(|s| s.body.as_str()).collect();
+    // The authored site ids the `CrewTransport` candidates name —
+    // colonies (the posting the contract counts) exist only at
+    // authored sites.
+    let site_ids: BTreeSet<&str> = sites.sites.iter().map(|s| s.id.as_str()).collect();
     let experiment_ids: BTreeSet<&str> = experiments
         .experiments
         .iter()
@@ -301,6 +339,7 @@ pub fn validate_contracts(
             &d.generate.space,
             &body_ids,
             &site_bodies,
+            &site_ids,
             &experiment_ids,
             res,
             &mut out,

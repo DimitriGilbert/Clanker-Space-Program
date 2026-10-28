@@ -4884,7 +4884,7 @@ fn stage_program_overview(
             ),
             // W2.1: the completion predicate's live reading — the
             // per-kind progress line (delivery counts, band checks).
-            progress: contract_progress(sim, &c.params),
+            progress: contract_progress(sim, c),
         });
     }
     let tech = sim.tech();
@@ -5085,6 +5085,18 @@ fn contract_params_summary(p: &csp_data::ContractParams) -> String {
             resource,
             amount,
         } => format!("deliver {amount:.0} {resource} to colonies on {body}"),
+        P::CrewTransport { site, count } => {
+            format!("deliver {count} crew to the colony at {site}")
+        }
+        P::TouristFlight { regime } => {
+            let regime = match regime {
+                csp_data::ContractRegime::Orbit { body, min_alt_m } => {
+                    format!("orbit {body} above {:.0} km", min_alt_m / 1.0e3)
+                }
+                csp_data::ContractRegime::Landed { body } => format!("land on {body}"),
+            };
+            format!("fly a tourist to {regime} and bring them home")
+        }
     }
 }
 
@@ -5151,9 +5163,12 @@ fn colony_module_label(d: &csp_data::ColonyModuleDef) -> String {
 /// The active contract's live progress line (W2.1) — the completion
 /// predicate's measurable half, per kind. Mirrors the sim's
 /// `objective_met`/`survey_returned_units` reads over the same state.
+/// Takes the whole record — `TouristFlight`'s second leg reads the
+/// progress state the params don't carry.
 #[allow(clippy::too_many_lines)] // one arm per contract kind
-fn contract_progress(sim: &SimWorld, params: &csp_data::ContractParams) -> String {
+fn contract_progress(sim: &SimWorld, contract: &csp_sim::ActiveContract) -> String {
     use csp_data::ContractParams as P;
+    let params = &contract.params;
     match params {
         P::SatelliteOrbit { body, .. } => {
             // The predicate's orbit scan: any non-debris rails vessel
@@ -5280,6 +5295,44 @@ fn contract_progress(sim: &SimWorld, params: &csp_data::ContractParams) -> Strin
                 })
                 .sum();
             format!("delivered {delivered:.1}/{amount:.0} {resource}")
+        }
+        P::CrewTransport { site, count } => {
+            // The predicate's level read: `Active` roster members
+            // posted at colonies occupying the site.
+            let posted = sim
+                .economy()
+                .crew
+                .values()
+                .filter(|m| {
+                    m.status == csp_sim::CrewStatus::Active
+                        && matches!(&m.location, csp_sim::CrewLocation::Colony(c)
+                            if sim.colonies().get(c).is_some_and(|co| co.site == *site))
+                })
+                .count();
+            format!("posted {posted}/{count} crew at {site}")
+        }
+        P::TouristFlight { .. } => {
+            // Leg one's witness count + leg two's return read —
+            // the sim's `stamp_tourist_flown`/`objective_met` pair.
+            let Some(csp_sim::ContractProgress::TouristFlight { flown }) = &contract.progress
+            else {
+                return "awaiting the flight".to_string();
+            };
+            let home = flown
+                .iter()
+                .filter(|id| {
+                    sim.economy().crew.get(id).is_some_and(|m| {
+                        m.kind == csp_sim::CrewKind::Tourist
+                            && m.status == csp_sim::CrewStatus::Active
+                            && m.location == csp_sim::CrewLocation::Unassigned
+                    })
+                })
+                .count();
+            if home > 0 {
+                "a tourist is home".to_string()
+            } else {
+                format!("{} tourist(s) flown — awaiting their return", flown.len())
+            }
         }
     }
 }
