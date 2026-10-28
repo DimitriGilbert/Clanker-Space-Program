@@ -534,6 +534,10 @@ pub struct ProgramInput {
     /// (`colony_founding_cost_funds`, whole funds) — the sites
     /// section's "found outpost" gate/label.
     pub colony_founding_cost: f64,
+    /// C09-F6: `RepairColonyModule`'s authored debit
+    /// (`colony_module_repair_cost_funds`, whole funds) — the colony
+    /// card's repair-button gate/label.
+    pub colony_repair_cost: f64,
     /// W2.5 — the automation surface. Scripts bound to the focused
     /// vessel.
     pub scripts: Vec<ScriptRow>,
@@ -680,6 +684,15 @@ pub enum ProgramCommand {
     AbandonColony {
         /// The colony to abandon.
         colony: u64,
+    },
+    /// Restore a damaged colony module → `RepairColonyModule`
+    /// (C09-F6 — the paid exit out of `Degraded{ImpactDamage}`; the
+    /// row carries the `ModuleIndex` the sim verb names).
+    RepairColonyModule {
+        /// The colony owning the module.
+        colony: u64,
+        /// The `ModuleIndex` to repair.
+        module: u64,
     },
     /// Schedule the colony's next inspection →
     /// `ScheduleColonyInspection` (the view resolves the tick).
@@ -1358,6 +1371,45 @@ fn colonies_section(
                     .color(dim)
                     .small(),
             );
+        }
+        // C09-F6: the repair verb's affordance — one button per
+        // damaged module (the sim names modules by `ModuleIndex`,
+        // which is the row order). Live colonies only — the apply
+        // refuses `Dormant`/`Abandoned` — and the button gates on
+        // the authored charge like "found outpost" does.
+        if c.live {
+            for (i, m) in c.modules.iter().enumerate() {
+                if !m.damaged {
+                    continue;
+                }
+                let can_pay = input.funds >= input.colony_repair_cost;
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("    ").font(MONO).small());
+                    if ui
+                        .add_enabled(
+                            can_pay,
+                            egui::Button::new(format!("repair {}", m.label)).small(),
+                        )
+                        .on_hover_text(if can_pay {
+                            format!(
+                                "restore this module (₣{:.0} — clears the damage flag; the colony leaves degraded: impact damage once nothing is broken)",
+                                input.colony_repair_cost
+                            )
+                        } else {
+                            format!(
+                                "repair costs ₣{:.0} — not enough funds",
+                                input.colony_repair_cost
+                            )
+                        })
+                        .clicked()
+                    {
+                        out.push(ProgramCommand::RepairColonyModule {
+                            colony: c.id,
+                            module: i as u64,
+                        });
+                    }
+                });
+            }
         }
         for s in &c.stores {
             ui.label(

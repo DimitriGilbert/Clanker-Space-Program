@@ -169,6 +169,22 @@ pub fn validate_balance(
         b.colony_founding_cost_funds,
         &mut out,
     );
+    // C09-F6: the `RepairColonyModule` debit — free is legal, a NaN
+    // or negative cost is not (`to_micros` is the mirror).
+    nonneg(
+        "colony_module_repair_cost_funds",
+        b.colony_module_repair_cost_funds,
+        &mut out,
+    );
+    // C14-F3: η is dimensionless and non-negative — `Environment`
+    // carries it into the M4b tick verbatim (η = 0 authors the
+    // convective channel off, the `eta_scales_convective_input`
+    // contract); negative would cool by flying fast.
+    nonneg(
+        "convective_heat_fraction",
+        b.convective_heat_fraction,
+        &mut out,
+    );
     // `EconomyConfig::is_valid`'s finite-≥0 mirror — a NaN or negative
     // salary/upkeep passes the loader but `set_economy_config`/
     // `World::restore` rejects it.

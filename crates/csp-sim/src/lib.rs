@@ -1304,6 +1304,29 @@ pub enum SimCommand {
         /// The build order to cancel.
         build: manufacture::BuildId,
     },
+    /// C09-F6 §3.5.1's repair verb — the doc-promised post-M8-A
+    /// follow-up to the M8-C impact seam: clear one module's
+    /// `damaged` flag for the authored
+    /// `colony_module_repair_cost_funds` debit
+    /// (`FundsReason::ColonyModuleRepair`), and lift the colony's
+    /// `Degraded{ImpactDamage}` to `Nominal` when the flag it
+    /// cleared was the last damage standing (a `Degraded{PowerLost}`
+    /// colony keeps its reason — power starvation is the network's
+    /// business, not the repair's). A `Nominal` colony can carry
+    /// damaged modules (a `PowerRestored` lift keeps the flags), so
+    /// repairing under `Nominal` is legal and changes no state tag.
+    /// `Recoverable`: unknown colony/module, colony not live
+    /// (`Dormant`/`Abandoned`), module not damaged, insufficient
+    /// funds. Issued by the program window's colony card — a repair
+    /// button per damaged module row. Appended last per the enum's
+    /// append-only variant order — the `command_log` stream encodes
+    /// variant indices.
+    RepairColonyModule {
+        /// The colony whose module is repaired.
+        colony: ColonyId,
+        /// The `ModuleIndex` to restore.
+        module: usize,
+    },
 }
 
 impl SimCommand {
@@ -5563,6 +5586,9 @@ impl World {
             SimCommand::ScheduleColonyInspection { colony, tick } => {
                 self.apply_schedule_inspection(*colony, *tick, shadow)?
             }
+            SimCommand::RepairColonyModule { colony, module } => {
+                self.apply_repair_module(*colony, *module, self.clock.ticks(), shadow)?
+            }
             SimCommand::ManufactureCraft {
                 site,
                 craft,
@@ -9152,6 +9178,7 @@ impl World {
         h.f64(self.economy_cfg.site_upkeep_funds_per_s);
         h.u64(self.economy_cfg.attrition_grace_periods);
         h.u64(self.economy_cfg.colony_founding_cost_micros);
+        h.u64(self.economy_cfg.colony_module_repair_cost_micros);
         economy::hash_economy(&mut h, &self.economy);
         // M7-D: the §2.7 save seed (the offer draw input), the
         // contract tunables, and the §3.6 contract book — offers,
@@ -17667,9 +17694,10 @@ mod tests {
     #[test]
     fn overheat_destroys_vessel() {
         let mut w = physics_world(false);
-        // 2 km/s at 10 km: ρ≈0.21 → q̇/A ≈ 0.005·0.5·0.21·8e9 ≈
-        // 4.3e6 W/m² → ~43 K/s into a 100 kJ/K lump — a 350 K ceiling
-        // (~60 K over ambient) crosses in ~1.5 s of descent.
+        // 2 km/s at 10 km: ρ≈0.21 → q̇/A ≈ 0.02·0.5·0.21·8e9 ≈
+        // 1.7e7 W/m² → ~170 K/s into a 100 kJ/K lump — a 350 K
+        // ceiling (~60 K over ambient) crosses in well under a
+        // second of descent.
         spawn_falling(
             &mut w,
             thermal_craft(100_000.0, 350.0, 60.0),
@@ -17977,7 +18005,7 @@ mod tests {
     #[test]
     fn reentry_heating_survivable() {
         let mut w = physics_world(false);
-        // 1200 m/s at 20 km: q̇/A ≈ 0.005·0.5·0.05·1.7e9 ≈ 2.2e5 W/m² —
+        // 1200 m/s at 20 km: q̇/A ≈ 0.02·0.5·0.05·1.7e9 ≈ 8.5e5 W/m² —
         // a real but sublethal pulse for a 400 kJ/K, 1100 K part.
         // (Ambient at 20 km is ~263 K — the 2-knot table interpolates.)
         spawn_falling(
@@ -18007,12 +18035,69 @@ mod tests {
         assert!(peak > t0 + 1.0, "no heating observed: {t0} -> {peak} K");
         assert!(peak < 1_100.0, "lethal reentry: {peak} K");
         // Deterministic regression pin: the peak measured on this rig
-        // is 273.98 K (ambient ~263 K at 20 km, +11 K pulse) — a ±0.5 K
-        // bound keeps the integration pinned without re-running the
-        // measurement on every refactor.
+        // is 306.80 K (ambient ~263 K at 20 km, a ~44 K pulse at the
+        // calibrated η = 0.02 — the C14-F3 number that makes shipped
+        // part limits reachable) — a ±0.5 K bound keeps the
+        // integration pinned without re-running the measurement on
+        // every refactor.
         assert!(
-            (peak - 273.98).abs() < 0.5,
-            "reentry peak drifted: {peak} K (expected ~273.98 K)"
+            (peak - 306.80).abs() < 0.5,
+            "reentry peak drifted: {peak} K (expected ~306.80 K)"
+        );
+    }
+
+    /// C14-F3's M4b "lethal in the right places" calibration pin:
+    /// the shipped η (0.02) burns the small low-margin part classes
+    /// on an aggressive steep entry while the pod class survives the
+    /// same profile. At the pre-calibration η (0.005) even this
+    /// 2.3 km/s straight-down drop peaked ~200–260 K against the
+    /// authored 800–1600 K limits — lethality was unreachable on
+    /// shipped parts.
+    #[test]
+    fn reentry_lethal_on_steep_profile() {
+        // The battery/chute/canister class — 20–50 kJ/K lumps,
+        // 800–1000 K ceilings — burns up mid-descent at orbital
+        // speed straight down (the review's worst-case rig).
+        for &(cap, max) in &[(20_000.0, 800.0), (40_000.0, 900.0), (50_000.0, 1_000.0)] {
+            let mut w = physics_world(false);
+            spawn_falling(&mut w, thermal_craft(cap, max, 60.0), 69_000.0, 2_300.0);
+            for _ in 0..120 {
+                w.step_frame(w.clock().ticks() + 64).unwrap();
+                if w.vessels().get(&VesselId(0)).is_none() {
+                    break;
+                }
+            }
+            assert!(
+                w.vessels().get(&VesselId(0)).is_none(),
+                "{cap} J/K {max} K part survived a steep orbital-speed entry"
+            );
+        }
+        // The pod class — 400 kJ/K, 1200 K — takes the same drop and
+        // lands: peaks ~360 K, real margin under its authored limit.
+        let mut w = physics_world(false);
+        spawn_falling(
+            &mut w,
+            thermal_craft(400_000.0, 1_200.0, 60.0),
+            69_000.0,
+            2_300.0,
+        );
+        let mut peak = 0.0f64;
+        for _ in 0..120 {
+            w.step_frame(w.clock().ticks() + 64).unwrap();
+            let Some(v) = w.vessels().get(&VesselId(0)) else {
+                break;
+            };
+            for t in v.thermal.part_temps_k.values() {
+                peak = peak.max(*t);
+            }
+        }
+        assert!(
+            w.vessels().get(&VesselId(0)).is_some(),
+            "the pod class must survive the steep entry (peak {peak:.1} K)"
+        );
+        assert!(
+            peak > 300.0 && peak < 1_200.0,
+            "pod-class peak out of band: {peak:.1} K"
         );
     }
 

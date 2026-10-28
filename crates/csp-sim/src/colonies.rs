@@ -85,16 +85,19 @@
 //! depleted even while a consumable reserve stays stocked (a
 //! power-pinned module cannot run at all; unsatisfied requests are
 //! depletion evidence).
-//! `PowerRestored` is the ONLY way out of `Degraded`, and only
-//! for `reason: PowerLost`: **`Degraded{ImpactDamage}` is terminal**
-//! — the repair command the M8-A doc promised stays unlanded even
-//! though the impact-detection hook (M8-C) has; that terminal-ness
-//! is the recorded v1 decision (§6.5's ritual), not a hook to come.
-//! Impact damage marks a colony dead without killing its crew, and
-//! every hit logs a `ColonyDamaged` notification (C09-F6). If damage lands while a colony is already
+//! `PowerRestored` exits `Degraded` only for `reason: PowerLost`;
+//! `Degraded{ImpactDamage}`'s exit is **`SimCommand::
+//! RepairColonyModule`** (C09-F6 — the doc-promised post-M8-A
+//! follow-up): for the authored `colony_module_repair_cost_funds`
+//! debit it clears one module's `damaged` flag, and lifts the
+//! `ImpactDamage` reason to `Nominal` once no damage stands. Every
+//! hit logs a `ColonyDamaged` notification and every repair a
+//! `ColonyModuleRepaired` one. If damage lands while a colony is already
 //! `Degraded{PowerLost}`, the `PowerLost` reason wins (the apply only
 //! records `ImpactDamage` from `Nominal`) — `PowerRestored` can still
-//! return it to `Nominal`, damaged modules and all.
+//! return it to `Nominal`, damaged modules and all (and repairing a
+//! module under `PowerLost` clears the flag without touching the
+//! reason — power starvation is the network's business).
 //!
 //! # Stale events
 //!
@@ -200,9 +203,10 @@ pub enum DegradeReason {
     /// drain, life support on reserves).
     PowerLost = 0,
     /// A crashing vessel's impact damaged modules (§3.5.1 rule 5's
-    /// "a `Degraded` reason"); marked via
-    /// `SimCommand::DamageColonyModule` — the bubble-impact detection
-    /// that would drive it in play is not part of M8-B's scope.
+    /// "a `Degraded` reason"); driven in play by M8-C's
+    /// `apply_surface_impacts`, marked in tests via
+    /// `SimCommand::DamageColonyModule`, and lifted by
+    /// `SimCommand::RepairColonyModule` once no damage stands.
     ImpactDamage = 1,
 }
 
@@ -2352,12 +2356,11 @@ impl World {
     /// (M8-C's `apply_surface_impacts` is the real in-play driver;
     /// this command exercises the same bookkeeping in tests). A
     /// dormant or abandoned colony takes no new damage —
-    /// it is already inert by state. There is no repair path —
-    /// `ImpactDamage` is a terminal `Degraded` reason (only a
-    /// `PowerLost` reason can leave `Degraded`, via `PowerRestored`),
-    /// and a `Degraded{PowerLost}` colony keeps its existing reason
+    /// it is already inert by state. The repair path is
+    /// [`Self::apply_repair_module`] (C09-F6); a
+    /// `Degraded{PowerLost}` colony keeps its existing reason
     /// rather than switching. Every landed hit posts a
-    /// `ColonyDamaged` notification (C09-F6).
+    /// `ColonyDamaged` notification.
     /// `tick` is the tick the damage lands at — the recompute anchors
     /// there. The command path passes the drain boundary's clock; the
     /// impact seam passes the impact's own tick so the damage is not
@@ -2394,14 +2397,92 @@ impl World {
         }
         // C09-F6: the damage was terminal-but-silent — the LOG ring
         // now carries it (program-level entry, the contract-kind
-        // convention; impact damage stays a terminal `Degraded`
-        // reason — the repair verb is post-v1 scope, §6.5's ritual).
+        // convention).
         self.notify(
             crate::reliability::Notification {
                 tick: self.clock.ticks(),
                 vessel: crate::reliability::PROGRAM_VESSEL,
                 node: None,
                 kind: crate::reliability::NotificationKind::ColonyDamaged {
+                    colony: id.0,
+                    module: module as u64,
+                },
+            },
+            shadow,
+        );
+        self.recompute_colony(id, tick, shadow)
+    }
+
+    /// `RepairColonyModule` — C09-F6's doc-promised repair path: for
+    /// the authored `colony_module_repair_cost_funds` debit, clear
+    /// one module's `damaged` flag and, when that flag was the last
+    /// damage standing, lift `Degraded{ImpactDamage}` back to
+    /// `Nominal`. A `Degraded{PowerLost}` colony keeps its reason —
+    /// the repair restores the module, not the network's power
+    /// balance (the `PowerRestored` event remains that reason's only
+    /// exit); repairing under `Nominal` — legal, the state can hold
+    /// damaged flags after a `PowerRestored` lift — changes the flag
+    /// and nothing else. `Dormant`/`Abandoned` refuse like the
+    /// damage apply does. The debit precedes the flag write so a
+    /// clamped charge can never deliver a free repair — and the
+    /// charge is a hard gate, not `charge`'s clamped drain: the
+    /// player either pays the authored cost or the module stays
+    /// broken. `tick` anchors the recompute like the damage path's.
+    pub(crate) fn apply_repair_module(
+        &mut self,
+        id: ColonyId,
+        module: usize,
+        tick: u64,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        let Some(colony) = self.colonies.get(&id) else {
+            return Err(SimError::Recoverable("repair: unknown colony"));
+        };
+        if matches!(colony.state, ColonyState::Dormant | ColonyState::Abandoned) {
+            return Err(SimError::Recoverable("repair: colony not live"));
+        }
+        if module >= colony.modules.len() {
+            return Err(SimError::Recoverable("repair: no such module"));
+        }
+        if !colony.modules[module].damaged {
+            return Err(SimError::Recoverable("repair: module not damaged"));
+        }
+        let cost = self.economy_cfg.colony_module_repair_cost_micros;
+        if cost > self.economy.funds_micros {
+            return Err(SimError::Recoverable("repair: insufficient funds"));
+        }
+        self.shadow_economy(shadow);
+        crate::economy::charge(
+            &mut self.economy,
+            self.clock.ticks(),
+            cost,
+            crate::economy::FundsReason::ColonyModuleRepair,
+        );
+        self.shadow_colonies(shadow);
+        let colony = self
+            .colonies
+            .get_mut(&id)
+            .ok_or(SimError::Fatal("repair: colony vanished"))?;
+        colony.modules[module].damaged = false;
+        // The damage→repaired transition: `ImpactDamage` degrades with
+        // nothing left broken → `Nominal`. `PowerLost` and `Nominal`
+        // are untouched — the former's exit stays `PowerRestored`,
+        // the latter was never lifted.
+        if matches!(
+            colony.state,
+            ColonyState::Degraded {
+                reason: DegradeReason::ImpactDamage
+            }
+        ) && !colony.modules.iter().any(|m| m.damaged)
+        {
+            colony.state = ColonyState::Nominal;
+        }
+        self.notify(
+            crate::reliability::Notification {
+                tick: self.clock.ticks(),
+                vessel: crate::reliability::PROGRAM_VESSEL,
+                node: None,
+                kind: crate::reliability::NotificationKind::ColonyModuleRepaired {
                     colony: id.0,
                     module: module as u64,
                 },
@@ -6801,6 +6882,289 @@ mod tests {
                 reason: DegradeReason::ImpactDamage
             }
         );
+    }
+
+    /// C09-F6's repair verb: the paid damage→repaired transition —
+    /// funds debit at the authored cost, the module's `damaged` flag
+    /// clears, the `ImpactDamage` reason lifts to `Nominal` once no
+    /// damage stands, and the log ring gets its `ColonyModuleRepaired`
+    /// record (the `ColonyDamaged` entry's inverse).
+    #[test]
+    fn repair_restores_module_and_lifts_impact_damage() {
+        let mut w = colony_world();
+        found(&mut w, vec![gen_module(10.0)], vec![]);
+        let colony = *w.colonies().keys().next().unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::DamageColonyModule { colony, module: 0 },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        let funds0 = w.funds_micros();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RepairColonyModule { colony, module: 0 },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        let c = &w.colonies()[&colony];
+        assert!(!c.modules[0].damaged, "module stayed damaged");
+        assert_eq!(
+            c.state,
+            ColonyState::Nominal,
+            "the last damage clearing must lift the reason"
+        );
+        assert_eq!(
+            w.funds_micros(),
+            funds0 - w.economy_config().colony_module_repair_cost_micros,
+            "repair must debit the authored cost"
+        );
+        assert!(
+            w.notifications().iter().any(|n| matches!(
+                n.kind,
+                crate::reliability::NotificationKind::ColonyModuleRepaired {
+                    colony: c,
+                    module: 0
+                } if c == colony.0
+            )),
+            "no ColonyModuleRepaired entry: {:?}",
+            w.notifications()
+        );
+    }
+
+    /// The transition is per-module: repairing one of two broken
+    /// modules leaves the `ImpactDamage` reason standing — the
+    /// colony is still a wreck, just a smaller one.
+    #[test]
+    fn repair_partial_damage_keeps_reason() {
+        let mut w = colony_world();
+        found(
+            &mut w,
+            vec![
+                gen_module(10.0),
+                ColonyModuleDef::Radiator {
+                    area_m2: 1.0,
+                    emissivity: 0.8,
+                },
+            ],
+            vec![],
+        );
+        let colony = *w.colonies().keys().next().unwrap();
+        for module in 0..2 {
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::DamageColonyModule { colony, module },
+            );
+        }
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RepairColonyModule { colony, module: 0 },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        let c = &w.colonies()[&colony];
+        assert!(!c.modules[0].damaged);
+        assert!(c.modules[1].damaged);
+        assert_eq!(
+            c.state,
+            ColonyState::Degraded {
+                reason: DegradeReason::ImpactDamage
+            },
+            "one damaged module left must hold the reason"
+        );
+    }
+
+    /// Repair under `Degraded{PowerLost}` clears the flag and keeps
+    /// the reason — the damage apply's "PowerLost wins" rule runs in
+    /// both directions: the repair restores the module, not the
+    /// network's power balance, and `PowerRestored` stays that
+    /// reason's only exit (the day crossing earns it back here).
+    #[test]
+    fn repair_under_power_lost_keeps_reason_then_restores() {
+        let mut w = colony_world();
+        // Solar + EC-drawing drill founded at midnight — the
+        // `power_loss_cycle_transitions` fixture: night starves the
+        // consumers, day restores.
+        found(
+            &mut w,
+            vec![
+                solar_def(1.0),
+                ColonyModuleDef::Drill {
+                    resource: ResourceId::from("ore"),
+                    base_rate_per_s: 1.0,
+                    min_concentration: 1.0,
+                    power_ec_per_s: 0.5,
+                },
+            ],
+            vec![],
+        );
+        let id = *w.colonies().keys().next().unwrap();
+        w.step_frame(w.clock().ticks() + 64).unwrap();
+        assert!(matches!(
+            w.colonies()[&id].state,
+            ColonyState::Degraded {
+                reason: DegradeReason::PowerLost
+            }
+        ));
+        // Damage lands under PowerLost — the reason holds (the
+        // `apply_damage_module` rule), the flag still sets.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::DamageColonyModule {
+                colony: id,
+                module: 0,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(w.colonies()[&id].modules[0].damaged);
+        assert!(matches!(
+            w.colonies()[&id].state,
+            ColonyState::Degraded {
+                reason: DegradeReason::PowerLost
+            }
+        ));
+        // Repair clears the flag; `PowerLost` stands — the module is
+        // whole again, the network is still dark.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RepairColonyModule {
+                colony: id,
+                module: 0,
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        assert!(!w.colonies()[&id].modules[0].damaged);
+        assert!(
+            matches!(
+                w.colonies()[&id].state,
+                ColonyState::Degraded {
+                    reason: DegradeReason::PowerLost
+                }
+            ),
+            "repair must not lift PowerLost: {:?}",
+            w.colonies()[&id].state
+        );
+        // And the reason's own exit still works: sunrise recharges
+        // the (undamaged) solar and `PowerRestored` lands.
+        let light = body_light(
+            &BodyId::from("terra"),
+            0.0,
+            0.0,
+            &test_system(),
+            &test_env()[&BodyId::from("terra")],
+        );
+        let sunrise = next_terminator_tick(&light, w.clock().ticks()).unwrap();
+        let mut events = Vec::new();
+        while w.clock().ticks() < sunrise + 64 {
+            let r = w.step_frame(sunrise + 64).unwrap();
+            events.extend(r.fired_events);
+            if !r.partial {
+                break;
+            }
+        }
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::PowerRestored { colony } if colony == id))
+        );
+        assert_eq!(w.colonies()[&id].state, ColonyState::Nominal);
+    }
+
+    /// The rejections — each `Recoverable`, each through the real
+    /// command channel: unknown colony, out-of-range module, an
+    /// undamaged module, insufficient funds, and a non-live colony
+    /// (the damage apply's `Dormant`/`Abandoned` convention).
+    #[test]
+    fn repair_rejects_cleanly() {
+        let mut w = colony_world();
+        found(
+            &mut w,
+            vec![
+                gen_module(10.0),
+                ColonyModuleDef::Radiator {
+                    area_m2: 1.0,
+                    emissivity: 0.8,
+                },
+            ],
+            vec![],
+        );
+        let colony = *w.colonies().keys().next().unwrap();
+        // Damage module 0 so the undamaged-module and funds arms are
+        // both reachable on the same fixture.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::DamageColonyModule { colony, module: 0 },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        let funds0 = w.funds_micros();
+        // Undamaged module → rejection, no charge.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RepairColonyModule { colony, module: 1 },
+        );
+        // Out-of-range module.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RepairColonyModule { colony, module: 9 },
+        );
+        // Unknown colony.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RepairColonyModule {
+                colony: ColonyId(99),
+                module: 0,
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert_eq!(r.rejected.len(), 3, "{:?}", r.rejected);
+        assert!(
+            r.rejected
+                .iter()
+                .all(|x| matches!(&x.error, SimError::Recoverable(_)))
+        );
+        assert_eq!(w.funds_micros(), funds0, "rejections must not charge");
+        // Insufficient funds → the damaged module stays broken and
+        // the debit never lands.
+        w.economy.funds_micros = 0;
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RepairColonyModule { colony, module: 0 },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert_eq!(r.rejected.len(), 1, "{:?}", r.rejected);
+        assert!(matches!(
+            &r.rejected[0].error,
+            SimError::Recoverable(m) if m.contains("insufficient funds")
+        ));
+        assert!(w.colonies()[&colony].modules[0].damaged);
+        // A non-live colony: abandon it, then the verb refuses like
+        // the damage apply does.
+        w.economy.funds_micros = funds0;
+        w.enqueue(SourceClass::Ui, 0, SimCommand::AbandonColony { colony });
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RepairColonyModule { colony, module: 0 },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert_eq!(r.rejected.len(), 1, "{:?}", r.rejected);
+        assert!(matches!(
+            &r.rejected[0].error,
+            SimError::Recoverable(m) if m.contains("not live")
+        ));
     }
 
     /// C09-F8's terminal-transition cleanup: `AbandonColony` vacates

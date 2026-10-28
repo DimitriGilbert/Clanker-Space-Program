@@ -69,10 +69,18 @@ use crate::ids::ResourceId;
 /// 14 (C14-F3): `convective_heat_fraction` — the M4b thermal
 /// model's η, the fraction of the kinetic energy flux `½ρv³` a part's
 /// exposed area absorbs as skin heat. Its own doc always named this
-/// file as the tunable's home; the shipped value is unchanged
-/// (lethality calibration is a design question, not a constant move).
+/// file as the tunable's home.
 /// Mirror: `csp_phys::DEFAULT_CONVECTIVE_HEAT_FRACTION`.
-pub const BALANCE_SCHEMA_VERSION: u32 = 14;
+/// 15 (C14-F3/C09-F6 remainders): `colony_module_repair_cost_funds` —
+/// §3.5.1's `RepairColonyModule` debit (impact damage gained the
+/// doc-promised repair path; a free repair would make the damage
+/// class decorative). Mirror:
+/// `csp_sim::economy::DEFAULT_COLONY_MODULE_REPAIR_FUNDS`. Same
+/// version ships the calibrated η — 0.005 made M4b lethality
+/// unreachable (measured entry peaks ~200–260 K against 800–1600 K
+/// part limits); 0.02 burns the small low-margin parts on an
+/// aggressive entry while the pod class lands.
+pub const BALANCE_SCHEMA_VERSION: u32 = 15;
 
 /// `data/balance.ron` — the tunables every later milestone consumes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -297,9 +305,21 @@ pub struct BalanceDef {
     pub colony_founding_cost_funds: f64,
     /// C14-F3 §2.4's convective-heating coefficient η — the
     /// dimensionless fraction of `½ρv³` on a part's exposed area
-    /// absorbed as skin heat in the M4b thermal tick. Authored 0.005:
-    /// a real but survivable pulse against authored `max_temp_k`
-    /// 800–1600 K parts (measured entry peaks sit ~200–260 K).
+    /// absorbed as skin heat in the M4b thermal tick. Authored 0.02 —
+    /// the M4b "survivable AND lethal in the right places"
+    /// calibration: 0.005 peaked ~200–260 K on a steep 2.3 km/s
+    /// entry against authored `max_temp_k` 800–1600 K (lethality
+    /// unreachable); 0.02 burns the 20–50 kJ/K, 800–1000 K parts on
+    /// that profile while the 400 kJ/K, 1200 K pod class peaks ~360 K
+    /// and lands.
     /// Mirror: `csp_phys::DEFAULT_CONVECTIVE_HEAT_FRACTION`.
     pub convective_heat_fraction: f64,
+    /// C09-F6 §3.5/§3.5.1's `RepairColonyModule` debit (funds) — the
+    /// per-module charge for clearing `damaged` on a live colony (the
+    /// doc-promised post-M8-A repair path landing with the M8-C
+    /// impact seam already in play). Authored free is legal — the
+    /// validator only bounds finite-≥0 — but a zero cost makes the
+    /// §3.5.1 crash-damage class decorative.
+    /// Mirror: `csp_sim::economy::DEFAULT_COLONY_MODULE_REPAIR_FUNDS`.
+    pub colony_module_repair_cost_funds: f64,
 }

@@ -111,17 +111,23 @@ pub const SPACE_SINK_K: f64 = 2.7;
 /// The dimensionless fraction of the kinetic energy flux `½ρv³`
 /// incident on a part's exposed area that is absorbed as skin heat —
 /// the v1 convective-heating coefficient's **default**. At reentry
-/// conditions (ρ ~ 4·10⁻² kg/m³, v ~ 2 km/s, A ~ 2.25 m²) η = 5·10⁻³
-/// drives a ~400 kJ/K lump at ~5–6 K/s through the heat pulse — a
-/// real but survivable pulse for authored `max_temp_k` 900–1600 K
-/// parts, and lethal above them or at lower capacity.
+/// conditions (ρ ~ 4·10⁻² kg/m³, v ~ 2 km/s, A ~ 2.25 m²) η = 2·10⁻²
+/// drives a ~400 kJ/K lump at ~20–25 K/s through the heat pulse —
+/// the M4b "survivable AND lethal in the right places" calibration
+/// (C14-F3): at η = 5·10⁻³ measured entry peaks sat ~200–260 K
+/// against authored `max_temp_k` 800–1600 K, so the §3.4 thermal
+/// lethality trigger could never fire on shipped parts; at 2·10⁻²
+/// the small low-margin parts (20–50 kJ/K, 800–1000 K limits) burn
+/// up on an aggressive steep entry while the pod class (~400 kJ/K,
+/// 1200 K) peaks ~360 K and lands, and a moderate descent stays a
+/// real-but-safe pulse.
 ///
 /// The live value is `balance.ron`'s `convective_heat_fraction`
 /// (C14-F3 — §8.3's "ALL tuning lives here", the home this constant's
 /// doc always named), carried on [`crate::simple::Environment`] into
 /// [`ThermalFlow`]; this constant is only the no-data default, the
 /// same role [`crate::simple::DEFAULT_FRICTION_MU`] plays.
-pub const DEFAULT_CONVECTIVE_HEAT_FRACTION: f64 = 0.005;
+pub const DEFAULT_CONVECTIVE_HEAT_FRACTION: f64 = 0.02;
 
 /// One part's weld-resolved thermal statics — the lumped node the
 /// per-tick [`step`] integrates. Geometry fields are body-frame:
@@ -595,7 +601,7 @@ mod tests {
         let body = weld(&g, &[part(1_000.0, 1.0, td)]).unwrap();
         let net = *body.thermal;
         let node = net.nodes[0];
-        // Constant flow: ρ=0.01, v=1500 → per_area = 0.005·0.5·0.01·1500³.
+        // Constant flow: ρ=0.01, v=1500 → per_area = η·0.5·0.01·1500³.
         let rho = 0.01;
         let v = 1_500.0;
         let flow = ThermalFlow {
@@ -850,7 +856,7 @@ mod tests {
     /// `convective_heat_fraction` via the environment. η = 0 must
     /// switch convective input off entirely (an ambient lump then
     /// holds temperature: no source, radiation balanced), and the
-    /// shipped 0.005 must heat at the authored rate.
+    /// shipped η must heat at the authored rate.
     #[test]
     fn eta_scales_convective_input() {
         let mut g = PartGraph::new(PartNodeId(0));

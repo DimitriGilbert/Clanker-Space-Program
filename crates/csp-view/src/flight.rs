@@ -48,8 +48,8 @@ const FLIGHT_DEFAULT_DIST: f64 = 60.0;
 /// shock-layer ionization, whose onset is keyed to *speed*, not raw
 /// heat flux — and the verified Terrin table forces the two-factor
 /// shape, since a normal mid-ascent carries MORE flux than a high
-/// reentry leg (12 km @ 450 m/s → η·½ρv³ ≈ 4.4e4 W/m² vs 40 km @
-/// 2200 m/s → ≈ 3.0e4). No monotone flux window can keep that ascent
+/// reentry leg (12 km @ 450 m/s → η·½ρv³ ≈ 1.8e5 W/m² vs 40 km @
+/// 2200 m/s → ≈ 1.2e5). No monotone flux window can keep that ascent
 /// dark while lighting the reentry, so:
 ///
 /// ```text
@@ -57,16 +57,17 @@ const FLIGHT_DEFAULT_DIST: f64 = 60.0;
 ///   · clamp((v_rel − GATE_ON)/(GATE_FULL − GATE_ON))  <- speed gate
 /// ```
 ///
-/// `ONSET` 1.0e4 / `FULL` 4.0e4 reads the 40 km @ 2200 leg at
+/// `ONSET` 4.0e4 / `FULL` 1.6e5 reads the 40 km @ 2200 leg at
 /// i ≈ 0.66 and saturates the deep corridor (35 km @ 2300 → flux
-/// ≈ 8.5e4); the gate keeps every stock-ascent row (≤450 m/s through
+/// ≈ 3.4e5); the gate keeps every stock-ascent row (≤450 m/s through
 /// 7–24 km) at zero and opens fully only in the near-orbital regime
 /// (Terrin LEO ≈ 2287 m/s) a sheath belongs to. Display
 /// normalization only — the sim's lethality is the M4b temperature
-/// record, not this curve.
-const PLASMA_ONSET_W_M2: f64 = 1.0e4;
+/// record, not this curve. (The window rode the C14-F3 η calibration
+/// ×4 with the authored value it normalizes — same legs, same i's.)
+const PLASMA_ONSET_W_M2: f64 = 4.0e4;
 /// See [`PLASMA_ONSET_W_M2`].
-const PLASMA_FULL_W_M2: f64 = 4.0e4;
+const PLASMA_FULL_W_M2: f64 = 1.6e5;
 /// Speed-gate lower edge (surface-relative m/s) — see
 /// [`PLASMA_ONSET_W_M2`]. Below this the sheath is dark regardless
 /// of flux: a dense slow pass heats but does not ionize.

@@ -1,7 +1,7 @@
 // Global balance constants. ALL tuning lives here (PLAN §8.3).
 // Named fields only — positional tuples drift silently under reordering.
 (
-    schema_version: 14,
+    schema_version: 15,
     // Physics bubble radius (PLAN §2.3): 20 km. Vessels go on rails at the
     // radius and rejoin at 90% (18 km) — the hysteresis is csp-sim logic,
     // not a second constant.
@@ -121,5 +121,9 @@
     // the shipped `data/balance.ron` value (the demo set diverges in
     // content, not in the physics constants it loads).
     // Mirror: `csp_phys::DEFAULT_CONVECTIVE_HEAT_FRACTION`.
-    convective_heat_fraction: 0.005,
+    convective_heat_fraction: 0.02,
+    // C09-F6 §3.5/§3.5.1: `RepairColonyModule`'s per-module funds
+    // debit — mirrors the shipped `data/balance.ron` value.
+    // Mirror: `csp_sim::economy::DEFAULT_COLONY_MODULE_REPAIR_FUNDS`.
+    colony_module_repair_cost_funds: 5_000.0,
 )

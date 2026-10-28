@@ -166,6 +166,14 @@ pub const DEFAULT_ATTRITION_GRACE_PERIODS: u64 = 1;
 /// purchase). 25 000 funds ≈ 2.5% of the starting balance, a mid-tier
 /// purchase next to the authored contract payouts.
 pub const DEFAULT_COLONY_FOUNDING_FUNDS: f64 = 25_000.0;
+/// `balance.ron: colony_module_repair_cost_funds` mirror — C09-F6's
+/// `RepairColonyModule` per-module debit (§3.5.1's crash-damage
+/// class: the repair is the doc-promised exit out of
+/// `Degraded{ImpactDamage}`). 5 000 funds — the authored hire cost,
+/// a fifth of founding — enough that a smashed module is a decision,
+/// not a rounding error, and never the mint `AbandonColony`'s 25%
+/// salvage would become against a free repair-and-abandon cycle.
+pub const DEFAULT_COLONY_MODULE_REPAIR_FUNDS: f64 = 5_000.0;
 
 /// Sim-day in seconds (86400) — the salary cadence conversion.
 const DAY_S: f64 = 86_400.0;
@@ -218,6 +226,11 @@ pub struct EconomyConfig {
     /// command path's founding charge. Hashed: a restored world
     /// enforces the founding economics it was built under.
     pub colony_founding_cost_micros: u64,
+    /// C09-F6 §3.5.1: `RepairColonyModule`'s per-module funds debit
+    /// (micros). Hashed with the rest of the config — the charge
+    /// moves the funds trajectory the same way the founding debit
+    /// does.
+    pub colony_module_repair_cost_micros: u64,
 }
 
 /// The `DEFAULT_*` config — `World::new()`'s no-data fallback.
@@ -234,6 +247,7 @@ pub fn default_config() -> EconomyConfig {
         site_upkeep_funds_per_s: DEFAULT_SITE_UPKEEP_FUNDS_PER_S,
         attrition_grace_periods: DEFAULT_ATTRITION_GRACE_PERIODS,
         colony_founding_cost_micros: to_micros(DEFAULT_COLONY_FOUNDING_FUNDS),
+        colony_module_repair_cost_micros: to_micros(DEFAULT_COLONY_MODULE_REPAIR_FUNDS),
     }
 }
 
@@ -252,6 +266,7 @@ impl EconomyConfig {
             site_upkeep_funds_per_s: b.site_upkeep_funds_per_s,
             attrition_grace_periods: b.attrition_grace_periods,
             colony_founding_cost_micros: to_micros(b.colony_founding_cost_funds),
+            colony_module_repair_cost_micros: to_micros(b.colony_module_repair_cost_funds),
         }
     }
 
@@ -424,6 +439,9 @@ pub enum FundsReason {
     /// C21-F8 §3.5's `FoundColony` founding charge — the
     /// `colony_founding_cost_funds` debit (facilities spend).
     ColonyFounding = 12,
+    /// C09-F6 §3.5.1's `RepairColonyModule` charge — the
+    /// `colony_module_repair_cost_funds` debit (facilities spend).
+    ColonyModuleRepair = 13,
 }
 
 impl StableDiscriminant for FundsReason {

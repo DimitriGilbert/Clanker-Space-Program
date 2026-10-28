@@ -468,6 +468,17 @@ pub enum NotificationKind {
         /// The module index marked inert.
         module: u64,
     },
+    /// C09-F6 §3.5.1's repair landing — `RepairColonyModule`
+    /// cleared the module's `damaged` flag (the `ColonyDamaged`
+    /// record's paid inverse; `PROGRAM_VESSEL`-level, same field
+    /// convention). Appended per the ring's positional-discriminant
+    /// rule.
+    ColonyModuleRepaired {
+        /// The repaired colony's arena id.
+        colony: u64,
+        /// The module index restored.
+        module: u64,
+    },
 }
 
 /// `Notification::vessel` sentinel for program-level entries —

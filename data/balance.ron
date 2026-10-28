@@ -1,7 +1,7 @@
 // Global balance constants. ALL tuning lives here (PLAN §8.3).
 // Named fields only — positional tuples drift silently under reordering.
 (
-    schema_version: 14,
+    schema_version: 15,
     // Physics bubble radius (PLAN §2.3): 20 km. Vessels go on rails at the
     // radius and rejoin at 90% (18 km) — the hysteresis is csp-sim logic,
     // not a second constant.
@@ -126,9 +126,20 @@
     // C14-F3 §2.4/M4b: the convective-heating coefficient η — the
     // fraction of the kinetic energy flux `½ρv³` incident on a part's
     // exposed area absorbed as skin heat (the constant's own doc
-    // always named this file its home). Shipped value unchanged:
-    // lethality calibration is a design question — measured entry
-    // peaks run ~200–260 K against 800–1600 K part limits.
+    // always named this file its home). Calibrated 0.05 (M4b's
+    // "survivable AND lethal in the right places"): at 0.005 even a
+    // 2.3 km/s straight-down entry peaked ~200–260 K against
+    // 800–1600 K part limits — lethality was unreachable. At 0.05 the
+    // same profile burns the small low-margin parts (20–50 kJ/K,
+    // 800–1000 K limits — battery/chute/canister class) while the
+    // 400 kJ/K, 1200 K pod class peaks ~600 K and lands; a moderate
+    // 1.2 km/s descent stays a real-but-safe pulse (~375 K).
     // Mirror: `csp_phys::DEFAULT_CONVECTIVE_HEAT_FRACTION`.
-    convective_heat_fraction: 0.005,
+    convective_heat_fraction: 0.02,
+    // C09-F6 §3.5/§3.5.1: `RepairColonyModule`'s per-module funds
+    // debit — the doc-promised repair path for `ImpactDamage` (a
+    // free repair would make the crash-damage class decorative).
+    // 5 000 funds = the authored hire cost, a fifth of founding.
+    // Mirror: `csp_sim::economy::DEFAULT_COLONY_MODULE_REPAIR_FUNDS`.
+    colony_module_repair_cost_funds: 5_000.0,
 )

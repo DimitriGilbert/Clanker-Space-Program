@@ -257,7 +257,18 @@ use crate::SimError;
 /// (`hash_craft_geometry`) — mass is no longer key material.
 /// `PartNode`'s serialized layout changed, so pre-field replay logs
 /// do not decode; the goldens re-record via `record --force`.
-pub const HASH_SCHEMA_VERSION: u32 = 27;
+///
+/// **Version 28** (C09-F6 repair verb + C14-F3 lethality
+/// calibration): `EconomyConfig` gained `colony_module_repair_cost_micros`
+/// (hashed with the config walk — the `RepairColonyModule` debit
+/// moves the funds trajectory), `FundsReason` gained
+/// `ColonyModuleRepair` (13), `NotificationKind` gained
+/// `ColonyModuleRepaired`, and `SimCommand` gained
+/// `RepairColonyModule` — all appended, never renumbered. The
+/// authored η moved to 0.02 (the M4b "lethal in the right places"
+/// calibration), so the flight golden's thermal trajectory moved
+/// with it. The goldens rebless.
+pub const HASH_SCHEMA_VERSION: u32 = 28;
 
 /// Rule-7 sum types: the source of an enum's *declared* stable `u16`
 /// discriminant (PLAN §7.1 rule 7).

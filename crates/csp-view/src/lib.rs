@@ -1175,6 +1175,10 @@ fn program_command(
         C::AbandonColony { colony } => Some(SimCommand::AbandonColony {
             colony: csp_sim::ColonyId(colony),
         }),
+        C::RepairColonyModule { colony, module } => Some(SimCommand::RepairColonyModule {
+            colony: csp_sim::ColonyId(colony),
+            module: module as usize,
+        }),
         C::ScheduleColonyInspection { colony } => Some(SimCommand::ScheduleColonyInspection {
             colony: csp_sim::ColonyId(colony),
             tick: mirror.now_ticks + csp_core::TICK_HZ * 86_400,
@@ -4115,6 +4119,7 @@ impl View {
     /// the Program window. Runs in `end_frame` beside
     /// [`Self::stage_vab_tech`]: sim reads happen HERE (the staging
     /// phase), systems only ever see the mirror (§2.5).
+    #[allow(clippy::too_many_lines)] // one staged row set = one pass
     fn stage_program(&mut self) {
         use csp_ui::program as up;
         let sim = &self.sim;
@@ -4139,6 +4144,10 @@ impl View {
             // C21-F8: the authored founding charge the colonies
             // section's button gates and labels on.
             colony_founding_cost: sim.economy_config().colony_founding_cost_micros as f64
+                / csp_sim::economy::MICROS_PER_FUND,
+            // C09-F6: the authored repair charge the colony card's
+            // per-module repair buttons gate and label on.
+            colony_repair_cost: sim.economy_config().colony_module_repair_cost_micros as f64
                 / csp_sim::economy::MICROS_PER_FUND,
             ..Default::default()
         };
@@ -5024,6 +5033,11 @@ fn notice_text(n: &csp_sim::reliability::Notification) -> String {
         // (no vessel prefix, the contract convention).
         K::ColonyDamaged { colony, module } => {
             format!("colony {colony} — MODULE {module} DAMAGED (impact)")
+        }
+        // C09-F6: the repair verb's log line — the paid inverse of
+        // the damage entry (same program-level convention).
+        K::ColonyModuleRepaired { colony, module } => {
+            format!("colony {colony} — module {module} repaired")
         }
     }
 }
@@ -6148,6 +6162,16 @@ mod tests {
                 C::AbandonColony { colony: 3 },
                 SimCommand::AbandonColony {
                     colony: csp_sim::ColonyId(3),
+                },
+            ),
+            (
+                C::RepairColonyModule {
+                    colony: 3,
+                    module: 1,
+                },
+                SimCommand::RepairColonyModule {
+                    colony: csp_sim::ColonyId(3),
+                    module: 1,
                 },
             ),
             (
