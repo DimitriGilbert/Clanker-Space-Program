@@ -133,7 +133,7 @@ Non-crate workspace members:
   decoupler, **parachute** `csp.chute.s125.ron`, **dock port** `csp.dockport.s125.ron`, lab, legs,
   science canister, probe core, battery, life-support tank, adapter, nosecone), the home system
   (`data/systems/home/`: Solen star + Terrin/Rask/Duva bodies, biomes PNGs, sites, one authored
-  colony), `techtree/`, `contracts/` (6 templates), `eval-scenarios/`, `recipes/`, `balance.ron`,
+  colony), `techtree/`, `contracts/` (8 templates), `eval-scenarios/`, `recipes/`, `balance.ron`,
   `resources.ron`, `loc/en.ron`, and `test-fixtures/` (frozen golden data sets). Licensed
   `LICENSE-GAME` (proprietary, source-available); engine crates are MIT OR Apache-2.0.
 - **`apps/telemetry/`** — the dashboard SPA (Vite + TanStack Router/Start + Tailwind, versions

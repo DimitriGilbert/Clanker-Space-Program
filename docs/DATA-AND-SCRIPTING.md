@@ -29,7 +29,7 @@ root; `cargo xtask …` is NOT an alias — always `cargo run -p xtask -- …`.
 | `data/systems/<sys>/<body>/biomes.png` | Palette-indexed equirect biome map (64×32) — indexed by `BodyDef::biome_map` | header-inspected (`biome.rs::inspect_indexed_png`) | `load_system` |
 | `data/systems/<sys>/sites.ron` | Surface sites: pads, recovery sites, mineable yields, **starting stockpile** | `SiteFile`/`SiteDef` (`site.rs`), `SITE_SCHEMA_VERSION = 3` | `load_sites` |
 | `data/systems/<sys>/colonies.ron` | Authored starting colonies (one Rask mining outpost) | `ColonyFile`/`ColonyDef` (`colony.rs`), `COLONY_SCHEMA_VERSION = 2` | `load_colonies` |
-| `data/contracts/<id>.ron` | Contract templates — **6 files** | `ContractTemplate` (`contract.rs`), v1 | `load_contracts` |
+| `data/contracts/<id>.ron` | Contract templates — **8 files** | `ContractTemplate` (`contract.rs`), v1 | `load_contracts` |
 | `data/techtree/<name>.ron` | Tech-tree fragments (`home.ron`: **4 nodes + 5 upgrade tracks**) | `TechTreeDef`/`TechNode`/`UpgradeTrack` (`techtree.rs`), v1 | `load_techtree` |
 | `data/balance.ron` | ~45 global tunables (physics caps, science, economy, reliability, `script_op_budget`) | `BalanceDef` (`balance.rs`), `BALANCE_SCHEMA_VERSION = 11` | `load_balance` |
 | `data/loc/en.ron` | English string table every `LocKey` resolves against | `LocFile` (`loc.rs`), v1 | `load_loc` |
@@ -191,14 +191,15 @@ the flow-network allocation tie-break. Modules: `Solar{area_m2, efficiency}`,
 
 `{id, display_name, description, kind, generate: {weight, space}, prerequisites,
 rewards: {advance_funds, completion_funds, failure_penalty_funds}, deadline_days}`.
-`ContractKind` (5): `SatellitePlacement, SurveyRun, PartTest, Rescue, ColonyResupply` —
-each with a matching `ContractParamSpace` variant describing the deterministic draw
-space (weighted template pick, then per-kind params from the seeded generator).
-`ContractPrereq` is fact-based (no reputation currency): `TechResearched`,
-`ContractsCompleted{kind, count}`, `BodyVisited`, `CrewLostAtMost`. Six templates live
-in `data/contracts/`. PLAN §3.6 names seven v1 types; **crew transport and tourist
-flight are deferred** (documented in the `contract.rs` module doc — their predicates
-have no honest sim-state reading yet).
+`ContractKind` (7): `SatellitePlacement, SurveyRun, PartTest, Rescue, ColonyResupply,
+CrewTransport, TouristFlight` — each with a matching `ContractParamSpace` variant
+describing the deterministic draw space (weighted template pick, then per-kind params
+from the seeded generator). `ContractPrereq` is fact-based (no reputation currency):
+`TechResearched`, `ContractsCompleted{kind, count}`, `BodyVisited`, `CrewLostAtMost`.
+Eight templates live in `data/contracts/` — all seven §3.6 v1 kinds ship (`SurveyRun`
+has two files: `contract.survey` + `contract.survey.data`); the crewed pair landed in
+fix-plan 7.3 (C34-F5) once the crew machinery could prove their facts (documented in
+the `contract.rs` module doc).
 
 #### techtree — `TechTreeDef` (`techtree.rs`, v1)
 
@@ -866,8 +867,10 @@ an agent over MCP/stdio but with no in-game UI · **[ABSENT]** not in the tree.
 5. **Poll detection** — PLAN's "budget-exhausting for 10 consecutive ticks" is
    implemented as 10 consecutive *heavy* ticks (aborted **or** ≥90% budget consumed),
    because aborts alone would hit the 5-strike disable first (scripts.rs module doc).
-6. **Contract kinds** — PLAN §3.6 names seven v1 types; 5 kinds ship; crew transport
-   and tourist flight are explicitly deferred (`contract.rs` module doc).
+6. **Contract kinds** — resolved: PLAN §3.6 names seven v1 types and all seven now
+   ship (8 templates — `SurveyRun` has two files). Crew transport and tourist flight
+   landed in fix-plan 7.3 (C34-F5) once the crew machinery (`TransferCargo::Crew`,
+   `land_crew`, `CrewLocation`) could prove their facts (`contract.rs` module doc).
 7. **Wire encoding** — PLAN §2.12.2's "MessagePack for arrays" is deferred; the WS
    stream is JSON-only with `proto` as the bump mechanism (`http.rs` deferral note).
 8. **Quaternion wire order** — `vessel.control`'s `attitude.rot` takes

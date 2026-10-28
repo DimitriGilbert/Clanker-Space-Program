@@ -517,7 +517,7 @@ Prerequisites are concrete facts (researched nodes, completed-by-kind counts,
 bodies visited) — no reputation currency. Completion is evaluated **by the sim on
 relevant events** (orbit achieved, recovery, transfer complete…), never polled.
 Deadlines fail with an authored penalty through the funds clamp. Templates:
-`data/contracts/*.ron` (6). **Player-reachable**: AcceptContract.
+`data/contracts/*.ron` (8). **Player-reachable**: AcceptContract.
 
 **Colonies** (`colonies.rs`, 5,172 lines): the §3.5.1 flow network, five rules
 verbatim — two-state Day/Night power with closed-form terminator crossings; algebraic

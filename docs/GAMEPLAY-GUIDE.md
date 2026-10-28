@@ -333,7 +333,7 @@ is wired to a real `SimCommand` — no dead buttons; disabled buttons carry the 
   button is disabled with "prerequisites unmet: …" until they hold (`contracts_section`).
   Accept credits the advance immediately; already-satisfied state-predicate offers
   (satellite/part-test) can complete at acceptance (`apply_accept_contract`).
-  The six shipped templates and how to complete them (`data/contracts/`):
+  The eight shipped templates and how to complete them (`data/contracts/`):
   | Template | Ask | How a player completes it |
   |---|---|---|
   | `contract.survey` | 1 unit of materials-study data from Terrin | Run the canister, transmit or recover (starter-completable) |
@@ -342,6 +342,8 @@ is wired to a real `SimCommand` — no dead buttons; disabled buttons carry the 
   | `contract.part_test` | A named module type in a drawn regime (orbit altitude / landed body) | Fly a craft carrying that module into the regime (bench tests do **not** satisfy it — it reads vessel state) |
   | `contract.rescue` | Recover a vessel on the drawn body | Land + latch + `RecoverVessel` there (transition-keyed) |
   | `contract.colony_resupply` | Deliver N resource units into colonies on the drawn body | Join a colony's inventory with a latched vessel and use **deliver** (`TransferColonyResource`) |
+  | `contract.crew_transport` | Post N crew at the colony on the drawn site | Fly members over and transfer them vessel↔colony, or **→colony** an unassigned member (`AssignCrewToColony`); the ask re-bases at accept, so crew already stationed don't count |
+  | `contract.tourist_flight` | A tourist rides through the drawn Terrin orbit band and comes home alive | Board a `CrewKind::Tourist`, fly the band, then recover them home — needs `CrewLostAtMost(0)` standing to unlock |
   Board gating is by tech prerequisites, so the deeper kinds appear only after research —
   at game start you see survey offers only. (The stale "2/6 uncompletable" finding from
   `.review/session-prd1` no longer holds: rescue and resupply both have player paths now.)
