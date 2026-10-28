@@ -187,10 +187,10 @@ fn step_complete(step: usize, i: &TutorialInput) -> bool {
     match step {
         0 => i.in_vab || i.has_vessel,
         1 => i.has_vessel || (i.craft_parts > 0 && i.craft_has_thrust),
-        // The launch step credits the ORDER, not only the delivered
-        // hull — a `ManufactureCraft` in flight is a launch that
-        // happened, and holding "Launch from the pad" pending through
-        // the whole build reads as if the press did nothing.
+        // The launch step credits a pending order too, not only the
+        // berthed hull — a `ManufactureCraft` in flight is a delivery
+        // that happened, and holding "Launch from the pad" pending
+        // through the build would read as if nothing did.
         2 => i.has_vessel || i.builds_pending,
         3 => i.has_vessel && i.throttle > 0.0,
         4 => i.has_vessel && i.alt_m > CLIMB_ALT_M,
@@ -649,9 +649,9 @@ mod tests {
         assert_eq!(t.step, 3);
     }
 
-    /// A launch in the build-order era: pressing LAUNCH recovers the
-    /// pad's craft and spends a `ManufactureCraft` order, so the
-    /// arena reads `has_vessel: false` for the whole build. That is
+    /// The pending-build surface in the reservation era: a colony/
+    /// foreign `ManufactureCraft` in flight leaves the arena reading
+    /// `has_vessel: false` for the whole build. That is
     /// a delivery in flight, not a lost vessel — the checklist must
     /// hold its step and keep the banner down while the order rides,
     /// and only judge the empty arena when the order leaves the

@@ -128,7 +128,9 @@ pub mod colonies;
 
 /// M8-B §3.5 manufacture — the launch-site build-order machinery:
 /// `ManufactureCraft` spends BOM + funds at order time and
-/// `ConstructionComplete` delivers the latched craft.
+/// `ConstructionComplete` delivers the latched craft, while
+/// `LaunchCraft` (the VAB's verb) runs the same gates and spend but
+/// berths the craft atomically — no build wait.
 pub mod manufacture;
 
 /// M8-C §3.5 — the vessel-side life support (the `LifeSupport`
@@ -572,11 +574,11 @@ pub enum SimCommand {
     /// command error: rejected onto [`AdvanceReport::rejected`]
     /// (§2.2.1's "rejected on the originating channel"), its effects
     /// rolled back — the boundary continues.
-    // ui-unreachable: play spawns vessels through `ManufactureCraft` →
-    // `ConstructionComplete` at a launch site (the site-less sandbox
-    // fallback is `SpawnPhysicalVessel`); elements-only spawn is
-    // issued by csp-bench harnesses and the MCP `sim.command`
-    // passthrough — never by a shipped UI path.
+    // ui-unreachable: play spawns vessels through `LaunchCraft` at a
+    // launch site (the site-less sandbox fallback is
+    // `SpawnPhysicalVessel`); elements-only spawn is issued by
+    // csp-bench harnesses and the MCP `sim.command` passthrough —
+    // never by a shipped UI path.
     SpawnVessel {
         /// The frame the elements are relative to.
         parent: BodyId,
@@ -1328,6 +1330,31 @@ pub enum SimCommand {
         /// The `ModuleIndex` to restore.
         module: usize,
     },
+    /// The VAB's launch verb — `ManufactureCraft`'s reservation
+    /// arithmetic with NO build wait: every
+    /// `check_manufacture_craft` gate plus the same atomic
+    /// BOM + funds spend, then the craft berths `SurfaceLatched` at
+    /// the site inside the SAME apply — no `ActiveBuild`, no
+    /// `ConstructionComplete`. A claimed berth rejects `Recoverable`
+    /// (a launch has no record to requeue — the build order's
+    /// `ConstructionRetry` chain is the patient path, and the launch
+    /// path's pad-clearing `RecoverVessel` drains ahead of this
+    /// command). `ManufactureCraft` stays the reservation shape for
+    /// colony/agent/inventory manufacture (csp-bench, the MCP
+    /// `sim.command` passthrough, foreign orders). Appended last per
+    /// the enum's append-only variant order — the `command_log`
+    /// stream encodes variant indices.
+    LaunchCraft {
+        /// The launch site ordering and instantly berthing the craft.
+        site: SiteId,
+        /// The craft to berth.
+        craft: CraftDef,
+        /// Aggregate `(resource, units)` the berth consumes — the
+        /// `ManufactureCraft` convention verbatim: caller-summed
+        /// from `EffectivePart::build_resources` so the log is
+        /// self-contained.
+        build_resources: Vec<(ResourceId, f64)>,
+    },
 }
 
 impl SimCommand {
@@ -1424,6 +1451,7 @@ fn reject_kind(command: &SimCommand) -> RejectKind {
     match command {
         SimCommand::ToBubble { .. } => RejectKind::ToBubble,
         SimCommand::ManufactureCraft { .. } => RejectKind::ManufactureCraft,
+        SimCommand::LaunchCraft { .. } => RejectKind::LaunchCraft,
         _ => RejectKind::Other,
     }
 }
@@ -5403,7 +5431,9 @@ impl World {
         if self.economy.insolvent
             && matches!(
                 command,
-                SimCommand::ManufactureCraft { .. } | SimCommand::RunBenchTest { .. }
+                SimCommand::ManufactureCraft { .. }
+                    | SimCommand::LaunchCraft { .. }
+                    | SimCommand::RunBenchTest { .. }
             )
         {
             return Err(SimError::Recoverable(
@@ -5596,6 +5626,16 @@ impl World {
                 craft,
                 build_resources,
             } => self.apply_manufacture_craft(
+                site.clone(),
+                craft.clone(),
+                build_resources.clone(),
+                shadow,
+            )?,
+            SimCommand::LaunchCraft {
+                site,
+                craft,
+                build_resources,
+            } => self.apply_launch_craft(
                 site.clone(),
                 craft.clone(),
                 build_resources.clone(),
@@ -6213,11 +6253,12 @@ impl World {
             ));
         }
         // The embodied-BOM table has no debit channel on this path —
-        // `ManufactureCraft` is the only verb that pays a bill out of
-        // a site inventory. A non-empty table here would mint stock
-        // at recovery (credit for resources never spent), so the
-        // sandbox spawn refuses it outright rather than rewriting
-        // the caller's craft. Test/scenario craft leave it empty.
+        // `ManufactureCraft`/`LaunchCraft` are the only verbs that pay
+        // a bill out of a site inventory. A non-empty table here
+        // would mint stock at recovery (credit for resources never
+        // spent), so the sandbox spawn refuses it outright rather
+        // than rewriting the caller's craft. Test/scenario craft
+        // leave it empty.
         if !craft.part_build_resources.is_empty() {
             return Err(SimError::Recoverable(
                 "physical spawn: build-resource table requires a manufacture order",

@@ -74,10 +74,11 @@ fn deliver_latched(view: &mut View) -> csp_sim::VesselId {
 }
 
 /// The launch path's own pad-clearing `RecoverVessel` must NOT trip
-/// the non-empty→empty arena edge: the order it armed is a delivery
-/// in flight, not a dead scene, so the player stays in Flight to
-/// watch it land (the "nothing happened" regression from fe4054a —
-/// the bounce fired in the SAME frame the launch switched modes).
+/// the non-empty→empty arena edge: `LaunchCraft` berths the new
+/// craft in the SAME drain the recovery empties it, so the player
+/// stays in Flight with the fresh hull in view (the "nothing
+/// happened" regression from fe4054a — the bounce fired in the SAME
+/// frame the launch switched modes).
 #[test]
 fn launch_with_parked_build_stays_in_flight() {
     let mut view = View::new().expect("data/ load");
@@ -85,28 +86,30 @@ fn launch_with_parked_build_stays_in_flight() {
     assert_eq!(view.flight_focus(), Some(seeded));
 
     view.launch_craft().expect("launch must place the order");
-    // The launch arms RecoverVessel(occupant) + ManufactureCraft, then
+    // The launch arms RecoverVessel(occupant) + LaunchCraft, then
     // flips to Flight BEFORE the drain — like a real click.
     assert_eq!(view.mode(), ViewMode::Flight, "launch_craft armed Flight");
 
-    // One frame — the drain consumes both commands.
+    // One frame — the drain consumes both commands: the occupant
+    // recovers and the new craft berths in the same drain.
     frame(&mut view, 8);
 
-    assert_eq!(view.sim.builds().len(), 1, "the build order must land");
-    assert!(view.sim.vessels().is_empty(), "the occupant recovery ran");
+    assert!(view.sim.builds().is_empty(), "a launch mints no build");
+    assert_eq!(
+        view.sim.vessels().len(),
+        1,
+        "the new craft berthed in the drain"
+    );
+    assert_ne!(
+        *view.sim.vessels().keys().next().unwrap(),
+        seeded,
+        "the occupant recovery ran — the berthed hull is the new one"
+    );
     assert_eq!(
         view.mode(),
         ViewMode::Flight,
-        "the pending build suppresses the empty-arena bounce — the \
-         delivery is coming, the scene is not dead"
+        "the instant berth leaves no empty-arena gap to bounce on"
     );
-
-    // The delivery then lands in Flight where the player watches it.
-    let complete = view.sim.builds().values().next().unwrap().complete_tick;
-    let now = view.sim.clock().ticks();
-    frame(&mut view, complete - now + 1);
-    assert_eq!(view.sim.vessels().len(), 1, "delivery materialized");
-    assert_eq!(view.mode(), ViewMode::Flight);
 }
 
 /// The other side of the launch affordance: a stockpile that cannot
@@ -119,22 +122,30 @@ fn launch_with_drained_stockpile_refuses_loudly() {
     let _seeded = deliver_latched(&mut view);
     // Drain the pad's stockpile with real orders (~12 starter BOMs vs
     // the 2000-metal authored stockpile — the pre-refund-fix
-    // soft-lock save state). The launch gate admits ONE pending
-    // order per pad now (the double-charge hole it closes), so the
-    // drain rides the command channel — parallel builds are the
-    // sim's own foreign-order path — and every delivered hull is
-    // terminated, never recovered (a pad recovery refunds the
-    // embodied bill).
-    view.launch_craft().expect("first order");
+    // soft-lock save state). `LaunchCraft` berths instantly, so the
+    // drain rides the reservation verb's channel — parallel builds
+    // are the sim's own foreign-order path — and every delivered
+    // hull is terminated, never recovered (a pad recovery refunds
+    // the embodied bill).
+    view.launch_craft().expect("first launch");
     frame(&mut view, 8);
-    let (site, craft, bom) = {
-        let b = view.sim.builds().values().next().expect("order armed");
-        (
-            b.site.clone(),
-            b.craft.clone(),
-            b.build_resources.clone().into_iter().collect::<Vec<_>>(),
-        )
-    };
+    // The launch berths instantly now — its logged `LaunchCraft`
+    // declaration is the same `(site, craft, bom)` the foreign
+    // orders below spend against.
+    let (site, craft, bom) = view
+        .sim
+        .command_log()
+        .iter()
+        .rev()
+        .find_map(|(_, c)| match c {
+            SimCommand::LaunchCraft {
+                site,
+                craft,
+                build_resources,
+            } => Some((site.clone(), craft.clone(), build_resources.clone())),
+            _ => None,
+        })
+        .expect("the launch logged a LaunchCraft");
     let mut drained = false;
     for _ in 0..40 {
         view.enqueue_command(
@@ -318,7 +329,7 @@ fn launch_recover_cycles_do_not_drain_the_stockpile() {
                 break;
             }
         }
-        assert!(delivered, "cycle {cycle}: build never delivered");
+        assert!(delivered, "cycle {cycle}: launch never berthed");
         let vid = *view.sim.vessels().keys().next().unwrap();
         view.enqueue_command(
             SourceClass::Ui,
@@ -361,10 +372,10 @@ fn launch_recover_cycles_do_not_drain_the_stockpile() {
 /// modes at enqueue and only a transient "COMMAND REFUSED" cue says
 /// why. The drain-reject is now a dead-scene edge of its own: the
 /// player lands in the VAB with the sim's reason on the notice row.
-/// (`ManufactureCraft` has apply-only gates the launch pre-flight
-/// can't see — the enqueue here proves the strand directly; a real
-/// launch reaches the same reject through a second source racing the
-/// drain.)
+/// (`RejectKind::LaunchCraft` matches the same edge — the applies
+/// share their gate set; the enqueue here proves the strand directly;
+/// a real launch reaches the same reject through a second source
+/// racing the drain.)
 #[test]
 fn rejected_order_on_empty_arena_bounces_to_vab() {
     let mut view = View::new().expect("data/ load");

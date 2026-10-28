@@ -167,11 +167,11 @@ fn stage_plan_fires_its_own_vessel_not_the_focus() {
         frame(&mut view, 64); // ~8 s — well clear of the pad volume
     }
     view.launch_craft().expect("second launch");
-    // W2.6: launch is a ManufactureCraft order — the second vessel
-    // materializes at `ConstructionComplete` and takes focus then.
+    // `LaunchCraft` is atomic — the second vessel berths at the
+    // first drain and takes focus there.
     for _ in 0..200 {
         frame(&mut view, 64);
-        if view.sim.builds().is_empty() {
+        if view.sim.vessels().len() > 1 {
             break;
         }
     }
@@ -248,11 +248,11 @@ fn staged_parachute_deploys_on_stage_press() {
     });
 
     view.launch_craft().expect("launch");
-    // ManufactureCraft delivery — the vessel materializes
-    // surface-latched on the pad.
+    // `LaunchCraft` berth — the vessel materializes surface-latched
+    // on the pad at the first drain.
     for _ in 0..200 {
         frame(&mut view, 64);
-        if view.sim.builds().is_empty() {
+        if !view.sim.vessels().is_empty() {
             break;
         }
     }

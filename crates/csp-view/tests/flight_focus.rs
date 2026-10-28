@@ -45,11 +45,11 @@ fn second_launch_moves_focus_to_the_new_vessel() {
     }
 
     view.launch_craft().expect("second launch");
-    // W2.6: launch is a ManufactureCraft order — the second vessel
-    // materializes at `ConstructionComplete`, not the next tick.
+    // `LaunchCraft` is atomic — the second vessel berths at the
+    // first drain, no build wait.
     for _ in 0..200 {
         frame(&mut view, 64);
-        if view.sim.builds().is_empty() {
+        if !view.sim.vessels().is_empty() {
             break;
         }
     }

@@ -160,9 +160,9 @@ fn new_demo_builds_scenario_and_enforces_constraints() {
         assert_eq!(v.session().name(), "Demo Hopper");
     });
 
-    // W2.6: the seed is a ManufactureCraft order — `seed_pad_craft`
-    // steps the sim through the order + build at construction, so
-    // the starter craft is already delivered surface-latched (the
+    // The seed is a `LaunchCraft` — `seed_pad_craft` steps the sim
+    // through the command's drain at construction, so the starter
+    // craft is already berthed surface-latched (the
     // pad's berth) when the scenario opens; a throttle unlatches it.
     assert_eq!(view.sim.vessels().len(), 1, "pad craft delivered");
     let vessel = view.sim.vessels().values().next().unwrap();
@@ -227,8 +227,8 @@ fn hold_radial_up(view: &mut View, vessel: csp_sim::VesselId) {
 #[test]
 fn demo_seed_craft_ascends() {
     let mut view = View::new_demo().unwrap();
-    // W2.6: the seed is already delivered surface-latched (the
-    // ManufactureCraft order's `ConstructionComplete`) — a frame
+    // The seed is already berthed surface-latched (the `LaunchCraft`
+    // drain at construction) — a frame
     // stages it, then the throttle command unlatches it.
     view.begin_frame();
     view.sim_step(view.sim.clock().ticks() + 1).unwrap();

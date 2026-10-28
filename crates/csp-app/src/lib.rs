@@ -5015,10 +5015,12 @@ mod tests {
             ..Default::default()
         });
         frame(&mut app, 1);
-        let deadline = app.view.sim.builds().values().next().unwrap().complete_tick;
-        while app.view.sim.clock().ticks() < deadline {
-            frame(&mut app, 64);
-        }
+        // `LaunchCraft` is atomic — the craft berthed in the drain.
+        assert_eq!(
+            app.view.sim.vessels().len(),
+            1,
+            "the launch berthed the new craft in one drain"
+        );
         frame(&mut app, 8);
         let focus = app.view.flight_focus().unwrap();
         // The state a full-throttle climb leaves behind — the axis
@@ -5042,9 +5044,9 @@ mod tests {
     }
 
     /// The real player flow end to end: the seeded pad craft (itself
-    /// a delivered build), a VAB LAUNCH that recovers the parked
-    /// build and orders a new one, the `ConstructionComplete`
-    /// delivery, then the Z snap — the delivered craft must unlatch,
+    /// a berthed launch), a VAB LAUNCH that recovers the parked
+    /// craft and berths a new one in the same drain, then the Z snap —
+    /// the berthed craft must unlatch,
     /// open the throttle, and climb.
     #[test]
     fn delivered_craft_flies_on_throttle() {
@@ -5058,18 +5060,19 @@ mod tests {
             app.view.end_frame();
         };
         frame(&mut app, 8); // settle the seeded pad craft
-        // The LAUNCH click — the parked build recovers, the order lands.
+        // The LAUNCH click — the parked craft recovers, the new one berths.
         app.handle_ui_outbox(csp_view::UiOutbox {
             launch: true,
             ..Default::default()
         });
         frame(&mut app, 1);
-        assert_eq!(app.view.sim.builds().len(), 1, "the launch ordered a build");
-        let deadline = app.view.sim.builds().values().next().unwrap().complete_tick;
-        while app.view.sim.clock().ticks() < deadline {
-            frame(&mut app, 64);
-        }
-        frame(&mut app, 8); // let the delivery stage
+        assert!(app.view.sim.builds().is_empty(), "a launch mints no build");
+        assert_eq!(
+            app.view.sim.vessels().len(),
+            1,
+            "the launch berthed the new craft in one drain"
+        );
+        frame(&mut app, 8); // let the berth stage
         let focus = app.view.flight_focus().expect("the delivery took focus");
         assert!(
             matches!(

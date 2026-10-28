@@ -155,20 +155,15 @@ fn launch_recovers_the_parked_build_instead_of_refusing() {
     // (its value credited) and the new build orders, not refused.
     view.launch_craft()
         .expect("launch over a parked build must recover it, not refuse");
-    // The parked build is recovered immediately; the new craft is a
-    // build order that lands on the first drain — step a frame so the
-    // queued ManufactureCraft becomes a live build, then run it out.
+    // The parked build is recovered and the new craft berths in the
+    // SAME drain — `LaunchCraft` is atomic, so one frame lands the
+    // fresh hull on the pad.
     frame(&mut view, 1);
-    let deadline = view
-        .sim
-        .builds()
-        .values()
-        .map(|b| b.complete_tick)
-        .max()
-        .expect("a build order was queued");
-    while view.sim.clock().ticks() <= deadline {
-        frame(&mut view, 64);
-    }
+    assert_eq!(
+        view.sim.vessels().len(),
+        1,
+        "the launch berthed the new craft in one drain"
+    );
     frame(&mut view, 8);
     // The recovery credited the parked craft's value back.
     let funds1 = view.sim.funds_micros();
@@ -176,6 +171,6 @@ fn launch_recovers_the_parked_build_instead_of_refusing() {
         funds1 >= funds0,
         "recovering the parked build should not lose funds ({funds0} -> {funds1})"
     );
-    // One vessel on the pad now — the new build, not two stacked.
+    // One vessel on the pad now — the new craft, not two stacked.
     assert!(view.flight_focus().is_some());
 }

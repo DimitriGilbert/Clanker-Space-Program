@@ -64,6 +64,12 @@ pub enum RejectKind {
     /// vessel-removal bounce cannot see (no vessel left to remove,
     /// no `ActiveBuild` in flight, Flight mode stranded).
     ManufactureCraft,
+    /// A `SimCommand::LaunchCraft` rejection — the VAB launch's
+    /// atomic order-and-berth refused at its drain. `csp-view`
+    /// matches it for the same dead-scene edge `ManufactureCraft`
+    /// covers (a refused launch on an empty arena strands Flight
+    /// identically — there is no `ActiveBuild` for it to wait on).
+    LaunchCraft,
     /// Any other rejection — no consumer branches on it.
     Other,
 }

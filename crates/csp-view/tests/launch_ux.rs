@@ -3,10 +3,11 @@
 //! findings, pinned as contracts):
 //!
 //! - The tutorial's `vessel_lost` rewind must NOT fire while a
-//!   `ManufactureCraft` order rides — the launch's pad-clearing
-//!   recovery empties the arena for the whole build, and "vessel
-//!   lost — LAUNCH again" was the wrong coaching for a delivery in
-//!   flight.
+//!   `ManufactureCraft` order rides — an empty arena with a pending
+//!   reservation is a delivery in flight, and "vessel lost — LAUNCH
+//!   again" was the wrong coaching for it. `LaunchCraft` itself
+//!   berths instantly, so the pending order here is the colony/
+//!   foreign-order path the surface still exists for.
 //! - A second LAUNCH while an order is pending refuses loudly (the
 //!   button used to arm a second build — double-charge, and a
 //!   delivery queued behind the single berth).
@@ -53,11 +54,15 @@ fn build_craft(view: &mut View) {
     });
 }
 
-/// Seed, build, and press LAUNCH through the real path; step one
-/// frame so the `RecoverVessel` + `ManufactureCraft` drain commits
-/// the "empty arena, order in flight" state. Returns the delivery
-/// deadline.
-fn launch_into_the_wait(view: &mut View) -> u64 {
+/// Seed, launch through the real path (`LaunchCraft` — the craft
+/// berths in one drain), then re-create the "empty arena, order in
+/// flight" state the pending-build surfaces exercise: terminate the
+/// berthed craft and place a colony/agent-style `ManufactureCraft`
+/// reservation in the same drain. `LaunchCraft` never mints a build,
+/// so a pending order can now only come from the reservation verb —
+/// which is exactly what stays real (colony builds, MCP/bench
+/// orders). Returns the delivery deadline.
+fn launch_then_foreign_build(view: &mut View) -> u64 {
     view.seed_starter_craft().expect("starter seed");
     frame(view, 1);
     build_craft(view);
@@ -65,10 +70,48 @@ fn launch_into_the_wait(view: &mut View) -> u64 {
     view.launch_craft().expect("launch enqueued");
     assert_eq!(view.mode(), ViewMode::Flight);
     frame(view, 1);
-    assert_eq!(view.sim.builds().len(), 1, "the launch is a build order");
+    assert_eq!(
+        view.sim.vessels().len(),
+        1,
+        "the launch berthed its craft in one drain"
+    );
+    // The launch's own declaration rides the log verbatim — reuse it
+    // as a foreign reservation's inputs so the order passes the
+    // same bill check the launch did.
+    let (site, craft, bom) = view
+        .sim
+        .command_log()
+        .iter()
+        .rev()
+        .find_map(|(_, c)| match c {
+            SimCommand::LaunchCraft {
+                site,
+                craft,
+                build_resources,
+            } => Some((site.clone(), craft.clone(), build_resources.clone())),
+            _ => None,
+        })
+        .expect("the launch logged a LaunchCraft");
+    let berthed = *view.sim.vessels().keys().next().expect("the berthed craft");
+    view.enqueue_command(
+        SourceClass::Ui,
+        csp_view::PLAYER_SOURCE_ID,
+        SimCommand::TerminateVessel { vessel: berthed },
+    );
+    view.enqueue_command(
+        SourceClass::Ui,
+        csp_view::PLAYER_SOURCE_ID,
+        SimCommand::ManufactureCraft {
+            site,
+            craft,
+            build_resources: bom,
+        },
+    );
+    frame(view, 1);
+    assert_eq!(view.sim.builds().len(), 1, "the reservation is in flight");
     assert!(
         view.sim.vessels().is_empty(),
-        "the pad-clearing recovery ran — the arena is empty mid-build"
+        "the berthed craft is gone — the arena is empty mid-build"
     );
     view.sim.builds().values().next().unwrap().complete_tick
 }
@@ -80,7 +123,7 @@ fn launch_into_the_wait(view: &mut View) -> u64 {
 #[test]
 fn pending_build_suppresses_vessel_lost() {
     let mut view = View::new().expect("view");
-    let complete = launch_into_the_wait(&mut view);
+    let complete = launch_then_foreign_build(&mut view);
 
     // Mid-build samples across the wait — every frame must hold the
     // checklist off the loss rewind and keep the launch step's
@@ -115,7 +158,7 @@ fn pending_build_suppresses_vessel_lost() {
 #[test]
 fn second_launch_during_build_refuses_loudly() {
     let mut view = View::new().expect("view");
-    launch_into_the_wait(&mut view);
+    launch_then_foreign_build(&mut view);
     let funds = view.sim.funds_micros();
 
     let err = match view.launch_craft() {
@@ -147,7 +190,7 @@ fn second_launch_during_build_refuses_loudly() {
 #[test]
 fn cancel_build_on_empty_arena_bounces_to_vab() {
     let mut view = View::new().expect("view");
-    launch_into_the_wait(&mut view);
+    launch_then_foreign_build(&mut view);
     assert_eq!(view.mode(), ViewMode::Flight);
 
     let build = *view.sim.builds().keys().next().unwrap();
@@ -177,7 +220,7 @@ fn cancel_build_on_empty_arena_bounces_to_vab() {
 #[test]
 fn flight_ui_mirrors_the_pending_build() {
     let mut view = View::new().expect("view");
-    launch_into_the_wait(&mut view);
+    launch_then_foreign_build(&mut view);
 
     frame(&mut view, 8);
     let ui = view.world.resource::<csp_view::flight::FlightUiData>();
@@ -197,7 +240,7 @@ fn flight_ui_mirrors_the_pending_build() {
 #[test]
 fn pending_build_keeps_the_pad_camera() {
     let mut view = View::new().expect("view");
-    launch_into_the_wait(&mut view);
+    launch_then_foreign_build(&mut view);
 
     frame(&mut view, 8);
     assert!(
@@ -220,9 +263,9 @@ fn pending_build_keeps_the_pad_camera() {
     // flight.rs).
 }
 
-/// The boot seed's stale toast: the seed's forced delivery leaves
-/// no "BUILD ORDER PLACED" countdown cue on the channel — the build
-/// it counted down already delivered before the scene opened.
+/// The boot seed's launch cue is honest: `LaunchCraft` berths in one
+/// drain, so the scene opens on "CRAFT ON THE PAD" — accurate the
+/// moment it appears — and never a stale build-order countdown.
 #[test]
 fn seed_leaves_no_stale_build_toast() {
     let mut view = View::new().expect("view");
@@ -230,7 +273,14 @@ fn seed_leaves_no_stale_build_toast() {
     let cues = view.world.resource::<FlightSfx>();
     assert!(
         cues.cues.iter().all(|c| !c.text.contains("BUILD ORDER")),
-        "the seed's own order toast must not survive into the scene: {:?}",
+        "no build-order toast may survive into the scene: {:?}",
+        cues.cues.iter().map(|c| &c.text).collect::<Vec<_>>()
+    );
+    assert!(
+        cues.cues
+            .iter()
+            .any(|c| c.text.contains("CRAFT ON THE PAD")),
+        "the instant-berth cue is the seed's honest launch note: {:?}",
         cues.cues.iter().map(|c| &c.text).collect::<Vec<_>>()
     );
 }

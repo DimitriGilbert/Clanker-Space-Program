@@ -213,7 +213,7 @@ pub fn source() -> EmbeddedSource {
 /// Seed a starter craft: build it through the VAB session's own action
 /// channel (so the editor opens on a real, editable craft — the
 /// discovery path), then launch it onto the pad via the same
-/// `SpawnPhysicalVessel` command the LAUNCH button emits. The spawn
+/// `LaunchCraft` command the LAUNCH button emits. The launch
 /// lands in the §7.6 command log like every other mutation.
 ///
 /// Shared by [`View::new_demo`] (the fixed §6.3 scenario) and
@@ -261,32 +261,18 @@ pub(crate) fn seed_pad_craft(view: &mut View, name: &str) -> Result<(), String> 
     // the failure (the caller turns it into a startup error rather
     // than leaving a silent empty pad).
     view.launch_craft()?;
-    // W2.6: launch is now a `ManufactureCraft` order — the seed
-    // steps the sim through the order + the build so the starter
-    // craft is parked (delivered surface-latched) when the scene
-    // opens, the "seeded on the pad" contract. The two steps are
-    // `step_frame`, not the frame pipeline: seeding runs before the
-    // first `begin_frame`, and the delivery only needs sim advance —
-    // one tick to drain the command into a scheduled build, then the
-    // build's own completion tick.
+    // `LaunchCraft` is atomic — one drain spends the bill and berths
+    // the craft, so the starter is parked (surface-latched) when the
+    // scene opens, the "seeded on the pad" contract. `step_frame`,
+    // not the frame pipeline: seeding runs before the first
+    // `begin_frame`, and the berth only needs the one tick that
+    // drains the command.
     view.sim
         .step_frame(view.sim.clock().ticks() + 1)
-        .map_err(|e| format!("starter seed: order drain failed: {e}"))?;
-    if let Some(b) = view.sim.builds().values().next() {
-        let complete = b.complete_tick;
-        view.sim
-            .step_frame(complete)
-            .map_err(|e| format!("starter seed: build delivery failed: {e}"))?;
-    }
-    // The seed ran the whole order inside `step_frame`, so the
-    // "BUILD ORDER PLACED — delivery in …" toast `launch_craft`
-    // pushed is stale the moment the scene opens: the build it
-    // counted down already delivered. Clear the cue channel rather
-    // than open on a phantom countdown for a craft that is parked.
-    view.world
-        .resource_mut::<crate::flight::FlightSfx>()
-        .cues
-        .clear();
+        .map_err(|e| format!("starter seed: launch drain failed: {e}"))?;
+    // The "CRAFT ON THE PAD — THROTTLE TO LIFTOFF" cue `launch_craft`
+    // pushed stays queued — it is accurate the moment the scene
+    // opens (the craft IS on the pad) and coaches the first action.
     Ok(())
 }
 

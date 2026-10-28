@@ -11,6 +11,16 @@
 //! `now + build_ticks`. The craft itself materializes ONLY at the
 //! event — a hull that does not exist cannot fly, be seen, or hash.
 //!
+//! `SimCommand::LaunchCraft { site, craft, build_resources }` is the
+//! VAB's launch verb — the same gates and the same atomic spend, but
+//! the craft berths `SurfaceLatched` inside the apply itself: no
+//! `ActiveBuild`, no `ConstructionComplete`. A claimed berth is a
+//! `Recoverable` rejection, not a retry (a launch has no record to
+//! requeue — the launch path's pad-clearing `RecoverVessel` drains
+//! ahead of the command). The reservation shape stays for
+//! colony/agent/inventory manufacture — csp-bench orders, the MCP
+//! `sim.command` passthrough, and foreign `ManufactureCraft`s.
+//!
 //! - `site` must name a `SiteDef` with `launch` — the §3.5 launch
 //!   site's own inventory is the bill the order pays out of (per-site
 //!   inventories are the supply loop's staging ground; a colony's
@@ -334,6 +344,39 @@ impl crate::World {
         Ok(bom)
     }
 
+    /// The atomic spend both manufacture verbs share — debit every
+    /// aggregated BOM row out of the ordering site's inventory and
+    /// charge the craft's funds through the ledger. Runs only AFTER
+    /// `check_manufacture_craft` proved every row affordable, so a
+    /// missing row here is `Fatal`, never `Recoverable` (the §2.6.4
+    /// rollback law: shadow before write).
+    fn spend_build_bill(
+        &mut self,
+        site: &SiteId,
+        bom: &BTreeMap<ResourceId, f64>,
+        cost: u64,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        self.shadow_economy(shadow);
+        for (r, q) in bom {
+            let st = self
+                .economy
+                .sites
+                .get_mut(site)
+                .ok_or(SimError::Fatal("manufacture: site row vanished"))?;
+            *st.inventory
+                .get_mut(r)
+                .ok_or(SimError::Fatal("manufacture: inventory row vanished"))? -= q;
+        }
+        crate::economy::charge(
+            &mut self.economy,
+            self.clock.ticks(),
+            cost,
+            FundsReason::Manufacture,
+        );
+        Ok(())
+    }
+
     /// `ManufactureCraft` — the reservation: validate site, craft,
     /// BOM, funds, and the vessel-cap slot, then spend everything and
     /// schedule the delivery. Nothing about the craft exists until
@@ -349,23 +392,7 @@ impl crate::World {
         // Commit — the §2.6.4 rollback law: shadow before write.
         let cost = crate::economy::craft_cost_micros(&craft);
         let mass = craft_mass_kg(&craft);
-        self.shadow_economy(shadow);
-        for (r, q) in &bom {
-            let st = self
-                .economy
-                .sites
-                .get_mut(&site)
-                .ok_or(SimError::Fatal("manufacture: site row vanished"))?;
-            *st.inventory
-                .get_mut(r)
-                .ok_or(SimError::Fatal("manufacture: inventory row vanished"))? -= q;
-        }
-        crate::economy::charge(
-            &mut self.economy,
-            self.clock.ticks(),
-            cost,
-            FundsReason::Manufacture,
-        );
+        self.spend_build_bill(&site, &bom, cost, shadow)?;
         self.shadow_builds(shadow);
         let id = BuildId(self.next_build_id);
         self.next_build_id = self
@@ -396,6 +423,37 @@ impl crate::World {
             complete_tick,
             shadow,
         )
+    }
+
+    /// `LaunchCraft` — the VAB's atomic order-and-berth: every
+    /// `check_manufacture_craft` gate, the same BOM + funds spend,
+    /// then the delivery tail's `SurfaceLatched` write — all inside
+    /// this one apply. No `ActiveBuild`, no `ConstructionComplete`:
+    /// the player's rocket is on the pad the moment the command
+    /// drains. A claimed berth is a `Recoverable` rejection rather
+    /// than the build order's `ConstructionRetry` — a launch has no
+    /// record to requeue, and the launch path's pad-clearing
+    /// `RecoverVessel` drains ahead of this command anyway, so a
+    /// block here can only be a non-recoverable claimant or a race
+    /// the pre-flight could not see.
+    pub(crate) fn apply_launch_craft(
+        &mut self,
+        site: SiteId,
+        craft: crate::CraftDef,
+        build_resources: Vec<(ResourceId, f64)>,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        let bom = self.check_manufacture_craft(&site, &craft, &build_resources)?;
+        // The berth check BEFORE the spend — the atomicity rule the
+        // order's affordability loop already sets: a refused launch
+        // debits nothing.
+        if self.berth_blocked(&site, &craft) {
+            return Err(SimError::Recoverable("launch: pad occupied"));
+        }
+        let cost = crate::economy::craft_cost_micros(&craft);
+        self.spend_build_bill(&site, &bom, cost, shadow)?;
+        self.insert_berthed_vessel(&site, craft, shadow)?;
+        Ok(())
     }
 
     /// `CancelBuild` — the C11-F3 exit a mis-order needed: refund the
@@ -469,24 +527,23 @@ impl crate::World {
         self.deliver_built_vessel(b, shadow, retried)
     }
 
-    /// The berth check for [`Self::deliver_built_vessel`]: weld the
-    /// finished craft, pose it where the site would deliver it
-    /// ([`berth_pose`] — upright, belly on the datum, the same
-    /// `SurfaceLatched` record the vessel lands with and the launch
-    /// path's own convention; an identity/flat probe would test a
-    /// volume the delivery never materializes, C12-F1), and run the
-    /// same `spawn_site_occupied` predicate the launch pre-flight and
-    /// `SpawnPhysicalVessel` apply share — a parked or in-bubble hull
-    /// claiming the site defers the delivery. A weld failure or a
-    /// world without physics cannot block: the order's weld gate
-    /// already ran at apply, and a physics-less world has no contact
-    /// model to overlap in.
-    fn delivery_blocked(&self, b: &ActiveBuild) -> bool {
-        let (Some(def), Some(physics)) = (self.site_defs.get(&b.site), self.physics.as_ref())
-        else {
+    /// The berth check both delivery paths share: weld the craft,
+    /// pose it where the site would berth it ([`berth_pose`] —
+    /// upright, belly on the datum, the same `SurfaceLatched` record
+    /// the vessel lands with and the launch path's own convention; an
+    /// identity/flat probe would test a volume the delivery never
+    /// materializes, C12-F1), and run the same `spawn_site_occupied`
+    /// predicate the launch pre-flight and `SpawnPhysicalVessel`
+    /// apply share — a parked or in-bubble hull claiming the site
+    /// defers a build delivery, refuses a `LaunchCraft`. A weld
+    /// failure or a world without physics cannot block: the order's
+    /// weld gate already ran at apply, and a physics-less world has
+    /// no contact model to overlap in.
+    fn berth_blocked(&self, site: &SiteId, craft: &crate::CraftDef) -> bool {
+        let (Some(def), Some(physics)) = (self.site_defs.get(site), self.physics.as_ref()) else {
             return false;
         };
-        let Ok(mut candidate) = csp_phys::weld::weld(&b.craft.graph, &b.craft.parts) else {
+        let Ok(mut candidate) = csp_phys::weld::weld(&craft.graph, &craft.parts) else {
             return false;
         };
         let pose = berth_pose(def, collider_belly(&candidate));
@@ -499,6 +556,12 @@ impl crate::World {
         candidate.pos = pos;
         candidate.rot = rot;
         self.spawn_site_occupied(&candidate)
+    }
+
+    /// The build order's berth check for [`Self::deliver_built_vessel`]
+    /// — [`Self::berth_blocked`] on the order's site and craft.
+    fn delivery_blocked(&self, b: &ActiveBuild) -> bool {
+        self.berth_blocked(&b.site, &b.craft)
     }
 
     /// The shared delivery tail — insert the latched vessel record.
@@ -518,7 +581,7 @@ impl crate::World {
     /// `BuildDelivered`; between them the chain is quiet.
     fn deliver_built_vessel(
         &mut self,
-        mut b: ActiveBuild,
+        b: ActiveBuild,
         shadow: &mut TickShadow,
         retried: bool,
     ) -> Result<(), SimError> {
@@ -564,6 +627,37 @@ impl crate::World {
                 shadow,
             );
         }
+        self.insert_berthed_vessel(&b.site, b.craft, shadow)?;
+        if retried {
+            // A retry-delivered build never fired `ConstructionComplete`
+            // — the log line closes the episode the `BuildBerthBlocked`
+            // entry opened (C21-F2).
+            self.notify(
+                crate::reliability::Notification {
+                    tick: self.clock.ticks(),
+                    vessel: crate::reliability::PROGRAM_VESSEL,
+                    node: None,
+                    kind: crate::reliability::NotificationKind::BuildDelivered { build: b.id.0 },
+                },
+                shadow,
+            );
+        }
+        Ok(())
+    }
+
+    /// The berth write both delivery paths share — materialize
+    /// `craft` as a `SurfaceLatched` vessel at `site` and restamp its
+    /// reliability residence. `deliver_built_vessel` runs it at the
+    /// order's deadline; `apply_launch_craft` runs it inside the
+    /// command's own apply. Callers gate the berth first (the retry
+    /// re-queue / the `LaunchCraft` rejection) — this write assumes
+    /// the volume is clear.
+    fn insert_berthed_vessel(
+        &mut self,
+        site: &SiteId,
+        mut craft: crate::CraftDef,
+        shadow: &mut TickShadow,
+    ) -> Result<VesselId, SimError> {
         self.shadow_vessels(shadow);
         let id = VesselId(self.next_vessel_id);
         self.next_vessel_id = self
@@ -572,7 +666,7 @@ impl crate::World {
             .ok_or(SimError::Fatal("vessel id counter overflow"))?;
         let def = self
             .site_defs
-            .get(&b.site)
+            .get(site)
             .cloned()
             .ok_or(SimError::Fatal("manufacture: site vanished mid-delivery"))?;
         let ambient = self
@@ -582,11 +676,11 @@ impl crate::World {
         // The spawn-fill write is part of delivery — propellant tanks
         // full, §3.5 build-material/cargo tanks EMPTY with their
         // authored wet mass handed back (the manufacture→recover
-        // faucet `spawn_contents`'s doc names). `b.craft` is the
+        // faucet `spawn_contents`'s doc names). `craft` is the
         // delivered record, so the strip lands on the vessel itself.
-        let tank_contents = crate::transfers::spawn_contents(&mut b.craft);
+        let tank_contents = crate::transfers::spawn_contents(&mut craft);
         let thermal = ambient.map_or_else(crate::VesselThermal::default, |a| {
-            crate::VesselThermal::at_ambient(&b.craft.graph, a)
+            crate::VesselThermal::at_ambient(&craft.graph, a)
         });
         // M9b §3.4: construction IS part creation — the delivered
         // craft's per-node records draw their `θ₀` here, so a revert
@@ -594,7 +688,7 @@ impl crate::World {
         // thresholds (the allocator rides `shadow_vessels`).
         let reliability = crate::reliability::allocate_records(
             self.save_seed,
-            &b.craft,
+            &craft,
             self.clock.ticks(),
             &mut self.next_part_instance_id,
         )?;
@@ -605,7 +699,7 @@ impl crate::World {
         // delivery reads as a crash). The occupancy probe reads the
         // identical pose, so a hull the probe cleared is the volume
         // this record materializes (C12-F1).
-        let pose = csp_phys::weld::weld(&b.craft.graph, &b.craft.parts)
+        let pose = csp_phys::weld::weld(&craft.graph, &craft.parts)
             .ok()
             .map(|w| berth_pose(&def, collider_belly(&w)))
             .unwrap_or_else(|| berth_pose(&def, 0.0));
@@ -613,7 +707,7 @@ impl crate::World {
             id,
             crate::Vessel {
                 id,
-                craft: Some(b.craft),
+                craft: Some(craft),
                 state: crate::VesselState::SurfaceLatched(pose),
                 aero_mask: csp_phys::ConfigMask::ALL,
                 thermal,
@@ -633,21 +727,7 @@ impl crate::World {
         // records under the dormant rate now (the publish slot's
         // next pass derives the pending crossings from this stamp).
         self.reliability_residence_change(id, self.clock.ticks(), true, shadow)?;
-        if retried {
-            // A retry-delivered build never fired `ConstructionComplete`
-            // — the log line closes the episode the `BuildBerthBlocked`
-            // entry opened (C21-F2).
-            self.notify(
-                crate::reliability::Notification {
-                    tick: self.clock.ticks(),
-                    vessel: crate::reliability::PROGRAM_VESSEL,
-                    node: None,
-                    kind: crate::reliability::NotificationKind::BuildDelivered { build: b.id.0 },
-                },
-                shadow,
-            );
-        }
-        Ok(())
+        Ok(id)
     }
 
     /// §3.5's server-side bill check (C11-F4). The command declares
@@ -1043,6 +1123,182 @@ mod tests {
             "cargo wet mass strips at delivery: {}",
             part.mass_kg
         );
+    }
+
+    /// `LaunchCraft` — the VAB's verb: the build order's reservation
+    /// arithmetic with NO build wait. One drain runs every
+    /// `check_manufacture_craft` gate, spends the aggregated BOM out
+    /// of the site's inventory plus the funds cost, and berths the
+    /// craft `SurfaceLatched` — no `ActiveBuild`, no
+    /// `ConstructionComplete`.
+    #[test]
+    fn launch_craft_spends_and_berths_atomically() {
+        let mut w = world();
+        let funds0 = w.economy().funds_micros;
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::LaunchCraft {
+                site: SiteId::from("pad"),
+                craft: craft(),
+                build_resources: vec![(ResourceId::from("ore"), 20.0)],
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        // The same atomic spend the order path debits: 20 ore + 10
+        // funds — and the craft is already berthed, no build record.
+        let site = &w.economy().sites[&SiteId::from("pad")];
+        assert!((site.inventory[&ResourceId::from("ore")] - 80.0).abs() < 1e-9);
+        assert_eq!(funds0 - w.economy().funds_micros, 10_000_000);
+        assert!(
+            w.builds.is_empty(),
+            "a launch mints no build order: {:?}",
+            w.builds.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(w.vessels().len(), 1, "the launch berthed in one drain");
+        let v = w.vessels().values().next().unwrap();
+        assert!(matches!(v.state, crate::VesselState::SurfaceLatched(_)));
+        // The delivery tail is verbatim the build's: cargo tanks
+        // deliver EMPTY (the manufacture→recover faucet) with the
+        // authored wet mass stripped.
+        let ore = ResourceId::from("ore");
+        assert_eq!(crate::transfers::vessel_resource(v, &ore), 0.0);
+        let part = &v.craft.as_ref().unwrap().parts[0];
+        assert!(
+            (part.mass_kg - 90.0).abs() < 1e-9,
+            "cargo wet mass strips at berth: {}",
+            part.mass_kg
+        );
+    }
+
+    /// A claimed berth refuses the launch `Recoverable` — a launch
+    /// has no `ActiveBuild` to requeue the way `ConstructionRetry`
+    /// re-fires a deferred delivery, so the atomicity rule applies:
+    /// the refused command debits nothing.
+    #[test]
+    fn launch_craft_rejects_on_a_claimed_berth() {
+        let mut w = physics_world();
+        let ore = ResourceId::from("ore");
+        let funds0 = w.economy().funds_micros;
+        // A parked hull holds the pad's single berth.
+        w.vessels.insert(VesselId(0), parked_vessel(&w, craft()));
+        w.next_vessel_id = 1;
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::LaunchCraft {
+                site: SiteId::from("pad"),
+                craft: craft(),
+                build_resources: vec![(ore.clone(), 20.0)],
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert_eq!(r.rejected.len(), 1, "{:?}", r.rejected);
+        assert_eq!(r.rejected[0].kind, csp_core::RejectKind::LaunchCraft);
+        assert!(matches!(r.rejected[0].error, SimError::Recoverable(_)));
+        // Nothing spent, nothing berthed, no record left behind.
+        assert_eq!(
+            w.economy().sites[&SiteId::from("pad")].inventory[&ore],
+            100.0
+        );
+        assert_eq!(w.economy().funds_micros, funds0);
+        assert_eq!(w.vessels().len(), 1, "only the occupant remains");
+        assert!(w.builds.is_empty());
+    }
+
+    /// `LaunchCraft` runs the `check_manufacture_craft` gate set
+    /// verbatim — the order's refusals are the launch's refusals:
+    /// insufficient inventory, insufficient funds, an unknown site,
+    /// a non-launch site, and the insolvency-dormant facility gate.
+    #[test]
+    fn launch_craft_runs_the_same_gates() {
+        let mut w = world();
+        let ore = ResourceId::from("ore");
+        let launch = |w: &mut World, site: &str, bom: Vec<(ResourceId, f64)>| {
+            w.enqueue(
+                SourceClass::Ui,
+                0,
+                SimCommand::LaunchCraft {
+                    site: SiteId::from(site),
+                    craft: craft(),
+                    build_resources: bom,
+                },
+            );
+            w.step_frame(w.clock().ticks() + 1).unwrap()
+        };
+        // Over-stockpile BOM — the affordability gate.
+        let r = launch(&mut w, "pad", vec![(ore.clone(), 200.0)]);
+        assert_eq!(r.rejected.len(), 1);
+        assert!(matches!(r.rejected[0].error, SimError::Recoverable(_)));
+        // Unknown site.
+        let r = launch(&mut w, "no-such-site", vec![(ore.clone(), 1.0)]);
+        assert_eq!(r.rejected.len(), 1);
+        assert_eq!(r.rejected[0].kind, csp_core::RejectKind::LaunchCraft);
+        // Non-launch site — clone the pad minus the flag (keep the
+        // pad in the def set: `set_sites` retires unlisted rows).
+        let mut sites = BTreeMap::new();
+        sites.insert(
+            SiteId::from("pad"),
+            SiteDef {
+                schema_version: csp_data::SITE_SCHEMA_VERSION,
+                id: SiteId::from("pad"),
+                display_name: LocKey::from("site.pad"),
+                body: BodyId::from("terra"),
+                latitude_rad: 0.0,
+                longitude_rad: 0.0,
+                altitude_m: 0.0,
+                launch: true,
+                resource_yields: vec![],
+                starting_stock: vec![],
+            },
+        );
+        sites.insert(
+            SiteId::from("field"),
+            SiteDef {
+                schema_version: csp_data::SITE_SCHEMA_VERSION,
+                id: SiteId::from("field"),
+                display_name: LocKey::from("site.field"),
+                body: BodyId::from("terra"),
+                latitude_rad: 0.0,
+                longitude_rad: 0.0,
+                altitude_m: 0.0,
+                launch: false,
+                resource_yields: vec![],
+                starting_stock: vec![],
+            },
+        );
+        w.set_sites(sites);
+        w.economy.sites.insert(
+            SiteId::from("field"),
+            crate::economy::SiteState {
+                id: SiteId::from("field"),
+                inventory: BTreeMap::from([(ore.clone(), 100.0)]),
+            },
+        );
+        let r = launch(&mut w, "field", vec![(ore.clone(), 1.0)]);
+        assert_eq!(r.rejected.len(), 1, "a non-launch site must refuse");
+        // Insolvency: the facility-dormant gate names the launch the
+        // same as the order.
+        w.economy.insolvent = true;
+        let r = launch(&mut w, "pad", vec![(ore.clone(), 1.0)]);
+        assert_eq!(r.rejected.len(), 1);
+        assert!(
+            matches!(&r.rejected[0].error, SimError::Recoverable(m) if m.contains("insolvent")),
+            "{:?}",
+            r.rejected
+        );
+        w.economy.insolvent = false;
+        // And the honest launch still applies after the refusals —
+        // the stockpile proves nothing debited along the way.
+        assert_eq!(
+            w.economy().sites[&SiteId::from("pad")].inventory[&ore],
+            100.0
+        );
+        let r = launch(&mut w, "pad", vec![(ore.clone(), 20.0)]);
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        assert_eq!(w.vessels().len(), 1);
+        assert!(w.builds.is_empty());
     }
 
     /// The faucet regression, end to end (fix-plan 3.1): build a bare

@@ -896,8 +896,8 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
                     )
                     .selectable(false),
                 );
-                // The build wait is the live case here — the launch
-                // path's own pad-clearing recovery leaves the arena
+                // A pending reservation is the live case here — a
+                // colony/foreign `ManufactureCraft` leaves the arena
                 // empty until `ConstructionComplete` delivers. Name
                 // the order + its countdown persistently (the toast
                 // faded long ago), plus the warp ladder's way out.
