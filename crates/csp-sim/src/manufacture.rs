@@ -173,25 +173,33 @@ impl crate::World {
         &self.builds
     }
 
-    /// `ManufactureCraft` — the reservation: validate site, craft,
-    /// BOM, funds, and the vessel-cap slot, then spend everything and
-    /// schedule the delivery. Nothing about the craft exists until
-    /// `ConstructionComplete`.
+    /// The pure-check half of `ManufactureCraft` — every gate the
+    /// order must clear BEFORE it spends: site validity, the craft's
+    /// shape/coherence tables, the §3.3 part + facility gates, the
+    /// weld, the declared BOM's shape and catalog envelope, funds,
+    /// the vessel-cap slot, and site-inventory affordability.
+    /// Returns the aggregated BOM the apply then debits atomically.
+    ///
+    /// `pub` for the launch pre-flight (csp-view mirrors the whole
+    /// gate set so a launch that would reject at the drain refuses
+    /// at the button with the real reason instead of stranding the
+    /// player in an empty flight scene). Read-only — the apply
+    /// re-runs it at drain time regardless, so a caller-side race
+    /// can only ever refuse early, never admit a bad order.
     #[allow(clippy::too_many_lines)]
-    pub(crate) fn apply_manufacture_craft(
-        &mut self,
-        site: SiteId,
-        craft: crate::CraftDef,
-        build_resources: Vec<(ResourceId, f64)>,
-        shadow: &mut TickShadow,
-    ) -> Result<(), SimError> {
+    pub fn check_manufacture_craft(
+        &self,
+        site: &SiteId,
+        craft: &crate::CraftDef,
+        build_resources: &[(ResourceId, f64)],
+    ) -> Result<BTreeMap<ResourceId, f64>, SimError> {
         if !self.economy_cfg.is_valid() {
             // Input-reachable like the five transfer sites (a config
             // a caller installed pre-check or a corrupt record): a
             // `Recoverable` rejection, never a `Fatal`.
             return Err(SimError::Recoverable("manufacture: invalid economy config"));
         }
-        let Some(def) = self.site_defs.get(&site) else {
+        let Some(def) = self.site_defs.get(site) else {
             return Err(SimError::Recoverable("manufacture: unknown site"));
         };
         if !def.launch {
@@ -199,7 +207,7 @@ impl crate::World {
                 "manufacture: build orders consume a launch-site inventory",
             ));
         }
-        if !self.economy.sites.contains_key(&site) {
+        if !self.economy.sites.contains_key(site) {
             return Err(SimError::Recoverable(
                 "manufacture: site has no state arena row",
             ));
@@ -207,7 +215,7 @@ impl crate::World {
         // Shape checks — the same gates `apply_spawn_physical` runs:
         // the weld must succeed at delivery, so it must be sound at
         // order time.
-        crate::transfers::check_tank_masses(&craft)?;
+        crate::transfers::check_tank_masses(craft)?;
         if craft.part_costs.len() != craft.parts.len()
             || !craft.part_costs.iter().all(|c| c.is_finite() && *c >= 0.0)
         {
@@ -241,7 +249,7 @@ impl crate::World {
         }
         // M7-B §3.3: the same availability gate the spawn apply runs —
         // an un-researched part cannot be ordered, not just launched.
-        self.check_part_gate(&craft)?;
+        self.check_part_gate(craft)?;
         // C08-F6/C33-F3 §3.3: the build order is assembled in the VAB
         // and rolled to the pad — both authored facility unlocks gate
         // the verb (a treeless world runs ungated, the
@@ -257,7 +265,7 @@ impl crate::World {
         csp_phys::weld::weld(&craft.graph, &craft.parts)
             .map_err(|_| SimError::Recoverable("manufacture: craft fails the weld gate"))?;
         let mut bom: BTreeMap<ResourceId, f64> = BTreeMap::new();
-        for (r, q) in &build_resources {
+        for (r, q) in build_resources {
             if !(q.is_finite() && *q > 0.0) {
                 return Err(SimError::Recoverable(
                     "manufacture: non-positive or non-finite build resource",
@@ -271,7 +279,7 @@ impl crate::World {
         // free-build bypass `check_part_gate`'s empty-`part_ids`
         // convention leaves open — closed here, at the money door only;
         // the spawn paths keep their sandbox craft rule).
-        self.verify_bill(&craft, &bom)?;
+        self.verify_bill(craft, &bom)?;
         // The mint-hole gate: when the craft carries a per-part bill,
         // it must sum to the declared `build_resources` the order
         // spends — recovery credits the per-part table back into a
@@ -292,11 +300,11 @@ impl crate::World {
                 ));
             }
         }
-        let cost = crate::economy::craft_cost_micros(&craft);
+        let cost = crate::economy::craft_cost_micros(craft);
         if cost > self.economy.funds_micros {
             return Err(SimError::Recoverable("manufacture: insufficient funds"));
         }
-        let mass = craft_mass_kg(&craft);
+        let mass = craft_mass_kg(craft);
         if !mass.is_finite() {
             return Err(SimError::Recoverable("manufacture: non-finite craft mass"));
         }
@@ -313,7 +321,7 @@ impl crate::World {
             let have = self
                 .economy
                 .sites
-                .get(&site)
+                .get(site)
                 .and_then(|st| st.inventory.get(r))
                 .copied()
                 .unwrap_or(0.0);
@@ -323,7 +331,24 @@ impl crate::World {
                 ));
             }
         }
+        Ok(bom)
+    }
+
+    /// `ManufactureCraft` — the reservation: validate site, craft,
+    /// BOM, funds, and the vessel-cap slot, then spend everything and
+    /// schedule the delivery. Nothing about the craft exists until
+    /// `ConstructionComplete`.
+    pub(crate) fn apply_manufacture_craft(
+        &mut self,
+        site: SiteId,
+        craft: crate::CraftDef,
+        build_resources: Vec<(ResourceId, f64)>,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        let bom = self.check_manufacture_craft(&site, &craft, &build_resources)?;
         // Commit — the §2.6.4 rollback law: shadow before write.
+        let cost = crate::economy::craft_cost_micros(&craft);
+        let mass = craft_mass_kg(&craft);
         self.shadow_economy(shadow);
         for (r, q) in &bom {
             let st = self
@@ -497,6 +522,17 @@ impl crate::World {
         shadow: &mut TickShadow,
         retried: bool,
     ) -> Result<(), SimError> {
+        // Test-only fault injection: the delivery path is
+        // deliberately TOTAL in production (every failure mode above
+        // is `Fatal` or a tolerated no-op), so `fire_due_events`'s
+        // `Recoverable` arm — and its zombie-drop for the
+        // construction pair — is unreachable from a test without a
+        // stand-in failure. One-shot: `replace(false)` consumes the
+        // flag so a berth-retry chain fails only the armed firing.
+        #[cfg(test)]
+        if TEST_FAIL_DELIVERY.with(|f| f.replace(false)) {
+            return Err(SimError::Recoverable("test: injected delivery failure"));
+        }
         if self.delivery_blocked(&b) {
             let retry_tick = self.clock.ticks().saturating_add(TICK_HZ);
             if !retried {
@@ -778,6 +814,18 @@ impl crate::World {
 
 /// ±1e-9 — the bill envelope's slack band (see `verify_bill`).
 const BILL_EPS: f64 = 1.0e-9;
+
+// Test-only fault injection for `World::deliver_built_vessel` — see
+// the comment at the use site. `cfg(test)` keeps it out of every
+// shipping build like the stand-in failure it produces; a
+// `thread_local` (not a shared atomic) so parallel test threads each
+// arm their own copy — a global flag would let any concurrent
+// delivery consume the arm mid-test.
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static TEST_FAIL_DELIVERY: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
 
 /// The scale rule's stat-factor corners — `s^e · t^max(e−2,0)` at
 /// every legal `(scale, stretch)` extreme. Stat factors are monotone
@@ -1644,5 +1692,119 @@ mod tests {
             .insert(ResourceId::from("metal"), 10.0);
         let r = bench(&mut w);
         assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+    }
+
+    /// The zombie-drop: a `Recoverable`-failed construction firing
+    /// consumes the popped event, and the per-event shadow rolls the
+    /// record back into `builds()` — under §3.7's strict
+    /// build↔event pairing that unpaired record is a zombie: nothing
+    /// reschedules it, `builds()` stays non-empty (suppressing the
+    /// view's dead-scene bounce — the stranded player), and the next
+    /// save trips `restore_build_state`'s pairing gate. The firing's
+    /// failure arm drops the record with the event, the
+    /// `ManeuverNodeStart`/`TransferComplete`/contract arms'
+    /// convention.
+    ///
+    /// The delivery path is deliberately TOTAL in production (see
+    /// `fire_construction_complete`'s doc), so the arm is reachable
+    /// only through `TEST_FAIL_DELIVERY`'s stand-in failure.
+    #[test]
+    fn failed_construction_delivery_drops_the_build() {
+        let mut w = world();
+        let ore = ResourceId::from("ore");
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::ManufactureCraft {
+                site: SiteId::from("pad"),
+                craft: craft(),
+                build_resources: vec![(ore.clone(), 20.0)],
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        let build = *w.builds.keys().next().unwrap();
+
+        // Arm the one-shot failure, then step past the deadline —
+        // 100 kg at 50 kg/s is 128 ticks (the delivery test above).
+        TEST_FAIL_DELIVERY.with(|f| f.set(true));
+        let r = w.step_frame(w.clock().ticks() + 200).unwrap();
+        assert!(
+            r.degraded
+                .iter()
+                .any(|e| matches!(e, SimError::Recoverable(_))),
+            "the injected failure must ride the degraded channel: {:?}",
+            r.degraded
+        );
+        assert!(
+            w.builds.is_empty(),
+            "a failed firing consumes the record with its event: {:?}",
+            w.builds.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !w.pending_events().iter().any(|e| matches!(&e.kind,
+                EventKind::ConstructionComplete { build: b }
+                | EventKind::ConstructionRetry { build: b }
+                    if *b == build)),
+            "no construction event may survive for the dropped record"
+        );
+        assert!(w.vessels().is_empty(), "a failed delivery lands no vessel");
+        // And the world is not wedged: the clock keeps advancing and
+        // the pairing gate has no zombie to fault on the next save.
+        w.step_frame(w.clock().ticks() + 64).unwrap();
+        w.snapshot().expect("a paired arena snapshots cleanly");
+    }
+
+    /// The retry arm of the same drop: a berth-blocked delivery
+    /// re-queues on `ConstructionRetry`, and a `Recoverable` failure
+    /// on the RE-fire consumes the record identically — the pairing
+    /// covers both kinds.
+    #[test]
+    fn failed_construction_retry_drops_the_build() {
+        let mut w = physics_world();
+        let ore = ResourceId::from("ore");
+        w.vessels.insert(VesselId(0), parked_vessel(&w, craft()));
+        w.next_vessel_id = 1;
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::ManufactureCraft {
+                site: SiteId::from("pad"),
+                craft: craft(),
+                build_resources: vec![(ore.clone(), 20.0)],
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        let build = *w.builds.keys().next().unwrap();
+        // Step to the deadline: the occupied berth re-queues the
+        // order onto `ConstructionRetry` one sim-second out.
+        w.step_frame(w.clock().ticks() + 200).unwrap();
+        assert_eq!(w.builds.len(), 1, "the berth-blocked order waits");
+        assert!(
+            w.pending_events().iter().any(
+                |e| matches!(&e.kind, EventKind::ConstructionRetry { build: b } if *b == build)
+            ),
+            "a retry event must be pending"
+        );
+        TEST_FAIL_DELIVERY.with(|f| f.set(true));
+        let r = w.step_frame(w.clock().ticks() + TICK_HZ + 8).unwrap();
+        assert!(
+            r.degraded
+                .iter()
+                .any(|e| matches!(e, SimError::Recoverable(_))),
+            "the retry's injected failure must ride degraded: {:?}",
+            r.degraded
+        );
+        assert!(
+            w.builds.is_empty(),
+            "the retry arm drops the record with its event too"
+        );
+        assert!(
+            !w.pending_events().iter().any(|e| matches!(&e.kind,
+                EventKind::ConstructionComplete { build: b }
+                | EventKind::ConstructionRetry { build: b }
+                    if *b == build)),
+            "no construction event may survive for the dropped record"
+        );
     }
 }

@@ -58,6 +58,12 @@ pub enum RejectKind {
     /// "recover control" conversion refused. `csp-view` releases the
     /// pending focus pin on this kind.
     ToBubble,
+    /// A `SimCommand::ManufactureCraft` rejection — the §3.5 build
+    /// order refused at its drain. `csp-view` treats one on an
+    /// already-empty arena as the dead-scene edge the
+    /// vessel-removal bounce cannot see (no vessel left to remove,
+    /// no `ActiveBuild` in flight, Flight mode stranded).
+    ManufactureCraft,
     /// Any other rejection — no consumer branches on it.
     Other,
 }

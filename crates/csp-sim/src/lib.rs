@@ -1423,6 +1423,7 @@ pub struct RejectedCommand {
 fn reject_kind(command: &SimCommand) -> RejectKind {
     match command {
         SimCommand::ToBubble { .. } => RejectKind::ToBubble,
+        SimCommand::ManufactureCraft { .. } => RejectKind::ManufactureCraft,
         _ => RejectKind::Other,
     }
 }
@@ -8574,6 +8575,23 @@ impl World {
                     if let EventKind::ContractDeadline { contract } = &event.kind {
                         self.shadow_contracts(shadow);
                         self.contracts.active.remove(contract);
+                    }
+                    // A failed construction firing orphans its
+                    // `ActiveBuild` the same way — the popped event
+                    // is consumed and `ev_shadow`'s restore rolls
+                    // the record back into `builds()` with nothing
+                    // left to ever land it. Under §3.7's strict
+                    // build↔event pairing that record is a zombie:
+                    // `builds()` stays non-empty (suppressing the
+                    // view's dead-scene bounce and stranding the
+                    // player), and the next save trips the pairing
+                    // gate. Consume the record with the event (the
+                    // zombie-drop, same as the node/transfer).
+                    if let EventKind::ConstructionComplete { build }
+                    | EventKind::ConstructionRetry { build } = &event.kind
+                    {
+                        self.shadow_builds(shadow);
+                        self.builds.remove(build);
                     }
                     let vessel = match &event.kind {
                         EventKind::SoiTransition { vessel, .. }

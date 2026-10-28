@@ -2441,15 +2441,34 @@ impl View {
         // ~build_ticks later with nobody watching). If the order
         // rejected at drain, `builds()` is empty and the bounce still
         // catches the truly-dead scene.
-        if had_vessels
+        // The rejected-order edge the `had_vessels` gate can't see:
+        // a `ManufactureCraft` that refuses AT ITS DRAIN on an
+        // ALREADY-empty arena (the player recovered the pad's last
+        // vessel before pressing LAUNCH, or a hand-queued order) has
+        // no vessel-removal edge at all — `launch_craft` switched to
+        // Flight at enqueue, so a refuse leaves `mode=Flight` with
+        // `vessels()`/`builds()` both empty and no exit path. The
+        // typed `RejectKind` carries the refusal (the `ToBubble`
+        // precedent — `reason()` text is never branch-determining);
+        // the sim's own reason lands on the VAB notice row rather
+        // than a transient "COMMAND REFUSED" cue the scene hides.
+        let order_reject = report.rejected.iter().find_map(|r| {
+            (r.key.source_class == SourceClass::Ui
+                && r.key.source_id == PLAYER_SOURCE_ID
+                && r.kind == csp_core::RejectKind::ManufactureCraft)
+                .then(|| r.error.reason())
+        });
+        if (had_vessels || order_reject.is_some())
             && self.sim.vessels().is_empty()
             && self.sim.builds().is_empty()
             && self.mode() == ViewMode::Flight
         {
             self.set_mode(ViewMode::Vab);
-            self.vab_event(vab::VabEvent::Notice(
-                "vessel recovered — the arena is empty; back in the VAB".to_string(),
-            ));
+            let msg = order_reject.map_or_else(
+                || "vessel recovered — the arena is empty; back in the VAB".to_string(),
+                |reason| format!("build order refused — {reason}"),
+            );
+            self.vab_event(vab::VabEvent::Notice(msg));
         }
         // The launch revert point's delivery boundary (PLAN:1177-1180 —
         // the sim contract at `manufacture.rs` expects the post-delivery
@@ -4096,6 +4115,25 @@ impl View {
             return Some(
                 self.launch_refused("launch site occupied — an active vessel blocks the pad"),
             );
+        }
+        // The drain-side contract, verbatim: a launch that will
+        // actually arm a `ManufactureCraft` order (a catalog-resolved
+        // craft to an authored launch site — the same condition
+        // `launch_craft` picks the order path on) must clear EVERY
+        // `apply_manufacture_craft` gate, not only the ones with
+        // friendlier wording above — the tank/coherence tables, the
+        // part and facility unlocks, the weld, and the catalog bill
+        // envelope all reject at the drain too, and a drain-reject on
+        // an already-empty arena strands the player in a dead flight
+        // scene. `check_manufacture_craft` is the apply's own gate
+        // list run read-only, so the button refuses with the sim's
+        // real reason rather than a cue after the mode switch.
+        if let Some(site) = site.filter(|_| !craft.part_ids.is_empty())
+            && let Err(e) = self
+                .sim
+                .check_manufacture_craft(&site.id, craft, build_resources)
+        {
+            return Some(self.launch_refused(e.reason()));
         }
         None
     }

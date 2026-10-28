@@ -303,3 +303,102 @@ fn launch_recover_cycles_do_not_drain_the_stockpile() {
         "composite drained across cycles: {composite0} -> {composite1}"
     );
 }
+
+/// The stranded-Flight gap the `had_vessels` edge can't cover: a
+/// `ManufactureCraft` that REJECTS at its drain while the arena was
+/// already empty (`had_vessels == false`) leaves `mode = Flight` with
+/// no vessel, no build, and no exit path — `launch_craft` switched
+/// modes at enqueue and only a transient "COMMAND REFUSED" cue says
+/// why. The drain-reject is now a dead-scene edge of its own: the
+/// player lands in the VAB with the sim's reason on the notice row.
+/// (`ManufactureCraft` has apply-only gates the launch pre-flight
+/// can't see — the enqueue here proves the strand directly; a real
+/// launch reaches the same reject through a second source racing the
+/// drain.)
+#[test]
+fn rejected_order_on_empty_arena_bounces_to_vab() {
+    let mut view = View::new().expect("data/ load");
+    // No seed — arena empty from boot. In Flight (the boot default).
+    assert_eq!(view.mode(), ViewMode::Flight);
+    assert!(view.sim.vessels().is_empty());
+
+    // A ManufactureCraft the apply must refuse — bogus site.
+    view.enqueue_command(
+        SourceClass::Ui,
+        csp_view::PLAYER_SOURCE_ID,
+        SimCommand::ManufactureCraft {
+            site: csp_data::SiteId::from("no-such-site"),
+            craft: csp_sim::CraftDef {
+                hash_memo: Default::default(),
+                graph: csp_phys::graph::PartGraph::new(csp_phys::PartNodeId(0)),
+                parts: Vec::new(),
+                part_costs: Vec::new(),
+                reliability: Vec::new(),
+                part_ids: Vec::new(),
+                part_build_resources: Vec::new(),
+            },
+            build_resources: Vec::new(),
+        },
+    );
+    let target = view.sim.clock().ticks() + 8;
+    view.begin_frame();
+    let r = view.sim_step(target).unwrap();
+    view.end_frame();
+    assert!(
+        !r.rejected.is_empty(),
+        "the bogus order must reject at drain"
+    );
+    assert!(view.sim.builds().is_empty());
+    assert!(view.sim.vessels().is_empty());
+    assert_eq!(
+        view.mode(),
+        ViewMode::Vab,
+        "an empty-arena reject must still land the player in the VAB"
+    );
+    // The reason rides the VAB notice row — persistent, not a
+    // transient cue the dead scene would have hidden.
+    view.begin_frame();
+    view.end_frame();
+    let notice = view.with_vab_session(|v| v.notice().map(str::to_string));
+    assert!(
+        notice
+            .as_deref()
+            .is_some_and(|n| n.contains("unknown site")),
+        "the drain-reject reason must persist on the notice row: {notice:?}"
+    );
+}
+
+/// The preflight mirror: `apply_manufacture_craft`'s facility gate
+/// (`facility.vab` + `facility.launchpad`) is a drain-time reject the
+/// button-side checks used to skip — an order enqueued anyway would
+/// land the player in Flight with only a reject cue. The launch must
+/// refuse at the button with the sim's real reason and keep the
+/// player in the VAB.
+#[test]
+fn launch_preflight_mirrors_the_facility_gate() {
+    let mut view = View::new().expect("data/ load");
+    view.seed_starter_craft().expect("starter seed");
+
+    // Re-install the tech tree minus its facility grants — the
+    // parts stay unlocked (`tech.start` is still researched and the
+    // part gate checks `tech_requirement`, not the unlocks table),
+    // but `facility.vab`/`facility.launchpad` are no longer granted.
+    let mut tree = view.sim.tech_tree().cloned().expect("home tree");
+    for node in &mut tree.nodes {
+        node.unlocks.facilities.clear();
+    }
+    view.sim.set_tech_tree(tree);
+
+    view.set_mode(ViewMode::Vab);
+    let err = match view.launch_craft() {
+        Ok(()) => panic!("a facility-locked build must refuse at the button"),
+        Err(e) => e,
+    };
+    assert!(
+        err.contains("facility"),
+        "the refusal must name the real gate: {err}"
+    );
+    assert_eq!(view.mode(), ViewMode::Vab, "a refused launch keeps VAB");
+    // No order was armed — the drain never sees it.
+    assert!(view.sim.builds().is_empty());
+}
