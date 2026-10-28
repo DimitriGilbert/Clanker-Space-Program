@@ -22,6 +22,7 @@
     build_resources: [("metal", 70.0), ("composite", 10.0)],
     attach_nodes: [
         (id: "top", position_m: (x: 0.0, y: 0.0, z: 0.9), direction: (x: 0.0, y: 0.0, z: 1.0), diameter_m: 1.25),
+        (id: "bottom", position_m: (x: 0.0, y: 0.0, z: -0.9), direction: (x: 0.0, y: 0.0, z: -1.0), diameter_m: 1.25),
     ],
     scale: None,
     collider: Cylinder(radius_m: 0.625, half_height_m: 0.9),
