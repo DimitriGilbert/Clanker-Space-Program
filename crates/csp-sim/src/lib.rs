@@ -3526,30 +3526,36 @@ impl World {
         // tick) — and every pending start event names a `Scheduled`
         // node. `node.tick` itself must be a live future-or-flushing
         // tick — the same `>= clock` bound the event passed above.
-        for (id, vessel) in &snapshot.vessels {
-            let node = vessel
-                .maneuver
-                .as_ref()
-                .filter(|n| matches!(n.status, ManeuverStatus::Scheduled));
-            let lead = node.map_or(0, |n| {
-                vessel
-                    .craft
+        check_record_event_pair(
+            &snapshot.vessels,
+            &node_events,
+            |v| {
+                v.maneuver
                     .as_ref()
-                    .map_or(0, |c| maneuver::node_lead_ticks(c, n.dv_magnitude()))
-            });
-            match (node.map(|n| n.tick), node_events.get(id)) {
-                (Some(tick), Some(&event_tick))
-                    if event_tick <= tick
-                        && tick - event_tick <= lead
-                        && tick >= snapshot.clock_ticks => {}
-                (None, None) => {}
-                _ => {
-                    return Err(SimError::Fatal(
-                        "snapshot: scheduled node / start event mismatch",
-                    ));
+                    .filter(|n| matches!(n.status, ManeuverStatus::Scheduled))
+                    .map(|n| n.tick)
+            },
+            |v, node_tick, event_tick| {
+                let lead = v
+                    .maneuver
+                    .as_ref()
+                    .filter(|n| matches!(n.status, ManeuverStatus::Scheduled))
+                    .map_or(0, |n| {
+                        v.craft
+                            .as_ref()
+                            .map_or(0, |c| maneuver::node_lead_ticks(c, n.dv_magnitude()))
+                    });
+                match (node_tick, event_tick) {
+                    (Some(tick), Some(et)) => {
+                        et <= tick && tick - et <= lead && tick >= snapshot.clock_ticks
+                    }
+                    (None, None) => true,
+                    _ => false,
                 }
-            }
-        }
+            },
+            "snapshot: scheduled node / start event mismatch",
+            "snapshot: node start event names unknown vessel",
+        )?;
         if salary_due_count > 1 {
             return Err(SimError::Fatal("snapshot: duplicate salary events"));
         }
@@ -3589,22 +3595,14 @@ impl World {
                 "snapshot: next_script_id not ahead of live ids",
             ));
         }
-        for (id, s) in &snapshot.scripts {
-            match (s.wake_tick, wake_events.get(id)) {
-                (Some(t), Some(&et)) if t == et => {}
-                (None, None) => {}
-                _ => {
-                    return Err(SimError::Fatal(
-                        "snapshot: script wake / pending event mismatch",
-                    ));
-                }
-            }
-        }
-        for s in wake_events.keys() {
-            if !snapshot.scripts.contains_key(s) {
-                return Err(SimError::Fatal("snapshot: wake names unknown script"));
-            }
-        }
+        check_record_event_pair(
+            &snapshot.scripts,
+            &wake_events,
+            |s| s.wake_tick,
+            |_, claimed, event| claimed == event,
+            "snapshot: script wake / pending event mismatch",
+            "snapshot: wake names unknown script",
+        )?;
         // A bound autopilot must not outlive its vessel (the removal
         // paths all delete it) — the `tracked_vessels` subset gate.
         for (id, a) in &snapshot.autopilots {
@@ -4016,6 +4014,33 @@ impl World {
         shadow_events_whole_split(&self.event_heap, self.next_event_seq, shadow);
     }
 
+    /// The wholesale heap rewrite (C04-F4's `shadow_events_whole →
+    /// mem::take → filter → collect` idiom, collapsed): capture the
+    /// boundary heap, drain it, run `f` per entry — `Some(e)` keeps
+    /// the entry (possibly restamped), `None` drops it — and
+    /// re-heapify. Drain order is irrelevant: `BinaryHeap` pops by the
+    /// `(tick, seq)` key, so the rewrite is a pure set operation and
+    /// cannot disturb event order.
+    fn rewrite_event_heap(
+        &mut self,
+        shadow: &mut TickShadow,
+        f: impl FnMut(ScheduledEvent) -> Option<ScheduledEvent>,
+    ) {
+        rewrite_event_heap_split(&mut self.event_heap, self.next_event_seq, shadow, f);
+    }
+
+    /// The drop-only half of [`Self::rewrite_event_heap`] — every
+    /// event-retirement path (vessel loss, residence change, record
+    /// retirement) is a `keep` predicate; spelling it as one makes
+    /// the "pending events die with their record" rule a named call.
+    fn scrub_event_heap(
+        &mut self,
+        shadow: &mut TickShadow,
+        keep: impl Fn(&ScheduledEvent) -> bool,
+    ) {
+        self.rewrite_event_heap(shadow, |e| keep(&e).then_some(e));
+    }
+
     /// Ops-mode bookkeeping: record a verbatim removal (the fire
     /// loop's pop) so restore can re-push it. No-op under `Whole` —
     /// the boundary heap is already held.
@@ -4130,12 +4155,7 @@ impl World {
                 // way `apply_to_bubble` does, then restamp the
                 // records to their bubble classes (publish flags
                 // cleared inside).
-                self.shadow_events_whole(shadow);
-                let heap = std::mem::take(&mut self.event_heap);
-                self.event_heap = heap
-                    .into_iter()
-                    .filter(|e| !event_names_vessel(&e.kind, &vessel))
-                    .collect();
+                self.scrub_event_heap(shadow, |e| !event_names_vessel(&e.kind, &vessel));
                 self.reliability_residence_change(vessel, self.clock.ticks(), false, shadow)?;
             }
             // The arm below returns a `&mut` into the arena for direct
@@ -5152,12 +5172,7 @@ impl World {
         self.autopilots.remove(&vessel);
         // Lazy no-op if the drop above already captured the heap —
         // needed when the vessel carried no projects at all.
-        self.shadow_events_whole(shadow);
-        let heap = std::mem::take(&mut self.event_heap);
-        self.event_heap = heap
-            .into_iter()
-            .filter(|e| !event_names_vessel(&e.kind, &vessel))
-            .collect();
+        self.scrub_event_heap(shadow, |e| !event_names_vessel(&e.kind, &vessel));
     }
 
     /// §3.5's debris-decay scheduling: after `ToRails` stamps the
@@ -5442,19 +5457,23 @@ impl World {
                 // pending SoiTransitions. `class` is not part of the heap
                 // key, so rewriting it via drain/re-heapify keeps the
                 // `(tick, seq)` order intact.
-                self.shadow_events_whole(shadow);
-                let heap = std::mem::take(&mut self.event_heap);
-                self.event_heap = heap
-                    .into_iter()
-                    .map(|mut e| {
+                // `tracked_vessels` rides the rewrite — the split twin
+                // borrows the heap mutably and the set immutably, which
+                // a `self.` method call cannot express.
+                let tracked = &self.tracked_vessels;
+                rewrite_event_heap_split(
+                    &mut self.event_heap,
+                    self.next_event_seq,
+                    shadow,
+                    |mut e| {
                         if let EventKind::SoiTransition { vessel: v, .. } = &e.kind
                             && v == vessel
                         {
-                            e.class = events::class_of(&e.kind, &self.tracked_vessels);
+                            e.class = events::class_of(&e.kind, tracked);
                         }
-                        e
-                    })
-                    .collect();
+                        Some(e)
+                    },
+                );
             }
             SimCommand::InstallAeroTables {
                 vessel,
@@ -6781,12 +6800,7 @@ impl World {
         // leaves rails — drop them in one re-heapify pass. M9b: the
         // same scrub covers the dormant `PartFailure`s (vessel-named);
         // the records restamp to their bubble classes next.
-        self.shadow_events_whole(shadow);
-        let heap = std::mem::take(&mut self.event_heap);
-        self.event_heap = heap
-            .into_iter()
-            .filter(|e| !event_names_vessel(&e.kind, &vessel))
-            .collect();
+        self.scrub_event_heap(shadow, |e| !event_names_vessel(&e.kind, &vessel));
         self.reliability_residence_change(vessel, self.clock.ticks(), false, shadow)?;
         Ok(())
     }
@@ -6895,14 +6909,10 @@ impl World {
             .maneuver = Some(node);
         // Replacing a Scheduled node: drop the old pending start event
         // before scheduling the new one — one live event per node.
-        self.shadow_events_whole(shadow);
-        let heap = std::mem::take(&mut self.event_heap);
-        self.event_heap = heap
-            .into_iter()
-            .filter(
-                |e| !matches!(&e.kind, EventKind::ManeuverNodeStart { vessel: v } if v == &vessel),
-            )
-            .collect();
+        self.scrub_event_heap(
+            shadow,
+            |e| !matches!(&e.kind, EventKind::ManeuverNodeStart { vessel: v } if v == &vessel),
+        );
         self.schedule_event(EventKind::ManeuverNodeStart { vessel }, start, shadow)
     }
 
@@ -6930,14 +6940,10 @@ impl World {
             body.throttle = 0.0;
         }
         v.maneuver = None;
-        self.shadow_events_whole(shadow);
-        let heap = std::mem::take(&mut self.event_heap);
-        self.event_heap = heap
-            .into_iter()
-            .filter(
-                |e| !matches!(&e.kind, EventKind::ManeuverNodeStart { vessel: v } if v == &vessel),
-            )
-            .collect();
+        self.scrub_event_heap(
+            shadow,
+            |e| !matches!(&e.kind, EventKind::ManeuverNodeStart { vessel: v } if v == &vessel),
+        );
         Ok(())
     }
 
@@ -7043,12 +7049,7 @@ impl World {
         // scrub; the just-fired event is already popped). M9b: the
         // dormant `PartFailure`s ride the same filter, and the
         // records restamp to their bubble classes.
-        self.shadow_events_whole(shadow);
-        let heap = std::mem::take(&mut self.event_heap);
-        self.event_heap = heap
-            .into_iter()
-            .filter(|e| !event_names_vessel(&e.kind, &vessel))
-            .collect();
+        self.scrub_event_heap(shadow, |e| !event_names_vessel(&e.kind, &vessel));
         self.reliability_residence_change(vessel, self.clock.ticks(), false, shadow)?;
         Ok(())
     }
@@ -7425,8 +7426,7 @@ impl World {
             [node].into_iter().collect();
         let tick = self.clock.ticks();
         self.shadow_science(shadow);
-        self.shadow_events_whole(shadow);
-        let (_, banked) = self.finalize_projects_on_nodes(vessel, &departing, tick);
+        let (_, banked) = self.finalize_projects_on_nodes(vessel, &departing, tick, shadow);
         // M7-C: the jettison-finalized projects' accrual pays out —
         // science banked is science banked.
         self.credit_science_payout(banked, shadow);
@@ -7745,18 +7745,14 @@ impl World {
         // them; orphans would fire as tolerated no-ops, but the apply
         // knows better here).
         for pid in &finalized {
-            let kept: Vec<ScheduledEvent> = std::mem::take(&mut self.event_heap)
-                .into_iter()
-                .filter(|e| {
-                    !matches!(
-                        &e.kind,
-                        EventKind::ResearchDataExhausted { project: p }
-                        | EventKind::ResearchProjectComplete { project: p }
-                            if *p == *pid
-                    )
-                })
-                .collect();
-            self.event_heap = kept.into_iter().collect();
+            self.scrub_event_heap(shadow, |e| {
+                !matches!(
+                    &e.kind,
+                    EventKind::ResearchDataExhausted { project: p }
+                    | EventKind::ResearchProjectComplete { project: p }
+                        if p == pid
+                )
+            });
         }
         if let Some(p) = self.physics.as_mut() {
             p.aero.remove(&vessel);
@@ -8371,12 +8367,10 @@ impl World {
             .iter()
             .any(|e| matches!(&e.kind, EventKind::ScriptWake { script } if *script == id));
         if pending {
-            self.shadow_events_whole(shadow);
-            let kept: Vec<ScheduledEvent> = std::mem::take(&mut self.event_heap)
-                .into_iter()
-                .filter(|e| !matches!(&e.kind, EventKind::ScriptWake { script } if *script == id))
-                .collect();
-            self.event_heap = kept.into_iter().collect();
+            self.scrub_event_heap(
+                shadow,
+                |e| !matches!(&e.kind, EventKind::ScriptWake { script } if *script == id),
+            );
         }
         // Clear the registration even when the heap held nothing — a
         // `Some(t)` pairing with no event is exactly the shape the
@@ -8402,11 +8396,10 @@ impl World {
         self.shadow_scripts(shadow);
         self.shadow_events_whole(shadow);
         self.scripts.remove(&id);
-        let kept: Vec<ScheduledEvent> = std::mem::take(&mut self.event_heap)
-            .into_iter()
-            .filter(|e| !matches!(&e.kind, EventKind::ScriptWake { script } if *script == id))
-            .collect();
-        self.event_heap = kept.into_iter().collect();
+        self.scrub_event_heap(
+            shadow,
+            |e| !matches!(&e.kind, EventKind::ScriptWake { script } if *script == id),
+        );
         // M9c: a dead script cannot hold a lease — release EVERY
         // vessel it controls back to `Player` so no craft is stranded
         // under a controller that no longer exists.
@@ -10272,12 +10265,12 @@ impl TickIo for WorldTickIo<'_> {
         // Scrub any pending wake for this script (the strict pair
         // invariant — one wake per script), shadowed like every heap
         // mutation, then schedule the resolved `Clamping` event.
-        shadow_events_whole_split(self.event_heap, *self.next_event_seq, self.shadow);
-        let kept: Vec<ScheduledEvent> = std::mem::take(self.event_heap)
-            .into_iter()
-            .filter(|e| !matches!(&e.kind, EventKind::ScriptWake { script: s } if *s == script))
-            .collect();
-        *self.event_heap = kept.into_iter().collect();
+        scrub_event_heap_split(
+            self.event_heap,
+            *self.next_event_seq,
+            self.shadow,
+            |e| !matches!(&e.kind, EventKind::ScriptWake { script: s } if *s == script),
+        );
         let seq = *self.next_event_seq;
         *self.next_event_seq = seq
             .checked_add(1)
@@ -10296,12 +10289,12 @@ impl TickIo for WorldTickIo<'_> {
         if self.bound_script != Some(script) {
             return Err(SimError::Recoverable("wake: script not bound to this io"));
         }
-        shadow_events_whole_split(self.event_heap, *self.next_event_seq, self.shadow);
-        let kept: Vec<ScheduledEvent> = std::mem::take(self.event_heap)
-            .into_iter()
-            .filter(|e| !matches!(&e.kind, EventKind::ScriptWake { script: s } if *s == script))
-            .collect();
-        *self.event_heap = kept.into_iter().collect();
+        scrub_event_heap_split(
+            self.event_heap,
+            *self.next_event_seq,
+            self.shadow,
+            |e| !matches!(&e.kind, EventKind::ScriptWake { script: s } if *s == script),
+        );
         self.wake = WakeAction::Cleared;
         Ok(())
     }
@@ -10370,6 +10363,36 @@ fn shadow_events_whole_split(
     }
 }
 
+/// The `World::rewrite_event_heap` twin for the field-split paths —
+/// same capture-then-rewrite contract, taking `event_heap` /
+/// `next_event_seq` / `shadow` as separate borrows for the
+/// destructure scopes (`step_bubble_range`, `apply_breakup`'s
+/// parameter list, the script-io struct) where `self` is out of
+/// reach. `f` returns `Some(e)` to keep (possibly restamped) or
+/// `None` to drop; drain order is irrelevant — the heap keys on
+/// `(tick, seq)`.
+fn rewrite_event_heap_split(
+    heap: &mut BinaryHeap<ScheduledEvent>,
+    next_event_seq: u64,
+    shadow: &mut TickShadow,
+    f: impl FnMut(ScheduledEvent) -> Option<ScheduledEvent>,
+) {
+    shadow_events_whole_split(heap, next_event_seq, shadow);
+    let taken = std::mem::take(heap);
+    *heap = taken.into_iter().filter_map(f).collect();
+}
+
+/// The drop-only half of [`rewrite_event_heap_split`], the split
+/// twin of `World::scrub_event_heap`.
+fn scrub_event_heap_split(
+    heap: &mut BinaryHeap<ScheduledEvent>,
+    next_event_seq: u64,
+    shadow: &mut TickShadow,
+    keep: impl Fn(&ScheduledEvent) -> bool,
+) {
+    rewrite_event_heap_split(heap, next_event_seq, shadow, |e| keep(&e).then_some(e));
+}
+
 /// Does this scheduled event name `vessel`? Used by the `ToBubble`
 /// apply and the node-start materialization to drop the vessel's dead
 /// events when it leaves rails — SOI events (no conic to scan) and
@@ -10436,6 +10459,77 @@ fn event_names_vessel(kind: &EventKind, vessel: &VesselId) -> bool {
         // `StaffAttrition` names a roster member, not a vessel.
         | EventKind::StaffAttrition { .. }
         | EventKind::FacilityDormant => false,
+    }
+}
+
+/// The record↔pending-event pairing gate (C04-F4) — strict in both
+/// directions, the shape every `restore_*` check hand-rolled: each
+/// record claims `record_tick(record)` (`None` = "holds no pairing"),
+/// and pairs iff `pairs(record, claimed, event_tick)`; the plain
+/// `claimed == event` is the common strict form (`Some(t)` with an
+/// event at `t`, `None` with none) — the maneuver node's lead window
+/// is the worked example of a custom predicate. The reverse arm
+/// refuses any event whose record id is absent from `arena`.
+///
+/// `events` is the heap walk's `id → tick` index — at most one event
+/// per id, duplicates refused upstream.
+fn check_record_event_pair<K: Ord + Copy, R>(
+    arena: &BTreeMap<K, R>,
+    events: &BTreeMap<K, u64>,
+    record_tick: impl Fn(&R) -> Option<u64>,
+    pairs: impl Fn(&R, Option<u64>, Option<u64>) -> bool,
+    mismatch: &'static str,
+    orphan: &'static str,
+) -> Result<(), SimError> {
+    for (id, r) in arena {
+        if !pairs(r, record_tick(r), events.get(id).copied()) {
+            return Err(SimError::Fatal(mismatch));
+        }
+    }
+    for id in events.keys() {
+        if !arena.contains_key(id) {
+            return Err(SimError::Fatal(orphan));
+        }
+    }
+    Ok(())
+}
+
+/// The two-stream variant of [`check_record_event_pair`] (C04-F4):
+/// each record pairs with exactly one event in EACH of two streams,
+/// both at `record_tick` — research's `DataExhausted`/`ProjectComplete`
+/// pair is the only instance. Forward direction only; the caller's
+/// doc says why record-less events are legal here.
+fn check_record_event_pair2<K: Ord + Copy, R>(
+    arena: &BTreeMap<K, R>,
+    events_a: &BTreeMap<K, u64>,
+    events_b: &BTreeMap<K, u64>,
+    record_tick: impl Fn(&R) -> u64,
+    mismatch: &'static str,
+) -> Result<(), SimError> {
+    for (id, r) in arena {
+        let t = record_tick(r);
+        if events_a.get(id) != Some(&t) || events_b.get(id) != Some(&t) {
+            return Err(SimError::Fatal(mismatch));
+        }
+    }
+    Ok(())
+}
+
+/// The one-directional variant (C04-F4): a `Some(t)` claim must pair
+/// with an event at `t`; a `None` claim and record-less events are
+/// both legal — the tolerated-staleness form (a record that departed
+/// on a fragment cleared its flag while the event still rides the
+/// heap).
+fn check_claimed_event_tick<K: Ord>(
+    claimed: Option<u64>,
+    key: K,
+    events: &BTreeMap<K, u64>,
+    mismatch: &'static str,
+) -> Result<(), SimError> {
+    match claimed {
+        None => Ok(()),
+        Some(t) if events.get(&key) == Some(&t) => Ok(()),
+        Some(_) => Err(SimError::Fatal(mismatch)),
     }
 }
 
@@ -10519,22 +10613,15 @@ fn restore_transfer_state(
                 // produced (the poison-save C04-F1).
             }
         }
-        match transfer_events.get(id) {
-            Some(&tick) if tick == t.complete_tick => {}
-            _ => {
-                return Err(SimError::Fatal(
-                    "snapshot: transfer / complete event mismatch",
-                ));
-            }
-        }
     }
-    for id in transfer_events.keys() {
-        if !snapshot.transfers.contains_key(id) {
-            return Err(SimError::Fatal(
-                "snapshot: complete event names unknown transfer",
-            ));
-        }
-    }
+    check_record_event_pair(
+        &snapshot.transfers,
+        transfer_events,
+        |t| Some(t.complete_tick),
+        |_, claimed, event| claimed == event,
+        "snapshot: transfer / complete event mismatch",
+        "snapshot: complete event names unknown transfer",
+    )?;
     for vessel in snapshot.vessels.values() {
         for c in &vessel.crew {
             if c.id.0 >= snapshot.next_crew_id || !crew_seen.insert(c.id) {
@@ -10590,22 +10677,15 @@ fn restore_build_state(
                 ));
             }
         }
-        match build_events.get(id) {
-            Some(&tick) if tick == b.complete_tick => {}
-            _ => {
-                return Err(SimError::Fatal(
-                    "snapshot: build / construction event mismatch",
-                ));
-            }
-        }
     }
-    for id in build_events.keys() {
-        if !snapshot.builds.contains_key(id) {
-            return Err(SimError::Fatal(
-                "snapshot: construction event names unknown build",
-            ));
-        }
-    }
+    check_record_event_pair(
+        &snapshot.builds,
+        build_events,
+        |b| Some(b.complete_tick),
+        |_, claimed, event| claimed == event,
+        "snapshot: build / construction event mismatch",
+        "snapshot: construction event names unknown build",
+    )?;
     for v in snapshot.vessels.values() {
         if let Some(c) = v.joined_colony
             && (!snapshot.colonies.contains_key(&c)
@@ -10710,16 +10790,17 @@ fn restore_science_state(
                 "snapshot: incoherent researcher assignment",
             ));
         }
-        // The event pair: exactly one each, both AT `exhaust_tick`.
-        match (research_exhausted.get(id), research_complete.get(id)) {
-            (Some(&a), Some(&b)) if a == p.exhaust_tick && b == p.exhaust_tick => {}
-            _ => {
-                return Err(SimError::Fatal(
-                    "snapshot: project / research event pair mismatch",
-                ));
-            }
-        }
     }
+    // The event pair: exactly one of each kind per project, both AT
+    // `exhaust_tick` — forward direction only (orphan events are legal;
+    // see the function doc).
+    check_record_event_pair2(
+        &science.projects,
+        research_exhausted,
+        research_complete,
+        |p| p.exhaust_tick,
+        "snapshot: project / research event pair mismatch",
+    )?;
     Ok(())
 }
 
@@ -10838,21 +10919,15 @@ fn restore_contract_state(
         if !contracts::params_ok(&a.params) {
             return Err(SimError::Fatal("snapshot: contract with non-finite params"));
         }
-        match (a.deadline_tick, deadline_events.get(id)) {
-            (Some(t), Some(&e)) if t == e => {}
-            (None, None) => {}
-            _ => {
-                return Err(SimError::Fatal(
-                    "snapshot: contract / deadline event pairing mismatch",
-                ));
-            }
-        }
     }
-    if deadline_events.keys().any(|id| !c.active.contains_key(id)) {
-        return Err(SimError::Fatal(
-            "snapshot: deadline event names no active contract",
-        ));
-    }
+    check_record_event_pair(
+        &c.active,
+        deadline_events,
+        |a| a.deadline_tick,
+        |_, claimed, event| claimed == event,
+        "snapshot: contract / deadline event pairing mismatch",
+        "snapshot: deadline event names no active contract",
+    )?;
     // M8-C: the resupply fact's cumulative quantities are bounded
     // accounting — a crafted NaN or negative total would lie about
     // delivered history (the `restore_economy_state` site-inventory
@@ -11057,28 +11132,31 @@ fn restore_colony_state(
                 return Err(SimError::Fatal("snapshot: incoherent colony store"));
             }
         }
-        // The `inspection_tick`↔`ColonyInspection` pairing — the
-        // sibling pairings' rule, strict in both directions but
-        // scoped to a LIVE colony: the recompute publishes exactly
-        // one inspection event at `inspection_tick` and the firing
-        // consumes it, so `Some(t)` pairs with a pending event at
-        // `t` (a `t` at-or-behind the clock stands only mid-flush,
-        // where the pending at-clock event IS the legal deferred
-        // state). Dormant/abandoned colonies keep the serialized
-        // record — the terminal transitions never clear it — but
-        // hold no events at all.
-        let expected = colonies::colony_live(&c.state)
-            .then_some(c.inspection_tick)
-            .flatten();
-        match (expected, colony_inspections.get(id)) {
-            (Some(t), Some(&et)) if t == et => {}
-            (None, None) => {}
-            _ => {
-                return Err(SimError::Fatal(
-                    "snapshot: colony inspection / event mismatch",
-                ));
-            }
-        }
+    }
+    // The `inspection_tick`↔`ColonyInspection` pairing — the
+    // sibling pairings' rule, strict in both directions but
+    // scoped to a LIVE colony: the recompute publishes exactly
+    // one inspection event at `inspection_tick` and the firing
+    // consumes it, so `Some(t)` pairs with a pending event at
+    // `t` (a `t` at-or-behind the clock stands only mid-flush,
+    // where the pending at-clock event IS the legal deferred
+    // state). Dormant/abandoned colonies keep the serialized
+    // record — the terminal transitions never clear it — but
+    // hold no events at all. (The reverse arm is already covered
+    // upstream by "event names unknown colony".)
+    check_record_event_pair(
+        &snapshot.colonies,
+        colony_inspections,
+        |c| {
+            colonies::colony_live(&c.state)
+                .then_some(c.inspection_tick)
+                .flatten()
+        },
+        |_, claimed, event| claimed == event,
+        "snapshot: colony inspection / event mismatch",
+        "snapshot: inspection event names unknown colony",
+    )?;
+    for (id, c) in &snapshot.colonies {
         for crew in &c.crew {
             let m = snapshot.economy.crew.get(crew);
             if m.is_none_or(|m| m.location != CrewLocation::Colony(*id)) {
@@ -11209,13 +11287,12 @@ fn restore_reliability_state(
             if !instances.insert(rec.instance) {
                 return Err(SimError::Fatal("snapshot: duplicate part instance"));
             }
-            if let Some(t) = rec.pending_failure_tick
-                && pf_events.get(&(vessel.id, rec.instance)) != Some(&t)
-            {
-                return Err(SimError::Fatal(
-                    "snapshot: pending failure tick / event mismatch",
-                ));
-            }
+            check_claimed_event_tick(
+                rec.pending_failure_tick,
+                (vessel.id, rec.instance),
+                pf_events,
+                "snapshot: pending failure tick / event mismatch",
+            )?;
         }
     }
     // C10-F6: the dormant publish writes `PartFailure`s for every
@@ -11251,19 +11328,15 @@ fn restore_reliability_state(
         if !(b.units.is_finite() && b.units > 0.0) {
             return Err(SimError::Fatal("snapshot: non-positive bench units"));
         }
-        if bench_events.get(id) != Some(&b.complete_tick) {
-            return Err(SimError::Fatal(
-                "snapshot: bench run / completion event mismatch",
-            ));
-        }
     }
-    for id in bench_events.keys() {
-        if !snapshot.bench_runs.contains_key(id) {
-            return Err(SimError::Fatal(
-                "snapshot: bench completion names unknown run",
-            ));
-        }
-    }
+    check_record_event_pair(
+        &snapshot.bench_runs,
+        bench_events,
+        |b| Some(b.complete_tick),
+        |_, claimed, event| claimed == event,
+        "snapshot: bench run / completion event mismatch",
+        "snapshot: bench completion names unknown run",
+    )?;
     Ok(())
 }
 
@@ -11520,70 +11593,44 @@ pub(crate) fn hash_craft(h: &mut StateHasher, craft: &CraftDef) {
                 h.u64(p.0);
             });
             let t = &node.transform;
-            h.f64(t.offset.x);
-            h.f64(t.offset.y);
-            h.f64(t.offset.z);
-            h.f64(t.rotation.x);
-            h.f64(t.rotation.y);
-            h.f64(t.rotation.z);
-            h.f64(t.rotation.w);
+            h.dvec3(t.offset);
+            h.dquat(t.rotation);
             h.u32(node.effective_index);
             // C14-F4: the snapped joint point is weld input — the
             // §2.4 joint-load torque arm reads it, so it is craft
             // identity like the transform.
             h.opt(&node.joint, |h, j| {
-                h.f64(j.x);
-                h.f64(j.y);
-                h.f64(j.z);
+                h.dvec3(*j);
             });
         },
     );
     h.vec(&craft.parts, |h, p| {
         h.f64(p.mass_kg);
-        h.f64(p.com.x);
-        h.f64(p.com.y);
-        h.f64(p.com.z);
-        h.f64(p.inertia.xx);
-        h.f64(p.inertia.yy);
-        h.f64(p.inertia.zz);
-        h.f64(p.inertia.xy);
-        h.f64(p.inertia.xz);
-        h.f64(p.inertia.yz);
+        h.dvec3(p.com);
+        p.inertia.hash(h);
         match &p.collider {
             csp_phys::ColliderShape::Points(points) => {
                 h.u16(0);
                 h.vec(points, |h, v| {
-                    h.f64(v.x);
-                    h.f64(v.y);
-                    h.f64(v.z);
+                    h.dvec3(*v);
                 });
             }
             csp_phys::ColliderShape::Box { half_extents } => {
                 h.u16(1);
-                h.f64(half_extents.x);
-                h.f64(half_extents.y);
-                h.f64(half_extents.z);
+                h.dvec3(*half_extents);
             }
         }
         h.vec(&p.force_sites, |h, s| {
-            h.f64(s.local_pos.x);
-            h.f64(s.local_pos.y);
-            h.f64(s.local_pos.z);
-            h.f64(s.local_dir.x);
-            h.f64(s.local_dir.y);
-            h.f64(s.local_dir.z);
+            h.dvec3(s.local_pos);
+            h.dvec3(s.local_dir);
             h.stable_enum(&s.kind);
             h.f64(s.rated_n);
         });
         // M6-B: the resolved dock-port faces — the capture predicate
         // reads them, so they are state like the force sites.
         h.vec(&p.dock_ports, |h, d| {
-            h.f64(d.local_pos.x);
-            h.f64(d.local_pos.y);
-            h.f64(d.local_pos.z);
-            h.f64(d.local_dir.x);
-            h.f64(d.local_dir.y);
-            h.f64(d.local_dir.z);
+            h.dvec3(d.local_pos);
+            h.dvec3(d.local_dir);
             h.stable_enum(&d.size);
         });
         // M6-D: the resolved tank capacities + seat count — transfer
@@ -11687,20 +11734,13 @@ pub(crate) fn hash_craft_geometry(h: &mut StateHasher, craft: &CraftDef) {
                 h.u64(p.0);
             });
             let t = &node.transform;
-            h.f64(t.offset.x);
-            h.f64(t.offset.y);
-            h.f64(t.offset.z);
-            h.f64(t.rotation.x);
-            h.f64(t.rotation.y);
-            h.f64(t.rotation.z);
-            h.f64(t.rotation.w);
+            h.dvec3(t.offset);
+            h.dquat(t.rotation);
             h.u32(node.effective_index);
             // The snapped joint point is geometry — it sits in the
             // attach node's frame like the transform itself.
             h.opt(&node.joint, |h, j| {
-                h.f64(j.x);
-                h.f64(j.y);
-                h.f64(j.z);
+                h.dvec3(*j);
             });
         },
     );
@@ -11709,16 +11749,12 @@ pub(crate) fn hash_craft_geometry(h: &mut StateHasher, craft: &CraftDef) {
             csp_phys::ColliderShape::Points(points) => {
                 h.u16(0);
                 h.vec(points, |h, v| {
-                    h.f64(v.x);
-                    h.f64(v.y);
-                    h.f64(v.z);
+                    h.dvec3(*v);
                 });
             }
             csp_phys::ColliderShape::Box { half_extents } => {
                 h.u16(1);
-                h.f64(half_extents.x);
-                h.f64(half_extents.y);
-                h.f64(half_extents.z);
+                h.dvec3(*half_extents);
             }
         }
         h.vec(&p.aero.cd_curve, |h, k| {
@@ -12476,18 +12512,14 @@ fn apply_breakup(
             // The finalized project's pending pair is dead — scrub it
             // (the events name the project, not the vessel, so the
             // vessel scrub never saw them).
-            let kept: Vec<ScheduledEvent> = std::mem::take(event_heap)
-                .into_iter()
-                .filter(|e| {
-                    !matches!(
-                        &e.kind,
-                        EventKind::ResearchDataExhausted { project: p }
-                        | EventKind::ResearchProjectComplete { project: p }
-                            if *p == pid
-                    )
-                })
-                .collect();
-            *event_heap = kept.into_iter().collect();
+            scrub_event_heap_split(event_heap, next_event_seq, shadow, |e| {
+                !matches!(
+                    &e.kind,
+                    EventKind::ResearchDataExhausted { project: p }
+                    | EventKind::ResearchProjectComplete { project: p }
+                        if *p == pid
+                )
+            });
         }
     }
     Ok(())
@@ -12818,12 +12850,8 @@ fn hash_vessel(h: &mut StateHasher, vessel: &Vessel) {
         h.u64(s.port_a.0);
         h.u64(s.port_b.0);
         h.u64(s.seam_node.0);
-        h.f64(s.local_a.x);
-        h.f64(s.local_a.y);
-        h.f64(s.local_a.z);
-        h.f64(s.local_b.x);
-        h.f64(s.local_b.y);
-        h.f64(s.local_b.z);
+        h.dvec3(s.local_a);
+        h.dvec3(s.local_b);
         h.u64(s.latch_tick);
     });
     // M5: the scheduled-Δv intent — a node changes the future, so it is
@@ -12927,19 +12955,10 @@ fn hash_vessel(h: &mut StateHasher, vessel: &Vessel) {
             // The authoritative subset — §7.2's walk covers kinematic +
             // control + settle state; the weld's mass properties are
             // derived from the hashed craft, not themselves state.
-            h.f64(body.pos.x);
-            h.f64(body.pos.y);
-            h.f64(body.pos.z);
-            h.f64(body.rot.x);
-            h.f64(body.rot.y);
-            h.f64(body.rot.z);
-            h.f64(body.rot.w);
-            h.f64(body.vel.x);
-            h.f64(body.vel.y);
-            h.f64(body.vel.z);
-            h.f64(body.ang_vel.x);
-            h.f64(body.ang_vel.y);
-            h.f64(body.ang_vel.z);
+            h.dvec3(body.pos);
+            h.dquat(body.rot);
+            h.dvec3(body.vel);
+            h.dvec3(body.ang_vel);
             h.f64(body.throttle);
             h.u32(body.settle.settled_ticks);
             h.bool(body.settle.latched);
@@ -12949,10 +12968,7 @@ fn hash_vessel(h: &mut StateHasher, vessel: &Vessel) {
             h.f64(pose.latitude_rad);
             h.f64(pose.longitude_rad);
             h.f64(pose.altitude_m);
-            h.f64(pose.orientation.x);
-            h.f64(pose.orientation.y);
-            h.f64(pose.orientation.z);
-            h.f64(pose.orientation.w);
+            h.dquat(pose.orientation);
         }
     }
 }
@@ -23504,7 +23520,8 @@ mod tests {
         w.science.projects.insert(ResearchId(0), key(0));
         w.science.projects.insert(ResearchId(1), key(1));
         let nodes: BTreeSet<csp_phys::PartNodeId> = [csp_phys::PartNodeId(0)].into_iter().collect();
-        let (_, banked) = w.finalize_projects_on_nodes(VesselId(0), &nodes, 100);
+        let mut shadow = TickShadow::capture(&w);
+        let (_, banked) = w.finalize_projects_on_nodes(VesselId(0), &nodes, 100, &mut shadow);
         assert!(banked > 0.0);
         assert!(
             !w.science.projects.contains_key(&ResearchId(0)),
@@ -27589,12 +27606,7 @@ mod tests {
         // restores: the boundary comes back the same way.
         let mut shadow = TickShadow::capture(&w);
         w.schedule_event(ev(), 30, &mut shadow).unwrap();
-        w.shadow_events_whole(&mut shadow);
-        let heap = std::mem::take(&mut w.event_heap);
-        w.event_heap = heap
-            .into_iter()
-            .filter(|e| e.tick != 10)
-            .collect::<BinaryHeap<_>>();
+        w.scrub_event_heap(&mut shadow, |e| e.tick != 10);
         shadow.restore(&mut w);
         assert_eq!(
             sorted(&w),

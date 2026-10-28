@@ -585,18 +585,14 @@ pub(crate) fn drop_vessel_projects(
     shadow_science(science, &mut shadow.science);
     crate::shadow_events_whole_split(heap, next_event_seq, shadow);
     science.projects.retain(|_, p| p.vessel != vessel);
-    let kept: Vec<_> = std::mem::take(heap)
-        .into_iter()
-        .filter(|e| {
-            !matches!(
-                &e.kind,
-                crate::EventKind::ResearchDataExhausted { project }
-                | crate::EventKind::ResearchProjectComplete { project }
-                    if !science.projects.contains_key(project)
-            )
-        })
-        .collect();
-    *heap = kept.into_iter().collect();
+    crate::scrub_event_heap_split(heap, next_event_seq, shadow, |e| {
+        !matches!(
+            &e.kind,
+            crate::EventKind::ResearchDataExhausted { project }
+            | crate::EventKind::ResearchProjectComplete { project }
+                if !science.projects.contains_key(project)
+        )
+    });
 }
 
 /// Lazy-shadow capture for the science book.
@@ -1136,18 +1132,14 @@ impl World {
         // `science_funds_per_point` — the milestone edge.
         self.credit_science_payout(banked, shadow);
         // Scrub the pending pair — the project is gone by intent.
-        let kept: Vec<_> = std::mem::take(&mut self.event_heap)
-            .into_iter()
-            .filter(|e| {
-                !matches!(
-                    &e.kind,
-                    crate::EventKind::ResearchDataExhausted { project: p }
-                    | crate::EventKind::ResearchProjectComplete { project: p }
-                        if *p == project
-                )
-            })
-            .collect();
-        self.event_heap = kept.into_iter().collect();
+        self.scrub_event_heap(shadow, |e| {
+            !matches!(
+                &e.kind,
+                crate::EventKind::ResearchDataExhausted { project: p }
+                | crate::EventKind::ResearchProjectComplete { project: p }
+                    if *p == project
+            )
+        });
         // C08-F4: stopping banks the accrued conversion AND releases
         // the live escrow — the survey predicate's outstanding-units
         // subtraction drops to the full `collected` here, the same
@@ -1228,12 +1220,15 @@ impl World {
     /// scope matters: `PartNodeId`s are only unique within one craft,
     /// so node `N` leaving vessel A must not touch another vessel's
     /// project that happens to share the id (the
-    /// [`split_vessel_science`] `p.vessel == vessel` rule).
+    /// [`split_vessel_science`] `p.vessel == vessel` rule). `shadow` is
+    /// taken for the heap scrub inside — the capture is lazy, so a
+    /// caller that already shadowed the heap pays nothing.
     pub(crate) fn finalize_projects_on_nodes(
         &mut self,
         vessel: VesselId,
         nodes: &BTreeSet<PartNodeId>,
         tick: u64,
+        shadow: &mut TickShadow,
     ) -> (Vec<(PartNodeId, DataKey, f64)>, f64) {
         let done: Vec<ResearchId> = self
             .science
@@ -1253,18 +1248,14 @@ impl World {
             if let Some(remnant) = remnant {
                 out.push(remnant);
             }
-            let kept: Vec<_> = std::mem::take(&mut self.event_heap)
-                .into_iter()
-                .filter(|e| {
-                    !matches!(
-                        &e.kind,
-                        crate::EventKind::ResearchDataExhausted { project: p }
-                        | crate::EventKind::ResearchProjectComplete { project: p }
-                            if *p == pid
-                    )
-                })
-                .collect();
-            self.event_heap = kept.into_iter().collect();
+            self.scrub_event_heap(shadow, |e| {
+                !matches!(
+                    &e.kind,
+                    crate::EventKind::ResearchDataExhausted { project: p }
+                    | crate::EventKind::ResearchProjectComplete { project: p }
+                        if *p == pid
+                )
+            });
         }
         (out, banked_total)
     }

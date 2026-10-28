@@ -146,6 +146,20 @@ impl SymMat3 {
         ))
     }
 
+    /// The §7.1 hash walk for the tensor — the six unique components in
+    /// declaration order (`xx yy zz xy xz yz`). The tensor keeps its own
+    /// writer for the reason `StateHasher::dvec3`/`dquat` exist (C01-F1):
+    /// a component count/order error at a walk site compiles fine and
+    /// silently narrows the determinism gate.
+    pub fn hash<'a>(&self, h: &'a mut csp_core::StateHasher) -> &'a mut csp_core::StateHasher {
+        h.f64(self.xx)
+            .f64(self.yy)
+            .f64(self.zz)
+            .f64(self.xy)
+            .f64(self.xz)
+            .f64(self.yz)
+    }
+
     /// All six components finite — the weld's input gate (§2.13).
     pub fn is_finite(self) -> bool {
         self.xx.is_finite()

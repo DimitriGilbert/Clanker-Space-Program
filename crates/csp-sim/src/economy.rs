@@ -1130,7 +1130,7 @@ impl World {
             .collect();
         if !lab_nodes.is_empty() {
             let (remnants, lab_banked) =
-                self.finalize_projects_on_nodes(vessel, &lab_nodes, self.clock.ticks());
+                self.finalize_projects_on_nodes(vessel, &lab_nodes, self.clock.ticks(), shadow);
             if let Some(v) = self.vessels.get_mut(&vessel) {
                 for (node, key, units) in remnants {
                     *v.science

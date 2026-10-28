@@ -1270,12 +1270,10 @@ impl World {
         // A pending deadline is dead with the contract — drop it so
         // the restore pairing holds in both directions.
         if c.deadline_tick.is_some() {
-            self.shadow_events_whole(shadow);
-            let heap = std::mem::take(&mut self.event_heap);
-            self.event_heap = heap
-                .into_iter()
-                .filter(|e| !matches!(&e.kind, EventKind::ContractDeadline { contract } if *contract == id))
-                .collect();
+            self.scrub_event_heap(
+                shadow,
+                |e| !matches!(&e.kind, EventKind::ContractDeadline { contract } if *contract == id),
+            );
         }
         self.credit_funds(to_micros(reward), FundsReason::ContractCompletion, shadow);
         self.notify(

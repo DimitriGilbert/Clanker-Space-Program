@@ -373,17 +373,12 @@ impl crate::World {
         );
         self.shadow_builds(shadow);
         self.builds.remove(&build);
-        self.shadow_events_whole(shadow);
-        let kept: Vec<crate::ScheduledEvent> = std::mem::take(&mut self.event_heap)
-            .into_iter()
-            .filter(|e| {
-                !matches!(&e.kind,
-                    EventKind::ConstructionComplete { build: b }
-                    | EventKind::ConstructionRetry { build: b }
-                        if *b == build)
-            })
-            .collect();
-        self.event_heap = kept.into_iter().collect();
+        self.scrub_event_heap(shadow, |e| {
+            !matches!(&e.kind,
+                EventKind::ConstructionComplete { build: b }
+                | EventKind::ConstructionRetry { build: b }
+                    if *b == build)
+        });
         Ok(())
     }
 

@@ -668,12 +668,8 @@ pub fn hash_joints(
         h.u64(j.vessel_b.0);
         h.u64(j.node_a.0);
         h.u64(j.node_b.0);
-        h.f64(j.local_a.x);
-        h.f64(j.local_a.y);
-        h.f64(j.local_a.z);
-        h.f64(j.local_b.x);
-        h.f64(j.local_b.y);
-        h.f64(j.local_b.z);
+        h.dvec3(j.local_a);
+        h.dvec3(j.local_b);
         h.stable_enum(&j.size);
         h.stable_enum(&j.kind);
         match j.kind {

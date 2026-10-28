@@ -303,9 +303,10 @@ impl TerrainCache {
         }
     }
 
-    /// The zero-height stand-in — same dims, a content key that can
-    /// never collide with a real bake (`mix64` is bijective and
-    /// `!seed != seed`), so the renderer re-uploads on the swap.
+    /// The zero-height stand-in — same dims, a content key from the
+    /// tagged stand-in namespace ([`rt::HeightField::flat_key`] sets
+    /// bit 0; real bakes keep it clear), so it provably cannot collide
+    /// with a real bake and the renderer re-uploads on the swap.
     /// Built once per key miss. wasm compiles it too (the `pending`
     /// machinery is cfg'd out there; the call stays reachable in the
     /// match arm either way).
@@ -317,7 +318,7 @@ impl TerrainCache {
                 width: w,
                 height: h,
                 data: vec![0.0; w as usize * h as usize],
-                key: csp_core::terrain::mix64(!seed) ^ (u64::from(w) << 32 | u64::from(h)),
+                key: rt::HeightField::flat_key(seed, w, h),
             }));
         }
         // `flat` is Some by construction.

@@ -162,8 +162,30 @@ impl HeightField {
             width,
             height,
             data,
-            key: mix64(seed) ^ (u64::from(width) << 32 | u64::from(height)),
+            key: Self::bake_key(seed, width, height),
         }
+    }
+
+    /// The renderer's height-texture change key for a real bake at
+    /// `(seed, w, h)` — `mix64(seed) ^ dims` shifted left one bit so bit
+    /// 0 carries the stand-in tag: `0` here (a real bake), `1` for the
+    /// view's flat stand-in ([`Self::flat_key`]). The tag bit makes the
+    /// two namespaces *provably* disjoint (C01-F3): `mix64` is
+    /// bijective, so ANY same-space derivation collides with exactly
+    /// one real seed — the earlier `mix64(!seed)` stand-in did so at
+    /// `!seed` itself, i.e. two bodies with complementary seeds, and
+    /// the renderer's `uploaded_height_key` skip then bound one body's
+    /// real field to the other's stand-in.
+    pub fn bake_key(seed: u64, width: u32, height: u32) -> u64 {
+        (mix64(seed) ^ (u64::from(width) << 32 | u64::from(height))) << 1
+    }
+
+    /// [`Self::bake_key`]'s tagged twin — the flat stand-in's key with
+    /// bit 0 set, so it can never equal any real bake's key regardless
+    /// of seed. The seed still mixes in, keeping stand-ins for
+    /// different bodies distinct from each other.
+    pub fn flat_key(seed: u64, width: u32, height: u32) -> u64 {
+        Self::bake_key(seed, width, height) | 1
     }
 
     /// Texel value (longitude wraps, latitude clamps — the equirect

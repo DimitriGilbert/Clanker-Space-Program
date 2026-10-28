@@ -1977,15 +1977,9 @@ impl World {
         boundary_only: bool,
         shadow: &mut TickShadow,
     ) {
-        self.shadow_events_whole(shadow);
-        let heap = std::mem::take(&mut self.event_heap);
-        self.event_heap = heap
-            .into_iter()
-            .filter(|e| {
-                event_colony(&e.kind) != Some(colony)
-                    || (boundary_only && !is_colony_boundary(&e.kind))
-            })
-            .collect();
+        self.scrub_event_heap(shadow, |e| {
+            event_colony(&e.kind) != Some(colony) || (boundary_only && !is_colony_boundary(&e.kind))
+        });
     }
 
     /// `FoundColony` — the command path: the authored founding cost

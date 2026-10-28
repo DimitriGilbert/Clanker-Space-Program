@@ -385,6 +385,28 @@ impl StateHasher {
         Ok(())
     }
 
+    // -- rule 3 applied to the math primitives --------------------------------
+    //
+    // The canonical writers the header's "one canonical writer per logical
+    // field" discipline promised (C01-F1): every hand-rolled
+    // `f64(x); f64(y); f64(z)` run in the walk compiled just as cleanly with a
+    // dropped or duplicated line, silently excluding a component from the
+    // determinism gate. The typed writers make the component count and order
+    // a property of the type, not of the call site.
+
+    /// `DVec3` as `x || y || z` (each an `f64` rule-3 write). Component order
+    /// is the struct's declaration order — identical to the hand-rolled runs
+    /// this replaces.
+    pub fn dvec3(&mut self, v: crate::DVec3) -> &mut Self {
+        self.f64(v.x).f64(v.y).f64(v.z)
+    }
+
+    /// `DQuat` as `x || y || z || w` — declaration order, `w` the scalar
+    /// part, identical to the hand-rolled runs this replaces.
+    pub fn dquat(&mut self, q: crate::DQuat) -> &mut Self {
+        self.f64(q.x).f64(q.y).f64(q.z).f64(q.w)
+    }
+
     // -- rule 7: option / enums ---------------------------------------------
 
     /// `Option`: `0u8` for `None`, `1u8 || payload` for `Some` (rule 7).
@@ -753,6 +775,23 @@ mod tests {
             expected.extend((v.len() as u32).to_le_bytes());
             expected.extend(v.as_bytes());
         }
+        assert_eq!(h.finish().unwrap(), digest(&expected));
+    }
+
+    /// The math-primitive writers expand in the struct's declaration order —
+    /// the exact `f64` component runs they replaced at the walk sites.
+    #[test]
+    fn math_primitives_expand_in_declaration_order() {
+        let v = crate::DVec3::new(1.5, -2.0, 3.25);
+        let q = crate::DQuat::new(0.0, 0.5, -0.5, 1.0);
+
+        let mut expected = canonical_prefix();
+        for c in [v.x, v.y, v.z, q.x, q.y, q.z, q.w] {
+            expected.extend(c.to_bits().to_le_bytes());
+        }
+
+        let mut h = StateHasher::new();
+        h.dvec3(v).dquat(q);
         assert_eq!(h.finish().unwrap(), digest(&expected));
     }
 

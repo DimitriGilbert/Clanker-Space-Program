@@ -353,9 +353,7 @@ pub fn hash_maneuver(h: &mut StateHasher, node: &ManeuverNode) {
     h.f64(node.dv_radial_mps);
     h.stable_enum(&node.status);
     if let ManeuverStatus::Burning(burn) = &node.status {
-        h.f64(burn.burn_dir.x);
-        h.f64(burn.burn_dir.y);
-        h.f64(burn.burn_dir.z);
+        h.dvec3(burn.burn_dir);
         h.f64(burn.dv_total_mps);
         h.f64(burn.dv_remaining_mps);
     }

@@ -9,6 +9,14 @@ disallowed-methods = [
     { path = "f64::log10", reason = "PLAN §8.2: libm only" },
     { path = "f64::powf" }, { path = "f64::powi" }, { path = "f64::sqrt" },
     { path = "f64::cbrt" }, { path = "f64::hypot" },
+    # The platform-libm-backed remainder of the f64 surface (C01-F2) — the
+    # §8.2 policy is libm-EXCLUSIVE, so every std delegate is banned, not
+    # just the trigonometric/core set above. `f64::mul_add` stays legal:
+    # IEEE `fma` is correctly rounded, and csp-sim/orbit.rs leans on it.
+    { path = "f64::exp2" }, { path = "f64::exp_m1" }, { path = "f64::ln_1p" },
+    { path = "f64::sinh" }, { path = "f64::cosh" }, { path = "f64::tanh" },
+    { path = "f64::asinh" }, { path = "f64::acosh" }, { path = "f64::atanh" },
+    { path = "f64::sin_cos" },
     { path = "rand_core::SeedableRng::seed_from_u64", reason = "PLAN §2.7/§8.2: rand_core implementation detail; use csp_core::rng::derive_key" },
 ]
 disallowed-types = [

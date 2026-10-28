@@ -239,19 +239,14 @@ impl World {
         // depletion is a committed transition only while the
         // subsystem that scheduled it lives; a colony-side straggler
         // would fire one tick out and kill while disabled).
-        self.shadow_events_whole(shadow);
-        let heap = std::mem::take(&mut self.event_heap);
-        self.event_heap = heap
-            .into_iter()
-            .filter(|e| {
-                !matches!(
-                    e.kind,
-                    EventKind::LifeSupportCheck
-                        | EventKind::LifeSupportDepleted { .. }
-                        | EventKind::VesselLifeSupportDepleted { .. }
-                )
-            })
-            .collect();
+        self.scrub_event_heap(shadow, |e| {
+            !matches!(
+                e.kind,
+                EventKind::LifeSupportCheck
+                    | EventKind::LifeSupportDepleted { .. }
+                    | EventKind::VesselLifeSupportDepleted { .. }
+            )
+        });
         // Re-solve every live colony — the flag gates the
         // `LifeSupport` module's demand inside the solve.
         let now = self.clock.ticks();
