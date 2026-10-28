@@ -2900,12 +2900,15 @@ fn flow_state(
 ) -> Option<FlowState> {
     let alt_m = rel.norm() - env.radius_m;
     let rho = atmosphere_density_kg_m3(atm, alt_m);
-    if rho <= 0.0 {
+    // NaN-rejecting gate: `is_nan() || <= 0.0` is the lint-clean spelling
+    // of "not `> 0.0`" — matches the `x > 0.0` polarity the two call sites
+    // carried pre-dedup (clippy::neg_cmp_op_on_partial_ord denies `!(x > y)`).
+    if rho.is_nan() || rho <= 0.0 {
         return None;
     }
     let v_rel = b.vel - env.body_spin.cross(rel);
     let speed = v_rel.norm();
-    if speed <= 0.0 {
+    if speed.is_nan() || speed <= 0.0 {
         return None;
     }
     Some(FlowState {
