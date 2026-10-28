@@ -115,6 +115,29 @@ pub(crate) struct SiteFrame {
     pub origin: DVec3,
 }
 
+/// The body's fixed→inertial spin at the flight frame's phase —
+/// `env.spin_phase` IS `ω·t`, identity at rest (C20-F4 — the
+/// lat/lon→direction + spin-phase math was hand-kept in four places;
+/// the heightfield's inverse lookup uses [`DQuat::conjugate`]).
+pub(crate) fn spin_rotation(env: &FlightEnv) -> DQuat {
+    let phase = env.spin_phase.rem_euclid(2.0 * core::f64::consts::PI);
+    if phase != 0.0 {
+        DQuat::from_axis_angle(env.spin_axis, phase)
+    } else {
+        DQuat::IDENTITY
+    }
+}
+
+/// The site's radial direction in inertial frame — its
+/// latitude/longitude direction spun by [`spin_rotation`]. This IS
+/// [`site_frame`]'s `up`: rotation is linear, so callers needing the
+/// inertial radial for a ground sample share the one computation.
+pub(crate) fn site_dir(env: &FlightEnv, site: &SiteEntry) -> DVec3 {
+    let (sl, cl) = site.latitude_rad.sin_cos();
+    let (so, co) = site.longitude_rad.sin_cos();
+    spin_rotation(env).rotate(DVec3::new(cl * co, cl * so, sl))
+}
+
 /// Resolve the site's inertial ENU frame at the staged spin phase —
 /// the same `R(axis, ω·t)` convention `csp_sim::bubble`'s surface-latch
 /// record restores poses with (`env.spin_phase` IS `ω·t`), over the
@@ -122,18 +145,10 @@ pub(crate) struct SiteFrame {
 /// datum altitude + the sampled terrain height, i.e. ON the rendered
 /// ground.
 pub(crate) fn site_frame(env: &FlightEnv, site: &SiteEntry, ground_r: f64) -> SiteFrame {
-    let (sl, cl) = site.latitude_rad.sin_cos();
-    let (so, co) = site.longitude_rad.sin_cos();
-    let dir_fixed = DVec3::new(cl * co, cl * so, sl);
-    let phase = env.spin_phase.rem_euclid(2.0 * core::f64::consts::PI);
-    let spin = if phase != 0.0 {
-        DQuat::from_axis_angle(env.spin_axis, phase)
-    } else {
-        DQuat::IDENTITY
-    };
+    let spin = spin_rotation(env);
     let upright = csp_sim::bubble::surface_upright(site.latitude_rad, site.longitude_rad);
     let q = (spin * upright).normalize();
-    let up = spin.rotate(dir_fixed);
+    let up = site_dir(env, site);
     SiteFrame {
         east: q.rotate(DVec3::X),
         north: q.rotate(DVec3::Y),
@@ -888,15 +903,7 @@ pub(crate) fn emit_launch_complex(
             footprint_m / env.radius_m.max(1.0),
         )
     };
-    let (sl, cl) = site.latitude_rad.sin_cos();
-    let (so, co) = site.longitude_rad.sin_cos();
-    let dir_fixed = DVec3::new(cl * co, cl * so, sl);
-    let phase = env.spin_phase.rem_euclid(2.0 * core::f64::consts::PI);
-    let dir_i = if phase != 0.0 {
-        DQuat::from_axis_angle(env.spin_axis, phase).rotate(dir_fixed)
-    } else {
-        dir_fixed
-    };
+    let dir_i = site_dir(env, site);
     let site_ground = ground(dir_i, 30.0);
     let frame = site_frame(env, site, site_ground);
 
@@ -943,16 +950,9 @@ pub(crate) fn emit_launch_complex(
 /// only solved for sites on the dominant body, the only body whose
 /// rotation `FlightEnv` carries.
 pub(crate) fn site_world_pos(env: &FlightEnv, site: &SiteEntry, body_pos: DVec3) -> DVec3 {
-    let (sl, cl) = site.latitude_rad.sin_cos();
-    let (so, co) = site.longitude_rad.sin_cos();
-    let dir_fixed = DVec3::new(cl * co, cl * so, sl) * (env.radius_m + site.altitude_m);
-    let phase = env.spin_phase.rem_euclid(2.0 * core::f64::consts::PI);
-    let rel = if phase != 0.0 {
-        DQuat::from_axis_angle(env.spin_axis, phase).rotate(dir_fixed)
-    } else {
-        dir_fixed
-    };
-    body_pos + rel
+    // `spin.rotate(d·s) ≡ spin.rotate(d)·s` — the radial scaled to the
+    // site's altitude.
+    body_pos + site_dir(env, site) * (env.radius_m + site.altitude_m)
 }
 
 #[cfg(test)]

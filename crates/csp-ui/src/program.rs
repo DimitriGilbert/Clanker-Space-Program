@@ -1944,18 +1944,7 @@ fn chute_deploy_button(
     node: u64,
     out: &mut Vec<ProgramCommand>,
 ) {
-    let ok = residence == "bubble";
-    if ui
-        .add_enabled(ok, egui::Button::new("deploy").small())
-        .on_hover_text(if ok {
-            "deploy the decelerator (armed → deployed)".to_string()
-        } else {
-            "deployable only while flying — not on the surface".to_string()
-        })
-        .clicked()
-    {
-        out.push(ProgramCommand::DeployPart { node });
-    }
+    chute_verb(ui, residence, "deploy", node, out);
 }
 
 /// The Program window — overview, contracts, research, vessel science,
@@ -2178,28 +2167,22 @@ pub fn program_panel(
                             Some(site) => format!("recover vessel → {site}"),
                             None => "recover vessel (remote salvage)".to_string(),
                         };
-                        if ui
-                            .add_enabled(input.latched, egui::Button::new(recover_label).small())
-                            .on_hover_text(if input.latched {
+                        vessel_recovery_verbs(
+                            ui,
+                            input.latched,
+                            recover_label,
+                            if input.latched {
                                 "recover the vessel: funds, science, crew home".to_string()
                             } else {
                                 "vessel must be on the surface".to_string()
-                            })
-                            .clicked()
-                        {
-                            out.push(ProgramCommand::RecoverVessel);
-                        }
-                        if ui
-                            .add_enabled(input.latched, egui::Button::new("terminate").small())
-                            .on_hover_text(if input.latched {
+                            },
+                            if input.latched {
                                 "delete the vessel — no payout, frees its berth".to_string()
                             } else {
                                 "vessel must be on the surface".to_string()
-                            })
-                            .clicked()
-                        {
-                            out.push(ProgramCommand::TerminateVessel);
-                        }
+                            },
+                            out,
+                        );
                     });
                 }
                 for d in &input.pooled {
@@ -2214,39 +2197,24 @@ pub fn program_panel(
                         // of a silent drain-time refusal.
                         let have_ec = input.vessel_ec.unwrap_or(0.0);
                         let ec_ok = have_ec >= d.transmit_ec_cost;
-                        if ui
-                            .add_enabled(
-                                ec_ok,
-                                egui::Button::new(format!("transmit +{:.1}⚛", d.transmit_yield))
-                                    .small(),
-                            )
-                            .on_hover_text(if ec_ok {
+                        pooled_data_verbs(
+                            ui,
+                            d,
+                            have_ec,
+                            input.latched,
+                            if ec_ok {
                                 format!("drains {:.0} EC (have {:.0})", d.transmit_ec_cost, have_ec)
                             } else {
                                 format!("needs {:.0} EC (have {:.0})", d.transmit_ec_cost, have_ec)
-                            })
-                            .clicked()
-                        {
-                            out.push(ProgramCommand::Transmit { row: d.index });
-                        }
-                        if ui
-                            .add_enabled(
-                                input.latched,
-                                egui::Button::new(format!("recover +{:.1}⚛", d.recover_yield))
-                                    .small(),
-                            )
-                            .on_hover_text(if input.latched {
+                            },
+                            if input.latched {
                                 "bank and close this record".to_string()
                             } else {
                                 "vessel must be on the surface".to_string()
-                            })
-                            .clicked()
-                        {
-                            out.push(ProgramCommand::Recover { row: d.index });
-                        }
-                        if d.transmitted {
-                            ui.label(egui::RichText::new("tx'd").color(dim).small());
-                        }
+                            },
+                            dim,
+                            out,
+                        );
                     });
                 }
                 // W2.0: decelerator deploy — `DeployPart` had no
@@ -2494,6 +2462,125 @@ impl Default for PartMenuState {
     }
 }
 
+/// The `ProgramCommand` sink the verb rows emit into — the Program
+/// window's `Vec` and the flight surfaces' [`FlightActionOutput`]
+/// were the two emit channels the science/recovery rows were
+/// hand-copied across (C22-F4 — the channel split is why the copies
+/// drifted). The row bodies below are generic over it.
+trait CommandSink {
+    fn emit(&mut self, cmd: ProgramCommand);
+}
+
+impl CommandSink for Vec<ProgramCommand> {
+    fn emit(&mut self, cmd: ProgramCommand) {
+        self.push(cmd);
+    }
+}
+
+impl CommandSink for FlightActionOutput {
+    fn emit(&mut self, cmd: ProgramCommand) {
+        self.commands.push(cmd);
+    }
+}
+
+/// The pooled-data verb pair (C22-F4 — the window, part menu, and
+/// action strip each hand-kept it): transmit for the fraction now
+/// (the sim's EC gate disclosed on hover), recover for the yield on
+/// the surface (the `SurfaceLatched` gate). `tx_hover`/`rc_hover`
+/// carry the per-surface copy — the window phrases the gates bare,
+/// the menus name the record.
+#[allow(clippy::too_many_arguments)] // the two hovers are the row's copy; a struct would obscure them
+fn pooled_data_verbs(
+    ui: &mut egui::Ui,
+    d: &DataRow,
+    have_ec: f64,
+    latched: bool,
+    tx_hover: String,
+    rc_hover: String,
+    dim: egui::Color32,
+    out: &mut impl CommandSink,
+) {
+    let ec_ok = have_ec >= d.transmit_ec_cost;
+    if ui
+        .add_enabled(
+            ec_ok,
+            egui::Button::new(format!("transmit +{:.1}⚛", d.transmit_yield)).small(),
+        )
+        .on_hover_text(tx_hover)
+        .clicked()
+    {
+        out.emit(ProgramCommand::Transmit { row: d.index });
+    }
+    if ui
+        .add_enabled(
+            latched,
+            egui::Button::new(format!("recover +{:.1}⚛", d.recover_yield)).small(),
+        )
+        .on_hover_text(rc_hover)
+        .clicked()
+    {
+        out.emit(ProgramCommand::Recover { row: d.index });
+    }
+    if d.transmitted {
+        ui.label(egui::RichText::new("tx'd").color(dim).small());
+    }
+}
+
+/// The vessel-level recovery verb pair (C22-F4): `RecoverVessel`
+/// cashes the latched hull out, `TerminateVessel` frees the berth
+/// with no payout — both gated on `latched` (the sim's
+/// `SurfaceLatched` requirement). `rc_hover`/`term_hover` carry the
+/// per-surface copy.
+fn vessel_recovery_verbs(
+    ui: &mut egui::Ui,
+    latched: bool,
+    recover_label: String,
+    rc_hover: String,
+    term_hover: String,
+    out: &mut impl CommandSink,
+) {
+    if ui
+        .add_enabled(latched, egui::Button::new(recover_label).small())
+        .on_hover_text(rc_hover)
+        .clicked()
+    {
+        out.emit(ProgramCommand::RecoverVessel);
+    }
+    if ui
+        .add_enabled(latched, egui::Button::new("terminate").small())
+        .on_hover_text(term_hover)
+        .clicked()
+    {
+        out.emit(ProgramCommand::TerminateVessel);
+    }
+}
+
+/// The armed-chute deploy verb (C22-F4 — three surfaces): gated on
+/// `residence == "bubble"`, the sim's own refusal — a latched/rails
+/// vessel dead-clicks onto the generic refusal otherwise (C22-F2).
+/// `label` is the surface's button copy ("deploy" in the window's
+/// dense row, "deploy parachute" in the menus).
+fn chute_verb(
+    ui: &mut egui::Ui,
+    residence: &str,
+    label: &str,
+    node: u64,
+    out: &mut impl CommandSink,
+) {
+    let ok = residence == "bubble";
+    if ui
+        .add_enabled(ok, egui::Button::new(label).small())
+        .on_hover_text(if ok {
+            "deploy the decelerator (armed → deployed)".to_string()
+        } else {
+            "deployable only while flying — not on the surface".to_string()
+        })
+        .clicked()
+    {
+        out.emit(ProgramCommand::DeployPart { node });
+    }
+}
+
 /// One part-action row set — the experiments and decelerators on
 /// node `n`, shared by the single-part and whole-vessel menus.
 fn part_node_actions(
@@ -2536,19 +2623,7 @@ fn part_node_actions(
                         .color(dim),
                 );
             } else {
-                let ok = input.residence == "bubble";
-                if ui
-                    .add_enabled(ok, egui::Button::new("deploy parachute").small())
-                    .on_hover_text(if ok {
-                        "deploy the decelerator (armed → deployed)".to_string()
-                    } else {
-                        "deployable only while flying — not on the surface".to_string()
-                    })
-                    .clicked()
-                {
-                    out.commands
-                        .push(ProgramCommand::DeployPart { node: ch.node });
-                }
+                chute_verb(ui, &input.residence, "deploy parachute", ch.node, out);
             }
         });
     }
@@ -2585,12 +2660,12 @@ fn pooled_rows(
             }
             let have_ec = input.vessel_ec.unwrap_or(0.0);
             let ec_ok = have_ec >= d.transmit_ec_cost;
-            if ui
-                .add_enabled(
-                    ec_ok,
-                    egui::Button::new(format!("transmit +{:.1}⚛", d.transmit_yield)).small(),
-                )
-                .on_hover_text(if ec_ok {
+            pooled_data_verbs(
+                ui,
+                d,
+                have_ec,
+                input.latched,
+                if ec_ok {
                     format!(
                         "{} — banks now, drains {:.0} EC (have {:.0})",
                         d.label, d.transmit_ec_cost, have_ec
@@ -2600,28 +2675,15 @@ fn pooled_rows(
                         "{} — needs {:.0} EC (have {:.0})",
                         d.label, d.transmit_ec_cost, have_ec
                     )
-                })
-                .clicked()
-            {
-                out.commands.push(ProgramCommand::Transmit { row: d.index });
-            }
-            if ui
-                .add_enabled(
-                    input.latched,
-                    egui::Button::new(format!("recover +{:.1}⚛", d.recover_yield)).small(),
-                )
-                .on_hover_text(if input.latched {
+                },
+                if input.latched {
                     format!("{} — bank and close on the surface", d.label)
                 } else {
                     format!("{} — land and settle first to recover", d.label)
-                })
-                .clicked()
-            {
-                out.commands.push(ProgramCommand::Recover { row: d.index });
-            }
-            if d.transmitted {
-                ui.label(egui::RichText::new("tx'd").color(dim).small());
-            }
+                },
+                dim,
+                out,
+            );
         });
     }
 }
@@ -2635,34 +2697,28 @@ fn vessel_recovery_row(
     out: &mut FlightActionOutput,
     dim: egui::Color32,
 ) {
+    let _ = dim;
     ui.horizontal(|ui| {
         let recover_label = match &input.recover_site {
             Some(site) => format!("recover vessel → {site}"),
             None => "recover vessel (remote salvage)".to_string(),
         };
-        if ui
-            .add_enabled(input.latched, egui::Button::new(recover_label).small())
-            .on_hover_text(if input.latched {
+        vessel_recovery_verbs(
+            ui,
+            input.latched,
+            recover_label,
+            if input.latched {
                 "recover the vessel: funds, pooled science, and crew come home".to_string()
             } else {
                 "land and settle first — the vessel must be on the surface".to_string()
-            })
-            .clicked()
-        {
-            out.commands.push(ProgramCommand::RecoverVessel);
-        }
-        if ui
-            .add_enabled(input.latched, egui::Button::new("terminate").small())
-            .on_hover_text(if input.latched {
+            },
+            if input.latched {
                 "delete the vessel — no payout, frees its berth".to_string()
             } else {
                 "vessel must be on the surface".to_string()
-            })
-            .clicked()
-        {
-            out.commands.push(ProgramCommand::TerminateVessel);
-        }
-        let _ = dim;
+            },
+            out,
+        );
     });
 }
 

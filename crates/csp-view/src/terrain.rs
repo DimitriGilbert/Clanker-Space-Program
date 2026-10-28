@@ -416,12 +416,11 @@ pub(crate) fn ground_radius(
         .cloned()
         .unwrap_or_else(|| TerrainBody::synthesized(body_id, env.radius_m));
     let field = cache.field(body_id, body.seed);
-    let phase = env.spin_phase.rem_euclid(2.0 * core::f64::consts::PI);
-    let fixed = if phase != 0.0 {
-        DQuat::from_axis_angle(env.spin_axis, -phase).rotate(dir)
-    } else {
-        dir
-    };
+    // The inertial→fixed half of `crate::structures::spin_rotation` —
+    // the same `R(axis, −phase)` conjugate the shader applies.
+    let fixed = crate::structures::spin_rotation(env)
+        .conjugate()
+        .rotate(dir);
     let (t1, t2) = {
         let a = if fixed.z.abs() < 0.9 {
             DVec3::Z

@@ -2424,6 +2424,16 @@ struct BurnStep {
 /// normalizes per tick, evaluated on the staged walk table at throttle
 /// `θ`. Unmetered nodes (`EngineSpec: None`) deliver `base·factor·θ`
 /// and claim nothing — the sim's free-thrust convention.
+///
+/// C13-F3: this is a *display mirror*, not a third authority — the
+/// sim's `propellant_plans` stays the consumption walk of record
+/// (it sees reliability `thrust_factor`s and debits per `PHYSICS_DT`;
+/// `csp-phys::readout` deliberately walks per-stage ignition, and this
+/// HUD copy evaluates the same coverage rule per second over a staged
+/// `WalkNode` table). Sharing the walk body would couple the HUD to
+/// sim-internal types (`CraftDef`/`WeldedBody`/reliability records)
+/// for no behavioral gain; the coverage rule the three agree on is
+/// documented on each side.
 fn burn_step(
     attached: &BTreeMap<csp_phys::PartNodeId, WalkNode>,
     mpu: &BTreeMap<csp_data::ResourceId, f64>,

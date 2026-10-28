@@ -626,7 +626,10 @@ fn shipping_world() -> Result<World, ReplayError> {
             .map_err(ReplayError::Load)?
             .colonies,
     )
-    .map_err(|_| ReplayError::MalformedGolden("perf: aero-table build failed"))?;
+    // C29: propagate the sim's own error — the previous blanket
+    // `|_|` blamed every failure on an aero-table build that runs
+    // nowhere near this call.
+    .map_err(ReplayError::Sim)?;
     Ok(w)
 }
 

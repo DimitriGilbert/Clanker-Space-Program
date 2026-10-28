@@ -1699,6 +1699,35 @@ impl VabSession {
         plan
     }
 
+    /// A node's rotation into body frame, folded down its ancestor
+    /// chain (C17-F9 — `plan_axial` and `attach_auto` each hand-folded
+    /// it). The staged `body_transforms` map is consulted first, the
+    /// fold is the fallback: local −z only agrees with stack-down
+    /// while every ancestor mounted unflipped, so the fold is what
+    /// stays correct through an upside-down parent.
+    fn parent_body_transform(&self, parent: PartNodeId) -> PartTransform {
+        self.body_transforms()
+            .get(&parent)
+            .copied()
+            .unwrap_or_else(|| {
+                let mut chain = vec![parent];
+                while let Some(e) = chain
+                    .last()
+                    .and_then(|id| self.session.node(*id))
+                    .and_then(|n| n.edge())
+                {
+                    chain.push(e.parent);
+                }
+                let mut t = PartTransform::IDENTITY;
+                for id in chain.iter().rev() {
+                    if let Some(n) = self.session.node(*id) {
+                        t = t.compose(n.transform());
+                    }
+                }
+                t
+            })
+    }
+
     /// The axial half of [`Self::plan_edges`] — the authored snap
     /// graph on the side the hit named (default: the down-stack face,
     /// the same preference `attach_auto` applies). Candidates are the
@@ -1723,53 +1752,29 @@ impl VabSession {
         };
         // The parent's body-frame orientation — needed to know which
         // authored node faces which way after the ancestor fold.
-        let parent_t = self
-            .body_transforms()
-            .get(&parent)
-            .copied()
-            .unwrap_or_else(|| {
-                let mut chain = vec![parent];
-                while let Some(e) = chain
-                    .last()
-                    .and_then(|id| self.session.node(*id))
-                    .and_then(|n| n.edge())
-                {
-                    chain.push(e.parent);
-                }
-                let mut t = PartTransform::IDENTITY;
-                for id in chain.iter().rev() {
-                    if let Some(n) = self.session.node(*id) {
-                        t = t.compose(n.transform());
-                    }
-                }
-                t
-            });
+        let parent_t = self.parent_body_transform(parent);
         // The preferred stack side: a cap hit names it, anything else
         // keeps "below" — the auto-placement's growth direction.
         let want_down = !matches!(hit.map(|h| h.region), Some(AttachRegion::TopCap));
-        let mut candidates: Vec<(&str, &str, i32, f64)> = Vec::new();
-        for pn in &parent_def.attach_nodes {
-            if bound.contains(&pn.id) {
-                continue;
-            }
-            // Same facing metric as `attach_auto`: the parent node's
-            // body-frame outward normal — positive faces down-stack.
-            let facing = -parent_t.apply_dir(pn.direction).z;
+        // A moved part's children already own some of its nodes — a
+        // node can't mate twice (the `child_bound` filter).
+        let mut candidates: Vec<(&str, &str, i32, f64)> = attach_candidates(
+            &parent_t,
+            &parent_def.attach_nodes,
+            &child_def.attach_nodes,
+            bound,
+            Some(child_bound),
+        )
+        .into_iter()
+        .map(|(p, c, facing, twist)| {
             let side_match = if want_down {
                 facing > 0.0
             } else {
                 facing < 0.0
             };
-            for cn in &child_def.attach_nodes {
-                // A moved part's children already own some of its
-                // nodes — a node can't mate twice.
-                if child_bound.contains(&cn.id) {
-                    continue;
-                }
-                let twist = cn.direction.dot(-pn.direction);
-                candidates.push((&pn.id, &cn.id, i32::from(side_match), twist));
-            }
-        }
+            (p, c, i32::from(side_match), twist)
+        })
+        .collect();
         // Preferred side first, then least twist, authored order last.
         candidates.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| b.3.total_cmp(&a.3)));
         let mut last = None;
@@ -2095,41 +2100,12 @@ impl VabSession {
         let child_nodes = child_def.attach_nodes.clone();
         // The parent's rotation into body frame — folded down its
         // ancestor chain — is what "downward-facing" is measured in.
-        // (Local −z only agrees with stack-down while every ancestor
-        // mounted unflipped; the fold stays correct through an
-        // upside-down parent.)
-        let mut chain = vec![parent];
-        while let Some(e) = chain
-            .last()
-            .and_then(|id| self.session.node(*id))
-            .and_then(|n| n.edge())
-        {
-            chain.push(e.parent);
-        }
-        let mut parent_t = PartTransform::IDENTITY;
-        for id in chain.iter().rev() {
-            if let Some(n) = self.session.node(*id) {
-                parent_t = parent_t.compose(n.transform());
-            }
-        }
-        let mut candidates: Vec<(&str, &str, f64, f64)> = Vec::new();
-        for pn in &parent_nodes {
-            if bound.contains(&pn.id) {
-                continue;
-            }
-            // The node normal in body frame: the child lands on the
-            // side it faces, so a large `facing` hangs the child low.
-            let facing = -parent_t.apply_dir(pn.direction).z;
-            for cn in &child_nodes {
-                // `d_c · −d_p` is the cosine of the snap arc the
-                // session computes — 1.0 snaps with no rotation,
-                // −1.0 flips the child. Least-twist wins ties and
-                // keeps the child's authored pose (engines mount
-                // nozzle-down).
-                let twist = cn.direction.dot(-pn.direction);
-                candidates.push((&pn.id, &cn.id, facing, twist));
-            }
-        }
+        let parent_t = self.parent_body_transform(parent);
+        // `facing` is the node normal in body frame: the child lands
+        // on the side it faces, so a large `facing` hangs the child
+        // low.
+        let mut candidates =
+            attach_candidates(&parent_t, &parent_nodes, &child_nodes, &bound, None);
         // Stable sort — authored order breaks ties deterministically.
         candidates.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| b.3.total_cmp(&a.3)));
         let mut last = None;
@@ -2154,6 +2130,41 @@ impl VabSession {
     pub fn to_bytes(&self) -> Result<Vec<u8>, csp_phys::session::CraftFileError> {
         self.session.to_bytes()
     }
+}
+
+/// The attach-candidate enumeration `plan_axial` and `attach_auto`
+/// share (C17-F9 — the facing/twist metrics were two hand-kept
+/// copies): every free parent node × child node pair scored
+/// `(pn_id, cn_id, facing, twist)`. `facing` is the parent node's
+/// body-frame outward normal's stack sign (−z faces down-stack, so
+/// positive hangs the child low); `twist` is the snap-arc cosine
+/// `d_c·−d_p` the session computes — 1.0 snaps unrotated, −1.0 flips
+/// the child. `child_bound`, when `Some`, filters nodes the moved
+/// part's children already own — the move planner needs it, the
+/// fresh-part auto-attach passes `None`. Ranking and the attempt op
+/// stay caller-side — the planners order and commit differently.
+fn attach_candidates<'n>(
+    parent_t: &PartTransform,
+    parent_nodes: &'n [csp_data::AttachNode],
+    child_nodes: &'n [csp_data::AttachNode],
+    bound: &std::collections::BTreeSet<String>,
+    child_bound: Option<&std::collections::BTreeSet<String>>,
+) -> Vec<(&'n str, &'n str, f64, f64)> {
+    let mut candidates = Vec::new();
+    for pn in parent_nodes {
+        if bound.contains(&pn.id) {
+            continue;
+        }
+        let facing = -parent_t.apply_dir(pn.direction).z;
+        for cn in child_nodes {
+            if child_bound.is_some_and(|b| b.contains(&cn.id)) {
+                continue;
+            }
+            let twist = cn.direction.dot(-pn.direction);
+            candidates.push((pn.id.as_str(), cn.id.as_str(), facing, twist));
+        }
+    }
+    candidates
 }
 
 /// The def's collider z-extent at a built scale — `(-h·s·t, +h·s·t)`

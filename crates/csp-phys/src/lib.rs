@@ -101,7 +101,7 @@ pub use aero::{
     AERO_AOA_KNOTS_RAD, AERO_DIRECTION_COUNT, AERO_MACH_KNOTS, AIR_VISCOSITY_PA_S, AeroError,
     ConfigMask, CraftAeroTables, DirTri, DirectionSet, MAX_CONFIG_MASKS, PartAeroTable,
     VOXEL_BUDGET, VOXEL_TARGET_EDGE_M, VOXELIZER_VERSION, build_aero_tables, direction_set,
-    eval_aero_curve, flow_dir_at_aoa, skin_friction_cd,
+    eval_aero_curve, flow_dir_at_aoa, remap_config_mask, skin_friction_cd,
 };
 pub use backend::{BodyHandle, Contact, Hit, JointDef, JointKind, PhysicsBackend, Ray};
 pub use graph::{PartGraph, PartNode, PartNodeId, PartTransform};

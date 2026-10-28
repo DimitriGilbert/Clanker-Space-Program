@@ -1049,6 +1049,56 @@ fn unlit_v(pos: [f32; 3], color: [f32; 4], pick: u32) -> VabVertex {
 /// painted-metal pair; the real models carry their own baked terms.
 const VAB_KITBASH_MAT: [f32; 3] = [0.45, 44.0, 1.0];
 
+/// The baked-model triangle walk `emit_part` and `emit_triangles`
+/// share (C17-F9 — was two hand-kept copies): `emit_model` wedges +
+/// authored albedo + baked material terms, transformed and projected
+/// corner-whole like the kitbash path. The two tint decisions are
+/// caller policy — `tint` multiplies the albedo rgb (white keeps it
+/// raw, `emit_part`'s look) and `alpha` overrides the albedo alpha
+/// (`Some`, the ghost's translucent tint) or leaves the baked
+/// vertex alpha (`None`, `emit_part`'s raw alpha).
+#[allow(clippy::too_many_arguments)]
+fn emit_model_tris(
+    verts: &mut Vec<VabVertex>,
+    cam: &MapCameraF64,
+    m: &crate::art::PartModel,
+    shape: &crate::part_mesh::PartShape,
+    transform: csp_phys::PartTransform,
+    tint: [f32; 3],
+    alpha: Option<f32>,
+    pick: u32,
+) {
+    let (lo, hi) = shape.local_aabb();
+    let mut mtris = Vec::new();
+    crate::part_mesh::emit_model(m, lo, hi, &mut mtris);
+    for t in &mtris {
+        let world = [t.a, t.b, t.c].map(|q| transform.apply(q));
+        let [Some(c0), Some(c1), Some(c2)] =
+            world.map(|q| project_into(&cam.view_proj, cam.eye, q))
+        else {
+            continue;
+        };
+        for (k, &(n, alb, mt)) in [(t.na, t.ca, t.ma), (t.nb, t.cb, t.mb), (t.nc, t.cc, t.mc)]
+            .iter()
+            .enumerate()
+        {
+            verts.push(VabVertex {
+                pos: [c0, c1, c2][k],
+                world: f3(world[k] - cam.eye),
+                nrm: f3(transform.apply_dir(n)),
+                color: [
+                    alb[0] * tint[0],
+                    alb[1] * tint[1],
+                    alb[2] * tint[2],
+                    alpha.unwrap_or(alb[3]),
+                ],
+                mat: mt,
+                pick,
+            });
+        }
+    }
+}
+
 /// Emit one kitbash shape's triangles under `transform` —
 /// `emit_part`'s core with the shape/color/pick as parameters so the
 /// selection shell, ghosts, and solid parts share the code path.
@@ -1068,35 +1118,16 @@ fn emit_triangles(
     if let Some(m) = model {
         // Ghost model: the real mesh under the ghost's translucent
         // tint (albedo × tint-hue, alpha from the ghost color).
-        let (lo, hi) = shape.local_aabb();
-        let mut mtris = Vec::new();
-        crate::part_mesh::emit_model(m, lo, hi, &mut mtris);
-        for t in &mtris {
-            let world = [t.a, t.b, t.c].map(|q| transform.apply(q));
-            let [Some(c0), Some(c1), Some(c2)] =
-                world.map(|q| project_into(&cam.view_proj, cam.eye, q))
-            else {
-                continue;
-            };
-            for (k, &(n, alb, mt)) in [(t.na, t.ca, t.ma), (t.nb, t.cb, t.mb), (t.nc, t.cc, t.mc)]
-                .iter()
-                .enumerate()
-            {
-                verts.push(VabVertex {
-                    pos: [c0, c1, c2][k],
-                    world: f3(world[k] - cam.eye),
-                    nrm: f3(transform.apply_dir(n)),
-                    color: [
-                        alb[0] * color[0],
-                        alb[1] * color[1],
-                        alb[2] * color[2],
-                        color[3],
-                    ],
-                    mat: mt,
-                    pick,
-                });
-            }
-        }
+        emit_model_tris(
+            verts,
+            cam,
+            m,
+            shape,
+            transform,
+            [color[0], color[1], color[2]],
+            Some(color[3]),
+            pick,
+        );
         return;
     }
     tris.clear();
@@ -1191,32 +1222,20 @@ fn emit_part(
     pick: u32,
 ) {
     if let Some(m) = &p.model {
-        // Real baked model (procedural, parts.csar): wedge normals
-        // + authored albedo + baked material terms.
-        let (lo, hi) = p.shape.local_aabb();
-        let mut mtris = Vec::new();
-        crate::part_mesh::emit_model(m, lo, hi, &mut mtris);
-        for t in &mtris {
-            let world = [t.a, t.b, t.c].map(|q| p.transform.apply(q));
-            let [Some(c0), Some(c1), Some(c2)] =
-                world.map(|q| project_into(&cam.view_proj, cam.eye, q))
-            else {
-                continue;
-            };
-            for (k, &(n, alb, mt)) in [(t.na, t.ca, t.ma), (t.nb, t.cb, t.mb), (t.nc, t.cc, t.mc)]
-                .iter()
-                .enumerate()
-            {
-                verts.push(VabVertex {
-                    pos: [c0, c1, c2][k],
-                    world: f3(world[k] - cam.eye),
-                    nrm: f3(p.transform.apply_dir(n)),
-                    color: alb,
-                    mat: mt,
-                    pick,
-                });
-            }
-        }
+        // Real baked model (procedural, parts.csar): wedge normals +
+        // authored albedo + baked material terms — raw albedo and the
+        // baked per-vertex alpha (the white-tint/alpha-defer decision
+        // `emit_model_tris` documents).
+        emit_model_tris(
+            verts,
+            cam,
+            m,
+            &p.shape,
+            p.transform,
+            [1.0, 1.0, 1.0],
+            None,
+            pick,
+        );
         return;
     }
     tris.clear();

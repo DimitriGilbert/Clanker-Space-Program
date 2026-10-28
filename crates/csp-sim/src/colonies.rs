@@ -770,6 +770,22 @@ pub(crate) fn colony_live(state: &ColonyState) -> bool {
     matches!(state, ColonyState::Nominal | ColonyState::Degraded { .. })
 }
 
+/// The terminal-store freeze the `Dormant`/`Abandoned` transitions
+/// run (C09-F10 — was two hand-kept copies): "consumes, produces,
+/// and schedules NOTHING" means the derived levels stop integrating
+/// too — re-anchor every store at `now` and zero the net rates, or
+/// `level_at` keeps integrating the last live rates and a later read
+/// (the `AbandonColony` salvage scan) sees production that accrued
+/// while the colony was dead.
+fn freeze_colony_stores(colony: &mut Colony, now: u64) {
+    for s in colony.stores.values_mut() {
+        let level = s.level_at(now);
+        s.anchor_level = level;
+        s.anchor_tick = now;
+        s.net_rate_per_s = 0.0;
+    }
+}
+
 /// The solve's inputs — everything the network reads, snapshotted at
 /// the boundary tick so the solve is a pure function of boundary
 /// state.
@@ -807,6 +823,23 @@ struct SolveInput<'a> {
     /// module's own `consumes_per_crew` authors the whole demand and
     /// this set registers nothing — no double-counting.
     crew_demands: &'a [(ResourceId, f64)],
+}
+
+/// The solve-input fields [`World::colony_net_solve`] and
+/// [`World::recompute_colony`] assemble identically (C09-F10 — was
+/// two hand-kept copies; the firing-time re-check's correctness
+/// depends on them staying identical). `levels`/`caps` stay with the
+/// caller: the pure path reads them while the recompute re-derives
+/// capacity and re-anchors first.
+struct SolveFrame {
+    /// The env-derived light field for the colony's body/site.
+    light: BodyLight,
+    /// The site's `resource_yields` resolved to concentrations.
+    concentrations: BTreeMap<ResourceId, f64>,
+    /// The life-support demand table (`LifeSupportConfig::demands`).
+    crew_demands: [(ResourceId, f64); 3],
+    /// Toggle-gated crew count — see [`SolveInput::crew`].
+    crew: usize,
 }
 
 /// The solve's outputs — everything a recompute writes or schedules
@@ -2187,13 +2220,7 @@ impl World {
                 *st.inventory.entry(r).or_insert(0.0) += u;
             }
         }
-        for c in &crew {
-            if let Some(m) = self.economy.crew.get_mut(c)
-                && m.location == crate::economy::CrewLocation::Colony(id)
-            {
-                m.location = crate::economy::CrewLocation::Unassigned;
-            }
-        }
+        self.unhook_colony_crew(id, &crew, false);
         // C09-F8: the terminal transition vacates every joined
         // vessel's inventory opt-in — a `joined_colony` naming a dead
         // colony is a stale tag (serialized, and it reads as "COLONY"
@@ -2211,17 +2238,9 @@ impl World {
             .ok_or(SimError::Fatal("abandon: colony vanished"))?;
         colony.state = ColonyState::Abandoned;
         colony.crew.clear();
-        // Terminal records freeze too — "consumes, produces, and
-        // schedules NOTHING" means the derived levels stop integrating:
-        // re-anchor at the abandon tick and zero every net rate (the
-        // salvage was already computed off the pre-freeze levels).
-        let now = self.clock.ticks();
-        for s in colony.stores.values_mut() {
-            let level = s.level_at(now);
-            s.anchor_level = level;
-            s.anchor_tick = now;
-            s.net_rate_per_s = 0.0;
-        }
+        // Terminal records freeze too — the salvage was already
+        // computed off the pre-freeze levels.
+        freeze_colony_stores(colony, self.clock.ticks());
         self.drop_colony_events(id, false, shadow);
         Ok(())
     }
@@ -2313,13 +2332,7 @@ impl World {
         let crew: Vec<CrewId> = colony.crew.iter().copied().collect();
         self.shadow_colonies(shadow);
         self.shadow_economy(shadow);
-        for c in &crew {
-            if let Some(m) = self.economy.crew.get_mut(c)
-                && m.location == crate::economy::CrewLocation::Colony(id)
-            {
-                m.location = crate::economy::CrewLocation::Unassigned;
-            }
-        }
+        self.unhook_colony_crew(id, &crew, false);
         self.colonies
             .get_mut(&id)
             .ok_or(SimError::Fatal("evacuate: colony vanished"))?
@@ -2501,6 +2514,42 @@ impl World {
         self.recompute_colony(id, self.clock.ticks(), shadow)
     }
 
+    /// The shared solve-input scaffold behind [`Self::colony_net_solve`]
+    /// and [`Self::recompute_colony`] (C09-F10). `None` on the missing
+    /// `colony_env` case — `colony_net_solve` propagates it as `None`,
+    /// `recompute_colony` maps it to its `Recoverable`.
+    fn colony_solve_frame(&self, colony: &Colony) -> Option<SolveFrame> {
+        let env = self.colony_env.get(&colony.body).copied()?;
+        Some(SolveFrame {
+            light: body_light(
+                &colony.body,
+                colony.latitude_rad,
+                colony.longitude_rad,
+                &self.orbits,
+                &env,
+            ),
+            concentrations: self
+                .site_defs
+                .get(&colony.site)
+                .map(|d| d.resource_yields.iter().cloned().collect())
+                .unwrap_or_default(),
+            crew_demands: self.life_support_cfg.demands(),
+            // M8-C §3.5's per-save toggle reads as zero crew for the
+            // `LifeSupport` rows — the `crew > 0` gates in
+            // `module_requests` and the depletion scan then close the
+            // whole arm (no consumable draw, no EC draw, no
+            // depletion). C09-F4: crewed colonies WITHOUT a
+            // `LifeSupport` module consume the vessel-side baseline
+            // set from colony stores (the toggle's zero-crew reading
+            // closes this arm too).
+            crew: if self.life_support_enabled {
+                colony.crew.len()
+            } else {
+                0
+            },
+        })
+    }
+
     /// The firing-time predicate re-check the transition arms run:
     /// re-solves the colony's network over exactly the inputs
     /// `recompute_colony` would read at `tick` — pure (levels via
@@ -2514,14 +2563,7 @@ impl World {
     /// `recompute_colony` fails `Recoverable` on).
     fn colony_net_solve(&self, id: ColonyId, tick: u64) -> Option<NetSolve> {
         let colony = self.colonies.get(&id)?;
-        let env = self.colony_env.get(&colony.body).copied()?;
-        let light = body_light(
-            &colony.body,
-            colony.latitude_rad,
-            colony.longitude_rad,
-            &self.orbits,
-            &env,
-        );
+        let frame = self.colony_solve_frame(colony)?;
         let levels: BTreeMap<ResourceId, f64> = colony
             .stores
             .iter()
@@ -2532,28 +2574,38 @@ impl World {
             .iter()
             .map(|(r, s)| (r.clone(), s.capacity))
             .collect();
-        let concentrations: BTreeMap<ResourceId, f64> = self
-            .site_defs
-            .get(&colony.site)
-            .map(|d| d.resource_yields.iter().cloned().collect())
-            .unwrap_or_default();
-        let crew_demands = self.life_support_cfg.demands();
         Some(solve_network(&SolveInput {
             modules: &colony.modules,
             state: colony.state,
             levels: &levels,
             caps: &caps,
-            light: &light,
-            crew: if self.life_support_enabled {
-                colony.crew.len()
-            } else {
-                0
-            },
+            light: &frame.light,
+            crew: frame.crew,
             daylight: colony.daylight,
             recipes: &self.recipes,
-            concentrations: &concentrations,
-            crew_demands: &crew_demands,
+            concentrations: &frame.concentrations,
+            crew_demands: &frame.crew_demands,
         }))
+    }
+
+    /// The roster half of vacating a colony's crew (C09-F10 — was
+    /// three hand-kept copies at abandon / evacuate /
+    /// LS-depleted): every member in `crew` still posted
+    /// `Colony(id)` goes `Unassigned`; `lost` marks them
+    /// [`CrewStatus::Lost`] first (the depletion path's dead). The
+    /// caller shadows `economy` and clears `colony.crew` itself —
+    /// that write sits beside the state write it belongs to.
+    fn unhook_colony_crew(&mut self, id: ColonyId, crew: &[CrewId], lost: bool) {
+        for c in crew {
+            if let Some(m) = self.economy.crew.get_mut(c)
+                && m.location == crate::economy::CrewLocation::Colony(id)
+            {
+                if lost {
+                    m.status = CrewStatus::Lost;
+                }
+                m.location = crate::economy::CrewLocation::Unassigned;
+            }
+        }
     }
 
     /// One colony event's application — the event-side counterpart of
@@ -2715,14 +2767,7 @@ impl World {
                 let crew: Vec<CrewId> = colony.crew.iter().copied().collect();
                 self.shadow_colonies(shadow);
                 self.shadow_economy(shadow);
-                for c in &crew {
-                    if let Some(m) = self.economy.crew.get_mut(c)
-                        && m.location == crate::economy::CrewLocation::Colony(id)
-                    {
-                        m.status = CrewStatus::Lost;
-                        m.location = crate::economy::CrewLocation::Unassigned;
-                    }
-                }
+                self.unhook_colony_crew(id, &crew, true);
                 // C09-F8: Dormant is terminal like Abandoned — clear
                 // the joined-vessel opt-ins so a latched hull beside
                 // the wreck doesn't carry a stale `joined_colony`.
@@ -2739,17 +2784,8 @@ impl World {
                 colony.crew.clear();
                 colony.state = ColonyState::Dormant;
                 // Dormant consumes, produces, and schedules NOTHING —
-                // the stores must stop evolving too: re-anchor at the
-                // firing tick and zero every net rate, or `level_at`
-                // keeps integrating the last live rates and a later
-                // `AbandonColony` salvages production that accrued
-                // while the colony was dead.
-                for s in colony.stores.values_mut() {
-                    let level = s.level_at(now);
-                    s.anchor_level = level;
-                    s.anchor_tick = now;
-                    s.net_rate_per_s = 0.0;
-                }
+                // the stores freeze at the firing tick.
+                freeze_colony_stores(colony, now);
                 self.drop_colony_events(id, false, shadow);
                 Ok(())
             }
@@ -2775,18 +2811,12 @@ impl World {
         if matches!(colony.state, ColonyState::Dormant | ColonyState::Abandoned) {
             return Ok(());
         }
-        let Some(env) = self.colony_env.get(&colony.body).copied() else {
+        let Some(frame) = self.colony_solve_frame(colony) else {
             return Err(SimError::Recoverable(
                 "colony: no colony environment for body",
             ));
         };
-        let light = body_light(
-            &colony.body,
-            colony.latitude_rad,
-            colony.longitude_rad,
-            &self.orbits,
-            &env,
-        );
+        let light = frame.light;
         self.shadow_colonies(shadow);
         let levels: BTreeMap<ResourceId, f64> = {
             let colony = self
@@ -2820,34 +2850,17 @@ impl World {
             .iter()
             .map(|(r, s)| (r.clone(), s.capacity))
             .collect();
-        let concentrations: BTreeMap<ResourceId, f64> = self
-            .site_defs
-            .get(&colony.site)
-            .map(|d| d.resource_yields.iter().cloned().collect())
-            .unwrap_or_default();
-        let crew_demands = self.life_support_cfg.demands();
         let solve = solve_network(&SolveInput {
             modules: &colony.modules,
             state: colony.state,
             levels: &levels,
             caps: &caps,
             light: &light,
-            // M8-C §3.5's per-save toggle reads as zero crew for the
-            // `LifeSupport` rows — the `crew > 0` gates in
-            // `module_requests` and the depletion scan then close the
-            // whole arm (no consumable draw, no EC draw, no depletion).
-            crew: if self.life_support_enabled {
-                colony.crew.len()
-            } else {
-                0
-            },
+            crew: frame.crew,
             daylight: colony.daylight,
             recipes: &self.recipes,
-            concentrations: &concentrations,
-            // C09-F4: crewed colonies WITHOUT a `LifeSupport` module
-            // consume the vessel-side baseline set from colony stores
-            // (the toggle's zero-crew reading closes this arm too).
-            crew_demands: &crew_demands,
+            concentrations: &frame.concentrations,
+            crew_demands: &frame.crew_demands,
         });
         let colony = self
             .colonies

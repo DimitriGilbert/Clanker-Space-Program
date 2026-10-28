@@ -871,6 +871,48 @@ impl World {
         )
     }
 
+    /// The commit half every `apply_transfer_*` ends on (C07-F4 —
+    /// was four hand-kept copies): allocate the `TransferId` (the
+    /// counter is serialized per §7.2, so overflow is `Fatal`), clamp
+    /// `dur_ticks` to the ≥1-tick grid, record the [`ActiveTransfer`],
+    /// and schedule its `TransferComplete`. The caller runs the
+    /// validation/debit half and the `shadow_*` calls first — this
+    /// only sees already-validated endpoints.
+    fn commit_transfer(
+        &mut self,
+        from: TransferEnd,
+        to: TransferEnd,
+        cargo: TransferCargo,
+        dur_ticks: u64,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        let id = TransferId(self.next_transfer_id);
+        self.next_transfer_id = self
+            .next_transfer_id
+            .checked_add(1)
+            .ok_or(SimError::Fatal("transfer id counter overflow"))?;
+        let complete_tick = self
+            .clock
+            .ticks()
+            .saturating_add(dur_ticks.max(1))
+            .max(self.clock.ticks().saturating_add(1));
+        self.transfers.insert(
+            id,
+            ActiveTransfer {
+                id,
+                from,
+                to,
+                cargo,
+                complete_tick,
+            },
+        );
+        self.schedule_event(
+            crate::EventKind::TransferComplete { transfer: id },
+            complete_tick,
+            shadow,
+        )
+    }
+
     /// `TransferResource` — §3.5's process: validate the link and the
     /// books, debit the source now, schedule `TransferComplete`. All
     /// failures are `Recoverable` rejections on the originating
@@ -924,35 +966,17 @@ impl World {
             .ok_or(SimError::Fatal("transfer: source vessel vanished"))?;
         let (_, mass_changed) = debit(src, resource, amount);
         reweld_if_mass_changed(src, mass_changed)?;
-        let id = TransferId(self.next_transfer_id);
-        self.next_transfer_id = self
-            .next_transfer_id
-            .checked_add(1)
-            .ok_or(SimError::Fatal("transfer id counter overflow"))?;
         let dur_ticks = (amount * csp_core::TICK_HZ as f64 / self.transfer_cfg.rate_units_per_s)
             .ceil()
             .min(u64::MAX as f64) as u64;
-        let complete_tick = self
-            .clock
-            .ticks()
-            .saturating_add(dur_ticks.max(1))
-            .max(self.clock.ticks().saturating_add(1));
-        self.transfers.insert(
-            id,
-            ActiveTransfer {
-                id,
-                from: TransferEnd::Vessel(from),
-                to: TransferEnd::Vessel(to),
-                cargo: TransferCargo::Resource {
-                    resource: resource.clone(),
-                    amount,
-                },
-                complete_tick,
+        self.commit_transfer(
+            TransferEnd::Vessel(from),
+            TransferEnd::Vessel(to),
+            TransferCargo::Resource {
+                resource: resource.clone(),
+                amount,
             },
-        );
-        self.schedule_event(
-            crate::EventKind::TransferComplete { transfer: id },
-            complete_tick,
+            dur_ticks,
             shadow,
         )
     }
@@ -1008,29 +1032,11 @@ impl World {
             return Err(SimError::Recoverable("crew transfer: no free seat"));
         }
         self.shadow_transfers(shadow);
-        let id = TransferId(self.next_transfer_id);
-        self.next_transfer_id = self
-            .next_transfer_id
-            .checked_add(1)
-            .ok_or(SimError::Fatal("transfer id counter overflow"))?;
-        let complete_tick = self
-            .clock
-            .ticks()
-            .saturating_add(self.transfer_cfg.crew_transfer_ticks.max(1))
-            .max(self.clock.ticks().saturating_add(1));
-        self.transfers.insert(
-            id,
-            ActiveTransfer {
-                id,
-                from: TransferEnd::Vessel(from),
-                to: TransferEnd::Vessel(to),
-                cargo: TransferCargo::Crew { crew },
-                complete_tick,
-            },
-        );
-        self.schedule_event(
-            crate::EventKind::TransferComplete { transfer: id },
-            complete_tick,
+        self.commit_transfer(
+            TransferEnd::Vessel(from),
+            TransferEnd::Vessel(to),
+            TransferCargo::Crew { crew },
+            self.transfer_cfg.crew_transfer_ticks,
             shadow,
         )
     }
@@ -1536,40 +1542,22 @@ impl World {
             self.recompute_colony(colony, now, shadow)?;
         }
         self.shadow_transfers(shadow);
-        let id = TransferId(self.next_transfer_id);
-        self.next_transfer_id = self
-            .next_transfer_id
-            .checked_add(1)
-            .ok_or(SimError::Fatal("transfer id counter overflow"))?;
         let dur_ticks = (amount * csp_core::TICK_HZ as f64 / self.transfer_cfg.rate_units_per_s)
             .ceil()
             .min(u64::MAX as f64) as u64;
-        let complete_tick = self
-            .clock
-            .ticks()
-            .saturating_add(dur_ticks.max(1))
-            .max(self.clock.ticks().saturating_add(1));
         let (from, to) = if to_colony {
             (TransferEnd::Vessel(vessel), TransferEnd::Colony(colony))
         } else {
             (TransferEnd::Colony(colony), TransferEnd::Vessel(vessel))
         };
-        self.transfers.insert(
-            id,
-            ActiveTransfer {
-                id,
-                from,
-                to,
-                cargo: TransferCargo::Resource {
-                    resource: resource.clone(),
-                    amount,
-                },
-                complete_tick,
+        self.commit_transfer(
+            from,
+            to,
+            TransferCargo::Resource {
+                resource: resource.clone(),
+                amount,
             },
-        );
-        self.schedule_event(
-            crate::EventKind::TransferComplete { transfer: id },
-            complete_tick,
+            dur_ticks,
             shadow,
         )
     }
@@ -1652,34 +1640,16 @@ impl World {
             }
         }
         self.shadow_transfers(shadow);
-        let id = TransferId(self.next_transfer_id);
-        self.next_transfer_id = self
-            .next_transfer_id
-            .checked_add(1)
-            .ok_or(SimError::Fatal("transfer id counter overflow"))?;
-        let complete_tick = self
-            .clock
-            .ticks()
-            .saturating_add(self.transfer_cfg.crew_transfer_ticks.max(1))
-            .max(self.clock.ticks().saturating_add(1));
         let (from, to) = if to_colony {
             (TransferEnd::Vessel(vessel), TransferEnd::Colony(colony))
         } else {
             (TransferEnd::Colony(colony), TransferEnd::Vessel(vessel))
         };
-        self.transfers.insert(
-            id,
-            ActiveTransfer {
-                id,
-                from,
-                to,
-                cargo: TransferCargo::Crew { crew },
-                complete_tick,
-            },
-        );
-        self.schedule_event(
-            crate::EventKind::TransferComplete { transfer: id },
-            complete_tick,
+        self.commit_transfer(
+            from,
+            to,
+            TransferCargo::Crew { crew },
+            self.transfer_cfg.crew_transfer_ticks,
             shadow,
         )
     }

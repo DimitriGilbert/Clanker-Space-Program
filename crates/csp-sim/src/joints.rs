@@ -1066,23 +1066,18 @@ pub(crate) fn apply_latch(
         .collect();
     let inv: BTreeMap<PartNodeId, PartNodeId> =
         merge.remap.iter().map(|(old, new)| (*new, *old)).collect();
-    // `ConfigMask` is a u64: positions ≥ 64 are aero-active by
-    // definition (`ConfigMask::active`), so a source bit past 63
-    // reads as set and a target position past 63 has no slot —
-    // the write is skipped rather than overflowing the shift.
-    let mut mask = 0u64;
-    for (j, id) in merge.graph.nodes.keys().enumerate() {
-        let bit = u64::from(if let Some(&i) = pos_p.get(id) {
+    // The merged bit comes from whichever side the node lived on; a
+    // node neither source knows (the seam) reads aero-active.
+    let mask = csp_phys::remap_config_mask(merge.graph.nodes.keys().copied(), |id| {
+        if let Some(&i) = pos_p.get(&id) {
             vp.aero_mask.active(i)
-        } else if let Some(&i) = inv.get(id).and_then(|old| pos_s.get(old)) {
+        } else if let Some(&i) = inv.get(&id).and_then(|old| pos_s.get(old)) {
             vs.aero_mask.active(i)
         } else {
             true
-        });
-        if j < 64 {
-            mask |= bit << j;
         }
-    }
+    })
+    .0;
     // §2.4.1: the merged body's attached aero table must be for its
     // own graph + mask — rebuild inline when the environment has an
     // atmosphere (the apply_breakup convention), else attach nothing;

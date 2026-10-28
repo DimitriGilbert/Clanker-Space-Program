@@ -1007,12 +1007,7 @@ fn advance_to(world: &mut World, target: u64) -> Result<(), ReplayError> {
         // A deferred over-ceiling event batch (§2.6.5's per-batch ceiling)
         // can legitimately return zero-advance frames while flushing the
         // tail — that IS progress. A stall is literally nothing happening.
-        if report.reached_tick <= before
-            && report.events_processed == 0
-            && report.commands_applied == 0
-            && report.rejected.is_empty()
-            && report.degraded.is_empty()
-        {
+        if crate::agent::advance_stalled(&report, before) {
             return Err(ReplayError::AdvanceStalled {
                 target,
                 reached: report.reached_tick,

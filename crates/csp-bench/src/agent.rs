@@ -345,11 +345,7 @@ impl Lockstep {
             // A partial is back-pressure, never a stall: it advanced
             // the clock, fired events, or applied/drained commands.
             // Zero activity on a continuation frame is a bug.
-            let stalled = next.reached_tick <= before
-                && next.events_processed == 0
-                && next.commands_applied == 0
-                && next.rejected.is_empty()
-                && next.degraded.is_empty();
+            let stalled = advance_stalled(&next, before);
             merge_report(&mut report, next);
             if stalled {
                 return Err(SimError::Fatal(
@@ -436,6 +432,20 @@ impl Lockstep {
             self.dv_used_mps += throttle * (thrust_n / body.mass_kg) * dt_s;
         }
     }
+}
+
+/// The "did this advance do anything at all" test shared by the
+/// agent's partial-continuation loop and the replay harness's
+/// `advance_to` (C29 — was two hand-kept copies): the §2.6.5 budget
+/// may split a frame but a return must always have moved the clock,
+/// fired events, or applied/drained commands. Zero activity below
+/// target is a broken harness or sim, never back-pressure.
+pub(crate) fn advance_stalled(report: &AdvanceReport, before: u64) -> bool {
+    report.reached_tick <= before
+        && report.events_processed == 0
+        && report.commands_applied == 0
+        && report.rejected.is_empty()
+        && report.degraded.is_empty()
 }
 
 /// Fold a §2.6.5 partial-continuation's report into `acc` — one

@@ -4779,24 +4779,16 @@ impl World {
                     self.notifications.pop_front();
                 }
             }
-            if !rel_burns.is_empty() {
-                if shadow.tech.is_none() {
-                    shadow.tech = Some(self.tech.clone());
-                }
-                for (family, burn_s, in_atmo) in rel_burns.drain(..) {
-                    let rate = if in_atmo {
-                        self.reliability_cfg.flight_units_per_s_atmosphere
-                    } else {
-                        self.reliability_cfg.flight_units_per_s_vacuum
-                    };
-                    // Same in-range rule: `Recoverable` cannot
-                    // propagate out of `step_bubble_range` — and a
-                    // non-finite accrual here IS a physics bug.
-                    self.tech
-                        .credit_qualification(family, burn_s * rate, 0.0, 0)
-                        .map_err(|e| SimError::Fatal(e.reason()))?;
-                }
-            }
+            // Same in-range rule: `Recoverable` cannot propagate out
+            // of `step_bubble_range` — a non-finite accrual here IS a
+            // physics bug.
+            drain_burn_credit(
+                &mut self.tech,
+                &self.reliability_cfg,
+                shadow,
+                &mut rel_burns,
+                true,
+            )?;
             // A `Leak` that moved bucketed mass re-welds the body —
             // the `reweld_if_mass_changed` convention, run after the
             // vessel loop's `body` borrows are done.
@@ -6090,53 +6082,7 @@ impl World {
     /// site. `false` when the world has no physics — a physical spawn
     /// refuses earlier on that ground anyway.
     fn spawn_site_occupied_by(&self, candidate: &WeldedBody) -> bool {
-        let Some(physics) = &self.physics else {
-            return false;
-        };
-        let env = physics.backend.environment();
-        for v in self.vessels.values() {
-            // The latched vessel's re-materialized body — assigned and
-            // read only inside the `SurfaceLatched` arm; it owns the
-            // weld `other` borrows from.
-            let parked: Option<WeldedBody>;
-            let other = match &v.state {
-                VesselState::InBubble(b) => Some(b),
-                VesselState::OnRails(_) => None,
-                VesselState::SurfaceLatched(pose) => {
-                    // Rebuild the pose the vessel would unlatch into
-                    // at this tick — the same weld + restore
-                    // `unlatched_body` runs. A latch on a body other
-                    // than this bubble's dominant, or a latched
-                    // vessel with no craft to weld, claims no volume
-                    // here (both break the latch invariant anyway;
-                    // skipping is the honest non-blocking read).
-                    if pose.body != physics.dominant {
-                        None
-                    } else {
-                        parked = v.craft.as_ref().and_then(|craft| {
-                            csp_phys::weld(&craft.graph, &craft.parts)
-                                .ok()
-                                .map(|mut b| {
-                                    let (pos, rot, _, _) = bubble::surface_pose_restore(
-                                        env,
-                                        pose,
-                                        b.com_local,
-                                        self.clock,
-                                    );
-                                    b.pos = pos;
-                                    b.rot = rot;
-                                    b
-                                })
-                        });
-                        parked.as_ref()
-                    }
-                }
-            };
-            if other.is_some_and(|o| physics.backend.volumes_overlap(candidate, o)) {
-                return true;
-            }
-        }
-        false
+        self.site_occupant(candidate).is_some()
     }
 
     /// The `SpawnPhysicalVessel` occupancy gate, exposed so a launch
@@ -6156,41 +6102,22 @@ impl World {
     /// `VesselId` so a launch can recover/replace the parked build
     /// rather than dead-refuse. `None` when unoccupied.
     pub fn spawn_site_occupant(&self, candidate: &WeldedBody) -> Option<VesselId> {
+        self.site_occupant(candidate)
+    }
+
+    /// Shared fold behind [`Self::spawn_site_occupied_by`] and
+    /// [`Self::spawn_site_occupant`]: the first vessel — ascending
+    /// `VesselId` order, the same order both former copies walked —
+    /// whose claimed collider volume overlaps `candidate`. `None`
+    /// when the world has no physics (a physical spawn refuses
+    /// earlier on that ground anyway).
+    fn site_occupant(&self, candidate: &WeldedBody) -> Option<VesselId> {
         let physics = self.physics.as_ref()?;
-        let env = physics.backend.environment();
-        for (id, v) in self.vessels.iter() {
-            let parked: Option<WeldedBody>;
-            let other = match &v.state {
-                VesselState::InBubble(b) => Some(b),
-                VesselState::OnRails(_) => None,
-                VesselState::SurfaceLatched(pose) => {
-                    if pose.body != physics.dominant {
-                        None
-                    } else {
-                        parked = v.craft.as_ref().and_then(|craft| {
-                            csp_phys::weld(&craft.graph, &craft.parts)
-                                .ok()
-                                .map(|mut b| {
-                                    let (pos, rot, _, _) = bubble::surface_pose_restore(
-                                        env,
-                                        pose,
-                                        b.com_local,
-                                        self.clock,
-                                    );
-                                    b.pos = pos;
-                                    b.rot = rot;
-                                    b
-                                })
-                        });
-                        parked.as_ref()
-                    }
-                }
-            };
-            if other.is_some_and(|o| physics.backend.volumes_overlap(candidate, o)) {
-                return Some(*id);
-            }
-        }
-        None
+        self.vessels.iter().find_map(|(id, v)| {
+            site_claim(v, physics, self.clock)
+                .filter(|claim| physics.backend.volumes_overlap(candidate, claim.body()))
+                .map(|_| *id)
+        })
     }
 
     /// `SpawnPhysicalVessel`: weld the craft graph into a fresh
@@ -7567,27 +7494,22 @@ impl World {
         nb.throttle = parent_body.throttle;
         nb.settle = parent_body.settle;
         // The retained body's aero-mask remap — positional, like
-        // apply_breakup's.
-        let old_order: Vec<csp_phys::PartNodeId> = craft.graph.nodes.keys().copied().collect();
-        let new_positions: std::collections::BTreeMap<csp_phys::PartNodeId, usize> = retained
+        // apply_breakup's (the shared `remap_config_mask`
+        // convention): a retained node's bit is its old position's
+        // activity; a node the old graph never carried lands no bit.
+        let old_positions: std::collections::BTreeMap<csp_phys::PartNodeId, usize> = craft
+            .graph
             .nodes
             .keys()
             .enumerate()
-            .map(|(j, i)| (*i, j))
+            .map(|(i, id)| (*id, i))
             .collect();
-        let mut retained_mask = 0u64;
-        for (old, i) in old_order.iter().enumerate() {
-            // `ConfigMask` is a u64: `active` reads positions ≥ 64 as
-            // set (the ≥64-always-active convention), and a target
-            // position ≥ 64 has no bit to land in — the write is
-            // skipped rather than overflowing the shift.
-            if v.aero_mask.active(old)
-                && let Some(&j) = new_positions.get(i)
-                && j < 64
-            {
-                retained_mask |= 1u64 << j;
-            }
-        }
+        let retained_mask = csp_phys::remap_config_mask(retained.nodes.keys().copied(), |id| {
+            old_positions
+                .get(&id)
+                .is_some_and(|&old| v.aero_mask.active(old))
+        })
+        .0;
         if let Some(p) = self.physics.as_ref()
             && p.backend.environment().atmosphere.is_some()
         {
@@ -10393,6 +10315,64 @@ fn scrub_event_heap_split(
     rewrite_event_heap_split(heap, next_event_seq, shadow, |e| keep(&e).then_some(e));
 }
 
+/// The collider volume a resident vessel claims against a spawn-site
+/// candidate — the `InBubble` hull borrowed live, or the
+/// `SurfaceLatched` hull re-materialized from its §2.6.4 pose at the
+/// current phase (a latched vessel carries no live collider; the
+/// volume it would unlatch into is the claim).
+enum SiteClaim<'a> {
+    /// The live hull — borrowed, no re-materialization needed.
+    Live(&'a WeldedBody),
+    /// The re-materialized latch weld — owned (and boxed: `WeldedBody`
+    /// is ~300 B, `Live` is a pointer — the unboxed variant made the
+    /// scan pay the full weld size per element) so the borrow of it
+    /// in `body()` outlives the local that built it.
+    Parked(Box<WeldedBody>),
+}
+
+impl SiteClaim<'_> {
+    fn body(&self) -> &WeldedBody {
+        match self {
+            Self::Live(b) => b,
+            Self::Parked(b) => b,
+        }
+    }
+}
+
+/// The volume `v` claims at a spawn site (see
+/// [`World::spawn_site_occupied`]'s doc for the claiming rules).
+/// `None` for `OnRails` (rails vessels hold no bubble volume), a
+/// latch on a body other than this bubble's dominant, or a latched
+/// vessel with no craft to weld — the latter two break the latch
+/// invariant anyway, so skipping is the honest non-blocking read.
+fn site_claim<'a>(v: &'a Vessel, physics: &Physics, clock: SimTime) -> Option<SiteClaim<'a>> {
+    match &v.state {
+        VesselState::InBubble(b) => Some(SiteClaim::Live(b)),
+        VesselState::OnRails(_) => None,
+        VesselState::SurfaceLatched(pose) => {
+            if pose.body != physics.dominant {
+                return None;
+            }
+            // Rebuild the pose the vessel would unlatch into at this
+            // tick — the same weld + restore `unlatched_body` runs.
+            v.craft
+                .as_ref()
+                .and_then(|craft| csp_phys::weld(&craft.graph, &craft.parts).ok())
+                .map(|mut b| {
+                    let (pos, rot, _, _) = bubble::surface_pose_restore(
+                        physics.backend.environment(),
+                        pose,
+                        b.com_local,
+                        clock,
+                    );
+                    b.pos = pos;
+                    b.rot = rot;
+                    SiteClaim::Parked(Box::new(b))
+                })
+        }
+    }
+}
+
 /// Does this scheduled event name `vessel`? Used by the `ToBubble`
 /// apply and the node-start materialization to drop the vessel's dead
 /// events when it leaves rails — SOI events (no conic to scan) and
@@ -12378,23 +12358,20 @@ fn apply_breakup(
         return Ok(());
     }
     craft.graph.nodes.retain(|id, _| !removed.contains(id));
-    // ConfigMask is positional — remap like jettison does.
-    let mut mask = 0u64;
-    let mut new_positions = std::collections::BTreeMap::new();
-    for (j, id) in craft.graph.nodes.keys().enumerate() {
-        new_positions.insert(*id, j);
-    }
-    for (old, id) in old_order.iter().enumerate() {
-        // Same ≥64-always-active convention as the latch merge's
-        // mask merge: `active` reads them set, and a target position
-        // ≥ 64 has no bit — skipped, never shifted.
-        if aero_mask.active(old)
-            && let Some(&j) = new_positions.get(id)
-            && j < 64
-        {
-            mask |= 1u64 << j;
-        }
-    }
+    // ConfigMask is positional — the shared `remap_config_mask`
+    // convention (a retained node's bit is its old position's
+    // activity; a node the old order never carried lands no bit).
+    let old_positions: std::collections::BTreeMap<csp_phys::PartNodeId, usize> = old_order
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (*id, i))
+        .collect();
+    let mask = csp_phys::remap_config_mask(craft.graph.nodes.keys().copied(), |id| {
+        old_positions
+            .get(&id)
+            .is_some_and(|&old| aero_mask.active(old))
+    })
+    .0;
     temps.retain(|id, _| craft.graph.nodes.contains_key(id));
     let mut nb =
         csp_phys::weld(&craft.graph, &craft.parts).map_err(|e| SimError::Fatal(e.reason()))?;
@@ -12598,6 +12575,42 @@ fn retire_debris_vessel(
     gone
 }
 
+/// §3.4's burn-exit credit drain (C10-F4 — was three hand-kept
+/// copies: the tick pass inside `step_bubble_range`, this removal
+/// path, and `reliability_residence_change`): each
+/// `(family, burn_s, in_atmo)` accrues flight units at the
+/// atmosphere/vacuum rate, shadowing `tech` once. `in_range` maps a
+/// rejection to `Fatal` — `Recoverable` cannot propagate out of
+/// `step_bubble_range` (a non-finite accrual there IS a physics bug);
+/// the residence-change drain keeps the record's own `Recoverable`.
+fn drain_burn_credit(
+    tech: &mut TechState,
+    cfg: &reliability::ReliabilityConfig,
+    shadow: &mut TickShadow,
+    burns: &mut Vec<(csp_data::FamilyId, f64, bool)>,
+    in_range: bool,
+) -> Result<(), SimError> {
+    if burns.is_empty() {
+        return Ok(());
+    }
+    if shadow.tech.is_none() {
+        shadow.tech = Some(tech.clone());
+    }
+    for (family, burn_s, in_atmo) in burns.drain(..) {
+        let rate = if in_atmo {
+            cfg.flight_units_per_s_atmosphere
+        } else {
+            cfg.flight_units_per_s_vacuum
+        };
+        match tech.credit_qualification(family, burn_s * rate, 0.0, 0) {
+            Ok(()) => {}
+            Err(e) if in_range => return Err(SimError::Fatal(e.reason())),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// §2.6.2's per-tick consequences, extracted from
 /// `step_bubble_range`'s tick loop: apply the tick's failures and
 /// surface impacts in ascending-vessel-id order (impacts remove,
@@ -12750,21 +12763,7 @@ fn bubble_consequences(
     // Removal-path burn credits (impacts, evictions, latch
     // touchdowns all pushed into `rel_burns` since the first
     // drain) — same in-range `Fatal`-only rule.
-    if !rel_burns.is_empty() {
-        if shadow.tech.is_none() {
-            shadow.tech = Some(tech.clone());
-        }
-        for (family, burn_s, in_atmo) in rel_burns.drain(..) {
-            let rate = if in_atmo {
-                rel_cfg.flight_units_per_s_atmosphere
-            } else {
-                rel_cfg.flight_units_per_s_vacuum
-            };
-            tech.credit_qualification(family, burn_s * rate, 0.0, 0)
-                .map_err(|e| SimError::Fatal(e.reason()))?;
-        }
-    }
-    Ok(())
+    drain_burn_credit(tech, rel_cfg, shadow, rel_burns, true)
 }
 
 /// §2.6.2's auto bubble→rails detection — the scan
@@ -14440,11 +14439,7 @@ mod tests {
         let build = |tracked: bool| {
             let mut w = World::with_physics(
                 test_system_crossing(),
-                PhysicsConfig {
-                    environment: test_env(true),
-                    dominant: BodyId::from("p"),
-                    bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
-                },
+                test_physics_cfg(test_env(true), "p"),
                 DEFAULT_MAX_EVENTS_PER_FRAME,
             );
             w.enqueue(
@@ -15119,11 +15114,7 @@ mod tests {
     /// snapshot could carry is refused with `Fatal`, never half-loaded.
     /// Shared fixtures for the two case tables below.
     fn crafted_physics() -> Option<PhysicsConfig> {
-        Some(PhysicsConfig {
-            environment: test_env(false),
-            dominant: BodyId::from("p"),
-            bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
-        })
+        Some(test_physics_cfg(test_env(false), "p"))
     }
 
     fn crafted_rails_vessel(
@@ -15258,13 +15249,7 @@ mod tests {
         // orientation or a pose on the wrong body is refused.
         let craft = box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0);
         let mut v = crafted_rails_vessel(VesselId(0), leo_elements(), Some(craft));
-        v.state = VesselState::SurfaceLatched(SurfacePose {
-            body: BodyId::from("p"),
-            latitude_rad: 0.0,
-            longitude_rad: 0.0,
-            altitude_m: 0.0,
-            orientation: DQuat::IDENTITY,
-        });
+        v.state = latched_state("p", 0.0, 0.0);
         v.thermal
             .part_temps_k
             .insert(csp_phys::PartNodeId(0), 300.0);
@@ -15656,13 +15641,7 @@ mod tests {
         // …and a vessel off rails carries no stamped conic — the scan
         // never runs on it, so the report is `None`, not an invented
         // stride.
-        w.vessels.get_mut(&VesselId(0)).unwrap().state = VesselState::SurfaceLatched(SurfacePose {
-            body: BodyId::from("p"),
-            latitude_rad: 0.0,
-            longitude_rad: 0.0,
-            altitude_m: 50.0,
-            orientation: DQuat::IDENTITY,
-        });
+        w.vessels.get_mut(&VesselId(0)).unwrap().state = latched_state("p", 0.0, 50.0);
         assert_eq!(w.soi_scan_strides(VesselId(0)).unwrap(), None);
     }
 
@@ -15708,6 +15687,33 @@ mod tests {
             // are authored against the datum, not a seeded field.
             terrain: None,
         }
+    }
+
+    /// C05-F7's restore-physics block — the `PhysicsConfig` literal
+    /// every physics-restore/`with_physics` test hand-wrote; `env`
+    /// carries the only real variant (`test_env(_)`, `spin`, a local
+    /// env), `dominant` the rare second.
+    fn test_physics_cfg(env: csp_phys::Environment, dominant: &str) -> PhysicsConfig {
+        PhysicsConfig {
+            environment: env,
+            dominant: BodyId::from(dominant),
+            bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
+        }
+    }
+
+    /// C05-F7's hand-latch literal — the
+    /// `VesselState::SurfaceLatched(SurfacePose)` block the tests
+    /// wrote eleven-plus times: an equatorial pose, identity
+    /// orientation; `longitude_rad`/`altitude_m` are the only
+    /// variants any site carries.
+    fn latched_state(body: &str, longitude_rad: f64, altitude_m: f64) -> VesselState {
+        VesselState::SurfaceLatched(SurfacePose {
+            body: BodyId::from(body),
+            latitude_rad: 0.0,
+            longitude_rad,
+            altitude_m,
+            orientation: DQuat::IDENTITY,
+        })
     }
 
     /// A one-part box craft — a `mass_kg` box with an engine on its −z
@@ -15761,11 +15767,7 @@ mod tests {
     fn physics_world(spin: bool) -> World {
         World::with_physics(
             test_system(),
-            PhysicsConfig {
-                environment: test_env(spin),
-                dominant: BodyId::from("p"),
-                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
-            },
+            test_physics_cfg(test_env(spin), "p"),
             DEFAULT_MAX_EVENTS_PER_FRAME,
         )
     }
@@ -16574,11 +16576,7 @@ mod tests {
         env.atmosphere = None; // ensure_aero early-outs — the body stays table-free
         let mut w = World::with_physics(
             test_system(),
-            PhysicsConfig {
-                environment: env,
-                dominant: BodyId::from("p"),
-                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
-            },
+            test_physics_cfg(env, "p"),
             DEFAULT_MAX_EVENTS_PER_FRAME,
         );
         let pos = DVec3::new(TERRIN_R + 30_000.0, 0.0, 0.0);
@@ -17059,13 +17057,7 @@ mod tests {
         // at the same tick: two restores of the latched snapshot stepped
         // identically hash identically.
         let snap = w.snapshot().unwrap();
-        let physics = || {
-            Some(PhysicsConfig {
-                environment: test_env(true),
-                dominant: BodyId::from("p"),
-                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
-            })
-        };
+        let physics = || Some(test_physics_cfg(test_env(true), "p"));
         let mut r1 = World::restore(test_system(), physics(), snap.clone()).unwrap();
         let mut r2 = World::restore(test_system(), physics(), snap).unwrap();
         let beyond = w.clock().ticks() + 64;
@@ -17550,11 +17542,7 @@ mod tests {
         let h_after = w.state_hash().unwrap();
         let mut w2 = World::restore(
             test_system(),
-            Some(PhysicsConfig {
-                environment: test_env(false),
-                dominant: BodyId::from("p"),
-                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
-            }),
+            Some(test_physics_cfg(test_env(false), "p")),
             snap.clone(),
         )
         .unwrap();
@@ -17576,11 +17564,7 @@ mod tests {
         assert!(matches!(
             World::restore(
                 test_system(),
-                Some(PhysicsConfig {
-                    environment: test_env(false),
-                    dominant: BodyId::from("p"),
-                    bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
-                }),
+                Some(test_physics_cfg(test_env(false), "p")),
                 broken
             ),
             Err(SimError::Fatal(_))
@@ -18401,11 +18385,7 @@ mod tests {
         let h_before = w.state_hash().unwrap();
         let mut w2 = World::restore(
             test_system(),
-            Some(PhysicsConfig {
-                environment: test_env(false),
-                dominant: BodyId::from("p"),
-                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
-            }),
+            Some(test_physics_cfg(test_env(false), "p")),
             snap,
         )
         .unwrap();
@@ -18597,11 +18577,7 @@ mod tests {
             // system the run used (the model is config, not hashed
             // state, so the roundtrip hash is unchanged).
             test_system(),
-            Some(PhysicsConfig {
-                environment: test_env(false),
-                dominant: BodyId::from("p"),
-                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
-            }),
+            Some(test_physics_cfg(test_env(false), "p")),
             snap,
         )
         .unwrap();
@@ -19269,11 +19245,7 @@ mod tests {
         let snap = w.snapshot().unwrap();
         let mut restored = World::restore(
             test_system(),
-            Some(PhysicsConfig {
-                environment: test_env(false),
-                dominant: BodyId::from("p"),
-                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
-            }),
+            Some(test_physics_cfg(test_env(false), "p")),
             snap,
         )
         .unwrap();
@@ -19449,11 +19421,7 @@ mod tests {
         let moon_m0 = libm::atan2(rc.y, rc.x) - n_moon * SimTime::from_ticks(tau_c).seconds();
         let mut w = World::with_physics(
             transit_system(moon_m0),
-            PhysicsConfig {
-                environment: test_env(false),
-                dominant: BodyId::from("p"),
-                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
-            },
+            test_physics_cfg(test_env(false), "p"),
             DEFAULT_MAX_EVENTS_PER_FRAME,
         );
         let (r0, v0) = w.orbits().state_at(&vs, SimTime::ZERO).unwrap();
@@ -20130,11 +20098,7 @@ mod tests {
         .unwrap();
         let mut w = World::with_physics(
             model.clone(),
-            PhysicsConfig {
-                environment: test_env(false),
-                dominant: BodyId::from("terrin"),
-                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
-            },
+            test_physics_cfg(test_env(false), "terrin"),
             DEFAULT_MAX_EVENTS_PER_FRAME,
         );
         w.enqueue(
@@ -20308,11 +20272,7 @@ mod tests {
         let r_park = TERRIN_R + 2.0e5;
         let mut w = World::with_physics(
             model.clone(),
-            PhysicsConfig {
-                environment: test_env(false),
-                dominant: BodyId::from("terrin"),
-                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
-            },
+            test_physics_cfg(test_env(false), "terrin"),
             DEFAULT_MAX_EVENTS_PER_FRAME,
         );
         w.enqueue(
@@ -20811,13 +20771,7 @@ mod tests {
             c.parts[0].dock_ports[0].local_pos = DVec3::new(0.0, 0.0, 2.0);
             c
         };
-        let physics = || {
-            Some(PhysicsConfig {
-                environment: test_env(false),
-                dominant: BodyId::from("p"),
-                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
-            })
-        };
+        let physics = || Some(test_physics_cfg(test_env(false), "p"));
         let base = DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0);
         let v = in_bubble_vel(base.norm());
         let mut w = physics_world(false);
@@ -21672,13 +21626,7 @@ mod tests {
     /// identically.
     #[test]
     fn seam_record_round_trips_save_load() {
-        let physics = || {
-            Some(PhysicsConfig {
-                environment: test_env(false),
-                dominant: BodyId::from("p"),
-                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
-            })
-        };
+        let physics = || Some(test_physics_cfg(test_env(false), "p"));
         let mut w = physics_world(false);
         spawn_port_pair(&mut w, DVec3::new(0.0, 0.0, 1.8), flip_rot());
         step_until(&mut w, 192, |w| w.joints().is_empty());
@@ -22163,13 +22111,7 @@ mod tests {
         // Latch the resident at exactly that pose (non-spinning env:
         // lat = lon = 0, origin altitude = |pos| − R) — the parked
         // vessel's §2.6.4 record claims the same volume.
-        w.vessels.get_mut(&VesselId(0)).unwrap().state = VesselState::SurfaceLatched(SurfacePose {
-            body: BodyId::from("p"),
-            latitude_rad: 0.0,
-            longitude_rad: 0.0,
-            altitude_m: 50.0,
-            orientation: DQuat::IDENTITY,
-        });
+        w.vessels.get_mut(&VesselId(0)).unwrap().state = latched_state("p", 0.0, 50.0);
         enqueue_physical(
             &mut w,
             box_craft(1_000.0, DVec3::new(0.5, 0.5, 0.5), 0.0),
@@ -22310,13 +22252,7 @@ mod tests {
             pos,
         );
         w.step_frame(1).unwrap();
-        w.vessels.get_mut(&VesselId(0)).unwrap().state = VesselState::SurfaceLatched(SurfacePose {
-            body: BodyId::from("p"),
-            latitude_rad: 0.0,
-            longitude_rad: 0.0,
-            altitude_m: 50.0,
-            orientation: DQuat::IDENTITY,
-        });
+        w.vessels.get_mut(&VesselId(0)).unwrap().state = latched_state("p", 0.0, 50.0);
         // Vessel 1 rides a hand-stamped OnRails conic whose current
         // point sits inside the hulk's claimed volume.
         let elements =
@@ -22414,13 +22350,7 @@ mod tests {
             pos,
         );
         w.step_frame(1).unwrap();
-        w.vessels.get_mut(&VesselId(0)).unwrap().state = VesselState::SurfaceLatched(SurfacePose {
-            body: BodyId::from("p"),
-            latitude_rad: 0.0,
-            longitude_rad: 0.0,
-            altitude_m: 50.0,
-            orientation: DQuat::IDENTITY,
-        });
+        w.vessels.get_mut(&VesselId(0)).unwrap().state = latched_state("p", 0.0, 50.0);
         // The hulk's pose claims the site — a launch refuses.
         enqueue_parked(
             &mut w,
@@ -22478,13 +22408,7 @@ mod tests {
         let funds_after_purchase = 10_000_000u64 - 4_000_000;
         enqueue_parked(&mut w, craft, pos);
         w.step_frame(1).unwrap();
-        w.vessels.get_mut(&VesselId(0)).unwrap().state = VesselState::SurfaceLatched(SurfacePose {
-            body: BodyId::from("p"),
-            latitude_rad: 0.0,
-            longitude_rad: 0.0,
-            altitude_m: 50.0,
-            orientation: DQuat::IDENTITY,
-        });
+        w.vessels.get_mut(&VesselId(0)).unwrap().state = latched_state("p", 0.0, 50.0);
         w.enqueue(
             SourceClass::Ui,
             0,
@@ -22874,13 +22798,7 @@ mod tests {
     /// restore mid-flight reproduces the run bit-for-bit.
     #[test]
     fn save_load_mid_transfer() {
-        let physics = || {
-            Some(PhysicsConfig {
-                environment: test_env(false),
-                dominant: BodyId::from("p"),
-                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
-            })
-        };
+        let physics = || Some(test_physics_cfg(test_env(false), "p"));
         let mut w = physics_world(false);
         spawn_tank_pair(&mut w, 50.0, 60.0);
         let res = ResourceId::from("liquid_fuel");
@@ -23096,13 +23014,7 @@ mod tests {
     /// exact-mass check used to `Fatal` this legitimate snapshot.
     #[test]
     fn save_load_sub_bucket_fill_dry_tank() {
-        let physics = || {
-            Some(PhysicsConfig {
-                environment: test_env(false),
-                dominant: BodyId::from("p"),
-                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
-            })
-        };
+        let physics = || Some(test_physics_cfg(test_env(false), "p"));
         let mut w = physics_world(false);
         let base = DVec3::new(TERRIN_R + 200_000.0, 0.0, 0.0);
         // dry_kg = 0 — the part's whole mass is its tank contents, so
@@ -23543,13 +23455,7 @@ mod tests {
             joined_colony: None,
             id: VesselId(id),
             craft: None,
-            state: VesselState::SurfaceLatched(SurfacePose {
-                body: BodyId::from("p"),
-                latitude_rad: 0.0,
-                longitude_rad: lon,
-                altitude_m: 0.0,
-                orientation: DQuat::IDENTITY,
-            }),
+            state: latched_state("p", lon, 0.0),
             aero_mask: csp_phys::ConfigMask::ALL,
             thermal: VesselThermal::default(),
             debris_since: None,
@@ -23809,13 +23715,7 @@ mod tests {
         // banks only the 1−ratio remainder and closes the key.
         run_experiment(&mut w, &key);
         let u2 = w.vessels()[&VesselId(0)].science.units_at(&key);
-        w.vessels.get_mut(&VesselId(0)).unwrap().state = VesselState::SurfaceLatched(SurfacePose {
-            body: BodyId::from("p"),
-            latitude_rad: 0.0,
-            longitude_rad: 0.0,
-            altitude_m: 0.0,
-            orientation: DQuat::IDENTITY,
-        });
+        w.vessels.get_mut(&VesselId(0)).unwrap().state = latched_state("p", 0.0, 0.0);
         let banked = w.science_now();
         w.enqueue(
             SourceClass::Ui,
@@ -24175,13 +24075,7 @@ mod tests {
         // finalize sees elapsed = 0.5 s.
         let rec = start + 32;
         w.step_frame(rec).unwrap();
-        w.vessels.get_mut(&VesselId(0)).unwrap().state = VesselState::SurfaceLatched(SurfacePose {
-            body: BodyId::from("p"),
-            latitude_rad: 0.0,
-            longitude_rad: 0.0,
-            altitude_m: 0.0,
-            orientation: DQuat::IDENTITY,
-        });
+        w.vessels.get_mut(&VesselId(0)).unwrap().state = latched_state("p", 0.0, 0.0);
         w.enqueue(
             SourceClass::Ui,
             0,
@@ -24265,13 +24159,7 @@ mod tests {
         let pooled = w.vessels()[&VesselId(0)].science.units_at(&key);
         assert!(pooled > 0.0, "the run must pool data aboard");
         // …and lands: stamp the homecoming latch, then recover.
-        w.vessels.get_mut(&VesselId(0)).unwrap().state = VesselState::SurfaceLatched(SurfacePose {
-            body: BodyId::from("p"),
-            latitude_rad: 0.0,
-            longitude_rad: 0.0,
-            altitude_m: 0.0,
-            orientation: DQuat::IDENTITY,
-        });
+        w.vessels.get_mut(&VesselId(0)).unwrap().state = latched_state("p", 0.0, 0.0);
         w.enqueue(
             SourceClass::Ui,
             0,
@@ -24329,13 +24217,7 @@ mod tests {
         assert!(w.vessels()[&VesselId(1)].science.units_at(&key) > 0.0);
         // Land vessel 0 and try to recover — refused: vessel 1's pool
         // would strand under the close.
-        w.vessels.get_mut(&VesselId(0)).unwrap().state = VesselState::SurfaceLatched(SurfacePose {
-            body: BodyId::from("p"),
-            latitude_rad: 0.0,
-            longitude_rad: 0.0,
-            altitude_m: 0.0,
-            orientation: DQuat::IDENTITY,
-        });
+        w.vessels.get_mut(&VesselId(0)).unwrap().state = latched_state("p", 0.0, 0.0);
         w.enqueue(
             SourceClass::Ui,
             0,
@@ -24412,13 +24294,7 @@ mod tests {
         run_experiment(&mut w, &key);
         assert!(w.vessels()[&VesselId(0)].science.units_at(&key) > 0.0);
         // Land and recover — refused: the live project holds the key.
-        w.vessels.get_mut(&VesselId(0)).unwrap().state = VesselState::SurfaceLatched(SurfacePose {
-            body: BodyId::from("p"),
-            latitude_rad: 0.0,
-            longitude_rad: 0.0,
-            altitude_m: 0.0,
-            orientation: DQuat::IDENTITY,
-        });
+        w.vessels.get_mut(&VesselId(0)).unwrap().state = latched_state("p", 0.0, 0.0);
         w.enqueue(
             SourceClass::Ui,
             0,
@@ -24466,11 +24342,7 @@ mod tests {
         let snap = w.snapshot().unwrap();
         World::restore(
             test_system(),
-            Some(PhysicsConfig {
-                environment: test_env(false),
-                dominant: BodyId::from("p"),
-                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
-            }),
+            Some(test_physics_cfg(test_env(false), "p")),
             snap,
         )
         .unwrap();
@@ -24490,13 +24362,7 @@ mod tests {
         let key = science_key("plains", Situation::SpaceLow);
         run_experiment(&mut w, &key);
         // Land + recover — the key closes.
-        w.vessels.get_mut(&VesselId(0)).unwrap().state = VesselState::SurfaceLatched(SurfacePose {
-            body: BodyId::from("p"),
-            latitude_rad: 0.0,
-            longitude_rad: 0.0,
-            altitude_m: 0.0,
-            orientation: DQuat::IDENTITY,
-        });
+        w.vessels.get_mut(&VesselId(0)).unwrap().state = latched_state("p", 0.0, 0.0);
         w.enqueue(
             SourceClass::Ui,
             0,
@@ -24556,11 +24422,7 @@ mod tests {
         assert!(
             World::restore(
                 test_system(),
-                Some(PhysicsConfig {
-                    environment: test_env(false),
-                    dominant: BodyId::from("p"),
-                    bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
-                }),
+                Some(test_physics_cfg(test_env(false), "p")),
                 snap,
             )
             .is_err(),
@@ -24600,11 +24462,7 @@ mod tests {
         let hash_mid = w.state_hash().unwrap();
         let mut r = World::restore(
             test_system(),
-            Some(PhysicsConfig {
-                environment: test_env(false),
-                dominant: BodyId::from("p"),
-                bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
-            }),
+            Some(test_physics_cfg(test_env(false), "p")),
             snap,
         )
         .unwrap();
@@ -24967,13 +24825,7 @@ mod tests {
             // The latched and rails pairings — the dormant residences
             // the publish actually writes — still restore.
             let mut v = pending(dormant_vessel(0));
-            v.state = VesselState::SurfaceLatched(SurfacePose {
-                body: BodyId::from("p"),
-                latitude_rad: 0.0,
-                longitude_rad: 0.0,
-                altitude_m: 0.0,
-                orientation: DQuat::IDENTITY,
-            });
+            v.state = latched_state("p", 0.0, 0.0);
             World::restore(test_system(), crafted_physics(), crafted(v)).unwrap();
             let v = pending(dormant_vessel(0));
             World::restore(test_system(), None, crafted(v)).unwrap();
@@ -25063,11 +24915,7 @@ mod tests {
             let snap = w.snapshot().unwrap();
             let mut w2 = World::restore(
                 test_system(),
-                Some(PhysicsConfig {
-                    environment: test_env(false),
-                    dominant: BodyId::from("p"),
-                    bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
-                }),
+                Some(test_physics_cfg(test_env(false), "p")),
                 snap,
             )
             .unwrap();
@@ -25508,11 +25356,7 @@ mod tests {
             // world was built with.
             let mut w2 = World::restore(
                 test_system(),
-                Some(PhysicsConfig {
-                    environment: test_env(false),
-                    dominant: BodyId::from("p"),
-                    bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
-                }),
+                Some(test_physics_cfg(test_env(false), "p")),
                 snap,
             )
             .unwrap();
@@ -25814,14 +25658,7 @@ mod tests {
             w.set_autopilot_driver(Box::new(Noop));
             enqueue_orbiter(&mut w);
             w.step_frame(1).unwrap();
-            w.vessels.get_mut(&VesselId(0)).unwrap().state =
-                VesselState::SurfaceLatched(SurfacePose {
-                    body: BodyId::from("p"),
-                    latitude_rad: 0.0,
-                    longitude_rad: 0.0,
-                    altitude_m: 0.0,
-                    orientation: DQuat::IDENTITY,
-                });
+            w.vessels.get_mut(&VesselId(0)).unwrap().state = latched_state("p", 0.0, 0.0);
             w.enqueue(
                 SourceClass::Ui,
                 0,
@@ -26237,11 +26074,7 @@ mod tests {
             let snap = w.snapshot().unwrap();
             let w2 = World::restore(
                 test_system(),
-                Some(PhysicsConfig {
-                    environment: test_env(false),
-                    dominant: BodyId::from("p"),
-                    bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
-                }),
+                Some(test_physics_cfg(test_env(false), "p")),
                 snap,
             )
             .unwrap();

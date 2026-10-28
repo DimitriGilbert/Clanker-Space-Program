@@ -49,6 +49,10 @@ struct Vout {
 // read over-bright against the tonemapped scene). The unlit stream
 // (shells, markers, accents — the `nn < 0.25` early return below)
 // stays raw: those colors are authored emissive, not lit material.
+// C16-F3: verbatim copies live in terrain.wgsl and flight.wgsl — the
+// build has no WGSL include/preprocessor (each module loads via
+// `include_str!`), so keep the bodies in sync until a shared-source
+// mechanism lands.
 fn tone_map(c: vec3<f32>) -> vec3<f32> {
     let a = 2.51;
     let b = 0.03;

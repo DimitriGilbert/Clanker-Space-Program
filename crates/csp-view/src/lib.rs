@@ -3876,7 +3876,6 @@ impl View {
     /// be noise (the per-vessel ReliabilityRow mirror still shows
     /// wear/failures on focus change).
     fn drain_part_notices(&mut self) {
-        use csp_sim::reliability::NotificationKind as K;
         let focus = self.flight_focus();
         let Some(vid) = focus else {
             // No focused vessel: still advance the cursor — the
@@ -3921,17 +3920,9 @@ impl View {
                     })
                 })
                 .unwrap_or_else(|| format!("part {}", n.node.map_or(0, |n| n.0)));
-            let text = match n.kind {
-                K::PartFailed { mode, dormant } => format!(
-                    "vessel {} — {part} PART FAILED {:?}{}",
-                    vid.0,
-                    mode,
-                    if dormant { " (dormant)" } else { "" }
-                ),
-                K::IgnitionMisfire => {
-                    format!("vessel {} — {part} IGNITION MISFIRE", vid.0)
-                }
-                _ => continue,
+            let text = match part_failure_text(&n.kind) {
+                Some(tail) => format!("vessel {} — {part} {tail}", vid.0),
+                None => continue,
             };
             toasts.push(text);
         }
@@ -4134,10 +4125,11 @@ impl View {
                 .unwrap_or_else(|| fallback.to_string())
         };
         let mut input = up::ProgramInput {
-            funds: sim.funds_micros() as f64 / 1.0e6,
+            funds: sim.funds_micros() as f64 / csp_sim::economy::MICROS_PER_FUND,
             science: sim.science_now(),
             banked: sim.science().banked,
-            hire_cost: sim.economy_config().hire_cost_micros as f64 / 1.0e6,
+            hire_cost: sim.economy_config().hire_cost_micros as f64
+                / csp_sim::economy::MICROS_PER_FUND,
             // C08-F2 §8.3: the hire default is authored in
             // `data/balance.ron` (`crew_salary_per_s`) and reaches the
             // panel through the sim's economy config — the retired
@@ -4146,7 +4138,8 @@ impl View {
             hire_salary_per_s: sim.economy_config().crew_salary_per_s,
             // C21-F8: the authored founding charge the colonies
             // section's button gates and labels on.
-            colony_founding_cost: sim.economy_config().colony_founding_cost_micros as f64 / 1.0e6,
+            colony_founding_cost: sim.economy_config().colony_founding_cost_micros as f64
+                / csp_sim::economy::MICROS_PER_FUND,
             ..Default::default()
         };
         // Contracts, research rows, and the notification log.
@@ -4936,7 +4929,7 @@ fn stage_program_overview(
             e.tick,
             format!(
                 "funds {:+}₣ — {:?}",
-                e.delta_micros as f64 / 1.0e6,
+                e.delta_micros as f64 / csp_sim::economy::MICROS_PER_FUND,
                 e.reason
             ),
         )
@@ -4944,6 +4937,43 @@ fn stage_program_overview(
     rows.sort_by_key(|(tick, _)| *tick);
     for (tick, text) in rows.into_iter().rev().take(8).rev() {
         input.notices.push(up::NoticeRow { tick, text });
+    }
+}
+
+/// The free-seat count both staging passes write (C21-F9 — the
+/// vessel-arena loop and the focused-vessel block each hand-kept
+/// it): `vessel_seats` minus aboard crew minus inbound crew
+/// transfers — an in-flight member holds a seat reservation, the
+/// sim-side transfer gate counts it the same way.
+fn free_seats(sim: &csp_sim::World, v: &csp_sim::Vessel, id: csp_sim::VesselId) -> u64 {
+    let inbound = sim
+        .transfers()
+        .values()
+        .filter(|t| {
+            t.to == csp_sim::transfers::TransferEnd::Vessel(id)
+                && matches!(t.cargo, csp_sim::transfers::TransferCargo::Crew { .. })
+        })
+        .count() as u64;
+    csp_sim::transfers::vessel_seats(v)
+        .saturating_sub(v.crew.len() as u64)
+        .saturating_sub(inbound)
+}
+
+/// The `PartFailed`/`IgnitionMisfire` mode text (C21-F9 — the
+/// focused-vessel toast and the `LOG` row each hand-kept the
+/// mode/dormant formatting). Callers add their own vessel/part
+/// naming — the toast resolves part display names, the LOG prints
+/// node ids.
+fn part_failure_text(kind: &csp_sim::reliability::NotificationKind) -> Option<String> {
+    use csp_sim::reliability::NotificationKind as K;
+    match kind {
+        K::PartFailed { mode, dormant } => Some(format!(
+            "PART FAILED {:?}{}",
+            mode,
+            if *dormant { " (dormant)" } else { "" }
+        )),
+        K::IgnitionMisfire => Some("IGNITION MISFIRE".to_string()),
+        _ => None,
     }
 }
 
@@ -4959,14 +4989,12 @@ fn notice_text(n: &csp_sim::reliability::Notification) -> String {
         node.map_or_else(String::new, |n| format!("part {} ", n.0))
     };
     match n.kind {
-        K::PartFailed { mode, dormant } => format!(
-            "{}{}PART FAILED {:?}{}",
+        K::PartFailed { .. } | K::IgnitionMisfire => format!(
+            "{}{}{}",
             v(n.vessel),
             p(n.node),
-            mode,
-            if dormant { " (dormant)" } else { "" }
+            part_failure_text(&n.kind).unwrap_or_default()
         ),
-        K::IgnitionMisfire => format!("{}{}IGNITION MISFIRE", v(n.vessel), p(n.node)),
         K::OnRails => format!("{}ON RAILS", v(n.vessel)),
         K::ContractAccepted { contract } => format!("contract #{contract} — ACCEPTED"),
         K::ContractCompleted { contract } => format!("contract #{contract} — COMPLETED"),
@@ -4974,7 +5002,10 @@ fn notice_text(n: &csp_sim::reliability::Notification) -> String {
             format!("contract #{contract} — FAILED (deadline expired)")
         }
         K::ScienceBanked { micros } => {
-            format!("science banked +{:.1}⚛", micros as f64 / 1.0e6)
+            format!(
+                "science banked +{:.1}⚛",
+                micros as f64 / csp_sim::economy::MICROS_PER_FUND
+            )
         }
         // C08-F3 §3.5's insolvency consequences — both program-level
         // entries (the contract-lifecycle prefix convention: no
@@ -5389,14 +5420,6 @@ fn stage_program_world(
             VesselState::OnRails(o) => ("on rails", o.parent.as_str().to_string()),
             VesselState::SurfaceLatched(p) => ("landed", p.body.as_str().to_string()),
         };
-        let inbound = sim
-            .transfers()
-            .values()
-            .filter(|t| {
-                t.to == csp_sim::transfers::TransferEnd::Vessel(*id)
-                    && matches!(t.cargo, csp_sim::transfers::TransferCargo::Crew { .. })
-            })
-            .count() as u64;
         input.vessels.push(up::VesselRow {
             id: id.0,
             residence: residence.to_string(),
@@ -5404,9 +5427,7 @@ fn stage_program_world(
             debris: v.debris_since.is_some(),
             focused: focus == Some(*id),
             crew: v.crew.iter().map(|c| c.id.0).collect(),
-            free_seats: csp_sim::transfers::vessel_seats(v)
-                .saturating_sub(v.crew.len() as u64)
-                .saturating_sub(inbound),
+            free_seats: free_seats(sim, v, *id),
             joined_colony: v.joined_colony.map(|c| c.0),
             linked_to_focus: focus.is_some_and(|f| sim.vessels_linked(f, *id)),
         });
@@ -5589,17 +5610,7 @@ fn stage_program_world(
         && let Some(v) = sim.vessels().get(&f)
     {
         input.focus_joined = v.joined_colony.map(|c| c.0);
-        let inbound = sim
-            .transfers()
-            .values()
-            .filter(|t| {
-                t.to == csp_sim::transfers::TransferEnd::Vessel(f)
-                    && matches!(t.cargo, csp_sim::transfers::TransferCargo::Crew { .. })
-            })
-            .count() as u64;
-        input.focus_free_seats = csp_sim::transfers::vessel_seats(v)
-            .saturating_sub(v.crew.len() as u64)
-            .saturating_sub(inbound);
+        input.focus_free_seats = free_seats(sim, v, f);
         let mut agg: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
         for stores in v.tank_contents.values() {
             for (r, u) in stores {

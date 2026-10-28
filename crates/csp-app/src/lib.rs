@@ -535,6 +535,17 @@ impl App {
         app
     }
 
+    /// §2.13's read-only refusal notice (C24-F7 — the gated verbs
+    /// each hand-wrote the same toast with drifting wording): a
+    /// halted session applies no player command, and says so rather
+    /// than queueing it silently behind the dead clock. `what` is the
+    /// full tail ("WARP NOT APPLIED", "LAUNCH REFUSED" — the wording
+    /// each surface's users already read).
+    fn refuse_read_only(&mut self, what: &str) {
+        self.view
+            .flight_notice(format!("SESSION IS READ-ONLY — {what}"));
+    }
+
     /// Apply the live-session half of [`Settings`] — everything that is
     /// *not* a new-game flag or a file location: the egui zoom factor
     /// (`ui_scale`) and the warp controller's QoL ceiling
@@ -567,8 +578,7 @@ impl App {
                 // still landed (it is app state, not sim state); only
                 // the logged command is refused — same notice
                 // convention as the launch/maneuver gates.
-                self.view
-                    .flight_notice("SESSION IS READ-ONLY — WARP DEMOTION NOT APPLIED");
+                self.refuse_read_only("WARP DEMOTION NOT APPLIED");
             } else {
                 self.view.enqueue_command(
                     SourceClass::Ui,
@@ -1521,8 +1531,7 @@ impl App {
             // Same §2.13 discipline as before: a halted session's
             // `decide` never runs, so the request would change
             // nothing — say so.
-            self.view
-                .flight_notice("SESSION IS READ-ONLY — WARP NOT APPLIED");
+            self.refuse_read_only("WARP NOT APPLIED");
             return;
         }
         if step <= 0 {
@@ -1678,8 +1687,7 @@ impl App {
                 // flight_notice, not the VAB row: a halted session can
                 // be sitting in any mode, and the VAB's notice row is
                 // invisible outside the editor.
-                self.view
-                    .flight_notice("SESSION IS READ-ONLY — LAUNCH REFUSED");
+                self.refuse_read_only("LAUNCH REFUSED");
             } else if let Err(reason) = self.view.launch_craft() {
                 // `launch_refused` already wrote the VAB session's
                 // notice row; forward the same text to the global cue
@@ -1693,8 +1701,7 @@ impl App {
             if self.read_only {
                 // Same §2.13 halt discipline — the command must not
                 // queue silently behind a clock that never ticks again.
-                self.view
-                    .flight_notice("SESSION IS READ-ONLY — MANEUVER NOT APPLIED");
+                self.refuse_read_only("MANEUVER NOT APPLIED");
             } else {
                 self.view
                     .enqueue_command(SourceClass::Ui, MANEUVER_SOURCE_ID, cmd);
@@ -1728,8 +1735,7 @@ impl App {
             return;
         }
         if self.read_only {
-            self.view
-                .flight_notice("SESSION IS READ-ONLY — ACTION NOT APPLIED");
+            self.refuse_read_only("ACTION NOT APPLIED");
             return;
         }
         for cmd in cmds {
@@ -2516,8 +2522,7 @@ impl App {
     /// [`csp_view::flight::StagePlan`] into logged `JettisonPart`s.
     fn stage_press(&mut self) {
         if self.read_only {
-            self.view
-                .flight_notice("SESSION IS READ-ONLY — STAGING NOT APPLIED");
+            self.refuse_read_only("STAGING NOT APPLIED");
         } else {
             self.view.fire_stage();
         }
@@ -2852,8 +2857,7 @@ impl App {
             // control lease.
             KeyAction::RecoverControl if mode != ViewMode::Vab => {
                 if self.read_only {
-                    self.view
-                        .flight_notice("SESSION IS READ-ONLY — RECOVER-CONTROL NOT APPLIED");
+                    self.refuse_read_only("RECOVER-CONTROL NOT APPLIED");
                 } else {
                     self.view.recover_control();
                 }

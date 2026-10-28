@@ -1181,18 +1181,16 @@ impl World {
                     if prior.closed {
                         continue;
                     }
-                    let fraction = if prior.transmitted {
-                        self.experiments
-                            .get(&key.experiment)
-                            .map_or(0.0, |d| (1.0 - d.transmit_ratio).max(0.0))
-                    } else {
-                        1.0
-                    };
-                    let closable = !self
-                        .vessels
-                        .iter()
-                        .any(|(id, o)| *id != vessel && o.science.units_at(key) > 0.0)
-                        && !self.science.projects.values().any(|p| p.key == *key);
+                    // Missing-def banks 0 rather than strand the whole
+                    // recovery on one bad key — the `RecoverData`
+                    // verb's typed-reject policy is the deliberate
+                    // alternative (`recover_fraction`'s doc).
+                    let fraction = crate::research::recover_fraction(
+                        prior.transmitted,
+                        self.experiments.get(&key.experiment),
+                    );
+                    let closable =
+                        !self.key_pooled_elsewhere(vessel, key) && !self.key_escrowed(key);
                     science_bank.push((key.clone(), units * fraction, closable));
                 }
             }

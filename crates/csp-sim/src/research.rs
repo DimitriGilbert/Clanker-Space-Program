@@ -595,6 +595,24 @@ pub(crate) fn drop_vessel_projects(
     });
 }
 
+/// §3.2's recover fraction for a pooled key (C08-F8 — the formula
+/// `apply_recover_data` and the vessel-recovery loop in `economy.rs`
+/// each hand-kept): the `1 − transmit_ratio` remainder for a
+/// previously transmitted key — a blanket over all units pooled at
+/// close, post-transmit re-collection included (see
+/// [`ScienceKeyState::transmitted`]) — else 100%. Missing-`def` is
+/// deliberately caller policy, not unified: the `RecoverData` verb
+/// rejects typed (`recover: no def loaded`), the vessel-recovery
+/// path banks 0 rather than strand the whole recovery on one bad
+/// key.
+pub(crate) fn recover_fraction(transmitted: bool, def: Option<&ExperimentDef>) -> f64 {
+    if transmitted {
+        def.map_or(0.0, |d| (1.0 - d.transmit_ratio).max(0.0))
+    } else {
+        1.0
+    }
+}
+
 /// Lazy-shadow capture for the science book.
 pub(crate) fn shadow_science(world_science: &ScienceState, slot: &mut Option<ScienceState>) {
     if slot.is_none() {
@@ -766,6 +784,54 @@ impl World {
         Ok(())
     }
 
+    /// §3.2's close-safety pair (C08-F8 — `apply_recover_data` and
+    /// the vessel-recovery loop in `economy.rs` each hand-kept it): a
+    /// key may close only while no OTHER vessel still pools data at
+    /// it. Pooled units aboard any vessel but `vessel` block the
+    /// close — the "closed ⇒ no aboard data" invariant
+    /// `restore_science_state` enforces.
+    pub(crate) fn key_pooled_elsewhere(&self, vessel: VesselId, key: &DataKey) -> bool {
+        self.vessels
+            .iter()
+            .any(|(id, o)| *id != vessel && o.science.units_at(key) > 0.0)
+    }
+
+    /// The escrow half of the close-safety pair: a live project
+    /// holding `key` blocks the close — a later finalize would
+    /// return its remnant to a pool the close just sealed.
+    pub(crate) fn key_escrowed(&self, key: &DataKey) -> bool {
+        self.science.projects.values().any(|p| p.key == *key)
+    }
+
+    /// The shared banking tail of `apply_transmit_data` /
+    /// `apply_recover_data` (C08-F8 — was two hand-kept copies):
+    /// `banked` accrues, pays out at `science_funds_per_point`
+    /// (M7-C's milestone edge), posts `ScienceBanked`, and fires the
+    /// §3.6 survey trigger (M7-D — transmit banks returned data,
+    /// recovery closes+returns it; both are `DataBanked`). The
+    /// caller writes the key ledger flag itself — `transmitted` vs
+    /// `closed` is verb-specific.
+    fn bank_science_payout(
+        &mut self,
+        banked: f64,
+        shadow: &mut TickShadow,
+    ) -> Result<(), SimError> {
+        self.science.banked += banked;
+        self.credit_science_payout(banked, shadow);
+        self.notify(
+            crate::reliability::Notification {
+                tick: self.clock.ticks(),
+                vessel: crate::reliability::PROGRAM_VESSEL,
+                node: None,
+                kind: crate::reliability::NotificationKind::ScienceBanked {
+                    micros: (banked * 1.0e6) as u64,
+                },
+            },
+            shadow,
+        );
+        self.contract_notify(&crate::contracts::ContractTrigger::DataBanked, shadow)
+    }
+
     /// `TransmitData` — bank `units·transmit_ratio`, drain
     /// `ElectricCharge`, drop the pooled units at `key`, flag the key
     /// transmitted (§3.2's "recovered-vs-transmitted is tracked per
@@ -820,29 +886,12 @@ impl World {
         }
         v.science.data.retain(|_, m| !m.is_empty());
         let banked = units * ratio;
-        self.science.banked += banked;
         self.science
             .keys
             .entry(key.clone())
             .or_default()
             .transmitted = true;
-        // M7-C: banked science pays out at
-        // `science_funds_per_point` — the milestone edge.
-        self.credit_science_payout(banked, shadow);
-        self.notify(
-            crate::reliability::Notification {
-                tick: self.clock.ticks(),
-                vessel: crate::reliability::PROGRAM_VESSEL,
-                node: None,
-                kind: crate::reliability::NotificationKind::ScienceBanked {
-                    micros: (banked * 1.0e6) as u64,
-                },
-            },
-            shadow,
-        );
-        // M7-D: a transmit banks returned data — the survey-contract
-        // trigger.
-        self.contract_notify(&crate::contracts::ContractTrigger::DataBanked, shadow)
+        self.bank_science_payout(banked, shadow)
     }
 
     /// `RecoverData` — the physical-recovery cashout: 100% of the
@@ -888,30 +937,21 @@ impl World {
         // Recovery closes the key *program-wide* (§3.2): the snapshot
         // restore gate fatals on pooled data under a closed ledger
         // entry, so the close is legal only while nothing elsewhere
-        // still holds the key — pooled units aboard ANY other vessel,
-        // or escrow inside a live project (a later finalize would
-        // return its remnant to a pool the close just sealed). Reject
-        // typed rather than silently strand: transmit the other
-        // vessel's record, or finish the project, first.
-        if self
-            .vessels
-            .iter()
-            .any(|(id, other)| *id != vessel && other.science.units_at(key) > 0.0)
-        {
+        // still holds the key (see `key_pooled_elsewhere` /
+        // `key_escrowed`). Reject typed rather than silently strand:
+        // transmit the other vessel's record, or finish the project,
+        // first.
+        if self.key_pooled_elsewhere(vessel, key) {
             return Err(SimError::Recoverable(
                 "recover: data at key aboard another vessel",
             ));
         }
-        if self.science.projects.values().any(|p| p.key == *key) {
+        if self.key_escrowed(key) {
             return Err(SimError::Recoverable(
                 "recover: a live project still holds the key",
             ));
         }
-        let fraction = if prior.transmitted {
-            (1.0 - def.transmit_ratio).max(0.0)
-        } else {
-            1.0
-        };
+        let fraction = recover_fraction(prior.transmitted, Some(def));
         self.shadow_science(shadow);
         self.shadow_vessels(shadow);
         let v = self
@@ -923,27 +963,8 @@ impl World {
         }
         v.science.data.retain(|_, m| !m.is_empty());
         let banked = units * fraction;
-        self.science.banked += banked;
-        let entry = self.science.keys.entry(key.clone()).or_default();
-        entry.closed = true;
-        // M7-C: banked science pays out at
-        // `science_funds_per_point` — the milestone edge.
-        self.credit_science_payout(banked, shadow);
-        self.notify(
-            crate::reliability::Notification {
-                tick: self.clock.ticks(),
-                vessel: crate::reliability::PROGRAM_VESSEL,
-                node: None,
-                kind: crate::reliability::NotificationKind::ScienceBanked {
-                    micros: (banked * 1.0e6) as u64,
-                },
-            },
-            shadow,
-        );
-        // M7-D: a recovery closes+returns the key — the survey
-        // trigger.
-        self.contract_notify(&crate::contracts::ContractTrigger::DataBanked, shadow)?;
-        Ok(())
+        self.science.keys.entry(key.clone()).or_default().closed = true;
+        self.bank_science_payout(banked, shadow)
     }
 
     /// `StartResearch` — create the project, escrow the pooled data at

@@ -932,19 +932,13 @@ impl World {
                 rec.thrust_factor = thrust_factor_for(rec, &cfg);
             }
         }
-        if !burns.is_empty() {
-            self.shadow_tech(shadow);
-            for (family, burn_s, in_atmo) in burns {
-                let rate = if in_atmo {
-                    self.reliability_cfg.flight_units_per_s_atmosphere
-                } else {
-                    self.reliability_cfg.flight_units_per_s_vacuum
-                };
-                self.tech
-                    .credit_qualification(family, burn_s * rate, 0.0, 0)?;
-            }
-        }
-        Ok(())
+        crate::drain_burn_credit(
+            &mut self.tech,
+            &self.reliability_cfg,
+            shadow,
+            &mut burns,
+            false,
+        )
     }
 
     /// The `Reliability` slot (§2.6.5 index 8) — publish dormant
@@ -1164,26 +1158,14 @@ impl World {
             // ticks past the true crossing, and keeping the overshoot
             // would queue a catch-up cascade of backlog renewals
             // (Λ ≫ θ) instead of one clean spaced renewal.
-            rec.usage.hazard_integral = rec.theta;
-            if !rec.failures.contains(&mode) {
-                rec.failures.push(mode);
-            }
-            rec.renewal_count += 1;
-            // The renewal threshold: θₖ = θₖ₋₁ + (−ln Uₖ), `k` the
-            // failure ordinal — same stream, next counter (module
-            // doc). `renewal_count`, not `failures.len()`: a repeat
-            // mode must still advance the draw series.
-            let u = uniform(
-                self.save_seed,
-                StreamKey {
-                    tag: StreamTag::Reliability,
-                    entity: rec.instance.0,
-                    counter: rec.renewal_count,
-                },
-            );
-            // Same U = 0 guard as `fresh_record` — a +inf θ here is
-            // serialized and then poisons every state hash forever.
-            rec.theta += -libm::log(u.max(f64::MIN_POSITIVE));
+            consume_theta_and_renew(rec, mode, self.save_seed);
+            // The effect half is NOT shared with
+            // `apply_mode_to_record`: this per-mode match sets
+            // `thrust_factor` from the just-fired mode alone, where
+            // the bubble path recomputes it from the whole `failures`
+            // list — a record carrying `IgnitionFailure` that fires
+            // `DegradedThrust` dormant reads degraded here but 0
+            // there (C10-F4's verified divergence, kept deliberately).
             match mode {
                 FailureMode::DegradedThrust => {
                     rec.thrust_factor = self.reliability_cfg.degraded_thrust_factor;
@@ -1400,20 +1382,36 @@ fn apply_mode_to_record(
     save_seed: u64,
     cfg: &ReliabilityConfig,
 ) {
+    consume_theta_and_renew(rec, mode, save_seed);
+    if mode == FailureMode::IgnitionFailure {
+        rec.burning = false;
+        rec.misfire = true;
+    }
+    rec.thrust_factor = thrust_factor_for(rec, cfg);
+}
+
+/// The anti-stall renewal core the dormant firing
+/// ([`World::apply_failure_at`]) and the in-bubble crossing
+/// ([`apply_mode_to_record`]) share (C10-F4 — was two hand-kept
+/// bodies): push the mode if absent, consume Λ at the crossed θ (the
+/// part's hazard clock restarts at the threshold, so the next leg is
+/// exactly the drawn `−ln Uₖ` — a *late* fire can't queue a catch-up
+/// cascade of backlog renewals, and a large per-tick accrual stride
+/// can't cascade repeated crossings while Λ ≥ θ), then draw the next
+/// threshold `θₖ = θₖ₋₁ + (−ln Uₖ)` on the same `{RELIABILITY}`
+/// stream. `renewal_count`, not `failures.len()`: the dedup'd mode
+/// list stalls on repeats, the draw series must not. The
+/// `MIN_POSITIVE` clamp is the `fresh_record` U = 0 guard — a +inf θ
+/// is serialized and poisons every state hash forever. The effect
+/// half (`thrust_factor`/`misfire`/`burning`) stays caller-side —
+/// the two sites' writes are deliberately different (see
+/// `apply_failure_at`'s match).
+fn consume_theta_and_renew(rec: &mut PartReliability, mode: FailureMode, save_seed: u64) {
     if !rec.failures.contains(&mode) {
         rec.failures.push(mode);
     }
-    // The crossing CONSUMES Λ — the same convention the dormant
-    // firing's `apply_failure_at` uses: Λ stamps to the crossed θ
-    // and the next leg is exactly the drawn `−ln Uₖ`. Keeping the
-    // per-tick overshoot instead would let a large accrual stride
-    // cascade repeated crossings while Λ ≥ θ.
     rec.usage.hazard_integral = rec.theta;
     rec.renewal_count += 1;
-    // `renewal_count`, not `failures.len()` — the dedup'd mode list
-    // stalls on repeats; the draw series must not. The `MIN_POSITIVE`
-    // clamp is the `fresh_record` U = 0 guard (a +inf θ bricks the
-    // state hash permanently).
     let u = uniform(
         save_seed,
         StreamKey {
@@ -1423,11 +1421,6 @@ fn apply_mode_to_record(
         },
     );
     rec.theta += -libm::log(u.max(f64::MIN_POSITIVE));
-    if mode == FailureMode::IgnitionFailure {
-        rec.burning = false;
-        rec.misfire = true;
-    }
-    rec.thrust_factor = thrust_factor_for(rec, cfg);
 }
 
 /// What one bubble tick's reliability pass hands back — the work

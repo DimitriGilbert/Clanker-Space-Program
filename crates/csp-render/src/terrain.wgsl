@@ -193,6 +193,10 @@ const MIE_BETA: vec3<f32> = vec3<f32>(2.9e-6, 2.9e-6, 2.9e-6); // 1/m, grey aero
 // "white worm" streaks) and let ~0.4-linear albedos land at ~0.75
 // sRGB (the washed-out pale terrain). The curve compresses the top
 // octave instead of clipping it, so texture detail survives.
+// C16-F3: verbatim copies live in flight.wgsl and vab.wgsl — the
+// build has no WGSL include/preprocessor (each module loads via
+// `include_str!`), so keep the bodies in sync until a shared-source
+// mechanism lands.
 fn tone_map(c: vec3<f32>) -> vec3<f32> {
     let a = 2.51;
     let b = 0.03;

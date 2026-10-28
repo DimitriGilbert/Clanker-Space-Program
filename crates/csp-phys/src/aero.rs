@@ -199,6 +199,29 @@ impl ConfigMask {
     }
 }
 
+/// The mask remap convention both graph surgeries share (C10-F4 —
+/// the latch merge's two-source→one rebuild and the undock split's
+/// subset rebuild each hand-kept the u64/≥64 rule): the mask is
+/// positional over the TARGET graph's ascending [`PartNodeId`]
+/// order, so rebuilding a graph means re-asking each target node's
+/// bit of the source mask(s). `source_bit` answers the source bit
+/// for the node at each target position. Because [`ConfigMask`] is a
+/// u64, [`ConfigMask::active`] reads source positions ≥ 64 as set,
+/// and a target position ≥ 64 has no bit to land in — the write is
+/// skipped rather than overflowing the shift.
+pub fn remap_config_mask(
+    target: impl IntoIterator<Item = PartNodeId>,
+    mut source_bit: impl FnMut(PartNodeId) -> bool,
+) -> ConfigMask {
+    let mut mask = 0u64;
+    for (j, id) in target.into_iter().enumerate() {
+        if j < 64 && source_bit(id) {
+            mask |= 1u64 << j;
+        }
+    }
+    ConfigMask(mask)
+}
+
 /// A direction-hull triangle: the three direction-set vertices plus
 /// the barycentric solve precomputation. For a unit query direction
 /// `w`, `wᵢ = (w·eᵢ)·inv_det` are the un-normalized barycentric
