@@ -17,7 +17,12 @@
     size_m: (x: 1.25, y: 1.25, z: 1.4),
     build_resources: [("metal", 30.0), ("composite", 8.0)],
     attach_nodes: [
-        (id: "top", position_m: (x: 0.0, y: 0.0, z: 0.7), direction: (x: 0.0, y: 0.0, z: 1.0), diameter_m: 1.25),
+        // KSP-style inline engine: the tank mounts `top`, and a
+        // decoupler or the next stage's tank may stack *beneath* the
+        // nozzle plane through `bottom` (the canister precedent —
+        // both faces are 1.25-class stack interfaces).
+        (id: "top",    position_m: (x: 0.0, y: 0.0, z: 0.7),  direction: (x: 0.0, y: 0.0, z: 1.0),  diameter_m: 1.25),
+        (id: "bottom", position_m: (x: 0.0, y: 0.0, z: -0.7), direction: (x: 0.0, y: 0.0, z: -1.0), diameter_m: 1.25),
     ],
     scale: None,
     collider: Cylinder(radius_m: 0.625, half_height_m: 0.7),

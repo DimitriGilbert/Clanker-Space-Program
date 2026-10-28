@@ -4249,6 +4249,66 @@ mod tests {
         );
     }
 
+    /// The authored-catalog regression for the reported bug: an
+    /// engine's `bottom` node is a real snap target, so the VAB's
+    /// action channel hangs a decoupler *beneath* the booster engine
+    /// (parent `bottom` ← child `top`) and the stack keeps growing
+    /// below it. `mini_catalog`'s engine is intentionally top-only;
+    /// this drives the shipped `data/parts` defs the bug was filed
+    /// against.
+    #[test]
+    fn attach_auto_stacks_a_decoupler_beneath_an_engine() {
+        let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let catalog = csp_data::load_parts(&data.join("parts")).unwrap();
+        let resources = csp_data::load_resources(&data.join("resources.ron")).unwrap();
+        let mut vab = VabSession::new(catalog, resources);
+
+        // pod → s160 tank → sparc engine — the authored booster stack.
+        vab.apply(VabAction::SetRoot(PartId::from("csp.pod.mk1")))
+            .unwrap();
+        let pod = vab.session().root().unwrap();
+        vab.apply(VabAction::AttachAuto {
+            part: PartId::from("csp.tank.s160"),
+            parent: pod,
+        })
+        .unwrap();
+        let tank = vab.selected().unwrap();
+        vab.apply(VabAction::AttachAuto {
+            part: PartId::from("csp.engine.sparc"),
+            parent: tank,
+        })
+        .unwrap();
+        let eng = vab.selected().unwrap();
+
+        // The bug's attach: the decoupler must find the engine's
+        // `bottom` — before the node existed this was refused
+        // `NoCompatibleAttach` (the engine's only node was bound).
+        vab.apply(VabAction::AttachAuto {
+            part: PartId::from("csp.decoupler.s125"),
+            parent: eng,
+        })
+        .unwrap();
+        let dec = vab.selected().unwrap();
+        let dec_node = vab.session().node(dec).unwrap();
+        let dec_edge = dec_node.edge().unwrap();
+        assert_eq!(dec_edge.parent, eng);
+        assert_eq!(dec_edge.parent_node, "bottom");
+        assert_eq!(dec_edge.child_node, "top");
+        assert!(
+            dec_node.transform().offset.z < 0.0,
+            "decoupler above its engine: {:?}",
+            dec_node.transform()
+        );
+
+        // And the lower stage keeps stacking below the decoupler.
+        vab.apply(VabAction::AttachAuto {
+            part: PartId::from("csp.tank.s320"),
+            parent: dec,
+        })
+        .unwrap();
+        assert_eq!(vab.session().len(), 5);
+    }
+
     /// Stale-staged-map regression — `apply` marks the session dirty
     /// WITHOUT recomputing, so inside the same frame `body_xforms` can
     /// still describe a pre-mutation tree. The mutation staged here

@@ -392,3 +392,56 @@ fn starter_craft_bom_sets_the_site_fuse() {
         "the starter-craft launch fuse moved — re-check §3.5 stockpile sizing"
     );
 }
+
+/// KSP-style stacking contract (§3.1 `attach_nodes`): an engine is an
+/// *inline* part, not a stack terminal — its `top` mates the tank
+/// above and a `bottom` node must exist so a decoupler or the next
+/// stage's tank can stack beneath the nozzle plane. The VAB offers
+/// every authored node, so an engine with no `bottom` can never grow
+/// downward — this is the authored-set pin for that shape: every
+/// Engine-category part declares `top` + `bottom` on the ±z faces
+/// with the mated-direction convention (`bottom` faces −z to a
+/// child's `top` +z) and matching size classes.
+#[test]
+fn engine_parts_offer_a_bottom_stack_node() {
+    let loaded = parts();
+    let engines: Vec<&PartDef> = loaded
+        .parts
+        .iter()
+        .map(|p| &p.def)
+        .filter(|d| d.category == csp_data::PartCategory::Engine)
+        .collect();
+    assert!(
+        engines.len() >= 2,
+        "expected the authored engine pair — got {}",
+        engines.len()
+    );
+    for engine in engines {
+        let node = |id: &str| {
+            engine
+                .attach_nodes
+                .iter()
+                .find(|n| n.id == id)
+                .unwrap_or_else(|| panic!("{} has no '{id}' attach node", engine.id))
+        };
+        let top = node("top");
+        let bottom = node("bottom");
+        assert_eq!(
+            bottom.direction,
+            csp_core::DVec3::new(0.0, 0.0, -1.0),
+            "{} 'bottom' node must face −z to mate a child's 'top'",
+            engine.id
+        );
+        assert!(
+            bottom.position_m.z < 0.0,
+            "{} 'bottom' node sits at z = {} — off the −z face",
+            engine.id,
+            bottom.position_m.z
+        );
+        assert_eq!(
+            bottom.diameter_m, top.diameter_m,
+            "{} stack nodes disagree on size class",
+            engine.id
+        );
+    }
+}

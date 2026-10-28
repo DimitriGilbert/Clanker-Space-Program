@@ -3922,4 +3922,94 @@ mod tests {
                 if *node == pod && node_id == "bottom"
         )));
     }
+
+    /// Authored-data regression for the "nothing stacks beneath an
+    /// engine" report: the fabricated `stack_catalog` engine always
+    /// carried top+bottom, but the authored `csp.engine.*` defs
+    /// declared `top` only — an engine could never parent a lower
+    /// stage in the VAB. Now the canonical two-stage build — a
+    /// decoupler hung on the booster engine's `bottom` — must attach,
+    /// validate launchable, resolve, and weld.
+    #[test]
+    fn authored_engine_bottom_node_stacks_and_welds() {
+        let data = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let defs = csp_data::load_parts(&data.join("parts")).unwrap();
+        let res = csp_data::load_resources(&data.join("resources.ron")).unwrap();
+
+        let mut s = CraftSession::with_name("two-stage");
+        let pod = s.add_root(&defs, stock("csp.pod.mk1")).unwrap();
+        let tank = s
+            .add_part(
+                &defs,
+                stock("csp.tank.s160"),
+                AttachEdge::new(pod, "bottom", "top"),
+            )
+            .unwrap();
+        let eng = s
+            .add_part(
+                &defs,
+                stock("csp.engine.sparc"),
+                AttachEdge::new(tank, "bottom", "top"),
+            )
+            .unwrap();
+        // The bug's edge — the decoupler's `top` against the engine's
+        // `bottom` — was `UnknownAttachNode` before the node existed.
+        let dec = s
+            .add_part(
+                &defs,
+                stock("csp.decoupler.s125"),
+                AttachEdge::new(eng, "bottom", "top"),
+            )
+            .unwrap();
+        let lower_tank = s
+            .add_part(
+                &defs,
+                stock("csp.tank.s320"),
+                AttachEdge::new(dec, "bottom", "top"),
+            )
+            .unwrap();
+        s.add_part(
+            &defs,
+            stock("csp.engine.ember"),
+            AttachEdge::new(lower_tank, "bottom", "top"),
+        )
+        .unwrap();
+
+        // Snap geometry: engine bottom −0.9 − decoupler top +0.125 →
+        // the decoupler hangs 1.025 m below the engine's origin,
+        // unrotated (bottom −z mates top +z with no twist).
+        let t = s.node(dec).unwrap().transform();
+        assert!(
+            (t.offset.z + 1.025).abs() < 1e-12,
+            "decoupler did not hang under the engine: {t:?}"
+        );
+        assert_eq!(t.rotation, DQuat::IDENTITY);
+
+        // The two-tier VAB gate agrees the craft is launchable — the
+        // mid-stack engine is no longer a dead end.
+        let v = s.validate(&defs);
+        assert!(v.errors.is_empty(), "validation errors: {:?}", v.errors);
+        assert!(v.is_launchable());
+
+        // §2.4 Stage 1: the graph resolves and welds — both engines'
+        // thrust sites land in the body.
+        let (graph, built) = s.to_part_graph(&defs).unwrap();
+        let eff = crate::resolve::resolve_parts(
+            &defs,
+            &built,
+            &res,
+            &crate::resolve::FamilyQualifications::new(),
+            None,
+        )
+        .unwrap();
+        let parts: Vec<crate::WeldPart> = eff.iter().map(|e| e.weld_input.clone()).collect();
+        let body = crate::weld::weld(&graph, &parts).unwrap();
+        assert_eq!(body.part_index.len(), 6);
+        let thrust_sites = body
+            .force_sites
+            .iter()
+            .filter(|f| f.kind == crate::ForceSiteKind::Thrust)
+            .count();
+        assert_eq!(thrust_sites, 2, "both engines' thrust sites welded");
+    }
 }
