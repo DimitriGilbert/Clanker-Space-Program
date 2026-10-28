@@ -2432,7 +2432,20 @@ impl View {
         // the EDGE (`had_vessels`): a vessel-free world from boot
         // keeps Flight until the seed delivers, and Map/VAB keep
         // their own surfaces — only an empty Flight scene is dead.
-        if had_vessels && self.sim.vessels().is_empty() && self.mode() == ViewMode::Flight {
+        // The pending-order carve-out: an empty arena with an
+        // `ActiveBuild` still on the books is a delivery in flight,
+        // not a dead scene — `launch_craft`'s own pad-clearing
+        // `RecoverVessel` drains the occupant in the SAME step that
+        // armed the order, and bouncing Flight→Vab there would hide
+        // the launch behind a "nothing happened" (the build lands
+        // ~build_ticks later with nobody watching). If the order
+        // rejected at drain, `builds()` is empty and the bounce still
+        // catches the truly-dead scene.
+        if had_vessels
+            && self.sim.vessels().is_empty()
+            && self.sim.builds().is_empty()
+            && self.mode() == ViewMode::Flight
+        {
             self.set_mode(ViewMode::Vab);
             self.vab_event(vab::VabEvent::Notice(
                 "vessel recovered — the arena is empty; back in the VAB".to_string(),

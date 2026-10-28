@@ -13,6 +13,11 @@
 //!   at the recovery efficiency, so the launch→recover loop is
 //!   stockpile-neutral at the pad instead of permanently sinking the
 //!   BOM (~11 cycles to a hard "insufficient metal" before).
+//! - `launch_craft`'s own pad-clearing `RecoverVessel` must not trip
+//!   that same edge: a pending `ActiveBuild` is a delivery in flight,
+//!   not a dead scene — the player stays in Flight to watch it land.
+//!   And the drained-stockpile refusal stays in the VAB with the
+//!   reason on the notice row + the global cue channel.
 
 #![cfg(not(target_arch = "wasm32"))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -42,6 +47,118 @@ fn deliver_seeded(view: &mut View) -> csp_sim::VesselId {
         "the starter seed never delivered"
     );
     *view.sim.vessels().keys().next().unwrap()
+}
+
+/// Seed + step until the starter is surface-latched on the pad —
+/// the state a real VAB launch iterates on (the pad-occupant path).
+fn deliver_latched(view: &mut View) -> csp_sim::VesselId {
+    view.seed_starter_craft().expect("starter seed");
+    for _ in 0..80 {
+        frame(view, 8);
+        if view
+            .sim
+            .vessels()
+            .values()
+            .any(|v| matches!(v.state, csp_sim::VesselState::SurfaceLatched(_)))
+        {
+            break;
+        }
+    }
+    let (id, v) = view.sim.vessels().iter().next().unwrap();
+    assert!(
+        matches!(v.state, csp_sim::VesselState::SurfaceLatched(_)),
+        "starter never latched: {:?}",
+        v.state
+    );
+    *id
+}
+
+/// The launch path's own pad-clearing `RecoverVessel` must NOT trip
+/// the non-empty→empty arena edge: the order it armed is a delivery
+/// in flight, not a dead scene, so the player stays in Flight to
+/// watch it land (the "nothing happened" regression from fe4054a —
+/// the bounce fired in the SAME frame the launch switched modes).
+#[test]
+fn launch_with_parked_build_stays_in_flight() {
+    let mut view = View::new().expect("data/ load");
+    let seeded = deliver_latched(&mut view);
+    assert_eq!(view.flight_focus(), Some(seeded));
+
+    view.launch_craft().expect("launch must place the order");
+    // The launch arms RecoverVessel(occupant) + ManufactureCraft, then
+    // flips to Flight BEFORE the drain — like a real click.
+    assert_eq!(view.mode(), ViewMode::Flight, "launch_craft armed Flight");
+
+    // One frame — the drain consumes both commands.
+    frame(&mut view, 8);
+
+    assert_eq!(view.sim.builds().len(), 1, "the build order must land");
+    assert!(view.sim.vessels().is_empty(), "the occupant recovery ran");
+    assert_eq!(
+        view.mode(),
+        ViewMode::Flight,
+        "the pending build suppresses the empty-arena bounce — the \
+         delivery is coming, the scene is not dead"
+    );
+
+    // The delivery then lands in Flight where the player watches it.
+    let complete = view.sim.builds().values().next().unwrap().complete_tick;
+    let now = view.sim.clock().ticks();
+    frame(&mut view, complete - now + 1);
+    assert_eq!(view.sim.vessels().len(), 1, "delivery materialized");
+    assert_eq!(view.mode(), ViewMode::Flight);
+}
+
+/// The other side of the launch affordance: a stockpile that cannot
+/// pay the BOM refuses BEFORE the enqueues/mode switch, keeping the
+/// player in the VAB with the reason on the notice row (and the
+/// global cue channel) instead of half-launching.
+#[test]
+fn launch_with_drained_stockpile_refuses_loudly() {
+    let mut view = View::new().expect("data/ load");
+    let _seeded = deliver_latched(&mut view);
+    // Drain the pad's metal by placing build orders until one refuses
+    // — the pre-refund-fix soft-lock save state (~12 starter BOMs vs
+    // the 2000-metal authored stockpile).
+    let mut err = None;
+    for _ in 0..40 {
+        match view.launch_craft() {
+            Ok(()) => frame(&mut view, 8), // drain the order → debit the BOM
+            Err(e) => {
+                err = Some(e);
+                break;
+            }
+        }
+    }
+    let err = err.expect("the stockpile never ran dry in 40 orders");
+    assert!(err.contains("insufficient"), "{err}");
+    // Re-press from VAB like the real player: the refusal must keep
+    // them there with a persistent notice. Mirror what
+    // `App::handle_ui_outbox` does on `Err` — forward to the global
+    // cue channel.
+    view.set_mode(ViewMode::Vab);
+    match view.launch_craft() {
+        Ok(()) => panic!("still drained, must still refuse"),
+        Err(reason) => view.flight_notice(reason.to_uppercase()),
+    }
+    assert_eq!(view.mode(), ViewMode::Vab, "a refused launch keeps VAB");
+    // Drain the staged VabEvent::Notice into the session like Input does.
+    view.begin_frame();
+    view.end_frame();
+    let notice = view.with_vab_session(|v| v.notice().map(str::to_string));
+    assert!(
+        notice
+            .as_deref()
+            .is_some_and(|n| n.contains("insufficient")),
+        "the refusal must persist on the VAB notice row: {notice:?}"
+    );
+    // And the global cue channel carried it too (transient, ~90 frames).
+    let cues = &view.world.resource::<csp_view::flight::FlightSfx>().cues;
+    assert!(
+        cues.iter()
+            .any(|c| c.text.to_lowercase().contains("insufficient")),
+        "the refusal must reach the global cue channel: {cues:?}"
+    );
 }
 
 /// The void regression, inverted into its fix's contract: recovering
