@@ -227,7 +227,7 @@ use csp_core::{DQuat, DVec3, SimTime, TICK_HZ};
 use csp_data::{AtmosphereDef, BodyDef};
 
 use crate::backend::{BodyHandle, Contact, Hit, JointDef, JointKind, PhysicsBackend, Ray};
-use crate::part::{ForceSiteKind, WeldPart};
+use crate::part::{ForceSite, ForceSiteKind, WeldPart};
 use crate::tensor::SymMat3;
 use crate::weld::{DecelSite, WeldedBody};
 
@@ -712,19 +712,23 @@ fn friction_basis(n_world: DVec3) -> (DVec3, DVec3) {
 /// cached world-frame `rot·ang_vel` — kept in sync because the pair
 /// constraints evaluate relative point velocities in world frame).
 /// The Gauss–Seidel write-back; `rot` does not change inside the
-/// velocity pass so every cached frame stays exact.
+/// velocity pass so every cached frame stays exact. `inv_i`/`r_body`
+/// arrive as values rather than a `&Constraint` because the caller's
+/// λ bookkeeping mut-borrows that constraint's impulse fields
+/// simultaneously — the solver needs the geometry, not the row state.
 fn apply_impulse(
     b: &mut WeldedBody,
     vel_b: &mut DVec3,
     omega_w: &mut DVec3,
-    c: &Constraint,
+    inv_i: SymMat3,
+    r_body: DVec3,
     dir_body: DVec3,
     d_lambda: f64,
 ) {
     let j_body = dir_body * d_lambda;
     *vel_b = *vel_b + j_body / b.mass_kg;
     b.vel = b.vel + b.rot.rotate(j_body) / b.mass_kg;
-    let dw_body = c.inv_i.mul_vec(c.r_body.cross(j_body));
+    let dw_body = inv_i.mul_vec(r_body.cross(j_body));
     b.ang_vel = b.ang_vel + dw_body;
     *omega_w = *omega_w + b.rot.rotate(dw_body);
 }
@@ -734,8 +738,84 @@ fn apply_impulse(
 /// caller's cached body-frame linear velocity (the solve caches it
 /// per body rather than quaternion-rotating `vel` on every
 /// evaluation); `v_surf` is `ZERO` on a non-rotating world.
-fn rel_point_velocity_body(vel_b: DVec3, b: &WeldedBody, c: &Constraint) -> DVec3 {
-    vel_b + b.ang_vel.cross(c.r_body) - c.surface_vel_body
+fn rel_point_velocity_body(
+    vel_b: DVec3,
+    ang_vel: DVec3,
+    r_body: DVec3,
+    surface_vel_body: DVec3,
+) -> DVec3 {
+    vel_b + ang_vel.cross(r_body) - surface_vel_body
+}
+
+/// One side of a **two-body** constraint ([`PairConstraint`] or
+/// [`JointConstraint`]): everything the inverse effective mass needs
+/// from that body, captured at generation pose. A latched body is a
+/// static collider for the tick — `inv_m = 0`, `inv_i = ZERO` — so
+/// its side of the constraint still solves (it is the immovable
+/// anchor the free side works against) while taking no impulse.
+/// Shared so the pair and joint paths cannot drift on the latched
+/// side's contribution — the boilerplate was byte-identical at both
+/// generation sites.
+#[derive(Clone, Copy)]
+struct ConstraintSide {
+    /// `settle.latched` at generation.
+    latched: bool,
+    /// Inverse mass — `0` when latched (static for the tick).
+    inv_m: f64,
+    /// Inverse inertia, the body's own frame — `ZERO` when latched or
+    /// for a singular tensor (no angular response).
+    inv_i: SymMat3,
+    /// Rotation at generation — rotates `inv_i` into the world frame
+    /// the two bodies share.
+    rot: DQuat,
+    /// Lever arm from the body's CoM to the shared constraint point,
+    /// world frame — frozen across the velocity solve (`rot` does not
+    /// change inside it), same discipline as the ground manifold.
+    r: DVec3,
+}
+
+impl ConstraintSide {
+    /// The side's solver view for `b` at the world-frame constraint
+    /// point `p_world`.
+    fn at(b: &WeldedBody, p_world: DVec3) -> Self {
+        let latched = b.settle.latched;
+        Self {
+            latched,
+            inv_m: if latched { 0.0 } else { 1.0 / b.mass_kg },
+            inv_i: if latched {
+                SymMat3::ZERO
+            } else {
+                b.inertia_local.inverse().unwrap_or(SymMat3::ZERO)
+            },
+            rot: b.rot,
+            r: p_world - b.com_world(),
+        }
+    }
+
+    /// This side's angular term of the inverse effective mass along
+    /// `dir`, world frame: `dir · (I_w⁻¹(r×dir) × r)` with
+    /// `I_w⁻¹ x = rot·(inv_i·(rot̄·x))` — the same `K` the ground
+    /// constraint computes in body frame, evaluated where the pair
+    /// shares a frame.
+    fn ang_term(&self, dir: DVec3) -> f64 {
+        let rd = self.r.cross(dir);
+        self.rot
+            .rotate(self.inv_i.mul_vec(self.rot.conjugate().rotate(rd)))
+            .cross(self.r)
+            .dot(dir)
+    }
+}
+
+/// Two-body inverse effective mass along `dir`:
+/// `1/(inv_m_a + inv_m_b + ang_a + ang_b)`, `0` for a singular `K`
+/// (PGS multiplies the velocity error by the stored reciprocal, so a
+/// zero is "no response", never a divide-by-zero). The two sides'
+/// angular terms are [`ConstraintSide::ang_term`]; shared by
+/// [`PairConstraint::new`] and [`JointConstraint::new`], which used to
+/// carry byte-identical `ang`/`effective` closures.
+fn two_body_effective_mass(a: &ConstraintSide, b: &ConstraintSide, dir: DVec3) -> f64 {
+    let k = a.inv_m + b.inv_m + a.ang_term(dir) + b.ang_term(dir);
+    if k > 0.0 { 1.0 / k } else { 0.0 }
 }
 
 /// One vessel-vessel contact constraint — a vertex of `a`'s compound
@@ -839,38 +919,11 @@ impl PairConstraint {
         has_record: bool,
     ) -> (Self, Contact, Contact) {
         let (t1, t2) = friction_basis(normal_world);
-        let r_a = pos_world - a.com_world();
-        let r_b = pos_world - b.com_world();
-        let a_latched = a.settle.latched;
-        let b_latched = b.settle.latched;
-        let inv_m_a = if a_latched { 0.0 } else { 1.0 / a.mass_kg };
-        let inv_m_b = if b_latched { 0.0 } else { 1.0 / b.mass_kg };
-        let inv_i_a = if a_latched {
-            SymMat3::ZERO
-        } else {
-            a.inertia_local.inverse().unwrap_or(SymMat3::ZERO)
-        };
-        let inv_i_b = if b_latched {
-            SymMat3::ZERO
-        } else {
-            b.inertia_local.inverse().unwrap_or(SymMat3::ZERO)
-        };
-        // Angular term of the inverse effective mass along `dir`,
-        // world frame: `dir · (I_w⁻¹(r×dir) × r)` with
-        // `I_w⁻¹ x = rot·(inv_i·(rot̄·x))` — the same `K` the ground
-        // constraint computes in body frame, evaluated where the pair
-        // shares a frame.
-        let ang = |rot: DQuat, inv_i: SymMat3, r: DVec3, dir: DVec3| {
-            let rd = r.cross(dir);
-            rot.rotate(inv_i.mul_vec(rot.conjugate().rotate(rd)))
-                .cross(r)
-                .dot(dir)
-        };
-        let effective = |dir: DVec3| {
-            let k =
-                inv_m_a + inv_m_b + ang(a.rot, inv_i_a, r_a, dir) + ang(b.rot, inv_i_b, r_b, dir);
-            if k > 0.0 { 1.0 / k } else { 0.0 }
-        };
+        // Each body's solver view at the shared contact point — the
+        // latched/lever-arm/inverse-mass boilerplate lives once in
+        // `ConstraintSide` (shared with `JointConstraint::new`).
+        let side_a = ConstraintSide::at(a, pos_world);
+        let side_b = ConstraintSide::at(b, pos_world);
         let constraint = Self {
             a: a_index as u32,
             b: b_index as u32,
@@ -882,15 +935,15 @@ impl PairConstraint {
             n: normal_world,
             t1,
             t2,
-            r_a,
-            r_b,
-            kn: effective(normal_world),
-            kt1: effective(t1),
-            kt2: effective(t2),
-            inv_i_a,
-            inv_i_b,
-            a_latched,
-            b_latched,
+            r_a: side_a.r,
+            r_b: side_b.r,
+            kn: two_body_effective_mass(&side_a, &side_b, normal_world),
+            kt1: two_body_effective_mass(&side_a, &side_b, t1),
+            kt2: two_body_effective_mass(&side_a, &side_b, t2),
+            inv_i_a: side_a.inv_i,
+            inv_i_b: side_b.inv_i,
+            a_latched: side_a.latched,
+            b_latched: side_b.latched,
             target_vn,
             has_record,
             lambda_n: 0.0,
@@ -958,35 +1011,6 @@ fn apply_two_body_impulse(
     }
 }
 
-/// The world-frame impulse `j` of a [`PairConstraint`]: `+j` on `a`,
-/// `−j` on `b` — the equal-and-opposite two-body write-back. Updates
-/// `vel` (world) directly, plus the solve's `vel_body`/`omega_world`
-/// caches (the ground constraints read the former; the pair
-/// constraints the latter — both must reflect every write, latched
-/// bodies excepted).
-fn apply_pair_impulse(
-    bodies: &mut [WeldedBody],
-    vel_body: &mut [DVec3],
-    omega_world: &mut [DVec3],
-    c: &PairConstraint,
-    j: DVec3,
-) {
-    apply_two_body_impulse(
-        bodies,
-        vel_body,
-        omega_world,
-        c.a as usize,
-        c.b as usize,
-        c.r_a,
-        c.r_b,
-        c.inv_i_a,
-        c.inv_i_b,
-        c.a_latched,
-        c.b_latched,
-        j,
-    );
-}
-
 /// One §2.4 transient joint constraint — a **bilateral** three-row PGS
 /// constraint in the fixed canonical basis (X, Y, Z), world frame like
 /// [`PairConstraint`]. It drives the anchors' relative point velocity
@@ -1048,33 +1072,11 @@ impl JointConstraint {
         }
         let p_a = a.pos + a.rot.rotate(joint.local_anchor_a);
         let p_b = b.pos + b.rot.rotate(joint.local_anchor_b);
-        let r_a = p_a - a.com_world();
-        let r_b = p_b - b.com_world();
-        let inv_m_a = if a_latched { 0.0 } else { 1.0 / a.mass_kg };
-        let inv_m_b = if b_latched { 0.0 } else { 1.0 / b.mass_kg };
-        let inv_i_a = if a_latched {
-            SymMat3::ZERO
-        } else {
-            a.inertia_local.inverse().unwrap_or(SymMat3::ZERO)
-        };
-        let inv_i_b = if b_latched {
-            SymMat3::ZERO
-        } else {
-            b.inertia_local.inverse().unwrap_or(SymMat3::ZERO)
-        };
-        // Angular term of the inverse effective mass along `dir`,
-        // world frame — identical to `PairConstraint::new`'s `ang`.
-        let ang = |rot: DQuat, inv_i: SymMat3, r: DVec3, dir: DVec3| {
-            let rd = r.cross(dir);
-            rot.rotate(inv_i.mul_vec(rot.conjugate().rotate(rd)))
-                .cross(r)
-                .dot(dir)
-        };
-        let effective = |dir: DVec3| {
-            let k =
-                inv_m_a + inv_m_b + ang(a.rot, inv_i_a, r_a, dir) + ang(b.rot, inv_i_b, r_b, dir);
-            if k > 0.0 { 1.0 / k } else { 0.0 }
-        };
+        // The anchor points play the contact-point role: same
+        // `ConstraintSide` lever-arm/latched boilerplate and the same
+        // `two_body_effective_mass` as `PairConstraint::new`.
+        let side_a = ConstraintSide::at(a, p_a);
+        let side_b = ConstraintSide::at(b, p_b);
         let c = p_a - p_b;
         let target = match joint.kind {
             // `v_a − v_b` target per axis: `−pull·C` reels the
@@ -1093,17 +1095,17 @@ impl JointConstraint {
         Some(Self {
             a: a_index as u32,
             b: b_index as u32,
-            r_a,
-            r_b,
+            r_a: side_a.r,
+            r_b: side_b.r,
             k: [
-                effective(DVec3::X),
-                effective(DVec3::Y),
-                effective(DVec3::Z),
+                two_body_effective_mass(&side_a, &side_b, DVec3::X),
+                two_body_effective_mass(&side_a, &side_b, DVec3::Y),
+                two_body_effective_mass(&side_a, &side_b, DVec3::Z),
             ],
-            inv_i_a,
-            inv_i_b,
-            a_latched,
-            b_latched,
+            inv_i_a: side_a.inv_i,
+            inv_i_b: side_b.inv_i,
+            a_latched: side_a.latched,
+            b_latched: side_b.latched,
             target,
         })
     }
@@ -1187,6 +1189,181 @@ fn pair_position_correction(b: &mut WeldedBody, inv_i: SymMat3, p_world: DVec3, 
     let dtheta_world = b.rot.rotate(dtheta_body);
     b.rot = apply_rotation_delta(b.rot, dtheta_world);
     b.pos = com - b.rot.rotate(b.com_local);
+}
+
+/// The frame-dependent half of a solved contact's rows — the seam
+/// [`solve_contact_rows`] needs to run one λ-bookkeeping block for
+/// both manifolds. The ground manifold measures and applies in one
+/// body's **body frame** against the ground's surface velocity; the
+/// pair manifold measures and applies in the **world frame** against
+/// the peer body's own point velocity — only those two operations
+/// differ, so each supplies them here and the row logic is written
+/// once.
+trait ContactRowSpace {
+    /// Relative point velocity along `dir` — re-evaluated after every
+    /// write-back (strict Gauss–Seidel: each row's write is the next
+    /// row's input).
+    fn rel_v(&mut self, dir: DVec3) -> f64;
+    /// Apply an accumulated-impulse delta `dl` along `dir`.
+    fn apply(&mut self, dir: DVec3, dl: f64);
+}
+
+/// The ground manifold's [`ContactRowSpace`]: body-frame rows at one
+/// body's contact vertex. The constraint's geometry arrives as
+/// **values** — its λ fields are mut-borrowed by [`ContactRows`] for
+/// the same call, so the space cannot hold a `&Constraint`.
+struct GroundRowSpace<'a> {
+    b: &'a mut WeldedBody,
+    vel_b: &'a mut DVec3,
+    omega_w: &'a mut DVec3,
+    r_body: DVec3,
+    surface_vel_body: DVec3,
+    inv_i: SymMat3,
+}
+
+impl ContactRowSpace for GroundRowSpace<'_> {
+    fn rel_v(&mut self, dir: DVec3) -> f64 {
+        rel_point_velocity_body(
+            *self.vel_b,
+            self.b.ang_vel,
+            self.r_body,
+            self.surface_vel_body,
+        )
+        .dot(dir)
+    }
+
+    fn apply(&mut self, dir: DVec3, dl: f64) {
+        apply_impulse(
+            self.b,
+            self.vel_b,
+            self.omega_w,
+            self.inv_i,
+            self.r_body,
+            dir,
+            dl,
+        );
+    }
+}
+
+/// The pair manifold's [`ContactRowSpace`]: world-frame rows between
+/// two bodies — the peer body's point velocity is the "surface"
+/// velocity, and the write-back is the equal-and-opposite
+/// `+j` on `a` / `−j` on `b` that conserves linear momentum. As with
+/// the ground space, the constraint's fields arrive as values because
+/// its λ fields are mut-borrowed alongside.
+struct PairRowSpace<'a> {
+    bodies: &'a mut [WeldedBody],
+    vel_body: &'a mut [DVec3],
+    omega_world: &'a mut [DVec3],
+    ia: usize,
+    ib: usize,
+    r_a: DVec3,
+    r_b: DVec3,
+    inv_i_a: SymMat3,
+    inv_i_b: SymMat3,
+    a_latched: bool,
+    b_latched: bool,
+}
+
+impl ContactRowSpace for PairRowSpace<'_> {
+    fn rel_v(&mut self, dir: DVec3) -> f64 {
+        (self.bodies[self.ia].vel + self.omega_world[self.ia].cross(self.r_a)
+            - (self.bodies[self.ib].vel + self.omega_world[self.ib].cross(self.r_b)))
+        .dot(dir)
+    }
+
+    fn apply(&mut self, dir: DVec3, dl: f64) {
+        apply_two_body_impulse(
+            self.bodies,
+            self.vel_body,
+            self.omega_world,
+            self.ia,
+            self.ib,
+            self.r_a,
+            self.r_b,
+            self.inv_i_a,
+            self.inv_i_b,
+            self.a_latched,
+            self.b_latched,
+            dir * dl,
+        );
+    }
+}
+
+/// [`solve_contact_rows`]' operand bundle: the three row directions in
+/// the space's frame, the velocity target and effective masses, and
+/// mutable access to the accumulated impulses. Bundled so the shared
+/// row solver has one operand list regardless of which constraint
+/// struct owns the storage.
+struct ContactRows<'a> {
+    n: DVec3,
+    t1: DVec3,
+    t2: DVec3,
+    target_vn: f64,
+    kn: f64,
+    kt1: f64,
+    kt2: f64,
+    lambda_n: &'a mut f64,
+    lambda_t1: &'a mut f64,
+    lambda_t2: &'a mut f64,
+}
+
+/// The §2.9 projected-Gauss–Seidel row triplet shared by the ground
+/// and pair manifolds — identical λ bookkeeping, written once. Normal
+/// row first: `λ_n` clamps `≥ 0` (restitution 0) as it drives `vn`
+/// toward `target_vn`. Then friction `t1` then `t2` (pinned order),
+/// each clamped to `±μ·λ_n`, then the Coulomb-disc projection
+/// rescaling the accumulated pair to exactly `μ·λ_n` — the
+/// per-direction clamps alone would admit `√2·μ·λ_n` on diagonal
+/// slides. Every row re-probes the relative velocity after the last
+/// write-back; the manifolds' frames differ but the order, clamps,
+/// and cold-start rules do not.
+fn solve_contact_rows(
+    rows: &mut ContactRows<'_>,
+    friction_mu: f64,
+    space: &mut impl ContactRowSpace,
+) {
+    let vn = space.rel_v(rows.n);
+    let old = *rows.lambda_n;
+    *rows.lambda_n = (*rows.lambda_n - (vn - rows.target_vn) * rows.kn).max(0.0);
+    let dl = *rows.lambda_n - old;
+    if dl != 0.0 {
+        space.apply(rows.n, dl);
+    }
+
+    let limit = friction_mu * *rows.lambda_n;
+    let vt1 = space.rel_v(rows.t1);
+    let old = *rows.lambda_t1;
+    *rows.lambda_t1 = (*rows.lambda_t1 - vt1 * rows.kt1).clamp(-limit, limit);
+    let dl = *rows.lambda_t1 - old;
+    if dl != 0.0 {
+        space.apply(rows.t1, dl);
+    }
+
+    let vt2 = space.rel_v(rows.t2);
+    let old = *rows.lambda_t2;
+    *rows.lambda_t2 = (*rows.lambda_t2 - vt2 * rows.kt2).clamp(-limit, limit);
+    let dl = *rows.lambda_t2 - old;
+    if dl != 0.0 {
+        space.apply(rows.t2, dl);
+    }
+
+    // Coulomb disc: project the accumulated friction pair so the true
+    // bound is μ·λ_n, same fixed t1-then-t2 write-back order.
+    let tnorm = libm::sqrt(*rows.lambda_t1 * *rows.lambda_t1 + *rows.lambda_t2 * *rows.lambda_t2);
+    if tnorm > limit && tnorm > 0.0 {
+        let s = limit / tnorm;
+        let dl1 = *rows.lambda_t1 * s - *rows.lambda_t1;
+        let dl2 = *rows.lambda_t2 * s - *rows.lambda_t2;
+        *rows.lambda_t1 *= s;
+        *rows.lambda_t2 *= s;
+        if dl1 != 0.0 {
+            space.apply(rows.t1, dl1);
+        }
+        if dl2 != 0.0 {
+            space.apply(rows.t2, dl2);
+        }
+    }
 }
 
 /// World-frame AABB of one hull of `b` — `None` on an empty vertex
@@ -1384,86 +1561,76 @@ impl SimpleBackend {
         };
 
         // Gravity at each part's body-frame CoM — the same analytic
-        // −μ·r̂/r² as `accumulate_forces`, attributed per part.
+        // −μ·r̂/r² as `accumulate_forces` (`gravity_force_world`),
+        // attributed per part.
         for (id, node) in &graph.nodes {
             let ep = &parts[node.effective_index as usize];
             let c_b = transforms[id].apply(ep.com);
             let rel = (body.pos + body.rot.rotate(c_b)) - self.env.body_center;
-            let r = rel.norm();
-            if r > 0.0 && ep.mass_kg > 0.0 {
-                push(
-                    *id,
-                    c_b,
-                    conj.rotate(rel * (-self.env.mu_m3_per_s2 * ep.mass_kg / (r * r * r))),
-                );
+            if ep.mass_kg > 0.0
+                && let Some(f_w) = gravity_force_world(&self.env, rel, ep.mass_kg)
+            {
+                push(*id, c_b, conj.rotate(f_w));
             }
         }
 
         // Aero — the §2.4.1 per-part table breakdown when installed,
         // else the placeholder total distributed by mass share (a
         // documented approximation — the placeholder has no
-        // application-point data to do better).
+        // application-point data to do better). The flow state is
+        // `flow_state` — the same derivation `accumulate_forces`
+        // runs, so the channels' ρ/Mach/Re glue can never disagree.
         if let Some(atm) = &self.env.atmosphere {
             let rel = body.com_world() - self.env.body_center;
-            let alt = rel.norm() - self.env.radius_m;
-            let rho = atmosphere_density_kg_m3(atm, alt);
-            if rho > 0.0 {
-                let v_rel = body.vel - self.env.body_spin.cross(rel);
-                let speed = v_rel.norm();
-                if speed > 0.0 {
-                    match &body.aero {
-                        Some(tables) => {
-                            let a = atmosphere_sound_speed_mps(atm, alt);
-                            let mach = if a > 0.0 { speed / a } else { 0.0 };
-                            let re_per_len = rho * speed / crate::aero::AIR_VISCOSITY_PA_S;
-                            let w_body = body.rot.conjugate().rotate(v_rel / -speed);
-                            for (node, f, cop) in tables.part_forces_body(
-                                w_body,
-                                0.5 * rho * speed * speed,
-                                mach,
-                                re_per_len,
-                            ) {
-                                push(node, cop, f);
-                            }
+            if let Some(flow) = flow_state(&self.env, atm, body, rel) {
+                match &body.aero {
+                    Some(tables) => {
+                        let (w_body, q, mach, re_per_len) = flow.table_args(atm, body.rot);
+                        for (node, f, cop) in tables.part_forces_body(w_body, q, mach, re_per_len) {
+                            push(node, cop, f);
                         }
-                        None => {
-                            let area = cross_section_area(body, v_rel / speed);
-                            let f_b =
-                                conj.rotate(v_rel * (-0.5 * rho * self.env.drag_cd * area * speed));
-                            if body.mass_kg > 0.0 {
-                                for (id, node) in &graph.nodes {
-                                    let ep = &parts[node.effective_index as usize];
-                                    if ep.mass_kg > 0.0 {
-                                        push(
-                                            *id,
-                                            transforms[id].apply(ep.com),
-                                            f_b * (ep.mass_kg / body.mass_kg),
-                                        );
-                                    }
+                    }
+                    None => {
+                        let f_b = conj.rotate(placeholder_drag_world(&self.env, body, &flow));
+                        if body.mass_kg > 0.0 {
+                            for (id, node) in &graph.nodes {
+                                let ep = &parts[node.effective_index as usize];
+                                if ep.mass_kg > 0.0 {
+                                    push(
+                                        *id,
+                                        transforms[id].apply(ep.com),
+                                        f_b * (ep.mass_kg / body.mass_kg),
+                                    );
                                 }
                             }
                         }
                     }
-                    // §3.1 decelerator sites — the same additive term
-                    // `accumulate_forces` applies, attributed to the
-                    // site-owning node (the canopy's pull loads its
-                    // own attachment).
-                    for site in &body.decel {
-                        let area =
-                            decel_area_m2(site, alt, speed, rho, self.time_s.get() + PHYSICS_DT);
-                        if area > 0.0 {
-                            push(
-                                site.node,
-                                site.local_pos,
-                                conj.rotate(v_rel * (-0.5 * rho * area * speed)),
-                            );
-                        }
+                }
+                // §3.1 decelerator sites — the same additive term
+                // `accumulate_forces` applies (`decel_drag_world`),
+                // attributed to the site-owning node (the canopy's
+                // pull loads its own attachment).
+                for site in &body.decel {
+                    let area = decel_area_m2(
+                        site,
+                        flow.alt_m,
+                        flow.speed,
+                        flow.rho,
+                        self.time_s.get() + PHYSICS_DT,
+                    );
+                    if area > 0.0 {
+                        push(
+                            site.node,
+                            site.local_pos,
+                            conj.rotate(decel_drag_world(&flow, area)),
+                        );
                     }
                 }
             }
         }
 
-        // Thrust sites — same channel as `accumulate_forces`.
+        // Thrust sites — same channel as `accumulate_forces`
+        // (`thrust_scalar_n`), iterated per part for attribution.
         let throttle = body.throttle.clamp(0.0, 1.0);
         if throttle > 0.0 {
             for (id, pw) in &body.part_index {
@@ -1474,7 +1641,7 @@ impl SimpleBackend {
                         push(
                             *id,
                             site.local_pos,
-                            site.local_dir * (throttle * site.rated_n),
+                            site.local_dir * thrust_scalar_n(throttle, site),
                         );
                     }
                 }
@@ -1559,13 +1726,13 @@ impl SimpleBackend {
     /// fixed accumulation order gravity → drag → thrust.
     fn accumulate_forces(&self, b: &WeldedBody) -> (DVec3, DVec3) {
         let rel = b.com_world() - self.env.body_center;
-        let r = rel.norm();
         let mut force = DVec3::ZERO;
         let mut torque = DVec3::ZERO;
 
-        // Gravity: −μ·m·r̂/r², at the CoM (no torque).
-        if r > 0.0 {
-            force = force + rel * (-self.env.mu_m3_per_s2 * b.mass_kg / (r * r * r));
+        // Gravity: −μ·m·r̂/r², at the CoM (no torque) — the shared
+        // `gravity_force_world` channel.
+        if let Some(f_w) = gravity_force_world(&self.env, rel, b.mass_kg) {
+            force = force + f_w;
         }
 
         // Aerodynamics: the §2.4.1 table-driven model when Stage-2
@@ -1575,51 +1742,44 @@ impl SimpleBackend {
         // exposure × authored Cd/Cl(Mach) + Cf(Re), forces applied at
         // each part's centre of pressure → drag, lift, and the pitch
         // moment all emerge (the placeholder produced no aero torque).
-        if let Some(atm) = &self.env.atmosphere {
-            let alt = r - self.env.radius_m;
-            let rho = atmosphere_density_kg_m3(atm, alt);
-            if rho > 0.0 {
-                let v_rel = b.vel - self.env.body_spin.cross(rel);
-                let speed = v_rel.norm();
-                if speed > 0.0 {
-                    match &b.aero {
-                        Some(tables) => {
-                            let a = atmosphere_sound_speed_mps(atm, alt);
-                            let mach = if a > 0.0 { speed / a } else { 0.0 };
-                            let re_per_len = rho * speed / crate::aero::AIR_VISCOSITY_PA_S;
-                            let w_body = b.rot.conjugate().rotate(v_rel / -speed);
-                            let (fb, taub) = tables.force_torque_body(
-                                w_body,
-                                0.5 * rho * speed * speed,
-                                mach,
-                                re_per_len,
-                            );
-                            force = force + b.rot.rotate(fb);
-                            torque = torque + b.rot.rotate(taub);
-                        }
-                        None => {
-                            let area = cross_section_area(b, v_rel / speed);
-                            force = force + v_rel * (-0.5 * rho * self.env.drag_cd * area * speed);
-                        }
-                    }
-                    // §3.1 decelerator sites — the additive analytic
-                    // drag term (no table recompute): packed Cd·A
-                    // always, the deployed Cd·A once the canopy can
-                    // catch (below the authored altitude/speed
-                    // ceilings), ramping in over `deploy_time_s` from
-                    // the gate-pass stamp and reefed to the mount's
-                    // load rating. Applied at the site point —
-                    // a canopy above the CoM weathervanes correctly.
-                    for site in &b.decel {
-                        let area =
-                            decel_area_m2(site, alt, speed, rho, self.time_s.get() + PHYSICS_DT);
-                        if area > 0.0 {
-                            let f_world = v_rel * (-0.5 * rho * area * speed);
-                            let r_world = b.rot.rotate(site.local_pos - b.com_local);
-                            force = force + f_world;
-                            torque = torque + r_world.cross(f_world);
-                        }
-                    }
+        // `flow_state`/`placeholder_drag_world`/`decel_drag_world` are
+        // the same builders `external_loads` runs, so the breakup
+        // budget and this total can never disagree.
+        if let Some(atm) = &self.env.atmosphere
+            && let Some(flow) = flow_state(&self.env, atm, b, rel)
+        {
+            match &b.aero {
+                Some(tables) => {
+                    let (w_body, q, mach, re_per_len) = flow.table_args(atm, b.rot);
+                    let (fb, taub) = tables.force_torque_body(w_body, q, mach, re_per_len);
+                    force = force + b.rot.rotate(fb);
+                    torque = torque + b.rot.rotate(taub);
+                }
+                None => {
+                    force = force + placeholder_drag_world(&self.env, b, &flow);
+                }
+            }
+            // §3.1 decelerator sites — the additive analytic
+            // drag term (no table recompute): packed Cd·A
+            // always, the deployed Cd·A once the canopy can
+            // catch (below the authored altitude/speed
+            // ceilings), ramping in over `deploy_time_s` from
+            // the gate-pass stamp and reefed to the mount's
+            // load rating. Applied at the site point —
+            // a canopy above the CoM weathervanes correctly.
+            for site in &b.decel {
+                let area = decel_area_m2(
+                    site,
+                    flow.alt_m,
+                    flow.speed,
+                    flow.rho,
+                    self.time_s.get() + PHYSICS_DT,
+                );
+                if area > 0.0 {
+                    let f_world = decel_drag_world(&flow, area);
+                    let r_world = b.rot.rotate(site.local_pos - b.com_local);
+                    force = force + f_world;
+                    torque = torque + r_world.cross(f_world);
                 }
             }
         }
@@ -1631,7 +1791,7 @@ impl SimpleBackend {
         if throttle > 0.0 {
             for site in &b.force_sites {
                 if site.kind == ForceSiteKind::Thrust {
-                    let f_world = b.rot.rotate(site.local_dir) * (throttle * site.rated_n);
+                    let f_world = b.rot.rotate(site.local_dir) * thrust_scalar_n(throttle, site);
                     let r_world = b.rot.rotate(site.local_pos - b.com_local);
                     force = force + f_world;
                     torque = torque + r_world.cross(f_world);
@@ -2038,111 +2198,66 @@ impl SimpleBackend {
         let mut omega_world: Vec<DVec3> = bodies.iter().map(|b| b.rot.rotate(b.ang_vel)).collect();
         for _ in 0..SOLVER_ITERATIONS {
             for c in constraints.iter_mut() {
-                let b = &mut bodies[c.body as usize];
-                let vel_b = &mut vel_body[c.body as usize];
-                let omega_w = &mut omega_world[c.body as usize];
-
-                // Normal: target vn ≥ v_surf·n (restitution 0; the
+                // Normal target `vn ≥ v_surf·n` (restitution 0; the
                 // surface velocity is tangential on the sphere, so in
                 // practice vn ≥ 0 — the relative form is the honest
-                // statement either way).
-                let vn = rel_point_velocity_body(*vel_b, b, c).dot(c.n_body);
-                let old = c.lambda_n;
-                c.lambda_n = (c.lambda_n - (vn - c.target_vn) * c.kn).max(0.0);
-                let dl = c.lambda_n - old;
-                if dl != 0.0 {
-                    apply_impulse(b, vel_b, omega_w, c, c.n_body, dl);
-                }
-
-                // Friction, fixed order t1 then t2.
-                let limit = self.env.friction_mu * c.lambda_n;
-                let vt1 = rel_point_velocity_body(*vel_b, b, c).dot(c.t1_body);
-                let old = c.lambda_t1;
-                c.lambda_t1 = (c.lambda_t1 - vt1 * c.kt1).clamp(-limit, limit);
-                let dl = c.lambda_t1 - old;
-                if dl != 0.0 {
-                    apply_impulse(b, vel_b, omega_w, c, c.t1_body, dl);
-                }
-
-                let vt2 = rel_point_velocity_body(*vel_b, b, c).dot(c.t2_body);
-                let old = c.lambda_t2;
-                c.lambda_t2 = (c.lambda_t2 - vt2 * c.kt2).clamp(-limit, limit);
-                let dl = c.lambda_t2 - old;
-                if dl != 0.0 {
-                    apply_impulse(b, vel_b, omega_w, c, c.t2_body, dl);
-                }
-
-                // Coulomb disc: the per-direction clamps alone admit
-                // ‖λ_t‖ ≤ √2·μ·λ_n on diagonal slides. Project the
-                // accumulated pair onto the disc (same fixed t1-then-
-                // t2 write-back order) so the true bound is μ·λ_n.
-                let tnorm = libm::sqrt(c.lambda_t1 * c.lambda_t1 + c.lambda_t2 * c.lambda_t2);
-                if tnorm > limit && tnorm > 0.0 {
-                    let s = limit / tnorm;
-                    let dl1 = c.lambda_t1 * s - c.lambda_t1;
-                    let dl2 = c.lambda_t2 * s - c.lambda_t2;
-                    c.lambda_t1 *= s;
-                    c.lambda_t2 *= s;
-                    if dl1 != 0.0 {
-                        apply_impulse(b, vel_b, omega_w, c, c.t1_body, dl1);
-                    }
-                    if dl2 != 0.0 {
-                        apply_impulse(b, vel_b, omega_w, c, c.t2_body, dl2);
-                    }
-                }
+                // statement either way). The λ bookkeeping itself is
+                // `solve_contact_rows` — the same block the pair
+                // manifold runs below.
+                let mut space = GroundRowSpace {
+                    b: &mut bodies[c.body as usize],
+                    vel_b: &mut vel_body[c.body as usize],
+                    omega_w: &mut omega_world[c.body as usize],
+                    r_body: c.r_body,
+                    surface_vel_body: c.surface_vel_body,
+                    inv_i: c.inv_i,
+                };
+                let mut rows = ContactRows {
+                    n: c.n_body,
+                    t1: c.t1_body,
+                    t2: c.t2_body,
+                    target_vn: c.target_vn,
+                    kn: c.kn,
+                    kt1: c.kt1,
+                    kt2: c.kt2,
+                    lambda_n: &mut c.lambda_n,
+                    lambda_t1: &mut c.lambda_t1,
+                    lambda_t2: &mut c.lambda_t2,
+                };
+                solve_contact_rows(&mut rows, self.env.friction_mu, &mut space);
             }
             for c in pairs.iter_mut() {
-                let (ia, ib) = (c.a as usize, c.b as usize);
                 // Relative point velocity along n — the peer body's
                 // point velocity is the "surface" velocity here, so
                 // the restitution-0 target is `vn ≥ 0` on `v_a − v_b`.
-                let vn = (bodies[ia].vel + omega_world[ia].cross(c.r_a)
-                    - (bodies[ib].vel + omega_world[ib].cross(c.r_b)))
-                .dot(c.n);
-                let old = c.lambda_n;
-                c.lambda_n = (c.lambda_n - (vn - c.target_vn) * c.kn).max(0.0);
-                let dl = c.lambda_n - old;
-                if dl != 0.0 {
-                    apply_pair_impulse(bodies, &mut vel_body, &mut omega_world, c, c.n * dl);
-                }
-
-                // Friction, same fixed t1-then-t2 order and Coulomb
-                // disc as the ground manifold, on relative velocity.
-                let limit = self.env.friction_mu * c.lambda_n;
-                let vt1 = (bodies[ia].vel + omega_world[ia].cross(c.r_a)
-                    - (bodies[ib].vel + omega_world[ib].cross(c.r_b)))
-                .dot(c.t1);
-                let old = c.lambda_t1;
-                c.lambda_t1 = (c.lambda_t1 - vt1 * c.kt1).clamp(-limit, limit);
-                let dl = c.lambda_t1 - old;
-                if dl != 0.0 {
-                    apply_pair_impulse(bodies, &mut vel_body, &mut omega_world, c, c.t1 * dl);
-                }
-
-                let vt2 = (bodies[ia].vel + omega_world[ia].cross(c.r_a)
-                    - (bodies[ib].vel + omega_world[ib].cross(c.r_b)))
-                .dot(c.t2);
-                let old = c.lambda_t2;
-                c.lambda_t2 = (c.lambda_t2 - vt2 * c.kt2).clamp(-limit, limit);
-                let dl = c.lambda_t2 - old;
-                if dl != 0.0 {
-                    apply_pair_impulse(bodies, &mut vel_body, &mut omega_world, c, c.t2 * dl);
-                }
-
-                let tnorm = libm::sqrt(c.lambda_t1 * c.lambda_t1 + c.lambda_t2 * c.lambda_t2);
-                if tnorm > limit && tnorm > 0.0 {
-                    let s = limit / tnorm;
-                    let dl1 = c.lambda_t1 * s - c.lambda_t1;
-                    let dl2 = c.lambda_t2 * s - c.lambda_t2;
-                    c.lambda_t1 *= s;
-                    c.lambda_t2 *= s;
-                    if dl1 != 0.0 {
-                        apply_pair_impulse(bodies, &mut vel_body, &mut omega_world, c, c.t1 * dl1);
-                    }
-                    if dl2 != 0.0 {
-                        apply_pair_impulse(bodies, &mut vel_body, &mut omega_world, c, c.t2 * dl2);
-                    }
-                }
+                // Same `solve_contact_rows` λ bookkeeping as the
+                // ground manifold; only the space differs.
+                let mut space = PairRowSpace {
+                    bodies,
+                    vel_body: &mut vel_body,
+                    omega_world: &mut omega_world,
+                    ia: c.a as usize,
+                    ib: c.b as usize,
+                    r_a: c.r_a,
+                    r_b: c.r_b,
+                    inv_i_a: c.inv_i_a,
+                    inv_i_b: c.inv_i_b,
+                    a_latched: c.a_latched,
+                    b_latched: c.b_latched,
+                };
+                let mut rows = ContactRows {
+                    n: c.n,
+                    t1: c.t1,
+                    t2: c.t2,
+                    target_vn: c.target_vn,
+                    kn: c.kn,
+                    kt1: c.kt1,
+                    kt2: c.kt2,
+                    lambda_n: &mut c.lambda_n,
+                    lambda_t1: &mut c.lambda_t1,
+                    lambda_t2: &mut c.lambda_t2,
+                };
+                solve_contact_rows(&mut rows, self.env.friction_mu, &mut space);
             }
             Self::solve_joint_rows(bodies, &mut vel_body, &mut omega_world, joints);
         }
@@ -2668,12 +2783,6 @@ impl PhysicsBackend for SimpleBackend {
     }
 }
 
-/// The pre-voxel reference area: cross-section of the compound
-/// collider's **velocity-aligned AABB** — project every hull vertex
-/// (world frame) onto the plane ⊥ `w` and take the extent rectangle.
-/// Deterministic (min/max are order-invariant), conservative for
-/// non-convex unions, and cheap. The §2.4.1 voxel tables' per-
-/// direction areas replace it at M4a.
 /// §3.1 decelerator catch: the site's effective Cd·A this tick —
 /// packed always, the deployed area ramping in over `deploy_time_s`
 /// once the flow can hold the canopy (below the authored
@@ -2707,6 +2816,12 @@ fn decel_area_m2(site: &DecelSite, alt_m: f64, speed_mps: f64, rho_kg_m3: f64, a
     }
 }
 
+/// The pre-voxel reference area: cross-section of the compound
+/// collider's **velocity-aligned AABB** — project every hull vertex
+/// (world frame) onto the plane ⊥ `w` and take the extent rectangle.
+/// Deterministic (min/max are order-invariant), conservative for
+/// non-convex unions, and cheap. The §2.4.1 voxel tables' per-
+/// direction areas replace it at M4a.
 fn cross_section_area(b: &WeldedBody, w: DVec3) -> f64 {
     let reference = if w.x.abs() <= w.y.abs() {
         DVec3::X
@@ -2737,6 +2852,116 @@ fn cross_section_area(b: &WeldedBody, w: DVec3) -> f64 {
         return 0.0;
     }
     (hi1 - lo1) * (hi2 - lo2)
+}
+
+/// Analytic two-body gravity `−μ·m·r̂/r²` on `mass_kg`, where `rel` is
+/// the force point's offset from `env.body_center` — the CoM offset
+/// for the body total, the part-CoM offset for the §2.4 breakup
+/// budget. `None` at the degenerate `r == 0` so both callers keep
+/// "record nothing" semantics (a zero-force entry is not a load).
+/// Shared by `accumulate_forces` and `external_loads` — the channel's
+/// formula is written once.
+fn gravity_force_world(env: &Environment, rel: DVec3, mass_kg: f64) -> Option<DVec3> {
+    let r = rel.norm();
+    if r > 0.0 {
+        Some(rel * (-env.mu_m3_per_s2 * mass_kg / (r * r * r)))
+    } else {
+        None
+    }
+}
+
+/// The local-flow state the aero channels derive identically —
+/// extracted so the `v_rel`/ρ/Mach/Re glue is one derivation shared
+/// by `accumulate_forces` (the body total) and `external_loads` (the
+/// §2.4 breakup budget), not two hand-maintained copies.
+struct FlowState {
+    /// Still-air relative velocity `v − ω×r`, world frame.
+    v_rel: DVec3,
+    /// `|v_rel|`.
+    speed: f64,
+    /// Ambient density at `alt_m`, kg/m³.
+    rho: f64,
+    /// Altitude above the datum sphere the density model used, m.
+    alt_m: f64,
+}
+
+/// Derive `b`'s [`FlowState`] — `rel` is the CoM's offset from the
+/// environment centre, already at hand in both callers (the gravity
+/// channel computed it). `None` is "aero channel off": zero ambient
+/// density at the CoM altitude or zero wind-relative speed — the same
+/// two gates both callers applied (the `atmosphere.is_some()` gate
+/// stays at the call sites, which still need `atm` for the table
+/// lookup inputs).
+fn flow_state(
+    env: &Environment,
+    atm: &AtmosphereDef,
+    b: &WeldedBody,
+    rel: DVec3,
+) -> Option<FlowState> {
+    let alt_m = rel.norm() - env.radius_m;
+    let rho = atmosphere_density_kg_m3(atm, alt_m);
+    if rho <= 0.0 {
+        return None;
+    }
+    let v_rel = b.vel - env.body_spin.cross(rel);
+    let speed = v_rel.norm();
+    if speed <= 0.0 {
+        return None;
+    }
+    Some(FlowState {
+        v_rel,
+        speed,
+        rho,
+        alt_m,
+    })
+}
+
+impl FlowState {
+    /// The §2.4.1 table-lookup inputs `(w_body, q, mach, re_per_len)`,
+    /// in [`crate::aero::CraftAeroTables`]' call order — the identical
+    /// four-line derivation both table call sites carried.
+    fn table_args(&self, atm: &AtmosphereDef, rot: DQuat) -> (DVec3, f64, f64, f64) {
+        let a = atmosphere_sound_speed_mps(atm, self.alt_m);
+        let mach = if a > 0.0 { self.speed / a } else { 0.0 };
+        let re_per_len = self.rho * self.speed / crate::aero::AIR_VISCOSITY_PA_S;
+        let w_body = rot.conjugate().rotate(self.v_rel / -self.speed);
+        (
+            w_body,
+            0.5 * self.rho * self.speed * self.speed,
+            mach,
+            re_per_len,
+        )
+    }
+}
+
+/// The pre-voxel placeholder's body-total drag — the analytic term
+/// `v_rel·(−½·ρ·Cd·A·|v_rel|)` at `env.drag_cd` over the collider's
+/// projected cross-section along the flow. `external_loads`
+/// distributes this same total by mass share, so the channel's
+/// arithmetic is written once.
+fn placeholder_drag_world(env: &Environment, b: &WeldedBody, flow: &FlowState) -> DVec3 {
+    let area = cross_section_area(b, flow.v_rel / flow.speed);
+    flow.v_rel * (-0.5 * flow.rho * env.drag_cd * area * flow.speed)
+}
+
+/// One §3.1 decelerator site's additive drag — the same analytic
+/// quadratic term as the placeholder but at the site's *effective*
+/// Cd·A from `decel_area_m2` (canopy Cd, the deploy ramp, and the
+/// reefed load cap are already folded into that area — no
+/// `env.drag_cd` here).
+fn decel_drag_world(flow: &FlowState, area_m2: f64) -> DVec3 {
+    flow.v_rel * (-0.5 * flow.rho * area_m2 * flow.speed)
+}
+
+/// The thrust channel's per-site magnitude `throttle·rated_n` —
+/// shared by the body total (`accumulate_forces`, applied along
+/// `rot·local_dir`) and the per-part budget (`external_loads`,
+/// applied along body-frame `local_dir`). The frame and the site
+/// iteration differ between the two (flat list vs per-part slices —
+/// the budget needs the node id), so the scalar is what the channel
+/// shares.
+fn thrust_scalar_n(throttle: f64, site: &ForceSite) -> f64 {
+    throttle * site.rated_n
 }
 
 #[cfg(test)]
