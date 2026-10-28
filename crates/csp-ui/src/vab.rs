@@ -1701,31 +1701,37 @@ impl VabSession {
 
     /// A node's rotation into body frame, folded down its ancestor
     /// chain (C17-F9 — `plan_axial` and `attach_auto` each hand-folded
-    /// it). The staged `body_transforms` map is consulted first, the
-    /// fold is the fallback: local −z only agrees with stack-down
-    /// while every ancestor mounted unflipped, so the fold is what
-    /// stays correct through an upside-down parent.
+    /// it). The staged `body_transforms` map is consulted first ONLY
+    /// while the session is clean — `apply` marks `dirty` without
+    /// recomputing, so a dirty map can describe a pre-mutation tree
+    /// (an undo, a reattach or a `LoadBytes` earlier in the same
+    /// frame) and the fold is what stays correct then. The fold is
+    /// also the correctness anchor in general: local −z only agrees
+    /// with stack-down while every ancestor mounted unflipped, so it
+    /// is what stays correct through an upside-down parent.
     fn parent_body_transform(&self, parent: PartNodeId) -> PartTransform {
-        self.body_transforms()
-            .get(&parent)
-            .copied()
-            .unwrap_or_else(|| {
-                let mut chain = vec![parent];
-                while let Some(e) = chain
-                    .last()
-                    .and_then(|id| self.session.node(*id))
-                    .and_then(|n| n.edge())
-                {
-                    chain.push(e.parent);
+        let staged = if self.dirty {
+            None
+        } else {
+            self.body_transforms().get(&parent).copied()
+        };
+        staged.unwrap_or_else(|| {
+            let mut chain = vec![parent];
+            while let Some(e) = chain
+                .last()
+                .and_then(|id| self.session.node(*id))
+                .and_then(|n| n.edge())
+            {
+                chain.push(e.parent);
+            }
+            let mut t = PartTransform::IDENTITY;
+            for id in chain.iter().rev() {
+                if let Some(n) = self.session.node(*id) {
+                    t = t.compose(n.transform());
                 }
-                let mut t = PartTransform::IDENTITY;
-                for id in chain.iter().rev() {
-                    if let Some(n) = self.session.node(*id) {
-                        t = t.compose(n.transform());
-                    }
-                }
-                t
-            })
+            }
+            t
+        })
     }
 
     /// The axial half of [`Self::plan_edges`] — the authored snap
@@ -4229,6 +4235,61 @@ mod tests {
                 part: PartId::from("t.eng"),
                 parent: mid,
             })
+        );
+    }
+
+    /// Stale-staged-map regression — `apply` marks the session dirty
+    /// WITHOUT recomputing, so inside the same frame `body_xforms` can
+    /// still describe a pre-mutation tree. The mutation staged here
+    /// is a `LoadBytes`: craft files restart the `PartNodeId`
+    /// counter, so the loaded root lands on the SAME id the staged
+    /// map still holds — under a different rotation. `attach_auto`
+    /// must fold the live ancestor chain while `dirty`: the stale
+    /// (unflipped) entry would hang the engine on "bottom" where the
+    /// flipped root's "top" is the node that now faces down-stack.
+    #[test]
+    fn attach_auto_folds_live_transform_while_dirty() {
+        // The staged-map state: a clean, recomputed session whose
+        // root sits unflipped at the origin.
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        vab.apply(VabAction::SetRoot(PartId::from("t.tank")))
+            .unwrap();
+        let staged_root = vab.session().root().unwrap();
+        vab.recompute();
+        // The replacement craft: one root minted to the same first id,
+        // rolled 180° about x so its authored "top" node faces
+        // down-stack.
+        let mut donor = VabSession::new(mini_catalog(), mini_resources());
+        donor
+            .apply(VabAction::SetRoot(PartId::from("t.tank")))
+            .unwrap();
+        let donor_root = donor.session().root().unwrap();
+        assert_eq!(donor_root, staged_root, "test needs the id reuse");
+        donor
+            .session
+            .set_transform(
+                donor_root,
+                PartTransform::new(
+                    DVec3::ZERO,
+                    DQuat::from_axis_angle(DVec3::X, core::f64::consts::PI),
+                ),
+            )
+            .unwrap();
+        // The load swaps the session and marks dirty without a
+        // recompute — the staged map keeps the OLD root's identity
+        // transform under the loaded root's id.
+        vab.apply(VabAction::LoadBytes(donor.to_bytes().unwrap()))
+            .unwrap();
+        vab.apply(VabAction::AttachAuto {
+            part: PartId::from("t.eng"),
+            parent: staged_root,
+        })
+        .unwrap();
+        let eng = vab.selected().unwrap();
+        let edge = vab.session().node(eng).unwrap().edge().unwrap();
+        assert_eq!(
+            edge.parent_node, "top",
+            "attach_auto ranked the stale staged transform, not the live fold"
         );
     }
 
