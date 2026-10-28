@@ -126,14 +126,16 @@
     // C14-F3 §2.4/M4b: the convective-heating coefficient η — the
     // fraction of the kinetic energy flux `½ρv³` incident on a part's
     // exposed area absorbed as skin heat (the constant's own doc
-    // always named this file its home). Calibrated 0.05 (M4b's
+    // always named this file its home). Calibration ledger (M4b's
     // "survivable AND lethal in the right places"): at 0.005 even a
     // 2.3 km/s straight-down entry peaked ~200–260 K against
-    // 800–1600 K part limits — lethality was unreachable. At 0.05 the
-    // same profile burns the small low-margin parts (20–50 kJ/K,
-    // 800–1000 K limits — battery/chute/canister class) while the
-    // 400 kJ/K, 1200 K pod class peaks ~600 K and lands; a moderate
-    // 1.2 km/s descent stays a real-but-safe pulse (~375 K).
+    // 800–1600 K part limits — lethality was unreachable. 0.05 was
+    // measured (pod class peaks ~600 K, a moderate 1.2 km/s descent
+    // ~375 K) but rejected for over-kill — it burned the small
+    // low-margin parts (20–50 kJ/K, 800–1000 K limits —
+    // battery/chute/canister class) too readily. Shipped 0.02: the
+    // 400 kJ/K, 1200 K pod class peaks ~360 K and lands; a moderate
+    // 1.2 km/s descent stays a real-but-safe pulse (~307 K).
     // Mirror: `csp_phys::DEFAULT_CONVECTIVE_HEAT_FRACTION`.
     convective_heat_fraction: 0.02,
     // C09-F6 §3.5/§3.5.1: `RepairColonyModule`'s per-module funds
