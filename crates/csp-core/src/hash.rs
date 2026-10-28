@@ -281,7 +281,18 @@ use crate::SimError;
 /// `BTreeSet<CrewId>`. The goldens rebless; the stale schema-27
 /// `trivial` log no longer decodes, so it re-records via
 /// `record --force` (the documented decode-break path).
-pub const HASH_SCHEMA_VERSION: u32 = 29;
+///
+/// **Version 30** (the recovery-BOM return leg): `CraftDef` gained
+/// `part_build_resources` — the per-part build bill `RecoverVessel`
+/// credits back into the site's inventory at the recovery
+/// efficiency. The craft walk emits the table only when non-empty,
+/// so an empty table — every pre-field and sandbox craft — hashes
+/// bit-identically to the pre-field stream; the visitor's possible
+/// byte-space still changed, so the schema bumps on the v29
+/// `ContractProgress` convention. The stale `flight-launch`
+/// `replay.bin` no longer decodes (the `CraftDef` wire shape moved),
+/// so it re-records via `record --force`; `trivial` still verifies.
+pub const HASH_SCHEMA_VERSION: u32 = 30;
 
 /// Rule-7 sum types: the source of an enum's *declared* stable `u16`
 /// discriminant (PLAN §7.1 rule 7).
