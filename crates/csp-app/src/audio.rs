@@ -830,7 +830,11 @@ mod tests {
                 throttle: 0.7,
                 debris: false,
                 contact: false,
-                plasma_w_m2: 4.0e4,
+                // Plasma-present fixture: 8.0e4 sits above the 4.0e4
+                // onset and below the 1.6e5 full (csp-view flight.rs)
+                // — a graded mid-intensity. The old 4.0e4 landed
+                // exactly on 5edf3ff's recalibrated onset (i = 0).
+                plasma_w_m2: 8.0e4,
                 nodes: 3,
                 parts: std::sync::Arc::new(Vec::new()),
                 plumes: Vec::new(),
@@ -875,7 +879,11 @@ mod tests {
                 throttle: 0.7,
                 debris: false,
                 contact: false,
-                plasma_w_m2: 4.0e4,
+                // Plasma-present fixture: 8.0e4 sits above the 4.0e4
+                // onset and below the 1.6e5 full (csp-view flight.rs)
+                // — a graded mid-intensity. The old 4.0e4 landed
+                // exactly on 5edf3ff's recalibrated onset (i = 0).
+                plasma_w_m2: 8.0e4,
                 nodes: 3,
                 parts: std::sync::Arc::new(Vec::new()),
                 plumes: Vec::new(),
