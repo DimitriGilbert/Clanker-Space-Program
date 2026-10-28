@@ -653,6 +653,19 @@ pub(crate) fn recovery_resources(
     out.into_iter().collect()
 }
 
+/// Whether `craft.part_build_resources` is positional over
+/// `craft.parts` — the [`crate::reliability::specs_parallel`]/
+/// [`crate::reliability::part_ids_parallel`] twin for the
+/// embodied-BOM table. The spawn/manufacture/snapshot gates enforce
+/// "empty or covering", so a non-covering table can only come from a
+/// bug; the latch merge consults this before carrying the table
+/// across the reindexed graph — a half whose parts have no rows
+/// cannot concat without binding the other half's bill at the wrong
+/// `effective_index` slots.
+pub(crate) fn bom_parallel(craft: &crate::CraftDef) -> bool {
+    craft.part_build_resources.len() == craft.parts.len()
+}
+
 /// The vessel's *embodied* bill of materials recovery credit —
 /// `CraftDef::part_build_resources` summed over the LIVE graph nodes
 /// (the `craft_cost_micros` convention: a node surgery removed

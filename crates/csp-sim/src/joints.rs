@@ -952,6 +952,29 @@ pub(crate) fn apply_latch(
     } else {
         Vec::new()
     };
+    // The embodied-BOM table merges by the `part_ids` rule — both
+    // halves carrying a bill covering their own `parts` concat, so
+    // every row keeps its `effective_index` binding and the merged
+    // hull refunds BOTH builds at recovery (without this the dock
+    // path was the same write-only sink the recovery credit closed:
+    // two manufactured vessels latched into a hull whose bill read
+    // "no bill recorded"). A mixed-coverage pair — a manufactured
+    // half latching a sandbox/legacy craft carrying no bill — drops
+    // to the empty convention rather than binding rows at the wrong
+    // index or emitting the partial table the snapshot gate Fatals
+    // on. Unlike the reliability specs — an in-force model whose
+    // silent loss warranted REFUSING the pair — a dropped BOM is a
+    // bounded one-time refund loss (the bill was already debited at
+    // manufacture), so the `part_ids` "drop, never a wrong binding"
+    // precedent applies over the spec table's refusal.
+    let part_build_resources_m =
+        if crate::economy::bom_parallel(&craft_p) && crate::economy::bom_parallel(&craft_s) {
+            let mut t = craft_p.part_build_resources.clone();
+            t.extend(craft_s.part_build_resources.iter().cloned());
+            t
+        } else {
+            Vec::new()
+        };
     let mut body_m =
         csp_phys::weld(&merge.graph, &parts_m).map_err(|e| SimError::Fatal(e.reason()))?;
     // §2.9's hand-off: the merged body keeps the primary's pose and
@@ -1085,7 +1108,7 @@ pub(crate) fn apply_latch(
     // re-derives the rest.
     if physics.backend.environment().atmosphere.is_some() {
         let craft_m = crate::CraftDef {
-            part_build_resources: Vec::new(),
+            part_build_resources: part_build_resources_m.clone(),
             hash_memo: Default::default(),
             graph: merge.graph.clone(),
             parts: parts_m.clone(),
@@ -1110,7 +1133,7 @@ pub(crate) fn apply_latch(
             .get_mut(&prim)
             .ok_or(SimError::Fatal("latch: primary vessel vanished"))?;
         v.craft = Some(crate::CraftDef {
-            part_build_resources: Vec::new(),
+            part_build_resources: part_build_resources_m,
             hash_memo: Default::default(),
             graph: merge.graph,
             parts: parts_m,

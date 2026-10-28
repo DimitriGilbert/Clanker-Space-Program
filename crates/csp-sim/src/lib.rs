@@ -14220,6 +14220,85 @@ mod tests {
         );
     }
 
+    /// The latch merge carries the embodied-BOM table positionally —
+    /// the `part_ids` precedent: both halves covering their own
+    /// `parts` concat, so the merged hull's recovery credit refunds
+    /// BOTH builds. Without it the dock path was the write-only sink
+    /// the recovery credit closed on the manufacture path: two paid
+    /// vessels latched into a hull whose bill read "no bill
+    /// recorded".
+    #[test]
+    fn latch_merge_preserves_part_build_resources() {
+        let mut w = physics_world(false);
+        spawn_port_pair(&mut w, DVec3::new(0.0, 0.0, 1.8), flip_rot());
+        assert_eq!(w.joints().len(), 1);
+        // Splice the per-part bill a `ManufactureCraft` order would
+        // have frozen at build onto each half (`SpawnPhysicalVessel`
+        // refuses a non-empty table — it has no debit channel).
+        let ore = ResourceId::from("resource.ore");
+        for (id, qty) in [(VesselId(0), 20.0), (VesselId(1), 30.0)] {
+            w.vessels
+                .get_mut(&id)
+                .unwrap()
+                .craft
+                .as_mut()
+                .unwrap()
+                .part_build_resources = vec![vec![(ore.clone(), qty)]];
+        }
+        step_until(&mut w, 192, |w| w.joints().is_empty());
+        assert_eq!(w.vessels().len(), 1, "the pair merged");
+        let merged = w.vessels()[&VesselId(0)].craft.as_ref().unwrap();
+        // The concat stays parallel to `parts` — the
+        // empty-or-covering invariant the snapshot gate enforces.
+        assert_eq!(merged.parts.len(), 2);
+        assert_eq!(merged.part_build_resources.len(), merged.parts.len());
+        // Positional, not just summed: each half's row rides its own
+        // `effective_index` slot (vessel 0 is primary — equal masses
+        // tie to the smaller id).
+        assert_eq!(
+            merged.part_build_resources,
+            vec![vec![(ore.clone(), 20.0)], vec![(ore.clone(), 30.0)]]
+        );
+        // And the recovery read resolves the whole merged bill.
+        assert_eq!(
+            economy::recovery_bom(merged, 1.0),
+            vec![(ore, 50.0)],
+            "recovery credits both builds' BOM"
+        );
+    }
+
+    /// A mixed-coverage latch — one half carrying a bill, the other
+    /// spawned without one (the sandbox/legacy craft) — still merges
+    /// but drops to the "no bill recorded" empty convention: the
+    /// `part_ids` precedent, never a non-parallel table (the snapshot
+    /// gate would Fatal) and never a row bound at the wrong
+    /// `effective_index`. The manufactured half's refund is the
+    /// bounded one-time loss the drop accepts — the spec table's
+    /// refusal does not apply because the BOM is a record, not an
+    /// in-force model, and refusing would bar a paid craft from ever
+    /// latching a legacy hull.
+    #[test]
+    fn latch_merge_mixed_bom_coverage_drops_to_empty() {
+        let mut w = physics_world(false);
+        spawn_port_pair(&mut w, DVec3::new(0.0, 0.0, 1.8), flip_rot());
+        let ore = ResourceId::from("resource.ore");
+        w.vessels
+            .get_mut(&VesselId(0))
+            .unwrap()
+            .craft
+            .as_mut()
+            .unwrap()
+            .part_build_resources = vec![vec![(ore.clone(), 20.0)]];
+        step_until(&mut w, 192, |w| w.joints().is_empty());
+        assert_eq!(w.vessels().len(), 1, "the mixed-coverage pair still merges");
+        let merged = w.vessels()[&VesselId(0)].craft.as_ref().unwrap();
+        assert!(
+            merged.part_build_resources.is_empty(),
+            "mixed coverage drops to the empty convention"
+        );
+        assert!(economy::recovery_bom(merged, 1.0).is_empty());
+    }
+
     /// §2.6.5's opt-in: tracking a vessel promotes its PENDING
     /// `SoiTransition` to Clamping (not just future ones), and untracking
     /// demotes it back — while the moon-crossing vessel's Enter{m}
