@@ -2404,6 +2404,11 @@ impl View {
     /// not swallow sim failures.
     pub fn sim_step(&mut self, target_tick: u64) -> Result<AdvanceReport, SimError> {
         let start = self.sim.clock().ticks();
+        // The non-empty → empty arena edge, captured BEFORE the drain:
+        // a post-removal escape below needs the edge, not the level
+        // (a world that never held a vessel — boot before the starter
+        // seed's build delivers — must keep its Flight default).
+        let had_vessels = !self.sim.vessels().is_empty();
         let report = self.sim.step_frame(target_tick)?;
         self.ticks_last_frame = report.reached_tick - start;
         // C02-F1/C02-F2's focus boundary rides THIS seam — AFTER the
@@ -2415,6 +2420,24 @@ impl View {
         // of anything enqueued later — a same-batch removal can never
         // beat them.
         self.sync_focus_commands();
+        // The post-removal escape: this step's drain took the LAST
+        // vessel out of the arena while the player was in Flight —
+        // `resolved_focus` now has nothing to resolve, `extract_flight`
+        // emits only the fallback sky, and no input path leads out
+        // (the "purple void" C24-F1 documented for boot — the same
+        // dead scene, mid-session, on the last `RecoverVessel` or a
+        // terminal impact). Land the player in the VAB — the working
+        // session outlives its vessel and holds the very craft they
+        // just flew — rather than a frame nothing reacts in. Gated on
+        // the EDGE (`had_vessels`): a vessel-free world from boot
+        // keeps Flight until the seed delivers, and Map/VAB keep
+        // their own surfaces — only an empty Flight scene is dead.
+        if had_vessels && self.sim.vessels().is_empty() && self.mode() == ViewMode::Flight {
+            self.set_mode(ViewMode::Vab);
+            self.vab_event(vab::VabEvent::Notice(
+                "vessel recovered — the arena is empty; back in the VAB".to_string(),
+            ));
+        }
         // The launch revert point's delivery boundary (PLAN:1177-1180 —
         // the sim contract at `manufacture.rs` expects the post-delivery
         // snapshot): `launch_craft` captured the pre-ORDER world — its
@@ -3332,6 +3355,15 @@ impl View {
                 // the spawn gate can resolve each def's `tech_requirement`.
                 let part_ids: Vec<csp_data::PartId> =
                     built.iter().map(|b| b.part_id.clone()).collect();
+                // The embodied BOM rides the craft too — recovery
+                // credits it back into the site's inventory, so the
+                // per-part rows travel parallel to `parts`/`part_costs`
+                // (the apply re-checks they sum to the declared bill).
+                let part_build_resources: Vec<Vec<(csp_data::ResourceId, f64)>> = analysis
+                    .effective
+                    .iter()
+                    .map(|e| e.build_resources.clone())
+                    .collect();
                 Ok((
                     csp_sim::CraftDef {
                         hash_memo: Default::default(),
@@ -3340,6 +3372,7 @@ impl View {
                         part_costs,
                         reliability,
                         part_ids,
+                        part_build_resources,
                     },
                     build_resources,
                 ))
@@ -3561,11 +3594,18 @@ impl View {
             // out of, so a site-less world keeps the instant spawn
             // (funds still debit at apply). Sandbox/test worlds only;
             // the shipped data set always authors `terrin-launch`.
+            // The embodied-BOM table must NOT ride: this path never
+            // debited a bill, and the apply refuses a non-empty table
+            // precisely because crediting it at recovery would mint
+            // stock. Strip it here — the sandbox spawn is free craft,
+            // free of the recovery BOM too.
+            let mut sandbox_craft = craft;
+            sandbox_craft.part_build_resources.clear();
             self.enqueue_command(
                 SourceClass::Ui,
                 PLAYER_SOURCE_ID,
                 SimCommand::SpawnPhysicalVessel {
-                    craft,
+                    craft: sandbox_craft,
                     pos,
                     rot,
                     vel,
@@ -5839,6 +5879,7 @@ fn stock_flight_craft() -> csp_sim::CraftDef {
         ),
     );
     csp_sim::CraftDef {
+        part_build_resources: Vec::new(),
         hash_memo: Default::default(),
         part_ids: vec![],
         graph,
@@ -7236,6 +7277,7 @@ mod tests {
             csp_phys::PartNode::new(None, csp_phys::PartTransform::IDENTITY, 0),
         );
         csp_sim::CraftDef {
+            part_build_resources: Vec::new(),
             hash_memo: Default::default(),
             part_ids: vec![],
             graph,

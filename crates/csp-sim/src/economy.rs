@@ -55,11 +55,13 @@
 //! Efficiency is `1.0` at the body's launch site (`SiteDef::launch`),
 //! `recovery_efficiency` (0.9) elsewhere; `site: None` is the remote
 //! salvage — `abandon_recovery` (0.25) and no inventory credit at
-//! all. Effects: resource contents move to the site's inventory at
-//! `efficiency`, the live part graph's resolved `part_costs` pay out
-//! at `efficiency` to funds, roster crew aboard come home
-//! (`location: Unassigned`), pooled science banks at the §3.2
-//! recover fraction — and the vessel leaves the sim (the
+//! all. Effects: resource contents AND the craft's embodied build
+//! bill (`CraftDef::part_build_resources`, summed over live nodes —
+//! the same BOM `ManufactureCraft` debited the site for) move to the
+//! site's inventory at `efficiency`, the live part graph's resolved
+//! `part_costs` pay out at `efficiency` to funds, roster crew aboard
+//! come home (`location: Unassigned`), pooled science banks at the
+//! §3.2 recover fraction — and the vessel leaves the sim (the
 //! `remove_vessel` scrub).
 //!
 //! # Insolvency
@@ -651,6 +653,32 @@ pub(crate) fn recovery_resources(
     out.into_iter().collect()
 }
 
+/// The vessel's *embodied* bill of materials recovery credit —
+/// `CraftDef::part_build_resources` summed over the LIVE graph nodes
+/// (the `craft_cost_micros` convention: a node surgery removed
+/// simply stops referencing its index, so a hulk that left parts
+/// behind refunds only what landed) at `efficiency` — the same share
+/// the tank-contents credit takes, so a destroyed-craft recovery is
+/// honest rather than free. The `ManufactureCraft` order debited
+/// this BOM out of the launch site's inventory; without the return
+/// leg the stockpile is a write-only sink that permanently refuses
+/// launch after a handful of cycles. An empty table — "no bill
+/// recorded" — credits nothing.
+pub(crate) fn recovery_bom(craft: &crate::CraftDef, efficiency: f64) -> Vec<(ResourceId, f64)> {
+    let mut out: BTreeMap<ResourceId, f64> = BTreeMap::new();
+    for node in craft.graph.nodes.values() {
+        let idx = node.effective_index as usize;
+        if let Some(rows) = craft.part_build_resources.get(idx) {
+            for (res, units) in rows {
+                if units.is_finite() && *units > 0.0 {
+                    *out.entry(res.clone()).or_insert(0.0) += units * efficiency;
+                }
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
 /// Lazy-shadow capture for the economy book (the `shadow_science`
 /// precedent — one clone per tick that mutates it).
 pub(crate) fn shadow_economy(world_economy: &EconomyState, slot: &mut Option<EconomyState>) {
@@ -1114,7 +1142,17 @@ impl World {
         // Compute every effect first, then commit — the apply stays
         // one atomic mutation under its command shadow.
         let resource_credit = match site {
-            Some(id) if self.economy.sites.contains_key(id) => recovery_resources(v, efficiency),
+            Some(id) if self.economy.sites.contains_key(id) => {
+                let mut credit = recovery_resources(v, efficiency);
+                // The embodied BOM comes home through the same door
+                // `ManufactureCraft` debited it out of — same site
+                // inventory, same efficiency (a clean pad recovery
+                // refunds the whole bill; a downrange salvage at 0.9
+                // does not). The remote-salvage `None` arm keeps its
+                // no-inventory rule.
+                credit.extend(recovery_bom(craft, efficiency));
+                credit
+            }
             Some(_) => return Err(SimError::Recoverable("recover: site has no state")),
             None => Vec::new(),
         };
@@ -1285,6 +1323,7 @@ mod tests {
             csp_phys::PartNode::new(None, csp_phys::PartTransform::IDENTITY, 0),
         );
         CraftDef {
+            part_build_resources: Vec::new(),
             hash_memo: Default::default(),
             part_ids: vec![],
             graph,
@@ -1356,6 +1395,23 @@ mod tests {
                 deployed: BTreeMap::new(),
             },
         );
+        id
+    }
+
+    /// `latched_vessel` plus an embodied build bill on the craft —
+    /// the shape a `ManufactureCraft` delivery carries and the
+    /// recovery BOM refund reads (one row per part; the test craft
+    /// is one-node).
+    fn latched_bom_vessel(
+        w: &mut World,
+        cost: f64,
+        fuel: f64,
+        bom: Vec<(ResourceId, f64)>,
+    ) -> VesselId {
+        let id = latched_vessel(w, cost, fuel);
+        if let Some(c) = w.vessels.get_mut(&id).and_then(|v| v.craft.as_mut()) {
+            c.part_build_resources = vec![bom];
+        }
         id
     }
 
@@ -1605,6 +1661,61 @@ mod tests {
         assert_eq!(w.funds_micros(), to_micros(400.0 * 0.9));
         let inv = &w.economy().sites[&SiteId::from("terrin-downrange")].inventory;
         assert!((inv[&ResourceId::from("liquid_fuel")] - 45.0).abs() < 1e-9);
+    }
+
+    /// The embodied BOM refund: the bill the `ManufactureCraft` order
+    /// debited comes home into the recovery site's inventory at the
+    /// SAME efficiency the tank contents credit uses — 1.0 at the
+    /// launch site, `recovery_efficiency` (0.9) downrange. This is
+    /// the return leg the stockpile soft-lock was missing: without
+    /// it the launch→recover loop permanently sank the craft's BOM
+    /// until the site refused launch outright.
+    #[test]
+    fn recovery_refunds_the_embodied_bom_at_efficiency() {
+        // Launch-site recovery: the full bill returns.
+        let mut w = world();
+        w.set_sites([site("terrin-launch", true)].into_iter().collect());
+        let v = latched_bom_vessel(&mut w, 0.0, 0.0, vec![(ResourceId::from("metal"), 10.0)]);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RecoverVessel {
+                vessel: v,
+                site: Some(SiteId::from("terrin-launch")),
+            },
+        );
+        w.step_frame(1).unwrap();
+        let inv = &w.economy().sites[&SiteId::from("terrin-launch")].inventory;
+        assert!((inv[&ResourceId::from("metal")] - 10.0).abs() < 1e-9);
+        // Downrange: the same bill credits at `recovery_efficiency`.
+        let mut w = world();
+        w.set_sites([site("terrin-downrange", false)].into_iter().collect());
+        let v = latched_bom_vessel(&mut w, 0.0, 0.0, vec![(ResourceId::from("metal"), 10.0)]);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RecoverVessel {
+                vessel: v,
+                site: Some(SiteId::from("terrin-downrange")),
+            },
+        );
+        w.step_frame(1).unwrap();
+        let inv = &w.economy().sites[&SiteId::from("terrin-downrange")].inventory;
+        assert!((inv[&ResourceId::from("metal")] - 9.0).abs() < 1e-9);
+        // Abandon (`site: None`): the no-inventory rule holds for the
+        // BOM too — the 0.25 salvage is funds-only.
+        let mut w = world();
+        let v = latched_bom_vessel(&mut w, 0.0, 0.0, vec![(ResourceId::from("metal"), 10.0)]);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RecoverVessel {
+                vessel: v,
+                site: None,
+            },
+        );
+        w.step_frame(1).unwrap();
+        assert!(w.economy().sites.is_empty());
     }
 
     /// Abandon recovery (site None): `abandon_recovery` 0.25 — funds

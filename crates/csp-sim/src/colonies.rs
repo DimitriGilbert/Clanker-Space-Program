@@ -5292,6 +5292,7 @@ mod tests {
             csp_phys::PartNode::new(None, csp_phys::PartTransform::IDENTITY, 0),
         );
         crate::CraftDef {
+            part_build_resources: Vec::new(),
             hash_memo: Default::default(),
             part_ids: vec![],
             graph,

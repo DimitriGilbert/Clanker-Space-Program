@@ -450,6 +450,7 @@ mod tests {
             PartNode::new(None, PartTransform::IDENTITY, 0),
         );
         crate::CraftDef {
+            part_build_resources: Vec::new(),
             hash_memo: Default::default(),
             part_ids: vec![],
             graph,

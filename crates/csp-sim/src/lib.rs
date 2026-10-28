@@ -6211,6 +6211,17 @@ impl World {
                 "physical spawn: reliability table malformed",
             ));
         }
+        // The embodied-BOM table has no debit channel on this path —
+        // `ManufactureCraft` is the only verb that pays a bill out of
+        // a site inventory. A non-empty table here would mint stock
+        // at recovery (credit for resources never spent), so the
+        // sandbox spawn refuses it outright rather than rewriting
+        // the caller's craft. Test/scenario craft leave it empty.
+        if !craft.part_build_resources.is_empty() {
+            return Err(SimError::Recoverable(
+                "physical spawn: build-resource table requires a manufacture order",
+            ));
+        }
         // M7-B §3.3: the availability gate — a craft carrying catalog
         // identity launches only when every part's `tech_requirement`
         // is researched (see `check_part_gate`).
@@ -7553,6 +7564,7 @@ impl World {
                         part_costs: craft.part_costs.clone(),
                         reliability: craft.reliability.clone(),
                         part_ids: craft.part_ids.clone(),
+                        part_build_resources: craft.part_build_resources.clone(),
                     }),
                 )
                 .map_err(|e| SimError::Fatal(e.reason()))?,
@@ -7608,6 +7620,7 @@ impl World {
             part_costs: craft.part_costs.clone(),
             reliability: craft.reliability.clone(),
             part_ids: craft.part_ids.clone(),
+            part_build_resources: craft.part_build_resources.clone(),
         });
         v.state = VesselState::InBubble(nb);
         v.aero_mask = csp_phys::ConfigMask(retained_mask);
@@ -7665,6 +7678,7 @@ impl World {
                     part_costs: craft.part_costs.clone(),
                     reliability: craft.reliability.clone(),
                     part_ids: craft.part_ids.clone(),
+                    part_build_resources: craft.part_build_resources.clone(),
                 }),
                 state: VesselState::InBubble(fb),
                 aero_mask: csp_phys::ConfigMask::ALL,
@@ -11277,6 +11291,22 @@ fn check_restored_craft(craft: &CraftDef) -> Result<(), SimError> {
     if !craft.part_ids.is_empty() && craft.part_ids.len() != craft.parts.len() {
         return Err(SimError::Fatal("snapshot: craft part_ids table malformed"));
     }
+    // The embodied-BOM table rides the identical convention — empty
+    // ("no bill recorded") or covering `parts` exactly, finite
+    // non-negative amounts (a NaN row would fault the craft walk
+    // AND mint or eat inventory at recovery).
+    if !craft.part_build_resources.is_empty()
+        && (craft.part_build_resources.len() != craft.parts.len()
+            || craft
+                .part_build_resources
+                .iter()
+                .flatten()
+                .any(|(_, u)| !(u.is_finite() && *u >= 0.0)))
+    {
+        return Err(SimError::Fatal(
+            "snapshot: craft part_build_resources table malformed",
+        ));
+    }
     csp_phys::weld(&craft.graph, &craft.parts).map_err(|e| SimError::Fatal(e.reason()))?;
     Ok(())
 }
@@ -11735,6 +11765,22 @@ pub(crate) fn hash_craft(h: &mut StateHasher, craft: &CraftDef) {
     h.vec(&craft.reliability, |h, s| {
         reliability::hash_spec(h, s);
     });
+    // The embodied build bill — recovery reads it to credit site
+    // inventory, so it is craft identity like `part_costs` (the
+    // `part_ids` "inert post-spawn" carve-out does not apply). The
+    // walk emits ONLY when the table rides: an empty table — every
+    // pre-field and sandbox craft — hashes bit-identically to the
+    // pre-field stream, the `ContractProgress` conditional-emit
+    // convention. The possible byte-space still changed, so the
+    // schema version bumps with it.
+    if !craft.part_build_resources.is_empty() {
+        h.vec(&craft.part_build_resources, |h, rows| {
+            h.vec(rows, |h, (r, u)| {
+                h.str(r.as_str());
+                h.f64(*u);
+            });
+        });
+    }
 }
 
 /// The aero-table geometry walk — exactly the `CraftDef` fields
@@ -12270,6 +12316,7 @@ fn apply_breakup(
                     part_costs: craft.part_costs.clone(),
                     reliability: craft.reliability.clone(),
                     part_ids: craft.part_ids.clone(),
+                    part_build_resources: craft.part_build_resources.clone(),
                 }),
                 state: VesselState::InBubble(fb),
                 aero_mask: csp_phys::ConfigMask::ALL,
@@ -15771,6 +15818,7 @@ mod tests {
             csp_phys::PartNode::new(None, csp_phys::PartTransform::IDENTITY, 0),
         );
         CraftDef {
+            part_build_resources: Vec::new(),
             hash_memo: Default::default(),
             part_ids: vec![],
             graph,
@@ -16030,6 +16078,7 @@ mod tests {
             },
         };
         CraftDef {
+            part_build_resources: Vec::new(),
             hash_memo: Default::default(),
             part_ids: vec![],
             graph,
@@ -16129,6 +16178,7 @@ mod tests {
             thermal,
         };
         CraftDef {
+            part_build_resources: Vec::new(),
             hash_memo: Default::default(),
             graph,
             parts: vec![pod_part, chute_part],
@@ -17661,6 +17711,7 @@ mod tests {
             csp_phys::PartNode::new(None, csp_phys::PartTransform::IDENTITY, 0),
         );
         CraftDef {
+            part_build_resources: Vec::new(),
             hash_memo: Default::default(),
             part_ids: vec![],
             graph,
@@ -18165,6 +18216,7 @@ mod tests {
         };
         // Root tough (10 000 K cap), leaf fragile (400 K).
         let craft = CraftDef {
+            part_build_resources: Vec::new(),
             hash_memo: Default::default(),
             part_ids: vec![],
             graph,
@@ -18273,6 +18325,7 @@ mod tests {
         // Node 2 fragile; its healthy child must still fall with it.
         // Zero conduction isolates each lump's heating.
         let craft = CraftDef {
+            part_build_resources: Vec::new(),
             hash_memo: Default::default(),
             part_ids: vec![],
             graph,
@@ -18353,6 +18406,7 @@ mod tests {
             ),
         );
         let craft = CraftDef {
+            part_build_resources: Vec::new(),
             hash_memo: Default::default(),
             part_ids: vec![],
             graph,
@@ -18580,6 +18634,7 @@ mod tests {
             thermal,
         };
         CraftDef {
+            part_build_resources: Vec::new(),
             hash_memo: Default::default(),
             part_ids: vec![],
             graph,
@@ -18711,6 +18766,7 @@ mod tests {
             );
         }
         CraftDef {
+            part_build_resources: Vec::new(),
             hash_memo: Default::default(),
             part_ids: vec![],
             graph,
@@ -25091,6 +25147,7 @@ mod tests {
                 ..exploding.clone()
             };
             let craft = CraftDef {
+                part_build_resources: Vec::new(),
                 hash_memo: Default::default(),
                 part_ids: vec![],
                 graph,

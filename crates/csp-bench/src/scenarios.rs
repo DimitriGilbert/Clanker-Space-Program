@@ -292,6 +292,7 @@ pub fn flight_craft() -> csp_sim::CraftDef {
         },
     };
     csp_sim::CraftDef {
+        part_build_resources: Vec::new(),
         hash_memo: Default::default(),
         part_ids: vec![],
         graph,
@@ -355,6 +356,7 @@ pub fn science_craft() -> (csp_sim::CraftDef, Vec<(csp_data::ResourceId, f64)>) 
     };
     (
         csp_sim::CraftDef {
+            part_build_resources: Vec::new(),
             hash_memo: Default::default(),
             part_ids: vec![csp_data::PartId::from("csp.science.canister")],
             graph,
@@ -414,6 +416,7 @@ pub fn cargo_craft() -> (csp_sim::CraftDef, Vec<(csp_data::ResourceId, f64)>) {
     };
     (
         csp_sim::CraftDef {
+            part_build_resources: Vec::new(),
             hash_memo: Default::default(),
             part_ids: vec![csp_data::PartId::from("csp.battery.z1k")],
             graph,
@@ -480,6 +483,7 @@ pub fn orbiter_craft() -> csp_sim::CraftDef {
         },
     };
     csp_sim::CraftDef {
+        part_build_resources: Vec::new(),
         hash_memo: Default::default(),
         part_ids: vec![],
         graph,

@@ -23,7 +23,7 @@
 use std::collections::BTreeMap;
 
 use csp_core::{DQuat, DVec3, SimTime, StableDiscriminant, TICK_HZ};
-use csp_data::{BodyId, PartId};
+use csp_data::{BodyId, PartId, ResourceId};
 use csp_phys::{Environment, PartGraph, PartNodeId, WeldPart, WeldedBody};
 use serde::{Deserialize, Serialize};
 
@@ -124,6 +124,34 @@ pub struct CraftDef {
     /// construction-config catalog + hashed `TechState` at drain.
     #[serde(default)]
     pub part_ids: Vec<PartId>,
+    /// The embodied bill of materials — each part's resolved
+    /// `EffectivePart::build_resources` row, parallel to `parts`/
+    /// `part_costs`/`reliability`/`part_ids` (the same
+    /// `effective_index` convention, frozen at build). `RecoverVessel`
+    /// sums it over *live* nodes — the `craft_cost_micros`
+    /// convention, so a node surgery removed simply stops
+    /// contributing — and credits it into the recovery site's
+    /// `economy.sites[].inventory` at the recovery efficiency, the
+    /// same door the `ManufactureCraft` order debited it out of.
+    /// Without this the stockpile is write-only: every
+    /// launch→recover cycle permanently sinks the craft's BOM.
+    ///
+    /// An EMPTY table is legal and means "no bill recorded" —
+    /// hand-built test craft, pre-field saves, and the
+    /// `SpawnPhysicalVessel` sandbox path, which has no BOM debit
+    /// channel at all (the apply rejects a non-empty table there:
+    /// crediting an unspent bill would mint inventory). A non-empty
+    /// table must cover `parts` exactly (the `part_costs` gate's
+    /// convention) and, on `ManufactureCraft`, sum to the order's
+    /// declared `build_resources` — a disagreeing table is a
+    /// debit-small/recover-big mint, refused at apply.
+    ///
+    /// Serialized (the `#[serde(default)]` field-addition convention)
+    /// and **hashed** — unlike `part_ids` this is NOT inert
+    /// post-spawn: recovery reads it, so it is craft identity the
+    /// same way `part_costs` is.
+    #[serde(default)]
+    pub part_build_resources: Vec<Vec<(ResourceId, f64)>>,
     /// The `craft_graph_hash` memo — a pure cache, never content:
     /// `Clone` drops it (clone-modify-reassign is THE craft-mutation
     /// convention, so a clone inheriting the old hash would lie

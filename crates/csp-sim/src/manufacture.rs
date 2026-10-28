@@ -223,6 +223,22 @@ impl crate::World {
                 "manufacture: incoherent reliability table",
             ));
         }
+        // The embodied-BOM table — empty ("no bill recorded", the
+        // recovery credit is then zero) or covering `parts` exactly
+        // with finite non-negative rows — the same parallel-table
+        // convention as `part_costs`/`reliability`/`part_ids`.
+        if !craft.part_build_resources.is_empty()
+            && (craft.part_build_resources.len() != craft.parts.len()
+                || craft
+                    .part_build_resources
+                    .iter()
+                    .flatten()
+                    .any(|(_, u)| !(u.is_finite() && *u >= 0.0)))
+        {
+            return Err(SimError::Recoverable(
+                "manufacture: incoherent build-resource table",
+            ));
+        }
         // M7-B §3.3: the same availability gate the spawn apply runs —
         // an un-researched part cannot be ordered, not just launched.
         self.check_part_gate(&craft)?;
@@ -256,6 +272,26 @@ impl crate::World {
         // convention leaves open — closed here, at the money door only;
         // the spawn paths keep their sandbox craft rule).
         self.verify_bill(&craft, &bom)?;
+        // The mint-hole gate: when the craft carries a per-part bill,
+        // it must sum to the declared `build_resources` the order
+        // spends — recovery credits the per-part table back into a
+        // site inventory, so a table that disagrees with the spent
+        // bill is debit-small/recover-big forgery. The producer sums
+        // both from the same `EffectivePart::build_resources` rows in
+        // the same order, so equality is bitwise, not approximate.
+        if !craft.part_build_resources.is_empty() {
+            let mut per_part: BTreeMap<ResourceId, f64> = BTreeMap::new();
+            for rows in &craft.part_build_resources {
+                for (r, q) in rows {
+                    *per_part.entry(r.clone()).or_insert(0.0) += q;
+                }
+            }
+            if per_part != bom {
+                return Err(SimError::Recoverable(
+                    "manufacture: per-part build resources do not sum to the declared bill",
+                ));
+            }
+        }
         let cost = crate::economy::craft_cost_micros(&craft);
         if cost > self.economy.funds_micros {
             return Err(SimError::Recoverable("manufacture: insufficient funds"));
@@ -874,6 +910,7 @@ mod tests {
             csp_phys::PartNode::new(None, csp_phys::PartTransform::IDENTITY, 0),
         );
         crate::CraftDef {
+            part_build_resources: Vec::new(),
             hash_memo: Default::default(),
             part_ids: vec![],
             graph,
@@ -1005,6 +1042,102 @@ mod tests {
             inv[&ore], 80.0,
             "build−recover cycle must net only the BOM spend ({inv:?})"
         );
+    }
+
+    /// The embodied-BOM return leg (the stockpile soft-lock): a craft
+    /// whose `part_build_resources` records the bill the order spent
+    /// carries it through delivery, and `RecoverVessel` credits it
+    /// back into the site's inventory at the recovery efficiency —
+    /// here the pad's 1.0, so the build→deliver→recover cycle is
+    /// stockpile-neutral. Without the return leg every cycle
+    /// permanently sank the BOM (the ~11-cycle "insufficient metal"
+    /// wall the drain report found).
+    #[test]
+    fn embodied_bom_rides_delivery_and_refunds_at_recovery() {
+        let mut w = world();
+        let ore = ResourceId::from("ore");
+        let mut c = craft();
+        c.part_build_resources = vec![vec![(ore.clone(), 20.0)]];
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::ManufactureCraft {
+                site: SiteId::from("pad"),
+                craft: c,
+                build_resources: vec![(ore.clone(), 20.0)],
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        w.step_frame(w.clock().ticks() + 128).unwrap();
+        let vessel = *w.vessels().keys().next().unwrap();
+        // The bill survives delivery on the craft record.
+        assert_eq!(
+            w.vessels()[&vessel]
+                .craft
+                .as_ref()
+                .unwrap()
+                .part_build_resources,
+            vec![vec![(ore.clone(), 20.0)]]
+        );
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::RecoverVessel {
+                vessel,
+                site: Some(SiteId::from("pad")),
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+        let inv = &w.economy().sites[&SiteId::from("pad")].inventory;
+        assert_eq!(
+            inv[&ore], 100.0,
+            "pad recovery refunds the whole embodied BOM: {inv:?}"
+        );
+    }
+
+    /// The mint-hole gate: a per-part bill that does not sum to the
+    /// declared `build_resources` refuses — the order spends the
+    /// declared figure but recovery would credit the bigger table.
+    /// A non-parallel table rejects the same way (the
+    /// `reliability`-gate convention).
+    #[test]
+    fn manufacture_rejects_a_bom_table_that_disagrees_with_the_bill() {
+        let mut w = world();
+        let ore = ResourceId::from("ore");
+        let mut c = craft();
+        // Table claims 25, the declared bill spends 20 — forgery.
+        c.part_build_resources = vec![vec![(ore.clone(), 25.0)]];
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::ManufactureCraft {
+                site: SiteId::from("pad"),
+                craft: c,
+                build_resources: vec![(ore.clone(), 20.0)],
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert_eq!(r.rejected.len(), 1);
+        assert!(matches!(r.rejected[0].error, SimError::Recoverable(_)));
+        assert_eq!(
+            w.economy().sites[&SiteId::from("pad")].inventory[&ore],
+            100.0,
+            "a rejected order spends nothing"
+        );
+        let mut c2 = craft();
+        c2.part_build_resources = vec![vec![(ore.clone(), 20.0)], Vec::new()];
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::ManufactureCraft {
+                site: SiteId::from("pad"),
+                craft: c2,
+                build_resources: vec![(ore.clone(), 20.0)],
+            },
+        );
+        let r = w.step_frame(w.clock().ticks() + 1).unwrap();
+        assert_eq!(r.rejected.len(), 1, "non-parallel table must reject");
     }
 
     /// Affordability gates: a BOM entry over the stockpile, a missing

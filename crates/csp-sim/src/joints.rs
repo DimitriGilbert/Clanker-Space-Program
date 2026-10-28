@@ -1085,6 +1085,7 @@ pub(crate) fn apply_latch(
     // re-derives the rest.
     if physics.backend.environment().atmosphere.is_some() {
         let craft_m = crate::CraftDef {
+            part_build_resources: Vec::new(),
             hash_memo: Default::default(),
             graph: merge.graph.clone(),
             parts: parts_m.clone(),
@@ -1109,6 +1110,7 @@ pub(crate) fn apply_latch(
             .get_mut(&prim)
             .ok_or(SimError::Fatal("latch: primary vessel vanished"))?;
         v.craft = Some(crate::CraftDef {
+            part_build_resources: Vec::new(),
             hash_memo: Default::default(),
             graph: merge.graph,
             parts: parts_m,

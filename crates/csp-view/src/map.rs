@@ -3513,6 +3513,7 @@ mod tests {
             0,
             SimCommand::SpawnPhysicalVessel {
                 craft: csp_sim::CraftDef {
+                    part_build_resources: Vec::new(),
                     hash_memo: Default::default(),
                     part_ids: vec![],
                     graph,

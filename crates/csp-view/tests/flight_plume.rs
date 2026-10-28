@@ -35,6 +35,7 @@ fn hopper_craft(cap: f64, mpu: f64, thrust_n: f64, isp: f64) -> csp_sim::CraftDe
         csp_phys::PartNode::new(None, csp_phys::PartTransform::IDENTITY, 0),
     );
     csp_sim::CraftDef {
+        part_build_resources: Vec::new(),
         hash_memo: Default::default(),
         part_ids: vec![],
         graph,

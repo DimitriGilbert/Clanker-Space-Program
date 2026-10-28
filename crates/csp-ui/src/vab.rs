@@ -2356,7 +2356,7 @@ pub fn vab_editor(
     let mut panels = Vec::with_capacity(4);
     panels.push(palette_panel(ctx, vab));
     panels.push(inspector_panel(ctx, vab, craft_files, out));
-    panels.push(action_bar(ctx, vab));
+    panels.push(action_bar(ctx, vab, out));
     vab_hint_bar(ctx, vab, keys, key_labels);
     panels
 }
@@ -2655,9 +2655,13 @@ fn vab_press_gesture(
 }
 
 /// The bottom-center action strip — always-visible placement
-/// controls: radial symmetry, the attach-mode override, and the
-/// obvious remove/cancel affordances the old hint-only UI lacked.
-fn action_bar(ctx: &egui::Context, vab: &mut VabSession) -> egui::Rect {
+/// controls: radial symmetry, the attach-mode override, the obvious
+/// remove/cancel affordances the old hint-only UI lacked, and the
+/// in-editor LAUNCH button — the top bar used to be the only way to
+/// bring the working craft to the pad, which read as a dead end from
+/// inside the editor. It emits the same [`VabUiOutput::launch`] the
+/// top-bar button does — one outbox, one launch path.
+fn action_bar(ctx: &egui::Context, vab: &mut VabSession, out: &mut VabUiOutput) -> egui::Rect {
     // No title bar ⇒ egui drags the strip from anywhere on its
     // surface (WindowDrag::Anywhere) — parked bottom-center by
     // default, movable like every other overlay.
@@ -2732,6 +2736,12 @@ fn action_bar(ctx: &egui::Context, vab: &mut VabSession) -> egui::Rect {
                 }
                 if vab.carried().is_some() && ui.button("Put back (Esc)").clicked() {
                     let _ = vab.apply(VabAction::CancelPlacement);
+                }
+                ui.separator();
+                // The in-editor launch affordance — same
+                // `VabUiOutput::launch` outbox as the top-bar button.
+                if ui.button("LAUNCH").clicked() {
+                    out.launch = true;
                 }
             });
         })
@@ -3932,9 +3942,10 @@ fn vab_hint_bar(
                 ),
                 egui::Align2::LEFT_BOTTOM,
                 format!(
-                    "VAB  ·  {parts} part(s)  —  [{}] exit  drag empty space: orbit  \
-                     wheel: zoom  click part: select  click/drag selected: move  \
-                     drag root: move craft  Del/right-click: remove  Ctrl+Z: undo",
+                    "VAB  ·  {parts} part(s)  —  LAUNCH: build → pad  [{}] exit  \
+                     drag empty space: orbit  wheel: zoom  click part: select  \
+                     click/drag selected: move  drag root: move craft  \
+                     Del/right-click: remove  Ctrl+Z: undo",
                     keys.hint_labeled(crate::settings::KeyAction::ToggleVab, key_labels)
                 ),
                 egui::FontId::proportional(13.0),
@@ -5621,6 +5632,70 @@ mod tests {
         assert_eq!(
             vab.qualifications().unwrap()[&csp_data::FamilyId::from("f")].units(),
             5.0
+        );
+    }
+
+    /// The in-editor launch affordance: the action strip's LAUNCH
+    /// button emits the same `VabUiOutput::launch` the top bar does —
+    /// the "no way to pad from inside the VAB" dead end is gone.
+    #[test]
+    fn action_bar_launch_button_emits_out_launch() {
+        let ctx = egui::Context::default();
+        let mut vab = VabSession::new(mini_catalog(), mini_resources());
+        vab.apply(VabAction::SetRoot(PartId::from("t.tank")))
+            .unwrap();
+        let mut out = VabUiOutput::default();
+        // A fresh `Context` needs a few passes for the window's Area
+        // state (position + auto-size) to settle before its widgets'
+        // hit rects are trustworthy. The viewport is deliberately
+        // wide — the strip's content overflows a narrow one and the
+        // rightmost LAUNCH button would clip at the screen edge.
+        let mut rect = egui::Rect::NOTHING;
+        let wide_input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1600.0, 900.0),
+            )),
+            focused: true,
+            events,
+            ..Default::default()
+        };
+        for _ in 0..4 {
+            ctx.run_pass(wide_input(Vec::new()), |ctx| {
+                rect = action_bar(ctx, &mut vab, &mut out);
+            })
+            .drop_without_applying_deltas();
+        }
+        assert!(rect.is_positive(), "the action strip must draw");
+        // LAUNCH is the strip's rightmost interactive widget — the
+        // `interactive_rects_last_pass` registry reports real hit
+        // rects, so the click lands on the button itself rather than
+        // a guessed offset that drifts with layout growth.
+        let all = ctx.interactive_rects_last_pass();
+        let launch_rect = all
+            .into_iter()
+            // The strip itself is drag-anywhere interactive — the
+            // window's own hit rect equals `rect`; exclude it so the
+            // rightmost WIDGET (LAUNCH) is what gets clicked.
+            .filter(|r| *r != rect && rect.contains(r.center()))
+            .max_by(|a, b| a.right().total_cmp(&b.right()))
+            .expect("the action strip should hold interactive widgets");
+        let pos = launch_rect.center();
+        ctx.run_pass(
+            wide_input(vec![
+                egui::Event::PointerMoved(pos),
+                primary_button(pos, true),
+                primary_button(pos, false),
+            ]),
+            |ctx| {
+                action_bar(ctx, &mut vab, &mut out);
+            },
+        )
+        .drop_without_applying_deltas();
+        assert!(
+            out.launch,
+            "a click on the strip's rightmost control {launch_rect:?} \
+             must emit VabUiOutput::launch"
         );
     }
 }
