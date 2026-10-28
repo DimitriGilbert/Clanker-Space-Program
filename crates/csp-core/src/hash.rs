@@ -268,7 +268,20 @@ use crate::SimError;
 /// authored η moved to 0.02 (the M4b "lethal in the right places"
 /// calibration), so the flight golden's thermal trajectory moved
 /// with it. The goldens rebless.
-pub const HASH_SCHEMA_VERSION: u32 = 28;
+///
+/// **Version 29** (§3.6 multi-leg contract kinds, Phase 7.3):
+/// `ActiveContract` gained `progress: Option<ContractProgress>` —
+/// the kind-scoped record the `TouristFlight` flown-then-returned
+/// predicate keeps between triggers. The walk emits it only when
+/// `Some`, so a `None`-progress record hashes bit-identically to
+/// the pre-field stream — but the visitor's possible byte-space
+/// changed, so the schema bumps on the same convention as v23's
+/// `DeployRecord`. `ContractProgress` is an append-only
+/// `#[repr(u16)]` sum (`TouristFlight` = 0) carrying a
+/// `BTreeSet<CrewId>`. The goldens rebless; the stale schema-27
+/// `trivial` log no longer decodes, so it re-records via
+/// `record --force` (the documented decode-break path).
+pub const HASH_SCHEMA_VERSION: u32 = 29;
 
 /// Rule-7 sum types: the source of an enum's *declared* stable `u16`
 /// discriminant (PLAN §7.1 rule 7).
