@@ -149,6 +149,13 @@ pub struct TutorialInput {
     pub craft_has_thrust: bool,
     /// A focused vessel exists in the bubble.
     pub has_vessel: bool,
+    /// A manufacture order is in flight (`sim.builds` non-empty,
+    /// staged off the Program mirror's FACILITIES rows) — a launch
+    /// the player committed to whose craft hasn't delivered yet. An
+    /// empty pad mid-build is a delivery in progress, never a lost
+    /// vessel: the rewind stays suppressed and the launch step reads
+    /// satisfied while the order rides.
+    pub builds_pending: bool,
     /// Focused vessel's throttle `[0,1]`.
     pub throttle: f64,
     /// Focused vessel's altitude above the surface (m).
@@ -180,7 +187,11 @@ fn step_complete(step: usize, i: &TutorialInput) -> bool {
     match step {
         0 => i.in_vab || i.has_vessel,
         1 => i.has_vessel || (i.craft_parts > 0 && i.craft_has_thrust),
-        2 => i.has_vessel,
+        // The launch step credits the ORDER, not only the delivered
+        // hull — a `ManufactureCraft` in flight is a launch that
+        // happened, and holding "Launch from the pad" pending through
+        // the whole build reads as if the press did nothing.
+        2 => i.has_vessel || i.builds_pending,
         3 => i.has_vessel && i.throttle > 0.0,
         4 => i.has_vessel && i.alt_m > CLIMB_ALT_M,
         5 => i.has_vessel && i.alt_m > space_alt(i),
@@ -269,7 +280,10 @@ impl TutorialState {
     /// - *latch*: `finished` is sticky — a completed tutorial is not
     ///   un-completed by a later crash.
     pub fn observe(&mut self, input: &TutorialInput) {
-        if input.has_vessel {
+        // A pending order is the re-launch the banner asks for — the
+        // "vessel lost" line clears on the order, not just on the
+        // delivered hull minutes later.
+        if input.has_vessel || input.builds_pending {
             self.vessel_lost = false;
         }
         self.best_alt_m = self.best_alt_m.max(input.alt_m);
@@ -294,7 +308,15 @@ impl TutorialState {
         // for the science tier, where any replacement vessel — even
         // a pad hopper that never re-flies the ascent — re-runs the
         // experiment.
+        // A delivery in flight is progress, not a loss: the launch's
+        // own pad-clearing recovery empties the arena for the whole
+        // build, and rewinding to LAUNCH there teaches the player
+        // their order failed — the false "vessel lost" this gate
+        // exists to suppress. A build that then CANCELS drops
+        // `builds_pending` and the next frame judges the empty
+        // arena honestly.
         if !input.has_vessel
+            && !input.builds_pending
             && self.step > STEP_LAUNCH
             && (self.step < SCIENCE_TIER_START || input.science_banked <= 0.0)
         {
@@ -625,6 +647,96 @@ mod tests {
         });
         assert!(!t.vessel_lost);
         assert_eq!(t.step, 3);
+    }
+
+    /// A launch in the build-order era: pressing LAUNCH recovers the
+    /// pad's craft and spends a `ManufactureCraft` order, so the
+    /// arena reads `has_vessel: false` for the whole build. That is
+    /// a delivery in flight, not a lost vessel — the checklist must
+    /// hold its step and keep the banner down while the order rides,
+    /// and only judge the empty arena when the order leaves the
+    /// books (a `CancelBuild`, which IS a loss to re-guide from).
+    #[test]
+    fn pending_build_suppresses_the_loss_rewind() {
+        let idle = TutorialInput::default();
+        let mut t = run_script(&[TutorialInput {
+            has_vessel: true,
+            throttle: 1.0,
+            alt_m: 15_000.0,
+            atmosphere_top_m: 70_000.0,
+            ..idle
+        }]);
+        assert_eq!(t.step, 5);
+        // LAUNCH pressed: the pad craft recovered, the order armed.
+        t.observe(&TutorialInput {
+            builds_pending: true,
+            atmosphere_top_m: 70_000.0,
+            ..idle
+        });
+        assert_eq!(t.step, 5, "the build wait is not a vessel loss");
+        assert!(!t.vessel_lost);
+        // The order rides for minutes — the hold is stable, not a
+        // one-frame reprieve.
+        for _ in 0..3 {
+            t.observe(&TutorialInput {
+                builds_pending: true,
+                ..idle
+            });
+        }
+        assert_eq!(t.step, 5);
+        assert!(!t.vessel_lost);
+        // CancelBuild drops the order with the arena still empty —
+        // NOW the rewind judges honestly.
+        t.observe(&idle);
+        assert_eq!(t.step, STEP_LAUNCH);
+        assert!(t.vessel_lost);
+    }
+
+    /// The launch step credits the order itself: a player who presses
+    /// LAUNCH at "Launch from the pad" has launched — the checklist
+    /// moves to the throttle coaching while the craft builds instead
+    /// of stalling on a step the snapshot says they already did.
+    #[test]
+    fn pending_build_satisfies_the_launch_step() {
+        let idle = TutorialInput::default();
+        let mut t = run_script(&[TutorialInput {
+            in_vab: true,
+            craft_parts: 3,
+            craft_has_thrust: true,
+            ..idle
+        }]);
+        assert_eq!(t.step, STEP_LAUNCH);
+        t.observe(&TutorialInput {
+            builds_pending: true,
+            ..idle
+        });
+        assert_eq!(t.step, STEP_LAUNCH + 1, "the order IS the launch");
+        assert!(!t.vessel_lost);
+    }
+
+    /// A real loss rewound the checklist to LAUNCH; the re-launch's
+    /// pending order clears the stale banner at once — the "launch
+    /// again" advice was followed the moment the order armed, not
+    /// minutes later at delivery.
+    #[test]
+    fn pending_build_clears_the_stale_loss_banner() {
+        let mut t = run_script(&[
+            TutorialInput {
+                has_vessel: true,
+                throttle: 1.0,
+                alt_m: 15_000.0,
+                ..TutorialInput::default()
+            },
+            TutorialInput::default(),
+        ]);
+        assert_eq!(t.step, STEP_LAUNCH);
+        assert!(t.vessel_lost);
+        t.observe(&TutorialInput {
+            builds_pending: true,
+            ..TutorialInput::default()
+        });
+        assert!(!t.vessel_lost, "the re-launch's order is the answer");
+        assert_eq!(t.step, STEP_LAUNCH + 1);
     }
 
     /// C23-F3 — the coached "land and 'recover'" path banks the

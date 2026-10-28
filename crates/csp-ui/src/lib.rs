@@ -627,6 +627,14 @@ pub struct FlightHudInput<'a> {
     pub t_pe_s: Option<f64>,
     /// Orbital period (s).
     pub period_s: Option<f64>,
+    /// In-flight manufacture orders (`sim.builds`) — the same staged
+    /// `BuildRow`s the FACILITIES section draws, mirrored into the
+    /// flight mirror so the `!has_vessel` branch can name what the
+    /// player is actually waiting on. An empty arena mid-build is a
+    /// delivery in progress: the order's toast fades in ~1.5 s but
+    /// the build runs for minutes — without a persistent row the
+    /// scene reads as a dead void.
+    pub builds: &'a [crate::program::BuildRow],
     /// The focused vessel's propellant — one gauge per resource
     /// still carried (empty for tank-less vessels).
     pub propellant: &'a [PropellantGauge],
@@ -888,6 +896,37 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
                     )
                     .selectable(false),
                 );
+                // The build wait is the live case here — the launch
+                // path's own pad-clearing recovery leaves the arena
+                // empty until `ConstructionComplete` delivers. Name
+                // the order + its countdown persistently (the toast
+                // faded long ago), plus the warp ladder's way out.
+                for b in input.builds {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!(
+                                "BUILD #{} — {} — delivers in {}",
+                                b.id,
+                                b.label,
+                                fmt_clock(b.eta_s)
+                            ))
+                            .color(egui::Color32::from_rgb(140, 220, 140)),
+                        )
+                        .selectable(false),
+                    );
+                }
+                if !input.builds.is_empty() {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!(
+                                "delivery lands on the pad — [{}] to warp ahead",
+                                input.keys.hint(settings::KeyAction::WarpUp)
+                            ))
+                            .color(egui::Color32::from_gray(185)),
+                        )
+                        .selectable(false),
+                    );
+                }
                 ui.add(
                     egui::Label::new(
                         egui::RichText::new(format!(
@@ -1900,6 +1939,7 @@ mod tests {
             t_apo_s: Some(214.0),
             t_pe_s: None,
             period_s: None,
+            builds: &[],
             propellant,
             stages_left: 2,
             stages_total: 3,

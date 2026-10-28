@@ -117,30 +117,80 @@ fn launch_with_parked_build_stays_in_flight() {
 fn launch_with_drained_stockpile_refuses_loudly() {
     let mut view = View::new().expect("data/ load");
     let _seeded = deliver_latched(&mut view);
-    // Drain the pad's metal by placing build orders until one refuses
-    // — the pre-refund-fix soft-lock save state (~12 starter BOMs vs
-    // the 2000-metal authored stockpile).
-    let mut err = None;
+    // Drain the pad's stockpile with real orders (~12 starter BOMs vs
+    // the 2000-metal authored stockpile — the pre-refund-fix
+    // soft-lock save state). The launch gate admits ONE pending
+    // order per pad now (the double-charge hole it closes), so the
+    // drain rides the command channel — parallel builds are the
+    // sim's own foreign-order path — and every delivered hull is
+    // terminated, never recovered (a pad recovery refunds the
+    // embodied bill).
+    view.launch_craft().expect("first order");
+    frame(&mut view, 8);
+    let (site, craft, bom) = {
+        let b = view.sim.builds().values().next().expect("order armed");
+        (
+            b.site.clone(),
+            b.craft.clone(),
+            b.build_resources.clone().into_iter().collect::<Vec<_>>(),
+        )
+    };
+    let mut drained = false;
     for _ in 0..40 {
-        match view.launch_craft() {
-            Ok(()) => frame(&mut view, 8), // drain the order → debit the BOM
-            Err(e) => {
-                err = Some(e);
-                break;
-            }
+        view.enqueue_command(
+            SourceClass::Ui,
+            csp_view::PLAYER_SOURCE_ID,
+            SimCommand::ManufactureCraft {
+                site: site.clone(),
+                craft: craft.clone(),
+                build_resources: bom.clone(),
+            },
+        );
+        view.begin_frame();
+        let report = view.sim_step(view.sim.clock().ticks() + 8).unwrap();
+        view.end_frame();
+        // A drain-side "insufficient site inventory" reject is the
+        // wall — the order stops debiting past it.
+        if !report.rejected.is_empty() {
+            drained = true;
+            break;
         }
     }
-    let err = err.expect("the stockpile never ran dry in 40 orders");
-    assert!(err.contains("insufficient"), "{err}");
-    // Re-press from VAB like the real player: the refusal must keep
-    // them there with a persistent notice. Mirror what
-    // `App::handle_ui_outbox` does on `Err` — forward to the global
-    // cue channel.
-    view.set_mode(ViewMode::Vab);
-    match view.launch_craft() {
-        Ok(()) => panic!("still drained, must still refuse"),
-        Err(reason) => view.flight_notice(reason.to_uppercase()),
+    assert!(drained, "the stockpile never ran dry in 40 orders");
+    // Clear the books: every armed order delivers (the berth-defers
+    // retry chain spaces them a sim-second apart) into an immediate
+    // termination — `builds()` must empty with nothing materialized
+    // left so the button's own gates run again.
+    for _ in 0..400 {
+        frame(&mut view, 64);
+        if let Some(&vid) = view.sim.vessels().keys().next() {
+            view.enqueue_command(
+                SourceClass::Ui,
+                csp_view::PLAYER_SOURCE_ID,
+                SimCommand::TerminateVessel { vessel: vid },
+            );
+            frame(&mut view, 8);
+        }
+        if view.sim.builds().is_empty() && view.sim.vessels().is_empty() {
+            break;
+        }
     }
+    assert!(view.sim.builds().is_empty(), "an order never delivered");
+    assert!(view.sim.vessels().is_empty(), "a hull never terminated");
+
+    // The button press now reaches the affordability gates — and
+    // refuses with the shortfall named, keeping the player in the
+    // VAB. Mirror what `App::handle_ui_outbox` does on `Err` —
+    // forward to the global cue channel.
+    view.set_mode(ViewMode::Vab);
+    let err = match view.launch_craft() {
+        Ok(()) => panic!("still drained, must still refuse"),
+        Err(reason) => {
+            view.flight_notice(reason.to_uppercase());
+            reason
+        }
+    };
+    assert!(err.contains("insufficient"), "{err}");
     assert_eq!(view.mode(), ViewMode::Vab, "a refused launch keeps VAB");
     // Drain the staged VabEvent::Notice into the session like Input does.
     view.begin_frame();

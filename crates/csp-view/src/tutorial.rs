@@ -101,6 +101,14 @@ pub(crate) fn tutorial_drive(
         // as lost (P12-F2). `focus` covers only the InBubble/latched
         // staged set — it is a subset of the count.
         has_vessel: live.0 > 0,
+        // A `ManufactureCraft` order on the books is a launch the
+        // player already committed to — the same staged FACILITIES
+        // rows the HUD's build status and the camera hold read. The
+        // launch's own pad-clearing recovery leaves the arena empty
+        // for the whole build; without this the checklist's
+        // `has_vessel` rewind would call the in-flight delivery a
+        // lost vessel for minutes (the launch-UX defect).
+        builds_pending: !mirror.input.builds.is_empty(),
         throttle: focus.map_or(0.0, |v| v.throttle),
         alt_m: match (focus, env) {
             (Some(v), Some(env)) => (v.com - env.body_center).norm() - env.radius_m,
@@ -328,6 +336,67 @@ mod tests {
             false,
             &mut t,
         );
+        assert_eq!(t.0.step, csp_ui::tutorial::STEP_LAUNCH);
+        assert!(t.0.vessel_lost);
+    }
+
+    /// The launch-UX rule end-to-end through the driver: a build
+    /// order staged in the Program mirror keeps the checklist off
+    /// the `vessel_lost` rewind while the arena reads empty — and
+    /// the launch step it parks on counts the pending order, so a
+    /// rewound checklist resumes coaching throttle during the wait.
+    #[test]
+    fn staged_build_row_suppresses_the_rewind() {
+        let with_build = |builds: Vec<csp_ui::program::BuildRow>, t: &mut TutorialRes| {
+            let mut world = World::new();
+            world.insert_resource(FlightSnapshot {
+                env: Some(env()),
+                vessels: vec![],
+            });
+            world.insert_resource(crate::flight::LiveVesselCount(0));
+            world.insert_resource(crate::flight::FlightFocusOverride::default());
+            world.insert_resource(VabInput::default());
+            world.insert_resource(VabSessionRes::default());
+            world.insert_resource(crate::ProgramMirror {
+                input: csp_ui::program::ProgramInput {
+                    builds,
+                    ..csp_ui::program::ProgramInput::default()
+                },
+                ..crate::ProgramMirror::default()
+            });
+            world.insert_resource(std::mem::take(t));
+            let mut sched = Schedule::default();
+            sched.add_systems(tutorial_drive);
+            sched.run(&mut world);
+            *t = world.remove_resource::<TutorialRes>().expect("resource");
+        };
+        let row = || csp_ui::program::BuildRow {
+            id: 0,
+            site: "terrin-launch".into(),
+            label: "3-part craft".into(),
+            eta_s: 100.0,
+        };
+        let mut t = TutorialRes::default();
+        // Climb first — put the checklist on a telemetry step the
+        // rewind would otherwise fire on.
+        let climbing = FlightSnapshot {
+            env: Some(env()),
+            vessels: vec![vessel(
+                DVec3::new(6.02e5, 0.0, 0.0),
+                DVec3::new(0.0, 300.0, 400.0),
+                1.0,
+            )],
+        };
+        drive(climbing, 1, false, &mut t);
+        assert!(t.0.step > csp_ui::tutorial::STEP_LAUNCH);
+        // The launch's pad-clearing drain: empty arena, order armed.
+        // The checklist holds the step it earned (4 = Climb at 2 km).
+        with_build(vec![row()], &mut t);
+        assert_eq!(t.0.step, 4, "the build wait must not rewind to launch");
+        assert!(!t.0.vessel_lost);
+        // The order leaves the books with nothing delivered (a
+        // CancelBuild) — the next frame judges the empty arena.
+        with_build(vec![], &mut t);
         assert_eq!(t.0.step, csp_ui::tutorial::STEP_LAUNCH);
         assert!(t.0.vessel_lost);
     }

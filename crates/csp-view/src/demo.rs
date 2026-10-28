@@ -278,6 +278,15 @@ pub(crate) fn seed_pad_craft(view: &mut View, name: &str) -> Result<(), String> 
             .step_frame(complete)
             .map_err(|e| format!("starter seed: build delivery failed: {e}"))?;
     }
+    // The seed ran the whole order inside `step_frame`, so the
+    // "BUILD ORDER PLACED — delivery in …" toast `launch_craft`
+    // pushed is stale the moment the scene opens: the build it
+    // counted down already delivered. Clear the cue channel rather
+    // than open on a phantom countdown for a craft that is parked.
+    view.world
+        .resource_mut::<crate::flight::FlightSfx>()
+        .cues
+        .clear();
     Ok(())
 }
 

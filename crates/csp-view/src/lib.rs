@@ -688,6 +688,7 @@ fn build_ui(
                     t_apo_s: flight_ui.t_apo_s,
                     t_pe_s: flight_ui.t_pe_s,
                     period_s: flight_ui.period_s,
+                    builds: &flight_ui.builds,
                     propellant: &flight_ui.propellant,
                     stages_left: flight_ui.stages_left,
                     stages_total: flight_ui.stages_total,
@@ -2409,6 +2410,13 @@ impl View {
         // (a world that never held a vessel — boot before the starter
         // seed's build delivers — must keep its Flight default).
         let had_vessels = !self.sim.vessels().is_empty();
+        // The builds-edge half of the same signal: a `CancelBuild`
+        // (or a delivery that dropped its record without
+        // materializing) empties the build arena with NO vessel
+        // edge at all — the wait below needs this captured
+        // pre-drain or the cancelled-order player strands in the
+        // empty Flight scene the bounce exists to leave.
+        let had_builds = !self.sim.builds().is_empty();
         let report = self.sim.step_frame(target_tick)?;
         self.ticks_last_frame = report.reached_tick - start;
         // C02-F1/C02-F2's focus boundary rides THIS seam — AFTER the
@@ -2458,16 +2466,27 @@ impl View {
                 && r.kind == csp_core::RejectKind::ManufactureCraft)
                 .then(|| r.error.reason())
         });
-        if (had_vessels || order_reject.is_some())
+        // The builds edge: `builds()` was non-empty before the drain
+        // and is empty now with no vessel delivered — the order
+        // left the books without a product, which is a `CancelBuild`
+        // (or a dropped delivery, e.g. a vanished site). The vessel
+        // edge can't see it — nothing was removed, the wait simply
+        // ended — so without it a cancel in Flight lands the player
+        // on the same dead empty scene the vessel edge covers.
+        let builds_edge = had_builds && self.sim.builds().is_empty();
+        if (had_vessels || order_reject.is_some() || builds_edge)
             && self.sim.vessels().is_empty()
             && self.sim.builds().is_empty()
             && self.mode() == ViewMode::Flight
         {
             self.set_mode(ViewMode::Vab);
-            let msg = order_reject.map_or_else(
-                || "vessel recovered — the arena is empty; back in the VAB".to_string(),
-                |reason| format!("build order refused — {reason}"),
-            );
+            let msg = if let Some(reason) = order_reject {
+                format!("build order refused — {reason}")
+            } else if !had_vessels {
+                "build order ended — the arena is empty; back in the VAB".to_string()
+            } else {
+                "vessel recovered — the arena is empty; back in the VAB".to_string()
+            };
             self.vab_event(vab::VabEvent::Notice(msg));
         }
         // The launch revert point's delivery boundary (PLAN:1177-1180 —
@@ -4056,6 +4075,25 @@ impl View {
         build_resources: &[(csp_data::ResourceId, f64)],
         occupant: Option<csp_sim::VesselId>,
     ) -> Option<String> {
+        // One order per pad at a time. A second LAUNCH mid-build
+        // used to arm a second `ManufactureCraft` — double-charging
+        // the player and queuing a delivery that can only berth
+        // after the first — so the press refuses loudly instead.
+        // Scoped to the same condition the order path takes below
+        // (`site` + a catalog-resolved craft): a site-less/anonymous
+        // spawn never mints a build, and a foreign order at ANOTHER
+        // site doesn't claim this berth.
+        if let Some(site) = site.filter(|_| !craft.part_ids.is_empty())
+            && let Some(b) = self.sim.builds().values().find(|b| b.site == site.id)
+        {
+            let eta_s = b.complete_tick.saturating_sub(self.sim.clock().ticks()) as f64
+                / csp_core::TICK_HZ as f64;
+            return Some(self.launch_refused(format!(
+                "a build is already in flight — delivery #{} lands in {}; wait for it or cancel it in FACILITIES",
+                b.id.0,
+                csp_ui::fmt_period(eta_s)
+            )));
+        }
         // §3.5's cap — vessels + in-flight builds (each build already
         // reserved its delivery slot).
         if self.sim.vessel_slots_in_use() >= self.sim.vessel_caps().max_vessels {

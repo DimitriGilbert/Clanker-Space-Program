@@ -292,6 +292,7 @@ fn flight_input<'a>(
         t_apo_s: Some(214.0),
         t_pe_s: None,
         period_s: None,
+        builds: &[],
         propellant: prop,
         stages_left: 2,
         stages_total: 3,

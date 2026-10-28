@@ -599,6 +599,14 @@ pub struct FlightUiData {
     /// Navball: surface-relative prograde in body frame (unit) —
     /// `None` while the vessel is surface-stationary (parked).
     pub nav_prograde: Option<[f64; 3]>,
+    /// In-flight manufacture orders — the FACILITIES `BuildRow`s
+    /// mirrored from [`crate::ProgramMirror`]'s staged table so the
+    /// `!has_vessel` HUD branch shows the delivery countdown and the
+    /// no-focus branch below can tell "arena empty mid-build" (hold
+    /// the camera; the pad the launch pressed from is still the
+    /// scene) from "arena empty, nothing coming" (the dead-scene
+    /// void). Session data only — never read back into the sim.
+    pub builds: Vec<csp_ui::program::BuildRow>,
     /// Total vessels in the world (bubble + latched).
     pub vessel_count: usize,
     /// Debris-flagged vessels.
@@ -2034,6 +2042,7 @@ pub(crate) fn flight_present(
     mut sfx: ResMut<FlightSfx>,
     clock: Res<crate::Clock>,
     mut focus_override: ResMut<FlightFocusOverride>,
+    mirror: Res<crate::ProgramMirror>,
 ) {
     ui.vessel_count = snap.vessels.len();
     ui.debris_count = snap.vessels.iter().filter(|v| v.debris).count();
@@ -2078,8 +2087,22 @@ pub(crate) fn flight_present(
     // The audio backend's focus mirror: voices key off this, not a
     // `vessels.last()` of their own (P07-F1).
     sfx.focus_vessel = focus.map(|f| f.id);
+    // The staged FACILITIES rows — the HUD's build-status surface and
+    // the no-focus branch's "delivery in flight" signal.
+    ui.builds.clone_from(&mirror.input.builds);
     let Some(focus) = focus else {
-        cam.0.valid = false;
+        // An empty arena with an order on the books is a delivery in
+        // flight, not a dead scene: keep the last solved chase pose
+        // (the pad the launch pressed from — the camera framed it
+        // while the occupant was still staged) so the terrain pass +
+        // launch complex keep drawing for the build's duration
+        // instead of dropping to the fallback void. The pose
+        // re-solves the frame the delivery stages a vessel; a
+        // build-free empty arena still invalidates (the truly dead
+        // scene `sim_step`'s VAB bounce covers).
+        if ui.builds.is_empty() {
+            cam.0.valid = false;
+        }
         ui.has_vessel = false;
         ui.focus = None;
         ui.propellant.clear();
@@ -4141,6 +4164,7 @@ mod tests {
             world.insert_resource(FlightSfx::default());
             world.insert_resource(crate::Clock::default());
             world.insert_resource(FlightFocusOverride::default());
+            world.insert_resource(crate::ProgramMirror::default());
             let mut sched = Schedule::default();
             sched.add_systems(flight_present);
             sched.run(&mut world);
@@ -4155,6 +4179,70 @@ mod tests {
             run(VesselId(7)),
             None,
             "the focused vessel's own plan needs no owner label"
+        );
+    }
+
+    /// The launch-UX camera hold: an empty arena with a build order
+    /// on the books is a delivery in flight — the no-focus branch
+    /// must KEEP the last solved pose (the pad the launch pressed
+    /// from), so `extract_flight`'s terrain gate stays open for the
+    /// whole build instead of dropping to the fallback void. The
+    /// same empty arena with NO order still invalidates — the
+    /// dead-scene path `sim_step` bounces out of.
+    #[test]
+    fn no_focus_holds_the_camera_while_a_build_is_pending() {
+        let run = |builds: Vec<csp_ui::program::BuildRow>| -> (bool, usize) {
+            let mut world = bevy_ecs::world::World::new();
+            world.insert_resource(FlightInput::default());
+            world.insert_resource(FlightSnapshot {
+                env: None,
+                vessels: vec![],
+            });
+            world.insert_resource(LiveVesselCount::default());
+            world.insert_resource(RailsStaged::default());
+            world.insert_resource(StagePlans::default());
+            world.insert_resource(VesselPropulsionStaged::default());
+            world.insert_resource(TerrainConfig::default());
+            world.insert_resource(TerrainCache::default());
+            // A previously solved pose — the pad camera from before
+            // the launch's pad-clearing drain emptied the scene.
+            let mut cam = FlightCameraF64::default();
+            cam.0.valid = true;
+            world.insert_resource(cam);
+            world.insert_resource(FlightUiData::default());
+            world.insert_resource(FlightSfx::default());
+            world.insert_resource(crate::Clock::default());
+            world.insert_resource(FlightFocusOverride::default());
+            world.insert_resource(crate::ProgramMirror {
+                input: csp_ui::program::ProgramInput {
+                    builds,
+                    ..csp_ui::program::ProgramInput::default()
+                },
+                ..crate::ProgramMirror::default()
+            });
+            let mut sched = Schedule::default();
+            sched.add_systems(flight_present);
+            sched.run(&mut world);
+            (
+                world.resource::<FlightCameraF64>().0.valid,
+                world.resource::<FlightUiData>().builds.len(),
+            )
+        };
+        let pending = vec![csp_ui::program::BuildRow {
+            id: 0,
+            site: "terrin-launch".into(),
+            label: "3-part craft".into(),
+            eta_s: 100.0,
+        }];
+        assert_eq!(
+            run(pending),
+            (true, 1),
+            "a pending order holds the camera + mirrors the row"
+        );
+        assert_eq!(
+            run(vec![]),
+            (false, 0),
+            "a build-free empty arena is still the dead scene"
         );
     }
 }
