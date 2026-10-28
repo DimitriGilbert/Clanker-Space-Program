@@ -565,14 +565,11 @@ pub(crate) fn build_packet(
     // co-rotates latched poses by. The heightfield/biome data is
     // body-fixed while patch directions and positions are inertial, so
     // lookups run through the conjugate rotation `unspin`; the shader
-    // does the same inside `vs_terrain`. `phase` wraps to [0, 2π)
-    // before the f32 cast so long-running clocks don't lose resolution.
-    let spin_phase = env.spin_phase.rem_euclid(2.0 * core::f64::consts::PI);
-    let unspin = if spin_phase != 0.0 {
-        DQuat::from_axis_angle(env.spin_axis, -spin_phase)
-    } else {
-        DQuat::IDENTITY
-    };
+    // does the same inside `vs_terrain`. `spin_rotation` wraps the
+    // phase to [0, 2π) so long-running clocks don't lose resolution —
+    // `conjugate` of `R(axis, φ)` IS `R(axis, −φ)` for a unit quat.
+    let unspin = crate::structures::spin_rotation(env).conjugate();
+    let spin_phase = crate::structures::wrapped_spin_phase(env);
 
     let eye_rel = cam.eye - env.body_center;
     // `amplitude_m` rides the horizon cull — displaced relief up to

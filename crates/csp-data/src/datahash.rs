@@ -414,7 +414,11 @@ fn collect(dir: &Path, prefix: &str, out: &mut Vec<String>) -> Result<(), DataHa
 /// *is* `data/art/` on a case-insensitive checkout, so folding keeps
 /// the hashed set platform-identical.
 fn in_scope(rel: &str) -> bool {
-    let in_art = rel.len() > 4 && rel[..4].eq_ignore_ascii_case("art/");
+    // Byte-slice prefix compare, not `rel[..4]` — `str` indexing panics
+    // when byte 4 straddles a multi-byte char (`ab€.ron` is legal
+    // UTF-8). `"art/"` is pure ASCII, so a match also makes index 4 a
+    // provable char boundary for the `rel[4..]` extension tail below.
+    let in_art = rel.len() > 4 && rel.as_bytes()[..4].eq_ignore_ascii_case(b"art/");
     if in_art
         && let Some(ext) = rel[4..].rsplit('.').next()
         && ART_EXTENSIONS.iter().any(|e| ext.eq_ignore_ascii_case(e))
@@ -505,6 +509,19 @@ mod tests {
         ] {
             assert!(in_scope(rel), "{rel} must be hashed");
         }
+    }
+
+    /// C31 side observation: a legal UTF-8 name whose 4th byte sits
+    /// mid-char must not panic the prefix probe — `str` slicing is
+    /// byte-granular and refuses non-boundary cuts. `€` is 3 UTF-8
+    /// bytes, so `ab€` and `ar€t` put index 4 inside the char.
+    #[test]
+    fn in_scope_tolerates_multibyte_names() {
+        assert!(in_scope("ab€.ron"));
+        assert!(in_scope("ar€t/x.csar"));
+        // The matched prefix keeps index 4 a boundary — `art/` plus a
+        // multi-byte stem is still the art dir.
+        assert!(!in_scope("art/€.csar"));
     }
 
     /// Two files whose paths differ only by case collide on a

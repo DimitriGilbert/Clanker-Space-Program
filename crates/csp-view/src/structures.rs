@@ -115,12 +115,20 @@ pub(crate) struct SiteFrame {
     pub origin: DVec3,
 }
 
+/// The wrapped spin phase `ω·t mod 2π` — the scalar the terrain
+/// shader's `spin` uniform consumes (and [`spin_rotation`] builds
+/// on). Wrapped before any f32 narrowing so long-running clocks
+/// don't lose resolution.
+pub(crate) fn wrapped_spin_phase(env: &FlightEnv) -> f64 {
+    env.spin_phase.rem_euclid(2.0 * core::f64::consts::PI)
+}
+
 /// The body's fixed→inertial spin at the flight frame's phase —
 /// `env.spin_phase` IS `ω·t`, identity at rest (C20-F4 — the
 /// lat/lon→direction + spin-phase math was hand-kept in four places;
 /// the heightfield's inverse lookup uses [`DQuat::conjugate`]).
 pub(crate) fn spin_rotation(env: &FlightEnv) -> DQuat {
-    let phase = env.spin_phase.rem_euclid(2.0 * core::f64::consts::PI);
+    let phase = wrapped_spin_phase(env);
     if phase != 0.0 {
         DQuat::from_axis_angle(env.spin_axis, phase)
     } else {

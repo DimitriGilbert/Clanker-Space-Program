@@ -88,10 +88,10 @@ pub use ids::{
 };
 pub use load::{
     DataSource, EmbeddedSource, FsDataSource, LoadError, LoadedBiomeMap, LoadedBody,
-    LoadedContract, LoadedContracts, LoadedExperiment, LoadedExperiments, LoadedPart, LoadedParts,
-    LoadedRecipe, LoadedRecipes, LoadedSystem, LoadedTechFile, LoadedTechTree, SourceEntry,
-    load_balance, load_balance_from, load_colonies, load_colonies_from, load_contracts,
-    load_contracts_from, load_experiments, load_experiments_from, load_id_baseline,
+    LoadedContract, LoadedContracts, LoadedDef, LoadedExperiment, LoadedExperiments, LoadedPart,
+    LoadedParts, LoadedRecipe, LoadedRecipes, LoadedSystem, LoadedTechFile, LoadedTechTree,
+    SourceEntry, load_balance, load_balance_from, load_colonies, load_colonies_from,
+    load_contracts, load_contracts_from, load_experiments, load_experiments_from, load_id_baseline,
     load_id_baseline_from, load_loc, load_loc_from, load_parts, load_parts_from, load_recipes,
     load_recipes_from, load_resources, load_resources_from, load_sites, load_sites_from,
     load_system, load_system_from, load_techtree, load_techtree_from,

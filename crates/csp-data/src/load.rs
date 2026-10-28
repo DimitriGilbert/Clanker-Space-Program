@@ -82,17 +82,23 @@ pub struct LoadedSystem {
     pub orphans: Vec<PathBuf>,
 }
 
-/// One loaded part def plus the file it came from — the validator
-/// checks `id` ↔ file-stem agreement (§3.1: the file *is* the ID).
+/// The `def + relative-path` pair every registry loader emits — the
+/// validator's `id` ↔ file-stem agreement check (§3.1: the file *is*
+/// the ID) needs the file name, and diagnostics report the path. One
+/// generic instead of five hand-kept copies (C31-F6); the per-kind
+/// aliases below keep the call sites' names.
 #[derive(Clone, Debug, PartialEq)]
-pub struct LoadedPart {
+pub struct LoadedDef<T> {
     /// Parsed def.
-    pub def: PartDef,
-    /// Path relative to the `data/parts/` root the loader was handed —
-    /// carried for diagnostics (`parts/engines/csp.engine.sparc.ron`)
-    /// and the id↔stem check.
+    pub def: T,
+    /// Path relative to the registry root the loader was handed.
     pub path: PathBuf,
 }
+
+/// One loaded part def plus the file it came from (e.g.
+/// `parts/engines/csp.engine.sparc.ron` relative to the `data/parts/`
+/// root).
+pub type LoadedPart = LoadedDef<PartDef>;
 
 /// Everything `load_parts` read under a `data/parts/` directory, in
 /// ascending relative-path order (deterministic — the same order
@@ -714,15 +720,45 @@ pub fn load_colonies_from(src: &dyn DataSource, path: &Path) -> Result<ColonyFil
     })
 }
 
-/// One loaded recipe def plus its source path — the `id` ↔ stem check
-/// needs the file name, like [`LoadedExperiment`].
-#[derive(Clone, Debug, PartialEq)]
-pub struct LoadedRecipe {
-    /// Parsed def.
-    pub def: RecipeDef,
-    /// Path relative to the `data/recipes/` root the loader was handed.
-    pub path: PathBuf,
+/// The shared body of the registry loaders (C31-F6 — the five
+/// `load_*_from` bodies were the same 20-line function written five
+/// times): missing directory → empty set, `ron_files` in hash order,
+/// one [`read_versioned_ron`] per file against its single-version
+/// slice, `strip_prefix` to the registry-relative path. A loader-rule
+/// change (a new file-shape gate, a second supported version) now
+/// lands once instead of five times.
+fn load_registry<T: serde::de::DeserializeOwned>(
+    src: &dyn DataSource,
+    dir: &Path,
+    supported: &[u32],
+    probe: fn(&T) -> u32,
+) -> Result<Vec<LoadedDef<T>>, LoadError> {
+    if !src.exists(dir) {
+        return Ok(Vec::new());
+    }
+    let files = src.ron_files(dir)?;
+    let mut defs = Vec::with_capacity(files.len());
+    for path in files {
+        let def: T = read_versioned_ron(src, &path, supported, probe)?;
+        let rel = path.strip_prefix(dir).unwrap_or(&path).to_path_buf();
+        defs.push(LoadedDef { def, path: rel });
+    }
+    Ok(defs)
 }
+
+/// The registries' shared `by_id` rule: first def wins on a duplicate
+/// id — the map only has to be deterministic because the validator
+/// flags the duplicate loudly.
+fn first_wins<'a, K: Ord, T: 'a>(pairs: impl Iterator<Item = (K, &'a T)>) -> BTreeMap<K, &'a T> {
+    let mut out = BTreeMap::new();
+    for (k, v) in pairs {
+        out.entry(k).or_insert(v);
+    }
+    out
+}
+
+/// One loaded recipe def plus its source path.
+pub type LoadedRecipe = LoadedDef<RecipeDef>;
 
 /// Everything `load_recipes` read under a `data/recipes/` directory,
 /// ascending relative-path order — the deterministic order
@@ -738,12 +774,8 @@ impl LoadedRecipes {
     /// installs as construction config and the validator resolves
     /// converter refs against. First def wins on a duplicate id; the
     /// validator flags the duplicate loudly.
-    pub fn by_id(&self) -> std::collections::BTreeMap<crate::ids::RecipeId, &RecipeDef> {
-        let mut out = std::collections::BTreeMap::new();
-        for r in &self.recipes {
-            out.entry(r.def.id.clone()).or_insert(&r.def);
-        }
-        out
+    pub fn by_id(&self) -> BTreeMap<crate::ids::RecipeId, &RecipeDef> {
+        first_wins(self.recipes.iter().map(|r| (r.def.id.clone(), &r.def)))
     }
 }
 
@@ -759,34 +791,15 @@ pub fn load_recipes(dir: &Path) -> Result<LoadedRecipes, LoadError> {
 
 /// [`load_recipes`] against an arbitrary [`DataSource`].
 pub fn load_recipes_from(src: &dyn DataSource, dir: &Path) -> Result<LoadedRecipes, LoadError> {
-    if !src.exists(dir) {
-        return Ok(LoadedRecipes {
-            recipes: Vec::new(),
-        });
-    }
-    let files = src.ron_files(dir)?;
-    let mut recipes = Vec::with_capacity(files.len());
-    for path in files {
-        let def: RecipeDef =
-            read_versioned_ron(src, &path, &[RECIPE_SCHEMA_VERSION], |d: &RecipeDef| {
-                d.schema_version
-            })?;
-        let rel = path.strip_prefix(dir).unwrap_or(&path).to_path_buf();
-        recipes.push(LoadedRecipe { def, path: rel });
-    }
-    Ok(LoadedRecipes { recipes })
+    Ok(LoadedRecipes {
+        recipes: load_registry(src, dir, &[RECIPE_SCHEMA_VERSION], |d: &RecipeDef| {
+            d.schema_version
+        })?,
+    })
 }
 
-/// One loaded experiment def plus its source path (the `id` ↔ stem
-/// check needs the file name, like [`LoadedPart`]).
-#[derive(Clone, Debug, PartialEq)]
-pub struct LoadedExperiment {
-    /// Parsed def.
-    pub def: ExperimentDef,
-    /// Path relative to the `data/experiments/` root the loader was
-    /// handed — diagnostics only.
-    pub path: PathBuf,
-}
+/// One loaded experiment def plus its source path.
+pub type LoadedExperiment = LoadedDef<ExperimentDef>;
 
 /// Everything `load_experiments` read under a `data/experiments/`
 /// directory, ascending relative-path order — the deterministic order
@@ -802,12 +815,8 @@ impl LoadedExperiments {
     /// installs (`csp-view`/`csp-bench` world construction; the
     /// validator iterates `experiments` directly). First def wins on
     /// a duplicate id; the validator flags the duplicate loudly.
-    pub fn by_id(&self) -> std::collections::BTreeMap<ExperimentId, &ExperimentDef> {
-        let mut out = std::collections::BTreeMap::new();
-        for e in &self.experiments {
-            out.entry(e.def.id.clone()).or_insert(&e.def);
-        }
-        out
+    pub fn by_id(&self) -> BTreeMap<ExperimentId, &ExperimentDef> {
+        first_wins(self.experiments.iter().map(|e| (e.def.id.clone(), &e.def)))
     }
 }
 
@@ -826,36 +835,18 @@ pub fn load_experiments_from(
     src: &dyn DataSource,
     dir: &Path,
 ) -> Result<LoadedExperiments, LoadError> {
-    if !src.exists(dir) {
-        return Ok(LoadedExperiments {
-            experiments: Vec::new(),
-        });
-    }
-    let files = src.ron_files(dir)?;
-    let mut experiments = Vec::with_capacity(files.len());
-    for path in files {
-        let def: ExperimentDef = read_versioned_ron(
+    Ok(LoadedExperiments {
+        experiments: load_registry(
             src,
-            &path,
+            dir,
             &[EXPERIMENT_SCHEMA_VERSION],
             |d: &ExperimentDef| d.schema_version,
-        )?;
-        let rel = path.strip_prefix(dir).unwrap_or(&path).to_path_buf();
-        experiments.push(LoadedExperiment { def, path: rel });
-    }
-    Ok(LoadedExperiments { experiments })
+        )?,
+    })
 }
 
-/// One loaded contract template plus its source path — the `id` ↔
-/// stem check needs the file name, like [`LoadedExperiment`].
-#[derive(Clone, Debug, PartialEq)]
-pub struct LoadedContract {
-    /// Parsed def.
-    pub def: ContractTemplate,
-    /// Path relative to the `data/contracts/` root the loader was
-    /// handed — diagnostics only.
-    pub path: PathBuf,
-}
+/// One loaded contract template plus its source path.
+pub type LoadedContract = LoadedDef<ContractTemplate>;
 
 /// Everything `load_contracts` read under a `data/contracts/`
 /// directory, ascending relative-path order — the deterministic order
@@ -870,14 +861,8 @@ impl LoadedContracts {
     /// The defs keyed by [`crate::ids::ContractTypeId`] — the lookup
     /// the sim installs. First def wins on a duplicate id; the
     /// validator flags the duplicate loudly.
-    pub fn by_id(
-        &self,
-    ) -> std::collections::BTreeMap<crate::ids::ContractTypeId, &ContractTemplate> {
-        let mut out = std::collections::BTreeMap::new();
-        for c in &self.contracts {
-            out.entry(c.def.id.clone()).or_insert(&c.def);
-        }
-        out
+    pub fn by_id(&self) -> BTreeMap<crate::ids::ContractTypeId, &ContractTemplate> {
+        first_wins(self.contracts.iter().map(|c| (c.def.id.clone(), &c.def)))
     }
 }
 
@@ -894,37 +879,20 @@ pub fn load_contracts(dir: &Path) -> Result<LoadedContracts, LoadError> {
 
 /// [`load_contracts`] against an arbitrary [`DataSource`].
 pub fn load_contracts_from(src: &dyn DataSource, dir: &Path) -> Result<LoadedContracts, LoadError> {
-    if !src.exists(dir) {
-        return Ok(LoadedContracts {
-            contracts: Vec::new(),
-        });
-    }
-    let files = src.ron_files(dir)?;
-    let mut contracts = Vec::with_capacity(files.len());
-    for path in files {
-        let def: ContractTemplate = read_versioned_ron(
+    Ok(LoadedContracts {
+        contracts: load_registry(
             src,
-            &path,
+            dir,
             &[CONTRACT_SCHEMA_VERSION],
             |d: &ContractTemplate| d.schema_version,
-        )?;
-        let rel = path.strip_prefix(dir).unwrap_or(&path).to_path_buf();
-        contracts.push(LoadedContract { def, path: rel });
-    }
-    Ok(LoadedContracts { contracts })
+        )?,
+    })
 }
 
 /// One loaded tech-tree fragment plus its source path — diagnostics
-/// only, like [`LoadedExperiment`]: the merged tree is id-keyed, and
-/// the validator reports errors with the file they came from.
-#[derive(Clone, Debug, PartialEq)]
-pub struct LoadedTechFile {
-    /// Parsed fragment.
-    pub def: TechTreeDef,
-    /// Path relative to the `data/techtree/` root the loader was
-    /// handed.
-    pub path: PathBuf,
-}
+/// only: the merged tree is id-keyed, and the validator reports
+/// errors with the file they came from.
+pub type LoadedTechFile = LoadedDef<TechTreeDef>;
 
 /// Everything `load_techtree` read under `data/techtree/`, ascending
 /// relative-path order — the deterministic order `data_set_hash`
@@ -966,20 +934,11 @@ pub fn load_techtree(dir: &Path) -> Result<LoadedTechTree, LoadError> {
 
 /// [`load_techtree`] against an arbitrary [`DataSource`].
 pub fn load_techtree_from(src: &dyn DataSource, dir: &Path) -> Result<LoadedTechTree, LoadError> {
-    if !src.exists(dir) {
-        return Ok(LoadedTechTree { trees: Vec::new() });
-    }
-    let files = src.ron_files(dir)?;
-    let mut trees = Vec::with_capacity(files.len());
-    for path in files {
-        let def: TechTreeDef =
-            read_versioned_ron(src, &path, &[TECHTREE_SCHEMA_VERSION], |d: &TechTreeDef| {
-                d.schema_version
-            })?;
-        let rel = path.strip_prefix(dir).unwrap_or(&path).to_path_buf();
-        trees.push(LoadedTechFile { def, path: rel });
-    }
-    Ok(LoadedTechTree { trees })
+    Ok(LoadedTechTree {
+        trees: load_registry(src, dir, &[TECHTREE_SCHEMA_VERSION], |d: &TechTreeDef| {
+            d.schema_version
+        })?,
+    })
 }
 
 /// Collect every `*.ron` under `dir` recursively, in `data_set_hash`'s
@@ -1072,20 +1031,11 @@ pub fn load_parts(dir: &Path) -> Result<LoadedParts, LoadError> {
 /// here where `EmbeddedSource` returned empty — an asymmetry, not a
 /// deliberate gate).
 pub fn load_parts_from(src: &dyn DataSource, dir: &Path) -> Result<LoadedParts, LoadError> {
-    if !src.exists(dir) {
-        return Ok(LoadedParts { parts: Vec::new() });
-    }
-    let files = src.ron_files(dir)?;
-    let mut parts = Vec::with_capacity(files.len());
-    for path in files {
-        let def: PartDef =
-            read_versioned_ron(src, &path, &[PART_SCHEMA_VERSION], |d: &PartDef| {
-                d.schema_version
-            })?;
-        let rel = path.strip_prefix(dir).unwrap_or(&path).to_path_buf();
-        parts.push(LoadedPart { def, path: rel });
-    }
-    Ok(LoadedParts { parts })
+    Ok(LoadedParts {
+        parts: load_registry(src, dir, &[PART_SCHEMA_VERSION], |d: &PartDef| {
+            d.schema_version
+        })?,
+    })
 }
 
 /// Load `data/loc/en.ron` — the §1.2 English localization table every

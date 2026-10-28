@@ -169,10 +169,12 @@ pub fn game_menu(
     if state.confirm_revert {
         let rect = egui::Window::new("revert_confirm")
             .title_bar(false)
-            .default_pos(egui::pos2(
-                screen.center().x - 190.0,
-                screen.center().y - 80.0,
-            ))
+            // One-shot modal: anchored center EVERY frame — the
+            // `default_pos` half-size guess it replaces could sit
+            // off-center once the disclosure text wrapped wider than
+            // the guess, and egui's remembered drag position has no
+            // business moving a confirm (C22-F9).
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .resizable(false)
             .collapsible(false)
             .show(ctx, |ui| {
@@ -202,10 +204,9 @@ pub fn game_menu(
     if state.confirm_new {
         let rect = egui::Window::new("new_game_confirm")
             .title_bar(false)
-            .default_pos(egui::pos2(
-                screen.center().x - 170.0,
-                screen.center().y - 60.0,
-            ))
+            // Same modal rule as `revert_confirm` — anchored center,
+            // not a remembered or hardcoded position (C22-F9).
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .resizable(false)
             .collapsible(false)
             .show(ctx, |ui| {
