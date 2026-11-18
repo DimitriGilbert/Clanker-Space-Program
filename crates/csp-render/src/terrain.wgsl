@@ -86,10 +86,11 @@ fn rot_axis(axis: vec3<f32>, angle: f32, v: vec3<f32>) -> vec3<f32> {
 
 // --- procedural detail: deterministic integer-hash value noise on the
 // sphere. This is the "not a smudge" channel — the baked heightfield
-// tops out near ~4 km texels while the quadtree subdivides to ~300 m
-// patches, so everything finer than a texel is synthesized here at
-// fragment rate: mid-scale relief bump normals, albedo mottling, water
-// waves, star cells. Deterministic by construction (u32 avalanche),
+// tops out near ~4 km texels (Legacy; ~1.8 km Mountain, M5 §5.2-R2)
+// while the quadtree subdivides to ~150 m patches, so everything
+// finer than a texel is synthesized here at fragment rate: mid-scale
+// relief bump normals, albedo mottling, water waves, star cells.
+// Deterministic by construction (u32 avalanche),
 // camera-independent (sampled on the body-fixed direction).
 //
 // STABILITY: every noise lookup below is a DIRECT `vnoise3(d·freq)`

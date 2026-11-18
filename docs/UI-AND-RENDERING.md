@@ -605,7 +605,7 @@ already-rasterized hull, C11-F3).
 | Renderer | Pipelines | Notes |
 |---|---|---|
 | `MapRenderer` (`map.rs:80`) | one unlit pipeline, three meshes (bg stars / lines / markers) | no depth state — the scene pass attaches depth only in Flight/VAB |
-| `TerrainRenderer` (`terrain.rs:665`) | `terrain_pipe`, `ocean_pipe` (depth-test-only variant), `sky_pipe` (fullscreen, always-pass depth) | bind group: 0 uniforms, 1 heightfield R32Float, 2 transmittance LUT RGBA32Float, 3 biome slots R8Uint, 4–6 art albedo/normal arrays + water normal, 7 sampler |
+| `TerrainRenderer` (`terrain.rs:670`) | `terrain_pipe`, `ocean_pipe` (depth-test-only variant), `sky_pipe` (fullscreen, always-pass depth) | bind group: 0 uniforms, 1 heightfield R32Float, 2 transmittance LUT RGBA32Float, 3 biome slots R8Uint, 4–6 art albedo/normal arrays + water normal, 7 sampler |
 | `FlightRenderer` (`flight.rs:75`) | one pipeline; owns the surface-sized reverse-Z depth target | depth compare `GreaterEqual` because the fallback sky sits ON the far plane |
 | `VabRenderer` (`vab.rs:123`) | color pipeline + offscreen pick pipeline (R32Uint object-id) | `encode_pick` rasterizes + copies one pixel |
 
@@ -630,28 +630,34 @@ regressions die in `cargo test`, not at device init.
 ### 7.4 Terrain: quadtree, heightfield, LUT, ocean, biome tint
 
 CPU quadtree over the six cube-sphere faces (`PatchId`, `select_patches`,
-`csp-render/src/terrain.rs:72`/`:158` — split while `dist(eye,node) < K·size`,
+`csp-render/src/terrain.rs:72`/`:163` — split while `dist(eye,node) < K·size`,
 horizon-culled, budget-bounded, BFS-deterministic). All leaves share one
 unit grid mesh (`unit_grid`); the draw is a single instanced call.
+Deepest level 13 ≈ 146 m patches at a 600 km body (M5 §5.2-R2 relief
+density — fine enough to resolve the Mountain bake's ~1.8 km texels).
 Precision: each instance bakes `origin − eye` in f64→f32
-(`patch_instance`, `:449`); residual vertex error ~5 cm at a 600 km body.
+(`patch_instance`, `:454`); residual vertex error ~5 cm at a 600 km body.
 Skirts hide T-junction cracks.
 
 Height source: deterministic seeded lattice value-noise FBM on the unit
 sphere, baked once per body into an R32Float equirect `HeightField`
-(`csp-view/src/terrain.rs:195` `TerrainCache`; constants shared with
+(`csp-view/src/terrain.rs:217` `TerrainCache`; constants shared with
 `csp_core::terrain` so the physics contact surface samples **bit-identically**
-to the drawn surface). A `heightmap: Some(_)` ref is the unimplemented
+to the drawn surface). Since M5 §5.2-R2 the bake is per authored
+`TerrainDef::relief` profile (`HeightField::bake_profiled`): Legacy
+1024×512, Mountain 2048×1024 — and the amplitude is authored
+(`radius_m · amplitude_frac` into `TerrainBody::amplitude_m`/
+`uniforms.planet.w`). A `heightmap: Some(_)` ref is the unimplemented
 R4/native hook.
 
-Scattering: `bake_transmittance` (`terrain.rs:568`) CPU-ray-marches the
+Scattering: `bake_transmittance` (`terrain.rs:573`) CPU-ray-marches the
 Bruneton-style T(altitude, μ) LUT (96 steps) for the §3.0 exponential
 atmosphere; the shader consumes it for sky color and terrain aerial
 perspective — the Baseline "precomputed LUTs, analytic single-scatter".
 
 Ocean: a second instanced batch of the same grid at the body's ocean datum
 radius, emitted only for leaf patches whose sampled heights reach the datum
-(`patch_might_hold_sea`, `csp-view/src/terrain.rs:346`); airless/oceanless
+(`patch_might_hold_sea`, `csp-view/src/terrain.rs:356`); airless/oceanless
 bodies emit nothing.
 
 Biome tint: the authored index map only **tints** — it never moves a vertex
@@ -662,8 +668,8 @@ the real-art albedo/normal arrays (`TerrainArt` from `data/art/terrain.csar`)
 when the packet carries them (`uniforms.art.x`).
 
 The vessel blob shadow (`uniforms.shadow`, `vessel_shadow`,
-`csp-view/src/terrain.rs:496`) anchors the focused craft's shadow to the
-surface; `csp-view/terrain.rs::build_packet` (`:548`) assembles the whole
+`csp-view/src/terrain.rs:505`) anchors the focused craft's shadow to the
+surface; `csp-view/terrain.rs::build_packet` (`:557`) assembles the whole
 `TerrainPacket` per frame from the staged `FlightEnv` + chase camera.
 
 ### 7.5 Sky, atmosphere, and the star field (current state)

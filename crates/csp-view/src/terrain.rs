@@ -27,12 +27,13 @@ use crate::map::MapCameraF64;
 // Heightfield bake dims + amplitude share `csp_core::terrain`'s
 // constants — the physics contact surface (`csp-phys` `TerrainSurface`)
 // bakes the SAME field at the SAME scale, so the ground the solver
-// contacts is bit-identical to the surface this module draws.
-// 1024×512 ≈ 3.7 km texels at Terrin's 600 km radius — the low-
-// frequency surface the R2 quadtree displaces; finer relief is R4
-// scatter/VT territory.
+// contacts is bit-identical to the surface this module draws. The bake
+// runs through `HeightField::bake_profiled` at the body's authored
+// `ReliefProfile` dims (M5 §5.2-R2: 1024×512 ≈ 3.7 km texels Legacy,
+// 2048×1024 Mountain, at Terrin's 600 km radius); the dims constants
+// stay imported for the flat stand-in and the camera-floor tap angle.
 use csp_core::terrain::{
-    AMPLITUDE_FRAC, BAKE_HEIGHT as HEIGHTFIELD_H, BAKE_WIDTH as HEIGHTFIELD_W,
+    AMPLITUDE_FRAC, BAKE_HEIGHT as HEIGHTFIELD_H, BAKE_WIDTH as HEIGHTFIELD_W, ReliefProfile,
 };
 
 /// Fallback sun direction when the world has no resolvable star —
@@ -49,8 +50,13 @@ const FALLBACK_SUN: DVec3 = DVec3 {
 pub struct TerrainBody {
     /// `TerrainDef::noise_seed` — the world generator's identity.
     pub seed: u64,
-    /// Height amplitude (m) — `AMPLITUDE_FRAC · radius`.
+    /// Height amplitude (m) — the authored
+    /// `TerrainDef::amplitude_frac · radius` (M5 §5.2-R2); the
+    /// synthesized fallback keeps `AMPLITUDE_FRAC · radius`.
     pub amplitude_m: f64,
+    /// Relief spectrum (M5 §5.2-R2) — which height function and bake
+    /// dims [`TerrainCache`] bakes for this body (`TerrainDef::relief`).
+    pub profile: ReliefProfile,
     /// Ocean datum radius (m), `None` for dry bodies.
     pub ocean_datum_m: Option<f64>,
     /// Decoded biome palette (slot-resolved), `None` → height ramp.
@@ -89,6 +95,9 @@ impl TerrainBody {
         Self {
             seed: seed_of(id),
             amplitude_m: radius_m * AMPLITUDE_FRAC,
+            // No authored `TerrainDef` to read — the legacy spectrum is
+            // the deterministic fallback for unlisted bodies.
+            profile: ReliefProfile::Legacy,
             ocean_datum_m: None,
             biome: None,
         }
@@ -112,7 +121,13 @@ pub fn config_from_bodies(bodies: &[csp_data::LoadedBody]) -> TerrainConfig {
             def.id.as_str().to_owned(),
             TerrainBody {
                 seed: def.terrain.noise_seed,
-                amplitude_m: def.radius_m * AMPLITUDE_FRAC,
+                // M5 §5.2-R2: amplitude and spectrum are authored
+                // (`TerrainDef::amplitude_frac`/`.relief`), not the
+                // fixed `AMPLITUDE_FRAC`/Legacy share — every shipped
+                // body still authors the legacy values, so nothing
+                // changes until Phase 2's data lands.
+                amplitude_m: def.radius_m * def.terrain.amplitude_frac,
+                profile: def.terrain.relief,
                 ocean_datum_m: def.ocean.as_ref().map(|o| o.datum_radius_m),
                 biome: b.biomes.as_ref().and_then(biome_field),
             },
@@ -179,27 +194,34 @@ fn biome_field(loaded: &csp_data::LoadedBiomeMap) -> Option<Arc<rt::BiomeField>>
     )))
 }
 
+/// Cache identity: `(body id, seed, profile seed-fold)` — the fold is
+/// [`ReliefProfile::key_seed_fold`], the same constant
+/// [`rt::HeightField::bake_profiled_key`] mixes into the field's
+/// content key, so a Legacy and a Mountain field for the same
+/// `(body, seed)` can never share a cache slot (M5 §5.2-R2).
+type CacheKey = (String, u64, u64);
+
 /// The baked heightfield cache — one per dominant body, rebuilt when
-/// the staged body id/seed/dims change (SOI transfer mid-flight).
-/// The bake (524k texels × 13 octaves) used to run synchronously on
-/// whichever thread first sampled it — the frame a body became
-/// dominant stalled outright (C12-F5). On native it now runs on a
-/// worker thread: [`Self::field`] returns a flat datum stand-in
-/// until the real field lands, so every caller (camera floor,
-/// shadow anchor, ocean cull, packet displacement) still samples
-/// the SAME field the shader draws — the honest "surface" while the
-/// bake is in flight. wasm has no threads and keeps the synchronous
-/// path (a one-time hitch the demo already pays at startup).
-/// Presentation data only.
+/// the staged body id/seed/profile change (SOI transfer mid-flight).
+/// The bake (524k texels × 13 octaves legacy, 4× that under Mountain)
+/// used to run synchronously on whichever thread first sampled it —
+/// the frame a body became dominant stalled outright (C12-F5). On
+/// native it now runs on a worker thread: [`Self::field`] returns a
+/// flat datum stand-in until the real field lands, so every caller
+/// (camera floor, shadow anchor, ocean cull, packet displacement)
+/// still samples the SAME field the shader draws — the honest
+/// "surface" while the bake is in flight. wasm has no threads and
+/// keeps the synchronous path (a one-time hitch the demo already pays
+/// at startup). Presentation data only.
 #[derive(Resource, Default)]
 pub struct TerrainCache {
-    /// Body id + seed the current field was baked for.
-    key: Option<(String, u64)>,
+    /// Body id + seed + profile fold the current field was baked for.
+    key: Option<CacheKey>,
     /// The baked field.
     field: Option<Arc<rt::HeightField>>,
-    /// Completed fields per `(body_id, seed)` — a body visited
-    /// before swaps back in instantly (bounded by body count).
-    done: BTreeMap<(String, u64), Arc<rt::HeightField>>,
+    /// Completed fields per cache key — a body visited before swaps
+    /// back in instantly (bounded by body count × profile).
+    done: BTreeMap<CacheKey, Arc<rt::HeightField>>,
     /// The in-flight background bake for `key` (native only).
     #[cfg(not(target_arch = "wasm32"))]
     pending: Option<std::sync::Mutex<std::sync::mpsc::Receiver<Arc<rt::HeightField>>>>,
@@ -210,12 +232,13 @@ pub struct TerrainCache {
 }
 
 impl TerrainCache {
-    /// The heightfield for `(body_id, seed)` — the real field once
-    /// baked, the flat stand-in while a background bake is in flight
-    /// (both share the caller contract "this is the surface the frame
-    /// draws").
-    fn field(&mut self, body_id: &str, seed: u64) -> Arc<rt::HeightField> {
-        let key = (body_id.to_owned(), seed);
+    /// The heightfield for `(body_id, seed, profile)` — the real field
+    /// once baked, the flat stand-in while a background bake is in
+    /// flight (both share the caller contract "this is the surface the
+    /// frame draws"). The bake dims follow the profile
+    /// ([`rt::HeightField::bake_profiled`], M5 §5.2-R2).
+    fn field(&mut self, body_id: &str, seed: u64, profile: ReliefProfile) -> Arc<rt::HeightField> {
+        let key: CacheKey = (body_id.to_owned(), seed, profile.key_seed_fold());
         if self.key.as_ref() != Some(&key) {
             // A body visited before swaps back in for free.
             self.field = self.done.get(&key).cloned();
@@ -228,22 +251,16 @@ impl TerrainCache {
                     match std::thread::Builder::new()
                         .name("terrain-heightfield-bake".into())
                         .spawn(move || {
-                            let _ = tx.send(Arc::new(rt::HeightField::bake(
-                                seed,
-                                HEIGHTFIELD_W,
-                                HEIGHTFIELD_H,
-                            )));
+                            let _ =
+                                tx.send(Arc::new(rt::HeightField::bake_profiled(seed, profile)));
                         }) {
                         Ok(_handle) => self.pending = Some(std::sync::Mutex::new(rx)),
                         Err(e) => {
                             log::warn!(
                                 "terrain: bake thread failed to spawn ({e}) — baking inline"
                             );
-                            self.field = Some(Arc::new(rt::HeightField::bake(
-                                seed,
-                                HEIGHTFIELD_W,
-                                HEIGHTFIELD_H,
-                            )));
+                            self.field =
+                                Some(Arc::new(rt::HeightField::bake_profiled(seed, profile)));
                         }
                     }
                 }
@@ -251,11 +268,7 @@ impl TerrainCache {
             #[cfg(target_arch = "wasm32")]
             {
                 if self.field.is_none() {
-                    self.field = Some(Arc::new(rt::HeightField::bake(
-                        seed,
-                        HEIGHTFIELD_W,
-                        HEIGHTFIELD_H,
-                    )));
+                    self.field = Some(Arc::new(rt::HeightField::bake_profiled(seed, profile)));
                 }
             }
             self.key = Some(key);
@@ -278,11 +291,7 @@ impl TerrainCache {
                 // rather than draw a datum sphere forever.
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     log::warn!("terrain: background bake lost — baking inline");
-                    self.field = Some(Arc::new(rt::HeightField::bake(
-                        seed,
-                        HEIGHTFIELD_W,
-                        HEIGHTFIELD_H,
-                    )));
+                    self.field = Some(Arc::new(rt::HeightField::bake_profiled(seed, profile)));
                     true
                 }
             };
@@ -303,17 +312,17 @@ impl TerrainCache {
         }
     }
 
-    /// The zero-height stand-in — same dims, a content key from the
-    /// tagged stand-in namespace ([`rt::HeightField::flat_key`] sets
-    /// bit 0; real bakes keep it clear), so it provably cannot collide
-    /// with a real bake and the renderer re-uploads on the swap.
-    /// Built once per key miss. wasm compiles it too (the `pending`
-    /// machinery is cfg'd out there; the call stays reachable in the
-    /// match arm either way).
+    /// The zero-height stand-in — Legacy dims with zero data whatever the
+    /// body's real profile dims, keyed from the tagged stand-in namespace
+    /// ([`rt::HeightField::flat_key`] sets bit 0; real bakes keep it clear):
+    /// it cannot collide with a real bake, and the tag forces the renderer
+    /// to re-upload on the swap. Built once per key miss. wasm compiles it
+    /// too (the `pending` machinery is cfg'd out there; the call stays
+    /// reachable in the match arm either way).
     fn flat_field(&mut self) -> Arc<rt::HeightField> {
         if self.flat.is_none() {
             let (w, h) = (HEIGHTFIELD_W, HEIGHTFIELD_H);
-            let seed = self.key.as_ref().map_or(0, |(_, s)| *s);
+            let seed = self.key.as_ref().map_or(0, |(_, s, _)| *s);
             self.flat = Some(Arc::new(rt::HeightField {
                 width: w,
                 height: h,
@@ -415,7 +424,7 @@ pub(crate) fn ground_radius(
         .get(body_id)
         .cloned()
         .unwrap_or_else(|| TerrainBody::synthesized(body_id, env.radius_m));
-    let field = cache.field(body_id, body.seed);
+    let field = cache.field(body_id, body.seed, body.profile);
     // The inertial→fixed half of `crate::structures::spin_rotation` —
     // the same `R(axis, −phase)` conjugate the shader applies.
     let fixed = crate::structures::spin_rotation(env)
@@ -559,7 +568,7 @@ pub(crate) fn build_packet(
         .get(body_id)
         .cloned()
         .unwrap_or_else(|| TerrainBody::synthesized(body_id, env.radius_m));
-    let field = cache.field(body_id, body.seed);
+    let field = cache.field(body_id, body.seed, body.profile);
 
     // The §2.6.4 spin phase — the same `R(axis, ω·t)` `bubble.rs`
     // co-rotates latched poses by. The heightfield/biome data is
@@ -699,7 +708,159 @@ pub(crate) fn build_packet(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::map::{mat4_mul, perspective_revz, project_into};
+    use crate::flight::FlightEnv;
+    use crate::map::{MapCameraF64, mat4_mul, perspective_revz, project_into};
+
+    /// A minimal `LoadedBody` — only the fields `config_from_bodies`
+    /// reads carry authored values; the rest is inert filler.
+    fn body_def(id: &str, radius_m: f64, terrain: csp_data::TerrainDef) -> csp_data::LoadedBody {
+        csp_data::LoadedBody {
+            def: csp_data::BodyDef {
+                schema_version: csp_data::BODY_SCHEMA_VERSION,
+                id: csp_data::BodyId::from(id),
+                display_name: csp_data::LocKey::from("x"),
+                parent: None,
+                radius_m,
+                mu_m3_per_s2: 1.0,
+                soi_m: None,
+                rotation_period_s: Some(1.0),
+                tilt_rad: 0.0,
+                orbit: None,
+                atmosphere: None,
+                ocean: None,
+                terrain,
+                biome_map: None,
+                surface_resources: Vec::new(),
+                insolation_w_m2: None,
+            },
+            biomes: None,
+        }
+    }
+
+    /// M5 §5.2-R2: the authored `TerrainDef::amplitude_frac`/`.relief`
+    /// map into the presentation `TerrainBody` — amplitude is
+    /// `radius · amplitude_frac` (no longer the fixed
+    /// `AMPLITUDE_FRAC` share) and the profile rides along to the
+    /// cache/bake.
+    #[test]
+    fn config_from_bodies_maps_authored_terrain_fields() {
+        let authored = csp_data::TerrainDef {
+            noise_seed: 601,
+            heightmap: None,
+            amplitude_frac: 0.006,
+            relief: ReliefProfile::Mountain,
+        };
+        let legacy = csp_data::TerrainDef {
+            noise_seed: 7,
+            heightmap: None,
+            amplitude_frac: AMPLITUDE_FRAC,
+            relief: ReliefProfile::Legacy,
+        };
+        let cfg = config_from_bodies(&[
+            body_def("terrin", 600_000.0, authored),
+            body_def("mun", 200_000.0, legacy),
+        ]);
+        let terrin = cfg.bodies.get("terrin").cloned().unwrap();
+        assert_eq!(terrin.seed, 601);
+        assert!(
+            (terrin.amplitude_m - 3_600.0).abs() < 1e-9,
+            "authored 0.006 × 600 km ⇒ ~3600 m, got {}",
+            terrin.amplitude_m
+        );
+        assert_eq!(terrin.profile, ReliefProfile::Mountain);
+        let mun = cfg.bodies.get("mun").cloned().unwrap();
+        assert_eq!(mun.amplitude_m, 200_000.0 * AMPLITUDE_FRAC);
+        assert_eq!(mun.profile, ReliefProfile::Legacy);
+    }
+
+    /// M5 §5.2-R2: the cache key folds the profile, so a Legacy and a
+    /// Mountain field for the same `(body, seed)` are distinct bakes —
+    /// different dims, different content keys (the
+    /// `bake_profiled_key` contract) — and a return visit swaps the
+    /// completed Legacy field back in from `done`.
+    #[test]
+    fn cache_separates_profiles_at_same_seed() {
+        // Real bakes keep key bit 0 clear; the flat stand-in sets it —
+        // poll `field` until the background bake lands.
+        let real = |cache: &mut TerrainCache, profile: ReliefProfile| -> Arc<rt::HeightField> {
+            for _ in 0..4_000 {
+                let f = cache.field("terrin", 601, profile);
+                if f.key & 1 == 0 {
+                    return f;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            panic!("background bake never landed for {profile:?}");
+        };
+        let mut cache = TerrainCache::default();
+        let legacy = real(&mut cache, ReliefProfile::Legacy);
+        let mountain = real(&mut cache, ReliefProfile::Mountain);
+        assert_eq!(
+            (legacy.width, legacy.height),
+            (HEIGHTFIELD_W, HEIGHTFIELD_H)
+        );
+        assert_eq!(
+            (mountain.width, mountain.height),
+            ReliefProfile::Mountain.bake_dims()
+        );
+        assert_ne!(legacy.key, mountain.key);
+        assert_eq!(
+            legacy.key,
+            rt::HeightField::bake_profiled_key(601, ReliefProfile::Legacy)
+        );
+        assert_eq!(
+            mountain.key,
+            rt::HeightField::bake_profiled_key(601, ReliefProfile::Mountain)
+        );
+        // The spectra are different functions — the texels differ.
+        assert_ne!(legacy.data, mountain.data);
+        // A return visit reuses the completed field (same bake key).
+        let back = real(&mut cache, ReliefProfile::Legacy);
+        assert_eq!(back.key, legacy.key);
+    }
+
+    /// The packet's `planet.w` is the body's AUTHORED amplitude — the
+    /// same `TerrainBody::amplitude_m` every amplitude-driven consumer
+    /// (horizon cull, blob shadow, ocean margin, camera floor) reads.
+    #[test]
+    fn packet_uniforms_carry_authored_amplitude() {
+        let cfg = config_from_bodies(&[body_def(
+            "terrin",
+            600_000.0,
+            csp_data::TerrainDef {
+                noise_seed: 601,
+                heightmap: None,
+                amplitude_frac: 0.006,
+                relief: ReliefProfile::Mountain,
+            },
+        )]);
+        let env = FlightEnv {
+            body_center: DVec3::ZERO,
+            radius_m: 600_000.0,
+            atm_top_m: 0.0,
+            atm_scale_height_m: 0.0,
+            mu_m3_per_s2: 1.0,
+            body: Some(csp_data::BodyId::from("terrin")),
+            sun_dir: DVec3::new(1.0, 0.0, 0.0),
+            spin_axis: DVec3::Z,
+            spin_phase: 0.0,
+            body_spin: DVec3::ZERO,
+        };
+        let packet = build_packet(
+            &cfg,
+            &mut TerrainCache::default(),
+            &env,
+            &MapCameraF64::default(),
+            (320.0, 240.0),
+            0.0,
+        );
+        assert_eq!(packet.uniforms.planet[0], 600_000.0);
+        assert!(
+            (f64::from(packet.uniforms.planet[3]) - 3_600.0).abs() < 1e-3,
+            "planet.w must be the authored 600 km × 0.006 = 3600 m, got {}",
+            packet.uniforms.planet[3]
+        );
+    }
 
     /// A non-axis-aligned camera basis — a transpose slips through
     /// any test whose axes line up with the coordinate axes.

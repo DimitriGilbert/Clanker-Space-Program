@@ -98,9 +98,10 @@ pub fn face_basis(face: u8) -> (DVec3, DVec3, DVec3) {
 #[derive(Clone, Copy, Debug)]
 pub struct LodConfig {
     /// Deepest quadtree level (finest patch ≈ `2·R / 2^max_level`
-    /// across — 12 on a 600 km body ≈ 290 m). Hard bound: `PatchId`
-    /// cell indices are `u16`, so a level-16 cell is the largest
-    /// representable — `x * 2 + dx` wraps past `max_level = 16`.
+    /// across — 13 on a 600 km body ≈ 146 m, ~9 m vertex spacing on
+    /// the 16-cell grid). Hard bound: `PatchId` cell indices are
+    /// `u16`, so a level-16 cell is the largest representable —
+    /// `x * 2 + dx` wraps past `max_level = 16`.
     pub max_level: u8,
     /// Split while `dist(eye, patch) < split_factor · patch_size`.
     pub split_factor: f64,
@@ -111,7 +112,11 @@ pub struct LodConfig {
 impl Default for LodConfig {
     fn default() -> Self {
         Self {
-            max_level: 12,
+            // M5 §5.2-R2 relief density: 13 halves the finest patch
+            // (~293 m → ~146 m) so the Mountain profile's 2048×1024
+            // bake (~1.8 km texels at a 600 km body) resolves its
+            // ridges instead of smearing them across a patch.
+            max_level: 13,
             split_factor: 4.0,
             max_patches: 2048,
         }
