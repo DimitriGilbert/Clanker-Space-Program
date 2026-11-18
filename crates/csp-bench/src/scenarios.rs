@@ -1111,6 +1111,11 @@ mod tests {
                 terrain: csp_data::TerrainDef {
                     noise_seed: 0,
                     heightmap: None,
+                    // M5/§5.2-R2 TerrainDef additions — values are
+                    // irrelevant here: `env.terrain = None` below
+                    // detaches the surface this fixture measures.
+                    amplitude_frac: csp_core::terrain::AMPLITUDE_FRAC,
+                    relief: csp_core::terrain::ReliefProfile::Legacy,
                 },
                 biome_map: None,
                 surface_resources: Vec::new(),

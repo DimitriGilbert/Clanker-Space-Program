@@ -10,7 +10,7 @@ use crate::biome::{BIOME_MAP_MAX_H, BIOME_MAP_MAX_W, decode_indexed_png, inspect
 use crate::ids::LocKey;
 use crate::load::LoadedSystem;
 use crate::loc::LocFile;
-use crate::system::{BODY_SCHEMA_VERSION, SCHEMA_VERSION};
+use crate::system::{BODY_SCHEMA_SUPPORTED, BODY_SCHEMA_VERSION, SCHEMA_VERSION};
 
 use super::ValidationError;
 use super::common::{check_finite, check_id, check_positive};
@@ -66,7 +66,11 @@ fn check_schema_versions(sys: &LoadedSystem, out: &mut Vec<ValidationError>) {
         });
     }
     for b in &sys.bodies {
-        if b.def.schema_version != BODY_SCHEMA_VERSION {
+        // The loader's current-or-previous band ([1, 2] — M5's
+        // `TerrainDef` additions read as legacy defaults in a v1
+        // file), the `sites.ron` convention; `expected` names the
+        // current version either way.
+        if !BODY_SCHEMA_SUPPORTED.contains(&b.def.schema_version) {
             out.push(ValidationError::SchemaVersion {
                 file: format!("{}/body.ron", b.def.id),
                 found: b.def.schema_version,
@@ -249,6 +253,22 @@ fn check_body_fields(b: &crate::load::LoadedBody, out: &mut Vec<ValidationError>
     }
     if let Some(oc) = &b.def.ocean {
         check_positive(body, "ocean.datum_radius_m", oc.datum_radius_m, out);
+    }
+    // M5/§5.2-R2: the terrain amplitude band. 0.0 is legal — a flat
+    // body (the star) authors it — but negatives would fold relief
+    // inward, non-finite breaks the bake, and >0.02 (80 km at Terrin)
+    // is a wall of noise no radius should displace.
+    let amp = b.def.terrain.amplitude_frac;
+    if !amp.is_finite() {
+        out.push(ValidationError::NonFinite {
+            body: body.to_string(),
+            field: "terrain.amplitude_frac",
+        });
+    } else if !(0.0..=0.02).contains(&amp) {
+        out.push(ValidationError::TerrainAmplitudeOutOfRange {
+            body: body.to_string(),
+            value: amp,
+        });
     }
     check_file_refs(b, out);
 }

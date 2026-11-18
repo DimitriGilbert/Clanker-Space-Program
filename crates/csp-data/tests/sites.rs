@@ -51,6 +51,8 @@ fn sys() -> csp_data::LoadedSystem {
             terrain: TerrainDef {
                 noise_seed: 0,
                 heightmap: None,
+                amplitude_frac: 0.0, // the star is flat
+                relief: Default::default(),
             },
             biome_map: None,
             surface_resources: Vec::new(),

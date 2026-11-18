@@ -9,6 +9,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use csp_core::terrain::{AMPLITUDE_FRAC, ReliefProfile};
+
 use crate::ids::{BodyId, LocKey, ResourceId, SystemId};
 
 /// The `schema_version` this loader/validator pair understands for
@@ -25,7 +27,21 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// The `schema_version` this loader/validator pair understands for
 /// `<body>/body.ron` — its own namespace (§3.1's per-file-type
 /// versioning; see [`SCHEMA_VERSION`]).
-pub const BODY_SCHEMA_VERSION: u32 = 1;
+///
+/// Version 2 (M5 terrain overhaul, §5.2-R2): `TerrainDef` gained
+/// `amplitude_frac` and `relief` — both additive with serde defaults
+/// (the legacy amplitude `csp_core::terrain::AMPLITUDE_FRAC` and
+/// `ReliefProfile::Legacy`), the `sites.ron` v2/v3 precedent. A v1
+/// file still parses and bakes the exact legacy field.
+pub const BODY_SCHEMA_VERSION: u32 = 2;
+
+/// The `body.ron` versions `load_system_from` accepts: the current
+/// schema and the previous one under §3.1's "current and previous,
+/// with explicit defaults" rule — v1's missing `amplitude_frac`/
+/// `relief` read the legacy defaults (the
+/// [`crate::site::SITE_SCHEMA_SUPPORTED`] pattern, which body.ron now
+/// shares).
+pub const BODY_SCHEMA_SUPPORTED: [u32; 2] = [BODY_SCHEMA_VERSION - 1, BODY_SCHEMA_VERSION];
 
 /// Classical Keplerian elements for a body or vessel on rails (§2.8
 /// `OrbitState` consumes this; `epoch` lives there — a body's epoch is
@@ -121,7 +137,9 @@ pub struct OceanDef {
 
 /// Terrain authoring refs (§3.0 schema: "noise seed + authored heightmap
 /// refs"). The seed is consumed by the R2 terrain generator; biomes are
-/// deliberately NOT derived from it (§3.0.1).
+/// deliberately NOT derived from it (§3.0.1). The M5 terrain overhaul
+/// (§5.2-R2) added the amplitude and relief-profile knobs — both
+/// defaulted, so a v1 file authors the exact legacy field.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TerrainDef {
@@ -131,6 +149,28 @@ pub struct TerrainDef {
     /// Authored heightmap, path relative to the body directory —
     /// `None` for pure noise (the §3.7/R2 "hybrid" question).
     pub heightmap: Option<String>,
+    /// Terrain amplitude as a fraction of the body radius (M5,
+    /// §5.2-R2) — `radius_m * amplitude_frac` metres of relief, the
+    /// same contract `csp_core::terrain::AMPLITUDE_FRAC` carries for
+    /// the shipped bodies (~2.4 km at Terrin). `0.0` = flat body
+    /// (a star); validator band `[0.0, 0.02]`.
+    #[serde(default = "default_amplitude_frac")]
+    pub amplitude_frac: f64,
+    /// Relief spectrum (M5, §5.2-R2) — which
+    /// `csp_core::terrain::height_normalized_profile` variant and bake
+    /// dims the body's [`csp_core::terrain::HeightField`] uses.
+    /// Defaults to the legacy R2 spectrum so existing worlds stay
+    /// bit-identical; serde rejects unknown variants at parse time.
+    #[serde(default)]
+    pub relief: ReliefProfile,
+}
+
+/// The serde default for [`TerrainDef::amplitude_frac`] — the single
+/// authored constant in `csp_core::terrain` (this crate already
+/// depends on csp-core for the shared 3-vector types, so the number
+/// is imported, not duplicated).
+fn default_amplitude_frac() -> f64 {
+    AMPLITUDE_FRAC
 }
 
 /// Reference to a body's §3.0.1 biome map: a palette-indexed equirect

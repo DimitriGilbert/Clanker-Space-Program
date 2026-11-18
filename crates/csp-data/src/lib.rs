@@ -109,8 +109,9 @@ pub use resource::{
 };
 pub use site::{SITE_SCHEMA_SUPPORTED, SITE_SCHEMA_VERSION, SiteDef, SiteFile};
 pub use system::{
-    AtmosphereDef, BODY_SCHEMA_VERSION, BiomeMapRef, BodyDef, ConcentrationMapRef, KeplerElements,
-    OceanDef, SCHEMA_VERSION, SystemDef, TemperatureKnot, TerrainDef,
+    AtmosphereDef, BODY_SCHEMA_SUPPORTED, BODY_SCHEMA_VERSION, BiomeMapRef, BodyDef,
+    ConcentrationMapRef, KeplerElements, OceanDef, SCHEMA_VERSION, SystemDef, TemperatureKnot,
+    TerrainDef,
 };
 pub use techtree::{
     TECHTREE_SCHEMA_VERSION, TechNode, TechTree, TechTreeDef, TechUnlocks, UpgradeEffect,

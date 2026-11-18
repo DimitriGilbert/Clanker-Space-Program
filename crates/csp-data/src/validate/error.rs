@@ -119,6 +119,16 @@ pub enum ValidationError {
         /// The offending eccentricity.
         e: f64,
     },
+    /// `terrain.amplitude_frac` outside the `[0.0, 0.02]` band (M5,
+    /// §5.2-R2): `0.0` is a legal flat body, negatives fold relief
+    /// inward, and past 2% of the radius the displaced surface stops
+    /// reading as terrain.
+    TerrainAmplitudeOutOfRange {
+        /// The body.
+        body: String,
+        /// The offending amplitude fraction.
+        value: f64,
+    },
     /// §3.0 rule: a child's apoapsis must lie inside its parent's SOI.
     SoiTooSmall {
         /// The parent whose SOI is too small.
@@ -693,6 +703,12 @@ impl fmt::Display for ValidationError {
             }
             Self::EccentricityOutOfRange { body, e } => {
                 write!(f, "{body:?}: eccentricity {e} outside [0, 1)")
+            }
+            Self::TerrainAmplitudeOutOfRange { body, value } => {
+                write!(
+                    f,
+                    "{body:?}.terrain.amplitude_frac: {value} outside [0.0, 0.02] (0 = flat body)"
+                )
             }
             Self::SoiTooSmall {
                 parent,

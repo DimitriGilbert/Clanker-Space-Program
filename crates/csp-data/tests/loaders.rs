@@ -140,10 +140,11 @@ fn version_errors_report_the_accepted_band() {
 /// C31-F2's constant split: `body.ron`, `biomes.ron`, and `en.ron`
 /// each carry their OWN version constant — a `body.ron` bump refuses
 /// only body files, never the manifest/legend/loc siblings that used
-/// to share `system::SCHEMA_VERSION`.
+/// to share `system::SCHEMA_VERSION`. (body.ron now carries M5's
+/// `[1, 2]` band, so the refused probe is v3 — two back.)
 #[test]
 fn version_namespaces_are_per_file_type() {
-    // A v2 body.ron inside an otherwise-clean system is refused with
+    // A v3 body.ron inside an otherwise-clean system is refused with
     // the BODY band, not the system file's.
     let src = EmbeddedSource::new(&[
         (
@@ -153,7 +154,7 @@ fn version_namespaces_are_per_file_type() {
         ),
         (
             "sys/a/body.ron",
-            br#"(schema_version: 2, id: "a", display_name: "k", parent: None,
+            br#"(schema_version: 3, id: "a", display_name: "k", parent: None,
                 radius_m: 1.0, mu_m3_per_s2: 1.0, soi_m: None, rotation_period_s: Some(1.0),
                 tilt_rad: 0.0, orbit: None, atmosphere: None, ocean: None,
                 terrain: (noise_seed: 0, heightmap: None),
@@ -163,7 +164,7 @@ fn version_namespaces_are_per_file_type() {
     ]);
     let err = load_system_from(&src, Path::new("sys")).unwrap_err();
     assert!(
-        matches!(err, LoadError::UnsupportedSchemaVersion { found: 2, .. }),
+        matches!(err, LoadError::UnsupportedSchemaVersion { found: 3, .. }),
         "{err:?}"
     );
 }

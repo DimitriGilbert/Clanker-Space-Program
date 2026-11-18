@@ -36,7 +36,7 @@ use crate::part::{PART_SCHEMA_VERSION, PartDef};
 use crate::recipe::{RECIPE_SCHEMA_VERSION, RecipeDef};
 use crate::resource::{RESOURCE_SCHEMA_VERSION, ResourceFile};
 use crate::site::{SITE_SCHEMA_SUPPORTED, SITE_SCHEMA_VERSION, SiteFile};
-use crate::system::{BODY_SCHEMA_VERSION, BodyDef, SCHEMA_VERSION, SystemDef};
+use crate::system::{BODY_SCHEMA_SUPPORTED, BodyDef, SCHEMA_VERSION, SystemDef};
 use crate::techtree::{TECHTREE_SCHEMA_VERSION, TechTree, TechTreeDef};
 
 /// A biome map as loaded: legend (parsed) plus the PNG's raw bytes.
@@ -135,12 +135,15 @@ pub enum LoadError {
     /// The accepted set is per file type, not a uniform
     /// current-and-previous band: `sites.ron` accepts
     /// [`crate::site::SITE_SCHEMA_SUPPORTED`] (`[2, 3]` — a v2 file
-    /// reads `starting_stock` as empty via serde defaults), while
-    /// `colonies.ron` accepts only v2 — its v1→v2 restructure
-    /// (`rate_per_s` rename, `Converter` inline pairs → `RecipeId`
-    /// indirection) has no honest mechanical mapping, so v1 is refused
-    /// outright rather than mis-migrated. Every other file type takes
-    /// its current version exactly (`balance.ron` is at v11).
+    /// reads `starting_stock` as empty via serde defaults) and
+    /// `body.ron` accepts [`crate::system::BODY_SCHEMA_SUPPORTED`]
+    /// (`[1, 2]` — a v1 file reads `TerrainDef`'s M5 additions as
+    /// their legacy defaults), while `colonies.ron` accepts only v2 —
+    /// its v1→v2 restructure (`rate_per_s` rename, `Converter` inline
+    /// pairs → `RecipeId` indirection) has no honest mechanical
+    /// mapping, so v1 is refused outright rather than mis-migrated.
+    /// Every other file type takes its current version exactly
+    /// (`balance.ron` is at v11).
     ///
     /// §3.1 asks for a current-and-previous band on *every* file type;
     /// the per-file-type policy is the recorded §7.7 deferral (see
@@ -591,7 +594,7 @@ pub fn load_system_from(src: &dyn DataSource, dir: &Path) -> Result<LoadedSystem
         let body_dir = join_authored(dir, id.as_str(), &system_path)?;
         let body_path = body_dir.join("body.ron");
         let def: BodyDef =
-            read_versioned_ron(src, &body_path, &[BODY_SCHEMA_VERSION], |d: &BodyDef| {
+            read_versioned_ron(src, &body_path, &BODY_SCHEMA_SUPPORTED, |d: &BodyDef| {
                 d.schema_version
             })?;
 

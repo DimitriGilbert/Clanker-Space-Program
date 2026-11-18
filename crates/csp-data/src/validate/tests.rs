@@ -38,6 +38,8 @@ fn fixture() -> LoadedSystem {
             terrain: TerrainDef {
                 noise_seed: 1,
                 heightmap: None,
+                amplitude_frac: 0.0, // the star is flat
+                relief: Default::default(),
             },
             biome_map: None,
             surface_resources: Vec::new(),
@@ -72,6 +74,8 @@ fn fixture() -> LoadedSystem {
             terrain: TerrainDef {
                 noise_seed: 2,
                 heightmap: None,
+                amplitude_frac: 0.004,
+                relief: Default::default(),
             },
             biome_map: None,
             surface_resources: Vec::new(),
@@ -333,6 +337,56 @@ fn non_finite_radius_is_rejected() {
             e,
             ValidationError::NonFinite {
                 field: "radius_m",
+                ..
+            }
+        )),
+        "{errs:?}"
+    );
+}
+
+/// M5/§5.2-R2: `terrain.amplitude_frac` outside `[0.0, 0.02]` is
+/// rejected with the dedicated variant — negative (relief folding
+/// inward) and past 2% of the radius alike. `0.0` itself is legal
+/// (the fixture's star authors a flat body and stays green).
+#[test]
+fn terrain_amplitude_out_of_range_is_rejected() {
+    for bad in [-1e-9, -0.004, 0.020_000_000_1, 0.05, 0.4] {
+        let mut sys = fixture();
+        planet(&mut sys).terrain.amplitude_frac = bad;
+        let errs = validate_system(&sys);
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::TerrainAmplitudeOutOfRange { value, .. } if *value == bad)),
+            "amplitude_frac={bad}: {errs:?}"
+        );
+    }
+    // The band edges themselves stay green — 0.0 (flat) and 0.02.
+    for ok in [0.0, 0.02] {
+        let mut sys = fixture();
+        planet(&mut sys).terrain.amplitude_frac = ok;
+        let errs = validate_system(&sys);
+        assert!(
+            !errs
+                .iter()
+                .any(|e| matches!(e, ValidationError::TerrainAmplitudeOutOfRange { .. })),
+            "amplitude_frac={ok}: {errs:?}"
+        );
+    }
+}
+
+/// NaN amplitude is the `NonFinite` stamp on the terrain field, not
+/// the range variant — the finite check runs first (the same split
+/// `check_positive` makes for `radius_m`).
+#[test]
+fn non_finite_terrain_amplitude_is_rejected() {
+    let mut sys = fixture();
+    planet(&mut sys).terrain.amplitude_frac = f64::NAN;
+    let errs = validate_system(&sys);
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            ValidationError::NonFinite {
+                field: "terrain.amplitude_frac",
                 ..
             }
         )),
