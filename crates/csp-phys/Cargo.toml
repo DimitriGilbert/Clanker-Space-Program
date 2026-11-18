@@ -22,5 +22,13 @@ serde = { workspace = true, features = ["derive"] }
 # bincode"); already on this crate's §2.1 allowlist.
 bincode = { workspace = true, features = ["serde"] }
 
+[dev-dependencies]
+# The §7.2 CSPSAVE body codec (canonical CBOR): the terrain-profile
+# save-compat test decodes a pre-profile CBOR payload exactly the way
+# an old save file loads. Test-only — the crate's own codecs are the
+# two pinned above; ciborium is on csp-phys's §2.1 lint-deps
+# allowlist.
+ciborium.workspace = true
+
 [lints]
 workspace = true

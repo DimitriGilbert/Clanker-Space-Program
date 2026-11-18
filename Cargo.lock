@@ -1048,6 +1048,7 @@ name = "csp-phys"
 version = "0.0.0"
 dependencies = [
  "bincode",
+ "ciborium",
  "csp-core",
  "csp-data",
  "libm",

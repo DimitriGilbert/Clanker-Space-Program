@@ -74,13 +74,31 @@
 //! (`‖p − c‖ < surface_radius(p̂)`) produces one manifold point
 //! `{pos, normal = up, depth}` — vertex-only contact per the M2
 //! scope with a radial "up" normal. The normal's error vs the true
-//! heightfield normal is the local slope angle (measured ≤ ~6° on
-//! the shipped seeded fields — C12-F2's empirical bound), not µm;
-//! the µm-scale claim survives only for the *manifold* half (vertex
-//! vs face/edge on a near-planar footprint). Its static-friction
-//! corollary: μ = 0.5 gives a 26.6° friction angle, so no shipped
-//! slope (tan ≤ 0.10) would slide even under the correct normal —
-//! the radial approximation changes no authored behavior today.
+//! heightfield normal is the local slope angle, not µm; the
+//! µm-scale claim survives only for the *manifold* half (vertex vs
+//! face/edge on a near-planar footprint). Measured land-slope bands
+//! (§5.2-R2's terrain overhaul, M5 — the
+//! `mountain_land_slope_distribution` survey: 2 seeds, Terrin's
+//! radius, land cells, pair-difference method):
+//! [`ReliefProfile::Legacy`] ≤ ~6° (C12-F2's empirical bound,
+//! tan ≤ 0.10); Mountain, p50/p95/p99/max tan —
+//! * macro grid 96×48 (~39 km spacing — the continent-scale
+//!   gradient): 0.011/0.048/0.087/0.230 at the planned authored
+//!   `amplitude_frac` 0.006, 0.008/0.032/0.058/0.153 at the 0.004
+//!   default;
+//! * ridge grid 512×256 (~7.4 km spacing — resolves the ×28 ridge
+//!   octaves and brackets the baked field's ~1.8 km contact
+//!   texels): 0.019/0.091/0.143/0.513 at 0.006, 0.013/0.060/0.095/
+//!   0.342 at 0.004.
+//!
+//! Both profiles therefore keep the radial normal — the decision
+//! datum, ridge p99 at 0.006, is 0.143: inside the tan(12°) ≈ 0.213
+//! warrant threshold a height-gradient normal model would need. The
+//! static-friction corollary holds through p99 under either normal
+//! model (μ = 0.5 ⇒ 26.6° friction angle, tan 0.50); the ridge-scale
+//! max (0.513) grazes that limit only in the extreme tail — the
+//! steepest handful of ~293 k surveyed land pairs sit at the slide
+//! limit, the distribution does not.
 //!
 //! **Vessel-vessel contact** (M6 sub-phase A): bodies in one `step`
 //! slice see each other through a symmetric vertex-vs-hull rule — a
@@ -222,7 +240,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use csp_core::terrain::{AMPLITUDE_FRAC, BAKE_HEIGHT, BAKE_WIDTH, HeightField};
+use csp_core::terrain::{HeightField, ReliefProfile};
 use csp_core::{DQuat, DVec3, SimTime, TICK_HZ};
 use csp_data::{AtmosphereDef, BodyDef};
 
@@ -300,59 +318,88 @@ const R_GAS: f64 = 8.314_462_618_153_24;
 /// datum sphere — the "sank below the visible ground before the sim
 /// noticed" defect this type exists to close.)
 ///
-/// The baked field is a **pure derived cache** of `seed`: it is
-/// skipped by serde (a save/replay carries the seed, not the ~2 MB of
-/// texels) and lazily re-baked on first sample — bit-identical every
-/// time, per `HeightField`'s determinism contract. The `OnceCell`
-/// keeps the `&self` predicate paths (`ground_contact`, `cast_ray`)
-/// honest: evaluation warms the cache without mutating state.
+/// The baked field is a **pure derived cache** of `(seed, profile)`:
+/// it is skipped by serde (a save/replay carries the descriptor, not
+/// the ~2 MB of texels) and lazily re-baked on first sample —
+/// bit-identical every time, per `HeightField`'s determinism
+/// contract. The `OnceCell` keeps the `&self` predicate paths
+/// (`ground_contact`, `cast_ray`) honest: evaluation warms the cache
+/// without mutating state.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TerrainSurface {
     /// `TerrainDef::noise_seed` — the height function's identity.
     pub seed: u64,
-    /// Height amplitude, metres — `radius_m · AMPLITUDE_FRAC`, the
-    /// same scale `csp-view`'s `TerrainBody::amplitude_m` computes.
+    /// Height amplitude, metres — `radius_m · TerrainDef::
+    /// amplitude_frac` (the authored fraction; `AMPLITUDE_FRAC` is
+    /// its data default), the same scale `csp-view`'s `TerrainBody::
+    /// amplitude_m` computes.
     pub amplitude_m: f64,
-    /// The baked equirect field — derived cache of `seed` (see the
-    /// type doc); `Arc`-shared so an `Environment` clone stays cheap.
+    /// The relief spectrum (§5.2-R2's terrain overhaul, M5) — which
+    /// `height_normalized_profile` variant and bake dims
+    /// [`Self::field`] uses. `serde(default)` keeps pre-profile CBOR
+    /// saves decoding as [`ReliefProfile::Legacy`] (an existing save
+    /// replays its authored world bit-for-bit); §7.6 bincode
+    /// artifacts embed the surface and follow the additive-field
+    /// landmine rule — re-recorded in the same commit as the field
+    /// (see `terrain_surface_profile_is_save_compatible`).
+    #[serde(default)]
+    pub profile: ReliefProfile,
+    /// The baked equirect field — derived cache of `(seed, profile)`
+    /// (see the type doc); `Arc`-shared so an `Environment` clone
+    /// stays cheap.
     #[serde(skip)]
     field: OnceCell<Arc<HeightField>>,
 }
 
 impl TerrainSurface {
-    /// A terrain surface for `seed` — the field bakes lazily on first
-    /// sample (or on [`Self::prewarm`]).
-    pub fn new(seed: u64, amplitude_m: f64) -> Self {
+    /// A terrain surface for `seed` under `profile` — the field bakes
+    /// lazily on first sample (or on [`Self::prewarm`]), at the
+    /// profile's own dims.
+    pub fn new(seed: u64, amplitude_m: f64, profile: ReliefProfile) -> Self {
         Self {
             seed,
             amplitude_m,
+            profile,
             field: OnceCell::new(),
         }
     }
 
     /// A surface over an already-baked field — the test seam: a small
     /// bake keeps the contact-surface tests fast while exercising the
-    /// identical sample path the full-size field drives.
+    /// identical sample path the full-size field drives. `profile`
+    /// tags the surface exactly as authored construction would.
     #[cfg(test)]
-    pub(crate) fn with_field(field: HeightField, seed: u64, amplitude_m: f64) -> Self {
-        let s = Self::new(seed, amplitude_m);
+    pub(crate) fn with_field(
+        field: HeightField,
+        seed: u64,
+        amplitude_m: f64,
+        profile: ReliefProfile,
+    ) -> Self {
+        let s = Self::new(seed, amplitude_m, profile);
         // New cell — `set` cannot fail on an empty OnceCell.
         let _ = s.field.set(Arc::new(field));
         s
     }
 
     /// Bake the field now — a construction-time warm-up so the first
-    /// contact tick doesn't eat the ~0.5 M-texel bake mid-frame. Pure
-    /// function of `seed`; safe to call repeatedly.
+    /// contact tick doesn't eat the multi-megatexel bake mid-frame.
+    /// Pure function of `(seed, profile)`; safe to call repeatedly.
     pub fn prewarm(&self) {
         let _ = self.field();
     }
 
     /// The baked field — `get_or_init` behind `OnceCell`, the lazy
-    /// half of [`Self::prewarm`].
+    /// half of [`Self::prewarm`]. Bakes via
+    /// [`HeightField::bake_profiled`] at the profile's own dims and
+    /// spectrum, which for [`ReliefProfile::Legacy`] is bit-identical
+    /// to the pre-profile `bake(seed, BAKE_WIDTH, BAKE_HEIGHT)` call
+    /// this migrated from (the legacy seed fold is 0; csp-core's
+    /// `legacy_profiled_bake_matches_bake` pins the identity and
+    /// `legacy_terrain_field_bake_is_bit_identical` below re-pins it
+    /// through this call site).
     fn field(&self) -> &Arc<HeightField> {
         self.field
-            .get_or_init(|| Arc::new(HeightField::bake(self.seed, BAKE_WIDTH, BAKE_HEIGHT)))
+            .get_or_init(|| Arc::new(HeightField::bake_profiled(self.seed, self.profile)))
     }
 
     /// Terrain height above the datum radius at `dir_fixed` — a
@@ -366,10 +413,13 @@ impl TerrainSurface {
 }
 
 impl PartialEq for TerrainSurface {
-    /// Identity is the seeded descriptor — the baked field is a
-    /// derived cache and never participates.
+    /// Identity is the seeded descriptor — profile included (the same
+    /// seed under two spectra is two different surfaces); the baked
+    /// field is a derived cache and never participates.
     fn eq(&self, other: &Self) -> bool {
-        self.seed == other.seed && self.amplitude_m == other.amplitude_m
+        self.seed == other.seed
+            && self.amplitude_m == other.amplitude_m
+            && self.profile == other.profile
     }
 }
 
@@ -378,6 +428,7 @@ impl core::fmt::Debug for TerrainSurface {
         f.debug_struct("TerrainSurface")
             .field("seed", &self.seed)
             .field("amplitude_m", &self.amplitude_m)
+            .field("profile", &self.profile)
             .field("field_baked", &self.field.get().is_some())
             .finish()
     }
@@ -474,13 +525,16 @@ impl Environment {
             drag_cd: DEFAULT_DRAG_CD,
             convective_heat_fraction: DEFAULT_CONVECTIVE_HEAT_FRACTION,
             // The seeded surface the renderer draws — `noise_seed` is
-            // the authored `TerrainDef` identity and the amplitude the
-            // shared `AMPLITUDE_FRAC · radius` rule `csp-view`'s
-            // `TerrainBody` computes; sim and render displace to the
-            // same surface by construction.
+            // the authored `TerrainDef` identity, the amplitude the
+            // authored `amplitude_frac · radius` (data default
+            // `AMPLITUDE_FRAC`, the scale `csp-view`'s `TerrainBody`
+            // computes), and the relief spectrum the authored profile
+            // (data default Legacy); sim and render bake and displace
+            // to the same surface by construction.
             terrain: Some(TerrainSurface::new(
                 body.terrain.noise_seed,
-                body.radius_m * AMPLITUDE_FRAC,
+                body.radius_m * body.terrain.amplitude_frac,
+                body.terrain.relief,
             )),
         }
     }
@@ -2976,6 +3030,7 @@ mod tests {
     use crate::graph::{PartGraph, PartNode, PartNodeId, PartTransform};
     use crate::part::{ColliderShape, ForceSite, WeldPart};
     use crate::weld::weld;
+    use csp_core::terrain::{AMPLITUDE_FRAC, BAKE_HEIGHT, BAKE_WIDTH, height_normalized_profile};
     use csp_data::TemperatureKnot;
 
     fn test_thermal() -> csp_data::ThermalDef {
@@ -4136,6 +4191,310 @@ mod tests {
 
     // ---- R2: the seeded heightfield IS the contact surface ----
 
+    /// §5.2-R2's slope survey (M5, terrain overhaul Phase 1b): the
+    /// Mountain spectrum's land-slope distribution, measured on the
+    /// analytic height function (NOT a bake — the survey must stay
+    /// cheap) × seeds {0, 601} at TWO scales:
+    ///
+    /// - **macro** 96×48 (~39 km spacing at Terrin): the
+    ///   continent-scale gradient — the C12-F2-class bound legacy
+    ///   carries.
+    /// - **ridge** 512×256 (~7.4 km spacing): resolves the Mountain
+    ///   spectrum's ×28 ridge octaves (~21 km wavelength at Terrin's
+    ///   radius) — the contact-scale slopes the normal-model decision
+    ///   reads; the macro grid aliases exactly that detail.
+    ///
+    /// Per cell pair the slope is `|Δh|·amplitude_m / arc` between the
+    /// two sample directions (east pairs wrap longitude, north pairs
+    /// stop at the last row); land cells only, land read as
+    /// `h > 0` — the above-datum notion, the survey's stand-in for
+    /// `height_normalized`'s private smoothstep continents mask. The
+    /// RIDGE p99 at `amplitude_frac = 0.006` (Terrin's planned M5
+    /// authoring) is the datum the contact-normal model decision
+    /// rests on (module doc, §5.2-R2): gradient normals are warranted
+    /// iff it clears tan(12°), and the survey ASSERTS the incumbent
+    /// bound so a future Mountain-spectrum edit that steepens ridges
+    /// fails here instead of silently invalidating the radial-normal
+    /// assumption. The remaining assertions are the cheap invariants
+    /// — finite, populated, monotone percentiles; the numbers are
+    /// printed for `--nocapture`.
+    #[test]
+    fn mountain_land_slope_distribution() {
+        for (rows, cols) in [(48usize, 96usize), (256usize, 512usize)] {
+            // Heights are amplitude-independent — bake the grid once
+            // per seed, then read both authored amplitude fractions
+            // off it.
+            let mut grids = Vec::new();
+            for seed in [0u64, 601] {
+                let mut h = vec![0.0f64; rows * cols];
+                for j in 0..rows {
+                    let lat = -core::f64::consts::FRAC_PI_2
+                        + core::f64::consts::PI * (j as f64 + 0.5) / rows as f64;
+                    let (slat, clat) = (libm::sin(lat), libm::cos(lat));
+                    for i in 0..cols {
+                        let lon = -core::f64::consts::PI
+                            + 2.0 * core::f64::consts::PI * (i as f64 + 0.5) / cols as f64;
+                        let dir = DVec3::new(clat * libm::cos(lon), clat * libm::sin(lon), slat);
+                        h[j * cols + i] =
+                            height_normalized_profile(seed, dir, ReliefProfile::Mountain);
+                    }
+                }
+                grids.push(h);
+            }
+            // The flag names the decision datum's amplitude without a
+            // float comparison — the warrant assert below reads it.
+            for (amp_frac, is_warrant_amplitude) in [(0.004f64, false), (0.006, true)] {
+                let amplitude_m = TERRIN_R * amp_frac;
+                let mut tans = Vec::new();
+                for h in &grids {
+                    for j in 0..rows {
+                        let lat = -core::f64::consts::FRAC_PI_2
+                            + core::f64::consts::PI * (j as f64 + 0.5) / rows as f64;
+                        // East pairs wrap longitude (the equirect seam
+                        // rule).
+                        let arc_e =
+                            TERRIN_R * libm::cos(lat) * 2.0 * core::f64::consts::PI / cols as f64;
+                        for i in 0..cols {
+                            if h[j * cols + i] <= 0.0 {
+                                continue; // ocean/coast cell — land survey only
+                            }
+                            let dh = (h[j * cols + (i + 1) % cols] - h[j * cols + i]).abs();
+                            tans.push(dh * amplitude_m / arc_e);
+                        }
+                    }
+                    let arc_n = TERRIN_R * core::f64::consts::PI / rows as f64;
+                    for j in 0..rows - 1 {
+                        for i in 0..cols {
+                            if h[j * cols + i] <= 0.0 {
+                                continue;
+                            }
+                            let dh = (h[(j + 1) * cols + i] - h[j * cols + i]).abs();
+                            tans.push(dh * amplitude_m / arc_n);
+                        }
+                    }
+                }
+                for t in &tans {
+                    assert!(t.is_finite(), "non-finite tan {t}");
+                }
+                tans.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let pick = |frac: f64| tans[((tans.len() - 1) as f64 * frac) as usize];
+                let (p50, p95, p99) = (pick(0.50), pick(0.95), pick(0.99));
+                let max = tans[tans.len() - 1];
+                println!(
+                    "mountain land slopes, {rows}×{cols} grid ({:.1} km spacing) \
+                     @ amplitude_frac {amp_frac} ({:.0} m at R=600 km), {} land pairs: \
+                     p50 {:.4}  p95 {:.4}  p99 {:.4}  max {:.4}",
+                    2.0 * core::f64::consts::PI * TERRIN_R / cols as f64 / 1_000.0,
+                    TERRIN_R * amp_frac,
+                    tans.len(),
+                    p50,
+                    p95,
+                    p99,
+                    max
+                );
+                assert!(
+                    p50 <= p95 && p95 <= p99 && p99 <= max,
+                    "percentiles not monotone"
+                );
+                // The radial-normal warrant datum (module doc, §5.2-R2):
+                // ridge-scale Mountain p99 at the planned authored
+                // amplitude 0.006 must stay under tan(12°) ≈ 0.2126 —
+                // the threshold past which the contact model's radial
+                // "up" needs replacing with height-gradient normals. A
+                // Mountain-spectrum edit that steepens ridges fails
+                // HERE, not silently in the contact solver.
+                if (rows, cols) == (256, 512) && is_warrant_amplitude {
+                    assert!(
+                        p99 < 0.2126,
+                        "ridge-scale Mountain p99 at amplitude_frac 0.006 is {p99:.4} — \
+                         exceeds the radial-normal warrant tan(12°) ≈ 0.2126; either \
+                         retune the spectrum or implement gradient contact normals \
+                         (module doc, §5.2-R2)"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A small `HeightField` baked from `height_normalized_profile` —
+    /// the test seam's stand-in for `HeightField::bake_profiled`
+    /// (whose own 2048×1024 × 16-layer bake costs ~seconds in debug;
+    /// csp-core pins the full-bake identity instead, and its ignored
+    /// `perf_probe_bake_mountain` is the deliberate cost probe).
+    /// Same equirect texel math and key rule as `bake_with_profile`.
+    fn small_profiled_field(
+        seed: u64,
+        profile: ReliefProfile,
+        width: u32,
+        height: u32,
+    ) -> HeightField {
+        let mut data = Vec::with_capacity((width * height) as usize);
+        for j in 0..height {
+            let lat = -core::f64::consts::FRAC_PI_2
+                + core::f64::consts::PI * (j as f64 + 0.5) / height as f64;
+            let (slat, clat) = (libm::sin(lat), libm::cos(lat));
+            for i in 0..width {
+                let lon = -core::f64::consts::PI
+                    + 2.0 * core::f64::consts::PI * (i as f64 + 0.5) / width as f64;
+                let dir = DVec3::new(clat * libm::cos(lon), clat * libm::sin(lon), slat);
+                data.push(height_normalized_profile(seed, dir, profile) as f32);
+            }
+        }
+        HeightField {
+            width,
+            height,
+            data,
+            key: HeightField::bake_key(seed ^ profile.key_seed_fold(), width, height),
+        }
+    }
+
+    /// §5.2-R2 save compatibility (M5): `profile` is an additive
+    /// field. **CBOR** (the §7.2 CSPSAVE body — self-describing maps):
+    /// a pre-profile payload (the two-field struct every existing
+    /// save carries) decodes with the `serde(default)` fallback
+    /// `Legacy`, exactly how an old save file loads, and round-trips
+    /// preserve the authored profile. **bincode** (the §7.6 replay
+    /// artifact — struct-as-seq, no field names on the wire):
+    /// additive fields cannot decode from pre-profile bytes (the
+    /// stream cannot say where the old surface ended), so artifacts
+    /// follow the additive-field landmine rule and are re-recorded in
+    /// the same commit as the field — the same-commit rebless every
+    /// prior wire change took (`terrain`, `convective_heat_fraction`,
+    /// `bubble_radius_m` each re-recorded `flight-launch/replay.bin`;
+    /// the re-record's final hash is unchanged because Legacy physics
+    /// is bit-identical). The bincode round-trip below pins the new
+    /// codec's self-consistency for both profiles.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct PreProfileTerrainSurface {
+        seed: u64,
+        amplitude_m: f64,
+    }
+
+    #[test]
+    fn terrain_surface_profile_is_save_compatible() {
+        // CBOR, the save codec: a pre-profile payload → Legacy.
+        let mut old = Vec::new();
+        ciborium::ser::into_writer(
+            &PreProfileTerrainSurface {
+                seed: 7,
+                amplitude_m: 100.0,
+            },
+            &mut old,
+        )
+        .unwrap();
+        let compat: TerrainSurface = ciborium::de::from_reader(&old[..]).unwrap();
+        assert_eq!(compat.seed, 7);
+        assert_eq!(compat.amplitude_m, 100.0);
+        assert_eq!(
+            compat.profile,
+            ReliefProfile::Legacy,
+            "a pre-profile save must decode as the legacy spectrum"
+        );
+        // CBOR round-trip preserves the authored profile.
+        let m = TerrainSurface::new(601, 3_600.0, ReliefProfile::Mountain);
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&m, &mut bytes).unwrap();
+        let back: TerrainSurface = ciborium::de::from_reader(&bytes[..]).unwrap();
+        assert_eq!(back, m, "CBOR round-trip must preserve the descriptor");
+        // bincode, the replay-artifact codec: new payloads round-trip
+        // (a Mountain surface persists through a recorded artifact).
+        let bytes = bincode::serde::encode_to_vec(&m, bincode::config::standard()).unwrap();
+        let back: TerrainSurface =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                .unwrap()
+                .0;
+        assert_eq!(back, m, "bincode round-trip must preserve the descriptor");
+    }
+
+    /// §5.2-R2 bit-stability (M5): `field()`'s migrated
+    /// `bake_profiled` call yields the identical bake the pre-profile
+    /// `bake(seed, BAKE_WIDTH, BAKE_HEIGHT)` produced — legacy dims,
+    /// the HISTORICAL key rule (fold 0), and texels that equal the
+    /// analytic legacy spectrum at every probed texel centre — so
+    /// every shipped body's contact surface (and its goldens) is
+    /// unchanged by the profile wiring. csp-core's
+    /// `legacy_profiled_bake_matches_bake` pins the full-data
+    /// identity against a second full bake; this re-pins the
+    /// migration through this crate's own call site without doubling
+    /// the suite's bake budget.
+    #[test]
+    fn legacy_terrain_field_bake_is_bit_identical() {
+        let seed = 601u64;
+        let s = TerrainSurface::new(seed, TERRIN_R * AMPLITUDE_FRAC, ReliefProfile::Legacy);
+        let f = s.field();
+        assert_eq!((f.width, f.height), (BAKE_WIDTH, BAKE_HEIGHT));
+        assert_eq!(
+            f.key,
+            HeightField::bake_key(seed, BAKE_WIDTH, BAKE_HEIGHT),
+            "legacy bake key must follow the historical rule"
+        );
+        // Texel centres: the bake writes `height_normalized_profile(
+        // seed, dir, Legacy)` verbatim — probe the first rows plus a
+        // strided sweep spanning all latitudes.
+        let texel = |idx: usize| {
+            let (i, j) = (idx % f.width as usize, idx / f.width as usize);
+            let lat = -core::f64::consts::FRAC_PI_2
+                + core::f64::consts::PI * (j as f64 + 0.5) / f.height as f64;
+            let lon = -core::f64::consts::PI
+                + 2.0 * core::f64::consts::PI * (i as f64 + 0.5) / f.width as f64;
+            let dir = DVec3::new(
+                libm::cos(lat) * libm::cos(lon),
+                libm::cos(lat) * libm::sin(lon),
+                libm::sin(lat),
+            );
+            height_normalized_profile(seed, dir, ReliefProfile::Legacy) as f32
+        };
+        for idx in (0..4 * f.width as usize).chain((0..f.data.len()).step_by(997)) {
+            assert_eq!(f.data[idx], texel(idx), "texel {idx} diverged from legacy");
+        }
+    }
+
+    /// §5.2-R2 wiring (M5): `Environment::for_body` stamps the
+    /// AUTHORED amplitude fraction and relief profile into the
+    /// contact surface — defaults `AMPLITUDE_FRAC`/Legacy (every
+    /// shipped body), authored `0.006`/Mountain for a Phase-2 body.
+    #[test]
+    fn for_body_stamps_authored_amplitude_and_profile() {
+        let body = csp_data::BodyDef {
+            schema_version: csp_data::BODY_SCHEMA_VERSION,
+            id: "planet".into(),
+            display_name: "body.planet.name".into(),
+            parent: None,
+            radius_m: TERRIN_R,
+            mu_m3_per_s2: TERRIN_MU,
+            soi_m: None,
+            rotation_period_s: Some(86_400.0),
+            tilt_rad: 0.0,
+            orbit: None,
+            atmosphere: None,
+            ocean: None,
+            terrain: csp_data::TerrainDef {
+                noise_seed: 601,
+                heightmap: None,
+                amplitude_frac: AMPLITUDE_FRAC, // the data default
+                relief: ReliefProfile::Legacy,
+            },
+            biome_map: None,
+            surface_resources: Vec::new(),
+            insolation_w_m2: Some(1_361.0),
+        };
+        let env = Environment::for_body(&body, DVec3::ZERO, None);
+        let t = env.terrain.as_ref().unwrap();
+        assert_eq!(t.seed, 601);
+        assert_eq!(t.profile, ReliefProfile::Legacy);
+        assert_eq!(t.amplitude_m, TERRIN_R * AMPLITUDE_FRAC);
+
+        let mut authored = body.clone();
+        authored.terrain.amplitude_frac = 0.006; // Terrin's planned authoring
+        authored.terrain.relief = ReliefProfile::Mountain;
+        let env_m = Environment::for_body(&authored, DVec3::ZERO, None);
+        let tm = env_m.terrain.as_ref().unwrap();
+        assert_eq!(tm.seed, 601);
+        assert_eq!(tm.profile, ReliefProfile::Mountain);
+        assert_eq!(tm.amplitude_m, TERRIN_R * 0.006);
+        assert_ne!(tm, t, "authored profile must change the surface identity");
+    }
+
     /// The ground the solver contacts is the same displaced field the
     /// renderer draws: a box dropped above a hill latches and rests
     /// with its lowest vertex at the terrain radius
@@ -4166,7 +4525,12 @@ mod tests {
             }
         }
         let mut env = terrin_env();
-        env.terrain = Some(TerrainSurface::with_field(field, seed, amp));
+        env.terrain = Some(TerrainSurface::with_field(
+            field,
+            seed,
+            amp,
+            ReliefProfile::Legacy,
+        ));
         env.settle_ticks = 32;
         let surf_r = env.surface_radius(dir, 0.0);
         assert!(
@@ -4220,6 +4584,99 @@ mod tests {
         );
     }
 
+    /// The Mountain twin of
+    /// [`dropped_box_rests_on_terrain_not_datum`] (§5.2-R2, M5): a
+    /// box dropped on the sharper spectrum at Terrin's planned
+    /// authored amplitude (`0.006·R`) latches and rests ON the
+    /// displaced field — the radial-normal contact model (this
+    /// phase's measured decision; module doc) still settles it.
+    /// Landing site: the flattest genuinely-land direction in a
+    /// fixed 64-dir scan (slope by finite differences on the same
+    /// `sample_dir` the solver sees, land read as above-datum), so
+    /// the latch is a property of the contact model, not of a
+    /// hand-picked permissive spot.
+    #[test]
+    fn dropped_box_settles_on_mountain_terrain() {
+        let seed = 601u64;
+        let amp = TERRIN_R * 0.006; // the planned M5 authoring
+        let field = small_profiled_field(seed, ReliefProfile::Mountain, 128, 64);
+        let mut env = terrin_env();
+        env.terrain = Some(TerrainSurface::with_field(
+            field,
+            seed,
+            amp,
+            ReliefProfile::Mountain,
+        ));
+        env.settle_ticks = 32;
+        // The flattest land dir in the scan band — tangent basis from
+        // Z (the band's z ≈ 0.32 keeps `Z×d` off the degeneracy).
+        let mut dir = DVec3::X;
+        let mut best_slope = f64::INFINITY;
+        for k in 0..64 {
+            let t = 2.0 * core::f64::consts::PI * k as f64 / 64.0;
+            let d = DVec3::new(libm::cos(t), libm::sin(t), 0.35);
+            let d = d / d.norm();
+            let h_m = |d: DVec3| env.surface_radius(d, 0.0) - env.radius_m;
+            // Land with real clearance: the datum discriminator needs
+            // the site to sit well above the bare sphere.
+            if h_m(d) <= 0.05 * amp {
+                continue;
+            }
+            let east_raw = DVec3::Z.cross(d);
+            let east = east_raw / east_raw.norm();
+            let north = d.cross(east);
+            let eps = 0.01; // rad — arc TERRIN_R·eps per step
+            let slope = [
+                (d + east * eps, TERRIN_R * eps),
+                (d - east * eps, TERRIN_R * eps),
+                (d + north * eps, TERRIN_R * eps),
+                (d - north * eps, TERRIN_R * eps),
+            ]
+            .into_iter()
+            .map(|(n, arc)| (h_m(n / n.norm()) - h_m(d)).abs() / arc)
+            .fold(0.0f64, f64::max);
+            if slope < best_slope {
+                best_slope = slope;
+                dir = d;
+            }
+        }
+        assert!(best_slope.is_finite(), "scan found no land site");
+        let mut backend = SimpleBackend::new(env.clone());
+        let surf_r = env.surface_radius(dir, 0.0);
+        let mut b = box_body(1_000.0, DVec3::new(0.5, 0.5, 0.5));
+        b.pos = dir * (surf_r + 3.0); // belly ~2.5 m over the surface
+        let mut bodies = vec![b];
+        let mut latched_at = None;
+        for tick in 0..4_096 {
+            backend.step(&mut bodies, &[]);
+            if bodies[0].settle.latched {
+                latched_at = Some(tick);
+                break;
+            }
+        }
+        let tick = latched_at.expect("dropped box never latched on mountain terrain");
+        let b = &bodies[0];
+        // Rests ON the displaced surface — no sinking (each collider
+        // vertex's radial clearance vs the surface under its own
+        // direction, the same read the legacy twin asserts).
+        let lo_terrain = b
+            .collider
+            .hulls
+            .iter()
+            .flat_map(|hull| hull.vertices.iter().copied())
+            .map(|v| {
+                let rel = b.pos + b.rot.rotate(v) - env.body_center;
+                let d = rel.norm();
+                d - env.surface_radius(rel / d, 0.0)
+            })
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            lo_terrain.abs() < 0.5,
+            "resting box floats/sinks {lo_terrain} m vs the mountain surface \
+             (latched at tick {tick}, site slope {best_slope:.4})"
+        );
+    }
+
     /// `ground_contact`/`cast_ray` predicate parity: a vertex just
     /// above the local terrain height is clear, just below is contact
     /// — and a downward ray reports its hit AT the displaced surface.
@@ -4229,7 +4686,12 @@ mod tests {
         let amp = 100.0; // exaggerated, keeps the test readable
         let field = HeightField::bake(seed, 64, 32);
         let mut env = terrin_env();
-        env.terrain = Some(TerrainSurface::with_field(field, seed, amp));
+        env.terrain = Some(TerrainSurface::with_field(
+            field,
+            seed,
+            amp,
+            ReliefProfile::Legacy,
+        ));
         let dir = DVec3::X;
         let surf_r = env.surface_radius(dir, 0.0);
         let backend = SimpleBackend::new(env.clone());
