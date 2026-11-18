@@ -113,6 +113,15 @@ run explicitly, e.g.
 cargo test -p csp-view --test render_gate dump_sky -- --ignored
 ```
 
+The dumps are binary P6 PPM (`/tmp/frame.ppm`, `/tmp/sky_*.ppm`,
+`/tmp/hud_*.ppm`, …). Convert one to PNG for eyeballing with the xtask
+helper — the output path defaults to the input's with the extension
+swapped for `.png`:
+
+```bash
+cargo run -p xtask --bin ppm2png -- /tmp/frame.ppm   # → /tmp/frame.png
+```
+
 ### Golden replay fixtures
 
 - Frozen data sets live in `data/test-fixtures/<scenario>/` — currently
