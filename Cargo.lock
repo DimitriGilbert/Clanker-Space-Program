@@ -1064,6 +1064,7 @@ dependencies = [
  "libm",
  "log",
  "naga",
+ "pollster",
  "wgpu",
 ]
 

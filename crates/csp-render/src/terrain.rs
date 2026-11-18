@@ -49,6 +49,7 @@ use std::sync::Arc;
 use csp_core::DVec3;
 
 use crate::GpuBuffer;
+use crate::shadow::{ShadowCore, ShadowDraw, ShadowUniforms};
 
 // ---------------------------------------------------------------------------
 // Seeded procedural height — the DETERMINISTIC SHARED SOURCE lives in
@@ -664,9 +665,11 @@ impl TexUpload {
 /// GPU owner for the R2 pass: the terrain/ocean instanced pipeline, the
 /// fullscreen sky pipeline, the uniform buffer, the three data
 /// textures (heightfield `R32Float`, transmittance `RGBA32Float`, biome
-/// `R8Uint`), and the real-art set (albedo/normal `RGBA8` arrays, the
+/// `R8Uint`), the real-art set (albedo/normal `RGBA8` arrays, the
 /// water normal map + the filtering sampler) — each re-uploaded only
-/// when its packet key changes.
+/// when its packet key changes — plus the R1 shadow-cascade core
+/// ([`ShadowCore`], phase 3a: present but disarmed until 3b's frame
+/// loop calls [`Self::draw_shadow`]).
 pub struct TerrainRenderer {
     terrain_pipe: wgpu::RenderPipeline,
     /// Ocean pipeline — same shaders/mesh as `terrain_pipe`, depth
@@ -686,6 +689,9 @@ pub struct TerrainRenderer {
     /// consumed by `draw_ocean`.
     inst_bytes: wgpu::BufferAddress,
     inst_end: wgpu::BufferAddress,
+    /// Cascade-map resources (the `SU` uniform entry at binding 8,
+    /// the receiving group(1), + the depth passes).
+    shadow: ShadowCore,
     height_tex: wgpu::Texture,
     lut_tex: wgpu::Texture,
     biome_tex: wgpu::Texture,
@@ -706,7 +712,12 @@ impl TerrainRenderer {
     /// (non-filterable formats keep every backend happy). Bindings 4–6
     /// are the real-art set (albedo/normal `D2Array`, water normal `D2`,
     /// all filterable `RGBA8`) plus the filtering sampler at 7 — they
-    /// carry 1×1 placeholders until a packet uploads art.
+    /// carry 1×1 placeholders until a packet uploads art. Binding 8 is
+    /// the R1 cascade `SU` uniform (phase 3a — both the receiving
+    /// `fs_terrain` and the depth-pass vertices `vs_shadow0/1` read
+    /// it; the cascade depth array + comparison sampler live in their
+    /// own group(1), which the shadow passes never bind — see
+    /// `ShadowCore`).
     fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
         let tex = |binding: u32, vis, sample_type| wgpu::BindGroupLayoutEntry {
             binding,
@@ -767,6 +778,17 @@ impl TerrainRenderer {
                     binding: 7,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // The cascade uniform — core WebGPU types, no features.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
                     count: None,
                 },
             ],
@@ -869,9 +891,19 @@ impl TerrainRenderer {
             source: wgpu::ShaderSource::Wgsl(include_str!("terrain.wgsl").into()),
         });
         let bgl = Self::bind_group_layout(device);
+        // The shadow core owns the cascade group(1) layout (depth
+        // array + comparison sampler) — the visible pipelines list it
+        // second; the shadow depth pipelines ride group(0) alone so
+        // their passes never bind the texture they render into.
+        let shadow = ShadowCore::new(
+            device,
+            &shader,
+            &bgl,
+            &[Some(GridVertex::LAYOUT), Some(TerrainInstance::LAYOUT)],
+        );
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("terrain"),
-            bind_group_layouts: &[Some(&bgl)],
+            bind_group_layouts: &[Some(&bgl), Some(shadow.sample_layout())],
             immediate_size: 0,
         });
         let depth_state = wgpu::DepthStencilState {
@@ -916,6 +948,7 @@ impl TerrainRenderer {
             &nrm_tex,
             &water_tex,
             &sampler,
+            &shadow,
         );
         Self {
             terrain_pipe,
@@ -935,6 +968,7 @@ impl TerrainRenderer {
             ),
             inst_bytes: 0,
             inst_end: 0,
+            shadow,
             height_tex,
             lut_tex,
             biome_tex,
@@ -1020,6 +1054,7 @@ impl TerrainRenderer {
         nrm_tex: &wgpu::Texture,
         water_tex: &wgpu::Texture,
         sampler: &wgpu::Sampler,
+        shadow: &ShadowCore,
     ) -> wgpu::BindGroup {
         let height_view = height_tex.create_view(&wgpu::TextureViewDescriptor::default());
         let lut_view = lut_tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1063,6 +1098,10 @@ impl TerrainRenderer {
                     binding: 7,
                     resource: wgpu::BindingResource::Sampler(sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: shadow.uniforms_ref().as_entire_binding(),
+                },
             ],
         })
     }
@@ -1079,6 +1118,7 @@ impl TerrainRenderer {
             &self.nrm_tex,
             &self.water_tex,
             &self.sampler,
+            &self.shadow,
         );
     }
 
@@ -1212,6 +1252,44 @@ impl TerrainRenderer {
         true
     }
 
+    /// The shared grid is immutable — upload once, lazily (the first
+    /// of `draw`/`draw_shadow` to run pays it).
+    fn ensure_grid(&mut self, queue: &wgpu::Queue) {
+        if !self.grid_uploaded {
+            let (verts, indices) = unit_grid();
+            queue.write_buffer(&self.grid_v, 0, bytemuck::cast_slice(&verts));
+            queue.write_buffer(&self.grid_i, 0, bytemuck::cast_slice(&indices));
+            self.grid_uploaded = true;
+        }
+    }
+
+    /// Terrain + ocean share the mesh — ONE upload, laid out
+    /// terrain-then-ocean so `draw` slices the terrain range and
+    /// `draw_ocean` slices the rest (the ocean draws in a second
+    /// phase after the flight stream, so the two stages never race
+    /// one buffer). `draw_shadow` re-runs the same upload when it
+    /// leads the frame; identical bytes, so the extra staging write
+    /// is the only cost.
+    fn upload_instances(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        packet: &TerrainPacket,
+    ) {
+        let n_terrain = packet.terrain.len();
+        let n_inst = n_terrain + packet.ocean.len();
+        if n_inst == 0 {
+            return;
+        }
+        let mut inst = Vec::with_capacity(n_inst);
+        inst.extend_from_slice(&packet.terrain);
+        inst.extend_from_slice(&packet.ocean);
+        let _ = self.instances.upload(device, queue, &inst);
+        self.inst_bytes =
+            (n_terrain * std::mem::size_of::<TerrainInstance>()) as wgpu::BufferAddress;
+        self.inst_end = (n_inst * std::mem::size_of::<TerrainInstance>()) as wgpu::BufferAddress;
+    }
+
     /// Upload the packet's changing pieces (uniforms, instance rows,
     /// any stale textures) and record: sky → opaque terrain, into the
     /// caller's open pass sharing the flight depth target (reverse-Z).
@@ -1226,13 +1304,7 @@ impl TerrainRenderer {
         packet: &TerrainPacket,
     ) {
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&packet.uniforms));
-        // The shared grid is immutable — upload once, lazily.
-        if !self.grid_uploaded {
-            let (verts, indices) = unit_grid();
-            queue.write_buffer(&self.grid_v, 0, bytemuck::cast_slice(&verts));
-            queue.write_buffer(&self.grid_i, 0, bytemuck::cast_slice(&indices));
-            self.grid_uploaded = true;
-        }
+        self.ensure_grid(queue);
         let mut rebind = false;
         if let Some(hf) = &packet.heightfield
             && self.uploaded_height_key != Some(hf.key)
@@ -1313,34 +1385,63 @@ impl TerrainRenderer {
         }
 
         pass.set_bind_group(0, &self.bind_group, &[]);
+        // Cascade receiving set (group 1: depth array + comparison
+        // sampler). Disarmed sessions sample a zeroed map through a
+        // zeroed `SU` — the armed flag keeps the path dead.
+        pass.set_bind_group(1, self.shadow.sample_bind(), &[]);
         if packet.sky {
             pass.set_pipeline(&self.sky_pipe);
             pass.draw(0..3, 0..1);
         }
-        // Terrain + ocean share the mesh — ONE upload, laid out
-        // terrain-then-ocean so `draw` slices the terrain range and
-        // `draw_ocean` slices the rest (the ocean draws in a second
-        // phase after the flight stream, so the two stages never
-        // race one buffer).
-        let n_terrain = packet.terrain.len();
-        let n_inst = n_terrain + packet.ocean.len();
-        if n_inst > 0 {
-            let mut inst = Vec::with_capacity(n_inst);
-            inst.extend_from_slice(&packet.terrain);
-            inst.extend_from_slice(&packet.ocean);
-            let _ = self.instances.upload(device, queue, &inst);
-            self.inst_bytes =
-                (n_terrain * std::mem::size_of::<TerrainInstance>()) as wgpu::BufferAddress;
-            self.inst_end =
-                (n_inst * std::mem::size_of::<TerrainInstance>()) as wgpu::BufferAddress;
-        }
-        if n_terrain > 0 {
+        self.upload_instances(device, queue, packet);
+        if !packet.terrain.is_empty() {
             pass.set_pipeline(&self.terrain_pipe);
             pass.set_vertex_buffer(0, self.grid_v.slice(..));
             pass.set_vertex_buffer(1, self.instances.buffer.slice(0..self.inst_bytes));
             pass.set_index_buffer(self.grid_i.slice(..), wgpu::IndexFormat::Uint16);
-            pass.draw_indexed(0..self.grid_index_count, 0, 0..n_terrain as u32);
+            pass.draw_indexed(0..self.grid_index_count, 0, 0..packet.terrain.len() as u32);
         }
+    }
+
+    /// The R1 shadow phase (PLAN §5.2): rasterize the packet's
+    /// terrain instances into the two cascade depth layers, BEFORE
+    /// the scene pass records its draws — `fs_terrain` samples the
+    /// layers through group(1) during [`Self::draw`]. Call order in
+    /// the frame loop: `draw_shadow` → `draw` → flight
+    /// `draw` → `draw_ocean`. A no-op unless `shadow` is armed AND
+    /// the packet carries terrain instances (the zeroed `SU` buffer
+    /// of a never-armed session keeps `fs_terrain` on the
+    /// `sun_occlusion` ray-march, bit-identical to the pre-cascade
+    /// build). Ocean instances deliberately do not cast (water
+    /// receives shadows only — the ray-march fallback's semantics).
+    /// Craft casting is 3b's extension point: add a depth-only draw
+    /// of the flight vertex stream inside
+    /// [`ShadowCore::draw_terrain`]'s passes.
+    pub fn draw_shadow(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        packet: &TerrainPacket,
+        shadow: &ShadowUniforms,
+    ) {
+        if !shadow.armed() || packet.terrain.is_empty() {
+            return;
+        }
+        self.ensure_grid(queue);
+        self.upload_instances(device, queue, packet);
+        self.shadow.write_uniforms(queue, shadow);
+        self.shadow.draw_terrain(
+            encoder,
+            ShadowDraw {
+                bind_group: &self.bind_group,
+                grid_v: self.grid_v.slice(..),
+                grid_i: self.grid_i.slice(..),
+                instances: self.instances.buffer.slice(0..self.inst_bytes),
+                index_count: self.grid_index_count,
+                instance_count: packet.terrain.len() as u32,
+            },
+        );
     }
 
     /// The ocean phase — call from the same open pass AFTER the flight
@@ -1356,6 +1457,12 @@ impl TerrainRenderer {
         }
         pass.set_pipeline(&self.ocean_pipe);
         pass.set_bind_group(0, &self.bind_group, &[]);
+        // Self-sufficient cascade set (draw normally sets it earlier
+        // in the same pass; re-setting is cheap and keeps this phase
+        // valid standalone — the ocean pipeline's layout declares
+        // group(1) too, since `fs_terrain` samples the cascades for
+        // water as well).
+        pass.set_bind_group(1, self.shadow.sample_bind(), &[]);
         pass.set_vertex_buffer(0, self.grid_v.slice(..));
         pass.set_vertex_buffer(
             1,
@@ -1367,7 +1474,7 @@ impl TerrainRenderer {
 }
 
 impl GridVertex {
-    const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+    pub(crate) const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<GridVertex>() as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32, 2 => Float32],
@@ -1375,7 +1482,7 @@ impl GridVertex {
 }
 
 impl TerrainInstance {
-    const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+    pub(crate) const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<TerrainInstance>() as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Instance,
         attributes: &wgpu::vertex_attr_array![

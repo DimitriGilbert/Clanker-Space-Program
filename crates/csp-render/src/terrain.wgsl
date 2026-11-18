@@ -43,6 +43,37 @@ struct U {
 @group(0) @binding(6) var water_nrm: texture_2d<f32>;
 @group(0) @binding(7) var samp: sampler;
 
+// --- shadow cascades (R1 debt; shadow.rs owns the CPU solve and
+// the depth passes) --------------------------------------------------
+// The cascade uniform rides its own struct/binding on group(0)
+// (NOT fields on `U`) because csp-view builds `TerrainUniforms`
+// with an exhaustive literal — the cascade contract stays inside
+// csp-render (see shadow.rs). All-zero = disarmed: `sun_visibility`
+// short-circuits to `sun_occlusion` and nothing below ever reads.
+struct SU {
+    // Cascade 0/1 light-view-proj: (world − eye) → cascade clip
+    // [0,1]³. Forward-Z INSIDE the map (smaller depth = closer to
+    // the sun; clear 1.0 = "nothing closer = lit") — independent of
+    // the main pass's reverse-Z, which this attachment never touches.
+    vp: array<mat4x4<f32>, 2>,
+    // Per-cascade bias row (shadow.rs solve output): x world texel
+    // (m), y normal-offset bias (m), z reference bias (normalized
+    // depth), w pad.
+    cascade: array<vec4<f32>, 2>,
+    // x armed (0 = ray-march fallback), y split distance (m),
+    // z coverage-far distance (m), w blend band (m).
+    pars: vec4<f32>,
+};
+@group(0) @binding(8) var<uniform> su: SU;
+// The map itself lives in its OWN group: a usage scope merges every
+// bind group set in a render pass — used or not — so the depth
+// texture must not appear in any bind group the shadow depth passes
+// set while that same texture is their attachment. Group(1) is bound
+// only by the visible scene pass; the depth pipelines' layout has
+// group(0) alone.
+@group(1) @binding(0) var shadow_tex: texture_depth_2d_array; // 2 layers
+@group(1) @binding(1) var shadow_samp: sampler_comparison;     // LessEqual
+
 const PI: f32 = 3.141592653589793;
 
 // --- heightfield sampling: manual bilinear over texel centres,
@@ -335,8 +366,21 @@ struct Vt {
     @location(4) dir_fix: vec3<f32>,
 };
 
-@vertex
-fn vs_terrain(g: Gv, inst: Inst) -> Vt {
+// The one true displacement (§2.3): cube-space uv → inertial dir →
+// body-fixed lookup → patch-local position → camera-relative `wrel`.
+// Shared verbatim by `vs_terrain` and the cascade depth pass
+// (`vs_shadow0/1`) — a depth pass that displaced even one vertex
+// differently from the visible pass would de-register map caster and
+// receiver by whole texels, so there is exactly one body.
+struct Disp {
+    wrel: vec3<f32>,    // world − eye (m) — the shadow matrices' frame
+    dir: vec3<f32>,     // inertial unit direction
+    dir_fix: vec3<f32>, // body-fixed direction
+    h_norm: f32,        // ocean quads carry 0
+    kind: f32,          // 0 terrain, 1 ocean
+};
+
+fn terrain_displace(g: Gv, inst: Inst) -> Disp {
     let cube = inst.corner.xyz + g.uv.x * inst.du.xyz + g.uv.y * inst.dv.xyz;
     let dir = normalize(cube);
     // `dir` is inertial; the heightfield/biome data is body-fixed —
@@ -355,19 +399,54 @@ fn vs_terrain(g: Gv, inst: Inst) -> Vt {
     if (g.skirt > 0.5) {
         local = local - dir * inst.origin_skirt.w;
     }
-    let wrel = local + inst.origin_skirt.xyz;
+    var d: Disp;
+    d.wrel = local + inst.origin_skirt.xyz;
+    d.dir = dir;
+    d.dir_fix = dir_fix;
+    d.h_norm = h_norm;
+    d.kind = inst.dir0_kind.w;
+    return d;
+}
 
-    // Shading normals are built per-fragment now (fs_terrain derives
+@vertex
+fn vs_terrain(g: Gv, inst: Inst) -> Vt {
+    let d = terrain_displace(g, inst);
+    // Shading normals are built per-fragment (fs_terrain derives
     // the heightfield gradient + procedural bump at the interpolated
     // direction) — the vertex stage only carries geometry.
-
     var o: Vt;
-    o.clip = u.view_proj * vec4<f32>(wrel, 1.0);
-    o.dir = dir;
-    o.pos_rel_body = dir * (radius + h);
-    o.h_norm = h_norm;
-    o.kind = inst.dir0_kind.w;
-    o.dir_fix = dir_fix;
+    o.clip = u.view_proj * vec4<f32>(d.wrel, 1.0);
+    o.dir = d.dir;
+    o.pos_rel_body = d.dir * (select(u.planet.x, u.planet.z, d.kind > 0.5)
+                              + d.h_norm * u.planet.w);
+    o.h_norm = d.h_norm;
+    o.kind = d.kind;
+    o.dir_fix = d.dir_fix;
+    return o;
+}
+
+// Cascade depth pass: same displacement, cascade matrix instead of
+// the camera's. One entry point per array layer (wgpu has no layered
+// rendering without features; each layer is its own pass with its
+// own constant matrix index). No fragment stage — the pipelines are
+// depth-only.
+struct VtS {
+    @builtin(position) clip: vec4<f32>,
+};
+
+@vertex
+fn vs_shadow0(g: Gv, inst: Inst) -> VtS {
+    let d = terrain_displace(g, inst);
+    var o: VtS;
+    o.clip = su.vp[0] * vec4<f32>(d.wrel, 1.0);
+    return o;
+}
+
+@vertex
+fn vs_shadow1(g: Gv, inst: Inst) -> VtS {
+    let d = terrain_displace(g, inst);
+    var o: VtS;
+    o.clip = su.vp[1] * vec4<f32>(d.wrel, 1.0);
     return o;
 }
 
@@ -474,6 +553,73 @@ fn blob_shadow(dir: vec3<f32>) -> f32 {
     let g = exp(-(d * d) / (rr * rr));
     let fade = exp(-u.atmo.z / 850.0);
     return 0.55 * g * fade;
+}
+
+// --- cascade sun visibility (R1; receiving half) ----------------------
+// One cascade lookup with the bias pair from the solve. SIGN CHAIN
+// (map depth is forward-Z-along-travel: closer to the sun = SMALLER
+// stored value; the sampler's LessEqual returns lit ⇔ ref ≤ stored,
+// and the receiver's own surface sits in the map at ≈ its own
+// depth — so both biases must move the reference TOWARD the sun,
+// i.e. subtract):
+//  * normal-offset — the sample position is nudged along +n; a lit
+//    fragment has n·sun > 0, travel = −sun, so lt·n < 0: the offset
+//    lowers the projected depth (away from the stored surface, into
+//    the sun direction) and shifts the sampled texel off the
+//    receiver's own footprint;
+//  * slope-scaled reference bias — cb.z·(1+tanθ) subtracted from
+//    the projected depth.
+// Both scale with (1 + tanθ) — the M5 relief tops out near tan 0.75
+// (~37° crests) — because an unbiased slope shadows its own texel
+// footprint (acne), while too much bias lifts contacts off the
+// ground (peter-panning; ~a texel is the accepted cost — shadow.rs
+// pins the flat-ground sign by unit test).
+// `textureSampleCompareLevel` — not `textureSampleCompare` — so the
+// call is legal in this data-dependent control flow (the *Level
+// variant carries no implicit derivatives; the depth array is
+// single-mip so the sample is identical).
+fn cascade_one(wrel: vec3<f32>, n: vec3<f32>, tan_slope: f32,
+               vp: mat4x4<f32>, cb: vec4<f32>, layer: i32) -> f32 {
+    let p = wrel + n * (cb.y * (1.0 + tan_slope));
+    let cd = vp * vec4<f32>(p, 1.0);
+    let uv = clamp(cd.xy * 0.5 + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
+    let ref_d = clamp(cd.z - cb.z * (1.0 + tan_slope), 0.0, 1.0);
+    return textureSampleCompareLevel(shadow_tex, shadow_samp, uv, layer, ref_d);
+}
+
+// Sun visibility through the cascades, with the `sun_occlusion`
+// ray-march retained as: (a) the exact fallback whenever `su` is
+// disarmed (bit-identical to the pre-cascade build — the armed flag
+// is checked FIRST and the fallback keeps its original arguments),
+// and (b) the far-field path beyond the coverage distance (~20 km,
+// where the ray-march's ~5 km reach is the only coverage).
+// Cascade selection is by EYE DISTANCE: conservative against view-Z
+// (every on-screen point at distance d has view-Z ≤ d, so the
+// selected cascade's slice still bounds it — shadow.rs pins the
+// containment), with a blend band at the split so the resolution
+// step cross-fades instead of seaming.
+fn sun_visibility(dir_fix: vec3<f32>, h_m: f32, sun_fix: vec3<f32>,
+                  wrel: vec3<f32>, n: vec3<f32>, dist: f32) -> f32 {
+    if (su.pars.x < 0.5 || dist > su.pars.z) {
+        return sun_occlusion(dir_fix, h_m, sun_fix);
+    }
+    let l = u.sun_dir.xyz;
+    let ndl = dot(n, l);
+    // Surface slope relative to the light in tan units — the bias
+    // driver. ndl is clamped: a back-facing fragment's direct term
+    // is already zero, so its (large) slope only biases a sample
+    // whose result cannot matter.
+    let tan_slope = length(n - l * ndl) / clamp(ndl, 0.25, 1.0);
+    let split = su.pars.y;
+    if (dist >= split) {
+        return cascade_one(wrel, n, tan_slope, su.vp[1], su.cascade[1], 1);
+    }
+    let v0 = cascade_one(wrel, n, tan_slope, su.vp[0], su.cascade[0], 0);
+    if (dist <= split - su.pars.w) {
+        return v0;
+    }
+    let band = smoothstep(split - su.pars.w, split, dist);
+    return mix(v0, cascade_one(wrel, n, tan_slope, su.vp[1], su.cascade[1], 1), band);
 }
 
 // Fallback palette when a body has no biome map — elevation bands
@@ -733,7 +879,8 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
             let alt_b = max(length(pb) - u.planet.x, 0.0);
             sun_lum = sun_lum * trans(alt_b, dot(sun, dir));
         }
-        let occ = sun_occlusion(dir_fix, u.planet.z - u.planet.x, sun_fix);
+        let occ = sun_visibility(dir_fix, u.planet.z - u.planet.x, sun_fix,
+                                 seg, n, dist);
         let vis = occ * (1.0 - blob_shadow(dir));
         // Sun glitter: the tight sparkle lobe rides the wave-normal
         // map (Foam002's squiggly foam pattern) — at the old 2.6 gain
@@ -837,7 +984,8 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
             sun_lum = sun_lum * trans(alt_b, dot(sun, dir));
         }
         let lam = max(dot(n, sun), 0.0);
-        let occ = sun_occlusion(dir_fix, i.h_norm * u.planet.w, sun_fix);
+        let occ = sun_visibility(dir_fix, i.h_norm * u.planet.w, sun_fix,
+                                 seg, n, dist);
         let vis = occ * (1.0 - blob_shadow(dir));
         // Hemisphere ambient — cool sky fill on day, a faint airglow
         // floor on the night side so the terminator never goes dead

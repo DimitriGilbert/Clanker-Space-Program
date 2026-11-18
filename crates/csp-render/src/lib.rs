@@ -14,6 +14,14 @@ pub mod map;
 /// per-patch f64 origins, precomputed-LUT atmospheric scattering, ocean.
 pub mod terrain;
 
+/// The R1 shadow-cascade core (PLAN §5.2 row R1 "shadow cascades" — the
+/// row's last unshipped term): the pure per-frame cascade solve
+/// ([`shadow::solve_cascades`]), the GPU cascade-map passes
+/// (`ShadowCore`), and the receiving `fs_terrain` path's uniforms.
+/// Terrain-overhaul phase 3a ships the core disarmed; phase 3b wires
+/// the view-side solve + frame loop that arms it.
+pub mod shadow;
+
 /// The M3 VAB craft view + GPU picking (PLAN M3 exit row "GPU picking",
 /// §9 "Editor viewport is `csp-render` + GPU picking"): a depth-tested
 /// kitbash part pass over a `csp-view`-built [`vab::VabPacket`], plus

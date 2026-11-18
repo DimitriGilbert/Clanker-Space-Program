@@ -605,7 +605,7 @@ already-rasterized hull, C11-F3).
 | Renderer | Pipelines | Notes |
 |---|---|---|
 | `MapRenderer` (`map.rs:80`) | one unlit pipeline, three meshes (bg stars / lines / markers) | no depth state — the scene pass attaches depth only in Flight/VAB |
-| `TerrainRenderer` (`terrain.rs:670`) | `terrain_pipe`, `ocean_pipe` (depth-test-only variant), `sky_pipe` (fullscreen, always-pass depth) | bind group: 0 uniforms, 1 heightfield R32Float, 2 transmittance LUT RGBA32Float, 3 biome slots R8Uint, 4–6 art albedo/normal arrays + water normal, 7 sampler |
+| `TerrainRenderer` (`terrain.rs:670`) | `terrain_pipe`, `ocean_pipe` (depth-test-only variant), `sky_pipe` (fullscreen, always-pass depth), + two depth-only shadow pipelines `vs_shadow0/1` (`shadow.rs`, 3a — see §7.4) | bind groups: group(0) = 0 uniforms, 1 heightfield R32Float, 2 transmittance LUT RGBA32Float, 3 biome slots R8Uint, 4–6 art albedo/normal arrays + water normal, 7 sampler, 8 cascade `SU` uniform; group(1) = shadow depth D2Array + comparison sampler (visible pass only — see §7.4) |
 | `FlightRenderer` (`flight.rs:75`) | one pipeline; owns the surface-sized reverse-Z depth target | depth compare `GreaterEqual` because the fallback sky sits ON the far plane |
 | `VabRenderer` (`vab.rs:123`) | color pipeline + offscreen pick pipeline (R32Uint object-id) | `encode_pick` rasterizes + copies one pixel |
 
@@ -621,7 +621,7 @@ wins).
 | `map.wgsl` (48 lines) | `vs_main`/`fs_main` | Unlit map primitives; vertices pre-projected on CPU; fragment shapes quad kind 0 line / 1 disc / 2 ring / 3 glow |
 | `vab.wgsl` (107) | `vs_main`/`fs_main` + pick fragment | Per-pixel-lit editor parts (hemisphere ambient × baked occlusion, key light, Blinn specular, fresnel rim); pick writes the 1-based object id |
 | `flight.wgsl` (104) | one vs/fs pair | Same per-pixel lighting as VAB minus pick, plus the unlit passthrough (`nrm ≈ 0`); ACES (Narkowicz) tone-map shared with terrain so lit hulls match the ground |
-| `terrain.wgsl` (1108) | `vs_terrain`/`fs_terrain` (`:334`/`:641`), `vs_sky`/`fs_sky` (`:870`/`:991`) | Quadtree terrain, ocean, and the sky/atmosphere/starfield — see §8 |
+| `terrain.wgsl` (1282) | `vs_terrain`/`fs_terrain` (`:412`/`:792`), `vs_sky`/`fs_sky` (`:1023`/`:1154`), `vs_shadow0`/`vs_shadow1` (`:438`/`:446`, depth-only cascade pass; the shared displacement is `terrain_displace`, `:383`) | Quadtree terrain, ocean, and the sky/atmosphere/starfield — see §8; the shadow entry points feed §7.4's cascade map |
 
 All four are parse+validate gated by a unit test
 (`shaders_parse_and_validate`, `csp-render/src/lib.rs:476`) so shader
@@ -672,24 +672,65 @@ The vessel blob shadow (`uniforms.shadow`, `vessel_shadow`,
 surface; `csp-view/terrain.rs::build_packet` (`:557`) assembles the whole
 `TerrainPacket` per frame from the staged `FlightEnv` + chase camera.
 
+**Shadow cascades (R1 core, landed terrain-overhaul 3a — not yet armed).**
+`csp-render/src/shadow.rs` owns the whole cascade core: the pure f64
+per-frame solve (`solve_cascades` — two sun-aligned ortho cascades fit to
+the chase camera's frustum slices at ~0–2 km and ~2–20 km, light basis
+fixed per sun direction, ortho extents quantized onto a √2 world-texel
+ladder and the box center texel-snapped so sub-texel camera motion
+reproduces bit-identical matrices), the GPU map (one 2-layer 2048²
+`Depth32Float` array, 2×2048²×4 B = 33.5 MB, sampled through a `LessEqual`
+**comparison sampler** — all core WebGPU, `Features::empty()` untouched),
+and two depth-only pipelines (`vs_shadow0/1`) whose vertex stage shares
+`terrain_displace` with `vs_terrain`, so the depth pass displaces vertices
+identically to the visible pass. The receiving half lives in `terrain.wgsl`:
+`sun_visibility` picks the cascade by eye-distance (conservative against
+view-Z), applies normal-offset + slope-scaled reference bias tuned for the
+M5 relief ceiling (~37° slopes), blends a band at the split, and multiplies
+the **direct sun term only** of terrain and ocean; the `sun_occlusion`
+ray-march remains the fallback beyond 20 km and — bit-identically — whenever
+the armed flag is off. The cascade uniform rides group(0) binding 8 while the
+depth array + comparison sampler live in their own group(1) — bound only by
+the visible pass, because a usage scope counts every bind group set in a
+render pass (used or not), so the depth passes must never bind the texture
+they render into (and csp-view builds `TerrainUniforms`/`TerrainPacket` with
+exhaustive literals, so the cascade data stays in a csp-render-owned buffer
+either way — see §7.2).
+**Armed state: nothing calls `TerrainRenderer::draw_shadow` yet.** Phase 3b
+wires the view-side per-frame solve (`solve_cascades` fed by the chase
+camera + `FlightEnv` sun) and the app frame-loop call
+(`draw_shadow` → `draw` → flight `draw` → `draw_ocean`); craft casting into
+the map is 3b's extension point inside `ShadowCore::draw_terrain`. Until
+then the zeroed `SU` buffer keeps `fs_terrain` on the ray-march path and
+the render output is pixel-identical to the pre-cascade build. Device
+coverage: the render gate constructs the core disarmed (pipeline layouts +
+entry points checked on a real adapter); the ARMED frame is validated by
+csp-render's own `armed_cascade_passes_validate_on_device` (an armed solve,
+`draw_shadow`, then the scene pass — asserting zero wgpu validation
+errors; skips adapter-less hosts unless `CSP_SHADOW_GATE_REQUIRED=1`).
+The receiving bias moves the comparison reference TOWARD the sun
+(normal-offset along `+n` plus a subtracted slope bias — map depth is
+forward-Z-along-travel, lit ⇔ ref ≤ stored), pinned by the
+`bias_moves_reference_toward_the_sun` unit test.
+
 ### 7.5 Sky, atmosphere, and the star field (current state)
 
-`fs_sky` (`terrain.wgsl:991`): fullscreen triangle; per-pixel scattering ray
+`fs_sky` (`terrain.wgsl:1154`): fullscreen triangle; per-pixel scattering ray
 in f32 with the shell-quadratic constants pre-baked in CPU f64
 (`uniforms.misc.z/w` — computing `|pa|²−r²` in f32 costs ~±300 m of limb
 wobble); 32-step jittered march with per-step jitter (partial cancellation,
 no banding); Rayleigh + Mie (aerosols hug the low shell) through the LUT;
 ground strikes swap the backdrop for haze; ACES tone-map.
 
-The star field (`star_cell`/`star_layer`/`star_field`, `terrain.wgsl:907`/
-`:938`/`:966`) is fully procedural — crisp point stars hashed out of a 3D
+The star field (`star_cell`/`star_layer`/`star_field`, `terrain.wgsl:1060`/
+`:1091`/`:1119`) is fully procedural — crisp point stars hashed out of a 3D
 direction-space lattice (~750 bright + ~700 faint incl. a Milky-Way band),
 each projected onto the direction sphere with a Gaussian core + faint halo,
 and a per-pixel ray-footprint floor (`sig_ang`) so **no star ever goes
 sub-pixel** — dense sub-pixel points read as film grain, which was the
 "grainy static sky" complaint.
 
-Daylight star gate (`terrain.wgsl:1098-1105`): stars survive only where the
+Daylight star gate (`terrain.wgsl:1264`): stars survive only where the
 shell scatters essentially nothing into the ray —
 `star_vis = 1 − smoothstep(6e-4, 4e-3, ins_lum)`. The previous
 `exp(−ins_lum·160)` never reached zero, so bright stars speckled the
@@ -780,11 +821,22 @@ Other §5 rows, plan vs code:
   sky/low/flight/surface; `render_dump_extra.rs`), but there is no two-tier
   comparison and no ΔE2000 machinery — only one tier exists.
 - **§5.2 phases**: R0 (forward, reverse-Z, analytic sky, camera-relative) ✓;
-  R1 (depth validation at 1e7 m, plasma, editor + GPU picking) ✓ except
-  shadow cascades — **absent** (no shadow maps anywhere; the only shadows
-  are the terrain blob shadow and structure contact quads); R2 (quadtree,
-  LUT scattering, ocean, planet-scale LOD) ✓; R3 (Advanced) — cut to
-  post-v1 per §6.4; R4 — absent, as planned.
+  R1 (depth validation at 1e7 m, plasma, editor + GPU picking) ✓, and its
+  last open term — **shadow cascades — has its core landed** (terrain-overhaul
+  3a: `csp-render/src/shadow.rs` solve + cascade-map passes + the receiving
+  `fs_terrain` path, §7.4). Precisely: the cascade core exists, is
+  constructed disarmed by every flight frame (the render gate included, so
+  pipeline layouts/entry points are device-checked), and its ARMED
+  end-to-end frame is device-validated by csp-render's own
+  `armed_cascade_passes_validate_on_device` (headless adapter; skips
+  adapter-less hosts unless `CSP_SHADOW_GATE_REQUIRED=1`), but **nothing
+  arms it yet** — phase 3b wires the view-side per-frame solve and the frame
+  loop's `draw_shadow` call. Until 3b the only shadows in a rendered frame
+  are still the terrain blob shadow and structure contact quads, and
+  `sun_occlusion`'s ray-march shades terrain sun terms exactly as before
+  (bit-identical by the armed flag's short-circuit);
+  R2 (quadtree, LUT scattering, ocean, planet-scale LOD) ✓; R3 (Advanced) —
+  cut to post-v1 per §6.4; R4 — absent, as planned.
 - **§5.1 Baseline post row "FXAA/none"** — code ships 4× MSAA instead
   (`MSAA_SAMPLES`, C11-F1); a superset of "none", not a divergence in kind.
 - **§5.4 VAB kill criterion (16 ms at 300 parts on REF-A)** — measured:
@@ -818,8 +870,8 @@ found live defects in the same tree, listed in the ledger below.
    readout block until dragged.
 2. **Grainy sky / stars too early.** FIXED: the star field is sparse
    resolved points with a resolution-aware sub-pixel floor, and the daylight
-   gate is the hard `smoothstep(6e-4, 4e-3, ins_lum)` (`terrain.wgsl:966`
-   `star_field`, `:1104` the gate) replacing the never-zero
+   gate is the hard `smoothstep(6e-4, 4e-3, ins_lum)` (`terrain.wgsl:1119`
+   `star_field`, `:1264` the gate) replacing the never-zero
    `exp(−ins_lum·160)`. The old faint-layer grain root cause is documented
    in the shader comments ("the old 11–23%-occupancy faint layer was the
    'grainy static' sky").
