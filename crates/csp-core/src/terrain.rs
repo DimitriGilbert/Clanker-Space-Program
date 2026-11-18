@@ -21,16 +21,17 @@
 //! the amplitude fraction live here too: the sim bake must be the
 //! *same* field the render displaces, not a lookalike.
 //!
-//! Two relief profiles ship (the §5.2-R2 terrain overhaul, M5):
-//! [`ReliefProfile::Legacy`] — the R2-launch [`height_normalized`]
-//! spectrum every existing body bakes, and the data default — and
-//! [`ReliefProfile::Mountain`] — a sharper ridged spectrum with
-//! valley carving and domain warp, baked at 2048×1024 so its extra
-//! peak detail survives the texel grid ([`HeightField::bake_profiled`]).
-//! The profile is data-authored (`csp_data`'s `TerrainDef`), reaches
-//! the bake key through a seed fold ([`HeightField::bake_profiled_key`]),
-//! and never touches the sim state hash — heights stay a pure function
-//! of `(seed, direction, profile)`.
+//! Two relief profiles ship (the §5.2-R2 terrain overhaul, M5,
+//! steepened by §2.1): [`ReliefProfile::Legacy`] — the R2-launch
+//! [`height_normalized`] spectrum every existing body bakes, and the
+//! data default — and [`ReliefProfile::Mountain`] — the steep ridged
+//! spectrum with valley carving and domain warp, baked at 2048×1024
+//! so its extra peak detail survives the texel grid
+//! ([`HeightField::bake_profiled`]). The profile is data-authored
+//! (`csp_data`'s `TerrainDef`), reaches the bake key through a seed
+//! fold ([`HeightField::bake_profiled_key`]), and never touches the
+//! sim state hash — heights stay a pure function of
+//! `(seed, direction, profile)`.
 
 use serde::{Deserialize, Serialize};
 
@@ -116,6 +117,72 @@ fn fbm3(seed: u64, p: DVec3, octaves: u32) -> f64 {
     sum
 }
 
+/// The §2.1 flat-top lattice interpolant — [`smooth`]'s Mountain-only
+/// twin. The cubic peaks at slope 1.5 mid-cell (and the survey's
+/// extreme pairs sit exactly there); this one ramps to a slope
+/// plateau of `1/(1-A)` ≈ 1.03 instead, cutting each layer's
+/// peak-vs-mean gradient ratio by ~31% for near-zero bulk cost.
+/// C1 at the cell borders and at the ramp knees; monotone; maps
+/// [0,1] → [0,1]. [`smooth`] itself stays bit-frozen for Legacy.
+fn smooth_flat(t: f64) -> f64 {
+    const A: f64 = 0.03;
+    const G1: f64 = 1.0 - A;
+    // G(t)/G(1) where G' = w, w = smoothstep(t/A)·smoothstep((1−t)/A):
+    // S-curve with derivative bounded by 1/(1−A).
+    let g = if t <= A {
+        let x = t / A;
+        A * (x * x * x - x * x * x * x * 0.5)
+    } else if t >= 1.0 - A {
+        let x = (1.0 - t) / A;
+        G1 - A * (x * x * x - x * x * x * x * 0.5)
+    } else {
+        0.5 * A + (t - A)
+    };
+    g / G1
+}
+
+/// [`value_noise3`]'s Mountain-only twin: identical lattice and corner
+/// hashing, [`smooth_flat`] as the interpolant (see its doc for why).
+fn value_noise3_flat(seed: u64, p: DVec3) -> f64 {
+    let (fx, fy, fz) = (p.x.floor(), p.y.floor(), p.z.floor());
+    let (ix, iy, iz) = (fx as i64, fy as i64, fz as i64);
+    let (tx, ty, tz) = (
+        smooth_flat(p.x - fx),
+        smooth_flat(p.y - fy),
+        smooth_flat(p.z - fz),
+    );
+    let lerp = |a: f64, b: f64, t: f64| a + (b - a) * t;
+    let c = |dx: i64, dy: i64, dz: i64| lattice(seed, ix + dx, iy + dy, iz + dz);
+    lerp(
+        lerp(
+            lerp(c(0, 0, 0), c(1, 0, 0), tx),
+            lerp(c(0, 1, 0), c(1, 1, 0), tx),
+            ty,
+        ),
+        lerp(
+            lerp(c(0, 0, 1), c(1, 0, 1), tx),
+            lerp(c(0, 1, 1), c(1, 1, 1), tx),
+            ty,
+        ),
+        tz,
+    )
+}
+
+/// [`fbm3`]'s gained twin for the Mountain spectrum: frequency still
+/// doubles per layer, but each layer's amplitude comes from `gains`
+/// (slice length = layer count) instead of the halving ladder — the
+/// §2.1 steep-spectrum reweighting moves energy between the SAME
+/// layers instead of adding any (the 16-layer budget holds; legacy
+/// keeps the frozen [`fbm3`]). Samples through [`value_noise3_flat`].
+fn fbm3_gained(seed: u64, p: DVec3, gains: &[f64]) -> f64 {
+    let (mut sum, mut q) = (0.0, p);
+    for &g in gains {
+        sum += g * value_noise3_flat(seed, q);
+        q = q * 2.0;
+    }
+    sum
+}
+
 fn smoothstep(e0: f64, e1: f64, x: f64) -> f64 {
     smooth(((x - e0) / (e1 - e0)).clamp(0.0, 1.0))
 }
@@ -154,11 +221,13 @@ pub enum ReliefProfile {
     /// the only profile any shipped body authors today.
     #[default]
     Legacy,
-    /// The M5 terrain-overhaul spectrum: stronger ridged weighting,
-    /// extra high-frequency ridge octaves for peak detail,
-    /// ridge-inversion valley carving, and a low-frequency domain
-    /// warp — baked at [`MOUNTAIN_BAKE_WIDTH`]×[`MOUNTAIN_BAKE_HEIGHT`]
-    /// ([`height_normalized_mountain`]'s doc has the spectrum).
+    /// The M5 terrain-overhaul spectrum, steepened by §2.1:
+    /// co-dominant ridged/detail stacks in the survey's frequency
+    /// sandwich, unsquared V-crests, ridge-inversion valley carving,
+    /// a low-frequency domain warp, flat-top lattice interpolation,
+    /// and a crest guard — baked at
+    /// [`MOUNTAIN_BAKE_WIDTH`]×[`MOUNTAIN_BAKE_HEIGHT`]
+    /// ([`height_normalized_mountain`]'s doc has the full spectrum).
     Mountain,
 }
 
@@ -206,25 +275,51 @@ pub fn height_normalized_profile(seed: u64, dir: DVec3, profile: ReliefProfile) 
     }
 }
 
-/// The Mountain spectrum (§5.2-R2's terrain overhaul, M5) — same
-/// construction rules as [`height_normalized`] (integer-hash lattice
-/// + f64 arithmetic only; no std transcendentals), harder relief:
+/// The Mountain spectrum — §5.2-R2's terrain overhaul (M5), steepened
+/// by the §2.1 relief pass — same construction rules as
+/// [`height_normalized`] (integer-hash lattice + f64 arithmetic only;
+/// no std transcendentals), tuned so the `csp-phys` land-slope survey
+/// at Terrin's radius reads ridge-scale p99 tan ≈ 0.36 / max ≈ 0.74 at
+/// `amplitude_frac` 0.006 (the §2.1 steep band) vs the M5 launch's
+/// 0.14 / 0.51 — real mountain angles, still macro-gentle (96×48 grid
+/// p99 ≈ 0.20). The shape levers, each load-bearing for that band:
 ///
-/// - **Inherited land/ocean mask**: the continents term — identical
-///   seed constant, frequency, and octave count — keeps the legacy
-///   coastline statistics, so an `OceanDef` body's seas still sit
-///   where its continents say they do.
-/// - **Stronger ridges**: the legacy ridge field (same seed constant)
-///   at 5 octaves instead of 4, composite-weighted 0.80 on land vs
-///   legacy's 0.35.
-/// - **Peak detail**: two extra high-frequency ridge octaves (`×28`)
-///   for crest sharpening legacy's `×18` hills smear over.
-/// - **Valley carving**: a ridge *inversion* at `×5` — `1 − r²` is
-///   the basin between ridge crests, subtracted on land to cut
-///   channels through the ranges.
-/// - **Domain warp**: one low-frequency warp layer (three
-///   single-octave axis fields at `×2`) folds the direction the ridge
-///   terms sample — folded strata instead of straight lattice ridges.
+/// - **Inherited land/ocean mask** (byte-identical): the continents
+///   term — same seed constant, frequency ×3.0, 4 octaves, same
+///   `smoothstep(-0.05, 0.35, …)` gate — keeps the legacy coastline
+///   statistics, so an `OceanDef` body's seas still sit where its
+///   continents say they do. Biome maps and ocean geometry do not
+///   move.
+/// - **Frequency sandwich**: the dominant ridge energy sits at
+///   lattice wavelengths whose flanks (~8–20 km) are wider than the
+///   survey's ridge-grid pairs (7.4 km — so the bulk reads the full
+///   gradient, high p99) but narrower than the macro grid's 39 km
+///   pairs (so the macro grid sees amplitude, not gradient — low
+///   macro p99). Two stacks share the band: the ridge field at `×5`
+///   (5 octaves, per-octave gains in the code) and the detail field
+///   at `×13` (2 octaves) — independent seeds, co-dominant, so their
+///   steepest lattice events rarely coincide (the max-tan tail).
+/// - **Unsquared crests**: `1 − 2|n|` (clamped to `[-0.84, 1]`) keeps
+///   V-sharp crests while the slope factor stays a constant 2 —
+///   squaring (`r*r`) spreads it over `[0, 4]`, the fat max tail the
+///   M5 spectrum capped out on. The asymmetric floor bounds the
+///   deepest trough swings (the co-aligned cliff events).
+/// - **Valley carving**: a ridge *inversion* at `×6` (2 octaves,
+///   squared — rounded basins) subtracted on land.
+/// - **Domain warp** (3 single-octave axis fields at `×2`): folds the
+///   direction the ridge terms sample — folded strata instead of
+///   straight lattice ridges — at 0.10 amplitude: the warp Jacobian
+///   multiplies local gradients, so its gain is deliberately small.
+/// - **Flat-top interpolation** ([`smooth_flat`]): every Mountain
+///   layer interpolates with a slope plateau of ~1.03 instead of the
+///   cubic's 1.5 peak — the survey's extreme pairs sit exactly at the
+///   interpolant's steepest point, and this one lever moved the max
+///   more than any reweighting.
+/// - **Crest guard**: unit slope through the working range `|z| ≤
+///   0.42`, easing to a 0.585 ceiling by `|z| = 0.75` — whole-range
+///   cliff crossings (the max-tan events) compress instead of mesafing
+///   at the hard clamp, and peaks top out ~0.59 rather than slamming
+///   ±1.
 ///
 /// Octave budget: 4 (continents) + 5 (ridges) + 2 (detail) + 2
 /// (valleys) + 3 (warp axes) = **16 noise layers**, the documented
@@ -234,27 +329,40 @@ fn height_normalized_mountain(seed: u64, dir: DVec3) -> f64 {
     let land = smoothstep(-0.05, 0.35, continents);
     let q = dir
         + DVec3::new(
-            value_noise3(seed ^ 0x6a09_e667_f3bc_c908, dir * 2.0),
-            value_noise3(seed ^ 0xbb67_ae85_84ca_a73b, dir * 2.0),
-            value_noise3(seed ^ 0x3c6e_f372_fe94_f82b, dir * 2.0),
-        ) * 0.3;
+            value_noise3_flat(seed ^ 0x6a09_e667_f3bc_c908, dir * 2.0),
+            value_noise3_flat(seed ^ 0xbb67_ae85_84ca_a73b, dir * 2.0),
+            value_noise3_flat(seed ^ 0x3c6e_f372_fe94_f82b, dir * 2.0),
+        ) * 0.10;
     let ridged = {
-        let n = fbm3(seed ^ 0x1656_67b1_9e37_79f9, q * 7.0, 5);
-        let r = 1.0 - 2.0 * n.abs();
-        r * r // ~[0,1], crested
+        let n = fbm3_gained(
+            seed ^ 0x1656_67b1_9e37_79f9,
+            q * 5.0,
+            &[1.00, 2.14, 1.05, 0.10, 0.02],
+        );
+        (1.0 - 2.0 * n.abs()).clamp(-0.84, 1.0)
     };
     let detail = {
-        let n = fbm3(seed ^ 0xa54f_f53a_5f1d_36f1, q * 28.0, 2);
-        let r = 1.0 - 2.0 * n.abs();
-        r * r
+        let n = fbm3_gained(seed ^ 0xa54f_f53a_5f1d_36f1, q * 13.0, &[1.59, 0.62]);
+        (1.0 - 2.0 * n.abs()).clamp(-0.84, 1.0)
     };
     let valleys = {
-        let n = fbm3(seed ^ 0x510e_527f_ade6_82d1, q * 5.0, 2);
-        let r = 1.0 - 2.0 * n.abs();
+        let n = fbm3_gained(seed ^ 0x510e_527f_ade6_82d1, q * 6.0, &[1.00, 0.70]);
+        let r = (1.0 - 2.0 * n.abs()).clamp(-1.0, 1.0);
         1.0 - r * r // ridge inversion — the basin between crests
     };
-    let ridge_mix = 0.72 * ridged + 0.28 * detail;
-    (0.62 * continents + land * (0.80 * ridge_mix - 0.15 * valleys - 0.10)).clamp(-1.0, 1.0)
+    let z = 0.62 * continents + land * (1.00 * ridged + 1.00 * detail - 0.65 * valleys + 0.29);
+    // §2.1 crest guard (see the spectrum doc above): slope exactly 1
+    // through |z| ≤ 0.42 — the p99 bulk rides mid-range swings, any
+    // knee there would reshape the steep-slope band — easing to the
+    // 0.585 ceiling over |z| ∈ [0.42, 0.75].
+    let az = z.abs();
+    let mag = if az <= 0.42 {
+        az
+    } else {
+        let t = ((az - 0.42) / 0.33).clamp(0.0, 1.0);
+        0.42 + 0.33 * (t - t * t * 0.5)
+    };
+    (if z >= 0.0 { mag } else { -mag }).clamp(-1.0, 1.0)
 }
 
 /// Baked normalized heights, equirect projection: texel `(i, j)` covers
@@ -453,7 +561,7 @@ mod tests {
     }
 
     /// The Mountain spectrum keeps the `[-1, 1]` contract — clamped
-    /// output despite the stronger 0.80 ridge weighting.
+    /// output despite the steep §2.1 composite.
     #[test]
     fn mountain_height_stays_clamped() {
         for seed in [0u64, 0x5eed_c0de_1234_5678] {
@@ -467,7 +575,10 @@ mod tests {
     /// The Mountain spectrum keeps meaningful oceans and real peaks
     /// (the inherited continents mask): recorded probe dirs — an ocean
     /// sample below the datum and a peak above 0.5, pinned to their
-    /// exact bits so the spectrum cannot silently drift.
+    /// exact bits so the spectrum cannot silently drift. The ocean
+    /// probe survived the §2.1 steepening bit-for-bit (the land gate is
+    /// closed there, so the frozen continents term is the whole value);
+    /// the peak moved onto the §2.1 crest guard's 0.585 ceiling.
     #[test]
     fn mountain_oceans_and_peaks_exist() {
         let ocean_dir = DVec3::new(
@@ -484,8 +595,83 @@ mod tests {
             -0.976_296_007_119_933_4,
         );
         let peak_h = height_normalized_profile(0, peak_dir, ReliefProfile::Mountain);
-        assert_eq!(peak_h.to_bits(), 0x3fe9_9874_edf2_ee71);
+        assert_eq!(peak_h.to_bits(), 0x3fe2_b851_eb85_1eb8);
         assert!(peak_h > 0.5);
+    }
+
+    /// The §2.1 steep-spectrum pin: six recorded probe dirs spanning
+    /// the relief classes (two oceans, a coastal cell, a mid-slope,
+    /// a sub-crest peak, and the crest-guard ceiling), pinned to
+    /// exact bits so the steep tuning cannot silently drift — any
+    /// Mountain-spectrum edit that moves a single one of these fails
+    /// here, not in the `csp-phys` survey. Recorded at seed 0 after
+    /// the §2.1 retune (ridge p99 0.3618 / max 0.7415 @ 0.006).
+    #[test]
+    fn mountain_steep_spectrum_pin() {
+        let pins = [
+            // deep ocean (h = −0.3892639776319882)
+            (
+                DVec3::new(
+                    -0.097_312_364_451_771_05,
+                    -0.011_733_009_979_987_902,
+                    -0.995_184_726_672_196_8,
+                ),
+                0xbfd8_e9b3_755c_2d4du64,
+            ),
+            // shallow ocean, the §5.2-R2-era probe (h = −0.23207846542245533)
+            (
+                DVec3::new(
+                    0.115_075_127_486_383_7,
+                    0.277_815_933_469_440_8,
+                    -0.953_716_950_748_226_8,
+                ),
+                0xbfcd_b4bf_458c_3333u64,
+            ),
+            // coastal cell, just above the datum (h = 0.016224170935803597)
+            (
+                DVec3::new(
+                    -0.032_717_136_199_948_58,
+                    -0.000_356_902_749_025_676_04,
+                    -0.999_464_587_476_365_7,
+                ),
+                0x3f90_9d11_ae4b_c414u64,
+            ),
+            // mid-slope (h = 0.24852098285893956)
+            (
+                DVec3::new(
+                    -0.071_963_822_378_108_21,
+                    0.025_307_173_584_810_556,
+                    -0.997_086_132_304_466_6,
+                ),
+                0x3fcf_cf89_1adf_dcadu64,
+            ),
+            // sub-crest peak, inside the crest guard's ease zone
+            // (h = 0.5634845810688168)
+            (
+                DVec3::new(
+                    -0.111_084_861_908_433_59,
+                    -0.044_599_535_290_780_33,
+                    -0.992_809_667_009_055,
+                ),
+                0x3fe2_0810_d0ef_b4dfu64,
+            ),
+            // the crest guard's 0.585 ceiling plateau (h = 0.585)
+            (
+                DVec3::new(
+                    -0.216_233_611_384_725_58,
+                    -0.009_440_963_361_569_903,
+                    -0.976_296_007_119_933_4,
+                ),
+                0x3fe2_b851_eb85_1eb8u64,
+            ),
+        ];
+        for (dir, bits) in pins {
+            assert_eq!(
+                height_normalized_profile(0, dir, ReliefProfile::Mountain).to_bits(),
+                bits,
+                "§2.1 steep-spectrum pin moved at {dir:?}"
+            );
+        }
     }
 
     /// Per-profile bake dims (§5.2-R2, M5): Legacy stays 1024×512 —
@@ -538,6 +724,132 @@ mod tests {
             assert_ne!(mountain, HeightField::bake_key(seed, mw, mh));
             assert_eq!(legacy & 1, 0);
             assert_eq!(mountain & 1, 0);
+        }
+    }
+
+    /// Terrin's radius — the survey constant `csp-phys`'s
+    /// `mountain_land_slope_distribution` uses (m).
+    const SURVEY_R: f64 = 600_000.0;
+
+    /// The §2.1 survey's two-seed bake for one grid: heights are
+    /// amplitude-independent, so the grids are baked once and both
+    /// authored amplitude fractions read off the same field.
+    fn survey_bake(rows: usize, cols: usize) -> Vec<Vec<f64>> {
+        let mut grids = Vec::new();
+        for seed in [0u64, 601] {
+            let mut h = vec![0.0f64; rows * cols];
+            for j in 0..rows {
+                let lat = -core::f64::consts::FRAC_PI_2
+                    + core::f64::consts::PI * (j as f64 + 0.5) / rows as f64;
+                let (slat, clat) = (libm::sin(lat), libm::cos(lat));
+                for i in 0..cols {
+                    let lon = -core::f64::consts::PI
+                        + 2.0 * core::f64::consts::PI * (i as f64 + 0.5) / cols as f64;
+                    let dir = DVec3::new(clat * libm::cos(lon), clat * libm::sin(lon), slat);
+                    h[j * cols + i] = height_normalized_profile(seed, dir, ReliefProfile::Mountain);
+                }
+            }
+            grids.push(h);
+        }
+        grids
+    }
+
+    /// One `(grid, amplitude)` slice of the §2.1 survey report: the
+    /// land-pair tans (east pairs wrap longitude, north pairs clamp —
+    /// the equirect seam rules), percentiles, exceedance counts, and
+    /// the top-10 steepest pairs with their heights — the tail-lever
+    /// diagnostics the retune iterated on.
+    fn survey_report(rows: usize, cols: usize, grids: &[Vec<f64>], amp_frac: f64) {
+        let amplitude_m = SURVEY_R * amp_frac;
+        // (tan, seed, j, i, east?) — tracked so the max pair's location
+        // and the pair's heights can be read off the printed line.
+        let mut tans: Vec<(f64, u64, usize, usize, bool)> = Vec::new();
+        for (gi, h) in grids.iter().enumerate() {
+            let seed = [0u64, 601][gi];
+            for j in 0..rows {
+                let lat = -core::f64::consts::FRAC_PI_2
+                    + core::f64::consts::PI * (j as f64 + 0.5) / rows as f64;
+                let arc_e = SURVEY_R * libm::cos(lat) * 2.0 * core::f64::consts::PI / cols as f64;
+                for i in 0..cols {
+                    if h[j * cols + i] <= 0.0 {
+                        continue; // ocean/coast cell — land survey only
+                    }
+                    let dh = (h[j * cols + (i + 1) % cols] - h[j * cols + i]).abs();
+                    tans.push((dh * amplitude_m / arc_e, seed, j, i, true));
+                }
+            }
+            let arc_n = SURVEY_R * core::f64::consts::PI / rows as f64;
+            for j in 0..rows - 1 {
+                for i in 0..cols {
+                    if h[j * cols + i] <= 0.0 {
+                        continue;
+                    }
+                    let dh = (h[(j + 1) * cols + i] - h[j * cols + i]).abs();
+                    tans.push((dh * amplitude_m / arc_n, seed, j, i, false));
+                }
+            }
+        }
+        tans.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let pick = |frac: f64| tans[((tans.len() - 1) as f64 * frac) as usize];
+        let (p50, p95, p99, p999) = (pick(0.50).0, pick(0.95).0, pick(0.99).0, pick(0.999).0);
+        let over75 = tans.iter().filter(|t| t.0 > 0.75).count();
+        let over50 = tans.iter().filter(|t| t.0 > 0.50).count();
+        let (max_tan, mseed, mj, mi, meast) = tans[tans.len() - 1];
+        let top10: Vec<String> = tans[tans.len() - 10..]
+            .iter()
+            .rev()
+            .map(|(t, s, j, i, e)| {
+                let g = &grids[if *s == 601 { 1 } else { 0 }];
+                let (a, b) = if *e {
+                    (g[j * cols + i], g[j * cols + (i + 1) % cols])
+                } else {
+                    (g[j * cols + i], g[(j + 1) * cols + i])
+                };
+                format!(
+                    "{t:.3}/s{s}/j{j}/{}{}/h{a:+.2}{b:+.2}",
+                    if *e { "E" } else { "N" },
+                    i % 10
+                )
+            })
+            .collect();
+        println!(
+            "mountain land slopes, {rows}×{cols} grid ({:.1} km spacing) \
+             @ amplitude_frac {amp_frac} ({:.0} m at R=600 km), {} land pairs: \
+             p50 {:.4}  p95 {:.4}  p99 {:.4}  p99.9 {:.4}  max {:.4} \
+             [>0.5: {}  >0.75: {}] [max pair: seed {mseed} j={mj} i={mi} {}]",
+            2.0 * core::f64::consts::PI * SURVEY_R / cols as f64 / 1_000.0,
+            SURVEY_R * amp_frac,
+            tans.len(),
+            p50,
+            p95,
+            p99,
+            p999,
+            max_tan,
+            over50,
+            over75,
+            if meast { "east" } else { "north" }
+        );
+        println!("  top10: {}", top10.join(" "));
+        assert!(p50 <= p95 && p95 <= p99 && p99 <= max_tan);
+    }
+
+    /// The §2.1 slope-survey tuning probe — a faithful mirror of
+    /// `csp-phys`'s `mountain_land_slope_distribution` survey (same
+    /// grids, seeds, land rule, pair math, percentile picks), run
+    /// explicitly when retuning [`height_normalized_mountain`]:
+    /// `cargo test -p csp-core mountain_slope_survey -- --ignored
+    /// --nocapture`. The authoritative warrant assert stays in
+    /// `csp-phys` (the contact model owns it); this print-only twin
+    /// exists so spectrum tuning does not need the physics crate in
+    /// the loop.
+    #[test]
+    #[ignore = "tuning probe — print-only survey; csp-phys owns the warrant assert"]
+    fn mountain_slope_survey_probe() {
+        for (rows, cols) in [(48usize, 96usize), (256usize, 512usize)] {
+            let grids = survey_bake(rows, cols);
+            for amp_frac in [0.004f64, 0.006] {
+                survey_report(rows, cols, &grids, amp_frac);
+            }
         }
     }
 
