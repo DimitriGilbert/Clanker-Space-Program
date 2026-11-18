@@ -3,10 +3,11 @@
 // launch arc never samples biomes (§3.0.1 decoupling), so the fixture
 // stays minimal. Terrain fields track the live authoring (M5 §5.2-R2):
 // Mountain relief at amplitude_frac 0.006 ⇒ 3 600 m of relief over a
-// 600 km radius; the ridge-scale slope warrant (csp-phys
-// `mountain_land_slope_distribution`) surveyed p99 = 0.1429 < tan 12°
-// at exactly this amplitude, so radial contact normals stay clear. The
-// launch site re-anchors onto the new field — see sites.ron.
+// 600 km radius; the steep ridge survey (csp-phys
+// `mountain_land_slope_distribution`) pins ridge p99 tan 0.3618 (19.9°)
+// and max 0.7415 (36.6°), contact normals are gradient-based
+// (csp-phys `surface_normal`), and the warrant is the spectrum
+// tripwire. The launch site re-anchors onto the new field — see sites.ron.
 (
     schema_version: 2,
     id: "terrin",

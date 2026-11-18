@@ -34,18 +34,20 @@
             // exact site is terrain-aware: the sim's contact surface
             // AND the rendered terrain are the same baked heightfield
             // (noise_seed 601). M5 §5.2-R2 re-authored that field to
-            // the Mountain spectrum at amplitude_frac 0.006, and the
+            // the steep Mountain spectrum (ridge p99 19.9°), and the
             // re-siting probe (`csp-view`'s ignored `pad_resite_scan`)
-            // kept the pad at its legacy coordinates: of 1681
-            // candidates in the ±5° window the old site ties for
-            // flattest — max−min over a 30 m footprint ring is 0.02 m
-            // (target ≤ ±0.5 m; the strict minimum, 0.017 m, sat 4.9°
-            // away — a 4 mm gain not worth losing the morning-pad
-            // longitude) — with the Mountain field at +14.36 m over
-            // datum, so the craft rests on the rendered ground and the
-            // datum-altimetry numbers stay honest.
+            // kept the pad at its legacy coordinates through BOTH
+            // re-authorings: under the steep field the ±5° window's
+            // 1681 candidates still put the legacy site at 0.159 m
+            // max−min over a 30 m footprint ring (target ≤ ±0.5 m;
+            // the strict minimum, 0.017 m, sits 0.35° SW — one grid
+            // step west and one south — a 14 cm gain not worth moving
+            // the pad off its documented morning-pad longitude) — the
+            // field there rose from +14.36 m to +52.00 m over datum,
+            // so `altitude_m` tracks it and the craft keeps resting
+            // on the rendered ground.
             longitude_rad: 2.916,
-            altitude_m: 14.36,
+            altitude_m: 52.0,
             launch: true,
             resource_yields: [
                 ("ore", 0.35),
@@ -69,18 +71,24 @@
             id: "terrin-downrange",
             display_name: "site.terrin-downrange",
             body: "terrin",
-            // Re-sited onto the M5 §5.2-R2 Mountain field: the old
-            // (0, 3.927) datum point now sits ~412 m under the ocean
-            // (the whole ±5° window is sea — the re-siting probe found
-            // zero dry candidates there), so the recovery site moved
-            // to the NEAREST dry ground the ±15° survey found — a
-            // shoreline bench 6.5° SSE of the old marker, field height
-            // +14.02 m over datum, flat to 0.9 m over a 30 m ring
-            // (nothing berths here — the marker anchors at the datum
-            // altitude and recovery is commanded, not landed).
-            latitude_rad: -0.10471975511965978, // −6°
-            longitude_rad: 3.9706240482870996,
-            altitude_m: 14.02,
+            // Re-sited twice by the M5 §5.2-R2 relief re-authorings.
+            // First (gentle Mountain): the (0, 3.927) datum point
+            // drowned, moving the marker 6.5° SSE to a shoreline bench.
+            // Then the steep Mountain spectrum (ridge p99 19.9°) pulled
+            // Terrin's land fraction down further (~55% → ~32%): that
+            // bench now sits −257 m under the new ocean. The ±5°
+            // re-scan still found 108 dry candidates, so the marker
+            // moved again — 4.3° ESE to the SECOND-flattest dry
+            // candidate in the window: +17.12 m over datum, 0.172 m
+            // flat over a 30 m ring (the strict 0.150 minimum sits
+            // 0.8° farther ESE — the chosen site is nearer the drowned
+            // bench; the nearest dry land of all, 3.0° away, is 1.05 m
+            // rugged — nothing berths here, but flat is free). The
+            // marker anchors at the field height and recovery is
+            // commanded, not landed.
+            latitude_rad: -0.12217304763960308, // −7°
+            longitude_rad: 4.0448005414968586,
+            altitude_m: 17.12,
             launch: false,
             resource_yields: [
                 ("ore", 0.20),
@@ -106,11 +114,17 @@
             // validator's floor, which colony founding shares). The
             // re-siting probe's flattest dry candidate within ±5° —
             // 4.0° SSE at lon 2.42182/lat −0.06545 — lifts the
-            // outpost onto a +31.19 m bench, 0.19 m flat over a 30 m
-            // ring, deepening the spawn margin to 0.751.
+            // outpost onto a bench the spectrum steepening then raised
+            // from +31.19 m to +95.14 m over datum: the steep-field
+            // re-audit kept the COORDINATES (0.184 m flat over a 30 m
+            // ring — pad-grade, 7th flattest of the window's 128 dry
+            // candidates) and re-authored only the altitude. The
+            // longitude is untouched, so the 0.751 |cos H0| spawn
+            // margin below is exactly the number the gentle-spectrum
+            // re-site documented.
             latitude_rad: -0.06544984694978735, // −3.75°
             longitude_rad: 2.421816615649929,
-            altitude_m: 31.19,
+            altitude_m: 95.14,
             launch: false,
             resource_yields: [
                 ("ore", 0.9),

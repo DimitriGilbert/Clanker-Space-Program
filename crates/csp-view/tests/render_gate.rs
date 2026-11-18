@@ -115,6 +115,47 @@ fn frame(view: &mut View, ticks: u64) {
     view.end_frame();
 }
 
+/// Advance `view` until the flight packet carries the REAL baked
+/// heightfield for the dominant body — not `TerrainCache`'s flat datum
+/// stand-in. On native the cache bakes on a background thread (C12-F5)
+/// and every consumer (packet displacement, structure anchors, camera
+/// floor) honestly samples the flat stand-in until the bake lands, so
+/// a dump captured in the first few frames draws a flat planet — a
+/// relief-verification dump captured there proves nothing (the
+/// vision-acceptance false pair: BEFORE and AFTER renders were both
+/// flat for exactly this reason). Polls the packet's heightfield
+/// content key against `bake_profiled_key` for the AUTHORED
+/// `(seed, profile)` — the same key contract `TerrainCache::field`
+/// serves, all public API — and panics if the bake never lands.
+fn until_real_terrain(view: &mut View) {
+    let want = {
+        let cfg = view.world.resource::<csp_view::terrain::TerrainConfig>();
+        let t = cfg.bodies.get("terrin").unwrap();
+        csp_render::terrain::HeightField::bake_profiled_key(t.seed, t.profile)
+    };
+    // Bound: a debug-build Mountain bake is single-digit seconds; poll
+    // up to ~1.5 min of frames+sleeps before calling it a stall.
+    for _ in 0..12_000 {
+        frame(view, 1);
+        if let Some(p) = view.take_flight_packet()
+            && let Some(t) = &p.terrain
+            && let Some(h) = &t.heightfield
+            && h.key == want
+        {
+            // The detection take consumed this frame's packet — emit
+            // one more so the caller's own `take_flight_packet` sees
+            // a fresh packet (the cache now serves the real field
+            // every frame, so the re-emit carries it too).
+            frame(view, 1);
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!(
+        "the real Terrin heightfield never landed in the flight packet — background bake stalled?"
+    );
+}
+
 /// What the readback measured. `distinct` is a color-diversity count
 /// (4-bit-per-channel buckets): a uniform image has 1, a two-stop
 /// gradient a few dozen, a lit scene hundreds.
@@ -849,9 +890,10 @@ fn dump_low() {
         input.pitch = pitch;
         input.yaw = yaw;
     }
-    for _ in 0..3 {
-        frame(&mut view, 1);
-    }
+    // Capture only once the packet carries the REAL heightfield — the
+    // first frames draw the cache's flat stand-in (see
+    // [`until_real_terrain`]).
+    until_real_terrain(&mut view);
     let packet = view.take_flight_packet().unwrap();
     let img = render_flight_scene(&device, &queue, &packet);
     let name = std::env::var("DUMP_OUT").unwrap_or_else(|_| "/tmp/frame_low.ppm".into());
@@ -887,6 +929,11 @@ fn dump_flight() {
         input.pitch = env_f("DUMP_PITCH", 0.25);
         input.distance_m = env_f("DUMP_DIST", 60.0);
     }
+    // Wait for the REAL heightfield BEFORE lighting the engine — the
+    // ascent loop below runs only seconds of wall time and the
+    // background bake (single-digit seconds in debug) would otherwise
+    // still be flat at capture (see [`until_real_terrain`]).
+    until_real_terrain(&mut view);
     frame(&mut view, 1); // the focus resolves in flight_present
     let vessel = view.flight_focus().expect("starter vessel");
     view.enqueue_command(
@@ -956,8 +1003,18 @@ fn env_f(k: &str, d: f64) -> f64 {
 /// Scratch terrain dump at an arbitrary surface point/heading —
 /// hand-builds the `TerrainPacket` (same builders `extract_flight`
 /// uses) so any location/altitude/pitch can be inspected without
-/// flying the sim. Env knobs: DUMP_LAT, DUMP_LON, DUMP_HEADING (deg),
-/// DUMP_ALT (m), DUMP_PITCH (rad, look-down), DUMP_OUT.
+/// flying the sim. TERRAIN-ONLY by design: the packet is hand-built
+/// with an empty flight-vertex stream, so the launch complex (pad,
+/// gantry, VAB — `structures::emit_launch_complex` is crate-private
+/// and only runs inside the real extract) does NOT appear here; judge
+/// pad-ground alignment from `dump_low`/`dump_flight`, which render
+/// the full extract — structures and craft anchored on the same
+/// heightfield this probe bakes. The field itself IS the real authored
+/// bake (profiled, synchronous — no cache stand-in race here).
+/// Env knobs: DUMP_LAT, DUMP_LON (deg), DUMP_HEADING (deg), DUMP_ALT
+/// (m), DUMP_PITCH (rad, look-down), DUMP_AMP (m, displacement-scale
+/// override — 0 bakes the flat datum for the A/B pair), DUMP_BODY
+/// (DUMP_SCAN survey body; render stays Terrin), DUMP_OUT.
 /// `cargo test -p csp-view --test render_gate dump_surface -- --ignored`.
 #[test]
 #[ignore]
@@ -981,22 +1038,20 @@ fn dump_surface() {
     let pitch_down = env("DUMP_PITCH", 0.55); // rad below the local horizon
     let heading = env("DUMP_HEADING", 0.0).to_radians();
 
-    // The AUTHORED Terrin field + amplitude (M5 §5.2-R2: Mountain,
-    // 0.006·R = 3 600 m) — the same profiled bake and scale the
-    // terrain pass draws, read from the view's config so a re-authored
-    // terrain block flows here without editing this probe.
-    let (field, amplitude_m) = {
+    if std::env::var("DUMP_SCAN").is_ok() {
+        // Coarse normalized-height survey: + land, . shallow sea, ~ deep
+        // sea. `DUMP_BODY` (default terrin) picks whose AUTHORED field
+        // the survey samples — the land-fraction measurement a relief
+        // re-authoring wants per body — scan-only: the render path
+        // below stays Terrin (radius, biome map).
         let view = View::new().unwrap();
         let cfg = view.world.resource::<csp_view::terrain::TerrainConfig>();
-        let t = cfg.bodies.get("terrin").unwrap();
-        (
-            csp_render::terrain::HeightField::bake_profiled(t.seed, t.profile),
-            t.amplitude_m,
-        )
-    };
-    let r_body = 600_000.0;
-    if std::env::var("DUMP_SCAN").is_ok() {
-        // Coarse normalized-height survey: + land, . shallow sea, ~ deep sea.
+        let name = std::env::var("DUMP_BODY").unwrap_or_else(|_| "terrin".into());
+        let t = cfg
+            .bodies
+            .get(&name)
+            .unwrap_or_else(|| panic!("no terrain config for {name}"));
+        let field = csp_render::terrain::HeightField::bake_profiled(t.seed, t.profile);
         for la in (-80..=80i32).step_by(8) {
             let mut row = String::new();
             for lo in (0..360i32).step_by(6) {
@@ -1020,6 +1075,23 @@ fn dump_surface() {
         }
         return;
     }
+    // The AUTHORED Terrin field + amplitude (M5 §5.2-R2: Mountain,
+    // 0.006·R = 3 600 m) — the same profiled bake and scale the
+    // terrain pass draws, read from the view's config so a re-authored
+    // terrain block flows here without editing this probe.
+    let (field, amplitude_m) = {
+        let view = View::new().unwrap();
+        let cfg = view.world.resource::<csp_view::terrain::TerrainConfig>();
+        let t = cfg.bodies.get("terrin").unwrap();
+        (
+            csp_render::terrain::HeightField::bake_profiled(t.seed, t.profile),
+            t.amplitude_m,
+        )
+    };
+    // A/B knob: force the displacement scale (0 = flat datum) to prove
+    // the mesh displacement is live — same scene, two amplitudes, diff.
+    let amplitude_m = env("DUMP_AMP", amplitude_m);
+    let r_body = 600_000.0;
     let art = csp_view::art::load()
         .0
         .terrain

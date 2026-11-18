@@ -11,10 +11,11 @@
 // v2 (M5 §5.2-R2): the terrain overhaul authors the amplitude and
 // relief spectrum — Terrin is the flagship: Mountain relief at
 // amplitude_frac 0.006 ⇒ 3 600 m of relief over a 600 km radius. The
-// ridge-scale slope warrant (csp-phys `mountain_ridge_slope_warrant`)
-// surveyed p99 = 0.1429 < tan 12° at exactly this amplitude, so radial
-// contact normals stay clear. The launch site re-sites onto the new
-// field — see sites.ron.
+// steep ridge survey (csp-phys `mountain_land_slope_distribution`)
+// pins ridge p99 tan 0.3618 (19.9°) and max 0.7415 (36.6°); contact
+// normals are GRADIENT-based for Mountain (csp-phys `surface_normal`),
+// so the warrant is the spectrum tripwire, not a radial-slope cap. The
+// launch site re-sites onto the new field — see sites.ron.
 (
     schema_version: 2,
     id: "terrin",

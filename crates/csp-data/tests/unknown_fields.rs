@@ -178,13 +178,34 @@ fn misspelled_engine_module_field_is_a_parse_error() {
 /// A previous-schema `sites.ron` still parses — the §3.1 "current
 /// and previous" rule: v2's missing `starting_stock` (v3's field)
 /// reads as the empty stockpile under `#[serde(default)]`, the same
-/// way v1's `resource_yields` read empty before it aged out. The
-/// frozen `flight-launch` fixture is the real v2 file.
+/// way v1's `resource_yields` read empty before it aged out. The v2
+/// specimen is OWNED BY THE TEST, never borrowed from
+/// `data/test-fixtures/`: golden fixtures track the LIVE data (a
+/// re-pin copies the current files verbatim — replay fidelity
+/// demands it), so a fixture is v3 the moment the live file is and
+/// a version-specimen premise rots on every schema bump.
 #[test]
 fn v2_sites_file_still_parses() {
-    let sites =
-        csp_data::load_sites(&data().join("test-fixtures/flight-launch/sites.ron")).unwrap();
-    assert!(!sites.sites.is_empty());
+    // Minimal v2 bytes: every required `SiteDef` field plus v2's own
+    // `resource_yields`, and NO v3 `starting_stock`.
+    let v2 = r#"(
+    schema_version: 2,
+    sites: [(
+        id: "v2-probe-site",
+        display_name: "site.v2-probe-site",
+        body: "terrin",
+        latitude_rad: -0.092,
+        longitude_rad: 2.916,
+        altitude_m: 52.0,
+        launch: true,
+        resource_yields: [("ore", 0.35)],
+    )],
+)"#;
+    let tmp = std::env::temp_dir().join(format!("csp-data-v2-sites-{}", std::process::id()));
+    std::fs::write(&tmp, v2).unwrap();
+    let sites = csp_data::load_sites(&tmp).unwrap();
+    let _ = std::fs::remove_file(&tmp);
+    assert_eq!(sites.sites.len(), 1);
     for s in &sites.sites {
         assert!(
             s.starting_stock.is_empty(),
