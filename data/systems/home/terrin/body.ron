@@ -8,8 +8,15 @@
 // 2π·sqrt(a³/μ_solen); the sheet's 9.203e6 s (426 sim-days of 21 600 s)
 // is its 4-significant-figure display — the §3.0 validator checks the
 // authored value against the closed form to 1e-9 relative.
+// v2 (M5 §5.2-R2): the terrain overhaul authors the amplitude and
+// relief spectrum — Terrin is the flagship: Mountain relief at
+// amplitude_frac 0.006 ⇒ 3 600 m of relief over a 600 km radius. The
+// ridge-scale slope warrant (csp-phys `mountain_ridge_slope_warrant`)
+// surveyed p99 = 0.1429 < tan 12° at exactly this amplitude, so radial
+// contact normals stay clear. The launch site re-sites onto the new
+// field — see sites.ron.
 (
-    schema_version: 1,
+    schema_version: 2,
     id: "terrin",
     display_name: "body.terrin.name",
     parent: Some("solen"),
@@ -43,7 +50,12 @@
     )),
     // §3.0: "Ocean — yes (datum r = R)".
     ocean: Some((datum_radius_m: 6.000e5)),
-    terrain: (noise_seed: 601, heightmap: None),
+    terrain: (
+        noise_seed: 601,
+        heightmap: None,
+        amplitude_frac: 0.006,
+        relief: Mountain,
+    ),
     biome_map: Some((png: "biomes.png", legend: "biomes.ron")),
     surface_resources: [],
     insolation_w_m2: Some(1361.0),

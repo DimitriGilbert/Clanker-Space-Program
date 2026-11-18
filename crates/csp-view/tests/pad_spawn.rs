@@ -120,11 +120,13 @@ fn launch_site_sits_on_rendered_ground() {
         .bodies
         .get(dominant.as_str())
         .expect("no terrain config for the dominant body");
-    // The same 1024×512 equirect bake `terrain::build_packet` ships to
-    // the GPU — `sample_dir` is the texel-exact CPU mirror of the
+    // The same profiled equirect bake `terrain::build_packet` ships to
+    // the GPU — `HeightField::bake_profiled` at the body's authored
+    // `ReliefProfile` dims (Mountain 2048×1024 vs Legacy 1024×512,
+    // M5 §5.2-R2) — `sample_dir` is the texel-exact CPU mirror of the
     // vertex shader's `height_at`, so this measures the exact surface
     // the pass draws at the pad.
-    let field = csp_render::terrain::HeightField::bake(body.seed, 1024, 512);
+    let field = csp_render::terrain::HeightField::bake_profiled(body.seed, body.profile);
     let (sl, cl) = site.latitude_rad.sin_cos();
     let (so, co) = site.longitude_rad.sin_cos();
     let dir = csp_core::DVec3::new(cl * co, cl * so, sl);

@@ -973,14 +973,28 @@ fn dump_surface() {
             .and_then(|s| s.parse().ok())
             .unwrap_or(d)
     };
-    let lat = env("DUMP_LAT", -0.092).to_radians();
-    let lon = env("DUMP_LON", 2.916).to_radians();
+    // Defaults: the terrin-launch pad, in DEGREES (lat −0.092 rad,
+    // lon 2.916 rad — the units this probe's knobs take).
+    let lat = env("DUMP_LAT", -5.2712).to_radians();
+    let lon = env("DUMP_LON", 167.0745).to_radians();
     let alt = env("DUMP_ALT", 710.0);
     let pitch_down = env("DUMP_PITCH", 0.55); // rad below the local horizon
     let heading = env("DUMP_HEADING", 0.0).to_radians();
 
+    // The AUTHORED Terrin field + amplitude (M5 §5.2-R2: Mountain,
+    // 0.006·R = 3 600 m) — the same profiled bake and scale the
+    // terrain pass draws, read from the view's config so a re-authored
+    // terrain block flows here without editing this probe.
+    let (field, amplitude_m) = {
+        let view = View::new().unwrap();
+        let cfg = view.world.resource::<csp_view::terrain::TerrainConfig>();
+        let t = cfg.bodies.get("terrin").unwrap();
+        (
+            csp_render::terrain::HeightField::bake_profiled(t.seed, t.profile),
+            t.amplitude_m,
+        )
+    };
     let r_body = 600_000.0;
-    let field = csp_render::terrain::HeightField::bake(601, 1024, 512);
     if std::env::var("DUMP_SCAN").is_ok() {
         // Coarse normalized-height survey: + land, . shallow sea, ~ deep sea.
         for la in (-80..=80i32).step_by(8) {
@@ -1022,7 +1036,7 @@ fn dump_surface() {
     let (slat, clat) = lat.sin_cos();
     let (slon, clon) = lon.sin_cos();
     let dir = DVec3::new(clat * clon, clat * slon, slat);
-    let h_here = field.sample_dir(dir) * 2_400.0;
+    let h_here = field.sample_dir(dir) * amplitude_m;
     let eye_rel = dir * (r_body + h_here.max(0.0) + alt);
 
     // Camera basis: look `pitch_down` below the local horizon toward
@@ -1075,7 +1089,7 @@ fn dump_surface() {
     let leaves = csp_render::terrain::select_patches(
         eye_rel,
         r_body,
-        2_400.0,
+        amplitude_m,
         &csp_render::terrain::LodConfig::default(),
     );
     let mut terrain_inst = Vec::new();
@@ -1093,7 +1107,7 @@ fn dump_surface() {
                 lo = lo.min(field.sample_dir(c / c.norm()));
             }
         }
-        if lo * 2_400.0 <= 600.0 {
+        if lo * amplitude_m <= 600.0 {
             ocean_inst.push(csp_render::terrain::patch_instance(
                 id, 1.0, eye_rel, r_body,
             ));
@@ -1127,7 +1141,7 @@ fn dump_surface() {
             view_rot,
             eye_rel_body: [eye_rel.x as f32, eye_rel.y as f32, eye_rel.z as f32, 0.0],
             sun_dir: [-1.0, 0.0, 0.0, 0.0],
-            planet: [r_body as f32, 70_000.0, r_body as f32, 2_400.0],
+            planet: [r_body as f32, 70_000.0, r_body as f32, amplitude_m as f32],
             atmo: [
                 5_600.0,
                 if biome.is_some() { 1.0 } else { 0.0 },

@@ -3533,8 +3533,8 @@ mod tests {
 
     /// `body_light` over the REAL system + the shipped rask-mines
     /// pose: synodic = n_rask − n_terrin ≈ 4.4525e-5 rad/s → a
-    /// ~141 115 s solar day, and the 2.4 rad spawn longitude sits
-    /// ~0.74 rad into the day side (|cos H0| = 0.737 — the real
+    /// ~141 115 s solar day, and the 2.4218 rad spawn longitude sits
+    /// ~0.72 rad into the day side (|cos H0| = 0.751 — the real
     /// margin the terminator verifier recommends, not the +6.1e-17
     /// residue π/2 left).
     #[test]

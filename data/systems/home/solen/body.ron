@@ -3,8 +3,13 @@
 // The star is the parent-chain root: `parent`/`orbit`/`soi_m` are None.
 // `insolation_w_m2` is the reference flux — "1361 @ 1.36e10 m" (§3.0),
 // i.e. the flux at Terrin's orbital distance.
+// v2 (M5 §5.2-R2): the star authors its terrain explicitly for the
+// first time — amplitude_frac 0.0 (the validator's flat-body corner;
+// 0.0 is legal) under the Legacy spectrum. A star has no surface to
+// sculpt: the flat datum IS the semantic truth, and the zero amplitude
+// makes every heightfield sample exactly the datum radius.
 (
-    schema_version: 1,
+    schema_version: 2,
     id: "solen",
     display_name: "body.solen.name",
     parent: None,
@@ -16,7 +21,12 @@
     orbit: None,
     atmosphere: None,
     ocean: None,
-    terrain: (noise_seed: 1, heightmap: None),
+    terrain: (
+        noise_seed: 1,
+        heightmap: None,
+        amplitude_frac: 0.0,
+        relief: Legacy,
+    ),
     biome_map: None,
     surface_resources: [],
     insolation_w_m2: Some(1361.0),

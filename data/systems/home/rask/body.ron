@@ -5,8 +5,14 @@
 //   orbital period = 1.390e5 s ±0.1%  (= 6.44 sim-days)
 // `orbit.period_s` stores the closed form 2π·sqrt(a³/μ_terrin); the
 // sheet's 1.390e5 s is its 4-significant-figure display.
+// v2 (M5 §5.2-R2): the moon ships the Mountain spectrum at the same
+// 0.006 amplitude fraction as Terrin — 1 200 m of relief over the
+// 200 km radius. Slopes scale with amplitude_frac roughly
+// independently of radius (relief ∝ R and texel ∝ R cancel), so 0.006
+// keeps the surveyed ridge-warrant p99 = 0.1429 < tan 12° verbatim;
+// DO NOT exceed it anywhere.
 (
-    schema_version: 1,
+    schema_version: 2,
     id: "rask",
     display_name: "body.rask.name",
     parent: Some("terrin"),
@@ -26,7 +32,12 @@
     )),
     atmosphere: None,
     ocean: None,
-    terrain: (noise_seed: 602, heightmap: None),
+    terrain: (
+        noise_seed: 602,
+        heightmap: None,
+        amplitude_frac: 0.006,
+        relief: Mountain,
+    ),
     biome_map: Some((png: "biomes.png", legend: "biomes.ron")),
     surface_resources: [],
     insolation_w_m2: Some(1361.0),
