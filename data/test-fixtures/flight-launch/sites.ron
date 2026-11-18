@@ -1,30 +1,121 @@
-// Frozen fixture sites — the flight-launch golden's recovery site set:
-// Terrin's launch pad (recovery_efficiency 1.0) plus a downrange field
-// (balance default 0.9). v2: no `resource_yields`/`starting_stock`
-// authored — both default empty (the golden needs no stockpile: its
-// recorded spawn is a direct SpawnPhysicalVessel).
+// The home system's surface sites (PLAN §3.5) — program geography:
+// launch pads and recovery locations. `launch: true` marks the body's
+// launch site (recovery_efficiency 1.0); every other site recovers at
+// balance.ron's recovery_efficiency (0.9).
+//
+// v2 (M8-B): `resource_yields` — per-site mineable concentrations a
+// colony Drill extracts against. Terrin's pads are modest; Rask's
+// mining site is the rich pull into the colony game.
+//
+// Loop-closure decision (fix-plan 3.1): §3.5's
+// "resources ◄── colonies/ISRU" edge runs over the EXISTING
+// colony→vessel `TransferColonyResource` end — a surface-latched
+// vessel `JoinColonyInventory`s, loads colony produce into a cargo
+// tank (`csp.tank.ore.s`), and `RecoverVessel` credits the tank
+// CONTENTS to the recovery site's inventory at its efficiency
+// (1.0 at a launch site). The alternative — refunding the craft's
+// embodied `build_resources` at recovery — was rejected: §3.5
+// specifies recovery credits contents only, and `CraftDef` does not
+// carry the resolved BOM.
 (
-    schema_version: 2,
+    schema_version: 3,
     sites: [
         (
-            schema_version: 2,
             id: "terrin-launch",
             display_name: "site.terrin-launch",
             body: "terrin",
-            latitude_rad: 0.0,
-            longitude_rad: 0.0,
-            altitude_m: 0.0,
+            // The pad sits just south of the equator on a shoreline —
+            // see the longitude note.
+            latitude_rad: -0.092,
+            // The sun sits at −X at t=0 (Terrin orbits at +X), so a pad
+            // near lon π spawns in daylight instead of on the night
+            // side. lon 2.916 (−0.226 rad from the sun meridian) is a
+            // MORNING pad — ~1.7 h of daylight remain at spawn. The
+            // exact site is terrain-aware: the sim's contact surface
+            // AND the rendered terrain are the same baked heightfield
+            // (noise_seed 601). M5 §5.2-R2 re-authored that field to
+            // the Mountain spectrum at amplitude_frac 0.006, and the
+            // re-siting probe (`csp-view`'s ignored `pad_resite_scan`)
+            // kept the pad at its legacy coordinates: of 1681
+            // candidates in the ±5° window the old site ties for
+            // flattest — max−min over a 30 m footprint ring is 0.02 m
+            // (target ≤ ±0.5 m; the strict minimum, 0.017 m, sat 4.9°
+            // away — a 4 mm gain not worth losing the morning-pad
+            // longitude) — with the Mountain field at +14.36 m over
+            // datum, so the craft rests on the rendered ground and the
+            // datum-altimetry numbers stay honest.
+            longitude_rad: 2.916,
+            altitude_m: 14.36,
             launch: true,
+            resource_yields: [
+                ("ore", 0.35),
+                ("water", 0.15),
+            ],
+            // W2.6 §3.5: the pad's starting stockpile — what
+            // ManufactureCraft BOMs (parts' `build_resources`) and
+            // RunBenchTest stands (`reliability_bench_resource` =
+            // metal) spend. ~12 starter-craft equivalents of metal
+            // plus composite for the electronics-heavy parts. It
+            // refills by logistics, not by fiat: recovery at the pad
+            // credits a recovered vessel's tank CONTENTS here at 1.0,
+            // so the refill run is a cargo carrier (`csp.tank.ore.s`)
+            // hauling colony metal/composite home — see the header.
+            starting_stock: [
+                ("metal", 2000.0),
+                ("composite", 400.0),
+            ],
         ),
         (
-            schema_version: 2,
             id: "terrin-downrange",
             display_name: "site.terrin-downrange",
             body: "terrin",
-            latitude_rad: 0.0,
-            longitude_rad: 0.7853981633974483,
-            altitude_m: 0.0,
+            // Re-sited onto the M5 §5.2-R2 Mountain field: the old
+            // (0, 3.927) datum point now sits ~412 m under the ocean
+            // (the whole ±5° window is sea — the re-siting probe found
+            // zero dry candidates there), so the recovery site moved
+            // to the NEAREST dry ground the ±15° survey found — a
+            // shoreline bench 6.5° SSE of the old marker, field height
+            // +14.02 m over datum, flat to 0.9 m over a 30 m ring
+            // (nothing berths here — the marker anchors at the datum
+            // altitude and recovery is commanded, not landed).
+            latitude_rad: -0.10471975511965978, // −6°
+            longitude_rad: 3.9706240482870996,
+            altitude_m: 14.02,
             launch: false,
+            resource_yields: [
+                ("ore", 0.20),
+            ],
+        ),
+        (
+            id: "rask-mines",
+            display_name: "site.rask-mines",
+            body: "rask",
+            // lon ~2.42 puts the spawn meridian ~0.72 rad into daylight
+            // — |cos H0| = 0.751 of terminator margin (C09-F2/C34-F3):
+            // the shipped π/2 parked the outpost ON the line, where its
+            // permanent Day verdict hung on a +6.1e-17 cosine residue
+            // (one longitude ulp flipped it to permanent Night). Rask's
+            // day/night still cycles — it is locked to Terrin, not the
+            // sun — so this margin buys a clean day-side spawn (~51.5 ks
+            // to first dusk), not a permanently-lit claim; see the
+            // colonies.ron header.
+            //
+            // Re-sited off the datum point (M5 §5.2-R2): rask's new
+            // Mountain field at (0, 2.4) sits −98.7 m under datum,
+            // where `altitude_m ≥ 0` is unsatisfiable (the site
+            // validator's floor, which colony founding shares). The
+            // re-siting probe's flattest dry candidate within ±5° —
+            // 4.0° SSE at lon 2.42182/lat −0.06545 — lifts the
+            // outpost onto a +31.19 m bench, 0.19 m flat over a 30 m
+            // ring, deepening the spawn margin to 0.751.
+            latitude_rad: -0.06544984694978735, // −3.75°
+            longitude_rad: 2.421816615649929,
+            altitude_m: 31.19,
+            launch: false,
+            resource_yields: [
+                ("ore", 0.9),
+                ("water", 0.3),
+            ],
         ),
     ],
 )

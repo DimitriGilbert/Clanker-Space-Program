@@ -1,9 +1,14 @@
-// Terrin — the home world (PLAN §3.0). Verbatim copy of
-// `data/systems/home/terrin/body.ron` minus `biome_map` — the flight
-// scenario's environment needs only the physics-relevant fields, and
-// the golden hash pins this file byte-for-byte.
+// Terrin — the home world (PLAN §3.0), as frozen for the flight-launch
+// golden: `data/systems/home/terrin/body.ron` minus `biome_map` — the
+// launch arc never samples biomes (§3.0.1 decoupling), so the fixture
+// stays minimal. Terrain fields track the live authoring (M5 §5.2-R2):
+// Mountain relief at amplitude_frac 0.006 ⇒ 3 600 m of relief over a
+// 600 km radius; the ridge-scale slope warrant (csp-phys
+// `mountain_land_slope_distribution`) surveyed p99 = 0.1429 < tan 12°
+// at exactly this amplitude, so radial contact normals stay clear. The
+// launch site re-anchors onto the new field — see sites.ron.
 (
-    schema_version: 1,
+    schema_version: 2,
     id: "terrin",
     display_name: "body.terrin.name",
     parent: Some("solen"),
@@ -37,7 +42,12 @@
     )),
     // §3.0: "Ocean — yes (datum r = R)".
     ocean: Some((datum_radius_m: 6.000e5)),
-    terrain: (noise_seed: 601, heightmap: None),
+    terrain: (
+        noise_seed: 601,
+        heightmap: None,
+        amplitude_frac: 0.006,
+        relief: Mountain,
+    ),
     biome_map: None,
     surface_resources: [],
     insolation_w_m2: Some(1361.0),
