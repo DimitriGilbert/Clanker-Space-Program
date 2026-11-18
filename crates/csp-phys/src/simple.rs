@@ -73,32 +73,49 @@
 //! vertex whose world position falls below the surface
 //! (`‖p − c‖ < surface_radius(p̂)`) produces one manifold point
 //! `{pos, normal = up, depth}` — vertex-only contact per the M2
-//! scope with a radial "up" normal. The normal's error vs the true
-//! heightfield normal is the local slope angle, not µm; the
-//! µm-scale claim survives only for the *manifold* half (vertex vs
-//! face/edge on a near-planar footprint). Measured land-slope bands
-//! (§5.2-R2's terrain overhaul, M5 — the
-//! `mountain_land_slope_distribution` survey: 2 seeds, Terrin's
-//! radius, land cells, pair-difference method):
-//! [`ReliefProfile::Legacy`] ≤ ~6° (C12-F2's empirical bound,
-//! tan ≤ 0.10); Mountain, p50/p95/p99/max tan —
-//! * macro grid 96×48 (~39 km spacing — the continent-scale
-//!   gradient): 0.011/0.048/0.087/0.230 at the planned authored
-//!   `amplitude_frac` 0.006, 0.008/0.032/0.058/0.153 at the 0.004
-//!   default;
-//! * ridge grid 512×256 (~7.4 km spacing — resolves the ×28 ridge
-//!   octaves and brackets the baked field's ~1.8 km contact
-//!   texels): 0.019/0.091/0.143/0.513 at 0.006, 0.013/0.060/0.095/
-//!   0.342 at 0.004.
+//! scope. The µm-scale claim survives only for the *manifold* half
+//! (vertex vs face/edge on a near-planar footprint); the "up" itself
+//! is profile-split (§2.1 gradient contact normals):
 //!
-//! Both profiles therefore keep the radial normal — the decision
-//! datum, ridge p99 at 0.006, is 0.143: inside the tan(12°) ≈ 0.213
-//! warrant threshold a height-gradient normal model would need. The
-//! static-friction corollary holds through p99 under either normal
-//! model (μ = 0.5 ⇒ 26.6° friction angle, tan 0.50); the ridge-scale
-//! max (0.513) grazes that limit only in the extreme tail — the
-//! steepest handful of ~293 k surveyed land pairs sit at the slide
-//! limit, the distribution does not.
+//! * **Bare spheres and [`ReliefProfile::Legacy`]** keep the RADIAL
+//!   `p̂` — bit-frozen: the §2.1 rework passes the radial direction
+//!   through [`Environment::surface_normal`] untouched, so every
+//!   shipped body solves exactly the pre-§2.1 tick. The radial
+//!   normal's error vs the true heightfield normal is the local
+//!   slope angle, and Legacy's measured land-slope band (the same
+//!   survey below) stays ≤ ~6° (C12-F2's empirical bound,
+//!   tan ≤ 0.10) — the radial reading was always warranted there.
+//! * **[`ReliefProfile::Mountain`]** — the §2.1-steepened spectrum
+//!   whose ridge-scale slopes leave that validity range — uses the
+//!   **heightfield-gradient normal** [`Environment::surface_normal`]:
+//!   central finite differences of the baked field over the unspun
+//!   body-fixed tangent frame (the same conjugate `surface_radius`
+//!   samples), gradient in metres per datum-sphere arc-metre, then
+//!   `n = normalize(dir − g_e·east − g_n·north)` — the true tilted
+//!   "up" of the same displaced surface the renderer draws. Valid at
+//!   ANY slope: the stencil differentiates the sampled field, and
+//!   nothing in it degrades with tilt. Measured land-slope bands
+//!   (§5.2-R2's terrain overhaul steepened by §2.1 — the
+//!   `mountain_land_slope_distribution` survey: 2 seeds, Terrin's
+//!   radius, land cells, pair-difference method), p50/p95/p99/max
+//!   tan:
+//!   * macro grid 96×48 (~39 km spacing — the continent-scale
+//!     gradient): 0.0236/0.1073/0.2001/0.5344 at the planned authored
+//!     `amplitude_frac` 0.006, 0.0158/0.0715/0.1334/0.3563 at the
+//!     0.004 default;
+//!   * ridge grid 512×256 (~7.4 km spacing — resolves the ridge
+//!     octaves and brackets the baked field's ~1.8 km contact
+//!     texels): 0.0305/0.2202/0.3618/0.7415 at 0.006,
+//!     0.0203/0.1468/0.2412/0.4943 at 0.004.
+//!
+//! The honest friction corollary of the steep spectrum: with μ = 0.5
+//! the friction angle is 26.57° (tan 0.50), and slope faces steeper
+//! than that SLIDE under the solver's Coulomb cone — physically
+//! correct on the steepest mountain faces (the ridge-scale max
+//! 0.7415 ≈ 36.6° sits past it, ~344 of ~168 k surveyed land pairs
+//! graze the slide limit at 0.006), while the distribution's p95
+//! (0.2202 ≈ 12.4°) sits well below it — the bulk of the land area
+//! still holds a resting vessel.
 //!
 //! **Vessel-vessel contact** (M6 sub-phase A): bodies in one `step`
 //! slice see each other through a symmetric vertex-vs-hull rule — a
@@ -564,6 +581,112 @@ impl Environment {
         };
         self.radius_m + t.height_m(dir_fixed)
     }
+
+    /// The contact-surface **outward normal** along `dir` at
+    /// sim-second `seconds` — `dir` a UNIT body-center-relative
+    /// direction in the inertial bubble frame, the same contract
+    /// [`Self::surface_radius`] carries.
+    ///
+    /// Profile-split (§2.1 gradient contact normals): bare spheres
+    /// and [`ReliefProfile::Legacy`] return the RADIAL `dir`
+    /// verbatim — the value passes through with zero arithmetic, so
+    /// the legacy manifold is bit-identical to the pre-§2.1
+    /// `rel / dist` construction at every call site.
+    /// [`ReliefProfile::Mountain`] returns the heightfield-gradient
+    /// normal: central finite differences of the baked field over
+    /// the unspun body-fixed tangent frame — the SAME `R(axis,
+    /// −ω·seconds)` conjugate [`Self::surface_radius`] samples, so
+    /// the normal belongs to the same surface the scalar radius
+    /// names — spun back to the inertial frame afterwards (see
+    /// [`gradient_normal_fixed`] for the stencil and the algebra
+    /// against the radial up it generalizes).
+    pub fn surface_normal(&self, dir: DVec3, seconds: f64) -> DVec3 {
+        let Some(t) = &self.terrain else {
+            return dir;
+        };
+        if t.profile == ReliefProfile::Legacy {
+            return dir;
+        }
+        let omega = self.body_spin.norm();
+        let unspin = if omega > 0.0 {
+            DQuat::from_axis_angle(self.body_spin / omega, -omega * seconds)
+        } else {
+            DQuat::IDENTITY
+        };
+        let dir_fixed = unspin.rotate(dir);
+        let eps = GRADIENT_NORMAL_FD_TEXELS * core::f64::consts::PI / t.field().height as f64;
+        let n_fixed = gradient_normal_fixed(t, self.radius_m, dir_fixed, eps);
+        if omega > 0.0 {
+            unspin.conjugate().rotate(n_fixed)
+        } else {
+            n_fixed
+        }
+    }
+}
+
+/// The §2.1 gradient-normal stencil, in LATITUDE texels of the baked
+/// field: [`gradient_normal_fixed`] samples `sample_dir` at
+/// ±[`GRADIENT_NORMAL_FD_TEXELS`]·(π/height) radians of polar angle.
+/// 2 texels (not 1, not 4) balances the two error channels of a
+/// central difference over a piecewise-bilinear field: a sub-texel
+/// stencil reads one cell's secant, whose error is the texel-scale
+/// curvature the bilinear interpolant flattens (O(texel·h″)), while a
+/// multi-texel stencil averages across the interpolant's C0 creases —
+/// the ε-sensitivity test (`gradient_normal_eps_curve_on_bowl`)
+/// sweeps the offset and pins this value at the flat end of the
+/// error curve. At Mountain's 2048×1024 bake the stencil spans
+/// ~7.4 km of arc — the same scale the slope survey's ridge grid
+/// resolves, so the contact normal sees the slopes the survey
+/// reports.
+const GRADIENT_NORMAL_FD_TEXELS: f64 = 2.0;
+
+/// The §2.1 gradient contact normal at a BODY-FIXED unit direction
+/// `d` — the central finite difference of the displaced heightfield
+/// over the local tangent frame. In the tangent-plane reading (the
+/// composition's model): the displaced surface `S(u) = (R +
+/// h(u)·A)·u` over the (east, north) arc coordinates at `d` is, to
+/// first order in the stencil's ~0.006 rad span, the graph
+/// `z = h·A` over the tangent plane — whose normal at the stencil
+/// centre is the planar heightfield normal formula
+/// `(−∂h/∂x, −∂h/∂y, 1)` written in the sphere's tangent frame,
+///
+/// ```text
+/// n = normalize(d − g_e·east − g_n·north)
+/// ```
+///
+/// with `g = dh/dσ·A` the height gradient in metres per datum-sphere
+/// arc-metre. Algebra vs the incumbent radial up: at `g = 0` (flat
+/// field) the formula collapses to `d` itself — the Legacy manifold's
+/// radial normal is exactly this model's flat-ground limit, which is
+/// why switching profiles cannot move a flat-terrain contact. The
+/// exact sphere-graph normal differs only by an `(R/r)`-scaling of
+/// `g` (`r = R + h·A`): ≤ |A·h/R| ≈ 0.6% of the gradient at
+/// Mountain's amplitude fraction, under the stencil's own resolution.
+///
+/// Stencil details:
+/// - The sampled directions are built with exact `cos/sin` —
+///   `normalize(d ± ε·t)` would sit at polar angle `atan(ε)`, a
+///   relative `ε²/3 ≈ 1.3e-5` stencil-width error at the §2.1 offset.
+/// - East degenerates at the poles (`‖Z×d‖ = cos(lat)`); within
+///   `1e-6` of one the function returns `d` — and the clamp-v field
+///   edge flattens the sampled surface there anyway, so `g_e ≈ 0` is
+///   also the honest reading of the surface being contacted.
+fn gradient_normal_fixed(t: &TerrainSurface, datum_r: f64, d: DVec3, eps: f64) -> DVec3 {
+    let field = t.field();
+    let east_raw = DVec3::Z.cross(d);
+    let east_len = east_raw.norm();
+    if east_len < 1e-6 {
+        return d;
+    }
+    let east = east_raw / east_len;
+    let north = d.cross(east);
+    let (s, c) = (libm::sin(eps), libm::cos(eps));
+    let sample = |tangent: DVec3| field.sample_dir(d * c + tangent * s);
+    let arc = 2.0 * eps * datum_r;
+    let g_e = (sample(east) - sample(-east)) * t.amplitude_m / arc;
+    let g_n = (sample(north) - sample(-north)) * t.amplitude_m / arc;
+    let n = d - east * g_e - north * g_n;
+    n / n.norm()
 }
 
 /// §3.0's closed form: `p(h) = p0·exp(−h/H)` up to `top_m`, then a
@@ -1935,13 +2058,17 @@ impl SimpleBackend {
                     if dist <= 0.0 {
                         continue;
                     }
-                    let n_w = rel / dist;
+                    let n_radial = rel / dist;
                     let speculative = if depth <= 0.0 {
                         // Vertex point velocity relative to the
-                        // (possibly spinning) surface, along n.
+                        // (possibly spinning) surface, along the
+                        // RADIAL up — the reachability threshold
+                        // keeps its pre-§2.1 arithmetic (a threshold,
+                        // not a solve direction; only the constraint
+                        // normal below models the slope).
                         let v_pt = b.vel + b.rot.rotate(b.ang_vel).cross(p - b.com_world())
                             - self.env.body_spin.cross(rel);
-                        let closing = -v_pt.dot(n_w);
+                        let closing = -v_pt.dot(n_radial);
                         // `depth` is negative outside the surface;
                         // within `closing·dt` it arrives this tick.
                         depth > -closing * PHYSICS_DT && closing > 0.0
@@ -1949,6 +2076,15 @@ impl SimpleBackend {
                         false
                     };
                     if depth > 0.0 || speculative {
+                        // §2.1 manifold "up": gradient-tilted for
+                        // non-Legacy relief, radial otherwise —
+                        // `surface_normal` passes `n_radial` through
+                        // untouched on the Legacy/bare-sphere paths,
+                        // so those solves are bit-identical to the
+                        // pre-§2.1 tick. Computed only once a contact
+                        // exists: the far-above-ground vertex path
+                        // pays one surface sample, not five.
+                        let n_w = self.env.surface_normal(n_radial, eval_s);
                         let ci = self.contacts[i].len();
                         let target_vn = if depth <= 0.0 {
                             depth / PHYSICS_DT
@@ -2396,6 +2532,7 @@ impl SimpleBackend {
         // body, which the linear budget alone leaves unbounded.
         let mut spent = vec![0.0; bodies.len()];
         let mut spent_ang = vec![0.0; bodies.len()];
+        let eval_s = self.time_s.get() + PHYSICS_DT;
         for _ in 0..SOLVER_ITERATIONS {
             for c in constraints {
                 let b = &mut bodies[c.body as usize];
@@ -2406,9 +2543,7 @@ impl SimpleBackend {
                 // generator used — the heightfield at the step's
                 // eval instant (`time_s + dt`), not the bare datum.
                 let depth = if dist > 0.0 {
-                    self.env
-                        .surface_radius(rel / dist, self.time_s.get() + PHYSICS_DT)
-                        - dist
+                    self.env.surface_radius(rel / dist, eval_s) - dist
                 } else {
                     self.env.radius_m - dist
                 };
@@ -2437,7 +2572,15 @@ impl SimpleBackend {
                 spent[c.body as usize] += com_travel(sigma);
                 spent_ang[c.body as usize] += ang_excursion_ground(c, b, sigma);
 
-                let normal = rel / dist;
+                // §2.1: the correction pushes along the SAME manifold
+                // normal the velocity solve used — `surface_normal`
+                // passes the radial direction through on the
+                // Legacy/bare-sphere paths (bit-identical
+                // correction), and tilts with the gradient for
+                // Mountain, so the Baumgarte pass never injects the
+                // up-slope slip a radial push on tilted ground would
+                // add every tick.
+                let normal = self.env.surface_normal(rel / dist, eval_s);
                 let conj = b.rot.conjugate();
                 let n_body = conj.rotate(normal);
                 // CoM-consistent write-back: advance x̄ by the linear
@@ -4191,33 +4334,38 @@ mod tests {
 
     // ---- R2: the seeded heightfield IS the contact surface ----
 
-    /// §5.2-R2's slope survey (M5, terrain overhaul Phase 1b): the
-    /// Mountain spectrum's land-slope distribution, measured on the
-    /// analytic height function (NOT a bake — the survey must stay
-    /// cheap) × seeds {0, 601} at TWO scales:
+    /// §5.2-R2's slope survey (M5, terrain overhaul Phase 1b),
+    /// re-derived for §2.1: the Mountain spectrum's land-slope
+    /// distribution, measured on the analytic height function (NOT a
+    /// bake — the survey must stay cheap) × seeds {0, 601} at TWO
+    /// scales:
     ///
     /// - **macro** 96×48 (~39 km spacing at Terrin): the
     ///   continent-scale gradient — the C12-F2-class bound legacy
     ///   carries.
     /// - **ridge** 512×256 (~7.4 km spacing): resolves the Mountain
-    ///   spectrum's ×28 ridge octaves (~21 km wavelength at Terrin's
-    ///   radius) — the contact-scale slopes the normal-model decision
-    ///   reads; the macro grid aliases exactly that detail.
+    ///   spectrum's ridge octaves — the contact-scale slopes the §2.1
+    ///   gradient contact normals tilt with; the macro grid aliases
+    ///   exactly that detail.
     ///
     /// Per cell pair the slope is `|Δh|·amplitude_m / arc` between the
     /// two sample directions (east pairs wrap longitude, north pairs
     /// stop at the last row); land cells only, land read as
     /// `h > 0` — the above-datum notion, the survey's stand-in for
     /// `height_normalized`'s private smoothstep continents mask. The
-    /// RIDGE p99 at `amplitude_frac = 0.006` (Terrin's planned M5
-    /// authoring) is the datum the contact-normal model decision
-    /// rests on (module doc, §5.2-R2): gradient normals are warranted
-    /// iff it clears tan(12°), and the survey ASSERTS the incumbent
-    /// bound so a future Mountain-spectrum edit that steepens ridges
-    /// fails here instead of silently invalidating the radial-normal
-    /// assumption. The remaining assertions are the cheap invariants
-    /// — finite, populated, monotone percentiles; the numbers are
-    /// printed for `--nocapture`.
+    /// RIDGE p99/max at `amplitude_frac = 0.006` (Terrin's planned
+    /// authoring) carry the §2.1 warrant: the OLD radial-normal cap
+    /// (p99 < tan 12°) is GONE — manifold normals now follow the
+    /// heightfield gradient, whose validity does not depend on slope
+    /// — and what the asserts guard instead is SPECTRUM DRIFT: the
+    /// band [0.30, 0.50] on p99 (§2.1 pin: 0.3618) and the 0.80
+    /// ceiling on max (§2.1 pin: 0.7415) catch a Mountain retune that
+    /// quietly reshapes the steep-slope band — and with it the
+    /// friction-slide statistics the module doc's honest corollary
+    /// and the midslope settle warrant rest on. The remaining
+    /// assertions are the cheap invariants — finite, populated,
+    /// monotone percentiles; the numbers are printed for
+    /// `--nocapture`.
     #[test]
     fn mountain_land_slope_distribution() {
         for (rows, cols) in [(48usize, 96usize), (256usize, 512usize)] {
@@ -4296,20 +4444,32 @@ mod tests {
                     p50 <= p95 && p95 <= p99 && p99 <= max,
                     "percentiles not monotone"
                 );
-                // The radial-normal warrant datum (module doc, §5.2-R2):
-                // ridge-scale Mountain p99 at the planned authored
-                // amplitude 0.006 must stay under tan(12°) ≈ 0.2126 —
-                // the threshold past which the contact model's radial
-                // "up" needs replacing with height-gradient normals. A
-                // Mountain-spectrum edit that steepens ridges fails
-                // HERE, not silently in the contact solver.
+                // The §2.1 spectrum-drift tripwire (module doc):
+                // gradient contact normals removed the radial cap —
+                // the manifold normal follows the heightfield
+                // gradient, whose VALIDITY does not depend on slope
+                // (finite differences of the sampled field work at
+                // any tilt). What still needs pinning is the SPECTRUM:
+                // ridge-scale p99 at the planned authored amplitude
+                // 0.006 must stay inside [0.30, 0.50] (§2.1 pin
+                // 0.3618) and the max under 0.80 (§2.1 pin 0.7415) —
+                // a Mountain edit that quietly steepens or flattens
+                // the contact-scale band fails HERE, not silently in
+                // the friction-slide statistics or the settle tests.
                 if (rows, cols) == (256, 512) && is_warrant_amplitude {
                     assert!(
-                        p99 < 0.2126,
+                        (0.30..=0.50).contains(&p99),
                         "ridge-scale Mountain p99 at amplitude_frac 0.006 is {p99:.4} — \
-                         exceeds the radial-normal warrant tan(12°) ≈ 0.2126; either \
-                         retune the spectrum or implement gradient contact normals \
-                         (module doc, §5.2-R2)"
+                         outside the §2.1 spectrum band [0.30, 0.50] (pin: 0.3618); \
+                         retune the spectrum or re-derive the survey band with it \
+                         (module doc, §5.2-R2/§2.1)"
+                    );
+                    assert!(
+                        max <= 0.80,
+                        "ridge-scale Mountain max tan at amplitude_frac 0.006 is {max:.4} — \
+                         exceeds the §2.1 band ceiling 0.80 (pin: 0.7415); the \
+                         friction-slide corollary and the midslope settle warrant \
+                         were derived against the pinned tail"
                     );
                 }
             }
@@ -4588,8 +4748,10 @@ mod tests {
     /// [`dropped_box_rests_on_terrain_not_datum`] (§5.2-R2, M5): a
     /// box dropped on the sharper spectrum at Terrin's planned
     /// authored amplitude (`0.006·R`) latches and rests ON the
-    /// displaced field — the radial-normal contact model (this
-    /// phase's measured decision; module doc) still settles it.
+    /// displaced field — under the §2.1 gradient contact normals the
+    /// flattest site's gradient is ≈ 0, so the normal is ≈ radial
+    /// and the latch is a property of the contact model, not of the
+    /// normal switch (the midslope twin below exercises real tilt).
     /// Landing site: the flattest genuinely-land direction in a
     /// fixed 64-dir scan (slope by finite differences on the same
     /// `sample_dir` the solver sees, land read as above-datum), so
@@ -4674,6 +4836,371 @@ mod tests {
             lo_terrain.abs() < 0.5,
             "resting box floats/sinks {lo_terrain} m vs the mountain surface \
              (latched at tick {tick}, site slope {best_slope:.4})"
+        );
+    }
+
+    // ---- §2.1: gradient contact normals ----
+
+    /// §2.1's flat-ground limit: on a constant field every bilinear
+    /// sample returns the constant exactly, both stencil differences
+    /// are exactly `0.0`, and the composition collapses to `dir` —
+    /// the radial up the Legacy manifold uses. Bit tolerance: the
+    /// arithmetic provably introduces no drift (`g ≡ 0`), and the
+    /// spin-phase conjugate cancels by construction (the same unspin
+    /// both ways, so a flat field is flat in every frame).
+    #[test]
+    fn gradient_normal_flat_field_is_radial() {
+        let field = HeightField {
+            width: 128,
+            height: 64,
+            data: vec![0.37f32; 128 * 64],
+            key: 0,
+        };
+        let mut env = terrin_env();
+        env.terrain = Some(TerrainSurface::with_field(
+            field,
+            7,
+            3_600.0,
+            ReliefProfile::Mountain,
+        ));
+        for dir in [
+            DVec3::X,
+            DVec3::new(0.6, 0.8, 0.0),
+            DVec3::new(0.115, 0.278, -0.954),
+            DVec3::new(-0.57, 0.57, 0.59),
+        ] {
+            let dir = dir / dir.norm();
+            let n = env.surface_normal(dir, 0.0);
+            assert!(
+                (n - dir).norm() < 1e-15,
+                "flat field must reproduce the radial up: {n:?} vs {dir:?}"
+            );
+        }
+        // The spin conjugate cancels at any phase.
+        env.body_spin = DVec3::Z * (2.0 * core::f64::consts::PI / 21_600.0);
+        let d = DVec3::new(0.6, 0.8, 0.0);
+        let dir = d / d.norm();
+        for seconds in [0.0, 1234.5] {
+            let n = env.surface_normal(dir, seconds);
+            assert!(
+                (n - dir).norm() < 1e-15,
+                "spinning flat field drifted at t={seconds}: {n:?}"
+            );
+        }
+    }
+
+    /// §2.1's analytic-tilt pin: a field whose sample is EXACTLY
+    /// linear in longitude — texel values `(i + ½)·2⁻⁸` are
+    /// f32-exact knots and bilinear interpolation reproduces the
+    /// ramp through them with no representation error — so the
+    /// gradient normal must match the analytic tilt well inside
+    /// 1e-6: `h(lon) = k·(lon + π)` with `k = c·w/(2π)`, east
+    /// gradient `A·k·β/(eps·R)` over the stencil's exact secant
+    /// (`β = atan2(sin eps, cos(lat)·cos eps)` — longitude runs
+    /// non-uniformly along the east great circle), north gradient
+    /// exactly 0 (meridians hold longitude). The probe sits at
+    /// lat 45° so a missing cos(lat) factor fails by ~9e-3, not
+    /// ~1e-16.
+    #[test]
+    fn gradient_normal_matches_analytic_ramp() {
+        let (w, h) = (1024u32, 512u32);
+        let c = 0.003_906_25f64; // 2⁻⁸ — f32-exact knot spacing
+        let field = HeightField {
+            width: w,
+            height: h,
+            data: (0..(w * h) as usize)
+                .map(|idx| (((idx % w as usize) as f64 + 0.5) * c) as f32)
+                .collect(),
+            key: 0,
+        };
+        let amplitude = 24_000.0; // A/R = 0.04 — synthetic, makes the tilt readable
+        let mut env = terrin_env();
+        env.terrain = Some(TerrainSurface::with_field(
+            field,
+            7,
+            amplitude,
+            ReliefProfile::Mountain,
+        ));
+        let lat = core::f64::consts::FRAC_PI_4;
+        let lon = 0.6;
+        let dir = DVec3::new(
+            libm::cos(lat) * libm::cos(lon),
+            libm::cos(lat) * libm::sin(lon),
+            libm::sin(lat),
+        );
+        let n = env.surface_normal(dir, 0.0);
+        // Analytic composition under the same planar formula the
+        // implementation uses (`gradient_normal_fixed`'s doc) — with
+        // the stencil's EXACT secant geometry: the two east samples
+        // sit at polar angle ±`eps` (the implementation's 2-texel
+        // offset of this 512-row field), whose longitudes are
+        // `lon ± β` with `β = atan2(sin eps, cos(lat)·cos eps)` —
+        // longitude runs non-uniformly along the east great circle,
+        // and integrating the tangent rate `1/cos(lat)` instead
+        // would leave an O(eps²·tan²(lat)) mismatch (~5e-5 relative
+        // here, 100× the tolerance).
+        let eps = GRADIENT_NORMAL_FD_TEXELS * core::f64::consts::PI / h as f64;
+        let beta = libm::atan2(libm::sin(eps), libm::cos(lat) * libm::cos(eps));
+        let k = c * w as f64 / (2.0 * core::f64::consts::PI);
+        let g_e = amplitude * k * beta / (eps * TERRIN_R);
+        let east_raw = DVec3::Z.cross(dir);
+        let east = east_raw / east_raw.norm();
+        let expected = dir - east * g_e;
+        let expected = expected / expected.norm();
+        assert!(
+            (n - expected).norm() < 1e-6,
+            "ramp normal {n:?} vs analytic {expected:?} (g_e {g_e:.6})"
+        );
+        // Sign: the ramp rises toward +east (increasing longitude),
+        // the normal tilts AWAY from east.
+        assert!(n.dot(east) < 0.0, "normal tilted uphill: {n:?}");
+    }
+
+    /// The ε curve that documents the stencil choice
+    /// ([`GRADIENT_NORMAL_FD_TEXELS`]): on a quadratic bowl baked
+    /// through the seam — texel knots of a smooth (lat,lon)
+    /// parabola, sampled bilinearly, the production field's exact
+    /// representation class — the central difference's error vs the
+    /// analytic normal traces the U the ε choice balances: a
+    /// sub-texel stencil reads one cell's secant and carries the
+    /// O(texel·h″) interpolation error, a 1–2-texel stencil averages
+    /// across the C0 creases into the curve's floor, and past that
+    /// the ε² secant-truncation of the curved path grows it again.
+    /// The asserts pin the U's shape: the production 2-texel offset
+    /// sits on the floor (well below the sub-texel reading) and
+    /// below the 4-texel upturn. Cheap curve check, not a precision
+    /// pin; printed for `--nocapture`.
+    #[test]
+    fn gradient_normal_eps_curve_on_bowl() {
+        let (w, h) = (512u32, 256u32);
+        let (lat0, lon0, q) = (0.1f64, -0.2f64, 0.2f64);
+        let height =
+            |lat: f64, lon: f64| -q * ((lat - lat0) * (lat - lat0) + (lon - lon0) * (lon - lon0));
+        let mut data = Vec::with_capacity((w * h) as usize);
+        for j in 0..h {
+            let lat =
+                -core::f64::consts::FRAC_PI_2 + core::f64::consts::PI * (j as f64 + 0.5) / h as f64;
+            for i in 0..w {
+                let lon = -core::f64::consts::PI
+                    + 2.0 * core::f64::consts::PI * (i as f64 + 0.5) / w as f64;
+                data.push(height(lat, lon) as f32);
+            }
+        }
+        let field = HeightField {
+            width: w,
+            height: h,
+            data,
+            key: 0,
+        };
+        let amplitude = 30_000.0; // exaggerates the gradient for the read
+        let mut env = terrin_env();
+        env.terrain = Some(TerrainSurface::with_field(
+            field,
+            7,
+            amplitude,
+            ReliefProfile::Mountain,
+        ));
+        let t = env.terrain.as_ref().unwrap();
+        // Probe off the bowl floor with nonzero gradient on both
+        // axes, positioned ~0.45 texels into its u-cell (near a
+        // knot edge, where the sub-texel stencil's secant error is
+        // near its cell-maximum).
+        let lon_p = -core::f64::consts::PI + 2.0 * core::f64::consts::PI * 100.95 / w as f64;
+        let lat_p = 0.3;
+        let dir = DVec3::new(
+            libm::cos(lat_p) * libm::cos(lon_p),
+            libm::cos(lat_p) * libm::sin(lon_p),
+            libm::sin(lat_p),
+        );
+        // Analytic gradient of the bowl at the probe (chain rule:
+        // lon rate 1/cos(lat) per radian of east arc).
+        let g_n = amplitude * (-2.0 * q * (lat_p - lat0)) / TERRIN_R;
+        let g_e = amplitude * (-2.0 * q * (lon_p - lon0)) / (TERRIN_R * libm::cos(lat_p));
+        let east_raw = DVec3::Z.cross(dir);
+        let east = east_raw / east_raw.norm();
+        let north = dir.cross(east);
+        let expected = dir - east * g_e - north * g_n;
+        let expected = expected / expected.norm();
+        // Sweep the stencil offset in latitude-texel units; the
+        // production value sits in the middle of the sweep.
+        let texel = core::f64::consts::PI / h as f64;
+        let mut errs = Vec::new();
+        for texels in [0.5f64, 1.0, 2.0, 4.0] {
+            let n = gradient_normal_fixed(t, TERRIN_R, dir, texels * texel);
+            let err = (n - expected).norm();
+            println!("bowl normal error @ {texels:.1} texels: {err:.3e}");
+            errs.push(err);
+        }
+        // The U's shape: fall from the sub-texel stencil into the
+        // floor, production offset ON the floor, 4 texels past the
+        // upturn.
+        assert!(
+            errs[1] < errs[0],
+            "error must fall off the sub-texel stencil: {errs:?}"
+        );
+        assert!(
+            errs[2] < 0.5 * errs[0],
+            "the production 2-texel stencil must sit on the curve's floor: {errs:?}"
+        );
+        assert!(
+            errs[2] < errs[3],
+            "wider stencils are past the truncation upturn: {errs:?}"
+        );
+    }
+
+    /// §2.1's midslope settle warrant: a box dropped on a Mountain
+    /// MIDSLOPE site — measured slope in the 10–13° band, real tilt
+    /// next to the flattest twin's site, comfortably below the
+    /// μ = 0.5 friction angle 26.57° — must latch and rest ON the
+    /// displaced surface without sliding away from the drop site:
+    /// the gradient normal + Coulomb cone doing the holding.
+    ///
+    /// The seam field bakes at 1024×512 — half the production
+    /// Mountain grid — so the contact stencil (±2 latitude texels ≈
+    /// 14.7 km of arc at Terrin) reads RIDGE-scale relief, where the
+    /// §2.1 spectrum's 10–13° band actually lives (the flattest twin's
+    /// 128×64 field resolves only ~30 km-scale relief, whose slopes
+    /// top out near 9° — midslope sites do not exist there). The
+    /// band's upper end is the honest physics of the §2.6.4 pose
+    /// gate, not a normal-model limit: per tick gravity injects
+    /// `g·sinθ·dt²` of downslope drift (0.42 mm at 10°, 0.83 mm at
+    /// 20°) against the latch's `settle_v·dt` ≈ 0.78 mm pose-delta
+    /// gate — a 20° slope rests-and-creeps just above the gate
+    /// rather than latching.
+    /// The midslope test's site selector — the land direction on the
+    /// slope survey's own 96×48 grid (full sphere: the band is a thin
+    /// tail of land pairs, so a partial band like the flattest twin's
+    /// z-stripes can simply miss them) whose measured slope is
+    /// nearest `target` inside `[lo, hi]`. Measured by central pair
+    /// differences on `surface_radius` at stencil offset `eps` — the
+    /// SAME scale `surface_normal` samples, computed independently of
+    /// the normal under test.
+    fn midslope_site(
+        env: &Environment,
+        amp: f64,
+        eps: f64,
+        lo: f64,
+        hi: f64,
+        target: f64,
+    ) -> Option<(DVec3, f64)> {
+        let h_m = |d: DVec3| env.surface_radius(d, 0.0) - env.radius_m;
+        let arc = 2.0 * eps * env.radius_m;
+        let probe_slope = |d: DVec3| -> f64 {
+            let east_raw = DVec3::Z.cross(d);
+            let east = east_raw / east_raw.norm();
+            let north = d.cross(east);
+            let g_e = (h_m((d + east * eps) / (d + east * eps).norm())
+                - h_m((d - east * eps) / (d - east * eps).norm()))
+                / arc;
+            let g_n = (h_m((d + north * eps) / (d + north * eps).norm())
+                - h_m((d - north * eps) / (d - north * eps).norm()))
+                / arc;
+            libm::sqrt(g_e * g_e + g_n * g_n)
+        };
+        let mut best: Option<(DVec3, f64)> = None;
+        for j in 0..48u32 {
+            let lat =
+                -core::f64::consts::FRAC_PI_2 + core::f64::consts::PI * (j as f64 + 0.5) / 48.0;
+            let (sl, cl) = (libm::sin(lat), libm::cos(lat));
+            for i in 0..96u32 {
+                let lon =
+                    -core::f64::consts::PI + 2.0 * core::f64::consts::PI * (i as f64 + 0.5) / 96.0;
+                let d = DVec3::new(cl * libm::cos(lon), cl * libm::sin(lon), sl);
+                // Land with real clearance, like the twin.
+                if h_m(d) <= 0.05 * amp {
+                    continue;
+                }
+                let slope = probe_slope(d);
+                if (lo..=hi).contains(&slope)
+                    && best.is_none_or(|(_, s): (DVec3, f64)| {
+                        (slope - target).abs() < (s - target).abs()
+                    })
+                {
+                    best = Some((d, slope));
+                }
+            }
+        }
+        best
+    }
+
+    #[test]
+    fn dropped_box_settles_on_mountain_midslope() {
+        let seed = 601u64;
+        let amp = TERRIN_R * 0.006; // the §2.1 authoring
+        let field = small_profiled_field(seed, ReliefProfile::Mountain, 1024, 512);
+        let mut env = terrin_env();
+        env.terrain = Some(TerrainSurface::with_field(
+            field,
+            seed,
+            amp,
+            ReliefProfile::Mountain,
+        ));
+        env.settle_ticks = 32;
+        let deg = |x: f64| x * core::f64::consts::PI / 180.0;
+        let (dir, slope) = midslope_site(
+            &env,
+            amp,
+            2.0 * core::f64::consts::PI / 512.0, // the impl's offset on this field
+            libm::tan(deg(10.0)),
+            libm::tan(deg(13.0)),
+            libm::tan(deg(11.5)),
+        )
+        .expect("no 10–13° midslope land site in the scan band");
+        println!(
+            "midslope site: dir {dir:?} (lat {:.2}° lon {:.2}°), measured slope tan {slope:.4} \
+             ({:.2}°)",
+            libm::asin(dir.z).to_degrees(),
+            libm::atan2(dir.y, dir.x).to_degrees(),
+            libm::atan(slope).to_degrees()
+        );
+        let mut backend = SimpleBackend::new(env.clone());
+        let surf_r = env.surface_radius(dir, 0.0);
+        let mut b = box_body(1_000.0, DVec3::new(0.5, 0.5, 0.5));
+        b.pos = dir * (surf_r + 3.0); // belly ~2.5 m over the surface
+        let mut bodies = vec![b];
+        let mut latched_at = None;
+        for tick in 0..8_192 {
+            backend.step(&mut bodies, &[]);
+            if bodies[0].settle.latched {
+                latched_at = Some(tick);
+                break;
+            }
+        }
+        let tick = latched_at.expect("dropped box never latched on the midslope");
+        let b = &bodies[0];
+        // Rests ON the displaced surface — the twin's radial-clearance
+        // read (each collider vertex vs the surface under its own
+        // direction).
+        let lo_terrain = b
+            .collider
+            .hulls
+            .iter()
+            .flat_map(|hull| hull.vertices.iter().copied())
+            .map(|v| {
+                let rel = b.pos + b.rot.rotate(v) - env.body_center;
+                let d = rel.norm();
+                d - env.surface_radius(rel / d, 0.0)
+            })
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            lo_terrain.abs() < 0.5,
+            "resting box floats/sinks {lo_terrain} m vs the midslope surface \
+             (tick {tick}, slope tan {slope:.4})"
+        );
+        // No slide: the rest site stays within 50 m of arc of the
+        // drop site — sub-friction-cone slopes hold position through
+        // the impact; the settle creep is sub-millimetre per tick.
+        let rest = b.com_world();
+        let rest_dir = rest / rest.norm();
+        let drift = libm::acos(dir.dot(rest_dir).clamp(-1.0, 1.0)) * TERRIN_R;
+        println!(
+            "midslope settle: latched at tick {tick}, drifted {drift:.2} m of arc \
+             (slope tan {slope:.4}, {:.2}°)",
+            libm::atan(slope).to_degrees()
+        );
+        assert!(
+            drift < 50.0,
+            "box slid {drift:.1} m down the {slope:.3}-tan midslope"
         );
     }
 
