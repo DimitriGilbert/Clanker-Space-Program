@@ -479,7 +479,8 @@ mod tests {
     /// header — native must carry the 1024² pack, the wasm demo the
     /// 512² web pack (§6.3 "reduced textures"; 2^k squares have
     /// k+1 mip levels). The native arm runs in CI; the wasm arm is
-    /// the compile-checked mirror for the wasm target.
+    /// the mirror assertion for the wasm target (verified indirectly
+    /// by the pack-shape tests).
     #[test]
     fn embedded_terrain_pack_is_target_sized() {
         let entries = decode(TERRAIN).expect("embedded terrain pack decode");

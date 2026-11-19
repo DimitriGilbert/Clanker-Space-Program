@@ -1008,7 +1008,10 @@ fn dump_low() {
 /// Determinism: `until_real_terrain` polls on IDLE frames and
 /// `DUMP_TIME=<seconds>` pins the capture clock on top of the fixed
 /// spawn stepping — the sun at capture is knob-controlled, never
-/// bake-wall-time (the 3b vision-check failure mode).
+/// bake-wall-time (the 3b vision-check failure mode). The flagship
+/// craft-shadow pair intentionally shares the pinned camera
+/// (`flight_craftshadow` and `flight` render the same pinned frame —
+/// the duplication is the determinism contract, not a bug).
 /// `cargo test -p csp-view --test render_gate dump_flight -- --ignored`.
 #[test]
 #[ignore]

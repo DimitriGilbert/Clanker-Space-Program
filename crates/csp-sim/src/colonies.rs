@@ -3570,7 +3570,7 @@ mod tests {
         let mut fx = home_rask();
         // A dusk-anchored clone of the authored site: h0 ≈ π/2 + 0.09
         // at lon 4.8 → Night at founding with the whole ~70 500 s
-        // night ahead (the authored 2.4 rad site saturates its stores
+        // night ahead (the authored 2.42 rad site saturates its stores
         // in the first ~2 ks of a 51.9 ks day and would idle the
         // night away — this pose forces the battery to carry real
         // production through it).

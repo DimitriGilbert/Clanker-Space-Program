@@ -619,25 +619,25 @@ wins).
 | File | Entry points | Renders |
 |---|---|---|
 | `map.wgsl` (48 lines) | `vs_main`/`fs_main` | Unlit map primitives; vertices pre-projected on CPU; fragment shapes quad kind 0 line / 1 disc / 2 ring / 3 glow |
-| `vab.wgsl` (107) | `vs_main`/`fs_main` + pick fragment | Per-pixel-lit editor parts (hemisphere ambient × baked occlusion, key light, Blinn specular, fresnel rim); pick writes the 1-based object id |
+| `vab.wgsl` (111) | `vs_main`/`fs_main` + pick fragment | Per-pixel-lit editor parts (hemisphere ambient × baked occlusion, key light, Blinn specular, fresnel rim); pick writes the 1-based object id |
 | `flight.wgsl` (208) | `vs_main`/`fs_main` | Same per-pixel lighting as VAB minus pick, plus the unlit passthrough (`nrm ≈ 0`); ACES (Narkowicz) tone-map shared with terrain so lit hulls match the ground. Since 3b: the direct-sun terms multiply the cascade `sun_visibility` (a C16-F3 duplication of terrain.wgsl's receive half — no WGSL include mechanism) |
 | `flight_shadow.wgsl` (69) | `vs_shadow0`/`vs_shadow1` (3b craft cast, depth-only) | Drops the flight stream into §7.4's cascade map. A dedicated module on purpose: the cast pipelines ride a minimal group(0) (`SU` alone at binding 8), and sharing flight.wgsl left its `light`/group(1) declarations dangling against that layout, which de-registered the uniform binding on-device (the cast silently discarded — see the file header) |
 | `terrain.wgsl` (1391) | `vs_terrain`/`fs_terrain` (`:414`/`:893`), `vs_sky`/`fs_sky` (`:1132`/`:1263`), `vs_shadow0`/`vs_shadow1` (`:440`/`:448`, depth-only cascade pass; the shared displacement is `terrain_displace`, `:385`) | Quadtree terrain, ocean, and the sky/atmosphere/starfield — see §8; the shadow entry points feed §7.4's cascade map |
 
-All four are parse+validate gated by a unit test
-(`shaders_parse_and_validate`, `csp-render/src/lib.rs:476`) so shader
+All five are parse+validate gated by a unit test
+(`shaders_parse_and_validate`, `csp-render/src/lib.rs:484`) so shader
 regressions die in `cargo test`, not at device init.
 
 ### 7.4 Terrain: quadtree, heightfield, LUT, ocean, biome tint
 
 CPU quadtree over the six cube-sphere faces (`PatchId`, `select_patches`,
-`csp-render/src/terrain.rs:72`/`:163` — split while `dist(eye,node) < K·size`,
+`csp-render/src/terrain.rs:73`/`:164` — split while `dist(eye,node) < K·size`,
 horizon-culled, budget-bounded, BFS-deterministic). All leaves share one
 unit grid mesh (`unit_grid`); the draw is a single instanced call.
 Deepest level 13 ≈ 146 m patches at a 600 km body (M5 §5.2-R2 relief
 density — fine enough to resolve the Mountain bake's ~1.8 km texels).
 Precision: each instance bakes `origin − eye` in f64→f32
-(`patch_instance`, `:454`); residual vertex error ~5 cm at a 600 km body.
+(`patch_instance`, `:458`); residual vertex error ~5 cm at a 600 km body.
 Skirts hide T-junction cracks.
 
 Height source: deterministic seeded lattice value-noise FBM on the unit
@@ -679,7 +679,7 @@ is flight-only. wasm has no threads: the bake runs inline at the first
 `field` poll, so the `None` wait state is unreachable there by
 construction (the demo already pays the one-time startup hitch).
 
-Scattering: `bake_transmittance` (`terrain.rs:573`) CPU-ray-marches the
+Scattering: `bake_transmittance` (`terrain.rs:577`) CPU-ray-marches the
 Bruneton-style T(altitude, μ) LUT (96 steps) for the §3.0 exponential
 atmosphere; the shader consumes it for sky color and terrain aerial
 perspective — the Baseline "precomputed LUTs, analytic single-scatter".
@@ -903,7 +903,7 @@ This landed in `ff897d4`.
 - `structures.rs`: the launch site as real geometry — pad with flame trench,
   gantry, VAB building, crawlerway, propellant farm — anchored to the
   **rendered** terrain height (re-sampled per footprint), emitted into the
-  flight view's lit stream (`emit_launch_complex`, `:781`). `SiteTable`
+  flight view's lit stream (`emit_launch_complex`, `:893`). `SiteTable`
   (`:70`) is a data-derived constant from `sites.ron`.
 
 ### 7.7 Presentation floor (M4c) inventory — with anchors

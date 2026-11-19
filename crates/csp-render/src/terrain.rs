@@ -403,10 +403,11 @@ pub struct TerrainTex {
 }
 
 /// The real-asset set for the surface pass — decoded from
-/// `data/art/terrain.csar` by `csp-view` (see `assets/ASSETS.md` for
-/// provenance). All three members ride one upload key: the pack is
-/// all-or-nothing. The night sky is procedural (`fs_sky`'s shell-lattice
-/// starfield) — no star texture ships.
+/// `data/art/terrain.csar` (native; wasm ships `terrain_web.csar`)
+/// by `csp-view` (see `assets/ASSETS.md` for provenance). All three
+/// members ride one upload key: the pack is all-or-nothing. The night
+/// sky is procedural (`fs_sky`'s shell-lattice starfield) — no star
+/// texture ships.
 #[derive(Debug)]
 pub struct TerrainArt {
     /// Class albedo array — layers `[grass, rock, sand, snow]`.

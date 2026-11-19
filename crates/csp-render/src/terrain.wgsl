@@ -169,7 +169,7 @@ fn vnoise3(p: vec3<f32>) -> f32 {
 // evaluation never leaves the cell it should — and because the
 // coordinate depends on NOTHING but the body-fixed direction, there is
 // no anchor that could shift on a quadtree re-split. Never pass a
-// freq above ~24k: finer octaves must come from the filtered textures.
+// freq above ~16000: finer octaves must come from the filtered textures.
 fn vnoise3w(d: vec3<f32>, freq: f32) -> f32 {
     return vnoise3(d * freq);
 }
@@ -473,7 +473,7 @@ fn terrain_normal_fix(dir_fix: vec3<f32>, b: Basis) -> vec3<f32> {
 // ~R/freq metres. Each octave fades with view distance before it can
 // sub-pixel shimmer. This is what stops the surface reading as a
 // smooth smudge at chase-camera range: the baked heightfield carries
-// nothing below ~4 km texels. ALL octaves stay at freq ≤ ~24k so the
+// nothing below ~4 km texels. ALL octaves stay at freq ≤ ~16000 so the
 // direct `vnoise3w` lattice sample is bit-stable (see STABILITY);
 // finer grain comes from the filtered normal-map detail instead.
 // The far+mid octaves. These feed BOTH the lighting normal and the
@@ -1010,7 +1010,7 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
         let slope = 1.0 - clamp(dot(n_fix, dir_fix), 0.0, 1.0);
         // Albedo grain — the same near-field banding as the bump:
         // large patches mottle, close-ups get a finer octave. Every
-        // freq stays ≤ ~24k so the direct lattice sample is bit-stable
+        // freq stays ≤ ~16000 so the direct lattice sample is bit-stable
         // (see STABILITY) — finer speckle lives in the filtered detail
         // textures, not in point-sampled hash noise.
         let f_near = clamp(1.0 - dist / 1.5e4, 0.0, 1.0);

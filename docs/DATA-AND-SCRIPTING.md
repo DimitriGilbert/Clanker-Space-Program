@@ -24,7 +24,7 @@ root; `cargo xtask …` is NOT an alias — always `cargo run -p xtask -- …`.
 | `data/recipes/<id>.ron` | Colony converter recipes — 3 files | `RecipeDef` (`recipe.rs`), v1 | `load_recipes` |
 | `data/experiments/<id>.ron` | Experiment kinds (caps, transmit ratio) — 1 file (`exp.materials_study`) | `ExperimentDef` (`experiment.rs`), v1 | `load_experiments` |
 | `data/systems/<sys>/system.ron` | System manifest: `id`, `star`, `bodies[]` | `SystemDef` (`system.rs`), `SCHEMA_VERSION = 1` | `load_system` |
-| `data/systems/<sys>/<body>/body.ron` | One celestial body per manifest entry (solen/terrin/rask/duva) | `BodyDef` (`system.rs`), v1 | `load_system` |
+| `data/systems/<sys>/<body>/body.ron` | One celestial body per manifest entry (solen/terrin/rask/duva) | `BodyDef` (`system.rs`), `BODY_SCHEMA_VERSION = 2` (v2, M5 §5.2-R2: `terrain.amplitude_frac`/`relief`; v1 still loads with legacy defaults) | `load_system` |
 | `data/systems/<sys>/<body>/biomes.ron` | Biome legend (palette index → biome id) | `BiomeLegend` (`biome.rs`), v1 | `load_system` |
 | `data/systems/<sys>/<body>/biomes.png` | Palette-indexed equirect biome map (256×128) — indexed by `BodyDef::biome_map` | header-inspected (`biome.rs::inspect_indexed_png`) | `load_system` |
 | `data/systems/<sys>/sites.ron` | Surface sites: pads, recovery sites, mineable yields, **starting stockpile** | `SiteFile`/`SiteDef` (`site.rs`), `SITE_SCHEMA_VERSION = 3` | `load_sites` |
@@ -155,8 +155,10 @@ lines, includes a `Parachute` module); an engine example: `csp.engine.sparc.ron`
 validator checks against `2π√(a³/μ_parent)` to 1e-9 — `PERIOD_REL_TOL`), `atmosphere:
 Option<AtmosphereDef>` (exponential `p0·exp(−h/H)` to a hard cut at `top_m`, plus a
 piecewise-linear temperature table), `ocean: Option<{datum_radius_m}>`, `terrain:
-{noise_seed, heightmap}`, `biome_map: Option<{png, legend}>`, `surface_resources`
-(empty in v1 — schema-only), `insolation_w_m2`.
+{noise_seed, heightmap, amplitude_frac, relief}` (v2: the M5 §5.2-R2 authored
+amplitude `radius_m·amplitude_frac` and `ReliefProfile` — Legacy/Mountain, with
+serde defaults so v1 files load unchanged), `biome_map: Option<{png, legend}>`,
+`surface_resources` (empty in v2 — schema-only), `insolation_w_m2`.
 
 `biomes.ron` (`BiomeLegend`): `entries: [{index: u8, id: BiomeId, name: LocKey}]`.
 The paired PNG must be an 8-bit-palette equirect ≤2048×1024 (validator), every painted
