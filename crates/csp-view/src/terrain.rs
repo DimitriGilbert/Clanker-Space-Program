@@ -73,8 +73,9 @@ pub struct TerrainConfig {
     pub bodies: BTreeMap<String, TerrainBody>,
     /// LOD selection tunables.
     pub lod: rt::LodConfig,
-    /// The real-art texture set (decoded `data/art/terrain.csar`) —
-    /// `None` keeps the procedural fallback shading.
+    /// The real-art texture set (decoded from the cfg-selected terrain
+    /// pack — `data/art/terrain.csar` native, `terrain_web.csar` wasm)
+    /// — `None` keeps the procedural fallback shading.
     pub art: Option<Arc<rt::TerrainArt>>,
 }
 

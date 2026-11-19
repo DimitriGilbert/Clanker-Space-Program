@@ -824,7 +824,17 @@ This landed in `ff897d4`.
   `xtask bake_art`; format documented in the module doc) embedded with
   `include_bytes!`, decoded once into `ArtAssets`; any decode failure
   degrades to the procedural kitbash. Part models emit through
-  `part_mesh::emit_model`.
+  `part_mesh::emit_model`. Terrain is a cfg-selected pair of packs:
+  native embeds `terrain.csar` at **1024²** (the ambientCG sources at
+  full 1K resolution — identity decode, no resampler in the bake), the
+  §6.3 wasm demo embeds `terrain_web.csar` at **512²** ("reduced
+  textures", Lanczos downscale); the two statics are `#[cfg]`-gated so
+  each binary carries exactly one. Every consumer downstream is
+  dims-driven from the CSAR header — upload sizing (`write_art_tex`),
+  `class_means` normalization, and `terrain.wgsl`'s world-space tile
+  scales — nothing hardcodes the texel size. GPU cost: 1024² RGBA8 ×
+  (4 albedo + 4 normal + 1 water) layers = 36 MiB at level 0, ≈48 MiB
+  with full mip chains (native), vs 9 / 12 MiB for the 512² web pack.
 - `structures.rs`: the launch site as real geometry — pad with flame trench,
   gantry, VAB building, crawlerway, propellant farm — anchored to the
   **rendered** terrain height (re-sampled per footprint), emitted into the

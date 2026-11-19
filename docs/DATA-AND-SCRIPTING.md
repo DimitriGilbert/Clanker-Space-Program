@@ -35,7 +35,7 @@ root; `cargo xtask …` is NOT an alias — always `cargo run -p xtask -- …`.
 | `data/loc/en.ron` | English string table every `LocKey` resolves against | `LocFile` (`loc.rs`), v1 | `load_loc` |
 | `data/eval-scenarios/*.ron` | 5 `csp-eval` scenario files (§5.8) | `csp_bench::scenario` types | csp-eval bin |
 | `data/test-fixtures/<scenario>/` | Frozen golden-replay data sets + artifacts (§2) | — | csp-bench |
-| `data/art/*.csar` | Baked art packs (`parts.csar`, `terrain.csar`); excluded from the data-set hash | `.csar` format (`xtask/src/bin/bake_art.rs`) | bake-time output |
+| `data/art/*.csar` | Baked art packs (`parts.csar`, `terrain.csar` 1024² native, `terrain_web.csar` 512² web); excluded from the data-set hash | `.csar` format (`xtask/src/bin/bake_art.rs`) | bake-time output |
 | `data/ATTRIBUTION.md`, `data/LICENSE` | Asset license manifest (`path \| source \| license \| url` lines; `xtask lint-attribution`) | — | — |
 
 Registries (`parts/`, `contracts/`, `recipes/`, `experiments/`, `techtree/`) are

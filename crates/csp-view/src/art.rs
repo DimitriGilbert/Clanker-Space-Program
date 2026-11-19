@@ -4,7 +4,10 @@
 //!
 //! The packs are embedded via `include_bytes!` so native and the §6.3
 //! wasm demo share one code path — this is *loading* real authored
-//! assets (models + PBR textures), not runtime noise synthesis. Any
+//! assets (models + PBR textures), not runtime noise synthesis. The
+//! terrain pair is cfg-selected: native embeds `terrain.csar` at
+//! 1024² (full 1K source resolution), wasm embeds `terrain_web.csar`
+//! at 512² (§6.3 "reduced textures"); `parts.csar` is shared. Any
 //! decode failure degrades gracefully to the procedural fallback:
 //! parts keep their kitbash lathes, the surface keeps its noise detail
 //! (the `uniforms.art.x` flag stays 0).
@@ -85,7 +88,16 @@ impl ArtAssets {
 }
 
 const PARTS: &[u8] = include_bytes!("../../../data/art/parts.csar");
+
+// Terrain pack selection: native embeds the 1024² pack (the ambientCG
+// sources at full 1K resolution), the §6.3 wasm demo embeds the 512²
+// "reduced textures" web pack (PLAN §6.3). Two cfg-gated statics —
+// exactly one pack per binary; including both would bloat the wasm
+// demo by the ~27 MB native pack.
+#[cfg(not(target_arch = "wasm32"))]
 const TERRAIN: &[u8] = include_bytes!("../../../data/art/terrain.csar");
+#[cfg(target_arch = "wasm32")]
+const TERRAIN: &[u8] = include_bytes!("../../../data/art/terrain_web.csar");
 
 /// Decode both packs into the catalog. Silent on success; on a bad
 /// pack the affected assets are dropped (log + fallback), never fatal
@@ -117,7 +129,7 @@ pub fn load() -> ArtAssets {
             }
             inner.terrain = t.finish();
         }
-        Err(e) => log::warn!("art: terrain.csar decode failed ({e}) — procedural fallback"),
+        Err(e) => log::warn!("art: terrain pack decode failed ({e}) — procedural fallback"),
     }
     ArtAssets(Arc::new(inner))
 }
@@ -461,6 +473,77 @@ mod tests {
         let t = art.0.terrain.as_ref().unwrap();
         assert_eq!(t.albedo.layers, 4);
         assert!(t.water.mips > 4);
+    }
+
+    /// The pack THIS target embeds declares its texel size in the CSAR
+    /// header — native must carry the 1024² pack, the wasm demo the
+    /// 512² web pack (§6.3 "reduced textures"; 2^k squares have
+    /// k+1 mip levels). The native arm runs in CI; the wasm arm is
+    /// the compile-checked mirror for the wasm target.
+    #[test]
+    fn embedded_terrain_pack_is_target_sized() {
+        let entries = decode(TERRAIN).expect("embedded terrain pack decode");
+        let tex = |name: &str| {
+            entries
+                .iter()
+                .find_map(|(n, e)| match (n.as_str(), e) {
+                    (n, Entry::Image(t)) if n == name => Some(t),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("terrain pack: missing entry {name}"))
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        assert_eq!(
+            (tex("albedo").w, tex("albedo").h, tex("albedo").mips),
+            (1024, 1024, 11)
+        );
+        #[cfg(target_arch = "wasm32")]
+        assert_eq!(
+            (tex("albedo").w, tex("albedo").h, tex("albedo").mips),
+            (512, 512, 10)
+        );
+    }
+
+    /// Both committed terrain packs decode with the right shape,
+    /// read from disk so the test covers each pack regardless of
+    /// which static this target embeds: `terrain.csar` 1024² (full 1K
+    /// ambientCG source resolution), `terrain_web.csar` 512² (the
+    /// §6.3 web tier). Water rides its pack's texel size as a single
+    /// layer.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn terrain_pack_shapes() {
+        let art = crate::data_root().join("art");
+        for (file, texels, mips) in [
+            ("terrain.csar", 1024u32, 11u32),
+            ("terrain_web.csar", 512, 10),
+        ] {
+            let bytes = std::fs::read(art.join(file)).expect("committed terrain pack");
+            let entries = decode(&bytes).expect("terrain pack decode");
+            let tex = |name: &str| {
+                entries
+                    .iter()
+                    .find_map(|(n, e)| match (n.as_str(), e) {
+                        (n, Entry::Image(t)) if n == name => Some(t),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("{file}: missing entry {name}"))
+            };
+            for name in ["albedo", "normal"] {
+                let t = tex(name);
+                assert_eq!(
+                    (t.w, t.h, t.layers, t.mips),
+                    (texels, texels, 4, mips),
+                    "{file}:{name}"
+                );
+            }
+            let w = tex("water_nrm");
+            assert_eq!(
+                (w.w, w.h, w.layers, w.mips),
+                (texels, texels, 1, mips),
+                "{file}:water_nrm"
+            );
+        }
     }
 
     /// C20-F1: every shipped catalog part resolves the SAME baked

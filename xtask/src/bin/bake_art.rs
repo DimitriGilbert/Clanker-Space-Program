@@ -13,7 +13,10 @@
 //! The one residual platform-bound step is the `image` crate's
 //! Lanczos3 resampler inside `load_rgba8` — its sinc kernel uses std
 //! `sin`; if `--check` ever false-reds across glibc versions, the fix
-//! is a vendored integer resampler, not a tolerance compare.
+//! is a vendored integer resampler, not a tolerance compare. Only the
+//! 512² web pack runs that path now: the native terrain pack decodes
+//! its 1K sources identity-size (`load_rgba8_identity`, no resampler
+//! in the path at all), so it has no platform-bound step left.
 //!
 //! ## `.csar` (Clanker Space Art Resource) — little-endian
 //!
@@ -482,6 +485,84 @@ fn load_rgba8(path: &Path, w: u32, h: u32) -> Vec<u8> {
     img.into_raw()
 }
 
+/// Decode a source at its NATIVE pixel size — no resampler in the
+/// path. The native terrain pack runs every source through here: the
+/// ambientCG sources are 1K and the pack is 1K, so this is a pure
+/// decode (the JPEG path is integer math), which removes the Lanczos
+/// sinc kernel — the one platform-bound step — from that pack
+/// entirely (see the module determinism note). A source whose pixels
+/// do not match the pack's texel size fails loud: a swapped half-res
+/// source would otherwise silently upscale and defeat the
+/// full-source-resolution premise.
+fn load_rgba8_identity(path: &Path, t: u32) -> Vec<u8> {
+    let img = image::open(path).unwrap_or_else(|e| panic!("decode {}: {e}", path.display()));
+    assert_eq!(
+        (img.width(), img.height()),
+        (t, t),
+        "{}: identity bake wants {t}×{t} source pixels",
+        path.display()
+    );
+    img.to_rgba8().into_raw()
+}
+
+/// Terrain texel sizes per target. The ambientCG sources are 1K:
+/// native carries them at full source resolution (identity decode);
+/// the §6.3 wasm demo keeps PLAN's "reduced textures" tier at 512²
+/// (the Lanczos downscale). `csp-view`'s `art.rs` cfg-selects the
+/// embedded pack — both are baked, checked, and committed here.
+const T_NATIVE: u32 = 1024;
+const T_WEB: u32 = 512;
+
+/// The terrain entry set at one texel size — layer order 0 grass,
+/// 1 rock, 2 sand, 3 snow (`terrain.wgsl` keys it), plus the ocean
+/// foam normal. `identity` decodes every source at its exact pixel
+/// size (the native pack); otherwise the Lanczos downscale (web).
+/// Water rides its pack's texel size like everything else: one rule,
+/// so the native bake has no resampler anywhere.
+fn terrain_entries(src: &Path, t: u32, identity: bool) -> Vec<(&'static str, Entry)> {
+    let acg = |id: &str, map: &str| src.join(format!("{id}/{id}_1K-JPG_{map}.jpg"));
+    let load = move |p: &Path| {
+        if identity {
+            load_rgba8_identity(p, t)
+        } else {
+            load_rgba8(p, t, t)
+        }
+    };
+    let alb_layers: Vec<Vec<u8>> = [
+        ("Grass003", "Color"),
+        ("Rock035", "Color"),
+        ("Ground080", "Color"),
+        ("Snow010A", "Color"),
+    ]
+    .iter()
+    .map(|(id, m)| load(&acg(id, m)))
+    .collect();
+    let nrm_layers: Vec<Vec<u8>> = [
+        ("Grass003", "NormalGL"),
+        ("Rock035", "NormalGL"),
+        ("Ground080", "NormalGL"),
+        ("Snow010A", "NormalGL"),
+    ]
+    .iter()
+    .map(|(id, m)| load(&acg(id, m)))
+    .collect();
+    let water = load(&acg("Foam002", "NormalGL"));
+    vec![
+        (
+            "albedo",
+            Entry::Image(image_entry(t as u16, t as u16, alb_layers, false)),
+        ),
+        (
+            "normal",
+            Entry::Image(image_entry(t as u16, t as u16, nrm_layers, true)),
+        ),
+        (
+            "water_nrm",
+            Entry::Image(image_entry(t as u16, t as u16, vec![water], true)),
+        ),
+    ]
+}
+
 /// round(acc/cnt) without float — `floor((2a + n) / 2n)`.
 fn div_round(acc: u32, cnt: u32) -> u8 {
     ((acc * 2 + cnt) / (cnt * 2)) as u8
@@ -640,52 +721,22 @@ fn main() {
     // procedural shell-lattice starfield — a baked equirect star map
     // blurred catalogue stars into speckle noise and smeared at the
     // poles, so the image was removed rather than replaced.
-    let acg = |id: &str, map: &str| src.join(format!("{id}/{id}_1K-JPG_{map}.jpg"));
-    const T: u32 = 512;
-    let alb_layers: Vec<Vec<u8>> = [
-        acg("Grass003", "Color"),
-        acg("Rock035", "Color"),
-        acg("Ground080", "Color"),
-        acg("Snow010A", "Color"),
-    ]
-    .iter()
-    .map(|p| load_rgba8(p, T, T))
-    .collect();
-    let nrm_layers: Vec<Vec<u8>> = [
-        acg("Grass003", "NormalGL"),
-        acg("Rock035", "NormalGL"),
-        acg("Ground080", "NormalGL"),
-        acg("Snow010A", "NormalGL"),
-    ]
-    .iter()
-    .map(|p| load_rgba8(p, T, T))
-    .collect();
-    let water = load_rgba8(&acg("Foam002", "NormalGL"), T, T);
+    //
+    // Two packs, one bake: the native binary embeds the 1024² pack
+    // (full 1K source resolution, identity decode) and the §6.3 wasm
+    // demo embeds the 512² web pack ("reduced textures", the Lanczos
+    // downscale) — `csp-view`'s art.rs cfg-selects between them.
+    let terrain_bytes = assemble_csar(&terrain_entries(&src, T_NATIVE, true));
+    let terrain_web_bytes = assemble_csar(&terrain_entries(&src, T_WEB, false));
 
-    let entries: Vec<(&str, Entry)> = vec![
-        // layer order: 0 grass, 1 rock, 2 sand, 3 snow — terrain.wgsl keys it
-        (
-            "albedo",
-            Entry::Image(image_entry(T as u16, T as u16, alb_layers, false)),
-        ),
-        (
-            "normal",
-            Entry::Image(image_entry(T as u16, T as u16, nrm_layers, true)),
-        ),
-        (
-            "water_nrm",
-            Entry::Image(image_entry(T as u16, T as u16, vec![water], true)),
-        ),
-    ];
-    let terrain_bytes = assemble_csar(&entries);
-
-    // Both packs assembled — `--check` compares, the write path
+    // All packs assembled — `--check` compares, the write path
     // publishes each atomically.
     if check {
         let mut stale = Vec::new();
         for (name, bytes) in [
             ("parts.csar", &parts_bytes),
             ("terrain.csar", &terrain_bytes),
+            ("terrain_web.csar", &terrain_web_bytes),
         ] {
             let path = out.join(name);
             match fs::read(&path) {
@@ -709,4 +760,5 @@ fn main() {
     fs::create_dir_all(&out).unwrap();
     atomic_write(&out.join("parts.csar"), &parts_bytes);
     atomic_write(&out.join("terrain.csar"), &terrain_bytes);
+    atomic_write(&out.join("terrain_web.csar"), &terrain_web_bytes);
 }

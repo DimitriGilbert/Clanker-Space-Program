@@ -227,7 +227,7 @@ Dispatcher: `xtask/src/main.rs` (`main()`, lines 391–406).
 | `cargo run -p xtask -- lint-reach` | "sim-complete but no UI" gate: every `SimCommand` variant needs a production issuer in `csp-ui`/`csp-view`/`csp-app` or an explicit `// ui-unreachable: <reason>` at the declaration | `xtask/src/lint_reach.rs` |
 | `cargo run -p xtask -- bless-goldens [--reason "<text>"]` | §8.4 golden regeneration: re-records every registered scenario's `replay.bin`/`expected-hash.txt`/`fingerprint.json`. **Refuses**: dirty tree (`git status --porcelain` non-empty), partial artifact sets, and a changed hash without a `HASH_SCHEMA_VERSION` bump or `--reason`. Bootstrap of a new golden: commit the fixture dir + recipe, then `bless-goldens` or `csp-replay record <name> <dir>` | `xtask/src/main.rs bless_goldens` |
 | `cargo run -p xtask -- build-web` | Package the §6.3 web demo: wasm release build of `csp-app --lib`, `wasm-bindgen --target web` into `apps/demo/dist` (staged, atomic rename; prints the exact manual commands if `wasm-bindgen-cli` is missing) | `xtask/src/main.rs build_web` |
-| `cargo run -p xtask --bin bake_art` | Bake art: `assets/src/` + procedurally-authored part meshes → `data/art/{parts.csar,terrain.csar}` | `xtask/src/bin/bake_art.rs` |
+| `cargo run -p xtask --bin bake_art` | Bake art: `assets/src/` + procedurally-authored part meshes → `data/art/{parts.csar,terrain.csar,terrain_web.csar}` | `xtask/src/bin/bake_art.rs` |
 | `cargo run -p xtask --bin gen_biome_maps [--check]` | Regenerate the authored biome PNGs under `data/systems/home/*/biomes.png`; `--check` verifies the committed files are byte-identical to the program's output (run manually — CI does not invoke it) | `xtask/src/bin/gen_biome_maps.rs` |
 
 ## 7. apps/telemetry and apps/demo
@@ -268,11 +268,17 @@ git-ignored (`.gitignore`).
 Two generators, both deterministic:
 
 - **`bake_art`** → `data/art/parts.csar` (part meshes, authored procedurally in
-  `xtask/src/bin/parts.rs`) and `data/art/terrain.csar` (ambientCG CC0 textures
-  from `assets/src/`; provenance in `assets/ASSETS.md`). Nothing under `assets/`
-  is read at runtime — `data/art/*.csar` is embedded via `include_bytes!` by
-  `csp-view`. **Regenerate** whenever `xtask/src/bin/parts.rs` or anything in
-  `assets/src/` changes, then commit the `.csar` files.
+  `xtask/src/bin/parts.rs`) and the TWO terrain packs (ambientCG CC0 textures
+  from `assets/src/`; provenance in `assets/ASSETS.md`): `data/art/terrain.csar`
+  — **1024²**, the 1K sources at full resolution via an identity decode (no
+  resampler in the path, so the pack is byte-stable across platforms) — and
+  `data/art/terrain_web.csar` — **512²**, the §6.3 web-demo "reduced
+  textures" tier (Lanczos3 downscale). `csp-view` embeds exactly one per
+  binary via a cfg-gated `include_bytes!` (native `terrain.csar`, wasm
+  `terrain_web.csar`); `--check` byte-compares all three packs. Nothing under
+  `assets/` is read at runtime. **Regenerate** whenever
+  `xtask/src/bin/parts.rs` or anything in `assets/src/` changes, then commit
+  the `.csar` files.
 - **`gen_biome_maps`** → `data/systems/home/{terrin,rask,duva}/biomes.png`. The
   committed PNGs must be byte-identical to the program's output — after editing
   the region rules or a body's `biomes.ron` legend, rerun it and verify with

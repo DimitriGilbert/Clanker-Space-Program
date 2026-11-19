@@ -27,7 +27,8 @@
 #
 # path | source | license | url
 data/art/parts.csar | procedural rocket-part meshes authored in xtask/src/bin/parts.rs, baked by xtask bake_art | MIT | https://github.com/DimitriGilbert/Clanker-Space-Program
-data/art/terrain.csar | ambientCG Grass003/Rock035/Ground080/Snow010A/Foam002 PBR maps, baked by xtask bake_art | CC0-1.0 | https://ambientcg.com
+data/art/terrain.csar | ambientCG Grass003/Rock035/Ground080/Snow010A/Foam002 PBR maps (1024² native tier), baked by xtask bake_art | CC0-1.0 | https://ambientcg.com
+data/art/terrain_web.csar | ambientCG Grass003/Rock035/Ground080/Snow010A/Foam002 PBR maps (512² web-demo tier, PLAN §6.3), baked by xtask bake_art | CC0-1.0 | https://ambientcg.com
 assets/src/Grass003/Grass003_1K-JPG_Color.jpg | ambientCG Grass003 (grass) | CC0-1.0 | https://ambientcg.com/view?id=Grass003
 assets/src/Grass003/Grass003_1K-JPG_NormalGL.jpg | ambientCG Grass003 (grass) | CC0-1.0 | https://ambientcg.com/view?id=Grass003
 assets/src/Rock035/Rock035_1K-JPG_Color.jpg | ambientCG Rock035 (rock) | CC0-1.0 | https://ambientcg.com/view?id=Rock035
