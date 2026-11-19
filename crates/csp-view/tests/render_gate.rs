@@ -115,6 +115,36 @@ fn frame(view: &mut View, ticks: u64) {
     view.end_frame();
 }
 
+/// One presentation frame with NO sim advance — the schedules
+/// (Presentation/UiBuild/RenderExtract) run, so the terrain cache
+/// still bakes and packets still emit, but the scene clock stands
+/// still. `until_real_terrain` polls with these so the capture time
+/// cannot drift with the bake's wall-time (the 3b vision-check
+/// failure: paired armed/disarmed dumps minutes apart compared
+/// different suns — a craft shadow appeared in one capture and not
+/// the other).
+fn idle_frame(view: &mut View) {
+    view.begin_frame();
+    view.end_frame();
+}
+
+/// Advance the sim to an absolute scene time (seconds) if `DUMP_TIME`
+/// is set — the dump-suite determinism knob. Pairs with
+/// `until_real_terrain`'s no-sim polling: capture time = spawn time +
+/// the test's own fixed stepping + this pinned offset, never wall
+/// clock.
+fn pin_dump_time(view: &mut View) {
+    if let Ok(t) = std::env::var("DUMP_TIME")
+        && let Ok(secs) = t.parse::<f64>()
+    {
+        let target = (secs * csp_core::TICK_HZ as f64).round() as u64;
+        let now = view.sim.clock().ticks();
+        if target > now {
+            frame(view, target - now);
+        }
+    }
+}
+
 /// Advance `view` until the flight packet carries the REAL baked
 /// heightfield for the dominant body — not `TerrainCache`'s flat datum
 /// stand-in. On native the cache bakes on a background thread (C12-F5)
@@ -134,9 +164,13 @@ fn until_real_terrain(view: &mut View) {
         csp_render::terrain::HeightField::bake_profiled_key(t.seed, t.profile)
     };
     // Bound: a debug-build Mountain bake is single-digit seconds; poll
-    // up to ~1.5 min of frames+sleeps before calling it a stall.
+    // up to ~1.5 min of idle frames+sleeps before calling it a stall.
+    // IDLE frames (no sim step): the bake progresses on wall-time while
+    // the scene clock stands still — the capture time below is
+    // therefore a function of the test's fixed stepping (+ DUMP_TIME)
+    // only, never of how long the bake happened to take.
     for _ in 0..12_000 {
-        frame(view, 1);
+        idle_frame(view);
         if let Some(p) = view.take_flight_packet()
             && let Some(t) = &p.terrain
             && let Some(h) = &t.heightfield
@@ -146,7 +180,7 @@ fn until_real_terrain(view: &mut View) {
             // one more so the caller's own `take_flight_packet` sees
             // a fresh packet (the cache now serves the real field
             // every frame, so the re-emit carries it too).
-            frame(view, 1);
+            idle_frame(view);
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -887,6 +921,11 @@ fn dump_sky() {
 
 /// Scratch visual dump — write the seeded frame to /tmp/frame.ppm.
 /// Run explicitly: `cargo test -p csp-view --test render_gate dump -- --ignored`.
+/// Determinism: `until_real_terrain` polls on IDLE frames (no sim
+/// advance) and `DUMP_TIME=<seconds>` optionally pins the capture
+/// clock — the scene (hence the sun) is a pure function of the knobs,
+/// never of the bake's wall-time. Paired A/B dumps (DUMP_SHADOWS) run
+/// minutes apart with identical lighting.
 #[test]
 #[ignore]
 fn dump_low() {
@@ -916,8 +955,10 @@ fn dump_low() {
     }
     // Capture only once the packet carries the REAL heightfield — the
     // first frames draw the cache's flat stand-in (see
-    // [`until_real_terrain`]).
+    // [`until_real_terrain`]). DUMP_TIME then pins the scene clock:
+    // paired A/B dumps can never drift to different suns.
     until_real_terrain(&mut view);
+    pin_dump_time(&mut view);
     let packet = view.take_flight_packet().unwrap();
     let img = render_flight_scene(&device, &queue, &packet);
     let name = std::env::var("DUMP_OUT").unwrap_or_else(|_| "/tmp/frame_low.ppm".into());
@@ -933,18 +974,23 @@ fn dump_low() {
         .filter(|p| p[0] > 235 && p[1] > 235 && p[2] > 235)
         .count();
     eprintln!(
-        "{name}: white={white} shadows={}",
+        "{name}: white={white} shadows={} t={:.1}s",
         if packet.shadow.armed() {
             "armed"
         } else {
             "disarmed"
-        }
+        },
+        view.sim.clock().ticks() as f64 / csp_core::TICK_HZ as f64
     );
 }
 
 /// Scratch dump of an actually-ascending craft: seed + throttle 1.0,
 /// step until ~700 m, then rasterize the real flight packet — the
 /// same VFX state the reported ~710 m screenshot came from.
+/// Determinism: `until_real_terrain` polls on IDLE frames and
+/// `DUMP_TIME=<seconds>` pins the capture clock on top of the fixed
+/// spawn stepping — the sun at capture is knob-controlled, never
+/// bake-wall-time (the 3b vision-check failure mode).
 /// `cargo test -p csp-view --test render_gate dump_flight -- --ignored`.
 #[test]
 #[ignore]
@@ -966,6 +1012,7 @@ fn dump_flight() {
     // background bake (single-digit seconds in debug) would otherwise
     // still be flat at capture (see [`until_real_terrain`]).
     until_real_terrain(&mut view);
+    pin_dump_time(&mut view);
     frame(&mut view, 1); // the focus resolves in flight_present
     let vessel = view.flight_focus().expect("starter vessel");
     view.enqueue_command(
@@ -1005,12 +1052,13 @@ fn dump_flight() {
         .filter(|p| p[0] > 235 && p[1] > 215)
         .count();
     eprintln!(
-        "{name}: alt={a:.0} white={white} shadows={}",
+        "{name}: alt={a:.0} white={white} shadows={} t={:.1}s",
         if packet.shadow.armed() {
             "armed"
         } else {
             "disarmed"
-        }
+        },
+        view.sim.clock().ticks() as f64 / csp_core::TICK_HZ as f64
     );
 }
 
