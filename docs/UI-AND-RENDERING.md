@@ -663,7 +663,10 @@ bodies emit nothing.
 
 Biome tint: the authored index map only **tints** — it never moves a vertex
 (§3.0.1 decoupling). `BiomeField` slots (≤16) map through
-`TerrainUniforms::biome_colors`; `ramp_albedo`/`class_weights` in WGSL blend
+`TerrainUniforms::biome_colors`; the tint map itself is the 256×128 equirect
+`biomes.png` (quadrupled from 64×32 in texture-quality 4c) — sampling is fully
+dims-driven (`textureDimensions` in WGSL, decoded width/height in `biome_at`);
+`ramp_albedo`/`class_weights` in WGSL blend
 grass/rock/sand/snow by height/slope/latitude with detail-noise dither, or
 the real-art albedo/normal arrays (`TerrainArt` from `data/art/terrain.csar`)
 when the packet carries them (`uniforms.art.x`).

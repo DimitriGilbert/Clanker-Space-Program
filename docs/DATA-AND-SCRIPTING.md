@@ -26,7 +26,7 @@ root; `cargo xtask …` is NOT an alias — always `cargo run -p xtask -- …`.
 | `data/systems/<sys>/system.ron` | System manifest: `id`, `star`, `bodies[]` | `SystemDef` (`system.rs`), `SCHEMA_VERSION = 1` | `load_system` |
 | `data/systems/<sys>/<body>/body.ron` | One celestial body per manifest entry (solen/terrin/rask/duva) | `BodyDef` (`system.rs`), v1 | `load_system` |
 | `data/systems/<sys>/<body>/biomes.ron` | Biome legend (palette index → biome id) | `BiomeLegend` (`biome.rs`), v1 | `load_system` |
-| `data/systems/<sys>/<body>/biomes.png` | Palette-indexed equirect biome map (64×32) — indexed by `BodyDef::biome_map` | header-inspected (`biome.rs::inspect_indexed_png`) | `load_system` |
+| `data/systems/<sys>/<body>/biomes.png` | Palette-indexed equirect biome map (256×128) — indexed by `BodyDef::biome_map` | header-inspected (`biome.rs::inspect_indexed_png`) | `load_system` |
 | `data/systems/<sys>/sites.ron` | Surface sites: pads, recovery sites, mineable yields, **starting stockpile** | `SiteFile`/`SiteDef` (`site.rs`), `SITE_SCHEMA_VERSION = 3` | `load_sites` |
 | `data/systems/<sys>/colonies.ron` | Authored starting colonies (one Rask mining outpost) | `ColonyFile`/`ColonyDef` (`colony.rs`), `COLONY_SCHEMA_VERSION = 2` | `load_colonies` |
 | `data/contracts/<id>.ron` | Contract templates — **8 files** | `ContractTemplate` (`contract.rs`), v1 | `load_contracts` |
@@ -394,8 +394,12 @@ carry no migration promise, so re-record or `bless-goldens`).
 ### 2.3 gen_biome_maps (`xtask/src/bin/gen_biome_maps.rs`)
 
 The biome PNGs are **outputs of this program** — the region rules in its source are
-the authored content. 64×32 equirect palette PNGs, deterministic dependency-free
-encoder. `--check` regenerates in memory and byte-compares against the committed
+the authored content. 256×128 equirect palette PNGs (quadrupled from 64×32 in M10
+texture-quality 4c), deterministic dependency-free encoder. The rules are analytic
+in (lon, lat), so a resolution change re-samples the identical shapes — only
+boundary texels sharpen; the bin's `index_sets_match_legend` test pins the painted
+palette-index set (hence every legend id — load-bearing science keys) across any
+such bump. `--check` regenerates in memory and byte-compares against the committed
 files — run it manually after touching the rules; **nothing in CI invokes it**.
 To change biome geography: edit the pixel rules in the bin, run it
 without `--check`, and remember biome ids are load-bearing science keys.

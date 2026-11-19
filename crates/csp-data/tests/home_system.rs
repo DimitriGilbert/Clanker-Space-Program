@@ -145,7 +145,9 @@ fn biome_maps_are_real_indexed_pngs() {
         let b = sys.bodies.iter().find(|b| b.def.id.as_str() == id).unwrap();
         let bm = b.biomes.as_ref().unwrap();
         let info = inspect_indexed_png(&bm.png).unwrap();
-        assert_eq!((info.width, info.height), (64, 32), "{id}");
+        // 256×128 since M10 texture-quality 4c (was 64×32) — the tint
+        // map quadrupling; shapes/ids identical, boundary texels only.
+        assert_eq!((info.width, info.height), (256, 128), "{id}");
         assert_eq!(info.palette_len, palette_len, "{id}");
         assert_eq!(bm.legend.entries.len(), palette_len, "{id}");
     }

@@ -13,13 +13,22 @@
 //! The encoder is deliberately dependency-free: 8-bit palette PNGs whose
 //! IDAT is a zlib stream of *stored* (uncompressed) DEFLATE blocks — a
 //! valid, deterministic, spec-legal encoding.
+//!
+//! The rules are analytic in (lon, lat), so a resolution change is a
+//! pure re-sampling: the shapes are identical and only boundary texels
+//! sharpen. [`W`]×[`H`] went 64×32 → 256×128 (M10 texture-quality 4c)
+//! with zero rule edits — the `index_sets_match_legend` test pinned
+//! that across the bump (same painted palette-index set at both
+//! resolutions, so every `biomes.ron` id stayed a live science key).
 
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
-/// §3.0.1 equirect dimensions — well under the 2048×1024 cap.
-const W: u32 = 64;
-const H: u32 = 32;
+/// §3.0.1 equirect dimensions — 256×128 (texel ≈1.41°×1.41°, square),
+/// well under the 2048×1024 cap. Quadrupled from 64×32 in M10 4c for
+/// crisper tint regions on the ground; the pixel rules never changed.
+const W: u32 = 256;
+const H: u32 = 128;
 
 /// One authored map: output path (repo-relative under the system dir)
 /// plus the pixel rule.
@@ -308,5 +317,118 @@ fn main() {
     }
     if check {
         println!("gen_biome_maps: all committed PNGs match generator output");
+    }
+}
+
+#[cfg(test)]
+// Tests signal failure by panicking — §2.13's no-panic rule covers
+// shipping fallible paths, not test code.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    use super::*;
+
+    /// Decode one of *this program's* PNGs back to pixel indices. The
+    /// encoder emits a fixed shape (single IDAT, filter 0 on every
+    /// scanline), so the decode mirrors exactly that shape — anything
+    /// else fails here rather than weakening the science-key guard
+    /// below. Inflating via `miniz_oxide` (already a dependency) keeps
+    /// this a real decode, not a re-trust of the encoder.
+    fn decode_committed(png: &[u8]) -> (u32, u32, Vec<u8>) {
+        let mut pos = 8; // past the signature
+        let mut dims = None;
+        let mut idat = Vec::new();
+        loop {
+            let len = u32::from_be_bytes(png[pos..pos + 4].try_into().unwrap()) as usize;
+            let kind = &png[pos + 4..pos + 8];
+            let data = &png[pos + 8..pos + 8 + len];
+            match kind {
+                b"IHDR" => {
+                    dims = Some((
+                        u32::from_be_bytes(data[..4].try_into().unwrap()),
+                        u32::from_be_bytes(data[4..8].try_into().unwrap()),
+                    ));
+                }
+                b"IDAT" => idat.extend_from_slice(data),
+                b"IEND" => break,
+                _ => {}
+            }
+            pos += 12 + len;
+        }
+        let (w, h) = dims.expect("IHDR before IEND");
+        let raw = miniz_oxide::inflate::decompress_to_vec_zlib(&idat).unwrap();
+        let stride = w as usize + 1;
+        assert_eq!(raw.len(), stride * h as usize, "IDAT payload/dims mismatch");
+        let mut indices = Vec::with_capacity((w * h) as usize);
+        for row in raw.chunks(stride) {
+            assert_eq!(row[0], 0, "this generator only emits filter 0");
+            indices.extend_from_slice(&row[1..]);
+        }
+        (w, h, indices)
+    }
+
+    /// The palette indices a body's `biomes.ron` legend names — parsed
+    /// with the real RON reader (already a dev-dependency for exactly
+    /// this kind of data-side gate).
+    fn legend_indices(path: &Path) -> BTreeSet<u8> {
+        #[derive(serde::Deserialize)]
+        struct Entry {
+            index: u8,
+        }
+        #[derive(serde::Deserialize)]
+        struct Legend {
+            entries: Vec<Entry>,
+        }
+        let legend: Legend = ron::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        legend.entries.iter().map(|e| e.index).collect()
+    }
+
+    /// Science-key stability (§3.0.1): the set of palette indices the
+    /// committed PNG paints, the current rules rasterize, and the
+    /// legend names must be ONE set per body. Biome ids are load-bearing
+    /// `(body, biome, situation)` science keys, and the legend maps
+    /// index → id 1:1, so a resolution bump (64×32 → 256×128, M10 4c)
+    /// or any future rule edit may sharpen boundary texels but must
+    /// never add or drop a region — that would silently orphan or
+    /// invent a science key. Deliberately dim-agnostic on the PNG side:
+    /// this same assertion was the old↔new proof across the 4c bump
+    /// and guards every future one.
+    #[test]
+    fn index_sets_match_legend() {
+        for spec in MAPS {
+            let dir = home_dir().join(spec.body);
+            let (_, _, painted) = decode_committed(&std::fs::read(dir.join("biomes.png")).unwrap());
+            let legend = legend_indices(&dir.join("biomes.ron"));
+            let png_set: BTreeSet<u8> = painted.into_iter().collect();
+            let raster: BTreeSet<u8> = rasterize(spec).unwrap().into_iter().collect();
+            assert_eq!(
+                png_set, legend,
+                "{}: committed PNG and legend disagree on the index set",
+                spec.body
+            );
+            assert_eq!(
+                raster, legend,
+                "{}: rules rasterize a different index set than the legend names",
+                spec.body
+            );
+        }
+    }
+
+    /// In-test mirror of `--check`: the committed bytes are exactly
+    /// `encode(rasterize())` at the current [`W`]×[`H`] — which pins
+    /// the committed dims to the constants too.
+    #[test]
+    fn committed_png_is_generator_output() {
+        for spec in MAPS {
+            let bytes = encode_indexed_png(W, H, spec.palette, &rasterize(spec).unwrap());
+            let on_disk = std::fs::read(home_dir().join(spec.body).join("biomes.png")).unwrap();
+            assert_eq!(
+                on_disk, bytes,
+                "{}: committed biomes.png is stale",
+                spec.body
+            );
+        }
     }
 }
