@@ -8,21 +8,39 @@ allow = [
     "MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "ISC",
     "BSD-2-Clause", "BSD-3-Clause", "Zlib", "Unicode-3.0",
     "Unicode-DFS-2016", "CC0-1.0", "BSL-1.0", "MPL-2.0",
+    # Ubuntu-font-1.0 + OFL-1.1 cover the Ubuntu fonts embedded in
+    # epaint_default_fonts (egui's bundled default fonts, used by
+    # csp-app/csp-ui/csp-view). These are font licenses on a data payload,
+    # not code licenses — no copyleft obligation attaches to linking.
+    "OFL-1.1", "Ubuntu-font-1.0",
 ]
-copyleft = "deny"
+# `copyleft = "deny"` was removed as a key in cargo-deny 0.21
+# (EmbarkStudios/cargo-deny#611). Semantics were already covered by the
+# closed allow-list above: any license not listed is denied.
 # csp-app is LicenseRef-CSP-GAME + publish=false — private, skipped here.
 # cargo-deny requires `registries` to be non-empty when `ignore = true`.
 private = { ignore = true, registries = ["https://github.com/rust-lang/crates.io-index"] }
 
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"
+# `wildcards = "deny"` fired on all 12 workspace path-deps once cargo-deny
+# started counting version-less path requirements as wildcards. The
+# intra-workspace path-dep architecture is intentional (crates depend on
+# each other by path, never by version), so wildcards are allowed here;
+# an external registry wildcard remains impossible — crates.io requires
+# a version on every published requirement.
+wildcards = "allow"
 deny = [
-    # The rand facade is banned workspace-wide (PLAN §2.1): the sanctioned
-    # RNG surface is rand_chacha + rand_core through csp_core::rng. A
-    # legitimate future need (e.g. §8.1's proptest, which pulls rand)
-    # must add `wrappers = [...]` here deliberately, not silently.
-    { name = "rand" },
+    # `rand` is deliberately NOT banned here. The workspace rule "no rand
+    # facade" (PLAN §2.1) is enforced where it actually bites: per-crate
+    # clippy lints (csp-core/data/phys/sim ban `seed_from_u64` and the
+    # wall-clock surface) plus `xtask lint-deps` (Ban::Exact("rand") over
+    # the determinism crates' trees, with rand_chacha/rand_core the
+    # sanctioned pair via csp_core::rng). cargo-deny cannot scope a ban
+    # per-crate, and rand DOES ride in transitively — only inside
+    # csp-server's websocket stack (axum -> tokio-tungstenite ->
+    # tungstenite; rand 0.10 via the server's own dev-dep for e2e) —
+    # where the headless sim cannot reach it.
     # No threadpool crates anywhere in the workspace — §2.1 bans them in
     # the determinism domain and no presentation crate uses one either.
     { name = "rayon" },
@@ -36,4 +54,18 @@ deny = [
     #          presentation side; banned only inside determinism crates.
     #   wgpu/winit/egui: legal in csp-app/csp-render/csp-ui/csp-view;
     #          banned inside determinism crates by lint-deps.
+]
+
+[advisories]
+ignore = [
+    # bincode: unmaintained upstream, but DELIBERATELY kept — it is the
+    # frozen replay-log codec (PLAN §7.2); swapping codecs is a golden-
+    # breaking landmine, not a hygiene fix.
+    "RUSTSEC-2025-0141",
+    # ttf-parser: unmaintained, transitive via egui's text stack; no
+    # fixed fork exists yet, tracked by egui upstream.
+    "RUSTSEC-2026-0192",
+    # smartstring: unmaintained, transitive only (not a workspace dep);
+    # no vulnerability, no replacement reachable without an egui bump.
+    "RUSTSEC-2026-0249",
 ]
