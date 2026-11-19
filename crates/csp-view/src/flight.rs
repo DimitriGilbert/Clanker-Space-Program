@@ -1918,6 +1918,80 @@ fn solve_chase_camera(
 #[derive(Resource, Default)]
 pub struct FlightCameraF64(pub MapCameraF64);
 
+/// The R1 cascade arm threshold (terrain-overhaul 3b): the flight
+/// extract solves cascades only while the sun clears the chase
+/// focus's local horizon by more than this (sun·up). 0.06 ≈ 3.4°
+/// elevation sits just above the two neighboring cutoffs —
+/// `sun_occlusion`'s ray-march full-occludes below sun·up 0.035 and
+/// the vessel blob disables at 0.04 — so there is no band where the
+/// cascade replaces a dimmer fallback; below it an ortho sun-fit
+/// degenerates into shadows hundreds of km long that no 20 km
+/// cascade box contains (at 0.06, the M5 relief ceiling of ~2.4 km
+/// throws a ~40 km penumbra — exactly the grazing-sun regime the
+/// ray-march's long soft shadows own). Night and the terminator keep
+/// the pre-cascade look bit-for-bit.
+pub const SHADOW_ARM_SUN_UP: f64 = 0.06;
+
+/// The 3b cascade arm predicate: sun above the local horizon by
+/// [`SHADOW_ARM_SUN_UP`]. Pure — pinned by unit test at the
+/// threshold, consumed by [`cascade_uniforms`] and by the render
+/// gate's hand-built surface probe (which reconstructs the solve
+/// outside the real extract).
+pub fn cascades_armed(sun_dir: DVec3, up: DVec3) -> bool {
+    sun_dir.dot(up) > SHADOW_ARM_SUN_UP
+}
+
+/// 3b: solve the frame's R1 cascade uniforms — pure presentation
+/// math over the SOLVED chase camera + the staged `FlightEnv` sun
+/// (§2.5: RenderExtract owns presentation derivation; nothing here
+/// reads the sim). The camera basis is recovered from `view_proj`
+/// exactly like `sky_view_rot`: the reverse-Z projection's last row
+/// is `[0,0,−1,0]`, so `view_proj`'s row 3 is `−z_out` — the forward
+/// — and the focus recovered as `eye − z_out·distance` (the same
+/// reconstruction `vessel_shadow` uses) supplies the local-level up.
+/// Returns the all-zero DISARMED row when the sun sits at or below
+/// the arm threshold; the solve itself is `csp_render::shadow::
+/// solve_cascades` (f64, texel-snapped — see its docs).
+fn cascade_uniforms(
+    cam: &MapCameraF64,
+    env: &FlightEnv,
+    viewport_px: (f64, f64),
+) -> csp_render::shadow::ShadowUniforms {
+    let z_out = DVec3::new(
+        -cam.view_proj[3][0],
+        -cam.view_proj[3][1],
+        -cam.view_proj[3][2],
+    );
+    let focus_rel = (cam.eye - env.body_center) - z_out * cam.distance_m;
+    let fl = focus_rel.norm();
+    let up = if fl > env.radius_m * 1.0e-6 {
+        focus_rel / fl
+    } else {
+        DVec3::Z
+    };
+    if !cascades_armed(env.sun_dir, up) {
+        return csp_render::shadow::ShadowUniforms::default();
+    }
+    let forward = {
+        let f = -z_out;
+        let n = f.norm();
+        if n > 1.0e-12 { f / n } else { DVec3::X }
+    };
+    let aspect = (viewport_px.0 / viewport_px.1.max(1.0)).max(1e-6);
+    csp_render::shadow::solve_cascades(
+        &csp_render::shadow::ShadowCamera {
+            sun_dir: env.sun_dir,
+            forward,
+            up,
+            fov_y: FLIGHT_FOV_Y,
+            aspect,
+            near_m: 0.1,
+        },
+        &csp_render::shadow::CascadeConfig::default(),
+    )
+    .uniforms
+}
+
 /// What a flight-mode right-click resolved — the part-action menu's
 /// target (§3.7's in-context surface: the menu emits the same
 /// `RunExperiment`/`DeployPart`/data/recovery commands the Program
@@ -3054,6 +3128,12 @@ pub(crate) fn extract_flight(
             input.viewport_px,
             clock.0.ticks() as f64 / csp_core::TICK_HZ as f64,
         ));
+        // R1/3b: solve the cascade uniforms beside the packet they
+        // shadow — the app feeds this row to `draw_shadow` before the
+        // scene pass. Same gate as the terrain build (a flight scene
+        // with an environment and a solved camera); the arm predicate
+        // inside additionally demands the sun clear the local horizon.
+        packet.shadow = cascade_uniforms(&cam.0, env, input.viewport_px);
     }
     let v = &mut packet.vertices;
     if packet.terrain.is_none() {
@@ -4244,5 +4324,142 @@ mod tests {
             (false, 0),
             "a build-free empty arena is still the dead scene"
         );
+    }
+
+    // --- R1/3b: the cascade solve's arm contract ----------------------
+
+    /// A test env over a body centred 600 km down −X (so the local up
+    /// at a focus near the origin is +X), with the sun at
+    /// `sun_x·X + 0.3·Y + 0.74·Z` normalized — `sun_x` is the sun's
+    /// elevation knob at the focus.
+    fn shadow_env(sun_x: f64) -> FlightEnv {
+        let s = DVec3::new(sun_x, 0.3, 0.74);
+        FlightEnv {
+            body_center: DVec3::new(-600_000.0, 0.0, 0.0),
+            radius_m: 600_000.0,
+            atm_top_m: 70_000.0,
+            atm_scale_height_m: 5_600.0,
+            mu_m3_per_s2: 2.4e19,
+            body: None,
+            sun_dir: s / s.norm(),
+            spin_axis: DVec3::Z,
+            spin_phase: 0.0,
+            body_spin: DVec3::ZERO,
+        }
+    }
+
+    /// The arm predicate pins its threshold: strictly above arms, at
+    /// and below do not (the boundary keeps the ray-march's grazing
+    /// regime — see [`SHADOW_ARM_SUN_UP`]).
+    #[test]
+    fn cascade_arm_predicate_pins_the_threshold() {
+        let up = DVec3::X;
+        // A unit sun whose dot with `up` is exactly `d` (the y leg
+        // completes the norm; the sun never points along ±X here).
+        let sun_at = |d: f64| DVec3::new(d, (1.0 - d * d).max(0.0).sqrt(), 0.0);
+        assert!(cascades_armed(sun_at(SHADOW_ARM_SUN_UP * 1.01), up));
+        assert!(!cascades_armed(sun_at(SHADOW_ARM_SUN_UP), up));
+        assert!(!cascades_armed(sun_at(SHADOW_ARM_SUN_UP * 0.99), up));
+        assert!(!cascades_armed(sun_at(0.0), up));
+        assert!(!cascades_armed(sun_at(-0.5), up), "night never arms");
+    }
+
+    /// The extract's cascade row flows armed by day: non-zero
+    /// matrices, the documented split/far band constants, terrain
+    /// packet present — and zeroed (the disarm row) at night. Run
+    /// through `run_extract`'s real Schedule so the wiring — not just
+    /// the solve — is what's under test.
+    #[test]
+    fn extract_solves_armed_cascades_by_day_and_disarms_at_night() {
+        // Deterministic reconstruction per use — `run_extract` takes
+        // the camera by value and `MapCameraF64` is not `Clone`.
+        let cam = || {
+            crate::map::solve_orbit_camera(
+                0.7,
+                0.25,
+                60.0,
+                (320.0, 240.0),
+                DVec3::ZERO,
+                FLIGHT_FOV_Y,
+                0.1,
+            )
+        };
+        // Day: sun 0.6 up the local (+X) horizon.
+        let day = run_extract(
+            FlightSnapshot {
+                env: Some(shadow_env(0.6)),
+                vessels: vec![],
+            },
+            cam(),
+        );
+        assert!(day.terrain.is_some(), "the env gate built a terrain packet");
+        assert!(
+            day.shadow.armed(),
+            "a sun 0.6 above the focus horizon must arm the cascades"
+        );
+        // The solved band rows are the documented cascade budget
+        // (2 km / 20 km defaults) and the matrices actually solved.
+        assert_eq!(day.shadow.pars[1], 2_000.0);
+        assert_eq!(day.shadow.pars[2], 20_000.0);
+        assert!(
+            day.shadow
+                .vp
+                .iter()
+                .flatten()
+                .any(|m| m.iter().any(|v| *v != 0.0))
+        );
+        // Night: same frame, sun down — the all-zero DISARM row (a
+        // partial row would leave receivers sampling dead matrices).
+        let night = run_extract(
+            FlightSnapshot {
+                env: Some(shadow_env(-0.6)),
+                vessels: vec![],
+            },
+            cam(),
+        );
+        assert!(!night.shadow.armed());
+        let zeroed = csp_render::shadow::ShadowUniforms::default();
+        assert!(
+            night.shadow.vp == zeroed.vp
+                && night.shadow.cascade == zeroed.cascade
+                && night.shadow.pars == zeroed.pars,
+            "the disarm row must be all-zero, not merely flagged off"
+        );
+        // And the solve is presentation-stable: the same inputs
+        // reproduce the same uniform bits (the texel-snap contract's
+        // precondition on the view side).
+        let again = run_extract(
+            FlightSnapshot {
+                env: Some(shadow_env(0.6)),
+                vessels: vec![],
+            },
+            cam(),
+        );
+        assert_eq!(day.shadow.vp, again.shadow.vp);
+        assert_eq!(day.shadow.cascade, again.shadow.cascade);
+        assert_eq!(day.shadow.pars, again.shadow.pars);
+    }
+
+    /// No environment (the vacuum/dead-scene fallback) leaves the
+    /// cascade row disarmed — the pre-3b packet shape.
+    #[test]
+    fn extract_without_env_disarms_cascades() {
+        let packet = run_extract(
+            FlightSnapshot {
+                env: None,
+                vessels: vec![],
+            },
+            crate::map::solve_orbit_camera(
+                0.7,
+                0.25,
+                60.0,
+                (320.0, 240.0),
+                DVec3::ZERO,
+                FLIGHT_FOV_Y,
+                0.1,
+            ),
+        );
+        assert!(!packet.shadow.armed());
+        assert!(packet.terrain.is_none());
     }
 }

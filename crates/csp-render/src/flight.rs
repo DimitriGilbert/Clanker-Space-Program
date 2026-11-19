@@ -38,7 +38,7 @@ pub struct FlightVertex {
 }
 
 impl FlightVertex {
-    const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+    pub(crate) const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<FlightVertex>() as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &wgpu::vertex_attr_array![
@@ -68,17 +68,37 @@ pub struct FlightPacket {
     /// `None` without a physics environment or a solved camera — the
     /// gradient in `vertices` is the retained fallback.
     pub terrain: Option<crate::terrain::TerrainPacket>,
+    /// The R1 cascade uniforms (terrain-overhaul 3b): the view's
+    /// flight extract solves [`crate::shadow::solve_cascades`] for
+    /// the chase camera + staged sun and hands the product here —
+    /// `Default` (all-zero) is DISARMED, keeping both receivers
+    /// (`fs_terrain`, this pass's `fs_main`) on their pre-cascade
+    /// shading. The app feeds this row to
+    /// [`crate::terrain::TerrainRenderer::draw_shadow`] before the
+    /// scene pass; the cast reads the same matrices through the
+    /// terrain group(0)'s binding 8.
+    pub shadow: crate::shadow::ShadowUniforms,
 }
 
 /// GPU owner for the flight pass — one pipeline + one depth target +
-/// the lighting uniform the lit vertex stream shades against.
+/// the lighting uniform the lit vertex stream shades against. Since
+/// 3b the pipeline also carries the cascade bindings: group(0) holds
+/// the light (binding 0) beside the `SU` uniform (binding 8 — the
+/// same slot the terrain group(0) gives it, so one WGSL declaration
+/// serves both this pipeline and the craft-cast twins), and group(1)
+/// is the terrain renderer's receiving set (depth array + comparison
+/// sampler — the identical bind group object `fs_terrain` samples).
 pub struct FlightRenderer {
     pipeline: wgpu::RenderPipeline,
     verts: GpuBuffer,
     /// `PartLight` uniform — rewritten per draw from the packet.
     light_buf: wgpu::Buffer,
-    /// group(0) — the `light` uniform binding.
+    /// group(0) — the `light` uniform (binding 0) + the `SU` cascade
+    /// uniform (binding 8, the terrain renderer's shadow buffer).
     light_bind: wgpu::BindGroup,
+    /// The cascade receiving set (group 1) — `ShadowCore`'s depth
+    /// array + comparison sampler, shared with the terrain pass.
+    shadow_bind: wgpu::BindGroup,
     depth: wgpu::Texture,
     depth_view: wgpu::TextureView,
     size: (u32, u32),
@@ -86,14 +106,75 @@ pub struct FlightRenderer {
 
 impl FlightRenderer {
     /// Build the pipeline/depth target; `size` is the initial surface.
+    /// `cascades` is the terrain renderer this flight pass shares a
+    /// frame with — 3b's hand-off (its `SU` buffer + receiving
+    /// group(1) are borrowed by handle, so construct the terrain
+    /// renderer first; the app and the render gate both do).
+    #[allow(clippy::too_many_lines)] // one device-resource construction; splitting fragments the descriptor set
     pub fn new(
         device: &wgpu::Device,
         surface_format: wgpu::TextureFormat,
         size: (u32, u32),
+        cascades: &crate::terrain::TerrainRenderer,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("flight"),
             source: wgpu::ShaderSource::Wgsl(include_str!("flight.wgsl").into()),
+        });
+        let (su_buf, sample_bgl, sample_bind) = cascades.cascade_resources();
+        let light_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("flight-light"),
+            size: std::mem::size_of::<crate::PartLight>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let g0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("flight"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Binding 8 mirrors the terrain group(0)'s `SU` slot so
+                // flight.wgsl's single `su` declaration serves both the
+                // visible pipeline (this layout) and the cast pipelines
+                // (the terrain layout, via `ShadowCore`).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let light_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("flight-light"),
+            layout: &g0,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: light_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: su_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("flight"),
+            bind_group_layouts: &[Some(&g0), Some(sample_bgl)],
+            immediate_size: 0,
         });
         let depth_state = wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
@@ -108,7 +189,7 @@ impl FlightRenderer {
         };
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("flight"),
-            layout: None,
+            layout: Some(&layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
@@ -128,7 +209,7 @@ impl FlightRenderer {
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 cull_mode: None,
-                ..Default::default()
+                ..wgpu::PrimitiveState::default()
             },
             depth_stencil: Some(depth_state),
             multisample: crate::msaa_state(),
@@ -151,20 +232,6 @@ impl FlightRenderer {
             view_formats: &[],
         });
         let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
-        let light_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("flight-light"),
-            size: std::mem::size_of::<crate::PartLight>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let light_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("flight-light"),
-            layout: &pipeline.get_bind_group_layout(0),
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: light_buf.as_entire_binding(),
-            }],
-        });
         Self {
             pipeline,
             verts: GpuBuffer::new(
@@ -174,6 +241,7 @@ impl FlightRenderer {
             ),
             light_buf,
             light_bind,
+            shadow_bind: sample_bind.clone(),
             depth,
             depth_view,
             size,
@@ -212,6 +280,28 @@ impl FlightRenderer {
         &self.depth_view
     }
 
+    /// 3b (R1): stage this frame's flight stream for the cascade
+    /// craft cast — upload the vertices and hand back the buffer +
+    /// count `TerrainRenderer::draw_shadow` records into both cascade
+    /// layers. Call BEFORE the scene pass (the cast precedes every
+    /// receiver); `None` when the frame is disarmed or the stream is
+    /// empty. The visible [`Self::draw`] re-uploads the identical
+    /// bytes inside the scene pass — the same double-write the
+    /// terrain instances already accept (a staging write, never a
+    /// sync).
+    pub fn stage_cascade_cast(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        packet: &FlightPacket,
+    ) -> Option<(wgpu::Buffer, u32)> {
+        if !packet.shadow.armed() {
+            return None;
+        }
+        let n = self.verts.upload(device, queue, &packet.vertices);
+        (n > 0).then(|| (self.verts.buffer.clone(), n))
+    }
+
     /// Upload the packet and draw.
     pub fn draw(
         &mut self,
@@ -227,6 +317,9 @@ impl FlightRenderer {
         queue.write_buffer(&self.light_buf, 0, bytemuck::bytes_of(&packet.light));
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.light_bind, &[]);
+        // The cascade receiving set (R1/3b) — the terrain pass's own
+        // group(1); a disarmed `SU` keeps the lookup dead.
+        pass.set_bind_group(1, &self.shadow_bind, &[]);
         pass.set_vertex_buffer(0, self.verts.buffer.slice(..));
         pass.draw(0..n, 0..1);
     }

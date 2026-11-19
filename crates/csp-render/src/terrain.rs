@@ -668,8 +668,9 @@ impl TexUpload {
 /// `R8Uint`), the real-art set (albedo/normal `RGBA8` arrays, the
 /// water normal map + the filtering sampler) — each re-uploaded only
 /// when its packet key changes — plus the R1 shadow-cascade core
-/// ([`ShadowCore`], phase 3a: present but disarmed until 3b's frame
-/// loop calls [`Self::draw_shadow`]).
+/// ([`ShadowCore`]; armed since 3b — the frame loop calls
+/// [`Self::draw_shadow`] before the scene pass whenever the flight
+/// packet's cascade row is solved).
 pub struct TerrainRenderer {
     terrain_pipe: wgpu::RenderPipeline,
     /// Ocean pipeline — same shaders/mesh as `terrain_pipe`, depth
@@ -1290,21 +1291,23 @@ impl TerrainRenderer {
         self.inst_end = (n_inst * std::mem::size_of::<TerrainInstance>()) as wgpu::BufferAddress;
     }
 
-    /// Upload the packet's changing pieces (uniforms, instance rows,
-    /// any stale textures) and record: sky → opaque terrain, into the
-    /// caller's open pass sharing the flight depth target (reverse-Z).
-    /// The ocean is the separate [`Self::draw_ocean`] phase — it runs
-    /// after the flight stream.
-    #[allow(clippy::too_many_lines)] // uploads + two draws; splitting fragments the data flow
-    pub fn draw(
+    /// Upload the packet's changing pieces and refresh the bind
+    /// group — the shared prefix of [`Self::draw_shadow`] (which runs
+    /// FIRST in the frame) and [`Self::draw`]. Keyed (content-hash /
+    /// shape) so the second call in a frame is just the uniform +
+    /// instance re-write. Without this the cascade passes would
+    /// displace against the previous frame's heightfield — or the
+    /// 1×1 placeholders on the very first frame — and rasterize a
+    /// stale or empty map while the visible pass draws the real
+    /// surface (de-registered casters/receivers by whole ridges).
+    #[allow(clippy::too_many_lines)] // uploads; splitting fragments the data flow
+    fn sync_resources(
         &mut self,
-        pass: &mut wgpu::RenderPass<'_>,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         packet: &TerrainPacket,
     ) {
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&packet.uniforms));
-        self.ensure_grid(queue);
         let mut rebind = false;
         if let Some(hf) = &packet.heightfield
             && self.uploaded_height_key != Some(hf.key)
@@ -1383,6 +1386,23 @@ impl TerrainRenderer {
         if rebind {
             self.rebind(device);
         }
+        self.upload_instances(device, queue, packet);
+    }
+
+    /// Upload the packet's changing pieces (uniforms, instance rows,
+    /// any stale textures) and record: sky → opaque terrain, into the
+    /// caller's open pass sharing the flight depth target (reverse-Z).
+    /// The ocean is the separate [`Self::draw_ocean`] phase — it runs
+    /// after the flight stream.
+    pub fn draw(
+        &mut self,
+        pass: &mut wgpu::RenderPass<'_>,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        packet: &TerrainPacket,
+    ) {
+        self.ensure_grid(queue);
+        self.sync_resources(device, queue, packet);
 
         pass.set_bind_group(0, &self.bind_group, &[]);
         // Cascade receiving set (group 1: depth array + comparison
@@ -1393,7 +1413,6 @@ impl TerrainRenderer {
             pass.set_pipeline(&self.sky_pipe);
             pass.draw(0..3, 0..1);
         }
-        self.upload_instances(device, queue, packet);
         if !packet.terrain.is_empty() {
             pass.set_pipeline(&self.terrain_pipe);
             pass.set_vertex_buffer(0, self.grid_v.slice(..));
@@ -1404,19 +1423,21 @@ impl TerrainRenderer {
     }
 
     /// The R1 shadow phase (PLAN §5.2): rasterize the packet's
-    /// terrain instances into the two cascade depth layers, BEFORE
-    /// the scene pass records its draws — `fs_terrain` samples the
-    /// layers through group(1) during [`Self::draw`]. Call order in
-    /// the frame loop: `draw_shadow` → `draw` → flight
-    /// `draw` → `draw_ocean`. A no-op unless `shadow` is armed AND
-    /// the packet carries terrain instances (the zeroed `SU` buffer
-    /// of a never-armed session keeps `fs_terrain` on the
-    /// `sun_occlusion` ray-march, bit-identical to the pre-cascade
-    /// build). Ocean instances deliberately do not cast (water
-    /// receives shadows only — the ray-march fallback's semantics).
-    /// Craft casting is 3b's extension point: add a depth-only draw
-    /// of the flight vertex stream inside
-    /// [`ShadowCore::draw_terrain`]'s passes.
+    /// terrain instances — and, when `cast` carries the staged flight
+    /// stream (3b), the craft/launch-complex depth draw — into the
+    /// two cascade depth layers, BEFORE the scene pass records its
+    /// draws — `fs_terrain` and the flight `fs_main` sample the
+    /// layers through group(1) during [`Self::draw`] / the flight
+    /// `draw`. Call order in the frame loop: `draw_shadow` → `draw`
+    /// → flight `draw` → `draw_ocean`. The `SU` uniform is written
+    /// EVERY call, armed or not: a skipped disarm would leave a stale
+    /// armed buffer driving receivers through dead matrices after
+    /// sunset or a mode switch. A no-op beyond that write unless
+    /// `shadow` is armed AND the packet carries terrain instances
+    /// (the zeroed `SU` keeps `fs_terrain` on the `sun_occlusion`
+    /// ray-march, bit-identical to the pre-cascade build). Ocean
+    /// instances deliberately do not cast (water receives shadows
+    /// only — the ray-march fallback's semantics).
     pub fn draw_shadow(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -1424,13 +1445,19 @@ impl TerrainRenderer {
         queue: &wgpu::Queue,
         packet: &TerrainPacket,
         shadow: &ShadowUniforms,
+        cast: Option<(wgpu::Buffer, u32)>,
     ) {
+        self.shadow.write_uniforms(queue, shadow);
         if !shadow.armed() || packet.terrain.is_empty() {
             return;
         }
         self.ensure_grid(queue);
-        self.upload_instances(device, queue, packet);
-        self.shadow.write_uniforms(queue, shadow);
+        // The depth vertex stage displaces through the SAME uniforms
+        // + heightfield the visible pass will read a moment later —
+        // sync them now (this call leads the frame), or the map would
+        // rasterize against stale/placeholder data (see
+        // `sync_resources`).
+        self.sync_resources(device, queue, packet);
         self.shadow.draw_terrain(
             encoder,
             ShadowDraw {
@@ -1440,8 +1467,27 @@ impl TerrainRenderer {
                 instances: self.instances.buffer.slice(0..self.inst_bytes),
                 index_count: self.grid_index_count,
                 instance_count: packet.terrain.len() as u32,
+                flight: cast,
             },
         );
+    }
+
+    /// 3b cascade hand-off (R1): the `SU` uniform buffer + the
+    /// receiving group(1) layout + bind group — everything the flight
+    /// renderer needs to cast into and receive from the same cascades
+    /// this renderer owns. `FlightRenderer::new` consumes the tuple.
+    pub fn cascade_resources(&self) -> (&wgpu::Buffer, &wgpu::BindGroupLayout, &wgpu::BindGroup) {
+        self.shadow.cascade_resources()
+    }
+
+    /// The cascade depth-array texture — diagnostic readback handle
+    /// (the array carries `COPY_SRC` for exactly this). The device
+    /// test suite uses it to pin that casts actually LAND in the map:
+    /// the silent-discard failure mode leaves every layer at the 1.0
+    /// clear and no validation error is ever raised.
+    #[cfg(test)]
+    pub(crate) fn cascade_texture(&self) -> &wgpu::Texture {
+        self.shadow.cascade_texture()
     }
 
     /// The ocean phase — call from the same open pass AFTER the flight

@@ -167,7 +167,12 @@ fn render_probe_frame(
         view_formats: &[],
     });
     let target = color_tex.create_view(&wgpu::TextureViewDescriptor::default());
-    let mut flight = FlightRenderer::new(device, FORMAT, (W, H));
+    // Terrain first — the flight renderer borrows the cascade
+    // resources (R1/3b) from it, mirroring the app's construction.
+    // The probe's packets are disarmed (`shadow` defaults to the
+    // zeroed row), so the cascade path stays dead in these frames.
+    let terrain = csp_render::terrain::TerrainRenderer::new(device, FORMAT);
+    let mut flight = FlightRenderer::new(device, FORMAT, (W, H), &terrain);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("depth-probe"),
     });

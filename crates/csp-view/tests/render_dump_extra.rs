@@ -346,7 +346,12 @@ fn dump_parts() {
     let msaa_tex = msaa_target(&device, "parts-dump-msaa");
     let msaa = msaa_tex.create_view(&wgpu::TextureViewDescriptor::default());
     let target = tex.create_view(&wgpu::TextureViewDescriptor::default());
-    let mut flight = csp_render::flight::FlightRenderer::new(&device, FORMAT, (W, H));
+    // Terrain first — the flight renderer borrows the cascade
+    // resources (R1/3b) from it, mirroring the app's construction.
+    // This packet is disarmed (`shadow` defaults), so the cascade
+    // path stays dead here; the pair exists for layout parity.
+    let terrain = csp_render::terrain::TerrainRenderer::new(&device, FORMAT);
+    let mut flight = csp_render::flight::FlightRenderer::new(&device, FORMAT, (W, H), &terrain);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("parts-dump"),
     });

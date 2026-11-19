@@ -231,6 +231,10 @@ fn render_flight_scene(
 }
 
 /// Sized variant — the 256 B copy-row alignment must divide `w*4`.
+/// Dump A/B knob: `DUMP_SHADOWS=0` zeroes the packet's cascade row
+/// before rendering, so the SAME frame can be rasterized armed and
+/// disarmed for the phase-3b shadow-evidence diff (the standing gate
+/// tests never set it — they always exercise the extract's real row).
 #[allow(clippy::too_many_lines)] // one render-pass recipe for the gate
 fn render_flight_scene_sized(
     device: &wgpu::Device,
@@ -239,6 +243,16 @@ fn render_flight_scene_sized(
     w: u32,
     h: u32,
 ) -> Vec<u8> {
+    let disarmed = std::env::var("DUMP_SHADOWS").is_ok_and(|v| v == "0");
+    let zeroed;
+    let packet = if disarmed {
+        let mut p = packet.clone();
+        p.shadow = csp_render::shadow::ShadowUniforms::default();
+        zeroed = p;
+        &zeroed
+    } else {
+        packet
+    };
     // Same target layout as the app: a 4×-multisampled color
     // attachment resolved into the single-sampled readback texture.
     let msaa_tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -271,11 +285,21 @@ fn render_flight_scene_sized(
         view_formats: &[],
     });
     let target = color_tex.create_view(&wgpu::TextureViewDescriptor::default());
-    let mut flight = csp_render::flight::FlightRenderer::new(device, FORMAT, (w, h));
+    // Terrain first: the flight renderer borrows the cascade
+    // resources (R1/3b) from it, mirroring the app's construction.
     let mut terrain = csp_render::terrain::TerrainRenderer::new(device, FORMAT);
+    let mut flight = csp_render::flight::FlightRenderer::new(device, FORMAT, (w, h), &terrain);
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("render-gate"),
     });
+    // The R1/3b cascade phase, exactly where the app records it:
+    // BEFORE the scene pass, craft cast staged from the same packet.
+    // Disarmed packets (all-zero `SU`) still take the call — it is
+    // the disarm write path too.
+    if let Some(tp) = &packet.terrain {
+        let cast = flight.stage_cascade_cast(device, queue, packet);
+        terrain.draw_shadow(&mut encoder, device, queue, tp, &packet.shadow, cast);
+    }
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("scene"),
@@ -736,7 +760,7 @@ fn dump_sky() {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
-    let flight = csp_render::flight::FlightRenderer::new(&device, FORMAT, (W, H));
+    let flight = csp_render::flight::FlightRenderer::new(&device, FORMAT, (W, H), &terrain);
     let aspect = f64::from(W) / f64::from(H);
     let t = (35.0f64.to_radians()).tan(); // ~70° vertical fov
     // Column-major view→world rotations: the sky ray is
@@ -902,12 +926,20 @@ fn dump_low() {
         out.extend_from_slice(&px[..3]);
     }
     std::fs::write(&name, &out).unwrap();
-    // Count near-white pixels for the sweep.
+    // Count near-white pixels for the sweep + report the cascade arm
+    // state (3b) — a dawn/night frame honestly renders disarmed.
     let white = img
         .chunks_exact(4)
         .filter(|p| p[0] > 235 && p[1] > 235 && p[2] > 235)
         .count();
-    eprintln!("{name}: white={white}");
+    eprintln!(
+        "{name}: white={white} shadows={}",
+        if packet.shadow.armed() {
+            "armed"
+        } else {
+            "disarmed"
+        }
+    );
 }
 
 /// Scratch dump of an actually-ascending craft: seed + throttle 1.0,
@@ -972,7 +1004,14 @@ fn dump_flight() {
         .chunks_exact(4)
         .filter(|p| p[0] > 235 && p[1] > 215)
         .count();
-    eprintln!("{name}: alt={a:.0} white={white}");
+    eprintln!(
+        "{name}: alt={a:.0} white={white} shadows={}",
+        if packet.shadow.armed() {
+            "armed"
+        } else {
+            "disarmed"
+        }
+    );
 }
 
 /// The pack's per-class means → the `class_means` uniform, mirroring
@@ -1247,6 +1286,29 @@ fn dump_surface() {
     };
     let fp = csp_render::flight::FlightPacket {
         terrain: Some(packet),
+        // 3b: solve the cascades for this probe's hand-built camera —
+        // the same arm predicate + solve the real extract applies,
+        // reconstructed here because the probe bypasses `extract_flight`
+        // (basis: the `fwd`/`dir` it already built; sun [−1,0,0]).
+        shadow: {
+            let sun = DVec3::new(-1.0, 0.0, 0.0);
+            if csp_view::flight::cascades_armed(sun, dir) {
+                csp_render::shadow::solve_cascades(
+                    &csp_render::shadow::ShadowCamera {
+                        sun_dir: sun,
+                        forward: fwd,
+                        up: dir,
+                        fov_y: fovy,
+                        aspect,
+                        near_m: 0.1,
+                    },
+                    &csp_render::shadow::CascadeConfig::default(),
+                )
+                .uniforms
+            } else {
+                csp_render::shadow::ShadowUniforms::default()
+            }
+        },
         ..Default::default()
     };
     let img = render_flight_scene(&device, &queue, &fp);
@@ -1260,7 +1322,14 @@ fn dump_surface() {
         .chunks_exact(4)
         .filter(|p| p[0] > 235 && p[1] > 215)
         .count();
-    eprintln!("{name}: h_here={h_here:.0} white={white}");
+    eprintln!(
+        "{name}: h_here={h_here:.0} white={white} shadows={}",
+        if fp.shadow.armed() {
+            "armed"
+        } else {
+            "disarmed"
+        }
+    );
 }
 
 /// Scratch visual dump — write the seeded frame to /tmp/frame.ppm.

@@ -582,7 +582,21 @@ fn cascade_one(wrel: vec3<f32>, n: vec3<f32>, tan_slope: f32,
                vp: mat4x4<f32>, cb: vec4<f32>, layer: i32) -> f32 {
     let p = wrel + n * (cb.y * (1.0 + tan_slope));
     let cd = vp * vec4<f32>(p, 1.0);
-    let uv = clamp(cd.xy * 0.5 + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
+    // Out of the cascade's ortho volume ⇒ no coverage: sampling the
+    // clamped edge instead would compare against near-plane-clipped
+    // geometry and read as occluded (whole-valley false shadow). Lit
+    // is the conservative answer — the ray-march handles the regime
+    // where it matters (grazing sun keeps the fallback armed anyway).
+    if (abs(cd.x) > 1.0 || abs(cd.y) > 1.0 || cd.z <= 0.0 || cd.z >= 1.0) {
+        return 1.0;
+    }
+    // Texel v runs opposite NDC y: the rasterizer writes NDC y=+1 at
+    // row 0, so the read must MIRROR y (`0.5 − y·0.5`). The unmirrored
+    // form sampled the horizontally-flipped column — up to km-scale
+    // phantom sunward depths and whole-valley false shadow at high
+    // sun (3b's "76° pad" artifact, root-caused by readback A/B).
+    let uv = clamp(vec2<f32>(cd.x * 0.5 + 0.5, 0.5 - cd.y * 0.5),
+                   vec2<f32>(0.0), vec2<f32>(1.0));
     let ref_d = clamp(cd.z - cb.z * (1.0 + tan_slope), 0.0, 1.0);
     return textureSampleCompareLevel(shadow_tex, shadow_samp, uv, layer, ref_d);
 }

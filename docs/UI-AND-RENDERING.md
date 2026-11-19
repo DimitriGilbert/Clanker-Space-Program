@@ -19,7 +19,7 @@ The four crates, and the only direction data flows:
 | Crate | Role | Key files |
 |---|---|---|
 | `csp-view` | bevy_ecs presentation world; mirrors sim → render/UI packets | `crates/csp-view/src/{lib,flight,map,vab,terrain,structures,part_mesh,art,demo,tutorial}.rs` |
-| `csp-render` | wgpu device, pipelines, WGSL; knows nothing of `csp-sim` | `crates/csp-render/src/{lib,terrain,terrain.wgsl,map,map.wgsl,flight,flight.wgsl,vab,vab.wgsl}` |
+| `csp-render` | wgpu device, pipelines, WGSL; knows nothing of `csp-sim` | `crates/csp-render/src/{lib,terrain,terrain.wgsl,map,map.wgsl,flight,flight.wgsl,flight_shadow.wgsl,vab,vab.wgsl}` |
 | `csp-ui` | pure egui panels + the VAB session model + settings/keymap | `crates/csp-ui/src/{lib,program,game,vab,settings,tutorial,navball}.rs` |
 | `csp-app` | winit shell, input dispatch, warp controller, audio, save IO | `crates/csp-app/src/{lib,warp,audio,synth,settings_io,bugreport,logring,main}.rs` |
 
@@ -620,8 +620,9 @@ wins).
 |---|---|---|
 | `map.wgsl` (48 lines) | `vs_main`/`fs_main` | Unlit map primitives; vertices pre-projected on CPU; fragment shapes quad kind 0 line / 1 disc / 2 ring / 3 glow |
 | `vab.wgsl` (107) | `vs_main`/`fs_main` + pick fragment | Per-pixel-lit editor parts (hemisphere ambient × baked occlusion, key light, Blinn specular, fresnel rim); pick writes the 1-based object id |
-| `flight.wgsl` (104) | one vs/fs pair | Same per-pixel lighting as VAB minus pick, plus the unlit passthrough (`nrm ≈ 0`); ACES (Narkowicz) tone-map shared with terrain so lit hulls match the ground |
-| `terrain.wgsl` (1282) | `vs_terrain`/`fs_terrain` (`:412`/`:792`), `vs_sky`/`fs_sky` (`:1023`/`:1154`), `vs_shadow0`/`vs_shadow1` (`:438`/`:446`, depth-only cascade pass; the shared displacement is `terrain_displace`, `:383`) | Quadtree terrain, ocean, and the sky/atmosphere/starfield — see §8; the shadow entry points feed §7.4's cascade map |
+| `flight.wgsl` (208) | `vs_main`/`fs_main` | Same per-pixel lighting as VAB minus pick, plus the unlit passthrough (`nrm ≈ 0`); ACES (Narkowicz) tone-map shared with terrain so lit hulls match the ground. Since 3b: the direct-sun terms multiply the cascade `sun_visibility` (a C16-F3 duplication of terrain.wgsl's receive half — no WGSL include mechanism) |
+| `flight_shadow.wgsl` (69) | `vs_shadow0`/`vs_shadow1` (3b craft cast, depth-only) | Drops the flight stream into §7.4's cascade map. A dedicated module on purpose: the cast pipelines ride a minimal group(0) (`SU` alone at binding 8), and sharing flight.wgsl left its `light`/group(1) declarations dangling against that layout, which de-registered the uniform binding on-device (the cast silently discarded — see the file header) |
+| `terrain.wgsl` (1296) | `vs_terrain`/`fs_terrain` (`:412`/`:792`), `vs_sky`/`fs_sky` (`:1037`/`:1168`), `vs_shadow0`/`vs_shadow1` (`:438`/`:446`, depth-only cascade pass; the shared displacement is `terrain_displace`, `:383`) | Quadtree terrain, ocean, and the sky/atmosphere/starfield — see §8; the shadow entry points feed §7.4's cascade map |
 
 All four are parse+validate gated by a unit test
 (`shaders_parse_and_validate`, `csp-render/src/lib.rs:476`) so shader
@@ -672,18 +673,19 @@ The vessel blob shadow (`uniforms.shadow`, `vessel_shadow`,
 surface; `csp-view/terrain.rs::build_packet` (`:557`) assembles the whole
 `TerrainPacket` per frame from the staged `FlightEnv` + chase camera.
 
-**Shadow cascades (R1 core, landed terrain-overhaul 3a — not yet armed).**
-`csp-render/src/shadow.rs` owns the whole cascade core: the pure f64
-per-frame solve (`solve_cascades` — two sun-aligned ortho cascades fit to
-the chase camera's frustum slices at ~0–2 km and ~2–20 km, light basis
-fixed per sun direction, ortho extents quantized onto a √2 world-texel
-ladder and the box center texel-snapped so sub-texel camera motion
-reproduces bit-identical matrices), the GPU map (one 2-layer 2048²
-`Depth32Float` array, 2×2048²×4 B = 33.5 MB, sampled through a `LessEqual`
-**comparison sampler** — all core WebGPU, `Features::empty()` untouched),
-and two depth-only pipelines (`vs_shadow0/1`) whose vertex stage shares
-`terrain_displace` with `vs_terrain`, so the depth pass displaces vertices
-identically to the visible pass. The receiving half lives in `terrain.wgsl`:
+**Shadow cascades (R1 core, landed 3a — ARMED since 3b; the R1 debt is
+closed).** `csp-render/src/shadow.rs` owns the whole cascade core: the
+pure f64 per-frame solve (`solve_cascades` — two sun-aligned ortho
+cascades fit to the chase camera's frustum slices at ~0–2 km and
+~2–20 km, light basis fixed per sun direction, ortho extents quantized
+onto a √2 world-texel ladder and the box center texel-snapped so
+sub-texel camera motion reproduces bit-identical matrices), the GPU map
+(one 2-layer 2048² `Depth32Float` array, 2×2048²×4 B = 33.5 MB, sampled
+through a `LessEqual` **comparison sampler** — all core WebGPU,
+`Features::empty()` untouched), and two depth-only pipelines
+(`vs_shadow0/1`) whose vertex stage shares `terrain_displace` with
+`vs_terrain`, so the depth pass displaces vertices identically to the
+visible pass. The receiving half lives in `terrain.wgsl`:
 `sun_visibility` picks the cascade by eye-distance (conservative against
 view-Z), applies normal-offset + slope-scaled reference bias tuned for the
 M5 relief ceiling (~37° slopes), blends a band at the split, and multiplies
@@ -696,22 +698,92 @@ render pass (used or not), so the depth passes must never bind the texture
 they render into (and csp-view builds `TerrainUniforms`/`TerrainPacket` with
 exhaustive literals, so the cascade data stays in a csp-render-owned buffer
 either way — see §7.2).
-**Armed state: nothing calls `TerrainRenderer::draw_shadow` yet.** Phase 3b
-wires the view-side per-frame solve (`solve_cascades` fed by the chase
-camera + `FlightEnv` sun) and the app frame-loop call
-(`draw_shadow` → `draw` → flight `draw` → `draw_ocean`); craft casting into
-the map is 3b's extension point inside `ShadowCore::draw_terrain`. Until
-then the zeroed `SU` buffer keeps `fs_terrain` on the ray-march path and
-the render output is pixel-identical to the pre-cascade build. Device
-coverage: the render gate constructs the core disarmed (pipeline layouts +
-entry points checked on a real adapter); the ARMED frame is validated by
-csp-render's own `armed_cascade_passes_validate_on_device` (an armed solve,
-`draw_shadow`, then the scene pass — asserting zero wgpu validation
-errors; skips adapter-less hosts unless `CSP_SHADOW_GATE_REQUIRED=1`).
 The receiving bias moves the comparison reference TOWARD the sun
 (normal-offset along `+n` plus a subtracted slope bias — map depth is
 forward-Z-along-travel, lit ⇔ ref ≤ stored), pinned by the
 `bias_moves_reference_toward_the_sun` unit test.
+
+**The armed path (3b) — who computes what, per flight frame:**
+
+1. *View solve* (`csp-view/src/flight.rs`, RenderExtract — §2.5:
+   presentation-only, never the sim): inside `extract_flight`'s terrain
+   gate, `cascade_uniforms` recovers the chase basis from the solved
+   `view_proj` (row 3 is `−z_out` under reverse-Z, the same recovery
+   `sky_view_rot` uses) and hands `solve_cascades` the forward/up/
+   `FLIGHT_FOV_Y`/viewport aspect/near 0.1 + the staged `FlightEnv` sun.
+   The product rides the flight packet (`FlightPacket::shadow`,
+   consumed via `View::take_flight_packet` like every other packet
+   row). **Arm predicate**: solve only while sun·up at the chase focus
+   exceeds `SHADOW_ARM_SUN_UP = 0.06` (≈3.4° elevation — just above
+   `sun_occlusion`'s 0.035 full-occlude and the blob's 0.04 disable, so
+   no band exists where the cascade replaces a dimmer fallback; below
+   it, an ortho sun-fit degenerates into shadows too long for a 20 km
+   box and the ray-march's long soft terminator shadows own the look).
+   Disarm is the all-zero row, and `draw_shadow` writes it every frame
+   (armed or not) so no stale armed matrices survive a sunset or mode
+   switch.
+2. *App frame loop* (`csp-app` `paint`): when the mode is Flight and
+   the packet carries terrain, `FlightRenderer::stage_cascade_cast`
+   uploads the flight stream, then `TerrainRenderer::draw_shadow`
+   records both cascade passes on the encoder BEFORE the scene pass
+   (`draw_shadow` → terrain `draw` → flight `draw` → `draw_ocean` —
+   the order 3a's device test pinned). `draw_shadow` first re-syncs the
+   frame's uniforms/heightfield (`sync_resources`, shared with `draw`)
+   so the depth pass displaces against exactly what the visible pass is
+   about to draw. Map and VAB frames never reach the call — their
+   scenes stay shadow-free by design.
+3. *Casting*: terrain instances (never ocean — water receives only) plus
+   **the craft**: `ShadowCore` carries a second pair of depth-only
+   pipelines built from the dedicated `flight_shadow.wgsl` module
+   (`vs_shadow0/1` over the `FlightVertex` layout, riding their own
+   minimal group(0) — the `SU` uniform alone at binding 8; see §7.3
+   for why that module is separate), and each cascade layer's pass
+   records one additional whole-stream draw after the terrain batch —
+   hulls, debris and the launch-complex structures land in the map;
+   unlit vertices (sky quads, plumes, dust, contact quads — zero
+   normal, placeholder `world`) are degenerated outside the clip
+   volume so emissive geometry never casts. The vessel **blob shadow
+   stays** this phase (harmless overlap under the sharper craft
+   shadow; removal is later polish).
+4. *Receiving*: terrain/ocean as above, and `flight.wgsl`'s own
+   `sun_visibility` twin (C16-F3 duplication — no WGSL include
+   mechanism; cross-referenced in both files) multiplies the craft
+   pass's direct-sun diffuse and Blinn specular terms by the same
+   cascade lookup (eye-distance = `length(world)`, the same split/
+   blend/bias rows), so a ridge line crossing the sun darkens hull and
+   ground together. Disarmed or beyond coverage ⇒ full light: the
+   pre-cascade craft shading is the fallback. The craft's terrain bias
+   rows are the terrain-tuned texels — hull self-shadowing at cascade-0
+   texels is peter-panned away rather than acned (the blob covers the
+   contact case this phase).
+
+Device coverage: the render gate constructs and draws the full armed
+frame (its dawn boot scene arms whenever the spawn-time sun clears the
+threshold; the `dump_surface`/`dump_flight` probes render armed
+deliberately and their `DUMP_SHADOWS=0` A/B knob isolates the cascade
+contribution), and csp-render's own
+`armed_cascade_passes_validate_on_device` runs an armed solve + terrain
+cast + craft cast + visible pass — asserting zero wgpu validation
+errors; skips adapter-less hosts unless `CSP_SHADOW_GATE_REQUIRED=1`.
+
+**The 3b "high-sun artifact" — RESOLVED (mirrored cascade read).**
+During arming, the pad probe reported 79% of ground falsely shadowed
+at 76° sun. Root cause: `cascade_one` computed
+`uv = cd.xy·0.5 + 0.5`, but WebGPU rasterization writes NDC y=+1 at
+texture row 0 — the read must MIRROR y (`0.5 − cd.y·0.5`, applied to
+both terrain.wgsl's and flight.wgsl's `cascade_one`). The unmirrored
+form sampled the vertically-flipped light column, comparing each
+receiver against up-to-km-scale phantom sunward depth — the error
+grew with the receiver's NDC-y spread, which is why near-zenith sun
+(high light-space y leverage) was worst and mid elevations looked
+plausible while actually under-shadowing. Post-fix evidence: the pad
+probe is bit-identical armed vs disarmed (0/76800 ground px — correct:
+a CPU sun-ray march finds no occluders there), a whole-field physics
+survey (1 007 directions, 91-point site grids) confirms the authored
+relief under the probe's fixed sun casts only isolated small shadows
+(no multi-texel patches), and the device readback test pins that both
+casts land. The out-of-volume guard (outside the ortho box ⇒ lit,
+never edge-clamped) stays as correct CSM hygiene.
 
 ### 7.5 Sky, atmosphere, and the star field (current state)
 
@@ -822,19 +894,13 @@ Other §5 rows, plan vs code:
   comparison and no ΔE2000 machinery — only one tier exists.
 - **§5.2 phases**: R0 (forward, reverse-Z, analytic sky, camera-relative) ✓;
   R1 (depth validation at 1e7 m, plasma, editor + GPU picking) ✓, and its
-  last open term — **shadow cascades — has its core landed** (terrain-overhaul
-  3a: `csp-render/src/shadow.rs` solve + cascade-map passes + the receiving
-  `fs_terrain` path, §7.4). Precisely: the cascade core exists, is
-  constructed disarmed by every flight frame (the render gate included, so
-  pipeline layouts/entry points are device-checked), and its ARMED
-  end-to-end frame is device-validated by csp-render's own
-  `armed_cascade_passes_validate_on_device` (headless adapter; skips
-  adapter-less hosts unless `CSP_SHADOW_GATE_REQUIRED=1`), but **nothing
-  arms it yet** — phase 3b wires the view-side per-frame solve and the frame
-  loop's `draw_shadow` call. Until 3b the only shadows in a rendered frame
-  are still the terrain blob shadow and structure contact quads, and
-  `sun_occlusion`'s ray-march shades terrain sun terms exactly as before
-  (bit-identical by the armed flag's short-circuit);
+  last open term — **shadow cascades — is closed** (terrain-overhaul 3a
+  landed the core, 3b armed it: §7.4's full path — the view's per-frame
+  `solve_cascades` riding the flight packet, the app's `draw_shadow`
+  before the scene pass, terrain + craft casting, terrain/ocean/craft
+  receiving; the `sun_occlusion` ray-march stays the far-field and
+  disarm fallback, and the vessel blob shadow remains pending removal
+  as later polish);
   R2 (quadtree, LUT scattering, ocean, planet-scale LOD) ✓; R3 (Advanced) —
   cut to post-v1 per §6.4; R4 — absent, as planned.
 - **§5.1 Baseline post row "FXAA/none"** — code ships 4× MSAA instead

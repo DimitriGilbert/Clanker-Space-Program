@@ -17,9 +17,9 @@ pub mod terrain;
 /// The R1 shadow-cascade core (PLAN §5.2 row R1 "shadow cascades" — the
 /// row's last unshipped term): the pure per-frame cascade solve
 /// ([`shadow::solve_cascades`]), the GPU cascade-map passes
-/// (`ShadowCore`), and the receiving `fs_terrain` path's uniforms.
-/// Terrain-overhaul phase 3a ships the core disarmed; phase 3b wires
-/// the view-side solve + frame loop that arms it.
+/// (`ShadowCore`, terrain + craft cast), and the receiving paths'
+/// uniforms. Terrain-overhaul 3a shipped the core; 3b armed it — the
+/// view solves per frame and the frame loop records the passes.
 pub mod shadow;
 
 /// The M3 VAB craft view + GPU picking (PLAN M3 exit row "GPU picking",
@@ -486,6 +486,7 @@ mod tests {
             ("map.wgsl", include_str!("map.wgsl")),
             ("vab.wgsl", include_str!("vab.wgsl")),
             ("flight.wgsl", include_str!("flight.wgsl")),
+            ("flight_shadow.wgsl", include_str!("flight_shadow.wgsl")),
             ("terrain.wgsl", include_str!("terrain.wgsl")),
         ] {
             let module = naga::front::wgsl::parse_str(src)

@@ -1,13 +1,15 @@
 //! Shadow-cascade core — the R1 debt (PLAN §5.2 row R1: "shadow
-//! cascades"; every other term of that row shipped at M3–M4, which is
-//! why §8 of `docs/UI-AND-RENDERING.md` could say "no shadow maps
-//! anywhere"). Terrain-overhaul phase 3a lands the renderer-side core;
-//! phase 3b arms it (the `csp-view` per-frame solve feeding
-//! [`solve_cascades`] + the app frame loop calling
-//! [`crate::terrain::TerrainRenderer::draw_shadow`] before the scene
-//! pass). Until then everything here is inert: the default
-//! [`ShadowUniforms`] is disarmed and `fs_terrain` keeps the
-//! `sun_occlusion` ray-march bit-for-bit.
+//! cascades"; every other term of that row shipped at M3–M4, which
+//! is why §8 of `docs/UI-AND-RENDERING.md` could say "no shadow
+//! maps anywhere"). Terrain-overhaul phase 3a landed the
+//! renderer-side core; phase 3b arms it: the `csp-view` flight
+//! extract solves [`solve_cascades`] per frame (fed by the chase
+//! camera + `FlightEnv` sun, riding the flight packet's
+//! [`crate::flight::FlightPacket::shadow`] row) and the app frame
+//! loop calls [`crate::terrain::TerrainRenderer::draw_shadow`]
+//! before the scene pass. The default [`ShadowUniforms`] stays the
+//! disarm row: night/grazing sun (see the view's arm threshold) and
+//! every non-flight mode render exactly as before.
 //!
 //! # What lives here
 //!
@@ -33,7 +35,10 @@
 //!   `terrain_displace` with `vs_terrain`, so the depth pass moves
 //!   vertices identically to the visible pass — a diverging
 //!   displacement would de-register map and receiver by whole
-//!   texels), and the per-layer render passes.
+//!   texels), the per-layer render passes, and — since 3b — the
+//!   craft-cast twins of those pipelines (`flight.wgsl`'s
+//!   `vs_shadow0/1` over the flight vertex stream) that put hulls and
+//!   launch-site structures into the same cascade map.
 //!
 //! # Cascade design (the constants below carry their own rationale)
 //!
@@ -43,8 +48,8 @@
 //! quads RECEIVE cascade shadows but never cast them (the ray-march
 //! fallback never let water shadow the seabed either; light loss
 //! through water is the depth-tint term's job). Craft casting is
-//! 3b's documented extension point: add the flight stream's
-//! depth-only draw to the same cascade passes.
+//! 3b's shipped extension: the flight vertex stream's depth-only
+//! draw rides the same cascade passes (see [`ShadowDraw::flight`]).
 //!
 //! # Why a dedicated uniform buffer (not `TerrainUniforms` fields)
 //!
@@ -467,6 +472,13 @@ pub(crate) struct ShadowDraw<'a> {
     pub index_count: u32,
     /// Terrain instance count this frame.
     pub instance_count: u32,
+    /// 3b craft cast: the flight vertex buffer + vertex count (the
+    /// stream `FlightRenderer::stage_cascade_cast` uploaded this
+    /// frame). `None`/0 casts terrain only. The cast pipelines ride
+    /// the SAME terrain group(0) — binding 8's `SU` uniform is what
+    /// their vertex stage reads — so no bind group change is needed
+    /// between the terrain and craft draws inside a layer's pass.
+    pub flight: Option<(wgpu::Buffer, u32)>,
 }
 
 /// GPU owner of the cascade resources: the 2-layer depth array, the
@@ -483,8 +495,21 @@ pub(crate) struct ShadowDraw<'a> {
 /// those alive for exactly as long as this struct lives.
 pub(crate) struct ShadowCore {
     pipes: [wgpu::RenderPipeline; 2],
+    /// 3b craft-cast twins (`flight.wgsl` `vs_shadow0/1` over the
+    /// `FlightVertex` layout): depth-only like the terrain pair, one
+    /// per layer, riding the terrain group(0) for the `SU` matrices.
+    flight_pipes: [wgpu::RenderPipeline; 2],
+    /// The craft-cast group(0) bind group over the `SU` uniform
+    /// (binding 8 — see `flight_shadow.wgsl`'s header for why the
+    /// cast keeps a dedicated minimal layout/bind group).
+    flight_bind: wgpu::BindGroup,
     /// Per-layer attachment views (2D, single layer).
     layers: [wgpu::TextureView; 2],
+    /// The depth array handle (views keep it alive anyway; kept for
+    /// the test readback — `cfg(test)` so release builds carry no
+    /// dead field).
+    #[cfg(test)]
+    cascade_tex: wgpu::Texture,
     /// The `SU` cascade uniform (terrain group(0) binding 8).
     uniforms: wgpu::Buffer,
     /// The RECEIVING bind group's layout (group(1)): depth array +
@@ -502,7 +527,9 @@ pub(crate) struct ShadowCore {
 /// per-pass depth attachments; the array view (depth aspect) is what
 /// group(1) samples through. The texture handle itself stays alive
 /// through the views' Arcs.
-fn depth_array(device: &wgpu::Device) -> ([wgpu::TextureView; 2], wgpu::TextureView) {
+fn depth_array(
+    device: &wgpu::Device,
+) -> ([wgpu::TextureView; 2], wgpu::TextureView, wgpu::Texture) {
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("terrain-shadow-depth"),
         size: wgpu::Extent3d {
@@ -514,7 +541,9 @@ fn depth_array(device: &wgpu::Device) -> ([wgpu::TextureView; 2], wgpu::TextureV
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Depth32Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
     let layer_view = |layer: u32| {
@@ -532,7 +561,8 @@ fn depth_array(device: &wgpu::Device) -> ([wgpu::TextureView; 2], wgpu::TextureV
         aspect: wgpu::TextureAspect::DepthOnly,
         ..wgpu::TextureViewDescriptor::default()
     });
-    ([layer_view(0), layer_view(1)], sample_view)
+    let out = tex.clone();
+    ([layer_view(0), layer_view(1)], sample_view, out)
 }
 
 /// Comparison sampler, LessEqual: a receiver is lit when its biased
@@ -599,48 +629,54 @@ fn sample_group(
     (bgl, bind)
 }
 
-/// The two depth-only pipelines (`vs_shadow0`/`vs_shadow1`): no
-/// fragment stage, single-sample (the cascade map is its own
-/// attachment — the MSAA surface contract belongs to the visible
-/// pipelines), forward-Z `Less` against a 1.0 clear (nothing
-/// rasterized closer ⇒ receiver lit). They ride the terrain
-/// group(0) alone — never the depth texture in a binding.
-fn depth_pipelines(
+/// One depth-only pipeline: no fragment stage, single-sample (the
+/// cascade map is its own attachment — the MSAA surface contract
+/// belongs to the visible pipelines), forward-Z `Less` against a 1.0
+/// clear (nothing rasterized closer ⇒ receiver lit). The terrain
+/// entries (`vs_shadow0/1`) ride the terrain group(0) alone — never
+/// the depth texture in a binding; the craft-cast entries
+/// (`flight.wgsl`'s twins of the same names) ride it too, reading
+/// only binding 8 (`SU`) in the vertex stage.
+fn depth_pipeline(
     device: &wgpu::Device,
     shader: &wgpu::ShaderModule,
+    entry: &'static str,
     terrain_bgl: &wgpu::BindGroupLayout,
     vertex_buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
-) -> [wgpu::RenderPipeline; 2] {
+) -> wgpu::RenderPipeline {
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("terrain-shadow"),
         bind_group_layouts: &[Some(terrain_bgl)],
         immediate_size: 0,
     });
-    let make = |entry: &'static str| {
-        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("terrain-shadow"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: shader,
-                entry_point: Some(entry),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: vertex_buffers,
-            },
-            fragment: None,
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        })
-    };
-    [make("vs_shadow0"), make("vs_shadow1")]
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("terrain-shadow"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some(entry),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: vertex_buffers,
+        },
+        fragment: None,
+        // Two-sided like the visible flight pass (it never culls): a
+        // hull's back faces must reach the map or the craft would
+        // cast a hollow shadow at grazing sun.
+        primitive: wgpu::PrimitiveState {
+            cull_mode: None,
+            ..wgpu::PrimitiveState::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Less),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
 }
 
 impl ShadowCore {
@@ -648,14 +684,21 @@ impl ShadowCore {
     /// bind-group layout (bindings 0–7 plus the `SU` uniform at 8) —
     /// the shadow pipelines ride the SAME group(0) so the depth pass
     /// reads the very uniforms/heightfield the visible pass does,
-    /// and never sees the depth texture in a binding.
+    /// and never sees the depth texture in a binding. Since 3b the
+    /// craft-cast pair is built here too, from `flight.wgsl` over the
+    /// [`crate::flight::FlightVertex`] layout — the documented 3a
+    /// extension point, shipped.
     pub(crate) fn new(
         device: &wgpu::Device,
         shader: &wgpu::ShaderModule,
         terrain_bgl: &wgpu::BindGroupLayout,
         vertex_buffers: &[Option<wgpu::VertexBufferLayout<'_>>],
     ) -> Self {
-        let (layers, sample_view) = depth_array(device);
+        let (layers, sample_view, tex_handle) = depth_array(device);
+        #[cfg(test)]
+        let cascade_tex = tex_handle;
+        #[cfg(not(test))]
+        let _ = tex_handle;
         let sampler = comparison_sampler(device);
         let (sample_bgl, sample_bind) = sample_group(device, &sampler, &sample_view);
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
@@ -664,10 +707,59 @@ impl ShadowCore {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let pipes = depth_pipelines(device, shader, terrain_bgl, vertex_buffers);
+        let pipes = [
+            depth_pipeline(device, shader, "vs_shadow0", terrain_bgl, vertex_buffers),
+            depth_pipeline(device, shader, "vs_shadow1", terrain_bgl, vertex_buffers),
+        ];
+        let flight_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("flight-shadow"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("flight_shadow.wgsl").into()),
+        });
+        let flight_buffers = [Some(crate::flight::FlightVertex::LAYOUT)];
+        let flight_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("flight-shadow"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 8,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let flight_pipes = [
+            depth_pipeline(
+                device,
+                &flight_shader,
+                "vs_shadow0",
+                &flight_bgl,
+                &flight_buffers,
+            ),
+            depth_pipeline(
+                device,
+                &flight_shader,
+                "vs_shadow1",
+                &flight_bgl,
+                &flight_buffers,
+            ),
+        ];
+        let flight_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("flight-shadow"),
+            layout: &flight_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 8,
+                resource: uniforms.as_entire_binding(),
+            }],
+        });
         Self {
             pipes,
+            flight_pipes,
+            flight_bind,
             layers,
+            #[cfg(test)]
+            cascade_tex,
             uniforms,
             sample_bgl,
             sample_bind,
@@ -691,19 +783,44 @@ impl ShadowCore {
         &self.sample_bind
     }
 
-    /// Upload the frame's [`ShadowUniforms`] (skipped while disarmed
-    /// — the zeroed buffer keeps `fs_terrain` on the fallback path).
+    /// The cascade depth-array texture (readback handle — the array
+    /// carries `COPY_SRC` for diagnostics/tests; see
+    /// `TerrainRenderer::cascade_texture`).
+    #[cfg(test)]
+    pub(crate) fn cascade_texture(&self) -> &wgpu::Texture {
+        &self.cascade_tex
+    }
+
+    /// 3b cascade hand-off: everything the flight renderer binds to
+    /// cast into and receive from the cascades — the `SU` uniform
+    /// buffer (its group(0) binding 8, mirroring the terrain's) plus
+    /// the receiving group(1) layout + bind group its visible pass
+    /// sets beside the light. One tuple so
+    /// [`crate::terrain::TerrainRenderer::cascade_resources`] stays a
+    /// single forwarding call.
+    pub(crate) fn cascade_resources(
+        &self,
+    ) -> (&wgpu::Buffer, &wgpu::BindGroupLayout, &wgpu::BindGroup) {
+        (&self.uniforms, &self.sample_bgl, &self.sample_bind)
+    }
+
+    /// Upload the frame's [`ShadowUniforms`]. Callers write it EVERY
+    /// armed-or-not flight frame (3b): a skipped disarm write would
+    /// leave a stale armed buffer driving `fs_terrain`'s cascade path
+    /// with dead matrices after sunset.
     pub(crate) fn write_uniforms(&self, queue: &wgpu::Queue, u: &ShadowUniforms) {
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(u));
     }
 
     /// Record both cascade depth passes — one per array layer, each
     /// drawing the full terrain instance batch through that layer's
-    /// pipeline. The 3b extension point for craft casting is here:
-    /// a depth-only draw of the flight stream inside these same
-    /// passes puts hulls into the cascade map.
+    /// pipeline, then (3b) the flight vertex stream through the
+    /// craft-cast twin: hulls, debris and the launch complex land in
+    /// the same map the terrain casts into, at whole-batch cost —
+    /// one non-indexed draw per layer, exactly how the visible
+    /// flight pass renders the stream.
     pub(crate) fn draw_terrain(&self, encoder: &mut wgpu::CommandEncoder, draw: ShadowDraw<'_>) {
-        for (layer, pipe) in self.layers.iter().zip(self.pipes.iter()) {
+        for (li, layer) in self.layers.iter().enumerate() {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("terrain-shadow"),
                 color_attachments: &[],
@@ -719,12 +836,24 @@ impl ShadowCore {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(pipe);
+            pass.set_pipeline(&self.pipes[li]);
             pass.set_bind_group(0, draw.bind_group, &[]);
             pass.set_vertex_buffer(0, draw.grid_v);
             pass.set_vertex_buffer(1, draw.instances);
             pass.set_index_buffer(draw.grid_i, wgpu::IndexFormat::Uint16);
             pass.draw_indexed(0..draw.index_count, 0, 0..draw.instance_count);
+            if let Some((buf, n)) = &draw.flight
+                && *n > 0
+            {
+                // Own minimal group(0) (binding 8 only — see
+                // `flight_bgl`); the vertex buffer slot rebinds to the
+                // flight stream's stride because the pipeline's
+                // layout changed.
+                pass.set_pipeline(&self.flight_pipes[li]);
+                pass.set_bind_group(0, &self.flight_bind, &[]);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.draw(0..*n, 0..1);
+            }
         }
     }
 }
@@ -737,6 +866,9 @@ impl ShadowCore {
 // Tests signal failure by panicking — §2.13's no-panic rule covers
 // shipping fallible paths, not test code.
 mod tests {
+    // §2.13's no-panic rule covers shipping fallible paths; tests
+    // signal failure by panicking.
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
     fn unit(v: DVec3) -> DVec3 {
@@ -1105,18 +1237,19 @@ mod tests {
         std::env::var("CSP_SHADOW_GATE_REQUIRED").is_ok_and(|v| !v.is_empty() && v != "0")
     }
 
-    /// The ARMED path on a real device (the render gate can't cover
-    /// it — nothing arms cascades until 3b): `draw_shadow` into the
-    /// cascade layers, then the visible scene pass binding group(1)
-    /// — exactly the frame order 3b will use. Asserts zero wgpu
-    /// errors through submit+poll, which is what catches the class
-    /// of bug the pure tests can't see (usage-scope conflicts, bind
-    /// group/pipeline layout mismatches, entry-point typos). Skips
-    /// loudly when no adapter exists — unless
-    /// [`CSP_SHADOW_GATE_REQUIRED`] is set, which makes the missing
-    /// adapter a failure (CI installs lavapipe and sets the flag).
+    /// The ARMED path on a real device: `draw_shadow` (terrain cast +
+    /// 3b's craft cast) into the cascade layers, then the visible
+    /// scene pass binding group(1) — exactly the frame order the app
+    /// uses. Asserts zero wgpu errors through submit+poll, which is
+    /// what catches the class of bug the pure tests can't see
+    /// (usage-scope conflicts, bind group/pipeline layout mismatches,
+    /// entry-point typos). Skips loudly when no adapter exists —
+    /// unless [`CSP_SHADOW_GATE_REQUIRED`] is set, which makes the
+    /// missing adapter a failure (CI installs lavapipe and sets the
+    /// flag).
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
+    #[allow(clippy::too_many_lines)] // one armed frame recipe; splitting fragments the pass order it pins
     fn armed_cascade_passes_validate_on_device() {
         use crate::terrain::TerrainRenderer;
         let Some((device, queue, errored)) = headless_device() else {
@@ -1133,12 +1266,44 @@ mod tests {
             return;
         };
         let (packet, su) = tiny_frame();
-        // The 3b frame order: cascade depth passes (encoder), then
-        // the visible scene pass over an MSAA color + reverse-Z
-        // depth attachment pair like the app's.
+        // The 3b frame order: cascade depth passes (encoder), then the
+        // visible scene pass over an MSAA color + reverse-Z depth
+        // attachment pair like the app's.
         let format = wgpu::TextureFormat::Rgba8UnormSrgb;
         let size = 64u32;
         let mut renderer = TerrainRenderer::new(&device, format);
+        let mut flight =
+            crate::flight::FlightRenderer::new(&device, format, (size, size), &renderer);
+        // A minimal flight stream: one lit triangle (a caster — its
+        // `world` is camera-relative like the real extract emits) and
+        // one unlit (the zero-normal sky/plume shape the cast must
+        // degenerate away rather than project at the eye).
+        let lit = |w: [f32; 3]| crate::flight::FlightVertex {
+            pos: [0.0, 0.0, 0.5],
+            world: w,
+            nrm: [0.0, 0.0, 1.0],
+            color: [0.8, 0.8, 0.8, 1.0],
+            mat: [0.2, 32.0, 1.0],
+        };
+        let unlit = crate::flight::FlightVertex {
+            pos: [0.0, 0.0, 0.5],
+            world: [0.0; 3],
+            nrm: [0.0; 3],
+            color: [0.1, 0.1, 0.2, 1.0],
+            mat: [0.0; 3],
+        };
+        let fp = crate::flight::FlightPacket {
+            vertices: vec![
+                lit([-20.0, -20.0, -300.0]),
+                lit([20.0, -20.0, -300.0]),
+                lit([0.0, 20.0, -300.0]),
+                unlit,
+                unlit,
+                unlit,
+            ],
+            shadow: su,
+            ..crate::flight::FlightPacket::default()
+        };
         let attachment = |format| {
             let tex = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("shadow-test-target"),
@@ -1161,7 +1326,8 @@ mod tests {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("shadow-test"),
         });
-        renderer.draw_shadow(&mut encoder, &device, &queue, &packet, &su);
+        let cast = flight.stage_cascade_cast(&device, &queue, &fp);
+        renderer.draw_shadow(&mut encoder, &device, &queue, &packet, &su, cast);
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shadow-test-scene"),
@@ -1187,12 +1353,141 @@ mod tests {
                 multiview_mask: None,
             });
             renderer.draw(&mut pass, &device, &queue, &packet);
+            flight.draw(&mut pass, &device, &queue, &fp);
         }
+        // And the disarm contract on-device: a following zeroed `SU`
+        // write is legal and silences the cascade path.
+        renderer.draw_shadow(
+            &mut encoder,
+            &device,
+            &queue,
+            &packet,
+            &ShadowUniforms::default(),
+            None,
+        );
         queue.submit([encoder.finish()]);
         let _ = device.poll(wgpu::PollType::wait_indefinitely());
         assert!(
             !errored.load(std::sync::atomic::Ordering::Relaxed),
             "armed cascade frame produced wgpu validation errors"
+        );
+
+        // 3b readback half: pins that the CRAFT CAST actually lands in
+        // the map. The silent-discard failure mode (the module-layout
+        // bug this suite caught during arming) leaves every layer at
+        // the 1.0 clear while raising no wgpu error at all — only a
+        // texel readback can see it. Recipe: a terrain packet whose
+        // single whole-face patch sits on the ANTIPODE of tiny_frame's
+        // +X eye (face 1 — every vertex lands far outside the cascade
+        // z window and clips, so the map starts provably empty), then
+        // a lit craft triangle inside cascade 0's volume MUST mark
+        // layer 0, and the no-cast control MUST stay clear.
+        let eye = DVec3::new(600_800.0, 0.0, 0.0);
+        let mut anti = packet.clone();
+        anti.terrain = vec![crate::terrain::patch_instance(
+            crate::terrain::PatchId {
+                face: 1,
+                level: 0,
+                x: 0,
+                y: 0,
+            },
+            0.0,
+            eye,
+            600_000.0,
+        )];
+        // A lit triangle hovering over the on-axis 1 km ground point,
+        // offset within the camera plane so it survives the light
+        // projection, plus one unlit triangle that must NOT cast.
+        let base = DVec3::new(-1_000.0, 0.0, 0.0);
+        let lit = |o: DVec3| crate::flight::FlightVertex {
+            pos: [0.0, 0.0, 0.5],
+            world: [o.x as f32, o.y as f32, o.z as f32],
+            nrm: [0.0, 0.0, 1.0],
+            color: [0.8, 0.8, 0.8, 1.0],
+            mat: [0.2, 32.0, 1.0],
+        };
+        let unlit = crate::flight::FlightVertex {
+            pos: [0.0, 0.0, 0.5],
+            world: [0.0; 3],
+            nrm: [0.0; 3],
+            color: [0.1, 0.1, 0.2, 1.0],
+            mat: [0.0; 3],
+        };
+        let craft_packet = crate::flight::FlightPacket {
+            vertices: vec![
+                lit(base),
+                lit(base + DVec3::new(0.0, 200.0, 200.0)),
+                lit(base + DVec3::new(0.0, -200.0, 200.0)),
+                unlit,
+                unlit,
+                unlit,
+            ],
+            shadow: su,
+            ..crate::flight::FlightPacket::default()
+        };
+        let mut cast_renderer = TerrainRenderer::new(&device, format);
+        let mut cast_flight =
+            crate::flight::FlightRenderer::new(&device, format, (size, size), &cast_renderer);
+        let stage = cast_flight.stage_cascade_cast(&device, &queue, &craft_packet);
+        let read_layer0 =
+            |renderer: &mut TerrainRenderer, craft: Option<(wgpu::Buffer, u32)>| -> usize {
+                let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("shadow-cast-readback"),
+                });
+                renderer.draw_shadow(&mut enc, &device, &queue, &anti, &su, craft);
+                let row_bytes = (SHADOW_MAP_RES * 4) as u64;
+                let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("shadow-cast-readback"),
+                    size: row_bytes * u64::from(SHADOW_MAP_RES),
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                enc.copy_texture_to_buffer(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: renderer.cascade_texture(),
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::DepthOnly,
+                    },
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &buf,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(row_bytes as u32),
+                            rows_per_image: Some(SHADOW_MAP_RES),
+                        },
+                    },
+                    wgpu::Extent3d {
+                        width: SHADOW_MAP_RES,
+                        height: SHADOW_MAP_RES,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                queue.submit([enc.finish()]);
+                let (tx, rx) = std::sync::mpsc::channel();
+                buf.map_async(wgpu::MapMode::Read, .., move |r| {
+                    let _ = tx.send(r);
+                });
+                let _ = device.poll(wgpu::PollType::wait_indefinitely());
+                rx.recv().unwrap().expect("cast readback map failed");
+                let data = buf.get_mapped_range(..).unwrap().to_vec();
+                buf.unmap();
+                data.chunks_exact(4)
+                    .filter(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) < 1.0)
+                    .count()
+            };
+        // Control first: the antipodal terrain alone leaves layer 0
+        // at the clear — otherwise the assertions below prove nothing.
+        let clear = read_layer0(&mut cast_renderer, None);
+        let covered = read_layer0(&mut cast_renderer, stage);
+        assert_eq!(
+            clear, 0,
+            "the antipodal-terrain control should leave the cascade map empty"
+        );
+        assert!(
+            covered > 100,
+            "the craft cast landed nothing in the cascade map \
+             (covered {covered} texels — the silent-discard regression)"
         );
     }
 }

@@ -841,12 +841,16 @@ impl App {
             gpu.surface_format(),
             (gpu.config.width, gpu.config.height),
         );
+        // Terrain first: the flight renderer borrows the cascade
+        // resources (R1/3b — the `SU` buffer + the receiving group(1))
+        // from it by handle at construction.
+        let terrain_renderer = TerrainRenderer::new(&gpu.device, gpu.surface_format());
         let flight_renderer = FlightRenderer::new(
             &gpu.device,
             gpu.surface_format(),
             (gpu.config.width, gpu.config.height),
+            &terrain_renderer,
         );
-        let terrain_renderer = TerrainRenderer::new(&gpu.device, gpu.surface_format());
         let info = gpu.adapter.get_info();
         self.gpu_info = Some((info.name.clone(), format!("{:?}", info.backend)));
         self.view
@@ -1834,6 +1838,35 @@ impl App {
             &tris,
             &screen,
         );
+
+        // R1 (terrain-overhaul 3b): the cascade depth passes — terrain
+        // instances plus the craft/launch-complex cast — rasterize
+        // BEFORE the scene pass records its draws (the frame order
+        // 3a's device test pinned; both receivers sample the layers
+        // through group(1) inside the pass below). Armed only when the
+        // view's flight extract solved cascades this frame (sun above
+        // the local horizon); a disarmed row still refreshes the GPU
+        // buffer so no stale armed matrices survive a sunset. Map and
+        // VAB frames never reach here — their scenes stay
+        // shadow-free by design.
+        if self.view.mode() == ViewMode::Flight
+            && let (Some(f), Some(t), Some(packet)) = (
+                &mut self.flight_renderer,
+                &mut self.terrain_renderer,
+                &flight_packet,
+            )
+            && let Some(tp) = &packet.terrain
+        {
+            let cast = f.stage_cascade_cast(&gpu.device, &gpu.queue, packet);
+            t.draw_shadow(
+                &mut frame.encoder,
+                &gpu.device,
+                &gpu.queue,
+                tp,
+                &packet.shadow,
+                cast,
+            );
+        }
 
         {
             let mut pass = frame
