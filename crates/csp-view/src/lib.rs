@@ -689,6 +689,10 @@ fn build_ui(
                     t_pe_s: flight_ui.t_pe_s,
                     period_s: flight_ui.period_s,
                     builds: &flight_ui.builds,
+                    // M5 §5.2-R2 arrival polish: the heightfield bake
+                    // wait — the chip shows a one-line "generating
+                    // surface" row while the terrain pass is sky-only.
+                    terrain_pending: flight_ui.terrain_pending,
                     propellant: &flight_ui.propellant,
                     stages_left: flight_ui.stages_left,
                     stages_total: flight_ui.stages_total,

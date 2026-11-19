@@ -434,15 +434,15 @@ impl HeightField {
     }
 
     /// The renderer's height-texture change key for a real bake at
-    /// `(seed, w, h)` — `mix64(seed) ^ dims` shifted left one bit so bit
-    /// 0 carries the stand-in tag: `0` here (a real bake), `1` for the
-    /// view's flat stand-in ([`Self::flat_key`]). The tag bit makes the
-    /// two namespaces *provably* disjoint (C01-F3): `mix64` is
-    /// bijective, so ANY same-space derivation collides with exactly
-    /// one real seed — the earlier `mix64(!seed)` stand-in did so at
-    /// `!seed` itself, i.e. two bodies with complementary seeds, and
-    /// the renderer's `uploaded_height_key` skip then bound one body's
-    /// real field to the other's stand-in.
+    /// `(seed, w, h)` — `mix64(seed) ^ dims` shifted left one bit so
+    /// bit 0 stays clear. The tag bit dates from the view's removed
+    /// flat-datum stand-in (C01-F3: the `<< 1` kept the stand-in's
+    /// `| 1` keys provably disjoint from every real bake, since
+    /// `mix64` is bijective and any same-space derivation collides
+    /// with exactly one real seed); the stand-in is gone — the flight
+    /// view now draws NO terrain while a bake is in flight — but the
+    /// shift stays frozen in the derivation (changing it would churn
+    /// every field's identity for no behavior gain).
     pub fn bake_key(seed: u64, width: u32, height: u32) -> u64 {
         (mix64(seed) ^ (u64::from(width) << 32 | u64::from(height))) << 1
     }
@@ -459,14 +459,6 @@ impl HeightField {
     pub fn bake_profiled_key(seed: u64, profile: ReliefProfile) -> u64 {
         let (width, height) = profile.bake_dims();
         Self::bake_key(seed ^ profile.key_seed_fold(), width, height)
-    }
-
-    /// [`Self::bake_key`]'s tagged twin — the flat stand-in's key with
-    /// bit 0 set, so it can never equal any real bake's key regardless
-    /// of seed. The seed still mixes in, keeping stand-ins for
-    /// different bodies distinct from each other.
-    pub fn flat_key(seed: u64, width: u32, height: u32) -> u64 {
-        Self::bake_key(seed, width, height) | 1
     }
 
     /// Texel value (longitude wraps, latitude clamps — the equirect
@@ -711,8 +703,8 @@ mod tests {
     /// legacy profiled key IS the historical key (0 fold), the
     /// mountain key differs from it AND from a same-dims un-folded
     /// key — the seed fold matters beyond the dims word — and both
-    /// stay in the real-bake namespace (bit 0 clear, the flat-key
-    /// tag).
+    /// keep bit 0 clear (the historical stand-in tag bit; the shift
+    /// is frozen in `bake_key`'s derivation).
     #[test]
     fn profiled_keys_are_distinct() {
         for seed in [0u64, 1, 0x5eed_c0de_1234_5678] {

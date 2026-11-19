@@ -642,7 +642,7 @@ Skirts hide T-junction cracks.
 
 Height source: deterministic seeded lattice value-noise FBM on the unit
 sphere, baked once per body into an R32Float equirect `HeightField`
-(`csp-view/src/terrain.rs:217` `TerrainCache`; constants shared with
+(`csp-view/src/terrain.rs` `TerrainCache`; constants shared with
 `csp_core::terrain` so the physics contact surface samples **bit-identically**
 to the drawn surface). Since M5 §5.2-R2 the bake is per authored
 `TerrainDef::relief` profile (`HeightField::bake_profiled`): Legacy
@@ -651,6 +651,34 @@ to the drawn surface). Since M5 §5.2-R2 the bake is per authored
 `uniforms.planet.w`). A `heightmap: Some(_)` ref is the unimplemented
 R4/native hook.
 
+**Bake scheduling / the arrival contract (M5 §5.2-R2 arrival polish).**
+The bake runs on a background thread (native; C12-F5 — the frame a body
+becomes dominant no longer stalls on it) and `TerrainCache::field`
+serves `None` until the real field lands. There is **no stand-in**: the
+packet for those frames is *sky-only* — `heightfield: None`, zero
+terrain/ocean instances, disarmed vessel blob — so the player sees the
+scattering sky (haze below the horizon on atmospheric bodies), the
+craft and the launch complex, never a flat datum sphere standing in
+for mountains. CPU-side takers of the field (chase-camera floor,
+structure anchors) fall back to the bare datum radius for exactly
+those frames; the first packet with a field swaps the full displaced
+surface in (the field's content key forces the height-texture
+re-upload). The wait frames also DISARM the shadow cascades — both in
+the view (`extract_flight` hands `draw_shadow` the zeroed row while
+pending) and structurally in the renderer (`draw_shadow` disarms any
+armed row handed with an instance-less packet: the cascade passes
+would early-return without clearing the depth array, and receivers
+would sample its never-cleared contents — zeros on a fresh session,
+the previous body's stale map after an SOI switch — through live
+matrices, silently killing the craft's sun term). The flight HUD
+mirrors the wait as a one-line
+"GENERATING SURFACE …" chip row (`FlightHudInput::terrain_pending`,
+written by `extract_flight`). Map view draws no terrain anywhere (its
+packet is lines/markers only) and VAB is scene-less, so the wait state
+is flight-only. wasm has no threads: the bake runs inline at the first
+`field` poll, so the `None` wait state is unreachable there by
+construction (the demo already pays the one-time startup hitch).
+
 Scattering: `bake_transmittance` (`terrain.rs:573`) CPU-ray-marches the
 Bruneton-style T(altitude, μ) LUT (96 steps) for the §3.0 exponential
 atmosphere; the shader consumes it for sky color and terrain aerial
@@ -658,7 +686,7 @@ perspective — the Baseline "precomputed LUTs, analytic single-scatter".
 
 Ocean: a second instanced batch of the same grid at the body's ocean datum
 radius, emitted only for leaf patches whose sampled heights reach the datum
-(`patch_might_hold_sea`, `csp-view/src/terrain.rs:356`); airless/oceanless
+(`patch_might_hold_sea`, `csp-view/src/terrain.rs:337`); airless/oceanless
 bodies emit nothing.
 
 Biome tint: the authored index map only **tints** — it never moves a vertex
@@ -706,8 +734,8 @@ finer filtered normal retilings above. `uniforms.art.z = 1` (render-gate
 pre-4b plain periodic tiling verbatim for before/after evidence pairs.
 
 The vessel blob shadow (`uniforms.shadow`, `vessel_shadow`,
-`csp-view/src/terrain.rs:505`) anchors the focused craft's shadow to the
-surface; `csp-view/terrain.rs::build_packet` (`:557`) assembles the whole
+`csp-view/src/terrain.rs:497`) anchors the focused craft's shadow to the
+surface; `csp-view/terrain.rs::build_packet` (`:560`) assembles the whole
 `TerrainPacket` per frame from the staged `FlightEnv` + chase camera.
 
 **Shadow cascades (R1 core, landed 3a — ARMED since 3b; the R1 debt is

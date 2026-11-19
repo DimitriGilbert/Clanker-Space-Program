@@ -146,17 +146,17 @@ fn pin_dump_time(view: &mut View) {
 }
 
 /// Advance `view` until the flight packet carries the REAL baked
-/// heightfield for the dominant body — not `TerrainCache`'s flat datum
-/// stand-in. On native the cache bakes on a background thread (C12-F5)
-/// and every consumer (packet displacement, structure anchors, camera
-/// floor) honestly samples the flat stand-in until the bake lands, so
-/// a dump captured in the first few frames draws a flat planet — a
-/// relief-verification dump captured there proves nothing (the
-/// vision-acceptance false pair: BEFORE and AFTER renders were both
-/// flat for exactly this reason). Polls the packet's heightfield
-/// content key against `bake_profiled_key` for the AUTHORED
-/// `(seed, profile)` — the same key contract `TerrainCache::field`
-/// serves, all public API — and panics if the bake never lands.
+/// heightfield for the dominant body. On native the cache bakes on a
+/// background thread (C12-F5) and, until it lands, the packet is
+/// deliberately SKY-ONLY — `heightfield: None` with no terrain or
+/// ocean instances (M5 §5.2-R2 arrival polish: the player must never
+/// see a flat datum sphere where mountains should be), so a relief
+/// dump captured in the first few frames draws no ground at all — a
+/// relief-verification dump captured there proves nothing. Polls the
+/// packet's heightfield content key against `bake_profiled_key` for
+/// the AUTHORED `(seed, profile)` — the same key contract
+/// `TerrainCache::field` serves, all public API — and panics if the
+/// bake never lands.
 fn until_real_terrain(view: &mut View) {
     let want = {
         let cfg = view.world.resource::<csp_view::terrain::TerrainConfig>();
@@ -454,6 +454,11 @@ fn boot_scene_has_real_geometry() {
     for _ in 0..3 {
         frame(&mut view, 1);
     }
+    // Wait out the background heightfield bake: the first frames after
+    // the seed are deliberately sky-only (M5 §5.2-R2 arrival polish —
+    // no flat datum stand-in), and this gate exists to prove TERRAIN
+    // content specifically.
+    until_real_terrain(&mut view);
     assert_eq!(view.mode(), csp_view::ViewMode::Flight);
     assert!(
         view.flight_focus().is_some(),
@@ -528,6 +533,9 @@ fn washed_out_scene_is_what_the_gate_rejects() {
     for _ in 0..3 {
         frame(&mut view, 1);
     }
+    // Same wait as the positive gate — the control must be the SAME
+    // scene shape driven hot, sky-only frames would weaken the A/B.
+    until_real_terrain(&mut view);
     let mut packet = view
         .take_flight_packet()
         .expect("RenderExtract produced a flight packet");
@@ -964,7 +972,7 @@ fn dump_low() {
         input.yaw = yaw;
     }
     // Capture only once the packet carries the REAL heightfield — the
-    // first frames draw the cache's flat stand-in (see
+    // first frames are sky-only, no ground drawn (see
     // [`until_real_terrain`]). DUMP_TIME then pins the scene clock:
     // paired A/B dumps can never drift to different suns.
     until_real_terrain(&mut view);
@@ -1020,7 +1028,7 @@ fn dump_flight() {
     // Wait for the REAL heightfield BEFORE lighting the engine — the
     // ascent loop below runs only seconds of wall time and the
     // background bake (single-digit seconds in debug) would otherwise
-    // still be flat at capture (see [`until_real_terrain`]).
+    // still be drawing sky-only at capture (see [`until_real_terrain`]).
     until_real_terrain(&mut view);
     pin_dump_time(&mut view);
     frame(&mut view, 1); // the focus resolves in flight_present
@@ -1407,6 +1415,9 @@ fn dump() {
     for _ in 0..3 {
         frame(&mut view, 1);
     }
+    // Sky-only until the bake lands — wait so the scratch dump shows
+    // the ground it exists to eyeball.
+    until_real_terrain(&mut view);
     let packet = view.take_flight_packet().unwrap();
     let img = render_flight_scene(&device, &queue, &packet);
     let mut out = b"P6 320 240 255\n".to_vec();

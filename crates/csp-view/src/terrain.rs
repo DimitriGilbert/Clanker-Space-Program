@@ -30,12 +30,9 @@ use crate::map::MapCameraF64;
 // contacts is bit-identical to the surface this module draws. The bake
 // runs through `HeightField::bake_profiled` at the body's authored
 // `ReliefProfile` dims (M5 §5.2-R2: 1024×512 ≈ 3.7 km texels Legacy,
-// 2048×1024 Mountain, at Terrin's 600 km radius); the dims constants
-// stay imported for the flat stand-in and the camera-floor tap angle.
-use csp_core::terrain::{
-    AMPLITUDE_FRAC, BAKE_HEIGHT as HEIGHTFIELD_H, BAKE_WIDTH as HEIGHTFIELD_W, ReliefProfile,
-};
-
+// 2048×1024 Mountain, at Terrin's 600 km radius); the width constant
+// stays imported for the camera-floor tap angle.
+use csp_core::terrain::{AMPLITUDE_FRAC, BAKE_WIDTH as HEIGHTFIELD_W, ReliefProfile};
 /// Fallback sun direction when the world has no resolvable star —
 /// unnormalized (callers divide by `norm`, like `flight.rs`'s copy).
 const FALLBACK_SUN: DVec3 = DVec3 {
@@ -207,18 +204,23 @@ type CacheKey = (String, u64, u64);
 /// The bake (524k texels × 13 octaves legacy, 4× that under Mountain)
 /// used to run synchronously on whichever thread first sampled it —
 /// the frame a body became dominant stalled outright (C12-F5). On
-/// native it now runs on a worker thread: [`Self::field`] returns a
-/// flat datum stand-in until the real field lands, so every caller
-/// (camera floor, shadow anchor, ocean cull, packet displacement)
-/// still samples the SAME field the shader draws — the honest
-/// "surface" while the bake is in flight. wasm has no threads and
-/// keeps the synchronous path (a one-time hitch the demo already pays
-/// at startup). Presentation data only.
+/// native it now runs on a worker thread and [`Self::field`] returns
+/// `None` until the real field lands: NO surface is drawn in the
+/// meantime (the packet suppresses terrain+ocean; the sky, craft and
+/// launch complex still render) — the pre-5.2-R2 "flat datum
+/// stand-in" showed a visibly flat planet for those first seconds and
+/// is removed. CPU-side takers of the field (camera floor, structure
+/// anchors, shadow) fall back to the datum radius, exactly the number
+/// the zeros stand-in used to sample. wasm has no threads and keeps
+/// the synchronous path (a one-time hitch the demo already pays at
+/// startup — `None` is unreachable there by construction).
+/// Presentation data only.
 #[derive(Resource, Default)]
 pub struct TerrainCache {
     /// Body id + seed + profile fold the current field was baked for.
     key: Option<CacheKey>,
-    /// The baked field.
+    /// The baked field — `None` while the native background bake for
+    /// `key` is in flight.
     field: Option<Arc<rt::HeightField>>,
     /// Completed fields per cache key — a body visited before swaps
     /// back in instantly (bounded by body count × profile).
@@ -226,24 +228,26 @@ pub struct TerrainCache {
     /// The in-flight background bake for `key` (native only).
     #[cfg(not(target_arch = "wasm32"))]
     pending: Option<std::sync::Mutex<std::sync::mpsc::Receiver<Arc<rt::HeightField>>>>,
-    /// The flat datum stand-in drawn while `pending` runs —
-    /// zero-height, so the drawn surface equals `radius_m` and the
-    /// camera floor / shadow / ocean tests bound it exactly.
-    flat: Option<Arc<rt::HeightField>>,
 }
 
 impl TerrainCache {
     /// The heightfield for `(body_id, seed, profile)` — the real field
-    /// once baked, the flat stand-in while a background bake is in
-    /// flight (both share the caller contract "this is the surface the
-    /// frame draws"). The bake dims follow the profile
+    /// once baked, `None` while a native background bake is in flight
+    /// (the caller contract: `None` means *draw/sample no displaced
+    /// surface this frame* — the packet suppresses terrain+ocean and
+    /// the CPU takers fall back to the datum radius, never to a zeros
+    /// stand-in). The bake dims follow the profile
     /// ([`rt::HeightField::bake_profiled`], M5 §5.2-R2).
-    fn field(&mut self, body_id: &str, seed: u64, profile: ReliefProfile) -> Arc<rt::HeightField> {
+    fn field(
+        &mut self,
+        body_id: &str,
+        seed: u64,
+        profile: ReliefProfile,
+    ) -> Option<Arc<rt::HeightField>> {
         let key: CacheKey = (body_id.to_owned(), seed, profile.key_seed_fold());
         if self.key.as_ref() != Some(&key) {
             // A body visited before swaps back in for free.
             self.field = self.done.get(&key).cloned();
-            self.flat = None;
             #[cfg(not(target_arch = "wasm32"))]
             {
                 self.pending = None;
@@ -268,6 +272,10 @@ impl TerrainCache {
             }
             #[cfg(target_arch = "wasm32")]
             {
+                // No threads on wasm: the bake runs inline HERE, so by
+                // the time `key` is stored the field is already Some —
+                // the `None` wait state below is unreachable on this
+                // target (no deadlock risk: no channel, no lock).
                 if self.field.is_none() {
                     self.field = Some(Arc::new(rt::HeightField::bake_profiled(seed, profile)));
                 }
@@ -289,7 +297,7 @@ impl TerrainCache {
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => false,
                 // The worker died mid-bake — take the one-time hit
-                // rather than draw a datum sphere forever.
+                // rather than draw nothing forever.
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     log::warn!("terrain: background bake lost — baking inline");
                     self.field = Some(Arc::new(rt::HeightField::bake_profiled(seed, profile)));
@@ -307,35 +315,7 @@ impl TerrainCache {
         {
             self.done.entry(k.clone()).or_insert_with(|| Arc::clone(f));
         }
-        match self.field.as_ref() {
-            Some(f) => Arc::clone(f),
-            None => self.flat_field(),
-        }
-    }
-
-    /// The zero-height stand-in — Legacy dims with zero data whatever the
-    /// body's real profile dims, keyed from the tagged stand-in namespace
-    /// ([`rt::HeightField::flat_key`] sets bit 0; real bakes keep it clear):
-    /// it cannot collide with a real bake, and the tag forces the renderer
-    /// to re-upload on the swap. Built once per key miss. wasm compiles it
-    /// too (the `pending` machinery is cfg'd out there; the call stays
-    /// reachable in the match arm either way).
-    fn flat_field(&mut self) -> Arc<rt::HeightField> {
-        if self.flat.is_none() {
-            let (w, h) = (HEIGHTFIELD_W, HEIGHTFIELD_H);
-            let seed = self.key.as_ref().map_or(0, |(_, s, _)| *s);
-            self.flat = Some(Arc::new(rt::HeightField {
-                width: w,
-                height: h,
-                data: vec![0.0; w as usize * h as usize],
-                key: rt::HeightField::flat_key(seed, w, h),
-            }));
-        }
-        // `flat` is Some by construction.
-        match self.flat.as_ref() {
-            Some(f) => Arc::clone(f),
-            None => Arc::new(rt::HeightField::bake(0, HEIGHTFIELD_W, HEIGHTFIELD_H)),
-        }
+        self.field.clone()
     }
 }
 
@@ -412,6 +392,9 @@ pub(crate) fn surface_floor_radius(
 /// same `R(axis, −phase)` inertial→fixed conjugate the shader applies
 /// before `height_at`, so callers measure the surface the pass draws.
 /// `crate::structures` anchors the launch-site buildings on it.
+/// While the background bake is in flight this returns the bare datum
+/// `radius_m` — the honest floor for a frame that draws no terrain
+/// (see [`TerrainCache::field`]).
 pub(crate) fn ground_radius(
     cfg: &TerrainConfig,
     cache: &mut TerrainCache,
@@ -425,7 +408,15 @@ pub(crate) fn ground_radius(
         .get(body_id)
         .cloned()
         .unwrap_or_else(|| TerrainBody::synthesized(body_id, env.radius_m));
-    let field = cache.field(body_id, body.seed, body.profile);
+    // While the bake is in flight there is no surface to measure — the
+    // datum radius IS the ground, exactly the number the removed zeros
+    // stand-in used to sample (its every texel was 0). No displaced
+    // terrain draws in those frames, so nothing can poke through a
+    // datum-level anchor; the next frame with a real field measures
+    // real relief again.
+    let Some(field) = cache.field(body_id, body.seed, body.profile) else {
+        return env.radius_m;
+    };
     // The inertial→fixed half of `crate::structures::spin_rotation` —
     // the same `R(axis, −phase)` conjugate the shader applies.
     let fixed = crate::structures::spin_rotation(env)
@@ -554,6 +545,17 @@ fn vessel_shadow(
 /// camera, per-patch instance baking, ocean emission, uniforms. Called
 /// from `extract_flight` — `cam`/`input` are the solved presentation
 /// camera; `env` is the staged physics environment.
+///
+/// **Arrival contract (M5 §5.2-R2 arrival polish):** while the real
+/// heightfield for the dominant body is still baking on the background
+/// thread, the packet carries `heightfield: None` and NO terrain or
+/// ocean instances — the renderer draws the sky pass, the craft and
+/// the launch complex over a haze/space backdrop, never a flat datum
+/// sphere standing in for mountains. The shadow blob is disarmed
+/// (`shadow.w = 0`; it has no displaced surface to land on) and the
+/// HUD mirrors the wait ("generating terrain"). The first packet with
+/// a field swaps the full displaced surface in (the field's content
+/// key forces the height-texture re-upload).
 #[allow(clippy::too_many_lines)] // quadtree select + uniform bake is one pass
 pub(crate) fn build_packet(
     cfg: &TerrainConfig,
@@ -584,15 +586,20 @@ pub(crate) fn build_packet(
     let eye_rel = cam.eye - env.body_center;
     // `amplitude_m` rides the horizon cull — displaced relief up to
     // `radius + amplitude` stays visible past the bare-datum limb.
-    let leaves = rt::select_patches(eye_rel, env.radius_m, body.amplitude_m, &cfg.lod);
-    let mut terrain = Vec::with_capacity(leaves.len());
+    // While the bake is pending there is nothing to select FOR: the
+    // instance lists stay empty (the arrival contract above — no
+    // displaced draw, hence no flat stand-in either).
+    let mut terrain = Vec::new();
     let mut ocean = Vec::new();
-    for &id in &leaves {
-        terrain.push(rt::patch_instance(id, 0.0, eye_rel, env.radius_m));
-        if let Some(datum) = body.ocean_datum_m
-            && patch_might_hold_sea(&field, id, body.amplitude_m, datum, env.radius_m, unspin)
-        {
-            ocean.push(rt::patch_instance(id, 1.0, eye_rel, datum));
+    if let Some(field) = &field {
+        let leaves = rt::select_patches(eye_rel, env.radius_m, body.amplitude_m, &cfg.lod);
+        for &id in &leaves {
+            terrain.push(rt::patch_instance(id, 0.0, eye_rel, env.radius_m));
+            if let Some(datum) = body.ocean_datum_m
+                && patch_might_hold_sea(field, id, body.amplitude_m, datum, env.radius_m, unspin)
+            {
+                ocean.push(rt::patch_instance(id, 1.0, eye_rel, datum));
+            }
         }
     }
 
@@ -612,15 +619,22 @@ pub(crate) fn build_packet(
         FALLBACK_SUN / FALLBACK_SUN.norm()
     };
 
-    let (shadow, craft_alt) = vessel_shadow(
-        &view_rot,
-        cam,
-        env,
-        &field,
-        &unspin,
-        body.amplitude_m,
-        sun_dir,
-    );
+    // Pending bake ⇒ no displaced surface ⇒ the blob has nowhere to
+    // land: disarm it (the `w = 0` row is `blob_shadow`'s own off
+    // switch) and zero `craft_alt` — that uniform only feeds the
+    // blob's altitude fade, which the disarm already killed.
+    let (shadow, craft_alt) = match field.as_ref() {
+        Some(field) => vessel_shadow(
+            &view_rot,
+            cam,
+            env,
+            field,
+            &unspin,
+            body.amplitude_m,
+            sun_dir,
+        ),
+        None => ([0.0; 4], 0.0),
+    };
 
     let atmo = (env.atm_top_m > 0.0).then_some(rt::AtmoDesc {
         radius_m: env.radius_m,
@@ -693,7 +707,7 @@ pub(crate) fn build_packet(
                 m
             }),
         },
-        heightfield: Some(field),
+        heightfield: field,
         biome: body.biome,
         atmo,
         terrain,
@@ -711,6 +725,8 @@ mod tests {
     use super::*;
     use crate::flight::FlightEnv;
     use crate::map::{MapCameraF64, mat4_mul, perspective_revz, project_into};
+    // The legacy bake height — only the tests assert the dims pair.
+    use csp_core::terrain::BAKE_HEIGHT as HEIGHTFIELD_H;
 
     /// A minimal `LoadedBody` — only the fields `config_from_bodies`
     /// reads carry authored values; the rest is inert filler.
@@ -781,12 +797,11 @@ mod tests {
     /// completed Legacy field back in from `done`.
     #[test]
     fn cache_separates_profiles_at_same_seed() {
-        // Real bakes keep key bit 0 clear; the flat stand-in sets it —
-        // poll `field` until the background bake lands.
+        // `field` serves `None` while the background bake is in flight
+        // (no stand-in since the arrival polish) — poll until it lands.
         let real = |cache: &mut TerrainCache, profile: ReliefProfile| -> Arc<rt::HeightField> {
             for _ in 0..4_000 {
-                let f = cache.field("terrin", 601, profile);
-                if f.key & 1 == 0 {
+                if let Some(f) = cache.field("terrin", 601, profile) {
                     return f;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(5));
@@ -820,11 +835,12 @@ mod tests {
         assert_eq!(back.key, legacy.key);
     }
 
-    /// The packet's `planet.w` is the body's AUTHORED amplitude — the
-    /// same `TerrainBody::amplitude_m` every amplitude-driven consumer
-    /// (horizon cull, blob shadow, ocean margin, camera floor) reads.
-    #[test]
-    fn packet_uniforms_carry_authored_amplitude() {
+    /// The shared scene for the arrival-contract tests: Terrin's
+    /// authored Mountain body (seed 601), an environment centred at
+    /// the origin, and a solved camera 15 km above the north pole —
+    /// any eye outside the body selects quadtree leaves, and the pole
+    /// keeps the direction axis-aligned.
+    fn arrival_scene() -> (TerrainConfig, FlightEnv, MapCameraF64) {
         let cfg = config_from_bodies(&[body_def(
             "terrin",
             600_000.0,
@@ -847,6 +863,115 @@ mod tests {
             spin_phase: 0.0,
             body_spin: DVec3::ZERO,
         };
+        let cam = MapCameraF64 {
+            view_proj: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            eye: DVec3::new(0.0, 0.0, 615_000.0),
+            distance_m: 15_000.0,
+            valid: true,
+        };
+        (cfg, env, cam)
+    }
+
+    /// M5 §5.2-R2 arrival contract, first half: the frames immediately
+    /// after a body becomes dominant (fresh cache, bake in flight)
+    /// must NEVER carry a flat-datum heightfield. The wait presents as
+    /// a SKY-ONLY packet — `heightfield: None`, zero terrain/ocean
+    /// instances, disarmed shadow blob — and the only field a packet
+    /// ever carries is the real bake (its authored key, bit 0 clear,
+    /// non-zero relief). The zeros stand-in this replaces drew a flat
+    /// planet for exactly these first seconds.
+    #[test]
+    fn first_frames_never_draw_the_flat_datum() {
+        let (cfg, env, cam) = arrival_scene();
+        let mut cache = TerrainCache::default();
+        let real_key = rt::HeightField::bake_profiled_key(601, ReliefProfile::Mountain);
+        // The loop must actually OBSERVE the wait state — otherwise
+        // bake-timing shrinkage would quietly hollow the test into
+        // "only ever saw the real field".
+        let mut saw_pending = false;
+        for _ in 0..64 {
+            let p = build_packet(&cfg, &mut cache, &env, &cam, (320.0, 240.0), 0.0);
+            match &p.heightfield {
+                // The wait state: sky (and the craft, drawn by the
+                // flight stream) only. A terrain or ocean instance
+                // here would draw displaced geometry against nothing.
+                None => {
+                    saw_pending = true;
+                    assert!(p.sky, "the sky backdrop stays while the bake runs");
+                    assert!(
+                        p.terrain.is_empty() && p.ocean.is_empty(),
+                        "a pending packet must draw no terrain/ocean"
+                    );
+                    assert_eq!(
+                        p.uniforms.shadow, [0.0; 4],
+                        "the blob has no surface to land on while pending"
+                    );
+                }
+                // If the bake already landed mid-loop, the field must
+                // be the REAL one — never zeros under a stand-in key.
+                Some(h) => {
+                    assert_eq!(h.key, real_key, "only the authored field may be carried");
+                    assert_eq!(h.key & 1, 0, "real bake keys keep bit 0 clear");
+                    assert!(
+                        h.data.iter().any(|&x| x != 0.0),
+                        "a carried field must be real relief, not a zeros stand-in"
+                    );
+                }
+            }
+        }
+        assert!(
+            saw_pending,
+            "the first frames never observed the bake wait — the test went \
+             vacuous (the bake landed inside one packet build?)"
+        );
+    }
+
+    /// M5 §5.2-R2 arrival contract, second half: once the background
+    /// bake lands, displaced draws RESUME — the packet carries the real
+    /// field's key with a non-empty terrain instance list (an eye
+    /// 15 km up always selects leaves), and the cache keeps serving
+    /// that field afterwards (no flap back to pending for a finished
+    /// key).
+    #[test]
+    fn terrain_draws_resume_when_the_bake_lands() {
+        let (cfg, env, cam) = arrival_scene();
+        let mut cache = TerrainCache::default();
+        let real_key = rt::HeightField::bake_profiled_key(601, ReliefProfile::Mountain);
+        let mut landed = false;
+        for _ in 0..4_000 {
+            let p = build_packet(&cfg, &mut cache, &env, &cam, (320.0, 240.0), 0.0);
+            if let Some(h) = &p.heightfield {
+                assert_eq!(h.key, real_key, "the landed field is the authored bake");
+                assert_eq!(h.key & 1, 0);
+                assert!(
+                    !p.terrain.is_empty(),
+                    "an eye above the surface must select terrain leaves again"
+                );
+                let next = build_packet(&cfg, &mut cache, &env, &cam, (320.0, 240.0), 0.0);
+                assert_eq!(
+                    next.heightfield.as_ref().map(|h| h.key),
+                    Some(real_key),
+                    "a finished key must keep serving its field"
+                );
+                landed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(landed, "the background bake never landed — stalled?");
+    }
+
+    /// The packet's `planet.w` is the body's AUTHORED amplitude — the
+    /// same `TerrainBody::amplitude_m` every amplitude-driven consumer
+    /// (horizon cull, blob shadow, ocean margin, camera floor) reads.
+    #[test]
+    fn packet_uniforms_carry_authored_amplitude() {
+        let (cfg, env, _cam) = arrival_scene();
         let packet = build_packet(
             &cfg,
             &mut TerrainCache::default(),

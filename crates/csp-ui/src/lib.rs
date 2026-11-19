@@ -635,6 +635,11 @@ pub struct FlightHudInput<'a> {
     /// the build runs for minutes — without a persistent row the
     /// scene reads as a dead void.
     pub builds: &'a [crate::program::BuildRow],
+    /// The dominant body's terrain heightfield is still baking — the
+    /// flight scene draws sky/craft only until it lands (M5 §5.2-R2
+    /// arrival polish; the view never shows a flat datum stand-in).
+    /// `true` adds the chip's "GENERATING SURFACE" wait row.
+    pub terrain_pending: bool,
     /// The focused vessel's propellant — one gauge per resource
     /// still carried (empty for tank-less vessels).
     pub propellant: &'a [PropellantGauge],
@@ -888,6 +893,22 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
             // Area's whole-rect move widget are hit-tested on top of
             // it — a selectable label claims the drag press, so the
             // panel cannot be grabbed by its own text (C23-F1).
+            //
+            // The terrain-bake wait row first, in BOTH branches below:
+            // while the dominant body's heightfield bakes the scene
+            // draws sky/craft only (never a flat datum sphere — M5
+            // §5.2-R2 arrival polish), and this line is the only
+            // on-screen cue for why the ground is missing.
+            if input.terrain_pending {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("GENERATING SURFACE …")
+                            .font(egui::FontId::monospace(14.0))
+                            .color(egui::Color32::from_rgb(228, 192, 118)),
+                    )
+                    .selectable(false),
+                );
+            }
             if !input.has_vessel {
                 ui.add(
                     egui::Label::new(
@@ -1940,6 +1961,7 @@ mod tests {
             t_pe_s: None,
             period_s: None,
             builds: &[],
+            terrain_pending: false,
             propellant,
             stages_left: 2,
             stages_total: 3,
@@ -2107,6 +2129,45 @@ mod tests {
         assert!(
             delta.length() > 60.0,
             "readout block should have followed the drag (moved {delta:?})"
+        );
+    }
+
+    /// M5 §5.2-R2 arrival polish: while the dominant body's heightfield
+    /// bakes, the flight scene draws sky/craft only and the HUD chip
+    /// carries the one-line "GENERATING SURFACE" wait row — the only
+    /// on-screen cue for the missing ground. `terrain_pending` must
+    /// add exactly that row: the chip grows by one label's height and
+    /// keeps its parked position (an Area that re-flowed into a
+    /// different corner would read as a mode change, not a wait).
+    #[test]
+    fn terrain_pending_row_appears_in_the_chip() {
+        let keys = settings::Keymap::default();
+        let key_labels = BTreeMap::new();
+        let prop: [PropellantGauge; 0] = [];
+        let mut input = hud_input(&keys, &key_labels, &prop);
+        let (ctx, raw) = hud_rig(960.0, 600.0);
+        let hud_id = egui::Id::unique("flight_hud");
+        // Warm the Area to its parked rect (see the drag test: the
+        // first pass records a stale rect before the off-screen
+        // correction), then measure the chip calm vs pending.
+        for _ in 0..3 {
+            run_frame(&ctx, raw.clone(), &input);
+        }
+        let calm = ctx
+            .memory(|m| m.area_rect(hud_id))
+            .expect("hud area registered");
+        input.terrain_pending = true;
+        run_frame(&ctx, raw.clone(), &input);
+        let pending = ctx
+            .memory(|m| m.area_rect(hud_id))
+            .expect("hud area registered");
+        assert!(
+            pending.height() > calm.height(),
+            "the wait row must add a line to the chip (calm {calm:?} vs pending {pending:?})"
+        );
+        assert!(
+            (pending.min - calm.min).length() < 1.0,
+            "the chip must not move while pending ({calm:?} → {pending:?})"
         );
     }
 }

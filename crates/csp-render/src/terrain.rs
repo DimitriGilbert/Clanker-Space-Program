@@ -1435,12 +1435,19 @@ impl TerrainRenderer {
     /// → flight `draw` → `draw_ocean`. The `SU` uniform is written
     /// EVERY call, armed or not: a skipped disarm would leave a stale
     /// armed buffer driving receivers through dead matrices after
-    /// sunset or a mode switch. A no-op beyond that write unless
-    /// `shadow` is armed AND the packet carries terrain instances
-    /// (the zeroed `SU` keeps `fs_terrain` on the `sun_occlusion`
-    /// ray-march, bit-identical to the pre-cascade build). Ocean
-    /// instances deliberately do not cast (water receives shadows
-    /// only — the ray-march fallback's semantics).
+    /// sunset or a mode switch. A packet with NO terrain instances
+    /// (the sky-only heightfield-bake wait, M5 §5.2-R2) is disarmed
+    /// in the buffer regardless of the handed row — the passes would
+    /// early-return without clearing the depth array, and receivers
+    /// would sample its stale contents (zeros on a fresh session, the
+    /// previous body's map after an SOI switch) through live
+    /// matrices, silently killing the craft's sun term. Beyond the
+    /// write this is a no-op unless the (effective) row is armed AND
+    /// the packet carries terrain instances (the zeroed `SU` keeps
+    /// `fs_terrain` on the `sun_occlusion` ray-march, bit-identical
+    /// to the pre-cascade build). Ocean instances deliberately do
+    /// not cast (water receives shadows only — the ray-march
+    /// fallback's semantics).
     pub fn draw_shadow(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -1450,8 +1457,19 @@ impl TerrainRenderer {
         shadow: &ShadowUniforms,
         cast: Option<(wgpu::Buffer, u32)>,
     ) {
-        self.shadow.write_uniforms(queue, shadow);
-        if !shadow.armed() || packet.terrain.is_empty() {
+        // The sky-only guard: no terrain instances ⇒ the effective row
+        // is the disarm row, whatever the caller solved (see the doc —
+        // the never-cleared depth array through live matrices is the
+        // silent craft-darkening failure the guard exists to make
+        // unproducible).
+        let disarmed = ShadowUniforms::default();
+        let row = if packet.terrain.is_empty() {
+            &disarmed
+        } else {
+            shadow
+        };
+        self.shadow.write_uniforms(queue, row);
+        if !row.armed() {
             return;
         }
         self.ensure_grid(queue);

@@ -615,6 +615,12 @@ pub struct FlightUiData {
     /// written from [`FlightSfx`], drawn as event flashes by
     /// `csp_ui::flight_hud`.
     pub sfx: Vec<String>,
+    /// The dominant body's heightfield bake is still in flight — the
+    /// frame's terrain packet is sky-only (no displaced surface drawn,
+    /// M5 §5.2-R2 arrival polish). Written by `extract_flight` (the
+    /// extract is where the cache is polled); the HUD reads it one
+    /// frame later because UiBuild runs before RenderExtract (§2.5).
+    pub terrain_pending: bool,
     /// Osculating apoapsis altitude (m) — `None` open/latched/no vessel.
     pub apo_alt_m: Option<f64>,
     /// Osculating periapsis altitude (m).
@@ -3105,6 +3111,7 @@ pub(crate) fn extract_flight(
     cam: Res<FlightCameraF64>,
     terrain_cfg: Res<TerrainConfig>,
     mut terrain_cache: ResMut<TerrainCache>,
+    mut flight_ui: ResMut<FlightUiData>,
     sites: Res<crate::structures::SiteTable>,
     clock: Res<crate::Clock>,
     mut frame: ResMut<FlightFrame>,
@@ -3116,25 +3123,48 @@ pub(crate) fn extract_flight(
     // a flight view with no planet is a vacuum backdrop anyway. The
     // mode gate keeps map frames from paying the quadtree walk +
     // instance bake for a packet nothing draws.
+    //
+    // While the body's heightfield bakes on the background thread the
+    // packet comes back sky-only (M5 §5.2-R2 arrival polish) — the
+    // HUD mirrors that wait below.
+    let mut terrain_pending = false;
     if map_input.mode == MapMode::Flight
         && cam.0.valid
         && let Some(env) = &snap.env
     {
-        packet.terrain = Some(crate::terrain::build_packet(
+        let tp = crate::terrain::build_packet(
             &terrain_cfg,
             &mut terrain_cache,
             env,
             &cam.0,
             input.viewport_px,
             clock.0.ticks() as f64 / csp_core::TICK_HZ as f64,
-        ));
+        );
+        terrain_pending = tp.heightfield.is_none();
+        packet.terrain = Some(tp);
         // R1/3b: solve the cascade uniforms beside the packet they
         // shadow — the app feeds this row to `draw_shadow` before the
         // scene pass. Same gate as the terrain build (a flight scene
         // with an environment and a solved camera); the arm predicate
         // inside additionally demands the sun clear the local horizon.
-        packet.shadow = cascade_uniforms(&cam.0, env, input.viewport_px);
+        //
+        // Sky-only wait frames DISARM the row: the cascade passes
+        // early-return on the empty terrain instance list, and an
+        // armed SU would drive the craft's cascade lookup into the
+        // never-cleared depth array (zeros on a fresh arrival — every
+        // comparison fails, a dull hull; the PREVIOUS body's stale map
+        // after an SOI switch — splotch self-shadowing). The disarmed
+        // row is both receivers' documented fully-lit fallback, and
+        // `draw_shadow`'s every-call SU write keeps the GPU row
+        // tracking the packet, so the armed solve resumes clean the
+        // frame the field lands.
+        packet.shadow = if terrain_pending {
+            csp_render::shadow::ShadowUniforms::default()
+        } else {
+            cascade_uniforms(&cam.0, env, input.viewport_px)
+        };
     }
+    flight_ui.terrain_pending = terrain_pending;
     let v = &mut packet.vertices;
     if packet.terrain.is_none() {
         // Sky fallback: a far-depth fullscreen space backdrop (two
@@ -3427,7 +3457,12 @@ mod tests {
     /// Run `extract_flight` on a synthetic snapshot/camera through a
     /// real `Schedule` — the RenderExtract system's own resource
     /// plumbing, not a bare call.
-    fn run_extract(snap: FlightSnapshot, cam: MapCameraF64) -> csp_render::flight::FlightPacket {
+    /// The extract's test rig — one world + the RenderExtract
+    /// schedule. The terrain cache LIVES IN THE WORLD, so a caller can
+    /// hold the rig across frames and idle-pump passes while the
+    /// background heightfield bake runs (the sky-only wait state; the
+    /// same poll pattern `render_gate::until_real_terrain` uses).
+    fn extract_rig(snap: FlightSnapshot, cam: MapCameraF64) -> (bevy_ecs::world::World, Schedule) {
         let mut world = bevy_ecs::world::World::new();
         world.insert_resource(FlightInput::default());
         // extract_flight gates the terrain build on the map's mode —
@@ -3447,17 +3482,32 @@ mod tests {
         world.insert_resource(FlightCameraF64(cam));
         world.insert_resource(TerrainConfig::default());
         world.insert_resource(TerrainCache::default());
+        // The HUD mirror the extract writes the terrain-bake wait to.
+        world.insert_resource(FlightUiData::default());
         world.insert_resource(crate::structures::SiteTable::default());
         world.insert_resource(crate::Clock::default());
         world.insert_resource(FlightFrame::default());
         let mut sched = Schedule::default();
         sched.add_systems(extract_flight);
-        sched.run(&mut world);
+        (world, sched)
+    }
+
+    /// One extract pass over the rig; takes the frame's packet.
+    fn extract_pass(
+        world: &mut bevy_ecs::world::World,
+        sched: &mut Schedule,
+    ) -> csp_render::flight::FlightPacket {
+        sched.run(world);
         world
             .resource_mut::<FlightFrame>()
             .0
             .take()
             .expect("extract produced a flight packet")
+    }
+
+    fn run_extract(snap: FlightSnapshot, cam: MapCameraF64) -> csp_render::flight::FlightPacket {
+        let (mut world, mut sched) = extract_rig(snap, cam);
+        extract_pass(&mut world, &mut sched)
     }
 
     /// A throttle-open vessel whose plume base ring lies exactly on
@@ -4367,11 +4417,15 @@ mod tests {
     /// The extract's cascade row flows armed by day: non-zero
     /// matrices, the documented split/far band constants, terrain
     /// packet present — and zeroed (the disarm row) at night. Run
-    /// through `run_extract`'s real Schedule so the wiring — not just
-    /// the solve — is what's under test.
+    /// through `extract_rig`'s real Schedule so the wiring — not just
+    /// the solve — is what's under test. The rig also pins the
+    /// sky-only disarm (M5 §5.2-R2 arrival polish): while the bake is
+    /// in flight the packet draws no terrain, and an armed row would
+    /// drive the craft's cascade lookup into the never-cleared depth
+    /// map — the row must be the disarmed fallback in those frames.
     #[test]
     fn extract_solves_armed_cascades_by_day_and_disarms_at_night() {
-        // Deterministic reconstruction per use — `run_extract` takes
+        // Deterministic reconstruction per use — `extract_pass` takes
         // the camera by value and `MapCameraF64` is not `Clone`.
         let cam = || {
             crate::map::solve_orbit_camera(
@@ -4384,14 +4438,41 @@ mod tests {
                 0.1,
             )
         };
-        // Day: sun 0.6 up the local (+X) horizon.
-        let day = run_extract(
+        // Day rig: sun 0.6 up the local (+X) horizon.
+        let (mut world, mut sched) = extract_rig(
             FlightSnapshot {
                 env: Some(shadow_env(0.6)),
                 vessels: vec![],
             },
             cam(),
         );
+        // First pass — fresh cache, the bake is in flight: the packet
+        // is sky-only and the row must be DISARMED even in daylight.
+        let pending = extract_pass(&mut world, &mut sched);
+        assert!(
+            pending
+                .terrain
+                .as_ref()
+                .is_some_and(|t| t.heightfield.is_none()),
+            "a fresh rig starts in the sky-only wait state"
+        );
+        assert!(
+            !pending.shadow.armed(),
+            "the sky-only wait must disarm the cascade row (an armed SU over \
+             the never-cleared depth map kills the craft's sun term)"
+        );
+        // Idle-pump the SAME rig until the bake lands, then the day
+        // row arms with the real field.
+        let mut day = None;
+        for _ in 0..4_000 {
+            let p = extract_pass(&mut world, &mut sched);
+            if p.terrain.as_ref().is_some_and(|t| t.heightfield.is_some()) {
+                day = Some(p);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let day = day.expect("the background bake never landed for the rig");
         assert!(day.terrain.is_some(), "the env gate built a terrain packet");
         assert!(
             day.shadow.armed(),
@@ -4408,15 +4489,14 @@ mod tests {
                 .flatten()
                 .any(|m| m.iter().any(|v| *v != 0.0))
         );
-        // Night: same frame, sun down — the all-zero DISARM row (a
-        // partial row would leave receivers sampling dead matrices).
-        let night = run_extract(
-            FlightSnapshot {
-                env: Some(shadow_env(-0.6)),
-                vessels: vec![],
-            },
-            cam(),
-        );
+        // Night: same rig (the real field stays cached), sun down —
+        // the all-zero DISARM row (a partial row would leave receivers
+        // sampling dead matrices).
+        world.insert_resource(FlightSnapshot {
+            env: Some(shadow_env(-0.6)),
+            vessels: vec![],
+        });
+        let night = extract_pass(&mut world, &mut sched);
         assert!(!night.shadow.armed());
         let zeroed = csp_render::shadow::ShadowUniforms::default();
         assert!(
@@ -4428,13 +4508,11 @@ mod tests {
         // And the solve is presentation-stable: the same inputs
         // reproduce the same uniform bits (the texel-snap contract's
         // precondition on the view side).
-        let again = run_extract(
-            FlightSnapshot {
-                env: Some(shadow_env(0.6)),
-                vessels: vec![],
-            },
-            cam(),
-        );
+        world.insert_resource(FlightSnapshot {
+            env: Some(shadow_env(0.6)),
+            vessels: vec![],
+        });
+        let again = extract_pass(&mut world, &mut sched);
         assert_eq!(day.shadow.vp, again.shadow.vp);
         assert_eq!(day.shadow.cascade, again.shadow.cascade);
         assert_eq!(day.shadow.pars, again.shadow.pars);

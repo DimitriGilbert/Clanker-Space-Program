@@ -1490,4 +1490,226 @@ mod tests {
              (covered {covered} texels — the silent-discard regression)"
         );
     }
+
+    /// The sky-only guard (M5 §5.2-R2 arrival polish): an ARMED row
+    /// handed to `draw_shadow` with a packet that carries NO terrain
+    /// instances must not change the craft's shading. The cascade
+    /// passes early-return without touching the depth array, so an
+    /// honored armed row would drive `fs_main`'s cascade lookup into
+    /// the never-cleared map (zeros on a fresh session — every
+    /// comparison fails and the direct sun term dies; the previous
+    /// body's stale map after an SOI switch) — exactly the silent
+    /// craft-darkening failure the producer-side disarm prevents.
+    /// Pinned here at the RENDERER so even a producer regression
+    /// cannot ship it: frame A shades the lit craft triangle through
+    /// the armed row, frame B is the documented disarmed fallback —
+    /// the readbacks must be BIT-IDENTICAL and the craft brightly
+    /// lit in both.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(clippy::too_many_lines)] // one frame recipe; splitting fragments the pass order it pins
+    fn armed_row_with_sky_only_packet_keeps_craft_fully_lit() {
+        use crate::terrain::TerrainRenderer;
+        let Some((device, queue, errored)) = headless_device() else {
+            assert!(
+                !shadow_gate_required(),
+                "shadow device test: CSP_SHADOW_GATE_REQUIRED is set but no headless \
+                 GPU adapter exists — install a Vulkan ICD or unset the flag"
+            );
+            eprintln!(
+                "shadow device test: SKIP — no headless GPU adapter \
+                 (same contract as csp-view's render gate)"
+            );
+            return;
+        };
+        let (packet, su) = tiny_frame();
+        assert!(
+            su.armed(),
+            "the fixture solve must arrive armed for the A frame"
+        );
+        // The wait-state packet: same uniforms, but no heightfield and
+        // no terrain/ocean instances — exactly what the view emits
+        // while the heightfield bake runs.
+        let mut sky_only = packet.clone();
+        sky_only.heightfield = None;
+        sky_only.terrain = Vec::new();
+        sky_only.ocean = Vec::new();
+        assert!(
+            sky_only.terrain.is_empty(),
+            "fixture sanity: the wait-state packet must carry no casters"
+        );
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let size = 64u32;
+        let mut renderer = TerrainRenderer::new(&device, format);
+        let mut flight =
+            crate::flight::FlightRenderer::new(&device, format, (size, size), &renderer);
+        // One lit NDC-space craft triangle (the `pos` stream is clip
+        // space — the fallback sky quad uses literal NDC corners), its
+        // `world` inside cascade 0's volume so the visibility lookup
+        // actually runs.
+        let craft = |shadow: ShadowUniforms| crate::flight::FlightPacket {
+            vertices: vec![
+                crate::flight::FlightVertex {
+                    pos: [-0.5, -0.5, 0.5],
+                    world: [-20.0, -20.0, -300.0],
+                    nrm: [0.0, 0.0, 1.0],
+                    color: [0.8, 0.8, 0.8, 1.0],
+                    mat: [0.2, 32.0, 1.0],
+                },
+                crate::flight::FlightVertex {
+                    pos: [0.5, -0.5, 0.5],
+                    world: [20.0, -20.0, -300.0],
+                    nrm: [0.0, 0.0, 1.0],
+                    color: [0.8, 0.8, 0.8, 1.0],
+                    mat: [0.2, 32.0, 1.0],
+                },
+                crate::flight::FlightVertex {
+                    pos: [0.0, 0.5, 0.5],
+                    world: [0.0, 20.0, -300.0],
+                    nrm: [0.0, 0.0, 1.0],
+                    color: [0.8, 0.8, 0.8, 1.0],
+                    mat: [0.2, 32.0, 1.0],
+                },
+            ],
+            shadow,
+            ..crate::flight::FlightPacket::default()
+        };
+        // One frame's shaded readback: the app's order — `draw_shadow`
+        // (the SU write; the passes skip on the sky-only packet) then
+        // the scene pass — into an MSAA color resolved for copy.
+        let attachment = |usage, sample_count, fmt| {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("sky-only-guard-target"),
+                size: wgpu::Extent3d {
+                    width: size,
+                    height: size,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count,
+                dimension: wgpu::TextureDimension::D2,
+                format: fmt,
+                usage,
+                view_formats: &[],
+            });
+            tex.create_view(&wgpu::TextureViewDescriptor::default())
+        };
+        let shade = |renderer: &mut TerrainRenderer,
+                     flight: &mut crate::flight::FlightRenderer,
+                     row: ShadowUniforms|
+         -> Vec<u8> {
+            let fp = craft(row);
+            let msaa = attachment(
+                wgpu::TextureUsages::RENDER_ATTACHMENT,
+                crate::MSAA_SAMPLES,
+                format,
+            );
+            let resolve = attachment(
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                1,
+                format,
+            );
+            let depth = attachment(
+                wgpu::TextureUsages::RENDER_ATTACHMENT,
+                crate::MSAA_SAMPLES,
+                wgpu::TextureFormat::Depth32Float,
+            );
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("sky-only-guard"),
+            });
+            let cast = flight.stage_cascade_cast(&device, &queue, &fp);
+            renderer.draw_shadow(&mut enc, &device, &queue, &sky_only, &row, cast);
+            {
+                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("sky-only-guard-scene"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &msaa,
+                        resolve_target: Some(&resolve),
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &depth,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(0.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                flight.draw(&mut pass, &device, &queue, &fp);
+            }
+            let row_bytes = (size * 4) as u64;
+            let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("sky-only-guard-readback"),
+                size: row_bytes * u64::from(size),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            enc.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: resolve.texture(),
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buf,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(row_bytes as u32),
+                        rows_per_image: Some(size),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: size,
+                    height: size,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit([enc.finish()]);
+            let (tx, rx) = std::sync::mpsc::channel();
+            buf.map_async(wgpu::MapMode::Read, .., move |r| {
+                let _ = tx.send(r);
+            });
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            rx.recv()
+                .unwrap()
+                .expect("sky-only guard readback map failed");
+            let data = buf.get_mapped_range(..).unwrap().to_vec();
+            buf.unmap();
+            data
+        };
+        let armed = shade(&mut renderer, &mut flight, su);
+        let disarmed = shade(&mut renderer, &mut flight, ShadowUniforms::default());
+        assert!(
+            !errored.load(std::sync::atomic::Ordering::Relaxed),
+            "the sky-only guard frame produced wgpu validation errors"
+        );
+        // The craft actually rasterized brightly (above the ambient
+        // floor — the studio light's direct term is the bulk of it).
+        let brightest = armed
+            .chunks_exact(4)
+            .map(|p| p.iter().take(3).copied().max().unwrap_or(0))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            brightest > 80,
+            "the craft triangle barely rasterized (max channel {brightest}) — \
+             the fixture went dark and the A/B pair proves nothing"
+        );
+        // The contract: the armed row changed NOTHING on a sky-only
+        // packet — bit-identical to the disarmed fallback.
+        assert_eq!(
+            armed, disarmed,
+            "an armed SU row must not shade the craft while the packet is \
+             sky-only (the never-cleared cascade map killed the sun term)"
+        );
+    }
 }
