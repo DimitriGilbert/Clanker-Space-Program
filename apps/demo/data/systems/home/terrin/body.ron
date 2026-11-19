@@ -8,8 +8,14 @@
 // 2π·sqrt(a³/μ_solen); the sheet's 9.203e6 s (426 sim-days of 21 600 s)
 // is its 4-significant-figure display — the §3.0 validator checks the
 // authored value against the closed form to 1e-9 relative.
+//
+// This is the demo-minimized copy of data/systems/home/terrin/body.ron:
+// the world authoring (terrain profile/amplitude, biomes) mirrors the
+// shipped M5 §5.2-R2 relief — Mountain at amplitude_frac 0.006 (3 600 m
+// of relief over the 600 km radius) — and must be refreshed whenever
+// the shipped home-system authoring changes (see docs/BUILD-AND-DEV.md).
 (
-    schema_version: 1,
+    schema_version: 2,
     id: "terrin",
     display_name: "body.terrin.name",
     parent: Some("solen"),
@@ -43,7 +49,12 @@
     )),
     // §3.0: "Ocean — yes (datum r = R)".
     ocean: Some((datum_radius_m: 6.000e5)),
-    terrain: (noise_seed: 601, heightmap: None),
+    terrain: (
+        noise_seed: 601,
+        heightmap: None,
+        amplitude_frac: 0.006,
+        relief: Mountain,
+    ),
     biome_map: Some((png: "biomes.png", legend: "biomes.ron")),
     surface_resources: [],
     insolation_w_m2: Some(1361.0),

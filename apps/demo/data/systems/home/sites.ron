@@ -10,17 +10,15 @@
             display_name: "site.terrin-launch",
             body: "terrin",
             // Mirror of data/systems/home/sites.ron: just south of the
-            // equator on a shoreline where the baked heightfield
-            // (noise_seed 601) — which is BOTH the sim's contact
-            // surface and the rendered ground — is ~0 m against datum:
-            // a flat pad, and altimetry that stays honest. The old
-            // lon-π site sits atop a +57 m hill — a pad there would
-            // be parked on a slope. lon 2.916 is ~0.23 rad west of the
-            // t=0 sun meridian: a morning pad, ~1.7 h of daylight at
-            // spawn.
+            // equator at the legacy coordinates (a MORNING pad, ~1.7 h
+            // of daylight at spawn — see the shipped file's longitude
+            // note). Under the mirrored M5 §5.2-R2 Mountain field the
+            // heightfield there is +52.00 m over datum, so
+            // `altitude_m` tracks it and a spawned craft rests on the
+            // rendered ground instead of buried inside it.
             latitude_rad: -0.092,
             longitude_rad: 2.916,
-            altitude_m: 0.0,
+            altitude_m: 52.0,
             launch: true,
             resource_yields: [
                 ("ore", 0.35),
@@ -38,9 +36,15 @@
             id: "terrin-downrange",
             display_name: "site.terrin-downrange",
             body: "terrin",
-            latitude_rad: 0.0,
-            longitude_rad: 3.9269908169872414,
-            altitude_m: 0.0,
+            // Mirror of data/systems/home/sites.ron — re-sited twice by
+            // the M5 §5.2-R2 relief re-authorings: the original (0,
+            // 3.927) datum point drowned under the Mountain field's
+            // ocean, so the marker moved to the flattest dry candidate
+            // in the ±5° re-scan window, anchored at its field height.
+            // Nothing berths here — recovery is commanded, not landed.
+            latitude_rad: -0.12217304763960308, // −7°
+            longitude_rad: 4.0448005414968586,
+            altitude_m: 17.12,
             launch: false,
             resource_yields: [
                 ("ore", 0.20),

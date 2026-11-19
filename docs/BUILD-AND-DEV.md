@@ -263,6 +263,18 @@ only, ≤60 parts, no saves (enforced in the app, `apps/demo/index.html` comment
 `apps/demo/data` is the reduced embedded data set; `apps/demo/dist` is
 git-ignored (`.gitignore`).
 
+**`apps/demo/data` mirrors the shipped home-system authoring** (recorded
+decision, M5 §5.2-R2): the demo's Terrin/Solen `body.ron` terrain blocks
+(profile + `amplitude_frac`), the biome PNG/legend, and `systems/home/sites.ron`
+copy the shipped values — reduced in *scope* (Terrin only, fewer
+parts/contracts), never in *world authoring*. When the shipped home system
+changes (terrain re-authoring, biome regen, site re-siting), refresh the demo
+copies in the same commit or the demo world drifts half-synced — a pad whose
+`altitude_m` no longer matches the rendered heightfield floats or buries the
+spawned craft. The `csp-view` demo tests (`tests/demo.rs` +
+`demo_files_match_disk`) load and validate the embedded set, but do not diff it
+against `data/` — the mirror is a manual obligation.
+
 ## 8. Data baking / asset pipeline
 
 Two generators, both deterministic:
