@@ -701,7 +701,7 @@ when the packet carries them (`uniforms.art.x`).
 
 **Triplanar detail + per-tile de-repetition (texture-quality 4b).** The
 real-art path samples all three projection planes with |n|⁴ weights over
-world-anchored UVs (`tri_planes`/`tile_uv`, `terrain.wgsl:704`/`:784` — the
+world-anchored UVs (`tri_planes`/`tile_uv`, `terrain.wgsl:724`/`:804` — the
 anchor quantizes the frame so `d·k`'s f32 ulp never jitters a texel).
 Since 4b each tile cell applies ONE of the eight dihedral transforms of
 the square (identity/rot90/rot180/rot270 × optional mirror — 3 bits:
@@ -728,7 +728,7 @@ ALU per sample coordinate, zero extra fetches. Distance-band table
 The micro-relief bump's top noise octave stays at freq 16000 — the
 shader's STABILITY ceiling for direct lattice samples — with 4b's extra
 near-field detail coming from a second incommensurate 12200 octave
-behind a 1.8 km boot fade (`bump_fix_near`, `terrain.wgsl:505`) plus the
+behind a 1.8 km boot fade (`bump_fix_near`, `terrain.wgsl:525`) plus the
 finer filtered normal retilings above. `uniforms.art.z = 1` (render-gate
 `DUMP_DEREPETITION=0` A/B dumps only; production writes 0) restores the
 pre-4b plain periodic tiling verbatim for before/after evidence pairs.
@@ -850,24 +850,75 @@ relief under the probe's fixed sun casts only isolated small shadows
 casts land. The out-of-volume guard (outside the ortho box ⇒ lit,
 never edge-clamped) stays as correct CSM hygiene.
 
+**Ridge-facet contrast levers (facet-tuning pass — the "soft blotches"
+weakness, settled by a render-and-look loop).** Three levers in
+`terrain.wgsl`, judged at a side-lit comparison vantage (`dump_surface`
+at lat 51, lon 124, heading 210, alt 710, pitch 0.25 — the pinned sun
+sits ~21° up and the camera-vs-sun azimuth dot is 0.04, so sun-facing
+and leeward facets interleave in one frame; HEAD baseline vs candidate
+A (MACRO_TILT 3.0 on the same gradient taps, a 1→0.45 day-ambient ramp
+over 8–18 km, a flat 0.55 inscatter scale) vs candidate B (the shipped
+structure), B's evidence and A's spec each untrusted until re-rendered
+here). The settled values: `MACRO_GAIN = 2.5` (`terrain.wgsl:479`)
+multiplies the heightfield gradient scale inside `terrain_normal_fix`
+(`:480` — the same four bilinear taps feed
+`k = u.planet.w/denom * MACRO_GAIN`, `:487`; a pure slope scale, no new
+octaves, so the STABILITY lattice ceiling holds) — at gain 1 the ~4.2 km
+gradient baseline flattens the Mountain spectrum's true facet tilts and
+whole ranges read as soft blotches. `AMB_DAY = 0.75` (`terrain.wgsl:918`)
+scales the dayness=1 endpoint of the hemisphere-ambient mix (`:1161`)
+only — the sky fill otherwise reaches sun-facing and leeward facets
+alike and floors exactly where the banding must read; the night floor
+and the airless override are untouched. `SHADE_K = 0.70`
+(`terrain.wgsl:933`) gates the terrain pass's aerial inscatter (`:1177`)
+by the struck facet's direct-lit fraction (`lit_frac`: ocean `:1034`,
+terrain macro normal `:1148`), so leeward haze stops lifting shadow
+bands toward horizon-sky brightness while lit facets and the sky pass
+keep full airlight. A was rejected on the rendered evidence, not on
+paper: its global far-field dimming strips aerial perspective — in the
+alt 3.5 km sweep distant ranges read murky, near-navy, with the
+amplified gradient's crest speckle standing proud of the lost haze —
+while B's lit-fraction gate kept depth haze and still gained the
+banding. Regression fences verified by eye at the settled values: the
+pad probe frame (`dump_surface` defaults) and flight flagship
+(`dump_flight` defaults — plume, craft, beach character and far headland
+intact, no new banding) re-rendered unchanged in character against HEAD,
+and a front-lit boot-range frame (lat −30, lon 116, heading 45, alt 150)
+pools shadows deeper without crushed blacks or flattened fill;
+`cargo test -p csp-render`'s naga gate (`shaders_parse_and_validate`) is
+green. The coupling the previous design's docs missed: the cascade
+receive bias's `tan_slope` (`terrain.wgsl:658`, consumed as the
+`(1 + tan_slope)` envelope in `cascade_one`'s reference-depth and
+normal-offset terms, `:615`/`:632`) is derived from the same macro
+normal, so MACRO_GAIN amplifies the shading gradient and the
+receive-bias factors together — empirically clean on the pad contracts,
+where the pad probe frame re-rendered identical to HEAD in character
+(same pale spalled ground, same exposure, same soft near field: no
+darkening, no flattening, no new banding), the expected flat-ground case
+since the pad's amplified gradient is ~0. Honest residual, unchanged by
+this pass: the foreground's soft cast-shadow blobs are
+heightfield-geometry-driven (cascade/`sun_occlusion` occluders, not
+shading) and present identically at HEAD; these levers reshape the
+mid/far-field sun/shade banding, not the blob pattern.
+
 ### 7.5 Sky, atmosphere, and the star field (current state)
 
-`fs_sky` (`terrain.wgsl:1263`): fullscreen triangle; per-pixel scattering ray
+`fs_sky` (`terrain.wgsl:1322`): fullscreen triangle; per-pixel scattering ray
 in f32 with the shell-quadratic constants pre-baked in CPU f64
 (`uniforms.misc.z/w` — computing |pa|²−r² in f32 costs ~±300 m of limb
 wobble); 32-step jittered march with per-step jitter (partial cancellation,
 no banding); Rayleigh + Mie (aerosols hug the low shell) through the LUT;
 ground strikes swap the backdrop for haze; ACES tone-map.
 
-The star field (`star_cell`/`star_layer`/`star_field`, `terrain.wgsl:1169`/
-`:1200`/`:1228`) is fully procedural — crisp point stars hashed out of a 3D
+The star field (`star_cell`/`star_layer`/`star_field`, `terrain.wgsl:1228`/
+`:1259`/`:1287`) is fully procedural — crisp point stars hashed out of a 3D
 direction-space lattice (~750 bright + ~700 faint incl. a Milky-Way band),
 each projected onto the direction sphere with a Gaussian core + faint halo,
 and a per-pixel ray-footprint floor (`sig_ang`) so **no star ever goes
 sub-pixel** — dense sub-pixel points read as film grain, which was the
 "grainy static sky" complaint.
 
-Daylight star gate (`terrain.wgsl:1373`): stars survive only where the
+Daylight star gate (`terrain.wgsl:1432`): stars survive only where the
 shell scatters essentially nothing into the ray —
 `star_vis = 1 − smoothstep(6e-4, 4e-3, ins_lum)`. The previous
 `exp(−ins_lum·160)` never reached zero, so bright stars speckled the
@@ -1011,8 +1062,8 @@ found live defects in the same tree, listed in the ledger below.
    readout block until dragged.
 2. **Grainy sky / stars too early.** FIXED: the star field is sparse
    resolved points with a resolution-aware sub-pixel floor, and the daylight
-   gate is the hard `smoothstep(6e-4, 4e-3, ins_lum)` (`terrain.wgsl:1228`
-   `star_field`, `:1373` the gate) replacing the never-zero
+   gate is the hard `smoothstep(6e-4, 4e-3, ins_lum)` (`terrain.wgsl:1287`
+   `star_field`, `:1432` the gate) replacing the never-zero
    `exp(−ins_lum·160)`. The old faint-layer grain root cause is documented
    in the shader comments ("the old 11–23%-occupancy faint layer was the
    'grainy static' sky").

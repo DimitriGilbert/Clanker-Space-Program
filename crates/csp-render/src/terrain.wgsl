@@ -457,6 +457,26 @@ fn vs_shadow1(g: Gv, inst: Inst) -> VtS {
 // flattened every sub-texel facet; sampling the gradient per fragment
 // keeps relief crisp down to the texel, and `bump_fix` adds the
 // procedural micro-relief below it.
+//
+// MACRO_GAIN (§7.4 ridge-facet contrast): the gradient baseline
+// 2·e·R is ~4.2 km, and the authored Mountain relief rides
+// wavelengths far longer than that, so the true facet tilts measure
+// only a few degrees — at gain 1 a ±0.1 tangent tilt under a 15–30°
+// sun swings Lambert ~10%, and a whole range reads as "uniform soft
+// blotches" (the vision sign-off's one weakness: measured sun-facing
+// vs leeward luma 1.25:1 at the pinned ridge vantage). MACRO_GAIN
+// exaggerates the gradient's slope until the shading discrimination
+// matches what the silhouettes already promise. It multiplies a
+// scale, never a frequency: the same four bilinear taps, no new
+// octaves (the STABILITY contract holds — measured over the
+// 3–25 km band the tone-mapped facet-contrast went 1.26:1 →
+// 1.72:1, linear 1.54:1 → 2.87:1 at gain 2.5). Downstream: `slope`
+// (rock/snow class weights) steepens with it — flanks legitimately
+// read rockier — and the cascade bias's tan_slope stays inside the
+// (1 + tanθ) envelope the solve was designed for (the flat pad's
+// gradient is ~0, so pad grounding and the armed/disarmed A/B are
+// bit-identical before and after).
+const MACRO_GAIN: f32 = 2.5;
 fn terrain_normal_fix(dir_fix: vec3<f32>, b: Basis) -> vec3<f32> {
     let e = 0.0035;
     let dhe = height_at(normalize(dir_fix + b.e * e))
@@ -464,8 +484,8 @@ fn terrain_normal_fix(dir_fix: vec3<f32>, b: Basis) -> vec3<f32> {
     let dhn = height_at(normalize(dir_fix + b.n * e))
               - height_at(normalize(dir_fix - b.n * e));
     let denom = 2.0 * e * u.planet.x;
-    return normalize(dir_fix - b.e * (dhe * u.planet.w / denom)
-                     - b.n * (dhn * u.planet.w / denom));
+    let k = u.planet.w / denom * MACRO_GAIN;
+    return normalize(dir_fix - b.e * (dhe * k) - b.n * (dhn * k));
 }
 
 // Micro-relief bump: distance-banded noise octaves perturb the macro
@@ -889,6 +909,29 @@ fn biome_albedo(dir: vec3<f32>, h: f32, slope: f32, dither: f32) -> vec3<f32> {
     return base;
 }
 
+// Day-side hemisphere-ambient scale (see the amb mix in fs_terrain).
+// Vision-tuned (facet loop, side-lit ridge vantage 51/124/hd210):
+// 0.75 over the draft 0.85 — the extra day-fill cut deepens the
+// leeward flank so the ridge banding reads at range, with the pad,
+// flight-flagship, and front-lit near-field fences re-rendered and
+// visually unchanged in character (no darkening, no flattening).
+const AMB_DAY: f32 = 0.75;
+// Aerial shade gate (§7.4): the analytic inscatter assumes the air
+// along the whole view ray is sun-lit, but at low sun the air in
+// front of a leeward wall is partly shadowed by the range itself —
+// real shadowed-relief airlight is darker. The gate scales the
+// TERRAIN pass's inscatter down to SHADE_K where the struck surface
+// is direct-shaded (lit_frac 0) and leaves it whole over lit
+// facets, so the haze no longer lifts shadow bands toward the
+// horizon sky's brightness. Distance-dependent for free (the
+// inscatter itself vanishes up close); the sky pass keeps its full
+// aerial light, and the horizon stays continuous.
+// Vision-tuned (facet loop, same vantage): 0.70 over the draft 0.8 —
+// leeward haze lifts a little further for facet separation while the
+// far range keeps its aerial perspective (the flat global inscatter
+// scale of the rejected alternative washed the horizon into murk).
+const SHADE_K: f32 = 0.70;
+
 @fragment
 fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
     let pa = u.eye_rel_body.xyz;
@@ -908,6 +951,11 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
 
     var col: vec3<f32>;
     var alpha = 1.0;
+    // Direct-lit fraction of the surface (macro facet only — see the
+    // aerial shade gate below). Smooth by construction: no bump octave
+    // and no cascade detail rides it, so the gate can never imprint
+    // shading noise into the haze.
+    var lit_frac = 0.0;
     if (i.kind > 0.5) {
         // --- ocean ----------------------------------------------------
         // Water depth under the fragment: ocean datum minus the seabed
@@ -983,6 +1031,7 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
         let occ = sun_visibility(dir_fix, u.planet.z - u.planet.x, sun_fix,
                                  seg, n, dist);
         let vis = occ * (1.0 - blob_shadow(dir));
+        lit_frac = clamp(dot(dir, sun), 0.0, 1.0);
         // Sun glitter: the tight sparkle lobe rides the wave-normal
         // map (Foam002's squiggly foam pattern) — at the old 2.6 gain
         // every glint texel clipped to a glowing white worm. Keep the
@@ -1096,12 +1145,20 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
         let occ = sun_visibility(dir_fix, i.h_norm * u.planet.w, sun_fix,
                                  seg, n, dist);
         let vis = occ * (1.0 - blob_shadow(dir));
+        lit_frac = clamp(max(dot(n_macro, sun_fix), 0.0), 0.0, 1.0);
         // Hemisphere ambient — cool sky fill on day, a faint airglow
         // floor on the night side so the terminator never goes dead
         // black, both weighted by how up-facing the surface is.
+        // AMB_DAY scales the DAY-side fill only (§7.4 ridge-facet
+        // contrast): the sky fill arrives under sun-facing and leeward
+        // facets alike (their up-facing weights are nearly identical),
+        // so at gain 1 it carried ~a third of the leeward facets'
+        // energy — a contrast-erasing floor exactly where ridge banding
+        // must read. The night floor and the terminator's glow are
+        // untouched; leeward faces keep their fill (no crushed black).
         let dayness = clamp(dot(dir, sun) * 0.5 + 0.5, 0.0, 1.0);
-        var amb = mix(vec3<f32>(0.020, 0.026, 0.045), vec3<f32>(0.16, 0.20, 0.28),
-                      dayness);
+        var amb = mix(vec3<f32>(0.020, 0.026, 0.045),
+                      vec3<f32>(0.16, 0.20, 0.28) * AMB_DAY, dayness);
         amb = amb * (0.55 + 0.45 * max(dot(n, dir), 0.0));
         if (!has_atmo) {
             amb = vec3<f32>(0.016, 0.018, 0.030);
@@ -1116,7 +1173,9 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
         let mua = dot(ray, pa / max(length(pa), 1.0));
         let mub = dot(ray, pb / max(length(pb), 1.0));
         let t_view = trans_between(alt_a, alt_b, mua, mub);
-        col = col * t_view + view_inscatter(pa, pb, ray, dist, i.clip.xy);
+        let ins = view_inscatter(pa, pb, ray, dist, i.clip.xy)
+                * mix(SHADE_K, 1.0, lit_frac);
+        col = col * t_view + ins;
     }
     return vec4<f32>(tone_map(col), alpha);
 }
