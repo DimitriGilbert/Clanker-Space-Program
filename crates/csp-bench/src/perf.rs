@@ -182,9 +182,13 @@ pub const BUDGET_ROWS: &[BudgetRow] = &[
         measurable: true,
         note: "order-dependent pixels at 1080p across two draw orders of \
                the §5.4 scene on the shipped flight pipeline (reverse-Z \
-               f32 clip, Depth32Float, GreaterEqual, 4×MSAA); measured by \
-               csp_view::depth_probe on a headless adapter (lavapipe on \
-               CI — C16-F5). Over the bound, §2.3's far-field pass is owed",
+               f32 clip, Depth32Float, GreaterEqual, 4×MSAA; since §2.3's \
+               far-field pass the surface composes through the far pass \
+               and the reference object through the near pass, where the \
+               partition — not f32 depth — fixes the cross-pass winner); \
+               measured by csp_view::depth_probe on a headless adapter \
+               (lavapipe on CI — C16-F5). Over the bound, §2.3's \
+               far-field pass is owed",
     },
     // --- hardware-gated fps rows (§8.2: reference-machine gates) ---
     BudgetRow {
@@ -1220,7 +1224,12 @@ fn headless_gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
 ///   a nonzero control means the probe is broken, not the format;
 /// - a fully coplanar run (0 m spread) must report a large count —
 ///   every covered pixel IS order-dependent by construction, so a
-///   small count means the differ is blind.
+///   small count means the differ is blind;
+/// - the far-CONTENT control must report the far surface actually
+///   rasterizing through the far pass — a far pass that stopped
+///   drawing would also read 0 order-dependent pixels (both orders
+///   render the same empty background), so without this guard the
+///   row's green is indistinguishable from a vacuous one.
 fn measure_depth_fight_1e7() -> Result<Measurement, ReplayError> {
     let Some((device, queue)) = headless_gpu() else {
         return Err(ReplayError::MalformedGolden(
@@ -1246,12 +1255,21 @@ fn measure_depth_fight_1e7() -> Result<Measurement, ReplayError> {
              the differ is blind",
         ));
     }
+    let far_px = csp_view::depth_probe::far_surface_rasterizes(&device, &queue, 1.0e7)
+        .map_err(|_| ReplayError::MalformedGolden("perf: depth probe readback failed"))?;
+    if far_px < 100_000 {
+        return Err(ReplayError::MalformedGolden(
+            "perf: the far pass rasterized almost nothing at 10⁷ m — \
+             far content is missing and the 0-px reading is vacuous",
+        ));
+    }
     let m = probe(1.0e7, 1.0)?;
     Ok(Measurement {
         value: f64::from(m.order_dependent_px),
         detail: format!(
-            "{}×{} two-order diff, controls 1 km/1 m → {} px and 1 km/coplanar → {} px",
-            m.width, m.height, near.order_dependent_px, coplanar.order_dependent_px
+            "{}×{} two-order diff, controls 1 km/1 m → {} px, 1 km/coplanar → {} px, \
+             10⁷ m far-surface survival → {} px",
+            m.width, m.height, near.order_dependent_px, coplanar.order_dependent_px, far_px
         ),
     })
 }

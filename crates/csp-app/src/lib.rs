@@ -1758,6 +1758,91 @@ impl App {
         self.view.vab_event(VabEvent::Notice(text));
     }
 
+    /// §2.3's far-field scene pass — the FIRST of a flight frame's two
+    /// render passes (see `paint`'s block comment for the partition
+    /// contract). Owns the frame's color clear and its own 0.0 depth
+    /// clear; the near pass that follows loads the color, clears the
+    /// depth again, and resolves into the surface view. A static helper
+    /// so the renderers borrow disjointly from `paint`'s `gpu` split.
+    fn record_scene_far(
+        terrain_renderer: &mut Option<TerrainRenderer>,
+        flight_renderer: &mut Option<FlightRenderer>,
+        encoder: &mut wgpu::CommandEncoder,
+        gpu: &csp_render::Gpu,
+        packet: &csp_render::flight::FlightPacket,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("scene-far"),
+            // 4×MSAA into the shared multisampled target; the NEAR
+            // pass after this loads these samples and resolves into
+            // the surface view (C11-F1 stays one resolve).
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: gpu.msaa_view(),
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.02,
+                        g: 0.02,
+                        b: 0.05,
+                        a: 1.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: flight_renderer.as_ref().map(|v| v.depth_view()).map(
+                |view| wgpu::RenderPassDepthStencilAttachment {
+                    view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0.0),
+                        // §2.3: the near pass clears this attachment
+                        // again before it reads it — the far pass's
+                        // depths are write-only, so discard the store
+                        // (a tiling win, never a visibility change).
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                },
+            ),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        // The far field's own draws: the terrain renderer's sky +
+        // far instances, then the flight stream's far vertices (the
+        // fallback sky when no terrain runs).
+        if let (Some(t), Some(tp)) = (terrain_renderer.as_mut(), &packet.terrain) {
+            t.draw_far(&mut pass, &gpu.device, &gpu.queue, tp);
+        }
+        if let Some(f) = flight_renderer {
+            f.draw_far(&mut pass, &gpu.device, &gpu.queue, packet);
+        }
+    }
+
+    /// The near pass's flight draws (§2.3's second half): R2's order —
+    /// OPAQUE near terrain first (it writes the depth the craft tests
+    /// against), then the craft stream, then the THIRD, depth-test-only
+    /// near ocean draw — alpha-blended water resolves over an
+    /// already-rasterized hull instead of occluding it with depth
+    /// written before the craft existed (C11-F3). The sky + far
+    /// instances drew in [`Self::record_scene_far`]. Static for
+    /// disjoint field borrows, same as its sibling.
+    fn record_flight_near(
+        terrain_renderer: &mut Option<TerrainRenderer>,
+        flight_renderer: &mut FlightRenderer,
+        pass: &mut wgpu::RenderPass<'_>,
+        gpu: &csp_render::Gpu,
+        packet: &csp_render::flight::FlightPacket,
+    ) {
+        if let (Some(t), Some(tp)) = (terrain_renderer.as_mut(), &packet.terrain) {
+            t.draw(pass, &gpu.device, &gpu.queue, tp);
+        }
+        flight_renderer.draw(pass, &gpu.device, &gpu.queue, packet);
+        if let (Some(t), Some(tp)) = (terrain_renderer.as_mut(), &packet.terrain) {
+            t.draw_ocean(pass, tp);
+        }
+    }
+
     /// The paint half of the frame: consume the `UiBuild`-produced
     /// `egui::FullOutput` (platform output, tessellation, textures delta)
     /// and draw it — no egui pass logic here (§2.5).
@@ -1868,6 +1953,32 @@ impl App {
             );
         }
 
+        // §2.3's far-field pass (the debt the `render.depth-fight-1e7`
+        // row calls in): FLIGHT frames split into two render passes
+        // over one depth attachment — the FAR pass first (sky backdrop
+        // + the ≥FAR_SPLIT_M terrain/ocean through the far projection,
+        // depth cleared 0.0), then the NEAR pass (today's pass: color
+        // LOADed, depth cleared AGAIN, near terrain + craft + near
+        // ocean). Clearing between passes is the partition: near
+        // geometry covers only [0.1, split) and far only [split, ∞),
+        // so "near wins where both exist" is exact at the boundary,
+        // not an approximation — and no submission order inside either
+        // pass can change a cross-pass winner. Map/VAB frames keep the
+        // single pass (their scenes have no far field).
+        let flight_mode = self.view.mode() == ViewMode::Flight;
+        // `far_ran` — the far pass actually recorded — is what the
+        // near pass's color op keys on: a flight frame without a
+        // packet must not `Load` samples nobody cleared.
+        let far_ran = flight_mode && flight_packet.is_some();
+        if far_ran && let Some(packet) = &flight_packet {
+            Self::record_scene_far(
+                &mut self.terrain_renderer,
+                &mut self.flight_renderer,
+                &mut frame.encoder,
+                gpu,
+                packet,
+            );
+        }
         {
             let mut pass = frame
                 .encoder
@@ -1876,17 +1987,23 @@ impl App {
                     // 4×MSAA: every pipeline rasterizes into the
                     // multisampled target and the pass resolves into
                     // the surface view (C11-F1 — the previous frame
-                    // had no AA anywhere).
+                    // had no AA anywhere). Flight frames that ran the
+                    // far pass LOAD its samples (it owns the clear);
+                    // every other frame clears here.
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: gpu.msaa_view(),
                         resolve_target: Some(&frame.view),
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: 0.02,
-                                g: 0.02,
-                                b: 0.05,
-                                a: 1.0,
-                            }),
+                            load: if far_ran {
+                                wgpu::LoadOp::Load
+                            } else {
+                                wgpu::LoadOp::Clear(wgpu::Color {
+                                    r: 0.02,
+                                    g: 0.02,
+                                    b: 0.05,
+                                    a: 1.0,
+                                })
+                            },
                             store: wgpu::StoreOp::Store,
                         },
                         depth_slice: None,
@@ -1898,7 +2015,9 @@ impl App {
                     // state, and wgpu validates pass/pipeline depth
                     // compatibility exactly: a no-depth pipeline in a
                     // depth-attached pass is a validation error, so Map
-                    // gets `None` here.
+                    // gets `None` here. Flight clears again — the §2.3
+                    // partition: the near pass never tests against far
+                    // depths, near geometry wins where both exist.
                     depth_stencil_attachment: (match self.view.mode() {
                         ViewMode::Flight => self.flight_renderer.as_ref().map(|v| v.depth_view()),
                         ViewMode::Vab => self.vab_renderer.as_ref().map(|v| v.depth_view()),
@@ -1924,22 +2043,10 @@ impl App {
             if let (Some(v), Some(packet)) = (&mut self.vab_renderer, &self.last_vab_packet) {
                 v.draw(&mut pass, &gpu.device, &gpu.queue, packet);
             }
-            if self.view.mode() == ViewMode::Flight
+            if flight_mode
                 && let (Some(f), Some(packet)) = (&mut self.flight_renderer, &flight_packet)
             {
-                // R2: the surface pass first — its sky is the backdrop
-                // and OPAQUE terrain writes the depth the craft tests
-                // against. The ocean is a THIRD draw after the craft
-                // stream: alpha-blended water must resolve over an
-                // already-rasterized hull, not occlude it with depth
-                // written before the craft existed (C11-F3).
-                if let (Some(t), Some(tp)) = (&mut self.terrain_renderer, &packet.terrain) {
-                    t.draw(&mut pass, &gpu.device, &gpu.queue, tp);
-                }
-                f.draw(&mut pass, &gpu.device, &gpu.queue, packet);
-                if let (Some(t), Some(tp)) = (&mut self.terrain_renderer, &packet.terrain) {
-                    t.draw_ocean(&mut pass, tp);
-                }
+                Self::record_flight_near(&mut self.terrain_renderer, f, &mut pass, gpu, packet);
             }
         }
 

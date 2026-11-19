@@ -344,12 +344,17 @@ fn render_flight_scene_sized(
         let cast = flight.stage_cascade_cast(device, queue, packet);
         terrain.draw_shadow(&mut encoder, device, queue, tp, &packet.shadow, cast);
     }
+    // §2.3's two-pass flight frame, mirroring the app: the FAR pass
+    // (sky backdrop + far instances + far flight stream, depth cleared
+    // 0.0, no resolve) records first; the NEAR pass below loads the
+    // color, clears the depth again, and draws near terrain → craft →
+    // near ocean exactly where the app does.
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("scene"),
+            label: Some("scene-far"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &msaa,
-                resolve_target: Some(&target),
+                resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color {
                         r: CLEAR[0],
@@ -361,8 +366,43 @@ fn render_flight_scene_sized(
                 },
                 depth_slice: None,
             })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: flight.depth_view(),
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(0.0),
+                    // The near pass clears again before reading — the
+                    // far depths are write-only (store discarded, the
+                    // app's far pass mirrored exactly).
+                    store: wgpu::StoreOp::Discard,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        if let Some(tp) = &packet.terrain {
+            terrain.draw_far(&mut pass, device, queue, tp);
+        }
+        flight.draw_far(&mut pass, device, queue, packet);
+    }
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("scene"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &msaa,
+                resolve_target: Some(&target),
+                ops: wgpu::Operations {
+                    // The far pass owns the frame's clear; this pass
+                    // composites over its samples.
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
             // Same attachment as the app: the flight renderer's shared
-            // reverse-Z target, cleared 0.0 (far).
+            // reverse-Z target, cleared 0.0 (far) again — the §2.3
+            // partition (near never tests against far depths).
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: flight.depth_view(),
                 depth_ops: Some(wgpu::Operations {
@@ -375,9 +415,9 @@ fn render_flight_scene_sized(
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        // The app's draw order: surface pass (sky backdrop + opaque
-        // terrain), craft vertex stream, then the depth-test-only
-        // ocean over both.
+        // The app's near-pass draw order: near terrain, craft vertex
+        // stream, then the depth-test-only near ocean over both. The
+        // sky and far instances drew in the far pass above.
         if let Some(tp) = &packet.terrain {
             terrain.draw(&mut pass, device, queue, tp);
         }
@@ -599,10 +639,17 @@ fn empty_flight_scene_is_what_the_gate_rejects() {
         packet.terrain.is_none(),
         "an empty flight scene must not claim a terrain packet"
     );
+    // §2.3: the fallback sky rides the FAR stream now (the far pass
+    // owns the sky backdrop) — the near stream stays empty for this
+    // craftless, environment-less scene.
     assert_eq!(
-        packet.vertices.len(),
+        packet.far_vertices.len(),
         6,
-        "an empty flight scene emits only the fallback-sky quad"
+        "an empty flight scene emits only the fallback-sky quad (far stream)"
+    );
+    assert!(
+        packet.vertices.is_empty(),
+        "an empty flight scene has no near-stream geometry"
     );
 
     // With the `GreaterEqual` fix the fallback sky rasterizes — the
@@ -1108,6 +1155,526 @@ fn env_f(k: &str, d: f64) -> f64 {
         .unwrap_or(d)
 }
 
+/// §2.3 routing for `dump_surface`'s hand-built scene, mirroring
+/// `build_packet`'s layout and rule: a patch routes far only when its
+/// nearest point ALONG THE VIEW AXIS (`dot(centre − eye, fwd) −
+/// patch_extent`) clears the split — straddlers (radial or angular)
+/// stay near, whole. Returns (near terrain, terrain far start, near
+/// ocean, ocean far start), near-then-far per list.
+fn routed_surface_instances(
+    leaves: &[csp_render::terrain::PatchId],
+    eye_rel: csp_core::DVec3,
+    fwd: csp_core::DVec3,
+    r_body: f64,
+    amplitude_m: f64,
+    field: &csp_render::terrain::HeightField,
+) -> (
+    Vec<csp_render::terrain::TerrainInstance>,
+    u32,
+    Vec<csp_render::terrain::TerrainInstance>,
+    u32,
+) {
+    let split = csp_render::flight::FAR_SPLIT_M;
+    let routed_far = |inst: &csp_render::terrain::TerrainInstance, extent: f64| {
+        let o = inst.origin_rel_eye;
+        f64::from(o[0]) * fwd.x + f64::from(o[1]) * fwd.y + f64::from(o[2]) * fwd.z - extent
+            >= split
+    };
+    let mut terrain_inst = Vec::new();
+    let mut ocean_inst = Vec::new();
+    let mut terrain_far = Vec::new();
+    let mut ocean_far = Vec::new();
+    for &id in leaves {
+        let extent = csp_render::terrain::patch_extent_m(id, r_body, amplitude_m);
+        let inst = csp_render::terrain::patch_instance(id, 0.0, eye_rel, r_body);
+        if routed_far(&inst, extent) {
+            terrain_far.push(inst);
+        } else {
+            terrain_inst.push(inst);
+        }
+        // replicate patch_might_hold_sea's 5x5 sample rule
+        let (corner, du, dv) = csp_render::terrain::patch_cube(id);
+        let mut lo = f64::INFINITY;
+        for j in 0..5 {
+            for i in 0..5 {
+                let c = corner + du * (i as f64 / 4.0) + dv * (j as f64 / 4.0);
+                lo = lo.min(field.sample_dir(c / c.norm()));
+            }
+        }
+        if lo * amplitude_m <= 600.0 {
+            let extent = csp_render::terrain::patch_extent_m(id, r_body, amplitude_m);
+            let inst = csp_render::terrain::patch_instance(id, 1.0, eye_rel, r_body);
+            if routed_far(&inst, extent) {
+                ocean_far.push(inst);
+            } else {
+                ocean_inst.push(inst);
+            }
+        }
+    }
+    let terrain_far_start = terrain_inst.len() as u32;
+    let ocean_far_start = ocean_inst.len() as u32;
+    terrain_inst.extend(terrain_far);
+    ocean_inst.extend(ocean_far);
+    (terrain_inst, terrain_far_start, ocean_inst, ocean_far_start)
+}
+
+/// The authored Terrin scene assets `dump_surface` and the §2.3
+/// mixed-altitude gate share: the profiled heightfield bake, the
+/// authored amplitude, the biome map, and the art pack — read from
+/// the view's config so a re-authored terrain block flows through
+/// without editing the probes.
+fn terrin_scene_assets() -> (
+    csp_render::terrain::HeightField,
+    f64,
+    Option<std::sync::Arc<csp_render::terrain::BiomeField>>,
+    std::sync::Arc<csp_render::terrain::TerrainArt>,
+) {
+    let view = View::new().unwrap();
+    let cfg = view.world.resource::<csp_view::terrain::TerrainConfig>();
+    let t = cfg.bodies.get("terrin").unwrap();
+    let field = csp_render::terrain::HeightField::bake_profiled(t.seed, t.profile);
+    let biome = t.biome.clone();
+    let amplitude = t.amplitude_m;
+    let art = csp_view::art::load()
+        .0
+        .terrain
+        .clone()
+        .expect("terrain art pack");
+    (field, amplitude, biome, art)
+}
+
+/// `dump_surface`'s scene core, parameterized: hand-builds the
+/// TERRAIN-ONLY surface `FlightPacket` at an arbitrary vantage
+/// (lat/lon deg, alt m, pitch rad below the local horizon, heading
+/// rad) with the same public builders the extract uses — §2.3's
+/// near/far routing included. No craft, no launch complex (the
+/// hand-built path never runs `emit_launch_complex`).
+#[allow(clippy::too_many_lines)]
+// one scene recipe shared by the dump and the gate test
+// One scene recipe shared by the dump and the gate — the parameter
+// list IS the scene; a config struct would just rename it.
+#[allow(clippy::too_many_arguments)]
+fn surface_probe_packet(
+    lat_deg: f64,
+    lon_deg: f64,
+    alt_m: f64,
+    pitch_down: f64,
+    heading_rad: f64,
+    amplitude_m: f64,
+    field: csp_render::terrain::HeightField,
+    biome: Option<std::sync::Arc<csp_render::terrain::BiomeField>>,
+    art: std::sync::Arc<csp_render::terrain::TerrainArt>,
+) -> csp_render::flight::FlightPacket {
+    use csp_core::DVec3;
+    let lat = lat_deg.to_radians();
+    let lon = lon_deg.to_radians();
+    let r_body = 600_000.0;
+    // Surface direction under the eye.
+    let (slat, clat) = lat.sin_cos();
+    let (slon, clon) = lon.sin_cos();
+    let dir = DVec3::new(clat * clon, clat * slon, slat);
+    let h_here = field.sample_dir(dir) * amplitude_m;
+    let eye_rel = dir * (r_body + h_here.max(0.0) + alt_m);
+
+    // Camera basis: look `pitch_down` below the local horizon toward
+    // `heading` (0 = north, clockwise).
+    let up = dir;
+    let east0 = DVec3::Z.cross(up);
+    let east = if east0.norm_squared() > 1e-12 {
+        east0 / east0.norm()
+    } else {
+        DVec3::X
+    };
+    let north = up.cross(east);
+    let fwd_h = north * heading_rad.cos() + east * heading_rad.sin();
+    let fwd = (up * (-pitch_down.sin()) + fwd_h * pitch_down.cos()) / 1.0;
+    let z_out = -fwd;
+    let right0 = up.cross(z_out);
+    let right = if right0.norm_squared() > 1e-12 {
+        right0 / right0.norm()
+    } else {
+        east
+    };
+    let upv = z_out.cross(right);
+    let view = [
+        [right.x, right.y, right.z, 0.0],
+        [upv.x, upv.y, upv.z, 0.0],
+        [z_out.x, z_out.y, z_out.z, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ];
+    let aspect = f64::from(W) / f64::from(H);
+    let fovy = 0.9f64;
+    let f = 1.0 / (fovy * 0.5).tan();
+    let proj = [
+        [f / aspect, 0.0, 0.0, 0.0],
+        [0.0, f, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.1],
+        [0.0, 0.0, -1.0, 0.0],
+    ];
+    let mut view_proj = [[0.0f64; 4]; 4];
+    for r in 0..4 {
+        for c in 0..4 {
+            view_proj[r][c] = proj[r][0] * view[0][c]
+                + proj[r][1] * view[1][c]
+                + proj[r][2] * view[2][c]
+                + proj[r][3] * view[3][c];
+        }
+    }
+    // Rebuild the packet through the same builder extract_flight uses —
+    // but it is crate-private, so replicate its uniform/instance steps
+    // with the public pieces.
+    let leaves = csp_render::terrain::select_patches(
+        eye_rel,
+        r_body,
+        amplitude_m,
+        &csp_render::terrain::LodConfig::default(),
+    );
+    let (terrain_inst, terrain_far_start, ocean_inst, ocean_far_start) =
+        routed_surface_instances(&leaves, eye_rel, fwd, r_body, amplitude_m, &field);
+    // view_rot columns = camera axes (sky_view_rot convention).
+    let mut view_rot = [[0.0f32; 4]; 4];
+    for c in 0..3 {
+        view_rot[0][c] = view[0][c] as f32;
+        view_rot[1][c] = view[1][c] as f32;
+        view_rot[2][c] = view[2][c] as f32;
+    }
+    let tan_y = (fovy * 0.5).tan();
+    let eye_r2 = eye_rel.norm_squared();
+    let r_top = r_body + 70_000.0;
+    let mut biome_colors = [[0.0f32; 4]; 16];
+    if let Some(b) = &biome {
+        biome_colors = b.colors;
+    }
+    let near_uniforms = csp_render::terrain::TerrainUniforms {
+        view_proj: {
+            let mut o = [[0.0f32; 4]; 4];
+            for r in 0..4 {
+                for c in 0..4 {
+                    o[c][r] = view_proj[r][c] as f32;
+                }
+            }
+            o
+        },
+        view_rot,
+        eye_rel_body: [eye_rel.x as f32, eye_rel.y as f32, eye_rel.z as f32, 0.0],
+        sun_dir: [-1.0, 0.0, 0.0, 0.0],
+        planet: [r_body as f32, 70_000.0, r_body as f32, amplitude_m as f32],
+        atmo: [
+            5_600.0,
+            if biome.is_some() { 1.0 } else { 0.0 },
+            alt_m as f32,
+            0.0,
+        ],
+        misc: [
+            (tan_y * aspect) as f32,
+            tan_y as f32,
+            (eye_r2 - r_top * r_top) as f32,
+            (eye_r2 - r_body * r_body) as f32,
+        ],
+        spin: [0.0, 0.0, 1.0, 0.0],
+        rayleigh: [5.8e-6, 13.5e-6, 33.1e-6, 0.0],
+        biome_colors,
+        shadow: [0.0; 4],
+        art: [1.0, 0.0, 0.0, 0.0],
+        class_means: test_means(&art),
+    };
+    let packet = csp_render::terrain::TerrainPacket {
+        uniforms: near_uniforms,
+        // §2.3 far row — the same FULL-CLONE + one-row swap
+        // `build_packet` applies: every other uniform field must ride
+        // along verbatim (an earlier version built this from
+        // `Default::default()` and zeroed `planet.x` — the far pass's
+        // displacement collapsed to degenerate triangles and painted
+        // nothing; the full clone is the load-bearing part, pinned by
+        // `far_uniforms_are_exactly_the_clip_z_row_swap`).
+        uniforms_far: {
+            let mut far_vp = view_proj;
+            far_vp[2] = [0.0, 0.0, 0.0, csp_render::flight::FAR_SPLIT_M];
+            let mut o = [[0.0f32; 4]; 4];
+            for r in 0..4 {
+                for c in 0..4 {
+                    o[c][r] = far_vp[r][c] as f32;
+                }
+            }
+            let mut u = near_uniforms;
+            u.view_proj = o;
+            u
+        },
+        heightfield: Some(std::sync::Arc::new(field)),
+        biome,
+        atmo: Some(csp_render::terrain::AtmoDesc {
+            radius_m: r_body,
+            top_m: 70_000.0,
+            scale_height_m: 5_600.0,
+        }),
+        terrain: terrain_inst,
+        terrain_far_start,
+        ocean: ocean_inst,
+        ocean_far_start,
+        sky: true,
+        art: Some(art),
+    };
+    csp_render::flight::FlightPacket {
+        terrain: Some(packet),
+        // 3b: solve the cascades for this probe's hand-built camera —
+        // the same arm predicate + solve the real extract applies,
+        // reconstructed here because the probe bypasses `extract_flight`
+        // (basis: the `fwd`/`dir` it already built; sun [−1,0,0]).
+        shadow: {
+            let sun = DVec3::new(-1.0, 0.0, 0.0);
+            if csp_view::flight::cascades_armed(sun, dir) {
+                csp_render::shadow::solve_cascades(
+                    &csp_render::shadow::ShadowCamera {
+                        sun_dir: sun,
+                        forward: fwd,
+                        up: dir,
+                        fov_y: fovy,
+                        aspect,
+                        near_m: 0.1,
+                    },
+                    &csp_render::shadow::CascadeConfig::default(),
+                )
+                .uniforms
+            } else {
+                csp_render::shadow::ShadowUniforms::default()
+            }
+        },
+        ..Default::default()
+    }
+}
+
+/// §2.3's split-ring regression gate (the routing blocker's pin): an
+/// 800 km vantage looks across the split ring — the disc's terrain
+/// spans ~800 km..~1.24 Mm of eye distance, so BOTH passes carry
+/// geometry and straddling patches exist. Both routing bugs this gate
+/// hunted sent coverable surface to the far pass, whose `split ≤ w`
+/// clip trimmed it out of both passes — sky through the planet: the
+/// original patch-CENTRE rule (validator: 6,344 px) and the
+/// radial-nearest rule (147 px more — the far clip measures FORWARD
+/// depth, `radial·cos(off-axis)`, short of the radial distance at the
+/// frame's side reaches). Pins, in strengthening order:
+///
+/// - **Routing** (CPU, exact): straddlers — radial OR angular —
+///   route NEAR (whole quads); every far-routed patch's
+///   forward-nearest point clears `split + patch_extent`; both bands
+///   non-empty (the case is live).
+/// - **No sky through the disc**: across the WHOLE frame, no pixel
+///   may be exactly the sky-only render where HEAD paints surface —
+///   the hole signature itself (a rectangle over the ring also stays
+///   under ≤ 32 px of inherent limb-haze coincidence; measured 3).
+/// - **HEAD equivalence**: with straddlers whole in the near pass,
+///   the composed frame must match the same scene with EVERY patch
+///   forced near — the pre-split render (the pinned dumps prove the
+///   all-near two-pass frame is bit-identical to HEAD's single pass) —
+///   within ≤ 8 px: the residual is the documented cross-pass
+///   approximation (a near-routed straddler's beyond-split fringe
+///   behind far-routed content along a grazing ray; measured 3). The
+///   bug classes this caught measured 575–6,344 px.
+#[test]
+#[allow(clippy::too_many_lines)] // three pin families over one rendered scene; splitting hides the A/B/C
+fn split_ring_vantage_keeps_the_disc_whole() {
+    let Some((device, queue)) = gate_device("split_ring_vantage_keeps_the_disc_whole") else {
+        return;
+    };
+    let (field, amplitude, biome, art) = terrin_scene_assets();
+    let fp = surface_probe_packet(
+        -5.2712,
+        167.0745,
+        800_000.0,
+        1.05, // rad below the local horizon — frames the split ring
+        0.0,
+        amplitude,
+        field,
+        biome.clone(),
+        art.clone(),
+    );
+    let tp = fp.terrain.as_ref().unwrap();
+
+    // --- routing ------------------------------------------------------
+    let split = csp_render::flight::FAR_SPLIT_M;
+    let dist2 = |i: &csp_render::terrain::TerrainInstance| {
+        let o = i.origin_rel_eye;
+        f64::from(o[0]) * f64::from(o[0])
+            + f64::from(o[1]) * f64::from(o[1])
+            + f64::from(o[2]) * f64::from(o[2])
+    };
+    // The extent rule, reconstructed from each instance's own rows
+    // (`rt::patch_extent_m`'s body; this scene's body radius 600 km).
+    let extent_of = |i: &csp_render::terrain::TerrainInstance| {
+        use csp_core::DVec3;
+        let d = |v: [f32; 4]| DVec3::new(f64::from(v[0]), f64::from(v[1]), f64::from(v[2]));
+        (d(i.du) + d(i.dv)).norm() * 0.5 * 600_000.0 + amplitude
+    };
+    // The camera forward, recovered from the packet's column-major
+    // uniforms (math row 3 = the [0,0,−1,0]·V row = the forward).
+    let fwd = {
+        use csp_core::DVec3;
+        let u = &tp.uniforms;
+        let v = DVec3::new(
+            f64::from(u.view_proj[0][3]),
+            f64::from(u.view_proj[1][3]),
+            f64::from(u.view_proj[2][3]),
+        );
+        let n = v.norm();
+        if n > 1e-9 {
+            DVec3::new(v.x / n, v.y / n, v.z / n)
+        } else {
+            DVec3::ZERO
+        }
+    };
+    let forward_of = |i: &csp_render::terrain::TerrainInstance| {
+        let o = i.origin_rel_eye;
+        f64::from(o[0]) * fwd.x + f64::from(o[1]) * fwd.y + f64::from(o[2]) * fwd.z
+    };
+    let near_n = tp.terrain_far_start as usize;
+    let far_n = tp.terrain.len() - near_n;
+    assert!(near_n > 0, "the 800 km disc's near band is non-empty");
+    assert!(far_n > 0, "the 800 km disc's far band is non-empty");
+    let straddlers = tp.terrain[..near_n]
+        .iter()
+        .filter(|i| dist2(i) >= split * split)
+        .count();
+    assert!(
+        straddlers > 0,
+        "the 800 km vantage must exercise straddlers (centre ≥ split, routed near)"
+    );
+    // The far list's forward-nearest bound clears the split — the
+    // exact quantity the far pass's clip test measures.
+    for i in &tp.terrain[near_n..] {
+        let nearest_fwd = forward_of(i) - extent_of(i);
+        assert!(
+            nearest_fwd >= split,
+            "far-routed patch forward-nearest point {nearest_fwd:.0} m < split"
+        );
+    }
+
+    // --- composed frame vs the sky-only and all-near renders ---------
+    let composed = render_flight_scene(&device, &queue, &fp);
+    // Sky-only: identical packet with empty instance lists — what a
+    // hole reveals wherever the composed frame matches it.
+    let mut sky_fp = fp.clone();
+    let tp_sky = sky_fp.terrain.as_mut().unwrap();
+    tp_sky.terrain.clear();
+    tp_sky.terrain_far_start = 0;
+    tp_sky.ocean.clear();
+    tp_sky.ocean_far_start = 0;
+    let sky = render_flight_scene(&device, &queue, &sky_fp);
+    // All-near: HEAD's render through the same pipelines (the pinned
+    // dumps' proven equivalence).
+    let mut head_fp = fp.clone();
+    let tp_head = head_fp.terrain.as_mut().unwrap();
+    tp_head.terrain_far_start = tp_head.terrain.len() as u32;
+    tp_head.ocean_far_start = tp_head.ocean.len() as u32;
+    let head = render_flight_scene(&device, &queue, &head_fp);
+
+    // The interior rectangle straddling the split ring, safely inside
+    // the silhouette: rows 66–82 %, cols 40–60 % of the frame.
+    let rows = (0.66 * H as f32) as usize..(0.82 * H as f32) as usize;
+    let cols = (0.40 * W as f32) as usize..(0.60 * W as f32) as usize;
+    let px = |img: &[u8], r: usize, c: usize| -> [u8; 4] {
+        let o = (r * W as usize + c) * 4;
+        [img[o], img[o + 1], img[o + 2], img[o + 3]]
+    };
+    let mut sky_through = 0usize;
+    let mut rect_n = 0usize;
+    for r in rows {
+        for c in cols.clone() {
+            rect_n += 1;
+            let a = px(&composed, r, c);
+            let s = px(&sky, r, c);
+            if (0..3).all(|k| a[k].abs_diff(s[k]) <= 8) {
+                sky_through += 1;
+            }
+        }
+    }
+    // The airtight check — over the WHOLE frame: the composed render
+    // vs the all-near (HEAD) render. Any difference must be confined
+    // to the split band (the documented cross-pass approximation):
+    // report the locus precisely.
+    let mut head_diff = 0usize;
+    let (mut rmin, mut rmax, mut cmin, mut cmax) = (usize::MAX, 0, usize::MAX, 0);
+    for (i, (a, h)) in composed
+        .chunks_exact(4)
+        .zip(head.chunks_exact(4))
+        .enumerate()
+    {
+        if (0..3).any(|k| a[k].abs_diff(h[k]) > 8) {
+            head_diff += 1;
+            let (r, c) = (i / W as usize, i % W as usize);
+            rmin = rmin.min(r);
+            rmax = rmax.max(r);
+            cmin = cmin.min(c);
+            cmax = cmax.max(c);
+        }
+    }
+    // Exact-hole count over the WHOLE frame: pixels where the
+    // composed frame is bit-for-bit the sky render while HEAD paints
+    // surface — the sky-through-the-planet signature itself.
+    let mut exact_holes = 0usize;
+    for (i, ((a, h), sk)) in composed
+        .chunks_exact(4)
+        .zip(head.chunks_exact(4))
+        .zip(sky.chunks_exact(4))
+        .enumerate()
+    {
+        let is_sky = (0..3).all(|k| a[k] == sk[k]);
+        let head_paints = (0..3).any(|k| a[k].abs_diff(h[k]) > 8);
+        if is_sky && head_paints {
+            exact_holes += 1;
+            if exact_holes <= 3 {
+                let _ = i; // locus printable on demand
+            }
+        }
+    }
+    eprintln!(
+        "split-ring vantage: rect={rect_n} sky_through={sky_through} head_diff={head_diff} \
+         exact_holes={exact_holes} near={near_n} far={far_n} straddlers={straddlers}"
+    );
+    // Scratch frames for offline inspection (never asserted on).
+    if std::env::var("SPLIT_RING_DUMP").is_ok() {
+        let write = |name: &str, img: &[u8]| {
+            let mut out = format!("P6 {W} {H} 255\n").into_bytes();
+            for p in img.chunks_exact(4) {
+                out.extend_from_slice(&p[..3]);
+            }
+            std::fs::write(name, &out).unwrap();
+        };
+        write("/tmp/split-composed.ppm", &composed);
+        write("/tmp/split-head.ppm", &head);
+        write("/tmp/split-sky.ppm", &sky);
+    }
+    assert_eq!(
+        exact_holes, 0,
+        "sky shows through the disc ({exact_holes} px are exactly the sky render where HEAD \
+         paints surface) — the far pass is clipping visible surface away"
+    );
+    // A handful of interior pixels legitimately coincide with the sky
+    // render (limb haze + MSAA blends — measured 3/2432); the hole
+    // signature is the exact_holes==0 pin above. The bound sits an
+    // order under any real hole and an order over the coincidence
+    // floor.
+    assert!(
+        sky_through <= 32,
+        "sky shows through the disc interior ({sky_through}/{rect_n} px match the sky-only \
+         render) — the far pass is clipping visible surface away"
+    );
+    // The composed frame vs the all-near (HEAD) render: measured 3 px
+    // of the documented cross-pass approximation — a near-routed
+    // straddler's beyond-split fringe sitting behind far-routed
+    // content along a grazing ray, where the near pass's
+    // unconditional-over policy picks the farther surface that HEAD's
+    // single-pass depth test resolves the other way (§7.2.1). Stable,
+    // sub-0.01 % of the frame, zero at gameplay vantages (the pinned
+    // dumps are byte-identical); the bound catches any regression
+    // class that drops or reorders far content wholesale (the bugs
+    // this test hunted measured 575–6,344 px).
+    assert!(
+        head_diff <= 8,
+        "the composed 800 km frame differs from the all-near HEAD render in {head_diff} px — \
+         the far pass changed visible output"
+    );
+}
+
 /// Scratch terrain dump at an arbitrary surface point/heading —
 /// hand-builds the `TerrainPacket` (same builders `extract_flight`
 /// uses) so any location/altitude/pitch can be inspected without
@@ -1140,8 +1707,8 @@ fn dump_surface() {
     };
     // Defaults: the terrin-launch pad, in DEGREES (lat −0.092 rad,
     // lon 2.916 rad — the units this probe's knobs take).
-    let lat = env("DUMP_LAT", -5.2712).to_radians();
-    let lon = env("DUMP_LON", 167.0745).to_radians();
+    let lat = env("DUMP_LAT", -5.2712);
+    let lon = env("DUMP_LON", 167.0745);
     let alt = env("DUMP_ALT", 710.0);
     let pitch_down = env("DUMP_PITCH", 0.55); // rad below the local horizon
     let heading = env("DUMP_HEADING", 0.0).to_radians();
@@ -1187,199 +1754,29 @@ fn dump_surface() {
     // 0.006·R = 3 600 m) — the same profiled bake and scale the
     // terrain pass draws, read from the view's config so a re-authored
     // terrain block flows here without editing this probe.
-    let (field, amplitude_m) = {
-        let view = View::new().unwrap();
-        let cfg = view.world.resource::<csp_view::terrain::TerrainConfig>();
-        let t = cfg.bodies.get("terrin").unwrap();
-        (
-            csp_render::terrain::HeightField::bake_profiled(t.seed, t.profile),
-            t.amplitude_m,
-        )
-    };
+    let (field, authored_amplitude, biome, art) = terrin_scene_assets();
     // A/B knob: force the displacement scale (0 = flat datum) to prove
     // the mesh displacement is live — same scene, two amplitudes, diff.
-    let amplitude_m = env("DUMP_AMP", amplitude_m);
-    let r_body = 600_000.0;
-    let art = csp_view::art::load()
-        .0
-        .terrain
-        .clone()
-        .expect("terrain art pack");
-    let biome = {
-        // The real Terrin biome map via the view's own loader path.
-        let view = View::new().unwrap();
-        let cfg = view.world.resource::<csp_view::terrain::TerrainConfig>();
-        cfg.bodies.get("terrin").and_then(|b| b.biome.clone())
+    let amplitude_m = env("DUMP_AMP", authored_amplitude);
+    let h_here = {
+        let dir = {
+            let (slat, clat) = lat.to_radians().sin_cos();
+            let (slon, clon) = lon.to_radians().sin_cos();
+            DVec3::new(clat * clon, clat * slon, slat)
+        };
+        field.sample_dir(dir) * amplitude_m
     };
-
-    // Surface direction under the eye.
-    let (slat, clat) = lat.sin_cos();
-    let (slon, clon) = lon.sin_cos();
-    let dir = DVec3::new(clat * clon, clat * slon, slat);
-    let h_here = field.sample_dir(dir) * amplitude_m;
-    let eye_rel = dir * (r_body + h_here.max(0.0) + alt);
-
-    // Camera basis: look `pitch_down` below the local horizon toward
-    // `heading` (0 = north, clockwise).
-    let up = dir;
-    let east0 = DVec3::Z.cross(up);
-    let east = if east0.norm_squared() > 1e-12 {
-        east0 / east0.norm()
-    } else {
-        DVec3::X
-    };
-    let north = up.cross(east);
-    let fwd_h = north * heading.cos() + east * heading.sin();
-    let fwd = (up * (-pitch_down.sin()) + fwd_h * pitch_down.cos()) / 1.0;
-    let z_out = -fwd;
-    let right0 = up.cross(z_out);
-    let right = if right0.norm_squared() > 1e-12 {
-        right0 / right0.norm()
-    } else {
-        east
-    };
-    let upv = z_out.cross(right);
-    let view = [
-        [right.x, right.y, right.z, 0.0],
-        [upv.x, upv.y, upv.z, 0.0],
-        [z_out.x, z_out.y, z_out.z, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-    ];
-    let aspect = f64::from(W) / f64::from(H);
-    let fovy = 0.9f64;
-    let f = 1.0 / (fovy * 0.5).tan();
-    let proj = [
-        [f / aspect, 0.0, 0.0, 0.0],
-        [0.0, f, 0.0, 0.0],
-        [0.0, 0.0, 0.0, 0.1],
-        [0.0, 0.0, -1.0, 0.0],
-    ];
-    let mut view_proj = [[0.0f64; 4]; 4];
-    for r in 0..4 {
-        for c in 0..4 {
-            view_proj[r][c] = proj[r][0] * view[0][c]
-                + proj[r][1] * view[1][c]
-                + proj[r][2] * view[2][c]
-                + proj[r][3] * view[3][c];
-        }
-    }
-    // Rebuild the packet through the same builder extract_flight uses —
-    // but it is crate-private, so replicate its uniform/instance steps
-    // with the public pieces.
-    let leaves = csp_render::terrain::select_patches(
-        eye_rel,
-        r_body,
+    let fp = surface_probe_packet(
+        lat,
+        lon,
+        alt,
+        pitch_down,
+        heading,
         amplitude_m,
-        &csp_render::terrain::LodConfig::default(),
-    );
-    let mut terrain_inst = Vec::new();
-    let mut ocean_inst = Vec::new();
-    for &id in &leaves {
-        terrain_inst.push(csp_render::terrain::patch_instance(
-            id, 0.0, eye_rel, r_body,
-        ));
-        // replicate patch_might_hold_sea's 5x5 sample rule
-        let (corner, du, dv) = csp_render::terrain::patch_cube(id);
-        let mut lo = f64::INFINITY;
-        for j in 0..5 {
-            for i in 0..5 {
-                let c = corner + du * (i as f64 / 4.0) + dv * (j as f64 / 4.0);
-                lo = lo.min(field.sample_dir(c / c.norm()));
-            }
-        }
-        if lo * amplitude_m <= 600.0 {
-            ocean_inst.push(csp_render::terrain::patch_instance(
-                id, 1.0, eye_rel, r_body,
-            ));
-        }
-    }
-    // view_rot columns = camera axes (sky_view_rot convention).
-    let mut view_rot = [[0.0f32; 4]; 4];
-    for c in 0..3 {
-        view_rot[0][c] = view[0][c] as f32;
-        view_rot[1][c] = view[1][c] as f32;
-        view_rot[2][c] = view[2][c] as f32;
-    }
-    let tan_y = (fovy * 0.5).tan();
-    let eye_r2 = eye_rel.norm_squared();
-    let r_top = r_body + 70_000.0;
-    let mut biome_colors = [[0.0f32; 4]; 16];
-    if let Some(b) = &biome {
-        biome_colors = b.colors;
-    }
-    let packet = csp_render::terrain::TerrainPacket {
-        uniforms: csp_render::terrain::TerrainUniforms {
-            view_proj: {
-                let mut o = [[0.0f32; 4]; 4];
-                for r in 0..4 {
-                    for c in 0..4 {
-                        o[c][r] = view_proj[r][c] as f32;
-                    }
-                }
-                o
-            },
-            view_rot,
-            eye_rel_body: [eye_rel.x as f32, eye_rel.y as f32, eye_rel.z as f32, 0.0],
-            sun_dir: [-1.0, 0.0, 0.0, 0.0],
-            planet: [r_body as f32, 70_000.0, r_body as f32, amplitude_m as f32],
-            atmo: [
-                5_600.0,
-                if biome.is_some() { 1.0 } else { 0.0 },
-                alt as f32,
-                0.0,
-            ],
-            misc: [
-                (tan_y * aspect) as f32,
-                tan_y as f32,
-                (eye_r2 - r_top * r_top) as f32,
-                (eye_r2 - r_body * r_body) as f32,
-            ],
-            spin: [0.0, 0.0, 1.0, 0.0],
-            rayleigh: [5.8e-6, 13.5e-6, 33.1e-6, 0.0],
-            biome_colors,
-            shadow: [0.0; 4],
-            art: [1.0, 0.0, 0.0, 0.0],
-            class_means: test_means(&art),
-        },
-        heightfield: Some(std::sync::Arc::new(field)),
+        field,
         biome,
-        atmo: Some(csp_render::terrain::AtmoDesc {
-            radius_m: r_body,
-            top_m: 70_000.0,
-            scale_height_m: 5_600.0,
-        }),
-        terrain: terrain_inst,
-        ocean: ocean_inst,
-        sky: true,
-        art: Some(art),
-    };
-    let fp = csp_render::flight::FlightPacket {
-        terrain: Some(packet),
-        // 3b: solve the cascades for this probe's hand-built camera —
-        // the same arm predicate + solve the real extract applies,
-        // reconstructed here because the probe bypasses `extract_flight`
-        // (basis: the `fwd`/`dir` it already built; sun [−1,0,0]).
-        shadow: {
-            let sun = DVec3::new(-1.0, 0.0, 0.0);
-            if csp_view::flight::cascades_armed(sun, dir) {
-                csp_render::shadow::solve_cascades(
-                    &csp_render::shadow::ShadowCamera {
-                        sun_dir: sun,
-                        forward: fwd,
-                        up: dir,
-                        fov_y: fovy,
-                        aspect,
-                        near_m: 0.1,
-                    },
-                    &csp_render::shadow::CascadeConfig::default(),
-                )
-                .uniforms
-            } else {
-                csp_render::shadow::ShadowUniforms::default()
-            }
-        },
-        ..Default::default()
-    };
+        art,
+    );
     let img = render_flight_scene(&device, &queue, &fp);
     let name = std::env::var("DUMP_OUT").unwrap_or_else(|_| "/tmp/surf.ppm".into());
     let mut out = format!("P6 {W} {H} 255\n").into_bytes();

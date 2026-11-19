@@ -593,26 +593,127 @@ resolve target (`lib.rs:60-130`) — there was no AA anywhere before C11-F1.
 
 ### 7.2 Pass/pipeline inventory
 
-One **scene** render pass per frame (cleared 0.02/0.02/0.05, MSAA resolve to
-the swapchain), then a separate **egui pass** (no depth, `LoadOp::Load`) —
-wgpu requires pass/pipeline depth formats to match, and egui's pipeline has
-none (`csp-app/src/lib.rs:1779-1806`). Draw order inside the scene pass
-(`csp-app/src/lib.rs:1752-1776`): map packet (Map mode) → VAB packet (Vab
-mode) → Flight mode: **terrain → flight craft stream → ocean** (the ocean is
-a third, alpha-blended draw after the craft so water resolves over an
-already-rasterized hull, C11-F3).
+**Flight mode runs TWO scene passes per frame** (§7.2.1's depth
+partition): `scene-far` (cleared 0.02/0.02/0.05, MSAA, no resolve,
+depth cleared 0.0 — the far field) then `scene` (color `LoadOp::Load`,
+the same depth attachment cleared AGAIN, MSAA resolve to the
+swapchain). Map/VAB keep one scene pass (clear + resolve,
+`csp-app/src/lib.rs:1887-2030`), then a separate **egui pass** (no
+depth, `LoadOp::Load`) — wgpu requires pass/pipeline depth formats to
+match, and egui's pipeline has none (`csp-app/src/lib.rs:2059`).
+Far-pass draw order (`csp-app/src/lib.rs:1767-1824`): terrain far
+phase (sky backdrop + far instances + far ocean) → flight far stream
+(the fallback sky). Near-pass order: map packet (Map mode) → VAB
+packet (Vab mode) → Flight mode: **near terrain → flight craft stream
+→ near ocean** (the ocean is a third, alpha-blended draw after the
+craft so water resolves over an already-rasterized hull, C11-F3).
 
 | Renderer | Pipelines | Notes |
 |---|---|---|
 | `MapRenderer` (`map.rs:80`) | one unlit pipeline, three meshes (bg stars / lines / markers) | no depth state — the scene pass attaches depth only in Flight/VAB |
-| `TerrainRenderer` (`terrain.rs:670`) | `terrain_pipe`, `ocean_pipe` (depth-test-only variant), `sky_pipe` (fullscreen, always-pass depth), + two depth-only shadow pipelines `vs_shadow0/1` (`shadow.rs`, 3a — see §7.4) | bind groups: group(0) = 0 uniforms, 1 heightfield R32Float, 2 transmittance LUT RGBA32Float, 3 biome slots R8Uint, 4–6 art albedo/normal arrays + water normal, 7 sampler, 8 cascade `SU` uniform; group(1) = shadow depth D2Array + comparison sampler (visible pass only — see §7.4) |
-| `FlightRenderer` (`flight.rs:75`) | one pipeline; owns the surface-sized reverse-Z depth target | depth compare `GreaterEqual` because the fallback sky sits ON the far plane |
+| `TerrainRenderer` (`terrain.rs:670`) | `terrain_pipe`, `ocean_pipe` (depth-test-only variant), `sky_pipe` (fullscreen, always-pass depth), + two depth-only shadow pipelines `vs_shadow0/1` (`shadow.rs`, 3a — see §7.4) | bind groups: group(0) = 0 uniforms, 1 heightfield R32Float, 2 transmittance LUT RGBA32Float, 3 biome slots R8Uint, 4–6 art albedo/normal arrays + water normal, 7 sampler, 8 cascade `SU` uniform; group(1) = shadow depth D2Array + comparison sampler (visible pass only — see §7.4). Since §7.2.1 there are TWO group(0) sets over the same textures — near and far uniform rows — swapped per phase; the pipelines themselves are shared |
+| `FlightRenderer` (`flight.rs:75`) | one pipeline; owns the surface-sized reverse-Z depth target | depth compare `GreaterEqual` because the fallback sky sits ON the far plane; since §7.2.1 a second vertex buffer (`far_vertices`) draws the far stream through the same pipeline in the far pass |
 | `VabRenderer` (`vab.rs:123`) | color pipeline + offscreen pick pipeline (R32Uint object-id) | `encode_pick` rasterizes + copies one pixel |
 
 Shared lighting: `PartLight` (`lib.rs:33`) — one directional sun + two-stop
 hemisphere ambient; the VAB uses the neutral studio default, flight uses the
 staged sun. Reverse-Z throughout (clear 0.0 = far, `Greater`/`GreaterEqual`
 wins).
+
+### 7.2.1 The two-pass depth partition (PLAN §2.3's far-field pass)
+
+The single-frustum reverse-Z depth strategy (§2.3: near 0.1, infinite
+far, `Depth32Float`) cracks beyond ~10⁷ m — the perf row
+`render.depth-fight-1e7` (§5.4's R1 measurement, 311 040
+order-dependent pixels at 1080p for a 1 m object crossing a surface at
+10⁷ m) called in the PRD's prescribed fix: a **second far-field
+pass**, not log-depth (log-depth breaks early-Z and interpolation).
+
+**The split** is `FAR_SPLIT_M = 10⁶ m`
+(`csp_render::flight::FAR_SPLIT_M`) — far enough that nothing
+gameplay-near changes (physics bubble 20 km, shadow cascade coverage
+~20 km, chase camera ~60–300 m, dump horizons < 30 km), near enough
+that 10⁷ m sits at z = 0.1 in the far pass's best-placed binade.
+
+**The algebra** (the cheaper math §2.3 allows): the reverse-Z
+projection's clip.z row in `(P·V)` is exactly `[0,0,0,n]` (every other
+z-row term is zero and the camera-relative view's bottom row is
+`[0,0,0,1]`), so `clip.z` is the constant `n` and NDC z = n/d. The far
+frustum is the SAME matrix with that one row set to `[0,0,0,10⁶]` —
+xy columns and the w row are bit-identical, so far geometry keeps its
+screen position and only depth remaps (`z = split/d`). The far pass
+reuses the near pass's pipelines wholesale: the terrain draws swap a
+second group(0) (same textures, far uniform row) and the flight far
+stream bakes `z = split/d` per vertex CPU-side (`vs_main` is a
+passthrough — no shader variant exists). The clip test
+`0 ≤ clip.z ≤ clip.w` becomes `split ≤ d` — a **staleness safety
+net**, never a coverage mechanism: routing (below) sends a patch far
+only when its nearest point clears the split, so the clip never trims
+visible surface.
+
+**Pass order + depth handling** — far first, near on top, clear
+between: the far pass attaches the shared depth target with its own
+0.0 clear (sky backdrop + far terrain/ocean + far flight stream; its
+depth store is `Discard` — the near pass clears the attachment again
+before reading it, so the far depths are write-only); the near pass
+attaches the SAME target, clears it again, and draws near
+terrain → craft → near ocean. Coverage is by WHOLE-QUAD routing: a
+patch routes far only when its nearest point ALONG THE VIEW AXIS —
+`dot(patch_origin − eye, fwd) − patch_extent ≥ split`, with
+`patch_extent_m` = cube half-diagonal + relief amplitude the
+conservative centre-to-surface reach — clears the split. The forward
+(view-axis) depth is what the far pass's clip test `split ≤ clip.w`
+measures, and it is `radial·cos(off-axis)` — up to ~25 % shorter
+than the radial distance at the frame's side reaches; a radial-only
+rule clipped side-of-frame quads out of both passes (the second
+sky-through-planet hole). Straddlers — radial or angular — route
+near and draw whole (exactly the pre-split behaviour for them; the
+original patch-CENTRE rule left their near fringes clipped and drawn
+by no pass), so the far pass's clip test is a pure staleness safety
+net that never removes visible surface. Cross-pass, "near wins where
+both exist" is the correct winner for every wholly-far quad; the one
+approximation is a near-routed straddler's beyond-split fringe,
+which rides the near pass's unconditional-over policy in the grazing
+band at the split ring (the same documented policy as the craft case;
+measured 3 px at the split-ring gate's 800 km vantage). No
+depth-bias or clip-range remap is needed, and the near pass's z
+encoding is unchanged bit-for-bit (the bit-identity proof:
+dump_surface / dump_low / dump_flight are byte-identical
+before/after; all their geometry routes near, so the far pass records
+sky only and the near pass is today's pass with `LoadOp::Load` over
+an identical backdrop).
+
+**What draws where**: terrain/ocean patches whose forward-nearest
+point clears the split, and the sky (sky writes no depth — `Always`
+compare, no write — so it can never occlude) draw far; near patches
+(including every straddler), craft, plumes, the launch complex draw
+near. Craft geometry NEVER routes far — a craft at 10⁷ m from
+the camera is the map regime; the near pass draws it over far terrain
+unconditionally, a documented stable approximation (no flicker, no
+correct craft-vs-far-terrain occlusion promised at interplanetary
+range). The §5.4 probe (`csp-view/src/depth_probe.rs`) composes its
+scene the same way — surface through the far pass, reference object
+through the near pass — and certifies zero order-dependent pixels.
+
+**Why a partition and not a finer float**: an f32 depth value carries
+2²⁴ steps total; the resolvable depth difference at range d is
+~d·2⁻²⁴ m regardless of the projection's near (ulp(z)·d²/n with
+z = n/d — the n cancels). 1 m at 10⁷ m is ~1.1 ulp of depth in the
+near pass (~1.3 in the far pass; ~0.89 m and ~0.75 m per ulp
+respectively), and a frame-width 1 m swing there would need ~2³²·⁴
+steps to resolve at every pixel — beyond any single f32 depth
+mapping. The split still buys two things: the far band's z values
+move from the 10⁻⁸ binade floor (z/ulp ≈ 1.1·10⁷) up to 0.1
+(z/ulp ≈ 1.3·10⁷, the best-placed binade), and — the load-bearing
+half — the pass partition fixes cross-pass ordering structurally,
+which is what eliminates the order-dependence the row measures.
+
+**Cost**: gameplay-range frames draw the same geometry as before (all
+patches near ⇒ the far pass records the sky only — the sky draw moved
+passes, it did not duplicate); frames with far-field geometry add one
+extra terrain draw call (the far instance range) and one extra ocean
+draw, plus one extra render-pass begin/end. The render gate's wall
+time is unchanged within noise (§8.2's log).
 
 ### 7.3 WGSL inventory
 

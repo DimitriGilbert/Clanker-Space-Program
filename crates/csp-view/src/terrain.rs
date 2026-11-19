@@ -589,19 +589,79 @@ pub(crate) fn build_packet(
     // While the bake is pending there is nothing to select FOR: the
     // instance lists stay empty (the arrival contract above — no
     // displaced draw, hence no flat stand-in either).
-    let mut terrain = Vec::new();
-    let mut ocean = Vec::new();
+    let mut near_terrain = Vec::new();
+    let mut far_terrain = Vec::new();
+    let mut near_ocean = Vec::new();
+    let mut far_ocean = Vec::new();
     if let Some(field) = &field {
         let leaves = rt::select_patches(eye_rel, env.radius_m, body.amplitude_m, &cfg.lod);
+        // §2.3's depth partition: a patch routes FAR only when its
+        // nearest point ALONG THE VIEW AXIS still clears the split —
+        // `dot(patch_origin − eye, fwd) − patch_extent ≥ FAR_SPLIT`.
+        // The forward (view-depth) coordinate matters, not the radial
+        // distance: the far pass's clip test `split ≤ clip.w` runs on
+        // `w = d·cos(off-axis)`, which at the frame's side reaches is
+        // up to ~25 % shorter than the radial distance — a
+        // radial-distance rule clipped side-of-frame quads out of
+        // both passes (the second sky-through-planet hole; forward is
+        // 1-Lipschitz, so `dot − extent` lower-bounds every vertex's
+        // clip.w). Straddlers — radial OR angular — route NEAR and
+        // draw whole, exactly the pre-split behaviour for them; the
+        // far pass's clip test stays only as the staleness safety
+        // net: coverage never depends on it. The bound's cost: a
+        // near-routed straddler's beyond-split fringe rides the near
+        // pass's unconditional-over policy (the same documented
+        // approximation as the craft case), confined to the grazing
+        // band at the split ring.
+        // `fwd` recovered from the projection itself: (P·V)'s row 3
+        // is `[0,0,−1,0]·V = −z_out` — the camera's forward.
+        let fwd = {
+            let r3 = cam.view_proj[3];
+            let n = (r3[0] * r3[0] + r3[1] * r3[1] + r3[2] * r3[2]).sqrt();
+            if n > 1e-9 {
+                DVec3::new(r3[0] / n, r3[1] / n, r3[2] / n)
+            } else {
+                DVec3::ZERO
+            }
+        };
+        let split = csp_render::flight::FAR_SPLIT_M;
         for &id in &leaves {
-            terrain.push(rt::patch_instance(id, 0.0, eye_rel, env.radius_m));
+            let extent = rt::patch_extent_m(id, env.radius_m, body.amplitude_m);
+            let forward_of = |inst: &rt::TerrainInstance| {
+                let o = inst.origin_rel_eye;
+                f64::from(o[0]) * fwd.x + f64::from(o[1]) * fwd.y + f64::from(o[2]) * fwd.z
+            };
+            let inst = rt::patch_instance(id, 0.0, eye_rel, env.radius_m);
+            if forward_of(&inst) - extent >= split {
+                far_terrain.push(inst);
+            } else {
+                near_terrain.push(inst);
+            }
             if let Some(datum) = body.ocean_datum_m
                 && patch_might_hold_sea(field, id, body.amplitude_m, datum, env.radius_m, unspin)
             {
-                ocean.push(rt::patch_instance(id, 1.0, eye_rel, datum));
+                // Ocean quads sit flat at the datum; the extent bound
+                // still applies through the terrain row's amplitude
+                // term (conservative, never under).
+                let extent = rt::patch_extent_m(id, datum, body.amplitude_m);
+                let inst = rt::patch_instance(id, 1.0, eye_rel, datum);
+                if forward_of(&inst) - extent >= split {
+                    far_ocean.push(inst);
+                } else {
+                    near_ocean.push(inst);
+                }
             }
         }
     }
+    // The packet's near-then-far layout the renderer slices: the
+    // `*_far_start` boundary counts index the first FAR instance of
+    // each list.
+    let terrain_far_start = near_terrain.len() as u32;
+    let ocean_far_start = near_ocean.len() as u32;
+    let mut terrain = near_terrain;
+    terrain.append(&mut far_terrain);
+    let mut ocean = near_ocean;
+    ocean.append(&mut far_ocean);
 
     // `view_rot` is the SOLVED chase camera's own basis — recovered
     // from `view_proj` rather than rebuilt from the orbit angles (see
@@ -650,68 +710,85 @@ pub(crate) fn build_packet(
     let r_top = env.radius_m + env.atm_top_m;
     let c_top = (eye_r2 - r_top * r_top) as f32;
     let c_ground = (eye_r2 - env.radius_m * env.radius_m) as f32;
+    let uniforms = rt::TerrainUniforms {
+        view_proj: m4_wgsl(&cam.view_proj),
+        view_rot,
+        eye_rel_body: [eye_rel.x as f32, eye_rel.y as f32, eye_rel.z as f32, 0.0],
+        sun_dir: [sun_dir.x as f32, sun_dir.y as f32, sun_dir.z as f32, 0.0],
+        planet: [
+            env.radius_m as f32,
+            env.atm_top_m as f32,
+            body.ocean_datum_m.unwrap_or(0.0) as f32,
+            body.amplitude_m as f32,
+        ],
+        atmo: [
+            env.atm_scale_height_m as f32,
+            if body.biome.is_some() { 1.0 } else { 0.0 },
+            craft_alt,
+            0.0,
+        ],
+        misc: [(tan_y * aspect) as f32, tan_y as f32, c_top, c_ground],
+        spin: [
+            env.spin_axis.x as f32,
+            env.spin_axis.y as f32,
+            env.spin_axis.z as f32,
+            spin_phase as f32,
+        ],
+        rayleigh: [
+            rt::RAYLEIGH_BETA[0] as f32,
+            rt::RAYLEIGH_BETA[1] as f32,
+            rt::RAYLEIGH_BETA[2] as f32,
+            0.0,
+        ],
+        biome_colors: body.biome.as_ref().map_or([[0.0; 4]; 16], |b| b.colors),
+        shadow,
+        // x: real-texture flag; y: the sim-clock seconds the wave
+        // scroll reads (deterministic — tick-derived, never wall).
+        art: [
+            if cfg.art.is_some() { 1.0 } else { 0.0 },
+            time_s as f32,
+            0.0,
+            0.0,
+        ],
+        // The pack's per-class means, sRGB bytes → linear — the
+        // shader divides class detail by these (the header row is
+        // the single source of truth for the layer mean).
+        class_means: cfg.art.as_ref().map_or([[0.0; 4]; 4], |a| {
+            let mut m = [[0.0f32; 4]; 4];
+            for (dst, src) in m.iter_mut().zip(a.albedo.means.iter()) {
+                *dst = [
+                    crate::art::srgb_to_linear(f32::from(src[0]) / 255.0),
+                    crate::art::srgb_to_linear(f32::from(src[1]) / 255.0),
+                    crate::art::srgb_to_linear(f32::from(src[2]) / 255.0),
+                    f32::from(src[3]) / 255.0,
+                ];
+            }
+            m
+        }),
+    };
+    // §2.3's far-field projection — the "cheaper math" the PRD's
+    // second pass allows: `(P·V)`'s clip.z row is exactly `n·V[3]`
+    // (the reverse-Z projection zeroes every other z-row term, and
+    // the camera-relative view's bottom row is `[0,0,0,1]`), i.e.
+    // `[0,0,0,n]` with `n = FLIGHT_NEAR_M`. The far frustum is the
+    // SAME matrix with that one row set to `[0,0,0,FAR_SPLIT_M]` —
+    // xy columns and the w row are bit-identical, so far geometry
+    // keeps its screen position and only depth remaps
+    // (`z = split/d`; NDC z at 10⁷ m moves from 10⁻⁸ to 0.1).
+    let mut far_vp = cam.view_proj;
+    far_vp[2] = [0.0, 0.0, 0.0, csp_render::flight::FAR_SPLIT_M];
+    let mut uniforms_far = uniforms;
+    uniforms_far.view_proj = m4_wgsl(&far_vp);
     rt::TerrainPacket {
-        uniforms: rt::TerrainUniforms {
-            view_proj: m4_wgsl(&cam.view_proj),
-            view_rot,
-            eye_rel_body: [eye_rel.x as f32, eye_rel.y as f32, eye_rel.z as f32, 0.0],
-            sun_dir: [sun_dir.x as f32, sun_dir.y as f32, sun_dir.z as f32, 0.0],
-            planet: [
-                env.radius_m as f32,
-                env.atm_top_m as f32,
-                body.ocean_datum_m.unwrap_or(0.0) as f32,
-                body.amplitude_m as f32,
-            ],
-            atmo: [
-                env.atm_scale_height_m as f32,
-                if body.biome.is_some() { 1.0 } else { 0.0 },
-                craft_alt,
-                0.0,
-            ],
-            misc: [(tan_y * aspect) as f32, tan_y as f32, c_top, c_ground],
-            spin: [
-                env.spin_axis.x as f32,
-                env.spin_axis.y as f32,
-                env.spin_axis.z as f32,
-                spin_phase as f32,
-            ],
-            rayleigh: [
-                rt::RAYLEIGH_BETA[0] as f32,
-                rt::RAYLEIGH_BETA[1] as f32,
-                rt::RAYLEIGH_BETA[2] as f32,
-                0.0,
-            ],
-            biome_colors: body.biome.as_ref().map_or([[0.0; 4]; 16], |b| b.colors),
-            shadow,
-            // x: real-texture flag; y: the sim-clock seconds the wave
-            // scroll reads (deterministic — tick-derived, never wall).
-            art: [
-                if cfg.art.is_some() { 1.0 } else { 0.0 },
-                time_s as f32,
-                0.0,
-                0.0,
-            ],
-            // The pack's per-class means, sRGB bytes → linear — the
-            // shader divides class detail by these (the header row is
-            // the single source of truth for the layer mean).
-            class_means: cfg.art.as_ref().map_or([[0.0; 4]; 4], |a| {
-                let mut m = [[0.0f32; 4]; 4];
-                for (dst, src) in m.iter_mut().zip(a.albedo.means.iter()) {
-                    *dst = [
-                        crate::art::srgb_to_linear(f32::from(src[0]) / 255.0),
-                        crate::art::srgb_to_linear(f32::from(src[1]) / 255.0),
-                        crate::art::srgb_to_linear(f32::from(src[2]) / 255.0),
-                        f32::from(src[3]) / 255.0,
-                    ];
-                }
-                m
-            }),
-        },
+        uniforms,
+        uniforms_far,
         heightfield: field,
         biome: body.biome,
         atmo,
         terrain,
+        terrain_far_start,
         ocean,
+        ocean_far_start,
         sky: true,
         art: cfg.art.clone(),
     }
@@ -985,6 +1062,271 @@ mod tests {
             (f64::from(packet.uniforms.planet[3]) - 3_600.0).abs() < 1e-3,
             "planet.w must be the authored 600 km × 0.006 = 3600 m, got {}",
             packet.uniforms.planet[3]
+        );
+    }
+
+    /// §2.3's far-field algebra, pinned at the source: a real chase
+    /// projection's clip.z row is EXACTLY `[0,0,0,FLIGHT_NEAR_M]`
+    /// (positions are camera-relative, so `(P·V)`'s z row is `n·V[3]`
+    /// with `V[3] = [0,0,0,1]`), and `build_packet`'s far uniforms
+    /// differ from the near row in that row ONLY — set to
+    /// `[0,0,0,FAR_SPLIT_M]` — leaving every other matrix cell and
+    /// every other uniform field bit-equal. That one-row swap is what
+    /// keeps far geometry on its screen pixels while remapping depth
+    /// to `z = split/d`.
+    #[test]
+    fn far_uniforms_are_exactly_the_clip_z_row_swap() {
+        let (cfg, env, _cam) = arrival_scene();
+        // A real chase-shaped camera (tilted basis + reverse-Z near
+        // 0.1), not arrival_scene's identity `view_proj`.
+        let (_r, _u, _z, view) = tilted_view();
+        let proj = perspective_revz(
+            crate::flight::FLIGHT_FOV_Y,
+            320.0 / 240.0,
+            crate::flight::FLIGHT_NEAR_M,
+        );
+        let vp = mat4_mul(&proj, &view);
+        assert_eq!(
+            vp[2],
+            [0.0, 0.0, 0.0, crate::flight::FLIGHT_NEAR_M],
+            "the algebra's premise: (P·V) row 2 is [0,0,0,near]"
+        );
+        let cam = MapCameraF64 {
+            view_proj: vp,
+            eye: DVec3::new(0.0, 0.0, 615_000.0),
+            distance_m: 15_000.0,
+            valid: true,
+        };
+        let packet = build_packet(
+            &cfg,
+            &mut TerrainCache::default(),
+            &env,
+            &cam,
+            (320.0, 240.0),
+            0.0,
+        );
+        // Column-major: uniform.view_proj[col][row] — the swapped row
+        // is index 2 along the second axis.
+        for c in 0..4 {
+            for r in 0..4 {
+                if r == 2 {
+                    continue;
+                }
+                assert_eq!(
+                    packet.uniforms_far.view_proj[c][r], packet.uniforms.view_proj[c][r],
+                    "far uniforms must not touch cell [{}][{}]",
+                    c, r
+                );
+            }
+        }
+        let split = csp_render::flight::FAR_SPLIT_M as f32;
+        for c in 0..4 {
+            let want = if c == 3 { split } else { 0.0 };
+            assert_eq!(
+                packet.uniforms_far.view_proj[c][2], want,
+                "far clip.z row must be [0,0,0,split] at column {c}"
+            );
+        }
+        // Every uniform outside view_proj is shared verbatim — the far
+        // row is a FULL clone with one row swapped. (A far row built
+        // from `Default::default()` zeroed `planet.x` and collapsed
+        // the far pass's displacement to nothing — the load-bearing
+        // half of this contract.)
+        let u = &packet.uniforms;
+        let f = &packet.uniforms_far;
+        assert_eq!(f.view_rot, u.view_rot);
+        assert_eq!(f.eye_rel_body, u.eye_rel_body);
+        assert_eq!(f.sun_dir, u.sun_dir);
+        assert_eq!(
+            f.planet, u.planet,
+            "planet.x is the body radius — zero collapses the far displacement"
+        );
+        assert_eq!(f.atmo, u.atmo);
+        assert_eq!(f.misc, u.misc);
+        assert_eq!(f.spin, u.spin);
+        assert_eq!(f.rayleigh, u.rayleigh);
+        assert_eq!(f.biome_colors, u.biome_colors);
+        assert_eq!(f.shadow, u.shadow);
+        assert_eq!(f.art, u.art);
+        assert_eq!(f.class_means, u.class_means);
+    }
+
+    /// §2.3's instance routing: `build_packet` lays instances out
+    /// near-then-far with the `*_far_start` boundary, and a patch
+    /// routes far only when its nearest point ALONG THE VIEW AXIS
+    /// (`dot(centre − eye, fwd) − patch_extent`) clears the split —
+    /// the earlier centre-only and radial-nearest rules both left
+    /// straddlers clipped by the far pass and drawn by no pass (sky
+    /// through the planet). A 15 km pole vantage routes everything
+    /// near; a 2 Mm vantage routes everything far; an 800 km vantage
+    /// straddles the split ring and MUST keep every straddler whole
+    /// in the near pass — the blocker's regression pin.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one rule pinned across three vantages; splitting dilutes the invariants
+    fn far_field_routing_partitions_instances() {
+        let (cfg, env, _cam) = arrival_scene();
+        let split = csp_render::flight::FAR_SPLIT_M;
+        // A real chase-shaped projection (the routing reads the camera
+        // forward out of `view_proj` row 3, which the identity matrix
+        // does not carry).
+        let (_r, _u, _z, view) = tilted_view();
+        let vp = mat4_mul(
+            &perspective_revz(
+                crate::flight::FLIGHT_FOV_Y,
+                320.0 / 240.0,
+                crate::flight::FLIGHT_NEAR_M,
+            ),
+            &view,
+        );
+        let fwd = {
+            let r3 = vp[3];
+            let v = DVec3::new(r3[0], r3[1], r3[2]);
+            let n = v.norm();
+            if n > 1e-9 {
+                DVec3::new(v.x / n, v.y / n, v.z / n)
+            } else {
+                DVec3::ZERO
+            }
+        };
+        // The routing rule, reconstructed from each instance's own
+        // rows: extent = |du+dv|/2·R + amplitude (the exact body of
+        // `rt::patch_extent_m`; `du`/`dv` are f32 casts of exact
+        // dyadic cube spans, so the f64 reconstruction agrees).
+        let amp = 600_000.0 * 0.006; // Terrin's authored amplitude
+        let dist2 = |i: &rt::TerrainInstance| {
+            let o = i.origin_rel_eye;
+            f64::from(o[0]) * f64::from(o[0])
+                + f64::from(o[1]) * f64::from(o[1])
+                + f64::from(o[2]) * f64::from(o[2])
+        };
+        let extent_of = |i: &rt::TerrainInstance| {
+            let d = |v: [f32; 4]| DVec3::new(f64::from(v[0]), f64::from(v[1]), f64::from(v[2]));
+            (d(i.du) + d(i.dv)).norm() * 0.5 * env.radius_m + amp
+        };
+        let is_far = |i: &rt::TerrainInstance| {
+            let o = i.origin_rel_eye;
+            f64::from(o[0]) * fwd.x + f64::from(o[1]) * fwd.y + f64::from(o[2]) * fwd.z
+                - extent_of(i)
+                >= split
+        };
+        let check = |p: &rt::TerrainPacket| {
+            for (i, inst) in p.terrain.iter().enumerate() {
+                let near = (i as u32) < p.terrain_far_start;
+                assert_eq!(
+                    near,
+                    !is_far(inst),
+                    "terrain instance {i} routed {} at distance² {:.3e}, extent {:.0} m",
+                    if near { "near" } else { "far" },
+                    dist2(inst),
+                    extent_of(inst)
+                );
+            }
+            for (i, inst) in p.ocean.iter().enumerate() {
+                let near = (i as u32) < p.ocean_far_start;
+                assert_eq!(
+                    near,
+                    !is_far(inst),
+                    "ocean instance {i} routed {} at distance² {:.3e}, extent {:.0} m",
+                    if near { "near" } else { "far" },
+                    dist2(inst),
+                    extent_of(inst)
+                );
+            }
+        };
+        // The bake is served by the background thread — poll until the
+        // packet carries instances (the arrival-contract pattern).
+        let mut cache = TerrainCache::default();
+        let near_cam = MapCameraF64 {
+            view_proj: vp,
+            eye: DVec3::new(0.0, 0.0, 615_000.0),
+            distance_m: 15_000.0,
+            valid: true,
+        };
+        let mut near_case = None;
+        for _ in 0..4_000 {
+            let p = build_packet(&cfg, &mut cache, &env, &near_cam, (320.0, 240.0), 0.0);
+            if !p.terrain.is_empty() {
+                near_case = Some(p);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let near_case = match near_case {
+            Some(p) => p,
+            None => panic!("the bake never landed for the routing test"),
+        };
+        check(&near_case);
+        assert_eq!(
+            near_case.terrain_far_start as usize,
+            near_case.terrain.len(),
+            "a 15 km vantage routes every patch near (horizon ≪ 1 Mm)"
+        );
+        // The blocker's vantage: 800 km above the pole — the split
+        // ring crosses the disc (terrain spans ~800 km..1.24 Mm eye
+        // distance), so straddling patches EXIST. Every one of them
+        // must route near (whole quad, near depth semantics); only
+        // patches whose forward-nearest point clears the split may
+        // route far. Both bands non-empty proves the case is live.
+        let straddle_cam = MapCameraF64 {
+            view_proj: vp,
+            eye: DVec3::new(0.0, 0.0, 1_400_000.0),
+            distance_m: 800_000.0,
+            valid: true,
+        };
+        let straddle_case =
+            build_packet(&cfg, &mut cache, &env, &straddle_cam, (320.0, 240.0), 0.0);
+        check(&straddle_case);
+        assert!(
+            !straddle_case.terrain.is_empty(),
+            "an 800 km vantage selects leaves"
+        );
+        let near_n = straddle_case.terrain_far_start;
+        let far_n = (straddle_case.terrain.len() - near_n as usize) as u32;
+        assert!(near_n > 0, "the 800 km disc's near band is non-empty");
+        assert!(far_n > 0, "the 800 km disc's far band is non-empty");
+        // Liveness: straddlers — radial centre beyond the split, but
+        // nearest-forward point inside — EXIST at this vantage and sit
+        // in the NEAR list (the centre-only rule shipped them to the
+        // far pass, whose clip trimmed their fringes into the
+        // sky-through-planet hole).
+        let n_straddlers_near = straddle_case.terrain[..near_n as usize]
+            .iter()
+            .filter(|i| dist2(i) >= split * split)
+            .count();
+        assert!(
+            n_straddlers_near > 0,
+            "the 800 km vantage must exercise straddlers (centre ≥ split routed near)"
+        );
+        // And the far list's forward-nearest bound genuinely clears
+        // the split (the far pass's clip test measures exactly this).
+        for i in &straddle_case.terrain[straddle_case.terrain_far_start as usize..] {
+            let o = i.origin_rel_eye;
+            let nearest_fwd =
+                f64::from(o[0]) * fwd.x + f64::from(o[1]) * fwd.y + f64::from(o[2]) * fwd.z
+                    - extent_of(i);
+            assert!(
+                nearest_fwd >= split,
+                "far-routed patch forward-nearest point {:.0} m < split",
+                nearest_fwd
+            );
+        }
+        // The far vantage: 2 Mm above the pole — the nearest terrain
+        // is ~2 Mm, wholly past the split even with the extent bound.
+        let far_cam = MapCameraF64 {
+            view_proj: vp,
+            eye: DVec3::new(0.0, 0.0, 2_600_000.0),
+            distance_m: 2_000_000.0,
+            valid: true,
+        };
+        let far_case = build_packet(&cfg, &mut cache, &env, &far_cam, (320.0, 240.0), 0.0);
+        check(&far_case);
+        assert!(
+            !far_case.terrain.is_empty(),
+            "a 2 Mm vantage still selects leaves (the body's disc)"
+        );
+        assert_eq!(
+            far_case.terrain_far_start, 0,
+            "every patch at a 2 Mm vantage routes far"
         );
     }
 

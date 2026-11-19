@@ -12,6 +12,55 @@
 
 use crate::GpuBuffer;
 
+/// PLAN §2.3's far-field split (the debt the `render.depth-fight-1e7`
+/// row calls in): the scene's single reverse-Z frustum (near 0.1,
+/// infinite far) partitions at this view distance into a near pass
+/// (today's projection, unchanged) and a far pass whose reversed-Z
+/// projection takes the split as its near — `ndc.z = split/d`, so
+/// 10⁷ m sits at z = 0.1 in the far pass's high-precision band
+/// instead of z = 10⁻⁸ at the bottom of the near pass's last binades.
+///
+/// **Algebra** (`csp_view::map::perspective_revz`): the projection is
+/// `[[f/a,0,0,0],[0,f,0,0],[0,0,0,n],[0,0,-1,0]]`; positions are
+/// camera-relative so `V`'s bottom row is `[0,0,0,1]`, which makes
+/// `(P·V)`'s clip.z row exactly `[0,0,0,n]` — clip.z is the constant
+/// `n` and `clip.w = d` (the FORWARD view depth; off-axis it is
+/// `radial·cos(angle)`, shorter than the radial distance), so NDC
+/// z = n/d. The far frustum's row is the same row with `n = split`:
+/// one row of the matrix, no other term changes (xy columns and w row
+/// are bit-equal, so far geometry lands on the same screen pixels
+/// with only the depth remapped). The clip test `0 ≤ clip.z ≤ clip.w`
+/// becomes `split ≤ forward_depth` — a STALENESS SAFETY NET, never a
+/// coverage mechanism: routing (see `patch_extent_m`) sends a patch
+/// far only when its forward-nearest point clears the split, so no
+/// legitimately-routed far quad reaches nearer than the split along
+/// the view axis and the clip never trims visible surface.
+///
+/// **Precision arithmetic** (f32 reverse-Z): the depth value at range
+/// `d` is `z = n/d` and its ulp is `~z·2⁻²³`, so the resolvable depth
+/// difference is `ulp·d²/n ≈ d·2⁻²³` — INDEPENDENT of `n` (an f32
+/// significand carries 2²⁴ steps total; at 10⁷ m that floors
+/// separation at ~0.89 m per ulp in the near pass (z = 10⁻⁸, binade
+/// [2⁻²⁷, 2⁻²⁶)) and ~0.75 m in the far pass (z = 0.1, binade
+/// [2⁻⁴, 2⁻³)) — ~1.1 vs ~1.3 ulp for the §5.4 scene's 1 m). The
+/// split therefore buys its precision two other ways: (a) it moves
+/// the far band's z values from the 10⁻⁸ binade floor
+/// (z/ulp ≈ 1.1·10⁷) up to 0.1 (z/ulp ≈ 1.3·10⁷, the best-placed
+/// binade below 1), and (b) — the load-bearing half — the pass
+/// partition resolves cross-pass ordering structurally: routed-far
+/// quads lie wholly beyond the split along the view axis
+/// (forward-nearest routing), the far-first/then-near-own-depth
+/// composition (see `csp-app`'s frame loop) is therefore correct
+/// across the partition — the one exception is a near-routed
+/// straddler's beyond-split fringe, which rides the near pass's
+/// unconditional-over policy (documented at the routing site) — and
+/// submission order can never decide a winner across the partition.
+/// Within the far pass, 1 m at 10⁷ m remains below the
+/// 1-frame-width budget of a 24-bit depth (it would need ~2³²·⁴
+/// steps) — no f32 mapping resolves that; the §2.3 prescription is
+/// the partition, not a magically finer float.
+pub const FAR_SPLIT_M: f64 = 1.0e6;
+
 /// One vertex of the flight scene — clip-space NDC (z: 1 = near,
 /// 0 = far) plus the per-pixel-lighting channels: camera-relative
 /// world position (the eye sits at the origin), world normal, linear
@@ -55,9 +104,21 @@ impl FlightVertex {
 /// sim state (§2.1/§2.5).
 #[derive(Clone, Debug, Default)]
 pub struct FlightPacket {
-    /// Triangle-list scene: fallback sky gradient, craft part meshes,
-    /// plumes.
+    /// Triangle-list scene: craft part meshes, plumes — the NEAR
+    /// stream (§2.3's first pass, projection near 0.1).
     pub vertices: Vec<FlightVertex>,
+    /// §2.3's far-field stream: geometry whose vertices already carry
+    /// the far pass's depth (`z = FAR_SPLIT/d`, baked f64→f32 at
+    /// extract — the pipeline itself is shared, `vs_main` is a
+    /// passthrough so no shader variant exists). Drawn by
+    /// [`FlightRenderer::draw_far`] in the frame's FIRST pass (own
+    /// cleared depth), before the near stream's pass. Today the
+    /// extract routes only the fallback sky gradient here; the §5.4
+    /// depth probe drives it with a far surface. Craft geometry
+    /// deliberately NEVER lands here (a craft beyond the split is the
+    /// map regime; the near pass draws it and wins over far terrain —
+    /// the documented stable approximation, no flicker).
+    pub far_vertices: Vec<FlightVertex>,
     /// The frame's part lighting — the staged sun + the hemisphere
     /// ambient the extract solved for the focus vessel's local sky.
     pub light: crate::PartLight,
@@ -91,6 +152,10 @@ pub struct FlightPacket {
 pub struct FlightRenderer {
     pipeline: wgpu::RenderPipeline,
     verts: GpuBuffer,
+    /// §2.3's far-field stream buffer — same pipeline, separate
+    /// upload so the near list's staging (and the cascade cast's
+    /// `stage_cascade_cast` slice) never interleaves far geometry.
+    far_verts: GpuBuffer,
     /// `PartLight` uniform — rewritten per draw from the packet.
     light_buf: wgpu::Buffer,
     /// group(0) — the `light` uniform (binding 0) + the `SU` cascade
@@ -239,6 +304,12 @@ impl FlightRenderer {
                 "flight-verts",
                 (std::mem::size_of::<FlightVertex>() * 16384) as u64,
             ),
+            far_verts: GpuBuffer::new(
+                device,
+                "flight-far-verts",
+                // Small steady state: the fallback sky's two triangles.
+                (std::mem::size_of::<FlightVertex>() * 256) as u64,
+            ),
             light_buf,
             light_bind,
             shadow_bind: sample_bind.clone(),
@@ -300,6 +371,34 @@ impl FlightRenderer {
         }
         let n = self.verts.upload(device, queue, &packet.vertices);
         (n > 0).then(|| (self.verts.buffer.clone(), n))
+    }
+
+    /// §2.3's far-field draw: the packet's [`FlightPacket::far_vertices`]
+    /// through the SAME pipeline (their `pos.z` already carries the far
+    /// remap `z = FAR_SPLIT/d` — `vs_main` is a passthrough, so no
+    /// shader variant exists). Call inside the frame's FIRST render
+    /// pass (the far pass: shared depth attachment, cleared 0.0);
+    /// the near pass that follows clears the depth again and draws
+    /// over, so far and near streams can never fight one depth buffer.
+    /// The light uniform write is idempotent with [`Self::draw`]'s —
+    /// both land before the frame's submit.
+    pub fn draw_far(
+        &mut self,
+        pass: &mut wgpu::RenderPass<'_>,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        packet: &FlightPacket,
+    ) {
+        let n = self.far_verts.upload(device, queue, &packet.far_vertices);
+        if n == 0 {
+            return;
+        }
+        queue.write_buffer(&self.light_buf, 0, bytemuck::bytes_of(&packet.light));
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.light_bind, &[]);
+        pass.set_bind_group(1, &self.shadow_bind, &[]);
+        pass.set_vertex_buffer(0, self.far_verts.buffer.slice(..));
+        pass.draw(0..n, 0..1);
     }
 
     /// Upload the packet and draw.

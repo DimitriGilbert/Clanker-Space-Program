@@ -38,6 +38,12 @@ use crate::terrain::{TerrainCache, TerrainConfig};
 
 /// Chase-camera FOV (radians, vertical).
 pub(crate) const FLIGHT_FOV_Y: f64 = 0.9;
+/// The chase camera's reverse-Z near plane (m, §2.3) — the near pass
+/// of the two-pass depth partition (the far pass's near is
+/// [`csp_render::flight::FAR_SPLIT_M`]). The only two places that
+/// bake `n` into a matrix or an NDC z must agree bit-for-bit, hence
+/// one constant.
+pub(crate) const FLIGHT_NEAR_M: f64 = 0.1;
 /// Default camera distance (m) — restored by `flight_present` on
 /// every focus-id change (C19-F4: a kept zoom framed the new focus at
 /// the old vessel's range).
@@ -1899,7 +1905,7 @@ fn solve_chase_camera(
         [0.0, 0.0, 0.0, 1.0],
     ];
     let aspect = (input.viewport_px.0 / input.viewport_px.1.max(1.0)).max(1e-6);
-    let proj = perspective_revz(FLIGHT_FOV_Y, aspect, 0.1);
+    let proj = perspective_revz(FLIGHT_FOV_Y, aspect, FLIGHT_NEAR_M);
     MapCameraF64 {
         view_proj: mat4_mul(&proj, &view),
         eye,
@@ -3171,6 +3177,11 @@ pub(crate) fn extract_flight(
         // tris at NDC z≈0 — reverse-Z far). Near-black with a faint
         // cool gradient so the frame isn't a dead flat void; the
         // scattering sky replaces it whenever terrain runs.
+        // §2.3: it rides the FAR stream (`far_vertices`) — the far
+        // pass owns the sky backdrop, drawn before the near pass
+        // clears the depth and draws gameplay geometry over it.
+        // (Its vertices are unlit, so the cascade cast degenerates
+        // them either way — moving streams changes no cascade byte.)
         let zenith = [0.004, 0.006, 0.015, 1.0];
         let nadir = [0.014, 0.017, 0.034, 1.0];
         let q = [
@@ -3182,7 +3193,7 @@ pub(crate) fn extract_flight(
             ([-1.0, 1.0, 0.0], zenith),
         ];
         for (pos, color) in q {
-            v.push(unlit_v(pos, color));
+            packet.far_vertices.push(unlit_v(pos, color));
         }
     }
     if !cam.0.valid {
@@ -3575,6 +3586,47 @@ mod tests {
             0,
             "unindexed TriangleList stream misaligned: {} vertices",
             packet.vertices.len()
+        );
+    }
+
+    /// §2.3's far-field routing at the flight-stream level: the
+    /// fallback sky gradient (no terrain packet) rides the FAR stream
+    /// — the far pass owns the sky backdrop — while a craftless
+    /// vacuum scene keeps the near stream empty. Both streams draw
+    /// exactly where the two-pass frame expects them.
+    #[test]
+    fn fallback_sky_routes_to_the_far_stream() {
+        let packet = run_extract(
+            FlightSnapshot {
+                env: None,
+                vessels: Vec::new(),
+            },
+            crate::map::solve_orbit_camera(
+                0.0,
+                0.0,
+                60.0,
+                (320.0, 240.0),
+                DVec3::ZERO,
+                FLIGHT_FOV_Y,
+                FLIGHT_NEAR_M,
+            ),
+        );
+        assert!(
+            packet.terrain.is_none(),
+            "no environment ⇒ no terrain packet"
+        );
+        assert_eq!(
+            packet.far_vertices.len(),
+            6,
+            "the two fallback-sky triangles"
+        );
+        assert!(
+            packet.vertices.is_empty(),
+            "a craftless vacuum scene has no near geometry"
+        );
+        assert!(
+            packet.far_vertices.iter().all(|v| v.pos[2] == 0.0),
+            "the backdrop sits on the reverse-Z far plane"
         );
     }
 

@@ -143,6 +143,27 @@ fn patch_dir0_size(id: PatchId) -> (DVec3, f64) {
     (c / c.norm(), du.norm())
 }
 
+/// §2.3 far-field routing bound: a conservative upper bound
+/// on the distance from a patch's baked centre (`dir0·R`) to ANY
+/// point of its surface — the cube-space half-diagonal `0.5·|du+dv|`
+/// scaled to metres, plus the relief amplitude (displacement only
+/// rises above the datum; skirts drop inward and their uv is clamped
+/// inside the cell, so they stay within the reach too). Routing sends
+/// a patch to the far pass only when
+/// `dot(centre − eye, fwd) − extent ≥ FAR_SPLIT` — the NEAREST point
+/// ALONG THE VIEW AXIS still clears the split (forward depth is what
+/// the far pass's clip test `split ≤ clip.w` measures, and it is
+/// `radial·cos(off-axis)` — up to ~25 % shorter than the radial
+/// distance at the frame's side reaches; forward is 1-Lipschitz, so
+/// the bound covers every vertex). No legitimately-routed far quad is
+/// ever trimmed away — every leaf is drawn WHOLE by exactly one pass,
+/// and the far clip remains a pure staleness safety net that never
+/// removes visible surface.
+pub fn patch_extent_m(id: PatchId, radius_m: f64, amplitude_m: f64) -> f64 {
+    let (_corner, du, dv) = patch_cube(id);
+    (du + dv).norm() * 0.5 * radius_m + amplitude_m
+}
+
 /// The R2 LOD walk: BFS over the six cube faces, splitting while the
 /// eye is within `split_factor · patch_size` of the patch's datum
 /// sphere point, up to `max_level` / `max_patches`. Nodes fully beyond
@@ -426,19 +447,36 @@ pub struct TerrainArt {
 /// when its key changes.
 #[derive(Clone, Debug, Default)]
 pub struct TerrainPacket {
-    /// Frame uniforms.
+    /// Frame uniforms (the near pass's projection, near 0.1).
     pub uniforms: TerrainUniforms,
+    /// §2.3's far-field uniforms: a byte-copy of `uniforms` whose
+    /// `view_proj` carries the far pass's clip.z row `[0,0,0,FAR_SPLIT]`
+    /// (see [`crate::flight::FAR_SPLIT_M`] for the algebra — xy and w
+    /// rows are identical, so far geometry keeps its screen position
+    /// and only the depth remaps). Consumed by
+    /// [`TerrainRenderer::draw_far`]; a `Default` row only ever
+    /// matters for packets that also carry no far instances.
+    pub uniforms_far: TerrainUniforms,
     /// Baked heightfield (absent ⇒ no terrain drawn).
     pub heightfield: Option<Arc<HeightField>>,
     /// Biome tint field (absent ⇒ height-ramp palette only).
     pub biome: Option<Arc<BiomeField>>,
     /// Atmosphere signature — `None` draws the vacuum path.
     pub atmo: Option<AtmoDesc>,
-    /// Terrain leaf instances (heightfield-displaced).
+    /// Terrain leaf instances (heightfield-displaced), ordered
+    /// near-then-far: `[0..terrain_far_start)` draw in the near pass,
+    /// the rest in the far pass.
     pub terrain: Vec<TerrainInstance>,
-    /// Ocean leaf instances (datum-clamped surface).
+    /// Index of the first FAR terrain instance (§2.3 routing — patch
+    /// centre at or beyond [`crate::flight::FAR_SPLIT_M`]).
+    pub terrain_far_start: u32,
+    /// Ocean leaf instances (datum-clamped surface), near-then-far
+    /// like `terrain`.
     pub ocean: Vec<TerrainInstance>,
-    /// Draw the sky backdrop pass.
+    /// Index of the first FAR ocean instance.
+    pub ocean_far_start: u32,
+    /// Draw the sky backdrop pass (§2.3: the sky belongs to the FAR
+    /// pass — it writes no depth and is the backdrop of everything).
     pub sky: bool,
     /// The real texture set — `None` keeps the procedural fallback
     /// shading (the packet stays valid with the placeholder textures).
@@ -683,17 +721,39 @@ pub struct TerrainRenderer {
     sky_pipe: wgpu::RenderPipeline,
     bgl: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
+    /// §2.3's far-field set: same textures, the far uniform row —
+    /// swapped in for the far instance draws (the pipelines
+    /// themselves are shared; only the clip.z row differs).
+    bind_group_far: wgpu::BindGroup,
     uniforms: wgpu::Buffer,
+    uniforms_far: wgpu::Buffer,
     grid_v: wgpu::Buffer,
     grid_i: wgpu::Buffer,
     grid_index_count: u32,
     grid_uploaded: bool,
     instances: GpuBuffer,
-    /// Byte range of the ocean slice inside `instances` (terrain ends
-    /// at `inst_bytes`, the upload at `inst_end`) — set by `draw`,
-    /// consumed by `draw_ocean`.
+    /// Instance-buffer layout, §2.3 near/far partitioned (one upload,
+    /// four contiguous segments):
+    /// `[0..inst_far)` near terrain, `[inst_far..inst_bytes)` far
+    /// terrain, `[inst_bytes..inst_ocean_far)` near ocean,
+    /// `[inst_ocean_far..inst_end)` far ocean. Set by
+    /// [`Self::upload_instances`], sliced by `draw`/`draw_far`/
+    /// `draw_ocean`; `draw_shadow` reads `[0..inst_bytes)` (every
+    /// terrain instance casts, near and far — far patches land
+    /// outside the cascade volume and clip, as they always have).
+    inst_far: wgpu::BufferAddress,
+    /// Byte range of the ocean slice start (terrain end) — set by
+    /// `draw`, consumed by `draw_ocean`.
     inst_bytes: wgpu::BufferAddress,
+    inst_ocean_far: wgpu::BufferAddress,
     inst_end: wgpu::BufferAddress,
+    /// Content key of the last instance upload. `sync_resources` runs
+    /// up to three times per frame (shadow → far → near phases) over
+    /// the SAME packet — identical bytes — so the 2nd/3rd staging
+    /// writes are pure overhead; keying on content folds them into
+    /// one upload per frame while a genuinely new selection (camera
+    /// move) always re-uploads.
+    inst_key: u64,
     /// Cascade-map resources (the `SU` uniform entry at binding 8,
     /// the receiving group(1), + the depth passes).
     shadow: ShadowCore,
@@ -890,6 +950,7 @@ impl TerrainRenderer {
     /// Build pipelines, the shared grid, the uniform buffer, and 1×1
     /// placeholder textures (a packet overrides them on first draw —
     /// the bind group starts valid regardless).
+    #[allow(clippy::too_many_lines)] // one device-resource construction; splitting fragments the descriptor set
     pub fn new(device: &wgpu::Device, surface_format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("terrain"),
@@ -940,6 +1001,14 @@ impl TerrainRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // §2.3's far uniform row — same size/layout, written with the
+        // far clip.z matrix by `sync_resources` every frame.
+        let uniforms_far = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("terrain-uniforms-far"),
+            size: std::mem::size_of::<TerrainUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let (height_tex, lut_tex, biome_tex) = Self::init_data_tex(device);
         let (alb_tex, nrm_tex, water_tex, sampler) = Self::init_art_tex(device);
         let bind_group = Self::bind_group(
@@ -955,13 +1024,28 @@ impl TerrainRenderer {
             &sampler,
             &shadow,
         );
+        let bind_group_far = Self::bind_group(
+            device,
+            &bgl,
+            &uniforms_far,
+            &height_tex,
+            &lut_tex,
+            &biome_tex,
+            &alb_tex,
+            &nrm_tex,
+            &water_tex,
+            &sampler,
+            &shadow,
+        );
         Self {
             terrain_pipe,
             ocean_pipe,
             sky_pipe,
             bgl,
             bind_group,
+            bind_group_far,
             uniforms,
+            uniforms_far,
             grid_v,
             grid_i,
             grid_index_count: indices.len() as u32,
@@ -971,8 +1055,11 @@ impl TerrainRenderer {
                 "terrain-instances",
                 (std::mem::size_of::<TerrainInstance>() * 4096) as u64,
             ),
+            inst_far: 0,
             inst_bytes: 0,
+            inst_ocean_far: 0,
             inst_end: 0,
+            inst_key: 0,
             shadow,
             height_tex,
             lut_tex,
@@ -1125,6 +1212,22 @@ impl TerrainRenderer {
             &self.sampler,
             &self.shadow,
         );
+        // The far set re-binds the SAME textures — only its uniform
+        // buffer differs, so both groups must track every texture
+        // swap together or the far pass would sample stale data.
+        self.bind_group_far = Self::bind_group(
+            device,
+            &self.bgl,
+            &self.uniforms_far,
+            &self.height_tex,
+            &self.lut_tex,
+            &self.biome_tex,
+            &self.alb_tex,
+            &self.nrm_tex,
+            &self.water_tex,
+            &self.sampler,
+            &self.shadow,
+        );
     }
 
     /// Create (on shape change) + upload a data texture in one step.
@@ -1268,31 +1371,60 @@ impl TerrainRenderer {
         }
     }
 
-    /// Terrain + ocean share the mesh — ONE upload, laid out
-    /// terrain-then-ocean so `draw` slices the terrain range and
-    /// `draw_ocean` slices the rest (the ocean draws in a second
-    /// phase after the flight stream, so the two stages never race
-    /// one buffer). `draw_shadow` re-runs the same upload when it
-    /// leads the frame; identical bytes, so the extra staging write
-    /// is the only cost.
+    /// Terrain + ocean share the mesh — ONE upload per frame, laid out
+    /// near-terrain / far-terrain / near-ocean / far-ocean (§2.3's
+    /// partition) so `draw` slices the near ranges, `draw_far` the far
+    /// ranges, and `draw_ocean` the near ocean (the ocean draws in a
+    /// later phase after the flight stream, so the stages never race
+    /// one buffer). The packet's lists already arrive near-then-far;
+    /// the boundary counts are read defensively (clamped, explicitly
+    /// re-segmented) so a mis-ordered packet can never desynchronize
+    /// the byte ranges from the draw slicing. `sync_resources` runs
+    /// for the shadow, far and near phases over the same packet, so
+    /// the upload itself is keyed on CONTENT (a `mix64` fold): the
+    /// first call of the frame stages the bytes, the repeats are
+    /// no-ops, and a changed selection always re-uploads.
     fn upload_instances(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         packet: &TerrainPacket,
     ) {
+        let sz = std::mem::size_of::<TerrainInstance>() as wgpu::BufferAddress;
         let n_terrain = packet.terrain.len();
-        let n_inst = n_terrain + packet.ocean.len();
+        let n_terrain_near = (packet.terrain_far_start as usize).min(n_terrain);
+        let n_ocean = packet.ocean.len();
+        let n_ocean_near = (packet.ocean_far_start as usize).min(n_ocean);
+        let n_inst = n_terrain + n_ocean;
+        // The byte ranges refresh unconditionally (cheap field writes
+        // a same-content packet sets idempotently); zero them on the
+        // empty packet so no later draw slices a previous frame's bytes.
+        self.inst_far = (n_terrain_near as wgpu::BufferAddress) * sz;
+        self.inst_bytes = (n_terrain as wgpu::BufferAddress) * sz;
+        self.inst_ocean_far = self.inst_bytes + (n_ocean_near as wgpu::BufferAddress) * sz;
+        self.inst_end = (n_inst as wgpu::BufferAddress) * sz;
         if n_inst == 0 {
+            self.inst_key = 0;
             return;
         }
         let mut inst = Vec::with_capacity(n_inst);
-        inst.extend_from_slice(&packet.terrain);
-        inst.extend_from_slice(&packet.ocean);
-        let _ = self.instances.upload(device, queue, &inst);
-        self.inst_bytes =
-            (n_terrain * std::mem::size_of::<TerrainInstance>()) as wgpu::BufferAddress;
-        self.inst_end = (n_inst * std::mem::size_of::<TerrainInstance>()) as wgpu::BufferAddress;
+        inst.extend_from_slice(&packet.terrain[..n_terrain_near]);
+        inst.extend_from_slice(&packet.terrain[n_terrain_near..]);
+        inst.extend_from_slice(&packet.ocean[..n_ocean_near]);
+        inst.extend_from_slice(&packet.ocean[n_ocean_near..]);
+        let bytes: &[u8] = bytemuck::cast_slice(&inst);
+        let mut key = mix64(bytes.len() as u64);
+        for c in bytes.chunks(8) {
+            let mut w = 0u64;
+            for (k, b) in c.iter().rev().enumerate() {
+                w |= u64::from(*b) << (8 * k);
+            }
+            key = mix64(key ^ w);
+        }
+        if key != self.inst_key {
+            let _ = self.instances.upload(device, queue, &inst);
+            self.inst_key = key;
+        }
     }
 
     /// Upload the packet's changing pieces and refresh the bind
@@ -1312,6 +1444,14 @@ impl TerrainRenderer {
         packet: &TerrainPacket,
     ) {
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&packet.uniforms));
+        // §2.3: the far row rides beside the near one every frame —
+        // the far pass draws from the same sync, never a stale
+        // matrix after a camera move.
+        queue.write_buffer(
+            &self.uniforms_far,
+            0,
+            bytemuck::bytes_of(&packet.uniforms_far),
+        );
         let mut rebind = false;
         if let Some(hf) = &packet.heightfield
             && self.uploaded_height_key != Some(hf.key)
@@ -1394,10 +1534,12 @@ impl TerrainRenderer {
     }
 
     /// Upload the packet's changing pieces (uniforms, instance rows,
-    /// any stale textures) and record: sky → opaque terrain, into the
-    /// caller's open pass sharing the flight depth target (reverse-Z).
-    /// The ocean is the separate [`Self::draw_ocean`] phase — it runs
-    /// after the flight stream.
+    /// any stale textures) and record the §2.3 NEAR terrain draw —
+    /// `[0..terrain_far_start)` instances through the near projection
+    /// — into the caller's open pass sharing the flight depth target
+    /// (reverse-Z). The sky and the far instances draw in the frame's
+    /// FIRST pass via [`Self::draw_far`]; the near ocean is the
+    /// separate [`Self::draw_ocean`] phase after the flight stream.
     pub fn draw(
         &mut self,
         pass: &mut wgpu::RenderPass<'_>,
@@ -1408,21 +1550,95 @@ impl TerrainRenderer {
         self.ensure_grid(queue);
         self.sync_resources(device, queue, packet);
 
+        let sz = std::mem::size_of::<TerrainInstance>() as wgpu::BufferAddress;
+        let n_near = ((self.inst_far / sz) as u32).min(packet.terrain.len() as u32);
+        if n_near == 0 {
+            return;
+        }
         pass.set_bind_group(0, &self.bind_group, &[]);
         // Cascade receiving set (group 1: depth array + comparison
         // sampler). Disarmed sessions sample a zeroed map through a
         // zeroed `SU` — the armed flag keeps the path dead.
         pass.set_bind_group(1, self.shadow.sample_bind(), &[]);
+        pass.set_pipeline(&self.terrain_pipe);
+        pass.set_vertex_buffer(0, self.grid_v.slice(..));
+        pass.set_vertex_buffer(1, self.instances.buffer.slice(0..self.inst_far));
+        pass.set_index_buffer(self.grid_i.slice(..), wgpu::IndexFormat::Uint16);
+        pass.draw_indexed(0..self.grid_index_count, 0, 0..n_near);
+    }
+
+    /// §2.3's far-field phase — record into the frame's FIRST render
+    /// pass (the far pass, sharing the flight depth attachment with
+    /// its own 0.0 clear): the sky backdrop first (it writes no depth
+    /// — `Always` compare, no write — so it can never occlude, and it
+    /// reads no `view_proj`, which is why it draws under the NEAR
+    /// uniform group), then the far terrain instances and the far
+    /// ocean through the FAR uniform row (`z = FAR_SPLIT/d`). Routing
+    /// (the packet's `*_far_start` counts, built with
+    /// [`patch_extent_m`]) sends only patches whose forward-nearest
+    /// point clears the split here, so the far pass's clip test
+    /// `split ≤ clip.w` is a pure staleness safety net — it never
+    /// trims visible surface, because no legitimately-routed far quad
+    /// reaches nearer than the split along the view axis. The near
+    /// pass that follows clears the depth again and draws on top:
+    /// routed-far quads lie wholly beyond the split, so near-over-far
+    /// is the correct winner everywhere except a near-routed
+    /// STRADDLER's beyond-split fringe
+    /// (the grazing-band approximation documented at the routing site
+    /// in `csp-view`), and no submission order inside either pass can
+    /// change a cross-pass winner. No-op draws (no sky, empty far
+    /// ranges) record nothing — a gameplay-range frame costs one
+    /// empty pass, not a second terrain draw.
+    pub fn draw_far(
+        &mut self,
+        pass: &mut wgpu::RenderPass<'_>,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        packet: &TerrainPacket,
+    ) {
+        self.ensure_grid(queue);
+        self.sync_resources(device, queue, packet);
+
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.set_bind_group(1, self.shadow.sample_bind(), &[]);
         if packet.sky {
             pass.set_pipeline(&self.sky_pipe);
             pass.draw(0..3, 0..1);
         }
-        if !packet.terrain.is_empty() {
+        let sz = std::mem::size_of::<TerrainInstance>() as wgpu::BufferAddress;
+        let n_far_terrain =
+            (((self.inst_bytes - self.inst_far) / sz) as u32).min(packet.terrain.len() as u32);
+        if n_far_terrain > 0 {
+            pass.set_bind_group(0, &self.bind_group_far, &[]);
             pass.set_pipeline(&self.terrain_pipe);
             pass.set_vertex_buffer(0, self.grid_v.slice(..));
-            pass.set_vertex_buffer(1, self.instances.buffer.slice(0..self.inst_bytes));
+            pass.set_vertex_buffer(
+                1,
+                self.instances.buffer.slice(self.inst_far..self.inst_bytes),
+            );
             pass.set_index_buffer(self.grid_i.slice(..), wgpu::IndexFormat::Uint16);
-            pass.draw_indexed(0..self.grid_index_count, 0, 0..packet.terrain.len() as u32);
+            pass.draw_indexed(0..self.grid_index_count, 0, 0..n_far_terrain);
+        }
+        let n_far_ocean =
+            (((self.inst_end - self.inst_ocean_far) / sz) as u32).min(packet.ocean.len() as u32);
+        if n_far_ocean > 0 {
+            // Same depth-test-only policy as the near ocean phase —
+            // far water tints what the far terrain pass already
+            // rasterized beneath it without writing depth. Buffer 0
+            // (the shared grid) is re-set: an ocean-only far packet
+            // never runs the terrain branch above, and the ocean
+            // pipeline requires it (a validation error otherwise).
+            pass.set_pipeline(&self.ocean_pipe);
+            pass.set_bind_group(0, &self.bind_group_far, &[]);
+            pass.set_vertex_buffer(0, self.grid_v.slice(..));
+            pass.set_vertex_buffer(
+                1,
+                self.instances
+                    .buffer
+                    .slice(self.inst_ocean_far..self.inst_end),
+            );
+            pass.set_index_buffer(self.grid_i.slice(..), wgpu::IndexFormat::Uint16);
+            pass.draw_indexed(0..self.grid_index_count, 0, 0..n_far_ocean);
         }
     }
 
@@ -1512,15 +1728,20 @@ impl TerrainRenderer {
         self.shadow.cascade_texture()
     }
 
-    /// The ocean phase — call from the same open pass AFTER the flight
-    /// vertex stream (app order: `draw` → flight `draw` → `draw_ocean`).
-    /// The ocean pipeline tests depth but never writes it: submerged
-    /// hull fragments keep their already-rasterized pixels instead of
-    /// being occluded by water drawn before them, and the alpha blend
-    /// still tints them through the surface. A no-op when `draw` was
-    /// not called this frame or no ocean instances were uploaded.
+    /// The ocean phase — call from the near pass AFTER the flight
+    /// vertex stream (app order: `draw_far` → `draw` → flight `draw`
+    /// → `draw_ocean`). §2.3 slices the NEAR ocean range here; the
+    /// far ocean draws inside [`Self::draw_far`]. The ocean pipeline
+    /// tests depth but never writes it: submerged hull fragments keep
+    /// their already-rasterized pixels instead of being occluded by
+    /// water drawn before them, and the alpha blend still tints them
+    /// through the surface. A no-op when `draw` was not called this
+    /// frame or no near ocean instances were uploaded.
     pub fn draw_ocean(&mut self, pass: &mut wgpu::RenderPass<'_>, packet: &TerrainPacket) {
-        if packet.ocean.is_empty() {
+        let sz = std::mem::size_of::<TerrainInstance>() as wgpu::BufferAddress;
+        let n_near =
+            (((self.inst_ocean_far - self.inst_bytes) / sz) as u32).min(packet.ocean.len() as u32);
+        if n_near == 0 {
             return;
         }
         pass.set_pipeline(&self.ocean_pipe);
@@ -1534,10 +1755,12 @@ impl TerrainRenderer {
         pass.set_vertex_buffer(0, self.grid_v.slice(..));
         pass.set_vertex_buffer(
             1,
-            self.instances.buffer.slice(self.inst_bytes..self.inst_end),
+            self.instances
+                .buffer
+                .slice(self.inst_bytes..self.inst_ocean_far),
         );
         pass.set_index_buffer(self.grid_i.slice(..), wgpu::IndexFormat::Uint16);
-        pass.draw_indexed(0..self.grid_index_count, 0, 0..packet.ocean.len() as u32);
+        pass.draw_indexed(0..self.grid_index_count, 0, 0..n_near);
     }
 }
 
@@ -1569,6 +1792,313 @@ impl TerrainInstance {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// §2.3's far-field draw on a real device (the pin the split-ring
+    /// gate's diagnosis demanded): a 600 km flat-datum body viewed
+    /// (a) from 2 Mm straight down — every leaf wholly beyond the
+    /// split — and (b) from 800 km pitched 1.05 rad — the split ring
+    /// crosses the disc, both bands populated. For each vantage the
+    /// disc renders through `draw_far` (far pass, far uniform row)
+    /// and, as the control, the SAME far-routed instances through
+    /// `draw_far` with the NEAR uniform row: the far row must paint
+    /// every pixel the near one does — byte-identical — which is
+    /// exactly what a broken far row (a collapsed displacement, a
+    /// dead bind group, a mis-sliced range, an over-eager clip)
+    /// cannot do. Skips without an adapter (CI sets
+    /// CSP_RENDER_GATE_REQUIRED to make the skip a failure — the
+    /// render gate's contract).
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(clippy::too_many_lines)] // one device frame recipe per arm; splitting hides the A/B
+    fn far_field_draw_paints_the_disc_on_device() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let Ok(adapter) =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: None,
+                ..wgpu::RequestAdapterOptions::default()
+            }))
+        else {
+            assert!(
+                !std::env::var("CSP_RENDER_GATE_REQUIRED").is_ok_and(|v| !v.is_empty() && v != "0"),
+                "far-field device test: CSP_RENDER_GATE_REQUIRED is set but no headless \
+                 GPU adapter exists"
+            );
+            eprintln!("far-field device test: SKIP — no headless GPU adapter");
+            return;
+        };
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("far-field-test"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            ..wgpu::DeviceDescriptor::default()
+        }))
+        .unwrap();
+        let radius = 600_000.0;
+        let lod = LodConfig {
+            max_level: 8,
+            split_factor: 2.0,
+            max_patches: 512,
+        };
+        let field = HeightField::bake_profiled(7, csp_core::terrain::ReliefProfile::Legacy);
+        // (alt above datum, pitch below the horizontal); case (a)
+        // looks straight down the nadir, case (b) across the ring.
+        for (label, alt, pitch) in [
+            (
+                "straight-down 2 Mm",
+                2_000_000.0,
+                std::f64::consts::FRAC_PI_2,
+            ),
+            ("split-ring 800 km", 800_000.0, 1.05),
+        ] {
+            // Camera basis, the gate probe's pole construction: up =
+            // +z, north = +y, fwd pitched `pitch` below the horizon.
+            let eye = DVec3::new(0.0, 0.0, radius + alt);
+            let (sp, cp) = pitch.sin_cos();
+            let fwd = DVec3::new(0.0, cp, -sp);
+            let z_out = -fwd;
+            let right = DVec3::new(1.0, 0.0, 0.0);
+            let upv = z_out.cross(right);
+            let view = [
+                [right.x, right.y, right.z, 0.0],
+                [upv.x, upv.y, upv.z, 0.0],
+                [z_out.x, z_out.y, z_out.z, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ];
+            let aspect = 1.0;
+            let f = 1.0 / (0.9f64 * 0.5).tan();
+            let proj = [
+                [f / aspect, 0.0, 0.0, 0.0],
+                [0.0, f, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.1],
+                [0.0, 0.0, -1.0, 0.0],
+            ];
+            let mut near_vp = [[0.0f64; 4]; 4];
+            for r in 0..4 {
+                for c in 0..4 {
+                    near_vp[r][c] = proj[r][0] * view[0][c]
+                        + proj[r][1] * view[1][c]
+                        + proj[r][2] * view[2][c]
+                        + proj[r][3] * view[3][c];
+                }
+            }
+            let mut far_vp = near_vp;
+            far_vp[2] = [0.0, 0.0, 0.0, crate::flight::FAR_SPLIT_M];
+            let wgsl_m = |m: &[[f64; 4]; 4]| {
+                let mut o = [[0.0f32; 4]; 4];
+                for r in 0..4 {
+                    for c in 0..4 {
+                        o[c][r] = m[r][c] as f32;
+                    }
+                }
+                o
+            };
+            // Leaves + the build_packet routing rule (forward-nearest
+            // point ≥ split), near-then-far.
+            let leaves = select_patches(eye, radius, 0.0, &lod);
+            let mut near_l = Vec::new();
+            let mut far_l = Vec::new();
+            for &id in &leaves {
+                let inst = patch_instance(id, 0.0, eye, radius);
+                let o = inst.origin_rel_eye;
+                let fwd_d =
+                    f64::from(o[0]) * fwd.x + f64::from(o[1]) * fwd.y + f64::from(o[2]) * fwd.z;
+                if fwd_d - patch_extent_m(id, radius, 0.0) >= crate::flight::FAR_SPLIT_M {
+                    far_l.push(inst);
+                } else {
+                    near_l.push(inst);
+                }
+            }
+            let terrain_far_start = near_l.len() as u32;
+            let mut terrain = near_l;
+            terrain.extend(far_l);
+            assert!(!terrain.is_empty(), "{label}: leaves must exist");
+            if alt >= 2_000_000.0 {
+                assert_eq!(
+                    terrain_far_start, 0,
+                    "{label}: every leaf routes far (the case's premise)"
+                );
+            } else {
+                assert!(
+                    terrain_far_start > 0 && (terrain_far_start as usize) < terrain.len(),
+                    "{label}: both bands must be populated (the split ring crosses the disc)"
+                );
+            }
+            let base = TerrainUniforms {
+                view_proj: wgsl_m(&near_vp),
+                eye_rel_body: [eye.x as f32, eye.y as f32, eye.z as f32, 0.0],
+                sun_dir: [0.0, 0.0, 1.0, 0.0],
+                planet: [radius as f32, 0.0, 0.0, 1.0],
+                ..TerrainUniforms::default()
+            };
+            let mut far = base;
+            far.view_proj = wgsl_m(&far_vp);
+            let packet = TerrainPacket {
+                uniforms: base,
+                uniforms_far: far,
+                heightfield: Some(std::sync::Arc::new(field.clone())),
+                terrain,
+                terrain_far_start,
+                sky: false,
+                ..TerrainPacket::default()
+            };
+            // One renderer + render per arm (fresh instance-buffer
+            // keys, no cross-talk); the control swaps ONLY the far
+            // uniform row for the near one.
+            let render = |use_near_row: bool| -> Vec<u8> {
+                let mut renderer =
+                    TerrainRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
+                let mut p = packet.clone();
+                if use_near_row {
+                    p.uniforms_far = p.uniforms;
+                }
+                let msaa = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("far-test-msaa"),
+                    size: wgpu::Extent3d {
+                        width: 128,
+                        height: 128,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: crate::MSAA_SAMPLES,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                });
+                let target = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("far-test-target"),
+                    size: wgpu::Extent3d {
+                        width: 128,
+                        height: 128,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                });
+                let msaa_view = msaa.create_view(&wgpu::TextureViewDescriptor::default());
+                let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+                // A local reverse-Z depth attachment, the flight pass's
+                // own conventions (Depth32Float, 4×, clear 0.0).
+                let depth = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("far-test-depth"),
+                    size: wgpu::Extent3d {
+                        width: 128,
+                        height: 128,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: crate::MSAA_SAMPLES,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Depth32Float,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                });
+                let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("far-test"),
+                });
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("far-test-pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &msaa_view,
+                            resolve_target: Some(&target_view),
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &depth_view,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(0.0),
+                                store: wgpu::StoreOp::Discard,
+                            }),
+                            stencil_ops: None,
+                        }),
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    renderer.draw_far(&mut pass, &device, &queue, &p);
+                }
+                let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("far-test-readback"),
+                    size: 128 * 128 * 4,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                encoder.copy_texture_to_buffer(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &target,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &buf,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(128 * 4),
+                            rows_per_image: Some(128),
+                        },
+                    },
+                    wgpu::Extent3d {
+                        width: 128,
+                        height: 128,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                queue.submit([encoder.finish()]);
+                let (tx, rx) = std::sync::mpsc::channel();
+                buf.map_async(wgpu::MapMode::Read, .., move |r| {
+                    let _ = tx.send(r);
+                });
+                device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+                rx.recv().unwrap().expect("map_async failed");
+                let img = buf.get_mapped_range(..).unwrap().to_vec();
+                buf.unmap();
+                img
+            };
+            let far_img = render(false);
+            let near_row_img = render(true);
+            let painted = |img: &[u8]| {
+                img.chunks_exact(4)
+                    .filter(|p| (0..3).any(|c| p[c] > 8))
+                    .count()
+            };
+            let far_px = painted(&far_img);
+            let control_px = painted(&near_row_img);
+            eprintln!("far-field device [{label}]: far={far_px} px, near-row control={control_px}");
+            assert!(
+                control_px > 500,
+                "{label}: the control arm must paint the disc ({control_px} px) — rig broke"
+            );
+            assert!(
+                far_px > 500,
+                "{label}: draw_far painted only {far_px} px (control {control_px}) — the far \
+                 pass lost its surface"
+            );
+            let diffs = far_img
+                .chunks_exact(4)
+                .zip(near_row_img.chunks_exact(4))
+                .filter(|(a, b)| (0..3).any(|c| a[c].abs_diff(b[c]) > 8))
+                .count();
+            assert_eq!(
+                diffs, 0,
+                "{label}: the far row's disc differs from the near-row control in {diffs} px"
+            );
+        }
+    }
 
     /// The R2 determinism contract: same seed + direction ⇒ bit-identical
     /// height, every run. Also seeds must actually differ.
