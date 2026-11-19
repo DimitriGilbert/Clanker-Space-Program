@@ -622,7 +622,7 @@ wins).
 | `vab.wgsl` (107) | `vs_main`/`fs_main` + pick fragment | Per-pixel-lit editor parts (hemisphere ambient × baked occlusion, key light, Blinn specular, fresnel rim); pick writes the 1-based object id |
 | `flight.wgsl` (208) | `vs_main`/`fs_main` | Same per-pixel lighting as VAB minus pick, plus the unlit passthrough (`nrm ≈ 0`); ACES (Narkowicz) tone-map shared with terrain so lit hulls match the ground. Since 3b: the direct-sun terms multiply the cascade `sun_visibility` (a C16-F3 duplication of terrain.wgsl's receive half — no WGSL include mechanism) |
 | `flight_shadow.wgsl` (69) | `vs_shadow0`/`vs_shadow1` (3b craft cast, depth-only) | Drops the flight stream into §7.4's cascade map. A dedicated module on purpose: the cast pipelines ride a minimal group(0) (`SU` alone at binding 8), and sharing flight.wgsl left its `light`/group(1) declarations dangling against that layout, which de-registered the uniform binding on-device (the cast silently discarded — see the file header) |
-| `terrain.wgsl` (1296) | `vs_terrain`/`fs_terrain` (`:412`/`:792`), `vs_sky`/`fs_sky` (`:1037`/`:1168`), `vs_shadow0`/`vs_shadow1` (`:438`/`:446`, depth-only cascade pass; the shared displacement is `terrain_displace`, `:383`) | Quadtree terrain, ocean, and the sky/atmosphere/starfield — see §8; the shadow entry points feed §7.4's cascade map |
+| `terrain.wgsl` (1391) | `vs_terrain`/`fs_terrain` (`:414`/`:893`), `vs_sky`/`fs_sky` (`:1132`/`:1263`), `vs_shadow0`/`vs_shadow1` (`:440`/`:448`, depth-only cascade pass; the shared displacement is `terrain_displace`, `:385`) | Quadtree terrain, ocean, and the sky/atmosphere/starfield — see §8; the shadow entry points feed §7.4's cascade map |
 
 All four are parse+validate gated by a unit test
 (`shaders_parse_and_validate`, `csp-render/src/lib.rs:476`) so shader
@@ -667,6 +667,40 @@ Biome tint: the authored index map only **tints** — it never moves a vertex
 grass/rock/sand/snow by height/slope/latitude with detail-noise dither, or
 the real-art albedo/normal arrays (`TerrainArt` from `data/art/terrain.csar`)
 when the packet carries them (`uniforms.art.x`).
+
+**Triplanar detail + per-tile de-repetition (texture-quality 4b).** The
+real-art path samples all three projection planes with |n|⁴ weights over
+world-anchored UVs (`tri_planes`/`tile_uv`, `terrain.wgsl:704`/`:784` — the
+anchor quantizes the frame so `d·k`'s f32 ulp never jitters a texel).
+Since 4b each tile cell applies ONE of the eight dihedral transforms of
+the square (identity/rot90/rot180/rot270 × optional mirror — 3 bits:
+flip-u, flip-v, swap) to its within-tile UV before the fetch, selected by
+an integer hash of (cell, plane, layer) (`tile_bits` — `hash_i3`'s
+avalanche with a top-3-bit cut). The cell index is `floor` of the *same*
+f32 coordinate whose `fract` is the sampled UV, so the transform can
+never disagree with the wrap (no border seam strip), and the hash inputs
+are pure functions of the body-fixed direction — the world-stability
+contract holds; camera motion cannot shimmer or crawl the pattern.
+Albedo and normal sample through the identical transform (lockstep), and
+the `class_means` normalization is preserved because every dihedral map
+is a texel bijection (each cell still shows the whole tile). Cost: ~20
+ALU per sample coordinate, zero extra fetches. Distance-band table
+(scales × base tiling; base tiles are 9/22/12/16 m per class):
+
+| band | old | 4b | fade |
+|---|---|---|---|
+| albedo mid (aerial large-variation layer) | 0.41× | **0.47×** (~19–47 m) | 40 km |
+| albedo near (boot/rover grain) | 5.9× | **8.5×** (~1.1–2.6 m) | 1.8 km |
+| normal near (matches albedo near) | 5.9× | **8.5×** | 1.8 km |
+| normal fine (finest grain, filtered) | 15.7× | **24×** (~0.4–0.9 m) | 1.8 km² |
+
+The micro-relief bump's top noise octave stays at freq 16000 — the
+shader's STABILITY ceiling for direct lattice samples — with 4b's extra
+near-field detail coming from a second incommensurate 12200 octave
+behind a 1.8 km boot fade (`bump_fix_near`, `terrain.wgsl:505`) plus the
+finer filtered normal retilings above. `uniforms.art.z = 1` (render-gate
+`DUMP_DEREPETITION=0` A/B dumps only; production writes 0) restores the
+pre-4b plain periodic tiling verbatim for before/after evidence pairs.
 
 The vessel blob shadow (`uniforms.shadow`, `vessel_shadow`,
 `csp-view/src/terrain.rs:505`) anchors the focused craft's shadow to the
@@ -787,22 +821,22 @@ never edge-clamped) stays as correct CSM hygiene.
 
 ### 7.5 Sky, atmosphere, and the star field (current state)
 
-`fs_sky` (`terrain.wgsl:1154`): fullscreen triangle; per-pixel scattering ray
+`fs_sky` (`terrain.wgsl:1263`): fullscreen triangle; per-pixel scattering ray
 in f32 with the shell-quadratic constants pre-baked in CPU f64
-(`uniforms.misc.z/w` — computing `|pa|²−r²` in f32 costs ~±300 m of limb
+(`uniforms.misc.z/w` — computing |pa|²−r² in f32 costs ~±300 m of limb
 wobble); 32-step jittered march with per-step jitter (partial cancellation,
 no banding); Rayleigh + Mie (aerosols hug the low shell) through the LUT;
 ground strikes swap the backdrop for haze; ACES tone-map.
 
-The star field (`star_cell`/`star_layer`/`star_field`, `terrain.wgsl:1060`/
-`:1091`/`:1119`) is fully procedural — crisp point stars hashed out of a 3D
+The star field (`star_cell`/`star_layer`/`star_field`, `terrain.wgsl:1169`/
+`:1200`/`:1228`) is fully procedural — crisp point stars hashed out of a 3D
 direction-space lattice (~750 bright + ~700 faint incl. a Milky-Way band),
 each projected onto the direction sphere with a Gaussian core + faint halo,
 and a per-pixel ray-footprint floor (`sig_ang`) so **no star ever goes
 sub-pixel** — dense sub-pixel points read as film grain, which was the
 "grainy static sky" complaint.
 
-Daylight star gate (`terrain.wgsl:1264`): stars survive only where the
+Daylight star gate (`terrain.wgsl:1373`): stars survive only where the
 shell scatters essentially nothing into the ray —
 `star_vis = 1 − smoothstep(6e-4, 4e-3, ins_lum)`. The previous
 `exp(−ins_lum·160)` never reached zero, so bright stars speckled the
@@ -946,8 +980,8 @@ found live defects in the same tree, listed in the ledger below.
    readout block until dragged.
 2. **Grainy sky / stars too early.** FIXED: the star field is sparse
    resolved points with a resolution-aware sub-pixel floor, and the daylight
-   gate is the hard `smoothstep(6e-4, 4e-3, ins_lum)` (`terrain.wgsl:1119`
-   `star_field`, `:1264` the gate) replacing the never-zero
+   gate is the hard `smoothstep(6e-4, 4e-3, ins_lum)` (`terrain.wgsl:1228`
+   `star_field`, `:1373` the gate) replacing the never-zero
    `exp(−ins_lum·160)`. The old faint-layer grain root cause is documented
    in the shader comments ("the old 11–23%-occupancy faint layer was the
    'grainy static' sky").

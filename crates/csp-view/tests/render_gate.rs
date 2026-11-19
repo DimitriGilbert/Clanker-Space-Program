@@ -265,10 +265,14 @@ fn render_flight_scene(
 }
 
 /// Sized variant — the 256 B copy-row alignment must divide `w*4`.
-/// Dump A/B knob: `DUMP_SHADOWS=0` zeroes the packet's cascade row
-/// before rendering, so the SAME frame can be rasterized armed and
-/// disarmed for the phase-3b shadow-evidence diff (the standing gate
-/// tests never set it — they always exercise the extract's real row).
+/// Dump A/B knobs, both mutating a packet CLONE so the standing gate
+/// tests (which never set them) always exercise the extract's real
+/// rows: `DUMP_SHADOWS=0` zeroes the packet's cascade row, rendering
+/// the SAME frame disarmed for the phase-3b shadow-evidence diff;
+/// `DUMP_DEREPETITION=0` raises the terrain uniform's de-repetition
+/// kill flag (`uniforms.art.z`), rendering the same frame with the
+/// pre-4b plain periodic tiling for the phase-4b tile-periodicity
+/// A/B pair.
 #[allow(clippy::too_many_lines)] // one render-pass recipe for the gate
 fn render_flight_scene_sized(
     device: &wgpu::Device,
@@ -278,12 +282,18 @@ fn render_flight_scene_sized(
     h: u32,
 ) -> Vec<u8> {
     let disarmed = std::env::var("DUMP_SHADOWS").is_ok_and(|v| v == "0");
-    let zeroed;
-    let packet = if disarmed {
+    let plain_tiles = std::env::var("DUMP_DEREPETITION").is_ok_and(|v| v == "0");
+    let patched;
+    let packet = if disarmed || plain_tiles {
         let mut p = packet.clone();
-        p.shadow = csp_render::shadow::ShadowUniforms::default();
-        zeroed = p;
-        &zeroed
+        if disarmed {
+            p.shadow = csp_render::shadow::ShadowUniforms::default();
+        }
+        if plain_tiles && let Some(t) = p.terrain.as_mut() {
+            t.uniforms.art[2] = 1.0; // terrain.wgsl's de-repetition kill flag
+        }
+        patched = p;
+        &patched
     } else {
         packet
     };
@@ -924,8 +934,8 @@ fn dump_sky() {
 /// Determinism: `until_real_terrain` polls on IDLE frames (no sim
 /// advance) and `DUMP_TIME=<seconds>` optionally pins the capture
 /// clock — the scene (hence the sun) is a pure function of the knobs,
-/// never of the bake's wall-time. Paired A/B dumps (DUMP_SHADOWS) run
-/// minutes apart with identical lighting.
+/// never of the bake's wall-time. Paired A/B dumps (DUMP_SHADOWS,
+/// DUMP_DEREPETITION) run minutes apart with identical lighting.
 #[test]
 #[ignore]
 fn dump_low() {

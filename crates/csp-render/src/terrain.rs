@@ -314,7 +314,10 @@ pub struct TerrainUniforms {
     /// carries [`TerrainArt`] — the shader falls back to procedural
     /// detail when 0), `y` = presentation clock in seconds (wave
     /// scroll — the sim tick-derived value, still deterministic),
-    /// `z`/`w` unused.
+    /// `z` = per-tile de-repetition kill flag (1.0 makes the shader
+    /// sample the pre-4b plain periodic tiling; render-gate
+    /// `DUMP_DEREPETITION=0` A/B dumps only — production writes 0),
+    /// `w` unused.
     pub art: [f32; 4],
     /// Per-class mean LINEAR albedo (grass, rock, sand, snow —
     /// `TerrainTex::means` sRGB→linear at packet build). The shader

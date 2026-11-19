@@ -24,7 +24,9 @@ struct U {
     rayleigh: vec4<f32>,      // Rayleigh β rgb (1/m)
     biome_colors: array<vec4<f32>, 16>,
     shadow: vec4<f32>,        // xyz vessel-shadow anchor dir (inertial, unit), w blob radius (m, 0 = off)
-    art: vec4<f32>,           // x real-texture flag (0 = procedural fallback), y clock s, z/w unused
+    art: vec4<f32>,           // x real-texture flag (0 = procedural fallback), y clock s,
+                              // z tile de-repetition kill flag (1 = plain tiling; dump
+                              // A/B only — production writes 0), w unused
     class_means: array<vec4<f32>, 4>, // per-class mean LINEAR albedo (pack header — single source of truth)
 };
 
@@ -489,18 +491,28 @@ fn bump_fix(dir_fix: vec3<f32>, n: vec3<f32>, b: Basis, dist: f32) -> vec3<f32> 
     return normalize(n - b.e * g.x - b.n * g.y);
 }
 
-// The fine octave (~40 m cells), applied on top of `bump_fix` for
-// LIGHTING only — letting it into the class-weight slope would speckle
-// rock/grass assignment at boot level. Metre-scale grain is the normal
-// maps' job (filtered, stable); this octave deliberately stops at the
-// coarsest "fine" band that stays f32-stable.
+// The fine octaves, applied on top of `bump_fix` for LIGHTING only —
+// letting them into the class-weight slope would speckle rock/grass
+// assignment at boot level. Metre-scale grain is the normal maps' job
+// (filtered, stable); these octaves deliberately stop at the coarsest
+// "fine" band that stays f32-stable. 4b: the STABILITY ceiling
+// (freq ≤ ~16000 for direct lattice samples) FORBIDS raising the top
+// frequency — the extra near-field detail therefore comes from octave
+// DENSITY: a second, incommensurate 12200 lattice interleaved under
+// the 16000 one (49 m vs 37.5 m cells) behind a tight 1.8 km boot
+// fade, so the added ngrad cost lands only at boot/rover range where
+// the extra texture actually reads.
 fn bump_fix_near(dir_fix: vec3<f32>, n: vec3<f32>, b: Basis, dist: f32) -> vec3<f32> {
     let R = u.planet.x;
     let f_near = clamp(1.0 - dist / 1.5e4, 0.0, 1.0);
     if (f_near <= 0.001) {
         return n;
     }
-    let g = ngrad(dir_fix, b.e, b.n, 16000.0) * (5.0 * 16000.0 / R * f_near);
+    var g = ngrad(dir_fix, b.e, b.n, 16000.0) * (5.0 * 16000.0 / R * f_near);
+    let f_boot = clamp(1.0 - dist / 1.8e3, 0.0, 1.0);
+    if (f_boot > 0.001) {
+        g = g + ngrad(dir_fix, b.e, b.n, 12200.0) * (4.0 * 12200.0 / R * f_boot);
+    }
     return normalize(n - b.e * g.x - b.n * g.y);
 }
 
@@ -706,6 +718,78 @@ fn tex_uv(dd: vec2<f32>, pb: vec2<f32>, k: f32) -> vec2<f32> {
     return fract(pb * k) + dd * k;
 }
 
+// --- per-tile de-repetition (texture quality 4b) ------------------------
+// A periodically tiled texture is its own worst enemy: with the art at
+// 1024² the dominant defect was the 9–22 m tile grid repeating over
+// every hillside. Each tile cell now applies ONE of the eight dihedral
+// transforms of the square (identity / rot90 / rot180 / rot270 ×
+// optional mirror — enumerated as 3 bits: flip-u, flip-v, swap) to its
+// WITHIN-TILE uv before the fetch, selected by an integer hash of
+// (cell, plane, layer). A random per-cell orientation is NOT a symmetry
+// of the tiling, so the pattern cannot repeat until the hash layout
+// recurs — the effective period grows from one tile to hundreds.
+// Consistency contracts, all held:
+//  * WORLD-STABLE: every input is a pure function of the body-fixed
+//    direction (cell, plane and layer are all derived from `d` and the
+//    fixed grid) — no camera term, no time term, nothing that can
+//    re-phase on a quadtree re-split or a camera move.
+//  * albedo/normal lockstep: `class_albedo`/`class_normal` call this
+//    with identical (plane, layer, k), so both arrays sample the same
+//    orientation of the same tile.
+//  * the cell index is `floor` of the SAME f32 coordinate whose
+//    `fract` is the sampled uv, so the transform can never disagree
+//    with the wrap — hashing `floor(d·k)` directly would leave a
+//    ~0.016-tile strip at every cell border (the raw product's ulp at
+//    k≈1.6e5) where the hash picks the NEIGHBOUR's transform for a
+//    fragment still sampling this cell's uv — a hard seam line per
+//    tile. Deriving both from one evaluation eliminates the strip by
+//    construction.
+//  * `class_means` normalization still cancels: every dihedral map is
+//    a texel bijection of the tile, so each cell still shows the whole
+//    tile and the per-layer (and plane-weighted) average is unchanged.
+// Cost: ~20 integer/float ALU per sample coordinate — UV math before
+// the SAME number of fetches. The visible price: a 2×2 quad straddling
+// a tile border carries a junk implicit derivative (the argument jumps
+// where orientations differ), so those lone quads pick a mip too
+// coarse — the standard trade of every rotated-tile shader, invisible
+// next to the periodicity it kills.
+// `u.art.z = 1` returns the PRE-4b sampling verbatim (plain unwrapped
+// tiling) — the render gate's DUMP_DEREPETITION=0 A/B knob; production
+// builds the uniform row with z = 0.
+fn tile_bits(cell: vec2<i32>, plane: i32, layer: i32) -> u32 {
+    // hash_i3's avalanche with the float fold replaced by a top-3-bit
+    // cut — the full [0,1) hash is overkill for 8 outcomes.
+    var h = bitcast<u32>(cell.x) * 0x8da6b343u;
+    h = h ^ (bitcast<u32>(cell.y) * 0xd8163841u);
+    h = h ^ (bitcast<u32>(plane * 4 + layer) * 0xcb1ab31fu);
+    h = (h ^ (h >> 15u)) * 0x85ebca6bu;
+    h = (h ^ (h >> 13u)) * 0xc2b2ae35u;
+    h = h ^ (h >> 16u);
+    return (h >> 29u) & 7u;
+}
+
+// One of the 8 dihedral transforms, bits: 1 flip-u, 2 flip-v, 4 swap
+// (any flip∘swap composition enumerates D4 exactly).
+fn tile_xfm(uv: vec2<f32>, bits: u32) -> vec2<f32> {
+    var r = vec2<f32>(select(uv.x, 1.0 - uv.x, (bits & 1u) != 0u),
+                      select(uv.y, 1.0 - uv.y, (bits & 2u) != 0u));
+    if ((bits & 4u) != 0u) {
+        r = vec2<f32>(r.y, r.x);
+    }
+    return r;
+}
+
+// Anchored + de-repeated sample coordinate for one (plane, layer) at
+// cells-per-radian `k` — see the block comment above.
+fn tile_uv(dd: vec2<f32>, pb: vec2<f32>, k: f32, plane: i32, layer: i32) -> vec2<f32> {
+    let raw = fract(pb * k) + dd * k;
+    if (u.art.z > 0.5) {
+        return raw; // dump kill switch — pre-4b tiling, verbatim
+    }
+    let fl = floor(raw); // exact: |raw| ≲ 1.3e3 ≪ 2²⁴
+    return tile_xfm(raw - fl, tile_bits(vec2<i32>(fl), plane, layer));
+}
+
 // Per-class tile edge length (m) — grass is fine-grained, rock coarse.
 fn class_tile(layer: i32) -> f32 {
     if (layer == 0) { return 9.0; }   // grass
@@ -730,7 +814,7 @@ fn class_albedo(tp: TriPlanes, layer: i32, scale: f32) -> vec3<f32> {
     var acc = vec3<f32>(0.0);
     for (var i = 0; i < 3; i = i + 1) {
         acc = acc + textureSample(alb_arr, samp,
-                                  tex_uv(tp.dd[i], tp.pb[i], k), layer).rgb
+                                  tile_uv(tp.dd[i], tp.pb[i], k, i, layer), layer).rgb
                   * tp.w[i];
     }
     let mean = u.class_means[layer].rgb;
@@ -738,12 +822,15 @@ fn class_albedo(tp: TriPlanes, layer: i32, scale: f32) -> vec3<f32> {
 }
 
 // Matching normal-map sample for `layer` — tangent-space xy slope.
+// Samples through the SAME tile_uv as `class_albedo` (identical
+// plane/layer/k ⇒ identical per-tile transform), so the normal grain
+// never contradicts the albedo pattern it belongs to.
 fn class_normal(tp: TriPlanes, layer: i32, scale: f32) -> vec2<f32> {
     let k = u.planet.x / (class_tile(layer) * scale);
     var acc = vec2<f32>(0.0);
     for (var i = 0; i < 3; i = i + 1) {
         acc = acc + (textureSample(nrm_arr, samp,
-                                   tex_uv(tp.dd[i], tp.pb[i], k), layer).xy
+                                   tile_uv(tp.dd[i], tp.pb[i], k, i, layer), layer).xy
                      * 2.0 - 1.0)
                   * tp.w[i];
     }
@@ -941,12 +1028,17 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
             // the shading normal on the dominant class.
             let wts = class_weights(i.h_norm, slope, abs(dir_fix.z), mottle);
             let tp = tri_planes(dir_fix, n_macro);
-            // Distance bands: the mid octave (a ~2.4× coarser,
-            // incommensurate retiling) decorrelates the visible
-            // 10–20 m tile repeat out to aerial range; the near
-            // octave (~5.9× finer, metre-scale tiles) adds cm-grain
-            // that only exists at boot/rover distance and fades long
-            // before it can sub-pixel shimmer. Both multiply in — a
+            // Distance bands (4b table — the per-tile de-repetition in
+            // `tile_uv` now carries the anti-periodicity burden, so the
+            // retilings are pure detail scales and could move closer
+            // in; scales stay pairwise incommensurate by habit):
+            //   albedo  mid  0.47×  (~19–47 m tiles, aerial-range
+            //                         large-variation layer, out to 40 km)
+            //   albedo  near 8.5×  (~1.1–2.6 m tiles, boot/rover grain)
+            //   normal  near 8.5×  (matches the albedo near grain)
+            //   normal  fine 24×   (~0.4–0.9 m grain, fades as near²)
+            // Old (pre-4b) scales for reference: mid 0.41, near 5.9,
+            // normal fine 15.7. Both extra bands multiply in — a
             // product of mean-1 fields keeps the authored brightness.
             let mid_fade = clamp(1.0 - dist / 4.0e4, 0.0, 1.0);
             let near_fade = clamp(1.0 - dist / 1.8e3, 0.0, 1.0);
@@ -959,12 +1051,12 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
                     var det_l = class_albedo(tp, l, 1.0);
                     if (mid_fade > 0.001) {
                         det_l = det_l * mix(vec3<f32>(1.0),
-                                            class_albedo(tp, l, 0.41),
+                                            class_albedo(tp, l, 0.47),
                                             0.60 * mid_fade);
                     }
                     if (near_fade > 0.001) {
                         det_l = det_l * mix(vec3<f32>(1.0),
-                                            class_albedo(tp, l, 5.9),
+                                            class_albedo(tp, l, 8.5),
                                             0.80 * near_fade);
                     }
                     detail = detail + det_l * w;
@@ -979,13 +1071,16 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
             let det_str = clamp(0.25 + 0.75 * det_fade, 0.0, 1.0);
             alb = alb * mix(vec3<f32>(1.0), clamp(detail, vec3<f32>(0.22), vec3<f32>(1.6)), det_str);
             // Detail normals: the base map plus two finer retilings —
-            // ~1.5–3.5 m and ~0.4–1.4 m grain — so the ground reads
-            // as rough rock/soil at boot level instead of a linear-
-            // filtered smear. Gains rise close in and die with range.
+            // at the 4b table ~1–3 m and ~0.4–0.9 m grain — so the
+            // ground reads as rough rock/soil at boot level instead of
+            // a linear-filtered smear. Gains rise close in and die
+            // with range. The finest scale is filtered texture detail
+            // (mip/aniso absorb sub-texel jitter), NOT hash noise —
+            // the STABILITY cap does not apply to it.
             var ntex = class_normal(tp, dom_layer, 1.0) * (0.35 + 0.65 * det_fade);
             if (near_fade > 0.001) {
-                ntex = ntex + class_normal(tp, dom_layer, 5.9) * (0.85 * near_fade)
-                            + class_normal(tp, dom_layer, 15.7) * (0.55 * near_fade * near_fade);
+                ntex = ntex + class_normal(tp, dom_layer, 8.5) * (0.85 * near_fade)
+                            + class_normal(tp, dom_layer, 24.0) * (0.55 * near_fade * near_fade);
             }
             n_fix = normalize(n_fix - basis.e * ntex.x * 0.62 - basis.n * ntex.y * 0.62);
         }
