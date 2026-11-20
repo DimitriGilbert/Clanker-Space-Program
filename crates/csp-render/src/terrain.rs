@@ -738,9 +738,11 @@ pub struct TerrainRenderer {
     /// terrain, `[inst_bytes..inst_ocean_far)` near ocean,
     /// `[inst_ocean_far..inst_end)` far ocean. Set by
     /// [`Self::upload_instances`], sliced by `draw`/`draw_far`/
-    /// `draw_ocean`; `draw_shadow` reads `[0..inst_bytes)` (every
-    /// terrain instance casts, near and far — far patches land
-    /// outside the cascade volume and clip, as they always have).
+    /// `draw_ocean`; `draw_shadow` culls per cascade (G3,
+    /// [`crate::shadow::cascade_runs`]) and draws kept runs out of
+    /// the whole `[0..inst_bytes)` terrain span — near-list only at
+    /// the home body (the far-list exclusion proof lives at
+    /// `cascade_runs`).
     inst_far: wgpu::BufferAddress,
     /// Byte range of the ocean slice start (terrain end) — set by
     /// `draw`, consumed by `draw_ocean`.
@@ -754,6 +756,27 @@ pub struct TerrainRenderer {
     /// one upload per frame while a genuinely new selection (camera
     /// move) always re-uploads.
     inst_key: u64,
+    /// G3+ fold memo — the KEY COMPUTATION above was itself the
+    /// remaining 3×/frame cost (~30.5k `mix64` over ~244 KB of
+    /// instances per sync, ×3): within one frame the packet is a
+    /// single immutable borrow, so (frame stamp + slice ptr/len +
+    /// near/far boundary counts) identity proves the bytes unchanged
+    /// and the 2nd/3rd syncs reuse the folded key outright. The
+    /// stamp is bumped once per frame by [`Self::draw_shadow`] — the
+    /// documented frame leader (the app and the render gate both
+    /// lead every terrain frame with it, armed or not) — which is
+    /// what separates "same packet later in this frame" from "a
+    /// fresh packet next frame that recycled the allocation": the
+    /// stamp differs, the fold reruns, the ABA trap never fires.
+    /// INVALIDATION CONTRACT: a caller that renders terrain phases
+    /// WITHOUT a preceding `draw_shadow` in the same frame (no such
+    /// caller exists today) and hands back a same-shape packet at a
+    /// recycled address would ride a stale key — such a caller must
+    /// bump the stamp itself (or lead with `draw_shadow`).
+    fold_memo: Option<InstanceFoldMemo>,
+    /// The frame stamp `fold_memo` keys on (see there); bumped once
+    /// per frame by `draw_shadow`'s body.
+    frame_stamp: u64,
     /// Cascade-map resources (the `SU` uniform entry at binding 8,
     /// the receiving group(1), + the depth passes).
     shadow: ShadowCore,
@@ -769,6 +792,39 @@ pub struct TerrainRenderer {
     uploaded_atmo: Option<AtmoDesc>,
     uploaded_biome_key: Option<u64>,
     uploaded_art_key: Option<u64>,
+}
+
+/// The identity half of [`TerrainRenderer::fold_memo`]: everything
+/// about a packet's instance lists that determines the fold INPUT,
+/// short of the bytes themselves — sound only combined with the
+/// frame stamp (same frame ⇒ one immutable packet ⇒ same bytes).
+/// Raw slice addresses are carried as `usize` so the renderer stays
+/// `Send` (raw pointers would poison it).
+#[derive(Clone, Copy, Debug)]
+struct InstanceFoldMemo {
+    /// The frame the fold ran in (`TerrainRenderer::frame_stamp`).
+    stamp: u64,
+    /// `packet.terrain` slice address + length.
+    terrain: (usize, usize),
+    /// `packet.ocean` slice address + length.
+    ocean: (usize, usize),
+    /// Near-count boundaries (`min`-clamped, exactly what
+    /// `upload_instances` segments by).
+    terrain_near: u32,
+    ocean_near: u32,
+    /// The folded content key this identity produced.
+    key: u64,
+}
+
+impl InstanceFoldMemo {
+    /// Same fold INPUTS (identity only — the key rides along).
+    fn same_inputs(&self, other: &Self) -> bool {
+        self.stamp == other.stamp
+            && self.terrain == other.terrain
+            && self.ocean == other.ocean
+            && self.terrain_near == other.terrain_near
+            && self.ocean_near == other.ocean_near
+    }
 }
 
 impl TerrainRenderer {
@@ -1060,6 +1116,8 @@ impl TerrainRenderer {
             inst_ocean_far: 0,
             inst_end: 0,
             inst_key: 0,
+            fold_memo: None,
+            frame_stamp: 0,
             shadow,
             height_tex,
             lut_tex,
@@ -1381,9 +1439,12 @@ impl TerrainRenderer {
     /// re-segmented) so a mis-ordered packet can never desynchronize
     /// the byte ranges from the draw slicing. `sync_resources` runs
     /// for the shadow, far and near phases over the same packet, so
-    /// the upload itself is keyed on CONTENT (a `mix64` fold): the
-    /// first call of the frame stages the bytes, the repeats are
-    /// no-ops, and a changed selection always re-uploads.
+    /// the upload itself is keyed on CONTENT (a `mix64` fold) — and
+    /// since G3+ the FOLD is memoized per frame (`fold_memo`: the
+    /// first sync of a frame folds, the repeats reuse the key; the
+    /// concat + fold was ~3×30.5k `mix64` over ~244 KB per frame),
+    /// while a genuinely new selection (camera move) always
+    /// re-uploads.
     fn upload_instances(
         &mut self,
         device: &wgpu::Device,
@@ -1403,8 +1464,27 @@ impl TerrainRenderer {
         self.inst_bytes = (n_terrain as wgpu::BufferAddress) * sz;
         self.inst_ocean_far = self.inst_bytes + (n_ocean_near as wgpu::BufferAddress) * sz;
         self.inst_end = (n_inst as wgpu::BufferAddress) * sz;
+        // The fold memo: within THIS frame (same stamp) the same
+        // slices are the same immutable packet — reuse the key and
+        // skip the concat + fold entirely. See `fold_memo`'s doc for
+        // the stamp's invalidation contract.
+        let probe = InstanceFoldMemo {
+            stamp: self.frame_stamp,
+            terrain: (packet.terrain.as_ptr() as usize, n_terrain),
+            ocean: (packet.ocean.as_ptr() as usize, n_ocean),
+            terrain_near: n_terrain_near as u32,
+            ocean_near: n_ocean_near as u32,
+            key: 0,
+        };
+        if let Some(memo) = self.fold_memo
+            && memo.same_inputs(&probe)
+        {
+            self.inst_key = memo.key;
+            return;
+        }
         if n_inst == 0 {
             self.inst_key = 0;
+            self.fold_memo = None;
             return;
         }
         let mut inst = Vec::with_capacity(n_inst);
@@ -1425,6 +1505,7 @@ impl TerrainRenderer {
             let _ = self.instances.upload(device, queue, &inst);
             self.inst_key = key;
         }
+        self.fold_memo = Some(InstanceFoldMemo { key, ..probe });
     }
 
     /// Upload the packet's changing pieces and refresh the bind
@@ -1665,6 +1746,15 @@ impl TerrainRenderer {
     /// to the pre-cascade build). Ocean instances deliberately do
     /// not cast (water receives shadows only — the ray-march
     /// fallback's semantics).
+    ///
+    /// G3: the armed path culls per cascade — each layer draws only
+    /// the instance runs whose patch could intersect that cascade's
+    /// ortho box ([`crate::shadow::cascade_runs`]; the pre-cull build
+    /// rasterized every instance, near and far, into both 2048²
+    /// layers). The cull is conservative, so an in-range scene's map
+    /// is byte-identical to the unculled draw (pinned by device
+    /// test), and an all-culled layer leaves its map at the fully-lit
+    /// clear ([`ShadowCore::draw_terrain`]'s empty-layer contract).
     pub fn draw_shadow(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -1674,6 +1764,62 @@ impl TerrainRenderer {
         shadow: &ShadowUniforms,
         cast: Option<(wgpu::Buffer, u32)>,
     ) {
+        let runs = crate::shadow::cascade_runs(
+            shadow,
+            &packet.terrain,
+            packet.terrain_far_start,
+            &packet.uniforms.planet,
+        );
+        self.shadow_passes(
+            encoder,
+            device,
+            queue,
+            packet,
+            shadow,
+            cast,
+            [&runs[0], &runs[1]],
+        );
+    }
+
+    /// The test-only UNCULLED control — G3's byte-identity pin needs
+    /// the pre-cull behavior (one full-batch draw per layer, both
+    /// passes recorded unconditionally) from the same build: the A/B
+    /// pair `draw_shadow` vs this must produce byte-identical
+    /// cascade maps (the cull may only drop instances that project
+    /// no fragment).
+    #[cfg(test)]
+    pub(crate) fn draw_shadow_unculled(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        packet: &TerrainPacket,
+        shadow: &ShadowUniforms,
+        cast: Option<(wgpu::Buffer, u32)>,
+    ) {
+        let full = crate::shadow::InstanceRuns::from([(0u32, packet.terrain.len() as u32)]);
+        self.shadow_passes(encoder, device, queue, packet, shadow, cast, [&full, &full]);
+    }
+
+    /// `draw_shadow`'s body past the cull solve (shared with the
+    /// test-only unculled control so the A/B differs in NOTHING but
+    /// the run lists). Also the frame leader: the FIRST line bumps
+    /// `frame_stamp` regardless of the armed row or packet contents,
+    /// so the per-frame `fold_memo` in `upload_instances` sees a new
+    /// stamp exactly once per terrain frame (see its invalidation
+    /// contract).
+    #[allow(clippy::too_many_arguments)] // the encoder/device/queue plumbing triple + the phase's own packet/row/cast/runs
+    fn shadow_passes(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        packet: &TerrainPacket,
+        shadow: &ShadowUniforms,
+        cast: Option<(wgpu::Buffer, u32)>,
+        runs: [&crate::shadow::InstanceRuns; crate::shadow::CASCADE_COUNT],
+    ) {
+        self.frame_stamp = self.frame_stamp.wrapping_add(1);
         // The sky-only guard: no terrain instances ⇒ the effective row
         // is the disarm row, whatever the caller solved (see the doc —
         // the never-cleared depth array through live matrices is the
@@ -1704,7 +1850,7 @@ impl TerrainRenderer {
                 grid_i: self.grid_i.slice(..),
                 instances: self.instances.buffer.slice(0..self.inst_bytes),
                 index_count: self.grid_index_count,
-                instance_count: packet.terrain.len() as u32,
+                runs,
                 flight: cast,
             },
         );

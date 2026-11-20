@@ -167,6 +167,16 @@ pub struct FlightRenderer {
     depth: wgpu::Texture,
     depth_view: wgpu::TextureView,
     size: (u32, u32),
+    /// G3+ cast-staging memo: the `(address, len)` of the vertex
+    /// slice [`Self::stage_cascade_cast`] already uploaded THIS frame
+    /// — the visible [`Self::draw`] runs on the same immutable packet
+    /// a moment later and skips its identical ~9 MB re-staging write
+    /// when the identity matches. `draw` consumes and clears it, so
+    /// the memo never crosses a frame boundary; a `draw` whose slice
+    /// does not match (a caller violating the stage→draw pairing)
+    /// re-uploads anyway. The address rides as `usize` to keep the
+    /// renderer `Send`.
+    staged_verts: Option<(usize, usize)>,
 }
 
 impl FlightRenderer {
@@ -316,6 +326,7 @@ impl FlightRenderer {
             depth,
             depth_view,
             size,
+            staged_verts: None,
         }
     }
 
@@ -356,21 +367,34 @@ impl FlightRenderer {
     /// count `TerrainRenderer::draw_shadow` records into both cascade
     /// layers. Call BEFORE the scene pass (the cast precedes every
     /// receiver); `None` when the frame is disarmed or the stream is
-    /// empty. The visible [`Self::draw`] re-uploads the identical
-    /// bytes inside the scene pass — the same double-write the
-    /// terrain instances already accept (a staging write, never a
-    /// sync).
+    /// empty. Since G3+ the visible [`Self::draw`] does NOT re-stage
+    /// the identical bytes: this call records the uploaded slice's
+    /// `(address, len)` in `staged_verts` and `draw` skips its write
+    /// when it sees the same slice (the app and the render gate both
+    /// pair them over one immutable packet per frame).
     pub fn stage_cascade_cast(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         packet: &FlightPacket,
     ) -> Option<(wgpu::Buffer, u32)> {
+        // Invalidate any memo a previous frame left behind FIRST —
+        // this call leads every flight frame that carries terrain
+        // (the app calls it armed or not), so a stale memo can never
+        // outlive the frame that set it except through a mid-frame
+        // abort followed by a terrain-less frame (documented at the
+        // field).
+        self.staged_verts = None;
         if !packet.shadow.armed() {
             return None;
         }
         let n = self.verts.upload(device, queue, &packet.vertices);
-        (n > 0).then(|| (self.verts.buffer.clone(), n))
+        if n > 0 {
+            self.staged_verts = Some((packet.vertices.as_ptr() as usize, packet.vertices.len()));
+            Some((self.verts.buffer.clone(), n))
+        } else {
+            None
+        }
     }
 
     /// §2.3's far-field draw: the packet's [`FlightPacket::far_vertices`]
@@ -401,7 +425,10 @@ impl FlightRenderer {
         pass.draw(0..n, 0..1);
     }
 
-    /// Upload the packet and draw.
+    /// Upload the packet and draw. When [`Self::stage_cascade_cast`]
+    /// already staged this same slice this frame (the app's armed
+    /// frame shape), the identical staging write is skipped — the
+    /// memo is consumed here, so it never leaks across frames.
     pub fn draw(
         &mut self,
         pass: &mut wgpu::RenderPass<'_>,
@@ -409,7 +436,15 @@ impl FlightRenderer {
         queue: &wgpu::Queue,
         packet: &FlightPacket,
     ) {
-        let n = self.verts.upload(device, queue, &packet.vertices);
+        // Consume the memo FIRST — even the empty-stream early return
+        // below must not leave it live for a later frame.
+        let staged = self.staged_verts.take()
+            == Some((packet.vertices.as_ptr() as usize, packet.vertices.len()));
+        let n = if staged {
+            packet.vertices.len() as u32
+        } else {
+            self.verts.upload(device, queue, &packet.vertices)
+        };
         if n == 0 {
             return;
         }

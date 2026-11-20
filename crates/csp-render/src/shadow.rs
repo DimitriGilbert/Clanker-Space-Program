@@ -452,6 +452,215 @@ pub fn solve_cascades(cam: &ShadowCamera, cfg: &CascadeConfig) -> Cascades {
 }
 
 // ---------------------------------------------------------------------------
+// G3 — the CPU-side per-cascade caster cull (pure; no GPU types).
+// ---------------------------------------------------------------------------
+
+/// Kept-instance runs per cascade layer: `(first_instance, count)`
+/// pairs over the terrain instance buffer's own indexing — contiguous
+/// draws over the SAME upload, no re-staging.
+pub(crate) type InstanceRuns = Vec<(u32, u32)>;
+
+/// Cap on kept-runs per layer. Kept instances cluster in quadtree BFS
+/// order (the sub-camera face's deep tail), so real frames land in a
+/// handful of runs; the cap bounds the pathological alternation to
+/// `CULL_MAX_RUNS` draws per layer by widening (never narrowing) the
+/// last run — a capped frame degrades toward the unculled draw, never
+/// past it.
+const CULL_MAX_RUNS: usize = 32;
+/// Gap (instances) a run is widened across to swallow a lone culled
+/// instance — one extra clipped draw beats a run-boundary draw call.
+const CULL_MERGE_GAP: u32 = 8;
+
+/// The exact f32 arithmetic of the depth vertex stage's
+/// `su.vp[c] * vec4(wrel, 1.0)` (column-major `m[col][row]`, ortho —
+/// `w` is identically 1, kept for the mirror's sake). Running the CPU
+/// test through the SAME matrix bits the GPU uses is what makes the
+/// cull a bound on the real rasterization, not on a re-derivation of
+/// it.
+fn clip_xform(m: &[[f32; 4]; 4], p: [f32; 3]) -> [f32; 4] {
+    let v = [p[0], p[1], p[2], 1.0f32];
+    let mut out = [0.0f32; 4];
+    for (r, o) in out.iter_mut().enumerate() {
+        let mut acc = 0.0f32;
+        for c in 0..4 {
+            acc += m[c][r] * v[c];
+        }
+        *o = acc;
+    }
+    out
+}
+
+/// Per-axis world-metres → clip-units scales of a cascade matrix:
+/// math rows `lr·(1/half)`, `lu·(1/half)`, `lt·(1/span)` are unit
+/// vectors times their scale, so each row's f64 magnitude IS the
+/// scale. Reconstructed from the f32 matrix the GPU reads (the solve
+/// wrote exactly these rows), not from the solve's f64 internals —
+/// the cull must bound what the shipped uniforms do.
+fn clip_scales(m: &[[f32; 4]; 4]) -> [f64; 3] {
+    let row =
+        |r: usize| DVec3::new(f64::from(m[0][r]), f64::from(m[1][r]), f64::from(m[2][r])).norm();
+    [row(0), row(1), row(2)]
+}
+
+/// Conservative keep test for one caster against cascade `c`'s clip
+/// volume: the patch's every displaced vertex lies within `extent_m`
+/// of its baked centre (the [`crate::terrain::patch_extent_m`]
+/// Lipschitz bound, reconstructed from the instance row below), so
+/// keep ⇔ the centre's clip interval ± `extent·scale` meets the
+/// WebGPU clip volume `x,y ∈ [−1,1]`, `z ∈ [0,1]` on ALL THREE axes —
+/// the patch's bounding sphere intersecting the ortho box. An
+/// instance that fails this projects no fragment
+/// into the layer (all of its vertices clip on at least one axis,
+/// every triangle with it dies whole), so dropping it cannot change a
+/// single stored texel. `+1.0` m of slack covers the vertex stage's
+/// f32 rounding of `wrel` (~mm at the 90 km horizon magnitudes)
+/// beside the extent's own f32-derived inputs.
+fn cascade_keeps(m: &[[f32; 4]; 4], origin_rel_eye: [f32; 3], extent_m: f64) -> bool {
+    let clip = clip_xform(m, origin_rel_eye);
+    let [sx, sy, sz] = clip_scales(m);
+    let (x, y, z) = (f64::from(clip[0]), f64::from(clip[1]), f64::from(clip[2]));
+    let e = extent_m + 1.0;
+    x.abs() <= 1.0 + e * sx && y.abs() <= 1.0 + e * sy && (-e * sz) <= z && z <= 1.0 + e * sz
+}
+
+/// Upper bound on the distance from the EYE (the rel-eye frame's
+/// origin) to any point of a cascade's ortho box — the box's farthest
+/// corner, reconstructed from the matrix: light-space rows give the
+/// box half-extents (`1/|row|`) and centre (`−t/|row|` in x/y; the z
+/// translation sits at the box's near end), and the light basis is
+/// orthonormal so `|p|²` is the sum of squared light coordinates.
+fn cascade_box_radius(m: &[[f32; 4]; 4]) -> f64 {
+    let [sx, sy, sz] = clip_scales(m);
+    // A disarmed/zero row has no box; callers only reach here armed.
+    let (sx, sy, sz) = (sx.max(1.0e-12), sy.max(1.0e-12), sz.max(1.0e-12));
+    let half_x = 1.0 / sx;
+    let half_y = 1.0 / sy;
+    let span = 1.0 / sz;
+    let cx = -f64::from(m[3][0]) / sx;
+    let cy = -f64::from(m[3][1]) / sy;
+    // z translation = −(cz − span/2)·sz → the box's NEAR end in m.
+    let z_near = -f64::from(m[3][2]) / sz;
+    let z_far = z_near + span;
+    let z = z_near.abs().max(z_far.abs());
+    libm::sqrt((cx.abs() + half_x).powi(2) + (cy.abs() + half_y).powi(2) + z.powi(2))
+}
+
+/// The cull's reach bound for one instance row —
+/// [`crate::terrain::patch_extent_m`]'s formula reconstructed from the
+/// row the GPU actually displaces (its f32 cube spans cast up), plus
+/// the row's own skirt depth (the skirt ring drops INWARD along
+/// `dir`, which shrinks its distance from the baked centre — the §2.3
+/// doc's argument — but crediting it costs nothing and removes the
+/// need to lean on that argument here) and the defensive
+/// `max(terrain, ocean) datum` for a mis-kind'd row (ocean radius is
+/// `planet.z`; real packets never carry ocean rows in the terrain
+/// list, a defensive producer bug would).
+fn instance_extent_m(
+    inst: &crate::terrain::TerrainInstance,
+    radius_m: f64,
+    ocean_radius_m: f64,
+    amplitude_m: f64,
+) -> f64 {
+    let du = DVec3::new(
+        f64::from(inst.du[0]),
+        f64::from(inst.du[1]),
+        f64::from(inst.du[2]),
+    );
+    let dv = DVec3::new(
+        f64::from(inst.dv[0]),
+        f64::from(inst.dv[1]),
+        f64::from(inst.dv[2]),
+    );
+    let radius = radius_m.max(ocean_radius_m);
+    (du + dv).norm() * 0.5 * radius + amplitude_m + f64::from(inst.origin_rel_eye[3]).max(0.0)
+}
+
+/// Record one kept instance into the run list (widen across small
+/// gaps, cap the run count by widening further — both directions
+/// CONSERVATIVE: a widened run re-draws instances the per-instance
+/// test placed outside the box, which the GPU then clips exactly as
+/// the unculled pass did).
+fn push_keep(runs: &mut InstanceRuns, i: u32) {
+    if let Some(&mut (start, ref mut count)) = runs.last_mut()
+        && i < start + *count + CULL_MERGE_GAP
+    {
+        *count = i + 1 - start;
+    } else {
+        runs.push((i, 1));
+    }
+    while runs.len() > CULL_MAX_RUNS && runs.len() >= 2 {
+        let last = runs.len() - 1;
+        let (s1, c1) = runs[last];
+        let (s0, _) = runs[last - 1];
+        runs[last - 1].1 = s1 + c1 - s0;
+        runs.truncate(last);
+    }
+}
+
+/// Solve both cascades' kept-instance runs over the packet's terrain
+/// list (near-then-far; `far_start` the §2.3 routing boundary;
+/// `planet` the uniform row — `x` datum radius, `z` ocean datum,
+/// `w` relief amplitude, the same values the depth vertex stage
+/// displaces through). Pure, deterministic (ascending instance
+/// order), armed-`su` only — the disarmed path never records passes,
+/// so it never calls this.
+///
+/// # Far-list exclusion (why only the near list is tested at the
+/// home body)
+///
+/// Every FAR instance satisfies the §2.3 routing invariant
+/// `fwd·origin − extent ≥ FAR_SPLIT_M` (1 Mm — the rule the view's
+/// routing applies and [`crate::flight::FAR_SPLIT_M`] pins): `fwd` is
+/// unit, so EVERY point of such a patch — centre, relief, skirt —
+/// carries `fwd·p ≥ 1 Mm` and hence `|p| ≥ 1 Mm` from the eye. The
+/// cascade boxes are fitted around the chase frustum's `[near, 20 km]`
+/// slices (plus a 4 km sun pullback, a 250 m receiver pad and the
+/// ≤ √2 ladder), so both boxes sit far inside a
+/// [`cascade_box_radius`] of ~75 km ≪ 1 Mm: no far patch's bounding
+/// sphere can reach either box, and testing them would be ~1000
+/// no-op projections per frame. That bound is COMPUTED here, not
+/// assumed — a `world_scale` large enough to grow a box past the
+/// split (a gas-giant config) flips the gate and the far list joins
+/// the test, keeping the cull correct for any config while the home
+/// body pays near-list cost only.
+pub(crate) fn cascade_runs(
+    su: &ShadowUniforms,
+    terrain: &[crate::terrain::TerrainInstance],
+    far_start: u32,
+    planet: &[f32; 4],
+) -> [InstanceRuns; CASCADE_COUNT] {
+    let radius_m = f64::from(planet[0]);
+    let ocean_radius_m = f64::from(planet[2]);
+    let amplitude_m = f64::from(planet[3]);
+    let far_start = (far_start as usize).min(terrain.len());
+    let box_r = cascade_box_radius(&su.vp[0]).max(cascade_box_radius(&su.vp[1]));
+    // The gate above: far patches live ≥ FAR_SPLIT from the eye, the
+    // boxes within `box_r` — disjoint spheres can't intersect.
+    let test_len = if box_r < crate::flight::FAR_SPLIT_M {
+        far_start
+    } else {
+        terrain.len()
+    };
+    let mut out = [Vec::new(), Vec::new()];
+    for (c, runs) in out.iter_mut().enumerate() {
+        for (i, inst) in terrain[..test_len].iter().enumerate() {
+            if cascade_keeps(
+                &su.vp[c],
+                [
+                    inst.origin_rel_eye[0],
+                    inst.origin_rel_eye[1],
+                    inst.origin_rel_eye[2],
+                ],
+                instance_extent_m(inst, radius_m, ocean_radius_m, amplitude_m),
+            ) {
+                push_keep(runs, i as u32);
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // GPU side — the depth-only cascade passes.
 // ---------------------------------------------------------------------------
 
@@ -470,8 +679,11 @@ pub(crate) struct ShadowDraw<'a> {
     pub instances: wgpu::BufferSlice<'a>,
     /// Grid index count (`grid_index_count`).
     pub index_count: u32,
-    /// Terrain instance count this frame.
-    pub instance_count: u32,
+    /// G3 per-layer kept-instance runs over `instances`
+    /// ([`cascade_runs`]). An empty run list draws no terrain into
+    /// that layer — the pass still clears (see
+    /// [`ShadowCore::draw_terrain`]'s empty-layer contract).
+    pub runs: [&'a InstanceRuns; CASCADE_COUNT],
     /// 3b craft cast: the flight vertex buffer + vertex count (the
     /// stream `FlightRenderer::stage_cascade_cast` uploaded this
     /// frame). `None`/0 casts terrain only. The cast pipelines ride
@@ -510,6 +722,16 @@ pub(crate) struct ShadowCore {
     /// dead field).
     #[cfg(test)]
     cascade_tex: wgpu::Texture,
+    /// G3 empty-layer tracking: the layer currently holds the 1.0
+    /// clear and no draw has written it since — set by a recorded
+    /// (drawless) clear pass, cleared by any pass that draws. Starts
+    /// `false`: a fresh `Depth32Float` texture is UNDEFINED (zeros on
+    /// most drivers), and zeros through a live armed row are exactly
+    /// the silent craft-darkening failure the sky-only guard exists
+    /// to prevent — the first armed frame must clear. This is what
+    /// lets an all-culled layer skip its pass outright: the receivers
+    /// still read a fully-lit map, byte-identical to a fresh clear.
+    cleared: [bool; CASCADE_COUNT],
     /// The `SU` cascade uniform (terrain group(0) binding 8).
     uniforms: wgpu::Buffer,
     /// The RECEIVING bind group's layout (group(1)): depth array +
@@ -758,6 +980,7 @@ impl ShadowCore {
             flight_pipes,
             flight_bind,
             layers,
+            cleared: [false; CASCADE_COUNT],
             #[cfg(test)]
             cascade_tex,
             uniforms,
@@ -812,15 +1035,47 @@ impl ShadowCore {
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(u));
     }
 
-    /// Record both cascade depth passes — one per array layer, each
-    /// drawing the full terrain instance batch through that layer's
-    /// pipeline, then (3b) the flight vertex stream through the
+    /// Record both cascade depth passes — one per array layer,
+    /// drawing only that layer's kept-instance runs
+    /// ([`ShadowDraw::runs`], G3's per-cascade cull — the unculled
+    /// build drew the whole terrain batch into BOTH 2048² layers,
+    /// 1.11 M displaced vertex invocations to fill <20 % of the maps
+    /// at the pad), then (3b) the flight vertex stream through the
     /// craft-cast twin: hulls, debris and the launch complex land in
-    /// the same map the terrain casts into, at whole-batch cost —
-    /// one non-indexed draw per layer, exactly how the visible
-    /// flight pass renders the stream.
-    pub(crate) fn draw_terrain(&self, encoder: &mut wgpu::CommandEncoder, draw: ShadowDraw<'_>) {
+    /// the same map the terrain casts into — still one non-indexed
+    /// craft draw per layer, exactly how the visible flight pass
+    /// renders the stream (a single draw over a few hundred verts;
+    /// no cull worth its CPU cost there).
+    ///
+    /// # Empty-layer contract
+    ///
+    /// A layer with no terrain runs and no craft cast must leave its
+    /// map FULLY LIT for the receivers — i.e. at the 1.0 clear
+    /// (`LessEqual`: every biased reference `∈ [0,1]` passes against
+    /// 1.0). Skipping the pass outright would normally betray that
+    /// (the map keeps last frame's casts), so the skip is gated on
+    /// the CPU-side [`Self::cleared`] tracking: the first empty frame
+    /// records the clear pass (and marks the layer cleared), later
+    /// empty frames skip entirely — receivers read a genuinely
+    /// all-1.0 map either way, byte-identical to the unculled build's
+    /// cleared layer. The `SU` write itself happens in
+    /// `TerrainRenderer::draw_shadow` before this and is untouched:
+    /// emptiness never disarms anything.
+    pub(crate) fn draw_terrain(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        draw: ShadowDraw<'_>,
+    ) {
+        let flight = draw.flight.filter(|&(_, n)| n > 0);
+        let stride = std::mem::size_of::<crate::terrain::TerrainInstance>() as wgpu::BufferAddress;
         for (li, layer) in self.layers.iter().enumerate() {
+            let draws_terrain = draw.runs[li].iter().any(|&(_, count)| count > 0);
+            if !draws_terrain && flight.is_none() && self.cleared[li] {
+                // All-culled layer whose map already sits at the
+                // clear — no pass, no clear/store traffic, receivers
+                // still fully lit (see the empty-layer contract).
+                continue;
+            }
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("terrain-shadow"),
                 color_attachments: &[],
@@ -836,15 +1091,29 @@ impl ShadowCore {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.pipes[li]);
-            pass.set_bind_group(0, draw.bind_group, &[]);
-            pass.set_vertex_buffer(0, draw.grid_v);
-            pass.set_vertex_buffer(1, draw.instances);
-            pass.set_index_buffer(draw.grid_i, wgpu::IndexFormat::Uint16);
-            pass.draw_indexed(0..draw.index_count, 0, 0..draw.instance_count);
-            if let Some((buf, n)) = &draw.flight
-                && *n > 0
-            {
+            let mut drew = false;
+            if draws_terrain {
+                pass.set_pipeline(&self.pipes[li]);
+                pass.set_bind_group(0, draw.bind_group, &[]);
+                pass.set_vertex_buffer(0, draw.grid_v);
+                pass.set_index_buffer(draw.grid_i, wgpu::IndexFormat::Uint16);
+                for &(start, count) in draw.runs[li] {
+                    // Narrower draw over the SAME upload: the run's
+                    // slice of the shared instance buffer, instance
+                    // range starting at 0 of the slice. (A zero-count
+                    // run — only constructible by a degenerate input
+                    // — records nothing.)
+                    if count == 0 {
+                        continue;
+                    }
+                    let lo = wgpu::BufferAddress::from(start) * stride;
+                    let hi = wgpu::BufferAddress::from(start + count) * stride;
+                    pass.set_vertex_buffer(1, draw.instances.slice(lo..hi));
+                    pass.draw_indexed(0..draw.index_count, 0, 0..count);
+                }
+                drew = true;
+            }
+            if let Some((buf, n)) = &flight {
                 // Own minimal group(0) (binding 8 only — see
                 // `flight_bgl`); the vertex buffer slot rebinds to the
                 // flight stream's stride because the pipeline's
@@ -853,7 +1122,9 @@ impl ShadowCore {
                 pass.set_bind_group(0, &self.flight_bind, &[]);
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..*n, 0..1);
+                drew = true;
             }
+            self.cleared[li] = !drew;
         }
     }
 }
@@ -1139,6 +1410,375 @@ mod tests {
             "cascade 0 sharper than budgeted?"
         );
         assert!(sol.texel_m[1] > sol.texel_m[0]);
+    }
+
+    // -----------------------------------------------------------------
+    // G3 — the per-cascade cull's contract.
+    // -----------------------------------------------------------------
+
+    /// Which instance indices a run list draws.
+    fn covered(runs: &InstanceRuns, len: usize) -> Vec<bool> {
+        let mut v = vec![false; len];
+        for &(s, c) in runs {
+            for i in s..s + c {
+                v[i as usize] = true;
+            }
+        }
+        v
+    }
+
+    /// The `cam()`-relative point-caster row: zero cube spans and no
+    /// skirt make the extent bound ≈ the +1 m pad, so the cull
+    /// reduces to the point-in-box test at `origin`.
+    fn point_caster(origin: DVec3) -> crate::terrain::TerrainInstance {
+        crate::terrain::TerrainInstance {
+            origin_rel_eye: [origin.x as f32, origin.y as f32, origin.z as f32, 0.0],
+            ..crate::terrain::TerrainInstance::default()
+        }
+    }
+
+    /// The brute-force surface of a patch, in the exact f64 form of
+    /// `terrain_displace` (`origin + R·(dir − dir0) + dir·(h −
+    /// skirt)`), sampled over a dense uv grid × the height clamp
+    /// ends × skirt on/off — every GPU vertex of the patch is one of
+    /// these up to interpolation, and interpolation stays inside the
+    /// patch's extent ball.
+    fn patch_samples(
+        id: crate::terrain::PatchId,
+        eye: DVec3,
+        radius: f64,
+        amp: f64,
+    ) -> (Vec<DVec3>, DVec3, f64) {
+        use crate::terrain::{patch_cube, patch_instance};
+        let (corner, du, dv) = patch_cube(id);
+        let c0 = corner + (du + dv) * 0.5;
+        let dir0 = c0 / c0.norm();
+        let origin = dir0 * radius - eye;
+        let inst = patch_instance(id, 0.0, eye, radius);
+        let skirt = f64::from(inst.origin_rel_eye[3]);
+        let mut out = Vec::new();
+        const N: usize = 25;
+        for ji in 0..=N {
+            for ii in 0..=N {
+                let (u, v) = (ii as f64 / N as f64, ji as f64 / N as f64);
+                let cube = corner + du * u + dv * v;
+                let dir = cube / cube.norm();
+                for h in [-amp, 0.0, amp] {
+                    for sk in [0.0, skirt] {
+                        out.push(origin + radius * (dir - dir0) + dir * (h - sk));
+                    }
+                }
+            }
+        }
+        (out, origin, skirt)
+    }
+
+    /// f64 projection through the f32 matrix entries (a superset of
+    /// the GPU's f32 result — the brute-force ground truth must err
+    /// towards visibility, never away from it).
+    fn xform_f64(m: &[[f32; 4]; 4], p: DVec3) -> [f64; 4] {
+        let v = [p.x, p.y, p.z, 1.0];
+        let mut out = [0.0f64; 4];
+        for (r, o) in out.iter_mut().enumerate() {
+            let mut acc = 0.0f64;
+            for (c, vc) in v.iter().enumerate() {
+                acc += f64::from(m[c][r]) * vc;
+            }
+            *o = acc;
+        }
+        out
+    }
+
+    /// The cull's two legs against brute force, over real patch
+    /// geometry at every interesting scale (whole-face, mid, finest,
+    /// face-corner, antipodal) and both cascades of a real solve:
+    ///
+    /// 1. the extent bound actually bounds — no sampled surface
+    ///    point sits further from the baked centre than
+    ///    `instance_extent_m` (+pad) claims (the `patch_extent_m`
+    ///    Lipschitz claim + the skirt credit, pinned numerically);
+    /// 2. visibility ⇒ keep — if ANY sampled point projects into a
+    ///    cascade's clip volume, that cascade's test must keep the
+    ///    instance (the cull may never remove a visible caster).
+    ///
+    /// Plus the non-vacuity pins: the sub-camera finest patch is
+    /// kept by cascade 0, the antipodal whole face by neither.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one brute-force recipe over the patch ladder; splitting hides the A/B
+    fn cull_bound_covers_the_bruteforce_surface() {
+        use crate::terrain::{PatchId, patch_instance};
+        let radius = 600_000.0;
+        let amp = 2_400.0;
+        let eye = DVec3::new(0.0, 0.0, radius + 800.0);
+        // Looking straight down at the sub-camera point (face 4),
+        // afternoon sun — the pad frame's geometry.
+        let sol = solve_cascades(
+            &ShadowCamera {
+                sun_dir: unit(DVec3::new(0.36, -0.24, 0.80)),
+                forward: DVec3::new(0.0, 0.0, -1.0),
+                up: DVec3::Y,
+                fov_y: 0.9,
+                aspect: 16.0 / 9.0,
+                near_m: 0.1,
+            },
+            &CascadeConfig::default(),
+        );
+        let ids = [
+            PatchId {
+                face: 4,
+                level: 0,
+                x: 0,
+                y: 0,
+            },
+            PatchId {
+                face: 4,
+                level: 4,
+                x: 8,
+                y: 8,
+            },
+            PatchId {
+                face: 4,
+                level: 9,
+                x: 256,
+                y: 256,
+            },
+            PatchId {
+                face: 4,
+                level: 13,
+                x: 4096,
+                y: 4096,
+            },
+            PatchId {
+                face: 4,
+                level: 13,
+                x: 0,
+                y: 0,
+            },
+            PatchId {
+                face: 4,
+                level: 6,
+                x: 63,
+                y: 0,
+            },
+            PatchId {
+                face: 0,
+                level: 5,
+                x: 16,
+                y: 16,
+            },
+            // The true far side (face 5 is the eye's antipode here):
+            // a LEVEL-4 patch, because a whole-face patch's extent
+            // (~half a circumference) legitimately wraps the boxes —
+            // conservative keep, not a bug (the pin below wants a
+            // caster that must drop, and fine far patches do).
+            PatchId {
+                face: 5,
+                level: 4,
+                x: 8,
+                y: 8,
+            },
+        ];
+        let mut any_visible = false;
+        for id in ids {
+            let (samples, origin, _skirt) = patch_samples(id, eye, radius, amp);
+            let inst = patch_instance(id, 0.0, eye, radius);
+            let centre = DVec3::new(
+                f64::from(inst.origin_rel_eye[0]),
+                f64::from(inst.origin_rel_eye[1]),
+                f64::from(inst.origin_rel_eye[2]),
+            );
+            let extent = instance_extent_m(&inst, radius, 0.0, amp);
+            // Leg 1: the bound bounds (against the f64 origin — the
+            // f32 row's own rounding is what the +1 m pad covers).
+            let reach = samples
+                .iter()
+                .map(|p| (*p - origin).norm())
+                .fold(0.0f64, f64::max);
+            assert!(
+                reach <= extent + 1.0,
+                "patch {id:?}: surface reach {reach} m exceeds the extent bound {extent} m"
+            );
+            // Leg 2: visibility ⇒ keep, per cascade.
+            for c in 0..CASCADE_COUNT {
+                let visible = samples.iter().any(|p| {
+                    let v = xform_f64(&sol.uniforms.vp[c], *p);
+                    v[0].abs() <= 1.0 && v[1].abs() <= 1.0 && (0.0..=1.0).contains(&v[2])
+                });
+                let keeps = cascade_keeps(
+                    &sol.uniforms.vp[c],
+                    [
+                        inst.origin_rel_eye[0],
+                        inst.origin_rel_eye[1],
+                        inst.origin_rel_eye[2],
+                    ],
+                    extent,
+                );
+                assert!(
+                    !visible || keeps,
+                    "cascade {c} culled a visible caster: patch {id:?} at {centre:?}"
+                );
+                any_visible |= visible;
+            }
+            let _ = centre;
+        }
+        assert!(any_visible, "fixture must contain visible casters");
+        // Non-vacuity: the sub-camera finest patch casts into
+        // cascade 0 (the ground under the craft), the far-side level-4
+        // patch casts into nothing.
+        let sub = patch_instance(ids[3], 0.0, eye, radius);
+        assert!(cascade_keeps(
+            &sol.uniforms.vp[0],
+            [
+                sub.origin_rel_eye[0],
+                sub.origin_rel_eye[1],
+                sub.origin_rel_eye[2],
+            ],
+            instance_extent_m(&sub, radius, 0.0, amp),
+        ));
+        let anti = patch_instance(ids[7], 0.0, eye, radius);
+        for c in 0..CASCADE_COUNT {
+            assert!(!cascade_keeps(
+                &sol.uniforms.vp[c],
+                [
+                    anti.origin_rel_eye[0],
+                    anti.origin_rel_eye[1],
+                    anti.origin_rel_eye[2],
+                ],
+                instance_extent_m(&anti, radius, 0.0, amp),
+            ));
+        }
+    }
+
+    /// The run lists: per-layer membership follows the box (the
+    /// differential pin — 1 km on-axis is cascade 0's, 15 km only
+    /// cascade 1's, both beyond `coverage_bands_split_correctly`),
+    /// out-of-box casters drop, and the merge/cap machinery stays
+    /// conservative (every kept instance covered, runs bounded).
+    /// Interesting casters are spaced past `CULL_MERGE_GAP` so
+    /// `covered` reads exact membership (a widened run reads as
+    /// coverage of its swallowed filler — pinned by the merge arm
+    /// below).
+    #[test]
+    fn runs_follow_the_boxes_and_stay_conservative() {
+        let sol = solve_cascades(&cam(), &CascadeConfig::default());
+        let f = unit(cam().forward);
+        let lateral = unit(DVec3::new(0.0, 0.0, 1.0)); // camera up, ⊥ forward
+        let filler = || point_caster(lateral * 500_000.0);
+        // Indices 0/10/20/30: in-0, neither, in-1-only, in-0.
+        let mut rows = Vec::new();
+        for i in 0..40usize {
+            rows.push(match i {
+                0 => point_caster(f * 1_000.0),
+                10 => point_caster(lateral * 500_000.0),
+                20 => point_caster(f * 15_000.0),
+                30 => point_caster(f * 1_100.0),
+                _ => filler(),
+            });
+        }
+        let runs = cascade_runs(&sol.uniforms, &rows, 40, &[600_000.0, 0.0, 0.0, 0.0]);
+        let cov0 = covered(&runs[0], rows.len());
+        let cov1 = covered(&runs[1], rows.len());
+        for (name, cov) in [("cascade 0", &cov0), ("cascade 1", &cov1)] {
+            assert!(!cov[10], "{name}: the off-axis caster must drop");
+            assert!(cov[0] && cov[30], "{name}: the 1 km casters must stay");
+        }
+        assert!(!cov0[20], "cascade 0: 15 km is past its split");
+        assert!(cov1[20], "cascade 1: 15 km is its band");
+        // Merge: alternating keep/cull with gaps under
+        // CULL_MERGE_GAP folds into one run that covers every keep.
+        let alt: Vec<_> = (0..40u32)
+            .map(|i| {
+                if i % 2 == 0 {
+                    point_caster(f * 1_000.0)
+                } else {
+                    point_caster(lateral * 500_000.0)
+                }
+            })
+            .collect();
+        let runs = cascade_runs(&sol.uniforms, &alt, 40, &[600_000.0, 0.0, 0.0, 0.0]);
+        assert_eq!(runs[0].len(), 1, "alternating keeps merge into one run");
+        assert!(covered(&runs[0], 40).iter().step_by(2).all(|b| *b));
+        // Cap: keeps spaced past the merge gap still land in ≤
+        // CULL_MAX_RUNS runs with every keep covered (the widened
+        // tail swallows extras, never drops them).
+        let sparse: Vec<_> = (0..400u32)
+            .map(|i| {
+                if i % 10 == 0 {
+                    point_caster(f * (1_000.0 + 0.1 * f64::from(i)))
+                } else {
+                    point_caster(lateral * 500_000.0)
+                }
+            })
+            .collect();
+        let runs = cascade_runs(&sol.uniforms, &sparse, 400, &[600_000.0, 0.0, 0.0, 0.0]);
+        assert!(runs[0].len() <= CULL_MAX_RUNS);
+        let cov = covered(&runs[0], 400);
+        for (i, b) in cov.iter().enumerate() {
+            if i % 10 == 0 {
+                assert!(b, "capped run list dropped a keep at {i}");
+            }
+        }
+    }
+
+    /// The far-list exclusion gate is COMPUTED, not assumed: at the
+    /// home body both boxes sit far inside the 1 Mm split (so the far
+    /// list never needs testing — see `cascade_runs`'s proof), while
+    /// a gas-giant `world_scale` grows the box past the split and
+    /// the far list joins the test. The differential pin: a caster
+    /// parked at the GIANT box's own centre (constructed from the
+    /// reconstructed light basis — inside that box by construction,
+    /// ≥ the split along the camera forward so it legitimately routes
+    /// far) is invisible to the default solve's runs and kept by the
+    /// giant solve's.
+    #[test]
+    fn far_list_gate_follows_the_computed_box_radius() {
+        let f = unit(cam().forward);
+        let scale = 100.0f64;
+        let giant = solve_cascades(
+            &cam(),
+            &CascadeConfig {
+                world_scale: scale,
+                ..CascadeConfig::default()
+            },
+        );
+        // The giant box centre in world (rel-eye) coordinates:
+        // rows `lr·sx` give the orthonormal light basis back.
+        let centre_of = |m: &[[f32; 4]; 4]| -> DVec3 {
+            let row =
+                |r: usize| DVec3::new(f64::from(m[0][r]), f64::from(m[1][r]), f64::from(m[2][r]));
+            let (r0, r1, r2) = (row(0), row(1), row(2));
+            let (sx, sy, sz) = (r0.norm(), r1.norm(), r2.norm());
+            let cx = -f64::from(m[3][0]) / sx;
+            let cy = -f64::from(m[3][1]) / sy;
+            let z_mid = -f64::from(m[3][2]) / sz + 0.5 / sz;
+            r0 / sx * cx + r1 / sy * cy + r2 / sz * z_mid
+        };
+        let p = centre_of(&giant.uniforms.vp[1]);
+        assert!(
+            p.norm() > crate::flight::FAR_SPLIT_M,
+            "fixture: the giant box centre must sit beyond the split (|p| {})",
+            p.norm()
+        );
+        assert!(
+            f.dot(p) - 1.0 >= crate::flight::FAR_SPLIT_M,
+            "fixture: the caster must legitimately route far"
+        );
+        let rows = [point_caster(f * 1_000.0), point_caster(p)];
+        // Default solve: box radius ≪ split → far list untested, and
+        // the near keep is the only covered instance.
+        let home = solve_cascades(&cam(), &CascadeConfig::default());
+        assert!(cascade_box_radius(&home.uniforms.vp[1]) < crate::flight::FAR_SPLIT_M);
+        let runs = cascade_runs(&home.uniforms, &rows, 1, &[600_000.0, 0.0, 0.0, 0.0]);
+        assert_eq!(covered(&runs[1], 2), vec![true, false]);
+        // Giant solve: box radius ≥ split → the far list joins, and
+        // the far caster (at the box's own centre) is kept.
+        assert!(cascade_box_radius(&giant.uniforms.vp[1]) >= crate::flight::FAR_SPLIT_M);
+        let runs = cascade_runs(&giant.uniforms, &rows, 1, &[600_000.0, 0.0, 0.0, 0.0]);
+        assert_eq!(
+            covered(&runs[1], 2),
+            vec![true, true],
+            "a box past the split must test (and here keep) the far caster"
+        );
     }
 
     /// A surfaceless adapter + device (LowPower prefers lavapipe —
@@ -1489,6 +2129,580 @@ mod tests {
             "the craft cast landed nothing in the cascade map \
              (covered {covered} texels — the silent-discard regression)"
         );
+    }
+
+    /// A pad-like flight frame for the G3 device tests: real LOD walk
+    /// (level 9) around the sub-camera point at 800 m altitude, the
+    /// §2.3 near/far routing applied, and the matching armed solve.
+    /// Returns the packet + `SU` + the camera forward (the routing
+    /// rule's axis).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pad_frame() -> (crate::terrain::TerrainPacket, ShadowUniforms, DVec3) {
+        use crate::terrain::{LodConfig, TerrainUniforms, patch_instance, select_patches};
+        use csp_core::terrain::HeightField;
+        let field = std::sync::Arc::new(HeightField::bake(601, 64, 32));
+        let radius = 600_000.0;
+        let amp = 2_400.0;
+        let eye = DVec3::new(0.0, 0.0, radius + 800.0);
+        let fwd = DVec3::new(0.0, 0.0, -1.0);
+        let lod = LodConfig {
+            max_level: 9,
+            split_factor: 4.0,
+            max_patches: 384,
+        };
+        let mut near_l = Vec::new();
+        let mut far_l = Vec::new();
+        for id in select_patches(eye, radius, amp, &lod) {
+            let inst = patch_instance(id, 0.0, eye, radius);
+            let o = inst.origin_rel_eye;
+            let fwd_d = f64::from(o[0]) * fwd.x + f64::from(o[1]) * fwd.y + f64::from(o[2]) * fwd.z;
+            // The §2.3 routing rule (the far-field site's expression,
+            // relief included this time).
+            if fwd_d - crate::terrain::patch_extent_m(id, radius, amp) >= crate::flight::FAR_SPLIT_M
+            {
+                far_l.push(inst);
+            } else {
+                near_l.push(inst);
+            }
+        }
+        let terrain_far_start = near_l.len() as u32;
+        let mut terrain = near_l;
+        terrain.extend(far_l);
+        let sun = unit(DVec3::new(0.36, -0.24, 0.80));
+        let packet = crate::terrain::TerrainPacket {
+            uniforms: TerrainUniforms {
+                eye_rel_body: [eye.x as f32, eye.y as f32, eye.z as f32, 0.0],
+                sun_dir: [sun.x as f32, sun.y as f32, sun.z as f32, 0.0],
+                planet: [radius as f32, 0.0, 0.0, amp as f32],
+                ..TerrainUniforms::default()
+            },
+            heightfield: Some(field),
+            terrain,
+            terrain_far_start,
+            sky: false,
+            ..crate::terrain::TerrainPacket::default()
+        };
+        let su = solve_cascades(
+            &ShadowCamera {
+                sun_dir: sun,
+                forward: fwd,
+                up: DVec3::Y,
+                fov_y: 0.9,
+                aspect: 16.0 / 9.0,
+                near_m: 0.1,
+            },
+            &CascadeConfig::default(),
+        )
+        .uniforms;
+        (packet, su, fwd)
+    }
+
+    /// Full-layer cascade-map readback (layer `z`, every texel's
+    /// bytes) — the G3 tests' evidence channel.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_cascade_layer(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        renderer: &crate::terrain::TerrainRenderer,
+        layer: u32,
+    ) -> Vec<u8> {
+        let row_bytes = (SHADOW_MAP_RES * 4) as u64;
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("g3-cascade-readback"),
+            size: row_bytes * u64::from(SHADOW_MAP_RES),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("g3-cascade-readback"),
+        });
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: renderer.cascade_texture(),
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: layer,
+                },
+                aspect: wgpu::TextureAspect::DepthOnly,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row_bytes as u32),
+                    rows_per_image: Some(SHADOW_MAP_RES),
+                },
+            },
+            wgpu::Extent3d {
+                width: SHADOW_MAP_RES,
+                height: SHADOW_MAP_RES,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([enc.finish()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        buf.map_async(wgpu::MapMode::Read, .., move |r| {
+            let _ = tx.send(r);
+        });
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv().unwrap().expect("g3 readback map failed");
+        let data = buf.get_mapped_range(..).unwrap().to_vec();
+        buf.unmap();
+        data
+    }
+
+    /// G3's correctness pin: the per-cascade cull must be invisible
+    /// in the maps. A culled `draw_shadow` and the unculled control
+    /// (`draw_shadow_unculled` — the pre-G3 whole-batch draw) render
+    /// the same packet through the same solve on two fresh renderers;
+    /// BOTH cascade layers must read back byte-identical. The cull is
+    /// allowed to drop only instances that project no fragment, so
+    /// any byte diff is a removed visible caster (or a routing
+    /// regression). The fixture first proves the cull actually culls
+    /// here (coverage < instances), so the pin is not vacuous.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn per_cascade_cull_matches_the_unculled_maps_bit_for_bit() {
+        use crate::terrain::TerrainRenderer;
+        let Some((device, queue, errored)) = headless_device() else {
+            assert!(
+                !shadow_gate_required(),
+                "shadow device test: CSP_SHADOW_GATE_REQUIRED is set but no headless \
+                 GPU adapter exists"
+            );
+            eprintln!("shadow device test: SKIP — no headless GPU adapter");
+            return;
+        };
+        let (packet, su, _fwd) = pad_frame();
+        assert!(su.armed());
+        // Non-vacuity: both layers drop a solid share of the batch.
+        let runs = cascade_runs(
+            &su,
+            &packet.terrain,
+            packet.terrain_far_start,
+            &packet.uniforms.planet,
+        );
+        for (c, r) in runs.iter().enumerate() {
+            let kept: u32 = r.iter().map(|&(_, n)| n).sum();
+            eprintln!(
+                "g3 byte-identity fixture: cascade {c} keeps {kept}/{} instances \
+                 in {} runs",
+                packet.terrain.len(),
+                r.len()
+            );
+            assert!(
+                kept < packet.terrain.len() as u32,
+                "cascade {c} culled nothing — the byte-identity pin is vacuous"
+            );
+        }
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let render = |unculled: bool| -> Vec<Vec<u8>> {
+            let mut renderer = TerrainRenderer::new(&device, format);
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("g3-ab"),
+            });
+            if unculled {
+                renderer.draw_shadow_unculled(&mut enc, &device, &queue, &packet, &su, None);
+            } else {
+                renderer.draw_shadow(&mut enc, &device, &queue, &packet, &su, None);
+            }
+            queue.submit([enc.finish()]);
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            (0..CASCADE_COUNT)
+                .map(|l| read_cascade_layer(&device, &queue, &renderer, l as u32))
+                .collect()
+        };
+        let culled = render(false);
+        let unculled = render(true);
+        assert!(
+            !errored.load(std::sync::atomic::Ordering::Relaxed),
+            "the G3 A/B frames produced wgpu validation errors"
+        );
+        for (c, (a, b)) in culled.iter().zip(unculled.iter()).enumerate() {
+            assert_eq!(
+                a, b,
+                "cascade {c}: the cull changed the map — a visible caster was removed"
+            );
+        }
+    }
+
+    /// G3's empty-layer contract on device: an armed row whose every
+    /// terrain instance culls out (lateral far-field patches —
+    /// near-routed by §2.3, far outside both boxes) must leave BOTH
+    /// layers at the fully-lit clear. Lit-by-clear is the compare
+    /// path's own semantics: every receiver's biased reference is
+    /// clamped into `[0,1]` and `LessEqual` passes `ref ≤ 1.0`
+    /// everywhere, so an all-1.0 map shades every receiver sunlit.
+    /// Both the clear pass (first frame) and the tracked skip
+    /// (second frame — no pass at all) must read back exactly 1.0 in
+    /// every texel; the packet stays armed throughout, pinning that
+    /// emptiness never disarms.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn all_culled_layers_stay_armed_and_fully_lit() {
+        use crate::terrain::{PatchId, TerrainRenderer, patch_instance};
+        let Some((device, queue, errored)) = headless_device() else {
+            assert!(
+                !shadow_gate_required(),
+                "shadow device test: CSP_SHADOW_GATE_REQUIRED is set but no headless \
+                 GPU adapter exists"
+            );
+            eprintln!("shadow device test: SKIP — no headless GPU adapter");
+            return;
+        };
+        let (mut packet, su, _fwd) = pad_frame();
+        // Three level-4 patches on face 2 (+Y): the horizon ring at
+        // ~850 km, near-routed (forward depth ~0), all-culled.
+        let eye = DVec3::new(0.0, 0.0, 600_800.0);
+        packet.terrain = vec![
+            patch_instance(
+                PatchId {
+                    face: 2,
+                    level: 4,
+                    x: 8,
+                    y: 8,
+                },
+                0.0,
+                eye,
+                600_000.0,
+            ),
+            patch_instance(
+                PatchId {
+                    face: 2,
+                    level: 4,
+                    x: 9,
+                    y: 8,
+                },
+                0.0,
+                eye,
+                600_000.0,
+            ),
+            patch_instance(
+                PatchId {
+                    face: 3,
+                    level: 4,
+                    x: 8,
+                    y: 7,
+                },
+                0.0,
+                eye,
+                600_000.0,
+            ),
+        ];
+        packet.terrain_far_start = 0;
+        let runs = cascade_runs(&su, &packet.terrain, 0, &packet.uniforms.planet);
+        for (c, r) in runs.iter().enumerate() {
+            assert!(
+                r.is_empty(),
+                "fixture: cascade {c} keeps lateral far-field patches?"
+            );
+        }
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut renderer = TerrainRenderer::new(&device, format);
+        for frame in 0..2 {
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("g3-empty"),
+            });
+            renderer.draw_shadow(&mut enc, &device, &queue, &packet, &su, None);
+            queue.submit([enc.finish()]);
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            for l in 0..CASCADE_COUNT {
+                let data = read_cascade_layer(&device, &queue, &renderer, l as u32);
+                let lit = data
+                    .chunks_exact(4)
+                    .all(|t| f32::from_le_bytes([t[0], t[1], t[2], t[3]]) == 1.0);
+                assert!(
+                    lit,
+                    "frame {frame} layer {l}: an all-culled pass left non-clear texels"
+                );
+            }
+        }
+        assert!(
+            !errored.load(std::sync::atomic::Ordering::Relaxed),
+            "the all-culled frames produced wgpu validation errors"
+        );
+    }
+
+    /// G3+ upload-memo contract on device, over the full app frame
+    /// recipe (stage cast → `draw_shadow` → far pass → near pass →
+    /// ocean — `draw_shadow` leads, so the frame stamp bumps and
+    /// syncs 2/3 ride the fold memo, and `draw` rides the staged-
+    /// verts memo):
+    ///
+    /// 1. steady state — the SAME packet on consecutive frames must
+    ///    dump byte-identical color (the memos changed nothing);
+    /// 2. refresh — mutating the packet's instance and vertex Vecs
+    ///    IN PLACE (same allocations: the exact input shape a stale
+    ///    memo would swallow) must reach the screen and the cascade
+    ///    map on the very next frame;
+    /// 3. steady state again on the mutated content.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(clippy::too_many_lines)] // one full frame recipe; splitting fragments the phase order it pins
+    fn upload_memos_preserve_dumps_and_refresh_content() {
+        use crate::terrain::TerrainRenderer;
+        let Some((device, queue, errored)) = headless_device() else {
+            assert!(
+                !shadow_gate_required(),
+                "shadow device test: CSP_SHADOW_GATE_REQUIRED is set but no headless \
+                 GPU adapter exists"
+            );
+            eprintln!("shadow device test: SKIP — no headless GPU adapter");
+            return;
+        };
+        let (mut packet, su, _fwd) = pad_frame();
+        // A real near-pass projection for the color dump (the
+        // far-field device test's straight-down camera — matches
+        // `pad_frame`'s solve). Reverse-Z rows, column-major cast.
+        let eye = DVec3::new(0.0, 0.0, 600_800.0);
+        let (right, upv, z_out) = (DVec3::X, DVec3::Y, DVec3::Z);
+        let view = [
+            [right.x, right.y, right.z, 0.0],
+            [upv.x, upv.y, upv.z, 0.0],
+            [z_out.x, z_out.y, z_out.z, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let f = 1.0 / (0.9f64 * 0.5).tan();
+        let proj = [
+            [f / (16.0 / 9.0), 0.0, 0.0, 0.0],
+            [0.0, f, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.1],
+            [0.0, 0.0, -1.0, 0.0],
+        ];
+        let mut near_vp = [[0.0f64; 4]; 4];
+        for r in 0..4 {
+            for c in 0..4 {
+                near_vp[r][c] = proj[r][0] * view[0][c]
+                    + proj[r][1] * view[1][c]
+                    + proj[r][2] * view[2][c]
+                    + proj[r][3] * view[3][c];
+            }
+        }
+        let wgsl_m = |m: &[[f64; 4]; 4]| {
+            let mut o = [[0.0f32; 4]; 4];
+            for r in 0..4 {
+                for c in 0..4 {
+                    o[c][r] = m[r][c] as f32;
+                }
+            }
+            o
+        };
+        packet.uniforms.view_proj = wgsl_m(&near_vp);
+        packet.uniforms_far.view_proj = wgsl_m(&near_vp);
+        packet.sky = true;
+        // The craft stream: a big lit triangle over the camera's
+        // ground point (its color change must move pixels), plus the
+        // unlit degenerate fillers.
+        let mut fp = crate::flight::FlightPacket {
+            shadow: su,
+            ..crate::flight::FlightPacket::default()
+        };
+        let lit = |color: [f32; 4], w: [f32; 3]| crate::flight::FlightVertex {
+            pos: [0.0, 0.0, 0.5],
+            world: w,
+            nrm: [0.0, 0.0, 1.0],
+            color,
+            mat: [0.2, 32.0, 1.0],
+        };
+        fp.vertices = vec![
+            lit([0.8, 0.8, 0.8, 1.0], [-20.0, -20.0, -300.0]),
+            lit([0.8, 0.8, 0.8, 1.0], [20.0, -20.0, -300.0]),
+            lit([0.8, 0.8, 0.8, 1.0], [0.0, 20.0, -300.0]),
+            crate::flight::FlightVertex {
+                pos: [0.0, 0.0, 0.5],
+                world: [0.0; 3],
+                nrm: [0.0; 3],
+                color: [0.1, 0.1, 0.2, 1.0],
+                mat: [0.0; 3],
+            },
+        ];
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let size = 64u32;
+        let mut terrain = TerrainRenderer::new(&device, format);
+        let mut flight =
+            crate::flight::FlightRenderer::new(&device, format, (size, size), &terrain);
+        let attachment = |usage, sample_count, fmt| {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("g3-memo-target"),
+                size: wgpu::Extent3d {
+                    width: size,
+                    height: size,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count,
+                dimension: wgpu::TextureDimension::D2,
+                format: fmt,
+                usage,
+                view_formats: &[],
+            });
+            tex.create_view(&wgpu::TextureViewDescriptor::default())
+        };
+        // One full app frame → the resolved color dump.
+        let shade = |terrain: &mut TerrainRenderer,
+                     flight: &mut crate::flight::FlightRenderer,
+                     tp: &crate::terrain::TerrainPacket,
+                     fpacket: &crate::flight::FlightPacket|
+         -> Vec<u8> {
+            let msaa = attachment(
+                wgpu::TextureUsages::RENDER_ATTACHMENT,
+                crate::MSAA_SAMPLES,
+                format,
+            );
+            let resolve = attachment(
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                1,
+                format,
+            );
+            let depth = attachment(
+                wgpu::TextureUsages::RENDER_ATTACHMENT,
+                crate::MSAA_SAMPLES,
+                wgpu::TextureFormat::Depth32Float,
+            );
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("g3-memo"),
+            });
+            let cast = flight.stage_cascade_cast(&device, &queue, fpacket);
+            terrain.draw_shadow(&mut enc, &device, &queue, tp, &fpacket.shadow, cast);
+            {
+                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("g3-memo-far"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &msaa,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &depth,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(0.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                terrain.draw_far(&mut pass, &device, &queue, tp);
+                flight.draw_far(&mut pass, &device, &queue, fpacket);
+            }
+            {
+                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("g3-memo-near"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &msaa,
+                        resolve_target: Some(&resolve),
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &depth,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(0.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                terrain.draw(&mut pass, &device, &queue, tp);
+                flight.draw(&mut pass, &device, &queue, fpacket);
+                terrain.draw_ocean(&mut pass, tp);
+            }
+            let row_bytes = (size * 4) as u64;
+            let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("g3-memo-readback"),
+                size: row_bytes * u64::from(size),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            enc.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: resolve.texture(),
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buf,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(row_bytes as u32),
+                        rows_per_image: Some(size),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: size,
+                    height: size,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit([enc.finish()]);
+            let (tx, rx) = std::sync::mpsc::channel();
+            buf.map_async(wgpu::MapMode::Read, .., move |r| {
+                let _ = tx.send(r);
+            });
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            rx.recv().unwrap().expect("g3 memo readback map failed");
+            let data = buf.get_mapped_range(..).unwrap().to_vec();
+            buf.unmap();
+            data
+        };
+        // 1. Steady state: same packet, two frames — memos ride.
+        let a = shade(&mut terrain, &mut flight, &packet, &fp);
+        let map_a = read_cascade_layer(&device, &queue, &terrain, 0);
+        let b = shade(&mut terrain, &mut flight, &packet, &fp);
+        assert_eq!(a, b, "the memo path changed the frame dump");
+        // 2. Refresh: mutate BOTH Vecs in place — the exact recycled
+        // allocation a stale memo would swallow.
+        let nearest = packet
+            .terrain
+            .iter()
+            .enumerate()
+            .min_by(|(_, x), (_, y)| {
+                let d = |v: [f32; 4]| {
+                    f64::from(v[0]) * f64::from(v[0])
+                        + f64::from(v[1]) * f64::from(v[1])
+                        + f64::from(v[2]) * f64::from(v[2])
+                };
+                d(x.origin_rel_eye).total_cmp(&d(y.origin_rel_eye))
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        packet.terrain[nearest].origin_rel_eye[0] += 400.0;
+        for v in fp.vertices.iter_mut().take(3) {
+            v.color = [0.1, 0.9, 0.1, 1.0];
+        }
+        let c = shade(&mut terrain, &mut flight, &packet, &fp);
+        let map_c = read_cascade_layer(&device, &queue, &terrain, 0);
+        assert_ne!(
+            a, c,
+            "an in-place packet mutation failed to reach the frame dump"
+        );
+        assert_ne!(
+            map_a, map_c,
+            "an in-place instance mutation failed to reach the cascade map"
+        );
+        // 3. Steady state on the mutated content.
+        let d = shade(&mut terrain, &mut flight, &packet, &fp);
+        assert_eq!(c, d, "the memo path changed the mutated frame dump");
+        assert!(
+            !errored.load(std::sync::atomic::Ordering::Relaxed),
+            "the memo frames produced wgpu validation errors"
+        );
+        let _ = eye;
     }
 
     /// The sky-only guard (M5 §5.2-R2 arrival polish): an ARMED row
