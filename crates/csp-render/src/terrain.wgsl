@@ -317,6 +317,21 @@ fn view_inscatter(pa: vec3<f32>, pb: vec3<f32>, ray: vec3<f32>, dist: f32, px: v
     let mu_sun = dot(ray, u.sun_dir.xyz);
     let phase = (3.0 / (16.0 * PI)) * (1.0 + mu_sun * mu_sun);
     let phase_m = mie_phase(mu_sun);
+    // Shader-diet inscatter early-out — every march term is bounded:
+    // density exp(−alt/H) ≤ 1 over the segment, transmittance products
+    // ≤ 1 per channel, so the whole integral is ≤ β·phase·dist (the
+    // Rayleigh gain 4.2 / Mie gain 1.6 included). When even that bound
+    // sits under ~3% of the linear scale the skip engages — near-ground
+    // short view segments. The bound is worst-case; the actual
+    // contribution there sits far below it (the diet A/B renders were
+    // byte-identical), and a tiered 8–12 step march of LUT loads buys
+    // nothing. The bound uses the per-pixel phases, so the skip tracks
+    // the actual forward-scatter geometry instead of a worst-case
+    // constant.
+    let bound = u.rayleigh.rgb * (phase * 4.2) + MIE_BETA * (phase_m * 1.6);
+    if (max(bound.r, max(bound.g, bound.b)) * dist < 3.0e-2) {
+        return vec3<f32>(0.0, 0.0, 0.0);
+    }
     let alt_a = max(length(pa) - R, 0.0);
     let mua = dot(ray, pa / max(length(pa), 1.0));
     var acc = vec3<f32>(0.0);
@@ -327,14 +342,43 @@ fn view_inscatter(pa: vec3<f32>, pb: vec3<f32>, ray: vec3<f32>, dist: f32, px: v
     // the per-pixel errors partially cancel (~√N quieter) while still
     // decorrelating the lattice — a single phase for all taps removed
     // the bands but left ±8% pixel grain in the smooth day sky.
-    let steps = 12.0;
+    //
+    // Diet: `trans_between`'s EYE endpoint (alt_a, mua) is pixel
+    // constant, so its LUT row is hoisted out of the march — one
+    // trans() call saved per tap (and one bilinear-kink noise source
+    // with it). Same ratio, same clamps, identical values.
+    let eye_desc = mua < 0.0;
+    let t_end = trans(alt_a, select(mua, -mua, eye_desc));
+    // Tiered taps (diet): the density falloff spans ~5.6 km scale
+    // heights, so any segment this short resolves with 8 taps at
+    // ≪1 tap per scale height of error; only genuinely long view
+    // segments (40 km+ — orbital terrain, far ocean) keep the 12 the
+    // shell banding fix landed. Boundary is a distance contour where
+    // both tiers are well-resolved — no seam (mid/horizon frames are
+    // the judge).
+    let steps = select(8.0, 12.0, dist > 4.0e4);
     let ds = dist / steps;
     for (var i = 0.0; i < steps; i = i + 1.0) {
         let jit = screen_hash(px + vec2<f32>(i * 17.13, i * 29.71));
         let p = pa + ray * ((i + 0.05 + jit * 0.9) * ds);
         let alt_i = max(length(p) - R, 0.0);
         let up = p / max(length(p), 1.0);
-        let t_ei = trans_between(alt_a, alt_i, mua, dot(ray, up));
+        let m_i = dot(ray, up);
+        // Hoisted trans_between: T(eye→tap) via the same LUT ratio
+        // (descending rays take the up-going continuation form). A
+        // real branch, not select(): select evaluates both operands,
+        // and the whole point is skipping the second LUT read. The
+        // condition is pixel-constant and trans() is textureLoad-only
+        // (no derivative/uniformity requirement), so the branch is
+        // free and legal.
+        var t_ei: vec3<f32>;
+        if (eye_desc) {
+            t_ei = clamp(trans(alt_i, -m_i) / max(t_end, vec3<f32>(1.0e-4)),
+                         vec3<f32>(0.0), vec3<f32>(1.0));
+        } else {
+            t_ei = clamp(t_end / max(trans(alt_i, m_i), vec3<f32>(1.0e-4)),
+                         vec3<f32>(0.0), vec3<f32>(1.0));
+        }
         let t_is = trans(alt_i, dot(u.sun_dir.xyz, up));
         acc = acc + u.rayleigh.rgb * phase * exp(-alt_i / H) * t_ei * t_is * ds;
         acc_m = acc_m + MIE_BETA * phase_m * exp(-alt_i / Hm) * t_ei * t_is * ds;
@@ -505,9 +549,13 @@ fn bump_fix(dir_fix: vec3<f32>, n: vec3<f32>, b: Basis, dist: f32) -> vec3<f32> 
     // ~2 km / ~400 m features — visible from low orbit.
     let f_far = clamp(1.0 - dist / 2.4e5, 0.0, 1.0);
     g = g + ngrad(dir_fix, b.e, b.n, 2800.0) * (90.0 * 2800.0 / R * f_far);
-    // ~65 m hillocks — fade out by ~60 km altitude.
+    // ~65 m hillocks — fade out by ~60 km altitude. Diet: evaluated
+    // only where the fade survives (weight 0 beyond the fade is a
+    // distance contour at zero contribution).
     let f_mid = clamp(1.0 - dist / 6.0e4, 0.0, 1.0);
-    g = g + ngrad(dir_fix, b.e, b.n, 9200.0) * (30.0 * 9200.0 / R * f_mid);
+    if (f_mid > 0.001) {
+        g = g + ngrad(dir_fix, b.e, b.n, 9200.0) * (30.0 * 9200.0 / R * f_mid);
+    }
     return normalize(n - b.e * g.x - b.n * g.y);
 }
 
@@ -810,6 +858,26 @@ fn tile_uv(dd: vec2<f32>, pb: vec2<f32>, k: f32, plane: i32, layer: i32) -> vec2
     return tile_xfm(raw - fl, tile_bits(vec2<i32>(fl), plane, layer));
 }
 
+// Per-plane triplanar fade (shader-diet lever A): `gate` is a
+// distance-raised weight floor set by `fs_terrain` — planes whose
+// |n|⁴ weight sits below it fade out SMOOTHLY (smoothstep, so no
+// isoline at any weight value) instead of being fetched and blended
+// at near-zero weight. Every dropped fetch is a full filtered sample
+// of a pattern the blend multiplied by ≤ gate anyway. The callers
+// renormalize by the kept-weight sum, which keeps the blend mean-exact
+// by construction: all three planes sample the SAME per-class texture
+// (one layer, three planar UVs), so each plane's tile average equals
+// the class mean regardless of projection — redistributing weight
+// cannot shift average brightness, only which plane's pattern carries
+// the modulation (≤ gate of it). Near the camera the gate floor
+// (0.02) drops only planes weighted ≲2% — an imperceptible ≤2% pattern
+// swap; beyond the fade ramp (1.6→3.2 km) it rises to 0.25, where the
+// |n|⁴ gating leaves typically ONE plane above the cut on the far
+// slopes a down-looking camera sees.
+fn plane_wfade(w: f32, gate: f32) -> f32 {
+    return smoothstep(gate * 0.5, gate, w);
+}
+
 // Per-class tile edge length (m) — grass is fine-grained, rock coarse.
 fn class_tile(layer: i32) -> f32 {
     if (layer == 0) { return 9.0; }   // grass
@@ -829,32 +897,47 @@ fn class_tile(layer: i32) -> f32 {
 // at the old 0.05 floor the dark layers divided by ~5× their own
 // mean, so the pattern's bright veins hit the downstream detail clamp
 // as isolated white streaks while the rest of the layer went mud-dark.
-fn class_albedo(tp: TriPlanes, layer: i32, scale: f32) -> vec3<f32> {
+fn class_albedo(tp: TriPlanes, layer: i32, scale: f32, gate: f32) -> vec3<f32> {
     let k = u.planet.x / (class_tile(layer) * scale);
     var acc = vec3<f32>(0.0);
+    var wsum = 0.0;
     for (var i = 0; i < 3; i = i + 1) {
-        acc = acc + textureSample(alb_arr, samp,
-                                  tile_uv(tp.dd[i], tp.pb[i], k, i, layer), layer).rgb
-                  * tp.w[i];
+        let wi = tp.w[i] * plane_wfade(tp.w[i], gate);
+        if (wi > 0.0) {
+            acc = acc + textureSample(alb_arr, samp,
+                                      tile_uv(tp.dd[i], tp.pb[i], k, i, layer), layer).rgb
+                      * wi;
+            wsum = wsum + wi;
+        }
     }
     let mean = u.class_means[layer].rgb;
-    return acc / max(mean, vec3<f32>(0.008, 0.008, 0.008));
+    // Renormalize by the kept-weight sum (see plane_wfade): the blend
+    // stays mean-exact, the dropped planes' ≤gate pattern share folds
+    // into the kept ones.
+    return acc / max(wsum, 1.0e-3) / max(mean, vec3<f32>(0.008, 0.008, 0.008));
 }
 
 // Matching normal-map sample for `layer` — tangent-space xy slope.
 // Samples through the SAME tile_uv as `class_albedo` (identical
 // plane/layer/k ⇒ identical per-tile transform), so the normal grain
-// never contradicts the albedo pattern it belongs to.
-fn class_normal(tp: TriPlanes, layer: i32, scale: f32) -> vec2<f32> {
+// never contradicts the albedo pattern it belongs to. The plane gate
+// and renormalization are applied identically (same faded weights) so
+// albedo and normal stay in lockstep.
+fn class_normal(tp: TriPlanes, layer: i32, scale: f32, gate: f32) -> vec2<f32> {
     let k = u.planet.x / (class_tile(layer) * scale);
     var acc = vec2<f32>(0.0);
+    var wsum = 0.0;
     for (var i = 0; i < 3; i = i + 1) {
-        acc = acc + (textureSample(nrm_arr, samp,
-                                   tile_uv(tp.dd[i], tp.pb[i], k, i, layer), layer).xy
-                     * 2.0 - 1.0)
-                  * tp.w[i];
+        let wi = tp.w[i] * plane_wfade(tp.w[i], gate);
+        if (wi > 0.0) {
+            acc = acc + (textureSample(nrm_arr, samp,
+                                       tile_uv(tp.dd[i], tp.pb[i], k, i, layer), layer).xy
+                         * 2.0 - 1.0)
+                      * wi;
+            wsum = wsum + wi;
+        }
     }
-    return acc;
+    return acc / max(wsum, 1.0e-3);
 }
 
 // Surface-class weights (grass, rock, sand, snow) from height/slope/
@@ -948,6 +1031,12 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
     // Detail fades out long before orbit distances — a planet seen from
     // 300 km shouldn't shimmer with 100 m noise.
     let det_fade = clamp(1.0 - dist / 2.4e5, 0.0, 1.0);
+    // Triplanar plane-gate (lever A): near the camera only planes
+    // weighted ≲2% are dropped (imperceptible), past the 1.6→3.2 km
+    // ramp the |n|⁴ weights leave typically one dominant plane. The
+    // fade is smooth in the weights, so no seam exists at any
+    // distance; see plane_wfade.
+    let plane_gate = 0.02 + 0.23 * smoothstep(1.6e3, 3.2e3, dist);
 
     var col: vec3<f32>;
     var alpha = 1.0;
@@ -970,9 +1059,14 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
         let wf_near = clamp(1.0 - dist / 2.0e4, 0.0, 1.0);
         var wg = ngrad(dir_fix, basis.e, basis.n, 1200.0) * (4.5 * 1200.0 / u.planet.x)
                + ngrad(dir_fix, basis.e, basis.n, 6400.0) * (1.8 * 6400.0 / u.planet.x);
-        wg = wg * (0.4 + 0.6 * det_fade)
-           + ngrad(dir_fix, basis.e, basis.n, 14000.0) * (0.9 * 14000.0 / u.planet.x)
-             * wf_near;
+        wg = wg * (0.4 + 0.6 * det_fade);
+        // The ~40 m chop dies at 20 km — evaluate it only where it
+        // survives (diet; the gate is a distance contour at a term
+        // whose weight there is 0).
+        if (wf_near > 0.001) {
+            wg = wg + ngrad(dir_fix, basis.e, basis.n, 14000.0)
+                   * (0.9 * 14000.0 / u.planet.x) * wf_near;
+        }
         if (u.art.x > 0.5) {
             // Real wave normal map (Foam 002, ambientCG CC0) at two
             // scrolled scales — chop + swell — over the noise swell.
@@ -984,12 +1078,18 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
             let k1 = u.planet.x / 37.0;
             let k2 = u.planet.x / 11.0;
             var w12 = vec2<f32>(0.0);
+            var w12_sum = 0.0;
             for (var pi = 0; pi < 3; pi = pi + 1) {
-                w12 = w12 + (textureSample(water_nrm, samp,
-                        tex_uv(tpw.dd[pi], tpw.pb[pi], k1)
-                        + vec2<f32>(t * 0.011, t * 0.007)).xy * 2.0 - 1.0)
-                      * tpw.w[pi];
+                let wi = tpw.w[pi] * plane_wfade(tpw.w[pi], plane_gate);
+                if (wi > 0.0) {
+                    w12 = w12 + (textureSample(water_nrm, samp,
+                            tex_uv(tpw.dd[pi], tpw.pb[pi], k1)
+                            + vec2<f32>(t * 0.011, t * 0.007)).xy * 2.0 - 1.0)
+                          * wi;
+                    w12_sum = w12_sum + wi;
+                }
             }
+            w12 = w12 / max(w12_sum, 1.0e-3);
             var di = 0;
             if (tpw.w[1] > tpw.w[di]) { di = 1; }
             if (tpw.w[2] > tpw.w[di]) { di = 2; }
@@ -1097,15 +1197,15 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
             for (var l = 0; l < 4; l = l + 1) {
                 let w = wts[l];
                 if (w > 0.02) {
-                    var det_l = class_albedo(tp, l, 1.0);
+                    var det_l = class_albedo(tp, l, 1.0, plane_gate);
                     if (mid_fade > 0.001) {
                         det_l = det_l * mix(vec3<f32>(1.0),
-                                            class_albedo(tp, l, 0.47),
+                                            class_albedo(tp, l, 0.47, plane_gate),
                                             0.60 * mid_fade);
                     }
                     if (near_fade > 0.001) {
                         det_l = det_l * mix(vec3<f32>(1.0),
-                                            class_albedo(tp, l, 8.5),
+                                            class_albedo(tp, l, 8.5, plane_gate),
                                             0.80 * near_fade);
                     }
                     detail = detail + det_l * w;
@@ -1126,15 +1226,24 @@ fn fs_terrain(i: Vt) -> @location(0) vec4<f32> {
             // with range. The finest scale is filtered texture detail
             // (mip/aniso absorb sub-texel jitter), NOT hash noise —
             // the STABILITY cap does not apply to it.
-            var ntex = class_normal(tp, dom_layer, 1.0) * (0.35 + 0.65 * det_fade);
+            var ntex = class_normal(tp, dom_layer, 1.0, plane_gate) * (0.35 + 0.65 * det_fade);
             if (near_fade > 0.001) {
-                ntex = ntex + class_normal(tp, dom_layer, 8.5) * (0.85 * near_fade)
-                            + class_normal(tp, dom_layer, 24.0) * (0.55 * near_fade * near_fade);
+                ntex = ntex + class_normal(tp, dom_layer, 8.5, plane_gate) * (0.85 * near_fade)
+                            + class_normal(tp, dom_layer, 24.0, plane_gate)
+                                * (0.55 * near_fade * near_fade);
             }
             n_fix = normalize(n_fix - basis.e * ntex.x * 0.62 - basis.n * ntex.y * 0.62);
         }
         let n = rot_axis(u.spin.xyz, u.spin.w, n_fix);
-        alb = alb * (1.0 + (0.09 * mottle + 0.10 * vnoise3w(dir_fix, 16000.0) * f_near));
+        // The finest grain octave dies with f_near (0 beyond 15 km) —
+        // evaluate it only where it survives (diet: the octave is 8
+        // lattice hashes; the sub-JND 0.001-floor boundary is a
+        // distance contour, never a seam).
+        var grain = 0.0;
+        if (f_near > 0.001) {
+            grain = vnoise3w(dir_fix, 16000.0) * f_near;
+        }
+        alb = alb * (1.0 + (0.09 * mottle + 0.10 * grain));
         // Sun dimmed by the atmosphere at the fragment's altitude.
         var sun_lum = vec3<f32>(1.0, 0.98, 0.92);
         if (has_atmo) {
@@ -1380,18 +1489,32 @@ fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
     }
     var col = vec3<f32>(0.0);
     if (t1 > t0) {
-        // 32 jittered steps — the jitter is PER-STEP: every tap draws
-        // its own offset, so the per-pixel misestimates partially
-        // cancel (~√N quieter than one phase for the whole lattice)
-        // while the decorrelation still breaks the banding a fixed
-        // lattice leaves in the thin shell.
-        let steps = 32.0;
-        let ds = (t1 - t0) / steps;
+        // Tiered tap count (shader-diet lever G2): the integrand's
+        // mass spans ~2.5 scale heights of ray (~140 km at grazing
+        // geometry) — a chord shorter than the tier bound resolves it
+        // with 12 taps below visibility, and only genuinely long grazing
+        // chords keep the full 32. Both tiers keep the PER-STEP
+        // jitter (uniform 12–16 taps spread over the LONG chords were
+        // rejected by eye during the diet sweep as clear grain over
+        // the smooth day gradient, but short chords integrate the
+        // mass with ~6+ taps per scale height, where the same
+        // estimator's error is far below visibility). Same estimator,
+        // same decorrelation, no new banding mode; the tier boundary
+        // is a smooth chord-length contour where the 12-tap error is
+        // itself sub-JND — the horizon frame is the judge. Like the
+        // terrain inscatter march, the eye endpoint's LUT row is
+        // hoisted out of the loop (one trans() per tap saved, same
+        // ratio, same clamps).
+        let span = t1 - t0;
+        let steps = select(12.0, 32.0, span > 1.5e5);
+        let ds = span / steps;
         let H = max(u.atmo.x, 1.0);
         let Hm = max(H * 0.30, 1.0); // aerosols hug the low shell
         let mu_sun = dot(rd, sun);
         let phase = (3.0 / (16.0 * PI)) * (1.0 + mu_sun * mu_sun);
         let phase_m = mie_phase(mu_sun);
+        let eye_desc = mu_eye < 0.0;
+        let t_end = trans(alt_a, select(mu_eye, -mu_eye, eye_desc));
         var acc = vec3<f32>(0.0);
         var acc_m = vec3<f32>(0.0);
         for (var s = 0.0; s < steps; s = s + 1.0) {
@@ -1400,7 +1523,15 @@ fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
             let pr = length(p);
             let alt_i = max(pr - R, 0.0);
             let up = p / pr;
-            let t_ei = trans_between(alt_a, alt_i, mu_eye, dot(rd, up));
+            let m_i = dot(rd, up);
+            var t_ei: vec3<f32>;
+            if (eye_desc) {
+                t_ei = clamp(trans(alt_i, -m_i) / max(t_end, vec3<f32>(1.0e-4)),
+                             vec3<f32>(0.0), vec3<f32>(1.0));
+            } else {
+                t_ei = clamp(t_end / max(trans(alt_i, m_i), vec3<f32>(1.0e-4)),
+                             vec3<f32>(0.0), vec3<f32>(1.0));
+            }
             let t_is = trans(alt_i, dot(sun, up));
             acc = acc + u.rayleigh.rgb * phase * exp(-alt_i / H) * t_ei * t_is * ds;
             acc_m = acc_m + MIE_BETA * phase_m * exp(-alt_i / Hm) * t_ei * t_is * ds;
