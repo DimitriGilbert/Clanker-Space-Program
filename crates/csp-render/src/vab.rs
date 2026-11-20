@@ -157,17 +157,26 @@ pub struct VabRenderer {
     pick: PickTargets,
     /// Single-pixel readback target (`MAP_READ | COPY_DST`).
     read_buf: wgpu::Buffer,
-    /// Surface size the offscreen targets were built at.
+    /// Surface (swapchain) size the PICK targets were built at — the
+    /// click coordinates and the pick rasterization are both native
+    /// resolution (P1: render scale shrinks only the visible scene).
     size: (u32, u32),
+    /// Scene size the DEPTH target was built at — the scaled MSAA
+    /// attachment the main pass binds (must match its color size).
+    scene_size: (u32, u32),
 }
 
 impl VabRenderer {
-    /// Build both pipelines and the offscreen targets for `size`.
+    /// Build both pipelines and the offscreen targets. `surface_size`
+    /// sizes the pick pass (native click coordinates); `scene_size`
+    /// sizes the main-pass depth (the render-scaled scene — P1; pass
+    /// the same pair for a full-resolution build).
     #[allow(clippy::too_many_lines)] // two pipelines + targets is one init block
     pub fn new(
         device: &wgpu::Device,
         surface_format: wgpu::TextureFormat,
-        size: (u32, u32),
+        surface_size: (u32, u32),
+        scene_size: (u32, u32),
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("vab"),
@@ -298,7 +307,7 @@ impl VabRenderer {
         );
         let depth = render_target(
             device,
-            size,
+            scene_size,
             wgpu::TextureFormat::Depth32Float,
             crate::MSAA_SAMPLES,
             "vab-depth",
@@ -341,24 +350,42 @@ impl VabRenderer {
             ),
             depth,
             depth_view,
-            pick: pick_targets(device, size),
+            pick: pick_targets(device, surface_size),
             read_buf: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("vab-pick-read"),
                 size: 4,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
-            size: (size.0.max(1), size.1.max(1)),
+            size: (surface_size.0.max(1), surface_size.1.max(1)),
+            scene_size: (scene_size.0.max(1), scene_size.1.max(1)),
         }
     }
 
-    /// Recreate the surface-sized targets after a resize.
-    pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+    /// Recreate the offscreen targets after a resize. `width`/
+    /// `height` are the SURFACE (swapchain) size the pick pass
+    /// rasterizes at (native click coordinates); `scene_w`/`scene_h`
+    /// the render-scaled scene size the main-pass depth must match
+    /// (P1) — the app passes the same pair for both when the scene
+    /// renders full resolution.
+    pub fn resize(
+        &mut self,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        scene_w: u32,
+        scene_h: u32,
+    ) {
         let size = (width.max(1), height.max(1));
+        let scene = (scene_w.max(1), scene_h.max(1));
         if size != self.size {
+            self.pick = pick_targets(device, size);
+            self.size = size;
+        }
+        if scene != self.scene_size {
             self.depth = render_target(
                 device,
-                size,
+                scene,
                 wgpu::TextureFormat::Depth32Float,
                 crate::MSAA_SAMPLES,
                 "vab-depth",
@@ -366,8 +393,7 @@ impl VabRenderer {
             self.depth_view = self
                 .depth
                 .create_view(&wgpu::TextureViewDescriptor::default());
-            self.pick = pick_targets(device, size);
-            self.size = size;
+            self.scene_size = scene;
         }
     }
 

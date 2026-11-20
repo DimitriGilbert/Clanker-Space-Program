@@ -693,6 +693,10 @@ fn build_ui(
                     // wait — the chip shows a one-line "generating
                     // surface" row while the terrain pass is sky-only.
                     terrain_pending: flight_ui.terrain_pending,
+                    // P1: the app's smoothed frame timing — fps + ms
+                    // over its ~10-frame window; 0.0 hides the row.
+                    fps: flight_ui.fps,
+                    frame_ms: flight_ui.frame_ms,
                     propellant: &flight_ui.propellant,
                     stages_left: flight_ui.stages_left,
                     stages_total: flight_ui.stages_total,
@@ -2907,6 +2911,17 @@ impl View {
         m.warp_requested = warp_requested;
         m.warp_effective = warp_effective;
         m.fatal = fatal;
+    }
+
+    /// P1's FPS readout plumbing: the app's smoothed wall-clock frame
+    /// timing (measured at §2.5's one legal Instant site, averaged
+    /// over its ~10-frame window) written into the flight HUD's mirror
+    /// for `UiBuild` to stage. Presentation data only — never read by
+    /// the sim, never part of any hash.
+    pub fn set_frame_timing(&mut self, fps: f64, frame_ms: f64) {
+        let mut r = self.world.resource_mut::<flight::FlightUiData>();
+        r.fps = fps;
+        r.frame_ms = frame_ms;
     }
 
     /// Update only the §2.13 halt mirror — for the frame a `Fatal` is

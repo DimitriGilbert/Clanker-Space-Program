@@ -1841,7 +1841,7 @@ fn vab_pick_pass_emits_no_pick_zero_geometry() {
     let Some((device, queue)) = gate_device("vab_pick_pass_emits_no_pick_zero_geometry") else {
         return;
     };
-    let mut vab = csp_render::vab::VabRenderer::new(&device, FORMAT, (W, H));
+    let mut vab = csp_render::vab::VabRenderer::new(&device, FORMAT, (W, H), (W, H));
     let v = |x: f32, y: f32, z: f32, pick: u32| csp_render::vab::VabVertex {
         pos: [x, y, z],
         world: [0.0; 3],

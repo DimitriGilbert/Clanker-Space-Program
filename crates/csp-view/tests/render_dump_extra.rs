@@ -425,7 +425,7 @@ fn dump_vab() {
     let msaa_tex = msaa_target(&device, "vab-dump-msaa");
     let msaa = msaa_tex.create_view(&wgpu::TextureViewDescriptor::default());
     let target = tex.create_view(&wgpu::TextureViewDescriptor::default());
-    let mut vab = csp_render::vab::VabRenderer::new(&device, FORMAT, (W, H));
+    let mut vab = csp_render::vab::VabRenderer::new(&device, FORMAT, (W, H), (W, H));
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("vab-dump"),
     });

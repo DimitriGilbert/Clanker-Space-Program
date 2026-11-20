@@ -92,6 +92,21 @@ pub struct GraphicsSettings {
     /// an absent one. Kept in the file schema for forward-compat (old
     /// files carry it; new ones default it).
     pub quality: GraphicsQuality,
+    /// Vertical sync (P1) — `Auto` is today's `PresentMode::AutoVsync`
+    /// (fps capped to the display refresh); `Off` switches the surface
+    /// to `PresentMode::AutoNoVsync` so the frame loop runs as fast as
+    /// the GPU allows (input latency + the FPS readout disambiguate a
+    /// CPU- from a GPU-bound session). `csp-app` maps this onto wgpu's
+    /// present modes — this crate names the choice, never the API.
+    pub vsync: VsyncMode,
+    /// The scene's internal render scale (P1) in
+    /// [`RENDER_SCALE_MIN`]..=[`RENDER_SCALE_MAX`]: the MSAA scene
+    /// targets render at `surface_size × scale` and the resolved image
+    /// is upscaled to the swapchain — the egui UI always composites at
+    /// native resolution (crisp text). `1.0` renders full resolution
+    /// through the exact pre-P1 resolve path (byte-identical frame
+    /// content); lower values trade scene sharpness for fill rate.
+    pub render_scale: f32,
     /// The egui zoom factor — the whole UI scales by it (1.0 = native).
     /// Clamped into [`UI_SCALE_MIN`]..=[`UI_SCALE_MAX`] when applied.
     pub ui_scale: f32,
@@ -107,10 +122,22 @@ pub const UI_SCALE_MIN: f32 = 0.5;
 /// The upper bound [`GraphicsSettings::ui_scale`] applies at.
 pub const UI_SCALE_MAX: f32 = 2.0;
 
+/// The lower bound [`GraphicsSettings::render_scale`] applies at —
+/// under 0.5 the upscale reads as mush before the fps gain matters.
+pub const RENDER_SCALE_MIN: f32 = 0.5;
+/// The upper bound [`GraphicsSettings::render_scale`] applies at — 1.0
+/// is full resolution (and the pre-P1 resolve path verbatim).
+pub const RENDER_SCALE_MAX: f32 = 1.0;
+/// The panel slider's step (and the app's snap) for
+/// [`GraphicsSettings::render_scale`].
+pub const RENDER_SCALE_STEP: f32 = 0.05;
+
 impl Default for GraphicsSettings {
     fn default() -> Self {
         Self {
             quality: GraphicsQuality::default(),
+            vsync: VsyncMode::default(),
+            render_scale: 1.0,
             ui_scale: 1.0,
             window_size: [1280, 720],
         }
@@ -128,6 +155,22 @@ pub enum GraphicsQuality {
     Medium,
     /// The full tier.
     High,
+}
+
+/// Vertical sync choice (P1's player-facing presentation control).
+/// Serialized kebab-case (`auto`/`off`); `csp-app` translates to the
+/// wgpu present mode at surface (re)configuration.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VsyncMode {
+    /// Vsync on (`PresentMode::AutoVsync`) — the historical default.
+    #[default]
+    Auto,
+    /// Vsync off (`PresentMode::AutoNoVsync`) — uncapped frame rate
+    /// where the platform's compositor honors it; the way to tell a
+    /// CPU-limited session (fps climbs) from a GPU-limited one (it
+    /// doesn't).
+    Off,
 }
 
 /// New-game difficulty flags — written into the world at save creation:
@@ -797,24 +840,7 @@ pub fn settings_panel(
                 });
             egui::CollapsingHeader::new("Graphics")
                 .default_open(true)
-                .show(ui, |ui| {
-                    // No `quality` row: the field has zero consumers
-                    // (P14-F1) — an interactive control that steers
-                    // nothing is a lie. It stays in the settings model
-                    // for file forward-compat only.
-                    ui.add(
-                        egui::Slider::new(
-                            &mut state.settings.graphics.ui_scale,
-                            UI_SCALE_MIN..=UI_SCALE_MAX,
-                        )
-                        .text("ui scale"),
-                    );
-                    ui.label(format!(
-                        "window: {}×{} px (restored at launch)",
-                        state.settings.graphics.window_size[0],
-                        state.settings.graphics.window_size[1],
-                    ));
-                });
+                .show(ui, |ui| graphics_section(ui, state));
             egui::CollapsingHeader::new("Gameplay")
                 .default_open(true)
                 .show(ui, |ui| {
@@ -872,6 +898,49 @@ pub fn settings_panel(
     rect
 }
 
+/// The Graphics section's rows — extracted from `settings_panel`'s
+/// body (P1 grew it past the complexity budget): vsync, render scale,
+/// ui scale, and the read-only window size. Every row's behavior note
+/// is the row's own documentation — the two P1 controls explain
+/// exactly when they take effect.
+fn graphics_section(ui: &mut egui::Ui, state: &mut SettingsPanelState) {
+    // No `quality` row: the field has zero consumers (P14-F1) — an
+    // interactive control that steers nothing is a lie. It stays in
+    // the settings model for file forward-compat only.
+    let mut vs = state.settings.graphics.vsync == VsyncMode::Auto;
+    ui.checkbox(&mut vs, "vertical sync");
+    state.settings.graphics.vsync = if vs { VsyncMode::Auto } else { VsyncMode::Off };
+    ui.label(
+        "off uncaps the frame rate at the next frame — where the compositor \
+         honors it (Wayland/macOS always composite), fps only climbs if the \
+         CPU was the limit",
+    );
+    ui.add(
+        egui::Slider::new(
+            &mut state.settings.graphics.render_scale,
+            RENDER_SCALE_MIN..=RENDER_SCALE_MAX,
+        )
+        .step_by(f64::from(RENDER_SCALE_STEP))
+        .text("render scale"),
+    );
+    ui.label(
+        "scene renders at scale × window and upscales (UI stays sharp); \
+         applies at the next frame — 1.0 is full resolution, lower trades \
+         sharpness for fill rate",
+    );
+    ui.add(
+        egui::Slider::new(
+            &mut state.settings.graphics.ui_scale,
+            UI_SCALE_MIN..=UI_SCALE_MAX,
+        )
+        .text("ui scale"),
+    );
+    ui.label(format!(
+        "window: {}×{} px (restored at launch)",
+        state.settings.graphics.window_size[0], state.settings.graphics.window_size[1],
+    ));
+}
+
 /// The keymap section's grid — one row per [`KeyAction`]: label, current
 /// bindings, and the rebind/clear affordance (or the "press a key" hint
 /// while a capture is armed). Bindings print through
@@ -918,6 +987,8 @@ mod tests {
         let mut s = Settings::default();
         s.audio.master_volume = 0.35;
         s.graphics.quality = GraphicsQuality::Low;
+        s.graphics.vsync = VsyncMode::Off;
+        s.graphics.render_scale = 0.75;
         s.graphics.ui_scale = 1.25;
         s.graphics.window_size = [1600, 900];
         s.difficulty.life_support_enabled = true;
@@ -928,6 +999,33 @@ mod tests {
         let text = ron::ser::to_string_pretty(&s, ron::ser::PrettyConfig::default()).unwrap();
         let back: Settings = ron::from_str(&text).unwrap();
         assert_eq!(back, s);
+        // P1's presentation fields serialize under their own kebab-case
+        // names — a hand-edited file spells them the same way.
+        assert!(
+            text.contains("vsync"),
+            "vsync missing from the round trip:\n{text}"
+        );
+        assert!(
+            text.contains("render_scale"),
+            "render_scale missing from the round trip:\n{text}"
+        );
+    }
+
+    /// P1's presentation fields default the way the pre-P1 build
+    /// behaved: vsync auto, full-resolution scene. An old settings
+    /// file (written before the fields existed) loads with exactly
+    /// those values — render-scale 1.0 keeps the frame path
+    /// byte-identical for upgrading users.
+    #[test]
+    fn pre_p1_file_defaults_to_vsync_auto_full_scale() {
+        let text = r#"(
+            graphics: (quality: high, ui_scale: 1.0, window_size: (1024, 768)),
+        )"#;
+        let s: Settings = ron::from_str(text).unwrap();
+        assert_eq!(s.graphics.vsync, VsyncMode::Auto);
+        assert_eq!(s.graphics.render_scale, 1.0);
+        assert_eq!(Settings::default().graphics.vsync, VsyncMode::Auto);
+        assert_eq!(Settings::default().graphics.render_scale, 1.0);
     }
 
     /// §7.8's forward-compat rule: a file with extra keys and a newer

@@ -777,6 +777,13 @@ pub struct TerrainRenderer {
     /// The frame stamp `fold_memo` keys on (see there); bumped once
     /// per frame by `draw_shadow`'s body.
     frame_stamp: u64,
+    /// Test-only observable: how many times `draw_shadow` actually ran
+    /// the [`crate::shadow::cascade_runs`] solve (the invalidation
+    /// test's counter — `FlightGeomCache`'s `smooth_bakes` precedent).
+    /// Stays 0 across disarmed/empty-terrain frames: those never read
+    /// run lists, so the solve is skipped for them.
+    #[cfg(test)]
+    cull_solves: u32,
     /// Cascade-map resources (the `SU` uniform entry at binding 8,
     /// the receiving group(1), + the depth passes).
     shadow: ShadowCore,
@@ -1118,6 +1125,8 @@ impl TerrainRenderer {
             inst_key: 0,
             fold_memo: None,
             frame_stamp: 0,
+            #[cfg(test)]
+            cull_solves: 0,
             shadow,
             height_tex,
             lut_tex,
@@ -1743,7 +1752,9 @@ impl TerrainRenderer {
     /// write this is a no-op unless the (effective) row is armed AND
     /// the packet carries terrain instances (the zeroed `SU` keeps
     /// `fs_terrain` on the `sun_occlusion` ray-march, bit-identical
-    /// to the pre-cascade build). Ocean instances deliberately do
+    /// to the pre-cascade build) — and the G3 cull solve itself is
+    /// gated on the same predicate, so a disarmed frame pays neither
+    /// the passes nor the projections. Ocean instances deliberately do
     /// not cast (water receives shadows only — the ray-march
     /// fallback's semantics).
     ///
@@ -1764,12 +1775,29 @@ impl TerrainRenderer {
         shadow: &ShadowUniforms,
         cast: Option<(wgpu::Buffer, u32)>,
     ) {
-        let runs = crate::shadow::cascade_runs(
-            shadow,
-            &packet.terrain,
-            packet.terrain_far_start,
-            &packet.uniforms.planet,
-        );
+        // P1: solve only when the passes will read the runs. The
+        // effective row is exactly `shadow_passes`' rule below (an
+        // unarmed row, or the implicit disarm an empty terrain list
+        // forces) — computing it here skips the 2×N keep-projections
+        // that night/sky-only frames with live terrain otherwise pay
+        // for run lists nothing draws from. The disarmed path hands
+        // empty runs (`shadow_passes` returns before touching them)
+        // and still bumps the stamp + writes the uniform row.
+        let armed = shadow.armed() && !packet.terrain.is_empty();
+        let runs = if armed {
+            #[cfg(test)]
+            {
+                self.cull_solves = self.cull_solves.wrapping_add(1);
+            }
+            crate::shadow::cascade_runs(
+                shadow,
+                &packet.terrain,
+                packet.terrain_far_start,
+                &packet.uniforms.planet,
+            )
+        } else {
+            [Vec::new(), Vec::new()]
+        };
         self.shadow_passes(
             encoder,
             device,
@@ -2244,6 +2272,132 @@ mod tests {
                 "{label}: the far row's disc differs from the near-row control in {diffs} px"
             );
         }
+    }
+
+    /// P1's disarmed-row gate: `draw_shadow` must pay the G3 cull
+    /// solve ONLY on frames whose (effective) row is armed and whose
+    /// packet carries live terrain — a night frame or the sky-only
+    /// heightfield bake previously burned 2×N keep-projections for
+    /// run lists the passes never read. `cull_solves` is the
+    /// observable. The stamp + uniform-write half must keep running on
+    /// every call (the frame-leader contract): a skipped disarm write
+    /// is the stale-armed-buffer failure the every-call write exists
+    /// to prevent. Skips without an adapter (CSP_RENDER_GATE_REQUIRED
+    /// makes the skip a failure — the render gate's contract).
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(clippy::too_many_lines)] // one device-frame recipe (adapter + packet + three arms); splitting hides the gate
+    fn disarmed_row_skips_the_cull_solve() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let Ok(adapter) =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: None,
+                ..wgpu::RequestAdapterOptions::default()
+            }))
+        else {
+            assert!(
+                !std::env::var("CSP_RENDER_GATE_REQUIRED").is_ok_and(|v| !v.is_empty() && v != "0"),
+                "disarmed-row device test: CSP_RENDER_GATE_REQUIRED is set but no headless \
+                 GPU adapter exists"
+            );
+            eprintln!("disarmed-row device test: SKIP — no headless GPU adapter");
+            return;
+        };
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("disarmed-row-test"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            ..wgpu::DeviceDescriptor::default()
+        }))
+        .unwrap();
+        // A packet with LIVE terrain instances + a heightfield (the
+        // armed arm's full path: solve → sync → cascade passes).
+        let radius = 600_000.0;
+        let eye = DVec3::new(0.0, 0.0, radius + 800_000.0);
+        let lod = LodConfig {
+            max_level: 8,
+            split_factor: 2.0,
+            max_patches: 512,
+        };
+        let field = HeightField::bake_profiled(7, csp_core::terrain::ReliefProfile::Legacy);
+        let terrain: Vec<TerrainInstance> = select_patches(eye, radius, 0.0, &lod)
+            .iter()
+            .map(|&id| patch_instance(id, 0.0, eye, radius))
+            .collect();
+        assert!(!terrain.is_empty(), "the packet must carry live terrain");
+        let packet = TerrainPacket {
+            uniforms: TerrainUniforms {
+                planet: [radius as f32, 0.0, 0.0, 1.0],
+                ..TerrainUniforms::default()
+            },
+            heightfield: Some(std::sync::Arc::new(field)),
+            terrain,
+            terrain_far_start: 0,
+            sky: false,
+            ..TerrainPacket::default()
+        };
+        let sun = DVec3::new(0.3, 0.2, 0.9);
+        let armed = crate::shadow::solve_cascades(
+            &crate::shadow::ShadowCamera {
+                sun_dir: sun / sun.norm(),
+                forward: DVec3::new(0.0, 0.0, -1.0),
+                up: DVec3::new(0.0, 1.0, 0.0),
+                fov_y: 1.2,
+                aspect: 1.6,
+                near_m: 0.1,
+            },
+            &crate::shadow::CascadeConfig::default(),
+        )
+        .uniforms;
+        assert!(armed.armed(), "the rig's solve must produce an armed row");
+        let mut renderer = TerrainRenderer::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("disarmed-row-test"),
+        });
+        let stamp_before = renderer.frame_stamp;
+        // (1) Disarmed row, live terrain — the night frame: no solve.
+        renderer.draw_shadow(
+            &mut encoder,
+            &device,
+            &queue,
+            &packet,
+            &ShadowUniforms::default(),
+            None,
+        );
+        assert_eq!(
+            renderer.cull_solves, 0,
+            "a disarmed row must not run the cull solve"
+        );
+        assert!(
+            renderer.frame_stamp.wrapping_sub(stamp_before) >= 1,
+            "the frame-leader stamp must still bump on a disarmed call"
+        );
+        // (2) Armed row, EMPTY terrain — the sky-only wait frame: the
+        // implicit disarm must skip the solve too.
+        let mut sky_only = packet.clone();
+        sky_only.terrain.clear();
+        renderer.draw_shadow(&mut encoder, &device, &queue, &sky_only, &armed, None);
+        assert_eq!(
+            renderer.cull_solves, 0,
+            "an armed row over an empty terrain list must not run the cull solve"
+        );
+        // (3) Armed row, live terrain — the daytime frame: solve once,
+        // and the full pass path records without a validation fault.
+        renderer.draw_shadow(&mut encoder, &device, &queue, &packet, &armed, None);
+        assert_eq!(
+            renderer.cull_solves, 1,
+            "an armed row with live terrain solves"
+        );
+        // A repeat in a fresh frame solves again (the gate is per-call,
+        // not a latch).
+        renderer.draw_shadow(&mut encoder, &device, &queue, &packet, &armed, None);
+        assert_eq!(renderer.cull_solves, 2);
+        queue.submit([encoder.finish()]);
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
     }
 
     /// The R2 determinism contract: same seed + direction ⇒ bit-identical

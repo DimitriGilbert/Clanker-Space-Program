@@ -180,9 +180,11 @@ pub struct FlightRenderer {
 }
 
 impl FlightRenderer {
-    /// Build the pipeline/depth target; `size` is the initial surface.
-    /// `cascades` is the terrain renderer this flight pass shares a
-    /// frame with — 3b's hand-off (its `SU` buffer + receiving
+    /// Build the pipeline/depth target; `size` is the SCENE size (P1:
+    /// the render-scaled attachment size the app's main pass binds —
+    /// pass `Gpu::scene_size()`, which equals the surface at scale
+    /// 1.0). `cascades` is the terrain renderer this flight pass
+    /// shares a frame with — 3b's hand-off (its `SU` buffer + receiving
     /// group(1) are borrowed by handle, so construct the terrain
     /// renderer first; the app and the render gate both do).
     #[allow(clippy::too_many_lines)] // one device-resource construction; splitting fragments the descriptor set
@@ -330,7 +332,9 @@ impl FlightRenderer {
         }
     }
 
-    /// Recreate the depth target after a resize.
+    /// Recreate the depth target after a resize — `width`/`height`
+    /// are the SCENE size (P1: `Gpu::scene_size()`, the scaled
+    /// attachment the main pass pairs this depth with).
     pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         let size = (width.max(1), height.max(1));
         if size == self.size {

@@ -640,6 +640,14 @@ pub struct FlightHudInput<'a> {
     /// arrival polish; the view never shows a flat datum stand-in).
     /// `true` adds the chip's "GENERATING SURFACE" wait row.
     pub terrain_pending: bool,
+    /// P1's FPS readout — the host's smoothed wall-clock frame rate
+    /// over its ~10-frame window. `0.0` = not yet measured (the row
+    /// hides — the same absent-until-real convention as
+    /// [`Self::terrain_pending`]); a real figure is always `> 0`.
+    pub fps: f64,
+    /// The same window's mean frame time (ms) — the CPU-or-GPU
+    /// question the pair answers together.
+    pub frame_ms: f64,
     /// The focused vessel's propellant — one gauge per resource
     /// still carried (empty for tank-less vessels).
     pub propellant: &'a [PropellantGauge],
@@ -1163,6 +1171,21 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
                 format!("parts {}  ·  warp ×{}", input.parts, input.warp),
                 dim,
             );
+            // P1's frame-timing readout — the host's ~10-frame smoothed
+            // fps + frame ms (wall clock measured where §2.5 allows it,
+            // far from the sim). The pair is how a player tells a
+            // CPU-bound session (uncapping vsync raises fps) from a
+            // GPU-limited one (it doesn't — lower the render scale).
+            // Hidden until the first window fills, exactly like the
+            // terrain bake row above.
+            if input.fps > 0.0 {
+                row(
+                    ui,
+                    "FPS",
+                    format!("{:>4.0}  {:>6.1} ms/frame", input.fps, input.frame_ms),
+                    dim,
+                );
+            }
             ui.add(
                 egui::Label::new(
                     egui::RichText::new(format!(
@@ -1962,6 +1985,8 @@ mod tests {
             period_s: None,
             builds: &[],
             terrain_pending: false,
+            fps: 0.0,
+            frame_ms: 0.0,
             propellant,
             stages_left: 2,
             stages_total: 3,
@@ -2168,6 +2193,42 @@ mod tests {
         assert!(
             (pending.min - calm.min).length() < 1.0,
             "the chip must not move while pending ({calm:?} → {pending:?})"
+        );
+    }
+
+    /// P1: the frame-timing row — `fps > 0` adds the readout line the
+    /// same way `terrain_pending` adds its wait row (one line of
+    /// height, no reflow), and a plausible figure formats as
+    /// fps + ms/frame. The plumbing contract this pins: the field is
+    /// absent-until-real (0.0 hides the row), never a placeholder.
+    #[test]
+    fn fps_row_appears_in_the_chip() {
+        let keys = settings::Keymap::default();
+        let key_labels = BTreeMap::new();
+        let prop: [PropellantGauge; 0] = [];
+        let mut input = hud_input(&keys, &key_labels, &prop);
+        let (ctx, raw) = hud_rig(960.0, 600.0);
+        let hud_id = egui::Id::unique("flight_hud");
+        for _ in 0..3 {
+            run_frame(&ctx, raw.clone(), &input);
+        }
+        let calm = ctx
+            .memory(|m| m.area_rect(hud_id))
+            .expect("hud area registered");
+        // A plausible measurement: 60 fps ≈ 16.7 ms/frame.
+        input.fps = 60.0;
+        input.frame_ms = 16.7;
+        run_frame(&ctx, raw.clone(), &input);
+        let timed = ctx
+            .memory(|m| m.area_rect(hud_id))
+            .expect("hud area registered");
+        assert!(
+            timed.height() > calm.height(),
+            "the FPS row must add a line to the chip (calm {calm:?} vs timed {timed:?})"
+        );
+        assert!(
+            (timed.min - calm.min).length() < 1.0,
+            "the chip must not move when the row lands ({calm:?} → {timed:?})"
         );
     }
 }

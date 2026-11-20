@@ -294,6 +294,8 @@ fn flight_input<'a>(
         period_s: None,
         builds: &[],
         terrain_pending: false,
+        fps: 0.0,
+        frame_ms: 0.0,
         propellant: prop,
         stages_left: 2,
         stages_total: 3,

@@ -50,7 +50,9 @@ use csp_render::terrain::TerrainRenderer;
 use csp_render::vab::VabRenderer;
 use csp_view::flight::FlightEvent;
 use csp_view::map::MapKeyEvent;
-use csp_view::settings::{KeyAction, Settings, UI_SCALE_MAX, UI_SCALE_MIN};
+use csp_view::settings::{
+    KeyAction, RENDER_SCALE_MAX, RENDER_SCALE_MIN, Settings, UI_SCALE_MAX, UI_SCALE_MIN,
+};
 use csp_view::vab::VabEvent;
 use csp_view::{EventClass, ModeSelect, SimCommand, SourceClass, View, ViewMode};
 use warp::WarpController;
@@ -130,6 +132,57 @@ const ATTITUDE_RATE_RAD_S: f64 = 0.8;
 /// and the two MUST stay equal: past this distance the pick is
 /// suppressed and the promotion is what resolves the drag instead.
 const CLICK_MAX_DRAG_PX: f64 = 4.0;
+
+/// The FPS readout's smoothing window (P1): the HUD's fps/frame-ms
+/// figures are the MEAN frame dt over the last this-many frames — a
+/// per-frame figure would flicker between e.g. 58 and 62 faster than
+/// anyone can read, and a longer window would hide exactly the swings
+/// the readout exists to expose.
+const FRAME_TIMING_WINDOW: usize = 10;
+
+/// The FPS readout's ring buffer (P1) — a fixed window, no
+/// allocation, no drift: `samples[..filled]` is always exactly the
+/// valid set (the ring only wraps once `filled` reaches the window
+/// size, when every slot is live).
+#[derive(Default)]
+struct FrameTimingSmoother {
+    samples: [f64; FRAME_TIMING_WINDOW],
+    idx: usize,
+    filled: usize,
+}
+
+impl FrameTimingSmoother {
+    /// Record one frame's wall dt (seconds, already §2.5-clamped — a
+    /// hitch shows as the clamp ceiling, never a multi-second spike).
+    fn push(&mut self, dt_s: f64) {
+        self.samples[self.idx] = dt_s;
+        self.idx = (self.idx + 1) % FRAME_TIMING_WINDOW;
+        self.filled = (self.filled + 1).min(FRAME_TIMING_WINDOW);
+    }
+
+    /// `(fps, frame_ms)` over the window — `None` until the first
+    /// frame lands (the HUD hides the row, its absent-until-real
+    /// convention).
+    fn read(&self) -> Option<(f64, f64)> {
+        if self.filled == 0 {
+            return None;
+        }
+        let mean = self.samples[..self.filled].iter().sum::<f64>() / self.filled as f64;
+        if mean <= 0.0 {
+            return None;
+        }
+        Some((1.0 / mean, mean * 1000.0))
+    }
+}
+
+/// The settings vsync choice → wgpu's present mode (P1). `csp-ui`
+/// names the choice; only the app knows the API.
+fn present_mode_of(vsync: csp_view::settings::VsyncMode) -> wgpu::PresentMode {
+    match vsync {
+        csp_view::settings::VsyncMode::Auto => wgpu::PresentMode::AutoVsync,
+        csp_view::settings::VsyncMode::Off => wgpu::PresentMode::AutoNoVsync,
+    }
+}
 
 struct App {
     window: Option<Arc<Window>>,
@@ -287,6 +340,10 @@ struct App {
     /// target; all wall-side, emitting only logged commands.
     warp: WarpController,
     last_frame: Instant,
+    /// P1's FPS readout source: the last [`FRAME_TIMING_WINDOW`] frame
+    /// dts (wall clock, read only in `render` — §2.5's one legal site).
+    /// Instant is legal in csp-app; nothing here ever reaches the sim.
+    frame_timing: FrameTimingSmoother,
     /// Per-tick wall ms of the last `step_frame` — the frame's whole step
     /// cost divided by the ticks it advanced (`View::ticks_last_frame`),
     /// because §2.6.3's inequality is written in per-tick cost. Never sim
@@ -514,6 +571,7 @@ impl App {
             view,
             warp: WarpController::new(),
             last_frame: Instant::now(),
+            frame_timing: FrameTimingSmoother::default(),
             last_tick_ms: 0.0,
             fatal: None,
             settings,
@@ -567,6 +625,31 @@ impl App {
             1.0
         };
         self.view.egui_context().set_zoom_factor(scale);
+        // P1 vsync: swap the surface's present mode — a reconfigure on
+        // the same path `resize` takes, so it lands at the next frame.
+        // Compositors that always vsync (Wayland, macOS) quietly
+        // absorb an Off; that is the platform's call, not an error.
+        // No-op when the mode already matches (`set_present_mode`
+        // reconfigures only on change).
+        if let Some(gpu) = &mut self.gpu {
+            gpu.set_present_mode(present_mode_of(self.settings.graphics.vsync));
+        }
+        // P1 render scale: rebuild the scaled scene attachments exactly
+        // as a resize does (the same recreate path) when the value
+        // moved. `Gpu::set_scene_scale` is itself change-gated.
+        let scale_target = self.clamped_render_scale();
+        let rescaled = if let Some(gpu) = &mut self.gpu {
+            let changed = gpu.scene_scale() != scale_target;
+            if changed {
+                gpu.set_scene_scale(scale_target);
+            }
+            changed
+        } else {
+            false
+        };
+        if rescaled {
+            self.resize_scene_attachments();
+        }
         if let Some(level) = self
             .warp
             .set_cap_multiplier(self.settings.gameplay.max_warp_multiplier)
@@ -586,6 +669,44 @@ impl App {
                     SimCommand::SetWarp(level),
                 );
             }
+        }
+    }
+
+    /// The settings render scale clamped into the player-facing ladder
+    /// (P1) — the same non-finite guard `ui_scale` gets: `f32::clamp`
+    /// passes NaN, and a NaN scene size would poison every attachment.
+    fn clamped_render_scale(&self) -> f32 {
+        let raw = self.settings.graphics.render_scale;
+        if raw.is_finite() {
+            raw.clamp(RENDER_SCALE_MIN, RENDER_SCALE_MAX)
+        } else {
+            1.0
+        }
+    }
+
+    /// Re-size the mode renderers' scene attachments (P1): the flight
+    /// and VAB depth targets track the SCALED scene size (they pair
+    /// with the MSAA color attachment in one pass — wgpu requires the
+    /// sizes to match), while the VAB pick pass stays native (its
+    /// rasterization is indexed by physical click pixels). Shared by
+    /// the `Resized` handler and a render-scale change — one recreate
+    /// path, exactly how a resize rebuilds them.
+    fn resize_scene_attachments(&mut self) {
+        let App {
+            gpu,
+            flight_renderer,
+            vab_renderer,
+            ..
+        } = self;
+        let Some(gpu) = gpu else {
+            return;
+        };
+        let (sw, sh) = gpu.scene_size();
+        if let Some(f) = flight_renderer.as_mut() {
+            f.resize(&gpu.device, sw, sh);
+        }
+        if let Some(v) = vab_renderer.as_mut() {
+            v.resize(&gpu.device, gpu.config.width, gpu.config.height, sw, sh);
         }
     }
 
@@ -762,8 +883,13 @@ impl App {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let size = window.inner_size();
-            let gpu = pollster::block_on(Gpu::new(window.clone(), (size.width, size.height)))
-                .expect("failed to init GPU");
+            let gpu = pollster::block_on(Gpu::new(
+                window.clone(),
+                (size.width, size.height),
+                present_mode_of(self.settings.graphics.vsync),
+                self.clamped_render_scale(),
+            ))
+            .expect("failed to init GPU");
             self.window = Some(window);
             self.finish_gpu_init(gpu);
         }
@@ -772,9 +898,11 @@ impl App {
             let (tx, rx) = std::sync::mpsc::channel();
             self.gpu_rx = Some(rx);
             self.window = Some(window.clone());
+            let vsync = present_mode_of(self.settings.graphics.vsync);
+            let scale = self.clamped_render_scale();
             wasm_bindgen_futures::spawn_local(async move {
                 let size = window.inner_size();
-                let _ = tx.send(Gpu::new(window, (size.width, size.height)).await);
+                let _ = tx.send(Gpu::new(window, (size.width, size.height), vsync, scale).await);
             });
         }
     }
@@ -836,10 +964,14 @@ impl App {
             egui_wgpu::RendererOptions::default(),
         );
         let map_renderer = MapRenderer::new(&gpu.device, gpu.surface_format());
+        // P1: the scene renderers' own depth targets track the SCALED
+        // scene size; the VAB pick pass stays native (click pixels).
+        let (sw, sh) = gpu.scene_size();
         let vab_renderer = VabRenderer::new(
             &gpu.device,
             gpu.surface_format(),
             (gpu.config.width, gpu.config.height),
+            (sw, sh),
         );
         // Terrain first: the flight renderer borrows the cascade
         // resources (R1/3b — the `SU` buffer + the receiving group(1))
@@ -848,7 +980,7 @@ impl App {
         let flight_renderer = FlightRenderer::new(
             &gpu.device,
             gpu.surface_format(),
-            (gpu.config.width, gpu.config.height),
+            (sw, sh),
             &terrain_renderer,
         );
         let info = gpu.adapter.get_info();
@@ -886,6 +1018,14 @@ impl App {
             .as_secs_f64()
             .min(MAX_FRAME_DT);
         self.last_frame = now;
+        // P1's FPS readout: the clamped dt feeds the ~10-frame window
+        // (a hitch reads as the clamp ceiling, never a spike), and the
+        // smoothed (fps, ms) rides the view's UI data into the flight
+        // HUD chip — presentation plumbing only, never sim state.
+        self.frame_timing.push(dt_wall);
+        if let Some((fps, frame_ms)) = self.frame_timing.read() {
+            self.view.set_frame_timing(fps, frame_ms);
+        }
 
         let window = match &self.window {
             Some(w) => w.clone(),
@@ -1980,19 +2120,25 @@ impl App {
             );
         }
         {
+            // P1 render scale: at 1.0 the resolve target is the frame
+            // view itself (the pre-P1 path, byte-identical frames);
+            // below it the pass resolves into the scaled intermediate
+            // and `blit_scene` upscales into the frame before the UI
+            // pass composites at native resolution.
+            let resolve_view = gpu.scene_resolve().unwrap_or(&frame.view);
             let mut pass = frame
                 .encoder
                 .begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("scene"),
                     // 4×MSAA: every pipeline rasterizes into the
                     // multisampled target and the pass resolves into
-                    // the surface view (C11-F1 — the previous frame
+                    // `resolve_view` (C11-F1 — the previous frame
                     // had no AA anywhere). Flight frames that ran the
                     // far pass LOAD its samples (it owns the clear);
                     // every other frame clears here.
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: gpu.msaa_view(),
-                        resolve_target: Some(&frame.view),
+                        resolve_target: Some(resolve_view),
                         ops: wgpu::Operations {
                             load: if far_ran {
                                 wgpu::LoadOp::Load
@@ -2049,6 +2195,13 @@ impl App {
                 Self::record_flight_near(&mut self.terrain_renderer, f, &mut pass, gpu, packet);
             }
         }
+
+        // P1: upscale the scaled resolved scene into the swapchain
+        // frame — recorded BEFORE the egui pass so the UI composites
+        // over the upscaled scene at native resolution (crisp text).
+        // A no-op at scale 1.0 (that path resolved straight into the
+        // frame; adding a pass there would change frame content).
+        gpu.blit_scene(&mut frame.encoder, &frame.view);
 
         // egui paints in a second pass of its own: its pipeline declares
         // no depth state (`RendererOptions::default().depth_stencil_format
@@ -3119,16 +3272,13 @@ impl ApplicationHandler for App {
                 if let Some(gpu) = &mut self.gpu {
                     gpu.resize(size.width, size.height);
                 }
-                // The renderer resize stays here (its target must match
-                // the surface), but the *view* viewport is re-fed per
-                // frame in `run_frame` — an event that lands before
-                // `finish_gpu_init` no longer loses the aspect.
-                if let (Some(g), Some(f)) = (&self.gpu, &mut self.flight_renderer) {
-                    f.resize(&g.device, size.width, size.height);
-                }
-                if let (Some(g), Some(v)) = (&self.gpu, &mut self.vab_renderer) {
-                    v.resize(&g.device, size.width, size.height);
-                }
+                // The renderer resize stays here (the scene targets must
+                // match the surface × the live render scale — P1 keeps
+                // the two paths in `resize_scene_attachments`), but the
+                // *view* viewport is re-fed per frame in `run_frame` —
+                // an event that lands before `finish_gpu_init` no
+                // longer loses the aspect.
+                self.resize_scene_attachments();
             }
             // Key presses and releases. egui reports `consumed` for
             // EVERY key press whenever *any* widget holds keyboard
@@ -4130,6 +4280,64 @@ mod tests {
             app.view.staged_settings().keys.action_for("arrow-up"),
             Some(KeyAction::PanUp)
         );
+    }
+
+    /// P1's frame-timing window: the readout is the MEAN dt over the
+    /// last [`FRAME_TIMING_WINDOW`] frames — `None` until the first
+    /// frame lands, the plain mean while the window fills, and a true
+    /// sliding window once it wraps (an old slow frame leaves the
+    /// figures exactly when the window forgets it).
+    #[test]
+    fn frame_timing_window_means_and_wraps() {
+        let mut t = FrameTimingSmoother::default();
+        assert_eq!(t.read(), None, "no frames yet — the HUD row hides");
+        for _ in 0..5 {
+            t.push(1.0 / 60.0);
+        }
+        let (fps, ms) = t.read().expect("a half-filled window still reads");
+        assert!((fps - 60.0).abs() < 0.01 && (ms - 1000.0 / 60.0).abs() < 0.01);
+        // Fill the rest with 30 fps frames: the mean is over 5+5.
+        for _ in 0..5 {
+            t.push(1.0 / 30.0);
+        }
+        let (fps, _) = t.read().expect("a full window reads");
+        assert!(
+            (fps - 40.0).abs() < 0.01,
+            "10 frames at half 60/half 30 fps mean 40 fps, got {fps}"
+        );
+        // Wrap: 9×30fps + 1×60fps — the window is exactly the last 10
+        // pushes (the 60 fps frames from the fill phase are gone).
+        for _ in 0..9 {
+            t.push(1.0 / 30.0);
+        }
+        t.push(1.0 / 60.0);
+        let expected = 1.0 / ((9.0 / 30.0 + 1.0 / 60.0) / 10.0);
+        let (fps, _) = t.read().expect("a wrapped window reads");
+        assert!((fps - expected).abs() < 0.01, "got {fps}, want {expected}");
+        // A degenerate zero-dt window reports nothing rather than inf.
+        let mut z = FrameTimingSmoother::default();
+        z.push(0.0);
+        assert_eq!(z.read(), None);
+    }
+
+    /// P1's render-scale clamp: the player-facing ladder bounds and
+    /// the NaN guard (`f32::clamp` passes NaN — a NaN scene size would
+    /// poison every attachment; the same rule `ui_scale` follows).
+    #[test]
+    fn clamped_render_scale_bounds_and_nan() {
+        let mut app = App::new_demo_with_settings_path(
+            &std::env::temp_dir().join(format!("csp-app-scale-{}", std::process::id())),
+        );
+        app.settings.graphics.render_scale = 0.75;
+        assert_eq!(app.clamped_render_scale(), 0.75);
+        app.settings.graphics.render_scale = 0.1;
+        assert_eq!(app.clamped_render_scale(), RENDER_SCALE_MIN);
+        app.settings.graphics.render_scale = 2.0;
+        assert_eq!(app.clamped_render_scale(), RENDER_SCALE_MAX);
+        app.settings.graphics.render_scale = f32::NAN;
+        assert_eq!(app.clamped_render_scale(), 1.0);
+        app.settings.graphics.render_scale = f32::INFINITY;
+        assert_eq!(app.clamped_render_scale(), 1.0);
     }
 
     /// §6.3 demo mode: the app flag comes from the view, craft-file

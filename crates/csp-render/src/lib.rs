@@ -72,6 +72,27 @@ impl Default for PartLight {
 /// impossible by construction.
 pub const MSAA_SAMPLES: u32 = 4;
 
+/// The renderer-side floor for the scene render scale (P1) —
+/// [`Gpu::set_scene_scale`] clamps into `SCENE_SCALE_MIN..=1.0`. The
+/// player-facing ladder (`csp-ui`'s `RENDER_SCALE_MIN`) is narrower
+/// policy on top of this safety bound.
+pub const SCENE_SCALE_MIN: f32 = 0.25;
+
+/// The scaled scene-target size for `surface` at `scale` (P1): each
+/// axis `round(surface × scale)`, floored at 1 px, `scale` clamped
+/// into `SCENE_SCALE_MIN..=1.0` (non-finite → 1.0). Pure — the
+/// target-math core `Gpu` and the app's renderer resizes share, and
+/// the unit tests pin. Uniform per-axis (aspect never changes).
+pub fn scene_target_size(surface: (u32, u32), scale: f32) -> (u32, u32) {
+    let s = if scale.is_finite() {
+        scale.clamp(SCENE_SCALE_MIN, 1.0)
+    } else {
+        1.0
+    };
+    let axis = |v: u32| (f64::from(v) * f64::from(s)).round().max(1.0) as u32;
+    (axis(surface.0), axis(surface.1))
+}
+
 /// The `MultisampleState` every surface-destined pipeline declares.
 pub(crate) fn msaa_state() -> wgpu::MultisampleState {
     wgpu::MultisampleState {
@@ -82,8 +103,9 @@ pub(crate) fn msaa_state() -> wgpu::MultisampleState {
 
 /// The scene pass's multisampled color target: every surface-bound
 /// pipeline renders into this 4× texture and the pass resolves into
-/// the swapchain view. Recreated when the surface size or format
-/// changes (resize/reconfigure).
+/// the swapchain view (scale 1.0) or the scaled resolve intermediate
+/// (P1 render scale). Recreated when the surface size, format, or
+/// scene scale changes (resize/reconfigure/scale change).
 pub struct MsaaColor {
     /// Kept alive for `view` — a wgpu `TextureView` is an unborrowed
     /// handle, so dropping the texture would leave a dangling view.
@@ -189,8 +211,20 @@ pub struct Gpu {
     pub queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
     /// The scene pass's multisampled framebuffer — pipelines render
-    /// into [`MsaaColor::view`] and resolve into the surface view.
+    /// into [`MsaaColor::view`] and resolve into the frame view (full
+    /// scale) or [`Self::scene_resolve`] (P1 render scale).
     msaa: MsaaColor,
+    /// The scene's render scale (P1) in `SCENE_SCALE_MIN..=1.0`;
+    /// 1.0 = the pre-P1 resolve-straight-to-swapchain path verbatim.
+    scene_scale: f32,
+    /// The scaled, single-sampled intermediate the scene pass resolves
+    /// into when `scene_scale < 1.0` (`None` at 1.0): RENDER_ATTACHMENT
+    /// for the resolve + TEXTURE_BINDING for [`Self::blit_scene`]'s
+    /// upscale pass. Recreated by `resize`/`set_scene_scale`.
+    scene_resolved: Option<SceneResolved>,
+    /// The upscale pipeline + sampler (P1); the per-texture bind group
+    /// rides `scene_resolved` (recreated with it).
+    blit: BlitPipeline,
     /// Set by the device-lost callback; `begin_frame` degrades to the
     /// reconfigure path instead of feeding commands to a dead device.
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -200,12 +234,36 @@ pub struct Gpu {
     surface_warned: std::cell::Cell<u8>,
 }
 
+/// The scene-resolve intermediate (P1): the scaled texture the MSAA
+/// scene pass resolves into, bound for the upscale pass that follows.
+struct SceneResolved {
+    #[allow(dead_code)] // kept alive for `view`/`bind`
+    tex: wgpu::Texture,
+    view: wgpu::TextureView,
+    bind: wgpu::BindGroup,
+    size: (u32, u32),
+}
+
+/// The upscale pass's device-fixed half (P1): pipeline, bind layout,
+/// sampler. Built once in `Gpu::new` — cheap, and always ready so a
+/// scale change never rebuilds pipeline state.
+struct BlitPipeline {
+    pipe: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+}
+
 impl Gpu {
     /// Create a GPU context bound to a window. `window` must be an owned
     /// handle (e.g. `Arc<Window>`) so the surface outlives the call.
+    /// `present_mode` is the vsync choice (P1 — the app maps its
+    /// settings enum onto wgpu's modes); `scene_scale` is the initial
+    /// render scale (P1, 1.0 = full resolution).
     pub async fn new(
         window: impl Into<wgpu::SurfaceTarget<'static>>,
         size: (u32, u32),
+        present_mode: wgpu::PresentMode,
+        scene_scale: f32,
     ) -> Result<Self, GpuError> {
         // PRIMARY auto-selects Vulkan/Metal/DX12 natively, WebGPU on wasm.
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -294,13 +352,25 @@ impl Gpu {
             color_space: wgpu::SurfaceColorSpace::Auto,
             width: size.0.max(1),
             height: size.1.max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
+            present_mode,
             desired_maximum_frame_latency: 2,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
         };
         surface.configure(&device, &config);
-        let msaa = MsaaColor::new(&device, format, (config.width, config.height));
+        // P1: the upscale pass's fixed half exists from the start (a
+        // small pipeline; the resolved texture + bind group come and go
+        // with the scale).
+        let blit = BlitPipeline::new(&device, format);
+        let scene_scale = if scene_scale.is_finite() {
+            scene_scale.clamp(SCENE_SCALE_MIN, 1.0)
+        } else {
+            1.0
+        };
+        let scene = scene_target_size((config.width, config.height), scene_scale);
+        let msaa = MsaaColor::new(&device, format, scene);
+        let scene_resolved =
+            (scene_scale < 1.0).then(|| SceneResolved::new(&device, format, scene, &blit));
 
         Ok(Self {
             instance,
@@ -310,6 +380,9 @@ impl Gpu {
             queue,
             config,
             msaa,
+            scene_scale,
+            scene_resolved,
+            blit,
             device_lost,
             surface_warned: std::cell::Cell::new(0),
         })
@@ -320,11 +393,98 @@ impl Gpu {
             self.config.width = width;
             self.config.height = height;
             self.surface.configure(&self.device, &self.config);
-            self.msaa.ensure(
-                &self.device,
-                self.config.format,
-                (self.config.width, self.config.height),
-            );
+            self.refresh_scene_targets();
+        }
+    }
+
+    /// (Re)build the scaled scene attachments at the current surface
+    /// size + scale — the shared tail of `resize` and
+    /// `set_scene_scale` (P1). The MSAA target and the resolve
+    /// intermediate always agree on size; at scale 1.0 the intermediate
+    /// is dropped and the scene pass resolves straight into the frame
+    /// view, byte-identical to the pre-P1 path.
+    fn refresh_scene_targets(&mut self) {
+        let scene = self.scene_size();
+        self.msaa.ensure(&self.device, self.config.format, scene);
+        self.scene_resolved = if self.scene_scale < 1.0 {
+            let stale = self.scene_resolved.as_ref().is_none_or(|r| r.size != scene);
+            if stale {
+                Some(SceneResolved::new(
+                    &self.device,
+                    self.config.format,
+                    scene,
+                    &self.blit,
+                ))
+            } else {
+                self.scene_resolved.take()
+            }
+        } else {
+            None
+        };
+    }
+
+    /// The current present mode (P1's vsync plumbing).
+    pub fn present_mode(&self) -> wgpu::PresentMode {
+        self.config.present_mode
+    }
+
+    /// Swap the present mode (P1's vsync setting) — a surface
+    /// reconfigure on the same path `resize` takes, so it lands at the
+    /// next frame; on compositors that always vsync (Wayland, macOS)
+    /// the request is quietly absorbed. No target rebuilds: present
+    /// mode never touches attachment sizes.
+    pub fn set_present_mode(&mut self, mode: wgpu::PresentMode) {
+        if self.config.present_mode != mode {
+            self.config.present_mode = mode;
+            self.surface.configure(&self.device, &self.config);
+        }
+    }
+
+    /// The live scene render scale (P1).
+    pub fn scene_scale(&self) -> f32 {
+        self.scene_scale
+    }
+
+    /// The scaled size the scene color/depth attachments render at
+    /// (P1) — what the app feeds the renderers' own depth-target
+    /// resizes. Aspect matches the surface (uniform scale).
+    pub fn scene_size(&self) -> (u32, u32) {
+        scene_target_size((self.config.width, self.config.height), self.scene_scale)
+    }
+
+    /// Set the scene render scale (P1): clamped into
+    /// `SCENE_SCALE_MIN..=1.0` (non-finite → 1.0), then the scaled
+    /// targets rebuild exactly as a resize rebuilds them. Only the
+    /// scene attachments move — the swapchain, egui, and the pick
+    /// pass stay native.
+    pub fn set_scene_scale(&mut self, scale: f32) {
+        let s = if scale.is_finite() {
+            scale.clamp(SCENE_SCALE_MIN, 1.0)
+        } else {
+            1.0
+        };
+        if s != self.scene_scale {
+            self.scene_scale = s;
+            self.refresh_scene_targets();
+        }
+    }
+
+    /// The resolve target the scene pass should resolve into (P1):
+    /// `None` at scale 1.0 — resolve straight into the frame view (the
+    /// pre-P1 path); `Some` at a reduced scale — resolve here, then
+    /// [`Self::blit_scene`] upscales into the frame before the UI
+    /// pass.
+    pub fn scene_resolve(&self) -> Option<&wgpu::TextureView> {
+        self.scene_resolved.as_ref().map(|r| &r.view)
+    }
+
+    /// Record the scene upscale pass (P1): the scaled resolved image →
+    /// `dst` (the swapchain frame view), one fullscreen linear-filtered
+    /// triangle. A no-op at scale 1.0 — that path resolved into the
+    /// frame directly and must stay byte-identical to pre-P1 frames.
+    pub fn blit_scene(&self, encoder: &mut wgpu::CommandEncoder, dst: &wgpu::TextureView) {
+        if let Some(resolved) = &self.scene_resolved {
+            self.blit.record(encoder, dst, &resolved.bind);
         }
     }
 
@@ -332,8 +492,9 @@ impl Gpu {
         self.config.format
     }
 
-    /// The multisampled attachment the scene pass renders into —
-    /// `resolve_target` is the frame's surface view.
+    /// The multisampled attachment the scene pass renders into — at
+    /// the scene scale (P1); the resolve target is [`Self::scene_resolve`]
+    /// when one exists, else the frame's surface view.
     pub fn msaa_view(&self) -> &wgpu::TextureView {
         self.msaa.view()
     }
@@ -414,6 +575,172 @@ impl Gpu {
     }
 }
 
+impl SceneResolved {
+    /// The scaled resolve intermediate: resolve target of the scene
+    /// pass, sample source of the upscale pass.
+    fn new(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        size: (u32, u32),
+        blit: &BlitPipeline,
+    ) -> Self {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("scene-resolved"),
+            size: wgpu::Extent3d {
+                width: size.0.max(1),
+                height: size.1.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            // Resolve target of the MSAA scene pass + sampled by the
+            // upscale pass — both usages, nothing else touches it.
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scene-blit"),
+            layout: &blit.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&blit.sampler),
+                },
+            ],
+        });
+        Self {
+            tex,
+            view,
+            bind,
+            size: (size.0.max(1), size.1.max(1)),
+        }
+    }
+}
+
+impl BlitPipeline {
+    /// Record the upscale pass (P1) — the exact pass `Gpu::blit_scene`
+    /// records, factored out so the headless scale-dump rig drives the
+    /// production path verbatim: fullscreen triangle sampling `src`
+    /// (the resolved scene's bind group) into `dst`.
+    fn record(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        dst: &wgpu::TextureView,
+        src: &wgpu::BindGroup,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("scene-blit"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: dst,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.pipe);
+        pass.set_bind_group(0, src, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
+    /// The upscale pipeline (P1): fullscreen triangle, linear sampler,
+    /// surface format, no depth, single sample.
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("blit"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("blit.wgsl").into()),
+        });
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("scene-blit"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        // The resolved scene is the surface format
+                        // (sRGB) — a float, filterable sample (the
+                        // linear upscale needs it); the sRGB decode
+                        // happens in the sampler, the re-encode at the
+                        // output merge.
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let pipe_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("scene-blit"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("scene-blit"),
+            layout: Some(&pipe_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None, // replace — the whole frame is the blit
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..wgpu::PrimitiveState::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("scene-blit"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..wgpu::SamplerDescriptor::default()
+        });
+        Self {
+            pipe,
+            layout,
+            sampler,
+        }
+    }
+}
+
 /// Result of [`Gpu::begin_frame`].
 pub enum FrameResult {
     Ok(Box<Frame>),
@@ -472,6 +799,9 @@ impl From<wgpu::RequestDeviceError> for GpuError {
 // contract, not a test contract).
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use super::scene_target_size;
+    use super::{BlitPipeline, MsaaColor, SceneResolved, map};
+
     /// Every WGSL source this crate feeds `create_shader_module` must
     /// pass the same checks wgpu runs eagerly at GPU init: naga parse +
     /// full validation. An invalid module panics device-side and kills
@@ -488,6 +818,7 @@ mod tests {
             ("flight.wgsl", include_str!("flight.wgsl")),
             ("flight_shadow.wgsl", include_str!("flight_shadow.wgsl")),
             ("terrain.wgsl", include_str!("terrain.wgsl")),
+            ("blit.wgsl", include_str!("blit.wgsl")),
         ] {
             let module = naga::front::wgsl::parse_str(src)
                 .unwrap_or_else(|e| panic!("{name}: parse failed\n{}", e.emit_to_string(src)));
@@ -499,5 +830,337 @@ mod tests {
                 .validate(&module)
                 .unwrap_or_else(|e| panic!("{name}: validation failed\n{e:?}"));
         }
+    }
+
+    /// P1's scene-target math: `scale × surface` per axis (rounded to
+    /// nearest, so 0.05 steps land on whole pixels where the product
+    /// allows), the 1-px floor (a degenerate axis must never produce a
+    /// 0-size attachment), the scale clamp, and the non-finite guard.
+    #[test]
+    fn scene_target_size_scales_and_floors() {
+        // The settings ladder's exact steps at a common resolution.
+        assert_eq!(scene_target_size((1920, 1080), 1.0), (1920, 1080));
+        assert_eq!(scene_target_size((1920, 1080), 0.75), (1440, 810));
+        assert_eq!(scene_target_size((1920, 1080), 0.5), (960, 540));
+        assert_eq!(scene_target_size((1280, 720), 0.95), (1216, 684));
+        // Rounding, not truncation: 0.85 × 1080 = 918 exactly, but odd
+        // surfaces at 0.65 land on halves — nearest keeps the aspect
+        // drift under half a pixel per axis.
+        assert_eq!(scene_target_size((1921, 1081), 0.65), (1249, 703));
+        // The 1-px floor — whatever the scale, an attachment axis is
+        // never 0 (wgpu would reject the descriptor; a 1-px scene is
+        // the honest degenerate).
+        assert_eq!(scene_target_size((1, 1), 0.5), (1, 1));
+        assert_eq!(scene_target_size((2, 3), 0.3), (1, 1));
+        // The clamp: below SCENE_SCALE_MIN floors at it, above 1.0 is
+        // full res (never an upscale), non-finite falls back to 1.0.
+        assert_eq!(scene_target_size((1000, 1000), 0.01), (250, 250));
+        assert_eq!(scene_target_size((1000, 1000), 4.0), (1000, 1000));
+        assert_eq!(scene_target_size((1000, 1000), f32::NAN), (1000, 1000));
+        assert_eq!(scene_target_size((1000, 1000), f32::INFINITY), (1000, 1000));
+        // Aspect: the scaled size's aspect matches the surface's to
+        // within half a pixel per axis (uniform scale).
+        for &s in &[0.5f32, 0.65, 0.75, 0.9, 1.0] {
+            let (w, h) = scene_target_size((1920, 1080), s);
+            let drift = (f64::from(w) / f64::from(h) - 1920.0 / 1080.0).abs() * f64::from(h);
+            assert!(drift < 1.0, "scale {s}: aspect drift {drift}px");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // P1 scale evidence rig (scratch visual dump, the repo's `#[ignore]`
+    // convention) — see docs/UI-AND-RENDERING.md §7.2.2.
+    // ------------------------------------------------------------------
+
+    /// The dump's frame size. 960×540 (a half-1080p 16:9 frame; 960·4
+    /// is a multiple of wgpu's 256-byte copy-row alignment).
+    const SCALE_DUMP_W: u32 = 960;
+    const SCALE_DUMP_H: u32 = 540;
+    /// Any surface-legal format works for the rig; sRGB like the real
+    /// surface path.
+    const SCALE_DUMP_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+
+    /// A headless adapter + device for the scale dumps (`None` when no
+    /// driver exists — the render gate's documented skip case).
+    fn scale_dump_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            ..Default::default()
+        }))
+        .ok()?;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("scale-dump"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            ..wgpu::DeviceDescriptor::default()
+        }))
+        .ok()?;
+        Some((device, queue))
+    }
+
+    /// The dump scene: fine 1–2 px line probes at three angles (the
+    /// sharpness signal an upscale either keeps or smears), colored
+    /// wedges, and the map pipeline's shaped markers (disc / ring /
+    /// glow) — all through the REAL scene pipeline (4× MSAA, alpha
+    /// blending, resolve), the same pass shape `csp-app` records.
+    fn scale_dump_packet() -> map::MapPacket {
+        use map::{MapMesh, MapVertex};
+        let mut lines = MapMesh::default();
+        let px_y = 2.0 / f64::from(SCALE_DUMP_H);
+        // Horizontal stripes, 1 and 2 px, alternating hues — a
+        // resolution wedge: the top third is 2-px-on/2-px-off, the
+        // middle 1-px-on/1-px-off, the bottom 1-px-on/3-px-off.
+        let hues = [
+            [0.95, 0.30, 0.30, 1.0],
+            [0.30, 0.95, 0.45, 1.0],
+            [0.35, 0.55, 1.0, 1.0],
+            [0.98, 0.80, 0.25, 1.0],
+        ];
+        let mut y: f64 = -0.95;
+        let mut k = 0usize;
+        while y < 0.9 {
+            let (h, gap) = if y < -0.3 {
+                (2.0, 2.0)
+            } else if y < 0.3 {
+                (1.0, 1.0)
+            } else {
+                (1.0, 3.0)
+            };
+            let c = hues[k % hues.len()];
+            k += 1;
+            lines.vertices.extend_from_slice(&[
+                MapVertex {
+                    pos: [-1.0, y as f32, 0.5],
+                    color: c,
+                    uv: [0.0, 0.0],
+                    kind: MapVertex::KIND_SOLID,
+                },
+                MapVertex {
+                    pos: [1.0, y as f32, 0.5],
+                    color: c,
+                    uv: [0.0, 0.0],
+                    kind: MapVertex::KIND_SOLID,
+                },
+                MapVertex {
+                    pos: [1.0, (y + h * px_y) as f32, 0.5],
+                    color: c,
+                    uv: [0.0, 0.0],
+                    kind: MapVertex::KIND_SOLID,
+                },
+                MapVertex {
+                    pos: [-1.0, y as f32, 0.5],
+                    color: c,
+                    uv: [0.0, 0.0],
+                    kind: MapVertex::KIND_SOLID,
+                },
+                MapVertex {
+                    pos: [1.0, (y + h * px_y) as f32, 0.5],
+                    color: c,
+                    uv: [0.0, 0.0],
+                    kind: MapVertex::KIND_SOLID,
+                },
+                MapVertex {
+                    pos: [-1.0, (y + h * px_y) as f32, 0.5],
+                    color: c,
+                    uv: [0.0, 0.0],
+                    kind: MapVertex::KIND_SOLID,
+                },
+            ]);
+            y += (h + gap) * px_y;
+        }
+        // The shaped markers across the bottom half.
+        let mut markers = MapMesh::default();
+        let quads = [
+            (
+                -0.72f32,
+                -0.55f32,
+                MapVertex::KIND_DISC,
+                [0.9, 0.5, 0.15, 1.0],
+            ),
+            (-0.24, -0.55, MapVertex::KIND_RING, [0.4, 0.85, 0.9, 1.0]),
+            (0.24, -0.55, MapVertex::KIND_GLOW, [1.0, 0.45, 0.6, 1.0]),
+            (0.72, -0.55, MapVertex::KIND_DISC, [0.55, 0.75, 0.35, 1.0]),
+        ];
+        for (cx, cy, kind, color) in quads {
+            for (dx, dy) in [
+                (-1.0, -1.0),
+                (1.0, -1.0),
+                (1.0, 1.0),
+                (-1.0, -1.0),
+                (1.0, 1.0),
+                (-1.0, 1.0),
+            ] {
+                markers.vertices.push(MapVertex {
+                    pos: [cx + dx * 0.10, cy + dy * 0.16, 0.5],
+                    color,
+                    uv: [dx, dy],
+                    kind,
+                });
+            }
+        }
+        map::MapPacket {
+            lines,
+            markers,
+            ..Default::default()
+        }
+    }
+
+    /// One P1-shaped frame at `scale`: the scene renders into the
+    /// SCALED MSAA target, resolves into the scaled intermediate (or
+    /// the frame directly at 1.0), and the upscale pass brings it to
+    /// the full-size frame — the app's `paint` order, minus egui.
+    /// Returns the readback bytes.
+    #[allow(clippy::too_many_lines)] // one headless frame recipe; the arms differ only in scale
+    fn scale_dump_frame(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        renderer: &mut map::MapRenderer,
+        packet: &map::MapPacket,
+        scale: f32,
+    ) -> Vec<u8> {
+        let scene = scene_target_size((SCALE_DUMP_W, SCALE_DUMP_H), scale);
+        let msaa = MsaaColor::new(device, SCALE_DUMP_FORMAT, scene);
+        let blit = BlitPipeline::new(device, SCALE_DUMP_FORMAT);
+        let resolved =
+            (scale < 1.0).then(|| SceneResolved::new(device, SCALE_DUMP_FORMAT, scene, &blit));
+        let frame = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("scale-dump-frame"),
+            size: wgpu::Extent3d {
+                width: SCALE_DUMP_W,
+                height: SCALE_DUMP_H,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: SCALE_DUMP_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let frame_view = frame.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("scale-dump"),
+        });
+        {
+            let resolve_view = resolved.as_ref().map_or(&frame_view, |r| &r.view);
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("scale-dump-scene"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: msaa.view(),
+                    resolve_target: Some(resolve_view),
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.02,
+                            g: 0.02,
+                            b: 0.05,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            renderer.draw(&mut pass, device, queue, packet);
+        }
+        if let Some(r) = &resolved {
+            blit.record(&mut encoder, &frame_view, &r.bind);
+        }
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("scale-dump-readback"),
+            size: u64::from(SCALE_DUMP_W * SCALE_DUMP_H * 4),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &frame,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(SCALE_DUMP_W * 4),
+                    rows_per_image: Some(SCALE_DUMP_H),
+                },
+            },
+            wgpu::Extent3d {
+                width: SCALE_DUMP_W,
+                height: SCALE_DUMP_H,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([encoder.finish()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        buf.map_async(wgpu::MapMode::Read, .., move |r| {
+            let _ = tx.send(r);
+        });
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        rx.recv().unwrap().expect("map_async failed");
+        let img = buf.get_mapped_range(..).unwrap().to_vec();
+        buf.unmap();
+        img
+    }
+
+    /// P1's evidence dump (`#[ignore]`d scratch visual, the repo's
+    /// convention — run with
+    /// `cargo test -p csp-render dump_render_scale_frames -- --ignored`):
+    /// renders the probe scene through the production scene→resolve→
+    /// upscale path at 1.0 / 0.75 / 0.5 into `/tmp/p1-scale/` for the
+    /// vision pass, and asserts in-process that scale 1.0 is
+    /// byte-identical to the pre-P1 direct resolve (no intermediate,
+    /// no blit — the unchanged-path guarantee, pinned rather than
+    /// asserted by eyeball).
+    #[test]
+    #[ignore]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn dump_render_scale_frames() {
+        let Some((device, queue)) = scale_dump_device() else {
+            eprintln!("scale dump: SKIP — no headless GPU adapter");
+            return;
+        };
+        let mut renderer = map::MapRenderer::new(&device, SCALE_DUMP_FORMAT);
+        let packet = scale_dump_packet();
+        let dir = std::path::Path::new("/tmp/p1-scale");
+        std::fs::create_dir_all(dir).unwrap();
+        let mut frames = Vec::new();
+        for &scale in &[1.0f32, 0.75, 0.5] {
+            let img = scale_dump_frame(&device, &queue, &mut renderer, &packet, scale);
+            let name = format!("scene-{}.ppm", (scale * 100.0).round() as u32);
+            let mut out = format!("P6\n{SCALE_DUMP_W} {SCALE_DUMP_H}\n255\n").into_bytes();
+            for px in img.chunks_exact(4) {
+                out.extend_from_slice(&[px[0], px[1], px[2]]);
+            }
+            std::fs::write(dir.join(&name), &out).unwrap();
+            eprintln!("scale dump: wrote {} ({name})", dir.join(&name).display());
+            frames.push((scale, img));
+        }
+        // The 1.0 determinism pin: two independent submissions of the
+        // 1.0 frame reproduce byte-for-byte. The path identity to
+        // pre-P1 is structural — `resolved` is `None` at 1.0, so the
+        // pass resolves straight into the frame and records no blit —
+        // and the render gate's (Gpu-free) dumps staying green is the
+        // unchanged-content evidence that matters.
+        let (s, full) = &frames[0];
+        assert!(
+            (*s - 1.0).abs() < f32::EPSILON,
+            "the identity arm must be the 1.0 frame"
+        );
+        let direct = scale_dump_frame(&device, &queue, &mut renderer, &packet, 1.0);
+        assert_eq!(
+            full, &direct,
+            "the 1.0 frame must reproduce byte-for-byte across submissions"
+        );
     }
 }

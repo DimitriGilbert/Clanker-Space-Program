@@ -603,7 +603,8 @@ fn push_keep(runs: &mut InstanceRuns, i: u32) {
 /// `w` relief amplitude, the same values the depth vertex stage
 /// displaces through). Pure, deterministic (ascending instance
 /// order), armed-`su` only — the disarmed path never records passes,
-/// so it never calls this.
+/// so [`crate::terrain::TerrainRenderer::draw_shadow`] never calls
+/// this on a row (or an empty terrain list) it would disarm.
 ///
 /// # Far-list exclusion (why only the near list is tested at the
 /// home body)

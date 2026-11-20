@@ -172,6 +172,14 @@ fn normalize(s: &mut Settings, notes: &mut Vec<String>) {
         s.graphics.ui_scale = csp_view::settings::GraphicsSettings::default().ui_scale;
         notes.push("graphics.ui_scale was not a finite number — reset to default".into());
     }
+    // P1: same non-finite guard as ui_scale — the render scale feeds
+    // the scene target math (`Gpu::set_scene_scale` clamps bounds, but
+    // NaN survives a clamp the same way) and a NaN there would poison
+    // every scene target size.
+    if !s.graphics.render_scale.is_finite() {
+        s.graphics.render_scale = csp_view::settings::GraphicsSettings::default().render_scale;
+        notes.push("graphics.render_scale was not a finite number — reset to default".into());
+    }
 }
 
 /// Backfill actions the loaded keymap predates (P14-F2): `bindings`
@@ -324,6 +332,8 @@ salvage_section_fn!(salvage_audio, "audio", csp_view::settings::AudioSettings, s
 });
 salvage_section_fn!(salvage_graphics, "graphics", csp_view::settings::GraphicsSettings, sec, m, {
     "quality": csp_view::settings::GraphicsQuality => sec.quality,
+    "vsync": csp_view::settings::VsyncMode => sec.vsync,
+    "render_scale": f32 => sec.render_scale,
     "ui_scale": f32 => sec.ui_scale,
     "window_size": [u32; 2] => sec.window_size,
 });

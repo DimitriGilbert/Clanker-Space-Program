@@ -122,6 +122,14 @@ swapped for `.png`:
 cargo run -p xtask --bin ppm2png -- /tmp/frame.ppm   # → /tmp/frame.png
 ```
 
+The render-scale evidence dump (P1) lives in `csp-render` and follows
+the same convention — the probe scene through the production
+scene→resolve→upscale path at 1.0/0.75/0.5 into `/tmp/p1-scale/`:
+
+```bash
+cargo test -p csp-render dump_render_scale_frames -- --ignored
+```
+
 ### Golden replay fixtures
 
 - Frozen data sets live in `data/test-fixtures/<scenario>/` — currently
@@ -162,7 +170,8 @@ cargo run -p xtask --bin ppm2png -- /tmp/frame.ppm   # → /tmp/frame.png
   (line ~158) deliberately measures a *regression band*, not a hard gate, to
   avoid flakiness — the §5.4 16 ms VAB kill criterion.
 - All `#[ignore]`d tests are explicit-run visual dumps (render_gate,
-  render_dump_extra, hud_dump), not flake quarantines.
+  render_dump_extra, hud_dump, csp-render's `dump_render_scale_frames`),
+  not flake quarantines.
 
 ## 4. csp-bench — the four headless binaries
 

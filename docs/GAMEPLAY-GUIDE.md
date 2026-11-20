@@ -97,11 +97,14 @@ etc.; hint bars always print the key as your layout labels it.
 
 ### 2.3 Rebinding & settings
 
-`Settings` (Esc): audio volume/mute, UI scale, **max time warp** (×1…×100,000 — a QoL ceiling
-under the ladder, `WARP_CAP_OPTIONS` at `csp-ui/src/settings.rs:163`), new-game difficulty
-(life support, dormant stress — applied only when a save is created), and the full key-binding
-grid with per-action rebind/clear (`Keymap::bind` evicts a stolen key so nothing double-fires).
-Settings persist to `$XDG_CONFIG_HOME/csp/settings.ron` (`csp-app/src/settings_io.rs: config_dir`).
+`Settings` (Esc): audio volume/mute, **vertical sync** and **render scale** (Graphics — vsync off
+uncaps the frame rate where the compositor allows, render scale 0.5–1.0 renders the 3D scene
+smaller and upscales it for fps while the UI stays sharp), UI scale, **max time warp**
+(×1…×100,000 — a QoL ceiling under the ladder, `WARP_CAP_OPTIONS` at `csp-ui/src/settings.rs:163`),
+new-game difficulty (life support, dormant stress — applied only when a save is created), and the
+full key-binding grid with per-action rebind/clear (`Keymap::bind` evicts a stolen key so nothing
+double-fires). Settings persist to `$XDG_CONFIG_HOME/csp/settings.ron`
+(`csp-app/src/settings_io.rs: config_dir`).
 
 ---
 

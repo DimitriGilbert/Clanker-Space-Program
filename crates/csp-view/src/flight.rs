@@ -231,6 +231,16 @@ pub struct FlightPart {
     pub transform: csp_phys::PartTransform,
     /// The classified silhouette in part-local space.
     pub shape: crate::part_mesh::PartShape,
+    /// `ShapeKey::of(&shape)` folded ONCE at part staging (P1): the
+    /// geometry cache's silhouette lookup used to rebuild this key per
+    /// part per frame — a `Vec<(u64, u64)>` allocation per lathe
+    /// profile on every frame's hit path. Cached here the lookup is
+    /// allocation-free; the key still IS the shape's exact bit pattern
+    /// (C1's identity rule — no hash folding, no collision class).
+    /// Private: it is a cache token for `FlightGeomCache`, not part of
+    /// the part's render data; construction sites all live in this
+    /// module (`vessel_parts` and the tests).
+    shape_key: ShapeKey,
     /// The module-family classification — livery tint + banding key.
     pub kind: PartKind,
     /// The real baked model (procedural parts.csar)
@@ -557,6 +567,13 @@ pub struct LiveVesselCount(pub usize);
 /// `csp_ui::flight_hud`.
 #[derive(Resource, Default)]
 pub struct FlightUiData {
+    /// P1's FPS readout — the app's smoothed wall-clock frame timing
+    /// (`View::set_frame_timing`, the §2.5-legal Instant site), NOT a
+    /// sim product: 0.0 until the first window of frames lands, which
+    /// the HUD reads as "hide the row".
+    pub fps: f64,
+    /// The same window's mean frame time (ms).
+    pub frame_ms: f64,
     /// Focused vessel exists.
     pub has_vessel: bool,
     /// Focused vessel id (for throttle commands), `None` otherwise —
@@ -1707,6 +1724,10 @@ fn vessel_parts(
                 }
                 let center = (lo + hi) * 0.5;
                 let half = (hi - lo) * 0.5;
+                let shape = crate::part_mesh::PartShape::Box {
+                    lo: -half,
+                    hi: half,
+                };
                 FlightPart {
                     lo,
                     hi,
@@ -1715,10 +1736,8 @@ fn vessel_parts(
                     // is part-LOCAL, so the box is centred on the local
                     // origin. Centring it again here would double the
                     // offset at emit (`transform.apply(shape_corner)`).
-                    shape: crate::part_mesh::PartShape::Box {
-                        lo: -half,
-                        hi: half,
-                    },
+                    shape_key: ShapeKey::of(&shape),
+                    shape,
                     kind: PartKind::Structural,
                     model: None,
                     node: u64::MAX,
@@ -1769,6 +1788,7 @@ fn vessel_parts(
             lo,
             hi,
             transform: t,
+            shape_key: ShapeKey::of(&shape),
             shape,
             kind,
             model,
@@ -3165,6 +3185,11 @@ struct BakedTri {
     mat: [f32; 3],
 }
 
+/// The silhouette table's inner map: `(kind tag, debris)` → the
+/// variant's baked tris — nested under [`ShapeKey`] so lookups borrow
+/// the caller's key (see `FlightGeomCache::smooth_tris`).
+type SmoothVariants = BTreeMap<(u8, bool), Arc<Vec<BakedTri>>>;
+
 /// The model cache's key: the fit AABB's bit pattern plus the model
 /// `Arc`'s address (pinned by the entry holding its own clone).
 type ModelKey = ([u64; 3], [u64; 3], usize);
@@ -3249,8 +3274,10 @@ fn bake_smooth(shape: &crate::part_mesh::PartShape, kind: PartKind, debris: bool
 pub(crate) struct FlightGeomCache {
     /// The launch complex's baked local tris (layout-version keyed).
     pub(crate) space_center: crate::structures::SpaceCenterBake,
-    /// Kitbash silhouettes: `(shape bits, kind, debris)` → tris.
-    smooth: BTreeMap<(ShapeKey, u8, bool), Arc<Vec<BakedTri>>>,
+    /// Kitbash silhouettes: shape bits → `(kind, debris)` → tris
+    /// (nested so lookups borrow the caller's key — see
+    /// [`Self::smooth_tris`]).
+    smooth: BTreeMap<ShapeKey, SmoothVariants>,
     /// Baked models: `(fit-lo bits, fit-hi bits, model address)` →
     /// the entry holds the model `Arc` (the address PIN — it can't be
     /// reused while the entry lives) beside its tris.
@@ -3273,18 +3300,29 @@ impl FlightGeomCache {
     fn smooth_tris(
         &mut self,
         shape: &crate::part_mesh::PartShape,
+        key: &ShapeKey,
         kind: PartKind,
         debris: bool,
     ) -> Arc<Vec<BakedTri>> {
-        let key = (ShapeKey::of(shape), kind_tag(kind), debris);
-        if let Some(t) = self.smooth.get(&key) {
+        // Nested so the HIT path borrows the caller's key: a flat
+        // `(ShapeKey, tag)` tuple key would clone the lathe profile
+        // Vec on every lookup (P1 — the allocation this cache exists
+        // to avoid). The clone happens only on a miss, beside the
+        // bake it amortizes.
+        let tag = (kind_tag(kind), debris);
+        if let Some(inner) = self.smooth.get(key)
+            && let Some(t) = inner.get(&tag)
+        {
             return Arc::clone(t);
         }
         if self.smooth.len() >= 256 {
             self.smooth.clear();
         }
         let baked = Arc::new(bake_smooth(shape, kind, debris));
-        self.smooth.insert(key, Arc::clone(&baked));
+        self.smooth
+            .entry(key.clone())
+            .or_default()
+            .insert(tag, Arc::clone(&baked));
         self.smooth_bakes += 1;
         baked
     }
@@ -3527,7 +3565,7 @@ pub(crate) fn extract_flight(
                 emit_model_part(v, b, p, &tris, vp, eye);
                 continue;
             }
-            let baked = geom.smooth_tris(&p.shape, p.kind, b.debris);
+            let baked = geom.smooth_tris(&p.shape, &p.shape_key, p.kind, b.debris);
             for t in baked.iter() {
                 // A tri with any corner behind the eye plane drops
                 // whole — the same all-or-nothing rule the VAB packet
@@ -3750,6 +3788,10 @@ mod tests {
                 lo: DVec3::new(-0.5, -0.5, -0.5),
                 hi: DVec3::new(0.5, 0.5, 0.5),
                 transform: csp_phys::PartTransform::IDENTITY,
+                shape_key: ShapeKey::of(&crate::part_mesh::PartShape::Box {
+                    lo: DVec3::new(-0.5, -0.5, -0.5),
+                    hi: DVec3::new(0.5, 0.5, 0.5),
+                }),
                 shape: crate::part_mesh::PartShape::Box {
                     lo: DVec3::new(-0.5, -0.5, -0.5),
                     hi: DVec3::new(0.5, 0.5, 0.5),
@@ -3999,14 +4041,18 @@ mod tests {
     /// true miss returns `None` (the caller closes the menu).
     #[test]
     fn pick_part_names_the_clicked_node() {
-        let mk = |node: u64, lo: DVec3, hi: DVec3| FlightPart {
-            node,
-            lo,
-            hi,
-            transform: csp_phys::PartTransform::IDENTITY,
-            shape: crate::part_mesh::PartShape::Box { lo, hi },
-            kind: PartKind::Structural,
-            model: None,
+        let mk = |node: u64, lo: DVec3, hi: DVec3| {
+            let shape = crate::part_mesh::PartShape::Box { lo, hi };
+            FlightPart {
+                node,
+                lo,
+                hi,
+                transform: csp_phys::PartTransform::IDENTITY,
+                shape_key: ShapeKey::of(&shape),
+                shape,
+                kind: PartKind::Structural,
+                model: None,
+            }
         };
         let vessel = FlightBody {
             id: 0,
@@ -4842,6 +4888,10 @@ mod tests {
                 lo: DVec3::new(-0.9, -0.9, 0.0),
                 hi: DVec3::new(0.9, 0.9, 4.0),
                 transform: csp_phys::PartTransform::IDENTITY,
+                shape_key: ShapeKey::of(&crate::part_mesh::PartShape::Lathe {
+                    axis: [0.0, 0.0],
+                    profile: vec![(0.0, 0.9), (2.0, 0.9), (3.4, 0.6), (4.0, 0.2)],
+                }),
                 shape: crate::part_mesh::PartShape::Lathe {
                     axis: [0.0, 0.0],
                     profile: vec![(0.0, 0.9), (2.0, 0.9), (3.4, 0.6), (4.0, 0.2)],
@@ -4857,6 +4907,10 @@ mod tests {
                     DVec3::new(0.0, 0.0, 4.2),
                     csp_core::DQuat::IDENTITY,
                 ),
+                shape_key: ShapeKey::of(&crate::part_mesh::PartShape::Box {
+                    lo: DVec3::new(-0.5, -0.5, -1.0),
+                    hi: DVec3::new(0.5, 0.5, 0.4),
+                }),
                 shape: crate::part_mesh::PartShape::Box {
                     lo: DVec3::new(-0.5, -0.5, -1.0),
                     hi: DVec3::new(0.5, 0.5, 0.4),
@@ -5055,20 +5109,38 @@ mod tests {
             lo: DVec3::new(-2.0, -1.0, -1.0),
             hi: DVec3::new(1.0, 1.0, 1.0),
         };
-        let t = g.smooth_tris(&box_a, PartKind::Tank, false);
+        // P1's cached-key contract: callers hand the key they folded
+        // at part staging — the fresh `ShapeKey::of` of the SAME shape
+        // must hit the entry it cached (bit-identity preserved, the
+        // lathe profile's Vec included), and a part-cached key of a
+        // DIFFERENT shape must miss. This is the identity the packet
+        // rides on: the extract never re-folds, so a drift here would
+        // silently serve one shape's silhouette under another's key.
+        let lathe = crate::part_mesh::PartShape::Lathe {
+            axis: [0.0, 0.0],
+            profile: vec![(0.0, 0.9), (2.0, 0.9), (3.4, 0.6), (4.0, 0.2)],
+        };
+        let t = g.smooth_tris(&box_a, &ShapeKey::of(&box_a), PartKind::Tank, false);
         assert_eq!(g.smooth_bakes, 1);
         assert!(!t.is_empty());
-        g.smooth_tris(&box_a, PartKind::Tank, false);
+        g.smooth_tris(&box_a, &ShapeKey::of(&box_a), PartKind::Tank, false);
         assert_eq!(g.smooth_bakes, 1, "an identical key must hit");
-        g.smooth_tris(&box_a, PartKind::Tank, true);
+        g.smooth_tris(&box_a, &ShapeKey::of(&box_a), PartKind::Tank, true);
         assert_eq!(g.smooth_bakes, 2, "debris folds into the key");
-        g.smooth_tris(&box_a, PartKind::Engine, false);
+        g.smooth_tris(&box_a, &ShapeKey::of(&box_a), PartKind::Engine, false);
         assert_eq!(g.smooth_bakes, 3, "kind folds into the key (livery)");
-        g.smooth_tris(&box_b, PartKind::Tank, false);
+        g.smooth_tris(&box_b, &ShapeKey::of(&box_b), PartKind::Tank, false);
         assert_eq!(g.smooth_bakes, 4, "shape bits fold into the key");
+        g.smooth_tris(&lathe, &ShapeKey::of(&lathe), PartKind::Tank, false);
+        assert_eq!(g.smooth_bakes, 5, "a lathe profile is its own key");
+        g.smooth_tris(&lathe, &ShapeKey::of(&lathe), PartKind::Tank, false);
+        assert_eq!(
+            g.smooth_bakes, 5,
+            "the cached lathe key must hit (no re-fold)"
+        );
         // The debris variant's colors differ from the clean one.
-        let clean = g.smooth_tris(&box_a, PartKind::Tank, false);
-        let debris = g.smooth_tris(&box_a, PartKind::Tank, true);
+        let clean = g.smooth_tris(&box_a, &ShapeKey::of(&box_a), PartKind::Tank, false);
+        let debris = g.smooth_tris(&box_a, &ShapeKey::of(&box_a), PartKind::Tank, true);
         assert_ne!(
             clean[0].col[0], debris[0].col[0],
             "debris charring must reach the baked colors"

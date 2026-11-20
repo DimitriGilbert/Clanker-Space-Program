@@ -228,7 +228,7 @@ output structs out; the sim is never read (crate doc,
 
 | Panel | Anchor | Purpose / commands |
 |---|---|---|
-| Flight HUD (`flight_hud`) | `csp-ui/src/lib.rs:747` | The telemetry block — ORBIT (Ap/Pe altitudes, times-to-apsis, period), SURFACE (alt, surface/orbital speed, VS, heading, pitch/roll), VESSEL (mass, thrust now/full, TWR local+surface, accel m/s²+g, Δv remaining incl. staged drops), PROP (throttle, tank gauges, mass flow, time-to-depletion, burn time, Isp), staging/parts/warp counts, controls hint. **Movable** `egui::Area` (`.movable(true)`, `lib.rs:753-756`) on the shared `hud_frame()` chip. Input: `FlightHudInput` built from `flight::FlightUiData`. |
+| Flight HUD (`flight_hud`) | `csp-ui/src/lib.rs:747` | The telemetry block — ORBIT (Ap/Pe altitudes, times-to-apsis, period), SURFACE (alt, surface/orbital speed, VS, heading, pitch/roll), VESSEL (mass, thrust now/full, TWR local+surface, accel m/s²+g, Δv remaining incl. staged drops), PROP (throttle, tank gauges, mass flow, time-to-depletion, burn time, Isp), staging/parts/warp counts, the P1 FPS row (smoothed fps + frame ms; hidden until the first 10-frame window fills), controls hint. **Movable** `egui::Area` (`.movable(true)`, `lib.rs:753-756`) on the shared `hud_frame()` chip. Input: `FlightHudInput` built from `flight::FlightUiData`. |
 | Navball (`navball` + `heading_tape`) | `csp-ui/src/navball.rs:203`/`:331` | KSP-style attitude ball + heading tape, pure egui painter over body-frame vectors (`NavballInput`). Its own **movable** Area (`lib.rs:1012-1020`). |
 | Actions strip (`flight_action_bar`) | `csp-ui/src/program.rs:2542` | Bottom-right window: "⚛ run science (N)" one-click, transmit/recover pooled rows, deploy-parachute rows, Recover vessel / Terminate, "more…" opens Program. Emits `ProgramCommand`s resolved against the same `ProgramMirror` as the window. |
 | Right-click part menu (`part_menu`) | `csp-ui/src/program.rs:2432` | KSP-style per-part action list at the click pixel. State `PartMenuState` (`program.rs:2228`) — `build_ui` closes it when the program mirror's focus moves off its vessel (`lib.rs:729-733`). Picking: `flight::pick_part` (§5.3). |
@@ -245,7 +245,7 @@ output structs out; the sim is never read (crate doc,
 
 | Panel | Anchor | Purpose |
 |---|---|---|
-| Settings window (`settings_panel`) | `csp-ui/src/settings.rs:754` | Keymap rebind (arms capture), ui_scale, warp cap, audio volumes, new-game difficulty flags, reset-to-defaults. Apply rides `settings_apply`; the app owns file IO. |
+| Settings window (`settings_panel`) | `csp-ui/src/settings.rs:754` | Keymap rebind (arms capture), Graphics: vertical sync + render scale (P1, §7.2.2) + ui_scale, warp cap, audio volumes, new-game difficulty flags, reset-to-defaults. Apply rides `settings_apply`; the app owns file IO. |
 | Crash dialog (`crash_dialog`) | `csp-ui/src/lib.rs:219` | §2.13 Fatal: reason + bug-report bundle path ("send this to the developer"). Session turns read-only. |
 | Tutorial checklist (`tutorial_overlay`) | `csp-ui/src/tutorial.rs:318` | 10-step first-flight checklist (`STEPS`, `tutorial.rs:70`; VAB steps coached from inside the editor). Progress predicates run in Presentation (`csp-view/src/tutorial.rs:62` `tutorial_drive`) against staged mirrors only. Dismiss/Restart are session state; progress survives hide/show. |
 | Debug panel (`debug_panel`) | `csp-ui/src/lib.rs:170` | Dev scaffold: adapter/backend, tick/frame counters, warp requested/effective. Off by default; `ToggleDebug` key. Hidden in VAB. |
@@ -584,23 +584,33 @@ states + on-rails flags + maneuver nodes + tick, staged by
 `Gpu` (`crates/csp-render/src/lib.rs:176`): wgpu 30, `Backends::PRIMARY`,
 HighPerformance adapter, **`required_features: Features::empty()`**
 (`lib.rs:227` — Baseline everywhere; see §10), sRGB surface format
-(non-sRGB fallback warns loudly — output renders ~2× dark), AutoVsync,
-frame latency 2. Uncaptured errors are logged-and-deduped (§2.13 Cosmetic
-class), device-lost degrades to per-frame reconfigure. `begin_frame`
-(`:345`) returns `Ok/Reconfigure/Skip`. 4× MSAA on every surface-bound
-pipeline via one shared `MSAA_SAMPLES = 4` constant and the `MsaaColor`
-resolve target (`lib.rs:60-130`) — there was no AA anywhere before C11-F1.
+(non-sRGB fallback warns loudly — output renders ~2× dark), frame
+latency 2. The present mode is a P1 parameter (`Gpu::new`, live via
+`Gpu::set_present_mode`): the settings' `vsync` (`auto`/`off`) maps to
+`AutoVsync`/`AutoNoVsync` in `csp-app` — a change reconfigures the
+surface on the same path `resize` takes (compositors that always
+vsync quietly absorb an `off`). Uncaptured errors are logged-and-deduped
+(§2.13 Cosmetic class), device-lost degrades to per-frame reconfigure.
+`begin_frame` (`:345`) returns `Ok/Reconfigure/Skip`. 4× MSAA on every
+surface-bound pipeline via one shared `MSAA_SAMPLES = 4` constant and
+the `MsaaColor` resolve target (`lib.rs:60-130`) — there was no AA
+anywhere before C11-F1. The scene render scale (P1, §7.2.2) sizes the
+MSAA target and the optional resolve intermediate; `scene_target_size`
+(`lib.rs`) is the pure target math (`round(surface × scale)` per axis,
+1-px floor, clamped, unit-tested).
 
 ### 7.2 Pass/pipeline inventory
 
 **Flight mode runs TWO scene passes per frame** (§7.2.1's depth
 partition): `scene-far` (cleared 0.02/0.02/0.05, MSAA, no resolve,
 depth cleared 0.0 — the far field) then `scene` (color `LoadOp::Load`,
-the same depth attachment cleared AGAIN, MSAA resolve to the
-swapchain). Map/VAB keep one scene pass (clear + resolve,
-`csp-app/src/lib.rs:1887-2030`), then a separate **egui pass** (no
-depth, `LoadOp::Load`) — wgpu requires pass/pipeline depth formats to
-match, and egui's pipeline has none (`csp-app/src/lib.rs:2059`).
+the same depth attachment cleared AGAIN, MSAA resolve to the swapchain —
+or to the §7.2.2 intermediate below render scale 1.0). Map/VAB keep one
+scene pass (clear + resolve, `csp-app/src/lib.rs:1887-2030`), then
+`Gpu::blit_scene` (no-op at scale 1.0, §7.2.2) and a separate **egui
+pass** (no depth, `LoadOp::Load`) — wgpu requires pass/pipeline depth
+formats to match, and egui's pipeline has none
+(`csp-app/src/lib.rs:2059`).
 Far-pass draw order (`csp-app/src/lib.rs:1767-1824`): terrain far
 phase (sky backdrop + far instances + far ocean) → flight far stream
 (the fallback sky). Near-pass order: map packet (Map mode) → VAB
@@ -715,6 +725,57 @@ extra terrain draw call (the far instance range) and one extra ocean
 draw, plus one extra render-pass begin/end. The render gate's wall
 time is unchanged within noise (§8.2's log).
 
+### 7.2.2 The render-scale path (P1 — settings-driven resolution scaling)
+
+`GraphicsSettings::render_scale` (`csp-ui/src/settings.rs`, 0.5–1.0 in
+0.05 steps, default 1.0) shrinks the SCENE while the UI stays native —
+the player's fill-rate control at high resolutions. The pipeline
+shape, end to end:
+
+1. **Apply**: `csp-app`'s `apply_live_settings` clamps the value and
+   calls `Gpu::set_scene_scale` → `refresh_scene_targets`, the SAME
+   recreate path a `Resized` event takes (the MSAA target rebuilds at
+   `scene_target_size(surface, scale)`). The mode renderers' depth
+   targets follow through `App::resize_scene_attachments`, shared by
+   the resize handler and the scale change — one path, no third
+   variant.
+2. **Scene render**: every scene pass (far + near, map, VAB) renders
+   into the scaled MSAA target against the scaled depth targets
+   (`FlightRenderer::resize` / `VabRenderer`'s scene half). Geometry
+   is projected to NDC — resolution-independent — so the scaled frame
+   is the same image at fewer pixels; only MSAA edge quality scales.
+   At scale 1.0 the pass resolves STRAIGHT INTO the swapchain view,
+   the pre-P1 path verbatim — no intermediate texture, no blit pass,
+   byte-identical frame content (what the render gate's dumps pin).
+3. **Resolve + upscale** (scale < 1.0 only): the pass resolves into a
+   scaled single-sampled intermediate (`SceneResolved`,
+   RENDER_ATTACHMENT | TEXTURE_BINDING), then `Gpu::blit_scene`
+   records one fullscreen-triangle pass (`blit.wgsl`, linear filter —
+   a straight upscale, scale ≤ 1 means downscaling never happens)
+   into the swapchain frame, and the egui pass composites over it at
+   NATIVE resolution — crisp text is the whole point of the two-step
+   resolve/blit instead of rendering everything small.
+
+**What scales and what doesn't** (the audit): the scene color MSAA
+target and the flight/VAB scene DEPTH targets scale (they share one
+pass — wgpu requires matching sizes). The shadow cascade maps (2048²
+fixed, `shadow.rs`), the VAB pick pass (`pick_targets` at SURFACE size
+— its rasterization is indexed by physical click pixels), the egui
+frame, and the swapchain itself stay native. The far-field partition
+(§7.2.1) keys on clip-space depth, not pixels, and both of its passes
+share the scaled color+depth attachments — resizing them together
+cannot change the partition (the render gate pins the two-pass shape
+at its own size; scaling only resamples it). Camera viewports feed
+full surface size (`run_frame`); aspect is identical (uniform per-axis
+scale), so projections are unchanged.
+
+The FPS readout that makes the scale worth reaching for: the flight
+HUD chip's FPS row (`fps`/`frame_ms` on `FlightHudInput`), fed by
+`csp-app`'s `FrameTimingSmoother` — the §2.5-legal wall-clock dt,
+mean over a 10-frame window, into `View::set_frame_timing` →
+`FlightUiData` → UiBuild. Pair it with vsync off: fps climbing means
+CPU-bound, standing still means GPU-bound — lower the scale.
+
 ### 7.3 WGSL inventory
 
 | File | Entry points | Renders |
@@ -724,8 +785,9 @@ time is unchanged within noise (§8.2's log).
 | `flight.wgsl` (208) | `vs_main`/`fs_main` | Same per-pixel lighting as VAB minus pick, plus the unlit passthrough (`nrm ≈ 0`); ACES (Narkowicz) tone-map shared with terrain so lit hulls match the ground. Since 3b: the direct-sun terms multiply the cascade `sun_visibility` (a C16-F3 duplication of terrain.wgsl's receive half — no WGSL include mechanism) |
 | `flight_shadow.wgsl` (69) | `vs_shadow0`/`vs_shadow1` (3b craft cast, depth-only) | Drops the flight stream into §7.4's cascade map. A dedicated module on purpose: the cast pipelines ride a minimal group(0) (`SU` alone at binding 8), and sharing flight.wgsl left its `light`/group(1) declarations dangling against that layout, which de-registered the uniform binding on-device (the cast silently discarded — see the file header) |
 | `terrain.wgsl` (1391) | `vs_terrain`/`fs_terrain` (`:414`/`:893`), `vs_sky`/`fs_sky` (`:1132`/`:1263`), `vs_shadow0`/`vs_shadow1` (`:440`/`:448`, depth-only cascade pass; the shared displacement is `terrain_displace`, `:385`) | Quadtree terrain, ocean, and the sky/atmosphere/starfield — see §8; the shadow entry points feed §7.4's cascade map |
+| `blit.wgsl` (P1) | `vs`/`fs` | §7.2.2's render-scale upscale — one fullscreen triangle sampling the scaled resolved scene (linear) into the swapchain |
 
-All five are parse+validate gated by a unit test
+All six are parse+validate gated by a unit test
 (`shaders_parse_and_validate`, `csp-render/src/lib.rs:484`) so shader
 regressions die in `cargo test`, not at device init.
 
