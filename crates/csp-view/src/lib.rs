@@ -2279,6 +2279,11 @@ impl View {
         world.insert_resource(flight::FlightUiData::default());
         world.insert_resource(flight::StagePlans::default());
         world.insert_resource(flight::FlightFrame::default());
+        // C1: the extract's geometry cache — baked launch-complex and
+        // part-silhouette/model triangles keyed by layout/shape
+        // identity. Pure presentation data; position/orientation stay
+        // per-frame and never enter the keys.
+        world.insert_resource(flight::FlightGeomCache::default());
         // §2.6.4: the latched-vessel weld cache — the staging path's
         // session state, so a parked craft isn't re-welded per frame.
         world.insert_resource(flight::LatchedWeldCache::default());

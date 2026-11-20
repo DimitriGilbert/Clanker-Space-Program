@@ -225,6 +225,9 @@ pub struct TerrainCache {
     /// Completed fields per cache key — a body visited before swaps
     /// back in instantly (bounded by body count × profile).
     done: BTreeMap<CacheKey, Arc<rt::HeightField>>,
+    /// C2: the ocean-cull probe table for the current heightfield
+    /// (rebuilt with it — see [`SeaProbeMemo`]).
+    sea: SeaProbeMemo,
     /// The in-flight background bake for `key` (native only).
     #[cfg(not(target_arch = "wasm32"))]
     pending: Option<std::sync::Mutex<std::sync::mpsc::Receiver<Arc<rt::HeightField>>>>,
@@ -317,6 +320,55 @@ impl TerrainCache {
         }
         self.field.clone()
     }
+
+    /// The ocean-cull answer for `id`, memoized (C2). On a miss this
+    /// runs the verbatim [`patch_might_hold_sea`]; on a hit it returns
+    /// the memoized answer, served ONLY inside the phase window the
+    /// miss proved the answer stable over — so every frame's packet is
+    /// bit-identical to an always-recompute extract. Callers pass the
+    /// same `unspin` they would have handed the probe plus the
+    /// `(axis, wrapped phase)` it derives from.
+    #[allow(clippy::too_many_arguments)] // the probe's inputs + the phase pair
+    fn sea_probe(
+        &mut self,
+        field: &rt::HeightField,
+        id: rt::PatchId,
+        amplitude_m: f64,
+        datum_m: f64,
+        radius_m: f64,
+        unspin: DQuat,
+        phase: f64,
+        axis: DVec3,
+    ) -> bool {
+        let bits = (
+            [axis.x.to_bits(), axis.y.to_bits(), axis.z.to_bits()],
+            amplitude_m.to_bits(),
+            datum_m.to_bits(),
+            radius_m.to_bits(),
+        );
+        if self.sea.header_key.as_ref() != self.key.as_ref() || self.sea.header_bits != Some(bits) {
+            self.sea.entries.clear();
+            self.sea.header_key = self.key.clone();
+            self.sea.header_bits = Some(bits);
+            self.sea.hits = 0;
+            self.sea.misses = 0;
+            self.sea.rebuilds += 1;
+        }
+        let tau = 2.0 * core::f64::consts::PI;
+        if let Some(p) = self.sea.entries.get(&id)
+            && (phase - p.lo).rem_euclid(tau) <= (p.hi - p.lo).rem_euclid(tau)
+        {
+            self.sea.hits += 1;
+            return p.holds;
+        }
+        let p = sea_probe_eval(field, id, amplitude_m, datum_m, radius_m, unspin, phase);
+        if self.sea.entries.len() >= 4096 {
+            self.sea.entries.clear();
+        }
+        self.sea.entries.insert(id, p);
+        self.sea.misses += 1;
+        p.holds
+    }
 }
 
 /// Does this leaf patch plausibly touch the ocean datum? Samples a
@@ -334,6 +386,13 @@ impl TerrainCache {
 /// `unspin` is the inertial→fixed rotation (`R(axis, −phase)`): patch
 /// directions are inertial but the heightfield is body-fixed — the
 /// same conjugate the shader applies before `height_at`.
+///
+/// C2: a pure function of `(field, id, amplitude, datum, radius,
+/// unspin)` — every input but the phase is pinned by the heightfield
+/// cache key (the body's authored table), and the phase's slow motion
+/// is memoized with a PROVEN stability window by
+/// [`TerrainCache::sea_probe`] (below); this function stays the
+/// verbatim recompute path.
 fn patch_might_hold_sea(
     field: &rt::HeightField,
     id: rt::PatchId,
@@ -352,6 +411,218 @@ fn patch_might_hold_sea(
     }
     let margin = (amplitude_m * rt::OCEAN_CULL_FRAC).max(250.0);
     lo * amplitude_m <= (datum_m - radius_m) + margin
+}
+
+// ---------------------------------------------------------------------------
+// C2: the sea-cull probe memo.
+// ---------------------------------------------------------------------------
+
+/// Window cap (rad): every proven stability window is clamped to this
+/// span around the evaluated phase. Generous against per-frame phase
+/// motion (Terrin's 6 h day advances ~5 µrad per 64 Hz tick) while
+/// keeping the latitude-band bound in `sea_probe_eval` honest.
+const SEA_PROBE_WINDOW_CAP: f64 = core::f64::consts::PI / 32.0;
+
+/// `HeightField::texel` mirrored (the csp-core original is private) —
+/// the same wrap-u/clamp-v edge rules, so the cell corners
+/// `sea_probe_window` reads are the exact corners `sample_dir`
+/// interpolated.
+fn texel(field: &rt::HeightField, i: i64, j: i64) -> f64 {
+    let i = i.rem_euclid(field.width as i64);
+    let j = j.clamp(0, field.height as i64 - 1);
+    f64::from(field.data[j as usize * field.width as usize + i as usize])
+}
+
+/// One memoized probe: the answer plus the phase window it is proven
+/// over (C2).
+#[derive(Clone, Copy)]
+struct SeaProbe {
+    /// The memoized `patch_might_hold_sea` answer.
+    holds: bool,
+    /// Wrapped-phase window lower bound.
+    lo: f64,
+    /// Wrapped-phase window upper bound.
+    hi: f64,
+}
+
+/// One sample's stability inputs (the `sea_probe_eval` proof's
+/// per-sample terms).
+#[derive(Clone, Copy)]
+struct SampleBound {
+    /// The sample's normalized height (bit-identical to the probe's
+    /// own evaluation).
+    h: f64,
+    /// `|Δh| ≤ rate·δ` over a phase move δ (normalized per radian).
+    rate: f64,
+    /// Phase radius that keeps the sample inside its bilinear cell.
+    cell: f64,
+}
+
+/// The sample's stability radius: the phase distance its `margin`
+/// (metres, derated) and cell slack prove the height stays on its own
+/// side of the threshold `t_m` over.
+fn sample_radius(b: &SampleBound, amplitude_m: f64, t_m: f64) -> f64 {
+    // Relative derate: the bound's own float error (mapping, cos,
+    // products) stays far under 1e-9 of the margin.
+    let margin = (b.h * amplitude_m - t_m).abs() * (1.0 - 1.0e-9);
+    if !b.rate.is_finite() || margin == 0.0 {
+        return 0.0;
+    }
+    if b.rate > 0.0 {
+        (margin / (amplitude_m * b.rate)).min(b.cell)
+    } else {
+        // Flat cell: constant within it; only the cell walls bound
+        // the reuse.
+        b.cell
+    }
+}
+
+/// The PROVEN stability window of one probe evaluation: the wrapped
+/// phase interval `[lo, hi]` (span ≤ `2·SEA_PROBE_WINDOW_CAP`) within
+/// which the probe's answer cannot change, so the memo may serve it
+/// in place of a recompute with bit-identical effect on the packet.
+///
+/// **The proof.** The answer flips only when the argmin sample's
+/// height crosses the cull threshold `t_m = (datum − radius) + margin`
+/// (metres; the sample contributes `h·amplitude`): for a TRUE answer
+/// the min staying ≤ `t_m` keeps it true (any other sample only
+/// matters by dropping lower, which keeps the min lower), and for a
+/// FALSE answer every sample must stay > `t_m` since any one dipping
+/// flips it. Each of the 25 samples sits at `unspin.rotate(c_i)` — as
+/// the phase moves by δ the direction moves along the unit sphere by
+/// arc ≤ δ, so its latitude moves ≤ δ and its longitude ≤ δ/cos λ at
+/// every latitude the path visits; the pole-ward edge of the band,
+/// `cos(|λ| + CAP)`, bounds that factor for any δ ≤ CAP (a band
+/// touching a pole yields a zero window). Through the equirect
+/// mapping (`u`/`v` mirrored from `sample_dir`) that bounds the index
+/// motion, and the in-cell bilinear partials are bounded by the
+/// cell's edge differences (`|∂h/∂u| ≤ max(|b−a|, |d−c|)`,
+/// `|∂h/∂v| ≤ max(|c−a|, |d−b|)` — each partial is linear in the
+/// other coordinate, so its extremes sit at the cell edges). So per
+/// sample `|Δh_i| ≤ rate_i·δ`, valid while the sample stays inside
+/// the cell the bounds were read from (`cell` enforces exactly
+/// that). For TRUE answers δ ≤ the ARGMIN sample's own radius keeps
+/// the min on its side; for FALSE answers δ ≤ the minimum radius over
+/// all samples keeps every sample on its side. QED.
+#[allow(clippy::too_many_arguments)] // the probe's input set + the phase
+fn sea_probe_eval(
+    field: &rt::HeightField,
+    id: rt::PatchId,
+    amplitude_m: f64,
+    datum_m: f64,
+    radius_m: f64,
+    unspin: DQuat,
+    phase: f64,
+) -> SeaProbe {
+    // The verbatim answer — the very code the pre-C2 extract ran per
+    // leaf per frame (and the differential test's brute-force side).
+    let holds = patch_might_hold_sea(field, id, amplitude_m, datum_m, radius_m, unspin);
+    let t_m = (datum_m - radius_m) + (amplitude_m * rt::OCEAN_CULL_FRAC).max(250.0);
+    let (corner, du, dv) = rt::patch_cube(id);
+    let w = f64::from(field.width);
+    let h = f64::from(field.height);
+    // The per-sample bound terms (the loop re-walks the probe's own
+    // 25 directions — a miss-only cost, amortized over the window).
+    let mut bounds = [SampleBound {
+        h: 0.0,
+        rate: f64::INFINITY,
+        cell: 0.0,
+    }; 25];
+    let mut lo = f64::INFINITY;
+    let mut argmin = 0usize;
+    for j in 0..5 {
+        for i in 0..5 {
+            let c = corner + du * (i as f64 / 4.0) + dv * (j as f64 / 4.0);
+            let dir = unspin.rotate(c / c.norm());
+            let sample = field.sample_dir(dir);
+            if sample < lo {
+                lo = sample;
+                argmin = j * 5 + i;
+            }
+            // The sample's equirect cell, mirroring `sample_dir`'s
+            // mapping so the corner reads below are the corners it
+            // interpolated. (std `asin`/`atan2` here vs csp-core's
+            // libm: any ulp disagreement can only land ON a cell
+            // boundary, where the cell slack is ~0 and the window
+            // collapses — sound; the margin derate absorbs the same
+            // worry on the bound itself.)
+            let lat = dir.z.clamp(-1.0, 1.0).asin();
+            let lon = dir.y.atan2(dir.x);
+            let u = (lon + core::f64::consts::PI) / (2.0 * core::f64::consts::PI) * w - 0.5;
+            let v = (lat + core::f64::consts::FRAC_PI_2) / core::f64::consts::PI * h - 0.5;
+            let (u0, v0) = (u.floor() as i64, v.floor() as i64);
+            let (fu, fv) = (u - u0 as f64, v - v0 as f64);
+            let (a, b) = (texel(field, u0, v0), texel(field, u0 + 1, v0));
+            let (cc, d) = (texel(field, u0, v0 + 1), texel(field, u0 + 1, v0 + 1));
+            let lu = (b - a).abs().max((d - cc).abs());
+            let lv = (cc - a).abs().max((d - b).abs());
+            let cos_b = (lat.abs() + SEA_PROBE_WINDOW_CAP).cos();
+            let (rate, cell_u) = if cos_b > 0.0 {
+                (
+                    lu * w / (2.0 * core::f64::consts::PI * cos_b) + lv * h / core::f64::consts::PI,
+                    fu.min(1.0 - fu) * 2.0 * core::f64::consts::PI * cos_b / w,
+                )
+            } else {
+                // The δ-band touches a pole: longitude rate unbounded.
+                (f64::INFINITY, 0.0)
+            };
+            let cell_v = fv.min(1.0 - fv) * core::f64::consts::PI / h;
+            bounds[j * 5 + i] = SampleBound {
+                h: sample,
+                rate,
+                cell: cell_u.min(cell_v),
+            };
+        }
+    }
+    debug_assert_eq!(
+        holds,
+        lo * amplitude_m <= t_m,
+        "the eval loop must mirror the verbatim probe"
+    );
+    let r = if holds {
+        // TRUE: the argmin staying ≤ t_m keeps the answer — and it
+        // carries the LARGEST below-threshold buffer of the samples.
+        sample_radius(&bounds[argmin], amplitude_m, t_m)
+    } else {
+        // FALSE: any sample dipping flips it — every sample stays.
+        bounds
+            .iter()
+            .map(|b| sample_radius(b, amplitude_m, t_m))
+            .fold(SEA_PROBE_WINDOW_CAP, f64::min)
+    }
+    .min(SEA_PROBE_WINDOW_CAP);
+    let tau = 2.0 * core::f64::consts::PI;
+    SeaProbe {
+        holds,
+        lo: (phase - r).rem_euclid(tau),
+        hi: (phase + r).rem_euclid(tau),
+    }
+}
+
+/// The sea-cull probe table (C2): per `(heightfield cache key,
+/// PatchId)` with proven phase windows, so a spinning body's
+/// slow-moving probes are answered from the table instead of 25
+/// heightfield samples per leaf per frame. Rebuilt when the
+/// heightfield, spin axis or the body's amplitude/datum/radius rows
+/// change; bounded at 4096 entries (a surface-locked camera's
+/// co-rotating leaf set sweeps the whole sphere over a body day — the
+/// cap keeps a long flight bounded; a clear re-computes, never
+/// mis-answers).
+#[derive(Default)]
+struct SeaProbeMemo {
+    /// Heightfield cache key the table was built under.
+    header_key: Option<CacheKey>,
+    /// Header bits — spin axis `xyz`, amplitude, datum, radius.
+    header_bits: Option<([u64; 3], u64, u64, u64)>,
+    /// The memoized probes.
+    entries: BTreeMap<rt::PatchId, SeaProbe>,
+    /// Lookups served from the table since the last rebuild (test
+    /// observability).
+    hits: u64,
+    /// Recomputations since the last rebuild.
+    misses: u64,
+    /// Rebuilds (heightfield/parameter changes).
+    rebuilds: u32,
 }
 
 /// The chase camera's ground floor along a unit `dir` (bubble-frame,
@@ -638,7 +909,16 @@ pub(crate) fn build_packet(
                 near_terrain.push(inst);
             }
             if let Some(datum) = body.ocean_datum_m
-                && patch_might_hold_sea(field, id, body.amplitude_m, datum, env.radius_m, unspin)
+                && cache.sea_probe(
+                    field,
+                    id,
+                    body.amplitude_m,
+                    datum,
+                    env.radius_m,
+                    unspin,
+                    spin_phase,
+                    env.spin_axis,
+                )
             {
                 // Ocean quads sit flat at the datum; the extent bound
                 // still applies through the terrain row's amplitude
@@ -1409,5 +1689,261 @@ mod tests {
                 ndc[1]
             );
         }
+    }
+
+    // ==================== C2: the sea-cull probe memo ================
+
+    /// The C2 test scene: Terrin's seed with an ocean at the datum
+    /// radius and a spinning Z-axis day, at the Legacy bake dims (the
+    /// faster field).
+    fn sea_scene() -> (TerrainConfig, FlightEnv) {
+        let mut bodies = BTreeMap::new();
+        bodies.insert(
+            "terrin".to_owned(),
+            TerrainBody {
+                seed: 601,
+                amplitude_m: 3_600.0,
+                profile: ReliefProfile::Legacy,
+                ocean_datum_m: Some(600_000.0),
+                biome: None,
+            },
+        );
+        let env = FlightEnv {
+            body_center: DVec3::ZERO,
+            radius_m: 600_000.0,
+            atm_top_m: 0.0,
+            atm_scale_height_m: 0.0,
+            mu_m3_per_s2: 1.0,
+            body: Some(csp_data::BodyId::from("terrin")),
+            sun_dir: DVec3::X,
+            spin_axis: DVec3::Z,
+            spin_phase: 0.0,
+            body_spin: DVec3::ZERO,
+        };
+        (
+            TerrainConfig {
+                bodies,
+                ..Default::default()
+            },
+            env,
+        )
+    }
+
+    /// Pump the background bake for `body` until the field lands (the
+    /// arrival-contract pattern).
+    fn baked_field(cache: &mut TerrainCache, body: &str, seed: u64) -> Arc<rt::HeightField> {
+        for _ in 0..4_000 {
+            if let Some(f) = cache.field(body, seed, ReliefProfile::Legacy) {
+                return f;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("sea-probe test: the {body} bake never landed");
+    }
+
+    /// C2's differential proof: across a phase schedule that exercises
+    /// both memo HITS (sub-window steps, the live-flight pattern) and
+    /// MISSES (window-crossing jumps), the memoized probe must equal
+    /// the verbatim brute-force evaluation at every step — and the
+    /// stored windows must not overreach (brute checks at their
+    /// interior, including just inside both ends).
+    #[test]
+    #[allow(clippy::too_many_lines)] // one differential sweep + the window-edge audit — splitting dilutes the invariant
+    fn sea_probe_memo_matches_bruteforce_and_windows_hold() {
+        let (_cfg, mut env) = sea_scene();
+        let mut cache = TerrainCache::default();
+        let field = baked_field(&mut cache, "terrin", 601);
+        // Leaves from three vantages — pole plus two tilted equatorial
+        // eyes — so the probe set spans shore and open ocean.
+        let mut leaves: Vec<rt::PatchId> = Vec::new();
+        for eye in [
+            DVec3::new(0.0, 0.0, 615_000.0),
+            DVec3::new(604_000.0, 0.0, 60_000.0),
+            DVec3::new(300_000.0, 300_000.0, 300_000.0),
+        ] {
+            leaves.extend(rt::select_patches(
+                eye,
+                600_000.0,
+                3_600.0,
+                &rt::LodConfig::default(),
+            ));
+        }
+        leaves.sort_unstable();
+        leaves.dedup();
+        assert!(
+            leaves.len() > 50,
+            "the vantages must select a real leaf set (got {})",
+            leaves.len()
+        );
+        let tau = 2.0 * core::f64::consts::PI;
+        // Fine steps (the ~5 µrad/frame live pattern), then jumps that
+        // cross windows, then fine steps again — inside the new windows.
+        let mut phases = Vec::new();
+        let mut p = 0.3_f64;
+        for _ in 0..60 {
+            phases.push(p);
+            p += 1.0e-5;
+        }
+        for _ in 0..8 {
+            p += 0.02;
+            phases.push(p);
+        }
+        for _ in 0..30 {
+            phases.push(p);
+            p += 1.0e-5;
+        }
+        let mut saw_hold = false;
+        let mut saw_drop = false;
+        for &phi in &phases {
+            env.spin_phase = phi;
+            let unspin = crate::structures::spin_rotation(&env).conjugate();
+            let wrapped = crate::structures::wrapped_spin_phase(&env);
+            for &id in &leaves {
+                let memo = cache.sea_probe(
+                    &field,
+                    id,
+                    3_600.0,
+                    600_000.0,
+                    600_000.0,
+                    unspin,
+                    wrapped,
+                    env.spin_axis,
+                );
+                let brute = patch_might_hold_sea(&field, id, 3_600.0, 600_000.0, 600_000.0, unspin);
+                assert_eq!(
+                    memo, brute,
+                    "memo diverged from brute force at phase {phi:.8} for {id:?}"
+                );
+                saw_hold |= memo;
+                saw_drop |= !memo;
+            }
+        }
+        assert!(
+            saw_hold && saw_drop,
+            "the leaf set must straddle a shoreline (both answers live)"
+        );
+        assert!(
+            cache.sea.hits > 0 && cache.sea.misses > 0,
+            "the schedule must exercise hits (got {}) and misses (got {})",
+            cache.sea.hits,
+            cache.sea.misses
+        );
+        assert!(
+            cache.sea.hits > cache.sea.misses,
+            "the memo must actually carry the load (hits {}, misses {})",
+            cache.sea.hits,
+            cache.sea.misses
+        );
+        // Window soundness: brute checks inside the stored windows —
+        // near both ends and the middle. An overreaching window fails
+        // HERE, not in a screenshot.
+        let mut checked = 0;
+        for (id, e) in cache.sea.entries.iter().take(48) {
+            let span = (e.hi - e.lo).rem_euclid(tau);
+            if span <= 0.0 {
+                continue;
+            }
+            for frac in [0.02_f64, 0.5, 0.98] {
+                let phi = (e.lo + span * frac).rem_euclid(tau);
+                env.spin_phase = phi;
+                let unspin = crate::structures::spin_rotation(&env).conjugate();
+                let brute =
+                    patch_might_hold_sea(&field, *id, 3_600.0, 600_000.0, 600_000.0, unspin);
+                assert_eq!(
+                    brute, e.holds,
+                    "window [{:.6}, {:.6}] (span {span:.3e}) overreaches for {id:?}",
+                    e.lo, e.hi
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "at least one window must be non-degenerate");
+    }
+
+    /// C2 invalidation: a heightfield change (new body key) or a
+    /// header change (spin axis, datum) rebuilds the table — the
+    /// probes re-run instead of serving stale shoreline answers.
+    #[test]
+    fn sea_probe_table_rebuilds_when_inputs_change() {
+        let (_cfg, mut env) = sea_scene();
+        let mut cache = TerrainCache::default();
+        let field = baked_field(&mut cache, "terrin", 601);
+        let id = rt::PatchId {
+            face: 2,
+            level: 6,
+            x: 17,
+            y: 40,
+        };
+        let unspin = crate::structures::spin_rotation(&env).conjugate();
+        let wrapped = crate::structures::wrapped_spin_phase(&env);
+        cache.sea_probe(
+            &field,
+            id,
+            3_600.0,
+            600_000.0,
+            600_000.0,
+            unspin,
+            wrapped,
+            env.spin_axis,
+        );
+        assert_eq!(cache.sea.rebuilds, 1, "the first probe builds the table");
+        assert_eq!(cache.sea.misses, 1);
+        // Same inputs: a hit, no rebuild.
+        cache.sea_probe(
+            &field,
+            id,
+            3_600.0,
+            600_000.0,
+            600_000.0,
+            unspin,
+            wrapped,
+            env.spin_axis,
+        );
+        assert_eq!(cache.sea.rebuilds, 1);
+        assert_eq!(cache.sea.hits, 1);
+        // A different spin axis rebuilds (the header bits).
+        env.spin_axis = DVec3::X;
+        let unspin = crate::structures::spin_rotation(&env).conjugate();
+        cache.sea_probe(
+            &field,
+            id,
+            3_600.0,
+            600_000.0,
+            600_000.0,
+            unspin,
+            wrapped,
+            env.spin_axis,
+        );
+        assert_eq!(cache.sea.rebuilds, 2, "an axis change must rebuild");
+        assert_eq!(
+            cache.sea.misses, 1,
+            "the miss counter resets with the rebuild"
+        );
+        // A different ocean datum rebuilds.
+        cache.sea_probe(
+            &field,
+            id,
+            3_600.0,
+            605_000.0,
+            600_000.0,
+            unspin,
+            wrapped,
+            env.spin_axis,
+        );
+        assert_eq!(cache.sea.rebuilds, 3, "a datum change must rebuild");
+        // A different heightfield (second body) rebuilds.
+        let mun = baked_field(&mut cache, "mun", 7);
+        let unspin = crate::structures::spin_rotation(&env).conjugate();
+        cache.sea_probe(
+            &mun,
+            id,
+            3_600.0,
+            600_000.0,
+            600_000.0,
+            unspin,
+            wrapped,
+            env.spin_axis,
+        );
+        assert_eq!(cache.sea.rebuilds, 4, "a heightfield change must rebuild");
     }
 }

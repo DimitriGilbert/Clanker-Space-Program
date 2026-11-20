@@ -3063,20 +3063,19 @@ fn kind_mat(kind: PartKind) -> [f32; 3] {
 /// smoothing-wedge normal, and the baked material terms; per-pixel
 /// lighting happens in the fragment shader under `packet.light`.
 /// Debris chars the albedo and kills the specular sheen.
-#[allow(clippy::too_many_arguments)]
+///
+/// C1: `tris` is the CACHED `emit_model` product for the part's
+/// (model, AABB) — the transform/projection arithmetic below is the
+/// exact per-frame code the fresh-emit path ran.
 fn emit_model_part(
     v: &mut Vec<csp_render::flight::FlightVertex>,
     b: &FlightBody,
     p: &FlightPart,
-    m: &crate::art::PartModel,
+    tris: &[crate::part_mesh::ModelTri],
     vp: &[[f64; 4]; 4],
     eye: DVec3,
-    mtris: &mut Vec<crate::part_mesh::ModelTri>,
 ) {
-    let (mlo, mhi) = p.shape.local_aabb();
-    mtris.clear(); // scratch — the sibling kitbash path reuses `tris` the same way (C12-F3)
-    crate::part_mesh::emit_model(m, mlo, mhi, mtris);
-    for t in mtris.iter() {
+    for t in tris.iter() {
         let world = [t.a, t.b, t.c].map(|q| b.pos + b.rot.rotate(p.transform.apply(q)));
         let [Some(c0), Some(c1), Some(c2)] = world.map(|q| project_into(vp, eye, q)) else {
             continue;
@@ -3104,6 +3103,217 @@ fn emit_model_part(
     }
 }
 
+/// The bit-pattern key of a [`crate::part_mesh::PartShape`] —
+/// `emit_smooth` is a pure function of the shape, so the bits ARE the
+/// cache identity (C1). Authored shapes never carry NaN.
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Debug)]
+enum ShapeKey {
+    /// Box collider corners.
+    Box {
+        /// Min corner bits.
+        lo: [u64; 3],
+        /// Max corner bits.
+        hi: [u64; 3],
+    },
+    /// Lathe stations.
+    Lathe {
+        /// Axis bits.
+        axis: [u64; 2],
+        /// `(z, r)` station bits, ascending.
+        profile: Vec<(u64, u64)>,
+    },
+}
+
+impl ShapeKey {
+    fn of(shape: &crate::part_mesh::PartShape) -> Self {
+        let v3 = |v: DVec3| [v.x.to_bits(), v.y.to_bits(), v.z.to_bits()];
+        match shape {
+            crate::part_mesh::PartShape::Box { lo, hi } => Self::Box {
+                lo: v3(*lo),
+                hi: v3(*hi),
+            },
+            crate::part_mesh::PartShape::Lathe { axis, profile } => Self::Lathe {
+                axis: [axis[0].to_bits(), axis[1].to_bits()],
+                profile: profile
+                    .iter()
+                    .map(|&(z, r)| (z.to_bits(), r.to_bits()))
+                    .collect(),
+            },
+        }
+    }
+}
+
+/// One baked kitbash triangle — part-local corners/normals plus the
+/// livery-baked per-corner color and the kind's material row (C1).
+struct BakedTri {
+    /// Corners, part-local.
+    a: DVec3,
+    /// Corner b.
+    b: DVec3,
+    /// Corner c.
+    c: DVec3,
+    /// Normal at `a`.
+    na: DVec3,
+    /// Normal at `b`.
+    nb: DVec3,
+    /// Normal at `c`.
+    nc: DVec3,
+    /// Livery color per corner (alpha 1).
+    col: [[f32; 4]; 3],
+    /// `[spec strength, exponent, occlusion]` — per-kind, shared by
+    /// the triangle's corners.
+    mat: [f32; 3],
+}
+
+/// The model cache's key: the fit AABB's bit pattern plus the model
+/// `Arc`'s address (pinned by the entry holding its own clone).
+type ModelKey = ([u64; 3], [u64; 3], usize);
+
+/// The model cache's entry — the pinning `Arc` beside its baked tris.
+type ModelEntry = (
+    Arc<crate::art::PartModel>,
+    Arc<Vec<crate::part_mesh::ModelTri>>,
+);
+
+/// `PartKind`'s cache tag — the livery/material tables key on it.
+const fn kind_tag(kind: PartKind) -> u8 {
+    match kind {
+        PartKind::Engine => 0,
+        PartKind::Crew => 1,
+        PartKind::Tank => 2,
+        PartKind::Battery => 3,
+        PartKind::Science => 4,
+        PartKind::Port => 5,
+        PartKind::Chute => 6,
+        PartKind::Structural => 7,
+    }
+}
+
+/// The LOCAL half of the kitbash part emit — `emit_smooth` plus the
+/// per-corner livery tint and material, every step the call the
+/// fresh-emit path made (C1; bits identical by construction).
+fn bake_smooth(shape: &crate::part_mesh::PartShape, kind: PartKind, debris: bool) -> Vec<BakedTri> {
+    let base: [f32; 3] = if debris {
+        [0.72, 0.38, 0.16]
+    } else {
+        kind_tint(kind)
+    };
+    let mat = if debris {
+        [0.0, 32.0, 1.0]
+    } else {
+        kind_mat(kind)
+    };
+    let (lo, hi) = shape.local_aabb();
+    let z_span = (hi.z - lo.z).max(1e-9);
+    let mut tris = Vec::new();
+    crate::part_mesh::emit_smooth(shape, &mut tris);
+    tris.iter()
+        .map(|t| {
+            let tint = |q: DVec3| -> [f32; 4] {
+                if debris {
+                    [base[0], base[1], base[2], 1.0]
+                } else {
+                    let c = livery(kind, base, (q.z - lo.z) / z_span);
+                    [c[0], c[1], c[2], 1.0]
+                }
+            };
+            BakedTri {
+                a: t.a,
+                b: t.b,
+                c: t.c,
+                na: t.na,
+                nb: t.nb,
+                nc: t.nc,
+                col: [tint(t.a), tint(t.b), tint(t.c)],
+                mat,
+            }
+        })
+        .collect()
+}
+
+/// The extract's geometry cache (C1): the launch complex's baked local
+/// triangles plus the craft's baked part silhouettes/models, keyed by
+/// what actually invalidates them — the static layout version for the
+/// structures, the shape/model bits (with kind and debris folding in
+/// the livery/material rows) for the parts. Position/orientation stay
+/// per-frame and never enter the keys. Presentation data only.
+///
+/// Bounds: the silhouette table caps at 256 entries and the model
+/// table at 128 — the parts catalog is far smaller, and a long
+/// session of craft edits (fresh collider AABBs) can't grow either
+/// unboundedly; on overflow the table simply clears (a re-bake, never
+/// a wrong answer). The model key is the model `Arc`'s address PINNED
+/// by the entry holding its own clone, so a freed-and-reused address
+/// can never alias a live key.
+#[derive(Resource, Default)]
+pub(crate) struct FlightGeomCache {
+    /// The launch complex's baked local tris (layout-version keyed).
+    pub(crate) space_center: crate::structures::SpaceCenterBake,
+    /// Kitbash silhouettes: `(shape bits, kind, debris)` → tris.
+    smooth: BTreeMap<(ShapeKey, u8, bool), Arc<Vec<BakedTri>>>,
+    /// Baked models: `(fit-lo bits, fit-hi bits, model address)` →
+    /// the entry holds the model `Arc` (the address PIN — it can't be
+    /// reused while the entry lives) beside its tris.
+    models: BTreeMap<ModelKey, ModelEntry>,
+    /// Bake counters (the invalidation tests' observability).
+    pub(crate) smooth_bakes: u32,
+    /// Model bake counter (same).
+    pub(crate) model_bakes: u32,
+    /// Scratch tri stream reused across frames (`emit_sheath`'s
+    /// target — the old per-extract `Vec::new()` pair).
+    pub(crate) sheath_tris: Vec<crate::part_mesh::SmoothTri>,
+    /// Last frame's vertex count — the capacity hint that spares the
+    /// packet's stream its growth-realloc chain (allocation only;
+    /// no output effect).
+    vert_hint: usize,
+}
+
+impl FlightGeomCache {
+    /// The part's baked kitbash triangles, baking once per key.
+    fn smooth_tris(
+        &mut self,
+        shape: &crate::part_mesh::PartShape,
+        kind: PartKind,
+        debris: bool,
+    ) -> Arc<Vec<BakedTri>> {
+        let key = (ShapeKey::of(shape), kind_tag(kind), debris);
+        if let Some(t) = self.smooth.get(&key) {
+            return Arc::clone(t);
+        }
+        if self.smooth.len() >= 256 {
+            self.smooth.clear();
+        }
+        let baked = Arc::new(bake_smooth(shape, kind, debris));
+        self.smooth.insert(key, Arc::clone(&baked));
+        self.smooth_bakes += 1;
+        baked
+    }
+
+    /// The part's baked model triangles fitted to `lo`/`hi`, baking
+    /// once per (model, fit).
+    fn model_tris(
+        &mut self,
+        m: &Arc<crate::art::PartModel>,
+        lo: DVec3,
+        hi: DVec3,
+    ) -> Arc<Vec<crate::part_mesh::ModelTri>> {
+        let v3 = |v: DVec3| [v.x.to_bits(), v.y.to_bits(), v.z.to_bits()];
+        let key = (v3(lo), v3(hi), Arc::as_ptr(m) as usize);
+        if let Some((_, t)) = self.models.get(&key) {
+            return Arc::clone(t);
+        }
+        if self.models.len() >= 128 {
+            self.models.clear();
+        }
+        let mut tris = Vec::new();
+        crate::part_mesh::emit_model(m, lo, hi, &mut tris);
+        let tris = Arc::new(tris);
+        self.models.insert(key, (Arc::clone(m), Arc::clone(&tris)));
+        self.model_bakes += 1;
+        tris
+    }
+}
+
 /// `RenderExtract` — emit the scene's clip-space triangles + the R2
 /// terrain packet (quadtree selection runs here, in the extract, from
 /// the solved camera — §2.5's "LOD selection" lives upstream in
@@ -3120,9 +3330,16 @@ pub(crate) fn extract_flight(
     mut flight_ui: ResMut<FlightUiData>,
     sites: Res<crate::structures::SiteTable>,
     clock: Res<crate::Clock>,
+    mut geom: ResMut<FlightGeomCache>,
     mut frame: ResMut<FlightFrame>,
 ) {
     let mut packet = csp_render::flight::FlightPacket::default();
+    // C1: pre-size the stream from the last frame's count — a pure
+    // allocation hint (the emit arithmetic is untouched), sparing the
+    // ~76 k-vertex stream its doubling-growth memcpy chain.
+    if geom.vert_hint > 0 {
+        packet.vertices = Vec::with_capacity(geom.vert_hint);
+    }
     // R2 surface pass: when a physical world is present and the chase
     // camera solved, the quadtree terrain + LUT sky replace the M4c
     // gradient/disc. Without an environment the flat gradient stays —
@@ -3222,6 +3439,7 @@ pub(crate) fn extract_flight(
             site,
             &terrain_cfg,
             &mut terrain_cache,
+            &mut geom.space_center,
         );
     }
 
@@ -3295,29 +3513,22 @@ pub(crate) fn extract_flight(
             hemi: [up.x as f32, up.y as f32, up.z as f32, 0.10],
         }
     };
-    let mut tris = Vec::new();
-    let mut mtris = Vec::new();
     for b in &snap.vessels {
         for p in b.parts.iter() {
-            let base: [f32; 3] = if b.debris {
-                [0.72, 0.38, 0.16]
-            } else {
-                kind_tint(p.kind)
-            };
-            let (lo, hi) = p.shape.local_aabb();
-            let z_span = (hi.z - lo.z).max(1e-9);
+            // C1: the part's local silhouette comes from the geometry
+            // cache — `emit_smooth` re-tessellation, the livery tint
+            // and the material rows are pure functions of
+            // (shape, kind, debris) and bake once; the world transform
+            // and projection below are the exact per-frame arithmetic
+            // the fresh-emit path ran.
             if let Some(m) = &p.model {
-                emit_model_part(v, b, p, m, vp, eye, &mut mtris);
+                let (mlo, mhi) = p.shape.local_aabb();
+                let tris = geom.model_tris(m, mlo, mhi);
+                emit_model_part(v, b, p, &tris, vp, eye);
                 continue;
             }
-            tris.clear();
-            crate::part_mesh::emit_smooth(&p.shape, &mut tris);
-            let mat = if b.debris {
-                [0.0, 32.0, 1.0]
-            } else {
-                kind_mat(p.kind)
-            };
-            for t in tris.iter() {
+            let baked = geom.smooth_tris(&p.shape, p.kind, b.debris);
+            for t in baked.iter() {
                 // A tri with any corner behind the eye plane drops
                 // whole — the same all-or-nothing rule the VAB packet
                 // uses — rather than emitting a corrupted fan.
@@ -3325,21 +3536,14 @@ pub(crate) fn extract_flight(
                 let [Some(c0), Some(c1), Some(c2)] = world.map(|q| project_into(vp, eye, q)) else {
                     continue;
                 };
-                for (k, &(local, nrm)) in [(t.a, t.na), (t.b, t.nb), (t.c, t.nc)].iter().enumerate()
-                {
-                    let n_w = b.rot.rotate(p.transform.apply_dir(nrm));
-                    let u = (local.z - lo.z) / z_span;
-                    let tint = if b.debris {
-                        base
-                    } else {
-                        livery(p.kind, base, u)
-                    };
+                for (k, nrm) in [t.na, t.nb, t.nc].iter().enumerate() {
+                    let n_w = b.rot.rotate(p.transform.apply_dir(*nrm));
                     v.push(csp_render::flight::FlightVertex {
                         pos: [c0, c1, c2][k],
                         world: f3(world[k] - eye),
                         nrm: f3(n_w),
-                        color: [tint[0], tint[1], tint[2], 1.0],
-                        mat,
+                        color: t.col[k],
+                        mat: t.mat,
                     });
                 }
             }
@@ -3382,7 +3586,7 @@ pub(crate) fn extract_flight(
             } else {
                 DVec3::ZERO
             };
-            emit_sheath(v, vp, eye, b, flow, plasma_i, &mut tris);
+            emit_sheath(v, vp, eye, b, flow, plasma_i, &mut geom.sheath_tris);
         }
 
         // §3.7 ground-contact dust: a translucent tan ring hugging
@@ -3455,6 +3659,7 @@ pub(crate) fn extract_flight(
             }
         }
     }
+    geom.vert_hint = packet.vertices.len();
     frame.0 = Some(packet);
 }
 
@@ -3498,6 +3703,7 @@ mod tests {
         world.insert_resource(crate::structures::SiteTable::default());
         world.insert_resource(crate::Clock::default());
         world.insert_resource(FlightFrame::default());
+        world.insert_resource(FlightGeomCache::default());
         let mut sched = Schedule::default();
         sched.add_systems(extract_flight);
         (world, sched)
@@ -4591,5 +4797,310 @@ mod tests {
         );
         assert!(!packet.shadow.armed());
         assert!(packet.terrain.is_none());
+    }
+
+    // ==================== C1: extract geometry cache ================
+
+    /// Raw bytes of one `repr(C)` Pod value — the packet-identity
+    /// tests' comparison basis (byte equality, not field tolerance).
+    #[allow(unsafe_code)] // a byte view of a Pod value — sound by the Pod contract
+    fn pod_bytes<T: Copy>(v: &T) -> Vec<u8> {
+        unsafe { std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>()) }
+            .to_vec()
+    }
+    fn pod_slice_bytes<T: Copy>(vs: &[T]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(std::mem::size_of_val(vs));
+        for v in vs {
+            out.extend_from_slice(&pod_bytes(v));
+        }
+        out
+    }
+
+    /// The C1 identity scene: Terrin (Legacy bake, ocean at the
+    /// datum), a launch site, a spinning day, and a two-vessel craft
+    /// (kitbash stack + debris cluster) at the pad.
+    fn geom_cache_scene(tick: u64) -> FlightSnapshot {
+        let omega = 2.0 * core::f64::consts::PI / 21_600.0;
+        let env = FlightEnv {
+            body_center: DVec3::ZERO,
+            radius_m: 600_000.0,
+            atm_top_m: 70_000.0,
+            atm_scale_height_m: 5_600.0,
+            mu_m3_per_s2: 3.5316e12,
+            body: Some(csp_data::BodyId::from("terrin")),
+            sun_dir: {
+                let s = DVec3::new(0.4, 0.3, 0.86);
+                s / s.norm()
+            },
+            spin_axis: DVec3::Z,
+            spin_phase: omega * (tick as f64 / csp_core::TICK_HZ as f64),
+            body_spin: DVec3::Z * omega,
+        };
+        let parts = Arc::new(vec![
+            FlightPart {
+                node: 0,
+                lo: DVec3::new(-0.9, -0.9, 0.0),
+                hi: DVec3::new(0.9, 0.9, 4.0),
+                transform: csp_phys::PartTransform::IDENTITY,
+                shape: crate::part_mesh::PartShape::Lathe {
+                    axis: [0.0, 0.0],
+                    profile: vec![(0.0, 0.9), (2.0, 0.9), (3.4, 0.6), (4.0, 0.2)],
+                },
+                kind: PartKind::Tank,
+                model: None,
+            },
+            FlightPart {
+                node: 1,
+                lo: DVec3::new(-0.5, -0.5, -1.0),
+                hi: DVec3::new(0.5, 0.5, 0.4),
+                transform: csp_phys::PartTransform::new(
+                    DVec3::new(0.0, 0.0, 4.2),
+                    csp_core::DQuat::IDENTITY,
+                ),
+                shape: crate::part_mesh::PartShape::Box {
+                    lo: DVec3::new(-0.5, -0.5, -1.0),
+                    hi: DVec3::new(0.5, 0.5, 0.4),
+                },
+                kind: PartKind::Crew,
+                model: None,
+            },
+        ]);
+        let site = crate::structures::SiteEntry {
+            id: csp_data::SiteId::from("terrin-launch"),
+            display_name: csp_data::LocKey::from("x"),
+            body: csp_data::BodyId::from("terrin"),
+            latitude_rad: 0.1,
+            longitude_rad: 0.2,
+            altitude_m: 0.0,
+            launch: true,
+        };
+        let up = crate::structures::site_dir(&env, &site);
+        let pos = up * (env.radius_m + 8.0);
+        let mk = |debris: bool| FlightBody {
+            id: debris as u64,
+            pos: if debris { pos + DVec3::X * 30.0 } else { pos },
+            rot: csp_core::DQuat::IDENTITY,
+            vel: DVec3::ZERO,
+            throttle: 0.0,
+            debris,
+            contact: false,
+            plasma_w_m2: 0.0,
+            nodes: 2,
+            parts: parts.clone(),
+            plumes: Vec::new(),
+            com: pos,
+            latched: false,
+            tanks: Vec::new(),
+        };
+        FlightSnapshot {
+            env: Some(env),
+            vessels: vec![mk(false), mk(true)],
+        }
+    }
+
+    /// The scene's world + a solved camera over the pad.
+    fn geom_cache_rig(tick: u64) -> (bevy_ecs::world::World, Schedule) {
+        let snap = geom_cache_scene(tick);
+        let focus = snap.vessels[0].pos;
+        let cam = crate::map::solve_orbit_camera(
+            0.8,
+            0.35,
+            120.0,
+            (1920.0, 1080.0),
+            focus,
+            FLIGHT_FOV_Y,
+            0.1,
+        );
+        let (mut world, sched) = extract_rig(snap, cam);
+        let mut bodies = std::collections::BTreeMap::new();
+        bodies.insert(
+            "terrin".to_owned(),
+            crate::terrain::TerrainBody {
+                seed: 601,
+                amplitude_m: 3_600.0,
+                profile: csp_core::terrain::ReliefProfile::Legacy,
+                ocean_datum_m: Some(600_000.0),
+                biome: None,
+            },
+        );
+        world.insert_resource(crate::terrain::TerrainConfig {
+            bodies,
+            ..Default::default()
+        });
+        let mut sites = crate::structures::SiteTable::default();
+        sites.sites.push(crate::structures::SiteEntry {
+            id: csp_data::SiteId::from("terrin-launch"),
+            display_name: csp_data::LocKey::from("x"),
+            body: csp_data::BodyId::from("terrin"),
+            latitude_rad: 0.1,
+            longitude_rad: 0.2,
+            altitude_m: 0.0,
+            launch: true,
+        });
+        world.insert_resource(sites);
+        (world, sched)
+    }
+
+    /// A packet's comparable bytes: the two vertex streams, the light
+    /// and shadow rows, and the terrain packet's uniform + instance
+    /// rows (the heightfield itself is keyed, not embedded).
+    fn packet_bytes(p: &csp_render::flight::FlightPacket) -> Vec<u8> {
+        let mut out = pod_slice_bytes(&p.vertices);
+        out.extend_from_slice(&pod_slice_bytes(&p.far_vertices));
+        out.extend_from_slice(&pod_bytes(&p.light));
+        out.extend_from_slice(&pod_bytes(&p.shadow));
+        if let Some(t) = &p.terrain {
+            out.extend_from_slice(&pod_bytes(&t.uniforms));
+            out.extend_from_slice(&pod_bytes(&t.uniforms_far));
+            out.extend_from_slice(&pod_slice_bytes(&t.terrain));
+            out.extend_from_slice(&pod_slice_bytes(&t.ocean));
+            out.extend_from_slice(&t.terrain_far_start.to_le_bytes());
+            out.extend_from_slice(&t.ocean_far_start.to_le_bytes());
+            out.extend_from_slice(
+                &t.heightfield
+                    .as_ref()
+                    .map_or(u64::MAX, |h| h.key)
+                    .to_le_bytes(),
+            );
+        }
+        out
+    }
+
+    /// C1's packet-identity contract: for the same scene state the
+    /// emitted packet bytes are IDENTICAL cold vs warm (the caches
+    /// change only where the work happens, never the output), and a
+    /// frame sequence with the clock advancing reproduces byte-for-
+    /// byte from a fresh world — cache state never leaks into the
+    /// packet.
+    #[test]
+    fn extract_packets_are_byte_identical_cold_warm_and_across_runs() {
+        let run_sequence = |cam_yaw: f64| -> Vec<Vec<u8>> {
+            let (mut world, mut sched) = geom_cache_rig(64 * 300);
+            // Pump the background bake (the arrival pattern).
+            for _ in 0..4_000 {
+                let p = extract_pass(&mut world, &mut sched);
+                if p.terrain.as_ref().is_some_and(|t| t.heightfield.is_some()) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let mut frames = Vec::new();
+            for f in 0..8 {
+                // One tick per frame — the spinning day advances, so
+                // every frame's spin phase (and the probes' windows)
+                // moves, exactly the live-flight pattern.
+                let tick = 64 * 300 + f;
+                let snap = geom_cache_scene(tick);
+                let focus = snap.vessels[0].pos;
+                world.insert_resource(FlightSnapshot {
+                    env: snap.env,
+                    vessels: snap.vessels,
+                });
+                world.insert_resource(FlightCameraF64(crate::map::solve_orbit_camera(
+                    cam_yaw,
+                    0.35,
+                    120.0,
+                    (1920.0, 1080.0),
+                    focus,
+                    FLIGHT_FOV_Y,
+                    0.1,
+                )));
+                world.insert_resource(crate::Clock(csp_core::SimTime::from_ticks(tick)));
+                let p = extract_pass(&mut world, &mut sched);
+                assert!(
+                    p.terrain.as_ref().is_some_and(|t| t.heightfield.is_some()),
+                    "the field must stay live across the sequence"
+                );
+                // Warm re-extract at the SAME state: identical bytes.
+                let warm = extract_pass(&mut world, &mut sched);
+                assert_eq!(
+                    packet_bytes(&p),
+                    packet_bytes(&warm),
+                    "frame {f}: cold and warm extracts must be byte-identical"
+                );
+                frames.push(packet_bytes(&p));
+            }
+            frames
+        };
+        let a = run_sequence(0.8);
+        let b = run_sequence(0.8);
+        assert!(
+            a.iter().zip(&b).all(|(x, y)| x == y),
+            "the same frame sequence from a fresh world must reproduce byte-for-byte"
+        );
+        assert!(
+            a.windows(2).any(|w| w[0] != w[1]),
+            "the sequence must actually advance (frames differ across ticks)"
+        );
+        assert!(
+            a[0].len() > 10_000,
+            "the scene must emit real geometry ({} bytes)",
+            a[0].len()
+        );
+    }
+
+    /// C1's craft-cache keys: the silhouette bake is keyed by (shape
+    /// bits, kind, debris) — every distinct key bakes once, repeats
+    /// hit — and the model bake is keyed by the model's PINNED Arc
+    /// address + fit AABB (a clone hits; a same-content new Arc
+    /// bakes; a different fit bakes).
+    #[test]
+    fn flight_geom_cache_keys_shape_kind_debris_and_pins_models() {
+        let mut g = FlightGeomCache::default();
+        let box_a = crate::part_mesh::PartShape::Box {
+            lo: DVec3::new(-1.0, -1.0, -1.0),
+            hi: DVec3::new(1.0, 1.0, 1.0),
+        };
+        let box_b = crate::part_mesh::PartShape::Box {
+            lo: DVec3::new(-2.0, -1.0, -1.0),
+            hi: DVec3::new(1.0, 1.0, 1.0),
+        };
+        let t = g.smooth_tris(&box_a, PartKind::Tank, false);
+        assert_eq!(g.smooth_bakes, 1);
+        assert!(!t.is_empty());
+        g.smooth_tris(&box_a, PartKind::Tank, false);
+        assert_eq!(g.smooth_bakes, 1, "an identical key must hit");
+        g.smooth_tris(&box_a, PartKind::Tank, true);
+        assert_eq!(g.smooth_bakes, 2, "debris folds into the key");
+        g.smooth_tris(&box_a, PartKind::Engine, false);
+        assert_eq!(g.smooth_bakes, 3, "kind folds into the key (livery)");
+        g.smooth_tris(&box_b, PartKind::Tank, false);
+        assert_eq!(g.smooth_bakes, 4, "shape bits fold into the key");
+        // The debris variant's colors differ from the clean one.
+        let clean = g.smooth_tris(&box_a, PartKind::Tank, false);
+        let debris = g.smooth_tris(&box_a, PartKind::Tank, true);
+        assert_ne!(
+            clean[0].col[0], debris[0].col[0],
+            "debris charring must reach the baked colors"
+        );
+        // Models: pinned by the Arc the entry itself holds. A minimal
+        // real model (two tris) exercises `emit_model`'s fit.
+        let tiny_model = || {
+            Arc::new(crate::art::PartModel {
+                verts: vec![crate::art::ModelVert {
+                    pos: [0.0, 0.0, 0.0],
+                    nrm: [0.0, 0.0, 1.0],
+                    col: [1.0, 1.0, 1.0, 1.0],
+                    mat: [0.5, 8.0, 1.0],
+                }],
+                indices: vec![0, 0, 0],
+                lo: DVec3::new(-1.0, -1.0, -1.0),
+                hi: DVec3::new(1.0, 1.0, 1.0),
+            })
+        };
+        let m = tiny_model();
+        let lo = DVec3::new(-1.0, -1.0, -1.0);
+        let hi = DVec3::new(1.0, 1.0, 1.0);
+        g.model_tris(&m, lo, hi);
+        assert_eq!(g.model_bakes, 1);
+        g.model_tris(&m.clone(), lo, hi);
+        assert_eq!(g.model_bakes, 1, "the same model Arc must hit");
+        g.model_tris(&tiny_model(), lo, hi);
+        assert_eq!(
+            g.model_bakes, 2,
+            "a same-content fresh Arc is a distinct (safe) key — it bakes"
+        );
+        g.model_tris(&m, lo, DVec3::new(2.0, 1.0, 1.0));
+        assert_eq!(g.model_bakes, 3, "a different fit AABB bakes");
     }
 }

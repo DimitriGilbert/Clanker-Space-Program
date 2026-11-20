@@ -731,6 +731,121 @@ fn tessellate_face(t: SmoothTri, out: &mut Vec<SmoothTri>) {
     }
 }
 
+/// Per-vertex baked occlusion — a 0.55→1.0 ramp over the first 3 m
+/// above the prim's own base, so wall bottoms read grounded against
+/// the contact-shadow quads the pieces sit on (the ramp the old
+/// inline emit baked; the C1 bake shares it verbatim).
+fn occ(z: f64) -> f32 {
+    (0.55 + 0.45 * (z / 3.0).clamp(0.0, 1.0)) as f32
+}
+
+/// One baked lit triangle of the space center, structure-local ENU
+/// metres: the `tessellate_face`d, mottled, occlusion-baked form of
+/// one [`Prim`] (C1 — the launch-complex geometry cache). Corners and
+/// normals stay LOCAL; the per-frame emit applies the piece's own ENU
+/// basis + camera projection with the exact arithmetic the fresh-emit
+/// path used, so the cached and fresh streams are bit-identical.
+struct LocalLitTri {
+    /// Structure-local corners.
+    p: [DVec3; 3],
+    /// Structure-local corner normals.
+    n: [DVec3; 3],
+    /// Mottled albedo per corner.
+    col: [[f32; 4]; 3],
+    /// `[spec, exponent, occlusion]` per corner.
+    mat: [[f32; 3]; 3],
+}
+
+/// Layout identity for [`SpaceCenterBake`]: the baked triangles are a
+/// pure function of the compile-time [`SPACE_CENTER`] table plus the
+/// palette and mottle/tess constants — bump on any change to those
+/// (the bake is keyed on it, so a stale table can never survive an
+/// edit to the layout it caches).
+const SPACE_CENTER_LAYOUT_VERSION: u8 = 1;
+
+/// The launch complex's baked local geometry (C1): every piece's
+/// tessellated, mottled triangles in structure-local coordinates,
+/// built once per layout version. The per-frame cost drops to the
+/// ENU transform + projection of the baked corners; the site's own
+/// ground anchors (heightfield-sampled per piece) stay per-frame —
+/// they ride the live terrain and the spinning site frame.
+#[derive(Default)]
+pub(crate) struct SpaceCenterBake {
+    /// [`SPACE_CENTER_LAYOUT_VERSION`] the pieces were baked for.
+    version: Option<u8>,
+    /// One tri list per [`SPACE_CENTER`] piece, in table order.
+    pieces: Vec<Vec<LocalLitTri>>,
+    /// Bakes performed (the invalidation tests' observability).
+    pub(crate) bakes: u32,
+}
+
+impl SpaceCenterBake {
+    /// The pieces list, baking once for the current layout version.
+    fn pieces(&mut self) -> &[Vec<LocalLitTri>] {
+        if self.version != Some(SPACE_CENTER_LAYOUT_VERSION) {
+            self.pieces = SPACE_CENTER.iter().map(bake_piece).collect();
+            self.version = Some(SPACE_CENTER_LAYOUT_VERSION);
+            self.bakes += 1;
+        }
+        &self.pieces
+    }
+}
+
+/// Bake one piece — the LOCAL half of the old `emit_prims`:
+/// `emit_smooth` per prim, the mottle tessellation for flat faces,
+/// then the per-corner mottle tint and occlusion ramp, every step the
+/// same call the fresh-emit path made (bit-identical inputs).
+fn bake_piece(piece: &Piece) -> Vec<LocalLitTri> {
+    let mut tris = Vec::new();
+    let mut tess: Vec<SmoothTri> = Vec::new();
+    let mut out = Vec::new();
+    for (pi, prim) in piece.prims.iter().enumerate() {
+        tris.clear();
+        match prim {
+            Prim::Bbox { lo, hi } => {
+                crate::part_mesh::emit_smooth(
+                    &crate::part_mesh::PartShape::Box { lo: *lo, hi: *hi },
+                    &mut tris,
+                );
+                // Flat faces retessellate to the mottle grid so the
+                // per-vertex albedo jitter reads as concrete/metal
+                // surface variation, not a corner-to-corner ramp.
+                tess.clear();
+                for t in tris.iter() {
+                    tessellate_face(*t, &mut tess);
+                }
+                std::mem::swap(&mut tris, &mut tess);
+            }
+            Prim::Lathe { axis, profile } => {
+                crate::part_mesh::emit_smooth(
+                    &crate::part_mesh::PartShape::Lathe {
+                        axis: *axis,
+                        profile: profile.to_vec(),
+                    },
+                    &mut tris,
+                );
+            }
+        }
+        for t in tris.iter() {
+            out.push(LocalLitTri {
+                p: [t.a, t.b, t.c],
+                n: [t.na, t.nb, t.nc],
+                col: [
+                    mottle_tint(piece.color, t.a, pi),
+                    mottle_tint(piece.color, t.b, pi),
+                    mottle_tint(piece.color, t.c, pi),
+                ],
+                mat: [
+                    [piece.mat[0], piece.mat[1], occ(t.a.z)],
+                    [piece.mat[0], piece.mat[1], occ(t.b.z)],
+                    [piece.mat[0], piece.mat[1], occ(t.c.z)],
+                ],
+            });
+        }
+    }
+    out
+}
+
 /// Emit one triangle's lit vertices — the all-or-nothing projection
 /// rule `extract_flight`'s part pass uses (a corner behind the eye
 /// drops the whole tri). `world` carries the camera-relative position;
@@ -765,15 +880,14 @@ fn lit_tri(
     }
 }
 
-/// Emit a piece's primitives transformed by the ENU basis at
-/// `anchor`/`up`. Per-vertex baked occlusion: a 0.55→1.0 ramp over the
-/// first 3 m above the prim's own base, so wall bottoms read grounded
-/// against the contact-shadow quads the pieces sit on. A second
-/// per-vertex term — the [`mottle01`] albedo jitter over the
-/// [`tessellate_face`]d faces — keeps the large walls and pads from
-/// reading as flat untextured quads.
-#[allow(clippy::too_many_arguments)] // ENU basis + paint + scratch — one emit call
-fn emit_prims(
+/// The per-frame half of the old `emit_prims` (C1): transform the
+/// baked structure-local triangles by the piece's ENU basis and hand
+/// them to [`lit_tri`] — the identical `to_world`/`n_world`/projection
+/// expressions the fresh-emit path evaluated per corner, so a cached
+/// emit and a fresh emit produce the same vertex bits for the same
+/// frame inputs.
+#[allow(clippy::too_many_arguments)]
+fn emit_lit_tris(
     v: &mut Vec<csp_render::flight::FlightVertex>,
     vp: &[[f64; 4]; 4],
     eye: DVec3,
@@ -781,63 +895,23 @@ fn emit_prims(
     east: DVec3,
     north: DVec3,
     up: DVec3,
-    color: [f32; 4],
-    mat: [f32; 3],
-    prims: &[Prim],
-    tris: &mut Vec<SmoothTri>,
+    tris: &[LocalLitTri],
 ) {
     let to_world = |p: DVec3| anchor + east * p.x + north * p.y + up * p.z;
     let n_world = |n: DVec3| east * n.x + north * n.y + up * n.z;
-    let occ = |z: f64| (0.55 + 0.45 * (z / 3.0).clamp(0.0, 1.0)) as f32;
-    // Second scratch for the mottle tessellation — `tris` stays the
-    // emit_smooth target the caller allocated.
-    let mut tess: Vec<SmoothTri> = Vec::new();
-    for (pi, prim) in prims.iter().enumerate() {
-        tris.clear();
-        match prim {
-            Prim::Bbox { lo, hi } => {
-                crate::part_mesh::emit_smooth(
-                    &crate::part_mesh::PartShape::Box { lo: *lo, hi: *hi },
-                    tris,
-                );
-                // Flat faces retessellate to the mottle grid so the
-                // per-vertex albedo jitter reads as concrete/metal
-                // surface variation, not a corner-to-corner ramp.
-                tess.clear();
-                for t in tris.iter() {
-                    tessellate_face(*t, &mut tess);
-                }
-                std::mem::swap(tris, &mut tess);
-            }
-            Prim::Lathe { axis, profile } => {
-                crate::part_mesh::emit_smooth(
-                    &crate::part_mesh::PartShape::Lathe {
-                        axis: *axis,
-                        profile: profile.to_vec(),
-                    },
-                    tris,
-                );
-            }
-        }
-        for t in tris.iter() {
-            let (wa, na) = (to_world(t.a), n_world(t.na));
-            let (wb, nb) = (to_world(t.b), n_world(t.nb));
-            let (wc, nc) = (to_world(t.c), n_world(t.nc));
-            lit_tri(
-                v,
-                vp,
-                eye,
-                [wa, wb, wc],
-                [na, nb, nc],
-                [
-                    mottle_tint(color, t.a, pi),
-                    mottle_tint(color, t.b, pi),
-                    mottle_tint(color, t.c, pi),
-                ],
-                mat,
-                [occ(t.a.z), occ(t.b.z), occ(t.c.z)],
-            );
-        }
+    for t in tris {
+        let w = [to_world(t.p[0]), to_world(t.p[1]), to_world(t.p[2])];
+        let n = [n_world(t.n[0]), n_world(t.n[1]), n_world(t.n[2])];
+        lit_tri(
+            v,
+            vp,
+            eye,
+            w,
+            n,
+            t.col,
+            [t.mat[0][0], t.mat[0][1], 0.0],
+            [t.mat[0][2], t.mat[1][2], t.mat[2][2]],
+        );
     }
 }
 
@@ -889,7 +963,13 @@ fn shadow_quad(
 /// `packet.light`.
 ///
 /// Called from `extract_flight` only when the terrain pass is live —
-/// the structures anchor to the same surface it draws.
+/// the structures anchor to the same surface it draws. The piece
+/// GEOMETRY comes from `bake` (C1 — the tessellated, mottled local
+/// triangles cached per layout version); the site frame, per-piece
+/// ground anchors and the shadow quads stay per-frame, so the complex
+/// still rides the live terrain and the body's spin exactly as the
+/// fresh-emit path did.
+#[allow(clippy::too_many_arguments)] // frame + site + terrain taps + the C1 bake — one emit call
 pub(crate) fn emit_launch_complex(
     v: &mut Vec<csp_render::flight::FlightVertex>,
     vp: &[[f64; 4]; 4],
@@ -898,6 +978,7 @@ pub(crate) fn emit_launch_complex(
     site: &SiteEntry,
     terrain_cfg: &TerrainConfig,
     terrain_cache: &mut TerrainCache,
+    bake: &mut SpaceCenterBake,
 ) {
     // The site's own ground: the rendered surface under the site
     // direction (footprint ~30 m — a wide ring sample so the complex
@@ -915,8 +996,13 @@ pub(crate) fn emit_launch_complex(
     let site_ground = ground(dir_i, 30.0);
     let frame = site_frame(env, site, site_ground);
 
-    let mut tris = Vec::new();
-    for piece in SPACE_CENTER {
+    let pieces = bake.pieces();
+    debug_assert_eq!(
+        pieces.len(),
+        SPACE_CENTER.len(),
+        "the bake must carry one tri list per layout piece"
+    );
+    for (piece, tris) in SPACE_CENTER.iter().zip(pieces.iter()) {
         let foot = piece.foot_m.0.hypot(piece.foot_m.1);
         let (anchor, up) = {
             let mut g = |d: DVec3| ground(d, foot);
@@ -935,19 +1021,7 @@ pub(crate) fn emit_launch_complex(
                 SHADOW,
             );
         }
-        emit_prims(
-            v,
-            vp,
-            eye,
-            anchor,
-            frame.east,
-            frame.north,
-            up,
-            piece.color,
-            piece.mat,
-            piece.prims,
-            &mut tris,
-        );
+        emit_lit_tris(v, vp, eye, anchor, frame.east, frame.north, up, tris);
     }
 }
 
@@ -1003,5 +1077,42 @@ mod tests {
         // spans ±15 m east / ±13 m north) — no piece may intrude on
         // the spawn volume.
         assert!(TEST_STAND_AT.0 - 7.0 > 15.0, "stand apron overlaps the pad");
+    }
+
+    /// C1: the bake is a pure function of the layout version — built
+    /// once, reused on every later call, and re-baked when the version
+    /// moves (the invalidation contract the extract's per-frame emit
+    /// depends on).
+    #[test]
+    fn space_center_bake_builds_once_per_layout_version() {
+        let mut bake = SpaceCenterBake::default();
+        assert_eq!(bake.bakes, 0);
+        assert_eq!(bake.pieces().len(), SPACE_CENTER.len());
+        assert_eq!(bake.bakes, 1);
+        let first = bake.pieces()[0].as_ptr();
+        bake.pieces();
+        assert_eq!(bake.bakes, 1, "a same-version call must not re-bake");
+        assert_eq!(
+            bake.pieces()[0].as_ptr(),
+            first,
+            "the bake must be reused, not rebuilt"
+        );
+        // A layout bump (any edit to SPACE_CENTER or the palette and
+        // mottle constants) invalidates the whole table.
+        bake.version = Some(SPACE_CENTER_LAYOUT_VERSION.wrapping_add(1));
+        bake.pieces();
+        assert_eq!(bake.bakes, 2, "a version change must re-bake");
+        assert_ne!(bake.pieces()[0].as_ptr(), first);
+        // The bake is real geometry: tessellated, mottled triangles
+        // across every piece.
+        let tris: usize = bake.pieces().iter().map(Vec::len).sum();
+        assert!(
+            tris > 1_000,
+            "the complex must bake a real triangle count (got {tris})"
+        );
+        assert!(
+            bake.pieces().iter().all(|p| !p.is_empty()),
+            "every layout piece carries geometry"
+        );
     }
 }
