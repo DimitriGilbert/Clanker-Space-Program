@@ -582,6 +582,22 @@ impl Environment {
         self.radius_m + t.height_m(dir_fixed)
     }
 
+    /// The contact-surface radius's **global upper bound** over every
+    /// direction and spin phase: `radius_m + amplitude_m` with terrain
+    /// (the baked field is `height_normalized_profile`, clamped to
+    /// [-1, 1], and the bilinear `sample_dir` is a convex combination
+    /// of its texels — so `surface_radius ≤ radius_m + amplitude_m`
+    /// unconditionally), `radius_m` on the bare sphere. The
+    /// far-above-ground culls (`provably_surface_free`) use this to
+    /// skip whole per-vertex scans without assuming anything about the
+    /// field's actual contents.
+    pub fn surface_radius_max(&self) -> f64 {
+        match &self.terrain {
+            Some(t) => self.radius_m + t.amplitude_m,
+            None => self.radius_m,
+        }
+    }
+
     /// The contact-surface **outward normal** along `dir` at
     /// sim-second `seconds` — `dir` a UNIT body-center-relative
     /// direction in the inertial bubble frame, the same contract
@@ -1586,6 +1602,66 @@ fn aabbs_overlap(a: (DVec3, DVec3), b: (DVec3, DVec3)) -> bool {
         && b.0.z < a.1.z
 }
 
+/// Provably-contact-free cull for the ground scans — **bit-exact by
+/// construction**: it only ever skips work whose outputs are provably
+/// empty, and its own arithmetic never enters any sim state.
+///
+/// The proof, per collider vertex `v` with world position
+/// `p = pos + rot·v` and `rel = p − body_center`, `dist = |rel|`:
+///
+/// - `dist ≥ |com_world − body_center| − R`, where
+///   `R = max_v |v − com_local|` (triangle inequality about the CoM);
+/// - `depth = surface_radius(rel/dist, phase) − dist ≤
+///   surface_radius_max() − dist` at every spin phase
+///   ([`Environment::surface_radius_max`]'s bound);
+/// - so `depth ≤ surf_max − (|com_rel| − R) =: −gap` with
+///   `gap = |com_rel| − R − surf_max`. A **real** contact needs
+///   `depth > 0`, i.e. `gap < 0`: with `gap ≥ 0` there is none.
+/// - A **speculative** contact additionally needs
+///   `depth > −closing·dt` with `closing = −v_pt·n̂ ≤ |v_pt|`, and
+///   `|v_pt| ≤ |vel| + |ang_vel|·R + |body_spin|·(|com_rel| + R)`
+///   (each term bounded by the same triangle/Cauchy-Schwarz splits).
+///   With `gap ≥ |v_pt|_bound·dt` the depth is `≤ −|v_pt|_bound·dt ≤
+///   −closing·dt` for every vertex, so the strict `>` fails and no
+///   speculative constraint can be generated either.
+///
+/// `speculative == false` is the position-only form (the
+/// `ground_contact` predicate's question). Any NaN in the inputs
+/// compares false and the caller falls through to the full scan — the
+/// cull can only be conservative, never wrong. The `R` sweep is
+/// `O(verts)` multiply-adds — no trig, no heightfield samples —
+/// versus the scan's per-vertex `asin`/`atan2` bilinear sample.
+fn provably_surface_free(b: &WeldedBody, env: &Environment, speculative_dt: Option<f64>) -> bool {
+    let mut r2_max = 0.0f64;
+    for hull in &b.collider.hulls {
+        for v in &hull.vertices {
+            let d = *v - b.com_local;
+            let n2 = d.x * d.x + d.y * d.y + d.z * d.z;
+            if n2 > r2_max {
+                r2_max = n2;
+            }
+        }
+    }
+    let reach = libm::sqrt(r2_max);
+    let com_rel = b.com_world() - env.body_center;
+    let com_n = com_rel.norm();
+    let surf_max = env.surface_radius_max();
+    let gap = com_n - reach - surf_max;
+    // NaN (non-finite inputs) must fall through to the full scan —
+    // the cull may only fire on a definite margin.
+    if gap.is_nan() || gap < 0.0 {
+        return false;
+    }
+    match speculative_dt {
+        None => true,
+        Some(dt) => {
+            let speed_bound =
+                b.vel.norm() + b.ang_vel.norm() * reach + env.body_spin.norm() * (com_n + reach);
+            gap >= speed_bound * dt
+        }
+    }
+}
+
 /// Inclusive AABB overlap — face-touching counts (the spawn-occupancy
 /// rule: a box sharing a boundary claims the spawn volume's edge).
 fn aabbs_touch(a: (DVec3, DVec3), b: (DVec3, DVec3)) -> bool {
@@ -1724,12 +1800,15 @@ impl SimpleBackend {
         graph: &crate::graph::PartGraph,
         parts: &[WeldPart],
         contacts: &[Contact],
+        transforms: &std::collections::BTreeMap<
+            crate::graph::PartNodeId,
+            crate::graph::PartTransform,
+        >,
     ) -> Result<
         std::collections::BTreeMap<crate::graph::PartNodeId, Vec<crate::structural::PartForce>>,
         crate::weld::WeldError,
     > {
         use crate::structural::PartForce;
-        let transforms = crate::weld::body_transforms(graph, parts)?;
         let mut out: std::collections::BTreeMap<crate::graph::PartNodeId, Vec<PartForce>> =
             std::collections::BTreeMap::new();
         let conj = body.rot.conjugate();
@@ -1857,6 +1936,13 @@ impl SimpleBackend {
     /// (`set_sim_time`): the surface under a vertex at tick `t` is
     /// the field at spin phase `ω·t`.
     pub fn ground_contact(&self, b: &WeldedBody) -> bool {
+        // Far-above-ground cull — `provably_surface_free`'s
+        // position-only form: no vertex can sit at or under the
+        // surface at any spin phase, so the per-vertex heightfield
+        // samples are skipped whole.
+        if provably_surface_free(b, &self.env, None) {
+            return false;
+        }
         for hull in &b.collider.hulls {
             for v in &hull.vertices {
                 let p = b.pos + b.rot.rotate(*v);
@@ -2035,6 +2121,13 @@ impl SimpleBackend {
         let eval_s = self.time_s.get() + PHYSICS_DT;
         for (i, b) in bodies.iter().enumerate() {
             if b.settle.latched {
+                continue;
+            }
+            // Far-above-ground cull — provably no manifold point (real
+            // or speculative) can exist for ANY vertex this tick, so
+            // the per-vertex heightfield samples are skipped whole
+            // (`provably_surface_free`'s proof).
+            if provably_surface_free(b, &self.env, Some(PHYSICS_DT)) {
                 continue;
             }
             for (hull_index, hull) in b.collider.hulls.iter().enumerate() {
@@ -3238,6 +3331,45 @@ mod tests {
         for _ in 0..n {
             backend.step(bodies, &[]);
         }
+    }
+
+    /// `provably_surface_free` — the far-above-ground cull behind
+    /// `generate_contacts` and `ground_contact`. It must fire only on
+    /// a PROVABLE margin: a body clear of `radius + amplitude` by
+    /// more than its worst-case closing this tick culls; a body at
+    /// rest just above the surface never does (the full scan owns
+    /// it), and neither does a body inside the speculative reach.
+    #[test]
+    fn surface_free_cull_fires_only_on_a_provable_margin() {
+        let mut env = terrin_env();
+        // Amplitude 1 km of authored relief, spinning body.
+        env.terrain = Some(crate::TerrainSurface::new(
+            7,
+            1_000.0,
+            ReliefProfile::Legacy,
+        ));
+        env.body_spin = DVec3::Z * 1.0e-4;
+        let mut b = box_body(1_000.0, DVec3::new(0.5, 0.5, 0.5));
+        // Resting just above the surface: no cull under any reading.
+        b.pos = DVec3::new(TERRIN_R + 0.6, 0.0, 0.0);
+        assert!(!provably_surface_free(&b, &env, None));
+        assert!(!provably_surface_free(&b, &env, Some(PHYSICS_DT)));
+        // 100 km up, at rest: both readings cull.
+        b.pos = DVec3::new(TERRIN_R + 100_000.0, 0.0, 0.0);
+        assert!(provably_surface_free(&b, &env, None));
+        assert!(provably_surface_free(&b, &env, Some(PHYSICS_DT)));
+        // Same pose diving at 3 km/s: the speculative margin
+        // (3_000/64 ≈ 47 m) is far inside the 99 km gap, so the
+        // velocity-aware reading still culls…
+        b.vel = DVec3::new(-3_000.0, 0.0, 0.0);
+        assert!(provably_surface_free(&b, &env, Some(PHYSICS_DT)));
+        // …but a 3 km/s dive from just inside the amplitude+reach
+        // band must NOT cull — the vertex scan owns that decision.
+        b.pos = DVec3::new(TERRIN_R + 1_002.0, 0.0, 0.0);
+        assert!(!provably_surface_free(&b, &env, Some(PHYSICS_DT)));
+        // A non-finite input never culls (falls through to the scan).
+        b.pos = DVec3::new(f64::NAN, 0.0, 0.0);
+        assert!(!provably_surface_free(&b, &env, None));
     }
 
     /// §2.9 oracle scenario 1 — free fall. Gravity is `μ/r²` toward the

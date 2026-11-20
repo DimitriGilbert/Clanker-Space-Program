@@ -157,8 +157,13 @@ pub struct WeldedBody {
     /// command). **Derived cache**: skipped in serialization and in
     /// the state-hash walk (a pure function of `(craft, mask)` —
     /// §2.4.1's "aero tables are never serialized in the save").
+    /// `Arc`-shared: the per-tick rollback shadow and the batch
+    /// bookkeeping clone `WeldedBody` wholesale, and a thousand-part
+    /// table is megabytes — a clone here must be a refcount bump, not
+    /// a deep copy (in-place mutation goes through `Arc::make_mut`,
+    /// the `rebody` restamp precedent).
     #[serde(skip)]
-    pub aero: Option<Box<crate::aero::CraftAeroTables>>,
+    pub aero: Option<std::sync::Arc<crate::aero::CraftAeroTables>>,
     /// §3.1 `Parachute` decelerator sites — the additive analytic-drag
     /// terms the §2.9 force model sums after the aero-table
     /// contribution. **Sim-owned state**: `weld` emits an empty list
@@ -178,6 +183,36 @@ pub struct WeldedBody {
     /// Boxed: the net is cold data (touched once per tick) and
     /// `WeldedBody` lives inside `VesselState`'s enum layout.
     pub thermal: Box<ThermalNet>,
+}
+
+impl Default for WeldedBody {
+    /// The empty placeholder — **never a sim value**. `csp-sim`'s tick
+    /// batch moves each `InBubble` body into the solver's slice with
+    /// `mem::take` and swaps the stepped body back after, so the
+    /// placeholder occupies the vessel record only for the duration of
+    /// `backend.step` (nothing reads an `InBubble` body in that
+    /// window), replacing what used to be a full deep clone of the
+    /// body — collider, part index, aero tables and all — per vessel
+    /// per tick.
+    fn default() -> Self {
+        Self {
+            pos: DVec3::ZERO,
+            rot: DQuat::IDENTITY,
+            vel: DVec3::ZERO,
+            ang_vel: DVec3::ZERO,
+            throttle: 0.0,
+            settle: SettleState::default(),
+            mass_kg: 0.0,
+            com_local: DVec3::ZERO,
+            inertia_local: SymMat3::ZERO,
+            force_sites: Vec::new(),
+            collider: CompoundCollider { hulls: Vec::new() },
+            part_index: BTreeMap::new(),
+            aero: None,
+            decel: Vec::new(),
+            thermal: Box::default(),
+        }
+    }
 }
 
 /// One decelerator drag site on a [`WeldedBody`] — a §3.1 `Parachute`

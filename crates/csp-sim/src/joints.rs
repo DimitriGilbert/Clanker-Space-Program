@@ -1116,7 +1116,7 @@ pub(crate) fn apply_latch(
             reliability: reliability_table_m.clone(),
             part_ids: part_ids_m.clone(),
         };
-        body_m.aero = Some(Box::new(
+        body_m.aero = Some(std::sync::Arc::new(
             csp_phys::aero::build_aero_tables(
                 &body_m,
                 &craft_m.graph,
@@ -1206,7 +1206,9 @@ pub(crate) fn apply_latch(
         crate::economy::reseat_roster(economy, sec, prim, &vs.crew);
     }
     physics.aero.remove(&prim);
+    physics.skeletons.remove(&prim);
     physics.aero.remove(&sec);
+    physics.skeletons.remove(&sec);
     // The seam's own joint is consumed; any other joint touching the
     // absorbed vessel is dead with it.
     joints.retain(|j| j.vessel_a != sec && j.vessel_b != sec);

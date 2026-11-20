@@ -1874,6 +1874,7 @@ macro_rules! define_world_snapshot {
                         bubble_radius_m: p.bubble_radius_m,
                         aero: BTreeMap::new(),
                         thermal_rates: Vec::new(),
+            skeletons: BTreeMap::new(),
                     }),
                     script_engine: None,
                     autopilot_driver: None,
@@ -2740,6 +2741,29 @@ struct Physics {
     /// serialized, never hashed (the whole `Physics` is construction
     /// config).
     thermal_rates: Vec<f64>,
+    /// The structural pass's craft skeletons — cached
+    /// `body_transforms` per vessel, keyed by `craft_graph_hash` (a
+    /// superset of everything `solve_transforms` reads: node parents,
+    /// transforms, effective indices). The tick's `external_loads` +
+    /// `joint_loads` pair used to re-derive the whole map — validate,
+    /// children build, DFS, two BTreeMap collects — twice per tick
+    /// per vessel for a craft that changes once per re-weld. Derived
+    /// cache like `aero`: never serialized, never hashed, a stale or
+    /// absent entry is recomputed by the same deterministic path.
+    skeletons: BTreeMap<VesselId, CraftSkeleton>,
+}
+
+/// One vessel's cached structural skeleton — the body-frame part
+/// transforms `weld::body_transforms` produces, bound to the craft
+/// generation (`graph_hash`) they were solved for.
+struct CraftSkeleton {
+    /// `craft_graph_hash` of the craft the transforms were solved
+    /// from; a mismatch invalidates wholesale (the `VesselAeroCache`
+    /// convention).
+    graph_hash: u64,
+    /// `body_transforms(&craft.graph, &craft.parts)` — the same map
+    /// the per-tick call produced, bit for bit.
+    transforms: BTreeMap<csp_phys::PartNodeId, csp_phys::PartTransform>,
 }
 
 /// One vessel's per-mask table cache — `graph_hash` binds the cache
@@ -2749,8 +2773,11 @@ struct VesselAeroCache {
     /// `craft_graph_hash` of the craft these tables were built for.
     graph_hash: u64,
     /// Computed tables by mask — capped at
-    /// `csp_phys::MAX_CONFIG_MASKS` per §2.4.1.
-    tables: BTreeMap<csp_phys::ConfigMask, csp_phys::CraftAeroTables>,
+    /// `csp_phys::MAX_CONFIG_MASKS` per §2.4.1. `Arc` values: the
+    /// per-tick attach hands the body a refcount, not a megabyte
+    /// deep copy (the C14-F2 restamp pays `make_mut` only when the
+    /// CoM actually moved).
+    tables: BTreeMap<csp_phys::ConfigMask, std::sync::Arc<csp_phys::CraftAeroTables>>,
 }
 
 impl World {
@@ -2958,6 +2985,7 @@ impl World {
             bubble_radius_m: physics.bubble_radius_m,
             aero: BTreeMap::new(),
             thermal_rates: Vec::new(),
+            skeletons: BTreeMap::new(),
         });
         w
     }
@@ -4518,7 +4546,16 @@ impl World {
                     burns_done.insert(*vid);
                 }
                 pre_vel.push((body.vel, body.ang_vel));
-                batch.push(body.clone());
+                // Move, don't clone: the placeholder occupies the
+                // vessel record only until the post-step swap below —
+                // nothing reads an `InBubble` body between here and
+                // there (`batch_joint_defs` touches only `craft`, the
+                // backend reads the batch), and any in-range `?`
+                // escape restores the pre-range arena from the shadow
+                // before the placeholders can be observed. Same values
+                // into the solver, same stepped values back — zero
+                // deep copies of collider/aero/thermal per tick.
+                batch.push(core::mem::take(body));
                 batch_vids.push(*vid);
             }
             // M6-B §2.4: translate the live transient joints into the
@@ -4556,13 +4593,44 @@ impl World {
                 // thrust, gravity, contact impulses). A joint whose
                 // load exceeds the child part's authored limits fails.
                 if let Some(craft) = &vessel.craft {
+                    // The craft skeleton — cached `body_transforms`,
+                    // rebuilt only when the craft generation changes
+                    // (re-weld, jettison). `external_loads` and
+                    // `joint_loads` below consume the SAME map the
+                    // per-tick re-solve used to produce, twice.
+                    let gh = craft_graph_hash(craft);
+                    let skeleton = physics
+                        .skeletons
+                        .entry(vid)
+                        .or_insert_with(|| CraftSkeleton {
+                            graph_hash: gh,
+                            transforms: BTreeMap::new(),
+                        });
+                    if skeleton.graph_hash != gh {
+                        *skeleton = CraftSkeleton {
+                            graph_hash: gh,
+                            transforms: BTreeMap::new(),
+                        };
+                    }
+                    if skeleton.transforms.is_empty() {
+                        skeleton.transforms =
+                            csp_phys::weld::body_transforms(&craft.graph, &craft.parts)
+                                .map_err(|e| SimError::Fatal(e.reason()))?;
+                    }
+                    let transforms = &skeleton.transforms;
                     let (ext, ground) = {
                         let contacts = physics.backend.contacts(csp_phys::BodyHandle(i as u32));
                         let ground = contacts.iter().any(|c| c.peer.is_none());
                         (
                             physics
                                 .backend
-                                .external_loads(body, &craft.graph, &craft.parts, contacts)
+                                .external_loads(
+                                    body,
+                                    &craft.graph,
+                                    &craft.parts,
+                                    contacts,
+                                    transforms,
+                                )
                                 .map_err(|e| SimError::Fatal(e.reason()))?,
                             ground,
                         )
@@ -4585,6 +4653,7 @@ impl World {
                         &ext,
                         accel_b,
                         alpha_b,
+                        transforms,
                     )
                     .map_err(|e| SimError::Fatal(e.reason()))?;
                     let failed = csp_phys::failed_joints(&loads, &craft.graph, &craft.parts)
@@ -6323,7 +6392,7 @@ impl World {
                 gh,
             )
             .map_err(|e| SimError::Recoverable(e.reason()))?;
-            body.aero = Some(Box::new(t.clone()));
+            body.aero = Some(std::sync::Arc::new(t.clone()));
             tables = Some(t);
         }
         // M4b: fresh parts start at the ambient temperature of the
@@ -6352,7 +6421,7 @@ impl World {
         let id = VesselId(self.next_vessel_id);
         if let (Some(t), Some(p)) = (tables, self.physics.as_mut()) {
             let mut tables_map = BTreeMap::new();
-            tables_map.insert(csp_phys::ConfigMask::ALL, t);
+            tables_map.insert(csp_phys::ConfigMask::ALL, std::sync::Arc::new(t));
             p.aero.insert(
                 id,
                 VesselAeroCache {
@@ -7107,7 +7176,7 @@ impl World {
             };
             let t = csp_phys::aero::build_aero_tables(body, &craft.graph, &craft.parts, mask, gh)
                 .map_err(|e| SimError::Recoverable(e.reason()))?;
-            cache.tables.insert(mask, t);
+            cache.tables.insert(mask, std::sync::Arc::new(t));
         }
         let resolved = if cache.tables.contains_key(&mask) {
             mask
@@ -7124,12 +7193,16 @@ impl World {
         let Some(v) = self.vessels.get_mut(&vessel) else {
             return Err(SimError::Fatal("aero: vessel vanished"));
         };
-        if let (Some(t), VesselState::InBubble(b)) = (tables, &mut v.state) {
-            let mut t = t;
+        if let (Some(mut t), VesselState::InBubble(b)) = (tables, &mut v.state) {
             // C14-F2: restamp the torque arm's CoM reference — a
             // cached table predating a burn carries the old `com_local`.
-            t.com_local = b.com_local;
-            b.aero = Some(Box::new(t));
+            // The restamp is the attach's only mutation, so the copy
+            // `make_mut` implies is paid exactly when the reference
+            // moved (a burn), never on a steady no-op attach.
+            if t.com_local != b.com_local {
+                std::sync::Arc::make_mut(&mut t).com_local = b.com_local;
+            }
+            b.aero = Some(t);
         }
         Ok(())
     }
@@ -7197,7 +7270,9 @@ impl World {
                 "install-aero: config-mask table cap reached",
             ));
         }
-        cache.tables.insert(mask, tables.clone());
+        cache
+            .tables
+            .insert(mask, std::sync::Arc::new(tables.clone()));
         if v.aero_mask == mask
             && let VesselState::InBubble(_) = v.state
         {
@@ -7210,7 +7285,7 @@ impl World {
                 // binding is geometric, so an install may legitimately
                 // carry a pre-burn CoM.
                 t.com_local = b.com_local;
-                b.aero = Some(Box::new(t));
+                b.aero = Some(std::sync::Arc::new(t));
             }
         }
         Ok(())
@@ -7265,7 +7340,7 @@ impl World {
             };
             let t = csp_phys::aero::build_aero_tables(&body, &craft.graph, &craft.parts, mask, gh)
                 .map_err(|e| SimError::Recoverable(e.reason()))?;
-            cache.tables.insert(mask, t);
+            cache.tables.insert(mask, std::sync::Arc::new(t));
         }
         let resolved = if cache.tables.contains_key(&mask) {
             mask
@@ -7295,9 +7370,10 @@ impl World {
             {
                 let mut t = t.clone();
                 // C14-F2: restamp `com_local` for the live weld — see
-                // `ensure_aero`.
-                t.com_local = b.com_local;
-                b.aero = Some(Box::new(t));
+                // `ensure_aero` (`make_mut`: the cache still holds a
+                // reference, so the restamp pays one copy here).
+                std::sync::Arc::make_mut(&mut t).com_local = b.com_local;
+                b.aero = Some(t);
             }
         }
         Ok(())
@@ -7439,6 +7515,7 @@ impl World {
         self.credit_science_payout(banked, shadow);
         if let Some(p) = self.physics.as_mut() {
             p.aero.remove(&vessel);
+            p.skeletons.remove(&vessel);
         }
         self.ensure_aero(vessel)
     }
@@ -7593,7 +7670,7 @@ impl World {
         if let Some(p) = self.physics.as_ref()
             && p.backend.environment().atmosphere.is_some()
         {
-            nb.aero = Some(Box::new(
+            nb.aero = Some(std::sync::Arc::new(
                 csp_phys::aero::build_aero_tables(
                     &nb,
                     &retained,
@@ -7761,6 +7838,7 @@ impl World {
         }
         if let Some(p) = self.physics.as_mut() {
             p.aero.remove(&vessel);
+            p.skeletons.remove(&vessel);
         }
         // C10-F1: refuse the split pair before returning — without
         // the refusal the next tick's `joints::lifecycle` detection
@@ -12506,6 +12584,7 @@ fn apply_breakup(
         research::drop_vessel_projects(science, event_heap, next_event_seq, vid, shadow);
         vessels.remove(&vid);
         physics.aero.remove(&vid);
+        physics.skeletons.remove(&vid);
         dead.push(vid);
         return Ok(());
     }
@@ -12537,7 +12616,7 @@ fn apply_breakup(
     // the M4b destruction path's convention (child fragments keep
     // the parent's until their Stage-2 recompute lands).
     nb.aero = if physics.backend.environment().atmosphere.is_some() {
-        Some(Box::new(
+        Some(std::sync::Arc::new(
             csp_phys::aero::build_aero_tables(
                 &nb,
                 &craft.graph,
@@ -12592,6 +12671,7 @@ fn apply_breakup(
     // The cache is bound to the pre-breakup graph hash — drop it;
     // `ensure_aero` rebuilds on the staleness check.
     physics.aero.remove(&vid);
+    physics.skeletons.remove(&vid);
     // M7-A: finalize the projects whose lab nodes left on a fragment —
     // accrued science banks at this tick; the escrowed remainder lands
     // in the fragment's pool under its lab node. A project whose node
@@ -12723,6 +12803,7 @@ fn retire_debris_vessel(
     }
     if let Some(p) = physics {
         p.aero.remove(&vid);
+        p.skeletons.remove(&vid);
     }
     gone
 }
@@ -16720,6 +16801,62 @@ mod tests {
         assert!(dv > 1.0, "staged/deployed divergence {dv} m/s");
     }
 
+    /// The structural skeleton cache (`Physics::skeletons`) must
+    /// rebuild when the craft generation changes: warm it on the
+    /// two-node craft, jettison a node (a new graph → a new
+    /// `craft_graph_hash`), and verify the cached transforms track
+    /// the reduced craft and equal a fresh `body_transforms` solve —
+    /// the `VesselAeroCache` invalidation convention, pinned on the
+    /// structural half.
+    #[test]
+    fn skeleton_cache_invalidates_on_craft_change() {
+        let mut w = physics_world(false);
+        let pos = DVec3::new(TERRIN_R + 30_000.0, 0.0, 0.0);
+        spawn_physical(
+            &mut w,
+            SimCommand::SpawnPhysicalVessel {
+                craft: two_node_craft(),
+                pos,
+                rot: csp_core::DQuat::IDENTITY,
+                vel: DVec3::new(-300.0, 0.0, 0.0),
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        let physics = w.physics.as_ref().expect("physics world");
+        let sk = physics
+            .skeletons
+            .get(&VesselId(0))
+            .expect("skeleton warmed by the first tick");
+        assert_eq!(sk.transforms.len(), 2, "covers the spawned graph");
+        let h0 = sk.graph_hash;
+        // Jettison node 2 — the craft's graph generation changes.
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::JettisonPart {
+                vessel: VesselId(0),
+                node: csp_phys::PartNodeId(2),
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        let physics = w.physics.as_ref().expect("physics world");
+        let sk = physics
+            .skeletons
+            .get(&VesselId(0))
+            .expect("skeleton survives the jettison");
+        assert_eq!(sk.transforms.len(), 1, "rebuilt for the reduced craft");
+        assert_ne!(sk.graph_hash, h0, "generation stamp moved");
+        // The cached map is exactly what a fresh solve produces.
+        let v = &w.vessels()[&VesselId(0)];
+        let craft = v.craft.as_ref().expect("craft survives the jettison");
+        assert_eq!(
+            sk.transforms,
+            csp_phys::weld::body_transforms(&craft.graph, &craft.parts).unwrap(),
+            "cached transforms equal a fresh body_transforms solve"
+        );
+    }
+
     /// `InstallAeroTables` reject leg: build sim-side, install via
     /// the command path, reject a mismatched graph hash — and a
     /// `mask` field that disagrees with the command's mask argument.
@@ -18976,6 +19113,7 @@ mod tests {
             bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
             aero: BTreeMap::new(),
             thermal_rates: Vec::new(),
+            skeletons: BTreeMap::new(),
         };
         let mut next_id = 1u64;
         let mut dead = Vec::new();
@@ -21445,6 +21583,7 @@ mod tests {
             bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,
             aero: BTreeMap::new(),
             thermal_rates: Vec::new(),
+            skeletons: BTreeMap::new(),
         };
         let mut joints_v = vec![LiveJoint {
             vessel_a: VesselId(0),

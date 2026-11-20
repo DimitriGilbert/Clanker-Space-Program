@@ -126,8 +126,8 @@ pub fn joint_loads(
     ext: &BTreeMap<PartNodeId, Vec<PartForce>>,
     accel_body: DVec3,
     alpha_body: DVec3,
+    transforms: &BTreeMap<PartNodeId, PartTransform>,
 ) -> Result<Vec<JointLoad>, WeldError> {
-    let transforms = crate::weld::body_transforms(graph, parts)?;
     // Part AABBs for the attach-axis convention — the thermal net's
     // per-node hull bounds (same data the conduction edge axis uses).
     let aabbs: BTreeMap<PartNodeId, (DVec3, DVec3)> = body
@@ -547,6 +547,7 @@ mod tests {
             &ext,
             DVec3::new(0.0, 0.0, 10.0),
             DVec3::ZERO,
+            &crate::weld::body_transforms(&graph, &parts).unwrap(),
         )
         .unwrap();
         let adapter = loads.iter().find(|l| l.node == PartNodeId(2)).unwrap();
@@ -576,23 +577,39 @@ mod tests {
         let body = crate::weld(&graph, &parts).unwrap();
         let ext: BTreeMap<PartNodeId, Vec<PartForce>> = BTreeMap::new();
         let a = DVec3::new(10.0, 0.0, 0.0);
-        let origin_arm = joint_loads(&body, &graph, &parts, &ext, a, DVec3::ZERO)
-            .unwrap()
-            .iter()
-            .find(|l| l.node == PartNodeId(2))
-            .unwrap()
-            .torque_nm;
+        let origin_arm = joint_loads(
+            &body,
+            &graph,
+            &parts,
+            &ext,
+            a,
+            DVec3::ZERO,
+            &crate::weld::body_transforms(&graph, &parts).unwrap(),
+        )
+        .unwrap()
+        .iter()
+        .find(|l| l.node == PartNodeId(2))
+        .unwrap()
+        .torque_nm;
         // Same craft with the edge's snapped attach point recorded at
         // z = 0.5 on the root's face — the physical mating surface.
         let mut graph2 = graph.clone();
         let adapter = graph2.nodes.get_mut(&PartNodeId(2)).unwrap();
         adapter.joint = Some(DVec3::new(0.0, 0.0, 0.5));
-        let joint_arm = joint_loads(&body, &graph2, &parts, &ext, a, DVec3::ZERO)
-            .unwrap()
-            .iter()
-            .find(|l| l.node == PartNodeId(2))
-            .unwrap()
-            .torque_nm;
+        let joint_arm = joint_loads(
+            &body,
+            &graph2,
+            &parts,
+            &ext,
+            a,
+            DVec3::ZERO,
+            &crate::weld::body_transforms(&graph2, &parts).unwrap(),
+        )
+        .unwrap()
+        .iter()
+        .find(|l| l.node == PartNodeId(2))
+        .unwrap()
+        .torque_nm;
         assert!(
             (origin_arm - 2_000.0).abs() < 1.0,
             "origin-fallback torque arm: {origin_arm}"

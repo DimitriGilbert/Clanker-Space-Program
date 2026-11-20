@@ -684,8 +684,11 @@ fn rebody(vessel: &mut Vessel) -> Result<(), SimError> {
     // reference and the one mass-derived field it carries — the mass
     // move the re-weld just integrated shifts the real CoM, so
     // restamp it (geometry itself is untouched by the mass change,
-    // which is why the table survives at all).
+    // which is why the table survives at all). `make_mut`: the Arc
+    // still shares the pre-rebody body here, so this is the one place
+    // a re-weld pays a table copy — the rare path, not the tick.
     if let Some(t) = body.aero.as_mut() {
+        let t = std::sync::Arc::make_mut(t);
         t.com_local = body.com_local;
     }
     vessel.state = VesselState::InBubble(body);
