@@ -584,20 +584,77 @@ states + on-rails flags + maneuver nodes + tick, staged by
 `Gpu` (`crates/csp-render/src/lib.rs:176`): wgpu 30, `Backends::PRIMARY`,
 HighPerformance adapter, **`required_features: Features::empty()`**
 (`lib.rs:227` — Baseline everywhere; see §10), sRGB surface format
-(non-sRGB fallback warns loudly — output renders ~2× dark), frame
-latency 2. The present mode is a P1 parameter (`Gpu::new`, live via
-`Gpu::set_present_mode`): the settings' `vsync` (`auto`/`off`) maps to
-`AutoVsync`/`AutoNoVsync` in `csp-app` — a change reconfigures the
-surface on the same path `resize` takes (compositors that always
-vsync quietly absorb an `off`). Uncaptured errors are logged-and-deduped
-(§2.13 Cosmetic class), device-lost degrades to per-frame reconfigure.
-`begin_frame` (`:345`) returns `Ok/Reconfigure/Skip`. 4× MSAA on every
+(non-sRGB fallback warns loudly — output renders ~2× dark). Uncaptured
+errors are logged-and-deduped (§2.13 Cosmetic class), device-lost
+degrades to per-frame reconfigure. `begin_frame` (`:345`) returns
+`Ok/Reconfigure/Skip`. 4× MSAA on every
 surface-bound pipeline via one shared `MSAA_SAMPLES = 4` constant and
 the `MsaaColor` resolve target (`lib.rs:60-130`) — there was no AA
 anywhere before C11-F1. The scene render scale (P1, §7.2.2) sizes the
 MSAA target and the optional resolve intermediate; `scene_target_size`
 (`lib.rs`) is the pure target math (`round(surface × scale)` per axis,
 1-px floor, clamped, unit-tested).
+
+**Present-mode negotiation (P1 vsync).** The settings' `vsync`
+(`auto`/`off`) maps to `AutoVsync`/`AutoNoVsync` in `csp-app`, and
+`csp_render::resolve_present_mode` resolves the request against the
+modes the surface offers exactly as wgpu-core 30.0.1 does:
+`AutoVsync` takes the first of `[FifoRelaxed, Fifo]` the surface lists,
+`AutoNoVsync` the first of `[Immediate, Mailbox, Fifo]`, and a concrete
+mode is used only when the surface lists it. `Gpu::new` and
+`Gpu::set_present_mode` both run that resolution and store the
+*resolved* mode, so `Gpu::present_mode` and the `render:` log lines
+report the mode frames actually run under (wgpu itself hands a
+configuration back as passed, `Auto*` included). Whether an `off`
+request takes effect is therefore the platform's and driver's call — a
+surface that lists `Mailbox` or `Immediate` runs uncapped, one that
+lists only `Fifo` stays on it. A settings flip reconfigures the surface
+on the same path `resize` takes, and only when the resolved mode moves;
+a request the surface refuses logs a warning and keeps the previous
+mode. A surface that offers no format or no usable mode is a
+`GpuError` at `Gpu::new`, never a panic.
+
+**Frame latency.** `Gpu::new` takes the requested frame latency
+(default 2, clamped to `1..=5`). On Vulkan it only sets the swapchain's
+minimum image count to latency + 1 (`wgpu-hal`
+`src/vulkan/swapchain/native.rs`), and wgpu-core clamps the request to
+the backend's own range — a range the public API does not expose, so
+the logged value is the request, not that second clamp.
+
+**Compositor-aligned redraw.** For the vblank-clocked modes (`Fifo`,
+`FifoRelaxed`, `Mailbox`) `paint` calls `window.pre_present_notify()`
+(`PresentOverrides::notify_compositor` in `csp-app/src/lib.rs`) right
+before `gpu.submit`: winit aligns `RedrawRequested` with the
+compositor's frame callbacks on Wayland only when it is called —
+without it the loop is paced solely by swapchain acquire blocking, which
+is uneven on some drivers. In winit 0.30.13 the call is a no-op on X11,
+Windows, web and macOS, and `Immediate` never requests it.
+
+**Runtime overrides** — environment variables read once at startup, so
+a remote player can test a candidate cause without a new build. A value
+a parser refuses logs a warning naming the value and takes the default;
+none of them can fail startup.
+
+| Variable | Accepted values | Effect |
+|---|---|---|
+| `CSP_PRESENT_MODE` | `auto` (default), `fifo`, `fifo-relaxed`, `mailbox`, `immediate` — case-insensitive, surrounding whitespace trimmed | Pins a concrete present mode regardless of the vsync setting, at init and on every later flip. A mode the surface does not offer logs a warning listing the offered modes and leaves the automatic rule in force. |
+| `CSP_FRAME_LATENCY` | a decimal integer in `1..=5` (default `2`) | The frame latency asked of the surface. |
+| `CSP_COMPOSITOR_PACING` | `0`, `off`, `false` — case-insensitive, trimmed | Disables the compositor-aligned redraw (one warning at startup). Unset, empty or any other value keeps it on. |
+
+**The log lines** (INFO; nothing is logged per frame). At GPU init and
+again together whenever the vsync setting or the mode in force moves:
+
+```text
+render: adapter "NVIDIA GeForce RTX 5060 Ti" (Vulkan), surface Bgra8UnormSrgb, 2560x1440, FifoRelaxed, scale 1.00
+render: present modes offered [Fifo, FifoRelaxed, Mailbox]; vsync on -> FifoRelaxed; frame latency 2; source auto
+```
+
+The first is `render_config_line` (`csp-app/src/lib.rs`); the second,
+`present_negotiation_line`, names what the surface offered, what the
+vsync setting asked (`vsync on` / `vsync off` — the arrow is the two
+ASCII characters `->`), the mode that won, the frame latency, and where
+the request came from: `source auto`, or `source CSP_PRESENT_MODE=mailbox`
+when a pin is in force.
 
 ### 7.2 Pass/pipeline inventory
 
@@ -784,8 +841,9 @@ the acquire + submit/present wait, where vsync or a saturated GPU
 parks the CPU thread). Present-dominated ⇒ GPU/vsync; cpu-dominated ⇒
 game code or the player's CPU. The same INFO line that lands at GPU
 init — `render: adapter "…" (backend), surface <fmt>, WxH, <present
-mode>, scale N.NN`, re-logged on every vsync/scale flip — is the
-support surface to attach beside it.
+mode>, scale N.NN`, re-logged on every vsync/scale flip (a vsync flip
+brings its negotiation line along, §7.1) — is the support surface to
+attach beside it.
 
 ### 7.3 WGSL inventory
 

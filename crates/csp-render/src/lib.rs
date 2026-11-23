@@ -78,6 +78,57 @@ pub const MSAA_SAMPLES: u32 = 4;
 /// policy on top of this safety bound.
 pub const SCENE_SCALE_MIN: f32 = 0.25;
 
+/// The frame-latency range [`Gpu::new`] clamps its `frame_latency`
+/// argument into — the same range the app's `CSP_FRAME_LATENCY`
+/// accepts. The floor is every backend's contract (wgpu-hal requires
+/// the range to start at 1); 5 is policy, not a wgpu limit — its docs
+/// call 1–3 typical and expect higher values to be clamped by the
+/// backend anyway.
+pub const FRAME_LATENCY_MIN: u32 = 1;
+/// See [`FRAME_LATENCY_MIN`].
+pub const FRAME_LATENCY_MAX: u32 = 5;
+
+/// Resolve a present-mode request against the modes a surface offers.
+/// Pure — the one negotiation [`Gpu::new`] and [`Gpu::set_present_mode`]
+/// both run, so the mode this crate stores (and the app logs) is the
+/// one wgpu configures: wgpu-core 30.0.1 (`validate_surface_configuration`,
+/// `device/surface_config.rs`) takes a concrete mode the surface lists,
+/// refuses one it does not, and resolves `AutoVsync` to the first of
+/// `[FifoRelaxed, Fifo]` and `AutoNoVsync` to the first of
+/// `[Immediate, Mailbox, Fifo]` the surface lists. The fallback lists
+/// here mirror that function, in its order — change them together.
+/// `None` when nothing resolves: a concrete mode the surface does not
+/// offer, or an empty `offered` (an incompatible surface).
+pub fn resolve_present_mode(
+    requested: wgpu::PresentMode,
+    offered: &[wgpu::PresentMode],
+) -> Option<wgpu::PresentMode> {
+    let fallbacks: &[wgpu::PresentMode] = match requested {
+        wgpu::PresentMode::AutoVsync => &[wgpu::PresentMode::FifoRelaxed, wgpu::PresentMode::Fifo],
+        wgpu::PresentMode::AutoNoVsync => &[
+            wgpu::PresentMode::Immediate,
+            wgpu::PresentMode::Mailbox,
+            wgpu::PresentMode::Fifo,
+        ],
+        _ => return offered.contains(&requested).then_some(requested),
+    };
+    fallbacks
+        .iter()
+        .copied()
+        .find(|fallback| offered.contains(fallback))
+}
+
+/// The present-mode list a re-negotiation resolves against: the one the
+/// surface reports now, or — when that is empty, i.e. the surface has
+/// gone incompatible with its adapter — the list stored at the last
+/// successful negotiation.
+pub(crate) fn effective_offered_modes<'a>(
+    stored: &'a [wgpu::PresentMode],
+    fresh: &'a [wgpu::PresentMode],
+) -> &'a [wgpu::PresentMode] {
+    if fresh.is_empty() { stored } else { fresh }
+}
+
 /// The scaled scene-target size for `surface` at `scale` (P1): each
 /// axis `round(surface × scale)`, floored at 1 px, `scale` clamped
 /// into `SCENE_SCALE_MIN..=1.0` (non-finite → 1.0). Pure — the
@@ -232,6 +283,12 @@ pub struct Gpu {
     /// (`Cell` — `begin_frame` takes `&self`). Bit 0: skip-class
     /// (Timeout/Occluded), bit 1: Validation, bit 2: device-lost.
     surface_warned: std::cell::Cell<u8>,
+    /// The present modes the surface offered at its last successful
+    /// negotiation, in the driver's order — what [`Self::set_present_mode`]
+    /// falls back to when a fresh query reports nothing.
+    present_modes: Vec<wgpu::PresentMode>,
+    /// The frame latency the surface is configured with.
+    frame_latency: u32,
 }
 
 /// The scene-resolve intermediate (P1): the scaled texture the MSAA
@@ -257,12 +314,20 @@ impl Gpu {
     /// Create a GPU context bound to a window. `window` must be an owned
     /// handle (e.g. `Arc<Window>`) so the surface outlives the call.
     /// `present_mode` is the vsync choice (P1 — the app maps its
-    /// settings enum onto wgpu's modes); `scene_scale` is the initial
-    /// render scale (P1, 1.0 = full resolution).
+    /// settings enum onto wgpu's modes), concrete or `Auto*`: it is
+    /// resolved against the surface's offered list by
+    /// [`resolve_present_mode`], and the resolved mode is the one
+    /// stored and reported. `frame_latency` is the requested frames in
+    /// flight, clamped into `FRAME_LATENCY_MIN..=FRAME_LATENCY_MAX`;
+    /// wgpu-core clamps it again to the backend's own range, which the
+    /// public API does not expose, so [`Self::frame_latency`] reports
+    /// the request rather than that second clamp. `scene_scale` is the
+    /// initial render scale (P1, 1.0 = full resolution).
     pub async fn new(
         window: impl Into<wgpu::SurfaceTarget<'static>>,
         size: (u32, u32),
         present_mode: wgpu::PresentMode,
+        frame_latency: u32,
         scene_scale: f32,
     ) -> Result<Self, GpuError> {
         // PRIMARY auto-selects Vulkan/Metal/DX12 natively, WebGPU on wasm.
@@ -328,32 +393,20 @@ impl Gpu {
         }
 
         let caps = surface.get_capabilities(&adapter);
-        let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| f.is_srgb())
-            .unwrap_or_else(|| {
-                // Every pipeline tone-maps into the attachment expecting
-                // a hardware sRGB encode — a non-sRGB fallback renders
-                // ~2.2× dark. Warn loudly rather than silently shipping
-                // a wrong-gamma frame (C11-F8).
-                log::warn!(
-                    "surface offers no sRGB format — falling back to {:?}; \
-                     output will render dark",
-                    caps.formats[0]
-                );
-                caps.formats[0]
-            });
+        let (format, present_mode) = Self::negotiate_surface(&caps, present_mode)?;
 
+        let frame_latency = frame_latency.clamp(FRAME_LATENCY_MIN, FRAME_LATENCY_MAX);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             color_space: wgpu::SurfaceColorSpace::Auto,
             width: size.0.max(1),
             height: size.1.max(1),
+            // Never the request: wgpu hands a configuration back as it
+            // was passed, so an `Auto*` stored here would have
+            // `present_mode` report a mode no frame runs under.
             present_mode,
-            desired_maximum_frame_latency: 2,
+            desired_maximum_frame_latency: frame_latency,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
         };
@@ -385,7 +438,50 @@ impl Gpu {
             blit,
             device_lost,
             surface_warned: std::cell::Cell::new(0),
+            present_modes: caps.present_modes,
+            frame_latency,
         })
+    }
+
+    /// The surface's format and concrete present mode, negotiated from
+    /// what it offers the adapter. An incompatible surface — one that
+    /// reports no format — or a request nothing resolves to is a
+    /// refusal, never a panic or a failed configure.
+    fn negotiate_surface(
+        caps: &wgpu::SurfaceCapabilities,
+        requested: wgpu::PresentMode,
+    ) -> Result<(wgpu::TextureFormat, wgpu::PresentMode), GpuError> {
+        // The capability query itself cannot fail: a surface that is
+        // incompatible with the adapter reports empty lists instead, and
+        // indexing them would panic.
+        let refused = || GpuError::PresentMode {
+            requested,
+            offered: caps.present_modes.clone(),
+        };
+        if caps.formats.is_empty() {
+            return Err(refused());
+        }
+        let Some(present_mode) = resolve_present_mode(requested, &caps.present_modes) else {
+            return Err(refused());
+        };
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| f.is_srgb())
+            .unwrap_or_else(|| {
+                // Every pipeline tone-maps into the attachment expecting
+                // a hardware sRGB encode — a non-sRGB fallback renders
+                // ~2.2× dark. Warn loudly rather than silently shipping
+                // a wrong-gamma frame (C11-F8).
+                log::warn!(
+                    "surface offers no sRGB format — falling back to {:?}; \
+                     output will render dark",
+                    caps.formats[0]
+                );
+                caps.formats[0]
+            });
+        Ok((format, present_mode))
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -423,21 +519,58 @@ impl Gpu {
         };
     }
 
-    /// The current present mode (P1's vsync plumbing).
+    /// The present mode in force (P1's vsync plumbing) — the concrete
+    /// mode the surface is configured with, i.e. the one frames run
+    /// under, never an `Auto*` request.
     pub fn present_mode(&self) -> wgpu::PresentMode {
         self.config.present_mode
     }
 
-    /// Swap the present mode (P1's vsync setting) — a surface
-    /// reconfigure on the same path `resize` takes, so it lands at the
-    /// next frame; on compositors that always vsync (Wayland, macOS)
-    /// the request is quietly absorbed. No target rebuilds: present
-    /// mode never touches attachment sizes.
-    pub fn set_present_mode(&mut self, mode: wgpu::PresentMode) {
-        if self.config.present_mode != mode {
-            self.config.present_mode = mode;
+    /// The present modes the surface offered at its last successful
+    /// negotiation, in the driver's order.
+    pub fn offered_present_modes(&self) -> &[wgpu::PresentMode] {
+        &self.present_modes
+    }
+
+    /// The frame latency the surface is configured with.
+    pub fn frame_latency(&self) -> u32 {
+        self.frame_latency
+    }
+
+    /// Negotiate a new present mode — a surface reconfigure on the same
+    /// path `resize` takes, so it lands at the next frame; returns the
+    /// mode that won, which is never an `Auto*` request. The request
+    /// (concrete or `Auto*`) resolves by [`resolve_present_mode`]
+    /// against the list the surface offers *now* — falling back to the
+    /// stored list when the fresh query reports nothing. Whether an
+    /// off-vsync request takes effect is therefore the platform's and
+    /// driver's call: on a surface that offers `Immediate` or `Mailbox`
+    /// it uncaps the frame loop, on one that offers only `Fifo` it
+    /// resolves to `Fifo`. A request that resolves to nothing is `Err`
+    /// and leaves the surface untouched — a concrete mode the surface
+    /// does not list cannot be configured, and wgpu would keep the old
+    /// swapchain anyway. No target rebuilds: present mode never touches
+    /// attachment sizes.
+    pub fn set_present_mode(
+        &mut self,
+        mode: wgpu::PresentMode,
+    ) -> Result<wgpu::PresentMode, GpuError> {
+        let fresh = self.surface.get_capabilities(&self.adapter).present_modes;
+        let offered = effective_offered_modes(&self.present_modes, &fresh);
+        let Some(resolved) = resolve_present_mode(mode, offered) else {
+            return Err(GpuError::PresentMode {
+                requested: mode,
+                offered: offered.to_vec(),
+            });
+        };
+        if !fresh.is_empty() {
+            self.present_modes = fresh;
+        }
+        if self.config.present_mode != resolved {
+            self.config.present_mode = resolved;
             self.surface.configure(&self.device, &self.config);
         }
+        Ok(resolved)
     }
 
     /// The live scene render scale (P1).
@@ -764,6 +897,14 @@ pub enum GpuError {
     Surface(wgpu::CreateSurfaceError),
     Adapter(wgpu::RequestAdapterError),
     Device(wgpu::RequestDeviceError),
+    /// The surface cannot carry `requested` — it offers none of the
+    /// modes that request resolves to. An empty `offered` is a surface
+    /// incompatible with the adapter (the capability query reports
+    /// empty lists rather than failing).
+    PresentMode {
+        requested: wgpu::PresentMode,
+        offered: Vec<wgpu::PresentMode>,
+    },
 }
 
 impl std::fmt::Display for GpuError {
@@ -772,6 +913,14 @@ impl std::fmt::Display for GpuError {
             Self::Surface(e) => write!(f, "surface: {e}"),
             Self::Adapter(e) => write!(f, "adapter: {e}"),
             Self::Device(e) => write!(f, "device: {e}"),
+            Self::PresentMode { requested, offered } if offered.is_empty() => write!(
+                f,
+                "surface offers no present modes (incompatible with the adapter); requested {requested:?}"
+            ),
+            Self::PresentMode { requested, offered } => write!(
+                f,
+                "requested present mode {requested:?} is not in the list of supported present modes: {offered:?}"
+            ),
         }
     }
 }
@@ -800,7 +949,10 @@ impl From<wgpu::RequestDeviceError> for GpuError {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::scene_target_size;
-    use super::{BlitPipeline, MsaaColor, SceneResolved, map};
+    use super::{
+        BlitPipeline, Gpu, GpuError, MsaaColor, SceneResolved, effective_offered_modes, map,
+        resolve_present_mode,
+    };
 
     /// Every WGSL source this crate feeds `create_shader_module` must
     /// pass the same checks wgpu runs eagerly at GPU init: naga parse +
@@ -865,6 +1017,153 @@ mod tests {
             let drift = (f64::from(w) / f64::from(h) - 1920.0 / 1080.0).abs() * f64::from(h);
             assert!(drift < 1.0, "scale {s}: aspect drift {drift}px");
         }
+    }
+
+    /// The present-mode negotiation mirrors wgpu-core 30.0.1's own: an
+    /// `Auto*` request takes the first of its fallback list the surface
+    /// offers (so the mode this crate logs is the one wgpu configures),
+    /// a concrete mode is honoured only when offered, and nothing
+    /// resolves against an empty list.
+    #[test]
+    fn resolve_present_mode_mirrors_wgpu_core_fallbacks() {
+        use wgpu::PresentMode::{AutoNoVsync, AutoVsync, Fifo, FifoRelaxed, Immediate, Mailbox};
+        // AutoVsync → the first of [FifoRelaxed, Fifo]: relaxed wins
+        // where offered, plain Fifo where it is not.
+        assert_eq!(
+            resolve_present_mode(AutoVsync, &[Fifo, FifoRelaxed, Mailbox]),
+            Some(FifoRelaxed)
+        );
+        assert_eq!(
+            resolve_present_mode(AutoVsync, &[Fifo, Mailbox, Immediate]),
+            Some(Fifo)
+        );
+        // AutoNoVsync → the first of [Immediate, Mailbox, Fifo].
+        assert_eq!(
+            resolve_present_mode(AutoNoVsync, &[Fifo, Mailbox]),
+            Some(Mailbox)
+        );
+        assert_eq!(
+            resolve_present_mode(AutoNoVsync, &[Fifo, FifoRelaxed]),
+            Some(Fifo)
+        );
+        // The offer list's order is the driver's — the fallback list's
+        // order is what decides, not it.
+        assert_eq!(
+            resolve_present_mode(AutoNoVsync, &[Mailbox, Immediate, Fifo]),
+            Some(Immediate)
+        );
+        // A concrete mode is honoured only when offered.
+        assert_eq!(resolve_present_mode(FifoRelaxed, &[Fifo, Mailbox]), None);
+        assert_eq!(
+            resolve_present_mode(Mailbox, &[Fifo, Mailbox]),
+            Some(Mailbox)
+        );
+        // An empty list — an incompatible surface — resolves nothing.
+        for request in [
+            AutoVsync,
+            AutoNoVsync,
+            Fifo,
+            FifoRelaxed,
+            Mailbox,
+            Immediate,
+        ] {
+            assert_eq!(resolve_present_mode(request, &[]), None, "{request:?}");
+        }
+    }
+
+    /// A re-negotiation resolves against the list the surface reports
+    /// now, and against the stored list only when that fresh query is
+    /// empty (a surface that has gone incompatible with its adapter).
+    #[test]
+    fn effective_offered_modes_prefers_the_fresh_list() {
+        use wgpu::PresentMode::{Fifo, Mailbox};
+        let stored = [Fifo];
+        let fresh = [Fifo, Mailbox];
+        assert_eq!(effective_offered_modes(&stored, &fresh), fresh.as_slice());
+        assert_eq!(effective_offered_modes(&stored, &[]), stored.as_slice());
+    }
+
+    /// The refusal names both sides of the failed negotiation — the
+    /// incompatible-surface form (empty offer list) and the plain
+    /// unsupported-mode form alike.
+    #[test]
+    fn present_mode_error_names_request_and_offered_modes() {
+        use wgpu::PresentMode::{AutoVsync, Fifo, FifoRelaxed, Immediate};
+        let refused = GpuError::PresentMode {
+            requested: Immediate,
+            offered: vec![Fifo, FifoRelaxed],
+        };
+        assert_eq!(
+            refused.to_string(),
+            "requested present mode Immediate is not in the list of supported present modes: \
+             [Fifo, FifoRelaxed]"
+        );
+        let incompatible = GpuError::PresentMode {
+            requested: AutoVsync,
+            offered: Vec::new(),
+        };
+        assert_eq!(
+            incompatible.to_string(),
+            "surface offers no present modes (incompatible with the adapter); requested AutoVsync"
+        );
+    }
+
+    /// `Gpu::new`'s surface negotiation refuses instead of panicking: a
+    /// surface with no formats (incompatible with the adapter) and a
+    /// request that resolves to nothing both come back as the error
+    /// naming the request and the offer list; a healthy surface yields
+    /// its first sRGB format — or the first one on offer — and the
+    /// resolved mode.
+    #[test]
+    fn negotiate_surface_refuses_instead_of_panicking() {
+        use wgpu::PresentMode::{AutoNoVsync, AutoVsync, Fifo, FifoRelaxed, Immediate, Mailbox};
+        use wgpu::TextureFormat::{Bgra8Unorm, Bgra8UnormSrgb, Rgba8UnormSrgb};
+        use wgpu::{CompositeAlphaMode, SurfaceCapabilities};
+        let caps =
+            |formats: &[wgpu::TextureFormat], modes: &[wgpu::PresentMode]| SurfaceCapabilities {
+                formats: formats.to_vec(),
+                present_modes: modes.to_vec(),
+                alpha_modes: vec![CompositeAlphaMode::Opaque],
+                ..Default::default()
+            };
+        // An incompatible surface reports empty lists.
+        let err = Gpu::negotiate_surface(&caps(&[], &[]), AutoVsync).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                GpuError::PresentMode {
+                    requested: AutoVsync,
+                    ref offered
+                } if offered.is_empty()
+            ),
+            "{err}"
+        );
+        // A concrete mode the surface does not list.
+        let err = Gpu::negotiate_surface(&caps(&[Rgba8UnormSrgb], &[Fifo, Mailbox]), Immediate)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "requested present mode Immediate is not in the list of supported present modes: \
+             [Fifo, Mailbox]"
+        );
+        // A healthy surface: the first sRGB format, the resolved mode.
+        let negotiated = Gpu::negotiate_surface(
+            &caps(
+                &[Bgra8Unorm, Bgra8UnormSrgb, Rgba8UnormSrgb],
+                &[Fifo, FifoRelaxed, Mailbox],
+            ),
+            AutoVsync,
+        )
+        .unwrap();
+        assert_eq!(negotiated, (Bgra8UnormSrgb, FifoRelaxed));
+        let negotiated =
+            Gpu::negotiate_surface(&caps(&[Rgba8UnormSrgb], &[Fifo, Mailbox]), AutoNoVsync)
+                .unwrap();
+        assert_eq!(negotiated, (Rgba8UnormSrgb, Mailbox));
+        // No sRGB format on offer: the first format is used (and warned
+        // about — see `negotiate_surface`).
+        let negotiated = Gpu::negotiate_surface(&caps(&[Bgra8Unorm], &[Fifo]), Fifo).unwrap();
+        assert_eq!(negotiated, (Bgra8Unorm, Fifo));
     }
 
     // ------------------------------------------------------------------

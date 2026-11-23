@@ -43,11 +43,11 @@ use std::sync::Arc;
 use csp_core::SimError;
 use std::collections::BTreeMap;
 
-use csp_render::Gpu;
 use csp_render::flight::FlightRenderer;
 use csp_render::map::MapRenderer;
 use csp_render::terrain::TerrainRenderer;
 use csp_render::vab::VabRenderer;
+use csp_render::{FRAME_LATENCY_MAX, FRAME_LATENCY_MIN, Gpu};
 use csp_view::flight::FlightEvent;
 use csp_view::map::MapKeyEvent;
 use csp_view::settings::{
@@ -256,6 +256,224 @@ fn present_mode_of(vsync: csp_view::settings::VsyncMode) -> wgpu::PresentMode {
     }
 }
 
+/// The mode asked of the surface: a `CSP_PRESENT_MODE` pin wins over
+/// the vsync setting on every request — at init and on each later flip
+/// — so the pin outlives settings changes; without one the setting rules.
+fn requested_present_mode(
+    vsync: csp_view::settings::VsyncMode,
+    mode_override: Option<wgpu::PresentMode>,
+) -> wgpu::PresentMode {
+    mode_override.unwrap_or_else(|| present_mode_of(vsync))
+}
+
+/// The concrete modes `CSP_PRESENT_MODE` pins, in the variable's own
+/// spelling — the parser's accepted values and the negotiation line's
+/// `source` term both read this table.
+const PRESENT_MODE_ENV_VALUES: [(&str, wgpu::PresentMode); 4] = [
+    ("fifo", wgpu::PresentMode::Fifo),
+    ("fifo-relaxed", wgpu::PresentMode::FifoRelaxed),
+    ("mailbox", wgpu::PresentMode::Mailbox),
+    ("immediate", wgpu::PresentMode::Immediate),
+];
+
+/// The frame latency asked of the surface unless `CSP_FRAME_LATENCY`
+/// overrides it — wgpu's own default.
+const DEFAULT_FRAME_LATENCY: u32 = 2;
+
+/// `CSP_PRESENT_MODE` → the mode it pins. `Ok(None)` is auto: unset,
+/// empty or the literal `auto` leave the vsync setting in charge. A
+/// concrete name matches case-insensitively, surrounding whitespace
+/// trimmed. Pure — the `Err` string is the warning the caller logs.
+fn parse_present_mode_override(raw: Option<&str>) -> Result<Option<wgpu::PresentMode>, String> {
+    let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    if raw.eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+    PRESENT_MODE_ENV_VALUES
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(raw))
+        .map(|(_, mode)| Some(*mode))
+        .ok_or_else(|| {
+            format!(
+                "CSP_PRESENT_MODE={raw:?} is not one of auto, fifo, fifo-relaxed, mailbox, \
+                 immediate — keeping the automatic rule"
+            )
+        })
+}
+
+/// The `CSP_PRESENT_MODE` spelling of a concrete mode (the inverse of
+/// [`parse_present_mode_override`]'s table); `None` for an `Auto*` request,
+/// which the variable cannot name.
+fn present_mode_env_name(mode: wgpu::PresentMode) -> Option<&'static str> {
+    PRESENT_MODE_ENV_VALUES
+        .iter()
+        .find(|(_, value)| *value == mode)
+        .map(|(name, _)| *name)
+}
+
+/// The negotiation line's `source` term: the `CSP_PRESENT_MODE` pin
+/// when the mode in force is the one it asked for, else `None` (`auto`).
+/// A pin the surface refused therefore reads as `auto` — the automatic
+/// rule is what put the current mode in force.
+fn present_mode_source(
+    mode_override: Option<wgpu::PresentMode>,
+    negotiated: wgpu::PresentMode,
+) -> Option<&'static str> {
+    if mode_override == Some(negotiated) {
+        present_mode_env_name(negotiated)
+    } else {
+        None
+    }
+}
+
+/// `CSP_FRAME_LATENCY` → the frame latency it asks for: a decimal
+/// integer in `FRAME_LATENCY_MIN..=FRAME_LATENCY_MAX`. `Ok(None)` is the
+/// default: unset or empty. Pure — the `Err` string is the warning the
+/// caller logs.
+fn parse_frame_latency_override(raw: Option<&str>) -> Result<Option<u32>, String> {
+    let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    match raw.parse::<u32>() {
+        Ok(latency) if (FRAME_LATENCY_MIN..=FRAME_LATENCY_MAX).contains(&latency) => {
+            Ok(Some(latency))
+        }
+        _ => Err(format!(
+            "CSP_FRAME_LATENCY={raw:?} is not a whole number from {FRAME_LATENCY_MIN} to \
+             {FRAME_LATENCY_MAX} — using {DEFAULT_FRAME_LATENCY}"
+        )),
+    }
+}
+
+/// `CSP_COMPOSITOR_PACING` → whether the compositor-aligned redraw runs:
+/// only `0`, `off` and `false` disable it (case-insensitive, trimmed);
+/// unset, empty or any other value keeps it on.
+fn compositor_pacing_enabled(raw: Option<&str>) -> bool {
+    !raw.is_some_and(|raw| {
+        let raw = raw.trim();
+        ["0", "off", "false"]
+            .iter()
+            .any(|off| raw.eq_ignore_ascii_case(off))
+    })
+}
+
+/// Whether a present mode should redraw in step with the compositor.
+/// `Fifo`, `FifoRelaxed` and `Mailbox` are vblank-clocked (the vsync-on
+/// modes), so the frame loop hands its pacing to the compositor's frame
+/// callbacks; `Immediate` is not, and an `Auto*` request never reaches
+/// the loop — the surface is only ever configured with the mode a
+/// request resolved to.
+fn paces_with_compositor(mode: wgpu::PresentMode) -> bool {
+    matches!(
+        mode,
+        wgpu::PresentMode::Fifo | wgpu::PresentMode::FifoRelaxed | wgpu::PresentMode::Mailbox
+    )
+}
+
+/// Assemble the present-mode negotiation log line — the term-by-term
+/// account of how the mode in force was chosen: what the surface
+/// offers, what was asked (`vsync on`/`off`, the setting), what won,
+/// the frame latency, and where the request came from (`auto`, or the
+/// `CSP_PRESENT_MODE` pin that won). Pure — logged at INFO right after
+/// the configuration line at GPU init and again whenever the mode in
+/// force moves; unit-tested for every term.
+fn present_negotiation_line(
+    offered: &[wgpu::PresentMode],
+    vsync: csp_view::settings::VsyncMode,
+    negotiated: wgpu::PresentMode,
+    frame_latency: u32,
+    source: Option<&str>,
+) -> String {
+    let vsync = match vsync {
+        csp_view::settings::VsyncMode::Auto => "on",
+        csp_view::settings::VsyncMode::Off => "off",
+    };
+    let source = match source {
+        Some(mode) => format!("CSP_PRESENT_MODE={mode}"),
+        None => String::from("auto"),
+    };
+    format!(
+        "render: present modes offered {offered:?}; vsync {vsync} -> {negotiated:?}; \
+         frame latency {frame_latency}; source {source}"
+    )
+}
+
+/// Take a parsed override — or, when its parser refused the value, log
+/// the refusal and take the default instead.
+fn default_or_warn<T>(parsed: Result<T, String>, fallback: T) -> T {
+    match parsed {
+        Ok(value) => value,
+        Err(warning) => {
+            log::warn!("{warning}");
+            fallback
+        }
+    }
+}
+
+/// The presentation overrides — three environment variables read once
+/// at `App` assembly, so a player on a remote machine can test a
+/// candidate cause of a frame-rate report without a new build. A value
+/// its parser refuses warns and falls back to the default; none of
+/// them can fail startup.
+#[derive(Clone, Copy, Debug)]
+struct PresentOverrides {
+    /// `CSP_PRESENT_MODE`: a concrete present mode pinned across vsync
+    /// flips; `None` leaves the vsync setting in charge.
+    mode: Option<wgpu::PresentMode>,
+    /// `CSP_FRAME_LATENCY`: the frame latency asked of the surface;
+    /// `None` asks for [`DEFAULT_FRAME_LATENCY`].
+    frame_latency: Option<u32>,
+    /// `false` when `CSP_COMPOSITOR_PACING` switched the compositor-aligned
+    /// redraw off.
+    compositor_pacing: bool,
+}
+
+impl PresentOverrides {
+    /// Read the three variables — once, at `App` assembly. Each parser's
+    /// refusal is logged and takes its default; the pacing switch says
+    /// so when it is switched off.
+    fn from_env() -> Self {
+        let mode = default_or_warn(
+            parse_present_mode_override(std::env::var("CSP_PRESENT_MODE").ok().as_deref()),
+            None,
+        );
+        let frame_latency = default_or_warn(
+            parse_frame_latency_override(std::env::var("CSP_FRAME_LATENCY").ok().as_deref()),
+            None,
+        );
+        let compositor_pacing =
+            compositor_pacing_enabled(std::env::var("CSP_COMPOSITOR_PACING").ok().as_deref());
+        if !compositor_pacing {
+            log::warn!(
+                "CSP_COMPOSITOR_PACING switches the compositor-aligned redraw off — \
+                 vsync-on present modes are paced by swapchain acquire alone"
+            );
+        }
+        Self {
+            mode,
+            frame_latency,
+            compositor_pacing,
+        }
+    }
+
+    /// The frame latency to configure the surface with.
+    fn latency(&self) -> u32 {
+        self.frame_latency.unwrap_or(DEFAULT_FRAME_LATENCY)
+    }
+
+    /// The compositor-aligned redraw step for one frame: ask winit to
+    /// throttle `RedrawRequested` to the compositor's frame callbacks
+    /// when `mode` is frame-clocked ([`paces_with_compositor`]) and
+    /// `CSP_COMPOSITOR_PACING` has not switched the step off.
+    fn notify_compositor(&self, window: &Window, mode: wgpu::PresentMode) {
+        if self.compositor_pacing && paces_with_compositor(mode) {
+            window.pre_present_notify();
+        }
+    }
+}
+
 struct App {
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
@@ -443,6 +661,13 @@ struct App {
     /// through the settings panel's staged copy, persisted on Apply.
     /// The input layer resolves every key press through `settings.keys`.
     settings: Settings,
+    /// The startup presentation overrides, read from the environment at
+    /// assembly — a `CSP_PRESENT_MODE` pin here outlives every vsync
+    /// flip in the settings panel.
+    present_overrides: PresentOverrides,
+    /// The vsync setting the surface's present mode was last negotiated
+    /// under; `None` until [`Self::apply_present_mode`] first runs.
+    negotiated_vsync: Option<csp_view::settings::VsyncMode>,
     /// §2.13's read-only mark: set by the `Fatal` path — a halted
     /// session refuses craft-file writes too (they would persist
     /// artifacts of a world that may be corrupt).
@@ -662,6 +887,8 @@ impl App {
             last_tick_ms: 0.0,
             fatal: None,
             settings,
+            present_overrides: PresentOverrides::from_env(),
+            negotiated_vsync: None,
             settings_path,
             read_only: false,
             last_refusal: None,
@@ -712,17 +939,10 @@ impl App {
             1.0
         };
         self.view.egui_context().set_zoom_factor(scale);
-        // P1 vsync: swap the surface's present mode — a reconfigure on
-        // the same path `resize` takes, so it lands at the next frame.
-        // Compositors that always vsync (Wayland, macOS) quietly
-        // absorb an Off; that is the platform's call, not an error.
-        // No-op when the mode already matches (`set_present_mode`
-        // reconfigures only on change).
-        let mode = present_mode_of(self.settings.graphics.vsync);
-        let mode_changed = self.gpu.as_ref().is_some_and(|g| g.present_mode() != mode);
-        if let Some(gpu) = &mut self.gpu {
-            gpu.set_present_mode(mode);
-        }
+        // P1 vsync: re-negotiate the surface's present mode. The
+        // reconfigure lands at the next frame, and only when the mode
+        // in force actually moves.
+        let mode_changed = self.apply_present_mode();
         // P1 render scale: rebuild the scaled scene attachments exactly
         // as a resize does (the same recreate path) when the value
         // moved. `Gpu::set_scene_scale` is itself change-gated.
@@ -741,9 +961,14 @@ impl App {
         }
         // Any presentation-affecting flip re-logs the live render
         // configuration — a support log attached after a settings change
-        // still names the mode the frame actually ran under.
+        // still names the mode the frame actually ran under. The
+        // negotiation line follows it whenever the present mode's
+        // request moved; a scale-only change leaves it alone.
         if mode_changed || rescaled {
             self.log_render_config();
+        }
+        if mode_changed {
+            self.log_present_negotiation();
         }
         if let Some(level) = self
             .warp
@@ -763,6 +988,34 @@ impl App {
                     SETTINGS_SOURCE_ID,
                     SimCommand::SetWarp(level),
                 );
+            }
+        }
+    }
+
+    /// Re-negotiate the surface's present mode for the live vsync
+    /// setting — the P1 half of [`Self::apply_live_settings`], and the
+    /// path a `CSP_PRESENT_MODE` pin lands through. Whether an `off`
+    /// request takes effect is the platform's and driver's call: the
+    /// request resolves against the modes the surface offers, and the
+    /// `render:` lines report the mode that won. Reports whether the
+    /// setting or the mode in force moved, i.e. whether those lines are
+    /// due again. A request the surface refuses warns and keeps the
+    /// previous mode; before GPU init there is nothing to configure and
+    /// only the setting is remembered.
+    fn apply_present_mode(&mut self) -> bool {
+        let vsync = self.settings.graphics.vsync;
+        let moved = self.negotiated_vsync != Some(vsync);
+        self.negotiated_vsync = Some(vsync);
+        let Some(gpu) = &mut self.gpu else {
+            return moved;
+        };
+        let before = gpu.present_mode();
+        let requested = requested_present_mode(vsync, self.present_overrides.mode);
+        match gpu.set_present_mode(requested) {
+            Ok(after) => moved || after != before,
+            Err(e) => {
+                log::warn!("CSP_PRESENT_MODE refused — keeping present mode {before:?}: {e}");
+                moved
             }
         }
     }
@@ -798,6 +1051,27 @@ impl App {
                 gpu.config.height,
                 gpu.present_mode(),
                 gpu.scene_scale(),
+            )
+        );
+    }
+
+    /// Log the present-mode negotiation at INFO — the configuration
+    /// line's companion, emitted right after it at GPU init and again
+    /// whenever the mode in force moves. A no-op before GPU init, like
+    /// [`Self::log_render_config`].
+    fn log_present_negotiation(&self) {
+        let Some(gpu) = &self.gpu else {
+            return;
+        };
+        let negotiated = gpu.present_mode();
+        log::info!(
+            "{}",
+            present_negotiation_line(
+                gpu.offered_present_modes(),
+                self.settings.graphics.vsync,
+                negotiated,
+                gpu.frame_latency(),
+                present_mode_source(self.present_overrides.mode, negotiated),
             )
         );
     }
@@ -994,6 +1268,11 @@ impl App {
     /// path spawns `Gpu::new` on the winit loop instead and
     /// [`Self::poll_gpu_init`] lands the result into
     /// [`Self::finish_gpu_init`] a few event turns later.
+    ///
+    /// The surface opens on the automatic mode for the live vsync
+    /// setting, never on a `CSP_PRESENT_MODE` pin: a pin the surface
+    /// refuses falls back to this configuration in
+    /// [`Self::finish_gpu_init`] instead of failing startup.
     #[allow(clippy::expect_used)]
     fn init_graphics(&mut self, event_loop: &ActiveEventLoop) {
         let window = self.create_window(event_loop);
@@ -1005,6 +1284,7 @@ impl App {
                 window.clone(),
                 (size.width, size.height),
                 present_mode_of(self.settings.graphics.vsync),
+                self.present_overrides.latency(),
                 self.clamped_render_scale(),
             ))
             .expect("failed to init GPU");
@@ -1017,10 +1297,12 @@ impl App {
             self.gpu_rx = Some(rx);
             self.window = Some(window.clone());
             let vsync = present_mode_of(self.settings.graphics.vsync);
+            let latency = self.present_overrides.latency();
             let scale = self.clamped_render_scale();
             wasm_bindgen_futures::spawn_local(async move {
                 let size = window.inner_size();
-                let _ = tx.send(Gpu::new(window, (size.width, size.height), vsync, scale).await);
+                let _ = tx
+                    .send(Gpu::new(window, (size.width, size.height), vsync, latency, scale).await);
             });
         }
     }
@@ -1113,11 +1395,17 @@ impl App {
         self.terrain_renderer = Some(terrain_renderer);
         self.map_renderer = Some(map_renderer);
         self.vab_renderer = Some(vab_renderer);
+        // A `CSP_PRESENT_MODE` pin lands through the same negotiation a
+        // settings flip takes; init opened the surface on the automatic
+        // mode, so a refused pin warns and keeps that instead.
+        self.apply_present_mode();
         // The startup render-configuration line — logged after the
         // first surface configure so the format/size/mode printed are
         // the ones frames actually run under (the support surface:
-        // "20 fps on a fast GPU" reports are diagnosed off this line).
+        // "20 fps on a fast GPU" reports are diagnosed off this line),
+        // then the negotiation that chose the mode.
         self.log_render_config();
+        self.log_present_negotiation();
         // M10 audio (native only): open the device beside the other
         // presentation init — `None` on any failure is the supported
         // silent path, never a startup error. Tests skip
@@ -2437,6 +2725,14 @@ impl App {
             self.pick_decode_ids = Some(ids);
             self.pick_decode_generation = encoded_generation;
         }
+        // winit aligns `RedrawRequested` with the compositor's frame
+        // callbacks on Wayland only when `pre_present_notify` is called;
+        // without it the loop is paced solely by swapchain acquire
+        // blocking, which is uneven on some drivers. The step runs ahead
+        // of the present timer so the frame-phase split keeps measuring
+        // GPU waits only.
+        self.present_overrides
+            .notify_compositor(window, gpu.present_mode());
         let present_start = Instant::now();
         gpu.submit(*frame);
         gpu_wait_ms += present_start.elapsed().as_secs_f64() * 1000.0;
@@ -4050,7 +4346,7 @@ fn fired_event_notices(events: &[csp_view::events::ScheduledEvent]) -> Vec<Strin
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use super::*;
-    use csp_view::settings::{KeyAction, KeyBinding};
+    use csp_view::settings::{KeyAction, KeyBinding, VsyncMode};
 
     /// A throwaway directory per test — `std::env::temp_dir` + a unique
     /// name (no tempfile dep).
@@ -4555,6 +4851,245 @@ mod tests {
         );
         assert!(flipped.contains("scale 0.75"), "{flipped}");
         assert!(flipped.contains("AutoNoVsync"), "{flipped}");
+    }
+
+    /// `CSP_PRESENT_MODE`: every accepted name in any case and padding,
+    /// `auto`/unset/empty as "no pin", and an unknown value refused with
+    /// a message that names both the value and the accepted list.
+    #[test]
+    fn present_mode_override_parses_names_case_and_garbage() {
+        use wgpu::PresentMode::{Fifo, FifoRelaxed, Immediate, Mailbox};
+        for (raw, mode) in [
+            ("fifo", Some(Fifo)),
+            ("fifo-relaxed", Some(FifoRelaxed)),
+            ("mailbox", Some(Mailbox)),
+            ("immediate", Some(Immediate)),
+        ] {
+            assert_eq!(parse_present_mode_override(Some(raw)), Ok(mode), "{raw}");
+            let padded = format!(" \t{raw}\n ");
+            assert_eq!(parse_present_mode_override(Some(&padded)), Ok(mode));
+            let capitalised = format!("{}{}", raw[..1].to_uppercase(), &raw[1..]);
+            assert_eq!(parse_present_mode_override(Some(&capitalised)), Ok(mode));
+            let upper = format!(" {} ", raw.to_uppercase());
+            assert_eq!(parse_present_mode_override(Some(&upper)), Ok(mode));
+        }
+        for raw in [None, Some(""), Some("   "), Some("auto"), Some(" Auto ")] {
+            assert_eq!(parse_present_mode_override(raw), Ok(None), "{raw:?}");
+        }
+        for raw in ["tearing", "fif", "auto-vsync", "fifo relaxed"] {
+            let refusal = parse_present_mode_override(Some(raw)).unwrap_err();
+            for term in [
+                "CSP_PRESENT_MODE",
+                raw,
+                "auto, fifo, fifo-relaxed, mailbox, immediate",
+            ] {
+                assert!(
+                    refusal.contains(term),
+                    "{raw:?}: refusal missing {term:?}: {refusal}"
+                );
+            }
+        }
+    }
+
+    /// `CSP_FRAME_LATENCY`: every value of the accepted range (padded
+    /// too), unset/empty as the default, and everything else — out of
+    /// range, negative, fractional, a word, an overflow — refused with a
+    /// message that names the value, the range and the default.
+    #[test]
+    fn frame_latency_override_parses_range_and_garbage() {
+        for latency in FRAME_LATENCY_MIN..=FRAME_LATENCY_MAX {
+            assert_eq!(
+                parse_frame_latency_override(Some(&latency.to_string())),
+                Ok(Some(latency))
+            );
+        }
+        assert_eq!(parse_frame_latency_override(Some(" 1 ")), Ok(Some(1)));
+        for raw in [None, Some(""), Some("  ")] {
+            assert_eq!(parse_frame_latency_override(raw), Ok(None), "{raw:?}");
+        }
+        assert_eq!(DEFAULT_FRAME_LATENCY, 2);
+        let range = format!("from {FRAME_LATENCY_MIN} to {FRAME_LATENCY_MAX}");
+        let default = format!("using {DEFAULT_FRAME_LATENCY}");
+        for raw in [
+            "0",
+            "6",
+            "-1",
+            "two",
+            "2.5",
+            "99999999999999999999",
+            "2 frames",
+        ] {
+            let refusal = parse_frame_latency_override(Some(raw)).unwrap_err();
+            for term in ["CSP_FRAME_LATENCY", raw, range.as_str(), default.as_str()] {
+                assert!(
+                    refusal.contains(term),
+                    "{raw:?}: refusal missing {term:?}: {refusal}"
+                );
+            }
+        }
+    }
+
+    /// The mode asked of the surface: the vsync setting rules when
+    /// nothing is pinned; a `CSP_PRESENT_MODE` pin wins under either
+    /// setting.
+    #[test]
+    fn requested_present_mode_follows_the_setting_unless_pinned() {
+        use wgpu::PresentMode::{AutoNoVsync, AutoVsync, Fifo, Immediate, Mailbox};
+        assert_eq!(requested_present_mode(VsyncMode::Off, None), AutoNoVsync);
+        assert_eq!(requested_present_mode(VsyncMode::Auto, None), AutoVsync);
+        for pinned in [Fifo, Immediate, Mailbox] {
+            assert_eq!(
+                requested_present_mode(VsyncMode::Auto, Some(pinned)),
+                pinned
+            );
+            assert_eq!(requested_present_mode(VsyncMode::Off, Some(pinned)), pinned);
+        }
+    }
+
+    /// The negotiation log line in both forms — automatic and pinned —
+    /// with the exact shape pinned and every term individually
+    /// greppable, the `render:` configuration line's companion.
+    #[test]
+    fn present_negotiation_line_carries_every_term() {
+        use wgpu::PresentMode::{Fifo, FifoRelaxed, Mailbox};
+        let automatic =
+            present_negotiation_line(&[Fifo, FifoRelaxed], VsyncMode::Auto, FifoRelaxed, 2, None);
+        assert_eq!(
+            automatic,
+            "render: present modes offered [Fifo, FifoRelaxed]; vsync on -> FifoRelaxed; \
+             frame latency 2; source auto"
+        );
+        let pinned = present_negotiation_line(
+            &[Fifo, FifoRelaxed, Mailbox],
+            VsyncMode::Off,
+            Mailbox,
+            1,
+            Some("mailbox"),
+        );
+        assert_eq!(
+            pinned,
+            "render: present modes offered [Fifo, FifoRelaxed, Mailbox]; vsync off -> Mailbox; \
+             frame latency 1; source CSP_PRESENT_MODE=mailbox"
+        );
+        for term in [
+            "render: present modes offered [Fifo, FifoRelaxed]",
+            "vsync on -> FifoRelaxed",
+            "frame latency 2",
+            "source auto",
+        ] {
+            assert!(
+                automatic.contains(term),
+                "automatic line missing {term:?}: {automatic}"
+            );
+        }
+        for term in [
+            "present modes offered [Fifo, FifoRelaxed, Mailbox]",
+            "vsync off -> Mailbox",
+            "frame latency 1",
+            "source CSP_PRESENT_MODE=mailbox",
+        ] {
+            assert!(
+                pinned.contains(term),
+                "pinned line missing {term:?}: {pinned}"
+            );
+        }
+        // The arrow is two ASCII characters, never a Unicode glyph a
+        // log-grep would have to reproduce.
+        for line in [&automatic, &pinned] {
+            assert!(line.contains(" -> ") && line.is_ascii(), "{line}");
+        }
+    }
+
+    /// The `source` term reads as the pin only while the mode in force
+    /// is the one the pin asked for — a pin the surface refused (or no
+    /// pin at all) is `auto`, because that is what put the mode there.
+    #[test]
+    fn present_mode_source_names_only_a_pin_in_force() {
+        use wgpu::PresentMode::{Fifo, FifoRelaxed, Mailbox};
+        assert_eq!(present_mode_source(None, Mailbox), None);
+        assert_eq!(present_mode_source(Some(Fifo), Mailbox), None);
+        assert_eq!(present_mode_source(Some(Mailbox), Mailbox), Some("mailbox"));
+        assert_eq!(
+            present_mode_source(Some(FifoRelaxed), FifoRelaxed),
+            Some("fifo-relaxed")
+        );
+    }
+
+    /// The compositor-aligned redraw's truth table: the three
+    /// frame-clocked modes pace with the compositor, `Immediate` and
+    /// both `Auto*` requests do not.
+    #[test]
+    fn paces_with_compositor_truth_table() {
+        use wgpu::PresentMode;
+        for mode in [
+            PresentMode::Fifo,
+            PresentMode::FifoRelaxed,
+            PresentMode::Mailbox,
+        ] {
+            assert!(
+                paces_with_compositor(mode),
+                "{mode:?} must pace with the compositor"
+            );
+        }
+        for mode in [
+            PresentMode::Immediate,
+            PresentMode::AutoVsync,
+            PresentMode::AutoNoVsync,
+        ] {
+            assert!(
+                !paces_with_compositor(mode),
+                "{mode:?} must not pace with the compositor"
+            );
+        }
+    }
+
+    /// `CSP_COMPOSITOR_PACING`: only `0`, `off` and `false` (any case,
+    /// padded) switch the redraw off; unset, empty and anything else
+    /// keeps it on.
+    #[test]
+    fn compositor_pacing_disables_only_on_the_three_values() {
+        for raw in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("1"),
+            Some("on"),
+            Some("true"),
+            Some("yes"),
+            Some("anything-else"),
+        ] {
+            assert!(
+                compositor_pacing_enabled(raw),
+                "{raw:?} must keep pacing on"
+            );
+        }
+        for raw in ["0", "off", "false", " 0 ", "OFF", "FaLsE", "\toff\n"] {
+            assert!(
+                !compositor_pacing_enabled(Some(raw)),
+                "{raw:?} must switch pacing off"
+            );
+        }
+    }
+
+    /// A `CSP_PRESENT_MODE` pin lives in the app state and outlives the
+    /// live-settings path: whichever way the vsync setting moves, the
+    /// mode the app asks the surface for stays the pin. (The
+    /// negotiation itself needs a GPU, which tests never open.)
+    #[test]
+    fn present_mode_pin_outlives_live_settings_flips() {
+        let dir = tempdir("present-pin");
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        app.present_overrides.mode = Some(wgpu::PresentMode::Mailbox);
+        for vsync in [VsyncMode::Off, VsyncMode::Auto] {
+            app.settings.graphics.vsync = vsync;
+            app.apply_live_settings();
+            assert_eq!(app.negotiated_vsync, Some(vsync));
+            assert_eq!(
+                requested_present_mode(app.settings.graphics.vsync, app.present_overrides.mode),
+                wgpu::PresentMode::Mailbox,
+                "vsync {vsync:?}"
+            );
+        }
     }
 
     /// P1's render-scale clamp: the player-facing ladder bounds and

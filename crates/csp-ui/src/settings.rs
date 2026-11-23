@@ -92,12 +92,14 @@ pub struct GraphicsSettings {
     /// an absent one. Kept in the file schema for forward-compat (old
     /// files carry it; new ones default it).
     pub quality: GraphicsQuality,
-    /// Vertical sync (P1) — `Auto` is today's `PresentMode::AutoVsync`
-    /// (fps capped to the display refresh); `Off` switches the surface
-    /// to `PresentMode::AutoNoVsync` so the frame loop runs as fast as
-    /// the GPU allows (input latency + the FPS readout disambiguate a
-    /// CPU- from a GPU-bound session). `csp-app` maps this onto wgpu's
-    /// present modes — this crate names the choice, never the API.
+    /// Vertical sync (P1) — `Auto` asks for `PresentMode::AutoVsync`
+    /// (fps capped to the display refresh); `Off` asks for
+    /// `PresentMode::AutoNoVsync`, which runs the frame loop as fast as
+    /// the GPU allows where the platform and driver honour it (input
+    /// latency + the FPS readout disambiguate a CPU- from a GPU-bound
+    /// session). `csp-app` maps this onto wgpu's present modes and
+    /// negotiates them with the surface — this crate names the choice,
+    /// never the API.
     pub vsync: VsyncMode,
     /// The scene's internal render scale (P1) in
     /// [`RENDER_SCALE_MIN`]..=[`RENDER_SCALE_MAX`]: the MSAA scene
@@ -158,18 +160,20 @@ pub enum GraphicsQuality {
 }
 
 /// Vertical sync choice (P1's player-facing presentation control).
-/// Serialized kebab-case (`auto`/`off`); `csp-app` translates to the
-/// wgpu present mode at surface (re)configuration.
+/// Serialized kebab-case (`auto`/`off`); `csp-app` translates it to the
+/// wgpu present mode at surface (re)configuration, and the log's
+/// `render:` lines report the mode that was negotiated.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum VsyncMode {
     /// Vsync on (`PresentMode::AutoVsync`) — the historical default.
     #[default]
     Auto,
-    /// Vsync off (`PresentMode::AutoNoVsync`) — uncapped frame rate
-    /// where the platform's compositor honors it; the way to tell a
-    /// CPU-limited session (fps climbs) from a GPU-limited one (it
-    /// doesn't).
+    /// Vsync off (`PresentMode::AutoNoVsync`) — asks for an uncapped
+    /// frame rate; whether the request takes effect is the platform's
+    /// and driver's call (a surface that offers only `Fifo` stays on
+    /// it). Where it does, it is the way to tell a CPU-limited session
+    /// (fps climbs) from a GPU-limited one (it doesn't).
     Off,
 }
 
@@ -911,9 +915,9 @@ fn graphics_section(ui: &mut egui::Ui, state: &mut SettingsPanelState) {
     ui.checkbox(&mut vs, "vertical sync");
     state.settings.graphics.vsync = if vs { VsyncMode::Auto } else { VsyncMode::Off };
     ui.label(
-        "off uncaps the frame rate at the next frame — where the compositor \
-         honors it (Wayland/macOS always composite), fps only climbs if the \
-         CPU was the limit",
+        "off asks for an uncapped frame rate at the next frame — whether it \
+         takes effect is the platform's and driver's call (the log's render: \
+         line names the mode in use); fps only climbs if the CPU was the limit",
     );
     ui.add(
         egui::Slider::new(

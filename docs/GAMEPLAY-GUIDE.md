@@ -98,7 +98,8 @@ etc.; hint bars always print the key as your layout labels it.
 ### 2.3 Rebinding & settings
 
 `Settings` (Esc): audio volume/mute, **vertical sync** and **render scale** (Graphics — vsync off
-uncaps the frame rate where the compositor allows, render scale 0.5–1.0 renders the 3D scene
+asks for an uncapped frame rate where the platform and driver allow it; the log's `render:` line
+names the mode actually in use. Render scale 0.5–1.0 renders the 3D scene
 smaller and upscales it for fps while the UI stays sharp), UI scale, **max time warp**
 (×1…×100,000 — a QoL ceiling under the ladder, `WARP_CAP_OPTIONS` at `csp-ui/src/settings.rs:163`),
 new-game difficulty (life support, dormant stress — applied only when a save is created), and the
