@@ -895,299 +895,299 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
             // scene — unreadable over bright terrain. The panel backs
             // every readout now (the navball is its own opaque draw).
             hud_frame().show(ui, |ui| {
-            // Every label in this Area is `.selectable(false)`: egui
-            // 0.37's `selectable_labels` default gives `ui.label` a
-            // `click_and_drag` sense, and labels created after the
-            // Area's whole-rect move widget are hit-tested on top of
-            // it — a selectable label claims the drag press, so the
-            // panel cannot be grabbed by its own text (C23-F1).
-            //
-            // The terrain-bake wait row first, in BOTH branches below:
-            // while the dominant body's heightfield bakes the scene
-            // draws sky/craft only (never a flat datum sphere — M5
-            // §5.2-R2 arrival polish), and this line is the only
-            // on-screen cue for why the ground is missing.
-            if input.terrain_pending {
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new("GENERATING SURFACE …")
-                            .font(egui::FontId::monospace(14.0))
-                            .color(egui::Color32::from_rgb(228, 192, 118)),
-                    )
-                    .selectable(false),
-                );
-            }
-            if !input.has_vessel {
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new("FLIGHT — no vessel in the bubble")
-                            .color(egui::Color32::from_gray(225)),
-                    )
-                    .selectable(false),
-                );
-                // A pending reservation is the live case here — a
-                // colony/foreign `ManufactureCraft` leaves the arena
-                // empty until `ConstructionComplete` delivers. Name
-                // the order + its countdown persistently (the toast
-                // faded long ago), plus the warp ladder's way out.
-                for b in input.builds {
+                // Every label in this Area is `.selectable(false)`: egui
+                // 0.37's `selectable_labels` default gives `ui.label` a
+                // `click_and_drag` sense, and labels created after the
+                // Area's whole-rect move widget are hit-tested on top of
+                // it — a selectable label claims the drag press, so the
+                // panel cannot be grabbed by its own text (C23-F1).
+                //
+                // The terrain-bake wait row first, in BOTH branches below:
+                // while the dominant body's heightfield bakes the scene
+                // draws sky/craft only (never a flat datum sphere — M5
+                // §5.2-R2 arrival polish), and this line is the only
+                // on-screen cue for why the ground is missing.
+                if input.terrain_pending {
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new(format!(
-                                "BUILD #{} — {} — delivers in {}",
-                                b.id,
-                                b.label,
-                                fmt_clock(b.eta_s)
-                            ))
-                            .color(egui::Color32::from_rgb(140, 220, 140)),
+                            egui::RichText::new("GENERATING SURFACE …")
+                                .font(egui::FontId::monospace(14.0))
+                                .color(egui::Color32::from_rgb(228, 192, 118)),
                         )
                         .selectable(false),
                     );
                 }
-                if !input.builds.is_empty() {
+                if !input.has_vessel {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new("FLIGHT — no vessel in the bubble")
+                                .color(egui::Color32::from_gray(225)),
+                        )
+                        .selectable(false),
+                    );
+                    // A pending reservation is the live case here — a
+                    // colony/foreign `ManufactureCraft` leaves the arena
+                    // empty until `ConstructionComplete` delivers. Name
+                    // the order + its countdown persistently (the toast
+                    // faded long ago), plus the warp ladder's way out.
+                    for b in input.builds {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!(
+                                    "BUILD #{} — {} — delivers in {}",
+                                    b.id,
+                                    b.label,
+                                    fmt_clock(b.eta_s)
+                                ))
+                                .color(egui::Color32::from_rgb(140, 220, 140)),
+                            )
+                            .selectable(false),
+                        );
+                    }
+                    if !input.builds.is_empty() {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!(
+                                    "delivery lands on the pad — [{}] to warp ahead",
+                                    input.keys.hint(settings::KeyAction::WarpUp)
+                                ))
+                                .color(egui::Color32::from_gray(185)),
+                            )
+                            .selectable(false),
+                        );
+                    }
                     ui.add(
                         egui::Label::new(
                             egui::RichText::new(format!(
-                                "delivery lands on the pad — [{}] to warp ahead",
-                                input.keys.hint(settings::KeyAction::WarpUp)
+                                "[{}] VAB  ·  [{}] map  ·  [{}] controls",
+                                input.keys.hint(settings::KeyAction::ToggleVab),
+                                input.keys.hint(settings::KeyAction::ToggleMap),
+                                input.keys.hint(settings::KeyAction::ToggleHelp),
                             ))
                             .color(egui::Color32::from_gray(185)),
                         )
                         .selectable(false),
                     );
+                    return;
                 }
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(format!(
-                            "[{}] VAB  ·  [{}] map  ·  [{}] controls",
-                            input.keys.hint(settings::KeyAction::ToggleVab),
-                            input.keys.hint(settings::KeyAction::ToggleMap),
-                            input.keys.hint(settings::KeyAction::ToggleHelp),
-                        ))
-                        .color(egui::Color32::from_gray(185)),
-                    )
-                    .selectable(false),
-                );
-                return;
-            }
-            let mono = egui::FontId::monospace(14.0);
-            let c = egui::Color32::from_gray(225);
-            let dim = egui::Color32::from_gray(185);
-            let head = egui::Color32::from_rgb(150, 195, 225);
-            // The readout grid: two `TAG value` cells per row — left
-            // cell a 4-char tag + 12-wide value, right cell a 6-char
-            // tag + 12-wide value (35 columns of mono).
-            let pair = |ui: &mut egui::Ui,
-                        l: &str,
-                        lv: String,
-                        r: &str,
-                        rv: String,
-                        col: egui::Color32| {
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(format!("{l:<4}{lv:>12}  {r:<6}{rv:>12}"))
+                let mono = egui::FontId::monospace(14.0);
+                let c = egui::Color32::from_gray(225);
+                let dim = egui::Color32::from_gray(185);
+                let head = egui::Color32::from_rgb(150, 195, 225);
+                // The readout grid: two `TAG value` cells per row — left
+                // cell a 4-char tag + 12-wide value, right cell a 6-char
+                // tag + 12-wide value (35 columns of mono).
+                let pair = |ui: &mut egui::Ui,
+                            l: &str,
+                            lv: String,
+                            r: &str,
+                            rv: String,
+                            col: egui::Color32| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("{l:<4}{lv:>12}  {r:<6}{rv:>12}"))
+                                .font(mono.clone())
+                                .color(col),
+                        )
+                        .selectable(false),
+                    );
+                };
+                let row = |ui: &mut egui::Ui, tag: &str, val: String, col: egui::Color32| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("{tag:<4}{val:>31}"))
+                                .font(mono.clone())
+                                .color(col),
+                        )
+                        .selectable(false),
+                    );
+                };
+                let sect = |ui: &mut egui::Ui, name: &str| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("── {name} ─────────────────────────────"))
+                                .font(mono.clone())
+                                .color(head),
+                        )
+                        .selectable(false),
+                    );
+                };
+                if input.latched {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!(
+                                "ON PAD — [{}] to launch",
+                                input.keys.hint(settings::KeyAction::ThrottleFull)
+                            ))
                             .font(mono.clone())
-                            .color(col),
-                    )
-                    .selectable(false),
-                );
-            };
-            let row = |ui: &mut egui::Ui, tag: &str, val: String, col: egui::Color32| {
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(format!("{tag:<4}{val:>31}"))
-                            .font(mono.clone())
-                            .color(col),
-                    )
-                    .selectable(false),
-                );
-            };
-            let sect = |ui: &mut egui::Ui, name: &str| {
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(format!("── {name} ─────────────────────────────"))
-                            .font(mono.clone())
-                            .color(head),
-                    )
-                    .selectable(false),
-                );
-            };
-            if input.latched {
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(format!(
-                            "ON PAD — [{}] to launch",
-                            input.keys.hint(settings::KeyAction::ThrottleFull)
-                        ))
-                        .font(mono.clone())
-                        .color(egui::Color32::from_rgb(140, 220, 140)),
-                    )
-                    .selectable(false),
-                );
-            }
-            // Orbit — the osculating conic at the CoM: apsides,
-            // times-to-apsis, period. "—" where the conic is open or
-            // the vessel rides surface rails.
-            sect(ui, "ORBIT");
-            pair(
-                ui,
-                "AP",
-                fmt_opt(input.apo_alt_m, fmt_alt),
-                "PE",
-                fmt_opt(input.pe_alt_m, fmt_alt),
-                c,
-            );
-            pair(
-                ui,
-                "T-AP",
-                fmt_opt(input.t_apo_s, fmt_clock),
-                "T-PE",
-                fmt_opt(input.t_pe_s, fmt_clock),
-                dim,
-            );
-            row(ui, "T", fmt_opt(input.period_s, fmt_period), dim);
-            // Surface frame — altitude, surface/orbital speed, vertical
-            // speed, and the attitude readouts.
-            sect(ui, "SURFACE");
-            pair(
-                ui,
-                "ALT",
-                fmt_alt(input.alt_m),
-                "V/S",
-                format!("{:>+6.1} m/s", input.vspeed_mps),
-                c,
-            );
-            pair(
-                ui,
-                "SPD",
-                format!("{:>6.1} m/s", input.surface_speed_mps),
-                "ORB",
-                format!("{:>6.1} m/s", input.orbital_speed_mps),
-                c,
-            );
-            let hdg = if input.heading_deg.is_finite() {
-                format!("{:>6.1}°", input.heading_deg)
-            } else {
-                "—".to_string()
-            };
-            let pr = if input.pitch_deg.is_finite() && input.roll_deg.is_finite() {
-                format!("{:>+4.0}°/{:>+4.0}°", input.pitch_deg, input.roll_deg)
-            } else {
-                "—/—".to_string()
-            };
-            pair(ui, "HDG", hdg, "P/R", pr, dim);
-            // Vessel — mass, the live thrust/TWR/acceleration readouts
-            // off the staged propulsion walk, and Δv remaining (the
-            // rocket equation over live tanks + isp + mass, including
-            // the stage plan's unfired drops).
-            sect(ui, "VESSEL");
-            pair(
-                ui,
-                "MASS",
-                fmt_mass(input.mass_kg),
-                "FN",
-                fmt_force(input.thrust_n),
-                c,
-            );
-            pair(
-                ui,
-                "TWR",
-                fmt_opt(input.twr, |v| format!("{v:.2}")),
-                "MAXF",
-                fmt_force(input.thrust_full_n),
-                c,
-            );
-            pair(
-                ui,
-                "TWR·SL",
-                fmt_opt(input.twr_surface, |v| format!("{v:.2}")),
-                "ACC",
-                fmt_opt(input.accel_mps2, |v| format!("{v:.1} m/s²")),
-                c,
-            );
-            pair(
-                ui,
-                "G",
-                fmt_opt(input.accel_gee, |v| format!("{v:.2}")),
-                "ΔV",
-                fmt_opt(input.delta_v_mps, fmt_speed),
-                c,
-            );
-            if input.delta_v_stages_mps > 0.0 {
-                row(
+                            .color(egui::Color32::from_rgb(140, 220, 140)),
+                        )
+                        .selectable(false),
+                    );
+                }
+                // Orbit — the osculating conic at the CoM: apsides,
+                // times-to-apsis, period. "—" where the conic is open or
+                // the vessel rides surface rails.
+                sect(ui, "ORBIT");
+                pair(
                     ui,
-                    "STG+",
-                    format!("{} m/s in stages", input.delta_v_stages_mps as u64),
+                    "AP",
+                    fmt_opt(input.apo_alt_m, fmt_alt),
+                    "PE",
+                    fmt_opt(input.pe_alt_m, fmt_alt),
+                    c,
+                );
+                pair(
+                    ui,
+                    "T-AP",
+                    fmt_opt(input.t_apo_s, fmt_clock),
+                    "T-PE",
+                    fmt_opt(input.t_pe_s, fmt_clock),
                     dim,
                 );
-            }
-            // Propellant — the tank gauges plus the flow/depletion
-            // readouts at the commanded throttle (and at full for the
-            // burn-time figure).
-            sect(ui, "PROP");
-            ui.add(
-                egui::ProgressBar::new(input.throttle as f32)
-                    .text(format!("THR  {:>5.1}%", input.throttle * 100.0))
-                    .desired_width(280.0),
-            );
-            // Propellant gauges — one bar per resource still aboard
-            // (tanks the staging drops leave with their nodes).
-            for t in input.propellant {
-                let frac = if t.capacity > 0.0 {
-                    (t.units / t.capacity) as f32
+                row(ui, "T", fmt_opt(input.period_s, fmt_period), dim);
+                // Surface frame — altitude, surface/orbital speed, vertical
+                // speed, and the attitude readouts.
+                sect(ui, "SURFACE");
+                pair(
+                    ui,
+                    "ALT",
+                    fmt_alt(input.alt_m),
+                    "V/S",
+                    format!("{:>+6.1} m/s", input.vspeed_mps),
+                    c,
+                );
+                pair(
+                    ui,
+                    "SPD",
+                    format!("{:>6.1} m/s", input.surface_speed_mps),
+                    "ORB",
+                    format!("{:>6.1} m/s", input.orbital_speed_mps),
+                    c,
+                );
+                let hdg = if input.heading_deg.is_finite() {
+                    format!("{:>6.1}°", input.heading_deg)
                 } else {
-                    0.0
+                    "—".to_string()
                 };
+                let pr = if input.pitch_deg.is_finite() && input.roll_deg.is_finite() {
+                    format!("{:>+4.0}°/{:>+4.0}°", input.pitch_deg, input.roll_deg)
+                } else {
+                    "—/—".to_string()
+                };
+                pair(ui, "HDG", hdg, "P/R", pr, dim);
+                // Vessel — mass, the live thrust/TWR/acceleration readouts
+                // off the staged propulsion walk, and Δv remaining (the
+                // rocket equation over live tanks + isp + mass, including
+                // the stage plan's unfired drops).
+                sect(ui, "VESSEL");
+                pair(
+                    ui,
+                    "MASS",
+                    fmt_mass(input.mass_kg),
+                    "FN",
+                    fmt_force(input.thrust_n),
+                    c,
+                );
+                pair(
+                    ui,
+                    "TWR",
+                    fmt_opt(input.twr, |v| format!("{v:.2}")),
+                    "MAXF",
+                    fmt_force(input.thrust_full_n),
+                    c,
+                );
+                pair(
+                    ui,
+                    "TWR·SL",
+                    fmt_opt(input.twr_surface, |v| format!("{v:.2}")),
+                    "ACC",
+                    fmt_opt(input.accel_mps2, |v| format!("{v:.1} m/s²")),
+                    c,
+                );
+                pair(
+                    ui,
+                    "G",
+                    fmt_opt(input.accel_gee, |v| format!("{v:.2}")),
+                    "ΔV",
+                    fmt_opt(input.delta_v_mps, fmt_speed),
+                    c,
+                );
+                if input.delta_v_stages_mps > 0.0 {
+                    row(
+                        ui,
+                        "STG+",
+                        format!("{} m/s in stages", input.delta_v_stages_mps as u64),
+                        dim,
+                    );
+                }
+                // Propellant — the tank gauges plus the flow/depletion
+                // readouts at the commanded throttle (and at full for the
+                // burn-time figure).
+                sect(ui, "PROP");
                 ui.add(
-                    egui::ProgressBar::new(frac)
+                    egui::ProgressBar::new(input.throttle as f32)
+                        .text(format!("THR  {:>5.1}%", input.throttle * 100.0))
+                        .desired_width(280.0),
+                );
+                // Propellant gauges — one bar per resource still aboard
+                // (tanks the staging drops leave with their nodes).
+                for t in input.propellant {
+                    let frac = if t.capacity > 0.0 {
+                        (t.units / t.capacity) as f32
+                    } else {
+                        0.0
+                    };
+                    ui.add(
+                        egui::ProgressBar::new(frac)
                         .text(format!(
                             "{}  {:.0}/{:.0}",
                             t.resource, t.units, t.capacity
                         ))
-                        .desired_width(280.0),
-                );
-            }
-            pair(
-                ui,
-                "FLOW",
-                fmt_opt(input.mass_flow_kg_s, |v| format!("{v:.1} kg/s")),
-                "DEP",
-                fmt_opt(input.fuel_depletion_s, fmt_clock),
-                c,
-            );
-            pair(
-                ui,
-                "BURN",
-                fmt_opt(input.burn_full_s, fmt_clock),
-                "ISP",
-                fmt_opt(input.isp_s, |v| format!("{v:.0} s")),
-                dim,
-            );
-            // Staging — the launch-captured plan's remaining firings.
-            row(ui, "STG", stages_label(input), dim);
-            row(
-                ui,
-                "",
-                format!("parts {}  ·  warp ×{}", input.parts, input.warp),
-                dim,
-            );
-            // P1's frame-timing readout — the host's ~10-frame smoothed
-            // fps + frame ms (wall clock measured where §2.5 allows it,
-            // far from the sim). The pair is how a player tells a
-            // CPU-bound session (uncapping vsync raises fps) from a
-            // GPU-limited one (it doesn't — lower the render scale).
-            // Hidden until the first window fills, exactly like the
-            // terrain bake row above.
-            if input.fps > 0.0 {
-                row(
+                            .desired_width(280.0),
+                    );
+                }
+                pair(
                     ui,
-                    "FPS",
-                    format!("{:>4.0}  {:>6.1} ms/frame", input.fps, input.frame_ms),
+                    "FLOW",
+                    fmt_opt(input.mass_flow_kg_s, |v| format!("{v:.1} kg/s")),
+                    "DEP",
+                    fmt_opt(input.fuel_depletion_s, fmt_clock),
+                    c,
+                );
+                pair(
+                    ui,
+                    "BURN",
+                    fmt_opt(input.burn_full_s, fmt_clock),
+                    "ISP",
+                    fmt_opt(input.isp_s, |v| format!("{v:.0} s")),
                     dim,
                 );
-            }
-            ui.add(
-                egui::Label::new(
+                // Staging — the launch-captured plan's remaining firings.
+                row(ui, "STG", stages_label(input), dim);
+                row(
+                    ui,
+                    "",
+                    format!("parts {}  ·  warp ×{}", input.parts, input.warp),
+                    dim,
+                );
+                // P1's frame-timing readout — the host's ~10-frame smoothed
+                // fps + frame ms (wall clock measured where §2.5 allows it,
+                // far from the sim). The pair is how a player tells a
+                // CPU-bound session (uncapping vsync raises fps) from a
+                // GPU-limited one (it doesn't — lower the render scale).
+                // Hidden until the first window fills, exactly like the
+                // terrain bake row above.
+                if input.fps > 0.0 {
+                    row(
+                        ui,
+                        "FPS",
+                        format!("{:>4.0}  {:>6.1} ms/frame", input.fps, input.frame_ms),
+                        dim,
+                    );
+                }
+                ui.add(
+                    egui::Label::new(
                     egui::RichText::new(format!(
                         "[{}] controls  ·  [{}]/[{}] throttle [{}]/[{}]  ·  [{}] stage  ·  [{}] map  [{}] VAB  ·  [{}] program  ·  RMB on a part: actions",
                         input
@@ -1218,10 +1218,10 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
                             .keys
                             .hint_labeled(settings::KeyAction::OpenProgram, input.key_labels),
                     ))
-                    .color(egui::Color32::from_gray(180)),
-                )
-                .selectable(false),
-            );
+                            .color(egui::Color32::from_gray(180)),
+                    )
+                    .selectable(false),
+                );
             });
         });
     // The navball — its own movable instrument Area (ball + heading
