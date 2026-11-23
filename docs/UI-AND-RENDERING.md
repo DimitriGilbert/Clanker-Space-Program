@@ -776,6 +776,17 @@ mean over a 10-frame window, into `View::set_frame_timing` →
 `FlightUiData` → UiBuild. Pair it with vsync off: fps climbing means
 CPU-bound, standing still means GPU-bound — lower the scale.
 
+The F3 debug panel carries the phase split that resolves the question
+outright: `frame split: cpu X ms · present Y ms` (`cpu_frame_ms`/
+`gpu_wait_ms` on `DebugPanelInput`, fed by `csp-app`'s
+`FramePhaseSmoother` through `View::set_frame_phase` — "present" is
+the acquire + submit/present wait, where vsync or a saturated GPU
+parks the CPU thread). Present-dominated ⇒ GPU/vsync; cpu-dominated ⇒
+game code or the player's CPU. The same INFO line that lands at GPU
+init — `render: adapter "…" (backend), surface <fmt>, WxH, <present
+mode>, scale N.NN`, re-logged on every vsync/scale flip — is the
+support surface to attach beside it.
+
 ### 7.3 WGSL inventory
 
 | File | Entry points | Renders |

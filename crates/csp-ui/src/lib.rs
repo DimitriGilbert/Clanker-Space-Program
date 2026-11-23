@@ -185,6 +185,16 @@ pub struct DebugPanelInput<'a> {
     /// Wall-clock frame delta for the HUD. Display-only: wall time never
     /// reaches the sim (§2.5).
     pub frame_dt_ms: f64,
+    /// The frame-phase split's cpu half (ms) — the loop iteration's
+    /// wall time minus the GPU wait, ~10-frame smoothed by the host.
+    /// 0.0 until the first submitted frame (the split row hides, the
+    /// absent-until-real convention). With [`Self::gpu_wait_ms`] this
+    /// is THE remote-diagnosis readout: present-dominated ⇒ GPU/vsync,
+    /// cpu-dominated ⇒ the game's code or the player's CPU.
+    pub cpu_frame_ms: f64,
+    /// The split's GPU-wait half (ms): surface acquire + submit/present
+    /// wait — where vsync or a saturated GPU parks the CPU thread.
+    pub gpu_wait_ms: f64,
     /// The sim-stored warp level, mirrored verbatim — with the M0 ladder
     /// encoding that IS the tick multiplier (§2.6.3).
     pub warp_level: u32,
@@ -229,6 +239,18 @@ pub fn debug_panel(
         ui.label(format!("ticks last frame: {}", input.ticks_last_frame));
         ui.label(format!("frames: {}", input.frames));
         ui.label(format!("frame dt: {:.2} ms", input.frame_dt_ms));
+        // The frame-phase split (the 20-fps-report diagnostic): cpu =
+        // loop iteration minus the acquire/present wait, present =
+        // that wait. Present-dominated ⇒ GPU/vsync (lower the render
+        // scale / check drivers); cpu-dominated ⇒ our code or the
+        // player's CPU. Hidden until the first submitted frame, the
+        // same absent-until-real convention as the HUD's fps row.
+        if input.cpu_frame_ms > 0.0 || input.gpu_wait_ms > 0.0 {
+            ui.label(format!(
+                "frame split: cpu {:.1} ms · present {:.1} ms",
+                input.cpu_frame_ms, input.gpu_wait_ms
+            ));
+        }
         ui.separator();
         // §2.6.3: the stored level IS the multiplier; the controller's
         // request may sit higher under an auto-derate.
@@ -864,6 +886,31 @@ pub fn notice_overlay(ctx: &egui::Context, lines: &[String]) -> Option<egui::Rec
     Some(shown.response.rect)
 }
 
+/// The flight footer's keybind hint line — every binding derives
+/// through `Keymap::hint_labeled`, so a rebind can never leave a
+/// printed key stale (the help-panel rule). Pure so the format — and
+/// the `OpenSettings` binding's presence in it — is unit-testable:
+/// the settings panel is Esc-reachable in every mode, and the footer
+/// is where a player looks for what a key does.
+fn footer_hint_line(
+    keys: &settings::Keymap,
+    key_labels: &std::collections::BTreeMap<String, String>,
+) -> String {
+    format!(
+        "[{}] controls  ·  [{}]/[{}] throttle [{}]/[{}]  ·  [{}] stage  ·  [{}] map [{}] VAB  ·  [{}] program [{}] settings  ·  RMB on a part: actions",
+        keys.hint_labeled(settings::KeyAction::ToggleHelp, key_labels),
+        keys.hint_labeled(settings::KeyAction::ThrottleFull, key_labels),
+        keys.hint_labeled(settings::KeyAction::ThrottleCut, key_labels),
+        keys.hint_labeled(settings::KeyAction::ThrottleUp, key_labels),
+        keys.hint_labeled(settings::KeyAction::ThrottleDown, key_labels),
+        keys.hint_labeled(settings::KeyAction::Stage, key_labels),
+        keys.hint_labeled(settings::KeyAction::ToggleMap, key_labels),
+        keys.hint_labeled(settings::KeyAction::ToggleVab, key_labels),
+        keys.hint_labeled(settings::KeyAction::OpenProgram, key_labels),
+        keys.hint_labeled(settings::KeyAction::OpenSettings, key_labels),
+    )
+}
+
 /// The M4c flight HUD (§3.7's presentation floor, upgraded): the
 /// navball attitude instrument bottom-center (ball + heading tape),
 /// a grouped telemetry grid at its left — ORBIT (Ap/Pe altitudes,
@@ -1140,10 +1187,7 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
                     };
                     ui.add(
                         egui::ProgressBar::new(frac)
-                        .text(format!(
-                            "{}  {:.0}/{:.0}",
-                            t.resource, t.units, t.capacity
-                        ))
+                            .text(format!("{}  {:.0}/{:.0}", t.resource, t.units, t.capacity))
                             .desired_width(280.0),
                     );
                 }
@@ -1188,36 +1232,7 @@ pub fn flight_hud(ctx: &egui::Context, input: &FlightHudInput<'_>) {
                 }
                 ui.add(
                     egui::Label::new(
-                    egui::RichText::new(format!(
-                        "[{}] controls  ·  [{}]/[{}] throttle [{}]/[{}]  ·  [{}] stage  ·  [{}] map  [{}] VAB  ·  [{}] program  ·  RMB on a part: actions",
-                        input
-                            .keys
-                            .hint_labeled(settings::KeyAction::ToggleHelp, input.key_labels),
-                        input
-                            .keys
-                            .hint_labeled(settings::KeyAction::ThrottleFull, input.key_labels),
-                        input
-                            .keys
-                            .hint_labeled(settings::KeyAction::ThrottleCut, input.key_labels),
-                        input
-                            .keys
-                            .hint_labeled(settings::KeyAction::ThrottleUp, input.key_labels),
-                        input
-                            .keys
-                            .hint_labeled(settings::KeyAction::ThrottleDown, input.key_labels),
-                        input
-                            .keys
-                            .hint_labeled(settings::KeyAction::Stage, input.key_labels),
-                        input
-                            .keys
-                            .hint_labeled(settings::KeyAction::ToggleMap, input.key_labels),
-                        input
-                            .keys
-                            .hint_labeled(settings::KeyAction::ToggleVab, input.key_labels),
-                        input
-                            .keys
-                            .hint_labeled(settings::KeyAction::OpenProgram, input.key_labels),
-                    ))
+                        egui::RichText::new(footer_hint_line(input.keys, input.key_labels))
                             .color(egui::Color32::from_gray(180)),
                     )
                     .selectable(false),
@@ -2229,6 +2244,106 @@ mod tests {
         assert!(
             (timed.min - calm.min).length() < 1.0,
             "the chip must not move when the row lands ({calm:?} → {timed:?})"
+        );
+    }
+
+    /// The flight footer's hint line names every footer-visible action
+    /// through the LIVE keymap — including the settings binding (Esc
+    /// opens the panel in every mode; a hint line that omits it is how
+    /// "can't find the settings" reports happen). A rebind must move
+    /// the printed key, and an unbound action must say so rather than
+    /// print a stale name.
+    #[test]
+    fn footer_hint_line_names_every_action_including_settings() {
+        let keys = settings::Keymap::default();
+        let labels = BTreeMap::new();
+        let line = footer_hint_line(&keys, &labels);
+        // The default bindings as the footer prints them (named tokens
+        // verbatim, physical `key-*` tokens as their QWERTY glyph).
+        for term in [
+            "controls",
+            "throttle",
+            "[space] stage",
+            "[M] map",
+            "[P] program",
+            "[escape] settings",
+            "RMB on a part: actions",
+        ] {
+            assert!(line.contains(term), "footer hint missing {term:?}: {line}");
+        }
+        // A rebind moves the printed settings key, never a hardcoded
+        // one (a positional rebind prints its physical glyph).
+        let mut rebound = settings::Keymap::default();
+        rebound.bind(
+            settings::KeyAction::OpenSettings,
+            settings::KeyBinding::parse("key-s").unwrap(),
+        );
+        let rebound_line = footer_hint_line(&rebound, &labels);
+        assert!(
+            rebound_line.contains("[S] settings") && !rebound_line.contains("[escape] settings"),
+            "a rebound OpenSettings must print the new key: {rebound_line}"
+        );
+        // An unbound action says so — never a stale printed name.
+        rebound.clear(settings::KeyAction::OpenSettings);
+        assert!(
+            footer_hint_line(&rebound, &labels)
+                .contains("[unbound] settings  ·  RMB on a part: actions"),
+            "an unbound OpenSettings must print the unbound marker"
+        );
+    }
+
+    /// The F3 panel's frame-phase split row (the 20-fps-report
+    /// diagnostic): a measured pair renders the one-line split, and
+    /// 0.0/0.0 keeps it absent (the absent-until-real convention — a
+    /// placeholder split would read as a measurement). Asserted on the
+    /// pass's laid-out text, the strongest form (the row's exact
+    /// wording is the support-facing contract).
+    #[test]
+    fn debug_split_row_appears_in_the_panel() {
+        let scan = SoiScanReport::default();
+        let mut input = DebugPanelInput {
+            adapter_name: "Test Adapter",
+            backend: "Vulkan",
+            sim_seconds: 12.0,
+            tick: 768,
+            ticks_last_frame: 1,
+            frames: 60,
+            frame_dt_ms: 16.7,
+            cpu_frame_ms: 0.0,
+            gpu_wait_ms: 0.0,
+            warp_level: 1,
+            warp_requested: 1,
+            warp_effective: 1,
+            soi_scan: &scan,
+            fatal_reason: None,
+        };
+        let (ctx, raw) = hud_rig(960.0, 600.0);
+        let mut out = DebugPanelOutput::default();
+        // One pass → all laid-out text, font-atlas delta acknowledged.
+        let mut pass_text = |input: &DebugPanelInput<'_>| -> String {
+            let mut full = ctx.run_pass(raw.clone(), |ctx| debug_panel(ctx, input, &mut out));
+            let mut text = String::new();
+            for shape in &full.shapes {
+                if let egui::Shape::Text(t) = &shape.shape {
+                    text.push_str(t.galley.text());
+                    text.push('\n');
+                }
+            }
+            full.textures_delta.clear();
+            text
+        };
+        let calm = pass_text(&input);
+        assert!(
+            !calm.contains("frame split"),
+            "0.0/0.0 must hide the split row — the panel read: {calm}"
+        );
+        // The reported case: 50 ms frames, present-dominated.
+        input.cpu_frame_ms = 6.5;
+        input.gpu_wait_ms = 44.1;
+        let split = pass_text(&input);
+        assert!(
+            split.contains("frame split: cpu 6.5 ms · present 44.1 ms"),
+            "the split row must render the measured pair — the panel read: {split}"
         );
     }
 }

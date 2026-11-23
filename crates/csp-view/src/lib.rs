@@ -571,6 +571,11 @@ fn build_ui(
         ticks_last_frame: stats.ticks_last_frame,
         frames: stats.frames,
         frame_dt_ms: session.dt_wall_ms,
+        // The frame-phase split (the app's `set_frame_phase`, the same
+        // §2.5-legal Instant site as the fps row) — F3-only readout;
+        // 0.0 hides the row until the first submitted frame lands.
+        cpu_frame_ms: flight_ui.cpu_ms,
+        gpu_wait_ms: flight_ui.present_ms,
         warp_level: warp.0,
         warp_requested: session.warp_requested,
         warp_effective: session.warp_effective,
@@ -2922,6 +2927,16 @@ impl View {
         let mut r = self.world.resource_mut::<flight::FlightUiData>();
         r.fps = fps;
         r.frame_ms = frame_ms;
+    }
+
+    /// The frame-phase split's plumbing (`set_frame_timing`'s sibling,
+    /// the 20-fps-report diagnostic): the app's smoothed cpu-residue vs
+    /// acquire/present wait, written into the flight mirror for the F3
+    /// debug panel to stage. Same presentation-only contract.
+    pub fn set_frame_phase(&mut self, cpu_ms: f64, present_ms: f64) {
+        let mut r = self.world.resource_mut::<flight::FlightUiData>();
+        r.cpu_ms = cpu_ms;
+        r.present_ms = present_ms;
     }
 
     /// Update only the §2.13 halt mirror — for the frame a `Fatal` is

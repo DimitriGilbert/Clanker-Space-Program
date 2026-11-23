@@ -574,6 +574,17 @@ pub struct FlightUiData {
     pub fps: f64,
     /// The same window's mean frame time (ms).
     pub frame_ms: f64,
+    /// The frame-phase split's cpu half (ms) — the loop iteration's
+    /// wall time minus the acquire/present wait (`View::set_frame_phase`,
+    /// same §2.5-legal Instant site as [`Self::fps`]). 0.0 until the
+    /// first submitted frame lands, which the F3 debug panel reads as
+    /// "hide the split row". Present-dominated ⇒ GPU/vsync;
+    /// cpu-dominated ⇒ our code or the player's CPU.
+    pub cpu_ms: f64,
+    /// The split's GPU-wait half (ms): `get_current_texture` acquire +
+    /// submit/present, the spans where vsync or a saturated GPU park
+    /// the CPU thread.
+    pub present_ms: f64,
     /// Focused vessel exists.
     pub has_vessel: bool,
     /// Focused vessel id (for throttle commands), `None` otherwise —

@@ -175,6 +175,78 @@ impl FrameTimingSmoother {
     }
 }
 
+/// The cpu/present frame-phase split's smoothing window — the same
+/// ~10-frame window as [`FRAME_TIMING_WINDOW`], so the F3 readout and
+/// the HUD's fps row always describe the same set of frames (a split
+/// averaged over a different window than the fps it explains would
+/// misattribute a hitch).
+const PHASE_TIMING_WINDOW: usize = FRAME_TIMING_WINDOW;
+
+/// The frame-phase split's ring buffer (the 20-fps-report diagnostic):
+/// per frame, the loop iteration's wall time minus the GPU wait vs the
+/// GPU wait itself. The wait spans (`get_current_texture` acquire +
+/// submit/present) are where vsync and a saturated GPU park the CPU
+/// thread, so the pair answers "is this frame OUR code or the
+/// GPU/present path": present-dominated ⇒ GPU/vsync, cpu-dominated ⇒
+/// sim/render-prepare code or the player's CPU. Same fixed-window
+/// shape as [`FrameTimingSmoother`].
+#[derive(Default)]
+struct FramePhaseSmoother {
+    cpu: [f64; PHASE_TIMING_WINDOW],
+    present: [f64; PHASE_TIMING_WINDOW],
+    idx: usize,
+    filled: usize,
+}
+
+impl FramePhaseSmoother {
+    /// Record one submitted frame: `frame_ms` is the loop iteration's
+    /// wall time (already §2.5-clamped) and `gpu_wait_ms` the acquire +
+    /// submit/present wait measured inside it. The cpu figure is the
+    /// residue, floored at 0 — a clamped hitch reads as all-wait, never
+    /// a negative "faster than free" cpu time.
+    fn push(&mut self, frame_ms: f64, gpu_wait_ms: f64) {
+        self.cpu[self.idx] = (frame_ms - gpu_wait_ms).max(0.0);
+        self.present[self.idx] = gpu_wait_ms.max(0.0);
+        self.idx = (self.idx + 1) % PHASE_TIMING_WINDOW;
+        self.filled = (self.filled + 1).min(PHASE_TIMING_WINDOW);
+    }
+
+    /// `(cpu_ms, present_ms)` means over the window — `None` until the
+    /// first submitted frame lands (the F3 split row hides, the same
+    /// absent-until-real convention as the HUD's fps row).
+    fn read(&self) -> Option<(f64, f64)> {
+        if self.filled == 0 {
+            return None;
+        }
+        let n = self.filled as f64;
+        let cpu = self.cpu[..self.filled].iter().sum::<f64>() / n;
+        let present = self.present[..self.filled].iter().sum::<f64>() / n;
+        Some((cpu, present))
+    }
+}
+
+/// Assemble the render-configuration log line — the support surface
+/// that makes any attached log self-diagnosing for "why is this
+/// machine slow" reports (the 20-fps-on-a-fast-GPU class): which
+/// adapter+backend wgpu actually chose, the negotiated surface format,
+/// the swapchain size, the present mode, and the live render scale.
+/// Pure — logged at INFO after GPU init and re-logged when vsync/scale
+/// change, unit-tested for field completeness. `backend`/`present_mode`
+/// arrive pre-formatted (`{:?}` of wgpu's enums — "Vulkan", "Fifo").
+fn render_config_line(
+    adapter: &str,
+    backend: &str,
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+    present_mode: wgpu::PresentMode,
+    scene_scale: f32,
+) -> String {
+    format!(
+        "render: adapter \"{adapter}\" ({backend}), surface {format:?}, {width}x{height}, {present_mode:?}, scale {scene_scale:.2}"
+    )
+}
+
 /// The settings vsync choice → wgpu's present mode (P1). `csp-ui`
 /// names the choice; only the app knows the API.
 fn present_mode_of(vsync: csp_view::settings::VsyncMode) -> wgpu::PresentMode {
@@ -344,6 +416,19 @@ struct App {
     /// dts (wall clock, read only in `render` — §2.5's one legal site).
     /// Instant is legal in csp-app; nothing here ever reaches the sim.
     frame_timing: FrameTimingSmoother,
+    /// The frame-phase split's ring (the 20-fps-report diagnostic):
+    /// per-frame cpu-residue vs GPU wait, same window as
+    /// [`Self::frame_timing`]. Fed only by frames that actually
+    /// submitted — a skipped/reconfigured frame has no honest split.
+    frame_phase: FramePhaseSmoother,
+    /// The GPU wait (acquire + submit/present, ms) measured during the
+    /// LAST frame's `paint` — paired with THIS frame's dt at `render`
+    /// entry (the dt spans the previous frame's body, so the pairing
+    /// keeps the split and its frame time the same iteration). `None`
+    /// whenever the last paint returned before submitting (no window,
+    /// surface skip/reconfigure) so a stale wait is never attributed to
+    /// a fresh frame.
+    last_gpu_wait_ms: Option<f64>,
     /// Per-tick wall ms of the last `step_frame` — the frame's whole step
     /// cost divided by the ticks it advanced (`View::ticks_last_frame`),
     /// because §2.6.3's inequality is written in per-tick cost. Never sim
@@ -572,6 +657,8 @@ impl App {
             warp: WarpController::new(),
             last_frame: Instant::now(),
             frame_timing: FrameTimingSmoother::default(),
+            frame_phase: FramePhaseSmoother::default(),
+            last_gpu_wait_ms: None,
             last_tick_ms: 0.0,
             fatal: None,
             settings,
@@ -631,8 +718,10 @@ impl App {
         // absorb an Off; that is the platform's call, not an error.
         // No-op when the mode already matches (`set_present_mode`
         // reconfigures only on change).
+        let mode = present_mode_of(self.settings.graphics.vsync);
+        let mode_changed = self.gpu.as_ref().is_some_and(|g| g.present_mode() != mode);
         if let Some(gpu) = &mut self.gpu {
-            gpu.set_present_mode(present_mode_of(self.settings.graphics.vsync));
+            gpu.set_present_mode(mode);
         }
         // P1 render scale: rebuild the scaled scene attachments exactly
         // as a resize does (the same recreate path) when the value
@@ -649,6 +738,12 @@ impl App {
         };
         if rescaled {
             self.resize_scene_attachments();
+        }
+        // Any presentation-affecting flip re-logs the live render
+        // configuration — a support log attached after a settings change
+        // still names the mode the frame actually ran under.
+        if mode_changed || rescaled {
+            self.log_render_config();
         }
         if let Some(level) = self
             .warp
@@ -682,6 +777,29 @@ impl App {
         } else {
             1.0
         }
+    }
+
+    /// Log the live render configuration at INFO (the support surface —
+    /// one line that names adapter, backend, surface format, swapchain
+    /// size, present mode, and render scale). Called once after GPU
+    /// init and again whenever vsync or the render scale flips; a
+    /// no-op before GPU init (the startup call covers the first log).
+    fn log_render_config(&self) {
+        let (Some(gpu), Some((adapter, backend))) = (&self.gpu, &self.gpu_info) else {
+            return;
+        };
+        log::info!(
+            "{}",
+            render_config_line(
+                adapter,
+                backend,
+                gpu.surface_format(),
+                gpu.config.width,
+                gpu.config.height,
+                gpu.present_mode(),
+                gpu.scene_scale(),
+            )
+        );
     }
 
     /// Re-size the mode renderers' scene attachments (P1): the flight
@@ -995,6 +1113,11 @@ impl App {
         self.terrain_renderer = Some(terrain_renderer);
         self.map_renderer = Some(map_renderer);
         self.vab_renderer = Some(vab_renderer);
+        // The startup render-configuration line — logged after the
+        // first surface configure so the format/size/mode printed are
+        // the ones frames actually run under (the support surface:
+        // "20 fps on a fast GPU" reports are diagnosed off this line).
+        self.log_render_config();
         // M10 audio (native only): open the device beside the other
         // presentation init — `None` on any failure is the supported
         // silent path, never a startup error. Tests skip
@@ -1025,6 +1148,17 @@ impl App {
         self.frame_timing.push(dt_wall);
         if let Some((fps, frame_ms)) = self.frame_timing.read() {
             self.view.set_frame_timing(fps, frame_ms);
+        }
+        // The frame-phase split: this dt spans the LAST frame's body
+        // (which measured its acquire/present wait into
+        // `last_gpu_wait_ms`), so the pair is the same iteration. Only
+        // frames that submitted left a wait — a skipped frame pushes
+        // nothing rather than a fabricated split.
+        if let Some(gpu_wait_ms) = self.last_gpu_wait_ms.take() {
+            self.frame_phase.push(dt_wall * 1000.0, gpu_wait_ms);
+            if let Some((cpu_ms, present_ms)) = self.frame_phase.read() {
+                self.view.set_frame_phase(cpu_ms, present_ms);
+            }
         }
 
         let window = match &self.window {
@@ -2038,6 +2172,18 @@ impl App {
             None => self.last_vab_packet = None,
         }
 
+        // The frame-phase split's GPU half: `get_current_texture`
+        // blocks when the swapchain has no free image (vsync/a
+        // saturated GPU park the CPU thread exactly here on most
+        // drivers), and `queue.present` can block on the presentation
+        // engine on others — both spans are measured and summed into
+        // the "present" figure, the residue of the loop iteration is
+        // "cpu". Accumulated into a local; `self.last_gpu_wait_ms` is
+        // written once the frame actually submits (an early return
+        // leaves no sample — a reconfigured/skipped frame has no
+        // honest split).
+        let mut gpu_wait_ms = 0.0f64;
+        let acquire_start = Instant::now();
         let mut frame = match gpu.begin_frame() {
             csp_render::FrameResult::Ok(f) => f,
             csp_render::FrameResult::Reconfigure => {
@@ -2051,6 +2197,7 @@ impl App {
             // Transient (timeout/occluded) — `begin_frame` warned once.
             csp_render::FrameResult::Skip => return,
         };
+        gpu_wait_ms += acquire_start.elapsed().as_secs_f64() * 1000.0;
 
         let screen = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [gpu.config.width, gpu.config.height],
@@ -2290,7 +2437,12 @@ impl App {
             self.pick_decode_ids = Some(ids);
             self.pick_decode_generation = encoded_generation;
         }
+        let present_start = Instant::now();
         gpu.submit(*frame);
+        gpu_wait_ms += present_start.elapsed().as_secs_f64() * 1000.0;
+        // The frame submitted — its GPU wait pairs with the next
+        // `render` entry's dt (see `last_gpu_wait_ms`).
+        self.last_gpu_wait_ms = Some(gpu_wait_ms);
         if encode_pick {
             if let Some(v) = &self.vab_renderer {
                 v.map_pick(self.pick_tx.clone());
@@ -4318,6 +4470,91 @@ mod tests {
         let mut z = FrameTimingSmoother::default();
         z.push(0.0);
         assert_eq!(z.read(), None);
+    }
+
+    /// The frame-phase split's window: the mean cpu/present pair over
+    /// the last [`PHASE_TIMING_WINDOW`] submitted frames, the
+    /// residue-floored cpu figure (a clamped hitch never reads as
+    /// negative cpu time), and the sliding wrap. This is the plumbing
+    /// the F3 split row reads — the pair that decides "GPU/vsync" vs
+    /// "our code/CPU" from a screenshot alone.
+    #[test]
+    fn frame_phase_window_means_clamps_and_wraps() {
+        let mut p = FramePhaseSmoother::default();
+        assert_eq!(p.read(), None, "no submitted frames yet — the row hides");
+        // The reported case, scaled: 50 ms frames dominated by present.
+        for _ in 0..10 {
+            p.push(50.6, 44.1);
+        }
+        let (cpu, present) = p.read().expect("a filled window reads");
+        assert!((cpu - 6.5).abs() < 0.01, "cpu residue 50.6−44.1, got {cpu}");
+        assert!((present - 44.1).abs() < 0.01, "got {present}");
+        // The floor: a §2.5-clamped hitch (100 ms ceiling) carrying a
+        // wait longer than the clamped dt reads as all-wait cpu 0 —
+        // never negative "faster than free" cpu time.
+        let mut h = FramePhaseSmoother::default();
+        h.push(100.0, 260.0);
+        let (cpu, present) = h.read().expect("one sample reads");
+        assert_eq!((cpu, present), (0.0, 260.0));
+        // Wrap: 10×(16.7, 1.0) then 10×(50.6, 44.1) — the window is
+        // exactly the last 10 pushes (the fast frames are gone).
+        let mut w = FramePhaseSmoother::default();
+        for _ in 0..10 {
+            w.push(16.7, 1.0);
+        }
+        for _ in 0..10 {
+            w.push(50.6, 44.1);
+        }
+        let (cpu, present) = w.read().expect("a wrapped window reads");
+        assert!((cpu - 6.5).abs() < 0.01 && (present - 44.1).abs() < 0.01);
+    }
+
+    /// The startup render-config log line — the support surface: every
+    /// negotiated configuration term must be present (adapter, backend,
+    /// surface format, swapchain size, present mode, render scale), and
+    /// the exact shape pinned so a log-grepping support flow keeps
+    /// working across refactors.
+    #[test]
+    fn render_config_line_carries_every_term() {
+        let line = render_config_line(
+            "NVIDIA GeForce RTX 5060 Ti",
+            "Vulkan",
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            2560,
+            1440,
+            wgpu::PresentMode::Fifo,
+            1.0,
+        );
+        assert_eq!(
+            line,
+            "render: adapter \"NVIDIA GeForce RTX 5060 Ti\" (Vulkan), \
+             surface Rgba8UnormSrgb, 2560x1440, Fifo, scale 1.00"
+        );
+        // Each term individually greppable — the failure message names
+        // the missing field, not just the whole-line diff.
+        for term in [
+            "RTX 5060 Ti",
+            "(Vulkan)",
+            "surface Rgba8UnormSrgb",
+            "2560x1440",
+            "Fifo",
+            "scale 1.00",
+        ] {
+            assert!(line.contains(term), "config line missing {term:?}: {line}");
+        }
+        // A reduced scale and the vsync-off mode read differently (the
+        // re-log on a settings flip must carry the new values).
+        let flipped = render_config_line(
+            "Intel Arc A770",
+            "Vulkan",
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            1920,
+            1080,
+            wgpu::PresentMode::AutoNoVsync,
+            0.75,
+        );
+        assert!(flipped.contains("scale 0.75"), "{flipped}");
+        assert!(flipped.contains("AutoNoVsync"), "{flipped}");
     }
 
     /// P1's render-scale clamp: the player-facing ladder bounds and
