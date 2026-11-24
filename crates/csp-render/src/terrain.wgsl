@@ -301,8 +301,9 @@ fn trans_between(ha: f32, hb: f32, mua: f32, mub: f32) -> vec3<f32> {
 }
 
 // Per-pixel march jitter — decorrelates the fixed step lattice so the
-// aerial-perspective integral doesn't band (the same trick fs_sky's
-// 20-step march already pulls).
+// aerial-perspective integral doesn't band. Only `view_inscatter` (the
+// terrain pass) uses it: `fs_sky`'s march is deterministic per ray, since
+// screen-space randomness on a sky-only pixel is nothing but grain.
 fn screen_hash(px: vec2<f32>) -> f32 {
     return fract(sin(dot(px, vec2<f32>(12.9898, 78.233))) * 43758.5453);
 }
@@ -1427,6 +1428,168 @@ fn sky_stars(rd: vec3<f32>, sun: vec3<f32>, pr: f32) -> vec3<f32> {
          * (1.0 - 0.85 * pow(max(dot(rd, sun), 0.0), 12.0));
 }
 
+// Mean of exp(-alt/H) over ONE stratum of `fs_sky`'s march. `alt_mid` is
+// the altitude at the stratum's midpoint and `x` its half width in scale
+// heights (x = slope·ds/(2H), slope = d(alt)/dt along the ray at the
+// midpoint — the altitude is linear in t across a stratum to within the
+// sphere's curvature). The density's integral over the stratum is this
+// times ds: exact for that model whatever the stratum's width, where the
+// same march with plain midpoints is off by 1–9% looking up from 0 to
+// 30 km in daylight.
+//
+// The closed form exp(-alt_mid/H)·sinh(x)/x is evaluated as
+// exp(-(alt_mid - |x|·H)/H)·(1 - exp(-2|x|))/(2|x|). The exponent is
+// minus the altitude of the stratum's LOW end, so it never grows with
+// |x|: a tap spanning hundreds of scale heights yields a small finite
+// number where exp(|x|) alone overflows into inf·0 = NaN. max(., 0) keeps
+// that exponent <= 0 where the linear model undershoots a grazing
+// stratum's low end below the datum (the march itself never goes there).
+// The series below |x| = 0.5 is not an optimisation: 1 - exp(-2|x|)
+// cancels towards 0/0 as x -> 0.
+fn stratum_density(alt_mid: f32, h: f32, x: f32) -> f32 {
+    let a = abs(x);
+    if (a < 0.5) {
+        let a2 = a * a;
+        return exp(-alt_mid / h)
+             * (1.0 + a2 * (1.0 / 6.0 + a2 * (1.0 / 120.0 + a2 / 5040.0)));
+    }
+    let low = max(alt_mid - a * h, 0.0);
+    return exp(-low / h) * (1.0 - exp(-2.0 * a)) / (2.0 * a);
+}
+
+// coth(x) - 1/x, in units of the stratum's half width: the density that
+// `stratum_density` integrates is centred tm - (ds/2)·coth_minus_inv(x)
+// from the stratum's midpoint tm, and that is where the march reads the
+// stratum's transmittances. Odd like x (ascending ray: the mass sits
+// before the midpoint). The series is written on x, NOT on |x|, so
+// rounding cannot break that symmetry; the closed form is the same
+// function with its exponential taken negatively (a long tap cannot
+// overflow it) and is unusable below |x| = 0.5, where it is the
+// difference of two terms that diverge as 1/x.
+fn coth_minus_inv(x: f32) -> f32 {
+    let a = abs(x);
+    if (a < 0.5) {
+        let x2 = x * x;
+        return x * (1.0 / 3.0 + x2 * (-1.0 / 45.0 + x2 * (2.0 / 945.0)));
+    }
+    let e2 = exp(-2.0 * a);
+    return sign(x) * (1.0 + 2.0 * e2 / (1.0 - e2)) - 1.0 / x;
+}
+
+// fs_sky's march along the eye ray's chord t0..t1: `steps` equal strata,
+// one tap each (the tier is fs_sky's choice). Returns the inscatter.
+fn shell_march(rd: vec3<f32>, sun: vec3<f32>, t0: f32, t1: f32, steps: f32) -> vec3<f32> {
+    let pa = u.eye_rel_body.xyz;
+    let R = u.planet.x;
+    let alt_a = max(length(pa) - R, 0.0);
+    let mu_eye = dot(rd, pa / max(length(pa), 1.0));
+    let ds = (t1 - t0) / steps;
+    let H = max(u.atmo.x, 1.0);
+    let Hm = max(H * 0.30, 1.0); // aerosols hug the low shell
+    let mu_sun = dot(rd, sun);
+    let phase = (3.0 / (16.0 * PI)) * (1.0 + mu_sun * mu_sun);
+    let phase_m = mie_phase(mu_sun);
+    let eye_desc = mu_eye < 0.0;
+    let t_end = trans(alt_a, select(mu_eye, -mu_eye, eye_desc));
+    var acc = vec3<f32>(0.0);
+    var acc_m = vec3<f32>(0.0);
+    for (var s = 0.0; s < steps; s = s + 1.0) {
+        let tm = t0 + (s + 0.5) * ds;
+        let pm = pa + rd * tm;
+        let prm = length(pm);
+        let alt_mid = max(prm - R, 0.0);
+        let slope = dot(rd, pm / prm);
+        let x = slope * ds / (2.0 * H);
+        // The one sample point per stratum (the fetch budget) is the
+        // Rayleigh centroid; the Mie term reads the same two LUT rows,
+        // not a second sample nearer the dense end (worth 0.03 levels).
+        let p = pa + rd * (tm - 0.5 * ds * coth_minus_inv(x));
+        let pr = length(p);
+        let alt_i = max(pr - R, 0.0);
+        let up = p / pr;
+        let m_i = dot(rd, up);
+        var t_ei: vec3<f32>;
+        if (eye_desc) {
+            t_ei = clamp(trans(alt_i, -m_i) / max(t_end, vec3<f32>(1.0e-4)),
+                         vec3<f32>(0.0), vec3<f32>(1.0));
+        } else {
+            t_ei = clamp(t_end / max(trans(alt_i, m_i), vec3<f32>(1.0e-4)),
+                         vec3<f32>(0.0), vec3<f32>(1.0));
+        }
+        let t_is = trans(alt_i, dot(sun, up));
+        acc = acc + u.rayleigh.rgb * phase
+            * stratum_density(alt_mid, H, x) * t_ei * t_is * ds;
+        acc_m = acc_m + MIE_BETA * phase_m
+              * stratum_density(alt_mid, Hm, slope * ds / (2.0 * Hm)) * t_ei * t_is * ds;
+    }
+    // The Mie veil is what whitens the limb and warms the glow around
+    // the sun instead of a flat blue tint.
+    return acc * 4.2 + acc_m * 1.5;
+}
+
+// The twilight band, in `sun_up` = sin of the sun's elevation at the
+// observer. Between TWILIGHT_LO and TWILIGHT_HI every chord takes the
+// 32-tap tier (fs_sky); across the 1° of sun beyond each edge the two
+// tiers are blended.
+const TWILIGHT_HI: f32 = 0.01; // +0.57°
+const TWILIGHT_LO: f32 = -0.10; // -5.74°
+const TWILIGHT_HI_OUT: f32 = 0.0274; // +1.57°
+const TWILIGHT_LO_OUT: f32 = -0.1173; // -6.74°
+
+// --- fs_sky's store into the 8-bit sRGB scene target -------------------
+//
+// The scene pass's colour target is the surface's sRGB8 format: the
+// hardware encodes and quantises what fs_sky returns, and a smooth sky
+// meets the 8-bit grid as one-level steps — faint ovals and wide bands
+// on the darkest blue once nothing jitters them apart. A dither of
+// ±half a code value removes them: triangular (two uniforms summed),
+// zero mean and static per screen pixel, so each code value flips where
+// the true colour passes it instead of along a contour, and the average
+// colour does not move. It is not grain — no pixel moves by a level —
+// and the render gate's grain metric low-passes before it measures for
+// exactly that reason.
+//
+// The encode is the hardware's, not this shader's, so the dither is
+// added in coded units and decoded again: the target re-encodes
+// decode(encode(c) + d) to encode(c) + d and rounds that.
+
+/// The sRGB OETF.
+fn srgb_encode(c: vec3<f32>) -> vec3<f32> {
+    return select(1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - 0.055, 12.92 * c,
+                  c <= vec3<f32>(0.0031308));
+}
+
+/// The sRGB EOTF.
+fn srgb_decode(c: vec3<f32>) -> vec3<f32> {
+    return select(pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)), c / 12.92,
+                  c <= vec3<f32>(0.04045));
+}
+
+/// The finaliser of a 32-bit integer hash: every output bit depends on
+/// every input bit.
+fn hash32(h: u32) -> u32 {
+    var x = (h ^ (h >> 16u)) * 0x7feb352du;
+    x = (x ^ (x >> 15u)) * 0x846ca68bu;
+    return x ^ (x >> 16u);
+}
+
+/// Triangular dither on [-0.5, 0.5] code values for framebuffer pixel
+/// `px`. Integer arithmetic only: bit-identical on every adapter, and a
+/// pure function of the pixel, so nothing of it moves between frames.
+fn dither_tpdf(px: vec2<u32>) -> f32 {
+    let a = hash32(px.x * 0x9e3779b9u + px.y * 0x85ebca6bu);
+    let b = hash32(a ^ 0x9e3779b9u);
+    return (f32(a >> 16u) + f32(b >> 16u)) * (1.0 / 131072.0) - 0.5;
+}
+
+/// What fs_sky stores for the sky colour `col`: tone-mapped, dithered,
+/// and handed back in linear units for the target to encode.
+fn sky_output(col: vec3<f32>, px: vec2<u32>) -> vec4<f32> {
+    let code = clamp(srgb_encode(tone_map(col)) + vec3<f32>(dither_tpdf(px) / 255.0),
+                     vec3<f32>(0.0), vec3<f32>(1.0));
+    return vec4<f32>(srgb_decode(code), 1.0);
+}
+
 @fragment
 fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
     let pa = u.eye_rel_body.xyz;
@@ -1434,6 +1597,8 @@ fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
     // View-space ray → body frame (view_rot columns are the view axes).
     let v = vec3<f32>(i.ndc.x * u.misc.x, i.ndc.y * u.misc.y, -1.0);
     let rd = normalize((u.view_rot * vec4<f32>(v, 0.0)).xyz);
+    // The framebuffer pixel fs_sky is storing into — the dither's seed.
+    let px = vec2<u32>(i.clip.xy);
 
     let R = u.planet.x;
     let alt_a = max(length(pa) - R, 0.0);
@@ -1458,7 +1623,7 @@ fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
     if (u.planet.y <= 0.0) {
         // Vacuum bodies see the raw night sky — nothing scatters
         // sunlight into the ray, so no daylight gate applies.
-        return vec4<f32>(tone_map(space_bg + sky_stars(rd, sun, pr)), 1.0);
+        return sky_output(space_bg + sky_stars(rd, sun, pr), px);
     }
 
     // Ray/shell quadratic |pa + t·rd|² = r² ⇒ t² + 2b·t + c = 0,
@@ -1472,7 +1637,7 @@ fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
         // The ray misses the top shell entirely — nothing crosses the
         // atmosphere, so the space backdrop arrives unattenuated (the
         // clamped LUT row would falsely dim the annulus past the limb).
-        return vec4<f32>(tone_map(space_bg + sky_stars(rd, sun, pr)), 1.0);
+        return sky_output(space_bg + sky_stars(rd, sun, pr), px);
     }
     let sq = sqrt(disc_top);
     var t0 = max(-b - sq, 0.0);
@@ -1489,78 +1654,83 @@ fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
     }
     var col = vec3<f32>(0.0);
     if (t1 > t0) {
-        // Tiered tap count (shader-diet lever G2): the integrand's
-        // mass spans ~2.5 scale heights of ray (~140 km at grazing
-        // geometry) — a chord shorter than the tier bound resolves it
-        // with 12 taps below visibility, and only genuinely long grazing
-        // chords keep the full 32. Both tiers keep the PER-STEP
-        // jitter (uniform 12–16 taps spread over the LONG chords were
-        // rejected by eye during the diet sweep as clear grain over
-        // the smooth day gradient, but short chords integrate the
-        // mass with ~6+ taps per scale height, where the same
-        // estimator's error is far below visibility). Same estimator,
-        // same decorrelation, no new banding mode; the tier boundary
-        // is a smooth chord-length contour where the 12-tap error is
-        // itself sub-JND — the horizon frame is the judge. Like the
-        // terrain inscatter march, the eye endpoint's LUT row is
-        // hoisted out of the loop (one trans() per tap saved, same
-        // ratio, same clamps).
+        // Tiered tap count (shader-diet lever G2): chords up to 150 km
+        // get 12 equal strata, longer ones 32. Each stratum is ONE tap
+        // whose density is integrated in closed form (`stratum_density`)
+        // and whose transmittances are read once, at the density-weighted
+        // centroid — a pure function of the ray. There is NO per-pixel
+        // jitter here. The march this replaced drew an independent random
+        // offset per pixel and step, so every pixel estimated the same
+        // integral differently, and a ground zenith chord (70 km = 12
+        // taps of 5.8 km, 1.04 scale heights each) came out as ±20% grain
+        // across a smooth blue sky. Against a 3000-tap reference the
+        // 12-tap zenith fan from the ground lands within 0.05 display
+        // levels (plain midpoints: 3.6) and the 12-vs-32-tap step across
+        // the tier boundary (21.6° elevation from the ground) within 0.04
+        // (1.3): the boundary is a chord-length contour, not a seam.
+        // The eye endpoint's LUT row is hoisted out of the loop as in the
+        // terrain inscatter march (one trans() per tap saved, same ratio,
+        // same clamps).
+        //
+        // One tap per stratum cannot resolve the planet's shadow edge,
+        // and around sunset it crosses the lowest, most massive strata:
+        // with the sun between +0.6° and -5.7° the 12-tap tier read the
+        // upward sky from the ground 0.7–2.1 display levels bright
+        // against a dense reference, and where the tiers met (21.6° up)
+        // the sky stepped by 2.7 levels at sun -1° — HEAD's worst step
+        // there was 0.45. So inside the twilight band every chord takes
+        // the 32-tap tier, within 0.7 levels of the reference. `sun_up`
+        // is one value per frame, and across the 1° of sun beyond each
+        // band edge a short chord runs BOTH marches and blends them: a
+        // hard switch would move the whole sky by the tiers' difference
+        // in a single frame. High sun is outside the band — the day sky
+        // keeps its 12 taps — and on a long chord the two tiers are the
+        // same march, so it never runs twice.
         let span = t1 - t0;
-        let steps = select(12.0, 32.0, span > 1.5e5);
-        let ds = span / steps;
-        let H = max(u.atmo.x, 1.0);
-        let Hm = max(H * 0.30, 1.0); // aerosols hug the low shell
-        let mu_sun = dot(rd, sun);
-        let phase = (3.0 / (16.0 * PI)) * (1.0 + mu_sun * mu_sun);
-        let phase_m = mie_phase(mu_sun);
-        let eye_desc = mu_eye < 0.0;
-        let t_end = trans(alt_a, select(mu_eye, -mu_eye, eye_desc));
-        var acc = vec3<f32>(0.0);
-        var acc_m = vec3<f32>(0.0);
-        for (var s = 0.0; s < steps; s = s + 1.0) {
-            let jit = screen_hash(i.ndc + vec2<f32>(s * 17.13, s * 29.71));
-            let p = pa + rd * (t0 + (s + 0.05 + jit * 0.9) * ds);
-            let pr = length(p);
-            let alt_i = max(pr - R, 0.0);
-            let up = p / pr;
-            let m_i = dot(rd, up);
-            var t_ei: vec3<f32>;
-            if (eye_desc) {
-                t_ei = clamp(trans(alt_i, -m_i) / max(t_end, vec3<f32>(1.0e-4)),
-                             vec3<f32>(0.0), vec3<f32>(1.0));
-            } else {
-                t_ei = clamp(t_end / max(trans(alt_i, m_i), vec3<f32>(1.0e-4)),
-                             vec3<f32>(0.0), vec3<f32>(1.0));
-            }
-            let t_is = trans(alt_i, dot(sun, up));
-            acc = acc + u.rayleigh.rgb * phase * exp(-alt_i / H) * t_ei * t_is * ds;
-            acc_m = acc_m + MIE_BETA * phase_m * exp(-alt_i / Hm) * t_ei * t_is * ds;
+        let short = span <= 1.5e5;
+        let sun_up = dot(sun, pa) / max(length(pa), 1.0);
+        let twilight = smoothstep(TWILIGHT_LO_OUT, TWILIGHT_LO, sun_up)
+                     * (1.0 - smoothstep(TWILIGHT_HI, TWILIGHT_HI_OUT, sun_up));
+        let tiered = select(12.0, 32.0, !short);
+        var ins = shell_march(rd, sun, t0, t1, select(32.0, tiered, twilight < 1.0));
+        if (twilight > 0.0 && twilight < 1.0 && short) {
+            ins = mix(ins, shell_march(rd, sun, t0, t1, 32.0), twilight);
         }
         // Inscatter + the space term attenuated by the view ray's own
         // transmittance; a ground strike swaps the backdrop for haze.
-        // The Mie veil is what whitens the limb and warms the glow
-        // around the sun instead of a flat blue tint.
         var bg_t = vec3<f32>(0.0);
         if (!hit_ground) {
             bg_t = t_bg;
         }
-        let ins = acc * 4.2 + acc_m * 1.5;
-        // Daylight gate: stars survive only where the shell scatters
+        // Glow gate: stars survive only where the shell scatters
         // essentially nothing into the ray. The old exp(−ins_lum·160)
         // never reached ZERO — a bright star at ~1% gate still speckled
-        // the dim-blue day sky, and at ~10 km altitude the gate sat
-        // near 40% (stars arriving "way too early"). A hard smoothstep
-        // instead: full stars below ~6e-4 inscatter (deep night, or
-        // the genuinely black day sky above ~18–20 km), literally NO
-        // stars above ~4e-3 — day zenith integrates ins_lum ≈
-        // 0.03–0.10, a bright limb far more, so every blue sky is
-        // guaranteed speckle-free. The night side's t_is→0 collapses
-        // ins → 0 → gate 1; the twilight band fades stars in as the
-        // sun drops below the samples' horizon — the same term that
-        // paints the bright horizon also clears the stars in front
-        // of it.
+        // the dim-blue day sky. A hard smoothstep instead: full stars
+        // below ~6e-4 inscatter, literally NO stars above ~4e-3 — a day
+        // zenith from the ground integrates ins_lum ≈ 3e-2, a bright
+        // limb far more, so no star ever sits in front of the glow. The
+        // night side's t_is→0 collapses ins → 0 → gate 1; the twilight
+        // band fades stars in as the sun drops below the samples'
+        // horizon — the same term that paints the bright horizon also
+        // clears the stars in front of it.
         let ins_lum = dot(ins, vec3<f32>(0.2126, 0.7152, 0.0722));
-        let star_vis = 1.0 - smoothstep(6.0e-4, 4.0e-3, ins_lum);
+        let glow_gate = 1.0 - smoothstep(6.0e-4, 4.0e-3, ins_lum);
+        // Altitude gate. Inscatter alone cannot tell night from a day sky
+        // that has merely thinned: the day zenith integrates 3.8e-2 on
+        // the ground but 6.0e-3 at 10 km and 2.9e-3 at 14 km, so the
+        // glow gate alone had the stars half on by 14 km and full by
+        // 20 km in broad daylight. In daylight the observer's altitude
+        // now decides: none below 42 km, full by 55 km. "Daylight" is
+        // the sun above the observer's own horizon (`sun_up`), handed
+        // over continuously across the 2.5° after sunset. From the
+        // ground that band ends while the glow gate is still shut on
+        // every above-horizon ray — it first opens, at the anti-solar
+        // horizon, with the sun 2.9° down — so from dusk to deep night
+        // dayness is 0 and star_vis IS the glow gate, exactly as before
+        // this gate existed.
+        let dayness = smoothstep(-0.0436, 0.0, sun_up);
+        let day_star = smoothstep(4.2e4, 5.5e4, alt_a);
+        let star_vis = glow_gate * (1.0 - dayness * (1.0 - day_star));
         // C16-F4: the two 27-cell star walks run only where their
         // output can be nonzero — `star_vis` is 0 across the whole
         // day side, and a ground strike (`bg_t` = 0) has no backdrop
@@ -1577,5 +1747,5 @@ fn fs_sky(i: Vs) -> @location(0) vec4<f32> {
         // initializer's case, made an explicit arm).
         col = space_bg + sky_stars(rd, sun, pr);
     }
-    return vec4<f32>(tone_map(col), 1.0);
+    return sky_output(col, px);
 }

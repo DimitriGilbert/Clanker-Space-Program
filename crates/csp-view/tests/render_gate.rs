@@ -253,6 +253,89 @@ fn analyze(img: &[u8]) -> Stats {
     }
 }
 
+/// Rec.709 luma of one RGBA8 readback pixel, in 8-bit levels.
+fn luma(px: &[u8]) -> f64 {
+    (2126.0 * f64::from(px[0]) + 7152.0 * f64::from(px[1]) + 722.0 * f64::from(px[2])) / 10_000.0
+}
+
+/// [`luma`] averaged over the 3×3 block of pixels centred on `(x, y)`, in
+/// 8-bit levels.
+fn box_luma(img: &[u8], w: usize, x: usize, y: usize) -> f64 {
+    let mut sum = 0.0;
+    for yy in y - 1..=y + 1 {
+        for xx in x - 1..=x + 1 {
+            sum += luma(&img[(yy * w + xx) * 4..]);
+        }
+    }
+    sum / 9.0
+}
+
+/// Mean |4-neighbour Laplacian| of the luma over the pixels at least two in
+/// from the border, in 8-bit levels — the grain metric. The luma is
+/// low-passed with a 3×3 box filter in floating point before the kernel
+/// runs: `fs_sky`'s output dither is a noise of σ ≈ 0.3 levels, uncorrelated
+/// pixel to pixel, and a per-pixel kernel reads it at 0.92 — right at a
+/// bound that admits the sky. Pixel-uncorrelated noise of standard
+/// deviation S levels measures 0.50·S (3.56·S without the filter), so the
+/// bound has room on both sides of the dither; a smooth sky measures far
+/// less whether or not it was quantised to 8 bits on the way out. Every box
+/// the kernel reads lies inside the frame, so no edge convention is needed.
+fn mean_laplacian(img: &[u8], w: usize, h: usize) -> f64 {
+    let mut sum = 0.0;
+    let mut n = 0u64;
+    for y in 2..h - 2 {
+        for x in 2..w - 2 {
+            let c = box_luma(img, w, x, y);
+            let around = box_luma(img, w, x - 1, y)
+                + box_luma(img, w, x + 1, y)
+                + box_luma(img, w, x, y - 1)
+                + box_luma(img, w, x, y + 1);
+            sum += (4.0 * c - around).abs();
+            n += 1;
+        }
+    }
+    sum / n as f64
+}
+
+/// The grain bound of [`mean_laplacian`], in 8-bit levels. On the ground
+/// zenith frame the jittered march measures 2.45–2.47 against it, the
+/// deterministic stratum march with `fs_sky`'s output dither 0.14: 6.2×
+/// over and 2.8× under, on lavapipe and RADV alike.
+const GRAIN_BOUND: f64 = 0.4;
+
+/// Rec.709 luma averaged over the frame, in 8-bit levels.
+fn mean_luma(img: &[u8]) -> f64 {
+    img.chunks_exact(4).map(luma).sum::<f64>() / (img.len() / 4) as f64
+}
+
+/// How far a star must rise above its surroundings to count: the sky
+/// itself is smooth to within one quantisation level, the dimmest
+/// resolved star peaks dozens of levels above it.
+const STAR_CONTRAST: f64 = 6.0;
+
+/// Star pixels: those whose luma tops the median of their 5×5
+/// neighbourhood by more than [`STAR_CONTRAST`] — an isolated bright
+/// point on the sky, whatever the sky's own brightness. The 2-pixel
+/// border has no full neighbourhood and is not tested.
+fn star_pixels(img: &[u8], w: usize, h: usize) -> usize {
+    let mut window = [0f64; 25];
+    let mut n = 0usize;
+    for y in 2..h - 2 {
+        for x in 2..w - 2 {
+            for (k, v) in window.iter_mut().enumerate() {
+                let yy = y + k / 5 - 2;
+                let xx = x + k % 5 - 2;
+                *v = luma(&img[(yy * w + xx) * 4..]);
+            }
+            window.sort_by(|a, b| a.total_cmp(b));
+            if luma(&img[(y * w + x) * 4..]) - window[12] > STAR_CONTRAST {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 /// Render one `FlightPacket` into an offscreen texture the way the
 /// app's scene pass does (clear color, reverse-Z depth, terrain then
 /// craft stream), and read the RGBA pixels back.
@@ -810,6 +893,328 @@ fn day_sky_shows_no_stars_night_sky_shows_them() {
         "only {night_white} star pixels in the night zenith sky — the \
          starfield is not rendering at all, so the day assertion above \
          proves nothing"
+    );
+}
+
+/// The day sky's sun, shared by the two sky gates below: ~25° above the
+/// horizon and ~65° off the zenith view axis (the same vector
+/// `day_sky_shows_no_stars_night_sky_shows_them` renders its day frame
+/// with), so neither the disc nor its glare is in frame.
+const DAY_SUN: [f32; 4] = [0.42, 0.0, 0.9075, 0.0];
+
+/// Grain gate — the "looking straight up from the ground the daytime sky
+/// is very grainy" complaint. `fs_sky` integrates the shell with one
+/// sample per stratum; while those samples were jittered per pixel, every
+/// pixel estimated the same integral differently and a smooth blue sky
+/// came out as ±20% speckle. No assertion above can see that: grain only
+/// grows the colour-bucket count. This renders a ground-level zenith
+/// packet and measures the one thing grain produces and a real sky never
+/// has — pixel-to-pixel luma curvature, as the mean |4-neighbour
+/// Laplacian| of the box-filtered luma in 8-bit levels ([`mean_laplacian`];
+/// `fs_sky`'s output dither sits under the bound at 0.14).
+///
+/// The bound is 0.4. The jittered march measured 2.45 on RADV and 2.47 on
+/// lavapipe; the deterministic stratum march 0.14 on both. The bound is
+/// read only after the frame has been shown to be the lit day sky it was
+/// calibrated on: the app's clear color alone sits at luma 45.6 with no
+/// curvature at all, so a frame the sky pass failed to draw would pass a
+/// luma band for free — hence a colour-bucket and spread floor (an undrawn
+/// frame has one bucket and no spread), then the luma band, then zero
+/// near-white pixels (a blown frame).
+#[test]
+fn zenith_sky_is_grain_free_from_the_ground() {
+    let Some((device, queue)) = gate_device("zenith_sky_is_grain_free_from_the_ground") else {
+        return;
+    };
+    let art = csp_view::art::load()
+        .0
+        .terrain
+        .clone()
+        .expect("terrain art pack loaded");
+    let img = render_flight_scene(
+        &device,
+        &queue,
+        &csp_render::flight::FlightPacket {
+            terrain: Some(zenith_sky_packet(0.0, DAY_SUN, &art)),
+            ..Default::default()
+        },
+    );
+    let stats = analyze(&img);
+    let luma = mean_luma(&img);
+    let lap = mean_laplacian(&img, W as usize, H as usize);
+    eprintln!(
+        "ground zenith sky, sun 65° off-axis: distinct={} spread={} mean_luma={luma:.2} \
+         near_white={} laplacian={lap:.3}",
+        stats.distinct, stats.max_spread, stats.near_white
+    );
+    assert!(
+        stats.distinct > 8 && stats.max_spread > 30,
+        "a flat frame ({} colour buckets, spread {}) — the sky pass drew nothing, and a \
+         void has no grain",
+        stats.distinct,
+        stats.max_spread
+    );
+    assert!(
+        (30.0..60.0).contains(&luma),
+        "mean luma {luma:.2} is outside 30–60 — not the lit day sky the grain bound was \
+         calibrated on"
+    );
+    assert_eq!(
+        stats.near_white, 0,
+        "{} near-white pixels in a day zenith frame with the sun off-axis — the frame is \
+         blown, or stars are leaking through the daylight gate",
+        stats.near_white
+    );
+    assert!(
+        lap < GRAIN_BOUND,
+        "mean |Laplacian| {lap:.3} — the sky is grainy again (bound {GRAIN_BOUND}; the \
+         jittered march measured 2.45–2.47, the stratum march 0.14). A per-pixel random \
+         offset in fs_sky's march is the usual cause."
+    );
+}
+
+/// Star gate — the "stars are visible way too early" complaint. The
+/// luminance half of `fs_sky`'s gate cannot tell night from a day sky that
+/// has merely thinned: on its own it had the stars half on by 14 km in
+/// broad daylight. Daylight stars are therefore held back by the
+/// observer's altitude — none below 42 km, full by 55 km. Rendered on the
+/// zenith packet lifted to each altitude, star pixels must be exactly
+/// zero at 10, 30 and 40 km and present at 55 and 60 km: a starless frame
+/// up there would mean the starfield or the gate broke, which the zero
+/// assertions alone cannot see.
+///
+/// Dusk keeps the behaviour the altitude gate must not touch, and is
+/// pinned with it: from the ground with the sun 9° down the glow gate is
+/// half open and the stars have to be up there.
+#[test]
+fn daytime_stars_wait_for_altitude() {
+    let Some((device, queue)) = gate_device("daytime_stars_wait_for_altitude") else {
+        return;
+    };
+    let art = csp_view::art::load()
+        .0
+        .terrain
+        .clone()
+        .expect("terrain art pack loaded");
+    // The zero assertions are only meaningful on a drawn frame, and
+    // `non_clear` cannot tell: the sunward edge of the 10 km frame is
+    // lit to within 8 levels of the clear color. An undrawn frame is ONE
+    // colour bucket with no spread; the bar cannot go higher, since the
+    // 30 km sky is dark and smooth enough to fill only seven.
+    let render = |alt_m: f64, sun: [f32; 4]| -> usize {
+        let img = render_flight_scene(
+            &device,
+            &queue,
+            &csp_render::flight::FlightPacket {
+                terrain: Some(zenith_sky_packet(alt_m, sun, &art)),
+                ..Default::default()
+            },
+        );
+        let stats = analyze(&img);
+        let stars = star_pixels(&img, W as usize, H as usize);
+        eprintln!(
+            "zenith sky at {alt_m:.0} m: distinct={} spread={} star_pixels={stars}",
+            stats.distinct, stats.max_spread
+        );
+        assert!(
+            stats.distinct > 1 && stats.max_spread > 8,
+            "a flat frame at {alt_m:.0} m ({} colour buckets, spread {}) — the sky pass \
+             drew nothing, so its star count is vacuous",
+            stats.distinct,
+            stats.max_spread
+        );
+        stars
+    };
+    for alt_m in [10_000.0, 30_000.0, 40_000.0] {
+        let stars = render(alt_m, DAY_SUN);
+        assert_eq!(
+            stars, 0,
+            "{stars} star pixels in a DAYLIGHT zenith sky at {alt_m:.0} m — stars are \
+             arriving way too early again (the altitude gate is gone or open too low)"
+        );
+    }
+    for alt_m in [55_000.0, 60_000.0] {
+        let stars = render(alt_m, DAY_SUN);
+        assert!(
+            stars > 20,
+            "only {stars} star pixels in the daylight zenith sky at {alt_m:.0} m — the \
+             altitude gate is still shut where it should be fully open, or the starfield \
+             is not rendering"
+        );
+    }
+    let dusk_sun = {
+        let e = (-9.0f64).to_radians();
+        [e.sin() as f32, 0.0, e.cos() as f32, 0.0]
+    };
+    let stars = render(0.0, dusk_sun);
+    assert!(
+        stars > 20,
+        "only {stars} star pixels in the zenith sky at dusk from the ground (sun 9° down) \
+         — the altitude gate is eating the stars it was meant to leave alone"
+    );
+}
+
+/// The grain metric's smooth test sky: a linear gradient per channel, as
+/// `fs_sky` computes it before its store.
+fn gradient_rgb(x: usize, y: usize, w: usize, h: usize) -> [f64; 3] {
+    let t = x as f64 / (w - 1) as f64;
+    let u = y as f64 / (h - 1) as f64;
+    [30.0 + 20.0 * t, 40.0 + 25.0 * u, 100.0 - 15.0 * t]
+}
+
+/// [`gradient_rgb`] stored to 8 bits: per pixel `offset` yields a number of
+/// code values that is added to every channel alike before rounding.
+fn stored_gradient(w: usize, h: usize, mut offset: impl FnMut() -> f64) -> Vec<u8> {
+    let mut img = Vec::with_capacity(w * h * 4);
+    for y in 0..h {
+        for x in 0..w {
+            let d = offset();
+            for c in gradient_rgb(x, y, w, h) {
+                img.push((c + d + 0.5) as u8);
+            }
+            img.push(255);
+        }
+    }
+    img
+}
+
+/// One step of xorshift32 on a non-zero state — deterministic noise for the
+/// tests below (the workspace has no `rand`).
+fn xorshift32(state: &mut u32) -> u32 {
+    *state ^= *state << 13;
+    *state ^= *state >> 17;
+    *state ^= *state << 5;
+    *state
+}
+
+/// The grain metric without a GPU. A smooth gradient rounded to 8 bits
+/// measures far under the gate's bound, and the same gradient plus white
+/// noise of ~5 levels standard deviation — what the jittered march left on
+/// the sky — measures the 0.50·S that [`mean_laplacian`] documents, several
+/// times over it.
+#[test]
+fn laplacian_metric_passes_quantised_gradient_and_rejects_white_noise() {
+    let (w, h) = (W as usize, H as usize);
+    let smooth = mean_laplacian(&stored_gradient(w, h, || 0.0), w, h);
+    eprintln!("quantised gradient: laplacian {smooth:.4}");
+    assert!(
+        smooth < GRAIN_BOUND,
+        "an 8-bit-quantised smooth gradient measures {smooth:.3} — the grain bound would \
+         reject grain-free skies"
+    );
+
+    // One draw per pixel, ±9 levels on every channel alike, so the luma
+    // noise has standard deviation sqrt(30) = 5.48 levels.
+    let mut state = 0x9e37_79b9_u32;
+    let noisy = stored_gradient(w, h, || ((xorshift32(&mut state) % 19) as i32 - 9) as f64);
+    let grain = mean_laplacian(&noisy, w, h);
+    let expected = 0.50 * 30.0f64.sqrt();
+    eprintln!("gradient + white noise (σ = 5.48 levels): laplacian {grain:.3}");
+    assert!(
+        (grain - expected).abs() < 0.1 * expected,
+        "white noise of σ = 5.48 levels measured {grain:.3}, not the documented 0.50·σ ≈ \
+         {expected:.2} — the grain metric is miscounting"
+    );
+    assert!(
+        grain > GRAIN_BOUND,
+        "white noise of σ = 5.48 levels measures {grain:.3} — under the gate's bound of \
+         {GRAIN_BOUND}, which would let the jittered march's grain through"
+    );
+}
+
+/// The grain metric on `fs_sky`'s store. A gradient rounded to 8 bits after
+/// a triangular dither of ±half a code value — two uniform draws summed, as
+/// `dither_tpdf` — carries noise of σ ≈ 0.3 levels and has to pass: it is
+/// what every daytime sky frame now contains.
+#[test]
+fn laplacian_metric_passes_half_step_dithered_gradient() {
+    let (w, h) = (W as usize, H as usize);
+    let mut state = 0x85eb_ca6b_u32;
+    let mut draw = || f64::from(xorshift32(&mut state) % 4096);
+    let dithered = stored_gradient(w, h, || (draw() + draw()) / 8192.0 - 0.5);
+
+    // The fixture is the store it claims. Against plain rounding exactly
+    // the samples whose threshold the dither crossed move — a fraction
+    // E|d| = 1/6 — and each by one code value.
+    let plain = stored_gradient(w, h, || 0.0);
+    let moved: Vec<i32> = dithered
+        .iter()
+        .zip(&plain)
+        .filter(|(a, b)| a != b)
+        .map(|(a, b)| i32::from(*a) - i32::from(*b))
+        .collect();
+    let fraction = moved.len() as f64 / (w * h * 3) as f64;
+    eprintln!("half-step dithered gradient: {fraction:.4} of samples moved by the dither");
+    assert!(
+        (0.15..0.185).contains(&fraction) && moved.iter().all(|d| d.abs() == 1),
+        "{fraction:.4} of the samples moved ({}/{}) by other than one code value — the \
+         fixture is not fs_sky's ±half-code triangular dither",
+        moved.iter().filter(|d| d.abs() != 1).count(),
+        moved.len()
+    );
+
+    let lap = mean_laplacian(&dithered, w, h);
+    eprintln!("half-step dithered gradient: laplacian {lap:.3}");
+    assert!(
+        lap < GRAIN_BOUND,
+        "a ±half-code dithered gradient measures {lap:.3} — over the grain bound of \
+         {GRAIN_BOUND}, which would reject every sky fs_sky dithers"
+    );
+}
+
+/// The star count without a GPU: on a smooth sky it counts exactly the
+/// isolated bright points planted in it, and nothing else — neither the
+/// quantised gradient nor a broad soft glow (sun halo, limb), which lifts
+/// a pixel and its neighbourhood together.
+#[test]
+fn star_count_counts_exactly_the_planted_stars() {
+    let (w, h) = (64usize, 48usize);
+    let mut sky = vec![0u8; w * h * 4];
+    for (y, row) in sky.chunks_exact_mut(4 * w).enumerate() {
+        for px in row.chunks_exact_mut(4) {
+            let v = (8 + y / 8) as u8;
+            px.copy_from_slice(&[v, v + 2, v + 16, 255]);
+        }
+    }
+    assert_eq!(
+        star_pixels(&sky, w, h),
+        0,
+        "a starless quantised gradient counted as stars"
+    );
+    // 7 one-pixel stars, each ≥ 5 px from every other and from the border.
+    const STARS: [(usize, usize); 7] = [
+        (7, 7),
+        (20, 30),
+        (31, 12),
+        (40, 40),
+        (55, 6),
+        (58, 25),
+        (33, 24),
+    ];
+    for (x, y) in STARS {
+        sky[(y * w + x) * 4..(y * w + x) * 4 + 4].copy_from_slice(&[200, 210, 255, 255]);
+    }
+    assert_eq!(
+        star_pixels(&sky, w, h),
+        STARS.len(),
+        "the planted stars were not counted one pixel each"
+    );
+    // A broad soft glow (σ = 12 px, +40 levels at its centre): every
+    // pixel rises together with its neighbourhood.
+    for y in 0..h {
+        for x in 0..w {
+            let d2 = (x as f64 - 52.0).powi(2) + (y as f64 - 38.0).powi(2);
+            let glow = 40.0 * f64::exp(-d2 / 288.0);
+            let px = &mut sky[(y * w + x) * 4..(y * w + x) * 4 + 4];
+            for c in &mut px[..3] {
+                *c = (u16::from(*c) + glow as u16).min(255) as u8;
+            }
+        }
+    }
+    assert_eq!(
+        star_pixels(&sky, w, h),
+        STARS.len(),
+        "a broad soft glow was counted as stars"
     );
 }
 

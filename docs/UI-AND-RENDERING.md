@@ -1135,29 +1135,66 @@ mid/far-field sun/shade banding, not the blob pattern.
 
 ### 7.5 Sky, atmosphere, and the star field (current state)
 
-`fs_sky` (`terrain.wgsl:1322`): fullscreen triangle; per-pixel scattering ray
+`fs_sky` (`terrain.wgsl:1594`): fullscreen triangle; per-pixel scattering ray
 in f32 with the shell-quadratic constants pre-baked in CPU f64
 (`uniforms.misc.z/w` — computing |pa|²−r² in f32 costs ~±300 m of limb
-wobble); 32-step jittered march with per-step jitter (partial cancellation,
-no banding); Rayleigh + Mie (aerosols hug the low shell) through the LUT;
-ground strikes swap the backdrop for haze; ACES tone-map.
+wobble); a deterministic stratum march — 12 equal strata on chords up to
+150 km, 32 on longer ones, one tap each whose exponential density is
+integrated in closed form (`stratum_density`) and whose two transmittance
+lookups are read at the stratum's density-weighted centroid
+(`coth_minus_inv`), a pure function of the ray with no per-pixel jitter.
+While the sun stands between +0.6° and −5.7° above the observer every chord
+takes the 32-tap tier, blended in across the 1° of sun beyond each band
+edge (`TWILIGHT_*`, `twilight`): one tap per stratum cannot resolve the
+planet's shadow edge, which crosses the lowest, most massive strata around
+sunset (§9 item 2). Then Rayleigh + Mie (aerosols hug the low shell)
+through the LUT; ground strikes swap the backdrop for haze; ACES tone-map;
+and the store below. The march this replaced jittered every tap per pixel,
+which was the grainy day sky.
 
-The star field (`star_cell`/`star_layer`/`star_field`, `terrain.wgsl:1228`/
-`:1259`/`:1287`) is fully procedural — crisp point stars hashed out of a 3D
+The store (`sky_output`, `terrain.wgsl:1587`): the scene target is the
+surface's sRGB8 format and the hardware quantises what `fs_sky` returns, so
+a smooth sky met the 8-bit grid as one-level contours — faint ovals and
+wide bands on the darkest blue once nothing jittered them apart. Every sky
+colour now leaves through one function: after the tone-map's sRGB encode
+it adds a triangular dither of ±half a code value (`dither_tpdf`: two
+integer hashes of the framebuffer pixel, summed; zero mean, a pure function
+of the pixel, so it is bit-identical on every adapter, needs no binding
+and nothing of it moves between frames) and hands the colour back linear
+for the target to encode. A code value now flips where the true colour
+passes it instead of along a contour, and the average colour does not
+move: on the ground zenith frame 39% of the pixels differ from the
+undithered one, each by exactly one code value, and the mean luma moves by
+at most 0.002. It is not grain — no pixel moves by more than one
+level — and the render gate low-passes its luma before it measures, for
+that reason (§10). The dither lives in `fs_sky` only: below a render scale
+of 1.0 the scene is rendered into a scaled target and the upscale pass is
+untouched, so there the dither is applied at the lower resolution and the
+upscale's own 8-bit quantisation is not dithered.
+
+The star field (`star_cell`/`star_layer`/`star_field`, `terrain.wgsl:1338`/
+`:1369`/`:1397`) is fully procedural — crisp point stars hashed out of a 3D
 direction-space lattice (~750 bright + ~700 faint incl. a Milky-Way band),
 each projected onto the direction sphere with a Gaussian core + faint halo,
 and a per-pixel ray-footprint floor (`sig_ang`) so **no star ever goes
 sub-pixel** — dense sub-pixel points read as film grain, which was the
 "grainy static sky" complaint.
 
-Daylight star gate (`terrain.wgsl:1432`): stars survive only where the
-shell scatters essentially nothing into the ray —
-`star_vis = 1 − smoothstep(6e-4, 4e-3, ins_lum)`. The previous
-`exp(−ins_lum·160)` never reached zero, so bright stars speckled the
-day sky and arrived "way too early" at altitude; the hard smoothstep
-guarantees zero stars on every blue sky (day zenith integrates ~0.03–0.10)
-while the night side (ins→0) and the black sky above ~18–20 km keep them.
-This landed in `ff897d4`.
+Star gates (`terrain.wgsl:1717`): two multiplied factors. The **glow gate**
+— `1 − smoothstep(6e-4, 4e-3, ins_lum)`, which replaced the never-zero
+`exp(−ins_lum·160)` in `ff897d4` — keeps stars out of every ray the shell
+lights up (a bright limb scatters far more than the ~3e-2 of a day zenith).
+The **altitude gate** applies only in daylight, meaning the sun above the
+observer's own horizon (`sun_up`, from the eye and sun uniforms `fs_sky`
+already held): stars fade in from none at 42 km to full at 55 km, and the
+gate hands over to the glow gate alone continuously across the 2.5° after
+sunset. Inscatter by itself cannot tell night from a day sky that has
+merely thinned — its zenith value falls from 3.8e-2 on the ground to 6.0e-3
+at 10 km and 2.9e-3 at 14 km, so the glow gate alone had the stars half on
+by 14 km in broad daylight. From the ground the hand-over ends while the
+glow gate is still shut on every above-horizon ray (it first opens, at the
+anti-solar horizon, with the sun 2.9° down), so dusk and night keep exactly
+the stars they had.
 
 ### 7.6 Part meshes, art, structures
 
@@ -1292,13 +1329,46 @@ found live defects in the same tree, listed in the ledger below.
    (b) the **navball's first-open parking is ~242 px too high** (clamped
    against egui's nominal area size — no `.default_size`), overlapping the
    readout block until dragged.
-2. **Grainy sky / stars too early.** FIXED: the star field is sparse
-   resolved points with a resolution-aware sub-pixel floor, and the daylight
-   gate is the hard `smoothstep(6e-4, 4e-3, ins_lum)` (`terrain.wgsl:1287`
-   `star_field`, `:1432` the gate) replacing the never-zero
-   `exp(−ins_lum·160)`. The old faint-layer grain root cause is documented
-   in the shader comments ("the old 11–23%-occupancy faint layer was the
-   'grainy static' sky").
+2. **Grainy sky / stars too early.** FIXED — on rendered frames, this time.
+   The earlier FIXED here covered only the star field's sub-pixel floor; it
+   was declared without ever looking at a frame from the ground aimed
+   upward, and two causes remained. (a) *Grain*: `fs_sky`'s march took one
+   jittered sample per stratum, 12 of them on a ground zenith chord, so
+   every pixel estimated the same integral differently — ±20% speckle on a
+   smooth blue sky. It is now a deterministic stratum march (§7.5): on the
+   render gate's grain metric (mean |Laplacian| of the box-filtered luma,
+   8-bit levels, bound 0.4) the ground zenith frame measures 2.45 on RADV
+   and 2.47 on lavapipe with the old shader and 0.14 with this one. (b)
+   *Stars*: the luminance gate alone opens between 12 and 14 km in
+   daylight; daylight stars are now gated by altitude — none below 42 km,
+   full by 55 km, dusk and night unchanged (`terrain.wgsl:1717`). Both are
+   held by regression gates (`zenith_sky_is_grain_free_from_the_ground`,
+   `daytime_stars_wait_for_altitude` — §10), which fail on the old shader.
+   Two residuals that fix left are closed as well, on rendered frames from
+   the ground at 1280×720 on both adapters. (c) *Banding*: with the grain
+   no longer dithering the 8-bit target, the sky's one-level quantisation
+   contours showed as wide bands on the darkest blue. `fs_sky` now stores
+   through an output dither (§7.5). At t=3450 looking straight up, the
+   luma averaged over the central 161 columns ran flat for 73 rows and
+   then stepped 0.72 levels in one row; dithered, its longest flat run is
+   two rows and its largest row-to-row change, 0.30 levels, is the sky's
+   own gradient. On the darkest blue the dither does not read as texture
+   at 1:1 or at 3× nearest-neighbour; a ×32 contrast stretch shows it, as
+   structureless speckle. (d) *Sunset contour*: within a few degrees of
+   sunset the 12-tap tier rendered the upward sky from the ground 0.7–2.1
+   levels brighter than a dense reference integral — at t=6250 (sun −1°)
+   toward the sun, 45° up: 2.7 on average and up to 4.3 — which showed as
+   a contour where the tiers met, 21.6° up. While the sun stands between
+   +0.6° and −5.7° above the observer every chord now takes the 32-tap
+   tier, within 0.5 levels of that reference and blended in across the 1°
+   of sun beyond each band edge: in the same frame the one-row drop of 3.0
+   levels at the old tier boundary is gone, and the largest row-to-row
+   change across it is 0.36 levels — again the sky's own gradient. The cost
+   is paid only in the twilight minutes. The night sky is the old shader's
+   up to the dither: at t=10800 from the ground every pixel that differs
+   differs by one code value, and every star more than 7 levels above its
+   neighbourhood (558 at the zenith, 648 at 45° up, 246 at the horizon)
+   stands in both frames within half a pixel.
 3. **Yellow notices unreadable / flight-data contrast.** FIXED: every
    floating HUD strip wears the shared dark chip — `HUD_CHIP_FILL` (9,13,19,
    210) + hairline edge (`csp-ui/src/lib.rs:62-91` `hud_frame`/
@@ -1348,8 +1418,17 @@ budget-limited previews, `csp-app/src/lib.rs:1398-1447`).
 
 ## 10. Testing the presentation stack
 
-- `csp-view/tests/render_gate.rs` (1062) — headless wgpu device; boot-scene
-  real-geometry gate, washed-out/empty rejection cases, `--ignored` PPM dumps.
+- `csp-view/tests/render_gate.rs` (2316) — headless wgpu device; boot-scene
+  real-geometry gate, washed-out/empty rejection cases; the sky gates
+  `day_sky_shows_no_stars_night_sky_shows_them`,
+  `zenith_sky_is_grain_free_from_the_ground` (mean |Laplacian| of the
+  3×3-box-filtered luma below 0.4 on a ground zenith frame at 320×240 — the
+  jittered march measures 2.45–2.47, the stratum march with `fs_sky`'s
+  output dither 0.14) and `daytime_stars_wait_for_altitude` (zero star
+  pixels at 10, 30 and 40 km in daylight, stars at 55 and 60 km and at dusk
+  from the ground), each metric with GPU-free tests of its own (the grain
+  metric on a quantised gradient, on one dithered by ±half a code value,
+  and on one plus white noise); `--ignored` PPM dumps.
 - `csp-view/tests/render_dump_extra.rs` (449) — additional dump scenes.
 - `csp-view/tests/vab_latency.rs` (165) — the §5.4 kill criterion.
 - `csp-ui/tests/hud_dump.rs` (393) — HUD contrast rasterizer.
