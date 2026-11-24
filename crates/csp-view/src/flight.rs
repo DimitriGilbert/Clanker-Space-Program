@@ -5,9 +5,10 @@
 //! convective-heating flux sample, **ground-contact dust**, and the
 //! HUD mirrors. Same §2.5 schedule shape as the map and VAB:
 //! `end_frame` stages sim reads into [`FlightSyncInput`],
-//! `sync_flight` mirrors them, `flight_present` solves the chase
-//! camera + the SFX cue edges, `extract_flight` emits clip-space
-//! vertices for `csp_render::flight::FlightRenderer`.
+//! `sync_flight` mirrors them, `flight_interp` draws each staged pose
+//! at the frame's fractional tick ([`DrawnScene`]), `flight_present`
+//! solves the chase camera + the SFX cue edges, `extract_flight` emits
+//! clip-space vertices for `csp_render::flight::FlightRenderer`.
 //!
 //! **SFX (§3.7 "basic SFX").** M4c ships the cue channel, not an
 //! audio device: [`FlightSfx`] edge-detects the sim transitions the
@@ -24,6 +25,7 @@
 //! the map projection. Cue TTLs count presentation frames — session
 //! state, never sim state.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
@@ -562,6 +564,190 @@ pub struct FlightSnapshot {
 /// an OnRails vessel is alive, not lost (P12-F2).
 #[derive(Resource, Default)]
 pub struct LiveVesselCount(pub usize);
+
+/// A vessel's pose as a frame draws it — the same origin / orientation /
+/// CoM triple [`FlightBody`] stages, at the instant the frame is drawn.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DrawnPose {
+    /// The vessel's id (`VesselId.0`).
+    pub id: u64,
+    /// Body-origin position (bubble frame).
+    pub pos: DVec3,
+    /// Body→world rotation.
+    pub rot: DQuat,
+    /// CoM (bubble frame) — the chase camera's focus.
+    pub com: DVec3,
+}
+
+impl DrawnPose {
+    /// Exactly as staged — no interpolation.
+    fn staged(b: &FlightBody) -> Self {
+        Self {
+            id: b.id,
+            pos: b.pos,
+            rot: b.rot,
+            com: b.com,
+        }
+    }
+}
+
+/// One staged pose at one whole tick — a sample on the path a vessel is
+/// drawn along.
+#[derive(Clone, Copy, Debug)]
+struct PoseSample {
+    /// The sim tick the pose was staged at.
+    tick: u64,
+    pose: DrawnPose,
+}
+
+/// The last two distinct-tick samples of one vessel.
+#[derive(Clone, Copy, Debug)]
+struct SamplePair {
+    /// The sample before `cur`'s tick — `None` until the vessel has
+    /// been staged across a tick boundary. A vessel with no previous
+    /// pose (freshly spawned, just delivered, a breakup fragment) is
+    /// drawn at its current pose.
+    prev: Option<PoseSample>,
+    /// The latest staged sample.
+    cur: PoseSample,
+}
+
+/// §2.5's interpolation memory — per vessel, the poses its last two
+/// distinct ticks staged. Session state only: nothing here is sim state
+/// or reaches a hash. A `BTreeMap`, so every walk is ascending
+/// `VesselId` — the staged list's own order.
+#[derive(Resource, Default)]
+pub struct PoseHistory {
+    samples: BTreeMap<u64, SamplePair>,
+}
+
+impl PoseHistory {
+    /// Age the history by one frame's staging and return the pose every
+    /// staged vessel is drawn at, in `vessels`' order. `tick` is the
+    /// clock the poses were staged at; `frac` the frame's fractional
+    /// tick remainder past it, in `[0, 1)` — at `0` every pose is the
+    /// staged one, unchanged.
+    fn advance(&mut self, vessels: &[FlightBody], tick: u64, frac: f64) -> Vec<DrawnPose> {
+        // A vessel absent from this frame's staging has left the path —
+        // a rails vessel outside the focus hint, a removal. Its next
+        // sighting starts over.
+        self.samples
+            .retain(|id, _| vessels.iter().any(|b| b.id == *id));
+        let mut poses = Vec::with_capacity(vessels.len());
+        for b in vessels {
+            let staged = PoseSample {
+                tick,
+                pose: DrawnPose::staged(b),
+            };
+            let pair = self.samples.entry(b.id).or_insert(SamplePair {
+                prev: None,
+                cur: staged,
+            });
+            match tick.cmp(&pair.cur.tick) {
+                Ordering::Greater => pair.prev = Some(pair.cur),
+                // The clock went backwards — a world restored at an
+                // earlier tick: the samples describe a discarded
+                // timeline.
+                Ordering::Less => pair.prev = None,
+                // A zero-tick frame restages the same instant.
+                Ordering::Equal => {}
+            }
+            pair.cur = staged;
+            poses.push(match pair.prev {
+                Some(prev) if frac > 0.0 => pose_between(&prev, &pair.cur, frac),
+                _ => pair.cur.pose,
+            });
+        }
+        poses
+    }
+}
+
+/// The point on `prev → cur` at the frame's drawn instant, `(cur.tick −
+/// 1) + frac` ticks — one tick of latency, so nothing is ever
+/// extrapolated: exactly `frac` of the way along a one-tick step, and a
+/// frame that spanned several ticks interpolates across that whole
+/// span. `frac < 1` keeps the result short of `cur`.
+fn pose_between(prev: &PoseSample, cur: &PoseSample, frac: f64) -> DrawnPose {
+    let span = (cur.tick - prev.tick) as f64;
+    let t = ((cur.tick - 1 - prev.tick) as f64 + frac) / span;
+    DrawnPose {
+        id: cur.pose.id,
+        pos: prev.pose.pos + (cur.pose.pos - prev.pose.pos) * t,
+        rot: rot_between(prev.pose.rot, cur.pose.rot, t),
+        com: prev.pose.com + (cur.pose.com - prev.pose.com) * t,
+    }
+}
+
+/// Shortest-arc interpolation of two unit rotations at `t`: the
+/// renormalized lerp, whose only transcendental is `DQuat::normalize`'s
+/// libm sqrt (`csp-view` has no `libm` edge for a constant-rate slerp's
+/// `acos`). It travels the arc a slerp would, at a rate that departs
+/// from constant by under 0.001 rad across a step turning up to 18° —
+/// a 64 Hz tick of any real tumble turns far less.
+fn rot_between(a: DQuat, b: DQuat, t: f64) -> DQuat {
+    // `q` and `−q` are the same rotation — flip to the shorter arc.
+    let flip = if a.dot(b) < 0.0 { -1.0 } else { 1.0 };
+    DQuat::new(
+        a.x + (b.x * flip - a.x) * t,
+        a.y + (b.y * flip - a.y) * t,
+        a.z + (b.z * flip - a.z) * t,
+        a.w + (b.w * flip - a.w) * t,
+    )
+    .normalize()
+}
+
+/// What a frame draws, all at one instant — §2.5's "never extrapolates"
+/// presentation time, `(clock − 1) + remainder` ticks: every staged
+/// vessel's pose, and the scene values that otherwise ride the integer
+/// clock (the dominant body's spin phase; the seconds the plume flicker
+/// and the ocean wave scroll read). [`flight_interp`] writes it every
+/// frame ahead of `flight_present`; the chase solve, the part pick and
+/// `extract_flight` read it. The default — nothing drawn — reads as the
+/// staged snapshot, so a rig that runs the extract alone draws exactly
+/// what it stages.
+#[derive(Resource, Default)]
+pub struct DrawnScene {
+    /// The environment at the drawn instant: the staged one with its
+    /// spin phase rolled back to it. `None` mirrors a snapshot without
+    /// physics.
+    pub(crate) env: Option<FlightEnv>,
+    /// The drawn instant in seconds — `None` until a frame has been
+    /// drawn.
+    pub(crate) time_s: Option<f64>,
+    /// One pose per staged vessel, ascending id.
+    poses: Vec<DrawnPose>,
+}
+
+impl DrawnScene {
+    /// The pose `body` is drawn at this frame — its staged pose when
+    /// this frame drew none.
+    pub(crate) fn pose_of(&self, body: &FlightBody) -> DrawnPose {
+        self.poses
+            .iter()
+            .find(|p| p.id == body.id)
+            .map_or_else(|| DrawnPose::staged(body), |p| *p)
+    }
+
+    /// The pose drawn for vessel `id` this frame — `None` when the frame
+    /// drew none (the vessel is not staged, or interpolation has not
+    /// run).
+    pub fn drawn(&self, id: u64) -> Option<DrawnPose> {
+        self.poses.iter().find(|p| p.id == id).copied()
+    }
+
+    /// The environment at the drawn instant — its spin phase is the
+    /// ground's, the drawn poses ride. `None` without physics or until
+    /// a frame has been drawn.
+    pub fn env(&self) -> Option<&FlightEnv> {
+        self.env.as_ref()
+    }
+
+    /// The drawn instant in seconds — `None` until a frame has been
+    /// drawn.
+    pub fn time_s(&self) -> Option<f64> {
+        self.time_s
+    }
+}
 
 /// HUD mirrors — written by `flight_present`, drawn by
 /// `csp_ui::flight_hud`.
@@ -1865,10 +2051,14 @@ pub(crate) fn sync_flight(
 /// to `amplitude_m` above `radius_m`, so a datum-only floor lets a
 /// downward drag bury the camera inside a hill). Falls back to the
 /// world-frame basis when there is no environment.
+///
+/// `focus` is the CoM the craft is DRAWN at this frame ([`DrawnScene`])
+/// — never the staged one — so the camera and the craft travel the same
+/// interpolated step.
 fn solve_chase_camera(
     input: &FlightInput,
     env: Option<&FlightEnv>,
-    focus: &FlightBody,
+    focus: DVec3,
     terrain_cfg: &TerrainConfig,
     terrain_cache: &mut TerrainCache,
 ) -> MapCameraF64 {
@@ -1876,7 +2066,7 @@ fn solve_chase_camera(
     let mut axis = DVec3::Z;
     if let Some(env) = env {
         axis = env.spin_axis;
-        let rel = focus.com - env.body_center;
+        let rel = focus - env.body_center;
         if rel.norm_squared() > 1.0e-12 {
             up = rel / rel.norm();
         }
@@ -1893,7 +2083,7 @@ fn solve_chase_camera(
     let (sy, cy) = input.yaw.sin_cos();
     let (sp, cp) = input.pitch.sin_cos();
     let dir = north * (cy * cp) + east * (sy * cp) + up * sp;
-    let mut eye = focus.com + dir * input.distance_m;
+    let mut eye = focus + dir * input.distance_m;
     // Keep the eye out of the ground: a drag pitching under the
     // horizon stops above the local terrain surface (the baked
     // heightfield's neighbourhood ceiling), not the bare datum —
@@ -1913,7 +2103,7 @@ fn solve_chase_camera(
     // Camera basis (columns = view axes in world, c0×c1 = c2): z_out
     // points focus → eye, "up" is the local surface up.
     let z_out = {
-        let d = eye - focus.com;
+        let d = eye - focus;
         if d.norm_squared() > 1.0e-12 {
             d / d.norm()
         } else {
@@ -1947,7 +2137,7 @@ fn solve_chase_camera(
         // engaged (C12-F4). This matches the map convention
         // (`distance_m` = actual |eye − focus|) — the no-clamp path
         // reduces to `input.distance_m` exactly.
-        distance_m: (eye - focus.com).norm(),
+        distance_m: (eye - focus).norm(),
         valid: true,
     }
 }
@@ -2066,15 +2256,16 @@ const PICK_NEAR_PX: f32 = 48.0;
 /// [`FlightPick::Vessel`] (the whole-vessel action list). `None` = a
 /// total miss — the caller closes any open menu.
 ///
-/// All presentation-side — the staged [`FlightBody`] transforms plus
-/// the presentation camera, never the sim.
+/// All presentation-side — the staged [`FlightBody`] parts placed at the
+/// pose the frame DRAWS the focus at ([`DrawnPose`], the one under the
+/// solved chase camera), never the sim.
 pub(crate) fn pick_part(
     cam: &FlightCameraF64,
-    focus: Option<&FlightBody>,
+    focus: Option<(&FlightBody, DrawnPose)>,
     content: egui::Rect,
     cursor: egui::Pos2,
 ) -> Option<FlightPick> {
-    let focus = focus?;
+    let (focus, pose) = focus?;
     if !cam.0.valid || focus.parts.is_empty() {
         return None;
     }
@@ -2098,7 +2289,7 @@ pub(crate) fn pick_part(
         for x in [p.lo.x, p.hi.x] {
             for y in [p.lo.y, p.hi.y] {
                 for z in [p.lo.z, p.hi.z] {
-                    let w = focus.pos + focus.rot.rotate(DVec3::new(x, y, z));
+                    let w = pose.pos + pose.rot.rotate(DVec3::new(x, y, z));
                     depth2 = depth2.min((w - cam.0.eye).norm_squared());
                     if let Some(s) = to_screen(w) {
                         pts.push(s);
@@ -2111,7 +2302,7 @@ pub(crate) fn pick_part(
         }
         let rect = egui::Rect::from_points(&pts);
         hull = hull.union(rect);
-        let center_w = focus.pos + focus.rot.rotate((p.lo + p.hi) * 0.5);
+        let center_w = pose.pos + pose.rot.rotate((p.lo + p.hi) * 0.5);
         if let Some(cs) = to_screen(center_w) {
             let d = cs.distance(cursor);
             if nearest.is_none_or(|(bd, _)| d < bd) {
@@ -2142,12 +2333,59 @@ pub(crate) fn pick_part(
     (hull.is_positive() && hull.expand(PICK_NEAR_PX).contains(cursor)).then_some(FlightPick::Vessel)
 }
 
+/// `Presentation` schedule — §2.5's interpolation, run ahead of
+/// `flight_present`: age every staged vessel's pose history and solve
+/// what the frame draws.
+///
+/// The snapshot holds each vessel at its LAST simulation tick; drawn
+/// there, a 60 fps frame steps one tick of motion fifteen frames in
+/// sixteen and two in the sixteenth — the view hitch-steps. With the
+/// frame's fractional tick remainder each vessel is instead drawn one
+/// tick of latency back, between its previous and current pose, so
+/// consecutive frames advance evenly. [`crate::TickFraction`] is the
+/// remainder — handed over by `csp-app`'s warp controller, never read
+/// off the clock here — and `0` (a harness that supplies none) draws
+/// every pose exactly as staged.
+pub(crate) fn flight_interp(
+    snap: Res<FlightSnapshot>,
+    clock: Res<crate::Clock>,
+    frac: Res<crate::TickFraction>,
+    mut history: ResMut<PoseHistory>,
+    mut scene: ResMut<DrawnScene>,
+) {
+    let tick = clock.0.ticks();
+    // Into `[0, 1)`, so the drawn instant never passes the clock's own
+    // pose. A non-finite remainder carries no interpolation: 0.
+    let frac = if frac.0.is_finite() {
+        frac.0.clamp(0.0, 1.0 - f64::EPSILON)
+    } else {
+        0.0
+    };
+    scene.poses = history.advance(&snap.vessels, tick, frac);
+    let drawn = if frac > 0.0 {
+        (tick.saturating_sub(1) as f64) + frac
+    } else {
+        tick as f64
+    };
+    scene.time_s = Some(drawn / csp_core::TICK_HZ as f64);
+    // The staged spin phase is `ω·t` at the clock's tick. Rolled back
+    // to the drawn instant, the ground turns under the craft at the
+    // rate the craft is drawn moving — a latched hull stays on its pad.
+    scene.env = snap.env.as_ref().map(|staged| {
+        let mut env = staged.clone();
+        env.spin_phase -=
+            staged.body_spin.norm() * (tick as f64 - drawn) / csp_core::TICK_HZ as f64;
+        env
+    });
+}
+
 /// `Presentation` schedule — chase-camera solve + HUD mirrors + the
 /// §3.7 SFX cue edges (the schedule's "VFX, audio cues" slot).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // the camera solve carries the terrain floor; per-vessel stage plans add the hud_plan read
 pub(crate) fn flight_present(
     mut input: ResMut<FlightInput>,
     snap: Res<FlightSnapshot>,
+    scene: Res<DrawnScene>,
     live: Res<LiveVesselCount>,
     rails: Res<RailsStaged>,
     plans: Res<StagePlans>,
@@ -2229,10 +2467,15 @@ pub(crate) fn flight_present(
         stage_propulsion(&mut ui, None, &[], 0.0, None, None);
         return;
     };
+    // The camera follows the craft as DRAWN — the interpolated CoM
+    // under the drawn spin phase (the floor it clamps against is the
+    // terrain the frame shows). The HUD mirrors below keep reading the
+    // staged body: instruments report the sim's last tick, not a
+    // pose between two.
     cam.0 = solve_chase_camera(
         &input,
-        snap.env.as_ref(),
-        focus,
+        scene.env.as_ref().or(snap.env.as_ref()),
+        scene.pose_of(focus).com,
         &terrain_cfg,
         &mut terrain_cache,
     );
@@ -2937,6 +3180,7 @@ fn emit_plumes(
     vp: &[[f64; 4]; 4],
     eye: DVec3,
     b: &FlightBody,
+    pose: &DrawnPose,
     expand: f64,
     t_s: f64,
 ) {
@@ -2954,10 +3198,10 @@ fn emit_plumes(
             continue;
         }
         let dir_w = {
-            let d = b.rot.rotate(*dir);
+            let d = pose.rot.rotate(*dir);
             d / d.norm()
         };
-        let tip = b.pos + b.rot.rotate(*p0);
+        let tip = pose.pos + pose.rot.rotate(*p0);
         let len = 4.5 + 22.0 * drive;
         let exit_r = 0.30 + 0.38 * drive;
         let (u1, u2) = {
@@ -3029,11 +3273,13 @@ fn emit_plumes(
 /// reads as glowing inside its shock layer. `plasma_i` is the staged
 /// convective input normalized through the display window; the shell
 /// is flat-lit (emissive).
+#[allow(clippy::too_many_arguments)] // the drawn pose rides beside the staged body it places
 fn emit_sheath(
     v: &mut Vec<csp_render::flight::FlightVertex>,
     vp: &[[f64; 4]; 4],
     eye: DVec3,
     b: &FlightBody,
+    pose: &DrawnPose,
     flow: DVec3,
     plasma_i: f64,
     tris: &mut Vec<crate::part_mesh::SmoothTri>,
@@ -3045,9 +3291,9 @@ fn emit_sheath(
         tris.clear();
         crate::part_mesh::emit_smooth(&shell, tris);
         for t in tris.iter() {
-            let world = |q: DVec3| b.pos + b.rot.rotate(p.transform.apply(q));
+            let world = |q: DVec3| pose.pos + pose.rot.rotate(p.transform.apply(q));
             let cols = [(t.a, t.na), (t.b, t.nb), (t.c, t.nc)].map(|(_q, n)| {
-                let n_w = b.rot.rotate(p.transform.apply_dir(n));
+                let n_w = pose.rot.rotate(p.transform.apply_dir(n));
                 let facing = if flow == DVec3::ZERO {
                     // Coasting: wrap the glow evenly rather than
                     // guess a leading side.
@@ -3101,19 +3347,20 @@ fn kind_mat(kind: PartKind) -> [f32; 3] {
 fn emit_model_part(
     v: &mut Vec<csp_render::flight::FlightVertex>,
     b: &FlightBody,
+    pose: &DrawnPose,
     p: &FlightPart,
     tris: &[crate::part_mesh::ModelTri],
     vp: &[[f64; 4]; 4],
     eye: DVec3,
 ) {
     for t in tris.iter() {
-        let world = [t.a, t.b, t.c].map(|q| b.pos + b.rot.rotate(p.transform.apply(q)));
+        let world = [t.a, t.b, t.c].map(|q| pose.pos + pose.rot.rotate(p.transform.apply(q)));
         let [Some(c0), Some(c1), Some(c2)] = world.map(|q| project_into(vp, eye, q)) else {
             continue;
         };
         for k in 0..3 {
             let (nrm, alb, mt) = [(t.na, t.ca, t.ma), (t.nb, t.cb, t.mb), (t.nc, t.cc, t.mc)][k];
-            let n_w = b.rot.rotate(p.transform.apply_dir(nrm));
+            let n_w = pose.rot.rotate(p.transform.apply_dir(nrm));
             let rel = world[k] - eye;
             let (color, mat) = if b.debris {
                 (
@@ -3373,6 +3620,7 @@ pub(crate) fn extract_flight(
     input: Res<FlightInput>,
     map_input: Res<MapInput>,
     snap: Res<FlightSnapshot>,
+    scene: Res<DrawnScene>,
     cam: Res<FlightCameraF64>,
     terrain_cfg: Res<TerrainConfig>,
     mut terrain_cache: ResMut<TerrainCache>,
@@ -3389,6 +3637,13 @@ pub(crate) fn extract_flight(
     if geom.vert_hint > 0 {
         packet.vertices = Vec::with_capacity(geom.vert_hint);
     }
+    // Every clock-driven quantity is taken at the drawn instant. The
+    // default scene — nothing drawn — reads as the staged snapshot at
+    // the clock's own tick.
+    let env = scene.env.as_ref().or(snap.env.as_ref());
+    let time_s = scene
+        .time_s
+        .unwrap_or_else(|| clock.0.ticks() as f64 / csp_core::TICK_HZ as f64);
     // R2 surface pass: when a physical world is present and the chase
     // camera solved, the quadtree terrain + LUT sky replace the M4c
     // gradient/disc. Without an environment the flat gradient stays —
@@ -3402,7 +3657,7 @@ pub(crate) fn extract_flight(
     let mut terrain_pending = false;
     if map_input.mode == MapMode::Flight
         && cam.0.valid
-        && let Some(env) = &snap.env
+        && let Some(env) = env
     {
         let tp = crate::terrain::build_packet(
             &terrain_cfg,
@@ -3410,7 +3665,7 @@ pub(crate) fn extract_flight(
             env,
             &cam.0,
             input.viewport_px,
-            clock.0.ticks() as f64 / csp_core::TICK_HZ as f64,
+            time_s,
         );
         terrain_pending = tp.heightfield.is_none();
         packet.terrain = Some(tp);
@@ -3476,7 +3731,7 @@ pub(crate) fn extract_flight(
     // terrain the craft rests on (the extract's `packet.terrain` gate
     // is exactly "env + solved camera + flight mode").
     if packet.terrain.is_some()
-        && let Some(env) = &snap.env
+        && let Some(env) = env
         && let Some(body) = &env.body
         && let Some(site) = sites.launch_site(body)
     {
@@ -3510,16 +3765,17 @@ pub(crate) fn extract_flight(
             s / s.norm()
         });
     // The part-lighting uniform for this frame: the staged sun plus a
-    // hemisphere ambient keyed to the focus vessel's local up — sky
+    // hemisphere ambient keyed to the lowest-id vessel's local up — sky
     // bounce above it, dim ground bounce below — so hull shading reads
     // like the scene the terrain pass draws (same sun direction).
     packet.light = {
+        let first = snap.vessels.first().map(|b| scene.pose_of(b));
         let up = snap
             .env
             .as_ref()
             .and_then(|e| {
-                snap.vessels.first().map(|b| {
-                    let d = b.com - e.body_center;
+                first.map(|p| {
+                    let d = p.com - e.body_center;
                     let l = d.norm();
                     if l > 1.0 { d / l } else { DVec3::Z }
                 })
@@ -3533,10 +3789,8 @@ pub(crate) fn extract_flight(
         // local transmittance exactly like the ground under it.
         // The base color mirrors fs_terrain's `sun_lum` ([1.0,0.98,0.92]).
         let sun_col = snap.env.as_ref().map_or([1.0, 0.98, 0.92], |e| {
-            let alt = snap
-                .vessels
-                .first()
-                .map(|b| ((b.com - e.body_center).norm() - e.radius_m).max(0.0))
+            let alt = first
+                .map(|p| ((p.com - e.body_center).norm() - e.radius_m).max(0.0))
                 .unwrap_or(0.0);
             if e.atm_top_m <= 0.0 {
                 [1.0, 0.98, 0.92] // vacuum — full sun
@@ -3563,6 +3817,7 @@ pub(crate) fn extract_flight(
         }
     };
     for b in &snap.vessels {
+        let pose = scene.pose_of(b);
         for p in b.parts.iter() {
             // C1: the part's local silhouette comes from the geometry
             // cache — `emit_smooth` re-tessellation, the livery tint
@@ -3573,7 +3828,7 @@ pub(crate) fn extract_flight(
             if let Some(m) = &p.model {
                 let (mlo, mhi) = p.shape.local_aabb();
                 let tris = geom.model_tris(m, mlo, mhi);
-                emit_model_part(v, b, p, &tris, vp, eye);
+                emit_model_part(v, b, &pose, p, &tris, vp, eye);
                 continue;
             }
             let baked = geom.smooth_tris(&p.shape, &p.shape_key, p.kind, b.debris);
@@ -3581,12 +3836,13 @@ pub(crate) fn extract_flight(
                 // A tri with any corner behind the eye plane drops
                 // whole — the same all-or-nothing rule the VAB packet
                 // uses — rather than emitting a corrupted fan.
-                let world = [t.a, t.b, t.c].map(|q| b.pos + b.rot.rotate(p.transform.apply(q)));
+                let world =
+                    [t.a, t.b, t.c].map(|q| pose.pos + pose.rot.rotate(p.transform.apply(q)));
                 let [Some(c0), Some(c1), Some(c2)] = world.map(|q| project_into(vp, eye, q)) else {
                     continue;
                 };
                 for (k, nrm) in [t.na, t.nb, t.nc].iter().enumerate() {
-                    let n_w = b.rot.rotate(p.transform.apply_dir(*nrm));
+                    let n_w = pose.rot.rotate(p.transform.apply_dir(*nrm));
                     v.push(csp_render::flight::FlightVertex {
                         pos: [c0, c1, c2][k],
                         world: f3(world[k] - eye),
@@ -3607,14 +3863,13 @@ pub(crate) fn extract_flight(
             // sea-level ones (ratio keyed to the atmosphere top).
             let expand = snap.env.as_ref().map_or(1.0, |e| {
                 if e.atm_top_m > 0.0 {
-                    let alt = ((b.com - e.body_center).norm() - e.radius_m).max(0.0);
+                    let alt = ((pose.com - e.body_center).norm() - e.radius_m).max(0.0);
                     1.0 + 1.8 * (alt / e.atm_top_m).clamp(0.0, 1.0)
                 } else {
                     2.6
                 }
             });
-            let t_s = clock.0.ticks() as f64 / csp_core::TICK_HZ as f64;
-            emit_plumes(v, vp, eye, b, expand, t_s);
+            emit_plumes(v, vp, eye, b, &pose, expand, time_s);
         }
 
         // §3.7 reentry plasma: an emissive sheath grown off the hull —
@@ -3624,10 +3879,9 @@ pub(crate) fn extract_flight(
         // `v_rel` convention) — its magnitude is also the speed the
         // C19-F1 gate reads, so the sheath can't light on a slow
         // ascent pass however dense the air.
-        let v_rel = snap
-            .env
-            .as_ref()
-            .map_or(b.vel, |e| b.vel - e.body_spin.cross(b.com - e.body_center));
+        let v_rel = snap.env.as_ref().map_or(b.vel, |e| {
+            b.vel - e.body_spin.cross(pose.com - e.body_center)
+        });
         let plasma_i = plasma_intensity(b.plasma_w_m2, v_rel.norm());
         if plasma_i > 0.0 {
             let flow = if v_rel.norm_squared() > 1.0 {
@@ -3635,15 +3889,15 @@ pub(crate) fn extract_flight(
             } else {
                 DVec3::ZERO
             };
-            emit_sheath(v, vp, eye, b, flow, plasma_i, &mut geom.sheath_tris);
+            emit_sheath(v, vp, eye, b, &pose, flow, plasma_i, &mut geom.sheath_tris);
         }
 
         // §3.7 ground-contact dust: a translucent tan ring hugging
         // the surface under the vessel's lowest hull vertex.
         if b.contact
-            && let Some(env) = snap.env.as_ref()
+            && let Some(env) = env
         {
-            let mut low = b.com;
+            let mut low = pose.com;
             let mut low_alt = f64::MAX;
             let mut extent = 1.0_f64;
             for p in b.parts.iter() {
@@ -3657,8 +3911,8 @@ pub(crate) fn extract_flight(
                     DVec3::new(p.hi.x, p.hi.y, p.hi.z),
                     DVec3::new(p.lo.x, p.hi.y, p.hi.z),
                 ] {
-                    let w = b.pos + b.rot.rotate(c);
-                    extent = extent.max((w - b.pos).norm());
+                    let w = pose.pos + pose.rot.rotate(c);
+                    extent = extent.max((w - pose.pos).norm());
                     let alt = (w - env.body_center).norm() - env.radius_m;
                     if alt < low_alt {
                         low_alt = alt;
@@ -3745,6 +3999,9 @@ mod tests {
         });
         world.insert_resource(snap);
         world.insert_resource(FlightCameraF64(cam));
+        // No interpolation has run in this rig — the extract reads the
+        // default scene as the staged snapshot itself.
+        world.insert_resource(DrawnScene::default());
         world.insert_resource(TerrainConfig::default());
         world.insert_resource(TerrainCache::default());
         // The HUD mirror the extract writes the terrain-bake wait to.
@@ -4105,7 +4362,8 @@ mod tests {
                 content.top() + (0.5 - ndc[1] * 0.5) * content.height(),
             )
         };
-        let pick = |p: egui::Pos2| pick_part(&cam, Some(&vessel), content, p);
+        let staged = DrawnPose::staged(&vessel);
+        let pick = |p: egui::Pos2| pick_part(&cam, Some((&vessel, staged)), content, p);
         // Dead center = node 1's AABB.
         assert_eq!(pick(to_screen(DVec3::ZERO)), Some(FlightPick::Part(1)));
         // Node 2's projected center is up-screen → its menu.
@@ -4127,7 +4385,7 @@ mod tests {
         assert_eq!(
             pick_part(
                 &FlightCameraF64::default(),
-                Some(&vessel),
+                Some((&vessel, staged)),
                 content,
                 to_screen(DVec3::ZERO)
             ),
@@ -4605,6 +4863,7 @@ mod tests {
             world.insert_resource(TerrainConfig::default());
             world.insert_resource(TerrainCache::default());
             world.insert_resource(FlightCameraF64::default());
+            world.insert_resource(DrawnScene::default());
             world.insert_resource(FlightUiData::default());
             world.insert_resource(FlightSfx::default());
             world.insert_resource(crate::Clock::default());
@@ -4654,6 +4913,7 @@ mod tests {
             let mut cam = FlightCameraF64::default();
             cam.0.valid = true;
             world.insert_resource(cam);
+            world.insert_resource(DrawnScene::default());
             world.insert_resource(FlightUiData::default());
             world.insert_resource(FlightSfx::default());
             world.insert_resource(crate::Clock::default());
@@ -5185,5 +5445,101 @@ mod tests {
         );
         g.model_tris(&m, lo, DVec3::new(2.0, 1.0, 1.0));
         assert_eq!(g.model_bakes, 3, "a different fit AABB bakes");
+    }
+
+    /// §2.5's pose history ages by tick, not by frame. A vessel first
+    /// seen draws at its staged pose; across a one-tick step it draws
+    /// the remainder of the way; a frame that carried several ticks
+    /// draws across the whole span; a zero-tick frame keeps closing on
+    /// the same current pose and never passes it; a clock that went
+    /// backwards, or a vessel that left and returned, starts over; and
+    /// at remainder 0 every pose is the staged one, exactly.
+    #[test]
+    fn pose_history_advances_by_tick_not_by_frame() {
+        // Origin `x` metres along +X, CoM a metre above it.
+        let body = |x: f64| FlightBody {
+            pos: DVec3::new(x, 0.0, 0.0),
+            com: DVec3::new(x, 0.0, 1.0),
+            ..bare_body(7, false)
+        };
+        let near = |a: DVec3, b: DVec3| assert!((a - b).norm() < 1e-9, "{a:?} vs {b:?}");
+        let mut h = PoseHistory::default();
+
+        let drawn = h.advance(&[body(10.0)], 100, 0.5);
+        assert_eq!(drawn, vec![DrawnPose::staged(&body(10.0))]);
+
+        // Tick 101, a quarter past it: a quarter of the 100 → 101 step.
+        let drawn = h.advance(&[body(10.4)], 101, 0.25)[0];
+        near(drawn.pos, DVec3::new(10.1, 0.0, 0.0));
+        near(drawn.com, DVec3::new(10.1, 0.0, 1.0));
+
+        // A frame that carried four ticks (×4 warp at 60 fps): the span
+        // is 101 → 105 and the drawn instant `(105 − 1) + 0.5`, so
+        // 3.5 of the 4 ticks across.
+        let drawn = h.advance(&[body(12.0)], 105, 0.5)[0];
+        near(drawn.pos, DVec3::new(10.4 + 1.6 * 0.875, 0.0, 0.0));
+
+        // A zero-tick frame: the same tick restaged, the remainder
+        // grown — still closing on tick 105's pose.
+        let drawn = h.advance(&[body(12.0)], 105, 0.75)[0];
+        near(drawn.pos, DVec3::new(10.4 + 1.6 * 0.9375, 0.0, 0.0));
+        // The largest remainder there is stops short of it — to within
+        // a rounding step of the arithmetic.
+        let drawn = h.advance(&[body(12.0)], 105, 1.0 - f64::EPSILON)[0];
+        assert!(
+            drawn.pos.x > 11.99 && drawn.pos.x <= 12.0,
+            "{}",
+            drawn.pos.x
+        );
+
+        // Remainder 0: the staged pose, bit for bit.
+        assert_eq!(
+            h.advance(&[body(12.0)], 106, 0.0)[0],
+            DrawnPose::staged(&body(12.0))
+        );
+
+        // The clock went backwards — a world restored at an earlier
+        // tick: the samples describe a discarded timeline.
+        let drawn = h.advance(&[body(3.0)], 90, 0.5)[0];
+        assert_eq!(drawn, DrawnPose::staged(&body(3.0)));
+
+        // A vessel absent for a frame has left the path.
+        assert!(h.advance(&[], 91, 0.5).is_empty());
+        let drawn = h.advance(&[body(3.1)], 92, 0.5)[0];
+        assert_eq!(drawn, DrawnPose::staged(&body(3.1)));
+    }
+
+    /// The drawn rotation is a unit rotation on the shorter arc between
+    /// its endpoints — `q` and `−q` are the same rotation, so the
+    /// negated end pose is not the long way round — exact at both ends
+    /// and half-way between them at the middle.
+    #[test]
+    fn rot_between_takes_the_shortest_arc() {
+        // The same rotation, to the last digit — whichever sign each
+        // quaternion carries.
+        let same = |a: DQuat, b: DQuat| {
+            let flip = if a.dot(b) < 0.0 { -1.0 } else { 1.0 };
+            assert!(
+                [
+                    a.x * flip - b.x,
+                    a.y * flip - b.y,
+                    a.z * flip - b.z,
+                    a.w * flip - b.w
+                ]
+                .iter()
+                .all(|d| d.abs() < 1e-12),
+                "{a:?} vs {b:?}"
+            );
+        };
+        let q0 = DQuat::from_axis_angle(DVec3::new(0.3, -0.5, 0.8), 0.4);
+        let q1 = DQuat::from_axis_angle(DVec3::new(0.3, -0.5, 0.8), 0.5);
+        let neg = DQuat::new(-q1.x, -q1.y, -q1.z, -q1.w);
+        let mid = DQuat::from_axis_angle(DVec3::new(0.3, -0.5, 0.8), 0.45);
+        for end in [q1, neg] {
+            same(rot_between(q0, end, 0.0), q0);
+            same(rot_between(q0, end, 1.0), end);
+            same(rot_between(q0, end, 0.5), mid);
+            assert!((rot_between(q0, end, 0.3).norm() - 1.0).abs() < 1e-12);
+        }
     }
 }

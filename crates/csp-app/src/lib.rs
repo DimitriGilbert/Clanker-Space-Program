@@ -9,6 +9,9 @@
 //!   target = warp.target_tick(clock, dt_wall)   // integer target
 //!   enqueue AdvanceTo(target)                   // §7.6: log is self-contained
 //!   Input → SimStep → Sync → Presentation → UiBuild → RenderExtract
+//!     (after SimStep: view.set_tick_fraction(warp.tick_fraction(reached))
+//!      — §2.5: Presentation draws each pose between its previous and
+//!      its current tick, so 60 fps over a 64 Hz sim does not hitch-step)
 //!   paint the UiBuild-produced FullOutput via egui-wgpu
 //! ```
 //!
@@ -1567,6 +1570,7 @@ impl App {
         // §2.5 order: Input → SimStep → Sync → Presentation → UiBuild →
         // RenderExtract. One sim_step call per frame, always.
         self.view.begin_frame();
+        let mut world_rebuilt = false;
         if let Some(target) = target {
             let step_start = Instant::now();
             match self.view.sim_step(target) {
@@ -1576,6 +1580,7 @@ impl App {
                     // run here; a world-replacing op discards the
                     // stale report rather than surfacing it.
                     self.run_session_op();
+                    world_rebuilt = self.world_rebuilt;
                     if self.world_rebuilt {
                         // The world under the warp controller was
                         // swapped (load/revert/new game): its banked
@@ -1612,6 +1617,7 @@ impl App {
         } else {
             self.last_tick_ms = 0.0;
         }
+        self.stage_tick_fraction(world_rebuilt);
         self.view.end_frame();
 
         // M10 audio (native only): the `FlightSfx` cue queue and the
@@ -1635,6 +1641,24 @@ impl App {
                 &self.settings.audio,
             );
         }
+    }
+
+    /// §2.5's interpolation input for the frame about to end: how far
+    /// past the tick the sim reached the warp accumulator sits — the
+    /// weight the view draws each pose between its previous and its
+    /// current tick with. Read whether or not this frame stepped: a
+    /// halted frame keeps handing over the last live remainder, so the
+    /// view holds the pose it froze on instead of jumping a tick. A
+    /// world swapped in this frame leaves the accumulator describing
+    /// the OLD world's clock — it names no fraction of the new one, so
+    /// the frame is handed none.
+    fn stage_tick_fraction(&mut self, world_rebuilt: bool) {
+        let frac = if world_rebuilt {
+            0.0
+        } else {
+            self.warp.tick_fraction(self.view.sim.clock().ticks())
+        };
+        self.view.set_tick_fraction(frac);
     }
 
     /// The Game menu / session-key verbs — drained from the outbox
@@ -6447,6 +6471,7 @@ mod tests {
                 Ok(report) => app.on_step_report(&report),
                 Err(e) => app.on_sim_fatal(e),
             }
+            app.stage_tick_fraction(false);
             app.view.end_frame();
         };
         let boot_clock = app.view.sim.clock().ticks();
@@ -6511,6 +6536,55 @@ mod tests {
         }
         app.release_edge(&shift.0, &shift.1);
         assert!(app.throttle_held.is_empty());
+    }
+
+    /// §2.5's interpolation plumbing: every frame hands the view the
+    /// warp controller's fractional tick remainder for the tick the
+    /// step reached — the weight `flight_interp` draws each pose
+    /// between its previous and its current tick with — and a frame
+    /// that swapped the world hands it none.
+    #[test]
+    fn frames_hand_the_view_their_tick_fraction() {
+        // The injected settings path, under `target/` — inside the repo.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/app-test-tick-fraction");
+        let mut app = App::new_with_settings_path(&dir.join("settings.ron"));
+        let handed = |app: &App| app.view.world.resource::<csp_view::TickFraction>().0;
+        // `run_frame`'s step → hand-off → end, at a fixed wall dt.
+        // Returns the frames that advanced two ticks and none.
+        let drive = |app: &mut App, dt: f64, frames: usize| {
+            let (mut two, mut zero) = (0, 0);
+            for _ in 0..frames {
+                let before = app.view.sim.clock().ticks();
+                let target = app.warp.target_tick(before, dt);
+                app.view.begin_frame();
+                app.view.sim_step(target).unwrap();
+                app.stage_tick_fraction(false);
+                let frac = handed(app);
+                assert!((0.0..1.0).contains(&frac), "fraction {frac} left [0, 1)");
+                assert_eq!(frac, app.warp.tick_fraction(app.view.sim.clock().ticks()));
+                app.view.end_frame();
+                match app.view.sim.clock().ticks() - before {
+                    2 => two += 1,
+                    0 => zero += 1,
+                    _ => {}
+                }
+            }
+            (two, zero)
+        };
+        // 60 fps over the 64 Hz sim: one frame in fifteen carries two
+        // ticks' worth of motion.
+        let (two, zero) = drive(&mut app, 1.0 / 60.0, 300);
+        assert!(two > 0, "300 frames at 60 fps carry two-tick frames");
+        assert_eq!(zero, 0);
+        // 240 fps: three frames in four carry none.
+        let (two, zero) = drive(&mut app, 1.0 / 240.0, 300);
+        assert_eq!(two, 0);
+        assert!(zero > 0, "300 frames at 240 fps carry zero-tick frames");
+        // A world swapped this frame: the accumulator still describes
+        // the old world's clock — no fraction of the new one exists.
+        app.stage_tick_fraction(true);
+        assert_eq!(handed(&app), 0.0);
     }
 
     /// The guard the rail-deliver must not blow through: a

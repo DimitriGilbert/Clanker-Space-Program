@@ -295,6 +295,26 @@ impl WarpController {
         target.max(current_tick)
     }
 
+    /// §2.5's frame fractional tick remainder: how far past
+    /// `reached_tick` the accumulator sits, in ticks — the weight
+    /// `Presentation` interpolates tick `reached_tick − 1` →
+    /// `reached_tick` with. Call it with the tick the last
+    /// [`Self::target_tick`]'s step actually reached, before the next
+    /// `target_tick` moves the accumulator.
+    ///
+    /// Always in `[0, 1)`: the remainder is integer nanoseconds under
+    /// one `NANOS_PER_TICK`. A clock AHEAD of the accumulator (a world
+    /// swapped under the controller) reads 0. A clock a whole tick or
+    /// more BEHIND it — the sim's per-call budget left it short of the
+    /// emitted target — is a backlog, not a fraction, and clamps to
+    /// just under 1 so the presentation still never extrapolates past
+    /// the pose the sim produced.
+    pub fn tick_fraction(&self, reached_tick: u64) -> f64 {
+        let anchor = u128::from(reached_tick) * NANOS_PER_TICK;
+        let past = self.scaled_nanos.saturating_sub(anchor);
+        past.min(NANOS_PER_TICK - 1) as f64 / NANOS_PER_TICK as f64
+    }
+
     /// §2.6.5 `Clamping` / §2.6.2 rails-refusal demotion: drop `effective`
     /// to ladder index `rung` NOW — the §2.6.3 hysteresis deliberately does
     /// not apply downward (a fired Clamping event means the player could
@@ -844,5 +864,183 @@ mod tests {
             2,
             "streaks into the gated rungs never complete"
         );
+    }
+
+    /// Drive `frames` frames of `dt` at the controller's current rung
+    /// against a modelled clock that always reaches the target, checking
+    /// the §2.5 remainder after every call: inside `[0, 1)`, and equal to
+    /// the previous leftover plus the frame's scaled time minus the ticks
+    /// the frame consumed — to the accessor's nanosecond quantum. Returns
+    /// the final clock and `(ticks advanced, fraction)` per frame.
+    fn check_fraction(c: &mut WarpController, dt: f64, frames: usize) -> (u64, Vec<(u64, f64)>) {
+        // Pick up wherever the accumulator stands (a zero-dt target is
+        // the clock it has already reached) and its leftover.
+        let mut clock = c.target_tick(0, 0.0);
+        let mut leftover = c.tick_fraction(clock);
+        let mut out = Vec::with_capacity(frames);
+        for _ in 0..frames {
+            let target = c.target_tick(clock, dt);
+            let advanced = target - clock;
+            clock = target;
+            let f = c.tick_fraction(clock);
+            assert!(
+                (0.0..1.0).contains(&f),
+                "fraction {f} left [0, 1) at tick {clock}"
+            );
+            // The controller quantizes dt once into whole nanoseconds.
+            let scaled_ticks = (dt * NANOS_PER_SEC as f64) as u64 as f64 * c.multiplier() as f64
+                / NANOS_PER_TICK as f64;
+            leftover += scaled_ticks - advanced as f64;
+            assert!(
+                (f - leftover).abs() <= 1.0 / NANOS_PER_TICK as f64,
+                "fraction {f} is not the leftover {leftover} at tick {clock}"
+            );
+            leftover = f;
+            out.push((advanced, f));
+        }
+        (clock, out)
+    }
+
+    /// §2.5's interpolation input at the ladder rungs: after every frame
+    /// — one-tick, two-tick, any-tick — the remainder stays a true
+    /// sub-tick fraction of the accumulator the target came from.
+    #[test]
+    fn tick_fraction_is_sub_tick_at_the_ladder_rungs() {
+        let mut c = WarpController::new();
+        // ×1 at 60 fps: 64 ticks per 60 frames, so one frame in fifteen
+        // carries two ticks' worth of motion — the hitch interpolation
+        // exists for.
+        let (_, x1) = check_fraction(&mut c, 1.0 / 60.0, 600);
+        let total: u64 = x1.iter().map(|&(a, _)| a).sum();
+        assert_eq!(
+            total, 639,
+            "600 frames at 1/60 s and ×1 advance 639–640 ticks"
+        );
+        assert!(x1.iter().any(|&(a, _)| a == 2), "no two-tick frame seen");
+        // Promote to ×2 (zero measured cost: every rung affordable).
+        c.request_step(1);
+        for _ in 0..=PROMOTE_FRAMES {
+            c.decide();
+        }
+        assert_eq!(c.multiplier(), 2);
+        let (_, x2) = check_fraction(&mut c, 1.0 / 60.0, 600);
+        // 1 279.9999 ticks of new time — plus the ×1 run's leftover
+        // remainder, which completes the 1 280th tick.
+        assert_eq!(x2.iter().map(|&(a, _)| a).sum::<u64>(), 1_280);
+        // ×10: the first rails rung, where frames carry 10–11 ticks.
+        c.request_step(1);
+        for _ in 0..=PROMOTE_FRAMES {
+            c.decide();
+        }
+        assert_eq!(c.multiplier(), 10);
+        let (_, x10) = check_fraction(&mut c, 1.0 / 60.0, 120);
+        assert!(x10.iter().all(|&(a, _)| (10..=11).contains(&a)));
+    }
+
+    /// The exact remainder the accessor reads for a clock sitting on the
+    /// accumulator's whole ticks — `scaled_nanos mod NANOS_PER_TICK`.
+    fn exact_remainder(c: &WarpController, clock: u64) -> f64 {
+        (c.scaled_nanos - u128::from(clock) * NANOS_PER_TICK) as f64 / NANOS_PER_TICK as f64
+    }
+
+    /// ×4 is not on `WARP_LADDER` (§2.6.2 caps physics warp at ×2 until
+    /// the per-tick cost is measured), so its accumulator states are
+    /// written by hand — the accessor reads `scaled_nanos` alone. Four to
+    /// five ticks a frame must still leave a sub-tick remainder.
+    #[test]
+    fn tick_fraction_is_sub_tick_at_x4() {
+        let mut c = WarpController::new();
+        let mut acc = 0_u128;
+        let mut clock = 0_u64;
+        for _ in 0..600 {
+            acc += u128::from((1.0 / 60.0 * NANOS_PER_SEC as f64) as u64) * 4;
+            c.scaled_nanos = acc;
+            let target = (acc * u128::from(TICK_HZ) / NANOS_PER_SEC) as u64;
+            assert!((4..=5).contains(&(target - clock)));
+            clock = target;
+            let f = c.tick_fraction(clock);
+            assert!((0.0..1.0).contains(&f), "fraction {f} left [0, 1)");
+            assert_eq!(f, exact_remainder(&c, clock));
+        }
+    }
+
+    /// Zero-tick frames: at 240 fps a frame carries 0.27 ticks, so three
+    /// frames in four advance nothing — their whole scaled time is the
+    /// remainder, which keeps growing toward the next tick. A zero-dt
+    /// frame leaves it where it was.
+    #[test]
+    fn tick_fraction_grows_through_zero_tick_frames() {
+        let mut c = WarpController::new();
+        let (clock, frames) = check_fraction(&mut c, 1.0 / 240.0, 8);
+        let advances: Vec<u64> = frames.iter().map(|(a, _)| *a).collect();
+        assert_eq!(
+            &advances[..4],
+            &[0, 0, 0, 1],
+            "the tick lands on the fourth frame"
+        );
+        assert!(
+            frames[..3].windows(2).all(|w| w[0].1 < w[1].1),
+            "the remainder must grow while no tick lands: {frames:?}"
+        );
+        let before = c.tick_fraction(clock);
+        assert_eq!(
+            c.target_tick(clock, 0.0),
+            clock,
+            "a zero-dt frame advances nothing"
+        );
+        assert_eq!(
+            c.tick_fraction(clock),
+            before,
+            "and leaves the remainder alone"
+        );
+    }
+
+    /// Past the §2.5 dt clamp: a stalled frame hands the controller the
+    /// 100 ms ceiling (`run_frame`'s `min`), which at ×1 is 6–7 ticks in
+    /// one frame — the remainder is still sub-tick on every such frame.
+    #[test]
+    fn tick_fraction_is_sub_tick_after_the_dt_clamp() {
+        let dt = 5.0_f64.min(crate::MAX_FRAME_DT);
+        assert_eq!(dt, crate::MAX_FRAME_DT, "the caller's clamp must engage");
+        let mut c = WarpController::new();
+        let (clock, frames) = check_fraction(&mut c, dt, 600);
+        assert!(frames.iter().all(|&(a, _)| (6..=7).contains(&a)));
+        // A negative dt (a clock step backwards) is clamped to zero
+        // inside the controller: nothing advances, nothing is left over.
+        let before = c.tick_fraction(clock);
+        assert_eq!(c.target_tick(clock, -0.5), clock);
+        assert_eq!(c.tick_fraction(clock), before);
+    }
+
+    /// The accessor's clamps. A clock ahead of the accumulator — a fresh
+    /// controller facing a seeded world, or a world swapped in — reads 0.
+    /// A clock a whole tick or more behind it is a backlog, not a
+    /// fraction: it reads just under 1, never 1, so nothing downstream
+    /// can extrapolate past the pose the sim produced.
+    #[test]
+    fn tick_fraction_clamps_to_the_clock() {
+        let just_under_one = (NANOS_PER_TICK - 1) as f64 / NANOS_PER_TICK as f64;
+        let fresh = WarpController::new();
+        assert_eq!(fresh.tick_fraction(4_941), 0.0);
+        let mut c = WarpController::new();
+        let (clock, _) = check_fraction(&mut c, 1.0 / 60.0, 120);
+        assert_eq!(c.tick_fraction(clock + 5), 0.0);
+        assert_eq!(c.tick_fraction(clock), exact_remainder(&c, clock));
+        assert_eq!(c.tick_fraction(clock - 1), just_under_one);
+        assert_eq!(c.tick_fraction(0), just_under_one);
+        // The real backlog: at ×10⁵ a frame accrues ~1 667 sim-s of
+        // target while a step covers at most 1 080 — the clock lags the
+        // accumulator by more than a tick every frame.
+        c.request_step(6);
+        for _ in 0..=PROMOTE_FRAMES {
+            c.decide();
+        }
+        assert_eq!(c.multiplier(), 100_000);
+        let mut lagging = 0_u64;
+        for _ in 0..120 {
+            let target = c.target_tick(lagging, 1.0 / 60.0);
+            lagging += 69_120.min(target - lagging);
+            assert_eq!(c.tick_fraction(lagging), just_under_one);
+        }
     }
 }

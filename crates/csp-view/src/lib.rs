@@ -143,6 +143,17 @@ pub use csp_ui::settings;
 #[derive(Resource, Default)]
 pub struct Clock(pub SimTime);
 
+/// The frame's fractional tick remainder — how far past [`Clock`] the
+/// frame is, in ticks, `[0, 1)`. `csp-app`'s warp controller is the one
+/// source ([`View::set_tick_fraction`], every frame); the schedules
+/// read it here and never touch the clock's fraction themselves. It is
+/// what `flight_interp` interpolates the staged poses with (§2.5). The
+/// default `0` carries no fractional time: every pose is drawn exactly
+/// as staged at the clock's tick. Presentation data only — never read
+/// by the sim, never part of any hash.
+#[derive(Resource, Default)]
+pub struct TickFraction(pub f64);
+
 /// Proof-of-life stats shown in the debug panel — written by [`sync_mirrors`]
 /// from the last [`AdvanceReport`](csp_sim::AdvanceReport), never by the sim
 /// path directly (Appendix A item 1).
@@ -525,6 +536,9 @@ struct MapUi<'w> {
 struct FlightScene<'w> {
     /// The mirrored flight scene — the pick targets.
     snap: Res<'w, flight::FlightSnapshot>,
+    /// The poses that scene is drawn at this frame — where the parts
+    /// are on screen under the solved camera.
+    drawn: Res<'w, flight::DrawnScene>,
     /// The solved chase camera — the projection.
     cam: Res<'w, flight::FlightCameraF64>,
     /// The flight-focus pin/override — the shared resolver.
@@ -754,9 +768,10 @@ fn build_ui(
             if let Some(pos) = rclick
                 && !over_ui
             {
+                let focus = scene.focus.resolve(&scene.snap.vessels);
                 let (node, open) = match flight::pick_part(
                     &scene.cam,
-                    scene.focus.resolve(&scene.snap.vessels),
+                    focus.map(|f| (f, scene.drawn.pose_of(f))),
                     ctx.content_rect(),
                     pos,
                 ) {
@@ -1733,6 +1748,15 @@ enum RevertCapture {
     Delivered,
 }
 
+/// §2.5's interpolation resources — installed with the flight view's
+/// (`View::with_sim`): the frame's fractional tick remainder, the
+/// flight view's previous-tick poses, and what the frame draws.
+fn insert_interp_resources(world: &mut World) {
+    world.insert_resource(TickFraction::default());
+    world.insert_resource(flight::PoseHistory::default());
+    world.insert_resource(flight::DrawnScene::default());
+}
+
 /// Replace the session's sim with a world rebuilt from `snapshot`,
 /// re-installing the originating world's own config channels
 /// ([`SimWorld::install_config`]) and the control engines the
@@ -1780,6 +1804,10 @@ fn rebuild_from_snapshot(
     view.world.insert_resource(flight::StagePlans::default());
     view.world.insert_resource(map::MapPlanning::default());
     view.world.insert_resource(ScriptLogMirror::default());
+    // The restored vessels' previous-tick poses belong to the replaced
+    // world — a drawn pose interpolated from them would slide the
+    // restored craft in from where the old one flew.
+    view.world.insert_resource(flight::PoseHistory::default());
     // The restored `active_vessel` becomes the session's focus: the
     // quiet flight pin (no lease re-arm — the restored record carries
     // its own leases) re-anchors the camera/HUD — a rails record
@@ -2207,6 +2235,7 @@ impl View {
 
     /// The shell around an explicit sim world — the headless/test
     /// constructor (`new` is the data-loading startup path).
+    #[allow(clippy::too_many_lines)] // a constructor: one resource insert per line, no branches
     pub fn with_sim(sim: SimWorld) -> Self {
         let mut world = World::new();
         world.insert_resource(Clock::default());
@@ -2272,6 +2301,7 @@ impl View {
         world.insert_resource(flight::FlightInputEvents::default());
         world.insert_resource(flight::FlightSyncInput::default());
         world.insert_resource(flight::FlightSnapshot::default());
+        insert_interp_resources(&mut world);
         // The non-debris vessel count across all residences — the
         // tutorial's alive-or-lost mirror (P12-F2).
         world.insert_resource(flight::LiveVesselCount::default());
@@ -2336,6 +2366,9 @@ impl View {
         presentation.add_systems((
             map::map_present,
             vab::vab_present,
+            // §2.5: the drawn poses exist before anything solves
+            // against them (the chase camera, the extract).
+            flight::flight_interp.before(flight::flight_present),
             flight::flight_present,
             // M10: the tutorial's progress observer — reads the
             // Sync-written snapshot directly, so it stays independent
@@ -2937,6 +2970,15 @@ impl View {
         let mut r = self.world.resource_mut::<flight::FlightUiData>();
         r.cpu_ms = cpu_ms;
         r.present_ms = present_ms;
+    }
+
+    /// Hand the frame its fractional tick remainder (§2.5 interpolation)
+    /// — `csp-app` calls this every frame, between the step and
+    /// [`Self::end_frame`], with its warp controller's figure for the
+    /// tick the step reached. The next `end_frame` draws every staged
+    /// pose between its previous and current tick at that fraction.
+    pub fn set_tick_fraction(&mut self, frac: f64) {
+        self.world.resource_mut::<TickFraction>().0 = frac;
     }
 
     /// Update only the §2.13 halt mirror — for the frame a `Fatal` is
