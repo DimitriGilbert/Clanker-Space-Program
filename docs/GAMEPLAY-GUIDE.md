@@ -89,7 +89,7 @@ etc.; hint bars always print the key as your layout labels it.
 
 | Input | Where | Effect |
 |---|---|---|
-| Drag | flight | Orbit the chase camera 1:1 — it turns by exactly what the pointer travels (`csp-view/src/flight.rs: FlightEvent::Orbit`); pitch stops at ±89°. Dragged below the horizon the camera rides 0.3 m above the ground, sliding along it rather than going under (1.5 m above the datum over open water), and the ground never pushes it inside the craft's minimum distance — dragged straight down, it slides along the ground toward the craft and then goes round it at exactly that distance, and zooming in never moves it back out. Over a craft that is under the ground, or sunk below the water, the camera orbits from above the surface; for a craft at least an eye distance down — the whole orbit above the surface — a drag moves it there as freely as in flight, while a shallower craft keeps only its depth of clearance and the surface still lifts the eye when it looks down |
+| Drag | flight | Orbit the chase camera 1:1 — it turns by exactly what the pointer travels (`csp-view/src/flight.rs: FlightEvent::Orbit`); pitch stops at ±89°. Dragged below the horizon the camera rides 0.3 m above the ground, sliding along it rather than going under, and the ground never pushes it inside the craft's minimum distance — dragged straight down, it slides along the ground toward the craft and then goes round it at exactly that distance, and zooming in never moves it back out. Over water the surface is no floor: the camera goes under it, down to 0.3 m above the seabed, and from below the water fills the view. Over a craft that is under the ground the camera orbits from above the ground; for a craft at least an eye distance down — the whole orbit above the ground — a drag moves it there as freely as in flight, while a shallower craft keeps only its depth of clearance and the ground still lifts the eye when it looks down |
 | Wheel | flight | Zoom: the wheel sets a distance and the camera eases to it (80 ms half-life), between 3 m (1.5 × the craft's size for a big one) and 1,000 km (`FlightEvent::Zoom`) |
 | Drag / RMB or MMB drag / wheel | map | Orbit / pan / zoom-to-cursor; **click** a marker to focus (`csp-ui/src/lib.rs: map_overlay` hint bar) |
 | Click / drag / RMB | VAB | Select part / lift-to-move / remove hovered subtree; drop a lifted part on the palette to delete (`csp-ui/src/vab.rs: vab_pointer_input`) |
@@ -291,6 +291,10 @@ click-to-focus, `Tab` cycles focus (`csp-view/src/map.rs`). Two planning windows
   canister's situation mask (49) does **not** include `Splashed` — recover a floater or
   transmit from it instead of running the canister (`csp-phys/src/water.rs`,
   `SimWorld::splashed`).
+  **You can see it** (sub-phase 4.2): a craft in the water shows through the surface, fading
+  with the water before it, red first — 15 m of water leaves a hundredth of the red, 92 m a
+  hundredth of the green, 230 m a hundredth of the blue — and the camera follows it under the
+  surface, down to 0.3 m above the seabed.
 - **Recovery**: land — or come to rest on the water — the vessel becomes **latched** — then **RECOVER VESSEL**
   (Actions strip, Program → SCIENCE, or right-click menu). Payout: **part value** at site
   efficiency (1.0 at the launch pad, 0.9 at other sites, 0.25 remote salvage), **resource

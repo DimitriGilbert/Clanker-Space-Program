@@ -10,11 +10,12 @@
 //! a focus change near or far moves the eye by no more than one step of
 //! its travel and leaves the orbit angles alone; a loaded world is a
 //! first focus for the camera, never a travel. A craft buried in the
-//! ground or flooded under the ocean's floor is orbited from an anchor
-//! lifted over it, the camera looking at the craft — a craft at least an
-//! eye distance down so that every drag moves the eye as freely as in
-//! flight; a focus change from such a craft moves nothing on its first
-//! frame, and a loaded one is a first focus too. Dragged straight down to
+//! ground is orbited from an anchor lifted over it, the camera looking at
+//! the craft — a craft at least an eye distance down so that every drag
+//! moves the eye as freely as in flight; a focus change from such a craft
+//! moves nothing on its first frame, and a loaded one is a first focus
+//! too. A craft in the water is orbited from its own CoM: the surface is
+//! no floor, and the eye goes under it, down to 0.3 m over the seabed. Dragged straight down to
 //! the ground, the eye never comes inside the craft's least distance: it
 //! goes round the craft on the floor at exactly that distance, and
 //! zooming in never backs it away from the craft. A focus travel whose
@@ -58,9 +59,6 @@ const TRAVEL_SETTLE_S: f64 = 0.5;
 /// The eye's clearance over the ground (m) — `flight.rs:
 /// EYE_GROUND_CLEARANCE_M`.
 const EYE_GROUND_CLEARANCE_M: f64 = 0.3;
-/// The eye's clearance over the ocean datum in open water (m) —
-/// `flight.rs: EYE_WATER_CLEARANCE_M`.
-const EYE_WATER_CLEARANCE_M: f64 = 1.5;
 /// The orbit pitch limit (rad) — `flight.rs: PITCH_LIMIT`.
 const PITCH_LIMIT: f64 = 89.0 * std::f64::consts::PI / 180.0;
 /// The chase camera's vertical FOV (rad) — `flight.rs: FLIGHT_FOV_Y`.
@@ -76,9 +74,9 @@ const ZOOM_LN_PER_LINE: f64 = 0.18;
 
 /// A 600 km vacuum body turning once an hour, centred on the bubble
 /// origin. Its ground is the bare datum (no relief), so the camera's
-/// floor is exactly the clearance over it — 0.3 m over the surface, or
-/// 1.5 m over the ocean's datum for a flooded one — whether or not the
-/// background heightfield bake has landed.
+/// floor is exactly the clearance over it — 0.3 m over the surface, the
+/// seabed included — whether or not the background heightfield bake has
+/// landed.
 const R_M: f64 = 6.0e5;
 const MU: f64 = 3.5316e12;
 const SPIN_RAD_S: f64 = 2.0 * std::f64::consts::PI / 3600.0;
@@ -170,7 +168,8 @@ fn quiet_view() -> View {
 }
 
 /// The same body under a 6.2 m ocean with its surface on the datum:
-/// the camera's floor is the ocean's, 1.5 m over the datum.
+/// the camera's floor is the seabed's, 0.3 m over it — 5.9 m under the
+/// surface.
 fn flooded_view() -> View {
     body_view(R_M - 6.2, Some(R_M), SPIN_RAD_S)
 }
@@ -1385,23 +1384,23 @@ fn a_buried_crafts_eye_crosses_the_floor_without_a_step() {
     );
 }
 
-/// A craft FLOODED: its CoM 3 m under the ocean's datum, 4.5 m under the
-/// datum floor. With the anchor on the CoM no orbit point clears that
-/// floor, and a vertical drag at the craft's level is dead — a 2 px drag
-/// moved the eye 0.5 mm where a free frame moves 0.104 m. The anchor is
-/// lifted 4.5 + 4.5 m over the CoM instead, 4.5 m over the water: through
-/// the real input path the eye is the intent's orbit point about it, the
-/// camera looks at the craft under the water, and a 0.01 rad drag at
-/// pitch 0, and from ±0.01 rad, moves the eye the full step.
+/// A craft IN THE WATER: its CoM 3 m under the ocean's surface, where
+/// the water is 6.2 m deep — 2.9 m over the seabed's floor. The surface
+/// is no floor: through the real input path the anchor is the CoM, the
+/// eye is the intent's orbit point about it — 3 m under the surface at
+/// pitch 0 — and the camera looks at the craft; a 0.01 rad drag at pitch
+/// 0, and from ±0.01 rad, moves the eye the full step. Dragged straight
+/// down to the pitch limit the eye ends on the seabed's floor: 0.3 m
+/// over the bottom, 5.9 m under the surface.
 #[test]
-fn a_flooded_craft_is_orbited_from_over_the_water() {
+fn a_craft_in_the_water_is_orbited_under_the_surface() {
     let mut view = flooded_view();
     view.set_flight_viewport(VIEWPORT_PX.0, VIEWPORT_PX.1);
     spawn(&mut view, DVec3::new(R_M - 3.0, 0.0, 0.0));
     frame(&mut view);
     let id = view
         .flight_focus()
-        .expect("the flooded craft takes the focus");
+        .expect("the craft in the water takes the focus");
     for _ in 0..400 {
         still_frame(&mut view);
     }
@@ -1411,32 +1410,29 @@ fn a_flooded_craft_is_orbited_from_over_the_water() {
         com.norm(),
         R_M - 3.0,
         1.0e-2,
-        "the craft's CoM 3 m under the datum",
+        "the craft's CoM 3 m under the surface",
     );
-    let floor_r = R_M + EYE_WATER_CLEARANCE_M;
-    close(
-        floor_r - com.norm(),
-        4.5,
-        1.0e-2,
-        "…and 4.5 m under the datum floor",
-    );
+    let floor_r = R_M - 6.2 + EYE_GROUND_CLEARANCE_M;
     let (yaw, _, distance, _) = angles_and_distances(&view);
     close(distance, 4.0 * RADIUS_M, 1.0e-6, "framed at four radii");
-    let depth = floor_r - com.norm();
-    let rest = resting_anchor(com, distance, floor_r);
     close(
-        rest.norm() - floor_r,
-        depth,
+        (resting_anchor(com, distance, floor_r) - com).norm(),
+        0.0,
         1.0e-9,
-        "the anchor is not the craft's depth over the water",
+        "the anchor is not the CoM, 2.9 m over the seabed's floor",
     );
 
     let level = drag_to(&mut view, com, yaw, 0.0, floor_r);
     close(
         level.norm(),
-        (rest.norm() * rest.norm() + distance * distance).sqrt(),
+        (com.norm().powi(2) + distance * distance).sqrt(),
         1.0e-9,
-        "a level eye is not level with the anchor",
+        "a level eye is not level with the CoM",
+    );
+    assert!(
+        R_M - level.norm() > 2.99,
+        "the level eye is not some 3 m under the surface: {:.3} m",
+        R_M - level.norm()
     );
     close(
         (anchor(&shot(&view)) - com).norm(),
@@ -1452,14 +1448,36 @@ fn a_flooded_craft_is_orbited_from_over_the_water() {
         close(step, full_step(distance, 0.01), 1.0e-9, "a 0.01 rad drag");
         moved.push(step);
     }
+    let (_, now_pitch, _, _) = angles_and_distances(&view);
+    view.flight_event(FlightEvent::Orbit {
+        dyaw: 0.0,
+        dpitch: -PITCH_LIMIT - now_pitch,
+    });
+    still_frame(&mut view);
+    let bottom = shot(&view).eye;
+    close(
+        bottom.norm(),
+        floor_r,
+        1.0e-9,
+        "dragged straight down, the eye is not on the seabed's floor",
+    );
+    close(
+        R_M - bottom.norm(),
+        5.9,
+        1.0e-9,
+        "…and so not this far under the surface",
+    );
     eprintln!(
-        "flooded craft through the input path, 4.5 m under the datum floor, framed at {distance:.3} m: a 0.01 rad drag at pitch 0 / +0.01 / 0 / −0.01 \
-         moves the eye {:.4} / {:.4} / {:.4} / {:.4} m (a free eye {:.4})",
+        "craft in the water through the input path, CoM 3 m under the surface, framed at {distance:.3} m: the level eye {:.4} m under the surface; \
+         a 0.01 rad drag at pitch 0 / +0.01 / 0 / −0.01 moves the eye {:.4} / {:.4} / {:.4} / {:.4} m (a free eye {:.4}); \
+         at the pitch limit the eye is {:.3} m under the surface",
+        R_M - level.norm(),
         moved[0],
         moved[1],
         moved[2],
         moved[3],
-        full_step(distance, 0.01)
+        full_step(distance, 0.01),
+        R_M - bottom.norm(),
     );
 }
 

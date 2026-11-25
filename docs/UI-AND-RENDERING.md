@@ -503,11 +503,11 @@ the craft is. Session state only: nothing here is sim state.
   the target becomes 4 × its bounding radius, clamped to the limits, and
   the camera eases there. No snap (C19-F4).
 - **Floor.** The eye stays 0.3 m above the heightfield's surface under it —
-  `ground_radius` sampled at the eye's own ground point, `eye_floor`. Where
-  the body has an ocean the eye also keeps 1.5 m over the datum once the
-  water is 1.2 m deep, easing to the land floor across the shoreline; a dry
-  body has the terrain floor alone. The eye may sit level with or below a
-  landed or capsized craft's CoM.
+  `ground_radius` sampled at the eye's own ground point, `eye_floor`. Over
+  an ocean that surface is the seabed: the surface of the water is no
+  floor, and the eye crosses it freely, down to 0.3 m over the bottom (the
+  view from there is §7.4's "under water"). The eye may sit level with or
+  below a landed or capsized craft's CoM.
 - **The floor lifts the point, never the angles.** The eye is the intent's
   orbit point about the anchor; under the floor it is that same point
   lifted along the local up onto the floor — radially out from the body
@@ -520,8 +520,9 @@ the craft is. Session state only: nothing here is sim state.
   which the next two rules are for.
 - **Anchor.** The camera orbits the craft's *resting anchor*
   (`resting_anchor`): its drawn CoM while the craft is at or above the
-  floor. A craft `depth` under the floor — buried in the ground, sunk
-  below the ocean's — has every orbit point lifted, so its anchor rises
+  floor — afloat in an ocean no less than in flight, since that floor is
+  the seabed. A craft `depth` under the floor — buried in the ground —
+  has every orbit point lifted, so its anchor rises
   along the local up to `depth + min(depth, eye distance)` over its CoM: a
   craft at least an eye distance down is orbited from a whole eye distance
   over the floor and a drag moves the eye as freely as in flight; a
@@ -631,7 +632,11 @@ Kerbal Engineer-equivalent readouts).
 ### 5.2 VFX: plume, plasma, dust (the §3.7 floor)
 
 All emitted into the flight packet's **unlit stream** (zero normal = fragment
-passthrough, `flight.rs:2386-2418`):
+passthrough, `flight.rs:2386-2418`). Every unlit vertex carries its place
+relative to the eye: with water in front of it the fragment shader thins
+its colour by the water's transmittance over that way and hands the share
+it took to the water body (§7.4), so a plume or a dust ring under the
+surface fades with the water before it like a hull does.
 
 - **Engine plume** (`emit_plumes`, `flight.rs:2446`) — cone per live Thrust
   site, keyed to **delivered** thrust (rated_n rewritten each tick by the
@@ -642,8 +647,11 @@ passthrough, `flight.rs:2386-2418`):
   5e3…8e4 W/m² convective flux (`PLASMA_ONSET_W_M2`/`PLASMA_FULL_W_M2`,
   `flight.rs:46-48`) from the same `flow_sample` the thermal tick consumes.
   Display normalization only — lethality is the sim's temperature record.
-- **Ground-contact dust** (`flight.rs:2893-2958`) — translucent tan ring at
-  the contact point when the last step recorded contact.
+- **Ground-contact dust** (`flight.rs:2893-2958`) — translucent tan ring
+  0.3 m above the local terrain surface under the craft's lowest hull
+  vertex when the last step recorded contact. Under an ocean that surface
+  is the seabed the craft rests on: the ring stays on the bottom, seen
+  through the water, not on the surface above it.
 
 ### 5.3 Part picking (right-click menu)
 
@@ -818,20 +826,23 @@ Far-pass draw order (`csp-app/src/lib.rs:1767-1824`): terrain far
 phase (sky backdrop + far instances + far ocean) → flight far stream
 (the fallback sky). Near-pass order: map packet (Map mode) → VAB
 packet (Vab mode) → Flight mode: **near terrain → flight craft stream
-→ near ocean** (the ocean is a third, alpha-blended draw after the
-craft so water resolves over an already-rasterized hull, C11-F3).
+→ near ocean** (the ocean is a third draw after the craft, blended
+premultiplied over what is already there — the seabed, a hull — so water
+resolves over an already-rasterized hull, C11-F3; §7.4 has the rule).
 
 | Renderer | Pipelines | Notes |
 |---|---|---|
 | `MapRenderer` (`map.rs:80`) | one unlit pipeline, three meshes (bg stars / lines / markers) | no depth state — the scene pass attaches depth only in Flight/VAB |
-| `TerrainRenderer` (`terrain.rs:670`) | `terrain_pipe`, `ocean_pipe` (depth-test-only variant), `sky_pipe` (fullscreen, always-pass depth), + two depth-only shadow pipelines `vs_shadow0/1` (`shadow.rs`, 3a — see §7.4) | bind groups: group(0) = 0 uniforms, 1 heightfield R32Float, 2 transmittance LUT RGBA32Float, 3 biome slots R8Uint, 4–6 art albedo/normal arrays + water normal, 7 sampler, 8 cascade `SU` uniform; group(1) = shadow depth D2Array + comparison sampler (visible pass only — see §7.4). Since §7.2.1 there are TWO group(0) sets over the same textures — near and far uniform rows — swapped per phase; the pipelines themselves are shared |
+| `TerrainRenderer` (`terrain.rs:670`) | `terrain_pipe`, `ocean_pipe` (depth-test-only variant, premultiplied blend), `sky_pipe` (fullscreen, always-pass depth), + two depth-only shadow pipelines `vs_shadow0/1` (`shadow.rs`, 3a — see §7.4) | bind groups: group(0) = 0 uniforms, 1 heightfield R32Float, 2 transmittance LUT RGBA32Float, 3 biome slots R8Uint, 4–6 art albedo/normal arrays + water normal, 7 sampler, 8 cascade `SU` uniform; group(1) = shadow depth D2Array + comparison sampler (visible pass only — see §7.4). Since §7.2.1 there are TWO group(0) sets over the same textures — near and far uniform rows — swapped per phase; the pipelines themselves are shared |
 | `FlightRenderer` (`flight.rs:75`) | one pipeline; owns the surface-sized reverse-Z depth target | depth compare `GreaterEqual` because the fallback sky sits ON the far plane; since §7.2.1 a second vertex buffer (`far_vertices`) draws the far stream through the same pipeline in the far pass |
 | `VabRenderer` (`vab.rs:123`) | color pipeline + offscreen pick pipeline (R32Uint object-id) | `encode_pick` rasterizes + copies one pixel |
 
 Shared lighting: `PartLight` (`lib.rs:33`) — one directional sun + two-stop
 hemisphere ambient; the VAB uses the neutral studio default, flight uses the
-staged sun. Reverse-Z throughout (clear 0.0 = far, `Greater`/`GreaterEqual`
-wins).
+staged sun. Its `water` row carries the eye from the body centre and the
+ocean's surface radius (0 without an ocean): `flight.wgsl` measures the
+water in front of each fragment by it (§7.4). Reverse-Z throughout (clear
+0.0 = far, `Greater`/`GreaterEqual` wins).
 
 ### 7.2.1 The two-pass depth partition (PLAN §2.3's far-field pass)
 
@@ -997,9 +1008,9 @@ attach beside it.
 |---|---|---|
 | `map.wgsl` (48 lines) | `vs_main`/`fs_main` | Unlit map primitives; vertices pre-projected on CPU; fragment shapes quad kind 0 line / 1 disc / 2 ring / 3 glow |
 | `vab.wgsl` (111) | `vs_main`/`fs_main` + pick fragment | Per-pixel-lit editor parts (hemisphere ambient × baked occlusion, key light, Blinn specular, fresnel rim); pick writes the 1-based object id |
-| `flight.wgsl` (208) | `vs_main`/`fs_main` | Same per-pixel lighting as VAB minus pick, plus the unlit passthrough (`nrm ≈ 0`); ACES (Narkowicz) tone-map shared with terrain so lit hulls match the ground. Since 3b: the direct-sun terms multiply the cascade `sun_visibility` (a C16-F3 duplication of terrain.wgsl's receive half — no WGSL include mechanism) |
-| `flight_shadow.wgsl` (69) | `vs_shadow0`/`vs_shadow1` (3b craft cast, depth-only) | Drops the flight stream into §7.4's cascade map. A dedicated module on purpose: the cast pipelines ride a minimal group(0) (`SU` alone at binding 8), and sharing flight.wgsl left its `light`/group(1) declarations dangling against that layout, which de-registered the uniform binding on-device (the cast silently discarded — see the file header) |
-| `terrain.wgsl` (1391) | `vs_terrain`/`fs_terrain` (`:414`/`:893`), `vs_sky`/`fs_sky` (`:1132`/`:1263`), `vs_shadow0`/`vs_shadow1` (`:440`/`:448`, depth-only cascade pass; the shared displacement is `terrain_displace`, `:385`) | Quadtree terrain, ocean, and the sky/atmosphere/starfield — see §8; the shadow entry points feed §7.4's cascade map |
+| `flight.wgsl` (308) | `vs_main`/`fs_main` | Same per-pixel lighting as VAB minus pick, plus the unlit passthrough (`nrm ≈ 0`); ACES (Narkowicz) tone-map shared with terrain so lit hulls match the ground. Since 3b: the direct-sun terms multiply the cascade `sun_visibility` (a C16-F3 duplication of terrain.wgsl's receive half — no WGSL include mechanism). The water block (`water_sun`/`water_fog`/`water_path`, one text with terrain.wgsl's) absorbs every fragment behind water, the unlit ones too |
+| `flight_shadow.wgsl` (70) | `vs_shadow0`/`vs_shadow1` (3b craft cast, depth-only) | Drops the flight stream into §7.4's cascade map. A dedicated module on purpose: the cast pipelines ride a minimal group(0) (`SU` alone at binding 8), and sharing flight.wgsl left its `light`/group(1) declarations dangling against that layout, which de-registered the uniform binding on-device (the cast silently discarded — see the file header) |
+| `terrain.wgsl` (1891) | `vs_terrain`/`fs_terrain` (`:414`/`:893`), `vs_sky`/`fs_sky` (`:1132`/`:1263`), `vs_shadow0`/`vs_shadow1` (`:440`/`:448`, depth-only cascade pass; the shared displacement is `terrain_displace`, `:385`) | Quadtree terrain, ocean, and the sky/atmosphere/starfield — see §8; the shadow entry points feed §7.4's cascade map |
 | `blit.wgsl` (P1) | `vs`/`fs` | §7.2.2's render-scale upscale — one fullscreen triangle sampling the scaled resolved scene (linear) into the swapchain |
 
 All six are parse+validate gated by a unit test
@@ -1066,6 +1077,41 @@ Ocean: a second instanced batch of the same grid at the body's ocean datum
 radius, emitted only for leaf patches whose sampled heights reach the datum
 (`patch_might_hold_sea`, `csp-view/src/terrain.rs:337`); airless/oceanless
 bodies emit nothing.
+
+**Water in the view.** The ocean never turns opaque with depth: what lies
+behind its surface fades by absorption instead. `terrain.wgsl` and
+`flight.wgsl` carry one water block verbatim (kept so by
+`water_block_is_one_text_in_both_shaders`). The ocean absorbs
+`(0.30, 0.05, 0.02)` per metre of path, red, green, blue — the path that
+leaves a hundredth of each is 15 m, 92 m and 230 m — and an endless path
+converges on the water body `(0.006, 0.042, 0.115)`. A seabed or a hull
+fragment under the surface is shaded as in air, then dimmed by the sun's
+way down to it and the eye's way to it, the share each takes going to the
+water body (`water_fog`). The surface drawn over it is layers whose alpha
+is only what they keep of the pixel: the sun's glint, the shoreline foam,
+and the Fresnel reflectance of bare water — 2 % looking straight down, all
+of it toward the horizon. The ocean pipeline blends premultiplied and
+tone-maps the light the layers carry, so a thin sky reflection stays as
+dark as the same light inside a hull's own sum. Seen from 15 m up, a hull
+whose top is 3 m under over 200 m of water reads cyan: over its silhouette
+its pixels differ from the open water beside them by 95 levels on average
+(device gate `a_hull_under_water_is_seen_from_above`,
+`csp-view/tests/render_gate.rs`; the rule this replaced — alpha 0.62 to 1.0
+with the sea's depth, 1.0 from 25 m — leaves 0.0).
+
+**Under water.** The eye can be below the surface (the camera floor is the
+seabed's, §5.1). From there the surface is a mirror: within 48.8° of the
+vertical the eye sees the sky through it, the ray bent away from the
+vertical on leaving (Snell's window — `fs_sky` shades the refracted
+direction), with 2 % of the pixel reflected; past that angle nothing above
+the surface reaches the eye and the surface shows the water body alone.
+Terrain and craft take the same absorption over the eye's way to them, and
+no aerial perspective — there is no air between; the sky takes it over the
+eye's way up to the surface. The unlit streams (plumes, dust, contact
+shadows) are thinned by the transmittance of that way and give the share it
+takes to the tone-mapped water body. No march was added to the ocean shader:
+its GPU time is taken by the ignored `time_ocean` gate on the driver named
+in `CSP_GPU`.
 
 Biome tint: the authored index map only **tints** — it never moves a vertex
 (§3.0.1 decoupling). `BiomeField` slots (≤16) map through
@@ -1195,8 +1241,8 @@ forward-Z-along-travel, lit ⇔ ref ≤ stored), pinned by the
    records one additional whole-stream draw after the terrain batch —
    hulls, debris and the launch-complex structures land in the map;
    unlit vertices (sky quads, plumes, dust, contact quads — zero
-   normal, placeholder `world`) are degenerated outside the clip
-   volume so emissive geometry never casts. The vessel **blob shadow
+   normal) are degenerated outside the clip volume by that normal, so
+   emissive geometry never casts. The vessel **blob shadow
    stays** this phase (harmless overlap under the sharper craft
    shadow; removal is later polish).
 4. *Receiving*: terrain/ocean as above, and `flight.wgsl`'s own

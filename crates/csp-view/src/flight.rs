@@ -69,11 +69,9 @@ const MAX_DISTANCE_M: f64 = 1.0e6;
 const MIN_RADIUS_MULTIPLE: f64 = 1.5;
 /// A focus is framed at this multiple of its bounding radius.
 const FRAME_RADIUS_MULTIPLE: f64 = 4.0;
-/// The eye's clearance over the terrain under it (m).
+/// The eye's clearance over the terrain under it (m) — the ground on
+/// land, the seabed under an ocean, whose surface is no floor.
 const EYE_GROUND_CLEARANCE_M: f64 = 0.3;
-/// The eye's clearance over the ocean datum in open water (m). The step
-/// up from [`EYE_GROUND_CLEARANCE_M`] is taken across as much depth.
-const EYE_WATER_CLEARANCE_M: f64 = 1.5;
 /// A focus travel shorter than this (m) is done: the anchor is the
 /// focus's resting anchor exactly from that frame on.
 const TRAVEL_DONE_M: f64 = 1.0e-3;
@@ -2379,24 +2377,11 @@ fn frame_distance(radius_m: f64) -> f64 {
 }
 
 /// The least radius the eye may have where the heightfield's surface is
-/// `ground_m` from the body centre: [`EYE_GROUND_CLEARANCE_M`] over
-/// that surface. Where the body has an ocean the eye also keeps
-/// [`EYE_WATER_CLEARANCE_M`] over the datum in open water; the step up
-/// from the land floor is taken across the first
-/// `EYE_WATER_CLEARANCE_M − EYE_GROUND_CLEARANCE_M` of depth, so the
-/// floor has no cliff at the shoreline. A dry body (`None`) has the
-/// terrain floor alone: its valleys lie below the datum, and the eye
-/// follows the craft into them.
-fn eye_floor(ground_m: f64, ocean_datum_m: Option<f64>) -> f64 {
-    let land = ground_m + EYE_GROUND_CLEARANCE_M;
-    match ocean_datum_m {
-        None => land,
-        Some(datum) => land.max(
-            datum
-                + EYE_GROUND_CLEARANCE_M
-                + (datum - ground_m).min(EYE_WATER_CLEARANCE_M - EYE_GROUND_CLEARANCE_M),
-        ),
-    }
+/// `ground_m` from the body centre: [`EYE_GROUND_CLEARANCE_M`] over that
+/// surface, on land and under an ocean alike. Over water the eye goes
+/// under the surface freely, down to the clearance over the seabed.
+fn eye_floor(ground_m: f64) -> f64 {
+    ground_m + EYE_GROUND_CLEARANCE_M
 }
 
 /// The local-level frame at the camera's anchor — the basis the orbit
@@ -4314,14 +4299,15 @@ pub(crate) fn flight_camera(inputs: ChaseInputs, mut cam: ResMut<FlightCameraF64
     let env = scene.env.as_ref().or(snap.env.as_ref());
     // The floor — under the eye and under the craft: the heightfield's
     // own surface there (a point sample — `ground_radius` with no ring),
-    // plus the clearance, plus the ocean's datum floor where the body
-    // has water.
-    let ocean = env.and_then(|e| crate::terrain::ocean_datum_m(&terrain_cfg, e));
+    // plus the clearance; under an ocean that is the seabed.
     let mut floor = |dir: DVec3| match env {
-        Some(e) => eye_floor(
-            crate::terrain::ground_radius(&terrain_cfg, &mut terrain_cache, e, dir, 0.0),
-            ocean,
-        ),
+        Some(e) => eye_floor(crate::terrain::ground_radius(
+            &terrain_cfg,
+            &mut terrain_cache,
+            e,
+            dir,
+            0.0,
+        )),
         None => f64::NEG_INFINITY,
     };
     cam.0 = step_chase_camera(
@@ -5057,11 +5043,14 @@ fn f3(v: DVec3) -> [f32; 3] {
 
 /// An unlit-stream vertex — sky quads, plumes, the plasma sheath, the
 /// contact-dust ring: `nrm` ≈ 0 marks the fragment-shader passthrough
-/// so `color` lands unchanged.
-fn unlit_v(pos: [f32; 3], color: [f32; 4]) -> csp_render::flight::FlightVertex {
+/// so `color` lands unchanged, save for water in front of it, which
+/// `flight.wgsl` measures from `world_rel` — the vertex's place relative
+/// to the eye. A vertex with no place of its own (the clip-space sky
+/// quad) passes `DVec3::ZERO`: it sits at the eye, where no water lies.
+fn unlit_v(pos: [f32; 3], world_rel: DVec3, color: [f32; 4]) -> csp_render::flight::FlightVertex {
     csp_render::flight::FlightVertex {
         pos,
-        world: [0.0; 3],
+        world: f3(world_rel),
         nrm: [0.0; 3],
         color,
         mat: [0.0; 3],
@@ -5070,8 +5059,8 @@ fn unlit_v(pos: [f32; 3], color: [f32; 4]) -> csp_render::flight::FlightVertex {
 
 /// All-or-nothing emission of one world-space triangle into the
 /// clip-space stream: every corner is projected first and the tri is
-/// pushed whole or dropped whole — the same rule the part pass and
-/// the VAB packet use. A per-vertex `push` would let one behind-eye
+/// pushed whole or dropped whole — the same rule the part pass and the
+/// VAB packet use. A per-vertex `push` would let one behind-eye
 /// corner shift every later triangle in the shared unindexed
 /// `TriangleList` stream.
 fn emit_tri(
@@ -5086,8 +5075,8 @@ fn emit_tri(
     let [Some(c0), Some(c1), Some(c2)] = [a, b, c].map(|q| project_into(vp, eye, q)) else {
         return;
     };
-    for pos in [c0, c1, c2] {
-        v.push(unlit_v(pos, color));
+    for (pos, q) in [(c0, a), (c1, b), (c2, c)] {
+        v.push(unlit_v(pos, q - eye, color));
     }
 }
 
@@ -5105,8 +5094,8 @@ fn emit_tri3(
     let [Some(c0), Some(c1), Some(c2)] = [a, b, c].map(|q| project_into(vp, eye, q)) else {
         return;
     };
-    for (pos, color) in [(c0, colors[0]), (c1, colors[1]), (c2, colors[2])] {
-        v.push(unlit_v(pos, color));
+    for (pos, q, color) in [(c0, a, colors[0]), (c1, b, colors[1]), (c2, c, colors[2])] {
+        v.push(unlit_v(pos, q - eye, color));
     }
 }
 
@@ -5664,7 +5653,7 @@ pub(crate) fn extract_flight(
             ([-1.0, 1.0, 0.0], zenith),
         ];
         for (pos, color) in q {
-            packet.far_vertices.push(unlit_v(pos, color));
+            packet.far_vertices.push(unlit_v(pos, DVec3::ZERO, color));
         }
     }
     if !cam.0.valid {
@@ -5764,6 +5753,18 @@ pub(crate) fn extract_flight(
             amb_up: [0.16, 0.20, 0.27, 0.0],
             amb_dn: [0.065, 0.060, 0.055, 0.0],
             hemi: [up.x as f32, up.y as f32, up.z as f32, 0.10],
+            // The water the hull is seen through: the eye from the body
+            // centre and the ocean's surface — all zero without an
+            // environment, the surface zero without an ocean.
+            water: snap.env.as_ref().map_or([0.0; 4], |e| {
+                let eye = cam.0.eye - e.body_center;
+                [
+                    eye.x as f32,
+                    eye.y as f32,
+                    eye.z as f32,
+                    crate::terrain::ocean_datum_m(&terrain_cfg, e).unwrap_or(0.0) as f32,
+                ]
+            }),
         }
     };
     for b in &snap.vessels {
@@ -5883,10 +5884,12 @@ pub(crate) fn extract_flight(
             // (a ring sample, so the ring never hangs over an un-sampled
             // dip), not the bare datum: a datum-anchored ring buries
             // under up to `amplitude_m` of positive relief and floats
-            // over dips (P07-F2/P08-F3).
+            // over dips (P07-F2/P08-F3). Under an ocean that surface is
+            // the seabed the craft rests on: the ring stays on the
+            // bottom, seen through the water, not on the surface above.
             let floor =
                 crate::terrain::surface_floor_radius(&terrain_cfg, &mut terrain_cache, env, dir);
-            let base = env.body_center + dir * (floor.max(env.radius_m) + 0.3);
+            let base = env.body_center + dir * (floor + 0.3);
             let (t1, t2) = {
                 let a = if dir.y.abs() < 0.9 {
                     DVec3::Y
@@ -5968,18 +5971,34 @@ mod tests {
     }
 
     /// Pump the rig until the background heightfield bake lands: the
-    /// terrain packet of the first pass that carries it.
+    /// packet of the first pass that carries it.
+    fn waited_pass(
+        world: &mut bevy_ecs::world::World,
+        sched: &mut Schedule,
+    ) -> csp_render::flight::FlightPacket {
+        for _ in 0..4_000 {
+            let packet = extract_pass(world, sched);
+            if packet
+                .terrain
+                .as_ref()
+                .is_some_and(|t| t.heightfield.is_some())
+            {
+                return packet;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("the background bake never landed for the rig");
+    }
+
+    /// The rig's terrain packet once the background heightfield bake has
+    /// landed.
     fn waited_terrain(
         world: &mut bevy_ecs::world::World,
         sched: &mut Schedule,
     ) -> csp_render::terrain::TerrainPacket {
-        for _ in 0..4_000 {
-            match extract_pass(world, sched).terrain {
-                Some(terrain) if terrain.heightfield.is_some() => return terrain,
-                _ => std::thread::sleep(std::time::Duration::from_millis(5)),
-            }
-        }
-        panic!("the background bake never landed for the rig");
+        waited_pass(world, sched)
+            .terrain
+            .expect("the packet carries terrain")
     }
 
     /// One extract pass over the rig; takes the frame's packet.
@@ -7171,6 +7190,133 @@ mod tests {
         );
     }
 
+    /// A rig over an ocean: Terrin's field at its authored amplitude on a
+    /// 600 km body, the datum on the body's radius, no spin, no craft.
+    /// Returns the rig, the environment, the level frame and the radius of
+    /// the surface under +X as the extract samples it, with the bake
+    /// landed. A bevy world lends one resource out at a time, so the
+    /// cache leaves for that sample and goes straight back.
+    fn ocean_rig() -> (bevy_ecs::world::World, Schedule, FlightEnv, LevelFrame, f64) {
+        let r = 600_000.0;
+        let env = FlightEnv {
+            body_center: DVec3::ZERO,
+            radius_m: r,
+            atm_top_m: 0.0,
+            atm_scale_height_m: 0.0,
+            mu_m3_per_s2: 1.0,
+            body: Some(csp_data::BodyId::from("sea")),
+            sun_dir: DVec3::new(0.8, 0.6, 0.0),
+            spin_axis: DVec3::Z,
+            spin_phase: 0.0,
+            body_spin: DVec3::ZERO,
+        };
+        let sea = TerrainConfig {
+            bodies: std::collections::BTreeMap::from([(
+                "sea".to_owned(),
+                crate::terrain::TerrainBody {
+                    seed: 601,
+                    amplitude_m: 3_600.0,
+                    profile: csp_core::terrain::ReliefProfile::Legacy,
+                    ocean_datum_m: Some(r),
+                    biome: None,
+                },
+            )]),
+            ..TerrainConfig::default()
+        };
+        let level = level_frame(DVec3::X * r, Some(DVec3::ZERO), DVec3::Z);
+        let nowhere = chase_camera(DVec3::X * (r + 50.0), DVec3::X * r, &level, (320.0, 240.0));
+        let (mut world, mut sched) = extract_rig(
+            FlightSnapshot {
+                env: Some(env.clone()),
+                vessels: Vec::new(),
+            },
+            nowhere,
+        );
+        world.insert_resource(sea);
+        waited_pass(&mut world, &mut sched);
+        let mut cache = world
+            .remove_resource::<TerrainCache>()
+            .expect("the terrain cache is installed");
+        let cfg = world.resource::<TerrainConfig>();
+        let floor_r = crate::terrain::surface_floor_radius(cfg, &mut cache, &env, DVec3::X);
+        world.insert_resource(cache);
+        (world, sched, env, level, floor_r)
+    }
+
+    /// The ground-contact dust ring of a craft resting on the seabed sits
+    /// on the seabed — 0.3 m over it, seen through the water — not on the
+    /// ocean's surface above. A craft in contact where Terrin's field lies
+    /// deep under the datum gets its ring's every vertex 0.3 m over that
+    /// ground, as far under the surface as it is, and the vertices carry
+    /// their place relative to the eye, by which `flight.wgsl` measures
+    /// the water in front of them. Run through `extract_rig`'s real
+    /// Schedule, with the bake landed.
+    #[test]
+    fn the_dust_ring_of_a_craft_on_the_seabed_sits_on_the_seabed() {
+        let (mut world, mut sched, env, level, floor_r) = ocean_rig();
+        let r = env.radius_m;
+        assert!(
+            floor_r < r - 50.0,
+            "the scene needs a seabed: the surface under +X is {:.1} m over the datum",
+            floor_r - r
+        );
+
+        let com = DVec3::X * (floor_r + 2.0);
+        let mut body = bare_body(7, false);
+        body.pos = com;
+        body.com = com;
+        body.contact = true;
+        // The camera 12 m from the craft, looking down at it.
+        let eye = com + level.dir(0.7, 0.25) * 12.0;
+        world.insert_resource(FlightSnapshot {
+            env: Some(env),
+            vessels: vec![body],
+        });
+        world.insert_resource(FlightCameraF64(chase_camera(
+            eye,
+            com,
+            &level,
+            (320.0, 240.0),
+        )));
+        let packet = extract_pass(&mut world, &mut sched);
+        let dust = |v: &csp_render::flight::FlightVertex| {
+            v.nrm == [0.0; 3] && v.color == [0.62, 0.55, 0.42, 0.35]
+        };
+        let ring: Vec<DVec3> = packet
+            .vertices
+            .iter()
+            .filter(|v| dust(v))
+            .map(|v| {
+                eye + DVec3::new(
+                    f64::from(v.world[0]),
+                    f64::from(v.world[1]),
+                    f64::from(v.world[2]),
+                )
+            })
+            .collect();
+        assert_eq!(ring.len(), 36, "the ring is twelve fan triangles");
+        let ring_centre = DVec3::X * (floor_r + EYE_GROUND_CLEARANCE_M);
+        for p in &ring {
+            // The rim leaves the sphere's tangent: 2.6² / 2R = 5.6 μm out.
+            close(
+                p.norm(),
+                floor_r + EYE_GROUND_CLEARANCE_M,
+                1.0e-4,
+                "a ring vertex's radius: on the seabed, not the surface",
+            );
+        }
+        let on_rim = ring
+            .iter()
+            .filter(|p| ((**p - ring_centre).norm() - 2.6).abs() <= 1.0e-5)
+            .count();
+        assert_eq!(on_rim, 24, "the fan's rim: two rim corners per triangle");
+        eprintln!(
+            "dust ring on the seabed: the surface under the craft {:.1} m under the datum, the ring {:.3} m under the ocean's",
+            r - floor_r,
+            r - ring_centre.norm()
+        );
+    }
+
     // ==================== C1: extract geometry cache ================
 
     /// Raw bytes of one `repr(C)` Pod value — the packet-identity
@@ -8134,87 +8280,119 @@ mod tests {
     }
 
     /// R5: a capsized craft, its CoM 1 m up, can be viewed level — on a
-    /// dry body and on the shore of an ocean one alike, because over
-    /// land the floor is 0.3 m over the ground, not the ocean's 1.5 m
-    /// over the datum — and, 0.5 m up, from below its CoM.
+    /// dry body and at an ocean's waterline alike, because the floor is
+    /// 0.3 m over the ground — and, 0.5 m up, from below its CoM.
     #[test]
     fn a_capsized_craft_can_be_viewed_level() {
         let (anchor, level) = landed(1.0);
         let datum_ground = |_: DVec3| BODY_R;
-        for datum in [None, Some(BODY_R)] {
-            let mut shore = move |dir: DVec3| eye_floor(datum_ground(dir), datum);
-            let (view, lifted) = solve_orbit(
-                &orbit(0.0, 0.0, 10.0),
-                anchor,
-                &level,
-                DVec3::ZERO,
-                &mut shore,
-            );
-            assert!(!lifted, "nothing lifts a level eye");
-            assert_eq!(view, anchor + level.dir(0.0, 0.0) * 10.0);
-            close(view.x, anchor.x, 1.0e-9, "level with the CoM");
-            close(view.norm() - BODY_R, 1.0, 1.0e-3, "height over the ground");
-            let (below, lifted) = solve_orbit(
-                &orbit(0.0, -0.05, 10.0),
-                anchor,
-                &level,
-                DVec3::ZERO,
-                &mut shore,
-            );
-            assert!(!lifted, "nothing lifts this one either");
-            assert_eq!(below, anchor + level.dir(0.0, -0.05) * 10.0);
+        let mut shore = move |dir: DVec3| eye_floor(datum_ground(dir));
+        let (view, lifted) = solve_orbit(
+            &orbit(0.0, 0.0, 10.0),
+            anchor,
+            &level,
+            DVec3::ZERO,
+            &mut shore,
+        );
+        assert!(!lifted, "nothing lifts a level eye");
+        assert_eq!(view, anchor + level.dir(0.0, 0.0) * 10.0);
+        close(view.x, anchor.x, 1.0e-9, "level with the CoM");
+        close(view.norm() - BODY_R, 1.0, 1.0e-3, "height over the ground");
+        let (below, lifted) = solve_orbit(
+            &orbit(0.0, -0.05, 10.0),
+            anchor,
+            &level,
+            DVec3::ZERO,
+            &mut shore,
+        );
+        assert!(!lifted, "nothing lifts this one either");
+        assert_eq!(below, anchor + level.dir(0.0, -0.05) * 10.0);
+        close(
+            below.norm() - BODY_R,
+            1.0 - 10.0 * 0.05_f64.sin(),
+            1.0e-3,
+            "height over the ground, below the CoM",
+        );
+    }
+
+    /// The floor is 0.3 m over the ground: on land, at the waterline, and
+    /// under an ocean's surface, where it keeps the eye down to the
+    /// seabed. Walking the ground from 2 m above the datum to 4 m below,
+    /// the floor moves exactly as the ground does — no cliff, no ramp, at
+    /// the waterline.
+    #[test]
+    fn the_floor_is_the_ground_on_land_and_under_water() {
+        let r = BODY_R;
+        close(eye_floor(r + 40.0), r + 40.3, 1.0e-6, "land");
+        close(eye_floor(r), r + 0.3, 1.0e-6, "the waterline");
+        close(
+            eye_floor(r - 0.5),
+            r - 0.2,
+            1.0e-6,
+            "half a metre deep: under the surface",
+        );
+        close(
+            eye_floor(r - 3000.0),
+            r - 2999.7,
+            1.0e-6,
+            "3 000 m of water: 2 999.7 m under the surface",
+        );
+        for step in 0..=600 {
+            let ground = r + 2.0 - step as f64 * 0.01;
             close(
-                below.norm() - BODY_R,
-                1.0 - 10.0 * 0.05_f64.sin(),
-                1.0e-3,
-                "height over the ground, below the CoM",
+                eye_floor(ground),
+                ground + EYE_GROUND_CLEARANCE_M,
+                1.0e-9,
+                "the floor follows the ground",
             );
         }
     }
 
-    /// R5's ocean clause: over deep water the datum floor stays what it
-    /// was, 1.5 m over the datum; over land the floor is 0.3 m over the
-    /// ground. The step between them is taken across the first 1.2 m of
-    /// depth, so the floor has no cliff at the waterline.
+    /// Over water the eye goes under the surface, down to 0.3 m over the
+    /// seabed. A craft afloat with its CoM on the surface of 200 m of
+    /// water is framed at 300 m: dragged straight down, its eye is lifted
+    /// onto the seabed's floor — 199.7 m under the surface — and 30 m
+    /// under the surface at pitch −0.1 rad nothing lifts it at all. The
+    /// surface is no floor; the seabed is the land's rule.
     #[test]
-    fn the_floor_steps_from_the_datum_to_the_ground_across_the_shore() {
-        let r = BODY_R;
-        close(eye_floor(r + 40.0, Some(r)), r + 40.3, 1.0e-6, "land");
-        close(eye_floor(r, Some(r)), r + 0.3, 1.0e-6, "the waterline");
+    fn over_water_the_eye_goes_down_to_the_seabed() {
+        let com = DVec3::X * BODY_R;
+        let seabed_r = BODY_R - 200.0;
+        let frame = craft_frame(7, com, 1.0, 1000.0 / 60.0);
+        let level = level_frame(com, Some(DVec3::ZERO), DVec3::Z);
+        let seabed = |_: DVec3| seabed_r;
+        let mut floor = |dir: DVec3| eye_floor(seabed(dir));
+        let mut input = camera_at(300.0);
+        held(&mut input, 7);
+        input.yaw = 0.0;
+        input.pitch = -PITCH_LIMIT;
+        let down = step_chase_camera(&mut input, &frame, &mut floor);
         close(
-            eye_floor(r - 0.5, Some(r)),
-            r + 0.8,
-            1.0e-6,
-            "half a metre deep",
-        );
-        close(eye_floor(r - 1.2, Some(r)), r + 1.5, 1.0e-6, "1.2 m deep");
-        close(
-            eye_floor(r - 3000.0, Some(r)),
-            r + 1.5,
-            1.0e-6,
-            "deep water",
+            down.eye.norm(),
+            seabed_r + EYE_GROUND_CLEARANCE_M,
+            1.0e-9,
+            "dragged straight down, the eye is 0.3 m over the seabed",
         );
         close(
-            eye_floor(r - 3000.0, None),
-            r - 2999.7,
-            1.0e-6,
-            "a dry body",
+            BODY_R - down.eye.norm(),
+            199.7,
+            1.0e-9,
+            "…and so this far under the surface",
         );
-        // Walking the ground from 2 m above the datum to 4 m below, no
-        // centimetre of ground moves the floor by more than a centimetre.
-        let mut previous = eye_floor(r + 2.0, Some(r));
-        for step in 1..=600 {
-            let ground = r + 2.0 - step as f64 * 0.01;
-            let now = eye_floor(ground, Some(r));
-            assert!(
-                (now - previous).abs() <= 0.010_001,
-                "a cliff at ground {:.2}: {} -> {}",
-                ground - r,
-                previous - r,
-                now - r
-            );
-            previous = now;
-        }
+        input.pitch = -0.1;
+        let shallow = step_chase_camera(&mut input, &frame, &mut floor);
+        let asked = com + level.dir(0.0, -0.1) * 300.0;
+        close(
+            (shallow.eye - asked).norm(),
+            0.0,
+            1.0e-9,
+            "30 m under the surface, the eye is exactly where the angles put it",
+        );
+        assert!(
+            shallow.eye.norm() < BODY_R && shallow.eye.norm() > seabed_r + 1.0,
+            "the eye is under the surface and well over the seabed: {:.3} m under",
+            BODY_R - shallow.eye.norm()
+        );
     }
 
     /// R6 frame to frame, at 60 fps through the per-frame step, for a
@@ -9968,29 +10146,24 @@ mod tests {
         BODY_R + 0.25 * (dir.y * BODY_R - 20.0)
     }
 
-    /// A craft FLOODED at a shore: its CoM 3 m under the ocean's datum,
-    /// where the water is 5 m deep, so it sits 4.5 m under the datum floor
-    /// — 1.5 m over the water — deeper than the 3 m eye distance, and with
-    /// the anchor on the CoM no orbit point clears that floor. Through the
-    /// floor `flight_camera` builds (`eye_floor` over the ground and the
-    /// datum) the anchor is lifted 4.5 + 3 m over the CoM, 3 m over the
-    /// water, and the eye is the intent's orbit point about it: a 0.01 rad
-    /// drag at pitch 0, and from ±0.01 rad, moves it the full 0.03 m a
-    /// free eye travels — where the lifted eye moved 0.09 mm — and the
-    /// camera looks at the craft under the water.
+    /// A craft in the water at a shore: its CoM 3 m under the surface,
+    /// where the water is 5 m deep — 1.7 m over the seabed's floor. The
+    /// surface is no floor: the anchor is the CoM itself, the eye is the
+    /// intent's orbit point about it — under the water, 2 m over the
+    /// seabed — and the camera looks at the craft. A 0.01 rad drag at
+    /// pitch 0, and from ±0.01 rad, moves the eye the full 0.03 m a free
+    /// eye travels.
     #[test]
-    fn a_flooded_craft_is_orbited_from_over_the_water() {
+    fn a_craft_in_the_water_is_orbited_under_the_surface() {
         let com = DVec3::X * (BODY_R - 3.0);
         let frame = ChaseFrame {
             com,
             centre: Some(DVec3::ZERO),
             ..space_frame(7, 1.0, 1000.0 / 60.0)
         };
-        let mut shore = |dir: DVec3| eye_floor(shore_ground(dir), Some(BODY_R));
-        let water_r = BODY_R + EYE_WATER_CLEARANCE_M;
+        let mut shore = |dir: DVec3| eye_floor(shore_ground(dir));
         let level = level_frame(com, Some(DVec3::ZERO), DVec3::Z);
-        let owed =
-            |input: &FlightInput| com + level.up * 7.5 + level.dir(input.yaw, input.pitch) * 3.0;
+        let owed = |input: &FlightInput| com + level.dir(input.yaw, input.pitch) * 3.0;
         let mut input = camera_at(3.0);
         held(&mut input, 7);
         input.yaw = core::f64::consts::FRAC_PI_2;
@@ -10000,13 +10173,24 @@ mod tests {
             (first.eye - owed(&input)).norm(),
             0.0,
             1.0e-9,
-            "the eye is not the intent's orbit point, 3 m over the water",
+            "the eye is not the intent's orbit point about the CoM",
         );
         close(
             first.eye.norm(),
-            ((water_r + 3.0).powi(2) + 9.0).sqrt(),
+            ((BODY_R - 3.0).powi(2) + 9.0).sqrt(),
             1.0e-9,
-            "the eye is not 3 m over the water, 3 m out",
+            "the eye is not 3 m out, level with a CoM 3 m under the surface",
+        );
+        close(
+            BODY_R - first.eye.norm(),
+            3.0,
+            1.0e-5,
+            "the eye is not 3 m under the surface",
+        );
+        assert!(
+            first.eye.norm() > shore_ground(first.eye / first.eye.norm()),
+            "the eye is not over the seabed's floor: {:.3} m",
+            first.eye.norm() - shore_ground(first.eye / first.eye.norm())
         );
         let to_com = first.eye - com;
         let back = -DVec3::new(
@@ -10048,9 +10232,8 @@ mod tests {
             "the angles are the player's own, whole"
         );
         eprintln!(
-            "flooded craft, 4.5 m under the datum floor from 3 m: the anchor {:.1} m over the water, the eye {:.3} m from the craft at pitch 0; \
+            "craft in the water, CoM 3 m under the surface, from 3 m: the eye {:.3} m from the craft at pitch 0; \
              a 0.01 rad drag at pitch 0 / +0.01 / 0 / −0.01 moves the eye {:.4} / {:.4} / {:.4} / {:.4} m (a free eye {:.4})",
-            3.0,
             to_com.norm(),
             moved[0],
             moved[1],
@@ -10060,38 +10243,35 @@ mod tests {
         );
     }
 
-    /// The flooded craft's crossing. Zoomed out to 16 m, the anchor is
-    /// lifted 9 m over the CoM — 4.5 m over the water floor — and the eye
-    /// orbits east towards the shore, where the floor rises — `eye_floor`
-    /// stepping from the water's 1.5 m over the datum up the shore's ramp
-    /// — and dips under it below −0.287 rad, on the shore's ramp. A
-    /// pitch drag run down through that crossing and back up, 30 frames
-    /// of 0.02 rad each way, moves the eye every
-    /// frame and never by more than the drag's own step: on the floor the
-    /// eye is on it exactly, off it the intent's orbit point exactly, and
-    /// no step at either crossing.
+    /// The craft in the water, its crossing. Zoomed out to 16 m, the eye
+    /// orbits east towards the shore, where the ground rises from the
+    /// seabed up the shore's slope, and dips under that floor below
+    /// pitch 0.14. A pitch drag run down through the crossing and back
+    /// up, 30 frames of 0.02 rad each way, moves the eye every frame and
+    /// never by more than the drag's own step: on the floor the eye is on
+    /// it exactly, off it the intent's orbit point exactly, and no step
+    /// at either crossing.
     #[test]
-    fn a_flooded_crafts_eye_crosses_the_shore_without_a_step() {
+    fn a_craft_in_the_waters_eye_crosses_the_shore_without_a_step() {
         let com = DVec3::X * (BODY_R - 3.0);
         let frame = ChaseFrame {
             com,
             centre: Some(DVec3::ZERO),
             ..space_frame(7, 1.0, 1000.0 / 60.0)
         };
-        let mut shore = |dir: DVec3| eye_floor(shore_ground(dir), Some(BODY_R));
-        // 4.5 m under the floor plus min(4.5, 16) m: 9 m over the CoM.
+        let mut shore = |dir: DVec3| eye_floor(shore_ground(dir));
         let anchor = resting_anchor(com, 16.0, Some(DVec3::ZERO), &mut shore);
         close(
-            anchor.x,
-            BODY_R + 6.0,
+            (anchor - com).norm(),
+            0.0,
             1.0e-9,
-            "the anchor is not 4.5 m over the water floor",
+            "the anchor is not the CoM, 1.7 m over the seabed's floor",
         );
         let level = level_frame(anchor, Some(DVec3::ZERO), DVec3::Z);
         let mut input = camera_at(16.0);
         held(&mut input, 7);
         input.yaw = core::f64::consts::FRAC_PI_2;
-        input.pitch = 0.15;
+        input.pitch = 0.35;
         let asked = |yaw: f64, pitch: f64| anchor + level.dir(yaw, pitch) * 16.0;
         // A point's radius from the body centre and the floor along it.
         let radii = |point: DVec3, shore: &mut dyn FnMut(DVec3) -> f64| {
@@ -10137,7 +10317,7 @@ mod tests {
             }
             if (now_r < floor_r) != (was_r < was_floor_r) {
                 crossings += 1;
-                at_crossings.push((input.pitch, moved, ratio, floor_r - BODY_R));
+                at_crossings.push((input.pitch, moved, ratio));
             }
             widest = widest.max(ratio);
             narrowest = narrowest.min(ratio);
@@ -10145,27 +10325,26 @@ mod tests {
         assert_eq!(crossings, 2, "one crossing each way");
         close(
             input.pitch,
-            0.15,
+            0.35,
             1.0e-12,
             "the drag came back to where it started",
         );
-        for (_, moved, ratio, floor_over_datum) in &at_crossings {
-            close(*moved, 0.27980, 1.0e-4, "the eye's step at the crossing");
+        for (pitch, moved, ratio) in &at_crossings {
+            assert!(
+                (*pitch - 0.13).abs() < 1.0e-9 || (*pitch - 0.15).abs() < 1.0e-9,
+                "a crossing at pitch {pitch}, not beside 0.14"
+            );
+            close(*moved, 0.13271, 1.0e-4, "the eye's step at the crossing");
             close(
                 *ratio,
-                0.87439,
+                0.41471,
                 1.0e-4,
                 "the eye's share of the drag at the crossing",
             );
-            assert!(
-                *floor_over_datum > EYE_GROUND_CLEARANCE_M + 1.0
-                    && *floor_over_datum < EYE_WATER_CLEARANCE_M - 1.0e-3,
-                "the crossing left the ramp: floor {floor_over_datum} m over the datum"
-            );
         }
         eprintln!(
-            "flooded craft, 16 m eye, anchor 4.5 m over the water floor, drag 0.02 rad a frame ({drag_step:.4} m): eye/drag ratio {narrowest:.4}..={widest:.5}; \
-             crossings (pitch, moved m, ratio, floor over the datum m): {at_crossings:?}"
+            "craft in the water, 16 m eye, drag 0.02 rad a frame ({drag_step:.4} m): eye/drag ratio {narrowest:.4}..={widest:.5}; \
+             crossings (pitch, moved m, ratio): {at_crossings:?}"
         );
     }
 
@@ -10795,8 +10974,7 @@ mod tests {
     }
 
     /// The floor `flight_camera` solves against along a unit direction on
-    /// the REAL body: [`eye_floor`] over [`crate::terrain::ground_radius`]
-    /// and the ocean's datum.
+    /// the REAL body: [`eye_floor`] over [`crate::terrain::ground_radius`].
     fn floor_along(view: &mut crate::View, dir: DVec3) -> f64 {
         let env = view
             .world
@@ -10812,10 +10990,9 @@ mod tests {
             .remove_resource::<crate::terrain::TerrainCache>()
             .expect("the terrain cache is installed");
         let cfg = view.world.resource::<crate::terrain::TerrainConfig>();
-        let floor_r = eye_floor(
-            crate::terrain::ground_radius(cfg, &mut cache, &env, dir, 0.0),
-            crate::terrain::ocean_datum_m(cfg, &env),
-        );
+        let floor_r = eye_floor(crate::terrain::ground_radius(
+            cfg, &mut cache, &env, dir, 0.0,
+        ));
         view.world.insert_resource(cache);
         floor_r
     }
@@ -10823,8 +11000,7 @@ mod tests {
     /// The eye the camera owes an orbit on the REAL body: the intent's
     /// orbit point about the focus's drawn CoM, lifted radially onto
     /// `flight_camera`'s own floor — [`eye_floor`] over
-    /// [`crate::terrain::ground_radius`] and the ocean's datum — while it
-    /// is under it.
+    /// [`crate::terrain::ground_radius`] — while it is under it.
     fn owed_eye(view: &mut crate::View, focus: u64) -> DVec3 {
         let (com, env, yaw, pitch, distance_m) = {
             let scene = view.world.resource::<DrawnScene>();

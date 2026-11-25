@@ -336,6 +336,132 @@ fn star_pixels(img: &[u8], w: usize, h: usize) -> usize {
     n
 }
 
+/// The scene's 4×-multisampled color attachment, `w`×`h` — the passes
+/// draw into it and never resolve it themselves.
+fn msaa_target(device: &wgpu::Device, w: u32, h: u32, label: &'static str) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: csp_render::MSAA_SAMPLES,
+            dimension: wgpu::TextureDimension::D2,
+            format: FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+        .create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// The single-sampled color the near pass resolves into and the
+/// readback copies from, `w`×`h`.
+fn color_target(device: &wgpu::Device, w: u32, h: u32, label: &'static str) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    })
+}
+
+/// The app's FAR pass (`scene-far`) attachments: the color cleared to
+/// [`CLEAR`] in the 4× MSAA target with no resolve, and the flight
+/// renderer's shared reverse-Z depth cleared 0.0 and discarded after —
+/// the near pass clears it again before reading, so the far depths are
+/// write-only.
+fn far_attachments<'a>(
+    msaa: &'a wgpu::TextureView,
+    depth: &'a wgpu::TextureView,
+) -> (
+    wgpu::RenderPassColorAttachment<'a>,
+    wgpu::RenderPassDepthStencilAttachment<'a>,
+) {
+    (
+        wgpu::RenderPassColorAttachment {
+            view: msaa,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color {
+                    r: CLEAR[0],
+                    g: CLEAR[1],
+                    b: CLEAR[2],
+                    a: CLEAR[3],
+                }),
+                store: wgpu::StoreOp::Store,
+            },
+            depth_slice: None,
+        },
+        wgpu::RenderPassDepthStencilAttachment {
+            view: depth,
+            depth_ops: Some(wgpu::Operations {
+                load: wgpu::LoadOp::Clear(0.0),
+                store: wgpu::StoreOp::Discard,
+            }),
+            stencil_ops: None,
+        },
+    )
+}
+
+/// The app's NEAR pass (`scene`) attachments: the color loaded from the
+/// far pass and resolved into `resolve` at the end, and the same depth
+/// attachment cleared 0.0 again — the §2.3 partition (near never tests
+/// against far depths).
+fn near_attachments<'a>(
+    msaa: &'a wgpu::TextureView,
+    resolve: &'a wgpu::TextureView,
+    depth: &'a wgpu::TextureView,
+) -> (
+    wgpu::RenderPassColorAttachment<'a>,
+    wgpu::RenderPassDepthStencilAttachment<'a>,
+) {
+    (
+        wgpu::RenderPassColorAttachment {
+            view: msaa,
+            resolve_target: Some(resolve),
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Load,
+                store: wgpu::StoreOp::Store,
+            },
+            depth_slice: None,
+        },
+        wgpu::RenderPassDepthStencilAttachment {
+            view: depth,
+            depth_ops: Some(wgpu::Operations {
+                load: wgpu::LoadOp::Clear(0.0),
+                store: wgpu::StoreOp::Store,
+            }),
+            stencil_ops: None,
+        },
+    )
+}
+
+/// A scene pass over one color and one depth attachment, with no
+/// queries — the app's passes carry none.
+macro_rules! scene_pass {
+    ($label:literal, $color:expr, $depth:expr) => {
+        wgpu::RenderPassDescriptor {
+            label: Some($label),
+            color_attachments: &[Some($color)],
+            depth_stencil_attachment: Some($depth),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        }
+    };
+}
+
 /// Render one `FlightPacket` into an offscreen texture the way the
 /// app's scene pass does (clear color, reverse-Z depth, terrain then
 /// craft stream), and read the RGBA pixels back.
@@ -382,35 +508,8 @@ fn render_flight_scene_sized(
     };
     // Same target layout as the app: a 4×-multisampled color
     // attachment resolved into the single-sampled readback texture.
-    let msaa_tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("render-gate-msaa"),
-        size: wgpu::Extent3d {
-            width: w,
-            height: h,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: csp_render::MSAA_SAMPLES,
-        dimension: wgpu::TextureDimension::D2,
-        format: FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[],
-    });
-    let msaa = msaa_tex.create_view(&wgpu::TextureViewDescriptor::default());
-    let color_tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("render-gate-target"),
-        size: wgpu::Extent3d {
-            width: w,
-            height: h,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
+    let msaa = msaa_target(device, w, h, "render-gate-msaa");
+    let color_tex = color_target(device, w, h, "render-gate-target");
     let target = color_tex.create_view(&wgpu::TextureViewDescriptor::default());
     // Terrain first: the flight renderer borrows the cascade
     // resources (R1/3b) from it, mirroring the app's construction.
@@ -433,71 +532,16 @@ fn render_flight_scene_sized(
     // color, clears the depth again, and draws near terrain → craft →
     // near ocean exactly where the app does.
     {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("scene-far"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &msaa,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: CLEAR[0],
-                        g: CLEAR[1],
-                        b: CLEAR[2],
-                        a: CLEAR[3],
-                    }),
-                    store: wgpu::StoreOp::Store,
-                },
-                depth_slice: None,
-            })],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: flight.depth_view(),
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(0.0),
-                    // The near pass clears again before reading — the
-                    // far depths are write-only (store discarded, the
-                    // app's far pass mirrored exactly).
-                    store: wgpu::StoreOp::Discard,
-                }),
-                stencil_ops: None,
-            }),
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
+        let (color, depth) = far_attachments(&msaa, flight.depth_view());
+        let mut pass = encoder.begin_render_pass(&scene_pass!("scene-far", color, depth));
         if let Some(tp) = &packet.terrain {
             terrain.draw_far(&mut pass, device, queue, tp);
         }
         flight.draw_far(&mut pass, device, queue, packet);
     }
     {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("scene"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &msaa,
-                resolve_target: Some(&target),
-                ops: wgpu::Operations {
-                    // The far pass owns the frame's clear; this pass
-                    // composites over its samples.
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                },
-                depth_slice: None,
-            })],
-            // Same attachment as the app: the flight renderer's shared
-            // reverse-Z target, cleared 0.0 (far) again — the §2.3
-            // partition (near never tests against far depths).
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: flight.depth_view(),
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(0.0),
-                    store: wgpu::StoreOp::Store,
-                }),
-                stencil_ops: None,
-            }),
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
+        let (color, depth) = near_attachments(&msaa, &target, flight.depth_view());
+        let mut pass = encoder.begin_render_pass(&scene_pass!("scene", color, depth));
         // The app's near-pass draw order: near terrain, craft vertex
         // stream, then the depth-test-only near ocean over both. The
         // sky and far instances drew in the far pass above.
@@ -1648,141 +1692,219 @@ fn terrin_scene_assets() -> (
     (field, amplitude, biome, art)
 }
 
-/// `dump_surface`'s scene core, parameterized: hand-builds the
-/// TERRAIN-ONLY surface `FlightPacket` at an arbitrary vantage
-/// (lat/lon deg, alt m, pitch rad below the local horizon, heading
-/// rad) with the same public builders the extract uses — §2.3's
-/// near/far routing included. No craft, no launch complex (the
-/// hand-built path never runs `emit_launch_complex`).
-#[allow(clippy::too_many_lines)]
-// one scene recipe shared by the dump and the gate test
-// One scene recipe shared by the dump and the gate — the parameter
-// list IS the scene; a config struct would just rename it.
-#[allow(clippy::too_many_arguments)]
-fn surface_probe_packet(
-    lat_deg: f64,
-    lon_deg: f64,
-    alt_m: f64,
-    pitch_down: f64,
-    heading_rad: f64,
-    amplitude_m: f64,
-    field: csp_render::terrain::HeightField,
-    biome: Option<std::sync::Arc<csp_render::terrain::BiomeField>>,
-    art: std::sync::Arc<csp_render::terrain::TerrainArt>,
-) -> csp_render::flight::FlightPacket {
-    use csp_core::DVec3;
-    let lat = lat_deg.to_radians();
-    let lon = lon_deg.to_radians();
-    let r_body = 600_000.0;
-    // Surface direction under the eye.
-    let (slat, clat) = lat.sin_cos();
-    let (slon, clon) = lon.sin_cos();
-    let dir = DVec3::new(clat * clon, clat * slon, slat);
-    let h_here = field.sample_dir(dir) * amplitude_m;
-    let eye_rel = dir * (r_body + h_here.max(0.0) + alt_m);
+/// The hand-built probes' body: Terrin's bare 600 km sphere.
+const R_BODY_M: f64 = 600_000.0;
+/// The probes' camera: the chase camera's FOV over the gate's viewport.
+const PROBE_FOV_Y: f64 = 0.9;
+const PROBE_ASPECT: f64 = W as f64 / H as f64;
 
-    // Camera basis: look `pitch_down` below the local horizon toward
-    // `heading` (0 = north, clockwise).
-    let up = dir;
-    let east0 = DVec3::Z.cross(up);
-    let east = if east0.norm_squared() > 1e-12 {
-        east0 / east0.norm()
-    } else {
-        DVec3::X
-    };
-    let north = up.cross(east);
-    let fwd_h = north * heading_rad.cos() + east * heading_rad.sin();
-    let fwd = (up * (-pitch_down.sin()) + fwd_h * pitch_down.cos()) / 1.0;
-    let z_out = -fwd;
-    let right0 = up.cross(z_out);
-    let right = if right0.norm_squared() > 1e-12 {
-        right0 / right0.norm()
-    } else {
-        east
-    };
-    let upv = z_out.cross(right);
-    let view = [
-        [right.x, right.y, right.z, 0.0],
-        [upv.x, upv.y, upv.z, 0.0],
-        [z_out.x, z_out.y, z_out.z, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-    ];
-    let aspect = f64::from(W) / f64::from(H);
-    let fovy = 0.9f64;
-    let f = 1.0 / (fovy * 0.5).tan();
-    let proj = [
-        [f / aspect, 0.0, 0.0, 0.0],
-        [0.0, f, 0.0, 0.0],
-        [0.0, 0.0, 0.0, 0.1],
-        [0.0, 0.0, -1.0, 0.0],
-    ];
-    let mut view_proj = [[0.0f64; 4]; 4];
-    for r in 0..4 {
-        for c in 0..4 {
-            view_proj[r][c] = proj[r][0] * view[0][c]
-                + proj[r][1] * view[1][c]
-                + proj[r][2] * view[2][c]
-                + proj[r][3] * view[3][c];
+/// The hand-built probes' camera at the surface point `(lat_deg,
+/// lon_deg)`: the eye `alt_m` over it — over the datum where the relief
+/// is below it, so a negative `alt_m` is under an ocean's surface —
+/// looking `pitch_down` below the local horizon toward `heading` (0 =
+/// north, clockwise). Body-centred vectors.
+struct ProbeFrame {
+    /// The eye relative to the body centre.
+    eye_rel: csp_core::DVec3,
+    /// The eye's `alt_m`.
+    alt_m: f64,
+    /// Local up — the radial at the surface point.
+    up: csp_core::DVec3,
+    /// Local east.
+    east: csp_core::DVec3,
+    /// Local north.
+    north: csp_core::DVec3,
+    /// View forward.
+    fwd: csp_core::DVec3,
+    /// Camera axes as view rows (right, up, back).
+    view: [[f64; 4]; 4],
+    /// `(world − eye) → clip`, row-major, reverse-Z.
+    view_proj: [[f64; 4]; 4],
+}
+
+impl ProbeFrame {
+    fn new(lat_deg: f64, lon_deg: f64, alt_m: f64, pitch_down: f64, heading_rad: f64) -> Self {
+        use csp_core::DVec3;
+        let lat = lat_deg.to_radians();
+        let lon = lon_deg.to_radians();
+        // Surface direction under the eye.
+        let (slat, clat) = lat.sin_cos();
+        let (slon, clon) = lon.sin_cos();
+        let up = DVec3::new(clat * clon, clat * slon, slat);
+        let eye_rel = up * (R_BODY_M + alt_m);
+
+        // Camera basis: look `pitch_down` below the local horizon toward
+        // `heading` (0 = north, clockwise).
+        let east0 = DVec3::Z.cross(up);
+        let east = if east0.norm_squared() > 1e-12 {
+            east0 / east0.norm()
+        } else {
+            DVec3::X
+        };
+        let north = up.cross(east);
+        let fwd_h = north * heading_rad.cos() + east * heading_rad.sin();
+        let fwd = (up * (-pitch_down.sin()) + fwd_h * pitch_down.cos()) / 1.0;
+        let z_out = -fwd;
+        let right0 = up.cross(z_out);
+        let right = if right0.norm_squared() > 1e-12 {
+            right0 / right0.norm()
+        } else {
+            east
+        };
+        let upv = z_out.cross(right);
+        let view = [
+            [right.x, right.y, right.z, 0.0],
+            [upv.x, upv.y, upv.z, 0.0],
+            [z_out.x, z_out.y, z_out.z, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let f = 1.0 / (PROBE_FOV_Y * 0.5).tan();
+        let proj = [
+            [f / PROBE_ASPECT, 0.0, 0.0, 0.0],
+            [0.0, f, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.1],
+            [0.0, 0.0, -1.0, 0.0],
+        ];
+        let mut view_proj = [[0.0f64; 4]; 4];
+        for r in 0..4 {
+            for c in 0..4 {
+                view_proj[r][c] = proj[r][0] * view[0][c]
+                    + proj[r][1] * view[1][c]
+                    + proj[r][2] * view[2][c]
+                    + proj[r][3] * view[3][c];
+            }
+        }
+        Self {
+            eye_rel,
+            alt_m,
+            up,
+            east,
+            north,
+            fwd,
+            view,
+            view_proj,
         }
     }
-    // Rebuild the packet through the same builder extract_flight uses —
-    // but it is crate-private, so replicate its uniform/instance steps
-    // with the public pieces.
-    let leaves = csp_render::terrain::select_patches(
-        eye_rel,
-        r_body,
-        amplitude_m,
-        &csp_render::terrain::LodConfig::default(),
-    );
-    let (terrain_inst, terrain_far_start, ocean_inst, ocean_far_start) =
-        routed_surface_instances(&leaves, eye_rel, fwd, r_body, amplitude_m, &field);
+
+    /// Where a body-centred point lands: its clip position, or `None`
+    /// behind the eye — `csp-view`'s `project_into`, which the tests
+    /// cannot reach.
+    fn project(&self, world: csp_core::DVec3) -> Option<[f32; 3]> {
+        let rel = world - self.eye_rel;
+        let m = &self.view_proj;
+        let clip = [
+            m[0][0] * rel.x + m[0][1] * rel.y + m[0][2] * rel.z + m[0][3],
+            m[1][0] * rel.x + m[1][1] * rel.y + m[1][2] * rel.z + m[1][3],
+            m[2][0] * rel.x + m[2][1] * rel.y + m[2][2] * rel.z + m[2][3],
+            m[3][0] * rel.x + m[3][1] * rel.y + m[3][2] * rel.z + m[3][3],
+        ];
+        (clip[3] > 1.0e-6).then(|| {
+            [
+                (clip[0] / clip[3]) as f32,
+                (clip[1] / clip[3]) as f32,
+                (clip[2] / clip[3]) as f32,
+            ]
+        })
+    }
+}
+
+/// The hand-built probes' near uniform row — what `build_packet` bakes
+/// for the probe's camera, rebuilt with the public pieces.
+fn probe_uniforms(
+    frame: &ProbeFrame,
+    amplitude_m: f64,
+    biome: Option<&std::sync::Arc<csp_render::terrain::BiomeField>>,
+    art: &std::sync::Arc<csp_render::terrain::TerrainArt>,
+) -> csp_render::terrain::TerrainUniforms {
+    let tan_y = (PROBE_FOV_Y * 0.5).tan();
     // view_rot columns = camera axes (sky_view_rot convention).
     let mut view_rot = [[0.0f32; 4]; 4];
-    for c in 0..3 {
-        view_rot[0][c] = view[0][c] as f32;
-        view_rot[1][c] = view[1][c] as f32;
-        view_rot[2][c] = view[2][c] as f32;
+    for (rot, row) in view_rot.iter_mut().zip(&frame.view) {
+        for (to, from) in rot.iter_mut().zip(row).take(3) {
+            *to = *from as f32;
+        }
     }
-    let tan_y = (fovy * 0.5).tan();
-    let eye_r2 = eye_rel.norm_squared();
-    let r_top = r_body + 70_000.0;
+    let eye_r2 = frame.eye_rel.norm_squared();
+    let r_top = R_BODY_M + 70_000.0;
     let mut biome_colors = [[0.0f32; 4]; 16];
     if let Some(b) = &biome {
         biome_colors = b.colors;
     }
-    let near_uniforms = csp_render::terrain::TerrainUniforms {
+    csp_render::terrain::TerrainUniforms {
         view_proj: {
             let mut o = [[0.0f32; 4]; 4];
-            for r in 0..4 {
-                for c in 0..4 {
-                    o[c][r] = view_proj[r][c] as f32;
+            for (c, col) in o.iter_mut().enumerate() {
+                for (r, to) in col.iter_mut().enumerate() {
+                    *to = frame.view_proj[r][c] as f32;
                 }
             }
             o
         },
         view_rot,
-        eye_rel_body: [eye_rel.x as f32, eye_rel.y as f32, eye_rel.z as f32, 0.0],
+        eye_rel_body: [
+            frame.eye_rel.x as f32,
+            frame.eye_rel.y as f32,
+            frame.eye_rel.z as f32,
+            0.0,
+        ],
         sun_dir: [-1.0, 0.0, 0.0, 0.0],
-        planet: [r_body as f32, 70_000.0, r_body as f32, amplitude_m as f32],
+        planet: [
+            R_BODY_M as f32,
+            70_000.0,
+            R_BODY_M as f32,
+            amplitude_m as f32,
+        ],
         atmo: [
             5_600.0,
             if biome.is_some() { 1.0 } else { 0.0 },
-            alt_m as f32,
+            frame.alt_m as f32,
             0.0,
         ],
         misc: [
-            (tan_y * aspect) as f32,
+            (tan_y * PROBE_ASPECT) as f32,
             tan_y as f32,
             (eye_r2 - r_top * r_top) as f32,
-            (eye_r2 - r_body * r_body) as f32,
+            (eye_r2 - R_BODY_M * R_BODY_M) as f32,
         ],
         spin: [0.0, 0.0, 1.0, 0.0],
         rayleigh: [5.8e-6, 13.5e-6, 33.1e-6, 0.0],
         biome_colors,
         shadow: [0.0; 4],
         art: [1.0, 0.0, 0.0, 0.0],
-        class_means: test_means(&art),
-    };
+        class_means: test_means(art),
+    }
+}
+
+/// The hand-built probes' TERRAIN-ONLY surface `FlightPacket` seen
+/// through `frame`, with the same public builders the extract uses —
+/// §2.3's near/far routing included. No craft, no launch complex (the
+/// hand-built path never runs `emit_launch_complex`); no vessel blob.
+fn probe_packet(
+    frame: &ProbeFrame,
+    amplitude_m: f64,
+    field: csp_render::terrain::HeightField,
+    biome: Option<std::sync::Arc<csp_render::terrain::BiomeField>>,
+    art: std::sync::Arc<csp_render::terrain::TerrainArt>,
+) -> csp_render::flight::FlightPacket {
+    use csp_core::DVec3;
+    // Rebuild the packet through the same builder extract_flight uses —
+    // but it is crate-private, so replicate its uniform/instance steps
+    // with the public pieces.
+    let leaves = csp_render::terrain::select_patches(
+        frame.eye_rel,
+        R_BODY_M,
+        amplitude_m,
+        &csp_render::terrain::LodConfig::default(),
+    );
+    let (terrain_inst, terrain_far_start, ocean_inst, ocean_far_start) = routed_surface_instances(
+        &leaves,
+        frame.eye_rel,
+        frame.fwd,
+        R_BODY_M,
+        amplitude_m,
+        &field,
+    );
+    let near_uniforms = probe_uniforms(frame, amplitude_m, biome.as_ref(), &art);
     let packet = csp_render::terrain::TerrainPacket {
         uniforms: near_uniforms,
         // §2.3 far row — the same FULL-CLONE + one-row swap
@@ -1793,7 +1915,7 @@ fn surface_probe_packet(
         // nothing; the full clone is the load-bearing part, pinned by
         // `far_uniforms_are_exactly_the_clip_z_row_swap`).
         uniforms_far: {
-            let mut far_vp = view_proj;
+            let mut far_vp = frame.view_proj;
             far_vp[2] = [0.0, 0.0, 0.0, csp_render::flight::FAR_SPLIT_M];
             let mut o = [[0.0f32; 4]; 4];
             for r in 0..4 {
@@ -1808,7 +1930,7 @@ fn surface_probe_packet(
         heightfield: Some(std::sync::Arc::new(field)),
         biome,
         atmo: Some(csp_render::terrain::AtmoDesc {
-            radius_m: r_body,
+            radius_m: R_BODY_M,
             top_m: 70_000.0,
             scale_height_m: 5_600.0,
         }),
@@ -1827,14 +1949,14 @@ fn surface_probe_packet(
         // (basis: the `fwd`/`dir` it already built; sun [−1,0,0]).
         shadow: {
             let sun = DVec3::new(-1.0, 0.0, 0.0);
-            if csp_view::flight::cascades_armed(sun, dir) {
+            if csp_view::flight::cascades_armed(sun, frame.up) {
                 csp_render::shadow::solve_cascades(
                     &csp_render::shadow::ShadowCamera {
                         sun_dir: sun,
-                        forward: fwd,
-                        up: dir,
-                        fov_y: fovy,
-                        aspect,
+                        forward: frame.fwd,
+                        up: frame.up,
+                        fov_y: PROBE_FOV_Y,
+                        aspect: PROBE_ASPECT,
                         near_m: 0.1,
                     },
                     &csp_render::shadow::CascadeConfig::default(),
@@ -1846,6 +1968,42 @@ fn surface_probe_packet(
         },
         ..Default::default()
     }
+}
+
+/// `dump_surface`'s scene core, parameterized: the probe packet at an
+/// arbitrary vantage (lat/lon deg, alt m over the higher of relief and
+/// datum, pitch rad below the local horizon, heading rad).
+// One scene recipe shared by the dump and the gate — the parameter
+// list IS the scene; a config struct would just rename it.
+#[allow(clippy::too_many_arguments)]
+fn surface_probe_packet(
+    lat_deg: f64,
+    lon_deg: f64,
+    alt_m: f64,
+    pitch_down: f64,
+    heading_rad: f64,
+    amplitude_m: f64,
+    field: csp_render::terrain::HeightField,
+    biome: Option<std::sync::Arc<csp_render::terrain::BiomeField>>,
+    art: std::sync::Arc<csp_render::terrain::TerrainArt>,
+) -> csp_render::flight::FlightPacket {
+    let (slat, clat) = lat_deg.to_radians().sin_cos();
+    let (slon, clon) = lon_deg.to_radians().sin_cos();
+    let dir = csp_core::DVec3::new(clat * clon, clat * slon, slat);
+    let h_here = field.sample_dir(dir) * amplitude_m;
+    probe_packet(
+        &ProbeFrame::new(
+            lat_deg,
+            lon_deg,
+            h_here.max(0.0) + alt_m,
+            pitch_down,
+            heading_rad,
+        ),
+        amplitude_m,
+        field,
+        biome,
+        art,
+    )
 }
 
 /// §2.3's split-ring regression gate (the routing blocker's pin): an
@@ -2230,6 +2388,550 @@ fn dump() {
         out.extend_from_slice(&px[..3]);
     }
     std::fs::write("/tmp/frame.ppm", &out).unwrap();
+}
+
+/// A surfaceless device on the first adapter whose name contains
+/// `needle` — a driver taken BY NAME, where [`headless_device`] prefers
+/// the CPU one. Timestamp queries inside render passes are requested:
+/// [`ocean_draw_ns`] is what this is for. `None` when no adapter matches
+/// or it has no timestamp queries.
+fn device_on(needle: &str) -> Option<(wgpu::Device, wgpu::Queue, String)> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::PRIMARY,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let wanted = needle.to_ascii_uppercase();
+    let adapter = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::PRIMARY))
+        .into_iter()
+        .find(|a| a.get_info().name.to_ascii_uppercase().contains(&wanted))?;
+    let name = adapter.get_info().name;
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("render-gate-timed"),
+        required_features: wgpu::Features::TIMESTAMP_QUERY
+            | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES,
+        required_limits: wgpu::Limits::default(),
+        ..Default::default()
+    }))
+    .ok()?;
+    Some((device, queue, name))
+}
+
+/// The size the ocean's GPU time is taken at — 1080p at scene scale 1.0.
+const TIMED_W: u32 = 1920;
+const TIMED_H: u32 = 1080;
+/// Frames recorded per scene, frames in one submission, and the frames
+/// at the head of a recording that are dropped before the statistics
+/// (the first submissions carry the pipelines' warm-up). One long
+/// submission runs past the kernel driver's hang timeout and costs the
+/// context.
+const TIMED_FRAMES: usize = 128;
+const TIMED_BATCH: usize = 4;
+const TIMED_WARMUP: usize = 8;
+
+/// The GPU time of three stretches of `packet`'s frame per recorded
+/// frame, in nanoseconds — `[near ocean, far ocean, near terrain with
+/// the craft stream]` — the warm-up frames dropped. The frame is the
+/// app's (shadow, far pass, near pass) through the shipped renderers at
+/// [`TIMED_W`]×[`TIMED_H`]. A timestamp pair brackets each stretch, so
+/// nothing else is counted; the far pass is recorded in two halves (the
+/// sky and far terrain, then the far ocean alone through the same
+/// `draw_far`) because the far ocean otherwise shares its call with them. The draw
+/// order inside each pass is the app's either way. The terrain's time
+/// rides along for comparison: the water's absorption is its work too.
+fn ocean_draw_ns(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    packet: &csp_render::flight::FlightPacket,
+) -> Vec<[f64; 3]> {
+    const STAMPS: usize = 5;
+    let tp = packet.terrain.as_ref().expect("a terrain packet");
+    let mut sky_and_far_terrain = tp.clone();
+    sky_and_far_terrain.ocean.clear();
+    sky_and_far_terrain.ocean_far_start = 0;
+    let mut far_ocean = tp.clone();
+    far_ocean.terrain.clear();
+    far_ocean.terrain_far_start = 0;
+    far_ocean.sky = false;
+
+    let msaa = msaa_target(device, TIMED_W, TIMED_H, "render-gate-timed-msaa");
+    let color = color_target(device, TIMED_W, TIMED_H, "render-gate-timed-target")
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    // Terrain first: the flight renderer borrows the cascade
+    // resources from it, mirroring the app's construction.
+    let mut terrain = csp_render::terrain::TerrainRenderer::new(device, FORMAT);
+    let mut flight =
+        csp_render::flight::FlightRenderer::new(device, FORMAT, (TIMED_W, TIMED_H), &terrain);
+    let ns = f64::from(queue.get_timestamp_period());
+    let mut out = Vec::with_capacity(TIMED_FRAMES);
+    for batch in 0..TIMED_FRAMES / TIMED_BATCH {
+        let count = (STAMPS * TIMED_BATCH) as u32;
+        let queries = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("render-gate-timed-queries"),
+            ty: wgpu::QueryType::Timestamp,
+            count,
+        });
+        let bytes = u64::from(count) * std::mem::size_of::<u64>() as u64;
+        let resolved = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("render-gate-timed-resolved"),
+            size: bytes,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("render-gate-timed-readback"),
+            size: bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("render-gate-timed"),
+        });
+        for frame in 0..TIMED_BATCH {
+            let q = (STAMPS * frame) as u32;
+            let cast = flight.stage_cascade_cast(device, queue, packet);
+            terrain.draw_shadow(&mut encoder, device, queue, tp, &packet.shadow, cast);
+            {
+                let (far_color, far_depth) = far_attachments(&msaa, flight.depth_view());
+                let mut pass =
+                    encoder.begin_render_pass(&scene_pass!("scene-far", far_color, far_depth));
+                terrain.draw_far(&mut pass, device, queue, &sky_and_far_terrain);
+                pass.write_timestamp(&queries, q);
+                terrain.draw_far(&mut pass, device, queue, &far_ocean);
+                pass.write_timestamp(&queries, q + 1);
+                flight.draw_far(&mut pass, device, queue, packet);
+            }
+            {
+                let (near_color, near_depth) = near_attachments(&msaa, &color, flight.depth_view());
+                let mut pass =
+                    encoder.begin_render_pass(&scene_pass!("scene", near_color, near_depth));
+                pass.write_timestamp(&queries, q + 2);
+                terrain.draw(&mut pass, device, queue, tp);
+                flight.draw(&mut pass, device, queue, packet);
+                pass.write_timestamp(&queries, q + 3);
+                terrain.draw_ocean(&mut pass, tp);
+                pass.write_timestamp(&queries, q + 4);
+            }
+        }
+        encoder.resolve_query_set(&queries, 0..count, &resolved, 0);
+        encoder.copy_buffer_to_buffer(&resolved, 0, &readback, 0, bytes);
+        queue.submit([encoder.finish()]);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        readback.map_async(wgpu::MapMode::Read, .., move |r| {
+            let _ = tx.send(r);
+        });
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        rx.recv().unwrap().expect("map_async failed");
+        let ticks: Vec<u64> = readback
+            .get_mapped_range(..)
+            .unwrap()
+            .chunks_exact(8)
+            .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+            .collect();
+        readback.unmap();
+        if batch * TIMED_BATCH >= TIMED_WARMUP {
+            out.extend(ticks.chunks_exact(STAMPS).map(|t| {
+                [
+                    ns * (t[4] - t[3]) as f64,
+                    ns * (t[1] - t[0]) as f64,
+                    ns * (t[3] - t[2]) as f64,
+                ]
+            }));
+        }
+    }
+    out
+}
+
+/// A point of open sea on the day side of the hand-built probes' fixed
+/// sun (`surface_probe_packet` aims it at −X, so daytime is longitude
+/// 90°–270°): the first of a fixed list of (latitude, longitude) in
+/// degrees where the field's normalized height is at or below −0.05 —
+/// 180 m of water at Terrin's authored amplitude. The sun stands 45°
+/// over the equator at 135°, so the list starts there.
+fn open_sea(field: &csp_render::terrain::HeightField) -> (f64, f64) {
+    let candidates: [(f64, f64); 14] = [
+        (0.0, 135.0),
+        (0.0, 225.0),
+        (10.0, 135.0),
+        (-10.0, 135.0),
+        (10.0, 225.0),
+        (-10.0, 225.0),
+        (20.0, 150.0),
+        (-20.0, 150.0),
+        (0.0, 150.0),
+        (0.0, 210.0),
+        (0.0, 120.0),
+        (0.0, 240.0),
+        (30.0, 180.0),
+        (-30.0, 180.0),
+    ];
+    for &(lat, lon) in &candidates {
+        let (slat, clat) = lat.to_radians().sin_cos();
+        let (slon, clon) = lon.to_radians().sin_cos();
+        let dir = csp_core::DVec3::new(clat * clon, clat * slon, slat);
+        if field.sample_dir(dir) <= -0.05 {
+            return (lat, lon);
+        }
+    }
+    panic!("none of the candidate points is open sea at the −0.05 height");
+}
+
+/// The ocean draws' GPU time, for a shader change to state before and
+/// after: three hand-built Terrin vantages over [`open_sea`] through the
+/// shipped renderers on the driver named by `CSP_GPU` (a fragment of the
+/// adapter's name, case insensitive — `CSP_GPU=radv`). The low vantage
+/// is the gameplay regime: the sea fills the frame and every ocean
+/// instance is the near pass's. From 800 km and from 2 000 km the disc
+/// spans the §2.3 split, so the far ocean draws beside the near one.
+/// Per vantage, each timed stretch's median, minimum and maximum over
+/// the recorded frames.
+/// `cargo test -p csp-view --test render_gate time_ocean -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn time_ocean() {
+    let needle = std::env::var("CSP_GPU").expect("CSP_GPU=<fragment of the adapter's name>");
+    let Some((device, queue, name)) = device_on(&needle) else {
+        panic!("no adapter whose name contains {needle:?}");
+    };
+    eprintln!(
+        "ocean time on {name} at {TIMED_W}x{TIMED_H}: {} frames, {TIMED_WARMUP} warm-up frames dropped",
+        TIMED_FRAMES - TIMED_WARMUP
+    );
+    let (field, amplitude, biome, art) = terrin_scene_assets();
+    let (lat, lon) = open_sea(&field);
+    eprintln!("open water at latitude {lat}°, longitude {lon}°");
+    for (what, alt_m, pitch_down) in [
+        ("30 m over open water", 30.0, 0.12),
+        ("800 km over open water", 800_000.0, 0.35),
+        ("2 000 km over open water", 2_000_000.0, 1.2),
+    ] {
+        let fp = surface_probe_packet(
+            lat,
+            lon,
+            alt_m,
+            // rad below the horizon — 0.12 keeps the horizon in frame at
+            // 30 m; the others look down the disc.
+            pitch_down,
+            0.0,
+            amplitude,
+            field.clone(),
+            biome.clone(),
+            art.clone(),
+        );
+        let tp = fp.terrain.as_ref().unwrap();
+        let times = ocean_draw_ns(&device, &queue, &fp);
+        eprintln!(
+            "{what}: ocean instances {} (far from index {})",
+            tp.ocean.len(),
+            tp.ocean_far_start
+        );
+        for (k, what) in ["near ocean", "far ocean", "near terrain and craft"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut v: Vec<f64> = times.iter().map(|t| t[k]).collect();
+            v.sort_by(|a, b| a.total_cmp(b));
+            eprintln!(
+                "  {what}: median {:.1} µs (min {:.1}, max {:.1})",
+                v[v.len() / 2] / 1000.0,
+                v[0] / 1000.0,
+                v[v.len() - 1] / 1000.0
+            );
+        }
+    }
+}
+
+// --- water in the view -----------------------------------------------------
+
+/// The water scenes' sea: a seabed flat this far under the datum — deep
+/// enough that an ocean opaque past 25 m of it shows nothing behind.
+const SEABED_M: f64 = 200.0;
+/// Terrin's authored relief amplitude: the flat seabed is shaded and
+/// textured like the game's ground.
+const WATER_AMPLITUDE_M: f64 = 3_600.0;
+/// Where the water scenes sit on the probe body — 30° north, 170° —
+/// clear of the quadtree's cell-boundary lines (the equator and 135° are
+/// on them: a seam runs through a frame taken there), and with the
+/// probes' fixed sun 58° up behind a camera looking north, so the water
+/// ahead is lit and carries no sun glint.
+const WATER_LAT_DEG: f64 = 30.0;
+const WATER_LON_DEG: f64 = 170.0;
+
+/// A heightfield flat at [`SEABED_M`] under the datum: one normalized
+/// height in every texel, keyed as a bake is.
+fn flat_seabed() -> csp_render::terrain::HeightField {
+    const W: u32 = 8;
+    const H: u32 = 4;
+    csp_render::terrain::HeightField {
+        width: W,
+        height: H,
+        data: vec![(-SEABED_M / WATER_AMPLITUDE_M) as f32; (W * H) as usize],
+        key: csp_render::terrain::HeightField::bake_key(SEABED_M.to_bits(), W, H),
+    }
+}
+
+/// The water scenes' hull is the kitbash `tank` with the `pod` on it,
+/// this many times the parts' own size: 3.7 m across, 12.9 m tall.
+const HULL_SCALE: f64 = 3.0;
+
+/// The water scenes' hull: the kitbash `tank` with the `pod` on it,
+/// upright and [`HULL_SCALE`] times the parts' own size, in a frame whose
+/// origin is the centre of the tank's base and whose z is up. Its
+/// triangles, its height and the radius of the narrower part's footprint
+/// — a disc of it about the hull's centre lies inside the silhouette.
+fn hull(art: &csp_view::art::ArtAssets) -> (Vec<csp_view::part_mesh::ModelTri>, f64, f64) {
+    use csp_core::DVec3;
+    let mut tris = Vec::new();
+    let mut base = 0.0;
+    let mut footprint = f64::MAX;
+    for key in ["tank", "pod"] {
+        let model = art
+            .model(key)
+            .unwrap_or_else(|| panic!("parts.csar carries no {key} model"));
+        let (lo, hi) = (model.lo, model.hi);
+        let half = DVec3::new((hi.x - lo.x) * 0.5, (hi.y - lo.y) * 0.5, hi.z - lo.z) * HULL_SCALE;
+        csp_view::part_mesh::emit_model(
+            &model,
+            DVec3::new(-half.x, -half.y, base),
+            DVec3::new(half.x, half.y, base + half.z),
+            &mut tris,
+        );
+        footprint = footprint.min(half.x).min(half.y);
+        base += half.z;
+    }
+    (tris, base, footprint)
+}
+
+/// A water scene: the probe packet, and where its hull is on the frame.
+struct WaterScene {
+    /// The scene's packet.
+    packet: csp_render::flight::FlightPacket,
+    /// With a hull: its centre on the [`W`]×[`H`] frame — `(x, y)` in
+    /// pixels from the top-left corner — and the radius in pixels of a
+    /// disc there that lies inside the hull's silhouette.
+    hull: Option<((f64, f64), f64)>,
+}
+
+/// One water scene through [`csp_view::art::load`]'s catalog: the probe
+/// camera at ([`WATER_LAT_DEG`], [`WATER_LON_DEG`]), `alt_m` over the
+/// datum — negative, under the surface — looking `pitch_down` (negative,
+/// up), over [`SEABED_M`] of water on the datum. With `hull_top_m` the
+/// [`hull`] stands upright, its top that far over the datum, its axis
+/// `hull_north_m` north of the point under the eye; the craft stream's
+/// light is the extract's for that sun.
+fn water_scene(
+    art: &csp_view::art::ArtAssets,
+    alt_m: f64,
+    pitch_down: f64,
+    hull_top_m: Option<f64>,
+    hull_north_m: f64,
+) -> WaterScene {
+    use csp_core::DVec3;
+    let terrain_art = art.0.terrain.clone().expect("terrain art pack");
+    let frame = ProbeFrame::new(WATER_LAT_DEG, WATER_LON_DEG, alt_m, pitch_down, 0.0);
+    let mut packet = probe_packet(&frame, WATER_AMPLITUDE_M, flat_seabed(), None, terrain_art);
+    packet.light = csp_render::PartLight {
+        sun_dir: [-1.0, 0.0, 0.0, 0.0],
+        sun_col: [1.0, 0.98, 0.92, 0.0],
+        amb_up: [0.16, 0.20, 0.27, 0.0],
+        amb_dn: [0.065, 0.060, 0.055, 0.0],
+        hemi: [
+            frame.up.x as f32,
+            frame.up.y as f32,
+            frame.up.z as f32,
+            0.10,
+        ],
+        water: [
+            frame.eye_rel.x as f32,
+            frame.eye_rel.y as f32,
+            frame.eye_rel.z as f32,
+            R_BODY_M as f32,
+        ],
+    };
+    let hull = hull_top_m.map(|top_m| {
+        let (tris, height, footprint) = hull(art);
+        // The hull's frame in body-centred vectors: the point (x, y, z)
+        // of it stands x east, y north of its axis and z over its base.
+        let place = |p: DVec3| {
+            frame.eye_rel
+                + frame.up * (top_m - height + p.z - alt_m)
+                + frame.north * (hull_north_m + p.y)
+                + frame.east * p.x
+        };
+        let turn = |n: DVec3| frame.up * n.z + frame.north * n.y + frame.east * n.x;
+        let f3 = |v: DVec3| [v.x as f32, v.y as f32, v.z as f32];
+        for t in &tris {
+            let world = [place(t.a), place(t.b), place(t.c)];
+            let [Some(a), Some(b), Some(c)] = world.map(|w| frame.project(w)) else {
+                continue; // a corner behind the eye: the whole triangle goes
+            };
+            for (i, (pos, nrm, color, mat)) in [
+                (a, t.na, t.ca, t.ma),
+                (b, t.nb, t.cb, t.mb),
+                (c, t.nc, t.cc, t.mc),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                packet.vertices.push(csp_render::flight::FlightVertex {
+                    pos,
+                    world: f3(world[i] - frame.eye_rel),
+                    nrm: f3(turn(nrm)),
+                    color,
+                    mat,
+                });
+            }
+        }
+        let centre =
+            frame.eye_rel + frame.up * (top_m - height * 0.5 - alt_m) + frame.north * hull_north_m;
+        let ndc = frame
+            .project(centre)
+            .expect("the hull is in front of the eye");
+        let disc = 0.85 * footprint / (centre - frame.eye_rel).norm() * (f64::from(H) * 0.5)
+            / (PROBE_FOV_Y * 0.5).tan();
+        (
+            (
+                (f64::from(ndc[0]) + 1.0) * 0.5 * f64::from(W),
+                (1.0 - f64::from(ndc[1])) * 0.5 * f64::from(H),
+            ),
+            disc,
+        )
+    });
+    WaterScene { packet, hull }
+}
+
+/// Mean over the pixels `inside` of the largest per-channel difference
+/// between two frames, in 8-bit levels, and how many pixels that is.
+fn mean_contrast(a: &[u8], b: &[u8], inside: &dyn Fn(usize, usize) -> bool) -> (f64, usize) {
+    let (mut sum, mut n) = (0.0, 0usize);
+    for (i, (pa, pb)) in a.chunks_exact(4).zip(b.chunks_exact(4)).enumerate() {
+        if inside(i % W as usize, i / W as usize) {
+            sum += f64::from((0..3).map(|c| pa[c].abs_diff(pb[c])).max().unwrap_or(0));
+            n += 1;
+        }
+    }
+    (sum / n.max(1) as f64, n)
+}
+
+/// A pixel of the [`W`]×[`H`] frame within `k` hull discs of the hull's
+/// centre `(cx, cy)` — a disc of `disc` pixels radius lies inside the
+/// hull's silhouette.
+fn within(k: f64, (cx, cy): (f64, f64), disc: f64, x: usize, y: usize) -> bool {
+    ((x as f64 + 0.5 - cx).powi(2) + (y as f64 + 0.5 - cy).powi(2)).sqrt() <= k * disc
+}
+
+/// The pixels inside the hull's disc, and those between 1.5 and 2.5
+/// discs of its centre — the open water around a hull.
+fn disc_and_around(
+    centre: (f64, f64),
+    disc: f64,
+) -> (impl Fn(usize, usize) -> bool, impl Fn(usize, usize) -> bool) {
+    (
+        move |x, y| within(1.0, centre, disc, x, y),
+        move |x, y| within(2.5, centre, disc, x, y) && !within(1.5, centre, disc, x, y),
+    )
+}
+
+/// The size the looked-at water frames are rendered at — three of the
+/// gate's viewport, the same 4:3.
+const FRAME_W: u32 = 3 * W;
+const FRAME_H: u32 = 3 * H;
+
+/// The three water frames, as P6 PPM in `dir`: a floating hull from
+/// above, the submerged hull from above (its top 3 m under the surface,
+/// the scene of [`a_hull_under_water_is_seen_from_above`]), and the same
+/// hull from below with the eye 20 m under the surface.
+fn dump_water_frames(device: &wgpu::Device, queue: &wgpu::Queue, dir: &std::path::Path) {
+    let art = csp_view::art::load();
+    std::fs::create_dir_all(dir).unwrap();
+    let down = core::f64::consts::FRAC_PI_4;
+    for (name, alt_m, pitch_down, hull_top_m, hull_north_m) in [
+        ("floating-from-above", 15.0, down, 3.9, 18.0),
+        ("submerged-from-above", 15.0, down, -3.0, 18.0),
+        ("submerged-from-below", -20.0, -0.9, -3.0, 7.0),
+    ] {
+        let scene = water_scene(&art, alt_m, pitch_down, Some(hull_top_m), hull_north_m);
+        let img = render_flight_scene_sized(device, queue, &scene.packet, FRAME_W, FRAME_H);
+        let path = dir.join(format!("{name}.ppm"));
+        let mut out = format!("P6 {FRAME_W} {FRAME_H} 255\n").into_bytes();
+        for px in img.chunks_exact(4) {
+            out.extend_from_slice(&px[..3]);
+        }
+        std::fs::write(&path, &out).unwrap();
+        eprintln!("wrote {}", path.display());
+    }
+}
+
+/// How far, in 8-bit levels per pixel on average, a hull 3 m under the
+/// surface must differ from the open water behind it.
+const HULL_CONTRAST: f64 = 1.0;
+
+/// Water in the view, from above: a hull whose top is 3 m under the
+/// surface over [`SEABED_M`] of water, seen from 15 m up. The ocean's
+/// opacity follows the water behind the pixel, so the hull shows: over
+/// the disc of the frame inside its silhouette, the frame with the hull
+/// differs from the same frame without it by at least [`HULL_CONTRAST`]
+/// (the largest channel difference per pixel, averaged). An ocean opaque
+/// past 25 m of depth — the rule this replaced, which drew the craft
+/// before it — leaves the open water there unaltered: 0.0. With
+/// `DUMP_WATER_DIR=1` the three looked-at water frames
+/// ([`dump_water_frames`]) are written under the workspace's
+/// `target/water-view/` first (PPM; `cargo run -q -p xtask --bin ppm2png
+/// -- <in> <out>`).
+#[test]
+fn a_hull_under_water_is_seen_from_above() {
+    let Some((device, queue)) = gate_device("a_hull_under_water_is_seen_from_above") else {
+        return;
+    };
+    let art = csp_view::art::load();
+    let scene = water_scene(&art, 15.0, core::f64::consts::FRAC_PI_4, Some(-3.0), 18.0);
+    let (centre, disc) = scene.hull.expect("the scene carries a hull");
+    let mut open = scene.packet.clone();
+    open.vertices.clear();
+    let with = render_flight_scene(&device, &queue, &scene.packet);
+    let without = render_flight_scene(&device, &queue, &open);
+    let (on_hull, around) = disc_and_around(centre, disc);
+    let (against_open, hull_px) = mean_contrast(&with, &without, &on_hull);
+    let (_, water_px) = mean_contrast(&with, &without, &around);
+
+    // The open water's mean colour around the hull, as a flat frame: the
+    // water the eye sees beside the hull.
+    let mut mean = [0.0f64; 3];
+    for (i, px) in with.chunks_exact(4).enumerate() {
+        if around(i % W as usize, i / W as usize) {
+            for c in 0..3 {
+                mean[c] += f64::from(px[c]);
+            }
+        }
+    }
+    let water: Vec<u8> = (0..W * H)
+        .flat_map(|_| {
+            let mut px = [0u8; 4];
+            for c in 0..3 {
+                px[c] = (mean[c] / water_px.max(1) as f64) as u8;
+            }
+            px
+        })
+        .collect();
+    let (beside, _) = mean_contrast(&with, &water, &on_hull);
+
+    if std::env::var("DUMP_WATER_DIR").is_ok_and(|v| v == "1") {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/water-view");
+        dump_water_frames(&device, &queue, &dir);
+    }
+    eprintln!(
+        "hull 3 m under, from above: {hull_px} px inside its silhouette, {water_px} of open water around it; \
+         against the frame without the hull {against_open:.1} levels; against that water {beside:.1} levels \
+         (it reads {:.0}, {:.0}, {:.0})",
+        mean[0] / water_px.max(1) as f64,
+        mean[1] / water_px.max(1) as f64,
+        mean[2] / water_px.max(1) as f64
+    );
+    assert!(hull_px >= 400, "only {hull_px} px of the hull are in frame");
+    assert!(
+        against_open >= HULL_CONTRAST,
+        "a hull 3 m under the surface differs from the open water by {against_open:.1} levels — under {HULL_CONTRAST}"
+    );
 }
 
 /// C17-F1 device-side check — the pick pass must emit no 0-tagged

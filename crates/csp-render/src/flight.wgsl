@@ -12,7 +12,8 @@
 // material pair, and a hemisphere fresnel rim — the per-pixel shading
 // that keeps the baked models reading as machined parts instead of
 // flat-shaded facets. A zero normal marks unlit geometry (sky quads,
-// plumes, dust, selection accents) which passes its color through.
+// plumes, dust, selection accents) which passes its color through, save
+// for the water in front of it.
 //
 // R1 shadow cascades (terrain-overhaul 3b): this module both CASTS
 // (`vs_shadow0/1` — the depth-only twins that drop the flight stream
@@ -28,6 +29,11 @@ struct Light {
     amb_up: vec4<f32>,
     amb_dn: vec4<f32>,
     hemi: vec4<f32>,
+    // The water a fragment can be seen through: `xyz` the eye relative
+    // to the body centre — the centre of the ocean, the sphere of radius
+    // `w` the surface is; 0, no ocean. A fragment inside that sphere is
+    // under water.
+    water: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> light: Light;
@@ -84,6 +90,65 @@ fn tone_map(c: vec3<f32>) -> vec3<f32> {
         vec3<f32>(0.0),
         vec3<f32>(1.0),
     );
+}
+
+// --- water ---------------------------------------------------------------
+// C16-F3's rule: one text, two files — this block stands verbatim in
+// `terrain.wgsl` and in `flight.wgsl`, and `water_block_is_one_text_in_both_shaders`
+// keeps it so.
+// The ocean's absorption, per metre of path, red, green, blue. The path
+// that leaves a hundredth of each: 15 m, 92 m, 230 m.
+const WATER_ABSORB: vec3<f32> = vec3<f32>(0.30, 0.05, 0.02);
+// What an endless path in the water converges to, before its lighting.
+const WATER_BODY: vec3<f32> = vec3<f32>(0.006, 0.042, 0.115);
+// Water against air.
+const WATER_IOR: f32 = 1.33;
+
+// Sunlight reaching `depth_m` under the surface. Entering the water the
+// sun's ray bends toward the vertical, to within 48.8° of it whatever its
+// height, so its path is at most 1.52 times the depth.
+fn water_sun(depth_m: f32, sun_up: f32) -> vec3<f32> {
+    let su = clamp(sun_up, 0.0, 1.0);
+    let cos_t = sqrt(1.0 - (1.0 - su * su) / (WATER_IOR * WATER_IOR));
+    return exp(-WATER_ABSORB * (depth_m / cos_t));
+}
+
+// A fragment `depth_m` under the surface, shaded `col` as if in air and
+// seen through `path_m` of water: the sun's way down to it and the eye's
+// way to it each absorb it, red first, and what the path scatters toward
+// the eye takes the lost share — the water body, lit as the surface is
+// (`sun_up`, the sun's height there, times `vis`, the share of the sun
+// that reaches it).
+fn water_fog(col: vec3<f32>, depth_m: f32, path_m: f32, sun_up: f32, vis: f32) -> vec3<f32> {
+    let through = exp(-WATER_ABSORB * path_m);
+    let body = WATER_BODY * (0.10 + 0.90 * sun_up * vis);
+    return col * water_sun(depth_m, sun_up) * through + body * (1.0 - through);
+}
+
+// The length of the part of the eye→fragment segment that is in the
+// water: its overlap with the ocean, the sphere of radius `ocean_r` about
+// the body centre, the eye at `pa` and the fragment at `pb` — both from
+// the centre. Zero without an ocean, or where the segment misses it.
+fn water_path(ocean_r: f32, pa: vec3<f32>, pb: vec3<f32>) -> f32 {
+    if (ocean_r <= 0.0) {
+        return 0.0;
+    }
+    let seg = pb - pa;
+    let dist = max(length(seg), 1.0e-3);
+    let ray = seg / dist;
+    let b = dot(pa, ray);
+    let eye_r = length(pa);
+    let c = (eye_r - ocean_r) * (eye_r + ocean_r);
+    let disc = b * b - c;
+    if (disc <= 0.0) {
+        return 0.0;
+    }
+    let s = sqrt(disc);
+    // Both roots in the form that keeps their small ones exact: the
+    // difference of two numbers the size of the body is not one.
+    let into = select(c / (s - b), -(s + b), b >= 0.0);
+    let out_of = select(-c / (s + b), s - b, b <= 0.0);
+    return max(min(out_of, dist) - max(into, 0.0), 0.0);
 }
 
 // --- cascade receive (R1; craft half — terrain.wgsl's `cascade_one`/
@@ -169,9 +234,36 @@ fn vs_main(v: Vin) -> Vout {
 
 @fragment
 fn fs_main(i: Vout) -> @location(0) vec4<f32> {
+    // The part of the eye→fragment way that is in the water — a hull, a
+    // plume or the dust under the surface seen from above, and the whole
+    // of it with the eye in the water — and the sun's height over the
+    // fragment. The eye is `light.water.xyz` from the body centre and the
+    // fragment `i.world` from the eye; a vertex that carries no place
+    // (the clip-space sky quad) sits at the eye, where no water lies.
+    var in_water_m = 0.0;
+    var depth_under_m = 0.0;
+    var sun_up = 0.0;
+    let ocean_r = light.water.w;
+    if (ocean_r > 0.0) {
+        let pa = light.water.xyz;
+        let pb = pa + i.world;
+        in_water_m = water_path(ocean_r, pa, pb);
+        depth_under_m = max(ocean_r - length(pb), 0.0);
+        sun_up = max(dot(pb / max(length(pb), 1.0e-6), light.sun_dir.xyz), 0.0);
+    }
     let nn = dot(i.nrm, i.nrm);
     if nn < 0.25 {
-        return i.color; // unlit stream (sky, plumes, dust, accents)
+        // Unlit stream (sky, plumes, dust, accents). Its colour is
+        // display-referred and is never tone-mapped, so the water before
+        // it only thins it, by the way's transmittance, and the share
+        // that takes goes to the water body as the lit fragments show it.
+        var col = i.color.rgb;
+        if (in_water_m > 0.0) {
+            let through = exp(-WATER_ABSORB * in_water_m);
+            let body = tone_map(WATER_BODY * (0.10 + 0.90 * sun_up));
+            col = col * through + body * (1.0 - through);
+        }
+        return vec4<f32>(col, i.color.a);
     }
     var n = i.nrm * inverseSqrt(nn);
     let v = -normalize(i.world); // camera-relative: the eye is the origin
@@ -204,5 +296,13 @@ fn fs_main(i: Vout) -> @location(0) vec4<f32> {
     // silhouette from the backdrop.
     let fres = pow(clamp(1.0 - dot(n, v), 0.0, 1.0), 3.0) * light.hemi.w * i.mat.z;
     rgb += light.amb_up.rgb * fres;
+    // Seen through water — a hull under the surface, or any of it with
+    // the eye in the water — it is absorbed on the sun's way down to it
+    // and the eye's way to it, red first, and the water body takes the
+    // lost share. The ocean surface in front of a hull above the water
+    // (`fs_terrain`'s ocean, from below) then only mirrors the water.
+    if (in_water_m > 0.0) {
+        rgb = water_fog(rgb, depth_under_m, in_water_m, sun_up, 1.0);
+    }
     return vec4<f32>(tone_map(rgb), i.color.a);
 }

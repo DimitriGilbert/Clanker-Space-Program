@@ -34,8 +34,9 @@ pub mod vab;
 /// bounce toward `hemi.xyz`, ground bounce away). All terms are in the
 /// camera-relative frame the vertex streams already carry; the eye
 /// sits at the origin by construction (§2.3), so the fragment shader
-/// needs no eye position. `mat` on each vertex supplies specular
-/// strength/exponent and baked occlusion.
+/// needs no eye position — save against the ocean, which is not about
+/// the eye: `water` carries that one. `mat` on each vertex supplies
+/// specular strength/exponent and baked occlusion.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct PartLight {
@@ -49,6 +50,11 @@ pub struct PartLight {
     pub amb_dn: [f32; 4],
     /// Hemisphere "up" axis (xyz; w = rim-light strength multiplier).
     pub hemi: [f32; 4],
+    /// The water a fragment is seen through: `xyz` the eye relative to
+    /// the body centre — the centre of the ocean, the sphere of radius
+    /// `w` the surface is, 0 for none. A fragment inside that sphere is
+    /// under water: `flight.wgsl`'s `water_fog` absorbs it.
+    pub water: [f32; 4],
 }
 
 impl Default for PartLight {
@@ -61,6 +67,7 @@ impl Default for PartLight {
             amb_up: [0.20, 0.24, 0.31, 0.0],
             amb_dn: [0.075, 0.070, 0.065, 0.0],
             hemi: [0.0, 0.0, 1.0, 0.1],
+            water: [0.0; 4],
         }
     }
 }
