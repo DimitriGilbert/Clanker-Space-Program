@@ -278,7 +278,20 @@ click-to-focus, `Tab` cycles focus (`csp-view/src/map.rs`). Two planning windows
   (in-bubble; `apply_deploy_part`, `csp-sim/src/lib.rs:7211`). The canopy catches below
   **6 km** and **260 m/s** (`deploy_alt_m`/`deploy_speed_mps` in the part def) with a
   120 m² drag area.
-- **Recovery**: land, come to rest — the vessel becomes **latched** — then **RECOVER VESSEL**
+- **Water is real** (sub-phase 4.1): where a body has an ocean (`terrin` does — everything
+  from the seabed up to sea level), water holds a craft up. A part floats if it is lighter
+  than the water its collider displaces (`water_density_kg_m3: 1025` kg/m³ — a full fuel tank
+  floats with four fifths of it under, a loaded ore carrier sinks). What floats **settles and
+  latches like a landed craft, as `Splashed`**; what sinks goes down to the seabed and latches
+  `Landed`. Weight high in the stack tips it over in the water, weight low brings it back
+  upright — a tall craft that splashes engine-first tips over and settles on its side.
+  **Splashdown loads are real**: under a parachute (≈17 m/s) a stack on the shipped
+  mount limits survives the hit (≈9 g); unbraked at 200 m/s it breaks apart (≈900 g). The
+  shipped science
+  canister's situation mask (49) does **not** include `Splashed` — recover a floater or
+  transmit from it instead of running the canister (`csp-phys/src/water.rs`,
+  `SimWorld::splashed`).
+- **Recovery**: land — or come to rest on the water — the vessel becomes **latched** — then **RECOVER VESSEL**
   (Actions strip, Program → SCIENCE, or right-click menu). Payout: **part value** at site
   efficiency (1.0 at the launch pad, 0.9 at other sites, 0.25 remote salvage), **resource
   contents** credited to that site's stockpile, **all pooled science banks at the recover

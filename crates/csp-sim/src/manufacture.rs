@@ -172,6 +172,7 @@ pub fn berth_pose(def: &SiteDef, belly: f64) -> crate::SurfacePose {
         longitude_rad: def.longitude_rad,
         altitude_m: def.altitude_m - belly,
         orientation: crate::bubble::surface_upright(def.latitude_rad, def.longitude_rad),
+        afloat: false,
     }
 }
 
@@ -1629,6 +1630,7 @@ mod tests {
                     drag_cd: 1.0,
                     convective_heat_fraction: csp_phys::DEFAULT_CONVECTIVE_HEAT_FRACTION,
                     terrain: None,
+                    ocean: None,
                 },
                 dominant: BodyId::from("terra"),
                 bubble_radius_m: crate::DEFAULT_BUBBLE_RADIUS_M,

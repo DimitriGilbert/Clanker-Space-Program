@@ -1,7 +1,7 @@
 // Global balance constants. ALL tuning lives here (PLAN §8.3).
 // Named fields only — positional tuples drift silently under reordering.
 (
-    schema_version: 15,
+    schema_version: 16,
     // Physics bubble radius (PLAN §2.3): 20 km. Vessels go on rails at the
     // radius and rejoin at 90% (18 km) — the hysteresis is csp-sim logic,
     // not a second constant.
@@ -144,4 +144,18 @@
     // 5 000 funds = the authored hire cost, a fifth of founding.
     // Mirror: `csp_sim::economy::DEFAULT_COLONY_MODULE_REPAIR_FUNDS`.
     colony_module_repair_cost_funds: 5_000.0,
+    // Water physics: the density of every ocean in kg/m³ — a part
+    // displaces this much mass per submerged cubic metre of its
+    // collider, so a part floats iff its own density is lower. 1025 is
+    // standard seawater: a full fuel tank (≈823 kg/m³) floats with
+    // four fifths of it under, a pod or an engine floats higher, and an
+    // ore carrier loaded with metal (≈1530 kg/m³) sinks.
+    // Mirror: `csp_phys::DEFAULT_WATER_DENSITY_KG_M3`.
+    water_density_kg_m3: 1025.0,
+    // Water physics: the quadratic drag coefficient on every part in
+    // water — `½·ρ·Cd·A·v²` over the submerged share of the part's
+    // projected area. 1.0 is bluff-body order — a flat face meeting the
+    // water; the same coefficient serves every part.
+    // Mirror: `csp_phys::DEFAULT_WATER_DRAG_CD`.
+    water_drag_cd: 1.0,
 )

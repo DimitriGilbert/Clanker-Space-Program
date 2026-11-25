@@ -3151,6 +3151,29 @@ impl World {
         }
     }
 
+    /// Is `vessel` in water with no ground under it — the simulation's
+    /// `Splashed` situation, as distinct from `Landed`? A latched
+    /// vessel reads the decision made at its latch
+    /// ([`SurfacePose::afloat`]); one in the bubble is tested
+    /// geometrically at the state's tick: a collider vertex below the
+    /// water and none against the seabed. A hull resting on the
+    /// seabed is `Landed` however deep it is, and `false` for a rails
+    /// vessel or a world without physics. Pure geometry over
+    /// already-hashed state; derived, never stored.
+    pub fn splashed(&self, vessel: VesselId) -> bool {
+        let (Some(p), Some(v)) = (self.physics.as_ref(), self.vessels.get(&vessel)) else {
+            return false;
+        };
+        match &v.state {
+            VesselState::SurfaceLatched(pose) => afloat_record(pose, p.backend.environment()),
+            VesselState::InBubble(b) => {
+                p.backend.set_sim_time(self.clock);
+                p.backend.in_water(b) && !p.backend.ground_contact(b)
+            }
+            VesselState::OnRails(_) => false,
+        }
+    }
+
     /// Vessel ids currently `InBubble` — the documented mask set the
     /// §2.6.1 equivalence test feeds [`Self::state_hash_masked`].
     pub fn in_bubble_ids(&self) -> BTreeSet<u64> {
@@ -4619,7 +4642,8 @@ impl World {
                     }
                     let transforms = &skeleton.transforms;
                     let (ext, ground) = {
-                        let contacts = physics.backend.contacts(csp_phys::BodyHandle(i as u32));
+                        let handle = csp_phys::BodyHandle(i as u32);
+                        let contacts = physics.backend.contacts(handle);
                         let ground = contacts.iter().any(|c| c.peer.is_none());
                         (
                             physics
@@ -4629,6 +4653,7 @@ impl World {
                                     &craft.graph,
                                     &craft.parts,
                                     contacts,
+                                    physics.backend.water_loads(handle),
                                     transforms,
                                 )
                                 .map_err(|e| SimError::Fatal(e.reason()))?,
@@ -12089,14 +12114,24 @@ fn ground_supported(env: &csp_phys::Environment, b: &WeldedBody, time_s: f64, ep
 /// genuinely floating hull shows.
 const GROUND_SUPPORT_EPS_M: f64 = 0.05;
 
+/// A parked record that says it settled on water, in a world that
+/// still has that water: supported by it, with nothing to re-probe.
+/// A record from a data set that has since lost its ocean is probed
+/// like any other, and released if nothing holds it.
+fn afloat_record(pose: &SurfacePose, env: &csp_phys::Environment) -> bool {
+    pose.afloat && env.ocean.is_some()
+}
+
 /// C12-F5: the `SurfaceLatched`/`InBubble`-latched vessels whose
 /// support has departed — the re-evaluation the settle doc's unwired
 /// unlatch triggers never ran. "Supported" means *something still
 /// beneath*: a lowest hull vertex within [`GROUND_SUPPORT_EPS_M`] of
 /// the surface ([`ground_supported`] — the strict contact predicate
-/// misses authored zero-penetration poses) or a vertex inside another
+/// misses authored zero-penetration poses), a vertex inside another
 /// hull ([`SimpleBackend::vessel_contact`], the same rule the settle
-/// latch qualified on), evaluated on the live poses.
+/// latch qualified on), or — for a hull that floats — the water
+/// itself ([`SimpleBackend::floating`], [`afloat_record`]). Evaluated
+/// on the live poses.
 /// Ascending-`VesselId` result; callers apply the unlatch.
 fn unsupported_statics(
     vessels: &BTreeMap<VesselId, Vessel>,
@@ -12105,7 +12140,8 @@ fn unsupported_statics(
 ) -> Vec<VesselId> {
     let env = physics.backend.environment();
     // Materialize every parked hull once — the supporter set itself
-    // is part of the query (a latched hull can rest on another).
+    // is part of the query (a latched hull can rest on another, and a
+    // floating one can be rested on).
     let mut parked: BTreeMap<VesselId, WeldedBody> = BTreeMap::new();
     for (vid, v) in vessels {
         let (VesselState::SurfaceLatched(pose), Some(craft)) = (&v.state, &v.craft) else {
@@ -12137,8 +12173,12 @@ fn unsupported_statics(
                 })
         };
         let unsupported = match &v.state {
-            VesselState::InBubble(b) => b.settle.latched && !supported_probe(b),
-            VesselState::SurfaceLatched(_) => parked.get(vid).is_some_and(|b| !supported_probe(b)),
+            VesselState::InBubble(b) => {
+                b.settle.latched && !physics.backend.floating(b) && !supported_probe(b)
+            }
+            VesselState::SurfaceLatched(pose) => {
+                !afloat_record(pose, env) && parked.get(vid).is_some_and(|b| !supported_probe(b))
+            }
             VesselState::OnRails(_) => false,
         };
         if unsupported {
@@ -12181,12 +12221,14 @@ fn transition_latched(
         if bubble_vessel_contact(&physics.backend, vessels, *vid, body, true) {
             continue;
         }
-        let pose = bubble::surface_pose_capture(
-            physics.backend.environment(),
-            &physics.dominant,
-            body,
-            sim,
-        );
+        // What the vessel settled on. Water is support only for a hull
+        // that floats and has no ground under its keel: that is the
+        // `Splashed`-versus-`Landed` decision, made here and kept with
+        // the pose — altitude alone cannot re-derive it.
+        let env = physics.backend.environment();
+        let afloat = physics.backend.floating(body)
+            && !ground_supported(env, body, sim.seconds(), GROUND_SUPPORT_EPS_M);
+        let pose = bubble::surface_pose_capture(env, &physics.dominant, body, sim, afloat);
         if let Some(vessel) = vessels.get_mut(vid) {
             vessel.state = VesselState::SurfaceLatched(pose);
             // M9b: the latch is a bubble→dormant transition — every
@@ -13201,6 +13243,12 @@ fn hash_vessel(h: &mut StateHasher, vessel: &Vessel) {
             h.f64(pose.longitude_rad);
             h.f64(pose.altitude_m);
             h.dquat(pose.orientation);
+            // The latch's settled-on-water record, emitted only when
+            // set: a grounded latch hashes the stream it did before
+            // water existed.
+            if pose.afloat {
+                h.bool(true);
+            }
         }
     }
 }
@@ -15177,6 +15225,7 @@ mod tests {
                 longitude_rad: 0.0,
                 altitude_m: 0.0,
                 orientation: DQuat::IDENTITY,
+                afloat: false,
             });
         s.event_heap = vec![ev(EventKind::DebrisDecay {
             vessel: VesselId(0),
@@ -15998,6 +16047,7 @@ mod tests {
             // Bare-sphere ground — the suite's landing/impact fixtures
             // are authored against the datum, not a seeded field.
             terrain: None,
+            ocean: None, // a dry world: the fixture's pinned model
         }
     }
 
@@ -16025,6 +16075,7 @@ mod tests {
             longitude_rad,
             altitude_m,
             orientation: DQuat::IDENTITY,
+            afloat: false,
         })
     }
 
@@ -18112,6 +18163,7 @@ mod tests {
                 longitude_rad: 0.0,
                 altitude_m,
                 orientation: csp_core::DQuat::IDENTITY,
+                afloat: false,
             })
         };
         // Parked 100 m up — nothing beneath it. Step past the
@@ -18146,6 +18198,482 @@ mod tests {
         );
     }
 
+    // ==================== Water (sub-phase 4.1) ====================
+
+    /// Terrin's ocean over a bare-sphere seabed `seabed_gap` metres
+    /// under the datum: water from the seabed up to the datum, on the
+    /// §3.0 gravity and atmosphere of `test_env`. `radius_m` — the
+    /// ground — is the seabed here, so a latch record's `altitude_m`
+    /// counts from `seabed_gap` metres under the water.
+    fn ocean_env(seabed_gap: f64) -> csp_phys::Environment {
+        let mut env = test_env(false);
+        env.radius_m = TERRIN_R - seabed_gap;
+        env.ocean = Some(csp_phys::Ocean::at_datum(TERRIN_R));
+        env
+    }
+
+    fn ocean_world(seabed_gap: f64) -> World {
+        World::with_physics(
+            test_system(),
+            test_physics_cfg(ocean_env(seabed_gap), "p"),
+            DEFAULT_MAX_EVENTS_PER_FRAME,
+        )
+    }
+
+    /// Cubes of half-extents `half` stacked along body +z — the pad's
+    /// up — each `(mass, mount limits)`.
+    fn cube_stack(parts: &[(f64, csp_data::StructuralDef)], half: DVec3) -> CraftDef {
+        let thermal = csp_data::ThermalDef {
+            heat_capacity_j_per_k: 400_000.0,
+            max_temp_k: 1_100.0,
+            emissivity: 0.8,
+            conduction_w_per_k: 60.0,
+        };
+        let mut graph = csp_phys::PartGraph::new(csp_phys::PartNodeId(1));
+        let mut weld_parts = Vec::with_capacity(parts.len());
+        for (i, (mass_kg, structural)) in parts.iter().enumerate() {
+            // Transforms are parent-relative: a cube one side above its
+            // parent's frame closes the stack.
+            let parent = (i > 0).then_some(csp_phys::PartNodeId(i as u64));
+            let lift = DVec3::new(0.0, 0.0, 2.0 * half.z);
+            graph.insert(
+                csp_phys::PartNodeId(i as u64 + 1),
+                csp_phys::PartNode::new(
+                    parent,
+                    csp_phys::PartTransform::new(lift, csp_core::DQuat::IDENTITY),
+                    i as u32,
+                ),
+            );
+            weld_parts.push(csp_phys::WeldPart {
+                experiments: Vec::new(),
+                lab: None,
+                engine: None,
+                parachute: None,
+                dock_ports: vec![],
+                tanks: vec![],
+                crew_seats: 0,
+                structural: structural.clone(),
+                mass_kg: *mass_kg,
+                com: DVec3::ZERO,
+                inertia: csp_phys::SymMat3::solid_box(*mass_kg, half),
+                collider: csp_phys::ColliderShape::Box { half_extents: half },
+                force_sites: vec![],
+                aero: csp_data::AeroDef::constant(0.8, 0.0, 1.0),
+                thermal: thermal.clone(),
+            });
+        }
+        CraftDef {
+            part_build_resources: Vec::new(),
+            hash_memo: Default::default(),
+            part_ids: vec![],
+            graph,
+            part_costs: vec![0.0; parts.len()],
+            parts: weld_parts,
+            reliability: vec![],
+        }
+    }
+
+    /// Spawn `craft` with its centre of mass `com_x` out on the +x
+    /// axis, at `rot`, moving at `vel`; the first (only) vessel.
+    fn spawn_at_com(
+        w: &mut World,
+        craft: CraftDef,
+        rot: csp_core::DQuat,
+        com_x: f64,
+        vel: DVec3,
+    ) -> VesselId {
+        let welded = csp_phys::weld(&craft.graph, &craft.parts).unwrap();
+        spawn_physical(
+            w,
+            SimCommand::SpawnPhysicalVessel {
+                craft,
+                pos: DVec3::new(com_x, 0.0, 0.0) - rot.rotate(welded.com_local),
+                rot,
+                vel,
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        VesselId(0)
+    }
+
+    fn latched_pose(w: &World, vessel: VesselId) -> Option<&SurfacePose> {
+        match &w.vessels()[&vessel].state {
+            VesselState::SurfaceLatched(pose) => Some(pose),
+            _ => None,
+        }
+    }
+
+    /// Step `vessel` to its latch, or `max_ticks`; reports whether it
+    /// was ever `Splashed`, its last in-bubble speed, and the pose.
+    fn settle_in_water(
+        w: &mut World,
+        vessel: VesselId,
+        max_ticks: u64,
+    ) -> (bool, f64, SurfacePose) {
+        let (mut splashed, mut last_speed) = (false, f64::INFINITY);
+        for _ in 0..max_ticks {
+            w.step_frame(w.clock().ticks() + 1).unwrap();
+            splashed |= w.splashed(vessel);
+            if let Some(b) = w.vessels()[&vessel].body() {
+                last_speed = b.vel.norm();
+            }
+            if let Some(pose) = latched_pose(w, vessel) {
+                return (splashed, last_speed, pose.clone());
+            }
+        }
+        panic!(
+            "the vessel never latched in {max_ticks} ticks: {:?}",
+            w.vessels()[&vessel].state
+        );
+    }
+
+    /// R3/R6: a sealed box lighter than water floats. Dropped a metre,
+    /// it comes to rest within a hundredth of the draft Archimedes
+    /// gives it — 500 kg of a 1 m³ cube sits 0.488 m deep — slow enough
+    /// to latch, as `Splashed`; the parked-support recheck leaves it
+    /// there for three periods running.
+    #[test]
+    fn a_light_box_floats_at_its_waterline_and_latches_splashed() {
+        let (mass_kg, side, seabed) = (500.0, 1.0, 500.0);
+        let draft = mass_kg / csp_phys::DEFAULT_WATER_DENSITY_KG_M3;
+        let mut w = ocean_world(seabed);
+        spawn_at_com(
+            &mut w,
+            box_craft(mass_kg, DVec3::new(0.5, 0.5, 0.5), 0.0),
+            pad_rot(),
+            TERRIN_R + 1.5,
+            DVec3::ZERO,
+        );
+        assert!(
+            !w.splashed(VesselId(0)),
+            "a metre up, it is not in the water"
+        );
+        let (splashed, last_speed, pose) = settle_in_water(&mut w, VesselId(0), 4_000);
+        assert!(splashed, "the box passed through the water");
+        assert!(pose.afloat, "it latched afloat");
+        assert!(w.splashed(VesselId(0)), "afloat is `Splashed`");
+        let rest_draft = side * 0.5 - (pose.altitude_m - seabed);
+        assert!(
+            (rest_draft - draft).abs() < draft * 0.01,
+            "rest depth {rest_draft} vs Archimedes' {draft}"
+        );
+        assert!(
+            last_speed < 0.05,
+            "latched from below 0.05 m/s, not {last_speed}"
+        );
+        w.step_frame(w.clock().ticks() + 192).unwrap();
+        let pose = latched_pose(&w, VesselId(0)).expect("still latched after three rechecks");
+        assert!(pose.afloat && w.splashed(VesselId(0)));
+    }
+
+    /// R3/R6: the same box heavier than water sinks 60 m to the seabed
+    /// and latches as `Landed` — `Splashed` on the way down, never at
+    /// rest, and never latched hanging in mid-water.
+    #[test]
+    fn a_heavy_box_sinks_to_the_seabed_and_latches_landed() {
+        let (mass_kg, seabed) = (2_000.0, 60.0);
+        let mut w = ocean_world(seabed);
+        spawn_at_com(
+            &mut w,
+            box_craft(mass_kg, DVec3::new(0.5, 0.5, 0.5), 0.0),
+            pad_rot(),
+            TERRIN_R + 1.0,
+            DVec3::ZERO,
+        );
+        let (splashed, _, pose) = settle_in_water(&mut w, VesselId(0), 4_000);
+        assert!(splashed, "it fell through the water");
+        assert!(!pose.afloat, "it latched on the seabed");
+        assert!(!w.splashed(VesselId(0)), "a hull on the seabed is `Landed`");
+        assert!(
+            (pose.altitude_m - 0.5).abs() < 0.01,
+            "resting on the bare-sphere seabed: {}",
+            pose.altitude_m
+        );
+    }
+
+    /// R3: buoyancy acts where the displaced water was, so stability is
+    /// where the weight sits. Two cubes of 1 600 kg displace 1.561 m³
+    /// whichever way up they are. Nudged 5° off vertical, the
+    /// top-heavy stack capsizes — the heavy cube ends a metre under
+    /// the light one — and the bottom-heavy one, spawned inverted,
+    /// rights itself to the same heavy-down pose.
+    #[test]
+    fn a_top_heavy_stack_capsizes_and_a_bottom_heavy_one_rights_itself() {
+        let (heavy, light, nudge) = (1_500.0, 100.0, 0.09);
+        let waterline = 0.5 + (1_600.0 / csp_phys::DEFAULT_WATER_DENSITY_KG_M3 - 1.0);
+        let (com_top_heavy, com_bottom_heavy) = (heavy / 1_600.0, light / 1_600.0);
+        for (lower, upper, inverted, com_z) in [
+            (light, heavy, false, com_top_heavy),
+            (heavy, light, true, com_bottom_heavy),
+        ] {
+            let mut w = ocean_world(500.0);
+            let craft = cube_stack(
+                &[
+                    (lower, csp_data::StructuralDef::unlimited()),
+                    (upper, csp_data::StructuralDef::unlimited()),
+                ],
+                DVec3::new(0.5, 0.5, 0.5),
+            );
+            // Upright the centre of mass is `waterline − com_z` under;
+            // inverted, the waterline drops to `1 − waterline` in body
+            // terms and the centre of mass is the same distance above.
+            let com_depth = waterline - com_z;
+            let com_x = TERRIN_R + if inverted { com_depth } else { -com_depth };
+            let lean = if inverted {
+                core::f64::consts::PI + nudge
+            } else {
+                nudge
+            };
+            let rot = pad_rot() * csp_core::DQuat::from_axis_angle(DVec3::X, lean);
+            spawn_at_com(&mut w, craft, rot, com_x, DVec3::ZERO);
+            let (_, _, pose) = settle_in_water(&mut w, VesselId(0), 8_000);
+            assert!(pose.afloat, "afloat either way up: {:?}", pose.orientation);
+            // Body +z runs from the lower cube to the upper one.
+            let stack_up = pose.orientation.rotate(DVec3::Z).x;
+            let heavy_down = if inverted {
+                stack_up > 0.99
+            } else {
+                stack_up < -0.99
+            };
+            assert!(
+                heavy_down,
+                "lower {lower} kg, inverted {inverted}: the heavy cube must end up down (stack axis {stack_up})"
+            );
+        }
+    }
+
+    /// R5: entry loads are real. A three-cube stack on the shipped
+    /// parts' mount limits, dropped engine-first, keeps every joint
+    /// under a parachute's 17 m/s — a 9 g jolt — and floats away
+    /// `Splashed`; at 200 m/s the water load peaks at 904 g and breaks
+    /// it on tick 15.
+    #[test]
+    fn splashdown_at_parachute_speed_spares_the_stack_and_a_fast_one_breaks_it() {
+        let mount = |axial: f64, shear: f64, torque: f64| csp_data::StructuralDef {
+            max_axial_n: axial,
+            max_shear_n: shear,
+            max_torque_nm: torque,
+        };
+        // csp.engine.sparc, csp.tank.s160, csp.pod.mk1 — 1.25 m cubes,
+        // light enough to float: 2 500 kg of 5.86 m³.
+        let craft = cube_stack(
+            &[
+                (900.0, mount(600_000.0, 150_000.0, 25_000.0)),
+                (800.0, mount(1_200_000.0, 350_000.0, 60_000.0)),
+                (800.0, mount(500_000.0, 200_000.0, 30_000.0)),
+            ],
+            DVec3::new(0.625, 0.625, 0.625),
+        );
+        for (speed, bottom_clearance, breaks) in [(17.0, 1.5, false), (200.0, 40.0, true)] {
+            let mut w = ocean_world(5_000.0);
+            let com_above_bottom = csp_phys::weld(&craft.graph, &craft.parts)
+                .unwrap()
+                .com_local
+                .z
+                + 0.625;
+            spawn_at_com(
+                &mut w,
+                craft.clone(),
+                pad_rot(),
+                TERRIN_R + bottom_clearance + com_above_bottom,
+                DVec3::new(-speed, 0.0, 0.0),
+            );
+            let mut peak_g = 0.0f64;
+            let mut broke_at = None;
+            for t in 1..=600 {
+                let before = w.vessels()[&VesselId(0)].body().map(|b| b.vel);
+                w.step_frame(t).unwrap();
+                let v = &w.vessels()[&VesselId(0)];
+                if let (Some(v0), Some(b)) = (before, v.body()) {
+                    peak_g = peak_g.max((b.vel - v0).norm() * 64.0 / 9.80665);
+                }
+                let whole = v.craft.as_ref().map(|c| c.graph.nodes.len()) == Some(3);
+                if !whole && broke_at.is_none() {
+                    broke_at = Some(t);
+                }
+            }
+            assert_eq!(
+                broke_at.is_some(),
+                breaks,
+                "at {speed} m/s: peak {peak_g} g"
+            );
+            if breaks {
+                assert!(
+                    broke_at.is_some_and(|t| t <= 32),
+                    "broken on impact: {broke_at:?}"
+                );
+                assert!(peak_g > 100.0, "a crash, not a jolt: {peak_g} g");
+            } else {
+                let (splashed, _, pose) = settle_in_water(&mut w, VesselId(0), 4_000);
+                assert!(splashed && pose.afloat, "the stack floats away");
+                assert_eq!(
+                    w.vessels()[&VesselId(0)]
+                        .craft
+                        .as_ref()
+                        .map(|c| c.graph.nodes.len()),
+                    Some(3),
+                    "every joint held"
+                );
+                assert!(
+                    (5.0..12.0).contains(&peak_g),
+                    "a parachute-speed splashdown is a jolt: {peak_g} g"
+                );
+                // Engine-first is an attitude it cannot float in — the
+                // centre of mass is above the centre of buoyancy — so it
+                // tips over and comes to rest on its side.
+                let axis_up = pose.orientation.rotate(DVec3::Z).x.abs();
+                assert!(axis_up < 0.05, "at rest on its side: {axis_up}");
+            }
+        }
+    }
+
+    /// R7: a craft the water cannot reach is bit-identical to the same
+    /// craft in a world with no ocean at all — state hash for state
+    /// hash, on a pad above the datum and through the last dry metre
+    /// of a fall onto water — and the moment it does get wet, the
+    /// worlds part.
+    #[test]
+    fn a_craft_away_from_water_is_bit_identical_with_and_without_an_ocean() {
+        let craft = two_node_craft();
+        for (ground, com_x, ticks, what) in [
+            (
+                TERRIN_R + 52.0,
+                TERRIN_R + 52.9,
+                700,
+                "parked on a pad above the datum",
+            ),
+            (
+                TERRIN_R - 5_000.0,
+                TERRIN_R + 1.2,
+                16,
+                "falling the last dry metre",
+            ),
+        ] {
+            let world = |ocean: bool| {
+                let mut env = test_env(false);
+                env.radius_m = ground;
+                env.ocean = ocean.then(|| csp_phys::Ocean::at_datum(TERRIN_R));
+                World::with_physics(
+                    test_system(),
+                    test_physics_cfg(env, "p"),
+                    DEFAULT_MAX_EVENTS_PER_FRAME,
+                )
+            };
+            let (mut dry, mut wet) = (world(false), world(true));
+            for w in [&mut dry, &mut wet] {
+                spawn_at_com(w, craft.clone(), pad_rot(), com_x, DVec3::ZERO);
+            }
+            for _ in 0..ticks {
+                let target = dry.clock().ticks() + 1;
+                dry.step_frame(target).unwrap();
+                wet.step_frame(target).unwrap();
+                assert_eq!(
+                    dry.state_hash().unwrap(),
+                    wet.state_hash().unwrap(),
+                    "{what}"
+                );
+                assert!(!wet.splashed(VesselId(0)), "{what}: still dry");
+            }
+            if what.starts_with("falling") {
+                let target = dry.clock().ticks() + 64;
+                dry.step_frame(target).unwrap();
+                wet.step_frame(target).unwrap();
+                assert_ne!(
+                    dry.state_hash().unwrap(),
+                    wet.state_hash().unwrap(),
+                    "then the ocean takes over"
+                );
+            }
+        }
+    }
+
+    /// The latch's settled-on-water record is hashed state: two worlds
+    /// differing in nothing else hash apart, and agree again once it
+    /// is cleared.
+    #[test]
+    fn afloat_is_hashed_state() {
+        let latched = |afloat: bool| {
+            VesselState::SurfaceLatched(SurfacePose {
+                body: BodyId::from("p"),
+                latitude_rad: 0.0,
+                longitude_rad: 0.0,
+                altitude_m: 0.0,
+                orientation: csp_core::DQuat::IDENTITY,
+                afloat,
+            })
+        };
+        let (mut a, mut b) = (ocean_world(500.0), ocean_world(500.0));
+        for w in [&mut a, &mut b] {
+            spawn_at_com(
+                w,
+                box_craft(500.0, DVec3::new(0.5, 0.5, 0.5), 0.0),
+                pad_rot(),
+                TERRIN_R + 100.0,
+                DVec3::ZERO,
+            );
+            w.vessels.get_mut(&VesselId(0)).unwrap().state = latched(false);
+        }
+        assert_eq!(a.state_hash().unwrap(), b.state_hash().unwrap());
+        b.vessels.get_mut(&VesselId(0)).unwrap().state = latched(true);
+        assert_ne!(a.state_hash().unwrap(), b.state_hash().unwrap());
+        assert!(b.splashed(VesselId(0)) && !a.splashed(VesselId(0)));
+    }
+
+    /// R8/R9: a latched floater saves and restores with its record —
+    /// same hash, still `Splashed` — and a latch record written before
+    /// the record existed decodes as grounded, which is what it was.
+    #[test]
+    fn a_floating_latch_saves_and_restores_and_old_records_decode_grounded() {
+        let (mass_kg, seabed) = (500.0, 500.0);
+        let mut w = ocean_world(seabed);
+        spawn_at_com(
+            &mut w,
+            box_craft(mass_kg, DVec3::new(0.5, 0.5, 0.5), 0.0),
+            pad_rot(),
+            TERRIN_R + 1.5,
+            DVec3::ZERO,
+        );
+        settle_in_water(&mut w, VesselId(0), 4_000);
+        let hash = w.state_hash().unwrap();
+        let snapshot = w.snapshot().unwrap();
+        let mut restored = World::restore(
+            test_system(),
+            Some(test_physics_cfg(ocean_env(seabed), "p")),
+            snapshot,
+        )
+        .unwrap();
+        assert_eq!(restored.state_hash().unwrap(), hash);
+        assert!(latched_pose(&restored, VesselId(0)).unwrap().afloat);
+        assert!(restored.splashed(VesselId(0)));
+        // The recheck keeps the restored floater where it is.
+        restored.step_frame(restored.clock().ticks() + 192).unwrap();
+        assert!(latched_pose(&restored, VesselId(0)).is_some());
+
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct PreAfloatSurfacePose {
+            body: BodyId,
+            latitude_rad: f64,
+            longitude_rad: f64,
+            altitude_m: f64,
+            orientation: csp_core::DQuat,
+        }
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(
+            &PreAfloatSurfacePose {
+                body: BodyId::from("terrin"),
+                latitude_rad: 0.1,
+                longitude_rad: 0.2,
+                altitude_m: -3.0,
+                orientation: csp_core::DQuat::IDENTITY,
+            },
+            &mut bytes,
+        )
+        .unwrap();
+        let pose: SurfacePose = ciborium::de::from_reader(&bytes[..]).unwrap();
+        assert!(!pose.afloat, "a pre-record latch was grounded");
+        assert_eq!(pose.altitude_m, -3.0);
+    }
+
     /// C12-F5 partition fix: a `SurfaceLatched` hull the support
     /// recheck flags at grid tick `t*` must release at `t* + 1`
     /// under EVERY §2.6.1 partition — the `rail_break` boundary
@@ -18165,6 +18693,7 @@ mod tests {
                 longitude_rad: 1.0,
                 altitude_m: 100.0,
                 orientation: csp_core::DQuat::IDENTITY,
+                afloat: false,
             })
         };
         let build = || {
@@ -18236,6 +18765,7 @@ mod tests {
                 longitude_rad: 0.0,
                 altitude_m: 100.0,
                 orientation: csp_core::DQuat::IDENTITY,
+                afloat: false,
             })
         };
         let build = || {
@@ -18306,6 +18836,7 @@ mod tests {
             longitude_rad: 0.0,
             altitude_m: 100.0,
             orientation: csp_core::DQuat::IDENTITY,
+            afloat: false,
         };
         let mut w = physics_world(true);
         enqueue_orbiter(&mut w);
@@ -27664,6 +28195,7 @@ mod tests {
                     &w.physics.as_ref().unwrap().dominant,
                     b,
                     w.clock,
+                    false,
                 ),
                 _ => panic!("in bubble"),
             }

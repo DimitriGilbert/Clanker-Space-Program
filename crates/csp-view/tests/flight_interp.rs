@@ -136,6 +136,7 @@ fn vacuum_view() -> View {
                 drag_cd: csp_phys::DEFAULT_DRAG_CD,
                 convective_heat_fraction: csp_phys::DEFAULT_CONVECTIVE_HEAT_FRACTION,
                 terrain: None,
+                ocean: None,
             },
             dominant: csp_data::BodyId::from("p"),
             bubble_radius_m: DEFAULT_BUBBLE_RADIUS_M,

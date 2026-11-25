@@ -1320,6 +1320,7 @@ impl World {
             longitude_rad: co.longitude_rad,
             altitude_m: co.altitude_m,
             orientation: csp_core::DQuat::IDENTITY,
+            afloat: false,
         };
         Some(latched_pos(&pose, r))
     }

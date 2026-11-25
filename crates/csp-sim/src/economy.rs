@@ -1393,6 +1393,7 @@ mod tests {
                     longitude_rad: 0.0,
                     altitude_m: 0.0,
                     orientation: DQuat::IDENTITY,
+                    afloat: false,
                 }),
                 aero_mask: csp_phys::ConfigMask::ALL,
                 thermal: VesselThermal::default(),

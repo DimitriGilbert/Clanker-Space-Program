@@ -1969,6 +1969,13 @@ fn build_sim_from_dataset(d: &LoadedDataset, save_seed: u64) -> Result<SimWorld,
     // C14-F3: the convective-heating η is authored — `for_body`
     // stamps the no-data default; the balance file overrides it.
     environment.convective_heat_fraction = balance.convective_heat_fraction;
+    // Water physics: the ocean's density and drag are authored the same
+    // way. One ocean, one water — a body's `ocean` says where the
+    // surface is; `balance.ron` says what the water is.
+    if let Some(ocean) = environment.ocean.as_mut() {
+        ocean.density_kg_m3 = balance.water_density_kg_m3;
+        ocean.drag_cd = balance.water_drag_cd;
+    }
     let mut sim = SimWorld::with_physics(
         orbits,
         csp_sim::PhysicsConfig {
@@ -3627,6 +3634,7 @@ impl View {
                 longitude_rad: lon,
                 altitude_m: site_alt + PAD_CLEARANCE_M - z_min,
                 orientation: csp_sim::bubble::surface_upright(lat, lon),
+                afloat: false,
             },
             |s| csp_sim::manufacture::berth_pose(s, z_min - PAD_CLEARANCE_M),
         );
@@ -4591,7 +4599,11 @@ impl View {
             .environment()
             .map_or(0.0, |e| e.atmosphere.as_ref().map_or(0.0, |a| a.top_m));
         let situation = match &v.state {
-            VesselState::SurfaceLatched(p) => Some(if p.altitude_m <= 0.0 {
+            // Ground or water is the simulation's call (`splashed`):
+            // a floater rides with its origin a few centimetres above
+            // the datum and a hull on a seabed far below it, so
+            // altitude cannot tell `Splashed` from `Landed`.
+            VesselState::SurfaceLatched(_) => Some(if sim.splashed(v.id) {
                 csp_data::Situation::Splashed
             } else {
                 csp_data::Situation::Landed
@@ -4599,11 +4611,9 @@ impl View {
             VesselState::InBubble(_) => {
                 let contact = sim.ground_contact(v.id);
                 if contact && alt_m <= 50.0 {
-                    Some(if alt_m <= 0.0 {
-                        csp_data::Situation::Splashed
-                    } else {
-                        csp_data::Situation::Landed
-                    })
+                    Some(csp_data::Situation::Landed)
+                } else if sim.splashed(v.id) {
+                    Some(csp_data::Situation::Splashed)
                 } else if alt_m < env_atm_top {
                     Some(if alt_m < FLYING_SPLIT_M.min(env_atm_top) {
                         csp_data::Situation::FlyingLow
@@ -6873,6 +6883,137 @@ mod tests {
             }),
             "RunExperiment must reach the outbox in orbit"
         );
+    }
+
+    /// One 1 m³ cube of `mass_kg` — a sealed box for the water: at
+    /// 500 kg it floats, at 2 000 kg it sinks.
+    fn water_cube(mass_kg: f64) -> csp_sim::CraftDef {
+        use csp_phys::{PartGraph, PartNode, PartNodeId, PartTransform};
+        let mut graph = PartGraph::new(PartNodeId(1));
+        graph.insert(
+            PartNodeId(1),
+            PartNode::new(None, PartTransform::IDENTITY, 0),
+        );
+        csp_sim::CraftDef {
+            part_build_resources: Vec::new(),
+            hash_memo: Default::default(),
+            part_ids: vec![],
+            graph,
+            part_costs: vec![0.0],
+            parts: vec![csp_phys::WeldPart {
+                experiments: Vec::new(),
+                lab: None,
+                engine: None,
+                parachute: None,
+                dock_ports: vec![],
+                tanks: vec![],
+                crew_seats: 0,
+                structural: csp_data::StructuralDef::unlimited(),
+                mass_kg,
+                com: csp_core::DVec3::ZERO,
+                inertia: csp_phys::SymMat3::solid_box(mass_kg, csp_core::DVec3::new(0.5, 0.5, 0.5)),
+                collider: csp_phys::ColliderShape::Box {
+                    half_extents: csp_core::DVec3::new(0.5, 0.5, 0.5),
+                },
+                force_sites: Vec::new(),
+                aero: csp_data::AeroDef::constant(0.8, 0.0, 1.0),
+                thermal: csp_data::ThermalDef {
+                    heat_capacity_j_per_k: 400_000.0,
+                    max_temp_k: 1_500.0,
+                    emissivity: 0.8,
+                    conduction_w_per_k: 50.0,
+                },
+            }],
+            reliability: vec![],
+        }
+    }
+
+    /// Water physics (sub-phase 4.1): the situation label is the
+    /// simulation's verdict, not altitude arithmetic. Over Terrin's
+    /// ocean on the equator at longitude 0 — 193 m of water there — a
+    /// sealed 500 kg cube floats and a 2 000 kg one sinks to the
+    /// seabed, and both come to rest. The floater's origin ends a
+    /// centimetre above the datum and the sinker's 192 m below it, so
+    /// an altitude rule calls them `Landed` and `Splashed`; the view
+    /// follows `SimWorld::splashed` and stages the reverse.
+    #[test]
+    fn situation_follows_the_simulation_not_altitude() {
+        let mut view = View::new_demo().expect("demo data loads");
+        let step = |view: &mut View| {
+            view.sim_step(view.sim.clock().ticks() + 1).expect("step");
+        };
+        // The pad craft wins the mirror's flight-focus pick — retire it.
+        view.enqueue_command(
+            SourceClass::Ui,
+            PLAYER_SOURCE_ID,
+            SimCommand::TerminateVessel {
+                vessel: csp_sim::VesselId(0),
+            },
+        );
+        step(&mut view);
+        for (mass_kg, situation, sign_of_altitude, what) in [
+            (500.0, csp_data::Situation::Splashed, 1.0, "afloat"),
+            (2_000.0, csp_data::Situation::Landed, -1.0, "on the seabed"),
+        ] {
+            let (center, radius, spin) = {
+                let env = view.sim.environment().expect("physics");
+                (env.body_center, env.radius_m, env.body_spin)
+            };
+            let pos = center + csp_core::DVec3::new(radius + 1.5, 0.0, 0.0);
+            view.enqueue_command(
+                SourceClass::Ui,
+                PLAYER_SOURCE_ID,
+                SimCommand::SpawnPhysicalVessel {
+                    craft: water_cube(mass_kg),
+                    pos,
+                    rot: csp_sim::bubble::surface_upright(0.0, 0.0),
+                    // At rest relative to the water, which turns with
+                    // the planet.
+                    vel: spin.cross(pos - center),
+                    ang_vel: csp_core::DVec3::ZERO,
+                },
+            );
+            step(&mut view);
+            let id = *view
+                .sim
+                .vessels()
+                .keys()
+                .next_back()
+                .expect("the cube spawned");
+            // A second at a time: the sinker has 192 m to cover.
+            let mut pose = None;
+            for _ in 0..130 {
+                view.sim_step(view.sim.clock().ticks() + 64).expect("step");
+                if let VesselState::SurfaceLatched(p) = &view.sim.vessels()[&id].state {
+                    pose = Some(p.clone());
+                    break;
+                }
+            }
+            let pose = pose.unwrap_or_else(|| panic!("the {what} cube never came to rest"));
+            assert!(
+                pose.altitude_m * sign_of_altitude > 0.0,
+                "the {what} cube rests {} m from the datum",
+                pose.altitude_m
+            );
+            view.world
+                .resource_mut::<flight::FlightFocusOverride>()
+                .target = None;
+            view.world.resource_mut::<map::MapInput>().focus_vessel = Some(id);
+            view.end_frame();
+            let mirror = view.world.resource::<ProgramMirror>();
+            assert_eq!(mirror.vessel, Some(id));
+            assert_eq!(
+                mirror.science_ctx.as_ref().map(|(_, s)| *s),
+                Some(situation),
+                "a cube {what} at {sign_of_altitude} altitude stages its situation from the sim"
+            );
+            view.enqueue_command(
+                SourceClass::Ui,
+                PLAYER_SOURCE_ID,
+                SimCommand::TerminateVessel { vessel: id },
+            );
+            step(&mut view);
+        }
     }
 
     /// W2.6: the §3.4 test stand is player-reachable — the panel's

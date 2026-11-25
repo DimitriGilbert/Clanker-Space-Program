@@ -6,7 +6,9 @@
 //! # Phase order (§2.9)
 //!
 //! One `step` is, per body, in a fixed order: **force accumulation →
-//! velocity integrate → position integrate → contact solve**. Bodies
+//! velocity integrate → position integrate → contact solve** — with
+//! the tick's water loads resolved first, from the pose the forces act
+//! on. Bodies
 //! carry no inter-body coupling in the force phase (all forces are
 //! environment- or site-generated), so the first three phases are fused
 //! into one ascending-index pass — semantically identical to three
@@ -59,6 +61,13 @@
 //!   here (per-engine `throttle_range` enforcement is the M3+ control
 //!   layer's job). `Rcs`/`Aero` sites are inert until their control
 //!   channels exist. Torque is `Σ r×F` about the world-frame CoM.
+//! - **Water** (only under an [`Environment::ocean`] — see
+//!   [`crate::water`]): summed after the three above, per wet part —
+//!   buoyancy `ρ_w·g·V_sub` at the collider's submerged centroid,
+//!   quadratic drag against the co-rotating water, and the linear
+//!   damping that brings a floater to rest. A body the water cannot
+//!   reach skips the whole channel and steps exactly as it did before
+//!   water existed.
 //!
 //! # Contact model
 //!
@@ -234,7 +243,9 @@
 //!
 //! # Settle latch (§2.6.4)
 //!
-//! After the solve, a body in contact with `‖v‖ < settle_v`,
+//! After the solve, a body in contact — or afloat: held up by water
+//! ([`crate::water::WaterLoads::supported`]), which counts the same —
+//! with `‖v‖ < settle_v`,
 //! `‖ω‖ < settle_w`, **and per-tick pose deltas below the same
 //! limits** (`‖Δpos‖ < settle_v·dt`, `‖Δrot‖ < settle_w·dt` in
 //! radians — i.e. the pose itself is at rest to the same tolerance
@@ -511,6 +522,15 @@ pub struct Environment {
     /// artifacts decodable — they replay on the sphere they recorded.
     #[serde(default)]
     pub terrain: Option<TerrainSurface>,
+    /// The body's ocean (see [`crate::water`]): water from the seabed
+    /// up to the datum sphere, with the density and drag every part in
+    /// it displaces and is slowed by; `None` ⇒ a dry body, and no water
+    /// force exists. `for_body` stamps an authored ocean at the
+    /// no-data tunables — `balance.ron`'s `water_density_kg_m3` and
+    /// `water_drag_cd` override them. `serde(default)` keeps pre-field
+    /// artifacts decodable as dry.
+    #[serde(default)]
+    pub ocean: Option<crate::water::Ocean>,
 }
 
 impl Environment {
@@ -553,6 +573,12 @@ impl Environment {
                 body.radius_m * body.terrain.amplitude_frac,
                 body.terrain.relief,
             )),
+            // An authored ocean exists from its seabed up to the datum;
+            // the balance file retunes the water after this stamp.
+            ocean: body
+                .ocean
+                .as_ref()
+                .map(|o| crate::water::Ocean::at_datum(o.datum_radius_m)),
         }
     }
 
@@ -888,7 +914,8 @@ impl Constraint {
 /// Fixed-order two-direction friction basis, deterministic from the
 /// world-frame normal: reference axis = least-aligned of X/Y, then
 /// `t1 = normalize(n × ref)`, `t2 = n × t1` (§2.9's pinned basis).
-fn friction_basis(n_world: DVec3) -> (DVec3, DVec3) {
+/// Shared with `water`'s planar vertex ordering (`t1 × t2 = n`).
+pub(crate) fn friction_basis(n_world: DVec3) -> (DVec3, DVec3) {
     let reference = if n_world.x.abs() <= n_world.y.abs() {
         DVec3::X
     } else {
@@ -1746,6 +1773,12 @@ pub struct SimpleBackend {
     /// Per-body contact manifold from the most recent `step`, indexed
     /// by slice position ([`BodyHandle`]). Cleared for latched bodies.
     contacts: Vec<Vec<Contact>>,
+    /// Per-body water loads integrated by the most recent `step`, by
+    /// slice position — the record [`Self::water_loads`] hands the
+    /// breakup budget, the contacts' twin: each wet part's peak load
+    /// over the tick. `None` for a body with no ocean in reach; rebuilt
+    /// every tick, never serialized.
+    water: Vec<Option<crate::water::WaterLoads>>,
 }
 
 impl SimpleBackend {
@@ -1761,6 +1794,7 @@ impl SimpleBackend {
             env,
             time_s: Cell::new(0.0),
             contacts: Vec::new(),
+            water: Vec::new(),
         }
     }
 
@@ -1786,13 +1820,14 @@ impl SimpleBackend {
     /// force the environment and the vessel's own sites apply to each
     /// graph node this tick — gravity at each part's CoM, per-part
     /// aero (table path, or the placeholder distributed by mass
-    /// share), thrust sites, and the solved contact impulses (ground
-    /// and vessel-vessel pair) attributed by hull — expressed in
-    /// **body frame** as [`PartForce`]s.
+    /// share), thrust sites, the solved contact impulses (ground and
+    /// vessel-vessel pair) attributed by hull, and the tick's water
+    /// loads (buoyancy, drag, damping) attributed by hull — expressed
+    /// in **body frame** as [`PartForce`]s.
     ///
-    /// `contacts` is the manifold record from the last `step` for
-    /// this body (`self.contacts(handle)`); passing it explicitly
-    /// keeps the borrow discipline honest.
+    /// `contacts` and `water` are the records from the last `step` for
+    /// this body (`self.contacts(handle)`, `self.water_loads(handle)`);
+    /// passing them explicitly keeps the borrow discipline honest.
     #[allow(clippy::too_many_lines)] // one section per force channel
     pub fn external_loads(
         &self,
@@ -1800,6 +1835,7 @@ impl SimpleBackend {
         graph: &crate::graph::PartGraph,
         parts: &[WeldPart],
         contacts: &[Contact],
+        water: &[crate::water::WaterPart],
         transforms: &std::collections::BTreeMap<
             crate::graph::PartNodeId,
             crate::graph::PartTransform,
@@ -1813,7 +1849,11 @@ impl SimpleBackend {
             std::collections::BTreeMap::new();
         let conj = body.rot.conjugate();
         let mut push = |id: crate::graph::PartNodeId, at: DVec3, force: DVec3| {
-            out.entry(id).or_default().push(PartForce { at, force });
+            out.entry(id).or_default().push(PartForce {
+                at,
+                force,
+                torque: DVec3::ZERO,
+            });
         };
 
         // Gravity at each part's body-frame CoM — the same analytic
@@ -1922,6 +1962,19 @@ impl SimpleBackend {
                 );
             }
         }
+        // Water — the tick's record, attributed by hull like the
+        // contacts: what the step integrated is what a splashdown's
+        // joint loads are measured against. The couple is already
+        // body frame.
+        for p in water {
+            if let Some(id) = hull_owner.get(&p.hull) {
+                out.entry(*id).or_default().push(PartForce {
+                    at: conj.rotate(p.at - body.pos),
+                    force: conj.rotate(p.force),
+                    torque: p.torque,
+                });
+            }
+        }
         Ok(out)
     }
 
@@ -1957,6 +2010,31 @@ impl SimpleBackend {
         false
     }
 
+    /// Is any collider vertex of `b` strictly below the water — the
+    /// "in water" behind the `Splashed` situation? Geometry only (no
+    /// volume is integrated); `false` without an ocean or beyond the
+    /// water's reach.
+    pub fn in_water(&self, b: &WeldedBody) -> bool {
+        crate::water::touches_water(&self.env, b)
+    }
+
+    /// Is `b` in water and lighter than the water its whole volume
+    /// displaces — afloat, the state the settle latch accepts in place
+    /// of ground contact? Evaluated on demand at `b`'s pose: the latch
+    /// transition's record and the parked-support recheck read it.
+    pub fn floating(&self, b: &WeldedBody) -> bool {
+        crate::water::WaterLoads::of(&self.env, b).is_some_and(|w| w.supported())
+    }
+
+    /// The water loads the last `step` integrated for `body`, by hull —
+    /// empty without an ocean in reach or while every part is dry.
+    pub fn water_loads(&self, body: BodyHandle) -> &[crate::water::WaterPart] {
+        self.water
+            .get(body.0 as usize)
+            .and_then(|w| w.as_ref())
+            .map_or(&[], |w| w.parts.as_slice())
+    }
+
     /// Geometric vessel-vessel contact predicate — the same rule
     /// [`Self::generate_pair_contacts`] applies (a collider vertex of
     /// either body strictly inside a facet volume of the other,
@@ -1986,7 +2064,9 @@ impl SimpleBackend {
     }
 
     /// Force and torque (about the world-frame CoM) on `b`, in the
-    /// fixed accumulation order gravity → drag → thrust.
+    /// fixed accumulation order gravity → drag → thrust. Water is
+    /// summed after these in [`Self::integrate_free`], from the tick's
+    /// record — once for a slow tick, at every stage of a stiff one.
     fn accumulate_forces(&self, b: &WeldedBody) -> (DVec3, DVec3) {
         let rel = b.com_world() - self.env.body_center;
         let mut force = DVec3::ZERO;
@@ -2067,23 +2147,39 @@ impl SimpleBackend {
     /// Phases 1–3 for one body: force accumulation → velocity
     /// integrate → position integrate (semi-implicit Euler; angular
     /// part includes the gyroscopic `ω×(Iω)` term, body frame).
-    fn integrate_free(&self, b: &mut WeldedBody) {
+    /// `water` is the tick's water record, integrated in place — `None`
+    /// leaves the pre-water arithmetic untouched, bit for bit.
+    fn integrate_free(&self, b: &mut WeldedBody, water: Option<&mut crate::water::WaterLoads>) {
         let (force, torque) = self.accumulate_forces(b);
-        b.vel = b.vel + force * (PHYSICS_DT / b.mass_kg);
-        let inv_i = b.inertia_local.inverse().unwrap_or(SymMat3::ZERO);
-        let tau_body = b.rot.conjugate().rotate(torque);
-        // Midpoint evaluation of the gyroscopic term: explicit Euler
-        // (α at the old ω) pumps rotational energy by a strictly
-        // positive ½dt²·aᵀIa every tick for ω off a principal axis —
-        // a torque-free tumble spun up ~×e^11 per game-hour at
-        // debris-tumble speeds. The midpoint stage costs one extra
-        // evaluate, keeps the pinned order, and demotes the pump to
-        // alternating-sign O(dt³).
-        let gyro = |w: DVec3| w.cross(b.inertia_local.mul_vec(w));
-        let a0 = inv_i.mul_vec(tau_body - gyro(b.ang_vel));
-        let w_mid = b.ang_vel + a0 * (0.5 * PHYSICS_DT);
-        let a1 = inv_i.mul_vec(tau_body - gyro(w_mid));
-        b.ang_vel = b.ang_vel + a1 * PHYSICS_DT;
+        // The pinned velocity step. It is the whole step of a body the
+        // water does not stiffen: `None` passes the other loads through
+        // unread, and a wet body whose drag is not stiff reads its
+        // water once, at the velocity the step starts from.
+        let pinned = |b: &mut WeldedBody, force: DVec3, torque: DVec3| {
+            b.vel = b.vel + force * (PHYSICS_DT / b.mass_kg);
+            let inv_i = b.inertia_local.inverse().unwrap_or(SymMat3::ZERO);
+            let tau_body = b.rot.conjugate().rotate(torque);
+            // Midpoint evaluation of the gyroscopic term: explicit Euler
+            // (α at the old ω) pumps rotational energy by a strictly
+            // positive ½dt²·aᵀIa every tick for ω off a principal axis —
+            // a torque-free tumble spun up ~×e^11 per game-hour at
+            // debris-tumble speeds. The midpoint stage costs one extra
+            // evaluate, keeps the pinned order, and demotes the pump to
+            // alternating-sign O(dt³).
+            let gyro = |w: DVec3| w.cross(b.inertia_local.mul_vec(w));
+            let a0 = inv_i.mul_vec(tau_body - gyro(b.ang_vel));
+            let w_mid = b.ang_vel + a0 * (0.5 * PHYSICS_DT);
+            let a1 = inv_i.mul_vec(tau_body - gyro(w_mid));
+            b.ang_vel = b.ang_vel + a1 * PHYSICS_DT;
+        };
+        match water {
+            None => pinned(b, force, torque),
+            Some(w) if w.substeps() == 1 => {
+                let (force, torque) = w.at_velocity(b.rot, b.vel, b.ang_vel, force, torque);
+                pinned(b, force, torque);
+            }
+            Some(w) => Self::integrate_stiff(b, w, force, torque),
+        }
 
         // The position phase advances the CoM, then re-derives the
         // origin from the new rotation — `vel` is the CoM velocity, so
@@ -2101,6 +2197,47 @@ impl SimpleBackend {
         )
         .normalize();
         b.pos = com - b.rot.rotate(b.com_local);
+    }
+
+    /// The velocity phase for a tick whose water drag is stiff
+    /// (`water.substeps() > 1`): the fourth-order Runge–Kutta step on
+    /// the body's velocity, over that many sub-steps of the pose the
+    /// forces were evaluated at. `force` and `torque` — gravity, aero,
+    /// thrust — are held whole at every stage: the sub-step's length is
+    /// their share. The water is re-read at every stage, since it is the
+    /// load that follows the velocity. The position phase is the
+    /// caller's, once.
+    fn integrate_stiff(
+        b: &mut WeldedBody,
+        water: &mut crate::water::WaterLoads,
+        force: DVec3,
+        torque: DVec3,
+    ) {
+        let steps = water.substeps();
+        let h = PHYSICS_DT / steps as f64;
+        let (mass, inertia) = (b.mass_kg, b.inertia_local);
+        let inv_i = inertia.inverse().unwrap_or(SymMat3::ZERO);
+        let (rot, conj) = (b.rot, b.rot.conjugate());
+        let derivative = |water: &mut crate::water::WaterLoads, vel: DVec3, ang_vel: DVec3| {
+            let (f, t) = water.at_velocity(rot, vel, ang_vel, force, torque);
+            let tau_body = conj.rotate(t);
+            (
+                f / mass,
+                inv_i.mul_vec(tau_body - ang_vel.cross(inertia.mul_vec(ang_vel))),
+            )
+        };
+        let (mut vel, mut ang_vel) = (b.vel, b.ang_vel);
+        for _ in 0..steps {
+            let (k1v, k1w) = derivative(water, vel, ang_vel);
+            let half = 0.5 * h;
+            let (k2v, k2w) = derivative(water, vel + k1v * half, ang_vel + k1w * half);
+            let (k3v, k3w) = derivative(water, vel + k2v * half, ang_vel + k2w * half);
+            let (k4v, k4w) = derivative(water, vel + k3v * h, ang_vel + k3w * h);
+            vel = vel + (k1v + (k2v + k3v) * 2.0 + k4v) * (h / 6.0);
+            ang_vel = ang_vel + (k1w + (k2w + k3w) * 2.0 + k4w) * (h / 6.0);
+        }
+        b.vel = vel;
+        b.ang_vel = ang_vel;
     }
 
     /// Phase 4a — contact generation at the post-integration pose.
@@ -2789,7 +2926,12 @@ impl SimpleBackend {
             if b.settle.latched {
                 continue;
             }
-            let in_contact = !self.contacts[i].is_empty();
+            // Ground contact, or water holding the body up — a floating
+            // craft is as settled as a parked one (§2.6.4).
+            let supported = self.water[i]
+                .as_ref()
+                .is_some_and(crate::water::WaterLoads::supported);
+            let in_contact = supported || !self.contacts[i].is_empty();
             // Surface-relative gates: identity when `body_spin` is zero.
             let v_rel = if spinning {
                 b.vel
@@ -2886,10 +3028,23 @@ impl PhysicsBackend for SimpleBackend {
         // Baumgarte pass, which never touches stored velocities.
         let pose0: Vec<(DVec3, DQuat)> = bodies.iter().map(|b| (b.pos, b.rot)).collect();
 
+        // The tick's water geometry, resolved before any body moves so
+        // each record sees the pose its forces act on. Only bodies the
+        // loop below integrates get one; a body out of the ocean's
+        // reach records `None` and integrates exactly as it did before
+        // water existed.
+        self.water.clear();
+        self.water.resize_with(bodies.len(), || None);
+        for (i, b) in bodies.iter().enumerate() {
+            if !b.settle.latched || b.throttle > 0.0 {
+                self.water[i] = crate::water::WaterLoads::of(&self.env, b);
+            }
+        }
+
         // Phases 1–3 fused per body in ascending index order — bodies
         // do not couple before the contact solve, so the fusion is
         // semantically identical to three passes.
-        for b in bodies.iter_mut() {
+        for (i, b) in bodies.iter_mut().enumerate() {
             if b.settle.latched {
                 // §2.6.4: a latched vessel's throttle is zero (the
                 // latch itself zeroes it), so a nonzero value here is
@@ -2901,7 +3056,11 @@ impl PhysicsBackend for SimpleBackend {
                     continue;
                 }
             }
-            self.integrate_free(b);
+            // The record leaves the slot while it is integrated — its
+            // parts keep the tick's peak loads — and goes straight back.
+            let mut water = self.water[i].take();
+            self.integrate_free(b, water.as_mut());
+            self.water[i] = water;
         }
 
         // Phase 4 — constraint solve: generation (ground contacts,
@@ -3150,8 +3309,9 @@ fn cross_section_area(b: &WeldedBody, w: DVec3) -> f64 {
 /// budget. `None` at the degenerate `r == 0` so both callers keep
 /// "record nothing" semantics (a zero-force entry is not a load).
 /// Shared by `accumulate_forces` and `external_loads` — the channel's
-/// formula is written once.
-fn gravity_force_world(env: &Environment, rel: DVec3, mass_kg: f64) -> Option<DVec3> {
+/// formula is written once — and by `water`, whose buoyancy is the
+/// same law on the negative mass of the displaced water.
+pub(crate) fn gravity_force_world(env: &Environment, rel: DVec3, mass_kg: f64) -> Option<DVec3> {
     let r = rel.norm();
     if r > 0.0 {
         Some(rel * (-env.mu_m3_per_s2 * mass_kg / (r * r * r)))
@@ -3297,6 +3457,7 @@ mod tests {
             friction_mu: DEFAULT_FRICTION_MU,
             drag_cd: DEFAULT_DRAG_CD,
             convective_heat_fraction: DEFAULT_CONVECTIVE_HEAT_FRACTION,
+            ocean: None, // a dry world: the fixture's pinned model
         }
     }
 

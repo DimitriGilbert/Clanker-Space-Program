@@ -155,6 +155,13 @@ fn flight_initial(dir: &Path) -> Result<World, ReplayError> {
     // C14-F3: the convective-heating η is authored in the fixture's
     // balance.ron like every other tunable.
     environment.convective_heat_fraction = balance.convective_heat_fraction;
+    // The ocean's density and drag likewise — the same wiring
+    // `csp-view` startup runs, so a recorded splashdown replays the
+    // water the game would have simulated.
+    if let Some(ocean) = environment.ocean.as_mut() {
+        ocean.density_kg_m3 = balance.water_density_kg_m3;
+        ocean.drag_cd = balance.water_drag_cd;
+    }
     let mut world = World::with_physics(
         orbits,
         PhysicsConfig {

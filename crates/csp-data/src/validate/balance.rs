@@ -1,6 +1,7 @@
 //! The §8.3 `balance.ron` rules: `schema_version` and every numeric
 //! tunable inside the domain its `csp-sim` `*Config::is_valid` mirror
-//! gates at restore.
+//! gates at restore, plus the two water tunables `csp-phys`'s `Ocean`
+//! carries into the tick verbatim.
 
 use crate::resource::ResourceFile;
 
@@ -306,5 +307,12 @@ pub fn validate_balance(
         b.reliability_bench_seconds_per_unit,
         &mut out,
     );
+    // Water physics — `Ocean`'s two authored tunables. The density is
+    // the mass a part displaces per submerged cubic metre: zero or
+    // negative water would leave "lighter than water" with no meaning
+    // (nothing could ever float). The drag coefficient is positive:
+    // zero would author water that does not slow a splashdown.
+    pos("water_density_kg_m3", b.water_density_kg_m3, &mut out);
+    pos("water_drag_cd", b.water_drag_cd, &mut out);
     out
 }

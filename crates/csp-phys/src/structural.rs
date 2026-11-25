@@ -74,7 +74,8 @@ use crate::tensor::SymMat3;
 use crate::weld::{WeldError, WeldedBody};
 
 /// One external force applied to a part, body frame: `force` applied
-/// at `at` (the point the moment arm is taken from). Produced by
+/// at `at` (the point the moment arm is taken from), plus `torque`, a
+/// pure couple on the part. Produced by
 /// [`crate::simple::SimpleBackend::external_loads`]; consumed by
 /// [`joint_loads`].
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -83,6 +84,8 @@ pub struct PartForce {
     pub at: DVec3,
     /// Force vector, body frame, newtons.
     pub force: DVec3,
+    /// Pure couple, body frame, newtons·metres.
+    pub torque: DVec3,
 }
 
 /// The measured load at one attachment joint — compared against the
@@ -172,7 +175,7 @@ pub fn joint_loads(
         if let Some(forces) = ext.get(id) {
             for f in forces {
                 agg.force = agg.force + f.force;
-                agg.moment = agg.moment + f.at.cross(f.force);
+                agg.moment = agg.moment + f.at.cross(f.force) + f.torque;
             }
         }
         aggs.insert(*id, agg);

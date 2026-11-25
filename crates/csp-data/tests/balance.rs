@@ -169,3 +169,58 @@ fn balance_economy_rates_are_gated() {
         "authored economy rates rejected: {errs:#?}"
     );
 }
+
+/// The v16 water tunables — `water_density_kg_m3` and `water_drag_cd`
+/// — are strictly positive: zero is as useless as a negative value
+/// (water with no density floats nothing; water with no drag does not
+/// slow a splashdown), so both report `PartNonPositive` at `0` and
+/// below, NaN reports `PartNonFinite`, and the authored file stays
+/// green at 1025 kg/m³ and 1.0.
+#[test]
+fn balance_water_tunables_are_gated() {
+    let fields = ["water_density_kg_m3", "water_drag_cd"];
+    for bad in [0.0, -1025.0] {
+        let mut b = csp_data::load_balance(&repo_root().join("data/balance.ron")).unwrap();
+        b.water_density_kg_m3 = bad;
+        b.water_drag_cd = bad;
+        let errs = csp_data::validate_balance(&b, &resources());
+        for field in fields {
+            assert!(
+                errs.iter().any(|e| matches!(
+                    e,
+                    csp_data::ValidationError::PartNonPositive { field: f, value, .. }
+                        if *f == field && *value == bad
+                )),
+                "{field} = {bad}: {errs:#?}"
+            );
+        }
+    }
+
+    let mut b = csp_data::load_balance(&repo_root().join("data/balance.ron")).unwrap();
+    b.water_density_kg_m3 = f64::NAN;
+    b.water_drag_cd = f64::NAN;
+    let errs = csp_data::validate_balance(&b, &resources());
+    for field in fields {
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                csp_data::ValidationError::PartNonFinite { field: f, .. } if *f == field
+            )),
+            "{field} NaN: {errs:#?}"
+        );
+    }
+
+    let b = csp_data::load_balance(&repo_root().join("data/balance.ron")).unwrap();
+    assert_eq!(b.water_density_kg_m3, 1025.0);
+    assert_eq!(b.water_drag_cd, 1.0);
+    let errs = csp_data::validate_balance(&b, &resources());
+    assert!(
+        !errs.iter().any(|e| matches!(
+            e,
+            csp_data::ValidationError::PartNonPositive { field, .. }
+            | csp_data::ValidationError::PartNonFinite { field, .. }
+                if fields.contains(field)
+        )),
+        "authored water tunables rejected: {errs:#?}"
+    );
+}

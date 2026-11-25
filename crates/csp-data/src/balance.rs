@@ -80,7 +80,12 @@ use crate::ids::ResourceId;
 /// unreachable (measured entry peaks ~200–260 K against 800–1600 K
 /// part limits); 0.02 burns the small low-margin parts on an
 /// aggressive entry while the pod class lands.
-pub const BALANCE_SCHEMA_VERSION: u32 = 15;
+/// 16 (water physics): `water_density_kg_m3` and `water_drag_cd` —
+/// the ocean's buoyancy and drag tunables. Both live here rather than
+/// on the body: every ocean in a data set is the same water.
+/// Mirrors: `csp_phys::DEFAULT_WATER_DENSITY_KG_M3`,
+/// `csp_phys::DEFAULT_WATER_DRAG_CD`.
+pub const BALANCE_SCHEMA_VERSION: u32 = 16;
 
 /// `data/balance.ron` — the tunables every later milestone consumes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -322,4 +327,16 @@ pub struct BalanceDef {
     /// §3.5.1 crash-damage class decorative.
     /// Mirror: `csp_sim::economy::DEFAULT_COLONY_MODULE_REPAIR_FUNDS`.
     pub colony_module_repair_cost_funds: f64,
+    /// The density of every body's ocean water (kg/m³) — the mass a
+    /// part displaces per submerged cubic metre of its collider. 1025
+    /// is standard seawater; a part floats iff its own density is
+    /// below this number.
+    /// Mirror: `csp_phys::DEFAULT_WATER_DENSITY_KG_M3`.
+    pub water_density_kg_m3: f64,
+    /// The quadratic water-drag coefficient every part is slowed by:
+    /// drag = `½ · water_density · water_drag_cd · area · speed²` on
+    /// the part's submerged share of its projected area. Bluff-body
+    /// order of magnitude; the same coefficient serves every part.
+    /// Mirror: `csp_phys::DEFAULT_WATER_DRAG_CD`.
+    pub water_drag_cd: f64,
 }

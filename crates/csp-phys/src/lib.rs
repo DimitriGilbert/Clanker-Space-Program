@@ -80,6 +80,8 @@
 //!   (`Ray`/`Hit`/`Contact`/`BodyHandle`/`JointDef`).
 //! - [`simple`] — `SimpleBackend`, the §2.9 default backend, and the
 //!   §3.0 closed-form atmosphere evaluators.
+//! - [`water`] — `Ocean` and the per-part buoyancy and drag the backend
+//!   sums from it: what each collider displaces below the free surface.
 
 pub mod aero;
 pub mod backend;
@@ -95,6 +97,7 @@ pub mod simple;
 pub mod structural;
 pub mod tensor;
 pub mod thermal;
+pub mod water;
 pub mod weld;
 
 pub use aero::{
@@ -142,6 +145,10 @@ pub use thermal::{
     DEFAULT_CONVECTIVE_HEAT_FRACTION, SPACE_SINK_K, STEFAN_BOLTZMANN_W_M2_K4, ThermalEdge,
     ThermalFlow, ThermalNet, ThermalNode, ambient_k, flow_sample, joint_conductance,
     steady_state_temp_k,
+};
+pub use water::{
+    DEFAULT_WATER_DENSITY_KG_M3, DEFAULT_WATER_DRAG_CD, DEFAULT_WATER_LINEAR_DAMPING_PER_S, Ocean,
+    WaterPart,
 };
 pub use weld::{
     CompoundCollider, ConvexHull, DecelSite, PartWeld, SettleState, WeldError, WeldedBody, weld,

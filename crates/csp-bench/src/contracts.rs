@@ -749,6 +749,7 @@ pub fn coverage_run(
                     longitude_rad: 2.916,
                     altitude_m: 0.0,
                     orientation: csp_core::DQuat::IDENTITY,
+                    afloat: false,
                 }),
             )?;
             w.enqueue(

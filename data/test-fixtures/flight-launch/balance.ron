@@ -1,7 +1,7 @@
 // Global balance constants. ALL tuning lives here (PLAN §8.3).
 // Named fields only — positional tuples drift silently under reordering.
 (
-    schema_version: 15,
+    schema_version: 16,
     // Physics bubble radius (PLAN §2.3): 20 km. Vessels go on rails at the
     // radius and rejoin at 90% (18 km) — the hysteresis is csp-sim logic,
     // not a second constant.
@@ -100,4 +100,10 @@
     // C09-F6 — same field as data/balance.ron: the RepairColonyModule
     // debit. Mirror: `csp_sim::economy::DEFAULT_COLONY_MODULE_REPAIR_FUNDS`.
     colony_module_repair_cost_funds: 5_000.0,
+    // Water physics — same fields as data/balance.ron: the ocean's
+    // density (kg/m³) and quadratic drag coefficient.
+    // Mirrors: `csp_phys::DEFAULT_WATER_DENSITY_KG_M3`,
+    // `csp_phys::DEFAULT_WATER_DRAG_CD`.
+    water_density_kg_m3: 1025.0,
+    water_drag_cd: 1.0,
 )

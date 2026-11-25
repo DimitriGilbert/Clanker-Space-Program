@@ -3468,6 +3468,7 @@ mod tests {
             drag_cd: 1.0,
             convective_heat_fraction: csp_phys::DEFAULT_CONVECTIVE_HEAT_FRACTION,
             terrain: None,
+            ocean: None,
         };
         let mut sim = SimWorld::with_physics(
             test_system(),

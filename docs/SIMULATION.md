@@ -374,6 +374,45 @@ contact (M6) runs the same PGS machinery over pair manifolds; latched bodies act
 static colliders. Terminal state is the §2.6.4 settle latch (`settle_v = 0.05` m/s,
 plus per-tick pose-delta limits).
 
+**Water** (`water.rs`) — buoyancy and drag for any body with an `ocean`
+(`csp_phys::Ocean` on `Environment`, `#[serde(default)]`: artifacts recorded before it decode
+dry). Water fills the seabed up to the datum sphere; each part is cut by the tangent plane
+at the craft's centre of mass (half a millimetre off the sphere at the ends of a 50 m craft).
+
+- **Displacement**: the collider's volume below the surface and that volume's centroid,
+  classified from the welded vertices each tick. The resolver's 16-point `Cylinder` prism is
+  recognised and cut as the **true cylinder** by a closed form — the primitive its inertia is
+  computed from, agreeing with its own section integral to 3.2e-10 over a sweep of
+  leans and drafts; an oriented **box** is clipped face by face; anything else is cut
+  as its own convex polytope.
+- **Buoyancy** `ρ·g·V_sub` along local up **at the submerged centroid** — the weight of the
+  displaced water through the same `gravity_force_world` channel as gravity. Where the weight
+  sits decides stability: a top-heavy stack capsizes, a bottom-heavy one rights itself.
+- **Drag** `½·ρ·Cd·A·f·|v|·v` against the co-rotating water (`A` the collider's silhouette
+  along the flow, `f` the submerged fraction), plus **linear damping** `k·ρ·V_sub·v` and
+  `k·ρ·V_sub·κ²·ω` (`k = 1.5 /s`, the wave-radiation stand-in) that ends the bob — quadratic
+  drag alone never brings a floater inside the settle thresholds. Each part's `v` is that
+  part's own velocity through the water, `v + ω×r`, so drag always takes energy: a stack that
+  tips over in the water comes to rest on its side.
+- **Stiff ticks**: water is about 840 times denser than air, so at entry speed a tick's drag
+  is more than the motion it acts on (a 1 m² face at 200 m/s reads 2 000 g). The load is never
+  scaled to fit the step: a tick whose drag is stiff integrates the velocity by fourth-order
+  Runge–Kutta sub-steps at the frozen pose, sized by a bound on the drag's stiffness — within
+  1e-4 of the drag law's own solution, measured 8e-6 at 200 m/s. A tick that is not stiff is
+  the backend's own step, bit for bit.
+- The tick's loads are a record (`SimpleBackend::water_loads`) the §2.4 joint-load evaluation
+  reads beside the contact impulses, so splashdown loads break stacks: a three-cube stack on
+  the shipped mount limits peaks at 9 g under a parachute's 17 m/s and holds; at 200 m/s it
+  peaks at 904 g and breaks on tick 15.
+- **Cull**: a centre of mass above the datum by more than the body's reach skips the whole
+  channel, and such a craft is bit-identical to the same craft in a world with no ocean
+  (state-hash test, on a pad and through the last dry metre of a fall onto water).
+- **Latch**: a hull the water holds up — in water, lighter than its own volume of water —
+  counts as in contact for the settle latch; a sinker never latches in mid-water.
+  `transition_latched` records the verdict in `SurfacePose::afloat` (hashed only when set),
+  `SimWorld::splashed` answers `Splashed` versus `Landed`, and the parked-support recheck
+  leaves a floater alone.
+
 - **PLAN-vs-code divergence #3 (documented in code):** PLAN §2.9 specifies a
   `RapierBackend` (`rapier3d-f64`) for jointed islands. **No RapierBackend exists**;
   `rapier3d-f64`/`parry3d-f64` are workspace-declared but unused by any crate

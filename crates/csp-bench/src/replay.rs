@@ -1476,6 +1476,7 @@ mod tests {
                         drag_cd: 1.0,
                         convective_heat_fraction: csp_phys::DEFAULT_CONVECTIVE_HEAT_FRACTION,
                         terrain: None,
+                        ocean: None,
                     },
                     dominant: BodyId::from("p"),
                     bubble_radius_m: csp_sim::DEFAULT_BUBBLE_RADIUS_M,
