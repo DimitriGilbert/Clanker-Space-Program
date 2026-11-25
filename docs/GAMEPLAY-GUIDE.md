@@ -89,8 +89,8 @@ etc.; hint bars always print the key as your layout labels it.
 
 | Input | Where | Effect |
 |---|---|---|
-| Drag | flight | Orbit the chase camera (`csp-view/src/flight.rs: FlightEvent::Orbit`) |
-| Wheel | flight | Multiplicative zoom (`FlightEvent::Zoom`) |
+| Drag | flight | Orbit the chase camera 1:1 — it turns by exactly what the pointer travels (`csp-view/src/flight.rs: FlightEvent::Orbit`); pitch stops at ±89°. Dragged below the horizon the camera rides 0.3 m above the ground, sliding along it rather than going under (1.5 m above the datum over open water), and the ground never pushes it inside the craft's minimum distance — dragged straight down, it slides along the ground toward the craft and then goes round it at exactly that distance, and zooming in never moves it back out. Over a craft that is under the ground, or sunk below the water, the camera orbits from above the surface; for a craft at least an eye distance down — the whole orbit above the surface — a drag moves it there as freely as in flight, while a shallower craft keeps only its depth of clearance and the surface still lifts the eye when it looks down |
+| Wheel | flight | Zoom: the wheel sets a distance and the camera eases to it (80 ms half-life), between 3 m (1.5 × the craft's size for a big one) and 1,000 km (`FlightEvent::Zoom`) |
 | Drag / RMB or MMB drag / wheel | map | Orbit / pan / zoom-to-cursor; **click** a marker to focus (`csp-ui/src/lib.rs: map_overlay` hint bar) |
 | Click / drag / RMB | VAB | Select part / lift-to-move / remove hovered subtree; drop a lifted part on the palette to delete (`csp-ui/src/vab.rs: vab_pointer_input`) |
 | **RMB on a part** | **flight** | **Part action menu** — run science, deploy parachute, transmit/recover data, recover/terminate vessel (`csp-ui/src/program.rs: part_menu`) |
@@ -100,8 +100,11 @@ etc.; hint bars always print the key as your layout labels it.
 `Settings` (Esc): audio volume/mute, **vertical sync** and **render scale** (Graphics — vsync off
 asks for an uncapped frame rate where the platform and driver allow it; the log's `render:` line
 names the mode actually in use. Render scale 0.5–1.0 renders the 3D scene
-smaller and upscales it for fps while the UI stays sharp), UI scale, **max time warp**
-(×1…×100,000 — a QoL ceiling under the ladder, `WARP_CAP_OPTIONS` at `csp-ui/src/settings.rs:163`),
+smaller and upscales it for fps while the UI stays sharp), UI scale, **orbit sensitivity**
+(0.25–4, default 1.0 — scales every camera drag in flight, map and VAB) and **invert vertical
+orbit** (reverses the vertical half of an orbit drag in all three cameras — flight, map and VAB),
+**max time warp**
+(×1…×100,000 — a QoL ceiling under the ladder, `WARP_CAP_OPTIONS` at `csp-ui/src/settings.rs:227`),
 new-game difficulty (life support, dormant stress — applied only when a save is created), and the
 full key-binding grid with per-action rebind/clear (`Keymap::bind` evicts a stolen key so nothing
 double-fires). Settings persist to `$XDG_CONFIG_HOME/csp/settings.ron`
@@ -201,7 +204,11 @@ subassembly loading; no offset/rotate gizmo — positions are snap-attach only.
 The delivered craft sits **latched** on the pad; the HUD prints `ON PAD — [Z] to launch`
 (`csp-ui/src/lib.rs: flight_hud`). `Z` (throttle full) issues `SetThrottle`, which **unlatches**
 the craft and starts the climb. Fly with `Shift/Ctrl` (throttle), `WASD` (pitch/yaw), `Q/E`
-(roll), `Space` (stage). Chase camera: drag to orbit, wheel to zoom.
+(roll), `Space` (stage). Chase camera: drag to orbit, wheel to zoom (the distance eases to the
+wheel's target, 80 ms half-life). A craft is framed at four times its size whenever it takes the
+camera — a launch, a recovery — and the camera eases there rather than jumping; when the new
+craft is far away (a recovery on the far side of the planet) the camera makes the trip in half a
+second, over the ground, and keeps your orbit angles.
 
 ### 4.2 HUD and navball (what the numbers mean)
 

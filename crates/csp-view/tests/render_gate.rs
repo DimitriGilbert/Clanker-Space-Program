@@ -573,7 +573,7 @@ fn boot_scene_has_real_geometry() {
     // frame so the pixel-variety assertions measure real scene content.
     view.world
         .resource_mut::<csp_view::flight::FlightInput>()
-        .distance_m = 300.0;
+        .set_distance(300.0);
     for _ in 0..3 {
         frame(&mut view, 1);
     }
@@ -652,7 +652,7 @@ fn washed_out_scene_is_what_the_gate_rejects() {
     view.set_flight_viewport(f64::from(W), f64::from(H));
     view.world
         .resource_mut::<csp_view::flight::FlightInput>()
-        .distance_m = 300.0;
+        .set_distance(300.0);
     for _ in 0..3 {
         frame(&mut view, 1);
     }
@@ -1419,7 +1419,7 @@ fn dump_low() {
     view.set_flight_viewport(320.0, 240.0);
     {
         let mut input = view.world.resource_mut::<csp_view::flight::FlightInput>();
-        input.distance_m = dist;
+        input.set_distance(dist);
         input.pitch = pitch;
         input.yaw = yaw;
     }
@@ -1478,7 +1478,7 @@ fn dump_flight() {
         let mut input = view.world.resource_mut::<csp_view::flight::FlightInput>();
         input.yaw = env_f("DUMP_YAW", 0.7);
         input.pitch = env_f("DUMP_PITCH", 0.25);
-        input.distance_m = env_f("DUMP_DIST", 60.0);
+        input.set_distance(env_f("DUMP_DIST", 60.0));
     }
     // Wait for the REAL heightfield BEFORE lighting the engine — the
     // ascent loop below runs only seconds of wall time and the
@@ -2216,7 +2216,7 @@ fn dump() {
     view.set_flight_viewport(320.0, 240.0);
     view.world
         .resource_mut::<csp_view::flight::FlightInput>()
-        .distance_m = 25.0;
+        .set_distance(25.0);
     for _ in 0..3 {
         frame(&mut view, 1);
     }

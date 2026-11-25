@@ -1808,6 +1808,12 @@ fn rebuild_from_snapshot(
     // world — a drawn pose interpolated from them would slide the
     // restored craft in from where the old one flew.
     view.world.insert_resource(flight::PoseHistory::default());
+    // The chase camera's anchor belongs to it as well: left in place,
+    // the restored focus reads as a focus CHANGE and the camera travels
+    // to the loaded craft from wherever the replaced session orbited.
+    view.world
+        .resource_mut::<flight::FlightInput>()
+        .forget_anchor();
     // The restored `active_vessel` becomes the session's focus: the
     // quiet flight pin (no lease re-arm — the restored record carries
     // its own leases) re-anchors the camera/HUD — a rails record
@@ -2308,6 +2314,9 @@ impl View {
         // The rails-staged id set — the C19-F2 focus handoff's mirror
         // (same standalone-resource pattern as `LiveVesselCount`).
         world.insert_resource(flight::RailsStaged::default());
+        // The staged bounding radii — the chase camera's framing input
+        // (same standalone-resource pattern).
+        world.insert_resource(flight::CraftRadii::default());
         // The propulsion walk mirror — the HUD's live TWR/Δv/
         // burn-time figures (same standalone-resource pattern as
         // `LiveVesselCount`: `FlightSnapshot` cannot grow).
@@ -2368,7 +2377,8 @@ impl View {
             vab::vab_present,
             // §2.5: the drawn poses exist before anything solves
             // against them (the chase camera, the extract).
-            flight::flight_interp.before(flight::flight_present),
+            flight::flight_interp.before(flight::flight_camera),
+            flight::flight_camera,
             flight::flight_present,
             // M10: the tutorial's progress observer — reads the
             // Sync-written snapshot directly, so it stays independent
@@ -6243,7 +6253,7 @@ mod tests {
         assert!(cam.valid, "map camera must be solved in map mode");
         assert_eq!(cam.distance_m, map_dist);
         // …and the chase camera exists on its own resource.
-        let flight_dist = view.world.resource::<flight::FlightInput>().distance_m;
+        let flight_dist = view.world.resource::<flight::FlightInput>().distance_m();
         let fcam = view.world.resource::<flight::FlightCameraF64>();
         assert!(fcam.0.valid, "chase camera must solve with a staged vessel");
         assert_eq!(fcam.0.distance_m, flight_dist);
@@ -7701,6 +7711,9 @@ mod tests {
 
     /// C19-F4 regression: the chase camera reframes on a focus-id
     /// change — a zoom held on one vessel must not carry to the next.
+    /// Changed with the eased camera: the reframe sets the TARGET
+    /// distance (the old test pinned a snap of the camera to 60 m; it
+    /// now eases there, and the frame of the change moves nothing).
     #[test]
     fn camera_reframes_on_focus_change() {
         let mut view = View::new().expect("data/ load");
@@ -7726,14 +7739,40 @@ mod tests {
         view.sim_step(1).expect("step");
         view.end_frame();
         let focus = view.flight_focus().expect("a vessel is focused");
+        fn radius_of(view: &View, vessel: csp_sim::VesselId) -> f64 {
+            view.world
+                .resource::<flight::CraftRadii>()
+                .0
+                .iter()
+                .find(|(v, _)| *v == vessel.0)
+                .expect("every staged vessel carries its radius")
+                .1
+        }
+        let first = radius_of(&view, focus);
+        // First focus: the target is the craft's frame distance.
+        assert_eq!(
+            view.world
+                .resource::<flight::FlightInput>()
+                .distance_target_m(),
+            (4.0 * first).max(3.0).max(1.5 * first),
+            "first focus frames the craft at four radii, clamped to the limits"
+        );
         // Zoom in, then remove the focused vessel — focus moves.
         view.flight_event(flight::FlightEvent::Zoom { factor: 0.05 });
         view.begin_frame();
         view.end_frame();
-        assert!(
-            view.world.resource::<flight::FlightInput>().distance_m < 30.0,
-            "the zoom applied"
+        let input = view.world.resource::<flight::FlightInput>();
+        assert_eq!(
+            input.distance_target_m(),
+            3.0_f64.max(1.5 * first),
+            "the zoom applies to the target and stops at the distance floor"
         );
+        // No frame time is supplied here, so the camera is still where
+        // it started and nothing eases.
+        let (was_at, was_eye, was_view) = {
+            let cam = &view.world.resource::<flight::FlightCameraF64>().0;
+            (input.distance_m(), cam.eye, cam.view_proj)
+        };
         view.enqueue_command(
             SourceClass::Ui,
             PLAYER_SOURCE_ID,
@@ -7743,10 +7782,24 @@ mod tests {
         view.sim_step(view.sim.clock().ticks() + 1).expect("step");
         view.end_frame();
         assert_ne!(view.flight_focus(), Some(focus));
+        let next = view.flight_focus().expect("the other vessel takes focus");
+        let next_radius = radius_of(&view, next);
+        let input = view.world.resource::<flight::FlightInput>();
         assert_eq!(
-            view.world.resource::<flight::FlightInput>().distance_m,
-            60.0,
-            "a focus-id change must reframe to the default distance"
+            input.distance_target_m(),
+            (4.0 * next_radius).max(3.0).max(1.5 * next_radius),
+            "a focus-id change must reframe to the new vessel's frame distance"
+        );
+        assert_eq!(
+            input.distance_m(),
+            was_at,
+            "the distance the camera is at does not snap — it eases"
+        );
+        let cam = &view.world.resource::<flight::FlightCameraF64>().0;
+        assert_eq!(
+            (cam.eye, cam.view_proj),
+            (was_eye, was_view),
+            "the frame of the focus change moves neither the eye nor the view"
         );
     }
 

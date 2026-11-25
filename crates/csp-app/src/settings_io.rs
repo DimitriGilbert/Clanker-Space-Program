@@ -148,6 +148,9 @@ pub fn load_settings_from(path: &Path) -> (Settings, Vec<String>) {
 ///   `f32::clamp` passes NaN straight through, so `ui_scale: NaN`
 ///   would reach `egui::Context::set_zoom_factor` and NaN the whole
 ///   UI past the point the settings panel could fix it (P14-F3).
+/// - `orbit_sensitivity` — the multiplier on every camera drag: reset
+///   when non-finite, clamped into its range when a hand edit left it
+///   outside.
 ///
 /// Each repair appends one user-facing line to `notes`.
 #[cfg(not(target_arch = "wasm32"))]
@@ -179,6 +182,20 @@ fn normalize(s: &mut Settings, notes: &mut Vec<String>) {
     if !s.graphics.render_scale.is_finite() {
         s.graphics.render_scale = csp_view::settings::GraphicsSettings::default().render_scale;
         notes.push("graphics.render_scale was not a finite number — reset to default".into());
+    }
+    let (min, max) = (
+        csp_view::settings::ORBIT_SENSITIVITY_MIN,
+        csp_view::settings::ORBIT_SENSITIVITY_MAX,
+    );
+    if !s.graphics.orbit_sensitivity.is_finite() {
+        s.graphics.orbit_sensitivity = csp_view::settings::ORBIT_SENSITIVITY_DEFAULT;
+        notes.push("graphics.orbit_sensitivity was not a finite number — reset to default".into());
+    } else if !(min..=max).contains(&s.graphics.orbit_sensitivity) {
+        let asked = s.graphics.orbit_sensitivity;
+        s.graphics.orbit_sensitivity = asked.clamp(min, max);
+        notes.push(format!(
+            "graphics.orbit_sensitivity was {asked}, outside {min} to {max} — clamped"
+        ));
     }
 }
 
@@ -336,6 +353,8 @@ salvage_section_fn!(salvage_graphics, "graphics", csp_view::settings::GraphicsSe
     "render_scale": f32 => sec.render_scale,
     "ui_scale": f32 => sec.ui_scale,
     "window_size": [u32; 2] => sec.window_size,
+    "orbit_sensitivity": f32 => sec.orbit_sensitivity,
+    "invert_vertical": bool => sec.invert_vertical,
 });
 salvage_section_fn!(salvage_difficulty, "difficulty", csp_view::settings::DifficultySettings, sec, m, {
     "life_support_enabled": bool => sec.life_support_enabled,

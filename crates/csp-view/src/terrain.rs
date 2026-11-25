@@ -31,7 +31,7 @@ use crate::map::MapCameraF64;
 // runs through `HeightField::bake_profiled` at the body's authored
 // `ReliefProfile` dims (M5 §5.2-R2: 1024×512 ≈ 3.7 km texels Legacy,
 // 2048×1024 Mountain, at Terrin's 600 km radius); the width constant
-// stays imported for the camera-floor tap angle.
+// stays imported for the contact-dust ring's tap angle.
 use csp_core::terrain::{AMPLITUDE_FRAC, BAKE_WIDTH as HEIGHTFIELD_W, ReliefProfile};
 /// Fallback sun direction when the world has no resolvable star —
 /// unnormalized (callers divide by `norm`, like `flight.rs`'s copy).
@@ -625,21 +625,20 @@ struct SeaProbeMemo {
     rebuilds: u32,
 }
 
-/// The chase camera's ground floor along a unit `dir` (bubble-frame,
-/// inertial): the local terrain surface radius — `radius_m` plus the
-/// baked heightfield's bilinear sample scaled by the body's
-/// amplitude — taken as the MAX over a ±1.5-texel ring around the
-/// direction. A bilinear texel cell's peak sits at a corner, so the
-/// ring bounds the *rendered* surface under the eye even when the eye
-/// direction lands mid-cell on a spike; [`crate::flight`] clamps the
-/// solved eye above this + the eye margin so an orbit drag cannot
-/// bury the camera inside a hill (the datum-only floor let terrain
-/// poke through — the camera-went-underground defect).
+/// The contact-dust ring's anchor radius along a unit `dir`
+/// (bubble-frame, inertial): the local terrain surface radius —
+/// `radius_m` plus the baked heightfield's bilinear sample scaled by
+/// the body's amplitude — taken as the MAX over a ±1.5-texel ring
+/// around the direction, so the ring never hangs over an un-sampled
+/// dip. The chase camera's floor does NOT use this: it samples the
+/// surface under its own eye (`crate::flight::eye_floor` over
+/// [`ground_radius`] with no tap), because a ring as wide as a texel
+/// lifts the eye by the slope times the ring on any hillside.
 ///
 /// Body resolution and seeding match [`build_packet`] exactly (the
 /// authored table, else the `synthesized` fallback), and the
 /// inertial→fixed `unspin` conjugate is the same `R(axis, −phase)`
-/// the shader applies — the clamp measures the same surface the pass
+/// the shader applies — the ring measures the same surface the pass
 /// draws.
 pub(crate) fn surface_floor_radius(
     cfg: &TerrainConfig,
@@ -647,22 +646,32 @@ pub(crate) fn surface_floor_radius(
     env: &FlightEnv,
     dir: DVec3,
 ) -> f64 {
-    // Ring taps at ~1.5 equirect texels of angular offset (2π/W ≈
-    // 6.1 mrad at 1024 wide) — near the poles a fixed offset covers
-    // more longitude texels, which only widens the bound.
+    // Ring taps at ~1.5 equirect texels of the Legacy grid's angular
+    // offset (2π/W ≈ 6.1 mrad at 1024 wide) — near the poles a fixed
+    // offset covers more longitude texels, which only widens the bound.
     const TAP: f64 = 1.5 * 2.0 * core::f64::consts::PI / HEIGHTFIELD_W as f64;
     ground_radius(cfg, cache, env, dir, TAP)
 }
 
+/// The ocean datum radius (m) of `env`'s body — `None` for a dry body
+/// and for one with no authored entry (the synthesized fallback is dry,
+/// like [`TerrainBody::synthesized`]).
+pub(crate) fn ocean_datum_m(cfg: &TerrainConfig, env: &FlightEnv) -> Option<f64> {
+    let body_id = env.body.as_ref().map_or("", |b| b.as_str());
+    cfg.bodies.get(body_id).and_then(|b| b.ocean_datum_m)
+}
+
 /// The rendered terrain surface radius along an inertial unit `dir`:
 /// `radius_m` plus the baked heightfield's bilinear sample scaled by
-/// the body's amplitude, taken as the MAX over `dir` plus a ±`tap_rad`
-/// ring of four taps around it (radians on the unit sphere — pass a
-/// structure's footprint/radius to bound the ground under it). The
-/// shared core of [`surface_floor_radius`]: same body resolution,
-/// same `R(axis, −phase)` inertial→fixed conjugate the shader applies
-/// before `height_at`, so callers measure the surface the pass draws.
-/// `crate::structures` anchors the launch-site buildings on it.
+/// the body's amplitude — the surface itself at `dir`. A positive
+/// `tap_rad` widens it to the MAX over `dir` plus a ±`tap_rad` ring of
+/// four taps around it (radians on the unit sphere — pass a
+/// structure's footprint/radius to bound the ground under it); a zero
+/// tap samples the point alone. Body resolution and the `R(axis,
+/// −phase)` inertial→fixed conjugate are [`surface_floor_radius`]'s:
+/// the same surface the pass draws. `crate::structures` anchors the
+/// launch-site buildings on the ringed form; the chase camera's floor
+/// reads the point sample.
 /// While the background bake is in flight this returns the bare datum
 /// `radius_m` — the honest floor for a frame that draws no terrain
 /// (see [`TerrainCache::field`]).
@@ -693,27 +702,29 @@ pub(crate) fn ground_radius(
     let fixed = crate::structures::spin_rotation(env)
         .conjugate()
         .rotate(dir);
-    let (t1, t2) = {
-        let a = if fixed.z.abs() < 0.9 {
-            DVec3::Z
-        } else {
-            DVec3::X
-        };
-        let t = {
-            let t = fixed.cross(a);
-            if t.norm_squared() > 1.0e-12 {
-                t / t.norm()
+    let mut h = field.sample_dir(fixed);
+    if tap_rad > 0.0 {
+        let (t1, t2) = {
+            let a = if fixed.z.abs() < 0.9 {
+                DVec3::Z
             } else {
                 DVec3::X
-            }
+            };
+            let t = {
+                let t = fixed.cross(a);
+                if t.norm_squared() > 1.0e-12 {
+                    t / t.norm()
+                } else {
+                    DVec3::X
+                }
+            };
+            (t, fixed.cross(t))
         };
-        (t, fixed.cross(t))
-    };
-    let mut h = field.sample_dir(fixed);
-    for off in [t1 * tap_rad, -t1 * tap_rad, t2 * tap_rad, -t2 * tap_rad] {
-        let d = fixed + off;
-        if d.norm_squared() > 1.0e-12 {
-            h = h.max(field.sample_dir(d / d.norm()));
+        for off in [t1 * tap_rad, -t1 * tap_rad, t2 * tap_rad, -t2 * tap_rad] {
+            let d = fixed + off;
+            if d.norm_squared() > 1.0e-12 {
+                h = h.max(field.sample_dir(d / d.norm()));
+            }
         }
     }
     env.radius_m + h * body.amplitude_m
@@ -753,33 +764,26 @@ fn sky_view_rot(vp: &[[f64; 4]; 4], tan_y: f64, aspect: f64) -> [[f32; 4]; 4] {
     view_rot
 }
 
-/// The vessel blob-shadow anchor — `(uniform_row, craft_alt_m)`.
-/// The chase camera's focus IS the vessel CoM, so
-/// `focus = eye − z_out·distance_m` recovers it from the solved basis
-/// (column 2 of `view_rot` is the camera's world-frame z_out —
-/// `solve_chase_camera` points it focus → eye). The shadow lands where
-/// the down-sun ray from the craft meets the local surface:
-/// `craft − sun·(alt/μ☉)` in the local-horizontal approximation,
-/// clamped so a low sun doesn't fling the anchor kilometres away.
-/// No sim data crosses into the extract — this is pure camera math.
-/// A `w = 0` row disables the blob (no focus, night side, orbit
-/// altitude).
-#[allow(clippy::too_many_arguments)]
+/// The vessel blob-shadow anchor — `(uniform_row, craft_alt_m)`, for
+/// the FOCUSED craft, whose drawn CoM `craft_com` is handed in (bubble
+/// frame). It is never recovered from the camera: after a focus change
+/// the camera's anchor is still travelling to the craft, and a blob
+/// read off the camera slid in with it — hundreds of kilometres, for a
+/// far change. The shadow lands where the down-sun ray from the craft
+/// meets the local surface: `craft − sun·(alt/μ☉)` in the
+/// local-horizontal approximation, clamped so a low sun doesn't fling
+/// the anchor kilometres away. No sim data crosses into the extract —
+/// a drawn CoM is presentation data, like the camera. A `w = 0` row
+/// disables the blob (night side, orbit altitude).
 fn vessel_shadow(
-    view_rot: &[[f32; 4]; 4],
-    cam: &MapCameraF64,
+    craft_com: DVec3,
     env: &FlightEnv,
     field: &rt::HeightField,
     unspin: &DQuat,
     amplitude_m: f64,
     sun_dir: DVec3,
 ) -> ([f32; 4], f32) {
-    let z_out = DVec3::new(
-        f64::from(view_rot[2][0]),
-        f64::from(view_rot[2][1]),
-        f64::from(view_rot[2][2]),
-    );
-    let craft_rel = cam.eye - env.body_center - z_out * cam.distance_m;
+    let craft_rel = craft_com - env.body_center;
     let craft_r = craft_rel.norm();
     if !(craft_r.is_finite() && craft_r > env.radius_m * 0.5) {
         return ([0.0; 4], 0.0);
@@ -814,8 +818,10 @@ fn vessel_shadow(
 
 /// The `RenderExtract`-side packet build: quadtree select around the
 /// camera, per-patch instance baking, ocean emission, uniforms. Called
-/// from `extract_flight` — `cam`/`input` are the solved presentation
-/// camera; `env` is the staged physics environment.
+/// from `extract_flight` — `cam` is the solved presentation camera,
+/// `craft_com` the focused craft's drawn CoM (bubble frame; `None`
+/// with nothing focused, which draws no blob shadow), `env` the staged
+/// physics environment.
 ///
 /// **Arrival contract (M5 §5.2-R2 arrival polish):** while the real
 /// heightfield for the dominant body is still baking on the background
@@ -833,6 +839,7 @@ pub(crate) fn build_packet(
     cache: &mut TerrainCache,
     env: &FlightEnv,
     cam: &MapCameraF64,
+    craft_com: Option<DVec3>,
     viewport_px: (f64, f64),
     time_s: f64,
 ) -> rt::TerrainPacket {
@@ -962,18 +969,13 @@ pub(crate) fn build_packet(
     // Pending bake ⇒ no displaced surface ⇒ the blob has nowhere to
     // land: disarm it (the `w = 0` row is `blob_shadow`'s own off
     // switch) and zero `craft_alt` — that uniform only feeds the
-    // blob's altitude fade, which the disarm already killed.
-    let (shadow, craft_alt) = match field.as_ref() {
-        Some(field) => vessel_shadow(
-            &view_rot,
-            cam,
-            env,
-            field,
-            &unspin,
-            body.amplitude_m,
-            sun_dir,
-        ),
-        None => ([0.0; 4], 0.0),
+    // blob's altitude fade, which the disarm already killed. The same
+    // for a frame with no focused craft.
+    let (shadow, craft_alt) = match (field.as_ref(), craft_com) {
+        (Some(field), Some(craft_com)) => {
+            vessel_shadow(craft_com, env, field, &unspin, body.amplitude_m, sun_dir)
+        }
+        _ => ([0.0; 4], 0.0),
     };
 
     let atmo = (env.atm_top_m > 0.0).then_some(rt::AtmoDesc {
@@ -1192,6 +1194,82 @@ mod tests {
         assert_eq!(back.key, legacy.key);
     }
 
+    /// The blob shadow is placed from the CRAFT alone. `vessel_shadow`
+    /// takes the focused craft's CoM and nothing of the camera, so a
+    /// camera still travelling towards the craft after a far focus
+    /// change cannot drag the blob with it: a landed craft gets its
+    /// blob underneath, a slanted sun slides it down-sun, and the night
+    /// side, orbit altitude and a craft that is not a point above the
+    /// body disarm it.
+    #[test]
+    fn the_blob_shadow_is_placed_from_the_craft_alone() {
+        let env = FlightEnv {
+            body_center: DVec3::ZERO,
+            radius_m: 600_000.0,
+            atm_top_m: 0.0,
+            atm_scale_height_m: 0.0,
+            mu_m3_per_s2: 1.0,
+            body: Some(csp_data::BodyId::from("terrin")),
+            sun_dir: DVec3::X,
+            spin_axis: DVec3::Z,
+            spin_phase: 0.0,
+            body_spin: DVec3::ZERO,
+        };
+        // All-zero texels: the surface is the datum everywhere.
+        let flat = rt::HeightField {
+            width: 4,
+            height: 4,
+            data: vec![0.0; 16],
+            key: 0,
+        };
+        let unspin = crate::structures::spin_rotation(&env).conjugate();
+        let r = env.radius_m;
+        let near = |a: f32, b: f32| (a - b).abs() <= 1.0e-5 * b.abs().max(1.0);
+        let shadow =
+            |craft: DVec3, sun: DVec3| vessel_shadow(craft, &env, &flat, &unspin, 3_600.0, sun);
+        let landed = DVec3::new(r + 5.0, 0.0, 0.0);
+
+        // Sun straight overhead: the blob sits exactly under the craft.
+        let (row, alt) = shadow(landed, DVec3::X);
+        assert_eq!(alt, 5.0);
+        assert!(
+            near(row[0], 1.0) && row[1] == 0.0 && row[2] == 0.0,
+            "straight under the craft: {row:?}"
+        );
+        assert!(near(row[3], 8.1), "7 m + 0.22 per metre up: {:?}", row[3]);
+
+        // Out of the sun's hemisphere, too high, and no point above the
+        // body at all: no blob.
+        assert_eq!(
+            shadow(DVec3::new(0.0, 0.0, r + 5.0), DVec3::X),
+            ([0.0; 4], 5.0)
+        );
+        assert_eq!(
+            shadow(DVec3::new(r + 5_000.0, 0.0, 0.0), DVec3::X),
+            ([0.0; 4], 5_000.0)
+        );
+        assert_eq!(shadow(DVec3::ZERO, DVec3::X), ([0.0; 4], 0.0));
+
+        // Sun 30° off vertical towards +Y: the blob slides down-sun by
+        // the drop from 2 m above the craft — 7/cos 30° along the sun,
+        // so 7·tan 30° sideways, an angle of that over the radius.
+        let sun = DVec3::new(0.866_025_403_784_438_6, 0.5, 0.0);
+        let sideways_m = 7.0 * (sun.y / sun.x);
+        let (row, alt) = shadow(landed, sun);
+        assert_eq!(alt, 5.0);
+        let dir = DVec3::new(f64::from(row[0]), f64::from(row[1]), f64::from(row[2]));
+        assert!(
+            dir.x > 0.0 && dir.y < 0.0 && dir.z == 0.0,
+            "down-sun: {row:?}"
+        );
+        let angle = (-dir.y).atan2(dir.x);
+        let want = (sideways_m / (r - 2.0)).atan();
+        assert!(
+            (angle - want).abs() < 1.0e-9,
+            "slid {angle:.4e} rad down-sun, wanted {want:.4e}"
+        );
+    }
+
     /// The shared scene for the arrival-contract tests: Terrin's
     /// authored Mountain body (seed 601), an environment centred at
     /// the origin, and a solved camera 15 km above the north pole —
@@ -1252,7 +1330,7 @@ mod tests {
         // "only ever saw the real field".
         let mut saw_pending = false;
         for _ in 0..64 {
-            let p = build_packet(&cfg, &mut cache, &env, &cam, (320.0, 240.0), 0.0);
+            let p = build_packet(&cfg, &mut cache, &env, &cam, None, (320.0, 240.0), 0.0);
             match &p.heightfield {
                 // The wait state: sky (and the craft, drawn by the
                 // flight stream) only. A terrain or ocean instance
@@ -1301,7 +1379,7 @@ mod tests {
         let real_key = rt::HeightField::bake_profiled_key(601, ReliefProfile::Mountain);
         let mut landed = false;
         for _ in 0..4_000 {
-            let p = build_packet(&cfg, &mut cache, &env, &cam, (320.0, 240.0), 0.0);
+            let p = build_packet(&cfg, &mut cache, &env, &cam, None, (320.0, 240.0), 0.0);
             if let Some(h) = &p.heightfield {
                 assert_eq!(h.key, real_key, "the landed field is the authored bake");
                 assert_eq!(h.key & 1, 0);
@@ -1309,7 +1387,7 @@ mod tests {
                     !p.terrain.is_empty(),
                     "an eye above the surface must select terrain leaves again"
                 );
-                let next = build_packet(&cfg, &mut cache, &env, &cam, (320.0, 240.0), 0.0);
+                let next = build_packet(&cfg, &mut cache, &env, &cam, None, (320.0, 240.0), 0.0);
                 assert_eq!(
                     next.heightfield.as_ref().map(|h| h.key),
                     Some(real_key),
@@ -1334,6 +1412,7 @@ mod tests {
             &mut TerrainCache::default(),
             &env,
             &MapCameraF64::default(),
+            None,
             (320.0, 240.0),
             0.0,
         );
@@ -1382,6 +1461,7 @@ mod tests {
             &mut TerrainCache::default(),
             &env,
             &cam,
+            None,
             (320.0, 240.0),
             0.0,
         );
@@ -1524,7 +1604,7 @@ mod tests {
         };
         let mut near_case = None;
         for _ in 0..4_000 {
-            let p = build_packet(&cfg, &mut cache, &env, &near_cam, (320.0, 240.0), 0.0);
+            let p = build_packet(&cfg, &mut cache, &env, &near_cam, None, (320.0, 240.0), 0.0);
             if !p.terrain.is_empty() {
                 near_case = Some(p);
                 break;
@@ -1553,8 +1633,15 @@ mod tests {
             distance_m: 800_000.0,
             valid: true,
         };
-        let straddle_case =
-            build_packet(&cfg, &mut cache, &env, &straddle_cam, (320.0, 240.0), 0.0);
+        let straddle_case = build_packet(
+            &cfg,
+            &mut cache,
+            &env,
+            &straddle_cam,
+            None,
+            (320.0, 240.0),
+            0.0,
+        );
         check(&straddle_case);
         assert!(
             !straddle_case.terrain.is_empty(),
@@ -1598,7 +1685,7 @@ mod tests {
             distance_m: 2_000_000.0,
             valid: true,
         };
-        let far_case = build_packet(&cfg, &mut cache, &env, &far_cam, (320.0, 240.0), 0.0);
+        let far_case = build_packet(&cfg, &mut cache, &env, &far_cam, None, (320.0, 240.0), 0.0);
         check(&far_case);
         assert!(
             !far_case.terrain.is_empty(),

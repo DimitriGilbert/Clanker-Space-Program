@@ -219,8 +219,9 @@ bug-report bundle (§8).
    `csp-view/src/lib.rs → ProgramMirror`).
 2. **Sync schedule** (single-threaded): `sync_mirrors`, `map::sync_map`, `flight::sync_flight` —
    write `Clock`, `WarpMirror`, `FrameStats`, flight snapshot mirrors.
-3. **Presentation schedule**: `map::map_present`, `vab::vab_present`, `flight::flight_present`,
-   `tutorial::tutorial_drive` — interpolation, camera solve, VFX cue emission (`FlightSfx`).
+3. **Presentation schedule**: `map::map_present`, `vab::vab_present`, `flight::flight_interp`,
+   `flight::flight_camera`, `flight::flight_present`, `tutorial::tutorial_drive` —
+   interpolation, camera solve, VFX cue emission (`FlightSfx`).
 4. **UiBuild schedule**: `build_ui` (+ `map_pointer_input`) — the entire egui pass. Panels from
    `csp-ui` are called with plain-data mirrors; their outputs land in **`UiOutbox`**
    (`launch`, `program: Vec<SimCommand>`, `maneuver`, `craft_save/load`, `settings_apply`,

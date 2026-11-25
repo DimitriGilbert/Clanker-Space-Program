@@ -54,7 +54,9 @@ use csp_render::{FRAME_LATENCY_MAX, FRAME_LATENCY_MIN, Gpu};
 use csp_view::flight::FlightEvent;
 use csp_view::map::MapKeyEvent;
 use csp_view::settings::{
-    KeyAction, RENDER_SCALE_MAX, RENDER_SCALE_MIN, Settings, UI_SCALE_MAX, UI_SCALE_MIN,
+    GraphicsSettings, KeyAction, ORBIT_SENSITIVITY_DEFAULT, ORBIT_SENSITIVITY_MAX,
+    ORBIT_SENSITIVITY_MIN, RENDER_SCALE_MAX, RENDER_SCALE_MIN, Settings, UI_SCALE_MAX,
+    UI_SCALE_MIN,
 };
 use csp_view::vab::VabEvent;
 use csp_view::{EventClass, ModeSelect, SimCommand, SourceClass, View, ViewMode};
@@ -95,7 +97,8 @@ const PROGRESSION_SOURCE_ID: u32 = 4;
 /// Map camera controls (M1-D, PLAN §5.1 R0): orbit-drag sensitivity is
 /// defined inside `csp_view::map` (`MapKeyEvent::Orbit` takes radians) —
 /// these are only the winit-side unit conversions.
-/// Radians of camera yaw/pitch per pixel of left-drag.
+/// Radians of camera yaw/pitch per pixel of left-drag at the default
+/// orbit sensitivity ([`orbit_delta`] scales it).
 const DRAG_RAD_PER_PX: f64 = 0.005;
 /// `ln` of the zoom factor per `MouseWheel::LineDelta` line.
 const ZOOM_LN_PER_LINE: f64 = 0.18;
@@ -226,6 +229,29 @@ impl FramePhaseSmoother {
         let present = self.present[..self.filled].iter().sum::<f64>() / n;
         Some((cpu, present))
     }
+}
+
+/// The orbit sensitivity the input layer applies — clamped into its
+/// range, with the same non-finite guard `ui_scale` gets: `f32::clamp`
+/// passes NaN, and a NaN gain would NaN every camera.
+fn orbit_sensitivity(graphics: &GraphicsSettings) -> f32 {
+    let raw = graphics.orbit_sensitivity;
+    if raw.is_finite() {
+        raw.clamp(ORBIT_SENSITIVITY_MIN, ORBIT_SENSITIVITY_MAX)
+    } else {
+        ORBIT_SENSITIVITY_DEFAULT
+    }
+}
+
+/// Pointer travel (logical px) of a left-drag → the orbit's yaw and
+/// pitch increments (rad): the one place the settings reach a camera
+/// drag. The sensitivity scales both axes, the invert flips the
+/// vertical one. At the defaults this is exactly [`DRAG_RAD_PER_PX`]
+/// per pixel on each axis.
+fn orbit_delta(dx_px: f64, dy_px: f64, graphics: &GraphicsSettings) -> (f64, f64) {
+    let gain = DRAG_RAD_PER_PX * f64::from(orbit_sensitivity(graphics));
+    let vertical = if graphics.invert_vertical { -1.0 } else { 1.0 };
+    (dx_px * gain, dy_px * gain * vertical)
 }
 
 /// Assemble the render-configuration log line — the support surface
@@ -3803,10 +3829,8 @@ impl ApplicationHandler for App {
                     && self.map_dragging
                     && let Some(last) = self.last_cursor
                 {
-                    let (dyaw, dpitch) = (
-                        (pos.0 - last.0) * DRAG_RAD_PER_PX,
-                        (pos.1 - last.1) * DRAG_RAD_PER_PX,
-                    );
+                    let (dyaw, dpitch) =
+                        orbit_delta(pos.0 - last.0, pos.1 - last.1, &self.settings.graphics);
                     match self.view.mode() {
                         ViewMode::Map => self.view.map_event(MapKeyEvent::Orbit { dyaw, dpitch }),
                         ViewMode::Vab => self.view.vab_event(VabEvent::Orbit { dyaw, dpitch }),
@@ -4691,8 +4715,9 @@ mod tests {
     /// The Apply path end-to-end: staged settings become the live set,
     /// persist to the injected file, and reach their live targets —
     /// `ui_scale` sets the egui zoom factor, `max_warp_multiplier` caps
-    /// the controller's ladder, and the app-tracked `window_size`
-    /// survives the staged copy's stale value.
+    /// the controller's ladder, the orbit controls are what the next
+    /// drag reads, and the app-tracked `window_size` survives the
+    /// staged copy's stale value.
     #[test]
     fn settings_apply_persists_and_reaches_live_targets() {
         let dir = tempdir("apply");
@@ -4701,6 +4726,8 @@ mod tests {
         app.settings.graphics.window_size = [1920, 1080]; // a resize landed
         let mut staged = app.view.staged_settings();
         staged.graphics.ui_scale = 1.5;
+        staged.graphics.orbit_sensitivity = 2.0;
+        staged.graphics.invert_vertical = true;
         staged.gameplay.max_warp_multiplier = 100;
         staged.graphics.window_size = [1280, 720]; // stale staged value
         app.view.stage_settings(&staged);
@@ -4718,6 +4745,10 @@ mod tests {
         assert_eq!(app.warp.requested_multiplier(), 100);
         // The tracked window size won over the stale staged copy.
         assert_eq!(app.settings.graphics.window_size, [1920, 1080]);
+        // The applied orbit controls are what the next drag reads:
+        // twice the yaw, the vertical half inverted.
+        let (dyaw, dpitch) = orbit_delta(10.0, 10.0, &app.settings.graphics);
+        assert!((dyaw - 0.1).abs() < 1.0e-15 && (dpitch + 0.1).abs() < 1.0e-15);
         // Persisted: the injected path now holds the applied file.
         let (on_disk, _) = settings_io::load_settings_from(&path);
         assert_eq!(on_disk.gameplay.max_warp_multiplier, 100);
@@ -5134,6 +5165,112 @@ mod tests {
         assert_eq!(app.clamped_render_scale(), 1.0);
         app.settings.graphics.render_scale = f32::INFINITY;
         assert_eq!(app.clamped_render_scale(), 1.0);
+    }
+
+    /// The orbit drag at the default settings is the shipped one to the
+    /// last digit: 0.005 rad per pixel on each axis. The sensitivity
+    /// scales both axes, the invert flips only the vertical one, and
+    /// the multiplier is held to 0.25…4 with a non-finite value reset.
+    #[test]
+    fn orbit_delta_defaults_scale_and_invert() {
+        let mut graphics = GraphicsSettings::default();
+        for (dx, dy) in [(37.0, -12.0), (-0.5, 0.25), (200.0, 133.0)] {
+            assert_eq!(
+                orbit_delta(dx, dy, &graphics),
+                (dx * DRAG_RAD_PER_PX, dy * DRAG_RAD_PER_PX)
+            );
+        }
+        let near = |got: (f64, f64), want: (f64, f64)| {
+            assert!(
+                (got.0 - want.0).abs() < 1.0e-15 && (got.1 - want.1).abs() < 1.0e-15,
+                "{got:?} vs {want:?}"
+            );
+        };
+        graphics.orbit_sensitivity = 2.0;
+        near(orbit_delta(10.0, -4.0, &graphics), (0.1, -0.04));
+        graphics.invert_vertical = true;
+        near(orbit_delta(10.0, -4.0, &graphics), (0.1, 0.04));
+        graphics.orbit_sensitivity = 0.0;
+        near(orbit_delta(10.0, -4.0, &graphics), (0.0125, 0.005));
+        graphics.orbit_sensitivity = 100.0;
+        near(orbit_delta(10.0, -4.0, &graphics), (0.2, 0.08));
+        graphics.orbit_sensitivity = f32::NAN;
+        near(orbit_delta(10.0, -4.0, &graphics), (0.05, 0.02));
+        graphics.orbit_sensitivity = f32::INFINITY;
+        near(orbit_delta(10.0, -4.0, &graphics), (0.05, 0.02));
+    }
+
+    /// The orbit controls load like the other graphics fields: a file
+    /// written before they existed gives the shipped feel, a multiplier
+    /// outside 0.25…4 is clamped and a non-finite one reset — each with
+    /// a note — and both survive the salvage of a partly unreadable
+    /// Graphics section.
+    #[test]
+    fn load_defaults_clamps_and_salvages_the_orbit_controls() {
+        let dir = tempdir("orbit");
+        let path = dir.join("settings.ron");
+        std::fs::write(&path, "(graphics: (ui_scale: 1.25))").unwrap();
+        let (loaded, notes) = settings_io::load_settings_from(&path);
+        assert_eq!(loaded.graphics.orbit_sensitivity, 1.0);
+        assert!(!loaded.graphics.invert_vertical);
+        assert_eq!(loaded.graphics.ui_scale, 1.25);
+        // (The file carries no keymap, so the backfill note is expected.)
+        assert!(
+            notes.iter().all(|n| !n.contains("orbit")),
+            "the shipped value needs no repair: {notes:?}"
+        );
+
+        // One repair of the orbit controls, one note naming it.
+        let orbit_notes = |notes: &[String]| {
+            notes
+                .iter()
+                .filter(|n| n.contains("orbit_sensitivity"))
+                .count()
+        };
+        std::fs::write(
+            &path,
+            "(graphics: (orbit_sensitivity: 12.0, invert_vertical: true))",
+        )
+        .unwrap();
+        let (loaded, notes) = settings_io::load_settings_from(&path);
+        assert_eq!(loaded.graphics.orbit_sensitivity, ORBIT_SENSITIVITY_MAX);
+        assert!(loaded.graphics.invert_vertical);
+        assert_eq!(orbit_notes(&notes), 1, "{notes:?}");
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("orbit_sensitivity") && n.contains("clamped")),
+            "{notes:?}"
+        );
+
+        std::fs::write(&path, "(graphics: (orbit_sensitivity: 0.05))").unwrap();
+        let (loaded, notes) = settings_io::load_settings_from(&path);
+        assert_eq!(loaded.graphics.orbit_sensitivity, ORBIT_SENSITIVITY_MIN);
+        assert_eq!(orbit_notes(&notes), 1, "{notes:?}");
+
+        std::fs::write(&path, "(graphics: (orbit_sensitivity: NaN))").unwrap();
+        let (loaded, notes) = settings_io::load_settings_from(&path);
+        assert_eq!(loaded.graphics.orbit_sensitivity, ORBIT_SENSITIVITY_DEFAULT);
+        assert!(
+            notes.iter().any(|n| n.contains("not a finite number")),
+            "{notes:?}"
+        );
+
+        // An unknown quality tier fails the strict parse; the two new
+        // leaves are still salvaged from the Graphics section.
+        std::fs::write(
+            &path,
+            "(graphics: (quality: ultra, orbit_sensitivity: 3.0, invert_vertical: true))",
+        )
+        .unwrap();
+        let (loaded, notes) = settings_io::load_settings_from(&path);
+        assert_eq!(loaded.graphics.orbit_sensitivity, 3.0);
+        assert!(loaded.graphics.invert_vertical);
+        assert_eq!(loaded.graphics.quality, GraphicsSettings::default().quality);
+        assert!(
+            notes.iter().any(|n| n.contains("partially unreadable")),
+            "{notes:?}"
+        );
     }
 
     /// §6.3 demo mode: the app flag comes from the view, craft-file

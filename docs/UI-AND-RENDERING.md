@@ -57,12 +57,12 @@ winit RedrawRequested → App::render (lib.rs:841)
   paint:                                  tessellate FullOutput, draw scene pass + egui pass
 ```
 
-Schedule membership (`crates/csp-view/src/lib.rs:2066-2092`):
+Schedule membership (`crates/csp-view/src/lib.rs:2362-2392`):
 
 - **Input**: `map::apply_map_input`, `vab::apply_vab_input`, `flight::apply_flight_input` — drain event queues staged by `csp-app`.
 - **SimStep**: single-threaded executor; the actual `step_frame` call sits in `View::sim_step` (a bevy system cannot reach `self.sim`).
-- **Sync**: `sync_mirrors` + `map::sync_map` + `flight::sync_flight` — copy staged post-step values into mirrors. The **sole writers** of `Clock`, `WarpMirror`, `FrameStats` (`lib.rs:435`).
-- **Presentation**: `map::map_present`, `vab::vab_present`, `flight::flight_present`, `tutorial::tutorial_drive` — camera solves, LOD, VFX, cue edges.
+- **Sync**: `sync_mirrors` + `map::sync_map` + `flight::sync_flight` — copy staged post-step values into mirrors. The **sole writers** of `Clock`, `WarpMirror`, `FrameStats` (`lib.rs:471`).
+- **Presentation**: `map::map_present`, `vab::vab_present`, `flight::flight_interp` → `flight::flight_camera` → `flight::flight_present`, `tutorial::tutorial_drive` — camera solves, LOD, VFX, cue edges.
 - **UiBuild**: `build_ui` then `map_pointer_input.after(build_ui)` — the entire egui pass.
 - **RenderExtract**: `map::extract_map`, `vab::extract_vab`, `flight::extract_flight` — produce plain-data render packets.
 
@@ -83,7 +83,7 @@ staging calls `stage_vab_tech` (`lib.rs:3548`) and `stage_program`
 | `ProgramMirror` (`lib.rs:231`) | `View::stage_program` | every `end_frame` | the whole progression surface — see §3.7 |
 | `ScriptLogMirror` (`lib.rs:276`) | `View::push_script_log` | per step | rolling 64-line script console tail |
 | `map::MapSnapshot` / `MapScene` / `MapUiData` / `MapPlanning` | `sync_map` / `map_present` / UiBuild | frame | orbit states, polylines, labels, alarm book |
-| `flight::FlightSnapshot` / `FlightUiData` / `VesselPropulsionStaged` / `LiveVesselCount` | `sync_flight` / `flight_present` | frame | InBubble+latched vessels, HUD figures, Δv walk |
+| `flight::FlightSnapshot` / `FlightUiData` / `VesselPropulsionStaged` / `LiveVesselCount` / `CraftRadii` | `sync_flight` / `flight_camera` / `flight_present` | frame | InBubble+latched vessels, HUD figures, Δv walk, bounding radii |
 | `vab::VabSessionRes` | UiBuild + `vab_event` plumbing | on event | the working craft (§5) |
 | `GameMenuRes`, `SettingsPanelRes`, `PartMenuRes`, `PanelFlags`, `tutorial::TutorialRes` | UiBuild / app plumbing | session state | panel visibility & widget state (§2.2-C: never sim state) |
 
@@ -158,11 +158,16 @@ event in a fixed order:
      becomes a VAB GPU-pick candidate (`lmb_click_candidate`) whose release
      position is the pick pixel.
    - `CursorMoved` while dragging → orbit deltas per mode
-     (`MapKeyEvent::Orbit` / `VabEvent::Orbit` / `FlightEvent::Orbit`).
-     `last_cursor` updates even on consumed moves (else a drag crossing a
-     panel takes one large jump).
+     (`MapKeyEvent::Orbit` / `VabEvent::Orbit` / `FlightEvent::Orbit`),
+     through `orbit_delta` — the one place the settings reach a drag:
+     `0.005 rad × orbit_sensitivity` per pixel on each axis, the vertical
+     half negated under *invert vertical orbit*. The defaults are the bare
+     `0.005`, the pre-settings drag to the last digit. `last_cursor`
+     updates even on consumed moves (else a drag crossing a panel takes one
+     large jump).
    - `MouseWheel` → multiplicative zoom (`exp(−lines)` — scroll-up is
-     zoom-in in every camera convention).
+     zoom-in in every camera convention; in flight it multiplies the
+     eased distance's target, §5.1).
 
 `key_press` resolves the event through the **live** `Keymap`
 (`settings_io::keycode_token` physical first, `key_token` logical fallback),
@@ -245,7 +250,7 @@ output structs out; the sim is never read (crate doc,
 
 | Panel | Anchor | Purpose |
 |---|---|---|
-| Settings window (`settings_panel`) | `csp-ui/src/settings.rs:754` | Keymap rebind (arms capture), Graphics: vertical sync + render scale (P1, §7.2.2) + ui_scale, warp cap, audio volumes, new-game difficulty flags, reset-to-defaults. Apply rides `settings_apply`; the app owns file IO. |
+| Settings window (`settings_panel`) | `csp-ui/src/settings.rs:842` | Keymap rebind (arms capture), Graphics: vertical sync + render scale (P1, §7.2.2) + ui_scale + orbit sensitivity (0.25–4, default 1.0) + invert vertical orbit, warp cap, audio volumes, new-game difficulty flags, reset-to-defaults. Apply rides `settings_apply`; the app owns file IO. |
 | Crash dialog (`crash_dialog`) | `csp-ui/src/lib.rs:219` | §2.13 Fatal: reason + bug-report bundle path ("send this to the developer"). Session turns read-only. |
 | Tutorial checklist (`tutorial_overlay`) | `csp-ui/src/tutorial.rs:318` | 10-step first-flight checklist (`STEPS`, `tutorial.rs:70`; VAB steps coached from inside the editor). Progress predicates run in Presentation (`csp-view/src/tutorial.rs:62` `tutorial_drive`) against staged mirrors only. Dismiss/Restart are session state; progress survives hide/show. |
 | Debug panel (`debug_panel`) | `csp-ui/src/lib.rs:170` | Dev scaffold: adapter/backend, tick/frame counters, warp requested/effective. Off by default; `ToggleDebug` key. Hidden in VAB. |
@@ -474,13 +479,154 @@ fresh launch). The `TakeControl{Player}` lease transfer issues on the pin's
 `seen` edge in `end_frame` (`lib.rs:2261-2283`) — never optimistically at
 press time.
 
-`flight_present` (`flight.rs:1730`) solves the chase camera
-(`solve_chase_camera`, `flight.rs:1524`, FOV 0.9 rad, terrain-floor aware via
-`terrain::surface_floor_radius`) and derives the HUD mirrors: attitude
-(`stage_attitude`, `flight.rs:1974` — heading/pitch/roll, navball
-body-frame up/north/east/prograde, surface-relative speed = v − ω×r) and the
-propulsion walk (`stage_propulsion`/`delta_v_walk_from` → per-stage Δv, TWR,
-burn time — the Kerbal Engineer-equivalent readouts).
+**The chase camera** (`flight_camera` → `step_chase_camera`, FOV 0.9 rad) is
+an orbit camera in the local-level frame at the craft — up is the radial,
+north the spin axis projected level — so the horizon stays level wherever
+the craft is. Session state only: nothing here is sim state.
+
+- **Drawn pose (§2.5 interpolation).** Every vessel is drawn between its
+  previous and its current tick at the frame's fractional tick remainder
+  (`flight_interp`, `DrawnScene`; `View::set_tick_fraction` is `csp-app`'s
+  hand-off, `warp.rs` the source). The camera solves from the CoM as drawn,
+  so craft and camera travel the same step. Nothing extrapolates; the
+  planet's spin phase is interpolated too.
+- **Drag.** `yaw`/`pitch` take the event's radians exactly — nothing smooths
+  or delays a drag. Pitch stops at ±89°.
+- **Zoom.** The wheel multiplies a *target* distance; the distance eases
+  toward it by `1 − exp2(−dt / 80 ms)` of what is left per frame (`dt` is
+  the frame's wall time, clamped like the frame dt). The same wall time
+  closes the same share at any frame rate; nothing overshoots.
+- **Limits.** 3 m to 1e6 m, the near limit raised to 1.5 × the craft's
+  bounding radius — the farthest collider-AABB corner from the CoM
+  (`bounding_radius`, staged once per craft revision into `CraftRadii`).
+- **Framing.** The frame a vessel takes the focus, first focus or change,
+  the target becomes 4 × its bounding radius, clamped to the limits, and
+  the camera eases there. No snap (C19-F4).
+- **Floor.** The eye stays 0.3 m above the heightfield's surface under it —
+  `ground_radius` sampled at the eye's own ground point, `eye_floor`. Where
+  the body has an ocean the eye also keeps 1.5 m over the datum once the
+  water is 1.2 m deep, easing to the land floor across the shoreline; a dry
+  body has the terrain floor alone. The eye may sit level with or below a
+  landed or capsized craft's CoM.
+- **The floor lifts the point, never the angles.** The eye is the intent's
+  orbit point about the anchor; under the floor it is that same point
+  lifted along the local up onto the floor — radially out from the body
+  centre, sampled under the point itself (`solve_orbit`). Yaw, pitch and
+  distance are the player's and are never rewritten: no pitch is searched
+  for and none is written back. The eye is continuous in the intent: no
+  step as the orbit point crosses the floor, in either direction. What the
+  lift keeps of a drag is the orbit point's share along the floor,
+  `d·cos(pitch)`, whose slope in pitch is zero at the anchor's own level —
+  which the next two rules are for.
+- **Anchor.** The camera orbits the craft's *resting anchor*
+  (`resting_anchor`): its drawn CoM while the craft is at or above the
+  floor. A craft `depth` under the floor — buried in the ground, sunk
+  below the ocean's — has every orbit point lifted, so its anchor rises
+  along the local up to `depth + min(depth, eye distance)` over its CoM: a
+  craft at least an eye distance down is orbited from a whole eye distance
+  over the floor and a drag moves the eye as freely as in flight; a
+  shallower one keeps `depth` of clearance. The camera looks at the craft,
+  never at the lifted anchor.
+- **Least distance on the ground.** The lift could take the eye inside the
+  craft's least distance: dragged straight down, it ended 0.3 m over the
+  craft's own ground point. A lifted eye that is nearer than the least
+  distance goes round the craft instead (`skirt_eye`, `KeptOut::rule`).
+  From the floor point `n` under the craft, out along the yaw's side of
+  it, the orbit point sits `h` metres along the floor, signed. The zone is
+  the stretch of that line nearer than `rmin` from the CoM: from the turn
+  point `h*` on the yaw's side to the far edge on the other. Outside the
+  zone the eye is the orbit point itself. Inside it the eye rides the floor
+  at exactly the least distance — the circle around `n` where the floor is
+  `rmin` from the CoM — entering at the turn point, going round the yaw's
+  own side (the way an increasing yaw moves the eye) and leaving at the
+  far edge. Its place on the circle is `skirt_azimuth` of its place in the
+  zone, a monotonic function of the intent: dragging down or zooming in
+  carries the eye forward round the craft, dragging up or zooming out
+  brings it back, a reversed drag retraces the path, and the eye never
+  turns back on a drag that goes on the same way. On flat ground `h*` is
+  `sqrt(rmin² − H²)`, `H` the CoM's signed height over `n`; both edges and
+  the circle itself are measured on the real floor (`clear_from`), so the
+  rule holds on a slope too — there the zone is not a circle about `n`:
+  uphill the floor rises toward the CoM and the zone reaches further out.
+  The eye sets off at the drag's own pace along the ground — the frame
+  that enters moves no more than the drag's step — and settles over the
+  first quarter of the way onto `skirt_plateau` (1.65) times the orbit
+  point's slide, the pace that carries it round by the far edge: the half
+  circumference is `π·h*` against `2·h*` of slide straight across. At rest
+  the pitch limit keeps the orbit point on the yaw's side, so a drag
+  enters at the turn and ends about 80° round the circle; the far edge is
+  met only by a focus travel. A floor whose point under the craft already
+  clears it (a craft high over rising ground) has no zone about the craft:
+  the eye is put past that band of ground's far edge instead.
+- **Focus change.** The camera's anchor starts where the previous frame's
+  eye orbited — the previous craft's resting anchor — and eases to the new
+  craft's resting anchor, so the frame of the change carries no jump:
+  before any frame time is put in, the eye and the view are exactly what
+  they were, and with frame time they move one step of the travel. What
+  the previous focus was looking at, and its eye's offset from its orbit
+  point, is carried along and handed over by `travel_blend` over the last
+  of the travel — the shorter of the eye distance and the travel's own
+  length. The travel takes its own half-life
+  (`travel_half_life`): the zoom's for a short change, shortened so that
+  every travel — 20 m or 850 km — is under 1 mm within 0.5 s at any frame
+  rate; a change that is already under 1 mm (or from an anchor that is not
+  a number) is no travel at all. The travel is a straight line, so a long
+  one crosses the planet: while the anchor would be under the floor it is
+  lifted radially to the floor plus a margin of its depth up to one eye
+  distance (`travel_anchor`), fading out over the last eye distance of
+  travel — so the floor never has to touch the orbit angles on a focus
+  change. A loaded world is a first focus (`FlightInput::forget_anchor`
+  beside the `PoseHistory` reset), never a travel in from the replaced
+  session. Under 1 mm of travel the anchor is the resting anchor exactly.
+- **Keep-out on a travel.** A focus's keep-out is a ball of its least
+  distance about its CoM; at rest only the floor lift can take the orbit
+  point into it (the rule above). On a travel the new craft's keep-out
+  acts at once on the travelling orbit point — with whatever is still
+  carried of the previous craft's skirt, which is kept out of the new
+  craft as well — whether the point rides the floor or is in the air.
+  Carried into the ball, the eye rides the ball from where its way
+  enters to where the orbit point's own way leaves it (`KeptOut::ride`,
+  `KeptOut::round_way`): the sphere wherever that is above the floor, the
+  floor's least-distance circle wherever it is under it, by the nearer
+  way round and along a diameter by the yaw's own side, so it passes over
+  or round the craft — never through it. The way is the nearer one,
+  always; for a travel that comes to rest inside the ball it is the short
+  arc from the entry to the at-rest eye, and the eye is there before the
+  travel settles, so the travel ends on the at-rest keep-out exactly.
+- **Pace.** No frame moves the eye more than a tenth beyond the one
+  before, over the frames moving more than a millimetre, in every
+  placement (`Pace::cap_m`, read as the eye itself moves; the first frame
+  of a travel is paced by the travel's own step). Toward the camera's
+  side and on the yaw's own side the way round is 1.6 to 2.9 times the
+  orbit point's remaining run; the ride used to take the orbit point's
+  progress as its own and moved 1.78 times the frame before from the
+  frame it entered. Its pace is its own now: it keeps its share of the
+  orbit point's remaining run where its pace allows and, held back,
+  makes up what it owes as its pace allows — it is at the way out about
+  when the orbit point is — and what it has left of a ride to a place it
+  must be at falls off by `ride_taper` of a frame, so it is there within
+  a tenth of a millimetre by the time the travel settles.
+- **The eye began inside the ball.** Where the eye itself begins the
+  travel inside the new craft's least distance (`FocusTravel::began_inside`)
+  the orbit point's own way may run on through the craft, so the eye does
+  not follow it (it used to be handed over along that way: 0.62 m from
+  the CoM, under the craft, before it came out). It leaves the ball by the
+  nearest way out (`KeptOut::outward`: straight out from the CoM, or
+  along the floor to the least-distance circle where the ball is under
+  it) and goes round the craft to where the orbit point's way leads, or
+  makes for the orbit point round the craft once its way has left the
+  ball (`KeptOut::chase`). Its distance to the craft's centre never
+  falls on any frame; the frame of the change still moves nothing.
+- **Direct placement.** `FlightInput::set_distance` sets the current and the
+  target distance together, and a harness that supplies no frame time
+  (`update_session`) steps nothing. The render gates place the camera that
+  way.
+
+`flight_present` derives the HUD mirrors: attitude (`stage_attitude` —
+heading/pitch/roll, navball body-frame up/north/east/prograde,
+surface-relative speed = v − ω×r) and the propulsion walk
+(`stage_propulsion`/`delta_v_walk_from` → per-stage Δv, TWR, burn time — the
+Kerbal Engineer-equivalent readouts).
 
 ### 5.2 VFX: plume, plasma, dust (the §3.7 floor)
 
@@ -966,9 +1112,13 @@ finer filtered normal retilings above. `uniforms.art.z = 1` (render-gate
 pre-4b plain periodic tiling verbatim for before/after evidence pairs.
 
 The vessel blob shadow (`uniforms.shadow`, `vessel_shadow`,
-`csp-view/src/terrain.rs:497`) anchors the focused craft's shadow to the
-surface; `csp-view/terrain.rs::build_packet` (`:560`) assembles the whole
-`TerrainPacket` per frame from the staged `FlightEnv` + chase camera.
+`csp-view/src/terrain.rs:778`) anchors the focused craft's shadow to the
+surface — from the craft's drawn CoM, which `extract_flight` resolves and
+hands in; never from the camera, whose anchor is still travelling to the
+craft for the first frames after a focus change;
+`csp-view/terrain.rs::build_packet` (`:837`) assembles the whole
+`TerrainPacket` per frame from the staged `FlightEnv`, the chase camera
+and that CoM.
 
 **Shadow cascades (R1 core, landed 3a — ARMED since 3b; the R1 debt is
 closed).** `csp-render/src/shadow.rs` owns the whole cascade core: the
@@ -1004,13 +1154,20 @@ forward-Z-along-travel, lit ⇔ ref ≤ stored), pinned by the
 
 1. *View solve* (`csp-view/src/flight.rs`, RenderExtract — §2.5:
    presentation-only, never the sim): inside `extract_flight`'s terrain
-   gate, `cascade_uniforms` recovers the chase basis from the solved
+   gate, `cascade_uniforms` recovers the camera's forward from the solved
    `view_proj` (row 3 is `−z_out` under reverse-Z, the same recovery
-   `sky_view_rot` uses) and hands `solve_cascades` the forward/up/
-   `FLIGHT_FOV_Y`/viewport aspect/near 0.1 + the staged `FlightEnv` sun.
+   `sky_view_rot` uses) and takes the local up from the FOCUSED craft —
+   the direction of its drawn CoM from the body centre, the blob shadow's
+   anchor, handed in by name — never from the camera, which for the
+   first frames after a focus change is still travelling toward the
+   craft: the shadows stay with the craft through the travel. With
+   nothing focused the point the camera looks at (`eye − z_out·distance_m`)
+   supplies the up. It hands
+   `solve_cascades` that forward and up, `FLIGHT_FOV_Y`, the viewport
+   aspect, near 0.1 and the staged `FlightEnv` sun.
    The product rides the flight packet (`FlightPacket::shadow`,
    consumed via `View::take_flight_packet` like every other packet
-   row). **Arm predicate**: solve only while sun·up at the chase focus
+   row). **Arm predicate**: solve only while sun·up at the focused craft
    exceeds `SHADOW_ARM_SUN_UP = 0.06` (≈3.4° elevation — just above
    `sun_occlusion`'s 0.035 full-occlude and the blob's 0.04 disable, so
    no band exists where the cascade replaces a dimmer fallback; below

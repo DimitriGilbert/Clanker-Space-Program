@@ -295,8 +295,8 @@ fn drawn(view: &View, id: VesselId) -> DrawnPose {
 }
 
 /// The point the chase camera orbits this frame, recovered from its
-/// matrix the way the extract does (`cascade_uniforms`): `eye −
-/// z_out · distance`.
+/// matrix by the camera's own convention — `distance_m` is the actual
+/// eye–anchor distance: `eye − z_out · distance`.
 fn camera_focus(view: &View) -> DVec3 {
     let cam = &view.world.resource::<FlightCameraF64>().0;
     assert!(cam.valid, "the chase camera must solve for a staged craft");
