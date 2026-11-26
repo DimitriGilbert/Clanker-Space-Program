@@ -1674,15 +1674,8 @@ pub struct View {
     /// evicted entries carry older ticks and can never resurface.
     /// Session state only — never sim state.
     notice_cursor: Option<(u64, u32)>,
-    /// The launch snapshot for revert-to-launch (PLAN:1180 —
-    /// "revert is not a reroll": the same pre-drawn θ records ride the
-    /// restore, so the same parts still fail at the same Λ). Captured
-    /// in `launch_craft` before the order's commands enqueue, then
-    /// recaptured at the delivery boundary (see [`RevertCapture`]) —
-    /// `launch_craft` itself can only ever see the pre-ORDER world,
-    /// its own commands still being pending. `Err` text records why
-    /// no revert point exists (a §7.4 snapshot refusal).
-    pre_launch: Option<Result<WorldSnapshot, String>>,
+    /// The launch revert point — see [`RevertPoint`].
+    pre_launch: Option<RevertPoint>,
     /// A launch awaiting its delivery-boundary recapture — see
     /// [`RevertCapture`]. Session state tied to this session's launch
     /// press: `rebuild_from_snapshot` clears it alongside `pre_launch`
@@ -1748,6 +1741,38 @@ enum RevertCapture {
     Delivered,
 }
 
+/// The revert-to-launch point (PLAN:1180 — "revert is not a reroll":
+/// the same pre-drawn θ records ride the restore, so the same parts
+/// still fail at the same Λ). Captured in `launch_craft` before the
+/// order's commands enqueue, then recaptured at the delivery boundary
+/// (see [`RevertCapture`]) — `launch_craft` itself can only ever see
+/// the pre-ORDER world, its own commands still being pending.
+///
+/// The stage plans ride beside the snapshot: they are session state
+/// the snapshot cannot hold, and they name the very `VesselId`s the
+/// restore brings back. A point taken without them reverts onto a
+/// craft whose stages are gone.
+struct RevertPoint {
+    /// The captured world; `Err` text records why no revert point
+    /// exists (a §7.4 snapshot refusal).
+    snapshot: Result<WorldSnapshot, String>,
+    /// [`flight::StagePlans`] as they stood when the snapshot was taken,
+    /// each plan bound to the vessel it fires at in that snapshot
+    /// ([`flight::StagePlans::captured_for_revert`]) — stored unbound, a
+    /// plan came back with the revert and bound to the next launch of
+    /// the same craft.
+    plans: flight::StagePlans,
+}
+
+/// How [`rebuild_from_snapshot`] refills the stage plans it resets.
+enum Restage {
+    /// A load: a save holds no plans, so each restored craft gets the
+    /// one its own parts imply ([`flight::StagePlans::from_restored_world`]).
+    FromRestoredCrafts,
+    /// A revert: the plans as they stood when the point was captured.
+    Captured(flight::StagePlans),
+}
+
 /// §2.5's interpolation resources — installed with the flight view's
 /// (`View::with_sim`): the frame's fractional tick remainder, the
 /// flight view's previous-tick poses, and what the frame draws.
@@ -1762,13 +1787,17 @@ fn insert_interp_resources(world: &mut World) {
 /// ([`SimWorld::install_config`]) and the control engines the
 /// snapshot cannot carry (`RhaiHost`/`AscentAutopilot` — the same
 /// pair `from_source` installs). Resets every sim-keyed session
-/// mirror (`StagePlans`, `MapPlanning`, the focus pin, the latched
-/// weld cache, the script log, the notice cursor) and lands the
-/// session in Flight — the restored world is a different vessel set,
-/// so no stale binding may survive.
+/// mirror (`MapPlanning`, the focus pin, the latched weld cache, the
+/// script log, the notice cursor) and lands the session in Flight —
+/// the restored world is a different vessel set, so no stale binding
+/// may survive. The stage plans are the one mirror that comes back
+/// here, because the restored crafts do need theirs: `restage` says
+/// whether they are derived from those crafts (a load) or put back as
+/// captured (a revert).
 fn rebuild_from_snapshot(
     view: &mut View,
     snapshot: WorldSnapshot,
+    restage: Restage,
 ) -> Result<Vec<String>, SimError> {
     // C02-F2: the focus record rides the snapshot — read it before
     // `restore` consumes the struct, then re-anchor the session on it
@@ -1801,7 +1830,11 @@ fn rebuild_from_snapshot(
     view.revert_capture = None;
     view.world
         .insert_resource(flight::LatchedWeldCache::default());
-    view.world.insert_resource(flight::StagePlans::default());
+    let plans = match restage {
+        Restage::FromRestoredCrafts => flight::StagePlans::from_restored_world(&view.sim),
+        Restage::Captured(plans) => plans,
+    };
+    view.world.insert_resource(plans);
     view.world.insert_resource(map::MapPlanning::default());
     view.world.insert_resource(ScriptLogMirror::default());
     // The restored vessels' previous-tick poses belong to the replaced
@@ -2582,7 +2615,17 @@ impl View {
         if matches!(self.revert_capture, Some(RevertCapture::Delivered))
             && let Ok(snap) = self.sim.snapshot()
         {
-            self.pre_launch = Some(Ok(snap));
+            // The plans go with the snapshot BOUND to the craft this
+            // launch berthed (`StagePlans::captured_for_revert`): this
+            // world is the one a revert restores, and every plan in it
+            // must name the vessel it fires at there.
+            self.pre_launch = Some(RevertPoint {
+                snapshot: Ok(snap),
+                plans: self
+                    .world
+                    .resource::<flight::StagePlans>()
+                    .captured_for_revert(&self.sim),
+            });
             self.revert_capture = None;
         }
         // The focus pin's drain-reject release (P04-F2): `end_frame`
@@ -3686,8 +3729,17 @@ impl View {
         // replaces this point when the launch berths — a revert retries
         // the flying, never un-pays the launch. A §7.4 refusal here is
         // still recorded verbatim: the revert verb then names its own
-        // refusal instead of silently missing.
-        self.pre_launch = Some(self.sim.snapshot().map_err(|e| e.to_string()));
+        // refusal instead of silently missing. The stage plans go with
+        // the snapshot (`RevertPoint`), bound to the vessels they name
+        // in this world: this launch's own is pushed below, after this
+        // capture.
+        self.pre_launch = Some(RevertPoint {
+            snapshot: self.sim.snapshot().map_err(|e| e.to_string()),
+            plans: self
+                .world
+                .resource::<flight::StagePlans>()
+                .captured_for_revert(&self.sim),
+        });
         // The parked build clears the pad before the new craft berths
         // — the recovery is a normal logged command that
         // credits its value back, then the launch proceeds.
@@ -3708,11 +3760,11 @@ impl View {
         // The staged craft's firing plan rides session state (the
         // spawned graph drops stage metadata); `fire_stage` drains it
         // one set per press. The plan binds to THIS launch's vessel —
-        // captured before the enqueue so `min_id` bounds the binding
-        // to ids minted after this point (the `LaunchCraft` apply
-        // mints the `VesselId` inside the drain — `StagePlan`'s
-        // `(min_id, fingerprint)` binding tolerates exactly this late
-        // materialization).
+        // captured before the enqueue so its launch window opens at
+        // the next id (the `LaunchCraft` apply mints the `VesselId`
+        // inside the drain — `StagePlan`'s lazy binding tolerates
+        // exactly this late materialization) and closes where the next
+        // launch's opens.
         let plan = flight::StagePlan::for_launch(stage_plan, &self.sim, &craft);
         if let Some(site) = site.filter(|_| !craft.part_ids.is_empty()) {
             // §3.5's honest path: the LAUNCH click is `LaunchCraft` —
@@ -3816,46 +3868,55 @@ impl View {
     /// Restore the world from a decoded save — full §7.3 config
     /// re-install, then reset every sim-keyed session mirror. Returns
     /// the post-restore warnings (missing config channels, which the
-    /// caller renders as notices).
+    /// caller renders as notices). A save stores no stage plans, so
+    /// each restored craft's is rebuilt from its own parts — a chute
+    /// becomes a deploy stage, a decoupler's subtree a drop stage.
     pub fn load_game(&mut self, snapshot: WorldSnapshot) -> Result<Vec<String>, SimError> {
-        rebuild_from_snapshot(self, snapshot)
+        rebuild_from_snapshot(self, snapshot, Restage::FromRestoredCrafts)
     }
 
     /// Whether a revert point exists — the Game menu gates its
     /// Revert button on this.
     pub fn revert_available(&self) -> bool {
-        matches!(&self.pre_launch, Some(Ok(_)))
+        matches!(&self.pre_launch, Some(point) if point.snapshot.is_ok())
     }
 
     /// The revert point's sim tick for the prompt; `None` when no
     /// captured snapshot exists (the `Err` arm's reason reads via
     /// [`Self::revert_to_launch`]).
     pub fn revert_tick(&self) -> Option<u64> {
-        match &self.pre_launch {
-            Some(Ok(snap)) => Some(snap.clock_ticks),
-            _ => None,
-        }
+        self.pre_launch
+            .as_ref()?
+            .snapshot
+            .as_ref()
+            .ok()
+            .map(|snap| snap.clock_ticks)
     }
 
     /// Why no revert point exists — the §7.4 capture refusal text,
     /// for the menu's disabled-button hover.
     pub fn revert_reason(&self) -> Option<&str> {
         match &self.pre_launch {
-            Some(Err(r)) => Some(r.as_str()),
-            _ => None,
+            Some(point) => point.snapshot.as_ref().err().map(String::as_str),
+            None => None,
         }
     }
 
-    /// PLAN:1180 — revert-to-launch. Restores the pre-launch snapshot
-    /// captured at `launch_craft` — the same pre-drawn θ records ride
-    /// the restore (it is a retry of the flying, never a reroll; the
-    /// UI says so at the prompt). `Err` when no revert point exists.
+    /// PLAN:1180 — revert-to-launch. Restores the point captured at
+    /// `launch_craft` — the snapshot and the stage plans that went with
+    /// it, so the craft back on the pad stages as it did at launch —
+    /// the same pre-drawn θ records ride the restore (it is a retry of
+    /// the flying, never a reroll; the UI says so at the prompt). `Err`
+    /// when no revert point exists.
     pub fn revert_to_launch(&mut self) -> Result<Vec<String>, SimError> {
-        let snapshot = match &self.pre_launch {
-            Some(Ok(snap)) => snap.clone(),
+        let (snapshot, plans) = match &self.pre_launch {
+            Some(RevertPoint {
+                snapshot: Ok(snapshot),
+                plans,
+            }) => (snapshot.clone(), plans.clone()),
             // The capture's refusal text is surfaced through
             // `revert_reason`, not smuggled in the static SimError.
-            Some(Err(_)) => {
+            Some(_) => {
                 return Err(SimError::Recoverable(
                     "revert point could not be captured at launch",
                 ));
@@ -3872,8 +3933,12 @@ impl View {
         // repeatable, a second press returning to the same pad-bound
         // state rather than reporting "nothing launched yet" while the
         // delivered craft sits on the pad.
-        let warnings = rebuild_from_snapshot(self, snapshot.clone())?;
-        self.pre_launch = Some(Ok(snapshot));
+        let warnings =
+            rebuild_from_snapshot(self, snapshot.clone(), Restage::Captured(plans.clone()))?;
+        self.pre_launch = Some(RevertPoint {
+            snapshot: Ok(snapshot),
+            plans,
+        });
         Ok(warnings)
     }
 
@@ -3970,10 +4035,11 @@ impl View {
             }
         }
         if ambiguous {
-            // P05-F1: two same-craft mints ≥ min_id — the plan can
-            // never name its vessel honestly, so a firing now would
-            // hit a random one. Retire it like the gone-vessel branch
-            // rather than leaving a loaded trap for the next press.
+            // P05-F1: two same-craft mints inside the plan's launch
+            // window — the plan can never name its vessel honestly, so
+            // a firing now would hit a random one. Retire it like the
+            // gone-vessel branch rather than leaving a loaded trap for
+            // the next press.
             {
                 let mut plans = self.world.resource_mut::<flight::StagePlans>();
                 let plan = &mut plans.plans[idx];
@@ -7568,6 +7634,119 @@ mod tests {
         );
     }
 
+    /// The revert point keeps its plans BOUND. A launch's plan is pushed
+    /// unbound (its vessel's id is minted in the drain), and the copy
+    /// used to be stored unbound too: a revert put it back into the
+    /// world its craft still occupies, where it bound to the next
+    /// launch of the same craft and shadowed that craft's own plan
+    /// (`stage_plan.rs`: the restaged relaunch fired the pre-revert
+    /// plan). The capture binds every plan against the world the
+    /// snapshot holds, keeps out a plan with no vessel there, and
+    /// leaves the live table alone.
+    #[test]
+    fn revert_point_keeps_its_plans_bound_to_the_captured_world() {
+        let mut view = View::new().expect("data/ load");
+        view.seed_starter_craft().expect("starter seed");
+        view.begin_frame();
+        view.sim_step(view.sim.clock().ticks() + 1)
+            .expect("advance");
+        view.end_frame();
+        let (&id, vessel) = view.sim.vessels().iter().next().unwrap();
+        let craft = vessel.craft.clone().expect("the seeded craft");
+        // The live table holds the launch's plan, still unbound — no
+        // stage was pressed.
+        let mut table = view.world.resource::<flight::StagePlans>().clone();
+        assert_eq!(table.plans.len(), 1);
+        assert!(table.plans[0].vessel.is_none());
+        // A plan whose launch never landed: nothing in this world was
+        // minted at or after its bound.
+        table.push(flight::StagePlan::for_launch(
+            vec![flight::StageActions {
+                jettisons: vec![csp_phys::PartNodeId(0)],
+                deploys: Vec::new(),
+            }],
+            &view.sim,
+            &craft,
+        ));
+
+        let stored = table.captured_for_revert(&view.sim);
+        assert_eq!(stored.plans.len(), 1, "only the plan with a vessel is kept");
+        assert_eq!(
+            stored.plans[0].vessel,
+            Some(id),
+            "the launch's plan is stored bound to its own craft"
+        );
+        assert_eq!(stored.plans[0].stages, table.plans[0].stages);
+        // The capture binds the copy, never the live table.
+        assert!(
+            table.plans.iter().all(|p| p.vessel.is_none()),
+            "the capture bound the live table"
+        );
+    }
+
+    /// Two launches of one craft and no stage pressed: both plans are
+    /// unbound when the first press comes. Each binds inside its own
+    /// launch window — the older plan's closes where the newer
+    /// launch's opens — so a press on the first craft fires the first
+    /// craft's plan. On `(min_id, key)` alone the older plan saw both
+    /// vessels, latched `ambiguous`, and the press fell through to the
+    /// newer craft's plan.
+    #[test]
+    fn two_unstaged_launches_bind_plans_to_their_own_crafts() {
+        let mut view = View::new().expect("data/ load");
+        view.seed_starter_craft().expect("starter seed");
+        let step = |view: &mut View, ticks: u64| {
+            view.begin_frame();
+            view.sim_step(view.sim.clock().ticks() + ticks)
+                .expect("advance");
+            view.end_frame();
+        };
+        step(&mut view, 1);
+        let first = csp_sim::VesselId(0);
+        // Fly the first craft clear of the pad — a single berth.
+        view.sim.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::SetThrottle {
+                vessel: first,
+                throttle: 1.0,
+            },
+        );
+        step(&mut view, 8 * 64);
+        view.launch_craft().expect("second launch");
+        step(&mut view, 1);
+        let second = view.flight_focus().expect("the second launch takes focus");
+        assert_ne!(second, first);
+        {
+            let plans = view.world.resource::<flight::StagePlans>();
+            assert_eq!(plans.plans.len(), 2);
+            assert!(
+                plans.plans.iter().all(|p| p.vessel.is_none()),
+                "no stage was pressed"
+            );
+        }
+
+        // SPACE with the FIRST craft focused.
+        view.world.resource_mut::<flight::FlightUiData>().focus = Some(first.0);
+        assert_eq!(
+            view.fire_stage(),
+            1,
+            "the first craft's plan did not fire on the first craft"
+        );
+        let plans = view.world.resource::<flight::StagePlans>();
+        assert_eq!(
+            plans.plans[0].vessel,
+            Some(first),
+            "the older plan owns the older craft"
+        );
+        assert_eq!(
+            plans.plans[1].vessel,
+            Some(second),
+            "the newer plan owns the newer craft"
+        );
+        assert!(!plans.plans[0].ambiguous);
+    }
+
     /// C21-F5 + C22-F1: `load_game` clears the revert point — a revert
     /// on a loaded world can never resurrect the prior session's
     /// launch snapshot over it.
@@ -7810,7 +7989,10 @@ mod tests {
         // match key — so only the reject outcome is exercised.
         let arm_site = csp_data::SiteId::from("csp.test.no-such-site");
         let arm_craft = tiny_foreign_craft();
-        view.pre_launch = Some(Ok(view.sim.snapshot().expect("snapshot at rest")));
+        view.pre_launch = Some(RevertPoint {
+            snapshot: Ok(view.sim.snapshot().expect("snapshot at rest")),
+            plans: view.world.resource::<flight::StagePlans>().clone(),
+        });
         view.revert_capture = Some(RevertCapture::AwaitingDelivery {
             site: arm_site.clone(),
             craft: arm_craft.clone(),

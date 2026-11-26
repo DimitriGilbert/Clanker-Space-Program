@@ -27,7 +27,7 @@
 //! state, never sim state.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use bevy_ecs::prelude::*;
@@ -1230,10 +1230,16 @@ pub struct StageActions {
 /// this plan. The `VesselId` cannot be predicted at capture (the
 /// enqueued `SpawnPhysicalVessel` allocates it inside `step_frame`,
 /// and queued producers/event firings may burn ids first), so the
-/// plan binds *lazily* — the first `fire_stage`/`vessel_for` call
-/// that sees a post-launch vessel carrying the captured craft's
-/// launch key keeps it.
-#[derive(Resource, Default)]
+/// plan binds *lazily* — the first binding pass that sees a vessel
+/// inside its LAUNCH WINDOW carrying the captured craft's launch key
+/// keeps it ([`StagePlans::bind_all`]).
+///
+/// `Clone` because the plan is §2.2-C session state the save does not
+/// carry: a revert point keeps its own copy of the plans its snapshot
+/// was taken with, bound ([`StagePlans::captured_for_revert`];
+/// [`crate::View::revert_to_launch`]), and a load rebuilds them from
+/// the restored crafts ([`StagePlans::from_restored_world`]).
+#[derive(Resource, Default, Clone)]
 pub struct StagePlan {
     /// Remaining stage firings' action sets, firing order.
     pub stages: Vec<StageActions>,
@@ -1244,25 +1250,28 @@ pub struct StagePlan {
     /// The vessel this plan fires at — `None` until [`Self::vessel_for`]
     /// binds it; a bound id is never re-pointed at another vessel.
     pub vessel: Option<VesselId>,
-    /// Binding bound: the lowest `VesselId` a post-launch spawn can
-    /// mint — `vessels().next_back() + 1` at capture (ids are
-    /// monotonic and never reused, so nothing already live can meet
+    /// Where the plan's launch window opens: the lowest `VesselId` its
+    /// launch could mint — `vessels().next_back() + 1` at capture (ids
+    /// are monotonic and never reused, so nothing already live can meet
     /// it, and any id at/above it was necessarily allocated after the
-    /// launch was enqueued).
+    /// launch was enqueued). The window closes where the next newer
+    /// plan's opens ([`StagePlans::bind_all`]).
     min_id: u64,
     /// [`craft_launch_key`] of the launched craft — the binding match.
-    /// Two launches of the same session craft produce identical keys;
-    /// `min_id` keeps the newest launch's plan from binding a
-    /// still-live older copy.
+    /// Two launches of the same session craft produce identical keys
+    /// and restaging changes nothing a launch keys on, so the key
+    /// alone cannot tell a plan's own vessel from a later copy of the
+    /// craft: the window does.
     craft_key: u64,
-    /// `true` once binding proved AMBIGUOUS — two or more live
-    /// vessels minted at/above `min_id` share the launch fingerprint
-    /// (P05-F1: a second same-craft mint interposed while unbound,
-    /// e.g. the plan's own spawn rejected and a scripted mint of the
-    /// same craft landed instead). `(min_id, fingerprint)` cannot
-    /// name the vessel honestly, so the plan stays unbound rather
-    /// than latching a permanent wrong-vessel bind — `fire_stage`
-    /// surfaces the notice and retires the plan.
+    /// `true` once binding proved AMBIGUOUS — two or more live vessels
+    /// inside the launch window share the launch fingerprint (P05-F1:
+    /// a second same-craft mint interposed while unbound, e.g. the
+    /// plan's own spawn rejected and a scripted mint of the same craft
+    /// landed instead). The window cannot name the vessel honestly, so
+    /// the plan stays unbound rather than latching a permanent
+    /// wrong-vessel bind — `fire_stage` surfaces the notice and retires
+    /// the plan. A later launch of the same craft is not ambiguity: its
+    /// vessel falls outside the window.
     pub ambiguous: bool,
 }
 
@@ -1287,31 +1296,43 @@ impl StagePlan {
     }
 
     /// A plan pre-bound to a known vessel — for tests and scripted
-    /// producers that mint the `VesselId` themselves. `min_id`/
-    /// `craft_key` stay inert because [`Self::vessel`] is already set.
+    /// producers that mint the `VesselId` themselves. Nothing is left
+    /// to bind; `craft_key` stays inert. `min_id` is the vessel's own
+    /// id — the launch minted exactly that — so the plan still closes
+    /// the window of any plan older than it.
     pub fn bound_to(stages: Vec<StageActions>, vessel: VesselId) -> Self {
         Self {
             total: stages.len(),
             stages,
             vessel: Some(vessel),
-            min_id: 0,
+            min_id: vessel.0,
             craft_key: 0,
             ambiguous: false,
         }
     }
 
     /// The vessel this plan fires at, binding on first call: the
-    /// UNIQUE vessel minted at-or-after [`Self::min_id`] whose stored
-    /// craft matches the launch's key (P05-F1 — the old
-    /// "newest match" rule permanently bound a wrong vessel whenever
-    /// a second same-craft mint interposed while the plan was
-    /// unbound). An unbound plan stays unbound (never caches `None`)
-    /// so a not-yet-landed spawn binds on a later press; a bound id
-    /// is returned verbatim — the caller re-checks it against the
-    /// live arena (the vessel may be gone). Two or more matching
-    /// candidates mean `(min_id, fingerprint)` cannot disambiguate:
-    /// [`Self::ambiguous`] latches and the plan never binds.
-    pub(crate) fn vessel_for(&mut self, sim: &World) -> Option<VesselId> {
+    /// UNIQUE vessel inside the plan's launch window — minted at or
+    /// after [`Self::min_id`] and before `closed_at`, the next newer
+    /// plan's own bound ([`StagePlans::bind_all`] walks the table to
+    /// supply it; the newest plan's window stays open, `u64::MAX`) —
+    /// whose stored craft matches the launch's key. Ids are monotonic
+    /// and the table is in launch order, so a vessel minted at or
+    /// after a newer launch's bound belongs to that launch or a later
+    /// one, never to this one: the window is what keeps a plan off the
+    /// next launch of the same craft, whether the plan is still
+    /// waiting for a spawn that never lands, came back from a revert
+    /// into the world its own craft occupies, or was retired and lost
+    /// its bound id. An unbound plan stays unbound (never caches
+    /// `None`) so a not-yet-landed spawn binds on a later press; a
+    /// bound id is returned verbatim — the caller re-checks it against
+    /// the live arena (the vessel may be gone). Two or more matching
+    /// candidates INSIDE the window mean it cannot name the vessel
+    /// honestly (P05-F1 — the old "newest match" rule permanently bound
+    /// a wrong vessel whenever a second same-craft mint interposed
+    /// while the plan was unbound): [`Self::ambiguous`] latches and the
+    /// plan never binds.
+    pub(crate) fn vessel_for(&mut self, sim: &World, closed_at: u64) -> Option<VesselId> {
         if let Some(v) = self.vessel {
             return Some(v);
         }
@@ -1319,14 +1340,14 @@ impl StagePlan {
             return None;
         }
         let mut candidates = sim.vessels().iter().filter(|(id, v)| {
-            id.0 >= self.min_id
+            (self.min_id..closed_at).contains(&id.0)
                 && v.craft
                     .as_ref()
                     .is_some_and(|c| craft_launch_key(c) == self.craft_key)
         });
         let found = candidates.next().map(|(id, _)| *id);
         if candidates.next().is_some() {
-            // A second same-fingerprint mint at/above the bound —
+            // A second same-fingerprint mint inside the window —
             // which one is OURS is unanswerable. Latch the flag:
             // honest "cannot stage" beats a silent wrong-vessel fire.
             self.ambiguous = true;
@@ -1343,14 +1364,16 @@ impl StagePlan {
 /// slot: a second launch used to `insert_resource` over the first
 /// craft's unfired stages, making them permanently unfireable and
 /// pointing the HUD at the wrong craft. Each launch pushes its own
-/// plan; they bind their own vessels independently through
-/// [`StagePlan::vessel_for`]. Most-recent launch LAST, so
-/// [`Self::active`] prefers the focused vessel's plan and falls back
-/// to the newest plan — the single-plan behaviour is unchanged.
-#[derive(Resource, Default)]
+/// plan; they bind their own vessels independently, each inside its
+/// launch window ([`StagePlan::vessel_for`], [`Self::bind_all`]).
+/// Most-recent launch LAST, so [`Self::active_index`] prefers the
+/// focused vessel's plan and falls back to the newest plan — the
+/// single-plan behaviour is unchanged.
+#[derive(Resource, Default, Clone)]
 pub struct StagePlans {
-    /// Live plans in launch order (oldest first). Expended or
-    /// orphaned plans are retired out of the vec by `fire_stage`.
+    /// Live plans in launch order (oldest first) — the order the
+    /// launch windows are read from. Expended or orphaned plans are
+    /// retired by `fire_stage`.
     pub plans: Vec<StagePlan>,
 }
 
@@ -1366,6 +1389,77 @@ impl StagePlans {
         self.plans.push(plan);
     }
 
+    /// Bind every unbound plan inside its LAUNCH WINDOW. The table is
+    /// in launch order and ids are never reused, so every vessel minted
+    /// at or after a newer plan's [`StagePlan::min_id`] belongs to that
+    /// launch or a later one: plan `i` may own the ids in
+    /// `[plans[i].min_id, plans[i + 1].min_id)`, and the newest plan's
+    /// window stays open. Keyed on `(min_id, craft key)` alone a plan
+    /// could not tell its own vessel from a later launch of the same
+    /// craft — restaging changes nothing the key reads — so any plan
+    /// still unbound when that launch berthed claimed it first and
+    /// shadowed its staging: one waiting for a spawn that never landed
+    /// (a rejected launch), one a revert put back beside its own
+    /// craft, one the gone-vessel branch of `fire_stage` had retired.
+    /// Inside its window each of them finds nothing and stays unbound.
+    fn bind_all(&mut self, sim: &World) {
+        // Newest first: each plan's bound closes the window of the
+        // plan launched before it.
+        let mut closed_at = u64::MAX;
+        for p in self.plans.iter_mut().rev() {
+            let _ = p.vessel_for(sim, closed_at);
+            closed_at = p.min_id;
+        }
+    }
+
+    /// The plans a loaded save comes back without: the file stores the
+    /// sim, and the stage table each craft launched under is session
+    /// state it does not carry. One plan per restored craft, bound to
+    /// its vessel and derived from the craft alone
+    /// ([`restored_stage_actions`]); a craft with nothing left to stage
+    /// gets none, so the press reports "nothing to stage".
+    pub(crate) fn from_restored_world(sim: &World) -> Self {
+        Self {
+            plans: sim
+                .vessels()
+                .iter()
+                .filter_map(|(id, vessel)| {
+                    let Some(craft) = &vessel.craft else {
+                        return None;
+                    };
+                    let stages = restored_stage_actions(craft, &vessel.deployed, sim.parts());
+                    (!stages.is_empty()).then(|| StagePlan::bound_to(stages, *id))
+                })
+                .collect(),
+        }
+    }
+
+    /// The plans a revert point keeps ([`crate::View::launch_craft`] and
+    /// the delivery-boundary recapture in `sim_step`): this table as it
+    /// stands, every plan bound inside its launch window against the
+    /// world the point's snapshot holds, and the plans that cannot bind
+    /// left out. Only the copy is bound — the live table keeps binding
+    /// on its first press.
+    ///
+    /// A launch's plan is pushed unbound, and the copy used to be
+    /// stored that way too. A revert then put it back into the world
+    /// its own craft still occupies, where the next launch of the same
+    /// craft recovers that craft and berths the restaged one under a
+    /// later id with the same launch key — and the older plan, still
+    /// unbound, claimed the new vessel first: SPACE fired the pre-revert
+    /// staging. Bound here the plan names the pad craft's own id, and a
+    /// bound id is never re-pointed.
+    ///
+    /// A plan with no vessel in the captured world is not kept: the
+    /// restore cannot bring its craft back, so it is an orphan of that
+    /// world — a launch that never landed, a craft since recovered.
+    pub(crate) fn captured_for_revert(&self, sim: &World) -> Self {
+        let mut plans = self.clone();
+        plans.bind_all(sim);
+        plans.plans.retain(|p| p.vessel.is_some());
+        plans
+    }
+
     /// The plan a stage press should fire: the plan bound to `focus`
     /// when one exists, else the most recent plan still holding
     /// stages (or simply the newest — an expended newest plan is
@@ -1373,9 +1467,7 @@ impl StagePlans {
     fn active_index(&mut self, sim: &World, focus: Option<VesselId>) -> Option<usize> {
         // Bind every unbound plan first so focus matching reads
         // resolved vessels, not pending fingerprints.
-        for p in self.plans.iter_mut() {
-            let _ = p.vessel_for(sim);
-        }
+        self.bind_all(sim);
         if let Some(f) = focus
             && let Some(i) = self.plans.iter().position(|p| p.vessel == Some(f))
         {
@@ -1408,20 +1500,114 @@ impl StagePlans {
     }
 
     /// Fire the active plan's next stage at `sim`: resolves binding,
-    /// returns `(vessel, ambiguous, refuse_msg)`; `refuse_msg`
-    /// `Some("")` means "plan exists but nothing to fire" — the
-    /// caller composes the cue from `total`.
+    /// returns `(index, vessel, ambiguous)` — the state
+    /// [`Self::active_index`]'s binding pass left the selected plan in
+    /// (never a second, window-less scan); the caller composes the cue
+    /// from `total`.
     pub(crate) fn select_for_fire(
         &mut self,
         sim: &World,
         focus: Option<VesselId>,
     ) -> Option<(usize, Option<VesselId>, bool)> {
         let i = self.active_index(sim, focus)?;
-        let p = &mut self.plans[i];
-        let v = p.vessel_for(sim);
-        let ambiguous = p.ambiguous;
-        Some((i, v, ambiguous))
+        let p = &self.plans[i];
+        Some((i, p.vessel, p.ambiguous))
     }
+}
+
+/// One restored craft's firing list, rebuilt from the craft itself —
+/// a save carries each part, not the stage table it launched under:
+///
+/// - a drop stage per depth of decoupler, deepest first, every
+///   decoupler at that depth firing together (a symmetric booster pair
+///   separates as one stage), each holding the subtree below its
+///   decouplers minus what a deeper firing already took;
+/// - then one deploy stage for the chutes no drop stage takes.
+///
+/// A chute already deployed before the save is not offered again, and
+/// the VAB's own stage order is gone — this is the order the craft's
+/// shape implies, not the one the player staged.
+fn restored_stage_actions(
+    craft: &csp_sim::CraftDef,
+    deployed: &BTreeMap<csp_phys::PartNodeId, csp_sim::DeployRecord>,
+    catalog: &BTreeMap<csp_data::PartId, csp_data::PartDef>,
+) -> Vec<StageActions> {
+    let nodes = &craft.graph.nodes;
+    let mut children: BTreeMap<csp_phys::PartNodeId, Vec<csp_phys::PartNodeId>> = BTreeMap::new();
+    for (id, node) in nodes {
+        if let Some(parent) = node.parent {
+            children.entry(parent).or_default().push(*id);
+        }
+    }
+    // Only the catalog says which parts are decouplers: staging is
+    // editor metadata the weld input does not carry.
+    let is_decoupler = |node: &csp_phys::PartNode| {
+        craft
+            .part_ids
+            .get(node.effective_index as usize)
+            .and_then(|part| catalog.get(part))
+            .is_some_and(|def| {
+                def.modules
+                    .iter()
+                    .any(|m| matches!(m, csp_data::ModuleDef::Decoupler))
+            })
+    };
+    let depth_of = |mut id: csp_phys::PartNodeId| {
+        let mut depth = 0;
+        while let Some(parent) = nodes[&id].parent {
+            depth += 1;
+            id = parent;
+        }
+        depth
+    };
+
+    // Every decoupler's drop set, by the decoupler's depth below the root.
+    let mut drops: BTreeMap<u32, BTreeSet<csp_phys::PartNodeId>> = BTreeMap::new();
+    for (id, node) in nodes {
+        if !is_decoupler(node) {
+            continue;
+        }
+        let set = drops.entry(depth_of(*id)).or_default();
+        let mut stack = children.get(id).cloned().unwrap_or_default();
+        while let Some(n) = stack.pop() {
+            if set.insert(n) {
+                stack.extend(children.get(&n).into_iter().flatten().copied());
+            }
+        }
+    }
+
+    let mut stages = Vec::new();
+    let mut dropped = BTreeSet::new();
+    for (_, set) in drops.into_iter().rev() {
+        let jettisons: Vec<csp_phys::PartNodeId> = set.difference(&dropped).copied().collect();
+        if !jettisons.is_empty() {
+            dropped.extend(jettisons.iter().copied());
+            stages.push(StageActions {
+                jettisons,
+                deploys: Vec::new(),
+            });
+        }
+    }
+    // The weld input's own parachute flag — the gate `DeployPart` checks.
+    let deploys: Vec<csp_phys::PartNodeId> = nodes
+        .iter()
+        .filter(|(id, node)| {
+            craft
+                .parts
+                .get(node.effective_index as usize)
+                .is_some_and(|p| p.parachute.is_some())
+                && !deployed.contains_key(id)
+                && !dropped.contains(id)
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    if !deploys.is_empty() {
+        stages.push(StageActions {
+            jettisons: Vec::new(),
+            deploys,
+        });
+    }
+    stages
 }
 
 /// Session-state cache for the §2.6.4 latched-vessel weld. The
@@ -6821,6 +7007,149 @@ mod tests {
         let wreck = [bare_body(4, true), bare_body(5, true)];
         assert_eq!(focus_vessel(&wreck).map(|b| b.id), Some(5));
         assert!(focus_vessel(&[]).is_none());
+    }
+
+    /// A craft for the restored-plan tests: one node per
+    /// `(catalog part, parent row, chute)` row, `None` for the root.
+    /// Returns the craft and the catalog its part ids resolve against.
+    fn restored_craft(
+        rows: &[(&str, Option<usize>, bool)],
+    ) -> (
+        csp_sim::CraftDef,
+        BTreeMap<csp_data::PartId, csp_data::PartDef>,
+    ) {
+        let blank = crate::stock_flight_craft().parts[3].clone();
+        let mut graph = csp_phys::PartGraph::new(csp_phys::PartNodeId(1));
+        let mut parts = Vec::new();
+        let mut catalog = BTreeMap::new();
+        for (i, &(id, parent, chute)) in rows.iter().enumerate() {
+            let above = parent.map(|p| csp_phys::PartNodeId(p as u64 + 1));
+            graph.insert(
+                csp_phys::PartNodeId(i as u64 + 1),
+                csp_phys::PartNode::new(above, csp_phys::PartTransform::IDENTITY, i as u32),
+            );
+            let mut part = blank.clone();
+            if chute {
+                part.parachute = Some(csp_phys::ParachuteSpec {
+                    deploy_alt_m: 0.0,
+                    deploy_speed_mps: 0.0,
+                    packed_drag_area_m2: 0.0,
+                    deployed_drag_area_m2: 0.0,
+                    deploy_time_s: 0.0,
+                });
+            }
+            parts.push(part);
+            let decoupler = id == "r.dec";
+            let def = readout_def(
+                id,
+                10.0,
+                decoupler
+                    .then_some(csp_data::ModuleDef::Decoupler)
+                    .into_iter()
+                    .collect(),
+            );
+            catalog.insert(def.id.clone(), def);
+        }
+        (
+            csp_sim::CraftDef {
+                hash_memo: Default::default(),
+                graph,
+                parts,
+                part_costs: Vec::new(),
+                reliability: Vec::new(),
+                part_ids: rows
+                    .iter()
+                    .map(|&(id, _, _)| csp_data::PartId::from(id))
+                    .collect(),
+                part_build_resources: Vec::new(),
+            },
+            catalog,
+        )
+    }
+
+    /// A restored craft stages by its shape: the deepest decoupler's
+    /// subtree drops first, the next decoupler's after it minus what the
+    /// first firing took (the decoupler itself stays parent-side), and
+    /// the chutes nothing drops deploy last.
+    #[test]
+    fn restored_plan_drops_deepest_first_and_deploys_last() {
+        let (craft, catalog) = restored_craft(&[
+            ("r.pod", None, false),
+            ("r.chute", Some(0), true),
+            ("r.dec", Some(0), false),
+            ("r.tank", Some(2), false),
+            ("r.eng", Some(3), false),
+            ("r.dec", Some(4), false),
+            ("r.boost", Some(5), false),
+        ]);
+        let node = |i: u64| vec![csp_phys::PartNodeId(i)];
+        assert_eq!(
+            restored_stage_actions(&craft, &BTreeMap::new(), &catalog),
+            vec![
+                StageActions {
+                    jettisons: node(7),
+                    deploys: Vec::new(),
+                },
+                StageActions {
+                    jettisons: (4..=6).map(csp_phys::PartNodeId).collect(),
+                    deploys: Vec::new(),
+                },
+                StageActions {
+                    jettisons: Vec::new(),
+                    deploys: node(2),
+                },
+            ]
+        );
+    }
+
+    /// Decouplers at one depth fire together — a booster pair separates
+    /// as one stage — a chute inside a drop set leaves with it rather
+    /// than deploying, and a chute the save shows already deployed is
+    /// not offered again.
+    #[test]
+    fn restored_plan_groups_a_depth_and_skips_spent_chutes() {
+        let (craft, catalog) = restored_craft(&[
+            ("r.pod", None, false),
+            ("r.dec", Some(0), false),
+            ("r.boost", Some(1), false),
+            ("r.chute", Some(2), true),
+            ("r.dec", Some(0), false),
+            ("r.boost", Some(4), false),
+            ("r.chute", Some(0), true),
+        ]);
+        let deployed = BTreeMap::from([(
+            csp_phys::PartNodeId(7),
+            csp_sim::DeployRecord {
+                deployed_tick: 1,
+                opened_tick: None,
+            },
+        )]);
+        assert_eq!(
+            restored_stage_actions(&craft, &deployed, &catalog),
+            vec![StageActions {
+                jettisons: vec![
+                    csp_phys::PartNodeId(3),
+                    csp_phys::PartNodeId(4),
+                    csp_phys::PartNodeId(6),
+                ],
+                deploys: Vec::new(),
+            }]
+        );
+    }
+
+    /// A craft with nothing to drop and nothing to deploy stages nothing:
+    /// it gets no plan, and the press reports a single-stage craft.
+    #[test]
+    fn restored_plan_is_empty_for_a_single_stage_craft() {
+        let (craft, catalog) = restored_craft(&[
+            ("r.pod", None, false),
+            ("r.tank", Some(0), false),
+            ("r.eng", Some(1), false),
+        ]);
+        assert!(restored_stage_actions(&craft, &BTreeMap::new(), &catalog).is_empty());
+        // A decoupler with nothing left under it drops nothing either.
+        let (spent, catalog) = restored_craft(&[("r.pod", None, false), ("r.dec", Some(0), false)]);
+        assert!(restored_stage_actions(&spent, &BTreeMap::new(), &catalog).is_empty());
     }
 
     /// C19-F5's sync half: `sync_flight` MOVES the staged buffers into

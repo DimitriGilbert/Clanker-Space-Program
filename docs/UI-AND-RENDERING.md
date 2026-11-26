@@ -126,7 +126,9 @@ the VAB with the reason on the session's notice row (`launch_refused`,
 
 Load/revert/new-game replace the whole sim through `rebuild_from_snapshot`
 (`lib.rs:1574`): config channels re-installed, `RhaiHost`/`AscentAutopilot`
-re-installed, every sim-keyed session mirror reset, mode forced to Flight.
+re-installed, every sim-keyed session mirror reset, mode forced to Flight. The
+stage plans are refilled in that same step — rebuilt from the restored crafts on a
+load, put back as captured on a revert (`Restage`, `RevertPoint`; §4.4).
 
 ---
 
@@ -373,9 +375,16 @@ hover pick. Radial symmetry ×1/×2/×4 (`SetSymmetry`). **Bottom attach works**
 the VAB camera's pitch clamp is full ±π so the −z cap and its `bottom` node
 are visible and hittable (`csp-view/src/vab.rs:47`).
 
-Staging: per-node `stage: u32` (higher fires earlier), edited in the
-inspector; `InsertStage`/`RemoveStage`/`CompactStages` maintain the table.
-The plan rides `flight::StagePlan` into launch (below).
+Staging: per-node `stage: u32` (higher fires earlier). The Staging panel
+(`staging_section`) lists `CraftSession::listed_stages` top-first — every populated
+stage plus every one `InsertStage` opened, which stays listed while empty
+(`open_stages`: editor state, not carried by the craft file) — and under each stage
+every part assigned to it (`VabSession::stage_rows`), not only the parts still attached
+when it fires. Clicking a part's row selects it; the selected part's row then carries
+`up`/`down` (`stage_move_buttons`), one `SetStage` per press, alongside the inspector's
+numeric stage field (both, and the header's `+ stage`, stop at stage 64, `STAGE_MAX`).
+`InsertStage`/`RemoveStage`/`CompactStages` maintain the table. The plan rides
+`flight::StagePlan` into launch (below).
 
 Readouts: `VabSession::recompute` (`vab.rs:849`) is dirty-gated — runs
 `csp_phys::readout::analyze` + `session.validate` + `body_transforms` only
@@ -446,9 +455,13 @@ reaches the craft behind it (C14-F2). `vab_pointer_input`
 
 `flight::StagePlan` (`csp-view/src/flight.rs:644`) captures the session's
 stage table at launch (`stage_plan_of`, `lib.rs:4061`); `StagePlans`
-(`flight.rs:758`) holds one plan per launch, bound to its vessel by
-`(min_id, craft fingerprint)` once the spawn lands. `View::fire_stage`
-(`lib.rs:3189`) pops the focused vessel's next stage set (`StageActions`,
+(`flight.rs:758`) holds one plan per launch, bound lazily to its vessel —
+the unique vessel inside its **launch window** (`[plan.min_id, next newer
+plan's min_id)`, newest open) carrying the craft's launch key — so a plan
+never claims a later launch of the same craft (`StagePlans::bind_all`). The
+revert point stores its plans already bound (`captured_for_revert`).
+`View::fire_stage` (`lib.rs:3189`) pops the focused vessel's next stage set
+(`StageActions`,
 `flight.rs:603`: `deploys` + `jettisons`) and issues **one logged `DeployPart`
 per staged deployable (parachutes) BEFORE one logged `JettisonPart` per
 drop-set node** — the staged-chute rule of `7dd4b86`: a chute staged alongside
@@ -460,6 +473,22 @@ posts a cue, naming deploys vs jettisons ("STAGED — 1 PART(S) DEPLOYED"). Know
 honest limitation (doc at `flight.rs:616-632`): a jettisoned part leaves the
 sim outright — no debris fragment — and engines are globally armed so a firing
 separates but never ignites.
+
+The plan is session state the save format does not carry, so both world-replacing
+verbs handle it explicitly:
+
+- **Revert** — `RevertPoint` stores `StagePlans` beside its snapshot at both capture
+  sites (`launch_craft`, and the delivery-boundary recapture in `sim_step`), and
+  `View::revert_to_launch` puts them back through `rebuild_from_snapshot`'s
+  `Restage::Captured`. The craft back on the pad stages as it did at launch.
+- **Load** — `View::load_game` passes `Restage::FromRestoredCrafts`, and
+  `StagePlans::from_restored_world` derives one plan per restored craft, bound to its
+  vessel (`restored_stage_actions`): a drop stage per decoupler depth, deepest first and
+  decouplers at one depth together, each holding the subtree below its decouplers minus
+  what an earlier firing took; then one deploy stage for the chutes no drop takes and the
+  save does not show deployed (the weld input's own `parachute` flag — the gate
+  `DeployPart` checks). A craft with nothing to stage gets no plan, and the press reports
+  a single-stage craft. The VAB's stage order is not recovered.
 
 ---
 

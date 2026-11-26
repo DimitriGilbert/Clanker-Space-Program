@@ -150,9 +150,18 @@ Entered with `V` or the top-bar button. Four surfaces: **palette** (left, catalo
 8. **Tweak**: inspector offers per-part **scale** and **stack-axis stretch** (gated by the part's
    `ScaleRule` — tanks scale continuously, the adapter has discrete 0.5/1/2 steps, most parts
    none) and **variants** (e.g. engine "qualified" variant: +20–25% cost for better stats).
-9. **Staging**: the Staging panel — `+ stage` / `− stage` / `compact`, and per-part stage
-   assignment via the inspector (higher stage index fires earlier). Space fires one stage set
-   per press in flight; the plan is captured at launch (`csp-view/src/flight.rs: StagePlan`).
+9. **Staging**: the Staging panel lists every stage top-first — the highest stage number fires
+   first — with each part on the row of the stage it is in. Click a part's row to select it, and
+   its row gains **up** / **down** buttons that move it one stage at a time (the inspector's
+   numeric stage field does the same and stays). `+ stage` adds an empty stage at the top (marked
+   `(empty)`; it stays listed, empty or not, until `compact` renumbers the stages, or until `− stage`
+   removes it — that button only takes the top listed stage, so an opened stage survives while
+   anything is listed above it), `− stage` removes the top listed stage (its parts fold down one),
+   `compact` renumbers the stages and drops the empty ones. New parts start in stage 0. An empty
+   stage is editor state: a saved craft file keeps only the stage each part is in. Space fires one
+   stage set per press in flight; the plan is captured at launch
+   (`csp-view/src/flight.rs: StagePlan`), comes back with a revert to launch, and is rebuilt from
+   the craft after a load (§8).
 
 ### 3.2 Readouts (before you launch)
 
@@ -485,9 +494,14 @@ Top-right **Game** strip (drag it anywhere) → **Game** menu (`csp-ui/src/game.
   Files are `CSPSAVE` under `$XDG_CONFIG_HOME/csp/saves/<slot>.cspsave`
   (`csp-app/src/lib.rs:1159`). Saving is refused (with the §7.4 reason named) while commands
   are pending, contacts are live, joints are live, or the session is tainted/halted — e.g.
-  *save while latched on the pad, not mid-bounce*.
+  *save while latched on the pad, not mid-bounce*. A save does not store stage plans: after a
+  load each craft's plan is rebuilt from its parts — a chute that is not already deployed is a
+  deploy stage, and each depth of decoupler drops the subtree under it, deepest first
+  (`csp-view/src/flight.rs: StagePlans::from_restored_world`). The order you staged in the VAB is
+  not kept.
 - **Revert to launch [F10]**: enabled once a launch order has been placed (the pre-launch
-  snapshot is captured at `launch_craft`). The confirm dialog carries the mandated honesty
+  snapshot is captured at `launch_craft`). The craft's stage plan comes back with the world, so
+  it stages as it did at launch. The confirm dialog carries the mandated honesty
   disclosure: **"Reliability thresholds are pre-drawn: the same parts will still fail at the
   same accumulated hazard. Revert is not a reroll — it is a retry of the flying."**
   (`game.rs`, PLAN §3.4's revert policy).
