@@ -274,6 +274,7 @@ use csp_data::{AtmosphereDef, BodyDef};
 
 use crate::backend::{BodyHandle, Contact, Hit, JointDef, JointKind, PhysicsBackend, Ray};
 use crate::part::{ForceSite, ForceSiteKind, WeldPart};
+use crate::structural::DEFAULT_TOUCHDOWN_CRUSH_M;
 use crate::tensor::SymMat3;
 use crate::weld::{DecelSite, WeldedBody};
 
@@ -331,6 +332,10 @@ pub const DEFAULT_CONVECTIVE_HEAT_FRACTION: f64 = crate::thermal::DEFAULT_CONVEC
 
 fn default_convective_heat_fraction() -> f64 {
     DEFAULT_CONVECTIVE_HEAT_FRACTION
+}
+
+fn default_touchdown_crush_m() -> f64 {
+    DEFAULT_TOUCHDOWN_CRUSH_M
 }
 
 /// Universal gas constant, J/(mol·K) — CODATA exact value; §3.0's
@@ -531,6 +536,15 @@ pub struct Environment {
     /// artifacts decodable as dry.
     #[serde(default)]
     pub ocean: Option<crate::water::Ocean>,
+    /// The §2.4 touchdown absorption's crush distance, metres — the
+    /// stop a landing's ground contact gives the body is read as
+    /// spread over this far ([`crate::structural::Touchdown`]).
+    /// `balance.ron`'s `touchdown_crush_m` is the authored value;
+    /// [`DEFAULT_TOUCHDOWN_CRUSH_M`] is the no-data default `for_body`
+    /// stamps. `serde(default)` keeps pre-field artifacts decodable at
+    /// the shipped value.
+    #[serde(default = "default_touchdown_crush_m")]
+    pub touchdown_crush_m: f64,
 }
 
 impl Environment {
@@ -579,6 +593,7 @@ impl Environment {
                 .ocean
                 .as_ref()
                 .map(|o| crate::water::Ocean::at_datum(o.datum_radius_m)),
+            touchdown_crush_m: DEFAULT_TOUCHDOWN_CRUSH_M,
         }
     }
 
@@ -808,6 +823,10 @@ struct Constraint {
     /// Index into `self.contacts[body]` of this constraint's public
     /// record — the impulse writeback's channel.
     contact_index: u32,
+    /// The collider hull the penetrating vertex belongs to — the part
+    /// the solved impulse landed on (`PartWeld::hull_index`), for the
+    /// touchdown record's per-part forces.
+    hull: u32,
     /// The penetrating vertex, body frame (a material point — its
     /// world position is recomputed as the pose evolves).
     local_vertex: DVec3,
@@ -883,6 +902,7 @@ impl Constraint {
         let constraint = Self {
             body: body_index as u32,
             contact_index: contact_index as u32,
+            hull: hull_index,
             local_vertex: vertex_body,
             r_body,
             n_body,
@@ -1779,6 +1799,43 @@ pub struct SimpleBackend {
     /// over the tick. `None` for a body with no ocean in reach; rebuilt
     /// every tick, never serialized.
     water: Vec<Option<crate::water::WaterLoads>>,
+    /// Per-body ground-contact velocity change solved by the most
+    /// recent `step`, by slice position — summed over every ground
+    /// row, the speculative ones included (they brake the body without
+    /// a public record) — and the rows themselves, which name the hull
+    /// each impulse landed on. The record [`Self::touchdown`] hands the
+    /// §2.4 evaluation. Rebuilt every tick, never serialized.
+    ground_dv: Vec<GroundDv>,
+    ground_rows: Vec<GroundRow>,
+}
+
+/// One solved ground row of the most recent `step`: the impulse the
+/// velocity pass accumulated on one collider vertex, body frame, with
+/// the row's normal — speculative rows included.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GroundRow {
+    /// The row's body, as a slice position.
+    body: u32,
+    /// The collider hull the vertex belongs to (`PartWeld::hull_index`).
+    hull: u32,
+    impulse: DVec3,
+    normal: DVec3,
+}
+
+/// One body's ground-contact velocity change over a tick: every ground
+/// row's impulse split at its own contact normal — the stop along it,
+/// the friction across it — summed as `Σ J/m`, plus the spin they
+/// imparted, `Σ I⁻¹(r × J)`: exactly what [`apply_impulse`] added to
+/// the body's velocity and spin, so the §2.4 evaluation can lift the
+/// channel out of the tick's measured acceleration.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct GroundDv {
+    /// `Σ J/m`, world frame.
+    world: DVec3,
+    /// The stop's share of it, world frame: `Σ (J·n̂)·n̂/m`.
+    normal: DVec3,
+    /// `Σ I⁻¹(r × J)`, body frame.
+    body: DVec3,
 }
 
 impl SimpleBackend {
@@ -1795,6 +1852,8 @@ impl SimpleBackend {
             time_s: Cell::new(0.0),
             contacts: Vec::new(),
             water: Vec::new(),
+            ground_dv: Vec::new(),
+            ground_rows: Vec::new(),
         }
     }
 
@@ -1823,7 +1882,8 @@ impl SimpleBackend {
     /// share), thrust sites, the solved contact impulses (ground and
     /// vessel-vessel pair) attributed by hull, and the tick's water
     /// loads (buoyancy, drag, damping) attributed by hull — expressed
-    /// in **body frame** as [`PartForce`]s.
+    /// in **body frame** as [`PartForce`]s. The ground impulses are
+    /// the channel [`PartForce::ground`] marks.
     ///
     /// `contacts` and `water` are the records from the last `step` for
     /// this body (`self.contacts(handle)`, `self.water_loads(handle)`);
@@ -1853,6 +1913,7 @@ impl SimpleBackend {
                 at,
                 force,
                 torque: DVec3::ZERO,
+                ground: false,
             });
         };
 
@@ -1906,14 +1967,10 @@ impl SimpleBackend {
                 // `accumulate_forces` applies (`decel_drag_world`),
                 // attributed to the site-owning node (the canopy's
                 // pull loads its own attachment).
+                let pull_body = flow.pull_body(body.rot);
                 for site in &body.decel {
-                    let area = decel_area_m2(
-                        site,
-                        flow.alt_m,
-                        flow.speed,
-                        flow.rho,
-                        self.time_s.get() + PHYSICS_DT,
-                    );
+                    let area =
+                        decel_area_m2(site, &flow, pull_body, self.time_s.get() + PHYSICS_DT);
                     if area > 0.0 {
                         push(
                             site.node,
@@ -1955,11 +2012,12 @@ impl SimpleBackend {
             if c.impulse.norm_squared() > 0.0
                 && let Some(id) = hull_owner.get(&c.hull)
             {
-                push(
-                    *id,
-                    conj.rotate(c.pos - body.pos),
-                    conj.rotate(c.impulse) * (1.0 / PHYSICS_DT),
-                );
+                out.entry(*id).or_default().push(PartForce {
+                    at: conj.rotate(c.pos - body.pos),
+                    force: conj.rotate(c.impulse) * (1.0 / PHYSICS_DT),
+                    torque: DVec3::ZERO,
+                    ground: true,
+                });
             }
         }
         // Water — the tick's record, attributed by hull like the
@@ -1972,6 +2030,7 @@ impl SimpleBackend {
                     at: conj.rotate(p.at - body.pos),
                     force: conj.rotate(p.force),
                     torque: p.torque,
+                    ground: false,
                 });
             }
         }
@@ -2033,6 +2092,128 @@ impl SimpleBackend {
             .get(body.0 as usize)
             .and_then(|w| w.as_ref())
             .map_or(&[], |w| w.parts.as_slice())
+    }
+
+    /// `body` one tick on, under every force but its decelerator sites'
+    /// drag — the backend's own step of a body whose `decel` is empty,
+    /// in place, with no water and no solve. The world's pull-path reef
+    /// ([`crate::structural::JointModel::pull_budgets`]) reads the loads at the pose
+    /// this lands in: the §2.4 evaluation reads its aero post-step, and
+    /// a stack swinging under an off-axis canopy turns a degree a tick.
+    pub fn coast_ahead(&self, body: &mut WeldedBody) {
+        let sites = core::mem::take(&mut body.decel);
+        self.integrate_free(body, None);
+        body.decel = sites;
+    }
+
+    /// `body` one tick on with its decelerator sites' drag kept —
+    /// [`Self::coast_ahead`] without the sites taken out: the backend's
+    /// own step of the body exactly as the tick about to run integrates
+    /// it (same forces, same stamp, in place, no water and no solve).
+    /// The world's reef flies a copy of the craft under its candidate
+    /// budgets this way and reads the joints with the §2.4 evaluation's
+    /// own arithmetic, instead of trusting what its model says they
+    /// will read.
+    pub fn coast_ahead_with_sites(&self, body: &mut WeldedBody) {
+        self.integrate_free(body, None);
+    }
+
+    /// The unit flow direction in body frame — the direction the §3.1
+    /// decelerator sites' pull is measured along this tick, the same
+    /// reading `accumulate_forces` and `external_loads` take (the
+    /// sites' drag pushes the other way). What the world's pull-path
+    /// reef ([`crate::structural::JointModel::pull_budgets`]) budgets against before
+    /// the step. `None` without atmospheric flow — the same gate the
+    /// force model applies, when no site drags at all.
+    pub fn decel_pull(&self, body: &WeldedBody) -> Option<DVec3> {
+        let atm = self.env.atmosphere.as_ref()?;
+        let rel = body.com_world() - self.env.body_center;
+        flow_state(&self.env, atm, body, rel).map(|flow| flow.pull_body(body.rot))
+    }
+
+    /// The drag each of `body`'s decelerator sites applies to it as it
+    /// stands, in `body.decel` order (N): the force the step about to
+    /// run integrates for each site — its effective area under the flow
+    /// ([`decel_area_m2`], the deploy ramp, the mount's reef and the
+    /// pull budget already folded in) at the body's own altitude and
+    /// speed, the reading `accumulate_forces` takes. Empty without
+    /// sites or atmospheric flow. A site's drag is the lesser of its
+    /// budget and what it can pull, so it is what a cut of the budget
+    /// has to land on to cut anything at all.
+    pub fn decel_pulls(&self, body: &WeldedBody) -> Vec<f64> {
+        let Some(atm) = self.env.atmosphere.as_ref() else {
+            return Vec::new();
+        };
+        let rel = body.com_world() - self.env.body_center;
+        let Some(flow) = flow_state(&self.env, atm, body, rel) else {
+            return Vec::new();
+        };
+        let pull_body = flow.pull_body(body.rot);
+        body.decel
+            .iter()
+            .map(|site| {
+                let area = decel_area_m2(site, &flow, pull_body, self.time_s.get() + PHYSICS_DT);
+                decel_drag_world(&flow, area).norm()
+            })
+            .collect()
+    }
+
+    /// The §2.4 evaluation's touchdown absorption for `body` this
+    /// tick ([`crate::structural::Touchdown`]): the ground-contact stop
+    /// the last `step` solved for it, read as spread over
+    /// [`Environment::touchdown_crush_m`]. `None` when the ground moved
+    /// nothing and for a stop that would outrun the crush distance (the
+    /// tick's own load is read). The water's loads are not this
+    /// channel.
+    pub fn touchdown(
+        &self,
+        body: &WeldedBody,
+        handle: BodyHandle,
+    ) -> Option<crate::structural::Touchdown> {
+        let dv = self.ground_dv.get(handle.0 as usize)?;
+        let conj = body.rot.conjugate();
+        let (normal_body, tangent_body) =
+            (conj.rotate(dv.normal), conj.rotate(dv.world - dv.normal));
+        let shares = crate::structural::Touchdown::shares(
+            normal_body.norm(),
+            tangent_body.norm(),
+            self.env.touchdown_crush_m,
+        )?;
+        // The impulse the solve landed on each touched part, each row
+        // split at its own normal and scaled to its share per second.
+        // Ascending node, as `part_index` walks. No application point:
+        // the evaluation reads each force through the body's CoM.
+        let rows = |hull: u32| {
+            self.ground_rows
+                .iter()
+                .filter(move |r| r.body == handle.0 && r.hull == hull)
+        };
+        let mut forces = Vec::new();
+        for (id, pw) in &body.part_index {
+            let (mut normal, mut tangent) = (DVec3::ZERO, DVec3::ZERO);
+            for r in rows(pw.hull_index) {
+                let along = r.normal * r.impulse.dot(r.normal);
+                normal = normal + along;
+                tangent = tangent + (r.impulse - along);
+            }
+            if normal != DVec3::ZERO || tangent != DVec3::ZERO {
+                forces.push((*id, (normal * shares.0 + tangent * shares.1) / PHYSICS_DT));
+            }
+        }
+        crate::structural::Touchdown::stopped_by(normal_body, tangent_body, dv.body, shares, forces)
+    }
+
+    /// Whether the last [`PhysicsBackend::step`] braked `handle`'s body
+    /// against the ground — solved any ground impulse for it at all,
+    /// the speculative rows included. [`Self::touchdown`] hands its
+    /// record only for a stop the crush distance absorbs; a hotter
+    /// stop's is withheld and the tick's own load read (a 150 m/s
+    /// impact leaves no record and no public contact), and this is
+    /// what tells that tick from one where nothing touched.
+    pub fn ground_braked(&self, handle: BodyHandle) -> bool {
+        self.ground_dv
+            .get(handle.0 as usize)
+            .is_some_and(|dv| dv.world != DVec3::ZERO || dv.body != DVec3::ZERO)
     }
 
     /// Geometric vessel-vessel contact predicate — the same rule
@@ -2110,14 +2291,9 @@ impl SimpleBackend {
             // the gate-pass stamp and reefed to the mount's
             // load rating. Applied at the site point —
             // a canopy above the CoM weathervanes correctly.
+            let pull_body = flow.pull_body(b.rot);
             for site in &b.decel {
-                let area = decel_area_m2(
-                    site,
-                    flow.alt_m,
-                    flow.speed,
-                    flow.rho,
-                    self.time_s.get() + PHYSICS_DT,
-                );
+                let area = decel_area_m2(site, &flow, pull_body, self.time_s.get() + PHYSICS_DT);
                 if area > 0.0 {
                     let f_world = decel_drag_world(&flow, area);
                     let r_world = b.rot.rotate(site.local_pos - b.com_local);
@@ -3080,16 +3256,31 @@ impl PhysicsBackend for SimpleBackend {
         // Write each constraint's accumulated impulse into its public
         // contact record — the §2.4 breakup load evaluation's
         // collision data. Position-level Baumgarte corrections are
-        // pseudo-impulses, not forces, and stay out.
+        // pseudo-impulses, not forces, and stay out. The same pass sums
+        // every ground row's velocity change, speculative rows included
+        // — the touchdown absorption's record (a near-miss brakes the
+        // body without a public record, and that braking is as much the
+        // touchdown as the penetrating rows').
+        self.ground_dv.clear();
+        self.ground_dv.resize_with(bodies.len(), Default::default);
+        self.ground_rows.clear();
         for c in &constraints {
-            if !c.has_record {
-                continue;
-            }
             let b = &bodies[c.body as usize];
-            let j = b
-                .rot
-                .rotate(c.n_body * c.lambda_n + c.t1_body * c.lambda_t1 + c.t2_body * c.lambda_t2);
-            self.contacts[c.body as usize][c.contact_index as usize].impulse = j;
+            let j_body = c.n_body * c.lambda_n + c.t1_body * c.lambda_t1 + c.t2_body * c.lambda_t2;
+            let (j_world, n_world) = (b.rot.rotate(j_body), b.rot.rotate(c.n_body));
+            let dv = &mut self.ground_dv[c.body as usize];
+            dv.world = dv.world + j_world / b.mass_kg;
+            dv.normal = dv.normal + n_world * (j_world.dot(n_world) / b.mass_kg);
+            dv.body = dv.body + c.inv_i.mul_vec(c.r_body.cross(j_body));
+            self.ground_rows.push(GroundRow {
+                body: c.body,
+                hull: c.hull,
+                impulse: j_body,
+                normal: c.n_body,
+            });
+            if c.has_record {
+                self.contacts[c.body as usize][c.contact_index as usize].impulse = j_world;
+            }
         }
         // Pair impulses are already world-frame: `+J` on the
         // penetrator's record, `−J` on the penetrated body's.
@@ -3240,28 +3431,58 @@ impl PhysicsBackend for SimpleBackend {
 /// the deploy command's stamp: a deploy-early command waits out the
 /// ceilings packed instead of arriving fully inflated (C14-F1). The
 /// canopy term is then reefed to the mount's authored load rating —
-/// `area ≤ reef_n / q̄` — so a hard catch pulls at the mount limit
-/// rather than snapping it (the ~2 MN gate-pass load the unbounded
-/// ramp produced vs the s125's 150 kN/60 kN mount). The packed term
-/// is never reefed — the canister's own drag is the mount's honest
-/// load on a hot entry. Shared by `accumulate_forces` and
-/// `external_loads` so the two channels can never disagree.
-fn decel_area_m2(site: &DecelSite, alt_m: f64, speed_mps: f64, rho_kg_m3: f64, at_s: f64) -> f64 {
-    match site.open_at_s {
-        Some(t0) if alt_m <= site.deploy_alt_m && speed_mps <= site.deploy_speed_mps => {
+/// `area ≤ reef / q̄` for [`reef_bound_n`] — so a hard catch pulls at
+/// the mount limit rather than snapping it (the ~2 MN gate-pass load
+/// the unbounded ramp produced vs the s125's 150 kN/60 kN mount). The
+/// mount never reefs the packed term — the canister's own drag is its
+/// honest load on a hot entry. The pull path then caps the site's
+/// **whole** drag, packed term included, at its budget
+/// ([`DecelSite::pull_budget_n`] over `q̄`): an off-axis canister's
+/// drag is a pitch moment every joint below it carries, canopy or not.
+/// `pull_body` is the unit flow direction in body frame — the
+/// direction the canopy's pull takes. Shared by `accumulate_forces`
+/// and `external_loads` so the two channels can never disagree.
+fn decel_area_m2(site: &DecelSite, flow: &FlowState, pull_body: DVec3, at_s: f64) -> f64 {
+    let area = match site.open_at_s {
+        Some(t0) if flow.alt_m <= site.deploy_alt_m && flow.speed <= site.deploy_speed_mps => {
             let ramp = if site.deploy_time_s > 0.0 {
                 ((at_s - t0) / site.deploy_time_s).clamp(0.0, 1.0)
             } else {
                 1.0
             };
             let mut canopy = (site.deployed_drag_area_m2 - site.packed_drag_area_m2) * ramp;
-            let qbar = 0.5 * rho_kg_m3 * speed_mps * speed_mps;
+            let qbar = 0.5 * flow.rho * flow.speed * flow.speed;
             if qbar > 0.0 && site.reef_n.is_finite() {
-                canopy = canopy.min(site.reef_n / qbar).max(0.0);
+                canopy = canopy.min(reef_bound_n(site, pull_body) / qbar).max(0.0);
             }
             site.packed_drag_area_m2 + canopy
         }
         _ => site.packed_drag_area_m2,
+    };
+    if !site.pull_budget_n.is_finite() {
+        return area;
+    }
+    let qbar = 0.5 * flow.rho * flow.speed * flow.speed;
+    if qbar > 0.0 {
+        area.min(site.pull_budget_n / qbar)
+    } else {
+        area
+    }
+}
+
+/// The canopy's load bound for a pull along `pull_body` (body frame,
+/// unit): the mount's weaker force channel, tightened to the torque
+/// rating over the arm the pull sees across `reef_lever` —
+/// `|(site − attach) × F|`, the §2.4 joint-load evaluation's own
+/// torque for that force. A radial mount pulled across its lever is
+/// capped by torque; an axial mount pulled along its lever makes none
+/// and keeps the force channel's bound.
+fn reef_bound_n(site: &DecelSite, pull_body: DVec3) -> f64 {
+    let arm_m = site.reef_lever.cross(pull_body).norm();
+    if arm_m > 0.0 {
+        site.reef_n.min(site.reef_torque_nm / arm_m)
+    } else {
+        site.reef_n
     }
 }
 
@@ -3370,6 +3591,13 @@ fn flow_state(
 }
 
 impl FlowState {
+    /// The unit flow direction in body frame — the direction the §3.1
+    /// decelerator sites measure their pull along, here, in
+    /// `external_loads`, and in [`SimpleBackend::decel_pull`].
+    fn pull_body(&self, rot: csp_core::DQuat) -> DVec3 {
+        rot.conjugate().rotate(self.v_rel) / self.speed
+    }
+
     /// The §2.4.1 table-lookup inputs `(w_body, q, mach, re_per_len)`,
     /// in [`crate::aero::CraftAeroTables`]' call order — the identical
     /// four-line derivation both table call sites carried.
@@ -3457,6 +3685,7 @@ mod tests {
             friction_mu: DEFAULT_FRICTION_MU,
             drag_cd: DEFAULT_DRAG_CD,
             convective_heat_fraction: DEFAULT_CONVECTIVE_HEAT_FRACTION,
+            touchdown_crush_m: DEFAULT_TOUCHDOWN_CRUSH_M,
             ocean: None, // a dry world: the fixture's pinned model
         }
     }
@@ -5805,5 +6034,412 @@ mod tests {
             }
         }
         assert!(min_h > -1.0, "buried {min_h} m under the surface");
+    }
+
+    /// A lower box with a lighter one stacked on it — the shape a flat
+    /// drop reads through in the touchdown test below.
+    fn two_box_stack() -> (PartGraph, Vec<WeldPart>) {
+        let mut g = PartGraph::new(PartNodeId(1));
+        g.insert(
+            PartNodeId(1),
+            PartNode::new(None, PartTransform::IDENTITY, 0),
+        );
+        g.insert(
+            PartNodeId(2),
+            PartNode::new(
+                Some(PartNodeId(1)),
+                PartTransform::new(DVec3::new(0.0, 0.0, 1.0), DQuat::IDENTITY),
+                1,
+            ),
+        );
+        let part = |mass_kg: f64, half: DVec3| WeldPart {
+            experiments: Vec::new(),
+            lab: None,
+            engine: None,
+            parachute: None,
+            dock_ports: vec![],
+            tanks: vec![],
+            crew_seats: 0,
+            structural: csp_data::StructuralDef::unlimited(),
+            mass_kg,
+            com: DVec3::ZERO,
+            inertia: SymMat3::solid_box(mass_kg, half),
+            collider: ColliderShape::Box { half_extents: half },
+            force_sites: vec![],
+            aero: csp_data::AeroDef::constant(1.0, 0.0, 1.0),
+            thermal: test_thermal(),
+        };
+        (
+            g,
+            vec![
+                part(1_000.0, DVec3::new(1.0, 1.0, 0.5)),
+                part(500.0, DVec3::new(0.5, 0.5, 0.5)),
+            ],
+        )
+    }
+
+    /// M4c: a flat drop touches down as a stop the §2.4 evaluation
+    /// reads as spread over the crush distance. Airborne there is
+    /// nothing to spread; through the catch every tick with a contact
+    /// carries a record, and the upper box's joint never carries more
+    /// than `m_above·Δv²/(2·s)` for the whole drop's speed — the
+    /// solver's one-tick reading of the same ticks is several times
+    /// that — nor any torque. A stop that outruns the crush distance
+    /// has no record: the same stack from 1 200 m arrives at ~150 m/s,
+    /// its catch holds a tick past `2·s/dt`, and that tick's own load
+    /// is read.
+    #[test]
+    fn a_flat_drop_is_a_stop_spread_over_the_crush_distance() {
+        let (graph, parts) = two_box_stack();
+        let transforms = crate::weld::body_transforms(&graph, &parts).unwrap();
+        let run = |drop_m: f64| {
+            let mut backend = SimpleBackend::new(terrin_env());
+            let mut body = crate::weld::weld(&graph, &parts).unwrap();
+            // The lower box's base `drop_m` above the sphere.
+            body.pos = DVec3::new(0.0, 0.0, TERRIN_R + drop_m + 0.5);
+            let mut bodies = vec![body];
+            let (mut airborne, mut absorbed, mut unabsorbed) = (true, false, false);
+            let (mut speed, mut spread, mut solved, mut turn): (f64, f64, f64, f64) =
+                (0.0, 0.0, 0.0, 0.0);
+            for _ in 0..6_000 {
+                let (v0, w0) = (bodies[0].vel, bodies[0].ang_vel);
+                backend.step(&mut bodies, &[]);
+                let handle = BodyHandle(0);
+                let contacts = backend.contacts(handle);
+                let touchdown = backend.touchdown(&bodies[0], handle);
+                // Resting on the sphere is a 0.15 m/s stop every tick;
+                // only the ticks the stack arrives at falling are read.
+                if -v0.z <= 1.0 {
+                    continue;
+                }
+                // Free fall makes `v.z` 0.15 m/s more negative a tick;
+                // anything else is the ground.
+                let braked = bodies[0].vel.z - v0.z > 0.0;
+                if touchdown.is_none() {
+                    unabsorbed |= braked;
+                    continue;
+                }
+                airborne &= braked;
+                absorbed = true;
+                speed = speed.max(-v0.z);
+                let upper_joint = |absorbed: bool| {
+                    let ext = backend
+                        .external_loads(
+                            &bodies[0],
+                            &graph,
+                            &parts,
+                            contacts,
+                            backend.water_loads(handle),
+                            &transforms,
+                        )
+                        .unwrap();
+                    let motion = crate::structural::TickMotion {
+                        accel_body: bodies[0].rot.conjugate().rotate(bodies[0].vel - v0)
+                            / PHYSICS_DT,
+                        alpha_body: (bodies[0].ang_vel - w0) / PHYSICS_DT,
+                        touchdown: absorbed.then_some(touchdown.as_ref()).flatten(),
+                    };
+                    crate::structural::joint_loads(
+                        &bodies[0],
+                        &graph,
+                        &parts,
+                        &ext,
+                        &transforms,
+                        motion,
+                    )
+                    .unwrap()
+                    .remove(0)
+                };
+                let stop = upper_joint(true);
+                spread = spread.max(stop.axial_n);
+                turn = turn.max(stop.torque_nm).max(stop.shear_n);
+                solved = solved.max(upper_joint(false).axial_n);
+            }
+            (airborne, absorbed, unabsorbed, speed, spread, solved, turn)
+        };
+
+        let (airborne, absorbed, unabsorbed, speed, spread, solved, turn) = run(1.1);
+        assert!(
+            airborne && absorbed && !unabsorbed,
+            "the 1.1 m drop is absorbed"
+        );
+        assert!(
+            speed > 4.0 && speed < 5.0,
+            "the 1.1 m drop's speed: {speed}"
+        );
+        let crush = 500.0 * speed * speed / (2.0 * DEFAULT_TOUCHDOWN_CRUSH_M);
+        assert!(
+            spread > 0.2 * crush && spread <= crush,
+            "the spread stop {spread} against m_above·Δv²/(2·s) = {crush}"
+        );
+        assert!(
+            solved > 4.0 * spread,
+            "the one-tick reading {solved} against the spread {spread}"
+        );
+        assert!(
+            turn < 10.0,
+            "a flat stop through the CoM turns nothing: {turn}"
+        );
+
+        let (airborne, _, unabsorbed, _, _, _, _) = run(1_200.0);
+        assert!(airborne, "airborne clear");
+        assert!(
+            unabsorbed,
+            "a ~150 m/s impact outruns the crush distance and is read as is"
+        );
+    }
+
+    /// An `csp.chute.s125` site on a 0.25 m lever along +z with the
+    /// shipped mount ratings (150 kN / 60 kN / 8 kN·m, derated 0.9).
+    fn umbrella_site() -> DecelSite {
+        DecelSite {
+            node: PartNodeId(1),
+            local_pos: DVec3::new(0.0, 0.0, 0.25),
+            packed_drag_area_m2: 0.4,
+            deployed_drag_area_m2: 700.0,
+            deploy_alt_m: 16_000.0,
+            deploy_speed_mps: 1_200.0,
+            deploy_time_s: 1.5,
+            deployed_at_s: Some(0.0),
+            open_at_s: Some(0.0),
+            reef_n: 54_000.0,
+            reef_torque_nm: 7_200.0,
+            reef_lever: DVec3::new(0.0, 0.0, 0.25),
+            pull_budget_n: f64::INFINITY,
+        }
+    }
+
+    /// M4c: the reef's torque bound is the joint evaluation's own —
+    /// the canopy's pull across the lever from the joint's attach point
+    /// to the site. A top-mounted canopy on an axial descent pulls
+    /// along its lever and keeps the force channel's bound (54 kN); the
+    /// same mount pulled across it — a radial canopy on that descent —
+    /// is capped at the torque rating over the arm (29 kN), and a
+    /// diagonal pull sits between. The bound is the canopy's area under
+    /// the flow: the same 250 m/s descent carries 1.7 m² of canopy one
+    /// way and 0.9 m² the other.
+    #[test]
+    fn reef_bound_follows_the_pull_across_the_lever() {
+        let site = umbrella_site();
+        assert_eq!(reef_bound_n(&site, DVec3::Z), 54_000.0);
+        assert!((reef_bound_n(&site, DVec3::X) - 28_800.0).abs() < 1e-9);
+        let diagonal = DVec3::new(1.0, 0.0, 1.0) / libm::sqrt(2.0);
+        let expected = 7_200.0 / (0.25 / libm::sqrt(2.0));
+        assert!((reef_bound_n(&site, diagonal) - expected).abs() < 1e-6);
+
+        let flow = FlowState {
+            v_rel: DVec3::new(0.0, 0.0, -250.0),
+            speed: 250.0,
+            rho: 1.0,
+            alt_m: 1_500.0,
+        };
+        let along = decel_area_m2(&site, &flow, DVec3::Z, 10.0);
+        let across = decel_area_m2(&site, &flow, DVec3::X, 10.0);
+        assert!(
+            (along - (0.4 + 54_000.0 / 31_250.0)).abs() < 1e-9,
+            "{along}"
+        );
+        assert!(
+            (across - (0.4 + 28_800.0 / 31_250.0)).abs() < 1e-9,
+            "{across}"
+        );
+    }
+
+    /// M4c pull-path reef: the site's budget caps its **whole** drag —
+    /// canopy and packed term alike — and an unbounded budget leaves
+    /// the area bit for bit as it was.
+    #[test]
+    fn the_pull_budget_caps_the_sites_whole_drag() {
+        let flow = FlowState {
+            v_rel: DVec3::new(0.0, 0.0, -250.0),
+            speed: 250.0,
+            rho: 1.0,
+            alt_m: 1_500.0,
+        };
+        let mut site = umbrella_site();
+        let open = decel_area_m2(&site, &flow, DVec3::Z, 10.0);
+        assert!((open - (0.4 + 54_000.0 / 31_250.0)).abs() < 1e-9, "{open}");
+        // A budget past the drag changes nothing, down to the bit.
+        site.pull_budget_n = 1.0e6;
+        assert_eq!(
+            decel_area_m2(&site, &flow, DVec3::Z, 10.0).to_bits(),
+            open.to_bits()
+        );
+        // The Stock Hopper's stack under a side canister at 250 m/s:
+        // 9 kN, under the packed term's own drag.
+        site.pull_budget_n = 9_000.0;
+        assert!((decel_area_m2(&site, &flow, DVec3::Z, 10.0) - 9_000.0 / 31_250.0).abs() < 1e-12);
+        site.pull_budget_n = 0.0;
+        assert_eq!(decel_area_m2(&site, &flow, DVec3::Z, 10.0), 0.0);
+        // Packed, undeployed: the same cap — the canister's own drag is
+        // what broke the stack before its canopy ever opened.
+        site.open_at_s = None;
+        site.pull_budget_n = 9_000.0;
+        assert!((decel_area_m2(&site, &flow, DVec3::Z, 10.0) - 9_000.0 / 31_250.0).abs() < 1e-12);
+    }
+
+    /// Terrin under a constant-density atmosphere (ρ ≈ 1.225 kg/m³ to
+    /// 1e-9 over the first kilometres) — the drag fixtures' air.
+    fn chuted_env() -> Environment {
+        let mut env = terrin_env();
+        env.atmosphere = Some(AtmosphereDef {
+            sea_level_pressure_pa: 101_325.0,
+            scale_height_m: 1.0e12,
+            top_m: 100_000.0,
+            molar_mass_kg_per_mol: 0.028_964_7,
+            heat_capacity_ratio: 1.4,
+            temperature_knots: vec![
+                TemperatureKnot {
+                    altitude_m: 0.0,
+                    temperature_k: 288.15,
+                },
+                TemperatureKnot {
+                    altitude_m: 100_000.0,
+                    temperature_k: 288.15,
+                },
+            ],
+        });
+        env
+    }
+
+    /// A 2.1 t box at 1.5 km falling at 250 m/s, the `umbrella_site`
+    /// canopy on it — the Stock Hopper under its chute, in one part.
+    fn chute_box_body() -> WeldedBody {
+        let mut b = box_body(2_100.0, DVec3::new(0.5, 0.5, 0.5));
+        b.pos = DVec3::new(0.0, 0.0, TERRIN_R + 1_500.0);
+        b.vel = DVec3::new(0.0, 0.0, -250.0);
+        b.decel = vec![umbrella_site()];
+        b
+    }
+
+    /// The reef's cut has to land on what a site really pulls, and
+    /// `decel_pulls` is that reading: the site's drag under the flow at
+    /// the body's own speed, the lesser of its budget and what it can
+    /// pull — the canopy reefed to its mount's 54 kN on an axial pull,
+    /// the budget when it is under that, and exactly the force
+    /// `accumulate_forces` gives the step with and without the site.
+    #[test]
+    fn decel_pulls_are_the_drag_the_step_integrates() {
+        let env = chuted_env();
+        let backend = SimpleBackend::new(env.clone());
+        backend.set_sim_time(SimTime::from_ticks(TICK_HZ * 4)); // past the 1.5 s ramp
+        let rho = atmosphere_density_kg_m3(env.atmosphere.as_ref().unwrap(), 1_500.0);
+        let qbar = 0.5 * rho * 250.0 * 250.0;
+
+        let body = chute_box_body();
+        let pulls = backend.decel_pulls(&body);
+        assert_eq!(pulls.len(), 1);
+        // Axial pull: the packed term plus the canopy reefed to 54 kN.
+        let reefed = qbar * 0.4 + 54_000.0;
+        assert!(
+            (pulls[0] - reefed).abs() < 1e-6,
+            "{} against {reefed}",
+            pulls[0]
+        );
+
+        // The same force the step integrates: with the site, less without.
+        let (with_site, with_torque) = backend.accumulate_forces(&body);
+        let mut bare = body.clone();
+        bare.decel.clear();
+        let (without_site, without_torque) = backend.accumulate_forces(&bare);
+        assert!(((with_site - without_site).norm() - pulls[0]).abs() < 1e-9);
+        // Applied on the stack's axis, through the CoM: no torque either way.
+        assert_eq!(with_torque, without_torque);
+
+        // A budget under the pull caps it — the cut lands on the stamp.
+        let mut budgeted = body.clone();
+        budgeted.decel[0].pull_budget_n = 9_000.0;
+        assert!((backend.decel_pulls(&budgeted)[0] - 9_000.0).abs() < 1e-9);
+        assert!(backend.decel_pulls(&bare).is_empty());
+        assert!(
+            SimpleBackend::new(terrin_env())
+                .decel_pulls(&body)
+                .is_empty()
+        );
+    }
+
+    /// The reef's read-back flies a copy of the craft one tick under its
+    /// budgets and reads it as the evaluation will: that is only worth
+    /// anything if the copy's tick IS the step's. `coast_ahead_with_sites`
+    /// moves a body exactly as `step` does — same forces, decelerator
+    /// drag included — where `coast_ahead`, the sites taken out, does not.
+    #[test]
+    fn coast_ahead_with_sites_is_the_step_itself() {
+        let mut backend = SimpleBackend::new(chuted_env());
+        backend.set_sim_time(SimTime::from_ticks(TICK_HZ * 4));
+        let mut flown = chute_box_body();
+        let mut stepped = vec![chute_box_body()];
+        let mut coasted = chute_box_body();
+        backend.coast_ahead_with_sites(&mut flown);
+        backend.step(&mut stepped, &[]);
+        backend.coast_ahead(&mut coasted);
+        let stepped = &stepped[0];
+        for (name, a, b) in [
+            ("pos", flown.pos, stepped.pos),
+            ("vel", flown.vel, stepped.vel),
+            ("ang_vel", flown.ang_vel, stepped.ang_vel),
+        ] {
+            assert_eq!(a, b, "{name}: the copy must fly the step's own tick");
+        }
+        assert_eq!(
+            flown.rot, stepped.rot,
+            "rot: the copy must fly the step's own tick"
+        );
+        assert_eq!(flown.decel.len(), 1, "the copy keeps its sites");
+        // Without the canopy the same tick falls about half a metre per
+        // second faster: 69 kN on 2.1 t for 1/64 s.
+        assert!(
+            coasted.vel.z < flown.vel.z - 0.4 && coasted.vel.z > flown.vel.z - 0.6,
+            "without the site {} against with {}",
+            coasted.vel.z,
+            flown.vel.z
+        );
+    }
+
+    /// `ground_braked` tells a hot stop from no stop. The touchdown
+    /// record is withheld for a stop that outruns the crush distance and
+    /// a speculative row leaves no public contact, so a 153 m/s impact
+    /// reads as "nothing touched" through either: the ground did brake
+    /// the body that tick, and only `ground_braked` says so. A 4.6 m/s
+    /// landing carries the record as well, and neither reads as a stop
+    /// on the ticks of free fall before it.
+    #[test]
+    fn ground_braked_answers_for_a_hot_stop_too() {
+        for (drop_m, hot) in [(1.1, false), (1_200.0, true)] {
+            let mut backend = SimpleBackend::new(terrin_env());
+            let mut b = box_body(20_000.0, DVec3::new(1.0, 1.0, 1.0));
+            b.pos = DVec3::new(0.0, 0.0, TERRIN_R + drop_m + 1.0); // the base `drop_m` up
+            let mut bodies = vec![b];
+            let handle = BodyHandle(0);
+            let mut braked_at = None;
+            for tick in 0..20_000 {
+                let v0 = bodies[0].vel;
+                assert!(
+                    !backend.ground_braked(handle),
+                    "tick {tick}: free fall is not a stop"
+                );
+                backend.step(&mut bodies, &[]);
+                // Falling only makes `v.z` more negative; anything else is the ground.
+                if bodies[0].vel.z > v0.z {
+                    braked_at = Some(tick);
+                    break;
+                }
+            }
+            let tick = braked_at.expect("the box must reach the ground");
+            assert!(backend.ground_braked(handle), "tick {tick}: the stop");
+            if hot {
+                // Nothing else says so: no record, no public contact.
+                assert!(backend.contacts(handle).is_empty());
+                assert!(
+                    backend.touchdown(&bodies[0], handle).is_none(),
+                    "a hot stop's record is withheld"
+                );
+            } else {
+                assert!(
+                    backend.touchdown(&bodies[0], handle).is_some(),
+                    "a soft stop carries its record"
+                );
+            }
+        }
     }
 }

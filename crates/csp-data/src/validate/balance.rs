@@ -1,7 +1,8 @@
 //! The §8.3 `balance.ron` rules: `schema_version` and every numeric
 //! tunable inside the domain its `csp-sim` `*Config::is_valid` mirror
 //! gates at restore, plus the two water tunables `csp-phys`'s `Ocean`
-//! carries into the tick verbatim.
+//! carries into the tick verbatim and the touchdown crush distance its
+//! joint-load evaluation reads.
 
 use crate::resource::ResourceFile;
 
@@ -314,5 +315,20 @@ pub fn validate_balance(
     // zero would author water that does not slow a splashdown.
     pos("water_density_kg_m3", b.water_density_kg_m3, &mut out);
     pos("water_drag_cd", b.water_drag_cd, &mut out);
+    // M4c touchdown absorption — the crush distance divides the
+    // spread load `m·Δv²/(2·s)`: zero would make every landing the
+    // solver's one-tick stop again, by a division the data author
+    // never sees; and it is at most 5 m. The absorption spreads a stop
+    // the crush distance can hold (`|Δv|·dt < 2·s`) — 64 m/s at half a
+    // metre, 640 m/s at five — so a longer one would read an orbital
+    // impact as five metres of structure folding, and nothing would
+    // break on touchdown.
+    pos("touchdown_crush_m", b.touchdown_crush_m, &mut out);
+    if b.touchdown_crush_m > 5.0 {
+        out.push(ValidationError::BadBalance {
+            field: "touchdown_crush_m",
+            reason: "> 5 m — the absorption would spread any impact short of 640 m/s over five metres (|Δv|·dt < 2·s at dt = 1/64 s), and nothing would break on touchdown",
+        });
+    }
     out
 }

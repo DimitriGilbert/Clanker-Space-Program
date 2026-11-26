@@ -1358,6 +1358,7 @@ mod tests {
             friction_mu: crate::simple::DEFAULT_FRICTION_MU,
             drag_cd: crate::simple::DEFAULT_DRAG_CD,
             convective_heat_fraction: crate::DEFAULT_CONVECTIVE_HEAT_FRACTION,
+            touchdown_crush_m: crate::DEFAULT_TOUCHDOWN_CRUSH_M,
             terrain: None,
             ocean: Some(Ocean::at_datum(TERRIN_R)),
         }
@@ -2875,6 +2876,11 @@ mod tests {
         assert_eq!(
             compat.ocean, None,
             "a pre-ocean save decodes as a dry world"
+        );
+        assert_eq!(
+            compat.touchdown_crush_m,
+            crate::DEFAULT_TOUCHDOWN_CRUSH_M,
+            "a pre-field save decodes at the shipped crush distance"
         );
         assert_eq!(compat.radius_m, TERRIN_R);
 

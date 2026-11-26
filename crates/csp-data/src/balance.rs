@@ -85,7 +85,11 @@ use crate::ids::ResourceId;
 /// on the body: every ocean in a data set is the same water.
 /// Mirrors: `csp_phys::DEFAULT_WATER_DENSITY_KG_M3`,
 /// `csp_phys::DEFAULT_WATER_DRAG_CD`.
-pub const BALANCE_SCHEMA_VERSION: u32 = 16;
+/// 17 (M4c landing): `touchdown_crush_m` — the §2.4 touchdown
+/// absorption's crush distance, the distance a landing's ground
+/// contact is read as stopping the craft over.
+/// Mirror: `csp_phys::DEFAULT_TOUCHDOWN_CRUSH_M`.
+pub const BALANCE_SCHEMA_VERSION: u32 = 17;
 
 /// `data/balance.ron` — the tunables every later milestone consumes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -339,4 +343,15 @@ pub struct BalanceDef {
     /// order of magnitude; the same coefficient serves every part.
     /// Mirror: `csp_phys::DEFAULT_WATER_DRAG_CD`.
     pub water_drag_cd: f64,
+    /// The §2.4 touchdown absorption's crush distance (m) — the
+    /// ground-contact stop of a landing is evaluated as if spread over
+    /// this far, so a joint above the contact carries
+    /// `m_above·Δv²/(2·touchdown_crush_m)` instead of the one-tick
+    /// stop's `m_above·Δv/dt`. Half a metre of crushing structure; a
+    /// stop that would outrun it (a hot impact) keeps the tick's own
+    /// load. The craft's motion is the solver's — this is the breakup
+    /// evaluation's reading of it. The validator gates it to (0, 5] m:
+    /// a longer crush would spread any impact short of 640 m/s.
+    /// Mirror: `csp_phys::DEFAULT_TOUCHDOWN_CRUSH_M`.
+    pub touchdown_crush_m: f64,
 }

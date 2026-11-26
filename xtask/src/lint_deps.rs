@@ -925,17 +925,18 @@ mod tests {
         let text = std::fs::read_to_string(root.join("data/balance.ron"))
             .expect("data/balance.ron missing");
         let b: Balance = ron::from_str(&text).expect("data/balance.ron is not valid RON");
-        // Schema v16 — M9b added §3.4's reliability block (v11), the
+        // Schema v17 — M9b added §3.4's reliability block (v11), the
         // C12 economy extension followed (v12), C21-F8 added
         // `colony_founding_cost_funds` (v13), 40dbc35 added
         // `convective_heat_fraction` (v14), 5edf3ff's 7.7 plasma
-        // recalibration bumped it again (v15), and the water model added
-        // `water_density_kg_m3`/`water_drag_cd` (v16). The loader-side
+        // recalibration bumped it again (v15), the water model added
+        // `water_density_kg_m3`/`water_drag_cd` (v16), and the M4c
+        // landing added `touchdown_crush_m` (v17). The loader-side
         // pin is `csp_data::BALANCE_SCHEMA_VERSION` (kept in lockstep by
         // csp-data's own balance gate test). NOTE: this pin was missed
         // on three schema bumps (11→13, 13→14, 14→15) — it MUST ride
         // every `data/balance.ron` schema_version change.
-        assert_eq!(b.schema_version, 16);
+        assert_eq!(b.schema_version, 17);
         assert_eq!(b.bubble_radius_m, 20_000.0);
         assert_eq!(b.advance_to_max_events_per_frame, 2_000);
         // And the other shipped data file parses too.

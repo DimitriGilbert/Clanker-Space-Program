@@ -224,8 +224,11 @@ impl Default for WeldedBody {
 /// catch gates (`deploy_alt_m`, `deploy_speed_mps`) held under flow —
 /// the `deploy_time_s` inflation ramp's anchor, so a deploy-early
 /// command cannot pre-complete inflation before the flow can hold the
-/// canopy (C14-F1). `reef_n` bounds the canopy load the mount was
-/// authored for. Gates and reef are evaluated per tick by the
+/// canopy (C14-F1). The reef bounds the canopy load the mount was
+/// authored for: `reef_n` on the force, `reef_torque_nm` over the arm
+/// the pull sees across `reef_lever`; the pull path caps the site's
+/// whole drag at what every other joint of the craft takes
+/// (`pull_budget_n`). Gates and reef are evaluated per tick by the
 /// backend's force accumulation against the body's own altitude,
 /// speed, and density.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -253,11 +256,33 @@ pub struct DecelSite {
     /// `None` until the flow can hold the canopy. The ramp opens from
     /// here, not from `deployed_at_s`.
     pub open_at_s: Option<f64>,
-    /// Canopy load bound (N) — the site's reefed ceiling on
-    /// `½·ρ·v²·A_canopy`, derived from the mount's authored
-    /// `StructuralDef` (weakest reachable channel). `f64::INFINITY`-class
-    /// values (an unlimited mount) leave the canopy unreefed.
+    /// Canopy force bound (N) — the weaker of the mount's authored
+    /// axial and shear ratings, derated: the ceiling on the reefed
+    /// `½·ρ·v²·A_canopy`. `f64::INFINITY`-class values (an unlimited
+    /// mount) leave the canopy unreefed.
     pub reef_n: f64,
+    /// Canopy torque bound about the joint (N·m) — the mount's
+    /// authored torque rating, derated.
+    pub reef_torque_nm: f64,
+    /// The joint's attach point to the site point, body frame — the
+    /// lever the §2.4 joint-load evaluation measures the canopy's
+    /// torque about: a pull across it spends `reef_torque_nm`, a pull
+    /// along it spends none.
+    pub reef_lever: DVec3,
+    /// The pull-path reef (C14-F1's companion): the greatest drag (N)
+    /// the site may apply this tick without loading any joint of the
+    /// craft but its own mount past the working-load derate —
+    /// [`crate::structural::JointModel::pull_budgets`], which the world
+    /// computes before each step from the tick's other loads, every
+    /// site of the body at once (each pulls its own budget times the
+    /// one scale that keeps the joints inside the derate with all of
+    /// them pulling). It caps the site's **whole** drag, the packed term
+    /// included: an off-axis canister at 250 m/s already overloads the
+    /// Stock Hopper's pod-to-canister joint before its canopy ever opens.
+    /// `f64::INFINITY` when nothing beside the mount feels the pull —
+    /// a pod-alone chute — and then the mount's reef alone caps the
+    /// site.
+    pub pull_budget_n: f64,
 }
 
 impl WeldedBody {

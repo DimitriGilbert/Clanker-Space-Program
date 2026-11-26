@@ -1,7 +1,7 @@
 // Global balance constants. ALL tuning lives here (PLAN §8.3).
 // Named fields only — positional tuples drift silently under reordering.
 (
-    schema_version: 16,
+    schema_version: 17,
     // Physics bubble radius (PLAN §2.3): 20 km. Vessels go on rails at the
     // radius and rejoin at 90% (18 km) — the hysteresis is csp-sim logic,
     // not a second constant.
@@ -106,4 +106,8 @@
     // `csp_phys::DEFAULT_WATER_DRAG_CD`.
     water_density_kg_m3: 1025.0,
     water_drag_cd: 1.0,
+    // M4c landing — same field as data/balance.ron: the touchdown
+    // absorption's crush distance.
+    // Mirror: `csp_phys::DEFAULT_TOUCHDOWN_CRUSH_M`.
+    touchdown_crush_m: 0.5,
 )

@@ -268,7 +268,11 @@ fn batch_errors_are_typed() {
 
 /// §3.1 `Parachute`: the authored chute's `Parachute` module resolves
 /// into the `WeldPart::parachute` deploy spec — the numbers a
-/// `DeployPart` apply reads (unscaled at s = 1).
+/// `DeployPart` apply reads (unscaled at s = 1). The authored values
+/// are the M4c landing tuning: the Stock Hopper free-falls to ~300 m/s,
+/// so the catch gates sit at 16 km / 1200 m/s (the hopper's returns
+/// pass 16 km at up to ~1180 m/s) and the canopy is 700 m² of Cd·A (a
+/// 7 m/s touchdown, the 0.5 m crush load the battery joint survives).
 #[test]
 fn chute_resolves_parachute_spec() {
     let defs = defs();
@@ -292,13 +296,13 @@ fn chute_resolves_parachute_spec() {
     else {
         panic!("parachute module expected");
     };
-    assert_eq!(*deploy_alt_m, 6_000.0);
-    assert_eq!(*deploy_speed_mps, 260.0);
+    assert_eq!(*deploy_alt_m, 16_000.0);
+    assert_eq!(*deploy_speed_mps, 1_200.0);
     let spec = eff[0].weld_input.parachute.unwrap();
-    assert_eq!(spec.deploy_alt_m, 6_000.0);
-    assert_eq!(spec.deploy_speed_mps, 260.0);
+    assert_eq!(spec.deploy_alt_m, 16_000.0);
+    assert_eq!(spec.deploy_speed_mps, 1_200.0);
     assert_eq!(spec.packed_drag_area_m2, 0.4);
-    assert_eq!(spec.deployed_drag_area_m2, 120.0);
+    assert_eq!(spec.deployed_drag_area_m2, 700.0);
     assert_eq!(spec.deploy_time_s, 1.5);
     // The deploy spec is craft identity — a resolved module set with
     // no `Parachute` carries `None`.

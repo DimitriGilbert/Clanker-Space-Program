@@ -162,6 +162,9 @@ fn flight_initial(dir: &Path) -> Result<World, ReplayError> {
         ocean.density_kg_m3 = balance.water_density_kg_m3;
         ocean.drag_cd = balance.water_drag_cd;
     }
+    // The touchdown crush distance likewise — a recorded landing
+    // breaks up (or holds) the way the game's would.
+    environment.touchdown_crush_m = balance.touchdown_crush_m;
     let mut world = World::with_physics(
         orbits,
         PhysicsConfig {

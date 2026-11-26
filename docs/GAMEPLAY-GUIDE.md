@@ -40,8 +40,9 @@ VAB (build) → LAUNCH (a paid build order) → fly in the bubble → auto OnRai
 What you start with (`csp-view/src/lib.rs: View::new` + `View::seed_starter_craft`):
 - **₣ 1,000,000** funds (`data/balance.ron: starting_funds_micros`).
 - A seeded starter craft, the **"Stock Hopper"** — pod + science canister + battery + s160 tank +
-  Sparc engine, sitting latched on the Terrin pad (`csp-view/src/demo.rs: STARTER_CRAFT`,
-  liftoff TWR ≈ 5).
+  Sparc engine + the s125 chute on the pod's top node, sitting latched on the Terrin pad
+  (`csp-view/src/demo.rs: STARTER_CRAFT`, liftoff TWR ≈ 5). The chute is **stage 1**: the first
+  **SPACE** after liftoff deploys it, and the canopy brings the hopper home (§4.5).
 - A seeded 6-slot contract offer board (`contract_offer_slots`, `csp-sim/src/contracts.rs`).
 - One authored colony: the **Rask Mines** outpost (solar + battery + ore drill + smelter),
   founded at boot (`data/systems/home/colonies.ron`).
@@ -274,10 +275,33 @@ click-to-focus, `Tab` cycles focus (`csp-view/src/map.rs`). Two planning windows
   notices name why). Then burn retrograde / set a retrograde node to lower Pe into the
   atmosphere and drag does the rest.
 - **Parachute**: the `csp.chute.s125` part (surface-mount). Deploy via **right-click on the
-  part → deploy parachute**, or the flight **Actions strip** — deployable **only while flying**
-  (in-bubble; `apply_deploy_part`, `csp-sim/src/lib.rs:7211`). The canopy catches below
-  **6 km** and **260 m/s** (`deploy_alt_m`/`deploy_speed_mps` in the part def) with a
-  120 m² drag area.
+  part → deploy parachute**, the flight **Actions strip**, or — the KSP rule — **SPACE**: a
+  chute assigned to a stage fires with it (the Stock Hopper's chute is stage 1) — deployable
+  **only while flying** (in-bubble; `apply_deploy_part`, `csp-sim/src/lib.rs:7211`). The canopy
+  waits packed until the craft is below **16 km** AND **1200 m/s**
+  (`deploy_alt_m`/`deploy_speed_mps` in the part def), so deploy early and let it wait; it is
+  reefed to its mount's rating while the craft is fast and lands the dry Stock Hopper at 7 m/s
+  (700 m² of drag area). **Mount it on the stack's top node to land it**: a radial mount's
+  canopy is capped by its mount's torque rating (about half the pull), and its off-axis drag is
+  a pitch moment every joint below has to carry — so the pull-path reef caps a side canister's
+  **whole** drag, packed or open, at what the stack's joints take. On the Stock Hopper that is
+  about 9 kN (the bare canister's own drag at 250 m/s is 12 kN): a side mount no longer breaks
+  the craft, but reefed that low it cannot land it either — from 1.5 km at 250 m/s the stack
+  still arrives at 149 m/s. Several chutes are reefed **together**: each gets its own budget
+  times the one scale that keeps every joint inside its margin with all of them pulling, so
+  two side canisters no longer each take the full budget, and a top chute with a radial one
+  beside it still lands the Hopper. On a lone pod a radial canister holds only to about
+  270 m/s at 1.5 km (280 m/s tears it off): nothing caps its own packed drag there. A catch
+  needs altitude under it — about 1.5 km at 250 m/s, 6 km at 600 m/s; lower and faster than
+  that it opens too late and the impact breaks the stack.
+- **Touchdown** (M4c landing): the ground stop of a landing is read by the breakup check as if
+  spread over 0.5 m of crush (`touchdown_crush_m`, `data/balance.ron`) — a 7 m/s touchdown loads
+  each inline joint to `m·v²/(2·0.5)` instead of the one-tick stop it is in the solver, and the
+  Stock Hopper lands intact on its engine bell. The spread stop acts through the centre of
+  mass, so a landing with drift or on a slope bends each joint only with what hangs off it.
+  The Hopper is a tall stack on a narrow bell, though: on sloping ground it can tip over after
+  touchdown, and the fall is what breaks it. An arrival faster than 64 m/s outruns the crush
+  distance and is read as the impact it is.
 - **Water is real** (sub-phase 4.1): where a body has an ocean (`terrin` does — everything
   from the seabed up to sea level), water holds a craft up. A part floats if it is lighter
   than the water its collider displaces (`water_density_kg_m3: 1025` kg/m³ — a full fuel tank
@@ -285,8 +309,9 @@ click-to-focus, `Tab` cycles focus (`csp-view/src/map.rs`). Two planning windows
   latches like a landed craft, as `Splashed`**; what sinks goes down to the seabed and latches
   `Landed`. Weight high in the stack tips it over in the water, weight low brings it back
   upright — a tall craft that splashes engine-first tips over and settles on its side.
-  **Splashdown loads are real**: under a parachute (≈17 m/s) a stack on the shipped
-  mount limits survives the hit (≈9 g); unbraked at 200 m/s it breaks apart (≈900 g). The
+  **Splashdown loads are real**: at a parachute-class 17 m/s a stack on the shipped
+  mount limits survives the hit (≈9 g; the stock chute now arrives at 7 m/s); unbraked at
+  200 m/s it breaks apart (≈900 g). The
   shipped science
   canister's situation mask (49) does **not** include `Splashed` — recover a floater or
   transmit from it instead of running the canister (`csp-phys/src/water.rs`,
@@ -625,7 +650,10 @@ It completes on the **recovery event**, not on landing — press RECOVER VESSEL 
 **How do I deorbit / come home?**
 Focus the vessel in map, press **T** (`RecoverControl`) to pull it off rails into the bubble,
 then fly the entry or set a retrograde maneuver node — the executor flies it automatically.
-Deploy the chute below ~6 km / 260 m/s.
+Deploy the chute before 16 km / 1200 m/s — on the Stock Hopper, SPACE fires its chute stage
+whenever you like after liftoff: the canopy waits packed for those gates. A catch needs about
+6 km of air beneath it at 600 m/s (1.5 km at 250 m/s); a craft that is still supersonic in the
+last kilometres is coming in without it.
 
 **The game says the session is read-only.**
 A fatal sim error halted the clock (crash dialog with a bug-report bundle path). Nothing can

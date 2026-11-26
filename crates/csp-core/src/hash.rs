@@ -305,7 +305,18 @@ use crate::SimError;
 /// `flight-launch` reproduced its committed hash exactly — so each
 /// re-recorded hash differs from its predecessor by this version
 /// prefix alone.
-pub const HASH_SCHEMA_VERSION: u32 = 31;
+///
+/// **Version 32** (M4c landing): `Environment` gained
+/// `touchdown_crush_m` — the crush distance the §2.4 joint-load
+/// evaluation spreads a touchdown's ground stop over (construction
+/// config, never hashed). The `flight-launch` artifact embeds the
+/// environment, so it no longer decodes and re-records in the same
+/// commit. That scenario's craft is one welded part, so neither
+/// golden meets the touchdown absorption or the decelerator reef:
+/// re-recorded at this change but under version 31, `flight-launch`
+/// reproduced its committed hash exactly — each re-recorded hash
+/// differs from its predecessor by this version prefix alone.
+pub const HASH_SCHEMA_VERSION: u32 = 32;
 
 /// Rule-7 sum types: the source of an enum's *declared* stable `u16`
 /// discriminant (PLAN §7.1 rule 7).

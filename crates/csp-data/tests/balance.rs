@@ -224,3 +224,85 @@ fn balance_water_tunables_are_gated() {
         "authored water tunables rejected: {errs:#?}"
     );
 }
+
+/// The v17 touchdown tunable — `touchdown_crush_m` — is gated to
+/// (0, 5] m: zero is as useless as a negative value (the crush
+/// distance divides the spread load, so either makes every landing the
+/// solver's one-tick stop; `PartNonPositive`), NaN reports
+/// `PartNonFinite`, and past 5 m it reports `BadBalance` — a range
+/// failure, not a sign one — because the absorption would spread any
+/// impact short of 640 m/s over five metres. The authored file stays
+/// green at 0.5 m, and the bound itself is inside the gate (the
+/// `csp-phys` mirror is pinned from `csp-bench`, which can reach both).
+#[test]
+fn balance_touchdown_crush_is_gated() {
+    let path = repo_root().join("data/balance.ron");
+    for bad in [0.0, -0.5] {
+        let mut b = csp_data::load_balance(&path).unwrap();
+        b.touchdown_crush_m = bad;
+        let errs = csp_data::validate_balance(&b, &resources());
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                csp_data::ValidationError::PartNonPositive { field: f, value, .. }
+                    if *f == "touchdown_crush_m" && *value == bad
+            )),
+            "touchdown_crush_m = {bad}: {errs:#?}"
+        );
+    }
+
+    let mut b = csp_data::load_balance(&path).unwrap();
+    b.touchdown_crush_m = f64::NAN;
+    let errs = csp_data::validate_balance(&b, &resources());
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            csp_data::ValidationError::PartNonFinite { field: f, .. }
+                if *f == "touchdown_crush_m"
+        )),
+        "touchdown_crush_m NaN: {errs:#?}"
+    );
+
+    // Past 5 m the bound reports as a range failure.
+    for over in [5.5, 50.0] {
+        let mut b = csp_data::load_balance(&path).unwrap();
+        b.touchdown_crush_m = over;
+        let errs = csp_data::validate_balance(&b, &resources());
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                csp_data::ValidationError::BadBalance { field: f, .. }
+                    if *f == "touchdown_crush_m"
+            )),
+            "touchdown_crush_m = {over}: {errs:#?}"
+        );
+    }
+
+    let no_touchdown_error = |errs: &[csp_data::ValidationError]| {
+        !errs.iter().any(|e| {
+            matches!(
+                e,
+                csp_data::ValidationError::PartNonPositive { field: f, .. }
+                | csp_data::ValidationError::PartNonFinite { field: f, .. }
+                | csp_data::ValidationError::BadBalance { field: f, .. }
+                    if *f == "touchdown_crush_m"
+            )
+        })
+    };
+    // The bound itself is inside the gate.
+    let mut b = csp_data::load_balance(&path).unwrap();
+    b.touchdown_crush_m = 5.0;
+    let errs = csp_data::validate_balance(&b, &resources());
+    assert!(
+        no_touchdown_error(&errs),
+        "touchdown_crush_m = 5 m rejected: {errs:#?}"
+    );
+
+    let b = csp_data::load_balance(&path).unwrap();
+    assert_eq!(b.touchdown_crush_m, 0.5);
+    let errs = csp_data::validate_balance(&b, &resources());
+    assert!(
+        no_touchdown_error(&errs),
+        "authored touchdown crush rejected: {errs:#?}"
+    );
+}

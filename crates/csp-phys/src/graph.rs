@@ -180,6 +180,27 @@ impl PartNode {
         self.joint = joint;
         self
     }
+
+    /// The attachment's body-frame attach point — the `p_J` the §2.4
+    /// joint-load torque arm measures about and the decelerator reef's
+    /// lever starts from: the recorded [`Self::joint`] carried into the
+    /// parent's pose, the node's own origin when it is unrecorded (the
+    /// pre-field approximation the field doc names). `id` is this
+    /// node's key in `transforms`; the root has no attachment and
+    /// answers its origin.
+    pub fn attach_point(
+        &self,
+        id: PartNodeId,
+        transforms: &BTreeMap<PartNodeId, PartTransform>,
+    ) -> DVec3 {
+        self.joint
+            .and_then(|j| {
+                let parent = self.parent?;
+                let t = transforms.get(&parent)?;
+                Some(t.apply(j))
+            })
+            .unwrap_or(transforms[&id].offset)
+    }
 }
 
 /// A rooted part tree — the first `weld` argument of §2.4's
@@ -372,5 +393,55 @@ mod tests {
         );
         assert!(displaced.is_some());
         assert_eq!(g.nodes[&PartNodeId(1)].effective_index, 7);
+    }
+
+    /// The attach point is the joint-load torque arm's `p_J`: a
+    /// recorded joint reads through the PARENT's pose (a turned,
+    /// offset parent carries it), an unrecorded one falls back to the
+    /// node's own origin, and the root has no attachment.
+    #[test]
+    fn attach_point_reads_the_recorded_joint_through_the_parent() {
+        let (root, child) = (PartNodeId(1), PartNodeId(2));
+        let mut g = PartGraph::new(root);
+        g.insert(root, PartNode::new(None, PartTransform::IDENTITY, 0));
+        g.insert(
+            child,
+            PartNode::new(
+                Some(root),
+                PartTransform::new(DVec3::new(0.0, 0.0, 2.0), DQuat::IDENTITY),
+                1,
+            ),
+        );
+        // The parent sits at (10, 0, 0), quarter-turned about z — its
+        // local +x is the body's +y.
+        let quarter = DQuat::from_axis_angle(DVec3::Z, FRAC_PI_2);
+        let transforms: BTreeMap<PartNodeId, PartTransform> = BTreeMap::from([
+            (
+                root,
+                PartTransform::new(DVec3::new(10.0, 0.0, 0.0), quarter),
+            ),
+            (
+                child,
+                PartTransform::new(DVec3::new(10.0, 0.0, 2.0), quarter),
+            ),
+        ]);
+        assert_eq!(
+            g.nodes[&root].attach_point(root, &transforms),
+            DVec3::new(10.0, 0.0, 0.0),
+            "the root answers its origin"
+        );
+        assert_eq!(
+            g.nodes[&child].attach_point(child, &transforms),
+            DVec3::new(10.0, 0.0, 2.0),
+            "unrecorded: the child's own origin"
+        );
+        let recorded = g.nodes[&child].clone();
+        g.nodes
+            .insert(child, recorded.with_joint(Some(DVec3::new(1.0, 0.0, 0.5))));
+        assert_eq!(
+            g.nodes[&child].attach_point(child, &transforms),
+            DVec3::new(10.0, 1.0, 0.5),
+            "recorded: the parent-frame point in the body frame"
+        );
     }
 }

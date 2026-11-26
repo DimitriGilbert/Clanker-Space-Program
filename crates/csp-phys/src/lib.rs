@@ -136,8 +136,8 @@ pub use simple::{
     atmosphere_temperature_k,
 };
 pub use structural::{
-    JointLoad, PartForce, failed_joints, fragment_graph, fragment_graph_of, fragment_velocity,
-    joint_loads, subtree_set,
+    DEFAULT_TOUCHDOWN_CRUSH_M, JointLoad, JointModel, PartForce, PullSite, TickMotion, Touchdown,
+    failed_joints, fragment_graph, fragment_graph_of, fragment_velocity, joint_loads, subtree_set,
 };
 pub use tensor::{Axis, SymMat3};
 pub use thermal::step as thermal_step;

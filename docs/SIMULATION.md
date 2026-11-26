@@ -431,6 +431,74 @@ joint reaction `F_J = M_S·a(c_S) − ΣF_ext` per non-root node decomposed agai
 attach axis; overload splits the graph, children inherit momentum (conservation
 test with the plan's defined denominators) and the parent's aero tables.
 
+- **Torque arm** (`PartNode::attach_point`): the reaction's torque is measured about
+  the edge's recorded attach point — the snapped `AttachNode` position carried into the
+  parent's pose (`CraftSession::to_part_graph` stamps it; a hand-built graph falls back
+  to the node origin). The decelerator reef reads the same point.
+- **Touchdown absorption** (M4c landing; `csp_phys::Touchdown`, `balance.ron`'s
+  `touchdown_crush_m`): the solver stops a landing inside one tick, so a touchdown's
+  measured `Δv/dt` is the whole impact speed over 1/64 s. The evaluation reads the stop
+  as spread over the crush distance `s` instead — each component, along the contact
+  normals and the friction across them, keeps `|Δv_c|·dt/(2·s)` of its share of the
+  acceleration and of the solved impulses (their resultant on each touched part, acting
+  through the body's CoM — `joint_loads` takes the moment `com × f`, so a joint carries
+  the inertia of what hangs off it, never the whole craft's stop about the CoM's height) —
+  so an inline joint carries `m·Δv²/(2·s)` and the spin the one-tick
+  sequential solve imparted is not read. A component that would outrun the crush
+  distance (`|Δv_c|·dt ≥ 2·s`: 64 m/s at 0.5 m) is not absorbed; the tick's own load is.
+  The record counts every ground row of the tick, speculative near-misses included (a
+  speculative row brakes the body without a public `Contact`); water is not this channel.
+  `SimpleBackend::touchdown` builds it, `structural_tick` (lib.rs) hands it to
+  `joint_loads`. The craft's motion is the solver's, unchanged. The CoM is load-bearing:
+  with the force read at the body origin instead, a lateral stop — the friction of a
+  touchdown on anything but level ground — turned every joint above the touched part
+  with five to six times the Stock Hopper battery joint's real torque: 114% of its rating
+  at a 7 m/s touchdown on a 1.5° slope, three nodes gone on the tick. Through the CoM that
+  touchdown reads 24% at its worst joint, and 6% of the torque rating on the pad.
+- **Decelerator reef** (M4c landing; `refresh_decel_sites` lib.rs + `reef_bound_n`
+  simple.rs) — the mount's own: a `Parachute` site carries its mount's derated bounds — 0.9 ×
+  the weaker of axial/shear as a force, 0.9 × the torque rating — over the lever from the
+  joint's attach point to the site. The canopy's area is capped at the force bound over the
+  dynamic pressure, tightened to the torque bound over the arm the pull sees across the lever
+  (`|(site − attach) × F|`, the joint evaluation's own torque): a top-mounted canopy on an
+  axial descent pulls along its lever and keeps the force bound (the s125: 54 kN), a radial
+  one on the same descent is capped at the rating over its 0.25 m arm (29 kN). The lever
+  used to run to the node ORIGIN — the part's centre for every box and cylinder, zero — so
+  the torque channel never entered the reef and a radial mount's canopy tore its joint off
+  (10.8× the s125's 8 kN·m rating at 250 m/s). It bounds the canopy term alone: the packed
+  canister's drag is the mount's honest load, which is what tears a chute off a hot entry.
+- **Pull-path reef** (M4c landing; `reef_pull_budgets` lib.rs + `JointModel::pull_budgets`
+  structural.rs): the site's drag reaches every joint of the craft, not only its mount — a
+  side-mounted canister is a pitch moment on everything below it — so before each step the
+  world gives every site a budget (`DecelSite::pull_budget_n`): the greatest drag that
+  leaves every joint but the chute's own mount within 0.9 × each of its limits. The backend
+  caps the site's **whole** drag — packed term included — at that over the dynamic pressure
+  (`decel_area_m2`). The budget is the joint-load model above read as a bound: the tick's
+  other loads (aero, thrust, gravity: `external_loads` on a probe of the body with its
+  sites out) under the rigid response the step gives them, plus the pull's own share per
+  newton (a unit pull less its negative, which cancels everything the pull does not cause);
+  per joint and channel — axial, shear, torque on the joint's attach axis — the pull gets
+  the room between the rest and its derated limit. It is read twice, where the forces act
+  and one tick on (`SimpleBackend::coast_ahead`), because the evaluation reads its aero at
+  the pose the step lands in; the lesser is the site's. **Several sites are budgeted
+  together**, because they pull together: each one's own budget carries the one scale that
+  keeps every channel inside the derate with all of them pulling — the pulls' shares add,
+  vector by vector, each times its budget — and the scale never exceeds 1 (beside another
+  chute a site pulls no more than alone; the derate's working point was measured for one).
+  Read one site at a time, two radial chutes on the Stock Hopper each took the full budget
+  and their turns met on the battery joint: 99.9% of its torque rating 3.5 s after the
+  catch, the lower stack broken off the pod; on one scale every node holds through the
+  catch, the battery joint still at the reef's working point (94%). A geometric lever
+  `|(site − attach) × F|` stands in for the pull's torque only at the mount — further down
+  a swinging stack puts twice that on a joint. Measured on the Stock Hopper with the s125 on
+  the pod's side, dry, 250 m/s: the packed canister alone (12 kN, 0.9 m off the axis) is
+  105% of the pod-to-canister joint's 10 kN·m and 113% of the canister-to-battery joint's
+  8 kN·m — the stack came apart on the spawn tick, before its canopy opened. Budgeted from
+  9 kN, every node holds through a 50° swing to touchdown, the worst joint at 93% of its
+  limit (the reef aims at 90%; the step between the reading and the evaluation costs the
+  rest). The top-mounted stock craft never meets it — its budget is far past the mount's
+  reef and it lands as before — and a pod-alone chute has no joint but its mount: unbounded.
+
 **Docking** (`merge.rs` + `joints.rs`): approach = live `LiveJoint` transient
 (cap 16; over-cap degrades to clean separation); latch = pure graph merge
 (secondary ids remapped `base = max(primary)+1`) + one Stage-1 weld + recorded

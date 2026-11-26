@@ -1,7 +1,7 @@
 // Global balance constants. ALL tuning lives here (PLAN §8.3).
 // Named fields only — positional tuples drift silently under reordering.
 (
-    schema_version: 16,
+    schema_version: 17,
     // Physics bubble radius (PLAN §2.3): 20 km. Vessels go on rails at the
     // radius and rejoin at 90% (18 km) — the hysteresis is csp-sim logic,
     // not a second constant.
@@ -158,4 +158,12 @@
     // water; the same coefficient serves every part.
     // Mirror: `csp_phys::DEFAULT_WATER_DRAG_CD`.
     water_drag_cd: 1.0,
+    // M4c landing: the touchdown absorption's crush distance (m) —
+    // the §2.4 joint-load evaluation reads a landing's ground-contact
+    // stop as if spread over this far (`F = m·Δv²/(2·s)`), so a
+    // chute-speed touchdown is a load the shipped inline joints
+    // survive while a hot impact still breaks the stack. The solver's
+    // motion is unchanged.
+    // Mirror: `csp_phys::DEFAULT_TOUCHDOWN_CRUSH_M`.
+    touchdown_crush_m: 0.5,
 )

@@ -3,27 +3,44 @@
 //
 // The recovery part: a side-mount canister carrying a `Parachute`
 // deployable-decelerator module. `SimCommand::DeployPart` arms the
-// canopy; it stays packed until the flow can hold it — below 6 km
-// AND 260 m/s — then inflates over `deploy_time_s` from the
+// canopy; it stays packed until the flow can hold it — below 16 km
+// AND 1200 m/s — then inflates over `deploy_time_s` from the
 // gate-crossing, and its pull is reefed to the mount's authored
 // rating (`structural` below) so a hard catch slides instead of
-// tearing the canister off. ~120 m² of Cd·A trades for a pod-class
-// terminal velocity near 12 m/s, slow enough to land intact and
-// make `RecoverData` a real path.
+// tearing the canister off. 700 m² of Cd·A lands the dry Stock
+// Hopper (2.1 t) at 7 m/s — slow enough to land intact and make
+// `RecoverData` a real path.
+//
+// Why those numbers (M4c landing, measured): the Stock Hopper is
+// slippery — free fall from a 70 km apogee still reaches ~300 m/s at
+// the ground — so the earlier 6 km / 260 m/s gates only let the
+// canopy catch in its last metres, and 120 m² (15.5 m/s) touched down
+// harder than the stack's inline joints survive. Reefed to 54 kN the
+// canopy needs ~6 km to bring a dry Hopper down from 600 m/s (1.5 km
+// from 250 m/s), so the gates let it catch at 16 km: a 70 km return
+// passes it at 886 m/s, the catch loads the mount to 43% of its axial
+// rating, and the 7 m/s touchdown leaves every inline joint under a
+// fifth of its limit (worst: the battery joint's axial at 18%).
 //
 // The REAL survival envelope: deploy-early is safe — the canopy
-// waits out the ceilings packed — and any gate-crossing under the
-// ceilings inflates a survivable catch. The kill cases are energy
-// and entry heat, not the canopy: below ~1–1.5 km at near-gate
-// speeds it opens too late to land, and on a genuinely hot entry
-// (km/s-class) the canister's own packed drag + aero load exceeds
-// the 150 kN/60 kN mount before the speed gate ever passes. The
-// pre-fix doc's deploy-and-forget semantics inverted this (the
-// ramp completed at command time and the first gate-pass tore the
-// mount — C14-F1). Note for stack design: at orbital entry speeds
-// the editor-default top-mounted science.canister + battery.z1k
-// strip at ~15–25 km under aero load REGARDLESS of the chute —
-// plan recovery legs accordingly (accepted behavior, M4c loads).
+// waits out the ceilings packed — and any catch with ~6 km beneath
+// it lands. The kill cases are energy and entry heat: a late deploy
+// (below ~2 km at 250 m/s, ~6 km at 600 m/s) opens too late, and on
+// a genuinely hot entry (km/s-class) the canister's own packed drag
+// + aero load exceeds the 150 kN/60 kN mount before the speed gate
+// ever passes. Note for stack design: at orbital entry speeds the
+// editor-default top-mounted science.canister + battery.z1k strip
+// at ~15–25 km under aero load REGARDLESS of the chute — plan
+// recovery legs accordingly (accepted behavior, M4c loads). Mount
+// it on the stack's TOP node to land. A radial mount holds only in
+// gentle flow: on a lone pod nothing caps the canister's own packed
+// drag and aero load across its 0.25 m lever — it holds to 270 m/s
+// at 1.5 km and tears off at 280, and at 4 km it holds at 300 m/s
+// (92.1% of the mount's rating) and tears off at 350 — past the
+// mount's 8 kN·m. On a stack the pull-path reef caps the canister's
+// whole drag at what the joints below take (9 kN on the Stock Hopper
+// at 250 m/s, its own packed drag 12 kN) — so it holds, and reefed
+// that low it cannot land the stack (149 m/s).
 // Its authored dominant failure mode is §3.4's `PanelJam` —
 // the deploy hardware is the part.
 // Category Utility: a decelerator is a browser bucket, not a
@@ -36,7 +53,7 @@
     category: Utility,
     mass_dry_kg: 55.0,
     cost_funds: 420.0,
-    size_m: (x: 0.5, y: 0.4, z: 0.5),
+    size_m: (x: 0.5, y: 0.25, z: 0.25),
     build_resources: [("composite", 4.0), ("metal", 2.0)],
     attach_nodes: [
         // Radial mount: the canister's −x face mates a synthesized
@@ -44,7 +61,18 @@
         (id: "mount", position_m: (x: -0.25, y: 0.0, z: 0.0), direction: (x: -1.0, y: 0.0, z: 0.0), diameter_m: 0.625),
     ],
     scale: None,
-    collider: Box(half_extents_m: (x: 0.25, y: 0.2, z: 0.25)),
+    // A slim canister, and its lateral size is load-bearing. The
+    // Stage-2 aero tables voxelise the craft on a 0.15 m grid whose
+    // origin is the craft's own bounding box, and the pod's near-axial
+    // lift direction is only symmetric for a centred raster. Two
+    // voxels wide (half-extent 0.125) the canister keeps it centred on
+    // the Stock Hopper; at 0.2 × 0.25 the voxel block sat off the pod's
+    // raster centre and the lift became a constant ~1 kN·m turning
+    // moment (120 m/s): the hopper has no pitch damping, so it pitched
+    // over four seconds into an unguided full-throttle climb and broke
+    // at the battery joint. `stock_hopper_climbs_under_full_throttle`
+    // (csp-sim) holds the line.
+    collider: Box(half_extents_m: (x: 0.25, y: 0.125, z: 0.125)),
     aero: (
         cd_curve: [(mach: 0.0, coeff: 0.5), (mach: 8.0, coeff: 0.35)],
         cl_curve: [(mach: 0.0, coeff: 0.0)],
@@ -66,10 +94,10 @@
     ],
     modules: [
         Parachute(
-            deploy_alt_m: 6_000.0,
-            deploy_speed_mps: 260.0,
+            deploy_alt_m: 16_000.0,
+            deploy_speed_mps: 1_200.0,
             packed_drag_area_m2: 0.4,
-            deployed_drag_area_m2: 120.0,
+            deployed_drag_area_m2: 700.0,
             deploy_time_s: 1.5,
         ),
     ],

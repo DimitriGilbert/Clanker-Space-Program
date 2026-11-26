@@ -1976,6 +1976,9 @@ fn build_sim_from_dataset(d: &LoadedDataset, save_seed: u64) -> Result<SimWorld,
         ocean.density_kg_m3 = balance.water_density_kg_m3;
         ocean.drag_cd = balance.water_drag_cd;
     }
+    // M4c landing: the touchdown absorption's crush distance — the
+    // §2.4 evaluation reads a landing's stop as spread over it.
+    environment.touchdown_crush_m = balance.touchdown_crush_m;
     let mut sim = SimWorld::with_physics(
         orbits,
         csp_sim::PhysicsConfig {

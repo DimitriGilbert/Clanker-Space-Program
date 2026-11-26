@@ -4595,9 +4595,10 @@ mod tests {
             "no pad vessel at boot — the flight scene would be empty"
         );
         // …and the same craft is loaded in the VAB for editing —
-        // pod + tank + engine + canister + battery (W1.5-b).
+        // pod + tank + engine + canister + battery (W1.5-b) + the
+        // chute on the pod's top (M4c landing).
         app.view
-            .with_vab_session(|v| assert_eq!(v.session().len(), 5));
+            .with_vab_session(|v| assert_eq!(v.session().len(), 6));
     }
 
     /// C24-F1: the Game-menu verb, not just the constructor. The
@@ -4625,7 +4626,7 @@ mod tests {
         // …and the VAB session carries the starter craft, not a blank
         // editor (the seed's `seed_pad_craft` half).
         app.view
-            .with_vab_session(|v| assert_eq!(v.session().len(), 5));
+            .with_vab_session(|v| assert_eq!(v.session().len(), 6));
     }
 
     /// C25-F1: New Game must not drop the M10 "max time warp" cap. The

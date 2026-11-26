@@ -337,7 +337,8 @@ fn ore_cargo_tank_is_authored_and_valid() {
 
 /// The starter-craft fuse, priced from the files: the Stock Hopper
 /// (`csp-view`'s seeded starter — pod + canister + battery + s160 +
-/// sparc) BOM is what `ManufactureCraft` debits from terrin-launch's
+/// sparc + the s125 chute on the pod's top) BOM is what
+/// `ManufactureCraft` debits from terrin-launch's
 /// `starting_stock`, so `floor(stock / bom)` is the launch count the
 /// pad supports before the supply loop must run. Any part re-price
 /// or stockpile re-size moves this number — the test is the fuse's
@@ -353,6 +354,7 @@ fn starter_craft_bom_sets_the_site_fuse() {
         "csp.battery.z1k",
         "csp.tank.s160",
         "csp.engine.sparc",
+        "csp.chute.s125",
     ] {
         for (r, units) in &def(&loaded, id).build_resources {
             match r.as_str() {
@@ -362,8 +364,8 @@ fn starter_craft_bom_sets_the_site_fuse() {
             }
         }
     }
-    assert_eq!(metal, 163.0, "starter-craft metal BOM re-priced");
-    assert_eq!(composite, 16.0, "starter-craft composite BOM re-priced");
+    assert_eq!(metal, 165.0, "starter-craft metal BOM re-priced");
+    assert_eq!(composite, 20.0, "starter-craft composite BOM re-priced");
 
     let sites = load_sites(&repo_root().join("data/systems/home/sites.ron")).unwrap();
     let pad = sites
@@ -378,7 +380,7 @@ fn starter_craft_bom_sets_the_site_fuse() {
             .map(|(_, u)| *u)
             .unwrap_or(0.0)
     };
-    // 2000/163 ≈ 12.27 → metal binds at 12 builds; 400/16 = 25 →
+    // 2000/165 ≈ 12.12 → metal binds at 12 builds; 400/20 = 20 →
     // composite is never the constraint at this ratio.
     assert!(
         stock("metal") / metal < stock("composite") / composite,

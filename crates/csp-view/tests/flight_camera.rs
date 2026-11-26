@@ -130,6 +130,7 @@ fn body_view(surface_r: f64, ocean_datum_m: Option<f64>, spin_rad_s: f64) -> Vie
                 friction_mu: csp_phys::DEFAULT_FRICTION_MU,
                 drag_cd: csp_phys::DEFAULT_DRAG_CD,
                 convective_heat_fraction: csp_phys::DEFAULT_CONVECTIVE_HEAT_FRACTION,
+                touchdown_crush_m: csp_phys::DEFAULT_TOUCHDOWN_CRUSH_M,
                 terrain: None,
                 ocean: None,
             },

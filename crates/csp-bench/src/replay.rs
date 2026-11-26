@@ -1475,6 +1475,7 @@ mod tests {
                         friction_mu: 0.5,
                         drag_cd: 1.0,
                         convective_heat_fraction: csp_phys::DEFAULT_CONVECTIVE_HEAT_FRACTION,
+                        touchdown_crush_m: csp_phys::DEFAULT_TOUCHDOWN_CRUSH_M,
                         terrain: None,
                         ocean: None,
                     },
@@ -1851,6 +1852,10 @@ mod tests {
             b.dock_latch_rel_speed_mps,
             csp_sim::DEFAULT_LATCH_REL_SPEED_MPS
         );
+        // M4c landing: the touchdown crush distance — `Environment::
+        // for_body`'s no-data stamp is what data-less worlds land
+        // under, so it must agree with the authored file.
+        assert_eq!(b.touchdown_crush_m, csp_phys::DEFAULT_TOUCHDOWN_CRUSH_M);
         // And the literal `DEFAULT_*` mirrors the file names.
         assert_eq!(b.dock_capture_range_m, csp_sim::DEFAULT_CAPTURE_RANGE_M);
         assert_eq!(

@@ -84,7 +84,7 @@ convention). `sites.ron`/`colonies.ron` are optional per system. `resources.ron`
 #### PartDef — `data/parts/<id>.ron` (`csp-data/src/part.rs::PartDef`)
 
 Field order: identity → economics → shape → scaling → physics → functionality →
-reliability → gating. A complete real example: `data/parts/csp.chute.s125.ron` (78
+reliability → gating. A complete real example: `data/parts/csp.chute.s125.ron` (118
 lines, includes a `Parachute` module); an engine example: `csp.engine.sparc.ron`.
 
 - `schema_version`, `id`, `family` (upgrade/qualification family, e.g.
@@ -225,9 +225,9 @@ still costs its own science. `data/techtree/home.ron` ships 4 nodes (`tech.start
 0 → `tech.science.1` 15 → `tech.rocketry.2` 30 → `tech.rocketry.3` 60) and 5 tracks.
 (Note: the review map's "9-node techtree" counts nodes+tracks; the file has 4 nodes.)
 
-#### balance.ron — `BalanceDef` (`balance.rs`, v16)
+#### balance.ron — `BalanceDef` (`balance.rs`, v17)
 
-54 named tunables, each a mirror of a sim-side default: bubble radius 20 km,
+55 named tunables, each a mirror of a sim-side default: bubble radius 20 km,
 `advance_to_max_events_per_frame` 2000, object caps, docking capture thresholds,
 transfer radius/rate, science soft-cap `k` and `lab_science_per_data`,
 `transmit_ec_per_data_unit`, `starting_funds_micros`, salary cadence, hire cost,
@@ -236,11 +236,16 @@ support rates, **`script_op_budget: 20_000`**, and the reliability block (dorman
 scale, ignition hazard, bench costs), and the water block (v16): **`water_density_kg_m3`
 (1025)** — the mass a part displaces per submerged cubic metre of its collider, so a part
 floats iff its own density is lower; **`water_drag_cd` (1.0)** — the quadratic drag
-coefficient on every part in water, over the submerged share of its projected area. Both
-are strictly positive in the validator (zero or negative reports `PartNonPositive`, NaN
-`PartNonFinite`) and must be mirrored in every `balance.ron` — `data/`, the
-`flight-launch` fixture and `apps/demo/data/` — along with the schema pin in
-`xtask/src/lint_deps.rs`. ALL tuning lives here (PLAN §8.3).
+coefficient on every part in water, over the submerged share of its projected area. The
+M4c landing adds (v17) **`touchdown_crush_m` (0.5)** — the crush distance the §2.4
+joint-load evaluation spreads a touchdown's ground stop over: an inline joint carries
+`m·Δv²/(2·s)` instead of the solver's one-tick `m·Δv/dt` (mirror:
+`csp_phys::DEFAULT_TOUCHDOWN_CRUSH_M`; `SIMULATION.md` §5, "Structural breakup"). All
+three are strictly positive in the validator (zero or negative reports `PartNonPositive`,
+NaN `PartNonFinite`), and `touchdown_crush_m` is capped at 5 m (above it `BadBalance`: a
+longer crush would spread any impact short of 640 m/s); all must be mirrored in every
+`balance.ron` — `data/`, the `flight-launch` fixture and `apps/demo/data/` — along with the
+schema pin in `xtask/src/lint_deps.rs`. ALL tuning lives here (PLAN §8.3).
 
 ### 1.4 Loading pipeline — loaders → validator → game wiring
 

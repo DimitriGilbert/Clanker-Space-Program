@@ -1231,8 +1231,8 @@ pub struct StageActions {
 /// enqueued `SpawnPhysicalVessel` allocates it inside `step_frame`,
 /// and queued producers/event firings may burn ids first), so the
 /// plan binds *lazily* — the first `fire_stage`/`vessel_for` call
-/// that sees a post-launch vessel carrying the captured craft
-/// fingerprint keeps it.
+/// that sees a post-launch vessel carrying the captured craft's
+/// launch key keeps it.
 #[derive(Resource, Default)]
 pub struct StagePlan {
     /// Remaining stage firings' action sets, firing order.
@@ -1250,10 +1250,10 @@ pub struct StagePlan {
     /// it, and any id at/above it was necessarily allocated after the
     /// launch was enqueued).
     min_id: u64,
-    /// `craft_fingerprint` of the launched craft — the binding match.
-    /// Two launches of the same session craft produce identical
-    /// fingerprints; `min_id` keeps the newest launch's plan from
-    /// binding a still-live older copy.
+    /// [`craft_launch_key`] of the launched craft — the binding match.
+    /// Two launches of the same session craft produce identical keys;
+    /// `min_id` keeps the newest launch's plan from binding a
+    /// still-live older copy.
     craft_key: u64,
     /// `true` once binding proved AMBIGUOUS — two or more live
     /// vessels minted at/above `min_id` share the launch fingerprint
@@ -1281,7 +1281,7 @@ impl StagePlan {
             stages,
             vessel: None,
             min_id: sim.vessels().keys().next_back().map_or(0, |id| id.0 + 1),
-            craft_key: craft_fingerprint(craft),
+            craft_key: craft_launch_key(craft),
             ambiguous: false,
         }
     }
@@ -1302,7 +1302,7 @@ impl StagePlan {
 
     /// The vessel this plan fires at, binding on first call: the
     /// UNIQUE vessel minted at-or-after [`Self::min_id`] whose stored
-    /// craft matches the launch's fingerprint (P05-F1 — the old
+    /// craft matches the launch's key (P05-F1 — the old
     /// "newest match" rule permanently bound a wrong vessel whenever
     /// a second same-craft mint interposed while the plan was
     /// unbound). An unbound plan stays unbound (never caches `None`)
@@ -1322,7 +1322,7 @@ impl StagePlan {
             id.0 >= self.min_id
                 && v.craft
                     .as_ref()
-                    .is_some_and(|c| craft_fingerprint(c) == self.craft_key)
+                    .is_some_and(|c| craft_launch_key(c) == self.craft_key)
         });
         let found = candidates.next().map(|(id, _)| *id);
         if candidates.next().is_some() {
@@ -1514,44 +1514,82 @@ fn bounding_radius(parts: &[FlightPart], com_local: DVec3) -> f64 {
     far_sq.sqrt()
 }
 
+/// FNV-1a over a craft — the mixer [`craft_fingerprint`] and
+/// [`craft_launch_key`] share.
+struct CraftHash(u64);
+
+impl CraftHash {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn mix(&mut self, bits: u64) {
+        self.0 ^= bits;
+        self.0 = self.0.wrapping_mul(Self::FNV_PRIME);
+    }
+
+    /// The mixer opened over `craft`'s shape: its root, then every
+    /// node ascending — id, parent, transform, effective index — then
+    /// the part count.
+    fn over(craft: &csp_sim::CraftDef) -> Self {
+        let mut h = Self(Self::FNV_OFFSET);
+        h.mix(craft.graph.root.0);
+        for (id, node) in &craft.graph.nodes {
+            h.mix(id.0);
+            h.mix(node.parent.map_or(u64::MAX, |p| p.0));
+            for v in [
+                node.transform.offset.x,
+                node.transform.offset.y,
+                node.transform.offset.z,
+                node.transform.rotation.x,
+                node.transform.rotation.y,
+                node.transform.rotation.z,
+                node.transform.rotation.w,
+            ] {
+                h.mix(v.to_bits());
+            }
+            h.mix(u64::from(node.effective_index));
+        }
+        h.mix(craft.parts.len() as u64);
+        h
+    }
+
+    fn finish(self) -> u64 {
+        self.0
+    }
+}
+
 /// The [`LatchedWeldCache`] staleness key: FNV-1a over the
 /// weld-relevant craft structure — node ids, parents, transforms, and
 /// effective indices, then the part count and each part's mass/CoM —
 /// so a same-id/different-craft hit re-welds rather than rendering a
 /// stale parked shape. Presentation-only; not the §7.1 state hash.
 fn craft_fingerprint(craft: &csp_sim::CraftDef) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut h = FNV_OFFSET;
-    let mut mix = |bits: u64| {
-        h ^= bits;
-        h = h.wrapping_mul(FNV_PRIME);
-    };
-    mix(craft.graph.root.0);
-    for (id, node) in &craft.graph.nodes {
-        mix(id.0);
-        mix(node.parent.map_or(u64::MAX, |p| p.0));
-        for v in [
-            node.transform.offset.x,
-            node.transform.offset.y,
-            node.transform.offset.z,
-            node.transform.rotation.x,
-            node.transform.rotation.y,
-            node.transform.rotation.z,
-            node.transform.rotation.w,
-        ] {
-            mix(v.to_bits());
-        }
-        mix(u64::from(node.effective_index));
-    }
-    mix(craft.parts.len() as u64);
+    let mut h = CraftHash::over(craft);
     for p in &craft.parts {
-        mix(p.mass_kg.to_bits());
-        mix(p.com.x.to_bits());
-        mix(p.com.y.to_bits());
-        mix(p.com.z.to_bits());
+        h.mix(p.mass_kg.to_bits());
+        h.mix(p.com.x.to_bits());
+        h.mix(p.com.y.to_bits());
+        h.mix(p.com.z.to_bits());
     }
-    h
+    h.finish()
+}
+
+/// The key a [`StagePlan`] binds its vessel by: the craft's shape and
+/// its catalog part ids — deliberately not the masses
+/// [`craft_fingerprint`] also folds in. A tanked craft's part masses
+/// move with the fuel bucket the first tick its engine burns, and the
+/// plan binds on its first stage press: keyed on mass, a craft the
+/// player flew before staging never matched its plan, and the press
+/// reported a spawn that had long since landed.
+fn craft_launch_key(craft: &csp_sim::CraftDef) -> u64 {
+    let mut h = CraftHash::over(craft);
+    for id in &craft.part_ids {
+        for byte in id.as_str().bytes() {
+            h.mix(u64::from(byte));
+        }
+        h.mix(u64::MAX);
+    }
+    h.finish()
 }
 
 /// Sun direction in the bubble frame: the bubble is a translated copy
@@ -8477,8 +8515,12 @@ mod tests {
         );
     }
 
-    /// The starter craft as measured on the real pad: bounding radius
-    /// 3.062 m — the least distance 4.593 m — framed at 12.248 m.
+    /// The starter craft's bounding radius as first measured on the
+    /// real pad, before it flew with its chute (M4c): 3.062 m — the
+    /// least distance 4.593 m — framed at 12.248 m. The synthetic
+    /// tests' stand-in; the shipped starter measures 3.329 m with the
+    /// canister on the pod's top node
+    /// (`on_the_real_pad_the_eye_goes_round_the_starter_craft`).
     const STARTER_RADIUS_M: f64 = 3.062;
 
     /// What [`sweep_the_zone`] saw.
@@ -11349,9 +11391,11 @@ mod tests {
             .expect("the focus is drawn")
             .com;
         let rmin = min_distance(radius_m);
+        // The chute's canister on the pod's top node (M4c landing) grew
+        // the starter past the 3.062 m the synthetic tests still pin.
         close(
             radius_m,
-            STARTER_RADIUS_M,
+            3.329_281_447_275,
             1.0e-3,
             "the starter craft's bounding radius",
         );

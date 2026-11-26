@@ -64,9 +64,9 @@ fn stage_press_on_a_parked_craft_refuses_instead_of_eating_the_stage() {
         "craft never latched"
     );
     let drop_node = jettisonable(&view, id);
-    // The starter craft is single-stage (no decouplers), so the launch
-    // plan was empty; install a two-firing plan bound to this vessel —
-    // `vessel` preset skips the lazy fingerprint bind.
+    // The starter craft's own plan holds one firing (its chute);
+    // replace it with a two-firing plan bound to this vessel — the
+    // `vessel` preset skips the lazy bind.
     view.world
         .insert_resource(StagePlans::single(StagePlan::bound_to(
             vec![
@@ -208,7 +208,7 @@ fn stage_plan_fires_its_own_vessel_not_the_focus() {
             .graph
             .nodes
             .len(),
-        5, // starter craft: pod + tank + engine + canister + battery
+        6, // starter craft: pod + tank + engine + canister + battery + chute
         "the focused vessel lost a node it never owned"
     );
 }
@@ -302,5 +302,83 @@ fn staged_parachute_deploys_on_stage_press() {
         cues(&view).iter().any(|c| c.contains("DEPLOYED")),
         "no deploy cue landed: {:?}",
         cues(&view)
+    );
+}
+
+/// The shipped starter flies with its chute (M4c landing): the seed
+/// places `csp.chute.s125` on the pod's free top node — along the
+/// stack, where its pull is axial — in stage 1, so the launch captures
+/// a one-firing plan whose deploy set is the chute and nothing else,
+/// and SPACE after liftoff deploys it — the press coming after the
+/// engine has burned, when the craft's tank mass no longer matches its
+/// launch-time fingerprint.
+#[test]
+fn starter_craft_fires_its_chute_from_its_own_stage() {
+    let mut view = View::new().expect("data/ load");
+    view.seed_starter_craft().expect("starter seed");
+    let (pod, chute) = view.with_vab_session(|v| {
+        assert_eq!(
+            v.session().len(),
+            6,
+            "the starter craft: pod, canister, battery, tank, engine, chute"
+        );
+        let node_of = |id: &str| {
+            v.session()
+                .iter()
+                .find(|(_, n)| n.built().part_id.as_str() == id)
+                .expect("starter part")
+                .0
+        };
+        (node_of("csp.pod.mk1"), node_of("csp.chute.s125"))
+    });
+    view.with_vab_session(|v| {
+        let edge = v.session().node(chute).expect("chute placed").edge();
+        let edge = edge.expect("the chute is attached");
+        assert_eq!(edge.parent, pod, "the chute rides the pod");
+        assert_eq!(
+            (edge.parent_node.as_str(), edge.child_node.as_str()),
+            ("top", "mount"),
+            "on the pod's free top node"
+        );
+        assert_eq!(
+            v.session().stage_of(chute),
+            Some(1),
+            "the chute is its own stage"
+        );
+    });
+    frame(&mut view, 1);
+
+    {
+        let plans = view.world.resource::<StagePlans>();
+        assert_eq!(plans.plans.len(), 1, "{:?}", plans.plans.len());
+        let stages = &plans.plans[0].stages;
+        assert_eq!(stages.len(), 1, "one firing: the chute");
+        assert_eq!(stages[0].deploys, [chute]);
+        assert!(stages[0].jettisons.is_empty());
+    }
+
+    // Throttle to liftoff — the engine burns, and the tank's mass
+    // moves with its fuel bucket — then the staged chute fires: the
+    // plan binds on its first press against a craft that no longer
+    // weighs what it did at the launch.
+    let id = view.flight_focus().expect("first spawn focused");
+    view.enqueue_command(
+        csp_view::SourceClass::Ui,
+        csp_view::PLAYER_SOURCE_ID,
+        csp_view::SimCommand::SetThrottle {
+            vessel: id,
+            throttle: 1.0,
+        },
+    );
+    frame(&mut view, 1);
+    assert_eq!(
+        view.fire_stage(),
+        1,
+        "the starter's chute stage did not fire"
+    );
+    frame(&mut view, 1);
+    assert!(
+        view.sim.vessels()[&id].deployed.contains_key(&chute),
+        "SPACE did not deploy the starter's chute"
     );
 }
