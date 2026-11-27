@@ -167,6 +167,9 @@ pub struct FlightInput {
     distance_target_m: f64,
     /// Viewport in physical pixels.
     pub viewport_px: (f64, f64),
+    /// The focus had an open canopy last frame — the edge a canopy
+    /// opening over the craft it already holds is read against.
+    canopy_open: bool,
     /// What makes a focus change continuous.
     travel: FocusTravel,
 }
@@ -179,6 +182,7 @@ impl Default for FlightInput {
             distance_m: FLIGHT_DEFAULT_DIST,
             distance_target_m: FLIGHT_DEFAULT_DIST,
             viewport_px: (1.0, 1.0),
+            canopy_open: false,
             travel: FocusTravel::default(),
         }
     }
@@ -604,6 +608,10 @@ pub struct FlightSyncInput {
     /// ([`bounding_radius`]), folded once per craft revision where the
     /// parts are staged. Mirrored into [`CraftRadii`].
     pub radii: Vec<(u64, f64)>,
+    /// The open canopies the frame draws — every staged vessel's, each
+    /// craft's own in its body's site order. Mirrored into
+    /// [`CanopiesStaged`].
+    pub canopies: Vec<FlightCanopy>,
 }
 
 /// [`FlightSyncInput::rails`] mirrored — a standalone resource for the
@@ -617,6 +625,90 @@ pub struct RailsStaged(pub Vec<u64>);
 /// camera reads the focus's row.
 #[derive(Resource, Default)]
 pub struct CraftRadii(pub Vec<(u64, f64)>);
+
+/// One deployed parachute's canopy as a frame stages it from the
+/// simulation ([`csp_sim::World::canopies`]) — presentation-owned, body
+/// frame like the craft it hangs under. A row exists exactly while the
+/// simulation holds the canopy open: a chute waiting out its gates, one
+/// back past them, and a craft out of the bubble stage none.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FlightCanopy {
+    /// The vessel it hangs under (`VesselId.0`).
+    pub vessel: u64,
+    /// The chute's graph node (`PartNodeId.0`).
+    pub node: u64,
+    /// How far the canopy is inflated, `0..=1` — the simulation's own
+    /// share of its open drag area, and the share of its size it is
+    /// drawn at.
+    pub inflation: f64,
+    /// The canister, body frame — where the suspension lines come down.
+    pub canister: DVec3,
+    /// The canister's place on the craft's axis, body frame — the
+    /// canopy hangs over this point.
+    pub on_axis: DVec3,
+    /// The craft's axis, unit, body frame — the way up to the canopy.
+    pub axis: DVec3,
+    /// The open canopy's drag area Cd·A (m²).
+    pub drag_area_m2: f64,
+}
+
+impl FlightCanopy {
+    /// The row for a canopy the simulation holds open — `None` where it
+    /// holds nothing.
+    fn staged(vessel: u64, canopy: csp_sim::Canopy) -> Option<Self> {
+        Some(Self {
+            vessel,
+            node: canopy.node.0,
+            inflation: canopy.inflation?,
+            canister: canopy.canister,
+            on_axis: canopy.on_axis,
+            axis: canopy.axis,
+            drag_area_m2: canopy.drag_area_m2,
+        })
+    }
+
+    /// The inflated canopy's radius (m): its drag area read as the disc
+    /// that catches it, `A = πr²`, at this inflation.
+    pub fn radius_m(&self) -> f64 {
+        (self.drag_area_m2 / core::f64::consts::PI).sqrt() * self.inflation
+    }
+
+    /// How far the canopy reaches from the craft's centre of mass `com`
+    /// once whole, body frame — the farthest of its dome's rings, rim and
+    /// apex counted in — at every inflation it may be staged at: the
+    /// chase camera frames a canopy by the size it is opening to, from
+    /// the first tick it shows, so the eye is already backing off while
+    /// it inflates.
+    fn reach_m(&self, com: DVec3) -> f64 {
+        let r = (self.drag_area_m2 / core::f64::consts::PI).sqrt();
+        let to_com = com - self.on_axis;
+        let along = to_com.dot(self.axis);
+        let aside = (to_com - self.axis * along).norm();
+        (0..=CANOPY_RINGS)
+            .map(|ring| {
+                let theta = ring as f64 * core::f64::consts::FRAC_PI_2 / CANOPY_RINGS as f64;
+                let height = (CANOPY_LINES + CANOPY_HEIGHT * theta.cos()) * r - along;
+                let out = aside + theta.sin() * r;
+                (height * height + out * out).sqrt()
+            })
+            .fold(0.0, f64::max)
+    }
+}
+
+/// How far the drawn canopy's rim stands over the point it hangs above,
+/// in canopy radii ([`FlightCanopy::radius_m`]) — its suspension lines
+/// run from there down to the canister.
+const CANOPY_LINES: f64 = 1.0;
+
+/// How far the drawn dome rises over its rim, in the same radii.
+const CANOPY_HEIGHT: f64 = 0.5;
+
+/// [`FlightSyncInput::canopies`] mirrored (same standalone-resource
+/// reason as [`RailsStaged`]): the open canopies the frame draws.
+/// `flight_present` and the chase camera read the focus's rows — the
+/// canopy-open cue and the framing it asks for.
+#[derive(Resource, Default)]
+pub struct CanopiesStaged(pub Vec<FlightCanopy>);
 
 /// The §3.4 flight display's g-load input (C10-F2/C22-F5): sustained
 /// acceleration per vessel, measured the way the sim's per-tick
@@ -1157,6 +1249,8 @@ struct SfxPrev {
     contact: bool,
     /// Focused vessel is surface-latched — the landing edge.
     latched: bool,
+    /// The focused vessel has an open canopy — the canopy-open edge.
+    canopy: bool,
 }
 
 /// §3.7's "basic SFX" as a visual cue channel (module docs carry the
@@ -1633,6 +1727,11 @@ pub struct LatchedWeldCache {
     /// each staged [`FlightBody`] — the cache entry is immutable per
     /// fingerprint, so the share is honest (C19-F5).
     bubble_parts: BTreeMap<u64, StagedCraft>,
+    /// Last frame's staged canopy rows, emptied — the buffer
+    /// [`capture_sync_input`] refills, so a steady canopy allocates
+    /// nothing frame to frame. `end_frame` hands it back from
+    /// [`CanopiesStaged`] before each capture.
+    pub(crate) canopy_rows: Vec<FlightCanopy>,
 }
 
 /// [`vessel_parts`]' output with what it bounds — derived once per
@@ -1878,6 +1977,11 @@ pub fn capture_sync_input(
     let mut propulsion = Vec::new();
     let mut rails = Vec::new();
     let mut radii = Vec::new();
+    // The canopy rows ride last frame's buffer, emptied: the capture
+    // refills it and `end_frame` hands it back, so a canopy that stays
+    // open stages without an allocation.
+    let mut canopies = std::mem::take(&mut cache.canopy_rows);
+    canopies.clear();
     for (id, vessel) in sim.vessels() {
         match &vessel.state {
             VesselState::InBubble(body) => {
@@ -1938,6 +2042,11 @@ pub fn capture_sync_input(
                 });
                 radii.push((id.0, radius_m));
                 propulsion.push(vessel_propulsion(*id, vessel, Some(body)));
+                for canopy in sim.canopies(*id) {
+                    if let Some(row) = FlightCanopy::staged(id.0, canopy) {
+                        canopies.push(row);
+                    }
+                }
             }
             // §2.6.4 surface rails: a latched vessel is still *on the
             // pad* — stage its restored inertial pose so the parked
@@ -1991,6 +2100,7 @@ pub fn capture_sync_input(
         propulsion,
         rails,
         radii,
+        canopies,
     }
 }
 
@@ -2557,6 +2667,7 @@ pub(crate) fn sync_flight(
     mut prop: ResMut<VesselPropulsionStaged>,
     mut rails: ResMut<RailsStaged>,
     mut radii: ResMut<CraftRadii>,
+    mut canopies: ResMut<CanopiesStaged>,
 ) {
     snap.env.clone_from(&staged.env);
     snap.vessels = std::mem::take(&mut staged.vessels);
@@ -2564,6 +2675,7 @@ pub(crate) fn sync_flight(
     prop.0 = std::mem::take(&mut staged.propulsion);
     rails.0 = std::mem::take(&mut staged.rails);
     radii.0 = std::mem::take(&mut staged.radii);
+    canopies.0 = std::mem::take(&mut staged.canopies);
 }
 
 /// The share of what is left that one frame of `dt_s` closes at a
@@ -3938,12 +4050,34 @@ struct ChaseFrame {
     com: DVec3,
     /// The focus's bounding radius about its CoM (m).
     radius_m: f64,
+    /// How far an open canopy over the focus reaches from its CoM once
+    /// whole (m) — `0` with none.
+    canopy_m: f64,
     /// The body's centre — `None` without physics (and then no floor).
     centre: Option<DVec3>,
     /// The body's spin axis — world +Z without physics.
     axis: DVec3,
     /// The frame's wall time (ms) — what the easing advances by.
     dt_wall_ms: f64,
+}
+
+/// The eye's target distance for a frame ([`step_chase_camera`]'s
+/// framing): the frame a vessel takes the focus — or already carries an
+/// open canopy — is [`frame_distance`] over craft and canopy alike. A
+/// canopy opening over the craft the camera already holds is framed the
+/// same way once, on the frame it appears, and only outward: a player
+/// already further out keeps their view, and after it the wheel is
+/// theirs. `canopy_m` is how far the open canopy reaches from the
+/// craft's CoM once whole — read from the first tick it shows, so the
+/// eye backs off to frame it while it inflates — `0` with none.
+fn frame_target(input: &mut FlightInput, changed: bool, radius_m: f64, canopy_m: f64) {
+    let framed = frame_distance(radius_m.max(canopy_m));
+    if changed {
+        input.distance_target_m = framed;
+    } else if canopy_m > 0.0 && !input.canopy_open {
+        input.distance_target_m = input.distance_target_m.max(framed);
+    }
+    input.canopy_open = canopy_m > 0.0;
 }
 
 /// One frame's chase-camera step, everything that moves the camera
@@ -3956,7 +4090,11 @@ struct ChaseFrame {
 ///
 /// - **Framing.** The frame a vessel takes the focus, its target
 ///   distance is [`frame_distance`] — the old snap to a fixed range put
-///   a new focus at the old vessel's distance (C19-F4).
+///   a new focus at the old vessel's distance (C19-F4) — over its open
+///   canopy as over the craft, when it carries one. A canopy opening
+///   over the craft the camera already holds is framed the same way
+///   once, on the frame it appears, and only outward: a player already
+///   further out keeps their view, and after it the wheel is theirs.
 /// - **Zoom.** The target is held inside the limits and the distance
 ///   eases toward it by this frame's share.
 /// - **Anchor.** The focus's resting anchor ([`resting_anchor`]): its
@@ -4030,9 +4168,7 @@ fn step_chase_camera(
 
     let last = input.travel.last;
     let changed = last.map(|l| l.id) != Some(frame.id);
-    if changed {
-        input.distance_target_m = frame_distance(radius_m);
-    }
+    frame_target(input, changed, radius_m, frame.canopy_m.max(0.0));
     input.distance_target_m = input
         .distance_target_m
         .clamp(min_distance(radius_m), MAX_DISTANCE_M);
@@ -4488,6 +4624,8 @@ pub(crate) struct ChaseInputs<'w> {
     terrain_cache: ResMut<'w, TerrainCache>,
     /// Every staged vessel's bounding radius — the focus's framing input.
     radii: Res<'w, CraftRadii>,
+    /// The open canopies — how far the focus's reaches.
+    canopies: Res<'w, CanopiesStaged>,
     /// The frame's wall time — what the easing advances by.
     session: Res<'w, crate::SessionMirror>,
 }
@@ -4507,6 +4645,7 @@ pub(crate) fn flight_camera(inputs: ChaseInputs, mut cam: ResMut<FlightCameraF64
         terrain_cfg,
         mut terrain_cache,
         radii,
+        canopies,
         session,
     } = inputs;
     // THE focus — the pin-aware resolver `flight_present`, the SFX
@@ -4544,6 +4683,17 @@ pub(crate) fn flight_camera(inputs: ChaseInputs, mut cam: ResMut<FlightCameraF64
                 .iter()
                 .find(|(id, _)| *id == focus.id)
                 .map_or(0.0, |(_, r)| *r),
+            canopy_m: {
+                // The craft's centre of mass in its own frame, as the
+                // staged rows' geometry is.
+                let com_local = focus.rot.conjugate().rotate(focus.com - focus.pos);
+                canopies
+                    .0
+                    .iter()
+                    .filter(|c| c.vessel == focus.id)
+                    .map(|c| c.reach_m(com_local))
+                    .fold(0.0, f64::max)
+            },
             centre: env.map(|e| e.body_center),
             axis: env.map_or(DVec3::Z, |e| e.spin_axis),
             dt_wall_ms: session.dt_wall_ms,
@@ -4560,6 +4710,7 @@ pub(crate) fn flight_present(
     snap: Res<FlightSnapshot>,
     live: Res<LiveVesselCount>,
     rails: Res<RailsStaged>,
+    canopies: Res<CanopiesStaged>,
     plans: Res<StagePlans>,
     prop: Res<VesselPropulsionStaged>,
     mut cam: ResMut<FlightCameraF64>,
@@ -4600,7 +4751,8 @@ pub(crate) fn flight_present(
     // TTL aging live in `sfx_edges` (kept out of this system under
     // the line budget). The edges baseline on the same resolved
     // focus the camera follows.
-    ui.sfx = sfx_edges(&mut sfx, ui.debris_count, live.0, &rails.0, focus);
+    let canopy = focus.is_some_and(|f| canopies.0.iter().any(|c| c.vessel == f.id));
+    ui.sfx = sfx_edges(&mut sfx, ui.debris_count, live.0, &rails.0, focus, canopy);
     // The audio backend's focus mirror: voices key off this, not a
     // `vessels.last()` of their own (P07-F1).
     sfx.focus_vessel = focus.map(|f| f.id);
@@ -4740,6 +4892,7 @@ fn sfx_edges(
     live_vessels: usize,
     rails: &[u64],
     focus: Option<&FlightBody>,
+    canopy: bool,
 ) -> Vec<String> {
     let cur = focus.map(|f| SfxPrev {
         focus: f.id,
@@ -4750,6 +4903,7 @@ fn sfx_edges(
         rails: rails.contains(&f.id),
         contact: f.contact,
         latched: f.latched,
+        canopy,
     });
     match (sfx.prev, cur) {
         (Some(p), Some(c)) => {
@@ -4770,6 +4924,12 @@ fn sfx_edges(
                 }
                 if c.contact && !p.contact {
                     push("CONTACT");
+                }
+                // The first canopy the simulation holds open over the
+                // craft — the moment it starts inflating, not the press
+                // that fired the chute (that cue names the firing).
+                if c.canopy && !p.canopy {
+                    push("CANOPY OPEN");
                 }
                 // §2.6.4: the settle → surface-rails transition — the
                 // "parked on the pad" edge.
@@ -5534,6 +5694,243 @@ fn emit_model_part(
     }
 }
 
+/// [`emit_tri`] for a lit triangle: each corner's world normal, one
+/// color and one material row — shaded by the fragment pass as a part's
+/// are.
+fn emit_lit(
+    v: &mut Vec<csp_render::flight::FlightVertex>,
+    vp: &[[f64; 4]; 4],
+    eye: DVec3,
+    corners: [DVec3; 3],
+    normals: [DVec3; 3],
+    color: [f32; 4],
+    mat: [f32; 3],
+) {
+    let [Some(c0), Some(c1), Some(c2)] = corners.map(|q| project_into(vp, eye, q)) else {
+        return;
+    };
+    for (k, pos) in [c0, c1, c2].into_iter().enumerate() {
+        v.push(csp_render::flight::FlightVertex {
+            pos,
+            world: f3(corners[k] - eye),
+            nrm: f3(normals[k]),
+            color,
+            mat,
+        });
+    }
+}
+
+/// One triangle of the unit canopy's dome — its corners and normals in
+/// the canopy's own frame (radius 1, rim on `z = `[`CANOPY_LINES`], the
+/// point it hangs over at the origin) — and whether it is a striped gore.
+struct CanopyTri {
+    /// Corner a.
+    a: DVec3,
+    /// Corner b.
+    b: DVec3,
+    /// Corner c.
+    c: DVec3,
+    /// Normal at a.
+    na: DVec3,
+    /// Normal at b.
+    nb: DVec3,
+    /// Normal at c.
+    nc: DVec3,
+    /// The orange gore; the others are undyed.
+    striped: bool,
+}
+
+/// The canopy drawn over an open chute, in unit radii: made once at run
+/// time ([`CanopyMesh::unit`]) and kept by the geometry cache — the art
+/// packs carry the packed canister alone.
+struct CanopyMesh {
+    /// The dome: a fan from the apex, then two triangles per gore per
+    /// ring down to the rim.
+    dome: Vec<CanopyTri>,
+    /// Where each suspension line leaves the rim.
+    lines: Vec<DVec3>,
+}
+
+/// The dome is cut into this many gores round it — striped and undyed
+/// alternating, every other seam carrying a line — and this many rings
+/// from the apex to the rim.
+const CANOPY_GORES: usize = 32;
+const CANOPY_RINGS: usize = 6;
+
+/// The triangles one open canopy adds to the craft's stream: the
+/// dome's — a fan of `CANOPY_GORES` from the apex, then two a gore over
+/// each of the `CANOPY_RINGS − 1` below it — and its lines', two each,
+/// one line to every other seam. 384, 1 152 vertices.
+pub const CANOPY_TRIANGLES: usize = CANOPY_GORES * (2 * CANOPY_RINGS - 1) + CANOPY_GORES;
+
+/// A suspension line's width, metres: a cord is millimetres wide, and
+/// would not cover a pixel at the distance a canopy is framed from.
+const CANOPY_LINE_WIDTH_M: f64 = 0.12;
+
+/// The canopy's cloth, gore by gore: safety orange — the recovery class
+/// the packed canister is painted — and undyed cloth, striped so the
+/// dome reads as a parachute and its turn shows.
+const CANOPY_CLOTH: [[f32; 4]; 2] = [[0.80, 0.26, 0.05, 1.0], [0.82, 0.80, 0.74, 1.0]];
+
+/// Cloth is matte: the sun lights it, and it barely sheens.
+const CANOPY_CLOTH_MAT: [f32; 3] = [0.08, 10.0, 1.0];
+
+/// The suspension lines: aramid cord, a dull gold.
+const CANOPY_CORD: [f32; 4] = [0.52, 0.42, 0.18, 1.0];
+const CANOPY_CORD_MAT: [f32; 3] = [0.05, 10.0, 1.0];
+
+impl CanopyMesh {
+    /// The unit canopy: a dome whose profile is a half-ellipse — the
+    /// rim a unit out, the apex [`CANOPY_HEIGHT`] over it — with smooth
+    /// normals, and a line at every other seam of the rim.
+    fn unit() -> Self {
+        let quarter = core::f64::consts::FRAC_PI_2 / CANOPY_RINGS as f64;
+        let slice = core::f64::consts::TAU / CANOPY_GORES as f64;
+        // The point of the surface at `ring` steps from the apex and
+        // `seam` steps round, and its outward normal.
+        let surface = |ring: usize, seam: usize| -> (DVec3, DVec3) {
+            let (sin_t, cos_t) = ((ring as f64) * quarter).sin_cos();
+            let (sin_p, cos_p) = ((seam as f64) * slice).sin_cos();
+            let out = DVec3::new(sin_t * cos_p, sin_t * sin_p, 0.0);
+            let normal = out * CANOPY_HEIGHT + DVec3::Z * cos_t;
+            (
+                out + DVec3::Z * (CANOPY_LINES + CANOPY_HEIGHT * cos_t),
+                normal / normal.norm(),
+            )
+        };
+        let mut dome = Vec::with_capacity(CANOPY_GORES * (2 * CANOPY_RINGS - 1));
+        for ring in 0..CANOPY_RINGS {
+            for gore in 0..CANOPY_GORES {
+                let striped = gore % 2 == 0;
+                let (next, over) = (gore + 1, ring + 1);
+                let tri = |a: (DVec3, DVec3), b: (DVec3, DVec3), c: (DVec3, DVec3)| CanopyTri {
+                    a: a.0,
+                    b: b.0,
+                    c: c.0,
+                    na: a.1,
+                    nb: b.1,
+                    nc: c.1,
+                    striped,
+                };
+                if ring == 0 {
+                    // The innermost ring is the apex: one triangle a
+                    // gore, not two with a corner on itself.
+                    dome.push(tri(surface(0, gore), surface(1, gore), surface(1, next)));
+                    continue;
+                }
+                let (here, there) = (surface(ring, gore), surface(over, gore));
+                let (here_next, there_next) = (surface(ring, next), surface(over, next));
+                dome.push(tri(here, there, there_next));
+                dome.push(tri(here, there_next, here_next));
+            }
+        }
+        Self {
+            dome,
+            lines: (0..CANOPY_GORES)
+                .step_by(2)
+                .map(|seam| surface(CANOPY_RINGS, seam).0)
+                .collect(),
+        }
+    }
+}
+
+/// Every staged vessel's open canopies, each drawn where the simulation
+/// hangs it.
+fn emit_canopies(
+    v: &mut Vec<csp_render::flight::FlightVertex>,
+    vp: &[[f64; 4]; 4],
+    eye: DVec3,
+    geom: &mut FlightGeomCache,
+    vessels: &[FlightBody],
+    scene: &DrawnScene,
+    canopies: &[FlightCanopy],
+) {
+    if canopies.is_empty() {
+        return;
+    }
+    let mesh = geom.canopy.get_or_insert_with(CanopyMesh::unit);
+    for body in vessels {
+        let pose = scene.pose_of(body);
+        for canopy in canopies.iter().filter(|c| c.vessel == body.id) {
+            emit_canopy(v, vp, eye, mesh, &pose, canopy);
+        }
+    }
+}
+
+/// One open canopy, drawn where the simulation hangs it: the dome over
+/// `on_axis` up the craft's axis, its suspension lines from the rim down
+/// to the canister, the whole of it at the simulation's inflation. Lit
+/// like the hull — the frame's sun and ambient, and the water in front
+/// of it — and cast into the cascade with it, as the same stream.
+fn emit_canopy(
+    v: &mut Vec<csp_render::flight::FlightVertex>,
+    vp: &[[f64; 4]; 4],
+    eye: DVec3,
+    mesh: &CanopyMesh,
+    pose: &DrawnPose,
+    canopy: &FlightCanopy,
+) {
+    let scale = canopy.radius_m();
+    // The canopy's frame set in the craft: z up the axis, x and y two
+    // perpendicular ways round it — the stripes have no anchor to keep.
+    let reference = if canopy.axis.z.abs() < 0.9 {
+        DVec3::Z
+    } else {
+        DVec3::X
+    };
+    let u = canopy.axis.cross(reference);
+    let u = u / u.norm();
+    let w = canopy.axis.cross(u);
+    let hang = |p: DVec3| {
+        let out = u * p.x + w * p.y + canopy.axis * p.z;
+        pose.pos + pose.rot.rotate(canopy.on_axis + out * scale)
+    };
+    let turn = |n: DVec3| pose.rot.rotate(u * n.x + w * n.y + canopy.axis * n.z);
+    for t in &mesh.dome {
+        emit_lit(
+            v,
+            vp,
+            eye,
+            [hang(t.a), hang(t.b), hang(t.c)],
+            [turn(t.na), turn(t.nb), turn(t.nc)],
+            CANOPY_CLOTH[!t.striped as usize],
+            CANOPY_CLOTH_MAT,
+        );
+    }
+    // Each line a ribbon turned to face the eye, so a cord shows from
+    // every side; its normal is the way it faces.
+    let end = pose.pos + pose.rot.rotate(canopy.canister);
+    for rim in &mesh.lines {
+        let from = hang(*rim);
+        let across = (from - end).cross((from + end) * 0.5 - eye);
+        let length = across.norm();
+        if length == 0.0 {
+            // Seen along its own length, a line is a point.
+            continue;
+        }
+        let side = across * (CANOPY_LINE_WIDTH_M * 0.5 / length);
+        let facing = [across / length; 3];
+        emit_lit(
+            v,
+            vp,
+            eye,
+            [from - side, from + side, end + side],
+            facing,
+            CANOPY_CORD,
+            CANOPY_CORD_MAT,
+        );
+        emit_lit(
+            v,
+            vp,
+            eye,
+            [from - side, end + side, end - side],
+            facing,
+            CANOPY_CORD,
+            CANOPY_CORD_MAT,
+        );
+    }
+}
+
 /// The bit-pattern key of a [`crate::part_mesh::PartShape`] —
 /// `emit_smooth` is a pure function of the shape, so the bits ARE the
 /// cache identity (C1). Authored shapes never carry NaN.
@@ -5700,6 +6097,9 @@ pub(crate) struct FlightGeomCache {
     /// Scratch tri stream reused across frames (`emit_sheath`'s
     /// target — the old per-extract `Vec::new()` pair).
     pub(crate) sheath_tris: Vec<crate::part_mesh::SmoothTri>,
+    /// The unit canopy mesh, made the first frame an open chute is
+    /// drawn.
+    canopy: Option<CanopyMesh>,
     /// Last frame's vertex count — the capacity hint that spares the
     /// packet's stream its growth-realloc chain (allocation only;
     /// no output effect).
@@ -5782,6 +6182,7 @@ pub(crate) fn extract_flight(
     sites: Res<crate::structures::SiteTable>,
     clock: Res<crate::Clock>,
     mut geom: ResMut<FlightGeomCache>,
+    canopies: Res<CanopiesStaged>,
     mut frame: ResMut<FlightFrame>,
 ) {
     let mut packet = csp_render::flight::FlightPacket::default();
@@ -6139,6 +6540,7 @@ pub(crate) fn extract_flight(
             }
         }
     }
+    emit_canopies(v, vp, eye, &mut geom, &snap.vessels, &scene, &canopies.0);
     geom.vert_hint = packet.vertices.len();
     frame.0 = Some(packet);
 }
@@ -6189,6 +6591,7 @@ mod tests {
         world.insert_resource(crate::Clock::default());
         world.insert_resource(FlightFrame::default());
         world.insert_resource(FlightGeomCache::default());
+        world.insert_resource(CanopiesStaged::default());
         let mut sched = Schedule::default();
         sched.add_systems(extract_flight);
         (world, sched)
@@ -6241,6 +6644,83 @@ mod tests {
     fn run_extract(snap: FlightSnapshot, cam: MapCameraF64) -> csp_render::flight::FlightPacket {
         let (mut world, mut sched) = extract_rig(snap, cam);
         extract_pass(&mut world, &mut sched)
+    }
+
+    /// An open chute is drawn as the canopy mesh — dome and lines, every
+    /// corner lit and opaque — hung over its canister up the craft's
+    /// axis, its rim a drag-area radius out, at the staged inflation:
+    /// nothing in the near stream without a staged canopy, the mesh's
+    /// own count with one, and a smaller canopy rather than a lesser
+    /// one as it inflates.
+    #[test]
+    fn an_open_chute_is_drawn_as_its_canopy_over_its_canister() {
+        let cam = crate::map::solve_orbit_camera(
+            0.0,
+            0.0,
+            600.0,
+            (1920.0, 1080.0),
+            DVec3::ZERO,
+            FLIGHT_FOV_Y,
+            0.1,
+        );
+        let eye = cam.eye;
+        let (mut world, mut sched) = extract_rig(
+            FlightSnapshot {
+                env: None,
+                vessels: vec![bare_body(7, false)],
+            },
+            cam,
+        );
+        let mesh = CanopyMesh::unit();
+        assert_eq!(
+            mesh.dome.len() + 2 * mesh.lines.len(),
+            CANOPY_TRIANGLES,
+            "the stated count is the mesh's"
+        );
+        let mesh_verts = 3 * CANOPY_TRIANGLES;
+        let packed = extract_pass(&mut world, &mut sched);
+        assert!(packed.vertices.is_empty(), "no open canopy, nothing drawn");
+        let radius = test_canopy(7, 1.0).radius_m();
+        assert!((radius - (700.0 / core::f64::consts::PI).sqrt()).abs() < 1e-9);
+        for inflation in [1.0, 0.5, 0.02] {
+            world.resource_mut::<CanopiesStaged>().0 = vec![test_canopy(7, inflation)];
+            let packet = extract_pass(&mut world, &mut sched);
+            assert_eq!(packet.vertices.len(), mesh_verts, "inflation {inflation}");
+            assert!(
+                packet
+                    .vertices
+                    .iter()
+                    .all(|v| v.nrm != [0.0; 3] && v.color[3] == 1.0),
+                "lit and opaque"
+            );
+            let corners: Vec<DVec3> = packet
+                .vertices
+                .iter()
+                .map(|v| eye + DVec3::new(v.world[0] as f64, v.world[1] as f64, v.world[2] as f64))
+                .collect();
+            let r = radius * inflation;
+            let top = corners
+                .iter()
+                .map(|c| c.z)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let bottom = corners.iter().map(|c| c.z).fold(f64::INFINITY, f64::min);
+            let out = corners
+                .iter()
+                .map(|c| (c.x * c.x + c.y * c.y).sqrt())
+                .fold(0.0, f64::max);
+            assert!(
+                (top - (CANOPY_LINES + CANOPY_HEIGHT) * r).abs() < 1e-3,
+                "apex {top}"
+            );
+            assert!(
+                bottom.abs() < CANOPY_LINE_WIDTH_M,
+                "lines reach the canister: {bottom}"
+            );
+            assert!((out - r).abs() < CANOPY_LINE_WIDTH_M, "rim {out} vs {r}");
+        }
+        // Gone from the stage — back past a gate — gone from the stream.
+        world.resource_mut::<CanopiesStaged>().0.clear();
+        assert!(extract_pass(&mut world, &mut sched).vertices.is_empty());
     }
 
     /// A throttle-open vessel whose plume base ring lies exactly on
@@ -6963,6 +7443,20 @@ mod tests {
         assert!((loads.g_for(2) - 2.0).abs() < 1e-9, "g {}", loads.g_for(2));
     }
 
+    /// An open canopy — the shipped s125's 700 m² at `inflation` —
+    /// hanging over vessel `vessel`'s canister at the origin, up +z.
+    fn test_canopy(vessel: u64, inflation: f64) -> FlightCanopy {
+        FlightCanopy {
+            vessel,
+            node: 3,
+            inflation,
+            canister: DVec3::ZERO,
+            on_axis: DVec3::ZERO,
+            axis: DVec3::Z,
+            drag_area_m2: 700.0,
+        }
+    }
+
     /// A bare `FlightBody` for the focus-rule tests — every field the
     /// rule ignores sits at its zero value.
     fn bare_body(id: u64, debris: bool) -> FlightBody {
@@ -7169,12 +7663,14 @@ mod tests {
             }],
             rails: vec![7],
             radii: vec![(7, 2.5)],
+            canopies: vec![test_canopy(7, 0.5)],
         });
         world.insert_resource(FlightSnapshot::default());
         world.insert_resource(LiveVesselCount::default());
         world.insert_resource(VesselPropulsionStaged::default());
         world.insert_resource(RailsStaged::default());
         world.insert_resource(CraftRadii::default());
+        world.insert_resource(CanopiesStaged::default());
         let mut sched = Schedule::default();
         sched.add_systems(sync_flight);
         sched.run(&mut world);
@@ -7187,11 +7683,16 @@ mod tests {
         assert_eq!(world.resource::<VesselPropulsionStaged>().0[0].vessel, 7);
         assert_eq!(world.resource::<RailsStaged>().0, vec![7]);
         assert_eq!(world.resource::<CraftRadii>().0, vec![(7, 2.5)]);
+        assert_eq!(
+            world.resource::<CanopiesStaged>().0,
+            vec![test_canopy(7, 0.5)]
+        );
         assert!(
             world.resource::<FlightSyncInput>().vessels.is_empty()
                 && world.resource::<FlightSyncInput>().propulsion.is_empty()
                 && world.resource::<FlightSyncInput>().rails.is_empty()
-                && world.resource::<FlightSyncInput>().radii.is_empty(),
+                && world.resource::<FlightSyncInput>().radii.is_empty()
+                && world.resource::<FlightSyncInput>().canopies.is_empty(),
             "the staged input must be consumed, not copied"
         );
     }
@@ -7210,6 +7711,7 @@ mod tests {
             });
             world.insert_resource(LiveVesselCount::default());
             world.insert_resource(RailsStaged::default());
+            world.insert_resource(CanopiesStaged::default());
             // The plan is bound to `plan_vessel`; the staged focus is
             // vessel 7 — `hud_plan` borrows the newest live plan.
             world.insert_resource(StagePlans::single(StagePlan::bound_to(
@@ -7243,6 +7745,68 @@ mod tests {
         );
     }
 
+    /// `CANOPY OPEN` lands the frame a canopy is first staged over the
+    /// focused craft — once, not again while it stays open or grows,
+    /// and never for another craft's canopy.
+    #[test]
+    fn a_canopy_opening_over_the_focus_posts_its_cue_once() {
+        let mut world = bevy_ecs::world::World::new();
+        world.insert_resource(FlightInput::default());
+        world.insert_resource(FlightSnapshot {
+            env: None,
+            vessels: vec![bare_body(7, false)],
+        });
+        world.insert_resource(LiveVesselCount::default());
+        world.insert_resource(RailsStaged::default());
+        world.insert_resource(StagePlans::default());
+        world.insert_resource(VesselPropulsionStaged::default());
+        world.insert_resource(CanopiesStaged::default());
+        world.insert_resource(TerrainConfig::default());
+        world.insert_resource(TerrainCache::default());
+        world.insert_resource(FlightCameraF64::default());
+        world.insert_resource(DrawnScene::default());
+        world.insert_resource(FlightUiData::default());
+        world.insert_resource(FlightSfx::default());
+        world.insert_resource(crate::Clock::default());
+        world.insert_resource(FlightFocusOverride::default());
+        world.insert_resource(crate::ProgramMirror::default());
+        let mut sched = Schedule::default();
+        sched.add_systems(flight_present);
+        let open_cues = |world: &bevy_ecs::world::World| {
+            world
+                .resource::<FlightUiData>()
+                .sfx
+                .iter()
+                .filter(|c| *c == "CANOPY OPEN")
+                .count()
+        };
+        // The first frame is a baseline: nothing is posted.
+        sched.run(&mut world);
+        assert_eq!(open_cues(&world), 0);
+        // Another craft's canopy opens: the focus's cue stack is silent.
+        world.resource_mut::<CanopiesStaged>().0 = vec![test_canopy(9, 0.5)];
+        sched.run(&mut world);
+        assert_eq!(
+            open_cues(&world),
+            0,
+            "another craft's canopy is not the focus's"
+        );
+        // The focus's canopy starts opening: the cue lands — and is not
+        // posted again while it inflates and hangs.
+        world.resource_mut::<CanopiesStaged>().0 = vec![test_canopy(9, 0.5), test_canopy(7, 0.02)];
+        sched.run(&mut world);
+        assert_eq!(open_cues(&world), 1);
+        for inflation in [0.5, 1.0, 1.0] {
+            world.resource_mut::<CanopiesStaged>().0[1] = test_canopy(7, inflation);
+            sched.run(&mut world);
+        }
+        assert_eq!(
+            open_cues(&world),
+            1,
+            "a canopy that stays open does not post again"
+        );
+    }
+
     /// The launch-UX camera hold: an empty arena with a build order
     /// on the books is a delivery in flight — the no-focus branch
     /// must KEEP the last solved pose (the pad the launch pressed
@@ -7261,6 +7825,7 @@ mod tests {
             });
             world.insert_resource(LiveVesselCount::default());
             world.insert_resource(RailsStaged::default());
+            world.insert_resource(CanopiesStaged::default());
             world.insert_resource(StagePlans::default());
             world.insert_resource(VesselPropulsionStaged::default());
             world.insert_resource(TerrainConfig::default());
@@ -8114,12 +8679,13 @@ mod tests {
     // --- Chase camera (terrain-overhaul 3.2) --------------------------
 
     /// A chase frame in deep space — no body, so no floor — for vessel
-    /// `id` at the origin.
+    /// `id` at the origin, no canopy over it.
     fn space_frame(id: u64, radius_m: f64, dt_ms: f64) -> ChaseFrame {
         ChaseFrame {
             id,
             com: DVec3::ZERO,
             radius_m,
+            canopy_m: 0.0,
             centre: None,
             axis: DVec3::Z,
             dt_wall_ms: dt_ms,
@@ -8289,6 +8855,102 @@ mod tests {
         );
     }
 
+    /// A canopy opening over the craft the camera already holds frames
+    /// as a focus change would — craft and canopy together at four
+    /// radii — once, on the frame it appears, and only outward: a player
+    /// already further out keeps their view, and the wheel is theirs
+    /// again after it.
+    #[test]
+    fn a_canopy_opening_backs_the_eye_off_to_frame_craft_and_canopy() {
+        let mut frame = space_frame(7, 3.5, 0.0);
+        // A craft framed close, its zoom kept — then its canopy opens.
+        let mut input = camera_at(14.0);
+        held(&mut input, 7);
+        step_chase_camera(&mut input, &frame, &mut no_floor);
+        assert_eq!(
+            input.distance_target_m(),
+            14.0,
+            "no canopy: the zoom is kept"
+        );
+        frame.canopy_m = 26.0;
+        step_chase_camera(&mut input, &frame, &mut no_floor);
+        assert_eq!(
+            input.distance_target_m(),
+            104.0,
+            "framed over the canopy: four of its radii"
+        );
+        // Once: the wheel's zoom after it stands while the canopy stays
+        // open.
+        input.set_distance(60.0);
+        step_chase_camera(&mut input, &frame, &mut no_floor);
+        assert_eq!(
+            input.distance_target_m(),
+            60.0,
+            "a steady canopy does not frame again"
+        );
+        // A player already further out is left where they are.
+        let mut far = camera_at(300.0);
+        held(&mut far, 7);
+        step_chase_camera(&mut far, &space_frame(7, 3.5, 0.0), &mut no_floor);
+        step_chase_camera(&mut far, &frame, &mut no_floor);
+        assert_eq!(far.distance_target_m(), 300.0, "the framing only backs off");
+        // A craft that takes the focus with its canopy already open is
+        // framed over it too — and that framing is the change's, not a
+        // second one.
+        let mut fresh = camera_at(14.0);
+        held(&mut fresh, 3);
+        step_chase_camera(&mut fresh, &frame, &mut no_floor);
+        assert_eq!(fresh.distance_target_m(), 104.0, "framed over the canopy");
+        fresh.set_distance(60.0);
+        step_chase_camera(&mut fresh, &frame, &mut no_floor);
+        assert_eq!(fresh.distance_target_m(), 60.0, "the change framed it once");
+        // And the eye eases to it as to any target.
+        let mut easing = camera_at(14.0);
+        held(&mut easing, 7);
+        step_chase_camera(&mut easing, &space_frame(7, 3.5, 0.0), &mut no_floor);
+        frame.dt_wall_ms = 1000.0 / 60.0;
+        step_chase_camera(&mut easing, &frame, &mut no_floor);
+        close(
+            easing.distance_m(),
+            14.0 + 90.0 * ease_fraction(1.0 / 60.0, EASE_HALF_LIFE_S),
+            1.0e-9,
+            "eased",
+        );
+    }
+
+    /// The reach the camera frames a canopy by is the whole canopy's,
+    /// whatever its row is staged at. A row first shows at 2/96, and
+    /// framed by that it would be a bud's reach: the dome would open
+    /// past the frame. Hung over the Stock Hopper's axis point with the
+    /// CoM 3.07 m below it, the canopy reaches from its apex and from
+    /// its rim alike — and the same at every inflation.
+    #[test]
+    fn a_canopy_is_framed_by_its_whole_reach_from_its_first_tick() {
+        let r = (700.0 / core::f64::consts::PI).sqrt();
+        let com = DVec3::new(0.0, 0.0, -3.07);
+        let whole = test_canopy(7, 1.0).reach_m(com);
+        assert!(
+            whole >= (CANOPY_LINES + CANOPY_HEIGHT) * r + 3.07,
+            "{whole}"
+        );
+        assert!(whole >= ((r + 3.07).powi(2) + r.powi(2)).sqrt(), "{whole}");
+        for inflation in [2.0 / 96.0, 0.02, 0.5] {
+            close(
+                test_canopy(7, inflation).reach_m(com),
+                whole,
+                1.0e-9,
+                "the staged inflation does not reach",
+            );
+        }
+        // Drawn, the same row is its inflation's size.
+        close(
+            test_canopy(7, 2.0 / 96.0).radius_m(),
+            r * 2.0 / 96.0,
+            1.0e-12,
+            "drawn at the staged inflation",
+        );
+    }
+
     /// R1/R6 through the Input schedule: an orbit event changes yaw and
     /// pitch by exactly its deltas — nothing smooths a drag — and pitch
     /// stops at ±89°. R2: a wheel event moves only the TARGET distance,
@@ -8365,6 +9027,7 @@ mod tests {
             id,
             com,
             radius_m,
+            canopy_m: 0.0,
             centre: Some(DVec3::ZERO),
             axis: DVec3::Z,
             dt_wall_ms: dt_ms,

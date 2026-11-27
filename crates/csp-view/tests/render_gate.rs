@@ -2934,6 +2934,369 @@ fn a_hull_under_water_is_seen_from_above() {
     );
 }
 
+/// Where the Stock Hopper is put to fall under its canopy: this far up
+/// over its own pad, metres, sinking through the air this fast (m/s).
+/// Reefed to 54 kN, the canopy takes 5 km to bring the fueled hopper
+/// (3.9 t) from 250 m/s down to parachute speed — from 3 km it reached
+/// its pad at 123 m/s and broke up — so from here it is still 1.8 km
+/// up when it gets there.
+const CANOPY_SPAWN_ALT_M: f64 = 7_000.0;
+const CANOPY_SPAWN_SINK_MPS: f64 = 250.0;
+
+/// The air speed the hopper is flown down to before its frame is
+/// taken (m/s): its descent under the whole canopy, with margin.
+const CANOPY_DESCENT_MPS: f64 = 12.0;
+
+/// How far the eye sits from the craft under its canopy in the canopy
+/// frames, metres: the whole canopy — 30 m across, 22 m over the
+/// canister — is in the frame at the default pitch, the craft still
+/// legible under it.
+const CANOPY_EYE_M: f64 = 75.0;
+
+/// The pixels the canopy must change in the [`W`]×[`H`] frame beside
+/// the same frame without it. At [`CANOPY_EYE_M`] it changes about
+/// 3 400: its dome 2 800 — 107 pixels across and 29 tall at the default
+/// pitch — its lines 550 below it. This demands a thousand, under a
+/// third of that: a canopy lit differently still passes, and none — 0 —
+/// fails.
+const CANOPY_PIXELS: usize = 1_000;
+
+/// A frame's wall time as the camera is handed it here — 60 fps.
+const FRAME_MS: f64 = 1000.0 / 60.0;
+
+/// One frame of the loop with the sim clock standing still and the
+/// frame's wall time put in, the way `csp-app` hands it over: with no
+/// time the camera stays exactly where it was put; with it the camera
+/// travels to its focus and eases to its distance.
+fn timed_still_frame(view: &mut View) {
+    view.update_session(FRAME_MS, 1, 1, None);
+    view.begin_frame();
+    view.end_frame();
+}
+
+/// The speed `vessel`'s craft moves through the air at, m/s.
+fn air_speed_mps(view: &View, vessel: csp_sim::VesselId) -> f64 {
+    let body = view
+        .sim
+        .vessels()
+        .get(&vessel)
+        .and_then(|v| v.body())
+        .expect("a craft in the bubble");
+    csp_phys::flow_sample(view.sim.environment().expect("physics world"), body).speed_mps
+}
+
+/// A copy of the seeded starter craft in the air over its own pad:
+/// `alt_m` up, moving through the air at `air_mps` along the pad's up
+/// (negative: sinking), flying in the bubble and holding the focus. The
+/// copy and its chute's node. No player verb puts a craft where it is
+/// asked to start, and the sandbox spawn takes no build bill, so the copy
+/// carries none.
+fn starter_copy_in_the_air(
+    view: &mut View,
+    alt_m: f64,
+    air_mps: f64,
+) -> (csp_sim::VesselId, csp_phys::PartNodeId) {
+    use csp_core::DVec3;
+    view.seed_starter_craft().expect("starter seed");
+    for _ in 0..40 {
+        frame(view, 64);
+        if !view.sim.vessels().is_empty() {
+            break;
+        }
+    }
+    let (&parked, _) = view
+        .sim
+        .vessels()
+        .iter()
+        .next()
+        .expect("the starter is spawned");
+    let mut craft = view.sim.vessels()[&parked].craft.clone().expect("a craft");
+    craft.part_build_resources.clear();
+    let park = view
+        .world
+        .resource::<csp_view::flight::FlightSnapshot>()
+        .vessels
+        .iter()
+        .find(|b| b.id == parked.0)
+        .expect("the parked starter is staged")
+        .clone();
+    let body_center = view.sim.environment().expect("physics world").body_center;
+    let up = (park.com - body_center) / (park.com - body_center).norm();
+    let (&chute, _) = craft
+        .graph
+        .nodes
+        .iter()
+        .find(|(_, node)| {
+            craft.parts[node.effective_index as usize]
+                .parachute
+                .is_some()
+        })
+        .expect("the starter carries a chute");
+    view.enqueue_command(
+        csp_sim::SourceClass::Ui,
+        csp_view::PLAYER_SOURCE_ID,
+        csp_sim::SimCommand::SpawnPhysicalVessel {
+            craft,
+            pos: park.pos + up * alt_m,
+            rot: park.rot,
+            // The pad's own speed through the air is nothing: its
+            // velocity is the ground's.
+            vel: park.vel + up * air_mps,
+            ang_vel: DVec3::ZERO,
+        },
+    );
+    view.begin_frame();
+    let spawn = view
+        .sim_step(view.sim.clock().ticks() + 1)
+        .expect("sim step");
+    assert!(
+        spawn.rejected.is_empty(),
+        "the spawn was refused: {:?}",
+        spawn.rejected
+    );
+    view.end_frame();
+    for _ in 0..8 {
+        frame(view, 1);
+    }
+    let (&id, _) = view
+        .sim
+        .vessels()
+        .iter()
+        .find(|(_, v)| v.body().is_some())
+        .expect("the copy flies in the bubble");
+    assert_eq!(
+        view.flight_focus(),
+        Some(id),
+        "the flying copy takes the focus"
+    );
+    (id, chute)
+}
+
+/// The Stock Hopper falling under its open canopy over its own pad:
+/// [`starter_copy_in_the_air`] [`CANOPY_SPAWN_ALT_M`] up, sinking at
+/// [`CANOPY_SPAWN_SINK_MPS`]; its chute fired by the stage press
+/// ([`View::fire_stage`], off a one-stage plan bound to the copy) and
+/// flown until the craft is down to [`CANOPY_DESCENT_MPS`] — the canopy's
+/// opening stepped a tick a frame, as the game shows it, then a second a
+/// frame. The canopy is whole long before the end, the craft still high
+/// over its pad.
+fn hopper_under_its_canopy(view: &mut View) -> (csp_sim::VesselId, csp_phys::PartNodeId) {
+    let (id, chute) = starter_copy_in_the_air(view, CANOPY_SPAWN_ALT_M, -CANOPY_SPAWN_SINK_MPS);
+    view.world
+        .insert_resource(csp_view::flight::StagePlans::single(
+            csp_view::flight::StagePlan::bound_to(
+                vec![csp_view::flight::StageActions {
+                    deploys: vec![chute],
+                    ..csp_view::flight::StageActions::default()
+                }],
+                id,
+            ),
+        ));
+    assert_eq!(view.fire_stage(), 1, "the chute's stage did not fire");
+    // A tick a frame until the canopy is first staged — two ninety-sixths
+    // open, the first a player sees of it — then a second a frame.
+    let staged = |view: &View| {
+        view.world
+            .resource::<csp_view::flight::CanopiesStaged>()
+            .0
+            .iter()
+            .any(|c| c.vessel == id.0 && c.node == chute.0)
+    };
+    let mut ticks = 0;
+    while !staged(view) {
+        ticks += 1;
+        assert!(ticks <= 16, "the canopy never opened: the gates hold here");
+        frame(view, 1);
+    }
+    let mut seconds = 0;
+    while air_speed_mps(view, id) > CANOPY_DESCENT_MPS {
+        seconds += 1;
+        assert!(seconds <= 90, "the hopper never slowed to its descent");
+        frame(view, 64);
+    }
+    let hopper = &view.sim.vessels()[&id];
+    assert!(
+        hopper.debris_since.is_none() && hopper.body().is_some(),
+        "the hopper broke up under its canopy"
+    );
+    let altitude = view.sim.telemetry(id).altitude_m.expect("altitude");
+    assert!(
+        altitude > 1_000.0,
+        "the hopper is down at {altitude} m after {seconds} s"
+    );
+    (id, chute)
+}
+
+/// The camera brought to rest on its focus: timed still frames until
+/// the eye stops moving — it travels to the craft and eases to its
+/// distance only on frames that carry a time — and the eye.
+fn camera_comes_to_rest(view: &mut View) -> csp_core::DVec3 {
+    use csp_view::flight::FlightCameraF64;
+    let eye = |view: &View| view.world.resource::<FlightCameraF64>().0.eye;
+    let mut still = 0;
+    let mut was = eye(view);
+    for _ in 1..=1_200 {
+        timed_still_frame(view);
+        let now = eye(view);
+        still = if (now - was).norm() < 1.0e-3 {
+            still + 1
+        } else {
+            0
+        };
+        if still >= 8 {
+            return now;
+        }
+        was = now;
+    }
+    panic!("the camera never came to rest on the craft");
+}
+
+/// `packet` without the canopy `canopy` stages over the craft drawn at
+/// `pose`: every triangle with a corner above the canister along the
+/// canopy's axis goes — where the canopy hangs, the whole of it. The
+/// craft's own parts hang at or below the canister, and 2 km up nothing
+/// else the near stream draws is up there. How many vertices went.
+fn without_canopy(
+    packet: &csp_render::flight::FlightPacket,
+    eye: csp_core::DVec3,
+    pose: csp_view::flight::DrawnPose,
+    canopy: &csp_view::flight::FlightCanopy,
+) -> (csp_render::flight::FlightPacket, usize) {
+    use csp_core::DVec3;
+    let craft_frame = pose.rot.conjugate();
+    let above = |v: &csp_render::flight::FlightVertex| {
+        let world = eye + DVec3::new(v.world[0] as f64, v.world[1] as f64, v.world[2] as f64);
+        (craft_frame.rotate(world - pose.pos) - canopy.canister).dot(canopy.axis) > 0.5
+    };
+    let before = packet.vertices.len();
+    let mut bare = packet.clone();
+    bare.vertices = packet
+        .vertices
+        .chunks_exact(3)
+        .filter(|tri| !tri.iter().any(above))
+        .flatten()
+        .copied()
+        .collect();
+    let removed = before - bare.vertices.len();
+    (bare, removed)
+}
+
+/// Canopy frames as P6 PPM in `dir`, by name.
+fn dump_canopy_frames(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    frames: [(&str, &csp_render::flight::FlightPacket); 3],
+    dir: &std::path::Path,
+) {
+    std::fs::create_dir_all(dir).unwrap();
+    for (name, packet) in frames {
+        let img = render_flight_scene_sized(device, queue, packet, FRAME_W, FRAME_H);
+        let path = dir.join(format!("{name}.ppm"));
+        let mut out = format!("P6 {FRAME_W} {FRAME_H} 255\n").into_bytes();
+        for px in img.chunks_exact(4) {
+            out.extend_from_slice(&px[..3]);
+        }
+        std::fs::write(&path, &out).unwrap();
+        eprintln!("wrote {}", path.display());
+    }
+}
+
+/// The visible parachute on a device, through the staging the player
+/// uses: the Stock Hopper hanging under its open canopy, as the real
+/// extract stages and emits it, rasterized the way the app's scene pass
+/// draws it — and beside it the same frame without the canopy's
+/// triangles. The camera's own framing backs the eye off to hold the
+/// whole canopy, exactly one canopy's triangles stand above the
+/// canister, and the two frames must differ on at least
+/// [`CANOPY_PIXELS`] pixels: the dome and its lines are drawn, lit by
+/// the scene's sun.
+/// With `DUMP_CANOPY_DIR=1` both frames are written under the
+/// workspace's `target/canopy/` first (PPM; `cargo run -q -p xtask
+/// --bin ppm2png -- <in> <out>`).
+#[test]
+fn an_open_canopy_is_drawn_over_the_stock_craft() {
+    use csp_view::flight::{CANOPY_TRIANGLES, CanopiesStaged, FlightInput};
+    let Some((device, queue)) = gate_device("an_open_canopy_is_drawn_over_the_stock_craft") else {
+        return;
+    };
+    let mut view = View::new().expect("data/ load");
+    view.set_flight_viewport(f64::from(W), f64::from(H));
+    let (id, _chute) = hopper_under_its_canopy(&mut view);
+    let staged = view.world.resource::<CanopiesStaged>().0.clone();
+    assert_eq!(staged.len(), 1, "one chute, one canopy: {staged:?}");
+    let canopy = staged[0];
+    assert_eq!(canopy.vessel, id.0);
+    assert_eq!(canopy.inflation, 1.0, "the canopy is whole");
+
+    until_real_terrain(&mut view);
+    // The game's own framing: the canopy's opening backed the eye off
+    // far enough to hold the whole of it.
+    camera_comes_to_rest(&mut view);
+    let framed_m = view.world.resource::<FlightInput>().distance_m();
+    let as_framed = view.take_flight_packet();
+    assert!(
+        framed_m >= CANOPY_EYE_M,
+        "the camera frames the hopper {framed_m:.1} m out under its canopy — under \
+         {CANOPY_EYE_M}, too near to hold it"
+    );
+    view.world
+        .resource_mut::<FlightInput>()
+        .set_distance(CANOPY_EYE_M);
+    let eye = camera_comes_to_rest(&mut view);
+    let with = view
+        .take_flight_packet()
+        .expect("RenderExtract produced a flight packet");
+    let pose = view
+        .world
+        .resource::<csp_view::flight::DrawnScene>()
+        .drawn(id.0)
+        .expect("the craft is drawn");
+    let (without, removed) = without_canopy(&with, eye, pose, &canopy);
+    assert_eq!(
+        removed,
+        3 * CANOPY_TRIANGLES,
+        "the vertices above the canister are one canopy's, and nothing else"
+    );
+
+    let a = render_flight_scene(&device, &queue, &with);
+    let b = render_flight_scene(&device, &queue, &without);
+    let differing = a
+        .chunks_exact(4)
+        .zip(b.chunks_exact(4))
+        .filter(|(p, q)| p[..3] != q[..3])
+        .count();
+    let telemetry = view.sim.telemetry(id);
+    eprintln!(
+        "canopy frame: the hopper {:.0} m up, {:.0} kg, under a whole canopy {CANOPY_EYE_M} m from the eye; \
+         {differing} of {} pixels differ without its {CANOPY_TRIANGLES} triangles",
+        telemetry
+            .altitude_m
+            .expect("a craft in the bubble has an altitude"),
+        telemetry.mass_kg.expect("a craft in the bubble has a mass"),
+        W * H
+    );
+    if std::env::var("DUMP_CANOPY_DIR").is_ok_and(|v| v == "1") {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/canopy");
+        dump_canopy_frames(
+            &device,
+            &queue,
+            [
+                ("stock-hopper-under-canopy", &with),
+                ("stock-hopper-no-canopy", &without),
+                (
+                    "stock-hopper-under-canopy-as-the-game-frames-it",
+                    as_framed.as_ref().expect("a packet at the game's framing"),
+                ),
+            ],
+            dir.as_path(),
+        );
+    }
+    assert!(
+        differing >= CANOPY_PIXELS,
+        "the canopy changes {differing} pixels — under {CANOPY_PIXELS}: it is not drawn"
+    );
+}
+
 /// C17-F1 device-side check — the pick pass must emit no 0-tagged
 /// geometry. `VabPacket.vertices` interleaves pick-0 decoration
 /// (selection shells, ghosts, markers) with the real part triangles;

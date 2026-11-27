@@ -301,6 +301,61 @@ pub struct DeployRecord {
     pub opened_tick: Option<u64>,
 }
 
+/// One §3.1 canopy of a craft in the bubble as the state's tick stands
+/// it — what presentation draws a deployed parachute by
+/// ([`World::canopies`]). Where it hangs is where the step takes its
+/// pull (rule A): above the canister's place on the craft's axis.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Canopy {
+    /// The chute's graph node — its `deployed` record's key.
+    pub node: csp_phys::PartNodeId,
+    /// The canister, body frame: where the canopy's lines come down to.
+    pub canister: DVec3,
+    /// The canister's place on the craft's longitudinal axis, body
+    /// frame — the canopy hangs above this point.
+    pub on_axis: DVec3,
+    /// The craft's longitudinal axis, unit, body frame — the way up to
+    /// the canopy.
+    pub axis: DVec3,
+    /// The open canopy's drag area Cd·A (m²) — the part's authored
+    /// `deployed_drag_area_m2`.
+    pub drag_area_m2: f64,
+    /// How far the canopy is inflated, `0..=1`: the share of that area
+    /// the step's ramp is at. `None` wherever the canopy holds nothing
+    /// — not yet caught, back past a gate, with no flow — and there is
+    /// nothing to draw.
+    pub inflation: Option<f64>,
+}
+
+/// [`World::canopies`]' iterator — the craft's deployed decelerator
+/// sites in the body's order.
+pub struct Canopies<'a> {
+    sites: std::slice::Iter<'a, csp_phys::DecelSite>,
+    flow: Option<csp_phys::CanopyFlow>,
+    at_s: f64,
+}
+
+impl Iterator for Canopies<'_> {
+    type Item = Canopy;
+
+    fn next(&mut self) -> Option<Canopy> {
+        let site = loop {
+            let site = self.sites.next()?;
+            if site.deployed_at_s.is_some() {
+                break site;
+            }
+        };
+        Some(Canopy {
+            node: site.node,
+            canister: site.local_pos,
+            on_axis: site.axis_pos,
+            axis: site.axis_dir,
+            drag_area_m2: site.deployed_drag_area_m2,
+            inflation: self.flow.as_ref().and_then(|f| f.ramp(site, self.at_s)),
+        })
+    }
+}
+
 /// A vessel — the §2.4 unit of craft. `state` is the residence triple
 /// (§2.6.2): on rails, in the bubble, or surface-latched.
 ///
@@ -3198,6 +3253,28 @@ impl World {
                 p.backend.in_water(b) && !p.backend.ground_contact(b)
             }
             VesselState::OnRails(_) => false,
+        }
+    }
+
+    /// The §3.1 canopies `vessel` carries in the bubble — one per
+    /// deployed decelerator, in the body's site order — read at the
+    /// state's tick under the flow at the body's own altitude and speed:
+    /// the step's own catch test and ramp, with none of the reef or the
+    /// budgets. What presentation draws a parachute by: a canopy is drawn
+    /// exactly while its [`Canopy::inflation`] is `Some`, at that share
+    /// of its size. Empty for every other vessel — latched, on rails,
+    /// gone — and for a world without physics. Pure observation over
+    /// already-hashed state; derived, never stored.
+    pub fn canopies(&self, vessel: VesselId) -> Canopies<'_> {
+        let body = self.vessels.get(&vessel).and_then(Vessel::body);
+        Canopies {
+            sites: body.map_or([].iter(), |b| b.decel.iter()),
+            flow: body.and_then(|b| {
+                self.physics
+                    .as_ref()
+                    .map(|p| csp_phys::CanopyFlow::of(p.backend.environment(), b))
+            }),
+            at_s: self.clock.seconds(),
         }
     }
 
@@ -17106,6 +17183,107 @@ mod tests {
             2,
             "the authored s125 mount must survive its own canopy"
         );
+    }
+
+    /// The canopy reading presentation draws by is the step's own. A
+    /// deploy-early command reads `None` all the while it waits out the
+    /// gates; from the first tick the step applies the canopy — two
+    /// after the stamp, which is written post-step and reaches the
+    /// body's sites on the next tick's refresh — the reading is the
+    /// ramp, two ninety-sixths, three, … to `1` over `deploy_time_s`,
+    /// where it stays, and it names the place the step takes the pull.
+    /// A gate exceeded drops it to `None` for exactly that long: the
+    /// anchor never moved, so it reads `1` again the tick the flow
+    /// holds.
+    #[test]
+    fn canopies_reads_the_inflation_the_step_applies() {
+        let mut w = physics_world(false); // no spin — v_rel == v
+        spawn_physical(
+            &mut w,
+            SimCommand::SpawnPhysicalVessel {
+                craft: chute_craft(),
+                pos: DVec3::new(TERRIN_R + 18_000.0, 0.0, 0.0),
+                rot: csp_core::DQuat::IDENTITY,
+                vel: DVec3::new(-400.0, 0.0, 0.0),
+                ang_vel: DVec3::ZERO,
+            },
+        );
+        let node = csp_phys::PartNodeId(2);
+        w.enqueue(
+            SourceClass::Ui,
+            0,
+            SimCommand::DeployPart {
+                vessel: VesselId(0),
+                node,
+            },
+        );
+        w.step_frame(w.clock().ticks() + 1).unwrap();
+        let read = |w: &World| {
+            let mut canopies = w.canopies(VesselId(0));
+            let canopy = canopies
+                .next()
+                .expect("the deployed chute's canopy is read");
+            assert!(canopies.next().is_none(), "one chute, one canopy");
+            canopy
+        };
+        fn flying(w: &mut World) -> &mut WeldedBody {
+            match &mut w.vessels.get_mut(&VesselId(0)).unwrap().state {
+                VesselState::InBubble(body) => body,
+                _ => panic!("the pod must stay physics-resident"),
+            }
+        }
+        assert_eq!(read(&w).inflation, None, "packed above the altitude gate");
+
+        // Tick by tick to the catch: the first reading is the first tick
+        // the step applied the canopy, two past its stamp.
+        let mut stamped = None;
+        for _ in 0..20_000 {
+            w.step_frame(w.clock().ticks() + 1).unwrap();
+            if let Some(r) = read(&w).inflation {
+                let opened = w.vessels()[&VesselId(0)].deployed[&node].opened_tick;
+                assert_eq!(opened, Some(w.clock().ticks() - 2));
+                assert!((r - 2.0 / 96.0).abs() < 1e-12, "first reading {r}");
+                stamped = opened;
+                break;
+            }
+        }
+        let stamped = stamped.expect("the descent must cross the gates");
+        let ramp = |ticks: u64| (ticks as f64 / 96.0).min(1.0);
+        for k in 3..=200u64 {
+            w.step_frame(w.clock().ticks() + 1).unwrap();
+            assert_eq!(
+                read(&w).inflation,
+                Some(ramp(k)),
+                "{k} ticks past the stamp"
+            );
+        }
+        assert_eq!(w.clock().ticks(), stamped + 200);
+        let canopy = read(&w);
+        assert_eq!(canopy.node, node);
+        assert_eq!(canopy.drag_area_m2, 700.0);
+        let site = w.vessels()[&VesselId(0)].body().unwrap().decel[0];
+        assert_eq!(
+            (canopy.canister, canopy.on_axis, canopy.axis),
+            (site.local_pos, site.axis_pos, site.axis_dir),
+            "the canopy hangs where the step takes its pull"
+        );
+
+        // Past a gate the canopy holds nothing — the speed gate, then
+        // the altitude one — and whole again the tick both hold.
+        let vel = flying(&mut w).vel;
+        flying(&mut w).vel = DVec3::new(-1_300.0, 0.0, 0.0);
+        assert_eq!(read(&w).inflation, None, "past the speed gate");
+        flying(&mut w).vel = vel;
+        flying(&mut w).pos.x += 2_000.0;
+        assert_eq!(read(&w).inflation, None, "past the altitude gate");
+        flying(&mut w).pos.x -= 2_000.0;
+        assert_eq!(
+            read(&w).inflation,
+            Some(1.0),
+            "the anchor held: whole again the tick the flow holds"
+        );
+        // A vessel that is not in the bubble carries no canopy to read.
+        assert!(w.canopies(VesselId(9)).next().is_none());
     }
 
     /// C14-F1's companion: the mount limits are real — a hot entry

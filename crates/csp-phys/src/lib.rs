@@ -130,11 +130,11 @@ pub use session::{
     snap_transform,
 };
 pub use simple::{
-    BAUMGARTE_BETA, CanopySteering, DEFAULT_CANOPY_STEADY_ARM_M, DEFAULT_CANOPY_STEADY_DAMP_M_S,
-    DEFAULT_DRAG_CD, DEFAULT_FRICTION_MU, DEFAULT_SETTLE_TICKS, DEFAULT_SETTLE_V, DEFAULT_SETTLE_W,
-    DecelDrag, Environment, PHYSICS_DT, SOLVER_ITERATIONS, SimpleBackend, TerrainSurface,
-    atmosphere_density_kg_m3, atmosphere_pressure_pa, atmosphere_sound_speed_mps,
-    atmosphere_temperature_k,
+    BAUMGARTE_BETA, CanopyFlow, CanopySteering, DEFAULT_CANOPY_STEADY_ARM_M,
+    DEFAULT_CANOPY_STEADY_DAMP_M_S, DEFAULT_DRAG_CD, DEFAULT_FRICTION_MU, DEFAULT_SETTLE_TICKS,
+    DEFAULT_SETTLE_V, DEFAULT_SETTLE_W, DecelDrag, Environment, PHYSICS_DT, SOLVER_ITERATIONS,
+    SimpleBackend, TerrainSurface, atmosphere_density_kg_m3, atmosphere_pressure_pa,
+    atmosphere_sound_speed_mps, atmosphere_temperature_k,
 };
 pub use structural::{
     DEFAULT_TOUCHDOWN_CRUSH_M, JointLoad, JointModel, PartForce, PullSite, TickMotion, Touchdown,

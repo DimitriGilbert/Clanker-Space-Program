@@ -23,8 +23,9 @@
 #![cfg(not(target_arch = "wasm32"))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use csp_core::DVec3;
 use csp_view::View;
-use csp_view::flight::{FlightSfx, StageActions, StagePlan, StagePlans};
+use csp_view::flight::{CanopiesStaged, FlightSfx, StageActions, StagePlan, StagePlans};
 
 /// One app frame's §2.5 loop, headlessly.
 fn frame(view: &mut View, ticks: u64) {
@@ -340,9 +341,339 @@ fn staged_parachute_deploys_on_stage_press() {
         view.sim.vessels()[&id].deployed.contains_key(&chute),
         "the chute never deployed"
     );
+    // The press says the chute was fired — never that its canopy is
+    // open: on the pad the gates already hold, and the canopy starts
+    // two ticks later on its own.
     assert!(
-        cues(&view).iter().any(|c| c.contains("DEPLOYED")),
-        "no deploy cue landed: {:?}",
+        cues(&view).iter().any(|c| c.contains("CHUTE(S) FIRED")),
+        "no chute-fired cue landed: {:?}",
+        cues(&view)
+    );
+    assert!(
+        !cues(&view).iter().any(|c| c.contains("DEPLOYED")),
+        "the stage press must not claim a deploy it cannot see: {:?}",
+        cues(&view)
+    );
+}
+
+/// The chute a craft carries — the node its stage plan's firing and
+/// its deploy record both name.
+fn chute_node(craft: &csp_sim::CraftDef) -> csp_phys::PartNodeId {
+    craft
+        .graph
+        .nodes
+        .iter()
+        .find(|(_, node)| {
+            craft.parts[node.effective_index as usize]
+                .parachute
+                .is_some()
+        })
+        .map(|(id, _)| *id)
+        .expect("the craft carries a chute")
+}
+
+/// How far the canopy over `vessel`'s chute is staged — `None` while
+/// the frame stages none.
+fn staged_inflation(
+    view: &View,
+    vessel: csp_sim::VesselId,
+    chute: csp_phys::PartNodeId,
+) -> Option<f64> {
+    view.world
+        .resource::<CanopiesStaged>()
+        .0
+        .iter()
+        .find(|c| c.vessel == vessel.0 && c.node == chute.0)
+        .map(|c| c.inflation)
+}
+
+/// `vessel`'s altitude over the datum, m.
+fn altitude_m(view: &View, vessel: csp_sim::VesselId) -> f64 {
+    view.sim
+        .telemetry(vessel)
+        .altitude_m
+        .expect("a craft in the bubble has an altitude")
+}
+
+/// Frames of `ticks` until `done` — `false` if `limit` frames pass
+/// first.
+fn run_until(view: &mut View, ticks: u64, limit: usize, done: impl Fn(&View) -> bool) -> bool {
+    for _ in 0..limit {
+        if done(view) {
+            return true;
+        }
+        frame(view, ticks);
+    }
+    done(view)
+}
+
+/// A copy of the seeded starter craft in the air `alt_m` over its own
+/// pad, rising through the air at `air_mps` (negative: sinking), with
+/// its chute's one-firing plan bound to it and the focus on it. No
+/// player verb puts a craft where its chute's gates fail, so the
+/// scenario spawns one there; the sandbox spawn takes no build bill, so
+/// the copy carries none.
+fn stock_craft_in_the_air(
+    view: &mut View,
+    alt_m: f64,
+    air_mps: f64,
+) -> (csp_sim::VesselId, csp_phys::PartNodeId) {
+    view.seed_starter_craft().expect("starter seed");
+    for _ in 0..40 {
+        frame(view, 64);
+        if !view.sim.vessels().is_empty() {
+            break;
+        }
+    }
+    // The starter parked on its pad: the craft it is, and where, how
+    // and at what speed it stands there.
+    let (craft, park) = {
+        let (&parked, _) = view
+            .sim
+            .vessels()
+            .iter()
+            .next()
+            .expect("the starter is spawned");
+        let mut craft = view.sim.vessels()[&parked].craft.clone().expect("a craft");
+        craft.part_build_resources.clear();
+        let park = view
+            .world
+            .resource::<csp_view::flight::FlightSnapshot>()
+            .vessels
+            .iter()
+            .find(|b| b.id == parked.0)
+            .expect("the parked starter is staged")
+            .clone();
+        (craft, park)
+    };
+    let body_center = view.sim.environment().expect("physics world").body_center;
+    let up = (park.com - body_center) / (park.com - body_center).norm();
+    view.enqueue_command(
+        csp_sim::SourceClass::Ui,
+        csp_view::PLAYER_SOURCE_ID,
+        csp_sim::SimCommand::SpawnPhysicalVessel {
+            craft: craft.clone(),
+            pos: park.pos + up * alt_m,
+            rot: park.rot,
+            // The pad's own speed through the air is nothing: its
+            // velocity is the ground's.
+            vel: park.vel + up * air_mps,
+            ang_vel: DVec3::ZERO,
+        },
+    );
+    view.begin_frame();
+    let spawn = view
+        .sim_step(view.sim.clock().ticks() + 1)
+        .expect("sim step");
+    assert!(
+        spawn.rejected.is_empty(),
+        "the spawn was refused: {:?}",
+        spawn.rejected
+    );
+    view.end_frame();
+    for _ in 0..8 {
+        frame(view, 1);
+    }
+    let (&id, _) = view
+        .sim
+        .vessels()
+        .iter()
+        .find(|(_, v)| v.body().is_some())
+        .expect("the copy flies in the bubble");
+    assert_eq!(
+        view.flight_focus(),
+        Some(id),
+        "the flying copy takes the focus"
+    );
+    let chute = chute_node(&craft);
+    view.world
+        .insert_resource(StagePlans::single(StagePlan::bound_to(
+            vec![StageActions {
+                deploys: vec![chute],
+                ..StageActions::default()
+            }],
+            id,
+        )));
+    (id, chute)
+}
+
+/// Ticks between the state's clock and `opened` — where the canopy's
+/// ramp stands.
+fn ticks_past(view: &View, opened: u64) -> u64 {
+    view.sim.clock().ticks() - opened
+}
+
+/// The visible parachute, a chute fired above its gates. SPACE fires
+/// the chute's stage, and what the player sees of it from there is the
+/// simulation's own doing — the view shows exactly that and says so
+/// when it opens:
+///
+/// - Over the altitude gate the press fires the chute and nothing is
+///   staged over the craft, tick after tick; the cue says the chute was
+///   FIRED, never that its canopy is open.
+/// - The first tick the simulation applies the canopy is the first the
+///   view stages it — two past the catch's stamp, two ninety-sixths
+///   inflated — and `CANOPY OPEN` lands that frame.
+/// - The staged inflation is the simulation's ramp: ninety-six ticks of
+///   it to a whole canopy, 700 m² read as a 29.9 m disc.
+#[test]
+fn a_staged_chute_shows_its_canopy_from_the_tick_the_simulation_opens_it() {
+    let mut view = View::new().expect("data/ load");
+    let (id, chute) = stock_craft_in_the_air(&mut view, 17_000.0, 0.0);
+
+    // Over the gate: the stage press fires the chute, and no canopy is
+    // staged over the craft while the simulation holds none.
+    assert_eq!(view.fire_stage(), 1, "the chute's stage did not fire");
+    frame(&mut view, 1);
+    let record = view.sim.vessels()[&id].deployed[&chute];
+    assert_eq!(record.opened_tick, None, "17 km is over the altitude gate");
+    assert!(
+        cues(&view).iter().any(|c| c == "STAGED — 1 CHUTE(S) FIRED"),
+        "{:?}",
+        cues(&view)
+    );
+    for _ in 0..64 {
+        frame(&mut view, 1);
+    }
+    assert_eq!(
+        staged_inflation(&view, id, chute),
+        None,
+        "packed: no canopy is staged"
+    );
+    assert!(
+        cues(&view).iter().all(|c| !c.contains("CANOPY")),
+        "{:?}",
+        cues(&view)
+    );
+
+    // The fall reaches the gate; the first tick the simulation applies
+    // the canopy is the first the view stages it.
+    assert!(
+        run_until(&mut view, 64, 60, |v| altitude_m(v, id) < 16_300.0),
+        "the craft never fell to its gate"
+    );
+    assert!(
+        run_until(&mut view, 1, 400, |v| staged_inflation(v, id, chute)
+            .is_some()),
+        "the canopy never opened"
+    );
+    let opened = view.sim.vessels()[&id].deployed[&chute]
+        .opened_tick
+        .expect("caught");
+    assert_eq!(ticks_past(&view, opened), 2, "two ticks past the stamp");
+    assert_eq!(staged_inflation(&view, id, chute), Some(2.0 / 96.0));
+    assert_eq!(
+        cues(&view).iter().filter(|c| *c == "CANOPY OPEN").count(),
+        1,
+        "CANOPY OPEN lands the frame the canopy starts: {:?}",
+        cues(&view)
+    );
+
+    // The staged inflation is the ramp, to a whole canopy and no
+    // further.
+    for (ticks, k) in [
+        (1, 3),
+        (7, 10),
+        (40, 50),
+        (45, 95),
+        (1, 96),
+        (1, 97),
+        (100, 197),
+    ] {
+        frame(&mut view, ticks);
+        assert_eq!(ticks_past(&view, opened), k);
+        assert_eq!(
+            staged_inflation(&view, id, chute),
+            Some((k as f64 / 96.0).min(1.0)),
+            "{k} ticks past the stamp"
+        );
+    }
+    let canopy = view
+        .world
+        .resource::<CanopiesStaged>()
+        .0
+        .iter()
+        .find(|c| c.vessel == id.0)
+        .expect("the whole canopy is staged");
+    assert_eq!(canopy.drag_area_m2, 700.0);
+    assert!((canopy.radius_m() - (700.0 / core::f64::consts::PI).sqrt()).abs() < 1e-9);
+    assert_eq!(
+        cues(&view).iter().filter(|c| *c == "CANOPY OPEN").count(),
+        1
+    );
+}
+
+/// The visible parachute, a canopy back past its gate. Fired while the
+/// craft climbs at 420 m/s from 15.2 km, the canopy is whole while the
+/// craft is still under the gate — and the climb carries it through:
+/// from that tick nothing is staged, the record's anchor untouched;
+/// whole again, not re-inflated, the tick the craft falls back under
+/// it — and said again, as any canopy appearing over the craft is.
+#[test]
+fn a_canopy_back_past_its_gate_is_not_staged_and_is_whole_when_it_holds() {
+    let mut view = View::new().expect("data/ load");
+    let (id, chute) = stock_craft_in_the_air(&mut view, 15_200.0, 420.0);
+
+    assert_eq!(view.fire_stage(), 1, "the chute's stage did not fire");
+    assert!(
+        run_until(&mut view, 1, 8, |v| staged_inflation(v, id, chute)
+            .is_some()),
+        "the gates hold: the canopy must open at once"
+    );
+    let opened = view.sim.vessels()[&id].deployed[&chute]
+        .opened_tick
+        .expect("caught at once");
+    assert_eq!(ticks_past(&view, opened), 2);
+    assert_eq!(staged_inflation(&view, id, chute), Some(2.0 / 96.0));
+    assert_eq!(
+        cues(&view).iter().filter(|c| *c == "CANOPY OPEN").count(),
+        1,
+        "{:?}",
+        cues(&view)
+    );
+
+    // Whole a ramp time on, still under the gate.
+    frame(&mut view, 94);
+    assert_eq!(ticks_past(&view, opened), 96);
+    assert_eq!(staged_inflation(&view, id, chute), Some(1.0));
+    assert!(altitude_m(&view, id) < 16_000.0, "still under the gate");
+
+    // The climb carries the craft up through the gate: no canopy is
+    // staged from then, and the simulation keeps the anchor.
+    assert!(
+        run_until(&mut view, 8, 400, |v| altitude_m(v, id) > 16_000.0),
+        "the craft never rose through the gate: {}",
+        altitude_m(&view, id)
+    );
+    assert_eq!(
+        staged_inflation(&view, id, chute),
+        None,
+        "over the gate no canopy is staged at {} m",
+        altitude_m(&view, id)
+    );
+    assert_eq!(
+        view.sim.vessels()[&id].deployed[&chute].opened_tick,
+        Some(opened),
+        "the anchor is the simulation's to keep"
+    );
+
+    let said = cues(&view).iter().filter(|c| *c == "CANOPY OPEN").count();
+
+    // The fall brings it back under the gate: whole at once, and said
+    // again — any canopy appearing over the craft is.
+    assert!(
+        run_until(&mut view, 64, 240, |v| altitude_m(v, id) < 15_990.0),
+        "the craft never fell back under the gate"
+    );
+    assert_eq!(
+        staged_inflation(&view, id, chute),
+        Some(1.0),
+        "whole again the tick the flow holds"
+    );
+    assert_eq!(
+        cues(&view).iter().filter(|c| *c == "CANOPY OPEN").count(),
+        said + 1,
+        "{:?}",
         cues(&view)
     );
 }

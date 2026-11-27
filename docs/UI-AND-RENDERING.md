@@ -469,7 +469,10 @@ the decoupler that drops its own subtree must get its deploy record while the
 node still exists (a `DeployPart` naming a jettisoned node just rejects). All
 of this only after the bound vessel checks bubble-resident (on a latched/rails
 vessel the commands would all reject while eating the stage). Every outcome
-posts a cue, naming deploys vs jettisons ("STAGED — 1 PART(S) DEPLOYED"). Known
+posts a cue, naming jettisons against **chutes fired** ("STAGED — 1 CHUTE(S)
+FIRED", "STAGED — 1 JETTISONED + 1 CHUTE(S) FIRED"): a press fires a chute, it
+does not open it — the canopy waits packed until the flow can hold it (§5.2),
+and "CANOPY OPEN" posts the frame it starts inflating, not the press. Known
 honest limitation (doc at `flight.rs:616-632`): a jettisoned part leaves the
 sim outright — no debris fragment — and engines are globally armed so a firing
 separates but never ignites.
@@ -530,7 +533,13 @@ the craft is. Session state only: nothing here is sim state.
   (`bounding_radius`, staged once per craft revision into `CraftRadii`).
 - **Framing.** The frame a vessel takes the focus, first focus or change,
   the target becomes 4 × its bounding radius, clamped to the limits, and
-  the camera eases there. No snap (C19-F4).
+  the camera eases there. No snap (C19-F4). An open canopy counts as the
+  craft's: the radius framed is the farther of the craft's own and its
+  canopy's reach from the CoM once whole (`FlightCanopy::reach_m` — 25.6 m
+  for the s125 over the Stock Hopper, so a 102 m target). A canopy opening over the craft the camera **already holds** is
+  framed the same way once, on the frame it appears, and only outward — a
+  player already further out keeps their view, and after that frame the
+  wheel is theirs again (`frame_target`).
 - **Floor.** The eye stays 0.3 m above the heightfield's surface under it —
   `ground_radius` sampled at the eye's own ground point, `eye_floor`. Over
   an ocean that surface is the seabed: the surface of the water is no
@@ -658,9 +667,9 @@ surface-relative speed = v − ω×r) and the propulsion walk
 (`stage_propulsion`/`delta_v_walk_from` → per-stage Δv, TWR, burn time — the
 Kerbal Engineer-equivalent readouts).
 
-### 5.2 VFX: plume, plasma, dust (the §3.7 floor)
+### 5.2 VFX: plume, plasma, dust, canopy
 
-All emitted into the flight packet's **unlit stream** (zero normal = fragment
+All but the canopy emitted into the flight packet's **unlit stream** (zero normal = fragment
 passthrough, `flight.rs:2386-2418`). Every unlit vertex carries its place
 relative to the eye: with water in front of it the fragment shader thins
 its colour by the water's transmittance over that way and hands the share
@@ -681,6 +690,39 @@ surface fades with the water before it like a hull does.
   vertex when the last step recorded contact. Under an ocean that surface
   is the seabed the craft rests on: the ring stays on the bottom, seen
   through the water, not on the surface above it.
+- **Parachute canopy** (`emit_canopies`/`emit_canopy`, `flight.rs:5839`) —
+  unlike the three above it goes into the **lit stream** (per-corner world
+  normals, a material row), so it takes the scene's sun, hemisphere ambient
+  and cascade shadow like the hull, and the water in front of it absorbs it
+  the same way. What is drawn is the simulation's own reading, never a
+  view-side guess: `World::canopies` (`csp-sim/src/lib.rs:3268`) yields one
+  `Canopy` per deployed chute of an InBubble vessel, read at the state's
+  tick through `CanopyFlow::ramp` (`csp-phys/src/simple.rs:3615`) — the
+  force model's own catch test and inflation ramp, with none of the reef or
+  the budgets. `capture_sync_input` folds those into `FlightCanopy` rows in
+  `CanopiesStaged`; a row exists exactly while the simulation holds the
+  canopy open, so a chute waiting out its gates, one back past them (over
+  16 km or 1 200 m/s), or a craft out of the bubble stages none, and
+  nothing is drawn for it.
+  - **Where.** Where the step takes the pull (§3.1 rule A): the dome over
+    the canister's place on the craft's longitudinal axis, up that axis; the
+    suspension lines run from the rim down to the canister itself.
+  - **How big.** The open canopy's drag area read as the disc that catches
+    it, `d = 2·√(A/π)` — 29.9 m across for the s125's 700 m² — times the
+    simulation's inflation fraction: nothing before the canopy starts
+    opening, the whole canopy a `deploy_time_s` later. The lines and the
+    dome's height scale with the same radius (rim one radius over the axis
+    point, apex half a radius higher).
+  - **The mesh.** Generated once at run time (`CanopyMesh::unit`, kept in
+    `FlightGeomCache`) — the art packs carry the packed canister alone. A
+    half-ellipse dome of 32 gores × 6 rings (352 triangles) in alternating
+    safety-orange and undyed cloth, and 16 suspension lines as eye-facing
+    ribbons two triangles each (32): **384 triangles, 1 152 vertices per open
+    canopy** (`CANOPY_TRIANGLES`), appended to the craft's own stream.
+  - **Cost.** A steady canopy allocates nothing per frame: the mesh is made
+    once, the row buffer is handed back from `CanopiesStaged` and refilled
+    each `end_frame`, and the vertex stream is pre-sized from the last
+    frame's count.
 
 ### 5.3 Part picking (right-click menu)
 
@@ -1468,7 +1510,7 @@ PLAN §3.7's M4c exit rows and where each lives:
 | Engine plume VFX | `flight::emit_plumes` (`flight.rs:2423`), delivered-thrust keyed |
 | Reentry plasma | `flight::emit_sheath` (`flight.rs:2520`), convective-flux driven |
 | Ground-contact dust | flight.rs:2870-2940 ring, §2.9 geometric predicate wired |
-| Basic SFX | M4c shipped the **cue channel** only: `FlightSfx`/`sfx_edges` (`flight.rs:575`/`:1887`) edge-detect ignition/cut, staging, breakup, contact, latch/liftoff, vessel-left — HUD flashes via `notice_overlay`. PLAN §3.7's as-shipped note documents the deferral to M10. |
+| Basic SFX | M4c shipped the **cue channel** only: `FlightSfx`/`sfx_edges` (`flight.rs:575`/`:1887`) edge-detect ignition/cut, staging, canopy-open (the frame a canopy first stands open over the focused craft — `sfx_edges`, `flight.rs:4889`), breakup, contact, latch/liftoff, vessel-left — HUD flashes via `notice_overlay`. PLAN §3.7's as-shipped note documents the deferral to M10. |
 | Audio (M10 exit row, the deferred half) | `csp-app/src/{audio,synth}.rs` — real backend: pure-function synth bank (`synth.rs`, fixed-seed xorshift — zero asset files, zero license rows) + a PCM mixer streaming to a **subprocess** player (`pw-play`/`paplay`/`aplay`, low-latency flags, bounded pipe lead); graceful silence when nothing can be spawned. Consumes `FlightSfx` + `FlightSnapshot` read-only after `end_frame` (`csp-app/src/lib.rs:1018-1027`). |
 
 Note: PLAN §3.7's as-shipped note says "no audio stack exists in the tree" —
@@ -1660,7 +1702,17 @@ budget-limited previews, `csp-app/src/lib.rs:1398-1447`).
   pixels at 10, 30 and 40 km in daylight, stars at 55 and 60 km and at dusk
   from the ground), each metric with GPU-free tests of its own (the grain
   metric on a quantised gradient, on one dithered by ±half a code value,
-  and on one plus white noise); `--ignored` PPM dumps.
+  and on one plus white noise); the canopy gate
+  `an_open_canopy_is_drawn_over_the_stock_craft` (the Stock Hopper staged
+  through `fire_stage` and flown down under its whole canopy 1.8 km up; the
+  frame beside the same frame with the canopy's 1 152 vertices taken out —
+  exactly one canopy's worth stands above the canister, and the two must
+  differ on ≥ 1 000 of 76 800 pixels; measured 3 394, with the canopy emit
+  disabled 0. The same test takes the camera's own framing first — its
+  opening stepped a tick a frame, as the game shows it — and requires the
+  eye at least 75 m out: 14.2 m with the reach read at the staged inflation.
+  `DUMP_CANOPY_DIR=1` writes the frames to `target/canopy/`);
+  `--ignored` PPM dumps.
 - `csp-view/tests/render_dump_extra.rs` (449) — additional dump scenes.
 - `csp-view/tests/vab_latency.rs` (165) — the §5.4 kill criterion.
 - `csp-ui/tests/hud_dump.rs` (393) — HUD contrast rasterizer.

@@ -2375,6 +2375,9 @@ impl View {
         // The staged bounding radii — the chase camera's framing input
         // (same standalone-resource pattern).
         world.insert_resource(flight::CraftRadii::default());
+        // The open canopies the frame draws — the same pattern; the
+        // canopy-open cue and the chase camera read the focus's rows.
+        world.insert_resource(flight::CanopiesStaged::default());
         // The propulsion walk mirror — the HUD's live TWR/Δv/
         // burn-time figures (same standalone-resource pattern as
         // `LiveVesselCount`: `FlightSnapshot` cannot grow).
@@ -2836,7 +2839,12 @@ impl View {
                 }
             }
             let art = self.world.resource::<art::ArtAssets>().clone();
+            // Last frame's canopy rows go back to the capture emptied:
+            // it refills their buffer, so a canopy that stays open
+            // stages without an allocation.
+            let rows = std::mem::take(&mut self.world.resource_mut::<flight::CanopiesStaged>().0);
             let mut cache = self.world.resource_mut::<flight::LatchedWeldCache>();
+            cache.canopy_rows = rows;
             flight::capture_sync_input(&self.sim, &mut cache, &art, &rails_hint)
         };
         self.world.insert_resource(staged_flight);
@@ -4122,15 +4130,17 @@ impl View {
                 SimCommand::JettisonPart { vessel, node },
             );
         }
-        // The cue names what the firing actually did — a chute-only
-        // stage reads "DEPLOYED", not "0 PART(S) JETTISONED". C19-F6:
-        // when the fired plan belongs to a vessel that ISN'T the
-        // focus, name it — jettisoning another craft's parts must
-        // never read as if the focused vessel staged.
+        // The cue names what the firing did — a chute-only stage is
+        // not "0 PART(S) JETTISONED". A chute is FIRED here: its canopy
+        // opens only when the flow can hold it, and `CANOPY OPEN` says
+        // so the frame it starts. C19-F6: when the fired plan belongs
+        // to a vessel that ISN'T the focus, name it — jettisoning
+        // another craft's parts must never read as if the focused
+        // vessel staged.
         let notice = match (n_jettisons, n_deploys) {
             (j, 0) => format!("STAGED — {j} PART(S) JETTISONED"),
-            (0, d) => format!("STAGED — {d} PART(S) DEPLOYED"),
-            (j, d) => format!("STAGED — {j} JETTISONED + {d} DEPLOYED"),
+            (0, d) => format!("STAGED — {d} CHUTE(S) FIRED"),
+            (j, d) => format!("STAGED — {j} JETTISONED + {d} CHUTE(S) FIRED"),
         };
         let notice = if focus != Some(vessel) {
             format!("{notice} · VESSEL {}", vessel.0)

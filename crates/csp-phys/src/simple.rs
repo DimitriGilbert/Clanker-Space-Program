@@ -3557,13 +3557,8 @@ impl PhysicsBackend for SimpleBackend {
 fn decel_areas_m2(site: &DecelSite, flow: &FlowState, at_s: f64) -> (f64, f64) {
     let qbar = 0.5 * flow.rho * flow.speed * flow.speed;
     let packed = capped(site.packed_drag_area_m2, site.packed_budget_n, qbar);
-    let canopy = match site.open_at_s {
-        Some(t0) if flow.alt_m <= site.deploy_alt_m && flow.speed <= site.deploy_speed_mps => {
-            let ramp = if site.deploy_time_s > 0.0 {
-                ((at_s - t0) / site.deploy_time_s).clamp(0.0, 1.0)
-            } else {
-                1.0
-            };
+    let canopy = match canopy_ramp(site, flow, at_s) {
+        Some(ramp) => {
             let canopy = (site.deployed_drag_area_m2 - site.packed_drag_area_m2) * ramp;
             let reefed = if qbar > 0.0 && site.reef_n.is_finite() {
                 canopy.min(site.reef_n / qbar).max(0.0)
@@ -3572,9 +3567,56 @@ fn decel_areas_m2(site: &DecelSite, flow: &FlowState, at_s: f64) -> (f64, f64) {
             };
             capped(reefed, site.canopy_budget_n, qbar)
         }
-        _ => 0.0,
+        None => 0.0,
     };
     (packed, canopy)
+}
+
+/// How far `site`'s canopy is inflated at `at_s` under `flow` — the catch
+/// test and the ramp on their own, with none of the reef or the budgets:
+/// the one reading the force model's area ([`decel_areas_m2`]) and
+/// [`CanopyFlow::ramp`] take. `None` wherever the canopy holds nothing:
+/// not yet caught, back beyond a gate, or no flow to catch in. Else
+/// `Some(r)`, `r` in `[0, 1]`: `0` at `open_at_s`, rising over
+/// `deploy_time_s` to `1`, which a site with no ramp time is at from its
+/// first tick.
+fn canopy_ramp(site: &DecelSite, flow: &FlowState, at_s: f64) -> Option<f64> {
+    match site.open_at_s {
+        Some(t0) if flow.alt_m <= site.deploy_alt_m && flow.speed <= site.deploy_speed_mps => {
+            Some(if site.deploy_time_s > 0.0 {
+                ((at_s - t0) / site.deploy_time_s).clamp(0.0, 1.0)
+            } else {
+                1.0
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The flow a body's canopies are read under — its [`FlowState`] at the
+/// body's own altitude and air-relative speed, or none where there is no
+/// atmospheric flow (the force model's own gate: nothing drags at all).
+/// The simulation's canopy reading for presentation is taken through
+/// it, so what is drawn by a canopy is the same catch test the step
+/// applies.
+pub struct CanopyFlow(Option<FlowState>);
+
+impl CanopyFlow {
+    /// The flow `body` stands in under `env`.
+    pub fn of(env: &Environment, body: &WeldedBody) -> Self {
+        Self(
+            env.atmosphere
+                .as_ref()
+                .and_then(|atm| flow_state(env, atm, body, body.com_world() - env.body_center)),
+        )
+    }
+
+    /// [`canopy_ramp`] of `site` under this flow, or `None` without one.
+    pub fn ramp(&self, site: &DecelSite, at_s: f64) -> Option<f64> {
+        self.0
+            .as_ref()
+            .and_then(|flow| canopy_ramp(site, flow, at_s))
+    }
 }
 
 /// One §3.1 decelerator site's action on the craft this tick, world
@@ -6446,6 +6488,61 @@ mod tests {
         let cut = decel_areas_m2(&site, &flow, 10.0);
         assert!((cut.0 - 9_000.0 / 31_250.0).abs() < 1e-12);
         assert_eq!(cut.1, 0.0);
+    }
+
+    /// The reading a canopy is drawn by is the force model's own: the
+    /// share the step's canopy area climbs along, and `None` wherever the
+    /// canopy holds nothing — uncaught, back past either gate, or with no
+    /// flow to catch in. Read through the body's own flow it is the same
+    /// number, and it leaves the moment the step drops the canopy term.
+    #[test]
+    fn the_canopy_reading_is_the_ramp_the_step_s_area_takes() {
+        let flow = hot_flow();
+        let site = umbrella_site();
+        // Caught at its anchor and holding nothing yet; half a ramp
+        // time on, half; a ramp time on, whole — and whole ever after.
+        assert_eq!(canopy_ramp(&site, &flow, 0.0), Some(0.0));
+        assert_eq!(canopy_ramp(&site, &flow, 0.75), Some(0.5));
+        assert_eq!(canopy_ramp(&site, &flow, 1.5), Some(1.0));
+        assert_eq!(canopy_ramp(&site, &flow, 600.0), Some(1.0));
+        // Unreefed and unbudgeted, the area is that share of the
+        // canopy's whole.
+        let mut bare = site;
+        bare.reef_n = f64::INFINITY;
+        let (_, area) = decel_areas_m2(&bare, &flow, 0.75);
+        assert!((area / (700.0 - 0.4) - 0.5).abs() < 1e-12, "{area}");
+        // Not caught: the deploy stamp alone opens nothing.
+        bare.open_at_s = None;
+        assert_eq!(canopy_ramp(&bare, &flow, 10.0), None);
+        // Caught, then back past a gate — either one.
+        bare.open_at_s = Some(0.0);
+        let under = |alt_m, speed| FlowState {
+            v_rel: flow.v_rel,
+            speed,
+            rho: flow.rho,
+            alt_m,
+        };
+        assert_eq!(
+            canopy_ramp(&bare, &under(16_000.0 + 1.0, flow.speed), 10.0),
+            None
+        );
+        assert_eq!(
+            canopy_ramp(&bare, &under(flow.alt_m, 1_200.0 + 1.0), 10.0),
+            None
+        );
+        // A site with no ramp time is whole from its first tick.
+        bare.deploy_time_s = 0.0;
+        assert_eq!(canopy_ramp(&bare, &flow, 0.0), Some(1.0));
+        // Through the body's own flow: the chute box falling at 250 m/s
+        // reads the ramp; at rest there is no flow, and nothing; over a
+        // world without air, the same.
+        let env = chuted_env();
+        let body = chute_box_body();
+        assert_eq!(CanopyFlow::of(&env, &body).ramp(&site, 0.75), Some(0.5));
+        let mut still = body.clone();
+        still.vel = DVec3::ZERO;
+        assert_eq!(CanopyFlow::of(&env, &still).ramp(&site, 0.75), None);
+        assert_eq!(CanopyFlow::of(&terrin_env(), &body).ramp(&site, 0.75), None);
     }
 
     /// Terrin under a constant-density atmosphere (ρ ≈ 1.225 kg/m³ to

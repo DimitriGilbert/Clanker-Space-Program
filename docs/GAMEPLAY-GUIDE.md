@@ -240,8 +240,8 @@ its text, and the navball first opens parked too high — see Known issues):
   high, a known issue; `csp-ui/src/navball.rs`): attitude ball with sky/ground, pitch
   ladder, compass letters, heading tape, plus **green prograde/retrograde markers** in the
   surface frame (hidden while parked).
-- Top-center **notice stack** (« cues »): engine/stage/impact SFX edges, warp/refusal reasons,
-  build-delivery toasts — in *every* view mode (`csp-ui/src/lib.rs: notice_overlay`).
+- Top-center **notice stack** (« cues »): engine/stage/canopy-open/impact SFX edges,
+  warp/refusal reasons, build-delivery toasts — in *every* view mode (`csp-ui/src/lib.rs: notice_overlay`).
 - Top-right **status strip** `₣ funds ⚛ science ✉ contracts` — click it to open the Program
   window (`program_status`).
 
@@ -303,7 +303,19 @@ click-to-focus, `Tab` cycles focus (`csp-view/src/map.rs`). Two planning windows
   Hopper hangs within about half a degree of the flow and comes in with no spin
   (`canopy_steady_arm_m`, `canopy_steady_damp_m_s`, `data/balance.ron`). A catch needs
   altitude under it — about 1.5 km at 250 m/s, 6 km at 600 m/s; lower and faster than
-  that it opens too late and the impact breaks the stack.
+  that it opens too late and the impact breaks the stack. Those are the dry Hopper's
+  numbers: with its tank full it is nearly twice as heavy and the same reefed canopy
+  takes about 5 km from 250 m/s.
+- **Seeing the parachute**: the press reads **`STAGED — 1 CHUTE(S) FIRED`** — fired, not
+  open. The canopy is drawn from the tick the simulation starts inflating it, and
+  **`CANOPY OPEN`** posts that same frame; it grows to full size over `deploy_time_s`
+  (1.5 s) and hangs there while the craft descends: a striped dome as wide as the part's
+  deployed drag area (30 m across for the s125's 700 m²) over the canister's place on the
+  craft's axis, its suspension lines down to the canister. The camera backs off once to
+  frame craft and canopy together as it opens — the wheel is yours again after that.
+  A chute waiting above the gates draws nothing; a craft that climbs back through them
+  loses its canopy from the view until it is under them again, and then the canopy is
+  whole at once, not re-inflated.
 - **Touchdown** (M4c landing): the ground stop of a landing is read by the breakup check as if
   spread over 0.5 m of crush (`touchdown_crush_m`, `data/balance.ron`) — a 7 m/s touchdown loads
   each inline joint to `m·v²/(2·0.5)` instead of the one-tick stop it is in the solver, and the
@@ -666,9 +678,11 @@ It completes on the **recovery event**, not on landing — press RECOVER VESSEL 
 Focus the vessel in map, press **T** (`RecoverControl`) to pull it off rails into the bubble,
 then fly the entry or set a retrograde maneuver node — the executor flies it automatically.
 Deploy the chute before 16 km / 1200 m/s — on the Stock Hopper, SPACE fires its chute stage
-whenever you like after liftoff: the canopy waits packed for those gates. A catch needs about
-6 km of air beneath it at 600 m/s (1.5 km at 250 m/s); a craft that is still supersonic in the
-last kilometres is coming in without it.
+whenever you like after liftoff: the canopy waits packed for those gates. The press reads
+`STAGED — 1 CHUTE(S) FIRED`; `CANOPY OPEN` and the canopy itself come when the gates pass.
+A catch needs about 6 km of air beneath it at 600 m/s (1.5 km at 250 m/s; about 5 km for a
+Hopper with its tank full); a craft that is still supersonic in the last kilometres is
+coming in without it.
 
 **The game says the session is read-only.**
 A fatal sim error halted the clock (crash dialog with a bug-report bundle path). Nothing can
